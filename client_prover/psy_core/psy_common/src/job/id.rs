@@ -62,6 +62,8 @@ pub enum QJobTopic {
     NotifyCoordinatorComplete = 3,
     NotifyRealmComplete = 4,
     AggregateJobs = 5,
+    Invalid = 254,
+    Unknown = 255,
 }
 impl QJobTopic {
     pub fn to_u8(&self) -> u8 {
@@ -84,6 +86,8 @@ impl TryFrom<u8> for QJobTopic {
             3 => Ok(QJobTopic::NotifyCoordinatorComplete),
             4 => Ok(QJobTopic::NotifyRealmComplete),
             5 => Ok(QJobTopic::AggregateJobs),
+            254 => Ok(QJobTopic::Invalid),
+            255 => Ok(QJobTopic::Unknown),
             _ => Err(anyhow::format_err!("Invalid QJobTopic value: {}", value)),
         }
     }
@@ -126,11 +130,11 @@ pub enum ProvingJobCircuitType {
     AppendUserRegistrationTree = 0,
     AppendUserRegistrationTreeAggregate = 1,
 
-    AddDeposit = 2,
-    AddDepositAggregate = 3,
+    AddL1Deposit = 2,
+    AddL1DepositAggregate = 3,
 
-    ClaimDeposit = 4,
-    ClaimDepositAggregate = 5,
+    ClaimL1Deposit = 4,
+    ClaimL1DepositAggregate = 5,
 
     UserEndCap = 6,
     GUTATwoEndCap = 7,
@@ -143,35 +147,46 @@ pub enum ProvingJobCircuitType {
     GUTAOnlyRegisterUsers = 14,
     GUTANoChange = 15,
 
-    AddWithdrawal = 16,
-    AddWithdrawalAggregate = 17,
+    AddL1Withdrawal = 16,
+    AddL1WithdrawalAggregate = 17,
 
     BatchDeployContracts = 18,
     BatchDeployContractsAggregate = 19,
 
-    ProcessWithdrawal = 20,
-    ProcessWithdrawalAggregate = 21,
+    ProcessL1Withdrawal = 20,
+    ProcessL1WithdrawalAggregate = 21,
+
+    BatchUpdateContracts = 22,
+    BatchUpdateContractsAggregate = 23,
 
     GenerateRollupStateTransitionProof = 32,
     GenerateSigHashIntrospectionProof = 33,
     GenerateFinalSigHashProof = 34,
     GenerateFinalSigHashProofGroth16 = 35,
     WrapFinalSigHashProofBLS12381 = 36,
+    GenesisBlockCheckpointStateTransition = 37,
 
     AggUserRegisterDeployContractsGUTA = 40,
-    AggAddProcessWithdrawalAddDeposit = 41,
+    AggAddProcessL1WithdrawalAddL1Deposit = 41,
 
     DummyAppendUserRegistrationTreeAggregate = 48,
-    DummyAddDepositAggregate = 49,
-    DummyClaimDepositAggregate = 50,
+    DummyAddL1DepositAggregate = 49,
+    DummyClaimL1DepositAggregate = 50,
     DummyGUTA = 51,
-    DummyAddWithdrawalAggregate = 52,
-    DummyProcessWithdrawalAggregate = 53,
+    DummyAddL1WithdrawalAggregate = 52,
+    DummyProcessL1WithdrawalAggregate = 53,
     DummyBatchDeployContractsAggregate = 54,
+    DummyBatchUpdateContractsAggregate = 61,
 
     // ADDED NEW - For Historical Upgrades
     GUTATwoGUTAWithCheckpointUpgrade = 55,
     GUTAVerifyToCapWithCheckpointUpgrade = 56,
+
+    // ADDED NEW - For Linear Transitions
+    GUTATwoGUTALinear = 57,
+    GUTATwoGUTALinearUpgradeCheckpoint = 58,
+    GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint = 59,
+    GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint = 60,
 
     WrappedSignatureProof = 64,
     Secp256K1SignatureProof = 65,
@@ -184,6 +199,7 @@ pub enum ProvingJobCircuitType {
     TypeD = 227,
     TypeE = 228,
     TypeF = 229,
+    Invalid = 254,
     Unknown = 255,
 }
 
@@ -198,16 +214,18 @@ impl ProvingJobCircuitType {
         let leaf_type = match self {
             ProvingJobCircuitType::AppendUserRegistrationTree => ProvingJobCircuitType::AppendUserRegistrationTree,
             ProvingJobCircuitType::AppendUserRegistrationTreeAggregate => ProvingJobCircuitType::AppendUserRegistrationTree,
-            ProvingJobCircuitType::AddDeposit => ProvingJobCircuitType::AddDeposit,
-            ProvingJobCircuitType::AddDepositAggregate => ProvingJobCircuitType::AddDeposit,
-            ProvingJobCircuitType::ClaimDeposit => ProvingJobCircuitType::ClaimDeposit,
-            ProvingJobCircuitType::ClaimDepositAggregate => ProvingJobCircuitType::ClaimDeposit,
-            ProvingJobCircuitType::AddWithdrawal => ProvingJobCircuitType::AddWithdrawal,
-            ProvingJobCircuitType::AddWithdrawalAggregate => ProvingJobCircuitType::AddWithdrawal,
+            ProvingJobCircuitType::AddL1Deposit => ProvingJobCircuitType::AddL1Deposit,
+            ProvingJobCircuitType::AddL1DepositAggregate => ProvingJobCircuitType::AddL1Deposit,
+            ProvingJobCircuitType::ClaimL1Deposit => ProvingJobCircuitType::ClaimL1Deposit,
+            ProvingJobCircuitType::ClaimL1DepositAggregate => ProvingJobCircuitType::ClaimL1Deposit,
+            ProvingJobCircuitType::AddL1Withdrawal => ProvingJobCircuitType::AddL1Withdrawal,
+            ProvingJobCircuitType::AddL1WithdrawalAggregate => ProvingJobCircuitType::AddL1Withdrawal,
             ProvingJobCircuitType::BatchDeployContracts => ProvingJobCircuitType::BatchDeployContracts,
             ProvingJobCircuitType::BatchDeployContractsAggregate => ProvingJobCircuitType::BatchDeployContracts,
-            ProvingJobCircuitType::ProcessWithdrawal => ProvingJobCircuitType::ProcessWithdrawal,
-            ProvingJobCircuitType::ProcessWithdrawalAggregate => ProvingJobCircuitType::ProcessWithdrawal,
+            ProvingJobCircuitType::BatchUpdateContracts => ProvingJobCircuitType::BatchUpdateContracts,
+            ProvingJobCircuitType::BatchUpdateContractsAggregate => ProvingJobCircuitType::BatchUpdateContracts,
+            ProvingJobCircuitType::ProcessL1Withdrawal => ProvingJobCircuitType::ProcessL1Withdrawal,
+            ProvingJobCircuitType::ProcessL1WithdrawalAggregate => ProvingJobCircuitType::ProcessL1Withdrawal,
             _ => anyhow::bail!("circuit type {:?} does not have a leaf type", self),
         };
         Ok(leaf_type)
@@ -244,6 +262,10 @@ impl ProvingJobCircuitType {
                 | ProvingJobCircuitType::GUTAVerifyToCap
                 | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
                 | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
+                | ProvingJobCircuitType::GUTATwoGUTALinear
+                | ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint
+                | ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint
+                | ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint
                 | ProvingJobCircuitType::GUTANoChange
         )
     }
@@ -252,16 +274,18 @@ impl ProvingJobCircuitType {
         let leaf_type = match self {
             ProvingJobCircuitType::AppendUserRegistrationTree => ProvingJobCircuitType::AppendUserRegistrationTreeAggregate,
             ProvingJobCircuitType::AppendUserRegistrationTreeAggregate => ProvingJobCircuitType::AppendUserRegistrationTreeAggregate,
-            ProvingJobCircuitType::AddDeposit => ProvingJobCircuitType::AddDepositAggregate,
-            ProvingJobCircuitType::AddDepositAggregate => ProvingJobCircuitType::AddDepositAggregate,
-            ProvingJobCircuitType::ClaimDeposit => ProvingJobCircuitType::ClaimDepositAggregate,
-            ProvingJobCircuitType::ClaimDepositAggregate => ProvingJobCircuitType::ClaimDepositAggregate,
-            ProvingJobCircuitType::AddWithdrawal => ProvingJobCircuitType::AddWithdrawalAggregate,
-            ProvingJobCircuitType::AddWithdrawalAggregate => ProvingJobCircuitType::AddWithdrawalAggregate,
+            ProvingJobCircuitType::AddL1Deposit => ProvingJobCircuitType::AddL1DepositAggregate,
+            ProvingJobCircuitType::AddL1DepositAggregate => ProvingJobCircuitType::AddL1DepositAggregate,
+            ProvingJobCircuitType::ClaimL1Deposit => ProvingJobCircuitType::ClaimL1DepositAggregate,
+            ProvingJobCircuitType::ClaimL1DepositAggregate => ProvingJobCircuitType::ClaimL1DepositAggregate,
+            ProvingJobCircuitType::AddL1Withdrawal => ProvingJobCircuitType::AddL1WithdrawalAggregate,
+            ProvingJobCircuitType::AddL1WithdrawalAggregate => ProvingJobCircuitType::AddL1WithdrawalAggregate,
             ProvingJobCircuitType::BatchDeployContracts => ProvingJobCircuitType::BatchDeployContractsAggregate,
             ProvingJobCircuitType::BatchDeployContractsAggregate => ProvingJobCircuitType::BatchDeployContractsAggregate,
-            ProvingJobCircuitType::ProcessWithdrawal => ProvingJobCircuitType::ProcessWithdrawalAggregate,
-            ProvingJobCircuitType::ProcessWithdrawalAggregate => ProvingJobCircuitType::ProcessWithdrawalAggregate,
+            ProvingJobCircuitType::BatchUpdateContracts => ProvingJobCircuitType::BatchUpdateContractsAggregate,
+            ProvingJobCircuitType::BatchUpdateContractsAggregate => ProvingJobCircuitType::BatchUpdateContractsAggregate,
+            ProvingJobCircuitType::ProcessL1Withdrawal => ProvingJobCircuitType::ProcessL1WithdrawalAggregate,
+            ProvingJobCircuitType::ProcessL1WithdrawalAggregate => ProvingJobCircuitType::ProcessL1WithdrawalAggregate,
             _ => anyhow::bail!("circuit type {:?} does not have a aggregated circuit type", self),
         };
         Ok(leaf_type)
@@ -272,21 +296,24 @@ impl ProvingJobCircuitType {
             ProvingJobCircuitType::AppendUserRegistrationTree => ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate,
             ProvingJobCircuitType::AppendUserRegistrationTreeAggregate => ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate,
             ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate => ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate,
-            ProvingJobCircuitType::AddDeposit => ProvingJobCircuitType::DummyAddDepositAggregate,
-            ProvingJobCircuitType::AddDepositAggregate => ProvingJobCircuitType::DummyAddDepositAggregate,
-            ProvingJobCircuitType::DummyAddDepositAggregate => ProvingJobCircuitType::DummyAddDepositAggregate,
-            ProvingJobCircuitType::ClaimDeposit => ProvingJobCircuitType::DummyClaimDepositAggregate,
-            ProvingJobCircuitType::ClaimDepositAggregate => ProvingJobCircuitType::DummyClaimDepositAggregate,
-            ProvingJobCircuitType::DummyClaimDepositAggregate => ProvingJobCircuitType::DummyClaimDepositAggregate,
-            ProvingJobCircuitType::AddWithdrawal => ProvingJobCircuitType::DummyAddWithdrawalAggregate,
-            ProvingJobCircuitType::AddWithdrawalAggregate => ProvingJobCircuitType::DummyAddWithdrawalAggregate,
-            ProvingJobCircuitType::DummyAddWithdrawalAggregate => ProvingJobCircuitType::DummyAddWithdrawalAggregate,
+            ProvingJobCircuitType::AddL1Deposit => ProvingJobCircuitType::DummyAddL1DepositAggregate,
+            ProvingJobCircuitType::AddL1DepositAggregate => ProvingJobCircuitType::DummyAddL1DepositAggregate,
+            ProvingJobCircuitType::DummyAddL1DepositAggregate => ProvingJobCircuitType::DummyAddL1DepositAggregate,
+            ProvingJobCircuitType::ClaimL1Deposit => ProvingJobCircuitType::DummyClaimL1DepositAggregate,
+            ProvingJobCircuitType::ClaimL1DepositAggregate => ProvingJobCircuitType::DummyClaimL1DepositAggregate,
+            ProvingJobCircuitType::DummyClaimL1DepositAggregate => ProvingJobCircuitType::DummyClaimL1DepositAggregate,
+            ProvingJobCircuitType::AddL1Withdrawal => ProvingJobCircuitType::DummyAddL1WithdrawalAggregate,
+            ProvingJobCircuitType::AddL1WithdrawalAggregate => ProvingJobCircuitType::DummyAddL1WithdrawalAggregate,
+            ProvingJobCircuitType::DummyAddL1WithdrawalAggregate => ProvingJobCircuitType::DummyAddL1WithdrawalAggregate,
             ProvingJobCircuitType::BatchDeployContracts => ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
             ProvingJobCircuitType::BatchDeployContractsAggregate => ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
             ProvingJobCircuitType::DummyBatchDeployContractsAggregate => ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
-            ProvingJobCircuitType::ProcessWithdrawal => ProvingJobCircuitType::DummyProcessWithdrawalAggregate,
-            ProvingJobCircuitType::ProcessWithdrawalAggregate => ProvingJobCircuitType::DummyProcessWithdrawalAggregate,
-            ProvingJobCircuitType::DummyProcessWithdrawalAggregate => ProvingJobCircuitType::DummyProcessWithdrawalAggregate,
+            ProvingJobCircuitType::BatchUpdateContracts => ProvingJobCircuitType::DummyBatchUpdateContractsAggregate,
+            ProvingJobCircuitType::BatchUpdateContractsAggregate => ProvingJobCircuitType::DummyBatchUpdateContractsAggregate,
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate => ProvingJobCircuitType::DummyBatchUpdateContractsAggregate,
+            ProvingJobCircuitType::ProcessL1Withdrawal => ProvingJobCircuitType::DummyProcessL1WithdrawalAggregate,
+            ProvingJobCircuitType::ProcessL1WithdrawalAggregate => ProvingJobCircuitType::DummyProcessL1WithdrawalAggregate,
+            ProvingJobCircuitType::DummyProcessL1WithdrawalAggregate => ProvingJobCircuitType::DummyProcessL1WithdrawalAggregate,
             _ => anyhow::bail!("circuit type {:?} does not have a aggregated dummy circuit type", self),
         };
         Ok(leaf_type)
@@ -299,10 +326,10 @@ impl TryFrom<u8> for ProvingJobCircuitType {
         match value {
             0 => Ok(ProvingJobCircuitType::AppendUserRegistrationTree),
             1 => Ok(ProvingJobCircuitType::AppendUserRegistrationTreeAggregate),
-            2 => Ok(ProvingJobCircuitType::AddDeposit),
-            3 => Ok(ProvingJobCircuitType::AddDepositAggregate),
-            4 => Ok(ProvingJobCircuitType::ClaimDeposit),
-            5 => Ok(ProvingJobCircuitType::ClaimDepositAggregate),
+            2 => Ok(ProvingJobCircuitType::AddL1Deposit),
+            3 => Ok(ProvingJobCircuitType::AddL1DepositAggregate),
+            4 => Ok(ProvingJobCircuitType::ClaimL1Deposit),
+            5 => Ok(ProvingJobCircuitType::ClaimL1DepositAggregate),
             6 => Ok(ProvingJobCircuitType::UserEndCap),
             7 => Ok(ProvingJobCircuitType::GUTATwoEndCap),
             8 => Ok(ProvingJobCircuitType::GUTATwoGUTA),
@@ -313,28 +340,36 @@ impl TryFrom<u8> for ProvingJobCircuitType {
             13 => Ok(ProvingJobCircuitType::GUTAVerifyToCap),
             14 => Ok(ProvingJobCircuitType::GUTAOnlyRegisterUsers),
             15 => Ok(ProvingJobCircuitType::GUTANoChange),
-            16 => Ok(ProvingJobCircuitType::AddWithdrawal),
-            17 => Ok(ProvingJobCircuitType::AddWithdrawalAggregate),
+            16 => Ok(ProvingJobCircuitType::AddL1Withdrawal),
+            17 => Ok(ProvingJobCircuitType::AddL1WithdrawalAggregate),
             18 => Ok(ProvingJobCircuitType::BatchDeployContracts),
             19 => Ok(ProvingJobCircuitType::BatchDeployContractsAggregate),
-            20 => Ok(ProvingJobCircuitType::ProcessWithdrawal),
-            21 => Ok(ProvingJobCircuitType::ProcessWithdrawalAggregate),
+            20 => Ok(ProvingJobCircuitType::ProcessL1Withdrawal),
+            21 => Ok(ProvingJobCircuitType::ProcessL1WithdrawalAggregate),
+            22 => Ok(ProvingJobCircuitType::BatchUpdateContracts),
+            23 => Ok(ProvingJobCircuitType::BatchUpdateContractsAggregate),
             32 => Ok(ProvingJobCircuitType::GenerateRollupStateTransitionProof),
             33 => Ok(ProvingJobCircuitType::GenerateSigHashIntrospectionProof),
             34 => Ok(ProvingJobCircuitType::GenerateFinalSigHashProof),
             35 => Ok(ProvingJobCircuitType::GenerateFinalSigHashProofGroth16),
             36 => Ok(ProvingJobCircuitType::WrapFinalSigHashProofBLS12381),
+            37 => Ok(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition),
             40 => Ok(ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA),
-            41 => Ok(ProvingJobCircuitType::AggAddProcessWithdrawalAddDeposit),
+            41 => Ok(ProvingJobCircuitType::AggAddProcessL1WithdrawalAddL1Deposit),
             48 => Ok(ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate),
-            49 => Ok(ProvingJobCircuitType::DummyAddDepositAggregate),
-            50 => Ok(ProvingJobCircuitType::DummyClaimDepositAggregate),
+            49 => Ok(ProvingJobCircuitType::DummyAddL1DepositAggregate),
+            50 => Ok(ProvingJobCircuitType::DummyClaimL1DepositAggregate),
             51 => Ok(ProvingJobCircuitType::DummyGUTA),
-            52 => Ok(ProvingJobCircuitType::DummyAddWithdrawalAggregate),
-            53 => Ok(ProvingJobCircuitType::DummyProcessWithdrawalAggregate),
+            52 => Ok(ProvingJobCircuitType::DummyAddL1WithdrawalAggregate),
+            53 => Ok(ProvingJobCircuitType::DummyProcessL1WithdrawalAggregate),
             54 => Ok(ProvingJobCircuitType::DummyBatchDeployContractsAggregate),
             55 => Ok(ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade),
             56 => Ok(ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade),
+            57 => Ok(ProvingJobCircuitType::GUTATwoGUTALinear),
+            58 => Ok(ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint),
+            59 => Ok(ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint),
+            60 => Ok(ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint),
+            61 => Ok(ProvingJobCircuitType::DummyBatchUpdateContractsAggregate),
 
             64 => Ok(ProvingJobCircuitType::WrappedSignatureProof),
             65 => Ok(ProvingJobCircuitType::Secp256K1SignatureProof),
@@ -346,6 +381,7 @@ impl TryFrom<u8> for ProvingJobCircuitType {
             227 => Ok(ProvingJobCircuitType::TypeD),
             228 => Ok(ProvingJobCircuitType::TypeE),
             229 => Ok(ProvingJobCircuitType::TypeF),
+            254 => Ok(ProvingJobCircuitType::Invalid),
             255 => Ok(ProvingJobCircuitType::Unknown),
             _ => Err(anyhow::format_err!("Invalid ProvingJobCircuitType value: {}", value)),
         }
@@ -797,7 +833,7 @@ impl QProvingJobDataID {
             goal_id: checkpoint_id,
             slot_id,
             group_id,
-            circuit_type: ProvingJobCircuitType::AggAddProcessWithdrawalAddDeposit,
+            circuit_type: ProvingJobCircuitType::AggAddProcessL1WithdrawalAddL1Deposit,
             sub_group_id: 0,
             task_index: 0,
             data_type: ProvingJobDataType::InputWitness,
@@ -886,19 +922,22 @@ impl QProvingJobDataID {
             ProvingJobCircuitType::AppendUserRegistrationTreeAggregate => ProvingJobCircuitType::AppendUserRegistrationTreeAggregate,
             ProvingJobCircuitType::BatchDeployContracts => ProvingJobCircuitType::BatchDeployContractsAggregate,
             ProvingJobCircuitType::BatchDeployContractsAggregate => ProvingJobCircuitType::BatchDeployContractsAggregate,
-            ProvingJobCircuitType::AddDeposit => ProvingJobCircuitType::AddDepositAggregate,
-            ProvingJobCircuitType::AddDepositAggregate => ProvingJobCircuitType::AddDepositAggregate,
-            ProvingJobCircuitType::ClaimDeposit => ProvingJobCircuitType::ClaimDepositAggregate,
-            ProvingJobCircuitType::ClaimDepositAggregate => ProvingJobCircuitType::ClaimDepositAggregate,
-            ProvingJobCircuitType::AddWithdrawal => ProvingJobCircuitType::AddWithdrawalAggregate,
-            ProvingJobCircuitType::AddWithdrawalAggregate => ProvingJobCircuitType::AddWithdrawalAggregate,
-            ProvingJobCircuitType::ProcessWithdrawal => ProvingJobCircuitType::ProcessWithdrawalAggregate,
-            ProvingJobCircuitType::ProcessWithdrawalAggregate => ProvingJobCircuitType::ProcessWithdrawalAggregate,
+            ProvingJobCircuitType::BatchUpdateContracts => ProvingJobCircuitType::BatchUpdateContractsAggregate,
+            ProvingJobCircuitType::BatchUpdateContractsAggregate => ProvingJobCircuitType::BatchUpdateContractsAggregate,
+            ProvingJobCircuitType::AddL1Deposit => ProvingJobCircuitType::AddL1DepositAggregate,
+            ProvingJobCircuitType::AddL1DepositAggregate => ProvingJobCircuitType::AddL1DepositAggregate,
+            ProvingJobCircuitType::ClaimL1Deposit => ProvingJobCircuitType::ClaimL1DepositAggregate,
+            ProvingJobCircuitType::ClaimL1DepositAggregate => ProvingJobCircuitType::ClaimL1DepositAggregate,
+            ProvingJobCircuitType::AddL1Withdrawal => ProvingJobCircuitType::AddL1WithdrawalAggregate,
+            ProvingJobCircuitType::AddL1WithdrawalAggregate => ProvingJobCircuitType::AddL1WithdrawalAggregate,
+            ProvingJobCircuitType::ProcessL1Withdrawal => ProvingJobCircuitType::ProcessL1WithdrawalAggregate,
+            ProvingJobCircuitType::ProcessL1WithdrawalAggregate => ProvingJobCircuitType::ProcessL1WithdrawalAggregate,
             ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate => ProvingJobCircuitType::AppendUserRegistrationTreeAggregate,
-            ProvingJobCircuitType::DummyAddDepositAggregate => ProvingJobCircuitType::AddDepositAggregate,
-            ProvingJobCircuitType::DummyClaimDepositAggregate => ProvingJobCircuitType::ClaimDepositAggregate,
-            ProvingJobCircuitType::DummyAddWithdrawalAggregate => ProvingJobCircuitType::AddWithdrawalAggregate,
-            ProvingJobCircuitType::DummyProcessWithdrawalAggregate => ProvingJobCircuitType::ProcessWithdrawalAggregate,
+            ProvingJobCircuitType::DummyAddL1DepositAggregate => ProvingJobCircuitType::AddL1DepositAggregate,
+            ProvingJobCircuitType::DummyClaimL1DepositAggregate => ProvingJobCircuitType::ClaimL1DepositAggregate,
+            ProvingJobCircuitType::DummyAddL1WithdrawalAggregate => ProvingJobCircuitType::AddL1WithdrawalAggregate,
+            ProvingJobCircuitType::DummyProcessL1WithdrawalAggregate => ProvingJobCircuitType::ProcessL1WithdrawalAggregate,
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate => ProvingJobCircuitType::BatchUpdateContractsAggregate,
             _ => self.circuit_type,
         };
         Self {
@@ -1046,5 +1085,34 @@ impl KVQSerializable for QProvingJobDataID {
 
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         QProvingJobDataID::try_from_byte_vec(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProvingJobCircuitType, QJobTopic};
+
+    #[test]
+    fn decodes_node_circuit_types_from_worker_backup() {
+        let expected = [
+            (22, ProvingJobCircuitType::BatchUpdateContracts),
+            (23, ProvingJobCircuitType::BatchUpdateContractsAggregate),
+            (37, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition),
+            (57, ProvingJobCircuitType::GUTATwoGUTALinear),
+            (58, ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint),
+            (59, ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint),
+            (60, ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint),
+            (61, ProvingJobCircuitType::DummyBatchUpdateContractsAggregate),
+            (254, ProvingJobCircuitType::Invalid),
+        ];
+
+        for (encoded, circuit_type) in expected {
+            assert_eq!(ProvingJobCircuitType::try_from(encoded).unwrap(), circuit_type);
+        }
+    }
+
+    #[test]
+    fn decodes_node_invalid_job_topic_sentinel() {
+        assert_eq!(QJobTopic::try_from(254).unwrap(), QJobTopic::Invalid);
     }
 }
