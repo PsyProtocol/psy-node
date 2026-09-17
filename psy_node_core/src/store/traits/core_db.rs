@@ -600,6 +600,14 @@ pub trait CoreDatabaseZeroIdMerkleDumpReader<
         max_checkpoint_id: u64,
         strategy: MerkleTreeDumpStrategy,
     ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>>;
+    async fn db_dump_zero_id_merkle_node_leaves_range(
+        &self,
+        table: &TableIdentifier,
+        max_checkpoint_id: u64,
+        start_index: u64,
+        end_index: u64,
+    ) -> anyhow::Result<HashMap<u64, Hash>>;
+
     /*
     async fn dump_all_zero_id_merkle_node_leaves_chunked<
         F: Send + Sync + FnMut(Vec<(u64, Hash)>) -> Fut,

@@ -21,7 +21,7 @@ use parth_core::{
         serializable::QPDSerializable,
     },
     felt::ToU64Value,
-    protocol::core_types::QNetworkDatabaseTypes,
+    protocol::core_types::{Q256BitHash, QNetworkDatabaseTypes},
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::{
@@ -41,7 +41,8 @@ use crate::{
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF,
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_VALIDATOR_TREE_PREIMAGE_BASE,
             LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE,
-            U64_SINGLETON_TABLE_OBJ_ID_BRIDGE_DEPOSIT_NEXT_INDEX_BASE, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID,
+            U64_SINGLETON_TABLE_OBJ_ID_BRIDGE_DEPOSIT_NEXT_INDEX_BASE, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID,
+            U64_SINGLETON_TABLE_OBJ_ID_GENESIS_COMPLETE, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID,
         },
         traits::full::*,
     },
@@ -375,6 +376,13 @@ impl<
             Some(id) => Ok(id),
             None => Ok(0),
         }
+    }
+    pub async fn get_genesis_complete(&self) -> anyhow::Result<bool> {
+        let v = self
+            .store
+            .db_select_u64_value(&self.u64_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_GENESIS_COMPLETE)
+            .await?;
+        Ok(v == Some(1))
     }
     pub async fn get_latest_pending_id(&self) -> anyhow::Result<u64> {
         let v = self
@@ -888,6 +896,24 @@ impl<
             )
             .await
     }
+
+    async fn validator_tree_get_leaf_preimages(
+        &self,
+        checkpoint_id: u64,
+        leaf_indexes: &[u64],
+    ) -> anyhow::Result<Vec<Option<ValidatorLeafPreimage>>> {
+        let obj_ids = leaf_indexes
+            .iter()
+            .map(|leaf_index| validator_tree_preimage_obj_id(*leaf_index))
+            .collect::<anyhow::Result<Vec<u64>>>()?;
+        self.store
+            .db_select_many_single_checkpointed_object_values::<ValidatorLeafPreimage>(
+                &self.checkpointed_object_table,
+                &obj_ids,
+                checkpoint_id,
+            )
+            .await
+    }
 }
 
 #[async_trait]
@@ -1101,6 +1127,25 @@ impl<
             .db_dump_all_zero_id_merkle_node_leaves_chunked(&self.global_user_tree_table, checkpoint_id)
             .await
     }
+    async fn global_user_tree_dump_leaves_range(
+        &self,
+        checkpoint_id: u64,
+        min_user_id_inclusive: u64,
+        max_user_id_exclusive: u64,
+    ) -> anyhow::Result<HashMap<u64, N::QHash>> {
+        if min_user_id_inclusive >= max_user_id_exclusive {
+            return Ok(HashMap::new());
+        }
+        self.store
+            .db_dump_zero_id_merkle_node_leaves_range(
+                &self.global_user_tree_table,
+                checkpoint_id,
+                min_user_id_inclusive,
+                max_user_id_exclusive - 1,
+            )
+            .await
+    }
+
 
     async fn global_user_tree_get_node_and_checkpoint_id_max_checkpoint(
         &self,
@@ -2197,6 +2242,10 @@ impl<
         self.get_latest_checkpoint_id().await
     }
 
+    async fn get_genesis_complete(&self) -> anyhow::Result<bool> {
+        self.get_genesis_complete().await
+    }
+
     async fn get_checkpoint_id_for_checkpoint_root_hash(&self, root_hash: N::QHash) -> anyhow::Result<Option<u64>> {
         self.store
             .db_select_one_by_k1::<N::QHash, u64>(&self.checkpoint_root_to_checkpoint_id_table, &root_hash)
@@ -2303,6 +2352,7 @@ impl<
             .db_select_u64_value(&self.pending_id_to_checkpoint_id_table, unique_pending_id)
             .await
     }
+
     async fn get_proc_checkpoint_unique_id_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<Option<QCoreProcCheckpointUniqueId>> {
         self.store
             .db_select_one_u128_value_by_u64(&self.pending_id_to_pending_proc_id_table, unique_pending_id)
@@ -2709,6 +2759,12 @@ impl<
     async fn set_latest_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<()> {
         self.store
             .db_set_u64_value(&self.u64_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, checkpoint_id)
+            .await
+    }
+
+    async fn set_genesis_complete(&self) -> anyhow::Result<()> {
+        self.store
+            .db_set_u64_value(&self.u64_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_GENESIS_COMPLETE, 1)
             .await
     }
 

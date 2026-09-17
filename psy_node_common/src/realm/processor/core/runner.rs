@@ -1,7 +1,7 @@
 
 use cf_utils::log_indicator::print_cf_log_indicator;
 use parth_core::{
-    crypto::hash::traits::HashTo4Felts,
+    crypto::hash::traits::{HashTo4Felts, MerkleZeroHasher},
     felt::ToU64Value,
     protocol::core_types::QNetworkTypesConfig,
 };
@@ -15,11 +15,30 @@ use psy_node_core::{
 };
 use tokio::time::sleep;
 
-use crate::{p2p::guta_submit::GutaSubmitError, realm::processor::core::PsyRealmProcessor};
+use crate::{p2p::guta_submit::GutaSubmitError, queue::gatherer::GathererChannelClosed, realm::processor::core::PsyRealmProcessor, utils::processor_status::ProcessorStatus};
+
+async fn join_gatherer(
+    handle: &mut Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    status: &ProcessorStatus,
+) -> anyhow::Result<bool> {
+    let handle = handle.take().ok_or_else(|| anyhow::anyhow!("GUTA gatherer handle missing"))?;
+    match handle.await {
+        Ok(result) => result?,
+        Err(error) if error.is_cancelled() && matches!(status.state(), crate::utils::processor_status::ProcessorState::Stopping | crate::utils::processor_status::ProcessorState::Stopped) => return Ok(false),
+        Err(error) => return Err(anyhow::Error::new(error).context("GUTA gatherer task failed")),
+    }
+    Ok(status.should_run())
+}
+
+fn report_processor_failure(realm_id: u64, realm_sub_id: u64, error: &anyhow::Error) {
+    let cause = format!("{error:#}").replace('\\', "\\\\").replace('\r', "\\r").replace('\n', "\\n");
+    eprintln!("realm_processor_failure realm_id={realm_id} realm_sub_id={realm_sub_id} error={cause}");
+    print_cf_log_indicator("PSY_REALM_PROCESSOR_ERROR", &format!("R{}_{}", realm_id, realm_sub_id));
+}
 
 pub async fn run_realm_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
     STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
     GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
@@ -41,7 +60,9 @@ pub async fn run_realm_processor_loop<
     >,
 ) -> anyhow::Result<()>
 where
-    N: 'static, FileSystem::File: Send + Sync + 'static,
+    N: 'static,
+    N::HasherBase: MerkleZeroHasher<N::QHash>,
+    FileSystem::File: Send + Sync + 'static,
 {
     let realm_id = processor.db.state.realm_id_u64;
     let realm_sub_id = processor.db.state.realm_sub_id_u64;
@@ -50,7 +71,13 @@ where
 
     let mut last_slot: u128 = 0;
 
+    let result: anyhow::Result<()> = async {
     loop {
+        if processor.guta_gatherer_join.as_ref().is_some_and(|handle| handle.is_finished()) {
+            if join_gatherer(&mut processor.guta_gatherer_join, &processor.db.status).await? {
+                processor.run_init_catchup().await?;
+            }
+        }
         if processor.db.status.should_run() {
             // tracing::debug!("[REALM] Sync and verify starting...");
             let sync_result = processor.sync_and_verify().await;
@@ -84,6 +111,12 @@ where
                         tracing::info!("Generated GUTA Realm update in {}ms at slot {}", duration_ms, current_slot);
                     }
                     Err(e) => {
+                        if e.downcast_ref::<GathererChannelClosed>().is_some() {
+                            if join_gatherer(&mut processor.guta_gatherer_join, &processor.db.status).await? {
+                                processor.run_init_catchup().await?;
+                            }
+                            continue;
+                        }
                         if e.downcast_ref::<GutaSubmitError>().is_some_and(|submit| submit.is_retryable()) {
                             tracing::warn!(
                                 "[REALM] Retryable process_block rejection at slot {} after {}ms: {:#}",
@@ -99,10 +132,21 @@ where
                                 );
                             }
                         } else {
-                            let error = format!("realm process_block failed at slot {}: {:#}", current_slot, e);
-                            processor.db.status.require_recovery(error.clone());
-                            tracing::error!("[REALM] Fatal error processing block: {:?}, took {}ms at slot {}; processor parked in Error state until manually restarted", e, duration_ms, current_slot);
-                            print_cf_log_indicator("PSY_REALM_PROCESSOR_ERROR", &format!("R{}_{}", realm_id, realm_sub_id));
+                            tracing::error!(
+                                "[REALM] Fatal error processing block: {:?}, took {}ms at slot {}; aborting gatherer and re-entering init catch-up",
+                                e,
+                                duration_ms,
+                                current_slot
+                            );
+                            report_processor_failure(realm_id, realm_sub_id, &e);
+                            if let Err(error) = processor.run_init_catchup().await {
+                                tracing::error!(
+                                    "init catch-up after fatal process_block failed sub_id={} error={:#}",
+                                    realm_sub_id,
+                                    error
+                                );
+                                sleep(std::time::Duration::from_secs(5)).await;
+                            }
                         }
                     }
                 }
@@ -116,10 +160,17 @@ where
             break;
         }
     }
+    processor.abort_production_gatherer().await;
     processor.db.status.mark_stopped();
     print_cf_log_indicator("PSY_REALM_PROCESSOR_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     Ok(())
+    }.await;
+    if let Err(error) = &result {
+        processor.db.status.require_recovery(format!("{error:#}"));
+        report_processor_failure(realm_id, realm_sub_id, error);
+    }
+    result
 }
 pub async fn run_realm_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -143,10 +194,10 @@ pub async fn run_realm_processor<
         FileSystem,
         CoordinatorClient,
     >,
-    guta_gatherer_join_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
 ) -> anyhow::Result<()>
 where
     N: 'static,
+    N::HasherBase: MerkleZeroHasher<N::QHash>,
     FileSystem::File: Send + Sync + 'static,
 {
     let status = processor.db.status.clone();
@@ -158,52 +209,77 @@ where
             sleep(std::time::Duration::from_secs(5)).await;
             Ok(())
         }
-        result = async {
-            let mut tasks: Vec<(&'static str, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> = vec![
-                ("realm processor", tokio::spawn(run_realm_processor_loop(processor))),
-                ("GUTA gatherer", guta_gatherer_join_handle),
-            ];
-
-            // Observe tasks directly. The first failure marks the processor
-            // status Error, aborts and joins only the still-running tasks so
-            // no live mutation is left detached, and returns the original
-            // error. Completed entries are removed before cleanup so a
-            // finished handle is never awaited twice.
-            let outcome = loop {
-                if tasks.is_empty() {
-                    break Ok::<(), anyhow::Error>(());
-                }
-                let boxed: Vec<_> = tasks
-                    .iter_mut()
-                    .map(|(name, handle)| Box::pin(async move { (*name, handle.await) }))
-                    .collect();
-                let ((name, completion), index, rest) = futures::future::select_all(boxed).await;
-                drop(rest);
-                tasks.swap_remove(index);
-                let error = match completion {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(error)) => error,
-                    Err(join_error) => anyhow::Error::new(join_error).context(format!("{name} task panicked")),
-                };
-                status.require_recovery(format!("{name} failed: {error:#}"));
-                for (name, handle) in tasks.iter_mut() {
-                    handle.abort();
-                    match handle.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => tracing::error!("{} task failed during cleanup: {:#}", *name, error),
-                        Err(join_error) if !join_error.is_cancelled() => {
-                            tracing::error!("{} task join error during cleanup: {}", *name, join_error);
-                        }
-                        Err(_) => {}
-                    }
-                }
-                break Err(error);
-            };
-            outcome
-        } => {
+        result = run_realm_processor_loop(processor) => {
             result?;
             tracing::info!("All realm processor threads completed");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("validator preimage mismatch")]
+    struct ProofFailure;
+
+    #[tokio::test]
+    async fn channel_close_waits_for_owner_and_preserves_failure_during_shutdown() {
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut handle = Some(tokio::spawn(async move {
+            drop(closed_tx);
+            release_rx.await.unwrap();
+            Err(anyhow::Error::new(ProofFailure).context("gatherer bootstrap"))
+        }));
+        closed_rx.await.unwrap_err();
+        assert!(!handle.as_ref().unwrap().is_finished());
+        status.begin_shutdown();
+        let mut joined = Box::pin(join_gatherer(&mut handle, &status));
+        tokio::select! {
+            biased;
+            result = &mut joined => panic!("owner has not exited: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        release_tx.send(()).unwrap();
+        let error = joined.await.unwrap_err();
+        assert!(error.downcast_ref::<ProofFailure>().is_some());
+        assert!(handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn clean_owner_exit_rebuilds_only_while_running() {
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        let mut handle = Some(tokio::spawn(async { Ok(()) }));
+        assert!(join_gatherer(&mut handle, &status).await.unwrap());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task_status = status.clone();
+        let mut handle = Some(tokio::spawn(async move {
+            release_rx.await.unwrap();
+            task_status.begin_shutdown();
+            Ok(())
+        }));
+        release_tx.send(()).unwrap();
+        assert!(!join_gatherer(&mut handle, &status).await.unwrap());
+        assert_eq!(status.state(), crate::utils::processor_status::ProcessorState::Stopping);
+        assert!(status.error().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_owner_is_expected_only_during_shutdown() {
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        let task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        task.abort();
+        assert!(join_gatherer(&mut Some(task), &status).await.unwrap_err().downcast_ref::<tokio::task::JoinError>().unwrap().is_cancelled());
+        status.begin_shutdown();
+        let task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        task.abort();
+        assert!(!join_gatherer(&mut Some(task), &status).await.unwrap());
     }
 }

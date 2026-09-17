@@ -89,7 +89,7 @@ PURGE=1 make shutdown
 make run-all
 ```
 
-Keep `make run-all` in the foreground; it intentionally remains alive as the service supervisor (`Makefile:63-66`, `dev/locSetupV4.ts:5630-5635`). Run readiness checks and every later command from a second terminal whose current directory is `<repo-root>`. Do not background or abandon the supervisor. The supervisor truncates the relayer logs for this initial launch (`dev/locSetupV4.ts:649-658,4542-4549`), so the marker below belongs to the current process. Do not continue until all checks below succeed:
+Keep `make run-all` in the foreground; it intentionally remains alive as the service supervisor (`Makefile:64-67`, `dev/locSetupV4.ts:5630-5635`). Run readiness checks and every later command from a second terminal whose current directory is `<repo-root>`. Do not background or abandon the supervisor. The supervisor truncates the relayer logs for this initial launch (`dev/locSetupV4.ts:649-658,4542-4549`), so the marker below belongs to the current process. Do not continue until all checks below succeed:
 
 ```bash
 curl -fsS http://127.0.0.1:3000/health
@@ -484,7 +484,7 @@ rm -rf "$RESULT_DIR"
 make shutdown
 ```
 
-Do not manually kill individual services. A non-purge restart can separate L1 and L2 state; the walkthrough sections “33.10 locSetupV4 auto-restart timing” and “33.11 Non-purge devnet restart tears L1/L2 state apart” explain why routine cleanup uses `make shutdown` before the next `make run-all`.
+Do not manually kill individual services. A non-purge restart can separate L1 and L2 state; the walkthrough sections “33.10 locSetupV4 auto-restart timing” and “33.11 Non-purge devnet restart tears L1/L2 state apart” explain why. Routine cleanup uses `make shutdown`, which purges the paired L1/L2 state by default (`PURGE ?= 1` in the Makefile), before the next `make run-all`; use `PURGE=0 make shutdown` only when the paired chain state must survive the cleanup.
 
 ## 16. Source and Walkthrough References
 

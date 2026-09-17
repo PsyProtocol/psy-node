@@ -96,8 +96,8 @@ struct PsyFaucetService {
     // Same-operator mutual exclusion is handled by `operator_locks` below.
     wallet_session: Arc<WalletSession>,
     claim_records: DashMap<(u64, u64), PsyFaucetClaimRecord>,
-    recipient_locks: DashSet<u64>,
-    operator_locks: DashSet<u64>,
+    recipient_locks: Arc<dashmap::DashSet<u64>>,
+    operator_locks: Arc<dashmap::DashSet<u64>>,
     window_checkpoints: u64,
     turnstile_secret: Option<String>,
     require_turnstile: bool,
@@ -259,8 +259,8 @@ impl PsyFaucetService {
             operators,
             wallet_session: Arc::new(wallet_session),
             claim_records: DashMap::new(),
-            recipient_locks: DashSet::new(),
-            operator_locks: DashSet::new(),
+            recipient_locks: Arc::new(DashSet::new()),
+            operator_locks: Arc::new(DashSet::new()),
             window_checkpoints,
             turnstile_secret,
             require_turnstile,
@@ -339,24 +339,44 @@ impl PsyFaucetService {
         }
         Ok(())
     }
+}
 
+struct DashSetEntryGuard<T: Copy + Eq + std::hash::Hash>(Arc<dashmap::DashSet<T>>, T);
+
+impl<T: Copy + Eq + std::hash::Hash> Drop for DashSetEntryGuard<T> {
+    fn drop(&mut self) {
+        self.0.remove(&self.1);
+    }
+}
+
+impl PsyFaucetService {
     // Turnstile-gated entry, used by the public web frontend and the hosted
     // wallet verification page.
-    async fn claim(&self, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
+    async fn claim(self: &Arc<Self>, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
         self.verify_turnstile(input.turnstile_token.as_deref(), input.turnstile_state.as_deref())
             .await?;
         self.claim_for_recipient(input).await
     }
 
-    async fn claim_for_recipient(&self, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
+    async fn claim_for_recipient(self: &Arc<Self>, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
         let recipient_user_id = input.recipient_user_id;
-        if self.recipient_locks.insert(recipient_user_id) {
-            let result = self.claim_locked(input).await;
-            self.recipient_locks.remove(&recipient_user_id);
-            result
-        } else {
-            Err(rpc_error("faucet claim already in progress for this recipient"))
+        if !self.recipient_locks.insert(recipient_user_id) {
+            return Err(rpc_error("faucet claim already in progress for this recipient"));
         }
+        // The claim runs in a detached task that owns the lock guards: a client
+        // disconnect drops this RPC future but never the locks, so the
+        // recipient/operator mutex windows span the whole proving-and-submit
+        // work exactly once.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let worker = Arc::clone(self);
+        tokio::spawn(async move {
+            let _recipient_guard = DashSetEntryGuard(Arc::clone(&worker.recipient_locks), recipient_user_id);
+            let result = worker.claim_locked(input).await;
+            let _ = result_tx.send(result);
+        });
+        result_rx
+            .await
+            .map_err(|_| rpc_error("faucet claim task terminated"))?
     }
 
     async fn claim_locked(&self, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
@@ -400,9 +420,9 @@ impl PsyFaucetService {
                 continue;
             }
             tried_operator = true;
+            let _operator_guard = DashSetEntryGuard(Arc::clone(&self.operator_locks), operator.user_id);
 
             let submit_result = self.submit_with_operator(operator, input.recipient_user_id, amount).await;
-            self.operator_locks.remove(&operator.user_id);
 
             match submit_result {
                 Ok(tx_hash) => {

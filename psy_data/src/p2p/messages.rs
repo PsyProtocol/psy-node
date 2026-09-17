@@ -16,11 +16,11 @@ use super::codec::{
 use super::domains::{DOMAIN_END_CAP_FORWARD, DOMAIN_PROPOSAL, DOMAIN_VOTE};
 use super::error::{ProtocolError, ProtocolResult};
 use super::limits::{
-    CERTIFICATE_WIRE_BYTES, DIRECT_BODY_REQUEST_WIRE_BYTES, DIRECT_REQUEST_MAX_BYTES,
+    CERTIFICATE_WIRE_BYTES, BODY_CHUNK_REQUEST_WIRE_BYTES, BODY_CHUNK_MAX_BYTES,
     END_CAP_FORWARD_HEADER_WIRE_BYTES, END_CAP_FORWARD_RESPONSE_WIRE_BYTES, MAX_BACKUP_BYTES,
     MAX_FINALIZER_OUTPUT_BYTES, MAX_FINALIZER_PROOF_BYTES, MAX_PROPOSAL_BODY_BYTES,
-    MAX_PROPOSAL_CHUNK_BYTES, MAX_PROPOSAL_PARTS, PROPOSAL_WIRE_BYTES,
-    VOTE_WIRE_BYTES,
+    MAX_PROPOSAL_CHUNK_BYTES, MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES, MAX_PROPOSAL_PARTS,
+    PROPOSAL_WIRE_BYTES, VOTE_WIRE_BYTES,
 };
 
 /// Canonical fixed-size Realm finalizer public output (exactly 410 bytes).
@@ -606,25 +606,25 @@ pub fn bitmap_set(bitmap: &mut [u8; 32], sub_id: u16) {
 
 /// Direct proposal-body range request (exactly 44 bytes).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DirectBodyRequest {
+pub struct BodyChunkRequest {
     pub proposal_id: [u8; 32],
     pub offset: u64,
     pub max_bytes: u32,
 }
 
-impl DirectBodyRequest {
+impl BodyChunkRequest {
     /// Exact wire length (44 bytes).
-    pub const WIRE_BYTES: usize = DIRECT_BODY_REQUEST_WIRE_BYTES;
+    pub const WIRE_BYTES: usize = BODY_CHUNK_REQUEST_WIRE_BYTES;
 
     pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
         let proposal_id = reader.read_bytes_32()?;
         let offset = reader.read_u64()?;
         let max_bytes = reader.read_u32()?;
-        if max_bytes == 0 || max_bytes > DIRECT_REQUEST_MAX_BYTES {
+        if max_bytes == 0 || max_bytes > BODY_CHUNK_MAX_BYTES {
             return Err(ProtocolError::LengthLimit {
-                what: "DirectBodyRequest.max_bytes",
+                what: "BodyChunkRequest.max_bytes",
                 got: max_bytes as u64,
-                max: DIRECT_REQUEST_MAX_BYTES as u64,
+                max: BODY_CHUNK_MAX_BYTES as u64,
             });
         }
         Ok(Self {
@@ -639,7 +639,7 @@ impl DirectBodyRequest {
     }
 }
 
-impl ProtocolEncode for DirectBodyRequest {
+impl ProtocolEncode for BodyChunkRequest {
     fn protocol_encode(&self, out: &mut Vec<u8>) {
         write_fixed(out, &self.proposal_id);
         write_u64(out, self.offset);
@@ -649,7 +649,7 @@ impl ProtocolEncode for DirectBodyRequest {
 
 /// Direct proposal-body range response (`53 + data.len()` bytes).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DirectBodyResponse {
+pub struct BodyChunkResponse {
     pub offset: u64,
     pub data: Vec<u8>,
     pub eof: bool,
@@ -657,15 +657,15 @@ pub struct DirectBodyResponse {
     pub body_hash: [u8; 32],
 }
 
-impl DirectBodyResponse {
+impl BodyChunkResponse {
     pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
         let offset = reader.read_u64()?;
-        let data = reader.read_bytes_u32("DirectBodyResponse.data", DIRECT_REQUEST_MAX_BYTES)?;
+        let data = reader.read_bytes_u32("BodyChunkResponse.data", BODY_CHUNK_MAX_BYTES)?;
         let eof = reader.read_bool()?;
         let body_len = reader.read_u64()?;
         if body_len > MAX_PROPOSAL_BODY_BYTES as u64 {
             return Err(ProtocolError::LengthLimit {
-                what: "DirectBodyResponse.body_len",
+                what: "BodyChunkResponse.body_len",
                 got: body_len,
                 max: MAX_PROPOSAL_BODY_BYTES as u64,
             });
@@ -685,13 +685,195 @@ impl DirectBodyResponse {
     }
 }
 
-impl ProtocolEncode for DirectBodyResponse {
+impl ProtocolEncode for BodyChunkResponse {
     fn protocol_encode(&self, out: &mut Vec<u8>) {
         write_u64(out, self.offset);
-        write_bytes_u32(out, &self.data).expect("DirectBodyResponse data length fits u32");
+        write_bytes_u32(out, &self.data).expect("BodyChunkResponse data length fits u32");
         write_bool(out, self.eof);
         write_u64(out, self.body_len);
         write_fixed(out, &self.body_hash);
+    }
+}
+
+pub const PROPOSAL_LOOKUP_MAX_PAIRS: usize = 256;
+pub const PROPOSAL_LOOKUP_CANDIDATES_PER_PAIR: usize = 2;
+/// chain_id(8) + realm_id(4) + pair_count(4) + pair_count * (old_root(32) + new_root(32)).
+pub const PROPOSAL_LOOKUP_REQUEST_MAX_WIRE_BYTES: usize = 16 + PROPOSAL_LOOKUP_MAX_PAIRS * 64;
+pub const PROPOSAL_LOOKUP_WINDOW_PAIRS: usize =
+    (MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES - 5) / (64 + 1 + PROPOSAL_WIRE_BYTES);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RealmTransition {
+    pub old_root: [u8; 32],
+    pub new_root: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalLookupStatus {
+    Candidates = 0,
+    Empty = 1,
+    Truncated = 2,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalLookupRequest {
+    pub chain_id: u64,
+    pub realm_id: u32,
+    pub pairs: Vec<RealmTransition>,
+}
+
+impl ProposalLookupRequest {
+    pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
+        let chain_id = reader.read_u64()?;
+        let realm_id = reader.read_u32()?;
+        let count = reader.read_u32()? as usize;
+        if count == 0 || count > PROPOSAL_LOOKUP_MAX_PAIRS {
+            return Err(ProtocolError::Message("invalid ProposalLookup pair count"));
+        }
+        if reader.remaining() < count * 64 {
+            return Err(ProtocolError::unexpected_eof("ProposalLookup pairs"));
+        }
+        let mut pairs = Vec::with_capacity(count);
+        for _ in 0..count {
+            pairs.push(RealmTransition {
+                old_root: reader.read_bytes_32()?,
+                new_root: reader.read_bytes_32()?,
+            });
+        }
+        Ok(Self { chain_id, realm_id, pairs })
+    }
+
+    pub fn decode_exact(bytes: &[u8]) -> ProtocolResult<Self> {
+        decode_exact(bytes, Self::protocol_decode)
+    }
+}
+
+impl ProtocolEncode for ProposalLookupRequest {
+    fn protocol_encode(&self, out: &mut Vec<u8>) {
+        write_u64(out, self.chain_id);
+        write_u32(out, self.realm_id);
+        write_u32(out, self.pairs.len() as u32);
+        for pair in &self.pairs {
+            write_fixed(out, &pair.old_root);
+            write_fixed(out, &pair.new_root);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalLookupEntry {
+    pub transition: RealmTransition,
+    pub candidates: Vec<Proposal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalLookupResponse {
+    pub status: ProposalLookupStatus,
+    pub entries: Vec<ProposalLookupEntry>,
+}
+
+impl ProposalLookupResponse {
+    pub fn candidates(entries: Vec<ProposalLookupEntry>) -> Self {
+        let status = if entries.iter().any(|entry| !entry.candidates.is_empty()) {
+            ProposalLookupStatus::Candidates
+        } else {
+            ProposalLookupStatus::Empty
+        };
+        Self { status, entries }
+    }
+
+    pub fn empty() -> Self {
+        Self { status: ProposalLookupStatus::Empty, entries: Vec::new() }
+    }
+
+    pub fn truncated(entries: Vec<ProposalLookupEntry>) -> Self {
+        Self { status: ProposalLookupStatus::Truncated, entries }
+    }
+
+    pub fn protocol_decode(reader: &mut ProtocolReader<'_>) -> ProtocolResult<Self> {
+        let status = match reader.read_u8()? {
+            0 => ProposalLookupStatus::Candidates,
+            1 => ProposalLookupStatus::Empty,
+            2 => ProposalLookupStatus::Truncated,
+            tag => return Err(ProtocolError::UnknownTag { ty: "ProposalLookupStatus", tag }),
+        };
+        let count = reader.read_u32()? as usize;
+        if count > PROPOSAL_LOOKUP_MAX_PAIRS {
+            return Err(ProtocolError::Message("invalid ProposalLookup entry count"));
+        }
+        if reader.remaining() < count * 65 {
+            return Err(ProtocolError::unexpected_eof("ProposalLookup entries"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut wire_bytes = 5;
+        let mut has_candidates = false;
+        for _ in 0..count {
+            let transition = RealmTransition {
+                old_root: reader.read_bytes_32()?,
+                new_root: reader.read_bytes_32()?,
+            };
+            let candidate_count = reader.read_u8()? as usize;
+            if candidate_count > PROPOSAL_LOOKUP_CANDIDATES_PER_PAIR {
+                return Err(ProtocolError::Message("invalid ProposalLookup candidate count"));
+            }
+            wire_bytes += 65 + candidate_count * PROPOSAL_WIRE_BYTES;
+            if wire_bytes > MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES {
+                return Err(ProtocolError::Message("ProposalLookup response exceeds maximum"));
+            }
+            let mut candidates = Vec::with_capacity(candidate_count);
+            for _ in 0..candidate_count {
+                candidates.push(Proposal::protocol_decode(reader)?);
+            }
+            has_candidates |= !candidates.is_empty();
+            entries.push(ProposalLookupEntry { transition, candidates });
+        }
+        if (status == ProposalLookupStatus::Candidates && !has_candidates)
+            || (status == ProposalLookupStatus::Empty && has_candidates)
+        {
+            return Err(ProtocolError::Message("non-canonical ProposalLookup status"));
+        }
+        Ok(Self { status, entries })
+    }
+
+    pub fn decode_exact(bytes: &[u8]) -> ProtocolResult<Self> {
+        if bytes.len() > MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES {
+            return Err(ProtocolError::LengthLimit {
+                what: "ProposalLookupResponse",
+                got: bytes.len() as u64,
+                max: MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES as u64,
+            });
+        }
+        decode_exact(bytes, Self::protocol_decode)
+    }
+}
+
+impl ProtocolEncode for ProposalLookupResponse {
+    fn protocol_encode(&self, out: &mut Vec<u8>) {
+        let mut wire_bytes = 5;
+        let mut count = 0;
+        for entry in self.entries.iter().take(PROPOSAL_LOOKUP_MAX_PAIRS) {
+            let entry_bytes = 65 + entry.candidates.len() * PROPOSAL_WIRE_BYTES;
+            if wire_bytes + entry_bytes > MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES {
+                break;
+            }
+            wire_bytes += entry_bytes;
+            count += 1;
+        }
+        let status = if count < self.entries.len() {
+            ProposalLookupStatus::Truncated
+        } else {
+            self.status
+        };
+        write_u8(out, status as u8);
+        write_u32(out, count as u32);
+        for entry in &self.entries[..count] {
+            write_fixed(out, &entry.transition.old_root);
+            write_fixed(out, &entry.transition.new_root);
+            write_u8(out, entry.candidates.len() as u8);
+            for candidate in &entry.candidates {
+                candidate.protocol_encode(out);
+            }
+        }
     }
 }
 
@@ -890,10 +1072,11 @@ mod tests {
     use super::super::domains::{DOMAIN_END_CAP_FORWARD, DOMAIN_PROPOSAL};
     use super::super::codec::{sha256, validate_hash32_canonical, write_fixed, write_u16, write_u32, write_u64, GOLDILOCKS_MODULUS};
     use super::super::limits::{
-        CERTIFICATE_WIRE_BYTES, DIRECT_BODY_REQUEST_WIRE_BYTES, DIRECT_REQUEST_MAX_BYTES,
-        END_CAP_FORWARD_HEADER_WIRE_BYTES, MAX_BACKUP_BYTES, MAX_FINALIZER_OUTPUT_BYTES,
-        MAX_FINALIZER_PROOF_BYTES, MAX_PROPOSAL_BODY_BYTES, MAX_PROPOSAL_CHUNK_BYTES,
-        MAX_PROPOSAL_PARTS, PROPOSAL_WIRE_BYTES, VOTE_WIRE_BYTES,
+        CERTIFICATE_WIRE_BYTES, BODY_CHUNK_REQUEST_WIRE_BYTES, BODY_CHUNK_MAX_BYTES,
+        END_CAP_FORWARD_HEADER_WIRE_BYTES, END_CAP_FORWARD_RESPONSE_WIRE_BYTES, MAX_BACKUP_BYTES,
+        MAX_FINALIZER_OUTPUT_BYTES, MAX_FINALIZER_PROOF_BYTES, MAX_PROPOSAL_BODY_BYTES,
+        MAX_PROPOSAL_CHUNK_BYTES, MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES, MAX_PROPOSAL_PARTS,
+        PROPOSAL_WIRE_BYTES, VOTE_WIRE_BYTES,
     };
 
     use psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET as NETWORK_MAGIC;
@@ -1230,31 +1413,31 @@ mod tests {
     }
 
     #[test]
-    fn direct_body_roundtrip() {
+    fn body_chunk_roundtrip() {
         let p = sample_proposal();
-        let req = DirectBodyRequest {
+        let req = BodyChunkRequest {
             proposal_id: p.proposal_id,
             offset: 0,
-            max_bytes: DIRECT_REQUEST_MAX_BYTES,
+            max_bytes: BODY_CHUNK_MAX_BYTES,
         };
         let enc = req.protocol_encode_to_vec();
-        assert_eq!(enc.len(), DIRECT_BODY_REQUEST_WIRE_BYTES);
+        assert_eq!(enc.len(), BODY_CHUNK_REQUEST_WIRE_BYTES);
         assert_eq!(enc.len(), 44);
-        assert_eq!(DirectBodyRequest::decode_exact(&enc).unwrap(), req);
-        let zero_max = DirectBodyRequest {
+        assert_eq!(BodyChunkRequest::decode_exact(&enc).unwrap(), req);
+        let zero_max = BodyChunkRequest {
             proposal_id: p.proposal_id,
             offset: 0,
             max_bytes: 0,
         };
-        assert!(DirectBodyRequest::decode_exact(&zero_max.protocol_encode_to_vec()).is_err());
-        let over_max = DirectBodyRequest {
+        assert!(BodyChunkRequest::decode_exact(&zero_max.protocol_encode_to_vec()).is_err());
+        let over_max = BodyChunkRequest {
             proposal_id: p.proposal_id,
             offset: 0,
-            max_bytes: DIRECT_REQUEST_MAX_BYTES + 1,
+            max_bytes: BODY_CHUNK_MAX_BYTES + 1,
         };
-        assert!(DirectBodyRequest::decode_exact(&over_max.protocol_encode_to_vec()).is_err());
+        assert!(BodyChunkRequest::decode_exact(&over_max.protocol_encode_to_vec()).is_err());
 
-        let resp = DirectBodyResponse {
+        let resp = BodyChunkResponse {
             offset: 0,
             data: vec![9u8; 32],
             eof: true,
@@ -1263,7 +1446,7 @@ mod tests {
         };
         let renc = resp.protocol_encode_to_vec();
         assert_eq!(renc.len(), 53 + 32);
-        assert_eq!(DirectBodyResponse::decode_exact(&renc).unwrap(), resp);
+        assert_eq!(BodyChunkResponse::decode_exact(&renc).unwrap(), resp);
 
     }
 
@@ -1287,5 +1470,126 @@ mod tests {
         assert_ne!(id, compute_end_cap_id(NETWORK_MAGIC, 2, 4, &input_hash, &proof_hash));
         assert_ne!(id, compute_end_cap_id(NETWORK_MAGIC, 2, 3, &proof_hash, &input_hash));
         assert_ne!(id, compute_end_cap_id(NETWORK_MAGIC ^ (1u64 << 32), 2, 3, &input_hash, &proof_hash));
+    }
+
+    #[test]
+    fn history_wire_regression() {
+        let proposal = sample_proposal();
+        assert_eq!(proposal.protocol_encode_to_vec().len(), 214);
+        let vote = Vote::new(proposal.proposal_id, 1, BlsSecretKey::key_gen(&[1u8; 32]).unwrap().sign_vote(&vote_message(
+            NETWORK_MAGIC, 2, &proposal.validator_tree_root, &proposal.proposal_id,
+        )));
+        assert_eq!(vote.protocol_encode_to_vec().len(), 130);
+        let cert = Certificate {
+            chain_id: NETWORK_MAGIC,
+            realm_id: 2,
+            validator_tree_root: proposal.validator_tree_root,
+            proposal_id: proposal.proposal_id,
+            signer_bitmap: [0u8; 32],
+            aggregated_signature: BlsSecretKey::key_gen(&[1u8; 32]).unwrap().sign_vote(&[0u8; 8]),
+        };
+        assert_eq!(cert.protocol_encode_to_vec().len(), 204);
+        assert_eq!(END_CAP_FORWARD_HEADER_WIRE_BYTES, 60);
+        assert_eq!(END_CAP_FORWARD_RESPONSE_WIRE_BYTES, 18);
+        let body = encode_proposal_body(
+            &vec![0u8; MAX_FINALIZER_OUTPUT_BYTES],
+            &[0u8; 1],
+            &[0u8; 1],
+            &[0x11u8; 32],
+        ).unwrap();
+        assert_eq!(&body[body.len() - 32..], &[0x11u8; 32]);
+        let proposal_bytes = proposal.protocol_encode_to_vec();
+        assert!(Proposal::decode_exact(&proposal_bytes[..213]).is_err());
+        assert!(Vote::decode_exact(&vote.protocol_encode_to_vec()[..129]).is_err());
+        assert!(Certificate::decode_exact(&cert.protocol_encode_to_vec()[..203]).is_err());
+    }
+
+}
+
+#[cfg(test)]
+mod proposal_lookup_tests {
+    use super::*;
+
+    fn pair(index: u8) -> RealmTransition {
+        RealmTransition { old_root: [index; 32], new_root: [index.wrapping_add(1); 32] }
+    }
+
+    fn entries(count: usize, candidates: usize) -> Vec<ProposalLookupEntry> {
+        let proposal = proposal_from_parts(1, 2, 3, 0, [1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        (0..count).map(|index| ProposalLookupEntry {
+            transition: pair(index as u8),
+            candidates: vec![proposal.clone(); candidates],
+        }).collect()
+    }
+
+    #[test]
+    fn request_window_bounds_and_canonical_length() {
+        let mut request = ProposalLookupRequest {
+            chain_id: 1, realm_id: 2,
+            pairs: (0..PROPOSAL_LOOKUP_MAX_PAIRS).map(|index| pair(index as u8)).collect(),
+        };
+        let bytes = request.protocol_encode_to_vec();
+        assert_eq!(bytes.len(), 16 + 256 * 64);
+        assert_eq!(bytes.len(), PROPOSAL_LOOKUP_REQUEST_MAX_WIRE_BYTES);
+        assert_eq!(ProposalLookupRequest::decode_exact(&bytes).unwrap(), request);
+        assert!(ProposalLookupRequest::decode_exact(&bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(ProposalLookupRequest::decode_exact(&trailing).is_err());
+        for count in [0u32, 257, u32::MAX] {
+            let mut invalid = bytes.clone();
+            invalid[12..16].copy_from_slice(&count.to_le_bytes());
+            assert!(ProposalLookupRequest::decode_exact(&invalid).is_err());
+        }
+        request.pairs.truncate(1);
+        assert_eq!(request.protocol_encode_to_vec().len(), 80);
+        assert_eq!(ProposalLookupRequest::decode_exact(&request.protocol_encode_to_vec()).unwrap(), request);
+    }
+
+    #[test]
+    fn response_budget_preserves_complete_prefix() {
+        assert_eq!(PROPOSAL_LOOKUP_WINDOW_PAIRS, 58);
+        let response = ProposalLookupResponse::candidates(entries(PROPOSAL_LOOKUP_WINDOW_PAIRS, 1));
+        let bytes = response.protocol_encode_to_vec();
+        assert_eq!(bytes.len(), 5 + 58 * (65 + PROPOSAL_WIRE_BYTES));
+        assert!(bytes.len() <= MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES);
+        assert_eq!(ProposalLookupResponse::decode_exact(&bytes).unwrap(), response);
+        for candidate_count in [0, 1, 2] {
+            let response = ProposalLookupResponse::candidates(entries(256, candidate_count));
+            let bytes = response.protocol_encode_to_vec();
+            assert!(bytes.len() <= MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES);
+            let decoded = ProposalLookupResponse::decode_exact(&bytes).unwrap();
+            assert_eq!(decoded.status, ProposalLookupStatus::Truncated);
+            let count = (MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES - 5) / (65 + candidate_count * PROPOSAL_WIRE_BYTES);
+            assert_eq!(decoded.entries, response.entries[..count]);
+        }
+    }
+
+    #[test]
+    fn response_rejects_invalid_counts_status_and_suffixes() {
+        let response = ProposalLookupResponse::candidates(entries(1, 2));
+        let bytes = response.protocol_encode_to_vec();
+        assert_eq!(ProposalLookupResponse::decode_exact(&bytes).unwrap(), response);
+        for status in [1, 3, 255] {
+            let mut invalid = bytes.clone();
+            invalid[0] = status;
+            assert!(ProposalLookupResponse::decode_exact(&invalid).is_err());
+        }
+        let mut invalid = bytes.clone();
+        invalid[69] = 3;
+        assert!(ProposalLookupResponse::decode_exact(&invalid).is_err());
+        invalid = bytes.clone();
+        invalid[1..5].copy_from_slice(&257u32.to_le_bytes());
+        assert!(ProposalLookupResponse::decode_exact(&invalid).is_err());
+        assert!(ProposalLookupResponse::decode_exact(&bytes[..bytes.len() - 1]).is_err());
+        invalid = bytes;
+        invalid.push(0);
+        assert!(ProposalLookupResponse::decode_exact(&invalid).is_err());
+        for response in [ProposalLookupResponse::empty(), ProposalLookupResponse::truncated(Vec::new()), ProposalLookupResponse::candidates(entries(1, 0))] {
+            assert_eq!(ProposalLookupResponse::decode_exact(&response.protocol_encode_to_vec()).unwrap(), response);
+        }
+        let mut invalid = ProposalLookupResponse::empty().protocol_encode_to_vec();
+        invalid[0] = ProposalLookupStatus::Candidates as u8;
+        assert!(ProposalLookupResponse::decode_exact(&invalid).is_err());
     }
 }

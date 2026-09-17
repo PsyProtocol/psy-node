@@ -4,6 +4,8 @@ use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher}, store::traits::proof_store::QParthProofStore
 };
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 
 use crate::{
@@ -67,11 +69,11 @@ pub struct PsyRealmProcessor<
     /// Local validator BLS secret key used to sign the processor's own Vote.
     /// Required when P2P is enabled; `set_realm_p2p` wires it.
     pub bls_secret: Option<psy_data::p2p::BlsSecretKey>,
-    pub proposal_rx: Option<mpsc::Receiver<crate::realm::network::ProposalWithBody>>,
-    /// Unresolved complete bodies remain owned here until commit and gatherer fast-forward succeed.
-    /// No eviction: memory use grows with distinct unresolved proposal IDs.
-    pub proposals: std::collections::BTreeMap<[u8; 32], crate::realm::network::ProposalWithBody>,
-
-
-
+    pub proposal_store: std::sync::Arc<crate::realm::processor::proposal_store::ProposalStore>,
+    pub baseline_replay_rx: Option<
+        mpsc::Receiver<crate::realm::processor::recovery::BaselineReplayRequest<N::QHash>>,
+    >,
+    pub file_system: Arc<FileSystem>,
+    pub guta_gatherer_backup_directory: String,
+    pub guta_gatherer_join: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>,
 }

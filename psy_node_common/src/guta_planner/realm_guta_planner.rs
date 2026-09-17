@@ -27,6 +27,7 @@ use psy_data::{
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::{
         checkpoint::{PQEDCheckpointLeaf, PQEDCheckpointLeafCompactWithStateRoots},
+        ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF,
         user::PQEDUserLeaf,
     },
     worker::{
@@ -93,6 +94,7 @@ pub struct RealmGUTAPlanner<F, Hash> {
     pub user_contract_tree_updates_ffs: Vec<u8>,
     pub contract_state_tree_updates_ffs: Vec<u8>,
     pub user_leaf_updates_ffs: Vec<u8>,
+    user_leaf_update_offsets: HashMap<u64, usize>,
     /// IMT (Indexed Merkle Tree) leaf preimage data for contract state trees.
     /// Accumulated from end cap submissions.
     pub contract_state_imt_leaves_ffs: Vec<u8>,
@@ -141,6 +143,7 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
             user_contract_tree_updates_ffs: Vec::new(),
             contract_state_tree_updates_ffs: Vec::new(),
             user_leaf_updates_ffs: Vec::new(),
+            user_leaf_update_offsets: HashMap::new(),
             contract_state_imt_leaves_ffs: Vec::new(),
             current_checkpoint_root,
             current_checkpoint_id,
@@ -162,7 +165,6 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
         }
     }
 
-
     pub fn set_validator_proofs(&mut self, proofs: RealmGUTAValidatorProofs<F, Hash>) -> anyhow::Result<()>
     where
         F: ToU64Value,
@@ -179,6 +181,34 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
 
 
 impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
+    fn update_user_leaf(&mut self, user_leaf: &PQEDUserLeaf<F, Hash>) -> anyhow::Result<()> {
+        let user_id = user_leaf.user_id.to_u64_value();
+        let user_leaf_bytes = user_leaf.psy_ser_to_bytes_vec()?;
+        anyhow::ensure!(
+            user_leaf_bytes.len() == PSY_OBJECT_FFS_SIZE_USER_LEAF,
+            "User leaf FFS record for user {} is {} bytes, expected {}",
+            user_id,
+            user_leaf_bytes.len(),
+            PSY_OBJECT_FFS_SIZE_USER_LEAF
+        );
+        if let Some(offset) = self.user_leaf_update_offsets.get(&user_id).copied() {
+            let end = offset
+                .checked_add(PSY_OBJECT_FFS_SIZE_USER_LEAF)
+                .ok_or_else(|| anyhow::anyhow!("User leaf update offset overflow for user {}", user_id))?;
+            anyhow::ensure!(
+                end <= self.user_leaf_updates_ffs.len(),
+                "User leaf update offset is out of bounds for user {}",
+                user_id
+            );
+            self.user_leaf_updates_ffs[offset..end].copy_from_slice(&user_leaf_bytes);
+        } else {
+            let offset = self.user_leaf_updates_ffs.len();
+            self.user_leaf_updates_ffs.extend_from_slice(&user_leaf_bytes);
+            self.user_leaf_update_offsets.insert(user_id, offset);
+        }
+        Ok(())
+    }
+
     pub async fn populate_future_end_cap_job<TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>>(
         _chain_id: u64,
         realm_identifier: &QRealmIdentifier,
@@ -214,9 +244,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 realm_id_u64,
                 realm_sub_id_u64,
             )?;
-        if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
-            tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
-                queue_item.expected_fake_checkpoint_id,
+        if single_header.checkpoint_id != queue_item.submission_nonce {
+            tracing::info!("Skipping end-cap job population due to a submission_nonce mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
+                queue_item.submission_nonce,
                 single_header.checkpoint_id
             );
             return Ok(None);
@@ -392,9 +422,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             )?;
 
         tracing::debug!("Single header: {}", serde_json::to_string_pretty(&single_header)?);
-        if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
-            tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
-                queue_item.expected_fake_checkpoint_id,
+        if single_header.checkpoint_id != queue_item.submission_nonce {
+            tracing::info!("Skipping end-cap job population due to a submission_nonce mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
+                queue_item.submission_nonce,
                 single_header.checkpoint_id
             );
             return Ok(0);
@@ -419,8 +449,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
 
         self.user_contract_tree_updates_ffs.extend_from_slice(&single_payload);
         self.contract_state_tree_updates_ffs.extend_from_slice(&double_payload);
-        self.user_leaf_updates_ffs
-            .extend_from_slice(&queue_item.new_user_leaf.psy_ser_to_bytes_vec()?);
+        self.update_user_leaf(&queue_item.new_user_leaf)?;
         if self.current_validator_user_leaf.as_ref().map(|leaf| leaf.user_id.to_u64_value()) == Some(user_id) {
             self.current_validator_user_leaf = Some(queue_item.new_user_leaf.clone());
         }
@@ -610,9 +639,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 QBlobMerkleNodeTreeType::UserContractTree,
             )?;
         tracing::debug!("Single header: {}", serde_json::to_string_pretty(&single_header)?);
-        if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
-            tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
-                queue_item.expected_fake_checkpoint_id,
+        if single_header.checkpoint_id != queue_item.submission_nonce {
+            tracing::info!("Skipping end-cap job population due to a submission_nonce mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
+                queue_item.submission_nonce,
                 single_header.checkpoint_id
             );
             return Ok(0);
@@ -638,8 +667,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
 
         self.user_contract_tree_updates_ffs.extend_from_slice(&single_payload);
         self.contract_state_tree_updates_ffs.extend_from_slice(&double_payload);
-        self.user_leaf_updates_ffs
-            .extend_from_slice(&queue_item.new_user_leaf.psy_ser_to_bytes_vec()?);
+        self.update_user_leaf(&queue_item.new_user_leaf)?;
         if self.current_validator_user_leaf.as_ref().map(|leaf| leaf.user_id.to_u64_value()) == Some(user_id) {
             self.current_validator_user_leaf = Some(queue_item.new_user_leaf.clone());
         }
@@ -1055,7 +1083,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         }
 
         let finalizer_bytes = finalizer_input.psy_ser_into_bytes_vec()?;
-        let new_user_leaf_bytes = new_user_leaf.psy_ser_to_bytes_vec()?;
         let new_total_jobs = self
             .total_jobs
             .checked_add(1)
@@ -1076,7 +1103,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         self.planned_jobs[finalizer_level].push(finalizer_job);
 
         self.total_jobs = new_total_jobs;
-        self.user_leaf_updates_ffs.extend_from_slice(&new_user_leaf_bytes);
+        self.update_user_leaf(&new_user_leaf)?;
         self.current_validator_user_leaf = Some(new_user_leaf);
 
         let final_header = GlobalUserTreeAggregatorHeaderWithJobId {
@@ -1187,7 +1214,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                         update_user_contract_tree_nodes_ffs: std::mem::take(&mut self.user_contract_tree_updates_ffs),
                         update_contract_state_tree_nodes_ffs: std::mem::take(&mut self.contract_state_tree_updates_ffs),
                         update_contract_state_imt_leaves_ffs: std::mem::take(&mut self.contract_state_imt_leaves_ffs),
-                        update_user_leaves_ffs: std::mem::take(&mut self.user_leaf_updates_ffs),
+                        update_user_leaves_ffs: {
+                            self.user_leaf_update_offsets.clear();
+                            std::mem::take(&mut self.user_leaf_updates_ffs)
+                        },
                         guta_header: root_header,
                     },
                     job_ids: std::mem::take(&mut self.planned_jobs).into_iter().filter(|jobs| !jobs.is_empty()).collect(),
@@ -1217,7 +1247,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     update_user_contract_tree_nodes_ffs: std::mem::take(&mut self.user_contract_tree_updates_ffs),
                     update_contract_state_tree_nodes_ffs: std::mem::take(&mut self.contract_state_tree_updates_ffs),
                     update_contract_state_imt_leaves_ffs: std::mem::take(&mut self.contract_state_imt_leaves_ffs),
-                    update_user_leaves_ffs: std::mem::take(&mut self.user_leaf_updates_ffs),
+                    update_user_leaves_ffs: {
+                        self.user_leaf_update_offsets.clear();
+                        std::mem::take(&mut self.user_leaf_updates_ffs)
+                    },
                     guta_header: root_header,
                 },
                 job_ids: std::mem::take(&mut self.planned_jobs).into_iter().filter(|x| !x.is_empty()).collect(),

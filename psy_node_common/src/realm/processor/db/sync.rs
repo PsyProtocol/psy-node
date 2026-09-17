@@ -1,7 +1,16 @@
-use anyhow::Ok;
+use anyhow::{Context, Ok};
 use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
-use parth_core::protocol::core_types::QNetworkTypesConfig;
-use psy_data::{prepared_block::realm::PsyRealmCoordinatorUpdate, v1::qdata::checkpoint::QEDL2BlockState};
+use parth_core::{
+    crypto::hash::{
+        merkle_proof::MerkleProofCore,
+        traits::{FieldQHasher, MerkleZeroHasher, ZeroableHash},
+    },
+    protocol::core_types::QNetworkTypesConfig,
+};
+use psy_data::{
+    prepared_block::realm::PsyRealmCoordinatorUpdate,
+    v1::qdata::{checkpoint::QEDL2BlockState, checkpoint_sync::PQEDCheckpointSyncInfoCompact},
+};
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
@@ -14,6 +23,70 @@ use psy_node_core::{
 };
 
 use crate::realm::processor::db::PsyRealmDatabaseProcessor;
+
+fn require_checkpoint_metadata<F, Hash, H>(
+    checkpoint_id: u64,
+    realm_id: u64,
+    checkpoint_tree_height: usize,
+    coordinator_global_user_tree_height: usize,
+    checkpoint_sync: &PQEDCheckpointSyncInfoCompact<F, Hash>,
+    membership: &MerkleProofCore<Hash>,
+    local_proof: &MerkleProofCore<Hash>,
+    previous_root: Hash,
+    realm_proof: &MerkleProofCore<Hash>,
+) -> anyhow::Result<()>
+where
+    F: parth_core::felt::QFelt64,
+    Hash: parth_core::protocol::core_types::QFHashBase<F>,
+    H: FieldQHasher<F, Hash> + MerkleZeroHasher<Hash>,
+{
+    anyhow::ensure!(
+        checkpoint_sync.checkpoint_id == checkpoint_id
+            && checkpoint_sync.block_state.checkpoint_id == checkpoint_id,
+        "MissingHistoryProof at C={checkpoint_id}: coordinator metadata checkpoint IDs do not match C"
+    );
+    anyhow::ensure!(
+        membership.index == checkpoint_id,
+        "MissingHistoryProof at C={checkpoint_id}: membership index {} is not C",
+        membership.index
+    );
+    anyhow::ensure!(
+        membership.siblings.len() == checkpoint_tree_height && membership.siblings.len() <= 64,
+        "MissingHistoryProof at C={checkpoint_id}: membership height {} is not {}",
+        membership.siblings.len(),
+        checkpoint_tree_height
+    );
+    anyhow::ensure!(
+        membership.value == checkpoint_sync.checkpoint_leaf_hash && membership.value == local_proof.value,
+        "MissingHistoryProof at C={checkpoint_id}: membership value does not match checkpoint leaf hash"
+    );
+    anyhow::ensure!(
+        membership.root == checkpoint_sync.checkpoint_tree_root,
+        "MissingHistoryProof at C={checkpoint_id}: membership root does not match synchronized C root"
+    );
+    checkpoint_sync.ensure_valid::<H>(&membership.siblings)?;
+    anyhow::ensure!(
+        membership.compute_root_with_value::<H>(Hash::get_zero_value()) == previous_root,
+        "MissingHistoryProof at C={checkpoint_id}: empty-leaf root does not match synchronized C-1 root"
+    );
+    anyhow::ensure!(
+        realm_proof.verify::<H>(),
+        "MissingHistoryProof at C={checkpoint_id}: Realm top proof does not verify"
+    );
+    anyhow::ensure!(
+        realm_proof.index == realm_id,
+        "MissingHistoryProof at C={checkpoint_id}: Realm top proof index mismatch"
+    );
+    anyhow::ensure!(
+        realm_proof.siblings.len() == coordinator_global_user_tree_height,
+        "MissingHistoryProof at C={checkpoint_id}: Realm top proof height mismatch"
+    );
+    anyhow::ensure!(
+        realm_proof.root == checkpoint_sync.state_roots.user_tree_root,
+        "MissingHistoryProof at C={checkpoint_id}: Realm top proof is not bound to C user tree root"
+    );
+    Ok(())
+}
 
 impl<
         N: QNetworkTypesConfig,
@@ -326,7 +399,7 @@ where
         }
     }
 
-    async fn persist_checkpoint_metadata_range(
+    pub(super) async fn persist_checkpoint_metadata_range(
         &mut self,
         from_checkpoint_id: u64,
         to_checkpoint_id: u64,
@@ -342,79 +415,72 @@ where
                 .coordinator_client
                 .rc_get_realm_sync_info(checkpoint_id, self.state.realm_id_u64)
                 .await?;
-
-            // CRITICAL VALIDATION: Ensure the local in-memory tree matches the Coordinator's canonical root for this checkpoint.
-            // If we have diverged (e.g. bad leaves or fork), we must reset the Backup Manager.
-            // We retrieve the proof for the leaf at `checkpoint_id`. The `get_append_root` from that proof
-            // represents the root of the tree at the moment that leaf was the right-most element (i.e., at that checkpoint).
+            let membership = self
+                .coordinator_client
+                .rc_get_checkpoint_tree_merkle_proof(checkpoint_id)
+                .await
+                .with_context(|| {
+                    format!("MissingHistoryProof at C={checkpoint_id}: checkpoint tree membership unavailable")
+                })?;
+            let checkpoint_sync = &sync_info.checkpoint_sync_info;
             let local_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(checkpoint_id);
-            let local_calculated_root = local_proof.get_append_root::<N::HasherBase>();
-
-            if local_calculated_root != sync_info.checkpoint_sync_info.checkpoint_tree_root {
-                tracing::error!(
-                    "CRITICAL CHECKSUM MISMATCH: Local Checkpoint Tree Root {:?} != Coordinator Root {:?} at Checkpoint {}. Triggering Backup Manager Hard Reset.",
-                    local_calculated_root,
-                    sync_info.checkpoint_sync_info.checkpoint_tree_root,
-                    checkpoint_id
-                );
-
-                // Reset the backup manager to the last known committed state in the DB to clear invalid in-memory state.
+            let local_root = local_proof.get_append_root::<N::HasherBase>();
+            if local_root != checkpoint_sync.checkpoint_tree_root {
                 self.checkpoint_tree_backup_manager
                     .hard_reset_and_truncate(reset_checkpoint_id)
                     .await?;
-
-                anyhow::bail!("Checkpoint Tree Divergence detected at checkpoint {}. Local state reset. Please retry sync.", checkpoint_id);
+                anyhow::bail!(
+                    "Checkpoint Tree Divergence detected at checkpoint {checkpoint_id}. Local state reset. Please retry sync."
+                );
             }
+            let previous_root = if checkpoint_id == 0 {
+                N::HasherBase::get_zero_hash(N::CHECKPOINT_TREE_HEIGHT as usize)
+            } else {
+                self.checkpoint_tree_backup_manager
+                    .checkpoint_tree
+                    .get_leaf(checkpoint_id - 1)
+                    .get_append_root::<N::HasherBase>()
+            };
+            let realm_proof = &sync_info.merkle_proof_to_realm_root;
+            require_checkpoint_metadata::<N::F, N::QHash, N::HasherBase>(
+                checkpoint_id,
+                self.state.realm_id_u64,
+                N::CHECKPOINT_TREE_HEIGHT as usize,
+                N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as usize,
+                checkpoint_sync,
+                &membership,
+                &local_proof,
+                previous_root,
+                realm_proof,
+            )?;
 
             tracing::info!(
                 "sync checkpoint metadata: checkpoint_id={}, checkpoint_tree_root={:?}, block_state_checkpoint_id={}",
                 checkpoint_id,
-                sync_info.checkpoint_sync_info.checkpoint_tree_root,
-                sync_info.checkpoint_sync_info.block_state.checkpoint_id
-            );
-            // ORDERING IS LOAD-BEARING: these writes are not transactional, so a crash between them can leave a
-            // checkpoint half-written. Recovery (`try_get_complete_l2_block_state`) requires all dependency records,
-            // and the L2 block state is written LAST so that its presence implies every other record was already
-            // written. Writing it earlier would let a crash after the block state but before the roots/leaf/proofs
-            // leave a checkpoint that recovery believes is complete and never re-syncs.
-            tracing::debug!(
-                "set checkpoint global state roots {} {:?}",
-                checkpoint_id,
-                sync_info.checkpoint_sync_info.state_roots
+                checkpoint_sync.checkpoint_tree_root,
+                checkpoint_sync.block_state.checkpoint_id
             );
             self.db
-                .set_checkpoint_global_state_roots(checkpoint_id, &sync_info.checkpoint_sync_info.state_roots)
+                .set_checkpoint_global_state_roots(checkpoint_id, &checkpoint_sync.state_roots)
                 .await?;
             self.db
-                .set_checkpoint_leaf_data(checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf)
-                .await?;
-            tracing::debug!(
-                "committing checkpoint proof: {:?}",
-                &local_proof.to_append_proof::<N::HasherBase>()
-            );
-
-            self.db
-                .checkpoint_tree_injest_merkle_proof(checkpoint_id, &local_proof.to_append_proof::<N::HasherBase>())
+                .set_checkpoint_leaf_data(checkpoint_id, &checkpoint_sync.checkpoint_leaf)
                 .await?;
             self.db
-                .set_checkpoint_root_hash_to_id_mapping(
-                    sync_info.checkpoint_sync_info.checkpoint_tree_root,
-                    sync_info.checkpoint_sync_info.checkpoint_id,
-                )
+                .checkpoint_tree_injest_merkle_proof(checkpoint_id, &membership)
                 .await?;
-
             self.db
-                .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &sync_info.merkle_proof_to_realm_root)
+                .set_checkpoint_root_hash_to_id_mapping(checkpoint_sync.checkpoint_tree_root, checkpoint_id)
                 .await?;
-
-            // Sentinel write — must remain the final persisted metadata for this checkpoint (see note above).
             self.db
-                .set_l2_block_state(checkpoint_id, &sync_info.checkpoint_sync_info.block_state)
+                .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, realm_proof)
+                .await?;
+            self.db
+                .set_l2_block_state(checkpoint_id, &checkpoint_sync.block_state)
                 .await?;
 
             latest_sync_info = Some(sync_info);
         }
-
         Ok(latest_sync_info)
     }
 
@@ -479,5 +545,194 @@ where
         let mapping: Vec<(u64, u8)> = ids.into_iter().zip(heights.into_iter()).collect();
         self.db.set_contract_tree_heights(checkpoint_id, &mapping).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_checkpoint_metadata;
+    use parth_common::memory_stores::dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore;
+    use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
+    use parth_core::crypto::hash::merkle_proof::MerkleProofCore;
+    use parth_core::crypto::hash::traits::{FieldQHasher, FromU64x4, MerkleZeroHasher, QFieldHashable, ZeroableHash};
+    use parth_core::pgoldilocks::PoseidonHasher;
+    use parth_core::{PF, PHash};
+    use psy_data::v1::qdata::checkpoint::{
+        PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState,
+    };
+    use psy_data::v1::qdata::checkpoint_sync::PQEDCheckpointSyncInfoCompact;
+
+    const CHECKPOINT_HEIGHT: usize = 8;
+    const REALM_HEIGHT: usize = 4;
+    const REALM_ID: u64 = 0;
+
+    struct Fixture {
+        checkpoint_id: u64,
+        previous_root: PHash,
+        local_proof: MerkleProofCore<PHash>,
+        checkpoint_sync: PQEDCheckpointSyncInfoCompact<PF, PHash>,
+        membership: MerkleProofCore<PHash>,
+        realm_proof: MerkleProofCore<PHash>,
+    }
+
+    fn zero_siblings(height: usize) -> Vec<PHash> {
+        (0..height).map(|level| PoseidonHasher::get_zero_hash(level)).collect()
+    }
+
+    fn empty_roots(user_tree_root: PHash) -> PQEDCheckpointGlobalStateRoots<PHash> {
+        PQEDCheckpointGlobalStateRoots {
+            contract_tree_root: PHash::get_zero_value(),
+            deposit_tree_root: PHash::get_zero_value(),
+            user_tree_root,
+            withdrawal_tree_root: PHash::get_zero_value(),
+            user_registration_tree_root: PHash::get_zero_value(),
+            validator_tree_root: PHash::get_zero_value(),
+        }
+    }
+
+    fn genesis_fixture() -> Fixture {
+        let realm_value = PHash::from_u64x4([7, 0, 0, 0]);
+        let realm_proof = MerkleProofCore::new_from_params::<PoseidonHasher>(REALM_ID, realm_value, zero_siblings(REALM_HEIGHT));
+        let state_roots = empty_roots(realm_proof.root);
+        let leaf = PQEDCheckpointLeaf {
+            global_chain_root: state_roots.qfhash::<PoseidonHasher>(),
+            stats: PQEDCheckpointLeafStats::get_empty_stats(),
+        };
+        let leaf_hash = leaf.qfhash::<PoseidonHasher>();
+        let tree = PsyDashMemoryAppendOnlyMerkleStore::<PoseidonHasher, PHash>::new(CHECKPOINT_HEIGHT as u8);
+        tree.append_leaf(0, leaf_hash).unwrap();
+        let local_proof = tree.get_leaf(0);
+        let membership = MerkleProofCore::new_from_params::<PoseidonHasher>(0, leaf_hash, zero_siblings(CHECKPOINT_HEIGHT));
+        let checkpoint_sync = PQEDCheckpointSyncInfoCompact {
+            checkpoint_id: 0,
+            coordinator_id: 0,
+            coordinator_sub_id: 0,
+            coordinator_unique_pending_id: 0,
+            block_state: QEDL2BlockState::get_genesis_value(),
+            state_roots,
+            checkpoint_leaf: leaf,
+            checkpoint_leaf_hash: leaf_hash,
+            checkpoint_tree_root: local_proof.get_append_root::<PoseidonHasher>(),
+        };
+        Fixture {
+            checkpoint_id: 0,
+            previous_root: PoseidonHasher::get_zero_hash(CHECKPOINT_HEIGHT),
+            local_proof,
+            checkpoint_sync,
+            membership,
+            realm_proof,
+        }
+    }
+
+    fn historical_fixture() -> Fixture {
+        let realm_value = PHash::from_u64x4([11, 0, 0, 0]);
+        let realm_proof = MerkleProofCore::new_from_params::<PoseidonHasher>(REALM_ID, realm_value, zero_siblings(REALM_HEIGHT));
+        let first_roots = empty_roots(PHash::from_u64x4([1, 0, 0, 0]));
+        let first_leaf = PQEDCheckpointLeaf {
+            global_chain_root: first_roots.qfhash::<PoseidonHasher>(),
+            stats: PQEDCheckpointLeafStats::get_empty_stats(),
+        };
+        let first_hash = first_leaf.qfhash::<PoseidonHasher>();
+        let second_roots = empty_roots(realm_proof.root);
+        let second_leaf = PQEDCheckpointLeaf {
+            global_chain_root: second_roots.qfhash::<PoseidonHasher>(),
+            stats: PQEDCheckpointLeafStats::get_empty_stats(),
+        };
+        let second_hash = second_leaf.qfhash::<PoseidonHasher>();
+        let tree = PsyDashMemoryAppendOnlyMerkleStore::<PoseidonHasher, PHash>::new(CHECKPOINT_HEIGHT as u8);
+        tree.append_leaf(0, first_hash).unwrap();
+        let previous_root = tree.get_leaf(0).get_append_root::<PoseidonHasher>();
+        tree.append_leaf(1, second_hash).unwrap();
+        let local_proof = tree.get_leaf(1);
+        let membership = tree.get_historical_merkle_proof_at_historical_index(1, 1);
+        let checkpoint_sync = PQEDCheckpointSyncInfoCompact {
+            checkpoint_id: 1,
+            coordinator_id: 0,
+            coordinator_sub_id: 0,
+            coordinator_unique_pending_id: 0,
+            block_state: QEDL2BlockState {
+                checkpoint_id: 1,
+                ..QEDL2BlockState::get_genesis_value()
+            },
+            state_roots: second_roots,
+            checkpoint_leaf: second_leaf,
+            checkpoint_leaf_hash: second_hash,
+            checkpoint_tree_root: local_proof.get_append_root::<PoseidonHasher>(),
+        };
+        Fixture {
+            checkpoint_id: 1,
+            previous_root,
+            local_proof,
+            checkpoint_sync,
+            membership,
+            realm_proof,
+        }
+    }
+
+    fn require_fixture(fixture: &Fixture) -> anyhow::Result<()> {
+        require_checkpoint_metadata::<PF, PHash, PoseidonHasher>(
+            fixture.checkpoint_id,
+            REALM_ID,
+            CHECKPOINT_HEIGHT,
+            REALM_HEIGHT,
+            &fixture.checkpoint_sync,
+            &fixture.membership,
+            &fixture.local_proof,
+            fixture.previous_root,
+            &fixture.realm_proof,
+        )
+    }
+
+    #[test]
+    fn require_checkpoint_metadata_accepts_genesis_and_historical_proofs() {
+        require_fixture(&genesis_fixture()).expect("genesis metadata must authenticate");
+        require_fixture(&historical_fixture()).expect("historical metadata must authenticate");
+    }
+
+    #[test]
+    fn require_checkpoint_metadata_rejects_altered_bindings() {
+        let mut fixture = genesis_fixture();
+        fixture.checkpoint_sync.state_roots.contract_tree_root = PHash::from_u64x4([9, 0, 0, 0]);
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.checkpoint_sync.checkpoint_leaf_hash = PHash::from_u64x4([3, 0, 0, 0]);
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.membership.index = 1;
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.membership.value = PHash::from_u64x4([4, 0, 0, 0]);
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.membership.root = PHash::from_u64x4([5, 0, 0, 0]);
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.membership.siblings.push(PHash::get_zero_value());
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.previous_root = PHash::from_u64x4([6, 0, 0, 0]);
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.local_proof.value = PHash::from_u64x4([8, 0, 0, 0]);
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.realm_proof.index = 1;
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.realm_proof.root = PHash::from_u64x4([12, 0, 0, 0]);
+        assert!(require_fixture(&fixture).is_err());
+
+        let mut fixture = genesis_fixture();
+        fixture.realm_proof.siblings.truncate(REALM_HEIGHT - 1);
+        assert!(require_fixture(&fixture).is_err());
     }
 }

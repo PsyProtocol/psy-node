@@ -63,6 +63,7 @@ pub trait PsyNodeValidatorTreeDatabaseReader<Hash> {
     async fn validator_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>>;
     async fn validator_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash>;
     async fn validator_tree_get_leaf_preimage(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<Option<ValidatorLeafPreimage>>;
+    async fn validator_tree_get_leaf_preimages(&self, checkpoint_id: u64, leaf_indexes: &[u64]) -> anyhow::Result<Vec<Option<ValidatorLeafPreimage>>>;
 }
 
 #[async_trait]
@@ -90,6 +91,13 @@ pub trait PsyNodeGlobalUserTreeDatabaseReader<Hash> {
     async fn global_user_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>>;
     async fn global_user_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash>;
     async fn global_user_tree_dump_all_leaves(&self, checkpoint_id: u64) -> anyhow::Result<HashMap<u64, Hash>>;
+    async fn global_user_tree_dump_leaves_range(
+        &self,
+        checkpoint_id: u64,
+        min_user_id_inclusive: u64,
+        max_user_id_exclusive: u64,
+    ) -> anyhow::Result<HashMap<u64, Hash>>;
+
     async fn global_user_tree_get_node_and_checkpoint_id_max_checkpoint(
         &self,
         max_checkpoint_id: u64,
@@ -275,6 +283,7 @@ pub trait PsyNodeContractFunctionTreeDatabaseWriter<Hash> {
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCheckpointObjectDatabaseReader<F, Hash> {
     async fn get_latest_checkpoint_id(&self) -> anyhow::Result<u64>;
+    async fn get_genesis_complete(&self) -> anyhow::Result<bool>;
     async fn get_checkpoint_id_for_checkpoint_root_hash(&self, root_hash: Hash) -> anyhow::Result<Option<u64>>;
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointLeaf<F, Hash>>;
     async fn get_l2_block_state(&self, checkpoint_id: u64) -> anyhow::Result<QEDL2BlockState>;
@@ -358,6 +367,7 @@ pub trait PsyNodeCheckpointObjectDatabaseWriter<F, Hash> {
         unique_id_struct: &QCoreProcCheckpointUniqueId,
     ) -> anyhow::Result<()>;
     async fn set_latest_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<()>;
+    async fn set_genesis_complete(&self) -> anyhow::Result<()>;
     async fn set_checkpoint_leaf_data(&self, checkpoint_id: u64, leaf_data: &PQEDCheckpointLeaf<F, Hash>) -> anyhow::Result<()>;
     async fn set_checkpoint_root_hash_to_id_mapping(&self, checkpoint_root: Hash, checkpoint_id: u64) -> anyhow::Result<()>;
     async fn set_l2_latest_block_state(&self, block_state: &QEDL2BlockState) -> anyhow::Result<()>;

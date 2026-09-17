@@ -88,6 +88,7 @@ pub struct PsyRealmDatabaseProcessor<
 
     // config
     pub circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
+    pub proof_verifier: Arc<N::ZKVerifier>,
 }
 
 impl<
@@ -147,6 +148,29 @@ where
             .global_user_tree_get_node(u64::MAX-0xffff, self.realm_root_node)
             .await?;
         Ok(realm_root_hash)
+    }
+
+    pub async fn set_last_committed_realm_root_from_db(&mut self) -> anyhow::Result<()> {
+        let current_realm_root = self
+            .db
+            .global_user_tree_get_node(self.state.last_committed_checkpoint_id, self.realm_root_node)
+            .await?;
+        self.state.last_committed_realm_end_root = current_realm_root;
+        self.state.last_committed_realm_start_root = current_realm_root;
+        self.shared_state.update_from_core_state(&self.state).await
+    }
+
+    pub async fn set_committed_realm_roots_from_db(&mut self) -> anyhow::Result<()> {
+        let current_realm_root = self
+            .db
+            .global_user_tree_get_node(self.state.last_committed_checkpoint_id, self.realm_root_node)
+            .await?;
+        self.state.last_committed_realm_end_root = current_realm_root;
+        self.state.last_committed_realm_start_root = current_realm_root;
+        self.state.processing_realm_start_root = current_realm_root;
+        self.state.processing_realm_end_root = current_realm_root;
+        self.state.gathering_realm_start_root = current_realm_root;
+        self.shared_state.update_from_core_state(&self.state).await
     }
 }
 

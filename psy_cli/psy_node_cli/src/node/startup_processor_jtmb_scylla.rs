@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -107,6 +108,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(config: &RealmProcessorStartConfig) -> anyhow::Result<()> {
     let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<JTMBPoseidonGoldilocksConfig>(config.network)?;
+    let proof_verifier = Arc::new(PsyJTMBZKVerifier::new(verifier));
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
     let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
@@ -161,7 +163,47 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 http_client,
             );
             tracing::info!("[REALM_BOOT] creating realm processor");
-            let (mut processor, guta_gatherer_join_handle) = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
+            let proposal_store = Arc::new(
+                psy_node_common::realm::processor::proposal_store::ProposalStore::open(
+                    config.get_proposal_backups_path(),
+                )
+                .await?,
+            );
+            let built = crate::node::realm_p2p::build_processor_network(config, chain_id)?;
+            let validator_leaves = match crate::node::realm_p2p::processor_realm_validator_leaves::<N, _>(
+                db.as_ref(),
+                chain_id,
+                config.realm_id as u32,
+            )
+            .await
+            {
+                Ok(leaves) => leaves,
+                Err(error) => {
+                    tracing::warn!("checkpoint validator leaves not loaded before genesis: {error:#}");
+                    Vec::new()
+                }
+            };
+            let commands = built.handle.commands();
+            let rotation = built.rotation.clone();
+            let bls_key_path = config.p2p_bls_key_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("processor P2P requires --p2p-bls-key")
+            })?;
+            let vote_enabled = Arc::new(AtomicBool::new(false));
+            let (replay_tx, replay_rx) = tokio::sync::mpsc::channel(8);
+            crate::node::realm_p2p::spawn_processor_realm_network::<N, _>(
+                built,
+                config,
+                realm_sub_id,
+                validator_store,
+                proof_verifier.clone(),
+                proposal_store.clone(),
+                validator_leaves,
+                commands.clone(),
+                load_bls_secret_key(bls_key_path)?,
+                vote_enabled.clone(),
+                replay_tx,
+            );
+            let mut processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
                 chain_id,
                 &genesis_data,
                 file_system,
@@ -176,31 +218,15 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 realm_identifier,
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
+                proof_verifier,
+                proposal_store,
+                Some(commands.clone()),
             )
             .await?;
-            let built = crate::node::realm_p2p::build_processor_network(config, chain_id)?;
-            let bls_secret = load_bls_secret_key(config.p2p_bls_key_path.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("processor P2P requires --p2p-bls-key")
-            })?)?;
-            let commands = built.handle.commands();
-            let rotation = built.rotation.clone();
-            processor.set_realm_p2p(commands, rotation, bls_secret);
-                let (proposal_tx, proposal_rx) = tokio::sync::mpsc::channel(4);
-                processor.proposal_rx = Some(proposal_rx);
-                crate::node::realm_p2p::spawn_processor_realm_network::<N, _>(
-                    built,
-                    config,
-                    realm_sub_id,
-                    validator_store,
-                    PsyJTMBZKVerifier::new(verifier),
-                    proposal_tx,
-                );
-
-
-
-
-
-            run_realm_processor(processor, guta_gatherer_join_handle).await?;
+            processor.set_baseline_replay_rx(replay_rx);
+            processor.set_realm_p2p(commands, rotation, load_bls_secret_key(bls_key_path)?);
+            vote_enabled.store(true, Ordering::Release);
+            run_realm_processor(processor).await?;
             tracing::info!("[REALM_BOOT] realm processor exited");
         }
         _ => {

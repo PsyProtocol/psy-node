@@ -46,6 +46,12 @@ impl RealmProcessorStartConfig {
             self.checkpoint_backup_path, self.realm_id, self.realm_sub_id
         )
     }
+    pub fn get_proposal_backups_path(&self) -> String {
+        format!(
+            "{}/realm_{}_{}/proposal_backups",
+            self.checkpoint_backup_path, self.realm_id, self.realm_sub_id
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
