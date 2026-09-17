@@ -4,7 +4,14 @@ use parth_core::{
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{QNetworkTypesConfig, QNetworkTypesConfigHelper, QNetworkZKTypes},
 };
-use psy_core::{job::job_id::QProvingJobDataID, network_config::{PsyNetworkLocalDevnetConstants, PsyNetworkPsyTeamDevnetConstants}};
+use psy_core::{
+    constants::protocol::{
+        STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
+        STATE_LAYOUT_MAX_AGGREGATION_DEPTH, STATE_LAYOUT_TREE_HEIGHT,
+    },
+    job::job_id::QProvingJobDataID,
+    network_config::{PsyNetworkLocalDevnetConstants, PsyNetworkPsyTeamDevnetConstants},
+};
 use psy_data::config::network_config::PsyNodeCircuitFingerprintConfigProvider;
 use psy_jtmb_testing_core::{
     circuit_library::core::get_jtmb_circuit_library_and_prover_for_network,
@@ -21,6 +28,11 @@ use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, Realm
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
+use psy_plonky2_circuits::coordinator::state_layout_helper::CanonicalLayoutProofVerifier;
+use plonky2::plonk::config::PoseidonGoldilocksConfig;
+
+type LayoutC = PoseidonGoldilocksConfig;
+const LAYOUT_D: usize = 2;
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &CoordinatorEdgeStartConfig) -> anyhow::Result<()> {
     let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<JTMBPoseidonGoldilocksConfig>(config.network)?;
@@ -51,6 +63,18 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
         realm_sub_id: config.coordinator_sub_id,
     };
     let proof_verifier = Arc::new(PsyJTMBZKVerifier::new(verifier));
+    let canonical_layout_proof_verifier = Arc::new(
+        CanonicalLayoutProofVerifier::<LayoutC, LAYOUT_D>::new(
+            STATE_LAYOUT_TREE_HEIGHT - STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
+            STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
+            STATE_LAYOUT_MAX_AGGREGATION_DEPTH,
+        ),
+    );
+    let canonical_layout_verifier_fingerprint =
+        canonical_layout_proof_verifier.fingerprint();
+    let verify_canonical_layout_proof = Arc::new(move |proof: &[u8]| {
+        canonical_layout_proof_verifier.verify_serialized_proof(proof)
+    });
     /*
 
     pub fn new(
@@ -84,6 +108,8 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                canonical_layout_verifier_fingerprint,
+                verify_canonical_layout_proof.clone(),
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         },
@@ -104,6 +130,8 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                canonical_layout_verifier_fingerprint,
+                verify_canonical_layout_proof,
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         }
