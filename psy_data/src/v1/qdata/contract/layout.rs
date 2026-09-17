@@ -339,7 +339,8 @@ pub struct CanonicalTypeLayoutDag {
 impl CanonicalTypeLayoutDag {
     pub fn validate_shape(&self) -> anyhow::Result<()> {
         const MAX_ARGUMENT: u64 = (1u64 << 31) - 1;
-        const MAX_SLOT_COUNT: u64 = (1u64 << 32) - 1;
+        const MAX_ARRAY_LENGTH: u64 = 1u64 << 32;
+        const MAX_SLOT_COUNT: u64 = 1u64 << 34;
         anyhow::ensure!(!self.nodes.is_empty(), "type-layout DAG is empty");
         anyhow::ensure!(
             self.nodes.len() <= CANONICAL_TYPE_LAYOUT_MAX_NODES,
@@ -371,7 +372,7 @@ impl CanonicalTypeLayoutDag {
                     ensure_child(*element)?;
                     anyhow::ensure!(*length > 0, "fixed array length is zero");
                     anyhow::ensure!(
-                        *length <= MAX_ARGUMENT,
+                        *length <= MAX_ARRAY_LENGTH,
                         "fixed array length exceeds canonical circuit range"
                     );
                     anyhow::ensure!(
@@ -905,7 +906,7 @@ enum CompilerAbiTypeRef {
     },
     Array {
         item: Box<CompilerAbiTypeRef>,
-        length: u32,
+        length: u64,
         item_felt_size: u64,
     },
     Map {
@@ -1920,7 +1921,7 @@ where
             );
             fixed_array_type_layout::<Hasher, F, Hash>(
                 item_layout,
-                u64::from(*length),
+                *length,
             )
         }
         CompilerAbiTypeRef::Map {
@@ -2026,7 +2027,7 @@ where
             Ok(StateTypeLayoutWitness::FixedArray {
                 element_type_hash: element.type_layout_hash,
                 element_slot_count: element.total_slot_count,
-                array_length: u64::from(*length),
+                array_length: *length,
             })
         }
         CompilerAbiTypeRef::Map {
@@ -2278,7 +2279,7 @@ fn append_compiler_abi_type_dag_node(
             )?;
             CanonicalTypeLayoutNode::FixedArray {
                 element,
-                length: u64::from(*length),
+                length: *length,
             }
         }
         CompilerAbiTypeRef::Map {
