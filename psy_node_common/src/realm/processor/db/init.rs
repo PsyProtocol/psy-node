@@ -515,8 +515,8 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync + MerkleZeroHasher<N::QHash> + FieldQHasher<N::F, N::QHash>,
 {
-    /// Root pairs for the window: each realm transition at C consumed the previous
-    /// transition's root, so the pair chain starts at the committed realm end root.
+    /// Root transitions for the window: each realm transition at C consumed the previous
+    /// transition's root, so the chain starts at the committed realm end root.
     async fn pending_transition_lookups(
         &self,
         from_checkpoint: u64,
@@ -550,10 +550,10 @@ where
         &self,
         from_checkpoint: u64,
         target_tip: u64,
-        proposal_store: &crate::realm::processor::proposal_store::ProposalStore,
+        proposal_backup: &crate::realm::processor::proposal_backup::ProposalBackup,
         client: &crate::realm::network::RealmNetworkCommands,
         validator_nodes: &[(u16, psy_data::p2p::NodeId)],
-    ) -> anyhow::Result<HashMap<psy_data::p2p::RealmTransition, crate::realm::processor::proposal_store::StagedProposal>>
+    ) -> anyhow::Result<HashMap<psy_data::p2p::RealmTransition, crate::realm::processor::proposal_backup::StagedProposal>>
     where
         N::QHash: Q256BitHash,
     {
@@ -566,7 +566,7 @@ where
         )?;
         let outcomes = crate::realm::processor::catchup::stage_transition_blocks(
             client,
-            proposal_store,
+            proposal_backup,
             &peers,
             self.state.chain_id,
             self.state.realm_id_u64 as u32,
@@ -577,18 +577,18 @@ where
         let mut staged = HashMap::new();
         for outcome in outcomes {
             match outcome {
-                crate::realm::processor::catchup::TransitionFetchOutcome::Staged(pair, staged_proposal) => {
-                    staged.insert(pair, staged_proposal);
+                crate::realm::processor::catchup::TransitionFetchOutcome::Staged(transition, staged_proposal) => {
+                    staged.insert(transition, staged_proposal);
                 }
-                crate::realm::processor::catchup::TransitionFetchOutcome::Absent(pair) => tracing::debug!(
-                    "catch-up window pair=({},{}) not offered by the batch peer",
-                    hex::encode(pair.old_root),
-                    hex::encode(pair.new_root)
+                crate::realm::processor::catchup::TransitionFetchOutcome::Absent(transition) => tracing::debug!(
+                    "catch-up window transition=({},{}) not offered by the batch peer",
+                    hex::encode(transition.old_root),
+                    hex::encode(transition.new_root)
                 ),
-                crate::realm::processor::catchup::TransitionFetchOutcome::Failed(pair, error) => tracing::warn!(
-                    "catch-up window pair=({},{}) failed error={error:#}",
-                    hex::encode(pair.old_root),
-                    hex::encode(pair.new_root)
+                crate::realm::processor::catchup::TransitionFetchOutcome::Failed(transition, error) => tracing::warn!(
+                    "catch-up window transition=({},{}) failed error={error:#}",
+                    hex::encode(transition.old_root),
+                    hex::encode(transition.new_root)
                 ),
             }
         }
@@ -597,12 +597,12 @@ where
 
     async fn stage_single_transition(
         &self,
-        pair: psy_data::p2p::RealmTransition,
-        proposal_store: &crate::realm::processor::proposal_store::ProposalStore,
+        transition: psy_data::p2p::RealmTransition,
+        proposal_backup: &crate::realm::processor::proposal_backup::ProposalBackup,
         client: &crate::realm::network::RealmNetworkCommands,
         batch_base: u64,
         rejected: &[[u8; 32]],
-    ) -> anyhow::Result<Option<crate::realm::processor::proposal_store::StagedProposal>> {
+    ) -> anyhow::Result<Option<crate::realm::processor::proposal_backup::StagedProposal>> {
         let validator_nodes = self.validator_nodes_at(batch_base).await?;
         let peers = crate::realm::processor::catchup::CatchupPeers::select(
             &validator_nodes,
@@ -610,51 +610,51 @@ where
         )?;
         let outcomes = crate::realm::processor::catchup::stage_transition_blocks(
             client,
-            proposal_store,
+            proposal_backup,
             &peers,
             self.state.chain_id,
             self.state.realm_id_u64 as u32,
-            &[pair],
+            &[transition],
             rejected,
         )
         .await;
         Ok(outcomes.into_iter().find_map(|outcome| match outcome {
             crate::realm::processor::catchup::TransitionFetchOutcome::Staged(_, staged) => Some(staged),
-            crate::realm::processor::catchup::TransitionFetchOutcome::Absent(pair) => {
+            crate::realm::processor::catchup::TransitionFetchOutcome::Absent(transition) => {
                 tracing::debug!(
-                    "catch-up pair=({},{}) not offered by any batch peer",
-                    hex::encode(pair.old_root),
-                    hex::encode(pair.new_root)
+                    "catch-up transition=({},{}) not offered by any batch peer",
+                    hex::encode(transition.old_root),
+                    hex::encode(transition.new_root)
                 );
                 None
             }
-            crate::realm::processor::catchup::TransitionFetchOutcome::Failed(pair, error) => {
+            crate::realm::processor::catchup::TransitionFetchOutcome::Failed(transition, error) => {
                 tracing::warn!(
-                    "catch-up pair=({},{}) failed error={error:#}",
-                    hex::encode(pair.old_root),
-                    hex::encode(pair.new_root)
+                    "catch-up transition=({},{}) failed error={error:#}",
+                    hex::encode(transition.old_root),
+                    hex::encode(transition.new_root)
                 );
                 None
             }
         }))
     }
 
-    /// Verify one transition, promote the verified bytes into its record, then apply.
+    /// Verify one transition, install the verified bytes into its record, then apply.
     async fn apply_verified_transition(
         &mut self,
-        included: &crate::realm::processor::recovery::CheckpointIdentity,
-        pair: psy_data::p2p::RealmTransition,
-        staged: Option<crate::realm::processor::proposal_store::StagedProposal>,
-        proposal_store: &crate::realm::processor::proposal_store::ProposalStore,
+        included: &crate::realm::processor::ffs::CheckpointIdentity,
+        transition: psy_data::p2p::RealmTransition,
+        staged: Option<crate::realm::processor::proposal_backup::StagedProposal>,
+        proposal_backup: &crate::realm::processor::proposal_backup::ProposalBackup,
         rejected: &mut Vec<[u8; 32]>,
     ) -> anyhow::Result<Option<(PsyPreparedRealmBlockStateUpdates<N::QHash>, Vec<u8>)>> {
         let verified = match self
-            .verify_history_transition(included, pair, staged.as_ref(), proposal_store)
+            .verify_history_transition(included, transition, staged.as_ref(), proposal_backup)
             .await
         {
             Ok(verified) => verified,
             Err(error) => {
-                let Some(proposal_id) = crate::realm::processor::recovery::invalid_candidate_id(&error) else {
+                let Some(proposal_id) = crate::realm::processor::ffs::invalid_candidate_id(&error) else {
                     return Err(error);
                 };
                 rejected.push(proposal_id);
@@ -665,7 +665,7 @@ where
             return Ok(None);
         };
         if let Some(staged) = staged {
-            proposal_store.install(staged).await?;
+            proposal_backup.install(staged).await?;
         }
         Ok(Some(
             self.apply_history_proposal(included, verified)
@@ -724,7 +724,7 @@ where
         file_system: &FileSystem,
         guta_gatherer_backup_directory: &str,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-        proposal_store: &crate::realm::processor::proposal_store::ProposalStore,
+        proposal_backup: &crate::realm::processor::proposal_backup::ProposalBackup,
         proposal_fetch: Option<&crate::realm::network::RealmNetworkCommands>,
     ) -> anyhow::Result<()> {
         let database_check_state = self.get_database_check_state().await?;
@@ -743,7 +743,7 @@ where
             tracing::warn!("Inconsistent Realm Processor State detected. Initiating Recovery.");
             self.apply_history_transitions(
                 file_system, guta_gatherer_backup_directory, global_user_tree,
-                proposal_store, proposal_fetch, database_check_state, target_tip,
+                proposal_backup, proposal_fetch, database_check_state, target_tip,
             ).await?;
         }
         Ok(())
@@ -780,7 +780,7 @@ where
         file_system: &FileSystem,
         guta_gatherer_backup_directory: &str,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-        proposal_store: &crate::realm::processor::proposal_store::ProposalStore,
+        proposal_backup: &crate::realm::processor::proposal_backup::ProposalBackup,
         proposal_fetch: Option<&crate::realm::network::RealmNetworkCommands>,
         database_check_state: DatabaseCheckState,
         mut target_tip: u64,
@@ -797,13 +797,13 @@ where
             if let Some(client) = proposal_fetch {
                 let validator_nodes = self.validator_nodes_at(start).await?;
                 staged_transitions = self
-                    .stage_recovery_window(start + 1, target_tip, proposal_store, client, &validator_nodes)
+                    .stage_recovery_window(start + 1, target_tip, proposal_backup, client, &validator_nodes)
                     .await?;
                 self.publish_validator_leaves(proposal_fetch, start).await?;
             }
             while checkpoint_id <= target_tip {
                 tracing::info!("Recovering checkpoint {}...", checkpoint_id);
-                let Some((coordinator_update, pair)) = self.transition_at(checkpoint_id).await? else {
+                let Some((coordinator_update, transition)) = self.transition_at(checkpoint_id).await? else {
                     // Empty checkpoints still authenticate proof-base roots for a later
                     // included proposal. Persist C only; do not advance the committed marker.
                     self.persist_checkpoint_metadata_range(checkpoint_id, checkpoint_id, start)
@@ -821,8 +821,8 @@ where
                 };
                 if !self.restore_checkpoint_transition(
                     file_system, guta_gatherer_backup_directory, global_user_tree,
-                    proposal_store, proposal_fetch, database_check_state, target_tip, start,
-                    checkpoint_id, &coordinator_update, pair, &mut staged_transitions,
+                    proposal_backup, proposal_fetch, database_check_state, target_tip, start,
+                    checkpoint_id, &coordinator_update, transition, &mut staged_transitions,
                     &mut rejected_proposal_ids,
                 ).await? {
                     continue;
@@ -848,18 +848,18 @@ where
         file_system: &FileSystem,
         guta_gatherer_backup_directory: &str,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-        proposal_store: &crate::realm::processor::proposal_store::ProposalStore,
+        proposal_backup: &crate::realm::processor::proposal_backup::ProposalBackup,
         proposal_fetch: Option<&crate::realm::network::RealmNetworkCommands>,
         database_check_state: DatabaseCheckState,
         target_tip: u64,
         start: u64,
         checkpoint_id: u64,
         coordinator_update: &psy_data::prepared_block::realm::PsyRealmCoordinatorUpdate<N::F, N::QHash>,
-        pair: psy_data::p2p::RealmTransition,
-        staged_transitions: &mut HashMap<psy_data::p2p::RealmTransition, crate::realm::processor::proposal_store::StagedProposal>,
+        transition: psy_data::p2p::RealmTransition,
+        staged_transitions: &mut HashMap<psy_data::p2p::RealmTransition, crate::realm::processor::proposal_backup::StagedProposal>,
         rejected_proposal_ids: &mut Vec<[u8; 32]>,
     ) -> anyhow::Result<bool> {
-        let target_root = N::QHash::from_owned_32bytes(pair.new_root);
+        let target_root = N::QHash::from_owned_32bytes(transition.new_root);
         self.state.processing_checkpoint_id = checkpoint_id;
         self.state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
         let prepared_updates = if checkpoint_id == 0 {
@@ -874,7 +874,7 @@ where
                     database_check_state, checkpoint_id, target_tip, target_root, coordinator_update,
                 ).await?;
                 if !recovered_from_backup && !self.retry_history_transition(
-                    checkpoint_id, coordinator_update, pair, proposal_store, proposal_fetch,
+                    checkpoint_id, coordinator_update, transition, proposal_backup, proposal_fetch,
                     start, staged_transitions, rejected_proposal_ids,
                 ).await? {
                     return Ok(false);
@@ -1078,34 +1078,34 @@ where
         &mut self,
         checkpoint_id: u64,
         coordinator_update: &psy_data::prepared_block::realm::PsyRealmCoordinatorUpdate<N::F, N::QHash>,
-        pair: psy_data::p2p::RealmTransition,
-        proposal_store: &crate::realm::processor::proposal_store::ProposalStore,
+        transition: psy_data::p2p::RealmTransition,
+        proposal_backup: &crate::realm::processor::proposal_backup::ProposalBackup,
         proposal_fetch: Option<&crate::realm::network::RealmNetworkCommands>,
         start: u64,
-        staged_transitions: &mut HashMap<psy_data::p2p::RealmTransition, crate::realm::processor::proposal_store::StagedProposal>,
+        staged_transitions: &mut HashMap<psy_data::p2p::RealmTransition, crate::realm::processor::proposal_backup::StagedProposal>,
         rejected_proposal_ids: &mut Vec<[u8; 32]>,
     ) -> anyhow::Result<bool> {
-        let included = crate::realm::processor::recovery::CheckpointIdentity {
+        let included = crate::realm::processor::ffs::CheckpointIdentity {
             checkpoint_id,
-            checkpoint_hash: coordinator_update.checkpoint_sync_info.checkpoint_leaf_hash.into_owned_32bytes(),
+            checkpoint_leaf_hash: coordinator_update.checkpoint_sync_info.checkpoint_leaf_hash.into_owned_32bytes(),
         };
-        for attempt in 0..crate::realm::processor::catchup::CATCHUP_PAIR_ATTEMPTS {
-            let staged = match staged_transitions.remove(&pair) {
+        for attempt in 0..crate::realm::processor::catchup::CATCHUP_TRANSITION_ATTEMPTS {
+            let staged = match staged_transitions.remove(&transition) {
                 Some(staged) => Some(staged),
                 None => match proposal_fetch {
                     Some(client) => self.stage_single_transition(
-                        pair, proposal_store, client, start, rejected_proposal_ids,
+                        transition, proposal_backup, client, start, rejected_proposal_ids,
                     ).await?,
                     None => None,
                 },
             };
             match self.apply_verified_transition(
-                &included, pair, staged, proposal_store, rejected_proposal_ids,
+                &included, transition, staged, proposal_backup, rejected_proposal_ids,
             ).await {
                 Ok(Some(_)) => return Ok(true),
                 Ok(None) => tracing::warn!(
-                    "MissingHistoryProof at C={} attempt={attempt} pair=({},{}) rejected",
-                    checkpoint_id, hex::encode(pair.old_root), hex::encode(pair.new_root)
+                    "MissingHistoryProof at C={} attempt={attempt} transition=({},{}) rejected",
+                    checkpoint_id, hex::encode(transition.old_root), hex::encode(transition.new_root)
                 ),
                 Err(error) => {
                     tracing::warn!(
@@ -1120,8 +1120,8 @@ where
         // round's rejections so the next round re-fetches and re-verifies the same candidate.
         rejected_proposal_ids.clear();
         tracing::warn!(
-            "MissingHistoryProof at C={}: no verified candidate for pair=({},{}); retrying in 5s",
-            checkpoint_id, hex::encode(pair.old_root), hex::encode(pair.new_root)
+            "MissingHistoryProof at C={}: no verified candidate for transition=({},{}); retrying in 5s",
+            checkpoint_id, hex::encode(transition.old_root), hex::encode(transition.new_root)
         );
         tokio::time::sleep(Duration::from_secs(5)).await;
         Ok(false)
@@ -1144,7 +1144,7 @@ where
         guta_gatherer_backup_directory: &str,
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
-        proposal_store: &crate::realm::processor::proposal_store::ProposalStore,
+        proposal_backup: &crate::realm::processor::proposal_backup::ProposalBackup,
         proposal_fetch: Option<&crate::realm::network::RealmNetworkCommands>,
     ) -> anyhow::Result<()> {
         let genesis_checkpoint_root = genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
@@ -1157,7 +1157,7 @@ where
             file_system,
             guta_gatherer_backup_directory,
             global_user_tree,
-            proposal_store,
+            proposal_backup,
             proposal_fetch,
         )
             .await?;

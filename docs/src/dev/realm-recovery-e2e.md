@@ -107,7 +107,7 @@ Failure signatures and what they mean:
 | `dropped unauthenticated Realm vote` | a vote arrived for a proposal whose vote-auth context is not registered locally | `drive.rs:328`; expected on the follower for the proposer's self-vote, abnormal if the follower never votes |
 | `follower baseline replay rejected proposal=` | the follower's baseline replay rejected the proposal (coverage or root binding) | `realm_p2p.rs:633`; reason comes from `recovery.rs` |
 | `timed out: wait_votes` | proposer never reached the replication threshold; 120 s deadline | `runner.rs:122` |
-| `InvalidStateUpdates: ... has no IMT record` | nonzero changed leaf on a tree classified as IMT-managed lacks its required IMT record; see limitations below, not a universal positional-write rejection | `psy_node_common/src/realm/processor/recovery.rs:389-393,570-603` |
+| `InvalidStateUpdates: ... has no IMT record` | nonzero changed leaf on an IMT-indexed tree lacks its required IMT record; see limitations below, not a universal positional-write rejection | `psy_node_common/src/realm/processor/recovery.rs:389-393,570-603` |
 
 ## H — lagging follower body catch-up
 
@@ -481,7 +481,7 @@ proposers without a harness change.
   a no-op for production realms.
 - Per-tree pairing classifies a tree using a **positive LIVE next-append
   pointer**, then requires IMT records for its nonzero changed leaves,
-  including new indices on an already-managed tree
+  including new indices on an IMT-indexed tree
   (`psy_node_common/src/realm/processor/recovery.rs:570-603,389-393`).
   Zero-valued changed leaves remain exempt. The pointer read is not
   checkpoint-versioned
@@ -603,4 +603,84 @@ C1915 `user_tree_root` still `367179a0…` after 4d
 realm 1; its user leaf on `:13390/:13391` stayed `0e49b588…` at both
 C2035 and C2036 (`inclusion-rpc.json`; token contract leaf already
 `…0001` from the earlier F transfers).
+
+## Rename-head rerun (2026-09-17)
+
+Fresh Plonky2 stack after HEAD `e5d03fd5` (`recovery/` → `ffs/`). Anvil
+state and localhost deployments were absent, so this is a new chain, not
+`PURGE=0` resume. Release CLIs rebuilt; `make run-all` in `tmux` pane
+`%12`. Evidence under `e2e-evidence/round3-*` (wallet files not committed).
+Case 3 not run.
+
+`[COORD_CREATE] processor new done` 22:56:47Z;
+`[REALM_CREATE] processor new done` r0s1 22:58:41, r1s1 22:59:31,
+r0s2 23:00:21, r1s2 23:01:11. Prove-proxy
+`[CFLI:PSY_PROVE_PROXY_STARTED][0.0.0.0:9999]` before F.
+
+### F — fee-reserved sequence — PASS
+
+Fresh zk wallet registered as user **1966080**
+(`public_key_hash=9882911b…`, `get-user-id.json`; wallet-create
+`9256a8fd…` is unused). Genesis user 0 `faucet(1966080, 3000006100)`:
+first EndCap `tx=f1f377fc…` timed out (`grant.stderr.txt`); user-0 leaf
+changed at C**61** to `e3fae7f6…` (nonce 0→1, balance 0→3000) instead
+of the submitted hash (`first-grant.json`). Not replayed. Second call
+from that leaf confirmed C**87** `tx=1ec4daa8…` (`grant.json`).
+Recipient `simple_claim([0])` C**92** `tx=80f1b918…`.
+`simple_transfer([1,50])` C**97** `tx=5a42d8c4…`.
+`simple_transfer([1,49])` C**102** `tx=851d5057…`. Fourth
+`simple_transfer([1,10])` **confirmed** C**106** `tx=99f46732…` because
+leftover token still covered fee+10 (`xfer10.json`). Fifth
+`simple_transfer([1,2000004092])` (leftover+1) failed at trace:
+`assertion failed: insufficient balance (left: 0, right: 1)`
+(`xfer-over.stderr.txt`). Five-edge roots equal at 87, 92, 97, 102,
+106 (`*-rpc.json`). Pipeline grep: `pipeline-grep.txt`.
+
+### H — lagging follower body catch-up — PASS
+
+SIGSTOP r0s2 PID **3294194** at 23:17:41Z tip **120** (`freeze.json`,
+`/proc` `T`). While frozen, `:13381` stayed 120. Epoch **14** (anchor
+139) computed r0 `sub_1`. User-0 EndCap submitted 23:21:10Z
+`tx=67a15b29…` then CLI timed out (`xfer.stderr.txt`); that hash
+`2849e0f7…` never appeared on `:13380`. r0s1 published proposal
+`95d8835f…` epoch 14 target 143 and committed C**144**. Operator/user-0
+leaf on `:13380` stayed `4cb2adb8…` through 143 and became `a540849a…`
+at 144 (`inclusion-rpc.json`). SIGCONT 23:24:55Z (`cont.json`). r0s2
+logged `Realm P2P proposal body complete` proposal=`95d8835f…` then
+`Committed coordinator processor state for checkpoint ID: 144`
+(`catchup-log.txt`). Body
+file `9f3156d0…_74269643…` (142020 bytes) appeared on r0s1 (mtime
+23:21:14Z) and r0s2 (mtime 23:24:55Z); `cmp` identical
+(`body-cmp.json`). Gossip `body_len=141806`; docs cite disk `cmp`.
+Five-edge roots at 144 identical (`catchup-rpc.json`);
+`no peer offered pair` count 0 (`ghost.txt`).
+
+
+### Case 2 — missed epoch nonempty takeover — FAIL
+
+SIGSTOP r0s2 PID **3294194** at 23:31:43Z tip **207** epoch **20**
+(computed r0 `sub_2`). Coordinator tip advanced 207→**219+** while that
+processor stayed `T`; `:13381` stayed 207 (`freeze.json`,
+`epoch-scan.json`). Epoch **21** (anchor 209) computed r0 `sub_2`
+(`epoch-scan.json`). r0s1 logged only
+`No GUTA jobs to process in this block, skipping.` (`process_block.rs:446`,
+`r0s1-skip.txt`);
+last `scheduled proposer realm=0 sub_id=1` remains 23:21:14Z epoch 14
+(`r0s1-scheduled.txt`).
+Last r0s2 `scheduled proposer` remains 23:11:26Z epoch 8
+(`r0s2-scheduled.txt`). SIGCONT 23:34:03Z; five edges 220 then 221.
+**Tip continued is not rotation takeover.** Nonempty sub_1 proposal
+during the pause was not obtained.
+
+### W — realm proving-worker freeze — PASS
+
+| step | evidence |
+|---|---|
+| W0 | Five edges **223**. Realm worker PID **3296594** `S`; `logs/worker_0_logs.txt` size 26515. Coordinator workers 3290766/3291435 `S`. `w0.json`. |
+| W1 | SIGSTOP 3296594 at 23:34:41Z; `/proc` `T`. Size stayed 26515 for 8s. Coordinator workers `S`; tip 223→224 (`w1.json`). |
+| W2 | User-0 `simple_transfer` CLI timed out. r0s2 `Realm worker publication acknowledged` 23:35:36Z checkpoint 230 unique_pending_id **509** (`w2-ack.txt`). Worker log did not grow before SIGCONT. |
+| W3 | Five `psy_get_checkpoint_global_state_roots[223]` identical (`user_tree_root=c44af9cd…`). Live tips during wait: `:13381`=230 others 237+. No 23:34–23:37 Fatal/RESTART (`w3-rpc.json`, `w3-fatals.txt`). |
+| W4 | Frozen-window identity r0 `sub_2` epoch 23 (anchor 229). Epoch **24** (anchor 239) computed r0 `sub_1` (`w4-scan.json`). Not wall-clock. |
+| W5 | SIGCONT 23:37:06Z; `T`→`S`; `size_before=26515` (`w5-cont.json`). `proving start` goal **509** GUTASingleEndCap (`w5-proving.txt`). |
+| W6 | Same-epoch proposer r0 `sub_2` epoch 23. 23:37:09Z `scheduled proposer realm=0 sub_id=2 epoch=23 target=230`; certificate `signers=[2]`; follower r0s1 `proposal start accepted` + `proposal body complete` proposal=`cde5de6d…` body_len=**142689**; r0s2 `Committed new realm block with checkpoint_id = 241` (`w6-commit.txt`, `w6-body.txt`). Operator/user-0 leaf on `:13380/:13381` first equals `0069e3ee…` at C241 (C240 still `a540849a…`). Five-edge roots at 241 identical (`w6-rpc.json`). |
 

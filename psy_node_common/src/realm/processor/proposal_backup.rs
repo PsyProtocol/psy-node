@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
+use parth_core::protocol::core_types::Q256BitHash;
+use parth_core::PHash;
 use psy_data::p2p::{
     BodyChunkRequest, BodyChunkResponse, Proposal, ProposalLookupEntry, ProposalLookupRequest,
     ProposalLookupResponse, ProtocolEncode, BODY_CHUNK_MAX_BYTES, MAX_PROPOSAL_BODY_BYTES,
@@ -14,9 +16,8 @@ use psy_data::p2p::{
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem, TokioStdFileSystem};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::realm::processor::consensus::decode_proposal_body;
+use crate::realm::processor::consensus::{decode_proposal_body, decode_proposal_state_updates};
 
-const STATE_UPDATES_ROOTS_OFFSET: usize = 40;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RealmTransition {
     pub from_root: [u8; 32],
@@ -31,7 +32,7 @@ struct TransitionRecord<T> {
 }
 
 /// Owns one staged body file. Dropping it removes the staging file through the
-/// store's filesystem abstraction, so an abandoned candidate cannot leak.
+/// backup's filesystem abstraction, so an abandoned candidate cannot leak.
 pub struct StagedProposal {
     path: String,
     transition: RealmTransition,
@@ -47,14 +48,14 @@ impl Drop for StagedProposal {
     }
 }
 
-/// In-memory tables over the retained bodies, guarded by the store's single
+/// In-memory tables over the retained bodies, guarded by the backup's single
 /// lock: records keyed by transition plus the O(1) proposal-id lookup index.
 struct RetainedBodies<T> {
     by_transition: HashMap<RealmTransition, TransitionRecord<T>>,
     by_proposal_id: HashMap<[u8; 32], RealmTransition>,
 }
 
-pub struct ProposalStore<F: TokioLikeFileSystem = TokioStdFileSystem> {
+pub struct ProposalBackup<F: TokioLikeFileSystem = TokioStdFileSystem> {
     fs: std::sync::Arc<F>,
     root: PathBuf,
     inner: tokio::sync::Mutex<RetainedBodies<F::File>>,
@@ -62,18 +63,18 @@ pub struct ProposalStore<F: TokioLikeFileSystem = TokioStdFileSystem> {
     instance_id: u64,
 }
 
-impl ProposalStore<TokioStdFileSystem> {
+impl ProposalBackup<TokioStdFileSystem> {
     pub async fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         Self::open_with_fs(root, TokioStdFileSystem).await
     }
 }
 
-impl<F: TokioLikeFileSystem + 'static> ProposalStore<F> {
+impl<F: TokioLikeFileSystem + 'static> ProposalBackup<F> {
     pub async fn open_with_fs(root: impl AsRef<Path>, fs: F) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs.file_like_fs_create_dir_all(&path_string(&root.join("bodies"))).await?;
         let root = if root.is_absolute() { root } else { std::env::current_dir()?.join(root) };
-        let store = Self {
+        let proposal_backup = Self {
             fs: std::sync::Arc::new(fs),
             root,
             inner: tokio::sync::Mutex::new(RetainedBodies {
@@ -83,14 +84,14 @@ impl<F: TokioLikeFileSystem + 'static> ProposalStore<F> {
             staged_seq: AtomicU64::new(1),
             instance_id: std::hash::RandomState::new().build_hasher().finish(),
         };
-        remove_staged_files(&store.root.join("bodies")).await?;
+        remove_staged_files(&proposal_backup.root.join("bodies")).await?;
         {
-            let mut inner = store.inner.lock().await;
-            for transition in store.read_stored_transitions().await? {
-                let _ = store.load_transition_record(&mut inner, &transition).await;
+            let mut inner = proposal_backup.inner.lock().await;
+            for transition in proposal_backup.load_retained_transitions().await? {
+                let _ = proposal_backup.load_transition_record(&mut inner, &transition).await;
             }
         }
-        Ok(store)
+        Ok(proposal_backup)
     }
 
     // Trusted local consensus/replay writes bypass fetched-body isolation staging verification.
@@ -131,19 +132,19 @@ impl<F: TokioLikeFileSystem + 'static> ProposalStore<F> {
     pub async fn lookup_proposal(&self, request: &ProposalLookupRequest) -> anyhow::Result<ProposalLookupResponse> {
         let mut entries = Vec::new();
         let mut wire_bytes = 5;
-        for pair in &request.pairs {
-            let candidates = self.lookup_transition(&pair.old_root, &pair.new_root).await?
+        for transition in &request.transitions {
+            let candidates = self.lookup_transition(&transition.old_root, &transition.new_root).await?
                 .into_iter().filter(|proposal| proposal.chain_id == request.chain_id && proposal.realm_id == request.realm_id).collect::<Vec<_>>();
             wire_bytes += 65 + candidates.len() * PROPOSAL_WIRE_BYTES;
             if wire_bytes > psy_data::p2p::MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES {
                 return Ok(ProposalLookupResponse::truncated(entries));
             }
-            entries.push(ProposalLookupEntry { transition: *pair, candidates });
+            entries.push(ProposalLookupEntry { transition: *transition, candidates });
         }
         Ok(ProposalLookupResponse::candidates(entries))
     }
 
-    /// The store retains one body per transition, so this yields zero or one
+    /// The backup retains one body per transition, so this yields zero or one
     /// proposal even though the wire answer carries room for two candidates.
     /// Cache hits skip disk reads; later on-disk corruption surfaces only on
     /// the verified load paths (load_proposal / read_body_chunk I/O).
@@ -237,7 +238,7 @@ impl<F: TokioLikeFileSystem + 'static> ProposalStore<F> {
         result
     }
 
-    /// A transition whose bytes do not verify is dropped entirely: the pair goes
+    /// A transition whose bytes do not verify is dropped entirely: the transition goes
     /// back to absent so an honest body can be staged and installed again.
     async fn remove_transition(&self, inner: &mut RetainedBodies<F::File>, transition: &RealmTransition) {
         if let Some(record) = inner.by_transition.remove(transition) {
@@ -247,7 +248,7 @@ impl<F: TokioLikeFileSystem + 'static> ProposalStore<F> {
         if let Err(error) = self.fs.file_like_remove_file(&path).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(
-                    "failed to remove unverified transition pair=({},{}) error={error}",
+                    "failed to remove unverified transition=({},{}) error={error}",
                     hex::encode(transition.from_root),
                     hex::encode(transition.to_root)
                 );
@@ -255,7 +256,7 @@ impl<F: TokioLikeFileSystem + 'static> ProposalStore<F> {
         }
     }
 
-    /// Verifies the staged bytes and installs them as the pair's retained body.
+    /// Verifies the staged bytes and installs them as the transition's retained body.
     pub async fn install(&self, staged: StagedProposal) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().await;
         let mut file = self.fs.file_like_fs_open(&staged.path).await?;
@@ -288,7 +289,7 @@ impl<F: TokioLikeFileSystem + 'static> ProposalStore<F> {
         Ok(())
     }
 
-    async fn read_stored_transitions(&self) -> anyhow::Result<Vec<RealmTransition>> {
+    async fn load_retained_transitions(&self) -> anyhow::Result<Vec<RealmTransition>> {
         let mut transitions = Vec::new();
         let mut dir = tokio::fs::read_dir(self.root.join("bodies")).await?;
         while let Some(entry) = dir.next_entry().await? {
@@ -363,12 +364,11 @@ fn verify_complete_object(proposal: &Proposal, body: &[u8]) -> anyhow::Result<Re
 }
 
 fn realm_roots_from_state_updates(state_updates: &[u8]) -> anyhow::Result<RealmTransition> {
-    anyhow::ensure!(state_updates.len() >= STATE_UPDATES_ROOTS_OFFSET + 64, "state_updates missing old/new realm roots");
-    let mut old_root = [0; 32];
-    let mut new_root = [0; 32];
-    old_root.copy_from_slice(&state_updates[STATE_UPDATES_ROOTS_OFFSET..STATE_UPDATES_ROOTS_OFFSET + 32]);
-    new_root.copy_from_slice(&state_updates[STATE_UPDATES_ROOTS_OFFSET + 32..STATE_UPDATES_ROOTS_OFFSET + 64]);
-    Ok(RealmTransition { from_root: old_root, to_root: new_root })
+    let updates = decode_proposal_state_updates::<PHash>(state_updates)?;
+    Ok(RealmTransition {
+        from_root: updates.old_realm_root.into_owned_32bytes(),
+        to_root: updates.new_realm_root.into_owned_32bytes(),
+    })
 }
 
 async fn remove_staged_files(dir: &Path) -> anyhow::Result<()> {
@@ -400,107 +400,136 @@ fn parse_transition_file_name(name: &str) -> Option<RealmTransition> {
 mod tests {
     use super::*;
     use psy_data::p2p::{encode_proposal_body, proposal_from_parts, sha256, MAX_FINALIZER_OUTPUT_BYTES};
+    use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-    fn sample_object(salt: u8) -> (Proposal, Vec<u8>) {
+    fn canonical_empty_state_updates(from_root: [u8; 32], to_root: [u8; 32]) -> Vec<u8> {
+        PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: 0,
+            realm_sub_id: 0,
+            unique_pending_id: 0,
+            proc_checkpoint_unique_id: 0,
+            old_realm_root: PHash::from_owned_32bytes(from_root),
+            new_realm_root: PHash::from_owned_32bytes(to_root),
+            update_global_user_tree_nodes_ffs: Vec::new(),
+            update_user_contract_tree_nodes_ffs: Vec::new(),
+            update_contract_state_tree_nodes_ffs: Vec::new(),
+            update_user_leaves_ffs: Vec::new(),
+            update_contract_state_imt_leaves_ffs: Vec::new(),
+        }
+        .psy_ser_to_bytes_vec()
+        .unwrap()
+    }
+
+    fn build_proposal_with_body(salt: u8) -> (Proposal, Vec<u8>) {
         let output = vec![salt; MAX_FINALIZER_OUTPUT_BYTES];
         let proof = vec![0xAB; 32];
-        let mut updates = vec![0; STATE_UPDATES_ROOTS_OFFSET + 64 + 20];
-        updates[40..72].fill(1);
-        updates[72..104].fill(2);
+        let updates = canonical_empty_state_updates([1; 32], [2; 32]);
         let body = encode_proposal_body(&output, &proof, &updates, &[0x11; 32]).unwrap();
         let proposal = proposal_from_parts(1, 0, 99, 1, [salt; 32], sha256(&output), sha256(&proof), sha256(&updates), sha256(&body));
         (proposal, body)
     }
 
+    #[test]
+    fn typed_roots_match_canonical_header_bytes() {
+        let updates = canonical_empty_state_updates([1; 32], [2; 32]);
+        assert_eq!(&updates[40..72], &[1u8; 32]);
+        assert_eq!(&updates[72..104], &[2u8; 32]);
+        let decoded = realm_roots_from_state_updates(&updates).unwrap();
+        assert_eq!(decoded.from_root, [1; 32]);
+        assert_eq!(decoded.to_root, [2; 32]);
+    }
+
+
     #[tokio::test]
     async fn transition_record_round_trip_and_read_bounds() {
         let dir = tempfile::tempdir().unwrap();
-        let (proposal, body) = sample_object(1);
-        let store = ProposalStore::open(dir.path()).await.unwrap();
-        store.save_proposal(&proposal, &body).await.unwrap();
-        drop(store);
-        let store = ProposalStore::open(dir.path()).await.unwrap();
-        let loaded = store.load_proposal(&[1; 32], &[2; 32]).await.unwrap().unwrap();
+        let (proposal, body) = build_proposal_with_body(1);
+        let proposal_backup = ProposalBackup::open(dir.path()).await.unwrap();
+        proposal_backup.save_proposal(&proposal, &body).await.unwrap();
+        drop(proposal_backup);
+        let proposal_backup = ProposalBackup::open(dir.path()).await.unwrap();
+        let loaded = proposal_backup.load_proposal(&[1; 32], &[2; 32]).await.unwrap().unwrap();
         assert_eq!(loaded.0.proposal_id, proposal.proposal_id);
         assert_eq!(loaded.1, body);
         let mut request = BodyChunkRequest { proposal_id: proposal.proposal_id, offset: 0, max_bytes: 64 };
-        assert_eq!(store.read_body_chunk(&request).await.unwrap().data, body[..64]);
-        let path = store.transition_path(&RealmTransition { from_root: [1; 32], to_root: [2; 32] });
+        assert_eq!(proposal_backup.read_body_chunk(&request).await.unwrap().data, body[..64]);
+        let path = proposal_backup.transition_path(&RealmTransition { from_root: [1; 32], to_root: [2; 32] });
         let moved = dir.path().join("cached-object");
         tokio::fs::rename(&path, &moved).await.unwrap();
         request.offset = 64;
-        let second = store.read_body_chunk(&request).await.unwrap();
+        let second = proposal_backup.read_body_chunk(&request).await.unwrap();
         assert_eq!(second.data, body[64..128]);
         assert_eq!(second.body_hash, proposal.body_hash);
         assert_eq!(second.body_len, body.len() as u64);
         tokio::fs::rename(&moved, &path).await.unwrap();
         request.offset = body.len() as u64;
-        let end = store.read_body_chunk(&request).await.unwrap();
+        let end = proposal_backup.read_body_chunk(&request).await.unwrap();
         assert!(end.eof);
         assert!(end.data.is_empty());
         request.offset += 1;
-        assert!(store.read_body_chunk(&request).await.is_err());
+        assert!(proposal_backup.read_body_chunk(&request).await.is_err());
         request.offset = 0;
         request.max_bytes = 0;
-        assert!(store.read_body_chunk(&request).await.is_err());
+        assert!(proposal_backup.read_body_chunk(&request).await.is_err());
         request.max_bytes = BODY_CHUNK_MAX_BYTES + 1;
-        assert!(store.read_body_chunk(&request).await.is_err());
+        assert!(proposal_backup.read_body_chunk(&request).await.is_err());
     }
 
     #[tokio::test]
     async fn staging_order_and_slot_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProposalStore::open(dir.path()).await.unwrap();
-        let (first, first_body) = sample_object(1);
-        let (second, second_body) = sample_object(2);
-        let first_stage = store.create_staged(&first, &first_body).await.unwrap();
-        let second_stage = store.create_staged(&second, &second_body).await.unwrap();
-        assert!(store.load_proposal(&[1; 32], &[2; 32]).await.unwrap().is_none());
-        assert!(store.lookup_transition(&[1; 32], &[2; 32]).await.unwrap().is_empty());
-        assert_eq!(store.read_staged(&second_stage).await.unwrap().1, second_body);
-        store.install(second_stage).await.unwrap();
-        assert_eq!(store.lookup_transition(&[1; 32], &[2; 32]).await.unwrap(), vec![second.clone()]);
-        assert_eq!(store.read_staged(&first_stage).await.unwrap().1, first_body);
-        store.install(first_stage).await.unwrap();
-        assert_eq!(store.load_proposal(&[1; 32], &[2; 32]).await.unwrap().unwrap().0.proposal_id, first.proposal_id);
-        assert_eq!(store.lookup_transition(&[1; 32], &[2; 32]).await.unwrap(), vec![first.clone()]);
+        let proposal_backup = ProposalBackup::open(dir.path()).await.unwrap();
+        let (first, first_body) = build_proposal_with_body(1);
+        let (second, second_body) = build_proposal_with_body(2);
+        let first_stage = proposal_backup.create_staged(&first, &first_body).await.unwrap();
+        let second_stage = proposal_backup.create_staged(&second, &second_body).await.unwrap();
+        assert!(proposal_backup.load_proposal(&[1; 32], &[2; 32]).await.unwrap().is_none());
+        assert!(proposal_backup.lookup_transition(&[1; 32], &[2; 32]).await.unwrap().is_empty());
+        assert_eq!(proposal_backup.read_staged(&second_stage).await.unwrap().1, second_body);
+        proposal_backup.install(second_stage).await.unwrap();
+        assert_eq!(proposal_backup.lookup_transition(&[1; 32], &[2; 32]).await.unwrap(), vec![second.clone()]);
+        assert_eq!(proposal_backup.read_staged(&first_stage).await.unwrap().1, first_body);
+        proposal_backup.install(first_stage).await.unwrap();
+        assert_eq!(proposal_backup.load_proposal(&[1; 32], &[2; 32]).await.unwrap().unwrap().0.proposal_id, first.proposal_id);
+        assert_eq!(proposal_backup.lookup_transition(&[1; 32], &[2; 32]).await.unwrap(), vec![first.clone()]);
         let replaced = BodyChunkRequest { proposal_id: second.proposal_id, offset: 0, max_bytes: 64 };
-        assert!(store.read_body_chunk(&replaced).await.is_err());
-        store.save_proposal(&second, &second_body).await.unwrap();
-        assert_eq!(store.read_body_chunk(&replaced).await.unwrap().data, second_body[..64]);
-        store.save_proposal(&first, &first_body).await.unwrap();
-        assert_eq!(store.load_proposal(&[1; 32], &[2; 32]).await.unwrap().unwrap().1, first_body);
+        assert!(proposal_backup.read_body_chunk(&replaced).await.is_err());
+        proposal_backup.save_proposal(&second, &second_body).await.unwrap();
+        assert_eq!(proposal_backup.read_body_chunk(&replaced).await.unwrap().data, second_body[..64]);
+        proposal_backup.save_proposal(&first, &first_body).await.unwrap();
+        assert_eq!(proposal_backup.load_proposal(&[1; 32], &[2; 32]).await.unwrap().unwrap().1, first_body);
     }
 
     #[tokio::test]
     async fn damaged_transition_is_dropped_and_reinstallable() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ProposalStore::open(dir.path()).await.unwrap();
-        let (proposal, body) = sample_object(1);
-        store.save_proposal(&proposal, &body).await.unwrap();
-        let path = store.transition_path(&RealmTransition { from_root: [1; 32], to_root: [2; 32] });
+        let proposal_backup = ProposalBackup::open(dir.path()).await.unwrap();
+        let (proposal, body) = build_proposal_with_body(1);
+        proposal_backup.save_proposal(&proposal, &body).await.unwrap();
+        let path = proposal_backup.transition_path(&RealmTransition { from_root: [1; 32], to_root: [2; 32] });
         let mut corrupted = encode_object(&proposal, &body);
         *corrupted.last_mut().unwrap() ^= 1;
         tokio::fs::write(&path, corrupted).await.unwrap();
         let request = BodyChunkRequest { proposal_id: proposal.proposal_id, offset: 0, max_bytes: 64 };
         // Cache hit: the installed header is served without touching disk.
-        assert_eq!(store.lookup_transition(&[1; 32], &[2; 32]).await.unwrap(), vec![proposal.clone()]);
+        assert_eq!(proposal_backup.lookup_transition(&[1; 32], &[2; 32]).await.unwrap(), vec![proposal.clone()]);
         // The verified load is the corruption discovery point: the damaged body
-        // is dropped (record + file) so the pair returns to absent.
-        assert!(store.load_proposal(&[1; 32], &[2; 32]).await.is_err());
+        // is dropped (record + file) so the transition returns to absent.
+        assert!(proposal_backup.load_proposal(&[1; 32], &[2; 32]).await.is_err());
         assert!(!path_exists(&path).await);
-        assert!(store.lookup_transition(&[1; 32], &[2; 32]).await.unwrap().is_empty());
-        assert!(store.read_body_chunk(&request).await.is_err());
-        let stage = store.create_staged(&proposal, &body).await.unwrap();
-        assert_eq!(store.read_staged(&stage).await.unwrap().1, body);
-        store.install(stage).await.unwrap();
-        assert_eq!(store.read_body_chunk(&request).await.unwrap().data, body[..64]);
+        assert!(proposal_backup.lookup_transition(&[1; 32], &[2; 32]).await.unwrap().is_empty());
+        assert!(proposal_backup.read_body_chunk(&request).await.is_err());
+        let stage = proposal_backup.create_staged(&proposal, &body).await.unwrap();
+        assert_eq!(proposal_backup.read_staged(&stage).await.unwrap().1, body);
+        proposal_backup.install(stage).await.unwrap();
+        assert_eq!(proposal_backup.read_body_chunk(&request).await.unwrap().data, body[..64]);
         tokio::fs::write(&path, &[]).await.unwrap();
-        assert!(store.read_body_chunk(&request).await.is_err());
-        assert!(store.lookup_transition(&[1; 32], &[2; 32]).await.unwrap().is_empty());
+        assert!(proposal_backup.read_body_chunk(&request).await.is_err());
+        assert!(proposal_backup.lookup_transition(&[1; 32], &[2; 32]).await.unwrap().is_empty());
         assert!(!path_exists(&path).await);
-        store.save_proposal(&proposal, &body).await.unwrap();
-        assert_eq!(store.read_body_chunk(&request).await.unwrap().data, body[..64]);
+        proposal_backup.save_proposal(&proposal, &body).await.unwrap();
+        assert_eq!(proposal_backup.read_body_chunk(&request).await.unwrap().data, body[..64]);
     }
 
     async fn path_exists(path: &str) -> bool {

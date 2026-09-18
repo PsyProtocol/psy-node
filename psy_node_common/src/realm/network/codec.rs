@@ -3,7 +3,7 @@
 //!
 //! Three request/response protocols are wired:
 //! - `/psy/realm/proposal-body/1` — bounded proposal body range exchange.
-//! - `/psy/realm/proposal-lookup/1` — windowed root-pair proposal lookup.
+//! - `/psy/realm/proposal-lookup/1` — windowed realm-transition proposal lookup.
 //! - `/psy/realm/end-cap-forward/2` — EndCap forward stream (56-byte header
 //!   followed by `end_cap_input_len` input bytes and `proof_len` proof bytes);
 //!   version 2 carries the 18-byte typed rejection response.
@@ -21,7 +21,7 @@ use psy_data::p2p::{
     ProposalLookupRequest, ProposalLookupResponse, ProtocolEncode,
     BODY_CHUNK_REQUEST_WIRE_BYTES, BODY_CHUNK_MAX_BYTES, END_CAP_FORWARD_HEADER_WIRE_BYTES,
     END_CAP_FORWARD_RESPONSE_WIRE_BYTES, MAX_END_CAP_FORWARD_BYTES,
-    MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES, PROPOSAL_LOOKUP_MAX_PAIRS,
+    MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES, PROPOSAL_LOOKUP_MAX_TRANSITIONS,
     PROPOSAL_LOOKUP_REQUEST_MAX_WIRE_BYTES,
 };
 use std::{fmt, io};
@@ -140,10 +140,10 @@ impl Codec for ProposalLookupCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        if request.pairs.is_empty() || request.pairs.len() > PROPOSAL_LOOKUP_MAX_PAIRS {
-            return Err(invalid_data("invalid ProposalLookup pair count"));
+        if request.transitions.is_empty() || request.transitions.len() > PROPOSAL_LOOKUP_MAX_TRANSITIONS {
+            return Err(invalid_data("invalid ProposalLookup transition count"));
         }
-        let expected = 16 + request.pairs.len() * 64;
+        let expected = 16 + request.transitions.len() * 64;
         let bytes = request.protocol_encode_to_vec();
         if bytes.len() != expected {
             return Err(invalid_data("invalid ProposalLookup request length"));
@@ -162,14 +162,14 @@ impl Codec for ProposalLookupCodec {
     {
         let has_candidates = response.entries.iter().any(|entry| !entry.candidates.is_empty());
         if response.entries.iter().any(|entry| {
-            entry.candidates.len() > psy_data::p2p::PROPOSAL_LOOKUP_CANDIDATES_PER_PAIR
+            entry.candidates.len() > psy_data::p2p::PROPOSAL_LOOKUP_CANDIDATES_PER_TRANSITION
         }) || (response.status == psy_data::p2p::ProposalLookupStatus::Candidates && !has_candidates)
             || (response.status == psy_data::p2p::ProposalLookupStatus::Empty && has_candidates)
         {
             return Err(invalid_data("invalid ProposalLookup response"));
         }
         let mut expected = 5;
-        for entry in response.entries.iter().take(PROPOSAL_LOOKUP_MAX_PAIRS) {
+        for entry in response.entries.iter().take(PROPOSAL_LOOKUP_MAX_TRANSITIONS) {
             let entry_bytes = 65 + entry.candidates.len() * psy_data::p2p::PROPOSAL_WIRE_BYTES;
             if expected + entry_bytes > MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES {
                 break;

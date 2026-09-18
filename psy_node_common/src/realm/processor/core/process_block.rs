@@ -235,12 +235,12 @@ where
             let _ = request.reply.send(result);
         }
         self.db.sync_with_coordinator().await?;
-        self.commit_included_proposal_ffs().await?;
+        self.apply_proposal_ffs().await?;
         self.db.ensure_db_matches_coordinator_head().await
     }
 
 
-    async fn commit_included_proposal_ffs(&mut self) -> anyhow::Result<()>
+    async fn apply_proposal_ffs(&mut self) -> anyhow::Result<()>
     where
         N::HasherBase: MerkleZeroHasher<N::QHash>,
     {
@@ -268,7 +268,7 @@ where
         }
         last_modifieds.reverse();
         let old_root = self.db.state.last_committed_realm_end_root.into_owned_32bytes();
-        let (pair, included_checkpoint_id) = match crate::realm::processor::catchup::first_unapplied_transition(
+        let (transition, included_checkpoint_id) = match crate::realm::processor::catchup::first_unapplied_transition(
             self.db.state.last_committed_checkpoint_id,
             old_root,
             &last_modifieds,
@@ -280,8 +280,8 @@ where
                 }
                 return self.db.sync_to_coordinator_checkpoint_id(latest_checkpoint_id).await;
             }
-            crate::realm::processor::catchup::UnappliedTransition::Real { pair, included_checkpoint } => {
-                (pair, included_checkpoint)
+            crate::realm::processor::catchup::UnappliedTransition::Real { transition, included_checkpoint } => {
+                (transition, included_checkpoint)
             }
         };
         coordinator_realm_state = self.db.coordinator_client
@@ -290,9 +290,9 @@ where
         let coordinator_update = self.db.coordinator_client
             .rc_get_realm_sync_info(included_checkpoint_id, self.db.state.realm_id_u64)
             .await?;
-        let included = crate::realm::processor::recovery::CheckpointIdentity {
+        let included = crate::realm::processor::ffs::CheckpointIdentity {
             checkpoint_id: included_checkpoint_id,
-            checkpoint_hash: coordinator_update
+            checkpoint_leaf_hash: coordinator_update
                 .checkpoint_sync_info
                 .checkpoint_leaf_hash
                 .into_owned_32bytes(),
@@ -300,7 +300,7 @@ where
         let gathering_start = self.db.state.gathering_realm_start_root;
         let mut selected = match self
             .db
-            .verify_history_transition(&included, pair, None, &self.proposal_store)
+            .verify_history_transition(&included, transition, None, &self.proposal_backup)
             .await
         {
             Ok(Some(verified)) if included.checkpoint_id > self.db.state.last_committed_checkpoint_id => {
@@ -312,7 +312,7 @@ where
             }
             Ok(Some(verified)) => Some((verified.updates, verified.state_updates)),
             Ok(None) => None,
-            Err(error) if crate::realm::processor::recovery::invalid_candidate_id(&error).is_some() => None,
+            Err(error) if crate::realm::processor::ffs::invalid_candidate_id(&error).is_some() => None,
             Err(error) => return Err(error),
         };
         if selected.is_none() {
@@ -327,42 +327,42 @@ where
                 )?;
                 let staged = crate::realm::processor::catchup::stage_transition_blocks(
                     client,
-                    &self.proposal_store,
+                    &self.proposal_backup,
                     &peers,
                     self.db.state.chain_id,
                     self.db.state.realm_id_u64 as u32,
-                    &[pair],
+                    &[transition],
                     &[],
                 )
                 .await
                 .into_iter()
                 .find_map(|outcome| match outcome {
                     crate::realm::processor::catchup::TransitionFetchOutcome::Staged(_, staged) => Some(staged),
-                    crate::realm::processor::catchup::TransitionFetchOutcome::Absent(pair) => {
+                    crate::realm::processor::catchup::TransitionFetchOutcome::Absent(transition) => {
                         tracing::debug!(
-                            "no peer offered pair=({},{})",
-                            hex::encode(pair.old_root),
-                            hex::encode(pair.new_root)
+                            "no peer offered transition=({},{})",
+                            hex::encode(transition.old_root),
+                            hex::encode(transition.new_root)
                         );
                         None
                     }
-                    crate::realm::processor::catchup::TransitionFetchOutcome::Failed(pair, error) => {
+                    crate::realm::processor::catchup::TransitionFetchOutcome::Failed(transition, error) => {
                         tracing::warn!(
-                            "peer fetch failed pair=({},{}) error={error:#}",
-                            hex::encode(pair.old_root),
-                            hex::encode(pair.new_root)
+                            "peer fetch failed transition=({},{}) error={error:#}",
+                            hex::encode(transition.old_root),
+                            hex::encode(transition.new_root)
                         );
                         None
                     }
                 });
                 selected = match self
                     .db
-                    .verify_history_transition(&included, pair, staged.as_ref(), &self.proposal_store)
+                    .verify_history_transition(&included, transition, staged.as_ref(), &self.proposal_backup)
                     .await
                 {
                     Ok(Some(verified)) => {
                         if let Some(staged) = staged {
-                            self.proposal_store.install(staged).await?;
+                            self.proposal_backup.install(staged).await?;
                         }
                         if included.checkpoint_id > self.db.state.last_committed_checkpoint_id {
                             Some(
@@ -376,7 +376,7 @@ where
                     }
                     Ok(None) => None,
                     Err(error) => {
-                        if crate::realm::processor::recovery::invalid_candidate_id(&error).is_none() {
+                        if crate::realm::processor::ffs::invalid_candidate_id(&error).is_none() {
                             return Err(error);
                         }
                         None
@@ -394,7 +394,7 @@ where
         };
         if included_checkpoint_id > self.db.state.last_committed_checkpoint_id {
             tracing::info!(
-                "Committed Realm proposal FFS checkpoint_id={}",
+                "Applied proposal FFS checkpoint_id={}",
                 included_checkpoint_id
             );
         }
@@ -402,7 +402,7 @@ where
         self.db.state.gathering_realm_start_root = updates.new_realm_root;
         self.db.shared_state.update_from_core_state(&self.db.state).await?;
         if gathering_start != updates.old_realm_root && gathering_start != updates.new_realm_root {
-            self.rebuild_production_gatherer().await?;
+            self.recreate_guta_gatherer().await?;
         } else if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
             self.guta_queue_gatherer.fast_forward(updates_bytes).await?;
         }
@@ -780,7 +780,7 @@ where
             .copied()
             .filter(|(sub_id, _)| *sub_id != local_sub_id)
             .collect();
-        self.proposal_store.save_proposal(&proposal, &body).await?;
+        self.proposal_backup.save_proposal(&proposal, &body).await?;
         cmds.publish_proposal(proposal.clone(), body.clone(), remote_bls_keys).await?;
         cmds.publish_vote(own_vote.clone()).await?;
         tracing::info!(
@@ -846,7 +846,7 @@ where
         }
         let certificate = form_certificate(&proposal, &all_votes)?;
         validate_certificate(&proposal, &certificate, &validator_sub_ids, &leaf_bls_keys)?;
-        self.proposal_store.save_proposal(&proposal, &body).await?;
+        self.proposal_backup.save_proposal(&proposal, &body).await?;
         let signer_ids = all_votes.iter().map(|(sub_id, _)| *sub_id).collect::<Vec<_>>();
         tracing::info!(
             "realm P2P certificate formed proposal={} realm={} target={} epoch={} signers={:?} verified_votes={}",

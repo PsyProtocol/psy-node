@@ -1,3 +1,5 @@
+//! Genesis bootstrap classification and checkpoint-0 write/seed helpers.
+
 use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
 use parth_core::{
     QCoreProcCheckpointUniqueId,

@@ -163,8 +163,8 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 http_client,
             );
             tracing::info!("[REALM_BOOT] creating realm processor");
-            let proposal_store = Arc::new(
-                psy_node_common::realm::processor::proposal_store::ProposalStore::open(
+            let proposal_backup = Arc::new(
+                psy_node_common::realm::processor::proposal_backup::ProposalBackup::open(
                     config.get_proposal_backups_path(),
                 )
                 .await?,
@@ -196,7 +196,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 realm_sub_id,
                 validator_store,
                 proof_verifier.clone(),
-                proposal_store.clone(),
+                proposal_backup.clone(),
                 validator_leaves,
                 commands.clone(),
                 load_bls_secret_key(bls_key_path)?,
@@ -219,7 +219,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
                 proof_verifier,
-                proposal_store,
+                proposal_backup,
                 Some(commands.clone()),
             )
             .await?;

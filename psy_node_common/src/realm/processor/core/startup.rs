@@ -57,7 +57,7 @@ where
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
-        proposal_store: std::sync::Arc<crate::realm::processor::proposal_store::ProposalStore>,
+        proposal_backup: std::sync::Arc<crate::realm::processor::proposal_backup::ProposalBackup>,
         proposal_fetch: Option<crate::realm::network::RealmNetworkCommands>,
     ) -> anyhow::Result<Self> {
         tracing::info!("[REALM_STARTUP] processor new start");
@@ -72,7 +72,7 @@ where
             &guta_gatherer_backup_directory,
             genesis_block_update,
             &mut global_user_tree,
-            proposal_store.as_ref(),
+            proposal_backup.as_ref(),
             proposal_fetch.as_ref(),
         )
             .await?;
@@ -127,7 +127,7 @@ where
             p2p: None,
             rotation: None,
             bls_secret: None,
-            proposal_store,
+            proposal_backup,
             baseline_replay_rx: None,
             file_system,
             guta_gatherer_backup_directory,
@@ -157,13 +157,13 @@ where
     pub fn set_baseline_replay_rx(
         &mut self,
         baseline_replay_rx: tokio::sync::mpsc::Receiver<
-            crate::realm::processor::recovery::BaselineReplayRequest<N::QHash>,
+            crate::realm::processor::ffs::BaselineReplayRequest<N::QHash>,
         >,
     ) {
         self.baseline_replay_rx = Some(baseline_replay_rx);
     }
 
-    pub async fn abort_production_gatherer(&mut self) {
+    pub async fn abort_guta_gatherer(&mut self) {
         let Some(handle) = self.guta_gatherer_join.take() else {
             return;
         };
@@ -171,10 +171,10 @@ where
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                tracing::error!("production gatherer failed during abort: {error:#}");
+                tracing::error!("guta gatherer failed during abort: {error:#}");
             }
             Err(join_error) if !join_error.is_cancelled() => {
-                tracing::error!("production gatherer join error during abort: {join_error}");
+                tracing::error!("guta gatherer join error during abort: {join_error}");
             }
             Err(_) => {}
         }
@@ -184,7 +184,7 @@ where
     where
         N::HasherBase: parth_core::crypto::hash::traits::MerkleZeroHasher<N::QHash>,
     {
-        self.abort_production_gatherer().await;
+        self.abort_guta_gatherer().await;
         let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(
             &self.db.db,
             self.db.state.last_committed_checkpoint_id,
@@ -198,19 +198,19 @@ where
                 &self.file_system,
                 &self.guta_gatherer_backup_directory,
                 &mut global_user_tree,
-                self.proposal_store.as_ref(),
+                self.proposal_backup.as_ref(),
                 self.p2p.as_ref(),
             )
             .await?;
         self.db.sync_to_coordinator_set_checkpoint_id().await?;
-        self.rebuild_production_gatherer().await
+        self.recreate_guta_gatherer().await
     }
 
-    pub async fn rebuild_production_gatherer(&mut self) -> anyhow::Result<()>
+    pub async fn recreate_guta_gatherer(&mut self) -> anyhow::Result<()>
     where
         N::HasherBase: parth_core::crypto::hash::traits::MerkleZeroHasher<N::QHash>,
     {
-        self.abort_production_gatherer().await;
+        self.abort_guta_gatherer().await;
         let (global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(
             &self.db.db,
             self.db.state.last_committed_checkpoint_id,

@@ -226,7 +226,11 @@ fn command_paths(cli: &Cli) -> Vec<&str> {
         Commands::ProveTxTrace(args) => { push_session_paths(&mut paths, &args.session); paths.extend([args.session.rpc_config.as_str(), args.input.as_str()]); paths.extend(args.output.as_deref()); }
         Commands::PrivateTransfer(args) => paths.extend([args.rpc_config.as_str(), args.output.as_str()]),
         Commands::PrivateClaim(args) => { paths.push(&args.rpc_config); paths.extend(args.note_proof.as_deref()); }
-        Commands::DeriveNoteOwner(args) => paths.push(&args.rpc_config),
+        Commands::DeriveShield(args) => {
+            if args.private_key.is_some() {
+                paths.push(&args.rpc_config);
+            }
+        }
         Commands::ClaimDeposit(args) => { push_wallet_paths(&mut paths, &args.wallet); paths.extend([args.rpc_config.as_str(), args.deposit_proof.as_str()]); }
         Commands::Withdraw(args) => { push_wallet_paths(&mut paths, &args.wallet); paths.push(&args.rpc_config); }
         Commands::Deposit(args) => { paths.push(&args.rpc_config); paths.extend(args.deposit_proof_output.as_deref()); }
@@ -698,7 +702,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::PrivateTransfer(args) => crate::subcommand::private_transfer::run(args).await?,
         Commands::PrivateClaim(args) => crate::subcommand::private_claim::run(args).await?,
-        Commands::DeriveNoteOwner(args) => crate::subcommand::shield_address::run(args).await?,
+        Commands::DeriveShield(args) => crate::subcommand::shield_address::run(args).await?,
         Commands::ClaimDeposit(args) => claim_deposit::run(args).await?,
         Commands::Deposit(args) => deposit::run(args).await?,
         Commands::Withdraw(args) => withdraw::run(args).await?,

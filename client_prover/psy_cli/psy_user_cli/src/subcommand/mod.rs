@@ -145,8 +145,8 @@ pub enum Commands {
     PrivateTransfer(crate::subcommand::args::PrivateTransferArgs),
     /// Claim a private note from generated proof payload.
     PrivateClaim(crate::subcommand::args::PrivateClaimArgs),
-    /// Derive note owner hash from receiver pubkey and binding.
-    DeriveNoteOwner(crate::subcommand::args::DeriveNoteOwnerArgs),
+    /// Derive a shield address from a private key or a known user id.
+    DeriveShield(crate::subcommand::args::DeriveShieldArgs),
     /// Claim a bridge deposit on L2. Requires the deposit proof from
     /// psy-services.
     ClaimDeposit(crate::subcommand::args::ClaimDepositArgs),

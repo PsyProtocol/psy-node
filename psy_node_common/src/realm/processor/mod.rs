@@ -6,5 +6,5 @@ pub mod processor_shared_status;
 pub mod gatherers;
 pub mod create;
 pub mod coordinator_sync;
-pub mod proposal_store;
-pub mod recovery;
+pub mod proposal_backup;
+pub mod ffs;

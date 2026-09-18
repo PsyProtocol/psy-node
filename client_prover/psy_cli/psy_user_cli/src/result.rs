@@ -198,11 +198,13 @@ pub struct StatusResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NoteOwnerResult {
-    pub public_key: QHashOut<F>,
+pub struct ShieldAddressResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<QHashOut<F>>,
     pub user_id: u64,
-    pub note_owner: QHashOut<F>,
-    pub nostr_npub: String,
+    pub shield_address: QHashOut<F>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nostr_npub: Option<String>,
 }
 
 /// Public headers only. The trace payload, call data, witnesses, proofs, note
@@ -251,7 +253,7 @@ pub enum CommandResult {
     CheckpointId(CheckpointIdResult),
     ClaimAmount(ClaimAmountResult),
     TxStatus(StatusResult),
-    NoteOwner(NoteOwnerResult),
+    ShieldAddress(ShieldAddressResult),
     TxTrace(TxTraceResult),
     Proofs(ProofsResult),
     Generic(GenericResult),
@@ -288,7 +290,7 @@ impl CommandResult {
             Self::CheckpointId(v) => write_json_atomically(path, v),
             Self::ClaimAmount(v) => write_json_atomically(path, v),
             Self::TxStatus(v) => write_json_atomically(path, v),
-            Self::NoteOwner(v) => write_json_atomically(path, v),
+            Self::ShieldAddress(v) => write_json_atomically(path, v),
             Self::TxTrace(v) => write_json_atomically(path, v),
             Self::Proofs(v) => write_json_atomically(path, v),
             Self::Generic(v) => write_json_atomically(path, v),
@@ -415,6 +417,24 @@ mod tests {
         ] {
             assert!(!object.contains_key(forbidden));
         }
+    }
+
+    #[test]
+    fn shield_address_result_omits_optional_identity_on_user_id_path() {
+        let value = serde_json::to_value(ShieldAddressResult {
+            public_key: None,
+            user_id: 7,
+            shield_address: QHashOut::<F>::from_values(1, 2, 3, 4),
+            nostr_npub: None,
+        })
+        .unwrap();
+        let object = value.as_object().unwrap();
+        assert!(object.get("shield_address").is_some());
+        assert_eq!(object.get("user_id"), Some(&serde_json::json!(7)));
+        assert!(!object.contains_key("public_key"));
+        assert!(!object.contains_key("nostr_npub"));
+        assert!(!object.contains_key("note_owner"));
+        assert!(!object.contains_key("private_key"));
     }
 
     #[test]

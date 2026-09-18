@@ -29,8 +29,8 @@ use psy_node_common::{
         },
         processor::{
             consensus::{decode_proposal_state_updates, sign_vote, verify_proposal_submission},
-            proposal_store::ProposalStore,
-            recovery::BaselineReplayRequest,
+            proposal_backup::ProposalBackup,
+            ffs::BaselineReplayRequest,
         },
     },
 };
@@ -530,7 +530,7 @@ pub fn spawn_processor_realm_network<N, S>(
     local_sub_id: u16,
     validator_store: Arc<S>,
     proof_verifier: Arc<N::ZKVerifier>,
-    proposal_store: Arc<ProposalStore>,
+    proposal_backup: Arc<ProposalBackup>,
     validator_leaves: Vec<ValidatorLeaf>,
     commands: RealmNetworkCommands,
     bls_secret: psy_data::p2p::BlsSecretKey,
@@ -564,7 +564,7 @@ pub fn spawn_processor_realm_network<N, S>(
                     let proposal_id = proposal.proposal_id;
                     let validator_store = validator_store.clone();
                     let proof_verifier = proof_verifier.clone();
-                    let proposal_store = proposal_store.clone();
+                    let proposal_backup = proposal_backup.clone();
                     let vote_enabled = vote_enabled.clone();
                     let baseline_replay = baseline_replay.clone();
                     let commands = commands.clone();
@@ -613,7 +613,7 @@ pub fn spawn_processor_realm_network<N, S>(
                             proposer_user_id,
                             proof_verifier.as_ref(),
                         )?;
-                        proposal_store.save_proposal(&proposal, body.as_bytes()).await?;
+                        proposal_backup.save_proposal(&proposal, body.as_bytes()).await?;
                         if !vote_enabled.load(Ordering::Acquire) {
                             return Ok(());
                         }
@@ -655,7 +655,7 @@ pub fn spawn_processor_realm_network<N, S>(
                     });
                 }
                 RealmNetworkEvent::LookupReceived { request, reply, .. } => {
-                    let response = match proposal_store.lookup_proposal(&request).await {
+                    let response = match proposal_backup.lookup_proposal(&request).await {
                         Ok(response) => response,
                         Err(error) => {
                             tracing::warn!("ProposalLookup serve failed error={error:#}");
@@ -665,7 +665,7 @@ pub fn spawn_processor_realm_network<N, S>(
                     let _ = reply.send(response);
                 }
                 RealmNetworkEvent::DirectBodyReceived { request, reply, .. } => {
-                    match proposal_store.read_body_chunk(&request).await {
+                    match proposal_backup.read_body_chunk(&request).await {
                         Ok(response) => {
                             let _ = reply.send(response);
                         }

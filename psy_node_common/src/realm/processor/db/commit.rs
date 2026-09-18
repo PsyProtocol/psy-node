@@ -120,13 +120,13 @@ where
     )
     .await?;
     write_checkpoint_state_records::<N, S>(db, &coordinator_update.checkpoint_sync_info, membership).await?;
-    let imt_managed = if checkpoint_id == 0 {
+    let changed_leaves_on_imt_indexed_trees = if checkpoint_id == 0 {
         HashSet::new()
     } else {
-        crate::realm::processor::recovery::imt_managed_leaves_from_db::<S, N::F, N::QHash>(db, realm_update)
+        crate::realm::processor::db::load_changed_leaves_on_imt_indexed_trees::<S, N::F, N::QHash>(db, realm_update)
             .await?
     };
-    crate::realm::processor::recovery::require_state_update_record_coverage(realm_update, checkpoint_id, &imt_managed)?;
+    crate::realm::processor::db::require_state_update_record_coverage(realm_update, checkpoint_id, &changed_leaves_on_imt_indexed_trees)?;
     apply_realm_ffs_updates::<N, S>(db, checkpoint_id, realm_update).await?;
     let durable_tip = db.get_latest_checkpoint_id().await?;
     if checkpoint_id >= durable_tip {

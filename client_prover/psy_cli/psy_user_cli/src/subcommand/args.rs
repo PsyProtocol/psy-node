@@ -795,11 +795,13 @@ pub struct WithdrawArgs {
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]
-pub struct DeriveNoteOwnerArgs {
+pub struct DeriveShieldArgs {
     #[clap(env, long, default_value = "config.json")]
     pub rpc_config: String,
-    #[clap(long, short = 'p')]
-    pub private_key: String,
+    #[clap(long, short = 'p', conflicts_with = "user_id", required_unless_present = "user_id")]
+    pub private_key: Option<String>,
+    #[clap(long, conflicts_with = "private_key", required_unless_present = "private_key")]
+    pub user_id: Option<u64>,
     #[clap(long, default_value_t = 0)]
     pub random0: u64,
     #[clap(long, default_value_t = 0)]

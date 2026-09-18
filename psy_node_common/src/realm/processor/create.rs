@@ -45,7 +45,7 @@ pub async fn create_realm_processor<
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     coordinator_client: Arc<CoordinatorClient>,
     proof_verifier: Arc<N::ZKVerifier>,
-    proposal_store: Arc<crate::realm::processor::proposal_store::ProposalStore>,
+    proposal_backup: Arc<crate::realm::processor::proposal_backup::ProposalBackup>,
     proposal_fetch: Option<crate::realm::network::RealmNetworkCommands>,
 ) -> anyhow::Result<
     PsyRealmProcessor<
@@ -96,7 +96,7 @@ where
         genesis,
         file_system,
         guta_gatherer_backup_directory,
-        proposal_store,
+        proposal_backup,
         proposal_fetch,
     )
     .await?;

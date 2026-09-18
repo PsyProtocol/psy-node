@@ -69,9 +69,9 @@ pub struct PsyRealmProcessor<
     /// Local validator BLS secret key used to sign the processor's own Vote.
     /// Required when P2P is enabled; `set_realm_p2p` wires it.
     pub bls_secret: Option<psy_data::p2p::BlsSecretKey>,
-    pub proposal_store: std::sync::Arc<crate::realm::processor::proposal_store::ProposalStore>,
+    pub proposal_backup: std::sync::Arc<crate::realm::processor::proposal_backup::ProposalBackup>,
     pub baseline_replay_rx: Option<
-        mpsc::Receiver<crate::realm::processor::recovery::BaselineReplayRequest<N::QHash>>,
+        mpsc::Receiver<crate::realm::processor::ffs::BaselineReplayRequest<N::QHash>>,
     >,
     pub file_system: Arc<FileSystem>,
     pub guta_gatherer_backup_directory: String,

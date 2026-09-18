@@ -35,8 +35,8 @@ pub use messages::{
     proposal_from_parts, vote_message, Certificate, BodyChunkRequest, BodyChunkResponse,
     EndCapForwardHeader, EndCapForwardResponse, EndCapRejectReason, Proposal, ProposalLookupEntry,
     ProposalLookupRequest, ProposalLookupResponse, ProposalLookupStatus, RealmTransition, ProposalPart,
-    RealmFinalizeOutputBytes, RealmFinalizeSubmitCode, Vote, PROPOSAL_LOOKUP_CANDIDATES_PER_PAIR,
-    PROPOSAL_LOOKUP_MAX_PAIRS, PROPOSAL_LOOKUP_REQUEST_MAX_WIRE_BYTES, PROPOSAL_LOOKUP_WINDOW_PAIRS,
+    RealmFinalizeOutputBytes, RealmFinalizeSubmitCode, Vote, PROPOSAL_LOOKUP_CANDIDATES_PER_TRANSITION,
+    PROPOSAL_LOOKUP_MAX_TRANSITIONS, PROPOSAL_LOOKUP_REQUEST_MAX_WIRE_BYTES, PROPOSAL_LOOKUP_WINDOW_TRANSITIONS,
 };
 pub use node_id::NodeId;
 pub use validator_leaf::ValidatorLeaf;

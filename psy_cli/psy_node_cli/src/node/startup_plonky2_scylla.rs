@@ -364,8 +364,8 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
             let coordinator_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
                 http_client,
             );
-            let proposal_store = Arc::new(
-                psy_node_common::realm::processor::proposal_store::ProposalStore::open(
+            let proposal_backup = Arc::new(
+                psy_node_common::realm::processor::proposal_backup::ProposalBackup::open(
                     config.get_proposal_backups_path(),
                 )
                 .await?,
@@ -397,7 +397,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 realm_sub_id,
                 validator_store,
                 proof_verifier.clone(),
-                proposal_store.clone(),
+                proposal_backup.clone(),
                 validator_leaves,
                 commands.clone(),
                 load_bls_secret_key(bls_key_path)?,
@@ -420,7 +420,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
                 proof_verifier,
-                proposal_store,
+                proposal_backup,
                 Some(commands.clone()),
             )
             .await?;

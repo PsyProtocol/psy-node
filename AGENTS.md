@@ -14,6 +14,10 @@ This file governs `psy-node` and coordinated changes across the sibling PsyProto
 
 It supplements higher-level agent rules. The stricter rule wins.
 
+## Required Terminology Reading
+
+Before naming a function, variable, field, type, module, file, or log marker, every AI agent MUST read `docs/src/dev/TERMINOLOGY.md`. That file owns the shared verbs and domain nouns. Do not create a second term for a concept it already names; reuse the existing word. If a needed term is absent, add it to `docs/src/dev/TERMINOLOGY.md` in the same change that introduces the symbol.
+
 ## Required Devnet Lifecycle Reading
 
 Before any devnet startup, shutdown, restart, rollback, or live E2E operation, every AI agent MUST read and follow `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md`. The lifecycle guide owns state-preserving operations; the launcher reference owns launcher flags, the startup DAG, ports, environment, Anvil persistence, and known current-source limitations. JTMB remains test-only and is not rollback-validation evidence. Rollback validation uses the Plonky2 path; all lifecycle stop/resume, artifact, and verification procedures remain authoritative.
@@ -589,19 +593,20 @@ Required fields per note:
 
 ## Naming
 
-1. Functions state what they do, variables state what they represent, and types state what they model.
-2. Avoid vague names such as `tmp`, `data`, `result`, `obj`, and `foo` in long-lived or public interfaces.
-3. Use only universally understood abbreviations such as `ctx`, `id`, `cfg`, `db`, and `tx`.
-4. Use the same name for the same concept throughout the repository.
-5. Do not rename an existing value when creating its target, constant, reference, witness, or borrowed form. Preserve the established concept name with a structural suffix only when the type requires distinction, for example `guta_circuit_whitelist_root` and `guta_circuit_whitelist_root_target`; subjective aliases such as `official_whitelist_root`, `canonical_root`, or `expected_root` for that same value are forbidden.
-6. Prefix booleans with `is_`, `has_`, `should_`, or `can_`.
-7. Do not embed task identifiers, phase numbers, or step numbers in code names, file names, comments, or commit messages.
-8. Version numbers belong to the runtime revision field and migration manifests, not to type names. If a migration window forces two schemas to coexist, name both by role and remove the older schema in the next storage-layout revision.
-9. Lifecycle and authority labels (`legacy`, `old`, `deprecated`, `retired`, `canonical`, `official`, `v1`, `v2`) never name code, files, or documentation. Keep exactly one optimal implementation. A proxy-upgrade storage mirror is named by what it holds (for example `ImportedTokenFlowConfig`) and is removed in the next storage-layout revision.
-10. Prefer one common verb plus one concrete object for function names. Use direct verbs such as `get`, `set`, `check`, `read`, `write`, `load`, `save`, `add`, `remove`, `create`, `update`, `apply`, and `build`; avoid multi-verb names, process jargon, and subjective lifecycle labels when one plain action states the behavior. `persist` is banned: write durable data with `save`/`write`, read it back with `load`/`read`; do not introduce `persist*`, `store` as a verb synonym for those, or other interchangeable synonyms for the same operation.
-11. Name quantities as `<state-or-qualifier>_<domain-object>_<unit>`, with the unit last: `remaining_backup_bytes`, `max_proof_bytes`, `processed_user_count`. Avoid sentence fragments such as `backup_bytes_remaining` and implementation terms such as `allocation` when the value is a validated size or count.
-12. Use common verbs consistently: `get` reads an existing value; `load` assembles a domain value from durable storage; `read` decodes a file or byte stream; `build` derives a value without persistence; `create` makes a new stored or runtime object; `set` replaces a whole value; `update` changes part of a value; `apply` executes a state transition; `validate` checks untrusted or serialized input; `ensure` enforces an internal invariant and returns an error; `check` returns a state classification or health result. Do not use these as interchangeable synonyms.
-13. Order composite domain names from scope to object to representation: `checkpoint_tree_root`, `validator_tree_proof`, `user_leaf_hash`, `gathering_checkpoint_id`. State qualifiers precede the domain name (`current_`, `next_`, `last_committed_`, `remaining_`, `expected_`, `actual_`); collections use plural nouns and identifiers end in `_id` or `_ids`.
+1. Read `docs/src/dev/TERMINOLOGY.md` before choosing any new function, variable, field, or type name. Reuse a term that file already defines. A second name for the same concept is forbidden.
+2. Functions state what they do, variables state what they represent, and types state what they model.
+3. Avoid vague names such as `tmp`, `data`, `result`, `obj`, and `foo` in long-lived or public interfaces.
+4. Use only universally understood abbreviations such as `ctx`, `id`, `cfg`, `db`, and `tx`.
+5. Use the same name for the same concept throughout the repository. Do not introduce a synonym, alias, or parallel term.
+6. Do not rename an existing value when creating its target, constant, reference, witness, or borrowed form. Preserve the established concept name with a structural suffix only when the type requires distinction, for example `guta_circuit_whitelist_root` and `guta_circuit_whitelist_root_target`; subjective aliases such as `official_whitelist_root`, `canonical_root`, or `expected_root` for that same value are forbidden.
+7. Prefix booleans with `is_`, `has_`, `should_`, or `can_`.
+8. Do not embed task identifiers, phase numbers, or step numbers in code names, file names, comments, or commit messages.
+9. Version numbers belong to the runtime revision field and migration manifests, not to type names. If a migration window forces two schemas to coexist, name both by role and remove the older schema in the next storage-layout revision.
+10. Lifecycle and authority labels (`legacy`, `old`, `deprecated`, `retired`, `canonical`, `official`, `v1`, `v2`) never name code, files, or documentation. Keep exactly one optimal implementation. A proxy-upgrade storage mirror is named by what it holds (for example `ImportedTokenFlowConfig`) and is removed in the next storage-layout revision.
+11. Prefer one common verb plus one concrete object for function names. Use direct verbs such as `get`, `set`, `check`, `read`, `write`, `load`, `save`, `add`, `remove`, `create`, `update`, `apply`, `build`, and `derive`; avoid multi-verb names, process jargon, and subjective lifecycle labels when one plain action states the behavior. `persist` is banned: write durable data with `save`/`write`, read it back with `load`/`read`; do not introduce `persist*`, `store` as a verb synonym for those, or other interchangeable synonyms for the same operation.
+12. Name quantities as `<state-or-qualifier>_<domain-object>_<unit>`, with the unit last: `remaining_backup_bytes`, `max_proof_bytes`, `processed_user_count`. Avoid sentence fragments such as `backup_bytes_remaining` and implementation terms such as `allocation` when the value is a validated size or count.
+13. Use common verbs consistently: `get` reads an existing value; `load` assembles a domain value from durable storage; `read` decodes a file or byte stream; `build` assembles a composite value without persistence; `derive` computes a deterministic hash or identity from known inputs; `create` makes a new stored or runtime object; `set` replaces a whole value; `update` changes part of a value; `apply` executes a state transition; `validate` checks untrusted or serialized input; `ensure` enforces an internal invariant and returns an error; `check` returns a state classification or health result. Do not use these as interchangeable synonyms.
+14. Order composite domain names from scope to object to representation: `checkpoint_tree_root`, `validator_tree_proof`, `user_leaf_hash`, `gathering_checkpoint_id`. State qualifiers precede the domain name (`current_`, `next_`, `last_committed_`, `remaining_`, `expected_`, `actual_`); collections use plural nouns and identifiers end in `_id` or `_ids`.
 
 ## Module Boundaries and Imports
 
@@ -698,17 +703,19 @@ A change is rejected until any applicable item is corrected:
 
 ## Documentation Standards
 
-1. `docs/` is the official developer-facing documentation: architecture, protocol, CLI reference, and verified procedures. It is split by audience. Public developer documentation lives under the mdBook-published tree (`src/SUMMARY.md` registration required). Internal developer documentation (devnet operations, verifier/circuit update procedures, debugging playbooks, incident postmortems) lives under `docs/src/dev/` and MUST NOT be registered in `src/SUMMARY.md` — it is repository-only and never published. Keep each topic consolidated in one document; do not fragment operational knowledge into many scattered files, and do not mix internal debugging records into public docs. Current GUTA pipeline internals: `docs/src/dev/reward-tree-circuits.md` (circuit reward layout and ASCII tree), `docs/src/dev/gatherers.md`, `docs/src/dev/processors.md`.
-
-2. Specs, reviews, and research documents must support factual claims with current `<file>:<line>` references.
-3. Reviews accept verified facts or explicit open questions, not inference presented as evidence.
-4. Test plans cover unit, integration, negative, and regression checks where applicable.
-5. Acceptance criteria are executable commands or observable scenarios.
-6. Mark inferred research statements explicitly as `Inference:` and list unchecked areas.
-7. Separate `In Scope` and `Out of Scope` in every specification.
-8. Operational documents are command-verified before commit: binaries, subcommands, flags, environment variables, RPC method names, ports, and configuration keys must match the current clap, serde, and network-configuration definitions. A nonexistent binary, flag, or environment variable in a document is a defect, not a style issue.
-9. When explaining code to users, default to concise pseudocode plus the core function and parameter names. Show real implementation excerpts or full data structures only when needed to resolve ambiguity, prove a claim, or enable a concrete action.
-10. Keep ordinary technical replies centered on the decision, observable behavior, material risk, and verification.
+1. `docs/` is the official developer-facing documentation: architecture, protocol, CLI reference, and verified procedures. It is split by audience.
+2. Public developer documentation lives under the mdBook-published tree (`src/SUMMARY.md` registration required). Internal developer documentation (devnet operations, verifier/circuit update procedures, debugging playbooks, incident postmortems) lives under `docs/src/dev/` and MUST NOT be registered in `src/SUMMARY.md` — it is repository-only and never published.
+3. Keep each topic consolidated in one document; do not fragment operational knowledge into many scattered files, and do not mix internal debugging records into public docs.
+4. Shared naming vocabulary is `docs/src/dev/TERMINOLOGY.md`. Current GUTA pipeline internals: `docs/src/dev/reward-tree-circuits.md` (circuit reward layout and ASCII tree), `docs/src/dev/gatherers.md`, `docs/src/dev/processors.md`.
+5. Specs, reviews, and research documents must support factual claims with current `<file>:<line>` references.
+6. Reviews accept verified facts or explicit open questions, not inference presented as evidence.
+7. Test plans cover unit, integration, negative, and regression checks where applicable.
+8. Acceptance criteria are executable commands or observable scenarios.
+9. Mark inferred research statements explicitly as `Inference:` and list unchecked areas.
+10. Separate `In Scope` and `Out of Scope` in every specification.
+11. Operational documents are command-verified before commit: binaries, subcommands, flags, environment variables, RPC method names, ports, and configuration keys must match the current clap, serde, and network-configuration definitions. A nonexistent binary, flag, or environment variable in a document is a defect, not a style issue.
+12. When explaining code to users, default to concise pseudocode plus the core function and parameter names. Show real implementation excerpts or full data structures only when needed to resolve ambiguity, prove a claim, or enable a concrete action.
+13. Keep ordinary technical replies centered on the decision, observable behavior, material risk, and verification.
 
 ## Agent Communication Style
 
@@ -718,15 +725,16 @@ A change is rejected until any applicable item is corrected:
 4. Clarify module boundaries with an ownership table: which module owns which datum, who reads, who writes.
 5. Use tables for classifications (mechanism vs necessity, component vs verdict) instead of narrative paragraphs.
 
-
 ## Naming Quality Checklist
 
-Every new name (function, file, directory, type, concept) must pass three tests. Any "no" means rename before landing.
+Every new name (function, file, directory, type, concept) must pass three tests. Any "no" means rename before landing. Read `docs/src/dev/TERMINOLOGY.md` first; if that file already names the concept, reuse that word.
 
 1. **Does the name say WHAT it does or contains?** The name must name a concrete domain concept, not a generic category. `objects/` fails (anything could be an object); `proposals/` passes (the directory contains proposals). `put_complete` fails ("complete" is an adjective, not an object); `store_proposal` passes ("store" is the action, "proposal" is the object).
 2. **Can someone who has never seen the code understand it from the name alone?** `lookup` fails (lookup what? by what key?); `lookup_by_checkpoint` passes (self-contained). `active view` fails ("view" is a presentation term, not a domain concept); `applied set` passes ("applied" = committed to DB, "set" = the collection).
 3. **Is there a more specific word that would be equally short?** If the answer is yes, use the more specific word. Never keep a vague name because renaming feels disruptive — vague names compound into unreadable codebases.
+
 The pattern for functions: **verb + concrete object**. The pattern for files/directories: **concrete noun**. If the object slot is filled by a generic word (`data`, `result`, `obj`, `items`, `view`, `complete`), replace it with the actual domain noun. The same ban covers generic catch-all nouns: `metadata`, `manifest`, `info`, `payload`, `context`, `detail(s)`, `entry`, `item(s)`, `blob`, `misc` — each must be replaced by what the value actually is (e.g. `PsyProvingJobMetadata` holds reward-tree layout and dependencies → name it by those fields, not "metadata"; a reset marker file is a `reset_marker`, not a "manifest"). `metadata`/`manifest` are allowed only where the word names a real external API or an established on-disk format owned outside this workspace; new code must name the concrete content. `isolated`/`isolation` are also banned as names: say what the check actually does — untrusted records replayed against the authenticated baseline before any durable write — e.g. `verify_state_updates_against_baseline`, `baseline_replay`; do not name new functions, types, fields, or error strings with `isolat*`. `submission` is banned as a new name: name the concrete act (`end_cap_upload`, `proof_delivery`, `vote_publication`) or reuse the established wire/type name it wraps; `Submit*`/`AlreadySubmitted` survive only as existing external API/wire names owned by current shipped interfaces.
+
 ## Git Commit Rules
 
 1. Commit each independent task or milestone separately.

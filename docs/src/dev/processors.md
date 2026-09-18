@@ -6,6 +6,8 @@
 
 ## Terminology
 
+Shared verbs are in [TERMINOLOGY](TERMINOLOGY.md). Local terms:
+
 | Term | Meaning |
 |---|---|
 | Processor | Long-lived async loop that gathers one batch, publishes proving jobs, and commits durable state. |
@@ -178,11 +180,14 @@ Root-proof waits must observe the persisted proof store, not only a queue-comple
 
 ## Related Documents
 
-- [Gatherers](gatherers.md) — who owns the trees and the N/N+1 seam.
-- [Reward Tree Circuit Layouts](reward-tree-circuits.md) — part-1 and CST reward nodes.
-- [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md) — submit/admit gate.
-- [Realm P2P Validators](realm-p2p-validators.md) — scheduled proposer.
-- [Devnet Lifecycle](devnet_lifecycle.md) — stack start/stop; processors are not restarted individually.
+| Document | Owns |
+|---|---|
+| [TERMINOLOGY](TERMINOLOGY.md) | Shared verbs; include vs apply vs commit; ready-path `apply_proposal_ffs` |
+| [Gatherers](gatherers.md) | Who owns the trees and the N/N+1 seam |
+| [Reward Tree Circuit Layouts](reward-tree-circuits.md) | Part-1 and CST reward nodes |
+| [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md) | Submit/admit gate |
+| [Realm P2P Validators](realm-p2p-validators.md) | Scheduled proposer |
+| [Devnet Lifecycle](devnet_lifecycle.md) | Stack start/stop; processors are not restarted individually |
 
 ## File index
 

@@ -74,7 +74,7 @@ Client CLI for wallet, contract deploy/call, tree/metadata queries, proving help
 | `prove-tx-trace` |
 | `private-transfer` |
 | `private-claim` |
-| `derive-note-owner` |
+| `derive-shield` |
 | `claim-deposit` |
 | `withdraw` |
 | `deposit` |
@@ -92,7 +92,7 @@ Client CLI for wallet, contract deploy/call, tree/metadata queries, proving help
 | Proving | `local-prover`, `prove-proxy`, `generate-tx-trace`, `prove-tx-trace`, `get-user-end-cap-common-data` |
 | Rewards / jobs | `get-claim-amount`, `batch-claim`, `claim-rewards`, `get-checkpoint-id-for-unique-pending-id`, `generate-batch-proof-miner-reward-proofs` |
 | Bridge | `deposit`, `claim-deposit`, `withdraw`, `claim-withdrawal` |
-| Privacy | `private-transfer`, `private-claim`, `derive-note-owner` |
+| Privacy | `private-transfer`, `private-claim`, `derive-shield` |
 | Misc | `tx`, `faucet-server`, `get-psy-sdc-fingerprint`, `get-user-event-data`, `get-user-leaf` |
 
 ## Source

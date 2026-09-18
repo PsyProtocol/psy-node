@@ -160,7 +160,7 @@ where
             break;
         }
     }
-    processor.abort_production_gatherer().await;
+    processor.abort_guta_gatherer().await;
     processor.db.status.mark_stopped();
     print_cf_log_indicator("PSY_REALM_PROCESSOR_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 

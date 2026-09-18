@@ -41,7 +41,7 @@ sequenceDiagram
     participant CLI as Release psy_dev_cli
     participant Stores as Retained stores
     Operator->>Supervisor: 1. make rollback-stop
-    Supervisor-->>Operator: 2. Applications stopped; sentinel written
+    Supervisor-->>Operator: 2. Applications stopped, sentinel written
     loop Coordinator and four Realm identities
         Operator->>CLI: 3. --generate with unique RP path
         CLI->>Stores: 4. Read target, mappings, backups, high-water
@@ -55,7 +55,7 @@ sequenceDiagram
     end
     Operator->>Operator: 10. Require all phases completed and external recovery complete
     Operator->>Supervisor: 11. make rollback-resume
-    Supervisor-->>Operator: 12. Saved applications ready; sentinel removed
+    Supervisor-->>Operator: 12. Saved applications ready, sentinel removed
 ```
 
 Generation reads authoritative stores and backups; execution writes the checkpoint marker last and persists phase progress (`psy_cli/psy_dev_cli/src/subcommand/rollback/generate.rs:301-340`; `psy_node_common/src/rollback/executor.rs:130-203`).
