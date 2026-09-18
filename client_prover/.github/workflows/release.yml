@@ -188,6 +188,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           OUT_DIR: target/${{ matrix.target }}/${{ env.PROFILE }}
           SQLX_OFFLINE: true
+          PSY_NETWORK: localhost
         shell: bash
         run: |
           set -eo pipefail

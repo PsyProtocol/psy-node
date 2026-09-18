@@ -37,20 +37,35 @@ wallet itself uses.
   · `pause_policy` · `resume_policy` · `revoke_session` · `check_budget` ·
   `describe_policy` · `get_spend_log`
 - **Live reads:** `get_chain_status` · `get_user_info` · `get_claimable`
-- **Spend / claim (policy-gated → real proof):**
-  - `transfer` — public `simple_transfer`, real proof + submit.
-  - `claim_all` — fuse all public claimables from the given senders into ONE UPS
-    proof / one fee (`claim_batch` + `simple_claim`). Safe: claiming only folds
-    funds already addressed to you.
-  - `private_transfer` — **prepare-only.** Derives the note and the exact
-    on-chain `private_transfer` call but does NOT submit: a private transfer is
-    claimable only once its note is delivered to the recipient over Nostr in the
-    exact format their wallet drains. That delivery is not yet wired/verified
-    (the CLI reference tags `psy_private_transfer` while recipient wallets drain
-    `psy_private_transfer_proof` — a mismatch that would strand funds). Settlement
-    is withheld until delivery is wired and verified against a live recipient.
-  - Deposit / withdraw and the x402 tools layer on the same `exec_call` /
-    `claim_batch` primitives next.
+- **Transactions (two-phase, see below):** `transfer` · `transfer_batch` ·
+  `claim_all` · `claim_deposit` · `private_claim` · `claim_batch` · `deposit` ·
+  `retry_deposit_delivery` · `withdraw` · `private_transfer` · `claim_faucet` ·
+  `call_contract` · `psyup_deploy` · `x402_fetch` · plus `create_wallet` /
+  `mint_agent_account`. None of these is callable directly: each is exposed as a
+  `prepare_<name>` / `execute_<name>` pair.
+
+### Transaction confirmation (prepare → execute)
+
+Every operation that can cause an on-chain write, an L1 write, or a payment
+requires two calls with a human in the loop:
+
+1. **`prepare_<name>`** — takes the operation's real arguments. Does NOT
+   authorize, charge budget, or submit anything. Stores them verbatim for five
+   minutes and returns a one-time `confirmation_token` plus the full summary
+   for review — complete network, addresses, token, and amounts; only
+   credentials (`session`, `owner_token`, `private_key*`) are redacted.
+2. **`execute_<name>`** — takes ONLY `confirmation_token` + `owner_token`.
+   Transaction fields cannot be re-passed or modified. The ticket is bound to
+   the operation, wallet, network, and every parameter, expires in five
+   minutes, and is consumed on first use. Execution always requires the
+   `PSY_MCP_OWNER_TOKEN` the server was started with — without it every
+   `execute_*` is disabled outright (fail closed, no dev fallback).
+
+The ticket's wallet binding rides the session token stored at prepare time: a
+policy governs one wallet, so swapping the active wallet between prepare and
+execute makes authorization fail and records the attempt. `create_wallet` /
+`mint_agent_account` take no session; for them the execute call's owner token
+is forwarded to their internal owner gate.
 
 ## Policy
 
@@ -128,7 +143,7 @@ Runtime environment:
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `PSY_MCP_OWNER_TOKEN` | Yes for owner tools | Owner gate token; agent tools still work without it |
+| `PSY_MCP_OWNER_TOKEN` | Yes for owner tools **and every `execute_*`** | Owner gate token. Without it all `execute_*` transaction tools are disabled (prepare/read-only tools still work) |
 | `PSY_MCP_KEY_FILE` | Optional | Load an existing key backup instead of creating a fresh wallet |
 
 The keystore lives at `/app/keys` inside the container. Mount a host directory or
@@ -165,7 +180,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```
 
 Restart Claude Desktop, then ask: **"List the psy wallet tools"**. You should
-see ~37 tools including `transfer`, `claim_batch`, and `x402_fetch`.
+see read-only tools (`get_balance`, `wallet_status`, …) plus `prepare_*` /
+`execute_*` pairs for every transaction (`prepare_transfer`, `execute_claim_batch`,
+`prepare_x402_fetch`, …) — no raw `transfer`/`claim_batch`/`x402_fetch`.
 
 ### Connect to Claude Code
 
@@ -191,18 +208,20 @@ docker run --rm -v psy_wallet_keys:/app/keys --entrypoint sh \
 
 ## Smoke test
 
-A quick read-only smoke test is available in `test-kit/smoke-test.sh`. With the
-image loaded:
+`scripts/smoke_confirmation_flow.py` drives a built binary over stdio MCP and
+verifies the confirmation flow end to end: no raw transaction routes in
+`tools/list`, direct calls refused, prepare storing verbatim arguments with
+credentials redacted, wrong owner token refused, smuggled fields refused,
+correct-owner dispatch reaching the real tool (stopped safely at the policy
+gate by a fake session), single-use tickets, and unknown tickets refused. It
+runs against a throwaway keystore with a random owner token, so it never
+touches real wallets or funds:
 
 ```bash
-cd client_prover/psy_mcp_server/test-kit
-bash smoke-test.sh
-```
-
-To run the full 6-check suite you need a wallet file:
-
-```bash
-SMOKE_KEY_FILE=/app/keys/wallet-xxxx.json bash smoke-test.sh
+cargo build --release
+python3 client_prover/psy_mcp_server/scripts/smoke_confirmation_flow.py
+# or point it at a specific binary/config:
+python3 scripts/smoke_confirmation_flow.py ../../target/release/psy-mcp-server ~/.psy/config.json
 ```
 
 ## Manual test checklist
@@ -223,14 +242,19 @@ Copy and fill as you test. Amounts are in Nano (1 PSY = 1e9 Nano).
 
 ### Group 2 — Transfers & claims (~30 min)
 
+Every prompt below now ends in a `prepare_*` result (`status=prepared`, full
+summary, `confirmation_token`) — nothing submits until the owner runs the
+matching `execute_*` with the owner token. "…then execute" below means exactly
+that second, human-made call.
+
 | # | Prompt | Expected |
 |---|---|---|
-| 2.1 | "Transfer 0.001 PSY to Psy-00860160" | `submitted=true` + `endUserLeafHash` |
+| 2.1 | "Transfer 0.001 PSY to Psy-00860160" then execute | `submitted=true` + `endUserLeafHash` |
 | 2.2 | "Transfer -5 PSY" | Rejected: invalid amount |
 | 2.3 | "Transfer 0 PSY" | Error: "a transfer of 0 is a no-op" |
-| 2.4 | "Batch transfer 0.001 to Psy-00860160 and 0.002 to Psy-0024576" | One `endUserLeafHash` |
-| 2.5 | "Private transfer 0.05 PSY to my own shield address" | `delivered=true` |
-| 2.6 | "Claim all my private notes" | `claimed >= 1` |
+| 2.4 | "Batch transfer 0.001 to Psy-00860160 and 0.002 to Psy-0024576" then execute | One `endUserLeafHash` |
+| 2.5 | "Private transfer 0.05 PSY to my own shield address" then execute | `delivered=true` |
+| 2.6 | "Claim all my private notes" then execute | `claimed >= 1` |
 
 ### Group 3 — Super UPS batch (~15 min)
 
@@ -246,7 +270,7 @@ Copy and fill as you test. Amounts are in Nano (1 PSY = 1e9 Nano).
 |---|---|---|
 | 4.1 | "Deposit 1 USDT" | Returns `expectedDepositIndex` |
 | 4.2 | "Claim the deposit once it is claimable" | `claimedBaseUnits=1000000` |
-| 4.3 | "Withdraw 0.005 PSY to 0xd307...10EF" | `submitted=true` + txHash |
+| 4.3 | "Withdraw 0.005 PSY to 0xd307...10EF" then execute | `submitted=true` + txHash |
 | 4.4 | "Withdraw to 0x000...0" | Error: "zero address — would burn the funds" |
 
 ### Group 5 — Contracts (~20 min)
@@ -255,9 +279,9 @@ Copy and fill as you test. Amounts are in Nano (1 PSY = 1e9 Nano).
 |---|---|---|
 | 5.1 | "Create a new contract project qa-myname" | `ok=true` |
 | 5.2 | "Write a contract with main returning 42 and compile it" | Build ok |
-| 5.3 | "Deploy it" | Output contains `contract_id` |
-| 5.4 | "Call its main" | `submitted=true` |
-| 5.5 | "Deploy an add(a,b) contract and call it with 40 and 2" | `submitted=true` |
+| 5.3 | "Deploy it" then execute | Output contains `contract_id` |
+| 5.4 | "Call its main" then execute | `submitted=true` |
+| 5.5 | "Deploy an add(a,b) contract and call it with 40 and 2" then execute | `submitted=true` |
 | 5.6 | "Call add with only one argument 40" | Proving error: arity mismatch |
 
 ### Group 6 — x402 payments (~10 min)
@@ -272,7 +296,7 @@ Then:
 
 | # | Prompt | Expected |
 |---|---|---|
-| 6.1 | "Fetch http://host.docker.internal:8410/resource with x402" | `paid=true` |
+| 6.1 | "Fetch http://host.docker.internal:8410/resource with x402" then execute | `paid=true` |
 | 6.2 | "Verify the previous payment" | `status=ok` |
 | 6.3 | "Verify this fake credential: garbage" | Error |
 
@@ -280,8 +304,8 @@ Then:
 
 | # | Action | Expected |
 |---|---|---|
-| 7.1 | Pause policy → ask agent to transfer | Error: "policy paused by owner" |
-| 7.2 | Resume → transfer again | `submitted=true` |
+| 7.1 | Pause policy → ask agent to transfer | Error at execute: "policy paused by owner" |
+| 7.2 | Resume → transfer again (prepare + execute) | `submitted=true` |
 | 7.3 | Issue session → revoke it → spend with old session | Error: "session token is not valid" |
 | 7.4 | Edit policy with wrong owner token | Error: "this is an owner tool" |
 | 7.5 | Set per-tx cap to 1 PSY → transfer 2 PSY | Error: "over the per-transaction cap" |

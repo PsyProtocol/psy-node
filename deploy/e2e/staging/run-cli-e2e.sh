@@ -40,7 +40,7 @@ select_profile() {
   case "$STAGING_CHAIN" in
     ethereum|sepolia)
       PROFILE_NAME="sepolia"
-      CONFIG_NETWORK="sepolia"
+      CONFIG_NETWORK="testnet"
       DEPLOYMENTS_NETWORK="sepolia"
       L1_CHAIN_ID="11155111"
       L1_CHAIN_INDEX="0"
@@ -77,7 +77,7 @@ select_profile() {
 
 ensure_e2e_binary() {
   echo "[staging-cli-e2e] checking incremental E2E build"
-  cargo build --locked --release --manifest-path "$E2E_MANIFEST"
+  PSY_NETWORK=localhost cargo build --locked --release --manifest-path "$E2E_MANIFEST"
   [ -x "$E2E_BIN" ] || fail "missing E2E executable: $E2E_BIN"
 }
 
@@ -97,7 +97,7 @@ render_staging_config() {
     --arg rpc_env "$RPC_ENV_NAME" \
     '.defaultNetwork = $network
      | .networks[$network] = (
-         .networks.sepolia
+         .networks.testnet
          | .l1_chain_id = $chain_id
          | .l1_rpc_urls = [$rpc_url]
          | .anvilForkSourceUrlEnv = $rpc_env

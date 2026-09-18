@@ -12,13 +12,13 @@ trap 'rm -rf "$test_parent"' EXIT
 # addresses, private config and initialized submodules. Init performs no RPCs.
 binary="$ROOT/deploy/e2e/cli-full-e2e/target/release/psy-cli-full-e2e"
 if [ ! -x "$binary" ]; then
-  cargo build --locked --release --manifest-path "$ROOT/deploy/e2e/cli-full-e2e/Cargo.toml"
+  PSY_NETWORK=localhost cargo build --locked --release --manifest-path "$ROOT/deploy/e2e/cli-full-e2e/Cargo.toml"
 fi
 fixture="$test_parent/repo"
 mkdir -p "$fixture/deploy/e2e/staging" "$fixture/deploy/e2e/cli-full-e2e/target/release" "$fixture/psy-genesis"
 cp "$STAGING_DIR/run-cli-e2e.sh" "$STAGING_DIR/run-multichain-e2e.sh" "$fixture/deploy/e2e/staging/"
 ln -s "$binary" "$fixture/deploy/e2e/cli-full-e2e/target/release/psy-cli-full-e2e"
-printf '%s\n' '{"networks":{"sepolia":{"l1_chain_id":11155111}}}' > "$fixture/psy-genesis/config.json"
+printf '%s\n' '{"networks":{"testnet":{"l1_chain_id":11155111}}}' > "$fixture/psy-genesis/config.json"
 for network in sepolia bscTestnet baseSepolia; do
   mkdir -p "$fixture/psy-contracts/deployments/$network"
   for artifact in deployed-contracts.json Bridge_Proxy.json; do
@@ -78,7 +78,7 @@ assert_profile() {
 jq -e '.required_chains == ["base", "bsc", "sepolia"]' \
   "$test_dir/matrix.json" >/dev/null || fail "matrix execution order mismatch"
 
-assert_profile sepolia sepolia sepolia 11155111 0
+assert_profile sepolia testnet sepolia 11155111 0
 assert_profile bsc bsc-testnet bscTestnet 97 1
 assert_profile base base-sepolia baseSepolia 84532 2
 

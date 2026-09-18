@@ -16,6 +16,7 @@ pub async fn restore_wallets(wallet: &WalletManager) -> Result<()> {
 
     let mut restored = HashSet::new();
     let mut restored_networks = HashSet::new();
+    let mut unavailable_networks = HashSet::new();
     let mut explicit_selection: Option<(String, String)> = None;
     for path in key_files {
         let path_text = path.to_string_lossy().to_string();
@@ -39,8 +40,13 @@ pub async fn restore_wallets(wallet: &WalletManager) -> Result<()> {
                 continue;
             }
         };
+        if unavailable_networks.contains(&network) {
+            tracing::warn!("skipping wallet {} because network `{backup_network}` already failed initialization during this startup", path.display());
+            continue;
+        }
         if let Err(e) = wallet.ensure_network(&network).await {
             tracing::error!("could not initialize network `{backup_network}` for {}: {e:#}", path.display());
+            unavailable_networks.insert(network);
             continue;
         }
         match wallet.load_from_backup(&network, &backup).await {
@@ -82,6 +88,10 @@ pub async fn restore_wallets(wallet: &WalletManager) -> Result<()> {
                 continue;
             }
         };
+        if unavailable_networks.contains(&network) {
+            tracing::warn!("cannot restore active wallet for unavailable network `{saved_network}`");
+            continue;
+        }
         if let Err(e) = wallet.ensure_network(&network).await {
             tracing::warn!("cannot restore active wallet for network `{saved_network}`: {e:#}");
             continue;

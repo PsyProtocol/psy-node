@@ -153,7 +153,7 @@ bash deploy/gcp/tests/test-multichain-profile.sh
 bash deploy/gcp/tests/test-runtime-source.sh
 bash deploy/gcp/tests/test-multichain-source-preparation.sh
 bash deploy/gcp/tests/test-frontend-workflow-safety.sh
-cargo test --locked --release --manifest-path deploy/e2e/cli-full-e2e/Cargo.toml
+PSY_NETWORK=testnet cargo test --locked --release --manifest-path deploy/e2e/cli-full-e2e/Cargo.toml
 ```
 
 CLI E2E now has a standalone Cargo workspace under `deploy/e2e/`; it does not

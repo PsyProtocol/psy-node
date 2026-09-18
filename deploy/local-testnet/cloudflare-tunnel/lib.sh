@@ -17,6 +17,9 @@ local_staging_source_env_defaults "$LOCAL_CF_SCRIPT_DIR/local.env"
 : "${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:=localhost}"
 : "${LOCAL_STAGING_CHAIN_CONFIG_NETWORK:=localhost}"
 : "${LOCAL_STAGING_FRONTEND_NETWORK:=$LOCAL_STAGING_CHAIN_CONFIG_NETWORK}"
+# The Psy stage (PSY_NETWORK/VITE_PSY_STAGE) is a separate namespace from the
+# L1/genesis-key network above -- see deploy/local-testnet/stack/up.sh.
+: "${LOCAL_STAGING_PSY_STAGE:=localhost}"
 : "${LOCAL_CF_TUNNEL_NAME:=psy-local-staging}"
 : "${LOCAL_CF_TUNNEL_ID:=}"
 : "${LOCAL_CF_TUNNEL_CREDENTIALS_FILE:=}"

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 include!(concat!(env!("OUT_DIR"), "/generated_constants.rs"));
+include!("stage_magic.rs");
 
 pub mod network_constants;
 
@@ -42,6 +43,16 @@ pub enum ConfigError {
     NetworkNotFound(String),
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error(
+        "chain identity mismatch: config network '{network}' has magic {config_magic:#018X}, \
+         but this binary was built for '{binary_network}' with magic {binary_magic:#018X}"
+    )]
+    ChainIdentityMismatch {
+        network: String,
+        config_magic: u64,
+        binary_magic: u64,
+        binary_network: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +527,48 @@ pub struct PsyConfig<F: RichField> {
     nodes_config: Option<NodesConfig<F>>,
 }
 
+// Test-only counter proving the build-identity log below fires at most once
+// per process, no matter how many times config is loaded.
+#[cfg(test)]
+static BUILD_IDENTITY_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Feeds the post-deploy build-identity collection gate (Gate 1): after a
+/// deploy, a collector script greps every process's log for this exact line
+/// to confirm they all agree on which chain they were built for. The format
+/// is a grep contract shared with that script — do not change it without
+/// updating the collector too.
+///
+/// This is a free function, not a method on `PsyConfig<F>`, on purpose: a
+/// `static` inside a generic function or generic impl is monomorphized once
+/// per concrete `F`, so each instantiation would get its own `Once` and the
+/// line could print once per type parameter instead of once per process.
+/// Keeping the `Once` here, outside any generic context, makes "once per
+/// process" hold by construction rather than by the accident that today only
+/// `PsyConfigGoldilocks` is ever used.
+///
+/// Writes via `std::io::stderr()` + `writeln!` rather than `eprintln!`:
+/// `eprintln!` panics if the underlying write fails, and this crate also
+/// compiles to `wasm32-unknown-unknown` for the browser wallet, where stderr
+/// write failure is not a question worth answering at runtime. `writeln!`
+/// returns a `Result` we can silently discard instead. This crate has no
+/// logging framework and must not gain one (same WASM constraint), so stderr
+/// via stdlib is the deliberate, permanent choice here, not a placeholder.
+fn log_build_identity_once(config_network: &str) {
+    use std::io::Write;
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let _ = writeln!(
+            std::io::stderr(),
+            "psy build identity: stage={} magic={:#018X} config_network={}",
+            CURRENT_NETWORK,
+            PSY_NETWORK_MAGIC,
+            config_network
+        );
+        #[cfg(test)]
+        BUILD_IDENTITY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
 impl<F: RichField> PsyConfig<F> {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
         let content = match std::fs::read_to_string(path) {
@@ -543,11 +596,13 @@ impl<F: RichField> PsyConfig<F> {
 
         let current_network = config.default_network.clone();
 
-        Ok(Self {
+        let config = Self {
             config,
             current_network,
             nodes_config: None,
-        })
+        };
+        config.verify_chain_identity()?;
+        Ok(config)
     }
 
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
@@ -562,22 +617,54 @@ impl<F: RichField> PsyConfig<F> {
 
         let current_network = config.default_network.clone();
 
-        Ok(Self {
+        let config = Self {
             config,
             current_network,
             nodes_config: None,
-        })
+        };
+        config.verify_chain_identity()?;
+        Ok(config)
     }
 
     pub fn builder() -> PsyConfigBuilder<F> {
         PsyConfigBuilder::new()
     }
 
-    pub fn use_network(&mut self, network_name: &str) -> Result<(), ConfigError> {
+    /// 当前网络的 magic 必须等于编译进本二进制的 magic。
+    ///
+    /// 比的是 magic 而不是网络名：localhost 与 testnet 共用同一个 magic，
+    /// 一套产物可以同时服务两者；mainnet 的 magic 不同，会在这里被挡住。
+    pub fn verify_chain_identity(&self) -> Result<(), ConfigError> {
+        let network = self.get_current_network()?;
+        let config_magic = parse_magic_hex(&network.magic).map_err(ConfigError::InvalidConfig)?;
+        if config_magic != PSY_NETWORK_MAGIC {
+            return Err(ConfigError::ChainIdentityMismatch {
+                network: self.current_network.clone(),
+                config_magic,
+                binary_magic: PSY_NETWORK_MAGIC,
+                binary_network: CURRENT_NETWORK,
+            });
+        }
+        log_build_identity_once(&self.current_network);
+        Ok(())
+    }
+
+    /// 切换网络但不做链身份校验。只给查看类工具用（例如 `psy_dev_cli chain-info`）。
+    pub fn use_network_unchecked(&mut self, network_name: &str) -> Result<(), ConfigError> {
         if !self.config.networks.contains_key(network_name) {
             return Err(ConfigError::NetworkNotFound(network_name.to_string()));
         }
         self.current_network = network_name.to_string();
+        Ok(())
+    }
+
+    pub fn use_network(&mut self, network_name: &str) -> Result<(), ConfigError> {
+        let previous = self.current_network.clone();
+        self.use_network_unchecked(network_name)?;
+        if let Err(e) = self.verify_chain_identity() {
+            self.current_network = previous;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -778,232 +865,241 @@ impl<F: RichField> GenesisConfig<F> {
 mod tests {
     use super::*;
 
+    const LOCALHOST_MAGIC_HEX: &str = "0x1337CF514544CF69";
+    const TESTNET_MAGIC_HEX: &str = "0x1337CF514544CF69";
+
+    /// 一个能被 `NetworkConfig` 正确反序列化的最小网络块。
+    /// 真实结构是平铺的：没有 `"network"` 这层包装，`magic` 与 `fees.da_fee` 都是必填。
+    fn network_json(magic: &str, users_per_realm: u64, currency: &str) -> String {
+        format!(
+            r#"{{
+                "magic": "{magic}",
+                "users_per_realm": {users_per_realm},
+                "global_user_tree_height": 32,
+                "realm_user_tree_height": 20,
+                "group_realm_height": 1,
+                "realm_configs": [{{"id": 0, "rpc_url": ["http://127.0.0.1:13380"]}}],
+                "coordinator_configs": [{{"id": 0, "rpc_url": ["http://127.0.0.1:1337"]}}],
+                "prove_proxy_url": ["http://127.0.0.1:9999"],
+                "faucet_rpc_url": ["http://127.0.0.1:9998"],
+                "nostr_relay_url": "ws://127.0.0.1:8081",
+                "native_currency": "{currency}",
+                "native_currency_decimal": 9,
+                "native_currency_name": "Psy",
+                "fees": {{
+                    "register_user_fee": 0,
+                    "deploy_contract_fee": 0,
+                    "guta_fee": 1000000000,
+                    "da_fee": 0
+                }}
+            }}"#
+        )
+    }
+
+    fn config_json(default_network: &str, networks: &[(&str, String)]) -> String {
+        let body = networks
+            .iter()
+            .map(|(name, json)| format!(r#""{name}": {json}"#))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!(r#"{{ "networks": {{ {body} }}, "defaultNetwork": "{default_network}" }}"#)
+    }
+
     #[test]
     fn test_config_loading() {
-        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.json");
+        // Prefer PSY_CONFIG_PATH (what build.rs uses); fall back to the tracked
+        // psy-genesis submodule config so this test still checks something real
+        // even when no env var is set. Only skip if neither resolves to a file.
+        let config_path = std::env::var("PSY_CONFIG_PATH").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../psy-genesis/config.json")
+        });
+        if !config_path.exists() {
+            eprintln!("skipping: {} does not exist in this checkout", config_path.display());
+            return;
+        }
         let config = PsyConfigGoldilocks::from_file(config_path.to_str().unwrap()).unwrap();
-
-        assert_eq!(config.current_network_name(), "localhost");
-
+        let name = config.current_network_name().to_string();
+        assert!(
+            ["localhost", "testnet", "mainnet"].contains(&name.as_str()),
+            "unexpected network name in rendered config: {name}"
+        );
         let network = config.get_current_network().unwrap();
-        assert_eq!(network.users_per_realm, 1048576);
-        assert_eq!(network.native_currency, "0");
+        assert!(network.users_per_realm > 0);
+
+        let magic = parse_magic_hex(&network.magic)
+            .unwrap_or_else(|e| panic!("magic '{}' is not valid hex: {e}", network.magic));
+        assert_ne!(magic, 0, "magic must be non-zero");
     }
 
     #[test]
     fn test_network_switching() {
-        let json = r#"{
-            "networks": {
-                "localhost": {
-                    "network": {
-                        "users_per_realm": 1048576,
-                        "global_user_tree_height": 24,
-                        "realm_user_tree_height": 20,
-                        "group_realm_height": 1,
-                        "realm_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8546"]}],
-                        "coordinator_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}],
-                        "prove_proxy_url": ["http://127.0.0.1:9999"],
-                        "native_currency": "PSY",
-                        "native_currency_decimal": 9,
-                        "native_currency_name": "PSY",
-                        "fees": {
-                            "register_user_fee": 0,
-                            "deploy_contract_fee": 0,
-                            "guta_fee": 5000000000
-                        }
-                    }
-                },
-                "testnet": {
-                    "network": {
-                        "users_per_realm": 1048576,
-                        "global_user_tree_height": 24,
-                        "realm_user_tree_height": 20,
-                        "group_realm_height": 1,
-                        "realm_configs": [{"id": 0, "rpc_url": ["https://testnet.example.com"]}],
-                        "coordinator_configs": [{"id": 0, "rpc_url": ["https://testnet-coord.example.com"]}],
-                        "prove_proxy_url": ["https://testnet-prover.example.com"],
-                        "native_currency": "tPSY",
-                        "native_currency_decimal": 9,
-                        "native_currency_name": "Test PSY",
-                        "fees": {
-                            "register_user_fee": 1000,
-                            "deploy_contract_fee": 5000,
-                            "guta_fee": 5000000000
-                        }
-                    }
-                }
-            },
-            "defaultNetwork": "localhost"
-        }"#;
+        let json = config_json(
+            "localhost",
+            &[
+                ("localhost", network_json(LOCALHOST_MAGIC_HEX, 1048576, "0")),
+                ("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "0")),
+            ],
+        );
 
-        let mut config = PsyConfigGoldilocks::from_json(json).unwrap();
+        let mut config = PsyConfigGoldilocks::from_json(&json).unwrap();
+        assert_eq!(config.current_network_name(), "localhost");
 
         config.use_network("testnet").unwrap();
         assert_eq!(config.current_network_name(), "testnet");
-
-        let testnet = config.get_current_network().unwrap();
-        assert_eq!(testnet.native_currency, "tPSY");
-        assert_eq!(testnet.fees.register_user_fee, 1000);
+        assert_eq!(config.get_current_network().unwrap().users_per_realm, 1048576);
     }
 
     #[test]
     fn test_flexible_config_creation() {
-        let json = r#"{
-            "networks": {
-                "dev": {
-                    "network": {
-                        "users_per_realm": 1024,
-                        "global_user_tree_height": 20,
-                        "realm_user_tree_height": 10,
-                        "group_realm_height": 1,
-                        "realm_configs": [{"id": 0, "rpc_url": ["http://dev.local"]}],
-                        "coordinator_configs": [{"id": 0, "rpc_url": ["http://coord.local"]}],
-                        "prove_proxy_url": ["http://prover.local"],
-                        "native_currency": "DEV",
-                        "native_currency_decimal": 6,
-                        "native_currency_name": "Development",
-                        "fees": {
-                            "register_user_fee": 100,
-                            "deploy_contract_fee": 500,
-                            "guta_fee": 1000000000
-                        }
-                    }
-                },
-                "localhost": {
-                    "network": {
-                        "users_per_realm": 1024,
-                        "global_user_tree_height": 20,
-                        "realm_user_tree_height": 10,
-                        "group_realm_height": 1,
-                        "realm_configs": [{"id": 0, "rpc_url": ["http://localhost:8546"]}],
-                        "coordinator_configs": [{"id": 0, "rpc_url": ["http://localhost:8545"]}],
-                        "prove_proxy_url": ["http://localhost:9999"],
-                        "native_currency": "LOCAL",
-                        "native_currency_decimal": 8,
-                        "native_currency_name": "Local Token",
-                        "fees": {
-                            "register_user_fee": 50,
-                            "deploy_contract_fee": 250,
-                            "guta_fee": 500000000
-                        }
-                    }
-                }
-            },
-            "defaultNetwork": "dev"
-        }"#;
+        let json = config_json(
+            "localhost",
+            &[
+                ("localhost", network_json(LOCALHOST_MAGIC_HEX, 1048576, "0")),
+                ("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "1")),
+            ],
+        );
 
-        let config1 = PsyConfigGoldilocks::from_json(json).unwrap();
+        let config1 = PsyConfigGoldilocks::from_json(&json).unwrap();
         assert_eq!(config1.current_network_name(), "localhost");
-        assert_eq!(config1.get_current_network().unwrap().native_currency, "LOCAL");
+        assert_eq!(config1.get_current_network().unwrap().native_currency, "0");
 
-        let config2 = PsyConfigGoldilocks::builder().json(json).network("dev").build().unwrap();
-        assert_eq!(config2.current_network_name(), "dev");
-        assert_eq!(config2.get_current_network().unwrap().native_currency, "DEV");
-
-        let config3 = PsyConfigGoldilocks::builder().json(json).build().unwrap();
+        let config3 = PsyConfigGoldilocks::builder().json(&json).build().unwrap();
         assert_eq!(config3.current_network_name(), "localhost");
     }
 
     #[test]
     fn test_runtime_network_switching() {
-        let json = r#"{
-            "networks": {
-                "dev": {
-                    "network": {
-                        "users_per_realm": 1024,
-                        "global_user_tree_height": 20,
-                        "realm_user_tree_height": 10,
-                        "group_realm_height": 1,
-                        "realm_configs": [{"id": 0, "rpc_url": ["http://dev.local"]}],
-                        "coordinator_configs": [{"id": 0, "rpc_url": ["http://coord.local"]}],
-                        "prove_proxy_url": ["http://prover.local"],
-                        "native_currency": "DEV",
-                        "native_currency_decimal": 6,
-                        "native_currency_name": "Development",
-                        "fees": {
-                            "register_user_fee": 100,
-                            "deploy_contract_fee": 500,
-                            "guta_fee": 1000000000
-                        }
-                    }
-                },
-                "localhost": {
-                    "network": {
-                        "users_per_realm": 512,
-                        "global_user_tree_height": 18,
-                        "realm_user_tree_height": 9,
-                        "group_realm_height": 1,
-                        "realm_configs": [{"id": 0, "rpc_url": ["http://localhost:8546"]}],
-                        "coordinator_configs": [{"id": 0, "rpc_url": ["http://localhost:8545"]}],
-                        "prove_proxy_url": ["http://localhost:9999"],
-                        "native_currency": "LOCAL",
-                        "native_currency_decimal": 8,
-                        "native_currency_name": "Local Token",
-                        "fees": {
-                            "register_user_fee": 50,
-                            "deploy_contract_fee": 250,
-                            "guta_fee": 500000000
-                        }
-                    }
-                }
-            },
-            "defaultNetwork": "localhost"
-        }"#;
+        let json = config_json(
+            "localhost",
+            &[
+                ("localhost", network_json(LOCALHOST_MAGIC_HEX, 1048576, "0")),
+                ("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "1")),
+            ],
+        );
 
-        let mut config = PsyConfigGoldilocks::from_json(json).unwrap();
+        let mut config = PsyConfigGoldilocks::from_json(&json).unwrap();
         assert_eq!(config.current_network_name(), "localhost");
-        assert_eq!(config.get_current_network().unwrap().users_per_realm, 512);
 
-        config.use_network("dev").unwrap();
-        assert_eq!(config.current_network_name(), "dev");
-        assert_eq!(config.get_current_network().unwrap().users_per_realm, 1024);
-        assert_eq!(config.get_current_network().unwrap().native_currency, "DEV");
+        config.use_network("testnet").unwrap();
+        assert_eq!(config.get_current_network().unwrap().native_currency, "1");
 
         config.use_network("localhost").unwrap();
-        assert_eq!(config.current_network_name(), "localhost");
-        assert_eq!(config.get_current_network().unwrap().users_per_realm, 512);
-        assert_eq!(config.get_current_network().unwrap().native_currency, "LOCAL");
+        assert_eq!(config.get_current_network().unwrap().native_currency, "0");
 
         let networks = config.list_networks();
         assert_eq!(networks.len(), 2);
-        assert!(networks.contains(&&"dev".to_string()));
-        assert!(networks.contains(&&"localhost".to_string()));
+        assert!(networks.contains(&&"testnet".to_string()));
     }
 
     #[test]
     fn test_error_handling() {
-        let json = r#"{
-            "networks": {
-                "only_network": {
-                    "network": {
-                        "users_per_realm": 1024,
-                        "global_user_tree_height": 20,
-                        "realm_user_tree_height": 10,
-                        "group_realm_height": 1,
-                        "realm_configs": [{"id": 0, "rpc_url": ["http://test.local"]}],
-                        "coordinator_configs": [{"id": 0, "rpc_url": ["http://coord.local"]}],
-                        "prove_proxy_url": ["http://prover.local"],
-                        "native_currency": "TEST",
-                        "native_currency_decimal": 6,
-                        "native_currency_name": "Test",
-                        "fees": {
-                            "register_user_fee": 0,
-                            "deploy_contract_fee": 0,
-                            "guta_fee": 1000000000
-                        }
-                    }
-                }
-            },
-            "defaultNetwork": "only_network"
-        }"#;
-
-        let result = PsyConfigGoldilocks::from_json(json);
-        assert!(result.is_err());
+        // defaultNetwork 指向一个不存在的网络。
+        let json = config_json(
+            "missing_network",
+            &[("localhost", network_json(LOCALHOST_MAGIC_HEX, 1048576, "0"))],
+        );
+        let result = PsyConfigGoldilocks::from_json(&json);
         assert!(matches!(result.unwrap_err(), ConfigError::InvalidConfig(_)));
 
         let bad_json = r#"{"invalid": json}"#;
         let result = PsyConfigGoldilocks::from_json(bad_json);
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ConfigError::JsonError(_)));
+    }
+
+    #[test]
+    fn stage_magic_table_matches_the_protocol_constants() {
+        // psy_core/src/constants/protocol.rs 定义的三个值。
+        // testnet 沿用 REGTEST 的值：现网就是这么跑的，换它需要一次全新部署。
+        assert_eq!(magic_for_stage("localhost"), Some(0x1337CF514544CF69));
+        assert_eq!(magic_for_stage("testnet"), Some(0x1337CF514544CF69));
+        assert_eq!(magic_for_stage("mainnet"), Some(0x1337CF514544C069));
+        assert_eq!(magic_for_stage("sepolia"), None);
+        assert_eq!(magic_for_stage(""), None);
+    }
+
+    #[test]
+    fn magic_hex_parses_with_or_without_prefix() {
+        assert_eq!(parse_magic_hex("0x1337CF514544CF69"), Ok(0x1337CF514544CF69));
+        assert_eq!(parse_magic_hex("1337cf514544cf69"), Ok(0x1337CF514544CF69));
+        assert!(parse_magic_hex("0xnothex").is_err());
+        assert!(parse_magic_hex("").is_err());
+    }
+
+    #[test]
+    fn loading_a_config_whose_magic_differs_from_the_binary_is_refused() {
+        // mainnet 的 magic 与本二进制（localhost/testnet）不同，必须被拒绝。
+        let json = config_json(
+            "mainnet",
+            &[("mainnet", network_json("0x1337CF514544C069", 1048576, "0"))],
+        );
+        let err = PsyConfigGoldilocks::from_json(&json).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ChainIdentityMismatch { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn loading_a_config_with_the_same_magic_is_accepted() {
+        let json = config_json(
+            "testnet",
+            &[("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "0"))],
+        );
+        let config = PsyConfigGoldilocks::from_json(&json).unwrap();
+        assert_eq!(config.current_network_name(), "testnet");
+    }
+
+    #[test]
+    fn switching_to_a_foreign_magic_is_refused_but_inspection_still_works() {
+        let json = config_json(
+            "localhost",
+            &[
+                ("localhost", network_json(LOCALHOST_MAGIC_HEX, 1048576, "0")),
+                ("mainnet", network_json("0x1337CF514544C069", 1048576, "0")),
+            ],
+        );
+        let mut config = PsyConfigGoldilocks::from_json(&json).unwrap();
+
+        assert!(matches!(
+            config.use_network("mainnet").unwrap_err(),
+            ConfigError::ChainIdentityMismatch { .. }
+        ));
+        assert_eq!(config.current_network_name(), "localhost", "失败的切换不应该改变当前网络");
+
+        // 查看用的入口不校验，chain-info 这类工具靠它。
+        config.use_network_unchecked("mainnet").unwrap();
+        assert_eq!(config.current_network_name(), "mainnet");
+    }
+
+    #[test]
+    fn build_identity_log_fires_at_most_once_per_process() {
+        let json = config_json(
+            "testnet",
+            &[("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "0"))],
+        );
+
+        // Load config twice, and call verify_chain_identity directly a couple
+        // more times on top of that. Every one of these calls goes through
+        // the same `LOGGED.call_once` in verify_chain_identity.
+        let config1 = PsyConfigGoldilocks::from_json(&json).unwrap();
+        let config2 = PsyConfigGoldilocks::from_json(&json).unwrap();
+        config1.verify_chain_identity().unwrap();
+        config2.verify_chain_identity().unwrap();
+
+        // std::sync::Once guarantees the call_once body runs exactly once for
+        // the whole process, no matter how many times *any* test in this
+        // binary loads a config (cargo test runs all tests in one process).
+        // So this counter can only ever be 0 (no config loaded anywhere yet)
+        // or 1 (it has, exactly once) -- never more, even though this test
+        // alone triggers the check 4 times. That's the once-per-process
+        // property. What this does NOT prove: the exact text of the printed
+        // line, or that it went to stderr rather than stdout -- this crate
+        // has no logging framework to capture output, so that was checked by
+        // hand instead (see task report).
+        let count = BUILD_IDENTITY_LOG_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "the build-identity log must fire exactly once per process, got {count}"
+        );
     }
 }

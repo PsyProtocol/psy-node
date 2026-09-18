@@ -101,6 +101,7 @@ docker_run_args=(
   -e CARGO_NET_GIT_FETCH_WITH_CLI=true
   -e CARGO_BUILD_JOBS="$bookworm_build_jobs"
   -e BUILD_PARTH_BINARIES="$BUILD_PARTH_BINARIES"
+  -e PSY_NETWORK="${PSY_NETWORK:-testnet}"
   -v "$WORKSPACE_ROOT:/work"
   -v "$PARTH_DIR:$PARTH_WORKDIR"
   -v "$PSY_SERVICES_DIR:$PSY_SERVICES_WORKDIR"
@@ -158,7 +159,7 @@ docker run \
 
     if [ "$BUILD_PARTH_BINARIES" = "1" ]; then
       cd "$PARTH_WORKDIR"
-      PSY_CONFIG_PATH="$PARTH_WORKDIR/psy-genesis/config.json" \
+      PSY_CONFIG_PATH="$PARTH_WORKDIR/psy-genesis/config.json" PSY_NETWORK="${PSY_NETWORK:-testnet}" \
         cargo +nightly build --release \
           --bin psy_node_cli \
           --bin psy_worker_cli \

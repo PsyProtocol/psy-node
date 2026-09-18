@@ -108,7 +108,7 @@ worktree must already contain a matching release `psy_user_cli`:
 ```bash
 cd "$PSY_NODE_HOME"
 cargo build --locked --release --manifest-path deploy/e2e/cli-full-e2e/Cargo.toml
-cargo build --locked --release -p psy_user_cli
+PSY_NETWORK=testnet cargo build --locked --release -p psy_user_cli
 ```
 
 ### Initialize a disposable run

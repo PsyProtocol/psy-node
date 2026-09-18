@@ -324,6 +324,9 @@ pub struct LoadedUser {
     pub user_id: u64,
     /// Circuit fingerprint is part of the wallet identity and must survive reloads.
     pub fingerprint: QHashOut<F>,
+    /// Signing circuit name (`zk`, `secp256k1`, `eth-personal-secp256k1`,
+    /// `sd-key`, or `custom`).
+    pub sign_type: String,
     pub mandate: Option<Mandate>,
     /// Kept in memory (never serialized) so the wallet can re-derive its
     /// private receive identity — the shielded address' blinding factors
@@ -343,7 +346,14 @@ pub struct EndpointSummary {
     pub coordinator: Vec<String>,
     pub realm: Vec<String>,
     pub prove_proxy: Vec<String>,
+    pub faucet: Vec<String>,
     pub api_services: Vec<String>,
+    pub indexer_graphql: Vec<String>,
+    pub explorer: Vec<String>,
+    pub nostr_relay: Vec<String>,
+    pub l1_rpc: Vec<String>,
+    pub bridge: Vec<String>,
+    pub l1_config: Vec<String>,
 }
 
 struct NetworkWallet {
@@ -512,14 +522,24 @@ struct McpNetworkConfig {
     #[serde(default)]
     bridge_url: Vec<String>,
     #[serde(default)]
+    indexer_graphql_url: Vec<String>,
+    #[serde(default)]
+    explorer_url: Vec<String>,
+    #[serde(default)]
     l1_config_url: Option<String>,
-    #[serde(default)]
-    l1_bridge_address: Option<String>,
-    #[serde(default)]
-    l1_router_address: Option<String>,
-    #[serde(default)]
-    l1_erc20_gateway_address: Option<String>,
-    #[serde(default)]
+    #[serde(skip)]
+    l1_chains: Vec<McpL1Chain>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct McpL1Chain {
+    chain_index: u32,
+    chain_id: u64,
+    name: Option<String>,
+    l1_rpc_urls: Vec<String>,
+    l1_bridge_address: String,
+    l1_router_address: String,
+    l1_erc20_gateway_address: String,
     l1_token_addresses: HashMap<String, String>,
 }
 
@@ -574,7 +594,7 @@ fn config_chain_id(document: &serde_json::Value) -> Result<u64> {
     raw.parse::<u64>().context("parse decimal L1 config chain ID")
 }
 
-fn apply_l1_config_document(network: &NetworkId, config: &mut McpNetworkConfig, document: &serde_json::Value) -> Result<u64> {
+fn parse_legacy_l1_document(network: &NetworkId, config: &McpNetworkConfig, document: &serde_json::Value) -> Result<McpL1Chain> {
     if let Some(document_network) = document.get("network").and_then(serde_json::Value::as_str) {
         anyhow::ensure!(
             document_network == network.as_str(),
@@ -583,9 +603,9 @@ fn apply_l1_config_document(network: &NetworkId, config: &mut McpNetworkConfig, 
     }
     let chain_id = config_chain_id(document)?;
 
-    config.l1_bridge_address = Some(required_l1_address(document, "Bridge")?);
-    config.l1_router_address = Some(required_l1_address(document, "Router")?);
-    config.l1_erc20_gateway_address = Some(required_l1_address(document, "ERC20Gateway")?);
+    let bridge = required_l1_address(document, "Bridge")?;
+    let router = required_l1_address(document, "Router")?;
+    let gateway = required_l1_address(document, "ERC20Gateway")?;
 
     let mut addresses = HashMap::new();
     if let Some(tokens) = document.pointer("/protocol/tokens").and_then(serde_json::Value::as_object) {
@@ -617,8 +637,93 @@ fn apply_l1_config_document(network: &NetworkId, config: &mut McpNetworkConfig, 
         }
     }
     anyhow::ensure!(!addresses.is_empty(), "L1 config has no token addresses");
-    config.l1_token_addresses = addresses;
-    Ok(chain_id)
+    Ok(McpL1Chain {
+        chain_index: 0,
+        chain_id,
+        name: document.pointer("/l1/chain_name").and_then(serde_json::Value::as_str).map(ToOwned::to_owned),
+        l1_rpc_urls: config.l1_rpc_urls.clone(),
+        l1_bridge_address: bridge,
+        l1_router_address: router,
+        l1_erc20_gateway_address: gateway,
+        l1_token_addresses: addresses,
+    })
+}
+
+fn parse_multichain_document(document: &serde_json::Value) -> Result<Option<Vec<McpL1Chain>>> {
+    let Some(entries) = document.get("l1_chains") else {
+        return Ok(None);
+    };
+    let entries = entries.as_array().ok_or_else(|| anyhow!("L1 config l1_chains must be an array"))?;
+    anyhow::ensure!(!entries.is_empty(), "L1 config l1_chains must not be empty");
+    let mut chains = Vec::with_capacity(entries.len());
+    let mut indexes = std::collections::HashSet::new();
+    let mut chain_ids = std::collections::HashSet::new();
+    for entry in entries {
+        let index_u64 = entry
+            .get("chain_index")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("L1 config chain is missing numeric chain_index"))?;
+        let chain_index = u32::try_from(index_u64).context("L1 config chain_index exceeds u32")?;
+        anyhow::ensure!(chain_index < 256, "L1 config chain_index {chain_index} is outside protocol range 0..255");
+        let chain_id = entry
+            .get("chain_id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("L1 config chain index {chain_index} is missing numeric chain_id"))?;
+        anyhow::ensure!(indexes.insert(chain_index), "duplicate L1 chain_index {chain_index}");
+        anyhow::ensure!(chain_ids.insert(chain_id), "duplicate L1 chain_id {chain_id}");
+
+        let rpc_url = entry
+            .get("rpc_url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("L1 config chain index {chain_index} is missing rpc_url"))?;
+        reqwest::Url::parse(rpc_url).with_context(|| format!("invalid rpc_url for L1 chain index {chain_index}"))?;
+        let contracts = entry
+            .get("contracts")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow!("L1 config chain index {chain_index} is missing contracts"))?;
+        let address = |key: &str| -> Result<String> {
+            let value = contracts
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("L1 config chain index {chain_index} is missing contracts.{key}"))?;
+            value
+                .parse::<alloy_primitives::Address>()
+                .with_context(|| format!("L1 config chain index {chain_index} contracts.{key} is invalid"))?;
+            Ok(value.to_string())
+        };
+        let mut tokens = HashMap::new();
+        for token in entry
+            .get("tokens")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow!("L1 config chain index {chain_index} is missing tokens"))?
+        {
+            let symbol = token
+                .get("symbol")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("L1 config chain index {chain_index} has a token without symbol"))?;
+            let token_address = token
+                .get("l1_address")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("L1 config chain index {chain_index} token {symbol} is missing l1_address"))?;
+            token_address
+                .parse::<alloy_primitives::Address>()
+                .with_context(|| format!("L1 config chain index {chain_index} token {symbol} has invalid l1_address"))?;
+            anyhow::ensure!(tokens.insert(symbol.to_string(), token_address.to_string()).is_none(), "duplicate token {symbol} on L1 chain index {chain_index}");
+        }
+        anyhow::ensure!(!tokens.is_empty(), "L1 config chain index {chain_index} has no tokens");
+        chains.push(McpL1Chain {
+            chain_index,
+            chain_id,
+            name: entry.get("name").and_then(serde_json::Value::as_str).map(ToOwned::to_owned),
+            l1_rpc_urls: vec![rpc_url.to_string()],
+            l1_bridge_address: address("Bridge")?,
+            l1_router_address: address("Router")?,
+            l1_erc20_gateway_address: address("ERC20Gateway")?,
+            l1_token_addresses: tokens,
+        });
+    }
+    Ok(Some(chains))
 }
 
 async fn load_l1_config(network: &NetworkId, config: &mut McpNetworkConfig) -> Result<()> {
@@ -637,8 +742,25 @@ async fn load_l1_config(network: &NetworkId, config: &mut McpNetworkConfig) -> R
         .json::<serde_json::Value>()
         .await
         .with_context(|| format!("parse L1 config from `{endpoint}`"))?;
-    let configured_chain_id =
-        apply_l1_config_document(network, config, &document).with_context(|| format!("validate L1 config from `{endpoint}`"))?;
+    if let Some(chains) = parse_multichain_document(&document)? {
+        for chain in &chains {
+            let rpc_chain_id = crate::l1::L1Client::read_only(chain.l1_rpc_urls[0].clone())
+                .chain_id()
+                .await
+                .with_context(|| format!("read eth_chainId for `{network}` L1 chain index {}", chain.chain_index))?;
+            anyhow::ensure!(
+                chain.chain_id == rpc_chain_id,
+                "L1 config/RPC chain mismatch for `{network}` chain index {}: config says {}, RPC says {}",
+                chain.chain_index,
+                chain.chain_id,
+                rpc_chain_id
+            );
+        }
+        config.l1_chains = chains;
+        return Ok(());
+    }
+    let legacy = parse_legacy_l1_document(network, config, &document)
+        .with_context(|| format!("validate L1 config from `{endpoint}`"))?;
     let rpc_url = config
         .l1_rpc_urls
         .first()
@@ -648,15 +770,109 @@ async fn load_l1_config(network: &NetworkId, config: &mut McpNetworkConfig) -> R
         .await
         .with_context(|| format!("read eth_chainId from `{rpc_url}`"))?;
     anyhow::ensure!(
-        configured_chain_id == rpc_chain_id,
-        "L1 config/RPC chain mismatch for `{network}`: config `{endpoint}` says {configured_chain_id}, RPC `{rpc_url}` says {rpc_chain_id}"
+        legacy.chain_id == rpc_chain_id,
+        "L1 config/RPC chain mismatch for `{network}`: config `{endpoint}` says {}, RPC `{rpc_url}` says {rpc_chain_id}",
+        legacy.chain_id
     );
+    config.l1_chains = vec![legacy];
     Ok(())
 }
 
 #[cfg(test)]
 mod l1_config_tests {
     use super::*;
+
+    #[test]
+    fn mcp_network_config_deserializes_urls_and_uses_remote_chain_registry() {
+        let mut config: McpNetworkConfig = serde_json::from_value(serde_json::json!({
+            "coordinator_configs": [],
+            "l1_rpc_urls": ["https://legacy-rpc.example"],
+            "bridge_url": ["https://bridge.example"],
+            "l1_config_url": "https://config.example/config.json"
+        }))
+        .unwrap();
+
+        assert_eq!(config.l1_rpc_urls, vec!["https://legacy-rpc.example"]);
+        assert_eq!(config.bridge_url, vec!["https://bridge.example"]);
+        assert_eq!(config.l1_config_url.as_deref(), Some("https://config.example/config.json"));
+        assert!(config.l1_chains.is_empty(), "chain data must come from l1_config_url, not Psy config");
+
+        let remote = serde_json::json!({
+            "l1_chains": [{
+                "network": "bscTestnet",
+                "chain_id": 97,
+                "chain_index": 1,
+                "name": "BSC Testnet",
+                "rpc_url": "https://bsc-rpc.example",
+                "contracts": {
+                    "Bridge": "0x0000000000000000000000000000000000000011",
+                    "Router": "0x0000000000000000000000000000000000000012",
+                    "ERC20Gateway": "0x0000000000000000000000000000000000000013"
+                },
+                "tokens": [{
+                    "symbol": "USDT",
+                    "l1_address": "0x0000000000000000000000000000000000000014"
+                }]
+            }]
+        });
+        config.l1_chains = parse_multichain_document(&remote).unwrap().unwrap();
+
+        assert_eq!(config.l1_chains.len(), 1);
+        let bsc = &config.l1_chains[0];
+        assert_eq!(bsc.chain_index, 1);
+        assert_eq!(bsc.chain_id, 97);
+        assert_eq!(bsc.name.as_deref(), Some("BSC Testnet"));
+        assert_eq!(bsc.l1_rpc_urls, vec!["https://bsc-rpc.example"]);
+        assert_eq!(bsc.l1_bridge_address, "0x0000000000000000000000000000000000000011");
+        assert_eq!(bsc.l1_router_address, "0x0000000000000000000000000000000000000012");
+        assert_eq!(bsc.l1_erc20_gateway_address, "0x0000000000000000000000000000000000000013");
+        assert_eq!(bsc.l1_token_addresses["USDT"], "0x0000000000000000000000000000000000000014");
+    }
+
+    #[tokio::test]
+    #[ignore = "online integration test: reads psy-genesis config and its live L1/RPC endpoints"]
+    async fn mcp_network_config_loads_live_l1_registry_from_psy_genesis() {
+        let genesis_config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../psy-genesis/config.json");
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&genesis_config_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", genesis_config_path.display())),
+        )
+        .unwrap_or_else(|error| panic!("parse {}: {error}", genesis_config_path.display()));
+        let networks = raw
+            .get("networks")
+            .and_then(serde_json::Value::as_object)
+            .expect("psy-genesis config must contain a networks object");
+        let network_name = std::env::var("PSY_MCP_LIVE_TEST_NETWORK")
+            .unwrap_or_else(|_| "testnet".to_owned());
+        let network_value = networks.get(&network_name).unwrap_or_else(|| {
+            panic!("psy-genesis config must contain networks.{network_name}")
+        });
+
+        let mut config: McpNetworkConfig = serde_json::from_value(network_value.clone())
+            .unwrap_or_else(|error| panic!("deserialize networks.{network_name} as McpNetworkConfig: {error}"));
+        let config_url = config
+            .l1_config_url
+            .clone()
+            .expect("selected Psy network must retain l1_config_url");
+        assert!(config.l1_chains.is_empty(), "runtime L1 registry must start empty");
+
+        let network = NetworkId::new(&network_name).expect("valid Psy network name");
+        load_l1_config(&network, &mut config)
+            .await
+            .unwrap_or_else(|error| panic!("load live L1 registry from {config_url}: {error:#}"));
+
+        assert!(!config.l1_chains.is_empty(), "{config_url} returned no usable L1 chains");
+        for chain in &config.l1_chains {
+            assert!(chain.chain_index < 256);
+            assert!(chain.chain_id > 0);
+            assert!(!chain.l1_rpc_urls.is_empty());
+            assert!(!chain.l1_bridge_address.is_empty());
+            assert!(!chain.l1_router_address.is_empty());
+            assert!(!chain.l1_erc20_gateway_address.is_empty());
+            assert!(!chain.l1_token_addresses.is_empty());
+        }
+    }
 
     #[test]
     fn relative_l1_config_url_uses_bridge_origin() {
@@ -674,7 +890,7 @@ mod l1_config_tests {
     #[test]
     fn runtime_document_replaces_contract_and_token_addresses() {
         let network = NetworkId::new("localhost").unwrap();
-        let mut config = McpNetworkConfig::default();
+        let config = McpNetworkConfig::default();
         let document = serde_json::json!({
             "network": "localhost",
             "chainId": "31337",
@@ -693,11 +909,11 @@ mod l1_config_tests {
             }
         });
 
-        apply_l1_config_document(&network, &mut config, &document).unwrap();
+        let chain = parse_legacy_l1_document(&network, &config, &document).unwrap();
 
-        assert_eq!(config.l1_router_address.as_deref(), Some("0x0000000000000000000000000000000000000002"));
+        assert_eq!(chain.l1_router_address, "0x0000000000000000000000000000000000000002");
         assert_eq!(
-            config.l1_token_addresses.get("PSY").map(String::as_str),
+            chain.l1_token_addresses.get("PSY").map(String::as_str),
             Some("0x0000000000000000000000000000000000000004")
         );
     }
@@ -705,15 +921,15 @@ mod l1_config_tests {
     #[test]
     fn runtime_document_rejects_wrong_network() {
         let network = NetworkId::new("localhost").unwrap();
-        let mut config = McpNetworkConfig::default();
-        let error = apply_l1_config_document(&network, &mut config, &serde_json::json!({ "network": "sepolia", "chainId": 11155111 })).unwrap_err();
+        let config = McpNetworkConfig::default();
+        let error = parse_legacy_l1_document(&network, &config, &serde_json::json!({ "network": "testnet", "chainId": 11155111 })).unwrap_err();
         assert!(error.to_string().contains("network mismatch"));
     }
 
     #[test]
     fn hosted_config_schema_is_supported() {
-        let network = NetworkId::new("sepolia").unwrap();
-        let mut config = McpNetworkConfig::default();
+        let network = NetworkId::new("testnet").unwrap();
+        let config = McpNetworkConfig::default();
         let document = serde_json::json!({
             "environment": "staging",
             "l1": { "network": "sepolia", "chain_id": 11155111 },
@@ -727,10 +943,10 @@ mod l1_config_tests {
             ]
         });
 
-        apply_l1_config_document(&network, &mut config, &document).unwrap();
+        let chain = parse_legacy_l1_document(&network, &config, &document).unwrap();
 
-        assert_eq!(config.l1_bridge_address.as_deref(), Some("0x0000000000000000000000000000000000000011"));
-        assert_eq!(config.l1_token_addresses.get("PSY").map(String::as_str), Some("0x0000000000000000000000000000000000000014"));
+        assert_eq!(chain.l1_bridge_address, "0x0000000000000000000000000000000000000011");
+        assert_eq!(chain.l1_token_addresses.get("PSY").map(String::as_str), Some("0x0000000000000000000000000000000000000014"));
     }
 
     #[test]
@@ -738,6 +954,55 @@ mod l1_config_tests {
         assert_eq!(config_chain_id(&serde_json::json!({ "chainId": "31337" })).unwrap(), 31_337);
         assert_eq!(config_chain_id(&serde_json::json!({ "chainId": "0x7a69" })).unwrap(), 31_337);
         assert_eq!(config_chain_id(&serde_json::json!({ "l1": { "chain_id": 11155111 } })).unwrap(), 11_155_111);
+    }
+
+    #[test]
+    fn multichain_document_builds_chain_scoped_registry() {
+        let document = serde_json::json!({
+            "l1_chains": [
+                {
+                    "chain_id": 11155111, "chain_index": 0, "name": "Ethereum Sepolia", "rpc_url": "https://eth.example",
+                    "contracts": {
+                        "Bridge": "0x0000000000000000000000000000000000000001",
+                        "Router": "0x0000000000000000000000000000000000000002",
+                        "ERC20Gateway": "0x0000000000000000000000000000000000000003"
+                    },
+                    "tokens": [{ "symbol": "USDT", "l1_address": "0x0000000000000000000000000000000000000004" }]
+                },
+                {
+                    "chain_id": 97, "chain_index": 1, "name": "BSC Testnet", "rpc_url": "https://bsc.example",
+                    "contracts": {
+                        "Bridge": "0x0000000000000000000000000000000000000011",
+                        "Router": "0x0000000000000000000000000000000000000012",
+                        "ERC20Gateway": "0x0000000000000000000000000000000000000013"
+                    },
+                    "tokens": [{ "symbol": "USDT", "l1_address": "0x0000000000000000000000000000000000000014" }]
+                }
+            ]
+        });
+        let chains = parse_multichain_document(&document).unwrap().unwrap();
+        assert_eq!(chains.len(), 2);
+        assert_eq!(chains[0].chain_index, 0);
+        assert_eq!(chains[1].chain_id, 97);
+        assert_eq!(chains[1].l1_router_address, "0x0000000000000000000000000000000000000012");
+        assert_eq!(chains[1].l1_token_addresses["USDT"], "0x0000000000000000000000000000000000000014");
+    }
+
+    #[test]
+    fn multichain_document_rejects_duplicate_indexes() {
+        let chain = serde_json::json!({
+            "chain_id": 1, "chain_index": 0, "rpc_url": "https://rpc.example",
+            "contracts": {
+                "Bridge": "0x0000000000000000000000000000000000000001",
+                "Router": "0x0000000000000000000000000000000000000002",
+                "ERC20Gateway": "0x0000000000000000000000000000000000000003"
+            },
+            "tokens": [{ "symbol": "PSY", "l1_address": "0x0000000000000000000000000000000000000004" }]
+        });
+        let mut other = chain.clone();
+        other["chain_id"] = serde_json::json!(2);
+        let error = parse_multichain_document(&serde_json::json!({ "l1_chains": [chain, other] })).unwrap_err();
+        assert!(error.to_string().contains("duplicate L1 chain_index"));
     }
 }
 
@@ -770,24 +1035,39 @@ impl WalletManager {
         let mcp_network = mcp_networks
             .get_mut(&network)
             .with_context(|| format!("network `{network}` is not present in Psy config"))?;
-        load_l1_config(&network, mcp_network).await?;
+        if let Err(error) = tokio::time::timeout(Duration::from_secs(15), load_l1_config(&network, mcp_network))
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("L1 configuration probe timed out after 15 seconds")))
+        {
+            // L1 bridge metadata is optional for the core Psy wallet. A
+            // temporary config-host or EVM RPC outage must not take down the
+            // entire MCP server (including its health/status tools).
+            tracing::warn!("L1 configuration for network `{network}` is unavailable; bridge tools will remain unavailable until restart: {error:#}");
+        }
         let rpc_config = psy_config
             .get_network(network.as_str())
             .with_context(|| format!("network `{network}` is not present in Psy config"))?
             .clone();
-        let session = WalletSession::new(&rpc_config)
-            .await
-            .context("failed to init WalletSession (prove-proxy / coordinator unreachable?)")?;
         let default_network = network.clone();
         let mut networks = HashMap::new();
-        networks.insert(
-            network.clone(),
-            Arc::new(Mutex::new(NetworkWallet {
-                session,
-                users: HashMap::new(),
-                active_user: None,
-            })),
-        );
+        match tokio::time::timeout(Duration::from_secs(15), WalletSession::new(&rpc_config)).await {
+            Ok(Ok(session)) => {
+                networks.insert(
+                    network.clone(),
+                    Arc::new(Mutex::new(NetworkWallet {
+                        session,
+                        users: HashMap::new(),
+                        active_user: None,
+                    })),
+                );
+            }
+            Ok(Err(error)) => tracing::warn!(
+                "default network `{network}` is currently unreachable; MCP will start in degraded mode and retry when a tool probes the network: {error:#}"
+            ),
+            Err(_) => tracing::warn!(
+                "default network `{network}` initialization timed out after 15 seconds; MCP will start in degraded mode"
+            ),
+        }
         Ok(Self {
             config: psy_config,
             mcp_networks,
@@ -798,6 +1078,12 @@ impl WalletManager {
 
     pub fn default_network(&self) -> &NetworkId {
         &self.default_network
+    }
+
+    pub fn configured_networks(&self) -> Vec<NetworkId> {
+        let mut networks = self.mcp_networks.keys().cloned().collect::<Vec<_>>();
+        networks.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        networks
     }
 
     /// The configured Nostr relay for private-note delivery on this network.
@@ -811,13 +1097,25 @@ impl WalletManager {
             })
     }
 
-    pub fn endpoint_summary(&self, network: &NetworkId) -> Result<EndpointSummary> {
-        let network = self.config.get_network(network.as_str())?;
+    pub fn endpoint_summary(&self, network_id: &NetworkId) -> Result<EndpointSummary> {
+        let network = self.config.get_network(network_id.as_str())?;
         Ok(EndpointSummary {
             coordinator: network.coordinator_configs.iter().flat_map(|c| c.rpc_url.clone()).collect(),
             realm: network.realm_configs.iter().flat_map(|r| r.rpc_url.clone()).collect(),
             prove_proxy: network.prove_proxy_url.clone(),
+            faucet: network.faucet_rpc_url.clone(),
             api_services: network.api_services_url.clone().unwrap_or_default(),
+            indexer_graphql: self.mcp_networks.get(network_id).map(|config| config.indexer_graphql_url.clone()).unwrap_or_default(),
+            explorer: self.mcp_networks.get(network_id).map(|config| config.explorer_url.clone()).unwrap_or_default(),
+            nostr_relay: (!network.nostr_relay_url.trim().is_empty()).then(|| network.nostr_relay_url.clone()).into_iter().collect(),
+            l1_rpc: self.mcp_networks.get(network_id).map(|config| config.l1_rpc_urls.clone()).unwrap_or_default(),
+            bridge: self.mcp_networks.get(network_id).map(|config| config.bridge_url.clone()).unwrap_or_default(),
+            l1_config: self
+                .mcp_networks
+                .get(network_id)
+                .and_then(|config| config.l1_config_url.clone())
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -842,34 +1140,59 @@ impl WalletManager {
             .cloned()
     }
 
-    pub fn l1_rpc_url(&self, network: &NetworkId) -> Option<String> {
-        self.mcp_networks
-            .get(network)?
+    fn l1_chain(&self, network: &NetworkId, chain_index: u32) -> Option<&McpL1Chain> {
+        self.mcp_networks.get(network)?.l1_chains.iter().find(|chain| chain.chain_index == chain_index)
+    }
+
+    pub fn l1_rpc_url(&self, network: &NetworkId, chain_index: u32) -> Option<String> {
+        self.l1_chain(network, chain_index)?
             .l1_rpc_urls
             .iter()
             .find(|url| !url.trim().is_empty())
             .cloned()
     }
 
-    pub fn l1_bridge_address(&self, network: &NetworkId) -> Option<String> {
-        self.mcp_networks.get(network)?.l1_bridge_address.clone()
+    pub fn l1_bridge_address(&self, network: &NetworkId, chain_index: u32) -> Option<String> {
+        Some(self.l1_chain(network, chain_index)?.l1_bridge_address.clone()).filter(|value| !value.is_empty())
     }
 
-    pub fn l1_router_address(&self, network: &NetworkId) -> Option<String> {
-        self.mcp_networks.get(network)?.l1_router_address.clone()
+    pub fn l1_router_address(&self, network: &NetworkId, chain_index: u32) -> Option<String> {
+        Some(self.l1_chain(network, chain_index)?.l1_router_address.clone()).filter(|value| !value.is_empty())
     }
 
-    pub fn l1_erc20_gateway_address(&self, network: &NetworkId) -> Option<String> {
-        self.mcp_networks.get(network)?.l1_erc20_gateway_address.clone()
+    pub fn l1_erc20_gateway_address(&self, network: &NetworkId, chain_index: u32) -> Option<String> {
+        Some(self.l1_chain(network, chain_index)?.l1_erc20_gateway_address.clone()).filter(|value| !value.is_empty())
     }
 
-    pub fn l1_token_address(&self, network: &NetworkId, token: &str) -> Option<String> {
-        self.mcp_networks
-            .get(network)?
+    pub fn l1_token_address(&self, network: &NetworkId, chain_index: u32, token: &str) -> Option<String> {
+        self.l1_chain(network, chain_index)?
             .l1_token_addresses
             .iter()
             .find(|(symbol, _)| symbol.eq_ignore_ascii_case(token))
             .map(|(_, address)| address.clone())
+    }
+
+    pub fn l1_chain_identity(&self, network: &NetworkId, chain_index: u32) -> Option<(u64, Option<String>)> {
+        let chain = self.l1_chain(network, chain_index)?;
+        Some((chain.chain_id, chain.name.clone()))
+    }
+
+    pub fn l1_chain_summaries(&self, network: &NetworkId) -> Vec<serde_json::Value> {
+        self.mcp_networks
+            .get(network)
+            .map(|config| {
+                config
+                    .l1_chains
+                    .iter()
+                    .map(|chain| serde_json::json!({
+                        "chainIndex": chain.chain_index,
+                        "chainId": chain.chain_id,
+                        "name": chain.name,
+                        "tokens": chain.l1_token_addresses.keys().collect::<Vec<_>>(),
+                    }))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Resolve the network for one MCP request and lazily create its
@@ -968,7 +1291,7 @@ impl WalletManager {
     /// devnet whose checkpoints are near-instant. We poll until the id
     /// exists, mirroring what the shipped web wallet's sign-in sequence
     /// does.
-    pub async fn register(&self, network: &NetworkId, private_key_hex: &str, fingerprint_hex: &str, name: &str) -> Result<LoadedUser> {
+    pub async fn register(&self, network: &NetworkId, private_key_hex: &str, fingerprint_hex: &str, name: &str, sign_type: &str) -> Result<LoadedUser> {
         let private_key = Self::parse_key(private_key_hex)?;
         let fingerprint = fingerprint_hex.trim().parse::<QHashOut<F>>().map_err(|_| anyhow!("invalid fingerprint (expected QHashOut hex)"))?;
         let pk_hash = self.state(network).await?.session.register_user(private_key, fingerprint).await?;
@@ -978,6 +1301,7 @@ impl WalletManager {
             pk_hash,
             user_id,
             fingerprint,
+            sign_type: sign_type.to_string(),
             mandate: None,
             private_key,
         };
@@ -1087,6 +1411,7 @@ impl WalletManager {
             pk_hash,
             user_id,
             fingerprint,
+            sign_type: "sd-key".to_string(),
             mandate: Some(mandate),
             private_key,
         };
@@ -1151,9 +1476,24 @@ impl WalletManager {
             (pk_hash, fingerprint)
         };
         let user_id = self.resolve_user_id(network, pk_hash).await?;
-        let loaded = LoadedUser { name: name.to_string(), pk_hash, user_id, fingerprint, mandate: None, private_key };
+        let resolved_sign_type = if fingerprint_hex.is_some() {
+            "custom".to_string()
+        } else {
+            sign_type.unwrap_or("zk").trim().to_ascii_lowercase()
+        };
+        let loaded = LoadedUser { name: name.to_string(), pk_hash, user_id, fingerprint, sign_type: resolved_sign_type, mandate: None, private_key };
         self.activate_user(network, loaded.clone()).await?;
         Ok(loaded)
+    }
+
+    async fn infer_sign_type(&self, network: &NetworkId, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> Result<String> {
+        let mut state = self.state(network).await?;
+        for sign_type in ["zk", "secp256k1", "eth-personal-secp256k1"] {
+            if state.resolve_fingerprint(private_key, Some(sign_type), None).await? == fingerprint {
+                return Ok(sign_type.to_string());
+            }
+        }
+        Ok("custom".to_string())
     }
 
     /// Restore a wallet from a key backup, re-registering the agent's circuit
@@ -1174,9 +1514,14 @@ impl WalletManager {
             let private_key = Self::parse_key(&backup.private_key)?;
             let fingerprint = backup.fingerprint.trim().parse::<QHashOut<F>>()
                 .map_err(|_| anyhow!("key backup has an invalid fingerprint"))?;
+            let sign_type = match backup.sign_type.as_deref() {
+                Some(value) => value.to_string(),
+                None => self.infer_sign_type(network, private_key, fingerprint).await?,
+            };
             let pk_hash = self.state(network).await?.session.add_user(private_key, fingerprint).await?;
             let user_id = self.resolve_user_id(network, pk_hash).await?;
-            let loaded = LoadedUser { name: backup.name.clone(), pk_hash, user_id, fingerprint, mandate: None, private_key };
+            validate_cached_identity(backup, pk_hash, user_id)?;
+            let loaded = LoadedUser { name: backup.name.clone(), pk_hash, user_id, fingerprint, sign_type, mandate: None, private_key };
             self.activate_user(network, loaded.clone()).await?;
             return Ok(loaded);
         };
@@ -1201,11 +1546,13 @@ impl WalletManager {
         }
         let pk_hash = self.state(network).await?.session.add_user(private_key, fingerprint).await?;
         let user_id = self.resolve_user_id(network, pk_hash).await?;
+        validate_cached_identity(backup, pk_hash, user_id)?;
         let loaded = LoadedUser {
             name: backup.name.clone(),
             pk_hash,
             user_id,
             fingerprint,
+            sign_type: "sd-key".to_string(),
             mandate: Some(mandate),
             private_key,
         };
@@ -1238,6 +1585,12 @@ impl WalletManager {
 
     pub async fn latest_checkpoint(&self, network: &NetworkId) -> Result<u64> {
         self.state(network).await?.latest_checkpoint().await
+    }
+
+    pub async fn latest_block_state_json(&self, network: &NetworkId) -> Result<(u64, serde_json::Value)> {
+        let state = self.state(network).await?.session.st_provider.get_coordinator_latest_block_state().await?;
+        let checkpoint_id = state.checkpoint_id;
+        Ok((checkpoint_id, serde_json::to_value(state).context("serialize coordinator latest block state")?))
     }
 
     /// Public claimable owed to the loaded user by a specific sender.
@@ -1423,6 +1776,22 @@ impl WalletManager {
     pub async fn generate_keypair(&self, network: &NetworkId, sign_type: Option<&str>, fingerprint: Option<&str>) -> Result<(String, String)> {
         self.state(network).await?.generate_keypair(sign_type, fingerprint).await
     }
+}
+
+fn validate_cached_identity(backup: &crate::keystore::KeyBackup, pk_hash: QHashOut<F>, user_id: u64) -> Result<()> {
+    if let Some(cached) = backup.public_key.as_deref() {
+        anyhow::ensure!(
+            cached == pk_hash.to_string(),
+            "key backup public_key {cached} does not match the public key derived from its private key and fingerprint ({pk_hash})"
+        );
+    }
+    if let Some(cached) = backup.user_id {
+        anyhow::ensure!(
+            cached == user_id,
+            "key backup user_id {cached} does not match user_id {user_id} resolved on the selected network"
+        );
+    }
+    Ok(())
 }
 
 /// The note tree is 20 levels deep (2^20 notes per user/contract).
@@ -2139,7 +2508,15 @@ impl DepositNote {
         Ok((qhash_to_bytes32_be(shield), qhash_to_bytes32_be(commitment)))
     }
 
-    pub fn path_in(dir: &std::path::Path, network: &str, expected_index: u64) -> Result<std::path::PathBuf> {
+    pub fn path_in(dir: &std::path::Path, network: &str, source_chain_index: u32, expected_index: u64) -> Result<std::path::PathBuf> {
+        Ok(crate::keystore::network_dir(dir, network)?
+            .join("deposits")
+            .join(source_chain_index.to_string())
+            .join(format!("deposit-{expected_index}.json")))
+    }
+
+    /// Pre-multichain location, read-only for recovery of existing chain-0 notes.
+    pub fn legacy_path_in(dir: &std::path::Path, network: &str, expected_index: u64) -> Result<std::path::PathBuf> {
         Ok(crate::keystore::network_dir(dir, network)?
             .join("deposits")
             .join(format!("deposit-{expected_index}.json")))
@@ -2149,7 +2526,7 @@ impl DepositNote {
     /// file is as fatal as a missing one.
     pub fn persist(&self, dir: &std::path::Path) -> Result<std::path::PathBuf> {
         let network = self.network.as_deref().ok_or_else(|| anyhow!("deposit note has no network"))?;
-        let path = Self::path_in(dir, network, self.expected_deposit_index)?;
+        let path = Self::path_in(dir, network, self.source_chain_index, self.expected_deposit_index)?;
         let parent = path.parent().ok_or_else(|| anyhow!("deposit note path has no parent"))?;
         std::fs::create_dir_all(parent)?;
         let tmp = path.with_extension("json.tmp");

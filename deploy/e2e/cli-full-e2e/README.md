@@ -26,7 +26,7 @@ artifact set. It does not alter repository deployment files.
 
 ```bash
 cargo build --locked --release --manifest-path deploy/e2e/cli-full-e2e/Cargo.toml
-cargo build --locked --release -p psy_user_cli
+PSY_NETWORK=localhost cargo build --locked --release -p psy_user_cli
 ```
 
 Validate all profile mappings and private run-directory construction without

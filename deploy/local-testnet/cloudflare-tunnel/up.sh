@@ -20,7 +20,7 @@ build_relayer_if_requested() {
 
   echo "[local-cf-tunnel] building bridge relayer release binary"
   CARGO_TARGET_DIR="${LOCAL_STAGING_TARGET_DIR:-$PARTH_DIR/target}" \
-    cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_relayer_cli
+    PSY_NETWORK="${LOCAL_STAGING_PSY_STAGE:-localhost}" cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_relayer_cli
 }
 
 start_anvil_if_needed() {

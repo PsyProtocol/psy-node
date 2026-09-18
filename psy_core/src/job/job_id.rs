@@ -223,7 +223,7 @@ impl ProvingJobCircuitType {
             | ProvingJobCircuitType::GUTAVerifyToCap
             | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
             | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
-            | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
+            | ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint
             | ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint
             | ProvingJobCircuitType::GUTALeftGUTARightEndCap
             | ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint => true,

@@ -171,5 +171,18 @@ grep -Fx "GENESIS_CONTRACTS_SHA256=$(sha256sum "$PSY_GENESIS_DIR/genesis_contrac
   exit 1
 }
 cat "$bundle_manifest"
-tar -xOf "$bundle" ./client_prover/config.json | jq '.networks.localhost.realm_configs'
+bundle_config_json="$(tar -xOf "$bundle" ./client_prover/config.json)"
+printf '%s' "$bundle_config_json" | jq -e '.networks.testnet.realm_configs' >/dev/null || {
+  echo "bundle client_prover/config.json has no networks.testnet.realm_configs" >&2
+  exit 1
+}
+printf '%s' "$bundle_config_json" | jq '.networks.testnet.realm_configs'
+bundle_default_network="$(printf '%s' "$bundle_config_json" | jq -er '.defaultNetwork')" || {
+  echo "bundle client_prover/config.json has no defaultNetwork" >&2
+  exit 1
+}
+[ "$bundle_default_network" = "testnet" ] || {
+  echo "bundle client_prover/config.json defaultNetwork is '$bundle_default_network', expected testnet" >&2
+  exit 1
+}
 du -h "$bundle"

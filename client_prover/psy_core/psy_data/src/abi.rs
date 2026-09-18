@@ -113,7 +113,7 @@ pub enum TypeRef {
     },
     Array {
         item: Box<TypeRef>,
-        length: u32,
+        length: u64,
         item_felt_size: usize,
     },
     Map {

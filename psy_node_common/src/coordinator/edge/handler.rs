@@ -25,6 +25,8 @@ use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabase
 
 use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorUpdateContractQueueKey};
 
+pub type CanonicalLayoutProofVerifier =
+    dyn Fn(&[u8]) -> anyhow::Result<()> + Send + Sync;
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct CoordinatorEdgeHandler<
@@ -56,6 +58,8 @@ pub struct CoordinatorEdgeHandler<
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
+    pub canonical_layout_verifier_fingerprint: N::QHash,
+    pub canonical_layout_proof_verifier: Arc<CanonicalLayoutProofVerifier>,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -96,6 +100,8 @@ impl<
             proof_verifier: self.proof_verifier.clone(),
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
+            canonical_layout_verifier_fingerprint: self.canonical_layout_verifier_fingerprint,
+            canonical_layout_proof_verifier: self.canonical_layout_proof_verifier.clone(),
         }
     }
 }
@@ -134,6 +140,8 @@ impl<
         realm_identifier: QRealmIdentifier,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
+        canonical_layout_verifier_fingerprint: N::QHash,
+        canonical_layout_proof_verifier: Arc<CanonicalLayoutProofVerifier>,
     ) -> Self {
         let realm_id_u64 = realm_identifier.realm_id as u64;
         let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
@@ -152,6 +160,8 @@ impl<
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
+            canonical_layout_verifier_fingerprint,
+            canonical_layout_proof_verifier,
         }
     }
     pub async fn get_checkpoint_leaves_batch_raw_internal(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<u8>>{
@@ -399,6 +409,26 @@ impl<
 
         Ok("ok".to_string())
     }
+
+    async fn validate_canonical_layout_proof(
+        &self,
+        claimed_fingerprint: N::QHash,
+        proof: &[u8],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            claimed_fingerprint == self.canonical_layout_verifier_fingerprint,
+            "canonical layout verifier fingerprint mismatch"
+        );
+
+        let verifier = self.canonical_layout_proof_verifier.clone();
+        let proof = proof.to_vec();
+        task::spawn_blocking(move || verifier(&proof))
+            .await?
+            .map_err(|error| {
+                anyhow::anyhow!("canonical layout proof verification failed: {error}")
+            })
+    }
+
     pub async fn deploy_contract_internal(
         &self,
         deploy_contract: PQBCDeployContractV2<N::QHash>,
@@ -418,6 +448,12 @@ impl<
             function_count <= (1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT),
             "contract has too many functions defined"
         );
+
+        self.validate_canonical_layout_proof(
+            deploy_contract.canonical_layout_verifier_fingerprint,
+            &deploy_contract.canonical_layout_proof,
+        )
+        .await?;
 
         let PQBCDeployContractV2 {
             deploy_contract,
@@ -516,6 +552,12 @@ impl<
                 == update_contract.code_definition.state_tree_height as u64,
             "contract state tree height is immutable"
         );
+
+        self.validate_canonical_layout_proof(
+            update_contract.canonical_layout_verifier_fingerprint,
+            &update_contract.canonical_layout_proof,
+        )
+        .await?;
 
         let (unique_pending_id, unique_proc_checkpoint_id, queue_key) = self.get_update_contract_queue_key().await?;
 

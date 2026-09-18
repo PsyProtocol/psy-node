@@ -15,7 +15,7 @@ for command in cargo rsync ssh; do
   }
 done
 
-cargo build --release --locked --manifest-path "$MANIFEST"
+PSY_NETWORK="${PSY_NETWORK:-localhost}" cargo build --release --locked --manifest-path "$MANIFEST"
 [ -x "$BINARY" ] || {
   echo "monitor binary was not generated: $BINARY" >&2
   exit 1

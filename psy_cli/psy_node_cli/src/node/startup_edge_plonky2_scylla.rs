@@ -2,7 +2,14 @@ use std::sync::Arc;
 
 use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfigHelper};
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
-use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
+use psy_core::{
+    constants::protocol::{
+        STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
+        STATE_LAYOUT_MAX_AGGREGATION_DEPTH, STATE_LAYOUT_TREE_HEIGHT,
+    },
+    job::job_id::QProvingJobDataID,
+    network_config::PsyNetworkLocalDevnetConstants,
+};
 use psy_data::
     config::network_config::PsyNodeCircuitFingerprintConfigProvider
 ;
@@ -12,6 +19,7 @@ use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
 use psy_plonky2_circuits::{
+    coordinator::state_layout_helper::CanonicalLayoutProofVerifier,
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon, zk_verifier::PsyPlonky2ZKVerifier,
 };
@@ -51,6 +59,18 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
     // instead of rebuilding every coordinator and state-layout circuit at
     // startup (the latter includes all layout aggregation levels).
     let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::from_cached());
+    let canonical_layout_proof_verifier = Arc::new(
+        CanonicalLayoutProofVerifier::<C, D>::new(
+            STATE_LAYOUT_TREE_HEIGHT - STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
+            STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT,
+            STATE_LAYOUT_MAX_AGGREGATION_DEPTH,
+        ),
+    );
+    let canonical_layout_verifier_fingerprint =
+        canonical_layout_proof_verifier.fingerprint();
+    let verify_canonical_layout_proof = Arc::new(move |proof: &[u8]| {
+        canonical_layout_proof_verifier.verify_serialized_proof(proof)
+    });
 /*
 
     pub fn new(
@@ -84,6 +104,8 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                canonical_layout_verifier_fingerprint,
+                verify_canonical_layout_proof,
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,

@@ -61,6 +61,7 @@ if [[ "$mode" == --apply ]]; then
     --volume "$registry:/cargo/registry" --volume "$repo:/workspace" \
     --workdir /workspace --env CARGO_HOME=/cargo \
     --env CARGO_TARGET_DIR=/workspace/target/bookworm --env RUSTUP_TOOLCHAIN=1.97.1 \
+    --env PSY_NETWORK="${PSY_NETWORK:-localhost}" \
     "${NOTIFIER_BOOKWORM_BUILDER_IMAGE:-parth-bookworm-builder:latest}" \
     cargo build --workspace --release --locked
   binaries="$repo/target/bookworm/release"

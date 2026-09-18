@@ -68,7 +68,7 @@ the CLI's required recovery flags before starting transactions. The wrapper
 always performs an incremental build of the orchestrator to avoid stale tools.
 
 ```bash
-cargo build --locked --release -p psy_user_cli --no-default-features
+PSY_NETWORK=localhost cargo build --locked --release -p psy_user_cli --no-default-features
 STAGING_CHAIN=base PSY_E2E_USER_CLI="$PWD/target/release/psy_user_cli" \
   deploy/e2e/staging/run-cli-e2e.sh recover-deposit "$RUN_ROOT/base" --token usdt
 ```

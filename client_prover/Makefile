@@ -6,7 +6,8 @@ PROFILE := release
 BIN_DIR := $(ROOT_DIR)/target/$(PROFILE)
 ROOT_CONFIG_PATH := $(CURDIR)/../psy-genesis/config.json
 PRIVATE_KEYS_FILE ?= $(ROOT_DIR)/private_keys.json
-CARGO := cd $(ROOT_DIR) && PSY_CONFIG_PATH=$(ROOT_CONFIG_PATH) cargo
+PSY_NETWORK ?= localhost
+CARGO := cd $(ROOT_DIR) && PSY_CONFIG_PATH=$(ROOT_CONFIG_PATH) PSY_NETWORK=$(PSY_NETWORK) cargo
 USER_CLI := $(BIN_DIR)/psy_user_cli
 LOG_LEVEL := psy_ups_circuit=trace,psy_dpn_circuit=trace,psy_user_cli=debug,psy_common_circuit=trace,psy_network_circuit=trace,psy_prover=trace,psy_client_data=trace,plonky2=error
 
@@ -47,8 +48,8 @@ fmt:
 	@cd $(ROOT_DIR) && cargo fmt
 
 install:
-	@cd $(ROOT_DIR) && cargo install --path client_prover/psy_cli/psy_user_cli --locked
-	@cd $(ROOT_DIR) && cargo install --path client_prover/psy_mcp_server --locked
+	@$(CARGO) install --path client_prover/psy_cli/psy_user_cli --locked
+	@$(CARGO) install --path client_prover/psy_mcp_server --locked
 
 clean:
 	@cd $(ROOT_DIR) && rm -rf target
@@ -143,14 +144,14 @@ register-random-user:
 deploy-contract:
 	@echo "Deploying contracts..."
 	@echo "USER0 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path $(CURDIR)/../psy-genesis/token.json --is-deploy
 	@echo "USER1 deploying token contract..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path $(CURDIR)/../psy-genesis/token.json --is-deploy
 
 update-contract:
 	@echo "Updating contracts..."
 	@echo "USER0 update token contract(no simple_mint)..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) update-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.update.json --old-abi-path ${PWD}/token.json --is-update --contract-id 6
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) update-contract --private-key=${USER0_PRIVATE_KEY} --contract-path $(CURDIR)/../psy-genesis/token.update.json --old-abi-path $(CURDIR)/../psy-genesis/token.json --is-update --contract-id 6
 
 get-deploy-contract-cmd:
 	@echo "Deploying contracts..."
