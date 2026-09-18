@@ -33,6 +33,14 @@ set -euo pipefail
 #   mainnet   = 0x1337CF514544C069
 expected_magic="${EXPECTED_MAGIC:-0x1337CF514544CF69}"
 hosts="${IDENTITY_HOSTS:?set IDENTITY_HOSTS to the space-separated VM list, e.g. IDENTITY_HOSTS=\"gcp-cp-ce gcp-prove-proxy\"}"
+# The :? guard above only catches unset or truly empty; a whitespace-only
+# value (e.g. IDENTITY_HOSTS=" ") passes it and then word-splits to zero
+# hosts below, which would silently "pass" having checked nothing. Reject
+# that here.
+if [ -z "${hosts//[[:space:]]/}" ]; then
+  echo "IDENTITY_HOSTS is set but contains no host names" >&2
+  exit 1
+fi
 units="${IDENTITY_UNITS:-psy-coordinator psy-realm0 psy-realm1 psy-worker psy-prove-proxy psy-system-prove-proxy psy-faucet psy-relayer}"
 since="${IDENTITY_SINCE:--2h}"
 zone_flag=()
