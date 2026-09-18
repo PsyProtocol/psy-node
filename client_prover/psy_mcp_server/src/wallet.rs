@@ -844,7 +844,7 @@ mod l1_config_tests {
             .and_then(serde_json::Value::as_object)
             .expect("psy-genesis config must contain a networks object");
         let network_name = std::env::var("PSY_MCP_LIVE_TEST_NETWORK")
-            .unwrap_or_else(|_| "sepolia".to_owned());
+            .unwrap_or_else(|_| "testnet".to_owned());
         let network_value = networks.get(&network_name).unwrap_or_else(|| {
             panic!("psy-genesis config must contain networks.{network_name}")
         });
@@ -922,13 +922,13 @@ mod l1_config_tests {
     fn runtime_document_rejects_wrong_network() {
         let network = NetworkId::new("localhost").unwrap();
         let config = McpNetworkConfig::default();
-        let error = parse_legacy_l1_document(&network, &config, &serde_json::json!({ "network": "sepolia", "chainId": 11155111 })).unwrap_err();
+        let error = parse_legacy_l1_document(&network, &config, &serde_json::json!({ "network": "testnet", "chainId": 11155111 })).unwrap_err();
         assert!(error.to_string().contains("network mismatch"));
     }
 
     #[test]
     fn hosted_config_schema_is_supported() {
-        let network = NetworkId::new("sepolia").unwrap();
+        let network = NetworkId::new("testnet").unwrap();
         let config = McpNetworkConfig::default();
         let document = serde_json::json!({
             "environment": "staging",

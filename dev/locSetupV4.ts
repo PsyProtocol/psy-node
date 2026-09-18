@@ -235,6 +235,31 @@ type ConfigNetworkEntry = {
     l1_rpc_urls?: string[];
     anvilForkSourceUrlEnv?: string;
 };
+
+// The Psy stage (genesis config block, VITE_PSY_STAGE) and the L1 target
+// network (anvil vs external RPC, psy-contracts/deployments/<name>,
+// VITE_NETWORK) are separate namespaces after the stage rename. A stage
+// picks the genesis config; an L1 network name picks the chain/deployments
+// directory. STAGE_DEFAULT_L1 is the default L1 for a stage when
+// VITE_NETWORK is not set explicitly.
+type PsyStage = "localhost" | "testnet" | "mainnet";
+const STAGE_DEFAULT_L1: Record<PsyStage, L1NetworkName> = {
+    localhost: "localhost",
+    testnet: "sepolia",
+    mainnet: "ethereum",
+};
+// Reverse map: only the L1 networks that are a stage's default L1 have a
+// corresponding genesis config block. bscTestnet/baseSepolia/localhostBsc/
+// localhostBase are L1-only names with no genesis stage of their own.
+const L1_TO_STAGE: Partial<Record<L1DeploymentNetwork, PsyStage>> = Object.fromEntries(
+    (Object.entries(STAGE_DEFAULT_L1) as [PsyStage, L1NetworkName][]).map(([stage, l1]) => [l1, stage]),
+);
+
+function resolveStage(): PsyStage {
+    const value = (process.env.VITE_PSY_STAGE || "localhost").trim().toLowerCase();
+    if (value === "localhost" || value === "testnet" || value === "mainnet") return value;
+    throw new Error(`[DevNet] unsupported VITE_PSY_STAGE=${value}; expected localhost, testnet, or mainnet`);
+}
 const DEV_TEST_ADDRESSES = [
     "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
     "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
@@ -243,17 +268,18 @@ const DEV_TEST_ADDRESSES = [
     "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65",
 ] as const;
 
-function resolveL1Selection(): { l1Network: L1NetworkName; l1Fork: boolean; cfgEntry: ConfigNetworkEntry } {
-    const l1Network = resolveL1Network();
+function resolveL1Selection(): { stage: PsyStage; l1Network: L1NetworkName; l1Fork: boolean; cfgEntry: ConfigNetworkEntry } {
+    const stage = resolveStage();
+    const l1Network = resolveL1Network(stage);
     const l1Fork = isTruthyEnv(process.env.VITE_FORK);
     if (l1Network === "localhost" && l1Fork) {
         throw new Error("[DevNet] VITE_FORK=true requires VITE_NETWORK=sepolia or ethereum");
     }
-    const cfgEntry = (allConfig as any)?.networks?.[l1Network] as ConfigNetworkEntry | undefined;
+    const cfgEntry = (allConfig as any)?.networks?.[stage] as ConfigNetworkEntry | undefined;
     if (!cfgEntry) {
-        throw new Error(`[DevNet] config.json networks.${l1Network} missing`);
+        throw new Error(`[DevNet] config.json networks.${stage} missing`);
     }
-    return { l1Network, l1Fork, cfgEntry };
+    return { stage, l1Network, l1Fork, cfgEntry };
 }
 
 let cachedWalletPassword: string | null = null;
@@ -479,12 +505,12 @@ async function fundDevTestAccounts(
     console.log(`[DevNet] funded ${targets.length} dev test accounts with ETH+USDT+PSY`);
 }
 
-function resolveL1Network(): L1NetworkName {
-    const value = (process.env.VITE_NETWORK || "localhost").trim().toLowerCase();
-    if (value === "localhost" || value === "sepolia" || value === "ethereum") {
-        return value;
+function resolveL1Network(stage: PsyStage): L1NetworkName {
+    const raw = (process.env.VITE_NETWORK || STAGE_DEFAULT_L1[stage]).trim().toLowerCase();
+    if (raw === "localhost" || raw === "sepolia" || raw === "ethereum") {
+        return raw;
     }
-    throw new Error(`[DevNet] unsupported VITE_NETWORK=${value}; expected localhost, sepolia, or ethereum`);
+    throw new Error(`[DevNet] unsupported VITE_NETWORK=${raw}; expected localhost, sepolia, or ethereum`);
 }
 
 function resolveLocalL1RpcUrl(port: number): string {
@@ -492,8 +518,7 @@ function resolveLocalL1RpcUrl(port: number): string {
     return `http://${rpcHost}:${port}`;
 }
 
-function resolveExternalL1RpcUrl(network: Exclude<L1NetworkName, "localhost">): string {
-    const cfgEntry = (allConfig as any)?.networks?.[network] as ConfigNetworkEntry | undefined;
+function resolveExternalL1RpcUrl(network: Exclude<L1NetworkName, "localhost">, cfgEntry: ConfigNetworkEntry | undefined): string {
     const envKey = cfgEntry?.anvilForkSourceUrlEnv;
     const rpcUrl = envKey ? process.env[envKey] : undefined;
     if (!rpcUrl || rpcUrl.trim().length === 0) {
@@ -2414,9 +2439,11 @@ async function ensureDevEnvironment(
 async function buildProject(cwd?: string) {
     console.log("Building project...");
     const root = cwd || ".";
+    const stage = resolveStage();
     const env = {
         ...process.env,
         PSY_CONFIG_PATH: path.join(root, "psy-genesis", "config.json"),
+        PSY_NETWORK: stage,
     };
     const proc = Bun.spawn([
         "cargo",
@@ -2596,7 +2623,17 @@ async function deployPsyContracts(
         console.log(`[DevNet] funded bridge relayer deployer ${bridgeRelayerSigner.address} on local anvil`);
     }
     console.log(`[DevNet] Deploying psy-contracts to ${deploymentsNetwork}...`);
-    const deploymentCfg = (allConfig as any)?.networks?.[deploymentsNetwork] as ConfigNetworkEntry | undefined;
+    // deploymentsNetwork is an L1 name (sepolia/bscTestnet/...), not a Psy
+    // stage, so it cannot index the genesis config's networks block
+    // directly. Only L1 names that are a stage's default L1 (see
+    // STAGE_DEFAULT_L1) have a corresponding genesis block; reverse-map
+    // through L1_TO_STAGE to find it. bscTestnet/baseSepolia/localhostBsc/
+    // localhostBase have no genesis stage of their own, so deploymentCfg
+    // stays undefined for them and the RPC env key falls through below.
+    const deploymentStage = L1_TO_STAGE[deploymentsNetwork];
+    const deploymentCfg = deploymentStage
+        ? ((allConfig as any)?.networks?.[deploymentStage] as ConfigNetworkEntry | undefined)
+        : undefined;
     const localRpcEnvKeys: Partial<Record<L1DeploymentNetwork, string>> = {
         localhost: "LOCALHOST_RPC_URL",
         localhostBsc: "LOCALHOST_BSC_RPC_URL",
@@ -3360,10 +3397,10 @@ class DevNetProcessManager {
         const cwd = options?.cwd || ".";
         const jtmb = !!options?.jtmb;
         const l1Port = options.l1Port ?? 8545;
-        const { l1Network, l1Fork, cfgEntry } = resolveL1Selection();
+        const { stage, l1Network, l1Fork, cfgEntry } = resolveL1Selection();
         const deploymentsNetwork: L1NetworkName = l1Fork ? "localhost" : l1Network;
         const localL1RpcUrl = resolveLocalL1RpcUrl(l1Port);
-        const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network);
+        const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network, cfgEntry);
         const relayerChains = deploymentsNetwork.startsWith('localhost')
             ? [
                 { chainIndex: 0, networkId: 'localhost', deploymentsNetwork: 'localhost', rpcUrl: l1RpcUrl },
@@ -4207,6 +4244,7 @@ class DevNetProcessManager {
                     ...getLogPaths('psy_privacy_bridge', false),
                     env: {
                         ...this.getEnv(),
+                        VITE_PSY_STAGE: stage,
                         VITE_NETWORK: l1Network,
                         VITE_FORK: String(l1Fork),
                         // Point @deployments at the root psy-contracts deployments the
@@ -4233,6 +4271,7 @@ class DevNetProcessManager {
                     ...getLogPaths('ide', false),
                     env: {
                         ...this.getEnv(),
+                        VITE_PSY_STAGE: stage,
                         VITE_NETWORK: l1Network,
                         VITE_FORK: String(l1Fork),
                     },
@@ -4255,6 +4294,7 @@ class DevNetProcessManager {
                     ...getLogPaths('explorer', false),
                     env: {
                         ...this.getEnv(),
+                        VITE_PSY_STAGE: stage,
                         VITE_NETWORK: l1Network,
                         VITE_FORK: String(l1Fork),
                         // Same as the bridge shell: read the root psy-contracts
@@ -4310,6 +4350,7 @@ class DevNetProcessManager {
                     ...getLogPaths('mode_a_web_wallet_bridge', false),
                     env: {
                         ...this.getEnv(),
+                        VITE_PSY_STAGE: stage,
                         VITE_NETWORK: l1Network,
                         VITE_FORK: String(l1Fork),
                         PSY_DEPLOYMENTS_DIR: path.resolve(cwd, 'psy-contracts', 'deployments'),
@@ -4845,9 +4886,9 @@ async function runMain() {
     const envString = values["env"];
     const help = !!values["help"];
     const l1Port = values["l1-port"] ? parseInt(values["l1-port"] as string, 10) : 8545;
-    const { l1Network, l1Fork } = resolveL1Selection();
+    const { l1Network, l1Fork, cfgEntry } = resolveL1Selection();
     const localL1RpcUrl = resolveLocalL1RpcUrl(l1Port);
-    const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network);
+    const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network, cfgEntry);
 
     const envVars: { [key: string]: string } = envString ? parseEnvAssignments(envString) : {};
 
@@ -4894,7 +4935,8 @@ Usage: bun run dev/locSetupV4.ts [options]
    --faucet-server                 Start psy faucet server (port 9998)
    --l1                            Start L1 chain (anvil, default port 8545)
    --l1-port <port>                Port for anvil L1 node (default: 8545)
-   VITE_NETWORK=localhost|sepolia|ethereum   Select L1 target network (default: localhost)
+   VITE_PSY_STAGE=localhost|testnet|mainnet   Select the Psy stage (default: localhost)
+   VITE_NETWORK=localhost|sepolia|ethereum   Select L1 target network (default: the stage's default L1, see VITE_PSY_STAGE)
    --relayer                       Start unified bridge relayer (psy_relayer_cli --config <daemon.toml>)
    --relayer-config <path>         Legacy relayer/envio config path (default: ./psy_cli/psy_relayer_cli/config/local.toml)
    --bridge-proposer-daemon        Alias for --relayer
@@ -4946,7 +4988,8 @@ Usage: bun run dev/locSetupV4.ts [options]
    - Flags can be combined (e.g., --db --coordinator)
    - Workers are started when --*-workers options are specified
    - No options specified starts the full system (all components)
-   - Set VITE_NETWORK=localhost|sepolia|ethereum to choose the L1 target network
+   - Set VITE_PSY_STAGE=localhost|testnet|mainnet to choose the Psy stage (genesis config block)
+   - Set VITE_NETWORK=localhost|sepolia|ethereum to choose the L1 target network (defaults to the stage's default L1)
    - Set VITE_NETWORK=<sepolia|ethereum> and VITE_FORK=true to run anvil in fork mode
    - Optionally set VITE_FORK_BLOCK_NUMBER=<block> to pin the fork block
    - PSY_SKIP_BRANCH_CHECK=0  explicitly enable repo fetch/checkout (default: leave every HEAD untouched)
