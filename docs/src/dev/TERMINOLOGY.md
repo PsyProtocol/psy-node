@@ -71,9 +71,9 @@ Realm commit            durable mappings, FFS rows, then set_latest_checkpoint_i
 | Apply | Realm (or gatherer FastForward) | Execute the FFS / tree transition. Pair of **unapplied**. | The checkpoint marker write. |
 | Commit | Local processor | `commit_state` writes records and the marker. Adjective: **last_committed_**. | Coordinator inclusion. A proposal that is only certified. |
 
-`included` appears as `included_checkpoint` on `UnappliedTransition`. That is the coordinator
-checkpoint that already carries the transition. It is not a good function
-adjective: the ready-path function *applies* FFS, then *commits* locally.
+`included` is the coordinator checkpoint that already carries the transition
+(`first_root_change` returns it with the `RealmTransition`). It is not a good
+function adjective: the ready-path function *applies* FFS, then *commits* locally.
 
 Rejected names for the ready-path function:
 
@@ -84,7 +84,7 @@ Rejected names for the ready-path function:
 | `apply_committed_proposal_ffs` | `committed` is `last_committed_*`, which this function produces, not consumes. |
 
 Chosen name: **`apply_proposal_ffs`**. Verb `apply`, object `proposal_ffs`, same
-family as `apply_history_proposal` and `first_unapplied_transition`.
+family as `apply_history_proposal` and `first_root_change`.
 
 Catch-up sibling: `apply_history_transitions` walks `C+1..=tip`. The ready path
 applies the next unapplied proposal FFS once per `sync_and_verify`.

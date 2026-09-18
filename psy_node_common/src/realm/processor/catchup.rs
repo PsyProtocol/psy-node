@@ -23,36 +23,27 @@ pub enum TransitionFetchOutcome {
     Failed(RealmTransition, anyhow::Error),
 }
 
-/// Next coordinator-authenticated realm transition after `last_committed`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UnappliedTransition {
-    None { accounted_checkpoint: u64 },
-    Real { transition: RealmTransition, included_checkpoint: u64 },
-}
-
 /// Last-modified events must be chronological. Equal roots are leaf rewrites, not bodies.
 /// A→B→A keeps the A→B hop because that first value differs.
-pub(crate) fn first_unapplied_transition(
+pub(crate) fn first_root_change(
     last_committed: u64,
     last_committed_root: [u8; 32],
     last_modifieds: &[(u64, [u8; 32])],
-) -> UnappliedTransition {
+) -> Option<(RealmTransition, u64)> {
     let mut old_root = last_committed_root;
-    let mut accounted_checkpoint = last_committed;
     for &(checkpoint_id, new_root) in last_modifieds {
         if checkpoint_id <= last_committed {
             continue;
         }
         if new_root != old_root {
-            return UnappliedTransition::Real {
-                transition: RealmTransition { old_root, new_root },
-                included_checkpoint: checkpoint_id,
-            };
+            return Some((
+                RealmTransition { old_root, new_root },
+                checkpoint_id,
+            ));
         }
-        accounted_checkpoint = checkpoint_id;
         old_root = new_root;
     }
-    UnappliedTransition::None { accounted_checkpoint }
+    None
 }
 
 /// Peer set chosen once per catch-up batch: one primary and at most one backup.
@@ -342,55 +333,29 @@ mod tests {
     const ROOT_B: [u8; 32] = [0xB; 32];
 
     #[test]
-    fn first_unapplied_transition_skips_identity_rewrite() {
-        let outcome = first_unapplied_transition(15, ROOT_A, &[(16, ROOT_A)]);
+    fn first_root_change_skips_identity_rewrite() {
+        assert_eq!(first_root_change(15, ROOT_A, &[(16, ROOT_A)]), None);
+    }
+
+    #[test]
+    fn first_root_change_keeps_cycle_first_hop() {
         assert_eq!(
-            outcome,
-            UnappliedTransition::None {
-                accounted_checkpoint: 16
-            }
+            first_root_change(15, ROOT_A, &[(20, ROOT_B), (50, ROOT_A)]),
+            Some((RealmTransition { old_root: ROOT_A, new_root: ROOT_B }, 20)),
         );
     }
 
     #[test]
-    fn first_unapplied_transition_keeps_cycle_first_hop() {
-        let outcome = first_unapplied_transition(15, ROOT_A, &[(20, ROOT_B), (50, ROOT_A)]);
+    fn first_root_change_skips_identity_then_takes_real() {
         assert_eq!(
-            outcome,
-            UnappliedTransition::Real {
-                transition: RealmTransition {
-                    old_root: ROOT_A,
-                    new_root: ROOT_B,
-                },
-                included_checkpoint: 20,
-            }
+            first_root_change(15, ROOT_A, &[(16, ROOT_A), (50, ROOT_B)]),
+            Some((RealmTransition { old_root: ROOT_A, new_root: ROOT_B }, 50)),
         );
     }
 
     #[test]
-    fn first_unapplied_transition_skips_identity_then_takes_real() {
-        let outcome = first_unapplied_transition(15, ROOT_A, &[(16, ROOT_A), (50, ROOT_B)]);
-        assert_eq!(
-            outcome,
-            UnappliedTransition::Real {
-                transition: RealmTransition {
-                    old_root: ROOT_A,
-                    new_root: ROOT_B,
-                },
-                included_checkpoint: 50,
-            }
-        );
-    }
-
-    #[test]
-    fn first_unapplied_transition_empty_is_accounted_at_committed() {
-        let outcome = first_unapplied_transition(15, ROOT_A, &[]);
-        assert_eq!(
-            outcome,
-            UnappliedTransition::None {
-                accounted_checkpoint: 15
-            }
-        );
+    fn first_root_change_empty_is_none() {
+        assert_eq!(first_root_change(15, ROOT_A, &[]), None);
     }
 
     fn build_proposal_with_body(old_root: [u8; 32], new_root: [u8; 32], salt: u8) -> (psy_data::p2p::Proposal, Vec<u8>) {

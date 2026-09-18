@@ -268,21 +268,23 @@ where
         }
         last_modifieds.reverse();
         let old_root = self.db.state.last_committed_realm_end_root.into_owned_32bytes();
-        let (transition, included_checkpoint_id) = match crate::realm::processor::catchup::first_unapplied_transition(
+        let (transition, included_checkpoint_id) = match crate::realm::processor::catchup::first_root_change(
             self.db.state.last_committed_checkpoint_id,
             old_root,
             &last_modifieds,
         ) {
-            crate::realm::processor::catchup::UnappliedTransition::None { accounted_checkpoint } => {
-                if accounted_checkpoint > self.db.state.last_committed_checkpoint_id {
+            None => {
+                if let Some(&(accounted_checkpoint, _)) = last_modifieds
+                    .iter()
+                    .rev()
+                    .find(|(checkpoint_id, _)| *checkpoint_id > self.db.state.last_committed_checkpoint_id)
+                {
                     self.db.state.last_committed_checkpoint_id = accounted_checkpoint;
                     self.db.shared_state.update_from_core_state(&self.db.state).await?;
                 }
                 return self.db.sync_to_coordinator_checkpoint_id(latest_checkpoint_id).await;
             }
-            crate::realm::processor::catchup::UnappliedTransition::Real { transition, included_checkpoint } => {
-                (transition, included_checkpoint)
-            }
+            Some((transition, included_checkpoint)) => (transition, included_checkpoint),
         };
         coordinator_realm_state = self.db.coordinator_client
             .rc_get_realm_root_and_last_modified_checkpoint(included_checkpoint_id, self.db.state.realm_id_u64)
