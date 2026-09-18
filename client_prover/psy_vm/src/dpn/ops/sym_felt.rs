@@ -1,6 +1,5 @@
 use std::{
     fmt::{Debug, Display},
-    hash::Hasher,
     ops::{
         Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div, DivAssign, Mul, MulAssign, Neg, Not, Rem, RemAssign,
         Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
@@ -12,7 +11,6 @@ use plonky2::field::{
     types::{Field, Field64, PrimeField64},
 };
 use serde::{Deserialize, Serialize};
-use twox_hash::xxh3::HasherExt;
 
 use super::{
     context_trait::{ContextFelt, DPNContext, FeltSized},
@@ -636,9 +634,47 @@ impl SymFeltRefValue {
         if self.op_type == DPNOpType::Constant || self.op_type == DPNOpType::InputTarget {
             return SymFeltRef(((self.op_type as u128) << 112) | self.const_param as u128);
         } else {
-            let mut hasher = twox_hash::Xxh3Hash128::default();
-            hasher.write(&bincode::serialize(&self).unwrap());
-            SymFeltRef((hasher.finish_ext() & SYM_FELT_REF_STORE_VALUE_MASK) | ((self.op_type as u128) << 112))
+            // twox-hash 1.6.3's streaming tail can read uninitialized buffer
+            // bytes for long inputs. Hash the complete serialized expression.
+            let hash = twox_hash::xxh3::hash128(&bincode::serialize(self).unwrap());
+            SymFeltRef((hash & SYM_FELT_REF_STORE_VALUE_MASK) | ((self.op_type as u128) << 112))
+        }
+    }
+}
+
+#[cfg(test)]
+mod symbol_key_tests {
+    use super::*;
+
+    #[test]
+    fn symbol_key_matches_one_shot_hash_across_buffer_boundaries() {
+        for input_count in [0, 1, 2, 8, 14, 15, 16, 17, 18, 19, 31, 32, 33, 48, 64, 80, 256] {
+            let value = SymFeltRefValue {
+                op_type: DPNOpType::Keccak256,
+                const_param: 0,
+                inputs: (0..input_count).map(SymFeltRef::new_constant).collect(),
+            };
+            let bytes = bincode::serialize(&value).unwrap();
+            let expected = SymFeltRef(
+                (twox_hash::xxh3::hash128(&bytes) & SYM_FELT_REF_STORE_VALUE_MASK)
+                    | ((value.op_type as u128) << 112),
+            );
+            for poison_byte in 1..=32u8 {
+                // Recycle the streaming hasher's 256-byte allocation with known
+                // bytes: a symbol key must never depend on prior heap contents.
+                let poison = vec![poison_byte; 256];
+                std::hint::black_box(&poison);
+                drop(poison);
+                assert_eq!(value.get_ref_key(), expected, "input_count={input_count}, bytes={}", bytes.len());
+            }
+        }
+    }
+
+    #[test]
+    fn inline_symbol_key_encoding_is_unchanged() {
+        for op_type in [DPNOpType::Constant, DPNOpType::InputTarget] {
+            let value = SymFeltRefValue { op_type, const_param: 42, inputs: vec![] };
+            assert_eq!(value.get_ref_key(), SymFeltRef(((op_type as u128) << 112) | 42));
         }
     }
 }
