@@ -3,24 +3,34 @@ set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
-if [ "${DEPLOY_OFFSITE_WORKERS:-0}" = "1" ]; then
-  offsite_host="${OFFSITE_WORKER_HOST:-arc99x4}"
-  log_step "stopping offsite workers on ${offsite_host} before clearing shared state"
-  offsite_stop_command='
-sudo systemctl stop \
-  parth-offsite-worker@coordinator.service \
-  parth-offsite-worker@realm-0.service \
-  parth-offsite-worker@realm-1.service
-sudo systemctl reset-failed \
-  parth-offsite-worker@coordinator.service \
-  parth-offsite-worker@realm-0.service \
-  parth-offsite-worker@realm-1.service >/dev/null 2>&1 || true
-'
-  if [ -f "$SSH_CONFIG_FILE" ]; then
-    ssh -tt -F "$SSH_CONFIG_FILE" -o BatchMode=yes "$offsite_host" "$offsite_stop_command"
+verify_offsite_stopped() {
+  local host="$1" role="$2" command
+  local ssh_args=(-o BatchMode=yes -o ConnectTimeout=10)
+  if [ -f "$SSH_CONFIG_FILE" ]; then ssh_args=(-F "$SSH_CONFIG_FILE" "${ssh_args[@]}"); fi
+  command='set -eu
+for unit in '
+  if [ "$role" = worker ]; then
+    command+='parth-offsite-worker@coordinator.service parth-offsite-worker@realm-0.service parth-offsite-worker@realm-1.service'
   else
-    ssh -tt -o BatchMode=yes "$offsite_host" "$offsite_stop_command"
+    command+='parth-prove-proxy@user.service parth-prove-proxy@system.service parth-offsite-prove-proxy.service'
   fi
+  command+='; do
+  if [ "$(systemctl show "$unit" -p LoadState --value)" = not-found ]; then continue; fi
+  state=$(systemctl show "$unit" -p ActiveState --value)
+  pid=$(systemctl show "$unit" -p MainPID --value)
+  case "$state:$pid" in inactive:0|failed:0) ;; *) echo "$unit must be stopped by the operator before clearing state" >&2; exit 1 ;; esac
+done'
+  log_step "verifying operator stopped $role services on $host"
+  ssh "${ssh_args[@]}" "$host" "$command" || {
+    echo "Run stop-offsite-for-fresh-deploy.sh $role on $host with sudo, then retry step 01" >&2
+    exit 1
+  }
+}
+if [ "${DEPLOY_OFFSITE_WORKERS:-0}" = 1 ]; then
+  verify_offsite_stopped "${OFFSITE_WORKER_HOST:-arc99x4}" worker
+fi
+if [ "${DEPLOY_OFFSITE_PROVE_PROXY:-0}" = 1 ]; then
+  verify_offsite_stopped "${OFFSITE_PROVE_PROXY_HOST:-arc99x3}" prove
 fi
 
 mapfile -t hosts < <(

@@ -7,6 +7,8 @@ WG_GATEWAY_IP="${WG_GATEWAY_IP:-10.250.0.1}"
 MIN_MEMORY_KIB="${MIN_MEMORY_KIB:-58720256}"
 MIN_CPU_COUNT="${MIN_CPU_COUNT:-16}"
 MIN_DISK_FREE_KIB="${MIN_DISK_FREE_KIB:-31457280}"
+RELEASE_STORAGE_PATH="${RELEASE_STORAGE_PATH:-/opt/parth}"
+STATE_STORAGE_PATH="${STATE_STORAGE_PATH:-/var/lib/parth}"
 MAX_HANDSHAKE_AGE_SECS="${MAX_HANDSHAKE_AGE_SECS:-180}"
 
 fail() {
@@ -30,14 +32,21 @@ rpc() {
 
 memory_kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
 cpu_count="$(nproc)"
-disk_free_kib="$(df -Pk / | awk 'NR == 2 { print $4 }')"
+check_storage() {
+  local path="$1" existing="$1" free_kib
+  while [ ! -d "$existing" ]; do existing="$(dirname "$existing")"; done
+  free_kib="$(df -Pk "$existing" | awk 'NR == 2 { print $4 }')"
+  [ "$free_kib" -ge "$MIN_DISK_FREE_KIB" ] ||
+    fail "requires at least $((MIN_DISK_FREE_KIB / 1024 / 1024)) GiB free for $path; found $((free_kib / 1024 / 1024)) GiB"
+  printf '  storage %s: %s GiB free\n' "$path" "$((free_kib / 1024 / 1024))"
+}
 
 [ "$memory_kib" -ge "$MIN_MEMORY_KIB" ] ||
   fail "requires at least $((MIN_MEMORY_KIB / 1024 / 1024)) GiB RAM; found $((memory_kib / 1024 / 1024)) GiB"
 [ "$cpu_count" -ge "$MIN_CPU_COUNT" ] ||
   fail "requires at least $MIN_CPU_COUNT logical CPUs; found $cpu_count"
-[ "$disk_free_kib" -ge "$MIN_DISK_FREE_KIB" ] ||
-  fail "requires at least $((MIN_DISK_FREE_KIB / 1024 / 1024)) GiB free on /; found $((disk_free_kib / 1024 / 1024)) GiB"
+check_storage "$RELEASE_STORAGE_PATH"
+check_storage "$STATE_STORAGE_PATH"
 
 systemctl is-active --quiet "wg-quick@$WG_IFACE.service" ||
   fail "wg-quick@$WG_IFACE.service is not active"
@@ -54,7 +63,6 @@ handshake_age=$((now - latest_handshake))
 echo "Host resources:"
 printf '  memory: %s GiB\n' "$((memory_kib / 1024 / 1024))"
 printf '  cpus:   %s\n' "$cpu_count"
-printf '  disk:   %s GiB free\n' "$((disk_free_kib / 1024 / 1024))"
 printf '  swap:   %s\n' "$(free -h | awk '/^Swap:/ { print $2 }')"
 
 echo
