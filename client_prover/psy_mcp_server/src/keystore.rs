@@ -57,6 +57,10 @@ pub struct KeyBackup {
     pub private_key: String,
     /// Public fingerprint of the key (safe to display).
     pub fingerprint: String,
+    /// Signing circuit used to derive this wallet identity. Missing in older
+    /// backups and inferred from the fingerprint when they are loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_type: Option<String>,
     /// Owner-chosen local account name. Not part of the cryptographic identity.
     pub name: String,
     /// Unix seconds when the backup was written.
@@ -64,6 +68,15 @@ pub struct KeyBackup {
     /// Psy config network this key was created for. Missing only in v1 files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
+    /// Public key hash derived from `private_key` and `fingerprint`. This is a
+    /// cache for display/recovery diagnostics only; loaders must derive it
+    /// again and reject a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// Network-scoped on-chain user id resolved after registration. This is a
+    /// cache only; loaders must query the selected network and use its value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<u64>,
     /// The mandate this key was minted under, when it is an agent account.
     ///
     /// Without it a minted account can never be reloaded: its identity comes
@@ -147,7 +160,17 @@ pub fn persist_generated_key(private_key_hex: &str, fingerprint_hex: &str, netwo
 }
 
 pub fn persist_generated_key_named(private_key_hex: &str, fingerprint_hex: &str, network: &str, name: &str) -> Result<PathBuf> {
-    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, None, name)
+    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, None, name, Some("zk"))
+}
+
+pub fn persist_generated_key_named_with_sign_type(
+    private_key_hex: &str,
+    fingerprint_hex: &str,
+    network: &str,
+    name: &str,
+    sign_type: &str,
+) -> Result<PathBuf> {
+    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, None, name, Some(sign_type))
 }
 
 /// As `persist_generated_key`, but also records the mandate for an agent
@@ -158,7 +181,7 @@ pub fn persist_generated_key_with_mandate(
     network: &str,
     mandate: Option<&crate::agent_account::Mandate>,
 ) -> Result<PathBuf> {
-    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, mandate, "Agent account")
+    persist_generated_key_with_mandate_and_name(private_key_hex, fingerprint_hex, network, mandate, "Agent account", Some("sd-key"))
 }
 
 fn persist_generated_key_with_mandate_and_name(
@@ -167,6 +190,7 @@ fn persist_generated_key_with_mandate_and_name(
     network: &str,
     mandate: Option<&crate::agent_account::Mandate>,
     name: &str,
+    sign_type: Option<&str>,
 ) -> Result<PathBuf> {
     let dir = keystore_dir();
     fs::create_dir_all(&dir).with_context(|| format!("failed to create keystore dir {}", dir.display()))?;
@@ -191,9 +215,12 @@ fn persist_generated_key_with_mandate_and_name(
         kind: KeyBackup::KIND.to_string(),
         private_key: private_key_hex.to_string(),
         fingerprint: fingerprint_hex.to_string(),
+        sign_type: sign_type.map(str::to_string),
         name: name.to_string(),
         created_at: now_secs(),
         network: Some(network.to_string()),
+        public_key: None,
+        user_id: None,
         mandate: mandate.cloned(),
         default_shield_address: None,
         nostr_pub: None,
@@ -230,14 +257,30 @@ fn persist_generated_key_with_mandate_and_name(
     Ok(final_path)
 }
 
+/// Add the public, network-scoped identity after registration settles. The
+/// secret backup is intentionally created first; this enrichment must never
+/// be moved ahead of the on-chain registration boundary.
+pub fn persist_public_identity(path: &Path, public_key: &str, user_id: u64) -> Result<()> {
+    update_key_file(path, "add public identity", |backup| {
+        backup.public_key = Some(public_key.to_string());
+        backup.user_id = Some(user_id);
+    })
+}
+
 /// Add the public receive metadata after registration resolves the user id.
 /// The initial secret backup is deliberately written before registration; the
 /// shield address cannot be computed until the chain assigns that user id.
 pub fn persist_default_receive_address(path: &Path, shield_address: &str, nostr_pub: &str) -> Result<()> {
+    update_key_file(path, "add receive address", |backup| {
+        backup.default_shield_address = Some(shield_address.to_string());
+        backup.nostr_pub = Some(nostr_pub.to_string());
+    })
+}
+
+fn update_key_file(path: &Path, operation: &str, update: impl FnOnce(&mut KeyBackup)) -> Result<()> {
     let path_text = path.to_string_lossy();
     let mut backup = load_key_file(&path_text)?;
-    backup.default_shield_address = Some(shield_address.to_string());
-    backup.nostr_pub = Some(nostr_pub.to_string());
+    update(&mut backup);
     let json = serde_json::to_string_pretty(&backup).context("failed to serialize enriched key backup")?;
     let dir = path.parent().ok_or_else(|| anyhow!("key backup has no parent directory"))?;
     let tmp_path = dir.join(format!(".tmp-{}", rand_suffix()));
@@ -256,7 +299,7 @@ pub fn persist_default_receive_address(path: &Path, shield_address: &str, nostr_
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
     }
-    result.with_context(|| format!("failed to add receive address to {}", path.display()))
+    result.with_context(|| format!("failed to {operation} to {}", path.display()))
 }
 
 fn rand_suffix() -> String {
@@ -404,6 +447,8 @@ mod tests {
             assert_eq!(loaded.name, "Wallet");
             assert_eq!(loaded.kind, KeyBackup::KIND);
             assert_eq!(loaded.network.as_deref(), Some("testnet"));
+            assert_eq!(loaded.public_key, None);
+            assert_eq!(loaded.user_id, None);
             assert_eq!(loaded.default_shield_address, None);
             assert_eq!(loaded.nostr_pub, None);
             #[cfg(unix)]
@@ -412,6 +457,17 @@ mod tests {
                 let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o600, "key file must be owner-only");
             }
+        })
+    }
+
+    #[test]
+    fn enriches_backup_with_public_identity() {
+        with_temp_keystore(|| {
+            let path = persist_generated_key("0xdeadbeef", "fingerprint", "testnet").unwrap();
+            persist_public_identity(&path, "0xpublic", 12345).unwrap();
+            let loaded = load_key_file(path.to_str().unwrap()).unwrap();
+            assert_eq!(loaded.public_key.as_deref(), Some("0xpublic"));
+            assert_eq!(loaded.user_id, Some(12345));
         })
     }
 

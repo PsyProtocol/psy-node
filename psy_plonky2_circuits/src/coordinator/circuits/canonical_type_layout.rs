@@ -207,7 +207,7 @@ where
             let kind = builder.add_virtual_target();
             let args = core::array::from_fn(|_| {
                 let target = builder.add_virtual_target();
-                builder.range_check(target, 31);
+                builder.range_check(target, 33);
                 target
             });
             let members = (0..CANONICAL_TYPE_LAYOUT_MAX_STRUCT_MEMBERS)
@@ -291,7 +291,7 @@ where
                 zero,
             );
             let array_total = builder.mul(array_child_slots, args[2]);
-            builder.range_check(array_total, 32);
+            builder.range_check(array_total, 35);
             let array_hash =
                 builder.hash_n_to_hash_no_pad::<C::Hasher>(vec![
                     array_domain,
@@ -352,7 +352,7 @@ where
                 );
             }
             let map_total = builder.mul(value_slots, args[2]);
-            builder.range_check(map_total, 32);
+            builder.range_check(map_total, 35);
             let map_hash =
                 builder.hash_n_to_hash_no_pad::<C::Hasher>(vec![
                     map_domain,
@@ -521,7 +521,7 @@ where
                     builder.mul(member_active.target, child_slots);
                 member_offset =
                     builder.add(member_offset, active_slots);
-                builder.range_check(member_offset, 32);
+                builder.range_check(member_offset, 35);
             }
             let mut roots = Vec::with_capacity(
                 CANONICAL_TYPE_LAYOUT_STRUCT_TREE_HEIGHT + 1,

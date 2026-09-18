@@ -49,8 +49,8 @@ fn identical_claim_ids_are_persisted_in_different_network_subtrees() {
     let a = make_deposit("network-a").persist(&root).unwrap();
     let b = make_deposit("network-b").persist(&root).unwrap();
     assert_ne!(a, b);
-    assert!(a.ends_with("networks/network-a/deposits/deposit-42.json"));
-    assert!(b.ends_with("networks/network-b/deposits/deposit-42.json"));
+    assert!(a.ends_with("networks/network-a/deposits/1/deposit-42.json"));
+    assert!(b.ends_with("networks/network-b/deposits/1/deposit-42.json"));
 
     let commitment = [9, 10, 11, 12];
     let note_a = wallet::PrivateNoteRecovery::path_in(&root, "network-a", &commitment).unwrap();

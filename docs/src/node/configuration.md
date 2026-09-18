@@ -35,7 +35,7 @@ The configuration file supports multiple networks with a default network setting
 }
 ```
 
-Applications will use the `defaultNetwork` configuration unless explicitly switched to another network.
+Applications will use the `defaultNetwork` configuration unless explicitly switched to another network. The Psy stage name (the `networks` key, and `defaultNetwork`) is one of exactly three values: `localhost`, `testnet`, or `mainnet` — it is not an L1 chain name.
 
 #### Core Network Parameters
 

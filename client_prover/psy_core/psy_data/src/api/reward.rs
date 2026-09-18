@@ -281,7 +281,7 @@ mod tests {
                 topic: QJobTopic::GenerateStandardProof,
                 goal_id: 100,
                 slot_id: 0, // 173-byte format doesn't include slot_id
-                circuit_type: ProvingJobCircuitType::AddDeposit,
+                circuit_type: ProvingJobCircuitType::AddL1Deposit,
                 group_id: 1,
                 sub_group_id: 0,
                 task_index: 0,

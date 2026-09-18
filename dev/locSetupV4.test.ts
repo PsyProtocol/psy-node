@@ -11,6 +11,7 @@ import {
     isUsableGenesisData,
     planPsyDappNestedSubmodulesFromDisk,
     readGenesisContractsArtifactStamp,
+    resolveForkRpcEnvKey,
     resolveProjectsDir,
     RunningProcess,
     runStreamingCaptureStderr,
@@ -331,5 +332,28 @@ describe("planPsyDappNestedSubmodulesFromDisk", () => {
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
         }
+    });
+});
+
+describe("resolveForkRpcEnvKey", () => {
+    it("falls back to the L1-owned table when the selected stage's genesis block has no anvilForkSourceUrlEnv", () => {
+        // Reproduces VITE_PSY_STAGE=localhost VITE_NETWORK=sepolia VITE_FORK=true:
+        // the localhost stage's genesis block never defines anvilForkSourceUrlEnv,
+        // but forking sepolia must still work without picking a non-local stage.
+        expect(resolveForkRpcEnvKey("sepolia", undefined)).toBe("SEPOLIA_RPC_URL");
+        expect(resolveForkRpcEnvKey("sepolia", {})).toBe("SEPOLIA_RPC_URL");
+        expect(resolveForkRpcEnvKey("ethereum", undefined)).toBe("ETH_RPC_URL");
+    });
+
+    it("prefers the genesis config's anvilForkSourceUrlEnv over the L1-owned fallback when the stage defines one", () => {
+        expect(resolveForkRpcEnvKey("sepolia", { anvilForkSourceUrlEnv: "CUSTOM_SEPOLIA_RPC_URL" })).toBe(
+            "CUSTOM_SEPOLIA_RPC_URL",
+        );
+    });
+
+    it("throws naming both VITE_NETWORK and the missing fork source when neither source has an answer", () => {
+        expect(() => resolveForkRpcEnvKey("localhost", undefined)).toThrow(
+            /no fork RPC env is known for VITE_NETWORK=localhost.*VITE_NETWORK must be one of the L1 names with a known fork source/s,
+        );
     });
 });

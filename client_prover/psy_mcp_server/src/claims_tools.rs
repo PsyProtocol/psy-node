@@ -1,16 +1,162 @@
 use super::*;
 use crate::wallet_network;
 
+async fn probe_endpoint(kind: &'static str, url: String) -> serde_json::Value {
+    let parsed = match reqwest::Url::parse(&url) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return json!({ "kind": kind, "url": url, "reachable": false, "httpStatus": null, "error": error.to_string() })
+        }
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return json!({
+            "kind": kind,
+            "url": url,
+            "reachable": null,
+            "httpStatus": null,
+            "error": format!("{} endpoint is configured but not HTTP-probed", parsed.scheme()),
+        });
+    }
+    let started = std::time::Instant::now();
+    match reqwest::Client::new()
+        .get(parsed)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) => json!({
+            "kind": kind,
+            "url": url,
+            "reachable": true,
+            "httpStatus": response.status().as_u16(),
+            "latencyMs": started.elapsed().as_millis() as u64,
+            "error": null,
+        }),
+        Err(error) => json!({
+            "kind": kind,
+            "url": url,
+            "reachable": false,
+            "httpStatus": null,
+            "latencyMs": started.elapsed().as_millis() as u64,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+async fn probe_endpoints(summary: crate::wallet::EndpointSummary) -> Vec<serde_json::Value> {
+    let groups = [
+        ("coordinator", summary.coordinator),
+        ("realm", summary.realm),
+        ("proveProxy", summary.prove_proxy),
+        ("faucet", summary.faucet),
+        ("apiServices", summary.api_services),
+        ("indexerGraphql", summary.indexer_graphql),
+        ("explorer", summary.explorer),
+        ("nostrRelay", summary.nostr_relay),
+        ("l1Rpc", summary.l1_rpc),
+        ("bridge", summary.bridge),
+        ("l1Config", summary.l1_config),
+    ];
+    futures_util::future::join_all(
+        groups
+            .into_iter()
+            .flat_map(|(kind, urls)| urls.into_iter().map(move |url| probe_endpoint(kind, url))),
+    )
+    .await
+}
+
 #[tool_router(router = claims_tools_router, vis = "pub(crate)")]
 impl PsyWalletServer {
-    #[tool(description = "Live chain status: the latest coordinator checkpoint id.")]
+    #[tool(
+        description = "Health of every configured Psy network (or one selected network): complete latest coordinator block state, active wallet, and live reachability/latency for coordinator, realm, prove-proxy, faucet, services, indexer, explorer, Nostr, bridge and L1 endpoints. A broken network or endpoint is reported as data and does not fail the whole MCP call."
+    )]
     async fn get_chain_status(&self, Parameters(a): Parameters<NetworkArgs>) -> Result<CallToolResult, McpError> {
         let state = &self.state;
-        let network = wallet_network!(state.wallet, a.network.as_deref());
-        match state.wallet.latest_checkpoint(&network).await {
-            Ok(cp) => ok_json(json!({ "network": network.as_str(), "checkpointId": cp })),
-            Err(e) => err_json(format!("chain unreachable: {e:#}"), json!({})),
-        }
+        let networks = match a.network.as_deref() {
+            Some(requested) => match state.wallet.resolve_network(Some(requested)) {
+                Ok(network) => vec![network],
+                Err(error) => return err_json(error, json!({ "gate": "network" })),
+            },
+            None => state.wallet.configured_networks(),
+        };
+        // Probe in parallel so one dead network does not delay every healthy
+        // result. Bound each probe as well: health inspection itself must not
+        // become another apparent MCP startup/hang failure.
+        let statuses = futures_util::future::join_all(networks.into_iter().map(|network| async move {
+            let endpoints = match state.wallet.endpoint_summary(&network) {
+                Ok(summary) => probe_endpoints(summary).await,
+                Err(error) => vec![json!({ "kind": "config", "url": null, "reachable": false, "error": error.to_string() })],
+            };
+            let probe = async {
+                state.wallet.ensure_network(&network).await?;
+                let (checkpoint_id, latest_block_state) = state.wallet.latest_block_state_json(&network).await?;
+                let active = state.wallet.current_user(&network).await;
+                let wallet_count = state.wallet.list_users(&network).await.map(|users| users.len()).unwrap_or(0);
+                Ok::<_, anyhow::Error>((checkpoint_id, latest_block_state, active, wallet_count))
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(15), probe).await {
+                Ok(Ok((checkpoint_id, latest_block_state, active, wallet_count))) => {
+                    let active_wallet = active.as_ref().map(|user| {
+                        json!({
+                            "name": user.name,
+                            "userId": user.user_id,
+                            "psyId": format!("Psy-{:08}", user.user_id),
+                            "pkHash": user.pk_hash.to_string(),
+                            "fingerprint": user.fingerprint.to_string(),
+                            "signType": user.sign_type,
+                            "accountType": if user.mandate.is_some() { "softwareDefined" } else { "standard" },
+                            "softwareDefined": user.mandate.is_some(),
+                            "mandate": user.mandate,
+                        })
+                    });
+                    json!({
+                        "network": network.as_str(),
+                        "connected": true,
+                        "checkpointId": checkpoint_id,
+                        "latestBlockState": latest_block_state,
+                        // Keep the original flat fields for existing clients.
+                        "activeUserId": active.as_ref().map(|user| user.user_id),
+                        "activePublicKey": active.as_ref().map(|user| user.pk_hash.to_string()),
+                        "activeWallet": active_wallet,
+                        "walletCount": wallet_count,
+                        "endpoints": endpoints,
+                        "error": null,
+                    })
+                }
+                Ok(Err(error)) => json!({
+                    "network": network.as_str(),
+                    "connected": false,
+                    "checkpointId": null,
+                    "latestBlockState": null,
+                    "activeUserId": null,
+                    "activePublicKey": null,
+                    "activeWallet": null,
+                    "walletCount": null,
+                    "endpoints": endpoints,
+                    "error": format!("network probe failed: {error:#}"),
+                }),
+                Err(_) => json!({
+                    "network": network.as_str(),
+                    "connected": false,
+                    "checkpointId": null,
+                    "latestBlockState": null,
+                    "activeUserId": null,
+                    "activePublicKey": null,
+                    "activeWallet": null,
+                    "walletCount": null,
+                    "endpoints": endpoints,
+                    "error": "network probe timed out after 15 seconds",
+                }),
+            }
+        }))
+        .await;
+        let connected = statuses.iter().filter(|status| status["connected"] == true).count();
+        ok_json(json!({
+            "connected": connected,
+            "total": statuses.len(),
+            "allConnected": connected == statuses.len(),
+            "chains": statuses,
+        }))
     }
 
     #[tool(description = "Info about the loaded wallet: user id and Psy ID.")]
@@ -297,11 +443,18 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Deposit tokens from Ethereum into this wallet's shielded address on Psy. Uses the owner-provisioned L1 key (PSY_MCP_L1_KEY env — the agent never sees it): saves the claim secrets to disk FIRST, then approves if needed and calls Router.deposit. After the bridge relayer proves it, publishes the wallet-compatible proof/secrets pair to the configured Nostr relay so psy-wallet can claim it. Policy-gated at the amount."
+        description = "Deposit tokens from a configured EVM chain into this wallet's shielded address on Psy. Select it with source_chain_index from wallet_status.l1Chains. Uses the owner-provisioned L1 key (PSY_MCP_L1_KEY env — the agent never sees it): saves the claim secrets to disk FIRST, then approves if needed and calls that chain's Router.deposit. After the bridge relayer proves it, publishes the wallet-compatible proof/secrets pair to the configured Nostr relay so psy-wallet can claim it. Policy-gated at the amount."
     )]
     async fn deposit(&self, Parameters(a): Parameters<DepositArgs>) -> Result<CallToolResult, McpError> {
         let state = &self.state;
         let network = wallet_network!(state.wallet, a.network.as_deref());
+        let (l1_chain_id, l1_chain_name) = match state.wallet.l1_chain_identity(&network, a.source_chain_index) {
+            Some(identity) => identity,
+            None => return err_json(
+                format!("unknown L1 source chain index {}", a.source_chain_index),
+                json!({ "gate": "config", "sourceChainIndex": a.source_chain_index }),
+            ),
+        };
         if let Some(user) = state.wallet.current_user(&network).await {
             self.policy.lock().unwrap().set_current_wallet(network.as_str(), user.user_id);
         }
@@ -335,7 +488,7 @@ impl PsyWalletServer {
                 return err_json($m, $x);
             }};
         }
-        let l1_rpc = match network_l1_rpc(&state.wallet, &network) {
+        let l1_rpc = match network_l1_rpc(&state.wallet, &network, a.source_chain_index) {
             Ok(url) => url,
             Err(e) => fail!(e, json!({ "gate": "config", "field": "l1_rpc_urls" })),
         };
@@ -343,7 +496,7 @@ impl PsyWalletServer {
             Ok(c) => c,
             Err(e) => fail!(format!("{e:#}"), json!({ "gate": "l1-key" })),
         };
-        let token_str = match network_l1_token(&state.wallet, &network, &a.token) {
+        let token_str = match network_l1_token(&state.wallet, &network, a.source_chain_index, &a.token) {
             Some(t) => t,
             None => fail!(format!("no L1 address known for {}", a.token), json!({ "gate": "config" })),
         };
@@ -351,7 +504,7 @@ impl PsyWalletServer {
             Ok(t) => t,
             Err(e) => fail!(format!("bad token address {token_str}: {e}"), json!({ "gate": "config" })),
         };
-        let router_value = match network_router(&state.wallet, &network) {
+        let router_value = match network_router(&state.wallet, &network, a.source_chain_index) {
             Ok(value) => value,
             Err(e) => fail!(e, json!({ "gate": "config", "field": "l1_router_address" })),
         };
@@ -359,7 +512,7 @@ impl PsyWalletServer {
             Ok(r) => r,
             Err(e) => fail!(format!("bad router address: {e}"), json!({ "gate": "config" })),
         };
-        let bridge_value = match network_bridge(&state.wallet, &network) {
+        let bridge_value = match network_bridge(&state.wallet, &network, a.source_chain_index) {
             Ok(value) => value,
             Err(e) => fail!(e, json!({ "gate": "config", "field": "l1_bridge_address" })),
         };
@@ -427,7 +580,7 @@ impl PsyWalletServer {
         // Router leaves allowance(gateway)=0 and the deposit reverts with
         // ERC20InsufficientAllowance. Mirrors the web wallet's
         // `spender = erc20GatewayAddress || routerAddress`.
-        let gateway_value = match network_erc20_gateway(&state.wallet, &network) {
+        let gateway_value = match network_erc20_gateway(&state.wallet, &network, a.source_chain_index) {
             Ok(value) => value,
             Err(e) => fail!(e, json!({ "gate": "config", "field": "l1_erc20_gateway_address" })),
         };
@@ -466,7 +619,7 @@ impl PsyWalletServer {
                 let _ = note.persist(&dir);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
                 let service_proof = loop {
-                    match load_claimable_deposit(&state.wallet, network.as_str(), Some(backup.to_string_lossy().to_string()), None, None).await {
+                    match load_claimable_deposit(&state.wallet, network.as_str(), Some(backup.to_string_lossy().to_string()), None, None, None).await {
                         Ok(DepositMaterial::Ready { proof, .. }) => break proof,
                         Ok(DepositMaterial::AlreadyClaimed { .. }) => {
                             return err_json(
@@ -526,6 +679,8 @@ impl PsyWalletServer {
                         ok_json(json!({
                             "status": "ok", "submitted": true, "delivered": true, "l1TxHash": tx,
                             "amountBaseUnits": a.amount_base_units, "token": a.token,
+                            "sourceChainIndex": a.source_chain_index, "l1ChainId": l1_chain_id,
+                            "l1ChainName": l1_chain_name,
                             "expectedDepositIndex": expected_index, "nostrEventIds": event_ids,
                             "recipientNpub": identity.npub,
                             "next": "The deposit proof and secrets were delivered to psy-wallet. Claim it from the wallet claim list.",
@@ -566,8 +721,17 @@ impl PsyWalletServer {
         let path = match a.backup_path.as_deref() {
             Some(path) => std::path::PathBuf::from(path),
             None => match a.deposit_index {
-                Some(index) => match crate::wallet::DepositNote::path_in(&dir, network.as_str(), index) {
-                    Ok(path) => path,
+                Some(index) => match crate::wallet::DepositNote::path_in(
+                    &dir,
+                    network.as_str(),
+                    a.source_chain_index.unwrap_or(0),
+                    index,
+                ) {
+                    Ok(path) if path.exists() || a.source_chain_index.unwrap_or(0) != 0 => path,
+                    Ok(_) => match crate::wallet::DepositNote::legacy_path_in(&dir, network.as_str(), index) {
+                        Ok(path) => path,
+                        Err(e) => return err_json(format!("{e:#}"), json!({ "gate": "network" })),
+                    },
                     Err(e) => return err_json(format!("{e:#}"), json!({ "gate": "network" })),
                 },
                 None => {
@@ -607,6 +771,7 @@ impl PsyWalletServer {
                 &state.wallet,
                 network.as_str(),
                 Some(path.to_string_lossy().to_string()),
+                None,
                 None,
                 a.services_url.as_deref(),
             )
@@ -682,6 +847,7 @@ impl PsyWalletServer {
             network.as_str(),
             a.backup_path.clone(),
             a.deposit_index,
+            a.source_chain_index,
             a.services_url.as_deref(),
         )
         .await
@@ -811,7 +977,7 @@ impl PsyWalletServer {
             self.policy.lock().unwrap().set_current_wallet(network.as_str(), user.user_id);
         }
         let wants_public = !a.public_claims.is_empty();
-        let wants_deposit = !a.deposit_indices.is_empty() || !a.backup_paths.is_empty();
+        let wants_deposit = !a.deposit_indices.is_empty() || !a.deposit_refs.is_empty() || !a.backup_paths.is_empty();
         let wants_private = !a.private_notes.is_empty() || a.drain_private;
         let wants_transfer = !a.transfers.is_empty();
         let wants_withdraw = !a.withdraws.is_empty();
@@ -934,7 +1100,10 @@ impl PsyWalletServer {
             };
             let token_addr = match spec.l1_token_address.clone() {
                 Some(t) => t,
-                None => match network_l1_token(&state.wallet, &network, &spec.token) {
+                None => match u32::try_from(spec.dest_chain_index)
+                    .ok()
+                    .and_then(|chain_index| network_l1_token(&state.wallet, &network, chain_index, &spec.token))
+                {
                     Some(t) => t,
                     None => {
                         refund_all(&mut spent_auths);
@@ -967,10 +1136,21 @@ impl PsyWalletServer {
         let mut deposit_notes: Vec<crate::wallet::DepositNote> = Vec::new();
         let mut deposit_proofs: Vec<serde_json::Value> = Vec::new();
         let mut skipped_claimed: Vec<u64> = Vec::new();
-        let mut deposit_lookups: Vec<(Option<String>, Option<u64>)> = a.backup_paths.iter().map(|p| (Some(p.clone()), None)).collect();
-        deposit_lookups.extend(a.deposit_indices.iter().copied().map(|i| (None, Some(i))));
-        for (backup_path, deposit_index) in deposit_lookups {
-            match load_claimable_deposit(&state.wallet, network.as_str(), backup_path, deposit_index, a.services_url.as_deref()).await {
+        let mut deposit_lookups: Vec<(Option<String>, Option<u64>, Option<u32>)> =
+            a.backup_paths.iter().map(|p| (Some(p.clone()), None, None)).collect();
+        deposit_lookups.extend(a.deposit_indices.iter().copied().map(|i| (None, Some(i), Some(0))));
+        deposit_lookups.extend(a.deposit_refs.iter().map(|item| (None, Some(item.deposit_index), Some(item.source_chain_index))));
+        for (backup_path, deposit_index, source_chain_index) in deposit_lookups {
+            match load_claimable_deposit(
+                &state.wallet,
+                network.as_str(),
+                backup_path,
+                deposit_index,
+                source_chain_index,
+                a.services_url.as_deref(),
+            )
+            .await
+            {
                 Ok(DepositMaterial::Ready { note, proof }) => {
                     deposit_notes.push(note);
                     deposit_proofs.push(proof);
@@ -1132,7 +1312,7 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Withdraw to an Ethereum address: burns the amount on Psy and the bridge relayer settles the L1 leg, so the agent needs no Ethereum gas. Policy-gated at the amount like any other spend."
+        description = "Withdraw to an address on a configured EVM chain: select it with dest_chain_index from wallet_status.l1Chains. Burns the amount on Psy and the bridge relayer settles the destination-chain leg, so the agent needs no EVM gas. Policy-gated at the amount like any other spend."
     )]
     async fn withdraw(&self, Parameters(a): Parameters<WithdrawArgs>) -> Result<CallToolResult, McpError> {
         // ZERO RECIPIENT = burned money. The L1 leg is settled by the relayer
@@ -1152,6 +1332,17 @@ impl PsyWalletServer {
         }
         let state = &self.state;
         let network = wallet_network!(state.wallet, a.network.as_deref());
+        let destination_chain_index = match u32::try_from(a.dest_chain_index) {
+            Ok(value) => value,
+            Err(_) => return err_json("destination chain index exceeds u32".to_string(), json!({ "gate": "args" })),
+        };
+        let (l1_chain_id, l1_chain_name) = match state.wallet.l1_chain_identity(&network, destination_chain_index) {
+            Some(identity) => identity,
+            None => return err_json(
+                format!("unknown L1 destination chain index {}", a.dest_chain_index),
+                json!({ "gate": "config", "destinationChainIndex": a.dest_chain_index }),
+            ),
+        };
         if let Some(user) = state.wallet.current_user(&network).await {
             self.policy.lock().unwrap().set_current_wallet(network.as_str(), user.user_id);
         }
@@ -1171,7 +1362,10 @@ impl PsyWalletServer {
         };
         let token_addr = match a.l1_token_address.clone() {
             Some(t) => t,
-            None => match network_l1_token(&state.wallet, &network, &a.token) {
+            None => match u32::try_from(a.dest_chain_index)
+                .ok()
+                .and_then(|chain_index| network_l1_token(&state.wallet, &network, chain_index, &a.token))
+            {
                 Some(t) => t,
                 None => {
                     self.policy.lock().unwrap().refund(&auth, charge);
@@ -1224,6 +1418,8 @@ impl PsyWalletServer {
             Ok(leaf) => ok_json(json!({
                 "status": "ok", "submitted": true, "amount": a.amount_nano, "token": a.token,
                 "l1Recipient": a.l1_recipient, "l1TokenAddress": token_addr, "nonce": nonce,
+                "destinationChainIndex": a.dest_chain_index, "l1ChainId": l1_chain_id,
+                "l1ChainName": l1_chain_name,
                 "txHash": leaf,
                 "note": "Burned on Psy. The bridge relayer settles the Ethereum leg; watch the L1 recipient.",
             })),
