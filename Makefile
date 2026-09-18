@@ -15,7 +15,7 @@ PSY_SKIP_KEYSTORE ?= 1
 PSY_SKIP_BUILD ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test check check-all deploy-contracts register-users query-chain-info run-all staging-server restart restart-all shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal mint-relayer-deposit-withdrawal
+.PHONY: all build clean test check check-all psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all staging-server restart restart-all shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal mint-relayer-deposit-withdrawal
 
 all: build
 
@@ -32,6 +32,35 @@ check-all: check
 
 test:
 	PSY_CONFIG_PATH=$(PSY_CONFIG_PATH) cargo test
+
+# Line coverage for node-side data, VM, and common runtime crates.
+PSY_CRATE_COVERAGE_MIN_LINES ?= 85
+PSY_CRATE_COVERAGE_MIN_FUNCTIONS ?= 85
+PSY_CRATE_COVERAGE_ARGS := --release --locked --lib --summary-only --fail-under-lines $(PSY_CRATE_COVERAGE_MIN_LINES) --fail-under-functions $(PSY_CRATE_COVERAGE_MIN_FUNCTIONS)
+
+psy-data-coverage:
+	cargo llvm-cov $(PSY_CRATE_COVERAGE_ARGS) -p psy_data
+
+psy-vm-coverage:
+	cargo llvm-cov $(PSY_CRATE_COVERAGE_ARGS) -p psy_vm
+
+psy-node-common-coverage:
+	cargo llvm-cov $(PSY_CRATE_COVERAGE_ARGS) -p psy_node_common
+
+# The full suite includes async_split_tests, which exercise live node services.
+# Keep explicit online and offline targets for environments without those services.
+PSY_PROVER_TEST_NETWORK ?= sepolia
+PSY_PROVER_COV_ARGS := --release --locked -p psy_prover --lib --ignore-filename-regex '(/|^)examples/|ordering_tests\.rs$$'
+PSY_PROVER_COV_OFFLINE_TESTS := --skip session::session::async_split_tests
+
+psy-prover-coverage:
+	PSY_PROVER_TEST_NETWORK=$(PSY_PROVER_TEST_NETWORK) cargo llvm-cov $(PSY_PROVER_COV_ARGS) --summary-only --fail-under-lines $(PSY_CRATE_COVERAGE_MIN_LINES) --fail-under-functions $(PSY_CRATE_COVERAGE_MIN_FUNCTIONS) -- --test-threads=1
+
+psy-prover-coverage-offline:
+	cargo llvm-cov $(PSY_PROVER_COV_ARGS) --summary-only -- $(PSY_PROVER_COV_OFFLINE_TESTS) --test-threads=1
+
+psy-prover-coverage-online:
+	PSY_PROVER_TEST_NETWORK=$(PSY_PROVER_TEST_NETWORK) cargo llvm-cov $(PSY_PROVER_COV_ARGS) --summary-only -- session::session::async_split_tests --test-threads=1
 
 verify-contracts:
 	@cd psy-contracts && npx hardhat verify-contracts --network ${NETWORK}
