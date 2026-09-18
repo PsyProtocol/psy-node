@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SINGLE_RUNNER="$SCRIPT_DIR/run-cli-e2e.sh"
-CHAINS=(base bsc testnet)
+CHAINS=(base bsc sepolia)
 
 usage() {
   cat <<'USAGE'
@@ -38,7 +38,7 @@ fail() {
 
 chain_key_file() {
   case "$1" in
-    testnet) printf '%s' "${SEPOLIA_EVM_KEY_FILE:-${MULTICHAIN_EVM_KEY_FILE:-}}" ;;
+    sepolia) printf '%s' "${SEPOLIA_EVM_KEY_FILE:-${MULTICHAIN_EVM_KEY_FILE:-}}" ;;
     bsc) printf '%s' "${BSC_EVM_KEY_FILE:-${MULTICHAIN_EVM_KEY_FILE:-}}" ;;
     base) printf '%s' "${BASE_EVM_KEY_FILE:-${MULTICHAIN_EVM_KEY_FILE:-}}" ;;
   esac
@@ -107,7 +107,7 @@ run_for_all_chains() {
           operation: $operation,
           run_id: $run_id,
           executed_at: $executed_at,
-          required_order: ["base", "bsc", "testnet"],
+          required_order: ["base", "bsc", "sepolia"],
           status: (if ($chains | length) == 3 and all($chains[]; .status == "PASS")
                    then "PASS" else "FAIL" end),
           chains: $chains
@@ -163,10 +163,10 @@ case "$command_name" in
       --arg repo_revision "$(git rev-parse HEAD)" \
       --arg base "$matrix_dir/base" \
       --arg bsc "$matrix_dir/bsc" \
-      --arg testnet "$matrix_dir/testnet" \
+      --arg sepolia "$matrix_dir/sepolia" \
       '{version: 1, created_at: $created_at, repo_revision: $repo_revision,
-        execution: "serial", required_chains: ["base", "bsc", "testnet"],
-        runs: {base: $base, bsc: $bsc, testnet: $testnet}}' \
+        execution: "serial", required_chains: ["base", "bsc", "sepolia"],
+        runs: {base: $base, bsc: $bsc, sepolia: $sepolia}}' \
       >"$matrix_dir/matrix.json"
     chmod 600 "$matrix_dir/matrix.json"
 

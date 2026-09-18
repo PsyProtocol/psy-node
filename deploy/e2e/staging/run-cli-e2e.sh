@@ -13,10 +13,10 @@ STAGING_CHAIN="${STAGING_CHAIN:-${STAGING_NETWORK:-bsc}}"
 usage() {
   cat <<'USAGE'
 Usage:
-  STAGING_CHAIN=testnet|bsc|base run-cli-e2e.sh init [RUN_DIR] [EVM_KEY_FILE]
-  STAGING_CHAIN=testnet|bsc|base run-cli-e2e.sh status RUN_DIR
-  STAGING_CHAIN=testnet|bsc|base run-cli-e2e.sh recover-deposit RUN_DIR [--token usdt|psy]
-  AUTHORIZED_STAGING_TRANSACTIONS=1 STAGING_CHAIN=testnet|bsc|base \
+  STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh init [RUN_DIR] [EVM_KEY_FILE]
+  STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh status RUN_DIR
+  STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh recover-deposit RUN_DIR [--token usdt|psy]
+  AUTHORIZED_STAGING_TRANSACTIONS=1 STAGING_CHAIN=sepolia|bsc|base \
     run-cli-e2e.sh run RUN_DIR [RUN_OPTIONS...]
 
 The default profile is BSC Testnet. Each run manifest pins the selected L1
@@ -38,8 +38,8 @@ fail() {
 
 select_profile() {
   case "$STAGING_CHAIN" in
-    mainnet|testnet)
-      PROFILE_NAME="testnet"
+    ethereum|sepolia)
+      PROFILE_NAME="sepolia"
       CONFIG_NETWORK="testnet"
       DEPLOYMENTS_NETWORK="sepolia"
       L1_CHAIN_ID="11155111"
@@ -69,7 +69,7 @@ select_profile() {
       RPC_ENV_NAME="BASE_SEPOLIA_RPC_URL"
       ;;
     *)
-      fail "unknown STAGING_CHAIN '$STAGING_CHAIN'; expected testnet, bsc, or base"
+      fail "unknown STAGING_CHAIN '$STAGING_CHAIN'; expected sepolia, bsc, or base"
       ;;
   esac
   L1_RPC_URL="${STAGING_L1_RPC_URL:-$PROFILE_RPC_URL}"

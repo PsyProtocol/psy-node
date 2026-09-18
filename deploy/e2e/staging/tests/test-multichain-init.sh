@@ -75,10 +75,10 @@ assert_profile() {
 
 "$STAGING_DIR/run-multichain-e2e.sh" init "$test_dir" >/dev/null
 
-jq -e '.required_chains == ["base", "bsc", "testnet"]' \
+jq -e '.required_chains == ["base", "bsc", "sepolia"]' \
   "$test_dir/matrix.json" >/dev/null || fail "matrix execution order mismatch"
 
-assert_profile testnet testnet sepolia 11155111 0
+assert_profile sepolia testnet sepolia 11155111 0
 assert_profile bsc bsc-testnet bscTestnet 97 1
 assert_profile base base-sepolia baseSepolia 84532 2
 
@@ -89,7 +89,7 @@ fi
 shared_dir="$test_parent/shared-matrix"
 MULTICHAIN_EVM_KEY_FILE="$test_dir/bsc/secrets/e.key" \
   "$STAGING_DIR/run-multichain-e2e.sh" init "$shared_dir" >/dev/null
-shared_address="$(jq -r .evm_address "$shared_dir/testnet/manifest.json")"
+shared_address="$(jq -r .evm_address "$shared_dir/sepolia/manifest.json")"
 for profile in bsc base; do
   [ "$(jq -r .evm_address "$shared_dir/$profile/manifest.json")" = "$shared_address" ] ||
     fail "shared EVM key produced a different $profile address"
