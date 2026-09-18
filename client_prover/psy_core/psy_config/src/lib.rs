@@ -527,6 +527,11 @@ pub struct PsyConfig<F: RichField> {
     nodes_config: Option<NodesConfig<F>>,
 }
 
+// Test-only counter proving the build-identity log in `verify_chain_identity`
+// fires at most once per process, no matter how many times config is loaded.
+#[cfg(test)]
+static BUILD_IDENTITY_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl<F: RichField> PsyConfig<F> {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
         let content = match std::fs::read_to_string(path) {
@@ -603,6 +608,15 @@ impl<F: RichField> PsyConfig<F> {
                 binary_network: CURRENT_NETWORK,
             });
         }
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            eprintln!(
+                "psy build identity: stage={} magic={:#018X} config_network={}",
+                CURRENT_NETWORK, PSY_NETWORK_MAGIC, self.current_network
+            );
+            #[cfg(test)]
+            BUILD_IDENTITY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
         Ok(())
     }
 
@@ -1026,5 +1040,37 @@ mod tests {
         // 查看用的入口不校验，chain-info 这类工具靠它。
         config.use_network_unchecked("mainnet").unwrap();
         assert_eq!(config.current_network_name(), "mainnet");
+    }
+
+    #[test]
+    fn build_identity_log_fires_at_most_once_per_process() {
+        let json = config_json(
+            "testnet",
+            &[("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "0"))],
+        );
+
+        // Load config twice, and call verify_chain_identity directly a couple
+        // more times on top of that. Every one of these calls goes through
+        // the same `LOGGED.call_once` in verify_chain_identity.
+        let config1 = PsyConfigGoldilocks::from_json(&json).unwrap();
+        let config2 = PsyConfigGoldilocks::from_json(&json).unwrap();
+        config1.verify_chain_identity().unwrap();
+        config2.verify_chain_identity().unwrap();
+
+        // std::sync::Once guarantees the call_once body runs exactly once for
+        // the whole process, no matter how many times *any* test in this
+        // binary loads a config (cargo test runs all tests in one process).
+        // So this counter can only ever be 0 (no config loaded anywhere yet)
+        // or 1 (it has, exactly once) -- never more, even though this test
+        // alone triggers the check 4 times. That's the once-per-process
+        // property. What this does NOT prove: the exact text of the printed
+        // line, or that it went to stderr rather than stdout -- this crate
+        // has no logging framework to capture output, so that was checked by
+        // hand instead (see task report).
+        let count = BUILD_IDENTITY_LOG_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "the build-identity log must fire exactly once per process, got {count}"
+        );
     }
 }
