@@ -820,10 +820,14 @@ mod tests {
 
     #[test]
     fn test_config_loading() {
-        // client_prover/config.json 是部署脚本渲染出来的产物，不在版本库里。
-        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.json");
+        // Prefer PSY_CONFIG_PATH (what build.rs uses); fall back to the tracked
+        // psy-genesis submodule config so this test still checks something real
+        // even when no env var is set. Only skip if neither resolves to a file.
+        let config_path = std::env::var("PSY_CONFIG_PATH").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../psy-genesis/config.json")
+        });
         if !config_path.exists() {
-            eprintln!("skipping: {} not rendered in this checkout", config_path.display());
+            eprintln!("skipping: {} does not exist in this checkout", config_path.display());
             return;
         }
         let config = PsyConfigGoldilocks::from_file(config_path.to_str().unwrap()).unwrap();
@@ -832,7 +836,13 @@ mod tests {
             ["localhost", "testnet", "mainnet"].contains(&name.as_str()),
             "unexpected network name in rendered config: {name}"
         );
-        assert!(config.get_current_network().unwrap().users_per_realm > 0);
+        let network = config.get_current_network().unwrap();
+        assert!(network.users_per_realm > 0);
+
+        let magic_hex = network.magic.trim_start_matches("0x");
+        let magic = u64::from_str_radix(magic_hex, 16)
+            .unwrap_or_else(|e| panic!("magic '{}' is not valid hex: {e}", network.magic));
+        assert_ne!(magic, 0, "magic must be non-zero");
     }
 
     #[test]
