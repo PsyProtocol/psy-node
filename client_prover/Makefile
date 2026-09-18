@@ -39,7 +39,7 @@ check:
 	@$(CARGO) check --workspace --all-targets --tests --benches --examples --bins
 
 fix:
-	@cd $(ROOT_DIR) && cargo fix --all-targets --allow-dirty --allow-staged
+	@$(CARGO) fix --all-targets --allow-dirty --allow-staged
 
 build:
 	@RUSTFLAGS="-A warnings" $(CARGO) build --profile $(PROFILE) --bin psy_user_cli --bin psy-mcp-server

@@ -21,12 +21,12 @@ The configuration file supports multiple networks with a default network setting
       // ... other localhost config
     },
     "testnet": {
-      "magic": "0x2337CF514544CF69", 
+      "magic": "0x1337CF514544CF69", 
       "users_per_realm": 1048576,
       // ... other testnet config
     },
     "mainnet": {
-      "magic": "0x3337CF514544CF69",
+      "magic": "0x1337CF514544C069",
       "users_per_realm": 1048576,
       // ... other mainnet config
     }
