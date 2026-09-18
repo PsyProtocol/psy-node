@@ -6,7 +6,8 @@ PROFILE := release
 BIN_DIR := $(ROOT_DIR)/target/$(PROFILE)
 ROOT_CONFIG_PATH := $(CURDIR)/../psy-genesis/config.json
 PRIVATE_KEYS_FILE ?= $(ROOT_DIR)/private_keys.json
-CARGO := cd $(ROOT_DIR) && PSY_CONFIG_PATH=$(ROOT_CONFIG_PATH) cargo
+PSY_NETWORK ?= localhost
+CARGO := cd $(ROOT_DIR) && PSY_CONFIG_PATH=$(ROOT_CONFIG_PATH) PSY_NETWORK=$(PSY_NETWORK) cargo
 USER_CLI := $(BIN_DIR)/psy_user_cli
 LOG_LEVEL := psy_ups_circuit=trace,psy_dpn_circuit=trace,psy_user_cli=debug,psy_common_circuit=trace,psy_network_circuit=trace,psy_prover=trace,psy_client_data=trace,plonky2=error
 
@@ -38,7 +39,7 @@ check:
 	@$(CARGO) check --workspace --all-targets --tests --benches --examples --bins
 
 fix:
-	@cd $(ROOT_DIR) && cargo fix --all-targets --allow-dirty --allow-staged
+	@$(CARGO) fix --all-targets --allow-dirty --allow-staged
 
 build:
 	@RUSTFLAGS="-A warnings" $(CARGO) build --profile $(PROFILE) --bin psy_user_cli --bin psy-mcp-server

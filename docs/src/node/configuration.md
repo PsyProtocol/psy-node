@@ -21,12 +21,12 @@ The configuration file supports multiple networks with a default network setting
       // ... other localhost config
     },
     "testnet": {
-      "magic": "0x2337CF514544CF69", 
+      "magic": "0x1337CF514544CF69",
       "users_per_realm": 1048576,
       // ... other testnet config
     },
     "mainnet": {
-      "magic": "0x3337CF514544CF69",
+      "magic": "0x1337CF514544C069",
       "users_per_realm": 1048576,
       // ... other mainnet config
     }
@@ -35,7 +35,7 @@ The configuration file supports multiple networks with a default network setting
 }
 ```
 
-Applications will use the `defaultNetwork` configuration unless explicitly switched to another network.
+Applications will use the `defaultNetwork` configuration unless explicitly switched to another network. The Psy stage name (the `networks` key, and `defaultNetwork`) is one of exactly three values: `localhost`, `testnet`, or `mainnet` — it is not an L1 chain name.
 
 #### Core Network Parameters
 
@@ -195,4 +195,3 @@ Pre-deployed contracts and their initial state:
 - **Magic Number**: Network identifier for message signing
 - **Whitelist**: Optional public key restrictions
 - **Fee Structure**: Economic security parameters
-

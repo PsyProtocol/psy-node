@@ -11,6 +11,7 @@ import {
     isUsableGenesisData,
     planPsyDappNestedSubmodulesFromDisk,
     readGenesisContractsArtifactStamp,
+    resolveForkRpcEnvKey,
     resolveProjectsDir,
     RunningProcess,
     runStreamingCaptureStderr,
@@ -331,5 +332,38 @@ describe("planPsyDappNestedSubmodulesFromDisk", () => {
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
         }
+    });
+});
+
+describe("resolveForkRpcEnvKey", () => {
+    it("falls back to the L1-owned table when the selected stage's genesis block has no anvilForkSourceUrlEnv", () => {
+        // Reproduces VITE_PSY_STAGE=localhost VITE_NETWORK=sepolia VITE_FORK=true:
+        // the localhost stage's genesis block never defines anvilForkSourceUrlEnv,
+        // but forking sepolia must still work without picking a non-local stage.
+        expect(resolveForkRpcEnvKey("sepolia", undefined, "localhost")).toBe("SEPOLIA_RPC_URL");
+        expect(resolveForkRpcEnvKey("sepolia", {}, "localhost")).toBe("SEPOLIA_RPC_URL");
+        expect(resolveForkRpcEnvKey("ethereum", undefined, "localhost")).toBe("ETH_RPC_URL");
+    });
+
+    it("prefers the genesis config's anvilForkSourceUrlEnv over the L1-owned fallback when the requested L1 is that stage's own default L1", () => {
+        expect(
+            resolveForkRpcEnvKey("sepolia", { anvilForkSourceUrlEnv: "CUSTOM_SEPOLIA_RPC_URL" }, "testnet"),
+        ).toBe("CUSTOM_SEPOLIA_RPC_URL");
+    });
+
+    it("ignores the genesis config's anvilForkSourceUrlEnv when the requested L1 is not the selected stage's default L1", () => {
+        // Reproduces VITE_PSY_STAGE=testnet VITE_NETWORK=ethereum VITE_FORK=true: the
+        // testnet stage's genesis block names a Sepolia fork source, but the request
+        // is for Ethereum, so it must fall through to the L1-owned ETH_RPC_URL
+        // instead of silently forking Ethereum via testnet's Sepolia RPC.
+        expect(
+            resolveForkRpcEnvKey("ethereum", { anvilForkSourceUrlEnv: "CUSTOM_SEPOLIA_RPC_URL" }, "testnet"),
+        ).toBe("ETH_RPC_URL");
+    });
+
+    it("throws naming both VITE_NETWORK and the missing fork source when neither source has an answer", () => {
+        expect(() => resolveForkRpcEnvKey("localhost", undefined, "localhost")).toThrow(
+            /no fork RPC env is known for VITE_NETWORK=localhost.*VITE_NETWORK must be one of the L1 names with a known fork source/s,
+        );
     });
 });
