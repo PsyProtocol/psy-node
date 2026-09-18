@@ -1,9 +1,58 @@
 # Multichain stage integration candidate
 
-Status: source integration only. NOT approved for an online fresh deployment.
+Status: source/build preparation complete in part; online release packaging is
+still outstanding. Not yet ready to stop or clear the existing network.
 No online service, database, L1 contract, wallet artifact or frontend was changed
 by this preparation. Do not run the destructive fresh-deployment steps until the
 remaining gates below are resolved.
+
+## Operator Update: Online Acceptance Instead Of Local E2E
+
+On 2026-09-18 the operator stopped local acceptance work and chose to run the
+remaining tests on the freshly deployed online testnet. Local three-chain E2E
+and browser acceptance are therefore **skipped, not passed**. The isolated
+launcher, its node process group, and its four infrastructure containers have
+been stopped. Artifacts and logs are retained; online services were not changed.
+
+The following preparation is complete:
+
+- Native and Debian Bookworm release binaries for Node and services are built.
+  The Bookworm build uses the pinned nightly-2025-09-20 toolchain and locked
+  dependencies. All seven release executables require at most GLIBC 2.34.
+- All three fresh Groth16 setup groups generated and self-verified successfully.
+- Their corresponding Solidity verifiers exported successfully in the isolated
+  runtime and from the Bookworm relayer. Verified setup files are staged under
+  `dist/groth16-keystore/{bridge,deposit_batch_append,withdrawal_claim}`;
+  matching exported verifiers are under `dist/verifiers`. Both have SHA256SUMS.
+- Local SDK archive exists for commit `310cd961bb479619069f12ca71c32e133066e2ad`:
+  SHA256 `3b19b24d9c2608670e55e03d741f9aa3df85a0a6df4716afd2136681f36d3643`.
+  It has not been published to npm or R2.
+- Wallet `3bb5d09c` was built in an isolated checkout using that exact local SDK.
+  Frozen offline dependency installation, typecheck and staging build passed.
+  ZIP SHA256: `3e754e5f8844f436cc06b2fafde4b146515ed66165554feed35ae416619cbb3d`.
+  The operator explicitly chose not to upload the SDK. Use the wallet candidate
+  publisher described in `WALLET-R2-CANDIDATE-2026-09-18.md`; do not switch the
+  default wallet download before the matching backend is accepted.
+- Fresh Genesis generation passed 3/3 tests with the established online relayer
+  L2 key at index 2. No disposable local-test wallet was copied into the release.
+
+Before stopping the current network:
+
+1. Produce and inspect the Debian Bookworm-compatible cloud bundle, including
+   services/indexer; keep an independently verified Arch release for offsite hosts.
+2. Use the verified local SDK for matching wallet/DApp builds; SDK upload is
+   deferred. The wallet workflow still selects the old `4146f805` archive and
+   must not be used to overwrite this candidate.
+3. Package the new setup and matching verifier sources with the cloud deployment;
+   verify Genesis/config/source hashes and prevent reuse of stale artifacts.
+4. Run the private-config preflight: three RPC chain IDs, signer balances,
+   deployment topology, SSH reachability and immutable source/artifact pins.
+
+Only then stop/reset and deploy. The numbered deployment sequence still places
+its build step after stop/reset; do not blindly run the full sequence before
+preparing artifacts separately. Services proof compatibility, continuous block
+production, and all three deposit/withdraw flows become online acceptance gates.
+Do not declare the network ready for normal use until those gates pass.
 
 ## Repository cohort
 
@@ -70,26 +119,30 @@ Genesis or Groth16 setup compatibility; the remaining gates still apply.
 
 ## Release blockers
 
-1. **SDK consumer rollout.** Build/pack validation is complete. Package the
-   immutable release and record its SHA-256 before distribution. Publish only
-   when authorized, then update wallet's
-   three `PSY_SDK_*` workflow pins. They still reference 4146f805. Verify DApp's
-   actual dependency resolution too. Changing source pins alone is insufficient.
+1. **SDK consumer rollout.** Wallet local-SDK build validation is complete.
+   Publish its immutable candidate separately from the default download. No SDK
+   upload is needed for this manual release. The workflow still references
+   4146f805; automatic release alignment remains deferred. Verify DApp's actual
+   dependency resolution too. Changing source pins alone is insufficient.
 2. **Fresh proof artifacts.** Genesis nondeterminism is resolved: the pinned
    streaming XXH3 implementation used uninitialized buffer tail bytes for
    certain symbolic inputs. One-shot XXH3 fixes this without changing inline
-   constant/input encoding. Generate and validate a fresh local Groth16 setup
-   before starting the acceptance stack; never silently reuse published setup.
+   constant/input encoding. Fresh setup generation and self-verification are
+   complete; inspect the final bundle and hash manifest before deployment.
+   Never silently reuse the old published setup.
 3. **Services/compiler compatibility.** Run proof fingerprint/verification and
    ABI/method checks against the final node + Genesis cohort, including Nostr
    deposit and private-transfer proofs. No reuse approval has been granted.
-4. **Whole-stack tests.** Run the isolated fresh stack, three-chain CLI E2E and
-   Bridge/Explorer browser tests. Test wallet migration, preserved keys and
+4. **Whole-stack tests.** Per the operator update above, run three-chain CLI E2E
+   and Bridge/Explorer browser tests on the fresh online testnet instead of
+   continuing the local stack. Test wallet migration, preserved keys and
    cross-stage rejection. Tests skipped are not passes.
-5. **Build/type coverage.** Wallet full typecheck is not green in the current
-   validation setup; after using the verified old SDK types, four pre-existing
-   `globalThis.chrome` typing errors remain. Validate against the new SDK and
-   production build environment rather than treating unit tests as a release.
+5. **Dual-role topology.** PsyProtocol/psy-node PR #10 is still open as of this
+   preparation. Candidate runtime `159c8f98` lacks `prove-proxy --role`, while
+   the live host runs separate user/system processes. It provides the legacy
+   combined API, but cannot be deployed as the agreed dual-role layout. Resolve
+   the runtime merge and rebuild applicable artifacts before stopping services;
+   do not silently deploy a legacy single-process replacement.
 
 Local launch safety: the legacy `deploy/local-multichain/start.sh` is NOT the
 acceptance entrypoint. It can stop processes by name/port, use existing Envio

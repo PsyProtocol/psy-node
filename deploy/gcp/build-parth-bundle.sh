@@ -1,6 +1,65 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+copy_runtime_deploy_files() {
+  local parth_dir="$1"
+  local fallback_dir="$2"
+  local bundle_root="$3"
+  local launcher="$parth_dir/deploy/bin/run-parth-service"
+
+  if [ ! -f "$launcher" ]; then
+    launcher="$fallback_dir/bin/run-parth-service"
+  fi
+  if [ ! -f "$launcher" ]; then
+    echo "missing runtime launcher: deploy/bin/run-parth-service" >&2
+    return 1
+  fi
+
+  install -D -m 0755 "$launcher" "$bundle_root/deploy/bin/run-parth-service"
+}
+
+reject_secret_files() {
+  local bundle_root="$1"
+  local path
+  local -a rejected=()
+
+  while IFS= read -r -d '' path; do
+    rejected+=("${path#"$bundle_root"/}")
+  done < <(
+    find "$bundle_root" -type f \( \
+      -name 'config.env' -o \
+      -name '.env' -o \
+      -name '.env.*' -o \
+      -name '*.key' -o \
+      -name '*.pem' -o \
+      -name '*.p12' -o \
+      -name '*.pfx' -o \
+      -name '*.jks' -o \
+      -name '*.keystore' -o \
+      -name 'keystore.json' -o \
+      -name 'private_keys.json' -o \
+      -name 'credentials.json' -o \
+      -iname '*secret*' -o \
+      -name 'id_rsa' -o \
+      -name 'id_rsa.*' -o \
+      -name 'id_ed25519' -o \
+      -name 'id_ed25519.*' \
+    \) -print0
+  )
+
+  if [ "${#rejected[@]}" -ne 0 ]; then
+    echo "refusing to package secret-like files:" >&2
+    printf '  %s\n' "${rejected[@]}" >&2
+    return 1
+  fi
+}
+
+# Allow focused tests to exercise the packaging primitives without loading a
+# deployment profile or assembling a complete release.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEPLOY_DIR="$ROOT/deploy"
 GCP_DIR="$DEPLOY_DIR/gcp"
@@ -161,12 +220,7 @@ elif [ -f "$PARTH_DIR/Makefile" ]; then
 else
   cp "$DEPLOY_DIR/sources/psy-node/Makefile" "$tmp/Makefile"
 fi
-parth_deploy_scripts="$DEPLOY_DIR/scripts/parth"
-if [ -d "$PARTH_DIR/deploy/bin" ]; then
-  parth_deploy_scripts="$PARTH_DIR/deploy"
-fi
-rsync -a --exclude 'gcp' "$parth_deploy_scripts/" "$tmp/deploy/"
-chmod 0755 "$tmp/deploy/bin/run-parth-service"
+copy_runtime_deploy_files "$PARTH_DIR" "$DEPLOY_DIR/scripts/parth" "$tmp"
 cp "$DEPLOY_DIR/config/parth/genesis.json" "$tmp/genesis.json"
 mkdir -p "$tmp/genesis_abi"
 if [ -d "$DEPLOY_DIR/config/parth/genesis_abi" ]; then
@@ -280,6 +334,7 @@ GENESIS_CONTRACTS_SHA256=$(sha256sum "$DEPLOY_DIR/config/parth/genesis_contracts
 EOF
 
 mkdir -p "$OUT_DIR"
+reject_secret_files "$tmp"
 tar -C "$tmp" -czf "$OUT_FILE" .
 echo "bundle build manifest:" >&2
 cat "$tmp/BUILD-MANIFEST.env" >&2

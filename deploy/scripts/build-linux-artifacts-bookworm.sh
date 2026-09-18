@@ -9,6 +9,16 @@ WORKSPACE_ROOT="${WORKSPACE_HOME:-$(cd "$ROOT/.." && pwd)}"
 PARTH_DIR="${PARTH_DIR:-$ROOT}"
 IMAGE="${BOOKWORM_BUILDER_IMAGE:-parth-bookworm-builder:latest}"
 GO_VERSION="${GO_VERSION:-1.22.3}"
+RUST_TOOLCHAIN="$(python3 - "$PARTH_DIR/rust-toolchain.toml" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], 'rb') as source:
+    print(tomllib.load(source)['toolchain']['channel'])
+PY
+)"
+[[ "$RUST_TOOLCHAIN" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || {
+  echo "Bookworm release builds require a dated nightly toolchain" >&2
+  exit 1
+}
 PACKAGE_ARTIFACTS="${PACKAGE_ARTIFACTS:-1}"
 BUILD_PARTH_BUNDLE="${BUILD_PARTH_BUNDLE:-1}"
 BUILD_PARTH_BINARIES="${BUILD_PARTH_BINARIES:-1}"
@@ -43,8 +53,8 @@ command -v docker >/dev/null 2>&1 || {
 }
 
 # Node binaries embed contract IDs and method IDs at compile time. A
-# psy-services-only build resolves its pinned psy-node Git dependencies and
-# must not depend on the deployment worktree's generated genesis artifacts.
+# psy-services-only build resolves its pinned psy-node Git dependencies, but
+# still consumes the canonical stage config supplied by this release cohort.
 if [ "$VERIFY_PARTH_GENESIS" = "1" ]; then
   bash "$PARTH_DIR/deploy/scripts/ensure-genesis-contracts.sh"
 fi
@@ -56,6 +66,7 @@ cat >"$tmp/Dockerfile" <<EOF
 FROM rust:bookworm
 
 ARG GO_VERSION=${GO_VERSION}
+ARG RUST_TOOLCHAIN=${RUST_TOOLCHAIN}
 
 RUN apt-get update \\
   && apt-get install -y --no-install-recommends \\
@@ -81,7 +92,7 @@ RUN curl -fsSL "https://go.dev/dl/go\${GO_VERSION}.linux-amd64.tar.gz" \\
   | tar -C /usr/local -xz
 
 ENV PATH="/usr/local/go/bin:/usr/local/cargo/bin:\${PATH}"
-RUN rustup toolchain install nightly --profile minimal --component rust-src
+RUN rustup toolchain install \${RUST_TOOLCHAIN} --profile minimal --component rust-src
 
 WORKDIR /work
 EOF
@@ -101,6 +112,8 @@ docker_run_args=(
   -e CARGO_NET_GIT_FETCH_WITH_CLI=true
   -e CARGO_BUILD_JOBS="$bookworm_build_jobs"
   -e BUILD_PARTH_BINARIES="$BUILD_PARTH_BINARIES"
+  -e RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN"
+  -e PSY_CONFIG_PATH="$PARTH_WORKDIR/psy-genesis/config.json"
   -e PSY_NETWORK="${PSY_NETWORK:-testnet}"
   -v "$WORKSPACE_ROOT:/work"
   -v "$PARTH_DIR:$PARTH_WORKDIR"
@@ -160,7 +173,7 @@ docker run \
     if [ "$BUILD_PARTH_BINARIES" = "1" ]; then
       cd "$PARTH_WORKDIR"
       PSY_CONFIG_PATH="$PARTH_WORKDIR/psy-genesis/config.json" PSY_NETWORK="${PSY_NETWORK:-testnet}" \
-        cargo +nightly build --release \
+        cargo build --locked --release \
           --bin psy_node_cli \
           --bin psy_worker_cli \
           --bin psy_user_cli \
@@ -169,7 +182,7 @@ docker run \
     fi
 
     cd "$PSY_SERVICES_WORKDIR"
-    cargo +nightly build --release --bin psy-services --bin psy-indexer
+    cargo build --locked --release --bin psy-services --bin psy-indexer
 
     chown -R "${HOST_UID}:${HOST_GID}" \
       /work/.cargo-bookworm \
@@ -190,11 +203,17 @@ if [ "$BUILD_PARTH_BINARIES" = "1" ]; then
     "$PARTH_DIR/target/release/psy_worker_cli"
     "$PARTH_DIR/target/release/psy_user_cli"
     "$PARTH_DIR/target/release/psy_relayer_cli"
+    "$PARTH_DIR/target/release/psy_dev_cli"
   )
 fi
 for bin in "${binaries[@]}"; do
   max_glibc="$(objdump -T "$bin" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true)"
   echo "[bookworm-build] $(basename "$bin") max ${max_glibc:-unknown}"
+  [ -n "$max_glibc" ] || { echo "Cannot verify GLIBC requirement: $bin" >&2; exit 1; }
+  [ "$(printf '%s\n' GLIBC_2.36 "$max_glibc" | sort -V | tail -1)" = GLIBC_2.36 ] || {
+    echo "Binary requires newer GLIBC than Debian Bookworm: $bin" >&2
+    exit 1
+  }
 done
 
 if [ "$PACKAGE_ARTIFACTS" = "1" ]; then
