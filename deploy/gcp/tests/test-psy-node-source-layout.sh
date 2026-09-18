@@ -12,19 +12,11 @@ VERSIONS_FILE="$ROOT/deploy/$PROFILE/gcp/source-versions.env"
 source "$VERSIONS_FILE"
 
 runtime_head="$(git -C "$ROOT" rev-parse HEAD)"
-git -C "$ROOT" merge-base --is-ancestor "$EXPECTED_PARTH_RUNTIME_COMMIT" "$runtime_head" || {
-  echo "psy-node deployment branch does not contain the pinned runtime commit" >&2
-  exit 1
-}
-non_deploy_changes="$(
-  git -C "$ROOT" diff --name-only "$EXPECTED_PARTH_RUNTIME_COMMIT" "$runtime_head" \
-    | awk '$0 !~ /^deploy\//'
-)"
-[ -z "$non_deploy_changes" ] || {
-  echo "deployment branch contains unapproved product changes:" >&2
-  printf '%s\n' "$non_deploy_changes" >&2
-  exit 1
-}
+# Reuse the production guard's exact metadata exceptions; product edits still
+# fail closed. Gitlink identity is checked independently below.
+# shellcheck source=../lib/runtime-source.sh
+source "$ROOT/deploy/gcp/lib/runtime-source.sh"
+verify_deployment_runtime_tree "$ROOT" "$EXPECTED_PARTH_RUNTIME_COMMIT"
 
 assert_commit() {
   local label="$1"
