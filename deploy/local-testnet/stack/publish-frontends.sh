@@ -81,7 +81,7 @@ build_frontend() {
       exit 1
     fi
     echo "[local-staging] building $label"
-    (cd "$dir" && PSY_SKIP_CONFIG_SYNC=1 VITE_NETWORK="$LOCAL_STAGING_FRONTEND_NETWORK" pnpm run build)
+    (cd "$dir" && PSY_SKIP_CONFIG_SYNC=1 VITE_PSY_STAGE="$LOCAL_STAGING_FRONTEND_NETWORK" VITE_NETWORK="${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:-localhost}" pnpm run build)
   fi
 
   [ -d "$dir/dist" ] || {
@@ -114,7 +114,7 @@ publish_wallet_downloads() {
       exit 1
     fi
     echo "[local-staging] building wallet package ($LOCAL_STAGING_WALLET_BUILD_SCRIPT)"
-    (cd "$PSY_WALLET_DIR" && VITE_NETWORK="$LOCAL_STAGING_FRONTEND_NETWORK" pnpm "$LOCAL_STAGING_WALLET_BUILD_SCRIPT")
+    (cd "$PSY_WALLET_DIR" && VITE_PSY_STAGE="$LOCAL_STAGING_FRONTEND_NETWORK" VITE_NETWORK="${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:-localhost}" pnpm "$LOCAL_STAGING_WALLET_BUILD_SCRIPT")
   fi
 
   if [ -d "$PSY_WALLET_DIR/$LOCAL_STAGING_WALLET_RELEASE_DIR" ]; then

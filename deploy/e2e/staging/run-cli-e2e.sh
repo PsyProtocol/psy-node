@@ -13,10 +13,10 @@ STAGING_CHAIN="${STAGING_CHAIN:-${STAGING_NETWORK:-bsc}}"
 usage() {
   cat <<'USAGE'
 Usage:
-  STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh init [RUN_DIR] [EVM_KEY_FILE]
-  STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh status RUN_DIR
-  STAGING_CHAIN=sepolia|bsc|base run-cli-e2e.sh recover-deposit RUN_DIR [--token usdt|psy]
-  AUTHORIZED_STAGING_TRANSACTIONS=1 STAGING_CHAIN=sepolia|bsc|base \
+  STAGING_CHAIN=testnet|bsc|base run-cli-e2e.sh init [RUN_DIR] [EVM_KEY_FILE]
+  STAGING_CHAIN=testnet|bsc|base run-cli-e2e.sh status RUN_DIR
+  STAGING_CHAIN=testnet|bsc|base run-cli-e2e.sh recover-deposit RUN_DIR [--token usdt|psy]
+  AUTHORIZED_STAGING_TRANSACTIONS=1 STAGING_CHAIN=testnet|bsc|base \
     run-cli-e2e.sh run RUN_DIR [RUN_OPTIONS...]
 
 The default profile is BSC Testnet. Each run manifest pins the selected L1
@@ -38,9 +38,9 @@ fail() {
 
 select_profile() {
   case "$STAGING_CHAIN" in
-    ethereum|sepolia)
-      PROFILE_NAME="sepolia"
-      CONFIG_NETWORK="sepolia"
+    mainnet|testnet)
+      PROFILE_NAME="testnet"
+      CONFIG_NETWORK="testnet"
       DEPLOYMENTS_NETWORK="sepolia"
       L1_CHAIN_ID="11155111"
       L1_CHAIN_INDEX="0"
@@ -69,7 +69,7 @@ select_profile() {
       RPC_ENV_NAME="BASE_SEPOLIA_RPC_URL"
       ;;
     *)
-      fail "unknown STAGING_CHAIN '$STAGING_CHAIN'; expected sepolia, bsc, or base"
+      fail "unknown STAGING_CHAIN '$STAGING_CHAIN'; expected testnet, bsc, or base"
       ;;
   esac
   L1_RPC_URL="${STAGING_L1_RPC_URL:-$PROFILE_RPC_URL}"
@@ -77,7 +77,7 @@ select_profile() {
 
 ensure_e2e_binary() {
   echo "[staging-cli-e2e] checking incremental E2E build"
-  cargo build --locked --release --manifest-path "$E2E_MANIFEST"
+  PSY_NETWORK=localhost cargo build --locked --release --manifest-path "$E2E_MANIFEST"
   [ -x "$E2E_BIN" ] || fail "missing E2E executable: $E2E_BIN"
 }
 
@@ -97,7 +97,7 @@ render_staging_config() {
     --arg rpc_env "$RPC_ENV_NAME" \
     '.defaultNetwork = $network
      | .networks[$network] = (
-         .networks.sepolia
+         .networks.testnet
          | .l1_chain_id = $chain_id
          | .l1_rpc_urls = [$rpc_url]
          | .anvilForkSourceUrlEnv = $rpc_env
