@@ -527,10 +527,47 @@ pub struct PsyConfig<F: RichField> {
     nodes_config: Option<NodesConfig<F>>,
 }
 
-// Test-only counter proving the build-identity log in `verify_chain_identity`
-// fires at most once per process, no matter how many times config is loaded.
+// Test-only counter proving the build-identity log below fires at most once
+// per process, no matter how many times config is loaded.
 #[cfg(test)]
 static BUILD_IDENTITY_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Feeds the post-deploy build-identity collection gate (Gate 1): after a
+/// deploy, a collector script greps every process's log for this exact line
+/// to confirm they all agree on which chain they were built for. The format
+/// is a grep contract shared with that script — do not change it without
+/// updating the collector too.
+///
+/// This is a free function, not a method on `PsyConfig<F>`, on purpose: a
+/// `static` inside a generic function or generic impl is monomorphized once
+/// per concrete `F`, so each instantiation would get its own `Once` and the
+/// line could print once per type parameter instead of once per process.
+/// Keeping the `Once` here, outside any generic context, makes "once per
+/// process" hold by construction rather than by the accident that today only
+/// `PsyConfigGoldilocks` is ever used.
+///
+/// Writes via `std::io::stderr()` + `writeln!` rather than `eprintln!`:
+/// `eprintln!` panics if the underlying write fails, and this crate also
+/// compiles to `wasm32-unknown-unknown` for the browser wallet, where stderr
+/// write failure is not a question worth answering at runtime. `writeln!`
+/// returns a `Result` we can silently discard instead. This crate has no
+/// logging framework and must not gain one (same WASM constraint), so stderr
+/// via stdlib is the deliberate, permanent choice here, not a placeholder.
+fn log_build_identity_once(config_network: &str) {
+    use std::io::Write;
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let _ = writeln!(
+            std::io::stderr(),
+            "psy build identity: stage={} magic={:#018X} config_network={}",
+            CURRENT_NETWORK,
+            PSY_NETWORK_MAGIC,
+            config_network
+        );
+        #[cfg(test)]
+        BUILD_IDENTITY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
 
 impl<F: RichField> PsyConfig<F> {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
@@ -608,15 +645,7 @@ impl<F: RichField> PsyConfig<F> {
                 binary_network: CURRENT_NETWORK,
             });
         }
-        static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
-            eprintln!(
-                "psy build identity: stage={} magic={:#018X} config_network={}",
-                CURRENT_NETWORK, PSY_NETWORK_MAGIC, self.current_network
-            );
-            #[cfg(test)]
-            BUILD_IDENTITY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        });
+        log_build_identity_once(&self.current_network);
         Ok(())
     }
 
