@@ -41,7 +41,39 @@ if [ -z "${hosts//[[:space:]]/}" ]; then
   echo "IDENTITY_HOSTS is set but contains no host names" >&2
   exit 1
 fi
-units="${IDENTITY_UNITS:-psy-coordinator psy-realm0 psy-realm1 psy-worker psy-prove-proxy psy-system-prove-proxy psy-faucet psy-relayer}"
+# Only units whose binary actually loads psy_config (and therefore can ever
+# print the "psy build identity" line) belong in this default list. The
+# default is deliberately narrower than "everything parth-* deploys":
+#
+#   - coordinator-processor/coordinator-edge/realm-processor/realm-edge run
+#     psy_node_cli, which has no dependency -- direct or transitive -- on
+#     psy_config (verified against psy_cli/psy_node_cli/Cargo.toml and every
+#     Cargo.toml under psy_node*/psy_worker* for a psy_config reference).
+#   - worker runs psy_worker_cli, which lists psy_provider as a Cargo
+#     dependency (and psy_provider does depend on psy_config), but nothing
+#     under psy_cli/psy_worker_cli/src ever calls psy_provider's
+#     config-loading path (RpcProvider::new_with_config_path /
+#     PsyConfigGoldilocks::from_file). psy_config is linked into the binary
+#     but never executed, so verify_chain_identity() -- and the log line --
+#     never runs.
+#
+# prove-proxy and faucet-server both run as `psy_user_cli` subcommands that
+# call psy_prover::run_prove_proxy_server / run_psy_faucet_server, which do
+# call PsyConfigGoldilocks::from_file; relayer runs psy_relayer_cli, which
+# depends on psy_config directly. Those three genuinely emit the line.
+#
+# Real service names are defined in deploy/gcp/deploy-*.sh via
+# deploy_parth_service (see deploy/gcp/lib/common.sh); parth-prove-proxy is a
+# systemd template unit instantiated per DEPLOY_INSTANCE (default 0 -- see
+# deploy/gcp/deploy-prove-proxy.sh). A second "system" prove-proxy instance
+# (parth-prove-proxy@2.service) only exists when DEPLOY_SYSTEM_PROVE_PROXY=1
+# was set at deploy time, so it is intentionally left out of the default and
+# must be added via IDENTITY_UNITS on deployments that enabled it.
+#
+# psy-services and psy-indexer are separate binaries not covered by this
+# audit; add them to IDENTITY_UNITS explicitly if/when they gain their own
+# build-identity log line.
+units="${IDENTITY_UNITS:-parth-prove-proxy@0.service parth-faucet-server.service parth-relayer.service}"
 since="${IDENTITY_SINCE:--2h}"
 zone_flag=()
 if [ -n "${IDENTITY_ZONE:-}" ]; then

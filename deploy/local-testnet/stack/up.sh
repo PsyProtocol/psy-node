@@ -45,6 +45,11 @@ local_staging_source_env_defaults "$SCRIPT_DIR/local.env"
 : "${LOCAL_STAGING_L1_RPC_PORT:=8545}"
 : "${LOCAL_STAGING_INDEXER_PORT:=8080}"
 : "${LOCAL_STAGING_NETWORK:=local-devnet}"
+# The Psy stage (PSY_NETWORK at build time / VITE_PSY_STAGE at frontend build
+# time) is a separate namespace from LOCAL_STAGING_CHAIN_CONFIG_NETWORK /
+# LOCAL_STAGING_FRONTEND_NETWORK, which name an L1/genesis-key network (e.g.
+# "bsc-testnet") and are not always a valid Psy stage name.
+: "${LOCAL_STAGING_PSY_STAGE:=localhost}"
 : "${LOCAL_STAGING_PROVING_BACKEND:=plonky2-poseidon-goldilocks}"
 : "${LOCAL_STAGING_RUST_LOG:=info}"
 : "${LOCAL_REDIS_PORT:=6379}"
@@ -153,7 +158,7 @@ generate_local_genesis_data() {
     echo "[local-staging] linking genesis generator with LLD to limit peak memory"
     env \
       CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" \
-      PSY_NETWORK="${LOCAL_STAGING_CHAIN_CONFIG_NETWORK:-localhost}" \
+      PSY_NETWORK="${LOCAL_STAGING_PSY_STAGE:-localhost}" \
       PSY_GENESIS_OUTPUT_PATH="$GENESIS_PATH" \
       PSY_PRIVATE_KEYS_OUTPUT_PATH="$PRIVATE_KEYS_PATH" \
       PSY_FAUCET_OPERATORS_OUTPUT_PATH="$PSY_FAUCET_TEMPLATE_JSON_PATH" \
@@ -162,7 +167,7 @@ generate_local_genesis_data() {
       cargo "${cargo_args[@]}"
   else
     CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" \
-      PSY_NETWORK="${LOCAL_STAGING_CHAIN_CONFIG_NETWORK:-localhost}" \
+      PSY_NETWORK="${LOCAL_STAGING_PSY_STAGE:-localhost}" \
       PSY_GENESIS_OUTPUT_PATH="$GENESIS_PATH" \
       PSY_PRIVATE_KEYS_OUTPUT_PATH="$PRIVATE_KEYS_PATH" \
       PSY_FAUCET_OPERATORS_OUTPUT_PATH="$PSY_FAUCET_TEMPLATE_JSON_PATH" \
@@ -802,7 +807,7 @@ main() {
         exit 1
       }
       echo "[local-staging] building psy_user_cli"
-      CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" PSY_NETWORK="${LOCAL_STAGING_CHAIN_CONFIG_NETWORK:-localhost}" cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_user_cli
+      CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" PSY_NETWORK="${LOCAL_STAGING_PSY_STAGE:-localhost}" cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_user_cli
     fi
     require_file "$LOCAL_STAGING_TOOLS_PARTH_DIR/deploy/bin/run-parth-service"
     require_file "$RPC_CONFIG"
@@ -822,7 +827,7 @@ main() {
 
   if [ "$LOCAL_STAGING_BUILD" = "1" ]; then
     echo "[local-staging] building parth release binaries"
-    CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" PSY_NETWORK="${LOCAL_STAGING_CHAIN_CONFIG_NETWORK:-localhost}" cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_node_cli --bin psy_worker_cli --bin psy_user_cli
+    CARGO_TARGET_DIR="$LOCAL_STAGING_TARGET_DIR" PSY_NETWORK="${LOCAL_STAGING_PSY_STAGE:-localhost}" cargo build --manifest-path "$PARTH_DIR/Cargo.toml" --release --bin psy_node_cli --bin psy_worker_cli --bin psy_user_cli
     if [ "$LOCAL_STAGING_START_PSY_SERVICES" = "1" ] || [ "$LOCAL_STAGING_START_INDEXERS" = "1" ]; then
       echo "[local-staging] building psy-services release binaries"
       CARGO_TARGET_DIR="$LOCAL_STAGING_PSY_SERVICES_TARGET_DIR" cargo build --manifest-path "$PSY_SERVICES_HOME/Cargo.toml" --release --bin psy-services --bin psy-indexer

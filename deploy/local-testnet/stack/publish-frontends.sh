@@ -22,6 +22,11 @@ local_staging_source_env_defaults "$SCRIPT_DIR/local.env"
 : "${LOCAL_STAGING_ALLOW_PUBLISH_WITH_CF:=0}"
 : "${LOCAL_STAGING_PSY_DAPP_DIR:=$PARTH_DIR/psy-dapp}"
 : "${LOCAL_STAGING_FRONTEND_NETWORK:=localhost}"
+# The Psy stage (VITE_PSY_STAGE) is a separate namespace from
+# LOCAL_STAGING_FRONTEND_NETWORK, which names an L1/genesis-key network (e.g.
+# "bsc-testnet") and is not always a valid Psy stage name -- see
+# deploy/local-testnet/stack/up.sh.
+: "${LOCAL_STAGING_PSY_STAGE:=localhost}"
 
 NGINX_ROOT="${LOCAL_STAGING_NGINX_ROOT:-$LOCAL_STAGING_STATE_DIR/nginx/html}"
 APP_DIR="$LOCAL_STAGING_PSY_DAPP_DIR/apps/bridge"
@@ -81,7 +86,7 @@ build_frontend() {
       exit 1
     fi
     echo "[local-staging] building $label"
-    (cd "$dir" && PSY_SKIP_CONFIG_SYNC=1 VITE_PSY_STAGE="$LOCAL_STAGING_FRONTEND_NETWORK" VITE_NETWORK="${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:-localhost}" pnpm run build)
+    (cd "$dir" && PSY_SKIP_CONFIG_SYNC=1 VITE_PSY_STAGE="$LOCAL_STAGING_PSY_STAGE" VITE_NETWORK="${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:-localhost}" pnpm run build)
   fi
 
   [ -d "$dir/dist" ] || {
@@ -114,7 +119,7 @@ publish_wallet_downloads() {
       exit 1
     fi
     echo "[local-staging] building wallet package ($LOCAL_STAGING_WALLET_BUILD_SCRIPT)"
-    (cd "$PSY_WALLET_DIR" && VITE_PSY_STAGE="$LOCAL_STAGING_FRONTEND_NETWORK" VITE_NETWORK="${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:-localhost}" pnpm "$LOCAL_STAGING_WALLET_BUILD_SCRIPT")
+    (cd "$PSY_WALLET_DIR" && VITE_PSY_STAGE="$LOCAL_STAGING_PSY_STAGE" VITE_NETWORK="${LOCAL_STAGING_L1_DEPLOYMENTS_NETWORK:-localhost}" pnpm "$LOCAL_STAGING_WALLET_BUILD_SCRIPT")
   fi
 
   if [ -d "$PSY_WALLET_DIR/$LOCAL_STAGING_WALLET_RELEASE_DIR" ]; then
