@@ -255,6 +255,22 @@ const L1_TO_STAGE: Partial<Record<L1DeploymentNetwork, PsyStage>> = Object.fromE
     (Object.entries(STAGE_DEFAULT_L1) as [PsyStage, L1NetworkName][]).map(([stage, l1]) => [l1, stage]),
 );
 
+// The env var that holds the RPC URL to fork/connect to a given L1 network
+// is a property of the L1 network, not of the Psy stage: you can run
+// VITE_PSY_STAGE=localhost (a local Psy chain / genesis block) while
+// VITE_NETWORK=sepolia VITE_FORK=true forks public Sepolia underneath it,
+// and that combination must not require picking a non-local stage just to
+// name an L1 RPC source — that would recouple the two namespaces this
+// rename is meant to separate. The genesis config's per-stage
+// anvilForkSourceUrlEnv (when the selected stage happens to define one)
+// stays authoritative as an override; this table is the L1-owned fallback.
+// Phase 2 moves this table into psy-contracts' protocol config, which is
+// the real L1-owned home for it.
+const L1_FORK_RPC_ENV: Partial<Record<L1NetworkName, string>> = {
+    sepolia: "SEPOLIA_RPC_URL",
+    ethereum: "ETH_RPC_URL",
+};
+
 function resolveStage(): PsyStage {
     const value = (process.env.VITE_PSY_STAGE || "localhost").trim().toLowerCase();
     if (value === "localhost" || value === "testnet" || value === "mainnet") return value;
@@ -518,14 +534,31 @@ function resolveLocalL1RpcUrl(port: number): string {
     return `http://${rpcHost}:${port}`;
 }
 
-function resolveExternalL1RpcUrl(network: Exclude<L1NetworkName, "localhost">, cfgEntry: ConfigNetworkEntry | undefined): string {
-    const envKey = cfgEntry?.anvilForkSourceUrlEnv;
-    const rpcUrl = envKey ? process.env[envKey] : undefined;
-    if (!rpcUrl || rpcUrl.trim().length === 0) {
-        throw new Error(`[DevNet] ${envKey ?? "RPC URL env"} is required when VITE_NETWORK=${network}`);
+// The genesis config's per-stage anvilForkSourceUrlEnv (when the selected
+// stage happens to define one) is authoritative; otherwise fall back to
+// the L1-owned L1_FORK_RPC_ENV table so forking a public L1
+// (VITE_NETWORK=sepolia VITE_FORK=true) works regardless of which Psy
+// stage (VITE_PSY_STAGE) is selected. Shared by every caller that needs
+// the fork/external RPC source env-var name for an L1 network, so the two
+// knobs stay named consistently in every error message.
+export function resolveForkRpcEnvKey(l1Network: L1NetworkName, cfgEntry: ConfigNetworkEntry | undefined): string {
+    const envKey = cfgEntry?.anvilForkSourceUrlEnv ?? L1_FORK_RPC_ENV[l1Network];
+    if (!envKey) {
+        throw new Error(
+            `[DevNet] no fork RPC env is known for VITE_NETWORK=${l1Network}; ` +
+            `VITE_NETWORK must be one of the L1 names with a known fork source (${Object.keys(L1_FORK_RPC_ENV).join(", ")})`,
+        );
     }
-    const trimmed = rpcUrl.trim();
-    return trimmed;
+    return envKey;
+}
+
+function resolveExternalL1RpcUrl(network: Exclude<L1NetworkName, "localhost">, cfgEntry: ConfigNetworkEntry | undefined): string {
+    const envKey = resolveForkRpcEnvKey(network, cfgEntry);
+    const rpcUrl = process.env[envKey];
+    if (!rpcUrl || rpcUrl.trim().length === 0) {
+        throw new Error(`[DevNet] ${envKey} is required when VITE_NETWORK=${network}`);
+    }
+    return rpcUrl.trim();
 }
 
 function shouldRedeployL1(): boolean {
@@ -3902,8 +3935,7 @@ class DevNetProcessManager {
                 const effectiveL1ChainId = protocolConfig.chains.localhost.l1ChainId;
                 const l1ForkArgs = ['anvil', '--host', '0.0.0.0', '--port', String(l1Port), '--chain-id', String(effectiveL1ChainId), '--steps-tracing', '-vvvv'];
                 if (l1Fork) {
-                    const forkEnvKey = cfgEntry.anvilForkSourceUrlEnv;
-                    if (!forkEnvKey) throw new Error(`[DevNet] cannot fork ${l1Network}: missing anvilForkSourceUrlEnv in config.json`);
+                    const forkEnvKey = resolveForkRpcEnvKey(l1Network, cfgEntry);
                     const forkRpcUrl = process.env[forkEnvKey];
                     if (!forkRpcUrl) {
                         throw new Error(`[DevNet] VITE_FORK=true requires env ${forkEnvKey}`);
@@ -4990,7 +5022,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    - No options specified starts the full system (all components)
    - Set VITE_PSY_STAGE=localhost|testnet|mainnet to choose the Psy stage (genesis config block)
    - Set VITE_NETWORK=localhost|sepolia|ethereum to choose the L1 target network (defaults to the stage's default L1)
-   - Set VITE_NETWORK=<sepolia|ethereum> and VITE_FORK=true to run anvil in fork mode
+   - Set VITE_NETWORK=<sepolia|ethereum> and VITE_FORK=true to run anvil in fork mode; this forks the L1 named by VITE_NETWORK regardless of VITE_PSY_STAGE (VITE_PSY_STAGE picks the Psy genesis block, VITE_NETWORK+VITE_FORK pick the L1 to fork — e.g. VITE_PSY_STAGE=localhost VITE_NETWORK=sepolia VITE_FORK=true runs a local Psy chain forking public Sepolia); requires SEPOLIA_RPC_URL or ETH_RPC_URL to be set
    - Optionally set VITE_FORK_BLOCK_NUMBER=<block> to pin the fork block
    - PSY_SKIP_BRANCH_CHECK=0  explicitly enable repo fetch/checkout (default: leave every HEAD untouched)
    - PSY_SKIP_KEYSTORE=1      keep local ~/.psy/keystore (skip S3 download/hash refresh)
