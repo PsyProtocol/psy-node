@@ -48,8 +48,8 @@ fmt:
 	@cd $(ROOT_DIR) && cargo fmt
 
 install:
-	@cd $(ROOT_DIR) && cargo install --path client_prover/psy_cli/psy_user_cli --locked
-	@cd $(ROOT_DIR) && cargo install --path client_prover/psy_mcp_server --locked
+	@$(CARGO) install --path client_prover/psy_cli/psy_user_cli --locked
+	@$(CARGO) install --path client_prover/psy_mcp_server --locked
 
 clean:
 	@cd $(ROOT_DIR) && rm -rf target

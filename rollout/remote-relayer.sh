@@ -50,7 +50,7 @@ if [ "$action" = rollback ]; then restore; exit; fi
 (cd "$HERE/out" && sha256sum -c SHA256SUMS)
 test "$(cat "$HERE/out/SOURCE_COMMIT")" = 3a81f59e0cf9333fc2ad4aefda7c83787660c9ab
 "$HERE/out/psy_relayer_cli" --help >/dev/null
-test "$(jq -r .defaultNetwork "$config")" = localhost
+test "$(jq -r .defaultNetwork "$config")" = testnet
 systemctl is-active --quiet "$unit"
 release=$(readlink -f /opt/parth/current)
 bin="$release/target/release/psy_relayer_cli"

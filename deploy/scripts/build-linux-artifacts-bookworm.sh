@@ -158,7 +158,7 @@ docker run \
 
     if [ "$BUILD_PARTH_BINARIES" = "1" ]; then
       cd "$PARTH_WORKDIR"
-      PSY_CONFIG_PATH="$PARTH_WORKDIR/psy-genesis/config.json" \
+      PSY_CONFIG_PATH="$PARTH_WORKDIR/psy-genesis/config.json" PSY_NETWORK="${PSY_NETWORK:-testnet}" \
         cargo +nightly build --release \
           --bin psy_node_cli \
           --bin psy_worker_cli \

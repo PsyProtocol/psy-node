@@ -115,7 +115,7 @@ with open(source, "r", encoding="utf-8") as f:
     data = json.load(f)
 
 networks = data.setdefault("networks", {})
-base = copy.deepcopy(networks.get("staging") or networks.get("localhost") or {})
+base = copy.deepcopy(networks.get("staging") or networks.get("testnet") or {})
 base["coordinator_configs"] = [{"id": 0, "rpc_url": [coordinator]}]
 base["realm_configs"] = [
     {"id": 0, "rpc_url": [realm0]},
@@ -123,7 +123,8 @@ base["realm_configs"] = [
 ]
 base["prove_proxy_url"] = [prove_proxy]
 base["api_services_url"] = [services]
-networks["localhost"] = base
+networks["testnet"] = base
+data["defaultNetwork"] = "testnet"
 
 with open(target, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
@@ -136,7 +137,7 @@ import json
 import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as f:
-    net = json.load(f)["networks"]["localhost"]
+    net = json.load(f)["networks"]["testnet"]
 
 print("  coordinator: " + net["coordinator_configs"][0]["rpc_url"][0])
 print("  realm0:      " + net["realm_configs"][0]["rpc_url"][0])

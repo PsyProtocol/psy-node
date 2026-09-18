@@ -28,7 +28,7 @@ docker run --rm "${auth[@]}" \
     set -euo pipefail
     export PATH="/usr/local/go/bin:/usr/local/cargo/bin:$PATH"
     trap '\''chown -R "$HOST_UID:$HOST_GID" /psy-node/target'\'' EXIT
-    PSY_CONFIG_PATH=/psy-node/psy-genesis/config.json \
+    PSY_CONFIG_PATH=/psy-node/psy-genesis/config.json PSY_NETWORK="${PSY_NETWORK:-testnet}" \
       cargo +nightly build --locked --release --bin psy_relayer_cli
     rustc +nightly --version > target/release/role-build-toolchain.txt
   '

@@ -108,24 +108,32 @@ render_client_prover_config() {
   echo "  prove proxy: ${prove_proxy_url}" >&2
   echo "  system prove proxy: ${system_prove_proxy_url}" >&2
   echo "  services:    ${psy_services_url}" >&2
+  echo "  stage:       ${DEPLOY_PSY_STAGE:-testnet}" >&2
 
   python3 - "$source_config" "$target_config" \
-    "$coordinator_url" "$realm_urls" "$prove_proxy_url" "$psy_services_url" "$system_prove_proxy_url" <<'PY'
+    "$coordinator_url" "$realm_urls" "$prove_proxy_url" "$psy_services_url" "$system_prove_proxy_url" \
+    "${DEPLOY_PSY_STAGE:-testnet}" <<'PY'
 import json
 import sys
 
-source, target, coordinator, realms_csv, prove_proxy, services, system_prove_proxy = sys.argv[1:]
+source, target, coordinator, realms_csv, prove_proxy, services, system_prove_proxy, stage = sys.argv[1:]
 
 with open(source, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-localhost = data.setdefault("networks", {}).setdefault("localhost", {})
-localhost["coordinator_configs"] = [{"id": 0, "rpc_url": [coordinator]}]
+# 从前这里无条件改写 networks.localhost，于是 staging 实际跑的是 localhost 块。
+# 现在按阶段填，并把 defaultNetwork 一起写死，免得二进制与配置对不上。
+networks = data.setdefault("networks", {})
+if stage not in networks:
+    raise SystemExit(f"source config has no networks.{stage}")
+block = networks[stage]
+block["coordinator_configs"] = [{"id": 0, "rpc_url": [coordinator]}]
 realms = [item.strip() for item in realms_csv.split(",") if item.strip()]
-localhost["realm_configs"] = [{"id": idx, "rpc_url": [url]} for idx, url in enumerate(realms)]
-localhost["prove_proxy_url"] = [prove_proxy]
-localhost["system_prove_proxy_url"] = [system_prove_proxy]
-localhost["api_services_url"] = [services]
+block["realm_configs"] = [{"id": idx, "rpc_url": [url]} for idx, url in enumerate(realms)]
+block["prove_proxy_url"] = [prove_proxy]
+block["system_prove_proxy_url"] = [system_prove_proxy]
+block["api_services_url"] = [services]
+data["defaultNetwork"] = stage
 
 with open(target, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)

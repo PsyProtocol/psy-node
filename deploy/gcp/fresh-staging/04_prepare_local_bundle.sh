@@ -171,5 +171,5 @@ grep -Fx "GENESIS_CONTRACTS_SHA256=$(sha256sum "$PSY_GENESIS_DIR/genesis_contrac
   exit 1
 }
 cat "$bundle_manifest"
-tar -xOf "$bundle" ./client_prover/config.json | jq '.networks.localhost.realm_configs'
+tar -xOf "$bundle" ./client_prover/config.json | jq '.networks.testnet.realm_configs'
 du -h "$bundle"

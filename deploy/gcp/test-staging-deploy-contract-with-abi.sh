@@ -80,7 +80,7 @@ with open(source, "r", encoding="utf-8") as f:
     data = json.load(f)
 
 networks = data.setdefault("networks", {})
-base = copy.deepcopy(networks.get("staging") or networks.get("localhost") or {})
+base = copy.deepcopy(networks.get("staging") or networks.get("testnet") or {})
 base["coordinator_configs"] = [{"id": 0, "rpc_url": [coordinator]}]
 base["realm_configs"] = [
     {"id": 0, "rpc_url": [realm0]},
@@ -88,8 +88,8 @@ base["realm_configs"] = [
 ]
 base["prove_proxy_url"] = [prove_proxy]
 base["api_services_url"] = [services]
-networks["localhost"] = base
-data["defaultNetwork"] = "localhost"
+networks["testnet"] = base
+data["defaultNetwork"] = "testnet"
 
 with open(target, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)

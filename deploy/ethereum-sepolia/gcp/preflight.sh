@@ -36,7 +36,7 @@ set +a
 }
 
 jq -e '
-  .networks.sepolia
+  .networks.testnet
   | .coordinator_configs[0].rpc_url[0] == "https://coordinator-stg.psy-protocol.xyz"
     and .realm_configs[0].rpc_url[0] == "https://realm0-stg.psy-protocol.xyz"
     and .realm_configs[1].rpc_url[0] == "https://realm1-stg.psy-protocol.xyz"

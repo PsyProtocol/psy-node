@@ -30,6 +30,7 @@ RUN curl -fsSL "https://golang.google.cn/dl/go1.24.5.linux-${TARGETARCH}.tar.gz"
     && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
     && git config --global --add url."https://github.com/".insteadOf "git@github.com:"
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV PSY_NETWORK=localhost
 COPY . .
 RUN cargo build --release -p psy_mcp_server
 
