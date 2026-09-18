@@ -527,6 +527,48 @@ pub struct PsyConfig<F: RichField> {
     nodes_config: Option<NodesConfig<F>>,
 }
 
+// Test-only counter proving the build-identity log below fires at most once
+// per process, no matter how many times config is loaded.
+#[cfg(test)]
+static BUILD_IDENTITY_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Feeds the post-deploy build-identity collection gate (Gate 1): after a
+/// deploy, a collector script greps every process's log for this exact line
+/// to confirm they all agree on which chain they were built for. The format
+/// is a grep contract shared with that script — do not change it without
+/// updating the collector too.
+///
+/// This is a free function, not a method on `PsyConfig<F>`, on purpose: a
+/// `static` inside a generic function or generic impl is monomorphized once
+/// per concrete `F`, so each instantiation would get its own `Once` and the
+/// line could print once per type parameter instead of once per process.
+/// Keeping the `Once` here, outside any generic context, makes "once per
+/// process" hold by construction rather than by the accident that today only
+/// `PsyConfigGoldilocks` is ever used.
+///
+/// Writes via `std::io::stderr()` + `writeln!` rather than `eprintln!`:
+/// `eprintln!` panics if the underlying write fails, and this crate also
+/// compiles to `wasm32-unknown-unknown` for the browser wallet, where stderr
+/// write failure is not a question worth answering at runtime. `writeln!`
+/// returns a `Result` we can silently discard instead. This crate has no
+/// logging framework and must not gain one (same WASM constraint), so stderr
+/// via stdlib is the deliberate, permanent choice here, not a placeholder.
+fn log_build_identity_once(config_network: &str) {
+    use std::io::Write;
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let _ = writeln!(
+            std::io::stderr(),
+            "psy build identity: stage={} magic={:#018X} config_network={}",
+            CURRENT_NETWORK,
+            PSY_NETWORK_MAGIC,
+            config_network
+        );
+        #[cfg(test)]
+        BUILD_IDENTITY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
 impl<F: RichField> PsyConfig<F> {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
         let content = match std::fs::read_to_string(path) {
@@ -603,6 +645,7 @@ impl<F: RichField> PsyConfig<F> {
                 binary_network: CURRENT_NETWORK,
             });
         }
+        log_build_identity_once(&self.current_network);
         Ok(())
     }
 
@@ -1026,5 +1069,37 @@ mod tests {
         // 查看用的入口不校验，chain-info 这类工具靠它。
         config.use_network_unchecked("mainnet").unwrap();
         assert_eq!(config.current_network_name(), "mainnet");
+    }
+
+    #[test]
+    fn build_identity_log_fires_at_most_once_per_process() {
+        let json = config_json(
+            "testnet",
+            &[("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "0"))],
+        );
+
+        // Load config twice, and call verify_chain_identity directly a couple
+        // more times on top of that. Every one of these calls goes through
+        // the same `LOGGED.call_once` in verify_chain_identity.
+        let config1 = PsyConfigGoldilocks::from_json(&json).unwrap();
+        let config2 = PsyConfigGoldilocks::from_json(&json).unwrap();
+        config1.verify_chain_identity().unwrap();
+        config2.verify_chain_identity().unwrap();
+
+        // std::sync::Once guarantees the call_once body runs exactly once for
+        // the whole process, no matter how many times *any* test in this
+        // binary loads a config (cargo test runs all tests in one process).
+        // So this counter can only ever be 0 (no config loaded anywhere yet)
+        // or 1 (it has, exactly once) -- never more, even though this test
+        // alone triggers the check 4 times. That's the once-per-process
+        // property. What this does NOT prove: the exact text of the printed
+        // line, or that it went to stderr rather than stdout -- this crate
+        // has no logging framework to capture output, so that was checked by
+        // hand instead (see task report).
+        let count = BUILD_IDENTITY_LOG_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "the build-identity log must fire exactly once per process, got {count}"
+        );
     }
 }
