@@ -534,15 +534,20 @@ function resolveLocalL1RpcUrl(port: number): string {
     return `http://${rpcHost}:${port}`;
 }
 
-// The genesis config's per-stage anvilForkSourceUrlEnv (when the selected
-// stage happens to define one) is authoritative; otherwise fall back to
-// the L1-owned L1_FORK_RPC_ENV table so forking a public L1
+// The genesis config's per-stage anvilForkSourceUrlEnv is only authoritative
+// when the requested L1 network is that stage's own default L1 (see
+// STAGE_DEFAULT_L1) — it names the fork source for the stage's usual L1,
+// not for whichever L1 happens to be requested. Otherwise fall back to the
+// L1-owned L1_FORK_RPC_ENV table so forking a public L1
 // (VITE_NETWORK=sepolia VITE_FORK=true) works regardless of which Psy
-// stage (VITE_PSY_STAGE) is selected. Shared by every caller that needs
-// the fork/external RPC source env-var name for an L1 network, so the two
-// knobs stay named consistently in every error message.
-export function resolveForkRpcEnvKey(l1Network: L1NetworkName, cfgEntry: ConfigNetworkEntry | undefined): string {
-    const envKey = cfgEntry?.anvilForkSourceUrlEnv ?? L1_FORK_RPC_ENV[l1Network];
+// stage (VITE_PSY_STAGE) is selected, and so a mismatched pair like
+// VITE_PSY_STAGE=testnet VITE_NETWORK=ethereum does not silently borrow
+// testnet's Sepolia fork source for an Ethereum fork. Shared by every
+// caller that needs the fork/external RPC source env-var name for an L1
+// network, so the two knobs stay named consistently in every error message.
+export function resolveForkRpcEnvKey(l1Network: L1NetworkName, cfgEntry: ConfigNetworkEntry | undefined, stage: PsyStage): string {
+    const cfgEnvKey = STAGE_DEFAULT_L1[stage] === l1Network ? cfgEntry?.anvilForkSourceUrlEnv : undefined;
+    const envKey = cfgEnvKey ?? L1_FORK_RPC_ENV[l1Network];
     if (!envKey) {
         throw new Error(
             `[DevNet] no fork RPC env is known for VITE_NETWORK=${l1Network}; ` +
@@ -552,8 +557,8 @@ export function resolveForkRpcEnvKey(l1Network: L1NetworkName, cfgEntry: ConfigN
     return envKey;
 }
 
-function resolveExternalL1RpcUrl(network: Exclude<L1NetworkName, "localhost">, cfgEntry: ConfigNetworkEntry | undefined): string {
-    const envKey = resolveForkRpcEnvKey(network, cfgEntry);
+function resolveExternalL1RpcUrl(network: Exclude<L1NetworkName, "localhost">, cfgEntry: ConfigNetworkEntry | undefined, stage: PsyStage): string {
+    const envKey = resolveForkRpcEnvKey(network, cfgEntry, stage);
     const rpcUrl = process.env[envKey];
     if (!rpcUrl || rpcUrl.trim().length === 0) {
         throw new Error(`[DevNet] ${envKey} is required when VITE_NETWORK=${network}`);
@@ -3433,7 +3438,7 @@ class DevNetProcessManager {
         const { stage, l1Network, l1Fork, cfgEntry } = resolveL1Selection();
         const deploymentsNetwork: L1NetworkName = l1Fork ? "localhost" : l1Network;
         const localL1RpcUrl = resolveLocalL1RpcUrl(l1Port);
-        const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network, cfgEntry);
+        const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network, cfgEntry, stage);
         const relayerChains = deploymentsNetwork.startsWith('localhost')
             ? [
                 { chainIndex: 0, networkId: 'localhost', deploymentsNetwork: 'localhost', rpcUrl: l1RpcUrl },
@@ -3935,7 +3940,7 @@ class DevNetProcessManager {
                 const effectiveL1ChainId = protocolConfig.chains.localhost.l1ChainId;
                 const l1ForkArgs = ['anvil', '--host', '0.0.0.0', '--port', String(l1Port), '--chain-id', String(effectiveL1ChainId), '--steps-tracing', '-vvvv'];
                 if (l1Fork) {
-                    const forkEnvKey = resolveForkRpcEnvKey(l1Network, cfgEntry);
+                    const forkEnvKey = resolveForkRpcEnvKey(l1Network, cfgEntry, stage);
                     const forkRpcUrl = process.env[forkEnvKey];
                     if (!forkRpcUrl) {
                         throw new Error(`[DevNet] VITE_FORK=true requires env ${forkEnvKey}`);
@@ -4918,9 +4923,9 @@ async function runMain() {
     const envString = values["env"];
     const help = !!values["help"];
     const l1Port = values["l1-port"] ? parseInt(values["l1-port"] as string, 10) : 8545;
-    const { l1Network, l1Fork, cfgEntry } = resolveL1Selection();
+    const { stage, l1Network, l1Fork, cfgEntry } = resolveL1Selection();
     const localL1RpcUrl = resolveLocalL1RpcUrl(l1Port);
-    const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network, cfgEntry);
+    const l1RpcUrl = (l1Network === "localhost" || l1Fork) ? localL1RpcUrl : resolveExternalL1RpcUrl(l1Network, cfgEntry, stage);
 
     const envVars: { [key: string]: string } = envString ? parseEnvAssignments(envString) : {};
 

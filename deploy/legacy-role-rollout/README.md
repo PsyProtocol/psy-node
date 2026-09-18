@@ -1,5 +1,9 @@
 # Two-process prove-proxy rollout
 
+Historical, revision-pinned rollout retained under `deploy/` for reference.
+For a new deployment use `deploy/multi-chain/gcp/deploy_all.sh`; these scripts
+target the old release below and are not the new stage-release entry point.
+
 Runtime: `3a81f59e0cf9333fc2ad4aefda7c83787660c9ab`.
 Supersedes the earlier single-process role=all plan. Do not use the original
 untracked 02/03 rollout prototypes.
@@ -24,8 +28,8 @@ No role env override is needed for the current topology.
 
 ## Order
 
-1. Build: `BOOKWORM_BUILD_GITHUB_SSH_KEY=$HOME/.ssh/id_ed25519 bash rollout/build-relayer-only.sh`
-2. Stage: `bash rollout/stage-role-release.sh relayer` and `bash rollout/stage-role-release.sh proxy`.
+1. Build: `BOOKWORM_BUILD_GITHUB_SSH_KEY=$HOME/.ssh/id_ed25519 bash deploy/legacy-role-rollout/build-relayer-only.sh`
+2. Stage: `bash deploy/legacy-role-rollout/stage-role-release.sh relayer` and `bash deploy/legacy-role-rollout/stage-role-release.sh proxy`.
 3. Upload gateway-system-proxy.sh to gcp-gateway, then run it with sudo and
    argument deploy. This adds only the private 19998 listener; no WireGuard,
    existing forwarding, DNS or Caddy change. Socket ingress permits only
@@ -65,7 +69,7 @@ the new relayer cannot use a stopped system port.
 
 ## Verification
 
-Run `bash rollout/test-split-role.sh` and ShellCheck before staging.
+Run `bash deploy/legacy-role-rollout/test-split-role.sh` and ShellCheck before staging.
 Remote proxy verify checks both capabilities, different PIDs and disallowed
 method boundaries without generating proofs. Deployment checks preserved
 genesis/config/binary/env checksums. Relayer requires a handshake in the new

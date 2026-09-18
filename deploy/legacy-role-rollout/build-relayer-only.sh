@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-WORKSPACE_HOME=${WORKSPACE_HOME:-$(cd "$HERE/../.." && pwd)}
+WORKSPACE_HOME=${WORKSPACE_HOME:-$(cd "$HERE/../../.." && pwd)}
 SRC=${SRC:-$WORKSPACE_HOME/psy-node-rollout-src}
 EXPECTED=3a81f59e0cf9333fc2ad4aefda7c83787660c9ab
 test "$(git -C "$SRC" rev-parse HEAD)" = "$EXPECTED"

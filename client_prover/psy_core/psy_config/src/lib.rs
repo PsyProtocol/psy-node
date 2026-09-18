@@ -571,6 +571,10 @@ fn log_build_identity_once(config_network: &str) {
 
 impl<F: RichField> PsyConfig<F> {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
+        Self::from_file_with_network(path, None)
+    }
+
+    fn from_file_with_network(path: &str, network: Option<&str>) -> Result<Self, ConfigError> {
         let content = match std::fs::read_to_string(path) {
             Ok(content) => content,
             Err(err) => {
@@ -585,27 +589,14 @@ impl<F: RichField> PsyConfig<F> {
                 }
             }
         };
-        let config: Config<F> = serde_json::from_str(&content)?;
-
-        if !config.networks.contains_key(&config.default_network) {
-            return Err(ConfigError::InvalidConfig(format!(
-                "Configuration must contain '{}' network",
-                config.default_network
-            )));
-        }
-
-        let current_network = config.default_network.clone();
-
-        let config = Self {
-            config,
-            current_network,
-            nodes_config: None,
-        };
-        config.verify_chain_identity()?;
-        Ok(config)
+        Self::from_json_with_network(&content, network)
     }
 
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
+        Self::from_json_with_network(json, None)
+    }
+
+    fn from_json_with_network(json: &str, network: Option<&str>) -> Result<Self, ConfigError> {
         let config: Config<F> = serde_json::from_str(json)?;
 
         if !config.networks.contains_key(&config.default_network) {
@@ -615,7 +606,7 @@ impl<F: RichField> PsyConfig<F> {
             )));
         }
 
-        let current_network = config.default_network.clone();
+        let current_network = network.unwrap_or(&config.default_network).to_string();
 
         let config = Self {
             config,
@@ -755,19 +746,15 @@ impl<F: RichField> PsyConfigBuilder<F> {
 
     pub fn build(self) -> Result<PsyConfig<F>, ConfigError> {
         let mut config = if let Some(json) = self.config_json {
-            PsyConfig::from_json(&json)?
+            PsyConfig::from_json_with_network(&json, self.initial_network.as_deref())?
         } else if let Some(path) = self.config_path {
-            PsyConfig::from_file(&path)?
+            PsyConfig::from_file_with_network(&path, self.initial_network.as_deref())?
         } else {
-            PsyConfig::from_file("config.json")?
+            PsyConfig::from_file_with_network("config.json", self.initial_network.as_deref())?
         };
 
         if let Some(deploy_path) = self.deploy_path {
             config.load_deploy_config(&deploy_path)?;
-        }
-
-        if let Some(network) = self.initial_network {
-            config.use_network(&network)?;
         }
 
         Ok(config)
@@ -865,8 +852,18 @@ impl<F: RichField> GenesisConfig<F> {
 mod tests {
     use super::*;
 
-    const LOCALHOST_MAGIC_HEX: &str = "0x1337CF514544CF69";
-    const TESTNET_MAGIC_HEX: &str = "0x1337CF514544CF69";
+    // Synthetic network names below exercise selection separately from magic.
+    const LOCALHOST_MAGIC_HEX: &str = if PSY_NETWORK_MAGIC == 0x1337CF514544C069 {
+        "0x1337CF514544C069"
+    } else {
+        "0x1337CF514544CF69"
+    };
+    const TESTNET_MAGIC_HEX: &str = LOCALHOST_MAGIC_HEX;
+    const FOREIGN_MAGIC_HEX: &str = if PSY_NETWORK_MAGIC == 0x1337CF514544C069 {
+        "0x1337CF514544CF69"
+    } else {
+        "0x1337CF514544C069"
+    };
 
     /// 一个能被 `NetworkConfig` 正确反序列化的最小网络块。
     /// 真实结构是平铺的：没有 `"network"` 这层包装，`magic` 与 `fees.da_fee` 都是必填。
@@ -917,7 +914,11 @@ mod tests {
             eprintln!("skipping: {} does not exist in this checkout", config_path.display());
             return;
         }
-        let config = PsyConfigGoldilocks::from_file(config_path.to_str().unwrap()).unwrap();
+        let config = PsyConfigGoldilocks::builder()
+            .path(config_path.to_str().unwrap())
+            .network(CURRENT_NETWORK)
+            .build()
+            .unwrap();
         let name = config.current_network_name().to_string();
         assert!(
             ["localhost", "testnet", "mainnet"].contains(&name.as_str()),
@@ -1027,10 +1028,9 @@ mod tests {
 
     #[test]
     fn loading_a_config_whose_magic_differs_from_the_binary_is_refused() {
-        // mainnet 的 magic 与本二进制（localhost/testnet）不同，必须被拒绝。
         let json = config_json(
             "mainnet",
-            &[("mainnet", network_json("0x1337CF514544C069", 1048576, "0"))],
+            &[("mainnet", network_json(FOREIGN_MAGIC_HEX, 1048576, "0"))],
         );
         let err = PsyConfigGoldilocks::from_json(&json).unwrap_err();
         assert!(
@@ -1055,7 +1055,7 @@ mod tests {
             "localhost",
             &[
                 ("localhost", network_json(LOCALHOST_MAGIC_HEX, 1048576, "0")),
-                ("mainnet", network_json("0x1337CF514544C069", 1048576, "0")),
+                ("mainnet", network_json(FOREIGN_MAGIC_HEX, 1048576, "0")),
             ],
         );
         let mut config = PsyConfigGoldilocks::from_json(&json).unwrap();
@@ -1069,6 +1069,25 @@ mod tests {
         // 查看用的入口不校验，chain-info 这类工具靠它。
         config.use_network_unchecked("mainnet").unwrap();
         assert_eq!(config.current_network_name(), "mainnet");
+    }
+
+    #[test]
+    fn builder_validates_the_selected_network_not_the_default() {
+        let json = config_json("foreign", &[
+            ("foreign", network_json(FOREIGN_MAGIC_HEX, 1048576, "0")),
+            ("selected", network_json(TESTNET_MAGIC_HEX, 1048576, "0")),
+        ]);
+        assert!(PsyConfigGoldilocks::from_json(&json).is_err());
+        let config = PsyConfigGoldilocks::builder().json(&json).network("selected").build().unwrap();
+        assert_eq!(config.current_network_name(), "selected");
+        assert!(matches!(
+            PsyConfigGoldilocks::builder().json(&json).network("foreign").build(),
+            Err(ConfigError::ChainIdentityMismatch { .. })
+        ));
+        assert!(matches!(
+            PsyConfigGoldilocks::builder().json(&json).network("missing").build(),
+            Err(ConfigError::NetworkNotFound(_))
+        ));
     }
 
     #[test]
