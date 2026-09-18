@@ -449,11 +449,11 @@ mod tests {
             operators,
         };
 
+        let faucet_config_dir = std::path::Path::new(project_dir)
+            .join("../psy-dapp/apps/bridge/src/config");
+        std::fs::create_dir_all(&faucet_config_dir)?;
         std::fs::write(
-            &format!(
-                "{}/../psy-dapp/apps/bridge/src/config/faucetOperators.json",
-                project_dir
-            ),
+            faucet_config_dir.join("faucetOperators.json"),
             serde_json::to_string_pretty(&faucet_operators)?,
         )?;
 
