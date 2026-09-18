@@ -66,6 +66,9 @@ pub struct NetworkConfig<F: RichField> {
     pub realm_configs: Vec<RealmConfig>,
     pub coordinator_configs: Vec<CoordinatorConfig>,
     pub prove_proxy_url: Vec<String>,
+    /// Dedicated bridge proof pool; relayers must not fall back to the user pool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_prove_proxy_url: Vec<String>,
     pub faucet_rpc_url: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_services_url: Option<Vec<String>>,
@@ -948,6 +951,25 @@ mod tests {
         config.use_network("testnet").unwrap();
         assert_eq!(config.current_network_name(), "testnet");
         assert_eq!(config.get_current_network().unwrap().users_per_realm, 1048576);
+    }
+
+    #[test]
+    fn system_prove_proxy_url_defaults_to_empty_and_reads_when_present() {
+        let json = config_json(
+            "testnet",
+            &[("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "0"))],
+        );
+        let config = PsyConfigGoldilocks::from_json(&json).unwrap();
+        assert!(config.get_current_network().unwrap().system_prove_proxy_url.is_empty());
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["networks"]["testnet"]["system_prove_proxy_url"] =
+            serde_json::json!(["http://127.0.0.1:9997"]);
+        let config = PsyConfigGoldilocks::from_json(&value.to_string()).unwrap();
+        assert_eq!(
+            config.get_current_network().unwrap().system_prove_proxy_url,
+            vec!["http://127.0.0.1:9997"]
+        );
     }
 
     #[test]
