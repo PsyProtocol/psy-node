@@ -32,6 +32,8 @@ Environment overrides:
   RUN_DEPOSIT                Set to 0 to skip deposit and claim
   RUN_WITHDRAW               Set to 0 to skip withdrawal and L1 settlement
   PSY_SERVICES_DB_URL        Defaults to the local multichain services database
+  DEPLOYMENTS_ROOT           Defaults to psy-contracts/deployments under PSY_NODE_DIR
+  RELAYER_PID                If set, require this PID's executable under PSY_NODE_DIR
 USAGE
 }
 
@@ -62,6 +64,7 @@ TOKEN_CONTRACT_ABI="${TOKEN_CONTRACT_ABI:-$PSY_NODE_DIR/psy-genesis/genesis_abi/
 PSY_SERVICES_DB_URL="${PSY_SERVICES_DB_URL:-postgresql://postgres:testing@127.0.0.1:5433/psy_services}"
 FAUCET_RPC_URL="${FAUCET_RPC_URL:-http://127.0.0.1:9998}"
 RELAYER_LOG="${RELAYER_LOG:-$PSY_NODE_DIR/logs/bridge_relayer_logs.txt}"
+DEPLOYMENTS_ROOT="${DEPLOYMENTS_ROOT:-$PSY_NODE_DIR/psy-contracts/deployments}"
 DEPOSIT_AMOUNT="${DEPOSIT_AMOUNT:-1000000}"
 WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-250000}"
 TOKEN_CONTRACT_ID="${TOKEN_CONTRACT_ID:-4}"
@@ -185,7 +188,7 @@ validate_chain() {
   index="$(chain_field "$chain" index)"
   rpc="$(chain_field "$chain" rpc)"
   network="$(chain_field "$chain" network)"
-  deploy_dir="$PSY_NODE_DIR/psy-contracts/deployments/$network"
+  deploy_dir="$DEPLOYMENTS_ROOT/$network"
   for contract in Router Bridge USDTToken ERC20Gateway; do
     require_file "$deploy_dir/$contract.json"
     read_deployed_address "$deploy_dir" "$contract" >/dev/null
@@ -210,7 +213,13 @@ run_preflight() {
     validate_chain "$CHAIN_SELECTION"
   fi
   local relayer_pid
-  relayer_pid="$(pgrep -n -x psy_relayer_cli || true)"
+  if [ -n "${RELAYER_PID:-}" ]; then
+    relayer_pid="$RELAYER_PID"
+    local_deploy_verify_owned_pid "$relayer_pid" "$PSY_NODE_DIR" psy_relayer_cli \
+      || fail "RELAYER_PID does not identify the psy_relayer_cli under PSY_NODE_DIR"
+  else
+    relayer_pid="$(pgrep -n -x psy_relayer_cli || true)"
+  fi
   [ -n "$relayer_pid" ] || fail "psy_relayer_cli is not running"
   log "preflight relayer_pid=$relayer_pid rpc_config=$RPC_CONFIG"
 }
@@ -251,7 +260,7 @@ CHAIN="$CHAIN_SELECTION"
 CHAIN_INDEX="$(chain_field "$CHAIN" index)"
 L1_RPC_URL="$(chain_field "$CHAIN" rpc)"
 DEPLOYMENTS_NETWORK="$(chain_field "$CHAIN" network)"
-DEPLOY_DIR="$PSY_NODE_DIR/psy-contracts/deployments/$DEPLOYMENTS_NETWORK"
+DEPLOY_DIR="$DEPLOYMENTS_ROOT/$DEPLOYMENTS_NETWORK"
 CASE_RESULT_DIR="$RESULT_ROOT/$CHAIN"
 mkdir -p "$CASE_RESULT_DIR"
 

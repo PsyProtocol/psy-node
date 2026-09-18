@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 LOCAL_DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PSY_NODE_DIR="$(cd "$LOCAL_DEPLOY_DIR/../.." && pwd)"
+PSY_NODE_DIR="${PSY_NODE_DIR:-$(cd "$LOCAL_DEPLOY_DIR/../.." && pwd)}"
 LOCAL_DEPLOY_STATE_DIR="${LOCAL_DEPLOY_STATE_DIR:-$LOCAL_DEPLOY_DIR/.runtime}"
 
 load_env_file() {
@@ -14,7 +14,43 @@ load_env_file() {
   set +a
 }
 
-load_env_file "$LOCAL_DEPLOY_DIR/local.env"
+LOCAL_MULTICHAIN_ENV_FILE="${LOCAL_MULTICHAIN_ENV_FILE:-$LOCAL_DEPLOY_DIR/local.env}"
+load_env_file "$LOCAL_MULTICHAIN_ENV_FILE"
+
+local_deploy_verify_owned_pid() {
+  local pid="$1"
+  local expected_root="$2"
+  local expected_name="${3:-}"
+  local executable resolved_root
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || {
+    echo "[local-multichain] invalid process ID: $pid" >&2
+    return 1
+  }
+  kill -0 "$pid" 2>/dev/null || {
+    echo "[local-multichain] process is not running: $pid" >&2
+    return 1
+  }
+  executable="$(readlink -f "/proc/$pid/exe")" || {
+    echo "[local-multichain] cannot resolve executable for process $pid" >&2
+    return 1
+  }
+  resolved_root="$(readlink -f "$expected_root")" || {
+    echo "[local-multichain] cannot resolve expected process root: $expected_root" >&2
+    return 1
+  }
+  case "$executable" in
+    "$resolved_root"/*) ;;
+    *)
+      echo "[local-multichain] process $pid executable is outside $resolved_root: $executable" >&2
+      return 1
+      ;;
+  esac
+  if [ -n "$expected_name" ] && [ "${executable##*/}" != "$expected_name" ]; then
+    echo "[local-multichain] process $pid executable name mismatch: $executable" >&2
+    return 1
+  fi
+}
 
 : "${LOCAL_CF_TUNNEL_NAME:=psy-local-staging}"
 : "${LOCAL_CF_TUNNEL_ID:=}"
