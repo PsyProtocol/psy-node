@@ -2,8 +2,9 @@
 
 Status: source/build preparation complete in part; online release packaging is
 still outstanding. Not yet ready to stop or clear the existing network.
-No online service, database, L1 contract, wallet artifact or frontend was changed
-by this preparation. Do not run the destructive fresh-deployment steps until the
+No online service, database, L1 contract, default wallet download or frontend was
+changed by this preparation. An immutable wallet candidate was uploaded separately.
+Do not run the destructive fresh-deployment steps until the
 remaining gates below are resolved.
 
 ## Operator Update: Online Acceptance Instead Of Local E2E
@@ -39,7 +40,8 @@ The following preparation is complete:
 Before stopping the current network:
 
 1. Produce and inspect the Debian Bookworm-compatible cloud bundle, including
-   services/indexer; keep an independently verified Arch release for offsite hosts.
+   services/indexer. The same GLIBC 2.34 binaries can run on the newer Arch hosts;
+   verify their installed hashes rather than creating an untracked second build.
 2. Use the verified local SDK for matching wallet/DApp builds; SDK upload is
    deferred. The wallet workflow still selects the old `4146f805` archive and
    must not be used to overwrite this candidate.
@@ -61,7 +63,7 @@ deployment scripts remain on `psy-node:deploy/multi-chain-gcp`.
 
 | Repository | Candidate commit | Notes |
 | --- | --- | --- |
-| psy-node | 159c8f9860a3c0ebe8b7db89ab30682eecf1b461 | Runtime fix plus canonical artifact tests, Genesis gitlink and clean-checkout generation fix |
+| psy-node | 32bfd3da73b4f05b9dfe2f3aa2f6b2278aa2a3b6 | Candidate fixes plus dual-role prove-proxy integration and fail-closed system readiness |
 | psy-genesis | cb3ea4a1e743c3c01037ae968e10f27389788a7d | Full generation reproduced twice byte-for-byte |
 | psy-contracts | d23bb8ca60f3da3347c7eb16d1f8c917396c1e7c | Deployment profile gitlink; no product changes in this task |
 | psy-services | 32218c2d417ec3e023e6f81eec34e25f4dad8fe6 | Already on multi_chain; proof compatibility still needs verification |
@@ -76,7 +78,12 @@ artifact is published. Never substitute an existing npm package by version alone
 
 Compiler and SDK Cargo dependencies all use the published node source
 `769711acfe3ba23dc0124f961ff361478e52b89b`. Later Node integration commits
-change only tests, the Genesis gitlink and the test-only Genesis generator.
+through `159c8f98` change only tests, the Genesis gitlink and the test-only
+Genesis generator. Runtime `32bfd3da` additionally integrates native prove-proxy
+roles and relayer routing. It changes no circuit, compiler or generated contract
+input. Existing WASM ignores the optional system URL and continues using the user
+URL. The SDK archive retains its real `769711ac` dependency provenance; it has
+not been relabeled or rebuilt for this native-only behavior change.
 Services retains its older node pin; compatibility still requires real proof
 verification, not an inference from equal tree heights.
 
@@ -120,7 +127,8 @@ Genesis or Groth16 setup compatibility; the remaining gates still apply.
 ## Release blockers
 
 1. **SDK consumer rollout.** Wallet local-SDK build validation is complete.
-   Publish its immutable candidate separately from the default download. No SDK
+   Its immutable candidate is uploaded and byte-verified; the default download
+   is unchanged. No SDK
    upload is needed for this manual release. The workflow still references
    4146f805; automatic release alignment remains deferred. Verify DApp's actual
    dependency resolution too. Changing source pins alone is insufficient.
@@ -137,12 +145,14 @@ Genesis or Groth16 setup compatibility; the remaining gates still apply.
    and Bridge/Explorer browser tests on the fresh online testnet instead of
    continuing the local stack. Test wallet migration, preserved keys and
    cross-stage rejection. Tests skipped are not passes.
-5. **Dual-role topology.** PsyProtocol/psy-node PR #10 is still open as of this
-   preparation. Candidate runtime `159c8f98` lacks `prove-proxy --role`, while
-   the live host runs separate user/system processes. It provides the legacy
-   combined API, but cannot be deployed as the agreed dual-role layout. Resolve
-   the runtime merge and rebuild applicable artifacts before stopping services;
-   do not silently deploy a legacy single-process replacement.
+5. **Dual-role rollout acceptance.** PR #10's runtime is integrated in
+   `32bfd3da`, independently reviewed and pushed to `multi_chain`. Bookworm
+   binaries are rebuilt and `prove-proxy --help` advertises user/system/all.
+   Configuration tests: 13 passed; CLI role tests: 4 passed; RPC assembly tests:
+   5 passed; relayer daemon tests: 125 passed; setup readiness test: 27 invalid
+   file cases passed. Live two-process startup and actual proof requests still
+   require deployment acceptance. Use distinct private user/system endpoints;
+   never silently fall back to the user pool for bridge proofs.
 
 Local launch safety: the legacy `deploy/local-multichain/start.sh` is NOT the
 acceptance entrypoint. It can stop processes by name/port, use existing Envio
@@ -156,6 +166,26 @@ using their current systemd invocation only. Coordinator, realm, edge and worker
 do not emit this identity record; audit their executable/config hashes separately.
 
 ## Safe next steps
+
+### Dual-role topology
+
+- `parth-prove-proxy@user.service`: `10.250.0.12:9999`, reached through
+  gateway `10.148.0.32:19999`. This is the public-facing user proof pool.
+- `parth-prove-proxy@system.service`: `10.250.0.12:9998`, reached through
+  gateway `10.148.0.32:19998`. Only the relayer host (`10.148.0.33`) and
+  the gateway itself are allowed through this VPC socket. Do not add a public
+  Caddy route for it.
+- Set `CLIENT_SYSTEM_PROVE_PROXY_URL` separately from `CLIENT_PROVE_PROXY_URL`.
+  The gateway's WireGuard peer and both routes are existing infrastructure
+  prerequisites; a fresh application deployment does not provision WireGuard.
+  If rebuilding the gateway, apply `gateway-install-arc99x2-relays.sh` with the
+  reviewed peer first, then verify connectivity from the relayer host.
+- Step 13 installs and verifies both roles before step 16 starts the relayer.
+  The installer rejects reused release IDs. Failed activation stops both
+  candidate roles; it does not pretend to roll back shared setup files safely.
+- Acceptance must check two distinct PIDs, exact role/capability responses,
+  opposite-role methods returning `-32601`, and real proofs through the relayer.
+  A listening port or `active` systemd state alone is insufficient.
 
 Resolve the blockers while the current network keeps running. Build all artifacts
 and stage immutable files before any service stop. Then get explicit fresh-deploy

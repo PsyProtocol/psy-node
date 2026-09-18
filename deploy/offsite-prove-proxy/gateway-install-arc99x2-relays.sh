@@ -13,8 +13,11 @@ WG_CONFIG="${WG_CONFIG:-/etc/wireguard/wg0.conf}"
 WG_GATEWAY_IP="${WG_GATEWAY_IP:-10.250.0.1}"
 ARC_WG_IP="${ARC_WG_IP:-10.250.0.12}"
 ARC_PROVE_PROXY_PORT="${ARC_PROVE_PROXY_PORT:-9999}"
+ARC_SYSTEM_PROVE_PROXY_PORT="${ARC_SYSTEM_PROVE_PROXY_PORT:-9998}"
 PARTH_RPC_IP="${PARTH_RPC_IP:-10.148.0.25}"
 GATEWAY_RELAY_PORT="${GATEWAY_RELAY_PORT:-19999}"
+SYSTEM_GATEWAY_RELAY_PORT="${SYSTEM_GATEWAY_RELAY_PORT:-19998}"
+SYSTEM_PROVE_CLIENT_IP="${SYSTEM_PROVE_CLIENT_IP:-10.148.0.33}"
 VPC_ADDRESS="${VPC_ADDRESS:-$(ip -4 route get 1.1.1.1 | awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')}"
 PEER_KEY_FILE="/etc/parth/offsite-prove-proxy-peer.pub"
 MARKER_BEGIN="# BEGIN PARTH ARC99X2 PROVE-PROXY"
@@ -90,6 +93,14 @@ install_socket_proxy() {
   local name="$1"
   local listen_address="$2"
   local target_address="$3"
+  local allowed_client="${4:-}"
+  local access_rules=""
+
+  if [ -n "$allowed_client" ]; then
+    access_rules="IPAddressDeny=any
+IPAddressAllow=$allowed_client/32
+IPAddressAllow=$VPC_ADDRESS/32"
+  fi
 
   cat >"/etc/systemd/system/$name.socket" <<EOF
 [Unit]
@@ -98,6 +109,7 @@ Description=Socket for $name
 [Socket]
 ListenStream=$listen_address
 NoDelay=true
+$access_rules
 
 [Install]
 WantedBy=sockets.target
@@ -131,6 +143,9 @@ install_socket_proxy parth-offsite-prove-rpc-services \
 # Existing GCP callers reach this VPC listener; it forwards over WireGuard.
 install_socket_proxy parth-offsite-prove-ingress \
   "$VPC_ADDRESS:$GATEWAY_RELAY_PORT" "$ARC_WG_IP:$ARC_PROVE_PROXY_PORT"
+install_socket_proxy parth-offsite-system-prove-ingress \
+  "$VPC_ADDRESS:$SYSTEM_GATEWAY_RELAY_PORT" \
+  "$ARC_WG_IP:$ARC_SYSTEM_PROVE_PROXY_PORT" "$SYSTEM_PROVE_CLIENT_IP"
 
 socket_units=(
   parth-offsite-prove-rpc-coordinator.socket
@@ -138,6 +153,7 @@ socket_units=(
   parth-offsite-prove-rpc-realm1.socket
   parth-offsite-prove-rpc-services.socket
   parth-offsite-prove-ingress.socket
+  parth-offsite-system-prove-ingress.socket
 )
 systemctl daemon-reload
 systemctl enable "${socket_units[@]}"
@@ -147,5 +163,6 @@ echo "WireGuard peer installed:"
 wg show "$WG_IFACE"
 echo
 echo "Gateway relay target for gcp-prove-proxy: $VPC_ADDRESS:$GATEWAY_RELAY_PORT"
+echo "Private system relay target for the relayer: $VPC_ADDRESS:$SYSTEM_GATEWAY_RELAY_PORT"
 echo
 systemctl --no-pager --full status "${socket_units[@]}"

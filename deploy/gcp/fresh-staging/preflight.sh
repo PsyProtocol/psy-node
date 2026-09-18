@@ -207,6 +207,11 @@ if has_step 13 && ! deploys_cloud_prove_proxy; then
     echo "CLIENT_PROVE_PROXY_URL is required when the cloud prove-proxy is disabled" >&2
     exit 1
   }
+  [ -n "${CLIENT_SYSTEM_PROVE_PROXY_URL:-}" ] &&
+    [ "${CLIENT_SYSTEM_PROVE_PROXY_URL%/}" != "${CLIENT_PROVE_PROXY_URL%/}" ] || {
+    echo "offsite dual-role deployment requires a distinct CLIENT_SYSTEM_PROVE_PROXY_URL" >&2
+    exit 1
+  }
   [ -n "${PUBLIC_PROVE_PROXY_UPSTREAM:-}" ] || {
     echo "PUBLIC_PROVE_PROXY_UPSTREAM is required when the cloud prove-proxy is disabled" >&2
     exit 1

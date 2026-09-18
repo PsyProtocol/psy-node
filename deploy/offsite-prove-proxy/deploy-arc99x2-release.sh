@@ -18,6 +18,10 @@ RELEASE_ID="${OFFSITE_PROVE_PROXY_RELEASE_ID:-$(date -u +%Y%m%d%H%M%S)-offsite-p
   echo "missing Parth bundle: $PARTH_BUNDLE" >&2
   exit 1
 }
+[ -s "$SCRIPT_DIR/parth-prove-proxy@.service" ] || {
+  echo "missing role unit template: $SCRIPT_DIR/parth-prove-proxy@.service" >&2
+  exit 1
+}
 
 for path in \
   ./target/release/psy_user_cli \
@@ -29,6 +33,16 @@ for path in \
     exit 1
   }
 done
+
+bundle_probe="$(mktemp)"
+trap 'rm -f "$bundle_probe"' EXIT
+tar -xOzf "$PARTH_BUNDLE" ./target/release/psy_user_cli >"$bundle_probe"
+chmod 0700 "$bundle_probe"
+"$bundle_probe" prove-proxy --help | grep -q -- '--role' || {
+  echo "bundle psy_user_cli does not support prove-proxy --role" >&2
+  exit 1
+}
+
 for kind in bridge deposit_batch_append withdrawal_claim; do
   for file in circuit_groth16.bin pk_groth16.bin vk_groth16.bin; do
     [ -s "$GROTH16_SETUP_ROOT/$kind/$file" ] || {
@@ -73,6 +87,7 @@ tar -xzf $(printf '%q' "$remote_incoming/parth-node-bundle.tar.gz") \
 test -x $(printf '%q' "$remote_release/target/release/psy_user_cli")
 test -x $(printf '%q' "$remote_release/deploy/bin/run-parth-service")
 test -s $(printf '%q' "$remote_release/client_prover/config.json")
+test -s $(printf '%q' "$remote_scripts/parth-prove-proxy@.service")
 "
 
 echo

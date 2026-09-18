@@ -23,11 +23,16 @@ rpc_health() {
 
 echo "Checking arc99x2 prove-proxy..."
 ssh -F "$SSH_CONFIG_FILE" "$OFFSITE_PROVE_PROXY_HOST" \
-  'systemctl is-active --quiet parth-offsite-prove-proxy.service &&
+  'systemctl is-active --quiet parth-prove-proxy@user.service &&
+   systemctl is-active --quiet parth-prove-proxy@system.service &&
    response="$(curl -sS --fail --max-time 30 http://10.250.0.12:9999 \
      -H "content-type: application/json" \
-     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"psy_get_fn_id\",\"params\":[0,\"simple_claim\"]}")" &&
-   jq -e ".result == 4" >/dev/null <<<"$response"'
+     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"psy_get_prove_proxy_role\",\"params\":[]}")" &&
+   jq -e ".result.role == \"user\" and .result.user_methods == true and .result.system_methods == false" >/dev/null <<<"$response" &&
+   response="$(curl -sS --fail --max-time 30 http://10.250.0.12:9998 \
+     -H "content-type: application/json" \
+     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"psy_get_prove_proxy_role\",\"params\":[]}")" &&
+   jq -e ".result.role == \"system\" and .result.user_methods == false and .result.system_methods == true" >/dev/null <<<"$response"'
 
 echo "Checking gateway relay from gcp-prove-proxy..."
 ssh -F "$SSH_CONFIG_FILE" "$GCP_PROVE_PROXY_HOST" \

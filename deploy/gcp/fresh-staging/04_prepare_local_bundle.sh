@@ -185,4 +185,14 @@ bundle_default_network="$(printf '%s' "$bundle_config_json" | jq -er '.defaultNe
   echo "bundle client_prover/config.json defaultNetwork is '$bundle_default_network', expected testnet" >&2
   exit 1
 }
+if [ -n "${CLIENT_SYSTEM_PROVE_PROXY_URL:-}" ]; then
+  printf '%s' "$bundle_config_json" | jq -e \
+    --arg user "${CLIENT_PROVE_PROXY_URL:?user proof endpoint is required}" \
+    --arg system "$CLIENT_SYSTEM_PROVE_PROXY_URL" \
+    '.networks.testnet.prove_proxy_url == [$user] and
+     .networks.testnet.system_prove_proxy_url == [$system]' >/dev/null || {
+    echo "bundle user/system proof endpoints differ from the selected deployment configuration" >&2
+    exit 1
+  }
+fi
 du -h "$bundle"
