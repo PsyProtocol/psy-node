@@ -1422,6 +1422,21 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 Ok(SymValue::Void)
             }
 
+            // psystd::invoke_deferred(contract_id, method_id, inputs) -> void
+            // Queue a cross-contract call for deferred execution. The return
+            // references are intentionally ignored, matching psy-compiler's
+            // public std wrapper, whose return type is unit.
+            "psystd::invoke_deferred" => {
+                if args.len() != 3 {
+                    bail!("{}() expects exactly 3 arguments: contract_id, method_id, inputs", name);
+                }
+                let contract_id = self.compile_expr(&args[0])?.as_felt();
+                let method_id = self.compile_expr(&args[1])?.as_felt();
+                let inputs = self.compile_expr(&args[2])?.to_felt_refs();
+                self.exec.cinvoke_external_contract_function_deferred(contract_id, method_id, inputs);
+                Ok(SymValue::Void)
+            }
+
             // ─── Type casting (with constraint checks) ──────────────────
 
             // psystd::cast_bool(value: Felt) -> Bool

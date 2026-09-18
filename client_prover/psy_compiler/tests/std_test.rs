@@ -49,6 +49,11 @@ const STD_SOURCE: &str = r#"
             let sum = psystd::sum_bits(bits);
             self.out0 = sum;
         }
+
+        #[contract_method]
+        pub fn call_deferred(&mut self, ctx: &ChainContext, contract_id: Felt, method_id: Felt, input: Felt) {
+            psystd::invoke_deferred(contract_id, method_id, [input]);
+        }
     }
 "#;
 
@@ -97,4 +102,27 @@ fn psystd_split_bits_should_work_but_currently_fails() {
     let result = execute(STD_SOURCE, "split_bits_should_work", &ctx, &[13]);
     assert!(result.success, "expected success, failure={:?}", result.failure);
     assert_write(&result, ctx.user_id, ctx.contract_id, 0, &[3]);
+}
+
+#[test]
+fn psystd_invoke_deferred_emits_deferred_state_command() {
+    use psy_vm::dpn::ops::state_cmd::data::DPNStateCmd;
+
+    let output = psy_compiler::compile(STD_SOURCE).expect("compilation should succeed");
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "call_deferred").unwrap();
+    let definition = output
+        .circuit_definitions
+        .iter()
+        .find(|definition| definition.method_id == method.method_id)
+        .unwrap();
+
+    let deferred = definition
+        .state_commands
+        .iter()
+        .find_map(|command| match command {
+            DPNStateCmd::InvokeExternalContractFunctionDeferred(command) => Some(command),
+            _ => None,
+        })
+        .expect("deferred invocation command should be emitted");
+    assert_eq!(deferred.input_args.len(), 1);
 }

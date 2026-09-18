@@ -362,7 +362,7 @@ impl TypeChecker {
             }
             Expr::FunctionCall { name, .. } => {
                 match name.as_str() {
-                    "require" | "psystd::emit_event" => Ok(ResolvedType::Bool), // void
+                    "require" | "psystd::emit_event" | "psystd::invoke_deferred" => Ok(ResolvedType::Bool), // void
                     "psystd::poseidon_hash" | "psystd::poseidon_two_to_one" => Ok(ResolvedType::Hash),
                     "psystd::keccak256" | "psystd::keccak_two_to_one" => Ok(ResolvedType::Array {
                         element: Box::new(ResolvedType::U32),
