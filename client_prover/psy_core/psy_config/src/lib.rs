@@ -43,6 +43,16 @@ pub enum ConfigError {
     NetworkNotFound(String),
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error(
+        "chain identity mismatch: config network '{network}' has magic {config_magic:#018X}, \
+         but this binary was built for '{binary_network}' with magic {binary_magic:#018X}"
+    )]
+    ChainIdentityMismatch {
+        network: String,
+        config_magic: u64,
+        binary_magic: u64,
+        binary_network: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,11 +554,13 @@ impl<F: RichField> PsyConfig<F> {
 
         let current_network = config.default_network.clone();
 
-        Ok(Self {
+        let config = Self {
             config,
             current_network,
             nodes_config: None,
-        })
+        };
+        config.verify_chain_identity()?;
+        Ok(config)
     }
 
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
@@ -563,22 +575,53 @@ impl<F: RichField> PsyConfig<F> {
 
         let current_network = config.default_network.clone();
 
-        Ok(Self {
+        let config = Self {
             config,
             current_network,
             nodes_config: None,
-        })
+        };
+        config.verify_chain_identity()?;
+        Ok(config)
     }
 
     pub fn builder() -> PsyConfigBuilder<F> {
         PsyConfigBuilder::new()
     }
 
-    pub fn use_network(&mut self, network_name: &str) -> Result<(), ConfigError> {
+    /// 当前网络的 magic 必须等于编译进本二进制的 magic。
+    ///
+    /// 比的是 magic 而不是网络名：localhost 与 testnet 共用同一个 magic，
+    /// 一套产物可以同时服务两者；mainnet 的 magic 不同，会在这里被挡住。
+    pub fn verify_chain_identity(&self) -> Result<(), ConfigError> {
+        let network = self.get_current_network()?;
+        let config_magic = parse_magic_hex(&network.magic).map_err(ConfigError::InvalidConfig)?;
+        if config_magic != PSY_NETWORK_MAGIC {
+            return Err(ConfigError::ChainIdentityMismatch {
+                network: self.current_network.clone(),
+                config_magic,
+                binary_magic: PSY_NETWORK_MAGIC,
+                binary_network: CURRENT_NETWORK,
+            });
+        }
+        Ok(())
+    }
+
+    /// 切换网络但不做链身份校验。只给查看类工具用（例如 `psy_dev_cli chain-info`）。
+    pub fn use_network_unchecked(&mut self, network_name: &str) -> Result<(), ConfigError> {
         if !self.config.networks.contains_key(network_name) {
             return Err(ConfigError::NetworkNotFound(network_name.to_string()));
         }
         self.current_network = network_name.to_string();
+        Ok(())
+    }
+
+    pub fn use_network(&mut self, network_name: &str) -> Result<(), ConfigError> {
+        let previous = self.current_network.clone();
+        self.use_network_unchecked(network_name)?;
+        if let Err(e) = self.verify_chain_identity() {
+            self.current_network = previous;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -937,5 +980,51 @@ mod tests {
         assert_eq!(parse_magic_hex("1337cf514544cf69"), Ok(0x1337CF514544CF69));
         assert!(parse_magic_hex("0xnothex").is_err());
         assert!(parse_magic_hex("").is_err());
+    }
+
+    #[test]
+    fn loading_a_config_whose_magic_differs_from_the_binary_is_refused() {
+        // mainnet 的 magic 与本二进制（localhost/testnet）不同，必须被拒绝。
+        let json = config_json(
+            "mainnet",
+            &[("mainnet", network_json("0x1337CF514544C069", 1048576, "0"))],
+        );
+        let err = PsyConfigGoldilocks::from_json(&json).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ChainIdentityMismatch { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn loading_a_config_with_the_same_magic_is_accepted() {
+        let json = config_json(
+            "testnet",
+            &[("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "0"))],
+        );
+        let config = PsyConfigGoldilocks::from_json(&json).unwrap();
+        assert_eq!(config.current_network_name(), "testnet");
+    }
+
+    #[test]
+    fn switching_to_a_foreign_magic_is_refused_but_inspection_still_works() {
+        let json = config_json(
+            "localhost",
+            &[
+                ("localhost", network_json(LOCALHOST_MAGIC_HEX, 1048576, "0")),
+                ("mainnet", network_json("0x1337CF514544C069", 1048576, "0")),
+            ],
+        );
+        let mut config = PsyConfigGoldilocks::from_json(&json).unwrap();
+
+        assert!(matches!(
+            config.use_network("mainnet").unwrap_err(),
+            ConfigError::ChainIdentityMismatch { .. }
+        ));
+        assert_eq!(config.current_network_name(), "localhost", "失败的切换不应该改变当前网络");
+
+        // 查看用的入口不校验，chain-info 这类工具靠它。
+        config.use_network_unchecked("mainnet").unwrap();
+        assert_eq!(config.current_network_name(), "mainnet");
     }
 }
