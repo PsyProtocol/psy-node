@@ -5,8 +5,6 @@ use psy_config::network_constants::MINING_REWARDS_CONTRACT_ID;
 use psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProofWithRewardPreimage;
 use serde::{Deserialize, Serialize};
 
-pub const LAST_CLAIMED_CHECKPOINT_SLOT: u64 = 0;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProofWithCheckpointV2 {
     pub checkpoint_id: u64,

@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use hashbrown::HashMap;
-use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
+use plonky2::field::{
+    goldilocks_field::GoldilocksField,
+    types::{Field, PrimeField64},
+};
 use psy_cli_common::key_utils::load_wallet_key_info;
 use psy_client_common::{
     args::ContractCallArgs,
@@ -18,9 +21,9 @@ use psy_client_data::{
     config::store_config::PsyHasher,
     traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync},
 };
-use psy_config::network_constants::{MINING_REWARDS_CONTRACT_ID, TOKEN_CONTRACT_ID, TOKEN_CONTRACT_STATE_TREE_HEIGHT};
+use psy_config::network_constants::{MINING_REWARDS_CONTRACT_ID, TOKEN_CONTRACT_ID};
 use psy_crypto::hash::{merkle::tag_tree::TagTreeMerkleProofWithRewardPreimage, traits::hasher::FieldQHasher};
-use psy_prover::session::{build_claim_calls_for_multi_checkpoints_v2, ProofWithCheckpointV2, LAST_CLAIMED_CHECKPOINT_SLOT};
+use psy_prover::session::{build_claim_calls_for_multi_checkpoints_v2, ProofWithCheckpointV2};
 use psy_provider::provider::RpcProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -130,26 +133,19 @@ pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
     );
     tracing::debug!("Total jobs: {}", serde_json::to_string_pretty(&job_ids)?);
 
-    let latest_checkpoint_id = provider.get_latest_block_state().await?.checkpoint_id;
-    let last_claimed_checkpoint_id = get_last_claimed_checkpoint_id(&provider, user_id, latest_checkpoint_id).await?;
-    tracing::info!(
-        "Claim reward checkpoint state: user_id={}, latest_checkpoint_id={}, last_claimed_checkpoint_id={}",
-        user_id,
-        latest_checkpoint_id,
-        last_claimed_checkpoint_id
-    );
-    let mut proofs_with_checkpoint_id = build_realm_proofs(&provider, last_claimed_checkpoint_id, job_ids.realm_jobs).await?;
-    for (k, v) in build_proofs(&provider, last_claimed_checkpoint_id, job_ids.coordinator_jobs, 2).await? {
+    let mut proofs_with_checkpoint_id = build_realm_proofs(&provider, job_ids.realm_jobs).await?;
+    for (k, v) in build_proofs(&provider, job_ids.coordinator_jobs, 2).await? {
         proofs_with_checkpoint_id.entry(k).or_default().extend(v);
     }
     tracing::info!(
-        "Proofs after checkpoint filtering: checkpoints={}, proofs={}",
+        "Proofs prepared for idempotent claim: checkpoints={}, proofs={}",
         proofs_with_checkpoint_id.len(),
         proofs_with_checkpoint_id.values().map(|proofs| proofs.len()).sum::<usize>()
     );
 
     // Build contract call args from proofs (pass job_ids to get reward_path_info)
-    let contract_call_args = build_claim_calls_from_proofs(&provider, &proofs_with_checkpoint_id).await?;
+    let contract_call_args =
+        build_claim_calls_from_proofs(&provider, user_id, &proofs_with_checkpoint_id).await?;
 
     // Execute contract calls
     if !contract_call_args.is_empty() {
@@ -300,7 +296,6 @@ fn reward_path_info(level: u8, index: u64) -> Result<u64> {
 
 pub async fn build_realm_proofs(
     provider: &RpcProvider,
-    last_claimed_checkpoint_id: u64,
     job_ids: Vec<(u64, u64, QProvingJobDataIDWithRewardPreimage)>,
 ) -> Result<HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>> {
     let job_ids_with_realm_and_unique_pending_id: HashMap<(u64, u64), Vec<QProvingJobDataIDWithRewardPreimage>> =
@@ -332,16 +327,6 @@ pub async fn build_realm_proofs(
             .generate_realm_batch_proof_miner_reward_proofs_by_realm_id(*realm_id, *unique_pending_id, job_ids)
             .await?;
 
-        if checkpoint_id <= last_claimed_checkpoint_id {
-            tracing::info!(
-                "Skipping realm {} unique_pending_id {} checkpoint {} because last_claimed_checkpoint_id is {}",
-                realm_id,
-                unique_pending_id,
-                checkpoint_id,
-                last_claimed_checkpoint_id
-            );
-            continue;
-        }
 
         total_proofs += proofs.len();
         tracing::info!(
@@ -366,7 +351,6 @@ pub async fn build_realm_proofs(
 
 pub async fn build_proofs(
     provider: &RpcProvider,
-    last_claimed_checkpoint_id: u64,
     job_ids: Vec<(u64, QProvingJobDataIDWithRewardPreimage)>,
     node_type: u8,
 ) -> Result<HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>> {
@@ -411,15 +395,6 @@ pub async fn build_proofs(
             (checkpoint_id, proofs)
         };
 
-        if checkpoint_id <= last_claimed_checkpoint_id {
-            tracing::info!(
-                "Skipping coordinator unique_pending_id {} checkpoint {} because last_claimed_checkpoint_id is {}",
-                unique_pending_id,
-                checkpoint_id,
-                last_claimed_checkpoint_id
-            );
-            continue;
-        }
 
         total_proofs += proofs.len();
         tracing::info!(
@@ -439,20 +414,6 @@ pub async fn build_proofs(
     tracing::info!("Total proofs: {}", total_proofs);
 
     Ok(proofs_with_unique_pending_id)
-}
-
-async fn get_last_claimed_checkpoint_id(provider: &RpcProvider, user_id: u64, latest_checkpoint_id: u64) -> Result<u64> {
-    let proof = provider
-        .get_user_contract_state_tree_merkle_proof(
-            latest_checkpoint_id,
-            user_id,
-            TOKEN_CONTRACT_ID,
-            TOKEN_CONTRACT_STATE_TREE_HEIGHT,
-            LAST_CLAIMED_CHECKPOINT_SLOT,
-        )
-        .await?;
-
-    Ok(proof.value.0.elements[1].0)
 }
 
 fn load_claim_jobs(path: &str) -> Result<LoadedClaimJobs> {
@@ -605,6 +566,7 @@ async fn build_reward_summary(provider: &RpcProvider, network: &str, source_path
     let mut checkpoints = Vec::with_capacity(groups.len());
     let mut distinct_checkpoint_ids = BTreeSet::new();
     let mut estimated_total_reward = 0u64;
+    let mut included_job_count = 0usize;
 
     for ((node_type, realm_id, realm_sub_id, unique_pending_id), records) in groups {
         let request_jobs = records
@@ -667,11 +629,20 @@ async fn build_reward_summary(provider: &RpcProvider, network: &str, source_path
             let proof = proofs_by_job
                 .remove(&metadata.job_id)
                 .with_context(|| format!("missing reward proof for job {:?}", metadata.job_id))?;
-            anyhow::ensure!(
-                proof.tag_tree_proof.leaf.tag == metadata.reward_tree_tag,
-                "reward proof leaf tag does not match backup tag for job {:?}",
-                metadata.job_id,
-            );
+            if proof.tag_tree_proof.leaf.tag != metadata.reward_tree_tag {
+                tracing::warn!(
+                    "Skipping reward job because proof leaf tag does not match backup tag: job={:?}, node_type={}, realm_id={}, unique_pending_id={}, reward_tree_level={}, reward_tree_index={}, backup_tag={:?}, proof_leaf_tag={:?}",
+                    metadata.job_id,
+                    node_type,
+                    realm_id,
+                    unique_pending_id,
+                    metadata.reward_tree_node_key.level,
+                    metadata.reward_tree_node_key.index,
+                    metadata.reward_tree_tag,
+                    proof.tag_tree_proof.leaf.tag,
+                );
+                continue;
+            }
             jobs.push(RewardSummaryJob {
                 metadata: metadata.clone(),
                 circuit_name: format!("{:?}", metadata.job_id.circuit_type),
@@ -689,10 +660,21 @@ async fn build_reward_summary(provider: &RpcProvider, network: &str, source_path
             unique_pending_id
         );
 
+        if jobs.is_empty() {
+            tracing::warn!(
+                "Skipping reward checkpoint group because it contains no valid jobs: node_type={}, realm_id={}, unique_pending_id={}",
+                node_type,
+                realm_id,
+                unique_pending_id,
+            );
+            continue;
+        }
+
         let group_total = reward_per_job.checked_mul(jobs.len() as u64).context("estimated group reward overflow")?;
         estimated_total_reward = estimated_total_reward
             .checked_add(group_total)
             .context("estimated total reward overflow")?;
+        included_job_count = included_job_count.checked_add(jobs.len()).context("summary job count overflow")?;
         distinct_checkpoint_ids.insert(checkpoint_id);
         checkpoints.push(RewardSummaryCheckpoint {
             checkpoint_id,
@@ -722,7 +704,7 @@ async fn build_reward_summary(provider: &RpcProvider, network: &str, source_path
         },
         summary: RewardSummaryTotals {
             checkpoint_count: distinct_checkpoint_ids.len(),
-            job_count: loaded.records.len(),
+            job_count: included_job_count,
             estimated_total_reward,
         },
         checkpoints,
@@ -731,6 +713,7 @@ async fn build_reward_summary(provider: &RpcProvider, network: &str, source_path
 
 pub async fn build_claim_calls_from_proofs(
     provider: &RpcProvider,
+    user_id: u64,
     proofs_with_unique_pending_id: &HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>,
 ) -> Result<Vec<ContractCallArgs>> {
     if proofs_with_unique_pending_id.is_empty() {
@@ -790,6 +773,52 @@ pub async fn build_claim_calls_from_proofs(
         return Ok(Vec::new());
     }
 
+    let latest_checkpoint_id = provider.get_latest_block_state().await?.checkpoint_id;
+    let candidate_count = all_proofs_with_checkpoints.len();
+    let mut unclaimed_proofs = Vec::with_capacity(candidate_count);
+    for proof in all_proofs_with_checkpoints {
+        let nullifier_key = reward_claim_nullifier_key(&proof)?;
+        match provider
+            .contract_state_imt_get_leaf_index_for_key(
+                latest_checkpoint_id,
+                user_id,
+                MINING_REWARDS_CONTRACT_ID as u64,
+                &nullifier_key,
+            )
+            .await
+        {
+            Ok(leaf_index) => {
+                tracing::info!(
+                    "Skipping already claimed reward: checkpoint={}, nullifier_key={}, leaf_index={}",
+                    proof.checkpoint_id,
+                    nullifier_key,
+                    leaf_index
+                );
+            }
+            Err(error) if is_missing_imt_key(&error) => unclaimed_proofs.push(proof),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to check reward nullifier at checkpoint {} for reward checkpoint {}",
+                        latest_checkpoint_id, proof.checkpoint_id
+                    )
+                });
+            }
+        }
+    }
+    let skipped_count = candidate_count - unclaimed_proofs.len();
+    tracing::info!(
+        "Reward nullifier preflight: candidates={}, unclaimed={}, already_claimed={}",
+        candidate_count,
+        unclaimed_proofs.len(),
+        skipped_count
+    );
+    if unclaimed_proofs.is_empty() {
+        tracing::info!("All reward jobs were already claimed; no transaction will be submitted");
+        return Ok(Vec::new());
+    }
+    let all_proofs_with_checkpoints = unclaimed_proofs;
+
     tracing::info!(
         "Building claim calls for {} proofs across {} checkpoints",
         all_proofs_with_checkpoints.len(),
@@ -826,29 +855,45 @@ pub async fn build_claim_calls_from_proofs(
         );
     }
 
-    let last_checkpoint = all_proofs_with_checkpoints
-        .last()
-        .with_context(|| "claim proof list became empty before checkpoint finalization")?
-        .checkpoint_id;
-
-    all_contract_calls.push(ContractCallArgs {
-        contract_id: MINING_REWARDS_CONTRACT_ID as u64,
-        method_name: "end_session".to_string(),
-        inputs: vec![last_checkpoint],
-    });
-
     all_contract_calls.push(ContractCallArgs {
         contract_id: TOKEN_CONTRACT_ID as u64,
         method_name: "simple_claim_pow_rewards".to_string(),
-        inputs: vec![last_checkpoint],
+        inputs: vec![],
     });
 
-    tracing::info!(
-        "Executing {} contract calls in single transaction, last_checkpoint={}",
-        all_contract_calls.len(),
-        last_checkpoint
-    );
+    tracing::info!("Executing {} contract calls in single transaction", all_contract_calls.len());
     Ok(all_contract_calls)
+}
+
+fn is_missing_imt_key(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("Key not found in IMT"))
+}
+
+fn reward_claim_nullifier_key(proof: &ProofWithCheckpointV2) -> Result<QHashOut<GoldilocksField>> {
+    let proof_height =
+        u32::try_from(proof.proof.proof_height).context("reward proof height does not fit u32")?;
+    let level_width = 1u64.checked_shl(proof_height).with_context(|| {
+        format!(
+            "reward proof height {} is too large",
+            proof.proof.proof_height
+        )
+    })?;
+    anyhow::ensure!(
+        proof.proof.inner.index < level_width,
+        "reward proof index {} exceeds proof height {}",
+        proof.proof.inner.index,
+        proof.proof.proof_height
+    );
+    let nullifier_index = level_width
+        .checked_sub(1)
+        .and_then(|base| base.checked_add(proof.proof.inner.index))
+        .context("reward nullifier index overflow")?;
+    Ok(PsyHasher::q_hash_many(&[
+        GoldilocksField::from_canonical_u64(proof.checkpoint_id),
+        GoldilocksField::from_canonical_u64(nullifier_index),
+    ]))
 }
 
 #[cfg(test)]
@@ -1074,5 +1119,49 @@ mod tests {
         let jobs = claim_jobs_from_metadata(loaded.records).unwrap();
         assert_eq!(jobs.realm_jobs[0].2.inner.reward_path_info, (3u64 << 56) | 2);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reward_claim_nullifier_matches_contract_indexing() {
+        let mut merkle_proof = psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty();
+        merkle_proof.index = 2;
+        let mut proof = TagTreeMerkleProofWithRewardPreimage::new(merkle_proof, QHashOut::ZERO);
+        proof.proof_height = 3;
+        let proof = ProofWithCheckpointV2 {
+            checkpoint_id: 17,
+            proof,
+            proposed_reward: 1,
+        };
+
+        let expected = PsyHasher::q_hash_many(&[
+            GoldilocksField::from_canonical_u64(17),
+            GoldilocksField::from_canonical_u64(9),
+        ]);
+        assert_eq!(reward_claim_nullifier_key(&proof).unwrap(), expected);
+    }
+
+    #[test]
+    fn reward_claim_nullifier_rejects_index_outside_proof_height() {
+        let mut merkle_proof = psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty();
+        merkle_proof.index = 8;
+        let mut proof = TagTreeMerkleProofWithRewardPreimage::new(merkle_proof, QHashOut::ZERO);
+        proof.proof_height = 3;
+        let proof = ProofWithCheckpointV2 {
+            checkpoint_id: 17,
+            proof,
+            proposed_reward: 1,
+        };
+
+        assert!(reward_claim_nullifier_key(&proof)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds proof height"));
+    }
+
+    #[test]
+    fn missing_imt_key_detection_checks_the_error_chain() {
+        let missing = anyhow::anyhow!("Key not found in IMT").context("rpc call failed");
+        assert!(is_missing_imt_key(&missing));
+        assert!(!is_missing_imt_key(&anyhow::anyhow!("connection refused")));
     }
 }
