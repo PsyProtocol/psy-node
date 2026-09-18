@@ -94,3 +94,92 @@ impl SignatureUser for SoftwareDefinedDpnUser {
         })
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::str::FromStr;
+
+    use psy_crypto::hash::traits::qhashable::QFieldHashable;
+
+    use super::*;
+
+    #[test]
+    fn constructor_preserves_key_and_fingerprint() {
+        let key = QHashOut::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a").unwrap();
+        let fingerprint = QHashOut::from_str("f07f91a0bdc0df4ec763285ba0eb578cb6e7a0811c3150494ab54e56f761fc1d").unwrap();
+        let user = SoftwareDefinedDpnUser::new(key, fingerprint);
+        assert_eq!(user.private_key, key);
+        assert_eq!(user.fingerprint, fingerprint);
+    }
+
+    fn psy_input() -> psy_provider::request::DPNSoftwareDefinedSignatureInput {
+        psy_provider::request::DPNSoftwareDefinedSignatureInput {
+            cfc_input: Default::default(),
+        }
+    }
+
+    fn plonky2_input() -> psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput {
+        psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput {
+            state_reader_results: psy_vm::ups::state_reader::StateReaderResults {
+                state: Default::default(),
+                state_cmds: Vec::new(),
+                merkel_proofs: Vec::new(),
+            },
+            circuit_inputs: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dpn_user_reports_public_key_param_without_circuit_registration() {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let session = session.read();
+        let wallet = &session.wallet;
+        let manager = wallet.random_circuit_manager();
+
+        let key = QHashOut::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a").unwrap();
+        let fingerprint = QHashOut::from_str("f07f91a0bdc0df4ec763285ba0eb578cb6e7a0811c3150494ab54e56f761fc1d").unwrap();
+        let user = SoftwareDefinedDpnUser::new(key, fingerprint);
+
+        let info = user.public_key_info(wallet, manager.as_ref()).await.unwrap();
+        assert_eq!(info.fingerprint, fingerprint);
+        assert_eq!(info.public_key_param, get_sdc_public_key_param(&key));
+
+        let pk_hash = user.public_key_hash(wallet, manager.as_ref()).await.unwrap();
+        assert_eq!(pk_hash, info.qfhash::<psy_client_data::config::store_config::PsyHasher>());
+    }
+
+    #[tokio::test]
+    async fn dpn_user_sign_and_circuit_info_validate_inputs_before_proving() {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let session = session.read();
+        let wallet = &session.wallet;
+        let manager = wallet.random_circuit_manager();
+
+        let key = QHashOut::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a").unwrap();
+        let fingerprint = QHashOut::from_str("f07f91a0bdc0df4ec763285ba0eb578cb6e7a0811c3150494ab54e56f761fc1d").unwrap();
+        let user = SoftwareDefinedDpnUser::new(key, fingerprint);
+        let sighash = QHashOut::ZERO;
+
+        let missing = SignContext::new(fingerprint);
+        let error = user.sign(wallet, manager.as_ref(), &missing, sighash).await.unwrap_err();
+        assert!(error.to_string().contains("PSY witness input missing"));
+
+        let conflicting = SignContext::new(fingerprint)
+            .with_psy_signature_input(psy_input(), 1, 2, QHashOut::ZERO, QHashOut::ZERO)
+            .with_plonky2_signature_input(plonky2_input(), 1, 2, QHashOut::ZERO, QHashOut::ZERO);
+        let error = user.sign(wallet, manager.as_ref(), &conflicting, sighash).await.unwrap_err();
+        assert!(error.to_string().contains("cannot handle PLONKY2 input"));
+
+        let unregistered = SignContext::new(fingerprint).with_psy_signature_input(psy_input(), 1, 2, QHashOut::ZERO, QHashOut::ZERO);
+        let error = user.sign(wallet, manager.as_ref(), &unregistered, sighash).await.unwrap_err();
+        assert!(error.to_string().contains("not registered"));
+
+        let error = user.circuit_info(wallet, manager.as_ref(), &missing).await.unwrap_err();
+        assert!(error.to_string().contains("PSY witness input missing"));
+        let error = user.circuit_info(wallet, manager.as_ref(), &conflicting).await.unwrap_err();
+        assert!(error.to_string().contains("cannot handle PLONKY2 input"));
+        let error = user.circuit_info(wallet, manager.as_ref(), &unregistered).await.unwrap_err();
+        assert!(error.to_string().contains("not registered"));
+    }
+}

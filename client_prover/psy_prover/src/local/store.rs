@@ -20,3 +20,25 @@ impl UserProverWorkerStore {
         self.results.insert(key, value);
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn result_lifecycle_supports_read_replace_and_clear() {
+        let key = Hash256([9; 32]);
+        let mut store = UserProverWorkerStore::new();
+
+        assert!(store.get_result(&key).is_none());
+        assert!(store.get_result_and_clear(&key).is_none());
+
+        store.set_result(key, vec![1, 2, 3]);
+        assert_eq!(store.get_result(&key), Some(&vec![1, 2, 3]));
+
+        store.set_result(key, vec![4, 5]);
+        assert_eq!(store.get_result_and_clear(&key), Some(vec![4, 5]));
+        assert!(store.get_result(&key).is_none());
+    }
+}

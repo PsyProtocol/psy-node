@@ -132,19 +132,843 @@ fn select_builtin_sign_circuit(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod coverage_unit_tests {
+    use super::*;
+
+    fn minimal_trace(steps: Vec<crate::trace::TraceStep>) -> crate::trace::TxTrace {
+        crate::trace::TxTrace {
+            meta: crate::trace::TraceMeta {
+                network_magic: 0,
+                user_id: 0,
+                public_key: QHashOut::ZERO,
+            },
+            anchor: crate::trace::SessionAnchor {
+                start_checkpoint_id: 0,
+                checkpoint_leaf: Default::default(),
+                global_state_roots: Default::default(),
+                ups_step_circuit_whitelist_root: QHashOut::ZERO,
+            },
+            ups_start_witness: crate::trace::UpsStartWitness {
+                ups_header: Default::default(),
+                state_roots: Default::default(),
+                checkpoint_tree_proof: Default::default(),
+                user_tree_proof: Default::default(),
+                user_registration_tree_proof: None,
+                proof: None,
+            },
+            contract_codes: Vec::new(),
+            steps,
+            finalization: crate::trace::TxFinalization {
+                submit_end_cap_input: SubmitUserEndCapNonProofInput::default(),
+                nonce: F::ZERO,
+                software_defined_call: Default::default(),
+                tx_hash: QHashOut::ZERO,
+                sig_hash: QHashOut::ZERO,
+            },
+        }
+    }
+
+    fn external_step() -> crate::trace::TraceStep {
+        let zero = QHashOut::<F>::ZERO;
+        crate::trace::TraceStep::ExternalProof(crate::trace::ExternalProofStep {
+            fingerprint: zero,
+            proof_tree_start_root: zero,
+            proof_tree_end_root: zero,
+            proof: Vec::new(),
+            verifier_data_alt: AltVerifierOnlyCircuitData {
+                constants_sigmas_cap: Vec::new(),
+                circuit_digest: zero,
+            },
+            siblings: Vec::new(),
+        })
+    }
+
+    fn cfc_step(id: usize, parent: Option<usize>, deferred: Vec<usize>, inlined: Vec<usize>) -> crate::trace::CfcStep {
+        crate::trace::CfcStep {
+            id: crate::trace::TraceStepId(id),
+            parent: parent.map(crate::trace::TraceStepId),
+            inlined: inlined.into_iter().map(crate::trace::TraceStepId).collect(),
+            deferred: deferred.into_iter().map(crate::trace::TraceStepId).collect(),
+            contract_id: 1,
+            fn_id: 0,
+            method_id: 0,
+            method_name: "test".to_string(),
+            cfc_fingerprint: QHashOut::ZERO,
+            ups_fingerprint: QHashOut::ZERO,
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::ZERO,
+            cfc_witness: Default::default(),
+            state_delta: crate::trace::CfcStateDelta {
+                cfc_transaction_input_context: Default::default(),
+                user_contract_tree_update_proof: Default::default(),
+                deferred_tx_debt_pivot_proof: Default::default(),
+                inline_tx_debt_pivot_proof: Default::default(),
+            },
+            cfc_inclusion_proof: Default::default(),
+            end_header: Default::default(),
+            debt_removal_proof: None,
+            proof: None,
+        }
+    }
+
+    fn proof_with_public_inputs(values: &[F]) -> (ProofWithPublicInputs<F, C, D>, AltVerifierOnlyCircuitData<F>) {
+        use plonky2::{
+            iop::witness::{PartialWitness, WitnessWrite},
+            plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig},
+        };
+        use psy_client_data::config::store_config::PsyPlonky2Config;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let targets = (0..values.len()).map(|_| builder.add_virtual_target()).collect::<Vec<_>>();
+        for target in &targets {
+            builder.register_public_input(*target);
+        }
+        let data = builder.build::<PsyPlonky2Config>();
+        let mut witness = PartialWitness::new();
+        for (target, value) in targets.into_iter().zip(values.iter().copied()) {
+            witness.set_target(target, value).unwrap();
+        }
+        let proof = data.prove(witness).unwrap();
+        let verifier = AltVerifierOnlyCircuitData::from(&data.verifier_only);
+        (proof, verifier)
+    }
+
+    fn private_claim_with_valid_public_inputs() -> PrivateTransferClaim {
+        let (placeholder, placeholder_verifier) = proof_with_public_inputs(&[F::ZERO; 4]);
+        let mut claim = PrivateTransferClaim {
+            nullifier: [1, 2, 3, 4],
+            owner: [5, 6, 7, 8],
+            amount: 9,
+            user_tree_root: [10, 11, 12, 13],
+            checkpoint_id: 14,
+            note_root_slot: 15,
+            token_contract_id: 16,
+            random0: 17,
+            random1: 18,
+            note_proof_fingerprint: QHashOut::from_values(19, 20, 21, 22),
+            note_proof: placeholder,
+            note_verifier_data: placeholder_verifier,
+        };
+        let expected = claim.expected_note_proof_public_inputs_hash();
+        let (proof, verifier) = proof_with_public_inputs(&expected.0.elements);
+        claim.note_proof = proof;
+        claim.note_verifier_data = verifier;
+        claim
+    }
+
+    fn traced_cfc_step(
+        contract_id: u64,
+        method_name: &str,
+        deferred: Vec<psy_ups_circuit::session::TracedCfcStep<F>>,
+    ) -> psy_ups_circuit::session::TracedCfcStep<F> {
+        psy_ups_circuit::session::TracedCfcStep {
+            contract_id,
+            fn_id: contract_id as u32 + 10,
+            method_id: contract_id as u32 + 20,
+            method_name: method_name.to_string(),
+            cfc_fingerprint: QHashOut::from_values(contract_id, 0, 0, 0),
+            ups_fingerprint: QHashOut::from_values(contract_id, 1, 0, 0),
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::from_values(contract_id, 2, 0, 0),
+            cfc_witness: Default::default(),
+            state_delta: Default::default(),
+            cfc_inclusion_proof: Default::default(),
+            end_header: Default::default(),
+            debt_removal_proof: None,
+            deferred,
+        }
+    }
+
+    #[test]
+    fn private_transfer_contract_validation_accepts_match_and_rejects_relabel() {
+        ensure_private_transfer_contract_matches(7, 7).unwrap();
+        let error = ensure_private_transfer_contract_matches(7, 8).unwrap_err();
+        assert!(error.to_string().contains("contract mismatch"));
+        assert!(error.to_string().contains("contract_id=7"));
+        assert!(error.to_string().contains("token_contract_id=8"));
+    }
+
+    #[test]
+    fn end_cap_submission_error_preserves_recovery_context() {
+        use std::error::Error;
+
+        let end_user_leaf_hash = QHashOut::<F>::from_values(1, 2, 3, 4);
+        let error = EndCapSubmissionError {
+            end_user_leaf_hash,
+            contract_slot_updates: vec![EndCapContractSlotUpdate {
+                contract_id: 5,
+                slot: 6,
+                old_value: 7,
+                new_value: 8,
+            }],
+            source: anyhow::anyhow!("coordinator rejected update"),
+        };
+
+        assert_eq!(error.end_user_leaf_hash, end_user_leaf_hash);
+        assert_eq!(error.contract_slot_updates[0].new_value, 8);
+        assert!(error.to_string().contains("end cap submission rejected"));
+        assert!(error.to_string().contains("coordinator rejected update"));
+        assert_eq!(error.source().unwrap().to_string(), "coordinator rejected update");
+    }
+
+    #[test]
+    fn claim_batch_items_round_trip_tagged_json_variants() {
+        let (shield_proof, shield_verifier_data) = proof_with_public_inputs(&[F::ZERO; 4]);
+        let public = ClaimBatchItem::Public(ContractCallArgs {
+            contract_id: 7,
+            method_name: "claim".to_string(),
+            inputs: vec![8, 9],
+        });
+        let private = ClaimBatchItem::PrivateTransfer {
+            contract_id: 16,
+            claim: private_claim_with_valid_public_inputs(),
+        };
+        let shield = ClaimBatchItem::ShieldDeposit(ShieldDepositClaim {
+            contract_id: 17,
+            l2_token_contract_id: [1; 8],
+            nullifier_hash: QHashOut::from_values(2, 3, 4, 5),
+            shield_address: QHashOut::from_values(6, 7, 8, 9),
+            token_address: [10; 8],
+            amount: [11; 8],
+            source_chain_index: 12,
+            deposit_root: QHashOut::from_values(13, 14, 15, 16),
+            note_commitment: QHashOut::from_values(17, 18, 19, 20),
+            deposit_index: 21,
+            r0: 22,
+            r1: 23,
+            proof_fingerprint: QHashOut::from_values(24, 25, 26, 27),
+            proof: shield_proof,
+            verifier_data: shield_verifier_data,
+        });
+
+        for (item, expected_tag) in [(public, "public"), (private, "private_transfer"), (shield, "shield_deposit")] {
+            let json = serde_json::to_value(&item).unwrap();
+            assert_eq!(json["type"], expected_tag);
+            let decoded: ClaimBatchItem = serde_json::from_value(json).unwrap();
+            match decoded {
+                ClaimBatchItem::Public(call) => {
+                    assert_eq!(call.contract_id, 7);
+                    assert_eq!(call.inputs, vec![8, 9]);
+                }
+                ClaimBatchItem::PrivateTransfer { contract_id, claim } => {
+                    assert_eq!(contract_id, 16);
+                    assert_eq!(claim.token_contract_id, 16);
+                }
+                ClaimBatchItem::ShieldDeposit(claim) => assert_eq!(claim.contract_id, 17),
+            }
+        }
+    }
+
+    #[test]
+    fn trace_proof_job_outputs_use_stable_serialization_tags() {
+        let zero = QHashOut::<F>::ZERO;
+        let outputs = vec![
+            TraceProofJobOutput::UpsStart {
+                proof: vec![1],
+                meta: ProofTreeMeta::new(1),
+                baton: LastStepProofInfo::default(),
+                current_header: UserProvingSessionHeader::default(),
+                previous_header: UserProvingSessionHeader::default(),
+            },
+            TraceProofJobOutput::CfcStep {
+                step_index: 2,
+                proof_bytes: (vec![3], vec![4]),
+                meta: ProofTreeMeta::new(1),
+                baton: LastStepProofInfo::default(),
+            },
+            TraceProofJobOutput::ExternalProof {
+                step_index: 5,
+                proof: vec![6],
+            },
+            TraceProofJobOutput::ZkSign { proof: vec![7] },
+            TraceProofJobOutput::EndCap {
+                proof: vec![8],
+                tx_hash: zero,
+            },
+            TraceProofJobOutput::Submit { tx_hash: zero },
+        ];
+        let expected = ["ups_start", "cfc_step", "external_proof", "zk_sign", "end_cap", "submit"];
+
+        for (output, expected_tag) in outputs.iter().zip(expected) {
+            let json = serde_json::to_value(output).unwrap();
+            assert_eq!(json["type"], expected_tag);
+        }
+    }
+
+    #[test]
+    fn trace_arena_pushes_and_finishes_non_cfc_steps_in_order() {
+        let zero = QHashOut::<F>::ZERO;
+        let verifier_data = AltVerifierOnlyCircuitData {
+            constants_sigmas_cap: Vec::new(),
+            circuit_digest: zero,
+        };
+        let mut arena = TraceArenaBuilder::new();
+        arena.push_step(crate::trace::TraceStep::ExternalProof(crate::trace::ExternalProofStep {
+            fingerprint: zero,
+            proof_tree_start_root: zero,
+            proof_tree_end_root: zero,
+            proof: Vec::new(),
+            verifier_data_alt: verifier_data.clone(),
+            siblings: Vec::new(),
+        }));
+        arena.push_step(crate::trace::TraceStep::ZkSign(crate::trace::ZkSignStep {
+            fingerprint: zero,
+            proof_tree_start_root: zero,
+            proof_tree_end_root: zero,
+            sign_circuit_source: crate::trace::TraceSignCircuitSource::ZkBuiltin,
+            sign_witness: Vec::new(),
+            public_key_param: zero,
+            sign_verifier_data_alt: verifier_data,
+        }));
+
+        let steps = arena.finish();
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0], crate::trace::TraceStep::ExternalProof(_)));
+        assert!(matches!(steps[1], crate::trace::TraceStep::ZkSign(_)));
+    }
+
+    #[test]
+    fn trace_arena_allocates_all_cfc_kinds_and_deferred_children() {
+        let child = traced_cfc_step(2, "deferred_child", Vec::new());
+        let mut arena = TraceArenaBuilder::new();
+
+        let standard_id = arena
+            .alloc_cfc(None, TraceCfcStepKind::Standard, traced_cfc_step(1, "standard", vec![child]))
+            .unwrap();
+        let burn_id = arena
+            .alloc_cfc(None, TraceCfcStepKind::BurnFee, traced_cfc_step(3, "burn", Vec::new()))
+            .unwrap();
+        let inlined_id = arena
+            .alloc_cfc(Some(standard_id), TraceCfcStepKind::Inlined, traced_cfc_step(4, "inline", Vec::new()))
+            .unwrap();
+
+        let steps = arena.finish();
+        assert_eq!(standard_id.0, 0);
+        assert_eq!(burn_id.0, 2);
+        assert_eq!(inlined_id.0, 3);
+        assert!(matches!(steps[0], crate::trace::TraceStep::Standard(_)));
+        assert!(matches!(steps[1], crate::trace::TraceStep::Deferred(_)));
+        assert!(matches!(steps[2], crate::trace::TraceStep::BurnFee(_)));
+        assert!(matches!(steps[3], crate::trace::TraceStep::Inlined(_)));
+
+        let standard = steps[0].as_cfc().unwrap();
+        assert_eq!(standard.contract_id, 1);
+        assert_eq!(standard.method_name, "standard");
+        assert_eq!(standard.deferred, vec![crate::trace::TraceStepId::from(1)]);
+        let deferred = steps[1].as_cfc().unwrap();
+        assert_eq!(deferred.parent, Some(standard_id));
+        assert_eq!(deferred.contract_id, 2);
+        assert_eq!(steps[2].contract_id(), Some(3));
+        assert_eq!(steps[3].as_cfc().unwrap().parent, Some(standard_id));
+    }
+
+    #[test]
+    fn cfc_artifacts_insert_once_per_step() {
+        let mut artifacts = TraceCfcJobArtifacts::default();
+        let meta = ProofTreeMeta::new(3);
+        artifacts
+            .insert(4, (vec![1, 2], vec![3, 4]), meta.clone(), LastStepProofInfo::default())
+            .unwrap();
+        assert_eq!(artifacts.proof_blobs[&4], (vec![1, 2], vec![3, 4]));
+        assert_eq!(artifacts.step_meta[&4].q_recursion_tree_height, 3);
+        assert!(artifacts.step_baton.contains_key(&4));
+
+        let error = artifacts
+            .insert(4, (Vec::new(), Vec::new()), meta, LastStepProofInfo::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate CFC proof output for step 4"));
+    }
+
+    #[test]
+    fn malformed_proof_bytes_are_rejected() {
+        let error = decode_proof_bytes(&[0xff, 0x00, 0x7f]).unwrap_err();
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn cfc_proof_records_round_trip_both_leaf_proofs() {
+        let (cfc_proof, _) = proof_with_public_inputs(&[F::from_canonical_u64(1), F::from_canonical_u64(2)]);
+        let (ups_proof, _) = proof_with_public_inputs(&[F::from_canonical_u64(3), F::from_canonical_u64(4)]);
+        let proofs = psy_ups_circuit::session::CfcStepProofs { cfc_proof, ups_proof };
+
+        let record = cfc_proofs_to_record(&proofs).unwrap();
+        assert!(!record.cfc_proof.is_empty());
+        assert!(!record.ups_proof.is_empty());
+        let restored = cfc_record_to_proofs(&record).unwrap();
+        assert_eq!(restored.cfc_proof.public_inputs, proofs.cfc_proof.public_inputs);
+        assert_eq!(restored.ups_proof.public_inputs, proofs.ups_proof.public_inputs);
+
+        let malformed = crate::trace::CfcProofRecord {
+            cfc_proof: vec![0xff],
+            ups_proof: record.ups_proof.clone(),
+        };
+        assert!(cfc_record_to_proofs(&malformed).is_err());
+
+        let malformed_ups = crate::trace::CfcProofRecord {
+            cfc_proof: record.cfc_proof,
+            ups_proof: vec![0xff, 0x00],
+        };
+        assert!(cfc_record_to_proofs(&malformed_ups).is_err());
+    }
+
+    #[test]
+    fn qhash_word_conversions_preserve_limb_order() {
+        let hash = QHashOut::<F>::from_values(0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00, 0x0102_0304_0506_0708, 0x8877_6655_4433_2211);
+        assert_eq!(
+            WalletSession::qhash_to_u64x4(hash),
+            [0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00, 0x0102_0304_0506_0708, 0x8877_6655_4433_2211,]
+        );
+        assert_eq!(
+            WalletSession::qhash_to_internal_u32x8(hash),
+            [
+                0x5566_7788,
+                0x1122_3344,
+                0xddee_ff00,
+                0x99aa_bbcc,
+                0x0506_0708,
+                0x0102_0304,
+                0x4433_2211,
+                0x8877_6655,
+            ]
+        );
+    }
+
+    #[test]
+    fn private_claim_inputs_follow_contract_argument_order() {
+        let sibling = QHashOut::<F>::from_values(31, 32, 33, 34);
+        let leaf_proof = MerkleProofCore {
+            root: QHashOut::<F>::ZERO,
+            value: QHashOut::<F>::ZERO,
+            index: 999,
+            siblings: vec![sibling],
+        };
+        let inputs = WalletSession::build_private_claim_inputs([1, 2, 3, 4], [5, 6, 7, 8], 9, [10, 11, 12, 13], 14, 15, 16, 17, &leaf_proof, 18);
+        assert_eq!(
+            inputs,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 31, 32, 33, 34, 18]
+        );
+    }
+
+    #[test]
+    fn shield_claim_inputs_split_internal_roots_and_append_proof_path() {
+        let deposit_root = QHashOut::<F>::from_values(0x0000_0002_0000_0001, 0x0000_0004_0000_0003, 0x0000_0006_0000_0005, 0x0000_0008_0000_0007);
+        let sibling = QHashOut::<F>::from_values(51, 52, 53, 54);
+        let leaf_proof = MerkleProofCore {
+            root: QHashOut::<F>::ZERO,
+            value: QHashOut::<F>::ZERO,
+            index: 999,
+            siblings: vec![sibling],
+        };
+        let inputs = WalletSession::build_shield_deposit_claim_inputs(
+            QHashOut::<F>::from_values(1, 2, 3, 4),
+            QHashOut::<F>::from_values(5, 6, 7, 8),
+            [9; 8],
+            [10; 8],
+            11,
+            deposit_root,
+            QHashOut::<F>::from_values(21, 22, 23, 24),
+            25,
+            26,
+            27,
+            &leaf_proof,
+            28,
+        );
+
+        assert_eq!(inputs.len(), 45);
+        assert_eq!(&inputs[0..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&inputs[8..16], &[9; 8]);
+        assert_eq!(&inputs[16..24], &[10; 8]);
+        assert_eq!(inputs[24], 11);
+        assert_eq!(&inputs[25..33], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&inputs[33..37], &[21, 22, 23, 24]);
+        assert_eq!(&inputs[37..], &[25, 26, 27, 51, 52, 53, 54, 28]);
+    }
+
+    #[test]
+    fn proving_state_validation_covers_missing_mismatched_and_valid_blobs() {
+        let mut state = ProvingState {
+            proof_tree_meta: ProofTreeMeta::new(3),
+            last_step_info: LastStepProofInfo::default(),
+            current_header: UserProvingSessionHeader::default(),
+            previous_header: UserProvingSessionHeader::default(),
+        };
+        let missing = WalletSession::validate_proving_state(&state, &[]).unwrap_err();
+        assert!(missing.to_string().contains("missing ups_start proof bytes"));
+
+        let mismatch = WalletSession::validate_proving_state(&state, &[vec![1]]).unwrap_err();
+        assert!(mismatch.to_string().contains("leaf_records (0) != proof_blobs (1)"));
+
+        let zero = QHashOut::<F>::ZERO;
+        state.proof_tree_meta.leaf_records.push(crate::trace::proof_tree_meta::LeafRecordMeta {
+            leaf_index: 0,
+            fingerprint: zero,
+            circuit_type: "UPS_START".to_string(),
+            leaf_circuit_type_id: 0,
+            insertion_proof: psy_crypto::hash::merkle::core::DeltaMerkleProofCore {
+                old_root: zero,
+                old_value: zero,
+                new_root: zero,
+                new_value: zero,
+                index: 0,
+                siblings: Vec::new(),
+            },
+        });
+        WalletSession::validate_proving_state(&state, &[vec![1]]).unwrap();
+    }
+
+    #[test]
+    fn non_cfc_trace_steps_report_expected_leaf_proof_counts() {
+        let zero = QHashOut::<F>::ZERO;
+        let verifier_data = AltVerifierOnlyCircuitData {
+            constants_sigmas_cap: Vec::new(),
+            circuit_digest: zero,
+        };
+        let external = crate::trace::TraceStep::ExternalProof(crate::trace::ExternalProofStep {
+            fingerprint: zero,
+            proof_tree_start_root: zero,
+            proof_tree_end_root: zero,
+            proof: Vec::new(),
+            verifier_data_alt: verifier_data.clone(),
+            siblings: Vec::new(),
+        });
+        let sign = crate::trace::TraceStep::ZkSign(crate::trace::ZkSignStep {
+            fingerprint: zero,
+            proof_tree_start_root: zero,
+            proof_tree_end_root: zero,
+            sign_circuit_source: crate::trace::TraceSignCircuitSource::ZkBuiltin,
+            sign_witness: Vec::new(),
+            public_key_param: zero,
+            sign_verifier_data_alt: verifier_data,
+        });
+
+        assert_eq!(WalletSession::trace_step_leaf_proof_count(&external).unwrap(), 1);
+        assert_eq!(WalletSession::trace_step_leaf_proof_count(&sign).unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_and_non_cfc_traces_pass_parent_link_validation() {
+        WalletSession::validate_trace_cfc_parent_before_children(&[]).unwrap();
+        let zero = QHashOut::<F>::ZERO;
+        let step = crate::trace::TraceStep::ZkSign(crate::trace::ZkSignStep {
+            fingerprint: zero,
+            proof_tree_start_root: zero,
+            proof_tree_end_root: zero,
+            sign_circuit_source: crate::trace::TraceSignCircuitSource::ZkBuiltin,
+            sign_witness: Vec::new(),
+            public_key_param: zero,
+            sign_verifier_data_alt: AltVerifierOnlyCircuitData {
+                constants_sigmas_cap: Vec::new(),
+                circuit_digest: zero,
+            },
+        });
+        WalletSession::validate_trace_cfc_parent_before_children(&[step]).unwrap();
+    }
+
+    #[test]
+    fn persisted_leaf_count_locates_resume_step_and_rejects_corruption() {
+        let empty = minimal_trace(Vec::new());
+        assert_eq!(WalletSession::next_step_index_from_leaf_proof_count(&empty, 1).unwrap(), 0);
+        assert!(WalletSession::next_step_index_from_leaf_proof_count(&empty, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("missing ups_start"));
+        assert!(WalletSession::next_step_index_from_leaf_proof_count(&empty, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match trace structure"));
+
+        let one_external = minimal_trace(vec![external_step()]);
+        assert_eq!(WalletSession::next_step_index_from_leaf_proof_count(&one_external, 1).unwrap(), 0);
+        assert_eq!(WalletSession::next_step_index_from_leaf_proof_count(&one_external, 2).unwrap(), 1);
+        assert!(WalletSession::next_step_index_from_leaf_proof_count(&one_external, 3).is_err());
+
+        let mixed = minimal_trace(vec![
+            external_step(),
+            crate::trace::TraceStep::Standard(cfc_step(1, None, Vec::new(), Vec::new())),
+            crate::trace::TraceStep::ZkSign(crate::trace::ZkSignStep {
+                fingerprint: QHashOut::ZERO,
+                proof_tree_start_root: QHashOut::ZERO,
+                proof_tree_end_root: QHashOut::ZERO,
+                sign_circuit_source: crate::trace::TraceSignCircuitSource::ZkBuiltin,
+                sign_witness: Vec::new(),
+                public_key_param: QHashOut::ZERO,
+                sign_verifier_data_alt: AltVerifierOnlyCircuitData {
+                    constants_sigmas_cap: Vec::new(),
+                    circuit_digest: QHashOut::ZERO,
+                },
+            }),
+        ]);
+        assert_eq!(WalletSession::next_step_index_from_leaf_proof_count(&mixed, 2).unwrap(), 1);
+        assert_eq!(WalletSession::next_step_index_from_leaf_proof_count(&mixed, 4).unwrap(), 2);
+        assert!(WalletSession::next_step_index_from_leaf_proof_count(&mixed, 5).is_err());
+    }
+
+    #[test]
+    fn ups_start_roots_use_anchor_for_legacy_trace_and_witness_for_new_trace() {
+        let mut trace = minimal_trace(Vec::new());
+        trace.anchor.global_state_roots.contract_tree_root = QHashOut::from_values(1, 2, 3, 4);
+        assert_eq!(WalletSession::ups_start_state_roots_for_trace(&trace), trace.anchor.global_state_roots);
+
+        trace.ups_start_witness.state_roots.user_tree_root = QHashOut::from_values(5, 6, 7, 8);
+        assert_eq!(
+            WalletSession::ups_start_state_roots_for_trace(&trace),
+            trace.ups_start_witness.state_roots
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_cfc_proofs_are_rejected() {
+        let record = crate::trace::CfcProofRecord {
+            cfc_proof: vec![0xff, 0x00],
+            ups_proof: vec![0x01],
+        };
+        assert!(cfc_record_to_proofs(&record).is_err());
+    }
+
+    #[test]
+    fn cfc_leaf_counts_cover_standard_deferred_burn_and_inlined_steps() {
+        let standard = crate::trace::TraceStep::Standard(cfc_step(0, None, Vec::new(), Vec::new()));
+        let deferred = crate::trace::TraceStep::Deferred(cfc_step(0, None, Vec::new(), Vec::new()));
+        let burn = crate::trace::TraceStep::BurnFee(cfc_step(0, None, Vec::new(), Vec::new()));
+        let inlined = crate::trace::TraceStep::Inlined(cfc_step(0, None, Vec::new(), Vec::new()));
+
+        assert_eq!(WalletSession::trace_step_leaf_proof_count(&standard).unwrap(), 2);
+        assert_eq!(WalletSession::trace_step_leaf_proof_count(&deferred).unwrap(), 2);
+        assert_eq!(WalletSession::trace_step_leaf_proof_count(&burn).unwrap(), 2);
+        assert!(WalletSession::trace_step_leaf_proof_count(&inlined)
+            .unwrap_err()
+            .to_string()
+            .contains("not implemented"));
+
+        let trace = minimal_trace(vec![standard]);
+        assert_eq!(WalletSession::next_step_index_from_leaf_proof_count(&trace, 1).unwrap(), 0);
+        assert_eq!(WalletSession::next_step_index_from_leaf_proof_count(&trace, 3).unwrap(), 1);
+        assert!(WalletSession::next_step_index_from_leaf_proof_count(&trace, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("splits trace step"));
+    }
+
+    #[test]
+    fn cfc_parent_links_accept_tree_order_and_reject_invalid_children() {
+        let valid = vec![
+            crate::trace::TraceStep::Standard(cfc_step(0, None, vec![1], Vec::new())),
+            crate::trace::TraceStep::Deferred(cfc_step(1, Some(0), Vec::new(), Vec::new())),
+        ];
+        WalletSession::validate_trace_cfc_parent_before_children(&valid).unwrap();
+
+        let wrong_parent = vec![
+            crate::trace::TraceStep::Standard(cfc_step(0, None, vec![1], Vec::new())),
+            crate::trace::TraceStep::Deferred(cfc_step(1, None, Vec::new(), Vec::new())),
+        ];
+        assert!(WalletSession::validate_trace_cfc_parent_before_children(&wrong_parent)
+            .unwrap_err()
+            .to_string()
+            .contains("parent mismatch"));
+
+        let non_cfc_child = vec![crate::trace::TraceStep::Standard(cfc_step(0, None, vec![1], Vec::new())), external_step()];
+        assert!(WalletSession::validate_trace_cfc_parent_before_children(&non_cfc_child)
+            .unwrap_err()
+            .to_string()
+            .contains("links non-CFC child"));
+
+        let out_of_bounds_child = vec![crate::trace::TraceStep::Standard(cfc_step(0, None, vec![9], Vec::new()))];
+        assert!(WalletSession::validate_trace_cfc_parent_before_children(&out_of_bounds_child)
+            .unwrap_err()
+            .to_string()
+            .contains("links non-CFC child 9"));
+
+        let duplicate_child = vec![
+            crate::trace::TraceStep::Standard(cfc_step(0, None, vec![1, 1], Vec::new())),
+            crate::trace::TraceStep::Deferred(cfc_step(1, Some(0), Vec::new(), Vec::new())),
+        ];
+        assert!(WalletSession::validate_trace_cfc_parent_before_children(&duplicate_child)
+            .unwrap_err()
+            .to_string()
+            .contains("linked more than once"));
+
+        let id_mismatch = vec![
+            crate::trace::TraceStep::Standard(cfc_step(1, None, Vec::new(), Vec::new())),
+            crate::trace::TraceStep::Standard(cfc_step(0, Some(1), Vec::new(), Vec::new())),
+        ];
+        assert!(WalletSession::validate_trace_cfc_parent_before_children(&id_mismatch)
+            .unwrap_err()
+            .to_string()
+            .contains("id mismatch"));
+
+        let child_before_parent = vec![
+            crate::trace::TraceStep::Deferred(cfc_step(0, Some(1), Vec::new(), Vec::new())),
+            crate::trace::TraceStep::Standard(cfc_step(1, None, vec![0], Vec::new())),
+        ];
+        assert!(WalletSession::validate_trace_cfc_parent_before_children(&child_before_parent)
+            .unwrap_err()
+            .to_string()
+            .contains("not parent-before-children"));
+
+        let invalid_root_id = vec![crate::trace::TraceStep::Standard(cfc_step(9, None, Vec::new(), Vec::new()))];
+        assert!(WalletSession::validate_trace_cfc_parent_before_children(&invalid_root_id)
+            .unwrap_err()
+            .to_string()
+            .contains("out of bounds for 1 steps"));
+    }
+
+    #[test]
+    fn private_claim_rejects_invalid_public_inputs_and_wrong_proof_leaf() {
+        let mut claim = private_claim_with_valid_public_inputs();
+        assert_eq!(
+            claim.validate_note_proof_public_inputs().unwrap(),
+            claim.expected_note_proof_public_inputs_hash()
+        );
+
+        let (short_proof, _) = proof_with_public_inputs(&[F::ZERO]);
+        let valid_proof = std::mem::replace(&mut claim.note_proof, short_proof);
+        assert!(claim
+            .validate_note_proof_public_inputs()
+            .unwrap_err()
+            .to_string()
+            .contains("must have 4 public inputs"));
+
+        let (mismatched_proof, _) = proof_with_public_inputs(&[F::ZERO; 4]);
+        claim.note_proof = mismatched_proof;
+        assert!(claim
+            .validate_note_proof_public_inputs()
+            .unwrap_err()
+            .to_string()
+            .contains("does not match note proof public inputs"));
+        claim.note_proof = valid_proof;
+
+        let wrong_ref = TraceExternalProofRef {
+            proof_index: 23,
+            leaf_proof: MerkleProofCore {
+                root: QHashOut::ZERO,
+                value: QHashOut::ZERO,
+                index: 23,
+                siblings: Vec::new(),
+            },
+        };
+        assert!(claim
+            .to_contract_call_args(16, &wrong_ref)
+            .unwrap_err()
+            .to_string()
+            .contains("proof-tree leaf mismatch"));
+    }
+
+    #[test]
+    fn private_claim_builds_contract_call_after_all_preflights_pass() {
+        let claim = private_claim_with_valid_public_inputs();
+        let public_inputs_hash = claim.expected_note_proof_public_inputs_hash();
+        let expected_leaf = PsyHasher::q_two_to_one(claim.note_proof_fingerprint, public_inputs_hash);
+        let proof_ref = TraceExternalProofRef {
+            proof_index: 23,
+            leaf_proof: MerkleProofCore {
+                root: QHashOut::from_values(24, 25, 26, 27),
+                value: expected_leaf,
+                index: 23,
+                siblings: vec![QHashOut::from_values(28, 29, 30, 31)],
+            },
+        };
+
+        let call = claim.to_contract_call_args(16, &proof_ref).unwrap();
+        assert_eq!(call.contract_id, 16);
+        assert_eq!(call.method_name, "private_claim");
+        assert_eq!(call.inputs.len(), 22);
+        assert_eq!(&call.inputs[..4], &[1, 2, 3, 4]);
+        assert_eq!(&call.inputs[4..8], &[5, 6, 7, 8]);
+        assert_eq!(call.inputs[8], 9);
+        assert_eq!(call.inputs.last(), Some(&23));
+    }
+
+    #[test]
+    fn shield_claim_builds_claim_deposit_contract_call() {
+        let (proof, verifier_data) = proof_with_public_inputs(&[F::ZERO; 4]);
+        let claim = ShieldDepositClaim {
+            contract_id: 77,
+            l2_token_contract_id: [1; 8],
+            nullifier_hash: QHashOut::from_values(2, 3, 4, 5),
+            shield_address: QHashOut::from_values(6, 7, 8, 9),
+            token_address: [10; 8],
+            amount: [11; 8],
+            source_chain_index: 12,
+            deposit_root: QHashOut::from_values(13, 14, 15, 16),
+            note_commitment: QHashOut::from_values(17, 18, 19, 20),
+            deposit_index: 21,
+            r0: 22,
+            r1: 23,
+            proof_fingerprint: QHashOut::from_values(24, 25, 26, 27),
+            proof,
+            verifier_data,
+        };
+        let proof_ref = TraceExternalProofRef {
+            proof_index: 28,
+            leaf_proof: MerkleProofCore {
+                root: QHashOut::from_values(29, 30, 31, 32),
+                value: QHashOut::from_values(33, 34, 35, 36),
+                index: 37,
+                siblings: vec![QHashOut::from_values(38, 39, 40, 41)],
+            },
+        };
+
+        let call = claim.to_contract_call_args(&proof_ref);
+        assert_eq!(call.contract_id, 77);
+        assert_eq!(call.method_name, "claim_deposit");
+        assert_eq!(call.inputs.len(), 45);
+        assert_eq!(call.inputs.last(), Some(&28));
+    }
+
+    #[test]
+    fn empty_contract_generation_keeps_deploy_and_update_metadata_consistent() {
+        let deployer = QHashOut::<F>::from_values(1, 2, 3, 4);
+        let (deploy_circuits, deploy) = gen_contract_deploy_and_circuits_for_functions::<C, D>(deployer, 19, &[]).unwrap();
+        let (update_circuits, update) = gen_contract_update_and_circuits_for_functions::<C, D>(55, deployer, 19, &[]).unwrap();
+
+        assert!(deploy_circuits.is_empty());
+        assert!(update_circuits.is_empty());
+        assert_eq!(deploy.deployer, deployer);
+        assert_eq!(deploy.code_definition.state_tree_height, 19);
+        assert!(deploy.code_definition.functions.is_empty());
+        assert!(deploy.function_whitelist.is_empty());
+        assert_eq!(update.contract_id, 55);
+        assert_eq!(update.deployer, deployer);
+        assert_eq!(update.code_definition, deploy.code_definition);
+        assert_eq!(update.function_whitelist, deploy.function_whitelist);
+        assert_eq!(update.code_root, deploy.code_root);
+        assert_eq!(update.layout_protocol_version, 0);
+        assert_eq!(update.state_layout_root, QHashOut::ZERO);
+        assert!(update.canonical_layout_proof.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod signer_mode_selection_tests {
     use super::*;
 
     #[test]
     fn selects_distinct_builtin_signer_modes() {
         let zk = QHashOut(HashOut {
-            elements: [F::from_canonical_u64(1), F::from_canonical_u64(2), F::from_canonical_u64(3), F::from_canonical_u64(4)],
+            elements: [
+                F::from_canonical_u64(1),
+                F::from_canonical_u64(2),
+                F::from_canonical_u64(3),
+                F::from_canonical_u64(4),
+            ],
         });
         let secp = QHashOut(HashOut {
-            elements: [F::from_canonical_u64(5), F::from_canonical_u64(6), F::from_canonical_u64(7), F::from_canonical_u64(8)],
+            elements: [
+                F::from_canonical_u64(5),
+                F::from_canonical_u64(6),
+                F::from_canonical_u64(7),
+                F::from_canonical_u64(8),
+            ],
         });
         let personal = QHashOut(HashOut {
-            elements: [F::from_canonical_u64(9), F::from_canonical_u64(10), F::from_canonical_u64(11), F::from_canonical_u64(12)],
+            elements: [
+                F::from_canonical_u64(9),
+                F::from_canonical_u64(10),
+                F::from_canonical_u64(11),
+                F::from_canonical_u64(12),
+            ],
         });
 
         assert!(matches!(
@@ -160,6 +984,15 @@ mod signer_mode_selection_tests {
             Some(crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin)
         ));
         assert!(select_builtin_sign_circuit(personal, zk, secp, None).is_none());
+        assert!(select_builtin_sign_circuit(
+            QHashOut(HashOut {
+                elements: [F::from_canonical_u64(13), F::ZERO, F::ZERO, F::ZERO],
+            }),
+            zk,
+            secp,
+            Some(personal)
+        )
+        .is_none());
     }
 }
 
@@ -306,6 +1139,37 @@ impl ProveError {
             Ok(prove_error) => prove_error,
             Err(error) => Self::Other(error),
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod prove_error_tests {
+    use super::*;
+
+    fn hash(value: u64) -> QHashOut<F> {
+        QHashOut(HashOut {
+            elements: [F::from_canonical_u64(value), F::ZERO, F::ZERO, F::ZERO],
+        })
+    }
+
+    #[test]
+    fn from_anyhow_keeps_stale_anchor_details() {
+        let error = anyhow::Error::new(ProveError::StaleTraceAnchor {
+            user_id: 7,
+            start_user_leaf_hash: hash(1),
+            latest_user_leaf_hash: hash(2),
+        });
+
+        assert!(matches!(ProveError::from_anyhow(error), ProveError::StaleTraceAnchor { user_id: 7, .. }));
+    }
+
+    #[test]
+    fn from_anyhow_wraps_unrelated_errors() {
+        assert!(matches!(
+            ProveError::from_anyhow(anyhow::anyhow!("rpc unavailable")),
+            ProveError::Other(_)
+        ));
     }
 }
 
@@ -599,6 +1463,33 @@ impl SimulationCallClassification {
 
     fn is_fee_free_view(&self) -> bool {
         self.call_count > 0 && self.all_view
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod simulation_call_classification_tests {
+    use super::*;
+
+    #[test]
+    fn empty_or_mutating_calls_are_not_fee_free_views() {
+        let mut classification = SimulationCallClassification::new();
+        assert!(!classification.is_fee_free_view());
+
+        classification.observe(true);
+        assert!(classification.is_fee_free_view());
+        classification.observe(false);
+        assert!(!classification.is_fee_free_view());
+        classification.observe(true);
+        assert!(!classification.is_fee_free_view());
+    }
+
+    #[test]
+    fn every_observed_view_call_is_fee_free() {
+        let mut classification = SimulationCallClassification::new();
+        classification.observe(true);
+        classification.observe(true);
+        assert!(classification.is_fee_free_view());
     }
 }
 
@@ -1008,6 +1899,7 @@ fn ensure_view_execution_effects(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod view_validation_tests {
     use super::*;
     use psy_vm::dpn::ops::{
@@ -1032,6 +1924,12 @@ mod view_validation_tests {
     #[test]
     fn call_view_preflight_accepts_pure_and_rejects_event_or_write_definitions() {
         ensure_view_definition(7, "pure", &definition(Vec::new())).unwrap();
+        ensure_view_definition(
+            7,
+            "reader",
+            &definition(vec![DPNStateCmd::get_self_user_current_contract_state_slot_single(1)]),
+        )
+        .unwrap();
 
         let mut event_only = definition(Vec::new());
         event_only.events.push(DPNEventRecord {
@@ -1045,6 +1943,100 @@ mod view_validation_tests {
 
         let writer = definition(vec![DPNStateCmd::set_contract_state_slot_single(1, 0, 1)]);
         assert!(ensure_view_definition(7, "writer", &writer).is_err());
+    }
+
+    #[test]
+    fn view_execution_preflight_accepts_default_read_only_witness() {
+        let witness = psy_vm::vm::cfc_input::DapenContractFunctionCircuitInput::<F>::default();
+        let zero = QHashOut::<F>::ZERO;
+        let update = psy_crypto::hash::merkle::core::DeltaMerkleProofCore {
+            old_root: zero,
+            old_value: zero,
+            new_root: zero,
+            new_value: zero,
+            index: 0,
+            siblings: Vec::new(),
+        };
+        ensure_view_execution_effects(7, "view", &witness, &update).unwrap();
+
+        let changed = psy_crypto::hash::merkle::core::DeltaMerkleProofCore {
+            new_root: QHashOut::from_values(1, 0, 0, 0),
+            ..update.clone()
+        };
+        let error = ensure_view_execution_effects(7, "view", &witness, &changed).unwrap_err();
+        assert!(error.to_string().contains("changed user contract state"));
+
+        let mut emitted = witness.clone();
+        emitted.tx_input_ctx.transaction_end_ctx.total_events_emitted = F::ONE;
+        assert!(ensure_view_execution_effects(7, "view", &emitted, &update)
+            .unwrap_err()
+            .to_string()
+            .contains("reported emitted events"));
+
+        let mut event_record = witness.clone();
+        event_record.events.push(psy_client_data::dpn::event::PsyUserEventRecord {
+            checkpoint_id: F::ZERO,
+            user_id: F::ZERO,
+            contract_id: F::from_canonical_u64(7),
+            method_id: F::ZERO,
+            event_index: F::ZERO,
+            data: Vec::new(),
+        });
+        assert!(ensure_view_execution_effects(7, "view", &event_record, &update)
+            .unwrap_err()
+            .to_string()
+            .contains("emitted events"));
+
+        let mut spent = witness.clone();
+        spent.tx_input_ctx.transaction_end_ctx.total_balance_spent = F::ONE;
+        assert!(ensure_view_execution_effects(7, "view", &spent, &update)
+            .unwrap_err()
+            .to_string()
+            .contains("spent balance"));
+
+        let mut debt_changed = witness.clone();
+        debt_changed.tx_input_ctx.transaction_end_ctx.end_deferred_tx_debt_tree_root = QHashOut::from_values(1, 0, 0, 0);
+        assert!(ensure_view_execution_effects(7, "view", &debt_changed, &update)
+            .unwrap_err()
+            .to_string()
+            .contains("changed deferred transaction state"));
+
+        let mut storage_changed = witness.clone();
+        storage_changed.tx_input_ctx.transaction_end_ctx.end_contract_state_tree_root = QHashOut::from_values(1, 0, 0, 0);
+        assert!(ensure_view_execution_effects(7, "view", &storage_changed, &update)
+            .unwrap_err()
+            .to_string()
+            .contains("changed contract storage"));
+
+        let mut storage_start_changed = witness.clone();
+        storage_start_changed
+            .tx_input_ctx
+            .transaction_call_start_ctx
+            .start_contract_state_tree_root = QHashOut::from_values(1, 0, 0, 0);
+        assert!(ensure_view_execution_effects(7, "view", &storage_start_changed, &update)
+            .unwrap_err()
+            .to_string()
+            .contains("changed contract storage"));
+
+        let changed_value = psy_crypto::hash::merkle::core::DeltaMerkleProofCore {
+            old_value: QHashOut::from_values(1, 0, 0, 0),
+            ..update.clone()
+        };
+        assert!(ensure_view_execution_effects(7, "view", &witness, &changed_value)
+            .unwrap_err()
+            .to_string()
+            .contains("changed user contract state"));
+
+        let mut write_cmd = witness.clone();
+        write_cmd.cmd_witnesses.push(psy_vm::vm::exec::PsyCmdWithInputAndWitness {
+            state_cmd: DPNStateCmd::set_contract_state_slot_single(0, 0, 1),
+            witness: psy_client_data::qstore::imm::cmd_processor::DPNStateCmdWitness::TargetArray(Vec::new()),
+            result: Vec::new(),
+        });
+        assert!(ensure_view_execution_effects(7, "view", &write_cmd, &update)
+            .unwrap_err()
+            .to_string()
+            .contains("non-read-only state command"));
     }
 }
 #[cfg(test)]
@@ -3016,6 +4008,12 @@ impl WalletSession {
         let mut visited = vec![false; trace_steps.len()];
         for step in trace_steps {
             if let Some(cfc) = step.as_cfc() {
+                anyhow::ensure!(
+                    cfc.id.0 < trace_steps.len(),
+                    "trace CFC id {} is out of bounds for {} steps",
+                    cfc.id.0,
+                    trace_steps.len()
+                );
                 if cfc.parent.is_none() && !visited[cfc.id.0] {
                     visit(trace_steps, cfc.id, &mut visited, &mut expected)?;
                 }
@@ -4953,6 +5951,2279 @@ pub struct WalletKeyPair {
     pub public_key: ZKPublicKeyInfo<F>,
 }
 
+/// Fully offline trace/prove pipeline tests.
+///
+/// These tests never touch a live network. A synthetic chain state — real
+/// `SimpleMerkleTree`s for the checkpoint/user/contract/function trees plus
+/// consistent leaves — is injected directly into the `PsyCmdStoreWithCache`
+/// caches. The few reads that bypass the caches (the checkpoint roots during
+/// manager init, and the submit anchor / tx-status / final submit checks
+/// during finalization) are answered by a loopback JSON-RPC server replaying
+/// canned responses, so the whole build → prove → sign → end-cap pipeline
+/// runs locally and only the final submit fails with the canned rejection.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod offline_trace_pipeline_tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use psy_client_data::{
+        dpn::proving_session::DPNProvingSessionSimpleMethodCall,
+        qdata::{
+            checkpoint::{PsyBlockState, PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf},
+            contract::PsyContractLeaf,
+            user::PsyUserLeaf,
+        },
+        qstore::imm::{
+            cache::PsyCmdStoreWithCache,
+            cmd::{
+                QSRCmdGetUserLeafData, QSRHashCmd, QSRHashCmdGetCheckpointTreeRoot, QSRMerkleCmd, QSRMerkleCmdGetCheckpointTreeMerkleProof,
+                QSRMerkleCmdGetContractFunctionTreeMerkleProof, QSRMerkleCmdGetContractTreeMerkleProof,
+                QSRMerkleCmdGetUserContractStateTreeMerkleProof, QSRMerkleCmdGetUserContractTreeMerkleProof, QSRMerkleCmdGetUserTreeMerkleProof,
+            },
+        },
+    };
+    use psy_compiler::output::serialize::CompilationArtifact;
+    use psy_config::network_constants::{
+        CHECKPOINT_TREE_HEIGHT, CONTRACT_FUNCTION_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, REALM_USER_TREE_HEIGHT,
+        TOKEN_CONTRACT_ID, TOKEN_SIMPLE_BURN_METHOD_ID, UPS_SESSION_PROOF_TREE_HEIGHT,
+    };
+    use psy_crypto::hash::merkle::utils::simple_merkle_tree::SimpleMerkleTree;
+    use psy_vm::{dpn::ops::state_cmd::data::DPNStateCmd, vm::exec::PsyCmdInputWitnessResolver};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::test_support::shared_offline_wallet_session;
+
+    pub(crate) const OFFLINE_HELPER_CONTRACT_ID: u64 = 7;
+    pub(crate) const OFFLINE_USER_ID: u64 = 2;
+    pub(crate) const OFFLINE_CHECKPOINT_ID: u64 = 33;
+    /// A token balance far above any fee combination (fees are read from
+    /// compile-time constants; `2^62` dwarfs them all).
+    const OFFLINE_TOKEN_BALANCE: u64 = 1 << 62;
+
+    type OfflineTree = SimpleMerkleTree<PsyHasher, QHashOut<F>>;
+
+    /// One canned JSON-RPC response. `params` is an optional subset filter:
+    /// when present, every key must match the incoming request's `params`
+    /// field of the same name, so per-contract (or per-function) responses
+    /// can share one method name. The first matching rule wins.
+    pub(crate) struct OfflineRpcRule {
+        pub(crate) method: String,
+        pub(crate) params: Option<serde_json::Value>,
+        pub(crate) response: serde_json::Value,
+    }
+    pub(crate) type OfflineResponses = Arc<Mutex<Vec<OfflineRpcRule>>>;
+
+    fn qhash_seed(seed: u64) -> QHashOut<F> {
+        QHashOut::from_values(
+            seed,
+            seed.wrapping_mul(2).wrapping_add(1),
+            seed.wrapping_mul(3).wrapping_add(2),
+            seed.wrapping_mul(5).wrapping_add(3),
+        )
+    }
+
+    /// A minimal loopback JSON-RPC server. Responses are installed (or
+    /// swapped) after binding through the shared [`OfflineResponses`] list:
+    /// each entry maps a method name to a JSON object carrying either
+    /// `result` or `error`. Unknown methods get a generic error so any leaked
+    /// RPC fails loudly instead of hanging. The method names the server saw
+    /// are recorded so tests can assert exactly which RPCs left the caches.
+    pub(crate) async fn spawn_offline_rpc() -> (u16, Arc<Mutex<Vec<String>>>, OfflineResponses) {
+        let seen_methods: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let responses: OfflineResponses = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback rpc");
+        let port = listener.local_addr().expect("loopback addr").port();
+        let method_log = seen_methods.clone();
+        let shared_responses = responses.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let responses = shared_responses.clone();
+                let method_log = method_log.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buffer.extend_from_slice(&chunk[..n]);
+                                let text = String::from_utf8_lossy(&buffer).into_owned();
+                                let Some(header_end) = text.find("\r\n\r\n") else { continue };
+                                let mut content_length = 0usize;
+                                for line in text[..header_end].lines() {
+                                    if let Some((name, value)) = line.split_once(':') {
+                                        if name.trim().eq_ignore_ascii_case("content-length") {
+                                            if let Ok(parsed) = value.trim().parse::<usize>() {
+                                                content_length = parsed;
+                                            }
+                                        }
+                                    }
+                                }
+                                if buffer.len() < header_end + 4 + content_length {
+                                    continue;
+                                }
+                                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text[header_end + 4..header_end + 4 + content_length])
+                                else {
+                                    buffer.clear();
+                                    continue;
+                                };
+                                let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("<unknown>").to_string();
+                                let params = parsed.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                                method_log.lock().push(method.clone());
+                                let template = responses
+                                    .lock()
+                                    .iter()
+                                    .find(|rule| {
+                                        rule.method == method
+                                            && rule.params.as_ref().map_or(true, |filter| offline_params_match(&params, filter))
+                                    })
+                                    .map(|rule| rule.response.clone())
+                                    .unwrap_or_else(|| {
+                                        serde_json::json!({
+                                            "error": { "code": -32603, "message": format!("offline mock has no canned response for {} params={}", method, params) }
+                                        })
+                                    });
+                                let mut response = template;
+                                response["jsonrpc"] = serde_json::json!("2.0");
+                                response["id"] = parsed.get("id").cloned().unwrap_or(serde_json::json!(1));
+                                let body = response.to_string();
+                                let http = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                );
+                                if socket.write_all(http.as_bytes()).await.is_err() {
+                                    return;
+                                }
+                                buffer.clear();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen_methods, responses)
+    }
+
+    /// Subset match for the optional rule filter: an empty filter object
+    /// matches any request (params may be a positional array), otherwise
+    /// every key in `filter` must be present in `params` with an equal value.
+    fn offline_params_match(params: &serde_json::Value, filter: &serde_json::Value) -> bool {
+        let Some(filter_map) = filter.as_object() else {
+            return params == filter;
+        };
+        if filter_map.is_empty() {
+            return true;
+        }
+        let Some(params_map) = params.as_object() else {
+            return false;
+        };
+        filter_map.iter().all(|(key, value)| params_map.get(key) == Some(value))
+    }
+
+    /// Append a param-filtered rule whose response carries a plain `result`.
+    fn set_offline_rpc_result(responses: &OfflineResponses, method: &str, params: serde_json::Value, result: serde_json::Value) {
+        responses.lock().push(OfflineRpcRule {
+            method: method.to_string(),
+            params: Some(params),
+            response: serde_json::json!({ "result": result }),
+        });
+    }
+
+    /// Install the canned responses derived from the synthetic chain: the
+    /// checkpoint roots for manager init, the latest block state and user
+    /// leaf for the submit anchor / tx-status checks (the served leaf's
+    /// nonce + 1 equals the session nonce, keeping the tx submittable), and
+    /// a canned rejection for the final end-cap submit.
+    pub(crate) fn set_offline_responses(responses: &OfflineResponses, chain: &OfflineChainFixture) -> anyhow::Result<()> {
+        let mut block_state = PsyBlockState::get_genesis_value();
+        block_state.checkpoint_id = OFFLINE_CHECKPOINT_ID;
+        *responses.lock() = vec![
+            OfflineRpcRule {
+                method: "psy_get_checkpoint_global_state_roots".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&chain.global_state_roots)? }),
+            },
+            OfflineRpcRule {
+                method: "psy_get_latest_l2_block_state".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&block_state)? }),
+            },
+            OfflineRpcRule {
+                method: "psy_get_user_leaf_data".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&chain.user_leaf)? }),
+            },
+            OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "error": { "code": -32603, "message": "offline canned rpc rejection" } }),
+            },
+        ];
+        Ok(())
+    }
+
+    /// Extend the canned responses with everything a fresh (cache-empty) lps
+    /// fetches over RPC on the real entry path: user-id resolution from the
+    /// registration index, the registration checks, per-contract leaf / code
+    /// / tree proofs, per-function proofs, state slots, user contract tree
+    /// leaves and the user / checkpoint trees. An empty-object filter matches
+    /// any params for that method.
+    pub(crate) fn set_offline_chain_rpc_rules(responses: &OfflineResponses, chain: &OfflineChainFixture, public_key: QHashOut<F>) -> anyhow::Result<()> {
+        let any = serde_json::json!({});
+        set_offline_rpc_result(
+            responses,
+            "psy_get_user_ids_for_public_key",
+            any.clone(),
+            serde_json::json!([OFFLINE_USER_ID]),
+        );
+
+        // registration checks: leaf hash non-zero + a proof whose leaf is the key
+        let registration_id = get_registration_id_from_user_id(OFFLINE_USER_ID);
+        set_offline_rpc_result(
+            responses,
+            "psy_get_user_registration_tree_leaf_hash",
+            any.clone(),
+            serde_json::to_value(&qhash_seed(700))?,
+        );
+        let registration_proof = psy_crypto::hash::merkle::core::MerkleProofCore {
+            root: chain.global_state_roots.user_registration_tree_root,
+            value: public_key,
+            index: registration_id,
+            siblings: Vec::new(),
+        };
+        set_offline_rpc_result(
+            responses,
+            "psy_get_user_registration_tree_merkle_proof",
+            any.clone(),
+            serde_json::to_value(&registration_proof)?,
+        );
+
+        set_offline_rpc_result(
+            responses,
+            "psy_get_checkpoint_leaf_data",
+            any.clone(),
+            serde_json::to_value(&chain.checkpoint_leaf)?,
+        );
+        set_offline_rpc_result(
+            responses,
+            "psy_get_checkpoint_tree_root",
+            any.clone(),
+            serde_json::to_value(&chain.checkpoint_tree_proof.root)?,
+        );
+        set_offline_rpc_result(
+            responses,
+            "psy_get_user_tree_root",
+            any.clone(),
+            serde_json::to_value(&chain.user_tree_proof.root)?,
+        );
+        set_offline_rpc_result(
+            responses,
+            "psy_get_user_tree_merkle_proof",
+            any.clone(),
+            serde_json::to_value(&chain.user_tree_proof)?,
+        );
+        // The provider stitches realm + coordinator proofs: it keeps the
+        // realm-level siblings of the served full proof and appends the
+        // coordinator-level suffix fetched here.
+        let user_tree_top_proof = psy_crypto::hash::merkle::core::MerkleProofCore {
+            root: chain.user_tree_proof.root,
+            value: qhash_seed(0),
+            index: 0,
+            siblings: chain.user_tree_proof.siblings[REALM_USER_TREE_HEIGHT as usize..].to_vec(),
+        };
+        set_offline_rpc_result(
+            responses,
+            "psy_get_user_sub_tree_merkle_proof",
+            any.clone(),
+            serde_json::to_value(&user_tree_top_proof)?,
+        );
+        set_offline_rpc_result(
+            responses,
+            "psy_get_checkpoint_tree_merkle_proof",
+            any.clone(),
+            serde_json::to_value(&chain.checkpoint_tree_proof)?,
+        );
+
+        for (index, contract) in chain.contracts.iter().enumerate() {
+            let by_contract = serde_json::json!({ "contract_id": contract.contract_id });
+            set_offline_rpc_result(
+                responses,
+                "psy_get_contract_leaf_data",
+                by_contract.clone(),
+                serde_json::to_value(&chain.contract_leaves[index])?,
+            );
+            set_offline_rpc_result(
+                responses,
+                "psy_get_contract_code_definition",
+                by_contract.clone(),
+                serde_json::to_value(&contract.deploy.code_definition)?,
+            );
+            set_offline_rpc_result(
+                responses,
+                "psy_get_contract_tree_merkle_proof",
+                by_contract.clone(),
+                serde_json::to_value(&chain.contract_tree_proofs[index])?,
+            );
+            for (fn_id, proof) in chain.fn_tree_proofs[index].iter().enumerate() {
+                set_offline_rpc_result(
+                    responses,
+                    "psy_get_contract_function_tree_merkle_proof",
+                    serde_json::json!({ "contract_id": contract.contract_id, "function_id": fn_id as u32 * 2 }),
+                    serde_json::to_value(proof)?,
+                );
+            }
+            set_offline_rpc_result(
+                responses,
+                "psy_get_user_contract_state_tree_merkle_proof",
+                by_contract.clone(),
+                serde_json::to_value(&chain.state_slot_proofs[index])?,
+            );
+            set_offline_rpc_result(
+                responses,
+                "psy_get_user_contract_tree_merkle_proof",
+                by_contract,
+                serde_json::to_value(&chain.user_contract_tree_proofs[index])?,
+            );
+        }
+        Ok(())
+    }
+
+    /// The dead offline network config with every realm/coordinator RPC
+    /// endpoint pointed at the loopback mock.
+    pub(crate) fn loopback_network_config(port: u16) -> psy_config::NetworkConfigGoldilocks {
+        serde_json::from_value(serde_json::json!({
+            "magic": "1",
+            "users_per_realm": 8,
+            "global_user_tree_height": 8,
+            "realm_user_tree_height": 4,
+            "group_realm_height": 4,
+            "realm_configs": [{"id": 0, "rpc_url": [format!("http://127.0.0.1:{}", port)]}],
+            "coordinator_configs": [{"id": 0, "rpc_url": [format!("http://127.0.0.1:{}", port)]}],
+            "prove_proxy_url": [],
+            "faucet_rpc_url": [],
+            "nostr_relay_url": "ws://127.0.0.1:1",
+            "native_currency": "PSY",
+            "native_currency_decimal": 18,
+            "native_currency_name": "Psy",
+            "fees": {
+                "register_user_fee": 0,
+                "deploy_contract_fee": 0,
+                "guta_fee": 0,
+                "da_fee": 0
+            }
+        }))
+        .expect("loopback network config must deserialize")
+    }
+
+    /// One contract on the synthetic chain: its deploy artifacts plus the
+    /// function-tree leaf position of the method the tests exercise.
+    pub(crate) struct SeededContract {
+        contract_id: u64,
+        state_tree_height: u8,
+        deploy: QBCDeployContract<F>,
+        /// The full circuit definitions the deploy was built from (the code
+        /// definition embedded in the deploy carries only method metadata).
+        defs: Vec<DPNFunctionCircuitDefinition>,
+        /// Index of the exercised method inside the code definition; its
+        /// circuit fingerprint sits at whitelist leaf `2 * used_fn_id`.
+        used_fn_id: u32,
+    }
+
+    impl SeededContract {
+        fn used_fingerprint(&self) -> QHashOut<F> {
+            self.deploy.function_whitelist[self.used_fn_id as usize * 2]
+        }
+    }
+
+    fn seeded_contract_from_defs(contract_id: u64, state_tree_height: u8, defs: &[DPNFunctionCircuitDefinition], method: &str) -> SeededContract {
+        let fn_id = defs
+            .iter()
+            .position(|def| def.name == method)
+            .unwrap_or_else(|| panic!("contract must expose method {}", method));
+        let (_, deploy) = gen_contract_deploy_and_circuits_for_functions::<C, D>(QHashOut::default(), state_tree_height, defs)
+            .expect("deploy artifacts must build");
+        // `gen_contract_deploy_and_circuits_for_functions` interleaves each
+        // function's fingerprint and metadata pair into consecutive whitelist
+        // leaves; assert the layout before relying on it below.
+        assert!(
+            deploy.function_whitelist.len() >= (fn_id + 1) * 2,
+            "function whitelist must hold the fingerprint of {}",
+            method
+        );
+        SeededContract {
+            contract_id,
+            state_tree_height,
+            deploy,
+            defs: defs.to_vec(),
+            used_fn_id: fn_id as u32,
+        }
+    }
+
+    /// Compile the shared helper contract and describe it for seeding.
+    pub(crate) fn seeded_helper_contract() -> SeededContract {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct OfflineHelperContract {
+                pub value: Felt,
+            }
+
+            #[contract_implementation]
+            impl OfflineHelperContract {
+                #[contract_method]
+                pub fn set_value(&mut self, ctx: &ChainContext, new_value: Felt) {
+                    self.value = new_value;
+                }
+
+                #[contract_method]
+                pub fn get_value(&mut self, ctx: &ChainContext) -> Felt {
+                    return self.value;
+                }
+            }
+        "#;
+        let output =
+            crate::session::compile_bridge::compile_contract_output(source).unwrap_or_else(|error| panic!("helper contract must compile: {}", error));
+        seeded_contract_from_defs(
+            OFFLINE_HELPER_CONTRACT_ID,
+            output.state_tree_height() as u8,
+            &output.circuit_definitions,
+            "set_value",
+        )
+    }
+
+    /// Load the authoritative token contract from `client_prover/token.json`
+    /// (a serialized compilation artifact) and rebuild its deploy artifacts
+    /// without any network access. The token is required because the
+    /// burn-fee step always targets contract 0.
+    pub(crate) fn seeded_token_contract() -> SeededContract {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../token.json");
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {}", path, error));
+        let artifact: CompilationArtifact = serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {}: {}", path, error));
+        seeded_contract_from_defs(
+            TOKEN_CONTRACT_ID as u64,
+            artifact.state_tree_height as u8,
+            &artifact.circuit_definitions,
+            "simple_burn",
+        )
+    }
+
+    /// The faucet submits `claim(recipient, amount)` against the faucet
+    /// contract (id 3): seed a minimal contract exposing exactly that method
+    /// so the operator submit pipeline runs end-to-end offline.
+    pub(crate) fn seeded_faucet_contract() -> SeededContract {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct OfflineFaucetContract {
+                pub claimed: Felt,
+            }
+
+            #[contract_implementation]
+            impl OfflineFaucetContract {
+                #[contract_method]
+                pub fn claim(&mut self, ctx: &ChainContext, recipient: Felt, amount: Felt) {
+                    self.claimed = amount;
+                }
+            }
+        "#;
+        let output =
+            crate::session::compile_bridge::compile_contract_output(source).unwrap_or_else(|error| panic!("faucet contract must compile: {}", error));
+        seeded_contract_from_defs(3, output.state_tree_height() as u8, &output.circuit_definitions, "claim")
+    }
+
+    /// The whole synthetic chain: every tree is a real `SimpleMerkleTree`, so
+    /// every requested proof verifies and every cross-constraint holds
+    /// simultaneously (contract tree root ↔ checkpoint roots, fn tree root ↔
+    /// contract leaf, roots hash ↔ checkpoint leaf global chain root, user
+    /// contract tree root ↔ user leaf state root).
+    pub(crate) struct OfflineChainFixture {
+        contracts: Vec<SeededContract>,
+        checkpoint_leaf: PsyCheckpointLeaf<F>,
+        checkpoint_tree_proof: MerkleProofCore<QHashOut<F>>,
+        global_state_roots: PsyCheckpointGlobalStateRoots<F>,
+        user_leaf: PsyUserLeaf<F>,
+        user_tree_proof: MerkleProofCore<QHashOut<F>>,
+        contract_leaves: Vec<PsyContractLeaf<F>>,
+        contract_tree_proofs: Vec<MerkleProofCore<QHashOut<F>>>,
+        /// Per-contract proof for every function leaf (fingerprint of fn i at
+        /// leaf 2i), so any method — not just the one a test exercises —
+        /// resolves from the cache without falling back to RPC.
+        fn_tree_proofs: Vec<Vec<MerkleProofCore<QHashOut<F>>>>,
+        state_slot_proofs: Vec<MerkleProofCore<QHashOut<F>>>,
+        user_contract_tree_proofs: Vec<MerkleProofCore<QHashOut<F>>>,
+    }
+
+    pub(crate) fn build_offline_chain(public_key: QHashOut<F>, contracts: Vec<SeededContract>) -> OfflineChainFixture {
+        // Per-contract function trees (whitelist leaves at consecutive
+        // indices, fingerprint of fn i at leaf 2i) and state trees (leaf 0
+        // holds the token balance at element 0).
+        let mut fn_trees = Vec::with_capacity(contracts.len());
+        let mut state_trees = Vec::with_capacity(contracts.len());
+        for contract in &contracts {
+            let mut fn_tree = OfflineTree::new(CONTRACT_FUNCTION_TREE_HEIGHT);
+            for (leaf_index, leaf) in contract.deploy.function_whitelist.iter().enumerate() {
+                fn_tree.set_leaf(leaf_index as u64, *leaf);
+            }
+            let mut state_tree = OfflineTree::new(contract.state_tree_height);
+            let slot0 = if contract.contract_id == TOKEN_CONTRACT_ID as u64 {
+                // simple_burn reads sub-slot 0 (leaf 0, element 0), matching
+                // the ABI layout where `balance` sits at felt offset 0.
+                QHashOut::from_values(OFFLINE_TOKEN_BALANCE, 0, 0, 0)
+            } else {
+                QHashOut::ZERO
+            };
+            state_tree.set_leaf(0, slot0);
+            fn_trees.push(fn_tree);
+            state_trees.push(state_tree);
+        }
+
+        let contract_leaves = contracts
+            .iter()
+            .zip(&fn_trees)
+            .map(|(contract, fn_tree)| PsyContractLeaf::<F> {
+                deployer: QHashOut::default(),
+                function_tree_root: fn_tree.get_root(),
+                code_root: contract.deploy.code_root,
+                state_tree_height: F::from_canonical_u8(contract.state_tree_height),
+                state_layout_root: QHashOut::default(),
+                state_layout_field_count: F::ZERO,
+                state_layout_slot_count: F::ZERO,
+            })
+            .collect();
+
+        // The user contract tree (leaf per contract id = that contract's
+        // state tree root) must fold to the user leaf's state root, because
+        // the UPS step circuits verify user contract tree updates against it.
+        let mut user_contract_tree = OfflineTree::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+        for (contract, state_tree) in contracts.iter().zip(&state_trees) {
+            user_contract_tree.set_leaf(contract.contract_id, state_tree.get_root());
+        }
+
+        let mut global_contract_tree = OfflineTree::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+        for (contract, leaf) in contracts.iter().zip(&contract_leaves) {
+            let leaf_hash: QHashOut<F> = <PsyContractLeaf<F> as QFieldHashable<F>>::qfhash::<PsyHasher>(leaf);
+            global_contract_tree.set_leaf(contract.contract_id, leaf_hash);
+        }
+
+        let user_leaf = PsyUserLeaf::<F> {
+            public_key,
+            user_state_tree_root: user_contract_tree.get_root(),
+            balance: F::ZERO,
+            nonce: F::from_canonical_u64(5),
+            last_checkpoint_id: F::from_canonical_u64(OFFLINE_CHECKPOINT_ID - 1),
+            event_index: F::ZERO,
+            user_id: F::from_canonical_u64(OFFLINE_USER_ID),
+        };
+        let mut user_tree = OfflineTree::new(GLOBAL_USER_TREE_HEIGHT);
+        user_tree.set_leaf(OFFLINE_USER_ID, user_leaf.qfhash::<PsyHasher>());
+
+        // The ups_start circuit constrains the checkpoint leaf's global chain
+        // root to the hash of exactly these roots.
+        let global_state_roots = PsyCheckpointGlobalStateRoots::<F> {
+            contract_tree_root: global_contract_tree.get_root(),
+            deposit_tree_root: qhash_seed(521),
+            user_tree_root: user_tree.get_root(),
+            withdrawal_tree_root: qhash_seed(522),
+            user_registration_tree_root: qhash_seed(523),
+        };
+        let mut checkpoint_leaf = PsyCheckpointLeaf::<F>::default();
+        checkpoint_leaf.global_chain_root = global_state_roots.qfhash::<PsyHasher>();
+        let mut checkpoint_tree = OfflineTree::new(CHECKPOINT_TREE_HEIGHT);
+        checkpoint_tree.set_leaf(OFFLINE_CHECKPOINT_ID, checkpoint_leaf.qfhash::<PsyHasher>());
+
+        let contract_tree_proofs = contracts
+            .iter()
+            .map(|contract| global_contract_tree.get_leaf(contract.contract_id))
+            .collect();
+        let fn_tree_proofs = contracts
+            .iter()
+            .zip(&fn_trees)
+            .map(|(contract, fn_tree)| {
+                let fn_count = contract.deploy.function_whitelist.len() / 2;
+                (0..fn_count)
+                    .map(|fn_id| {
+                        let proof = fn_tree.get_leaf(fn_id as u64 * 2);
+                        assert_eq!(
+                            proof.value,
+                            contract.deploy.function_whitelist[fn_id * 2],
+                            "function tree leaf must carry the circuit fingerprint"
+                        );
+                        proof
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let state_slot_proofs = state_trees.iter().map(|tree| tree.get_leaf(0)).collect();
+        let user_contract_tree_proofs = contracts
+            .iter()
+            .map(|contract| user_contract_tree.get_leaf(contract.contract_id))
+            .collect();
+
+        OfflineChainFixture {
+            contracts,
+            checkpoint_leaf,
+            checkpoint_tree_proof: checkpoint_tree.get_leaf(OFFLINE_CHECKPOINT_ID),
+            global_state_roots,
+            user_leaf,
+            user_tree_proof: user_tree.get_leaf(OFFLINE_USER_ID),
+            contract_leaves,
+            contract_tree_proofs,
+            fn_tree_proofs,
+            state_slot_proofs,
+            user_contract_tree_proofs,
+        }
+    }
+
+    /// Seed every cache the pipeline reads so no lps query falls through to
+    /// an RPC: checkpoint/user leaves and tree proofs, per-contract leaves,
+    /// code definitions, inclusion proofs, state slots and the user contract
+    /// tree leaves.
+    fn seed_cmd_store_from_chain(cmd_store: &mut PsyCmdStoreWithCache<F, RpcProvider>, chain: &OfflineChainFixture) {
+        cmd_store.set_user_id(OFFLINE_USER_ID);
+
+        cmd_store
+            .cache
+            .checkpoint_leaf_cache
+            .insert(OFFLINE_CHECKPOINT_ID, chain.checkpoint_leaf.clone());
+        cmd_store.cache.user_leaf_cache.insert(
+            QSRCmdGetUserLeafData {
+                checkpoint_id: OFFLINE_CHECKPOINT_ID,
+                user_id: OFFLINE_USER_ID,
+            },
+            chain.user_leaf,
+        );
+        cmd_store.cache.hash_cmd_cache.insert(
+            QSRHashCmd::GetCheckpointTreeRoot(QSRHashCmdGetCheckpointTreeRoot {
+                checkpoint_id: OFFLINE_CHECKPOINT_ID,
+            }),
+            chain.checkpoint_tree_proof.root,
+        );
+        cmd_store.cache.merkle_cmd_cache.insert(
+            QSRMerkleCmd::GetCheckpointTreeMerkleProof(QSRMerkleCmdGetCheckpointTreeMerkleProof {
+                checkpoint_id: OFFLINE_CHECKPOINT_ID,
+                leaf_checkpoint_id: OFFLINE_CHECKPOINT_ID,
+            }),
+            chain.checkpoint_tree_proof.clone(),
+        );
+        cmd_store.cache.merkle_cmd_cache.insert(
+            QSRMerkleCmd::GetUserTreeMerkleProof(QSRMerkleCmdGetUserTreeMerkleProof {
+                checkpoint_id: OFFLINE_CHECKPOINT_ID,
+                user_id: OFFLINE_USER_ID,
+            }),
+            chain.user_tree_proof.clone(),
+        );
+
+        for (((contract, leaf), contract_tree_proof), index) in chain
+            .contracts
+            .iter()
+            .zip(&chain.contract_leaves)
+            .zip(&chain.contract_tree_proofs)
+            .zip(0..)
+        {
+            cmd_store.cache.contract_leaf_cache.insert(contract.contract_id, leaf.clone());
+            cmd_store
+                .cache
+                .contract_code_definition_cache
+                .insert(contract.contract_id, contract.deploy.code_definition.clone());
+            cmd_store.cache.merkle_cmd_cache.insert(
+                QSRMerkleCmd::GetContractTreeMerkleProof(QSRMerkleCmdGetContractTreeMerkleProof {
+                    checkpoint_id: OFFLINE_CHECKPOINT_ID,
+                    contract_id: contract.contract_id as u32,
+                }),
+                contract_tree_proof.clone(),
+            );
+            for (fn_id, fn_tree_proof) in chain.fn_tree_proofs[index].iter().enumerate() {
+                cmd_store.cache.merkle_cmd_cache.insert(
+                    QSRMerkleCmd::GetContractFunctionTreeMerkleProof(QSRMerkleCmdGetContractFunctionTreeMerkleProof {
+                        checkpoint_id: OFFLINE_CHECKPOINT_ID,
+                        contract_id: contract.contract_id as u32,
+                        function_id: fn_id as u32 * 2,
+                    }),
+                    fn_tree_proof.clone(),
+                );
+            }
+            cmd_store.cache.merkle_cmd_cache.insert(
+                QSRMerkleCmd::GetUserContractStateTreeMerkleProof(QSRMerkleCmdGetUserContractStateTreeMerkleProof {
+                    checkpoint_id: OFFLINE_CHECKPOINT_ID,
+                    user_id: OFFLINE_USER_ID,
+                    contract_id: contract.contract_id as u32,
+                    height: contract.state_tree_height,
+                    leaf_id: 0,
+                }),
+                chain.state_slot_proofs[index].clone(),
+            );
+            cmd_store.cache.merkle_cmd_cache.insert(
+                QSRMerkleCmd::GetUserContractTreeMerkleProof(QSRMerkleCmdGetUserContractTreeMerkleProof {
+                    checkpoint_id: OFFLINE_CHECKPOINT_ID,
+                    user_id: OFFLINE_USER_ID,
+                    contract_id: contract.contract_id as u32,
+                }),
+                chain.user_contract_tree_proofs[index].clone(),
+            );
+        }
+    }
+
+    /// Build a fully-seeded step proving manager for `public_key` on the
+    /// synthetic chain. Mirrors `create_clean_user_session` but sources every
+    /// read from seeded caches (plus the loopback roots RPC) instead of a
+    /// live realm.
+    async fn seeded_user_proving_session(
+        wallet_session: &WalletSession,
+        cmd_provider: RpcProvider,
+        public_key: QHashOut<F>,
+        chain: &OfflineChainFixture,
+    ) -> anyhow::Result<UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>> {
+        let mut cmd_store = PsyCmdStoreWithCache::<F, RpcProvider>::new(OFFLINE_CHECKPOINT_ID, cmd_provider);
+        seed_cmd_store_from_chain(&mut cmd_store, chain);
+
+        let lps = PsyLocalProvingSessionStore::<F, RpcProvider, PoseidonHash>::new_at_with_cmd_store(
+            cmd_store,
+            F::from_canonical_u64(OFFLINE_CHECKPOINT_ID),
+            F::from_canonical_u64(OFFLINE_USER_ID),
+            F::from_canonical_u64(6),
+            F::ZERO,
+            UPS_SESSION_PROOF_TREE_HEIGHT as usize,
+        );
+        let whitelist_root = wallet_session.wallet.random_circuit_manager().ups_circuit_whitelist_root().await?;
+        UserProvingSessionManager::<F, PoseidonHash, RpcProvider, C, D>::new(lps, wallet_session.circuit_info.clone(), whitelist_root).await
+    }
+
+    /// Register a fresh zk user on the shared offline wallet and return its
+    /// public key hash.
+    async fn offline_zk_public_key(shared: &Arc<parking_lot::RwLock<WalletSession>>) -> anyhow::Result<QHashOut<F>> {
+        let mut wallet_session = shared.write();
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(901, 902, 903, 904))
+            .await?;
+        Ok(pk_info.qfhash::<PsyHasher>())
+    }
+
+    /// Build a `TraceBuildSession` against the seeded chain, bypassing
+    /// `begin_trace_build`'s user-resolution RPC.
+    async fn offline_trace_build_session<'a>(
+        wallet_session: &'a WalletSession,
+        cmd_provider: RpcProvider,
+        public_key: QHashOut<F>,
+        chain: &OfflineChainFixture,
+    ) -> anyhow::Result<TraceBuildSession<'a>> {
+        let mut user_session_mgr = seeded_user_proving_session(wallet_session, cmd_provider, public_key, chain).await?;
+        // Mirror `initialize_transaction_session`: prove ups_start so its leaf
+        // sits in the proof tree before the first step records its start root
+        // (`begin_trace_build` proves through `build_transaction_preview_session`).
+        user_session_mgr
+            .prove_ups_start(wallet_session.wallet.random_circuit_manager().as_ref())
+            .await?;
+        let ups_start_witness_input = user_session_mgr.get_ups_start_witness().await?;
+        Ok(TraceBuildSession {
+            wallet_session,
+            public_key,
+            user_session_mgr,
+            trace_arena: TraceArenaBuilder::new(),
+            ups_start_witness_input,
+            ups_start_registration_proof: None,
+        })
+    }
+
+    /// Direct probe of the token balance read the fee burn performs: the
+    /// seeded state-slot cache must survive the whole lps read path
+    /// (contract-leaf height lookup, cache hit, store injection) and yield
+    /// the balance at element 0 of state-tree leaf 0.
+    #[tokio::test]
+    async fn offline_token_balance_read_returns_seeded_slot() -> anyhow::Result<()> {
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        let chain = build_offline_chain(QHashOut::from_values(1, 2, 3, 4), vec![seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+        let cmd_provider = RpcProvider::new_with_config(&loopback_network_config(port))?.with_user_id_owned(OFFLINE_USER_ID);
+
+        let mut cmd_store = PsyCmdStoreWithCache::<F, RpcProvider>::new(OFFLINE_CHECKPOINT_ID, cmd_provider);
+        seed_cmd_store_from_chain(&mut cmd_store, &chain);
+
+        let direct = cmd_store
+            .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractStateTreeMerkleProof(
+                QSRMerkleCmdGetUserContractStateTreeMerkleProof {
+                    checkpoint_id: OFFLINE_CHECKPOINT_ID,
+                    user_id: OFFLINE_USER_ID,
+                    contract_id: TOKEN_CONTRACT_ID,
+                    height: chain.contracts[0].state_tree_height,
+                    leaf_id: 0,
+                },
+            ))
+            .await?;
+        assert_eq!(direct.value, QHashOut::from_values(OFFLINE_TOKEN_BALANCE, 0, 0, 0));
+
+        let mut lps = PsyLocalProvingSessionStore::<F, RpcProvider, PoseidonHash>::new_at_with_cmd_store(
+            cmd_store,
+            F::from_canonical_u64(OFFLINE_CHECKPOINT_ID),
+            F::from_canonical_u64(OFFLINE_USER_ID),
+            F::from_canonical_u64(6),
+            F::ZERO,
+            UPS_SESSION_PROOF_TREE_HEIGHT as usize,
+        );
+        let slot = lps.get_contract_state_slot(F::ZERO, F::ZERO).await?;
+        assert_eq!(slot.value, QHashOut::from_values(OFFLINE_TOKEN_BALANCE, 0, 0, 0), "lps slot read");
+        assert_eq!(
+            slot.root, chain.user_contract_tree_proofs[0].value,
+            "slot root must be the token state tree root"
+        );
+
+        // Now replay the exact pre-VM sequence the burn call performs: UCT
+        // leaf read, init_transaction, get_call_start_data — none of which may
+        // zero out or replace the seeded slot.
+        let uct_leaf = lps.get_self_user_contract_tree_leaf(F::ZERO).await?;
+        assert_ne!(uct_leaf.value, QHashOut::ZERO, "token UCT leaf is the seeded state root");
+        assert_eq!(uct_leaf.value, chain.user_contract_tree_proofs[0].value);
+
+        lps.init_transaction(DPNProvingSessionSimpleMethodCall {
+            caller_contract_id: F::from_canonical_u64(psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64),
+            contract_id: F::ZERO,
+            method_id: F::from_canonical_u32(TOKEN_SIMPLE_BURN_METHOD_ID),
+            inputs: vec![F::ONE],
+        })
+        .await?;
+        let _ = lps
+            .get_call_start_data(F::ZERO, F::from_canonical_u32(TOKEN_SIMPLE_BURN_METHOD_ID), &[F::ONE])
+            .await?;
+
+        let after = lps.get_contract_state_slot(F::ZERO, F::ZERO).await?;
+        assert_eq!(
+            after.value,
+            QHashOut::from_values(OFFLINE_TOKEN_BALANCE, 0, 0, 0),
+            "slot after call-start"
+        );
+
+        // Balance read as the VM would issue it (simple_burn resolves its
+        // sub-slot template through Constant(0): leaf 0, element 0).
+        let read = lps
+            .resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_single(0u64))
+            .await?;
+        assert_eq!(read.result[0], F::from_canonical_u64(OFFLINE_TOKEN_BALANCE), "VM-style sub-slot 0 read");
+
+        // Finally the full pipeline shape: a helper write on another contract
+        // first (updating the user contract tree at the write checkpoint),
+        // then the burn's read must still see the seeded balance.
+        let helper = seeded_helper_contract();
+        let helper_id = F::from_canonical_u64(helper.contract_id);
+        let mut full_chain = build_offline_chain(QHashOut::from_values(1, 2, 3, 4), vec![helper, seeded_token_contract()]);
+        let (port2, rpc_seen2, responses2) = spawn_offline_rpc().await;
+        set_offline_responses(&responses2, &full_chain)?;
+        let cmd_provider2 = RpcProvider::new_with_config(&loopback_network_config(port2))?.with_user_id_owned(OFFLINE_USER_ID);
+        let mut cmd_store2 = PsyCmdStoreWithCache::<F, RpcProvider>::new(OFFLINE_CHECKPOINT_ID, cmd_provider2);
+        seed_cmd_store_from_chain(&mut cmd_store2, &full_chain);
+        let mut lps2 = PsyLocalProvingSessionStore::<F, RpcProvider, PoseidonHash>::new_at_with_cmd_store(
+            cmd_store2,
+            F::from_canonical_u64(OFFLINE_CHECKPOINT_ID),
+            F::from_canonical_u64(OFFLINE_USER_ID),
+            F::from_canonical_u64(6),
+            F::ZERO,
+            UPS_SESSION_PROOF_TREE_HEIGHT as usize,
+        );
+
+        // helper set_value: write felt 42 at sub-slot 0 of the helper contract
+        lps2.init_transaction(DPNProvingSessionSimpleMethodCall {
+            caller_contract_id: F::from_canonical_u64(psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64),
+            contract_id: helper_id,
+            method_id: F::from_canonical_u32(full_chain.contracts[0].deploy.code_definition.functions[0].method_id),
+            inputs: vec![F::from_canonical_u64(42)],
+        })
+        .await?;
+        let _ = lps2
+            .get_call_start_data(
+                helper_id,
+                F::from_canonical_u32(full_chain.contracts[0].deploy.code_definition.functions[0].method_id),
+                &[F::from_canonical_u64(42)],
+            )
+            .await?;
+        let _ = lps2.resolve_vec(&DPNStateCmd::set_contract_state_slot_single(1u64, 0u64, 42u64)).await?;
+
+        // burn call on the token contract
+        lps2.init_transaction(DPNProvingSessionSimpleMethodCall {
+            caller_contract_id: F::from_canonical_u64(psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64),
+            contract_id: F::ZERO,
+            method_id: F::from_canonical_u32(TOKEN_SIMPLE_BURN_METHOD_ID),
+            inputs: vec![F::ONE],
+        })
+        .await?;
+        let _ = lps2
+            .get_call_start_data(F::ZERO, F::from_canonical_u32(TOKEN_SIMPLE_BURN_METHOD_ID), &[F::ONE])
+            .await?;
+        let burn_read = lps2
+            .resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_single(0u64))
+            .await?;
+        assert_eq!(
+            burn_read.result[0],
+            F::from_canonical_u64(OFFLINE_TOKEN_BALANCE),
+            "balance after a sibling-contract write (pipeline shape)"
+        );
+
+        let leaked = rpc_seen.lock().clone();
+        assert!(leaked.is_empty(), "probe must be fully cached, saw: {:?}", leaked);
+        let leaked2 = rpc_seen2.lock().clone();
+        assert!(leaked2.is_empty(), "second probe must be fully cached, saw: {:?}", leaked2);
+        Ok(())
+    }
+
+    /// The helper contract compiles to the shapes the other tests rely on:
+    /// `set_value` is one write command, `get_value` is a pure getter with
+    /// zero state commands (field reads are lowered implicitly).
+    #[test]
+    fn offline_helper_method_definitions_have_expected_shapes() {
+        let helper = seeded_helper_contract();
+        let set_value = helper.defs.iter().find(|def| def.name == "set_value").expect("set_value must exist");
+        assert_eq!(set_value.state_commands.len(), 1);
+        assert!(matches!(set_value.state_commands[0], DPNStateCmd::SetContractStateSlotSingle(_)));
+        assert!(!set_value.is_view_function());
+
+        let get_value = helper.defs.iter().find(|def| def.name == "get_value").expect("get_value must exist");
+        assert!(get_value.state_commands.is_empty(), "pure getter carries no state commands");
+        assert!(get_value.events.is_empty());
+        assert!(get_value.is_view_function());
+    }
+
+    #[tokio::test]
+    async fn offline_generate_tx_trace_builds_standard_burn_and_sign_steps() -> anyhow::Result<()> {
+        let shared = shared_offline_wallet_session().await;
+        let public_key = offline_zk_public_key(&shared).await?;
+        let wallet_session = shared.read();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        set_offline_responses(&responses, &chain)?;
+        let cmd_provider = RpcProvider::new_with_config(&loopback_network_config(port))?.with_user_id_owned(OFFLINE_USER_ID);
+
+        let mut builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+
+        let is_view = builder
+            .trace_call(ContractCallArgs {
+                contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                method_name: "set_value".to_string(),
+                inputs: vec![42],
+            })
+            .await?;
+        assert!(!is_view, "set_value mutates state and must not classify as a view");
+
+        let trace = builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?;
+
+        assert_eq!(trace.meta.user_id, OFFLINE_USER_ID);
+        assert_eq!(trace.meta.public_key, public_key);
+        assert_eq!(trace.anchor.start_checkpoint_id, OFFLINE_CHECKPOINT_ID);
+        assert_eq!(trace.steps.len(), 3, "expected standard call + burn fee + zk sign");
+        assert!(matches!(trace.steps[0], crate::trace::TraceStep::Standard(_)));
+        assert!(matches!(trace.steps[1], crate::trace::TraceStep::BurnFee(_)));
+        assert!(matches!(trace.steps[2], crate::trace::TraceStep::ZkSign(_)));
+
+        let mut embedded_contract_ids: Vec<u64> = trace.contract_codes.iter().map(|code| code.contract_id).collect();
+        embedded_contract_ids.sort();
+        let mut expected = vec![OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64];
+        expected.sort();
+        assert_eq!(embedded_contract_ids, expected, "trace must embed helper and token contract code");
+
+        assert_ne!(trace.finalization.tx_hash, QHashOut::ZERO);
+        assert_ne!(trace.finalization.sig_hash, QHashOut::ZERO);
+        assert_eq!(trace.finalization.nonce, F::from_canonical_u64(6));
+        assert!(
+            trace.ups_start_witness.proof.is_none(),
+            "freshly built traces carry no precomputed start proof"
+        );
+
+        let leaked = rpc_seen.lock().clone();
+        assert!(
+            leaked.iter().all(|method| method == "psy_get_checkpoint_global_state_roots"),
+            "offline build must only issue the checkpoint roots RPC, saw: {:?}",
+            leaked
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn offline_prove_trace_step_pipeline_runs_until_submit_fails() -> anyhow::Result<()> {
+        // The submit anchor / tx-status / final submit RPCs flow through the
+        // session's own provider, so this test needs a private wallet
+        // session whose provider points at the loopback mock; the shared
+        // session keeps its dead endpoints (and its parsed circuit bundle).
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(911, 912, 913, 914))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+
+        let cmd_provider = wallet_session.st_provider.clone();
+        let mut builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+        builder
+            .trace_call(ContractCallArgs {
+                contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                method_name: "set_value".to_string(),
+                inputs: vec![7],
+            })
+            .await?;
+        let trace = builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?;
+
+        let mut state: Option<ProvingState> = None;
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        let mut terminal_error: Option<String> = None;
+        for _ in 0..8 {
+            let result = wallet_session
+                .prove_trace_step(
+                    public_key,
+                    &trace,
+                    state.as_ref(),
+                    if state.is_some() { Some(blobs.as_slice()) } else { None },
+                )
+                .await;
+            match result {
+                TraceProvingStepResult::Progress { state: next_state, proofs } => {
+                    // Drop the in-memory manager between steps so the resume
+                    // path (restore from ProvingState + proof blobs) is
+                    // exercised, exactly like a restarted prover. Each step
+                    // returns only its newly proven blobs, so accumulate.
+                    wallet_session.user_session_mgrs.remove(&public_key);
+                    state = Some(next_state);
+                    blobs.extend(proofs);
+                }
+                TraceProvingStepResult::Submitted(_) => {
+                    anyhow::bail!("offline submit unexpectedly succeeded; the mock must reject every end-cap submit");
+                }
+                TraceProvingStepResult::Failed { error } => {
+                    terminal_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let error = terminal_error.unwrap_or_else(|| "prove loop never reached a terminal state".to_string());
+        assert!(
+            error.contains("submit_end_cap_proof rpc call failed"),
+            "expected the canned submit rejection, got: {}",
+            error
+        );
+
+        let allowed = [
+            "psy_get_checkpoint_global_state_roots",
+            "psy_get_latest_l2_block_state",
+            "psy_get_user_leaf_data",
+            "psy_submit_user_end_cap",
+        ];
+        let leaked = rpc_seen.lock().clone();
+        assert!(
+            leaked.iter().all(|method| allowed.contains(&method.as_str())),
+            "offline pipeline issued unexpected RPCs: {:?}",
+            leaked
+        );
+        Ok(())
+    }
+
+    /// `simulate_contract_call` must split on the fee-free-view
+    /// classification: a getter-only simulation returns bare metadata with no
+    /// prove envelope (and no recorded reads, since the pure getter compiles
+    /// to zero state commands), while a mutating simulation embeds the full
+    /// generated trace.
+    #[tokio::test]
+    async fn offline_simulate_contract_call_splits_view_and_mutating_paths() -> anyhow::Result<()> {
+        let shared = shared_offline_wallet_session().await;
+        let public_key = offline_zk_public_key(&shared).await?;
+        let wallet_session = shared.read();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        set_offline_responses(&responses, &chain)?;
+        let cmd_provider = RpcProvider::new_with_config(&loopback_network_config(port))?.with_user_id_owned(OFFLINE_USER_ID);
+
+        let builder = offline_trace_build_session(&wallet_session, cmd_provider.clone(), public_key, &chain).await?;
+        let simulated = builder
+            .simulate_contract_call(ContractCallData::new(vec![ContractCallArgs {
+                contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                method_name: "get_value".to_string(),
+                inputs: vec![],
+            }]))
+            .await?;
+
+        assert!(simulated.generated.is_none(), "view simulation must not generate a prove envelope");
+        assert!(simulated.metadata.tx_hash.is_none());
+        assert!(simulated.metadata.end_cap_data.is_none());
+        assert!(
+            simulated.metadata.storage_data.writes.is_empty(),
+            "view simulation must not write storage"
+        );
+        assert!(
+            simulated.metadata.storage_data.reads.is_empty(),
+            "the pure getter compiles to zero state commands, so no storage read is recorded"
+        );
+        let calls = &simulated.metadata.contract_call_data.contract_calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].contract_id, OFFLINE_HELPER_CONTRACT_ID);
+        assert_eq!(calls[0].method_name, "get_value");
+
+        let builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+        let simulated = builder
+            .simulate_contract_call(ContractCallData::new(vec![ContractCallArgs {
+                contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                method_name: "set_value".to_string(),
+                inputs: vec![9],
+            }]))
+            .await?;
+
+        let generated = simulated.generated.expect("mutating simulation must embed the generated trace");
+        assert_eq!(generated.tx_count, 3, "standard call + burn fee + zk sign");
+        assert_eq!(generated.user_id, OFFLINE_USER_ID.to_string());
+        let decoded: crate::trace::TxTrace = serde_json::from_str(&generated.trace.payload)?;
+        assert_eq!(decoded.steps.len(), 3);
+        assert!(matches!(decoded.steps[0], crate::trace::TraceStep::Standard(_)));
+        assert!(
+            simulated
+                .metadata
+                .storage_data
+                .writes
+                .iter()
+                .any(|write| { write.contract_id == OFFLINE_HELPER_CONTRACT_ID && write.new_value.0.elements[0] == F::from_canonical_u64(9) }),
+            "set_value write must surface in storage data, writes: {:?}",
+            simulated.metadata.storage_data.writes
+        );
+
+        let leaked = rpc_seen.lock().clone();
+        assert!(
+            leaked.iter().all(|method| method == "psy_get_checkpoint_global_state_roots"),
+            "offline simulation must only issue the checkpoint roots RPC, saw: {:?}",
+            leaked
+        );
+        Ok(())
+    }
+
+    /// The parallel job-graph proving path: schedule + plan built purely from
+    /// the trace, then the graph runs every job (ups_start, CFC steps, zk
+    /// sign, end cap) until the final submit job hits the canned rejection.
+    #[tokio::test]
+    async fn offline_prove_trace_jobs_by_graph_runs_until_submit_rejects() -> anyhow::Result<()> {
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(921, 922, 923, 924))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+
+        let cmd_provider = wallet_session.st_provider.clone();
+        let mut builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+        builder
+            .trace_call(ContractCallArgs {
+                contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                method_name: "set_value".to_string(),
+                inputs: vec![5],
+            })
+            .await?;
+        let trace = std::sync::Arc::new(builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?);
+
+        let wallet_session = std::sync::Arc::new(wallet_session);
+        let plan = wallet_session.build_trace_proof_plan_from_trace(&trace).await?;
+        let error = wallet_session
+            .clone()
+            .prove_trace_jobs_by_graph(public_key, trace.clone(), &plan)
+            .await
+            .expect_err("the canned submit rejection must fail the graph");
+        let message = format!("{:#}", error);
+        assert!(
+            message.contains("submit_end_cap_proof rpc call failed"),
+            "expected the canned submit rejection, got: {}",
+            message
+        );
+
+        // every job up to and including zk sign completed and left its
+        // recorded output; only the submit job failed, failing the graph
+        for job in [TraceProofJobId::UpsStart, TraceProofJobId::CfcStep(0), TraceProofJobId::ZkSign] {
+            assert!(
+                matches!(wallet_session.local_proving_job_status_for_trace(&trace, job), Some(JobStatus::Completed)),
+                "job {:?} must complete before the submit rejection",
+                job
+            );
+        }
+        assert!(matches!(
+            wallet_session.local_proving_job_status_for_trace(&trace, TraceProofJobId::Submit),
+            Some(JobStatus::Failed)
+        ));
+        assert!(matches!(
+            wallet_session.local_proving_graph_status_for_trace(&trace),
+            Some(JobStatus::Failed)
+        ));
+        let statuses = wallet_session.local_proving_job_statuses_for_trace(&trace);
+        assert!(statuses.contains_key(&TraceProofJobId::EndCap), "the plan must schedule the end-cap job");
+
+        let graph_id = WalletSession::local_proving_graph_id_for_trace(&trace);
+        let results = wallet_session.local_proving_job_results_for_graph(graph_id.clone());
+        assert!(matches!(results.get(&TraceProofJobId::UpsStart), Some(TraceProofJobOutput::UpsStart { .. })));
+        assert!(matches!(
+            results.get(&TraceProofJobId::CfcStep(0)),
+            Some(TraceProofJobOutput::CfcStep { step_index: 0, .. })
+        ));
+        assert!(matches!(
+            wallet_session.local_proving_job_result_for_graph(graph_id, TraceProofJobId::ZkSign),
+            Some(TraceProofJobOutput::ZkSign { .. })
+        ));
+
+        // the recorded end-cap output re-submits through the public helper and
+        // surfaces the same canned rejection
+        let graph_id = WalletSession::local_proving_graph_id_for_trace(&trace);
+        let endcap = wallet_session
+            .local_proving_job_result_for_graph(graph_id, TraceProofJobId::EndCap)
+            .expect("the end-cap job must have completed before the submit job");
+        let error = wallet_session
+            .submit_endcap_job(&trace, endcap)
+            .await
+            .expect_err("re-submitting must hit the canned rejection");
+        assert!(
+            format!("{:#}", error).contains("submit_end_cap_proof rpc call failed"),
+            "unexpected re-submit failure: {:#}",
+            error
+        );
+
+        let allowed = [
+            "psy_get_checkpoint_global_state_roots",
+            "psy_get_latest_l2_block_state",
+            "psy_get_user_leaf_data",
+            "psy_submit_user_end_cap",
+        ];
+        let leaked = rpc_seen.lock().clone();
+        assert!(
+            leaked.iter().all(|method| allowed.contains(&method.as_str())),
+            "offline job graph issued unexpected RPCs: {:?}",
+            leaked
+        );
+        Ok(())
+    }
+
+    /// Contract deploy and update submissions: the layout-aware deploy
+    /// command is accepted by the canned chain RPC, while the plain update
+    /// command is rejected by shape validation before any RPC (updates must
+    /// attach a canonical layout proof first).
+    #[tokio::test]
+    async fn offline_deploy_submits_and_update_rejects_unshaped_commands() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        responses.lock().push(OfflineRpcRule {
+            method: "psy_deploy_contract".to_string(),
+            params: None,
+            response: serde_json::json!({ "result": "offline-deploy-ok" }),
+        });
+
+        let output = crate::session::compile_bridge::compile_contract_output(
+            r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct OfflineDeployContract {
+                pub value: Felt,
+            }
+
+            #[contract_implementation]
+            impl OfflineDeployContract {
+                #[contract_method]
+                pub fn set_value(&mut self, ctx: &ChainContext, new_value: Felt) {
+                    self.value = new_value;
+                }
+            }
+        "#,
+        )?;
+        let deployer = QHashOut::from_values(51, 52, 53, 54);
+
+        let deployed = wallet_session
+            .deploy_contract_with_abi(deployer, output.circuit_definitions.clone(), output.abi)
+            .await?;
+        assert_eq!(deployed, "offline-deploy-ok");
+
+        let updated = wallet_session
+            .update_contract(9002, deployer, output.circuit_definitions)
+            .await
+            .expect_err("the plain update command lacks the canonical layout proof");
+        assert!(
+            format!("{:#}", updated).contains("layout protocol version must be non-zero"),
+            "unexpected update rejection: {:#}",
+            updated
+        );
+        Ok(())
+    }
+
+    /// An sd-key signing user proves and submits a contract call offline: the
+    /// sd-key circuit is registered for the exact (contract, method) pairs the
+    /// trace performs (helper set_value + token burn fee, two introspectable
+    /// txs), the session signs through the sd-key witness, and the canned
+    /// submit acceptance completes `exec_contract_call`.
+    #[tokio::test]
+    async fn offline_sd_key_user_proves_and_submits_a_contract_call() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+
+        let helper = seeded_helper_contract();
+        let token = seeded_token_contract();
+        // the sd-key policy checks ABI method ids, not circuit-definition
+        // positions: the standard tx records set_value's compiled method id
+        // and the burn step always targets the token's fixed burn method
+        let set_value_method_id = helper.defs.iter().find(|def| def.name == "set_value").unwrap().method_id;
+
+        let sd_fingerprint = wallet_session
+            .register_sd_key_circuit(
+                &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
+                &[set_value_method_id, TOKEN_SIMPLE_BURN_METHOD_ID],
+                2,
+            )
+            .await?;
+        let private_key = QHashOut::from_values(961, 962, 963, 964);
+        let pk_info = wallet_session.wallet.get_or_create_user(private_key, sd_fingerprint).await?;
+        assert_eq!(pk_info.fingerprint, sd_fingerprint);
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![helper, token]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+        responses.lock().insert(
+            0,
+            OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&QHashOut::<F>::ZERO)? }),
+            },
+        );
+
+        let tx_hash = wallet_session
+            .exec_contract_call(
+                public_key,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                    method_name: "set_value".to_string(),
+                    inputs: vec![7],
+                }]),
+            )
+            .await?;
+        assert_ne!(tx_hash, QHashOut::<F>::ZERO);
+        Ok(())
+    }
+
+    /// The sd-key signing source survives into the parallel job graph: the
+    /// trace records the sd-key circuit policy plus witness, the plan's
+    /// zk-sign job rebuilds the circuit from the trace, and the graph runs to
+    /// the canned submit acceptance.
+    #[tokio::test]
+    async fn offline_sd_key_trace_proves_via_job_graph() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+
+        let helper = seeded_helper_contract();
+        let token = seeded_token_contract();
+        // the sd-key policy checks ABI method ids, not circuit-definition
+        // positions: the standard tx records set_value's compiled method id
+        // and the burn step always targets the token's fixed burn method
+        let set_value_method_id = helper.defs.iter().find(|def| def.name == "set_value").unwrap().method_id;
+        let sd_fingerprint = wallet_session
+            .register_sd_key_circuit(
+                &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
+                &[set_value_method_id, TOKEN_SIMPLE_BURN_METHOD_ID],
+                2,
+            )
+            .await?;
+        let pk_info = wallet_session
+            .wallet
+            .get_or_create_user(QHashOut::from_values(971, 972, 973, 974), sd_fingerprint)
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![helper, token]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+        responses.lock().insert(
+            0,
+            OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&QHashOut::<F>::ZERO)? }),
+            },
+        );
+
+        let cmd_provider = wallet_session.st_provider.clone();
+        let mut builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+        builder
+            .trace_call(ContractCallArgs {
+                contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                method_name: "set_value".to_string(),
+                inputs: vec![9],
+            })
+            .await?;
+        let trace = std::sync::Arc::new(builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?);
+
+        let wallet_session = std::sync::Arc::new(wallet_session);
+        let plan = wallet_session.build_trace_proof_plan_from_trace(&trace).await?;
+        let tx_hash = wallet_session
+            .clone()
+            .prove_trace_jobs_by_graph(public_key, trace, &plan)
+            .await?;
+        assert_ne!(tx_hash, QHashOut::<F>::ZERO);
+        Ok(())
+    }
+
+    /// `claim_batch` with a `PrivateTransfer` item, entirely offline: the
+    /// wallet proves the note-inclusion proof through the local fallback
+    /// minifier, the batch validates the claim payload against the proof's
+    /// public inputs, injects the proof into the session proof tree, and
+    /// proves the seeded `private_claim` contract call (17 payload words +
+    /// 64 proof-tree sibling words + leaf index = 82 inputs) before the
+    /// shadowed submit.
+    #[tokio::test]
+    async fn claim_batch_proves_a_private_transfer_offline() -> anyhow::Result<()> {
+        use plonky2::field::types::PrimeField64;
+        use psy_client_data::privacy::private_note_inclusion::PrivateNoteInclusionInput;
+        use psy_client_data::qdata::user::PsyUserLeaf;
+        use psy_config::network_constants::{PRIVATE_NOTE_TREE_HEIGHT, TOKEN_CONTRACT_STATE_TREE_HEIGHT};
+        use psy_crypto::hash::{
+            merkle::utils::simple_merkle_tree::SimpleMerkleTree,
+            traits::hasher::FieldQHasher,
+        };
+
+        const CLAIM_CONTRACT_ID: u64 = 9;
+
+        let params = (0..82).map(|i| format!("p{i}: Felt")).collect::<Vec<_>>().join(", ");
+        let source = format!(
+            r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct OfflinePrivateClaimContract {{
+                pub claimed: Felt,
+            }}
+
+            #[contract_implementation]
+            impl OfflinePrivateClaimContract {{
+                #[contract_method]
+                pub fn private_claim(&mut self, ctx: &ChainContext, {params}) {{
+                    self.claimed = p0;
+                }}
+            }}
+        "#
+        );
+        let output = crate::session::compile_bridge::compile_contract_output(&source)
+            .unwrap_or_else(|error| panic!("private-claim contract must compile: {}", error));
+        let claim_contract = seeded_contract_from_defs(
+            CLAIM_CONTRACT_ID,
+            output.state_tree_height() as u8,
+            &output.circuit_definitions,
+            "private_claim",
+        );
+
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(981, 982, 983, 984))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract(), claim_contract]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+        responses.lock().insert(
+            0,
+            OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&QHashOut::<F>::ZERO)? }),
+            },
+        );
+
+        // the same witness chain as the wallet-level fallback test; the claim
+        // contract plays the token contract that anchors the note tree
+        type OfflineTree = SimpleMerkleTree<PsyHasher, QHashOut<F>>;
+        let nullifier_secret = QHashOut::from_values(31, 32, 33, 34);
+        let note_secret = QHashOut::from_values(41, 42, 43, 44);
+        let owner = QHashOut::from_values(51, 52, 53, 54);
+        let amount = F::from_canonical_u64(777);
+        let checkpoint_id = F::from_canonical_u64(33);
+
+        let value_hash = QHashOut(HashOut { elements: [amount, F::ZERO, F::ZERO, F::ZERO] });
+        let inner_hash = PsyHasher::q_two_to_one(owner, value_hash);
+        let note_commitment = PsyHasher::q_hash_many(
+            &nullifier_secret
+                .0
+                .elements
+                .iter()
+                .chain(&note_secret.0.elements)
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        let commitment = PsyHasher::q_two_to_one(inner_hash, note_commitment);
+
+        let note_index = 5u64;
+        let mut note_tree = OfflineTree::new(PRIVATE_NOTE_TREE_HEIGHT as u8);
+        note_tree.set_leaf(note_index, commitment);
+        let note_membership_proof = note_tree.get_leaf(note_index);
+
+        let note_root_slot = 3u64;
+        let mut state_tree = OfflineTree::new(TOKEN_CONTRACT_STATE_TREE_HEIGHT);
+        state_tree.set_leaf(note_root_slot, note_membership_proof.root);
+        let note_root_slot_proof = state_tree.get_leaf(note_root_slot);
+
+        let mut user_state_tree = OfflineTree::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+        user_state_tree.set_leaf(CLAIM_CONTRACT_ID, note_root_slot_proof.root);
+        let contract_proof = user_state_tree.get_leaf(CLAIM_CONTRACT_ID);
+
+        let sender_user_id = 2u64;
+        let user_leaf = PsyUserLeaf::new_user_default(
+            F::from_canonical_u64(sender_user_id),
+            QHashOut::from_values(61, 62, 63, 64),
+            contract_proof.root,
+        );
+        let mut user_tree = OfflineTree::new(GLOBAL_USER_TREE_HEIGHT);
+        user_tree.set_leaf(sender_user_id, user_leaf.qfhash::<PsyHasher>());
+        let user_tree_proof = user_tree.get_leaf(sender_user_id);
+        let user_tree_root = user_tree_proof.root;
+
+        let input = PrivateNoteInclusionInput {
+            nullifier_secret,
+            sender_user_id,
+            contract_id: CLAIM_CONTRACT_ID,
+            user_leaf,
+            owner,
+            amount,
+            note_secret,
+            note_membership_proof,
+            note_root_slot,
+            note_root_slot_proof,
+            contract_proof,
+            user_tree_proof,
+            checkpoint_id,
+        };
+
+        let (fingerprint, note_proof, note_verifier) = wallet_session.wallet.prove_private_note_inclusion(&input).await?;
+        assert_ne!(fingerprint, QHashOut::<F>::ZERO);
+
+        // preflight: the minified proof's public input must equal the
+        // 16-value hash the claim payload recomputes
+        let expected_note_pi = PsyHasher::q_hash_many(
+            &owner
+                .0
+                .elements
+                .iter()
+                .copied()
+                .chain([amount])
+                .chain(user_tree_root.0.elements)
+                .chain([
+                    checkpoint_id,
+                    F::from_canonical_u64(note_root_slot),
+                    F::from_canonical_u64(CLAIM_CONTRACT_ID),
+                ])
+                .chain(PsyHasher::q_hash_many(&nullifier_secret.0.elements).0.elements)
+                .collect::<Vec<_>>(),
+        );
+        let actual_note_pi = QHashOut(HashOut {
+            elements: [
+                note_proof.public_inputs[0],
+                note_proof.public_inputs[1],
+                note_proof.public_inputs[2],
+                note_proof.public_inputs[3],
+            ],
+        });
+        assert_eq!(
+            expected_note_pi, actual_note_pi,
+            "note proof public inputs diverge: len={}",
+            note_proof.public_inputs.len()
+        );
+
+        // the nullifier field carries the nullifier HASH (the circuit's public
+        // input), not the raw secret
+        let nullifier_hash = PsyHasher::q_hash_many(&nullifier_secret.0.elements);
+        let claim = PrivateTransferClaim {
+            nullifier: nullifier_hash.0.elements.map(|element| element.to_canonical_u64()),
+            owner: owner.0.elements.map(|element| element.to_canonical_u64()),
+            amount: 777,
+            user_tree_root: user_tree_root.0.elements.map(|element| element.to_canonical_u64()),
+            checkpoint_id: 33,
+            note_root_slot: 3,
+            token_contract_id: CLAIM_CONTRACT_ID,
+            random0: 5,
+            random1: 6,
+            note_proof_fingerprint: fingerprint,
+            note_proof,
+            note_verifier_data: note_verifier,
+        };
+
+        // preflight the exact hash claim_batch recomputes from the payload
+        let payload_hash = claim.expected_note_proof_public_inputs_hash();
+        assert_eq!(payload_hash, actual_note_pi, "payload_hash={payload_hash} proof_pi={actual_note_pi} direct={expected_note_pi}");
+
+        let tx_hash = wallet_session
+            .claim_batch(
+                public_key,
+                vec![ClaimBatchItem::PrivateTransfer {
+                    contract_id: CLAIM_CONTRACT_ID,
+                    claim,
+                }],
+            )
+            .await?;
+        assert_ne!(tx_hash, QHashOut::<F>::ZERO);
+        Ok(())
+    }
+
+    /// `claim_batch` with a `ShieldDeposit` item: the fallback deposit
+    /// inclusion proof goes into the proof tree and the seeded
+    /// `claim_deposit` contract call proves against it (40 payload words +
+    /// 64 proof-tree sibling words + proof index = 105 inputs). Unlike the
+    /// private-transfer arm, only the leaf root is checked — the payload is
+    /// not re-hashed against the proof's public inputs.
+    #[tokio::test]
+    async fn claim_batch_proves_a_shield_deposit_offline() -> anyhow::Result<()> {
+        use plonky2::field::types::PrimeField64;
+        use psy_client_data::privacy::deposit_inclusion::DepositInclusionInput;
+        use psy_crypto::hash::{
+            merkle::utils::simple_merkle_tree::SimpleMerkleTree,
+            traits::hasher::FieldQHasher,
+        };
+
+        const DEPOSIT_CLAIM_CONTRACT_ID: u64 = 10;
+
+        let params = (0..105).map(|i| format!("p{i}: Felt")).collect::<Vec<_>>().join(", ");
+        let source = format!(
+            r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct OfflineClaimDepositContract {{
+                pub claimed: Felt,
+            }}
+
+            #[contract_implementation]
+            impl OfflineClaimDepositContract {{
+                #[contract_method]
+                pub fn claim_deposit(&mut self, ctx: &ChainContext, {params}) {{
+                    self.claimed = p0;
+                }}
+            }}
+        "#
+        );
+        let output = crate::session::compile_bridge::compile_contract_output(&source)
+            .unwrap_or_else(|error| panic!("claim-deposit contract must compile: {}", error));
+        let deposit_contract = seeded_contract_from_defs(
+            DEPOSIT_CLAIM_CONTRACT_ID,
+            output.state_tree_height() as u8,
+            &output.circuit_definitions,
+            "claim_deposit",
+        );
+
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(991, 992, 993, 994))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract(), deposit_contract]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+        responses.lock().insert(
+            0,
+            OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&QHashOut::<F>::ZERO)? }),
+            },
+        );
+
+        // the same relayer-leaf layout as the wallet-level fallback test
+        type OfflineTree = SimpleMerkleTree<PsyHasher, QHashOut<F>>;
+        let nullifier_secret =
+            [F::from_canonical_u64(71), F::from_canonical_u64(72), F::from_canonical_u64(73), F::from_canonical_u64(74)];
+        let note_secret =
+            [F::from_canonical_u64(81), F::from_canonical_u64(82), F::from_canonical_u64(83), F::from_canonical_u64(84)];
+        let shield_address = QHashOut::from_values(91, 92, 93, 94);
+        let deposit_index = 6u64;
+        let token_address = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let l2_token_contract_id = [9u32, 10, 11, 12, 13, 14, 15, 16];
+        let amount_value: u64 = 9876543210;
+        let amount = [0u32, 0, 0, 0, 0, 0, (amount_value >> 32) as u32, amount_value as u32];
+        let source_chain_index = 3u32;
+
+        let split_words = |hash: &QHashOut<F>| -> [F; 8] {
+            std::array::from_fn(|i| {
+                let value = hash.0.elements[i / 2].to_canonical_u64();
+                if i % 2 == 0 {
+                    F::from_canonical_u64(value >> 32)
+                } else {
+                    F::from_canonical_u64(value & 0xffffffff)
+                }
+            })
+        };
+
+        let nullifier_hash = PsyHasher::q_hash_many(&nullifier_secret);
+        let note_commitment =
+            PsyHasher::q_hash_many(&nullifier_secret.iter().chain(&note_secret).copied().collect::<Vec<_>>());
+        let shield_words = split_words(&shield_address);
+        let note_words = split_words(&note_commitment);
+
+        let mut preimage = Vec::with_capacity(41);
+        preimage.extend_from_slice(&shield_words);
+        preimage.extend_from_slice(&token_address.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        preimage
+            .extend_from_slice(&l2_token_contract_id.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        preimage.extend_from_slice(&amount.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        preimage.push(F::from_canonical_u32(source_chain_index));
+        preimage.extend_from_slice(&note_words);
+        let deposit_commitment = PsyHasher::q_hash_many(&preimage);
+
+        let mut deposit_tree = OfflineTree::new(psy_config::network_constants::GLOBAL_DEPOSIT_TREE_HEIGHT);
+        deposit_tree.set_leaf(deposit_index, deposit_commitment);
+        let deposit_proof = deposit_tree.get_leaf(deposit_index);
+        let deposit_root = deposit_proof.root;
+
+        let input = DepositInclusionInput {
+            nullifier_secret,
+            note_secret,
+            shield_address,
+            deposit_index,
+            token_address,
+            l2_token_contract_id,
+            amount,
+            source_chain_index,
+            deposit_root,
+            deposit_proof,
+        };
+
+        let (fingerprint, proof, verifier) = wallet_session.wallet.prove_shield_deposit_claim(&input).await?;
+        assert_ne!(fingerprint, QHashOut::<F>::ZERO);
+
+        let claim = ShieldDepositClaim {
+            contract_id: DEPOSIT_CLAIM_CONTRACT_ID,
+            l2_token_contract_id,
+            nullifier_hash,
+            shield_address,
+            token_address,
+            amount,
+            source_chain_index,
+            deposit_root,
+            note_commitment,
+            deposit_index,
+            r0: 7,
+            r1: 8,
+            proof_fingerprint: fingerprint,
+            proof,
+            verifier_data: verifier,
+        };
+
+        let tx_hash = wallet_session
+            .claim_batch(public_key, vec![ClaimBatchItem::ShieldDeposit(claim)])
+            .await?;
+        assert_ne!(tx_hash, QHashOut::<F>::ZERO);
+        Ok(())
+    }
+
+    /// The one-shot prove API: submit-anchor check, full in-session step
+    /// proving (ups_start, every CFC step, zk sign) and the final submit,
+    /// which the offline mock rejects.
+    #[tokio::test]
+    async fn offline_prove_tx_trace_runs_all_steps_until_submit_rejects() -> anyhow::Result<()> {
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(931, 932, 933, 934))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+
+        let cmd_provider = wallet_session.st_provider.clone();
+        let mut builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+        builder
+            .trace_call(ContractCallArgs {
+                contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                method_name: "set_value".to_string(),
+                inputs: vec![3],
+            })
+            .await?;
+        let trace = builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?;
+
+        let error = wallet_session
+            .prove_tx_trace(public_key, &trace)
+            .await
+            .expect_err("the canned submit rejection must fail the one-shot prove");
+        let message = error.to_string();
+        assert!(
+            message.contains("submit_end_cap_proof rpc call failed"),
+            "expected the canned submit rejection, got: {}",
+            message
+        );
+
+        let allowed = [
+            "psy_get_checkpoint_global_state_roots",
+            "psy_get_latest_l2_block_state",
+            "psy_get_user_leaf_data",
+            "psy_submit_user_end_cap",
+        ];
+        let leaked = rpc_seen.lock().clone();
+        assert!(
+            leaked.iter().all(|method| allowed.contains(&method.as_str())),
+            "offline one-shot prove issued unexpected RPCs: {:?}",
+            leaked
+        );
+        Ok(())
+    }
+
+    /// The production trace-build entry (`generate_tx_trace` through
+    /// `begin_trace_build` + `initialize_transaction_session`) runs fully
+    /// offline against the canned chain: user-id resolution from the
+    /// registration index, a cache-empty lps fetching every merkle proof over
+    /// RPC, ups_start prove, the standard call and the burn fee.
+    #[tokio::test]
+    async fn offline_generate_tx_trace_real_entry_resolves_user_and_fetches_proofs_over_rpc() -> anyhow::Result<()> {
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(941, 942, 943, 944))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+
+        let trace = wallet_session
+            .generate_tx_trace(
+                public_key,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                    method_name: "set_value".to_string(),
+                    inputs: vec![11],
+                }]),
+            )
+            .await?;
+
+        assert_eq!(trace.meta.user_id, OFFLINE_USER_ID);
+        assert_eq!(trace.steps.len(), 3, "standard call + burn fee + zk sign");
+        assert!(matches!(trace.steps[0], crate::trace::TraceStep::Standard(_)));
+        assert!(matches!(trace.steps[1], crate::trace::TraceStep::BurnFee(_)));
+
+        let leaked = rpc_seen.lock().clone();
+        assert!(
+            leaked.iter().any(|method| method == "psy_get_user_ids_for_public_key"),
+            "the real entry must resolve the user id from the registration index, saw: {:?}",
+            leaked
+        );
+        assert!(
+            leaked.iter().any(|method| method == "psy_get_user_contract_state_tree_merkle_proof"),
+            "the cache-empty lps must fetch state slots over RPC, saw: {:?}",
+            leaked
+        );
+        assert!(
+            leaked.iter().all(|method| !method.starts_with("psy_submit")),
+            "building must not submit anything, saw: {:?}",
+            leaked
+        );
+        Ok(())
+    }
+
+    /// `call_view` executes read-only methods through a fresh session and
+    /// reports the storage reads, while rejecting a mutating method outright.
+    #[tokio::test]
+    async fn offline_call_view_executes_getter_and_rejects_mutation() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(951, 952, 953, 954))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+
+        let view = wallet_session
+            .call_view(
+                public_key,
+                ViewCallData::new(vec![ContractCallArgs {
+                    contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                    method_name: "get_value".to_string(),
+                    inputs: vec![],
+                }]),
+            )
+            .await?;
+        assert_eq!(view.checkpoint_id, OFFLINE_CHECKPOINT_ID);
+        assert_eq!(view.contract_calls.len(), 1);
+        assert_eq!(view.contract_calls[0].method_name, "get_value");
+        assert!(
+            view.storage_reads.is_empty(),
+            "the pure getter compiles to zero state commands, so no storage read is reported"
+        );
+
+        let rejected = wallet_session
+            .call_view(
+                public_key,
+                ViewCallData::new(vec![ContractCallArgs {
+                    contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                    method_name: "set_value".to_string(),
+                    inputs: vec![1],
+                }]),
+            )
+            .await
+            .expect_err("mutating methods must be rejected by the view preflight");
+        assert!(
+            rejected.to_string().contains("is not read-only"),
+            "expected the read-only rejection, got: {}",
+            rejected
+        );
+        Ok(())
+    }
+
+    /// The legacy one-call entry (`exec_contract_call`): session start,
+    /// direct CFC proving of the call plus burn fee, then sign-and-submit,
+    /// which the offline mock rejects.
+    #[tokio::test]
+    async fn offline_exec_contract_call_legacy_path_runs_until_submit_rejects() -> anyhow::Result<()> {
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(961, 962, 963, 964))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+
+        let error = wallet_session
+            .exec_contract_call(
+                public_key,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                    method_name: "set_value".to_string(),
+                    inputs: vec![13],
+                }]),
+            )
+            .await
+            .expect_err("the canned submit rejection must fail the legacy exec path");
+        assert!(
+            error.to_string().contains("offline canned rpc rejection"),
+            "expected the canned submit rejection, got: {}",
+            error
+        );
+
+        let leaked = rpc_seen.lock().clone();
+        assert!(
+            leaked.iter().any(|method| method == "psy_submit_user_end_cap"),
+            "the legacy path must reach the end-cap submit, saw: {:?}",
+            leaked
+        );
+        Ok(())
+    }
+
+    /// External zk-sign proofs can be injected into a live offline session:
+    /// `start_session` proves ups_start, then `add_external_proof` /
+    /// `add_external_proof_with_siblings` append consecutive proof-tree
+    /// leaves whose Merkle path binds to the session root, and unknown
+    /// users are rejected before touching the tree.
+    #[tokio::test]
+    async fn offline_inject_external_proofs_into_session() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let private_key = QHashOut::from_values(971, 972, 973, 974);
+        let pk_info = wallet_session.wallet.add_zk_private_key(private_key).await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+
+        wallet_session.start_session(public_key).await?;
+
+        let sighash = QHashOut::<F>::from_values(31, 32, 33, 34);
+        let fingerprint = wallet_session.wallet.zk_circuit_fingerprint().await?;
+        let first = wallet_session.wallet.prove_zk_sign(private_key, sighash).await?;
+        let second = wallet_session.wallet.prove_zk_sign(private_key, sighash).await?;
+        let verifier = wallet_session.wallet.zk_circuit_verifier_config().await?;
+
+        let leaf_a = wallet_session.add_external_proof(public_key, fingerprint, first, verifier.clone()).await?;
+        let (leaf_b, siblings) = wallet_session
+            .add_external_proof_with_siblings(public_key, fingerprint, second.clone(), verifier.clone())
+            .await?;
+        assert_eq!(leaf_b, leaf_a + 1, "external proofs must occupy consecutive leaves");
+        assert!(!siblings.is_empty(), "the session proof tree must return a non-empty path");
+
+        // unknown users are rejected before touching the proof tree
+        let error = wallet_session
+            .add_external_proof(QHashOut::ZERO, fingerprint, second, verifier)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not found"));
+        Ok(())
+    }
+
+    /// An external zk-sign proof injected during trace build becomes an
+    /// `ExternalProof` arena step; the job graph then proves it from the
+    /// serialized trace alone (no live session state), re-injecting the leaf
+    /// during restore, and still only the canned submit rejection fails.
+    #[tokio::test]
+    async fn offline_trace_with_external_proof_step_proves_via_job_graph() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let private_key = QHashOut::from_values(981, 982, 983, 984);
+        let pk_info = wallet_session.wallet.add_zk_private_key(private_key).await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+
+        let cmd_provider = wallet_session.st_provider.clone();
+        let mut builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+
+        // one external zk-sign proof, sitting after the ups_start leaf
+        let sighash = QHashOut::<F>::from_values(41, 42, 43, 44);
+        let fingerprint = wallet_session.wallet.zk_circuit_fingerprint().await?;
+        let proof = wallet_session.wallet.prove_zk_sign(private_key, sighash).await?;
+        let verifier = wallet_session.wallet.zk_circuit_verifier_config().await?;
+        let external_ref = builder.add_external_proof(fingerprint, proof, verifier).await?;
+        assert_eq!(external_ref.proof_index, 1, "ups_start holds leaf 0, the external proof follows");
+
+        builder
+            .trace_call(ContractCallArgs {
+                contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                method_name: "set_value".to_string(),
+                inputs: vec![7],
+            })
+            .await?;
+        let trace = std::sync::Arc::new(builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?);
+        assert!(
+            trace.steps.iter().any(|step| matches!(step, crate::trace::TraceStep::ExternalProof(_))),
+            "the arena must carry the external proof step"
+        );
+
+        let wallet_session = std::sync::Arc::new(wallet_session);
+        let plan = wallet_session.build_trace_proof_plan_from_trace(&trace).await?;
+        let error = wallet_session
+            .clone()
+            .prove_trace_jobs_by_graph(public_key, trace.clone(), &plan)
+            .await
+            .expect_err("the canned submit rejection must fail the graph");
+        assert!(
+            format!("{:#}", error).contains("submit_end_cap_proof rpc call failed"),
+            "expected the canned submit rejection, got: {:#}",
+            error
+        );
+
+        // the external proof job ran from the serialized trace and completed
+        assert!(matches!(
+            wallet_session.local_proving_job_status_for_trace(&trace, TraceProofJobId::ExternalProof(0)),
+            Some(JobStatus::Completed)
+        ));
+        let results = wallet_session.local_proving_job_results_for_trace(&trace);
+        assert!(matches!(
+            results.get(&TraceProofJobId::ExternalProof(0)),
+            Some(TraceProofJobOutput::ExternalProof { step_index: 0, .. })
+        ));
+        Ok(())
+    }
+
+    /// When the chain advances while the client holds its session (the served
+    /// user leaf carries a newer nonce than the session's cached leaf), the
+    /// tx-status check on session restart must reject with the stale-nonce
+    /// error instead of building on outdated state.
+    #[tokio::test]
+    async fn offline_stale_user_leaf_nonce_rejects_session_restart() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(991, 992, 993, 994))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+
+        wallet_session.start_session(public_key).await?;
+
+        // the realm moves on: serve a leaf whose nonce jumped ahead. The rule
+        // is inserted at the front so it shadows the fixture rule (first
+        // match wins); the session's own cached leaf keeps its old nonce.
+        let mut advanced_leaf = chain.user_leaf.clone();
+        advanced_leaf.nonce = advanced_leaf.nonce + F::from_canonical_u64(5);
+        responses.lock().insert(
+            0,
+            OfflineRpcRule {
+                method: "psy_get_user_leaf_data".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&advanced_leaf)? }),
+            },
+        );
+
+        let error = wallet_session
+            .start_session(public_key)
+            .await
+            .expect_err("the advanced chain leaf must invalidate the session nonce");
+        let message = format!("{:#}", error);
+        assert!(
+            message.contains("stale nonce"),
+            "expected the stale-nonce rejection, got: {}",
+            message
+        );
+        Ok(())
+    }
+
+    /// A public key with no registration entry resolves to no user id, and
+    /// the real entry must surface the register-first error instead of
+    /// building a trace for a ghost user.
+    #[tokio::test]
+    async fn offline_unregistered_public_key_is_rejected_before_trace_build() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(995, 996, 997, 998))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+        // shadow the resolution rule: this key has no registered user id
+        responses.lock().insert(
+            0,
+            OfflineRpcRule {
+                method: "psy_get_user_ids_for_public_key".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": [] }),
+            },
+        );
+
+        let error = wallet_session
+            .generate_tx_trace(
+                public_key,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                    method_name: "set_value".to_string(),
+                    inputs: vec![1],
+                }]),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("an unregistered key must not build a trace");
+        let message = format!("{:#}", error);
+        assert!(
+            message.contains("not registered"),
+            "expected the register-first rejection, got: {}",
+            message
+        );
+        Ok(())
+    }
+
+    /// End-cap inclusion polling reads only the canned user leaf and block
+    /// state: the fixture leaf's hash is reported included at the latest
+    /// checkpoint, any other hash stays excluded and the bounded wait gives
+    /// up with the timeout error.
+    #[tokio::test]
+    async fn offline_endcap_inclusion_polls_the_canned_user_leaf() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(999, 998, 997, 996))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+
+        let included = chain.user_leaf.qfhash::<PsyHasher>();
+        assert!(
+            wallet_session
+                .is_endcap_included_at_checkpoint(OFFLINE_CHECKPOINT_ID, OFFLINE_USER_ID, included)
+                .await?
+        );
+        assert!(
+            !wallet_session
+                .is_endcap_included_at_checkpoint(OFFLINE_CHECKPOINT_ID, OFFLINE_USER_ID, QHashOut::ZERO)
+                .await?
+        );
+
+        let found = wallet_session
+            .wait_for_endcap_inclusion(OFFLINE_USER_ID, included, OFFLINE_CHECKPOINT_ID, Some(5), 1)
+            .await?;
+        assert_eq!(found, OFFLINE_CHECKPOINT_ID, "the canned leaf hash must be found at the latest checkpoint");
+
+        let error = wallet_session
+            .wait_for_endcap_inclusion(OFFLINE_USER_ID, QHashOut::from_values(1, 2, 3, 4), OFFLINE_CHECKPOINT_ID, Some(0), 1)
+            .await
+            .expect_err("a foreign leaf hash is never included, so the bounded wait must time out");
+        let message = format!("{:#}", error);
+        assert!(
+            message.contains("timeout waiting endcap inclusion"),
+            "expected the endcap wait timeout, got: {}",
+            message
+        );
+        Ok(())
+    }
+
+    /// The public-call arm of `claim_batch` runs offline like any standard
+    /// call: per-item proving, the burn fee, the tx-status check and the
+    /// final submit, which the mock rejects. An empty batch bails up front.
+    #[tokio::test]
+    async fn offline_claim_batch_public_items_run_until_submit_rejects() -> anyhow::Result<()> {
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(993, 992, 991, 990))
+            .await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+
+        let error = wallet_session
+            .claim_batch(public_key, vec![])
+            .await
+            .expect_err("an empty claim batch must bail before any work");
+        assert!(
+            error.to_string().contains("No claims to execute"),
+            "expected the empty-batch rejection, got: {}",
+            error
+        );
+
+        let error = wallet_session
+            .claim_batch(
+                public_key,
+                vec![ClaimBatchItem::Public(ContractCallArgs {
+                    contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                    method_name: "set_value".to_string(),
+                    inputs: vec![21],
+                })],
+            )
+            .await
+            .expect_err("the canned submit rejection must fail the claim batch");
+        let message = format!("{:#}", error);
+        assert!(
+            message.contains("offline canned rpc rejection"),
+            "expected the canned submit rejection, got: {}",
+            message
+        );
+        Ok(())
+    }
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "is_sync"))]
 mod tests {
     use std::{path::Path, thread, time::Duration};
@@ -5321,34 +8592,201 @@ mod tests {
         let error = ensure_private_transfer_contract_matches(5, 4).unwrap_err();
         assert!(error.to_string().contains("proof token_contract_id=4"));
     }
-
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod async_split_tests {
-    use std::{fs, path::Path, process::Command, str::FromStr, thread, time::Duration};
+    use std::{path::Path, process::Command, str::FromStr, time::Duration};
 
-    use psy_client_data::{dpn::proving_session::DPNProvingSessionSimpleMethodCall, privacy::deposit_inclusion::DepositInclusionInput};
+    use anyhow::Context;
+    use psy_client_data::privacy::{deposit_inclusion::DepositInclusionInput, private_note_inclusion::PrivateNoteInclusionInput};
     use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
     use psy_crypto::shield_address::{
-        derive_deposit_commitment, derive_note_commitment, derive_nullifier_hash, derive_shield_address, qhashout_to_bytes32_be, qhashout_to_u32x8_be,
+        derive_deposit_commitment, derive_note_commitment, derive_nullifier_hash, derive_shield_address, qhashout_to_bytes32_be,
     };
-    use psy_dpn_circuit::circuits::privacy::{deposit_inclusion::DepositInclusionCircuit, private_note_inclusion::PrivateNoteInclusionCircuit};
+    use psy_dpn_circuit::circuits::privacy::deposit_inclusion::DepositInclusionCircuit;
     use serde::Deserialize;
 
     use super::*;
 
-    #[derive(Debug, Deserialize)]
-    struct LegacyNoteProofOutput {
-        nullifier: [u64; 4],
-        owner: [u64; 4],
-        amount: u64,
-        user_tree_root: [u64; 4],
-        checkpoint_id: u64,
-        note_root_slot: u64,
-        token_contract_id: String,
-        note_proof_fingerprint: [u64; 4],
-        note_proof: Vec<u8>,
+    fn integration_config_path(project_path: &str) -> String {
+        if let Ok(path) = std::env::var("PSY_PROVER_TEST_CONFIG") {
+            return path;
+        }
+        let local = Path::new(project_path).join("../config.json");
+        if local.exists() {
+            return local.to_string_lossy().into_owned();
+        }
+        Path::new(project_path)
+            .join("../../psy-genesis/config.json")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn selected_test_network_name() -> String {
+        std::env::var("PSY_PROVER_TEST_NETWORK").unwrap_or_else(|_| "sepolia".to_owned())
+    }
+
+    async fn reachable_test_network(config: &psy_config::PsyConfigGoldilocks) -> anyhow::Result<psy_config::NetworkConfigGoldilocks> {
+        let name = selected_test_network_name();
+        let network = config
+            .get_network(&name)
+            .with_context(|| format!("PSY_PROVER_TEST_NETWORK={name} is missing from test config"))?;
+        let provider = RpcProvider::new_with_config(network)
+            .with_context(|| format!("failed to initialize provider for PSY_PROVER_TEST_NETWORK={name}"))?;
+        let latest = tokio::time::timeout(Duration::from_secs(3), provider.get_latest_block_state()).await;
+        let checkpoint = tokio::time::timeout(Duration::from_secs(3), provider.get_checkpoint_tree_root(0)).await;
+        if matches!(&latest, Ok(Ok(_))) && matches!(&checkpoint, Ok(Ok(_))) {
+            return Ok(network.clone());
+        }
+        let latest_status = match latest {
+            Ok(Ok(_)) => "ok".to_owned(),
+            Ok(Err(error)) => format!("error: {error:#}"),
+            Err(_) => "timeout after 3s".to_owned(),
+        };
+        let checkpoint_status = match checkpoint {
+            Ok(Ok(_)) => "ok".to_owned(),
+            Ok(Err(error)) => format!("error: {error:#}"),
+            Err(_) => "timeout after 3s".to_owned(),
+        };
+        anyhow::bail!(
+            "PSY_PROVER_TEST_NETWORK={} is not reachable: latest_block_state=[{}], checkpoint_tree_root=[{}]",
+            name,
+            latest_status,
+            checkpoint_status
+        )
+    }
+
+    fn test_services_url(network: &psy_config::NetworkConfigGoldilocks) -> anyhow::Result<&str> {
+        network
+            .api_services_url
+            .as_ref()
+            .and_then(|urls| urls.first())
+            .map(String::as_str)
+            .ok_or_else(|| anyhow::anyhow!("PSY_PROVER_TEST_NETWORK={} has no api_services_url", selected_test_network_name()))
+    }
+
+    async fn request_test_faucet(network: &psy_config::NetworkConfigGoldilocks, user_id: u64) -> anyhow::Result<u64> {
+        let faucet_url = network
+            .faucet_rpc_url
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("selected test network has no faucet_rpc_url"))?;
+        let client = reqwest::Client::new();
+        for attempt in 1..=12 {
+            let response = client
+                .post(faucet_url)
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "psy_claim_faucet",
+                    "params": [{
+                        "recipient_user_id": user_id
+                    }],
+                    "id": 1
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<serde_json::Value>()
+                .await?;
+            if let Some(operator_user_id) = response.pointer("/result/operator_user_id").and_then(serde_json::Value::as_u64) {
+                return Ok(operator_user_id);
+            }
+            let error = response.get("error").cloned().unwrap_or_else(|| response.clone());
+            if error.to_string().contains("stale nonce") && attempt < 12 {
+                tracing::warn!(user_id, attempt, %error, "faucet operator nonce raced; retrying");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            anyhow::bail!("faucet RPC rejected claim: {}", error);
+        }
+        unreachable!("faucet retry loop always returns or errors")
+    }
+
+    async fn wait_for_faucet_grant_to_settle(wallet_session: &WalletSession) -> anyhow::Result<()> {
+        let start_checkpoint = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let started_at = std::time::Instant::now();
+        let minimum_wait = Duration::from_secs(30);
+        let timeout = Duration::from_secs(720);
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let latest_checkpoint = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+            let advanced = latest_checkpoint.saturating_sub(start_checkpoint);
+            if started_at.elapsed() >= minimum_wait && advanced >= 6 {
+                tracing::info!(start_checkpoint, latest_checkpoint, advanced, "faucet grant settlement margin reached");
+                return Ok(());
+            }
+            if started_at.elapsed() >= timeout {
+                anyhow::bail!(
+                    "timed out waiting for faucet grant to settle: start_checkpoint={}, latest_checkpoint={}, advanced={}",
+                    start_checkpoint,
+                    latest_checkpoint,
+                    advanced
+                );
+            }
+        }
+    }
+
+    async fn wait_for_test_services_ready(wallet_session: &WalletSession) -> anyhow::Result<()> {
+        let mut last_realm_error = None;
+        let mut last_checkpoint_error = None;
+        for _ in 0..60 {
+            match wallet_session.st_provider.get_latest_block_state().await {
+                Ok(_) => last_realm_error = None,
+                Err(error) => last_realm_error = Some(format!("{error:#}")),
+            }
+            match wallet_session.st_provider.get_checkpoint_tree_root(0).await {
+                Ok(_) => last_checkpoint_error = None,
+                Err(error) => last_checkpoint_error = Some(format!("{error:#}")),
+            }
+            if last_realm_error.is_none() && last_checkpoint_error.is_none() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        anyhow::bail!(
+            "timed out waiting for test services: realm={}, checkpoint={}",
+            last_realm_error.as_deref().unwrap_or("ready"),
+            last_checkpoint_error.as_deref().unwrap_or("ready")
+        )
+    }
+
+    async fn register_test_user_with_retry(
+        wallet_session: &mut WalletSession,
+        private_key: QHashOut<F>,
+        fingerprint: QHashOut<F>,
+        label: &str,
+    ) -> anyhow::Result<QHashOut<F>> {
+        let mut last_error = None;
+        for _ in 0..30 {
+            match wallet_session.register_user(private_key, fingerprint).await {
+                Ok(public_key) => return Ok(public_key),
+                Err(error) => last_error = Some(error),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("registration request returned no result"))
+            .context(format!("register_user({label}) failed after 30 attempts")))
+    }
+
+    async fn wait_for_registered_user_id(
+        wallet_session: &WalletSession,
+        public_key: QHashOut<F>,
+        label: &str,
+    ) -> anyhow::Result<u64> {
+        let mut last_error = None;
+        for _ in 0..60 {
+            match wallet_session.resolve_registered_user_id(public_key).await {
+                Ok(user_id) => return Ok(user_id),
+                Err(error) => last_error = Some(error),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("registration lookup returned no result"))
+            .context(format!("timed out waiting for {label} registration")))
     }
 
     #[derive(Debug, Deserialize)]
@@ -5377,6 +8815,23 @@ mod async_split_tests {
         siblings: Option<Vec<String>>,
         deposit_root: Option<String>,
         deposit: Option<DepositClaimProofDeposit>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PaginatedResponse<T> {
+        items: Vec<T>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct BridgeDepositItem {
+        deposit_index: u64,
+        chain_index: u32,
+        shield_address: String,
+        token: String,
+        l2_token_contract_id: String,
+        amount: String,
+        note_commitment: String,
+        tx_hash: String,
     }
 
     fn u64_to_u32x8_be(v: u64) -> [u32; 8] {
@@ -5460,6 +8915,99 @@ mod async_split_tests {
         ]
     }
 
+    #[test]
+    fn bridge_integer_word_conversions_cover_boundaries_and_overflow() {
+        for value in [0, 1, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(u32x8_be_to_u64(u64_to_u32x8_be(value)).unwrap(), value);
+        }
+
+        let mut overflowing = u64_to_u32x8_be(7);
+        overflowing[0] = 1;
+        assert!(u32x8_be_to_u64(overflowing).unwrap_err().to_string().contains("does not fit into u64"));
+    }
+
+    #[test]
+    fn bridge_address_parser_accepts_address_and_bytes32_forms() {
+        let address = "0x00112233445566778899aabbccddeeff00112233";
+        let padded = "00000000000000000000000000112233445566778899aabbccddeeff00112233";
+        let bytes32 = parse_evm_addr_or_bytes32_to_u32x8(padded).unwrap();
+
+        assert_eq!(parse_evm_addr_or_bytes32_to_u32x8(address).unwrap(), bytes32);
+        assert_eq!(bytes32, [0, 0, 0, 0x0011_2233, 0x4455_6677, 0x8899_aabb, 0xccdd_eeff, 0x0011_2233]);
+        assert!(parse_evm_addr_or_bytes32_to_u32x8("00").unwrap_err().to_string().contains("got 1 bytes"));
+        assert!(parse_evm_addr_or_bytes32_to_u32x8("zz").is_err());
+    }
+
+    #[test]
+    fn qhash_parsers_preserve_their_documented_byte_orders() {
+        let bytes32 = "0000000000000001000000000000000200000000000000030000000000000004";
+        assert_eq!(qhash_to_u64x4(parse_qhash_bytes32_be(bytes32).unwrap()), [1, 2, 3, 4]);
+        assert_eq!(qhash_to_u64x4(parse_qhash_cli_input(&format!(" 0X{bytes32} ")).unwrap()), [1, 2, 3, 4]);
+
+        let internal = "0000000100000002000000030000000400000005000000060000000700000008";
+        assert_eq!(
+            qhash_to_u64x4(parse_qhash_internal_bytes_hex(internal).unwrap()),
+            [(2u64 << 32) | 1, (4u64 << 32) | 3, (6u64 << 32) | 5, (8u64 << 32) | 7]
+        );
+
+        let hash = QHashOut::<F>::from_values(9, 10, 11, 12);
+        assert_eq!(parse_qhash_display_hex(&hash.to_string()).unwrap(), hash);
+        assert_eq!(qhash_to_u64x4(parse_qhash_cli_input(&hash.to_string()).unwrap()), [12, 11, 10, 9]);
+
+        for invalid in ["", "00", "xyz"] {
+            assert!(parse_qhash_bytes32_be(invalid).is_err());
+            assert!(parse_qhash_internal_bytes_hex(invalid).is_err());
+        }
+        assert!(parse_qhash_display_hex("xyz").is_err());
+        assert!(parse_qhash_cli_input("xyz").is_err());
+    }
+
+    #[test]
+    fn bridge_indexer_responses_deserialize_success_and_error_shapes() {
+        let success: ApiResponse<DepositClaimProofResponse> = serde_json::from_value(serde_json::json!({
+            "success": true,
+            "data": {
+                "found": true,
+                "checkpoint_id": 7,
+                "deposit_index": 3,
+                "leaf_hash": "leaf",
+                "siblings": ["sibling"],
+                "deposit_root": "root",
+                "deposit": {
+                    "shield_address": "shield",
+                    "token_address": "token",
+                    "l2_token_contract_id": "4",
+                    "amount": "5",
+                    "note_commitment": "note",
+                    "source_chain_id": 6
+                }
+            },
+            "error": null
+        }))
+        .unwrap();
+        let data = success.data.unwrap();
+        let deposit = data.deposit.unwrap();
+        assert!(success.success);
+        assert!(data.found);
+        assert_eq!(data.checkpoint_id, Some(7));
+        assert_eq!(data.deposit_index, Some(3));
+        assert_eq!(data.leaf_hash.as_deref(), Some("leaf"));
+        assert_eq!(data.siblings.as_ref().unwrap(), &["sibling".to_owned()]);
+        assert_eq!(data.deposit_root.as_deref(), Some("root"));
+        assert_eq!(deposit.shield_address, "shield");
+        assert_eq!(deposit.token_address, "token");
+        assert_eq!(deposit.l2_token_contract_id, "4");
+        assert_eq!(deposit.amount, "5");
+        assert_eq!(deposit.note_commitment, "note");
+        assert_eq!(deposit.source_chain_id, 6);
+
+        let failure: ApiResponse<DepositClaimProofResponse> =
+            serde_json::from_value(serde_json::json!({"success": false, "data": null, "error": "not indexed"})).unwrap();
+        assert!(!failure.success);
+        assert!(failure.data.is_none());
+        assert_eq!(failure.error.as_deref(), Some("not indexed"));
+    }
+
     async fn setup_wallet_and_users_with_keys() -> anyhow::Result<(
         WalletSession,
         WalletKeyPair,
@@ -5472,71 +9020,24 @@ mod async_split_tests {
         psy_client_common::setup_logging()?;
         let project_path =
             std::env::var("CARGO_MANIFEST_DIR").map_err(|e| anyhow::format_err!("Error `{}`, cannot get CARGO_MANIFEST_DIR env", e))?;
-        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&Path::new(&project_path).join("../config.json").to_string_lossy())?;
-        let mut rpc_config = psy_config.get_current_network()?.clone();
-        rpc_config.prove_proxy_url.clear();
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let rpc_config = reachable_test_network(&psy_config).await?;
 
-        let mut wallet_session = WalletSession::new(&rpc_config).await?;
+        let mut wallet_session = WalletSession::new(&rpc_config)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to initialize integration-test wallet: {:#}", error))?;
+        tracing::info!("integration-test wallet initialized");
         let user0_keys = wallet_session.get_random_keypair().await?;
         let user1_keys = wallet_session.get_random_keypair().await?;
         let user0_pk = user0_keys.public_key.clone();
         let user1_pk = user1_keys.public_key.clone();
 
-        for _ in 0..60 {
-            let realm_ok = wallet_session.st_provider.get_latest_block_state().await.is_ok();
-            let tree_ok = wallet_session.st_provider.get_checkpoint_tree_root(0).await.is_ok();
-            if realm_ok && tree_ok {
-                break;
-            }
-            thread::sleep(Duration::from_secs(5));
-        }
+        wait_for_test_services_ready(&wallet_session).await?;
 
-        let user0 = {
-            let mut last_err = None;
-            let mut value = None;
-            for _ in 0..30 {
-                match wallet_session.register_user(user0_keys.private_key, user0_pk.fingerprint).await {
-                    Ok(v) => {
-                        value = Some(v);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        thread::sleep(Duration::from_secs(5));
-                    }
-                }
-            }
-            value.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("register_user(user0) failed")))?
-        };
-        let user1 = {
-            let mut last_err = None;
-            let mut value = None;
-            for _ in 0..30 {
-                match wallet_session.register_user(user1_keys.private_key, user1_pk.fingerprint).await {
-                    Ok(v) => {
-                        value = Some(v);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        thread::sleep(Duration::from_secs(5));
-                    }
-                }
-            }
-            value.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("register_user(user1) failed")))?
-        };
-        let user0_id = loop {
-            match wallet_session.resolve_registered_user_id(user0).await {
-                Ok(v) => break v,
-                Err(_) => thread::sleep(Duration::from_secs(5)),
-            }
-        };
-        let user1_id = loop {
-            match wallet_session.resolve_registered_user_id(user1).await {
-                Ok(v) => break v,
-                Err(_) => thread::sleep(Duration::from_secs(5)),
-            }
-        };
+        let user0 = register_test_user_with_retry(&mut wallet_session, user0_keys.private_key, user0_pk.fingerprint, "user0").await?;
+        let user1 = register_test_user_with_retry(&mut wallet_session, user1_keys.private_key, user1_pk.fingerprint, "user1").await?;
+        let user0_id = wait_for_registered_user_id(&wallet_session, user0, "user0").await?;
+        let user1_id = wait_for_registered_user_id(&wallet_session, user1, "user1").await?;
         for _ in 0..60 {
             let u0_ok = wallet_session
                 .add_user_with_user_id(user0_keys.private_key, user0_pk.fingerprint, user0_id)
@@ -5557,22 +9058,71 @@ mod async_split_tests {
                 wait_for_user_registered_on_realm(&wallet_session, user1_id).await?;
                 return Ok((wallet_session, user0_keys, user0, user0_id, user1_keys, user1, user1_id));
             }
-            thread::sleep(Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
         anyhow::bail!("timed out waiting for add_user_with_user_id to succeed against provider")
     }
 
-    async fn wait_for_user_nonce_gt(wallet_session: &WalletSession, user_id: u64, baseline_nonce: u64) -> anyhow::Result<u64> {
-        for _ in 0..60 {
-            let checkpoint_id = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
-            let user_leaf = wallet_session.st_provider.get_user_leaf_data(checkpoint_id, user_id).await?;
-            let nonce = user_leaf.nonce.to_canonical_u64();
-            if nonce > baseline_nonce {
-                return Ok(checkpoint_id);
-            }
-            thread::sleep(Duration::from_secs(5));
-        }
-        anyhow::bail!("timed out waiting for user {} nonce to exceed {}", user_id, baseline_nonce)
+    async fn wait_for_submitted_endcap(
+        wallet_session: &WalletSession,
+        user_id: u64,
+        end_user_leaf_hash: QHashOut<F>,
+        checkpoint_before: u64,
+    ) -> anyhow::Result<u64> {
+        wallet_session
+            .st_provider
+            .with_user_id_owned(user_id)
+            .wait_for_endcap_inclusion(user_id, end_user_leaf_hash, checkpoint_before, Some(300), 5)
+            .await
+    }
+
+    async fn fund_test_user(
+        wallet_session: &WalletSession,
+        public_key: QHashOut<F>,
+        user_id: u64,
+        contract_id: u64,
+    ) -> anyhow::Result<()> {
+        let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let network = reachable_test_network(&psy_config).await?;
+        let operator_user_id = request_test_faucet(&network, user_id).await?;
+        wait_for_faucet_grant_to_settle(wallet_session).await?;
+        let trace = wallet_session
+            .generate_tx_trace(
+                public_key,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id,
+                    method_name: "simple_claim".to_string(),
+                    inputs: vec![operator_user_id],
+                }]),
+            )
+            .await?;
+        let checkpoint_before = trace.anchor.start_checkpoint_id;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(public_key, &trace).await?;
+        wait_for_submitted_endcap(wallet_session, user_id, end_user_leaf_hash, checkpoint_before).await?;
+        Ok(())
+    }
+
+    async fn funded_transfer_trace(
+        wallet_session: &WalletSession,
+        sender: QHashOut<F>,
+        recipient: QHashOut<F>,
+        contract_id: u64,
+        amount: u64,
+    ) -> anyhow::Result<crate::trace::TxTrace> {
+        let sender_id = wait_for_registered_user_id(wallet_session, sender, "transfer sender").await?;
+        let recipient_id = wait_for_registered_user_id(wallet_session, recipient, "transfer recipient").await?;
+        fund_test_user(wallet_session, sender, sender_id, contract_id).await?;
+        wallet_session
+            .generate_tx_trace(
+                sender,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id,
+                    method_name: "simple_transfer".to_string(),
+                    inputs: vec![recipient_id, amount],
+                }]),
+            )
+            .await
     }
 
     async fn wait_for_user_registered_on_realm(wallet_session: &WalletSession, user_id: u64) -> anyhow::Result<u64> {
@@ -5584,65 +9134,12 @@ mod async_split_tests {
             if leaf_hash != QHashOut::ZERO {
                 return Ok(checkpoint_id);
             }
-            thread::sleep(Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
         anyhow::bail!(
             "timed out waiting for user {} registration leaf to appear on realm latest checkpoint",
             user_id
         )
-    }
-
-    async fn load_private_transfer_claim_from_file(
-        wallet_session: &mut WalletSession,
-        note_path: &Path,
-        random0: u64,
-        random1: u64,
-    ) -> anyhow::Result<PrivateTransferClaim> {
-        let note_data: LegacyNoteProofOutput = serde_json::from_str(&fs::read_to_string(note_path)?)?;
-        let token_contract_id = note_data
-            .token_contract_id
-            .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("invalid token_contract_id in note proof: {}", e))?;
-        let proof: ProofWithPublicInputs<F, C, D> =
-            bincode::deserialize(&note_data.note_proof).map_err(|e| anyhow::anyhow!("invalid bincode proof: {}", e))?;
-        let fingerprint = QHashOut::<F>::from_values(
-            note_data.note_proof_fingerprint[0],
-            note_data.note_proof_fingerprint[1],
-            note_data.note_proof_fingerprint[2],
-            note_data.note_proof_fingerprint[3],
-        );
-        let verifier_data = if let Ok(info) = wallet_session.circuit_info.get_circuit_info_by_fingerprint(fingerprint) {
-            info.verifier_data.to_verifier_data::<C, D>()
-        } else {
-            let local = PrivateNoteInclusionCircuit::<C, D>::new(
-                psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize,
-                psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-                psy_config::network_constants::TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
-                20,
-            );
-            let local_fingerprint = local.get_fingerprint();
-            anyhow::ensure!(
-                local_fingerprint == fingerprint,
-                "local PrivateNoteInclusion fingerprint mismatch: payload={}, local={}",
-                fingerprint,
-                local_fingerprint
-            );
-            local.get_verifier_config_ref().clone()
-        };
-        Ok(PrivateTransferClaim {
-            nullifier: note_data.nullifier,
-            owner: note_data.owner,
-            amount: note_data.amount,
-            user_tree_root: note_data.user_tree_root,
-            checkpoint_id: note_data.checkpoint_id,
-            note_root_slot: note_data.note_root_slot,
-            token_contract_id,
-            random0,
-            random1,
-            note_proof_fingerprint: fingerprint,
-            note_proof: proof,
-            note_verifier_data: AltVerifierOnlyCircuitData::from(&verifier_data),
-        })
     }
 
     async fn get_contract_slot_value(
@@ -5666,34 +9163,51 @@ mod async_split_tests {
         Ok(slot.value)
     }
 
-    async fn wait_for_indexed_deposit(indexer_url: &str, tx_hash: &str) -> anyhow::Result<(u64, DepositClaimProofDeposit)> {
+    async fn wait_for_indexed_deposit(
+        services_url: &str,
+        shield_address: &str,
+        tx_hash: &str,
+    ) -> anyhow::Result<(u64, DepositClaimProofDeposit)> {
         let client = reqwest::Client::new();
         let tx_hash = tx_hash.to_lowercase();
         for _ in 0..240 {
-            let query = format!(
-                "{{ Deposit(where: {{ tx_hash: {{_eq: \\\"{}\\\"}}, chain_index: {{_eq: 0}} }}, order_by: {{deposit_index: desc}}, limit: 1) {{ tx_hash shield_address token_address: token l2_token_contract_id amount note_commitment source_chain_id: chain_index deposit_index }} }}",
-                tx_hash
-            );
-            let body = serde_json::json!({ "query": query });
-            let resp = client.post(indexer_url).json(&body).send().await?;
+            let url = format!("{}/api/v1/bridge/deposits", services_url.trim_end_matches('/'));
+            let resp = client
+                .get(&url)
+                .query(&[
+                    ("shield_address", shield_address),
+                    ("chain_index", "0"),
+                    ("limit", "1000"),
+                    ("offset", "0"),
+                ])
+                .send()
+                .await?;
             let status = resp.status();
             let text = resp.text().await?;
-            anyhow::ensure!(status.is_success(), "indexer query failed: status={} body={}", status, text);
-            let json: serde_json::Value = serde_json::from_str(&text)?;
-            if let Some(item) = json
-                .get("data")
-                .and_then(|d| d.get("Deposit"))
-                .and_then(|d| d.as_array())
-                .and_then(|arr| arr.first())
-            {
-                let deposit_index = item
-                    .get("deposit_index")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| anyhow::anyhow!("missing deposit_index in indexer response"))?;
-                let deposit: DepositClaimProofDeposit = serde_json::from_value(item.clone())?;
-                return Ok((deposit_index, deposit));
+            anyhow::ensure!(status.is_success(), "bridge deposits request failed: status={} body={}", status, text);
+            let envelope: ApiResponse<PaginatedResponse<BridgeDepositItem>> = serde_json::from_str(&text)?;
+            anyhow::ensure!(
+                envelope.success,
+                "bridge deposits request unsuccessful: {}",
+                envelope.error.unwrap_or_else(|| "unknown error".to_string())
+            );
+            let page = envelope
+                .data
+                .ok_or_else(|| anyhow::anyhow!("bridge deposits response missing data"))?;
+            if let Some(item) = page.items.into_iter().find(|item| item.tx_hash.eq_ignore_ascii_case(&tx_hash)) {
+                return Ok((
+                    item.deposit_index,
+                    DepositClaimProofDeposit {
+                        shield_address: item.shield_address,
+                        token_address: item.token,
+                        l2_token_contract_id: item.l2_token_contract_id,
+                        amount: item.amount,
+                        note_commitment: item.note_commitment,
+                        source_chain_id: item.chain_index,
+                    },
+                ));
             }
-            thread::sleep(Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
         anyhow::bail!("timed out waiting for indexed deposit tx_hash={}", tx_hash)
     }
@@ -5752,12 +9266,12 @@ mod async_split_tests {
         ))
     }
 
-    async fn submit_local_usdt_deposit(shield_address: &str, note_commitment: &str) -> anyhow::Result<String> {
+    async fn submit_usdt_deposit(network_name: &str, shield_address: &str, note_commitment: &str) -> anyhow::Result<String> {
         let output = Command::new("npx")
             .arg("hardhat")
             .arg("psy:deposit")
             .arg("--network")
-            .arg("localhost")
+            .arg(network_name)
             .arg("--token")
             .arg("USDTToken")
             .arg("--amount-raw")
@@ -5871,20 +9385,18 @@ mod async_split_tests {
             services_checkpoint_id,
         ))
     }
-    async fn setup_wallet_and_users(
-        two_contracts: bool,
-    ) -> anyhow::Result<(WalletSession, QHashOut<GoldilocksField>, QHashOut<GoldilocksField>, Vec<u64>)> {
+    async fn setup_wallet_and_users() -> anyhow::Result<(WalletSession, QHashOut<GoldilocksField>, QHashOut<GoldilocksField>, Vec<u64>)> {
         psy_client_common::setup_logging()?;
         let project_path =
             std::env::var("CARGO_MANIFEST_DIR").map_err(|e| anyhow::format_err!("Error `{}`, cannot get CARGO_MANIFEST_DIR env", e))?;
 
-        let deployer_private_key = QHashOut::<GoldilocksField>::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let rpc_config = reachable_test_network(&psy_config).await?;
 
-        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&Path::new(&project_path).join("../config.json").to_string_lossy())?;
-        let mut rpc_config = psy_config.get_current_network()?.clone();
-        rpc_config.prove_proxy_url.clear();
-
-        let mut wallet_session = WalletSession::new(&rpc_config).await?;
+        let mut wallet_session = WalletSession::new(&rpc_config)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to initialize integration-test wallet: {:#}", error))?;
+        tracing::info!("integration-test wallet initialized");
         let user0_keys = wallet_session.get_random_keypair().await?;
         let user1_keys = wallet_session.get_random_keypair().await?;
         let user0_pk = user0_keys.public_key.clone();
@@ -5893,53 +9405,45 @@ mod async_split_tests {
         // Wait until realm RPC + coordinator checkpoint RPC are actually responsive.
         // Do NOT use get_user_ids_for_public_key(random_pk) here: a fresh random key
         // correctly returns "no user ids found", which is not a readiness failure.
-        for _ in 0..60 {
-            let realm_ok = wallet_session.st_provider.get_latest_block_state().await.is_ok();
-            let tree_ok = wallet_session.st_provider.get_checkpoint_tree_root(0).await.is_ok();
-            if realm_ok && tree_ok {
-                break;
-            }
-            thread::sleep(Duration::from_secs(5));
-        }
+        wait_for_test_services_ready(&wallet_session).await?;
 
-        // Built-in token contract 0 uses the standard simple_mint method id.
-        let built_in_simple_mint_method_id = 1450059340_u32;
-
-        let source = format!(
-            r#"
+        // This helper currently provides the method identities used by the
+        // integration tests and contract-id scan.
+        let source = r#"
             use std::prelude::*;
 
             #[contract]
-            #[derive(Storage)]
-            pub struct DeferredWrapper {{
+            pub struct DeferredWrapper {
                 pub marker: Felt,
-            }}
+            }
 
-            impl DeferredWrapperRef {{
+            #[contract_implementation]
+            impl DeferredWrapper {
                 #[contract_method]
-                pub fn simple_deferred_mint() -> Felt {{
-                    invoke_deferred(0, {built_in_simple_mint_method_id}, [500000000000]);
+                pub fn simple_deferred_transfer(&mut self, ctx: &ChainContext, recipient: Felt, amount: Felt) -> Felt {
+                    self.marker = 1;
+                    psystd::invoke_deferred(0, 354447671, [recipient, amount]);
                     return 1;
-                }}
+                }
 
                 #[contract_method]
-                pub fn pure_view() -> Felt {{
+                pub fn pure_view(&mut self, ctx: &ChainContext) -> Felt {
                     return 42;
-                }}
-            }}
-        "#
-        );
+                }
+            }
+        "#;
         let deployer_private_key = QHashOut::<GoldilocksField>::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a")?;
         let deployer_pk_info = wallet_session.get_zk_public_key(deployer_private_key).await?;
-        let compiled = crate::session::compile_bridge::compile_contract(&source, deployer_pk_info.qfhash::<PsyHasher>())?;
+        let compiled = crate::session::compile_bridge::compile_contract(&source, deployer_pk_info.qfhash::<PsyHasher>())
+            .map_err(|error| anyhow::anyhow!("failed to compile integration-test helper contract: {:#}", error))?;
         let helper_simple_deferred_method_id = compiled
             .contract_output
             .abi
             .contract
             .methods
             .iter()
-            .find(|m| m.name == "simple_deferred_mint")
-            .ok_or_else(|| anyhow::anyhow!("simple_deferred_mint missing from helper ABI"))?
+            .find(|m| m.name == "simple_deferred_transfer")
+            .ok_or_else(|| anyhow::anyhow!("simple_deferred_transfer missing from helper ABI"))?
             .method_id;
         wallet_session
             .st_provider
@@ -5957,7 +9461,7 @@ mod async_split_tests {
                         if def
                             .functions
                             .iter()
-                            .any(|f| f.method_id == helper_simple_deferred_method_id && f.num_inputs == 0)
+                            .any(|f| f.method_id == helper_simple_deferred_method_id && f.num_inputs == 2)
                         {
                             found = Some(contract_id);
                         }
@@ -5966,53 +9470,21 @@ mod async_split_tests {
                 if found.is_some() {
                     break;
                 }
-                thread::sleep(Duration::from_secs(2));
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            found.ok_or_else(|| anyhow::anyhow!("could not resolve helper contract_id for simple_deferred_mint"))?
+            found.ok_or_else(|| anyhow::anyhow!("could not resolve helper contract_id for simple_deferred_transfer"))?
         };
         let contract_ids = vec![0_u64, helper_contract_id];
 
-        let user0 = {
-            let mut last_err = None;
-            let mut value = None;
-            for _ in 0..30 {
-                match wallet_session.register_user(user0_keys.private_key, user0_pk.fingerprint).await {
-                    Ok(v) => {
-                        value = Some(v);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        thread::sleep(Duration::from_secs(5));
-                    }
-                }
-            }
-            value.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("register_user(user0) failed")))?
-        };
-        let user1 = {
-            let mut last_err = None;
-            let mut value = None;
-            for _ in 0..30 {
-                match wallet_session.register_user(user1_keys.private_key, user1_pk.fingerprint).await {
-                    Ok(v) => {
-                        value = Some(v);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        thread::sleep(Duration::from_secs(5));
-                    }
-                }
-            }
-            value.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("register_user(user1) failed")))?
-        };
+        let user0 = register_test_user_with_retry(&mut wallet_session, user0_keys.private_key, user0_pk.fingerprint, "user0").await?;
+        let user1 = register_test_user_with_retry(&mut wallet_session, user1_keys.private_key, user1_pk.fingerprint, "user1").await?;
         for _ in 0..60 {
             let u0_ok = wallet_session.add_user(user0_keys.private_key, user0_pk.fingerprint).await.is_ok();
             let u1_ok = wallet_session.add_user(user1_keys.private_key, user1_pk.fingerprint).await.is_ok();
             if u0_ok && u1_ok {
                 return Ok((wallet_session, user0, user1, contract_ids));
             }
-            thread::sleep(Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
 
         anyhow::bail!("timed out waiting for add_user to succeed against provider")
@@ -6021,48 +9493,20 @@ mod async_split_tests {
     async fn setup_single_user_ready() -> anyhow::Result<(WalletSession, WalletKeyPair, QHashOut<GoldilocksField>, u64, u64)> {
         let project_path =
             std::env::var("CARGO_MANIFEST_DIR").map_err(|e| anyhow::format_err!("Error `{}`, cannot get CARGO_MANIFEST_DIR env", e))?;
-        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&Path::new(&project_path).join("../config.json").to_string_lossy())?;
-        let mut rpc_config = psy_config.get_current_network()?.clone();
-        rpc_config.prove_proxy_url.clear();
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let rpc_config = reachable_test_network(&psy_config).await?;
 
         let mut wallet_session = WalletSession::new(&rpc_config).await?;
         let user_keys = wallet_session.get_random_keypair().await?;
         let user_pk = user_keys.public_key.clone();
         let contract_id = 0_u64;
 
-        for _ in 0..60 {
-            let realm_ok = wallet_session.st_provider.get_latest_block_state().await.is_ok();
-            let tree_ok = wallet_session.st_provider.get_checkpoint_tree_root(0).await.is_ok();
-            if realm_ok && tree_ok {
-                break;
-            }
-            thread::sleep(Duration::from_secs(5));
-        }
+        wait_for_test_services_ready(&wallet_session).await?;
 
-        let user = {
-            let mut last_err = None;
-            let mut value = None;
-            for _ in 0..30 {
-                match wallet_session.register_user(user_keys.private_key, user_pk.fingerprint).await {
-                    Ok(v) => {
-                        value = Some(v);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        thread::sleep(Duration::from_secs(5));
-                    }
-                }
-            }
-            value.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("register_user(single user) failed")))?
-        };
+        let user =
+            register_test_user_with_retry(&mut wallet_session, user_keys.private_key, user_pk.fingerprint, "single user").await?;
 
-        let user_id = loop {
-            match wallet_session.resolve_registered_user_id(user).await {
-                Ok(v) => break v,
-                Err(_) => thread::sleep(Duration::from_secs(5)),
-            }
-        };
+        let user_id = wait_for_registered_user_id(&wallet_session, user, "single user").await?;
 
         for _ in 0..30 {
             if wallet_session
@@ -6075,7 +9519,7 @@ mod async_split_tests {
                 }
                 return Ok((wallet_session, user_keys, user, user_id, contract_id));
             }
-            thread::sleep(Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
 
         anyhow::bail!("add_user_with_user_id(single user) failed")
@@ -6104,7 +9548,7 @@ mod async_split_tests {
             if slot.value.0.elements[0].to_canonical_u64() >= min_value {
                 return Ok(());
             }
-            thread::sleep(Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
         anyhow::bail!(
             "timed out waiting for contract {} slot {} to reach at least {}",
@@ -6114,15 +9558,63 @@ mod async_split_tests {
         )
     }
 
+    async fn build_private_note_membership_proof(
+        wallet_session: &WalletSession,
+        sender_user_id: u64,
+        contract_id: u64,
+        checkpoint_id: u64,
+        note_root_slot: u64,
+        amount: u64,
+        owner: QHashOut<F>,
+        note_commitment: QHashOut<F>,
+    ) -> anyhow::Result<MerkleProofCore<QHashOut<F>>> {
+        let provider = wallet_session.st_provider.with_user_id_owned(sender_user_id);
+        let height = wallet_session
+            .st_provider
+            .get_contract_leaf_data(contract_id)
+            .await?
+            .state_tree_height
+            .to_canonical_u64() as u8;
+        let note_count = provider
+            .get_user_contract_state_tree_merkle_proof(checkpoint_id, sender_user_id, contract_id as u32, height, note_root_slot - 1)
+            .await?
+            .value
+            .0
+            .elements[3]
+            .to_canonical_u64();
+        let mut frontier = Vec::with_capacity(20);
+        for level in 0..20_u64 {
+            frontier.push(
+                provider
+                    .get_user_contract_state_tree_merkle_proof(checkpoint_id, sender_user_id, contract_id as u32, height, note_root_slot + 1 + level)
+                    .await?
+                    .value,
+            );
+        }
+        let value_hash = QHashOut::<F>::from_values(amount, 0, 0, 0);
+        let commitment = PsyHasher::q_two_to_one(PsyHasher::q_two_to_one(owner, value_hash), note_commitment);
+        let mut zero = QHashOut::ZERO;
+        let mut siblings = Vec::with_capacity(20);
+        for (level, frontier_node) in frontier.into_iter().enumerate() {
+            siblings.push(if (note_count >> level) & 1 == 0 { zero } else { frontier_node });
+            zero = PsyHasher::q_two_to_one(zero, zero);
+        }
+        Ok(MerkleProofCore::new_from_params::<PsyHasher>(note_count, commitment, siblings))
+    }
+
     #[tokio::test]
     async fn async_generate_prove_simple_mint() -> anyhow::Result<()> {
-        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
-        let contract_id = contract_ids[0];
+        let (mut wallet_session, user0_keys, user0, user_id, contract_id) = setup_single_user_ready().await?;
+        let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let network = reachable_test_network(&psy_config).await?;
+        let operator_user_id = request_test_faucet(&network, user_id).await?;
+        wait_for_faucet_grant_to_settle(&wallet_session).await?;
 
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id,
-            method_name: "simple_mint".to_string(),
-            inputs: vec![1_000_000_000_000],
+            method_name: "simple_claim".to_string(),
+            inputs: vec![operator_user_id],
         }]);
         wallet_session.start_session(user0).await?;
         let (before_count, before_hash) = {
@@ -6132,12 +9624,15 @@ mod async_split_tests {
 
         let simulated = wallet_session.simulate_contract_call(user0, call_data.clone()).await?;
         let generated = simulated.generated.as_ref().expect("simulation should include a generated tx trace");
-        assert_eq!(simulated.metadata.tx_hash.expect("simulation should include a tx hash").to_string(), generated.tx_hash);
+        assert_eq!(
+            simulated.metadata.tx_hash.expect("simulation should include a tx hash").to_string(),
+            generated.tx_hash
+        );
         assert!(!generated.trace.payload.is_empty());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].contract_id, contract_id);
-        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].method_name, "simple_mint");
-        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].inputs, vec![1_000_000_000_000]);
+        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].method_name, "simple_claim");
+        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].inputs, vec![operator_user_id]);
         assert!(!simulated.metadata.storage_data.writes.is_empty());
         let (after_count, after_hash) = {
             let mgr = wallet_session.user_session_mgrs.get(&user0).unwrap();
@@ -6148,14 +9643,497 @@ mod async_split_tests {
 
         let trace = wallet_session.generate_tx_trace(user0, call_data).await?;
         assert!(!trace.steps.is_empty());
-        let _tx_hash = wallet_session.prove_tx_trace(user0, &trace).await?;
+        let public_claim_checkpoint = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user0, &trace).await?;
+        wait_for_submitted_endcap(&wallet_session, user_id, end_user_leaf_hash, public_claim_checkpoint).await?;
+        tracing::info!(user_id, "public faucet claim confirmed");
+
+        // Shield part of the faucet-funded balance back to this user's own
+        // shield address, then prove and claim the resulting private note.
+        let random0 = 111_u64;
+        let random1 = 222_u64;
+        let amount = 100_000_000_000_u64;
+        let note_root_slot = 2_147_483_649_u64;
+        let owner = derive_shield_address(user_id, random0, random1);
+        let note_secret = [11_u64, 12, 13, 14];
+        let nullifier_secret = [21_u64, 22, 23, 24];
+        let note_commitment = derive_note_commitment(nullifier_secret, note_secret);
+        let private_transfer_checkpoint = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let note_membership_proof = build_private_note_membership_proof(
+            &wallet_session,
+            user_id,
+            contract_id,
+            private_transfer_checkpoint,
+            note_root_slot,
+            amount,
+            owner,
+            note_commitment,
+        )
+        .await?;
+        let mut private_transfer_inputs = Vec::new();
+        private_transfer_inputs.extend(qhash_to_u64x4(owner));
+        private_transfer_inputs.push(amount);
+        private_transfer_inputs.extend(qhash_to_u64x4(note_commitment));
+        let private_transfer_trace = wallet_session
+            .generate_tx_trace(
+                user0,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id,
+                    method_name: "private_transfer".to_string(),
+                    inputs: private_transfer_inputs,
+                }]),
+            )
+            .await?;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user0, &private_transfer_trace).await?;
+        let note_checkpoint =
+            wait_for_submitted_endcap(&wallet_session, user_id, end_user_leaf_hash, private_transfer_checkpoint).await?;
+        tracing::info!(user_id, note_checkpoint, "private transfer confirmed");
+        let provider = wallet_session.st_provider.with_user_id_owned(user_id);
+        let height = wallet_session
+            .st_provider
+            .get_contract_leaf_data(contract_id)
+            .await?
+            .state_tree_height
+            .to_canonical_u64() as u8;
+        let user_leaf = provider.get_user_leaf_data(note_checkpoint, user_id).await?;
+        let note_root_slot_proof = provider
+            .get_user_contract_state_tree_merkle_proof(note_checkpoint, user_id, contract_id as u32, height, note_root_slot)
+            .await?;
+        anyhow::ensure!(
+            note_membership_proof.root == note_root_slot_proof.value,
+            "private note root was not committed at checkpoint {}",
+            note_checkpoint
+        );
+        let contract_proof = provider
+            .get_user_contract_tree_merkle_proof(note_checkpoint, user_id, contract_id as u32)
+            .await?;
+        let user_tree_proof = provider.get_user_tree_merkle_proof(note_checkpoint, user_id).await?;
+        let user_tree_root = user_tree_proof.root;
+        let private_note_input = PrivateNoteInclusionInput {
+            nullifier_secret: QHashOut::from_values(nullifier_secret[0], nullifier_secret[1], nullifier_secret[2], nullifier_secret[3]),
+            sender_user_id: user_id,
+            contract_id,
+            user_leaf,
+            owner,
+            amount: F::from_canonical_u64(amount),
+            note_secret: QHashOut::from_values(note_secret[0], note_secret[1], note_secret[2], note_secret[3]),
+            note_membership_proof,
+            note_root_slot,
+            note_root_slot_proof,
+            contract_proof,
+            user_tree_proof,
+            checkpoint_id: F::from_canonical_u64(note_checkpoint),
+        };
+        let (note_proof_fingerprint, note_proof, note_verifier_data) = wallet_session.prove_private_note_inclusion(&private_note_input).await?;
+        let private_claim = PrivateTransferClaim {
+            nullifier: qhash_to_u64x4(derive_nullifier_hash(nullifier_secret)),
+            owner: qhash_to_u64x4(owner),
+            amount,
+            user_tree_root: qhash_to_u64x4(user_tree_root),
+            checkpoint_id: note_checkpoint,
+            note_root_slot,
+            token_contract_id: contract_id,
+            random0,
+            random1,
+            note_proof_fingerprint,
+            note_proof,
+            note_verifier_data,
+        };
+        wallet_session.user_session_mgrs.remove(&user0);
+        wallet_session
+            .add_user_with_user_id(user0_keys.private_key, user0_keys.public_key.fingerprint, user_id)
+            .await?;
+        if let Some(mut mgr) = wallet_session.user_session_mgrs.get_mut(&user0) {
+            mgr.require_lps_mut()?.set_is_new_user(false);
+        }
+        let private_claim_checkpoint = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let end_user_leaf_hash = wallet_session
+            .claim_batch(
+                user0,
+                vec![ClaimBatchItem::PrivateTransfer {
+                    contract_id,
+                    claim: private_claim,
+                }],
+            )
+            .await?;
+        wait_for_submitted_endcap(&wallet_session, user_id, end_user_leaf_hash, private_claim_checkpoint).await?;
+        tracing::info!(user_id, "private claim confirmed");
         Ok(())
     }
 
+    #[tokio::test]
+    async fn async_prove_trace_jobs_by_graph_public_claim() -> anyhow::Result<()> {
+        let (wallet_session, _user0_keys, user0, user_id, contract_id) = setup_single_user_ready().await?;
+        let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let network = reachable_test_network(&psy_config).await?;
+        let operator_user_id = request_test_faucet(&network, user_id).await?;
+        wait_for_faucet_grant_to_settle(&wallet_session).await?;
+
+        let wallet_session = Arc::new(wallet_session);
+        wallet_session.start_session(user0).await?;
+        let trace = wallet_session
+            .generate_tx_trace(
+                user0,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id,
+                    method_name: "simple_claim".to_string(),
+                    inputs: vec![operator_user_id],
+                }]),
+            )
+            .await?;
+        wallet_session.register_trace_contract_circuits(&trace).await?;
+        let plan = wallet_session.build_trace_proof_plan_from_trace(&trace).await?;
+        let graph_id = plan.graph_id.clone();
+        assert_eq!(WalletSession::local_proving_graph_id_for_trace(&trace), graph_id);
+
+        let tx_hash = wallet_session
+            .clone()
+            .prove_trace_jobs_by_graph(user0, Arc::new(trace.clone()), &plan)
+            .await?;
+        assert_ne!(tx_hash, QHashOut::ZERO);
+
+        // every job completed and the graph-level accessors agree
+        assert!(matches!(
+            wallet_session.local_proving_graph_status_for_trace(&trace),
+            Some(JobStatus::Completed)
+        ));
+        let statuses = wallet_session.local_proving_job_statuses_for_trace(&trace);
+        assert!(statuses.values().all(|status| matches!(status, JobStatus::Completed)));
+        assert!(matches!(
+            wallet_session.local_proving_job_status_for_trace(&trace, TraceProofJobId::ZkSign),
+            Some(JobStatus::Completed)
+        ));
+        assert!(matches!(
+            wallet_session.local_proving_job_status_for_graph(graph_id.clone(), TraceProofJobId::UpsStart),
+            Some(JobStatus::Completed)
+        ));
+        assert!(matches!(
+            wallet_session.local_proving_graph_status_for_graph(graph_id.clone()),
+            Some(JobStatus::Completed)
+        ));
+        let results = wallet_session.local_proving_job_results_for_graph(graph_id.clone());
+        assert!(matches!(
+            results.get(&TraceProofJobId::UpsStart),
+            Some(TraceProofJobOutput::UpsStart { .. })
+        ));
+        assert!(matches!(
+            wallet_session.local_proving_job_result_for_trace(&trace, TraceProofJobId::Submit),
+            Some(TraceProofJobOutput::Submit { tx_hash: submitted }) if submitted == tx_hash
+        ));
+        assert!(matches!(
+            wallet_session.local_proving_job_result_for_graph(graph_id, TraceProofJobId::EndCap),
+            Some(TraceProofJobOutput::EndCap { .. })
+        ));
+        assert!(wallet_session
+            .local_proving_job_results_for_trace(&trace)
+            .contains_key(&TraceProofJobId::CfcStep(0)));
+
+        wait_for_submitted_endcap(&wallet_session, user_id, tx_hash, trace.anchor.start_checkpoint_id).await?;
+        tracing::info!(user_id, "job-graph public claim confirmed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_inject_external_proofs_into_session() -> anyhow::Result<()> {
+        let (wallet_session, user_keys, user0, _user_id, _contract_id) = setup_single_user_ready().await?;
+        wallet_session.start_session(user0).await?;
+
+        let sighash = QHashOut::<F>::from_values(31, 32, 33, 34);
+        let fingerprint = wallet_session.wallet.zk_circuit_fingerprint().await?;
+        let first = wallet_session.wallet.prove_zk_sign(user_keys.private_key, sighash).await?;
+        let second = wallet_session.wallet.prove_zk_sign(user_keys.private_key, sighash).await?;
+        let verifier = wallet_session.wallet.zk_circuit_verifier_config().await?;
+
+        let leaf_a = wallet_session.add_external_proof(user0, fingerprint, first, verifier.clone()).await?;
+        let (leaf_b, siblings) = wallet_session
+            .add_external_proof_with_siblings(user0, fingerprint, second.clone(), verifier.clone())
+            .await?;
+        assert_eq!(leaf_b, leaf_a + 1);
+        assert!(!siblings.is_empty());
+
+        // unknown users are rejected before touching the proof tree
+        let error = wallet_session
+            .add_external_proof(QHashOut::ZERO, fingerprint, second, verifier)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not found"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_deploy_and_update_contract_with_abi() -> anyhow::Result<()> {
+        let (wallet_session, user_keys, _user0, _user_id, _contract_id) = setup_single_user_ready().await?;
+        let deployer = user_keys.public_key.qfhash::<PsyHasher>();
+
+        let old_source = r#"
+            #[contract]
+            pub struct DeployUpdateContract {
+                pub value: Felt,
+            }
+
+            #[contract_implementation]
+            impl DeployUpdateContract {
+                #[contract_method]
+                pub fn set_value(&mut self, ctx: &ChainContext, new_value: Felt) {
+                    self.value = new_value;
+                }
+            }
+        "#;
+        let new_source = r#"
+            #[contract]
+            pub struct DeployUpdateContract {
+                pub value: Felt,
+                pub extra: Felt,
+            }
+
+            #[contract_implementation]
+            impl DeployUpdateContract {
+                #[contract_method]
+                pub fn set_value(&mut self, ctx: &ChainContext, new_value: Felt) {
+                    self.value = new_value;
+                }
+
+                #[contract_method]
+                pub fn bump_extra(&mut self, ctx: &ChainContext) {
+                    self.extra += 1;
+                }
+            }
+        "#;
+        let old_output = psy_compiler::compile(old_source)?;
+        let old_method_id = old_output
+            .abi
+            .contract
+            .methods
+            .iter()
+            .find(|m| m.name == "set_value")
+            .map(|m| m.method_id)
+            .ok_or_else(|| anyhow::anyhow!("set_value missing from compiled ABI"))?;
+
+        let next_before_deploy = wallet_session.st_provider.get_latest_block_state().await?.next_contract_id as u64;
+        let _deploy_summary = wallet_session
+            .deploy_contract_with_abi(deployer, old_output.circuit_definitions.clone(), old_output.abi.clone())
+            .await?;
+
+        let contract_id = {
+            let mut found = None;
+            for _ in 0..24 {
+                let next_contract_id = wallet_session.st_provider.get_latest_block_state().await?.next_contract_id as u64;
+                for candidate in next_before_deploy..next_contract_id {
+                    if let Ok(def) = wallet_session.st_provider.get_contract_code_definition(candidate).await {
+                        if def.functions.iter().any(|f| f.method_id == old_method_id) {
+                            found = Some(candidate);
+                        }
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            found.ok_or_else(|| anyhow::anyhow!("deployed contract not found on chain after {}", next_before_deploy))?
+        };
+
+        let new_output = psy_compiler::compile(new_source)?;
+        let update_hash = wallet_session
+            .update_contract(contract_id, deployer, new_output.circuit_definitions)
+            .await?;
+        assert!(!update_hash.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_psy_software_defined_signer_public_claim() -> anyhow::Result<()> {
+        let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let rpc_config = reachable_test_network(&psy_config).await?;
+        let mut wallet_session = WalletSession::new(&rpc_config).await?;
+
+        let source = r#"
+            #[contract]
+            pub struct SdSignContract {
+                pub marker: Felt,
+            }
+
+            #[contract_implementation]
+            impl SdSignContract {
+                #[contract_method]
+                pub fn sd_sign_view(&mut self, ctx: &ChainContext, witness: Felt) -> Felt {
+                    return witness + 1;
+                }
+            }
+        "#;
+        let output = psy_compiler::compile(source)?;
+        let view_def = output
+            .circuit_definitions
+            .iter()
+            .find(|def| def.is_view_function())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("sd_sign_view should lower to a view function"))?;
+        let sd_fingerprint = wallet_session.wallet.register_psy_software_defined_circuit(view_def, false).await?;
+
+        let user_keys = wallet_session.get_random_keypair().await?;
+        let sd_pk_info = wallet_session.wallet.get_or_create_user(user_keys.private_key, sd_fingerprint).await?;
+        let sd_public_key = sd_pk_info.qfhash::<PsyHasher>();
+        register_test_user_with_retry(&mut wallet_session, user_keys.private_key, sd_fingerprint, "psy sd signer").await?;
+        let mut user_id = None;
+        for _ in 0..30 {
+            match wallet_session.resolve_registered_user_id(sd_public_key).await {
+                Ok(v) => {
+                    user_id = Some(v);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+            }
+        }
+        let user_id = user_id.ok_or_else(|| anyhow::anyhow!("sd signer user registration never settled"))?;
+        let mut user_added = false;
+        for _ in 0..30 {
+            if wallet_session
+                .add_user_with_user_id(user_keys.private_key, sd_fingerprint, user_id)
+                .await
+                .is_ok()
+            {
+                if let Some(mut mgr) = wallet_session.user_session_mgrs.get_mut(&sd_public_key) {
+                    mgr.require_lps_mut().unwrap().set_is_new_user(false);
+                }
+                user_added = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        anyhow::ensure!(user_added, "sd signer add_user_with_user_id never succeeded");
+
+        let network = reachable_test_network(&psy_config).await?;
+        let operator_user_id = request_test_faucet(&network, user_id).await?;
+        wait_for_faucet_grant_to_settle(&wallet_session).await?;
+
+        let checkpoint_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let call_data = ContractCallData {
+            contract_calls: vec![ContractCallArgs {
+                contract_id: 0,
+                method_name: "simple_claim".to_string(),
+                inputs: vec![operator_user_id],
+            }],
+            software_defined_call: DPNSoftwareDefinedCallData { inputs: vec![42] },
+        };
+        let tx_hash = wallet_session.exec_contract_call(sd_public_key, call_data).await?;
+        assert_ne!(tx_hash, QHashOut::ZERO);
+        wait_for_submitted_endcap(&wallet_session, user_id, tx_hash, checkpoint_before).await?;
+        tracing::info!(user_id, "software-defined signed claim confirmed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_plonky2_software_defined_signer_public_claim() -> anyhow::Result<()> {
+        let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let rpc_config = reachable_test_network(&psy_config).await?;
+        let mut wallet_session = WalletSession::new(&rpc_config).await?;
+
+        // The signing circuit's input arity must match the call below.  The
+        // previous value (4) made `set_target_arr` zip four targets with one
+        // supplied input and panicked inside itertools.
+        let sd_fingerprint = wallet_session.wallet.register_plonky2_software_defined_circuit(10, 1).await?;
+
+        let user_keys = wallet_session.get_random_keypair().await?;
+        let sd_pk_info = wallet_session.wallet.get_or_create_user(user_keys.private_key, sd_fingerprint).await?;
+        let sd_public_key = sd_pk_info.qfhash::<PsyHasher>();
+        register_test_user_with_retry(&mut wallet_session, user_keys.private_key, sd_fingerprint, "plonky2 sd signer").await?;
+        let mut user_id = None;
+        for _ in 0..30 {
+            match wallet_session.resolve_registered_user_id(sd_public_key).await {
+                Ok(v) => {
+                    user_id = Some(v);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+            }
+        }
+        let user_id = user_id.ok_or_else(|| anyhow::anyhow!("plonky2 sd signer user registration never settled"))?;
+        let mut user_added = false;
+        for _ in 0..30 {
+            if wallet_session
+                .add_user_with_user_id(user_keys.private_key, sd_fingerprint, user_id)
+                .await
+                .is_ok()
+            {
+                if let Some(mut mgr) = wallet_session.user_session_mgrs.get_mut(&sd_public_key) {
+                    mgr.require_lps_mut().unwrap().set_is_new_user(false);
+                }
+                user_added = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        anyhow::ensure!(user_added, "plonky2 sd signer add_user_with_user_id never succeeded");
+
+        let network = reachable_test_network(&psy_config).await?;
+        let operator_user_id = request_test_faucet(&network, user_id).await?;
+        wait_for_faucet_grant_to_settle(&wallet_session).await?;
+
+        let checkpoint_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let call_data = ContractCallData {
+            contract_calls: vec![ContractCallArgs {
+                contract_id: 0,
+                method_name: "simple_claim".to_string(),
+                inputs: vec![operator_user_id],
+            }],
+            software_defined_call: DPNSoftwareDefinedCallData { inputs: vec![7] },
+        };
+        let tx_hash = wallet_session.exec_contract_call(sd_public_key, call_data).await?;
+        assert_ne!(tx_hash, QHashOut::ZERO);
+        wait_for_submitted_endcap(&wallet_session, user_id, tx_hash, checkpoint_before).await?;
+        tracing::info!(user_id, "plonky2 software-defined signed claim confirmed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_generate_prove_simple_mint_secp256k1() -> anyhow::Result<()> {
+        let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let network = reachable_test_network(&psy_config).await?;
+        let mut wallet_session = WalletSession::new(&network).await?;
+        let private_key = wallet_session.get_random_keypair().await?.private_key;
+        let fingerprint = crate::wallet::memory_wallet::get_secp256k1_fingerprint();
+        let user = register_test_user_with_retry(&mut wallet_session, private_key, fingerprint, "secp256k1 user").await?;
+        let user_id = wait_for_registered_user_id(&wallet_session, user, "secp256k1 user").await?;
+        let mut user_added = false;
+        for _ in 0..60 {
+            if wallet_session.add_user_with_user_id(private_key, fingerprint, user_id).await.is_ok() {
+                if let Some(mut mgr) = wallet_session.user_session_mgrs.get_mut(&user) {
+                    mgr.require_lps_mut()?.set_is_new_user(false);
+                }
+                user_added = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        anyhow::ensure!(user_added, "timed out adding secp256k1 user {}", user_id);
+        wait_for_user_registered_on_realm(&wallet_session, user_id).await?;
+
+        let operator_user_id = request_test_faucet(&network, user_id).await?;
+        wait_for_faucet_grant_to_settle(&wallet_session).await?;
+        let trace = wallet_session
+            .generate_tx_trace(
+                user,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id: 0,
+                    method_name: "simple_claim".to_string(),
+                    inputs: vec![operator_user_id],
+                }]),
+            )
+            .await?;
+        anyhow::ensure!(!trace.steps.is_empty(), "secp256k1 claim produced an empty trace");
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user, &trace).await?;
+        wait_for_submitted_endcap(&wallet_session, user_id, end_user_leaf_hash, trace.anchor.start_checkpoint_id).await?;
+        tracing::info!(user_id, %fingerprint, "secp256k1 wallet claim confirmed");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn async_call_view_is_read_only_and_rejects_mutation() -> anyhow::Result<()> {
-        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
+        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users().await?;
         let helper_contract_id = contract_ids[1];
         wallet_session.start_session(user0).await?;
         let (before_count, before_hash) = {
@@ -6186,8 +10164,8 @@ mod async_split_tests {
                 user0,
                 ViewCallData::new(vec![ContractCallArgs {
                     contract_id: 0,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1],
+                    method_name: "simple_transfer".to_string(),
+                    inputs: vec![0, 1],
                 }]),
             )
             .await
@@ -6207,8 +10185,9 @@ mod async_split_tests {
     async fn async_external_eth_personal_user_simple_mint() -> anyhow::Result<()> {
         use psy_client_common::data::base_types::hash256::Hash256;
 
-        let (mut wallet_session, _user0, _user1, contract_ids) = setup_wallet_and_users(false).await?;
+        let (mut wallet_session, user0, _user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
+        let user0_id = wait_for_registered_user_id(&wallet_session, user0, "transfer sender").await?;
         let private_key = QHashOut::<GoldilocksField>::rand();
         let signing_key = k256::ecdsa::SigningKey::from_slice(&Hash256::from(private_key).0)?;
         let selected_address = psy_crypto::signature::secp256k1::wallet::ethereum_address_for_verifying_key(signing_key.verifying_key());
@@ -6222,18 +10201,33 @@ mod async_split_tests {
         let public_key = wallet_session
             .register_external_eth_personal_user(selected_address, challenge, challenge_signature_bytes)
             .await?;
-        let user_id = loop {
-            match wallet_session.resolve_registered_user_id(public_key).await {
-                Ok(value) => break value,
-                Err(_) => thread::sleep(Duration::from_secs(5)),
-            }
-        };
+        let user_id = wait_for_registered_user_id(&wallet_session, public_key, "external eth personal user").await?;
         wait_for_user_registered_on_realm(&wallet_session, user_id).await?;
+
+        fund_test_user(&wallet_session, user0, user0_id, contract_id).await?;
+        let funding_trace = wallet_session
+            .generate_tx_trace(
+                user0,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id,
+                    method_name: "simple_transfer".to_string(),
+                    inputs: vec![user_id, 1],
+                }]),
+            )
+            .await?;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user0, &funding_trace).await?;
+        wait_for_submitted_endcap(
+            &wallet_session,
+            user0_id,
+            end_user_leaf_hash,
+            funding_trace.anchor.start_checkpoint_id,
+        )
+        .await?;
 
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id,
-            method_name: "simple_mint".to_string(),
-            inputs: vec![1_000_000_000_000],
+            method_name: "simple_claim".to_string(),
+            inputs: vec![user0_id],
         }]);
         let trace = wallet_session.generate_tx_trace(public_key, call_data).await?;
         assert!(!trace.steps.is_empty());
@@ -6253,19 +10247,10 @@ mod async_split_tests {
     }
     #[tokio::test]
     async fn async_trace_first_step_root_matches_ups_start_root() -> anyhow::Result<()> {
-        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
 
-        let trace = wallet_session
-            .generate_tx_trace(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
-                }]),
-            )
-            .await?;
+        let trace = funded_transfer_trace(&wallet_session, user0, user1, contract_id, 1).await?;
 
         let (meta, _, _, _, proof) = wallet_session.prove_ups_start(user0, &trace).await?;
         let start_root_from_proof = meta
@@ -6292,25 +10277,17 @@ mod async_split_tests {
 
     #[tokio::test]
     async fn async_prove_trace_step_resume_after_manager_drop() -> anyhow::Result<()> {
-        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
 
-        let trace = wallet_session
-            .generate_tx_trace(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
-                }]),
-            )
-            .await?;
+        let trace = funded_transfer_trace(&wallet_session, user0, user1, contract_id, 1).await?;
 
         let mut proving_state: Option<ProvingState> = None;
         let mut proof_blobs: Vec<Vec<u8>> = Vec::new();
         let mut progress_count = 0usize;
 
-        loop {
+        let mut submitted = false;
+        for _ in 0..64 {
             match wallet_session
                 .prove_trace_step(
                     user0,
@@ -6331,6 +10308,7 @@ mod async_split_tests {
                 }
                 TraceProvingStepResult::Submitted(_tx_hash) => {
                     assert!(progress_count >= 2);
+                    submitted = true;
                     break;
                 }
                 TraceProvingStepResult::Failed { error } => {
@@ -6338,25 +10316,17 @@ mod async_split_tests {
                 }
             }
         }
+        anyhow::ensure!(submitted, "prove_trace_step did not submit after 64 iterations");
 
         Ok(())
     }
 
     #[tokio::test]
     async fn async_trace_resume_snapshot_restores_ups_start_root() -> anyhow::Result<()> {
-        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
 
-        let trace = wallet_session
-            .generate_tx_trace(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
-                }]),
-            )
-            .await?;
+        let trace = funded_transfer_trace(&wallet_session, user0, user1, contract_id, 1).await?;
 
         let expected_root = trace
             .steps
@@ -6396,30 +10366,13 @@ mod async_split_tests {
 
     #[tokio::test]
     async fn async_prove_trace_step_resume_simple_claim() -> anyhow::Result<()> {
-        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users(false).await?;
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
         let user0_id = wallet_session.resolve_registered_user_id(user0).await?;
         let user1_id = wallet_session.resolve_registered_user_id(user1).await?;
 
-        tracing::info!("step-claim test: start mint");
-        let mint_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
-        let mint_trace = wallet_session
-            .generate_tx_trace(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
-                }]),
-            )
-            .await?;
-        let mint_tx_hash = wallet_session.prove_tx_trace(user0, &mint_trace).await?;
-        tracing::info!("step-claim test: mint submitted tx_hash={}", mint_tx_hash);
-        wallet_session
-            .st_provider
-            .wait_for_endcap_inclusion(user0_id, mint_tx_hash, mint_before, Some(240), 1)
-            .await?;
-        tracing::info!("step-claim test: mint included");
+        tracing::info!("step-claim test: fund sender through faucet");
+        fund_test_user(&wallet_session, user0, user0_id, contract_id).await?;
 
         tracing::info!("step-claim test: start transfer");
         let transfer_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
@@ -6458,7 +10411,8 @@ mod async_split_tests {
         let mut progress_count = 0usize;
         let mut dropped_manager = false;
 
-        loop {
+        let mut submitted = false;
+        for _ in 0..64 {
             match wallet_session
                 .prove_trace_step(
                     user1,
@@ -6483,6 +10437,7 @@ mod async_split_tests {
                 TraceProvingStepResult::Submitted(_tx_hash) => {
                     tracing::info!("step-claim test: claim submitted");
                     assert!(progress_count >= 2);
+                    submitted = true;
                     break;
                 }
                 TraceProvingStepResult::Failed { error } => {
@@ -6490,14 +10445,18 @@ mod async_split_tests {
                 }
             }
         }
+        anyhow::ensure!(submitted, "simple_claim prove_trace_step did not submit after 64 iterations");
 
         Ok(())
     }
 
     #[tokio::test]
     async fn async_generate_prove_multicall() -> anyhow::Result<()> {
-        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
+        let user0_id = wait_for_registered_user_id(&wallet_session, user0, "multicall sender").await?;
+        let user1_id = wait_for_registered_user_id(&wallet_session, user1, "multicall recipient").await?;
+        fund_test_user(&wallet_session, user0, user0_id, contract_id).await?;
 
         let trace = wallet_session
             .generate_tx_trace(
@@ -6505,13 +10464,13 @@ mod async_split_tests {
                 ContractCallData::new(vec![
                     ContractCallArgs {
                         contract_id,
-                        method_name: "simple_mint".to_string(),
-                        inputs: vec![2_000_000_000_000],
+                        method_name: "simple_transfer".to_string(),
+                        inputs: vec![user1_id, 1],
                     },
                     ContractCallArgs {
                         contract_id,
                         method_name: "simple_burn".to_string(),
-                        inputs: vec![1_000_000_000_000],
+                        inputs: vec![1],
                     },
                 ]),
             )
@@ -6525,8 +10484,12 @@ mod async_split_tests {
 
     #[tokio::test]
     async fn async_generate_prove_deferred() -> anyhow::Result<()> {
-        let (wallet_session, user0, _user1, contract_ids) = setup_wallet_and_users(false).await?;
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[1];
+        let token_contract_id = contract_ids[0];
+        let user0_id = wait_for_registered_user_id(&wallet_session, user0, "deferred sender").await?;
+        let user1_id = wait_for_registered_user_id(&wallet_session, user1, "deferred recipient").await?;
+        fund_test_user(&wallet_session, user0, user0_id, token_contract_id).await?;
         let cm = wallet_session.wallet.random_circuit_manager();
 
         // Generate side: capture one standard parent + one real deferred child on the
@@ -6560,7 +10523,7 @@ mod async_split_tests {
                 .resolve_get_contract_code_mut(&QSRCmdGetContractCodeDefinition { contract_id })
                 .await?;
             let (parent_fn_id, parent_fn_circuit_def) = cm
-                .resolve_contract_function_by_method_name(contract_id, &contract_code, "simple_deferred_mint".to_string())
+                .resolve_contract_function_by_method_name(contract_id, &contract_code, "simple_deferred_transfer".to_string())
                 .await?;
 
             let parent_step = mgr
@@ -6569,7 +10532,7 @@ mod async_split_tests {
                     F::from_canonical_u64(contract_id),
                     parent_fn_id as u32,
                     &parent_fn_circuit_def,
-                    vec![],
+                    vec![F::from_canonical_u64(user1_id), F::ONE],
                 )
                 .await?;
             println!(
@@ -6627,7 +10590,7 @@ mod async_split_tests {
         };
 
         // Prove side: fresh manager created through the same start_session path used by
-        // the legacy flow.
+        // the claim flow.
         wallet_session.user_session_mgrs.remove(&user0);
         wallet_session.start_session(user0).await?;
         {
@@ -6667,60 +10630,50 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_legacy_claim_batch_public_and_private_transfer() -> anyhow::Result<()> {
-        let (mut wallet_session, user0_keys, user0, user0_id, _user1_keys, user1, user1_id) = setup_wallet_and_users_with_keys().await?;
+    async fn async_claim_batch_public_and_private_transfer() -> anyhow::Result<()> {
+        let (mut wallet_session, _user0_keys, user0, user0_id, _user1_keys, user1, user1_id) = setup_wallet_and_users_with_keys().await?;
         let contract_id = 0_u64;
-        let sender_mint = 20_000_000_000_000_u64;
-        let receiver_fee_mint = 2_000_000_000_000_u64;
-        let public_amount = 5_000_000_000_000_u64;
-        let private_amount = 7_000_000_000_000_u64;
+        let public_amount = 100_000_000_000_u64;
+        let private_amount = 100_000_000_000_u64;
 
-        // Fund sender for both transfers and receiver for batch-claim fee.
-        let baseline_sender_nonce = wallet_session
-            .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user0_id)
-            .await?
-            .nonce
-            .to_canonical_u64();
+        // Fund both fresh users through the network faucet. The built-in token's
+        // simple_mint method is deployer-only on Sepolia, so random test users
+        // must claim the faucet grants after they have settled on-chain.
+        let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let network = reachable_test_network(&psy_config).await?;
+        let sender_operator_user_id = request_test_faucet(&network, user0_id).await?;
+        wait_for_faucet_grant_to_settle(&wallet_session).await?;
+        let receiver_operator_user_id = request_test_faucet(&network, user1_id).await?;
+        wait_for_faucet_grant_to_settle(&wallet_session).await?;
+
         let trace = wallet_session
             .generate_tx_trace(
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![sender_mint],
+                    method_name: "simple_claim".to_string(),
+                    inputs: vec![sender_operator_user_id],
                 }]),
             )
             .await?;
-        wallet_session.prove_tx_trace(user0, &trace).await?;
-        wait_for_user_nonce_gt(&wallet_session, user0_id, baseline_sender_nonce).await?;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user0, &trace).await?;
+        wait_for_submitted_endcap(&wallet_session, user0_id, end_user_leaf_hash, trace.anchor.start_checkpoint_id).await?;
 
-        let baseline_receiver_nonce = wallet_session
-            .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user1_id)
-            .await?
-            .nonce
-            .to_canonical_u64();
         let trace = wallet_session
             .generate_tx_trace(
                 user1,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![receiver_fee_mint],
+                    method_name: "simple_claim".to_string(),
+                    inputs: vec![receiver_operator_user_id],
                 }]),
             )
             .await?;
-        wallet_session.prove_tx_trace(user1, &trace).await?;
-        wait_for_user_nonce_gt(&wallet_session, user1_id, baseline_receiver_nonce).await?;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user1, &trace).await?;
+        wait_for_submitted_endcap(&wallet_session, user1_id, end_user_leaf_hash, trace.anchor.start_checkpoint_id).await?;
 
         // Prepare a public pending claim for receiver.
-        let baseline_sender_nonce = wallet_session
-            .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user0_id)
-            .await?
-            .nonce
-            .to_canonical_u64();
         let trace = wallet_session
             .generate_tx_trace(
                 user0,
@@ -6731,38 +10684,96 @@ mod async_split_tests {
                 }]),
             )
             .await?;
-        wallet_session.prove_tx_trace(user0, &trace).await?;
-        wait_for_user_nonce_gt(&wallet_session, user0_id, baseline_sender_nonce).await?;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user0, &trace).await?;
+        wait_for_submitted_endcap(&wallet_session, user0_id, end_user_leaf_hash, trace.anchor.start_checkpoint_id).await?;
 
-        let owner = derive_shield_address(user1_id, 111, 222).to_string();
-        let project_path =
-            std::env::var("CARGO_MANIFEST_DIR").map_err(|e| anyhow::format_err!("Error `{}`, cannot get CARGO_MANIFEST_DIR env", e))?;
-        let cli_bin = Path::new(&project_path).join("../../target/release/psy_user_cli");
-        anyhow::ensure!(cli_bin.exists(), "psy_user_cli binary missing at {}", cli_bin.display());
-        let note_path = std::env::temp_dir().join(format!("claim-batch-{}-{}.json", user0_id, user1_id));
-        let output = Command::new(&cli_bin)
-            .arg("private-transfer")
-            .arg("--rpc-config")
-            .arg(Path::new(&project_path).join("../config.json"))
-            .arg("-p")
-            .arg(user0_keys.private_key.to_string())
-            .arg("--contract-id")
-            .arg(contract_id.to_string())
-            .arg("--amount")
-            .arg(private_amount.to_string())
-            .arg("--receiver")
-            .arg(owner)
-            .arg("--output")
-            .arg(&note_path)
-            .output()?;
+        let random0 = 111_u64;
+        let random1 = 222_u64;
+        let note_root_slot = 2_147_483_649_u64;
+        let owner = derive_shield_address(user1_id, random0, random1);
+        let note_secret = [31_u64, 32, 33, 34];
+        let nullifier_secret = [41_u64, 42, 43, 44];
+        let note_commitment = derive_note_commitment(nullifier_secret, note_secret);
+        let private_transfer_checkpoint = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let note_membership_proof = build_private_note_membership_proof(
+            &wallet_session,
+            user0_id,
+            contract_id,
+            private_transfer_checkpoint,
+            note_root_slot,
+            private_amount,
+            owner,
+            note_commitment,
+        )
+        .await?;
+        let mut private_transfer_inputs = Vec::new();
+        private_transfer_inputs.extend(qhash_to_u64x4(owner));
+        private_transfer_inputs.push(private_amount);
+        private_transfer_inputs.extend(qhash_to_u64x4(note_commitment));
+        let private_transfer_trace = wallet_session
+            .generate_tx_trace(
+                user0,
+                ContractCallData::new(vec![ContractCallArgs {
+                    contract_id,
+                    method_name: "private_transfer".to_string(),
+                    inputs: private_transfer_inputs,
+                }]),
+            )
+            .await?;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user0, &private_transfer_trace).await?;
+        let note_checkpoint =
+            wait_for_submitted_endcap(&wallet_session, user0_id, end_user_leaf_hash, private_transfer_checkpoint).await?;
+        let provider = wallet_session.st_provider.with_user_id_owned(user0_id);
+        let height = wallet_session
+            .st_provider
+            .get_contract_leaf_data(contract_id)
+            .await?
+            .state_tree_height
+            .to_canonical_u64() as u8;
+        let user_leaf = provider.get_user_leaf_data(note_checkpoint, user0_id).await?;
+        let note_root_slot_proof = provider
+            .get_user_contract_state_tree_merkle_proof(note_checkpoint, user0_id, contract_id as u32, height, note_root_slot)
+            .await?;
         anyhow::ensure!(
-            output.status.success(),
-            "private-transfer CLI failed: stdout={}\nstderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            note_membership_proof.root == note_root_slot_proof.value,
+            "private note root was not committed at checkpoint {}",
+            note_checkpoint
         );
-
-        let private_claim = load_private_transfer_claim_from_file(&mut wallet_session, &note_path, 111, 222).await?;
+        let contract_proof = provider
+            .get_user_contract_tree_merkle_proof(note_checkpoint, user0_id, contract_id as u32)
+            .await?;
+        let user_tree_proof = provider.get_user_tree_merkle_proof(note_checkpoint, user0_id).await?;
+        let user_tree_root = user_tree_proof.root;
+        let private_note_input = PrivateNoteInclusionInput {
+            nullifier_secret: QHashOut::from_values(nullifier_secret[0], nullifier_secret[1], nullifier_secret[2], nullifier_secret[3]),
+            sender_user_id: user0_id,
+            contract_id,
+            user_leaf,
+            owner,
+            amount: F::from_canonical_u64(private_amount),
+            note_secret: QHashOut::from_values(note_secret[0], note_secret[1], note_secret[2], note_secret[3]),
+            note_membership_proof,
+            note_root_slot,
+            note_root_slot_proof,
+            contract_proof,
+            user_tree_proof,
+            checkpoint_id: F::from_canonical_u64(note_checkpoint),
+        };
+        let (note_proof_fingerprint, note_proof, note_verifier_data) = wallet_session.prove_private_note_inclusion(&private_note_input).await?;
+        let private_claim = PrivateTransferClaim {
+            nullifier: qhash_to_u64x4(derive_nullifier_hash(nullifier_secret)),
+            owner: qhash_to_u64x4(owner),
+            amount: private_amount,
+            user_tree_root: qhash_to_u64x4(user_tree_root),
+            checkpoint_id: note_checkpoint,
+            note_root_slot,
+            token_contract_id: contract_id,
+            random0,
+            random1,
+            note_proof_fingerprint,
+            note_proof,
+            note_verifier_data,
+        };
 
         let checkpoint_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
         let baseline_balance = get_contract_slot_value(&wallet_session, user1_id, contract_id, 0).await?.0.elements[0].to_canonical_u64();
@@ -6787,7 +10798,7 @@ mod async_split_tests {
         let confirmed_checkpoint = wallet_session
             .wait_for_endcap_inclusion(user1_id, end_user_leaf_hash, checkpoint_before, Some(180), 1)
             .await?;
-        tracing::info!("legacy claim_batch mixed batch confirmed at checkpoint {}", confirmed_checkpoint);
+        tracing::info!("claim_batch mixed batch confirmed at checkpoint {}", confirmed_checkpoint);
 
         let expected_min = baseline_balance + public_amount + private_amount - 5_000_000_000_u64;
         wait_for_contract_slot_min(&wallet_session, user1_id, contract_id, 0, expected_min).await?;
@@ -6795,11 +10806,15 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_legacy_claim_batch_public_and_shield_deposit() -> anyhow::Result<()> {
+    #[ignore = "requires the selected network's L1, indexer, and psy-services bridge stack"]
+    async fn async_claim_batch_public_and_shield_deposit() -> anyhow::Result<()> {
+        let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let network = reachable_test_network(&psy_config).await?;
+        let services_url = test_services_url(&network)?;
+        let network_name = selected_test_network_name();
         let (mut wallet_session, _user0_keys, user0, user0_id, _user1_keys, user1, user1_id) = setup_wallet_and_users_with_keys().await?;
         let public_contract_id = 0_u64;
-        let sender_mint = 20_000_000_000_000_u64;
-        let receiver_fee_mint = 2_000_000_000_000_u64;
         let public_amount = 5_000_000_000_000_u64;
         let deposit_amount = 1_000_000_u64;
         let random0 = 333_u64;
@@ -6807,50 +10822,9 @@ mod async_split_tests {
         let note_secret = "0x0000000000000000000000000000000000000000000000000000000000001234";
         let nullifier_secret = "0x0000000000000000000000000000000000000000000000000000000000005678";
 
-        let baseline_sender_nonce = wallet_session
-            .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user0_id)
-            .await?
-            .nonce
-            .to_canonical_u64();
-        let trace = wallet_session
-            .generate_tx_trace(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id: public_contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![sender_mint],
-                }]),
-            )
-            .await?;
-        wallet_session.prove_tx_trace(user0, &trace).await?;
-        wait_for_user_nonce_gt(&wallet_session, user0_id, baseline_sender_nonce).await?;
+        fund_test_user(&wallet_session, user0, user0_id, public_contract_id).await?;
+        fund_test_user(&wallet_session, user1, user1_id, public_contract_id).await?;
 
-        let baseline_receiver_nonce = wallet_session
-            .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user1_id)
-            .await?
-            .nonce
-            .to_canonical_u64();
-        let trace = wallet_session
-            .generate_tx_trace(
-                user1,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id: public_contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![receiver_fee_mint],
-                }]),
-            )
-            .await?;
-        wallet_session.prove_tx_trace(user1, &trace).await?;
-        wait_for_user_nonce_gt(&wallet_session, user1_id, baseline_receiver_nonce).await?;
-
-        let baseline_sender_nonce = wallet_session
-            .st_provider
-            .get_user_leaf_data(wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id, user0_id)
-            .await?
-            .nonce
-            .to_canonical_u64();
         let trace = wallet_session
             .generate_tx_trace(
                 user0,
@@ -6861,8 +10835,8 @@ mod async_split_tests {
                 }]),
             )
             .await?;
-        wallet_session.prove_tx_trace(user0, &trace).await?;
-        wait_for_user_nonce_gt(&wallet_session, user0_id, baseline_sender_nonce).await?;
+        let end_user_leaf_hash = wallet_session.prove_tx_trace(user0, &trace).await?;
+        wait_for_submitted_endcap(&wallet_session, user0_id, end_user_leaf_hash, trace.anchor.start_checkpoint_id).await?;
 
         let shield_address = derive_shield_address(user1_id, random0, random1).to_string();
         let note_secret_q = parse_qhash_cli_input(note_secret)?;
@@ -6874,13 +10848,15 @@ mod async_split_tests {
                 qhash_to_u64x4(note_secret_q),
             )))
         );
-        let tx_hash = submit_local_usdt_deposit(&shield_address, &note_commitment).await?;
-        let (deposit_index, indexed_deposit) = wait_for_indexed_deposit("http://127.0.0.1:8080/v1/graphql", &tx_hash).await?;
+        let tx_hash = submit_usdt_deposit(&network_name, &shield_address, &note_commitment).await?;
+        let (deposit_index, indexed_deposit) = wait_for_indexed_deposit(services_url, &shield_address, &tx_hash).await?;
         anyhow::ensure!(indexed_deposit.shield_address.to_lowercase() == format!("0x{}", shield_address).to_lowercase());
 
-        let (shield_claim, _services_checkpoint_id) = loop {
+        let mut shield_claim_result = None;
+        let mut last_claim_error = None;
+        for _ in 0..120 {
             match build_shield_deposit_claim(
-                "http://127.0.0.1:3000",
+                services_url,
                 deposit_index,
                 user1_id,
                 random0,
@@ -6892,10 +10868,21 @@ mod async_split_tests {
             )
             .await
             {
-                Ok(v) => break v,
-                Err(_) => thread::sleep(Duration::from_secs(5)),
+                Ok(value) => {
+                    shield_claim_result = Some(value);
+                    break;
+                }
+                Err(error) => {
+                    last_claim_error = Some(error);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
-        };
+        }
+        let (shield_claim, _services_checkpoint_id) = shield_claim_result.ok_or_else(|| {
+            last_claim_error
+                .unwrap_or_else(|| anyhow::anyhow!("deposit claim proof was not produced"))
+                .context("timed out waiting for deposit claim proof")
+        })?;
 
         let checkpoint_before = wallet_session.st_provider.get_latest_block_state().await?.checkpoint_id;
         let baseline_public_balance = get_contract_slot_value(&wallet_session, user1_id, public_contract_id, 0)
@@ -6926,7 +10913,7 @@ mod async_split_tests {
         let confirmed_checkpoint = wallet_session
             .wait_for_endcap_inclusion(user1_id, end_user_leaf_hash, checkpoint_before, Some(240), 1)
             .await?;
-        tracing::info!("legacy claim_batch public+shield confirmed at checkpoint {}", confirmed_checkpoint);
+        tracing::info!("claim_batch public+shield confirmed at checkpoint {}", confirmed_checkpoint);
 
         let expected_public_min = baseline_public_balance + public_amount - 5_000_000_000_u64;
         wait_for_contract_slot_min(&wallet_session, user1_id, public_contract_id, 0, expected_public_min).await?;
@@ -6942,25 +10929,14 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    #[ignore = "legacy business flow probe"]
-    async fn async_legacy_transfer_claim_probe_old_fixture() -> anyhow::Result<()> {
-        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users(false).await?;
+    #[ignore = "business flow probe"]
+    async fn async_transfer_claim_probe() -> anyhow::Result<()> {
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
         let user0_id = wallet_session.resolve_registered_user_id(user0).await?;
         let user1_id = wallet_session.resolve_registered_user_id(user1).await?;
 
-        wallet_session
-            .exec_contract_call(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
-                }]),
-            )
-            .await?;
-        thread::sleep(Duration::from_secs(5));
-        thread::sleep(Duration::from_secs(5));
+        fund_test_user(&wallet_session, user0, user0_id, contract_id).await?;
 
         wallet_session
             .exec_contract_call(
@@ -6972,8 +10948,8 @@ mod async_split_tests {
                 }]),
             )
             .await?;
-        thread::sleep(Duration::from_secs(5));
-        thread::sleep(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
         wallet_session
             .exec_contract_call(
@@ -6989,49 +10965,42 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_legacy_exec_simple_mint_smoke() -> anyhow::Result<()> {
-        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
+    async fn async_exec_simple_transfer_smoke() -> anyhow::Result<()> {
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
+        let user0_id = wait_for_registered_user_id(&wallet_session, user0, "smoke sender").await?;
+        let user1_id = wait_for_registered_user_id(&wallet_session, user1, "smoke recipient").await?;
+        fund_test_user(&wallet_session, user0, user0_id, contract_id).await?;
         let tx_hash = wallet_session
             .exec_contract_call(
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
+                    method_name: "simple_transfer".to_string(),
+                    inputs: vec![user1_id, 1],
                 }]),
             )
             .await?;
-        tracing::info!("legacy exec tx_hash={}", tx_hash);
+        tracing::info!("exec tx_hash={}", tx_hash);
         Ok(())
     }
 
     #[tokio::test]
-    async fn async_generate_prove_deferred_simple_mint() -> anyhow::Result<()> {
-        let (wallet_session, user0, _user1, contract_ids) = setup_wallet_and_users(false).await?;
+    async fn async_generate_prove_deferred_simple_transfer() -> anyhow::Result<()> {
+        let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let token_contract_id = contract_ids[0];
         let deferred_contract_id = contract_ids[1];
-
-        let mint_trace = wallet_session
-            .generate_tx_trace(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id: token_contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
-                }]),
-            )
-            .await?;
-        wallet_session.prove_tx_trace(user0, &mint_trace).await?;
-        thread::sleep(Duration::from_secs(20));
+        let user0_id = wait_for_registered_user_id(&wallet_session, user0, "deferred sender").await?;
+        let user1_id = wait_for_registered_user_id(&wallet_session, user1, "deferred recipient").await?;
+        fund_test_user(&wallet_session, user0, user0_id, token_contract_id).await?;
 
         let deferred_trace = wallet_session
             .generate_tx_trace(
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id: deferred_contract_id,
-                    method_name: "simple_deferred_mint".to_string(),
-                    inputs: vec![],
+                    method_name: "simple_deferred_transfer".to_string(),
+                    inputs: vec![user1_id, 1],
                 }]),
             )
             .await?;
@@ -7075,7 +11044,7 @@ mod async_split_tests {
                 | crate::trace::TraceStep::Deferred(c) => !c.deferred.is_empty(),
                 _ => false,
             }),
-            "simple_deferred_mint should generate deferred children"
+            "simple_deferred_transfer should generate deferred children"
         );
         wallet_session.prove_tx_trace(user0, &deferred_trace).await?;
 
@@ -7084,18 +11053,18 @@ mod async_split_tests {
 
     #[tokio::test]
     async fn async_generate_prove_deferred_business_flow() -> anyhow::Result<()> {
-        let (wallet_session, user0, _user1, contract_ids) = {
+        let (wallet_session, user0, user1, contract_ids) = {
             let mut last_err = None;
             let mut value = None;
             for _ in 0..5 {
-                match setup_wallet_and_users(false).await {
+                match setup_wallet_and_users().await {
                     Ok(v) => {
                         value = Some(v);
                         break;
                     }
                     Err(e) => {
                         last_err = Some(e);
-                        thread::sleep(Duration::from_secs(10));
+                        tokio::time::sleep(Duration::from_secs(10)).await;
                     }
                 }
             }
@@ -7103,19 +11072,9 @@ mod async_split_tests {
         };
         let token_contract_id = contract_ids[0];
         let deferred_contract_id = contract_ids[1];
-        let mint_trace = wallet_session
-            .generate_tx_trace(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id: token_contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
-                }]),
-            )
-            .await?;
-        wallet_session.prove_tx_trace(user0, &mint_trace).await?;
-        thread::sleep(Duration::from_secs(5));
-        thread::sleep(Duration::from_secs(5));
+        let user0_id = wait_for_registered_user_id(&wallet_session, user0, "deferred business sender").await?;
+        let user1_id = wait_for_registered_user_id(&wallet_session, user1, "deferred business recipient").await?;
+        fund_test_user(&wallet_session, user0, user0_id, token_contract_id).await?;
 
         let deferred_trace = {
             let mut last_err = None;
@@ -7126,8 +11085,8 @@ mod async_split_tests {
                         user0,
                         ContractCallData::new(vec![ContractCallArgs {
                             contract_id: deferred_contract_id,
-                            method_name: "simple_deferred_mint".to_string(),
-                            inputs: vec![],
+                            method_name: "simple_deferred_transfer".to_string(),
+                            inputs: vec![user1_id, 1],
                         }]),
                     )
                     .await
@@ -7138,7 +11097,7 @@ mod async_split_tests {
                     }
                     Err(e) if format!("{e:#}").contains("stale nonce") => {
                         last_err = Some(e);
-                        thread::sleep(Duration::from_secs(5));
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                     Err(e) => return Err(e),
                 }
@@ -7153,7 +11112,7 @@ mod async_split_tests {
                 | crate::trace::TraceStep::Deferred(c) => !c.deferred.is_empty(),
                 _ => false,
             }),
-            "simple_deferred_mint should generate deferred children"
+            "simple_deferred_transfer should generate deferred children"
         );
         wallet_session.prove_tx_trace(user0, &deferred_trace).await?;
 
@@ -7166,35 +11125,23 @@ mod async_split_tests {
             let mut last_err = None;
             let mut value = None;
             for _ in 0..5 {
-                match setup_wallet_and_users(false).await {
+                match setup_wallet_and_users().await {
                     Ok(v) => {
                         value = Some(v);
                         break;
                     }
                     Err(e) => {
                         last_err = Some(e);
-                        thread::sleep(Duration::from_secs(10));
+                        tokio::time::sleep(Duration::from_secs(10)).await;
                     }
                 }
             }
             value.ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("setup_wallet_and_users failed for deferred transfer flow")))?
         };
         let contract_id = contract_ids[0];
+        let user0_id = wait_for_registered_user_id(&wallet_session, user0, "deferred transfer sender").await?;
         let user1_id = wallet_session.resolve_registered_user_id(user1).await?;
-
-        let mint_trace = wallet_session
-            .generate_tx_trace(
-                user0,
-                ContractCallData::new(vec![ContractCallArgs {
-                    contract_id,
-                    method_name: "simple_mint".to_string(),
-                    inputs: vec![1_000_000_000_000],
-                }]),
-            )
-            .await?;
-        wallet_session.prove_tx_trace(user0, &mint_trace).await?;
-        thread::sleep(Duration::from_secs(5));
-        thread::sleep(Duration::from_secs(5));
+        fund_test_user(&wallet_session, user0, user0_id, contract_id).await?;
 
         let transfer_trace = {
             let mut last_err = None;
@@ -7217,7 +11164,7 @@ mod async_split_tests {
                     }
                     Err(e) if format!("{e:#}").contains("stale nonce") => {
                         last_err = Some(e);
-                        thread::sleep(Duration::from_secs(5));
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                     Err(e) => return Err(e),
                 }
@@ -7241,14 +11188,12 @@ mod async_split_tests {
     #[tokio::test]
     #[ignore = "debug baseline only"]
     async fn async_local_prove_minimal_add_balance_baseline() -> anyhow::Result<()> {
-
         let project_path =
             std::env::var("CARGO_MANIFEST_DIR").map_err(|e| anyhow::format_err!("Error `{}`, cannot get CARGO_MANIFEST_DIR env", e))?;
         let deployer_private_key = QHashOut::<GoldilocksField>::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a")?;
 
-        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&Path::new(&project_path).join("../config.json").to_string_lossy())?;
-        let mut rpc_config = psy_config.get_current_network()?.clone();
-        rpc_config.prove_proxy_url.clear();
+        let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
+        let rpc_config = reachable_test_network(&psy_config).await?;
         let source = r#"
             use std::prelude::*;
 
@@ -7284,12 +11229,13 @@ mod async_split_tests {
 
         let user_keys = wallet_session.get_random_keypair().await?;
         let user_pk = user_keys.public_key.clone();
-        let user = wallet_session.register_user(user_keys.private_key, user_pk.fingerprint).await?;
+        let user =
+            register_test_user_with_retry(&mut wallet_session, user_keys.private_key, user_pk.fingerprint, "baseline user").await?;
         for _ in 0..18 {
             if wallet_session.resolve_registered_user_id(user).await.is_ok() {
                 break;
             }
-            thread::sleep(Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
         wallet_session.add_user(user_keys.private_key, user_pk.fingerprint).await?;
 

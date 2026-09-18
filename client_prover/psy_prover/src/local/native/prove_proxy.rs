@@ -1937,3 +1937,79 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod hash_encoding_tests {
+    use super::*;
+
+    fn canonical_elements(hash: &ParthQHashOut<F>) -> [u64; 4] {
+        hash.0.elements.map(|element| element.to_canonical_u64())
+    }
+
+    #[test]
+    fn felt4_hex_format_round_trips_through_bridge_parser() {
+        let felts = [
+            F::from_canonical_u64(1),
+            F::from_canonical_u64(0x1020_3040_5060_7080),
+            F::from_canonical_u64(17),
+            F::from_canonical_u64(0x7fff_ffff_ffff_fffe),
+        ];
+
+        let encoded = felt4_to_bytes32_hex(&felts);
+        let parsed = parse_hex_qhashout(&encoded).unwrap();
+        let parsed_without_prefix = parse_hex_qhashout(encoded.trim_start_matches("0x")).unwrap();
+
+        assert_eq!(canonical_elements(&parsed), [1, 0x1020_3040_5060_7080, 17, 0x7fff_ffff_ffff_fffe]);
+        assert_eq!(canonical_elements(&parsed_without_prefix), canonical_elements(&parsed));
+        assert_eq!(
+            canonical_elements(&parse_hex_qhashout_to_qhash(&encoded).unwrap()),
+            canonical_elements(&parsed)
+        );
+    }
+
+    #[test]
+    fn internal_u32_word_parser_preserves_little_endian_limb_pairs() {
+        let words = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let felts = words.map(|word| F::from_canonical_u64(word as u64));
+        let encoded = u32x8_to_bytes32_hex(&felts);
+        let parsed = parse_internal_u32x8_qhashout(&encoded).unwrap();
+
+        assert_eq!(
+            canonical_elements(&parsed),
+            [(2u64 << 32) | 1, (4u64 << 32) | 3, (6u64 << 32) | 5, (8u64 << 32) | 7,]
+        );
+        assert_eq!(
+            u32x8_to_bytes32_hex(&felts),
+            "0x0000000100000002000000030000000400000005000000060000000700000008"
+        );
+    }
+
+    #[test]
+    fn hash_parsers_reject_wrong_lengths_and_invalid_hex() {
+        for input in ["", "0x", "00", &"00".repeat(31), &"00".repeat(33)] {
+            assert!(parse_hex_qhashout(input).is_err(), "accepted invalid bridge hash {input}");
+            assert!(parse_internal_u32x8_qhashout(input).is_err(), "accepted invalid internal hash {input}");
+        }
+
+        let invalid = format!("{}zz", "00".repeat(31));
+        assert!(parse_hex_qhashout(&invalid).is_err());
+        assert!(parse_internal_u32x8_qhashout(&invalid).is_err());
+    }
+
+    #[test]
+    fn helper_formatters_use_expected_word_order() {
+        let felts = [
+            F::from_canonical_u64(1),
+            F::from_canonical_u64(2),
+            F::from_canonical_u64(3),
+            F::from_canonical_u64(4),
+        ];
+        let hash = qhashout_from_felts(&felts);
+
+        assert_eq!(canonical_elements(&hash), [1, 2, 3, 4]);
+        assert_eq!(
+            felt4_to_bytes32_hex(&felts),
+            "0x0000000000000004000000000000000300000000000000020000000000000001"
+        );
+    }
+}

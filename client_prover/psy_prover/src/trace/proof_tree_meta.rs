@@ -178,3 +178,149 @@ impl ProofTreeMeta {
         old_root
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use plonky2::{field::types::Field, hash::hash_types::HashOut};
+
+    use super::*;
+
+    fn value(seed: u64) -> QHashOut<F> {
+        QHashOut(HashOut {
+            elements: [
+                F::from_canonical_u64(seed),
+                F::from_canonical_u64(seed + 1),
+                F::from_canonical_u64(seed + 2),
+                F::from_canonical_u64(seed + 3),
+            ],
+        })
+    }
+
+    #[test]
+    fn new_meta_has_the_expected_empty_tree_shape() {
+        let meta = ProofTreeMeta::new(4);
+
+        assert_eq!(meta.proof_tree.height, 4);
+        assert_eq!(meta.proof_tree.zero_value_hashes.len(), 5);
+        assert!(meta.proof_tree.nodes.is_empty());
+        assert!(meta.root_history.is_empty());
+        assert!(meta.leaf_records.is_empty());
+        assert_eq!(meta.next_leaf_index, 0);
+        assert_eq!(meta.q_recursion_tree_height, 4);
+        assert_eq!(meta.get_root(), meta.proof_tree.zero_value_hashes[0]);
+    }
+
+    #[test]
+    fn inserting_leaves_tracks_roots_and_advances_only_past_the_highest_index() {
+        let mut meta = ProofTreeMeta::new(4);
+        let empty_root = meta.get_root();
+
+        assert_eq!(meta.insert_leaf_value(value(10), 3), empty_root);
+        let first_root = meta.get_root();
+        assert_ne!(first_root, empty_root);
+        assert_eq!(meta.next_leaf_index, 4);
+        assert_eq!(meta.root_history, vec![empty_root]);
+
+        assert_eq!(meta.insert_leaf_value(value(20), 1), first_root);
+        assert_eq!(meta.next_leaf_index, 4);
+        assert_eq!(meta.root_history, vec![empty_root, first_root]);
+        assert_ne!(meta.get_root(), first_root);
+    }
+
+    #[test]
+    fn json_round_trip_preserves_tree_state() {
+        let mut meta = ProofTreeMeta::new(3);
+        meta.insert_leaf_value(value(30), 0);
+        meta.insert_leaf_value(value(40), 5);
+
+        let encoded = serde_json::to_string(&meta).unwrap();
+        let decoded: ProofTreeMeta = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.get_root(), meta.get_root());
+        assert_eq!(decoded.next_leaf_index, 6);
+        assert_eq!(decoded.root_history, meta.root_history);
+        assert_eq!(decoded.proof_tree.nodes, meta.proof_tree.nodes);
+        assert_eq!(decoded.proof_tree.zero_value_hashes, meta.proof_tree.zero_value_hashes);
+    }
+
+    #[test]
+    fn replacing_an_existing_leaf_tracks_history_without_advancing_cursor() {
+        let mut meta = ProofTreeMeta::new(3);
+        meta.insert_leaf_value(value(10), 2);
+        let first_root = meta.get_root();
+        assert_eq!(meta.next_leaf_index, 3);
+
+        assert_eq!(meta.insert_leaf_value(value(20), 2), first_root);
+        assert_eq!(meta.next_leaf_index, 3);
+        assert_eq!(meta.root_history.last(), Some(&first_root));
+        assert_ne!(meta.get_root(), first_root);
+    }
+
+    #[test]
+    fn bincode_round_trip_preserves_sparse_tree_state() {
+        let mut meta = ProofTreeMeta::new(4);
+        meta.insert_leaf_value(value(50), 0);
+        meta.insert_leaf_value(value(60), 9);
+
+        let encoded = bincode::serialize(&meta).unwrap();
+        let decoded: ProofTreeMeta = bincode::deserialize(&encoded).unwrap();
+
+        assert_eq!(decoded.get_root(), meta.get_root());
+        assert_eq!(decoded.next_leaf_index, 10);
+        assert_eq!(decoded.root_history, meta.root_history);
+        assert_eq!(decoded.proof_tree.nodes, meta.proof_tree.nodes);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn from_portable_manager_maps_leaf_circuit_types_and_indices() {
+        use plonky2::{hash::merkle_tree::MerkleCap, plonk::circuit_data::VerifierOnlyCircuitData};
+        use psy_crypto::common::witnesses::qrecursion::proof_data::LeafProofRecord;
+
+        // the record blobs are never verified here, but they must be real
+        // enough to type-check; the zk-sign inner proof is cheap to produce
+        let circuits = crate::wallet::memory_wallet::PsyWalletLocalCircuits::from_embedded_bundle().expect("embedded local circuits should load");
+        let proof = circuits
+            .prove_zk_sign_inner(value(41), value(45))
+            .expect("zk-sign inner proof should be cheap");
+        let verifier_data = VerifierOnlyCircuitData {
+            constants_sigmas_cap: MerkleCap(Vec::new()),
+            circuit_digest: QHashOut::<F>::ZERO.0,
+        };
+
+        // leaf circuit types 1..=5 exercise every mapping arm incl. UNKNOWN
+        let records: Vec<LeafProofRecord<C, D>> = (0u64..5)
+            .map(|i| LeafProofRecord {
+                leaf_circuit_type: i + 1,
+                fingerprint: value(100 + i),
+                insertion_proof: DeltaMerkleProofCore {
+                    old_root: QHashOut::ZERO,
+                    old_value: QHashOut::ZERO,
+                    new_root: QHashOut::ZERO,
+                    new_value: value(200 + i),
+                    index: i,
+                    siblings: Vec::new(),
+                },
+                proof: proof.clone(),
+                verifier_data: verifier_data.clone(),
+            })
+            .collect();
+
+        let mut manager = PortableQTreeRecursionManager::<C, D>::new(3).await;
+        manager.restore_leaf_proofs_from_records(records);
+
+        let metadata = ProofTreeMeta::from_portable_manager(&manager);
+        assert_eq!(metadata.leaf_records.len(), 5);
+        let types: Vec<&str> = metadata.leaf_records.iter().map(|record| record.circuit_type.as_str()).collect();
+        assert_eq!(types, vec!["UPS_STEP", "CFC", "ZK_SIG", "EXTERNAL_PROOF", "UNKNOWN"]);
+        for (i, record) in metadata.leaf_records.iter().enumerate() {
+            assert_eq!(record.leaf_index, i as u64);
+            assert_eq!(record.leaf_circuit_type_id, i as u64 + 1);
+            assert_eq!(record.fingerprint, value(100 + i as u64));
+        }
+        assert_eq!(metadata.proof_tree.height, 3);
+        // restoring records does not advance the tree cursor
+        assert_eq!(metadata.next_leaf_index, 0);
+    }
+}

@@ -63,3 +63,50 @@ impl SignatureUser for ZKUser {
         })
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn constructor_retains_the_private_key() {
+        let private_key = QHashOut::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a").unwrap();
+        let user = ZKUser::new(private_key.into());
+
+        assert_eq!(user.private_key.private_key, private_key);
+    }
+
+    #[tokio::test]
+    async fn zk_user_derives_identity_and_circuit_info_from_the_wallet() {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let session = session.read();
+        let wallet = &session.wallet;
+        let manager = wallet.random_circuit_manager();
+
+        let private_key = QHashOut::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a").unwrap();
+        let user = ZKUser::new(private_key.into());
+
+        let info = user.public_key_info(wallet, manager.as_ref()).await.unwrap();
+        assert_eq!(info.fingerprint, wallet.zk_circuit_fingerprint().await.unwrap());
+        assert_eq!(
+            info.public_key_param,
+            SimplePsyPrivateKey::new(private_key).get_public_key_param::<PoseidonHash>()
+        );
+
+        let circuit_info = user
+            .circuit_info(wallet, manager.as_ref(), &SignContext::new(QHashOut::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(circuit_info.circuit_fingerprint, info.fingerprint);
+
+        // held-key zk signing proves through the wallet's local zk-sign circuit
+        let proof = user
+            .sign(wallet, manager.as_ref(), &SignContext::new(info.fingerprint), QHashOut::ZERO)
+            .await
+            .unwrap();
+        assert!(!proof.proof.wires_cap.0.is_empty());
+    }
+}

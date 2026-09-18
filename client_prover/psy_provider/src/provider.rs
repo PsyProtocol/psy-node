@@ -316,7 +316,13 @@ macro_rules! psy_rpc_call_back {
                                 error = %e,
                                 "[RPC_DECODE_FAIL] failed to parse JSON-RPC response body"
                             );
-                            Err(anyhow::anyhow!("Failed to parse JSON response: {}", e))
+                            Err(anyhow::anyhow!(
+                                "failed to parse JSON-RPC response: method={} status={} error={} body={}",
+                                method_name,
+                                status,
+                                e,
+                                body
+                            ))
                         }
                     }
                 }

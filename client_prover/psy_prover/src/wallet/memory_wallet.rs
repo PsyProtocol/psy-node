@@ -1216,6 +1216,7 @@ impl PsyMemoryWallet {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::str::FromStr;
 
@@ -1229,6 +1230,634 @@ mod tests {
     type F = GoldilocksField;
     type C = PoseidonGoldilocksConfig;
     const D: usize = 2;
+
+    #[test]
+    fn built_in_fingerprints_are_distinct_and_stable() {
+        let zk = get_zk_fingerprint::<F>();
+        let secp = get_secp256k1_fingerprint::<F>();
+        let personal = get_eth_personal_secp256k1_fingerprint::<F>();
+
+        assert_ne!(zk, secp);
+        assert_ne!(zk, personal);
+        assert_ne!(secp, personal);
+        assert_eq!(zk.0.elements, ZK_FINGERPRINT_U64.map(F::from_canonical_u64));
+        assert_eq!(secp.0.elements, SECP256K1_FINGERPRINT_U64.map(F::from_canonical_u64));
+        assert_eq!(personal.0.elements, ETH_PERSONAL_SECP256K1_FINGERPRINT_U64.map(F::from_canonical_u64));
+    }
+
+    #[test]
+    fn allowed_contract_method_pairs_support_zip_and_broadcast() {
+        assert_eq!(allowed_contract_method_pairs(&[1, 2], &[10, 20]).unwrap(), vec![(1, 10), (2, 20)]);
+        assert_eq!(allowed_contract_method_pairs(&[7], &[10, 20]).unwrap(), vec![(7, 10), (7, 20)]);
+        assert_eq!(allowed_contract_method_pairs(&[1, 2], &[99]).unwrap(), vec![(1, 99), (2, 99)]);
+    }
+
+    #[test]
+    fn allowed_contract_method_pairs_reject_invalid_shapes() {
+        assert!(allowed_contract_method_pairs(&[], &[1])
+            .unwrap_err()
+            .to_string()
+            .contains("contract_id list"));
+        assert!(allowed_contract_method_pairs(&[1], &[])
+            .unwrap_err()
+            .to_string()
+            .contains("method_id list"));
+        assert!(allowed_contract_method_pairs(&[1, 2], &[3, 4, 5])
+            .unwrap_err()
+            .to_string()
+            .contains("same length"));
+    }
+
+    #[test]
+    fn allow_method_circuit_rejects_invalid_transaction_counts_early() {
+        assert!(build_allow_method_sd_key_circuit(&[1], &[2], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("greater than zero"));
+        assert!(build_allow_method_sd_key_circuit(&[1], &[2], u32::MAX as u64 + 1)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds u32 range"));
+    }
+
+    #[test]
+    fn circuit_bundle_fields_round_trip_and_reject_invalid_base64() {
+        let encoded = encode_circuit_field(&[0, 1, 2, 254, 255]);
+        assert_eq!(decode_circuit_field(&encoded).unwrap(), vec![0, 1, 2, 254, 255]);
+        assert!(decode_circuit_field("not-base64!").is_err());
+    }
+
+    #[test]
+    fn public_key_info_supports_zk_and_secp_builtin_fingerprints() -> Result<()> {
+        let private_key = QHashOut::<F>::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a")?;
+        let zk = get_public_key_info(private_key, get_zk_fingerprint())?;
+        let secp = get_public_key_info(private_key, get_secp256k1_fingerprint())?;
+        let personal = get_public_key_info(private_key, get_eth_personal_secp256k1_fingerprint())?;
+
+        assert_eq!(zk.fingerprint, get_zk_fingerprint());
+        assert_eq!(secp.fingerprint, get_secp256k1_fingerprint());
+        assert_eq!(personal.fingerprint, get_eth_personal_secp256k1_fingerprint());
+        assert_ne!(zk.public_key_param, secp.public_key_param);
+        assert_eq!(secp.public_key_param, personal.public_key_param);
+        Ok(())
+    }
+
+    #[test]
+    fn local_circuit_registry_tracks_sd_key_policy_without_loading_circuits() {
+        let circuits = PsyWalletLocalCircuits::default();
+        let fingerprint = get_zk_fingerprint::<F>();
+        assert!(!circuits.has_sd_key_circuit(&fingerprint));
+        assert!(circuits.get_sd_key_policy(&fingerprint).is_none());
+
+        circuits.insert_sd_key_policy(
+            fingerprint,
+            SDKeyPolicy {
+                allowed_contract_ids: vec![7, 8],
+                allowed_method_ids: vec![11],
+                expected_tx_count: 2,
+            },
+        );
+        let policy = circuits.get_sd_key_policy(&fingerprint).unwrap();
+        assert_eq!(policy.allowed_contract_ids, vec![7, 8]);
+        assert_eq!(policy.allowed_method_ids, vec![11]);
+        assert_eq!(policy.expected_tx_count, 2);
+    }
+
+    #[test]
+    fn empty_wallet_reports_missing_user_by_public_key_hash() {
+        let wallet = PsyMemoryWallet::new(Vec::new());
+        let missing = get_zk_fingerprint::<F>();
+        assert!(wallet
+            .get_user_by_public_key_hash(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+    }
+
+    #[test]
+    fn allow_method_fingerprint_helper_builds_the_circuit() -> Result<()> {
+        let fingerprint = get_allow_method_sd_key_fingerprint(&[5], &[6], 1)?;
+        assert_ne!(fingerprint, QHashOut::<F>::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_loader_rejects_malformed_json() {
+        assert!(PsyWalletLocalCircuits::from_bundle_json("not json").is_err());
+    }
+
+    #[tokio::test]
+    async fn wallet_manages_held_key_and_external_users_offline() {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let key = QHashOut::<F>::from_values(201, 202, 203, 204);
+        let other_key = QHashOut::<F>::from_values(205, 206, 207, 208);
+        let sighash = QHashOut::<F>::from_values(9, 9, 9, 9);
+
+        let (zk_fingerprint, secp_fingerprint, eth_personal_fingerprint) = {
+            let read = session.read();
+            let wallet = &read.wallet;
+            let manager = wallet.random_circuit_manager();
+            (
+                wallet.zk_circuit_fingerprint().await.unwrap(),
+                manager.secp_circuit_fingerprint().await.unwrap(),
+                manager.eth_personal_secp_circuit_fingerprint().await.unwrap(),
+            )
+        };
+
+        // get_or_create_user dispatches by fingerprint across the held-key types
+        let zk_info = session.write().wallet.get_or_create_user(key, zk_fingerprint).await.unwrap();
+        let secp_info = session.write().wallet.get_or_create_user(key, secp_fingerprint).await.unwrap();
+        let eth_info = session.write().wallet.get_or_create_user(key, eth_personal_fingerprint).await.unwrap();
+        assert_eq!(zk_info.fingerprint, zk_fingerprint);
+        assert_eq!(secp_info.fingerprint, secp_fingerprint);
+        assert_eq!(eth_info.fingerprint, eth_personal_fingerprint);
+        assert_ne!(zk_info.public_key_param, secp_info.public_key_param);
+        assert_eq!(secp_info.public_key_param, eth_info.public_key_param);
+
+        // sd-key users dispatch through the registered sd-key circuit
+        let sd_key_fingerprint = session.write().register_sd_key_circuit(&[3], &[4], 2).await.unwrap();
+        let sd_key_info = session.write().wallet.get_or_create_user(key, sd_key_fingerprint).await.unwrap();
+        assert_eq!(sd_key_info.fingerprint, sd_key_fingerprint);
+
+        // unregistered software-defined fingerprints are rejected
+        let error = session
+            .write()
+            .wallet
+            .get_or_create_user(key, QHashOut::from_values(77, 77, 77, 77))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
+
+        // the per-type pk-info getters agree with the dispatch results
+        {
+            let read = session.read();
+            let wallet = &read.wallet;
+            assert_eq!(wallet.get_zk_pk_info(key).await.unwrap().public_key_param, zk_info.public_key_param);
+            assert_eq!(wallet.get_secp_pk_info(key).await.unwrap().public_key_param, secp_info.public_key_param);
+            assert_eq!(
+                wallet.get_eth_personal_secp_pk_info(key).await.unwrap().public_key_param,
+                eth_info.public_key_param
+            );
+        }
+
+        // registered users resolve by info, hash, and public key
+        {
+            let read = session.read();
+            let wallet = &read.wallet;
+            let zk_hash = zk_info.qfhash::<psy_client_data::config::store_config::PsyHasher>();
+            assert!(wallet.get_user_by_info(&zk_info).await.is_ok());
+            assert!(wallet.get_user_by_public_key_hash(&zk_hash).is_ok());
+            assert_eq!(wallet.get_public_key_info(&zk_hash).await.unwrap().fingerprint, zk_fingerprint);
+            assert!(wallet
+                .get_user_by_info(&ZKPublicKeyInfo {
+                    fingerprint: zk_fingerprint,
+                    public_key_param: QHashOut::ZERO,
+                })
+                .await
+                .is_err());
+            assert!(wallet.get_public_key_info(&QHashOut::ZERO).await.is_err());
+        }
+
+        // raw secp signing stays offline and feeds the external-user injection
+        let compressed = psy_crypto::signature::secp256k1::wallet::get_secp_public_key::<F>(key).unwrap();
+        let (external_info, personal_external) = {
+            let mut write = session.write();
+            let external_info = write.wallet.register_external_secp_user(compressed).await.unwrap();
+            let personal_external = write.wallet.register_external_eth_personal_user(compressed).await.unwrap();
+            (external_info, personal_external)
+        };
+        let external_hash = external_info.qfhash::<psy_client_data::config::store_config::PsyHasher>();
+        let personal_hash = personal_external.qfhash::<psy_client_data::config::store_config::PsyHasher>();
+
+        let signature = session.read().wallet.secp256k1_sign(key, sighash).unwrap();
+        let error = session
+            .write()
+            .wallet
+            .inject_secp_signature(QHashOut::ZERO, signature.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not found in wallet"));
+
+        let foreign = session.read().wallet.secp256k1_sign(other_key, sighash).unwrap();
+        let error = session.write().wallet.inject_secp_signature(external_hash, foreign).await.unwrap_err();
+        assert!(error.to_string().contains("belongs to public key"));
+
+        let injected = session.write().wallet.inject_secp_signature(external_hash, signature).await.unwrap();
+        assert_eq!(injected.public_key_param, external_info.public_key_param);
+
+        // EIP-191 raw signing round-trips through the same wallet surface
+        let personal = session.read().wallet.eth_personal_secp256k1_sign(key, sighash).unwrap();
+        assert_eq!(personal.message.0, psy_client_common::data::base_types::hash256::Hash256::from(sighash).0);
+
+        // signing through the wallet dispatches per fingerprint and fails
+        // cleanly for unknown users or missing external signatures
+        {
+            let read = session.read();
+            let wallet = &read.wallet;
+            let zk_hash = zk_info.qfhash::<psy_client_data::config::store_config::PsyHasher>();
+            let proof = wallet.zk_sign_for_public_key(zk_hash, sighash).await.unwrap();
+            assert!(!proof.proof.wires_cap.0.is_empty());
+            assert!(wallet.zk_sign_with_private_key(key, sighash).await.is_ok());
+            assert!(wallet
+                .sign_with_public_key(&QHashOut::ZERO, &SignContext::new(zk_fingerprint), sighash)
+                .await
+                .is_err());
+            assert!(wallet.zk_sign_secp256k1(QHashOut::ZERO, sighash).await.is_err());
+
+            // the eth-personal manager selection path fails before proving on
+            // the PK-only external user (no signature injected yet)
+            let error = wallet
+                .sign_with_public_key(&personal_hash, &SignContext::new(get_eth_personal_secp256k1_fingerprint()), sighash)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("signature missing"));
+        }
+
+        // privacy fallback minifier metadata is available offline
+        {
+            let read = session.read();
+            let wallet = &read.wallet;
+            assert_ne!(wallet.fallback_private_note_inclusion_minifier_fingerprint(), QHashOut::ZERO);
+            assert!(!wallet
+                .local_circuits()
+                .private_note_inclusion_verifier_data()
+                .constants_sigmas_cap
+                .is_empty());
+        }
+    }
+
+    const VIEW_AND_MUTATE_CONTRACT: &str = r#"
+        const PSY_TOTAL_USERS: usize = 4;
+        const PSY_TOTAL_CONTRACTS: usize = 4;
+
+        #[contract]
+        pub struct TestContract {
+            pub value: Felt,
+        }
+
+        #[contract_implementation]
+        impl TestContract {
+            #[contract_method]
+            pub fn set_value(&mut self, ctx: &ChainContext, new_value: Felt) {
+                self.value = new_value;
+            }
+
+            #[contract_method]
+            pub fn get_value(&mut self, ctx: &ChainContext) -> Felt {
+                return self.value;
+            }
+        }
+    "#;
+
+    #[tokio::test]
+    async fn wallet_registers_software_defined_and_contract_circuits() {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let output = psy_compiler::compile(VIEW_AND_MUTATE_CONTRACT).expect("contract should compile");
+        let view_def = output
+            .circuit_definitions
+            .iter()
+            .find(|def| def.is_view_function())
+            .expect("getter should lower to a view function")
+            .clone();
+        let mutating_def = output
+            .circuit_definitions
+            .iter()
+            .find(|def| !def.is_view_function())
+            .expect("setter should lower to a mutating function")
+            .clone();
+
+        let (psy_fingerprint, plonky2_fingerprint) = {
+            let read = session.read();
+            let wallet = &read.wallet;
+
+            let error = wallet.register_psy_software_defined_circuit(mutating_def, false).await.unwrap_err();
+            assert!(error.to_string().contains("Cannot register view function"));
+
+            let psy_fingerprint = wallet.register_psy_software_defined_circuit(view_def.clone(), false).await.unwrap();
+            assert_ne!(psy_fingerprint, QHashOut::<F>::ZERO);
+            assert!(wallet.has_psy_software_defined_circuit(&psy_fingerprint));
+            // re-registration keeps the fingerprint and only warns
+            assert_eq!(
+                wallet.register_psy_software_defined_circuit(view_def.clone(), false).await.unwrap(),
+                psy_fingerprint
+            );
+
+            let plonky2_fingerprint = wallet.register_plonky2_software_defined_circuit(10, 4).await.unwrap();
+            assert_ne!(plonky2_fingerprint, QHashOut::<F>::ZERO);
+            assert!(wallet.has_plonky2_software_defined_circuit(&plonky2_fingerprint));
+            assert!(!wallet.has_plonky2_software_defined_circuit(&psy_fingerprint));
+            assert_eq!(
+                wallet.register_plonky2_software_defined_circuit(10, 4).await.unwrap(),
+                plonky2_fingerprint
+            );
+
+            (psy_fingerprint, plonky2_fingerprint)
+        };
+
+        // the registered fingerprints create users through the dispatch
+        let key = QHashOut::<F>::from_values(151, 152, 153, 154);
+        let psy_info = session.write().wallet.get_or_create_user(key, psy_fingerprint).await.unwrap();
+        assert_eq!(psy_info.fingerprint, psy_fingerprint);
+        let plonky2_info = session.write().wallet.get_or_create_user(key, plonky2_fingerprint).await.unwrap();
+        assert_eq!(plonky2_info.fingerprint, plonky2_fingerprint);
+
+        // registered sd-key circuits expose their gadget and policy accessors
+        let sd_key_fingerprint = session.write().register_sd_key_circuit(&[3], &[4], 2).await.unwrap();
+        {
+            let read = session.read();
+            let wallet = &read.wallet;
+            assert!(wallet.get_sd_key_circuit(&sd_key_fingerprint).is_some());
+            assert!(wallet.get_sd_key_circuit_mut(&sd_key_fingerprint).is_some());
+            let policy = wallet
+                .get_sd_key_policy(&sd_key_fingerprint)
+                .expect("allow-method sd key circuit carries its policy");
+            assert_eq!(policy.expected_tx_count, 2);
+            assert!(wallet.local_circuits().get_sd_key_circuit_mut(&sd_key_fingerprint).is_some());
+            assert!(!wallet
+                .fallback_private_note_inclusion_minifier_verifier_data()
+                .constants_sigmas_cap
+                .is_empty());
+        }
+
+        // trace-provided contract code registers on every manager and caches
+        let deployer = QHashOut::<F>::from_values(161, 162, 163, 164);
+        let contract_bytes = {
+            let read = session.read();
+            let update_cmd = read.get_update_contract_cmd(9001, deployer, output.circuit_definitions.clone()).unwrap();
+            assert_eq!(update_cmd.contract_id, 9001);
+            bincode::serialize(&update_cmd.code_definition).unwrap()
+        };
+        {
+            let read = session.read();
+            let wallet = &read.wallet;
+            wallet.ensure_trace_contract_circuits_registered(9001, &contract_bytes).await.unwrap();
+            // the second registration hits the byte cache without recompiling
+            wallet.ensure_trace_contract_circuits_registered(9001, &contract_bytes).await.unwrap();
+            assert!(wallet.ensure_trace_contract_circuits_registered(9001, &[1, 2, 3]).await.is_err());
+        }
+    }
+
+    /// `prove_private_note_inclusion` proves through the local fallback when
+    /// the circuit-manager proxy is unreachable: the dead-network session's
+    /// manager call fails, so the in-process minifier chain re-wraps the base
+    /// proof instead. The public input is the circuit's 16-value commitment
+    /// hash: owner ‖ amount ‖ user_tree_root ‖ checkpoint ‖ slot ‖
+    /// contract_id ‖ nullifier.
+    #[tokio::test]
+    async fn private_note_inclusion_proves_via_the_local_fallback_minifier() -> Result<()> {
+        use psy_client_data::qdata::user::PsyUserLeaf;
+        use psy_crypto::hash::{
+            merkle::utils::simple_merkle_tree::SimpleMerkleTree,
+            traits::hasher::FieldQHasher,
+        };
+
+        type OfflineTree = SimpleMerkleTree<PsyHasher, QHashOut<F>>;
+
+        let nullifier_secret = QHashOut::from_values(31, 32, 33, 34);
+        let note_secret = QHashOut::from_values(41, 42, 43, 44);
+        let owner = QHashOut::from_values(51, 52, 53, 54);
+        let amount = F::from_canonical_u64(777);
+        let checkpoint_id = F::from_canonical_u64(33);
+
+        // commitment = two_to_one(two_to_one(owner, [amount, 0, 0, 0]),
+        // hash8(nullifier_secret ‖ note_secret))
+        let value_hash = QHashOut(HashOut { elements: [amount, F::ZERO, F::ZERO, F::ZERO] });
+        let inner_hash = PsyHasher::q_two_to_one(owner, value_hash);
+        let note_commitment = PsyHasher::q_hash_many(
+            &nullifier_secret
+                .0
+                .elements
+                .iter()
+                .chain(&note_secret.0.elements)
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        let commitment = PsyHasher::q_two_to_one(inner_hash, note_commitment);
+
+        let note_index = 5u64;
+        let mut note_tree = OfflineTree::new(PRIVATE_NOTE_TREE_HEIGHT as u8);
+        note_tree.set_leaf(note_index, commitment);
+        let note_membership_proof = note_tree.get_leaf(note_index);
+
+        let note_root_slot = 3u64;
+        let contract_id = 9u64;
+        let mut state_tree = OfflineTree::new(TOKEN_CONTRACT_STATE_TREE_HEIGHT);
+        state_tree.set_leaf(note_root_slot, note_membership_proof.root);
+        let note_root_slot_proof = state_tree.get_leaf(note_root_slot);
+
+        let mut user_state_tree = OfflineTree::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+        user_state_tree.set_leaf(contract_id, note_root_slot_proof.root);
+        let contract_proof = user_state_tree.get_leaf(contract_id);
+
+        let sender_user_id = 2u64;
+        let user_leaf = PsyUserLeaf::new_user_default(
+            F::from_canonical_u64(sender_user_id),
+            QHashOut::from_values(61, 62, 63, 64),
+            contract_proof.root,
+        );
+        let mut user_tree = OfflineTree::new(GLOBAL_USER_TREE_HEIGHT);
+        user_tree.set_leaf(sender_user_id, user_leaf.qfhash::<PsyHasher>());
+        let user_tree_proof = user_tree.get_leaf(sender_user_id);
+        let user_tree_root = user_tree_proof.root;
+
+        let input = PrivateNoteInclusionInput {
+            nullifier_secret,
+            sender_user_id,
+            contract_id,
+            user_leaf,
+            owner,
+            amount,
+            note_secret,
+            note_membership_proof,
+            note_root_slot,
+            note_root_slot_proof,
+            contract_proof,
+            user_tree_proof,
+            checkpoint_id,
+        };
+
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let (fingerprint, proof, _verifier) = session.read().wallet.prove_private_note_inclusion(&input).await?;
+        assert_ne!(fingerprint, QHashOut::<F>::ZERO);
+
+        let nullifier = PsyHasher::q_hash_many(&nullifier_secret.0.elements);
+        let expected_public_inputs = PsyHasher::q_hash_many(
+            &owner
+                .0
+                .elements
+                .iter()
+                .copied()
+                .chain([amount])
+                .chain(user_tree_root.0.elements)
+                .chain([
+                    checkpoint_id,
+                    F::from_canonical_u64(note_root_slot),
+                    F::from_canonical_u64(contract_id),
+                ])
+                .chain(nullifier.0.elements)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(proof.public_inputs.len(), 4);
+        assert_eq!(proof.public_inputs, expected_public_inputs.0.elements.to_vec());
+        Ok(())
+    }
+
+    /// `prove_shield_deposit_claim` walks the same fallback for the
+    /// deposit-inclusion circuit. The 41-value deposit commitment follows the
+    /// relayer leaf layout (u32 words, HIGH then LOW per field element); the
+    /// 42-value public hash mixes the public metadata, deposit root/index,
+    /// nullifier and note commitment.
+    #[tokio::test]
+    async fn shield_deposit_claim_proves_via_the_local_fallback_minifier() -> Result<()> {
+        use plonky2::field::types::PrimeField64;
+        use psy_crypto::hash::{
+            merkle::utils::simple_merkle_tree::SimpleMerkleTree,
+            traits::hasher::FieldQHasher,
+        };
+
+        type OfflineTree = SimpleMerkleTree<PsyHasher, QHashOut<F>>;
+
+        // mirrors the deposit circuit's private DEPOSIT_TREE_HEIGHT constant
+        const DEPOSIT_TREE_HEIGHT: u8 = psy_config::network_constants::GLOBAL_DEPOSIT_TREE_HEIGHT;
+
+        let nullifier_secret =
+            [F::from_canonical_u64(71), F::from_canonical_u64(72), F::from_canonical_u64(73), F::from_canonical_u64(74)];
+        let note_secret =
+            [F::from_canonical_u64(81), F::from_canonical_u64(82), F::from_canonical_u64(83), F::from_canonical_u64(84)];
+        let shield_address = QHashOut::from_values(91, 92, 93, 94);
+        let deposit_index = 6u64;
+        let token_address = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let l2_token_contract_id = [9u32, 10, 11, 12, 13, 14, 15, 16];
+        // words 0..6 are constrained to zero; the amount value lives in the
+        // final (high, low) pair
+        let amount_value: u64 = 9876543210;
+        let amount = [0u32, 0, 0, 0, 0, 0, (amount_value >> 32) as u32, amount_value as u32];
+        let source_chain_index = 3u32;
+
+        let split_words = |hash: &QHashOut<F>| -> [F; 8] {
+            std::array::from_fn(|i| {
+                let value = hash.0.elements[i / 2].to_canonical_u64();
+                if i % 2 == 0 {
+                    F::from_canonical_u64(value >> 32)
+                } else {
+                    F::from_canonical_u64(value & 0xffffffff)
+                }
+            })
+        };
+
+        let nullifier_hash = PsyHasher::q_hash_many(&nullifier_secret);
+        let note_commitment =
+            PsyHasher::q_hash_many(&nullifier_secret.iter().chain(&note_secret).copied().collect::<Vec<_>>());
+        let shield_words = split_words(&shield_address);
+        let note_words = split_words(&note_commitment);
+
+        let mut preimage = Vec::with_capacity(41);
+        preimage.extend_from_slice(&shield_words);
+        preimage.extend_from_slice(&token_address.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        preimage
+            .extend_from_slice(&l2_token_contract_id.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        preimage.extend_from_slice(&amount.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        preimage.push(F::from_canonical_u32(source_chain_index));
+        preimage.extend_from_slice(&note_words);
+        let deposit_commitment = PsyHasher::q_hash_many(&preimage);
+
+        let mut deposit_tree = OfflineTree::new(DEPOSIT_TREE_HEIGHT);
+        deposit_tree.set_leaf(deposit_index, deposit_commitment);
+        let deposit_proof = deposit_tree.get_leaf(deposit_index);
+        let deposit_root = deposit_proof.root;
+
+        let input = DepositInclusionInput {
+            nullifier_secret,
+            note_secret,
+            shield_address,
+            deposit_index,
+            token_address,
+            l2_token_contract_id,
+            amount,
+            source_chain_index,
+            deposit_root,
+            deposit_proof,
+        };
+
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let (fingerprint, proof, _verifier) = session.read().wallet.prove_shield_deposit_claim(&input).await?;
+        assert_ne!(fingerprint, QHashOut::<F>::ZERO);
+
+        let mut expected_preimage = Vec::with_capacity(42);
+        expected_preimage.extend_from_slice(&shield_address.0.elements);
+        expected_preimage.extend_from_slice(&amount.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        expected_preimage.extend_from_slice(&token_address.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        expected_preimage.extend_from_slice(&l2_token_contract_id.iter().map(|word| F::from_canonical_u32(*word)).collect::<Vec<_>>());
+        expected_preimage.push(F::from_canonical_u32(source_chain_index));
+        expected_preimage.extend_from_slice(&deposit_root.0.elements);
+        expected_preimage.extend_from_slice(&nullifier_hash.0.elements);
+        expected_preimage.extend_from_slice(&note_commitment.0.elements);
+        expected_preimage.push(F::from_canonical_u64(deposit_index));
+        let expected_public_inputs = PsyHasher::q_hash_many(&expected_preimage);
+
+        assert_eq!(proof.public_inputs.len(), 4);
+        assert_eq!(proof.public_inputs, expected_public_inputs.0.elements.to_vec());
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn local_circuit_disk_cache_round_trips_and_survives_corruption() {
+        let name = format!(
+            "test_lolc_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let path = local_circuit_cache_path(&name).expect("host cache dir should be available");
+
+        let build = || 7u32;
+        let load = |bytes: &[u8]| -> anyhow::Result<u32> {
+            let text = String::from_utf8(bytes.to_vec())?;
+            text.parse::<u32>().map_err(Into::into)
+        };
+        let serialize = |value: &u32| -> anyhow::Result<Vec<u8>> { Ok(value.to_string().into_bytes()) };
+
+        // the first call builds the value and writes the cache
+        assert_eq!(load_or_build_local_circuit(&name, build, load, serialize), 7);
+        assert!(path.exists());
+
+        // the second call loads from the cache without rebuilding
+        assert_eq!(
+            load_or_build_local_circuit(&name, || unreachable!("cache should hit"), load, serialize),
+            7
+        );
+
+        // a corrupt cache falls back to a rebuild and rewrites the file
+        std::fs::write(&path, b"garbage").unwrap();
+        assert_eq!(load_or_build_local_circuit(&name, build, load, serialize), 7);
+
+        // serialization failures only skip the cache write
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            load_or_build_local_circuit(&name, build, load, |_| -> anyhow::Result<Vec<u8>> {
+                anyhow::bail!("serialization disabled")
+            }),
+            7
+        );
+        assert!(!path.exists());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bundle_loader_rejects_version_mismatches() {
+        let bad_version = serde_json::json!({
+            "version": 999999,
+            "zk_signature_inner": "",
+            "private_note_inclusion": "",
+            "shield_deposit_claim": ""
+        })
+        .to_string();
+        let error = PsyWalletLocalCircuits::from_bundle_json(&bad_version)
+            .err()
+            .expect("bundle with wrong version should be rejected");
+        assert!(error.to_string().contains("version mismatch"));
+    }
 
     /// Measures pure-Rust deflate (flate2/miniz_oxide, wasm-compatible)
     /// compression ratio on the base circuit bytes, to see whether
@@ -1568,6 +2197,91 @@ mod tests {
             "EIP-191 proof public inputs should match hash(raw_sighash, public_key_param)"
         );
 
+        Ok(())
+    }
+
+    /// The raw secp signing helpers bind the sighash into a compressed
+    /// signature, and the signature-to-proof bridges turn either flavor into
+    /// a verifiable plonky2 proof through the offline circuit manager.
+    #[tokio::test]
+    async fn raw_secp_sign_helpers_and_signature_proofs_round_trip() -> Result<()> {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let wallet = &session.read().wallet;
+
+        let private_key = QHashOut::<F>::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a")?;
+        let sig_hash = QHashOut::<F>::from_str("83955402ec7f375d1d6e8f3bf59753fe0af1e7c62bb4b662716a2524d3e2d186")?;
+
+        let signature = wallet.secp256k1_sign(private_key, sig_hash)?;
+        let personal = wallet.eth_personal_secp256k1_sign(private_key, sig_hash)?;
+        assert_ne!(signature.signature, personal.signature);
+
+        let proof = wallet.zk_secp256k1_from_signature(&signature).await?;
+        assert!(proof.public_inputs.len() >= 4);
+        let personal_proof = wallet.zk_eth_personal_secp256k1_from_signature(&personal).await?;
+        assert!(personal_proof.public_inputs.len() >= 4);
+        Ok(())
+    }
+
+    /// Software-defined circuit registration installs every flavor and the
+    /// lookup helpers agree; only view functions are accepted for the psy
+    /// software-defined flavor.
+    #[tokio::test]
+    async fn software_defined_circuits_register_and_report_their_fingerprints() -> Result<()> {
+        let session = crate::test_support::shared_offline_wallet_session().await;
+        let wallet = &session.read().wallet;
+
+        // sd-key allow-method circuit: registering twice keeps the fingerprint
+        let sd_fingerprint = wallet.register_allow_method_sd_key_circuit(&[7], &[2], 3).await?;
+        assert!(wallet.has_sd_key_circuit(&sd_fingerprint));
+        assert_eq!(wallet.register_allow_method_sd_key_circuit(&[7], &[2], 3).await?, sd_fingerprint);
+
+        // plonky2 software-defined flavor
+        let plonky2_fingerprint = wallet.register_plonky2_software_defined_circuit(8, 4).await?;
+        assert!(wallet.has_plonky2_software_defined_circuit(&plonky2_fingerprint));
+
+        // psy software-defined flavor needs a view function; the helper
+        // contract's getter qualifies, its setter does not
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct WalletTestContract {
+                pub value: Felt,
+            }
+
+            #[contract_implementation]
+            impl WalletTestContract {
+                #[contract_method]
+                pub fn set_value(&mut self, ctx: &ChainContext, new_value: Felt) {
+                    self.value = new_value;
+                }
+
+                #[contract_method]
+                pub fn get_value(&mut self, ctx: &ChainContext) -> Felt {
+                    return self.value;
+                }
+            }
+        "#;
+        let output = crate::session::compile_bridge::compile_contract_output(source)?;
+        let view_def = output
+            .circuit_definitions
+            .iter()
+            .find(|def| def.is_view_function())
+            .cloned()
+            .expect("the getter must compile to a view function");
+        let mutating_def = output
+            .circuit_definitions
+            .iter()
+            .find(|def| !def.is_view_function())
+            .cloned()
+            .expect("the setter must compile to a mutating function");
+
+        let psy_fingerprint = wallet.register_psy_software_defined_circuit(view_def, false).await?;
+        assert!(wallet.has_psy_software_defined_circuit(&psy_fingerprint));
+
+        let error = wallet.register_psy_software_defined_circuit(mutating_def, false).await.unwrap_err();
+        assert!(error.to_string().contains("Cannot register view function"));
         Ok(())
     }
 }

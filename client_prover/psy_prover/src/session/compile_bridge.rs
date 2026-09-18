@@ -305,6 +305,13 @@ pub fn simulate_method(
             let available: Vec<&str> = contract_output.abi.contract.methods.iter().map(|m| m.name.as_str()).collect();
             anyhow::anyhow!("Method '{}' not found. Available: {:?}", method_name, available)
         })?;
+    anyhow::ensure!(
+        inputs.len() == abi_method.input_felt_count,
+        "Method '{}' expects {} input felts, got {}",
+        method_name,
+        abi_method.input_felt_count,
+        inputs.len()
+    );
 
     // Find the matching circuit definition
     let circuit_def = contract_output
@@ -343,41 +350,61 @@ pub fn simulate_method_with_state(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_simulate_basic_contract() {
-        // A simple contract that just sets a state slot
-        let source = r#"
-            const PSY_TOTAL_USERS: usize = 4;
-            const PSY_TOTAL_CONTRACTS: usize = 4;
+    const BASIC_CONTRACT: &str = r#"
+        const PSY_TOTAL_USERS: usize = 4;
+        const PSY_TOTAL_CONTRACTS: usize = 4;
 
-            #[contract]
-            pub struct TestContract {
-                pub value: Felt,
+        #[contract]
+        pub struct TestContract {
+            pub value: Felt,
+        }
+
+        #[contract_implementation]
+        impl TestContract {
+            #[contract_method]
+            pub fn set_value(&mut self, ctx: &ChainContext, new_value: Felt) {
+                self.value = new_value;
             }
+        }
+    "#;
 
-            #[contract_implementation]
-            impl TestContract {
-                #[contract_method]
-                pub fn set_value(&mut self, ctx: &ChainContext, new_value: Felt) {
-                    self.value = new_value;
-                }
+    const GUARDED_CONTRACT: &str = r#"
+        #[contract]
+        pub struct GuardedContract {
+            pub value: Felt,
+        }
+
+        #[contract_implementation]
+        impl GuardedContract {
+            #[contract_method]
+            pub fn set_seven(&mut self, ctx: &ChainContext, new_value: Felt) {
+                require(new_value == 7, "expected seven");
+                self.value = new_value;
             }
-        "#;
+        }
+    "#;
 
-        let contract_output = psy_compiler::compile(source).expect("compilation should succeed");
-        assert_eq!(contract_output.method_count(), 1);
-
-        let context = ExecutionContext {
+    fn execution_context() -> ExecutionContext {
+        ExecutionContext {
             user_id: 1,
             contract_id: 1,
             caller_contract_id: 0,
             checkpoint_id: 100,
             nonce: 0,
             user_public_key_hash: [0; 4],
-        };
+        }
+    }
+
+    #[test]
+    fn test_simulate_basic_contract() {
+        let contract_output = psy_compiler::compile(BASIC_CONTRACT).expect("compilation should succeed");
+        assert_eq!(contract_output.method_count(), 1);
+
+        let context = execution_context();
 
         let result = simulate_method(&contract_output, "set_value", &[42], &context);
         assert!(result.is_ok(), "simulation should succeed: {:?}", result.err());
@@ -388,7 +415,94 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "builds state-layout circuits and generates a recursive deploy proof"]
+    fn simulation_returns_failed_result_for_contract_assertion() {
+        let output = compile_contract_output(GUARDED_CONTRACT).unwrap();
+
+        let failed = simulate_method(&output, "set_seven", &[6], &execution_context()).unwrap();
+        assert!(!failed.passed);
+        let failure = failed.execution.failure.expect("require failure must be reported");
+        assert_eq!(failure.message, "expected seven");
+        assert_eq!(failure.left_value, 0);
+        assert_eq!(failure.right_value, 1);
+
+        let passed = simulate_method(&output, "set_seven", &[7], &execution_context()).unwrap();
+        assert!(passed.passed);
+        assert!(passed.execution.failure.is_none());
+    }
+
+    #[test]
+    fn raw_compile_helpers_report_valid_and_invalid_inputs() {
+        let output = compile_contract_output(BASIC_CONTRACT).expect("valid source should compile");
+        assert_eq!(output.method_count(), 1);
+        assert!(compile_contract_output("this is not a Psy contract").is_err());
+
+        let missing = std::env::temp_dir().join(format!(
+            "psy-prover-missing-contract-{}-{}.psy",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        assert!(compile_crate_output(&missing).is_err());
+    }
+
+    #[test]
+    fn compile_crate_output_accepts_a_valid_root_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("contract.psy");
+        let root_source = format!("pub mod types;\nuse types::*;\n{BASIC_CONTRACT}");
+        std::fs::write(&root, root_source).unwrap();
+        std::fs::write(
+            directory.path().join("types.psy.rs"),
+            "#[derive(FeltSized)] pub struct ImportedValue { pub value: Felt }",
+        )
+        .unwrap();
+
+        let output = compile_crate_output(&root).expect("valid crate root should compile");
+        assert_eq!(output.method_count(), 1);
+        assert_eq!(output.abi.contract.name, "TestContract");
+    }
+
+    #[test]
+    fn simulation_rejects_unknown_method_and_missing_circuit_definition() {
+        let output = compile_contract_output(BASIC_CONTRACT).unwrap();
+        let error = simulate_method(&output, "missing", &[], &execution_context()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Method 'missing' not found"));
+        assert!(message.contains("set_value"));
+
+        let mut output_without_circuit = output;
+        output_without_circuit.circuit_definitions.clear();
+        let error = simulate_method(&output_without_circuit, "set_value", &[42], &execution_context()).unwrap_err();
+        assert!(error.to_string().contains("No circuit definition for method 'set_value'"));
+    }
+
+    #[test]
+    fn simulation_propagates_invalid_input_arity() {
+        let output = compile_contract_output(BASIC_CONTRACT).unwrap();
+
+        let missing = simulate_method(&output, "set_value", &[], &execution_context()).unwrap_err();
+        assert!(!missing.to_string().is_empty());
+
+        let extra = simulate_method(&output, "set_value", &[42, 43], &execution_context()).unwrap_err();
+        assert!(!extra.to_string().is_empty());
+    }
+
+    #[test]
+    fn simulation_with_supplied_state_executes_the_circuit_definition() {
+        let output = compile_contract_output(BASIC_CONTRACT).unwrap();
+        let mut state = InMemoryStateBackend::new();
+        state.set_slot(1, 1, 0, 55);
+        let execution = simulate_method_with_state(&output.circuit_definitions[0], &[77], &execution_context(), state).unwrap();
+
+        assert!(execution.success);
+        assert_eq!(execution.state_writes.len(), 1);
+        assert_eq!(execution.state_writes[0].old_value, vec![55]);
+        assert_eq!(execution.state_writes[0].new_value, vec![77]);
+        assert_eq!(execution.state_delta.len(), 1);
+        assert_eq!(execution.state_delta[0].old_value, vec![55]);
+        assert_eq!(execution.state_delta[0].new_value, vec![77]);
+    }
+
+    #[test]
     fn proves_layout_aware_contract_deploy() -> anyhow::Result<()> {
         let source = r#"
             #[contract]
@@ -423,7 +537,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "builds state-layout circuits and generates a recursive update proof"]
     fn proves_complex_append_only_contract_update() -> anyhow::Result<()> {
         let old_source = r#"
             #[derive(FeltSized)]
@@ -503,6 +616,59 @@ mod tests {
         assert_eq!(update.state_layout_slot_count, 55);
         assert!(!update.canonical_layout_proof.is_empty());
         update.validate_shape()?;
+        Ok(())
+    }
+
+    #[test]
+    fn compile_contract_builds_circuits_and_deploy_command() -> anyhow::Result<()> {
+        let deployer = QHashOut::<F>::from_values(21, 22, 23, 24);
+        let result = compile_contract(BASIC_CONTRACT, deployer)?;
+
+        assert!(!result.contract_output.circuit_definitions.is_empty());
+        assert_eq!(result.circuits.len(), result.contract_output.circuit_definitions.len());
+
+        Ok(())
+    }
+
+    #[test]
+    fn layout_proof_cache_serves_repeats_and_evicts_when_full() -> anyhow::Result<()> {
+        let contract_output = psy_compiler::compile(BASIC_CONTRACT)?;
+        let build_base_deploy = || {
+            super::super::gen_contract_deploy_and_circuits_for_functions::<C, D>(
+                QHashOut::<F>::default(),
+                u8::try_from(contract_output.abi.contract.state_tree_height)?,
+                &contract_output.circuit_definitions,
+            )
+            .map(|(_, deploy)| deploy)
+        };
+
+        // the first build proves the layout and caches it; the second build
+        // resolves the same manifest (same cache key) from the cache
+        build_layout_aware_deploy_command(&contract_output, build_base_deploy()?)?;
+        build_layout_aware_deploy_command(&contract_output, build_base_deploy()?)?;
+        assert!(local_layout_proof_cache().lock().unwrap().len() >= 1);
+
+        // fill the cache to capacity with clones, then one more distinct key
+        // must evict an existing entry to stay within the cap
+        let template = local_layout_proof_cache()
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+            .expect("the deploy build must have cached a layout proof");
+        {
+            let mut cache = local_layout_proof_cache().lock().unwrap();
+            let mut filler = 0u32;
+            while cache.len() < LOCAL_LAYOUT_PROOF_CACHE_MAX_ENTRIES {
+                cache.insert(format!("psy-test-filler-{filler}"), template.clone());
+                filler += 1;
+            }
+        }
+        cache_layout_proof("psy-test-fresh-entry".to_string(), template)?;
+        let cache = local_layout_proof_cache().lock().unwrap();
+        assert!(cache.contains_key("psy-test-fresh-entry"));
+        assert!(cache.len() <= LOCAL_LAYOUT_PROOF_CACHE_MAX_ENTRIES);
         Ok(())
     }
 }

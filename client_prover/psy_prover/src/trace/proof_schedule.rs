@@ -1204,6 +1204,7 @@ impl TraceProofSchedule {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::PoseidonHash, plonk::config::Hasher};
     use psy_client_common::data::qhashout::QHashOut;
@@ -1676,5 +1677,367 @@ mod tests {
                 sig_hash: QHashOut::ZERO,
             },
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase A over a self-consistent CFC trace
+    // -----------------------------------------------------------------------
+
+    use psy_client_common::data::alt::AltVerifierOnlyCircuitData;
+    use psy_crypto::hash::merkle::core::DeltaMerkleProofCore;
+    use psy_vm::vm::cfc_input::DapenContractFunctionCircuitInput;
+
+    use crate::trace::{CfcStateDelta, ExternalProofStep, TraceSignCircuitSource, TraceStepId, ZkSignStep};
+
+    fn zero_state_delta() -> CfcStateDelta {
+        CfcStateDelta {
+            cfc_transaction_input_context: Default::default(),
+            user_contract_tree_update_proof: DeltaMerkleProofCore {
+                old_root: QHashOut::ZERO,
+                old_value: QHashOut::ZERO,
+                new_root: QHashOut::ZERO,
+                new_value: QHashOut::ZERO,
+                index: 0,
+                siblings: Vec::new(),
+            },
+            deferred_tx_debt_pivot_proof: Default::default(),
+            inline_tx_debt_pivot_proof: Default::default(),
+        }
+    }
+
+    fn empty_alt_verifier_data() -> AltVerifierOnlyCircuitData<F> {
+        AltVerifierOnlyCircuitData {
+            constants_sigmas_cap: Vec::new(),
+            circuit_digest: QHashOut::ZERO,
+        }
+    }
+
+    /// Build a trace whose proof-tree bookend roots agree with the pure-hash
+    /// replay performed by `initial_state_from_trace` and
+    /// `TraceProofSchedule::build`, so the whole Phase A pipeline runs without
+    /// any proving. Steps: Standard(CFC) at 0, Inlined at 1 (skipped by the
+    /// schedule), ZkSign at 2 (skipped by the schedule).
+    fn consistent_cfc_trace() -> (TxTrace, QHashOut<F>) {
+        let ups_start_fingerprint = make_qhash(11, 11, 11, 11);
+        let cfc_fingerprint = make_qhash(22, 22, 22, 22);
+        let ups_fingerprint = make_qhash(33, 33, 33, 33);
+
+        // replay the ups-start leaf exactly as initial_state_from_trace does
+        let mut meta = ProofTreeMeta::new(UPS_SESSION_PROOF_TREE_HEIGHT as usize);
+        let root0 = current_root(&meta);
+        let ups_header: UserProvingSessionHeader<F> = Default::default();
+        insert_next_leaf(&mut meta, ups_leaf_value(ups_start_fingerprint, root0, ups_header.qfhash::<PsyHasher>()));
+        let root_after_start = current_root(&meta);
+
+        // replay the CFC + UPS leaves exactly as process_cfc_step does
+        let cfc_witness: DapenContractFunctionCircuitInput<F> = Default::default();
+        let end_header: UserProvingSessionHeader<F> = Default::default();
+        insert_next_leaf(
+            &mut meta,
+            cfc_leaf_value(
+                cfc_fingerprint,
+                cfc_witness.session_proof_tree_root,
+                cfc_witness.tx_input_ctx.qfhash::<PsyHasher>(),
+            ),
+        );
+        let root_after_cfc = current_root(&meta);
+        insert_next_leaf(
+            &mut meta,
+            ups_leaf_value(ups_fingerprint, root_after_cfc, end_header.qfhash::<PsyHasher>()),
+        );
+        let root_after_step = current_root(&meta);
+
+        let cfc_step_at = |step_id: usize| CfcStep {
+            id: TraceStepId(step_id),
+            parent: None,
+            inlined: Vec::new(),
+            deferred: Vec::new(),
+            contract_id: 5,
+            fn_id: 1,
+            method_id: 2,
+            method_name: "set_value".to_string(),
+            cfc_fingerprint,
+            ups_fingerprint,
+            proof_tree_start_root: root_after_start,
+            proof_tree_end_root: root_after_step,
+            cfc_witness: cfc_witness.clone(),
+            state_delta: zero_state_delta(),
+            cfc_inclusion_proof: Default::default(),
+            end_header: end_header.clone(),
+            debt_removal_proof: None,
+            proof: None,
+        };
+
+        let mut trace = minimal_empty_trace();
+        trace.ups_start_witness.ups_header = ups_header;
+        trace.steps = vec![
+            TraceStep::Standard(cfc_step_at(0)),
+            // inlined steps carry no independent proof-tree entry
+            TraceStep::Inlined(cfc_step_at(1)),
+            TraceStep::ZkSign(ZkSignStep {
+                fingerprint: make_qhash(55, 55, 55, 55),
+                proof_tree_start_root: root_after_step,
+                proof_tree_end_root: root_after_step,
+                sign_circuit_source: TraceSignCircuitSource::ZkBuiltin,
+                sign_witness: Vec::new(),
+                public_key_param: QHashOut::ZERO,
+                sign_verifier_data_alt: empty_alt_verifier_data(),
+            }),
+        ];
+        (trace, ups_start_fingerprint)
+    }
+
+    #[test]
+    fn schedule_initial_state_and_build_replay_a_consistent_cfc_trace() {
+        let (trace, ups_start_fingerprint) = consistent_cfc_trace();
+
+        let (meta, baton) = TraceProofSchedule::initial_state_from_trace(&trace, ups_start_fingerprint, false).unwrap();
+        assert_eq!(meta.next_leaf_index, 1);
+        assert_eq!(baton.proof_tree_index, 0);
+        assert_eq!(baton.circuit_id, LocalCircuitType::UPSStart.into());
+        assert_ne!(baton.inner_public_inputs_hash, QHashOut::ZERO);
+        assert_ne!(baton.known_proof_tree_root, QHashOut::ZERO);
+
+        let registered = TraceProofSchedule::initial_state_from_trace(&trace, ups_start_fingerprint, true).unwrap();
+        assert_eq!(registered.1.circuit_id, LocalCircuitType::UPSStartRegisterUser.into());
+
+        let schedule = TraceProofSchedule::build(meta, baton, &trace).unwrap();
+        assert_eq!(schedule.seeds.len(), 1);
+        let seed = &schedule.seeds[0];
+        assert_eq!(seed.step_index, 0);
+        assert_eq!(seed.cfc_index, 1);
+        assert_eq!(seed.ups_index, 2);
+        assert_eq!(schedule.final_meta.next_leaf_index, 3);
+        assert_eq!(schedule.final_baton.proof_tree_index, 2);
+        assert_ne!(schedule.final_baton.known_proof_tree_root, QHashOut::ZERO);
+    }
+
+    #[test]
+    fn schedule_initial_state_and_build_flag_root_and_proof_mismatches() {
+        let (trace, ups_start_fingerprint) = consistent_cfc_trace();
+
+        // ups-start derivation must match the first step's recorded start root
+        let mut bad_start = trace.clone();
+        if let TraceStep::Standard(cfc) = &mut bad_start.steps[0] {
+            cfc.proof_tree_start_root = make_qhash(99, 99, 99, 99);
+        }
+        let error = TraceProofSchedule::initial_state_from_trace(&bad_start, ups_start_fingerprint, false).unwrap_err();
+        assert!(error.to_string().contains("derived UPS start proof-tree root mismatch"));
+
+        let (meta, baton) = TraceProofSchedule::initial_state_from_trace(&trace, ups_start_fingerprint, false).unwrap();
+
+        let mut bad_cfc_start = trace.clone();
+        if let TraceStep::Standard(cfc) = &mut bad_cfc_start.steps[0] {
+            cfc.proof_tree_start_root = make_qhash(98, 98, 98, 98);
+        }
+        let error = TraceProofSchedule::build(meta.clone(), baton, &bad_cfc_start).unwrap_err();
+        assert!(error.to_string().contains("CFC root mismatch before step"));
+
+        let mut bad_cfc_end = trace.clone();
+        if let TraceStep::Standard(cfc) = &mut bad_cfc_end.steps[0] {
+            cfc.proof_tree_end_root = make_qhash(97, 97, 97, 97);
+        }
+        let error = TraceProofSchedule::build(meta.clone(), baton, &bad_cfc_end).unwrap_err();
+        assert!(error.to_string().contains("CFC root mismatch after step"));
+
+        // undecodable external proof bytes fail before any root comparison
+        let mut bad_external = trace.clone();
+        bad_external.steps.push(TraceStep::ExternalProof(ExternalProofStep {
+            fingerprint: make_qhash(44, 44, 44, 44),
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::ZERO,
+            proof: vec![1, 2, 3],
+            verifier_data_alt: empty_alt_verifier_data(),
+            siblings: Vec::new(),
+        }));
+        let error = TraceProofSchedule::build(meta, baton, &bad_external).unwrap_err();
+        assert!(error.to_string().contains("external proof deserialize error"));
+    }
+
+    #[test]
+    fn schedule_build_replays_a_consistent_external_proof_step() {
+        use crate::wallet::memory_wallet::PsyWalletLocalCircuits;
+
+        let circuits = PsyWalletLocalCircuits::from_embedded_bundle().expect("embedded local circuits should load");
+        let proof = circuits
+            .prove_zk_sign_inner(QHashOut::from_values(41, 42, 43, 44), QHashOut::from_values(45, 46, 47, 48))
+            .expect("zk-sign inner proof should be cheap");
+        assert!(proof.public_inputs.len() >= 4);
+
+        let (mut trace, ups_start_fingerprint) = consistent_cfc_trace();
+        let (meta, baton) = TraceProofSchedule::initial_state_from_trace(&trace, ups_start_fingerprint, false).unwrap();
+        let base = TraceProofSchedule::build(meta.clone(), baton, &trace).unwrap();
+
+        let ext_fingerprint = make_qhash(44, 44, 44, 44);
+        let start_root = current_root(&base.final_meta);
+        let pub_inputs_hash = QHashOut(HashOut {
+            elements: [
+                proof.public_inputs[0],
+                proof.public_inputs[1],
+                proof.public_inputs[2],
+                proof.public_inputs[3],
+            ],
+        });
+        let mut ext_meta = base.final_meta.clone();
+        insert_next_leaf(&mut ext_meta, external_leaf_value(ext_fingerprint, pub_inputs_hash));
+        let end_root = current_root(&ext_meta);
+
+        trace.steps.push(TraceStep::ExternalProof(ExternalProofStep {
+            fingerprint: ext_fingerprint,
+            proof_tree_start_root: start_root,
+            proof_tree_end_root: end_root,
+            proof: bincode::serialize(&proof).unwrap(),
+            verifier_data_alt: empty_alt_verifier_data(),
+            siblings: Vec::new(),
+        }));
+
+        let extended = TraceProofSchedule::build(meta, baton, &trace).unwrap();
+        assert_eq!(extended.seeds.len(), 1);
+        assert_eq!(extended.final_meta.next_leaf_index, base.final_meta.next_leaf_index + 1);
+        assert_eq!(current_root(&extended.final_meta), end_root);
+    }
+
+    #[test]
+    fn job_graphs_derive_from_trace_and_schedule() {
+        // from_trace treats Standard/BurnFee/Deferred as CFC jobs, skips
+        // Inlined and ZkSign, and maps ExternalProof steps by arena index
+        let (mut with_external, _) = consistent_cfc_trace();
+        with_external.steps.push(TraceStep::ExternalProof(ExternalProofStep {
+            fingerprint: make_qhash(44, 44, 44, 44),
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::ZERO,
+            proof: Vec::new(),
+            verifier_data_alt: empty_alt_verifier_data(),
+            siblings: Vec::new(),
+        }));
+        let from_trace = TraceProofJobGraph::from_trace(&with_external);
+        assert_eq!(
+            from_trace.jobs(),
+            vec![
+                TraceProofJobId::UpsStart,
+                TraceProofJobId::ZkSign,
+                TraceProofJobId::CfcStep(0),
+                TraceProofJobId::ExternalProof(3),
+                TraceProofJobId::EndCap,
+                TraceProofJobId::Submit,
+            ]
+        );
+
+        // from_schedule derives the CFC jobs from the built schedule's seeds
+        let (trace, ups_start_fingerprint) = consistent_cfc_trace();
+        let (meta, baton) = TraceProofSchedule::initial_state_from_trace(&trace, ups_start_fingerprint, false).unwrap();
+        let schedule = TraceProofSchedule::build(meta, baton, &trace).unwrap();
+        let from_schedule = TraceProofJobGraph::from_schedule(&schedule, &trace);
+        assert_eq!(
+            from_schedule.jobs(),
+            vec![
+                TraceProofJobId::UpsStart,
+                TraceProofJobId::ZkSign,
+                TraceProofJobId::CfcStep(0),
+                TraceProofJobId::EndCap,
+                TraceProofJobId::Submit,
+            ]
+        );
+        assert_eq!(from_schedule.dependencies(TraceProofJobId::ZkSign), vec![TraceProofJobId::CfcStep(0)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // JobManager error paths
+    // -----------------------------------------------------------------------
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn job_manager_rejects_unknown_jobs_and_unsatisfied_dependencies() {
+        let manager = JobManager::<i32, i32>::empty();
+        let graph_id = test_graph_id("errors");
+        manager
+            .add_graph(graph_id.clone(), JobGraph::new([1, 2], BTreeMap::from([(2, vec![1])])))
+            .expect("graph should be accepted");
+
+        // initially-completed job outside the graph
+        let error = manager
+            .run_graph(graph_id.clone(), [99], [], |job: i32| async move { Ok::<_, anyhow::Error>(job) })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not present in job graph"));
+
+        // runnable job outside the graph
+        let error = manager
+            .run_graph(graph_id.clone(), [], [99], |job: i32| async move { Ok::<_, anyhow::Error>(job) })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not present in job graph"));
+
+        // dependency neither completed nor runnable
+        let error = manager
+            .run_graph(graph_id, [], [2], |job: i32| async move { Ok::<_, anyhow::Error>(job) })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("neither initially completed nor runnable"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn job_manager_rejects_cyclic_job_graphs_with_no_runnable_jobs() {
+        let manager = JobManager::<i32, i32>::empty();
+        let graph_id = test_graph_id("cycle");
+        manager
+            .add_graph(graph_id.clone(), JobGraph::new([1, 2], BTreeMap::from([(1, vec![2]), (2, vec![1])])))
+            .expect("cyclic graph should still be accepted for tracking");
+
+        let error = manager
+            .run_graph(graph_id.clone(), [], [1, 2], |job: i32| async move { Ok::<_, anyhow::Error>(job) })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no runnable jobs"));
+        assert_eq!(manager.status(graph_id.clone(), &1), Some(JobStatus::Pending));
+        assert_eq!(manager.status(graph_id, &2), Some(JobStatus::Pending));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn job_manager_surfaces_panicking_jobs_as_failures() {
+        let manager = JobManager::<i32, i32>::empty();
+        let graph_id = test_graph_id("panic");
+        manager
+            .add_graph(graph_id.clone(), JobGraph::new([1], BTreeMap::new()))
+            .expect("graph should be accepted");
+
+        let error = manager
+            .run_graph(graph_id.clone(), [], [1], move |_: i32| async move { panic!("job task panicked") })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed to join"));
+        assert_eq!(manager.status(graph_id, &1), Some(JobStatus::Failed));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn job_manager_resumes_graphs_from_initially_completed_jobs() {
+        let manager = JobManager::<i32, i32>::empty();
+        let graph_id = test_graph_id("resume");
+        manager
+            .add_graph(graph_id.clone(), JobGraph::new([1, 2], BTreeMap::from([(2, vec![1])])))
+            .expect("graph should be accepted");
+
+        // first pass completes job 1 only; job 2 still waits on its dependency
+        let first = manager
+            .run_graph(graph_id.clone(), [], [1], |job: i32| async move { Ok::<_, anyhow::Error>(job) })
+            .await
+            .expect("the first job should complete");
+        assert_eq!(first.len(), 1);
+        assert_eq!(manager.status(graph_id.clone(), &1), Some(JobStatus::Completed));
+        assert_eq!(manager.status(graph_id.clone(), &2), Some(JobStatus::Pending));
+
+        // the second pass resumes from the recorded completion of job 1 and
+        // only runs the remaining dependency-satisfied job
+        let resumed = manager
+            .run_graph(graph_id.clone(), [1], [2], |job: i32| async move { Ok::<_, anyhow::Error>(job * 10) })
+            .await
+            .expect("the resume pass should complete the graph");
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[&2], 20);
+        assert_eq!(manager.status(graph_id.clone(), &2), Some(JobStatus::Completed));
+        assert_eq!(manager.graph_status(graph_id), Some(JobStatus::Completed));
     }
 }
