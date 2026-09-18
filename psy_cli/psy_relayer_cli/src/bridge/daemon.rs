@@ -2295,13 +2295,13 @@ fn apply_claim_report(
     for leaf_hash in &report.resolved_leaf_hashes {
         pending_claim_withdrawals.remove(leaf_hash);
     }
-    for (leaf_hash, reason) in &report.failure_reasons {
-        tracing::warn!(
-            leaf_hash,
-            reason,
-            "withdrawal claim deferred; will retry next round"
-        );
-    }
+    // Failures are not logged here. This used to warn "withdrawal claim
+    // deferred; will retry next round" for every one of them, which stopped
+    // being true when the attempt ceiling landed: record_claim_outcome runs
+    // straight after and may retire the very claim this line had just promised
+    // to retry, so the round that mattered most logged a warning and an error
+    // that contradicted each other, the false one first. It logs each failure
+    // with its attempt count, and each deferral as a deferral.
 }
 
 /// Durable pending-claim settlement shared by finalize rounds and append-only
