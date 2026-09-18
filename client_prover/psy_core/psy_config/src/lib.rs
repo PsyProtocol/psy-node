@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 include!(concat!(env!("OUT_DIR"), "/generated_constants.rs"));
+include!("stage_magic.rs");
 
 pub mod network_constants;
 
@@ -839,8 +840,7 @@ mod tests {
         let network = config.get_current_network().unwrap();
         assert!(network.users_per_realm > 0);
 
-        let magic_hex = network.magic.trim_start_matches("0x");
-        let magic = u64::from_str_radix(magic_hex, 16)
+        let magic = parse_magic_hex(&network.magic)
             .unwrap_or_else(|e| panic!("magic '{}' is not valid hex: {e}", network.magic));
         assert_ne!(magic, 0, "magic must be non-zero");
     }
@@ -918,5 +918,24 @@ mod tests {
         let bad_json = r#"{"invalid": json}"#;
         let result = PsyConfigGoldilocks::from_json(bad_json);
         assert!(matches!(result.unwrap_err(), ConfigError::JsonError(_)));
+    }
+
+    #[test]
+    fn stage_magic_table_matches_the_protocol_constants() {
+        // psy_core/src/constants/protocol.rs 定义的三个值。
+        // testnet 沿用 REGTEST 的值：现网就是这么跑的，换它需要一次全新部署。
+        assert_eq!(magic_for_stage("localhost"), Some(0x1337CF514544CF69));
+        assert_eq!(magic_for_stage("testnet"), Some(0x1337CF514544CF69));
+        assert_eq!(magic_for_stage("mainnet"), Some(0x1337CF514544C069));
+        assert_eq!(magic_for_stage("sepolia"), None);
+        assert_eq!(magic_for_stage(""), None);
+    }
+
+    #[test]
+    fn magic_hex_parses_with_or_without_prefix() {
+        assert_eq!(parse_magic_hex("0x1337CF514544CF69"), Ok(0x1337CF514544CF69));
+        assert_eq!(parse_magic_hex("1337cf514544cf69"), Ok(0x1337CF514544CF69));
+        assert!(parse_magic_hex("0xnothex").is_err());
+        assert!(parse_magic_hex("").is_err());
     }
 }
