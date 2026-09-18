@@ -1,5 +1,4 @@
 pub mod faucet;
-#[cfg(feature = "gnark-wrap")]
 pub mod prove_proxy;
 
 use std::{sync::Arc, time::Duration};
