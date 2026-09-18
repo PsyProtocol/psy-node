@@ -1699,3 +1699,33 @@ mod backup_file_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod history_overlap_tests {
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::Q256BitHash,
+        PHash,
+    };
+
+    use super::apply_state_updates_to_tree;
+
+    #[test]
+    fn history_live_overlap_regression() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(4);
+        let start = tree.get_root();
+        apply_state_updates_to_tree(&mut tree, start, start, &[], 32, 0).unwrap();
+        assert_eq!(tree.get_last_commit_root(), start);
+        apply_state_updates_to_tree(&mut tree, start, start, &[], 32, 0).unwrap();
+        assert_eq!(tree.get_last_commit_root(), start);
+        let other = PHash::from_owned_32bytes([0xAB; 32]);
+        let error = apply_state_updates_to_tree(&mut tree, start, other, &[], 32, 0).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("new_root"),
+            "{message}"
+        );
+        assert_eq!(tree.get_last_commit_root(), start);
+    }
+}

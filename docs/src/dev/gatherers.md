@@ -6,6 +6,8 @@
 
 ## Terminology
 
+Shared verbs are in [TERMINOLOGY](TERMINOLOGY.md). Local terms:
+
 | Term | Meaning |
 |---|---|
 | Gatherer | Background task that consumes one NATS ephemeral queue, feeds a planner, and returns a finalized snapshot for `process_block`. |
@@ -147,10 +149,13 @@ A parked processor (`ProcessorState::Error`) stops every bound gatherer. That is
 
 ## Related Documents
 
-- [Processors](processors.md) — who triggers finalize, publishes jobs, and commits.
-- [Reward Tree Circuit Layouts](reward-tree-circuits.md) — modes the planners write.
-- [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md) — official identity after gatherer finalize.
-- [Realm P2P Validators](realm-p2p-validators.md) — who is scheduled to finalize.
+| Document | Owns |
+|---|---|
+| [TERMINOLOGY](TERMINOLOGY.md) | Shared verbs; FFS, FastForward, gathering vs processing vs committed |
+| [Processors](processors.md) | Who triggers finalize, publishes jobs, and commits |
+| [Reward Tree Circuit Layouts](reward-tree-circuits.md) | Modes the planners write |
+| [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md) | Official identity after gatherer finalize |
+| [Realm P2P Validators](realm-p2p-validators.md) | Who is scheduled to finalize |
 
 ## File index
 

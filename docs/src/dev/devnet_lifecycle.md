@@ -86,7 +86,7 @@ Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` ov
 
 ## 3. Fresh Start
 
-A fresh test chain requires a full purge because Scylla volumes, checkpoint ring buffer files, the persisted Anvil snapshot, and localhost deployments must start from the same genesis state:
+A fresh test chain requires a full purge because Scylla volumes, checkpoint ring buffer files, the persisted Anvil snapshot, and localhost deployments must start from the same genesis state. `make shutdown` purges by default (`PURGE ?= 1` in the Makefile); only `PURGE=0 make shutdown` preserves the paired state:
 
 ```bash
 PURGE=1 make shutdown
@@ -97,7 +97,7 @@ PSY_SKIP_BUILD=1 \
 make run-all
 ```
 
-`PURGE=1 make shutdown` removes checkpoints, `db/anvil/state.json`, logs, local deployments, and devnet Docker volumes. `make restart-all` performs this purge followed by `make run-all`. Never delete only Scylla, the Anvil state, deployments, or `local_checkpoints/`; retained components would describe different chains.
+`PURGE=1 make shutdown` removes checkpoints, `db/anvil/state.json`, logs, local deployments, and devnet Docker volumes; bare `make shutdown` is identical because purge is the Make default. `make restart-all` performs this purge followed by `make run-all`. Never delete only Scylla, the Anvil state, deployments, or `local_checkpoints/`; retained components would describe different chains.
 
 `make run-all` stays in the foreground. Run it in a dedicated terminal or tmux pane. Do not background it with `&`.
 
@@ -145,9 +145,9 @@ make restart
 
 `make restart` sends a command to the existing supervisor. It stops and recreates processors, edges, workers, proof services, APIs, indexers, relayer, and UIs from their recorded commands. The original Anvil process, database launcher, Scylla, Redis, NATS, Nostr, Envio containers, checkpoints, and logs remain active. Contract deployment and Envio storage initialization are not rerun.
 
-Anvil continuously saves the local L1 chain to `db/anvil/state.json`. A non-purge `make shutdown` followed by `make run-all` loads that exact L1 state and reuses `psy-contracts/deployments/localhost/deployed-contracts.json`. The state and deployment must exist together; mismatch fails with an instruction to run `make restart-all`.
+Anvil continuously saves the local L1 chain to `db/anvil/state.json`. A non-purge shutdown (`PURGE=0 make shutdown`) followed by `make run-all` loads that exact L1 state and reuses `psy-contracts/deployments/localhost/deployed-contracts.json`. The state and deployment must exist together; mismatch fails with an instruction to run `make restart-all`.
 
-`make shutdown` is a full process teardown that preserves the paired Anvil state, L2 databases, checkpoints, and deployments. A later `make run-all` restores the same chain. For a complete fresh restart use:
+`PURGE=0 make shutdown` is a full process teardown that preserves the paired Anvil state, L2 databases, checkpoints, and deployments. A later `make run-all` restores the same chain. Bare `make shutdown` purges by default and deletes that state; use it only when a fresh chain is intended. For a complete fresh restart use:
 
 ```bash
 make restart-all
@@ -194,7 +194,7 @@ for p in 8545 9042 6379 4222 8081 5433 8080; do nc -z 127.0.0.1 "$p"; done
 make rollback-resume
 ```
 
-The supervisor removes the stop sentinel only after every saved application process reaches its startup condition. Never purge or run `make shutdown` between rollback plan generation, execution, recovery, and resume.
+The supervisor removes the stop sentinel only after every saved application process reaches its startup condition. Never purge or tear down the stack — neither the default purging `make shutdown` nor the state-preserving `PURGE=0 make shutdown` — between rollback plan generation, execution, recovery, and resume.
 
 `make rollback-resume` restarts the saved application templates. It can take several minutes because release Plonky2 workers and the prove proxy rebuild circuit state. A long-running command is not stuck while new `CONTROLLED START` markers appear and readiness ports progressively open. The current supervisor starts templates serially; the prove proxy warm-up is usually the critical path.
 
@@ -233,7 +233,7 @@ The earlier checkpoint-289-to-0 run proved L2 rollback, convergence, and transac
 
 ## 9. Forbidden Operations
 
-- Do not use `make shutdown && make run-all` unless `db/anvil/state.json` and the localhost deployment both remain present.
+- Do not use `PURGE=0 make shutdown && make run-all` unless `db/anvil/state.json` and the localhost deployment both remain present. Bare `make shutdown` purges by default and deletes both.
 - Do not run `docker compose` or manually restart one devnet service.
 - Do not run individual process binaries to substitute for the supervisor control targets.
 - Do not use `PSY_NO_AUTO_RESTART=1` when process-only restart or rollback stop/resume is required.

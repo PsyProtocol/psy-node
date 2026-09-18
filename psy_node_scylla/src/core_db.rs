@@ -503,6 +503,21 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
     ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>>{
         table.dump_all_zero_id_merkle_node_leaves_vec::<Hash>(&self.session, max_checkpoint_id, strategy).await
     }
+
+    async fn db_dump_zero_id_merkle_node_leaves_range(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        max_checkpoint_id: u64,
+        start_index: u64,
+        end_index: u64,
+    ) -> anyhow::Result<HashMap<u64, Hash>> {
+        if start_index > end_index {
+            return Ok(HashMap::new());
+        }
+        table
+            .dump_leaves_stream_end_index::<Hash>(&self.session, max_checkpoint_id, start_index, end_index)
+            .await
+    }
 }
 
 #[async_trait]

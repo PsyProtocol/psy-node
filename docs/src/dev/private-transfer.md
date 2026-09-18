@@ -56,19 +56,19 @@ The key cryptographic primitive is the `PrivateNoteInclusionCircuit`, which prov
 3. The receiver has sufficient L2 PSY balance to pay the claim transaction fee (the claim itself burns a fee).
 4. Release binaries are used for all operations.
 
-### Step 1: Derive Receiver Note Owner
+### Step 1: Derive Receiver Shield Address
 
-The receiver derives a shielded note owner using their private key and two random values (`r0`, `r1`):
+The receiver derives a shield address using two random values (`r0`, `r1`) and either their private key or a known `user_id`:
 
 ```text
-note_owner = PoseidonHash(user_id, 1337, r0, r1)
+shield_address = PoseidonHash(user_id, 1337, r0, r1)
 ```
 
-The receiver must remember `r0` and `r1` — they are required to claim the note. The `derive-note-owner` command outputs the note owner hash; obtain the receiver's Nostr public key separately (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:797-807`).
+The receiver must remember `r0` and `r1` — they are required to claim the note. `psy_user_cli derive-shield` prints `shield_address`; the private-key path also prints the Nostr npub (`client_prover/psy_cli/psy_user_cli/src/subcommand/shield_address.rs:66-112`, `args.rs:798-808`).
 
 ### Step 2: Execute Private Transfer
 
-The sender calls `private-transfer` with the receiver's note owner:
+The sender calls `private-transfer` with the receiver's shield address:
 
 ```bash
 ./target/release/psy_user_cli private-transfer \
@@ -76,7 +76,7 @@ The sender calls `private-transfer` with the receiver's note owner:
   -p <sender_private_key> \
   --contract-id <token_contract_id> \
   --amount <amount> \
-  --receiver <receiver_note_owner_hash> \
+  --receiver <receiver_shield_address> \
   --note-root-slot 2147483649 \
   --nostr-recipient-pubkey '<receiver-npub>' \
   --output <output_file>
@@ -94,7 +94,7 @@ The sender calls `private-transfer` with the receiver's note owner:
 | Field | Type | Description |
 |-------|------|-------------|
 | `nullifier` | u64×4 | Nullifier hash of the spent note |
-| `owner` | u64×4 | Receiver's note owner hash |
+| `owner` | u64×4 | Receiver's shield address |
 | `amount` | string | Transfer amount |
 | `user_tree_root` | u64×4 | User tree root at proof time |
 | `checkpoint_id` | string | L2 checkpoint when proof was generated |
@@ -191,9 +191,9 @@ Each private note has a unique `nullifier_hash = PoseidonHash(nullifier_secret)`
 assertion failed: nullifier already claimed
 ```
 
-### 3. Note Owner Binding
+### 3. Shield Address Binding
 
-The `owner` field in the `NoteProofOutput` is the receiver's note owner hash (`PoseidonHash(user_id, 1337, r0, r1)`). The claiming user must match this owner. Using a different private key or different `r0`/`r1` values results in:
+The `owner` field in the `NoteProofOutput` is the receiver's shield address (`PoseidonHash(user_id, 1337, r0, r1)`). The claiming user must match this address. Using a different private key or different `r0`/`r1` values results in:
 
 ```text
 receiver does not match claiming user
@@ -211,7 +211,7 @@ In the proving session, the external proof (note inclusion) must be inserted **b
 
 | Error | Cause | Resolution |
 |-------|-------|------------|
-| `receiver does not match claiming user` | Wrong private key or wrong `r0`/`r1` | Ensure the receiver key and randoms match the note owner |
+| `receiver does not match claiming user` | Wrong private key or wrong `r0`/`r1` | Ensure the receiver key and randoms match the shield address |
 | `nullifier already claimed` | Note was already claimed by someone | Check claim status before attempting |
 | `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund the receiver through `docs/src/dev/common-operations.md` Section 5.1; genesis `simple_mint` is not available to devnet wallets |
 | `note proof deserialization failed` | Corrupted or wrong format proof file | Regenerate the proof file |

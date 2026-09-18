@@ -13,6 +13,7 @@ SEPOLIA_RPC_URL ?= https://ethereum-sepolia-rpc.publicnode.com
 PSY_SKIP_BRANCH_CHECK ?= 1
 PSY_SKIP_KEYSTORE ?= 1
 PSY_SKIP_BUILD ?= 1
+PURGE ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
 .PHONY: all build clean test check check-all deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart restart-all shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal

@@ -33,7 +33,7 @@ use psy_data::{
     p2p::{
         aggregate_signatures, bitmap_get, bitmap_set, sha256, vote_message, BlsPublicKey,
         BlsSecretKey, BlsSignature, Certificate, ProtocolError, ProtocolResult, Proposal, Vote,
-        MAX_INCLUSION_LAG_CHECKPOINTS, MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
+        MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
         replication_threshold,
     },
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
@@ -89,8 +89,8 @@ pub fn decode_proposal_body(
     Ok(DecodedProposalBody { output, proof, state_updates, worker_tag })
 }
 
-/// Verify the in-band FFS roots against the decoded GUTA output.
-pub fn verify_state_updates_match_guta_output<F, Hash>(
+/// Check declared roots only; recovery verifies every durable FFS record separately.
+pub fn require_declared_roots_match_zk_output<F, Hash>(
     state_updates: &PsyPreparedRealmBlockStateUpdates<Hash>,
     output: &RealmFinalizeGUTAPublicOutput<F, Hash>,
 ) -> anyhow::Result<()>
@@ -185,7 +185,7 @@ where
         "Realm finalize output fee user is not the scheduled proposer's validator leaf user"
     );
     let state_updates = decode_proposal_state_updates::<N::QHash>(&decoded.state_updates)?;
-    verify_state_updates_match_guta_output(&state_updates, &output)?;
+    require_declared_roots_match_zk_output(&state_updates, &output)?;
     let worker_tag = N::QHash::from_owned_32bytes(decoded.worker_tag);
     let expected_public_inputs_hash =
         finalize_public_input_hash::<N::F, N::QHash, N::HasherBase>(&output, &worker_tag);
@@ -369,37 +369,21 @@ pub fn validator_tree_root_matches_proof_base(
     proposal_root == proof_base_root
 }
 
-/// Inclusion lag of a GUTA Proposal proof-base checkpoint against the
-/// coordinator's inclusion checkpoint: the proof base must strictly precede
-/// inclusion (`lag >= 1`) and must not be older than
-/// [`MAX_INCLUSION_LAG_CHECKPOINTS`]. Returns `Some(lag)` when admissible.
-pub fn inclusion_lag_within_limit(
-    base_checkpoint_id: u64,
-    inclusion_checkpoint_id: u64,
-) -> Option<u64> {
-    inclusion_checkpoint_id
-        .checked_sub(base_checkpoint_id)
-        .filter(|lag| (1..=MAX_INCLUSION_LAG_CHECKPOINTS).contains(lag))
-}
-
 /// True when the certificate's signer set includes the proposal's proposer.
 pub fn certificate_includes_proposer(certificate: &Certificate, proposer_sub_id: u16) -> bool {
     certificate.signer_sub_ids().contains(&proposer_sub_id)
 }
 
-/// True when the collected votes satisfy the proposal's replication wait:
-/// at least `replication_threshold(n)` distinct signers and — for realms with
-/// two or more validators — at least one signer other than the proposer (a
-/// proposal must not be certified by the proposer alone).
-pub fn votes_meet_wait(n: usize, proposer_sub_id: u16, signer_sub_ids: &[u16]) -> bool {
+/// True when collected votes meet `replication_threshold(n)` distinct signers.
+/// The proposer's own vote counts toward `ceil(n / 2)`. For n == 2 that
+/// threshold is 1, so the proposer may certify alone. For n >= 3 the
+/// threshold is at least 2, which already requires a non-proposer signer.
+/// A separate "must include a non-proposer" rule would bind only two-validator
+/// realms and stall them after a single-node fault. Production realms have
+/// more than two validators, so that extra rule is not restored.
+pub fn votes_meet_wait(n: usize, signer_sub_ids: &[u16]) -> bool {
     let unique: HashSet<u16> = signer_sub_ids.iter().copied().collect();
-    if unique.len() < replication_threshold(n) {
-        return false;
-    }
-    if n >= 2 && !unique.iter().any(|sub_id| *sub_id != proposer_sub_id) {
-        return false;
-    }
-    true
+    unique.len() >= replication_threshold(n)
 }
 
 #[cfg(test)]
@@ -462,6 +446,45 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn proposal_identity_mutations_require_rehashing_but_transport_is_not_proof_validation() {
+        let (output, proof, backup) = sample_body_sections();
+        let (proposal, body) =
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+        // These are transport-only fixtures, not valid circuit proofs or state updates.
+        for offset in [32usize, 48, 114] {
+            let mut changed_output = output.clone();
+            changed_output[offset] = 1;
+            let (rehashed, changed_body) = proposal_with_body(
+                TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &changed_output, &proof, &backup,
+            );
+            assert!(decode_proposal_body(&proposal, &changed_body).is_err());
+            let mut body_hash_only = proposal.clone();
+            body_hash_only.body_hash = rehashed.body_hash;
+            assert!(decode_proposal_body(&body_hash_only, &changed_body).is_err());
+            assert_ne!(body_hash_only.compute_proposal_id(), proposal.proposal_id);
+            assert_eq!(rehashed.compute_proposal_id(), rehashed.proposal_id);
+            assert_ne!(rehashed.proposal_id, proposal.proposal_id);
+            let decoded = decode_proposal_body(&rehashed, &changed_body).unwrap();
+            assert_eq!(decoded.proof, proof);
+            assert_eq!(decoded.state_updates, backup);
+            assert_eq!(&decoded.output[218..], &output[218..]);
+            let mut deleted_body = body.clone();
+            deleted_body.drain(4 + offset..4 + offset + if offset == 48 { 2 } else { 8 });
+            let mut deleted_proposal = proposal.clone();
+            deleted_proposal.body_hash = sha256(&deleted_body);
+            deleted_proposal.proposal_id = deleted_proposal.compute_proposal_id();
+            assert!(decode_proposal_body(&deleted_proposal, &deleted_body).is_err());
+        }
+        for proposer_sub_id in [0, 2] {
+            let mut changed = proposal.clone();
+            changed.proposer_sub_id = proposer_sub_id;
+            assert_ne!(changed.compute_proposal_id(), proposal.proposal_id);
+            changed.proposal_id = changed.compute_proposal_id();
+            assert!(decode_proposal_body(&changed, &body).is_ok());
+        }
+    }
 
     #[test]
     fn decode_proposal_body_roundtrips_canonical_body() {
@@ -728,26 +751,6 @@ mod tests {
     }
 
     #[test]
-    fn inclusion_lag_within_limit_accepts_one_to_max() {
-        assert_eq!(inclusion_lag_within_limit(10, 11), Some(1));
-        assert_eq!(inclusion_lag_within_limit(10, 26), Some(16));
-    }
-
-    #[test]
-    fn inclusion_lag_within_limit_rejects_zero_lag() {
-        // The proof base must strictly precede the inclusion checkpoint.
-        assert_eq!(inclusion_lag_within_limit(10, 10), None);
-    }
-
-    #[test]
-    fn inclusion_lag_within_limit_rejects_lag_beyond_max_and_underflow() {
-        // lag 17 > MAX_INCLUSION_LAG_CHECKPOINTS (16).
-        assert_eq!(inclusion_lag_within_limit(10, 27), None);
-        // A proof base after the inclusion checkpoint cannot compute a lag.
-        assert_eq!(inclusion_lag_within_limit(20, 10), None);
-    }
-
-    #[test]
     fn certificate_includes_proposer_requires_proposer_signature() {
         let validator_sub_ids: [u16; 3] = [1, 2, 3];
         let (secrets, _keys) = build_validators(&validator_sub_ids);
@@ -768,34 +771,67 @@ mod tests {
     }
 
     #[test]
-    fn votes_meet_wait_requires_non_proposer_signer_when_n_is_two() {
-        // n = 2: the replication threshold is 1, but the proposer alone must
-        // not certify its own proposal.
-        assert!(!votes_meet_wait(2, 1, &[1]));
-        assert!(!votes_meet_wait(2, 1, &[1, 1]));
-        assert!(votes_meet_wait(2, 1, &[1, 2]));
+    fn votes_meet_wait_proposer_only_meets_threshold_when_n_is_two() {
+        assert!(votes_meet_wait(2, &[1]));
+        assert!(votes_meet_wait(2, &[1, 1]));
+        assert!(votes_meet_wait(2, &[1, 2]));
     }
 
     #[test]
     fn votes_meet_wait_proposer_only_is_enough_when_n_is_one() {
-        assert!(votes_meet_wait(1, 1, &[1]));
+        assert!(votes_meet_wait(1, &[1]));
     }
 
     #[test]
     fn votes_meet_wait_enforces_replication_threshold() {
-        // n = 3: ceil(3/2) = 2 distinct signers required.
-        assert!(!votes_meet_wait(3, 1, &[1]));
-        assert!(!votes_meet_wait(3, 1, &[1, 1])); // duplicates do not count twice
-        assert!(votes_meet_wait(3, 1, &[1, 2]));
-        assert!(votes_meet_wait(3, 1, &[2, 3]));
+        assert!(!votes_meet_wait(3, &[1]));
+        assert!(!votes_meet_wait(3, &[1, 1]));
+        assert!(votes_meet_wait(3, &[1, 2]));
+        assert!(votes_meet_wait(3, &[2, 3]));
+    }
+
+    #[test]
+    fn certificate_rejects_tampered_proposal_id_despite_valid_signer_keys() {
+        // A certificate whose proposal_id field was replaced with a different
+        // proposal's id must be rejected: the identity comparison binds the
+        // certificate to the proposal before any signature check.
+        let validator_sub_ids: [u16; 3] = [1, 2, 3];
+        let (secrets, keys) = build_validators(&validator_sub_ids);
+        let (output, proof, backup) = sample_body_sections();
+        let (proposal, _body) =
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+        let votes = signed_votes(&secrets, &validator_sub_ids, &proposal);
+        let mut cert = form_certificate(&proposal, &votes).expect("form");
+        // Replace only the proposal_id with another valid proposal's id.
+        let (other, _) =
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [2u8; 32], &output, &proof, &backup);
+        cert.proposal_id = other.proposal_id;
+        let err = validate_certificate(&proposal, &cert, &validator_sub_ids, &keys).unwrap_err();
+        assert_eq!(err, ProtocolError::Message("certificate does not match proposal"));
+    }
+
+    #[test]
+    fn certificate_rejects_bitmap_corruption_below_threshold() {
+        // Same signer aggregate, same proposal: clearing signer bits must
+        // reduce the replication count below ceil(n/2) and be rejected.
+        let validator_sub_ids: [u16; 3] = [1, 2, 3];
+        let (secrets, keys) = build_validators(&validator_sub_ids);
+        let (output, proof, backup) = sample_body_sections();
+        let (proposal, _body) =
+            proposal_with_body(TEST_CHAIN_ID, 3, 99, 1, [1u8; 32], &output, &proof, &backup);
+        let votes = signed_votes(&secrets, &validator_sub_ids, &proposal);
+        let mut cert = form_certificate(&proposal, &votes).expect("form");
+        // Bits 1..=3 were set by form_certificate; clear bits 2 and 3 so only
+        // one signer remains, below ceil(3/2) = 2.
+        cert.signer_bitmap[0] &= !(0x08 | 0x04);
+        let err = validate_certificate(&proposal, &cert, &validator_sub_ids, &keys).unwrap_err();
+        assert_eq!(err, ProtocolError::Message("certificate below replication threshold"));
     }
 
     #[test]
     fn votes_meet_wait_duplicate_signer_does_not_count_twice() {
-        // Three reported votes from two distinct signers still satisfy the
-        // n = 3 wait (threshold 2) with a non-proposer signer.
-        assert!(votes_meet_wait(3, 1, &[1, 1, 2]));
-        // n = 2 with only duplicated proposer votes has no non-proposer signer.
-        assert!(!votes_meet_wait(2, 1, &[1, 1]));
+        assert!(votes_meet_wait(3, &[1, 1, 2]));
+        assert!(votes_meet_wait(2, &[1, 1]));
+        assert!(!votes_meet_wait(3, &[1, 1, 1]));
     }
 }

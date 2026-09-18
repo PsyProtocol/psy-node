@@ -10,7 +10,7 @@ use parth_core::{
         merkle_store_key::{QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdNode},
     },
     felt::ToU64Value,
-    protocol::core_types::QNetworkDatabaseTypes,
+    protocol::core_types::{Q256BitHash, QNetworkDatabaseTypes},
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::v1::qdata::{

@@ -54,18 +54,7 @@ impl VerifiedProposalBody {
         &self.storage.bytes
     }
 
-    pub fn read_range(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        let end = offset
-            .checked_add(length as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proposal body range overflow"))?;
-        if end > self.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "proposal body range out of bounds"));
-        }
-        Ok(self.storage.bytes[offset as usize..end as usize].to_vec())
-    }
-
-    /// Durably persist the verified body to `destination` (blocking std::fs).
-    pub fn persist_to(&self, destination: &Path) -> io::Result<()> {
+    pub fn save_to(&self, destination: &Path) -> io::Result<()> {
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -296,7 +285,7 @@ impl ReassemblyBook {
     }
 
     /// Begin a new reassembly. Returns `Duplicate` if one already exists for
-    /// the proposal, or `Inserted` after evicting the oldest entry when the
+    /// the proposal, or `Inserted` after evicting the oldest reassembly when the
     /// in-flight bound is reached.
     pub fn start(
         &mut self,

@@ -749,7 +749,7 @@ fn perform_smart_rehash<Hash: Copy + PartialEq, Destination: FastTreeSyncLocalDe
     Ok(())
 }
 
-fn rehash_sparse_paths<Hash: Copy, Destination: FastTreeSyncLocalDestination<Hash>>(
+pub fn rehash_sparse_paths<Hash: Copy, Destination: FastTreeSyncLocalDestination<Hash>>(
     local_tree: &mut Destination,
     nodes: &[SimpleMerkleNodeKey],
     target_level: u8,

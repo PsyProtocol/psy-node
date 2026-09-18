@@ -11,7 +11,8 @@
 //! does not include `kad` or `upnp`, and the slim port does not require them.
 
 use crate::realm::network::codec::{
-    DirectBodyCodec, EndCapForwardCodec, DIRECT_BODY_PROTOCOL_ID, END_CAP_FORWARD_PROTOCOL_ID,
+    BodyChunkCodec, EndCapForwardCodec, ProposalLookupCodec, DIRECT_BODY_PROTOCOL_ID,
+    END_CAP_FORWARD_PROTOCOL_ID, PROPOSAL_LOOKUP_PROTOCOL_ID,
 };
 use crate::realm::network::config::RealmNetworkConfig;
 use libp2p::autonat;
@@ -41,7 +42,8 @@ pub fn vote_topic(realm_id: u32) -> gossipsub::IdentTopic {
 pub struct RealmBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub identify: identify::Behaviour,
-    pub direct_body: request_response::Behaviour<DirectBodyCodec>,
+    pub body_chunk: request_response::Behaviour<BodyChunkCodec>,
+    pub proposal_lookup: request_response::Behaviour<ProposalLookupCodec>,
     pub end_cap_forward: request_response::Behaviour<EndCapForwardCodec>,
     pub relay_client: relay::client::Behaviour,
     pub relay_server: Toggle<relay::Behaviour>,
@@ -92,7 +94,7 @@ impl RealmBehaviour {
                 .with_cache_size(256),
         );
 
-        let direct_body_config = request_response::Config::default()
+        let body_chunk_config = request_response::Config::default()
             .with_request_timeout(Duration::from_secs(psy_data::p2p::DIRECT_REQUEST_TIMEOUT_SECS))
             .with_max_concurrent_streams(MAX_CONCURRENT_DIRECT_EXCHANGES);
         let end_cap_config = request_response::Config::default()
@@ -101,7 +103,7 @@ impl RealmBehaviour {
 
         // DirectBody is validator-only. EndCap forward is Edge-only: validators
         // and bootnodes neither advertise nor accept the forwarding protocol.
-        let direct_body_protocols: &[(StreamProtocol, request_response::ProtocolSupport)] =
+        let body_chunk_protocols: &[(StreamProtocol, request_response::ProtocolSupport)] =
             if is_bootnode || is_edge {
                 &[]
             } else {
@@ -120,8 +122,24 @@ impl RealmBehaviour {
                 &[]
             };
 
-        let direct_body =
-            request_response::Behaviour::new(direct_body_protocols.iter().cloned(), direct_body_config);
+        let proposal_lookup_config = request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(psy_data::p2p::DIRECT_REQUEST_TIMEOUT_SECS))
+            .with_max_concurrent_streams(MAX_CONCURRENT_DIRECT_EXCHANGES);
+        let proposal_lookup_protocols: &[(StreamProtocol, request_response::ProtocolSupport)] =
+            if is_bootnode || is_edge {
+                &[]
+            } else {
+                &[(
+                    StreamProtocol::new(PROPOSAL_LOOKUP_PROTOCOL_ID),
+                    request_response::ProtocolSupport::Full,
+                )]
+            };
+        let body_chunk =
+            request_response::Behaviour::new(body_chunk_protocols.iter().cloned(), body_chunk_config);
+        let proposal_lookup = request_response::Behaviour::new(
+            proposal_lookup_protocols.iter().cloned(),
+            proposal_lookup_config,
+        );
         let end_cap_forward = request_response::Behaviour::new(
             end_cap_protocols.iter().cloned(),
             end_cap_config,
@@ -138,7 +156,8 @@ impl RealmBehaviour {
         Self {
             gossipsub,
             identify,
-            direct_body,
+            body_chunk,
+            proposal_lookup,
             end_cap_forward,
             relay_client,
             relay_server,
@@ -148,8 +167,9 @@ impl RealmBehaviour {
     }
 }
 
-/// Register a known validator peer for mesh membership.
-pub fn add_known_address(behaviour: &mut RealmBehaviour, peer_id: PeerId, _address: libp2p::Multiaddr) {
+/// Register a realm peer as a gossipsub explicit peer so proposal and vote
+/// delivery never depends on mesh gossip luck.
+pub fn register_explicit_peer(behaviour: &mut RealmBehaviour, peer_id: PeerId) {
     behaviour.gossipsub.add_explicit_peer(&peer_id);
 }
 

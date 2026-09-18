@@ -1262,6 +1262,41 @@ where
         
 
     }
+    async fn db_dump_zero_id_merkle_node_leaves_range(
+        &self,
+        table: &InMemoryTableIdentifier,
+        max_checkpoint_id: u64,
+        start_index: u64,
+        end_index: u64,
+    ) -> anyhow::Result<HashMap<u64, Hash>> {
+        if start_index > end_index {
+            return Ok(HashMap::new());
+        }
+        let db = self.get_or_create_table(&table.to_string());
+        let tree_height = table.tree_height;
+        let start_key = key_helpers::key_merkle_zero_id(
+            &SimpleMerkleNodeKey { level: tree_height, index: start_index },
+            0,
+        );
+        let end_key = key_helpers::key_merkle_zero_id(
+            &SimpleMerkleNodeKey { level: tree_height, index: end_index },
+            u64::MAX,
+        );
+        let mut result_map = HashMap::new();
+        for entry in db.range(start_key..=end_key) {
+            let key_bytes = entry.key();
+            let index = u64::from_be_bytes(key_bytes[1..9].try_into()?);
+            if index < start_index || index > end_index {
+                continue;
+            }
+            let checkpoint_id = u64::from_be_bytes(key_bytes[9..17].try_into()?);
+            if checkpoint_id > max_checkpoint_id {
+                continue;
+            }
+            result_map.insert(index, Hash::from_bytes(entry.value())?);
+        }
+        Ok(result_map)
+    }
 }
 #[async_trait]
 impl<Hash, Hasher> CoreDatabaseZeroIdMerkleReader<Hash, Hasher, InMemoryTableIdentifier>

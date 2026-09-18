@@ -507,8 +507,8 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
                     let hash = Hash::from_slice_32bytes(&value)?;
 
                     output_map.insert(node_index, hash);
+                    prev_index = Some(node_index_i64);
                 }
-                prev_index = Some(node_index_i64);
             }
             // Else skip historical for same index
         }
@@ -516,7 +516,7 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
     }
     // Consolidated dump: stream leaf level, dedup client-side for latest <=
     // max_checkpoint
-    async fn dump_leaves_stream_end_index<Hash: QDBHashBase>(
+    pub(crate) async fn dump_leaves_stream_end_index<Hash: QDBHashBase>(
         &self,
         session: &Session,
         max_checkpoint_id: u64,
@@ -543,8 +543,8 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
                     let hash = Hash::from_slice_32bytes(&value)?;
 
                     output_map.insert(node_index, hash);
+                    prev_index = Some(node_index_i64);
                 }
-                prev_index = Some(node_index_i64);
             }
             // Else skip historical for same index
         }

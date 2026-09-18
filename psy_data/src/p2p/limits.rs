@@ -26,7 +26,7 @@ pub const MAX_PROPOSAL_PARTS: u32 =
     MAX_PROPOSAL_BODY_BYTES.div_ceil(MAX_PROPOSAL_CHUNK_BYTES) as u32;
 
 /// Maximum direct body-range response payload.
-pub const DIRECT_REQUEST_MAX_BYTES: u32 = 61_440;
+pub const BODY_CHUNK_MAX_BYTES: u32 = 61_440;
 
 /// Maximum EndCap forward stream total (header + input + proof).
 pub const MAX_END_CAP_FORWARD_BYTES: usize = 536_870_912;
@@ -40,8 +40,8 @@ pub const VOTE_WIRE_BYTES: usize = 130;
 /// Fixed Certificate wire length.
 pub const CERTIFICATE_WIRE_BYTES: usize = 204;
 
-/// Fixed DirectBodyRequest wire length.
-pub const DIRECT_BODY_REQUEST_WIRE_BYTES: usize = 44;
+/// Fixed BodyChunkRequest wire length.
+pub const BODY_CHUNK_REQUEST_WIRE_BYTES: usize = 44;
 
 /// EndCapForwardHeader wire length (60 bytes):
 /// `chain_id(8) + realm_id(4) + checkpoint_id(8) + end_cap_id(32)
@@ -73,11 +73,32 @@ pub const MAX_VALIDATORS_PER_REALM: usize = 64;
 /// Minimum occupied validators per Realm.
 pub const MIN_VALIDATORS_PER_REALM: usize = 1;
 
-/// Maximum checkpoints between a proposal's proof base and coordinator inclusion.
-pub const MAX_INCLUSION_LAG_CHECKPOINTS: u64 = 16;
+/// Maximum windowed ProposalLookup response bytes.
+pub const MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES: usize = 16_384;
+
+/// Concurrent ProposalLookup/direct-range peers on the recovery client.
+pub const PROPOSAL_LOOKUP_CONCURRENCY: usize = 4;
+
+/// Per-round ProposalLookup/direct-range wait (seconds).
+pub const PROPOSAL_LOOKUP_ROUND_SECS: u64 = 5;
+
+/// Total ProposalLookup/direct-range client budget (seconds).
+pub const PROPOSAL_LOOKUP_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum concurrent direct body exchanges.
 pub const MAX_CONCURRENT_DIRECT_EXCHANGES: usize = 64;
+
+/// Concurrent in-flight proposal reassemblies and recorded Start sources.
+pub const MAX_IN_FLIGHT_PROPOSALS: usize = 2;
+
+/// Vote-auth / backlog entries kept without an active waiter.
+pub const MAX_VOTE_AUTH: usize = MAX_IN_FLIGHT_PROPOSALS;
+
+/// Vote-auth TTL when no waiter is attached (seconds).
+pub const VOTE_AUTH_TTL_SECS: u64 = 1_800;
+
+/// Proposal reassembly expiry (seconds).
+pub const REASSEMBLY_EXPIRY_SECS: u64 = 1_800;
 
 /// Direct request exchange timeout (seconds).
 pub const DIRECT_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -110,6 +131,14 @@ mod tests {
         assert_eq!(VOTE_WIRE_BYTES, 130);
         assert_eq!(CERTIFICATE_WIRE_BYTES, 204);
         assert_eq!(END_CAP_FORWARD_HEADER_WIRE_BYTES, 60);
+        assert_eq!(MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES, 16_384);
+        assert_eq!(PROPOSAL_LOOKUP_CONCURRENCY, 4);
+        assert_eq!(PROPOSAL_LOOKUP_ROUND_SECS, 5);
+        assert_eq!(PROPOSAL_LOOKUP_TIMEOUT_SECS, 30);
+        assert_eq!(MAX_IN_FLIGHT_PROPOSALS, 2);
+        assert_eq!(MAX_VOTE_AUTH, 2);
+        assert_eq!(VOTE_AUTH_TTL_SECS, 1_800);
+        assert_eq!(REASSEMBLY_EXPIRY_SECS, 1_800);
         assert_eq!(replication_threshold(1), 1);
         assert_eq!(replication_threshold(2), 1);
         assert_eq!(replication_threshold(3), 2);

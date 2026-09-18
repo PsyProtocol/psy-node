@@ -311,7 +311,7 @@ impl<
             .db_reader
             .get_checkpoint_global_state_roots(base_checkpoint_id)
             .await?;
-        let (validator_sub_ids, _, _) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+        let (validator_sub_ids, _, _, _) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
             self.db_reader.as_ref(),
             self.chain_id,
             base_checkpoint_id,
@@ -1059,7 +1059,7 @@ impl<
 
         let queue_item = PsyRealmUserUpdateQueueItem {
             job_id: job_id,
-            expected_fake_checkpoint_id: submission_token,
+            submission_nonce: submission_token,
             old_user_leaf_hash: old_leaf_hash,
             new_user_leaf_hash,
             new_user_leaf,

@@ -13,7 +13,7 @@ process construction, readiness, supervision, control commands, ports, persisten
 Use the Make targets for the repository-supported operating lifecycle, and use direct launcher commands only when
 selecting a documented component set or diagnosing launcher behavior. The lifecycle procedure remains owned by
 [devnet_lifecycle.md](devnet_lifecycle.md); this reference explains how the launcher implements that procedure
-([devnet_lifecycle.md](devnet_lifecycle.md); `Makefile:60-79`; `dev/locSetupV4.ts:5435-5794`).
+([devnet_lifecycle.md](devnet_lifecycle.md); `Makefile:61-80`; `dev/locSetupV4.ts:5435-5794`).
 
 ## Background
 
@@ -22,7 +22,7 @@ readiness gates, process supervision, local Layer 1 persistence, and destructive
 (`dev/locSetupV4.ts:2747-2789`; `dev/locSetupV4.ts:3950-4839`; `dev/locSetupV4.ts:5218-5226`). Operators therefore
 need one source-grounded map that distinguishes supported Make commands from direct launcher mechanics, especially
 because a bare launcher invocation and `make run-all` select different counts, and because the embedded help contains
-current-source defects that must not be copied into commands (`Makefile:60-66`; `dev/locSetupV4.ts:5443-5449`;
+current-source defects that must not be copied into commands (`Makefile:61-67`; `dev/locSetupV4.ts:5443-5449`;
 `dev/locSetupV4.ts:5561-5566`; `dev/locSetupV4.ts:5581-5603`).
 
 ## Table of Contents
@@ -234,17 +234,17 @@ make run-all
 
 `make run-all` does **not** rely on bare defaults. It expands an explicit component list with two Realms, two
 Coordinator workers, one Realm worker, one prove proxy, the database group, Coordinator/Realm nodes, faucet, Layer 1,
-relayer stack, and all four UI flags (`Makefile:60-66`). It also defaults `PSY_SKIP_BRANCH_CHECK`,
+relayer stack, and all four UI flags (`Makefile:61-67`). It also defaults `PSY_SKIP_BRANCH_CHECK`,
 `PSY_SKIP_KEYSTORE`, and `PSY_SKIP_BUILD` to `1`, whereas a direct launcher invocation has no intrinsic
-`PSY_SKIP_BUILD=1` default (`Makefile:13-15`; `Makefile:66`; `dev/locSetupV4.ts:1933-1968`).
+`PSY_SKIP_BUILD=1` default (`Makefile:13-15`; `Makefile:67`; `dev/locSetupV4.ts:1933-1968`).
 
 | Setting             | Bare launcher                                      | `make run-all`                         | Evidence                                        |
 | ------------------- | -------------------------------------------------: | -------------------------------------: | ----------------------------------------------- |
-| Realm count         | 1                                                  | 2                                      | `dev/locSetupV4.ts:5448-5486`; `Makefile:60`    |
-| Coordinator workers | 1                                                  | 2                                      | `dev/locSetupV4.ts:5484`; `Makefile:60`         |
-| Realm workers       | 2                                                  | 1                                      | `dev/locSetupV4.ts:5477-5481`; `Makefile:60`    |
-| Prove proxy         | Implicit 1                                         | Explicit 1                             | `dev/locSetupV4.ts:4362-4369`; `Makefile:60`    |
-| Build policy        | Build when required unless environment disables it | Existing artifacts required by default | `dev/locSetupV4.ts:1933-1968`; `Makefile:15,66` |
+| Realm count         | 1                                                  | 2                                      | `dev/locSetupV4.ts:5448-5486`; `Makefile:61`    |
+| Coordinator workers | 1                                                  | 2                                      | `dev/locSetupV4.ts:5484`; `Makefile:61`         |
+| Realm workers       | 2                                                  | 1                                      | `dev/locSetupV4.ts:5477-5481`; `Makefile:61`    |
+| Prove proxy         | Implicit 1                                         | Explicit 1                             | `dev/locSetupV4.ts:4362-4369`; `Makefile:61`    |
+| Build policy        | Build when required unless environment disables it | Existing artifacts required by default | `dev/locSetupV4.ts:1933-1968`; `Makefile:15,67` |
 
 ### 4.3 Component Selection
 
@@ -336,6 +336,38 @@ Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime co
 | `PSY_SKIP_KEYSTORE`        | Direct default off; Make default `1`                                      | Exact `1` skips remote trust-setup refresh/hash verification but still requires mandatory local files. | `dev/locSetupV4.ts:2487-2521`; `Makefile:14`                                                |
 | `PSY_KEYSTORE_S3_BASE_URL` | Published development asset prefix                                        | Overrides trust-setup manifest and proving-key download base.                                          | `dev/locSetupV4.ts:1657-1660`; `dev/locSetupV4.ts:2285-2295`                                |
 
+#### Using a Throwaway Bridge-Relayer Keystore
+
+`KEYSTORE_PATH` redirects only the bridge-relayer wallet; the proving trust setup stays under
+`~/.psy/keystore` regardless of the value (`dev/locSetupV4.ts:2532`, `dev/locSetupV4.ts:2547`). This
+exists so tests and CI can use a disposable relayer wallet without touching a developer's real
+`~/.psy/keystore/bridge-relayer`.
+
+```bash
+# Use a throwaway bridge-relayer keystore instead of ~/.psy/keystore/bridge-relayer
+export WALLET_PASSWORD=devnet
+export KEYSTORE_PATH=/tmp/psy-devnet-relayer/bridge-relayer-keystore
+make run-all
+```
+
+Behavior on the first and later launches:
+
+1. Path absent — the launcher auto-generates a development keystore from the Anvil development
+   private key `0xac0974…2ff80`, encrypted with `WALLET_PASSWORD` (default `"devnet"` when unset)
+   (`dev/locSetupV4.ts:2390-2408`).
+2. Path exists — the password must match that keystore. In a non-interactive session
+   (`WALLET_PASSWORD` unset, no TTY) startup fails with
+   `"WALLET_PASSWORD is required for an existing bridge-relayer keystore in a non-interactive
+   session"`; interactive sessions prompt instead (`dev/locSetupPolicy.ts:511-543`). An existing
+   keystore is never silently re-encrypted with the devnet default.
+3. A mismatched password is not detected at startup validation alone — it surfaces later as a
+   decrypt failure (`invalid password`) when the relayer or deployment first uses the wallet
+   (`dev/locSetupPolicy.ts:546-555`). Always pass the same `WALLET_PASSWORD` for a given
+   `KEYSTORE_PATH`.
+
+The developer's real `~/.psy/keystore/bridge-relayer` is never read or modified while
+`KEYSTORE_PATH` points elsewhere; trust-setup artifacts are not affected by this variable.
+
 ### 6.4 Resources, Logging, and Supervision
 
 | Variable                           | Default                               | Effect                                                                                | Evidence                                                       |
@@ -351,7 +383,7 @@ Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime co
 | `SCYLLA_COMMITLOG_SYNC`            | `batch` in foreground DB script       | Sets foreground Scylla commitlog mode; daemon generation has no equivalent input.     | `dev/start_db.sh:125-163`; `dev/locSetupV4.ts:4899-4908`       |
 | `SCYLLA_COMMITLOG_BATCH_WINDOW`    | `2` milliseconds                      | Sets foreground batch sync window.                                                    | `dev/start_db.sh:129-163`                                      |
 | `SCYLLA_COMMITLOG_PERIOD`          | `10` milliseconds                     | Sets foreground periodic sync interval.                                               | `dev/start_db.sh:129-163`                                      |
-| `RUST_LOG`                         | No direct global default              | Controls Rust tracing; Make maps `LOG_LEVEL` to `--env RUST_LOG=...`.                 | `Makefile:9,60`; `dev/locSetupV4.ts:3923-3930`                 |
+| `RUST_LOG`                         | No direct global default              | Controls Rust tracing; Make maps `LOG_LEVEL` to `--env RUST_LOG=...`.                 | `Makefile:9,61`; `dev/locSetupV4.ts:3923-3930` |
 | `PSY_NO_AUTO_RESTART`              | Restart enabled                       | Exact `1` disables foreground child auto-restart.                                     | `dev/locSetupV4.ts:3643-3645`; `dev/locSetupV4.ts:5775-5780`   |
 | `TMPDIR`                           | `/tmp`                                | Bases the repository-keyed lock and control socket paths.                             | `dev/locSetupV4.ts:5238-5241`; `dev/locSetupV4.ts:5328-5330`   |
 
@@ -497,7 +529,7 @@ launch, uses the plan's `hasState` result, and passes the plan's reset decision 
 (`dev/locSetupV4.ts:4404-4452`; `dev/locSetupV4.ts:4454-4475`).
 
 `make restart` sends a control command to the existing supervisor; it stops and recreates applications while the
-tracked Anvil and DB processes remain alive (`Makefile:68-69`; `dev/locSetupV4.ts:3505-3512`;
+tracked Anvil and DB processes remain alive (`Makefile:69-70`; `dev/locSetupV4.ts:3505-3512`;
 `dev/locSetupV4.ts:3851-3919`; `dev/locSetupV4.ts:5761-5772`). A non-purge shutdown stops Anvil but does not delete
 its state or the localhost deployment; a later launch loads the state and reuses the deployment
 (`dev/locSetupV4.ts:3450-3468`; `dev/locSetupV4.ts:2942-2992`). Purge deletes both `db/anvil` and the localhost
@@ -513,9 +545,9 @@ queue, so lifecycle mutations do not overlap (`dev/locSetupV4.ts:5395-5413`).
 
 | Command           | Supported Make target  | Effect                                                               | Evidence                                                                       |
 | ----------------- | ---------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `restart`         | `make restart`         | Stop then start applications; keep DB and Anvil alive.               | `Makefile:68-69`; `dev/locSetupV4.ts:3916-3919`; `dev/locSetupV4.ts:5763-5766` |
-| `rollback-stop`   | `make rollback-stop`   | Stop applications, verify ports closed, write rollback sentinel.     | `Makefile:71-72`; `dev/locSetupV4.ts:3851-3886`                                |
-| `rollback-resume` | `make rollback-resume` | Start saved application templates and remove sentinel after success. | `Makefile:74-75`; `dev/locSetupV4.ts:3888-3913`                                |
+| `restart`         | `make restart`         | Stop then start applications; keep DB and Anvil alive.               | `Makefile:69-70`; `dev/locSetupV4.ts:3916-3919`; `dev/locSetupV4.ts:5763-5766` |
+| `rollback-stop`   | `make rollback-stop`   | Stop applications, verify ports closed, write rollback sentinel.     | `Makefile:72-73`; `dev/locSetupV4.ts:3851-3886`                                |
+| `rollback-resume` | `make rollback-resume` | Start saved application templates and remove sentinel after success. | `Makefile:75-76`; `dev/locSetupV4.ts:3888-3913`                                |
 
 Application stop sends process groups `SIGTERM`, waits up to 15 seconds, escalates to `SIGKILL`, and verifies derived
 application ports are closed (`dev/locSetupV4.ts:3540-3587`; `dev/locSetupV4.ts:3604-3613`;
@@ -542,9 +574,11 @@ for supervised restart so they rebuild infrastructure connections (`dev/locSetup
 
 ## 13. Teardown and Purge
 
-`make shutdown` invokes `--teardown` and adds `--purge` only when `PURGE=1`; `make restart-all` performs purge shutdown
-then `make run-all` (`Makefile:77-79`; `Makefile:102-106`). Direct teardown executes this sequence
-(`dev/locSetupV4.ts:3402-3468`):
+`make shutdown` invokes `--teardown --purge` by default: the Makefile sets `PURGE ?= 1` and the target adds `--purge`
+unless an explicit `PURGE=0` limits it to bare `--teardown`; `PURGE=1 make shutdown` remains valid and is identical to
+the default. Bare launcher `--teardown` stays non-purge regardless of the Make default. `make restart-all` performs
+purge shutdown then `make run-all` (`Makefile:16`; `Makefile:78-80`; `Makefile:103-107`). Direct teardown executes
+this sequence (`dev/locSetupV4.ts:3402-3468`):
 
 ```text
 1. Kill known command patterns.
@@ -590,13 +624,15 @@ make restart
 make rollback-stop
 make rollback-resume
 make shutdown
+PURGE=0 make shutdown
 PURGE=1 make shutdown
 make restart-all
 ```
 
 These are the repository-supported lifecycle entry points ([devnet_lifecycle.md](devnet_lifecycle.md);
-`Makefile:63-79`; `Makefile:99-106`). `make restart` requires the original foreground supervisor; it is not a new
-launcher startup (`Makefile:68-75`; `dev/locSetupV4.ts:5337-5369`).
+`Makefile:64-80`; `Makefile:100-107`). `make shutdown` purges by default; `PURGE=0 make shutdown` is the
+state-preserving form. `make restart` requires the original foreground supervisor; it is not a new
+launcher startup (`Makefile:69-76`; `dev/locSetupV4.ts:5337-5369`).
 
 ### Bare foreground full mode
 
@@ -709,11 +745,10 @@ These are limitations of the current source, not supported command examples.
    `dev/locSetupV4.ts:4923-5160`).
 8. Daemonized Realm P2P uses a separate public-only runtime config: processor and edge public multiaddresses name the
    corresponding Compose DNS services, while each container listens on `/ip4/0.0.0.0/tcp/...`.
-9. Teardown uses fixed process patterns and port ranges rather than the actual launch plan; Mode A port 5179 and a
-   hypothetical custom Anvil port are absent from the fixed listener list (`dev/locSetupV4.ts:3402-3447`).
+9. Teardown uses fixed process patterns and port ranges rather than the actual launch plan; a hypothetical custom Anvil port is absent from the fixed listener list (`dev/locSetupV4.ts:3422-3470`). Mode A port 5179 is included in `killKnownPorts` and matched by `psy-dapp/mode-a-web-wallet-bridge` plus `vite.js --host 0.0.0.0 --port 5179`.
 10. Startup purge with `--purge` performs the full paired teardown (processes, containers, checkpoints, Anvil state,
     deployments, volumes) before auto-setup; it is equivalent to `PURGE=1 make shutdown` followed by `make run-all`
-    (`dev/locSetupV4.ts:5693-5698`; `dev/locSetupV4.ts:3450-3468`).
+    (`dev/locSetupV4.ts:5693-5698`; `dev/locSetupV4.ts:3472-3492`).
 
 ## 18. Core Data Structures
 
@@ -976,9 +1011,9 @@ Commands execute serially and the loop remains available until the server is clo
    [devnet_lifecycle.md](devnet_lifecycle.md)).
 6. The control socket is local and permissioned `0600`, but any process running as the same account can attempt its
    three lifecycle commands (`dev/locSetupV4.ts:5317-5335`; `dev/locSetupV4.ts:5416-5424`).
-7. Purge is intentionally destructive across both Layer 1 and Layer 2 state. Review the exact deletion set before
-   running `PURGE=1 make shutdown` or `make restart-all` (`Makefile:77-79`; `Makefile:102-106`;
-   `dev/locSetupV4.ts:3458-3466`).
+7. Purge is intentionally destructive across both Layer 1 and Layer 2 state, and it is the `make shutdown` default.
+   Review the deletion set before running either command. Use `PURGE=0 make shutdown` to preserve state;
+   `make restart-all` always purges, even with `PURGE=0` (`Makefile:16`; `Makefile:78-80`; `Makefile:103-107`).
 8. With Coordinator/Realm core selected, `--genesis-data-path` is input and output: startup rewrites validators. Use a
    disposable copy when preserving an existing validator list matters. Component-only modes without core processors do
    not rewrite it (`dev/locSetupV4.ts:1225-1234`; `dev/locSetupV4.ts:4072-4079`).

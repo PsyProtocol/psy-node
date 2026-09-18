@@ -1,3 +1,4 @@
+pub mod catchup;
 pub mod consensus;
 pub mod core;
 pub mod db;
@@ -5,3 +6,5 @@ pub mod processor_shared_status;
 pub mod gatherers;
 pub mod create;
 pub mod coordinator_sync;
+pub mod proposal_backup;
+pub mod ffs;

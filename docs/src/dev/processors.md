@@ -6,6 +6,8 @@
 
 ## Terminology
 
+Shared verbs are in [TERMINOLOGY](TERMINOLOGY.md). Local terms:
+
 | Term | Meaning |
 |---|---|
 | Processor | Long-lived async loop that gathers one batch, publishes proving jobs, and commits durable state. |
@@ -143,6 +145,8 @@ A crash after the mapping and before the marker is `NeedsRecovery`. Recovery reb
 5. `set_latest_checkpoint_id`.
 6. `set_l2_latest_block_state` only after the marker.
 
+Genesis C=0 is not inferred from the pending mapping. `new_init` writes C=0 DB records from the trusted bundle before constructing the backup manager when the complete singleton is missing and tip is 0. `ensure_genesis_applied` appends C=0 only when the backup ring is empty; a non-empty ring that still holds leaf 0 must match the trusted genesis hash. At tip 0, a missing mapping or incomplete L2 state replays C=0 records, and validator-tree genesis plus the `genesis_complete` singleton are written last. tip>0 does not rewrite C=0. Recovery rebuilds a cleared backup when local tip>0 and the ring is empty, and hard-resets an ahead ring when the coordinator tip is still 0.
+
 `wait_for_realm_update_sync_with_coordinator` does not advance the singleton. The following `commit_state` does.
 
 ## 6. Sync and recovery
@@ -176,11 +180,14 @@ Root-proof waits must observe the persisted proof store, not only a queue-comple
 
 ## Related Documents
 
-- [Gatherers](gatherers.md) — who owns the trees and the N/N+1 seam.
-- [Reward Tree Circuit Layouts](reward-tree-circuits.md) — part-1 and CST reward nodes.
-- [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md) — submit/admit gate.
-- [Realm P2P Validators](realm-p2p-validators.md) — scheduled proposer.
-- [Devnet Lifecycle](devnet_lifecycle.md) — stack start/stop; processors are not restarted individually.
+| Document | Owns |
+|---|---|
+| [TERMINOLOGY](TERMINOLOGY.md) | Shared verbs; include vs apply vs commit; ready-path `apply_proposal_ffs` |
+| [Gatherers](gatherers.md) | Who owns the trees and the N/N+1 seam |
+| [Reward Tree Circuit Layouts](reward-tree-circuits.md) | Part-1 and CST reward nodes |
+| [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md) | Submit/admit gate |
+| [Realm P2P Validators](realm-p2p-validators.md) | Scheduled proposer |
+| [Devnet Lifecycle](devnet_lifecycle.md) | Stack start/stop; processors are not restarted individually |
 
 ## File index
 

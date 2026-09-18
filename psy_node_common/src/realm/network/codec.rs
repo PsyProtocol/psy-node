@@ -1,8 +1,9 @@
 //! libp2p `request_response::Codec` implementations for the slim Realm P2P
 //! protocols.
 //!
-//! Two request/response protocols are wired:
+//! Three request/response protocols are wired:
 //! - `/psy/realm/proposal-body/1` — bounded proposal body range exchange.
+//! - `/psy/realm/proposal-lookup/1` — windowed realm-transition proposal lookup.
 //! - `/psy/realm/end-cap-forward/2` — EndCap forward stream (56-byte header
 //!   followed by `end_cap_input_len` input bytes and `proof_len` proof bytes);
 //!   version 2 carries the 18-byte typed rejection response.
@@ -16,20 +17,23 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::Codec;
 use libp2p::swarm::StreamProtocol;
 use psy_data::p2p::{
-    DirectBodyRequest, DirectBodyResponse, EndCapForwardHeader, EndCapForwardResponse,
-    ProtocolEncode, DIRECT_BODY_REQUEST_WIRE_BYTES, DIRECT_REQUEST_MAX_BYTES,
-    END_CAP_FORWARD_HEADER_WIRE_BYTES, END_CAP_FORWARD_RESPONSE_WIRE_BYTES,
-    MAX_END_CAP_FORWARD_BYTES,
+    BodyChunkRequest, BodyChunkResponse, EndCapForwardHeader, EndCapForwardResponse,
+    ProposalLookupRequest, ProposalLookupResponse, ProtocolEncode,
+    BODY_CHUNK_REQUEST_WIRE_BYTES, BODY_CHUNK_MAX_BYTES, END_CAP_FORWARD_HEADER_WIRE_BYTES,
+    END_CAP_FORWARD_RESPONSE_WIRE_BYTES, MAX_END_CAP_FORWARD_BYTES,
+    MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES, PROPOSAL_LOOKUP_MAX_TRANSITIONS,
+    PROPOSAL_LOOKUP_REQUEST_MAX_WIRE_BYTES,
 };
 use std::{fmt, io};
 
 pub const DIRECT_BODY_PROTOCOL_ID: &str = "/psy/realm/proposal-body/1";
+pub const PROPOSAL_LOOKUP_PROTOCOL_ID: &str = "/psy/realm/proposal-lookup/1";
 /// Bumped from `.../end-cap-forward/1` when the response grew from a bare
 /// 1-byte bool to the typed 18-byte rejection, so mixed-version peers never
 /// misread each other's responses.
 pub const END_CAP_FORWARD_PROTOCOL_ID: &str = "/psy/realm/end-cap-forward/2";
 
-const DIRECT_BODY_RESPONSE_OVERHEAD: usize = 53;
+const BODY_CHUNK_RESPONSE_OVERHEAD: usize = 53;
 
 
 // ---------------------------------------------------------------------------
@@ -37,20 +41,20 @@ const DIRECT_BODY_RESPONSE_OVERHEAD: usize = 53;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Default)]
-pub struct DirectBodyCodec;
+pub struct BodyChunkCodec;
 
 #[async_trait]
-impl Codec for DirectBodyCodec {
+impl Codec for BodyChunkCodec {
     type Protocol = StreamProtocol;
-    type Request = DirectBodyRequest;
-    type Response = DirectBodyResponse;
+    type Request = BodyChunkRequest;
+    type Response = BodyChunkResponse;
 
     async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
-        let bytes = read_to_end_bounded(io, DIRECT_BODY_REQUEST_WIRE_BYTES).await?;
-        DirectBodyRequest::decode_exact(&bytes).map_err(invalid_data)
+        let bytes = read_to_end_bounded(io, BODY_CHUNK_REQUEST_WIRE_BYTES).await?;
+        BodyChunkRequest::decode_exact(&bytes).map_err(invalid_data)
     }
 
     async fn read_response<T>(
@@ -61,9 +65,9 @@ impl Codec for DirectBodyCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let max = DIRECT_BODY_RESPONSE_OVERHEAD + DIRECT_REQUEST_MAX_BYTES as usize;
+        let max = BODY_CHUNK_RESPONSE_OVERHEAD + BODY_CHUNK_MAX_BYTES as usize;
         let bytes = read_to_end_bounded(io, max).await?;
-        DirectBodyResponse::decode_exact(&bytes).map_err(invalid_data)
+        BodyChunkResponse::decode_exact(&bytes).map_err(invalid_data)
     }
 
     async fn write_request<T>(
@@ -76,7 +80,7 @@ impl Codec for DirectBodyCodec {
         T: AsyncWrite + Unpin + Send,
     {
         let bytes = request.protocol_encode_to_vec();
-        if bytes.len() != DIRECT_BODY_REQUEST_WIRE_BYTES {
+        if bytes.len() != BODY_CHUNK_REQUEST_WIRE_BYTES {
             return Err(invalid_data("invalid direct-body request length"));
         }
         write_all_and_close(io, &bytes).await
@@ -91,10 +95,92 @@ impl Codec for DirectBodyCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        if response.data.len() > DIRECT_REQUEST_MAX_BYTES as usize {
+        if response.data.len() > BODY_CHUNK_MAX_BYTES as usize {
             return Err(invalid_data("direct-body response exceeds maximum"));
         }
         write_all_and_close(io, &response.protocol_encode_to_vec()).await
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ProposalLookupCodec;
+
+#[async_trait]
+impl Codec for ProposalLookupCodec {
+    type Protocol = StreamProtocol;
+    type Request = ProposalLookupRequest;
+    type Response = ProposalLookupResponse;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let bytes = read_to_end_bounded(io, PROPOSAL_LOOKUP_REQUEST_MAX_WIRE_BYTES).await?;
+        ProposalLookupRequest::decode_exact(&bytes).map_err(invalid_data)
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let bytes = read_to_end_bounded(io, MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES).await?;
+        ProposalLookupResponse::decode_exact(&bytes).map_err(invalid_data)
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        request: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        if request.transitions.is_empty() || request.transitions.len() > PROPOSAL_LOOKUP_MAX_TRANSITIONS {
+            return Err(invalid_data("invalid ProposalLookup transition count"));
+        }
+        let expected = 16 + request.transitions.len() * 64;
+        let bytes = request.protocol_encode_to_vec();
+        if bytes.len() != expected {
+            return Err(invalid_data("invalid ProposalLookup request length"));
+        }
+        write_all_and_close(io, &bytes).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        response: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let has_candidates = response.entries.iter().any(|entry| !entry.candidates.is_empty());
+        if response.entries.iter().any(|entry| {
+            entry.candidates.len() > psy_data::p2p::PROPOSAL_LOOKUP_CANDIDATES_PER_TRANSITION
+        }) || (response.status == psy_data::p2p::ProposalLookupStatus::Candidates && !has_candidates)
+            || (response.status == psy_data::p2p::ProposalLookupStatus::Empty && has_candidates)
+        {
+            return Err(invalid_data("invalid ProposalLookup response"));
+        }
+        let mut expected = 5;
+        for entry in response.entries.iter().take(PROPOSAL_LOOKUP_MAX_TRANSITIONS) {
+            let entry_bytes = 65 + entry.candidates.len() * psy_data::p2p::PROPOSAL_WIRE_BYTES;
+            if expected + entry_bytes > MAX_PROPOSAL_LOOKUP_RESPONSE_BYTES {
+                break;
+            }
+            expected += entry_bytes;
+        }
+        let bytes = response.protocol_encode_to_vec();
+        if bytes.len() != expected {
+            return Err(invalid_data("invalid ProposalLookup response length"));
+        }
+        write_all_and_close(io, &bytes).await
     }
 }
 

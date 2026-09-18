@@ -12,7 +12,7 @@ make build
 PSY_SKIP_BRANCH_CHECK=1 PSY_SKIP_KEYSTORE=1 make run-all
 ```
 
-The launcher runs in the foreground and starts Realm P2P with generated local keys and a public runtime config. Stop the stack with `make shutdown`. Logs are written under `./logs`.
+The launcher runs in the foreground and starts Realm P2P with generated local keys and a public runtime config. Stop the stack with `make shutdown`; this defaults to purge and deletes persisted chain state, so use `PURGE=0 make shutdown` to stop while preserving state. Logs are written under `./logs`.
 
 To run some example transactions first run:
 ```bash
