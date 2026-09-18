@@ -11,6 +11,12 @@ set -euo pipefail
 : "${L1_DEPLOYER_WALLET_PASSWORD:=}"
 : "${L1_DEPLOYER_BALANCE_HEX:=0x21e19e0c9bab2400000}"
 : "${L1_DEPLOY_RESET:=1}"
+: "${L1_DEPLOY_WAIT_CONFIRMATIONS:=1}"
+[[ "$L1_DEPLOY_WAIT_CONFIRMATIONS" =~ ^[1-9][0-9]?$ ]] || {
+  echo 'L1_DEPLOY_WAIT_CONFIRMATIONS must be an integer from 1 to 99' >&2
+  exit 1
+}
+export L1_DEPLOY_WAIT_CONFIRMATIONS
 
 [ -d "$L1_CONTRACTS_UPLOAD" ] || {
   echo "missing uploaded contracts source: $L1_CONTRACTS_UPLOAD" >&2
@@ -156,7 +162,33 @@ if [ -n "$deployer_private_key" ]; then
   echo "using configured L1 deployer for ${L1_DEPLOYMENTS_NETWORK}: ${deployer_address}"
 fi
 
-args=(npx hardhat deploy --network "$L1_DEPLOYMENTS_NETWORK")
+args=(npx hardhat)
+if [ "$L1_DEPLOY_WAIT_CONFIRMATIONS" -gt 1 ]; then
+  # Some RPCs return a receipt before latest-state reads see the new contract.
+  # hardhat-deploy propagates waitConfirmations to proxy implementations/admins.
+  cat > hardhat.deploy-confirmations.config.ts <<'HARDHAT_CONFIRMATIONS_CONFIG'
+const base = require("./hardhat.config");
+const { extendEnvironment } = require("hardhat/config");
+const minimum = Number(process.env.L1_DEPLOY_WAIT_CONFIRMATIONS);
+if (!Number.isInteger(minimum) || minimum < 1 || minimum > 99) {
+  throw new Error("Invalid L1_DEPLOY_WAIT_CONFIRMATIONS");
+}
+extendEnvironment((hre) => {
+  for (const name of ["deploy", "execute"]) {
+    const original = hre.deployments[name].bind(hre.deployments);
+    hre.deployments[name] = (deployment, options, ...args) => original(
+      deployment,
+      { ...options, waitConfirmations: Math.max(minimum, options.waitConfirmations ?? 1) },
+      ...args,
+    );
+  }
+});
+module.exports = base.default || base;
+HARDHAT_CONFIRMATIONS_CONFIG
+  args+=(--config hardhat.deploy-confirmations.config.ts)
+  echo "L1 deployment waits for at least $L1_DEPLOY_WAIT_CONFIRMATIONS confirmations"
+fi
+args+=(deploy --network "$L1_DEPLOYMENTS_NETWORK")
 first_args=("${args[@]}")
 if [ "$L1_DEPLOY_RESET" = "1" ] || [ "$L1_DEPLOY_RESET" = "true" ]; then
   first_args+=(--reset)
