@@ -220,7 +220,7 @@ impl PsyWalletServer {
             return err_json("a transfer of 0 is a no-op — pass a positive amount", json!({ "gate": "args" }));
         }
         let auth = match self
-            .authorize_wallet(&network, &a.session, &a.to_user_id.to_string(), charge, "simple_transfer")
+            .authorize_wallet(&network, &a.session, &a.to_user_id.to_string(), charge, "transfer")
             .await
         {
             Ok(auth) => auth,
@@ -292,7 +292,7 @@ impl PsyWalletServer {
         }
         let legs: Vec<(&str, u64)> = recipients.iter().zip(charged.iter()).map(|(r, c)| (r.as_str(), *c)).collect();
         let total_nano: u64 = charged.iter().fold(0u64, |acc, n| acc.saturating_add(*n));
-        let auth = match self.authorize_wallet_batch(&network, &a.session, &legs, "simple_transfer").await {
+        let auth = match self.authorize_wallet_batch(&network, &a.session, &legs, "transfer").await {
             Ok(auth) => auth,
             Err(e) => return err_json(format!("policy denied: {e:#}"), json!({ "gate": "policy", "sent": false })),
         };
@@ -343,7 +343,7 @@ impl PsyWalletServer {
         // Policy gate — claims move value into the account, so we gate them too
         // (amount 0: claiming does not spend). This keeps a paused policy able to
         // freeze all activity.
-        if let Err(e) = self.authorize_wallet(&network, &a.session, SELF_RECIPIENT, 0, "simple_claim").await {
+        if let Err(e) = self.authorize_wallet(&network, &a.session, SELF_RECIPIENT, 0, "claim").await {
             return err_json(format!("policy denied: {e:#}"), json!({ "gate": "policy" }));
         }
         let Some(contract) = contract_for(&a.token) else {
@@ -968,7 +968,7 @@ impl PsyWalletServer {
     }
 
     #[tool(
-        description = "Fuse public claims, private-note claims and shield-deposit claims into ONE UPS proof / one fee. The chain primitive has always accepted mixed items; this is the tool that builds that mixed batch. Pass any combination of public_claims, deposit_indices / backup_paths, private_notes, or drain_private. Each present category is policy-gated as simple_claim / claim_deposit / private_claim (amount 0 — claiming folds in funds already addressed to this wallet)."
+        description = "Fuse public claims, private-note claims and shield-deposit claims into ONE UPS proof / one fee. The chain primitive has always accepted mixed items; this is the tool that builds that mixed batch. Pass any combination of public_claims, deposit_indices / backup_paths, private_notes, or drain_private. Each present category is policy-gated as claim / claim_deposit / private_claim (amount 0 — claiming folds in funds already addressed to this wallet)."
     )]
     async fn claim_batch(&self, Parameters(a): Parameters<ClaimBatchArgs>) -> Result<CallToolResult, McpError> {
         let state = &self.state;
@@ -989,13 +989,13 @@ impl PsyWalletServer {
             );
         }
         // Gate each constituent method the batch will actually perform, so a
-        // policy that allows simple_claim but not claim_deposit cannot sneak a
+        // policy that allows claim but not claim_deposit cannot sneak a
         // deposit into the same UPS. Amount 0: claiming does not spend.
         if wants_public {
-            if let Err(e) = self.authorize_wallet(&network, &a.session, SELF_RECIPIENT, 0, "simple_claim").await {
+            if let Err(e) = self.authorize_wallet(&network, &a.session, SELF_RECIPIENT, 0, "claim").await {
                 return err_json(
                     format!("policy denied public claims: {e:#}"),
-                    json!({ "gate": "policy", "method": "simple_claim" }),
+                    json!({ "gate": "policy", "method": "claim" }),
                 );
             }
         }
@@ -1034,7 +1034,7 @@ impl PsyWalletServer {
                 );
             };
             match self
-                .authorize_wallet(&network, &a.session, &spec.to_user_id.to_string(), charge, "simple_transfer")
+                .authorize_wallet(&network, &a.session, &spec.to_user_id.to_string(), charge, "transfer")
                 .await
             {
                 Ok(auth) => spent_auths.push((auth, charge)),
@@ -1042,7 +1042,7 @@ impl PsyWalletServer {
                     refund_all(&mut spent_auths);
                     return err_json(
                         format!("policy denied a transfer leg: {e:#}"),
-                        json!({ "gate": "policy", "method": "simple_transfer" }),
+                        json!({ "gate": "policy", "method": "transfer" }),
                     );
                 }
             }

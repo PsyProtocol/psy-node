@@ -21,7 +21,7 @@ use psy_client_data::{
     config::store_config::PsyHasher,
     traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync},
 };
-use psy_config::network_constants::{MINING_REWARDS_CONTRACT_ID, TOKEN_CONTRACT_ID};
+use psy_config::network_constants::MINING_REWARDS_CONTRACT_ID;
 use psy_crypto::hash::{merkle::tag_tree::TagTreeMerkleProofWithRewardPreimage, traits::hasher::FieldQHasher};
 use psy_prover::session::{build_claim_calls_for_multi_checkpoints_v2, ProofWithCheckpointV2};
 use psy_provider::provider::RpcProvider;
@@ -854,12 +854,6 @@ pub async fn build_claim_calls_from_proofs(
             call.inputs.len()
         );
     }
-
-    all_contract_calls.push(ContractCallArgs {
-        contract_id: TOKEN_CONTRACT_ID as u64,
-        method_name: "simple_claim_pow_rewards".to_string(),
-        inputs: vec![],
-    });
 
     tracing::info!("Executing {} contract calls in single transaction", all_contract_calls.len());
     Ok(all_contract_calls)

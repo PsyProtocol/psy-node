@@ -6,7 +6,7 @@ use plonky2::{
 };
 use psy_common_circuit::builder::{comparison::CircuitBuilderComparison, core::CircuitBuilderHelpersCore, hash::core::CircuitBuilderHashCore};
 use psy_config::{
-    network_constants::{CHECKPOINT_TREE_HEIGHT, DEFAULT_CALLER_CONTRACT_ID_U64, GUTA_FEE, TOKEN_CONTRACT_ID, TOKEN_SIMPLE_BURN_METHOD_ID},
+    network_constants::{CHECKPOINT_TREE_HEIGHT, DEFAULT_CALLER_CONTRACT_ID_U64, GUTA_FEE, TOKEN_BURN_METHOD_ID, TOKEN_CONTRACT_ID},
     DA_FEE,
 };
 
@@ -215,7 +215,7 @@ impl UPSEndCapCoreGadget {
         builder.ensure_is_greater_than(MAX_NONCE_BITS as usize, tx_count, one_target);
 
         let burn_contract_id = builder.constant_u64(TOKEN_CONTRACT_ID as u64);
-        let burn_method_id = builder.constant_u64(TOKEN_SIMPLE_BURN_METHOD_ID as u64);
+        let burn_method_id = builder.constant_u64(TOKEN_BURN_METHOD_ID as u64);
         let guta_fee = builder.constant_u64(GUTA_FEE);
         let da_fee_per_slot = builder.constant_u64(DA_FEE);
         let da_fee = builder.mul(da_fee_per_slot, slots_modified);

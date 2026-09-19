@@ -198,7 +198,7 @@ mint-relayer:
 		--rpc-config $(ROOT_RPC_CONFIG) \
 		-p $${PRIVATE_KEY:-$(RELAYER_PRIVATE_KEY)} \
 		--contract-id $${CONTRACT_ID:-$(RELAYER_FEE_CONTRACT_ID)} \
-		--method-name simple_mint \
+		--method-name mint \
 		--inputs "[$${AMOUNT:-$(RELAYER_FEE_MINT_AMOUNT)}]" \
 		--wait-until-confirmation
 

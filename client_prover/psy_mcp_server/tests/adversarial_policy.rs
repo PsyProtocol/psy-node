@@ -54,17 +54,17 @@ fn attack_splitting_an_over_cap_payment_still_hits_the_daily_cap() {
     let limits = Limits { per_transaction: 100, per_day: 250, ..open_limits() };
     let (mut e, pid, t) = engine_with(limits, None);
 
-    assert!(e.authorize(&t, "9999", 300, "simple_transfer").is_err(), "the whole amount is over the per-tx cap");
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok());
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok());
-    let err = e.authorize(&t, "9999", 100, "simple_transfer").unwrap_err().to_string();
+    assert!(e.authorize(&t, "9999", 300, "transfer").is_err(), "the whole amount is over the per-tx cap");
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok());
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok());
+    let err = e.authorize(&t, "9999", 100, "transfer").unwrap_err().to_string();
     assert!(err.contains("daily cap"), "the third slice must be refused by the daily cap: {err}");
     assert_eq!(spent_today(&mut e, &pid), 200, "exactly what was authorized, nothing lost or double-counted");
 
     // ...and the leftover headroom is honoured exactly, not rounded up.
-    assert!(e.authorize(&t, "9999", 51, "simple_transfer").is_err(), "51 > the 50 left");
-    assert!(e.authorize(&t, "9999", 50, "simple_transfer").is_ok(), "exactly the remainder is allowed");
-    assert!(e.authorize(&t, "9999", 1, "simple_transfer").is_err(), "and then nothing at all");
+    assert!(e.authorize(&t, "9999", 51, "transfer").is_err(), "51 > the 50 left");
+    assert!(e.authorize(&t, "9999", 50, "transfer").is_ok(), "exactly the remainder is allowed");
+    assert!(e.authorize(&t, "9999", 1, "transfer").is_err(), "and then nothing at all");
 }
 
 /// Splitting under a wide-open daily cap must still be caught by the 30-day one.
@@ -72,12 +72,12 @@ fn attack_splitting_an_over_cap_payment_still_hits_the_daily_cap() {
 fn attack_splitting_under_a_wide_daily_cap_still_hits_the_monthly_cap() {
     let limits = Limits { per_transaction: 100, per_day: 1_000_000, per_month: Some(250), total_budget: None };
     let (mut e, pid, t) = engine_with(limits, None);
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok());
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok());
-    let err = e.authorize(&t, "9999", 100, "simple_transfer").unwrap_err().to_string();
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok());
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok());
+    let err = e.authorize(&t, "9999", 100, "transfer").unwrap_err().to_string();
     assert!(err.contains("30-day cap"), "the daily cap is wide open; the monthly one must bind: {err}");
     assert_eq!(e.describe(&pid).unwrap().spent_this_month_nano, 200);
-    assert!(e.authorize(&t, "9999", 50, "simple_transfer").is_ok(), "exactly the remainder");
+    assert!(e.authorize(&t, "9999", 50, "transfer").is_ok(), "exactly the remainder");
 }
 
 /// The LIFETIME cap is the one that must survive a period rollover — otherwise
@@ -86,12 +86,12 @@ fn attack_splitting_under_a_wide_daily_cap_still_hits_the_monthly_cap() {
 fn attack_a_period_rollover_does_not_refresh_the_lifetime_budget() {
     let limits = Limits { per_transaction: 100, per_day: 1_000_000, per_month: Some(1_000_000), total_budget: Some(300) };
     let (mut e, pid, t) = engine_with(limits, None);
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok());
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok());
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok());
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok());
 
     e.force_period_rollover_for_test(); // a new 30-day bucket, and a new day
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok(), "the periodic budgets did refresh");
-    let err = e.authorize(&t, "9999", 100, "simple_transfer").unwrap_err().to_string();
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok(), "the periodic budgets did refresh");
+    let err = e.authorize(&t, "9999", 100, "transfer").unwrap_err().to_string();
     assert!(err.contains("total budget"), "300 lifetime is spent; a new period changes nothing: {err}");
 
     let d = e.describe(&pid).unwrap();
@@ -107,7 +107,7 @@ fn attack_over_refunding_cannot_manufacture_headroom() {
     let limits = Limits { per_transaction: 100, per_day: 100, per_month: Some(100), total_budget: Some(100) };
     let (mut e, pid, t) = engine_with(limits, None);
 
-    let auth = e.authorize(&t, "9999", 100, "simple_transfer").unwrap();
+    let auth = e.authorize(&t, "9999", 100, "transfer").unwrap();
     // Refund far more than was ever spent, several times over.
     for _ in 0..5 {
         e.refund(&auth, u64::MAX);
@@ -120,8 +120,8 @@ fn attack_over_refunding_cannot_manufacture_headroom() {
     assert_eq!(d.remaining_total_nano, Some(100));
 
     // The budget is exactly one payment wide, still.
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok());
-    assert!(e.authorize(&t, "9999", 1, "simple_transfer").is_err(), "no free lifetime budget was minted");
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok());
+    assert!(e.authorize(&t, "9999", 1, "transfer").is_err(), "no free lifetime budget was minted");
 }
 
 /// A spend that fails and is retried must cost the budget ONCE — not twice
@@ -132,12 +132,12 @@ fn attack_a_failed_then_retried_spend_nets_exactly_one_charge() {
     let limits = Limits { per_transaction: 100, per_day: 150, ..open_limits() };
     let (mut e, pid, t) = engine_with(limits, None);
 
-    let auth = e.authorize(&t, "9999", 100, "simple_transfer").unwrap();
+    let auth = e.authorize(&t, "9999", 100, "transfer").unwrap();
     e.refund(&auth, 100); // the tool's failure path
     assert_eq!(spent_today(&mut e, &pid), 0);
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok(), "the retry is affordable again");
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok(), "the retry is affordable again");
     assert_eq!(spent_today(&mut e, &pid), 100, "one net charge for one settled payment");
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_err(), "and the cap still binds after the round trip");
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_err(), "and the cap still binds after the round trip");
 }
 
 /// A refund is never a spend: the daily counter after N failed-and-refunded
@@ -146,7 +146,7 @@ fn attack_a_failed_then_retried_spend_nets_exactly_one_charge() {
 fn attack_a_thousand_refunded_attempts_do_not_drift_the_counter() {
     let (mut e, pid, t) = engine_with(Limits { per_transaction: 7, per_day: 1_000, ..open_limits() }, None);
     for _ in 0..1_000 {
-        let auth = e.authorize(&t, "9999", 7, "simple_transfer").unwrap();
+        let auth = e.authorize(&t, "9999", 7, "transfer").unwrap();
         e.refund(&auth, 7);
     }
     assert_eq!(spent_today(&mut e, &pid), 0, "no accumulated drift from refund arithmetic");
@@ -163,9 +163,9 @@ fn finding_a_refund_across_the_day_boundary_must_not_credit_the_new_day() {
     let limits = Limits { per_transaction: 100, per_day: 100, ..open_limits() };
     let (mut e, pid, t) = engine_with(limits, None);
 
-    let yesterday = e.authorize(&t, "9999", 100, "simple_transfer").unwrap(); // day D
+    let yesterday = e.authorize(&t, "9999", 100, "transfer").unwrap(); // day D
     e.force_day_rollover_for_test(); // wall clock crosses midnight
-    e.authorize(&t, "9999", 100, "simple_transfer").unwrap(); // day D+1, budget now spent
+    e.authorize(&t, "9999", 100, "transfer").unwrap(); // day D+1, budget now spent
     e.refund(&yesterday, 100); // day D's call finally fails
 
     assert_eq!(
@@ -173,21 +173,21 @@ fn finding_a_refund_across_the_day_boundary_must_not_credit_the_new_day() {
         100,
         "yesterday's refund must not restore today's budget"
     );
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_err(), "today's cap is already spent");
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_err(), "today's cap is already spent");
 }
 
 #[test]
 fn documents_the_cross_day_refund_credit() {
     let limits = Limits { per_transaction: 100, per_day: 100, ..open_limits() };
     let (mut e, pid, t) = engine_with(limits, None);
-    let yesterday = e.authorize(&t, "9999", 100, "simple_transfer").unwrap();
+    let yesterday = e.authorize(&t, "9999", 100, "transfer").unwrap();
     e.force_day_rollover_for_test();
-    e.authorize(&t, "9999", 100, "simple_transfer").unwrap();
+    e.authorize(&t, "9999", 100, "transfer").unwrap();
     e.refund(&yesterday, 100);
     // CURRENT behaviour: today's 100 was silently un-spent, so a second 100
     // goes through — 200 Nano moved on a 100/day policy.
     assert_eq!(spent_today(&mut e, &pid), 0, "current (vulnerable) behaviour");
-    assert!(e.authorize(&t, "9999", 100, "simple_transfer").is_ok(), "second 100 on a 100/day cap");
+    assert!(e.authorize(&t, "9999", 100, "transfer").is_ok(), "second 100 on a 100/day cap");
 }
 
 /// Regression for the overflow attack: the cap comparisons now use
@@ -198,11 +198,11 @@ fn attack_an_overflowing_amount_is_denied_by_the_authorize_gate() {
     let limits = Limits { per_transaction: u64::MAX, per_day: 1_000, per_month: None, total_budget: None };
     let (mut e, _pid, t) = engine_with(limits, None);
     // Land a small legitimate spend so spent_today > 0.
-    e.authorize(&t, "9999", 500, "simple_transfer").unwrap();
+    e.authorize(&t, "9999", 500, "transfer").unwrap();
     // amount <= per_transaction, so the per-tx gate passes; the daily gate then
     // computes checked 500 + u64::MAX and must refuse.
     assert!(
-        e.authorize(&t, "9999", u64::MAX, "simple_transfer").is_err(),
+        e.authorize(&t, "9999", u64::MAX, "transfer").is_err(),
         "u64::MAX on a 1000/day policy must be refused"
     );
 }
@@ -212,9 +212,9 @@ fn attack_an_overflowing_amount_is_denied_by_the_authorize_gate() {
 fn attack_the_monthly_cap_overflow_is_denied_the_same_way() {
     let limits = Limits { per_transaction: u64::MAX, per_day: u64::MAX, per_month: Some(1_000), total_budget: None };
     let (mut e, _pid, t) = engine_with(limits, None);
-    e.authorize(&t, "9999", 500, "simple_transfer").unwrap();
+    e.authorize(&t, "9999", 500, "transfer").unwrap();
     assert!(
-        e.authorize(&t, "9999", u64::MAX, "simple_transfer").is_err(),
+        e.authorize(&t, "9999", u64::MAX, "transfer").is_err(),
         "u64::MAX on a 1000/month policy must be refused"
     );
 }
@@ -226,9 +226,9 @@ fn attack_huge_amounts_under_sane_limits_are_simply_denied() {
     let limits = Limits { per_transaction: 5_000_000_000, per_day: 50_000_000_000, ..open_limits() };
     let (mut e, _pid, t) = engine_with(limits, None);
     for amount in [u64::MAX, u64::MAX - 1, u64::MAX / 2, 5_000_000_001] {
-        assert!(e.authorize(&t, "9999", amount, "simple_transfer").is_err(), "amount {amount} must be denied");
+        assert!(e.authorize(&t, "9999", amount, "transfer").is_err(), "amount {amount} must be denied");
     }
-    assert!(e.authorize(&t, "9999", 0, "simple_transfer").is_ok(), "a zero-value call is not a cap violation");
+    assert!(e.authorize(&t, "9999", 0, "transfer").is_ok(), "a zero-value call is not a cap violation");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -267,13 +267,13 @@ fn attack_an_unlisted_recipient_is_denied_in_every_spelling() {
     ];
     for d in disguises.iter().take(disguises.len() - 1) {
         assert!(
-            e.authorize(&t, d, 1, "simple_transfer").is_err(),
+            e.authorize(&t, d, 1, "transfer").is_err(),
             "`{d}` must not reach an unapproved party (normalized to `{}`)",
             normalize_recipient(d)
         );
     }
     // Whitespace around the APPROVED id is genuinely the approved id.
-    assert!(e.authorize(&t, "1234 ", 1, "simple_transfer").is_ok());
+    assert!(e.authorize(&t, "1234 ", 1, "transfer").is_ok());
 }
 
 /// Non-ASCII digit forms must not be silently folded into an approved decimal id.
@@ -357,7 +357,7 @@ fn attack_x402_aliases_cannot_smuggle_an_unapproved_seller() {
 fn finding_an_empty_alias_list_must_not_bypass_the_allowlist() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
     assert!(
-        e.authorize_aliases(&t, &[], 1_000, "simple_transfer").is_err(),
+        e.authorize_aliases(&t, &[], 1_000, "transfer").is_err(),
         "a spend with no named recipient must be refused, not treated as self"
     );
 }
@@ -366,7 +366,7 @@ fn finding_an_empty_alias_list_must_not_bypass_the_allowlist() {
 fn documents_the_empty_alias_list_bypass() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
     assert!(
-        e.authorize_aliases(&t, &[], 1_000, "simple_transfer").is_ok(),
+        e.authorize_aliases(&t, &[], 1_000, "transfer").is_ok(),
         "current (vulnerable) behaviour: vacuous all() ⇒ inbound ⇒ allowlist skipped"
     );
 }
@@ -406,22 +406,22 @@ fn documents_the_hex_decimal_collision() {
 fn attack_a_blank_allowlist_entry_is_not_a_wildcard_for_real_payees() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["".into()]));
     for real in ["1234", "0xdeadbeef", "https://evil.com/x", "evil.com"] {
-        assert!(e.authorize(&t, real, 1, "simple_transfer").is_err(), "`{real}` must not match a blank entry");
+        assert!(e.authorize(&t, real, 1, "transfer").is_err(), "`{real}` must not match a blank entry");
     }
     // Degenerate inputs DO match it — they normalize to "" as well. They are
     // not payable identifiers, so nothing can be sent to them, but a blank
     // entry is still a configuration smell worth rejecting at create time.
-    assert!(e.authorize(&t, "", 1, "simple_transfer").is_ok(), "documented: blank matches blank");
-    assert!(e.authorize(&t, "   ", 1, "simple_transfer").is_ok());
+    assert!(e.authorize(&t, "", 1, "transfer").is_ok(), "documented: blank matches blank");
+    assert!(e.authorize(&t, "   ", 1, "transfer").is_ok());
 }
 
 #[test]
 fn attack_an_empty_allowlist_blocks_outbound_but_not_inbound() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec![])); // "pay nobody"
     for r in ["1234", "0xdeadbeef", "https://good.example.com", ""] {
-        assert!(e.authorize(&t, r, 1, "simple_transfer").is_err(), "`{r}` must be refused");
+        assert!(e.authorize(&t, r, 1, "transfer").is_err(), "`{r}` must be refused");
     }
-    assert!(e.authorize(&t, SELF_RECIPIENT, 0, "simple_claim").is_ok(), "claims still fold funds in");
+    assert!(e.authorize(&t, SELF_RECIPIENT, 0, "claim").is_ok(), "claims still fold funds in");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -431,13 +431,13 @@ fn attack_an_empty_allowlist_blocks_outbound_but_not_inbound() {
 #[test]
 fn attack_a_method_off_the_allowlist_is_denied_even_to_an_approved_recipient() {
     let mut e = PolicyEngine::new();
-    let pid = e.create_policy("agent-1", open_limits(), Some(vec!["1234".into()]), vec!["simple_claim".into()]);
+    let pid = e.create_policy("agent-1", open_limits(), Some(vec!["1234".into()]), vec!["claim".into()]);
     let (t, _) = e.issue_session(&pid, 60, None).unwrap();
-    for m in ["simple_transfer", "private_transfer", "withdraw", "deposit", "x402_fetch", "claim_deposit", "private_claim"] {
+    for m in ["transfer", "private_transfer", "withdraw", "deposit", "x402_fetch", "claim_deposit", "private_claim"] {
         let err = e.authorize(&t, "1234", 1, m).unwrap_err().to_string();
         assert!(err.contains("not allowed"), "`{m}` must be off-limits: {err}");
     }
-    assert!(e.authorize(&t, SELF_RECIPIENT, 0, "simple_claim").is_ok(), "only the one granted method works");
+    assert!(e.authorize(&t, SELF_RECIPIENT, 0, "claim").is_ok(), "only the one granted method works");
 }
 
 /// Method names are matched exactly — no case folding, no prefix matching, no
@@ -445,32 +445,32 @@ fn attack_a_method_off_the_allowlist_is_denied_even_to_an_approved_recipient() {
 #[test]
 fn attack_method_names_are_matched_exactly() {
     let mut e = PolicyEngine::new();
-    let pid = e.create_policy("agent-1", open_limits(), None, vec!["simple_claim".into()]);
+    let pid = e.create_policy("agent-1", open_limits(), None, vec!["claim".into()]);
     let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     for near_miss in [
-        "SIMPLE_CLAIM", "Simple_Claim", "simple_claim ", " simple_claim",
-        "simple_claim\0", "simple_claims", "simple", "simple_transfer",
-        "simple_claim;simple_transfer", "simple_claim\nsimple_transfer",
+        "SIMPLE_CLAIM", "Simple_Claim", "claim ", " claim",
+        "claim\0", "claims", "simple", "transfer",
+        "claim;transfer", "claim\ntransfer",
     ] {
-        assert!(e.authorize(&t, "1", 1, near_miss).is_err(), "`{near_miss}` must not pass as simple_claim");
+        assert!(e.authorize(&t, "1", 1, near_miss).is_err(), "`{near_miss}` must not pass as claim");
     }
-    assert!(e.authorize(&t, "1", 1, "simple_claim").is_ok());
+    assert!(e.authorize(&t, "1", 1, "claim").is_ok());
 }
 
 /// x402 payments and direct transfers are separately gated in BOTH directions,
 /// so an owner can allow one without the other.
 #[test]
-fn attack_x402_and_simple_transfer_are_not_interchangeable() {
+fn attack_x402_and_transfer_are_not_interchangeable() {
     let mut e = PolicyEngine::new();
-    let transfers_only = e.create_policy("a", open_limits(), None, vec!["simple_transfer".into()]);
+    let transfers_only = e.create_policy("a", open_limits(), None, vec!["transfer".into()]);
     let x402_only = e.create_policy("b", open_limits(), None, vec!["x402_fetch".into()]);
     let (t1, _) = e.issue_session(&transfers_only, 60, None).unwrap();
     let (t2, _) = e.issue_session(&x402_only, 60, None).unwrap();
 
-    assert!(e.authorize(&t1, "1", 1, "simple_transfer").is_ok());
+    assert!(e.authorize(&t1, "1", 1, "transfer").is_ok());
     assert!(e.authorize(&t1, "1", 1, "x402_fetch").is_err(), "paid fetches are separately approved");
     assert!(e.authorize(&t2, "1", 1, "x402_fetch").is_ok());
-    assert!(e.authorize(&t2, "1", 1, "simple_transfer").is_err(), "and so are direct transfers");
+    assert!(e.authorize(&t2, "1", 1, "transfer").is_err(), "and so are direct transfers");
 }
 
 /// FINDING (MEDIUM, defence-in-depth) — the inbound exemption tests the RAW
@@ -484,7 +484,7 @@ fn attack_x402_and_simple_transfer_are_not_interchangeable() {
 #[ignore = "FINDING: the literal \"self\" bypasses the recipient allowlist on spend methods"]
 fn finding_the_self_sentinel_must_not_exempt_a_spend_method() {
     let (mut e, _pid, t) = engine_with(open_limits(), Some(vec!["1234".into()]));
-    for method in ["withdraw", "private_transfer", "simple_transfer", "x402_fetch"] {
+    for method in ["withdraw", "private_transfer", "transfer", "x402_fetch"] {
         assert!(
             e.authorize(&t, SELF_RECIPIENT, 1_000_000, method).is_err(),
             "`{method}` moves money OUT; \"self\" is not a payee it may name"
@@ -520,7 +520,7 @@ fn attack_the_self_exemption_does_not_lift_the_amount_caps() {
     assert!(e.authorize(&t, SELF_RECIPIENT, 100, "deposit").is_ok());
     assert!(e.authorize(&t, SELF_RECIPIENT, 1, "deposit").is_err(), "daily cap still applies to self");
     // A paused policy freezes inbound operations too — that is the kill switch.
-    assert!(e.authorize(&t, SELF_RECIPIENT, 0, "simple_claim").is_ok());
+    assert!(e.authorize(&t, SELF_RECIPIENT, 0, "claim").is_ok());
 }
 
 #[test]
@@ -528,10 +528,10 @@ fn attack_a_paused_policy_freezes_claims_too_so_pause_is_a_real_kill_switch() {
     let (mut e, pid, t) = engine_with(open_limits(), None);
     e.pause(&pid);
     for (r, m, amt) in [
-        (SELF_RECIPIENT, "simple_claim", 0u64),
+        (SELF_RECIPIENT, "claim", 0u64),
         (SELF_RECIPIENT, "private_claim", 0),
         (SELF_RECIPIENT, "claim_deposit", 0),
-        ("1234", "simple_transfer", 1),
+        ("1234", "transfer", 1),
         ("1234", "x402_fetch", 1),
     ] {
         let err = e.authorize(&t, r, amt, m).unwrap_err().to_string();
@@ -548,13 +548,13 @@ fn attack_a_revoked_token_stays_dead() {
     let (mut e, pid, t) = engine_with(open_limits(), None);
     assert!(e.revoke(&t));
     assert!(!e.revoke(&t), "revoking twice reports honestly");
-    assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err());
+    assert!(e.authorize(&t, "1", 1, "transfer").is_err());
     assert!(e.budget(&t).is_none(), "and it can no longer even read the budget");
     assert!(e.policy_id_for_session(&t).is_none());
     // Pausing/resuming the policy must not resurrect it.
     e.pause(&pid);
     e.resume(&pid);
-    assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err(), "a revoked token is gone for good");
+    assert!(e.authorize(&t, "1", 1, "transfer").is_err(), "a revoked token is gone for good");
 }
 
 #[test]
@@ -563,7 +563,7 @@ fn attack_an_expired_token_is_dead_and_is_reaped() {
     let pid = e.create_policy("a", open_limits(), None, vec![]);
     let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     e.expire_session_for_test(&t);
-    assert!(e.authorize(&t, "1", 1, "simple_transfer").unwrap_err().to_string().contains("expired"));
+    assert!(e.authorize(&t, "1", 1, "transfer").unwrap_err().to_string().contains("expired"));
     assert!(e.policy_id_for_session(&t).is_none(), "expired tokens are dropped, not left to leak");
     assert_eq!(e.describe(&pid).unwrap().active_sessions, 0);
 }
@@ -622,9 +622,9 @@ fn attack_forged_tokens_are_rejected() {
     ];
     for f in &forgeries {
         if f == &t { continue }
-        assert!(e.authorize(f, "1", 1, "simple_transfer").is_err(), "forged token `{f}` must be rejected");
+        assert!(e.authorize(f, "1", 1, "transfer").is_err(), "forged token `{f}` must be rejected");
     }
-    assert!(e.authorize(&t, "1", 1, "simple_transfer").is_ok(), "the real one still works");
+    assert!(e.authorize(&t, "1", 1, "transfer").is_ok(), "the real one still works");
 }
 
 #[test]
@@ -645,7 +645,7 @@ fn attack_a_session_cannot_be_spent_against_another_policy() {
     let rich = e.create_policy("b", open_limits(), None, vec![]);
     let (t, _) = e.issue_session(&poor, 60, None).unwrap();
     assert_eq!(e.policy_id_for_session(&t).as_deref(), Some(poor.as_str()));
-    assert!(e.authorize(&t, "1", 1_000, "simple_transfer").is_err(), "the poor policy's cap binds");
+    assert!(e.authorize(&t, "1", 1_000, "transfer").is_err(), "the poor policy's cap binds");
     assert_eq!(e.describe(&rich).unwrap().spent_total_nano, 0, "the rich policy was never touched");
 }
 
@@ -656,9 +656,9 @@ fn attack_a_session_cannot_be_spent_against_another_policy() {
 fn documents_that_resume_rearms_pre_pause_sessions() {
     let (mut e, pid, t) = engine_with(open_limits(), None);
     e.pause(&pid);
-    assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err());
+    assert!(e.authorize(&t, "1", 1, "transfer").is_err());
     e.resume(&pid);
-    assert!(e.authorize(&t, "1", 1, "simple_transfer").is_ok(), "the pre-pause token works again");
+    assert!(e.authorize(&t, "1", 1, "transfer").is_ok(), "the pre-pause token works again");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -680,16 +680,16 @@ fn attack_a_restart_does_not_re_grant_the_lifetime_budget() {
         let pid = e.create_policy("a", limits, None, vec![]);
         let (t, _) = e.issue_session(&pid, 60, None).unwrap();
         for _ in 0..3 {
-            e.authorize(&t, "1", 100, "simple_transfer").unwrap();
+            e.authorize(&t, "1", 100, "transfer").unwrap();
         }
-        assert!(e.authorize(&t, "1", 1, "simple_transfer").is_err(), "lifetime budget spent");
+        assert!(e.authorize(&t, "1", 1, "transfer").is_err(), "lifetime budget spent");
         pid
     };
     // Crash-loop the server ten times; each restart must find the budget spent.
     for i in 0..10 {
         let mut e = PolicyEngine::load_or_new(&dir);
         let (t, _) = e.issue_session(&pid, 60, None).unwrap();
-        let err = e.authorize(&t, "1", 1, "simple_transfer").unwrap_err().to_string();
+        let err = e.authorize(&t, "1", 1, "transfer").unwrap_err().to_string();
         assert!(err.contains("total budget"), "restart {i} re-granted the budget: {err}");
         assert_eq!(e.describe(&pid).unwrap().spent_total_nano, 300);
     }
@@ -705,12 +705,12 @@ fn attack_a_restart_does_not_reset_the_daily_counter() {
         let mut e = PolicyEngine::load_or_new(&dir);
         let pid = e.create_policy("a", limits, None, vec![]);
         let (t, _) = e.issue_session(&pid, 60, None).unwrap();
-        e.authorize(&t, "1", 100, "simple_transfer").unwrap();
+        e.authorize(&t, "1", 100, "transfer").unwrap();
         pid
     };
     let mut e = PolicyEngine::load_or_new(&dir);
     let (t, _) = e.issue_session(&pid, 60, None).unwrap();
-    let err = e.authorize(&t, "1", 1, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize(&t, "1", 1, "transfer").unwrap_err().to_string();
     assert!(err.contains("daily cap"), "the daily window survived the restart: {err}");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -744,7 +744,7 @@ fn attack_sessions_do_not_survive_a_restart() {
         (pid, t)
     };
     let mut e = PolicyEngine::load_or_new(&dir);
-    assert!(e.authorize(&token, "1", 1, "simple_transfer").is_err(), "a stale token is not honoured");
+    assert!(e.authorize(&token, "1", 1, "transfer").is_err(), "a stale token is not honoured");
     assert!(e.policy_id_for_session(&token).is_none());
     assert_eq!(e.describe(&pid).unwrap().active_sessions, 0);
     std::fs::remove_dir_all(&dir).ok();
@@ -757,13 +757,13 @@ fn attack_a_restart_does_not_widen_the_recipient_allowlist() {
     let dir = temp_dir("allowlist");
     let pid = {
         let mut e = PolicyEngine::load_or_new(&dir);
-        e.create_policy("a", open_limits(), Some(vec!["1234".into()]), vec!["simple_transfer".into()])
+        e.create_policy("a", open_limits(), Some(vec!["1234".into()]), vec!["transfer".into()])
     };
     let mut e = PolicyEngine::load_or_new(&dir);
     let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     assert_eq!(e.describe(&pid).unwrap().allowed_recipient_count, Some(1));
-    assert!(e.authorize(&t, "9999", 1, "simple_transfer").is_err(), "still restricted after a restart");
-    assert!(e.authorize(&t, "1234", 1, "simple_transfer").is_ok());
+    assert!(e.authorize(&t, "9999", 1, "transfer").is_err(), "still restricted after a restart");
+    assert!(e.authorize(&t, "1234", 1, "transfer").is_ok());
     assert!(e.authorize(&t, "1234", 1, "withdraw").is_err(), "and the method list survived too");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -789,7 +789,7 @@ fn attack_a_corrupt_store_fails_closed_for_spending() {
         let mut e = PolicyEngine::load_or_new(&dir);
         assert!(e.policy_ids().is_empty(), "a corrupt store must not yield a usable policy: {garbage:?}");
         assert!(e.issue_session("anything", 60, None).is_err());
-        assert!(e.authorize("anything", "1", 1, "simple_transfer").is_err());
+        assert!(e.authorize("anything", "1", 1, "transfer").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
@@ -839,7 +839,7 @@ fn attack_a_stray_tmp_file_is_not_loaded_as_policy() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("policies.json.tmp"),
-        r#"{"attacker": {"agent_id":"evil","limits":{"per_transaction":18446744073709551615,"per_day":18446744073709551615,"per_month":null,"total_budget":null},"allowed_recipients":null,"allowed_methods":["simple_transfer"],"active":true,"spent_today":0,"spent_this_month":0,"spent_total":0,"last_day":0,"last_month":0}}"#,
+        r#"{"attacker": {"agent_id":"evil","limits":{"per_transaction":18446744073709551615,"per_day":18446744073709551615,"per_month":null,"total_budget":null},"allowed_recipients":null,"allowed_methods":["transfer"],"active":true,"spent_today":0,"spent_this_month":0,"spent_total":0,"last_day":0,"last_month":0}}"#,
     ).unwrap();
     let e = PolicyEngine::load_or_new(&dir);
     assert!(e.policy_ids().is_empty(), "only policies.json is authoritative");
@@ -927,7 +927,7 @@ fn attack_the_engine_surface_never_panics_on_hostile_arguments() {
 fn attack_the_spend_log_cannot_be_grown_without_bound() {
     let (mut e, _pid, t) = engine_with(open_limits(), None);
     for i in 0..5_000u64 {
-        e.authorize(&t, "1", i % 10, "simple_transfer").unwrap();
+        e.authorize(&t, "1", i % 10, "transfer").unwrap();
     }
     assert!(e.spend_log_len() <= 100, "the ring is capped, got {}", e.spend_log_len());
     assert_eq!(e.spend_log(usize::MAX, None).len(), e.spend_log_len());
@@ -938,12 +938,12 @@ fn attack_the_spend_log_cannot_be_grown_without_bound() {
 #[test]
 fn attack_denied_attempts_never_enter_the_audit_trail() {
     let (mut e, pid, t) = engine_with(Limits { per_transaction: 5, ..open_limits() }, Some(vec!["1234".into()]));
-    let _ = e.authorize(&t, "9999", 1, "simple_transfer");   // allowlist
-    let _ = e.authorize(&t, "1234", 500, "simple_transfer"); // per-tx cap
+    let _ = e.authorize(&t, "9999", 1, "transfer");   // allowlist
+    let _ = e.authorize(&t, "1234", 500, "transfer"); // per-tx cap
     let _ = e.authorize(&t, "1234", 1, "sudo_drain");        // method
-    let _ = e.authorize("bogus", "1234", 1, "simple_transfer"); // session
+    let _ = e.authorize("bogus", "1234", 1, "transfer"); // session
     e.pause(&pid);
-    let _ = e.authorize(&t, "1234", 1, "simple_transfer");   // paused
+    let _ = e.authorize(&t, "1234", 1, "transfer");   // paused
     assert_eq!(e.spend_log(100, None).len(), 0, "only approvals are spends");
     assert_eq!(e.describe(&pid).unwrap().spent_total_nano, 0);
 }
@@ -961,7 +961,7 @@ fn attack_describe_does_not_leak_the_allowlist_contents() {
     assert_eq!(d.allowed_recipient_count, Some(3), "the agent learns it is constrained, and how tightly");
 
     // A denial names the attempted recipient and the list SIZE only.
-    let err = e.authorize(&_t, "9999", 1, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize(&_t, "9999", 1, "transfer").unwrap_err().to_string();
     assert!(err.contains("9999"));
     for s in &secrets {
         assert!(!err.contains(s.trim_start_matches("https://")), "denial leaked `{s}`: {err}");

@@ -3769,7 +3769,7 @@ impl WalletSession {
 
     //     all_contract_calls.push(ContractCallArgs {
     //         contract_id: TOKEN_CONTRACT_ID as u64,
-    //         method_name: "simple_claim_pow_rewards".to_string(),
+    //         method_name: "claim_pow_rewards".to_string(),
     //         inputs: vec![last_checkpoint],
     //     });
 
@@ -5985,7 +5985,7 @@ pub(crate) mod offline_trace_pipeline_tests {
     use psy_compiler::output::serialize::CompilationArtifact;
     use psy_config::network_constants::{
         CHECKPOINT_TREE_HEIGHT, CONTRACT_FUNCTION_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, REALM_USER_TREE_HEIGHT,
-        TOKEN_CONTRACT_ID, TOKEN_SIMPLE_BURN_METHOD_ID, UPS_SESSION_PROOF_TREE_HEIGHT,
+        TOKEN_BURN_METHOD_ID, TOKEN_CONTRACT_ID, UPS_SESSION_PROOF_TREE_HEIGHT,
     };
     use psy_crypto::hash::merkle::utils::simple_merkle_tree::SimpleMerkleTree;
     use psy_vm::{dpn::ops::state_cmd::data::DPNStateCmd, vm::exec::PsyCmdInputWitnessResolver};
@@ -6408,7 +6408,7 @@ pub(crate) mod offline_trace_pipeline_tests {
             TOKEN_CONTRACT_ID as u64,
             artifact.state_tree_height as u8,
             &artifact.circuit_definitions,
-            "simple_burn",
+            "burn",
         )
     }
 
@@ -6473,7 +6473,7 @@ pub(crate) mod offline_trace_pipeline_tests {
             }
             let mut state_tree = OfflineTree::new(contract.state_tree_height);
             let slot0 = if contract.contract_id == TOKEN_CONTRACT_ID as u64 {
-                // simple_burn reads sub-slot 0 (leaf 0, element 0), matching
+                // burn reads sub-slot 0 (leaf 0, element 0), matching
                 // the ABI layout where `balance` sits at felt offset 0.
                 QHashOut::from_values(OFFLINE_TOKEN_BALANCE, 0, 0, 0)
             } else {
@@ -6784,12 +6784,12 @@ pub(crate) mod offline_trace_pipeline_tests {
         lps.init_transaction(DPNProvingSessionSimpleMethodCall {
             caller_contract_id: F::from_canonical_u64(psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64),
             contract_id: F::ZERO,
-            method_id: F::from_canonical_u32(TOKEN_SIMPLE_BURN_METHOD_ID),
+            method_id: F::from_canonical_u32(TOKEN_BURN_METHOD_ID),
             inputs: vec![F::ONE],
         })
         .await?;
         let _ = lps
-            .get_call_start_data(F::ZERO, F::from_canonical_u32(TOKEN_SIMPLE_BURN_METHOD_ID), &[F::ONE])
+            .get_call_start_data(F::ZERO, F::from_canonical_u32(TOKEN_BURN_METHOD_ID), &[F::ONE])
             .await?;
 
         let after = lps.get_contract_state_slot(F::ZERO, F::ZERO).await?;
@@ -6799,7 +6799,7 @@ pub(crate) mod offline_trace_pipeline_tests {
             "slot after call-start"
         );
 
-        // Balance read as the VM would issue it (simple_burn resolves its
+        // Balance read as the VM would issue it (burn resolves its
         // sub-slot template through Constant(0): leaf 0, element 0).
         let read = lps
             .resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_single(0u64))
@@ -6847,12 +6847,12 @@ pub(crate) mod offline_trace_pipeline_tests {
         lps2.init_transaction(DPNProvingSessionSimpleMethodCall {
             caller_contract_id: F::from_canonical_u64(psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64),
             contract_id: F::ZERO,
-            method_id: F::from_canonical_u32(TOKEN_SIMPLE_BURN_METHOD_ID),
+            method_id: F::from_canonical_u32(TOKEN_BURN_METHOD_ID),
             inputs: vec![F::ONE],
         })
         .await?;
         let _ = lps2
-            .get_call_start_data(F::ZERO, F::from_canonical_u32(TOKEN_SIMPLE_BURN_METHOD_ID), &[F::ONE])
+            .get_call_start_data(F::ZERO, F::from_canonical_u32(TOKEN_BURN_METHOD_ID), &[F::ONE])
             .await?;
         let burn_read = lps2
             .resolve_vec(&DPNStateCmd::get_self_user_current_contract_state_slot_single(0u64))
@@ -7275,7 +7275,7 @@ pub(crate) mod offline_trace_pipeline_tests {
         let sd_fingerprint = wallet_session
             .register_sd_key_circuit(
                 &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
-                &[set_value_method_id, TOKEN_SIMPLE_BURN_METHOD_ID],
+                &[set_value_method_id, TOKEN_BURN_METHOD_ID],
                 2,
             )
             .await?;
@@ -7328,7 +7328,7 @@ pub(crate) mod offline_trace_pipeline_tests {
         let sd_fingerprint = wallet_session
             .register_sd_key_circuit(
                 &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
-                &[set_value_method_id, TOKEN_SIMPLE_BURN_METHOD_ID],
+                &[set_value_method_id, TOKEN_BURN_METHOD_ID],
                 2,
             )
             .await?;
@@ -8274,7 +8274,7 @@ mod tests {
             user0,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             }],
         )?;
@@ -8289,7 +8289,7 @@ mod tests {
             user0,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_transfer".to_string(),
+                method_name: "transfer".to_string(),
                 inputs: vec![1, 500],
             }],
         )?;
@@ -8304,7 +8304,7 @@ mod tests {
             user1,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_claim".to_string(),
+                method_name: "claim".to_string(),
                 inputs: vec![0],
             }],
         )?;
@@ -8319,7 +8319,7 @@ mod tests {
             user1,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_transfer".to_string(),
+                method_name: "transfer".to_string(),
                 inputs: vec![0, 500],
             }],
         )?;
@@ -8377,7 +8377,7 @@ mod tests {
             user0,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             }],
         )?;
@@ -8392,7 +8392,7 @@ mod tests {
             user0,
             vec![ContractCallArgs {
                 contract_id: 1,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             }],
         )?;
@@ -8406,9 +8406,9 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_prove_simple_mint() -> anyhow::Result<()> {
+    fn test_generate_prove_mint() -> anyhow::Result<()> {
         psy_client_common::setup_logging()?;
-        tracing::info!("test_generate_prove_simple_mint");
+        tracing::info!("test_generate_prove_mint");
         let project_path =
             std::env::var("CARGO_MANIFEST_DIR").map_err(|e| anyhow::format_err!("Error `{}`, cannot get CARGO_MANIFEST_DIR env", e))?;
 
@@ -8434,10 +8434,10 @@ mod tests {
         wallet_session.add_user(private_key0)?;
 
         // Generate trace: simple mint
-        tracing::info!("=== generate_tx_trace: simple_mint ===");
+        tracing::info!("=== generate_tx_trace: mint ===");
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id: 0,
-            method_name: "simple_mint".to_string(),
+            method_name: "mint".to_string(),
             inputs: vec![1_000_000_000_000],
         }]);
         let trace = wallet_session.generate_tx_trace(user0, call_data)?;
@@ -8487,12 +8487,12 @@ mod tests {
         let call_data = ContractCallData::new(vec![
             ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             },
             ContractCallArgs {
                 contract_id: 1,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![2_000_000_000_000],
             },
         ]);
@@ -8548,7 +8548,7 @@ mod tests {
             user0,
             ContractCallData::new(vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             }]),
         )?;
@@ -8563,7 +8563,7 @@ mod tests {
             user0,
             ContractCallData::new(vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_transfer".to_string(),
+                method_name: "transfer".to_string(),
                 inputs: vec![1, 500],
             }]),
         )?;
@@ -8578,7 +8578,7 @@ mod tests {
             user1,
             ContractCallData::new(vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_claim".to_string(),
+                method_name: "claim".to_string(),
                 inputs: vec![0],
             }]),
         )?;
@@ -9092,7 +9092,7 @@ mod async_split_tests {
                 public_key,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![operator_user_id],
                 }]),
             )
@@ -9118,7 +9118,7 @@ mod async_split_tests {
                 sender,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![recipient_id, amount],
                 }]),
             )
@@ -9422,7 +9422,7 @@ mod async_split_tests {
                 #[contract_method]
                 pub fn simple_deferred_transfer(&mut self, ctx: &ChainContext, recipient: Felt, amount: Felt) -> Felt {
                     self.marker = 1;
-                    psystd::invoke_deferred(0, 354447671, [recipient, amount]);
+                    psystd::invoke_deferred(0, 2789897329, [recipient, amount]);
                     return 1;
                 }
 
@@ -9603,7 +9603,7 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_generate_prove_simple_mint() -> anyhow::Result<()> {
+    async fn async_generate_prove_mint() -> anyhow::Result<()> {
         let (mut wallet_session, user0_keys, user0, user_id, contract_id) = setup_single_user_ready().await?;
         let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
         let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
@@ -9613,7 +9613,7 @@ mod async_split_tests {
 
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id,
-            method_name: "simple_claim".to_string(),
+            method_name: "claim".to_string(),
             inputs: vec![operator_user_id],
         }]);
         wallet_session.start_session(user0).await?;
@@ -9631,7 +9631,7 @@ mod async_split_tests {
         assert!(!generated.trace.payload.is_empty());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].contract_id, contract_id);
-        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].method_name, "simple_claim");
+        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].method_name, "claim");
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].inputs, vec![operator_user_id]);
         assert!(!simulated.metadata.storage_data.writes.is_empty());
         let (after_count, after_hash) = {
@@ -9777,7 +9777,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![operator_user_id],
                 }]),
             )
@@ -10012,7 +10012,7 @@ mod async_split_tests {
         let call_data = ContractCallData {
             contract_calls: vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_claim".to_string(),
+                method_name: "claim".to_string(),
                 inputs: vec![operator_user_id],
             }],
             software_defined_call: DPNSoftwareDefinedCallData { inputs: vec![42] },
@@ -10076,7 +10076,7 @@ mod async_split_tests {
         let call_data = ContractCallData {
             contract_calls: vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_claim".to_string(),
+                method_name: "claim".to_string(),
                 inputs: vec![operator_user_id],
             }],
             software_defined_call: DPNSoftwareDefinedCallData { inputs: vec![7] },
@@ -10089,7 +10089,7 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_generate_prove_simple_mint_secp256k1() -> anyhow::Result<()> {
+    async fn async_generate_prove_mint_secp256k1() -> anyhow::Result<()> {
         let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
         let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
         let network = reachable_test_network(&psy_config).await?;
@@ -10119,7 +10119,7 @@ mod async_split_tests {
                 user,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id: 0,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![operator_user_id],
                 }]),
             )
@@ -10164,7 +10164,7 @@ mod async_split_tests {
                 user0,
                 ViewCallData::new(vec![ContractCallArgs {
                     contract_id: 0,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![0, 1],
                 }]),
             )
@@ -10182,7 +10182,7 @@ mod async_split_tests {
     /// trace without a held key, sign the exact session sighash, then inject
     /// the 65-byte signature for proving.
     #[tokio::test]
-    async fn async_external_eth_personal_user_simple_mint() -> anyhow::Result<()> {
+    async fn async_external_eth_personal_user_mint() -> anyhow::Result<()> {
         use psy_client_common::data::base_types::hash256::Hash256;
 
         let (mut wallet_session, user0, _user1, contract_ids) = setup_wallet_and_users().await?;
@@ -10210,7 +10210,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user_id, 1],
                 }]),
             )
@@ -10226,7 +10226,7 @@ mod async_split_tests {
 
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id,
-            method_name: "simple_claim".to_string(),
+            method_name: "claim".to_string(),
             inputs: vec![user0_id],
         }]);
         let trace = wallet_session.generate_tx_trace(public_key, call_data).await?;
@@ -10365,7 +10365,7 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_prove_trace_step_resume_simple_claim() -> anyhow::Result<()> {
+    async fn async_prove_trace_step_resume_claim() -> anyhow::Result<()> {
         let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
         let user0_id = wallet_session.resolve_registered_user_id(user0).await?;
@@ -10381,7 +10381,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, 250_000_000_000],
                 }]),
             )
@@ -10400,7 +10400,7 @@ mod async_split_tests {
                 user1,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![user0_id],
                 }]),
             )
@@ -10441,11 +10441,11 @@ mod async_split_tests {
                     break;
                 }
                 TraceProvingStepResult::Failed { error } => {
-                    anyhow::bail!("prove_trace_step simple_claim failed unexpectedly: error={}", error);
+                    anyhow::bail!("prove_trace_step claim failed unexpectedly: error={}", error);
                 }
             }
         }
-        anyhow::ensure!(submitted, "simple_claim prove_trace_step did not submit after 64 iterations");
+        anyhow::ensure!(submitted, "claim prove_trace_step did not submit after 64 iterations");
 
         Ok(())
     }
@@ -10464,12 +10464,12 @@ mod async_split_tests {
                 ContractCallData::new(vec![
                     ContractCallArgs {
                         contract_id,
-                        method_name: "simple_transfer".to_string(),
+                        method_name: "transfer".to_string(),
                         inputs: vec![user1_id, 1],
                     },
                     ContractCallArgs {
                         contract_id,
-                        method_name: "simple_burn".to_string(),
+                        method_name: "burn".to_string(),
                         inputs: vec![1],
                     },
                 ]),
@@ -10637,7 +10637,7 @@ mod async_split_tests {
         let private_amount = 100_000_000_000_u64;
 
         // Fund both fresh users through the network faucet. The built-in token's
-        // simple_mint method is deployer-only on Sepolia, so random test users
+        // mint method is deployer-only on Sepolia, so random test users
         // must claim the faucet grants after they have settled on-chain.
         let project_path = std::env::var("CARGO_MANIFEST_DIR")?;
         let psy_config = psy_config::PsyConfigGoldilocks::from_file(&integration_config_path(&project_path))?;
@@ -10652,7 +10652,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![sender_operator_user_id],
                 }]),
             )
@@ -10665,7 +10665,7 @@ mod async_split_tests {
                 user1,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![receiver_operator_user_id],
                 }]),
             )
@@ -10679,7 +10679,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, public_amount],
                 }]),
             )
@@ -10784,7 +10784,7 @@ mod async_split_tests {
                 vec![
                     ClaimBatchItem::Public(ContractCallArgs {
                         contract_id,
-                        method_name: "simple_claim".to_string(),
+                        method_name: "claim".to_string(),
                         inputs: vec![user0_id],
                     }),
                     ClaimBatchItem::PrivateTransfer {
@@ -10830,7 +10830,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id: public_contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, public_amount],
                 }]),
             )
@@ -10902,7 +10902,7 @@ mod async_split_tests {
                 vec![
                     ClaimBatchItem::Public(ContractCallArgs {
                         contract_id: public_contract_id,
-                        method_name: "simple_claim".to_string(),
+                        method_name: "claim".to_string(),
                         inputs: vec![user0_id],
                     }),
                     ClaimBatchItem::ShieldDeposit(shield_claim.clone()),
@@ -10943,7 +10943,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, 250_000_000_000],
                 }]),
             )
@@ -10956,7 +10956,7 @@ mod async_split_tests {
                 user1,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![user0_id],
                 }]),
             )
@@ -10965,7 +10965,7 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_exec_simple_transfer_smoke() -> anyhow::Result<()> {
+    async fn async_exec_transfer_smoke() -> anyhow::Result<()> {
         let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let contract_id = contract_ids[0];
         let user0_id = wait_for_registered_user_id(&wallet_session, user0, "smoke sender").await?;
@@ -10976,7 +10976,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, 1],
                 }]),
             )
@@ -10986,7 +10986,7 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_generate_prove_deferred_simple_transfer() -> anyhow::Result<()> {
+    async fn async_generate_prove_deferred_transfer() -> anyhow::Result<()> {
         let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users().await?;
         let token_contract_id = contract_ids[0];
         let deferred_contract_id = contract_ids[1];
@@ -11152,7 +11152,7 @@ mod async_split_tests {
                         user0,
                         ContractCallData::new(vec![ContractCallArgs {
                             contract_id,
-                            method_name: "simple_transfer".to_string(),
+                            method_name: "transfer".to_string(),
                             inputs: vec![user1_id, 250_000_000_000],
                         }]),
                     )
