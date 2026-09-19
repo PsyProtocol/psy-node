@@ -21,6 +21,7 @@ required_files=(
   "$STAGED_RELEASE/target/release/psy_user_cli"
   "$STAGED_RELEASE/deploy/bin/run-parth-service"
   "$CONFIG_SOURCE"
+  "$STAGED_RELEASE/genesis.json"
   "$STAGED_RELEASE/BUILD-MANIFEST.env"
   "$UNIT_SOURCE"
 )
@@ -53,6 +54,12 @@ fi
 sudo install -d -o root -g root -m 0755 /opt/parth /opt/parth/releases
 sudo install -d -o root -g root -m 0755 "$RELEASE_DIR"
 sudo cp -a "$STAGED_RELEASE/." "$RELEASE_DIR/"
+sudo test ! -L "$RELEASE_DIR/genesis.json"
+sudo test -f "$RELEASE_DIR/genesis.json"
+sudo test ! -L "$RELEASE_DIR/client_prover"
+sudo test -d "$RELEASE_DIR/client_prover"
+sudo test ! -L "$RELEASE_DIR/client_prover/config.json"
+sudo test -f "$RELEASE_DIR/client_prover/config.json"
 sudo chown -R root:root "$RELEASE_DIR"
 sudo chmod 0755 \
   "$RELEASE_DIR" \
@@ -65,6 +72,12 @@ sudo chmod 0755 \
   "$RELEASE_DIR/deploy/bin/run-parth-service"
 sudo -u parth test -x "$RELEASE_DIR"
 sudo -u parth test -x "$RELEASE_DIR/deploy/bin/run-parth-service"
+
+# Protected staging permissions must not make runtime inputs root-only.
+sudo chown root:parth "$RELEASE_DIR/client_prover" "$RELEASE_DIR/genesis.json"
+sudo chmod 0750 "$RELEASE_DIR/client_prover"
+sudo chmod 0640 "$RELEASE_DIR/genesis.json"
+sudo -u parth test -r "$RELEASE_DIR/genesis.json"
 
 tmp_config="$(mktemp)"
 trap 'rm -f "$tmp_config"' EXIT
@@ -91,8 +104,9 @@ jq \
     | .networks[$network].system_prove_proxy_url = [$system_prove_proxy]
     | .networks[$network].api_services_url = [$services]
   ' "$CONFIG_SOURCE" >"$tmp_config"
-sudo install -o root -g root -m 0644 \
+sudo install -o root -g parth -m 0640 \
   "$tmp_config" "$RELEASE_DIR/client_prover/config.json"
+sudo -u parth test -r "$RELEASE_DIR/client_prover/config.json"
 
 sudo install -d -o root -g root -m 0700 \
   "$RELEASE_DIR/groth16-keystore" \

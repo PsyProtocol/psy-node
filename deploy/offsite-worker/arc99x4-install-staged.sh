@@ -35,6 +35,8 @@ id -u parth >/dev/null 2>&1 || \
 sudo install -d -o root -g root -m 0755 /opt/parth /opt/parth/releases
 sudo install -d -o root -g root -m 0755 "$RELEASE_DIR"
 sudo cp -a "$STAGED_RELEASE/." "$RELEASE_DIR/"
+sudo test ! -L "$RELEASE_DIR/genesis.json"
+sudo test -f "$RELEASE_DIR/genesis.json"
 sudo chown -R root:root "$RELEASE_DIR"
 sudo chmod 0755 \
   "$RELEASE_DIR" \
@@ -46,6 +48,11 @@ sudo chmod 0755 "$RELEASE_DIR/target/release/psy_worker_cli"
 sudo chmod 0755 "$RELEASE_DIR/deploy/bin/run-parth-service"
 sudo -u parth test -x "$RELEASE_DIR"
 sudo -u parth test -x "$RELEASE_DIR/deploy/bin/run-parth-service"
+
+# Bundles created with umask 077 retain root-only Genesis after cp -a.
+sudo chown root:parth "$RELEASE_DIR/genesis.json"
+sudo chmod 0640 "$RELEASE_DIR/genesis.json"
+sudo -u parth test -r "$RELEASE_DIR/genesis.json"
 
 sudo ln -sfn "$RELEASE_DIR" /opt/parth/current
 
