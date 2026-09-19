@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         "single",
         ContractCallData::new(vec![ContractCallArgs {
             contract_id: 0,
-            method_name: "simple_mint".to_string(),
+            method_name: "mint".to_string(),
             inputs: vec![100],
         }]),
         false,
@@ -59,12 +59,12 @@ async fn main() -> anyhow::Result<()> {
         ContractCallData::new(vec![
             ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![101],
             },
             ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![202],
             },
         ]),
@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         "deferred-transfer",
         ContractCallData::new(vec![ContractCallArgs {
             contract_id: 0,
-            method_name: "simple_transfer".to_string(),
+            method_name: "transfer".to_string(),
             inputs: vec![user1_id, 500],
         }]),
         false,
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         "deferred-claim",
         ContractCallData::new(vec![ContractCallArgs {
             contract_id: 0,
-            method_name: "simple_claim".to_string(),
+            method_name: "claim".to_string(),
             inputs: vec![user0_id],
         }]),
         false,

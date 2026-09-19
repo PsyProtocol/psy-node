@@ -56,7 +56,7 @@ fn a_method_the_owner_did_not_allow_may_not_act() {
         "agent",
         Limits { per_transaction: PSY, per_day: PSY, per_month: None, total_budget: None },
         None,
-        vec!["simple_transfer".into()], // x402_fetch deliberately absent
+        vec!["transfer".into()], // x402_fetch deliberately absent
     );
     let (t, _) = e.issue_session(&pid, 60, None).unwrap();
     let err = e.check_can_act(&t, "x402_fetch").unwrap_err().to_string();

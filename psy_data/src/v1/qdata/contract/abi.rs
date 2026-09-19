@@ -388,7 +388,7 @@ mod tests {
                     ],
                     "functions": [
                         {
-                            "name": "simple_mint",
+                            "name": "mint",
                             "params": [
                                 {
                                     "name": "amount",

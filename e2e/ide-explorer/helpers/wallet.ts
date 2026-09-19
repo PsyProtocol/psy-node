@@ -164,7 +164,7 @@ export async function prepareDeployUser(opts?: {
     "--contract-id",
     "0",
     "--method-name",
-    "simple_mint",
+    "mint",
     "--inputs",
     `[${amount}]`,
     "--wait-until-confirmation",

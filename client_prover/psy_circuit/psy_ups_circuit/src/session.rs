@@ -54,7 +54,7 @@ use psy_common_circuit::treeprover::qrecursion::standard::manager::portable::cor
 use psy_config::{
     network_constants::{
         DEFAULT_CALLER_CONTRACT_ID_U64, DEFERRED_TRANSACTION_TREE_HEIGHT, GUTA_FEE, INLINE_TRANSACTION_TREE_HEIGHT, TOKEN_CONTRACT_ID,
-        TOKEN_SIMPLE_BURN_METHOD_ID, UPS_SESSION_PROOF_TREE_HEIGHT,
+        TOKEN_BURN_METHOD_ID, UPS_SESSION_PROOF_TREE_HEIGHT,
     },
     DA_FEE,
 };
@@ -1327,7 +1327,7 @@ impl<
         tracing::info!("Adding burn transaction for DA fee: {}", total_da_fee);
 
         let (burn_fn_id, burn_fn_circuit_def) = self
-            .resolve_contract_function(TOKEN_CONTRACT_ID as u64, TOKEN_SIMPLE_BURN_METHOD_ID)
+            .resolve_contract_function(TOKEN_CONTRACT_ID as u64, TOKEN_BURN_METHOD_ID)
             .await?;
 
         let burn_contract_id = F::from_canonical_u64(TOKEN_CONTRACT_ID as u64);
@@ -1914,7 +1914,7 @@ impl<
         let total_da_fee = DA_FEE * total_slots_modified as u64;
 
         let (burn_fn_id, burn_fn_circuit_def) = self
-            .resolve_contract_function(TOKEN_CONTRACT_ID as u64, TOKEN_SIMPLE_BURN_METHOD_ID)
+            .resolve_contract_function(TOKEN_CONTRACT_ID as u64, TOKEN_BURN_METHOD_ID)
             .await?;
 
         let burn_contract_id = F::from_canonical_u64(TOKEN_CONTRACT_ID as u64);

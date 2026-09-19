@@ -213,8 +213,8 @@ const fmtPsy = n => {
   return v.toLocaleString(undefined,{maximumFractionDigits:6});
 };
 const METHOD = {
-  simple_transfer:'Send a payment', private_transfer:'Send a private payment',
-  simple_claim:'Claim a received payment', private_claim:'Claim a private payment',
+  transfer:'Send a payment', private_transfer:'Send a private payment',
+  claim:'Claim a received payment', private_claim:'Claim a private payment',
   claim_deposit:'Claim a deposit', deposit:'Add funds from Ethereum',
   withdraw:'Withdraw to Ethereum', x402_fetch:'Pay for an online resource',
 };
@@ -222,7 +222,7 @@ const methodLabel = m => METHOD[m] || m.replace(/_/g,' ');
 const ago = s => { s=Number(s)||0;
   if(s<60)return 'just now'; if(s<3600)return Math.floor(s/60)+' min ago';
   if(s<86400)return Math.floor(s/3600)+' hr ago'; return Math.floor(s/86400)+' d ago'; };
-const isInbound = m => ['simple_claim','private_claim','claim_deposit','deposit'].includes(m);
+const isInbound = m => ['claim','private_claim','claim_deposit','deposit'].includes(m);
 const recipLabel = r => (r==null||r==='self') ? 'your own wallet' : (/^\d+$/.test(String(r)) ? 'Psy-'+String(r).padStart(8,'0') : String(r));
 
 // ── data ──────────────────────────────────────────────────────────────
@@ -279,7 +279,7 @@ function initWiz(){
     perday:p.perDay!=null?(Number(p.perDay)/NANO):50,
     permonth:p.perMonth!=null?(Number(p.perMonth)/NANO):'',
     recips:[''],
-    methods:new Set((p.allowedMethods&&p.allowedMethods.length)?p.allowedMethods:['simple_transfer','private_transfer','simple_claim','private_claim','x402_fetch']),
+    methods:new Set((p.allowedMethods&&p.allowedMethods.length)?p.allowedMethods:['transfer','private_transfer','claim','private_claim','x402_fetch']),
     working:false};
 }
 const WIZ_STEPS=['Limits','Access','Review'];
@@ -306,7 +306,7 @@ function Onboarding(){
     <div class="field"><label>Monthly budget <span style="color:var(--tx4);font-weight:400">(optional)</span></label><div class="fh">A rolling 30-day cap. Leave blank for none.</div>
       <div class="inp"><input id="w_permonth" type="number" min="0" step="1" value="${wiz.permonth}"><span class="u">PSY</span></div></div>`;
   } else if(wiz.step===1){
-    const ALLM=['simple_transfer','private_transfer','simple_claim','private_claim','x402_fetch','deposit','claim_deposit','withdraw'];
+    const ALLM=['transfer','private_transfer','claim','private_claim','x402_fetch','deposit','claim_deposit','withdraw'];
     body=`
     <h2 class="sec">Who can it pay, and what can it do?</h2>
     <p class="hint">Add the Psy IDs it’s allowed to pay. Leave empty to let it pay anyone. Then choose which kinds of actions it can take.</p>
@@ -486,7 +486,7 @@ function meter(lbl,val,unit,pct,cls,ft){
 function Policy(){
   const p=S.policy;
   const recips = (p.allowedRecipientCount==null) ? [] : (p._recips||[]); // list not exposed by server → editable additively
-  const ALLM=['simple_transfer','private_transfer','simple_claim','private_claim','x402_fetch','deposit','claim_deposit','withdraw'];
+  const ALLM=['transfer','private_transfer','claim','private_claim','x402_fetch','deposit','claim_deposit','withdraw'];
   const on = new Set(p.allowedMethods||[]);
   return `
   <div class="card">

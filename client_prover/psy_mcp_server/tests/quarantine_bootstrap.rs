@@ -77,7 +77,7 @@ fn even_a_narrow_policy_is_gated_after_a_quarantine() {
     let dir = tmpdir("narrow");
     std::fs::write(&dir.join("policies.json"), b"garbage").unwrap();
     let e = PolicyEngine::load_or_new(&dir);
-    assert!(e.creation_widens(&narrow(), &Some(vec!["1234".into()]), &["simple_transfer".into()]).is_some());
+    assert!(e.creation_widens(&narrow(), &Some(vec!["1234".into()]), &["transfer".into()]).is_some());
 }
 
 #[test]
@@ -85,13 +85,13 @@ fn a_readable_file_restores_the_normal_comparison() {
     let dir = tmpdir("readable");
     {
         let mut e = PolicyEngine::load_or_new(&dir);
-        e.create_policy("a", narrow(), Some(vec!["1234".into()]), vec!["simple_transfer".into()]);
+        e.create_policy("a", narrow(), Some(vec!["1234".into()]), vec!["transfer".into()]);
     }
     let e = PolicyEngine::load_or_new(&dir);
     assert!(!e.lost_policies(), "a good file is not a loss");
     // Equivalent is fine, wider is not — the ordinary rule.
     assert!(e
-        .creation_widens(&narrow(), &Some(vec!["1234".into()]), &["simple_transfer".into()])
+        .creation_widens(&narrow(), &Some(vec!["1234".into()]), &["transfer".into()])
         .is_none());
     assert!(e.creation_widens(&wide(), &None, &[]).is_some());
 }

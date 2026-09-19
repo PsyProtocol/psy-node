@@ -95,9 +95,9 @@ USER1_ID                 := 1
 
 SDC_PATH                 := "sdc.json"
 SDC_FINGERPRINT          := "136ed39299c17a8cc4ea84e0b676e74c70d2a1668abaf346088d2df4087304c5"
-SD_KEY_FINGERPRINT      := "38755910c4dfb3c9bef528a4af697edced7e2607a6b769d054c4985a7000f0eb"
+SD_KEY_FINGERPRINT      := "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278"
 TRACE_FILE               ?= trace.json
-METHOD_NAME              ?= simple_transfer
+METHOD_NAME              ?= transfer
 TX_INPUTS                ?= [0, 11000000000]
 
 WITHDRAW_DEST_CHAIN_ID   ?= 1
@@ -150,7 +150,7 @@ deploy-contract:
 
 update-contract:
 	@echo "Updating contracts..."
-	@echo "USER0 update token contract(no simple_mint)..."
+	@echo "USER0 update token contract(no mint)..."
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) update-contract --private-key=${USER0_PRIVATE_KEY} --contract-path $(CURDIR)/../psy-genesis/token.update.json --old-abi-path $(CURDIR)/../psy-genesis/token.json --is-update --contract-id 6
 
 get-deploy-contract-cmd:
@@ -165,25 +165,25 @@ multi-contract-call:
 
 mint:
 	@echo "All users minting 1000 tokens..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_mint --inputs "[1000000000000]"
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name mint --inputs "[1000000000000]"
 
 transfer:
 	@echo "USER0 transferring 250 to USER1..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_transfer --inputs "[1, 250000000000]" --sign-type $(SIGN_TYPE)
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name transfer --inputs "[1, 250000000000]" --sign-type $(SIGN_TYPE)
 	@echo "USER1 transferring 250 to USER0..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER1_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_transfer --inputs "[0, 250000000000]" --sign-type $(SIGN_TYPE)
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER1_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name transfer --inputs "[0, 250000000000]" --sign-type $(SIGN_TYPE)
 
 claim:
 	@echo "USER1 claiming transfer..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER1_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_claim --inputs "[0]" --sign-type $(SIGN_TYPE)
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER1_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name claim --inputs "[0]" --sign-type $(SIGN_TYPE)
 	@echo "USER0 claiming transfer..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_claim --inputs "[$(USER1_ID)]" --sign-type $(SIGN_TYPE)
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name claim --inputs "[$(USER1_ID)]" --sign-type $(SIGN_TYPE)
 
 return-back:
 	@echo "USER1 transferring back to USER0..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER1_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_transfer --inputs "[0, 250000000000]" --sign-type $(SIGN_TYPE)
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER1_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name transfer --inputs "[0, 250000000000]" --sign-type $(SIGN_TYPE)
 	@echo "USER0 transferring back to USER1..."
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_transfer --inputs "[$(USER1_ID), 250000000000]" --sign-type $(SIGN_TYPE)
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name transfer --inputs "[$(USER1_ID), 250000000000]" --sign-type $(SIGN_TYPE)
 
 claim-rewards:
 	@RUST_LOG=info $(USER_CLI) claim-rewards --private-key ${USER0_PRIVATE_KEY} --jobs-file $(ROOT_DIR)/local_checkpoints/realm_worker_0.backup
@@ -281,7 +281,7 @@ register-sdc-user:
 	@$(USER_CLI) register-user --private-key ${USER0_PRIVATE_KEY} --fingerprint ${SDC_FINGERPRINT} --sign-type "software-defined-dpn"
 
 mint-sdc:
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_mint --inputs "[1000000000000]" --sign-type "software-defined-dpn" --fingerprint ${SDC_FINGERPRINT}
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name mint --inputs "[1000000000000]" --sign-type "software-defined-dpn" --fingerprint ${SDC_FINGERPRINT}
 
 get-endcap-common-data:
 	@$(USER_CLI) get-user-end-cap-common-data
@@ -292,8 +292,8 @@ get-sd-key-fingerprint:
 		--allowed-contract-id 0 \
 		--allowed-contract-id 0 \
     	--allowed-method-id 3375543263 \
-		--allowed-method-id 354447671 \
-		--allowed-method-id 2923993647 \
+		--allowed-method-id 2789897329 \
+		--allowed-method-id 3998182541 \
 		--expected-tx-count 3
 
 make register-sd-key-user:
@@ -311,8 +311,8 @@ faucet:
 		--sd-key-allowed-contract-id 0 \
 		--sd-key-allowed-contract-id 0 \
     	--sd-key-allowed-method-id 3375543263 \
-		--sd-key-allowed-method-id 354447671 \
-		--sd-key-allowed-method-id 2923993647 \
+		--sd-key-allowed-method-id 2789897329 \
+		--sd-key-allowed-method-id 3998182541 \
     	--sd-key-expected-tx-count 3 \
     	--contract-id 5 \
     	--method-name faucet \
@@ -327,18 +327,18 @@ error-faucet:
 		--sd-key-allowed-contract-id 0 \
 		--sd-key-allowed-contract-id 0 \
     	--sd-key-allowed-method-id 3375543263 \
-		--sd-key-allowed-method-id 354447671 \
-		--sd-key-allowed-method-id 2923993647 \
+		--sd-key-allowed-method-id 2789897329 \
+		--sd-key-allowed-method-id 3998182541 \
     	--sd-key-expected-tx-count 3 \
     	--contract-id 0 \
-    	--method-name simple_transfer \
+    	--method-name transfer \
     	--inputs '[0, 666000000000]' \
 		--contract-id 0 \
-    	--method-name simple_transfer \
+    	--method-name transfer \
     	--inputs '[0, 334000000000]' 
 
 claim-faucet:
-	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_claim --inputs "[262144]" --sign-type $(SIGN_TYPE)
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name claim --inputs "[262144]" --sign-type $(SIGN_TYPE)
 
 ################################################################################
 #                          Trace generation & proving                           #
@@ -346,13 +346,13 @@ claim-faucet:
 # Variables (override on command line):
 #   TRACE_FILE   — path to trace JSON          (default: trace.json)
 #   CONTRACT_ID  — contract to call            (default: 0)
-#   METHOD_NAME  — method to call              (default: simple_mint)
+#   METHOD_NAME  — method to call              (default: mint)
 #   TX_INPUTS    — JSON array of u64 inputs    (default: [1000000000000])
 #
 # Multicall example (two CFC steps):
 #   make generate-trace \
 #     CONTRACT_ID="0 --contract-id 0" \
-#     METHOD_NAME="simple_mint --method-name simple_transfer" \
+#     METHOD_NAME="mint --method-name transfer" \
 #     TX_INPUTS="[1000000000000] --inputs [1,250000000000]"
 
 # Generate an unproved trace from a contract call.

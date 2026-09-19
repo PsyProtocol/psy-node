@@ -33,7 +33,7 @@ fn spent(e: &mut PolicyEngine, pid: &str) -> u64 {
 #[test]
 fn an_authorized_spend_is_not_marked_refunded() {
     let (mut e, _pid, tok) = engine();
-    e.authorize(&tok, "alice", 5 * PSY, "simple_transfer").unwrap();
+    e.authorize(&tok, "alice", 5 * PSY, "transfer").unwrap();
     let log = e.spend_log(10, None);
     assert_eq!(log.len(), 1);
     assert!(!log[0].refunded, "a spend that stands must not look refunded");
@@ -42,7 +42,7 @@ fn an_authorized_spend_is_not_marked_refunded() {
 #[test]
 fn a_refunded_single_payment_is_marked_in_the_log() {
     let (mut e, pid, tok) = engine();
-    let auth = e.authorize(&tok, "alice", 5 * PSY, "simple_transfer").unwrap();
+    let auth = e.authorize(&tok, "alice", 5 * PSY, "transfer").unwrap();
     e.refund(&auth, 5 * PSY);
     assert_eq!(spent(&mut e, &pid), 0, "budget restored");
     let log = e.spend_log(10, None);
@@ -55,7 +55,7 @@ fn every_leg_of_a_refunded_batch_is_marked() {
     // The live case: 2 legs authorized, submission failed, whole total refunded.
     let (mut e, pid, tok) = engine();
     let auth = e
-        .authorize_batch(&tok, &[("alice", 5 * PSY), ("bob", 3 * PSY)], "simple_transfer")
+        .authorize_batch(&tok, &[("alice", 5 * PSY), ("bob", 3 * PSY)], "transfer")
         .unwrap();
     assert_eq!(spent(&mut e, &pid), 8 * PSY);
     e.refund(&auth, 8 * PSY);
@@ -68,8 +68,8 @@ fn every_leg_of_a_refunded_batch_is_marked() {
 #[test]
 fn a_refund_does_not_touch_an_unrelated_earlier_spend() {
     let (mut e, pid, tok) = engine();
-    e.authorize(&tok, "alice", 5 * PSY, "simple_transfer").unwrap();
-    let second = e.authorize(&tok, "bob", 2 * PSY, "simple_transfer").unwrap();
+    e.authorize(&tok, "alice", 5 * PSY, "transfer").unwrap();
+    let second = e.authorize(&tok, "bob", 2 * PSY, "transfer").unwrap();
     e.refund(&second, 2 * PSY);
     assert_eq!(spent(&mut e, &pid), 5 * PSY, "only the failed one comes back");
     let log = e.spend_log(10, None);
@@ -82,8 +82,8 @@ fn a_refund_does_not_touch_an_unrelated_earlier_spend() {
 #[test]
 fn refunding_twice_does_not_hand_the_budget_back_twice() {
     let (mut e, pid, tok) = engine();
-    e.authorize(&tok, "carol", 10 * PSY, "simple_transfer").unwrap();
-    let auth = e.authorize(&tok, "alice", 5 * PSY, "simple_transfer").unwrap();
+    e.authorize(&tok, "carol", 10 * PSY, "transfer").unwrap();
+    let auth = e.authorize(&tok, "alice", 5 * PSY, "transfer").unwrap();
     e.refund(&auth, 5 * PSY);
     e.refund(&auth, 5 * PSY);
     assert_eq!(spent(&mut e, &pid), 10 * PSY, "carol's spend must survive a double refund");
@@ -92,7 +92,7 @@ fn refunding_twice_does_not_hand_the_budget_back_twice() {
 #[test]
 fn spend_rows_carry_distinct_ids() {
     let (mut e, _pid, tok) = engine();
-    e.authorize_batch(&tok, &[("alice", 1 * PSY), ("bob", 1 * PSY), ("carol", 1 * PSY)], "simple_transfer")
+    e.authorize_batch(&tok, &[("alice", 1 * PSY), ("bob", 1 * PSY), ("carol", 1 * PSY)], "transfer")
         .unwrap();
     let log = e.spend_log(10, None);
     let mut ids: Vec<u64> = log.iter().map(|r| r.id).collect();
