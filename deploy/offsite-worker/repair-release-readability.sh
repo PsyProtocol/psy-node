@@ -70,7 +70,15 @@ stop_on_failure() {
   exit "$rc"
 }
 trap stop_on_failure EXIT
-sudo systemctl reset-failed "${units[@]}"
+sudo systemctl daemon-reload
+for unit in "${units[@]}"; do
+  [ "$(systemctl show "$unit" -p LoadState --value)" = loaded ] || {
+    echo "Unit is not loadable: $unit" >&2; exit 1;
+  }
+  if systemctl is-failed --quiet "$unit"; then
+    sudo systemctl reset-failed "$unit"
+  fi
+done
 sudo systemctl enable --now "${units[@]}"
 if [ "$role" = proxy ]; then
   deadline=$((SECONDS + 1200))
