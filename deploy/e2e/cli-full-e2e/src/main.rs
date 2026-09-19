@@ -925,6 +925,8 @@ impl Runner {
                     self.contracts.token_faucet.clone().into(),
                     "claim(address)".into(),
                     token.l1_address.clone().into(),
+                    "--confirmations".into(),
+                    "2".into(),
                     "--private-key".into(),
                     self.e_key.clone().into(),
                     "--rpc-url".into(),
@@ -936,8 +938,18 @@ impl Runner {
             let receipt: Value =
                 serde_json::from_str(&captured.stdout).context("cast send did not return JSON")?;
             ensure!(receipt_status_success(&receipt), "token faucet receipt failed");
-            let after = erc20_balance(&token.l1_address, &self.e_address, &self.l1_rpc_url)?;
-            ensure!(after > before, "{} faucet did not increase balance", token.symbol);
+            // A successful preconfirmed receipt can precede the RPC's latest state.
+            // Poll reads only; never resubmit the faucet transaction.
+            let started = Instant::now();
+            let after = loop {
+                let balance = erc20_balance(&token.l1_address, &self.e_address, &self.l1_rpc_url)?;
+                if balance > before {
+                    break balance;
+                }
+                ensure!(started.elapsed() < Duration::from_secs(60),
+                    "{} faucet did not increase balance within 60s", token.symbol);
+                thread::sleep(Duration::from_secs(2));
+            };
             Ok(json!({
                 "token": token.symbol,
                 "token_address": token.l1_address,
@@ -1517,6 +1529,8 @@ impl Runner {
                     "approve(address,uint256)(bool)".into(),
                     target.into(),
                     amount.to_string().into(),
+                    "--confirmations".into(),
+                    "2".into(),
                     "--private-key".into(),
                     self.e_key.clone().into(),
                     "--rpc-url".into(),
@@ -1527,17 +1541,24 @@ impl Runner {
             )?;
             let receipt: Value = serde_json::from_str(&captured.stdout)?;
             ensure!(receipt_status_success(&receipt), "approval receipt failed");
-            let allowance = self.cast(&[
-                "call",
-                &token.l1_address,
-                "allowance(address,address)(uint256)",
-                &self.e_address,
-                target,
-                "--rpc-url",
-                &self.l1_rpc_url,
-            ])?;
-            let allowance = parse_first_u128(&allowance.stdout)?;
-            ensure!(allowance >= token.deposit_amount, "allowance is too small");
+            let started = Instant::now();
+            let allowance = loop {
+                let response = self.cast(&[
+                    "call",
+                    &token.l1_address,
+                    "allowance(address,address)(uint256)",
+                    &self.e_address,
+                    target,
+                    "--rpc-url",
+                    &self.l1_rpc_url,
+                ])?;
+                let allowance = parse_first_u128(&response.stdout)?;
+                if allowance >= token.deposit_amount {
+                    break allowance;
+                }
+                ensure!(started.elapsed() < Duration::from_secs(60), "allowance is too small after 60s");
+                thread::sleep(Duration::from_secs(2));
+            };
             Ok(json!({
                 "token": token.symbol,
                 "spender": target,
