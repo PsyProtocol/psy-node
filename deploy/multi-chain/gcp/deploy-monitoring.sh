@@ -78,7 +78,9 @@ if [[ "$mode" == --apply ]]; then
   done
   "$binaries/psy-notifier-controller" config validate --config "$SENTINEL_CONTROLLER_CONFIG"
   bash "$repo/deploy/staging/deploy-wireguard-forward.sh" --apply
-  bash "$repo/deploy/staging/deploy-staging-all.sh" --skip-build --controller-only --apply
+  # The fleet wrapper checks every collector even in controller-only mode.
+  # Install/verify the Controller independently before staging the collectors.
+  bash "$repo/deploy/staging/deploy-staging-controller.sh" --skip-build --apply
   expected_sha="$(sha256sum "$binaries/psy-notifier-collector" | awk '{print $1}')"
   for host in "${hosts[@]}"; do
     case "$host" in arc99x3|arc99x4) continue ;; esac

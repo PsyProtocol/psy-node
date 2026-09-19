@@ -20,7 +20,8 @@ for script in deploy-staging-all.sh deploy-staging-controller.sh deploy-wireguar
 name="$(basename "$0")"
 [[ -n "$*" || "$name" == status-staging.sh ]] || exit 0
 echo "$name $*" >> "$TEST_CALLS"
-if [[ "$name" == deploy-staging-all.sh && "${TEST_FLEET_FAIL:-0}" == 1 ]]; then exit 17; fi
+if [[ "$name" == deploy-staging-all.sh && " $* " == *' --apply '* ]]; then exit 18; fi
+if [[ "$name" == deploy-staging-controller.sh && "${TEST_CONTROLLER_FAIL:-0}" == 1 ]]; then exit 17; fi
 SH
 done
 git -C "$repo" init -q
@@ -87,7 +88,8 @@ apply_rc=0
 bash "$runner" --apply > "$tmp/apply.log" || apply_rc=$?
 [ "$apply_rc" = 3 ]
 [ "$(grep -c '^validate$' "$TEST_CALLS")" = 12 ]
-grep -q '^deploy-staging-all.sh --skip-build --controller-only --apply$' "$TEST_CALLS"
+grep -q '^deploy-staging-controller.sh --skip-build --apply$' "$TEST_CALLS"
+if grep -q '^deploy-staging-all.sh ' "$TEST_CALLS"; then exit 1; fi
 [ "$(grep -c '^deploy-collector.sh ' "$TEST_CALLS")" = 9 ]
 [ "$(grep -c '^checksum-query$' "$TEST_CALLS")" = 9 ]
 [ "$(grep -c '^prepare-offsite-collector.sh ' "$TEST_CALLS")" = 2 ]
@@ -106,7 +108,9 @@ if TEST_CREDENTIAL_EXIT=5 bash "$runner" --apply > /dev/null 2>&1; then exit 1; 
 : > "$TEST_CALLS"
 if TEST_BUILD_EXIT=6 bash "$runner" --apply > /dev/null 2>&1; then exit 1; fi
 if grep -q '^deploy-' "$TEST_CALLS"; then exit 1; fi
-if TEST_FLEET_FAIL=1 bash "$runner" --apply > /dev/null 2>&1; then exit 1; fi
+: > "$TEST_CALLS"
+if TEST_CONTROLLER_FAIL=1 bash "$runner" --apply > /dev/null 2>&1; then exit 1; fi
+if grep -Eq '^(deploy-collector|prepare-offsite-collector)\.sh ' "$TEST_CALLS"; then exit 1; fi
 
 accepts() { jq -e --argjson hosts "$hosts_json" --argjson now "$now" -f "$filter" >/dev/null; }
 accepts < "$TEST_HEALTH"
