@@ -32,6 +32,14 @@ hosts=(gcp-cp-ce gcp-coordinator-worker gcp-faucet gcp-postgres gcp-scylla
 for host in "${hosts[@]}"; do
   [[ -f "$repo/config/staging/collectors/$host.toml" ]] || fail "missing collector inventory: $host"
 done
+collector_config() {
+  if [[ "$1" == arc99x3 ]]; then
+    printf '%s' "$PROFILE/monitoring-arc99x3.toml"
+  else
+    printf '%s' "$repo/config/staging/collectors/$1.toml"
+  fi
+}
+[[ -f "$(collector_config arc99x3)" ]] || fail 'missing dual-role collector inventory'
 for script in deploy-staging-all.sh deploy-staging-controller.sh deploy-wireguard-forward.sh status-staging.sh; do
   bash -n "$repo/deploy/staging/$script"
 done
@@ -66,13 +74,31 @@ if [[ "$mode" == --apply ]]; then
     cargo build --workspace --release --locked
   binaries="$repo/target/bookworm/release"
   for host in "${hosts[@]}"; do
-    "$binaries/psy-notifier-collector" config validate --config "$repo/config/staging/collectors/$host.toml"
+    "$binaries/psy-notifier-collector" config validate --config "$(collector_config "$host")"
   done
   "$binaries/psy-notifier-controller" config validate --config "$SENTINEL_CONTROLLER_CONFIG"
   bash "$repo/deploy/staging/deploy-wireguard-forward.sh" --apply
-  # Upstream verifies installed checksums and uses an interactive SSH PTY for
-  # offsite sudo. No --test-slack: real notification tests need separate consent.
-  bash "$repo/deploy/staging/deploy-staging-all.sh" --skip-build --apply
+  bash "$repo/deploy/staging/deploy-staging-all.sh" --skip-build --controller-only --apply
+  expected_sha="$(sha256sum "$binaries/psy-notifier-collector" | awk '{print $1}')"
+  for host in "${hosts[@]}"; do
+    case "$host" in arc99x3|arc99x4) continue ;; esac
+    bash "$repo/deploy/staging/deploy-collector.sh" --host "$host" \
+      --config "$(collector_config "$host")" \
+      --controller-endpoint "$SENTINEL_CONTROLLER_GCP_ENDPOINT" \
+      --binary "$binaries/psy-notifier-collector" --apply
+    actual_sha="$(ssh -F "$SSH_CONFIG" -o BatchMode=yes "$host" \
+      sha256sum /usr/local/bin/psy-notifier-collector | awk '{print $1}')"
+    [[ "$actual_sha" == "$expected_sha" ]] || fail "collector binary mismatch on $host"
+  done
+  for host in arc99x3 arc99x4; do
+    bash "$repo/deploy/staging/prepare-offsite-collector.sh" --host "$host" \
+      --config "$(collector_config "$host")" \
+      --controller-endpoint "$SENTINEL_CONTROLLER_OFFSITE_ENDPOINT" \
+      --binary "$binaries/psy-notifier-collector"
+    printf "[monitoring] user action: ssh -t %s 'cd ~/psy-notifier-install && sudo ./install-collector.sh ./psy-notifier-collector ./collector.toml ./parth-sentinel-collector.service'\n" "$host"
+  done
+  echo '[monitoring] PENDING: cloud installed; offsite packages staged, not activated. Run --status after user installation.'
+  exit 3
 fi
 
 bash "$repo/deploy/staging/status-staging.sh"

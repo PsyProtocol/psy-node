@@ -1,0 +1,42 @@
+schema_version = 1
+
+[collector]
+id = "arc99x3"
+environment = "staging"
+hostname = "arc99x3"
+labels = { region = "offsite", role = "prove-proxy" }
+
+[controller]
+endpoint = "http://10.250.0.1:9443"
+
+[spool]
+path = "/var/lib/parth-sentinel-collector/spool.db"
+max_size = "512MiB"
+retention = "24h"
+
+[[targets]]
+id = "arc99x3-host"
+kind = "host"
+
+[[targets.probes]]
+id = "host-resources"
+kind = "host"
+interval = "30s"
+
+[[targets]]
+id = "offsite-prove-proxy"
+kind = "prove_proxy"
+
+[[targets.services]]
+id = "prove-proxy-user"
+unit = "parth-prove-proxy@user.service"
+[targets.services.logs]
+source = "journald"
+unit = "parth-prove-proxy@user.service"
+
+[[targets.services]]
+id = "prove-proxy-system"
+unit = "parth-prove-proxy@system.service"
+[targets.services.logs]
+source = "journald"
+unit = "parth-prove-proxy@system.service"

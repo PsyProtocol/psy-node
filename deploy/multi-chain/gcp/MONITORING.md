@@ -12,6 +12,8 @@ Its exact published commit is pinned in `source-versions.env`.
 - Nine GCP collectors: cp-ce, coordinator-worker, faucet, postgres, scylla,
   nats, redis, nostr and gateway (SSH aliases carry the `gcp-` prefix).
 - Two offsite collectors: `arc99x4` workers and `arc99x3` prove-proxy.
+  The deployment-owned `monitoring-arc99x3.toml` watches both
+  `parth-prove-proxy@user.service` and `parth-prove-proxy@system.service`.
 - Offsite reporting: existing WireGuard gateway `10.250.0.1:9443`, forwarded
   only to the Controller. No public monitoring endpoint is created.
 - Existing `parth-sentinel-*` systemd names, users and persistent paths remain
@@ -45,8 +47,9 @@ source validation happens before the runner stops business services. Full
    root-only configuration to obtain current RPCs and the existing signer.
    It does not use historical hard-coded provider credentials.
 3. Keep sudo access on GCP hosts and an interactive terminal for offsite sudo.
-   The existing installer prompts once per offsite host; a missing password
-   or failed installation fails step 32, not a successful "staged" result.
+   Apply stages the offsite packages and returns exit code 3 (PENDING).
+   The user runs the printed installation commands; the agent never handles
+   offsite sudo passwords. Step 32 is not recorded as SUCCEEDED at this point.
 4. The Bookworm builder image must contain Rust 1.97.1, matching the reviewed
    Notifier portable build. The adapter builds locked release binaries before
    touching monitoring services, with configurable home/cache paths.
@@ -74,15 +77,26 @@ bash deploy/multi-chain/gcp/deploy-monitoring.sh --apply
 
 Apply builds both binaries in Bookworm, validates all eleven collector configs
 and the Controller config, installs the private gateway forwarder, then invokes
-the pinned fleet installer. That installer checks deployed binary checksums
-and service activation. Finally, this adapter requires:
+the pinned Controller and nine cloud Collector installers with checksum checks.
+It stages, but does not activate, the two offsite packages and exits 3. Run:
+
+```bash
+ssh -t arc99x3 'cd ~/psy-notifier-install && sudo ./install-collector.sh ./psy-notifier-collector ./collector.toml ./parth-sentinel-collector.service'
+ssh -t arc99x4 'cd ~/psy-notifier-install && sudo ./install-collector.sh ./psy-notifier-collector ./collector.toml ./parth-sentinel-collector.service'
+bash deploy/multi-chain/gcp/deploy-monitoring.sh --status
+```
+
+Only the final read-only status check accepts fleet readiness. Keep its output
+beside the original step-32 PENDING receipt; do not rewrite that receipt.
+It requires:
 
 - Controller `ready=true`;
 - healthy probes for exactly Sepolia 11155111, BSC 97 and Base Sepolia 84532;
 - all eleven expected staging collectors observed within the last 120 seconds
   (clock synchronization is required; future timestamps beyond 30s fail).
 
-If those checks fail, the step exits nonzero and the runner records `FAILED`.
+If those checks fail, the standalone status command exits nonzero; the original
+step-32 receipt remains `PENDING` until readiness is established separately.
 Do not rerun destructive steps: diagnose and retry only monitoring. A healthy
 transport does not mean no incidents exist. Review firing incidents/outbox
 separately. The pinned configuration enables Slack and has a dry-run PagerDuty

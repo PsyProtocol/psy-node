@@ -208,6 +208,11 @@ for id in "${selected[@]}"; do
   result="${pipeline_status[0]}"
   [ "$result" != "0" ] || result="${pipeline_status[1]}"
   elapsed="$(( $(date +%s) - started ))"
+  if [ "$id" = "32" ] && [ "$result" = "3" ] && [ "${pipeline_status[1]}" = "0" ]; then
+    printf '%s\tPENDING\t3\t%s\t%s\n' "$id" "$elapsed" "$step_log" >> "$status_file"
+    echo '[multichain-deploy] PENDING 32: finish offsite monitoring installation, then run deploy-monitoring.sh --status' >&2
+    exit 3
+  fi
   if [ "$result" != "0" ]; then
     printf '%s\tFAILED\t%s\t%s\t%s\n' "$id" "$result" "$elapsed" "$step_log" >> "$status_file"
     echo "[multichain-deploy] FAILED $id (exit=$result); inspect $step_log" >&2

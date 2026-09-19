@@ -14,7 +14,7 @@ for host in "${hosts[@]}"; do
 done
 touch "$tmp/ssh-config" "$repo/config/staging/controller.wallet-slack-test.toml"
 printf 'target/\n' > "$repo/.gitignore"
-for script in deploy-staging-all.sh deploy-staging-controller.sh deploy-wireguard-forward.sh status-staging.sh; do
+for script in deploy-staging-all.sh deploy-staging-controller.sh deploy-wireguard-forward.sh status-staging.sh deploy-collector.sh prepare-offsite-collector.sh; do
   cat > "$repo/deploy/staging/$script" <<'SH'
 #!/usr/bin/env bash
 name="$(basename "$0")"
@@ -48,6 +48,11 @@ if [[ "$*" == *'test -s'* ]]; then
   echo credentials-check >> "$TEST_CALLS"
   exit "${TEST_CREDENTIAL_EXIT:-0}"
 fi
+if [[ "$*" == *'sha256sum /usr/local/bin/psy-notifier-collector'* ]]; then
+  echo checksum-query >> "$TEST_CALLS"
+  printf '%s  binary\n' "${TEST_BAD_SHA:-$TEST_COLLECTOR_SHA}"
+  exit 0
+fi
 echo status-query >> "$TEST_CALLS"
 cat "$TEST_HEALTH"
 SH
@@ -63,6 +68,8 @@ echo validate >> "$TEST_CALLS"
 SH
   chmod +x "$repo/target/bookworm/release/psy-notifier-$role"
 done
+export TEST_COLLECTOR_SHA
+TEST_COLLECTOR_SHA="$(sha256sum "$repo/target/bookworm/release/psy-notifier-collector" | awk '{print $1}')"
 chmod +x "$tmp/bin/"*
 export PATH="$tmp/bin:$PATH" GCP_DEPLOY_CONFIG="$tmp/config.env" DEPLOY_SOURCE_VERSIONS_FILE="$tmp/pins.env"
 runner="$ROOT/deploy/multi-chain/gcp/deploy-monitoring.sh"
@@ -76,11 +83,19 @@ jq -n --argjson hosts "$hosts_json" --argjson now "$now" '{ready:true,evm_all_he
 
 bash "$runner" --check > "$tmp/check.log"
 [ ! -e "$TEST_CALLS" ]
-bash "$runner" --apply > "$tmp/apply.log"
+apply_rc=0
+bash "$runner" --apply > "$tmp/apply.log" || apply_rc=$?
+[ "$apply_rc" = 3 ]
 [ "$(grep -c '^validate$' "$TEST_CALLS")" = 12 ]
-grep -q '^deploy-staging-all.sh --skip-build --apply$' "$TEST_CALLS"
+grep -q '^deploy-staging-all.sh --skip-build --controller-only --apply$' "$TEST_CALLS"
+[ "$(grep -c '^deploy-collector.sh ' "$TEST_CALLS")" = 9 ]
+[ "$(grep -c '^checksum-query$' "$TEST_CALLS")" = 9 ]
+[ "$(grep -c '^prepare-offsite-collector.sh ' "$TEST_CALLS")" = 2 ]
+grep -q 'monitoring-arc99x3.toml' "$TEST_CALLS"
 grep -q '^deploy-wireguard-forward.sh --apply$' "$TEST_CALLS"
-grep -q 'PASS: Controller ready' "$tmp/apply.log"
+grep -q 'PENDING: cloud installed' "$tmp/apply.log"
+if grep -q 'PASS: Controller ready' "$tmp/apply.log"; then exit 1; fi
+if TEST_BAD_SHA=bad bash "$runner" --apply > /dev/null 2>&1; then exit 1; fi
 
 : > "$TEST_CALLS"
 bash "$runner" --status > "$tmp/status.log"

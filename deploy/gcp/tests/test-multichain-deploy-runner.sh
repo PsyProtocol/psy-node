@@ -50,6 +50,7 @@ step="${step%%_*}"
 echo "$step" >> "$TEST_CALLS"
 echo "step=$step"
 if [ "$step" = "${TEST_FAIL_STEP:-}" ]; then exit 7; fi
+if [ "$step" = "32" ] && [ "${TEST_MONITOR_PENDING:-0}" = 1 ]; then exit 3; fi
 SH
 done < "$profile/steps.tsv"
 
@@ -123,6 +124,13 @@ if TEST_MONITORING_CHECK_EXIT=6 bash "$runner" > /dev/null 2>&1; then exit 1; fi
 if TEST_FAIL_STEP=32 bash "$runner" --from 31 > "$tmp/monitor-failure" 2>&1; then exit 1; fi
 grep -q 'FAILED 32' "$tmp/monitor-failure"
 [ "$(grep -E '^[0-9]{2}$' "$TEST_CALLS" | paste -sd, -)" = '31,32' ]
+pending_rc=0
+TEST_MONITOR_PENDING=1 bash "$runner" --only 32 > "$tmp/monitor-pending" 2>&1 || pending_rc=$?
+[ "$pending_rc" = 3 ]
+grep -q 'PENDING 32' "$tmp/monitor-pending"
+pending_dir="$(sed -n 's/^\[multichain-deploy\] logs: //p' "$tmp/monitor-pending")"
+awk -F '\t' '$1 == "32" && $2 == "PENDING" && $3 == "3" {found=1} END {exit !found}' "$pending_dir/status.tsv"
+if grep -q SUCCEEDED "$pending_dir/status.tsv"; then exit 1; fi
 DEPLOY_MONITORING=0 bash "$runner" --plan > "$tmp/no-monitor"
 if grep -q '^32  ' "$tmp/no-monitor"; then exit 1; fi
 grep -q 'monitoring explicitly disabled' "$tmp/no-monitor"
