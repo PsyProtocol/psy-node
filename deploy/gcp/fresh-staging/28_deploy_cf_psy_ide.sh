@@ -25,7 +25,7 @@ trap 'restore_tracked_node_modules "$FRONTEND_DIR"' EXIT
 }
 
 log_step "deploying Cloudflare Pages project ${PROJECT_NAME}"
-if [ "${BUILD_LOCAL_PSY_SDK:-0}" = "1" ]; then
+if [ "${BUILD_LOCAL_PSY_SDK:-0}" = "1" ] && [ -z "${PSY_FRONTEND_SDK_ARCHIVE:-}" ]; then
   echo "[28_deploy_cf_psy_ide.sh] building local @psy-protocol/psy-sdk package in $PSY_SDK_PACKAGE_DIR"
   (
     cd "$PSY_SDK_PACKAGE_DIR"

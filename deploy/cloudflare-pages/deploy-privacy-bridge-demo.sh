@@ -277,7 +277,7 @@ if ! is_truthy "$PSY_FAUCET_SERVER_MODE" && [ "$GENERATE_PRIVACY_FAUCET_OPERATOR
   echo "[cloudflare-pages] generated local Psy faucet operator config: operators=$faucet_operator_count"
 fi
 
-if [ "${BUILD_LOCAL_PSY_SDK:-0}" = "1" ]; then
+if [ "${BUILD_LOCAL_PSY_SDK:-0}" = "1" ] && [ -z "${PSY_FRONTEND_SDK_ARCHIVE:-}" ]; then
   echo "[cloudflare-pages] building local @psy/psy-sdk package in $PSY_SDK_PACKAGE_DIR"
   (
     cd "$PSY_SDK_PACKAGE_DIR"
@@ -301,7 +301,7 @@ fi
 
 echo "[cloudflare-pages] demo L1 config: router=$VITE_L1_ROUTER_ADDRESS erc20_gateway=$VITE_L1_ERC20_GATEWAY_ADDRESS usdt=$VITE_USDT_TOKEN_ADDRESS"
 
-if [ "${BUILD_LOCAL_PSY_SDK:-0}" = "1" ]; then
+if [ "${BUILD_LOCAL_PSY_SDK:-0}" = "1" ] && [ -z "${PSY_FRONTEND_SDK_ARCHIVE:-}" ]; then
   CF_PAGES_SKIP_INSTALL=1 build_frontend_dir "$FRONTEND_DIR" "psy-privacy-bridge-demo"
 else
   build_frontend_dir "$FRONTEND_DIR" "psy-privacy-bridge-demo"

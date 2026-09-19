@@ -410,7 +410,12 @@ if has_step 21 && is_truthy "${INCLUDE_WALLET_DOWNLOAD:-0}"; then
   verify_clean_git_source "psy-wallet" "$psy_wallet_dir" "$EXPECTED_PSY_WALLET_COMMIT" exact
 fi
 
-if has_step 28 && is_truthy "${BUILD_LOCAL_PSY_SDK:-1}"; then
+if has_any_step 21 26 28 30 && [ -n "${PSY_FRONTEND_SDK_ARCHIVE:-}" ]; then
+  : "${PSY_FRONTEND_SDK_SHA256:?pinned frontend SDK SHA256 is required}"
+  [ -f "$PSY_FRONTEND_SDK_ARCHIVE" ] || { echo "missing frontend SDK archive" >&2; exit 1; }
+  [ "$(sha256sum "$PSY_FRONTEND_SDK_ARCHIVE" | awk '{print $1}')" = "$PSY_FRONTEND_SDK_SHA256" ] \
+    || { echo "frontend SDK archive SHA256 mismatch" >&2; exit 1; }
+elif has_step 28 && is_truthy "${BUILD_LOCAL_PSY_SDK:-1}"; then
   require_cmd git
   psy_sdk_dir="${PSY_SDK_DIR:-$WORKSPACE_HOME/psy-sdk}"
   : "${EXPECTED_PSY_SDK_REPOSITORY:?missing from deploy/source-versions.env}"

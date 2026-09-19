@@ -83,7 +83,7 @@ echo "  PSY_CONFIG_URL=$PSY_CONFIG_URL"
 echo "  config=$PSY_DAPP_DIR/psy-genesis/config.json"
 
 if command -v jq >/dev/null 2>&1; then
-  jq -e --arg network "$VITE_L1_NETWORK" '
+  jq -e --arg network "$VITE_PSY_STAGE" '
     def first_url($v): if ($v | type) == "array" then $v[0] else $v end;
     .networks[$network] as $n
     | if $n == null then false else
@@ -95,7 +95,7 @@ if command -v jq >/dev/null 2>&1; then
       and all($n.realm_configs[]; ((.rpc_url[0] // "") | test("^https://")))
       end
   ' "$PSY_DAPP_DIR/psy-genesis/config.json" >/dev/null || {
-    echo "selected explorer config '$VITE_L1_NETWORK' is missing endpoints" >&2
+    echo "selected explorer Psy stage '$VITE_PSY_STAGE' is missing endpoints" >&2
     exit 1
   }
 
