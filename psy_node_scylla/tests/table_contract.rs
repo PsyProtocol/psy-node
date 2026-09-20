@@ -156,19 +156,29 @@ async fn kiv_batch_variants_return_values_in_requested_order() -> anyhow::Result
     let t = s.init_std_table::<ScyllaGenericKeyIdValueTablePreparedStatements>("objects", routing()).await?;
     assert!(t.select_one_kiv_value_and_ids::<u64>(&s.session, 1).await?.is_none());
     assert!(t.select_one_kiv_value_and_ids_t::<u64, QDatabaseKeyIdValueTableRow<u64>>(&s.session, 1).await?.is_none());
-    let rows: Vec<_> = (1..=129).map(|i| QDatabaseKeyIdValueTableRow { obj_id: i, value: i * 10 }).collect();
-    t.insert_many_kivs(&s.session, &rows).await?;
-    t.insert_many_kivs_t::<u64, _>(&s.session, &rows).await?;
-    t.insert_many_kiv_rows_t::<u64, _>(&s.session, &rows).await?;
+    // Disjoint IDs and immediate readback prevent one writer masking another.
+    for (variant, offset) in [(0, 0u64), (1, 1000), (2, 2000)] {
+        let rows: Vec<_> = (1..=129).map(|i| QDatabaseKeyIdValueTableRow { obj_id: offset + i, value: (offset + i) * 10 }).collect();
+        match variant {
+            0 => t.insert_many_kivs(&s.session, &rows).await?,
+            1 => t.insert_many_kivs_t::<u64, _>(&s.session, &rows).await?,
+            _ => t.insert_many_kiv_rows_t::<u64, _>(&s.session, &rows).await?,
+        }
+        let keys: Vec<_> = rows.iter().rev().map(|r| r.obj_id).collect();
+        assert_eq!(t.select_many_kiv_values::<u64>(&s.session, &keys).await?, rows.iter().rev().map(|r| Some(r.value)).collect::<Vec<_>>(), "writer variant {variant}");
+    }
     t.insert_one_kiv(&s.session, 130, &1300u64).await?;
     assert_eq!(t.select_one_kiv_value_and_ids::<u64>(&s.session, 1).await?.unwrap().value, 10);
-    assert_eq!(t.select_one_kiv_value_and_ids_t::<u64, QDatabaseKeyIdValueTableRow<u64>>(&s.session, 129).await?.unwrap().obj_id, 129);
-    assert_eq!(t.select_many_kiv_values::<u64>(&s.session, &[129, 999, 1]).await?, vec![Some(1290), None, Some(10)]);
-    let selected = t.select_many_kiv_keys_and_values::<u64, QDatabaseKeyIdValueTableRow<u64>>(&s.session, &[129, 999, 1]).await?;
-    assert_eq!(selected.iter().map(|v| (v.obj_id, v.value)).collect::<Vec<_>>(), vec![(129, 1290), (1, 10)]);
+    assert_eq!(t.select_one_kiv_value_and_ids_t::<u64, QDatabaseKeyIdValueTableRow<u64>>(&s.session, 1129).await?.unwrap().obj_id, 1129);
+    assert_eq!(t.select_many_kiv_values::<u64>(&s.session, &[2129, 999, 1]).await?, vec![Some(21290), None, Some(10)]);
+    let selected = t.select_many_kiv_keys_and_values::<u64, QDatabaseKeyIdValueTableRow<u64>>(&s.session, &[2129, 999, 1]).await?;
+    assert_eq!(selected.iter().map(|v| (v.obj_id, v.value)).collect::<Vec<_>>(), vec![(2129, 21290), (1, 10)]);
     let mut all = t.select_all_kiv::<u64>(&s.session).await?;
     all.sort_by_key(|v| v.obj_id);
-    assert_eq!(all.iter().map(|v| v.value).collect::<Vec<_>>(), (1..=130).map(|i| i * 10).collect::<Vec<_>>());
+    let mut expected: Vec<_> = [0, 1000, 2000].into_iter().flat_map(|offset| (1..=129).map(move |i| (offset + i, (offset + i) * 10))).collect();
+    expected.push((130, 1300));
+    expected.sort_unstable();
+    assert_eq!(all.iter().map(|v| (v.obj_id, v.value)).collect::<Vec<_>>(), expected);
     cleanup(&s).await
 }
 
@@ -220,21 +230,23 @@ async fn tag_tree_optional_bulk_reads_and_both_proof_readers_agree() -> anyhow::
     let zero = Hash256([0; 32]);
     let tag = Hash256([7; 32]);
     let value = hash_tag_tree_node::<Hash256, CoreSha256Hasher>(&zero, &zero, &tag);
+    let right_tag = Hash256([9; 32]);
+    let right_value = hash_tag_tree_node::<Hash256, CoreSha256Hasher>(&zero, &zero, &right_tag);
     assert!(t.select_tag_tree_proof_old::<Hash256>(&s.session, 1, left).await.is_err());
     t.set_or_insert_one(&s.session, 1, &left, &tag.0, &value.0).await?;
-    t.set_or_insert_one(&s.session, 1, &right, &tag.0, &value.0).await?;
+    t.set_or_insert_one(&s.session, 1, &right, &right_tag.0, &right_value.0).await?;
     t.set_tag_only_computed::<Hash256, CoreSha256Hasher>(&s.session, 1, root, Some(1), &tag).await?;
-    for proof in [t.select_tag_tree_proof::<Hash256>(&s.session, 1, left).await?, t.select_tag_tree_proof_old::<Hash256>(&s.session, 1, left).await?] {
+    for proof in [t.select_tag_tree_proof::<Hash256>(&s.session, 1, left).await?, t.select_tag_tree_proof_old::<Hash256>(&s.session, 1, left).await?, t.select_tag_tree_proof::<Hash256>(&s.session, 1, right).await?, t.select_tag_tree_proof_old::<Hash256>(&s.session, 1, right).await?] {
         assert!(proof.verify::<CoreSha256Hasher>());
-        assert_eq!(proof.root, hash_tag_tree_node::<Hash256, CoreSha256Hasher>(&value, &value, &tag));
+        assert_eq!(proof.root, hash_tag_tree_node::<Hash256, CoreSha256Hasher>(&value, &right_value, &tag));
     }
     let keys = [right, missing, left];
-    assert_eq!(t.select_many_tag_tree_values::<Hash256>(&s.session, 1, &keys).await?, vec![Some(value), None, Some(value)]);
-    assert_eq!(t.select_many_tag_tree_tags::<Hash256>(&s.session, 1, &keys).await?, vec![Some(tag), None, Some(tag)]);
-    assert_eq!(t.select_many_tag_tree_values_or_zero::<Hash256>(&s.session, 1, &keys).await?, vec![value, zero, value]);
-    assert_eq!(t.select_many_tag_tree_tags_or_zero::<Hash256>(&s.session, 1, &keys).await?, vec![tag, zero, tag]);
+    assert_eq!(t.select_many_tag_tree_values::<Hash256>(&s.session, 1, &keys).await?, vec![Some(right_value), None, Some(value)]);
+    assert_eq!(t.select_many_tag_tree_tags::<Hash256>(&s.session, 1, &keys).await?, vec![Some(right_tag), None, Some(tag)]);
+    assert_eq!(t.select_many_tag_tree_values_or_zero::<Hash256>(&s.session, 1, &keys).await?, vec![right_value, zero, value]);
+    assert_eq!(t.select_many_tag_tree_tags_or_zero::<Hash256>(&s.session, 1, &keys).await?, vec![right_tag, zero, tag]);
     let values = t.select_many_tag_tree_tags_and_values::<Hash256>(&s.session, 1, &keys).await?;
-    assert_eq!(values[0].as_ref().unwrap().tag, tag);
+    assert_eq!(values[0].as_ref().unwrap().tag, right_tag);
     assert!(values[1].is_none());
     let values = t.select_many_tag_tree_tags_and_values_or_zero::<Hash256>(&s.session, 1, &keys).await?;
     assert_eq!((values[1].tag, values[1].value), (zero, zero));
@@ -259,7 +271,9 @@ async fn packed_object_writers_preserve_ids_values_and_checkpoint_history() -> a
     let s = store().await?;
     let t = s.init_std_table::<ScyllaGenericObjectSingleIdTablePreparedStatements>("packed", routing()).await?;
     for count in [0, 63, 128, 257] {
-        let rows: Vec<_> = (0..count).map(|i| QDatabaseSingleIdTableRowNoCheckpointId { obj_id: i, value: i + 100u64 }).collect();
+        // New IDs per batch size: a partial write cannot reuse a previous batch.
+        let base = count * 1000;
+        let rows: Vec<_> = (0..count).map(|i| QDatabaseSingleIdTableRowNoCheckpointId { obj_id: base + i, value: i + 100u64 }).collect();
         let packed: Vec<u8> = rows.iter().flat_map(|r| [r.obj_id.to_le_bytes().to_vec(), r.value.psy_ser_to_bytes_vec().unwrap()].concat()).collect();
         t.insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(&s.session, 8, 5, &packed).await?;
         for r in &rows {
@@ -271,11 +285,16 @@ async fn packed_object_writers_preserve_ids_values_and_checkpoint_history() -> a
             let record = t.select_one_single_checkpointed_object_value::<u128>(&s.session, r.obj_id, 6).await?.unwrap();
             assert_eq!(record, u128::from(r.obj_id) | (u128::from(r.value) << 64));
         }
-        t.insert_many_single_checkpointed_objects_at_checkpoint_t_single_insert_chunks::<u64, _>(&s.session, 7, &rows).await?;
-        t.insert_many_single_checkpointed_objects_at_checkpoint_t_with_batch_size::<u64, _>(&s.session, 8, 64, &rows).await?;
+        let at_seven: Vec<_> = rows.iter().map(|r| QDatabaseSingleIdTableRowNoCheckpointId { obj_id: r.obj_id, value: r.value + 7000 }).collect();
+        let at_eight: Vec<_> = rows.iter().map(|r| QDatabaseSingleIdTableRowNoCheckpointId { obj_id: r.obj_id, value: r.value + 8000 }).collect();
+        t.insert_many_single_checkpointed_objects_at_checkpoint_t_single_insert_chunks::<u64, _>(&s.session, 7, &at_seven).await?;
         let keys: Vec<_> = rows.iter().map(|r| r.obj_id).collect();
-        assert_eq!(t.select_many_single_checkpointed_object_values::<u64>(&s.session, &keys, 8).await?, rows.iter().map(|r| Some(r.value)).collect::<Vec<_>>());
-        assert!(t.select_one_single_checkpointed_object_value::<u64>(&s.session, 0, 4).await?.is_none());
+        assert_eq!(t.select_many_single_checkpointed_object_values::<u64>(&s.session, &keys, 7).await?, at_seven.iter().map(|r| Some(r.value)).collect::<Vec<_>>());
+        t.insert_many_single_checkpointed_objects_at_checkpoint_t_with_batch_size::<u64, _>(&s.session, 8, 64, &at_eight).await?;
+        for (checkpoint, expected) in [(5, &rows), (7, &at_seven), (8, &at_eight)] {
+            assert_eq!(t.select_many_single_checkpointed_object_values::<u64>(&s.session, &keys, checkpoint).await?, expected.iter().map(|r| Some(r.value)).collect::<Vec<_>>());
+        }
+        assert!(t.select_one_single_checkpointed_object_value::<u64>(&s.session, base, 4).await?.is_none());
     }
     assert!(t.insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(&s.session, 8, 9, &[0]).await.is_err());
     assert!(t.insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index(&s.session, 16, 0, 9, &[0]).await.is_err());

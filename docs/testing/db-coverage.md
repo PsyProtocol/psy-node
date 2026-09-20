@@ -114,3 +114,6 @@ To test the coverage gate itself:
 ```sh
 python3 dev/check-db-coverage.test.py
 ```
+
+See [Database test quality](db-test-quality.md) for behavioral contracts, directed
+fault-injection checks, and the limits of the current integration coverage.

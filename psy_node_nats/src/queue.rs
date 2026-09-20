@@ -446,6 +446,9 @@ impl NatsJetStreamClient {
         max_messages_total_to_dump: usize,
         data_vec: &mut Vec<QK::QueueItem>,
     ) -> anyhow::Result<()> {
+        if max_messages_per_batch == 0 || max_messages_total_to_dump == 0 {
+            return Ok(());
+        }
         let size_hint = QK::QueueItem::get_size_hint();
         let has_fixed_size = QK::QueueItem::has_fixed_size() && size_hint > 0;
 
@@ -468,9 +471,6 @@ impl NatsJetStreamClient {
             Err(err) => return Err(err.into()),
         };
         let mut total_messages_dumped = 0;
-        if max_messages_total_to_dump == 0 {
-            return Ok(());
-        }
 
         let mode = queue_key.get_queue_type();
 
@@ -516,6 +516,9 @@ impl NatsJetStreamClient {
         expected_size: Option<usize>,
         bytes_vec: &mut Vec<Vec<u8>>,
     ) -> anyhow::Result<usize> {
+        if max_messages_per_batch == 0 || max_messages_total_to_dump == 0 {
+            return Ok(0);
+        }
         let has_expected_size = expected_size.is_some();
         let real_expected_size = expected_size.unwrap_or(0);
 
@@ -524,7 +527,7 @@ impl NatsJetStreamClient {
             Err(err) if Self::is_consumer_not_found_error(&err) => return Ok(0),
             Err(err) => return Err(err),
         };
-        let mut messages = match consumer.fetch().max_messages(max_messages_per_batch).messages().await {
+        let mut messages = match consumer.fetch().max_messages(max_messages_per_batch.min(max_messages_total_to_dump)).messages().await {
             Ok(messages) => messages,
             Err(err) if Self::is_consumer_not_found_error(&err) => {
                 self.invalidate_consumer_cache(durable_name).await;
@@ -533,9 +536,6 @@ impl NatsJetStreamClient {
             Err(err) => return Err(err.into()),
         };
         let mut total_messages_dumped = 0;
-        if max_messages_total_to_dump == 0 {
-            return Ok(0);
-        }
 
         let mut last_reply: Option<Subject> = None;
 

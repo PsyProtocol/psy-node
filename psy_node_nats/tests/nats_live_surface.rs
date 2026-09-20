@@ -78,13 +78,8 @@ async fn setup_rejects_unreachable_server() {
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         setup_nats_psy_queue_from_connection_str("nats://127.0.0.1:1", "ns_unreachable"),
-    )
-    .await;
-    match result {
-        Err(_) => {}
-        Ok(Err(_)) => {}
-        Ok(Ok(_)) => panic!("expected connection to unused port to fail"),
-    }
+    ).await.expect("a refused local connection must fail promptly");
+    assert!(result.is_err(), "an unreachable server must not produce a usable client");
 }
 
 #[tokio::test]
@@ -183,7 +178,7 @@ async fn ephemeral_publish_wait_dump_and_ack_modes() -> anyhow::Result<()> {
     let dumped_items = client
         .dump_entire_ephemeral_queue(&key, 7, 11, unique_id, 0, 100)
         .await?;
-    assert!(dumped_items.len() >= 8, "got {:?}", dumped_items);
+    assert_eq!(dumped_items, (2..=10).map(TestJob).collect::<Vec<_>>());
 
     let none = client
         .wait_for_ephemeral_queue_item_bytes(&key, 7, 11, unique_id, 0, 150)
@@ -230,8 +225,8 @@ async fn ephemeral_publish_wait_dump_and_ack_modes() -> anyhow::Result<()> {
             &mut bytes,
         )
         .await?;
-    assert_eq!(n, bytes.len());
-    assert!(n > 0);
+    assert_eq!(n, 3);
+    assert_eq!(bytes, vec![b"abcdefgh".to_vec(), b"ijklmnop".to_vec(), vec![b'z'; 8]]);
 
     let mut bytes = Vec::new();
     client
@@ -245,6 +240,7 @@ async fn ephemeral_publish_wait_dump_and_ack_modes() -> anyhow::Result<()> {
             &mut bytes,
         )
         .await?;
+    assert_eq!(bytes, vec![TestJob(21).encode_queue_item_vec()?, TestJob(22).encode_queue_item_vec()?]);
 
     let mut bytes = Vec::new();
     client
@@ -258,6 +254,7 @@ async fn ephemeral_publish_wait_dump_and_ack_modes() -> anyhow::Result<()> {
             &mut bytes,
         )
         .await?;
+    assert_eq!(bytes, vec![TestJob(23).encode_queue_item_vec()?, TestJob(24).encode_queue_item_vec()?]);
 
     let zero = client
         .dump_queue_dq_bytes_ephemeral(
@@ -279,7 +276,7 @@ async fn ephemeral_publish_wait_dump_and_ack_modes() -> anyhow::Result<()> {
             JetStreamAckMode::AckEach,
         )
         .await?;
-    let _ = maybe;
+    assert_eq!(maybe, None);
 
     <NatsJetStreamClient as QStandardQueueBase>::recreate_consumer(
         &client, &key, 7, 11, unique_id, 0,
@@ -367,10 +364,9 @@ async fn worker_dump_kv_timeouts_and_consumers() -> anyhow::Result<()> {
     client
         .publish_ephemeral_queue_item_bytes_ref(&eph, 7, 11, unique_id, 0, &TestJob(41).encode_queue_item_vec()?)
         .await?;
-    assert!(client
+    assert_eq!(client
         .consume_ephemeral_queue_item_or_none_bytes(&eph, 7, 11, unique_id, 0)
-        .await?
-        .is_some());
+        .await?, Some(TestJob(41).encode_queue_item_vec()?));
 
     for i in 0..8u64 {
         client
@@ -381,7 +377,7 @@ async fn worker_dump_kv_timeouts_and_consumers() -> anyhow::Result<()> {
     let dumped_bytes = client
         .dump_entire_ephemeral_queue_bytes(&eph, 7, 11, unique_id, 0, 100)
         .await?;
-    let _ = dumped_bytes;
+    assert_eq!(dumped_bytes, (100..108).map(|i| TestJob(i).encode_queue_item_vec().unwrap()).collect::<Vec<_>>());
 
     let short_id = unique_id + 99;
     let short_key = eph_key(short_id);
@@ -416,7 +412,7 @@ async fn worker_dump_kv_timeouts_and_consumers() -> anyhow::Result<()> {
     let peeked = client
         .get_message_if_exists_dq_bytes_ephemeral(&subject, &durable, JetStreamAckMode::NoAck)
         .await?;
-    assert!(peeked.is_some());
+    assert_eq!(peeked, Some(TestJob(50).encode_queue_item_vec()?));
     client
         .publish_ephemeral_queue_item_owned(&eph, 7, 11, unique_id, 0, TestJob(51))
         .await?;
@@ -428,7 +424,7 @@ async fn worker_dump_kv_timeouts_and_consumers() -> anyhow::Result<()> {
             JetStreamAckMode::AckEach,
         )
         .await?;
-    assert!(peeked_qi.is_some());
+    assert_eq!(peeked_qi, Some(TestJob(51)));
 
     client
         .delete_ephemeral_queue_consumer(&eph, 7, 11, unique_id, 0)
@@ -448,19 +444,22 @@ async fn worker_dump_kv_timeouts_and_consumers() -> anyhow::Result<()> {
     let dumped = client
         .dump_entire_worker_queue(&wkey, 7, 11, unique_id + 7, 0, 10)
         .await?;
-    assert!(dumped.len() >= 1, "worker dump got {:?}", dumped);
+    assert_eq!(dumped, vec![TestJob(60), TestJob(61), TestJob(62)]);
     for job in &dumped {
-        let _ = client
+        assert!(client
             .worker_queue_report_job_completed(&wkey, 7, 11, unique_id + 7, 0, job)
-            .await?;
+            .await?);
     }
 
     let wsubject = wkey.get_queue_subject(&client.base_namespace, 7, 11, unique_id + 7, 0);
     let wdurable = wkey.get_durable_name(&client.base_namespace, 7, 11, unique_id + 7, 0);
     let mut batch = Vec::new();
+    client.publish_worker_queue_item_owned(&wkey, 7, 11, unique_id + 7, 0, TestJob(65)).await?;
     client
         .dump_queue_dq_qi_batch(&wkey, &wsubject, &wdurable, 10, 10, &mut batch)
         .await?;
+    assert_eq!(batch, vec![TestJob(65)]);
+    assert!(client.worker_queue_report_job_completed(&wkey, 7, 11, unique_id + 7, 0, &batch[0]).await?);
 
     let barrier2 = client
         .publish_worker_queue_item_owned(&wkey, 7, 11, unique_id + 7, 0, TestJob(70))
@@ -499,6 +498,76 @@ async fn worker_dump_kv_timeouts_and_consumers() -> anyhow::Result<()> {
         )
         .await?;
 
-    let _ = barrier;
+    client.wait_until_all_jobs_complete_or_timeout_worker(&wkey, 7, 11, unique_id + 7, 0, &barrier, 2_000).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "Requires isolated NATS_INTEGRATION_URL"]
+async fn ack_modes_change_server_pending_state() -> anyhow::Result<()> {
+    use std::time::Duration;
+    let (client, unique_id, _) = connect().await?;
+    for (offset, mode) in [JetStreamAckMode::AckEach, JetStreamAckMode::NoAck, JetStreamAckMode::AckBatchLast].into_iter().enumerate() {
+        let id = unique_id + 1000 + offset as u128;
+        let key = eph_key(id);
+        <NatsJetStreamClient as QStandardQueueBase>::ensure_stream_consumer(&client, &key, 7, 11, id, 0).await?;
+        let subject = key.get_queue_subject(&client.base_namespace, 7, 11, id, 0);
+        let durable = key.get_durable_name(&client.base_namespace, 7, 11, id, 0);
+        let jobs = vec![TestJob(201), TestJob(202), TestJob(203)];
+        client.publish_many_ephemeral_queue_items(&key, 7, 11, id, 0, &jobs).await?;
+        let mut bytes = Vec::new();
+        assert_eq!(client.dump_queue_dq_bytes_ephemeral(&subject, &durable, mode, 3, 3, Some(8), &mut bytes).await?, 3);
+        assert_eq!(bytes, jobs.iter().map(|j| j.encode_queue_item_vec().unwrap()).collect::<Vec<_>>());
+        let mut consumer = client.jetstream.get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(&durable, &client.stream_name).await?;
+        let expected_unacked = if mode == JetStreamAckMode::NoAck { 3 } else { 0 };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let info = consumer.info().await?;
+                if info.num_pending == 0 && info.num_ack_pending == expected_unacked { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "Requires isolated NATS_INTEGRATION_URL"]
+async fn zero_limit_does_not_fetch_or_hide_waiting_messages() -> anyhow::Result<()> {
+    let (client, id, key) = connect().await?;
+    let subject = key.get_queue_subject(&client.base_namespace, 7, 11, id, 0);
+    let durable = key.get_durable_name(&client.base_namespace, 7, 11, id, 0);
+    client.publish_ephemeral_queue_item_owned(&key, 7, 11, id, 0, TestJob(91)).await?;
+    let mut bytes = Vec::new();
+    assert_eq!(client.dump_queue_dq_bytes_ephemeral(&subject, &durable, JetStreamAckMode::AckEach, 10, 0, None, &mut bytes).await?, 0);
+    assert!(bytes.is_empty());
+    assert_eq!(client.wait_for_ephemeral_queue_item(&key, 7, 11, id, 0, 1000).await?, Some(TestJob(91)));
+    client.publish_ephemeral_queue_item_owned(&key, 7, 11, id, 0, TestJob(92)).await?;
+    assert_eq!(client.dump_queue_dq_bytes_ephemeral(&subject, &durable, JetStreamAckMode::AckEach, 0, 10, None, &mut bytes).await?, 0);
+    let mut jobs = Vec::new();
+    client.dump_queue_dq_qi_batch(&key, &subject, &durable, 10, 0, &mut jobs).await?;
+    client.dump_queue_dq_qi_batch(&key, &subject, &durable, 0, 10, &mut jobs).await?;
+    assert!(jobs.is_empty());
+    assert_eq!(client.wait_for_ephemeral_queue_item(&key, 7, 11, id, 0, 1000).await?, Some(TestJob(92)));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "Requires isolated NATS_INTEGRATION_URL"]
+async fn worker_unacked_job_redelivers_and_ack_completes_barrier() -> anyhow::Result<()> {
+    let (mut client, id, _) = connect().await?;
+    // Keep production Explicit ACK / multi-delivery policy; shorten only the timer.
+    client.worker_queue_pull_config.ack_wait = std::time::Duration::from_millis(100);
+    let key = worker_key(id);
+    <NatsJetStreamClient as QStandardQueueBase>::ensure_stream_consumer(&client, &key, 7, 11, id, 0).await?;
+    let barrier = client.publish_worker_queue_item_owned(&key, 7, 11, id, 0, TestJob(301)).await?;
+    let first = client.wait_for_worker_queue_item(&key, 7, 11, id, 0, 2000).await?;
+    assert_eq!(first, Some(TestJob(301)));
+    let retried = client.wait_for_worker_queue_item(&key, 7, 11, id, 0, 2000).await?;
+    assert_eq!(retried, first, "an unacknowledged worker job must be retried");
+    assert!(client.worker_queue_report_job_completed(&key, 7, 11, id, 0, &retried.unwrap()).await?);
+    client.wait_until_all_jobs_complete_or_timeout_worker(&key, 7, 11, id, 0, &barrier, 2000).await?;
     Ok(())
 }
