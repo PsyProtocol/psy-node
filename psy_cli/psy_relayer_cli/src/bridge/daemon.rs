@@ -2765,7 +2765,7 @@ async fn build_multichain_l2_plan(
         }
 
         if append_business && pending > l2_count {
-            let snapshot = crate::bridge::api_client::fetch_services_deposit_tree_root(
+            let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
                 &http,
                 &base.services_url,
                 u64::from(chain.chain_index),
