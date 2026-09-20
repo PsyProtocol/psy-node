@@ -4,7 +4,7 @@ This repository-only developer reference covers launcher internals, process supe
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-07. Status: Review.
+> Updated: 2026-09-20. Status: Review.
 
 ## Overview
 
@@ -13,7 +13,7 @@ process construction, readiness, supervision, control commands, ports, persisten
 Use the Make targets for the repository-supported operating lifecycle, and use direct launcher commands only when
 selecting a documented component set or diagnosing launcher behavior. The lifecycle procedure remains owned by
 [devnet_lifecycle.md](devnet_lifecycle.md); this reference explains how the launcher implements that procedure
-([devnet_lifecycle.md](devnet_lifecycle.md); `Makefile:61-80`; `dev/locSetupV4.ts:5435-5794`).
+([devnet_lifecycle.md](devnet_lifecycle.md); `Makefile:61-76`; `dev/locSetupV4.ts:5435-5794`).
 
 ## Background
 
@@ -331,22 +331,24 @@ Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime co
 | Variable                   | Default                                                                   | Effect                                                                                                 | Evidence                                                                                    |
 | -------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
 | `HOME`                     | Required                                                                  | Locates trust setup and default relayer keystore.                                                      | `dev/locSetupV4.ts:2476-2481`; `dev/locSetupV4.ts:2968-2973`                                |
-| `KEYSTORE_PATH`            | `${HOME}/.psy/keystore/bridge-relayer`                                    | Overrides only the bridge-relayer wallet path.                                                         | `dev/locSetupV4.ts:263-269`; `dev/locSetupV4.ts:3029-3034`                                  |
-| `WALLET_PASSWORD`          | Prompt/policy; generated development keystore can use development default | Decrypts/generates the relayer wallet and is forwarded to deployment/relayer processes.                | `dev/locSetupPolicy.ts:500-540`; `dev/locSetupV4.ts:275-315`; `dev/locSetupV4.ts:3029-3034` |
+| `KEYSTORE_PATH`            | `${HOME}/.psy/keystore/bridge-relayer`                                    | Encrypted UTC JSON used by both `[relayer_wallet]` (L2 ZKSign) and `[finalize]` / `[[chains]]` (L1 secp). | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`, `daemonConfig`)                    |
+| `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` | unset | Genesis registration 2 and locSetup: first-choice UTC JSON path. Same file the relayer decrypts. | `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`; `dev/locSetupV4.ts:298-310` |
+| `BRIDGE_RELAYER_KEYSTORE_PATH` | unset | Alias if `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` is unset. | same |
+| `WALLET_PASSWORD`          | Prompt/policy; generated development keystore can use development default | Decrypts the UTC JSON for locSetup, L1 deploy, genesis generation, and the relayer.                    | `dev/locSetupPolicy.ts:615-638`; `dev/locSetupV4.ts:313-330`; `dev/locSetupV4.ts:3084-3097` |
 | `PSY_SKIP_KEYSTORE`        | Direct default off; Make default `1`                                      | Exact `1` skips remote trust-setup refresh/hash verification but still requires mandatory local files. | `dev/locSetupV4.ts:2487-2521`; `Makefile:14`                                                |
 | `PSY_KEYSTORE_S3_BASE_URL` | Published development asset prefix                                        | Overrides trust-setup manifest and proving-key download base.                                          | `dev/locSetupV4.ts:1657-1660`; `dev/locSetupV4.ts:2285-2295`                                |
 
 #### Using a Throwaway Bridge-Relayer Keystore
 
-`KEYSTORE_PATH` redirects only the bridge-relayer wallet; the proving trust setup stays under
-`~/.psy/keystore` regardless of the value (`dev/locSetupV4.ts:2532`, `dev/locSetupV4.ts:2547`). This
-exists so tests and CI can use a disposable relayer wallet without touching a developer's real
-`~/.psy/keystore/bridge-relayer`.
+`KEYSTORE_PATH` is the encrypted UTC JSON used by both `[relayer_wallet]` and `[finalize]` / `[[chains]]` in generated `daemon.toml`. The L2 identity is that file's 32-byte secret parsed as a Poseidon key (`Wallet::load` then `Hash256` then `QHashOut`), not a plaintext `private_key`. Genesis registration 2 (`user_id` `524288`) matches only when the same file was passed to `make generate-genesis-data` ([genesis-generation.md](genesis-generation.md) section 1.2.1: `PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, or `KEYSTORE_PATH`, plus `WALLET_PASSWORD`). The proving trust setup stays under `~/.psy/keystore` regardless of `KEYSTORE_PATH`.
 
 ```bash
-# Use a throwaway bridge-relayer keystore instead of ~/.psy/keystore/bridge-relayer
+# Throwaway UTC JSON instead of ~/.psy/keystore/bridge-relayer
 export WALLET_PASSWORD=devnet
+mkdir -p /tmp/psy-devnet-relayer
 export KEYSTORE_PATH=/tmp/psy-devnet-relayer/bridge-relayer-keystore
+cast wallet new /tmp/psy-devnet-relayer bridge-relayer-keystore --unsafe-password "$WALLET_PASSWORD"
+PSY_BRIDGE_RELAYER_KEYSTORE_PATH="$KEYSTORE_PATH" make generate-genesis-data
 make run-all
 ```
 
@@ -354,7 +356,8 @@ Behavior on the first and later launches:
 
 1. Path absent — the launcher auto-generates a development keystore from the Anvil development
    private key `0xac0974…2ff80`, encrypted with `WALLET_PASSWORD` (default `"devnet"` when unset)
-   (`dev/locSetupV4.ts:2390-2408`).
+   (`dev/locSetupV4.ts:2427-2588`). That file still has to be the genesis input or registration 2
+   is `deterministic_private_key(2)` and the relayer is `not_registered`.
 2. Path exists — the password must match that keystore. In a non-interactive session
    (`WALLET_PASSWORD` unset, no TTY) startup fails with
    `"WALLET_PASSWORD is required for an existing bridge-relayer keystore in a non-interactive
@@ -513,18 +516,18 @@ RPC loop (`dev/locSetupV4.ts:4451-4454`). Without it, the best-effort
 
 Do not describe all Anvil-related data as living under `db/`: the required localhost deployment summary is the paired
 file `psy-contracts/deployments/localhost/deployed-contracts.json`, outside `db/`
-(`dev/locSetupV4.ts:2942-2951`).
+(`dev/locSetupV4.ts:2999-3007`).
 
 The pair invariant is strict:
 
 ```text
 state absent + deployment absent   -> fresh local chain; reset Envio storage
 state present + deployment present -> load Anvil state; reuse deployment; retain Envio storage
-only one present                    -> fail and instruct make restart-all
+only one present                    -> fail and instruct PURGE=1 make shutdown then make run-all
 ```
 
 This behavior is implemented by `resolveLocalAnvilStatePlan()` and the localhost reuse branch in
-`deployPsyContracts()` (`dev/locSetupV4.ts:2942-2992`). Foreground Anvil startup creates the parent directory before
+`deployPsyContracts()` (`dev/locSetupV4.ts:2991-3007`). Foreground Anvil startup creates the parent directory before
 launch, uses the plan's `hasState` result, and passes the plan's reset decision into Envio setup
 (`dev/locSetupV4.ts:4404-4452`; `dev/locSetupV4.ts:4454-4475`).
 
@@ -532,7 +535,7 @@ launch, uses the plan's `hasState` result, and passes the plan's reset decision 
 tracked Anvil and DB processes remain alive (`Makefile:69-70`; `dev/locSetupV4.ts:3505-3512`;
 `dev/locSetupV4.ts:3851-3919`; `dev/locSetupV4.ts:5761-5772`). A non-purge shutdown stops Anvil but does not delete
 its state or the localhost deployment; a later launch loads the state and reuses the deployment
-(`dev/locSetupV4.ts:3450-3468`; `dev/locSetupV4.ts:2942-2992`). Purge deletes both `db/anvil` and the localhost
+(`dev/locSetupV4.ts:3450-3468`; `dev/locSetupV4.ts:2991-3007`). Purge deletes both `db/anvil` and the localhost
 deployment directory, preserving the pair invariant for the next fresh launch (`dev/locSetupV4.ts:3458-3466`).
 
 ## 11. Control Socket and Application Lifecycle
@@ -576,8 +579,8 @@ for supervised restart so they rebuild infrastructure connections (`dev/locSetup
 
 `make shutdown` invokes `--teardown --purge` by default: the Makefile sets `PURGE ?= 1` and the target adds `--purge`
 unless an explicit `PURGE=0` limits it to bare `--teardown`; `PURGE=1 make shutdown` remains valid and is identical to
-the default. Bare launcher `--teardown` stays non-purge regardless of the Make default. `make restart-all` performs
-purge shutdown then `make run-all` (`Makefile:16`; `Makefile:78-80`; `Makefile:103-107`). Direct teardown executes
+the default. Bare launcher `--teardown` stays non-purge regardless of the Make default. A fresh chain is
+`PURGE=1 make shutdown` then `make run-all` (`Makefile:16`; `Makefile:99-103`). Direct teardown executes
 this sequence (`dev/locSetupV4.ts:3402-3468`):
 
 ```text
@@ -626,11 +629,12 @@ make rollback-resume
 make shutdown
 PURGE=0 make shutdown
 PURGE=1 make shutdown
-make restart-all
 ```
 
+A fresh chain is `PURGE=1 make shutdown` then `make run-all`.
+
 These are the repository-supported lifecycle entry points ([devnet_lifecycle.md](devnet_lifecycle.md);
-`Makefile:64-80`; `Makefile:100-107`). `make shutdown` purges by default; `PURGE=0 make shutdown` is the
+`Makefile:64-76`; `Makefile:99-103`). `make shutdown` purges by default; `PURGE=0 make shutdown` is the
 state-preserving form. `make restart` requires the original foreground supervisor; it is not a new
 launcher startup (`Makefile:69-76`; `dev/locSetupV4.ts:5337-5369`).
 
@@ -713,7 +717,7 @@ Only the second command deletes persisted state (`dev/locSetupV4.ts:5722-5725`;
 | Another devnet is running                          | A repository-keyed kernel `flock` is held; use supported teardown or control rather than starting a second foreground launcher.          | `dev/locSetupV4.ts:5260-5309`                                |
 | Help or teardown fails before its branch           | Network resolution and `--env` parsing occur before help/teardown; correct invalid network, missing external RPC, or invalid assignment. | `dev/locSetupV4.ts:5511-5539`; `dev/locSetupV4.ts:5722-5725` |
 | Processor exits before ready                       | Read its error log; only recognized transient Scylla schema failures receive processor retry.                                            | `dev/locSetupV4.ts:47-96`; `dev/locSetupV4.ts:4060-4090`     |
-| Anvil state/deployment mismatch                    | Do not create or delete one side; run `make restart-all`.                                                                                | `dev/locSetupV4.ts:2942-2951`                                |
+| Anvil state/deployment mismatch                    | Do not create or delete one side; run `PURGE=1 make shutdown` then `make run-all`.                                                       | `dev/locSetupV4.ts:2999-3007`                                |
 | `make restart` cannot connect                      | The foreground supervisor/socket is absent; daemon mode and completed teardown have no control server.                                   | `dev/locSetupV4.ts:5361-5363`; `dev/locSetupV4.ts:5755-5774` |
 | Rollback stop reports open ports                   | The manager remains in `stopping`; identify the retained application listener and retry the supported stop after resolving it.           | `dev/locSetupV4.ts:3560-3587`; `dev/locSetupV4.ts:3877-3879` |
 | Controlled resume fails                            | Newly started applications are stopped and lifecycle returns to `stopped`; fix the failing application and rerun resume.                 | `dev/locSetupV4.ts:3905-3913`                                |
@@ -901,7 +905,7 @@ Scylla concurrency, and returns normalized child environment (`dev/locSetupV4.ts
 ### `resolveLocalAnvilStatePlan()`
 
 **Signature:** `export async function resolveLocalAnvilStatePlan(repoCwd: string): Promise<LocalAnvilStatePlan>`
-(`dev/locSetupV4.ts:2942`). It checks both files, throws on mismatch, and returns whether to reuse state and retain
+(`dev/locSetupV4.ts:2999`). It checks both files, throws on mismatch, and returns whether to reuse state and retain
 Envio storage (`dev/locSetupV4.ts:2943-2957`).
 
 ### `stopApplications()`, `startApplications()`, and `restartApplications()`
@@ -981,7 +985,7 @@ Commands execute serially and the loop remains available until the server is clo
   [devnet_lifecycle.md](devnet_lifecycle.md)).
 - **Paired Anvil state and deployment:** restoring chain storage without matching addresses, or addresses without the
   chain, would describe different Layer 1 histories; the launcher therefore fails closed on mismatch
-  (`dev/locSetupV4.ts:2942-2951`).
+  (`dev/locSetupV4.ts:2999-3007`).
 - **Persistent/application split:** restart and offline rollback need application processes to stop without recreating
   Anvil or the DB group (`dev/locSetupV4.ts:3505-3512`; `dev/locSetupV4.ts:3851-3919`).
 - **Exact readiness before dependents:** processors require exact completion markers, bridge services require network
@@ -1013,7 +1017,7 @@ Commands execute serially and the loop remains available until the server is clo
    three lifecycle commands (`dev/locSetupV4.ts:5317-5335`; `dev/locSetupV4.ts:5416-5424`).
 7. Purge is intentionally destructive across both Layer 1 and Layer 2 state, and it is the `make shutdown` default.
    Review the deletion set before running either command. Use `PURGE=0 make shutdown` to preserve state;
-   `make restart-all` always purges, even with `PURGE=0` (`Makefile:16`; `Makefile:78-80`; `Makefile:103-107`).
+   `PURGE=1 make shutdown` then `make run-all` is the fresh-chain sequence (`Makefile:16`; `Makefile:99-103`).
 8. With Coordinator/Realm core selected, `--genesis-data-path` is input and output: startup rewrites validators. Use a
    disposable copy when preserving an existing validator list matters. Component-only modes without core processors do
    not rewrite it (`dev/locSetupV4.ts:1225-1234`; `dev/locSetupV4.ts:4072-4079`).

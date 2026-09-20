@@ -2190,9 +2190,9 @@ fn record_claim_result(
 /// a round named nowhere is precisely the case that used to retry forever in
 /// silence.
 ///
-/// Deferrals are the exception. Waiting for bridge liquidity resolves on its
-/// own and says nothing about whether the claim is valid, so it must not spend
-/// one of the three attempts.
+/// Deferrals are the exception. Waiting for a missing services proof or for
+/// bridge liquidity resolves on its own and must not spend an attempt.
+/// An unauthorized withdrawal root is a failure.
 fn record_claim_outcome(
     attempted: &[propose_withdrawals::PendingWithdrawal],
     report: &claim_withdrawals::BatchWithdrawalsReport,
@@ -4090,6 +4090,42 @@ mod tests {
         record_claim_outcome(&attempted, &deferred, &mut pending, &mut retry, &mut retired, 0);
 
         assert_eq!(retry["a"].attempts, 1, "the earlier failure still counts");
+    }
+
+    #[test]
+    fn proof_readiness_deferrals_do_not_exhaust_claim_attempts() {
+        let attempted = vec![backoff_withdrawal("not-found"), backoff_withdrawal("root-mismatch")];
+        let mut pending = attempted.iter().map(|w| (w.leaf_hash.clone(), w.clone())).collect();
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let mut report = empty_report();
+        report.deferrals.insert("not-found".to_string(), "withdrawal claim proof not available yet; L1 root not finalized".to_string());
+        report.failure_reasons.insert("root-mismatch".to_string(), "withdrawal root is not current or known: services=0x01 l1=0x02".to_string());
+
+        for round in 0..claim_attempts::CLAIM_MAX_ATTEMPTS {
+            record_claim_outcome(&attempted, &report, &mut pending, &mut retry, &mut retired, u64::from(round));
+        }
+        assert!(retry.get("not-found").is_none(), "waiting for proof must not spend attempts");
+        assert!(retired.get("not-found").is_none(), "waiting for proof must not retire claims");
+        assert!(retired.contains_key("root-mismatch"), "unauthorized root must spend attempts and retire");
+        assert_eq!(claims_to_attempt(&pending, &retry).len(), 1);
+
+        let remaining: Vec<_> = pending.values().cloned().collect();
+        let mut failed = empty_report();
+        failed.failure_reasons.insert("not-found".to_string(), "fetch claim proof failed: RPC unavailable".to_string());
+        record_claim_outcome(&remaining, &failed, &mut pending, &mut retry, &mut retired, 10);
+        assert_eq!(retry["not-found"].attempts, 1);
+        assert!(retired.contains_key("root-mismatch"));
+
+        let mut waiting = empty_report();
+        waiting.deferrals.insert("not-found".to_string(), "withdrawal claim proof not available yet; L1 root not finalized".to_string());
+        for round in 11..15 {
+            let remaining: Vec<_> = pending.values().cloned().collect();
+            record_claim_outcome(&remaining, &waiting, &mut pending, &mut retry, &mut retired, round);
+            assert_eq!(retry["not-found"].attempts, 1);
+            assert!(retired.contains_key("root-mismatch"));
+            assert_eq!(claims_to_attempt(&pending, &retry).len(), 1);
+        }
     }
 
     #[test]

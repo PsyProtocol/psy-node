@@ -8,6 +8,8 @@ import {
     REALM_PROCESSOR_READY_MARKER,
     isExactProcessorReadyLine,
     s3CurlArgs,
+    psyServicesDatabaseCommands,
+    pinFaucetPerClaimAmount,
 } from "./locSetupPolicy";
 import {
     ANVIL_STATE_PATH,
@@ -44,6 +46,7 @@ import {
     strategy5UserIdFromRegistrationId,
     LOCAL_DEVNET_RELAYER_REGISTRATION_ID,
     LOCAL_DEVNET_RELAYER_USER_ID,
+    LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY,
     planRealmP2pConfig,
     daemonRealmP2pConfig,
     realmP2pProcessorPort,
@@ -53,8 +56,39 @@ import {
     selectedRuntimeConfigKey,
     REALM_P2P_SUB_IDS,
 } from "./locSetupV4";
-import allConfig from "../psy-genesis/config.json";
 import type { GenesisContractsArtifactFingerprint } from "./locSetupV4";
+
+describe("psy_services database preservation", () => {
+    it("leaves an existing database untouched without purge", () => {
+        expect(psyServicesDatabaseCommands(false, true)).toEqual([]);
+    });
+
+    it("creates a missing database without dropping it", () => {
+        expect(psyServicesDatabaseCommands(false, false)).toEqual([
+            ['docker', 'exec', 'generated-envio-postgres-1', 'createdb', '-U', 'postgres', 'psy_services'],
+        ]);
+    });
+
+    it("drops and recreates the database only with purge", () => {
+        expect(psyServicesDatabaseCommands(true, true)).toEqual([
+            ['docker', 'exec', 'generated-envio-postgres-1', 'dropdb', '-U', 'postgres', '--if-exists', 'psy_services'],
+            ['docker', 'exec', 'generated-envio-postgres-1', 'createdb', '-U', 'postgres', 'psy_services'],
+        ]);
+    });
+});
+
+describe("pinFaucetPerClaimAmount", () => {
+    it("forces the genesis amount without changing operators", () => {
+        const config = { faucetPerClaimAmount: "42", operators: [{ userId: "test-operator" }] };
+        expect(JSON.parse(pinFaucetPerClaimAmount(JSON.stringify(config)))).toEqual({
+            ...config, faucetPerClaimAmount: "1000000000000",
+        });
+    });
+
+    it("rejects malformed JSON rather than inventing operators", () => {
+        expect(() => pinFaucetPerClaimAmount("not json")).toThrow();
+    });
+});
 
 describe("s3CurlArgs", () => {
     it("builds a shell-free curl argv that is fail-closed, follows redirects, and shows progress", () => {
@@ -712,6 +746,10 @@ describe("realm P2P launch planning", () => {
         expect(reservedValidatorUserId(1, 2)).toBe((1 << 20) + (1 << 19));
         expect(LOCAL_DEVNET_RELAYER_REGISTRATION_ID).toBe(2);
         expect(strategy5UserIdFromRegistrationId(LOCAL_DEVNET_RELAYER_REGISTRATION_ID)).toBe(LOCAL_DEVNET_RELAYER_USER_ID);
+        expect(LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY).toBe(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        );
+        expect(LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY.startsWith("0x")).toBe(false);
         expect(() => reservedValidatorRegistrationId(2, 1)).toThrow(/realms 0\.\.1/);
     });
 });

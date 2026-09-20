@@ -123,7 +123,7 @@ where
     let changed_leaves_on_imt_indexed_trees = if checkpoint_id == 0 {
         HashSet::new()
     } else {
-        crate::realm::processor::db::load_changed_leaves_on_imt_indexed_trees::<S, N::F, N::QHash>(db, realm_update)
+        crate::realm::processor::db::load_changed_leaves_on_imt_indexed_trees::<S, N::F, N::QHash>(db, checkpoint_id - 1, realm_update)
             .await?
     };
     crate::realm::processor::db::require_state_update_record_coverage(realm_update, checkpoint_id, &changed_leaves_on_imt_indexed_trees)?;

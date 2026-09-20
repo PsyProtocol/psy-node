@@ -2,7 +2,7 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-07. Status: Review.
+> Updated: 2026-09-20. Status: Review.
 
 ## Overview
 
@@ -278,7 +278,7 @@ When triggered, the current target is:
 make generate-genesis-data
 ```
 
-It runs the local-devnet Genesis test (`Makefile:110-111`). The generator writes root `genesis.json`, root `private_keys.json`, and `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_plonky2_circuits/src/node/config/networks/local_devnet.rs:434-440,442-521`). Root `genesis.json` and `private_keys.json` are local operational artifacts. Never package or publish `private_keys.json`; never include generated private keys in a release artifact.
+It runs `./target/release/psy_dev_cli generate-genesis-data` (`Makefile:113-114`). Feed registration 2 from an encrypted UTC JSON keystore (`PSY_BRIDGE_RELAYER_KEYSTORE_PATH` / `BRIDGE_RELAYER_KEYSTORE_PATH` / `KEYSTORE_PATH` plus `WALLET_PASSWORD`); see [genesis-generation.md](genesis-generation.md) section 1.2.1. The generator writes root `genesis.json`, root `private_keys.json`, and `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Root `genesis.json` and `private_keys.json` are local operational artifacts. Never package or publish `private_keys.json`; never include generated private keys in a release artifact.
 
 ### 6.2 Embedded wallet circuit trigger
 
@@ -288,7 +288,7 @@ Run the following only when an embedded bundle circuit source, bundle serializat
 make generate-local-circuits
 ```
 
-The target regenerates `client_prover/psy_prover/src/wallet/local_circuits.json` (`Makefile:113-118`). Runtime loads that embedded bundle, containing zk-sign plus the private-note-inclusion and shield-deposit-claim base circuits (`client_prover/psy_prover/src/wallet/memory_wallet.rs:336-339,426-451`). Ordinary EndCap, GUTA, cache, or verifier changes do not trigger it. The same privacy-circuit change also invalidates the token-precompile fingerprint constants; follow [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md) and do not treat this wallet bundle as a substitute for those contract limbs.
+The target regenerates `client_prover/psy_prover/src/wallet/local_circuits.json` (`Makefile:120-121`). Runtime loads that embedded bundle, containing zk-sign plus the private-note-inclusion and shield-deposit-claim base circuits (`client_prover/psy_prover/src/wallet/memory_wallet.rs:336-339,426-451`). Ordinary EndCap, GUTA, cache, or verifier changes do not trigger it. The same privacy-circuit change also invalidates the token-precompile fingerprint constants; follow [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md) and do not treat this wallet bundle as a substitute for those contract limbs.
 
 ## 7. Real Peer-to-Peer End-to-End Acceptance
 

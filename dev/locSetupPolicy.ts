@@ -11,6 +11,23 @@ export const FAUCET_ENV_KEYS = [
     "PSY_FAUCET_WINDOW_CHECKPOINTS",
 ] as const;
 
+export function psyServicesDatabaseCommands(purge: boolean, databaseExists: boolean): string[][] {
+    const prefix = ['docker', 'exec', 'generated-envio-postgres-1'];
+    if (purge) {
+        return [
+            [...prefix, 'dropdb', '-U', 'postgres', '--if-exists', 'psy_services'],
+            [...prefix, 'createdb', '-U', 'postgres', 'psy_services'],
+        ];
+    }
+    return databaseExists ? [] : [[...prefix, 'createdb', '-U', 'postgres', 'psy_services']];
+}
+
+export function pinFaucetPerClaimAmount(json: string): string {
+    const config = JSON.parse(json);
+    config.faucetPerClaimAmount = "1000000000000";
+    return JSON.stringify(config);
+}
+
 export function resolveScyllaMemory(value: string | undefined): string {
     return value?.trim() || DEFAULT_SCYLLA_MEMORY;
 }

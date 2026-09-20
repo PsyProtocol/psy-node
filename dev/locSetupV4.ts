@@ -49,6 +49,8 @@ import {
     planPsyDappNestedSubmoduleInit,
     isCompilerFingerprintSource,
     s3CurlArgs,
+    psyServicesDatabaseCommands,
+    pinFaucetPerClaimAmount,
 } from "./locSetupPolicy";
 import type {
     FatalProcessorErrorMarker,
@@ -293,9 +295,26 @@ let cachedWalletPassword: string | null = null;
 /** True when auto-setup generated the bridge-relayer keystore during this process. */
 let bridgeRelayerKeystoreGeneratedThisRun = false;
 
+function setBridgeRelayerKeystoreAlias(): { name: string; path: string } | null {
+    for (const name of [
+        "PSY_BRIDGE_RELAYER_KEYSTORE_PATH",
+        "BRIDGE_RELAYER_KEYSTORE_PATH",
+        "KEYSTORE_PATH",
+    ] as const) {
+        const raw = process.env[name];
+        if (raw && raw.trim() !== "") {
+            return { name, path: raw.trim() };
+        }
+    }
+    return null;
+}
+
 function resolveBridgeRelayerKeystorePath(): string {
+    const setAlias = setBridgeRelayerKeystoreAlias();
+    if (setAlias) {
+        return setAlias.path;
+    }
     const homeDir = process.env.HOME;
-    if (process.env.KEYSTORE_PATH) return process.env.KEYSTORE_PATH;
     if (!homeDir) {
         throw new Error("[DevNet] HOME is not set and KEYSTORE_PATH was not provided");
     }
@@ -1006,12 +1025,15 @@ export const REALM_P2P_SUB_IDS = [1, 2] as const;
 /** Local-devnet genesis pre-places ZK validators only for realms `[0, count)`. */
 export const LOCAL_DEVNET_VALIDATOR_REALM_COUNT = 2;
 export const LOCAL_DEVNET_VALIDATORS_PER_REALM = REALM_P2P_SUB_IDS.length;
-/** Local-devnet ZK fingerprint from `local_devnet.rs` genesis generator. */
+/** Local-devnet ZK fingerprint constant from `local_devnet.rs`. */
 export const LOCAL_DEVNET_ZK_FINGERPRINT = "65e0169bfffd55f1c0ea9f76c111a5b15e652322ee253c1a9604a10d59066b50";
 
 /** Local-devnet bridge relayer stays at registration 2 (Strategy5 user_id 524288). */
 export const LOCAL_DEVNET_RELAYER_REGISTRATION_ID = 2;
 export const LOCAL_DEVNET_RELAYER_USER_ID = 524288;
+/** Anvil account #0. Seeds an auto-generated encrypted bridge-relayer keystore; daemon.toml still uses keystore_path. */
+export const LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY =
+    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 /** Canonical reserved leaf: `realm_id * 2^h + (sub_id - 1)`. */
 export function realmValidatorUserId(realmId: number, subId: number, height: number = 20): number {
@@ -2001,6 +2023,7 @@ async function ensureAllBinariesBuilt(cwd: string): Promise<void> {
         { name: "psy_worker_cli", path: path.join(cwd, "target", "release", "psy_worker_cli") },
         { name: "psy_relayer_cli", path: path.join(cwd, "target", "release", "psy_relayer_cli") },
         { name: "psy_user_cli", path: path.join(cwd, "target", "release", "psy_user_cli") },
+        { name: "psy_dev_cli", path: path.join(cwd, "target", "release", "psy_dev_cli") },
     ];
     const psyServicesPath = path.resolve(resolveProjectsDir(), "psy-services");
     const psyServicesBinaries = [
@@ -2022,7 +2045,8 @@ async function ensureAllBinariesBuilt(cwd: string): Promise<void> {
          "--bin", "psy_node_cli",
          "--bin", "psy_worker_cli",
          "--bin", "psy_relayer_cli",
-         "--bin", "psy_user_cli"],
+         "--bin", "psy_user_cli",
+         "--bin", "psy_dev_cli"],
         cwd,
     );
     if (nodeCode !== 0) {
@@ -2415,7 +2439,7 @@ const fs = require("fs");
 
 async function autoGenerateBridgeRelayerKeystore(keystorePath: string, contractsDir: string): Promise<void> {
     console.log("[AutoSetup] Auto-generating bridge-relayer keystore...");
-    const devPrivateKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const devPrivateKey = `0x${LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY}`;
     const devPassword = process.env.WALLET_PASSWORD || "devnet";
     const script = `
 const { Wallet } = require("ethers");
@@ -2524,7 +2548,13 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
     if (!homeDir) throw new Error("[AutoSetup] HOME is not set");
     const keystoreDir = path.join(homeDir, ".psy", "keystore");
     await mkdir(keystoreDir, { recursive: true });
+    const setAlias = setBridgeRelayerKeystoreAlias();
     const bridgeRelayerPath = resolveBridgeRelayerKeystorePath();
+    if (setAlias && !(await exists(setAlias.path))) {
+        throw new Error(
+            `[AutoSetup] ${setAlias.name} is set to ${setAlias.path} but that file does not exist`,
+        );
+    }
     await mkdir(path.dirname(bridgeRelayerPath), { recursive: true });
     let generated = false;
 
@@ -2555,7 +2585,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
                 `Generate them first or run without PSY_SKIP_KEYSTORE=1 to download the published setup.`,
             );
         }
-        // KEYSTORE_PATH overrides only the relayer wallet; trust setup remains under ~/.psy/keystore.
+        // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by [relayer_wallet] and [finalize]; trust setup remains under ~/.psy/keystore.
         if (!(await exists(bridgeRelayerPath))) {
             await ensurePsyContractsDependencies(contractsDir);
             await autoGenerateBridgeRelayerKeystore(bridgeRelayerPath, contractsDir);
@@ -2570,7 +2600,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
 
     // 1. bridge-relayer keystore: auto-generate only when missing.
     //    It is a dev key and never needs refreshing on its own; no interactive prompt.
-    // KEYSTORE_PATH overrides only the relayer wallet; trust setup remains under ~/.psy/keystore.
+    // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by [relayer_wallet] and [finalize]; trust setup remains under ~/.psy/keystore.
     if (!(await exists(bridgeRelayerPath))) {
         await ensurePsyContractsDependencies(contractsDir);
         await rm(bridgeRelayerPath).catch(() => undefined);
@@ -2778,12 +2808,15 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
         console.log("[AutoSetup] genesis.json present but not strict Unix-seconds genesis; regenerating");
     }
 
-    // genesis.json: generated by cargo test in psy_plonky2_circuits
-    console.log("[AutoSetup] Generating genesis.json (this may take a few minutes)...");
-    const result = await runAndCapture([
-        "cargo", "test", "--release", "--package", "psy_plonky2_circuits", "--lib",
-        "--", "node::config::networks::local_devnet::tests", "--nocapture",
-    ], cwd);
+    const cli = path.join(cwd, "target", "release", "psy_dev_cli");
+    if (!(await exists(cli))) {
+        throw new Error(
+            `[AutoSetup] ${cli} is missing; build it with cargo build --release --bin psy_dev_cli ` +
+            `or run without PSY_SKIP_BUILD=1.`,
+        );
+    }
+    console.log("[AutoSetup] Generating genesis.json via psy_dev_cli generate-genesis-data...");
+    const result = await runAndCapture([cli, "generate-genesis-data", "--repo-root", cwd], cwd);
     if (result.code !== 0) {
         throw new Error(`[AutoSetup] Failed to generate genesis.json: ${result.stderr || result.stdout}`);
     }
@@ -2832,15 +2865,15 @@ async function ensureDevEnvironment(
     const sdk = await ensurePsySdkArtifacts(cwd);
     await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
     const { generated } = await ensureKeystoreFiles(contractsDir);
-    await ensureGenesisFiles(cwd);
-    await ensureAllBinariesBuilt(cwd);
     // Only set default WALLET_PASSWORD when we generated the keystore this run.
-    // For an existing keystore, leave it unset so the prompt/decryption flow still works.
+    // Must happen before generate-genesis-data decrypts that UTC JSON.
     if (generated && !process.env.WALLET_PASSWORD) {
         process.env.WALLET_PASSWORD = "devnet";
         bridgeRelayerKeystoreGeneratedThisRun = true;
         console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
     }
+    await ensureAllBinariesBuilt(cwd);
+    await ensureGenesisFiles(cwd);
     console.log("[AutoSetup] Dev environment ready.");
 }
 
@@ -2993,7 +3026,7 @@ export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1Dep
     if (hasState !== hasDeployment) {
         throw new Error(
             `[DevNet] Local Anvil state and ${network} deployment must exist together: ` +
-            `${statePath}=${hasState}, ${deploymentPath}=${hasDeployment}. Run make restart-all.`,
+            `${statePath}=${hasState}, ${deploymentPath}=${hasDeployment}. Run PURGE=1 make shutdown, then make run-all.`,
         );
     }
     return {
@@ -3520,6 +3553,7 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
 }
 
 interface ProcessOptions {
+    purge?: boolean;
     cwd?: string;
     jtmb?: boolean;
     l1Port?: number;
@@ -4538,7 +4572,7 @@ class DevNetProcessManager {
                 ? await Promise.all(relayerChains.map((chain) => resolveLocalAnvilStatePlan(cwd, chain.deploymentsNetwork)))
                 : [];
             if (statePlans.some((plan) => plan.hasState) && statePlans.some((plan) => !plan.hasState)) {
-                throw new Error("[DevNet] Partial persisted L1 cohort; refusing to reset retained chains. Run make restart-all.");
+                throw new Error("[DevNet] Partial persisted L1 cohort; refusing to reset retained chains. Run PURGE=1 make shutdown, then make run-all.");
             }
             resetEnvioStorage = statePlans.length > 0 && statePlans.every((plan) => plan.shouldResetEnvio);
             for (const [index, chain] of relayerChains.entries()) {
@@ -4682,12 +4716,20 @@ class DevNetProcessManager {
                 };
             }));
 
-            await Bun.spawn(['docker', 'exec', 'generated-envio-postgres-1', 'dropdb', '-U', 'postgres', '--if-exists', 'psy_services'], {
-                stdio: ['ignore', 'ignore', 'ignore'],
-            }).exited;
-            await Bun.spawn(['docker', 'exec', 'generated-envio-postgres-1', 'createdb', '-U', 'postgres', 'psy_services'], {
-                stdio: ['ignore', 'ignore', 'ignore'],
-            }).exited;
+            let servicesDatabaseExists = false;
+            if (!options.purge) {
+                const probe = Bun.spawn([
+                    'docker', 'exec', 'generated-envio-postgres-1', 'psql', '-U', 'postgres',
+                    '-d', 'postgres', '-tAc', "SELECT 1 FROM pg_database WHERE datname = 'psy_services'",
+                ], { stdio: ['ignore', 'pipe', 'inherit'] });
+                const result = await new Response(probe.stdout).text();
+                if (await probe.exited !== 0) throw new Error('[DevNet] Failed to check psy_services database');
+                servicesDatabaseExists = result.trim() === '1';
+            }
+            for (const command of psyServicesDatabaseCommands(!!options.purge, servicesDatabaseExists)) {
+                const code = await Bun.spawn(command, { stdio: ['ignore', 'ignore', 'inherit'] }).exited;
+                if (code !== 0) throw new Error(`[DevNet] psy_services database setup failed: ${command[3]}`);
+            }
             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                 psyServicesCmd,
                 psyServicesStartedDetector,
@@ -5685,7 +5727,7 @@ async function runMain() {
         try {
             const faucetOpsPath = path.join(REPO_ROOT, "psy-dapp", "apps", "bridge", "src", "config", "faucetOperators.json");
             if (fs.existsSync(faucetOpsPath)) {
-                envVars["PSY_FAUCET_OPERATORS_JSON"] = fs.readFileSync(faucetOpsPath, "utf-8");
+                envVars["PSY_FAUCET_OPERATORS_JSON"] = pinFaucetPerClaimAmount(fs.readFileSync(faucetOpsPath, "utf-8"));
                 console.log(`[DevNet] Loaded faucet operators from ${faucetOpsPath}`);
             }
         } catch (err) {
@@ -5869,7 +5911,7 @@ Usage: bun run dev/locSetupV4.ts [options]
         try {
             const faucetOpsPath = path.join(REPO_ROOT, "psy-dapp", "apps", "bridge", "src", "config", "faucetOperators.json");
             if (fs.existsSync(faucetOpsPath)) {
-                envVars["PSY_FAUCET_OPERATORS_JSON"] = fs.readFileSync(faucetOpsPath, "utf-8");
+                envVars["PSY_FAUCET_OPERATORS_JSON"] = pinFaucetPerClaimAmount(fs.readFileSync(faucetOpsPath, "utf-8"));
                 console.log(`[DevNet] Loaded faucet operators from ${faucetOpsPath}`);
             }
         } catch (err) {
@@ -5883,6 +5925,7 @@ Usage: bun run dev/locSetupV4.ts [options]
     }
 
         const options: ProcessOptions = {
+            purge,
             jtmb: !!values.jtmb,
             l1Port,
             workerRealmCount,

@@ -7,9 +7,11 @@ pub mod redis_inspect;
 pub mod scylla_inspect;
 pub mod nats_inspect;
 pub mod chain_info;
+pub mod generate_genesis;
 pub mod rollback;
 
 use chain_info::ChainInfoArgs;
+use generate_genesis::GenerateGenesisDataArgs;
 use nats_inspect::NatsInspectArgs;
 use read_checkpoint_backup::ReadCheckpointBackupArgs;
 use read_realm_backup::ReadRealmBackupArgs;
@@ -42,4 +44,6 @@ pub enum Commands {
     ChainInfo(ChainInfoArgs),
     #[command(name = "rollback", about = "Generate or execute an offline role-local rollback plan")]
     Rollback(RollbackArgs),
+    #[command(name = "generate-genesis-data", about = "Write local-devnet genesis.json, private_keys.json, and faucetOperators.json")]
+    GenerateGenesisData(GenerateGenesisDataArgs),
 }

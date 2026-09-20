@@ -9,7 +9,7 @@
 `devnet_lifecycle.md` is the required operating procedure for local Psy devnet work: startup, shutdown,
 restart, and offline rollback keep the persisted Anvil chain, Scylla state, checkpoint files, and
 supervised processes aligned. Supported entry points are `make run-all`, `make restart`, `make
-rollback-stop`, `make rollback-resume`, `make shutdown`, and `make restart-all`.
+rollback-stop`, `make rollback-resume`, and `make shutdown`.
 
 ## Background
 
@@ -97,7 +97,7 @@ PSY_SKIP_BUILD=1 \
 make run-all
 ```
 
-`PURGE=1 make shutdown` removes checkpoints, `db/anvil/state.json`, logs, local deployments, and devnet Docker volumes; bare `make shutdown` is identical because purge is the Make default. `make restart-all` performs this purge followed by `make run-all`. Never delete only Scylla, the Anvil state, deployments, or `local_checkpoints/`; retained components would describe different chains.
+`PURGE=1 make shutdown` removes checkpoints, `db/anvil/state.json`, logs, local deployments, and devnet Docker volumes; bare `make shutdown` is identical because purge is the Make default. A fresh chain is `PURGE=1 make shutdown` followed by `make run-all`. Never delete only Scylla, the Anvil state, deployments, or `local_checkpoints/`; retained components would describe different chains.
 
 `make run-all` stays in the foreground. Run it in a dedicated terminal or tmux pane. Do not background it with `&`.
 
@@ -145,15 +145,16 @@ make restart
 
 `make restart` sends a command to the existing supervisor. It stops and recreates processors, edges, workers, proof services, APIs, indexers, relayer, and UIs from their recorded commands. The original Anvil process, database launcher, Scylla, Redis, NATS, Nostr, Envio containers, checkpoints, and logs remain active. Contract deployment and Envio storage initialization are not rerun.
 
-Anvil continuously saves the local L1 chain to `db/anvil/state.json`. A non-purge shutdown (`PURGE=0 make shutdown`) followed by `make run-all` loads that exact L1 state and reuses `psy-contracts/deployments/localhost/deployed-contracts.json`. The state and deployment must exist together; mismatch fails with an instruction to run `make restart-all`.
+Anvil continuously saves the local L1 chain to `db/anvil/state.json`. A non-purge shutdown (`PURGE=0 make shutdown`) followed by `make run-all` loads that exact L1 state and reuses `psy-contracts/deployments/localhost/deployed-contracts.json`. The state and deployment must exist together; mismatch fails with an instruction to run `PURGE=1 make shutdown` then `make run-all`.
 
 `PURGE=0 make shutdown` is a full process teardown that preserves the paired Anvil state, L2 databases, checkpoints, and deployments. A later `make run-all` restores the same chain. Bare `make shutdown` purges by default and deletes that state; use it only when a fresh chain is intended. For a complete fresh restart use:
 
 ```bash
-make restart-all
+PURGE=1 make shutdown
+make run-all
 ```
 
-`make restart-all` purges L1 and L2 together before starting a new chain. The equivalent single-command form passes `--purge` to the launcher, which runs the same paired purge (checkpoints, `db/anvil/state.json`, logs, localhost deployments, devnet Docker volumes) before any process starts and then deploys contracts fresh:
+That sequence purges L1 and L2 together before starting a new chain. The equivalent single-command form passes `--purge` to the launcher, which runs the same paired purge (checkpoints, `db/anvil/state.json`, logs, localhost deployments, devnet Docker volumes) before any process starts and then deploys contracts fresh:
 
 ```bash
 make run-all LOCSETUP_START_ARGS="... --purge"
@@ -219,9 +220,9 @@ The earlier checkpoint-289-to-0 run proved L2 rollback, convergence, and transac
 | Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data`; stale embedded circuit definitions can fail prove-proxy circuit construction. |
 | Cargo cannot authenticate to `git@github.com` | Set `CARGO_NET_GIT_FETCH_WITH_CLI=true`; repair empty cached submodules without deleting the whole Cargo git cache. |
 | Submodule fetch reports `early EOF` | Retry the same authenticated command. |
-| Scylla `raft operation add_entry timed out` during fresh schema creation | Run `make restart-all`; do not reuse the partial Scylla volume. |
-| Anvil state and localhost deployment do not both exist | Run `make restart-all`; do not regenerate or delete only one artifact. |
-| `db/anvil/state.json` is truncated or invalid JSON | The L1 snapshot is unusable. Do not repair it manually or claim L1 continuity. Use `make restart-all` for full-stack work; an explicitly authorized L2-only test may omit L1 and must record that limitation. |
+| Scylla `raft operation add_entry timed out` during fresh schema creation | Run `PURGE=1 make shutdown` then `make run-all`; do not reuse the partial Scylla volume. |
+| Anvil state and localhost deployment do not both exist | Run `PURGE=1 make shutdown` then `make run-all`; do not regenerate or delete only one artifact. |
+| `db/anvil/state.json` is truncated or invalid JSON | The L1 snapshot is unusable. Do not repair it manually or claim L1 continuity. Use `PURGE=1 make shutdown` then `make run-all` for full-stack work; an explicitly authorized L2-only test may omit L1 and must record that limitation. |
 | Database proof differs from checkpoint ring buffer proof | Keep the stack stopped and identify whether the DB history or ring buffer is stale; do not delete only one side. |
 | `rollback-stop` reports an application port still open | Keep the supervisor in `stopping`, terminate the tracked application process group, and retry `make rollback-stop`. Do not write the sentinel manually. |
 | `make restart` cannot reach the control socket | The foreground `make run-all` supervisor is absent. Start `make run-all` only when the preserved Anvil/deployment pair and retained databases are valid. |

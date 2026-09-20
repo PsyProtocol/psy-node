@@ -249,7 +249,7 @@ Stop the supervised stack without deleting state:
 PURGE=0 make shutdown
 ```
 
-`make shutdown` purges by default (`PURGE ?= 1` in the Makefile): it deletes checkpoints, `db/anvil/state.json`, logs, localhost deployments, and devnet Docker volumes; `PURGE=1 make shutdown` is the explicit equivalent. The shutdown target invokes the launcher teardown path (`Makefile:103-104`). Do not remove data directories manually.
+`make shutdown` purges by default (`PURGE ?= 1` in the Makefile): it deletes checkpoints, `db/anvil/state.json`, logs, localhost deployments, and devnet Docker volumes; `PURGE=1 make shutdown` is the explicit equivalent. The shutdown target invokes the launcher teardown path (`Makefile:99-100`). Do not remove data directories manually.
 
 ## 9. Implemented Network Capabilities
 

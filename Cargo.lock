@@ -7669,6 +7669,8 @@ dependencies = [
  "postcard",
  "pser",
  "psy_api_core",
+ "psy_cli_common",
+ "psy_client_common",
  "psy_config",
  "psy_core",
  "psy_data",
@@ -7699,6 +7701,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -8264,8 +8267,6 @@ dependencies = [
  "plonky2x",
  "postcard",
  "pser",
- "psy_cli_common",
- "psy_client_common",
  "psy_common_circuit",
  "psy_core",
  "psy_crypto",

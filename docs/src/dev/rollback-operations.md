@@ -246,7 +246,7 @@ A zero exit code for one identity does not complete the other four. Require ever
 
 ## 7. Failure and resume procedure
 
-Throughout generation, execution, recovery, and resume: **no purge and no teardown**. This prohibits `make shutdown`, `PURGE=0 make shutdown`, `make restart-all`, launcher `--teardown`/`--purge`, Docker teardown, manual per-service restart, deleting retained files, and substituting `make run-all`. Preserve the original supervisor, Anvil and its snapshot/deployment pair, Scylla, Redis, NATS, checkpoint files, logs, keys, runtime config, sentinel, and RPs (`docs/src/dev/devnet_lifecycle.md:166,197,234-243`).
+Throughout generation, execution, recovery, and resume: **no purge and no teardown**. This prohibits `make shutdown`, `PURGE=0 make shutdown`, `PURGE=1 make shutdown`, launcher `--teardown`/`--purge`, Docker teardown, manual per-service restart, deleting retained files, and substituting `make run-all`. Preserve the original supervisor, Anvil and its snapshot/deployment pair, Scylla, Redis, NATS, checkpoint files, logs, keys, runtime config, sentinel, and RPs (`docs/src/dev/devnet_lifecycle.md:166,197,234-243`).
 
 | Failure | Required action |
 |---|---|

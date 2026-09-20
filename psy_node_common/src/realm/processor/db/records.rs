@@ -112,10 +112,10 @@ where
     Ok(())
 }
 
-/// Nonempty FFS-changed leaves on IMT-indexed trees.
-/// Zeroed leaves omitted. Append index is the previous checkpoint's.
+/// Nonzero FFS-changed leaves identified as IMT by this update or a previous-checkpoint preimage.
 pub(crate) async fn load_changed_leaves_on_imt_indexed_trees<S, F, Hash>(
     db: &S,
+    previous_checkpoint_id: u64,
     updates: &PsyPreparedRealmBlockStateUpdates<Hash>,
 ) -> anyhow::Result<HashSet<(u64, u64, u64)>>
 where
@@ -123,31 +123,37 @@ where
     F: parth_core::felt::QFelt64,
     Hash: Q256BitHash + Copy + PartialEq,
 {
+    require_width(
+        &updates.update_contract_state_imt_leaves_ffs,
+        IMT_LEAF_FFS_ENTRY_SIZE_V2,
+        "IMT leaf FFS",
+    )?;
+    let mut update_imt_leaves = HashSet::new();
+    for chunk in updates
+        .update_contract_state_imt_leaves_ffs
+        .chunks_exact(IMT_LEAF_FFS_ENTRY_SIZE_V2)
+    {
+        let (user_id, contract_id, index, _, _, _, _, _, _) =
+            deserialize_imt_leaf_ffs_entry_v2(chunk)?;
+        update_imt_leaves.insert((user_id, contract_id, index));
+    }
     let empty_leaf = Hash::from_owned_32bytes([0u8; 32]);
-    let mut changed_trees: HashMap<(u64, u64), Vec<u64>> = HashMap::new();
+    let mut required_imt_leaves = HashSet::new();
     for ((user_id, contract_id, index), new_value) in contract_state_leaves_from_ffs(updates)? {
         if new_value == empty_leaf {
             continue;
         }
-        changed_trees
-            .entry((user_id, contract_id))
-            .or_default()
-            .push(index);
-    }
-    let mut changed_leaves_on_imt_indexed_trees = HashSet::new();
-    for ((user_id, contract_id), leaves) in changed_trees {
-        let next_append_index = db
-            .contract_state_imt_get_next_append_index(user_id, contract_id)
-            .await
-            .with_context(|| format!("previous-checkpoint IMT append index read failed user={user_id} contract={contract_id}"))?;
-        if next_append_index == 0 {
-            continue;
-        }
-        for index in leaves {
-            changed_leaves_on_imt_indexed_trees.insert((user_id, contract_id, index));
+        if update_imt_leaves.contains(&(user_id, contract_id, index))
+            || db
+                .contract_state_imt_get_leaf_preimage(previous_checkpoint_id, user_id, contract_id, index)
+                .await
+                .with_context(|| format!("previous-checkpoint IMT preimage read failed checkpoint={previous_checkpoint_id} user={user_id} contract={contract_id} index={index}"))?
+                .is_some()
+        {
+            required_imt_leaves.insert((user_id, contract_id, index));
         }
     }
-    Ok(changed_leaves_on_imt_indexed_trees)
+    Ok(required_imt_leaves)
 }
 
 #[cfg(test)]
@@ -408,18 +414,19 @@ mod tests {
 
     struct IMTPreimageFixture {
         next_append: HashMap<(u64, u64), u64>,
+        preimages: HashMap<(u64, u64, u64, u64), IMTContractStateLeaf<PGoldilocksFelt, PGoldilocksHash>>,
     }
 
     #[async_trait::async_trait]
     impl psy_node_core::psy_core_db::traits::full::PsyNodeContractStateIMTDatabaseReader<PGoldilocksFelt, PGoldilocksHash> for IMTPreimageFixture {
         async fn contract_state_imt_get_leaf_preimage(
             &self,
-            _checkpoint_id: u64,
-            _user_id: u64,
-            _contract_id: u64,
-            _leaf_index: u64,
+            checkpoint_id: u64,
+            user_id: u64,
+            contract_id: u64,
+            leaf_index: u64,
         ) -> anyhow::Result<Option<IMTContractStateLeaf<PGoldilocksFelt, PGoldilocksHash>>> {
-            Ok(None)
+            Ok(self.preimages.get(&(checkpoint_id, user_id, contract_id, leaf_index)).cloned())
         }
 
         async fn contract_state_imt_get_leaf_index_for_key(
@@ -463,49 +470,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_changed_leaves_on_imt_indexed_trees_follow_append_index() {
-        let mut imt_indexed_tree = IMTPreimageFixture { next_append: HashMap::new() };
-        imt_indexed_tree.next_append.insert((1, 2), 2);
-
-        let mut new_key = empty_updates(
-            PGoldilocksHash::from_owned_32bytes([1u8; 32]),
-            PGoldilocksHash::from_owned_32bytes([2u8; 32]),
-        );
-        new_key.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 5, 0x07);
-        let changed_leaves_on_imt_indexed_trees = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&imt_indexed_tree, &new_key)
-            .await
-            .unwrap();
-        assert_eq!(changed_leaves_on_imt_indexed_trees, HashSet::from_iter([(1u64, 2u64, 5u64)]));
-        let error = require_state_update_record_coverage(&new_key, 1, &changed_leaves_on_imt_indexed_trees)
-            .expect_err("new key on an IMT-indexed tree without IMT record must fail");
+    async fn history_changed_leaves_require_existing_imt_identity() {
+        let mut db = IMTPreimageFixture {
+            next_append: HashMap::from([((1, 2), 2)]),
+            preimages: HashMap::from([((7, 1, 2, 0), IMTContractStateLeaf::default())]),
+        };
+        let hash = PGoldilocksHash::from_owned_32bytes([1u8; 32]);
+        let mut updates = empty_updates(hash, hash);
+        updates.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, 0x05);
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        assert_eq!(required, HashSet::from([(1, 2, 0)]));
+        let error = require_state_update_record_coverage(&updates, 8, &required)
+            .expect_err("known IMT identity without a record must fail");
         assert!(error.to_string().contains("no IMT record"), "{error}");
 
-        let mut tracked_changed = empty_updates(
-            PGoldilocksHash::from_owned_32bytes([1u8; 32]),
-            PGoldilocksHash::from_owned_32bytes([2u8; 32]),
-        );
-        tracked_changed.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, 0x05);
-        let tracked_changed_leaves = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&imt_indexed_tree, &tracked_changed)
-            .await
-            .unwrap();
-        assert_eq!(tracked_changed_leaves, HashSet::from_iter([(1u64, 2u64, 0u64)]));
+        updates.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, 0);
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        assert!(required.is_empty(), "cleared IMT leaves remain exempt");
 
-        let positional_tree = IMTPreimageFixture { next_append: HashMap::new() };
-        let positional_changed_leaves = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&positional_tree, &tracked_changed)
-            .await
-            .unwrap();
-        assert!(positional_changed_leaves.is_empty(), "trees with no IMT entries are positional");
-        require_state_update_record_coverage(&tracked_changed, 1, &positional_changed_leaves)
-            .expect("collector output for a positional leaf must pass coverage");
+        updates.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, 0x05);
+        db.preimages.clear();
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        assert!(required.is_empty(), "append marker alone does not identify IMT leaves");
+        require_state_update_record_coverage(&updates, 8, &required).unwrap();
+    }
 
-        let mut cleared = empty_updates(
-            PGoldilocksHash::from_owned_32bytes([1u8; 32]),
-            PGoldilocksHash::from_owned_32bytes([2u8; 32]),
-        );
-        cleared.update_contract_state_tree_nodes_ffs = contract_state_leaf_ffs(1, 2, 0, 0x00);
-        let cleared_leaves = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&imt_indexed_tree, &cleared)
-            .await
-            .unwrap();
-        assert!(cleared_leaves.is_empty(), "leaf cleared to zero keeps the no-IMT behavior");
+    #[tokio::test]
+    async fn history_changed_leaves_mixed_positional_and_imt_coverage() {
+        let db = IMTPreimageFixture {
+            next_append: HashMap::from([((1, 2), 2147483673)]),
+            preimages: HashMap::from([((7, 1, 2, 2147483671), IMTContractStateLeaf::default())]),
+        };
+        let hash = PGoldilocksHash::from_owned_32bytes([1u8; 32]);
+        let mut updates = empty_updates(hash, hash);
+        for index in [0, 2147483671, 2147483672] {
+            updates.update_contract_state_tree_nodes_ffs.extend(contract_state_leaf_ffs(1, 2, index, 0x05));
+        }
+        for index in [2147483671, 2147483672] {
+            updates.update_contract_state_imt_leaves_ffs.extend_from_slice(
+                &psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+                    1, 2, index, &hash, &hash, &hash, &hash, 0, index == 2147483672,
+                ),
+            );
+        }
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        assert_eq!(required, HashSet::from([(1, 2, 2147483671), (1, 2, 2147483672)]));
+        require_state_update_record_coverage(&updates, 8, &required)
+            .expect("mixed positional and IMT changes must pass coverage");
+
+        updates.update_contract_state_imt_leaves_ffs.drain(..IMT_LEAF_FFS_ENTRY_SIZE_V2);
+        let required = load_changed_leaves_on_imt_indexed_trees::<_, PGoldilocksFelt, PGoldilocksHash>(&db, 7, &updates).await.unwrap();
+        assert_eq!(required, HashSet::from([(1, 2, 2147483671), (1, 2, 2147483672)]));
+        let error = require_state_update_record_coverage(&updates, 8, &required)
+            .expect_err("omitting a changed existing IMT record must still fail");
+        assert!(error.to_string().contains("index=2147483671 has no IMT record"), "{error}");
     }
 }

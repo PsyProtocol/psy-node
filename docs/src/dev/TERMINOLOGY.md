@@ -233,3 +233,4 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 5. A verb-table gloss uses only registered verbs plus concrete OS mechanics, never a synonym.
 6. A `RealmTransition` is `transition`. Do not name it `pair`.
 7. Receiver identity for private notes and deposit claims is `shield_address`. Do not name it `note_owner`.
+8. `explicit` is not a domain name. A keystore path is `set` or `default`.

@@ -1,2 +1,2 @@
-mod local_devnet;
+pub mod local_devnet;
 pub mod resolver;

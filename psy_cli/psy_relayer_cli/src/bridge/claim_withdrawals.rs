@@ -44,6 +44,10 @@ sol! {
     function claimedNullifiers(bytes32 nullifier) view returns (bool);
 
     function balanceOf(address account) view returns (uint256);
+
+    function withdrawalSubtreeRoot() view returns (bytes32);
+
+    function knownWithdrawalSubtreeRoots(bytes32 root) view returns (bool);
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,15 +58,6 @@ struct WithdrawalClaimProofResult {
     pub siblings: Option<Vec<String>>,
 }
 
-fn select_claim_proof_poll_result(
-    final_result: Option<WithdrawalClaimProofResult>,
-    last_not_ready: Option<WithdrawalClaimProofResult>,
-    last_err: Option<anyhow::Error>,
-) -> Result<WithdrawalClaimProofResult> {
-    final_result
-        .or(last_not_ready)
-        .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("claim proof fetch exhausted without response")))
-}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchWithdrawalsReport {
@@ -74,9 +69,9 @@ pub struct BatchWithdrawalsReport {
     #[serde(default)]
     pub failure_reasons: HashMap<String, String>,
     /// Withdrawals held back for a reason that resolves on its own, and that
-    /// therefore must not spend one of the claim's limited attempts. Today
-    /// that means waiting for bridge liquidity: the claim is correct, the
-    /// bridge simply cannot pay it yet.
+    /// therefore must not spend one of the claim's limited attempts: waiting
+    /// for a services proof that is not found yet, or waiting for bridge
+    /// liquidity. Unauthorized withdrawal roots are failures, not deferrals.
     #[serde(default)]
     pub deferrals: HashMap<String, String>,
 }
@@ -181,35 +176,108 @@ async fn fetch_claim_proof(
     resp.data.ok_or_else(|| anyhow::anyhow!("psy-services returned success but no data"))
 }
 
-/// Normalize L1 withdrawalSubtreeRoot (big-endian bytes32, u32 words MSB-first)
-/// to the services u32x8 little-endian word order (LSB-first) for comparison.
-///
-/// L1 stores the 8 × u32 limbs as bytes32 with word 7 (most significant) first.
-/// psy-services returns the same 8 limbs with word 0 (least significant) first.
-/// The two formats differ only by word-order reversal.
-pub(crate) fn normalize_l1_root_for_services(l1_hex: &str) -> String {
-    let raw = l1_hex.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if raw.len() != 64 {
-        return l1_hex.to_string();
+fn reverse_u32x8_root_hex(hex: &str) -> Result<[u8; 32]> {
+    let raw = hex.trim().trim_start_matches("0x").trim_start_matches("0X");
+    anyhow::ensure!(raw.len() == 64, "expected 64 hex chars, got {}", raw.len());
+    let bytes = hex::decode(raw).context("invalid root hex")?;
+    anyhow::ensure!(bytes.len() == 32, "expected 32 root bytes, got {}", bytes.len());
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        let src = (7 - i) * 4;
+        out[i * 4..i * 4 + 4].copy_from_slice(&bytes[src..src + 4]);
     }
-    // Split into 8 × 8-char u32 words, emit in reverse order
-    let mut out = String::with_capacity(66);
-    out.push_str("0x");
-    for i in (0..64).step_by(8).rev() {
-        out.push_str(&raw[i..i + 8]);
-    }
-    out
+    Ok(out)
 }
 
-async fn read_l1_withdrawal_subtree_root<P: Provider>(provider: &P, state_manager: Address) -> Result<String> {
-    let raw = provider.call(
-        TransactionRequest::default()
-            .to(state_manager)
-            .input(alloy_primitives::Bytes::from(hex::decode("7cd34bf4").unwrap()).into()),
-    ).await?;
-    anyhow::ensure!(raw.len() >= 32, "withdrawalSubtreeRoot returned {} bytes", raw.len());
-    Ok(format!("0x{}", hex::encode(&raw[..32])))
+async fn read_l1_withdrawal_subtree_root<P: Provider>(provider: &P, state_manager: Address) -> Result<B256> {
+    let call = withdrawalSubtreeRootCall {};
+    let tx = TransactionRequest::default().to(state_manager).input(call.abi_encode().into());
+    let raw = provider.call(tx).await.context("withdrawalSubtreeRoot eth_call failed")?;
+    withdrawalSubtreeRootCall::abi_decode_returns(&raw).context("failed to decode withdrawalSubtreeRoot return")
 }
+
+async fn read_known_withdrawal_subtree_root<P: Provider>(
+    provider: &P,
+    state_manager: Address,
+    root: B256,
+) -> Result<bool> {
+    let call = knownWithdrawalSubtreeRootsCall { root };
+    let tx = TransactionRequest::default().to(state_manager).input(call.abi_encode().into());
+    let raw = provider.call(tx).await.context("knownWithdrawalSubtreeRoots eth_call failed")?;
+    knownWithdrawalSubtreeRootsCall::abi_decode_returns(&raw)
+        .context("failed to decode knownWithdrawalSubtreeRoots return")
+}
+
+async fn check_withdrawal_root_on_l1<P: Provider>(
+    provider: &P,
+    state_manager: Address,
+    services_root_hex: &str,
+) -> Result<(bool, String)> {
+    let proof_root = B256::from(
+        reverse_u32x8_root_hex(services_root_hex).context("invalid withdrawal_root encoding")?,
+    );
+    let current = read_l1_withdrawal_subtree_root(provider, state_manager).await?;
+    let current_root_hex = format!("0x{}", hex::encode(current));
+    if proof_root == current {
+        return Ok((true, current_root_hex));
+    }
+    let known = read_known_withdrawal_subtree_root(provider, state_manager, proof_root).await?;
+    Ok((
+        withdrawal_root_is_authorized(proof_root, current, known),
+        current_root_hex,
+    ))
+}
+
+fn withdrawal_root_is_authorized(proof_root: B256, current_root: B256, historically_known: bool) -> bool {
+    proof_root == current_root || historically_known
+}
+
+
+async fn poll_claim_proof<P: Provider>(
+    http: &reqwest::Client,
+    services_url: &str,
+    provider: &P,
+    state_manager: Address,
+    withdrawal: &PendingWithdrawal,
+    max_attempts: usize,
+    retry_delay: Duration,
+) -> Result<WithdrawalClaimProofResult> {
+    anyhow::ensure!(max_attempts > 0, "claim proof fetch requires at least one attempt");
+    let mut latest: Result<WithdrawalClaimProofResult> =
+        Err(anyhow::anyhow!("claim proof fetch exhausted without response"));
+    for attempt in 1..=max_attempts {
+        latest = match fetch_claim_proof(http, services_url, withdrawal).await {
+            Ok(r) if !r.found => Ok(r),
+            Ok(r) => {
+                if let Some(root_hex) = r.withdrawal_root.clone() {
+                    match check_withdrawal_root_on_l1(provider, state_manager, &root_hex).await {
+                        Ok((true, _)) => return Ok(r),
+                        Ok((false, l1_root)) => {
+                            tracing::debug!(
+                                services_root = %root_hex,
+                                l1_root = %l1_root,
+                                attempt,
+                                max_attempts,
+                                "claim proof root is not current or known; will retry"
+                            );
+                            Ok(r)
+                        }
+                        Err(err) => Err(err.context("check L1 withdrawal root failed")),
+                    }
+                } else {
+                    return Ok(r);
+                }
+            }
+            Err(err) => Err(err),
+        };
+        if attempt < max_attempts {
+            tokio::time::sleep(retry_delay).await;
+        }
+    }
+    latest
+}
+
+
 
 async fn withdrawal_already_claimed<P: Provider>(
     provider: &P,
@@ -673,95 +741,45 @@ pub async fn submit_batch(
             // the on-chain liquidity check provides the authoritative guard.
         }
 
-        let proof_result = {
-            let mut last_err: Option<anyhow::Error> = None;
-            let mut last_not_ready: Option<WithdrawalClaimProofResult> = None;
-            let mut final_result: Option<WithdrawalClaimProofResult> = None;
-            for attempt in 1..=CLAIM_PROOF_FETCH_MAX_ATTEMPTS {
-                match fetch_claim_proof(&http, services_url, w).await {
-                    Ok(r) => {
-                        if !r.found {
-                            tracing::debug!(
-                                index = i,
-                                attempt,
-                                max_attempts = CLAIM_PROOF_FETCH_MAX_ATTEMPTS,
-                                retry_delay_secs = CLAIM_PROOF_FETCH_RETRY_DELAY_SECS,
-                                recipient = %recipient_addr,
-                                "withdrawal claim proof not ready yet; will retry"
-                            );
-                            last_not_ready = Some(r);
-                        } else if let Some(ref root_hex) = r.withdrawal_root {
-                            match read_l1_withdrawal_subtree_root(&provider, state_manager).await {
-                                Ok(l1_root) => {
-                                    let normalized_l1 = normalize_l1_root_for_services(&l1_root);
-                                    let root_match = normalized_l1.trim_start_matches("0x").eq_ignore_ascii_case(
-                                        root_hex.trim_start_matches("0x")
-                                    );
-                                    tracing::debug!(
-                                        services_root = %root_hex,
-                                        l1_root = %l1_root,
-                                        root_match,
-                                        attempt,
-                                        max_attempts = CLAIM_PROOF_FETCH_MAX_ATTEMPTS,
-                                        retry_delay_secs = CLAIM_PROOF_FETCH_RETRY_DELAY_SECS,
-                                        "claim proof root comparison"
-                                    );
-                                    if root_match {
-                                        final_result = Some(r);
-                                        break;
-                                    }
-                                    final_result = Some(r);
-                                }
-                                Err(err) => {
-                                    last_err = Some(err.context("read L1 withdrawalSubtreeRoot failed"));
-                                }
-                            }
-                        } else {
-                            final_result = Some(r);
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        last_err = Some(err);
-                    }
-                }
-                if attempt < CLAIM_PROOF_FETCH_MAX_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_secs(CLAIM_PROOF_FETCH_RETRY_DELAY_SECS)).await;
-                }
-            }
-            match select_claim_proof_poll_result(final_result, last_not_ready, last_err) {
-                Ok(r) => r,
-                Err(err) => {
-                    failure_reasons.insert(w.leaf_hash.clone(), format!("fetch claim proof failed: {err}"));
-                    tracing::error!(index = i, recipient = %recipient_addr, error = %err, "fetch claim proof failed, skipping");
-                    continue;
-                }
+        let proof_result = match poll_claim_proof(
+            &http,
+            services_url,
+            &provider,
+            state_manager,
+            w,
+            CLAIM_PROOF_FETCH_MAX_ATTEMPTS,
+            Duration::from_secs(CLAIM_PROOF_FETCH_RETRY_DELAY_SECS),
+        ).await {
+            Ok(r) => r,
+            Err(err) => {
+                failure_reasons.insert(w.leaf_hash.clone(), format!("fetch claim proof failed: {err}"));
+                tracing::error!(index = i, recipient = %recipient_addr, error = %err, "fetch claim proof failed, skipping");
+                continue;
             }
         };
 
         if !proof_result.found {
-            failure_reasons.insert(w.leaf_hash.clone(), "withdrawal claim proof not available yet; L1 root not finalized".to_string());
+            deferrals.insert(w.leaf_hash.clone(), "withdrawal claim proof not available yet; L1 root not finalized".to_string());
             tracing::info!(index = i, recipient = %recipient_addr, "withdrawal claim proof not available yet (L1 root not finalized); deferring to next round");
             continue;
         }
-        if let Some(ref root_hex) = proof_result.withdrawal_root {
-            let l1_root = match read_l1_withdrawal_subtree_root(&provider, state_manager).await {
-                Ok(r) => r,
+        if let Some(root_hex) = &proof_result.withdrawal_root {
+            match check_withdrawal_root_on_l1(&provider, state_manager, root_hex).await {
+                Ok((true, _)) => {}
+                Ok((false, l1_root)) => {
+                    failure_reasons.insert(w.leaf_hash.clone(), format!("withdrawal root is not current or known: services={} l1={}", root_hex, l1_root));
+                    tracing::warn!(index = i, recipient = %recipient_addr, services_root = %root_hex, l1_root = %l1_root, "withdrawal root is not current or known after retries, skipping");
+                    continue;
+                }
                 Err(err) => {
                     failure_reasons.insert(w.leaf_hash.clone(), format!("failed to read L1 withdrawal root: {err}"));
                     tracing::error!(index = i, recipient = %recipient_addr, error = %err, "failed to read L1 withdrawal root, skipping");
                     continue;
                 }
-            };
-            let root_match = normalize_l1_root_for_services(&l1_root)
-                .trim_start_matches("0x")
-                .eq_ignore_ascii_case(root_hex.trim_start_matches("0x"));
-            if !root_match {
-                failure_reasons.insert(w.leaf_hash.clone(), format!("withdrawal root still mismatched after retries: services={} l1={}", root_hex, l1_root));
-                tracing::warn!(index = i, recipient = %recipient_addr, services_root = %root_hex, l1_root = %l1_root, "withdrawal root mismatch after retries, skipping");
-                continue;
             }
         }
+
+
 
         let leaf_index = match proof_result.leaf_index {
             Some(idx) => idx,
@@ -1089,13 +1107,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_l1_root_for_services_reverses_u32_word_order() {
-        let root =
+    fn reverse_u32x8_root_hex_reverses_word_order() {
+        let display =
             "0x1111111122222222333333334444444455555555666666667777777788888888";
         assert_eq!(
-            normalize_l1_root_for_services(root),
-            "0x8888888877777777666666665555555544444444333333332222222211111111"
+            hex::encode(reverse_u32x8_root_hex(display).expect("valid 32-byte root")),
+            "8888888877777777666666665555555544444444333333332222222211111111"
         );
+    }
+
+    #[test]
+    fn reverse_u32x8_root_hex_rejects_malformed_input() {
+        assert!(reverse_u32x8_root_hex("0x11").is_err());
+        assert!(reverse_u32x8_root_hex("0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    #[test]
+    fn withdrawal_root_is_authorized_for_current_or_known_history() {
+        let current = B256::from([0x11; 32]);
+        let historical = B256::from([0x22; 32]);
+        let unknown = B256::from([0x33; 32]);
+        assert!(withdrawal_root_is_authorized(current, current, false));
+        assert!(withdrawal_root_is_authorized(historical, current, true));
+        assert!(!withdrawal_root_is_authorized(unknown, current, false));
+        assert!(!withdrawal_root_is_authorized(historical, current, false));
     }
 
     #[test]
@@ -1140,76 +1175,365 @@ mod tests {
         assert!(!address_high_bits_are_zero([1, 0, 0, 1, 2, 3, 4, 5]));
     }
 
-    // ── claim-scheduling fix (commit 7522ca93): poll-result classification ─
+    use alloy_provider::ProviderBuilder;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
 
-    /// Build a `WithdrawalClaimProofResult` with only the fields the
-    /// classification tests need. `leaf_index` is the discriminator used to
-    /// tell which candidate a call returned.
-    fn proof_result(found: bool, leaf_index: Option<u32>) -> WithdrawalClaimProofResult {
-        WithdrawalClaimProofResult {
-            found,
-            leaf_index,
-            withdrawal_root: None,
-            siblings: None,
+    const STATE_MANAGER: Address = Address::repeat_byte(0x53);
+    const DISPLAY_ROOT: &str =
+        "0x1111111122222222333333334444444455555555666666667777777788888888";
+
+    fn dummy_withdrawal() -> PendingWithdrawal {
+        PendingWithdrawal {
+            event_id: 1,
+            checkpoint_id: 1,
+            user_id: 1,
+            sender_user_id: 1,
+            contract_id: 0,
+            destination_chain_index: 0,
+            token_address: [0; 8],
+            amount: [0, 0, 0, 0, 0, 0, 0, 1],
+            recipient: [0; 8],
+            nonce: [0; 8],
+            leaf_hash: "leaf".to_string(),
         }
     }
 
-    #[test]
-    fn select_claim_proof_poll_result_prefers_final_over_not_ready_and_error() {
-        // Defends the poll-result priority contract: a found=true final result
-        // is preferred over a found=false not-ready result AND over a fetch
-        // error (final > not_ready > err). A regression that swaps the `.or()`
-        // ordering (preferring not_ready, or surfacing the error when a final
-        // result exists) reddens this test. We distinguish the two results by
-        // leaf_index so the assertion proves the final one was returned.
-        let final_r = proof_result(true, Some(111));
-        let not_ready = proof_result(false, Some(222));
-        let chosen = select_claim_proof_poll_result(
-            Some(final_r),
-            Some(not_ready),
-            Some(anyhow::anyhow!("transient fetch error")),
+    fn l1_bytes_from_display(display: &str) -> [u8; 32] {
+        reverse_u32x8_root_hex(display).expect("valid display root")
+    }
+
+    fn abi_word(bytes: &[u8; 32]) -> String {
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    fn abi_bool(value: bool) -> String {
+        let mut word = [0u8; 32];
+        if value {
+            word[31] = 1;
+        }
+        abi_word(&word)
+    }
+
+    fn services_body(found: bool, root: Option<&str>) -> String {
+        json!({
+            "success": true,
+            "data": {
+                "found": found,
+                "leaf_index": 7,
+                "withdrawal_root": root,
+                "siblings": Value::Null,
+            }
+        })
+        .to_string()
+    }
+
+    async fn read_http_exchange(
+        listener: &TcpListener,
+    ) -> (Value, tokio::io::BufReader<tokio::net::TcpStream>, bool) {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut line = String::new();
+        let mut length = 0;
+        let mut is_get = false;
+        loop {
+            line.clear();
+            assert!(socket.read_line(&mut line).await.unwrap() > 0);
+            if line.starts_with("GET ") {
+                is_get = true;
+            }
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+        }
+        let mut body = vec![0; length];
+        if length > 0 {
+            socket.read_exact(&mut body).await.unwrap();
+        }
+        let actual = if is_get {
+            json!({"method": "GET"})
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
+        (actual, socket, is_get)
+    }
+
+    async fn write_http(socket: &mut BufReader<tokio::net::TcpStream>, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        );
+        socket.get_mut().write_all(response.as_bytes()).await.unwrap();
+    }
+
+    fn call_input(actual: &Value) -> String {
+        let params = &actual["params"][0];
+        params
+            .get("data")
+            .or_else(|| params.get("input"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase()
+    }
+
+    enum EthCall {
+        Current([u8; 32]),
+        Known { expected_root: [u8; 32], known: bool },
+        RpcError(&'static str),
+    }
+
+    async fn serve_eth_calls(listener: TcpListener, calls: Vec<EthCall>) {
+        let current_sel = hex::encode(withdrawalSubtreeRootCall {}.abi_encode());
+        let known_sel = hex::encode(knownWithdrawalSubtreeRootsCall { root: B256::ZERO }.abi_encode());
+        let current_sel = &current_sel[..8];
+        let known_sel = &known_sel[..8];
+        let mut remaining = calls;
+        while !remaining.is_empty() {
+            let (actual, mut socket, _) = read_http_exchange(&listener).await;
+            let method = actual["method"].as_str().unwrap_or("");
+            if method != "eth_call" {
+                let body = json!({"jsonrpc":"2.0","id": actual["id"], "result": "0x1"}).to_string();
+                write_http(&mut socket, "200 OK", &body).await;
+                continue;
+            }
+            let input = call_input(&actual);
+            let selector = input.trim_start_matches("0x").get(..8).unwrap_or("");
+            let scripted = remaining.remove(0);
+            let body = match scripted {
+                EthCall::Current(root) => {
+                    assert_eq!(selector, current_sel, "expected withdrawalSubtreeRoot, got {input}");
+                    json!({"jsonrpc":"2.0","id": actual["id"], "result": abi_word(&root)}).to_string()
+                }
+                EthCall::Known { expected_root, known } => {
+                    assert_eq!(selector, known_sel, "expected knownWithdrawalSubtreeRoots, got {input}");
+                    let arg = input.trim_start_matches("0x").get(8..).unwrap_or("");
+                    assert_eq!(arg, hex::encode(expected_root), "mapping must receive reversed L1 bytes32");
+                    json!({"jsonrpc":"2.0","id": actual["id"], "result": abi_bool(known)}).to_string()
+                }
+                EthCall::RpcError(message) => {
+                    json!({"jsonrpc":"2.0","id": actual["id"], "error": {"code": -32000, "message": message}}).to_string()
+                }
+            };
+            write_http(&mut socket, "200 OK", &body).await;
+        }
+    }
+
+    async fn serve_services(listener: TcpListener, bodies: Vec<Result<String, u16>>) {
+        for body in bodies {
+            let (_, mut socket, is_get) = read_http_exchange(&listener).await;
+            assert!(is_get, "services proof is fetched with GET");
+            match body {
+                Ok(json_body) => write_http(&mut socket, "200 OK", &json_body).await,
+                Err(503) => write_http(&mut socket, "503 Service Unavailable", "{\"error\":\"RPC 503 upstream\"}").await,
+                Err(code) => write_http(&mut socket, &format!("{code} Error"), "{}").await,
+            }
+        }
+    }
+
+    async fn join_fixture(mut server: tokio::task::JoinHandle<()>) {
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        server.abort();
+        joined.expect("unused fixture requests").expect("fixture assertion failed");
+    }
+
+    async fn with_l1<T, F, Fut>(calls: Vec<EthCall>, f: F) -> T
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(serve_eth_calls(listener, calls));
+        let out = f(url).await;
+        join_fixture(server).await;
+        out
+    }
+
+    async fn with_services_and_l1<T, F, Fut>(
+        services: Vec<Result<String, u16>>,
+        calls: Vec<EthCall>,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce(String, String) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let services_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let services_url = format!("http://{}", services_listener.local_addr().unwrap());
+        let rpc_url = format!("http://{}", rpc_listener.local_addr().unwrap());
+        let services_server = tokio::spawn(serve_services(services_listener, services));
+        let rpc_server = tokio::spawn(serve_eth_calls(rpc_listener, calls));
+        let out = f(services_url, rpc_url).await;
+        join_fixture(services_server).await;
+        join_fixture(rpc_server).await;
+        out
+    }
+
+    #[tokio::test]
+    async fn current_withdrawal_root_is_authorized_on_l1() {
+        let l1_root = l1_bytes_from_display(DISPLAY_ROOT);
+        let (authorized, _) = with_l1(vec![EthCall::Current(l1_root)], |url| async move {
+            let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+            check_withdrawal_root_on_l1(&provider, STATE_MANAGER, DISPLAY_ROOT).await.unwrap()
+        })
+        .await;
+        assert!(authorized);
+    }
+
+    #[tokio::test]
+    async fn historically_known_withdrawal_root_is_authorized_on_l1() {
+        let proof_l1 = l1_bytes_from_display(DISPLAY_ROOT);
+        let current = [0xaau8; 32];
+        let (authorized, _) = with_l1(
+            vec![
+                EthCall::Current(current),
+                EthCall::Known { expected_root: proof_l1, known: true },
+            ],
+            |url| async move {
+                let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+                check_withdrawal_root_on_l1(&provider, STATE_MANAGER, DISPLAY_ROOT).await.unwrap()
+            },
         )
-        .expect("final result must win over not-ready and error");
-        assert!(chosen.found, "final found=true must be returned, not the not-ready");
-        assert_eq!(
-            chosen.leaf_index,
-            Some(111),
-            "must return the final result, not the not-ready one"
-        );
+        .await;
+        assert!(authorized);
+    }
+
+    #[tokio::test]
+    async fn unknown_withdrawal_root_is_rejected_on_l1() {
+        let proof_l1 = l1_bytes_from_display(DISPLAY_ROOT);
+        let (authorized, _) = with_l1(
+            vec![
+                EthCall::Current([0xaau8; 32]),
+                EthCall::Known { expected_root: proof_l1, known: false },
+            ],
+            |url| async move {
+                let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+                check_withdrawal_root_on_l1(&provider, STATE_MANAGER, DISPLAY_ROOT).await.unwrap()
+            },
+        )
+        .await;
+        assert!(!authorized);
+    }
+
+    #[tokio::test]
+    async fn history_mapping_rpc_error_is_a_failure() {
+        let err = with_l1(
+            vec![EthCall::Current([0xaau8; 32]), EthCall::RpcError("RPC 503 upstream")],
+            |url| async move {
+                let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+                check_withdrawal_root_on_l1(&provider, STATE_MANAGER, DISPLAY_ROOT).await.unwrap_err()
+            },
+        )
+        .await;
+        assert!(err.to_string().contains("RPC 503 upstream") || err.to_string().contains("eth_call"));
     }
 
     #[test]
-    fn select_claim_proof_poll_result_returns_not_ready_when_no_final_so_caller_defers() {
-        // Defends the found=false classification contract: when only a
-        // not-ready (found=false) response was seen, the function must return
-        // it — so the caller's `!proof_result.found` branch defers to the next
-        // round — rather than erroring. A regression that errors on found=false
-        // (the pre-fix behaviour, which misreported a not-yet-finalized root
-        // as a fetch failure) would surface an error string instead and fail.
-        let not_ready = proof_result(false, Some(222));
-        let chosen = select_claim_proof_poll_result(None, Some(not_ready), None)
-            .expect("not-ready result must be returned, not errored");
-        assert!(!chosen.found);
-        assert_eq!(chosen.leaf_index, Some(222));
+    fn malformed_withdrawal_root_hex_is_a_failure() {
+        assert!(reverse_u32x8_root_hex("0x11").is_err());
     }
 
-    #[test]
-    fn select_claim_proof_poll_result_surfaces_real_error_when_no_response() {
-        // Defends the error-surfacing contract: with no final and no not-ready
-        // result but a real fetch error present, the function must surface
-        // THAT error — not the generic "exhausted without response" string —
-        // so the caller logs the actual failure cause. A regression that
-        // discards last_err in favour of the generic message reddens this.
-        let err = select_claim_proof_poll_result(None, None, Some(anyhow::anyhow!("RPC 503 upstream")))
-            .unwrap_err();
+    #[tokio::test]
+    async fn poll_replaces_unauthorized_root_with_later_rpc_error() {
+        let proof_l1 = l1_bytes_from_display(DISPLAY_ROOT);
+        let err = with_services_and_l1(
+            vec![
+                Ok(services_body(true, Some(DISPLAY_ROOT))),
+                Err(503),
+            ],
+            vec![
+                EthCall::Current([0xaau8; 32]),
+                EthCall::Known { expected_root: proof_l1, known: false },
+            ],
+            |services_url, rpc_url| async move {
+                let http = reqwest::Client::new();
+                let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+                poll_claim_proof(
+                    &http,
+                    &services_url,
+                    &provider,
+                    STATE_MANAGER,
+                    &dummy_withdrawal(),
+                    2,
+                    Duration::from_millis(1),
+                )
+                .await
+                .unwrap_err()
+            },
+        )
+        .await;
         assert!(
-            err.to_string().contains("RPC 503 upstream"),
-            "must surface the real error, got: {err}"
-        );
-        assert!(
-            !err.to_string().contains("without response"),
-            "must not use the generic exhausted message when a real error exists: {err}"
+            err.to_string().contains("503") || err.to_string().contains("RPC 503"),
+            "later services RPC error must replace earlier unauthorized Ok, got: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn poll_replaces_not_ready_with_later_rpc_error() {
+        let err = with_services_and_l1(
+            vec![Ok(services_body(false, None)), Err(503)],
+            vec![],
+            |services_url, rpc_url| async move {
+                let http = reqwest::Client::new();
+                let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+                poll_claim_proof(
+                    &http,
+                    &services_url,
+                    &provider,
+                    STATE_MANAGER,
+                    &dummy_withdrawal(),
+                    2,
+                    Duration::from_millis(1),
+                )
+                .await
+                .unwrap_err()
+            },
+        )
+        .await;
+        assert!(
+            err.to_string().contains("503") || err.to_string().contains("RPC 503"),
+            "later services RPC error must replace earlier found=false, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_accepts_historically_known_root() {
+        let proof_l1 = l1_bytes_from_display(DISPLAY_ROOT);
+        let proof = with_services_and_l1(
+            vec![Ok(services_body(true, Some(DISPLAY_ROOT)))],
+            vec![
+                EthCall::Current([0xaau8; 32]),
+                EthCall::Known { expected_root: proof_l1, known: true },
+            ],
+            |services_url, rpc_url| async move {
+                let http = reqwest::Client::new();
+                let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+                poll_claim_proof(
+                    &http,
+                    &services_url,
+                    &provider,
+                    STATE_MANAGER,
+                    &dummy_withdrawal(),
+                    1,
+                    Duration::from_millis(1),
+                )
+                .await
+                .unwrap()
+            },
+        )
+        .await;
+        assert!(proof.found);
+        assert_eq!(proof.withdrawal_root.as_deref(), Some(DISPLAY_ROOT));
+    }
+
 
 }

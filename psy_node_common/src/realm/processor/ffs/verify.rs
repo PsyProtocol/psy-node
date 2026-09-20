@@ -55,6 +55,17 @@ use super::{
     VerifiedHistoryCandidate,
 };
 
+const ZERO_SENTINEL_KEY: [u8; 32] = [0u8; 32];
+const UNWRITTEN_CST_LEAF: [u8; 32] = [0u8; 32];
+
+fn is_empty_imt_zero_key_sentinel(
+    has_previous_imt_preimage: bool,
+    previous_cst_leaf: [u8; 32],
+    key: [u8; 32],
+) -> bool {
+    !has_previous_imt_preimage && previous_cst_leaf == UNWRITTEN_CST_LEAF && key == ZERO_SENTINEL_KEY
+}
+
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -88,7 +99,7 @@ where
         previous_checkpoint_id: u64,
         updates: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
     ) -> anyhow::Result<()> {
-        let changed_leaves_on_imt_indexed_trees = crate::realm::processor::db::load_changed_leaves_on_imt_indexed_trees::<S, N::F, N::QHash>(self.db.as_ref(), updates)
+        let changed_leaves_on_imt_indexed_trees = crate::realm::processor::db::load_changed_leaves_on_imt_indexed_trees::<S, N::F, N::QHash>(self.db.as_ref(), previous_checkpoint_id, updates)
             .await?;
         let mut trees = load_realm_memory_trees_from_db::<N, _>(
             &*self.db,
@@ -329,15 +340,40 @@ where
                     previous_at_index.is_none(),
                     "InvalidStateUpdates: IMT new key overwrites an authenticated index user={tree_id} contract={tree_sub_id} index={leaf_index}"
                 );
-            } else {
-                let old_index = old_index.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "InvalidStateUpdates: IMT key is not new but has no authenticated index user={tree_id} contract={tree_sub_id} index={leaf_index}"
-                    )
-                })?;
+            } else if let Some(old_index) = old_index {
                 anyhow::ensure!(
                     old_index == *leaf_index,
                     "InvalidStateUpdates: IMT key index moved user={tree_id} contract={tree_sub_id}"
+                );
+            } else {
+                let previous_at_index = self
+                    .db
+                    .contract_state_imt_get_leaf_preimage(
+                        previous_checkpoint_id,
+                        *tree_id,
+                        *tree_sub_id,
+                        *leaf_index,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("MissingAuthenticatedState: IMT previous leaf user={tree_id} contract={tree_sub_id} index={leaf_index}: {error}"))?;
+                let previous_cst = self
+                    .db
+                    .contract_state_tree_get_leaf_hash(
+                        previous_checkpoint_id,
+                        *tree_id,
+                        *tree_sub_id,
+                        height,
+                        *leaf_index,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("MissingAuthenticatedState: IMT previous contract-state leaf user={tree_id} contract={tree_sub_id} index={leaf_index}: {error}"))?;
+                anyhow::ensure!(
+                    is_empty_imt_zero_key_sentinel(
+                        previous_at_index.is_some(),
+                        previous_cst.into_owned_32bytes(),
+                        *leaf_key,
+                    ),
+                    "InvalidStateUpdates: IMT key is not new but has no authenticated index user={tree_id} contract={tree_sub_id} index={leaf_index}"
                 );
             }
             if *next_index == 0 {
@@ -567,7 +603,7 @@ where
                     return Err(error);
                 }
                 tracing::warn!(
-                    "history verify rejected C={} transition=({},{}) proposal={} error={error}",
+                    "history verify rejected C={} transition=({},{}) proposal={} error={error:#}",
                     included.checkpoint_id,
                     hex::encode(transition.old_root),
                     hex::encode(transition.new_root),
@@ -579,5 +615,22 @@ where
                 }))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_imt_zero_key_sentinel_only_when_all_three_hold() {
+        assert!(is_empty_imt_zero_key_sentinel(false, UNWRITTEN_CST_LEAF, ZERO_SENTINEL_KEY));
+        assert!(!is_empty_imt_zero_key_sentinel(true, UNWRITTEN_CST_LEAF, ZERO_SENTINEL_KEY));
+        let mut key = ZERO_SENTINEL_KEY;
+        key[0] = 1;
+        assert!(!is_empty_imt_zero_key_sentinel(false, UNWRITTEN_CST_LEAF, key));
+        let mut cst = UNWRITTEN_CST_LEAF;
+        cst[0] = 1;
+        assert!(!is_empty_imt_zero_key_sentinel(false, cst, ZERO_SENTINEL_KEY));
     }
 }
