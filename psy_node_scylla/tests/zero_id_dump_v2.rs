@@ -1,5 +1,6 @@
 use cf_utils::timer::DebugTimer;
-use rand::{thread_rng, Rng, RngCore};
+use rand::{Rng, RngCore, SeedableRng};
+use rand_chacha::ChaCha12Rng;
 use std::{collections::HashMap, hash::Hash, sync::{Arc, RwLock}};
 
 use dashmap::DashMap;
@@ -284,16 +285,22 @@ impl SimpleStoreEx {
     }
 
     async fn overwrite_test(&self, _seed: &str, tree_height: usize) -> anyhow::Result<()> {
-        let mut rng = thread_rng();//ChaCha12Rng::from_seed(get_seed_for_rng(seed));
+        let mut rng = ChaCha12Rng::seed_from_u64(0xdb80);
         rng.next_u64();
         
         let mut current_checkpoint = 0u64;
         let mut timer = DebugTimer::new("merkle_dumper");
         let mut total_leaves_inserted = 0usize;
-        for i in 0..100 {
-            let count =(rng.next_u32() % 5000) + 1;
+        // Keep the large stress mode available; the deterministic CI case crosses
+        // batch boundaries and guarantees overwrites at every checkpoint.
+        let stress = std::env::var("PSY_SCYLLA_STRESS").as_deref() == Ok("1");
+        for i in 0..if stress { 100 } else { 6 } {
+            let count = if stress { (rng.next_u32() % 5000) + 1 } else { [129, 257, 513][i % 3] };
             total_leaves_inserted += count as usize;
-            let leaves = random_leaves_in_tree::<_, ExHash>(count as usize, &mut rng, tree_height);
+            let mut leaves = random_leaves_in_tree::<_, ExHash>(count as usize, &mut rng, tree_height);
+            for (index, leaf) in leaves.iter_mut().take(16).enumerate() {
+                leaf.key.index = index as u64;
+            }
             self.store
                 .set_zero_id_merkle_nodes_for_checkpoint(
                     &self.store.merkle_node_zero_id_table_a,
@@ -417,7 +424,7 @@ impl SimpleStoreEx {
 async fn simple_store_basic_test_1() -> anyhow::Result<()> {
     let key_space = format!("psy_node_zero_id_dump_test_v1_{}", rand::random::<u64>());
     let scylla_db = ScyllaCoreStore::<ExHash, ExHasher>::new(0, 0, key_space, &[
-        "127.0.0.1:9042".to_string()
+        std::env::var("PSY_TEST_SCYLLA").expect("PSY_TEST_SCYLLA must identify an isolated test database")
     ]).await?;
     let simple_store = SimpleStoreEx::setup(Arc::new(scylla_db)).await?;
     println!("setup simple store");

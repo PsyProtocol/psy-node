@@ -1,0 +1,56 @@
+name: Database crate coverage
+
+on:
+  pull_request:
+    branches: [multi_chain]
+  push:
+    branches: [multi_chain]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Configure private build dependencies
+        env:
+          GH_TOKEN: ${{ secrets.PSY_RELEASE_REPOSITORY_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?PSY_RELEASE_REPOSITORY_TOKEN is required for private dependencies}"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git config --global http.https://github.com/.extraheader "AUTHORIZATION: basic ${auth}"
+          git submodule update --init psy-genesis
+      - name: Install coverage tooling
+        run: |
+          rustup component add rust-src llvm-tools-preview
+          cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Check the per-crate gate
+        run: python3 dev/check-db-coverage.test.py
+      - name: Run isolated integration coverage
+        run: make test-db-coverage
+      - name: Save coverage and test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: db-coverage
+          path: target/db-coverage/
+      - name: Remove dependency credentials
+        if: always()
+        run: git config --global --unset-all http.https://github.com/.extraheader || true

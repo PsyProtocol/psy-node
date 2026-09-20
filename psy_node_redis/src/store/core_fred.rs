@@ -91,6 +91,15 @@ pub async fn new_redis_async_pool(
     Ok(pool)
 }
 
+// A blocking command must not occupy the pool used by its producers. Abort its
+// dedicated router even when the waiting future is cancelled or times out.
+struct BlockingConnection(fred::types::ConnectHandle);
+
+impl Drop for BlockingConnection {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 #[derive(Debug, Clone)]
 pub struct StandardFredRedisStore {
     pub client: RedisPool,
@@ -116,6 +125,17 @@ impl StandardFredRedisStore {
             realm_id,
             realm_sub_id,
         }
+    }
+
+    async fn blocking_pop<R: fred::types::FromValue>(&self, key: &str, timeout_secs: f64) -> anyhow::Result<R> {
+        let client = self.client.clients()[0].clone_new();
+        let _connection = BlockingConnection(client.connect());
+        client.wait_for_connect().await?;
+        // The raw command preserves nil vs transport timeout semantics.
+        Ok(client.custom(
+            fred::types::CustomCommand::new("BLPOP", None, true),
+            vec![Value::from(key), Value::try_from(timeout_secs)?],
+        ).await?)
     }
 
     pub async fn get_bytes_generic_internal(&self, ns_key: &str, key: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -222,7 +242,7 @@ impl StandardFredRedisStore {
     pub async fn wait_for_generic_u64_queue_internal(&self, queue_key: &str) -> anyhow::Result<u64> {
         // Optimization: Use BLPOP (0.0 means infinite block) instead of polling loop
         // blpop returns (key, value)
-        let (_key, val): (String, u64) = self.client.blpop(queue_key, 0.0).await?;
+        let (_key, val): (String, u64) = self.blocking_pop(queue_key, 0.0).await?;
         Ok(val)
     }
 
@@ -246,7 +266,7 @@ impl StandardFredRedisStore {
 
     pub async fn wait_for_generic_bytes_queue_internal(&self, queue_key: &str) -> anyhow::Result<Vec<u8>> {
         // Optimization: BLPOP
-        let (_key, val): (String, Vec<u8>) = self.client.blpop(queue_key, 0.0).await?;
+        let (_key, val): (String, Vec<u8>) = self.blocking_pop(queue_key, 0.0).await?;
         Ok(val)
     }
 
@@ -481,10 +501,10 @@ impl QStandardEphemeralQueueSubscriber for StandardFredRedisStore {
         let timeout_secs = timeout_ms as f64 / 1000.0;
         
         // Use BLPOP
-        match self.client.blpop::<Option<(String, Vec<u8>)>, _>(&subject, timeout_secs).await? {
-            Some((_k, v)) => Ok(Some(v)),
-            None => Ok(None) // Timeout hit
-        }
+        // Use the raw command so only a server nil reply means an empty queue.
+        // Fred's BLPOP wrapper conflates nil replies and transport timeouts.
+        let reply: Option<(String, Vec<u8>)> = self.blocking_pop(&subject, timeout_secs).await?;
+        Ok(reply.map(|(_key, value)| value))
     }
 
     async fn wait_for_ephemeral_queue_item<QK: PCoreStandardQueueKeyForRealm>(
@@ -733,3 +753,39 @@ impl QTempDatabaseRawCounterWriterBase for StandardFredRedisStore {
 }
 
 impl QAutoImplementGeneric for StandardFredRedisStore {}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tmp_kv_and_proof_namespace_keys_include_realm() {
+        assert_eq!(
+            get_tmp_kv_store_ns_key("root", 7, 11),
+            "TKVSV1-root-7-11"
+        );
+        assert_eq!(
+            get_tmp_proof_store_ns_key("root", 7, 11),
+            "TMPPSV1-root-7-11"
+        );
+        assert_eq!(
+            get_tmp_proof_store_bucket_ns_key("root", 7, 11, 99),
+            "TMPPSV1-root-7-11-99"
+        );
+    }
+
+    #[test]
+    fn prefixes_are_stable() {
+        assert_eq!(REDIS_TMP_PROOF_STORE_PREFIX, "TMPPSV1");
+        assert_eq!(REDIS_TMP_KV_STORE_PREFIX, "TKVSV1");
+    }
+
+    #[tokio::test]
+    async fn invalid_redis_url_fails_to_build_pool() {
+        let err = new_redis_async_pool("not-a-redis-url", 2).await.unwrap_err();
+        assert!(!err.to_string().is_empty());
+        let err = new_redis_async_pool("", 1).await.unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+}

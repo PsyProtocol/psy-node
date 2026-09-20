@@ -84,6 +84,7 @@ pub fn generate_batch_pre_prepared_statements(statement: &PreparedStatement, bat
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::ops::{Shl, Shr};
 
@@ -225,5 +226,21 @@ mod tests {
             let expected = if x < 0 { i64::MAX as u64 } else { x as u64 };
             assert_eq!(convert_i64_to_checkpoint_id(x), expected, "Failed for input value: {}", x);
         }
+    }
+
+    #[test]
+    fn calc_best_batch_size_empty_list_is_one() {
+        assert_eq!(calc_best_batch_size(100, &[]), 1);
+        assert_eq!(calc_best_batch_size(0, &[]), 1);
+    }
+
+    #[test]
+    fn calc_best_batch_size_picks_first_fitting_size() {
+        let sizes = [256, 128, 64];
+        assert_eq!(calc_best_batch_size(256, &sizes), 256);
+        assert_eq!(calc_best_batch_size(255, &sizes), 128);
+        assert_eq!(calc_best_batch_size(128, &sizes), 128);
+        assert_eq!(calc_best_batch_size(64, &sizes), 64);
+        assert_eq!(calc_best_batch_size(1, &sizes), 64);
     }
 }

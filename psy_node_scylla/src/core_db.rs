@@ -785,7 +785,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
     for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_inc_u64_counter(&self, table: &ScyllaU64ToU64CounterTablePreparedStatements, obj_id: u64, amount: i64) -> anyhow::Result<u64> {
-        table.atomic_increment(&self.session, obj_id, amount as u64).await
+        table.atomic_increment_signed(&self.session, obj_id, amount).await
     }
 }
 

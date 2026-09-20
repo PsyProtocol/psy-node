@@ -845,10 +845,11 @@ impl NatsJetStreamClient {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        consumer_missing_with_barrier, worker_queue_completion_reached,
-        NatsWorkerQueuePublishBarrier,
+        consumer_missing_with_barrier, worker_queue_completion_reached, JetStreamAckMode,
+        NatsJetStreamClient, NatsWorkerQueuePublishBarrier,
     };
 
     fn barrier_with_sequences(sequences: &[u64]) -> NatsWorkerQueuePublishBarrier {
@@ -891,6 +892,56 @@ mod tests {
         assert_eq!(barrier.min_stream_sequence, Some(552));
         assert_eq!(barrier.max_stream_sequence, Some(555));
         assert_eq!(barrier.message_count, 4);
+        assert_eq!(barrier.message_count(), 4);
+        assert_eq!(barrier.max_stream_sequence(), Some(555));
+        assert_eq!(barrier.required_ack_stream_sequence(), Some(555));
+        assert!(!barrier.is_empty());
+    }
+
+    #[test]
+    fn empty_publication_barrier_is_not_an_error() {
+        let barrier = NatsWorkerQueuePublishBarrier::default();
+        assert!(barrier.is_empty());
+        assert_eq!(barrier.message_count(), 0);
+        assert_eq!(barrier.max_stream_sequence(), None);
+        assert!(consumer_missing_with_barrier("jobs", "worker", &barrier).is_ok());
+    }
+
+    #[test]
+    fn delivered_below_required_sequence_does_not_complete() {
+        assert!(!worker_queue_completion_reached(0, 0, 551, 552, 552));
+        assert!(!worker_queue_completion_reached(0, 0, 552, 551, 552));
+    }
+
+    #[test]
+    fn consumer_not_found_error_matches_nats_wording() {
+        assert!(NatsJetStreamClient::is_consumer_not_found_error(
+            &"Consumer not found"
+        ));
+        assert!(NatsJetStreamClient::is_consumer_not_found_error(
+            &"nats: error code 10014"
+        ));
+        assert!(!NatsJetStreamClient::is_consumer_not_found_error(
+            &"stream not found"
+        ));
+    }
+
+    #[test]
+    fn jetstream_ack_mode_orders_by_discriminant() {
+        assert!(JetStreamAckMode::AckEach < JetStreamAckMode::NoAck);
+        assert!(JetStreamAckMode::NoAck < JetStreamAckMode::AckBatchLast);
+        assert_eq!(JetStreamAckMode::AckEach as u8, 0);
+        assert_eq!(JetStreamAckMode::NoAck as u8, 1);
+        assert_eq!(JetStreamAckMode::AckBatchLast as u8, 2);
+    }
+
+    #[test]
+    fn publication_barrier_tracks_single_ack() {
+        let barrier = barrier_with_sequences(&[7]);
+        assert_eq!(barrier.min_stream_sequence, Some(7));
+        assert_eq!(barrier.max_stream_sequence(), Some(7));
+        assert_eq!(barrier.message_count(), 1);
+        assert_eq!(barrier.required_ack_stream_sequence(), Some(7));
     }
 }
 

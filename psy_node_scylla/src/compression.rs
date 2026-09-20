@@ -24,3 +24,39 @@ pub fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
         Ok(data.to_vec())
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compress_round_trips_and_prefixes_magic() {
+        let original = (0u8..=255).cycle().take(2048).collect::<Vec<_>>();
+        let encoded = compress(&original).unwrap();
+        assert!(encoded.starts_with(COMPRESSED_MAGIC));
+        assert_ne!(encoded, original);
+        assert_eq!(decompress(&encoded).unwrap(), original);
+    }
+
+    #[test]
+    fn compress_empty_round_trips() {
+        let encoded = compress(&[]).unwrap();
+        assert!(encoded.starts_with(COMPRESSED_MAGIC));
+        assert_eq!(decompress(&encoded).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn decompress_legacy_bytes_without_magic() {
+        let raw = b"pre-compression-payload";
+        assert_eq!(decompress(raw).unwrap(), raw);
+        assert_eq!(decompress(&[]).unwrap(), Vec::<u8>::new());
+        assert_eq!(decompress(b"PSZ").unwrap(), b"PSZ");
+    }
+
+    #[test]
+    fn decompress_rejects_truncated_zstd_after_magic() {
+        assert!(decompress(b"PSZ1not-a-zstd-frame").is_err());
+        assert!(decompress(COMPRESSED_MAGIC).is_err());
+    }
+}

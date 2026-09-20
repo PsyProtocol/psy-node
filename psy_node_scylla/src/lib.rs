@@ -1,3 +1,4 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 pub mod constants;
 pub mod compression;
 pub mod tables;

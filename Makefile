@@ -36,6 +36,10 @@ check-all: check
 test:
 	PSY_CONFIG_PATH=$(PSY_CONFIG_PATH) cargo test
 
+.PHONY: test-db-coverage
+test-db-coverage:
+	./dev/run-db-coverage.sh
+
 verify-contracts:
 	@cd psy-contracts && npx hardhat verify-contracts --network ${NETWORK}
 
@@ -187,3 +191,7 @@ withdraw:
 		--amount $${AMOUNT:-$(BRIDGE_WITHDRAW_AMOUNT)} \
 		--recipient "$$RECIPIENT_ADDR" \
 		--nonce $${NONCE:-$(BRIDGE_WITHDRAW_NONCE)}
+
+.PHONY: test-db-coverage-scylla test-db-coverage-nats test-db-coverage-redis
+test-db-coverage-scylla test-db-coverage-nats test-db-coverage-redis:
+	./dev/run-db-coverage.sh $(patsubst test-db-coverage-%,%,$@)

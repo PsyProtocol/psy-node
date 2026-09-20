@@ -117,16 +117,24 @@ impl ScyllaNoTabletPreparedTableStatements for ScyllaU64ToU64CounterTablePrepare
 
 impl ScyllaU64ToU64CounterTablePreparedStatements {
     pub async fn atomic_increment(&self, session: &Session, obj_id: u64, amount: u64) -> anyhow::Result<u64> {
+        self.atomic_delta(session, obj_id, i128::from(amount)).await
+    }
+
+    pub async fn atomic_increment_signed(&self, session: &Session, obj_id: u64, amount: i64) -> anyhow::Result<u64> {
+        self.atomic_delta(session, obj_id, i128::from(amount)).await
+    }
+
+    async fn atomic_delta(&self, session: &Session, obj_id: u64, amount: i128) -> anyhow::Result<u64> {
         const MAX_RETRIES: usize = 10;
         for _ in 0..MAX_RETRIES {
             let old_opt = self.select_one_single(session, obj_id).await?;
             match old_opt {
                 Some(old_u64) => {
-                    let new_u64 = old_u64.checked_add(amount)
-                        .ok_or_else(|| anyhow::anyhow!("Overflow when adding {} to {}", amount, old_u64))?;
-                    if !is_u64_safe_for_counter(new_u64) {
-                        return Err(anyhow::anyhow!("New value {} exceeds i64::MAX", new_u64));
+                    let next = (i128::from(old_u64) + amount).max(0);
+                    if next > i128::from(i64::MAX) {
+                        return Err(anyhow::anyhow!("New value {} exceeds i64::MAX", next));
                     }
+                    let new_u64 = next as u64;
                     let old_i64 = u64_to_i64_exact(old_u64);
                     let new_i64 = u64_to_i64_exact(new_u64);
                     let res = session
@@ -140,7 +148,7 @@ impl ScyllaU64ToU64CounterTablePreparedStatements {
                     }
                 }
                 None => {
-                    let new_u64 = amount;
+                    let new_u64 = amount.max(0) as u64;
                     if !is_u64_safe_for_counter(new_u64) {
                         return Err(anyhow::anyhow!("New value {} exceeds i64::MAX", new_u64));
                     }

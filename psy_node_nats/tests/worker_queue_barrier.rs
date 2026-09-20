@@ -91,13 +91,13 @@ fn assert_next_barrier(
 }
 
 #[tokio::test]
+#[ignore = "Requires isolated NATS_INTEGRATION_URL"]
 async fn all_publish_forms_ack_and_completion_tracks_their_barrier() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .try_init();
     let Ok(nats_url) = std::env::var("NATS_INTEGRATION_URL") else {
-        eprintln!("skipping: NATS_INTEGRATION_URL is not set");
-        return Ok(());
+        panic!("NATS_INTEGRATION_URL must identify an isolated test server");
     };
 
     let suffix = SystemTime::now()

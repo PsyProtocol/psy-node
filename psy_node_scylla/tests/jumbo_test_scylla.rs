@@ -241,7 +241,7 @@ impl SimpleStoreEx {
 async fn simple_store_basic_test_1() -> anyhow::Result<()> {
     let key_space = format!("psy_node_jumbo_scylla_test_ex1_{}", rand::random::<u64>());
     let scylla_db = ScyllaCoreStore::<ExHash, ExHasher>::new(0, 0, key_space, &[
-        "127.0.0.1:9042".to_string()
+        std::env::var("PSY_TEST_SCYLLA").expect("PSY_TEST_SCYLLA must identify an isolated test database")
     ]).await?;
     let simple_store = SimpleStoreEx::setup(Arc::new(scylla_db)).await?;
     println!("setup jumbo store");

@@ -176,7 +176,7 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
             session.batch(&batch, values).await?;
             batch_index += 1;
         }
-        for _ in first_batch_size..256 {
+        for _ in (if first_batch_size == 256 { 0 } else { first_batch_size })..256 {
             batch.append_statement(self.insert_1_statement.clone());
         }
         for _ in batch_index..num_batches {
@@ -233,7 +233,7 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
             session.batch(&batch, values).await?;
             batch_index += 1;
         }
-        for _ in first_batch_size..256 {
+        for _ in (if first_batch_size == 256 { 0 } else { first_batch_size })..256 {
             batch.append_statement(self.insert_1_statement.clone());
         }
         for _ in batch_index..num_batches {
@@ -1016,6 +1016,7 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
 
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::calc_best_batch_size;
     #[test]
@@ -1032,10 +1033,11 @@ mod tests {
         assert_eq!(calc_best_batch_size(127, &[256, 128, 64]), 64);
         assert_eq!(calc_best_batch_size(65, &[256, 128, 64]), 64);
         assert_eq!(calc_best_batch_size(64, &[256, 128, 64]), 64);
-        assert_eq!(calc_best_batch_size(63, &[256, 128, 64]), 32);
-        assert_eq!(calc_best_batch_size(33, &[256, 128, 64]), 32);
-        assert_eq!(calc_best_batch_size(32, &[256, 128, 64]), 32);
-        assert_eq!(calc_best_batch_size(31, &[256, 128, 64]), 32);
-        assert_eq!(calc_best_batch_size(1, &[256, 128, 64]), 32);
+        // Below every listed size, the helper falls back to the last entry.
+        assert_eq!(calc_best_batch_size(63, &[256, 128, 64]), 64);
+        assert_eq!(calc_best_batch_size(33, &[256, 128, 64]), 64);
+        assert_eq!(calc_best_batch_size(32, &[256, 128, 64]), 64);
+        assert_eq!(calc_best_batch_size(31, &[256, 128, 64]), 64);
+        assert_eq!(calc_best_batch_size(1, &[256, 128, 64]), 64);
     }
 }

@@ -582,7 +582,8 @@ where
     async fn test_checkpoint_tree(&self) -> anyhow::Result<()> {
         let db = &self.db;
         let tree_height = N::CHECKPOINT_TREE_HEIGHT;
-        let leaf_index = 0;
+        // Checkpoint leaves are appended at their checkpoint ID.
+        let leaf_index = 1;
 
         let initial_root = db.checkpoint_tree_get_root_hash(0).await?;
         assert_eq!(initial_root, N::HasherBase::get_zero_hash(tree_height as usize));
@@ -592,7 +593,7 @@ where
         assert!(proof_of_nothing.verify::<N::HasherBase>());
 
         let leaf_val_1 = N::QHash::qp_rand_gen();
-        // The writer function hardcodes leaf_index to 0
+        // Checkpoint 1 writes leaf index 1.
         let delta_proof_1 = db.checkpoint_tree_set_leaf_hash(1, leaf_val_1).await?;
 
         assert!(delta_proof_1.verify::<N::HasherBase>());

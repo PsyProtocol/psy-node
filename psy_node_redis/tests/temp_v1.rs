@@ -12,7 +12,7 @@ pub struct RedisStoreFactory {
 impl RedisStoreFactory {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            redis_url: std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into()),
+            redis_url: std::env::var("REDIS_URL").expect("REDIS_URL must identify an isolated test database"),
         })
     }
 }

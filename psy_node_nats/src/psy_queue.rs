@@ -72,3 +72,43 @@ pub async fn setup_nats_psy_queue_from_connection_str(
     Ok(client)
 
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_u64_ms_uses_default_when_unset() {
+        let name = "PSY_NATS_TEST_UNSET_MS_A1B2";
+        std::env::remove_var(name);
+        assert_eq!(env_u64_ms(name, 5000).unwrap(), 5000);
+    }
+
+    #[test]
+    fn env_u64_ms_parses_valid_value() {
+        let name = "PSY_NATS_TEST_SET_MS_C3D4";
+        std::env::set_var(name, "1234");
+        let got = env_u64_ms(name, 1).unwrap();
+        std::env::remove_var(name);
+        assert_eq!(got, 1234);
+    }
+
+    #[test]
+    fn env_u64_ms_rejects_non_integer() {
+        let name = "PSY_NATS_TEST_BAD_MS_E5F6";
+        std::env::set_var(name, "not-a-number");
+        let err = env_u64_ms(name, 1).unwrap_err();
+        std::env::remove_var(name);
+        assert!(err.to_string().contains(name));
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_empty_connection_string() {
+        let result = setup_nats_psy_queue_from_connection_str("", "ns").await;
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(err.to_string().contains("empty"));
+        }
+    }
+}

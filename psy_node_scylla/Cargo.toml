@@ -64,3 +64,6 @@ cf_utils = { workspace = true }
 [[bench]]
 name = "main"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
