@@ -55,6 +55,7 @@ async-nats = { workspace = true }
 scylla = { workspace = true }
 chrono = { workspace = true }
 url = { workspace = true }
+zstd = { workspace = true }
 
 # start local packages
 pser = { workspace = true }
@@ -73,6 +74,8 @@ psy_node_common = { workspace = true }
 psy_node_cli = { workspace = true }
 psy_config = { workspace = true }
 psy_plonky2_circuits = { workspace = true }
+psy_cli_common = { path = "../psy_cli_common" }
+psy_client_common = { workspace = true }
 psy_jtmb_testing_core = { workspace = true }
 psy_node_scylla = { workspace = true }
 psy_node_redis = { workspace = true }

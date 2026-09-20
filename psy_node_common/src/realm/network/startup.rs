@@ -10,7 +10,9 @@ use crate::realm::network::{
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use parth_common::realm_rotation::RealmRotationConfig;
-use psy_data::p2p::{BlsSecretKey, NodeId};
+use psy_data::p2p::{
+    BlsSecretKey, NodeId, MAX_IN_FLIGHT_PROPOSALS, MAX_PROPOSAL_CHUNK_BYTES, REASSEMBLY_EXPIRY_SECS,
+};
 use std::str::FromStr;
 
 /// Parsed optional Realm network plus the rotation/BLS material the

@@ -77,10 +77,9 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
         realm_id: u64,
         proposal: Option<Vec<u8>>,
         certificate: Option<Vec<u8>>,
-        finalize_binding: Vec<u8>,
     ) -> anyhow::Result<()> {
         self.client
-            .submit_guta(input, proof, realm_id, proposal, certificate, finalize_binding)
+            .submit_guta(input, proof, realm_id, proposal, certificate)
             .await
             .map_err(|error| match error {
                 JsonRpseeClientError::Call(object) => GutaSubmitError::from_error_object(&object)

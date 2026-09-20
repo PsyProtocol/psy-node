@@ -16,7 +16,7 @@ use crate::{
         stats::GUTAStats,
         sub_tree_transition::SubTreeNodeStateTransition,
     },
-    p2p::{validate_goldilocks_limb, validate_hash32_canonical, DOMAIN_VALIDATOR_LEAF_FELT, ProtocolError, ProtocolReader, ProtocolResult, write_fixed, write_u16, write_u64},
+    p2p::{validate_goldilocks_limb, DOMAIN_VALIDATOR_LEAF_FELT, ProtocolError, ProtocolReader, ProtocolResult, write_fixed, write_u16, write_u64},
     v1::qdata::{
         checkpoint::{PQEDCheckpointLeaf, PQEDCheckpointLeafCompactWithStateRoots},
         user::PQEDUserLeaf,
@@ -281,60 +281,6 @@ where
         action_hash,
         final_guta_header,
     })
-}
-
-// =================================================================================
-// Finalizer Binding (off-circuit BLS authorization material)
-// =================================================================================
-
-/// Exact wire length of [`RealmFinalizeBinding`]: 410-byte output + 32-byte tag.
-pub const REALM_FINALIZE_BINDING_WIRE_BYTES: usize = 410 + 32;
-
-/// Public binding payload required by the `psy_submit_guta` Realm admission gate.
-///
-/// It carries the actual canonical circuit output plus the finalizer worker
-/// reward tag needed to recompute the circuit reward root. It contains no
-/// signature and no secret: authorization is the Coordinator-verified BLS
-/// certificate over the proposal identity derived from this output.
-///
-/// Wire encoding is direct concatenation in declaration order, exactly
-/// [`REALM_FINALIZE_BINDING_WIRE_BYTES`]; decoders reject trailing bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RealmFinalizeBinding {
-    /// Actual canonical finalizer output; required, no default.
-    pub output: [u8; 410],
-    /// Canonical field-hash bytes of the finalizer worker reward tag.
-    pub finalizer_worker_reward_tag: [u8; 32],
-}
-
-impl RealmFinalizeBinding {
-    pub fn protocol_encode_to_vec(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(REALM_FINALIZE_BINDING_WIRE_BYTES);
-        write_fixed(&mut out, &self.output);
-        write_fixed(&mut out, &self.finalizer_worker_reward_tag);
-        out
-    }
-
-    /// Strictly decode a 442-byte binding; rejects wrong length and
-    /// noncanonical worker-tag field limbs.
-    pub fn protocol_decode(bytes: &[u8]) -> ProtocolResult<Self> {
-        if bytes.len() != REALM_FINALIZE_BINDING_WIRE_BYTES {
-            return Err(ProtocolError::InvalidLength {
-                what: "RealmFinalizeBinding",
-                got: bytes.len(),
-                expected: REALM_FINALIZE_BINDING_WIRE_BYTES,
-            });
-        }
-        let mut output = [0u8; 410];
-        output.copy_from_slice(&bytes[..410]);
-        let mut tag = [0u8; 32];
-        tag.copy_from_slice(&bytes[410..]);
-        validate_hash32_canonical(&tag)?;
-        Ok(Self {
-            output,
-            finalizer_worker_reward_tag: tag,
-        })
-    }
 }
 
 /// Reconstruct the actual finalizer output from the exact planner witness
@@ -619,62 +565,6 @@ mod chain_domain_tests {
         let old_domain = realm_finalize_guta_chain_domain::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(0);
         assert_ne!(domain, old_domain);
         assert_eq!(domain, PoseidonHasher::q_hash_many(&[PGoldilocksFelt::from_u64_value(magic)]));
-    }
-}
-
-#[cfg(test)]
-mod finalize_binding_tests {
-    use super::*;
-    use crate::p2p::{GOLDILOCKS_MODULUS, ProtocolError};
-
-    #[test]
-    fn binding_roundtrip_accepts_largest_canonical_tag() {
-        let mut tag = [0u8; 32];
-        tag[24..32].copy_from_slice(&(GOLDILOCKS_MODULUS - 1).to_le_bytes());
-        let binding = RealmFinalizeBinding {
-            output: [0x11; 410],
-            finalizer_worker_reward_tag: tag,
-        };
-        let encoded = binding.protocol_encode_to_vec();
-        assert_eq!(encoded.len(), REALM_FINALIZE_BINDING_WIRE_BYTES);
-        assert_eq!(RealmFinalizeBinding::protocol_decode(&encoded).unwrap(), binding);
-    }
-
-    #[test]
-    fn binding_decode_rejects_noncanonical_tag_and_wrong_length() {
-        let mut tag = [0u8; 32];
-        tag[24..32].copy_from_slice(&GOLDILOCKS_MODULUS.to_le_bytes());
-        let binding = RealmFinalizeBinding {
-            output: [0x22; 410],
-            finalizer_worker_reward_tag: tag,
-        };
-        let encoded = binding.protocol_encode_to_vec();
-        assert!(matches!(
-            RealmFinalizeBinding::protocol_decode(&encoded),
-            Err(ProtocolError::NonCanonicalField { .. })
-        ));
-
-        let ok_tag = [0u8; 32];
-        let mut truncated = RealmFinalizeBinding {
-            output: [0x22; 410],
-            finalizer_worker_reward_tag: ok_tag,
-        }
-        .protocol_encode_to_vec();
-        truncated.pop();
-        assert!(matches!(
-            RealmFinalizeBinding::protocol_decode(&truncated),
-            Err(ProtocolError::InvalidLength { .. })
-        ));
-        let mut trailing = RealmFinalizeBinding {
-            output: [0x22; 410],
-            finalizer_worker_reward_tag: ok_tag,
-        }
-        .protocol_encode_to_vec();
-        trailing.push(0);
-        assert!(matches!(
-            RealmFinalizeBinding::protocol_decode(&truncated),
-            Err(ProtocolError::InvalidLength { .. })
-        ));
     }
 }
 

@@ -1,6 +1,6 @@
 # Getting Started
 
-> For supervised start/stop/restart/rollback, follow the internal guides `docs/src/../dev/devnet_lifecycle.md` and `docs/src/../dev/devnet-launcher-reference.md` (not published in SUMMARY). Prefer `make run-all` / `make shutdown` over manual per-service starts.
+> For supervised start/stop/restart/rollback, follow the internal guides `docs/src/../dev/devnet_lifecycle.md` and `docs/src/../dev/devnet-launcher-reference.md` (not published in SUMMARY). Prefer `make run-all` / `make shutdown` over manual per-service starts. Note that `make shutdown` purges persisted chain state by default; use `PURGE=0 make shutdown` to stop the stack while preserving it.
 
 
 > Updated: 2026-09-03.
@@ -40,7 +40,7 @@ Run the supported launcher from `<repo-root>`:
 make run-all
 ```
 
-The launcher starts the configured database, coordinator, realms, workers, proving services, layer-one services, relayer, and selected application surfaces. The target is defined in `Makefile:60-66`.
+The launcher starts the configured database, coordinator, realms, workers, proving services, layer-one services, relayer, and selected application surfaces. The target is defined in `Makefile:61-67`.
 
 ## 3. Required Components
 
@@ -246,10 +246,10 @@ HTTP admission alone is not end-to-end acceptance. Follow the lifecycle guide fo
 Stop the supervised stack without deleting state:
 
 ```bash
-make shutdown
+PURGE=0 make shutdown
 ```
 
-The shutdown target invokes the launcher teardown path (`Makefile:102-103`). Do not remove data directories manually.
+`make shutdown` purges by default (`PURGE ?= 1` in the Makefile): it deletes checkpoints, `db/anvil/state.json`, logs, localhost deployments, and devnet Docker volumes; `PURGE=1 make shutdown` is the explicit equivalent. The shutdown target invokes the launcher teardown path (`Makefile:99-100`). Do not remove data directories manually.
 
 ## 9. Implemented Network Capabilities
 

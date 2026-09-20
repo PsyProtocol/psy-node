@@ -11,6 +11,23 @@ export const FAUCET_ENV_KEYS = [
     "PSY_FAUCET_WINDOW_CHECKPOINTS",
 ] as const;
 
+export function psyServicesDatabaseCommands(purge: boolean, databaseExists: boolean): string[][] {
+    const prefix = ['docker', 'exec', 'generated-envio-postgres-1'];
+    if (purge) {
+        return [
+            [...prefix, 'dropdb', '-U', 'postgres', '--if-exists', 'psy_services'],
+            [...prefix, 'createdb', '-U', 'postgres', 'psy_services'],
+        ];
+    }
+    return databaseExists ? [] : [[...prefix, 'createdb', '-U', 'postgres', 'psy_services']];
+}
+
+export function pinFaucetPerClaimAmount(json: string): string {
+    const config = JSON.parse(json);
+    config.faucetPerClaimAmount = "1000000000000";
+    return JSON.stringify(config);
+}
+
 export function resolveScyllaMemory(value: string | undefined): string {
     return value?.trim() || DEFAULT_SCYLLA_MEMORY;
 }
@@ -350,26 +367,130 @@ export function isTransientScyllaSchemaFailure(errorText: string): boolean {
     });
 }
 
-// Log markers the processor binaries emit when they hit a fatal, unrecoverable
-// error. Such a processor may keep running while producing empty blocks, so the
-// devnet supervisor must terminate it and let auto-restart recreate it.
-export const FATAL_PROCESSOR_ERROR_MARKERS: readonly string[] = [
-    "[CFLI:PSY_REALM_PROCESSOR_ERROR]",
-    "[CFLI:PSY_COORDINATOR_PROCESSOR_ERROR]",
-];
+// Processor binaries emit these CFLI tokens on a fatal, unrecoverable error.
+export const FATAL_PROCESSOR_ERROR_MARKERS = [
+    "PSY_REALM_PROCESSOR_ERROR",
+    "PSY_COORDINATOR_PROCESSOR_ERROR",
+] as const;
+export type FatalProcessorErrorMarker = (typeof FATAL_PROCESSOR_ERROR_MARKERS)[number];
 
-/** True when a processor log line announces a fatal, unrecoverable error. */
-export function isFatalProcessorErrorLine(line: string): boolean {
-    return FATAL_PROCESSOR_ERROR_MARKERS.some((marker) => line.includes(marker));
+/** Existing backoff: 1s exponential, cap 30s. Spawn-retry delay doubles, cap 60s. */
+export const RESTART_BACKOFF_CAP_MS = 30_000;
+export const RESTART_SPAWN_RETRY_CAP_MS = 60_000;
+/** Ready/healthy interval that resets backoff. Circuit-build time is not healthy. */
+export const RESTART_STABLE_RUN_MS = 60_000;
+/** Consecutive identical typed failures that still auto-restart. The next identical failure stops. */
+export const MAX_IDENTICAL_FAILURE_RESTARTS = 4;
+export const SUPERVISOR_RESTART_LIMIT_TAG = "[DevNet][supervisor][restart-limit]";
+
+export type SupervisedFailureCause =
+    | { kind: "fatal-processor-error"; marker: FatalProcessorErrorMarker }
+    | { kind: "signaled"; signal: string }
+    | { kind: "exited"; code: number }
+    | { kind: "spawn-failed" }
+    | { kind: "dependency-restart" };
+
+/** One retry record. First causal stderr is kept; kind is derived from cause. */
+export type RestartStreak = {
+    cause: SupervisedFailureCause | null;
+    firstCause: string | null;
+    firstObservedAtIso: string | null;
+    identicalRepeats: number;
+};
+
+export type RestartPlan = {
+    action: "restart" | "limit";
+    restartCount: number;
+    delayMs: number;
+    streak: RestartStreak;
+};
+
+export function emptyRestartStreak(): RestartStreak {
+    return { cause: null, firstCause: null, firstObservedAtIso: null, identicalRepeats: 0 };
 }
 
-/**
- * Decide whether a processor process emitting `line` should be terminated for
- * a supervised restart. Returns false once a kill has already been requested
- * (`alreadyRequested`), so duplicate log lines do not trigger repeated kills.
- */
-export function shouldFatalRestartProcessor(line: string, alreadyRequested: boolean): boolean {
-    return !alreadyRequested && isFatalProcessorErrorLine(line);
+/** Recheck after every backoff/spawn-retry sleep. Never clear intentionalStop to force a retry. */
+export function shouldScheduleSupervisedRestart(stopping: boolean, intentionalStop: boolean): boolean {
+    return !stopping && !intentionalStop;
+}
+
+/** Single prose boundary: exact `[CFLI:<token>]` → closed marker. */
+export function parseFatalProcessorErrorMarker(line: string): FatalProcessorErrorMarker | null {
+    for (const marker of FATAL_PROCESSOR_ERROR_MARKERS) {
+        if (line.includes(`[CFLI:${marker}]`)) return marker;
+    }
+    return null;
+}
+
+/** Structured stderr event; never treat CFLI as the causal error. */
+export function parseRealmProcessorFailureLine(line: string): string | null {
+    const normalized = line.replace(/\u001b\[[0-9;]*m/g, "").trim();
+    return normalized.startsWith("realm_processor_failure ") ? normalized : null;
+}
+
+export function classifySupervisedExit(opts: {
+    spawnFailed?: boolean;
+    fatalProcessorErrorMarker: FatalProcessorErrorMarker | null;
+    dependencyRestartRequested: boolean;
+    signalCode: string | null;
+    exitCode: number | null;
+}): SupervisedFailureCause {
+    if (opts.spawnFailed) return { kind: "spawn-failed" };
+    if (opts.fatalProcessorErrorMarker !== null) {
+        return { kind: "fatal-processor-error", marker: opts.fatalProcessorErrorMarker };
+    }
+    if (opts.dependencyRestartRequested) return { kind: "dependency-restart" };
+    if (opts.signalCode) return { kind: "signaled", signal: opts.signalCode };
+    return { kind: "exited", code: opts.exitCode ?? 0 };
+}
+
+export function failureSignature(cause: SupervisedFailureCause): string {
+    switch (cause.kind) {
+        case "fatal-processor-error": return `fatal-processor-error:${cause.marker}`;
+        case "signaled": return `signaled:${cause.signal}`;
+        case "exited": return `exited:${cause.code}`;
+        default: return cause.kind;
+    }
+}
+
+export function nextRestartDelayMs(attempt: number): number {
+    return Math.min(RESTART_BACKOFF_CAP_MS, 1_000 * Math.pow(2, Math.min(attempt - 1, 5)));
+}
+
+export function nextSpawnRetryDelayMs(restartDelayMs: number): number {
+    return Math.min(RESTART_SPAWN_RETRY_CAP_MS, restartDelayMs * 2);
+}
+
+export function planSupervisedRestart(opts: {
+    restartCount: number;
+    streak: RestartStreak;
+    cause: SupervisedFailureCause;
+    firstCause: string | null;
+    healthySinceMs: number;
+    nowMs: number;
+    observedAtIso: string;
+}): RestartPlan {
+    const stable = opts.healthySinceMs > 0 && opts.nowMs - opts.healthySinceMs >= RESTART_STABLE_RUN_MS;
+    const restartCount = stable ? 0 : opts.restartCount;
+    const streak = stable ? emptyRestartStreak() : opts.streak;
+    const firstCause = stable ? opts.firstCause : (streak.firstCause ?? opts.firstCause);
+    if (opts.cause.kind === "dependency-restart") {
+        return { action: "restart", restartCount: restartCount + 1, delayMs: nextRestartDelayMs(restartCount + 1), streak };
+    }
+    const signature = failureSignature(opts.cause);
+    const same = streak.cause !== null && failureSignature(streak.cause) === signature;
+    const nextStreak: RestartStreak = same
+        ? { ...streak, firstCause: streak.firstCause ?? firstCause, identicalRepeats: streak.identicalRepeats + 1 }
+        : {
+            cause: opts.cause,
+            firstCause,
+            firstObservedAtIso: streak.firstObservedAtIso ?? opts.observedAtIso,
+            identicalRepeats: 1,
+        };
+    if (nextStreak.identicalRepeats > MAX_IDENTICAL_FAILURE_RESTARTS) {
+        return { action: "limit", restartCount, delayMs: 0, streak: nextStreak };
+    }
+    return { action: "restart", restartCount: restartCount + 1, delayMs: nextRestartDelayMs(restartCount + 1), streak: nextStreak };
 }
 
 /**

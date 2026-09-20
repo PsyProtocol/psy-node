@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::table::QDatabaseTableRoutingKey, hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, serializable::QPDPair}, protocol::core_types::{QDBHashBase}};
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_node_scylla::{core::ScyllaCoreStore, tables::merkle::ScyllaMerkleNodesZeroPreparedStatements};
-use psy_node_core::store::traits::{core_db::{CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleStore}, helpers::db_helper_zero_id_merkle_node_simple_set_leaves};
+use psy_node_core::store::traits::{core_db::{CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleStore, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy}, helpers::db_helper_zero_id_merkle_node_simple_set_leaves};
 
 use serde::Serialize;
 
@@ -423,4 +423,76 @@ async fn simple_store_basic_test_1() -> anyhow::Result<()> {
     println!("setup simple store");
     simple_store.basic_test_1().await?;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "database slow"]
+async fn historical_dump_matches_point_select_at_prior_checkpoint() -> anyhow::Result<()> {
+    let key_space = format!("psy_node_zero_id_dump_hist_{}", rand::random::<u64>());
+    let scylla_db = ScyllaCoreStore::<ExHash, ExHasher>::new(0, 0, key_space, &[
+        "127.0.0.1:9042".to_string()
+    ]).await?;
+    let session = scylla_db.session.clone();
+    let keyspace = scylla_db.keyspace.clone();
+    let result: anyhow::Result<()> = async {
+        let simple_store = SimpleStoreEx::setup(Arc::new(scylla_db)).await?;
+        let table = simple_store.store.merkle_node_zero_id_table_a.as_ref();
+        let store = simple_store.store.store.as_ref();
+        let level = EX_ZERO_ID_TREE_A_HEIGHT as u8;
+        let expected_100 = [
+            Hash256([0xA1; 32]),
+            Hash256([0xA2; 32]),
+            Hash256([0xA3; 32]),
+        ];
+        let expected_200 = [
+            Hash256([0xB1; 32]),
+            Hash256([0xB2; 32]),
+            ExHasher::get_zero_hash(0),
+        ];
+        store.db_set_zero_id_merkle_nodes_batch(table, 100, &[
+            SimpleMerkleNode { key: SimpleMerkleNodeKey { level, index: 0 }, value: expected_100[0] },
+            SimpleMerkleNode { key: SimpleMerkleNodeKey { level, index: 1 }, value: expected_100[1] },
+            SimpleMerkleNode { key: SimpleMerkleNodeKey { level, index: 2 }, value: expected_100[2] },
+        ]).await?;
+        store.db_set_zero_id_merkle_nodes_batch(table, 200, &[
+            SimpleMerkleNode { key: SimpleMerkleNodeKey { level, index: 0 }, value: expected_200[0] },
+            SimpleMerkleNode { key: SimpleMerkleNodeKey { level, index: 1 }, value: expected_200[1] },
+            SimpleMerkleNode { key: SimpleMerkleNodeKey { level, index: 2 }, value: expected_200[2] },
+        ]).await?;
+        for (checkpoint, expected_values) in [(100u64, expected_100), (200u64, expected_200)] {
+            let mut expected = HashMap::new();
+            for index in 0..3u64 {
+                let key = SimpleMerkleNodeKey { level, index };
+                let oracle = store.db_select_zero_id_merkle_node_max_checkpoint(table, checkpoint, &key).await?;
+                if oracle != expected_values[index as usize] {
+                    return Err(anyhow::anyhow!("point select at cp{checkpoint} index {index} expected {:?} got {:?}", expected_values[index as usize], oracle));
+                }
+                expected.insert(index, expected_values[index as usize]);
+            }
+            let full = store.db_dump_all_zero_id_merkle_node_leaves_vec(table, checkpoint, MerkleTreeDumpStrategy::DumpAllStrategy).await?;
+            let bounded = store.db_dump_all_zero_id_merkle_node_leaves_vec(table, checkpoint, MerkleTreeDumpStrategy::AppendOnlyTreeStrategy).await?;
+            let full_map: HashMap<u64, ExHash> = full.into_iter().map(|n| (n.key.index, n.value)).collect();
+            let bounded_map: HashMap<u64, ExHash> = bounded.into_iter().map(|n| (n.key.index, n.value)).collect();
+            if full_map != expected {
+                return Err(anyhow::anyhow!("full dump at cp{checkpoint} expected {:?} got {:?}", expected, full_map));
+            }
+            if bounded_map != expected {
+                return Err(anyhow::anyhow!("bounded dump at cp{checkpoint} expected {:?} got {:?}", expected, bounded_map));
+            }
+        }
+        Ok(())
+    }.await;
+    let cleanup = async {
+        session.query_unpaged(format!("DROP KEYSPACE IF EXISTS {keyspace}"), &[]).await?;
+        session.await_schema_agreement().await?;
+        session.query_unpaged(format!("DROP KEYSPACE IF EXISTS {keyspace}_no_tablet"), &[]).await?;
+        session.await_schema_agreement().await?;
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(e),
+        (Ok(()), Err(c)) => Err(c),
+        (Err(e), Err(c)) => Err(anyhow::anyhow!("{e:#}; cleanup also failed: {c:#}")),
+    }
 }

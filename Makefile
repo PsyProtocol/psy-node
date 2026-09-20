@@ -13,9 +13,10 @@ SEPOLIA_RPC_URL ?= https://ethereum-sepolia-rpc.publicnode.com
 PSY_SKIP_BRANCH_CHECK ?= 1
 PSY_SKIP_KEYSTORE ?= 1
 PSY_SKIP_BUILD ?= 1
+PURGE ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test check check-all deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart restart-all shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal
+.PHONY: all build clean test check check-all deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal
 
 all: build
 
@@ -74,10 +75,6 @@ rollback-stop:
 rollback-resume:
 	bun run dev/locSetupV4.ts --control rollback-resume
 
-restart-all:
-	$(MAKE) shutdown PURGE=1
-	$(MAKE) run-all
-
 run-dummy-prover:
 	@echo "Starting dummy prover for all realms using random users..."
 	@./dev/dummy_prover.sh prove_random -p ${PROVING_BACKEND}
@@ -107,8 +104,14 @@ clean-db:
 config_gen_v2:
 	cargo run --release --package psy_plonky2_circuits --example config_gen_v2
 
+# Registration 2 (user_id 524288) is derived from an encrypted UTC JSON keystore
+# when one of these is set and the file exists:
+#   PSY_BRIDGE_RELAYER_KEYSTORE_PATH, BRIDGE_RELAYER_KEYSTORE_PATH, KEYSTORE_PATH
+# Decrypts with WALLET_PASSWORD. First set alias wins; a missing set path fails closed.
+#   WALLET_PASSWORD=… PSY_BRIDGE_RELAYER_KEYSTORE_PATH=$HOME/.psy/keystore/bridge-relayer \
+#     make generate-genesis-data
 generate-genesis-data:
-	cargo test --release --package psy_plonky2_circuits --lib -- node::config::networks::local_devnet::tests --nocapture
+	${BIN_PREFIX}psy_dev_cli generate-genesis-data
 
 # Regenerates client_prover/psy_prover/src/wallet/local_circuits.json (embedded
 # zk-sign + privacy base circuits). Needed whenever the circuit-defining

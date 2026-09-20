@@ -25,10 +25,13 @@ mod startup;
 
 
 pub use behaviour::{
-    add_bootnode_address, add_known_address, proposal_topic, vote_topic, RealmBehaviour,
+    add_bootnode_address, proposal_topic, register_explicit_peer, vote_topic, RealmBehaviour,
     IDENTIFY_PROTOCOL_ID,
 };
-pub use codec::{DirectBodyCodec, EndCapForwardCodec, EndCapForwardRequest, DIRECT_BODY_PROTOCOL_ID, END_CAP_FORWARD_PROTOCOL_ID};
+pub use codec::{
+    BodyChunkCodec, EndCapForwardCodec, EndCapForwardRequest, ProposalLookupCodec,
+    DIRECT_BODY_PROTOCOL_ID, END_CAP_FORWARD_PROTOCOL_ID, PROPOSAL_LOOKUP_PROTOCOL_ID,
+};
 pub use config::{
     generate_bls_secret_file, generate_ed25519_identity_file, load_bls_secret_key,
     load_ed25519_identity_key, RealmNetworkConfig, BOOTNODE_MIN_CIRCUIT_BYTES,
@@ -45,9 +48,10 @@ pub use startup::{build_optional_realm_network, parse_bootnode, OptionalRealmNet
 use libp2p::request_response;
 use libp2p::{identity, noise, tcp, yamux, Swarm, SwarmBuilder};
 use psy_data::p2p::{
-    BlsPublicKey, DirectBodyResponse, EndCapForwardHeader, EndCapForwardResponse, NodeId,
-    Proposal, Vote,
+    BlsPublicKey, BodyChunkRequest, BodyChunkResponse, EndCapForwardHeader, EndCapForwardResponse,
+    NodeId, Proposal, ProposalLookupRequest, ProposalLookupResponse, ValidatorLeaf, Vote,
 };
+use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -59,8 +63,8 @@ pub enum NetworkError {
     Configuration(String),
     #[error("network key file {path}: {details}")]
     KeyFile { path: String, details: String },
-    #[error("unauthorized NodeId {0}")]
-    Unauthorized(NodeId),
+    #[error("NodeId {0} has no validator leaf under the checkpoint validator tree")]
+    NotAValidator(NodeId),
     #[error("protocol error: {0}")]
     Protocol(#[from] psy_data::p2p::ProtocolError),
     #[error("libp2p behaviour error: {0}")]
@@ -106,11 +110,17 @@ pub enum RealmNetworkCommand {
         vote: Vote,
         response: oneshot::Sender<Result<(), NetworkError>>,
     },
-    /// Respond to an inbound direct-body range request.
-    ServeBody {
-        request_id: request_response::InboundRequestId,
-        response_body: DirectBodyResponse,
-        response: oneshot::Sender<Result<(), NetworkError>>,
+    /// Ask one peer for candidates across a window of root pairs.
+    LookupProposal {
+        destination: NodeId,
+        request: ProposalLookupRequest,
+        response: oneshot::Sender<Result<ProposalLookupResponse, NetworkError>>,
+    },
+    /// Ask one peer for one direct-body range.
+    RequestBody {
+        destination: NodeId,
+        request: BodyChunkRequest,
+        response: oneshot::Sender<Result<BodyChunkResponse, NetworkError>>,
     },
     /// Block until `threshold` distinct votes for `proposal_id` arrive, or
     /// `timeout` elapses. Fail-closed: timeout or a closed waiter is an error.
@@ -120,6 +130,10 @@ pub enum RealmNetworkCommand {
         timeout: Duration,
         response: oneshot::Sender<Result<Vec<Vote>, NetworkError>>,
     },
+    SetValidatorLeaves {
+        leaves: Vec<ValidatorLeaf>,
+        response: oneshot::Sender<Result<(), NetworkError>>,
+    },
 }
 
 /// Network → application events. The driving loop emits these for the
@@ -128,7 +142,7 @@ pub enum RealmNetworkCommand {
 #[derive(Debug)]
 pub enum RealmNetworkEvent {
     /// An EndCap forward request was received. The application validates the
-    /// header/payload and replies with `EndCapForwardResponse` on `reply`.
+    /// header, input, and proof, and replies with `EndCapForwardResponse` on `reply`.
     EndCapReceived {
         request_id: request_response::InboundRequestId,
         source: NodeId,
@@ -142,6 +156,18 @@ pub enum RealmNetworkEvent {
         source: NodeId,
         proposal: Proposal,
         body: VerifiedProposalBody,
+    },
+    /// Inbound ProposalLookup from a current validator leaf. Drop `reply` to close the stream.
+    LookupReceived {
+        source: NodeId,
+        request: ProposalLookupRequest,
+        reply: oneshot::Sender<ProposalLookupResponse>,
+    },
+    /// Inbound direct-body range from a current validator leaf. Drop `reply` to close the stream.
+    DirectBodyReceived {
+        source: NodeId,
+        request: BodyChunkRequest,
+        reply: oneshot::Sender<BodyChunkResponse>,
     },
     /// A vote was received on the Realm vote topic.
     VoteReceived {
@@ -167,6 +193,15 @@ impl std::fmt::Debug for RealmNetworkCommands {
 }
 
 impl RealmNetworkCommands {
+    /// Builds a command handle over an existing command channel. The caller owns
+    /// the matching receiver and must drive it.
+    pub fn from_channel(commands: mpsc::Sender<RealmNetworkCommand>, local_node_id: NodeId) -> Self {
+        Self {
+            commands,
+            local_node_id,
+        }
+    }
+
     pub fn local_node_id(&self) -> NodeId {
         self.local_node_id
     }
@@ -208,14 +243,27 @@ impl RealmNetworkCommands {
         .await?
     }
 
-    pub async fn serve_body(
+    pub async fn lookup_proposal(
         &self,
-        request_id: request_response::InboundRequestId,
-        response_body: DirectBodyResponse,
-    ) -> Result<(), NetworkError> {
-        self.request(|response| RealmNetworkCommand::ServeBody {
-            request_id,
-            response_body,
+        destination: NodeId,
+        request: ProposalLookupRequest,
+    ) -> Result<ProposalLookupResponse, NetworkError> {
+        self.request(|response| RealmNetworkCommand::LookupProposal {
+            destination,
+            request,
+            response,
+        })
+        .await?
+    }
+
+    pub async fn request_body(
+        &self,
+        destination: NodeId,
+        request: BodyChunkRequest,
+    ) -> Result<BodyChunkResponse, NetworkError> {
+        self.request(|response| RealmNetworkCommand::RequestBody {
+            destination,
+            request,
             response,
         })
         .await?
@@ -246,6 +294,14 @@ impl RealmNetworkCommands {
             .await
             .map_err(|_| NetworkError::CommandChannelClosed)?;
         rx.await.map_err(|_| NetworkError::ResponseChannelClosed)
+    }
+
+    pub async fn set_validator_leaves(
+        &self,
+        leaves: Vec<ValidatorLeaf>,
+    ) -> Result<(), NetworkError> {
+        self.request(|response| RealmNetworkCommand::SetValidatorLeaves { leaves, response })
+            .await?
     }
 }
 
@@ -308,12 +364,20 @@ impl RealmNetworkHandle {
         self.commands.publish_vote(vote).await
     }
 
-    pub async fn serve_body(
+    pub async fn lookup_proposal(
         &self,
-        request_id: request_response::InboundRequestId,
-        response_body: DirectBodyResponse,
-    ) -> Result<(), NetworkError> {
-        self.commands.serve_body(request_id, response_body).await
+        destination: NodeId,
+        request: ProposalLookupRequest,
+    ) -> Result<ProposalLookupResponse, NetworkError> {
+        self.commands.lookup_proposal(destination, request).await
+    }
+
+    pub async fn request_body(
+        &self,
+        destination: NodeId,
+        request: BodyChunkRequest,
+    ) -> Result<BodyChunkResponse, NetworkError> {
+        self.commands.request_body(destination, request).await
     }
 
     pub async fn wait_votes(
@@ -339,6 +403,7 @@ pub struct RealmNetwork {
     command_rx: mpsc::Receiver<RealmNetworkCommand>,
     event_tx: mpsc::Sender<RealmNetworkEvent>,
     reassembly: ReassemblyBook,
+    validator_leaves: HashMap<NodeId, ValidatorLeaf>,
 }
 
 impl std::fmt::Debug for RealmNetwork {
@@ -390,10 +455,7 @@ impl RealmNetwork {
         );
 
         let handle = RealmNetworkHandle {
-            commands: RealmNetworkCommands {
-                commands: command_tx,
-                local_node_id,
-            },
+            commands: RealmNetworkCommands::from_channel(command_tx, local_node_id),
             events: event_rx,
         };
 
@@ -406,9 +468,17 @@ impl RealmNetwork {
                 command_rx,
                 event_tx,
                 reassembly,
+                validator_leaves: HashMap::new(),
             },
             handle,
         ))
+    }
+
+    pub fn set_validator_leaves(&mut self, leaves: Vec<ValidatorLeaf>) {
+        self.validator_leaves = leaves
+            .into_iter()
+            .map(|leaf| (leaf.node_id, leaf))
+            .collect();
     }
 
     /// Build a Realm network, loading the Ed25519 identity key from

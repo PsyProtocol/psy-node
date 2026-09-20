@@ -15,7 +15,7 @@ use psy_data::{
         header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
         realm_finalize::{
             finalize_output_from_witness, finalize_reward_root63, realm_finalize_guta_chain_domain,
-            protocol_encode_finalize_output, RealmFinalizeBinding, RealmFinalizeGUTAInput,
+            protocol_encode_finalize_output, RealmFinalizeGUTAInput,
         },
     },
     node::node_proving_state::PsyNodeProvingState,
@@ -29,7 +29,10 @@ use psy_data::{
 use psy_io::tokio::TokioLikeFileSystem;
 use cf_utils::timer::TraceTimer;
 use psy_node_core::{
-    p2p::{traits::realm_coordinantor::RealmCoordinatorClient, validator_lookup::load_realm_validators_from_tree},
+    p2p::{
+        traits::realm_coordinantor::RealmCoordinatorClient,
+        validator_lookup::{load_realm_validators_from_tree, validator_nodes_from_leaves},
+    },
     psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore},
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
@@ -42,7 +45,10 @@ use psy_node_core::{
 use crate::{
     realm::{
         processor::{
-            consensus::{form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate, votes_meet_wait},
+            consensus::{
+                form_certificate, require_nonzero_validator_tree_root, sign_vote, validate_certificate,
+                votes_meet_wait,
+            },
             core::PsyRealmProcessor,
             gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput,
         },
@@ -54,7 +60,7 @@ use crate::utils::persisted_artifact::wait_for_persisted_artifact;
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-        S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+        S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
         GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
@@ -211,61 +217,44 @@ where
         Ok(guta_result)
     }
 
-    pub async fn sync_and_verify(&mut self) -> anyhow::Result<()> {
-        // Drain before any fallible sync/early return; never replace a distinct proposal.
-        if let Some(proposal_rx) = self.proposal_rx.as_mut() {
-            while let Ok(complete) = proposal_rx.try_recv() {
-                self.proposals.entry(complete.proposal.proposal_id).or_insert(complete);
+    pub async fn sync_and_verify(&mut self) -> anyhow::Result<()>
+    where
+        N::HasherBase: MerkleZeroHasher<N::QHash>,
+    {
+        let mut replay_requests = Vec::new();
+        if let Some(replay_rx) = self.baseline_replay_rx.as_mut() {
+            while let Ok(request) = replay_rx.try_recv() {
+                replay_requests.push(request);
             }
         }
+        for request in replay_requests {
+            let result = self
+                .db
+                .verify_state_updates_from_baseline(request.previous_checkpoint_id, &request.updates)
+                .await;
+            let _ = request.reply.send(result);
+        }
         self.db.sync_with_coordinator().await?;
-        // This also retries gatherer fast-forward after a successful durable commit.
-        self.commit_included_proposal_ffs().await?;
+        self.apply_proposal_ffs().await?;
         self.db.ensure_db_matches_coordinator_head().await
     }
 
-    async fn ensure_uncommitted_processing_ids(&mut self, checkpoint_id: u64) -> anyhow::Result<()> {
-        let pending_id = self.db.state.processing_unique_pending_id;
-        let mapped_checkpoint = self.db.db.get_checkpoint_id_for_unique_pending_id(pending_id).await?;
-        // commit_state writes this forward mapping first. Keep its IDs even if the
-        // reverse mapping or a later write failed; a retry must not allocate again.
-        if pending_id != 0 && mapped_checkpoint == Some(checkpoint_id) {
-            return Ok(());
-        }
-        let (pending_id, proc_checkpoint_unique_id) =
-            if let Some(ids) = self.db.db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await? {
-                ids
-            } else if pending_id != 0 && mapped_checkpoint.is_none() {
-                return Ok(());
-            } else {
-                self.db.db.inc_unique_pending_id(1).await?
-            };
-        self.db.state.processing_unique_pending_id = pending_id;
-        self.db.state.processing_proc_checkpoint_unique_id = proc_checkpoint_unique_id;
-        self.db.temp_db.set_unique_pending_ids(
-            &self.db.state.realm_identifier, pending_id, proc_checkpoint_unique_id,
-        ).await?;
-        Ok(())
-    }
 
-
-    async fn commit_included_proposal_ffs(&mut self) -> anyhow::Result<()> {
+    async fn apply_proposal_ffs(&mut self) -> anyhow::Result<()>
+    where
+        N::HasherBase: MerkleZeroHasher<N::QHash>,
+    {
         let latest_checkpoint_id = self.db.coordinator_client.rc_get_latest_checkpoint_id().await?;
-        let mapped_checkpoint = self.db.db.get_checkpoint_id_for_unique_pending_id(
-            self.db.state.processing_unique_pending_id,
-        ).await?;
-        // Resume a partially committed transition at its original checkpoint, even
-        // when the coordinator has already included a subsequent proposal.
-        let checkpoint_id = mapped_checkpoint
-            .filter(|id| *id > self.db.state.last_committed_checkpoint_id)
-            .unwrap_or(latest_checkpoint_id);
+        self.db.set_last_committed_realm_root_from_db().await?;
         let mut coordinator_realm_state = self.db.coordinator_client
-            .rc_get_realm_root_and_last_modified_checkpoint(checkpoint_id, self.db.state.realm_id_u64)
+            .rc_get_realm_root_and_last_modified_checkpoint(latest_checkpoint_id, self.db.state.realm_id_u64)
             .await?;
-        // Walk authenticated last-modified boundaries backwards to the first
-        // unapplied transition. Looking only at the tip can skip retained bodies
-        // (or hide a root that changed away and then returned to its old value).
+        let mut last_modifieds = Vec::new();
         while coordinator_realm_state.checkpoint_id > self.db.state.last_committed_checkpoint_id {
+            last_modifieds.push((
+                coordinator_realm_state.checkpoint_id,
+                coordinator_realm_state.value.into_owned_32bytes(),
+            ));
             let previous = self.db.coordinator_client
                 .rc_get_realm_root_and_last_modified_checkpoint(
                     coordinator_realm_state.checkpoint_id - 1, self.db.state.realm_id_u64,
@@ -277,66 +266,151 @@ where
                 "Coordinator realm last-modified checkpoint did not decrease during recovery");
             coordinator_realm_state = previous;
         }
-
-        let mut selected = None;
-        for (proposal_id, complete) in &self.proposals {
-            let decoded = crate::realm::processor::consensus::decode_proposal_body(
-                &complete.proposal, complete.body.as_bytes(),
-            ).map_err(|error| anyhow::anyhow!("Proposal {}: {error}", hex::encode(proposal_id)))?;
-            let updates = PsyPreparedRealmBlockStateUpdates::<N::QHash>::psy_ser_from_slice(&decoded.state_updates)?;
-            // An already committed object takes precedence: its gatherer may still
-            // need FF, and a newer transition cannot safely run ahead of that FF.
-            if updates.new_realm_root == self.db.state.last_committed_realm_end_root
-                && updates.old_realm_root == self.db.state.last_committed_realm_start_root
-            {
-                coordinator_realm_state = self.db.coordinator_client
-                    .rc_get_realm_root_and_last_modified_checkpoint(
-                        self.db.state.last_committed_checkpoint_id, self.db.state.realm_id_u64,
-                    ).await?;
-                anyhow::ensure!(coordinator_realm_state.value == updates.new_realm_root,
-                    "Committed proposal {} no longer matches authenticated realm root", hex::encode(proposal_id));
-                selected = Some((*proposal_id, updates, decoded.state_updates));
-                break;
+        last_modifieds.reverse();
+        let old_root = self.db.state.last_committed_realm_end_root.into_owned_32bytes();
+        let (transition, included_checkpoint_id) = match crate::realm::processor::catchup::first_root_change(
+            self.db.state.last_committed_checkpoint_id,
+            old_root,
+            &last_modifieds,
+        ) {
+            None => {
+                if let Some(&(accounted_checkpoint, _)) = last_modifieds
+                    .iter()
+                    .rev()
+                    .find(|(checkpoint_id, _)| *checkpoint_id > self.db.state.last_committed_checkpoint_id)
+                {
+                    self.db.state.last_committed_checkpoint_id = accounted_checkpoint;
+                    self.db.shared_state.update_from_core_state(&self.db.state).await?;
+                }
+                return self.db.sync_to_coordinator_checkpoint_id(latest_checkpoint_id).await;
             }
-            if selected.is_none() && updates.new_realm_root == coordinator_realm_state.value
-                && updates.old_realm_root == self.db.state.last_committed_realm_end_root
-            {
-                selected = Some((*proposal_id, updates, decoded.state_updates));
+            Some((transition, included_checkpoint)) => (transition, included_checkpoint),
+        };
+        coordinator_realm_state = self.db.coordinator_client
+            .rc_get_realm_root_and_last_modified_checkpoint(included_checkpoint_id, self.db.state.realm_id_u64)
+            .await?;
+        let coordinator_update = self.db.coordinator_client
+            .rc_get_realm_sync_info(included_checkpoint_id, self.db.state.realm_id_u64)
+            .await?;
+        let included = crate::realm::processor::ffs::CheckpointIdentity {
+            checkpoint_id: included_checkpoint_id,
+            checkpoint_leaf_hash: coordinator_update
+                .checkpoint_sync_info
+                .checkpoint_leaf_hash
+                .into_owned_32bytes(),
+        };
+        let gathering_start = self.db.state.gathering_realm_start_root;
+        let mut selected = match self
+            .db
+            .verify_history_transition(&included, transition, None, &self.proposal_backup)
+            .await
+        {
+            Ok(Some(verified)) if included.checkpoint_id > self.db.state.last_committed_checkpoint_id => {
+                Some(
+                    self.db
+                        .apply_history_proposal(&included, verified)
+                        .await?,
+                )
+            }
+            Ok(Some(verified)) => Some((verified.updates, verified.state_updates)),
+            Ok(None) => None,
+            Err(error) if crate::realm::processor::ffs::invalid_candidate_id(&error).is_some() => None,
+            Err(error) => return Err(error),
+        };
+        if selected.is_none() {
+            if let Some(client) = self.p2p.as_ref() {
+                let (_, _, _, leaves) = self
+                    .load_base_checkpoint_validators(self.db.state.last_committed_checkpoint_id)
+                    .await?;
+                let validator_nodes = validator_nodes_from_leaves(&leaves);
+                let peers = crate::realm::processor::catchup::CatchupPeers::select(
+                    &validator_nodes,
+                    self.db.state.realm_sub_id_u64 as u16,
+                )?;
+                let staged = crate::realm::processor::catchup::stage_transition_blocks(
+                    client,
+                    &self.proposal_backup,
+                    &peers,
+                    self.db.state.chain_id,
+                    self.db.state.realm_id_u64 as u32,
+                    &[transition],
+                    &[],
+                )
+                .await
+                .into_iter()
+                .find_map(|outcome| match outcome {
+                    crate::realm::processor::catchup::TransitionFetchOutcome::Staged(_, staged) => Some(staged),
+                    crate::realm::processor::catchup::TransitionFetchOutcome::Absent(transition) => {
+                        tracing::debug!(
+                            "no peer offered transition=({},{})",
+                            hex::encode(transition.old_root),
+                            hex::encode(transition.new_root)
+                        );
+                        None
+                    }
+                    crate::realm::processor::catchup::TransitionFetchOutcome::Failed(transition, error) => {
+                        tracing::warn!(
+                            "peer fetch failed transition=({},{}) error={error:#}",
+                            hex::encode(transition.old_root),
+                            hex::encode(transition.new_root)
+                        );
+                        None
+                    }
+                });
+                selected = match self
+                    .db
+                    .verify_history_transition(&included, transition, staged.as_ref(), &self.proposal_backup)
+                    .await
+                {
+                    Ok(Some(verified)) => {
+                        if let Some(staged) = staged {
+                            self.proposal_backup.install(staged).await?;
+                        }
+                        if included.checkpoint_id > self.db.state.last_committed_checkpoint_id {
+                            Some(
+                                self.db
+                                    .apply_history_proposal(&included, verified)
+                                    .await?,
+                            )
+                        } else {
+                            Some((verified.updates, verified.state_updates))
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        if crate::realm::processor::ffs::invalid_candidate_id(&error).is_none() {
+                            return Err(error);
+                        }
+                        None
+                    }
+                };
             }
         }
-        let Some((proposal_id, updates, updates_bytes)) = selected else {
+        let Some((updates, updates_bytes)) = selected else {
             anyhow::ensure!(coordinator_realm_state.value == self.db.state.last_committed_realm_end_root
                 && coordinator_realm_state.checkpoint_id <= self.db.state.last_committed_checkpoint_id,
-                "Checkpoint {}: no complete proposal body for included realm transition {:?} -> {:?}; retaining {} unresolved proposals without advancing committed state",
+                "Checkpoint {}: no stored proposal for included realm transition {:?} -> {:?}",
                 coordinator_realm_state.checkpoint_id, self.db.state.last_committed_realm_end_root,
-                coordinator_realm_state.value, self.proposals.len());
-            return self.db.sync_to_coordinator_checkpoint_id(checkpoint_id).await;
+                coordinator_realm_state.value);
+            return self.db.sync_to_coordinator_checkpoint_id(latest_checkpoint_id).await;
         };
-        let included_checkpoint_id = coordinator_realm_state.checkpoint_id;
         if included_checkpoint_id > self.db.state.last_committed_checkpoint_id {
-            self.ensure_uncommitted_processing_ids(included_checkpoint_id).await?;
-            let coordinator_update = self.db.coordinator_client
-                .rc_get_realm_sync_info(included_checkpoint_id, self.db.state.realm_id_u64)
-                .await?;
-            self.db.state.processing_checkpoint_id = included_checkpoint_id;
-            self.db.state.processing_checkpoint_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
-            self.db.state.processing_realm_start_root = updates.old_realm_root;
-            self.db.state.processing_realm_end_root = updates.new_realm_root;
-            self.db.commit_state(
-                &coordinator_update, &updates, ProvingJobCircuitType::GUTANoChange, vec![], true,
-            ).await?;
-            tracing::info!("Committed Realm proposal {} FFS checkpoint_id={}", hex::encode(proposal_id), included_checkpoint_id);
+            tracing::info!(
+                "Applied proposal FFS checkpoint_id={}",
+                included_checkpoint_id
+            );
         }
 
         self.db.state.gathering_realm_start_root = updates.new_realm_root;
         self.db.shared_state.update_from_core_state(&self.db.state).await?;
-        // The author's gatherer already contains this transition.
-        if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
+        if gathering_start != updates.old_realm_root && gathering_start != updates.new_realm_root {
+            self.recreate_guta_gatherer().await?;
+        } else if updates.realm_sub_id != self.db.state.realm_sub_id_u64 {
             self.guta_queue_gatherer.fast_forward(updates_bytes).await?;
         }
-        self.proposals.remove(&proposal_id);
-        // Bound metadata advancement to the applied root's checkpoint. A newer
-        // transition is selected on the next sync rather than skipped as metadata.
+        self.db
+            .publish_validator_leaves(self.p2p.as_ref(), self.db.state.last_committed_checkpoint_id)
+            .await?;
         self.db.sync_to_coordinator_checkpoint_id(self.db.state.last_committed_checkpoint_id).await
     }
 
@@ -345,7 +419,10 @@ where
 
 
 
-    pub async fn process_block(&mut self) -> anyhow::Result<()> {
+    pub async fn process_block(&mut self) -> anyhow::Result<()>
+    where
+        N::HasherBase: MerkleZeroHasher<N::QHash>,
+    {
         self.db.run_sanity_check("process_block start").await?;
         let mut timer = TraceTimer::new("process_block");
         tracing::info!(
@@ -526,11 +603,7 @@ where
                 .await?;
         }
 
-        if let Some((proposal, certificate, output_bytes, worker_tag)) = p2p_submission.as_ref() {
-            let finalize_binding = RealmFinalizeBinding {
-                output: *output_bytes,
-                finalizer_worker_reward_tag: *worker_tag,
-            };
+        if let Some((proposal, certificate, _output_bytes, _worker_tag)) = p2p_submission.as_ref() {
             tracing::info!(
                 "Submitting GUTA proof to Coordinator proposal={} realm={} sub_id={}",
                 hex::encode(proposal.proposal_id),
@@ -545,7 +618,6 @@ where
                     self.db.state.realm_id_u64,
                     Some(proposal.protocol_encode_to_vec()),
                     Some(certificate.protocol_encode_to_vec()),
-                    finalize_binding.protocol_encode_to_vec(),
                 )
                 .await?;
         } else {
@@ -558,7 +630,6 @@ where
                     self.db.state.realm_id_u64,
                     None,
                     None,
-                    Vec::new(),
                 )
                 .await?;
         }
@@ -579,10 +650,18 @@ where
         // commit_state").await?;
 
         self.db
-            .commit_state(&sync_info, &db_output, root_job_id.circuit_type, root_job_proof, false)
+            .commit_state(
+                &sync_info,
+                &db_output,
+                root_job_id.circuit_type,
+                root_job_proof,
+            )
             .await?;
         timer.lap("commit_state");
         self.db.run_sanity_check("after commit").await?;
+        self.db
+            .publish_validator_leaves(self.p2p.as_ref(), self.db.state.last_committed_checkpoint_id)
+            .await?;
 
         tracing::info!(
             "Committed new realm block with checkpoint_id = {}.",
@@ -648,7 +727,7 @@ where
             .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
 
         let local_sub_id = self.db.state.realm_sub_id_u64 as u16;
-        let (validator_sub_ids, leaf_bls_keys, validator_user_ids) =
+        let (validator_sub_ids, leaf_bls_keys, validator_user_ids, _) =
             self.load_base_checkpoint_validators(base_checkpoint_id).await?;
         let proposer_user_id = validator_user_ids
             .iter()
@@ -703,7 +782,8 @@ where
             .copied()
             .filter(|(sub_id, _)| *sub_id != local_sub_id)
             .collect();
-        cmds.publish_proposal(proposal.clone(), body, remote_bls_keys).await?;
+        self.proposal_backup.save_proposal(&proposal, &body).await?;
+        cmds.publish_proposal(proposal.clone(), body.clone(), remote_bls_keys).await?;
         cmds.publish_vote(own_vote.clone()).await?;
         tracing::info!(
             "realm P2P proposal published proposal={} realm={} sub_id={} epoch={} target={} base={} validator_tree_root={}",
@@ -721,7 +801,6 @@ where
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         while !votes_meet_wait(
             n,
-            local_sub_id,
             &all_votes.iter().map(|(sub_id, _)| *sub_id).collect::<Vec<_>>(),
         ) {
             let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -769,6 +848,7 @@ where
         }
         let certificate = form_certificate(&proposal, &all_votes)?;
         validate_certificate(&proposal, &certificate, &validator_sub_ids, &leaf_bls_keys)?;
+        self.proposal_backup.save_proposal(&proposal, &body).await?;
         let signer_ids = all_votes.iter().map(|(sub_id, _)| *sub_id).collect::<Vec<_>>();
         tracing::info!(
             "realm P2P certificate formed proposal={} realm={} target={} epoch={} signers={:?} verified_votes={}",
@@ -789,6 +869,7 @@ where
         Vec<u16>,
         Vec<(u16, psy_data::p2p::BlsPublicKey)>,
         Vec<(u16, u64)>,
+        Vec<(u16, psy_data::p2p::ValidatorLeaf)>,
     )>
     where
         N::HasherBase: MerkleZeroHasher<N::QHash>,
@@ -814,7 +895,7 @@ where
         let target = base_checkpoint_id
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
-        let (validator_sub_ids, _, _) = self.load_base_checkpoint_validators(base_checkpoint_id).await?;
+        let (validator_sub_ids, _, _, _) = self.load_base_checkpoint_validators(base_checkpoint_id).await?;
         let tree_rotation = parth_common::realm_rotation::RealmRotationConfig {
             checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH,
             validator_sub_ids,

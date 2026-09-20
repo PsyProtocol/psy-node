@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parth_core::{
@@ -15,7 +16,7 @@ use psy_data::{
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
     p2p::{
         BlsPublicKey, EndCapForwardHeader, EndCapForwardResponse, EndCapRejectReason, NodeId,
-        MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
+        ProposalLookupResponse, ValidatorLeaf, MAX_VALIDATORS_PER_REALM, MIN_VALIDATORS_PER_REALM,
     },
 };
 use psy_node_common::{
@@ -23,10 +24,14 @@ use psy_node_common::{
     realm::{
         network::{
             build_optional_realm_network, load_bls_secret_key, load_ed25519_identity_key,
-            parse_bootnode, run_realm_network, ProposalWithBody, OptionalRealmNetwork,
+            parse_bootnode, run_realm_network, OptionalRealmNetwork, RealmNetworkCommands,
             RealmNetworkEvent,
         },
-        processor::consensus::{sign_vote, verify_proposal_submission},
+        processor::{
+            consensus::{decode_proposal_state_updates, sign_vote, verify_proposal_submission},
+            proposal_backup::ProposalBackup,
+            ffs::BaselineReplayRequest,
+        },
     },
 };
 use psy_node_core::{
@@ -492,40 +497,64 @@ pub fn validate_processor_identity<F, Hash>(
     Ok(derived_sub_id)
 }
 
-/// Drive loop plus processor event consumer. Non-proposers validate, deliver the
-/// complete proposal, and vote.
+pub async fn processor_realm_validator_leaves<N, S>(
+    store: &S,
+    chain_id: u64,
+    realm_id: u32,
+) -> anyhow::Result<Vec<ValidatorLeaf>>
+where
+    N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Sync,
+    N::HasherBase: MerkleZeroHasher<N::QHash>,
+    N::QHash: Copy + PartialEq + Q256BitHash,
+{
+    let checkpoint_id = store.get_latest_checkpoint_id().await?;
+    let roots = store.get_checkpoint_global_state_roots(checkpoint_id).await?;
+    let (_, _, _, leaves) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+        store,
+        chain_id,
+        checkpoint_id,
+        realm_id,
+        &roots.validator_tree_root,
+    )
+    .await?;
+    Ok(leaves.into_iter().map(|(_, leaf)| leaf).collect())
+}
+
+/// Drive loop plus processor event consumer. Lookup/range serve immediately.
+/// Follower Vote waits until production runtime enables voting, then stores the
+/// proposal and requires baseline replay before sign/publish.
 pub fn spawn_processor_realm_network<N, S>(
-    built: OptionalRealmNetwork,
+    mut built: OptionalRealmNetwork,
     config: &RealmProcessorStartConfig,
     local_sub_id: u16,
     validator_store: Arc<S>,
-    proof_verifier: N::ZKVerifier,
-    proposal_tx: tokio::sync::mpsc::Sender<ProposalWithBody>,
+    proof_verifier: Arc<N::ZKVerifier>,
+    proposal_backup: Arc<ProposalBackup>,
+    validator_leaves: Vec<ValidatorLeaf>,
+    commands: RealmNetworkCommands,
+    bls_secret: psy_data::p2p::BlsSecretKey,
+    vote_enabled: Arc<AtomicBool>,
+    baseline_replay: tokio::sync::mpsc::Sender<BaselineReplayRequest<N::QHash>>,
 ) where
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
     S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync + 'static,
     N::HasherBase: MerkleZeroHasher<N::QHash>,
-    N::ZKVerifier: 'static,
+    N::ZKVerifier: Send + Sync + 'static,
+    N::QHash: Q256BitHash + Send + 'static,
 {
+    built.network.set_validator_leaves(validator_leaves);
     let OptionalRealmNetwork {
         network,
         handle,
-        bls_secret,
         ..
     } = built;
     let realm_id = config.realm_id as u32;
     let chain_id = config.network.get_chain_id();
-    let public = realm_public_data(config.network, realm_id)
-        .expect("processor Realm P2P public config was validated at startup");
-    let proof_verifier = Arc::new(proof_verifier);
-    let commands = handle.commands();
+    let bls_secret = Arc::new(bls_secret);
     let mut events = handle.into_parts().1;
     tokio::spawn(run_realm_network(network));
     tokio::spawn(async move {
-        let Some(bls_secret) = bls_secret else {
-            tracing::error!("processor P2P event loop missing BLS secret");
-            return;
-        };
         while let Some(event) = events.recv().await {
             match event {
                 RealmNetworkEvent::ProposalReady { source, proposal, body } => {
@@ -533,6 +562,14 @@ pub fn spawn_processor_realm_network<N, S>(
                         continue;
                     }
                     let proposal_id = proposal.proposal_id;
+                    let validator_store = validator_store.clone();
+                    let proof_verifier = proof_verifier.clone();
+                    let proposal_backup = proposal_backup.clone();
+                    let vote_enabled = vote_enabled.clone();
+                    let baseline_replay = baseline_replay.clone();
+                    let commands = commands.clone();
+                    let bls_secret = bls_secret.clone();
+                    tokio::spawn(async move {
                     let validation = async {
                         anyhow::ensure!(proposal.chain_id == chain_id, "Proposal chain_id mismatch");
                         anyhow::ensure!(proposal.realm_id == realm_id, "Proposal realm_id mismatch");
@@ -540,14 +577,10 @@ pub fn spawn_processor_realm_network<N, S>(
                             proposal.compute_proposal_id() == proposal.proposal_id,
                             "Proposal proposal_id mismatch"
                         );
-                        anyhow::ensure!(
-                            public.validator_processor_node_ids.get(&proposal.proposer_sub_id) == Some(&source),
-                            "Proposal source NodeId does not match configured proposer"
-                        );
                         let roots = validator_store
                             .get_checkpoint_global_state_roots(proposal.base_checkpoint_id)
                             .await?;
-                        let (_, _, user_ids) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+                        let (_, _, user_ids, leaves) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
                             validator_store.as_ref(),
                             chain_id,
                             proposal.base_checkpoint_id,
@@ -555,6 +588,14 @@ pub fn spawn_processor_realm_network<N, S>(
                             &roots.validator_tree_root,
                         )
                         .await?;
+                        let expected_source = leaves
+                            .iter()
+                            .find(|(sub_id, _)| *sub_id == proposal.proposer_sub_id)
+                            .map(|(_, leaf)| leaf.node_id);
+                        anyhow::ensure!(
+                            expected_source == Some(source),
+                            "Proposal source NodeId does not match validator leaf at proof-base checkpoint"
+                        );
                         anyhow::ensure!(
                             proposal.validator_tree_root == roots.validator_tree_root.into_owned_32bytes(),
                             "Proposal validator_tree_root does not match proof-base checkpoint"
@@ -566,46 +607,72 @@ pub fn spawn_processor_realm_network<N, S>(
                                 "GUTA proposer sub_id {} has no checkpoint validator",
                                 proposal.proposer_sub_id
                             ))?;
-                        verify_proposal_submission::<N>(
+                        let decoded = verify_proposal_submission::<N>(
                             &proposal,
                             body.as_bytes(),
                             proposer_user_id,
                             proof_verifier.as_ref(),
                         )?;
-                        let vote = sign_vote(&bls_secret, local_sub_id, &proposal);
-                        let complete = ProposalWithBody { proposal, body };
-                        proposal_tx
-                            .send(complete)
-                            .await
-                            .map_err(|_| anyhow::anyhow!("verified proposals receiver dropped"))?;
-                        Ok::<_, anyhow::Error>(vote)
-                    }.await;
-                    let vote = match validation {
-                        Ok(vote) => vote,
-                        Err(error) => {
-                            tracing::warn!(
-                                "realm P2P non-proposer rejected Proposal proposal={} error={:#}",
-                                hex::encode(proposal_id),
-                                error
-                            );
-                            continue;
+                        proposal_backup.save_proposal(&proposal, body.as_bytes()).await?;
+                        if !vote_enabled.load(Ordering::Acquire) {
+                            return Ok(());
                         }
-                    };
-                    if let Err(error) = commands.publish_vote(vote).await {
+                        let updates = decode_proposal_state_updates::<N::QHash>(&decoded.state_updates)?;
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        baseline_replay
+                            .send(BaselineReplayRequest {
+                                previous_checkpoint_id: proposal.base_checkpoint_id,
+                                updates,
+                                reply: reply_tx,
+                            })
+                            .await
+                            .map_err(|_| anyhow::anyhow!("baseline replay receiver dropped"))?;
+                        match reply_rx.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(
+                                    "follower baseline replay rejected proposal={} error={error:#}",
+                                    hex::encode(proposal.proposal_id)
+                                );
+                                return Ok(());
+                            }
+                            Err(_) => anyhow::bail!("baseline replay reply dropped"),
+                        }
+                        let vote = sign_vote(&bls_secret, local_sub_id, &proposal);
+                        commands
+                            .publish_vote(vote)
+                            .await
+                            .map_err(|error| anyhow::anyhow!("follower vote publish failed: {error}"))?;
+                        Ok::<_, anyhow::Error>(())
+                    }.await;
+                    if let Err(error) = validation {
                         tracing::warn!(
-                            "realm P2P non-proposer vote publish failed proposal={} error={}",
+                            "realm P2P non-proposer rejected Proposal proposal={} error={:#}",
                             hex::encode(proposal_id),
                             error
                         );
-                        continue;
                     }
-                    tracing::info!(
-                        "realm P2P non-proposer vote published proposal={} signer_sub_id={} realm={} source={:?}",
-                        hex::encode(proposal_id),
-                        local_sub_id,
-                        realm_id,
-                        source
-                    );
+                    });
+                }
+                RealmNetworkEvent::LookupReceived { request, reply, .. } => {
+                    let response = match proposal_backup.lookup_proposal(&request).await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!("ProposalLookup serve failed error={error:#}");
+                            ProposalLookupResponse::empty()
+                        }
+                    };
+                    let _ = reply.send(response);
+                }
+                RealmNetworkEvent::DirectBodyReceived { request, reply, .. } => {
+                    match proposal_backup.read_body_chunk(&request).await {
+                        Ok(response) => {
+                            let _ = reply.send(response);
+                        }
+                        Err(error) => {
+                            tracing::warn!("direct range serve failed error={error:#}");
+                        }
+                    }
                 }
                 RealmNetworkEvent::EndCapReceived { reply, .. } => {
                     let _ = reply.send(EndCapForwardResponse::rejected(EndCapRejectReason::Invalid));
@@ -645,6 +712,8 @@ where
                     let _ = reply.send(response);
                 }
                 RealmNetworkEvent::ProposalReady { .. }
+                | RealmNetworkEvent::LookupReceived { .. }
+                | RealmNetworkEvent::DirectBodyReceived { .. }
                 | RealmNetworkEvent::VoteReceived { .. } => {}
             }
         }

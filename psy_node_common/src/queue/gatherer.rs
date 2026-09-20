@@ -13,6 +13,10 @@ use crate::{
     utils::processor_status::ProcessorStatus,
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("GATHERER_{0}: gatherer channel closed")]
+pub struct GathererChannelClosed(pub u32);
+
 pub enum GathererTreeCommand<Output> {
     Finalize {
         reply: oneshot::Sender<anyhow::Result<Output>>,
@@ -123,15 +127,15 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
     pub async fn stop_gracefully(&mut self) -> anyhow::Result<()> {
         self.qk.begin_shutdown()?;
         let (response_tx, response_rx) = oneshot::channel();
-        self.trigger_tx.send(response_tx).await?;
-        let _result = response_rx.await??;
+        self.trigger_tx.send(response_tx).await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))?;
+        let _result = response_rx.await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))??;
         Ok(())
     }
     pub async fn finalize_gathering_and_update_queue_key(&mut self, unique_id: u128) -> anyhow::Result<Output> {
         self.qk.set_unique_id(unique_id)?;
         let (response_tx, response_rx) = oneshot::channel();
-        self.trigger_tx.send(response_tx).await?;
-        let result = response_rx.await??;
+        self.trigger_tx.send(response_tx).await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))?;
+        let result = response_rx.await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))??;
         Ok(result)
     }
 }
@@ -241,8 +245,8 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         let (response_tx, response_rx) = oneshot::channel();
         self.trigger_tx
             .send(GathererTreeCommand::Stop { reply: response_tx })
-            .await?;
-        let _result = response_rx.await??;
+            .await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))?;
+        let _result = response_rx.await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))??;
         Ok(())
     }
 
@@ -252,16 +256,11 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
     ) -> anyhow::Result<Output> {
         self.qk.set_unique_id(unique_id)?;
         let (response_tx, response_rx) = oneshot::channel();
-        if response_rx.is_terminated() {
-            anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Response channel was terminated before sending.");
-        } else if response_tx.is_closed() {
-            anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Response channel was closed before sending.");
-        }
         tracing::info!("start finish finalize_gathering_and_update_queue_key for GATHERER_{QUEUE_TOPIC_ID}");
         self.trigger_tx
             .send(GathererTreeCommand::Finalize { reply: response_tx })
-            .await?;
-        let result = response_rx.await??;
+            .await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))?;
+        let result = response_rx.await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))??;
         tracing::info!("end finish finalize_gathering_and_update_queue_key for GATHERER_{QUEUE_TOPIC_ID}");
         Ok(result)
     }
@@ -273,8 +272,8 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
                 state_updates,
                 reply: response_tx,
             })
-            .await?;
-        response_rx.await?
+            .await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))?;
+        response_rx.await.map_err(|_| GathererChannelClosed(QUEUE_TOPIC_ID))?
     }
 
 }
@@ -453,6 +452,7 @@ pub async fn gatherer_runner_for_tree<
                 builder
             }
             Err(error) => {
+                tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: bootstrap failed: {error:#}");
                 if let Some(command) = command {
                     match command {
                         GathererTreeCommand::Finalize { reply } | GathererTreeCommand::Stop { reply } => {
@@ -575,5 +575,97 @@ pub async fn gatherer_runner_for_tree<
             }
         }
         tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Handoff complete. Cycle restarting.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parth_core::{data::queue::queue_key::QPBaseQueueType, pgoldilocks::PoseidonHasher, PHash};
+    use psy_data::v1::qdata::public_key::PZKPublicKeyInfo;
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+
+    type Item = PZKPublicKeyInfo<PHash>;
+    type Tree = SimpleMemoryMerkleRecorderStore<PoseidonHasher, PHash>;
+    type Gatherer = EphemeralQueueGathererWithTree<32, Item, ()>;
+
+    fn queue_key() -> QPStandardUniqueIdQueueKey<32, Item> {
+        QPStandardUniqueIdQueueKey {
+            realm_id: 0, realm_sub_id: 1, unique_id: 0, task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral,
+            _phantom_queue_item: std::marker::PhantomData,
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("bootstrap proof mismatch")]
+    struct BootstrapFailure;
+
+    struct FailingBuilder;
+
+    #[async_trait::async_trait]
+    impl QueueGathererItemBuilderWithTree<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>), Tree> for FailingBuilder {
+        type Output = ();
+
+        async fn create_new_with_tree(_: &mut Tree, _: u128, (entered, release): (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)) -> anyhow::Result<Self> {
+            entered.notify_one();
+            release.notified().await;
+            Err(anyhow::Error::new(BootstrapFailure).context("restoring gatherer"))
+        }
+
+        async fn update_from_queue_item_with_tree(&mut self, _: &mut Tree, _: Vec<u8>) -> anyhow::Result<()> { unreachable!() }
+        async fn update_from_many_queue_items_with_tree(&mut self, _: &mut Tree, _: Vec<Vec<u8>>) -> anyhow::Result<()> { unreachable!() }
+        async fn finalize_with_tree(self, _: &mut Tree) -> anyhow::Result<()> { unreachable!() }
+    }
+
+    #[tokio::test]
+    async fn queued_finalize_recovers_original_bootstrap_error_from_owner() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let tree = Arc::new(tokio::sync::RwLock::new(Tree::new(4)));
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        let (mut gatherer, handle) = Gatherer::new_with_status_shared::<_, _, PHash, PoseidonHasher, FailingBuilder>(
+            Arc::new(InMemoryTempStore::new("queued-bootstrap-test".to_string(), 1, 0)),
+            (entered.clone(), release.clone()), queue_key(), tree, status,
+        );
+        entered.notified().await;
+        let mut finalize = Box::pin(gatherer.finalize_gathering_and_update_queue_key(1));
+        tokio::select! {
+            biased;
+            result = &mut finalize => panic!("finalize completed before bootstrap: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        release.notify_one();
+        let closed = finalize.await.unwrap_err();
+        assert_eq!(closed.downcast_ref::<GathererChannelClosed>().unwrap().0, 32);
+        let original = handle.await.unwrap().unwrap_err();
+        assert!(original.downcast_ref::<BootstrapFailure>().is_some());
+    }
+
+    #[tokio::test]
+    async fn closed_trigger_is_typed_for_finalize_stop_and_fast_forward() {
+        let (trigger_tx, trigger_rx) = mpsc::channel(1);
+        let mut gatherer = Gatherer { qk: QueueKeyStatusManager::new(queue_key()), trigger_tx };
+        drop(trigger_rx);
+        let finalize = gatherer.finalize_gathering_and_update_queue_key(1).await.unwrap_err();
+        let fast_forward = gatherer.fast_forward(Vec::new()).await.unwrap_err();
+        let stop = gatherer.stop_gracefully().await.unwrap_err();
+        for error in [finalize, fast_forward, stop] {
+            assert_eq!(error.downcast_ref::<GathererChannelClosed>().unwrap().0, 32);
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_preserves_inner_error_identity() {
+        let (trigger_tx, mut trigger_rx) = mpsc::channel(1);
+        let mut gatherer = Gatherer { qk: QueueKeyStatusManager::new(queue_key()), trigger_tx };
+        let owner = tokio::spawn(async move {
+            let Some(GathererTreeCommand::Finalize { reply }) = trigger_rx.recv().await else { panic!("expected finalize") };
+            reply.send(Err(anyhow::Error::new(BootstrapFailure))).unwrap();
+        });
+        let error = gatherer.finalize_gathering_and_update_queue_key(1).await.unwrap_err();
+        assert!(error.downcast_ref::<BootstrapFailure>().is_some());
+        owner.await.unwrap();
     }
 }

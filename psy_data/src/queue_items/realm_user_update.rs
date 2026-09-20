@@ -11,7 +11,7 @@ use crate::{guta::stats::GUTAStats, proof_input::guta::end_cap_input::PsyUserEve
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 pub struct PsyRealmUserUpdateQueueItem<F, Hash> {
     pub job_id: QProvingJobDataID,
-    pub expected_fake_checkpoint_id: u64,
+    pub submission_nonce: u64,
     pub old_user_leaf_hash: Hash,
     pub new_user_leaf_hash: Hash,
     pub new_user_leaf: PQEDUserLeaf<F, Hash>,
@@ -22,7 +22,7 @@ pub struct PsyRealmUserUpdateQueueItem<F, Hash> {
 impl<F, Hash> PsyRealmUserUpdateQueueItem<F, Hash> {
     pub fn new(
         job_id: QProvingJobDataID,
-        expected_fake_checkpoint_id: u64,
+        submission_nonce: u64,
         old_user_leaf_hash: Hash,
         new_user_leaf_hash: Hash,
         new_user_leaf: PQEDUserLeaf<F, Hash>,
@@ -31,7 +31,7 @@ impl<F, Hash> PsyRealmUserUpdateQueueItem<F, Hash> {
     ) -> Self {
         Self {
             job_id,
-            expected_fake_checkpoint_id,
+            submission_nonce,
             old_user_leaf_hash,
             new_user_leaf_hash,
             new_user_leaf,
@@ -48,7 +48,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyRealmUserUpdateQueueI
     {
         PsyRealmUserUpdateQueueItem {
             job_id: QProvingJobDataID::qp_rand_gen(),
-            expected_fake_checkpoint_id: u64::qp_rand_gen(),
+            submission_nonce: u64::qp_rand_gen(),
             old_user_leaf_hash: Hash::qp_rand_gen(),
             new_user_leaf_hash: Hash::qp_rand_gen(),
             new_user_leaf: PQEDUserLeaf::qp_rand_gen(),
@@ -76,7 +76,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmUs
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         writer.psy_write_bytes_fixed(&self.job_id.to_fixed_bytes())?;
-        writer.psy_write_u64(self.expected_fake_checkpoint_id)?;
+        writer.psy_write_u64(self.submission_nonce)?;
         writer.psy_write_bytes_fixed(&self.old_user_leaf_hash.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.new_user_leaf_hash.into_owned_32bytes())?;
         self.new_user_leaf.pio_write_to_io(writer)?;
@@ -91,7 +91,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmUs
 
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let job_id = QProvingJobDataID::try_from_byte_vec(&reader.psy_read_bytes_fixed::<QJOB_ID_SERIALIZED_SIZE>()?)?;
-        let expected_fake_checkpoint_id = reader.psy_read_u64()?;
+        let submission_nonce = reader.psy_read_u64()?;
         let old_user_leaf_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         let new_user_leaf_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         let new_user_leaf = PQEDUserLeaf::<F, Hash>::pio_read_from_io(reader)?;
@@ -103,7 +103,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmUs
         }
         Ok(Self {
             job_id,
-            expected_fake_checkpoint_id,
+            submission_nonce,
             old_user_leaf_hash,
             new_user_leaf_hash,
             new_user_leaf,
@@ -130,7 +130,7 @@ pser::impl_psy_ser_basic_tests_fallback!(
 impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase for PsyRealmUserUpdateQueueItem<F, Hash> {
     fn is_queue_item(data: &[u8]) -> bool {
         // Variable-length payload:
-        // fixed prefix = job_id + expected_fake_checkpoint_id + 2*hash + user_leaf + stats + events_len(u32)
+        // fixed prefix = job_id + submission_nonce + 2*hash + user_leaf + stats + events_len(u32)
         let min_size = QJOB_ID_SERIALIZED_SIZE
             + 8
             + 32

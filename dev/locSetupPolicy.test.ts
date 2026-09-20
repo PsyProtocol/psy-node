@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
     applyEnvioCpuSetToCompose,
+    classifySupervisedExit,
     DEFAULT_PROVING_RAYON_THREADS,
     DEFAULT_WORKER_BATCH_SIZE,
-    FATAL_PROCESSOR_ERROR_MARKERS,
+    emptyRestartStreak,
     FAUCET_ENV_KEYS,
+    failureSignature,
     findCpuSetOverlap,
     formatBridgeRelayerKeystoreDecryptError,
     formatCpuSet,
@@ -12,14 +14,20 @@ import {
     COORDINATOR_PROCESSOR_READY_MARKER,
     REALM_PROCESSOR_READY_MARKER,
     hasZstdMagic,
-    isFatalProcessorErrorLine,
     isCompilerFingerprintSource,
     isExactProcessorReadyLine,
     isLikelyWrongKeystorePassword,
     isTransientScyllaSchemaFailure,
+    MAX_IDENTICAL_FAILURE_RESTARTS,
+    nextRestartDelayMs,
+    nextSpawnRetryDelayMs,
+    shouldScheduleSupervisedRestart,
     parseCpuSet,
     parseEnvAssignments,
+    parseFatalProcessorErrorMarker,
     parseLscpuTopology,
+    parseRealmProcessorFailureLine,
+    planSupervisedRestart,
     PSY_DAPP_NESTED_PAYLOADS,
     PSY_DAPP_NESTED_SUBMODULES,
     PSY_SDK_GENESIS_CONFIG_REL,
@@ -35,9 +43,9 @@ import {
     resolveWalletPasswordPolicy,
     selectNonEmptyEnv,
     resolveRealmWorkerCount,
-    shouldFatalRestartProcessor,
     shouldSkipBranchSync,
 } from "./locSetupPolicy";
+import type { RestartPlan, RestartStreak, SupervisedFailureCause } from "./locSetupPolicy";
 
 describe("resolveRealmWorkerCount", () => {
     it("starts two realm workers for a full devnet by default", () => {
@@ -248,44 +256,226 @@ describe("shouldSkipBranchSync", () => {
     });
 });
 
-describe("isFatalProcessorErrorLine", () => {
-    it("detects the realm processor fatal marker", () => {
-        expect(isFatalProcessorErrorLine("[CFLI:PSY_REALM_PROCESSOR_ERROR] coordinator halted")).toBe(true);
-    });
-
-    it("detects the coordinator processor fatal marker", () => {
-        expect(isFatalProcessorErrorLine("2026-07-29 [CFLI:PSY_COORDINATOR_PROCESSOR_ERROR] boom")).toBe(true);
-    });
-
-    it("ignores ordinary processor log lines", () => {
-        expect(isFatalProcessorErrorLine("[CFLI:PSY_REALM_PROCESSOR_STARTED] up")).toBe(false);
-        expect(isFatalProcessorErrorLine("[REALM_CREATE] processor new done")).toBe(false);
-        expect(isFatalProcessorErrorLine("")).toBe(false);
-    });
-
-    it("matches every advertised marker", () => {
-        for (const marker of FATAL_PROCESSOR_ERROR_MARKERS) {
-            expect(isFatalProcessorErrorLine(`prefix ${marker} suffix`)).toBe(true);
-        }
+describe("parseFatalProcessorErrorMarker", () => {
+    it("parses exact CFLI tokens and ignores other lines", () => {
+        expect(parseFatalProcessorErrorMarker("[CFLI:PSY_REALM_PROCESSOR_ERROR] coordinator halted")).toBe("PSY_REALM_PROCESSOR_ERROR");
+        expect(parseFatalProcessorErrorMarker("2026-07-29 [CFLI:PSY_COORDINATOR_PROCESSOR_ERROR] boom")).toBe("PSY_COORDINATOR_PROCESSOR_ERROR");
+        expect(parseFatalProcessorErrorMarker("[CFLI:PSY_REALM_PROCESSOR_STARTED] up")).toBeNull();
+        expect(parseFatalProcessorErrorMarker("realm_processor_failure realm_id=0 realm_sub_id=1 error=x")).toBeNull();
     });
 });
 
-describe("shouldFatalRestartProcessor", () => {
-    it("requests a restart the first time a fatal marker appears", () => {
-        expect(shouldFatalRestartProcessor("[CFLI:PSY_REALM_PROCESSOR_ERROR] x", false)).toBe(true);
-        expect(shouldFatalRestartProcessor("[CFLI:PSY_COORDINATOR_PROCESSOR_ERROR] x", false)).toBe(true);
+describe("parseRealmProcessorFailureLine", () => {
+    it("captures the structured stderr event and ignores CFLI", () => {
+        const line = "realm_processor_failure realm_id=0 realm_sub_id=1 error=leaf-mismatch";
+        expect(parseRealmProcessorFailureLine(line)).toBe(line);
+        expect(parseRealmProcessorFailureLine("[CFLI:PSY_REALM_PROCESSOR_ERROR] x")).toBeNull();
+        expect(parseRealmProcessorFailureLine("Error: channel closed")).toBeNull();
+        expect(parseRealmProcessorFailureLine("realm_processor_failureevil")).toBeNull();
+        expect(parseRealmProcessorFailureLine("\u001b[0m\u001b[31m" + line + "\u001b[0m")).toBe(line);
+    });
+});
+
+describe("supervised retry policy", () => {
+    const fatal: SupervisedFailureCause = { kind: "fatal-processor-error", marker: "PSY_REALM_PROCESSOR_ERROR" };
+    const firstCause = "realm_processor_failure realm_id=0 realm_sub_id=1 error=leaf-mismatch";
+    const firstIso = "2026-01-01T00:00:00.000Z";
+
+    function plan(overrides: {
+        restartCount?: number;
+        streak?: RestartStreak;
+        cause?: SupervisedFailureCause;
+        firstCause?: string | null;
+        healthySinceMs?: number;
+        nowMs?: number;
+        observedAtIso?: string;
+    } = {}): RestartPlan {
+        return planSupervisedRestart({
+            restartCount: 0,
+            streak: emptyRestartStreak(),
+            cause: fatal,
+            firstCause,
+            healthySinceMs: 0,
+            nowMs: 1_000,
+            observedAtIso: firstIso,
+            ...overrides,
+        });
+    }
+
+    function repeat(count: number, cause: SupervisedFailureCause = fatal): RestartPlan {
+        let streak = emptyRestartStreak();
+        let restartCount = 0;
+        let last = plan({ streak, restartCount, cause });
+        for (let i = 0; i < count; i += 1) {
+            last = plan({ streak, restartCount, cause, observedAtIso: `2026-01-01T00:00:0${i}.000Z` });
+            streak = last.streak;
+            restartCount = last.restartCount;
+        }
+        return last;
+    }
+
+    it("keeps the existing 1s exponential backoff capped at 30s", () => {
+        expect([1, 2, 3, 4, 5, 6, 7].map(nextRestartDelayMs)).toEqual([1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+        expect(nextSpawnRetryDelayMs(30000)).toBe(60000);
     });
 
-    it("does not request a restart for non-fatal lines", () => {
-        expect(shouldFatalRestartProcessor("[REALM_CREATE] processor new done", false)).toBe(false);
-        expect(shouldFatalRestartProcessor("ordinary stdout", false)).toBe(false);
+    it("classifies from typed marker, signal, and exit code", () => {
+        expect(classifySupervisedExit({
+            fatalProcessorErrorMarker: "PSY_REALM_PROCESSOR_ERROR",
+            dependencyRestartRequested: false,
+            signalCode: "SIGTERM",
+            exitCode: 143,
+        })).toEqual({ kind: "fatal-processor-error", marker: "PSY_REALM_PROCESSOR_ERROR" });
+        expect(classifySupervisedExit({
+            fatalProcessorErrorMarker: null,
+            dependencyRestartRequested: false,
+            signalCode: "SIGTERM",
+            exitCode: null,
+        })).toEqual({ kind: "signaled", signal: "SIGTERM" });
+        expect(classifySupervisedExit({
+            fatalProcessorErrorMarker: null,
+            dependencyRestartRequested: false,
+            signalCode: null,
+            exitCode: 1,
+        })).toEqual({ kind: "exited", code: 1 });
     });
 
-    it("suppresses repeated kills once one has already been requested", () => {
-        const line = "[CFLI:PSY_REALM_PROCESSOR_ERROR] duplicated";
-        expect(shouldFatalRestartProcessor(line, false)).toBe(true);
-        expect(shouldFatalRestartProcessor(line, true)).toBe(false);
-        expect(shouldFatalRestartProcessor("[CFLI:PSY_COORDINATOR_PROCESSOR_ERROR] other", true)).toBe(false);
+    it("restarts the first identical typed failure on the 1s backoff", () => {
+        const first = plan();
+        expect(first.action).toBe("restart");
+        expect(first.restartCount).toBe(1);
+        expect(first.delayMs).toBe(1000);
+        expect(first.streak.identicalRepeats).toBe(1);
+        expect(first.streak.firstCause).toBe(firstCause);
+        expect(failureSignature(first.streak.cause!)).toBe(failureSignature(fatal));
+    });
+
+    it("stops automatic restarts on the fifth identical typed failure", () => {
+        expect(MAX_IDENTICAL_FAILURE_RESTARTS).toBe(4);
+        const last = repeat(MAX_IDENTICAL_FAILURE_RESTARTS + 1);
+        expect(last.action).toBe("limit");
+        expect(last.delayMs).toBe(0);
+        expect(last.restartCount).toBe(4);
+        expect(last.streak.identicalRepeats).toBe(5);
+        expect(last.streak.firstCause).toBe(firstCause);
+        expect(last.streak.firstObservedAtIso).toBe("2026-01-01T00:00:00.000Z");
+    });
+
+    it("still restarts before the identical-failure cap", () => {
+        const last = repeat(MAX_IDENTICAL_FAILURE_RESTARTS);
+        expect(last.action).toBe("restart");
+        expect(last.restartCount).toBe(4);
+        expect(last.streak.identicalRepeats).toBe(4);
+    });
+
+    it("resets identical repeats when the typed cause changes but keeps the first causal stderr", () => {
+        const afterFatal = repeat(2);
+        const afterExit = plan({
+            streak: afterFatal.streak,
+            restartCount: afterFatal.restartCount,
+            cause: { kind: "exited", code: 1 },
+            firstCause: "realm_processor_failure realm_id=0 realm_sub_id=1 error=other",
+        });
+        expect(afterExit.action).toBe("restart");
+        expect(afterExit.streak.identicalRepeats).toBe(1);
+        expect(afterExit.streak.cause).toEqual({ kind: "exited", code: 1 });
+        expect(afterExit.streak.firstCause).toBe(firstCause);
+        expect(afterExit.streak.firstObservedAtIso).toBe("2026-01-01T00:00:00.000Z");
+    });
+
+    it("keeps the first causal stderr for the life of the streak", () => {
+        const first = plan({ observedAtIso: firstIso });
+        const later = plan({
+            streak: first.streak,
+            restartCount: first.restartCount,
+            firstCause: "realm_processor_failure realm_id=0 realm_sub_id=1 error=later-symptom",
+            observedAtIso: "2026-01-01T00:00:10.000Z",
+        });
+        expect(later.streak.firstCause).toBe(firstCause);
+        expect(later.streak.firstObservedAtIso).toBe(firstIso);
+        expect(later.streak.identicalRepeats).toBe(2);
+    });
+
+    it("does not treat a long unready launch as a stable run", () => {
+        const longUnready = plan({
+            restartCount: 4,
+            healthySinceMs: 0,
+            nowMs: 120_000,
+        });
+        expect(longUnready.action).toBe("restart");
+        expect(longUnready.restartCount).toBe(5);
+        expect(longUnready.delayMs).toBe(16_000);
+        expect(longUnready.streak.identicalRepeats).toBe(1);
+    });
+
+    it("resets backoff and streak after a ready run of at least 60s", () => {
+        const healthy = plan({
+            restartCount: 4,
+            healthySinceMs: 1,
+            nowMs: 60_001,
+        });
+        expect(healthy.action).toBe("restart");
+        expect(healthy.restartCount).toBe(1);
+        expect(healthy.delayMs).toBe(1000);
+        expect(healthy.streak.identicalRepeats).toBe(1);
+        expect(healthy.streak.firstCause).toBe(firstCause);
+    });
+
+    it("uses the current spawn cause after a healthy reset, not the previous epoch", () => {
+        const causeA = "realm_processor_failure realm_id=0 realm_sub_id=1 error=A";
+        const causeB = "realm_processor_failure realm_id=0 realm_sub_id=1 error=B";
+        const epochA = plan({ firstCause: causeA, observedAtIso: firstIso });
+        const afterHealthy = plan({
+            streak: epochA.streak,
+            restartCount: epochA.restartCount,
+            firstCause: causeB,
+            healthySinceMs: 1,
+            nowMs: 60_001,
+            observedAtIso: "2026-01-01T00:02:00.000Z",
+        });
+        expect(afterHealthy.action).toBe("restart");
+        expect(afterHealthy.restartCount).toBe(1);
+        expect(afterHealthy.streak.identicalRepeats).toBe(1);
+        expect(afterHealthy.streak.firstCause).toBe(causeB);
+        expect(afterHealthy.streak.firstObservedAtIso).toBe("2026-01-01T00:02:00.000Z");
+    });
+
+    it("does not treat later spawn-failure waits as a second healthy reset", () => {
+        const spawnFailed: SupervisedFailureCause = { kind: "spawn-failed" };
+        const afterHealthyChild = plan({
+            restartCount: 0,
+            healthySinceMs: 1,
+            nowMs: 60_001,
+            cause: spawnFailed,
+            firstCause: null,
+        });
+        expect(afterHealthyChild.action).toBe("restart");
+        expect(afterHealthyChild.restartCount).toBe(1);
+        let last = afterHealthyChild;
+        let nowMs = 60_001;
+        const failedSpawnMs = 20_000;
+        for (let i = 0; i < MAX_IDENTICAL_FAILURE_RESTARTS; i += 1) {
+            nowMs += failedSpawnMs + nextSpawnRetryDelayMs(last.delayMs);
+            last = plan({
+                streak: last.streak,
+                restartCount: last.restartCount,
+                cause: spawnFailed,
+                firstCause: null,
+                healthySinceMs: 0,
+                nowMs,
+            });
+        }
+        expect(nowMs - 60_001).toBeGreaterThan(60_000);
+        expect(last.action).toBe("limit");
+        expect(last.streak.identicalRepeats).toBe(5);
+        expect(last.restartCount).toBe(4);
+    });
+
+    it("does not schedule a restart after intentional stop or teardown", () => {
+        expect(shouldScheduleSupervisedRestart(false, false)).toBe(true);
+        expect(shouldScheduleSupervisedRestart(true, false)).toBe(false);
+        expect(shouldScheduleSupervisedRestart(false, true)).toBe(false);
+        expect(shouldScheduleSupervisedRestart(true, true)).toBe(false);
     });
 });
 

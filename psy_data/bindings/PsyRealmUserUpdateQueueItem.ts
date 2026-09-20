@@ -5,4 +5,4 @@ import type { QEDUserLeaf } from "./QEDUserLeaf";
 import type { QHashOut } from "./QHashOut";
 import type { QProvingJobDataID } from "./QProvingJobDataID";
 
-export type PsyRealmUserUpdateQueueItem = { job_id: QProvingJobDataID, expected_fake_checkpoint_id: bigint, old_user_leaf_hash: QHashOut, new_user_leaf_hash: QHashOut, new_user_leaf: QEDUserLeaf, stats: GUTAStats, events: Array<PsyUserEventRecord>, };
+export type PsyRealmUserUpdateQueueItem = { job_id: QProvingJobDataID, submission_nonce: bigint, old_user_leaf_hash: QHashOut, new_user_leaf_hash: QHashOut, new_user_leaf: QEDUserLeaf, stats: GUTAStats, events: Array<PsyUserEventRecord>, };

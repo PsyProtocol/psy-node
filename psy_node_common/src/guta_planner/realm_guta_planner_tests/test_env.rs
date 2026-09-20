@@ -21,6 +21,7 @@ use psy_data::{
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::{
         contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
+        ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF,
         public_key::PZKPublicKeyInfo,
         user::PQEDUserLeaf,
         user_end_cap_result::PUPSEndCapResultCompact,
@@ -505,7 +506,7 @@ impl RGPTestChainState {
 
         let queue_item = PsyRealmUserUpdateQueueItem {
             job_id: job_id,
-            expected_fake_checkpoint_id: fake_checkpoint_id,
+            submission_nonce: fake_checkpoint_id,
             old_user_leaf_hash: old_leaf_hash,
             new_user_leaf_hash,
             new_user_leaf,
@@ -1285,6 +1286,48 @@ async fn test_finalizer_single_endcap_dispatch_and_fee_credit() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn validator_fee_update_emits_one_leaf_record_for_checkpoint() -> anyhow::Result<()> {
+    let mut state = RGPTestChainState::create_for_tests().await?;
+    state.add_new_contract(12).await?;
+    state.finalizer_user.user_leaf.nonce = F::from_u8_value(1);
+    state.first_realm_global_user_tree.set_leaf(
+        state.finalizer_user.user_id,
+        state.finalizer_user.user_leaf.qfhash::<Hasher>(),
+    );
+    let validator_user = state.finalizer_user.clone();
+    state.users.insert(validator_user.user_id, validator_user.clone());
+    let transactions = state.gen_rand_contract_updates_for_ups(1, 1)?;
+    let output = state
+        .process_checkpoint(&[], &[(validator_user.user_id, transactions)], true)
+        .await?
+        .expect("validator EndCap must produce a Realm GUTA output");
+
+    let serialized_user_leaves = output.db_output.update_user_leaves_ffs.chunks_exact(PSY_OBJECT_FFS_SIZE_USER_LEAF);
+    assert!(serialized_user_leaves.remainder().is_empty());
+    let validator_leaves = serialized_user_leaves
+        .map(PQEDUserLeaf::<F, Hash>::psy_ser_from_slice)
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|leaf| leaf.user_id.to_u64_value() == validator_user.user_id)
+        .collect::<Vec<_>>();
+    assert_eq!(validator_leaves.len(), 1);
+    let fee = output.db_output.guta_header.header.stats.da_fees_collected;
+    assert_eq!(validator_leaves[0].balance, validator_user.user_leaf.balance + fee);
+    let planned_checkpoint_id = state.checkpoint_id - 1;
+    if fee != F::ZERO_VALUE {
+        assert_eq!(
+            validator_leaves[0].last_checkpoint_id,
+            F::from_u64_value(planned_checkpoint_id)
+        );
+    }
+    assert_eq!(
+        state.db.get_user_leaf(state.checkpoint_id, validator_user.user_id).await?,
+        validator_leaves[0]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_finalizer_missing_validator_proofs_fails_closed() -> anyhow::Result<()> {
     let mut state = RGPTestChainState::create_for_tests().await?;
     let mut planner = RealmGUTAPlanner::new(state.chain_id, state.realm_identifier, state.checkpoint_tree_root,
@@ -1310,7 +1353,7 @@ async fn deferred_endcap_conflict_preserves_authoritative_leaf() -> anyhow::Resu
     let mut leaf = state.finalizer_user.user_leaf.clone();
     leaf.balance += F::from_u64_value(9);
     let item = PsyRealmUserUpdateQueueItem {
-        job_id: QProvingJobDataID::new_invalid_job_id(), expected_fake_checkpoint_id: 0,
+        job_id: QProvingJobDataID::new_invalid_job_id(), submission_nonce: 0,
         old_user_leaf_hash: Hash::from_u64x4([999, 0, 0, 0]), new_user_leaf_hash: leaf.qfhash::<Hasher>(),
         events: vec![],
         new_user_leaf: leaf, stats: GUTAStats::get_zero_value(),
@@ -1642,7 +1685,7 @@ mod realm_gatherer_fixture_tests {
         // validation: the taken job must land back in the shared slot.
         let job = PlannedFutureEndCapJob {
             queue_item: PsyRealmUserUpdateQueueItem {
-                job_id: QProvingJobDataID::new_invalid_job_id(), expected_fake_checkpoint_id: 0,
+                job_id: QProvingJobDataID::new_invalid_job_id(), submission_nonce: 0,
                 old_user_leaf_hash: leaf_hash, new_user_leaf_hash: leaf_hash,
                 events: vec![], new_user_leaf: validator_user.user_leaf.clone(), stats: GUTAStats::get_zero_value(),
             },
@@ -1670,7 +1713,7 @@ mod realm_gatherer_fixture_tests {
         leaf.last_checkpoint_id = F::from_u64_value(5);
         gatherer.guta_planner.future_pending_end_cap_jobs.push(PlannedFutureEndCapJob {
             queue_item: PsyRealmUserUpdateQueueItem {
-                job_id: QProvingJobDataID::new_invalid_job_id(), expected_fake_checkpoint_id: 0,
+                job_id: QProvingJobDataID::new_invalid_job_id(), submission_nonce: 0,
                 old_user_leaf_hash: Hash::get_zero_value(), new_user_leaf_hash: leaf.qfhash::<Hasher>(),
                 events: vec![], new_user_leaf: leaf, stats: GUTAStats::get_zero_value(),
             },
@@ -1692,7 +1735,7 @@ mod realm_gatherer_fixture_tests {
         leaf.last_checkpoint_id = F::from_u64_value(5);
         gatherer.guta_planner.future_pending_end_cap_jobs.push(PlannedFutureEndCapJob {
             queue_item: PsyRealmUserUpdateQueueItem {
-                job_id: QProvingJobDataID::new_invalid_job_id(), expected_fake_checkpoint_id: 0,
+                job_id: QProvingJobDataID::new_invalid_job_id(), submission_nonce: 0,
                 old_user_leaf_hash: Hash::get_zero_value(), new_user_leaf_hash: leaf.qfhash::<Hasher>(),
                 events: vec![], new_user_leaf: leaf, stats: GUTAStats::get_zero_value(),
             },

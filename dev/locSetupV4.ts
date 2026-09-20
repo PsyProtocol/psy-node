@@ -17,7 +17,11 @@ import {
     PSY_SDK_GENESIS_CONFIG_REL,
     PSY_SDK_GENESIS_SUBMODULE,
     REALM_PROCESSOR_READY_MARKER,
+    SUPERVISOR_RESTART_LIMIT_TAG,
     applyEnvioCpuSetToCompose,
+    classifySupervisedExit,
+    emptyRestartStreak,
+    failureSignature,
     formatBridgeRelayerKeystoreDecryptError,
     formatPsyDappNestedSubmoduleRemedy,
     hasFaucetOperatorConfig,
@@ -25,7 +29,12 @@ import {
     parseCpuSet,
     isExactProcessorReadyLine,
     isTransientScyllaSchemaFailure,
+    nextSpawnRetryDelayMs,
+    parseFatalProcessorErrorMarker,
+    parseRealmProcessorFailureLine,
     parseLscpuTopology,
+    planSupervisedRestart,
+    shouldScheduleSupervisedRestart,
     resolveCpuPartition,
     parseEnvAssignments,
     resolveCpuPartitionForAffinity,
@@ -33,7 +42,6 @@ import {
     resolveRayonThreadCount,
     resolveRealmWorkerCount,
     resolveWalletPasswordPolicy,
-    shouldFatalRestartProcessor,
     resolveScyllaMemory,
     selectNonEmptyEnv,
     shouldSkipBranchSync,
@@ -41,8 +49,15 @@ import {
     planPsyDappNestedSubmoduleInit,
     isCompilerFingerprintSource,
     s3CurlArgs,
+    psyServicesDatabaseCommands,
+    pinFaucetPerClaimAmount,
 } from "./locSetupPolicy";
-import type { PsyDappNestedInitPlan, PsyDappNestedSubmodule } from "./locSetupPolicy";
+import type {
+    FatalProcessorErrorMarker,
+    PsyDappNestedInitPlan,
+    PsyDappNestedSubmodule,
+    RestartStreak,
+} from "./locSetupPolicy";
 
 /**
  * Retry processor creation only for the known transient Scylla schema family.
@@ -280,9 +295,26 @@ let cachedWalletPassword: string | null = null;
 /** True when auto-setup generated the bridge-relayer keystore during this process. */
 let bridgeRelayerKeystoreGeneratedThisRun = false;
 
+function setBridgeRelayerKeystoreAlias(): { name: string; path: string } | null {
+    for (const name of [
+        "PSY_BRIDGE_RELAYER_KEYSTORE_PATH",
+        "BRIDGE_RELAYER_KEYSTORE_PATH",
+        "KEYSTORE_PATH",
+    ] as const) {
+        const raw = process.env[name];
+        if (raw && raw.trim() !== "") {
+            return { name, path: raw.trim() };
+        }
+    }
+    return null;
+}
+
 function resolveBridgeRelayerKeystorePath(): string {
+    const setAlias = setBridgeRelayerKeystoreAlias();
+    if (setAlias) {
+        return setAlias.path;
+    }
     const homeDir = process.env.HOME;
-    if (process.env.KEYSTORE_PATH) return process.env.KEYSTORE_PATH;
     if (!homeDir) {
         throw new Error("[DevNet] HOME is not set and KEYSTORE_PATH was not provided");
     }
@@ -560,7 +592,7 @@ export class RunningProcess {
     stdOutVisitor: ProcessLineVisitor = () => { };
     stdErrVisitor: ProcessLineVisitor = () => { };
     allOutputVisitor: ProcessLineVisitor = () => { };
-    onExit: (code: number | null, signal: number | null) => void = () => { };
+    onExit: (code: number | null, signal: string | null) => void = () => { };
 
     /** Stable service name for supervisor logs (e.g. prove_proxy_0, bridge_relayer). */
     name: string = '';
@@ -582,14 +614,19 @@ export class RunningProcess {
     initMaxRetries: number = 3;
     initRetryDelayMs: number = 2000;
     restartCount: number = 0;
+    startedAtMs: number = 0;
+    /** 0 until ready. Circuit build must not count as a healthy run. */
+    healthySinceMs: number = 0;
+    restartStreak: RestartStreak = emptyRestartStreak();
     hasExited: boolean = false;
     exitCode: number | null = null;
-    exitSignal: number | null = null;
+    exitSignal: string | null = null;
     supervisorObservedExit: boolean = false;
     intentionalStop: boolean = false;
     dependencyRestartRequested: boolean = false;
-    /** Fatal processor error already observed and signaled for supervised restart. */
-    fatalRestartRequested: boolean = false;
+    fatalProcessorErrorMarker: FatalProcessorErrorMarker | null = null;
+    firstCausalStderr: string | null = null;
+    fatalWitnessWrite: Promise<void> | null = null;
 
     constructor(proc: Bun.Subprocess, stdOutVisitor?: ProcessLineVisitor, stdErrVisitor?: ProcessLineVisitor, allOutputVisitor?: ProcessLineVisitor) {
         this.proc = proc;
@@ -618,6 +655,10 @@ export class RunningProcess {
         let lines = this.lineBufferStdErr.split('\n');
         this.lineBufferStdErr = lines.pop() || '';
         lines.forEach(line => {
+            if (!this.firstCausalStderr) {
+                const causal = parseRealmProcessorFailureLine(line);
+                if (causal) this.firstCausalStderr = causal;
+            }
             this.stdErrVisitor(line, this);
             this.allOutputVisitor(line, this);
         });
@@ -690,6 +731,8 @@ export class RunningProcess {
 
         const runningProcess = new RunningProcess(proc, options.stdOutVisitor, options.stdErrVisitor, options.allOutputVisitor);
         runningProcess.cmds = cmds.slice();
+        runningProcess.startedAtMs = Date.now();
+        runningProcess.healthySinceMs = runningProcess.startedAtMs;
         runningProcess.spawnOptions = {
             cwd: options.cwd,
             stdOutVisitor: options.stdOutVisitor,
@@ -701,7 +744,6 @@ export class RunningProcess {
             env: options.env,
             appendLogs: options.appendLogs,
         };
-
         const outputPumps: Promise<void>[] = [];
         const pumpOutput = async (
             readableStream: AsyncIterable<Uint8Array>,
@@ -771,10 +813,11 @@ export class RunningProcess {
         (async () => {
             const code = await proc.exited;
             await Promise.allSettled(outputPumps);
+            const exitSignal = proc.signalCode ?? null;
             runningProcess.exitCode = code;
-            runningProcess.exitSignal = null;
+            runningProcess.exitSignal = exitSignal;
             runningProcess.hasExited = true;
-            runningProcess.onExit(code, null);
+            runningProcess.onExit(code, exitSignal);
         })();
 
         return runningProcess;
@@ -803,6 +846,7 @@ export class RunningProcess {
             initialized = true;
             clearTimeout(timeout);
             process.initializationReady = true;
+            process.healthySinceMs = Date.now();
             resolve(process);
         };
         const allOutputVisitor: ProcessLineVisitor = (line: string, process: RunningProcess) => {
@@ -825,9 +869,10 @@ export class RunningProcess {
         // Keep the ORIGINAL visitor for supervisor restarts (not the init-hint wrapper).
         proc.spawnOptions.allOutputVisitor = options.allOutputVisitor;
         proc.hintDetector = hintDetector;
+        if (!proc.initializationReady) proc.healthySinceMs = 0;
         proc.useInitHint = true;
         const prevOnExit = proc.onExit.bind(proc);
-        proc.onExit = (code: number | null, signal: number | null) => {
+        proc.onExit = (code: number | null, signal: string | null) => {
             if (!settled) {
                 settled = true;
                 clearTimeout(timeout);
@@ -980,12 +1025,15 @@ export const REALM_P2P_SUB_IDS = [1, 2] as const;
 /** Local-devnet genesis pre-places ZK validators only for realms `[0, count)`. */
 export const LOCAL_DEVNET_VALIDATOR_REALM_COUNT = 2;
 export const LOCAL_DEVNET_VALIDATORS_PER_REALM = REALM_P2P_SUB_IDS.length;
-/** Local-devnet ZK fingerprint from `local_devnet.rs` genesis generator. */
+/** Local-devnet ZK fingerprint constant from `local_devnet.rs`. */
 export const LOCAL_DEVNET_ZK_FINGERPRINT = "65e0169bfffd55f1c0ea9f76c111a5b15e652322ee253c1a9604a10d59066b50";
 
 /** Local-devnet bridge relayer stays at registration 2 (Strategy5 user_id 524288). */
 export const LOCAL_DEVNET_RELAYER_REGISTRATION_ID = 2;
 export const LOCAL_DEVNET_RELAYER_USER_ID = 524288;
+/** Anvil account #0. Seeds an auto-generated encrypted bridge-relayer keystore; daemon.toml still uses keystore_path. */
+export const LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY =
+    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 /** Canonical reserved leaf: `realm_id * 2^h + (sub_id - 1)`. */
 export function realmValidatorUserId(realmId: number, subId: number, height: number = 20): number {
@@ -1975,6 +2023,7 @@ async function ensureAllBinariesBuilt(cwd: string): Promise<void> {
         { name: "psy_worker_cli", path: path.join(cwd, "target", "release", "psy_worker_cli") },
         { name: "psy_relayer_cli", path: path.join(cwd, "target", "release", "psy_relayer_cli") },
         { name: "psy_user_cli", path: path.join(cwd, "target", "release", "psy_user_cli") },
+        { name: "psy_dev_cli", path: path.join(cwd, "target", "release", "psy_dev_cli") },
     ];
     const psyServicesPath = path.resolve(resolveProjectsDir(), "psy-services");
     const psyServicesBinaries = [
@@ -1996,7 +2045,8 @@ async function ensureAllBinariesBuilt(cwd: string): Promise<void> {
          "--bin", "psy_node_cli",
          "--bin", "psy_worker_cli",
          "--bin", "psy_relayer_cli",
-         "--bin", "psy_user_cli"],
+         "--bin", "psy_user_cli",
+         "--bin", "psy_dev_cli"],
         cwd,
     );
     if (nodeCode !== 0) {
@@ -2389,7 +2439,7 @@ const fs = require("fs");
 
 async function autoGenerateBridgeRelayerKeystore(keystorePath: string, contractsDir: string): Promise<void> {
     console.log("[AutoSetup] Auto-generating bridge-relayer keystore...");
-    const devPrivateKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const devPrivateKey = `0x${LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY}`;
     const devPassword = process.env.WALLET_PASSWORD || "devnet";
     const script = `
 const { Wallet } = require("ethers");
@@ -2498,7 +2548,13 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
     if (!homeDir) throw new Error("[AutoSetup] HOME is not set");
     const keystoreDir = path.join(homeDir, ".psy", "keystore");
     await mkdir(keystoreDir, { recursive: true });
+    const setAlias = setBridgeRelayerKeystoreAlias();
     const bridgeRelayerPath = resolveBridgeRelayerKeystorePath();
+    if (setAlias && !(await exists(setAlias.path))) {
+        throw new Error(
+            `[AutoSetup] ${setAlias.name} is set to ${setAlias.path} but that file does not exist`,
+        );
+    }
     await mkdir(path.dirname(bridgeRelayerPath), { recursive: true });
     let generated = false;
 
@@ -2529,7 +2585,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
                 `Generate them first or run without PSY_SKIP_KEYSTORE=1 to download the published setup.`,
             );
         }
-        // KEYSTORE_PATH overrides only the relayer wallet; trust setup remains under ~/.psy/keystore.
+        // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by [relayer_wallet] and [finalize]; trust setup remains under ~/.psy/keystore.
         if (!(await exists(bridgeRelayerPath))) {
             await ensurePsyContractsDependencies(contractsDir);
             await autoGenerateBridgeRelayerKeystore(bridgeRelayerPath, contractsDir);
@@ -2544,7 +2600,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
 
     // 1. bridge-relayer keystore: auto-generate only when missing.
     //    It is a dev key and never needs refreshing on its own; no interactive prompt.
-    // KEYSTORE_PATH overrides only the relayer wallet; trust setup remains under ~/.psy/keystore.
+    // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by [relayer_wallet] and [finalize]; trust setup remains under ~/.psy/keystore.
     if (!(await exists(bridgeRelayerPath))) {
         await ensurePsyContractsDependencies(contractsDir);
         await rm(bridgeRelayerPath).catch(() => undefined);
@@ -2752,12 +2808,15 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
         console.log("[AutoSetup] genesis.json present but not strict Unix-seconds genesis; regenerating");
     }
 
-    // genesis.json: generated by cargo test in psy_plonky2_circuits
-    console.log("[AutoSetup] Generating genesis.json (this may take a few minutes)...");
-    const result = await runAndCapture([
-        "cargo", "test", "--release", "--package", "psy_plonky2_circuits", "--lib",
-        "--", "node::config::networks::local_devnet::tests", "--nocapture",
-    ], cwd);
+    const cli = path.join(cwd, "target", "release", "psy_dev_cli");
+    if (!(await exists(cli))) {
+        throw new Error(
+            `[AutoSetup] ${cli} is missing; build it with cargo build --release --bin psy_dev_cli ` +
+            `or run without PSY_SKIP_BUILD=1.`,
+        );
+    }
+    console.log("[AutoSetup] Generating genesis.json via psy_dev_cli generate-genesis-data...");
+    const result = await runAndCapture([cli, "generate-genesis-data", "--repo-root", cwd], cwd);
     if (result.code !== 0) {
         throw new Error(`[AutoSetup] Failed to generate genesis.json: ${result.stderr || result.stdout}`);
     }
@@ -2806,15 +2865,15 @@ async function ensureDevEnvironment(
     const sdk = await ensurePsySdkArtifacts(cwd);
     await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
     const { generated } = await ensureKeystoreFiles(contractsDir);
-    await ensureGenesisFiles(cwd);
-    await ensureAllBinariesBuilt(cwd);
     // Only set default WALLET_PASSWORD when we generated the keystore this run.
-    // For an existing keystore, leave it unset so the prompt/decryption flow still works.
+    // Must happen before generate-genesis-data decrypts that UTC JSON.
     if (generated && !process.env.WALLET_PASSWORD) {
         process.env.WALLET_PASSWORD = "devnet";
         bridgeRelayerKeystoreGeneratedThisRun = true;
         console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
     }
+    await ensureAllBinariesBuilt(cwd);
+    await ensureGenesisFiles(cwd);
     console.log("[AutoSetup] Dev environment ready.");
 }
 
@@ -2967,7 +3026,7 @@ export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1Dep
     if (hasState !== hasDeployment) {
         throw new Error(
             `[DevNet] Local Anvil state and ${network} deployment must exist together: ` +
-            `${statePath}=${hasState}, ${deploymentPath}=${hasDeployment}. Run make restart-all.`,
+            `${statePath}=${hasState}, ${deploymentPath}=${hasDeployment}. Run PURGE=1 make shutdown, then make run-all.`,
         );
     }
     return {
@@ -3441,6 +3500,8 @@ async function killKnownProcesses(): Promise<void> {
         "psy-dapp/apps/bridge",
         "psy-dapp/apps/ide",
         "psy-dapp/apps/explorer",
+        "psy-dapp/mode-a-web-wallet-bridge",
+        "vite.js --host 0.0.0.0 --port 5179",
         "pnpm dev",
         "envio/bin.js",
         "envio-linux",
@@ -3456,7 +3517,7 @@ async function killKnownProcesses(): Promise<void> {
 }
 
 async function killKnownPorts(): Promise<void> {
-    const ports: number[] = [3000, 5433, 8080, 8081, 8545, 9545, 10545, 9898, 9998, 5174, 5175, 5176, 5177, 5178];
+    const ports: number[] = [3000, 5433, 8080, 8081, 8545, 9545, 10545, 9898, 9998, 5174, 5175, 5176, 5177, 5178, 5179];
     for (let p = 1337; p <= 1346; p++) ports.push(p);
     for (let p = 9999; p <= 10008; p++) ports.push(p);
     for (let p = 13380; p <= 14679; p++) ports.push(p);
@@ -3492,6 +3553,7 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
 }
 
 interface ProcessOptions {
+    purge?: boolean;
     cwd?: string;
     jtmb?: boolean;
     l1Port?: number;
@@ -3742,26 +3804,43 @@ class DevNetProcessManager {
         if (!this.autoRestartEnabled() || !this.isProcessorProcess(p)) return;
         const originalVisitor = p.allOutputVisitor;
         p.allOutputVisitor = (line: string, process: RunningProcess) => {
-            if (shouldFatalRestartProcessor(line, process.fatalRestartRequested)) {
-                process.fatalRestartRequested = true;
-                console.warn(
-                    `[DevNet][supervisor] fatal processor error detected for '${process.name}' ` +
-                    `(pid=${process.pid}); terminating for supervised restart`
-                );
-                try {
-                    process.signalProcessGroup("SIGTERM");
-                } catch (err) {
-                    console.warn(`[DevNet][supervisor] failed to signal fatal processor '${process.name}': ${err}`);
-                }
+            const marker = parseFatalProcessorErrorMarker(line);
+            if (marker !== null && process.fatalProcessorErrorMarker === null) {
+                process.fatalProcessorErrorMarker = marker;
+                process.fatalWitnessWrite = this.writeFatalWitnessThenTerminate(process, marker);
             }
             originalVisitor(line, process);
         };
     }
 
+    private async writeFatalWitnessThenTerminate(
+        process: RunningProcess,
+        marker: FatalProcessorErrorMarker,
+    ): Promise<void> {
+        const witness =
+            `[DevNet][supervisor][restart-failure] service=${process.name} ` +
+            `cause=${failureSignature({ kind: "fatal-processor-error", marker })} ` +
+            `marker=${marker} pid=${process.pid}`;
+        console.warn(witness);
+        try {
+            await RunningProcess.appendLogBanner(process.spawnOptions.stdoutLogFile, witness);
+            await RunningProcess.appendLogBanner(process.spawnOptions.stderrLogFile, witness);
+        } catch (err) {
+            console.warn(`[DevNet][supervisor] failed to write fatal witness for '${process.name}': ${err}`);
+        }
+        if (this.stopping || process.intentionalStop || process.hasExited) return;
+        try {
+            process.signalProcessGroup("SIGTERM");
+        } catch (err) {
+            console.warn(`[DevNet][supervisor] failed to signal fatal processor '${process.name}': ${err}`);
+        }
+    }
+
     private async handleSupervisedExit(
         previous: RunningProcess,
         code: number | null,
-        signal: number | null,
+        signal: string | null,
+        spawnFailed: boolean = false,
     ): Promise<void> {
         const name = previous.name || "process";
         if (this.stopping || previous.intentionalStop) {
@@ -3772,28 +3851,74 @@ class DevNetProcessManager {
             console.warn(`[DevNet][supervisor] process '${name}' exited (code=${code}, signal=${signal}); auto-restart disabled via PSY_NO_AUTO_RESTART=1`);
             return;
         }
+        if (previous.fatalWitnessWrite) {
+            try {
+                await previous.fatalWitnessWrite;
+            } catch (err) {
+                console.warn(`[DevNet][supervisor] fatal witness write failed for '${name}': ${err}`);
+            }
+        }
 
-        previous.restartCount += 1;
-        const attempt = previous.restartCount;
-        const delayMs = Math.min(30_000, 1_000 * Math.pow(2, Math.min(attempt - 1, 5)));
-        const cmdStr = previous.cmds.join(" ");
-        const ts = new Date().toISOString();
+        const nowMs = Date.now();
+        const observedAtIso = new Date(nowMs).toISOString();
+        const cause = classifySupervisedExit({
+            spawnFailed,
+            fatalProcessorErrorMarker: previous.fatalProcessorErrorMarker,
+            dependencyRestartRequested: previous.dependencyRestartRequested,
+            signalCode: signal,
+            exitCode: code,
+        });
+        const plan = planSupervisedRestart({
+            restartCount: previous.restartCount,
+            streak: previous.restartStreak,
+            cause,
+            firstCause: previous.firstCausalStderr,
+            healthySinceMs: spawnFailed ? 0 : previous.healthySinceMs,
+            nowMs,
+            observedAtIso,
+        });
+        previous.restartCount = plan.restartCount;
+        previous.restartStreak = plan.streak;
+
+        if (plan.action === "limit") {
+            const first = plan.streak;
+            const summary =
+                `${SUPERVISOR_RESTART_LIMIT_TAG} service=${name} cause=${failureSignature(cause)} ` +
+                `attempts=${first.identicalRepeats} first-observed-at=${first.firstObservedAtIso ?? ""}` +
+                (first.firstCause ? ` first-cause=${first.firstCause}` : "");
+            console.error(summary);
+            try {
+                await RunningProcess.appendLogBanner(previous.spawnOptions.stdoutLogFile, summary);
+                await RunningProcess.appendLogBanner(previous.spawnOptions.stderrLogFile, summary);
+            } catch (err) {
+                console.warn(`[DevNet][supervisor] failed to write restart-limit summary for '${name}': ${err}`);
+            }
+            return;
+        }
+
         console.warn(
             `[DevNet][supervisor] process '${name}' EXITED (code=${code}, signal=${signal}, pid=${previous.pid}); ` +
-            `will RESTART in ${delayMs}ms (restart #${attempt}) cmd=${cmdStr}`
+            `will RESTART in ${plan.delayMs}ms (restart #${plan.restartCount})`,
         );
 
-        await new Promise((r) => setTimeout(r, delayMs));
-        if (this.stopping || previous.intentionalStop) {
+        const delay = Promise.withResolvers<void>();
+        setTimeout(delay.resolve, plan.delayMs);
+        await delay.promise;
+        if (!shouldScheduleSupervisedRestart(this.stopping, previous.intentionalStop)) {
             console.log(`[DevNet][supervisor] process '${name}' restart aborted (intentional stop or teardown)`);
             return;
         }
 
+        const first = plan.streak;
+        const firstPart = first.cause && first.firstObservedAtIso
+            ? ` first-failure=${failureSignature(first.cause)}@${first.firstObservedAtIso}`
+            : "";
+        const firstCause = first.firstCause ? ` first-cause=${first.firstCause}` : "";
         const banner =
-            `\n===== [DevNet supervisor] RESTART #${attempt} at ${ts} ` +
+            `\n===== [DevNet supervisor] RESTART #${plan.restartCount} at ${observedAtIso} ` +
             `(previous exit code=${code}, signal=${signal}, previous pid=${previous.pid}) =====\n` +
             `===== service: ${name} =====\n` +
-            `===== cmd: ${cmdStr} =====\n`;
+            `=====${firstPart}${firstCause} =====\n`;
 
         try {
             const restarted = await this.spawnFromTemplate(previous, banner, false);
@@ -3805,32 +3930,38 @@ class DevNetProcessManager {
 
             console.log(
                 `[DevNet][supervisor] process '${name}' RESTARTED successfully ` +
-                `(new pid=${restarted.pid}, restart #${attempt})`
+                `(new pid=${restarted.pid}, restart #${plan.restartCount})`,
             );
             await RunningProcess.appendLogBanner(
                 restarted.spawnOptions.stdoutLogFile,
-                `[DevNet][supervisor] process '${name}' is UP again pid=${restarted.pid} restart #${attempt}\n`,
+                `[DevNet][supervisor] process '${name}' is UP again pid=${restarted.pid} restart #${plan.restartCount}\n`,
             );
             await RunningProcess.appendLogBanner(
                 restarted.spawnOptions.stderrLogFile,
-                `[DevNet][supervisor] process '${name}' is UP again pid=${restarted.pid} restart #${attempt}\n`,
+                `[DevNet][supervisor] process '${name}' is UP again pid=${restarted.pid} restart #${plan.restartCount}\n`,
             );
             if (name === "db") {
                 this.restartProcessorsAfterDbRecovery();
             }
         } catch (err) {
             console.error(
-                `[DevNet][supervisor] process '${name}' restart #${attempt} FAILED: ${err}`
+                `[DevNet][supervisor] process '${name}' restart #${plan.restartCount} FAILED: ${err}`,
             );
-            if (!this.stopping && !previous.intentionalStop) {
-                const retryDelay = Math.min(60_000, delayMs * 2);
+            if (shouldScheduleSupervisedRestart(this.stopping, previous.intentionalStop)) {
+                const retryDelay = nextSpawnRetryDelayMs(plan.delayMs);
                 console.warn(
-                    `[DevNet][supervisor] will retry '${name}' again in ${retryDelay}ms (still counting as restart #${attempt})`
+                    `[DevNet][supervisor] will retry '${name}' again in ${retryDelay}ms (still counting as restart #${plan.restartCount})`,
                 );
-                await new Promise((r) => setTimeout(r, retryDelay));
+                const spawnRetry = Promise.withResolvers<void>();
+                setTimeout(spawnRetry.resolve, retryDelay);
+                await spawnRetry.promise;
+                if (!shouldScheduleSupervisedRestart(this.stopping, previous.intentionalStop)) {
+                    console.log(`[DevNet][supervisor] process '${name}' spawn-retry aborted (intentional stop or teardown)`);
+                    return;
+                }
                 previous.hasExited = true;
-                previous.intentionalStop = false;
-                void this.handleSupervisedExit(previous, code, signal);
+                previous.healthySinceMs = 0;
+                void this.handleSupervisedExit(previous, code, signal, true);
             }
         }
     }
@@ -3850,10 +3981,12 @@ class DevNetProcessManager {
             : await RunningProcess.spawn(template.cmds, options);
         process.name = template.name;
         process.restartCount = template.restartCount;
+        process.restartStreak = template.restartStreak;
         process.hintDetector = template.hintDetector;
         process.useInitHint = template.useInitHint;
         process.initMaxRetries = template.initMaxRetries;
         process.initRetryDelayMs = template.initRetryDelayMs;
+        if (!process.useInitHint) process.healthySinceMs = process.startedAtMs;
         return track ? this.track(process, template.name) : process;
     }
     private async waitForControlledStartDependency(process: RunningProcess): Promise<void> {
@@ -3918,6 +4051,10 @@ class DevNetProcessManager {
         const started: RunningProcess[] = [];
         try {
             for (const template of templates) {
+                template.restartCount = 0;
+                template.restartStreak = emptyRestartStreak();
+                template.fatalProcessorErrorMarker = null;
+                template.firstCausalStderr = null;
                 const process = await this.spawnFromTemplate(template);
                 started.push(process);
                 await this.waitForControlledStartDependency(process);
@@ -4435,7 +4572,7 @@ class DevNetProcessManager {
                 ? await Promise.all(relayerChains.map((chain) => resolveLocalAnvilStatePlan(cwd, chain.deploymentsNetwork)))
                 : [];
             if (statePlans.some((plan) => plan.hasState) && statePlans.some((plan) => !plan.hasState)) {
-                throw new Error("[DevNet] Partial persisted L1 cohort; refusing to reset retained chains. Run make restart-all.");
+                throw new Error("[DevNet] Partial persisted L1 cohort; refusing to reset retained chains. Run PURGE=1 make shutdown, then make run-all.");
             }
             resetEnvioStorage = statePlans.length > 0 && statePlans.every((plan) => plan.shouldResetEnvio);
             for (const [index, chain] of relayerChains.entries()) {
@@ -4579,12 +4716,20 @@ class DevNetProcessManager {
                 };
             }));
 
-            await Bun.spawn(['docker', 'exec', 'generated-envio-postgres-1', 'dropdb', '-U', 'postgres', '--if-exists', 'psy_services'], {
-                stdio: ['ignore', 'ignore', 'ignore'],
-            }).exited;
-            await Bun.spawn(['docker', 'exec', 'generated-envio-postgres-1', 'createdb', '-U', 'postgres', 'psy_services'], {
-                stdio: ['ignore', 'ignore', 'ignore'],
-            }).exited;
+            let servicesDatabaseExists = false;
+            if (!options.purge) {
+                const probe = Bun.spawn([
+                    'docker', 'exec', 'generated-envio-postgres-1', 'psql', '-U', 'postgres',
+                    '-d', 'postgres', '-tAc', "SELECT 1 FROM pg_database WHERE datname = 'psy_services'",
+                ], { stdio: ['ignore', 'pipe', 'inherit'] });
+                const result = await new Response(probe.stdout).text();
+                if (await probe.exited !== 0) throw new Error('[DevNet] Failed to check psy_services database');
+                servicesDatabaseExists = result.trim() === '1';
+            }
+            for (const command of psyServicesDatabaseCommands(!!options.purge, servicesDatabaseExists)) {
+                const code = await Bun.spawn(command, { stdio: ['ignore', 'ignore', 'inherit'] }).exited;
+                if (code !== 0) throw new Error(`[DevNet] psy_services database setup failed: ${command[3]}`);
+            }
             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                 psyServicesCmd,
                 psyServicesStartedDetector,
@@ -5582,7 +5727,7 @@ async function runMain() {
         try {
             const faucetOpsPath = path.join(REPO_ROOT, "psy-dapp", "apps", "bridge", "src", "config", "faucetOperators.json");
             if (fs.existsSync(faucetOpsPath)) {
-                envVars["PSY_FAUCET_OPERATORS_JSON"] = fs.readFileSync(faucetOpsPath, "utf-8");
+                envVars["PSY_FAUCET_OPERATORS_JSON"] = pinFaucetPerClaimAmount(fs.readFileSync(faucetOpsPath, "utf-8"));
                 console.log(`[DevNet] Loaded faucet operators from ${faucetOpsPath}`);
             }
         } catch (err) {
@@ -5766,7 +5911,7 @@ Usage: bun run dev/locSetupV4.ts [options]
         try {
             const faucetOpsPath = path.join(REPO_ROOT, "psy-dapp", "apps", "bridge", "src", "config", "faucetOperators.json");
             if (fs.existsSync(faucetOpsPath)) {
-                envVars["PSY_FAUCET_OPERATORS_JSON"] = fs.readFileSync(faucetOpsPath, "utf-8");
+                envVars["PSY_FAUCET_OPERATORS_JSON"] = pinFaucetPerClaimAmount(fs.readFileSync(faucetOpsPath, "utf-8"));
                 console.log(`[DevNet] Loaded faucet operators from ${faucetOpsPath}`);
             }
         } catch (err) {
@@ -5780,6 +5925,7 @@ Usage: bun run dev/locSetupV4.ts [options]
     }
 
         const options: ProcessOptions = {
+            purge,
             jtmb: !!values.jtmb,
             l1Port,
             workerRealmCount,

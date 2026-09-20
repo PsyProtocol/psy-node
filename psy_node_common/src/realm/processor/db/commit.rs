@@ -1,9 +1,12 @@
-use anyhow::Ok;
+use std::collections::HashSet;
+
+use anyhow::{Context, Ok};
 use parth_core::{
     QCoreProcCheckpointUniqueId,
-    crypto::hash::
-        merkle_proof::MerkleProofCore
-    ,
+    crypto::hash::{
+        merkle_proof::MerkleProofCore,
+        traits::{FieldQHasher, MerkleZeroHasher, ZeroableHash},
+    },
     protocol::core_types::QNetworkTypesConfig,
     data::queue::queue_key::{PCoreSubjectQueueBase, QPBaseQueueType},
 };
@@ -22,7 +25,8 @@ use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::{
-        PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
+        PsyNodeCheckpointTreeDatabaseReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter,
+        PsyRealmProcessorStore,
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
@@ -34,6 +38,104 @@ use crate::realm::{
     processor::db::PsyRealmDatabaseProcessor,
     queue_key::{RealmUserUpdateQueueKey, RealmProvingWorkQueueKey},
 };
+
+async fn write_checkpoint_state_records<N, S>(
+    db: &S,
+    checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
+    membership: &MerkleProofCore<N::QHash>,
+) -> anyhow::Result<()>
+where
+    N: QNetworkTypesConfig,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+{
+    // ORDERING IS LOAD-BEARING: these writes are not transactional. Recovery
+    // (`get_latest_available_l2_block_state` / `try_get_complete_l2_block_state`) treats a checkpoint as
+    // complete based on its core metadata records, so the L2 block state MUST be written LAST — after the
+    // state roots, checkpoint leaf, tree proof, and root mapping. Writing it earlier would let a crash mid-way
+    // leave a checkpoint that looks complete (L2 present) but is missing its proof/root mapping, which recovery
+    // would then never backfill. The `latest_l2_block_state` singleton is advanced by the caller
+    // (`apply_prepared_realm_checkpoint`) only after `set_latest_checkpoint_id`, so it can never lead the committed marker.
+    db.set_checkpoint_global_state_roots(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.state_roots)
+        .await?;
+    db.set_checkpoint_leaf_data(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.checkpoint_leaf)
+        .await?;
+    db.checkpoint_tree_injest_merkle_proof(checkpoint_sync_info.checkpoint_id, membership)
+        .await?;
+    db.set_checkpoint_root_hash_to_id_mapping(checkpoint_sync_info.checkpoint_tree_root, checkpoint_sync_info.checkpoint_id)
+        .await?;
+    db.set_l2_block_state(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.block_state)
+        .await?;
+    Ok(())
+}
+
+async fn apply_realm_ffs_updates<N, S>(
+    db: &S,
+    checkpoint_id: u64,
+    realm_update: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
+) -> anyhow::Result<()>
+where
+    N: QNetworkTypesConfig,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+{
+    if realm_update.update_user_leaves_ffs.is_empty() {
+        return Ok(());
+    }
+    db.set_user_leaves_ffs(checkpoint_id, &realm_update.update_user_leaves_ffs)
+        .await?;
+    db.contract_state_tree_set_nodes_ffs(checkpoint_id, &realm_update.update_contract_state_tree_nodes_ffs)
+        .await?;
+    if !realm_update.update_contract_state_imt_leaves_ffs.is_empty() {
+        db.contract_state_imt_set_leaves_ffs(checkpoint_id, &realm_update.update_contract_state_imt_leaves_ffs)
+            .await?;
+    }
+    db.user_contract_tree_set_nodes_ffs(checkpoint_id, &realm_update.update_user_contract_tree_nodes_ffs)
+        .await?;
+    db.global_user_tree_set_nodes_ffs(checkpoint_id, &realm_update.update_global_user_tree_nodes_ffs)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn apply_prepared_realm_checkpoint<N, S>(
+    db: &S,
+    coordinator_update: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,
+    realm_update: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
+    unique_pending_id: u64,
+    proc_id: &QCoreProcCheckpointUniqueId,
+    membership: &MerkleProofCore<N::QHash>,
+) -> anyhow::Result<()>
+where
+    N: QNetworkTypesConfig,
+    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+{
+    let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
+    db.set_unique_pending_id_checkpoint_id_mapping(unique_pending_id, checkpoint_id)
+        .await?;
+    db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, proc_id)
+        .await?;
+    db.global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &coordinator_update.merkle_proof_to_realm_root)
+        .await?;
+    db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(
+        unique_pending_id,
+        &coordinator_update.reward_tree_top_proof,
+    )
+    .await?;
+    write_checkpoint_state_records::<N, S>(db, &coordinator_update.checkpoint_sync_info, membership).await?;
+    let changed_leaves_on_imt_indexed_trees = if checkpoint_id == 0 {
+        HashSet::new()
+    } else {
+        crate::realm::processor::db::load_changed_leaves_on_imt_indexed_trees::<S, N::F, N::QHash>(db, checkpoint_id - 1, realm_update)
+            .await?
+    };
+    crate::realm::processor::db::require_state_update_record_coverage(realm_update, checkpoint_id, &changed_leaves_on_imt_indexed_trees)?;
+    apply_realm_ffs_updates::<N, S>(db, checkpoint_id, realm_update).await?;
+    let durable_tip = db.get_latest_checkpoint_id().await?;
+    if checkpoint_id >= durable_tip {
+        db.set_latest_checkpoint_id(checkpoint_id).await?;
+        db.set_l2_latest_block_state(&coordinator_update.checkpoint_sync_info.block_state)
+            .await?;
+    }
+    Ok(())
+}
 
 impl<
         N: QNetworkTypesConfig,
@@ -47,7 +149,7 @@ impl<
         CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync,
     > PsyRealmDatabaseProcessor<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>
 where
-    N::HasherBase: 'static + Send + Sync,
+    N::HasherBase: 'static + Send + Sync + MerkleZeroHasher<N::QHash> + FieldQHasher<N::F, N::QHash>,
 {
     pub async fn set_new_unique_ids(&mut self, gathering_realm_end_root: Option<N::QHash>) -> anyhow::Result<()> {
         let (new_gathering_unique_pending_id, new_gathering_proc_checkpoint_unique_id) = self.db.inc_unique_pending_id(1).await?;
@@ -122,162 +224,83 @@ where
         Ok(())
     }
 
-    pub async fn commit_checkpoint_state_no_guta_update(
-        &mut self,
-        checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
-    ) -> anyhow::Result<()> {
-        let previous = self.write_checkpoint_state_records(checkpoint_sync_info).await?;
-
-        let expected_new_checkpoint_root = previous.compute_root_with_value::<N::HasherBase>(checkpoint_sync_info.checkpoint_leaf_hash);
-        if expected_new_checkpoint_root != checkpoint_sync_info.checkpoint_tree_root {
-            anyhow::bail!("Inconsistent checkpoint tree root detected when committing checkpoint ID: {}. Expected root: {:?}, but got: {:?}. This indicates a serious inconsistency in the checkpoint tree state.",
-                checkpoint_sync_info.checkpoint_id, expected_new_checkpoint_root, checkpoint_sync_info.checkpoint_tree_root);
-        }
-
-        self.checkpoint_tree_backup_manager
-            .append_checkpoint_leaf_hash(checkpoint_sync_info.checkpoint_id, checkpoint_sync_info.checkpoint_leaf_hash)
-            .await?;
-
-        // THIS DOES NOT SET THE LATEST CHECKPOINT ID, THAT MUST BE DONE AT THE VERY END
-        // OF COMMITTING THE FULL STATE
-
-        Ok(())
-    }
-
-    async fn commit_checkpoint_state_after_checkpoint_tree_sync(
-        &mut self,
-        checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
-    ) -> anyhow::Result<()> {
-        self.write_checkpoint_state_records(checkpoint_sync_info).await?;
-
-        // The checkpoint tree backup manager was already synced from coordinator,
-        // so do not recompute a historical append root or append this leaf again.
-        Ok(())
-    }
-
-    async fn write_checkpoint_state_records(
-        &mut self,
-        checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
-    ) -> anyhow::Result<MerkleProofCore<N::QHash>> {
-        let previous: MerkleProofCore<N::QHash> = self
-            .checkpoint_tree_backup_manager
-            .checkpoint_tree
-            .get_leaf(checkpoint_sync_info.checkpoint_id);
-
-        // ORDERING IS LOAD-BEARING: these writes are not transactional. Recovery
-        // (`get_latest_available_l2_block_state` / `try_get_complete_l2_block_state`) treats a checkpoint as
-        // complete based on its core metadata records, so the L2 block state MUST be written LAST — after the
-        // state roots, checkpoint leaf, tree proof, and root mapping. Writing it earlier would let a crash mid-way
-        // leave a checkpoint that looks complete (L2 present) but is missing its proof/root mapping, which recovery
-        // would then never backfill. The `latest_l2_block_state` singleton is advanced by the caller
-        // (`commit_state`) only after `set_latest_checkpoint_id`, so it can never lead the committed marker.
-        self.db
-            .set_checkpoint_global_state_roots(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.state_roots)
-            .await?;
-        self.db
-            .set_checkpoint_leaf_data(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.checkpoint_leaf)
-            .await?;
-
-        println!("committing checkpoint proof: {:?}", &previous.to_append_proof::<N::HasherBase>());
-        self.db
-            .checkpoint_tree_injest_merkle_proof(checkpoint_sync_info.checkpoint_id, &previous.to_append_proof::<N::HasherBase>())
-            .await?;
-
-        self.db
-            .set_checkpoint_root_hash_to_id_mapping(checkpoint_sync_info.checkpoint_tree_root, checkpoint_sync_info.checkpoint_id)
-            .await?;
-
-        // Sentinel write — must remain the final persisted metadata for this checkpoint (see note above).
-        self.db
-            .set_l2_block_state(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.block_state)
-            .await?;
-
-        Ok(previous)
-    }
-
     pub async fn commit_state(
         &mut self,
         coordinator_update: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,
         realm_update: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
         _state_transition_circuit_type: ProvingJobCircuitType,
         _zk_proof: Vec<u8>,
-        skip_checkpoint_root_check: bool,
     ) -> anyhow::Result<()> {
         let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
-        let unique_pending_id = self.state.processing_unique_pending_id;
-        // CRITICAL: set unique_pending_id to checkpoint_id mapping BEFORE ANY OTHER
-        // STATE UPDATES so we can recover if something goes wrong.
-        //
-        // SOLE writer of the (unique_pending_id <-> checkpoint_id) mapping. Catch-up,
-        // fast-forward, init, and no-jobs-skip paths MUST NOT write this mapping —
-        // doing so either pollutes it with `processing_unique_pending_id` values that
-        // were never actually committed, or overwrites a correct entry with a stale
-        // key -> newer checkpoint pair if the coordinator advanced between commit and
-        // a subsequent sync. Both break recovery (init.rs:423) and RPC consumers.
-        self.db
-            .set_unique_pending_id_checkpoint_id_mapping(unique_pending_id, checkpoint_id)
-            .await?;
-        self.db
-            .set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, &self.state.processing_proc_checkpoint_unique_id)
-            .await?;
-        tracing::info!("Set unique pending ID to checkpoint ID mapping for checkpoint ID: {}", checkpoint_id);
-
-        self.db
-            .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &coordinator_update.merkle_proof_to_realm_root)
-            .await?;
-        self.db
-            .set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(
-                unique_pending_id,
-                &coordinator_update.reward_tree_top_proof,
-            )
-            .await?;
-        if skip_checkpoint_root_check {
-            self.commit_checkpoint_state_after_checkpoint_tree_sync(&coordinator_update.checkpoint_sync_info)
-                .await?;
+        let leaf_hash = coordinator_update.checkpoint_sync_info.checkpoint_leaf_hash;
+        let tree_root = coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
+        let membership = if checkpoint_id == 0 {
+            let siblings = (0..N::CHECKPOINT_TREE_HEIGHT as usize)
+                .map(|level| N::HasherBase::get_zero_hash(level))
+                .collect();
+            MerkleProofCore::new_from_params::<N::HasherBase>(0, leaf_hash, siblings)
         } else {
-            self.commit_checkpoint_state_no_guta_update(&coordinator_update.checkpoint_sync_info)
-                .await?;
-        }
+            self.coordinator_client
+                .rc_get_checkpoint_tree_merkle_proof(checkpoint_id)
+                .await
+                .context(format!(
+                    "MissingHistoryProof at C={checkpoint_id}: checkpoint tree membership unavailable"
+                ))?
+        };
+        anyhow::ensure!(
+            membership.verify::<N::HasherBase>(),
+            "MissingHistoryProof at C={checkpoint_id}: checkpoint membership does not verify"
+        );
+        anyhow::ensure!(
+            membership.index == checkpoint_id,
+            "MissingHistoryProof at C={checkpoint_id}: membership index {} is not C",
+            membership.index
+        );
+        anyhow::ensure!(
+            membership.siblings.len() == N::CHECKPOINT_TREE_HEIGHT as usize,
+            "MissingHistoryProof at C={checkpoint_id}: membership height {} is not {}",
+            membership.siblings.len(),
+            N::CHECKPOINT_TREE_HEIGHT
+        );
+        anyhow::ensure!(
+            membership.value == leaf_hash,
+            "MissingHistoryProof at C={checkpoint_id}: membership value does not match checkpoint leaf hash"
+        );
+        anyhow::ensure!(
+            membership.root == tree_root,
+            "MissingHistoryProof at C={checkpoint_id}: membership root does not match trusted C after-root"
+        );
+        let trusted_previous_root = if checkpoint_id == 0 {
+            N::HasherBase::get_zero_hash(N::CHECKPOINT_TREE_HEIGHT as usize)
+        } else {
+            self.db
+                .checkpoint_tree_get_root_hash(checkpoint_id - 1)
+                .await
+                .context(format!(
+                    "MissingHistoryProof at C={checkpoint_id}: trusted C-1 checkpoint root read failed"
+                ))?
+        };
+        anyhow::ensure!(
+            membership.compute_root_with_value::<N::HasherBase>(N::QHash::get_zero_value())
+                == trusted_previous_root,
+            "MissingHistoryProof at C={checkpoint_id}: empty-leaf root does not match trusted C-1 root"
+        );
+        coordinator_update
+            .checkpoint_sync_info
+            .ensure_valid::<N::HasherBase>(&membership.siblings)?;
 
-        // START STANDARD STATE UPDATES (technically these can be done in any order
-        // after the above two are done) start contract updates
-        if !realm_update.update_user_leaves_ffs.is_empty() {
-            self.db.set_user_leaves_ffs(checkpoint_id, &realm_update.update_user_leaves_ffs).await?;
-            tracing::info!("Committed user leaves ffs for checkpoint ID: {}", checkpoint_id);
-            self.db
-                .contract_state_tree_set_nodes_ffs(checkpoint_id, &realm_update.update_contract_state_tree_nodes_ffs)
-                .await?;
-            tracing::info!("Committed contract state tree updates for checkpoint ID: {}", checkpoint_id);
-            // Write IMT (Indexed Merkle Tree) leaf preimages and key index entries
-            if !realm_update.update_contract_state_imt_leaves_ffs.is_empty() {
-                self.db
-                    .contract_state_imt_set_leaves_ffs(checkpoint_id, &realm_update.update_contract_state_imt_leaves_ffs)
-                    .await?;
-                tracing::info!("Committed contract state IMT leaf updates for checkpoint ID: {}", checkpoint_id);
-            }
-            self.db
-                .user_contract_tree_set_nodes_ffs(checkpoint_id, &realm_update.update_user_contract_tree_nodes_ffs)
-                .await?;
-            tracing::info!("Committed user contract tree updates for checkpoint ID: {}", checkpoint_id);
-            self.db
-                .global_user_tree_set_nodes_ffs(checkpoint_id, &realm_update.update_global_user_tree_nodes_ffs)
-                .await?;
-            tracing::info!("Committed global user tree updates for checkpoint ID: {}", checkpoint_id);
-        }
-        // END STANDARD STATE UPDATES (technically these can be done in any order after
-        // the above two are done)
-
-        // CRITICAL: we need to set the checkpoint id at the VERY END otherwise the
-        // recovery doesn't work this enables us to avoid having to do atomic
-        // commits, since if the node dies during this process, it will load the backups
-        // from disk SO LONG AS THE checkpoint_id is not set!!!!
+        let unique_pending_id = self.state.processing_unique_pending_id;
+        apply_prepared_realm_checkpoint::<N, S>(
+            self.db.as_ref(),
+            coordinator_update,
+            realm_update,
+            unique_pending_id,
+            &self.state.processing_proc_checkpoint_unique_id,
+            &membership,
+        )
+        .await?;
+        tracing::info!("Set unique pending ID to checkpoint ID mapping for checkpoint ID: {}", checkpoint_id);
         let previous_checkpoint_id = self.state.last_committed_checkpoint_id;
-        self.db.set_latest_checkpoint_id(checkpoint_id).await?;
-        // Advance the `latest_l2_block_state` singleton only AFTER the checkpoint marker is committed, so the RPC
-        // `get_latest_l2_block_state` can never expose a block state that leads the committed `latest_checkpoint_id`.
-        self.db
-            .set_l2_latest_block_state(&coordinator_update.checkpoint_sync_info.block_state)
-            .await?;
         if checkpoint_id > 0 && previous_checkpoint_id < checkpoint_id {
             if let Some((previous_pending_id, _)) = self
                 .db
@@ -309,5 +332,51 @@ where
         tracing::info!("Updated last committed state for checkpoint ID: {}", checkpoint_id);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use parth_common::memory_stores::dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore;
+    use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
+    use parth_core::crypto::hash::merkle_proof::MerkleProofCore;
+    use parth_core::crypto::hash::traits::{FromU64x4, MerkleZeroHasher, ZeroableHash};
+    use parth_core::pgoldilocks::PoseidonHasher;
+    use parth_core::PHash;
+
+    #[test]
+    fn tip_empty_append_proof_is_not_historical_membership() {
+        let tree = PsyDashMemoryAppendOnlyMerkleStore::<PoseidonHasher, PHash>::new(8);
+        tree.set_leaf(0, PHash::from_u64x4([1, 0, 0, 0]));
+        let tip_empty_append = tree.get_leaf(1).to_append_proof::<PoseidonHasher>();
+        tree.set_leaf(1, PHash::from_u64x4([2, 0, 0, 0]));
+        tree.set_leaf(2, PHash::from_u64x4([3, 0, 0, 0]));
+        let historical = tree.get_historical_merkle_proof_at_historical_index(1, 1);
+        assert_ne!(
+            tip_empty_append.value, historical.value,
+            "commit must not persist get_leaf(C).to_append_proof() taken before the leaf is set"
+        );
+        assert!(historical.verify::<PoseidonHasher>());
+        assert_eq!(historical.index, 1);
+        assert_eq!(
+            historical.compute_root_with_value::<PoseidonHasher>(PHash::get_zero_value()),
+            tree.get_historical_merkle_proof_at_historical_index(0, 0).root
+        );
+    }
+
+    #[test]
+    fn genesis_setup_membership_has_no_predecessor() {
+        let height = 8usize;
+        let leaf = PHash::from_u64x4([9, 0, 0, 0]);
+        let siblings = (0..height)
+            .map(|level| PoseidonHasher::get_zero_hash(level))
+            .collect();
+        let membership = MerkleProofCore::new_from_params::<PoseidonHasher>(0, leaf, siblings);
+        assert!(membership.verify::<PoseidonHasher>());
+        assert_eq!(membership.index, 0);
+        assert_eq!(
+            membership.compute_root_with_value::<PoseidonHasher>(PHash::get_zero_value()),
+            PoseidonHasher::get_zero_hash(height)
+        );
     }
 }
