@@ -180,3 +180,45 @@ async fn blocked_consumers_do_not_starve_producers_and_cancel_cleanly() -> anyho
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "Requires isolated Redis 7.4+ at REDIS_URL"]
+async fn public_publish_variants_preserve_fifo_and_queue_coordinates() -> anyhow::Result<()> {
+    use parth_core::data::queue::queue_key::{PCoreQueueItemBase, QPBaseQueueType};
+    use psy_node_core::{queue::ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber}, test_helpers::basic_1::{TestQueueItem, TestQueueKey}};
+    let s = store().await?;
+    // Key fields deliberately differ from call coordinates: routing must use the caller's realm/job.
+    let key = TestQueueKey { realm_id: 99, realm_sub_id: 98, unique_id: 97, task_group: 96, queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData };
+    let bytes = vec![vec![0, 255, 1], vec![], vec![2, 0], vec![3, 255], vec![4], vec![5, 0, 255]];
+    s.publish_ephemeral_queue_item_bytes_ref(&key, 1, 2, 3, 4, &bytes[0]).await?;
+    s.publish_many_ephemeral_queue_items_bytes_ref(&key, 1, 2, 3, 4, &[&bytes[1], &bytes[2]]).await?;
+    s.publish_ephemeral_queue_item_owned_bytes(&key, 1, 2, 3, 4, bytes[3].clone()).await?;
+    s.publish_many_ephemeral_queue_items_owned_bytes(&key, 1, 2, 3, 4, bytes[4..].to_vec()).await?;
+    let items: Vec<_> = (10..19).map(|job_id| TestQueueItem { job_id, payload: format!("任务\0{job_id}") }).collect();
+    s.publish_ephemeral_queue_item_ref(&key, 1, 2, 3, 4, &items[0]).await?;
+    s.publish_many_ephemeral_queue_items_ref(&key, 1, 2, 3, 4, &[&items[1], &items[2]]).await?;
+    s.publish_many_ephemeral_queue_items(&key, 1, 2, 3, 4, &items[3..5]).await?;
+    s.publish_ephemeral_queue_item_owned(&key, 1, 2, 3, 4, items[5].clone()).await?;
+    s.publish_many_ephemeral_queue_items_owned(&key, 1, 2, 3, 4, items[6..].to_vec()).await?;
+    // Each coordinate is independently part of the queue identity.
+    for (realm, sub, id, group) in [(9, 2, 3, 4), (1, 9, 3, 4), (1, 2, 9, 4), (1, 2, 3, 9)] {
+        assert!(s.consume_ephemeral_queue_item_or_none_bytes(&key, realm, sub, id, group).await?.is_none());
+        s.publish_ephemeral_queue_item_bytes_ref(&key, realm, sub, id, group, b"isolated").await?;
+    }
+    for expected in bytes {
+        assert_eq!(s.consume_ephemeral_queue_item_or_none_bytes(&key, 1, 2, 3, 4).await?, Some(expected));
+    }
+    for (i, expected) in items.into_iter().enumerate() {
+        if i % 2 == 0 {
+            assert_eq!(s.consume_ephemeral_queue_item_or_none(&key, 1, 2, 3, 4).await?, Some(expected));
+        } else {
+            assert_eq!(s.consume_ephemeral_queue_item_or_none_bytes(&key, 1, 2, 3, 4).await?, Some(expected.encode_queue_item_vec()?));
+        }
+    }
+    assert!(s.consume_ephemeral_queue_item_or_none_bytes(&key, 1, 2, 3, 4).await?.is_none());
+    for (realm, sub, id, group) in [(9, 2, 3, 4), (1, 9, 3, 4), (1, 2, 9, 4), (1, 2, 3, 9)] {
+        assert_eq!(s.consume_ephemeral_queue_item_or_none_bytes(&key, realm, sub, id, group).await?, Some(b"isolated".to_vec()));
+        assert!(s.consume_ephemeral_queue_item_or_none_bytes(&key, realm, sub, id, group).await?.is_none());
+    }
+    Ok(())
+}

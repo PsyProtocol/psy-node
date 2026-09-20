@@ -24,7 +24,7 @@ make test-db-coverage-nats
 make test-db-coverage-redis
 ```
 
-Each invocation has its own 80% gate and only starts its matching service. Scylla uses two CPUs, 4 GiB RAM, and a disposable tmpfs data directory.
+Each invocation has its own gate (Scylla 90%, NATS 92%, Redis 95%) and only starts its matching service. Scylla uses two CPUs, 4 GiB RAM, and a disposable tmpfs data directory.
 The runner removes only the containers it created, including after a failure.
 It does not reuse the development network's databases.
 
@@ -42,8 +42,8 @@ provided by disposable containers; not every legacy test removes its namespace.
 
 ## Coverage contract
 
-Each of `psy_node_scylla`, `psy_node_nats`, and `psy_node_redis` must independently
-reach **at least 80% line coverage**. This is the default-feature compiled
+`psy_node_scylla`, `psy_node_nats`, and `psy_node_redis` must independently
+reach **at least 90%, 92%, and 95% line coverage**, respectively. This is the default-feature compiled
 production source, including the Scylla table implementations and store adapters.
 Files which are not declared as Rust modules are not compiled and do not appear
 in LLVM's coverage map. No compiled production modules are excluded.
@@ -56,7 +56,7 @@ in LLVM's coverage map. No compiled production modules are excluded.
   assertions and fixtures do not inflate production coverage.
 - The runner cleans previous instrumentation/profile artifacts before running.
   It does not combine evidence from old worktrees or previous failed attempts.
-- A missing crate, empty coverage map, failing test or sub-80% crate fails the
+- A missing crate, empty coverage map, failing test or crate below its own floor fails the
   command. The threshold uses unrounded counts, not displayed percentages.
 - This is a line coverage gate, not a branch-coverage or full fault-tolerance
   guarantee. It exercises real single-node services rather than multi-node
@@ -93,7 +93,7 @@ The existing Scylla dump stress test now has a deterministic CI mode with six
 batches crossing the 128/256/512 boundaries and guaranteed overwritten leaves.
 Set `PSY_SCYLLA_STRESS=1` to retain the larger 100-batch stress workload.
 
-Tests exposed three implementation defects repaired alongside the tests:
+Tests exposed implementation defects repaired alongside the tests:
 
 1. Scylla's signed counter adapter cast negative increments to `u64`. It now
    applies signed deltas through the same compare-and-set loop, clamps at zero,
@@ -105,6 +105,12 @@ Tests exposed three implementation defects repaired alongside the tests:
    is aborted on completion, error or future cancellation. This adds one
    connection setup per blocking wait. The raw BLPOP command preserves the
    distinction between server nil (`None`) and command/transport errors.
+
+4. NATS byte dumps could fetch beyond the requested limit, leaving later messages
+   delivered but unavailable to the next read. Fetches now respect both limits.
+5. Scylla leaf dumps skipped a node's historical value when its newest version
+   was newer than the requested checkpoint. Both full and bounded dump paths now
+   skip older versions only after selecting a version visible in the snapshot.
 
 The shared checkpoint-tree test helper also now reads leaf index 1 after writing
 checkpoint 1, matching the production append-by-checkpoint-ID contract.

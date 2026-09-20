@@ -300,3 +300,47 @@ async fn packed_object_writers_preserve_ids_values_and_checkpoint_history() -> a
     assert!(t.insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index(&s.session, 16, 0, 9, &[0]).await.is_err());
     cleanup(&s).await
 }
+
+#[tokio::test]
+#[ignore = "Requires isolated PSY_TEST_SCYLLA"]
+async fn double_id_object_writers_preserve_secondary_ids_and_history() -> anyhow::Result<()> {
+    use parth_core::data::db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowNoCheckpointId, QDoubleIdKey};
+    use psy_node_scylla::tables::object::ScyllaGenericObjectDoubleIdTablePreparedStatements;
+    let s = store().await?;
+    let t = s.init_std_table::<ScyllaGenericObjectDoubleIdTablePreparedStatements>("double_objects", routing()).await?;
+    assert!(s.db_select_one_double_checkpointed_object_value_and_ids::<u64>(&t, 99, 99, 5).await?.is_none());
+    assert!(s.db_select_one_double_checkpointed_object_value_and_ids_t::<u64, QDatabaseDoubleIdTableRow<u64>>(&t, 99, 99, 5).await?.is_none());
+    let mut expected_history = Vec::new();
+    for variant in 0..4u64 {
+        let rows: Vec<_> = (0..129).map(|i| QDatabaseDoubleIdTableRow::new(variant * 1000 + i / 3, i % 3, 5, variant * 10000 + i)).collect();
+        match variant {
+            0 => s.db_insert_many_double_checkpointed_object_rows(&t, &rows).await?,
+            1 => s.db_insert_many_double_checkpointed_object_rows_t::<u64, _>(&t, &rows).await?,
+            2 => {
+                let values: Vec<_> = rows.iter().map(|r| QDatabaseDoubleIdTableRowNoCheckpointId::new(r.obj_id, r.secondary_id, r.value)).collect();
+                s.db_insert_many_double_checkpointed_objects_at_checkpoint(&t, 5, &values).await?;
+            },
+            _ => s.db_insert_many_double_checkpointed_objects_at_checkpoint_t::<u64, _>(&t, 5, &rows).await?,
+        }
+        let keys: Vec<_> = rows.iter().rev().map(|r| QDoubleIdKey::from((r.obj_id, r.secondary_id))).collect();
+        assert_eq!(s.db_select_many_double_checkpointed_object_values::<u64>(&t, &keys, 5).await?, rows.iter().rev().map(|r| Some(r.value)).collect::<Vec<_>>(), "writer {variant}");
+        let first = &rows[0];
+        s.db_insert_one_double_checkpointed_object(&t, first.obj_id, first.secondary_id, 9, &(first.value + 99_000)).await?;
+        assert_eq!(s.db_select_one_double_checkpointed_object_value::<u64>(&t, first.obj_id, first.secondary_id, 8).await?, Some(first.value));
+        let latest = s.db_select_one_double_checkpointed_object_value_and_ids::<u64>(&t, first.obj_id, first.secondary_id, 9).await?.unwrap();
+        assert_eq!((latest.obj_id, latest.secondary_id, latest.checkpoint_id, latest.value), (first.obj_id, first.secondary_id, 9, first.value + 99_000));
+        let historical = s.db_select_one_double_checkpointed_object_value_and_ids_t::<u64, QDatabaseDoubleIdTableRow<u64>>(&t, first.obj_id, first.secondary_id, 8).await?.unwrap();
+        assert_eq!((historical.checkpoint_id, historical.value), (5, first.value));
+        let mixed = [QDoubleIdKey::from((first.obj_id, 1)), QDoubleIdKey::from((first.obj_id, 999)), QDoubleIdKey::from((first.obj_id, 0)), QDoubleIdKey::from((first.obj_id, 1))];
+        assert_eq!(s.db_select_many_double_checkpointed_object_values::<u64>(&t, &mixed, 8).await?, vec![Some(first.value+1), None, Some(first.value), Some(first.value+1)]);
+        let values = s.db_select_many_double_checkpointed_object_keys_and_values::<u64, QDatabaseDoubleIdTableRow<u64>>(&t, &mixed, 8).await?;
+        assert_eq!(values.iter().map(|r| (r.obj_id, r.secondary_id, r.checkpoint_id, r.value)).collect::<Vec<_>>(), vec![(first.obj_id,1,5,first.value+1),(first.obj_id,0,5,first.value),(first.obj_id,1,5,first.value+1)]);
+        expected_history.extend(rows.iter().map(|r| (r.obj_id, r.secondary_id, r.checkpoint_id, r.value)));
+        expected_history.push((first.obj_id, first.secondary_id, 9, first.value+99_000));
+    }
+    let all = s.db_select_all_double_checkpointed_object::<u64>(&t).await?;
+    let mut actual: Vec<_> = all.iter().map(|r| (r.obj_id,r.secondary_id,r.checkpoint_id,r.value)).collect();
+    actual.sort_unstable(); expected_history.sort_unstable();
+    assert_eq!(actual, expected_history);
+    cleanup(&s).await
+}

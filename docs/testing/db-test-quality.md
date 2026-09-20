@@ -1,6 +1,7 @@
 # Database test quality
 
-The 80% production-line coverage gate is a minimum execution check. A passing
+The per-crate production-line coverage gates (Scylla 90%, NATS 92%, Redis 95%)
+are minimum execution checks. A passing
 percentage does not establish correct behavior. Tests also need independent
 expected results, adversarial data, and sensitivity to plausible regressions.
 
@@ -18,18 +19,39 @@ writes. These choices prevent an earlier successful write from masking a later
 no-op. Tag-tree left/right children use different tags and hashes, so swapping
 children or returning the wrong proof cannot pass through symmetric fixtures.
 
+Zero-ID and single-ID Merkle writers use independent trees/index ranges across
+64/128/256 boundaries and compare every returned node with the input. Snapshot
+fixtures write checkpoint 5 and then overwrite at 9, before exporting checkpoint
+8. Both full and append-only dump strategies must retain older visible values and
+exclude future-only leaves. These regressions exposed and fixed the historical
+leaf selection bug in both dump paths. Double-ID object batches independently
+exercise all four writer variants, secondary-ID isolation, requested key order,
+missing keys, and checkpoint metadata after later writes.
+
 NATS assertions compare complete expected payload sequences and explicit ACK
 state, rather than only nonempty results or minimum lengths. This exposed a real
 limited-read defect: the byte dump could fetch a full batch, return only the
 requested prefix, and leave the remainder delivered but unavailable to the next
 read. The fetch now respects both limits, and zero limits return before fetching.
 
+NATS recovery checks delete a consumer directly on the server while the adapter's
+cache still holds it, then verify its recreated subject filter, ACK policy, and
+payload delivery. A new connection reuses the existing KV bucket and loads the
+consumer from the server. Missing consumers return empty results; a missing stream
+returns errors. Invalid typed payloads must fail without advancing the ACK floor
+or recording a completed job.
+
+Redis public publisher variants are checked through complete FIFO readback,
+including empty binary payloads and typed Unicode/NUL data. Realm, sub-realm,
+unique job ID, and task group are varied independently to verify routing isolation.
+
 ## Directed fault checks
 
 `dev/check-db-test-sensitivity.py` checks a bounded selection of plausible faults:
 
 - Scylla: replace each of the three KIV batch writers with a successful no-op;
-  replace the checkpoint chunk writer with a successful no-op.
+  replace the checkpoint chunk writer with a successful no-op; restore the
+  historical snapshot bug independently in full and bounded leaf dumps.
 - NATS: restore overfetch beyond the caller's limit; make NoAck send an ACK.
 - Redis: use a shared pool connection for a blocking consumer; convert command
   timeouts into an empty queue result.

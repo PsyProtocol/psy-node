@@ -30,13 +30,22 @@ class CoverageGateTest(unittest.TestCase):
         self.assertEqual(self.run_gate([(c, 0, 0) for c in CRATES]).returncode, 1)
 
     def test_single_crate_requires_its_own_coverage(self):
-        self.assertEqual(self.run_gate([(CRATES[0], 100, 81)], "--crate", CRATES[0]).returncode, 0)
-        self.assertEqual(self.run_gate([(CRATES[0], 100, 79)], "--crate", CRATES[0]).returncode, 1)
+        self.assertEqual(self.run_gate([(CRATES[0], 100, 91)], "--crate", CRATES[0]).returncode, 0)
+        self.assertEqual(self.run_gate([(CRATES[0], 100, 89)], "--crate", CRATES[0]).returncode, 1)
         self.assertEqual(self.run_gate([(CRATES[1], 100, 100)], "--crate", CRATES[0]).returncode, 1)
 
     def test_threshold_uses_unrounded_ratio(self):
-        self.assertEqual(self.run_gate([(c, 100000, 79999) for c in CRATES]).returncode, 1)
-        self.assertEqual(self.run_gate([(c, 100000, 80000) for c in CRATES]).returncode, 0)
+        self.assertEqual(self.run_gate([(c, 100000, 79999) for c in CRATES], "--minimum", "80").returncode, 1)
+        self.assertEqual(self.run_gate([(c, 100000, 80000) for c in CRATES], "--minimum", "80").returncode, 0)
+
+    def test_distinct_default_floors(self):
+        floors = (90, 92, 95)
+        exact = [(c, 100, floor) for c, floor in zip(CRATES, floors)]
+        self.assertEqual(self.run_gate(exact).returncode, 0)
+        for crate, floor in zip(CRATES, floors):
+            with self.subTest(crate=crate):
+                below = [(c, 100, floor - 1 if c == crate else 100) for c in CRATES]
+                self.assertEqual(self.run_gate(below).returncode, 1)
 
 
 if __name__ == "__main__":

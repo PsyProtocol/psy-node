@@ -571,3 +571,97 @@ async fn worker_unacked_job_redelivers_and_ack_completes_barrier() -> anyhow::Re
     client.wait_until_all_jobs_complete_or_timeout_worker(&key, 7, 11, id, 0, &barrier, 2000).await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "Requires isolated NATS_INTEGRATION_URL"]
+async fn externally_deleted_consumer_is_recreated_with_correct_filter_and_ack_policy() -> anyhow::Result<()> {
+    use async_nats::jetstream::consumer::{pull::Config, AckPolicy};
+    let (client, id, key) = connect().await?;
+    let subject = key.get_queue_subject(&client.base_namespace, 7, 11, id, 0);
+    let durable = key.get_durable_name(&client.base_namespace, 7, 11, id, 0);
+    // Delete directly on the server, leaving the adapter's cache stale.
+    client.jetstream.delete_consumer_from_stream(&durable, &client.stream_name).await?;
+    client.ensure_consumer(&subject, &durable, QPBaseQueueType::StandardEphemeral).await?;
+    let mut observer = client.jetstream.get_consumer_from_stream::<Config, _, _>(&durable, &client.stream_name).await?;
+    let info = observer.info().await?;
+    assert_eq!(info.config.filter_subject, subject);
+    assert_eq!(info.config.ack_policy, AckPolicy::All);
+    client.push_message_dq_qi_ref(&subject, &TestJob(601)).await?;
+    let other = eph_key(id + 1).get_queue_subject(&client.base_namespace, 7, 11, id + 1, 0);
+    client.push_message_dq_qi_ref(&other, &TestJob(999)).await?;
+    assert_eq!(client.get_message_if_exists_dq_bytes_ephemeral_qi::<TestJob>(&subject, &durable, JetStreamAckMode::NoAck).await?, Some(TestJob(601)));
+    assert_eq!(observer.info().await?.num_ack_pending, 1);
+    assert!(client.get_message_if_exists_dq_bytes_ephemeral_qi::<TestJob>(&subject, &durable, JetStreamAckMode::NoAck).await?.is_none());
+    // A fresh connection must reuse the existing KV bucket and load the consumer from the server.
+    let fresh = setup_nats_psy_queue_from_connection_str(&nats_url().unwrap(), &client.base_namespace).await?;
+    client.push_message_dq_qi_ref(&subject, &TestJob(602)).await?;
+    assert_eq!(fresh.consume_ephemeral_queue_item_or_none(&key, 7, 11, id, 0).await?, Some(TestJob(602)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while observer.info().await?.num_ack_pending != 0 { tokio::task::yield_now().await; }
+        Ok::<_, anyhow::Error>(())
+    }).await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "Requires isolated NATS_INTEGRATION_URL"]
+async fn malformed_typed_messages_fail_without_acknowledgement() -> anyhow::Result<()> {
+    use async_nats::jetstream::consumer::pull::Config;
+    let (client, id, _) = connect().await?;
+    for mode in 0..4 {
+        let unique = id + 10 + mode;
+        let mut key = eph_key(unique);
+        if mode >= 2 { key.queue_type = QPBaseQueueType::WorkerQueue; }
+        let subject = key.get_queue_subject(&client.base_namespace, 7, 11, unique, 0);
+        let durable = key.get_durable_name(&client.base_namespace, 7, 11, unique, 0);
+        client.ensure_consumer(&subject, &durable, key.queue_type).await?;
+        client.push_messages_dq_bytes(&subject, &[b"bad"]).await?;
+        let failed = match mode {
+            0 => client.get_message_if_exists_dq_bytes_ephemeral_qi::<TestJob>(&subject, &durable, JetStreamAckMode::AckEach).await.is_err(),
+            1 => client.dump_queue_dq_qi_batch(&key, &subject, &durable, 10, 10, &mut Vec::new()).await.is_err(),
+            2 => client.get_message_if_exists_dqi_worker(&key, &subject, &durable).await.is_err(),
+            _ => client.dump_entire_worker_queue(&key, 7, 11, unique, 0, 10).await.is_err(),
+        };
+        assert!(failed, "malformed bytes must fail for reader {mode}");
+        let mut observer = client.jetstream.get_consumer_from_stream::<Config, _, _>(&durable, &client.stream_name).await?;
+        let info = observer.info().await?;
+        assert_eq!(info.num_ack_pending, 1, "invalid jobs must not be acknowledged");
+        assert_eq!(info.ack_floor.stream_sequence, 0);
+        assert!(!client.report_message_completed_dq(&subject, &TestJob(0).get_restorable_job_id()).await?);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "Requires isolated NATS_INTEGRATION_URL"]
+async fn missing_consumers_are_empty_but_missing_streams_are_errors() -> anyhow::Result<()> {
+    let (client, id, key) = connect().await?;
+    let subject = key.get_queue_subject(&client.base_namespace, 7, 11, id, 0);
+    let durable = key.get_durable_name(&client.base_namespace, 7, 11, id, 0);
+    let wkey = worker_key(id);
+    let wsubject = wkey.get_queue_subject(&client.base_namespace, 7, 11, id, 0);
+    let wdurable = wkey.get_durable_name(&client.base_namespace, 7, 11, id, 0);
+    client.delete_ephemeral_queue_consumer(&key, 7, 11, id, 0).await?;
+    let mut jobs = Vec::new();
+    client.dump_queue_dq_qi_batch(&key, &subject, &durable, 10, 10, &mut jobs).await?;
+    assert!(jobs.is_empty());
+    assert!(client.get_message_if_exists_dq_bytes_ephemeral_qi::<TestJob>(&subject, &durable, JetStreamAckMode::AckEach).await?.is_none());
+    assert!(client.get_message_if_exists_dqi_worker(&wkey, &wsubject, &wdurable).await?.is_none());
+    assert!(client.dump_entire_worker_queue(&wkey, 7, 11, id, 0, 10).await?.is_empty());
+    client.ensure_consumer(&subject, &durable, QPBaseQueueType::StandardEphemeral).await?;
+    // Retain a cached consumer only in `client`. The fresh client must ask the server.
+    let fresh = setup_nats_psy_queue_from_connection_str(&nats_url().unwrap(), &client.base_namespace).await?;
+    client.jetstream.delete_stream(&client.stream_name).await?;
+    assert!(client.ensure_consumer(&subject, &durable, QPBaseQueueType::StandardEphemeral).await.is_err());
+    assert!(fresh.dump_queue_dq_qi_batch(&key, &subject, &durable, 10, 10, &mut jobs).await.is_err());
+    assert!(fresh.dump_queue_dq_bytes_ephemeral(&subject, &durable, JetStreamAckMode::AckEach, 10, 10, None, &mut Vec::new()).await.is_err());
+    assert!(fresh.get_message_if_exists_dq_bytes_ephemeral(&subject, &durable, JetStreamAckMode::AckEach).await.is_err());
+    assert!(fresh.get_message_if_exists_dq_bytes_ephemeral_qi::<TestJob>(&subject, &durable, JetStreamAckMode::AckEach).await.is_err());
+    assert!(fresh.get_message_if_exists_dqi_worker(&wkey, &wsubject, &wdurable).await.is_err());
+    assert!(fresh.dump_entire_worker_queue(&wkey, 7, 11, id, 0, 10).await.is_err());
+    // Recreating infrastructure restores the same adapter's useful operation.
+    client.ensure_stream_consumer(&subject, &durable, QPBaseQueueType::StandardEphemeral).await?;
+    client.push_message_dq_qi_ref(&subject, &TestJob(701)).await?;
+    assert_eq!(client.consume_ephemeral_queue_item_or_none(&key, 7, 11, id, 0).await?, Some(TestJob(701)));
+    Ok(())
+}

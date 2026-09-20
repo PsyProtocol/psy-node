@@ -19,6 +19,8 @@ import subprocess
 ROOT = Path(__file__).resolve().parent.parent
 CASES = {
     "scylla": [
+        ("future_leaf_hides_snapshot", "src/tables/merkle/zero.rs", "dump_leaves_stream", "snapshot", "merkle_contract", "zero_id_dump_selects_history_before_future_overwrites"),
+        ("future_append_leaf_hides_snapshot", "src/tables/merkle/zero.rs", "dump_leaves_stream_end_index", "snapshot", "merkle_contract", "append_only_dump_respects_snapshot_and_full_tree_boundary"),
         ("kiv_plain_no_write", "src/tables/object/kiv.rs", "insert_many_kivs", "noop", "table_contract", "kiv_batch_variants_return_values_in_requested_order"),
         ("kiv_generic_no_write", "src/tables/object/kiv.rs", "insert_many_kivs_t", "noop", "table_contract", "kiv_batch_variants_return_values_in_requested_order"),
         ("kiv_rows_no_write", "src/tables/object/kiv.rs", "insert_many_kiv_rows_t", "noop", "table_contract", "kiv_batch_variants_return_values_in_requested_order"),
@@ -51,6 +53,7 @@ def inject(source, function, fault):
         changed = "{\n        return Ok(()); // injected missing write\n" + body[1:]
     else:
         replacements = {
+            "snapshot": ("prev_index = Some(node_index_i64);\n            }", "}\n            prev_index = Some(node_index_i64);"),
             "overfetch": ("max_messages(max_messages_per_batch.min(max_messages_total_to_dump))", "max_messages(max_messages_per_batch)"),
             "ack": ("// no-op", 'jet_msg.ack().await.map_err(|e| anyhow::anyhow!("{e}"))?;'),
             "pool": ("let client = self.client.clients()[0].clone_new();\n        let _connection = BlockingConnection(client.connect());\n        client.wait_for_connect().await?;", "let client = self.client.clients()[0].clone();"),

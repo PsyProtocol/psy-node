@@ -4,16 +4,17 @@ import argparse
 import json
 from pathlib import Path
 
-CRATES = ("psy_node_scylla", "psy_node_nats", "psy_node_redis")
+MINIMUMS = {"psy_node_scylla": 90.0, "psy_node_nats": 92.0, "psy_node_redis": 95.0}
+CRATES = tuple(MINIMUMS)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
-    parser.add_argument("--minimum", type=float, default=80.0)
+    parser.add_argument("--minimum", type=float, help="Override the per-crate coverage floors")
     parser.add_argument("--crate", choices=CRATES, help="Check only the separately tested crate")
     args = parser.parse_args()
-    if not 0 <= args.minimum <= 100:
+    if args.minimum is not None and not 0 <= args.minimum <= 100:
         parser.error("minimum must be between 0 and 100")
     data = json.loads(args.report.read_text())
     files = [f for group in data["data"] for f in group["files"]]
@@ -24,10 +25,11 @@ def main():
         source = {f["filename"]: f for f in files if f"/{crate}/src/" in f["filename"]}
         total = sum(f["summary"]["lines"]["count"] for f in source.values())
         covered = sum(f["summary"]["lines"]["covered"] for f in source.values())
-        passed = bool(total) and covered * 100 >= total * args.minimum
+        minimum = MINIMUMS[crate] if args.minimum is None else args.minimum
+        passed = bool(total) and covered * 100 >= total * minimum
         failed |= not passed
         percent = f"{covered / total * 100:.2f}%" if total else "MISSING"
-        print(f"| {crate} | {covered} | {total} | {percent} | {'PASS' if passed else 'FAIL'} |")
+        print(f"| {crate} | {covered} | {total} | {percent} | {'PASS' if passed else 'FAIL'} (≥{minimum:g}%) |")
     raise SystemExit(int(failed))
 
 
