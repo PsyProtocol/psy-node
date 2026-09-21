@@ -2777,7 +2777,7 @@ impl WalletSession {
 
     //     all_contract_calls.push(ContractCallArgs {
     //         contract_id: TOKEN_CONTRACT_ID as u64,
-    //         method_name: "simple_claim_pow_rewards".to_string(),
+    //         method_name: "claim_pow_rewards".to_string(),
     //         inputs: vec![last_checkpoint],
     //     });
 
@@ -5003,7 +5003,7 @@ mod tests {
             user0,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             }],
         )?;
@@ -5018,7 +5018,7 @@ mod tests {
             user0,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_transfer".to_string(),
+                method_name: "transfer".to_string(),
                 inputs: vec![1, 500],
             }],
         )?;
@@ -5033,7 +5033,7 @@ mod tests {
             user1,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_claim".to_string(),
+                method_name: "claim".to_string(),
                 inputs: vec![0],
             }],
         )?;
@@ -5048,7 +5048,7 @@ mod tests {
             user1,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_transfer".to_string(),
+                method_name: "transfer".to_string(),
                 inputs: vec![0, 500],
             }],
         )?;
@@ -5106,7 +5106,7 @@ mod tests {
             user0,
             vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             }],
         )?;
@@ -5121,7 +5121,7 @@ mod tests {
             user0,
             vec![ContractCallArgs {
                 contract_id: 1,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             }],
         )?;
@@ -5135,9 +5135,9 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_prove_simple_mint() -> anyhow::Result<()> {
+    fn test_generate_prove_mint() -> anyhow::Result<()> {
         psy_client_common::setup_logging()?;
-        tracing::info!("test_generate_prove_simple_mint");
+        tracing::info!("test_generate_prove_mint");
         let project_path =
             std::env::var("CARGO_MANIFEST_DIR").map_err(|e| anyhow::format_err!("Error `{}`, cannot get CARGO_MANIFEST_DIR env", e))?;
 
@@ -5163,10 +5163,10 @@ mod tests {
         wallet_session.add_user(private_key0)?;
 
         // Generate trace: simple mint
-        tracing::info!("=== generate_tx_trace: simple_mint ===");
+        tracing::info!("=== generate_tx_trace: mint ===");
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id: 0,
-            method_name: "simple_mint".to_string(),
+            method_name: "mint".to_string(),
             inputs: vec![1_000_000_000_000],
         }]);
         let trace = wallet_session.generate_tx_trace(user0, call_data)?;
@@ -5216,12 +5216,12 @@ mod tests {
         let call_data = ContractCallData::new(vec![
             ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             },
             ContractCallArgs {
                 contract_id: 1,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![2_000_000_000_000],
             },
         ]);
@@ -5277,7 +5277,7 @@ mod tests {
             user0,
             ContractCallData::new(vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_mint".to_string(),
+                method_name: "mint".to_string(),
                 inputs: vec![1_000_000_000_000],
             }]),
         )?;
@@ -5292,7 +5292,7 @@ mod tests {
             user0,
             ContractCallData::new(vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_transfer".to_string(),
+                method_name: "transfer".to_string(),
                 inputs: vec![1, 500],
             }]),
         )?;
@@ -5307,7 +5307,7 @@ mod tests {
             user1,
             ContractCallData::new(vec![ContractCallArgs {
                 contract_id: 0,
-                method_name: "simple_claim".to_string(),
+                method_name: "claim".to_string(),
                 inputs: vec![0],
             }]),
         )?;
@@ -5902,8 +5902,8 @@ mod async_split_tests {
             thread::sleep(Duration::from_secs(5));
         }
 
-        // Built-in token contract 0 uses the standard simple_mint method id.
-        let built_in_simple_mint_method_id = 1450059340_u32;
+        // Built-in token contract 0 uses the standard mint method id.
+        let built_in_mint_method_id = 3374273625_u32;
 
         let source = format!(
             r#"
@@ -5918,7 +5918,7 @@ mod async_split_tests {
             impl DeferredWrapperRef {{
                 #[contract_method]
                 pub fn simple_deferred_mint() -> Felt {{
-                    invoke_deferred(0, {built_in_simple_mint_method_id}, [500000000000]);
+                    invoke_deferred(0, {built_in_mint_method_id}, [500000000000]);
                     return 1;
                 }}
 
@@ -6115,13 +6115,13 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_generate_prove_simple_mint() -> anyhow::Result<()> {
+    async fn async_generate_prove_mint() -> anyhow::Result<()> {
         let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
         let contract_id = contract_ids[0];
 
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id,
-            method_name: "simple_mint".to_string(),
+            method_name: "mint".to_string(),
             inputs: vec![1_000_000_000_000],
         }]);
         wallet_session.start_session(user0).await?;
@@ -6136,7 +6136,7 @@ mod async_split_tests {
         assert!(!generated.trace.payload.is_empty());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].contract_id, contract_id);
-        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].method_name, "simple_mint");
+        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].method_name, "mint");
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].inputs, vec![1_000_000_000_000]);
         assert!(!simulated.metadata.storage_data.writes.is_empty());
         let (after_count, after_hash) = {
@@ -6186,7 +6186,7 @@ mod async_split_tests {
                 user0,
                 ViewCallData::new(vec![ContractCallArgs {
                     contract_id: 0,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1],
                 }]),
             )
@@ -6204,7 +6204,7 @@ mod async_split_tests {
     /// trace without a held key, sign the exact session sighash, then inject
     /// the 65-byte signature for proving.
     #[tokio::test]
-    async fn async_external_eth_personal_user_simple_mint() -> anyhow::Result<()> {
+    async fn async_external_eth_personal_user_mint() -> anyhow::Result<()> {
         use psy_client_common::data::base_types::hash256::Hash256;
 
         let (mut wallet_session, _user0, _user1, contract_ids) = setup_wallet_and_users(false).await?;
@@ -6232,7 +6232,7 @@ mod async_split_tests {
 
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id,
-            method_name: "simple_mint".to_string(),
+            method_name: "mint".to_string(),
             inputs: vec![1_000_000_000_000],
         }]);
         let trace = wallet_session.generate_tx_trace(public_key, call_data).await?;
@@ -6261,7 +6261,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -6300,7 +6300,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -6352,7 +6352,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -6395,7 +6395,7 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_prove_trace_step_resume_simple_claim() -> anyhow::Result<()> {
+    async fn async_prove_trace_step_resume_claim() -> anyhow::Result<()> {
         let (wallet_session, user0, user1, contract_ids) = setup_wallet_and_users(false).await?;
         let contract_id = contract_ids[0];
         let user0_id = wallet_session.resolve_registered_user_id(user0).await?;
@@ -6408,7 +6408,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -6428,7 +6428,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, 250_000_000_000],
                 }]),
             )
@@ -6447,7 +6447,7 @@ mod async_split_tests {
                 user1,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![user0_id],
                 }]),
             )
@@ -6486,7 +6486,7 @@ mod async_split_tests {
                     break;
                 }
                 TraceProvingStepResult::Failed { error } => {
-                    anyhow::bail!("prove_trace_step simple_claim failed unexpectedly: error={}", error);
+                    anyhow::bail!("prove_trace_step claim failed unexpectedly: error={}", error);
                 }
             }
         }
@@ -6505,12 +6505,12 @@ mod async_split_tests {
                 ContractCallData::new(vec![
                     ContractCallArgs {
                         contract_id,
-                        method_name: "simple_mint".to_string(),
+                        method_name: "mint".to_string(),
                         inputs: vec![2_000_000_000_000],
                     },
                     ContractCallArgs {
                         contract_id,
-                        method_name: "simple_burn".to_string(),
+                        method_name: "burn".to_string(),
                         inputs: vec![1_000_000_000_000],
                     },
                 ]),
@@ -6687,7 +6687,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![sender_mint],
                 }]),
             )
@@ -6706,7 +6706,7 @@ mod async_split_tests {
                 user1,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![receiver_fee_mint],
                 }]),
             )
@@ -6726,7 +6726,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, public_amount],
                 }]),
             )
@@ -6773,7 +6773,7 @@ mod async_split_tests {
                 vec![
                     ClaimBatchItem::Public(ContractCallArgs {
                         contract_id,
-                        method_name: "simple_claim".to_string(),
+                        method_name: "claim".to_string(),
                         inputs: vec![user0_id],
                     }),
                     ClaimBatchItem::PrivateTransfer {
@@ -6818,7 +6818,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id: public_contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![sender_mint],
                 }]),
             )
@@ -6837,7 +6837,7 @@ mod async_split_tests {
                 user1,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id: public_contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![receiver_fee_mint],
                 }]),
             )
@@ -6856,7 +6856,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id: public_contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, public_amount],
                 }]),
             )
@@ -6915,7 +6915,7 @@ mod async_split_tests {
                 vec![
                     ClaimBatchItem::Public(ContractCallArgs {
                         contract_id: public_contract_id,
-                        method_name: "simple_claim".to_string(),
+                        method_name: "claim".to_string(),
                         inputs: vec![user0_id],
                     }),
                     ClaimBatchItem::ShieldDeposit(shield_claim.clone()),
@@ -6954,7 +6954,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -6967,7 +6967,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![user1_id, 250_000_000_000],
                 }]),
             )
@@ -6980,7 +6980,7 @@ mod async_split_tests {
                 user1,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![user0_id],
                 }]),
             )
@@ -6989,7 +6989,7 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_legacy_exec_simple_mint_smoke() -> anyhow::Result<()> {
+    async fn async_legacy_exec_mint_smoke() -> anyhow::Result<()> {
         let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
         let contract_id = contract_ids[0];
         let tx_hash = wallet_session
@@ -6997,7 +6997,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -7007,7 +7007,7 @@ mod async_split_tests {
     }
 
     #[tokio::test]
-    async fn async_generate_prove_deferred_simple_mint() -> anyhow::Result<()> {
+    async fn async_generate_prove_deferred_mint() -> anyhow::Result<()> {
         let (wallet_session, user0, _user1, contract_ids) = setup_wallet_and_users(false).await?;
         let token_contract_id = contract_ids[0];
         let deferred_contract_id = contract_ids[1];
@@ -7017,7 +7017,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id: token_contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -7108,7 +7108,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id: token_contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -7187,7 +7187,7 @@ mod async_split_tests {
                 user0,
                 ContractCallData::new(vec![ContractCallArgs {
                     contract_id,
-                    method_name: "simple_mint".to_string(),
+                    method_name: "mint".to_string(),
                     inputs: vec![1_000_000_000_000],
                 }]),
             )
@@ -7205,7 +7205,7 @@ mod async_split_tests {
                         user0,
                         ContractCallData::new(vec![ContractCallArgs {
                             contract_id,
-                            method_name: "simple_transfer".to_string(),
+                            method_name: "transfer".to_string(),
                             inputs: vec![user1_id, 250_000_000_000],
                         }]),
                     )

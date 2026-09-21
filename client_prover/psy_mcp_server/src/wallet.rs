@@ -1619,9 +1619,9 @@ impl WalletManager {
         state.exec_call(contract_id, method_name, inputs).await
     }
 
-    /// Public transfer: `simple_transfer(recipient_user_id, amount_nano)`.
+    /// Public transfer: `transfer(recipient_user_id, amount_nano)`.
     pub async fn transfer(&self, network: &NetworkId, to_user_id: u64, amount_nano: u64, contract_id: u64) -> Result<String> {
-        self.exec_call(network, contract_id, "simple_transfer", vec![to_user_id, amount_nano])
+        self.exec_call(network, contract_id, "transfer", vec![to_user_id, amount_nano])
             .await
     }
 
@@ -1633,7 +1633,7 @@ impl WalletManager {
         amount_nano: u64,
         contract_id: u64,
     ) -> Result<String> {
-        self.exec_call_for(network, expected_user_id, contract_id, "simple_transfer", vec![to_user_id, amount_nano])
+        self.exec_call_for(network, expected_user_id, contract_id, "transfer", vec![to_user_id, amount_nano])
             .await
     }
 
@@ -1655,7 +1655,7 @@ impl WalletManager {
     }
 
     /// Claim all PUBLIC claimables owed by the given senders, fused into ONE
-    /// UPS proof / one tx (a `simple_claim` per sender). Claiming is
+    /// UPS proof / one tx (a `claim` per sender). Claiming is
     /// non-destructive: it only folds funds already addressed to this user
     /// into spendable balance. Private-note and deposit claiming need
     /// note/deposit material from the discovery layer (Nostr drain +
@@ -1671,7 +1671,7 @@ impl WalletManager {
             .map(|sender| {
                 ClaimBatchItem::Public(ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![sender],
                 })
             })
@@ -1680,7 +1680,7 @@ impl WalletManager {
     }
 
     /// Public transfer to MANY recipients, fused into ONE UPS proof / one tx —
-    /// a `simple_transfer` per payment, through the same batching primitive
+    /// a `transfer` per payment, through the same batching primitive
     /// `claim_all_public` uses. N recipients therefore cost one proof and one
     /// fee instead of N of each.
     ///
@@ -1697,7 +1697,7 @@ impl WalletManager {
             .map(|(to_user_id, amount_nano)| {
                 ClaimBatchItem::Public(ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![to_user_id, amount_nano],
                 })
             })
@@ -1720,7 +1720,7 @@ impl WalletManager {
             .map(|(to_user_id, amount_nano)| {
                 ClaimBatchItem::Public(ContractCallArgs {
                     contract_id,
-                    method_name: "simple_transfer".to_string(),
+                    method_name: "transfer".to_string(),
                     inputs: vec![to_user_id, amount_nano],
                 })
             })
@@ -2811,8 +2811,8 @@ impl WalletManager {
         &self,
         network: &NetworkId,
         expected_user_id: Option<u64>,
-        public_claims: Vec<(u64, u64)>,  // (sender_user_id, contract_id) — simple_claim
-        transfers: Vec<(u64, u64, u64)>, // (to_user_id, amount, contract_id) — simple_transfer
+        public_claims: Vec<(u64, u64)>,  // (sender_user_id, contract_id) — claim
+        transfers: Vec<(u64, u64, u64)>, // (to_user_id, amount, contract_id) — transfer
         withdraws: Vec<WithdrawLeg>,
         deposits: Vec<(&DepositNote, &serde_json::Value)>,
         private_notes: Vec<(&IncomingPrivateNote, u64)>, // (note, contract_id)
@@ -2825,7 +2825,7 @@ impl WalletManager {
             .map(|(sender, contract_id)| {
                 ClaimBatchItem::Public(ContractCallArgs {
                     contract_id,
-                    method_name: "simple_claim".to_string(),
+                    method_name: "claim".to_string(),
                     inputs: vec![sender],
                 })
             })
@@ -2833,7 +2833,7 @@ impl WalletManager {
         for (to_user_id, amount, contract_id) in transfers {
             items.push(ClaimBatchItem::Public(ContractCallArgs {
                 contract_id,
-                method_name: "simple_transfer".to_string(),
+                method_name: "transfer".to_string(),
                 inputs: vec![to_user_id, amount],
             }));
         }
