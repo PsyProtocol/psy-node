@@ -14,6 +14,14 @@ This file governs `psy-node` and coordinated changes across the sibling PsyProto
 
 It supplements higher-level agent rules. The stricter rule wins.
 
+## Mandatory Development Pipeline
+
+Before starting work or delegating a task, every agent MUST read and follow the repository-root [PIPELINE.md](PIPELINE.md). That document is the single authority for stage order, review gates, test execution, repair loops, and commit readiness; do not duplicate or bypass its workflow.
+
+Research, design drafting, multiple-model multi-round design review, and the design-reviewer gate MUST precede implementation. Tests may be written during implementation, but MUST NOT be executed until implementation and test authoring are complete and the post-implementation reviewer has cleared all findings. QA is the first test-execution stage; smoke tests, benchmarks, and live E2E are not exceptions. This ordering supersedes any conflicting test-order instruction elsewhere in this file; correctness, evidence, and security requirements remain mandatory.
+
+Every delegated assignment MUST state its current pipeline stage, owned files, required evidence, and whether test execution is prohibited or authorized. Styler changes require renewed affected QA evidence before final reviewer and auditor approval. Commit only after the complete pipeline passes; a commit never authorizes a push, deployment, publication, or live-account migration.
+
 ## Required Terminology Reading
 
 Before naming a function, variable, field, type, module, file, or log marker, every AI agent MUST read `docs/src/dev/TERMINOLOGY.md`. That file owns the shared verbs and domain nouns. Do not create a second term for a concept it already names; reuse the existing word. If a needed term is absent, add it to `docs/src/dev/TERMINOLOGY.md` in the same change that introduces the symbol.
