@@ -18,6 +18,7 @@ use psy_client_common::{
 use psy_crypto::signature::zk::data::ZKPublicKeyInfo;
 use psy_provider::provider::RpcProvider;
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
+use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MultisigSignatures};
 use tokio::time::timeout;
 
 use crate::session::{WalletKeyPair, WalletSession};
@@ -46,6 +47,14 @@ pub trait Rpc {
     async fn register_user(&self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> Result<QHashOut<F>, ErrorObjectOwned>;
     #[method(name = "add_user")]
     async fn add_user(&self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> Result<QHashOut<F>, ErrorObjectOwned>;
+    #[method(name = "register_multisig_user")]
+    async fn register_multisig_user(&self, account: MultisigAccount) -> Result<QHashOut<F>, ErrorObjectOwned>;
+    #[method(name = "add_multisig_user")]
+    async fn add_multisig_user(&self, account: MultisigAccount) -> Result<QHashOut<F>, ErrorObjectOwned>;
+    #[method(name = "set_multisig_policy")]
+    async fn set_multisig_policy(&self, public_key: QHashOut<F>, current_policy: MultisigPolicy, ending_policy: MultisigPolicy) -> Result<(), ErrorObjectOwned>;
+    #[method(name = "inject_multisig_signatures")]
+    async fn inject_multisig_signatures(&self, public_key: QHashOut<F>, signatures: MultisigSignatures) -> Result<QHashOut<F>, ErrorObjectOwned>;
     #[method(name = "eth_personal_registration_challenge")]
     async fn eth_personal_registration_challenge(&self, selected_evm_address: [u8; 20]) -> Result<Hash256, ErrorObjectOwned>;
     #[method(name = "register_external_eth_personal_user")]
@@ -266,6 +275,50 @@ impl RpcServer for RpcServerImpl {
         .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
     }
 
+    async fn register_multisig_user(&self, account: MultisigAccount) -> Result<QHashOut<F>, ErrorObjectOwned> {
+        let wallet_session = self.wallet_session.clone();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move { wallet_session.write().register_multisig_user(account).await })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn add_multisig_user(&self, account: MultisigAccount) -> Result<QHashOut<F>, ErrorObjectOwned> {
+        let wallet_session = self.wallet_session.clone();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move { wallet_session.write().add_multisig_user(account).await })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn set_multisig_policy(&self, public_key: QHashOut<F>, current_policy: MultisigPolicy, ending_policy: MultisigPolicy) -> Result<(), ErrorObjectOwned> {
+        let wallet_session = self.wallet_session.clone();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                wallet_session.write().set_multisig_policy(public_key, current_policy, ending_policy).await
+            })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn inject_multisig_signatures(&self, public_key: QHashOut<F>, signatures: MultisigSignatures) -> Result<QHashOut<F>, ErrorObjectOwned> {
+        let wallet_session = self.wallet_session.clone();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                wallet_session.write().inject_multisig_signatures(public_key, signatures).await
+            })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
     async fn eth_personal_registration_challenge(&self, selected_evm_address: [u8; 20]) -> Result<Hash256, ErrorObjectOwned> {
         WalletSession::eth_personal_registration_challenge(selected_evm_address)
             .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
@@ -384,5 +437,97 @@ impl RpcServer for RpcServerImpl {
             .read()
             .get_layout_aware_deploy_contract_cmd(deployer, circuit_defs, abi)
             .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+}
+
+#[cfg(test)]
+mod multisig_rpc_tests {
+    use super::*;
+    use plonky2::hash::poseidon::PoseidonPermutation;
+    use psy_client_common::data::secp256k1::CompressedPublicKey;
+    use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::secp256k1::wallet::{hash_no_pad_compressed_public_key, secp256k1_sign}};
+    use serde_json::{json, Value};
+
+    async fn request(module: &jsonrpsee::RpcModule<RpcServerImpl>, method: &str, params: Value) -> Value {
+        let request = json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": params }).to_string();
+        let (response, _) = module.raw_json_request(&request, 1).await.unwrap();
+        let response: Value = serde_json::from_str(response.get()).unwrap();
+        assert_eq!(response["id"], 7);
+        response
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multisig_public_requests_validate_accounts_policies_and_signatures() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[1; 32]).unwrap();
+        let signatures = MultisigSignatures {
+            member_indices: vec![0],
+            signatures: vec![secp256k1_sign(key, QHashOut::<F>::from_values(1, 2, 3, 4)).unwrap()],
+        };
+        let mut member_hashes = [QHashOut::ZERO; 8];
+        member_hashes[0] = hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(
+            CompressedPublicKey(signatures.signatures[0].public_key),
+        );
+        let policy = MultisigPolicy { version: 1, threshold: 1, member_count: 1, member_hashes };
+        let account = MultisigAccount { contract_id: 42, initial_policy: policy.clone() };
+        let mut wallet = crate::wallet::memory_wallet::PsyMemoryWallet::new(Vec::new());
+        let info = wallet.register_multisig_user(account.clone()).unwrap();
+        let public_key = info.qfhash::<psy_client_data::config::store_config::PsyHasher>();
+        let session = Arc::new(RwLock::new(WalletSession {
+            wallet,
+            circuit_info: psy_client_data::qstore::controllers::session_info::SessionCircuitInfoStore::new(),
+            st_provider: RpcProvider {
+                client: Arc::new(reqwest::Client::new()),
+                realm_configs: Default::default(),
+                coordinator_configs: Default::default(),
+                users_per_realm: 1,
+                current_user_id: 0,
+            },
+            local_proving_job_manager: crate::trace::proof_schedule::JobManager::empty(),
+            user_session_mgrs: Default::default(),
+        }));
+        let module = RpcServerImpl::new(session.clone()).into_rpc();
+
+        // Invalid enrollment rejects before any provider access; no chain registration is simulated.
+        let mut invalid_account = account.clone();
+        invalid_account.initial_policy.threshold = 0;
+        for method in ["psy_register_multisig_user", "psy_add_multisig_user"] {
+            let response = request(&module, method, json!([invalid_account])).await;
+            assert_eq!(response["error"]["code"], 1);
+            assert!(response.get("result").is_none());
+        }
+
+        let mut ending = policy.clone();
+        ending.version = 2;
+        let response = request(&module, "psy_set_multisig_policy", json!([public_key, policy, ending])).await;
+        assert_eq!(response.get("result"), Some(&Value::Null));
+        assert!(response.get("error").is_none());
+        let retained = session.read().wallet.get_multisig_user(&public_key).unwrap();
+        assert_eq!(retained.policies().unwrap().1.commitment().unwrap(), ending.commitment().unwrap());
+        assert_eq!(retained.account().public_key_param().unwrap(), info.public_key_param);
+
+        let mut invalid = ending.clone();
+        invalid.threshold = 0;
+        let response = request(&module, "psy_set_multisig_policy", json!([public_key, policy, invalid])).await;
+        assert_eq!(response["error"]["code"], 1);
+        assert_eq!(session.read().wallet.get_multisig_user(&public_key).unwrap().policies().unwrap().1.commitment().unwrap(), ending.commitment().unwrap());
+
+        let response = request(&module, "psy_inject_multisig_signatures", json!([public_key, signatures])).await;
+        assert_eq!(response["result"], serde_json::to_value(public_key).unwrap());
+        assert!(response.get("error").is_none());
+        let mut duplicate = signatures.clone();
+        duplicate.member_indices.push(0);
+        duplicate.signatures.push(duplicate.signatures[0]);
+        let response = request(&module, "psy_inject_multisig_signatures", json!([public_key, duplicate])).await;
+        assert_eq!(response["error"]["code"], 1);
+
+        let missing = QHashOut::<F>::ZERO;
+        for (method, params) in [
+            ("psy_set_multisig_policy", json!([missing, policy, ending])),
+            ("psy_inject_multisig_signatures", json!([missing, signatures])),
+        ] {
+            let response = request(&module, method, params).await;
+            assert_eq!(response["error"]["code"], 1);
+            assert!(response.get("result").is_none());
+        }
     }
 }

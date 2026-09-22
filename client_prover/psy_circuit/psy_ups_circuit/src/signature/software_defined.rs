@@ -47,7 +47,7 @@ type C = PoseidonGoldilocksConfig;
 type GF = GoldilocksField;
 const D: usize = 2;
 
-fn set_sig_hash_witness(
+pub(crate) fn set_sig_hash_witness(
     pw: &mut PartialWitness<GF>,
     sig_data: &PsyUserProvingSessionSignatureDataCompactGadget,
     sign_context: &SignContextGadget,
@@ -67,7 +67,7 @@ fn set_sig_hash_witness(
 }
 
 /// Circuit equivalent of `compute_sighash_from_header` / `get_sig_action_for_user` → `sig_hash`.
-fn compute_sig_hash(
+pub(crate) fn compute_sig_hash(
     builder: &mut CircuitBuilder<GF, D>,
     sig_data: &PsyUserProvingSessionSignatureDataCompactGadget,
     sign_context: &SignContextGadget,

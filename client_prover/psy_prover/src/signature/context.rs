@@ -1,7 +1,7 @@
 use plonky2::field::goldilocks_field::GoldilocksField;
 use psy_client_common::data::qhashout::QHashOut;
 use psy_provider::request::DPNSoftwareDefinedSignatureInput;
-use psy_vm::ups::{sd_key::SDKeyCircuitWitnessInput, signature::Plonky2SoftwareDefinedSignatureInput};
+use psy_vm::ups::{multisig::MultisigSignatureWitness, sd_key::SDKeyCircuitWitnessInput, signature::Plonky2SoftwareDefinedSignatureInput};
 
 #[derive(Debug)]
 pub struct SignContext {
@@ -11,6 +11,7 @@ pub struct SignContext {
     pub psy_signature_input: Option<DPNSoftwareDefinedSignatureInput>,
     pub plonky2_signature_input: Option<Plonky2SoftwareDefinedSignatureInput>,
     pub sd_key_signature_input: Option<SDKeyCircuitWitnessInput>,
+    pub multisig_signature_witness: Option<MultisigSignatureWitness>,
     pub checkpoint_id: Option<u64>,
     pub user_id: Option<u64>,
     pub contract_state_tree_root: Option<QHashOut<GoldilocksField>>,
@@ -26,11 +27,17 @@ impl SignContext {
             psy_signature_input: None,
             plonky2_signature_input: None,
             sd_key_signature_input: None,
+            multisig_signature_witness: None,
             checkpoint_id: None,
             user_id: None,
             contract_state_tree_root: None,
             checkpoint_tree_root: None,
         }
+    }
+
+    pub fn with_multisig_signature_witness(mut self, witness: MultisigSignatureWitness) -> Self {
+        self.multisig_signature_witness = Some(witness);
+        self
     }
 
     pub fn with_contract_id(mut self, contract_id: Option<u64>) -> Self {

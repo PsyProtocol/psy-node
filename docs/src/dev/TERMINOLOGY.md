@@ -234,3 +234,22 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 6. A `RealmTransition` is `transition`. Do not name it `pair`.
 7. Receiver identity for private notes and deposit claims is `shield_address`. Do not name it `note_owner`.
 8. `explicit` is not a domain name. A keystore path is `set` or `default`.
+
+## 11. Mutable multisig authentication
+
+| Term | Meaning |
+|---|---|
+| `MultisigPolicy` | Version, threshold, member count, and eight ordered member commitments; active members are distinct and nonzero, unused entries are zero. |
+| Policy commitment | Poseidon hash of the validated `MultisigPolicy`; the account's own `CSTATE` slot 0 is the on-chain authority. |
+| Initial policy | Version-1 policy in `MultisigAccount`; its commitment is bound into immutable `public_key_param`. |
+| Current policy | Policy authenticated against the session's starting self-state; authorizes every operation, including policy replacement. |
+| Ending policy | Validated policy authenticated against the session's ending self-state; unchanged or one version higher outside bootstrap. |
+| `MultisigAccount` | Public enrollment configuration: `contract_id` and initial policy. No master secret or signer private key. |
+| `MultisigSignatures` | Matching vectors of strictly increasing current-member indices and external secp256k1 signatures over the exact session sighash bytes. |
+| `MultisigSignatureWitness` | Unsigned trace context: account, current and ending policies, starting and ending state proofs, signature data, ending sign context, starting user leaf, and nonce. |
+| `MultisigSignatureInput` | `MultisigSignatureWitness` plus `MultisigSignatures`, combined when signing the trace. |
+| `MultisigSignatureCircuit` | Fixed-capacity, eight-member, no-secret authentication circuit; checks starting-policy signatures and ending-policy validity. |
+| `TraceSignCircuitSource::Multisig` | Saved-trace selector for the fixed multisig circuit; not a ZK-key fallback. |
+| `set_multisig_policy` | Local wallet operation supplying current and ending policy preimages; does not change on-chain state. |
+| `set_policy(expected, next)` | `MultisigPolicyContract` operation replacing the on-chain policy commitment; policy semantics and authorization belong to the authentication circuit. |
+| Bootstrap | First multisig session: zero policy slot, zero nonce, and default user-state root; initial-policy signatures must install the initial commitment. Cannot be re-entered after initialization; restoring earlier membership requires a current-policy-authorized, version-incremented replacement. |

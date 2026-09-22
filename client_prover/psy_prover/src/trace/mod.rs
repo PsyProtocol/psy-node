@@ -633,6 +633,7 @@ pub enum TraceSignCircuitSource {
     ZkBuiltin,
     SecpBuiltin,
     EthPersonalSecpBuiltin,
+    Multisig,
     SdKey {
         allowed_contract_ids: Vec<u64>,
         allowed_method_ids: Vec<u32>,

@@ -1,11 +1,11 @@
 # Built-in Signature Schemes
 
-> Updated: 2026-09-04.
+> Updated: 2026-09-21. Mutable multisig status: scoped verification completed; final review pending. Public-chain enrollment and deployment have not been exercised.
 
 ## Abstract
 
 
-This guide compares the ZK and SECP256K1 signature types, their authorization models, and the commands used to register wallets with each type.
+This guide compares the ZK and SECP256K1 signature types and mutable multisig authentication. Mutable multisig supports public-only enrollment and policy replacement without changing the account identity.
 
 ## Table of Contents
 
@@ -17,6 +17,7 @@ This guide compares the ZK and SECP256K1 signature types, their authorization mo
 - [6. Changing Signature Type](#6-changing-signature-type)
 - [7. Operational Guidance](#7-operational-guidance)
 - [8. Support Direction](#8-support-direction)
+- [9. Mutable Multisig Authentication](#9-mutable-multisig-authentication)
 
 ## 1. ZK Key Signature
 
@@ -179,19 +180,14 @@ Based on standard hardware configurations:
 
 ### Changing from SECP256K1 to ZK
 
-If you're currently using SECP256K1 and want to upgrade:
-
-1. Generate a new ZK key pair
-2. Register the new public key
-3. Update applications to use the new key
-4. Gradually migrate transaction signing
+Registering a new ZK public key creates a separate account; it does not change an existing account's signature type or preserve its `user_id`. Existing-account migration is not provided by mutable multisig.
 
 ### Backward Compatibility
 
 Both signature schemes can coexist in the same application:
 - Different users can use different schemes
 - Applications can support both simultaneously
-- Gradual migration strategies are supported
+- Coexistence does not provide an in-place account migration
 
 ## 7. Operational Guidance
 
@@ -237,3 +233,61 @@ make register-users
 ### Signature-Type Focus
 
 SECP256K1 support continues, while new features and optimizations focus on ZK-based schemes.
+
+## 9. Mutable Multisig Authentication
+
+### Identity and policy
+
+`MultisigSignatureCircuit` is a separate built-in authentication circuit selected by `TraceSignCircuitSource::Multisig`, not a private-key mode of `zk` or `secp256k1`. Proving needs only public account configuration, authenticated state, and external signatures: neither a master secret nor any member's private key.
+
+The capacity is **exactly eight member slots**. `MultisigPolicy` contains `version: u32`, `threshold: u8`, `member_count: u8`, and `member_hashes: [QHashOut<GoldilocksField>; 8]`. A valid policy has a nonzero version and `1 <= threshold <= member_count <= 8`. Active member commitments are nonzero and strictly ordered lexicographically by their four canonical unsigned 64-bit limbs; unused slots are zero. Member commitments use `hash_no_pad_compressed_public_key` over canonical compressed secp256k1 public keys, not addresses.
+
+`MultisigAccount` contains only `contract_id: u32` and `initial_policy: MultisigPolicy`. The initial policy has version 1. Its commitment and contract location (contract identifier, slot 0, state-tree height 4) determine immutable `public_key_param`. Together with the fixed circuit fingerprint, this determines `public_key`. Replacing the current policy changes neither value nor the registered `user_id`.
+
+The authoritative policy commitment is in the account's **own starting contract state**, not another account's state or only the ending state. Exactly the current threshold of distinct current members authorizes the whole user proving session, including any replacement. The circuit also validates the ending policy: outside bootstrap it must be unchanged or have version `current.version + 1`, without overflow. Adding members, removing members, and changing the threshold all use one complete replacement policy. For example, a current 2-of-3 policy can authorize a version-incremented 3-of-4 policy with two current-member signatures; three replacement-member signatures are not a substitute.
+
+Type and encoding source: `client_prover/psy_vm/src/ups/multisig.rs:20-108`.
+
+### Bootstrap and replacement
+
+The ordinary Dargo contract example is `../psy-compiler/psy-dargo-cli/examples/multisig_policy/src/main.psy:3-18`. It exposes `set_policy(expected: Hash, next: Hash)`: require the stored commitment to equal `expected`, require `next` to be nonzero, then replace the commitment. It is not a genesis precompile or a reserved contract identifier. The authentication circuit enforces membership, threshold, and version rules; the contract stores the commitment.
+
+Bootstrap requires a zero starting policy slot, zero starting nonce, and the default starting user-state root. The first session must call `set_policy(zero, initial_commitment)` and end with the initial commitment, authorized by initial-policy signatures. There is no unsigned initialization, empty ending policy, or re-entry into bootstrap after initialization. A replacement calls `set_policy(current_commitment, next_commitment)` and admits at most one effective version increment per session. The current quorum can restore earlier membership through a valid version-incremented replacement; this is not bootstrap. Clearing the final policy slot is rejected even if a different contract method writes it.
+
+Contract deployment, live-network rollout, and migration of existing single-key accounts are outside this feature's scope. This guide supplies no migration or deployment command. Scoped circuit, policy, and prover checks have passed, and the contract has compiled with its storage layout verified as slot 0 and state-tree height 4. Public-chain enrollment and deployment have not been exercised. These checks do not establish product performance; the single-key timing figures above are not multisig measurements.
+
+### Wallet and remote procedure call interfaces
+
+The asynchronous `WalletSession` methods take `&mut self`. Here `F` is `GoldilocksField`; hash arguments and successful key returns use `QHashOut<F>`.
+
+| Method arguments | Successful return | Effect |
+|---|---|---|
+| `register_multisig_user(account: MultisigAccount)` | `QHashOut<F>` | Install the public-only signer and register its public identity; return `public_key`, not `user_id`. |
+| `add_multisig_user(account: MultisigAccount)` | `QHashOut<F>` | Install an already-registered account in this wallet and resolve its `user_id`; no second registration. |
+| `set_multisig_policy(public_key: QHashOut<F>, current_policy: MultisigPolicy, ending_policy: MultisigPolicy)` | `()` | Supply local policy preimages for trace generation; no on-chain write. |
+| `inject_multisig_signatures(public_key: QHashOut<F>, signatures: MultisigSignatures)` | `QHashOut<F>` | Retain external signatures for signing; return the unchanged `public_key`. |
+
+Rust methods return `anyhow::Result` around these values. The local JSON remote procedure call interface exposes the same arguments under `psy_register_multisig_user`, `psy_add_multisig_user`, `psy_set_multisig_policy`, and `psy_inject_multisig_signatures`. None accepts a private key. Sources: `client_prover/psy_prover/src/session/session.rs:1718-1741` and `client_prover/psy_prover/src/local/native/mod.rs:27-57`.
+
+**The local `set_multisig_policy` and the on-chain `set_policy` are different operations.** Supplying ending-policy preimages does not execute the contract. A replacement trace must include the contract call and matching preimages. For an ordinary session after bootstrap, supply the same policy as both current and ending.
+
+### Saved trace, external signatures, and proving
+
+1. Register the account, or add its original `MultisigAccount` to a fresh wallet. Keep the original initial policy even after replacement.
+2. Set current and ending policy preimages locally. Generate the unsigned `TxTrace` with `WalletSession::generate_tx_trace(public_key, call_data)`, including `set_policy` for bootstrap or replacement. The trace contains `MultisigSignatureWitness`: account, policy preimages, starting and ending state proofs, signature data, sign context, starting user leaf, and nonce. It does not contain injected signatures or member secrets.
+3. Give each signer the complete trace and policies for independent review. Sign the exact 32-byte prehash described below, not a displayed hash string.
+4. Supply `MultisigSignatures { member_indices: Vec<u8>, signatures: Vec<PsyCompressedSecp256K1Signature> }` through `inject_multisig_signatures`. Indices must be strictly increasing and refer to the sorted current-policy members. For proving, both vectors must have exactly `current_policy.threshold` entries.
+5. Call `WalletSession::prove_tx_trace(public_key, &trace)`. A fresh wallet needs `add_multisig_user` and signature injection first; it does not need `set_multisig_policy` when proving this saved trace because the trace owns the policy preimages. Saved multisig traces select `TraceSignCircuitSource::Multisig` and must match its fingerprint; they do not fall back to a ZK-key circuit.
+
+The local remote procedure call methods are `psy_generate_tx_trace(public_key, call_data)` and `psy_prove_tx_trace(public_key, envelope_json)`. Generation returns a JSON string encoding `GeneratedTxTraceJson`; pass the saved envelope string to proving rather than substituting a Rust `TxTrace` object. Sources: `client_prover/psy_prover/src/local/native/mod.rs:32-39,137-202`; `client_prover/psy_prover/src/session/session.rs:3270-3276,3557`.
+
+For `sighash = trace.finalization.sig_hash`, the external signing message is exactly `Hash256::from(sighash).0`. If the four canonical hash limbs are `h0`, `h1`, `h2`, `h3`, construct:
+
+```text
+B = LE64(h0) || LE64(h1) || LE64(h2) || LE64(h3)
+message = reverse(B)  // exactly 32 bytes
+```
+
+Use raw secp256k1 prehash signing with no additional hash, personal-sign prefix, or text encoding. Each signature supplies that identical `message`, a canonical compressed public key, and big-endian `r || s` signature bytes with low `s`. The envelope's displayed `sig_hash` is not the byte-contract specification.
+
+Injection checks signature encodings, vector lengths, ordered indices, and a common message; it does not authenticate a trace that has not been supplied. Signing recomputes the trace sighash and checks the account identity, exact message bytes, current-member commitments, and exact threshold count before proving. Missing signatures, another account's witness, or a mismatched message fail. Source: `client_prover/psy_prover/src/signature/users/multisig_user.rs:48-112`.

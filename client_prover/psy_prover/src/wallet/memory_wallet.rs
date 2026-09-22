@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use anyhow::bail;
 use base64::Engine;
@@ -47,17 +47,18 @@ use psy_dpn_circuit::circuits::privacy::{
     shield_deposit_claim::{ShieldDepositClaimCircuit, ShieldDepositClaimInnerCircuit},
 };
 use psy_ups_circuit::signature::{
+    multisig::MultisigSignatureCircuit,
     sd_key::SDKeyCircuitGadget,
     software_defined::{DPNSoftwareDefinedSignatureGadget, Plonky2SoftwareDefinedSignatureGadget},
 };
-use psy_vm::ups::{circuit_manager::UPSCircuitManager, state_reader::StateReader};
+use psy_vm::ups::{circuit_manager::UPSCircuitManager, multisig::{MultisigAccount, MultisigPolicy, MultisigSignatures}, state_reader::StateReader};
 
 use crate::signature::{
     context::SignContext,
     traits::{SignatureResult, SignatureUser},
     users::{
         EthPersonalSignSECP256K1User, ExternalEthPersonalSignUser, ExternalSecp256K1User, SDKeyUser, SECP256K1User, SoftwareDefinedDpnUser,
-        SoftwareDefinedPlonky2User, ZKUser,
+        MultisigUser, SoftwareDefinedPlonky2User, ZKUser,
     },
 };
 
@@ -225,8 +226,23 @@ pub fn get_public_key_info<F: RichField>(private_key: QHashOut<F>, fingerprint: 
         fingerprint,
     })
 }
+enum WalletSignatureUser {
+    Standard(Arc<dyn SignatureUser>),
+    Multisig(Arc<MultisigUser>),
+}
+
+impl WalletSignatureUser {
+    fn user(&self) -> Arc<dyn SignatureUser> {
+        match self {
+            Self::Standard(user) => user.clone(),
+            Self::Multisig(user) => user.clone(),
+        }
+    }
+}
+
 pub struct PsyMemoryWallet {
-    signature_users: DashMap<QHashOut<F>, Arc<dyn SignatureUser>>,
+    signature_users: DashMap<QHashOut<F>, WalletSignatureUser>,
+    multisig_circuit: LazyLock<anyhow::Result<MultisigSignatureCircuit>>,
     local_circuits: PsyWalletLocalCircuits,
     circuit_manager: Vec<Box<dyn UPSCircuitManager<C, D> + Send + Sync>>,
     fallback_minifiers: FallbackMinifierCircuits,
@@ -588,6 +604,7 @@ impl PsyMemoryWallet {
     ) -> Self {
         Self {
             signature_users: DashMap::new(),
+            multisig_circuit: LazyLock::new(MultisigSignatureCircuit::new),
             local_circuits,
             circuit_manager,
             fallback_minifiers: FallbackMinifierCircuits::default(),
@@ -597,6 +614,62 @@ impl PsyMemoryWallet {
 
     pub fn local_circuits(&self) -> &PsyWalletLocalCircuits {
         &self.local_circuits
+    }
+
+    pub fn get_multisig_circuit(&self) -> anyhow::Result<&MultisigSignatureCircuit> {
+        self.multisig_circuit
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("multisig circuit construction failed: {}", error))
+    }
+
+    pub fn register_multisig_user(&mut self, account: MultisigAccount) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user = Arc::new(MultisigUser::new(account)?);
+        let info = ZKPublicKeyInfo {
+            fingerprint: self.get_multisig_circuit()?.get_fingerprint(),
+            public_key_param: user.account().public_key_param()?,
+        };
+        let public_key = info.qfhash::<PsyHasher>();
+        if self.signature_users.contains_key(&public_key) {
+            let existing = self.get_multisig_user(&public_key)?;
+            anyhow::ensure!(existing.account().public_key_param()? == info.public_key_param, "multisig account identity mismatch");
+            return Ok(info);
+        }
+        self.signature_users.insert(public_key, WalletSignatureUser::Multisig(user));
+        Ok(info)
+    }
+
+    pub fn get_multisig_user(&self, public_key: &QHashOut<F>) -> anyhow::Result<Arc<MultisigUser>> {
+        let user = self.signature_users.get(public_key)
+            .ok_or_else(|| anyhow::anyhow!("multisig user `{}` not found in wallet", public_key))?;
+        match user.value() {
+            WalletSignatureUser::Multisig(user) => Ok(user.clone()),
+            WalletSignatureUser::Standard(_) => bail!("wallet user `{}` is not multisig", public_key),
+        }
+    }
+
+    pub fn set_multisig_policy(
+        &mut self,
+        public_key: QHashOut<F>,
+        current_policy: MultisigPolicy,
+        ending_policy: MultisigPolicy,
+    ) -> anyhow::Result<()> {
+        let mut user = (*self.get_multisig_user(&public_key)?).clone();
+        user.set_policy(current_policy, ending_policy)?;
+        let user = Arc::new(user);
+        self.signature_users.insert(public_key, WalletSignatureUser::Multisig(user));
+        Ok(())
+    }
+
+    pub fn inject_multisig_signatures(
+        &mut self,
+        public_key: QHashOut<F>,
+        signatures: MultisigSignatures,
+    ) -> anyhow::Result<QHashOut<F>> {
+        let mut user = (*self.get_multisig_user(&public_key)?).clone();
+        user.inject_signatures(signatures)?;
+        let user = Arc::new(user);
+        self.signature_users.insert(public_key, WalletSignatureUser::Multisig(user));
+        Ok(public_key)
     }
 
     pub fn fallback_private_note_inclusion_minifier_fingerprint(&self) -> QHashOut<F> {
@@ -751,7 +824,7 @@ impl PsyMemoryWallet {
         let manager_ref = manager.as_ref();
         let pk_info = user.public_key_info(self, manager_ref).await?;
         let pk_hash = pk_info.qfhash::<PsyHasher>();
-        self.signature_users.insert(pk_hash, user);
+        self.signature_users.insert(pk_hash, WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
 
@@ -761,14 +834,14 @@ impl PsyMemoryWallet {
         let manager_ref = manager.as_ref();
         let pk_info = user.public_key_info(self, manager_ref).await?;
         let pk_hash = pk_info.qfhash::<PsyHasher>();
-        self.signature_users.insert(pk_hash, user);
+        self.signature_users.insert(pk_hash, WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
     /// Held-key counterpart of [`Self::register_external_eth_personal_user`].
     pub async fn add_eth_personal_secp_private_key(&mut self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         let user: Arc<dyn SignatureUser> = Arc::new(EthPersonalSignSECP256K1User::new(private_key));
         let pk_info = user.public_key_info(self, self.eth_personal_circuit_manager().await?.as_ref()).await?;
-        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), user);
+        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
 
@@ -780,7 +853,7 @@ impl PsyMemoryWallet {
     pub async fn register_external_secp_user(&mut self, compressed_public_key: CompressedPublicKey) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         let user: Arc<dyn SignatureUser> = Arc::new(ExternalSecp256K1User::new(compressed_public_key)?);
         let pk_info = user.public_key_info(self, self.random_circuit_manager().as_ref()).await?;
-        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), user);
+        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
     /// Install an EIP-191 external user PK-first using the compatible proving cohort.
@@ -790,7 +863,7 @@ impl PsyMemoryWallet {
     ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         let user: Arc<dyn SignatureUser> = Arc::new(ExternalEthPersonalSignUser::new(compressed_public_key)?);
         let pk_info = user.public_key_info(self, self.eth_personal_circuit_manager().await?.as_ref()).await?;
-        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), user);
+        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
 
@@ -828,7 +901,7 @@ impl PsyMemoryWallet {
                 expected_public_key
             );
         }
-        self.signature_users.insert(expected_public_key, user);
+        self.signature_users.insert(expected_public_key, WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
 
@@ -851,7 +924,7 @@ impl PsyMemoryWallet {
                 expected_public_key
             );
         }
-        self.signature_users.insert(expected_public_key, user);
+        self.signature_users.insert(expected_public_key, WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
 
@@ -891,7 +964,7 @@ impl PsyMemoryWallet {
             .signature_users
             .get(public_key)
             .ok_or_else(|| anyhow::anyhow!("public key `{}` not found in wallet", public_key))?;
-        let user = user_guard.value().clone();
+        let user = user_guard.value().user();
         drop(user_guard);
         let mut last_error = None;
         for manager in &self.circuit_manager {
@@ -913,7 +986,7 @@ impl PsyMemoryWallet {
             .signature_users
             .get(public_key)
             .ok_or_else(|| anyhow::anyhow!("signature user for `{}` not found", public_key))?;
-        let user = user_guard.value().clone();
+        let user = user_guard.value().user();
         drop(user_guard);
 
         let manager = if context.fingerprint == get_eth_personal_secp256k1_fingerprint() {
@@ -933,14 +1006,14 @@ impl PsyMemoryWallet {
         let pk_hash = pk_info.qfhash::<PsyHasher>();
         self.signature_users
             .get(&pk_hash)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().user())
             .ok_or_else(|| anyhow::anyhow!("User with public key hash {} not found", pk_hash))
     }
 
     pub fn get_user_by_public_key_hash(&self, pk_hash: &QHashOut<F>) -> anyhow::Result<Arc<dyn SignatureUser>> {
         self.signature_users
             .get(pk_hash)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().user())
             .ok_or_else(|| anyhow::anyhow!("User with public key hash {} not found", pk_hash))
     }
 
@@ -954,7 +1027,7 @@ impl PsyMemoryWallet {
         let manager_ref = manager.as_ref();
         let pk_info = user.public_key_info(self, manager_ref).await?;
         let pk_hash = pk_info.qfhash::<PsyHasher>();
-        self.signature_users.insert(pk_hash, user);
+        self.signature_users.insert(pk_hash, WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
 
@@ -968,7 +1041,7 @@ impl PsyMemoryWallet {
         let manager_ref = manager.as_ref();
         let pk_info = user.public_key_info(self, manager_ref).await?;
         let pk_hash = pk_info.qfhash::<PsyHasher>();
-        self.signature_users.insert(pk_hash, user);
+        self.signature_users.insert(pk_hash, WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
 
@@ -978,7 +1051,7 @@ impl PsyMemoryWallet {
         let manager_ref = manager.as_ref();
         let pk_info = user.public_key_info(self, manager_ref).await?;
         let pk_hash = pk_info.qfhash::<PsyHasher>();
-        self.signature_users.insert(pk_hash, user);
+        self.signature_users.insert(pk_hash, WalletSignatureUser::Standard(user));
         Ok(pk_info)
     }
 
@@ -1229,6 +1302,22 @@ mod tests {
     type F = GoldilocksField;
     type C = PoseidonGoldilocksConfig;
     const D: usize = 2;
+
+    #[test]
+    fn multisig_updates_reject_missing_and_standard_users() {
+        let mut wallet = PsyMemoryWallet::new(Vec::new());
+        let public_key = QHashOut::from_values(1, 2, 3, 4);
+        let mut member_hashes = [QHashOut::ZERO; 8];
+        member_hashes[0] = QHashOut::from_values(1, 0, 0, 0);
+        let policy = MultisigPolicy { version: 1, threshold: 1, member_count: 1, member_hashes };
+        assert!(wallet.set_multisig_policy(public_key, policy.clone(), policy.clone()).is_err());
+        let user: Arc<dyn SignatureUser> = Arc::new(ZKUser::new(SimplePsyPrivateKey { private_key: public_key }));
+        wallet.signature_users.insert(public_key, WalletSignatureUser::Standard(user));
+        assert!(wallet.get_multisig_user(&public_key).is_err());
+        assert!(wallet.set_multisig_policy(public_key, policy.clone(), policy).is_err());
+        assert!(wallet.inject_multisig_signatures(public_key, MultisigSignatures { member_indices: vec![], signatures: vec![] }).is_err());
+        assert!(wallet.get_user_by_public_key_hash(&public_key).is_ok());
+    }
 
     /// Measures pure-Rust deflate (flate2/miniz_oxide, wasm-compatible)
     /// compression ratio on the base circuit bytes, to see whether
