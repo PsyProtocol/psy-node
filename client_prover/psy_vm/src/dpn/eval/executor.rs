@@ -19,31 +19,11 @@ use tiny_keccak::{Hasher as _, Keccak};
 use crate::dpn::{
     ops::{
         op_types::{decode_indexed_op_id, DPNBuiltInDataType, DPNOpType},
+        semantics,
         state_cmd::data::DPNStateCmd,
     },
     vm::def::DPNFunctionCircuitDefinition,
 };
-
-fn keccak_words_u32_be_to_u32_vec(words: &[u64]) -> Vec<u32> {
-    let mut bytes = Vec::with_capacity(words.len() * 4);
-    for word in words {
-        bytes.extend_from_slice(&(*word as u32).to_be_bytes());
-    }
-    let mut digest = [0u8; 32];
-    let mut keccak = Keccak::v256();
-    keccak.update(&bytes);
-    keccak.finalize(&mut digest);
-
-    digest
-        .chunks_exact(4)
-        .take(8)
-        .map(|chunk| {
-            let mut bytes = [0u8; 4];
-            bytes.copy_from_slice(chunk);
-            u32::from_be_bytes(bytes)
-        })
-        .collect()
-}
 
 // ---------------------------------------------------------------------------
 // Core result types
@@ -133,6 +113,10 @@ pub struct OpCounts {
 // Execution context
 // ---------------------------------------------------------------------------
 
+/// Goldilocks field order; felt-lane inputs are canonical (reduced mod p)
+/// exactly like DSL constants and the witness/prove path.
+const GOLDILOCKS_ORDER: u64 = 0xFFFF_FFFF_0000_0001;
+
 /// Context for a contract function execution
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
@@ -142,6 +126,9 @@ pub struct ExecutionContext {
     pub checkpoint_id: u64,
     pub nonce: u64,
     pub user_public_key_hash: [u64; 4],
+    /// Full 4-element session proof tree root, mirroring the witness
+    /// executor's `session_proof_tree_root` (GetSessionProofTreeRoot).
+    pub session_proof_tree_root: [u64; 4],
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +386,11 @@ impl<S: StateBackend> VmExecutor<S> {
 
     /// Execute a contract function with the given context and inputs
     pub fn execute(&mut self, circuit: &DPNFunctionCircuitDefinition, context: &ExecutionContext, inputs: &[u64]) -> anyhow::Result<ExecutionResult> {
+        // Untrusted-definition gate: reject malformed programs before the
+        // evaluation arms can panic on them.
+        crate::dpn::vm::validate::validate_function_definition(circuit)
+            .map_err(|e| anyhow::anyhow!("dapen function definition failed validation: {e}"))?;
+
         // Clear write overlays for fresh execution
         self.write_overlay.clear();
         self.imt_write_overlay.clear();
@@ -408,10 +400,31 @@ impl<S: StateBackend> VmExecutor<S> {
         let mut state_writes = Vec::new();
         let mut op_counts = OpCounts::default();
 
-        // Bind inputs
+        // Bind inputs. The felt lane canonicalizes with the same
+        // reduce-mod-p semantics as DSL constants (`SymFeltRef::new_constant`)
+        // and the witness/prove path (field elements are canonical by
+        // construction); a raw host u64 >= p otherwise silently diverges the
+        // preview from what the circuit proves (Lt(p+1, 2) would preview
+        // false while the circuit proves F(1) < 2 = true). The u32 and bool
+        // lanes carry the same range guards the witness executor asserts.
         for (i, &input_id) in circuit.circuit_inputs.iter().enumerate() {
             let (data_type, index) = decode_indexed_op_id(input_id);
-            let value = if i < inputs.len() { inputs[i] } else { 0 };
+            let raw = if i < inputs.len() { inputs[i] } else { 0 };
+            let value = match data_type {
+                DPNBuiltInDataType::U32Target => {
+                    if raw > 0xffff_ffff {
+                        anyhow::bail!("input[{i}] = {raw:#x} does not fit the u32 lane");
+                    }
+                    raw
+                }
+                DPNBuiltInDataType::Bool => {
+                    if raw > 1 {
+                        anyhow::bail!("input[{i}] = {raw} is not a boolean (0/1)");
+                    }
+                    raw
+                }
+                _ => raw % GOLDILOCKS_ORDER,
+            };
             registers.set(data_type, index, value);
         }
 
@@ -501,15 +514,29 @@ impl<S: StateBackend> VmExecutor<S> {
                 };
                 let full_hash: Vec<u64> = hash_elements.iter().map(|f| f.to_canonical_u64()).collect();
                 registers.hash_out_arrays.insert(def.index, full_hash);
+            } else if matches!(def.op_type, DPNOpType::GetUserPublicKeyHash) {
+                // Context hashes resolve like computed hashes: the scalar
+                // arm above returns element 0, the full 4-element hash is
+                // registered for TargetAt — same as the witness executor.
+                registers
+                    .hash_out_arrays
+                    .insert(def.index, context.user_public_key_hash.to_vec());
+            } else if matches!(def.op_type, DPNOpType::GetSessionProofTreeRoot) {
+                registers
+                    .hash_out_arrays
+                    .insert(def.index, context.session_proof_tree_root.to_vec());
             } else if def.op_type == DPNOpType::Keccak256 {
                 let words: Vec<u64> = def.inputs.iter().map(|&id| registers.get_by_encoded_id(id)).collect();
-                let full_words: Vec<u64> = keccak_words_u32_be_to_u32_vec(&words).into_iter().map(|x| x as u64).collect();
+                let full_words: Vec<u64> = semantics::keccak_u32_words_be(&words)?.into_iter().map(|x| x as u64).collect();
                 registers.set_array(DPNBuiltInDataType::U32TargetArray, def.index, full_words);
             } else if def.op_type == DPNOpType::SplitBits {
                 let value = registers.get_by_encoded_id(def.inputs[1]);
                 let num_bits = def.inputs[0];
-                let bits: Vec<u64> = (0..num_bits).map(|i| (value >> i) & 1).collect();
+                let bits: Vec<u64> = semantics::split_bits(value, num_bits)?.into_iter().map(|b| b as u64).collect();
                 registers.set_array(DPNBuiltInDataType::BoolArray, def.index, bits);
+            } else if def.op_type == DPNOpType::DivRem4 {
+                let value = registers.get_by_encoded_id(def.inputs[0]);
+                registers.set_array(DPNBuiltInDataType::TargetArray, def.index, semantics::div_rem4(value).to_vec());
             }
             op_counts.total_operations += 1;
         }
@@ -626,84 +653,79 @@ impl<S: StateBackend> VmExecutor<S> {
             // Arithmetic (Goldilocks field)
             DPNOpType::Add => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve_gl(def.inputs[0]);
-                let b = resolve_gl(def.inputs[1]);
-                Ok((a + b).to_canonical_u64())
+                let a = resolve(def.inputs[0]);
+                let b = resolve(def.inputs[1]);
+                Ok(semantics::felt_add(a, b))
             }
             DPNOpType::Sub => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve_gl(def.inputs[0]);
-                let b = resolve_gl(def.inputs[1]);
-                Ok((a - b).to_canonical_u64())
+                let a = resolve(def.inputs[0]);
+                let b = resolve(def.inputs[1]);
+                Ok(semantics::felt_sub(a, b))
             }
             DPNOpType::Mul => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve_gl(def.inputs[0]);
-                let b = resolve_gl(def.inputs[1]);
-                Ok((a * b).to_canonical_u64())
+                let a = resolve(def.inputs[0]);
+                let b = resolve(def.inputs[1]);
+                Ok(semantics::felt_mul(a, b))
             }
             DPNOpType::Div => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve_gl(def.inputs[0]);
-                let b = resolve_gl(def.inputs[1]);
-                Ok((a / b).to_canonical_u64())
+                let a = resolve_gl(def.inputs[0]).to_canonical_u64();
+                let b = resolve_gl(def.inputs[1]).to_canonical_u64();
+                Ok(semantics::felt_div(a, b)?)
             }
-            DPNOpType::Mod => {
+            DPNOpType::Mod | DPNOpType::ModConstantDividend | DPNOpType::ModConstantDivisor => {
                 op_counts.arithmetic_ops += 1;
                 let a = resolve(def.inputs[0]);
                 let b = resolve(def.inputs[1]);
-                if b == 0 {
-                    anyhow::bail!("Division by zero in Mod");
-                }
-                Ok(a % b)
+                Ok(semantics::felt_mod("Mod", a, b)?)
             }
-            DPNOpType::Exp => {
+            DPNOpType::Exp | DPNOpType::ExpConstantPower | DPNOpType::ExpConstantBase => {
                 op_counts.arithmetic_ops += 1;
-                let base = resolve_gl(def.inputs[0]);
-                let exp = resolve(def.inputs[1]);
-                Ok(base.exp_u64(exp).to_canonical_u64())
+                Ok(semantics::felt_pow(resolve(def.inputs[0]), resolve(def.inputs[1])))
             }
 
             // Unary
             DPNOpType::UnaryInverse => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve_gl(def.inputs[0]);
-                Ok(a.inverse().to_canonical_u64())
+                let a = resolve_gl(def.inputs[0]).to_canonical_u64();
+                Ok(semantics::felt_inverse("UnaryInverse", a)?)
             }
             DPNOpType::UnaryNegative => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve_gl(def.inputs[0]);
-                Ok((-a).to_canonical_u64())
+                Ok(semantics::felt_neg(resolve(def.inputs[0])))
             }
 
             // Boolean operations
             DPNOpType::BoolNot => {
                 op_counts.boolean_ops += 1;
-                Ok((resolve(def.inputs[0]) == 0) as u64)
+                let v = semantics::resolve_bool_value("BoolNot", resolve(def.inputs[0]))?;
+                Ok((!v) as u64)
             }
             DPNOpType::BoolAnd => {
                 op_counts.boolean_ops += 1;
-                let a = resolve(def.inputs[0]);
-                let b = resolve(def.inputs[1]);
-                Ok(((a != 0) && (b != 0)) as u64)
+                let a = semantics::resolve_bool_value("BoolAnd", resolve(def.inputs[0]))?;
+                let b = semantics::resolve_bool_value("BoolAnd", resolve(def.inputs[1]))?;
+                Ok((a && b) as u64)
             }
             DPNOpType::BoolOr => {
                 op_counts.boolean_ops += 1;
-                let a = resolve(def.inputs[0]);
-                let b = resolve(def.inputs[1]);
-                Ok(((a != 0) || (b != 0)) as u64)
+                let a = semantics::resolve_bool_value("BoolOr", resolve(def.inputs[0]))?;
+                let b = semantics::resolve_bool_value("BoolOr", resolve(def.inputs[1]))?;
+                Ok((a || b) as u64)
             }
             DPNOpType::Xor => {
                 op_counts.boolean_ops += 1;
                 let a = resolve(def.inputs[0]);
                 let b = resolve(def.inputs[1]);
-                Ok((a ^ b) & 0xFFFFFFFF)
+                Ok(semantics::bool_xor("Xor", a, b)?)
             }
             DPNOpType::Nor => {
                 op_counts.boolean_ops += 1;
                 let a = resolve(def.inputs[0]);
                 let b = resolve(def.inputs[1]);
-                Ok((!(a | b)) & 0xFFFFFFFF)
+                Ok(semantics::bool_nor("Nor", a, b)?)
             }
 
             // Comparison
@@ -739,78 +761,78 @@ impl<S: StateBackend> VmExecutor<S> {
             // U32 operations
             DPNOpType::U32Add => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve(def.inputs[0]) & 0xFFFFFFFF;
-                let b = resolve(def.inputs[1]) & 0xFFFFFFFF;
-                Ok((a + b) & 0xFFFFFFFF)
+                let a = resolve(def.inputs[0]);
+                let b = resolve(def.inputs[1]);
+                Ok(semantics::u32_add("u32 add", a, b)? as u64)
             }
             DPNOpType::U32Sub => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve(def.inputs[0]) & 0xFFFFFFFF;
-                let b = resolve(def.inputs[1]) & 0xFFFFFFFF;
-                Ok((a.wrapping_sub(b)) & 0xFFFFFFFF)
+                let a = resolve(def.inputs[0]);
+                let b = resolve(def.inputs[1]);
+                Ok(semantics::u32_sub("u32 sub", a, b)? as u64)
             }
             DPNOpType::U32Mul => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve(def.inputs[0]) & 0xFFFFFFFF;
-                let b = resolve(def.inputs[1]) & 0xFFFFFFFF;
-                Ok((a.wrapping_mul(b)) & 0xFFFFFFFF)
+                let a = resolve(def.inputs[0]);
+                let b = resolve(def.inputs[1]);
+                Ok(semantics::u32_mul("u32 mul", a, b)? as u64)
             }
             DPNOpType::U32Div => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve(def.inputs[0]) & 0xFFFFFFFF;
-                let b = resolve(def.inputs[1]) & 0xFFFFFFFF;
-                if b == 0 {
-                    anyhow::bail!("Division by zero in U32Div");
-                }
-                Ok((a / b) & 0xFFFFFFFF)
+                let a = resolve(def.inputs[0]);
+                let b = resolve(def.inputs[1]);
+                Ok(semantics::u32_div("u32 div", a, b)? as u64)
             }
             DPNOpType::U32Mod => {
                 op_counts.arithmetic_ops += 1;
-                let a = resolve(def.inputs[0]) & 0xFFFFFFFF;
-                let b = resolve(def.inputs[1]) & 0xFFFFFFFF;
-                if b == 0 {
-                    anyhow::bail!("Division by zero in U32Mod");
-                }
-                Ok(a % b)
+                let a = resolve(def.inputs[0]);
+                let b = resolve(def.inputs[1]);
+                Ok(semantics::u32_mod("u32 mod", a, b)? as u64)
             }
             DPNOpType::U32Exp => {
                 op_counts.arithmetic_ops += 1;
-                let base = resolve(def.inputs[0]) & 0xFFFFFFFF;
-                let exp = resolve(def.inputs[1]) & 0xFFFFFFFF;
-                let base_gl = GoldilocksField::from_noncanonical_u64(base);
-                Ok(base_gl.exp_u64(exp).to_canonical_u64() & 0xFFFFFFFF)
+                let base = resolve(def.inputs[0]);
+                let exp = resolve(def.inputs[1]);
+                Ok(semantics::u32_exp("u32 exp", base, exp)? as u64)
             }
 
             // U32 bitwise
-            DPNOpType::U32And => {
+            DPNOpType::U32And | DPNOpType::U32AndConstant => {
                 op_counts.boolean_ops += 1;
                 Ok((resolve(def.inputs[0]) & resolve(def.inputs[1])) & 0xFFFFFFFF)
             }
-            DPNOpType::U32Or => {
+            DPNOpType::U32Or | DPNOpType::U32OrConstant => {
                 op_counts.boolean_ops += 1;
                 Ok((resolve(def.inputs[0]) | resolve(def.inputs[1])) & 0xFFFFFFFF)
             }
-            DPNOpType::U32Xor => {
+            DPNOpType::U32Xor | DPNOpType::U32XorConstant => {
                 op_counts.boolean_ops += 1;
                 Ok((resolve(def.inputs[0]) ^ resolve(def.inputs[1])) & 0xFFFFFFFF)
             }
-            DPNOpType::U32ShiftLeft => {
+            // u32 shifts: every bit leaves the 32-bit window once the
+            // distance reaches 32, so distances >= 32 evaluate to 0. The
+            // unguarded `a << b` on u64 panicked in debug and silently
+            // wrapped in release for distances >= 64.
+            // The Constant* variants carry their constant as a resolvable
+            // input node, so the same logic covers all of them; they
+            // previously fell through to the catch-all below and returned 0.
+            DPNOpType::U32ShiftLeft | DPNOpType::U32ShiftLeftConstantBitDistance | DPNOpType::U32ShiftLeftConstantValue => {
                 op_counts.boolean_ops += 1;
-                let a = resolve(def.inputs[0]) & 0xFFFFFFFF;
-                let b = resolve(def.inputs[1]) & 0xFFFFFFFF;
-                Ok((a << b) & 0xFFFFFFFF)
+                let a = semantics::u32_operand("u32 shift", resolve(def.inputs[0]))?;
+                let b = semantics::u32_operand("u32 shift", resolve(def.inputs[1]))?;
+                Ok(semantics::u32_shl(a, b) as u64)
             }
-            DPNOpType::U32ShiftRight => {
+            DPNOpType::U32ShiftRight | DPNOpType::U32ShiftRightConstantBitDistance | DPNOpType::U32ShiftRightConstantValue => {
                 op_counts.boolean_ops += 1;
-                let a = resolve(def.inputs[0]) & 0xFFFFFFFF;
-                let b = resolve(def.inputs[1]) & 0xFFFFFFFF;
-                Ok((a >> b) & 0xFFFFFFFF)
+                let a = semantics::u32_operand("u32 shift", resolve(def.inputs[0]))?;
+                let b = semantics::u32_operand("u32 shift", resolve(def.inputs[1]))?;
+                Ok(semantics::u32_shr(a, b) as u64)
             }
 
             // Type casts
-            DPNOpType::CastU32 => Ok(resolve(def.inputs[0]) & 0xFFFFFFFF),
+            DPNOpType::CastU32 => Ok(semantics::cast_u32(resolve(def.inputs[0]))? as u64),
             DPNOpType::CastFelt => Ok(resolve(def.inputs[0])),
-            DPNOpType::CastBool => Ok((resolve(def.inputs[0]) != 0) as u64),
+            DPNOpType::CastBool => Ok(semantics::resolve_bool_value("CastBool", resolve(def.inputs[0]))? as u64),
 
             // Context
             DPNOpType::GetUserId => Ok(context.user_id),
@@ -821,6 +843,11 @@ impl<S: StateBackend> VmExecutor<S> {
             DPNOpType::GetUserPublicKeyHash => {
                 // Returns first element of hash; array result handled separately
                 Ok(context.user_public_key_hash[0])
+            }
+            DPNOpType::GetSessionProofTreeRoot => {
+                // Scalar view of the tree root; the full hash is registered
+                // for TargetAt in the post-step below, matching the witness.
+                Ok(context.session_proof_tree_root[0])
             }
 
             // Hashing
@@ -850,7 +877,7 @@ impl<S: StateBackend> VmExecutor<S> {
             DPNOpType::Keccak256 => {
                 op_counts.hash_ops += 1;
                 let args: Vec<u64> = def.inputs.iter().map(|&id| resolve(id)).collect();
-                let result: Vec<u32> = keccak_words_u32_be_to_u32_vec(&args);
+                let result = semantics::keccak_u32_words_be(&args)?;
                 Ok(result[0] as u64)
             }
 
@@ -883,15 +910,76 @@ impl<S: StateBackend> VmExecutor<S> {
                 }
             }
 
-            // Bit operations
+            // Bit operations.
             DPNOpType::SumBits => {
-                let sum: u64 = def.inputs.iter().map(|&id| resolve(id)).sum();
+                // Weighted binary reconstruction sum(bit[i] * 2^i) over
+                // strict boolean inputs, reduced mod p — matches the
+                // witness and the circuit (the old fold was an unweighted
+                // field sum, a third SumBits dialect).
+                let bits: Vec<bool> = def
+                    .inputs
+                    .iter()
+                    .map(|id| semantics::resolve_bool_value("SumBits", resolve(*id)))
+                    .collect::<Result<_, _>>()?;
+                let sum = semantics::sum_bits_weighted(&bits)?;
                 Ok(GoldilocksField::from_noncanonical_u64(sum).to_canonical_u64())
             }
 
+            // ECDSA verification: 36 inputs = pk[16] ++ sig[16] ++ msg[4],
+            // packed exactly like the core_eval arm (u32 words in reversed
+            // word order with big-endian bytes; msg words are full felts).
+            // Invalid public keys / signatures fail verification (return 0)
+            // instead of aborting. This arm previously fell through to the
+            // catch-all below and silently returned 0 even for valid
+            // signatures.
+            DPNOpType::Secp256k1Verify => {
+                use k256::ecdsa::signature::hazmat::PrehashVerifier;
+                if def.inputs.len() != 36 {
+                    anyhow::bail!("Secp256k1Verify requires exactly 36 inputs, got {}", def.inputs.len());
+                }
+                let words: Vec<u64> = def.inputs.iter().map(|&id| resolve(id)).collect();
+                let be_u32_words = |ws: &[u64]| -> Vec<u8> {
+                    ws.iter()
+                        .map(|w| {
+                            // Same range check as the vm / core_eval arms:
+                            // pk and sig words must fit a u32 (0xffffffff is
+                            // a legal word — a `< 0xffffffff` check rejects
+                            // it, and silent `as u32` truncation hides it).
+                            assert!(*w <= 0xffffffff, "secp pk/sig words must fit u32");
+                            *w as u32
+                        })
+                        .flat_map(|w| w.to_le_bytes())
+                        .rev()
+                        .collect()
+                };
+                let mut sec1 = vec![0x04];
+                sec1.extend(be_u32_words(&words[0..8]));
+                sec1.extend(be_u32_words(&words[8..16]));
+                let Ok(vk) = k256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1) else {
+                    return Ok(0);
+                };
+                let mut sig_bytes = be_u32_words(&words[16..24]);
+                sig_bytes.extend(be_u32_words(&words[24..32]));
+                let Ok(sig) = k256::ecdsa::Signature::from_slice(&sig_bytes) else {
+                    return Ok(0);
+                };
+                let msg_bytes: Vec<u8> = words[32..36].iter().flat_map(|w| w.to_le_bytes()).rev().collect();
+                Ok(matches!(vk.verify_prehash(&msg_bytes, &sig), Ok(_)) as u64)
+            }
+
+            // SplitBits' real result is the bool array materialized in the
+            // post-step below; array defs have no meaningful scalar view, so
+            // the scalar resolution is an explicit placeholder.
+            DPNOpType::SplitBits => Ok(0),
+            // Same pattern for DivRem4's [quotient, remainder] array.
+            DPNOpType::DivRem4 => Ok(0),
+
             _ => {
-                // For unimplemented ops, return 0 with a warning
-                Ok(0)
+                // Every opcode must have an explicit arm: silently returning
+                // 0 would hide a missing implementation as a wrong result.
+                // (The structural validator already rejects the known
+                // no-implementation opcodes before execution.)
+                anyhow::bail!("VmExecutor has no arm for opcode {:?}", def.op_type)
             }
         }
     }
@@ -1650,5 +1738,136 @@ impl Registers {
             }
             _ => vec![self.get(data_type, index)],
         }
+    }
+}
+
+#[cfg(test)]
+mod input_binding_tests {
+    use super::*;
+    use crate::dpn::ops::op_types::{encode_indexed_op_id, DPNIndexedVarDef, DPNOpType};
+
+    fn three_lane_program() -> DPNFunctionCircuitDefinition {
+        let target = |i: usize| encode_indexed_op_id(DPNBuiltInDataType::Target, i);
+        DPNFunctionCircuitDefinition {
+            name: "binding".to_string(),
+            method_id: 0,
+            circuit_inputs: vec![
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+                encode_indexed_op_id(DPNBuiltInDataType::U32Target, 0),
+                encode_indexed_op_id(DPNBuiltInDataType::Bool, 0),
+            ],
+            circuit_outputs: vec![target(0)],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            events: vec![],
+            definitions: vec![
+                DPNIndexedVarDef {
+                    data_type: DPNBuiltInDataType::Target,
+                    index: 0,
+                    op_type: DPNOpType::InputTarget,
+                    inputs: vec![0],
+                },
+                DPNIndexedVarDef {
+                    data_type: DPNBuiltInDataType::U32Target,
+                    index: 0,
+                    op_type: DPNOpType::U32InputTarget,
+                    inputs: vec![1],
+                },
+                DPNIndexedVarDef {
+                    data_type: DPNBuiltInDataType::Bool,
+                    index: 0,
+                    op_type: DPNOpType::BoolInputTarget,
+                    inputs: vec![2],
+                },
+            ],
+        }
+    }
+
+    fn context() -> ExecutionContext {
+        ExecutionContext {
+            user_id: 0,
+            contract_id: 0,
+            caller_contract_id: 0,
+            checkpoint_id: 0,
+            nonce: 0,
+            user_public_key_hash: [0; 4],
+            session_proof_tree_root: [0; 4],
+        }
+    }
+
+    // A host u64 at or above the field order must bind as the SAME value the
+    // witness/circuit prove (F::from_noncanonical_u64 reduction): the preview
+    // can never silently disagree with the proof.
+    #[test]
+    fn felt_inputs_bind_canonically_like_the_prove_path() {
+        let defn = three_lane_program();
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        let result = executor.execute(&defn, &context(), &[GOLDILOCKS_ORDER + 1, 0, 0]).unwrap();
+        assert_eq!(result.outputs[0], 1, "p+1 must bind as F(1)");
+    }
+
+    #[test]
+    fn u32_and_bool_inputs_reject_out_of_range_values() {
+        let defn = three_lane_program();
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        let err = executor.execute(&defn, &context(), &[0, 0x1_0000_0000, 0]).unwrap_err();
+        assert!(err.to_string().contains("u32 lane"), "{err}");
+
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        let err = executor.execute(&defn, &context(), &[0, 0, 2]).unwrap_err();
+        assert!(err.to_string().contains("boolean"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod nor_lane_tests {
+    use super::*;
+    use crate::dpn::ops::op_types::DPNIndexedVarDef;
+
+    fn d(lane: DPNBuiltInDataType, idx: usize, op: DPNOpType, inputs: Vec<u64>) -> DPNIndexedVarDef {
+        DPNIndexedVarDef { data_type: lane, index: idx, op_type: op, inputs }
+    }
+    fn u32(i: usize) -> u64 { crate::dpn::ops::op_types::encode_indexed_op_id(DPNBuiltInDataType::U32Target, i) }
+    fn tgt(i: usize) -> u64 { crate::dpn::ops::op_types::encode_indexed_op_id(DPNBuiltInDataType::Target, i) }
+
+    #[test]
+    fn nor_rejects_non_boolean_scalar_operand() {
+        let target = |i: usize| crate::dpn::ops::op_types::encode_indexed_op_id(DPNBuiltInDataType::Target, i);
+        let bool_id = |i: usize| crate::dpn::ops::op_types::encode_indexed_op_id(DPNBuiltInDataType::Bool, i);
+        let defn = DPNFunctionCircuitDefinition {
+            name: "nor".to_string(),
+            method_id: 0,
+            circuit_inputs: vec![tgt(0), bool_id(0)],
+            circuit_outputs: vec![bool_id(2), crate::dpn::ops::op_types::encode_indexed_op_id(DPNBuiltInDataType::U32Target, 3)],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            events: vec![],
+            definitions: vec![
+                d(DPNBuiltInDataType::Target, 0, DPNOpType::InputTarget, vec![0]),
+                d(DPNBuiltInDataType::Bool, 0, DPNOpType::BoolInputTarget, vec![1]),
+                d(DPNBuiltInDataType::U32Target, 0, DPNOpType::ConstantU32, vec![1463407909]),
+                d(DPNBuiltInDataType::U32Target, 1, DPNOpType::ConstantU32, vec![2]),
+                d(DPNBuiltInDataType::Target, 1, DPNOpType::Constant, vec![8]),
+                d(DPNBuiltInDataType::U32Target, 2, DPNOpType::ConstantU32, vec![1]),
+                d(DPNBuiltInDataType::Bool, 1, DPNOpType::ConstantTrue, vec![]),
+                d(DPNBuiltInDataType::Target, 2, DPNOpType::Constant, vec![2]),
+                d(DPNBuiltInDataType::U32Target, 3, DPNOpType::CastU32, vec![tgt(2)]),
+                d(DPNBuiltInDataType::Bool, 2, DPNOpType::Nor, vec![bool_id(1), tgt(2)]),
+            ],
+        };
+        let ctx = ExecutionContext {
+            user_id: 0,
+            contract_id: 0,
+            caller_contract_id: 0,
+            checkpoint_id: 0,
+            nonce: 0,
+            user_public_key_hash: [0; 4],
+            session_proof_tree_root: [0; 4],
+        };
+        let mut executor = VmExecutor::new(InMemoryStateBackend::new());
+        let err = executor.execute(&defn, &ctx, &[4, 0]).unwrap_err();
+        assert!(err.to_string().contains("invalid bool value"), "{err}");
     }
 }

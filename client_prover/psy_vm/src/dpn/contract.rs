@@ -10,10 +10,15 @@ use crate::dpn::{
         op_types::{DPNAssertEqInfoIndexed, DPNEventRecord, DPNIndexedVarDef},
         state_cmd::{data::DPNStateCmd, types::DPNStateCmdCore},
     },
-    vm::def::DPNFunctionCircuitDefinition,
+    vm::{def::DPNFunctionCircuitDefinition, validate::validate_function_definition},
 };
 
 pub fn dapen_fc_to_cfc_code_definition(dpn_fc_def: &DPNFunctionCircuitDefinition) -> ContractFunctionCodeDefinition {
+    // Deploy gate: the compiler output must be structurally valid before it
+    // is persisted; a violation is a compiler bug and must not be stored.
+    if let Err(e) = validate_function_definition(dpn_fc_def) {
+        panic!("refusing to deploy an invalid dapen function definition: {e}");
+    }
     ContractFunctionCodeDefinition {
         method_id: dpn_fc_def.method_id,
         num_inputs: dpn_fc_def.circuit_inputs.len() as u32,
@@ -227,7 +232,13 @@ pub fn cfc_code_definition_to_dapen_fc(cfc_def: &ContractFunctionCodeDefinition)
     let res = serde_cbor::from_slice::<DPNFunctionCircuitDefinition>(&cfc_def.code);
 
     match res {
-        Ok(r) => Ok(r),
+        // Ingress gate: on-chain / RPC-sourced code is untrusted; reject
+        // structurally invalid definitions before any executor panics on
+        // them.
+        Ok(r) => match validate_function_definition(&r) {
+            Ok(()) => Ok(r),
+            Err(e) => anyhow::bail!("dapen function definition failed validation: {e}"),
+        },
         Err(e) => anyhow::bail!("error deserializing dapen function definition {:?}", e),
     }
 }
