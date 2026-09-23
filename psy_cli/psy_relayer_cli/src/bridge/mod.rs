@@ -6,6 +6,7 @@ pub mod constants;
 pub mod daemon;
 pub mod deposit_logs;
 pub mod finalize_bridge;
+mod finalize_preflight;
 pub mod l1_provider;
 pub mod l1_client;
 pub mod prove_proxy_client;
