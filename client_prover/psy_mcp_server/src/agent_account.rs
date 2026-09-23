@@ -79,20 +79,20 @@ pub struct CapabilityRequest {
     pub method_name: String,
 }
 
-/// Parse `["0:simple_transfer", "4:simple_claim"]` into capability requests.
+/// Parse `["0:transfer", "4:claim"]` into capability requests.
 ///
 /// The `contract_id:method_name` form keeps the pairing explicit — a bare list of
 /// contracts plus a bare list of methods would be ambiguous about which method
 /// belongs to which contract, and the engine would silently cross-product it.
 pub fn parse_capability_requests(specs: &[String]) -> Result<Vec<CapabilityRequest>> {
     if specs.is_empty() {
-        bail!("a mandate needs at least one capability, e.g. \"0:simple_transfer\"");
+        bail!("a mandate needs at least one capability, e.g. \"0:transfer\"");
     }
     let mut out = Vec::with_capacity(specs.len());
     for spec in specs {
         let (contract, method) = spec
             .split_once(':')
-            .ok_or_else(|| anyhow!("capability `{spec}` must be `contract_id:method_name`, e.g. \"0:simple_transfer\""))?;
+            .ok_or_else(|| anyhow!("capability `{spec}` must be `contract_id:method_name`, e.g. \"0:transfer\""))?;
         let contract_id: u64 = contract
             .trim()
             .parse()
@@ -144,19 +144,19 @@ mod tests {
 
     #[test]
     fn parses_contract_method_pairs() {
-        let reqs = parse_capability_requests(&["0:simple_transfer".into(), " 4 : simple_claim ".into()]).unwrap();
+        let reqs = parse_capability_requests(&["0:transfer".into(), " 4 : claim ".into()]).unwrap();
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].contract_id, 0);
-        assert_eq!(reqs[0].method_name, "simple_transfer");
+        assert_eq!(reqs[0].method_name, "transfer");
         assert_eq!(reqs[1].contract_id, 4);
-        assert_eq!(reqs[1].method_name, "simple_claim", "surrounding whitespace must be trimmed");
+        assert_eq!(reqs[1].method_name, "claim", "surrounding whitespace must be trimmed");
     }
 
     #[test]
     fn rejects_malformed_capabilities() {
         assert!(parse_capability_requests(&[]).is_err(), "empty mandate");
-        assert!(parse_capability_requests(&["simple_transfer".into()]).is_err(), "missing contract id");
-        assert!(parse_capability_requests(&["x:simple_transfer".into()]).is_err(), "non-numeric contract id");
+        assert!(parse_capability_requests(&["transfer".into()]).is_err(), "missing contract id");
+        assert!(parse_capability_requests(&["x:transfer".into()]).is_err(), "non-numeric contract id");
         assert!(parse_capability_requests(&["0:".into()]).is_err(), "empty method name");
     }
 

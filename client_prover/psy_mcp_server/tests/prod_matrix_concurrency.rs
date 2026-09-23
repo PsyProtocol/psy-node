@@ -70,7 +70,7 @@ fn stress_01_a_daily_cap_holds_exactly_under_concurrent_authorize() {
     {
         let (shared, granted, token) = (Arc::clone(&shared), Arc::clone(&granted), token.clone());
         hammer(16, 500, move |_, _| {
-            if shared.lock().unwrap().authorize(&token, "204800", 1, "simple_transfer").is_ok() {
+            if shared.lock().unwrap().authorize(&token, "204800", 1, "transfer").is_ok() {
                 granted.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -80,7 +80,7 @@ fn stress_01_a_daily_cap_holds_exactly_under_concurrent_authorize() {
     assert_eq!(granted, CAP, "exactly the daily cap must be authorized across 8000 concurrent attempts");
     let spent = shared.lock().unwrap().describe(&pid).unwrap().spent_today_nano;
     assert_eq!(spent, granted, "the counter must equal what was actually handed out — no lost updates");
-    assert!(shared.lock().unwrap().authorize(&token, "204800", 1, "simple_transfer").is_err(), "and the cap stays closed afterwards");
+    assert!(shared.lock().unwrap().authorize(&token, "204800", 1, "transfer").is_err(), "and the cap stays closed afterwards");
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn stress_01b_a_lifetime_budget_holds_under_mixed_amounts() {
         let (shared, total, token) = (Arc::clone(&shared), Arc::clone(&total), token.clone());
         hammer(12, 400, move |t, i| {
             let amount = 1 + ((t * 400 + i) as u64 % 997);
-            if shared.lock().unwrap().authorize(&token, "204800", amount, "simple_transfer").is_ok() {
+            if shared.lock().unwrap().authorize(&token, "204800", amount, "transfer").is_ok() {
                 total.fetch_add(amount, Ordering::Relaxed);
             }
         });
@@ -147,7 +147,7 @@ fn stress_02_concurrent_agents_cannot_spend_each_others_budgets() {
         let (shared, granted, policies) = (Arc::clone(&shared), Arc::clone(&granted), policies.clone());
         hammer(AGENTS * 3, 400, move |t, _| {
             let a = t % AGENTS;
-            if shared.lock().unwrap().authorize(&policies[a].1, "204800", 1, "simple_transfer").is_ok() {
+            if shared.lock().unwrap().authorize(&policies[a].1, "204800", 1, "transfer").is_ok() {
                 granted[a].fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -198,7 +198,7 @@ fn stress_02b_a_revoked_agent_stops_mid_swarm_without_disturbing_the_others() {
                 revoked.store(true, Ordering::SeqCst);
             }
             let idx = t % 4;
-            let ok = shared.lock().unwrap().authorize(&tokens[idx], "204800", 1, "simple_transfer").is_ok();
+            let ok = shared.lock().unwrap().authorize(&tokens[idx], "204800", 1, "transfer").is_ok();
             if idx == 0 && ok && revoked.load(Ordering::SeqCst) {
                 after_revoke.fetch_add(1, Ordering::Relaxed);
             }
@@ -243,7 +243,7 @@ fn stress_03_refunds_racing_authorizations_never_mint_or_lose_budget() {
         hammer(10, 500, move |t, i| {
             let amount = 1 + ((t + i) as u64 % 100);
             let mut e = shared.lock().unwrap();
-            if let Ok(auth) = e.authorize(&token, "204800", amount, "simple_transfer") {
+            if let Ok(auth) = e.authorize(&token, "204800", amount, "transfer") {
                 net.fetch_add(amount, Ordering::SeqCst);
                 // Every third settle "fails" and is refunded under the same lock
                 // the next authorize will take.
@@ -288,7 +288,7 @@ fn stress_03b_check_budget_is_advisory_but_authorize_is_still_exact() {
             let headroom = shared.lock().unwrap().budget(&token).map(|b| b.remaining_day).unwrap_or(0);
             // Deliberately act on the possibly-stale read.
             if headroom >= 10 {
-                if shared.lock().unwrap().authorize(&token, "204800", 10, "simple_transfer").is_ok() {
+                if shared.lock().unwrap().authorize(&token, "204800", 10, "transfer").is_ok() {
                     granted.fetch_add(10, Ordering::Relaxed);
                 } else {
                     stale_reads.fetch_add(1, Ordering::Relaxed);
@@ -325,7 +325,7 @@ fn stress_04_a_long_running_server_stays_bounded_and_exact() {
     let mut expected = 0u64;
     for i in 0..ROUNDS {
         let amount = 1 + (i % 10);
-        let auth = engine.authorize(&token, "204800", amount, "simple_transfer").expect("headroom is effectively unlimited");
+        let auth = engine.authorize(&token, "204800", amount, "transfer").expect("headroom is effectively unlimited");
         expected += amount;
         if i % 7 == 0 {
             engine.refund(&auth, amount);
@@ -363,7 +363,7 @@ fn stress_05_persisted_counters_match_memory_after_a_concurrent_run() {
     {
         let (shared, token) = (Arc::clone(&shared), token.clone());
         hammer(8, 400, move |_, _| {
-            let _ = shared.lock().unwrap().authorize(&token, "204800", 5, "simple_transfer");
+            let _ = shared.lock().unwrap().authorize(&token, "204800", 5, "transfer");
         });
     }
 
@@ -376,6 +376,6 @@ fn stress_05_persisted_counters_match_memory_after_a_concurrent_run() {
     assert_eq!(d.spent_total_nano, in_memory, "the persisted counter disagrees with memory — a restart would re-grant budget");
     assert_eq!(d.remaining_total_nano, Some(0));
     let (t2, _) = restarted.issue_session(&pid, 60, None).unwrap();
-    assert!(restarted.authorize(&t2, "204800", 1, "simple_transfer").is_err(), "and nothing is spendable after the restart");
+    assert!(restarted.authorize(&t2, "204800", 1, "transfer").is_err(), "and nothing is spendable after the restart");
     std::fs::remove_dir_all(&dir).ok();
 }

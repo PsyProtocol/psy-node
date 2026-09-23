@@ -29,12 +29,12 @@ fn engine() -> (PolicyEngine, String, String) {
 #[test]
 fn revoke_then_hammer_is_recorded_not_silent() {
     let (mut e, _pid, tok) = engine();
-    assert!(e.authorize(&tok, "1234", PSY, "simple_transfer").is_ok(), "baseline spend works");
+    assert!(e.authorize(&tok, "1234", PSY, "transfer").is_ok(), "baseline spend works");
 
     assert!(e.revoke(&tok), "owner revokes the session");
 
     for _ in 0..5 {
-        assert!(e.authorize(&tok, "1234", PSY, "simple_transfer").is_err());
+        assert!(e.authorize(&tok, "1234", PSY, "transfer").is_err());
     }
 
     let blocked = e.denied_log(50, None);
@@ -64,7 +64,7 @@ fn an_expired_session_records_its_refusal_and_says_what_to_do() {
     // an equality the gate deliberately does not treat as expired.
     let (tok, _) = e.issue_session(&pid, 0, None).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1_100));
-    assert!(e.authorize(&tok, "9999", 5 * PSY, "simple_transfer").is_err());
+    assert!(e.authorize(&tok, "9999", 5 * PSY, "transfer").is_err());
 
     let blocked = e.denied_log(10, None);
     assert_eq!(blocked.len(), 1);
@@ -76,7 +76,7 @@ fn an_expired_session_records_its_refusal_and_says_what_to_do() {
 #[test]
 fn a_garbage_token_is_recorded_against_no_policy() {
     let (mut e, _pid, _tok) = engine();
-    assert!(e.authorize("not-a-real-token", "1234", PSY, "simple_transfer").is_err());
+    assert!(e.authorize("not-a-real-token", "1234", PSY, "transfer").is_err());
     let blocked = e.denied_log(10, None);
     assert_eq!(blocked.len(), 1, "an unauthenticated attempt is still an attempt");
     assert_eq!(blocked[0].policy_id, "-", "it names no policy, and the reader surfaces it anyway");
@@ -86,7 +86,7 @@ fn a_garbage_token_is_recorded_against_no_policy() {
 fn a_valid_session_still_records_nothing_extra() {
     // Regression guard: the resolver must not record on the happy path.
     let (mut e, _pid, tok) = engine();
-    assert!(e.authorize(&tok, "1234", PSY, "simple_transfer").is_ok());
+    assert!(e.authorize(&tok, "1234", PSY, "transfer").is_ok());
     assert_eq!(e.denied_log(10, None).len(), 0);
 }
 
@@ -94,7 +94,7 @@ fn a_valid_session_still_records_nothing_extra() {
 fn an_oversized_batch_is_recorded_too() {
     let (mut e, _pid, tok) = engine();
     let legs: Vec<(&str, u64)> = (0..500).map(|_| ("1234", 1u64)).collect();
-    assert!(e.authorize_batch(&tok, &legs, "simple_transfer").is_err());
+    assert!(e.authorize_batch(&tok, &legs, "transfer").is_err());
     let blocked = e.denied_log(10, None);
     assert_eq!(blocked.len(), 1, "a refused batch shape is a refused attempt");
     assert!(blocked[0].reason.contains("batch"), "{}", blocked[0].reason);
@@ -105,7 +105,7 @@ fn a_revoked_token_on_the_BATCH_path_is_recorded() {
     let (mut e, _pid, tok) = engine();
     e.revoke(&tok);
     let legs: Vec<(&str, u64)> = vec![("1234", PSY)];
-    assert!(e.authorize_batch(&tok, &legs, "simple_transfer").is_err());
+    assert!(e.authorize_batch(&tok, &legs, "transfer").is_err());
     let blocked = e.denied_log(10, None);
     assert_eq!(blocked.len(), 1);
     assert_eq!(blocked[0].amount_nano, PSY, "the batch total is what it tried to move");

@@ -177,7 +177,7 @@ impl PsyWalletServer {
         description = "Owner: mint an AGENT ACCOUNT whose key is a Software-Defined Key circuit. The mandate — the \
                        (contract, method) calls it may make — is compiled into the identity, so a call outside it is \
                        UNPROVABLE rather than merely refused, and the constraint survives compromise of this server. \
-                       Capabilities are given as \"contract_id:method_name\" (e.g. [\"0:simple_transfer\"]). \
+                       Capabilities are given as \"contract_id:method_name\" (e.g. [\"0:transfer\"]). \
                        NOTE: calls_per_transaction is enforced by EQUALITY — a transaction must contain exactly that \
                        many contract calls — so it is a transaction shape, not a budget. The circuit cannot constrain \
                        amounts or recipients; those stay operational limits (see check_budget)."
@@ -265,10 +265,10 @@ impl PsyWalletServer {
             .map(|m| m.capabilities.iter().map(|c| c.method_name.clone()).collect())
             .unwrap_or_default();
         // x402_fetch is a policy-level name for "pay a 402 challenge"; on chain
-        // it IS a simple_transfer, so an identity whose circuit permits
-        // simple_transfer can pay challenges too — without this, minted agents
+        // it IS a transfer, so an identity whose circuit permits
+        // transfer can pay challenges too — without this, minted agents
         // silently lose x402 the moment the method names diverged.
-        if methods.iter().any(|m| m == "simple_transfer") {
+        if methods.iter().any(|m| m == "transfer") {
             methods.push("x402_fetch".into());
         }
         let recipient_count = a.allowed_recipients.as_ref().map(|r| r.len());

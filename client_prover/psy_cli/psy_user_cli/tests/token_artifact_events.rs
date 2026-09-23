@@ -253,8 +253,8 @@ fn deployed_token_artifact_exposes_claim_events_for_all_claim_paths() {
     let methods = read_methods(&token_artifact_path());
 
     assert!(
-        event_len(&methods, "simple_claim") >= 1,
-        "psy-genesis/token.json simple_claim must expose ClaimEvent"
+        event_len(&methods, "claim") >= 1,
+        "psy-genesis/token.json claim must expose ClaimEvent"
     );
     assert!(
         event_len(&methods, "private_claim") >= 1,
@@ -368,7 +368,7 @@ fn deployed_token_artifact_matches_genesis_for_claim_event_presence() {
     let genesis_token = genesis_methods("token");
     let genesis_usdt = genesis_methods("usdt_token");
 
-    for name in ["simple_claim", "private_claim", "claim_deposit"] {
+    for name in ["claim", "private_claim", "claim_deposit"] {
         assert_eq!(
             event_len(&deployed, name),
             event_len(&genesis_token, name),

@@ -10,7 +10,7 @@ struct Contract {
 }
 
 impl Contract {
-    pub fn simple_mint(amount: Felt) -> Felt {
+    pub fn mint(amount: Felt) -> Felt {
         let self_user_leaf: Hash = get_state_hash_at(get_user_id());
         let current_balance: Felt = self_user_leaf[0];
         let new_balance: Felt = current_balance + amount;

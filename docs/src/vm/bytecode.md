@@ -317,7 +317,7 @@ pub struct DPNFunctionCircuitDefinition {
 
 **`name: String`**
 - Human-readable function name for debugging and identification
-- Example: `"simple_mint"`, `"transfer"`, `"main"`
+- Example: `"mint"`, `"transfer"`, `"main"`
 
 **`method_id: u32`**  
 - Unique identifier for the function within the contract

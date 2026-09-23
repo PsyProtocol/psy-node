@@ -25,12 +25,12 @@ fn a_policy_created_for_one_wallet_refuses_another() {
     e.set_current_user(111);
     let pid = e.create_policy("agent", limits(), None, vec![]);
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
-    assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_ok(), "its own wallet spends fine");
+    assert!(e.authorize(&tok, "1", PSY, "transfer").is_ok(), "its own wallet spends fine");
 
     // The process swaps identity underneath the policy.
     e.set_current_user(222);
     let err = e
-        .authorize(&tok, "1", PSY, "simple_transfer")
+        .authorize(&tok, "1", PSY, "transfer")
         .expect_err("a policy must not govern a wallet it was not created for");
     let msg = err.to_string();
     assert!(msg.contains("Psy-00000111"), "it names the wallet the policy is for: {msg}");
@@ -47,7 +47,7 @@ fn the_refusal_is_recorded_as_a_blocked_attempt() {
     let pid = e.create_policy("agent", limits(), None, vec![]);
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     e.set_current_user(222);
-    let _ = e.authorize(&tok, "9", 7 * PSY, "simple_transfer");
+    let _ = e.authorize(&tok, "9", 7 * PSY, "transfer");
 
     let blocked = e.denied_log(10, None);
     assert_eq!(blocked.len(), 1, "the attempt is on the record");
@@ -63,9 +63,9 @@ fn returning_to_the_right_wallet_works_again() {
     let pid = e.create_policy("agent", limits(), None, vec![]);
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     e.set_current_user(222);
-    assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_err());
+    assert!(e.authorize(&tok, "1", PSY, "transfer").is_err());
     e.set_current_user(111);
-    assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_ok(), "back on its own wallet");
+    assert!(e.authorize(&tok, "1", PSY, "transfer").is_ok(), "back on its own wallet");
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn a_persisted_policy_names_the_wallet_mismatch_after_an_in_process_swap() {
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
 
     e.set_current_user(222);
-    let msg = e.authorize(&tok, "1", PSY, "simple_transfer")
+    let msg = e.authorize(&tok, "1", PSY, "transfer")
         .expect_err("a persisted policy must remain visible to the binding gate")
         .to_string();
     assert!(msg.contains("Psy-00000111"), "{msg}");
@@ -104,11 +104,11 @@ fn a_policy_written_before_this_binds_on_first_use_rather_than_locking_out() {
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
 
     e.set_current_user(555);
-    assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_ok(), "first use binds, does not refuse");
+    assert!(e.authorize(&tok, "1", PSY, "transfer").is_ok(), "first use binds, does not refuse");
 
     // ...and from then on it is checked like any other.
     e.set_current_user(666);
-    assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_err(), "bound on first use, enforced after");
+    assert!(e.authorize(&tok, "1", PSY, "transfer").is_err(), "bound on first use, enforced after");
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn with_no_wallet_loaded_the_gate_stays_out_of_the_way() {
     let mut e = PolicyEngine::new();
     let pid = e.create_policy("agent", limits(), None, vec![]);
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
-    assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_ok());
+    assert!(e.authorize(&tok, "1", PSY, "transfer").is_ok());
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn the_batch_path_is_gated_too() {
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     e.set_current_user(222);
     let legs: Vec<(&str, u64)> = vec![("1", PSY), ("2", PSY)];
-    let err = e.authorize_batch(&tok, &legs, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize_batch(&tok, &legs, "transfer").unwrap_err().to_string();
     assert!(err.contains("one wallet"), "{err}");
     assert_eq!(e.denied_log(10, None).len(), 1, "recorded on the batch path too");
 }
@@ -147,12 +147,12 @@ fn spent_counters_do_not_leak_between_wallets() {
         vec![],
     );
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
-    assert!(e.authorize(&tok, "1", 9 * PSY, "simple_transfer").is_ok());
+    assert!(e.authorize(&tok, "1", 9 * PSY, "transfer").is_ok());
 
     // Wallet B must not be able to spend against A's remaining 1 PSY, nor be
     // charged for A's 9.
     e.set_current_user(222);
-    assert!(e.authorize(&tok, "1", PSY, "simple_transfer").is_err(), "B cannot draw on A's policy at all");
+    assert!(e.authorize(&tok, "1", PSY, "transfer").is_err(), "B cannot draw on A's policy at all");
     let d = e.describe(&pid).unwrap();
     assert_eq!(d.spent_today_nano, 9 * PSY, "A's counter is untouched by B's attempt");
 }

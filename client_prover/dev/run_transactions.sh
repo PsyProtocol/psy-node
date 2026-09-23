@@ -33,14 +33,14 @@ echo "  USER0 minting 1000 tokens..."
 RUST_LOG="$LOG_LEVEL" "$BIN" call \
     -p "$USER0_KEY" \
     --contract-id "$CONTRACT_ID" \
-    --method-name simple_mint \
+    --method-name mint \
     --inputs "[1000000000000]" 2>&1 | tail -5
 
 echo "  USER1 minting 1000 tokens..."
 RUST_LOG="$LOG_LEVEL" "$BIN" call \
     -p "$USER1_KEY" \
     --contract-id "$CONTRACT_ID" \
-    --method-name simple_mint \
+    --method-name mint \
     --inputs "[1000000000000]" 2>&1 | tail -5
 
 echo "  Waiting for minting to be processed..."
@@ -53,7 +53,7 @@ echo "  USER0 transferring 250 tokens to USER1..."
 RUST_LOG="$LOG_LEVEL" "$BIN" call \
     -p "$USER0_KEY" \
     --contract-id "$CONTRACT_ID" \
-    --method-name simple_transfer \
+    --method-name transfer \
     --inputs "[1, 250000000000]" 2>&1 | tail -5
 
 echo "  Waiting for transfer to be processed..."
@@ -66,7 +66,7 @@ echo "  USER1 claiming transfer from USER0..."
 RUST_LOG="$LOG_LEVEL" "$BIN" call \
     -p "$USER1_KEY" \
     --contract-id "$CONTRACT_ID" \
-    --method-name simple_claim \
+    --method-name claim \
     --inputs "[0]" 2>&1 | tail -5
 
 echo ""
