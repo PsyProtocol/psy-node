@@ -240,10 +240,13 @@ impl QExecContext {
         if (op_type == DPNOpType::Add || op_type == DPNOpType::Sub) && b_type == DPNOpType::Constant && b.get_constant_value() == 0 {
             return a;
         }
+        // `x * 0` must fold to the constant 0, not to `x`: returning `a`
+        // here miscompiled symbolic products (the circuit kept the `x`
+        // node and downstream asserts recorded `x == 0`).
         if op_type == DPNOpType::Mul
             && (a_type == DPNOpType::Constant && a.get_constant_value() == 0 || b_type == DPNOpType::Constant && b.get_constant_value() == 0)
         {
-            return a;
+            return self.op_const(0);
         }
         let value = SymFeltRefValue {
             op_type,
@@ -524,14 +527,30 @@ impl DPNContext<SymFeltRef> for QExecContext {
     }
 
     fn op_mod(&mut self, a: SymFeltRef, b: SymFeltRef) -> SymFeltRef {
+        // A compile-time-constant dividend or divisor selects the Constant*
+        // variant (same pattern as op_exp / the shift ops); consumers read
+        // both operands as regular inputs. These variants were previously
+        // dead — no producer ever emitted them.
+        if b.get_op_type() == DPNOpType::Constant {
+            return self.op_std_binary_op(DPNOpType::ModConstantDivisor, a, b);
+        }
+        if a.get_op_type() == DPNOpType::Constant {
+            return self.op_std_binary_op(DPNOpType::ModConstantDividend, a, b);
+        }
         self.op_std_binary_op(DPNOpType::Mod, a, b)
     }
 
     fn op_exp(&mut self, a: SymFeltRef, b: SymFeltRef) -> SymFeltRef {
-        if a.get_op_type() == DPNOpType::ConstantU32 {
-            return self.op_std_binary_op_u32(DPNOpType::ExpConstantBase, a, b);
-        } else if b.get_op_type() == DPNOpType::ConstantU32 {
-            return self.op_std_binary_op_u32(DPNOpType::ExpConstantPower, a, b);
+        // A compile-time-constant base or exponent gets its own op so the
+        // circuit can skip the symbolic-exponent machinery. This is the felt
+        // lane: felt constants are `Constant` nodes, so the old routing
+        // (`== ConstantU32`, the u32 lane's marker) never fired and every
+        // `**` emitted a plain `Exp`. `op_std_binary_op_u32` is wrong here —
+        // it asserts both values fit u32, but felt constants range to p - 1.
+        if a.get_op_type() == DPNOpType::Constant {
+            return self.op_std_binary_op(DPNOpType::ExpConstantBase, a, b);
+        } else if b.get_op_type() == DPNOpType::Constant {
+            return self.op_std_binary_op(DPNOpType::ExpConstantPower, a, b);
         }
         self.op_std_binary_op(DPNOpType::Exp, a, b)
     }
@@ -592,15 +611,28 @@ impl DPNContext<SymFeltRef> for QExecContext {
         self.op_std_unary_op(DPNOpType::UnaryNegative, a)
     }
 
+    // A compile-time-constant right operand (the mask) selects the
+    // Constant* variant, same pattern as the shift ops below; consumers
+    // read both operands as regular inputs. and/or/xor are commutative, so
+    // a constant left operand needs no variant of its own.
     fn op_u32_xor(&mut self, a: SymFeltRef, b: SymFeltRef) -> SymFeltRef {
+        if b.get_op_type() == DPNOpType::ConstantU32 {
+            return self.op_std_binary_op_u32(DPNOpType::U32XorConstant, a, b);
+        }
         self.op_std_binary_op_u32(DPNOpType::U32Xor, a, b)
     }
 
     fn op_u32_or(&mut self, a: SymFeltRef, b: SymFeltRef) -> SymFeltRef {
+        if b.get_op_type() == DPNOpType::ConstantU32 {
+            return self.op_std_binary_op_u32(DPNOpType::U32OrConstant, a, b);
+        }
         self.op_std_binary_op_u32(DPNOpType::U32Or, a, b)
     }
 
     fn op_u32_and(&mut self, a: SymFeltRef, b: SymFeltRef) -> SymFeltRef {
+        if b.get_op_type() == DPNOpType::ConstantU32 {
+            return self.op_std_binary_op_u32(DPNOpType::U32AndConstant, a, b);
+        }
         self.op_std_binary_op_u32(DPNOpType::U32And, a, b)
     }
 

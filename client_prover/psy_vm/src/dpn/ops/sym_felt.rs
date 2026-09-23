@@ -254,7 +254,14 @@ impl Shr for SymFeltRef {
 impl Not for SymFeltRef {
     type Output = Self;
     fn not(self) -> Self {
-        SymFeltRef::new_constant((self.get_u64() == 0) as u64)
+        // Constant-fold `!x` with the SAME strict boolean semantics as the
+        // runtime BoolNot arms (semantics::resolve_bool_value): a non-0/1
+        // operand must abort compilation, not silently fold to a truthy
+        // negation - the bug class caught in core_eval/VmExecutor by the
+        // random differential.
+        let value = self.get_u64();
+        assert!(value <= 1, "Not: invalid bool value {value}");
+        SymFeltRef::new_constant(1 - value)
     }
 }
 impl Neg for SymFeltRef {
