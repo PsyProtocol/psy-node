@@ -390,8 +390,14 @@ mod tests {
         let primary = "http://127.0.0.1:1".parse::<url::Url>().unwrap();
         let other = "http://127.0.0.1:2".parse::<url::Url>().unwrap();
         let providers = vec![
-            RpcProviderConfig { name: "p0".into(), url: primary.to_string(), priority_weight: 10 },
-            RpcProviderConfig { name: "p1".into(), url: other.to_string(), priority_weight: 10 },
+            RpcProviderConfig {
+                name: "p0".into(), url: primary.to_string(), priority_weight: 10,
+                operator: String::new(), quota_group: String::new(),
+            },
+            RpcProviderConfig {
+                name: "p1".into(), url: other.to_string(), priority_weight: 10,
+                operator: String::new(), quota_group: String::new(),
+            },
         ];
         let client = L1Client { rpc: build_pool_client("test", &providers).unwrap(), primary };
         let mut calls = 0;

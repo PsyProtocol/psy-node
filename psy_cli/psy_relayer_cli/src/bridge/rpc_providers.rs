@@ -15,8 +15,20 @@ pub(crate) struct RpcProviderConfig {
     #[serde(default)]
     pub name: String,
     pub url: String,
-    #[serde(default = "default_priority_weight")]
+    #[serde(default = "default_priority_weight", alias = "weight")]
     pub priority_weight: i32,
+    /// Shared infrastructure failure domain (e.g. `alchemy`), spec §7.2.1.
+    /// Kept exactly as configured here (empty means unset): resolution
+    /// (explicit value, else inferred from the URL host) happens at
+    /// pool-build time in `l1_provider.rs`, not here.
+    #[serde(default)]
+    pub operator: String,
+    /// Shared rate-limit/credit domain (e.g. an account), spec §7.2.1. Kept
+    /// exactly as configured here (empty means unset); the pool's own
+    /// default (the provider name) applies via `.with_quota_group(..)` when
+    /// this is blank.
+    #[serde(default)]
+    pub quota_group: String,
 }
 
 /// `providers` wins when non-empty. Otherwise each URL becomes a weight-10
@@ -33,6 +45,8 @@ pub(crate) fn resolve_rpc_providers(
                 name: String::new(),
                 url: url.clone(),
                 priority_weight: DEFAULT_PRIORITY_WEIGHT,
+                operator: String::new(),
+                quota_group: String::new(),
             })
             .collect()
     } else {
@@ -106,7 +120,13 @@ mod tests {
     use super::*;
 
     fn p(name: &str, url: &str, weight: i32) -> RpcProviderConfig {
-        RpcProviderConfig { name: name.into(), url: url.into(), priority_weight: weight }
+        RpcProviderConfig {
+            name: name.into(),
+            url: url.into(),
+            priority_weight: weight,
+            operator: String::new(),
+            quota_group: String::new(),
+        }
     }
 
     #[test]
@@ -227,5 +247,42 @@ url = "https://i"
         };
         let resolved = finalize_rpc_providers("l1", &finalize).unwrap();
         assert_eq!(resolved, providers);
+    }
+
+    #[test]
+    fn weight_is_accepted_as_an_alias_of_priority_weight() {
+        #[derive(Deserialize)]
+        struct Wrapper { rpc_providers: Vec<RpcProviderConfig> }
+        let raw = r#"
+[[rpc_providers]]
+name = "alchemy"
+url = "https://a"
+weight = 11
+"#;
+        let wrapper: Wrapper = toml::from_str(raw).unwrap();
+        assert_eq!(wrapper.rpc_providers[0].priority_weight, 11);
+    }
+
+    #[test]
+    fn operator_and_quota_group_parse_raw_and_default_to_blank() {
+        // Kept exactly as configured (not trimmed/lowercased) at this layer:
+        // pool-build time (l1_provider.rs) owns normalization and defaults.
+        #[derive(Deserialize)]
+        struct Wrapper { rpc_providers: Vec<RpcProviderConfig> }
+        let raw = r#"
+[[rpc_providers]]
+name = "alchemy-jason"
+url = "https://a"
+operator = "  Alchemy  "
+quota_group = "  Alchemy-Jason  "
+
+[[rpc_providers]]
+url = "https://i"
+"#;
+        let wrapper: Wrapper = toml::from_str(raw).unwrap();
+        assert_eq!(wrapper.rpc_providers[0].operator, "  Alchemy  ");
+        assert_eq!(wrapper.rpc_providers[0].quota_group, "  Alchemy-Jason  ");
+        assert_eq!(wrapper.rpc_providers[1].operator, "");
+        assert_eq!(wrapper.rpc_providers[1].quota_group, "");
     }
 }

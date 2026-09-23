@@ -6109,6 +6109,8 @@ deployments_network = "localhostBase"
             name: "alchemy".into(),
             url: "https://a".into(),
             priority_weight: 10,
+            operator: String::new(),
+            quota_group: String::new(),
         };
         let providers_only = DaemonFinalizeConfig {
             l1_rpc_providers: vec![provider.clone()],

@@ -737,6 +737,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn infra_failure_prefers_a_different_quota_group_at_the_same_operator_over_the_same_quota_group() {
+        // No other operator is present, so infra tiering is exercised
+        // within one operator: step 2 (same operator, different quota
+        // group: a2) must still beat step 3 (same quota group: a1b), even
+        // though a1b's higher weight would win under plain Best.
+        let world = World::default();
+        let pool = pool_labeled(&[
+            ("a1", 12, "alchemy", "qa1"),
+            ("a1b", 11, "alchemy", "qa1"),
+            ("a2", 10, "alchemy", "qa2"),
+        ]);
+        world.set("a1", Mode::Fail(CallOutcome::Server));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
+        assert_eq!(world.calls(), vec!["a1", "a2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_failure_on_one_provider_leaves_a_same_operator_sibling_at_full_health() {
         let world = World::default();
         let pool = trio();

@@ -18,12 +18,16 @@ Per EVM chain in the multichain daemon config:
 
 ```toml
 [[chains.rpc_providers]]
-name = "alchemy"
+name = "alchemy-jason"
 url = "https://..."
-priority_weight = 11   # optional, default 10
+priority_weight = 11   # optional, default 10; `weight` is accepted as an alias
+operator = "alchemy"                   # optional
+quota_group = "alchemy-account-jason"  # optional
 ```
 
 - `rpc_providers` takes precedence when present on a chain.
+- `weight` is accepted as an alias of `priority_weight` (same field; set one
+  or the other, not both).
 - The existing `rpc_urls = [...]` stays valid: each URL becomes a provider
   with weight 10 and a generated name (`<chain>-rpc-<index>`), so declaration
   order is the priority.
@@ -42,7 +46,65 @@ finalize label for `finalize.l1_rpc_providers`).
 The single-chain `l1_rpc_url` / `l1_rpc_fallback_url` fields map to a
 two-provider list in that order: `l1_rpc_url` (or the default L1 RPC URL)
 first, then `l1_rpc_fallback_url` when present. Both become weight-10
-providers with generated names.
+providers with generated names, and their `operator` is still inferred from
+the URL (see below).
+
+### Operator and quota group
+
+Each provider entry may also set `operator` and `quota_group` (spec
+§5.1, §7.2.1):
+
+- `operator`: the shared infrastructure failure domain, e.g. `alchemy`,
+  `infura`, `nodereal`. A failure classified as an infrastructure failure
+  (Timeout, Transport, Server, InvalidResponse) fails over away from this
+  provider's whole operator first.
+- `quota_group`: the shared rate-limit/credit domain, e.g. an account or
+  subscription. A `RateLimited` failure fails over away from this provider's
+  quota group first.
+- Health, penalties, consecutive failures and quarantine stay per provider.
+  A failure never penalizes a sibling provider that shares the same operator
+  or quota group.
+
+**Defaults:**
+
+- `operator` default: inferred from the URL host when `operator` is blank
+  or omitted (this applies to every provider, including ones generated from
+  legacy `rpc_urls`/`l1_rpc_url`). The host is lowercased; a trailing `.` is
+  stripped. An IPv4 address, a bracketed IPv6 address, or a single-label
+  host (e.g. `localhost`) uses the whole host. Otherwise the second-to-last
+  dot-separated label is used, e.g. `eth-sepolia.g.alchemy.com` ->
+  `alchemy`, `sepolia.infura.io` -> `infura`. An unparseable URL infers
+  `"unknown"` (a real startup error is still raised separately for an
+  invalid provider URL). **Caveat:** the heuristic ignores multi-part public
+  suffixes such as `co.uk` — `foo.co.uk` infers `co`, not `foo`. Set
+  `operator` explicitly for hosts under such a suffix.
+- `quota_group` default: the exact provider name (case preserved), so
+  providers are quota-independent unless explicitly grouped.
+- An explicit `operator`/`quota_group` value is trimmed and lowercased; a
+  blank value is treated as unset and the default above applies.
+
+**Routing order** within one request (spec §5.1): every untried provider is
+given a tier — lower is tried first — and Best (tolerance, then weight, then
+config order) applies within the lowest available tier:
+
+- After an infrastructure failure (Timeout, Transport, Server,
+  InvalidResponse): a different operator first; then the same operator with
+  a different quota group; then the same quota group.
+- After a `RateLimited` failure: a different quota group at a different
+  operator first; then a different quota group at the same operator; then
+  the same quota group.
+- Application errors return immediately (no failover, no penalty) and mark
+  nothing.
+- On the first attempt every tier is equal, so plain Best applies.
+- No sibling penalties: a failure only ever affects the failed provider's
+  own health/quarantine state, never a same-operator or same-quota-group
+  sibling's.
+
+**Startup WARN:** once per pool (chain), if every provider ends up with the
+same operator (after defaults/inference), a WARN logs `label` and
+`operator`: `"all L1 RPC providers share one operator; no
+infrastructure-level backup"`. This also fires for a single-provider chain.
+Never includes a URL.
 
 ## v1 parameters
 
@@ -139,6 +201,33 @@ need that data and it never contains a URL.
   the default filler stack in `connect_l1_readonly` /
   `connect_l1_with_wallet`) queries whichever provider the pool currently
   routes the request to, since a fresh provider is built per RPC operation.
+
+### Provider certification probe
+
+Before a provider is configured (added to `rpc_providers`), certify it with
+`psy_cli/psy_relayer_cli/tools/probe_rpc_providers.py`.
+
+- **Input:** a JSON file listing candidate providers. Each entry gives
+  either `url_env` (the name of an environment variable holding the URL —
+  secrets stay in the environment or an `--env-file`, never in the input
+  file; the environment wins over `--env-file` on a name collision) or a
+  literal `url` for keyless endpoints.
+- **Flags:** `--chain` (which chain's candidates to probe), `--env-file`
+  (load URL env vars from a file instead of the shell environment),
+  `--confirmations` (how many blocks back to check for gaps; default `12`),
+  `--self-test` (run the tool's own unit tests).
+- **Verdicts**, per candidate:
+  - `CERTIFIED`: passed every check.
+  - `INCOMPLETE`: silent data loss — the provider returned fewer logs than
+    the chain's observed maximum over the probed range with no error
+    reported. This is the dangerous case: the provider looks healthy but
+    would quietly under-report events.
+  - `REJECTED`: a hard failure (unreachable, wrong chain ID, missing method
+    support, or another explicit error).
+- **Exit code 1** if any selected chain ends the probe with no `CERTIFIED`
+  candidate.
+- A provider must be `CERTIFIED` before it is added to `rpc_providers`/
+  `rpc_urls` for that chain.
 
 ## Safety boundaries (unchanged)
 
