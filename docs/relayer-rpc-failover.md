@@ -20,7 +20,7 @@ Per EVM chain in the multichain daemon config:
 [[chains.rpc_providers]]
 name = "alchemy-jason"
 url = "https://..."
-priority_weight = 11   # optional, default 10; `weight` is accepted as an alias
+weight = 11   # optional alias of priority_weight (default 10); set only one
 operator = "alchemy"                   # optional
 quota_group = "alchemy-account-jason"  # optional
 ```
@@ -29,8 +29,13 @@ quota_group = "alchemy-account-jason"  # optional
 - `weight` is accepted as an alias of `priority_weight` (same field; set one
   or the other, not both).
 - The existing `rpc_urls = [...]` stays valid: each URL becomes a provider
-  with weight 10 and a generated name (`<chain>-rpc-<index>`), so declaration
-  order is the priority.
+  with weight 10 and a generated name (`<chain>-rpc-<index>`). Declaration
+  order decides only the first attempt (every generated provider starts at
+  weight 10, so Best falls back to config order); after a failure within a
+  request, the next provider is chosen by failure domain (operator/quota
+  group; see Routing order below), not simply the next one in the list. See
+  "Upgrading existing configs" below for what this changes for an unchanged
+  legacy config.
 - Duplicate URLs are dropped, keeping the first occurrence. The check is a
   plain string comparison on the trimmed URL, not a normalized comparison.
 
@@ -85,6 +90,14 @@ Each provider entry may also set `operator` and `quota_group` (spec
   providers are quota-independent unless explicitly grouped.
 - An explicit `operator`/`quota_group` value is trimmed and lowercased; a
   blank value is treated as unset and the default above applies.
+- **Case trap:** the `quota_group` default preserves the provider name's
+  case exactly, but an *explicit* `quota_group` value is always lowercased.
+  Do not rely on one provider's default `quota_group` (its own name) to
+  group it with another provider — the strings will not match unless the
+  case happens to line up, and never will if any member's `quota_group` is
+  explicit (lowercased) while another's is the mixed-case default. To group
+  providers, set the same explicit `quota_group` value on every member of
+  the group.
 
 **Routing order** within one request (spec §5.1): every untried provider is
 given a tier — lower is tried first — and Best (tolerance, then weight, then
@@ -102,12 +115,49 @@ config order) applies within the lowest available tier:
 - No sibling penalties: a failure only ever affects the failed provider's
   own health/quarantine state, never a same-operator or same-quota-group
   sibling's.
+- A lower-tier provider beats a healthier or higher-weight provider in a
+  worse tier, as long as it is not quarantined (spec §5.1).
 
 **Startup WARN:** once per pool (chain), if every provider ends up with the
 same operator (after defaults/inference), a WARN logs `label` and
 `operator`: `"all L1 RPC providers share one operator; no
 infrastructure-level backup"`. This also fires for a single-provider chain.
 Never includes a URL.
+
+### Upgrading existing configs
+
+An unchanged legacy config (`rpc_urls`, or `l1_rpc_url`/`l1_rpc_fallback_url`)
+now gets an inferred `operator` per URL and a `quota_group` equal to each
+provider's generated name (see Defaults above). The failure-domain routing
+in Routing order applies to it exactly as it does to an explicit
+`rpc_providers` list, with these consequences:
+
+- **Failover order can change.** Example: `rpc_urls = [alchemy key A,
+  alchemy key B, infura]`. Before, a timeout/connection failure or a 5xx on
+  key A always went next to key B (plain declaration order), and so did a
+  rate limit on key A. Now: an infrastructure failure (Timeout, Transport,
+  Server, InvalidResponse) on key A goes to infura first, not key B —
+  infura is a different operator (`infura` vs the inferred `alchemy` shared
+  by keys A and B). A rate limit on key A also goes to infura first: a
+  different quota group at a different operator is preferred over a
+  different quota group at the same operator, and infura is both a
+  different quota group and a different operator from key A, while key B is
+  only a different quota group.
+- **Single-URL chains, and chains whose URLs all share one inferred
+  operator, log the same-operator WARN at every startup** (see Startup WARN
+  above) — this is expected, not a new problem, and fires even for a
+  single-provider chain.
+- **Two local nodes both reachable at `127.0.0.1`** (e.g. on different
+  ports) infer the same operator (the whole host, `127.0.0.1`), so a
+  failure on one is treated as same-operator for routing purposes even
+  though they are different processes.
+- **Legacy keys cannot override inference.** `rpc_urls`, `l1_rpc_url` and
+  `l1_rpc_fallback_url` have no field to set `operator`/`quota_group`
+  explicitly, so the inference heuristic always applies to them — including
+  its multi-part public-suffix caveat (e.g. a host under `co.uk`, see
+  Defaults above). Migrate the affected chain to `rpc_providers` with an
+  explicit `operator`/`quota_group` per entry to fix or opt out of
+  inference.
 
 ## v1 parameters
 
