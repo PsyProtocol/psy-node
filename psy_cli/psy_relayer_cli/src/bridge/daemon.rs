@@ -11,7 +11,7 @@ use std::{
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
 use anyhow::{Context, ensure};
@@ -845,7 +845,7 @@ async fn run_multichain(
         let state_manager = resolve_state_manager_address(&effective)?;
         chains.push(ChainRuntime {
             chain_index: chain.chain_index,
-            l1: L1Client::from_finalize_config(&effective.finalize),
+            l1: L1Client::from_finalize_config(&effective.finalize)?,
             config: effective,
             bridge,
             state_manager,
@@ -1034,7 +1034,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
     tracing::info!(prove_proxy = %proxy_url_at_startup, "system prove proxy configured; local Groth16 warmup skipped");
 
     let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
-    let l1 = L1Client::from_finalize_config(&config.finalize);
+    let l1 = L1Client::from_finalize_config(&config.finalize)?;
     let bridge_address = resolve_bridge_address(&config)?;
     let bridge = bridge_address
         .parse::<Address>()
@@ -1496,7 +1496,7 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
     let rpc_url = l1_rpc
         .parse()
         .with_context(|| format!("invalid L1 rpc url: {}", l1_rpc))?;
-    let provider = ProviderBuilder::new().wallet(wallet).connect_http(rpc_url);
+    let provider = crate::bridge::l1_provider::connect_l1_with_wallet(rpc_url, wallet)?;
     let proved_before = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
     let expected_proved_after = U256::from(target_deposit_count);
     ensure!(
@@ -1964,7 +1964,7 @@ pub(crate) fn resolve_bridge_address(config: &BridgeProposeDaemonConfig) -> anyh
         .ok_or_else(|| anyhow::anyhow!("Bridge not found in {}", path.display()))
 }
 
-fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Address> {
+pub(crate) fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Address> {
     if let Some(addr) = config.finalize.state_manager.as_deref() {
         return addr
             .parse::<Address>()
@@ -1978,11 +1978,12 @@ fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::
     crate::bridge::api_client::resolve_contract_address_from_deployments(network, "StateManager")
 }
 
-pub(crate) async fn run_l2_bridge_round_with_l1_provider(
+pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
     config: &BridgeProposeDaemonConfig,
     provider: &RpcProvider,
-    l1_provider: &impl Provider,
-    bridge: Address,
+    source_chain_index: u64,
+    proved_deposit_count: u32,
+    pending_deposit_count: u32,
     from_checkpoint: u64,
     to_checkpoint: u64,
     confirmation_lag_checkpoints: u64,
@@ -1997,17 +1998,6 @@ pub(crate) async fn run_l2_bridge_round_with_l1_provider(
         .unwrap_or_else(|| Path::new(DEFAULT_PROOF_DIR));
     let state_path = proof_dir.join("daemon_state.toml");
     propose_args.poll_timeout_secs = 0;
-    let deployments_network = config
-        .finalize
-        .deployments_network
-        .as_deref()
-        .unwrap_or(DEFAULT_DEPLOYMENTS_NETWORK);
-    let state_manager = resolve_state_manager_address(config)?;
-    let source_chain_index =
-        u64::from(crate::bridge::api_client::resolve_l1_chain_index(l1_provider, deployments_network, state_manager).await?);
-
-    let proved_deposit_count = fetch_proved_deposit_count(l1_provider, bridge).await?;
-    let pending_deposit_count = fetch_pending_deposit_count(l1_provider, bridge).await?;
     ensure!(
         pending_deposit_count >= proved_deposit_count,
         "pendingDepositCount is behind provedDepositCount: pending={} proved={}",
@@ -2108,8 +2098,6 @@ pub(crate) async fn run_l2_bridge_round_with_l1_provider(
             &config.services_url,
             source_chain_index,
             provider,
-            l1_provider,
-            bridge,
             &propose_args,
             from_checkpoint,
             to_checkpoint,
@@ -2562,8 +2550,6 @@ async fn build_l2_call_plan(
     services_url: &str,
     source_chain_index: u64,
     provider: &RpcProvider,
-    _l1_provider: &impl Provider,
-    _bridge: Address,
     propose_args: &ProposeWithdrawalsArgs,
     from_checkpoint: u64,
     to_checkpoint: u64,
@@ -2732,7 +2718,7 @@ async fn build_multichain_l2_plan(
     for chain in chains {
         let (proved, pending) = chain
             .l1
-            .with_retry("read_deposit_progress", 10, |url| {
+            .with_rpc_failover("read_deposit_progress", |url| {
                 let url = url.to_string();
                 async move {
                     let l1_provider = crate::bridge::l1_provider::connect_l1_readonly(
@@ -3242,12 +3228,12 @@ async fn chunk_deposit_batch_append_by_gas(
     chunks
 }
 
-async fn fetch_proved_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
+pub(crate) async fn fetch_proved_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
     let proved = crate::bridge::api_client::eth_call_u256(provider, bridge, provedDepositCountCall {}).await?;
     u32::try_from(proved).context("provedDepositCount exceeds u32")
 }
 
-async fn fetch_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
+pub(crate) async fn fetch_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
     let pending = crate::bridge::api_client::eth_call_u256(provider, bridge, pendingDepositCountCall {}).await?;
     u32::try_from(pending).context("pendingDepositCount exceeds u32")
 }
@@ -5383,7 +5369,7 @@ mod tests {
 
     // ── inner-loop catch-up break (run_l2_bridge_round mid-round stop) ────
 
-    /// Mirrors the mid-loop guard in `run_l2_bridge_round_with_l1_provider`:
+    /// Mirrors the mid-loop guard in `run_l2_bridge_round_with_l1_snapshot`:
     /// while still in a normal round (`is_catchup_batch == false`), re-check the
     /// window against the latest planning checkpoint and break once the gap
     /// has crossed into catch-up. Catch-up rounds never take this path

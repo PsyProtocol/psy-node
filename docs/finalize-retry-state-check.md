@@ -23,9 +23,10 @@ Every `finalize_bridge::run` attempt now checks StateManager before submitting:
   This patch does not infer historical success from height alone.
 - RPC and decoding errors also return without sending.
 
-The existing maximum of 10 attempts per configured RPC endpoint and backoff
-remain unchanged. Successful preflight reconciliation exits that retry loop
-normally, so the daemon can advance its existing finalization bookkeeping.
+The original patch retained ten operation attempts. This branch replaces that
+outer loop with [per-request primary/backup failover](relayer-rpc-failover.md).
+Successful preflight reconciliation still lets the daemon advance its existing
+finalization bookkeeping without another submission.
 
 Expected reconciliation log:
 

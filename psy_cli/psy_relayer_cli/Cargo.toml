@@ -57,3 +57,7 @@ psy_crypto = { workspace = true }
 psy_ups_circuit = { workspace = true }
 bincode = { workspace = true }
 futures = { workspace = true }
+tower = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

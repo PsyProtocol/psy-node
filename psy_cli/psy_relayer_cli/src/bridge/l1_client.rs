@@ -10,11 +10,13 @@ use crate::bridge::{
     constants::{DEFAULT_DEPLOYMENTS_NETWORK, DEFAULT_L1_RPC_URL},
     daemon::{
         fetch_l1_last_finalized_checkpoint, resolve_bridge_address, resolve_system_prove_proxy_url,
-        run_l2_bridge_round_with_l1_provider, submit_deposit_batch_appends_with_l1_rpc,
+        run_l2_bridge_round_with_l1_snapshot, submit_deposit_batch_appends_with_l1_rpc,
+        resolve_state_manager_address, fetch_proved_deposit_count, fetch_pending_deposit_count,
         BridgeProposeDaemonConfig, DaemonState, DaemonFinalizeConfig, L2RoundResult,
     },
     finalize_bridge::{self, FinalizeBridgeAggArgs},
     l1_provider::connect_l1_readonly,
+    l1_provider::{build_failover_client, with_l1_rpc_client},
     propose_withdrawals::{self, ProposeWithdrawalsArgs},
     prove_bridge::{self, BridgeProveResult},
 };
@@ -31,103 +33,49 @@ struct ProofMetadata {
     withdrawal_tree_root: String,
 }
 
-const L1_RETRY_MAX_ATTEMPTS: usize = 10;
-const L1_RETRY_BASE_DELAY_SECS: u64 = 1;
-const L1_RETRY_MAX_DELAY_SECS: u64 = 60;
-
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct L1Client {
-    rpc_urls: Vec<String>,
+    primary: url::Url,
+    rpc: alloy_rpc_client::RpcClient,
+}
+
+impl std::fmt::Debug for L1Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L1Client").finish_non_exhaustive()
+    }
 }
 
 impl L1Client {
-    pub fn from_finalize_config(finalize: &DaemonFinalizeConfig) -> Self {
+    pub fn from_finalize_config(finalize: &DaemonFinalizeConfig) -> anyhow::Result<Self> {
         let primary = finalize
             .l1_rpc_url
             .clone()
             .unwrap_or_else(|| DEFAULT_L1_RPC_URL.to_string());
-        let mut rpc_urls = vec![primary];
-        if let Some(fallback) = finalize.l1_rpc_fallback_url.as_deref() {
-            let fallback = fallback.trim();
-            if !fallback.is_empty() && !rpc_urls.iter().any(|url| url == fallback) {
-                rpc_urls.push(fallback.to_string());
-            }
-        }
-        Self { rpc_urls }
+        let primary: url::Url = primary.trim().parse().context("invalid primary L1 RPC URL")?;
+        let backup = finalize.l1_rpc_fallback_url.as_deref().map(str::trim)
+            .filter(|url| !url.is_empty()).map(str::parse).transpose()
+            .context("invalid backup L1 RPC URL")?;
+        Ok(Self { rpc: build_failover_client(primary.clone(), backup)?, primary })
     }
 
-    /// Retry an L1 operation across all configured RPC URLs.
-    /// `f` is called once per URL; the first success is returned.
-    pub async fn with_retry<T, F, Fut>(
+    /// Run business logic once. Individual RPC packets own failover internally.
+    pub async fn with_rpc_failover<T, F, Fut>(
         &self,
         label: &str,
-        max_attempts: usize,
         f: F,
     ) -> anyhow::Result<T>
     where
-        F: Fn(&str) -> Fut,
+        F: FnOnce(&str) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
-        if self.rpc_urls.is_empty() {
-            anyhow::bail!("no L1 RPC URLs configured for {label}");
-        }
-
-        let mut last_err = None;
-        for attempt in 1..=max_attempts.max(1) {
-            for (index, l1_rpc_url) in self.rpc_urls.iter().enumerate() {
-                match f(l1_rpc_url).await {
-                    Ok(value) => {
-                        if attempt > 1 || index > 0 {
-                            tracing::warn!(
-                                l1_rpc_url = %l1_rpc_url,
-                                label = %label,
-                                attempt,
-                                "L1 RPC retry/fallback succeeded"
-                            );
-                        }
-                        return Ok(value);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            l1_rpc_url = %l1_rpc_url,
-                            label = %label,
-                            attempt,
-                            error = %err,
-                            error_debug = ?err,
-                            "L1 RPC failed"
-                        );
-                        last_err = Some(err);
-                    }
-                }
-            }
-
-            if attempt < max_attempts {
-                let delay_secs = (L1_RETRY_BASE_DELAY_SECS << (attempt.saturating_sub(1).min(5)))
-                    .min(L1_RETRY_MAX_DELAY_SECS);
-                tracing::warn!(
-                    label = %label,
-                    attempt,
-                    next_attempt = attempt + 1,
-                    delay_secs,
-                    "all L1 RPC attempts failed; backing off before retry"
-                );
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-            }
-        }
-
-        match last_err {
-            Some(err) => anyhow::bail!(
-                "L1 operation '{}' failed after {} attempts: {}",
-                label,
-                max_attempts,
-                err
-            ),
-            None => anyhow::bail!("L1 operation '{}' failed after {} attempts", label, max_attempts),
-        }
+        with_l1_rpc_client(self.primary.clone(), self.rpc.clone(), async {
+            f(self.primary.as_str()).await
+        })
+            .await.with_context(|| format!("L1 operation {label} failed"))
     }
 
     pub async fn last_finalized_checkpoint(&self, state_manager: Address) -> anyhow::Result<u64> {
-        self.with_retry("last_finalized_checkpoint", L1_RETRY_MAX_ATTEMPTS, |url| {
+        self.with_rpc_failover("last_finalized_checkpoint", |url| {
             let owned = url.to_string();
             async move {
                 let l1_provider = connect_l1_readonly(
@@ -151,7 +99,7 @@ impl L1Client {
             .to(state_manager)
             .input(alloy_primitives::Bytes::from(selector).into());
 
-        self.with_retry("withdrawal_subtree_root", L1_RETRY_MAX_ATTEMPTS, |url| {
+        self.with_rpc_failover("withdrawal_subtree_root", |url| {
             let owned = url.to_string();
             let tx = tx.clone();
             async move {
@@ -166,7 +114,7 @@ impl L1Client {
         .await
     }
 
-    /// Run one L2 bridge round through a writable L1 provider.
+    /// Read an L1 snapshot with failover, then execute the L2 round exactly once.
     ///
     /// The returned result carries the sticky catch-up authority for the round:
     /// it starts from the pre-round window flag and latches true if the fresh
@@ -186,31 +134,29 @@ impl L1Client {
         propose_args: ProposeWithdrawalsArgs,
         max_checkpoint_batch: u64,
     ) -> anyhow::Result<L2RoundResult> {
-        self.with_retry("run_l2_bridge_round", L1_RETRY_MAX_ATTEMPTS, |url| {
+        let deployments_network = config.finalize.deployments_network.as_deref()
+            .unwrap_or(DEFAULT_DEPLOYMENTS_NETWORK);
+        let state_manager = resolve_state_manager_address(config)?;
+        let (source_chain_index, proved, pending) = self.with_rpc_failover("read_l1_round_snapshot", |url| {
             let owned = url.to_string();
-            let propose_args_clone = propose_args.clone();
             async move {
                 let l1_provider = connect_l1_readonly(
                     owned.parse()
                         .with_context(|| format!("invalid L1 rpc url: {owned}"))?,
                 )?;
-                run_l2_bridge_round_with_l1_provider(
-                    config,
-                    provider,
-                    &l1_provider,
-                    bridge,
-                    from_checkpoint,
-                    to_checkpoint,
-                    confirmation_lag_checkpoints,
-                    is_catchup_batch,
-                    state,
-                    propose_args_clone,
-                    max_checkpoint_batch,
-                )
-                .await
+                let chain_index = crate::bridge::api_client::resolve_l1_chain_index(
+                    &l1_provider, deployments_network, state_manager,
+                ).await?;
+                Ok((u64::from(chain_index),
+                    fetch_proved_deposit_count(&l1_provider, bridge).await?,
+                    fetch_pending_deposit_count(&l1_provider, bridge).await?))
             }
-        })
-        .await
+        }).await?;
+        run_l2_bridge_round_with_l1_snapshot(
+            config, provider, source_chain_index, proved, pending, from_checkpoint,
+            to_checkpoint, confirmation_lag_checkpoints, is_catchup_batch, state,
+            propose_args, max_checkpoint_batch,
+        ).await
     }
 
     pub async fn submit_deposit_batch_appends(
@@ -219,7 +165,7 @@ impl L1Client {
         target_deposit_count: u32,
     ) -> anyhow::Result<()> {
         let prove_proxy_url = resolve_system_prove_proxy_url(config)?;
-        self.with_retry("deposit_batch_appends", L1_RETRY_MAX_ATTEMPTS, |url| {
+        self.with_rpc_failover("deposit_batch_appends", |url| {
             let owned = url.to_string();
             let proxy = prove_proxy_url.clone();
             async move {
@@ -248,7 +194,7 @@ impl L1Client {
             "claiming current batch withdrawals on L1"
         );
         let prove_proxy_url = resolve_system_prove_proxy_url(config)?;
-        self.with_retry("claim_withdrawals", L1_RETRY_MAX_ATTEMPTS, |url| {
+        self.with_rpc_failover("claim_withdrawals", |url| {
             let owned = url.to_string();
             let bridge_addr = bridge_addr.clone();
             let proxy = prove_proxy_url.clone();
@@ -319,34 +265,20 @@ impl L1Client {
                 .with_context(|| format!("failed to remove stale proof {}", proof_path.display()))?;
         }
 
-        self.with_retry("bridge_proof_generation", L1_RETRY_MAX_ATTEMPTS, |url| {
-            let owned = url.to_string();
-            async move {
-                match load_or_build_proof_impl(
-                    &owned,
-                    config,
-                    proof_path,
-                    from_checkpoint,
-                    to_checkpoint,
-                    prove_proxy_url,
-                )
-                .await
-                {
-                    Ok(result) => Ok(result),
-                    Err(err) => {
-                        let _ = fs::remove_file(proof_path);
-                        Err(err)
-                    }
-                }
-            }
-        })
-        .await
+        // Proof generation does not use an L1 endpoint and must not alter its health.
+        let result = load_or_build_proof_impl(
+            config, proof_path, from_checkpoint, to_checkpoint, prove_proxy_url,
+        ).await;
+        if result.is_err() {
+            let _ = fs::remove_file(proof_path);
+        }
+        result
     }
 
     pub async fn finalize(&self, args: FinalizeBridgeAggArgs) -> anyhow::Result<()> {
         let label = format!("finalize/{}", args.to_checkpoint);
         let args_base = args.clone();
-        self.with_retry(&label, L1_RETRY_MAX_ATTEMPTS, |url| {
+        self.with_rpc_failover(&label, |url| {
             let owned = url.to_string();
             let mut cloned = args_base.clone();
             cloned.l1_rpc_url = owned;
@@ -362,7 +294,6 @@ fn load_proof_metadata(path: &Path) -> anyhow::Result<ProofMetadata> {
 }
 
 async fn load_or_build_proof_impl(
-    _l1_rpc_url: &str,
     config: &BridgeProposeDaemonConfig,
     proof_path: &Path,
     from_checkpoint: u64,
@@ -453,6 +384,25 @@ async fn claim_withdrawal_chunks(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn business_callback_runs_once_and_synchronous_setup_is_scoped() {
+        let primary = "http://127.0.0.1:1".parse::<url::Url>().unwrap();
+        let other = "http://127.0.0.1:2".parse::<url::Url>().unwrap();
+        let client = L1Client {
+            rpc: build_failover_client(primary.clone(), Some(other.clone())).unwrap(),
+            primary,
+        };
+        let mut calls = 0;
+        let result: anyhow::Result<()> = client.with_rpc_failover("test", |_| {
+            calls += 1;
+            // The closure itself, not only its returned future, needs the scope.
+            assert!(connect_l1_readonly(other).is_err());
+            async { anyhow::bail!("proof failure must not replay the business callback") }
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -560,4 +510,3 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 }
-
