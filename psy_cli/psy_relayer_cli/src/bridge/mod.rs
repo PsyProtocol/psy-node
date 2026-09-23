@@ -9,7 +9,7 @@ pub mod finalize_bridge;
 mod finalize_preflight;
 pub mod l1_provider;
 pub mod l1_client;
-mod rpc_failover;
+mod pool_transport;
 pub mod prove_proxy_client;
 pub mod l1_signer;
 pub mod propose_withdrawals;

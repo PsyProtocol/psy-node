@@ -1,59 +1,44 @@
-use std::{sync::Arc, task::{Context, Poll}, time::Duration};
+use std::{sync::Arc, task::{Context, Poll}};
 
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
 use alloy_transport::{BoxTransport, TransportError, TransportErrorKind, TransportFut};
-use tokio::{sync::Mutex, time::Instant};
+use psy_rpc_pool::{CallOutcome, PoolError, ProviderPool, RetryPolicy};
+use serde::de::Error as _;
 use tower::Service;
 
-const PRIMARY_COOLDOWN: Duration = Duration::from_secs(300);
-
-/// Shared by all providers for one chain, including receipt polling and signing fillers.
+/// alloy transport over a scored provider pool. Shared by all providers for
+/// one chain, including receipt polling and signing fillers.
 #[derive(Clone)]
-pub(super) struct RpcFailover {
-    primary: BoxTransport,
-    backup: Option<BoxTransport>,
-    primary_retry_at: Arc<Mutex<Option<Instant>>>,
+pub(super) struct PoolTransport {
+    pool: Arc<ProviderPool<BoxTransport>>,
 }
 
-impl RpcFailover {
-    pub(super) fn new(primary: BoxTransport, backup: Option<BoxTransport>) -> Self {
-        Self { primary, backup, primary_retry_at: Arc::new(Mutex::new(None)) }
+impl PoolTransport {
+    pub(super) fn new(pool: Arc<ProviderPool<BoxTransport>>) -> Self {
+        Self { pool }
     }
 
-    async fn request(mut self, request: RequestPacket) -> Result<ResponsePacket, TransportError> {
-        // Serialize requests per chain so clones cannot race the recovery probe.
-        // The lock covers one RPC, never a proof job or a receipt polling loop.
-        let mut retry_at = self.primary_retry_at.lock().await;
+    async fn request(self, request: RequestPacket) -> Result<ResponsePacket, TransportError> {
         let method = request.method_names().next().unwrap_or("empty").to_owned();
-        if retry_at.is_none_or(|deadline| Instant::now() >= deadline) {
-            let response = send(&mut self.primary, request.clone()).await;
-            match response {
-                Err(error) if self.backup.is_some() && is_endpoint_failure(&error) => {
-                    *retry_at = Some(Instant::now() + PRIMARY_COOLDOWN);
-                    // Do not log URLs, request params or provider messages containing API keys.
-                    tracing::warn!(%method, cooldown_secs = PRIMARY_COOLDOWN.as_secs(),
-                        "L1 primary RPC failed; using backup during cooldown");
-                    if !replay_safe(&request) {
-                        return Err(error);
-                    }
-                }
-                response => {
-                    if response.as_ref().is_ok_and(ResponsePacket::is_success)
-                        && retry_at.take().is_some()
-                    {
-                        tracing::info!(%method, "L1 primary RPC recovered");
-                    }
-                    return response;
-                }
-            }
-        }
-        let backup = self.backup.as_mut().expect("cooldown requires a backup");
-        // Exactly one backup attempt, with no sleep or outer operation replay.
-        send(backup, request).await
+        let policy = if replay_safe(&request) {
+            RetryPolicy::SafeAcrossEndpoints
+        } else {
+            RetryPolicy::NoRetry
+        };
+        self.pool
+            .call(policy, &method, classify, |mut transport| {
+                let request = request.clone();
+                async move { send(&mut transport, request).await }
+            })
+            .await
+            .map_err(|error| match error {
+                PoolError::Provider(error) => error,
+                PoolError::Timeout => TransportErrorKind::custom_str("L1 RPC attempt timed out"),
+            })
     }
 }
 
-impl Service<RequestPacket> for RpcFailover {
+impl Service<RequestPacket> for PoolTransport {
     type Response = ResponsePacket;
     type Error = TransportError;
     type Future = TransportFut<'static>;
@@ -75,7 +60,10 @@ async fn send(transport: &mut BoxTransport, request: RequestPacket) -> Result<Re
             response.response_ids().filter(|id| *id == req.id()).count() != 1
         })
     {
-        return Err(TransportErrorKind::custom_str("L1 RPC response IDs do not match request"));
+        return Err(TransportError::deser_err(
+            serde_json::Error::custom("L1 RPC response IDs do not match request"),
+            "",
+        ));
     }
     // HTTP 200 can still carry provider-side rate limits or quota errors.
     for error in response.iter_errors() {
@@ -85,6 +73,42 @@ async fn send(transport: &mut BoxTransport, request: RequestPacket) -> Result<Re
         }
     }
     Ok(response)
+}
+
+/// `send` already turns in-body provider faults into errors, so any response
+/// that reaches `Ok` came from a working provider.
+fn classify(result: &Result<ResponsePacket, TransportError>) -> CallOutcome {
+    match result {
+        Ok(_) => CallOutcome::Success,
+        Err(error) => outcome_of(error),
+    }
+}
+
+fn outcome_of(error: &TransportError) -> CallOutcome {
+    if !is_endpoint_failure(error) {
+        return CallOutcome::Application;
+    }
+    match error {
+        TransportError::Transport(TransportErrorKind::HttpError(http)) if http.status == 429 => {
+            CallOutcome::RateLimited
+        }
+        TransportError::Transport(TransportErrorKind::HttpError(_)) => CallOutcome::Server,
+        TransportError::Transport(_) => CallOutcome::Transport,
+        TransportError::NullResp | TransportError::DeserError { .. } => CallOutcome::InvalidResponse,
+        TransportError::ErrorResp(payload) => {
+            let message = payload.message.to_ascii_lowercase();
+            if payload.is_retry_err()
+                || message.contains("rate limit")
+                || message.contains("quota")
+                || message.contains("free tier")
+            {
+                CallOutcome::RateLimited
+            } else {
+                CallOutcome::Server
+            }
+        }
+        _ => CallOutcome::Server,
+    }
 }
 
 fn is_endpoint_failure(error: &TransportError) -> bool {
@@ -125,7 +149,10 @@ fn replay_safe(request: &RequestPacket) -> bool {
 mod tests {
     use super::*;
     use alloy_json_rpc::{Id, Request};
+    use psy_rpc_pool::{PoolConfig, ProviderSpec};
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     #[derive(Clone, Default)]
     struct Mock {
@@ -183,17 +210,35 @@ mod tests {
         Request::new(method, Id::Number(1), serde_json::json!([])).serialize().unwrap().into()
     }
 
-    fn fixture() -> (RpcFailover, Mock, Mock) {
-        let primary = Mock::default();
-        let backup = Mock::default();
-        (RpcFailover::new(BoxTransport::new(primary.clone()), Some(BoxTransport::new(backup.clone()))), primary, backup)
-    }
-
     fn batch(methods: &[&'static str]) -> RequestPacket {
         RequestPacket::Batch(methods.iter().enumerate().map(|(index, method)| {
             Request::new(*method, Id::Number(index as u64 + 1), serde_json::json!([]))
                 .serialize().unwrap()
         }).collect())
+    }
+
+    // `Mock` impl and `packet` / `batch` helpers: copy unchanged from the old
+    // rpc_failover.rs test module (struct Mock, impl Mock, impl Service for Mock,
+    // fn packet, fn batch).
+
+    fn fixture_n(n: usize) -> (PoolTransport, Vec<Mock>) {
+        let mocks: Vec<Mock> = (0..n).map(|_| Mock::default()).collect();
+        let specs = mocks
+            .iter()
+            .enumerate()
+            .map(|(i, mock)| ProviderSpec::new(format!("p{i}"), BoxTransport::new(mock.clone())))
+            .collect();
+        let pool = ProviderPool::new("test-chain", specs, PoolConfig::default()).unwrap();
+        (PoolTransport::new(Arc::new(pool)), mocks)
+    }
+
+    fn fixture() -> (PoolTransport, Mock, Mock) {
+        let (rpc, mocks) = fixture_n(2);
+        (rpc, mocks[0].clone(), mocks[1].clone())
+    }
+
+    fn health(rpc: &PoolTransport, index: usize) -> f64 {
+        rpc.pool.snapshot()[index].health
     }
 
     #[tokio::test(start_paused = true)]
@@ -205,47 +250,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn backup_is_sticky_until_exactly_five_minutes_then_primary_recovers() {
+    async fn penalized_primary_returns_after_penalty_decays_within_tolerance() {
         let (mut rpc, p, b) = fixture();
         p.fail(503);
         rpc.call(packet("eth_blockNumber")).await.unwrap();
         p.recover();
-        tokio::time::advance(Duration::from_secs(299)).await;
-        rpc.clone().call(packet("eth_call")).await.unwrap();
+        // HTTP 503 is Server (15); it decays to 2 after about 174.4s.
+        tokio::time::advance(Duration::from_secs(174)).await;
+        rpc.call(packet("eth_call")).await.unwrap();
         assert_eq!((p.count(), b.count()), (1, 2));
         tokio::time::advance(Duration::from_secs(1)).await;
         rpc.call(packet("eth_call")).await.unwrap();
-        rpc.call(packet("eth_call")).await.unwrap();
-        assert_eq!((p.count(), b.count()), (3, 2));
+        assert_eq!((p.count(), b.count()), (2, 2));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn failed_primary_probe_renews_cooldown() {
+    async fn all_providers_failing_returns_error_without_sleeping() {
         let (mut rpc, p, b) = fixture();
-        p.fail(429);
-        rpc.call(packet("eth_call")).await.unwrap();
-        tokio::time::advance(PRIMARY_COOLDOWN).await;
-        rpc.call(packet("eth_call")).await.unwrap();
-        tokio::time::advance(Duration::from_secs(299)).await;
-        rpc.call(packet("eth_call")).await.unwrap();
-        assert_eq!((p.count(), b.count()), (2, 3));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn backup_failure_returns_without_retry_or_cooldown_extension() {
-        let (mut rpc, p, b) = fixture();
-        p.fail(503); b.fail(503);
+        p.fail(503);
+        b.fail(503);
         let start = Instant::now();
         assert!(rpc.call(packet("eth_call")).await.is_err());
         assert_eq!((p.count(), b.count()), (1, 1));
         assert_eq!(Instant::now(), start);
-        tokio::time::advance(Duration::from_secs(299)).await;
-        assert!(rpc.call(packet("eth_call")).await.is_err());
-        assert_eq!((p.count(), b.count()), (1, 2));
-        tokio::time::advance(Duration::from_secs(1)).await;
-        p.recover();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_providers_fail_over_in_configured_order() {
+        let (mut rpc, mocks) = fixture_n(3);
+        mocks[0].fail(503);
+        mocks[1].fail(429);
         rpc.call(packet("eth_call")).await.unwrap();
-        assert_eq!((p.count(), b.count()), (2, 2));
+        assert_eq!(mocks.iter().map(Mock::count).collect::<Vec<_>>(), vec![1, 1, 1]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -259,30 +295,15 @@ mod tests {
         assert_eq!((p.count(), b.count(), p2.count(), b2.count()), (1, 2, 1, 0));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn concurrent_expiry_only_probes_failed_primary_once() {
-        let (mut rpc, p, b) = fixture();
-        p.fail(503);
-        rpc.call(packet("eth_call")).await.unwrap();
-        tokio::time::advance(PRIMARY_COOLDOWN).await;
-        let mut jobs = Vec::new();
-        for _ in 0..8 {
-            let mut client = rpc.clone();
-            jobs.push(tokio::spawn(async move { client.call(packet("eth_call")).await.unwrap(); }));
-        }
-        for job in jobs { job.await.unwrap(); }
-        assert_eq!((p.count(), b.count()), (2, 9));
-    }
-
     #[tokio::test]
-    async fn reverts_and_invalid_params_do_not_fail_over() {
+    async fn reverts_and_invalid_params_do_not_fail_over_or_penalize() {
         for code in [3, -32602] {
             let (mut rpc, p, b) = fixture();
             p.fail(code);
             let response = rpc.call(packet("eth_call")).await.unwrap();
             assert_eq!(response.first_error_code(), Some(code));
             assert_eq!((p.count(), b.count()), (1, 0));
-            assert!(rpc.primary_retry_at.lock().await.is_none());
+            assert_eq!(health(&rpc, 0), 100.0);
         }
     }
 
@@ -302,29 +323,15 @@ mod tests {
         p.fail(503);
         assert!(rpc.call(packet("eth_sendTransaction")).await.is_err());
         assert_eq!((p.count(), b.count()), (1, 0));
+        assert!(health(&rpc, 0) < 100.0);
     }
 
     #[tokio::test]
-    async fn no_backup_attempts_primary_once() {
-        let p = Mock::default(); p.fail(503);
-        let mut rpc = RpcFailover::new(BoxTransport::new(p.clone()), None);
+    async fn single_provider_attempts_once() {
+        let (mut rpc, mocks) = fixture_n(1);
+        mocks[0].fail(503);
         assert!(rpc.call(packet("eth_call")).await.is_err());
-        assert_eq!(p.count(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancellation_releases_lock_and_preserves_recorded_cooldown() {
-        let (mut rpc, p, b) = fixture();
-        p.fail(503);
-        *b.wait.lock().unwrap() = Some(Arc::new(tokio::sync::Notify::new()));
-        let mut clone = rpc.clone();
-        let job = tokio::spawn(async move { clone.call(packet("eth_call")).await });
-        while b.count() == 0 { tokio::task::yield_now().await; }
-        job.abort();
-        assert!(job.await.unwrap_err().is_cancelled());
-        *b.wait.lock().unwrap() = None;
-        rpc.call(packet("eth_call")).await.unwrap();
-        assert_eq!((p.count(), b.count()), (1, 2));
+        assert_eq!(mocks[0].count(), 1);
     }
 
     #[tokio::test]
@@ -339,17 +346,29 @@ mod tests {
     }
 
     #[test]
-    fn quota_and_business_errors_are_distinguished() {
-        for (code, message, expected) in [
-            (-32600, "Under the Free tier plan, up to a 10 block range", true),
-            (-32603, "upstream unavailable", true),
-            (-32000, "execution reverted", false),
-            (-32000, "nonce too low", false),
-            (-32000, "insufficient funds", false),
-            (-32602, "invalid params", false),
+    fn errors_are_classified_by_provider_fault() {
+        use CallOutcome::*;
+        let resp = |code: i64, message: &str| {
+            TransportError::ErrorResp(
+                serde_json::from_value(serde_json::json!({"code": code, "message": message})).unwrap(),
+            )
+        };
+        for (error, expected) in [
+            (resp(-32600, "Under the Free tier plan, up to a 10 block range"), RateLimited),
+            (resp(429, "rate limit"), RateLimited),
+            (resp(-32000, "monthly quota exceeded"), RateLimited),
+            (resp(-32603, "upstream unavailable"), Server),
+            (resp(-32000, "execution reverted"), Application),
+            (resp(3, "execution reverted"), Application),
+            (resp(-32000, "nonce too low"), Application),
+            (resp(-32000, "insufficient funds"), Application),
+            (resp(-32602, "invalid params"), Application),
+            (TransportErrorKind::http_error(429, "busy".into()), RateLimited),
+            (TransportErrorKind::http_error(503, "down".into()), Server),
+            (TransportErrorKind::custom_str("connection reset"), Transport),
+            (TransportError::NullResp, InvalidResponse),
         ] {
-            let payload = serde_json::from_value(serde_json::json!({"code":code,"message":message})).unwrap();
-            assert_eq!(is_endpoint_failure(&TransportError::ErrorResp(payload)), expected, "{message}");
+            assert_eq!(outcome_of(&error), expected, "{error:?}");
         }
     }
 
@@ -365,7 +384,7 @@ mod tests {
         let response = rpc.call(batch(&["eth_blockNumber", "eth_call"])).await.unwrap();
         assert_eq!(serde_json::to_value(response.as_batch().unwrap()).unwrap(), body);
         assert_eq!((p.count(), b.count()), (1, 0));
-        assert!(rpc.primary_retry_at.lock().await.is_none());
+        assert_eq!(health(&rpc, 0), 100.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -373,14 +392,13 @@ mod tests {
         let (mut rpc, p, b) = fixture();
         *p.response.lock().unwrap() = Some(serde_json::json!([
             {"jsonrpc":"2.0", "id":1, "result":"0x1"},
-            {"jsonrpc":"2.0", "id":2,
-                "error":{"code":429, "message":"quota exceeded"}}
+            {"jsonrpc":"2.0", "id":2, "error":{"code":429, "message":"quota exceeded"}}
         ]));
         let response = rpc.call(batch(&["eth_blockNumber", "eth_call"])).await.unwrap();
         assert!(response.is_success());
         assert_eq!((p.count(), b.count()), (1, 1));
         assert_eq!(*p.calls.lock().unwrap(), *b.calls.lock().unwrap());
-        assert_eq!(*rpc.primary_retry_at.lock().await, Some(Instant::now() + PRIMARY_COOLDOWN));
+        assert_eq!(health(&rpc, 0), 80.0);
     }
 
     #[tokio::test]
@@ -388,13 +406,11 @@ mod tests {
         let (mut rpc, p, b) = fixture();
         *p.response.lock().unwrap() = Some(serde_json::json!([
             {"jsonrpc":"2.0", "id":1, "result":"0x1234"},
-            {"jsonrpc":"2.0", "id":2,
-                "error":{"code":429, "message":"quota exceeded"}}
+            {"jsonrpc":"2.0", "id":2, "error":{"code":429, "message":"quota exceeded"}}
         ]));
         let error = rpc.call(batch(&["eth_sendTransaction", "eth_call"])).await.unwrap_err();
         assert!(matches!(error, TransportError::ErrorResp(ref payload) if payload.code == 429));
         assert_eq!((p.count(), b.count()), (1, 0));
-        assert!(rpc.primary_retry_at.lock().await.is_some());
     }
 
     #[tokio::test]
@@ -408,31 +424,20 @@ mod tests {
         let response = rpc.call(batch(&["eth_blockNumber", "eth_chainId"])).await.unwrap();
         assert_eq!(serde_json::to_value(response.as_batch().unwrap()).unwrap(), body);
         assert_eq!((p.count(), b.count()), (1, 0));
-        assert!(rpc.primary_retry_at.lock().await.is_none());
     }
 
-    #[tokio::test]
-    async fn malformed_missing_duplicate_and_wrong_ids_fail_over_only_once() {
+    #[tokio::test(start_paused = true)]
+    async fn malformed_missing_duplicate_and_wrong_ids_are_invalid_responses() {
         let cases = [
-            ("missing member", serde_json::json!([
-                {"jsonrpc":"2.0", "id":1, "result":"0x1"}
-            ])),
+            ("missing member", serde_json::json!([{"jsonrpc":"2.0", "id":1, "result":"0x1"}])),
             ("missing id", serde_json::json!([
-                {"jsonrpc":"2.0", "result":"0x1"},
-                {"jsonrpc":"2.0", "id":2, "result":"0x1"}
-            ])),
+                {"jsonrpc":"2.0", "result":"0x1"}, {"jsonrpc":"2.0", "id":2, "result":"0x1"}])),
             ("duplicate id", serde_json::json!([
-                {"jsonrpc":"2.0", "id":1, "result":"0x1"},
-                {"jsonrpc":"2.0", "id":1, "result":"0x1"}
-            ])),
+                {"jsonrpc":"2.0", "id":1, "result":"0x1"}, {"jsonrpc":"2.0", "id":1, "result":"0x1"}])),
             ("wrong id", serde_json::json!([
-                {"jsonrpc":"2.0", "id":1, "result":"0x1"},
-                {"jsonrpc":"2.0", "id":99, "result":"0x1"}
-            ])),
+                {"jsonrpc":"2.0", "id":1, "result":"0x1"}, {"jsonrpc":"2.0", "id":99, "result":"0x1"}])),
             ("malformed id", serde_json::json!([
-                {"jsonrpc":"2.0", "id":true, "result":"0x1"},
-                {"jsonrpc":"2.0", "id":2, "result":"0x1"}
-            ])),
+                {"jsonrpc":"2.0", "id":true, "result":"0x1"}, {"jsonrpc":"2.0", "id":2, "result":"0x1"}])),
         ];
         for (name, body) in cases {
             for backup_invalid in [false, true] {
@@ -441,69 +446,47 @@ mod tests {
                 if backup_invalid { *b.response.lock().unwrap() = Some(body.clone()); }
                 let result = rpc.call(batch(&["eth_blockNumber", "eth_call"])).await;
                 assert_eq!(result.is_err(), backup_invalid, "{name}");
-                if let Err(error) = result { assert!(is_endpoint_failure(&error), "{name}"); }
+                if let Err(error) = result {
+                    assert_eq!(outcome_of(&error), CallOutcome::InvalidResponse, "{name}");
+                }
                 assert_eq!((p.count(), b.count()), (1, 1), "{name}");
                 assert_eq!(*p.calls.lock().unwrap(), *b.calls.lock().unwrap(), "{name}");
-                assert!(rpc.primary_retry_at.lock().await.is_some(), "{name}");
+                assert_eq!(health(&rpc, 0), 70.0, "{name}");
             }
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancelling_initial_primary_or_recovery_probe_releases_lock_without_new_cooldown() {
-        for recovering in [false, true] {
-            let (mut rpc, p, b) = fixture();
-            if recovering {
-                p.fail(503);
-                rpc.call(packet("eth_call")).await.unwrap();
-                tokio::time::advance(PRIMARY_COOLDOWN).await;
-                p.recover();
-            }
-            let previous_deadline = *rpc.primary_retry_at.lock().await;
-            *p.wait.lock().unwrap() = Some(Arc::new(tokio::sync::Notify::new()));
-            let mut cancelled = rpc.call(packet("eth_call"));
-            assert!(futures::poll!(cancelled.as_mut()).is_pending());
-            assert_eq!((p.count(), b.count()), if recovering { (2, 1) } else { (1, 0) });
-            drop(cancelled);
-            assert_eq!(*rpc.primary_retry_at.try_lock().unwrap(), previous_deadline);
-            *p.wait.lock().unwrap() = None;
-            tokio::time::timeout(Duration::from_secs(1), rpc.call(packet("eth_call")))
-                .await.unwrap().unwrap();
-            assert_eq!((p.count(), b.count()), if recovering { (3, 1) } else { (2, 0) });
-            assert!(rpc.primary_retry_at.lock().await.is_none());
-        }
+    async fn cancelled_request_records_nothing() {
+        let (mut rpc, p, b) = fixture();
+        *p.wait.lock().unwrap() = Some(Arc::new(tokio::sync::Notify::new()));
+        let mut cancelled = rpc.call(packet("eth_call"));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        *p.wait.lock().unwrap() = None;
+        rpc.call(packet("eth_call")).await.unwrap();
+        assert_eq!((p.count(), b.count()), (2, 0));
+        assert_eq!(health(&rpc, 0), 100.0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancelling_mutex_waiter_sends_nothing_and_does_not_block_next_waiter() {
+    async fn in_flight_request_does_not_serialize_other_requests() {
         let (mut rpc, p, b) = fixture();
         let release = Arc::new(tokio::sync::Notify::new());
         *p.wait.lock().unwrap() = Some(release.clone());
-        let mut holder = rpc.call(packet("eth_blockNumber"));
-        assert!(futures::poll!(holder.as_mut()).is_pending());
-        let mut cancelled = rpc.call(packet("eth_getBalance"));
-        assert!(futures::poll!(cancelled.as_mut()).is_pending());
-        let mut next = rpc.call(packet("eth_chainId"));
-        assert!(futures::poll!(next.as_mut()).is_pending());
-        assert_eq!((p.count(), b.count()), (1, 0));
-        drop(cancelled);
-        assert!(rpc.primary_retry_at.try_lock().is_err());
+        let mut slow = rpc.call(packet("eth_blockNumber"));
+        assert!(futures::poll!(slow.as_mut()).is_pending());
         *p.wait.lock().unwrap() = None;
+        tokio::time::timeout(Duration::from_secs(1), rpc.call(packet("eth_chainId")))
+            .await.unwrap().unwrap();
         release.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), holder).await.unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(1), next).await.unwrap().unwrap();
-        let calls = p.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0]["method"], "eth_blockNumber");
-        assert_eq!(calls[1]["method"], "eth_chainId");
-        assert_eq!(b.count(), 0);
-        assert!(rpc.primary_retry_at.try_lock().unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(1), slow).await.unwrap().unwrap();
+        assert_eq!((p.count(), b.count()), (2, 0));
     }
 
     #[tokio::test(start_paused = true)]
     async fn lost_signed_send_response_then_already_known_does_not_resign_or_retry() {
         let (mut rpc, p, b) = fixture();
-        // Model a lost response after receipt of the packet, not on-chain execution.
         p.fail(503);
         let body = serde_json::json!({"jsonrpc":"2.0", "id":123,
             "error":{"code":-32000, "message":"already known", "data":null}});
@@ -518,6 +501,6 @@ mod tests {
         assert_eq!(*p.calls.lock().unwrap(), vec![expected.clone()]);
         assert_eq!(*b.calls.lock().unwrap(), vec![expected]);
         assert_eq!(Instant::now(), start);
-        assert_eq!(*rpc.primary_retry_at.lock().await, Some(start + PRIMARY_COOLDOWN));
+        assert_eq!(health(&rpc, 1), 100.0);
     }
 }

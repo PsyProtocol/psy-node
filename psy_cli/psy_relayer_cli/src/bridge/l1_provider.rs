@@ -9,7 +9,7 @@ use alloy_transport_http::Http;
 use anyhow::{Context, Result};
 use url::Url;
 
-use super::rpc_failover::RpcFailover;
+use super::pool_transport::PoolTransport;
 
 tokio::task_local! {
     // Scope provider construction to a chain without a global URL/state registry.
@@ -28,17 +28,22 @@ pub(super) async fn with_l1_rpc_client<T>(
 pub(super) fn build_failover_client(primary: Url, backup: Option<Url>) -> Result<RpcClient> {
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(L1_HTTP_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(POOL_HTTP_TIMEOUT_SECS))
         .build()
         .context("failed to build L1 failover HTTP client")?;
-    let backup = backup.filter(|url| url != &primary)
-        .map(|url| BoxTransport::new(Http::with_client(http.clone(), url)));
-    let primary = Http::with_client(http, primary);
-    let is_local = primary.guess_local();
-    Ok(ClientBuilder::default().transport(
-        RpcFailover::new(BoxTransport::new(primary), backup), is_local,
-    ))
+    let is_local = Http::with_client(http.clone(), primary.clone()).guess_local();
+    let mut specs = vec![psy_rpc_pool::ProviderSpec::new("primary",
+        BoxTransport::new(Http::with_client(http.clone(), primary.clone())))];
+    if let Some(backup) = backup.filter(|url| url != &primary) {
+        specs.push(psy_rpc_pool::ProviderSpec::new("backup", BoxTransport::new(Http::with_client(http, backup))));
+    }
+    let pool = psy_rpc_pool::ProviderPool::new("l1", specs, psy_rpc_pool::PoolConfig::default())
+        .context("invalid L1 RPC provider pool")?;
+    Ok(ClientBuilder::default().transport(PoolTransport::new(std::sync::Arc::new(pool)), is_local))
 }
+
+/// Above the pool's 15s attempt timeout, so the pool classifies hangs as Timeout.
+const POOL_HTTP_TIMEOUT_SECS: u64 = 20;
 
 const L1_HTTP_TIMEOUT_SECS: u64 = 15;
 

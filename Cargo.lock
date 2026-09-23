@@ -7607,6 +7607,7 @@ dependencies = [
  "psy_plonky2_common_circuits",
  "psy_prover",
  "psy_provider",
+ "psy_rpc_pool",
  "psy_ups_circuit",
  "psy_vm",
  "reqwest 0.12.28",
