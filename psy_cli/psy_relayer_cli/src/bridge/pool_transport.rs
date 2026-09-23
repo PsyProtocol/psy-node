@@ -32,7 +32,7 @@ impl PoolTransport {
             })
             .await
             .map_err(|error| match error {
-                PoolError::Provider(error) => error,
+                PoolError::Provider(error) => redact(error),
                 PoolError::Timeout => TransportErrorKind::custom_str("L1 RPC attempt timed out"),
             })
     }
@@ -108,6 +108,25 @@ fn outcome_of(error: &TransportError) -> CallOutcome {
             }
         }
         _ => CallOutcome::Server,
+    }
+}
+
+/// Strips provider URLs and response bodies from an error before it can reach
+/// a caller or a log line. Business errors (`ErrorResp`, including revert
+/// data) are left untouched: callers need that data, and it never contains a
+/// URL. Everything else may carry a URL (API keys can live in the query
+/// string) or an upstream response body, so those are redacted in place.
+fn redact(error: TransportError) -> TransportError {
+    match error {
+        TransportError::Transport(TransportErrorKind::Custom(err)) => match err.downcast::<reqwest::Error>() {
+            Ok(reqwest_error) => TransportErrorKind::custom((*reqwest_error).without_url()),
+            Err(err) => TransportError::Transport(TransportErrorKind::Custom(err)),
+        },
+        TransportError::Transport(TransportErrorKind::HttpError(http)) => {
+            TransportErrorKind::http_error(http.status, String::new())
+        }
+        TransportError::DeserError { err, .. } => TransportError::DeserError { err, text: String::new() },
+        other => other,
     }
 }
 
@@ -216,10 +235,6 @@ mod tests {
                 .serialize().unwrap()
         }).collect())
     }
-
-    // `Mock` impl and `packet` / `batch` helpers: copy unchanged from the old
-    // rpc_failover.rs test module (struct Mock, impl Mock, impl Service for Mock,
-    // fn packet, fn batch).
 
     fn fixture_n(n: usize) -> (PoolTransport, Vec<Mock>) {
         let mocks: Vec<Mock> = (0..n).map(|_| Mock::default()).collect();
@@ -363,12 +378,22 @@ mod tests {
             (resp(-32000, "nonce too low"), Application),
             (resp(-32000, "insufficient funds"), Application),
             (resp(-32602, "invalid params"), Application),
+            (resp(-32601, "method not found"), Server),
+            (resp(-32600, "method not enabled on this endpoint"), Server),
+            (resp(-32600, "block range too large"), Server),
+            (resp(-32000, "already known"), Application),
             (TransportErrorKind::http_error(429, "busy".into()), RateLimited),
             (TransportErrorKind::http_error(503, "down".into()), Server),
             (TransportErrorKind::custom_str("connection reset"), Transport),
             (TransportError::NullResp, InvalidResponse),
         ] {
-            assert_eq!(outcome_of(&error), expected, "{error:?}");
+            let outcome = outcome_of(&error);
+            assert_eq!(outcome, expected, "{error:?}");
+        }
+        // "method not enabled" and "block range too large" are provider faults,
+        // not business errors: they must fail over, never reach the caller as Application.
+        for message in ["method not enabled on this endpoint", "block range too large"] {
+            assert!(outcome_of(&resp(-32600, message)).is_failure(), "{message}");
         }
     }
 
@@ -401,6 +426,21 @@ mod tests {
         assert_eq!(health(&rpc, 0), 80.0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn mixed_revert_and_quota_batch_fails_over_once_and_penalizes_rate_limited() {
+        let (mut rpc, p, b) = fixture();
+        *p.response.lock().unwrap() = Some(serde_json::json!([
+            {"jsonrpc":"2.0", "id":1,
+                "error":{"code":3, "message":"execution reverted", "data":"0xdeadbeef"}},
+            {"jsonrpc":"2.0", "id":2, "error":{"code":429, "message":"quota exceeded"}}
+        ]));
+        let response = rpc.call(batch(&["eth_call", "eth_call"])).await.unwrap();
+        assert!(response.is_success());
+        assert_eq!((p.count(), b.count()), (1, 1));
+        assert_eq!(*p.calls.lock().unwrap(), *b.calls.lock().unwrap());
+        assert_eq!(health(&rpc, 0), 80.0);
+    }
+
     #[tokio::test]
     async fn mixed_batch_with_node_signed_send_is_not_replayed_after_partial_success() {
         let (mut rpc, p, b) = fixture();
@@ -411,6 +451,7 @@ mod tests {
         let error = rpc.call(batch(&["eth_sendTransaction", "eth_call"])).await.unwrap_err();
         assert!(matches!(error, TransportError::ErrorResp(ref payload) if payload.code == 429));
         assert_eq!((p.count(), b.count()), (1, 0));
+        assert!(health(&rpc, 0) < 100.0);
     }
 
     #[tokio::test]
@@ -424,6 +465,7 @@ mod tests {
         let response = rpc.call(batch(&["eth_blockNumber", "eth_chainId"])).await.unwrap();
         assert_eq!(serde_json::to_value(response.as_batch().unwrap()).unwrap(), body);
         assert_eq!((p.count(), b.count()), (1, 0));
+        assert_eq!(health(&rpc, 0), 100.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -485,6 +527,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cancelling_the_backup_attempt_leaves_its_health_untouched() {
+        let (mut rpc, p, b) = fixture();
+        // Primary fails and is recorded before failover ever reaches the backup.
+        p.fail(503);
+        *b.wait.lock().unwrap() = Some(Arc::new(tokio::sync::Notify::new()));
+        let mut cancelled = rpc.call(packet("eth_call"));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        assert_eq!((p.count(), b.count()), (1, 1));
+        drop(cancelled);
+        // The primary's failure was recorded before the backup attempt began.
+        assert!(health(&rpc, 0) < 100.0);
+        // The cancelled backup attempt never reached record(), so its health
+        // and consecutive-failure count are untouched.
+        assert_eq!(health(&rpc, 1), 100.0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn lost_signed_send_response_then_already_known_does_not_resign_or_retry() {
         let (mut rpc, p, b) = fixture();
         p.fail(503);
@@ -502,5 +561,64 @@ mod tests {
         assert_eq!(*b.calls.lock().unwrap(), vec![expected]);
         assert_eq!(Instant::now(), start);
         assert_eq!(health(&rpc, 1), 100.0);
+    }
+
+    #[tokio::test]
+    async fn redact_strips_urls_from_custom_reqwest_errors() {
+        // A `reqwest::Error` whose `Display` embeds the request URL, the way a
+        // connection failure does. The URL may embed an API key.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let reqwest_error = reqwest::Client::new()
+            .get(format!("http://{addr}/SECRETKEY"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(format!("{reqwest_error}").contains("SECRETKEY"), "test setup must embed the URL");
+        let redacted = redact(TransportErrorKind::custom(reqwest_error));
+        assert!(!redacted.to_string().contains("SECRETKEY"));
+    }
+
+    #[test]
+    fn redact_clears_http_error_body_but_keeps_status() {
+        let error = TransportErrorKind::http_error(503, "provider secret response body".into());
+        match redact(error) {
+            TransportError::Transport(TransportErrorKind::HttpError(http)) => {
+                assert_eq!(http.status, 503);
+                assert_eq!(http.body, "");
+            }
+            other => panic!("expected HttpError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redact_clears_deser_error_text_but_keeps_err() {
+        let parse_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let original_message = parse_err.to_string();
+        let error = TransportError::DeserError { err: parse_err, text: "provider secret response body".into() };
+        match redact(error) {
+            TransportError::DeserError { err, text } => {
+                assert_eq!(text, "");
+                assert_eq!(err.to_string(), original_message);
+            }
+            other => panic!("expected DeserError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redact_leaves_error_resp_untouched() {
+        let payload: alloy_json_rpc::ErrorPayload = serde_json::from_value(
+            serde_json::json!({"code": 3, "message": "execution reverted", "data": "0xdeadbeef"}),
+        ).unwrap();
+        let error = TransportError::ErrorResp(payload);
+        match redact(error) {
+            TransportError::ErrorResp(got) => {
+                assert_eq!(got.code, 3);
+                assert_eq!(got.message, "execution reverted");
+                assert_eq!(got.data.map(|d| d.to_string()), Some("\"0xdeadbeef\"".to_string()));
+            }
+            other => panic!("expected ErrorResp, got {other:?}"),
+        }
     }
 }
