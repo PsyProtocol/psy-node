@@ -153,6 +153,11 @@ impl L1Config {
     ) -> anyhow::Result<BridgeProposeDaemonConfig> {
         let mut config = base.clone();
         config.chains.clear();
+        // Raw, user-supplied fields: warn here (not inside `resolve_rpc_providers`,
+        // which downstream callers also invoke with already-derived config).
+        crate::bridge::rpc_providers::warn_if_rpc_urls_ignored(
+            &self.network_id, &self.rpc_providers, &self.rpc_urls,
+        );
         let providers = crate::bridge::rpc_providers::resolve_rpc_providers(
             &self.network_id, &self.rpc_providers, &self.rpc_urls,
         )?;
