@@ -23,6 +23,17 @@ impl CallOutcome {
         !matches!(self, Self::Success | Self::Application)
     }
 
+    /// Rate-limit failure: marks the quota group as failed (spec §5.1).
+    pub fn is_quota_failure(self) -> bool {
+        matches!(self, Self::RateLimited)
+    }
+
+    /// Infrastructure failure: marks the operator (and its quota group) as
+    /// failed (spec §5.1).
+    pub fn is_infra_failure(self) -> bool {
+        matches!(self, Self::Timeout | Self::Transport | Self::Server | Self::InvalidResponse)
+    }
+
     fn penalty(self) -> f64 {
         match self {
             Self::Success | Self::Application => 0.0,
@@ -154,6 +165,33 @@ impl Health {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_rate_limited_is_a_quota_failure() {
+        assert!(CallOutcome::RateLimited.is_quota_failure());
+        for other in [
+            CallOutcome::Success,
+            CallOutcome::Application,
+            CallOutcome::Timeout,
+            CallOutcome::Transport,
+            CallOutcome::Server,
+            CallOutcome::InvalidResponse,
+        ] {
+            assert!(!other.is_quota_failure(), "{other:?} must not be a quota failure");
+        }
+    }
+
+    #[test]
+    fn timeout_transport_server_and_invalid_response_are_infra_failures() {
+        for infra in
+            [CallOutcome::Timeout, CallOutcome::Transport, CallOutcome::Server, CallOutcome::InvalidResponse]
+        {
+            assert!(infra.is_infra_failure(), "{infra:?} must be an infra failure");
+        }
+        for other in [CallOutcome::Success, CallOutcome::Application, CallOutcome::RateLimited] {
+            assert!(!other.is_infra_failure(), "{other:?} must not be an infra failure");
+        }
+    }
 
     fn policy() -> HealthPolicy {
         HealthPolicy {

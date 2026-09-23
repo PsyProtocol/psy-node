@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     future::Future,
     sync::{Mutex, MutexGuard, PoisonError},
     time::Duration,
@@ -17,18 +18,59 @@ pub struct ProviderSpec<C> {
     /// Log label. Must not be a URL: provider URLs can embed API keys.
     pub name: String,
     pub priority_weight: i32,
+    /// Shared infrastructure failure domain, e.g. `alchemy`, `infura`.
+    /// Defaults to `name` (unnormalized); an explicit value is trimmed and
+    /// lowercased. Defaults and explicit values share one namespace, so an
+    /// unlabeled provider can coincide with another provider's explicit
+    /// label if their names collide after normalization. See spec §5.1.
+    pub operator: String,
+    /// Shared rate-limit/credit domain, e.g. an account or subscription.
+    /// Same default and namespace rules as `operator`. See spec §5.1.
+    pub quota_group: String,
     pub client: C,
 }
 
 impl<C> ProviderSpec<C> {
     pub fn new(name: impl Into<String>, client: C) -> Self {
-        Self { name: name.into(), priority_weight: DEFAULT_PRIORITY_WEIGHT, client }
+        let name = name.into();
+        Self {
+            operator: name.clone(),
+            quota_group: name.clone(),
+            name,
+            priority_weight: DEFAULT_PRIORITY_WEIGHT,
+            client,
+        }
     }
 
     pub fn with_priority_weight(mut self, priority_weight: i32) -> Self {
         self.priority_weight = priority_weight;
         self
     }
+
+    /// Trimmed and lowercased; a blank value keeps the name-derived default.
+    pub fn with_operator(mut self, operator: impl Into<String>) -> Self {
+        let normalized = normalize_label(operator.into());
+        if let Some(operator) = normalized {
+            self.operator = operator;
+        }
+        self
+    }
+
+    /// Trimmed and lowercased; a blank value keeps the name-derived default.
+    pub fn with_quota_group(mut self, quota_group: impl Into<String>) -> Self {
+        let normalized = normalize_label(quota_group.into());
+        if let Some(quota_group) = normalized {
+            self.quota_group = quota_group;
+        }
+        self
+    }
+}
+
+/// Trims and lowercases a label; returns `None` for a blank value so the
+/// caller can keep its existing default.
+fn normalize_label(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_lowercase())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +149,8 @@ impl PoolConfig {
 pub struct ProviderSnapshot {
     pub name: String,
     pub priority_weight: i32,
+    pub operator: String,
+    pub quota_group: String,
     pub health: f64,
     pub quarantined: bool,
     pub consecutive_failures: u32,
@@ -173,6 +217,8 @@ impl<C: Clone> ProviderPool<C> {
             .map(|(provider, h)| ProviderSnapshot {
                 name: provider.name.clone(),
                 priority_weight: provider.priority_weight,
+                operator: provider.operator.clone(),
+                quota_group: provider.quota_group.clone(),
                 health: h.health(now, self.config.half_life),
                 quarantined: h.quarantined(now),
                 consecutive_failures: h.consecutive_failures(),
@@ -199,9 +245,16 @@ impl<C: Clone> ProviderPool<C> {
         let deadline = Instant::now() + self.config.total_timeout;
         let max_attempts = self.config.max_attempts.clamp(1, self.providers.len());
         let mut tried = vec![false; self.providers.len()];
+        // Per-request failure domains (spec §5.1): which operators had an
+        // infrastructure failure, which quota groups are rate-limited or
+        // behind an infra failure, and which operators were touched by any
+        // failure at all (infra or quota).
+        let mut infra_failed_operators = HashSet::new();
+        let mut failed_quota_groups = HashSet::new();
+        let mut touched_operators = HashSet::new();
         let mut last = None;
         for attempt in 1..=max_attempts {
-            let mut guard = self.begin(&tried);
+            let mut guard = self.begin(&tried, &infra_failed_operators, &failed_quota_groups, &touched_operators);
             let index = guard.index;
             tried[index] = true;
             let started = Instant::now();
@@ -218,10 +271,21 @@ impl<C: Clone> ProviderPool<C> {
             if !outcome.is_failure() {
                 return result;
             }
+            let provider = &self.providers[index];
+            if outcome.is_infra_failure() {
+                infra_failed_operators.insert(provider.operator.clone());
+                touched_operators.insert(provider.operator.clone());
+                failed_quota_groups.insert(provider.quota_group.clone());
+            } else if outcome.is_quota_failure() {
+                failed_quota_groups.insert(provider.quota_group.clone());
+                touched_operators.insert(provider.operator.clone());
+            }
             let stop = policy == RetryPolicy::NoRetry || attempt == max_attempts || now >= deadline;
             tracing::warn!(
                 pool = %self.label,
-                provider = %self.providers[index].name,
+                provider = %provider.name,
+                operator = %provider.operator,
+                quota_group = %provider.quota_group,
                 ?outcome,
                 method,
                 failover = !stop,
@@ -235,18 +299,32 @@ impl<C: Clone> ProviderPool<C> {
         last.expect("at least one attempt runs")
     }
 
-    fn begin(&self, tried: &[bool]) -> AttemptGuard<'_, C> {
+    fn begin(
+        &self,
+        tried: &[bool],
+        infra_failed_operators: &HashSet<String>,
+        failed_quota_groups: &HashSet<String>,
+        touched_operators: &HashSet<String>,
+    ) -> AttemptGuard<'_, C> {
         let now = Instant::now();
         let mut health = self.lock();
         let candidates: Vec<Candidate> = health
             .iter()
             .enumerate()
             .filter(|(index, _)| !tried[*index])
-            .map(|(index, h)| Candidate {
-                index,
-                health: h.health(now, self.config.half_life),
-                available: h.available(now),
-                priority_weight: self.providers[index].priority_weight,
+            .map(|(index, h)| {
+                let provider = &self.providers[index];
+                Candidate {
+                    index,
+                    health: h.health(now, self.config.half_life),
+                    available: h.available(now),
+                    priority_weight: provider.priority_weight,
+                    tier: (
+                        infra_failed_operators.contains(&provider.operator),
+                        failed_quota_groups.contains(&provider.quota_group),
+                        touched_operators.contains(&provider.operator),
+                    ),
+                }
             })
             .collect();
         let index = select_best(&candidates, self.config.tolerance)
@@ -343,6 +421,26 @@ mod tests {
 
     fn pool(names: &[(&'static str, i32)]) -> Arc<ProviderPool<&'static str>> {
         pool_with(names, PoolConfig::default())
+    }
+
+    fn pool_labeled_with(
+        specs: &[(&'static str, i32, &'static str, &'static str)],
+        config: PoolConfig,
+    ) -> Arc<ProviderPool<&'static str>> {
+        let specs = specs
+            .iter()
+            .map(|(name, weight, operator, quota_group)| {
+                ProviderSpec::new(*name, *name)
+                    .with_priority_weight(*weight)
+                    .with_operator(*operator)
+                    .with_quota_group(*quota_group)
+            })
+            .collect();
+        Arc::new(ProviderPool::new("test", specs, config).unwrap())
+    }
+
+    fn pool_labeled(specs: &[(&'static str, i32, &'static str, &'static str)]) -> Arc<ProviderPool<&'static str>> {
+        pool_labeled_with(specs, PoolConfig::default())
     }
 
     /// Tolerance above 100 makes static priority always win among available
@@ -559,5 +657,118 @@ mod tests {
         let a = health_of(&pool, "a");
         assert_eq!(a.latency_ewma, Some(Duration::from_millis(120)));
         assert_eq!(a.health, 100.0);
+    }
+
+    // -- Failure domains: operator and quota group (spec §5.1) --------------
+
+    /// The trio used across the failure-domain tests below.
+    fn trio() -> Arc<ProviderPool<&'static str>> {
+        pool_labeled(&[
+            ("a1", 12, "alchemy", "qa1"),
+            ("a2", 11, "alchemy", "qa2"),
+            ("i1", 10, "infura", "qi1"),
+        ])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn infra_failure_prefers_a_different_operator() {
+        let world = World::default();
+        let pool = trio();
+        world.set("a1", Mode::Fail(CallOutcome::Transport));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "i1");
+        assert_eq!(world.calls(), vec!["a1", "i1"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quota_failure_prefers_a_different_operator_and_quota_group() {
+        let world = World::default();
+        let pool = trio();
+        world.set("a1", Mode::Fail(CallOutcome::RateLimited));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "i1");
+        assert_eq!(world.calls(), vec!["a1", "i1"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quarantined_operator_is_skipped_for_an_available_worse_tier() {
+        let world = World::default();
+        // Guards against taking the lowest tier over ALL untried candidates
+        // (quarantined or not): i1 is in the best tier (infura, untouched)
+        // but quarantined, so the available a2 (worse tier) must still win.
+        // i1 is given the highest weight here (opposite of `trio()`) and a
+        // huge tolerance (as in `sticky()`) so plain NoRetry calls keep
+        // targeting it despite its health dropping, priming its quarantine;
+        // a1/a2's relative order (a1 > a2) is unaffected either way.
+        let pool = pool_labeled_with(
+            &[("a1", 11, "alchemy", "qa1"), ("a2", 10, "alchemy", "qa2"), ("i1", 12, "infura", "qi1")],
+            sticky(),
+        );
+        world.set("i1", Mode::Fail(CallOutcome::Server));
+        for _ in 0..5 { call(&pool, &world, NoRetry).await.unwrap_err(); }
+        assert!(health_of(&pool, "i1").quarantined);
+        world.set("i1", Mode::Ok);
+        world.set("a1", Mode::Fail(CallOutcome::Server));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
+        assert_eq!(world.calls()[5..], ["a1", "a2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_infra_failures_exhaust_operators_before_the_same_operator_serves() {
+        let world = World::default();
+        let pool = trio();
+        // Server (not Timeout) per the brief: two 15s timeouts plus the 30s
+        // total deadline would cut off the third attempt.
+        world.set("a1", Mode::Fail(CallOutcome::Server));
+        world.set("i1", Mode::Fail(CallOutcome::Server));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
+        assert_eq!(world.calls(), vec!["a1", "i1", "a2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quota_failure_prefers_a_different_quota_group_over_a_sibling_in_the_same_group() {
+        let world = World::default();
+        let pool = pool_labeled(&[
+            ("a1", 12, "alchemy", "qa1"),
+            ("a1b", 11, "alchemy", "qa1"),
+            ("a2", 10, "alchemy", "qa2"),
+        ]);
+        world.set("a1", Mode::Fail(CallOutcome::RateLimited));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
+        assert_eq!(world.calls(), vec!["a1", "a2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_on_one_provider_leaves_a_same_operator_sibling_at_full_health() {
+        let world = World::default();
+        let pool = trio();
+        world.set("a1", Mode::Fail(CallOutcome::Server));
+        call(&pool, &world, NoRetry).await.unwrap_err();
+        let a2 = health_of(&pool, "a2");
+        assert_eq!((a2.health, a2.consecutive_failures), (100.0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_reports_operator_and_quota_group() {
+        let pool = trio();
+        let a1 = health_of(&pool, "a1");
+        assert_eq!((a1.operator.as_str(), a1.quota_group.as_str()), ("alchemy", "qa1"));
+    }
+
+    #[test]
+    fn operator_and_quota_group_default_to_the_exact_name() {
+        let spec = ProviderSpec::new("Alchemy-Jason", ());
+        assert_eq!(spec.operator, "Alchemy-Jason");
+        assert_eq!(spec.quota_group, "Alchemy-Jason");
+    }
+
+    #[test]
+    fn operator_and_quota_group_builders_trim_and_lowercase_and_keep_the_default_when_blank() {
+        let spec =
+            ProviderSpec::new("p", ()).with_operator("  Alchemy  ").with_quota_group(" QA-Jason ");
+        assert_eq!(spec.operator, "alchemy");
+        assert_eq!(spec.quota_group, "qa-jason");
+
+        let blank = ProviderSpec::new("p", ()).with_operator("   ").with_quota_group("");
+        assert_eq!(blank.operator, "p");
+        assert_eq!(blank.quota_group, "p");
     }
 }
