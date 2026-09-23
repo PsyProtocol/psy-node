@@ -84,7 +84,7 @@ impl Health {
     /// Whether normal selection may route here. A provider on probation
     /// accepts one probe at a time.
     pub(crate) fn available(&self, now: Instant) -> bool {
-        !self.quarantined(now) && !(self.on_probation(now) && self.probe_in_flight)
+        !(self.quarantined(now) || self.on_probation(now) && self.probe_in_flight)
     }
 
     /// Returns true when this attempt is the probe for a provider on probation.
