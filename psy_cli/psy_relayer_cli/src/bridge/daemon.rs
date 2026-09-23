@@ -123,7 +123,10 @@ pub(crate) struct L1Config {
     pub family: String,
     pub chain_index: u8,
     pub network_id: String,
+    #[serde(default)]
     pub rpc_urls: Vec<String>,
+    #[serde(default)]
+    pub rpc_providers: Vec<crate::bridge::rpc_providers::RpcProviderConfig>,
     pub deployments_network: String,
     #[serde(default)]
     pub state_manager: Option<String>,
@@ -150,13 +153,13 @@ impl L1Config {
     ) -> anyhow::Result<BridgeProposeDaemonConfig> {
         let mut config = base.clone();
         config.chains.clear();
-        config.finalize.l1_rpc_url = Some(
-            self.rpc_urls
-                .first()
-                .cloned()
-                .context("EVM chain rpc_urls must not be empty")?,
-        );
-        config.finalize.l1_rpc_fallback_url = self.rpc_urls.get(1).cloned();
+        let providers = crate::bridge::rpc_providers::resolve_rpc_providers(
+            &self.network_id, &self.rpc_providers, &self.rpc_urls,
+        )?;
+        // The first provider URL is the scope identity for provider factories.
+        config.finalize.l1_rpc_url = Some(providers[0].url.clone());
+        config.finalize.l1_rpc_fallback_url = None;
+        config.finalize.l1_rpc_providers = providers;
         config.finalize.deployments_network = Some(self.deployments_network.clone());
         config.finalize.state_manager = self.state_manager.clone();
         config.finalize.bridge_address = self.bridge_address.clone();
@@ -195,6 +198,7 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
             chain_index,
             network_id: deployments_network.clone(),
             rpc_urls,
+            rpc_providers: config.finalize.l1_rpc_providers.clone(),
             deployments_network,
             state_manager: config.finalize.state_manager.clone(),
             bridge_address: config.finalize.bridge_address.clone(),
@@ -209,7 +213,11 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
     let mut seen = HashSet::with_capacity(chains.len());
     for chain in &chains {
         ensure!(chain.family.eq_ignore_ascii_case("evm"), "unsupported bridge chain family {}", chain.family);
-        ensure!(!chain.rpc_urls.is_empty(), "chain {} has no RPC URL", chain.network_id);
+        ensure!(
+            !chain.rpc_urls.is_empty() || !chain.rpc_providers.is_empty(),
+            "chain {} has no RPC URL",
+            chain.network_id
+        );
         ensure!(
             seen.insert(chain.chain_index),
             "duplicate bridge chain_index {}",
@@ -234,6 +242,8 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
 pub(crate) struct DaemonFinalizeConfig {
     pub l1_rpc_url: Option<String>,
     pub l1_rpc_fallback_url: Option<String>,
+    #[serde(default)]
+    pub l1_rpc_providers: Vec<crate::bridge::rpc_providers::RpcProviderConfig>,
     pub deployments_network: Option<String>,
     pub state_manager: Option<String>,
     pub bridge_address: Option<String>,
@@ -845,7 +855,7 @@ async fn run_multichain(
         let state_manager = resolve_state_manager_address(&effective)?;
         chains.push(ChainRuntime {
             chain_index: chain.chain_index,
-            l1: L1Client::from_finalize_config(&effective.finalize)?,
+            l1: L1Client::from_finalize_config(&effective.finalize, &chain.network_id)?,
             config: effective,
             bridge,
             state_manager,
@@ -1034,7 +1044,10 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
     tracing::info!(prove_proxy = %proxy_url_at_startup, "system prove proxy configured; local Groth16 warmup skipped");
 
     let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
-    let l1 = L1Client::from_finalize_config(&config.finalize)?;
+    let l1 = L1Client::from_finalize_config(
+        &config.finalize,
+        config.finalize.deployments_network.as_deref().unwrap_or("l1"),
+    )?;
     let bridge_address = resolve_bridge_address(&config)?;
     let bridge = bridge_address
         .parse::<Address>()
@@ -6075,6 +6088,47 @@ deployments_network = "localhostBase"
         assert_eq!(config.chains.len(), 3);
         assert_eq!(config.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert!(config.chains.iter().all(|chain| chain.family == "evm"));
+    }
+
+    #[test]
+    fn chain_rpc_providers_take_precedence_and_legacy_urls_keep_order() {
+        let raw = r#"
+rpc_config = "config.json"
+services_url = "http://127.0.0.1:3000"
+withdraw_method_id = 1
+
+[[chains]]
+chain_index = 0
+network_id = "sepolia"
+deployments_network = "sepolia"
+rpc_urls = ["https://ignored"]
+[[chains.rpc_providers]]
+name = "alchemy"
+url = "https://a"
+priority_weight = 11
+[[chains.rpc_providers]]
+name = "infura"
+url = "https://i"
+
+[[chains]]
+chain_index = 1
+network_id = "bscTestnet"
+deployments_network = "bscTestnet"
+rpc_urls = ["https://z", "https://a"]
+"#;
+        let config: BridgeProposeDaemonConfig = toml::from_str(raw).unwrap();
+        let first = config.chains[0].effective_config(&config).unwrap().finalize;
+        assert_eq!(first.l1_rpc_url.as_deref(), Some("https://a"));
+        assert_eq!(
+            first.l1_rpc_providers.iter().map(|p| (p.name.as_str(), p.priority_weight)).collect::<Vec<_>>(),
+            vec![("alchemy", 11), ("infura", 10)]
+        );
+        let second = config.chains[1].effective_config(&config).unwrap().finalize;
+        assert_eq!(
+            second.l1_rpc_providers.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://z", "https://a"]
+        );
+        assert_eq!(second.l1_rpc_fallback_url, None);
     }
 
     fn write_temp_rpc_config(system_urls: &str) -> std::path::PathBuf {

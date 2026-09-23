@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::bridge::{
     claim_withdrawals,
-    constants::{DEFAULT_DEPLOYMENTS_NETWORK, DEFAULT_L1_RPC_URL},
+    constants::DEFAULT_DEPLOYMENTS_NETWORK,
     daemon::{
         fetch_l1_last_finalized_checkpoint, resolve_bridge_address, resolve_system_prove_proxy_url,
         run_l2_bridge_round_with_l1_snapshot, submit_deposit_batch_appends_with_l1_rpc,
@@ -16,7 +16,8 @@ use crate::bridge::{
     },
     finalize_bridge::{self, FinalizeBridgeAggArgs},
     l1_provider::connect_l1_readonly,
-    l1_provider::{build_failover_client, with_l1_rpc_client},
+    l1_provider::{build_pool_client, with_l1_rpc_client},
+    rpc_providers::finalize_rpc_providers,
     propose_withdrawals::{self, ProposeWithdrawalsArgs},
     prove_bridge::{self, BridgeProveResult},
 };
@@ -35,6 +36,7 @@ struct ProofMetadata {
 
 #[derive(Clone)]
 pub struct L1Client {
+    /// Scope identity: the first configured provider URL, not a routing preference.
     primary: url::Url,
     rpc: alloy_rpc_client::RpcClient,
 }
@@ -46,16 +48,13 @@ impl std::fmt::Debug for L1Client {
 }
 
 impl L1Client {
-    pub fn from_finalize_config(finalize: &DaemonFinalizeConfig) -> anyhow::Result<Self> {
-        let primary = finalize
-            .l1_rpc_url
-            .clone()
-            .unwrap_or_else(|| DEFAULT_L1_RPC_URL.to_string());
-        let primary: url::Url = primary.trim().parse().context("invalid primary L1 RPC URL")?;
-        let backup = finalize.l1_rpc_fallback_url.as_deref().map(str::trim)
-            .filter(|url| !url.is_empty()).map(str::parse).transpose()
-            .context("invalid backup L1 RPC URL")?;
-        Ok(Self { rpc: build_failover_client(primary.clone(), backup)?, primary })
+    pub fn from_finalize_config(finalize: &DaemonFinalizeConfig, label: &str) -> anyhow::Result<Self> {
+        let providers = finalize_rpc_providers(label, finalize)?;
+        let primary: url::Url = providers[0]
+            .url
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid L1 RPC URL for provider {}", providers[0].name))?;
+        Ok(Self { rpc: build_pool_client(label, &providers)?, primary })
     }
 
     /// Run business logic once. Individual RPC packets own failover internally.
@@ -383,16 +382,18 @@ async fn claim_withdrawal_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::rpc_providers::RpcProviderConfig;
     use std::path::PathBuf;
 
     #[tokio::test]
     async fn business_callback_runs_once_and_synchronous_setup_is_scoped() {
         let primary = "http://127.0.0.1:1".parse::<url::Url>().unwrap();
         let other = "http://127.0.0.1:2".parse::<url::Url>().unwrap();
-        let client = L1Client {
-            rpc: build_failover_client(primary.clone(), Some(other.clone())).unwrap(),
-            primary,
-        };
+        let providers = vec![
+            RpcProviderConfig { name: "p0".into(), url: primary.to_string(), priority_weight: 10 },
+            RpcProviderConfig { name: "p1".into(), url: other.to_string(), priority_weight: 10 },
+        ];
+        let client = L1Client { rpc: build_pool_client("test", &providers).unwrap(), primary };
         let mut calls = 0;
         let result: anyhow::Result<()> = client.with_rpc_failover("test", |_| {
             calls += 1;

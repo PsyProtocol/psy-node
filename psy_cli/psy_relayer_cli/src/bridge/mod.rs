@@ -11,6 +11,7 @@ pub mod l1_provider;
 pub mod l1_client;
 mod pool_transport;
 pub mod prove_proxy_client;
+mod rpc_providers;
 pub mod l1_signer;
 pub mod propose_withdrawals;
 pub mod prove_bridge;
