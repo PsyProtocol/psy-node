@@ -79,6 +79,14 @@ These are tunable v1 guesses. Adjust from observed production logs.
   quarantine was lifted: either a post-quarantine probe succeeded, or a
   least-bad fallback attempt succeeded on a still-quarantined provider.
 
+**Operator note:** a pool where every provider is quarantined keeps serving
+traffic through the least-bad provider (the selection fallback picks the
+best-scoring provider even when none is technically "available"), so
+`RPC provider quarantined` log lines alone do not mean the chain is down.
+Every failed attempt logs `RPC provider attempt failed` (WARN), including
+the final attempt in a request (`failover=false` on that one) — a WARN by
+itself is not necessarily an operator-actionable event.
+
 Logs and errors returned to callers never contain provider URLs, request
 parameters or provider response bodies. Provider URLs can embed API keys.
 `PoolTransport` redacts errors before they leave the pool: reqwest errors are
@@ -100,6 +108,37 @@ need that data and it never contains a URL.
 - The pool's HTTP client has a 20s total timeout, above the pool's 15s
   per-attempt timeout, so a hung connection is classified as `Timeout` by the
   pool rather than surfacing as a raw reqwest error.
+- **Local polling:** `build_pool_client` treats the pooled transport as
+  local (250ms poll interval) only when every configured provider URL passes
+  alloy's `guess_local` check. One remote provider in the list switches the
+  whole pool to the non-local polling cadence.
+
+## Implementation boundaries / rollout prerequisites
+
+- Pooled L1 providers only exist inside `L1Client::with_rpc_failover`'s
+  task-local scope (`l1_provider.rs`'s `L1_RPC_CONTEXT`). `L1Client` builds
+  the pool once, in `L1Client::from_finalize_config`, and each business
+  operation re-enters the scope through `with_rpc_failover`. A newly spawned
+  task does **not** inherit that scope. Provider construction outside it
+  (`connect_l1_readonly` / `connect_l1_with_wallet` called with no scope on
+  the stack) silently falls back to `build_rpc_client`, a standalone
+  single-URL client with no pooling, scoring or failover. Known pre-existing
+  standalone paths in this codebase, unaffected by this delivery:
+  - the `finalize-bridge-agg` CLI subcommand (`finalize_bridge::run` takes a
+    single `l1_rpc_url: String` argument, not a provider list)
+  - the `claim-withdrawals` CLI subcommand (`claim_withdrawals::run`, same
+    single-URL shape)
+  - the indexer source mode in `main.rs` (`ProviderBuilder::new()
+    .connect_http(rpc_url)`, built from one configured chain RPC URL)
+- Before rollout, verify per configured provider — not just the pool as a
+  whole: chain ID matches the deployment, contract reads succeed, receipt
+  lookup works, raw transaction submission (`eth_sendRawTransaction`) is
+  supported, and `eth_getLogs` range limits accommodate the relayer's
+  requests (it can request up to 50,000 blocks in one call). There is no
+  per-provider chain ID check at startup: alloy's `ChainIdFiller` (part of
+  the default filler stack in `connect_l1_readonly` /
+  `connect_l1_with_wallet`) queries whichever provider the pool currently
+  routes the request to, since a fresh provider is built per RPC operation.
 
 ## Safety boundaries (unchanged)
 
@@ -133,6 +172,23 @@ need that data and it never contains a URL.
   RPC.
 - **Tuning:** penalties, half-life, thresholds and timeouts are v1 guesses
   and have not been validated against production traffic.
+- **Split receipt view:** alloy's `get_receipt()` can see the block that
+  mined a transaction from one provider, then poll a lagging provider on the
+  next call and get a null receipt — reported as a receipt failure even
+  though the transaction is mined.
+- **Resend can surface `nonce too low`, not just `already known`:** on fast
+  chains, resending `eth_sendRawTransaction` after a lost response can come
+  back `nonce too low` (classified `Application`), not only `already known`.
+- **Nonce read from whichever provider is current:** the nonce manager
+  (alloy's `NonceFiller`, part of `connect_l1_with_wallet`'s default
+  fillers) fetches the pending nonce per provider instance, and that
+  instance is built fresh per operation — so the pending-nonce read can come
+  from a lagging provider, risking `nonce too low` or a transaction that
+  never mines. `finalize` and `claim_withdrawals` wrap `get_receipt()` in a
+  180s timeout (`L1_TX_RECEIPT_TIMEOUT_SECS`); the deposit batchAppend
+  send/receipt path (`daemon.rs` ~1627-1631) has no timeout on either
+  `send_transaction` or `get_receipt` — pre-existing, recommended fix before
+  rollout.
 
 ## Known follow-ups (not fixed in this delivery)
 
