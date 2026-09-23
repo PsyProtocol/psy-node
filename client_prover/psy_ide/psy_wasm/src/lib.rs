@@ -211,7 +211,7 @@ struct HashValueInput {
 #[derive(Deserialize)]
 struct DeployerInput {
     contract_id: u64,
-    deployer: [u64; 4],
+    deployer: u64,
 }
 
 #[derive(Deserialize)]

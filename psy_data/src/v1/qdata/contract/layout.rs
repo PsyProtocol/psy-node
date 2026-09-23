@@ -36,11 +36,11 @@ pub const STRUCT_TYPE_LAYOUT_DOMAIN: u64 = 0x5354_5459_5631;
 pub const PRIMITIVE_TYPE_LAYOUT_DOMAIN: u64 = 0x5052_5459_5631; 
 pub const FIXED_ARRAY_TYPE_LAYOUT_DOMAIN: u64 = 0x4152_5459_5631; 
 pub const FIXED_MAP_TYPE_LAYOUT_DOMAIN: u64 = 0x4d50_5459_5631; 
-pub const CONTRACT_LEAF_DOMAIN: u64 = 0x434c_5632; 
-pub const STATE_LAYOUT_APPEND_BATCH_DOMAIN: u64 = 0x534c_4241_5631; 
-pub const STATE_LAYOUT_APPEND_AGG_DOMAIN: u64 = 0x534c_4147_5631; 
-pub const CONTRACT_LEAF_FELT_SIZE: usize = 19;
-pub const CONTRACT_LEAF_SERIALIZED_SIZE: usize = 152;
+pub const CONTRACT_LEAF_DOMAIN: u64 = 0x434c_5633;
+pub const STATE_LAYOUT_APPEND_BATCH_DOMAIN: u64 = 0x534c_4241_5631;
+pub const STATE_LAYOUT_APPEND_AGG_DOMAIN: u64 = 0x534c_4147_5631;
+pub const CONTRACT_LEAF_FELT_SIZE: usize = 16;
+pub const CONTRACT_LEAF_SERIALIZED_SIZE: usize = 128;
 
 /// Minimal queryable metadata carried by a layout-aware contract leaf.
 ///
@@ -60,11 +60,14 @@ pub struct ContractLayoutMetadata<Hash> {
 ///
 /// It is intentionally a distinct type so old 104-byte records
 /// cannot be silently decoded as the canonical layout.
+///
+/// The deployer is the on-chain user id (not a public key hash); the
+/// in-place V2 layout change is pre-mainnet, sealed by the CLV3 domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
 #[ts(concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDContractLeafV2")]
 #[repr(C)]
 pub struct PQEDContractLeafV2<F, Hash> {
-    pub deployer: Hash,
+    pub deployer: F,
     pub function_tree_root: Hash,
     pub code_root: Hash,
     pub state_tree_height: F,
@@ -88,7 +91,7 @@ impl<F: QFelt64, Hash: QHashBase> PQEDContractLeafV2<F, Hash> {
 impl<F: Default, Hash: Default> Default for PQEDContractLeafV2<F, Hash> {
     fn default() -> Self {
         Self {
-            deployer: Hash::default(),
+            deployer: F::default(),
             function_tree_root: Hash::default(),
             code_root: Hash::default(),
             state_tree_height: F::default(),
@@ -115,15 +118,11 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F>
     for PQEDContractLeafV2<F, Hash>
 {
     fn to_qfelts(&self) -> Vec<F> {
-        let deployer = self.deployer.to_4_felts();
         let function_tree_root = self.function_tree_root.to_4_felts();
         let code_root = self.code_root.to_4_felts();
         let state_layout_root = self.state_layout_root.to_4_felts();
         vec![
-            deployer[0],
-            deployer[1],
-            deployer[2],
-            deployer[3],
+            self.deployer,
             function_tree_root[0],
             function_tree_root[1],
             function_tree_root[2],
@@ -149,13 +148,13 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F>
             "invalid number of contract leaf felts"
         );
         Self {
-            deployer: Hash::from_4_felts_slice(&felts[0..4]),
-            function_tree_root: Hash::from_4_felts_slice(&felts[4..8]),
-            code_root: Hash::from_4_felts_slice(&felts[8..12]),
-            state_tree_height: felts[12],
-            state_layout_root: Hash::from_4_felts_slice(&felts[13..17]),
-            state_layout_field_count: felts[17],
-            state_layout_slot_count: felts[18],
+            deployer: felts[0],
+            function_tree_root: Hash::from_4_felts_slice(&felts[1..5]),
+            code_root: Hash::from_4_felts_slice(&felts[5..9]),
+            state_tree_height: felts[9],
+            state_layout_root: Hash::from_4_felts_slice(&felts[10..14]),
+            state_layout_field_count: felts[14],
+            state_layout_slot_count: felts[15],
         }
     }
 }
@@ -189,7 +188,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical
         &self,
         writer: &mut W,
     ) -> anyhow::Result<()> {
-        writer.psy_write_bytes_fixed(&self.deployer.into_owned_32bytes())?;
+        writer.psy_write_u64(self.deployer.to_u64_value())?;
         writer.psy_write_bytes_fixed(
             &self.function_tree_root.into_owned_32bytes(),
         )?;
@@ -207,9 +206,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical
         reader: &mut R,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            deployer: Hash::from_owned_32bytes(
-                reader.psy_read_bytes_fixed::<32>()?,
-            ),
+            deployer: F::from_u64_value(reader.psy_read_u64()?),
             function_tree_root: Hash::from_owned_32bytes(
                 reader.psy_read_bytes_fixed::<32>()?,
             ),
@@ -2553,8 +2550,10 @@ mod tests {
                 StatePrimitiveTypeTag::U64,
                 1,
             )?;
+        // Each state-tree leaf stores four felts, so height 3 gives 32 slots;
+        // 33 single-slot elements must be rejected.
         let huge =
-            fixed_array_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(u64_layout, 9)?;
+            fixed_array_type_layout::<PoseidonHasher, PF, QHashOut<PF>>(u64_layout, 33)?;
         let error = contract_state_layout::<PoseidonHasher, PF, QHashOut<PF>>(
             &[huge],
             1,
@@ -2585,7 +2584,7 @@ mod tests {
     #[test]
     fn v2_contract_leaf_felt_round_trip() {
         let leaf = PQEDContractLeafV2::<PF, QHashOut<PF>> {
-            deployer: QHashOut::rand(),
+            deployer: PF::from_u64_value(4242),
             function_tree_root: QHashOut::rand(),
             code_root: QHashOut::rand(),
             state_tree_height: PF::from_u64_value(16),
@@ -2667,9 +2666,9 @@ mod tests {
     #[test]
     fn binds_transition_to_v2_leaf_endpoints_and_capacity(
     ) -> anyhow::Result<()> {
-        let deployer: QHashOut<PF> = QHashOut::rand();
-        let old_root = QHashOut::rand();
-        let new_root = QHashOut::rand();
+        let deployer: PF = PF::from_u64_value(4242);
+        let old_root: QHashOut<PF> = QHashOut::rand();
+        let new_root: QHashOut<PF> = QHashOut::rand();
         let old_leaf = PQEDContractLeafV2 {
             deployer,
             function_tree_root: QHashOut::rand(),
@@ -2707,9 +2706,9 @@ mod tests {
             &transition,
         )?;
 
-        new_leaf.state_layout_slot_count = PF::from_u64_value(9);
+        new_leaf.state_layout_slot_count = PF::from_u64_value(33);
         let mut oversized = transition;
-        oversized.new_layout_slot_count = 9;
+        oversized.new_layout_slot_count = 33;
         assert!(
             validate_contract_layout_transition(
                 11, &old_leaf, &new_leaf, &oversized,

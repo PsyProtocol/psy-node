@@ -132,7 +132,7 @@ Deploy a new smart contract.
 ```json
 {
   "deploy_contract": {
-    "deployer": "0x1234...",
+    "deployer": 12345,
     "code_definition": {
       "state_tree_height": 10,
       "functions": [...]
@@ -161,7 +161,7 @@ curl -X POST http://localhost:8545 \
     "jsonrpc": "2.0",
     "method": "psy_deploy_contract",
     "params": [{
-      "deployer": "0x...",
+      "deployer": 12345,
       "code_definition": {...},
       "function_whitelist": [...]
     }],
@@ -2164,7 +2164,7 @@ Contract deployment command.
 **Structure**:
 ```rust
 pub struct QBCDeployContract<F: RichField> {
-    pub deployer: QHashOut<F>,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<QHashOut<F>>,
 }
@@ -2174,14 +2174,14 @@ pub struct QBCDeployContract<F: RichField> {
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `deployer` | `QHashOut<F>` | Deployer's public key hash |
+| `deployer` | `u64` | Deployer user id |
 | `code_definition` | `ContractCodeDefinition` | Contract code definition |
 | `function_whitelist` | `Vec<QHashOut<F>>` | Function whitelist hashes |
 
 **Example**:
 ```json
 {
-  "deployer": "0x1234...",
+  "deployer": 12345,
   "code_definition": {
     "state_tree_height": 10,
     "functions": [...]
@@ -2254,7 +2254,7 @@ Contract leaf data.
 **Structure**:
 ```rust
 pub struct PsyContractLeaf<F: RichField> {
-    pub deployer: QHashOut<F>,
+    pub deployer: u64,
     pub function_tree_root: QHashOut<F>,
     pub state_tree_height: F,
 }
@@ -2264,14 +2264,14 @@ pub struct PsyContractLeaf<F: RichField> {
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `deployer` | `QHashOut<F>` | Deployer's public key hash |
+| `deployer` | `u64` | Deployer user id |
 | `function_tree_root` | `QHashOut<F>` | Root of the function tree |
 | `state_tree_height` | `F` | Height of the state tree |
 
 **Example**:
 ```json
 {
-  "deployer": "0x1234...",
+  "deployer": 12345,
   "function_tree_root": "0x5678...",
   "state_tree_height": "10"
 }
@@ -2613,7 +2613,7 @@ curl -X POST http://localhost:8545 \
     "jsonrpc": "2.0",
     "method": "psy_deploy_contract",
     "params": [{
-      "deployer": "0x...",
+      "deployer": 12345,
       "code_definition": {
         "state_tree_height": 10,
         "functions": [...]

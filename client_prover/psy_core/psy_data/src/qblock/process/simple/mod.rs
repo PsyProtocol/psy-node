@@ -88,7 +88,7 @@ impl SimpleBlockProcessor {
             let function_tree_root = store.set_contract_function_whitelist(new_checkpoint_id, contract_id, &d.function_whitelist)?;
 
             let contract_leaf = PsyContractLeaf {
-                deployer: d.deployer,
+                deployer: PsyFelt::from_canonical_u64(d.deployer),
                 function_tree_root,
                 state_tree_height: PsyFelt::from_canonical_u16(d.code_definition.state_tree_height),
                 code_root: d.code_root,
@@ -226,7 +226,7 @@ impl SimpleBlockProcessor {
 
         let mut all_contracts = vec![
             QBCDeployContract {
-                deployer: QBCRegisterUser::new_from_u64s([1; 4], [13371, 13372, 13373, 13374]).get_public_key::<PsyHasher>(),
+                deployer: 13371,
                 code_definition: ContractCodeDefinition {
                     state_tree_height: 12 as u16,
                     functions: vec![ContractFunctionCodeDefinition::default()],
@@ -235,7 +235,7 @@ impl SimpleBlockProcessor {
                 code_root: QHashOut::rand(),
             },
             QBCDeployContract {
-                deployer: QBCRegisterUser::new_from_u64s([1; 4], [13375, 13376, 13377, 13378]).get_public_key::<PsyHasher>(),
+                deployer: 13375,
                 code_definition: ContractCodeDefinition {
                     state_tree_height: 13 as u16,
                     functions: vec![ContractFunctionCodeDefinition::default()],

@@ -485,7 +485,7 @@ impl<
         let (unique_pending_id, unique_proc_checkpoint_id, queue_key) =
             self.get_deploy_contract_queue_key().await?;
         let deploy_content_hash = compute_deploy_contract_content_hash(
-            &queue_item.contract_leaf.deployer.into_owned_32bytes(),
+            queue_item.contract_leaf.deployer.to_u64_value(),
             &queue_item
                 .contract_leaf
                 .function_tree_root
@@ -541,7 +541,7 @@ impl<
             .await
             .map_err(|_| anyhow::anyhow!("contract with id {} does not exist", update_contract.contract_id))?;
 
-        if existing_leaf.deployer != update_contract.deployer {
+        if existing_leaf.deployer.to_u64_value() != update_contract.deployer {
             anyhow::bail!(
                 "only the original deployer can update contract {}",
                 update_contract.contract_id
@@ -591,7 +591,7 @@ impl<
         )?;
         let update_content_hash = compute_update_contract_content_hash(
             contract_id,
-            &queue_item.contract_leaf.deployer.into_owned_32bytes(),
+            queue_item.contract_leaf.deployer.to_u64_value(),
             &queue_item.contract_leaf.function_tree_root.into_owned_32bytes(),
             queue_item.contract_leaf.state_tree_height.to_u64_value(),
         );

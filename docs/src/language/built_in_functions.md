@@ -43,11 +43,11 @@ fn main() {
 ```rust
 fn check_contract_deployer() {
     let contract_id = get_contract_id();
-    
-    // Get the deployer hash of a contract
-    let deployer_hash = get_contract_deployer(contract_id);
-    
-    // Hash is [Felt; 4] representing the deployer's public key hash
+
+    // Get the deployer of a contract
+    let deployer = get_contract_deployer(contract_id);
+
+    // deployer is a Felt holding the deployer's on-chain user id
 }
 ```
 

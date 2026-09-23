@@ -19,14 +19,14 @@ pub const STATE_LAYOUT_MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 #[ts(export, concrete(F = GoldilocksField))]
 pub struct QBCDeployContract<F: RichField> {
-    pub deployer: QHashOut<F>,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<QHashOut<F>>,
     pub code_root: QHashOut<F>,
 }
 
 impl<F: RichField> QBCDeployContract<F> {
-    pub fn new(deployer: QHashOut<F>, code_definition: ContractCodeDefinition, function_whitelist: Vec<QHashOut<F>>, code_root: QHashOut<F>) -> Self {
+    pub fn new(deployer: u64, code_definition: ContractCodeDefinition, function_whitelist: Vec<QHashOut<F>>, code_root: QHashOut<F>) -> Self {
         Self {
             deployer,
             code_definition,
@@ -118,7 +118,7 @@ impl<F: RichField> KVQSerializable for QBCDeployContractV2<F> {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 pub struct QBCDeployContractWithRoot<F: RichField> {
-    pub deployer: QHashOut<F>,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<QHashOut<F>>,
     pub function_whitelist_root: QHashOut<F>,
@@ -127,7 +127,7 @@ pub struct QBCDeployContractWithRoot<F: RichField> {
 
 impl<F: RichField> QBCDeployContractWithRoot<F> {
     pub fn new<H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>>>(
-        deployer: QHashOut<F>,
+        deployer: u64,
         code_definition: ContractCodeDefinition,
         function_whitelist: Vec<QHashOut<F>>,
         code_root: QHashOut<F>,
@@ -172,7 +172,7 @@ impl<F: RichField> KVQSerializable for QBCDeployContractWithRoot<F> {
 #[ts(export, concrete(F = GoldilocksField))]
 pub struct QBCUpdateContract<F: RichField> {
     pub contract_id: u64,
-    pub deployer: QHashOut<F>,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<QHashOut<F>>,
     pub code_root: QHashOut<F>,
@@ -187,7 +187,7 @@ pub struct QBCUpdateContract<F: RichField> {
 impl<F: RichField> QBCUpdateContract<F> {
     pub fn new(
         contract_id: u64,
-        deployer: QHashOut<F>,
+        deployer: u64,
         code_definition: ContractCodeDefinition,
         function_whitelist: Vec<QHashOut<F>>,
         code_root: QHashOut<F>,
@@ -264,7 +264,7 @@ impl<F: RichField> KVQSerializable for QBCUpdateContract<F> {
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 pub struct QBCUpdateContractWithRoot<F: RichField> {
     pub contract_id: u64,
-    pub deployer: QHashOut<F>,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<QHashOut<F>>,
     pub function_whitelist_root: QHashOut<F>,
@@ -274,7 +274,7 @@ pub struct QBCUpdateContractWithRoot<F: RichField> {
 impl<F: RichField> QBCUpdateContractWithRoot<F> {
     pub fn new<H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>>>(
         contract_id: u64,
-        deployer: QHashOut<F>,
+        deployer: u64,
         code_definition: ContractCodeDefinition,
         function_whitelist: Vec<QHashOut<F>>,
         code_root: QHashOut<F>,
@@ -746,7 +746,7 @@ mod update_contract_tests {
     fn sample_update() -> QBCUpdateContract<F> {
         QBCUpdateContract {
             contract_id: 1337,
-            deployer: QHashOut::from_values(21, 22, 23, 24),
+            deployer: 2122,
             code_definition: sample_code_definition(),
             function_whitelist: sample_whitelist(),
             code_root: QHashOut::from_values(31, 32, 33, 34),
@@ -779,14 +779,15 @@ mod update_contract_tests {
         assert!(missing_proof.validate_shape().is_err());
 
         let mut overflow = sample_update();
-        overflow.state_layout_slot_count = (1 << 10) + 1;
+        // each state-tree leaf stores four felts: capacity at height 10 is 4096
+        overflow.state_layout_slot_count = (1 << 10) * 4 + 1;
         assert!(overflow.validate_shape().is_err());
     }
 
     fn sample_deploy_v2() -> QBCDeployContractV2<F> {
         QBCDeployContractV2 {
             deploy_contract: QBCDeployContract {
-                deployer: QHashOut::from_values(21, 22, 23, 24),
+                deployer: 2122,
                 code_definition: sample_code_definition(),
                 function_whitelist: sample_whitelist(),
                 code_root: QHashOut::from_values(31, 32, 33, 34),
@@ -815,7 +816,8 @@ mod update_contract_tests {
         assert!(missing_proof.validate_shape().is_err());
 
         let mut overflow = sample_deploy_v2();
-        overflow.state_layout_slot_count = (1 << 10) + 1;
+        // each state-tree leaf stores four felts: capacity at height 10 is 4096
+        overflow.state_layout_slot_count = (1 << 10) * 4 + 1;
         assert!(overflow.validate_shape().is_err());
     }
 
@@ -823,7 +825,7 @@ mod update_contract_tests {
     // whitelist root for the same inputs
     #[test]
     fn test_update_whitelist_root_matches_deploy() -> anyhow::Result<()> {
-        let deployer = QHashOut::from_values(21, 22, 23, 24);
+        let deployer: u64 = 2122;
         let code_definition = sample_code_definition();
         let whitelist = sample_whitelist();
         let code_root = QHashOut::from_values(31, 32, 33, 34);

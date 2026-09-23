@@ -146,14 +146,15 @@ pub trait StateBackend {
     /// Read a range of felts from a user's contract state
     fn get_contract_range(&self, user_id: u64, contract_id: u64, slot_index: u64, length: usize) -> anyhow::Result<Vec<u64>>;
 
-    /// Get contract deployer hash
-    fn get_contract_deployer(&self, contract_id: u64) -> anyhow::Result<[u64; 4]>;
+    /// Get contract deployer user id
+    fn get_contract_deployer(&self, contract_id: u64) -> anyhow::Result<u64>;
 
     /// Get checkpoint stats (returns array of stats felts)
     fn get_checkpoint_stats(&self, checkpoint_id: u64) -> anyhow::Result<Vec<u64>>;
 
-    /// Get contract leaf data (returns [deployer(4), function_tree_root(4),
-    /// code_root(4), state_tree_height(1)])
+    /// Get contract leaf data (returns [deployer(1), function_tree_root(4),
+    /// code_root(4), state_tree_height(1), state_layout_root(4),
+    /// state_layout_field_count(1), state_layout_slot_count(1)])
     fn get_contract_leaf(&self, contract_id: u64) -> anyhow::Result<Vec<u64>>;
 
     /// Get checkpoint global state roots (20 felts).
@@ -176,7 +177,7 @@ pub struct InMemoryStateBackend {
     /// State slots keyed by (user_id, contract_id, slot_index)
     slots: HashMap<(u64, u64, u64), u64>,
     /// Contract deployers keyed by contract_id
-    deployers: HashMap<u64, [u64; 4]>,
+    deployers: HashMap<u64, u64>,
     /// Checkpoint stats keyed by checkpoint_id
     checkpoint_stats: HashMap<u64, Vec<u64>>,
     /// Contract leaf data keyed by contract_id
@@ -207,7 +208,7 @@ impl InMemoryStateBackend {
     }
 
     /// Set contract deployer
-    pub fn set_deployer(&mut self, contract_id: u64, deployer: [u64; 4]) {
+    pub fn set_deployer(&mut self, contract_id: u64, deployer: u64) {
         self.deployers.insert(contract_id, deployer);
     }
 
@@ -278,8 +279,8 @@ impl StateBackend for InMemoryStateBackend {
         Ok(result)
     }
 
-    fn get_contract_deployer(&self, contract_id: u64) -> anyhow::Result<[u64; 4]> {
-        Ok(*self.deployers.get(&contract_id).unwrap_or(&[0; 4]))
+    fn get_contract_deployer(&self, contract_id: u64) -> anyhow::Result<u64> {
+        Ok(*self.deployers.get(&contract_id).unwrap_or(&0))
     }
 
     fn get_checkpoint_stats(&self, checkpoint_id: u64) -> anyhow::Result<Vec<u64>> {
@@ -287,7 +288,7 @@ impl StateBackend for InMemoryStateBackend {
     }
 
     fn get_contract_leaf(&self, contract_id: u64) -> anyhow::Result<Vec<u64>> {
-        Ok(self.contract_leaves.get(&contract_id).cloned().unwrap_or_else(|| vec![0; 13]))
+        Ok(self.contract_leaves.get(&contract_id).cloned().unwrap_or_else(|| vec![0; 16]))
     }
 
     fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> anyhow::Result<Vec<u64>> {

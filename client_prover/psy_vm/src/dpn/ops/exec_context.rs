@@ -872,16 +872,16 @@ impl DPNContext<SymFeltRef> for QExecContext {
         SymFeltRef::new_valueless(DPNOpType::GetContractId)
     }
 
-    fn get_contract_deployer(&mut self, contract_id: SymFeltRef) -> [SymFeltRef; 4] {
+    fn get_contract_deployer(&mut self, contract_id: SymFeltRef) -> SymFeltRef {
         let cmd = DPNStateCmd::GetContractLeaf(DPNStateCmdGetContractLeaf { contract_id });
         let b = self.resolve_state_cmd_base(cmd);
-        self.op_target_at_array::<4>(b)
+        self.op_target_at(b, 0)
     }
 
     fn get_contract_state_tree_height(&mut self, contract_id: SymFeltRef) -> SymFeltRef {
         let cmd = DPNStateCmd::GetContractLeaf(DPNStateCmdGetContractLeaf { contract_id });
         let contract_leaf = self.resolve_state_cmd_base(cmd);
-        self.op_target_at(contract_leaf, 12)
+        self.op_target_at(contract_leaf, 9)
     }
 
     fn get_caller_contract_id(&mut self) -> SymFeltRef {

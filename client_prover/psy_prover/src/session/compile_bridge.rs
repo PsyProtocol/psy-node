@@ -112,27 +112,27 @@ pub struct SimulationResult {
 
 /// Compile a single-file contract source and generate deployment artifacts.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn compile_contract(source: &str, deployer: QHashOut<F>) -> anyhow::Result<CompileResult> {
+pub fn compile_contract(source: &str, deployer: u64) -> anyhow::Result<CompileResult> {
     let contract_output = psy_compiler::compile(source)?;
     build_deploy_artifacts(contract_output, deployer)
 }
 
 /// Native deployment artifact generation is unavailable in a browser build.
 #[cfg(target_arch = "wasm32")]
-pub fn compile_contract(_source: &str, _deployer: QHashOut<F>) -> anyhow::Result<CompileResult> {
+pub fn compile_contract(_source: &str, _deployer: u64) -> anyhow::Result<CompileResult> {
     anyhow::bail!("native contract compilation with layout proofs is unavailable on wasm32")
 }
 
 /// Compile a multi-file contract crate and generate deployment artifacts.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn compile_crate_contract(root_file: &Path, deployer: QHashOut<F>) -> anyhow::Result<CompileResult> {
+pub fn compile_crate_contract(root_file: &Path, deployer: u64) -> anyhow::Result<CompileResult> {
     let contract_output = psy_compiler::compile_crate(root_file)?;
     build_deploy_artifacts(contract_output, deployer)
 }
 
 /// Native deployment artifact generation is unavailable in a browser build.
 #[cfg(target_arch = "wasm32")]
-pub fn compile_crate_contract(_root_file: &Path, _deployer: QHashOut<F>) -> anyhow::Result<CompileResult> {
+pub fn compile_crate_contract(_root_file: &Path, _deployer: u64) -> anyhow::Result<CompileResult> {
     anyhow::bail!("native contract compilation with layout proofs is unavailable on wasm32")
 }
 
@@ -148,7 +148,7 @@ pub fn compile_crate_output(root_file: &Path) -> anyhow::Result<ContractOutput> 
 
 /// Build deploy artifacts from a ContractOutput.
 #[cfg(not(target_arch = "wasm32"))]
-fn build_deploy_artifacts(contract_output: ContractOutput, deployer: QHashOut<F>) -> anyhow::Result<CompileResult> {
+fn build_deploy_artifacts(contract_output: ContractOutput, deployer: u64) -> anyhow::Result<CompileResult> {
     let state_tree_height = contract_output.state_tree_height() as u8;
 
     let (circuits, base_deploy_cmd) =
@@ -407,7 +407,7 @@ mod tests {
             }
         "#;
         let contract_output = psy_compiler::compile(source)?;
-        let deployer = QHashOut::<F>::default();
+        let deployer: u64 = 4242;
         let (_, base_deploy) = super::super::gen_contract_deploy_and_circuits_for_functions::<C, D>(
             deployer,
             u8::try_from(contract_output.abi.contract.state_tree_height)?,
@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(new_output.abi.contract.state_layout.slot_count, 55);
         new_output.abi.validate_layout_update_from(&old_output.abi)?;
 
-        let deployer = QHashOut::<F>::default();
+        let deployer: u64 = 4242;
         let contract_id = 42;
         let (_, base_update) = super::super::gen_contract_update_and_circuits_for_functions::<C, D>(
             contract_id,
