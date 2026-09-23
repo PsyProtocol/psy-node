@@ -30,6 +30,13 @@ priority_weight = 11   # optional, default 10
 - Duplicate URLs are dropped, keeping the first occurrence. The check is a
   plain string comparison on the trimmed URL, not a normalized comparison.
 
+A single-chain config may also set `[finalize] l1_rpc_providers`, the same
+`{ name, url, priority_weight }` table shape as `[[chains.rpc_providers]]`.
+It takes the same precedence over `l1_rpc_url`/`l1_rpc_fallback_url`. In any
+provider entry, `name` is optional: when blank it is generated as
+`<label>-rpc-<n>` (`<chain>-rpc-<index>` for `chains.rpc_providers`, the
+finalize label for `finalize.l1_rpc_providers`).
+
 ### Legacy mapping
 
 The single-chain `l1_rpc_url` / `l1_rpc_fallback_url` fields map to a
@@ -63,10 +70,14 @@ These are tunable v1 guesses. Adjust from observed production logs.
 - `RPC provider attempt failed` (WARN) — fields: `pool` (chain name),
   `provider`, `outcome`, `method`, `failover` (whether another attempt will
   run). Emitted on every failed attempt.
-- `RPC provider quarantined` (INFO) — a provider hit 5 consecutive failures
-  and stopped receiving normal traffic for 30 minutes.
-- `RPC provider restored` (INFO) — a post-quarantine probe succeeded and the
-  provider resumed normal selection.
+- `RPC provider quarantined` (INFO, field `minutes`) — a provider entered or
+  renewed quarantine: 5 consecutive failures triggered it, a failed
+  post-quarantine probe renewed it, or a least-bad fallback attempt failed on
+  a provider that was already quarantined. The provider stops receiving
+  normal traffic for `minutes` (30 by default).
+- `RPC provider restored` (INFO) — a quarantined provider succeeded and its
+  quarantine was lifted: either a post-quarantine probe succeeded, or a
+  least-bad fallback attempt succeeded on a still-quarantined provider.
 
 Logs and errors returned to callers never contain provider URLs, request
 parameters or provider response bodies. Provider URLs can embed API keys.
@@ -126,10 +137,13 @@ need that data and it never contains a URL.
 ## Known follow-ups (not fixed in this delivery)
 
 - Some pre-existing error strings still interpolate the configured URL
-  outside the pool transport, e.g. `invalid L1 rpc url: {url}` in
-  `l1_client.rs`, `finalize_bridge.rs`, `claim_withdrawals.rs` and
-  `prove_bridge.rs`. These are config-validation errors at startup, not pool
-  request errors, and are unchanged by this delivery.
+  outside the pool transport: `invalid L1 rpc url: {url}` (or `{owned}`) in
+  `l1_client.rs` (3 call sites), `daemon.rs` (2 call sites), and one call
+  site each in `finalize_bridge.rs`, `claim_withdrawals.rs` and
+  `prove_bridge.rs`. These are URL-parse errors raised at call time inside
+  per-request operation closures (re-parsing an already-scoped URL string on
+  every invocation), not config-validation errors checked once at startup.
+  They are unchanged by this delivery.
 - The duplicate-URL check in provider resolution is a textual comparison on
   the trimmed URL string, not a normalized one (e.g. trailing slash or
   scheme case differences are not deduplicated).
@@ -138,8 +152,9 @@ need that data and it never contains a URL.
   deadline — not necessarily the provider — ended the attempt early.
 - The worker (jsonrpsee, Psy Edge Worker RPC) is not migrated to
   `psy_rpc_pool` in this delivery; see design §9.
-- The GCP deploy config generator (`deploy/gcp/lib/multichain.sh`) still
-  builds `rpc_urls` with `jq unique`, which can reorder providers. The fix
-  lives on a separate, local-only deploy branch
-  (`fix/deploy-relayer-rpc-order-20260923`), not in this runtime source
-  commit.
+- The GCP deploy config generator (`deploy/gcp/lib/multichain.sh`) does not
+  exist in this runtime branch at all; it lives only on the deployment
+  branch/worktree. There it built `rpc_urls` with `jq unique`, which can
+  reorder providers. That is fixed on local branch
+  `fix/deploy-relayer-rpc-order-20260923` (commit `79778b79`, worktree
+  `psy-node-deploy-rpc-order-20260923`), not in this runtime source commit.
