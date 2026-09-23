@@ -97,7 +97,7 @@ impl<T: KVQBinaryStore> QMetaDataStoreReaderSync<F> for T {
         leaf_index: u64,
     ) -> anyhow::Result<crate::qdata::imt_contract_state::IMTContractStateLeaf<F>> {
         let _ = (checkpoint_id, user_id, contract_id, leaf_index);
-        anyhow::bail!("IMT leaf preimage not found")
+        Err(crate::qdata::imt_lookup_error::ImtLookupNotFound::LeafPreimage { leaf_index }.into())
     }
 
     async fn contract_state_imt_get_leaf_index_for_key(
@@ -108,7 +108,7 @@ impl<T: KVQBinaryStore> QMetaDataStoreReaderSync<F> for T {
         key: &QHashOut<F>,
     ) -> anyhow::Result<u64> {
         let _ = (checkpoint_id, user_id, contract_id, key);
-        anyhow::bail!("Key not found in IMT")
+        Err(crate::qdata::imt_lookup_error::ImtLookupNotFound::Key.into())
     }
 
     async fn contract_state_imt_find_predecessor(
@@ -119,7 +119,7 @@ impl<T: KVQBinaryStore> QMetaDataStoreReaderSync<F> for T {
         key: &QHashOut<F>,
     ) -> anyhow::Result<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)> {
         let _ = (checkpoint_id, user_id, contract_id, key);
-        anyhow::bail!("No predecessor found for key")
+        Err(crate::qdata::imt_lookup_error::ImtLookupNotFound::Predecessor.into())
     }
 
     async fn contract_state_imt_get_next_append_index(&self, user_id: u64, contract_id: u64) -> anyhow::Result<u64> {

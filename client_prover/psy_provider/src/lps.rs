@@ -18,10 +18,51 @@ use psy_client_data::{
 use psy_config::network_constants::{COORDINATOR_USER_TREE_HEIGHT, GLOBAL_DEPOSIT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, REALM_USER_TREE_HEIGHT};
 use psy_crypto::hash::{merkle::core::MerkleProofCore, traits::hasher::MerkleZeroHasher};
 use tracing::{debug, error, info, instrument};
+use psy_client_data::qdata::imt_lookup_error::ImtLookupNotFound;
 
 use super::{provider::RpcProvider, request::*};
 
 type F = GoldilocksField;
+
+// Existing nodes use -32001 for all handler errors. Match the complete known
+// absence message at the RPC boundary, not substrings in downstream errors.
+fn imt_rpc_error(error: RpcError, missing: ImtLookupNotFound, operation: &str) -> anyhow::Error {
+    if error.code == ErrorCode::ServerError(-32001) && error.message.as_ref() == missing.to_string() {
+        debug!(operation, error = ?error, "IMT lookup returned no entry");
+        anyhow::Error::new(missing)
+    } else {
+        error!(operation, error = ?error, "IMT RPC call failed");
+        anyhow::anyhow!("{} rpc call failed `{:?}`", operation, error)
+    }
+}
+
+#[cfg(test)]
+mod imt_error_tests {
+    use super::*;
+
+    #[test]
+    fn imt_legacy_rpc_absence_is_typed() {
+        for missing in [ImtLookupNotFound::Key, ImtLookupNotFound::LeafPreimage { leaf_index: 18157 }, ImtLookupNotFound::Predecessor] {
+            let response = RpcError { code: ErrorCode::ServerError(-32001), message: missing.to_string().into(), data: None };
+            assert!(missing.matches(&imt_rpc_error(response, missing, "test")));
+        }
+    }
+
+    #[test]
+    fn imt_rpc_other_errors_are_not_absence() {
+        let missing = ImtLookupNotFound::LeafPreimage { leaf_index: 18157 };
+        for (code, message) in [
+            (ErrorCode::InternalError, missing.to_string()),
+            (ErrorCode::ServerError(-32001), "database timeout".into()),
+            (ErrorCode::ServerError(-32001), "Leaf preimage not found at index 18158".into()),
+            (ErrorCode::ServerError(-32001), "database error: Leaf preimage not found at index 18157".into()),
+            (ErrorCode::ServerError(-32001), "Key not found in IMT".into()),
+        ] {
+            let response = RpcError { code, message: message.into(), data: None };
+            assert!(imt_rpc_error(response, missing, "test").downcast_ref::<ImtLookupNotFound>().is_none());
+        }
+    }
+}
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
@@ -1162,8 +1203,7 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
                 Ok(leaf)
             }
             ResponseResult::Error(e) => {
-                error!("RPC call failed: {:?}", e);
-                Err(anyhow::format_err!("contract_state_imt_get_leaf_preimage rpc call failed `{:?}`", e))
+                Err(imt_rpc_error(e, ImtLookupNotFound::LeafPreimage { leaf_index }, "contract_state_imt_get_leaf_preimage"))
             }
         }
     }
@@ -1193,8 +1233,7 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
                 Ok(index)
             }
             ResponseResult::Error(e) => {
-                error!("RPC call failed: {:?}", e);
-                Err(anyhow::format_err!("contract_state_imt_get_leaf_index_for_key rpc call failed `{:?}`", e))
+                Err(imt_rpc_error(e, ImtLookupNotFound::Key, "contract_state_imt_get_leaf_index_for_key"))
             }
         }
     }
@@ -1229,8 +1268,7 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
                 Ok((resp.leaf_index, resp.leaf))
             }
             ResponseResult::Error(e) => {
-                error!("RPC call failed: {:?}", e);
-                Err(anyhow::format_err!("contract_state_imt_find_predecessor rpc call failed `{:?}`", e))
+                Err(imt_rpc_error(e, ImtLookupNotFound::Predecessor, "contract_state_imt_find_predecessor"))
             }
         }
     }

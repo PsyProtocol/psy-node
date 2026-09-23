@@ -71,6 +71,63 @@ use crate::{
     ups::{ups_context_input::UserProvingSessionStartContext, ups_standard_cfc_input::UPSCFCStandardStateDeltaInput},
 };
 
+fn merge_imt_predecessors<F: RichField + PrimeField64>(
+    local: Option<(u64, IMTContractStateLeaf<F>)>,
+    remote: anyhow::Result<(u64, IMTContractStateLeaf<F>)>,
+) -> anyhow::Result<(u64, IMTContractStateLeaf<F>)> {
+    use crate::qdata::{imt_contract_state::compare_qhashout_keys, imt_lookup_error::ImtLookupNotFound};
+
+    // Equal keys prefer the local preimage, which includes earlier writes in
+    // this proof. A failed remote lookup must not silently select a local key.
+    match (local, ImtLookupNotFound::Predecessor.optional(remote)?) {
+        (Some(local), Some(remote)) => match compare_qhashout_keys(&local.1.key, &remote.1.key) {
+            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => Ok(local),
+            std::cmp::Ordering::Less => Ok(remote),
+        },
+        (Some(local), None) => Ok(local),
+        (None, Some(remote)) => Ok(remote),
+        (None, None) => Err(ImtLookupNotFound::Predecessor.into()),
+    }
+}
+
+#[cfg(test)]
+mod imt_predecessor_tests {
+    use super::*;
+    use crate::qdata::imt_lookup_error::ImtLookupNotFound;
+    use plonky2::field::{goldilocks_field::GoldilocksField as F, types::Field};
+
+    fn leaf(key: u64, value: u64) -> IMTContractStateLeaf<F> {
+        IMTContractStateLeaf::new(QHashOut::from_values(key, 0, 0, 0), QHashOut::from_values(value, 0, 0, 0), QHashOut::ZERO, F::ZERO)
+    }
+
+    #[test]
+    fn imt_predecessor_merge_propagates_remote_failure_even_with_local_candidate() {
+        for local in [None, Some((1, leaf(1, 2)))] {
+            let error = merge_imt_predecessors(local, Err(anyhow::anyhow!("remote database timeout"))).unwrap_err();
+            assert_eq!(error.to_string(), "remote database timeout");
+        }
+    }
+
+    #[test]
+    fn imt_predecessor_merge_accepts_only_explicit_absence() {
+        let local = (1, leaf(1, 2));
+        assert_eq!(merge_imt_predecessors(Some(local), Err(ImtLookupNotFound::Predecessor.into())).unwrap(), local);
+        let error = merge_imt_predecessors::<F>(None, Err(ImtLookupNotFound::Predecessor.into())).unwrap_err();
+        assert!(ImtLookupNotFound::Predecessor.matches(&error));
+        assert!(merge_imt_predecessors(Some(local), Err(ImtLookupNotFound::Key.into())).is_err());
+    }
+
+    #[test]
+    fn imt_predecessor_merge_keeps_largest_key_and_prefers_local_on_ties() {
+        let local = (1, leaf(10, 5));
+        assert_eq!(merge_imt_predecessors(Some(local), Ok((1, leaf(10, 1)))).unwrap(), local);
+        assert_eq!(merge_imt_predecessors(Some(local), Ok((2, leaf(9, 1)))).unwrap(), local);
+        let remote = (2, leaf(11, 1));
+        assert_eq!(merge_imt_predecessors(Some(local), Ok(remote)).unwrap(), remote);
+        assert_eq!(merge_imt_predecessors(None, Ok(remote)).unwrap(), remote);
+    }
+}
+
 pub trait PsyReadLocalProvingSessionStore<F: RichField> {
     fn get_current_contract_id(&self) -> F;
     fn get_current_caller_contract_id(&self) -> F;
@@ -318,27 +375,14 @@ impl<
         &mut self,
         input: &crate::qstore::imm::cmd::QSRIMTCmdFindPredecessor,
     ) -> anyhow::Result<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)> {
-        use crate::qdata::imt_contract_state::compare_qhashout_keys;
-
         let key = QHashOut::from_values(input.key[0], input.key[1], input.key[2], input.key[3]);
         let contract_id = input.contract_id as u64;
 
         let local_pred = self
             .local_state_tracker
             .find_imt_predecessor(contract_id, input.state_slot_base, input.capacity, &key);
-        let remote_pred = self.cmd_store.resolve_contract_state_imt_find_predecessor_mut(input).await.ok();
-
-        // Merge local and remote predecessors. Equal keys must prefer local because
-        // local carries the latest preimage after earlier writes in this proof.
-        let result = match (local_pred, remote_pred) {
-            (Some((local_idx, local_leaf)), Some((remote_idx, remote_leaf))) => match compare_qhashout_keys(&local_leaf.key, &remote_leaf.key) {
-                std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => (local_idx, local_leaf),
-                std::cmp::Ordering::Less => (remote_idx, remote_leaf),
-            },
-            (Some(local), None) => local,
-            (None, Some(remote)) => remote,
-            (None, None) => return Err(anyhow::anyhow!("No predecessor found")),
-        };
+        let remote_pred = self.cmd_store.resolve_contract_state_imt_find_predecessor_mut(input).await;
+        let result = merge_imt_predecessors(local_pred, remote_pred)?;
 
         tracing::info!(
             "IMT predecessor raw response: leaf_index={}, leaf.key={}, leaf.next_index={}, leaf.next_key={}, state_slot_base={}, capacity={}",

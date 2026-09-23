@@ -115,13 +115,24 @@ fn validate_imt_preimage<F: RichField + PrimeField64>(
 }
 
 fn is_imt_key_not_found_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("Key not found in IMT") || msg.contains("key not found in IMT")
+    psy_client_data::qdata::imt_lookup_error::ImtLookupNotFound::Key.matches(err)
 }
 
 fn is_imt_predecessor_not_found_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("No predecessor found")
+    psy_client_data::qdata::imt_lookup_error::ImtLookupNotFound::Predecessor.matches(err)
+}
+
+fn imt_leaf_or_empty<F: RichField>(
+    result: anyhow::Result<psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf<F>>,
+    leaf_index: u64,
+    slot_hash: QHashOut<F>,
+) -> anyhow::Result<psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf<F>> {
+    use psy_client_data::qdata::imt_lookup_error::ImtLookupNotFound;
+    match (ImtLookupNotFound::LeafPreimage { leaf_index }).optional(result)? {
+        Some(leaf) => Ok(leaf),
+        None if slot_hash == QHashOut::ZERO => Ok(Default::default()),
+        None => anyhow::bail!("IMT non-empty slot {} is missing its leaf preimage", leaf_index),
+    }
 }
 
 fn validate_contract_state_tree_height(height: u64) -> anyhow::Result<u8> {
@@ -1271,10 +1282,10 @@ impl<
                     result.extend_from_slice(&noop_dmp.old_value.0.elements);
                     result.extend_from_slice(&noop_dmp.new_value.0.elements);
 
-                    let noop_leaf = self
+                    let noop_leaf_result = self
                         .resolve_contract_state_imt_get_leaf_preimage_mut(&leaf_preimage_lookup)
-                        .await
-                        .unwrap_or_default();
+                        .await;
+                    let noop_leaf = imt_leaf_or_empty(noop_leaf_result, noop_slot_index, noop_dmp.old_value)?;
                     let witness = DPNStateCmdWitness::IMTSet(DPNIMTSetWitness {
                         delta_merkle_proofs: vec![noop_dmp.clone(), noop_dmp],
                         is_insert: false,
@@ -1365,8 +1376,8 @@ impl<
                 if !is_insert {
                     let old_leaf = match old_leaf_result {
                         Ok(existing_leaf) => existing_leaf,
-                        Err(_) => {
-                            anyhow::bail!("IMT update expects existing leaf preimage for slot index {}", leaf_slot_index)
+                        Err(error) => {
+                            return Err(error.context(format!("IMT update expects existing leaf preimage for slot index {}", leaf_slot_index)));
                         }
                     };
                     let new_preimage = psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf {
@@ -1415,7 +1426,7 @@ impl<
                     );
                 }
 
-                let old_leaf = old_leaf_result.unwrap_or_default();
+                let old_leaf = imt_leaf_or_empty(old_leaf_result, leaf_slot_index, old_slot_mp.value)?;
                 let predecessor_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdFindPredecessor {
                     key: c.key,
                     checkpoint_id,
@@ -1442,10 +1453,11 @@ impl<
                                 contract_id: contract_id_u32,
                                 leaf_index: state_slot_base,
                             };
-                            let sentinel = self
+                            let sentinel_result = self
                                 .resolve_contract_state_imt_get_leaf_preimage_mut(&sentinel_preimage_lookup)
-                                .await
-                                .unwrap_or_default();
+                                .await;
+                            let sentinel_slot = self.get_contract_state_slot(current_contract_id, F::from_canonical_u64(state_slot_base)).await?;
+                            let sentinel = imt_leaf_or_empty(sentinel_result, state_slot_base, sentinel_slot.value)?;
                             (false, state_slot_base, validate_imt_preimage(sentinel, state_slot_base, capacity)?)
                         }
                         Err(err) => return Err(err),
@@ -2069,7 +2081,38 @@ impl<F: RichField> PsyEvalSessionResult<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::imt_slot_base_from_subslot_base;
+    use super::{imt_leaf_or_empty, imt_slot_base_from_subslot_base, validate_imt_preimage};
+    use plonky2::field::{goldilocks_field::GoldilocksField as F, types::Field};
+    use psy_client_common::data::qhashout::QHashOut;
+    use psy_client_data::qdata::{imt_contract_state::IMTContractStateLeaf, imt_lookup_error::ImtLookupNotFound};
+
+    #[test]
+    fn imt_missing_preimage_only_defaults_for_a_proven_empty_slot() {
+        let missing = || Err(ImtLookupNotFound::LeafPreimage { leaf_index: 17 }.into());
+        assert_eq!(imt_leaf_or_empty::<F>(missing(), 17, QHashOut::ZERO).unwrap(), IMTContractStateLeaf::default());
+        assert!(imt_leaf_or_empty::<F>(missing(), 17, QHashOut::from_values(1, 0, 0, 0)).is_err());
+        assert!(imt_leaf_or_empty::<F>(missing(), 18, QHashOut::ZERO).is_err());
+    }
+
+    #[test]
+    fn imt_insert_preserves_lookup_and_validation_errors() {
+        for message in ["RPC timeout", "database unavailable", "corrupt leaf", "Leaf preimage not found at index 17"] {
+            let error = imt_leaf_or_empty::<F>(Err(anyhow::anyhow!(message)), 17, QHashOut::ZERO).unwrap_err();
+            assert_eq!(error.to_string(), message);
+        }
+        let invalid = IMTContractStateLeaf::<F> { next_index: F::from_canonical_u64(999), ..Default::default() };
+        assert!(imt_leaf_or_empty(validate_imt_preimage(invalid, 0, 32), 17, QHashOut::ZERO).is_err());
+    }
+
+    #[test]
+    fn imt_existing_preimage_is_preserved() {
+        let leaf = IMTContractStateLeaf::<F> { value: QHashOut::from_values(42, 0, 0, 0), ..Default::default() };
+        assert_eq!(imt_leaf_or_empty(Ok(leaf), 17, QHashOut::from_values(1, 0, 0, 0)).unwrap(), leaf);
+        assert!(!super::is_imt_key_not_found_error(&anyhow::anyhow!("RPC timeout: Key not found in IMT")));
+        assert!(!super::is_imt_predecessor_not_found_error(&anyhow::anyhow!("No predecessor found")));
+        assert!(super::is_imt_key_not_found_error(&ImtLookupNotFound::Key.into()));
+        assert!(super::is_imt_predecessor_not_found_error(&ImtLookupNotFound::Predecessor.into()));
+    }
 
     #[test]
     fn test_imt_slot_base_from_subslot_base_rounds_up_to_slot_boundary() {

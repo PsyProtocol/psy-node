@@ -8,6 +8,7 @@ pub mod hash_cache_result;
 pub mod hash_key;
 pub mod hash_key_with_id;
 pub mod imt_contract_state;
+pub mod imt_lookup_error;
 pub mod imt_proof;
 pub mod pm_jobs_completed_stats;
 pub mod pm_reward_commitment;
