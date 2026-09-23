@@ -377,6 +377,7 @@ mod tests {
             checkpoint_id: 100,
             nonce: 0,
             user_public_key_hash: [0; 4],
+            session_proof_tree_root: [0; 4],
         };
 
         let result = simulate_method(&contract_output, "set_value", &[42], &context);

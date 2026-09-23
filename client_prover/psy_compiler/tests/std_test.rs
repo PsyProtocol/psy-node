@@ -90,11 +90,11 @@ fn psystd_field_inverse_and_emit_event_work() {
 }
 
 #[test]
-fn psystd_split_bits_should_work_but_currently_fails() {
-    // Intentionally failing regression test:
-    // split_bits/sum_bits should be executable end-to-end.
+fn psystd_split_bits_sum_bits_roundtrip_works() {
+    // SumBits is weighted binary reconstruction, so split_bits followed by
+    // sum_bits must roundtrip the input value (13 = 0b1101).
     let ctx = default_context();
     let result = execute(STD_SOURCE, "split_bits_should_work", &ctx, &[13]);
     assert!(result.success, "expected success, failure={:?}", result.failure);
-    assert_write(&result, ctx.user_id, ctx.contract_id, 0, &[3]);
+    assert_write(&result, ctx.user_id, ctx.contract_id, 0, &[13]);
 }

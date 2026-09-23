@@ -14,6 +14,7 @@ fn default_context() -> ExecutionContext {
         checkpoint_id: 100,
         nonce: 0,
         user_public_key_hash: [0; 4],
+        session_proof_tree_root: [0; 4],
     }
 }
 
@@ -1003,4 +1004,62 @@ fn test_trait_with_default_method() {
 
     let output = compile(source).expect("trait with default method should compile");
     assert_eq!(output.method_count(), 1);
+}
+
+/// Regression: shift evaluation on the VM executor (DSL shifts lower to the
+/// u32 shift ops on Felt operands).
+///
+/// - Symbolic distances >= 32 must evaluate to 0; the unguarded `a << b` on
+///   u64 used to panic in debug builds for distances >= 64.
+/// - Normal distances keep their value.
+#[test]
+fn test_compile_and_execute_shifts() {
+    let source = r#"
+        const PSY_TOTAL_USERS: usize = 4;
+        const PSY_TOTAL_CONTRACTS: usize = 4;
+
+        #[contract]
+        pub struct TestContract {
+            pub value: Felt,
+        }
+
+        #[contract_implementation]
+        impl TestContract {
+            #[contract_method]
+            pub fn shifts(&mut self, ctx: &ChainContext, a: Felt, b: Felt) {
+                let three: Felt = 3;
+                let four: Felt = 4;
+                let one: Felt = 1;
+                let zero: Felt = 0;
+
+                let c1 = a << three;
+                let e1: Felt = 40;
+                require(c1 == e1, "5 << 3 == 40");
+                let c2 = a >> four;
+                let e2: Felt = 0;
+                require(c2 == e2, "5 >> 4 == 0");
+
+                let s1 = a << b;
+                require(s1 == zero, "5 << 70 == 0");
+                let s2 = one << b;
+                require(s2 == zero, "1 << 70 == 0");
+
+                let n1 = one << four;
+                let e3: Felt = 16;
+                require(n1 == e3, "1 << 4 == 16");
+            }
+        }
+    "#;
+
+    let output = compile(source).expect("compilation should succeed");
+    let method = output.abi.contract.methods.iter().find(|m| m.name == "shifts").unwrap();
+    let circuit = output.circuit_definitions.iter().find(|d| d.method_id == method.method_id).unwrap();
+
+    let state = InMemoryStateBackend::new();
+    let mut executor = VmExecutor::new(state);
+    let result = executor
+        .execute(circuit, &default_context(), &[5, 70])
+        .expect("execution should succeed");
+
+    assert!(result.success, "shift semantics must hold: {:?}", result.failure);
 }

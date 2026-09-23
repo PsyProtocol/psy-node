@@ -72,3 +72,6 @@ is_sync = [
     "psy_common_circuit/is_sync",
     "psy_network_circuit/is_sync",
 ]
+
+[dev-dependencies]
+psy_vm = { workspace = true, default-features = false, features = ["fuzz-support"] }
