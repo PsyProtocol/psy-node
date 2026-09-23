@@ -7623,6 +7623,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_rpc_pool"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "psy_scratchpad"
 version = "0.1.0"
 dependencies = [

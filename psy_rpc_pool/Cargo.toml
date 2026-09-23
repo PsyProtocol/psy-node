@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+name = "psy_rpc_pool"
+version = "0.1.0"
+
+[dependencies]
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time", "sync", "rt", "macros", "test-util"] }

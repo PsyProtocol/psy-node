@@ -28,6 +28,7 @@ members = [
     "psy_plonky2_testbed",
     "psy_worker_core",
     "psy_api_core",
+    "psy_rpc_pool",
     "psy_dummy_prover",
     "psy_cli/psy_worker_cli",
     "psy_cli/psy_cli_common",
