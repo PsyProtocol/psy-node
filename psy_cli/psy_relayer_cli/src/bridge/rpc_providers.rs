@@ -82,7 +82,8 @@ pub(crate) fn resolve_rpc_providers(
 /// distinct user input.
 pub(crate) fn warn_if_rpc_urls_ignored(label: &str, providers: &[RpcProviderConfig], urls: &[String]) {
     if !providers.is_empty() && !urls.is_empty() {
-        tracing::warn!(label, "rpc_urls is ignored because rpc_providers is set");
+        // Single-chain configs spell these l1_rpc_url / l1_rpc_providers.
+        tracing::warn!(label, "legacy RPC URLs (rpc_urls or l1_rpc_url) are ignored because an RPC provider list is set");
     }
 }
 

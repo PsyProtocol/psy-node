@@ -175,6 +175,24 @@ impl L1Config {
     }
 }
 
+/// URL list for the single-chain `[finalize]` path. The default URL is only a
+/// stand-in for a missing config; with `l1_rpc_providers` set it would be
+/// reported as an ignored `rpc_urls` entry the operator never wrote.
+fn legacy_rpc_urls(finalize: &DaemonFinalizeConfig) -> Vec<String> {
+    let primary = match finalize.l1_rpc_url.clone() {
+        Some(url) => Some(url),
+        None if finalize.l1_rpc_providers.is_empty() => Some(DEFAULT_L1_RPC_URL.to_string()),
+        None => None,
+    };
+    let mut rpc_urls: Vec<String> = primary.into_iter().collect();
+    if let Some(url) = finalize.l1_rpc_fallback_url.clone() {
+        if !url.trim().is_empty() && !rpc_urls.contains(&url) {
+            rpc_urls.push(url);
+        }
+    }
+    rpc_urls
+}
+
 fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L1Config>> {
     let mut chains = if config.chains.is_empty() {
         let deployments_network = config
@@ -188,21 +206,11 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
             .map(|protocol| protocol.chain.l1_chain_index)
             .or_else(|| (deployments_network == "localhost").then_some(0))
             .context("deployment is missing protocol.chain.l1ChainIndex")?;
-        let mut rpc_urls = vec![config
-            .finalize
-            .l1_rpc_url
-            .clone()
-            .unwrap_or_else(|| DEFAULT_L1_RPC_URL.to_string())];
-        if let Some(url) = config.finalize.l1_rpc_fallback_url.clone() {
-            if !url.trim().is_empty() && !rpc_urls.contains(&url) {
-                rpc_urls.push(url);
-            }
-        }
         vec![L1Config {
             family: default_evm_family(),
             chain_index,
             network_id: deployments_network.clone(),
-            rpc_urls,
+            rpc_urls: legacy_rpc_urls(&config.finalize),
             rpc_providers: config.finalize.l1_rpc_providers.clone(),
             deployments_network,
             state_manager: config.finalize.state_manager.clone(),
@@ -6093,6 +6101,48 @@ deployments_network = "localhostBase"
         assert_eq!(config.chains.len(), 3);
         assert_eq!(config.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert!(config.chains.iter().all(|chain| chain.family == "evm"));
+    }
+
+    #[test]
+    fn legacy_urls_skip_the_default_when_finalize_providers_are_set() {
+        let provider = crate::bridge::rpc_providers::RpcProviderConfig {
+            name: "alchemy".into(),
+            url: "https://a".into(),
+            priority_weight: 10,
+        };
+        let providers_only = DaemonFinalizeConfig {
+            l1_rpc_providers: vec![provider.clone()],
+            ..DaemonFinalizeConfig::default()
+        };
+        assert!(legacy_rpc_urls(&providers_only).is_empty());
+
+        // An explicit l1_rpc_url next to providers is a real conflict and stays visible.
+        let both = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_providers: vec![provider],
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&both), vec!["https://z".to_string()]);
+    }
+
+    #[test]
+    fn legacy_urls_default_and_deduplicate_without_providers() {
+        assert_eq!(
+            legacy_rpc_urls(&DaemonFinalizeConfig::default()),
+            vec![DEFAULT_L1_RPC_URL.to_string()]
+        );
+        let finalize = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_fallback_url: Some("https://z".into()),
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&finalize), vec!["https://z".to_string()]);
+        let finalize = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_fallback_url: Some("https://a".into()),
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&finalize), vec!["https://z".to_string(), "https://a".to_string()]);
     }
 
     #[test]
