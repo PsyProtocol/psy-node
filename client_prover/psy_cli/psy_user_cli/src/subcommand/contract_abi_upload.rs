@@ -12,7 +12,7 @@ const MAX_CONTRACT_ABI_JSON_BYTES: usize = 2 * 1024 * 1024;
 pub fn deploy_contract_content_hash(deploy_contract: &QBCDeployContract<F>) -> anyhow::Result<String> {
     let deploy_with_root = deploy_contract.clone().into_with_whitelist_root::<PsyHasher>()?;
     let content_hash = compute_deploy_contract_content_hash(
-        &deploy_with_root.deployer.to_le_bytes(),
+        deploy_with_root.deployer,
         &deploy_with_root.function_whitelist_root.to_le_bytes(),
         deploy_with_root.code_definition.state_tree_height as u64,
     );
@@ -23,7 +23,7 @@ pub fn update_contract_content_hash(update_contract: &QBCUpdateContract<F>) -> a
     let update_with_root = update_contract.clone().into_with_whitelist_root::<PsyHasher>()?;
     let content_hash = compute_update_contract_content_hash(
         update_with_root.contract_id,
-        &update_with_root.deployer.to_le_bytes(),
+        update_with_root.deployer,
         &update_with_root.function_whitelist_root.to_le_bytes(),
         update_with_root.code_definition.state_tree_height as u64,
     );

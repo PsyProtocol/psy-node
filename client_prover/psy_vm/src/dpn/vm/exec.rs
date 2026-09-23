@@ -5,7 +5,10 @@ use plonky2::{
 use psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64;
 use tiny_keccak::{Hasher as _, Keccak};
 
-use crate::dpn::ops::op_types::{decode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType};
+use crate::dpn::ops::{
+    op_types::{decode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType},
+    semantics,
+};
 
 pub struct SimpleDPNExecutor<F: RichField> {
     pub targets: Vec<F>,
@@ -264,24 +267,21 @@ impl<F: RichField> SimpleDPNExecutor<F> {
     pub fn resolve_bool(&self, id: u64) -> bool {
         let (t, index) = decode_indexed_op_id(id);
         match t {
+            // The 0/1 domain check lives in one place: semantics.
             DPNBuiltInDataType::Bool => {
                 assert!(index < self.bools.len(), "Invalid bool index");
                 self.bools[index]
             }
             DPNBuiltInDataType::Target => {
                 assert!(index < self.targets.len(), "Invalid target index");
-
-                let uv = self.targets[index].to_canonical_u64();
-                assert!(uv == 1 || uv == 0, "Invalid bool value");
-                uv == 1
+                semantics::resolve_bool_value("bool", self.targets[index].to_canonical_u64())
+                    .unwrap_or_else(|e| panic!("{e}"))
             }
 
             DPNBuiltInDataType::U32Target => {
                 assert!(index < self.u32s.len(), "Invalid u32 index");
-
-                let uv = self.u32s[index];
-                assert!(uv == 1 || uv == 0, "Invalid bool value");
-                uv == 1
+                semantics::resolve_bool_value("bool", self.u32s[index] as u64)
+                    .unwrap_or_else(|e| panic!("{e}"))
             }
             _ => panic!("Invalid data type for bool"),
         }
@@ -300,7 +300,7 @@ impl<F: RichField> SimpleDPNExecutor<F> {
         let (t, index) = decode_indexed_op_id(id);
         match t {
             DPNBuiltInDataType::HashOut160 => {
-                assert!(index < self.hashes.len(), "Invalid hash160 index");
+                assert!(index < self.hash160s.len(), "Invalid hash160 index");
                 self.hash160s[index]
             }
             _ => panic!("Invalid data type for hash160"),
@@ -351,7 +351,9 @@ impl<F: RichField> SimpleDPNExecutor<F> {
             }
             DPNBuiltInDataType::Target => {
                 assert!(index < self.targets.len(), "Invalid target index");
-                self.targets[index].to_canonical_u64() as u32
+                // The u32 lane must not silently truncate felt values; the
+                // circuit builder constrains the high 32 bits to zero.
+                semantics::cast_u32(self.targets[index].to_canonical_u64()).unwrap_or_else(|e| panic!("{e}"))
             }
             _ => panic!("Invalid data type for U32Target"),
         }
@@ -391,6 +393,7 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                 self.hashes[index][ind_real.to_canonical_u64() as usize]
             }
             DPNBuiltInDataType::HashOut160 => {
+                assert!(index < self.hash160s.len(), "Invalid hash160 index");
                 assert!(ind_real.to_canonical_u64() < 5, "Invalid index in hash160");
                 F::from_canonical_u32(self.hash160s[index][ind_real.to_canonical_u64() as usize])
             }
@@ -528,9 +531,10 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                 self.set_target_at(op.index, left * right, "Mul");
             }
             DPNOpType::Div => {
-                let left = self.resolve_target(op.inputs[0]);
-                let right = self.resolve_target(op.inputs[1]);
-                self.set_target_at(op.index, left / right, "Div");
+                let left = self.resolve_target(op.inputs[0]).to_canonical_u64();
+                let right = self.resolve_target(op.inputs[1]).to_canonical_u64();
+                let value = semantics::felt_div(left, right).unwrap_or_else(|e| panic!("{e}"));
+                self.set_target_at(op.index, F::from_canonical_u64(value), "Div");
             }
             DPNOpType::BoolNot => {
                 let left = self.resolve_bool(op.inputs[0]);
@@ -582,27 +586,18 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                 self.set_bool_at(op.index, left < right, "Lt");
             }
             DPNOpType::SplitBits => {
-                let target = self.resolve_target(op.inputs[1]);
+                let target = self.resolve_target(op.inputs[1]).to_canonical_u64();
                 let num_bits = op.inputs[0];
-                assert!(num_bits <= 64, "SplitBits: num_bits must be less than 64");
-
-                let actual_target_bits = 64 - target.to_canonical_u64().leading_zeros();
-                assert!(actual_target_bits <= num_bits as u32, "SplitBits: target bits must be less than num_bits");
-
-                self.set_bool_array_at(op.index, split_bits(target.to_canonical_u64(), num_bits), "SplitBits");
+                let bits = semantics::split_bits(target, num_bits).unwrap_or_else(|e| panic!("{e}"));
+                self.set_bool_array_at(op.index, bits, "SplitBits");
             }
             DPNOpType::SumBits => {
-                assert!(op.inputs.len() <= 64, "Sumbits: can only sum at most 64 bits");
-                let sum = op
-                    .inputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &input)| self.resolve_bool(input) as u64 * (1 << i))
-                    .sum::<u64>();
-
-                assert!(sum <= F::ORDER, "SumBits: sum must be less than field order");
-
-                self.set_target_at(op.index, F::from_canonical_u64(sum), "SumBits");
+                let bits: Vec<bool> = op.inputs.iter().map(|&input| self.resolve_bool(input)).collect();
+                // Weighted binary reconstruction; the exact sum can reach
+                // 2^64 - 1 > p - 1, so reduce with from_noncanonical_u64
+                // exactly like the circuit's field mul_add accumulation.
+                let sum = semantics::sum_bits_weighted(&bits).unwrap_or_else(|e| panic!("{e}"));
+                self.set_target_at(op.index, F::from_noncanonical_u64(sum), "SumBits");
             }
             DPNOpType::TargetAt => {
                 let r = self.resolve_target_array_ref(op.inputs[0], op.inputs[1]);
@@ -653,66 +648,51 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                 self.set_hash_at(op.index, result.elements, "HashTwoToOne");
             }
             DPNOpType::Keccak256 => {
-                let values = self.resolve_targets(&op.inputs);
-                let mut bytes = Vec::with_capacity(values.len() * 4);
-                for value in &values {
-                    let limb = value.to_canonical_u64() as u32;
-                    bytes.extend_from_slice(&limb.to_be_bytes());
-                }
-                self.set_u32_array_at(op.index, Self::keccak256_bytes_to_u32x8(&bytes).to_vec(), "Keccak256");
+                let words: Vec<u64> = self.resolve_targets(&op.inputs).iter().map(|v| v.to_canonical_u64()).collect();
+                // The circuit range-checks each word into u32; reject
+                // out-of-range words instead of truncating.
+                let digest = semantics::keccak_u32_words_be(&words).unwrap_or_else(|e| panic!("{e}"));
+                self.set_u32_array_at(op.index, digest, "Keccak256");
             }
             DPNOpType::HashPad => unimplemented!(),
             DPNOpType::Select => {
                 let condition = self.resolve_target(op.inputs[0]);
-                let result = if condition.to_canonical_u64() != 0 {
+                let result = if semantics::is_truthy(condition.to_canonical_u64()) {
                     self.resolve_target(op.inputs[1])
                 } else {
                     self.resolve_target(op.inputs[2])
                 };
                 self.set_target_at(op.index, result, "Select");
             }
-            DPNOpType::Exp => {
+            // The Constant* variants carry their constant as a resolvable
+            // input node, same convention as the shift Constant* arms. The
+            // old arms read the constant via decode_indexed_op_id, which
+            // yields the referenced node's register index, not its value —
+            // these ops were unreachable from the DSL until the op_exp
+            // routing was fixed, so the bug never surfaced.
+            DPNOpType::Exp | DPNOpType::ExpConstantPower | DPNOpType::ExpConstantBase => {
                 let left = self.resolve_target(op.inputs[0]);
                 let right = self.resolve_target(op.inputs[1]);
-                self.set_target_at(op.index, left.exp_u64(right.to_canonical_u64()), "Exp");
+                let value = semantics::felt_pow(left.to_canonical_u64(), right.to_canonical_u64());
+                self.set_target_at(op.index, F::from_canonical_u64(value), "Exp");
             }
-            DPNOpType::ExpConstantPower => {
-                let left = self.resolve_target(op.inputs[0]);
-                let (_optype, right) = decode_indexed_op_id(op.inputs[1]);
-                self.set_target_at(op.index, left.exp_u64(right as u64), "ExpConstantPower")
-            }
-            DPNOpType::ExpConstantBase => {
-                let (_optype, left) = decode_indexed_op_id(op.inputs[0]);
-                let right = self.resolve_target(op.inputs[1]);
-                self.set_target_at(
-                    op.index,
-                    F::from_noncanonical_u64(left as u64).exp_u64(right.to_canonical_u64()),
-                    "ExpConstantBase",
-                )
-            }
-            DPNOpType::Mod => {
+            // The Constant* variants carry their constant as a resolvable
+            // input node (node-ref layout) — merged here like the Exp arm
+            // above. The old arms decoded the referenced node's register
+            // index out of the input id and used it as the constant value.
+            DPNOpType::Mod | DPNOpType::ModConstantDividend | DPNOpType::ModConstantDivisor => {
                 let left = self.resolve_target(op.inputs[0]).to_canonical_u64();
                 let right = self.resolve_target(op.inputs[1]).to_canonical_u64();
-                assert!(right != 0, "Mod by zero");
-                self.set_target_at(op.index, F::from_canonical_u64(left % right), "Mod");
-            }
-            DPNOpType::ModConstantDividend => {
-                let (_optype, left) = decode_indexed_op_id(op.inputs[0]);
-                let right = self.resolve_target(op.inputs[1]).to_canonical_u64();
-                assert!(right != 0, "Mod by zero");
-                self.set_target_at(op.index, F::from_canonical_u64((left as u64) % right), "ModConstantDividend");
-            }
-            DPNOpType::ModConstantDivisor => {
-                let left = self.resolve_target(op.inputs[0]).to_canonical_u64();
-                let (_optype, right) = decode_indexed_op_id(op.inputs[1]);
-                assert!(right != 0, "Mod by zero");
-                self.set_target_at(op.index, F::from_canonical_u64(left % (right as u64)), "ModConstantDivisor");
+                let value = semantics::felt_mod("Mod", left, right).unwrap_or_else(|e| panic!("{e}"));
+                self.set_target_at(op.index, F::from_canonical_u64(value), "Mod");
             }
             DPNOpType::DivRem4 => {
-                let dividend = self.resolve_target(op.inputs[0]).to_canonical_u64();
-                let quotient = F::from_noncanonical_u64(dividend >> 2);
-                let remainder = F::from_noncanonical_u64(dividend & 3);
-                self.set_target_array_at(op.index, vec![quotient, remainder], "DivRem4");
+                let [quotient, remainder] = semantics::div_rem4(self.resolve_target(op.inputs[0]).to_canonical_u64());
+                self.set_target_array_at(
+                    op.index,
+                    vec![F::from_noncanonical_u64(quotient), F::from_noncanonical_u64(remainder)],
+                    "DivRem4",
+                );
             }
             DPNOpType::CastU32 => {
                 let (t, index) = decode_indexed_op_id(op.inputs[0]);
@@ -732,96 +712,59 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                     DPNBuiltInDataType::Target => {
                         assert!(index < self.targets.len(), "Invalid target index");
                         let value = self.targets[index].to_canonical_u64();
-                        assert!(value <= 0xffffffffu64, "Invalid u32 value");
-                        (value & 0xffffffffu64) as u32
+                        semantics::cast_u32(value).unwrap_or_else(|e| panic!("{e}"))
                     }
                     _ => panic!("Invalid data type for U32Target"),
                 };
                 self.set_u32_at(op.index, value, "CastU32");
             }
-            DPNOpType::U32And => {
+            // Constant* variants carry their constant as a resolvable input
+            // node (node-ref layout) — merged with the plain arms like Mod
+            // and Exp above.
+            DPNOpType::U32And | DPNOpType::U32AndConstant => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
                 self.set_u32_at(op.index, left & right, "U32And");
             }
-            DPNOpType::U32AndConstant => {
-                let left = self.resolve_u32(op.inputs[0]);
-                let (_optype, right) = decode_indexed_op_id(op.inputs[1]);
-                self.set_u32_at(op.index, left & (right as u32), "U32AndConstant");
-            }
-            DPNOpType::U32Or => {
+            DPNOpType::U32Or | DPNOpType::U32OrConstant => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
                 self.set_u32_at(op.index, left | right, "U32Or");
             }
-            DPNOpType::U32OrConstant => {
-                let left = self.resolve_u32(op.inputs[0]);
-                let (_optype, right) = decode_indexed_op_id(op.inputs[1]);
-                self.set_u32_at(op.index, left | (right as u32), "U32OrConstant");
-            }
-            DPNOpType::U32Xor => {
+            DPNOpType::U32Xor | DPNOpType::U32XorConstant => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
                 self.set_u32_at(op.index, left ^ right, "U32Xor");
             }
-            DPNOpType::U32XorConstant => {
-                let left = self.resolve_u32(op.inputs[0]);
-                let (_optype, right) = decode_indexed_op_id(op.inputs[1]);
-                self.set_u32_at(op.index, left ^ (right as u32), "U32XorConstant");
-            }
             DPNOpType::U32ShiftLeft => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                if right >= 32 {
-                    self.set_u32_at(op.index, 0u32, "U32ShiftLeftZero");
-                } else {
-                    self.set_u32_at(op.index, left << right, "U32ShiftLeft");
-                }
+                self.set_u32_at(op.index, semantics::u32_shl(left, right), "U32ShiftLeft");
             }
             DPNOpType::U32ShiftLeftConstantBitDistance => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                if right >= 32 {
-                    self.set_u32_at(op.index, 0u32, "U32ShiftLeftConstantBitDistanceZero");
-                } else {
-                    self.set_u32_at(op.index, left << right, "U32ShiftLeftConstantBitDistance");
-                }
+                self.set_u32_at(op.index, semantics::u32_shl(left, right), "U32ShiftLeftConstantBitDistance");
             }
             DPNOpType::U32ShiftLeftConstantValue => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                if right >= 32 {
-                    self.set_u32_at(op.index, 0u32, "U32ShiftLeftConstantValueZero");
-                } else {
-                    self.set_u32_at(op.index, left << right, "U32ShiftLeftConstantValue");
-                }
+                self.set_u32_at(op.index, semantics::u32_shl(left, right), "U32ShiftLeftConstantValue");
             }
             DPNOpType::U32ShiftRight => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                if right >= 32 {
-                    self.set_u32_at(op.index, 0u32, "U32ShiftRightZero");
-                } else {
-                    self.set_u32_at(op.index, left >> right, "U32ShiftRight");
-                }
+                self.set_u32_at(op.index, semantics::u32_shr(left, right), "U32ShiftRight");
             }
             DPNOpType::U32ShiftRightConstantBitDistance => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                if right >= 32 {
-                    self.set_u32_at(op.index, 0u32, "U32ShiftRightConstantBitDistanceZero");
-                } else {
-                    self.set_u32_at(op.index, left >> right, "U32ShiftRightConstantBitDistance");
-                }
+                self.set_u32_at(op.index, semantics::u32_shr(left, right), "U32ShiftRightConstantBitDistance");
             }
             DPNOpType::U32ShiftRightConstantValue => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                if right >= 32 {
-                    self.set_u32_at(op.index, 0u32, "U32ShiftRightConstantValueZero");
-                } else {
-                    self.set_u32_at(op.index, left >> right, "U32ShiftRightConstantValue");
-                }
+                self.set_u32_at(op.index, semantics::u32_shr(left, right), "U32ShiftRightConstantValue");
             }
             DPNOpType::CalculateMerkleRoot => unimplemented!(),
             DPNOpType::GetUserId => self.set_target_at(op.index, self.user_id, "GetUserId"),
@@ -840,9 +783,9 @@ impl<F: RichField> SimpleDPNExecutor<F> {
             DPNOpType::GetStateCommandResultSingle => unreachable!(),
             DPNOpType::GetStateCommandResultArray => unreachable!(),
             DPNOpType::UnaryInverse => {
-                let left = self.resolve_target(op.inputs[0]);
-                assert_ne!(left, F::ZERO, "Cannot inverse zero");
-                self.set_target_at(op.index, left.inverse(), "UnaryInverse");
+                let left = self.resolve_target(op.inputs[0]).to_canonical_u64();
+                let value = semantics::felt_inverse("UnaryInverse", left).unwrap_or_else(|e| panic!("{e}"));
+                self.set_target_at(op.index, F::from_canonical_u64(value), "UnaryInverse");
             }
             DPNOpType::UnaryNegative => {
                 let left = self.resolve_target(op.inputs[0]);
@@ -864,26 +807,26 @@ impl<F: RichField> SimpleDPNExecutor<F> {
             DPNOpType::U32Add => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                assert!(left as u64 + right as u64 <= 0xffffffffu64, "u32 add value too large");
-                self.set_u32_at(op.index, left + right, "U32Add");
+                let value = semantics::u32_add("u32 add", left as u64, right as u64).unwrap_or_else(|e| panic!("{e}"));
+                self.set_u32_at(op.index, value, "U32Add");
             }
             DPNOpType::U32Sub => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                assert!(left > right, "u32 sub value too low");
-                self.set_u32_at(op.index, left - right, "U32Sub");
+                let value = semantics::u32_sub("u32 sub", left as u64, right as u64).unwrap_or_else(|e| panic!("{e}"));
+                self.set_u32_at(op.index, value, "U32Sub");
             }
             DPNOpType::U32Mul => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                assert!(left as u64 * right as u64 <= 0xffffffffu64, "u32 mul value too large");
-                self.set_u32_at(op.index, left * right, "U32Mul");
+                let value = semantics::u32_mul("u32 mul", left as u64, right as u64).unwrap_or_else(|e| panic!("{e}"));
+                self.set_u32_at(op.index, value, "U32Mul");
             }
             DPNOpType::U32Div => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                assert!(right != 0, "u32 div by zero");
-                self.set_u32_at(op.index, left / right, "U32Div");
+                let value = semantics::u32_div("u32 div", left as u64, right as u64).unwrap_or_else(|e| panic!("{e}"));
+                self.set_u32_at(op.index, value, "U32Div");
             }
             DPNOpType::CastFelt => {
                 let (t, index) = decode_indexed_op_id(op.inputs[0]);
@@ -914,8 +857,7 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                 let value = match t {
                     DPNBuiltInDataType::U32Target => {
                         assert!(index < self.u32s.len(), "Invalid u32 index");
-                        assert!(self.u32s[index] <= 1, "Invalid bool value");
-                        self.u32s[index] != 0
+                        semantics::resolve_bool_value("CastBool", self.u32s[index] as u64).unwrap_or_else(|e| panic!("{e}"))
                     }
                     DPNBuiltInDataType::Bool => {
                         assert!(index < self.bools.len(), "Invalid bool index");
@@ -923,8 +865,7 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                     }
                     DPNBuiltInDataType::Target => {
                         assert!(index < self.targets.len(), "Invalid target index");
-                        assert!(self.targets[index].to_canonical_u64() <= 1, "Invalid bool value");
-                        self.targets[index].to_canonical_u64() != 0
+                        semantics::resolve_bool_value("CastBool", self.targets[index].to_canonical_u64()).unwrap_or_else(|e| panic!("{e}"))
                     }
                     _ => panic!("Invalid data type for Target"),
                 };
@@ -942,15 +883,14 @@ impl<F: RichField> SimpleDPNExecutor<F> {
             DPNOpType::U32Mod => {
                 let left = self.resolve_u32(op.inputs[0]);
                 let right = self.resolve_u32(op.inputs[1]);
-                assert!(right != 0, "u32 mod by zero");
-                self.set_u32_at(op.index, left % right, "U32Mod");
+                let value = semantics::u32_mod("u32 mod", left as u64, right as u64).unwrap_or_else(|e| panic!("{e}"));
+                self.set_u32_at(op.index, value, "U32Mod");
             }
             DPNOpType::U32Exp => {
                 let left = self.resolve_target(op.inputs[0]);
                 let right = self.resolve_target(op.inputs[1]);
-                let res = left.exp_u64(right.to_canonical_u64()).to_canonical_u64();
-                assert!(res <= 0xffffffffu64, "u32 exp value too large");
-                self.set_u32_at(op.index, res as u32, "U32Exp");
+                let value = semantics::u32_exp("u32 exp", left.to_canonical_u64(), right.to_canonical_u64()).unwrap_or_else(|e| panic!("{e}"));
+                self.set_u32_at(op.index, value, "U32Exp");
             }
             DPNOpType::Secp256k1Verify => {
                 // 8 + 8 + 8 + 8 + 8 = 40
@@ -961,7 +901,7 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                     .to_vec()
                     .iter()
                     .map(|k| {
-                        assert!(k.to_canonical_u64() < 0xffffffffu64, "secp pk.x must be [u32; 16]");
+                        assert!(k.to_canonical_u64() <= 0xffffffffu64, "secp pk.x must be [u32; 16]");
                         k.to_canonical_u64() as u32
                     })
                     .collect::<Vec<u32>>();
@@ -970,12 +910,21 @@ impl<F: RichField> SimpleDPNExecutor<F> {
                 let mut pk_sec1_bytes = vec![0x04];
                 pk_sec1_bytes.extend(pk_x_bytes);
                 pk_sec1_bytes.extend(pk_y_bytes);
-                let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_sec1_bytes).expect("secp pk must be valid");
+                // A malformed public key (not a curve point) or an
+                // out-of-range (r, s) fails verification — mapping them to
+                // false keeps parity with the eval arms (core_eval /
+                // executor). These previously `.expect`ed and aborted the
+                // whole run on attacker-controllable inputs (pk / sig are
+                // user-supplied [Felt; 16] parameters).
+                let Ok(vk) = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_sec1_bytes) else {
+                    self.set_bool_at(op.index, false, "Secp256k1VerifyBadPk");
+                    return;
+                };
                 let signature_u32 = inputs[16..32]
                     .to_vec()
                     .iter()
                     .map(|k| {
-                        assert!(k.to_canonical_u64() < 0xffffffffu64, "secp signature must be [u32; 16]");
+                        assert!(k.to_canonical_u64() <= 0xffffffffu64, "secp signature must be [u32; 16]");
                         k.to_canonical_u64() as u32
                     })
                     .collect::<Vec<u32>>();
@@ -985,7 +934,10 @@ impl<F: RichField> SimpleDPNExecutor<F> {
 
                 let signature_bytes = signature_r_bytes.iter().chain(signature_s_bytes.iter()).cloned().collect::<Vec<_>>();
 
-                let signature = Signature::from_slice(&signature_bytes).expect("secp signature must be valid");
+                let Ok(signature) = Signature::from_slice(&signature_bytes) else {
+                    self.set_bool_at(op.index, false, "Secp256k1VerifyBadSig");
+                    return;
+                };
 
                 let msg_bytes = inputs[32..36]
                     .iter()
@@ -1000,14 +952,6 @@ impl<F: RichField> SimpleDPNExecutor<F> {
             }
         }
     }
-}
-
-fn split_bits(x: u64, num_bits: u64) -> Vec<bool> {
-    let mut result = vec![false; num_bits as usize];
-    for i in 0..num_bits {
-        result[i as usize] = ((x >> i) & 1) != 0;
-    }
-    result
 }
 
 #[cfg(test)]
@@ -1464,5 +1408,86 @@ mod tests {
         let expected_bytes4_le = keccak_digest_bytes_to_u32x8(&packed_bytes4_le);
 
         assert_ne!(got, expected_bytes4_le);
+    }
+
+    #[test]
+    fn secp256k1_verify_matches_native_k256() {
+        use k256::{
+            ecdsa::{
+                signature::hazmat::{PrehashSigner, PrehashVerifier},
+                SigningKey, VerifyingKey,
+            },
+            elliptic_curve::sec1::ToEncodedPoint,
+        };
+
+        // Deterministic vector: fixed scalar, 32-byte prehash.
+        let key_bytes = [0x42u8; 32];
+        let sk = SigningKey::from_bytes(k256::FieldBytes::from_slice(&key_bytes)).unwrap();
+        let prehash: [u8; 32] = *b"psy secp256k1 regression prehash";
+        let (signature, _) = sk.sign_prehash(&prehash).unwrap();
+        let vk: VerifyingKey = sk.verifying_key().clone();
+        let sec1 = vk.to_encoded_point(false);
+        let x: [u8; 32] = sec1.as_bytes()[1..33].try_into().unwrap();
+        let y: [u8; 32] = sec1.as_bytes()[33..65].try_into().unwrap();
+        let r: [u8; 32] = signature.r().to_bytes().into();
+        let s: [u8; 32] = signature.s().to_bytes().into();
+
+        // The VM arm packs pk/sig as u32 words in reversed word order with
+        // big-endian bytes, and the msg as four full u64 words the same way.
+        fn be32_to_u32_words_le(be: &[u8; 32]) -> Vec<u64> {
+            (0..8)
+                .map(|i| u32::from_be_bytes(be[28 - 4 * i..32 - 4 * i].try_into().unwrap()) as u64)
+                .collect()
+        }
+        fn be32_to_u64_words_le(be: &[u8; 32]) -> Vec<u64> {
+            (0..4)
+                .map(|i| u64::from_be_bytes(be[24 - 8 * i..32 - 8 * i].try_into().unwrap()))
+                .collect()
+        }
+
+        fn run_secp_verify(inputs: &[u64]) -> bool {
+            let mut exec = mk_exec(vec![]);
+            for (i, word) in inputs.iter().enumerate() {
+                exec.push_external_target(i, GoldilocksField::from_canonical_u64(*word));
+            }
+            exec.process_var_def(&DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Bool,
+                index: 0,
+                op_type: DPNOpType::Secp256k1Verify,
+                inputs: (0..36).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+            });
+            exec.bools[0]
+        }
+
+        let mut valid = Vec::new();
+        valid.extend_from_slice(&be32_to_u32_words_le(&x));
+        valid.extend_from_slice(&be32_to_u32_words_le(&y));
+        valid.extend_from_slice(&be32_to_u32_words_le(&r));
+        valid.extend_from_slice(&be32_to_u32_words_le(&s));
+        valid.extend_from_slice(&be32_to_u64_words_le(&prehash));
+
+        // Packing sanity: the native verifier agrees the vector is valid.
+        assert!(vk.verify_prehash(&prehash, &signature).is_ok());
+        assert!(run_secp_verify(&valid), "valid (pk, sig, msg) must verify to true");
+
+        // Same signature over a different prehash.
+        let mut wrong_msg = valid.clone();
+        wrong_msg[32] ^= 1;
+        assert!(!run_secp_verify(&wrong_msg), "signature over another prehash must be false");
+
+        // Off-curve public key: must report false, not abort — the arm
+        // previously `.expect`ed on user-controllable pk parameters.
+        let mut bad_pk = valid.clone();
+        bad_pk[15] ^= 1;
+        assert!(!run_secp_verify(&bad_pk), "off-curve public key must be false, not a panic");
+
+        // Out-of-range r (all-ones >= n). Every word is 0xffffffff — a
+        // legal u32 word the old `< 0xffffffff` assert rejected — and the
+        // scalar must be rejected, not abort.
+        let mut bad_r = valid.clone();
+        for word in bad_r.iter_mut().take(24).skip(16) {
+            *word = 0xffffffff;
+        }
+        assert!(!run_secp_verify(&bad_r), "out-of-range r must be false, not a panic");
     }
 }

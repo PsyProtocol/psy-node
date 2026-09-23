@@ -245,7 +245,10 @@ mod tests {
             ],
             root: 1,
         };
-        prove_single_layout_append(dag, field, type_witness, 3, 0)
+        // web_tree_height follows the production append window
+        // (STATE_LAYOUT_APPEND_SUB_TREE_HEIGHT = 4); a zero-height web tree is
+        // not a supported circuit shape.
+        prove_single_layout_append(dag, field, type_witness, 3, 4)
     }
 
     #[test]

@@ -332,14 +332,14 @@ impl_qpq_serialize_bincode!(ContractConfig);
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCDeployContract")]
 pub struct PQBCDeployContract<Hash> {
-    pub deployer: Hash,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,
     pub code_root: Hash,
 }
 
 impl<Hash: QHashBase> PQBCDeployContract<Hash> {
-    pub fn new(deployer: Hash, code_definition: ContractCodeDefinition, function_whitelist: Vec<Hash>, code_root: Hash) -> Self {
+    pub fn new(deployer: u64, code_definition: ContractCodeDefinition, function_whitelist: Vec<Hash>, code_root: Hash) -> Self {
         Self {
             deployer,
             code_definition,
@@ -347,7 +347,7 @@ impl<Hash: QHashBase> PQBCDeployContract<Hash> {
             code_root,
         }
     }
-    pub fn split_into_tuple(self) -> (Hash, ContractCodeDefinition, Vec<Hash>, Hash) {
+    pub fn split_into_tuple(self) -> (u64, ContractCodeDefinition, Vec<Hash>, Hash) {
         (self.deployer, self.code_definition, self.function_whitelist, self.code_root)
     }
     pub fn into_with_whitelist_root<H: MerkleZeroHasher<Hash>>(
@@ -416,7 +416,7 @@ impl<Hash: QHashBase> PQBCDeployContractV2<Hash> {
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCDeployContractWithRoot")]
 pub struct PQBCDeployContractWithRoot<Hash> {
-    pub deployer: Hash,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,
     pub function_whitelist_root: Hash,
@@ -425,7 +425,7 @@ pub struct PQBCDeployContractWithRoot<Hash> {
 
 impl<Hash: QHashBase> PQBCDeployContractWithRoot<Hash> {
     pub fn new<H: MerkleZeroHasher<Hash>>(
-        deployer: Hash,
+        deployer: u64,
         code_definition: ContractCodeDefinition,
         function_whitelist: Vec<Hash>,
         contract_function_tree_height: u8,
@@ -451,7 +451,7 @@ impl<Hash: QHashBase> PQBCDeployContractWithRoot<Hash> {
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCUpdateContract")]
 pub struct PQBCUpdateContract<Hash> {
     pub contract_id: u64,
-    pub deployer: Hash,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,
     pub code_root: Hash,
@@ -514,7 +514,7 @@ impl<Hash: QHashBase> PQBCUpdateContract<Hash> {
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCUpdateContractWithRoot")]
 pub struct PQBCUpdateContractWithRoot<Hash> {
     pub contract_id: u64,
-    pub deployer: Hash,
+    pub deployer: u64,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,
     pub function_whitelist_root: Hash,
@@ -524,7 +524,7 @@ pub struct PQBCUpdateContractWithRoot<Hash> {
 impl<Hash: QHashBase> PQBCUpdateContractWithRoot<Hash> {
     pub fn new<H: MerkleZeroHasher<Hash>>(
         contract_id: u64,
-        deployer: Hash,
+        deployer: u64,
         code_definition: ContractCodeDefinition,
         function_whitelist: Vec<Hash>,
         contract_function_tree_height: u8,

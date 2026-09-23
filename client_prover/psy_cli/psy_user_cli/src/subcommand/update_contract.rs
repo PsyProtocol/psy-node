@@ -14,7 +14,7 @@ use psy_provider::{
 };
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
 
-use super::{args::UpdateContractArgs, contract_abi_upload};
+use super::{args::UpdateContractArgs, contract_abi_upload, resolve_deployer_user_id};
 use crate::result::{CommandResult, UpdateResult, UpdateStatus};
 
 // #[cfg(feature = "is_sync")]
@@ -33,7 +33,8 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
         .transpose()?;
 
     let fingerprint = fingerprint.unwrap_or_else(|| get_zk_fingerprint());
-    let deployer = get_public_key_info::<F>(private_key, fingerprint)?.qfhash::<PsyHasher>();
+    let public_key_hash = get_public_key_info::<F>(private_key, fingerprint)?.qfhash::<PsyHasher>();
+    let deployer = resolve_deployer_user_id(&rpc_provider, public_key_hash, args.user_id).await?;
 
     let contract_source = fs::read_to_string(&args.contract_path)?;
     // Prefer the unified compilation artifact (state_tree_height + defs + ABI).

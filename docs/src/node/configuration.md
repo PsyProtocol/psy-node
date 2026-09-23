@@ -137,7 +137,7 @@ Pre-deployed contracts and their initial state:
     "precompiles": [
       {
         "name": "system_contract",
-        "deployer": [/* hash elements */],
+        "deployer": 12345,
         "bytecode": [/* contract bytecode */]
       }
     ]

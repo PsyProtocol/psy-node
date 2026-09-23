@@ -2215,6 +2215,11 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             + PsyReadLocalProvingSessionStoreMut<F>
             + PsyCmdInputWitnessResolver<F, <S as PsyReadLocalProvingSessionStoreMut<F>>::Hasher>,
     {
+        // Untrusted-definition gate: reject malformed programs before the
+        // witness arms can panic on them mid-execution.
+        crate::dpn::vm::validate::validate_function_definition(fn_def)
+            .map_err(|e| anyhow::anyhow!("dapen function definition failed validation: {e}"))?;
+
         let start_session_ctx = sesh.get_fresh_start_ctx_for_user(sesh.get_current_user_id()).await?;
         let mut call_data_ctx = sesh
             .get_call_start_data(sesh.get_current_contract_id(), F::from_canonical_u32(fn_def.method_id), &inputs)

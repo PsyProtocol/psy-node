@@ -62,9 +62,17 @@ pub fn keccak_f1600<F: RichField + Extendable<D>, const D: usize>(
     });
 
     for rndc_i in &rndc {
-        // Theta
+        // Theta. XOR is folded pairwise with the safe xor_u64: the
+        // interleaved-sum shortcut (unsafe_xor_many_u64) provably
+        // mis-evaluates when 3+ of its inputs are 0xffffffff (its own
+        // docs say so), and an all-ones input word drives several state
+        // lanes to exactly that - caught by the circuit-side random
+        // differential (seed 13134802118721589147).
         for i in 0..5 {
-            bc[i] = builder.unsafe_xor_many_u64(&[s[i], s[i + 5], s[i + 10], s[i + 15], s[i + 20]]);
+            let mut acc = builder.xor_u64(&s[i], &s[i + 5]);
+            acc = builder.xor_u64(&acc, &s[i + 10]);
+            acc = builder.xor_u64(&acc, &s[i + 15]);
+            bc[i] = builder.xor_u64(&acc, &s[i + 20]);
         }
         for i in 0..5 {
             let t1 = builder.lrot_u64(&bc[(i + 1) % 5], 1);

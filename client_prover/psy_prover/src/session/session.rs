@@ -164,7 +164,7 @@ mod signer_mode_selection_tests {
 }
 
 pub fn gen_contract_deploy_and_circuits_for_functions<C: GenericConfig<D>, const D: usize>(
-    deployer: QHashOut<C::F>,
+    deployer: u64,
     contract_state_tree_height: u8,
     defs: &[DPNFunctionCircuitDefinition],
 ) -> anyhow::Result<(Vec<DapenContractFunctionCircuit<C, D>>, QBCDeployContract<C::F>)>
@@ -208,7 +208,7 @@ where
 /// existing on-chain state tree height of the contract (it is immutable).
 pub fn gen_contract_update_and_circuits_for_functions<C: GenericConfig<D>, const D: usize>(
     contract_id: u64,
-    deployer: QHashOut<C::F>,
+    deployer: u64,
     contract_state_tree_height: u8,
     defs: &[DPNFunctionCircuitDefinition],
 ) -> anyhow::Result<(Vec<DapenContractFunctionCircuit<C, D>>, QBCUpdateContract<C::F>)>
@@ -2588,7 +2588,7 @@ impl WalletSession {
 
     pub fn get_deploy_contract_cmd(
         &self,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
     ) -> anyhow::Result<QBCDeployContract<F>> {
         let contract_state_tree_height = derive_state_tree_height(&circuit_defs);
@@ -2600,7 +2600,7 @@ impl WalletSession {
 
     pub fn get_layout_aware_deploy_contract_cmd(
         &self,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
         abi: psy_compiler::abi::Abi,
     ) -> anyhow::Result<psy_client_data::qblock::cmds::deploy_contract::QBCDeployContractV2<F>> {
@@ -2618,7 +2618,7 @@ impl WalletSession {
 
     pub fn get_layout_aware_deploy_contract_cmd_from_json(
         &self,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
         abi_json: &str,
     ) -> anyhow::Result<psy_client_data::qblock::cmds::deploy_contract::QBCDeployContractV2<F>> {
@@ -2630,7 +2630,7 @@ impl WalletSession {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn deploy_contract_with_abi(
         &self,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
         abi: psy_compiler::abi::Abi,
     ) -> anyhow::Result<String> {
@@ -2643,14 +2643,14 @@ impl WalletSession {
     #[cfg(target_arch = "wasm32")]
     pub async fn deploy_contract_with_abi(
         &self,
-        _deployer: QHashOut<F>,
+        _deployer: u64,
         _circuit_defs: Vec<DPNFunctionCircuitDefinition>,
         _abi: psy_compiler::abi::Abi,
     ) -> anyhow::Result<String> {
         anyhow::bail!("deploy_contract_with_abi requires native layout proofs and is unavailable on wasm32")
     }
 
-    pub async fn deploy_contract(&self, deployer: QHashOut<F>, circuit_defs: Vec<DPNFunctionCircuitDefinition>) -> anyhow::Result<String> {
+    pub async fn deploy_contract(&self, deployer: u64, circuit_defs: Vec<DPNFunctionCircuitDefinition>) -> anyhow::Result<String> {
         let _ = (deployer, circuit_defs);
         anyhow::bail!("deploy_contract requires ABI; use deploy_contract_with_abi")
     }
@@ -2658,7 +2658,7 @@ impl WalletSession {
     pub fn get_update_contract_cmd(
         &self,
         contract_id: u64,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
     ) -> anyhow::Result<QBCUpdateContract<F>> {
         let contract_state_tree_height = derive_state_tree_height(&circuit_defs);
@@ -2671,7 +2671,7 @@ impl WalletSession {
     pub async fn update_contract(
         &self,
         contract_id: u64,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
     ) -> anyhow::Result<String> {
         let update_cmd = self.get_update_contract_cmd(contract_id, deployer, circuit_defs)?;
@@ -5930,8 +5930,8 @@ mod async_split_tests {
         "#
         );
         let deployer_private_key = QHashOut::<GoldilocksField>::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a")?;
-        let deployer_pk_info = wallet_session.get_zk_public_key(deployer_private_key).await?;
-        let compiled = crate::session::compile_bridge::compile_contract(&source, deployer_pk_info.qfhash::<PsyHasher>())?;
+        let _deployer_pk_info = wallet_session.get_zk_public_key(deployer_private_key).await?;
+        let compiled = crate::session::compile_bridge::compile_contract(&source, 1u64)?;
         let helper_simple_deferred_method_id = compiled
             .contract_output
             .abi
@@ -7273,8 +7273,8 @@ mod async_split_tests {
         "#;
 
         let mut wallet_session = WalletSession::new(&rpc_config).await?;
-        let deployer_pk_info = wallet_session.get_zk_public_key(deployer_private_key).await?;
-        let compiled = crate::session::compile_bridge::compile_contract(source, deployer_pk_info.qfhash::<PsyHasher>())?;
+        let _deployer_pk_info = wallet_session.get_zk_public_key(deployer_private_key).await?;
+        let compiled = crate::session::compile_bridge::compile_contract(source, 1u64)?;
         wallet_session
             .st_provider
             .deploy_contract::<F>(QDeployContractRPCRequest {

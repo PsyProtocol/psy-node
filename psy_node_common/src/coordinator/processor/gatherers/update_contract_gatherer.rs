@@ -911,9 +911,9 @@ mod tests {
     type F = PF;
     type Hasher = PoseidonHasher;
 
-    fn rand_contract_leaf(deployer: Hash, state_tree_height: u16) -> PQEDContractLeafV2<F, Hash> {
+    fn rand_contract_leaf(deployer: u64, state_tree_height: u16) -> PQEDContractLeafV2<F, Hash> {
         PQEDContractLeafV2 {
-            deployer,
+            deployer: F::from_u64_value(deployer),
             function_tree_root: Hash::qp_rand_gen(),
             code_root: Hash::qp_rand_gen(),
             state_tree_height: F::from_u16_value(state_tree_height),
@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn test_update_after_deploy_succeeds() -> anyhow::Result<()> {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let deployer = Hash::qp_rand_gen();
+        let deployer: u64 = rand::random();
         let old_leaf = rand_contract_leaf(deployer, 10);
         deploy_contract(&mut tree, 5, &old_leaf);
 
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn test_update_nonexistent_contract_fails() -> anyhow::Result<()> {
         let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let deployer = Hash::qp_rand_gen();
+        let deployer: u64 = rand::random();
         let old_leaf = rand_contract_leaf(deployer, 10);
         let new_leaf = rand_contract_leaf(deployer, 10);
 
@@ -969,12 +969,12 @@ mod tests {
     #[test]
     fn test_update_with_wrong_deployer_fails() -> anyhow::Result<()> {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let deployer = Hash::qp_rand_gen();
+        let deployer: u64 = rand::random();
         let old_leaf = rand_contract_leaf(deployer, 10);
         deploy_contract(&mut tree, 3, &old_leaf);
 
         let mut new_leaf = old_leaf;
-        new_leaf.deployer = Hash::qp_rand_gen();
+        new_leaf.deployer = F::from_u64_value(rand::random::<u64>());
 
         let result = validate_contract_update::<Hasher, F, Hash>(&tree, 3, &old_leaf, &new_leaf);
         assert!(result.is_err());
@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn test_update_with_stale_old_leaf_fails() -> anyhow::Result<()> {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let deployer = Hash::qp_rand_gen();
+        let deployer: u64 = rand::random();
         let old_leaf = rand_contract_leaf(deployer, 10);
         deploy_contract(&mut tree, 3, &old_leaf);
 
@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     fn test_update_state_tree_height_change_fails() -> anyhow::Result<()> {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let deployer = Hash::qp_rand_gen();
+        let deployer: u64 = rand::random();
         let old_leaf = rand_contract_leaf(deployer, 10);
         deploy_contract(&mut tree, 3, &old_leaf);
 
@@ -1021,7 +1021,7 @@ mod tests {
     #[test]
     fn test_update_contract_id_zero_fails() -> anyhow::Result<()> {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let deployer = Hash::qp_rand_gen();
+        let deployer: u64 = rand::random();
         let old_leaf = rand_contract_leaf(deployer, 10);
         deploy_contract(&mut tree, 0, &old_leaf);
 
@@ -1037,7 +1037,7 @@ mod tests {
     #[test]
     fn test_revert_restores_original_root() -> anyhow::Result<()> {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let deployer = Hash::qp_rand_gen();
+        let deployer: u64 = rand::random();
         let old_leaf_a = rand_contract_leaf(deployer, 10);
         let old_leaf_b = rand_contract_leaf(deployer, 12);
         deploy_contract(&mut tree, 2, &old_leaf_a);

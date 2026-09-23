@@ -12,6 +12,7 @@ fn default_context() -> ExecutionContext {
         checkpoint_id: 77,
         nonce: 0,
         user_public_key_hash: [0; 4],
+        session_proof_tree_root: [0; 4],
     }
 }
 
