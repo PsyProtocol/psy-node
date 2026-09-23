@@ -35,11 +35,14 @@ quota_group = "alchemy-account-jason"  # optional
   plain string comparison on the trimmed URL, not a normalized comparison.
 
 A single-chain config may also set `[finalize] l1_rpc_providers`, the same
-`{ name, url, priority_weight }` table shape as `[[chains.rpc_providers]]`.
-It takes the same precedence over `l1_rpc_url`/`l1_rpc_fallback_url`. In any
-provider entry, `name` is optional: when blank it is generated as
-`<label>-rpc-<n>` (`<chain>-rpc-<index>` for `chains.rpc_providers`, the
-finalize label for `finalize.l1_rpc_providers`).
+`{ name, url, priority_weight, operator, quota_group }` table shape as
+`[[chains.rpc_providers]]` (`name`, `priority_weight`, `operator` and
+`quota_group` are all optional; `weight` is accepted as an alias of
+`priority_weight`, same as above). It takes the same precedence over
+`l1_rpc_url`/`l1_rpc_fallback_url`. In any provider entry, `name` is
+optional: when blank it is generated as `<label>-rpc-<n>`
+(`<chain>-rpc-<index>` for `chains.rpc_providers`, the finalize label for
+`finalize.l1_rpc_providers`).
 
 ### Legacy mapping
 
@@ -205,27 +208,97 @@ need that data and it never contains a URL.
 ### Provider certification probe
 
 Before a provider is configured (added to `rpc_providers`), certify it with
-`psy_cli/psy_relayer_cli/tools/probe_rpc_providers.py`.
+`psy_cli/psy_relayer_cli/tools/probe_rpc_providers.py` (Python 3, standard
+library only; see `probe_rpc_providers.example.json` for the input shape).
 
-- **Input:** a JSON file listing candidate providers. Each entry gives
-  either `url_env` (the name of an environment variable holding the URL —
-  secrets stay in the environment or an `--env-file`, never in the input
-  file; the environment wins over `--env-file` on a name collision) or a
-  literal `url` for keyless endpoints.
-- **Flags:** `--chain` (which chain's candidates to probe), `--env-file`
-  (load URL env vars from a file instead of the shell environment),
-  `--confirmations` (how many blocks back to check for gaps; default `12`),
-  `--self-test` (run the tool's own unit tests).
+- **Input:** a JSON file listing chains (`chain_id`, `bridge`,
+  `state_manager`, `start_block`) and candidate providers. Each candidate
+  names its chain and either `url_env` (an environment variable holding the
+  URL — secrets stay in the environment or an `--env-file`, never in the
+  input file) or a literal `url` for a keyless public endpoint. Only
+  `http`/`https` URLs are probed. A URL with userinfo
+  (`https://user:pass@host/...`, e.g. a basic-auth provider) works: the
+  userinfo is stripped before the request is built and sent as an
+  `Authorization: Basic` header (percent-decoded first), so the DNS
+  resolver only ever sees the bare host; the header is not forwarded on a
+  redirect. The tool only ever prints the bare host of a URL, never its
+  path, query, or userinfo. Proxy environment variables (`http_proxy`,
+  `https_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`) are ignored by default and
+  every request goes directly to the provider, because a proxy would
+  receive the full candidate URL. `--use-env-proxy` opts back in to them;
+  the proxy then sees full provider URLs, including API keys in the path
+  or query, plus any userinfo credentials in the `Authorization` header,
+  and the tool prints a warning to stderr. The input is
+  validated up front: a missing input file, malformed JSON, a non-object
+  top-level value, an unknown chain referenced by a candidate, a malformed
+  chain field, or a non-string `url`/`url_env` all exit **2** with a clear
+  message instead of running any check.
+- **Flags:** `--chain NAME` (only probe that chain's candidates),
+  `--env-file PATH` (adds URL env vars from a file; the shell environment
+  wins on collision), `--confirmations N` (blocks subtracted from the
+  shared scan-end block described below; default `12`), `--use-env-proxy`
+  (honour proxy environment variables; the proxy then sees full provider
+  URLs including API keys, see **Input** above), `--self-test` (run the
+  tool's own unit tests; no external network access, only mocks and
+  loopback HTTP servers on `127.0.0.1`).
+- **Shared scan window:** for each chain, the tool first fetches
+  `eth_chainId` and `eth_blockNumber` from every candidate, then scans
+  `start_block` through one shared end block for every candidate on that
+  chain — `min(head among candidates that reported the correct chain id) -
+  confirmations` — instead of each candidate's own head, which is sampled
+  at a slightly different moment per candidate and would otherwise make
+  deposit counts incomparable. Each candidate's own head is still reported,
+  along with its lag behind the fastest candidate (`head_lag`). If a
+  chain's confirmed scan window ends up before its own `start_block`, the
+  summary prints `WARNING: <chain>: scan window is empty (scan_end <
+  start_block)` and no candidate on that chain can be `CERTIFIED`.
+- **Checks per candidate:** chain ID; `eth_call` plus `eth_getCode` on the
+  StateManager (an empty `eth_getCode` result fails the check even if the
+  call itself returned data — the address may simply be wrong for this
+  chain); `eth_sendRawTransaction("0x00")` service (a decode error counts
+  as served, even one arriving as an HTTP 4xx response whose body carries a
+  JSON-RPC error; only a JSON-RPC error response that is not
+  method-not-found/unsupported counts — a timeout, connection failure,
+  malformed URL, bare HTTP status, or non-JSON body is not served); the
+  largest successful `eth_getLogs` span near the candidate's own head; a fixed 50,000-block full-history scan over the
+  shared window, counting `DepositRecorded` logs (this is what the
+  relayer's own fixed-size chunking needs the provider to sustain — the
+  scan is deliberately not adaptive, and stops after 3 consecutive chunk
+  failures since the candidate is already `REJECTED` by then); and a
+  receipt lookup for the most recent deposit tx found anywhere (visible as
+  `receipt: "skipped: no deposit tx"` when none exists — a skipped check is
+  never silently omitted). Per-chunk scan progress
+  (`<host>: scanning blocks <from>-<to>`, host only, never a URL) is
+  printed to stderr.
 - **Verdicts**, per candidate:
-  - `CERTIFIED`: passed every check.
-  - `INCOMPLETE`: silent data loss — the provider returned fewer logs than
-    the chain's observed maximum over the probed range with no error
-    reported. This is the dangerous case: the provider looks healthy but
-    would quietly under-report events.
-  - `REJECTED`: a hard failure (unreachable, wrong chain ID, missing method
-    support, or another explicit error).
-- **Exit code 1** if any selected chain ends the probe with no `CERTIFIED`
-  candidate.
+  - `CERTIFIED`: no check errored and its deposit count equals the chain's
+    max (a candidate with the wrong chain ID never counts toward that max).
+  - `INCOMPLETE`: silent data loss — its count is lower than the chain's
+    max with no error reported. This is the dangerous case: the provider
+    looks healthy but would quietly under-report events.
+  - `REJECTED`: any check errored — unreachable, wrong chain ID, missing
+    method support, an empty scan window, or another explicit error.
+  A chain whose max deposit count is 0, or that ends the probe with at most
+  one non-`REJECTED` candidate, gets an explicit `WARNING: <chain>: nothing
+  to compare against -- certification is vacuous` line in the summary —
+  there was nothing to compare the winner against. When the chain's scan
+  window is empty (`scan_end < start_block`), only the more specific
+  `WARNING: <chain>: scan window is empty (scan_end < start_block)` line is
+  printed for that chain, not both warnings.
+- **Exit codes:**
+  - `0`: every selected chain has at least one `CERTIFIED` candidate (or
+    `--self-test` passed).
+  - `1`: `--chain` matched no candidates, any selected chain ends the probe
+    with no `CERTIFIED` candidate, or `--self-test` failed.
+  - `2`: usage or input error, before any check runs — the input fails
+    validation, no input file argument was given, the input file is
+    missing, unreadable, not UTF-8, or not JSON, the `--env-file` is
+    missing, a directory, unreadable, or not UTF-8, or `--confirmations`
+    is negative (argparse's own usage errors also exit `2`).
+  - `3`: an unexpected internal error; only `ERROR: probe crashed:
+    <Type>` is printed (the exception type, never its message or a
+    traceback, which could embed a URL).
+  - `130`: interrupted with Ctrl-C.
 - A provider must be `CERTIFIED` before it is added to `rpc_providers`/
   `rpc_urls` for that chain.
 
