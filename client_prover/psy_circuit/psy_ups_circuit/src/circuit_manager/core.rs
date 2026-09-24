@@ -63,11 +63,17 @@ use serde::Serialize;
 /// Upper bound on registered contract functions whose verifier data is kept.
 const CONTRACT_FUNCTION_INFO_CAPACITY: usize = 10_000;
 /// Default memory budget for cached contract prover circuits. One circuit is
-/// ~0.11 GiB for an ordinary token method and up to ~2 GiB for bridge methods.
+/// ~0.11 GiB for an ordinary token method and 1.1-2.1 GiB for bridge methods.
+/// Natively the budget holds the prove proxy's working set: on arc99x3 the 20
+/// most requested functions (three bridge methods among them) total ~6.5 GiB,
+/// and all 68 functions requested over five days ~11.9 GiB.
 #[cfg(not(target_arch = "wasm32"))]
-const DEFAULT_CONTRACT_PROVER_CACHE_BYTES: u64 = 4 << 30;
+const DEFAULT_CONTRACT_PROVER_CACHE_BYTES: u64 = 10 << 30;
+/// In the browser nothing is evicted by default, which keeps the wallet's
+/// behaviour as it was until a budget has been measured there; a wallet sets
+/// one per prover instance with `set_contract_prover_cache_bytes`.
 #[cfg(target_arch = "wasm32")]
-const DEFAULT_CONTRACT_PROVER_CACHE_BYTES: u64 = 1 << 30;
+const DEFAULT_CONTRACT_PROVER_CACHE_BYTES: u64 = u64::MAX / 4;
 /// Overrides the prover-circuit budget in bytes (native builds only). A budget
 /// smaller than a circuit means that circuit is rebuilt on every proof; 0
 /// disables the prover-circuit cache.
@@ -126,7 +132,7 @@ where
 {
     // One shard: quick_cache splits the byte budget evenly across shards and
     // drops any item heavier than one shard's share, which would silently keep
-    // a ~2 GiB bridge circuit out of a 4 GiB budget.
+    // a ~2 GiB bridge circuit out of a budget only twice its size.
     let options = OptionsBuilder::new()
         .estimated_items_capacity(64)
         .weight_capacity(contract_prover_cache_bytes())
@@ -350,11 +356,15 @@ where
         }
 
         let circuit = self.contract_prover_circuit(key, &dapen_fc, state_tree_height);
+        let (cached_bytes, budget_bytes, cached_circuits) = self.contract_prover_cache_usage();
         tracing::info!(
-            "register contract {} function {} estimated prover bytes {}",
+            "register contract {} function {} estimated prover bytes {}; prover cache {} of {} bytes in {} circuits",
             contract_id,
             fn_name,
-            circuit.estimated_prover_bytes()
+            circuit.estimated_prover_bytes(),
+            cached_bytes,
+            budget_bytes,
+            cached_circuits
         );
         self.contract_function_infos.insert(
             key,
@@ -414,6 +424,17 @@ where
         }
         // Still contended by another definition: compile privately, uncached.
         compile()
+    }
+
+    /// Changes the memory budget of the prover-circuit cache; circuits over the
+    /// new budget are evicted and rebuilt on their next proof.
+    pub fn set_contract_prover_cache_bytes(&self, bytes: u64) {
+        self.contract_circuits.set_capacity(bytes);
+    }
+
+    /// Estimated bytes held, byte budget and entry count of the prover-circuit cache.
+    pub fn contract_prover_cache_usage(&self) -> (u64, u64, usize) {
+        (self.contract_circuits.weight(), self.contract_circuits.capacity(), self.contract_circuits.len())
     }
 
     /// Verifier data of a registered contract function, if registered.
