@@ -12,6 +12,32 @@ multichain_specs_json() {
   printf '%s\n' "$MULTICHAIN_L1_CHAINS_JSON"
 }
 
+# Do not print RPC values: authenticated provider URLs contain secrets.
+multichain_validate_rpc_provider() {
+  case "${MULTICHAIN_L1_RPC_PROVIDER:-any}" in
+    any) cat >/dev/null; return 0 ;;
+    alchemy) ;;
+    *) echo "unknown MULTICHAIN_L1_RPC_PROVIDER" >&2; return 1 ;;
+  esac
+  jq -e '
+    def allowed($id):
+      if $id == 11155111 then "eth-sepolia"
+      elif $id == 97 then "bnb-testnet"
+      elif $id == 84532 then "base-sepolia"
+      else null end;
+    all(.[];
+      .chain_id as $id | allowed($id) as $host |
+      $host != null and
+      ([.rpc_url, (.rpc_fallback_url // "")] | all(.[];
+        . == "" or (type == "string" and test("^https://" + $host + "\\.g\\.alchemy\\.com/v2/[A-Za-z0-9_-]+$"))))
+      and (.rpc_url | type == "string" and length > 0)
+    )
+  ' >/dev/null || {
+    echo "L1 RPC policy rejected an endpoint: this GCP profile requires authenticated Alchemy URLs for every chain and fallback" >&2
+    return 1
+  }
+}
+
 multichain_runtime_file() {
   local repository_root
   repository_root="${REPO_ROOT:-${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}}"
@@ -41,6 +67,7 @@ multichain_validate_specs() {
     echo "invalid MULTICHAIN_L1_CHAINS_JSON" >&2
     return 1
   }
+  multichain_validate_rpc_provider <<<"$json" || return 1
 }
 
 multichain_require_runtime() {
@@ -75,6 +102,8 @@ multichain_require_runtime() {
     echo "invalid multichain L1 runtime manifest: $runtime_file" >&2
     return 1
   }
+
+  jq -c '.chains' "$runtime_file" | multichain_validate_rpc_provider || return 1
 
   if [ -n "${MULTICHAIN_L1_CHAINS_JSON:-}" ]; then
     multichain_validate_specs || return 1
