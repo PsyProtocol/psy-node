@@ -779,6 +779,79 @@ where
         Ok(self.eth_personal_secp_circuit().get_verifier_config_ref().clone().into())
     }
 }
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod contract_cache_tests {
+    use super::*;
+    use plonky2::plonk::config::PoseidonGoldilocksConfig;
+
+    // No production witness or private transaction data is needed for cache
+    // identity tests. Full proof replay remains a separate deployment gate.
+    fn definition() -> DPNFunctionCircuitDefinition {
+        DPNFunctionCircuitDefinition {
+            name: "cache_identity".into(),
+            method_id: 1,
+            circuit_inputs: vec![],
+            circuit_outputs: vec![],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            definitions: vec![],
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn contract_cache_rebuild_preserves_identity_and_coalesces_misses() {
+        let manager = PsyUPSStepCircuitManager::<PoseidonGoldilocksConfig, 2>::new_with_config(1);
+        manager.set_contract_prover_cache_bytes(1 << 30);
+        let key = (42, 1);
+        let def = definition();
+        let first = manager.contract_prover_circuit(key, &def, 4);
+        assert!(first.estimated_prover_bytes() > 0);
+        assert!(Arc::ptr_eq(&first, &manager.contract_prover_circuit(key, &def, 4)));
+        let fingerprint = first.get_fingerprint();
+        let verifier = serde_json::to_value(first.get_verifier_config_ref()).unwrap();
+        manager.contract_function_infos.insert(key, Arc::new(ContractFunctionCircuitInfo {
+            fn_def: def.clone(),
+            state_tree_height: 4,
+            fingerprint,
+            verifier_only: first.get_verifier_config_ref().clone(),
+        }));
+
+        manager.set_contract_prover_cache_bytes(0);
+        assert_eq!(manager.contract_prover_cache_usage(), (0, 0, 0));
+        assert!(manager.contract_function_info(key.0, key.1).is_some());
+        let rebuilt = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eq!(rebuilt.get_fingerprint(), fingerprint);
+        assert_eq!(serde_json::to_value(rebuilt.get_verifier_config_ref()).unwrap(), verifier);
+        assert_eq!(manager.contract_prover_cache_usage(), (0, 0, 0));
+        assert!(manager.contract_function_circuit(999, 1).is_err());
+
+        manager.set_contract_prover_cache_bytes(1 << 30);
+        let barrier = std::sync::Barrier::new(4);
+        let circuits = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                barrier.wait();
+                manager.contract_function_circuit(key.0, key.1).unwrap()
+            })).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+        });
+        for circuit in &circuits {
+            assert!(Arc::ptr_eq(&circuits[0], circuit));
+            assert_eq!(circuit.get_fingerprint(), fingerprint);
+        }
+
+        let changed = manager.contract_prover_circuit(key, &def, 5);
+        assert_eq!(changed.fn_builder_gadget.state_reader.contract_state_tree_height, 5);
+        assert!(!Arc::ptr_eq(&circuits[0], &changed));
+        // A cached different definition must not poison the registered inputs.
+        let restored = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert_eq!(restored.get_fingerprint(), fingerprint);
+        assert_eq!(serde_json::to_value(restored.get_verifier_config_ref()).unwrap(), verifier);
+    }
+}
+
 #[cfg(test)]
 mod eth_personal_tests {
     use plonky2::{
