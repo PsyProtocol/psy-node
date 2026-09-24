@@ -54,8 +54,103 @@ use psy_vm::{
     ups::circuit_manager::{PortableQTreeRecursion, PortableQTreeRecursionCircuitsData, PortableQTreeRecursionCircuitsProve, UPSCircuitManager},
     vm::cfc_input::DapenContractFunctionCircuitInput,
 };
-use quick_cache::sync::Cache;
+use quick_cache::{
+    sync::{Cache, DefaultLifecycle},
+    DefaultHashBuilder, OptionsBuilder, Weighter,
+};
 use serde::Serialize;
+
+/// Upper bound on registered contract functions whose verifier data is kept.
+const CONTRACT_FUNCTION_INFO_CAPACITY: usize = 10_000;
+/// Default memory budget for cached contract prover circuits. One circuit is
+/// ~0.11 GiB for an ordinary token method and 1.1-2.1 GiB for bridge methods.
+/// Natively the budget holds the prove proxy's working set: on arc99x3 the 20
+/// most requested functions (three bridge methods among them) total ~6.5 GiB,
+/// and all 68 functions requested over five days ~11.9 GiB.
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_CONTRACT_PROVER_CACHE_BYTES: u64 = 10 << 30;
+/// In the browser nothing is evicted by default, which keeps the wallet's
+/// behaviour as it was until a budget has been measured there; a wallet sets
+/// one per prover instance with `set_contract_prover_cache_bytes`.
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_CONTRACT_PROVER_CACHE_BYTES: u64 = u64::MAX / 4;
+/// Overrides the prover-circuit budget in bytes (native builds only). A budget
+/// smaller than a circuit means that circuit is rebuilt on every proof; 0
+/// disables the prover-circuit cache.
+#[cfg(not(target_arch = "wasm32"))]
+const CONTRACT_PROVER_CACHE_BYTES_ENV: &str = "PSY_CONTRACT_PROVER_CACHE_BYTES";
+
+fn contract_prover_cache_bytes() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(bytes) = std::env::var(CONTRACT_PROVER_CACHE_BYTES_ENV).ok().and_then(|value| value.parse::<u64>().ok()) {
+        return bytes;
+    }
+    DEFAULT_CONTRACT_PROVER_CACHE_BYTES
+}
+
+/// What a registered contract function needs to stay answerable without its
+/// prover data: the verifier-side facts clients ask for, and the inputs that
+/// rebuild the prover circuit on demand.
+#[derive(Debug)]
+pub struct ContractFunctionCircuitInfo<C: GenericConfig<D>, const D: usize> {
+    pub fn_def: DPNFunctionCircuitDefinition,
+    pub state_tree_height: usize,
+    pub fingerprint: QHashOut<C::F>,
+    pub verifier_only: VerifierOnlyCircuitData<C, D>,
+}
+
+/// A cached prover circuit with its weight computed once at insertion.
+#[derive(Debug)]
+pub struct ContractProverCircuit<C: GenericConfig<D>, const D: usize>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    circuit: Arc<DapenContractFunctionCircuit<C, D>>,
+    estimated_bytes: u64,
+}
+
+impl<C: GenericConfig<D>, const D: usize> Clone for ContractProverCircuit<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            circuit: self.circuit.clone(),
+            estimated_bytes: self.estimated_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContractProverCircuitWeighter;
+
+type ContractProverCircuitCache<C, const D: usize> = Cache<(u64, u32), ContractProverCircuit<C, D>, ContractProverCircuitWeighter>;
+
+fn new_contract_prover_circuit_cache<C: GenericConfig<D>, const D: usize>() -> ContractProverCircuitCache<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    // One shard: quick_cache splits the byte budget evenly across shards and
+    // drops any item heavier than one shard's share, which would silently keep
+    // a ~2 GiB bridge circuit out of a budget only twice its size.
+    let options = OptionsBuilder::new()
+        .estimated_items_capacity(64)
+        .weight_capacity(contract_prover_cache_bytes())
+        .shards(1)
+        .build()
+        .expect("contract prover cache options set every required field");
+    Cache::with_options(options, ContractProverCircuitWeighter, DefaultHashBuilder::default(), DefaultLifecycle::default())
+}
+
+impl<C: GenericConfig<D>, const D: usize> Weighter<(u64, u32), ContractProverCircuit<C, D>> for ContractProverCircuitWeighter
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    fn weight(&self, _key: &(u64, u32), value: &ContractProverCircuit<C, D>) -> u64 {
+        // Zero-weight entries would never be evicted.
+        value.estimated_bytes.max(1)
+    }
+}
 
 #[derive(Debug)]
 pub struct PsyUPSStepCircuitManager<C: GenericConfig<D> + 'static, const D: usize>
@@ -75,8 +170,12 @@ where
     pub ups_cfc_deferred_tx_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub ups_start_register_user_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
 
-    // contract circuits, lazily cached by (contract_id, fn_id)
-    pub contract_circuits: Cache<(u64, u32), Arc<DapenContractFunctionCircuit<C, D>>>,
+    // Verifier data of every registered contract function, by (contract_id, fn_id).
+    contract_function_infos: Cache<(u64, u32), Arc<ContractFunctionCircuitInfo<C, D>>>,
+    // Full prover circuits, bounded by estimated bytes and rebuilt from the
+    // function info when evicted. Keeping every compiled circuit (~0.11-2 GiB
+    // each) is what grew the user prove proxy past 20 GiB.
+    contract_circuits: ContractProverCircuitCache<C, D>,
     // method name index, cached by (contract_id, method_name)
     pub contract_method_ids: Cache<(u64, String), u32>,
 
@@ -159,7 +258,8 @@ where
             ups_cfc_standard_tx_whitelist_proof,
             ups_cfc_deferred_tx_whitelist_proof,
             ups_start_register_user_whitelist_proof,
-            contract_circuits: Cache::new(200),
+            contract_function_infos: Cache::new(CONTRACT_FUNCTION_INFO_CAPACITY),
+            contract_circuits: new_contract_prover_circuit_cache(),
             contract_method_ids: Cache::new(1000),
             zk_signature_minifier_circuit: OnceLock::new(),
             secp_circuit: OnceLock::new(),
@@ -242,36 +342,114 @@ where
         let fn_name = dapen_fc.name.clone();
         let state_tree_height = contract_code.state_tree_height as usize;
 
-        // Fast-path: already cached and still valid (function definition and
+        let key = (contract_id, fn_id);
+
+        // Fast-path: already registered and still valid (function definition and
         // state tree height are the inputs that determine the compiled circuit).
-        if let Some(cached_circuit) = self.contract_circuits.get(&(contract_id, fn_id)) {
-            if cached_circuit.fn_def == dapen_fc
-                && cached_circuit.fn_builder_gadget.state_reader.contract_state_tree_height == state_tree_height
-            {
+        if let Some(info) = self.contract_function_infos.get(&key) {
+            if info.fn_def == dapen_fc && info.state_tree_height == state_tree_height {
                 return Ok(());
             }
             // Stale: function definition or state tree height changed.
-            self.contract_circuits.remove(&(contract_id, fn_id)); 
+            self.contract_function_infos.remove(&key);
+            self.contract_circuits.remove(&key);
         }
 
-        tracing::info!("register contract {} function {}", contract_id, fn_name);
-
-        // Use get_or_insert_with for atomic check-then-insert: only one thread
-        // compiles per (contract_id, fn_id); all others block and receive the
-        // cached Arc via the guard mechanism.
-        self.contract_circuits
-            .get_or_insert_with(&(contract_id, fn_id), || {
-                Ok::<Arc<DapenContractFunctionCircuit<C, D>>, std::convert::Infallible>(Arc::new(DapenContractFunctionCircuit::<C, D>::new(
-                    &dapen_fc,
-                    state_tree_height,
-                    UPS_SESSION_PROOF_TREE_HEIGHT as usize,
-                    false,
-                )))
-            })
-            .ok();
+        let circuit = self.contract_prover_circuit(key, &dapen_fc, state_tree_height);
+        let (cached_bytes, budget_bytes, cached_circuits) = self.contract_prover_cache_usage();
+        tracing::info!(
+            "register contract {} function {} estimated prover bytes {}; prover cache {} of {} bytes in {} circuits",
+            contract_id,
+            fn_name,
+            circuit.estimated_prover_bytes(),
+            cached_bytes,
+            budget_bytes,
+            cached_circuits
+        );
+        self.contract_function_infos.insert(
+            key,
+            Arc::new(ContractFunctionCircuitInfo {
+                fn_def: dapen_fc,
+                state_tree_height,
+                fingerprint: circuit.get_fingerprint(),
+                verifier_only: circuit.get_verifier_config_ref().clone(),
+            }),
+        );
 
         self.contract_method_ids.insert((contract_id, fn_name), fn_id);
         Ok(())
+    }
+
+    /// Returns a prover circuit compiled from exactly these inputs, from the
+    /// cache when possible. Only one thread compiles per key; concurrent callers
+    /// wait on the same entry.
+    fn contract_prover_circuit(
+        &self,
+        key: (u64, u32),
+        fn_def: &DPNFunctionCircuitDefinition,
+        state_tree_height: usize,
+    ) -> Arc<DapenContractFunctionCircuit<C, D>> {
+        let compile = || {
+            Arc::new(DapenContractFunctionCircuit::<C, D>::new(
+                fn_def,
+                state_tree_height,
+                UPS_SESSION_PROOF_TREE_HEIGHT as usize,
+                false,
+            ))
+        };
+        let compiled_from_inputs = |circuit: &DapenContractFunctionCircuit<C, D>| {
+            circuit.fn_def == *fn_def && circuit.fn_builder_gadget.state_reader.contract_state_tree_height == state_tree_height
+        };
+        for _ in 0..3 {
+            if let Some(cached) = self.contract_circuits.get(&key) {
+                if compiled_from_inputs(&cached.circuit) {
+                    return cached.circuit;
+                }
+                self.contract_circuits.remove(&key);
+            }
+            let entry = match self.contract_circuits.get_or_insert_with(&key, || {
+                let circuit = compile();
+                let estimated_bytes = circuit.estimated_prover_bytes();
+                Ok::<_, std::convert::Infallible>(ContractProverCircuit { circuit, estimated_bytes })
+            }) {
+                Ok(entry) => entry,
+                Err(never) => match never {},
+            };
+            // A concurrent caller holding a different definition of the same
+            // function may have filled this key; get_or_insert_with hands back
+            // whatever it inserted, so check before trusting it.
+            if compiled_from_inputs(&entry.circuit) {
+                return entry.circuit;
+            }
+        }
+        // Still contended by another definition: compile privately, uncached.
+        compile()
+    }
+
+    /// Changes the memory budget of the prover-circuit cache; circuits over the
+    /// new budget are evicted and rebuilt on their next proof.
+    pub fn set_contract_prover_cache_bytes(&self, bytes: u64) {
+        self.contract_circuits.set_capacity(bytes);
+    }
+
+    /// Estimated bytes held, byte budget and entry count of the prover-circuit cache.
+    pub fn contract_prover_cache_usage(&self) -> (u64, u64, usize) {
+        (self.contract_circuits.weight(), self.contract_circuits.capacity(), self.contract_circuits.len())
+    }
+
+    /// Verifier data of a registered contract function, if registered.
+    pub fn contract_function_info(&self, contract_id: u64, fn_id: u32) -> Option<Arc<ContractFunctionCircuitInfo<C, D>>> {
+        self.contract_function_infos.get(&(contract_id, fn_id))
+    }
+
+    /// Prover circuit of a registered contract function, rebuilt from its
+    /// registration if it was evicted from the prover-circuit cache. Compiling
+    /// can take seconds; call it from a blocking context.
+    pub fn contract_function_circuit(&self, contract_id: u64, fn_id: u32) -> anyhow::Result<Arc<DapenContractFunctionCircuit<C, D>>> {
+        let info = self
+            .contract_function_info(contract_id, fn_id)
+            .ok_or_else(|| anyhow::format_err!("contract {} method {} is not found", contract_id, fn_id))?;
+        Ok(self.contract_prover_circuit((contract_id, fn_id), &info.fn_def, info.state_tree_height))
     }
 
     fn resolve_fn_id_by_method_name(&self, contract_code: &ContractCodeDefinition, method_name: &str) -> anyhow::Result<u32> {
@@ -396,13 +574,11 @@ where
     }
 
     async fn get_contract_method_common_data(&self, contract_id: u64, fn_id: u32) -> anyhow::Result<(QHashOut<C::F>, VerifierOnlyCircuitData<C, D>)> {
-        let key = (contract_id, fn_id);
-        let circuit = self
-            .contract_circuits
-            .get(&key)
+        let info = self
+            .contract_function_info(contract_id, fn_id)
             .ok_or_else(|| anyhow::format_err!("contract {} method {} is not found", contract_id, fn_id))?;
         tracing::info!("get contract {} method {} common data", contract_id, fn_id);
-        Ok((circuit.get_fingerprint(), circuit.get_verifier_config_ref().clone()))
+        Ok((info.fingerprint, info.verifier_only.clone()))
     }
 
     async fn prove_contract_call(
@@ -411,11 +587,7 @@ where
         fn_id: u32,
         input: &DapenContractFunctionCircuitInput<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let key = (contract_id, fn_id);
-        let fn_circuit = self
-            .contract_circuits
-            .get(&key)
-            .ok_or_else(|| anyhow::format_err!("contract {} method {} is not found", contract_id, fn_id))?;
+        let fn_circuit = self.contract_function_circuit(contract_id, fn_id)?;
         fn_circuit.prove_base(&input)
     }
 
@@ -607,6 +779,79 @@ where
         Ok(self.eth_personal_secp_circuit().get_verifier_config_ref().clone().into())
     }
 }
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod contract_cache_tests {
+    use super::*;
+    use plonky2::plonk::config::PoseidonGoldilocksConfig;
+
+    // No production witness or private transaction data is needed for cache
+    // identity tests. Full proof replay remains a separate deployment gate.
+    fn definition() -> DPNFunctionCircuitDefinition {
+        DPNFunctionCircuitDefinition {
+            name: "cache_identity".into(),
+            method_id: 1,
+            circuit_inputs: vec![],
+            circuit_outputs: vec![],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![],
+            definitions: vec![],
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn contract_cache_rebuild_preserves_identity_and_coalesces_misses() {
+        let manager = PsyUPSStepCircuitManager::<PoseidonGoldilocksConfig, 2>::new_with_config(1);
+        manager.set_contract_prover_cache_bytes(1 << 30);
+        let key = (42, 1);
+        let def = definition();
+        let first = manager.contract_prover_circuit(key, &def, 4);
+        assert!(first.estimated_prover_bytes() > 0);
+        assert!(Arc::ptr_eq(&first, &manager.contract_prover_circuit(key, &def, 4)));
+        let fingerprint = first.get_fingerprint();
+        let verifier = serde_json::to_value(first.get_verifier_config_ref()).unwrap();
+        manager.contract_function_infos.insert(key, Arc::new(ContractFunctionCircuitInfo {
+            fn_def: def.clone(),
+            state_tree_height: 4,
+            fingerprint,
+            verifier_only: first.get_verifier_config_ref().clone(),
+        }));
+
+        manager.set_contract_prover_cache_bytes(0);
+        assert_eq!(manager.contract_prover_cache_usage(), (0, 0, 0));
+        assert!(manager.contract_function_info(key.0, key.1).is_some());
+        let rebuilt = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eq!(rebuilt.get_fingerprint(), fingerprint);
+        assert_eq!(serde_json::to_value(rebuilt.get_verifier_config_ref()).unwrap(), verifier);
+        assert_eq!(manager.contract_prover_cache_usage(), (0, 0, 0));
+        assert!(manager.contract_function_circuit(999, 1).is_err());
+
+        manager.set_contract_prover_cache_bytes(1 << 30);
+        let barrier = std::sync::Barrier::new(4);
+        let circuits = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                barrier.wait();
+                manager.contract_function_circuit(key.0, key.1).unwrap()
+            })).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+        });
+        for circuit in &circuits {
+            assert!(Arc::ptr_eq(&circuits[0], circuit));
+            assert_eq!(circuit.get_fingerprint(), fingerprint);
+        }
+
+        let changed = manager.contract_prover_circuit(key, &def, 5);
+        assert_eq!(changed.fn_builder_gadget.state_reader.contract_state_tree_height, 5);
+        assert!(!Arc::ptr_eq(&circuits[0], &changed));
+        // A cached different definition must not poison the registered inputs.
+        let restored = manager.contract_function_circuit(key.0, key.1).unwrap();
+        assert_eq!(restored.get_fingerprint(), fingerprint);
+        assert_eq!(serde_json::to_value(restored.get_verifier_config_ref()).unwrap(), verifier);
+    }
+}
+
 #[cfg(test)]
 mod eth_personal_tests {
     use plonky2::{
