@@ -71,6 +71,10 @@ nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
 tokio-tungstenite = "0.24"
 futures-util = { workspace = true }
 
+# Global allocator for the native Linux binary (see src/main.rs)
+[target.'cfg(all(target_os = "linux", not(target_arch = "wasm32")))'.dependencies]
+tikv-jemallocator = "0.6.1"
+
 # Native-only build dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.build-dependencies]
 shadow-rs = { workspace = true }
