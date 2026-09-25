@@ -44,7 +44,7 @@ use crate::data::qhashout::QHashOut;
 type F = GoldilocksField;
 
 pub const GUTA_REWARDS_TREE_MAX_HEIGHT: usize = 12;
-pub const GUTA_REWARDS_TREE_V2_MAX_HEIGHT: usize = 21;
+pub const GUTA_REWARDS_TREE_V2_MAX_HEIGHT: usize = 26;
 pub const CONTRACT_DEPLOYMENT_REWARDS_MAX_HEIGHT: usize = 20;
 pub const USER_REGISTRATION_REWARDS_MAX_HEIGHT: usize = 20;
 

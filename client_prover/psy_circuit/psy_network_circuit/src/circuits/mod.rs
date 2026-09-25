@@ -1,1 +1,15 @@
 pub mod cfc_placeholder;
+pub mod claim_rewards_l1_batch_job;
+pub mod claim_rewards_l1_batch_job_tree;
+pub mod claim_rewards_l1_batch_user;
+pub mod claim_rewards_l1_batch_tree;
+pub mod claim_rewards_l1_checkpoint_upgrade;
+pub mod claim_rewards_l1_final;
+pub mod claim_rewards_l1_user_leaf;
+pub mod claim_rewards_l1_user_single_leaf;
+pub mod claim_rewards_l1_user_tree;
+pub mod claim_rewards_l1_user_two_leaf;
+pub mod claim_rewards_l1_user_header;
+pub mod claim_rewards_l1_user_two_aggregate;
+pub mod claim_rewards_l1_user_mixed;
+pub mod claim_rewards_l1_user_tree_set;
