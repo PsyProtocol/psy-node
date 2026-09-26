@@ -18,7 +18,7 @@ PSY_SKIP_KEYSTORE ?= 1
 PSY_SKIP_BUILD ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test check check-all deploy-contracts register-users query-chain-info run-all staging-server restart restart-all shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal mint-relayer-deposit-withdrawal
+.PHONY: all build clean test check check-all deploy-contracts register-users query-chain-info run-all staging-server restart restart-all shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward-batch export-all-solidity-verifier mint-relayer-deposit-withdrawal
 
 all: build
 
@@ -133,6 +133,7 @@ generate-groth16:
 
 regen-groth16-keystore:
 	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR) --include-bridge-agg
+	PSY_CLAIM_L1_REGENERATE_GROTH16=1 PSY_CLAIM_L1_GROTH16_KEYSTORE=$(KEYSTORE_DIR)/reward_batch cargo test --release -p psy_network_circuit --test claim_rewards_l1_flow five_users_with_one_three_five_seven_nine_rewards_then_batch -- --exact --nocapture
 
 regen-bridge-agg-keystore:
 	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR) --skip-deposit-append --skip-withdrawal-claim --include-bridge-agg
@@ -147,7 +148,10 @@ export-solidity-verifier-deposit:
 export-solidity-verifier-withdrawal:
 	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/withdrawal_claim ./psy-contracts/src/WithdrawalClaimVerifier.sol
 
-export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal
+export-solidity-verifier-reward-batch:
+	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/reward_batch ./psy-contracts/src/RewardBatchVerifier.sol
+
+export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward-batch
 
 BRIDGE_TO_CHECKPOINT ?= 10
 BRIDGE_FROM_CHECKPOINT ?= 1

@@ -13,6 +13,7 @@ use plonky2::{
     plonk::{circuit_data::VerifierOnlyCircuitData, config::{Hasher, PoseidonGoldilocksConfig}, proof::ProofWithPublicInputs},
 };
 use psy_client_common::data::qhashout::QHashOut;
+use parth_core::pgoldilocks::QHashOut as ParthQHashOut;
 use psy_client_data::qdata::checkpoint::PsyCheckpointLeaf;
 use psy_common_circuit::proof_minifier::pm_core::get_circuit_fingerprint_generic;
 use psy_config::network_constants::CHECKPOINT_TREE_HEIGHT;
@@ -34,6 +35,9 @@ use psy_network_circuit::circuits::{
     claim_rewards_l1_final::{RewardBatchFinalCircuit, UserRewardFinalCircuit},
     claim_rewards_l1_user_leaf::UserRewardLeafInput,
     claim_rewards_l1_user_tree_set::UserRewardTreeCircuitSet,
+};
+use psy_plonky2_circuits::bridge::circuits::bridge_wrap::{
+    RewardBatchL1Input, RewardBatchUserInput, RewardBatchWrapCircuit,
 };
 
 type C = PoseidonGoldilocksConfig;
@@ -538,9 +542,73 @@ fn five_users_with_one_three_five_seven_nine_rewards_then_batch() -> anyhow::Res
     assert_eq!(batch_proof.public_inputs[20], F::from_canonical_u64(calldata_total));
     assert_eq!(calldata_total, JOBS as u64 * AMOUNT);
 
-    // A different calldata amount or recipient must change the reconstructed
-    // rewardsRoot. This is an off-chain consistency check only: the current
-    // Groth16/L1 interface does not yet enforce this equality on-chain.
+    // The Groth16-facing wrapper must open the final Poseidon rewards root
+    // against exactly the user list that the L1 call will encode.
+    let wrap = RewardBatchWrapCircuit::new(
+        &batch_final.circuit_data().common,
+        ParthQHashOut(get_circuit_fingerprint_generic(&batch_final.circuit_data().verifier_only)),
+        batch_final.circuit_data().verifier_only.constants_sigmas_cap.height(),
+    );
+    let ledger_address_hex = std::env::var("PSY_CLAIM_L1_LEDGER_ADDRESS")
+        .unwrap_or_else(|_| "0x0000000000000000000000000000000000001234".to_string());
+    let address_hex = ledger_address_hex.trim_start_matches("0x");
+    anyhow::ensure!(address_hex.len() == 40, "L1 ledger address must be 20 bytes");
+    let mut ledger_address = [0u32; 5];
+    for (limb, target) in ledger_address.iter_mut().enumerate() {
+        let end = 40 - limb * 8;
+        *target = u32::from_str_radix(&address_hex[end - 8..end], 16)?;
+    }
+    let l1_input = RewardBatchL1Input {
+        chain_id: 31337,
+        ledger_address,
+        batch_id: 0,
+        users: l1_rewards.iter().enumerate().map(|(user, &(recipient, amount))| RewardBatchUserInput {
+            user_id: user_ids[user], recipient: [recipient, 0, 0, 0, 0], amount,
+        }).collect(),
+    };
+    let wrapped = wrap.prove_wrapper(&batch_final.circuit_data().verifier_only, &batch_proof, &l1_input)?;
+    wrap.circuit_data.verify(wrapped.clone())?;
+    let wrapper_digest = l1_input.digest(&batch_proof.public_inputs)?;
+    let mut changed_l1 = l1_input.clone();
+    changed_l1.users[0].amount += 1;
+    assert!(wrap.prove_wrapper(&batch_final.circuit_data().verifier_only, &batch_proof, &changed_l1).is_err());
+
+    changed_l1 = l1_input.clone();
+    changed_l1.users[0].recipient[0] += 1;
+    assert!(wrap.prove_wrapper(&batch_final.circuit_data().verifier_only, &batch_proof, &changed_l1).is_err());
+
+    let mut groth16_calldata = None;
+    if let Ok(path) = std::env::var("PSY_CLAIM_L1_GROTH16_KEYSTORE") {
+        let keystore = std::path::Path::new(&path);
+        fs::create_dir_all(keystore)?;
+        if std::env::var("PSY_CLAIM_L1_REGENERATE_GROTH16").as_deref() == Ok("1") {
+            for name in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
+                let file = keystore.join(name);
+                if file.exists() {
+                    fs::remove_file(file)?;
+                }
+            }
+        }
+        let shared = wrap.into_shared_groth16_wrapper(format!("{}/", keystore.display()));
+        let groth16 = shared.prove_groth16(&wrapped, None)?;
+        let expected_hi = u128::from_be_bytes(wrapper_digest[..16].try_into()?);
+        let expected_lo = u128::from_be_bytes(wrapper_digest[16..].try_into()?);
+        assert_eq!(u128::from_str_radix(&groth16.public_inputs[0], 16)?, expected_hi);
+        assert_eq!(u128::from_str_radix(&groth16.public_inputs[1], 16)?, expected_lo);
+        groth16_calldata = Some([
+            &groth16.pi_a[0], &groth16.pi_a[1],
+            &groth16.pi_b[0][1], &groth16.pi_b[0][0],
+            &groth16.pi_b[1][1], &groth16.pi_b[1][0],
+            &groth16.pi_c[0], &groth16.pi_c[1],
+        ].map(|value| format!("0x{value}")));
+        for name in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
+            assert!(keystore.join(name).is_file(), "missing {name}");
+        }
+        println!("reward batch Groth16 keystore: {}", keystore.display());
+    }
+
+    // A different calldata amount or recipient changes rewardsRoot. The
+    // wrapper also rejects both changes against the proved rewardsRoot above.
     for tampered in [(l1_rewards[0].0, l1_rewards[0].1 + 1), (l1_rewards[0].0 + 1, l1_rewards[0].1)] {
         let mut changed_rewards = l1_rewards.clone();
         changed_rewards[0] = tampered;
@@ -571,6 +639,7 @@ fn five_users_with_one_three_five_seven_nine_rewards_then_batch() -> anyhow::Res
             .enumerate()
             .map(|(user, count)| {
                 serde_json::json!({
+                    "userId": user_ids[user],
                     "user": format!("0x{:040x}", recipients[user]),
                     "amount": count * AMOUNT as usize,
                 })
@@ -580,6 +649,9 @@ fn five_users_with_one_three_five_seven_nine_rewards_then_batch() -> anyhow::Res
             "publicInputs": batch_proof.public_inputs.iter().map(|field| field.to_canonical_u64().to_string()).collect::<Vec<_>>(),
             "jobs": jobs,
             "rewards": rewards,
+            "wrapperDigest": format!("0x{}", wrapper_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+            "l1LedgerAddress": ledger_address_hex,
+            "groth16Proof": groth16_calldata,
         });
         fs::write(path, serde_json::to_vec_pretty(&fixture)?)?;
     }

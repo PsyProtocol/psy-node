@@ -19,6 +19,10 @@ psy_client_data = { workspace = true, default-features = false }
 psy_crypto = { workspace = true }
 psy_config = { workspace = true }
 
+[dev-dependencies]
+parth_core = { workspace = true }
+psy_plonky2_circuits = { workspace = true }
+
 
 [features]
 # default = ["is_sync"]
