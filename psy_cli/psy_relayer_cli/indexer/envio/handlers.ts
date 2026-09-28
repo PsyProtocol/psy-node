@@ -211,6 +211,8 @@ Bridge.DepositRecorded.handler(async ({ event, context }) => {
     chain_index: chainIndex,
     leaf_hash: leafHash,
     block_number: blockNumber,
+    // Already fetched by Envio; do not issue an additional L1 RPC request.
+    block_timestamp: BigInt(event.block.timestamp),
     tx_hash: txHash,
   });
   const poseidonLeaf = computePoseidonDepositLeaf(

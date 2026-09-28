@@ -11,6 +11,7 @@ type Deposit @entity {
   chain_index: Int!
   leaf_hash: String!
   block_number: Int!
+  block_timestamp: BigInt          # Unix seconds; nullable for pre-upgrade rows
   tx_hash: String!
 }
 

@@ -16,6 +16,7 @@ export const Deposit = {
   note_commitment: "String",
   leaf_hash: "String",
   block_number: "Int",
+  block_timestamp: "BigInt", // nullable in schema.graphql for pre-upgrade rows
   tx_hash: "String",
 };
 
