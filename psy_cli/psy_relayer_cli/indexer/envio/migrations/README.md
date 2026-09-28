@@ -46,6 +46,11 @@ can keep reading the augmented schema because the new field is additive.
    deployed. Preserve the live `RpcSource` polling patch when installing
    dependencies. Inspect the generated `Deposit` and `envio_history_Deposit`
    definitions: both must have nullable numeric `block_timestamp`.
+   **Required for Envio 2.32.10:** apply `scripts/patch-history-backfill.py`
+   before building and run it with `--check` on the final installed packages.
+   See `../HISTORY_BACKFILL_FIX.md`. The original framework history insert is
+   positional and is incompatible with the additive migration's physical column
+   order. Both the ReScript source and runtime JavaScript must be patched.
 3. Stop only the Envio writer. Confirm the exact target database and schema.
    Apply `001-deposit-block-timestamp.sql` using `psql -X`,
    `ON_ERROR_STOP=1`, and an explicit `envio_schema` variable. It only adds the

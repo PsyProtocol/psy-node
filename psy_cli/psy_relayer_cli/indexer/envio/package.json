@@ -3,10 +3,11 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "postinstall": "python3 scripts/patch-history-backfill.py",
     "test": "node --test tests/*.test.cjs",
     "dev": "envio dev --config ./config.yaml",
-    "codegen": "envio codegen --config ./config.yaml",
-    "start": "envio start --config ./config.yaml"
+    "codegen": "python3 scripts/patch-history-backfill.py && envio codegen --config ./config.yaml && python3 scripts/patch-history-backfill.py",
+    "start": "python3 scripts/patch-history-backfill.py --check && envio start --config ./config.yaml"
   },
   "devDependencies": {
     "envio": "2.32.10",
