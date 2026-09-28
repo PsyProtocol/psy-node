@@ -147,83 +147,9 @@ build_generated_rescript() {
 }
 
 patch_envio_rpc_source() {
-  local rpc_source_js="$ENVIO_HOME/node_modules/envio/src/sources/RpcSource.res.js"
-  [ -f "$rpc_source_js" ] || return 0
-
-  # Envio's RPC source polls eth_blockNumber every 1s by default. In staging,
-  # RPC is only a fallback behind HyperSync, so keep fallback polling modest.
-  python3 - "$rpc_source_js" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-
-text = text.replace(
-    "var maxSuggestedBlockIntervalKey = \"max\";\n\n",
-    """var maxSuggestedBlockIntervalKey = \"max\";
-
-function __psyRpcMeterEvery(method) {
-  if (method === \"eth_blockNumber\") {
-    return Number(process.env.ENVIO_RPC_HEIGHT_LOG_EVERY || \"300\");
-  }
-  if (method === \"eth_getLogs\") {
-    return Number(process.env.ENVIO_RPC_GET_LOGS_LOG_EVERY || \"100\");
-  }
-  return 100;
-}
-
-function __psyRpcMeter(method, details) {
-  if (process.env.ENVIO_RPC_METERING === \"0\") {
-    return;
-  }
-  var key = \"__psyEnvioRpcMeter_\" + method;
-  globalThis[key] = (globalThis[key] || 0) + 1;
-  var count = globalThis[key];
-  var every = __psyRpcMeterEvery(method);
-  if (every > 0 && count % every === 0) {
-    console.warn(\"[psy-rpc-meter] source=envio method=\" + method + \" count=\" + String(count) + \" \" + details);
-  }
-}
-
-""",
-)
-
-text = text.replace(
-    "  var latestFetchedBlockPromise = loadBlock(toBlock);\n"
-    "  var logsPromise = provider.getLogs(Ethers.CombinedFilter.toFilter({",
-    "  var latestFetchedBlockPromise = loadBlock(toBlock);\n"
-    "  __psyRpcMeter(\"eth_getLogs\", \"fromBlock=\" + String(fromBlock) + \" toBlock=\" + String(toBlock) + \" partition=\" + String(partitionId));\n"
-    "  var logsPromise = provider.getLogs(Ethers.CombinedFilter.toFilter({",
-)
-
-text = text.replace(
-    "          pollingInterval: 1000,\n",
-    "          pollingInterval: Number(process.env.ENVIO_RPC_POLLING_INTERVAL_MILLIS || \"1000\"),\n",
-)
-
-text = text.replace(
-    "          getHeightOrThrow: (function () {\n"
-    "              return Rest.$$fetch(Rpc.GetBlockHeight.route, undefined, client);\n"
-    "            }),\n",
-    "          getHeightOrThrow: (function () {\n"
-    "              __psyRpcMeter(\"eth_blockNumber\", \"host=\" + urlHost + \" pollingIntervalMs=\" + String(Number(process.env.ENVIO_RPC_POLLING_INTERVAL_MILLIS || \"1000\")));\n"
-    "              return Rest.$$fetch(Rpc.GetBlockHeight.route, undefined, client);\n"
-    "            }),\n",
-)
-
-required_markers = [
-    "function __psyRpcMeter(method, details)",
-    "__psyRpcMeter(\"eth_getLogs\"",
-    "ENVIO_RPC_POLLING_INTERVAL_MILLIS",
-    "__psyRpcMeter(\"eth_blockNumber\"",
-]
-missing = [marker for marker in required_markers if marker not in text]
-if missing:
-    raise SystemExit("failed to patch Envio RPC source; missing markers: " + ", ".join(missing))
-
-path.write_text(text)
-PY
+  # Patch both the ReScript source and generated JS: codegen/build used to erase
+  # the generated-only patch. Unknown dependency layouts now fail closed.
+  python3 /opt/parth/envio/patch-envio-rpc-source.py --home "$ENVIO_HOME"
 }
 
 bash /tmp/mount-data-disk.sh
@@ -233,6 +159,7 @@ if ! command -v pnpm >/dev/null 2>&1; then
 fi
 
 cd "$ENVIO_HOME"
+install -m 0755 /tmp/patch-envio-rpc-source.py /opt/parth/envio/patch-envio-rpc-source.py
 ENVIO_POSTGRES_PASSWORD_ENCODED="$(url_encode "$ENVIO_PG_PASSWORD")"
 write_envio_config
 
@@ -291,6 +218,10 @@ build_envio_rescript_dependency
 # reuse stale generated handlers after contract events change.
 pnpm exec envio codegen --config ./config.yaml
 build_generated_rescript
+
+# codegen may install dependencies; reapply and verify the final runtime package.
+patch_envio_rpc_source
+python3 /opt/parth/envio/patch-envio-rpc-source.py --home "$ENVIO_HOME" --check
 
 patch_generated_compose
 
@@ -354,7 +285,8 @@ After=network-online.target docker.service
 Type=simple
 WorkingDirectory=/opt/parth/envio/current
 EnvironmentFile=/opt/parth/envio/current/.env
-ExecStart=/usr/local/bin/pnpm dev
+ExecStartPre=/usr/bin/python3 /opt/parth/envio/patch-envio-rpc-source.py --home /opt/parth/envio/current --check
+ExecStart=/usr/local/bin/pnpm start
 Restart=always
 RestartSec=5
 TimeoutStopSec=60

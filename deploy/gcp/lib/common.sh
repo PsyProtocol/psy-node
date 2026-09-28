@@ -354,7 +354,7 @@ run_remote_script() {
 
   remote="/tmp/$(basename "$script_path")"
   scp_to_remote "$name" "$script_path" "$remote"
-  for support in install-docker.sh mount-data-disk.sh prepare-parth-host.sh nostr-maintenance.sh write-relayer-config.sh envio-config.sh; do
+  for support in install-docker.sh mount-data-disk.sh prepare-parth-host.sh nostr-maintenance.sh write-relayer-config.sh envio-config.sh patch-envio-rpc-source.py; do
     if [ -f "$GCP_DIR/remote/$support" ]; then
       scp_to_remote "$name" "$GCP_DIR/remote/$support" "/tmp/$support"
     elif [ -f "$GCP_DIR/lib/$support" ]; then
