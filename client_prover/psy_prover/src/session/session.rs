@@ -1060,11 +1060,198 @@ mod personal_registration_tests {
     }
 }
 
+/// Checkpoint against which registration-tree membership is verified.
+///
+/// Registration state (user ids and registration-tree merkle proofs) is
+/// served by the coordinator and global across realms, so the checkpoint
+/// must come from the coordinator too. A realm's latest checkpoint can lag
+/// behind the coordinator's (e.g. realm 0 catching up while a realm-1 user
+/// just registered); using the realm checkpoint would request registration
+/// proofs at a checkpoint older than the registration itself.
+#[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
+#[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+async fn registration_checkpoint_id(provider: &RpcProvider) -> anyhow::Result<u64> {
+    Ok(provider.get_coordinator_latest_block_state().await?.checkpoint_id)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod registration_checkpoint_tests {
+    use std::{
+        collections::HashMap,
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        sync::mpsc::{channel, Receiver},
+        time::Duration,
+    };
+
+    use super::*;
+
+    const MOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Serves exactly `expected_requests` JSON-RPC requests (one request per
+    /// connection, `Connection: close`) on an ephemeral localhost port.
+    /// `respond` maps each parsed request to its JSON-RPC `result` payload.
+    ///
+    /// Returns the mock base URL and a channel that resolves once every
+    /// request was served (or with the first handler error). Waiting on the
+    /// channel via `await_mock` converts a silent hang into a test failure
+    /// instead of blocking forever inside `accept`.
+    fn spawn_jsonrpc_mock(
+        expected_requests: usize,
+        respond: impl Fn(&serde_json::Value) -> anyhow::Result<serde_json::Value> + Send + 'static,
+    ) -> anyhow::Result<(String, Receiver<anyhow::Result<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                for _ in 0..expected_requests {
+                    let (mut stream, _) = listener.accept()?;
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line)?;
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            content_length = value.trim().parse()?;
+                        }
+                    }
+                    let mut request_body = vec![0u8; content_length];
+                    reader.read_exact(&mut request_body)?;
+                    let request = serde_json::from_slice::<serde_json::Value>(&request_body)?;
+                    let result = respond(&request)?;
+                    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": result }).to_string();
+                    drop(reader);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )?;
+                    stream.flush()?;
+                }
+                Ok(())
+            })();
+            let _ = tx.send(result);
+        });
+        Ok((url, rx))
+    }
+
+    /// Waits for the mock server to finish, failing the test if it never does.
+    fn await_mock(rx: Receiver<anyhow::Result<()>>) -> anyhow::Result<()> {
+        rx.recv_timeout(MOCK_TIMEOUT)
+            .map_err(|_| anyhow::format_err!("coordinator mock did not complete within {:?}", MOCK_TIMEOUT))?
+    }
+
+    /// Realm 0 points at a dead port: registration state is global and must be
+    /// served by the coordinator even when the realm is unavailable or behind.
+    fn mock_provider(coordinator_url: String) -> RpcProvider {
+        RpcProvider {
+            client: std::sync::Arc::new(reqwest::Client::new()),
+            realm_configs: HashMap::from([(0, vec!["http://127.0.0.1:1".to_string()])]),
+            coordinator_configs: HashMap::from([(0, vec![coordinator_url])]),
+            users_per_realm: 1_048_576,
+            current_user_id: 0,
+        }
+    }
+
+    /// Minimal WalletSession: the user-id resolution path only touches
+    /// `st_provider`, so the wallet/circuit/job fields stay empty.
+    fn mock_wallet_session(provider: RpcProvider) -> WalletSession {
+        WalletSession {
+            wallet: PsyMemoryWallet::new(Vec::new()),
+            circuit_info: SessionCircuitInfoStore::new(),
+            st_provider: provider,
+            local_proving_job_manager: JobManager::empty(),
+            user_session_mgrs: DashMap::new(),
+        }
+    }
+
+    fn block_state_result(checkpoint_id: u64) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(psy_client_data::qdata::checkpoint::PsyBlockState {
+            checkpoint_id,
+            ..Default::default()
+        })?)
+    }
+
+    /// Asserts the registration proof is requested at the coordinator
+    /// checkpoint (57_812), not the lagging realm checkpoint (56_029).
+    fn registration_proof_result(public_key: QHashOut<F>, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            request["params"]["checkpoint_id"].as_u64() == Some(57_812),
+            "registration proof requested at the realm checkpoint instead of the coordinator checkpoint"
+        );
+        Ok(serde_json::to_value(MerkleProofCore {
+            root: QHashOut::ZERO,
+            value: public_key,
+            index: 0,
+            siblings: Vec::new(),
+        })?)
+    }
+
+    #[tokio::test]
+    async fn registration_checkpoint_comes_from_coordinator_when_realm_zero_is_behind() -> anyhow::Result<()> {
+        let (url, rx) = spawn_jsonrpc_mock(1, |request| {
+            anyhow::ensure!(
+                request["method"] == "psy_get_latest_l2_block_state",
+                "unexpected RPC method: {}",
+                request["method"]
+            );
+            block_state_result(57_812)
+        })?;
+
+        // Realm 0 is unavailable at its old checkpoint (56_029); a newly
+        // registered realm-1 user must still use the coordinator's 57_812.
+        let checkpoint = registration_checkpoint_id(&mock_provider(url)).await?;
+        await_mock(rx)?;
+        assert_eq!(checkpoint, 57_812);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_registered_user_id_uses_coordinator_checkpoint_when_realm_zero_is_behind() -> anyhow::Result<()> {
+        let public_key = QHashOut::<F>::from_values(3, 1, 4, 1);
+        let user_id = 1_048_576; // realm 1, while realm 0 is at the dead port
+        let (url, rx) = spawn_jsonrpc_mock(3, move |request| match request["method"].as_str().unwrap_or_default() {
+            "psy_get_user_ids_for_public_key" => Ok(serde_json::json!([user_id])),
+            "psy_get_latest_l2_block_state" => block_state_result(57_812),
+            "psy_get_user_registration_tree_merkle_proof" => registration_proof_result(public_key, request),
+            method => anyhow::bail!("unexpected RPC method: {}", method),
+        })?;
+
+        let wallet_session = mock_wallet_session(mock_provider(url));
+        let resolved = wallet_session.resolve_registered_user_id(public_key).await?;
+        await_mock(rx)?;
+        assert_eq!(resolved, user_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_registered_user_id_with_hint_uses_coordinator_checkpoint_when_realm_zero_is_behind() -> anyhow::Result<()> {
+        let public_key = QHashOut::<F>::from_values(2, 7, 1, 8);
+        let user_id = 1_048_576;
+        let (url, rx) = spawn_jsonrpc_mock(2, move |request| match request["method"].as_str().unwrap_or_default() {
+            "psy_get_latest_l2_block_state" => block_state_result(57_812),
+            "psy_get_user_registration_tree_merkle_proof" => registration_proof_result(public_key, request),
+            method => anyhow::bail!("unexpected RPC method: {}", method),
+        })?;
+
+        let wallet_session = mock_wallet_session(mock_provider(url));
+        let resolved = wallet_session.resolve_registered_user_id_with_hint(public_key, user_id).await?;
+        await_mock(rx)?;
+        assert_eq!(resolved, user_id);
+        Ok(())
+    }
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
 impl WalletSession {
     async fn resolve_registered_user_id_with_hint(&self, public_key: QHashOut<F>, hinted_user_id: u64) -> anyhow::Result<u64> {
-        let latest_checkpoint_id = self.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let latest_checkpoint_id = registration_checkpoint_id(&self.st_provider).await?;
         let registration_id = get_registration_id_from_user_id(hinted_user_id);
         let mp = self
             .st_provider
@@ -1093,7 +1280,7 @@ impl WalletSession {
         }
         candidate_ids.sort_unstable();
         candidate_ids.dedup();
-        let latest_checkpoint_id = self.st_provider.get_latest_block_state().await?.checkpoint_id;
+        let latest_checkpoint_id = registration_checkpoint_id(&self.st_provider).await?;
         tracing::info!(
             public_key = %public_key,
             latest_checkpoint_id,
