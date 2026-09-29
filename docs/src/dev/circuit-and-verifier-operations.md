@@ -275,10 +275,10 @@ EndCap metadata, GUTA, cache, verifier JSON, network fingerprint, ordinary circu
 When triggered, the current target is:
 
 ```bash
-make generate-genesis-data
+PSY_RELAYER_MULTISIG_ACCOUNT='<public-multisig-account-json>' PSY_MULTISIG_POLICY_ARTIFACT='<approved-policy-compiler-artifact-json>' make generate-genesis-data
 ```
 
-It runs `./target/release/psy_dev_cli generate-genesis-data` (`Makefile:113-114`). Feed registration 2 from an encrypted UTC JSON keystore (`PSY_BRIDGE_RELAYER_KEYSTORE_PATH` / `BRIDGE_RELAYER_KEYSTORE_PATH` / `KEYSTORE_PATH` plus `WALLET_PASSWORD`); see [genesis-generation.md](genesis-generation.md) section 1.2.1. The generator writes root `genesis.json`, root `private_keys.json`, and `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Root `genesis.json` and `private_keys.json` are local operational artifacts. Never package or publish `private_keys.json`; never include generated private keys in a release artifact.
+It runs `./target/release/psy_dev_cli generate-genesis-data` with required `--relayer-multisig-account` and `--multisig-policy-artifact` public file paths (`Makefile:107-112`). Registration 2 is derived from the initial two-of-three public account and actual multisig circuit fingerprint, with contract-6 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet keys remain secret. Root artifacts remain local operational files: never package or publish `private_keys.json` or generated private keys. L1 custody remains separate and unchanged. Current public Genesis construction and startup QA is pending; do not infer readiness from the existence of these command interfaces.
 
 ### 6.2 Embedded wallet circuit trigger
 

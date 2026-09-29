@@ -239,17 +239,71 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 
 | Term | Meaning |
 |---|---|
-| `MultisigPolicy` | Version, threshold, member count, and eight ordered member commitments; active members are distinct and nonzero, unused entries are zero. |
-| Policy commitment | Poseidon hash of the validated `MultisigPolicy`; the account's own `CSTATE` slot 0 is the on-chain authority. |
-| Initial policy | Version-1 policy in `MultisigAccount`; its commitment is bound into immutable `public_key_param`. |
-| Current policy | Policy authenticated against the session's starting self-state; authorizes every operation, including policy replacement. |
-| Ending policy | Validated policy authenticated against the session's ending self-state; unchanged or one version higher outside bootstrap. |
-| `MultisigAccount` | Public enrollment configuration: `contract_id` and initial policy. No master secret or signer private key. |
-| `MultisigSignatures` | Matching vectors of strictly increasing current-member indices and external secp256k1 signatures over the exact session sighash bytes. |
-| `MultisigSignatureWitness` | Unsigned trace context: account, current and ending policies, starting and ending state proofs, signature data, ending sign context, starting user leaf, and nonce. |
+| `MultisigPolicy` | Nonzero `version: u32`, fixed `threshold: u8 = 2`, fixed `member_count: u8 = 3`, and `member_hashes: [QHashOut<GoldilocksField>; 8]`. Entries 0 through 2 are nonzero, strictly ordered member commitments; entries 3 through 7 are zero padding, not additional members. |
+| `StoredMultisigPolicy` | Policy precompile fields: `header: QHashOut<GoldilocksField>` containing `[version, 2, 3, 0]` in slot 0 and `members: [QHashOut<GoldilocksField>; 3]` in slots 1 through 3. Precompile contract identifier 6, state-tree height 4. |
+| Policy commitment | Derived Poseidon hash of a validated `MultisigPolicy`. The initial-policy commitment binds immutable identity; no opaque policy commitment is stored as the on-chain authority. |
+| Initial policy | Version-1 policy in `MultisigAccount`; its derived commitment is bound into immutable `public_key_param`. |
+| Current policy | Policy derived from authenticated starting self-state fields; its two-member quorum authorizes every operation, including replacement. During pristine bootstrap it is the initial policy. |
+| Ending policy | Policy derived from authenticated ending self-state fields; equal to the current policy or changed members with exactly the next version outside bootstrap. Threshold and member count remain fixed. |
+| `MultisigAccount` | Public enrollment configuration: `contract_id` fixed to 6 and `initial_policy`. No master secret or signer private key. |
+| `MultisigSignatures` | Exactly two external secp256k1 signatures over the exact session sighash bytes and two strictly increasing current-member indices in 0 through 2. |
+| `MultisigSignatureWitness` | Unsigned trace fields: `account`, `start_state`, `end_state`, `sig_data`, `sign_context`, `start_session_user_leaf`, and `nonce`. Each state has four self-slot commands and eight alternating contract-tree/slot proofs; current and ending policies are derived, not separate supplied preimages. |
 | `MultisigSignatureInput` | `MultisigSignatureWitness` plus `MultisigSignatures`, combined when signing the trace. |
-| `MultisigSignatureCircuit` | Fixed-capacity, eight-member, no-secret authentication circuit; checks starting-policy signatures and ending-policy validity. |
+| `MultisigSignatureCircuit` | Fixed two-of-three, no-secret authentication circuit; checks authenticated starting-policy signatures and ending-policy validity. |
 | `TraceSignCircuitSource::Multisig` | Saved-trace selector for the fixed multisig circuit; not a ZK-key fallback. |
-| `set_multisig_policy` | Local wallet operation supplying current and ending policy preimages; does not change on-chain state. |
-| `set_policy(expected, next)` | `MultisigPolicyContract` operation replacing the on-chain policy commitment; policy semantics and authorization belong to the authentication circuit. |
-| Bootstrap | First multisig session: zero policy slot, zero nonce, and default user-state root; initial-policy signatures must install the initial commitment. Cannot be re-entered after initialization; restoring earlier membership requires a current-policy-authorized, version-incremented replacement. |
+| `set_policy(expected_header, expected_members, next_members)` | Policy precompile operation comparing all four current slots and writing three next members with version 1 on all-zero bootstrap or the next version on replacement. Replacement requires changed members; the authentication circuit owns account authorization. No local wallet policy setter exists. |
+| Bootstrap | First multisig session: all four policy slots zero, zero starting nonce, and default starting user-state root; two initial-member signatures must install the exact initial policy. Cannot be re-entered after initialization. |
+
+Sources: `client_prover/psy_vm/src/ups/multisig.rs:20-175`; `client_prover/psy_prover/src/signature/users/multisig_user.rs:30-99`; `../psy-compiler/psy-precompiles/multisig_policy/src/main.psy:3-83`. Current first-milestone quality assurance is pending; these definitions are not runtime validation evidence.
+
+### Scoped membership and Guardian evidence
+
+| Term | Meaning |
+|---|---|
+| IMT | Indexed Merkle tree. A scoped membership request identifies one map within a contract-state tree, not the entire tree. |
+| `QIMTMembershipProofRPCRequest<F>` | `checkpoint_id: u64`, `user_id: u64`, `contract_id: u32`, `key: QHashOut<F>`, `state_slot_base: u64`, and `capacity: u64`. Membership index and nonzero successor index must be in the checked inclusive range `state_slot_base + 1 ..= state_slot_base + capacity`; the sentinel is excluded and capacity must be nonzero. |
+| `psy_provider::lps::WithdrawalBurnProof` | Process-local checkpoint-pinned burn evidence (`client_prover/psy_provider/src/lps.rs:28-39`): `checkpoint_id: u64`, `checkpoint_leaf: PsyCheckpointLeaf<F>`, `global_roots: PsyCheckpointGlobalStateRoots<F>`, `checkpoint_path: MerkleProofCore<QHashOut<F>>`, `user_leaf: PsyUserLeaf<F>`, `user_path: MerkleProofCore<QHashOut<F>>`, `contract_path: MerkleProofCore<QHashOut<F>>`, `contract_leaf: PsyContractLeaf<F>`, `global_contract_path: MerkleProofCore<QHashOut<F>>`, and `record_membership: IMTMembershipProof<F>`, where `F = GoldilocksField`. The provider assembles it; the verifier authenticates it against the approved operational committed checkpoint root and approved complete contract artifact/map interpretation. It is not a Guardian request field or a duplicate JSON wire type. |
+| `GuardianAuthorization` | Versioned account/network identity, approved contract definitions, fees, chain authorization, and token mappings used to constrain Guardian signing. Distinct from current multisig policy and runtime endpoint configuration. |
+| `ApprovedContract` | `contract_id`, approved `contract_leaf_json`, original `compiler_artifact_json: JsonText<CompilerArtifact>`, and `compiler_artifact_sha256: Hex32`. The digest covers the exact retained UTF-8 artifact text, including its ABI; no canonical layout root substitutes for this approval. |
+| `CompilerArtifact` | Complete approved artifact fields: `state_tree_height: u16`, compiled `circuit_definitions`, and current `abi`. ABI schema version must be `2.0.0` and its declared height must match the artifact. |
+| `GuardianRuntimeConfig` | Guardian runtime paths, transport configuration, endpoint URLs, and secret-file paths; not the signing authorization. `signing_authorization_path` is required. `custody_attestation_path` is rejected, not accepted as an alias. |
+| `GuardianDb` | Exclusive redb owner for one guardian signing key in `psy_cli/psy_relayer_cli/src/guardian/db.rs`. Field and local name when the value is this type: `db`. `db_path` is its protected config-relative file path; `guardian-create-db` creates a new signing-key journal, while `guardian-service` only reopens retained state. Not a wire error name. |
+| `SigningAuthorization` | Protected local JSON asserting one guardian signing key's `exclusive_key_use`, `complete_journal`, validity interval, and `revoked` state. Distinct from `GuardianAuthorization`. Old key `exclusive_custody` is rejected, not aliased. |
+| `SigningAuthorizationFile` | Process-local retained bytes and database identity for one `SigningAuthorization`. Not serialized. |
+| `SigningAuthorizationInvalid` | Sixth `HaltReason`, fixed-integer bincode ordinal 5. Covers readable changed approval bytes, `revoked`, `!exclusive_key_use`, and `!complete_journal`. Missing, unreadable, expired, or not-yet-valid approval stays unavailable. Not a separate file-changed or revoked variant. |
+| `GuardianOperation` | Request operation: `Bridge`, `Bootstrap`, or `ReplacePolicy`; JSON values are `bridge`, `bootstrap`, and `replace_policy`. |
+| `GuardianSignRequest` | Request schema and authorization versions, network/account identity, session nonce, operation, original trace JSON, deposit anchors, and withdrawal records. Request data is not an independently trusted checkpoint root. |
+| `GuardianSignResponse` | Request/account/session identity, derived current `policy_commitment`, `member_index`, exact `message`, compressed `public_key`, and external `signature`. Not a stored policy update. |
+| `WithdrawalBurnRecord` | Sender user identifier, token contract identifier, destination chain index, and eight-`u32` representations of token, amount, recipient, and withdrawal nonce. |
+| `DepositAnchor` | Chain index, block number, block hash, and old/new deposit counts that identify the requested deposit evidence. |
+| Decision signature | `None` means the nonce is reserved; `Some` means it is signed. At response time, `request_id` is derived from retained request bytes, `public_key` comes from the immutable signer identity, and `member_index` is that key's position in the exact retained session's historically reverified starting policy. These fields are not stored on the decision row. |
+| `JsonText<T>` | Validated JSON text retained with its original UTF-8 bytes; decoding does not replace the retained source text. |
+| `Hex<N>` | Fixed-width `N` bytes encoded as lowercase hexadecimal JSON text with a `0x` prefix. |
+| `Hash4` | Guardian alias for `QHashOut<GoldilocksField>`; not a separate hash representation. |
+
+Sources: `client_prover/psy_provider/src/request.rs:1213-1229`; `client_prover/psy_provider/src/lps.rs:26-38`; `psy_cli/psy_relayer_cli/src/guardian/protocol.rs:16-73,152-240`. These names describe implemented protocol types, not a claim that Guardian runtime validation has passed.
+
+Artifact approval source: `psy_cli/psy_relayer_cli/src/guardian/protocol.rs:150-185`.
+
+## 12. Bridge proof aggregation
+
+| Term | Meaning |
+|---|---|
+| Deposit aggregate | Shared final Groth16 artifact A authenticating every configured chain's contiguous deposit append interval. |
+| Checkpoint aggregate | Shared final Groth16 artifact B authenticating checkpoint advancement, withdrawal registration and Ethereum reward payments. |
+| Complete opening | Canonical preimages for every configured chain and every real aggregate record, supplied on each executing chain. |
+| `batchCommit` | Context-bound Keccak commitment to one ordered chunk of at most 32 real records. |
+| `DepositRecordRange` | Global first-record ordinal and count defining one chain's interval in the complete deposit opening. |
+| `chainEndsHash` | Internal ordered height-eight Merkle commitment authenticating configured chain ends; not a separately stored authority. |
+| Global deposit record root | Internal ordered height-ten Merkle commitment to all deposit record commitments, their positions and total count; shared by web proofs and complete-opening normalization. |
+| `BridgeOpening` | Internal Solidity owner of canonical configuration and complete A/B opening decoding and hashing. |
+| `DigestBitsAdapter` | Source-pinned normalizer proof adapter exposing the statement digest as 256 MSB-first bits. |
+| `DigestBitsWrapper` | Final wrapped Groth16 circuit whose native verifier checks those 256 bits directly. |
+| `DigestBitsIdentity` | Exact source, schema, artifact, and verifier identity bound to one setup. |
+| `AggregateSetupConfig` | Canonical network configuration and source revisions required to build one fresh A/B setup pair. |
+| `EthereumRewardPayer` | Ethereum-only funded contract that consumes canonical reward keys and pays the configured fixed amount through its StateManager. |
+| `REWARD_PER_CLAIM` | Required positive immutable reward amount in the configured token's smallest units; no production value is inferred. |
+| `rewardNullifierDomain` | Stable network, bridge-user and Ethereum payer/token domain for reward consumption. |
+| Consumed reward key | Domain-bound claim checkpoint and full-root tagged-tree position; recipient changes cannot create another entitlement. |
+
+Source contract: `docs/src/dev/bridge-proof-aggregation.md`. Narrow PI and chain-level amendment digest `8426151fdf1efab9be36bbd6d863d833f4308f1e339a288638dcaab48dabd9ba` passed static design review; implementation, executable validation and activation remain separate gates.

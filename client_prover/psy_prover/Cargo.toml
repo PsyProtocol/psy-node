@@ -17,6 +17,7 @@ plonky2 = { workspace = true }
 tracing = { workspace = true }
 ts-rs = { workspace = true }
 thiserror = { workspace = true }
+tiny-keccak = { workspace = true }
 
 psy_client_common = { workspace = true }
 psy_config = { workspace = true }
@@ -73,6 +74,7 @@ gnark-plonky2-verifier-ffi = { workspace = true, optional = true }
 
 # WASM-only dependencies
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { workspace = true, features = ["json"] }
 console_error_panic_hook = { workspace = true }
 wasm-logger = { workspace = true }
 wasm-tracing = { workspace = true }

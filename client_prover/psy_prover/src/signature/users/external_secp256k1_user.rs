@@ -35,6 +35,7 @@ use psy_crypto::signature::{
     },
     zk::data::ZKPublicKeyInfo,
 };
+use psy_ups_circuit::signature::reward_authorization::{RewardAuthorizationCircuits, RewardAuthorizationContext};
 use psy_vm::ups::circuit_manager::UPSCircuitManager;
 
 use crate::{
@@ -108,6 +109,10 @@ impl ExternalSecp256K1User {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SignatureUser for ExternalSecp256K1User {
+    fn prove_reward_authorization(&self, _context: &RewardAuthorizationContext, _circuits: &RewardAuthorizationCircuits) -> Result<Option<PsyProof>> {
+        Ok(None)
+    }
+
     async fn public_key_info(
         &self,
         _wallet: &PsyMemoryWallet,

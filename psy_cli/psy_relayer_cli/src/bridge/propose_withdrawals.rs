@@ -7,18 +7,13 @@ use plonky2::{
     hash::poseidon::PoseidonHash,
     plonk::config::Hasher,
 };
-use psy_client_common::args::{ContractCallArgs, ContractCallData, SignType, WalletSourceArgs};
 use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
-use psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT;
-use psy_prover::session::WalletSession;
 use psy_provider::provider::RpcProvider;
-use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
 use serde::{Deserialize, Serialize};
 
-use psy_cli_common::key_utils::load_wallet_key_info;
 
 use crate::bridge::api_client::{ApiResponse, build_default_http_client, get_services_json};
-use crate::bridge::constants::{BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID};
+use crate::bridge::constants::BRIDGE_USER_ID_U64;
 
 // ── CLI args ─────────────────────────────────────────────────────────────────
 
@@ -26,8 +21,8 @@ use crate::bridge::constants::{BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID};
 pub struct ProposeWithdrawalsArgs {
     #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
-    #[command(flatten)]
-    pub wallet: WalletSourceArgs,
+    #[clap(long, env = "PSY_GUARDIAN_CONFIG")]
+    pub guardian_config: String,
     #[clap(long, env = "PSY_SERVICES_URL")]
     pub services_url: Option<String>,
     #[clap(long, env = "PSY_WITHDRAW_METHOD_ID")]
@@ -87,41 +82,6 @@ pub struct WithdrawalRoundPlan {
     pub claim_withdrawals: Vec<PendingWithdrawal>,
 }
 
-pub fn build_append_withdrawal_calls(withdrawals: &[PendingWithdrawal]) -> anyhow::Result<Vec<ContractCallArgs>> {
-    if withdrawals.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut calls = Vec::with_capacity(withdrawals.len());
-    for w in withdrawals {
-        // New append_withdrawal input order:
-        //   sender_user_id, token_contract_id, destination_chain_index,
-        //   token[8], amount[8], recipient[8], nonce[8]
-        let mut inputs = Vec::with_capacity(3 + 8 * 4);
-        inputs.push(w.sender_user_id);
-        inputs.push(w.contract_id);
-        inputs.push(w.destination_chain_index);
-        inputs.extend(w.token_address.iter().map(|&v| v as u64));
-        inputs.extend(w.amount.iter().map(|&v| v as u64));
-        inputs.extend(w.recipient.iter().map(|&v| v as u64));
-        inputs.extend(w.nonce.iter().map(|&v| v as u64));
-        tracing::info!(
-            sender_user_id = w.sender_user_id,
-            contract_id = w.contract_id,
-            destination_chain_index = w.destination_chain_index,
-            nonce = ?w.nonce,
-            leaf_hash = %w.leaf_hash,
-            "building individual append_withdrawal call"
-        );
-        calls.push(ContractCallArgs {
-            contract_id: WITHDRAWAL_TREE_CONTRACT_ID as u64,
-            method_name: "append_withdrawal".to_string(),
-            inputs,
-        });
-    }
-
-    Ok(calls)
-}
 
 // ── psy-services API response types ──────────────────────────────────────────
 
@@ -458,12 +418,7 @@ fn compute_withdrawal_leaf_hash(
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
-/// `chain_offsets` carries one `(destination_chain_index, event_offset)` pair
-/// per L1 chain: psy-services rejects an unfiltered withdrawals query once it
-/// indexes multiple L1 chains, and each chain's filtered event stream needs its
-/// own offset (the per-chain L2 withdrawal-tree cursor). An empty slice falls
-/// back to `args.destination_chain_indices` with offset 0 (full scan), and when
-/// that is empty too, to the legacy unfiltered single-chain query.
+/// Discover from offset zero; canonical included history, never service position, selects new burns.
 pub async fn fetch_pending_bridge_withdrawals(
     args: &ProposeWithdrawalsArgs,
     _from_checkpoint: u64,
@@ -480,7 +435,7 @@ pub async fn fetch_pending_bridge_withdrawals(
             .map(|&index| (index, 0))
             .collect()
     } else {
-        chain_offsets.to_vec()
+        chain_offsets.iter().map(|&(chain, _)| (chain, 0)).collect()
     };
 
     let mut service_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
@@ -499,15 +454,10 @@ pub async fn fetch_pending_bridge_withdrawals(
             service_withdrawals.append(&mut page);
         }
     }
-    service_withdrawals.sort_by_key(|w| w.event_id);
 
     let mut withdrawals: Vec<PendingWithdrawal> = Vec::new();
 
     for withdrawal in service_withdrawals {
-        // Each chain's event offset is the per-chain withdrawal cursor on the
-        // L2 withdrawal tree. It aligns with the first unappended entry in
-        // that chain's services event stream, so we intentionally do not
-        // re-filter by checkpoint window here.
         tracing::debug!(
             event_id = withdrawal.event_id,
             checkpoint_id = withdrawal.checkpoint_id,
@@ -556,7 +506,19 @@ pub async fn fetch_pending_bridge_withdrawals(
         });
     }
 
-    withdrawals.sort_by_key(|w| w.event_id);
+    withdrawals.sort_by_key(|w| (w.destination_chain_index, w.sender_user_id, w.contract_id, w.nonce));
+    let mut unique = std::collections::BTreeMap::new();
+    for withdrawal in withdrawals {
+        let key = (withdrawal.sender_user_id, withdrawal.contract_id, withdrawal.nonce);
+        if let Some(previous) = unique.get(&key) {
+            let previous: &PendingWithdrawal = previous;
+            anyhow::ensure!(previous.destination_chain_index == withdrawal.destination_chain_index && previous.token_address == withdrawal.token_address && previous.amount == withdrawal.amount && previous.recipient == withdrawal.recipient, "conflicting duplicate burn identity");
+        } else {
+            unique.insert(key, withdrawal);
+        }
+    }
+    let mut withdrawals: Vec<_> = unique.into_values().collect();
+    withdrawals.sort_by_key(|w| (w.destination_chain_index, w.sender_user_id, w.contract_id, w.nonce));
 
     Ok(withdrawals)
 }
@@ -670,101 +632,12 @@ pub async fn run_and_get_withdrawal_root(
         "discovered pending bridge withdrawals, building append_withdrawal calls"
     );
 
-    // ── Step 4: build append_withdrawal contract calls ───────────────────────
-    // New input order: sender_user_id, token_contract_id, destination_chain_index,
-    //   token[8], amount[8], recipient[8], nonce[8]
-    let contract_calls: Vec<ContractCallArgs> = discovered
-        .iter()
-        .map(|w| ContractCallArgs {
-            contract_id: WITHDRAWAL_TREE_CONTRACT_ID as u64,
-            method_name: "append_withdrawal".to_string(),
-            inputs: std::iter::once(w.sender_user_id)
-                .chain(std::iter::once(w.contract_id))
-                .chain(std::iter::once(w.destination_chain_index))
-                .chain(w.token_address.iter().map(|&v| v as u64))
-                .chain(w.amount.iter().map(|&v| v as u64))
-                .chain(w.recipient.iter().map(|&v| v as u64))
-                .chain(w.nonce.iter().map(|&v| v as u64))
-                .collect(),
-        })
-        .collect();
-
-    let contract_call_data = ContractCallData::new(contract_calls);
-
-    // ── Step 5: submit tx via proposer's software-defined key ────────────────
-    let mut wallet_session = WalletSession::new(&rpc_config).await?;
-    let info = load_wallet_key_info(&args.wallet, false)?;
-
-    match args.wallet.sign_type {
-        SignType::SoftwareDefinedPlonky2Sign => {
-            let fingerprint = wallet_session
-                .wallet
-                .register_plonky2_software_defined_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
-                .await?;
-            assert_eq!(info.fingerprint, fingerprint, "software-defined-plonky2-sign key fingerprint mismatch");
-        }
-        SignType::SoftwareDefinedDPNSign => {
-            let user_sdc: DPNFunctionCircuitDefinition = serde_json::from_str(&std::fs::read_to_string("sdc.json")?)?;
-            let fingerprint = wallet_session.wallet.register_psy_software_defined_circuit(user_sdc, false).await?;
-            assert_eq!(info.fingerprint, fingerprint, "software-defined-dpn-sign key fingerprint mismatch");
-        }
-        _ => {}
-    };
-
-    // Record realm checkpoint BEFORE submission so we can detect advancement.
-    let realm_checkpoint_before = provider.get_realm_latest_block_state().await?.checkpoint_id;
-
-    let user_pk_hash = wallet_session.add_user(info.private_key, info.fingerprint).await?;
-    let tx_hash = wallet_session
-        .exec_contract_call(user_pk_hash, contract_call_data)
-        .await?;
-
-    tracing::info!(
-        withdrawals_count = discovered.len(),
-        from_checkpoint,
-        to_checkpoint_exclusive,
-        tx_hash = %tx_hash,
-        "append_withdrawal tx submitted"
-    );
-
-    // ── Step 6: wait for checkpoint, then read root from bridge contract state ─
-    let withdrawals_count = discovered.len();
-    let result = {
-        let new_realm_checkpoint =
-            poll_realm_checkpoint_advance(&provider, realm_checkpoint_before, args.poll_timeout_secs, args.poll_interval_secs).await?;
-
-        let withdrawal_tree_root = provider
-            .get_proposed_withdrawal_tree_root(new_realm_checkpoint, BRIDGE_USER_ID_U64)
-            .await?;
-
-        tracing::info!(
-            new_realm_checkpoint,
-            withdrawal_tree_root = %withdrawal_tree_root,
-            "read withdrawal_tree_root from bridge contract state"
-        );
-
-        // 6c. Notify coordinator
-        // provider.submit_withdrawals(&withdrawal_tree_root).await?;
-
-        tracing::info!(
-            withdrawal_tree_root = %withdrawal_tree_root,
-            "submitted withdrawal_tree_root to coordinator via submit_withdrawals"
-        );
-
-        ProposeResult {
-            observed_checkpoint_id: new_realm_checkpoint,
-            withdrawal_tree_root,
-            withdrawals: discovered,
-        }
-    };
-
-    tracing::info!(
-        withdrawals_count,
-        to_checkpoint_exclusive,
-        "propose-withdrawals completed successfully"
-    );
-
-    Ok(result)
+    let calls = super::daemon::build_withdrawal_batch_calls(&discovered);
+    let checkpoint = super::daemon::submit_guardian_calls(
+        &args.rpc_config, &args.guardian_config, &provider, calls, &discovered,
+    ).await?;
+    let withdrawal_tree_root = provider.get_proposed_withdrawal_tree_root(checkpoint, BRIDGE_USER_ID_U64).await?;
+    Ok(ProposeResult { observed_checkpoint_id: checkpoint, withdrawal_tree_root, withdrawals: discovered })
 }
 
 pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
@@ -781,7 +654,11 @@ pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
         "resolved withdrawal scan range"
     );
 
-    let _ = run_and_get_withdrawal_root(args.clone(), from_checkpoint, to_checkpoint_exclusive).await?;
+    let history = super::guardian_client::GuardianClientConfig::load(std::path::Path::new(&args.guardian_config))?;
+    tokio::select! {
+        result = history.serve_history() => { result?; anyhow::bail!("guardian history listener stopped"); },
+        result = run_and_get_withdrawal_root(args.clone(), from_checkpoint, to_checkpoint_exclusive) => { result?; },
+    }
     save_state_checkpoint(&args.state_file, to_checkpoint_exclusive)?;
     Ok(())
 }

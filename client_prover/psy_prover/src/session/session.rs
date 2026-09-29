@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
-        types::{Field, PrimeField64},
+        types::{Field, Field64, PrimeField64},
     },
     hash::{hash_types::HashOut, poseidon::PoseidonHash},
     plonk::{
@@ -172,33 +172,45 @@ mod multisig_snapshot_tests {
 
     fn policy(version: u32, member: u64) -> MultisigPolicy {
         let mut member_hashes = [QHashOut::default(); 8];
-        member_hashes[0] = QHashOut::from_values(member, 0, 0, 0);
-        MultisigPolicy { version, threshold: 1, member_count: 1, member_hashes }
+        for index in 0..3 { member_hashes[index] = QHashOut::from_values(member + index as u64, 0, 0, 0); }
+        MultisigPolicy { version, threshold: 2, member_count: 3, member_hashes }
     }
 
-    fn state(contract_id: u32, commitment: QHashOut<F>, nonce: F) -> StateReaderResults<F> {
-        let slot = MerkleProofCore::new_from_params::<PsyHasher>(0, commitment,
-            (0..4).map(<PsyHasher as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash).collect());
-        let contract = MerkleProofCore::new_from_params::<PsyHasher>(contract_id as u64, slot.root,
+    fn state(contract_id: u32, policy: Option<&MultisigPolicy>, nonce: F) -> StateReaderResults<F> {
+        let mut leaves = vec![QHashOut::ZERO; 16];
+        if let Some(policy) = policy {
+            leaves[0] = QHashOut::from_values(policy.version as u64, 2, 3, 0);
+            leaves[1..4].copy_from_slice(&policy.member_hashes[..3]);
+        }
+        let mut levels = vec![leaves];
+        for height in 0..4 {
+            levels.push(levels[height].chunks_exact(2).map(|pair| PsyHasher::q_two_to_one(pair[0], pair[1])).collect());
+        }
+        let root = levels[4][0];
+        let contract = MerkleProofCore::new_from_params::<PsyHasher>(contract_id as u64, if policy.is_some() { root } else { QHashOut::ZERO },
             (0..psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize)
                 .map(<PsyHasher as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash).collect());
         let leaf = PsyUserLeaf { user_state_tree_root: contract.root, nonce, ..Default::default() };
+        let mut merkel_proofs = Vec::new();
+        let mut state_cmds = Vec::new();
+        for index in 0..4 {
+            state_cmds.push(DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(DPNStateCmdGetSelfUserCurrentContractStateSlotHash { slot_index: F::from_canonical_usize(index) }));
+            merkel_proofs.push(contract.clone());
+            merkel_proofs.push(MerkleProofCore::new_from_params::<PsyHasher>(index as u64, levels[0][index], (0..4).map(|height| levels[height][(index >> height) ^ 1]).collect()));
+        }
         StateReaderResults {
-            state: UserContractState::new(QHashOut::default(), leaf, slot.root, F::from_canonical_u32(contract_id), F::ZERO),
-            user_tree_root: QHashOut::default(), checkpoint: None, aux_user_leaves: Vec::new(),
-            state_cmds: vec![DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(DPNStateCmdGetSelfUserCurrentContractStateSlotHash { slot_index: F::ZERO })],
-            merkel_proofs: vec![contract, slot],
+            state: UserContractState::new(QHashOut::default(), leaf, root, F::from_canonical_u32(contract_id), F::ZERO),
+            user_tree_root: QHashOut::default(), checkpoint: None, aux_user_leaves: Vec::new(), state_cmds, merkel_proofs,
         }
     }
 
     fn rotation() -> MultisigSignatureWitness {
         let current_policy = policy(1, 1);
         let ending_policy = policy(2, 2);
-        let start_state = state(42, current_policy.commitment().unwrap(), F::ONE);
-        let end_state = state(42, ending_policy.commitment().unwrap(), F::ONE);
+        let start_state = state(6, Some(&current_policy), F::ONE);
+        let end_state = state(6, Some(&ending_policy), F::ONE);
         MultisigSignatureWitness {
-            account: MultisigAccount { contract_id: 42, initial_policy: current_policy.clone() },
-            current_policy, ending_policy,
+            account: MultisigAccount { contract_id: 6, initial_policy: current_policy.clone() },
             start_session_user_leaf: start_state.state.user_leaf,
             sign_context: psy_client_data::qdata::user_contract_state::SignContext {
                 checkpoint_tree_root: QHashOut::default(), user_leaf: end_state.state.user_leaf,
@@ -211,7 +223,7 @@ mod multisig_snapshot_tests {
     fn rotation_requires_start_policy_not_end_policy() {
         let mut witness = rotation();
         WalletSession::validate_multisig_witness(&witness).unwrap();
-        witness.current_policy = witness.ending_policy.clone();
+        witness.start_state.merkel_proofs[3].value = witness.end_state.merkel_proofs[3].value;
         assert!(WalletSession::validate_multisig_witness(&witness).is_err());
     }
 
@@ -225,12 +237,63 @@ mod multisig_snapshot_tests {
     #[test]
     fn policy_replacement_rejects_rollback_and_clearing() {
         let mut witness = rotation();
-        witness.ending_policy = policy(1, 2);
-        witness.end_state = state(42, witness.ending_policy.commitment().unwrap(), F::ONE);
+        witness.end_state = state(6, Some(&policy(1, 2)), F::ONE);
         witness.sign_context.user_leaf = witness.end_state.state.user_leaf;
         assert!(WalletSession::validate_multisig_witness(&witness).is_err());
         witness = rotation();
-        witness.end_state = state(42, QHashOut::default(), F::ONE);
+        witness.end_state = state(6, None, F::ONE);
+        witness.sign_context.user_leaf = witness.end_state.state.user_leaf;
+        assert!(WalletSession::validate_multisig_witness(&witness).is_err());
+    }
+
+    #[test]
+    fn pinned_nonce_rejects_field_wrap_and_integer_overflow() {
+        assert_eq!(WalletSession::next_session_nonce(0).unwrap(), 1);
+        assert_eq!(WalletSession::next_session_nonce(F::ORDER - 2).unwrap(), F::ORDER - 1);
+        assert!(WalletSession::next_session_nonce(F::ORDER - 1).is_err());
+        assert!(WalletSession::next_session_nonce(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn all_members_and_reader_anchors_are_authenticated() {
+        for index in [1, 3, 5, 7] {
+            let mut witness = rotation();
+            witness.start_state.merkel_proofs[index].value = QHashOut::ZERO;
+            assert!(WalletSession::validate_multisig_witness(&witness).is_err());
+        }
+        let mut witness = rotation();
+        witness.end_state.merkel_proofs[2].index = 7;
+        assert!(WalletSession::validate_multisig_witness(&witness).is_err());
+        let mut witness = rotation();
+        witness.end_state.state.checkpoint_id = F::ONE;
+        assert!(WalletSession::validate_multisig_witness(&witness).is_err());
+    }
+
+    #[test]
+    fn bootstrap_installs_only_immutable_initial_members() {
+        let mut witness = rotation();
+        witness.start_state = state(6, None, F::ZERO);
+        witness.start_session_user_leaf = witness.start_state.state.user_leaf;
+        witness.end_state = state(6, Some(&witness.account.initial_policy), F::ZERO);
+        witness.sign_context.user_leaf = witness.end_state.state.user_leaf;
+        WalletSession::validate_multisig_witness(&witness).unwrap();
+        witness.end_state = state(6, Some(&policy(1, 5)), F::ZERO);
+        witness.sign_context.user_leaf = witness.end_state.state.user_leaf;
+        assert!(WalletSession::validate_multisig_witness(&witness).is_err());
+        witness.end_state = state(6, Some(&witness.account.initial_policy), F::ZERO);
+        witness.sign_context.user_leaf = witness.end_state.state.user_leaf;
+        witness.start_state.state.user_leaf.nonce = F::ONE;
+        witness.start_session_user_leaf = witness.start_state.state.user_leaf;
+        assert!(WalletSession::validate_multisig_witness(&witness).is_err());
+    }
+
+    #[test]
+    fn unchanged_policy_is_valid_but_version_only_rotation_is_not() {
+        let mut witness = rotation();
+        witness.end_state = state(6, Some(&policy(1, 1)), F::ONE);
+        witness.sign_context.user_leaf = witness.end_state.state.user_leaf;
+        WalletSession::validate_multisig_witness(&witness).unwrap();
+        witness.end_state = state(6, Some(&policy(2, 1)), F::ONE);
         witness.sign_context.user_leaf = witness.end_state.state.user_leaf;
         assert!(WalletSession::validate_multisig_witness(&witness).is_err());
     }
@@ -255,17 +318,13 @@ mod multisig_snapshot_tests {
             member_hashes[slot] = *hash;
         }
         let initial = MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes };
-        let account = MultisigAccount { contract_id: 42, initial_policy: initial.clone() };
+        let account = MultisigAccount { contract_id: 6, initial_policy: initial.clone() };
         let mut producer = PsyMemoryWallet::new(Vec::new());
         let info = producer.register_multisig_user(account.clone())?;
         let public_key = info.qfhash::<PsyHasher>();
-        producer.set_multisig_policy(public_key, initial.clone(), initial.clone())?;
 
-        let mut start_state = state(42, QHashOut::ZERO, F::ZERO);
-        let contract = &mut start_state.merkel_proofs[0];
-        *contract = MerkleProofCore::new_from_params::<PsyHasher>(42, QHashOut::ZERO, contract.siblings.clone());
-        start_state.state.user_leaf.user_state_tree_root = contract.root;
-        let mut end_state = state(42, initial.commitment()?, F::ZERO);
+        let mut start_state = state(6, None, F::ZERO);
+        let mut end_state = state(6, Some(&initial), F::ZERO);
         for snapshot in [&mut start_state, &mut end_state] {
             snapshot.state.user_leaf.public_key = public_key;
             snapshot.state.user_leaf.user_id = F::from_canonical_u64(9);
@@ -280,7 +339,7 @@ mod multisig_snapshot_tests {
             psy_vm::ups::signature::sig_hash_fields_from_header_poseidon(&header, nonce);
         let sighash = sig_data.get_sig_action_for_user::<PsyHasher>(PSY_NETWORK_MAGIC, F::from_canonical_u64(9), nonce, sign_context).get_qhash::<PsyHasher>();
         let witness = MultisigSignatureWitness {
-            account: account.clone(), current_policy: initial.clone(), ending_policy: initial,
+            account: account.clone(),
             start_state, end_state, sig_data, sign_context, start_session_user_leaf, nonce,
         };
         let step = ZkSignStep {
@@ -309,11 +368,11 @@ mod multisig_snapshot_tests {
         let mut session = WalletSession {
             wallet: PsyMemoryWallet::new(vec![Box::new(manager)]),
             circuit_info: SessionCircuitInfoStore::new(),
-            st_provider: RpcProvider { client: Arc::new(reqwest::Client::new()), realm_configs: Default::default(), coordinator_configs: Default::default(), users_per_realm: 1, current_user_id: 0 },
+            st_provider: RpcProvider { client: Arc::new(reqwest::Client::new()), endpoint_clients: None, realm_configs: Default::default(), coordinator_configs: Default::default(), users_per_realm: 1, current_user_id: 0 },
             local_proving_job_manager: JobManager::empty(), user_session_mgrs: DashMap::new(),
         };
+        assert!(session.register_bridge_multisig_user(account.clone(), false).await.is_err());
         assert_eq!(session.wallet.register_multisig_user(account.clone())?.qfhash::<PsyHasher>(), public_key);
-        assert!(session.wallet.get_multisig_user(&public_key)?.policies().is_err());
         let trace: TxTrace = serde_json::from_slice(&saved)?;
         let TraceStep::ZkSign(step) = &trace.steps[0] else { panic!("saved signature step missing") };
         let mut changed_header = trace.ups_start_witness.ups_header;
@@ -327,9 +386,7 @@ mod multisig_snapshot_tests {
         };
         let mut wrong_account = account;
         wrong_account.contract_id += 1;
-        let wrong_public_key = session.wallet.register_multisig_user(wrong_account)?.qfhash::<PsyHasher>();
-        session.wallet.inject_multisig_signatures(wrong_public_key, signatures.clone())?;
-        assert!(session.wallet.sign_with_public_key(&wrong_public_key, &context, sighash).await.is_err());
+        assert!(session.wallet.register_multisig_user(wrong_account).is_err());
         let other_sighash = QHashOut::<F>::from_values(21, 22, 23, 24);
         let stale = MultisigSignatures {
             member_indices: vec![0, 2],
@@ -343,7 +400,6 @@ mod multisig_snapshot_tests {
             assert_eq!(signed.proof.public_inputs, PsyHasher::q_two_to_one(sighash, info.public_key_param).0.elements.to_vec());
             assert_eq!(signed.circuit_info.circuit_fingerprint, info.fingerprint);
         }
-        assert!(session.wallet.get_multisig_user(&public_key)?.policies().is_err());
         Ok(())
     }
 }
@@ -797,6 +853,17 @@ pub struct TraceBuildSession<'a> {
     multisig_start_state: Option<StateReaderResults<F>>,
 }
 impl<'a> TraceBuildSession<'a> {
+    pub fn required_fee(&self) -> anyhow::Result<u64> {
+        let lps = self.user_session_mgr.require_lps()?;
+        let slots = u64::try_from(lps.get_total_modified_slots_for_fee())?;
+        let slots = slots.checked_add(u64::from(!lps.has_positional_slot_update(psy_config::network_constants::TOKEN_CONTRACT_ID as u64, 0)))
+            .ok_or_else(|| anyhow::anyhow!("fee slot count overflow"))?;
+        let fee = psy_config::DA_FEE.checked_mul(slots).and_then(|fee| fee.checked_add(psy_config::GUTA_FEE))
+            .ok_or_else(|| anyhow::anyhow!("session fee overflow"))?;
+        anyhow::ensure!(fee < F::ORDER, "session fee is not canonical");
+        Ok(fee)
+    }
+
     pub async fn add_external_proof(
         &mut self,
         fingerprint: QHashOut<F>,
@@ -856,6 +923,7 @@ impl<'a> TraceBuildSession<'a> {
         if !self.trace_arena.steps.iter().any(|step| step.contract_id().is_some()) {
             anyhow::bail!("No contract calls to execute");
         }
+        self.required_fee()?;
 
         let user_session_mgr = &mut self.user_session_mgr;
         let cm = self.wallet_session.wallet.random_circuit_manager();
@@ -956,7 +1024,6 @@ impl<'a> TraceBuildSession<'a> {
             ),
             TraceSignCircuitSource::Multisig => {
                 let user = self.wallet_session.wallet.get_multisig_user(&self.public_key)?;
-                let (current_policy, ending_policy) = user.policies()?;
                 let start_state = self.multisig_start_state.take()
                     .ok_or_else(|| anyhow::anyhow!("multisig START state snapshot missing"))?;
                 let end_state = WalletSession::build_multisig_state(user.account().contract_id, user_session_mgr, false).await?;
@@ -964,8 +1031,6 @@ impl<'a> TraceBuildSession<'a> {
                     psy_vm::ups::signature::sig_hash_fields_from_header_poseidon(&user_session_mgr.get_current_ups_header(), nonce);
                 let witness = MultisigSignatureWitness {
                     account: user.account().clone(),
-                    current_policy: current_policy.clone(),
-                    ending_policy: ending_policy.clone(),
                     start_state,
                     end_state,
                     sig_data,
@@ -1241,6 +1306,38 @@ mod view_validation_tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn deployed_second_function_resolves_its_fingerprint_and_metadata() -> anyhow::Result<()> {
+        use kvq::memory::simple::KVQSimpleMemoryBackingStore;
+        use psy_client_data::{qdata::contract::PsyContractLeaf, traits::qdatastore::{qmetadata::QMetaDataStoreWriterSync, qtreedata::QTreeDataStoreWriterSync}};
+        let first = definition(Vec::new());
+        let mut second = definition(Vec::new());
+        second.name = "second".into();
+        second.method_id = 2;
+        let definitions = [first, second];
+        let (circuits, deploy) = gen_contract_deploy_and_circuits_for_functions::<C, D>(QHashOut::ZERO, 4, &definitions)?;
+        let deploy = deploy.into_with_whitelist_root::<PsyHasher>()?;
+        let store = KVQSimpleMemoryBackingStore::new();
+        let function_tree_root = store.set_contract_function_whitelist(1, 6, &deploy.function_whitelist)?;
+        assert_eq!(function_tree_root, deploy.function_whitelist_root);
+        let contract = PsyContractLeaf { function_tree_root, code_root: deploy.code_root, ..Default::default() };
+        store.set_contract_leaf_data(1, 6, &contract)?;
+        store.set_contract_tree_leaf_hash(1, 6, contract.qfhash::<PsyHasher>())?;
+        let mut session = PsyLocalProvingSessionStore::<F, _, PsyHasher>::new_at(store.clone(), F::ONE, F::ZERO, F::ONE, F::ZERO, UPS_SESSION_PROOF_TREE_HEIGHT as usize);
+        let inclusion = session.get_contract_function_inclusion_proof(6, 1).await?;
+        assert!(inclusion.verify::<PsyHasher>());
+        assert_eq!(inclusion.contract_function_merkle_proof.index, 2);
+        assert_eq!(inclusion.get_function_verifier_fingerprint(), circuits[1].get_fingerprint());
+        assert_eq!(inclusion.get_method_id(), 2);
+        let metadata = store.get_contract_function_tree_merkle_proof(1, 6, 3).await?;
+        assert_eq!(metadata.value, QHashOut::from_values(2, 0, 0, 0));
+        let code_hashes: Vec<_> = definitions.iter().map(hash_dpn_function::<F>).collect();
+        assert_eq!(contract.code_root, get_code_root_by_code_hashes::<F, PsyHasher>(&code_hashes, CONTRACT_FUNCTION_TREE_HEIGHT - 1));
+        assert!(session.get_contract_function_inclusion_proof(6, 1u32 << 31).await.is_err());
+        Ok(())
+    }
+
     #[test]
     fn call_view_preflight_accepts_pure_and_rejects_event_or_write_definitions() {
         ensure_view_definition(7, "pure", &definition(Vec::new())).unwrap();
@@ -1445,6 +1542,15 @@ impl WalletSession {
     pub async fn new(rpc_config: &psy_config::NetworkConfigGoldilocks) -> anyhow::Result<Self> {
         tracing::info!("init rpc provider");
         let st_provider = RpcProvider::new_with_config(rpc_config)?;
+        Self::build_wallet_session(rpc_config, st_provider).await
+    }
+
+    pub async fn new_with_provider(rpc_config: &psy_config::NetworkConfigGoldilocks, st_provider: RpcProvider) -> anyhow::Result<Self> {
+        anyhow::ensure!(rpc_config.prove_proxy_url.iter().all(|url| url.trim().is_empty()), "injected provider sessions require local proving managers");
+        Self::build_wallet_session(rpc_config, st_provider).await
+    }
+
+    async fn build_wallet_session(rpc_config: &psy_config::NetworkConfigGoldilocks, st_provider: RpcProvider) -> anyhow::Result<Self> {
 
         tracing::info!("init wallet");
         tracing::info!("init ups step circuit manager");
@@ -1720,6 +1826,45 @@ impl WalletSession {
         self.register_external_pk_info_on_chain(pk_info, "multisig").await
     }
 
+    /// Requires exclusively controlled and drained registration intake until inclusion.
+    /// A submission error is ambiguous: never automatically repeat this operation.
+    pub async fn register_bridge_multisig_user(
+        &mut self,
+        account: MultisigAccount,
+        exclusive_registration_intake: bool,
+    ) -> anyhow::Result<QHashOut<F>> {
+        anyhow::ensure!(exclusive_registration_intake, "exclusive drained registration intake is required");
+        anyhow::ensure!(get_registration_id_from_user_id(524288) == 2 && psy_crypto::common::user_id::get_user_id_from_registration_id(2) == 524288, "bridge registration mapping mismatch");
+        let info = self.wallet.register_multisig_user(account)?;
+        let public_key = info.qfhash::<PsyHasher>();
+        let mut block = self.st_provider.get_coordinator_latest_block_state().await?;
+        let registered = self.st_provider.get_user_registration_tree_leaf_hash(block.checkpoint_id, 2).await?;
+        if registered == public_key {
+            let ids = self.st_provider.get_user_ids_for_public_key(public_key).await?;
+            anyhow::ensure!(ids == vec![524288], "bridge registered identity mapping conflict");
+            return Ok(public_key);
+        }
+        anyhow::ensure!(registered == QHashOut::ZERO, "AccountIdentityConflict: bridge registration slot is occupied");
+        anyhow::ensure!(block.next_user_id == 2, "bridge registration requires next registration index 2");
+        anyhow::ensure!(self.st_provider.get_user_ids_for_public_key(public_key).await?.is_empty(), "bridge public key already registered at another index");
+        self.st_provider.register_user(QRegisterUserRPCRequest { public_key: info }).await
+            .map_err(|error| anyhow::anyhow!("bridge registration submission outcome is unknown; registration may have occurred; inspect slot 2 and public key {} before any manual action; do not resubmit: {}", public_key, error))?;
+        loop {
+            self.st_provider.wait_next_checkpoint(block.checkpoint_id, None, 1).await?;
+            block = self.st_provider.get_coordinator_latest_block_state().await?;
+            let registered = self.st_provider.get_user_registration_tree_leaf_hash(block.checkpoint_id, 2).await?;
+            if registered == public_key {
+                let ids = self.st_provider.get_user_ids_for_public_key(public_key).await?;
+                anyhow::ensure!(ids == vec![524288], "bridge registration mapping {:?} is not exactly user524288; registration may have occurred at another index; no rollback or resubmission", ids);
+                return Ok(public_key);
+            }
+            if registered != QHashOut::ZERO || block.next_user_id != 2 {
+                let ids = self.st_provider.get_user_ids_for_public_key(public_key).await;
+                anyhow::bail!("AccountIdentityConflict: bridge registration raced; slot2 key={}, submitted key={}, observed user ids={:?}; submission may remain queued or have registered another index; no rollback or resubmission", registered, public_key, ids);
+            }
+        }
+    }
+
     pub async fn add_multisig_user(&mut self, account: MultisigAccount) -> anyhow::Result<QHashOut<F>> {
         let pk_info = self.wallet.register_multisig_user(account)?;
         let public_key = pk_info.qfhash::<PsyHasher>();
@@ -1728,14 +1873,6 @@ impl WalletSession {
         Ok(public_key)
     }
 
-    pub async fn set_multisig_policy(
-        &mut self,
-        public_key: QHashOut<F>,
-        current_policy: MultisigPolicy,
-        ending_policy: MultisigPolicy,
-    ) -> anyhow::Result<()> {
-        self.wallet.set_multisig_policy(public_key, current_policy, ending_policy)
-    }
 
     pub async fn inject_multisig_signatures(&mut self, public_key: QHashOut<F>, signatures: MultisigSignatures) -> anyhow::Result<QHashOut<F>> {
         self.wallet.inject_multisig_signatures(public_key, signatures)
@@ -2044,7 +2181,65 @@ impl WalletSession {
     }
 
     pub async fn begin_trace_build(&self, public_key: QHashOut<F>) -> anyhow::Result<TraceBuildSession<'_>> {
-        let mut user_session_mgr = self.build_transaction_preview_session(public_key).await?;
+        let user_session_mgr = self.build_transaction_preview_session(public_key).await?;
+        self.build_trace_session(public_key, user_session_mgr).await
+    }
+
+    /// The root must be independently authenticated by the caller, not supplied by a signing request.
+    pub async fn begin_trace_build_at_checkpoint(
+        &self,
+        public_key: QHashOut<F>,
+        user_id: u64,
+        checkpoint_id: u64,
+        expected_nonce: u64,
+        verified_checkpoint_tree_root: QHashOut<F>,
+    ) -> anyhow::Result<TraceBuildSession<'_>> {
+        anyhow::ensure!(user_id < (1u64 << psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT) && checkpoint_id < (1u64 << psy_config::network_constants::CHECKPOINT_TREE_HEIGHT), "pinned session location out of range");
+        let provider = self.st_provider.with_user_id_owned(user_id);
+        let proof = provider.get_user_tree_merkle_proof(checkpoint_id, user_id).await?;
+        let is_new_user = proof.value == QHashOut::ZERO;
+        let (nonce, event_index) = if is_new_user {
+            (1, F::ZERO)
+        } else {
+            let leaf = provider.get_user_leaf_data(checkpoint_id, user_id).await?;
+            anyhow::ensure!(leaf.qfhash::<PsyHasher>() == proof.value && leaf.public_key == public_key && leaf.user_id.to_canonical_u64() == user_id, "pinned account leaf mismatch");
+            (Self::next_session_nonce(leaf.nonce.to_canonical_u64())?, leaf.event_index)
+        };
+        anyhow::ensure!(nonce == expected_nonce, "pinned session nonce mismatch");
+        let mut lps = PsyLocalProvingSessionStore::new_at(provider, F::from_canonical_u64(checkpoint_id), F::from_canonical_u64(user_id), F::from_canonical_u64(nonce), event_index, UPS_SESSION_PROOF_TREE_HEIGHT as usize);
+        lps.set_is_new_user(is_new_user);
+        let circuit_mgr = self.wallet.random_circuit_manager();
+        let manager = UserProvingSessionManager::new(lps, self.circuit_info.clone(), circuit_mgr.ups_circuit_whitelist_root().await?).await?;
+        let builder = self.build_trace_session(public_key, manager).await?;
+        let input = &builder.ups_start_witness_input;
+        let context = &input.ups_header.session_start_context;
+        anyhow::ensure!(context.checkpoint_id.to_canonical_u64() == checkpoint_id && context.checkpoint_tree_root == verified_checkpoint_tree_root, "pinned checkpoint context mismatch");
+        anyhow::ensure!(input.checkpoint_tree_proof.siblings.len() == psy_config::network_constants::CHECKPOINT_TREE_HEIGHT as usize && proof.siblings.len() == psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize, "pinned proof height mismatch");
+        anyhow::ensure!(input.checkpoint_tree_proof.index == checkpoint_id && input.checkpoint_tree_proof.root == verified_checkpoint_tree_root && input.checkpoint_tree_proof.value == input.checkpoint_leaf.qfhash::<PsyHasher>() && input.checkpoint_tree_proof.verify::<PsyHasher>(), "invalid pinned checkpoint membership");
+        anyhow::ensure!(context.checkpoint_leaf_hash == input.checkpoint_tree_proof.value && input.state_roots.qfhash::<PsyHasher>() == input.checkpoint_leaf.global_chain_root, "pinned global roots mismatch");
+        anyhow::ensure!(input.user_tree_proof == proof && proof.index == user_id && proof.root == input.state_roots.user_tree_root && proof.verify::<PsyHasher>(), "invalid pinned account membership");
+        let leaf = &context.start_session_user_leaf;
+        anyhow::ensure!(leaf.public_key == public_key && leaf.user_id.to_canonical_u64() == user_id, "pinned account identity mismatch");
+        if let Some(registration) = &builder.ups_start_registration_proof {
+            anyhow::ensure!(registration.siblings.len() == psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize, "pinned registration height mismatch");
+            anyhow::ensure!(registration.index == get_registration_id_from_user_id(user_id) && registration.root == input.state_roots.user_registration_tree_root && registration.value == public_key && registration.verify::<PsyHasher>(), "invalid pinned registration membership");
+        } else {
+            anyhow::ensure!(leaf.qfhash::<PsyHasher>() == proof.value && Self::next_session_nonce(leaf.nonce.to_canonical_u64())? == nonce && leaf.event_index == event_index, "pinned starting leaf changed");
+        }
+        Ok(builder)
+    }
+
+    fn next_session_nonce(start_nonce: u64) -> anyhow::Result<u64> {
+        let nonce = start_nonce.checked_add(1).ok_or_else(|| anyhow::anyhow!("session nonce overflow"))?;
+        anyhow::ensure!(nonce < F::ORDER, "session nonce is not canonical");
+        Ok(nonce)
+    }
+
+    async fn build_trace_session(
+        &self,
+        public_key: QHashOut<F>,
+        mut user_session_mgr: UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>,
+    ) -> anyhow::Result<TraceBuildSession<'_>> {
         let setup_result = async {
             let ups_start_witness_input = user_session_mgr.get_ups_start_witness().await?;
             let ups_start_registration_proof: Option<psy_crypto::hash::merkle::core::MerkleProofCore<QHashOut<F>>> =
@@ -2677,48 +2872,7 @@ impl WalletSession {
     }
 
     fn validate_multisig_witness(witness: &MultisigSignatureWitness) -> anyhow::Result<()> {
-        witness.account.public_key_param()?;
-        let current = witness.current_policy.commitment()?;
-        let ending = witness.ending_policy.commitment()?;
-        for (state, leaf) in [
-            (&witness.start_state, &witness.start_session_user_leaf),
-            (&witness.end_state, &witness.sign_context.user_leaf),
-        ] {
-            anyhow::ensure!(state.state.user_leaf == *leaf, "multisig state user leaf mismatch");
-            anyhow::ensure!(state.state.contract_id == F::from_canonical_u32(witness.account.contract_id), "multisig account location mismatch");
-            anyhow::ensure!(state.state.checkpoint_tree_root == witness.sign_context.checkpoint_tree_root, "multisig checkpoint root mismatch");
-            anyhow::ensure!(state.merkel_proofs.len() == 2, "multisig requires UCON and CSTATE proofs");
-            let contract = &state.merkel_proofs[0];
-            let slot = &state.merkel_proofs[1];
-            anyhow::ensure!(contract.index == witness.account.contract_id as u64 && contract.root == leaf.user_state_tree_root, "multisig UCON anchor mismatch");
-            anyhow::ensure!(contract.siblings.len() == psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize, "multisig UCON height mismatch");
-            anyhow::ensure!(slot.index == 0 && slot.siblings.len() == 4, "multisig requires CSTATE slot 0 height 4");
-            let root = if contract.value == QHashOut::default() {
-                <PsyHasher as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(4)
-            } else {
-                contract.value
-            };
-            anyhow::ensure!(slot.root == root && state.state.start_contract_state_root == root, "multisig CSTATE anchor mismatch");
-            anyhow::ensure!(contract.verify::<PsyHasher>() && slot.verify::<PsyHasher>(), "invalid multisig state proof");
-        }
-        let start = witness.start_state.merkel_proofs[1].value;
-        anyhow::ensure!(witness.end_state.merkel_proofs[1].value == ending, "ending policy does not match END slot");
-        if start == QHashOut::default() {
-            let default_root = psy_config::network_constants::DEFAULT_USER_STATE_TREE_ROOT_U64;
-            anyhow::ensure!(
-                witness.start_session_user_leaf.nonce == F::ZERO
-                    && witness.start_session_user_leaf.user_state_tree_root == QHashOut::from_values(default_root[0], default_root[1], default_root[2], default_root[3]),
-                "multisig bootstrap requires pristine START account"
-            );
-            let initial = witness.account.initial_policy.commitment()?;
-            anyhow::ensure!(current == initial && ending == initial, "multisig bootstrap must install initial policy");
-        } else {
-            anyhow::ensure!(start == current, "current policy does not match START slot");
-            anyhow::ensure!(
-                current == ending || witness.current_policy.version.checked_add(1) == Some(witness.ending_policy.version),
-                "multisig replacement requires next version"
-            );
-        }
+        witness.policies()?;
         Ok(())
     }
 
@@ -2782,12 +2936,15 @@ impl WalletSession {
             user_session_mgr.require_lps()?.get_cmd_store().clone(),
             user_session_mgr.require_lps()?.get_state_tree_store().clone(),
         ).await;
-        reader.get_self_user_current_contract_state_slot_hash(F::ZERO).await?;
+        for slot_index in 0..4 {
+            reader.get_self_user_current_contract_state_slot_hash(F::from_canonical_usize(slot_index)).await?;
+        }
         let mut results = reader.to_results();
         let slot_proof = results.merkel_proofs.get(1)
             .ok_or_else(|| anyhow::anyhow!("multisig slot proof missing"))?;
         anyhow::ensure!(slot_proof.siblings.len() == 4, "multisig contract requires CSTATE height 4");
         results.state.start_contract_state_root = slot_proof.root;
+        psy_vm::ups::multisig::StoredMultisigPolicy::load(&results)?;
         Ok(results)
     }
 

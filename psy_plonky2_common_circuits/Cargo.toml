@@ -41,5 +41,6 @@ parth_core = { workspace = true }
 parth_common = { workspace = true }
 psy_plonky2_basic_helpers = { workspace = true }
 pser = { workspace = true }
+psy_client_data = { workspace = true, default-features = false }
 
 [dev-dependencies]

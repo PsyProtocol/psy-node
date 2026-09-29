@@ -18,7 +18,7 @@ use psy_client_common::{
 use psy_crypto::signature::zk::data::ZKPublicKeyInfo;
 use psy_provider::provider::RpcProvider;
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
-use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MultisigSignatures};
+use psy_vm::ups::multisig::{MultisigAccount, MultisigSignatures};
 use tokio::time::timeout;
 
 use crate::session::{WalletKeyPair, WalletSession};
@@ -51,8 +51,6 @@ pub trait Rpc {
     async fn register_multisig_user(&self, account: MultisigAccount) -> Result<QHashOut<F>, ErrorObjectOwned>;
     #[method(name = "add_multisig_user")]
     async fn add_multisig_user(&self, account: MultisigAccount) -> Result<QHashOut<F>, ErrorObjectOwned>;
-    #[method(name = "set_multisig_policy")]
-    async fn set_multisig_policy(&self, public_key: QHashOut<F>, current_policy: MultisigPolicy, ending_policy: MultisigPolicy) -> Result<(), ErrorObjectOwned>;
     #[method(name = "inject_multisig_signatures")]
     async fn inject_multisig_signatures(&self, public_key: QHashOut<F>, signatures: MultisigSignatures) -> Result<QHashOut<F>, ErrorObjectOwned>;
     #[method(name = "eth_personal_registration_challenge")]
@@ -295,17 +293,6 @@ impl RpcServer for RpcServerImpl {
         .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
     }
 
-    async fn set_multisig_policy(&self, public_key: QHashOut<F>, current_policy: MultisigPolicy, ending_policy: MultisigPolicy) -> Result<(), ErrorObjectOwned> {
-        let wallet_session = self.wallet_session.clone();
-        tokio::task::spawn_blocking(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                wallet_session.write().set_multisig_policy(public_key, current_policy, ending_policy).await
-            })
-        })
-        .await
-        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
-        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
-    }
 
     async fn inject_multisig_signatures(&self, public_key: QHashOut<F>, signatures: MultisigSignatures) -> Result<QHashOut<F>, ErrorObjectOwned> {
         let wallet_session = self.wallet_session.clone();
@@ -458,17 +445,19 @@ mod multisig_rpc_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn multisig_public_requests_validate_accounts_policies_and_signatures() {
-        let key = k256::ecdsa::SigningKey::from_slice(&[1; 32]).unwrap();
-        let signatures = MultisigSignatures {
-            member_indices: vec![0],
-            signatures: vec![secp256k1_sign(key, QHashOut::<F>::from_values(1, 2, 3, 4)).unwrap()],
-        };
+        use plonky2::field::types::PrimeField64;
+        use psy_vm::ups::multisig::MultisigPolicy;
+        let mut members: Vec<_> = (1u8..=3).map(|byte| {
+            let key = k256::ecdsa::SigningKey::from_slice(&[byte; 32]).unwrap();
+            let signature = secp256k1_sign(key, QHashOut::<F>::from_values(1, 2, 3, 4)).unwrap();
+            (hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(CompressedPublicKey(signature.public_key)), signature)
+        }).collect();
+        members.sort_by_key(|(hash, _)| hash.0.elements.map(|limb| limb.to_canonical_u64()));
+        let signatures = MultisigSignatures { member_indices: vec![0, 2], signatures: vec![members[0].1, members[2].1] };
         let mut member_hashes = [QHashOut::ZERO; 8];
-        member_hashes[0] = hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(
-            CompressedPublicKey(signatures.signatures[0].public_key),
-        );
-        let policy = MultisigPolicy { version: 1, threshold: 1, member_count: 1, member_hashes };
-        let account = MultisigAccount { contract_id: 42, initial_policy: policy.clone() };
+        for (index, (hash, _)) in members.iter().enumerate() { member_hashes[index] = *hash; }
+        let policy = MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes };
+        let account = MultisigAccount { contract_id: 6, initial_policy: policy.clone() };
         let mut wallet = crate::wallet::memory_wallet::PsyMemoryWallet::new(Vec::new());
         let info = wallet.register_multisig_user(account.clone()).unwrap();
         let public_key = info.qfhash::<psy_client_data::config::store_config::PsyHasher>();
@@ -477,6 +466,7 @@ mod multisig_rpc_tests {
             circuit_info: psy_client_data::qstore::controllers::session_info::SessionCircuitInfoStore::new(),
             st_provider: RpcProvider {
                 client: Arc::new(reqwest::Client::new()),
+                endpoint_clients: None,
                 realm_configs: Default::default(),
                 coordinator_configs: Default::default(),
                 users_per_realm: 1,
@@ -496,20 +486,9 @@ mod multisig_rpc_tests {
             assert!(response.get("result").is_none());
         }
 
-        let mut ending = policy.clone();
-        ending.version = 2;
-        let response = request(&module, "psy_set_multisig_policy", json!([public_key, policy, ending])).await;
-        assert_eq!(response.get("result"), Some(&Value::Null));
-        assert!(response.get("error").is_none());
-        let retained = session.read().wallet.get_multisig_user(&public_key).unwrap();
-        assert_eq!(retained.policies().unwrap().1.commitment().unwrap(), ending.commitment().unwrap());
-        assert_eq!(retained.account().public_key_param().unwrap(), info.public_key_param);
-
-        let mut invalid = ending.clone();
-        invalid.threshold = 0;
-        let response = request(&module, "psy_set_multisig_policy", json!([public_key, policy, invalid])).await;
-        assert_eq!(response["error"]["code"], 1);
-        assert_eq!(session.read().wallet.get_multisig_user(&public_key).unwrap().policies().unwrap().1.commitment().unwrap(), ending.commitment().unwrap());
+        let response = request(&module, "psy_set_multisig_policy", json!([public_key, policy, policy])).await;
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(session.read().wallet.get_multisig_user(&public_key).unwrap().account().public_key_param().unwrap(), info.public_key_param);
 
         let response = request(&module, "psy_inject_multisig_signatures", json!([public_key, signatures])).await;
         assert_eq!(response["result"], serde_json::to_value(public_key).unwrap());
@@ -522,7 +501,6 @@ mod multisig_rpc_tests {
 
         let missing = QHashOut::<F>::ZERO;
         for (method, params) in [
-            ("psy_set_multisig_policy", json!([missing, policy, ending])),
             ("psy_inject_multisig_signatures", json!([missing, signatures])),
         ] {
             let response = request(&module, method, params).await;

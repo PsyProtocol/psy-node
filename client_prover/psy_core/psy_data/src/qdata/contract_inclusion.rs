@@ -44,17 +44,14 @@ pub struct PsyContractFunctionInclusionProof<F: RichField> {
 
 impl<F: RichField> PsyContractFunctionInclusionProof<F> {
     pub fn verify<H: FieldQHasher<F>>(&self) -> bool {
-        // must have a valid contract inclusion proof and a valid merkle proof with an
-        // index divisible by 4 (each function uses four leaves: fingerprint,
-        // metadata, code hash, reserved)
+        // Each function occupies an even fingerprint leaf and its metadata sibling.
         self.contract_inclusion_proof.verify::<H>()
             && self.contract_function_merkle_proof.verify::<H>()
-            && (self.contract_function_merkle_proof.index & 3) == 0
+            && (self.contract_function_merkle_proof.index & 1) == 0
     }
 
-    // note that each function occupies four leaves:
-    // 4*i = verifier fingerprint, 4*i+1 = [method_id, (num_outputs<<32)|num_inputs,
-    // 0, 0], 4*i+2 = code hash, 4*i+3 = reserved zero
+    // 2*i = verifier fingerprint; 2*i+1 = [method_id, (num_outputs<<32)|num_inputs, 0, 0].
+    // Function code hashes are committed separately in the contract code root.
 
     pub fn get_function_verifier_fingerprint(&self) -> QHashOut<F> {
         self.contract_function_merkle_proof.value

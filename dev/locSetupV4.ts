@@ -707,6 +707,10 @@ export class RunningProcess {
         appendLogs?: boolean,
         logBanner?: string,
     }): Promise<RunningProcess> {
+        if (cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli")) {
+            options = { ...options, cwd: path.resolve(options.cwd || process.cwd()), env: options.env ?? { ...process.env } as Record<string, string> };
+        }
+        await validateRelayerTemplate(cmds, options);
         const prepareLog = async (filePath: string | undefined) => {
             if (!filePath) return;
             if (options.appendLogs) {
@@ -725,7 +729,7 @@ export class RunningProcess {
             cwd: options.cwd || undefined,
             stdout: "pipe",
             stderr: "pipe",
-            env: options.env ? { ...process.env, ...options.env } : undefined,
+            env: cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli") ? options.env : options.env ? { ...process.env, ...options.env } : undefined,
             detached: true,
         });
 
@@ -1031,8 +1035,8 @@ export const LOCAL_DEVNET_ZK_FINGERPRINT = "65e0169bfffd55f1c0ea9f76c111a5b15e65
 /** Local-devnet bridge relayer stays at registration 2 (Strategy5 user_id 524288). */
 export const LOCAL_DEVNET_RELAYER_REGISTRATION_ID = 2;
 export const LOCAL_DEVNET_RELAYER_USER_ID = 524288;
-/** Anvil account #0. Seeds an auto-generated encrypted bridge-relayer keystore; daemon.toml still uses keystore_path. */
-export const LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY =
+/** Anvil account #0 fixture for the separate local L1 deployment keystore, not daemon signer selection. */
+export const LOCAL_DEVNET_RELAYER_L1_PRIVATE_KEY =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 /** Canonical reserved leaf: `realm_id * 2^h + (sub_id - 1)`. */
@@ -1319,7 +1323,7 @@ async function ensureRealmP2pConfig(
         .map((secretPath) => exists(path.join(cwd, secretPath))))).every(Boolean);
     const validatorUserIds = await genesisValidatorUserIds(cwd, realmIds);
     const plan = planRealmP2pConfig(secretsExist ? config : null, realmIds, edgeCount, publicHost, validatorUserIds, genesisConfigHash);
-    const privateKeys = JSON.parse(await fs.promises.readFile(path.join(cwd, "private_keys.json"), "utf-8")) as string[];
+    const privateKeys = JSON.parse(await fs.promises.readFile(path.join(cwd, "private_keys.json"), "utf-8")) as (string | null)[];
     const validatorKeys = validatorUserIds.map((userId, index) => {
         const realmId = realmIds[Math.floor(index / REALM_P2P_SUB_IDS.length)];
         const subId = (index % REALM_P2P_SUB_IDS.length) + 1;
@@ -1372,11 +1376,8 @@ export function realmP2pProcessorExtraArgs(host: string, realmId: number, subId:
 export function realmP2pEdgeExtraArgs(host: string, realmId: number, subId: number, edgeIndex: number, edgeCount: number): string[] {
     return ["--p2p-identity-key", realmP2pEdgeIdentityPath(realmId, subId, edgeIndex), "--p2p-listen", realmP2pListen(host, realmP2pEdgePort(realmId, subId, edgeIndex, edgeCount))];
 }
-function relayerStartedDetector(line: string): boolean {
-    return line.includes("connected to indexer postgres")
-        || line.includes("envio schema is ready")
-        || line.includes("indexer deposit sync window")
-        || line.includes("bridge relayer started");
+export function relayerStartedDetector(line: string): boolean {
+    return /(?:^|\s)aggregate bridge relayer started(?:\s|$)/.test(line);
 }
 function psyServicesStartedDetector(line: string): boolean {
     return line.includes('Starting API server on')
@@ -2439,7 +2440,7 @@ const fs = require("fs");
 
 async function autoGenerateBridgeRelayerKeystore(keystorePath: string, contractsDir: string): Promise<void> {
     console.log("[AutoSetup] Auto-generating bridge-relayer keystore...");
-    const devPrivateKey = `0x${LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY}`;
+    const devPrivateKey = `0x${LOCAL_DEVNET_RELAYER_L1_PRIVATE_KEY}`;
     const devPassword = process.env.WALLET_PASSWORD || "devnet";
     const script = `
 const { Wallet } = require("ethers");
@@ -2585,7 +2586,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
                 `Generate them first or run without PSY_SKIP_KEYSTORE=1 to download the published setup.`,
             );
         }
-        // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by [relayer_wallet] and [finalize]; trust setup remains under ~/.psy/keystore.
+        // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by L1 finalize/claim signing; trust setup remains under ~/.psy/keystore.
         if (!(await exists(bridgeRelayerPath))) {
             await ensurePsyContractsDependencies(contractsDir);
             await autoGenerateBridgeRelayerKeystore(bridgeRelayerPath, contractsDir);
@@ -2600,7 +2601,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
 
     // 1. bridge-relayer keystore: auto-generate only when missing.
     //    It is a dev key and never needs refreshing on its own; no interactive prompt.
-    // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by [relayer_wallet] and [finalize]; trust setup remains under ~/.psy/keystore.
+    // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by L1 finalize/claim signing; trust setup remains under ~/.psy/keystore.
     if (!(await exists(bridgeRelayerPath))) {
         await ensurePsyContractsDependencies(contractsDir);
         await rm(bridgeRelayerPath).catch(() => undefined);
@@ -2742,7 +2743,59 @@ async function isUsableGenesisContracts(filePath: string): Promise<boolean> {
     }
 }
 
-async function ensureGenesisFiles(cwd: string): Promise<void> {
+export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv): Promise<{ args: string[]; env: NodeJS.ProcessEnv }> {
+    const configuredPath = env.PSY_RELAYER_MULTISIG_ACCOUNT;
+    if (!configuredPath?.trim()) throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT is required for Genesis generation");
+    const accountPath = path.resolve(cwd, configuredPath);
+    try {
+        if (!(await fs.promises.stat(accountPath)).isFile()) throw new Error("not a regular file");
+        const text = await fs.promises.readFile(accountPath, "utf-8");
+        const account = JSON.parse(text);
+        const fields = new Set<string>();
+        let previousToken = "";
+        for (const [token] of text.matchAll(/"(?:\\.|[^"\\])*"|:/g)) {
+            if (token === ":") {
+                const field = JSON.parse(previousToken);
+                if (fields.has(field)) throw new Error("duplicate field");
+                fields.add(field);
+            }
+            previousToken = token;
+        }
+        if (!account || Object.keys(account).sort().join(",") !== "contract_id,initial_policy" || account.contract_id !== 6) throw new Error("invalid account");
+        const policy = account.initial_policy;
+        if (!policy || Object.keys(policy).sort().join(",") !== "member_count,member_hashes,threshold,version"
+            || policy.version !== 1 || policy.threshold !== 2 || policy.member_count !== 3
+            || !Array.isArray(policy.member_hashes) || policy.member_hashes.length !== 8) throw new Error("invalid initial policy");
+        let previous = [0n, 0n, 0n, 0n];
+        for (const [index, hash] of policy.member_hashes.entries()) {
+            if (typeof hash !== "string" || !/^(?:[0-9a-fA-F]{2}){0,32}$/.test(hash)) throw new Error("invalid member hash");
+            const padded = hash.padStart(64, "0");
+            const limbs = [3, 2, 1, 0].map((limb) => BigInt(`0x${padded.slice(limb * 16, limb * 16 + 16)}`) % 0xffffffff00000001n);
+            const firstDifference = limbs.findIndex((limb, position) => limb !== previous[position]);
+            if (index < 3 ? firstDifference < 0 || limbs[firstDifference] < previous[firstDifference] : limbs.some((limb) => limb !== 0n)) throw new Error("invalid member order or padding");
+            previous = limbs;
+        }
+    } catch {
+        throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT must be a readable public MultisigAccount file with contract 6 and a valid initial two-of-three policy");
+    }
+    const configuredArtifact = env.PSY_MULTISIG_POLICY_ARTIFACT;
+    if (!configuredArtifact?.trim()) throw new Error("PSY_MULTISIG_POLICY_ARTIFACT is required for Genesis generation");
+    const artifactPath = path.resolve(cwd, configuredArtifact);
+    try {
+        if (!(await fs.promises.stat(artifactPath)).isFile()) throw new Error("not a regular file");
+        const artifact = JSON.parse(await fs.promises.readFile(artifactPath, "utf-8"));
+        if (artifact?.state_tree_height !== 4 || artifact?.abi?.contract?.state_tree_height !== 4
+            || !Array.isArray(artifact.circuit_definitions) || artifact.circuit_definitions.length !== 2
+            || artifact.circuit_definitions.map((definition: { name?: string }) => definition?.name).sort().join(",") !== "get_policy,set_policy") throw new Error("invalid policy artifact");
+    } catch {
+        throw new Error("PSY_MULTISIG_POLICY_ARTIFACT must be a readable policy artifact with height 4, ABI, get_policy and set_policy");
+    }
+    const childEnv: NodeJS.ProcessEnv = { ...env, PWD: cwd };
+    for (const key of ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"]) delete childEnv[key];
+    return { args: [path.join(cwd, "target", "release", "psy_dev_cli"), "generate-genesis-data", "--repo-root", cwd, "--relayer-multisig-account", accountPath, "--multisig-policy-artifact", artifactPath], env: childEnv };
+}
+
+export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
     const genesisPath = path.join(cwd, "genesis.json");
     const genesisContractsPath = path.join(cwd, "psy-genesis", "genesis_contracts.json");
     const genesisContractsStampPath = path.join(cwd, "psy-genesis", ".genesis_contracts.compiler-artifact.json");
@@ -2805,7 +2858,7 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
             console.log("[AutoSetup] genesis artifacts already exist");
             return;
         }
-        console.log("[AutoSetup] genesis.json present but not strict Unix-seconds genesis; regenerating");
+        throw new Error("[AutoSetup] Existing genesis.json is invalid; explicit authorized regeneration is required");
     }
 
     const cli = path.join(cwd, "target", "release", "psy_dev_cli");
@@ -2815,10 +2868,12 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
             `or run without PSY_SKIP_BUILD=1.`,
         );
     }
+    const generation = await planGenesisGeneration(cwd, env);
     console.log("[AutoSetup] Generating genesis.json via psy_dev_cli generate-genesis-data...");
-    const result = await runAndCapture([cli, "generate-genesis-data", "--repo-root", cwd], cwd);
-    if (result.code !== 0) {
-        throw new Error(`[AutoSetup] Failed to generate genesis.json: ${result.stderr || result.stdout}`);
+    const child = Bun.spawn(generation.args, { cwd, env: generation.env, stdout: "ignore", stderr: "ignore" });
+    const code = await child.exited;
+    if (code !== 0) {
+        throw new Error(`[AutoSetup] Failed to generate genesis.json (exit ${code})`);
     }
     console.log("[AutoSetup] genesis.json generated");
 }
@@ -2829,6 +2884,7 @@ async function ensureDevEnvironment(
         requireDocker?: boolean;
         requireAnvil?: boolean;
         requireBun?: boolean;
+        env?: NodeJS.ProcessEnv;
     },
 ): Promise<void> {
     console.log("[AutoSetup] Checking dev environment...");
@@ -2866,14 +2922,13 @@ async function ensureDevEnvironment(
     await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
     const { generated } = await ensureKeystoreFiles(contractsDir);
     // Only set default WALLET_PASSWORD when we generated the keystore this run.
-    // Must happen before generate-genesis-data decrypts that UTC JSON.
     if (generated && !process.env.WALLET_PASSWORD) {
         process.env.WALLET_PASSWORD = "devnet";
         bridgeRelayerKeystoreGeneratedThisRun = true;
-        console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
+        console.warn("[AutoSetup] Using the local default password for the auto-generated L1 keystore.");
     }
     await ensureAllBinariesBuilt(cwd);
-    await ensureGenesisFiles(cwd);
+    await ensureGenesisFiles(cwd, { ...process.env, ...opts?.env });
     console.log("[AutoSetup] Dev environment ready.");
 }
 
@@ -3240,6 +3295,183 @@ function parseTomlScalar(raw: string, key: string): string | undefined {
     return m?.[1];
 }
 
+export async function resolveGuardianConfigPath(cwd: string, configuredPath: string | undefined): Promise<string> {
+    const context = "[DevNet] Bridge relayer requires PSY_GUARDIAN_CONFIG pointing to an existing public GuardianClientConfig JSON";
+    if (!configuredPath?.trim()) {
+        throw new Error(`${context}; supply it in the environment or --env. Guardian credentials, registration and bootstrap are operator prerequisites; no L2 wallet fallback is available.`);
+    }
+    const configPath = path.resolve(cwd, configuredPath);
+    let config: Record<string, unknown>;
+    try {
+        const stat = await fs.promises.lstat(configPath);
+        if (!stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error("not a regular bounded file");
+        config = JSON.parse(await fs.promises.readFile(configPath, "utf8"));
+    } catch {
+        throw new Error(`${context}; the selected path must be a readable, non-symlink regular file containing valid JSON (at most 64 MiB).`);
+    }
+    const pathFields = [
+        "authorization_path", "archive_path", "tls_identity_path", "server_ca_path",
+        "authorization_archive_path", "authorization_index_path", "history_tls_certificate_path",
+        "history_tls_private_key_path", "history_client_ca_path",
+    ];
+    const fields = [...pathFields, "endpoints", "l1_endpoints", "listen_address", "allowed_client_certificate_sha256"];
+    if (!config || typeof config !== "object" || Array.isArray(config)
+        || Object.keys(config).some((field) => !fields.includes(field))
+        || fields.some((field) => !Object.hasOwn(config, field))) {
+        throw new Error(`${context}; expected only GuardianClientConfig public fields and credential-file references, not a guardian service config or embedded signing keys.`);
+    }
+    for (const field of pathFields) {
+        const value = config[field];
+        if (typeof value !== "string" || !value || value.includes("\0") || path.isAbsolute(value)
+            || value.split(/[\\/]/).some((component) => !component || component === "." || component === "..")) {
+            throw new Error(`${context}; ${field} must be a nonempty config-relative path without traversal.`);
+        }
+    }
+    const endpoints = config.endpoints;
+    if (!Array.isArray(endpoints) || endpoints.length !== 3 || endpoints.some((endpoint) => {
+        if (typeof endpoint !== "string") return true;
+        try {
+            const url = new URL(endpoint);
+            return url.protocol !== "https:" || !url.hostname || !!url.username || !!url.password
+                || url.pathname !== "/" || !!url.search || !!url.hash;
+        } catch { return true; }
+    }) || new Set(endpoints.map((endpoint) => new URL(endpoint).origin)).size !== 3) {
+        throw new Error(`${context}; endpoints must name three distinct fixed HTTPS origins.`);
+    }
+    if (typeof config.listen_address !== "string" || !config.listen_address.trim()
+        || !Array.isArray(config.allowed_client_certificate_sha256)
+        || config.allowed_client_certificate_sha256.some((digest) => typeof digest !== "string" || !/^0x[0-9a-f]{64}$/.test(digest))
+        || !Array.isArray(config.l1_endpoints)
+        || config.l1_endpoints.some((endpoint) => !endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)
+            || Object.keys(endpoint).some((field) => field !== "chain_index" && field !== "rpc_url")
+            || !Number.isInteger(endpoint.chain_index) || endpoint.chain_index < 0 || endpoint.chain_index > 255
+            || typeof endpoint.rpc_url !== "string")) {
+        throw new Error(`${context}; invalid history listener, client certificate pins or L1 endpoint fields.`);
+    }
+    return configPath;
+}
+
+const DEVNET_PURGE_PATHS = [
+    "local_checkpoints", "db/anvil", "logs",
+    ...["localhost", "localhostBsc", "localhostBase", "sepolia", "ethereum"].map((network) => `psy-contracts/deployments/${network}`),
+];
+
+function daemonConfigError(field: string): Error {
+    return new Error(`[DevNet] PSY_BRIDGE_DAEMON_CONFIG: invalid or unavailable ${field}; operator provisioning required`);
+}
+
+async function validateDaemonPath(file: string, kind: "file" | "directory" | "output", purgeTargets: readonly string[], field: string): Promise<void> {
+    const contains = (parent: string, child: string) => {
+        const relative = path.relative(parent, child);
+        return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+    };
+    const realPath = async (target: string): Promise<string> => {
+        try { return await fs.promises.realpath(target); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            // A dangling symlink is not an absent output directory.
+            try { await fs.promises.lstat(target); throw daemonConfigError(field); }
+            catch (missing) { if ((missing as NodeJS.ErrnoException).code !== "ENOENT") throw missing; }
+            const parent = path.dirname(target);
+            if (parent === target) throw error;
+            return path.join(await realPath(parent), path.basename(target));
+        }
+    };
+    try {
+        const resolved = await realPath(file);
+        for (const target of purgeTargets) {
+            if (contains(target, file) || contains(await realPath(target), resolved)) throw daemonConfigError(field);
+        }
+        try {
+            const stat = await fs.promises.stat(file);
+            if (kind === "directory" ? !stat.isDirectory() : !stat.isFile()) throw daemonConfigError(field);
+        } catch (error) {
+            if (kind !== "output" || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+    } catch { throw daemonConfigError(field); }
+}
+
+export async function resolveBridgeDaemonConfigPath(
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    purge: boolean = false,
+    parse: ((text: string) => unknown) | undefined = Bun.TOML?.parse,
+): Promise<string> {
+    if (typeof parse !== "function") throw daemonConfigError("Bun.TOML.parse capability");
+    const textField = (value: unknown, field: string): string => {
+        if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw daemonConfigError(field);
+        return value;
+    };
+    const table = (value: unknown, field: string): Record<string, unknown> => {
+        if (!value || typeof value !== "object" || Array.isArray(value) || value instanceof Date) throw daemonConfigError(field);
+        return value as Record<string, unknown>;
+    };
+    const integer = (value: unknown, bits: number, field: string): void => {
+        if (typeof value !== "bigint" && (typeof value !== "number" || !Number.isSafeInteger(value))) throw daemonConfigError(field);
+        const n = BigInt(value as number | bigint);
+        if (n < 0n || n >= (1n << BigInt(bits))) throw daemonConfigError(field);
+    };
+    const configPath = path.resolve(cwd, textField(env.PSY_BRIDGE_DAEMON_CONFIG, "config path"));
+    const purgeTargets = purge ? DEVNET_PURGE_PATHS.map((target) => path.resolve(cwd, target)) : [];
+    await validateDaemonPath(configPath, "file", purgeTargets, "config path metadata");
+    let config: Record<string, unknown>;
+    try {
+        if ((await fs.promises.stat(configPath)).size > 64 * 1024 * 1024) throw daemonConfigError("config size");
+        config = table(parse(await fs.promises.readFile(configPath, "utf8")), "config table");
+    } catch { throw daemonConfigError("TOML document (details withheld)"); }
+    const inspectCredentials = async (value: unknown): Promise<void> => {
+        if (!value || typeof value !== "object") return;
+        for (const [field, child] of Object.entries(value)) {
+            if (field === "private_key" && child !== "") throw daemonConfigError("inline private_key");
+            if (field === "keystore_path") {
+                await validateDaemonPath(path.resolve(cwd, textField(child, "keystore_path")), "file", purgeTargets, "keystore_path metadata");
+            } else if (child && typeof child === "object") await inspectCredentials(child);
+        }
+    };
+    await inspectCredentials(config);
+    for (const field of ["rpc_config", "guardian_config", "aggregate_setup_config", "aggregation_token_file"]) {
+        await validateDaemonPath(path.resolve(cwd, textField(config[field], field)), "file", purgeTargets, `${field} metadata`);
+    }
+    await validateDaemonPath(path.resolve(cwd, textField(config.aggregate_artifact_dir, "aggregate_artifact_dir")), "directory", purgeTargets, "aggregate_artifact_dir metadata");
+    textField(config.services_url, "services_url");
+    integer(config.withdraw_method_id, 64, "withdraw_method_id");
+    for (const field of ["poll_interval_secs", "confirmation_lag_checkpoints", "max_checkpoint_batch", "withdrawal_scan_lookback_checkpoints", "max_concurrent_l2_batches"]) {
+        if (Object.hasOwn(config, field)) integer(config[field], 64, field);
+    }
+    const limits = table(config.aggregate_limits, "aggregate_limits");
+    for (const field of ["max_deposits", "reserved_withdrawals", "reserved_rewards"]) integer(limits[field], 32, `aggregate_limits.${field}`);
+    for (const field of ["max_a_calldata_bytes", "max_b_calldata_bytes"]) integer(limits[field], 64, `aggregate_limits.${field}`);
+    if (!Array.isArray(limits.chains) || !limits.chains.length) throw daemonConfigError("aggregate_limits.chains");
+    for (const value of limits.chains) {
+        const chain = table(value, "aggregate_limits.chains");
+        integer(chain.chain_index, 8, "aggregate_limits.chains.chain_index");
+        for (const field of ["max_deposits", "reserved_withdrawals"]) integer(chain[field], 32, `aggregate_limits.chains.${field}`);
+        for (const field of ["tx_gas_limit", "block_gas_reserve"]) integer(chain[field], 64, `aggregate_limits.chains.${field}`);
+    }
+    const guardianPath = path.resolve(cwd, config.guardian_config as string);
+    if (env.PSY_GUARDIAN_CONFIG !== undefined && path.resolve(cwd, env.PSY_GUARDIAN_CONFIG) !== guardianPath) {
+        throw daemonConfigError("PSY_GUARDIAN_CONFIG coherence");
+    }
+    await resolveGuardianConfigPath(cwd, guardianPath);
+    let guardian: Record<string, unknown>;
+    try { guardian = JSON.parse(await fs.promises.readFile(guardianPath, "utf8")); }
+    catch { throw daemonConfigError("guardian_config public JSON"); }
+    for (const field of ["authorization_path", "archive_path", "tls_identity_path", "server_ca_path", "authorization_archive_path", "authorization_index_path", "history_tls_certificate_path", "history_tls_private_key_path", "history_client_ca_path"]) {
+        await validateDaemonPath(path.resolve(path.dirname(guardianPath), guardian[field] as string),
+            field === "archive_path" ? "output" : field === "authorization_archive_path" ? "directory" : "file", purgeTargets, `guardian_config.${field} metadata`);
+    }
+    return configPath;
+}
+
+export async function validateRelayerTemplate(cmds: readonly string[], options: RunningProcess["spawnOptions"]): Promise<void> {
+    if (!cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli")) return;
+    const cwd = options.cwd || process.cwd();
+    const env = options.env ?? process.env;
+    const configPath = await resolveBridgeDaemonConfigPath(cwd, env);
+    const index = cmds.indexOf("--config");
+    if (index < 0 || !cmds[index + 1] || path.resolve(cwd, cmds[index + 1]) !== configPath) throw daemonConfigError("saved --config coherence");
+}
+
 const ENVIO_NPM_VERSION = "2.32.10";
 const ENVIO_HASURA_IMAGE = "hasura/graphql-engine:v2.43.0";
 const ENVIO_POSTGRES_IMAGE = "postgres:17.5";
@@ -3540,14 +3772,7 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
     await killKnownPorts();
     if (purge) {
         console.log("[DevNet] Purging local checkpoints, Anvil state, logs, deployments, and Docker volumes...");
-        await cleanCheckpoint("./local_checkpoints", cwd);
-        await cleanCheckpoint("./db/anvil", cwd);
-        await cleanCheckpoint("./logs", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/localhost", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/localhostBsc", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/localhostBase", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/sepolia", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/ethereum", cwd);
+        for (const target of DEVNET_PURGE_PATHS) await cleanCheckpoint(target, cwd);
         await runIgnoreErrors(["docker", "volume", "rm", "-f", "psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data", "psy-devnet-nats"]);
     }
 }
@@ -3582,6 +3807,11 @@ interface ProcessOptions {
     modeAWebWalletBridge?: boolean;
     daemonlize?: boolean;
 }
+
+export function shouldRequireGuardianConfig(startAll: boolean, options: Pick<ProcessOptions, "relayer" | "bridgeProposerDaemon" | "bridgeUi">): boolean {
+    return startAll || !!options.relayer || !!options.bridgeProposerDaemon || !!options.bridgeUi;
+}
+
 export const ROLLBACK_STOP_SENTINEL_CONTENT =
     "rollback offline: all processors and relayer stopped; Scylla Redis NATS and checkpoints retained";
 export const ROLLBACK_STOP_SENTINEL_PATH = path.join("local_checkpoints", "rollback-stop.sentinel");
@@ -3697,7 +3927,7 @@ async function waitForProcessExit(process: RunningProcess, timeoutMs: number = 1
     process.killWithSignal("SIGKILL");
     await process.proc.exited;
 }
-class DevNetProcessManager {
+export class DevNetProcessManager {
     spawnedProcesses: RunningProcess[] = [];
     needsStartDb: boolean = false;
     /** When true, exited children must not be auto-restarted (teardown/Ctrl+C). */
@@ -3971,6 +4201,7 @@ class DevNetProcessManager {
         banner: string = `\n===== [DevNet supervisor] CONTROLLED START at ${new Date().toISOString()} =====\n`,
         track: boolean = true,
     ): Promise<RunningProcess> {
+        await validateRelayerTemplate(template.cmds, template.spawnOptions);
         const options = { ...template.spawnOptions, appendLogs: true, logBanner: banner };
         const process = template.useInitHint && template.hintDetector
             ? await RunningProcess.spawnWithInitializationHintWithRetry(
@@ -4046,6 +4277,7 @@ class DevNetProcessManager {
         if (this.applicationLifecycleState !== "stopped") {
             throw new Error(`[DevNet][control] cannot start applications while state=${this.applicationLifecycleState}`);
         }
+        for (const template of this.pausedApplicationProcesses) await validateRelayerTemplate(template.cmds, template.spawnOptions);
         this.applicationLifecycleState = "starting";
         const templates = sortedApplicationProcesses(this.pausedApplicationProcesses);
         const started: RunningProcess[] = [];
@@ -4075,6 +4307,7 @@ class DevNetProcessManager {
     }
 
     async restartApplications(cwd: string = "."): Promise<void> {
+        for (const template of splitDevnetProcesses(this.spawnedProcesses).applications) await validateRelayerTemplate(template.cmds, template.spawnOptions);
         await this.stopApplications(cwd, false);
         await this.startApplications(cwd);
     }
@@ -4112,7 +4345,10 @@ class DevNetProcessManager {
         // Determine what components to start
         const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || !!options.relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
         const startAll = !hasOnlyOptions;
-        const startBridgeProposerDaemon = startAll || !!options.bridgeProposerDaemon || !!options.relayer || !!options.bridgeUi;
+        const startBridgeProposerDaemon = shouldRequireGuardianConfig(startAll, options);
+        const daemonConfigPath = startBridgeProposerDaemon
+            ? await resolveBridgeDaemonConfigPath(cwd, this.getEnv(), !!options.purge)
+            : undefined;
 
         const startCoordinatorProcessor = startAll || !!options.coordinator;
         const startCoordinatorWorkers = coordinatorWorkersCount > 0;
@@ -4853,44 +5089,10 @@ class DevNetProcessManager {
         if (startBridgeProposerDaemon) {
             await waitForProveProxy("bridge relayer");
 
-            // 11.5 Unified bridge relayer
-            const proofDir = path.resolve(cwd, 'local_checkpoints', 'bridge_proposer');
-            await mkdir(proofDir, { recursive: true });
-            const daemonConfigPath = path.join(proofDir, 'daemon.toml');
-            const daemonConfig = [
-                `rpc_config = "psy-genesis/config.json"`,
-                `services_url = "http://127.0.0.1:3000"`,
-                `withdraw_method_id = 4159421846`,
-                `proof_dir = "${proofDir.replaceAll('\\', '\\\\')}"`,
-                `poll_interval_secs = 15`,
-                `confirmation_lag_checkpoints = 3`,
-                ``,
-                `[relayer_wallet]`,
-                `sign_type = "ZKSign"`,
-                `keystore_path = "${resolveBridgeRelayerKeystorePath().replaceAll('\\', '\\\\')}"`,
-                ``,
-                `[finalize]`,
-                `l1_rpc_url = "${l1RpcUrl}"`,
-                `deployments_network = "${deploymentsNetwork}"`,
-                `keystore_path = "${resolveBridgeRelayerKeystorePath().replaceAll('\\', '\\\\')}"`,
-                `password_env = "WALLET_PASSWORD"`,
-                ``,
-                ...relayerChains.flatMap((chain) => [
-                    `[[chains]]`,
-                    `family = "evm"`,
-                    `chain_index = ${chain.chainIndex}`,
-                    `network_id = "${chain.networkId}"`,
-                    `rpc_urls = ["${chain.rpcUrl}"]`,
-                    `deployments_network = "${chain.deploymentsNetwork}"`,
-                    `keystore_path = "${resolveBridgeRelayerKeystorePath().replaceAll('\\', '\\\\')}"`,
-                    `password_env = "WALLET_PASSWORD"`,
-                    ``,
-                ]),
-            ].join('\n');
-            await writeFile(daemonConfigPath, daemonConfig, 'utf8');
+            // Forward the whole operator config unchanged; the daemon owns protocol and credential validation.
 
             this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                ['./target/release/psy_relayer_cli', '--config', daemonConfigPath],
+                ['./target/release/psy_relayer_cli', '--config', daemonConfigPath!],
                 relayerStartedDetector,
                 {
                     cwd,
@@ -5836,6 +6038,10 @@ Usage: bun run dev/locSetupV4.ts [options]
         process.exit(0);
     }
 
+    if (!teardown && !daemonlize && shouldRequireGuardianConfig(!hasOnlyOptions, { relayer, bridgeProposerDaemon })) {
+        envVars.PSY_BRIDGE_DAEMON_CONFIG = await resolveBridgeDaemonConfigPath(process.cwd(), { ...process.env, ...envVars }, purge);
+    }
+
 
     // Acquire a race-safe per-repository kernel lock BEFORE auto-setup or any
     // Docker/process destruction. A live holder blocks this startup; an
@@ -5902,6 +6108,7 @@ Usage: bun run dev/locSetupV4.ts [options]
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
             requireBun: !hasOnlyOptions || psyPrivacyBridge || ide || modeAWebWalletBridge,
+            env: envVars,
         });
     }
 

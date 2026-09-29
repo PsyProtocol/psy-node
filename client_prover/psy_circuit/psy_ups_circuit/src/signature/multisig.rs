@@ -19,7 +19,7 @@ use psy_common_circuit::{
 use psy_config::{network_constants::PSY_NETWORK_MAGIC, DEFAULT_USER_STATE_TREE_ROOT_U64};
 use psy_crypto::signature::secp256k1::wallet::{hash_no_pad_compressed_public_key, validate_compressed_secp256k1_public_key};
 use psy_network_circuit::{gadgets::qdata::{user::PsyUserLeafGadget, user_contract_state::SignContextGadget}, ups::gadgets::ups_signature_data::PsyUserProvingSessionSignatureDataCompactGadget};
-use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatureInput};
+use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatureInput, MULTISIG_POLICY_CONTRACT_ID};
 
 use super::{software_defined::{compute_sig_hash, set_sig_hash_witness}, state_reader::StateReaderGadget};
 
@@ -59,13 +59,12 @@ impl MultisigPolicyTarget {
         let threshold = builder.add_virtual_target();
         let member_count = builder.add_virtual_target();
         builder.range_check(version, 32);
-        builder.range_check(threshold, 8);
-        builder.range_check(member_count, 8);
+        let two = builder.constant(F::from_canonical_u8(2));
+        let three = builder.constant(F::from_canonical_u8(3));
+        builder.connect(threshold, two);
+        builder.connect(member_count, three);
         builder.assert_non_zero(version);
-        builder.assert_non_zero(threshold);
-        builder.ensure_is_less_than_or_equal(8, threshold, member_count);
         let capacity = builder.constant(F::from_canonical_u8(8));
-        builder.ensure_is_less_than_or_equal(8, member_count, capacity);
         let member_hashes = core::array::from_fn(|_| builder.add_virtual_hash());
         let mut previous_bits: Option<Vec<BoolTarget>> = None;
         let one = builder.one();
@@ -136,11 +135,15 @@ fn constrain_policy_transition(
     initial: &MultisigPolicyTarget,
     current: &MultisigPolicyTarget,
     ending: &MultisigPolicyTarget,
-    start_slot: HashOutTarget,
-    end_slot: HashOutTarget,
+    start_slots: [HashOutTarget; 4],
+    end_slots: [HashOutTarget; 4],
     start_leaf: &PsyUserLeafGadget,
 ) {
-    let bootstrap = builder.is_zero_hash(start_slot);
+    let mut bootstrap = builder._true();
+    for slot in start_slots {
+        let empty = builder.is_zero_hash(slot);
+        bootstrap = builder.and(bootstrap, empty);
+    }
     let initialized = builder.not(bootstrap);
     let one = builder.one();
     let zero = builder.zero();
@@ -150,14 +153,27 @@ fn constrain_policy_transition(
         elements: DEFAULT_USER_STATE_TREE_ROOT_U64.map(F::from_canonical_u64),
     });
     builder.connect_hashes_if_true(bootstrap, start_leaf.user_state_tree_root, default_root);
-    builder.connect_hashes_if_true(bootstrap, current.commitment, initial.commitment);
-    builder.connect_hashes_if_true(bootstrap, ending.commitment, initial.commitment);
-    builder.connect_hashes_if_true(initialized, start_slot, current.commitment);
-    builder.connect_hashes(end_slot, ending.commitment);
-    let unchanged = builder.is_equal_hash(current.commitment, ending.commitment);
-    let changed = builder.not(unchanged);
+    let initial_header = HashOutTarget { elements: [initial.version, initial.threshold, initial.member_count, zero] };
+    let current_header = HashOutTarget { elements: [current.version, current.threshold, current.member_count, zero] };
+    let ending_header = HashOutTarget { elements: [ending.version, ending.threshold, ending.member_count, zero] };
+    for (current, initial) in core::iter::once(current_header).chain(current.member_hashes[..3].iter().copied()).zip(core::iter::once(initial_header).chain(initial.member_hashes[..3].iter().copied())) {
+        builder.connect_hashes_if_true(bootstrap, current, initial);
+    }
+    let current_slots = [current_header, current.member_hashes[0], current.member_hashes[1], current.member_hashes[2]];
+    let ending_slots = [ending_header, ending.member_hashes[0], ending.member_hashes[1], ending.member_hashes[2]];
+    for i in 0..4 {
+        builder.connect_hashes_if_true(initialized, start_slots[i], current_slots[i]);
+        builder.connect_hashes(end_slots[i], ending_slots[i]);
+        builder.connect_hashes_if_true(bootstrap, ending_slots[i], current_slots[i]);
+    }
+    let mut same_members = builder._true();
+    for i in 0..3 {
+        let equal = builder.is_equal_hash(current.member_hashes[i], ending.member_hashes[i]);
+        same_members = builder.and(same_members, equal);
+    }
+    builder.connect_if_true(same_members, ending.version, current.version);
+    let changed = builder.not(same_members);
     let replacement = builder.and(initialized, changed);
-    // Both versions are u32; the field sum cannot wrap and 2^32 cannot equal ending.version.
     let next_version = builder.add(current.version, one);
     builder.connect_if_true(replacement, ending.version, next_version);
 }
@@ -174,8 +190,8 @@ pub struct MultisigSignatureCircuit {
     sign_context: SignContextGadget,
     start_user_leaf: PsyUserLeafGadget,
     nonce: Target,
-    signatures: [Secp256K1Gadget; 8],
-    member_indices: [Target; 8],
+    signatures: [Secp256K1Gadget; 2],
+    member_indices: [Target; 2],
     circuit_data: CircuitData<F, C, 2>,
     minifier_chain: PsyProofMinifierChain<2, F, C>,
 }
@@ -188,8 +204,7 @@ impl MultisigSignatureCircuit {
         let start_user_leaf = PsyUserLeafGadget::create_virtual(&mut builder);
         let nonce = builder.add_virtual_target();
         let sighash = compute_sig_hash(&mut builder, &sig_data, &sign_context, &start_user_leaf, nonce);
-        let contract_id = builder.add_virtual_target();
-        builder.range_check(contract_id, 32);
+        let contract_id = builder.constant(F::from_canonical_u32(MULTISIG_POLICY_CONTRACT_ID));
         let mut start_reader = StateReaderGadget::new(&mut builder, 4);
         let mut end_reader = StateReaderGadget::new(&mut builder, 4);
         for (reader, leaf) in [(&mut start_reader, start_user_leaf), (&mut end_reader, sign_context.user_leaf)] {
@@ -198,12 +213,28 @@ impl MultisigSignatureCircuit {
             builder.connect_hashes(reader.state.checkpoint_tree_root, sign_context.checkpoint_tree_root);
             builder.connect_hashes(reader.checkpoint_leaf_hash, sig_data.checkpoint_leaf_hash);
         }
-        let start_slot = start_reader.get_self_user_current_contract_state_slot_hash(&mut builder, F::ZERO)?;
-        let end_slot = end_reader.get_self_user_current_contract_state_slot_hash(&mut builder, F::ZERO)?;
+        builder.connect(start_reader.state.checkpoint_id, end_reader.state.checkpoint_id);
+        let zero_hash = builder.constant_hash(QHashOut::<F>::ZERO.0);
+        let mut start_slots = [zero_hash; 4];
+        let mut end_slots = [zero_hash; 4];
+        for i in 0..4 {
+            start_slots[i] = start_reader.get_self_user_current_contract_state_slot_hash(&mut builder, F::from_canonical_usize(i))?;
+            end_slots[i] = end_reader.get_self_user_current_contract_state_slot_hash(&mut builder, F::from_canonical_usize(i))?;
+        }
+        for reader in [&start_reader, &end_reader] {
+            for i in 1..4 {
+                let first = &reader.merkel_proofs[0];
+                let next = &reader.merkel_proofs[2 * i];
+                builder.connect_hashes(first.value, next.value);
+                for (first, next) in first.siblings.iter().zip(&next.siblings) {
+                    builder.connect_hashes(*first, *next);
+                }
+            }
+        }
         let initial = MultisigPolicyTarget::add_virtual_to(&mut builder);
         let current = MultisigPolicyTarget::add_virtual_to(&mut builder);
         let ending = MultisigPolicyTarget::add_virtual_to(&mut builder);
-        constrain_policy_transition(&mut builder, &initial, &current, &ending, start_slot, end_slot, &start_user_leaf);
+        constrain_policy_transition(&mut builder, &initial, &current, &ending, start_slots, end_slots, &start_user_leaf);
         let domain = builder.constant(F::from_canonical_u32(0x4d534741));
         let zero = builder.zero();
         let height = builder.constant(F::from_canonical_u8(4));
@@ -213,7 +244,7 @@ impl MultisigSignatureCircuit {
         let message_bytes: Vec<_> = sighash.elements.iter().flat_map(|limb| {
             canonical_bits(&mut builder, *limb).chunks_exact(8).map(|bits| builder.le_sum(bits.iter())).collect::<Vec<_>>()
         }).rev().collect();
-        let signatures: [Secp256K1Gadget; 8] = core::array::from_fn(|_| {
+        let signatures: [Secp256K1Gadget; 2] = core::array::from_fn(|_| {
             let signature = Secp256K1Gadget::add_virtual_to::<PoseidonHash, F, 2>(&mut builder, b"");
             constrain_signature(&mut builder, &signature);
             for (target, byte) in signature.msg_bytes_target.iter().zip(&message_bytes) {
@@ -222,35 +253,19 @@ impl MultisigSignatureCircuit {
             }
             signature
         });
-        let member_indices: [Target; 8] = builder.add_virtual_target_arr();
-        let one = builder.one();
-        for i in 0..8 {
-            let slot = builder.constant(F::from_canonical_usize(i));
-            let active = builder.is_less_than(8, slot, current.threshold);
-            let inactive = builder.not(active);
-            builder.range_check(member_indices[i], 3);
-            let in_range = builder.is_less_than(8, member_indices[i], current.member_count);
-            builder.connect_if_true(active, in_range.target, one);
+        let member_indices: [Target; 2] = builder.add_virtual_target_arr();
+        for i in 0..2 {
+            builder.range_check(member_indices[i], 2);
+            let in_range = builder.is_less_than(2, member_indices[i], current.member_count);
+            builder.assert_one(in_range.target);
             if i > 0 {
-                let increasing = builder.is_less_than(3, member_indices[i - 1], member_indices[i]);
-                builder.connect_if_true(active, increasing.target, one);
-                builder.connect_if_true(inactive, member_indices[i], member_indices[0]);
-                for (padded, first) in [
-                    (&signatures[i].public_key_x_target, &signatures[0].public_key_x_target),
-                    (&signatures[i].public_key_y_target, &signatures[0].public_key_y_target),
-                    (&signatures[i].signature_r_target, &signatures[0].signature_r_target),
-                    (&signatures[i].signature_s_target, &signatures[0].signature_s_target),
-                ] {
-                    for (padded, first) in padded.limbs.iter().zip(&first.limbs) {
-                        builder.connect_if_true(inactive, padded.0, first.0);
-                    }
-                }
+                let increasing = builder.is_less_than(2, member_indices[i - 1], member_indices[i]);
+                builder.assert_one(increasing.target);
             }
-            for j in 0..8 {
+            for j in 0..3 {
                 let index = builder.constant(F::from_canonical_usize(j));
                 let selected = builder.is_equal(member_indices[i], index);
-                let counted = builder.and(active, selected);
-                builder.connect_hashes_if_true(counted, signatures[i].public_key_hash, current.member_hashes[j]);
+                builder.connect_hashes_if_true(selected, signatures[i].public_key_hash, current.member_hashes[j]);
             }
         }
         builder.add_psy_type_b_common_gates();
@@ -264,10 +279,9 @@ impl MultisigSignatureCircuit {
     pub fn prove(&self, input: &MultisigSignatureInput, sighash: QHashOut<F>) -> anyhow::Result<PsyProof> {
         let witness = &input.witness;
         let param = witness.account.public_key_param()?;
-        witness.current_policy.commitment()?;
-        witness.ending_policy.commitment()?;
+        let (current, _) = witness.policies()?;
         let signatures = &input.signatures;
-        anyhow::ensure!(signatures.signatures.len() == witness.current_policy.threshold as usize, "multisig signature count must equal threshold");
+        anyhow::ensure!(signatures.signatures.len() == 2, "multisig requires exactly two signatures");
         anyhow::ensure!(signatures.member_indices.len() == signatures.signatures.len(), "multisig signature/index count mismatch");
         let expected = witness.sig_data.get_sig_action_for_user::<PoseidonHash>(PSY_NETWORK_MAGIC, witness.sign_context.user_leaf.user_id, witness.nonce, witness.sign_context.clone()).get_qhash::<PoseidonHash>();
         anyhow::ensure!(expected == sighash, "multisig sighash mismatch");
@@ -277,7 +291,7 @@ impl MultisigSignatureCircuit {
             anyhow::ensure!(state.state.contract_id == F::from_canonical_u32(witness.account.contract_id), "multisig state contract mismatch");
             anyhow::ensure!(state.state.checkpoint_tree_root == witness.sign_context.checkpoint_tree_root, "multisig state checkpoint mismatch");
             anyhow::ensure!(state.state_cmds == self.start_reader.state_cmds, "multisig state commands mismatch");
-            anyhow::ensure!(state.merkel_proofs.len() == 2 && state.aux_user_leaves.is_empty(), "multisig self-state proof shape mismatch");
+            anyhow::ensure!(state.merkel_proofs.len() == 8 && state.aux_user_leaves.is_empty(), "multisig self-state proof shape mismatch");
             for (proof, target) in state.merkel_proofs.iter().zip(&self.start_reader.merkel_proofs) {
                 anyhow::ensure!(proof.siblings.len() == target.siblings.len(), "multisig state proof height mismatch");
             }
@@ -287,12 +301,12 @@ impl MultisigSignatureCircuit {
         anyhow::ensure!(witness.start_session_user_leaf.public_key == public_key && witness.sign_context.user_leaf.public_key == public_key, "multisig account identity mismatch");
         let message = Hash256::from(sighash);
         for (i, (&index, signature)) in signatures.member_indices.iter().zip(&signatures.signatures).enumerate() {
-            anyhow::ensure!(index < witness.current_policy.member_count, "multisig member index out of range");
+            anyhow::ensure!(index < 3, "multisig member index out of range");
             anyhow::ensure!(i == 0 || signatures.member_indices[i - 1] < index, "multisig member indices must strictly increase");
             anyhow::ensure!(signature.message == message, "multisig external signature message mismatch");
             let key = validate_compressed_secp256k1_public_key(CompressedPublicKey(signature.public_key))?;
             let commitment = hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(key);
-            anyhow::ensure!(commitment == witness.current_policy.member_hashes[index as usize], "multisig signer is not the selected member");
+            anyhow::ensure!(commitment == current.member_hashes[index as usize], "multisig signer is not the selected member");
             let scalar = Signature::from_slice(&signature.signature)?;
             anyhow::ensure!(scalar.normalize_s().is_none(), "multisig signature must use low-S form");
         }
@@ -302,21 +316,23 @@ impl MultisigSignatureCircuit {
     fn set_witness(&self, input: &MultisigSignatureInput) -> anyhow::Result<PartialWitness<F>> {
         let witness = &input.witness;
         let signatures = &input.signatures;
+        anyhow::ensure!(signatures.signatures.len() == 2 && signatures.member_indices.len() == 2, "multisig requires exactly two indexed signatures");
+        let (current, ending) = witness.policies()?;
         let decoded = signatures.signatures.iter().map(|signature| {
             VerifyingKey::from_sec1_bytes(&signature.public_key).map(|key| key.to_encoded_point(false))
         }).collect::<Result<Vec<_>, _>>()?;
         let mut pw = PartialWitness::new();
         pw.set_target(self.contract_id, F::from_canonical_u32(witness.account.contract_id))?;
         self.initial.set_witness(&mut pw, &witness.account.initial_policy)?;
-        self.current.set_witness(&mut pw, &witness.current_policy)?;
-        self.ending.set_witness(&mut pw, &witness.ending_policy)?;
+        self.current.set_witness(&mut pw, &current)?;
+        self.ending.set_witness(&mut pw, &ending)?;
         set_sig_hash_witness(&mut pw, &self.sig_data, &self.sign_context, self.nonce, &self.start_user_leaf, &witness.sig_data, &witness.sign_context, witness.nonce, &witness.start_session_user_leaf)?;
         self.start_reader.set_witness(&mut pw, &witness.start_state)?;
         self.end_reader.set_witness(&mut pw, &witness.end_state)?;
         pw.set_hash_target(self.start_reader.checkpoint_leaf_hash, witness.sig_data.checkpoint_leaf_hash.0)?;
         pw.set_hash_target(self.end_reader.checkpoint_leaf_hash, witness.sig_data.checkpoint_leaf_hash.0)?;
-        for i in 0..8 {
-            let source = if i < signatures.signatures.len() { i } else { 0 };
+        for i in 0..2 {
+            let source = i;
             let signature = &signatures.signatures[source];
             let key = decoded[source].as_bytes();
             let gadget = &self.signatures[i];
@@ -350,7 +366,8 @@ mod tests {
         let mut member_hashes = [QHashOut::ZERO; 8];
         member_hashes[0] = QHashOut::from_values(1, 0, 0, 0);
         member_hashes[1] = QHashOut::from_values(2, 0, 0, 0);
-        MultisigPolicy { version, threshold: 1, member_count: 2, member_hashes }
+        member_hashes[2] = QHashOut::from_values(3, 0, 0, 0);
+        MultisigPolicy { version, threshold: 2, member_count: 3, member_hashes }
     }
 
     fn policy_proof(policy: &MultisigPolicy) -> anyhow::Result<()> {
@@ -408,8 +425,8 @@ mod tests {
         let initial = MultisigPolicyTarget::add_virtual_to(&mut builder);
         let current_target = MultisigPolicyTarget::add_virtual_to(&mut builder);
         let ending_target = MultisigPolicyTarget::add_virtual_to(&mut builder);
-        let start_slot = builder.add_virtual_hash();
-        let end_slot = builder.add_virtual_hash();
+        let start_slot = core::array::from_fn(|_| builder.add_virtual_hash());
+        let end_slot = core::array::from_fn(|_| builder.add_virtual_hash());
         let leaf = PsyUserLeafGadget::create_virtual(&mut builder);
         constrain_policy_transition(&mut builder, &initial, &current_target, &ending_target, start_slot, end_slot, &leaf);
         let data = builder.build::<C>();
@@ -417,8 +434,12 @@ mod tests {
         initial.set_witness(&mut pw, &policy(1))?;
         current_target.set_witness(&mut pw, current)?;
         ending_target.set_witness(&mut pw, ending)?;
-        pw.set_hash_target(start_slot, if bootstrap { QHashOut::ZERO.0 } else { current.commitment()?.0 })?;
-        pw.set_hash_target(end_slot, if clear { QHashOut::ZERO.0 } else { ending.commitment()?.0 })?;
+        for (i, slot) in policy_slots(current).iter().enumerate() {
+            pw.set_hash_target(start_slot[i], if bootstrap { QHashOut::ZERO.0 } else { slot.0 })?;
+        }
+        for (i, slot) in policy_slots(ending).iter().enumerate() {
+            pw.set_hash_target(end_slot[i], if clear { QHashOut::ZERO.0 } else { slot.0 })?;
+        }
         pw.set_target(leaf.nonce, F::from_canonical_u64(nonce))?;
         pw.set_hash_target(leaf.user_state_tree_root, plonky2::hash::hash_types::HashOut { elements: DEFAULT_USER_STATE_TREE_ROOT_U64.map(F::from_canonical_u64) })?;
         // Unused leaf fields are not inputs to the policy transition relation.
@@ -433,15 +454,25 @@ mod tests {
     fn policy_transition_rejects_clear_rollback_overflow_and_bootstrap_replay() {
         transition_proof(&policy(1), &policy(1), true, false, 0).unwrap();
         transition_proof(&policy(2), &policy(2), false, false, 1).unwrap();
-        transition_proof(&policy(2), &policy(3), false, false, 1).unwrap();
+        let mut replacement = policy(3);
+        replacement.member_hashes[2] = QHashOut::from_values(4, 0, 0, 0);
+        transition_proof(&policy(2), &replacement, false, false, 1).unwrap();
+        assert!(transition_proof(&policy(2), &policy(3), false, false, 1).is_err());
         assert!(transition_proof(&policy(2), &policy(1), false, false, 1).is_err());
         assert!(transition_proof(&policy(2), &policy(2), false, true, 1).is_err());
         assert!(transition_proof(&policy(u32::MAX), &policy(1), false, false, 1).is_err());
         assert!(transition_proof(&policy(1), &policy(1), true, false, 1).is_err());
         assert!(transition_proof(&policy(1), &policy(2), true, false, 0).is_err());
         let mut changed = policy(2);
-        changed.threshold = 2;
+        changed.member_hashes[2] = QHashOut::from_values(4, 0, 0, 0);
         assert!(transition_proof(&policy(2), &changed, false, false, 1).is_err());
+        let mut overflow = changed.clone();
+        overflow.version = 1;
+        assert!(transition_proof(&policy(u32::MAX), &overflow, false, false, 1).is_err());
+    }
+
+    fn policy_slots(policy: &MultisigPolicy) -> [QHashOut<F>; 4] {
+        [QHashOut::from_values(policy.version as u64, policy.threshold as u64, policy.member_count as u64, 0), policy.member_hashes[0], policy.member_hashes[1], policy.member_hashes[2]]
     }
 
     #[test]
@@ -494,7 +525,7 @@ mod tests {
         use psy_client_data::qdata::{user::PsyUserLeaf, user_contract_state::{SignContext, UserContractState}, ups_signature::PsyUserProvingSessionSignatureDataCompact};
         use psy_crypto::{hash::{merkle::core::MerkleProofCore, traits::{hasher::MerkleZeroHasher, qhashable::QFieldHashable}}, signature::secp256k1::core::PsyCompressedSecp256K1Signature};
         use psy_vm::ups::{multisig::{MultisigAccount, MultisigSignatures, MultisigSignatureWitness}, state_reader::StateReaderResults};
-        let mut keys: Vec<_> = (1u8..=3).map(|byte| {
+        let mut keys: Vec<_> = (1u8..=4).map(|byte| {
             let key = SigningKey::from_slice(&[byte; 32]).unwrap();
             let compressed: [u8; 33] = key.verifying_key().to_encoded_point(true).as_bytes().try_into().unwrap();
             let member = hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(CompressedPublicKey(compressed));
@@ -502,23 +533,18 @@ mod tests {
         }).collect();
         keys.sort_by_key(|(member, _, _)| member.0.elements.map(|limb| limb.to_canonical_u64()));
         let mut initial = policy(1);
-        initial.threshold = 2;
-        initial.member_count = 3;
-        for (i, (member, _, _)) in keys.iter().enumerate() {
+        for (i, (member, _, _)) in keys.iter().take(3).enumerate() {
             initial.member_hashes[i] = *member;
         }
-        let account = MultisigAccount { contract_id: 42, initial_policy: initial.clone() };
+        let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: initial.clone() };
         let mut current = initial.clone();
         let mut ending = initial;
         if !bootstrap {
             ending.version = 2;
-            ending.threshold = 3;
+            for i in 0..3 { ending.member_hashes[i] = keys[i + 1].0; }
         }
         if revoked {
-            current.version = 2;
-            current.member_count = 2;
-            current.member_hashes[2] = QHashOut::ZERO;
-            ending = current.clone();
+            current = ending.clone();
         }
         let public_key = QHashOut(PoseidonHash::two_to_one(circuit.get_fingerprint().0, account.public_key_param().unwrap().0));
         let leaf = PsyUserLeaf {
@@ -526,24 +552,35 @@ mod tests {
             nonce: if bootstrap { F::ZERO } else { F::ONE }, last_checkpoint_id: F::ONE,
             event_index: F::ZERO, user_id: F::from_canonical_u64(9),
         };
-        let state = |slot: QHashOut<F>, uninitialized: bool| {
-            let slot_siblings: Vec<_> = (0..4).map(|height| QHashOut(<PoseidonHash as MerkleZeroHasher<HashOut<F>>>::get_zero_hash(height))).collect();
-            let slot_proof = MerkleProofCore::new_from_params::<PsyHasher>(0, slot, slot_siblings);
-            let slot_root = slot_proof.root;
+        let state = |slots: [QHashOut<F>; 4], uninitialized: bool| {
+            let mut leaves = vec![QHashOut::ZERO; 16];
+            leaves[..4].copy_from_slice(&slots);
+            let mut levels = vec![leaves];
+            for height in 0..4 {
+                let parents = levels[height].chunks_exact(2).map(|pair| QHashOut(PoseidonHash::two_to_one(pair[0].0, pair[1].0))).collect();
+                levels.push(parents);
+            }
+            let slot_root = levels[4][0];
             let contract_siblings: Vec<_> = (0..psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize).map(|height| QHashOut(<PoseidonHash as MerkleZeroHasher<HashOut<F>>>::get_zero_hash(height))).collect();
             let contract_value = if uninitialized { QHashOut::ZERO } else { slot_root };
-            let contract_proof = MerkleProofCore::new_from_params::<PsyHasher>(42, contract_value, contract_siblings);
+            let contract_proof = MerkleProofCore::new_from_params::<PsyHasher>(MULTISIG_POLICY_CONTRACT_ID as u64, contract_value, contract_siblings);
             let user_root = contract_proof.root;
             let mut user_leaf = leaf;
             user_leaf.user_state_tree_root = user_root;
+            let mut proofs = Vec::new();
+            for i in 0..4 {
+                let siblings = (0..4).map(|height| levels[height][(i >> height) ^ 1]).collect();
+                proofs.push(contract_proof.clone());
+                proofs.push(MerkleProofCore::new_from_params::<PsyHasher>(i as u64, slots[i], siblings));
+            }
             StateReaderResults {
-                state: UserContractState { checkpoint_tree_root: QHashOut::ZERO, user_leaf, start_contract_state_root: slot_root, contract_id: F::from_canonical_u32(42), checkpoint_id: F::ONE },
+                state: UserContractState { checkpoint_tree_root: QHashOut::ZERO, user_leaf, start_contract_state_root: slot_root, contract_id: F::from_canonical_u32(MULTISIG_POLICY_CONTRACT_ID), checkpoint_id: F::ONE },
                 user_tree_root: QHashOut::ZERO, checkpoint: None, aux_user_leaves: vec![],
-                state_cmds: circuit.start_reader.state_cmds.clone(), merkel_proofs: vec![contract_proof, slot_proof],
+                state_cmds: circuit.start_reader.state_cmds.clone(), merkel_proofs: proofs,
             }
         };
-        let start_state = state(if bootstrap { QHashOut::ZERO } else { current.commitment().unwrap() }, bootstrap);
-        let end_state = state(ending.commitment().unwrap(), false);
+        let start_state = state(if bootstrap { [QHashOut::ZERO; 4] } else { policy_slots(&current) }, bootstrap);
+        let end_state = state(policy_slots(&ending), false);
         let start_session_user_leaf = start_state.state.user_leaf;
         let sign_context = SignContext { checkpoint_tree_root: QHashOut::ZERO, user_leaf: end_state.state.user_leaf };
         let nonce = leaf.nonce + F::ONE;
@@ -561,26 +598,43 @@ mod tests {
             PsyCompressedSecp256K1Signature { public_key: keys[index].2, signature: signature.to_bytes().into(), message }
         });
         (MultisigSignatureInput {
-            witness: MultisigSignatureWitness { account, current_policy: current, ending_policy: ending, start_state, end_state, sig_data, sign_context, start_session_user_leaf, nonce },
+            witness: MultisigSignatureWitness { account, start_state, end_state, sig_data, sign_context, start_session_user_leaf, nonce },
             signatures: MultisigSignatures { member_indices: vec![0, 2], signatures: signatures.to_vec() },
         }, sighash)
     }
 
     #[test]
-    fn eight_slot_bootstrap_rotation_and_forged_witnesses() {
+    fn four_field_bootstrap_rotation_and_forged_witnesses() {
         let circuit = MultisigSignatureCircuit::new().unwrap();
         for bootstrap in [true, false] {
             let (input, sighash) = full_input(&circuit, bootstrap, false);
             circuit.prove(&input, sighash).unwrap();
-            // Skip prove's host validation: these must fail in the complete relation.
+            // Bypass prove's signature checks to exercise the ECDSA/member relation.
             let mut duplicate = input.clone();
             duplicate.signatures.member_indices[1] = duplicate.signatures.member_indices[0];
             duplicate.signatures.signatures[1] = duplicate.signatures.signatures[0];
             assert!(circuit.set_witness(&duplicate).and_then(|pw| circuit.circuit_data.prove(pw)).is_err());
-            let mut end_authorization = input.clone();
-            end_authorization.witness.current_policy = input.witness.ending_policy.clone();
-            if !bootstrap {
-                assert!(circuit.set_witness(&end_authorization).and_then(|pw| circuit.circuit_data.prove(pw)).is_err());
+            let mut forged_slot = input.clone();
+            forged_slot.witness.start_state.merkel_proofs[3].value = QHashOut::from_values(9, 9, 9, 9);
+            assert!(forged_slot.witness.policies().is_err());
+            let mut forged_relation = circuit.set_witness(&input).unwrap();
+            let slot_target = circuit.start_reader.merkel_proofs[3].value.elements[0];
+            forged_relation.target_values.insert(slot_target, F::from_canonical_u64(9));
+            assert!(circuit.circuit_data.prove(forged_relation).is_err());
+            let mut wrong_index = input.clone();
+            wrong_index.witness.end_state.merkel_proofs[7].index = 2;
+            assert!(wrong_index.witness.policies().is_err());
+            let mut wrong_anchor = input.clone();
+            wrong_anchor.witness.end_state.merkel_proofs[4].root = QHashOut::ZERO;
+            assert!(wrong_anchor.witness.policies().is_err());
+            let mut wrong_identity = input.clone();
+            wrong_identity.witness.account.initial_policy.member_hashes[2] = QHashOut::from_values(u64::MAX - (1u64 << 32), 0, 0, 0);
+            assert!(circuit.prove(&wrong_identity, sighash).is_err());
+            for count in [0, 1, 3] {
+                let mut wrong_count = input.clone();
+                wrong_count.signatures.signatures.resize(count, input.signatures.signatures[0]);
+                wrong_count.signatures.member_indices.resize(count, 0);
+                assert!(circuit.set_witness(&wrong_count).is_err());
             }
             let mut substituted_start = input.clone();
             substituted_start.witness.start_state = input.witness.end_state.clone();
@@ -589,8 +643,7 @@ mod tests {
             wrong_message.signatures.signatures[0].message.0.reverse();
             assert!(circuit.set_witness(&wrong_message).and_then(|pw| circuit.circuit_data.prove(pw)).is_err());
         }
-        let (mut revoked, _) = full_input(&circuit, false, true);
-        revoked.signatures.member_indices[1] = 1;
+        let (revoked, _) = full_input(&circuit, false, true);
         assert!(circuit.set_witness(&revoked).and_then(|pw| circuit.circuit_data.prove(pw)).is_err());
     }
 }

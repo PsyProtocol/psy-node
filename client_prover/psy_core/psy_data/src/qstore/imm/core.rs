@@ -237,8 +237,7 @@ impl<T: KVQBinaryStore> QTreeDataStoreReaderSync<F> for T {
         contract_id: u32,
         function_id: u32,
     ) -> anyhow::Result<MerkleProofCore<QHashOut<F>>> {
-        // NOTE: four leaves per function (fingerprint, metadata, code hash, reserved)
-        ContractFunctionTreeStore::<T>::get_leaf_sfc(self, checkpoint_id, contract_id.into(), (function_id as u64) * 4u64)
+        ContractFunctionTreeStore::<T>::get_leaf_sfc(self, checkpoint_id, contract_id.into(), function_id as u64)
     }
 
     async fn get_contract_tree_root(&self, checkpoint_id: u64) -> anyhow::Result<QHashOut<F>> {

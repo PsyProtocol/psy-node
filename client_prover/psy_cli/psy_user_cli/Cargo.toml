@@ -12,6 +12,10 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 psy_crypto = { workspace = true }
+psy_core = { workspace = true }
+parth_core = { workspace = true }
+psy_plonky2_circuits = { workspace = true, default-features = false, features = ["std", "serialize_speedy"] }
+psy_plonky2_common_circuits = { workspace = true, default-features = false, features = ["std"] }
 psy_common_circuit = { workspace = true }
 psy_dpn_circuit = { workspace = true }
 psy_ups_circuit = { workspace = true }

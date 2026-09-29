@@ -15,7 +15,7 @@ use psy_client_common::data::{
     alt::AltVerifierOnlyCircuitData, base_types::hash256::Hash256, qhashout::QHashOut, secp256k1::CompressedPublicKey,
 };
 use psy_client_data::{
-    config::store_config::PsyHasher,
+    config::store_config::{PsyHasher, PsyProof},
     dpn::sd_key::SDKeyConfig,
     privacy::{deposit_inclusion::DepositInclusionInput, private_note_inclusion::PrivateNoteInclusionInput},
     qdata::contract::ContractCodeDefinition,
@@ -48,10 +48,11 @@ use psy_dpn_circuit::circuits::privacy::{
 };
 use psy_ups_circuit::signature::{
     multisig::MultisigSignatureCircuit,
+    reward_authorization::{RewardAuthorizationCircuits, RewardAuthorizationContext},
     sd_key::SDKeyCircuitGadget,
     software_defined::{DPNSoftwareDefinedSignatureGadget, Plonky2SoftwareDefinedSignatureGadget},
 };
-use psy_vm::ups::{circuit_manager::UPSCircuitManager, multisig::{MultisigAccount, MultisigPolicy, MultisigSignatures}, state_reader::StateReader};
+use psy_vm::ups::{circuit_manager::UPSCircuitManager, multisig::{MultisigAccount, MultisigSignatures}, state_reader::StateReader};
 
 use crate::signature::{
     context::SignContext,
@@ -647,18 +648,6 @@ impl PsyMemoryWallet {
         }
     }
 
-    pub fn set_multisig_policy(
-        &mut self,
-        public_key: QHashOut<F>,
-        current_policy: MultisigPolicy,
-        ending_policy: MultisigPolicy,
-    ) -> anyhow::Result<()> {
-        let mut user = (*self.get_multisig_user(&public_key)?).clone();
-        user.set_policy(current_policy, ending_policy)?;
-        let user = Arc::new(user);
-        self.signature_users.insert(public_key, WalletSignatureUser::Multisig(user));
-        Ok(())
-    }
 
     pub fn inject_multisig_signatures(
         &mut self,
@@ -1017,6 +1006,16 @@ impl PsyMemoryWallet {
             .ok_or_else(|| anyhow::anyhow!("User with public key hash {} not found", pk_hash))
     }
 
+    pub fn prove_reward_authorization(
+        &self,
+        public_key: &QHashOut<F>,
+        context: &RewardAuthorizationContext,
+        circuits: &RewardAuthorizationCircuits,
+    ) -> anyhow::Result<Option<PsyProof>> {
+        anyhow::ensure!(context.authorization_user_leaf.public_key == *public_key, "reward authorization user identity mismatch");
+        self.get_user_by_public_key_hash(public_key)?.prove_reward_authorization(context, circuits)
+    }
+
     pub async fn add_software_defined_dpn_private_key(
         &mut self,
         private_key: QHashOut<F>,
@@ -1307,14 +1306,10 @@ mod tests {
     fn multisig_updates_reject_missing_and_standard_users() {
         let mut wallet = PsyMemoryWallet::new(Vec::new());
         let public_key = QHashOut::from_values(1, 2, 3, 4);
-        let mut member_hashes = [QHashOut::ZERO; 8];
-        member_hashes[0] = QHashOut::from_values(1, 0, 0, 0);
-        let policy = MultisigPolicy { version: 1, threshold: 1, member_count: 1, member_hashes };
-        assert!(wallet.set_multisig_policy(public_key, policy.clone(), policy.clone()).is_err());
+        assert!(wallet.inject_multisig_signatures(public_key, MultisigSignatures { member_indices: vec![], signatures: vec![] }).is_err());
         let user: Arc<dyn SignatureUser> = Arc::new(ZKUser::new(SimplePsyPrivateKey { private_key: public_key }));
         wallet.signature_users.insert(public_key, WalletSignatureUser::Standard(user));
         assert!(wallet.get_multisig_user(&public_key).is_err());
-        assert!(wallet.set_multisig_policy(public_key, policy.clone(), policy).is_err());
         assert!(wallet.inject_multisig_signatures(public_key, MultisigSignatures { member_indices: vec![], signatures: vec![] }).is_err());
         assert!(wallet.get_user_by_public_key_hash(&public_key).is_ok());
     }

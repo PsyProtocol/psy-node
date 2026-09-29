@@ -81,6 +81,166 @@ const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
     psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const GROTH16_FILES: [&str; 3] = ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"];
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AggregateSetupConfig {
+    pub(crate) network_config: String,
+    pub(crate) sources: psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestBitsSources,
+}
+
+pub(crate) fn load_aggregate_setup_config(path: &Path) -> anyhow::Result<AggregateSetupConfig> {
+    let approved: AggregateSetupConfig = serde_json::from_slice(&fs::read(path)?)?;
+    approved.sources.validate()?;
+    let config_bytes = hex::decode(&approved.network_config)?;
+    anyhow::ensure!(hex::encode(&config_bytes) == approved.network_config, "network_config must be lowercase canonical hex without 0x");
+    psy_client_data::bridge_aggregate::NetworkConfig::decode(&config_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid approved aggregate configuration: {error:?}"))?;
+    Ok(approved)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DigestBitsManifest {
+    schema: u32,
+    identity_hash: String,
+    files: Vec<DigestBitsManifestFile>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DigestBitsManifestFile {
+    name: String,
+    sha256: String,
+}
+
+pub(crate) fn validate_digest_bits_setup(dir: &Path, expected: &psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestBitsIdentity) -> anyhow::Result<String> {
+    use psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestBitsIdentity;
+    use psy_crypto::hash::core::sha256::CoreSha256Hasher;
+    let identity: DigestBitsIdentity = serde_json::from_slice(&fs::read(dir.join("identity.json"))?)?;
+    anyhow::ensure!(&identity == expected, "native setup identity differs from actual wrapper");
+    let identity_hash = identity.identity_hash()?;
+    let manifest: DigestBitsManifest = serde_json::from_slice(&fs::read(dir.join("manifest.json"))?)?;
+    anyhow::ensure!(manifest.schema == 1 && manifest.identity_hash == identity_hash, "setup manifest identity mismatch");
+    let names = ["circuit_groth16.bin", "identity.json", "pk_groth16.bin", "verifier.sol", "vk_groth16.bin"];
+    anyhow::ensure!(manifest.files.len() == names.len(), "incomplete setup manifest");
+    for (file, name) in manifest.files.iter().zip(names) {
+        anyhow::ensure!(file.name == name, "noncanonical setup manifest files");
+        let path = dir.join(name);
+        anyhow::ensure!(fs::symlink_metadata(&path)?.file_type().is_file(), "setup artifact is not a regular file");
+        let bytes = fs::read(&path)?;
+        anyhow::ensure!(!bytes.is_empty() && file.sha256 == hex::encode(CoreSha256Hasher::hash_bytes(&bytes).0), "setup artifact digest mismatch: {name}");
+        fs::File::open(path)?.sync_all()?;
+    }
+    fs::File::open(dir.join("manifest.json"))?.sync_all()?;
+    fs::File::open(dir)?.sync_all()?;
+    Ok(identity_hash)
+}
+
+fn regenerate_aggregate_pair(config_path: &Path, output: &Path) -> anyhow::Result<()> {
+    use psy_plonky2_circuits::bridge::{aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits}, circuits::bridge_wrap::{DigestArtifact, DigestBitsAdapter}};
+    anyhow::ensure!(matches!(fs::symlink_metadata(output), Err(error) if error.kind() == std::io::ErrorKind::NotFound), "aggregate output must not exist");
+    let approved = load_aggregate_setup_config(config_path)?;
+    let config = psy_client_data::bridge_aggregate::NetworkConfig::decode(&hex::decode(&approved.network_config)?)
+        .map_err(|error| anyhow::anyhow!("invalid approved aggregate configuration: {error:?}"))?;
+    let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(config.chains.len(), cached_bridge_coordinator_circuits()?, AggregateCircuitHeights {
+        deposit_state_tree: DEPOSIT_CONTRACT_STATE_TREE_HEIGHT,
+        withdrawal_state_tree: WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
+    })?;
+    circuits.validate_config(&config)?;
+    let circuit_set = psy_client_data::bridge_aggregate::encode_circuit_set(circuits.entries())?;
+    let (normalizer_a, normalizer_b) = circuits.into_normalizers();
+    let adapter_a = DigestBitsAdapter::build(DigestArtifact::A, &normalizer_a.common, &normalizer_a.verifier_only)?;
+    let adapter_b = DigestBitsAdapter::build(DigestArtifact::B, &normalizer_b.common, &normalizer_b.verifier_only)?;
+    drop((normalizer_a, normalizer_b));
+    let a = adapter_a.into_wrapper(approved.sources.clone())?;
+    let b = adapter_b.into_wrapper(approved.sources)?;
+    let parent = output.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let name = output.file_name().context("aggregate output must name a directory")?;
+    let mut staging_name = name.to_os_string();
+    staging_name.push(format!(".staging-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+    let staging = parent.join(staging_name);
+    fs::create_dir(&staging)?;
+    let result = (|| -> anyhow::Result<()> {
+        fs::write(staging.join("circuit_set.bin"), &circuit_set)?;
+        fs::File::open(staging.join("circuit_set.bin"))?.sync_all()?;
+        let mut hashes = Vec::with_capacity(2);
+        for (name, wrapper) in [("A", &a), ("B", &b)] {
+            let directory = staging.join(name);
+            wrapper.setup(directory.to_str().context("aggregate artifact path must be UTF-8")?)?;
+            hashes.push(validate_digest_bits_setup(&directory, wrapper.identity())?);
+        }
+        let pair = serde_json::json!({"schema": 1, "A": hashes[0], "B": hashes[1]});
+        fs::write(staging.join("pair.json"), serde_json::to_vec(&pair)?)?;
+        fs::File::open(staging.join("pair.json"))?.sync_all()?;
+        fs::File::open(&staging)?.sync_all()?;
+        install_aggregate_pair(&staging, output)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() && staging.exists() { let _ = fs::remove_dir_all(&staging); }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn install_aggregate_pair(staging: &Path, output: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let staging = std::ffi::CString::new(staging.as_os_str().as_bytes())?;
+    let output = std::ffi::CString::new(output.as_os_str().as_bytes())?;
+    let result = unsafe { libc::renameat2(libc::AT_FDCWD, staging.as_ptr(), libc::AT_FDCWD, output.as_ptr(), libc::RENAME_NOREPLACE) };
+    if result != 0 { return Err(std::io::Error::last_os_error().into()); }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_aggregate_pair(_staging: &Path, _output: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("atomic no-replace aggregate publication requires Linux renameat2")
+}
+
+#[cfg(test)]
+mod aggregate_setup_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        args: RegenerateGroth16KeystoreArgs,
+    }
+
+    #[test]
+    fn aggregate_pair_requires_complete_exclusive_arguments() {
+        assert!(Command::try_parse_from(["setup", "--aggregate-pair"]).is_err());
+        assert!(Command::try_parse_from(["setup", "--aggregate-config", "config.json", "--output-dir", "pair"]).is_err());
+        for option in ["--include-bridge-agg", "--skip-deposit-append", "--skip-withdrawal-claim"] {
+            assert!(Command::try_parse_from(["setup", "--aggregate-pair", "--aggregate-config", "config.json", "--output-dir", "pair", option]).is_err());
+        }
+        let command = Command::try_parse_from(["setup", "--aggregate-pair", "--aggregate-config", "config.json", "--output-dir", "pair"]).unwrap();
+        assert_eq!(command.args.aggregate_config.as_deref(), Some(Path::new("config.json")));
+        assert_eq!(command.args.output_dir.as_deref(), Some(Path::new("pair")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn aggregate_publication_never_replaces_existing_destination() {
+        let root = std::env::temp_dir().join(format!("aggregate-publication-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&root).unwrap();
+        let staging = root.join("staging");
+        let output = root.join("output");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("pair.json"), b"candidate").unwrap();
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("pair.json"), b"retained").unwrap();
+        assert!(install_aggregate_pair(&staging, &output).is_err());
+        assert_eq!(fs::read(output.join("pair.json")).unwrap(), b"retained");
+        assert_eq!(fs::read(staging.join("pair.json")).unwrap(), b"candidate");
+        let fresh = root.join("fresh");
+        install_aggregate_pair(&staging, &fresh).unwrap();
+        assert_eq!(fs::read(fresh.join("pair.json")).unwrap(), b"candidate");
+        assert!(!staging.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct RegenerateGroth16KeystoreArgs {
     /// Keystore root directory. Defaults to ~/.psy/keystore.
@@ -95,9 +255,23 @@ pub struct RegenerateGroth16KeystoreArgs {
     /// Do not regenerate withdrawal_claim.
     #[arg(long, default_value_t = false)]
     pub skip_withdrawal_claim: bool,
+    /// Generate and publish the complete A/B setup pair to a fresh destination.
+    #[arg(long, requires_all = ["aggregate_config", "output_dir"], conflicts_with_all = ["keystore_dir", "include_bridge_agg", "skip_deposit_append", "skip_withdrawal_claim"])]
+    pub aggregate_pair: bool,
+    /// Approved canonical configuration and reviewed source identities as JSON.
+    #[arg(long, requires = "aggregate_pair")]
+    pub aggregate_config: Option<PathBuf>,
+    /// Fresh directory receiving both setups in one atomic publication.
+    #[arg(long, requires = "aggregate_pair")]
+    pub output_dir: Option<PathBuf>,
 }
 
 pub fn run(args: RegenerateGroth16KeystoreArgs) -> anyhow::Result<()> {
+    if args.aggregate_pair {
+        anyhow::ensure!(!args.include_bridge_agg && !args.skip_deposit_append && !args.skip_withdrawal_claim && args.keystore_dir.is_none(), "aggregate-pair cannot use old keystore options");
+        return regenerate_aggregate_pair(args.aggregate_config.as_deref().context("aggregate-pair requires aggregate-config")?, args.output_dir.as_deref().context("aggregate-pair requires output-dir")?);
+    }
+    anyhow::ensure!(args.aggregate_config.is_none() && args.output_dir.is_none(), "aggregate-config and output-dir require aggregate-pair");
     let keystore_dir = args.keystore_dir.unwrap_or_else(default_keystore_dir);
     fs::create_dir_all(&keystore_dir)
         .with_context(|| format!("failed to create keystore dir: {}", keystore_dir.display()))?;

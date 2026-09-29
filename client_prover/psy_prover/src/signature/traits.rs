@@ -6,6 +6,7 @@ use plonky2::{field::goldilocks_field::GoldilocksField, plonk::circuit_data::Ver
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::config::store_config::{PsyHasher, PsyPlonky2Config, PsyProof};
 use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::zk::data::ZKPublicKeyInfo};
+use psy_ups_circuit::signature::reward_authorization::{RewardAuthorizationCircuits, RewardAuthorizationContext};
 use psy_vm::ups::circuit_manager::UPSCircuitManager;
 
 use super::context::SignContext;
@@ -42,6 +43,14 @@ impl fmt::Debug for SignatureResult {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait SignatureUser: fmt::Debug + Send + Sync {
+    fn prove_reward_authorization(
+        &self,
+        _context: &RewardAuthorizationContext,
+        _circuits: &RewardAuthorizationCircuits,
+    ) -> Result<Option<PsyProof>> {
+        anyhow::bail!("wallet identity is not a supported reward authorization family")
+    }
+
     async fn public_key_info(
         &self,
         wallet: &PsyMemoryWallet,

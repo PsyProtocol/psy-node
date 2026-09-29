@@ -263,6 +263,8 @@ pub enum RequestParams<F: RichField> {
     FindIMTPredecessor(QFindIMTPredecessorRPCRequest<F>),
     #[serde(rename = "psy_get_imt_next_append_index")]
     GetIMTNextAppendIndex(QIMTNextAppendIndexRPCRequest),
+    #[serde(rename = "psy_get_imt_membership_proof")]
+    GetIMTMembershipProof(QIMTMembershipProofRPCRequest<F>),
 
     /// generate proof
     #[serde(rename = "psy_get_circuits_data")]
@@ -1205,6 +1207,28 @@ pub struct QUserEventDataFRPCRequest<F: RichField> {
     pub event_index: F,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(bound = "")]
+#[ts(export, concrete(F = GoldilocksField))]
+pub struct QIMTMembershipProofRPCRequest<F: RichField> {
+    pub checkpoint_id: u64,
+    pub user_id: u64,
+    pub contract_id: u32,
+    pub key: QHashOut<F>,
+    pub state_slot_base: u64,
+    pub capacity: u64,
+}
+
+impl<F: RichField> QIMTMembershipProofRPCRequest<F> {
+    pub fn validate_indices(&self, leaf_index: u64, next_index: u64) -> anyhow::Result<()> {
+        let min = self.state_slot_base.checked_add(1).ok_or_else(|| anyhow::anyhow!("IMT range overflow"))?;
+        let max = self.state_slot_base.checked_add(self.capacity).ok_or_else(|| anyhow::anyhow!("IMT range overflow"))?;
+        anyhow::ensure!(self.capacity != 0 && (min..=max).contains(&leaf_index), "IMT membership leaf outside requested map");
+        anyhow::ensure!(next_index == 0 || (min..=max).contains(&next_index), "IMT successor outside requested map");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QIMTLeafPreimageRPCRequest {
     pub checkpoint_id: u64,
@@ -1712,6 +1736,36 @@ pub enum QRPCRequest<F: RichField> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn membership_scope_rejects_other_maps_and_sentinel() {
+        let request = QIMTMembershipProofRPCRequest::<GoldilocksField> {
+            checkpoint_id: 120, user_id: 1000, contract_id: 4,
+            key: QHashOut::ZERO, state_slot_base: 100, capacity: 8,
+        };
+        assert!(request.validate_indices(100, 0).is_err());
+        assert!(request.validate_indices(8, 0).is_err());
+        assert!(request.validate_indices(109, 0).is_err());
+        assert!(request.validate_indices(101, 108).is_ok());
+        assert!(request.validate_indices(108, 0).is_ok());
+        assert!(request.validate_indices(101, 100).is_err());
+        assert!(request.validate_indices(101, 109).is_err());
+    }
+
+    #[test]
+    fn membership_scope_rejects_empty_and_overflowing_ranges() {
+        let mut request = QIMTMembershipProofRPCRequest::<GoldilocksField> {
+            checkpoint_id: 120, user_id: 1000, contract_id: 4,
+            key: QHashOut::ZERO, state_slot_base: 100, capacity: 0,
+        };
+        assert!(request.validate_indices(101, 0).is_err());
+        request.state_slot_base = u64::MAX;
+        request.capacity = 1;
+        assert!(request.validate_indices(0, 0).is_err());
+        request.state_slot_base = u64::MAX - 1;
+        request.capacity = 2;
+        assert!(request.validate_indices(u64::MAX, 0).is_err());
+    }
 
     #[test]
     fn eth_personal_signature_request_round_trip_preserves_exact_bytes() {

@@ -27,6 +27,173 @@ use crate::{
     simple_wrapper::dynamic::SimpleWrapperDynamic,
 };
 
+pub use gnark_plonky2_verifier_ffi::DigestArtifact;
+use plonky2::field::types::Field;
+use parth_core::crypto::hash::traits::ToU64x4;
+use psy_common_circuit::serialization::PsyGateSerializer;
+use psy_crypto::hash::core::sha256::CoreSha256Hasher;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DigestBitsSources {
+    pub node_source: String,
+    pub native_source: String,
+    pub plonky2_source: String,
+    pub wrapper_source: String,
+}
+
+impl DigestBitsSources {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for source in [&self.node_source, &self.native_source, &self.plonky2_source, &self.wrapper_source] {
+            let (hex, width) = source.strip_prefix("local:").map_or((source.as_str(), 40), |hex| (hex, 64));
+            anyhow::ensure!(hex.len() == width && hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "invalid reviewed source identity");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DigestBitsIdentity {
+    pub schema: u32,
+    pub mode: String,
+    pub artifact: u32,
+    pub node_source: String,
+    pub native_source: String,
+    pub plonky2_source: String,
+    pub wrapper_source: String,
+    pub normalizer_fingerprint: [u64; 4],
+    pub normalizer_common: String,
+    pub normalizer_verifier: String,
+    pub final_common_json: String,
+    pub final_verifier_json: String,
+}
+
+impl DigestBitsIdentity {
+    pub fn identity_hash(&self) -> anyhow::Result<String> {
+        anyhow::ensure!(self.schema == 1 && self.mode == "DigestBits" && matches!(self.artifact, 1 | 2), "invalid DigestBits identity");
+        DigestBitsSources { node_source: self.node_source.clone(), native_source: self.native_source.clone(), plonky2_source: self.plonky2_source.clone(), wrapper_source: self.wrapper_source.clone() }.validate()?;
+        anyhow::ensure!(self.normalizer_fingerprint.iter().all(|limb| *limb < 0xffff_ffff_0000_0001), "noncanonical fingerprint");
+        let mut bytes = b"PsyBridge/DigestBits/1".to_vec();
+        bytes.extend(self.schema.to_be_bytes());
+        bytes.extend(self.artifact.to_be_bytes());
+        fn append(bytes: &mut Vec<u8>, value: &[u8]) {
+            bytes.extend((value.len() as u64).to_be_bytes());
+            bytes.extend(value);
+        }
+        for value in [&self.mode, &self.node_source, &self.native_source, &self.plonky2_source, &self.wrapper_source] { append(&mut bytes, value.as_bytes()); }
+        for limb in self.normalizer_fingerprint { bytes.extend(limb.to_be_bytes()); }
+        for value in [&self.normalizer_common, &self.normalizer_verifier] {
+            let decoded = hex::decode(value)?;
+            anyhow::ensure!(hex::encode(&decoded) == *value, "noncanonical identity hex");
+            append(&mut bytes, &decoded);
+        }
+        append(&mut bytes, self.final_common_json.as_bytes());
+        append(&mut bytes, self.final_verifier_json.as_bytes());
+        Ok(hex::encode(CoreSha256Hasher::hash_bytes(&bytes).0))
+    }
+}
+
+pub struct DigestBitsAdapter {
+    pub circuit_data: CircuitData<F, C, D>,
+    normalizer: ProofWithPublicInputsTarget<D>,
+    artifact: DigestArtifact,
+    normalizer_fingerprint: [u64; 4],
+    normalizer_common: String,
+    normalizer_verifier: String,
+}
+
+impl DigestBitsAdapter {
+    pub fn build(artifact: DigestArtifact, common: &CommonCircuitData<F, D>, verifier: &VerifierOnlyCircuitData<C, D>) -> anyhow::Result<Self> {
+        anyhow::ensure!(common.num_public_inputs == 12, "normalizer must expose exactly 12 public inputs");
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let normalizer = builder.add_virtual_proof_with_pis(common);
+        let pinned_verifier = builder.constant_verifier_data(verifier);
+        builder.verify_proof::<C>(&normalizer, &pinned_verifier, common);
+        for (target, value) in normalizer.public_inputs[..4].iter().zip([1, 11, artifact as u64, 0]) {
+            let constant = builder.constant(F::from_canonical_u64(value));
+            builder.connect(*target, constant);
+        }
+        for word in &normalizer.public_inputs[4..12] {
+            let bits = builder.split_le(*word, 32);
+            for bit in bits.into_iter().rev() { builder.register_public_input(bit.target); }
+        }
+        Ok(Self {
+            circuit_data: builder.build::<C>(), normalizer, artifact,
+            normalizer_fingerprint: crate::proof_minifier::pm_core::get_circuit_fingerprint_generic_q::<D, F, C>(verifier).to_u64x4(),
+            normalizer_common: hex::encode(common.to_bytes(&PsyGateSerializer).map_err(|error| anyhow::anyhow!("common serialization: {error:?}"))?),
+            normalizer_verifier: hex::encode(verifier.to_bytes().map_err(|error| anyhow::anyhow!("verifier serialization: {error:?}"))?),
+        })
+    }
+
+    pub fn prove(&self, proof: &ProofWithPublicInputs<F, C, D>) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+        anyhow::ensure!(proof.public_inputs.len() == 12, "normalizer PI width mismatch");
+        let mut witness = PartialWitness::new();
+        witness.set_proof_with_pis_target(&self.normalizer, proof)?;
+        self.circuit_data.prove(witness)
+    }
+
+    pub fn into_wrapper(self, sources: DigestBitsSources) -> anyhow::Result<DigestBitsWrapper> {
+        sources.validate()?;
+        let shared = SharedGroth16Wrapper::new(self.circuit_data, String::new());
+        let final_data = &shared.wrapped_circuit.wrapper_circuit.data;
+        anyhow::ensure!(final_data.common.num_public_inputs == 256, "final wrapper must expose 256 digest bits");
+        let identity = DigestBitsIdentity {
+            schema: 1, mode: "DigestBits".into(), artifact: self.artifact as u32,
+            node_source: sources.node_source, native_source: sources.native_source,
+            plonky2_source: sources.plonky2_source, wrapper_source: sources.wrapper_source,
+            normalizer_fingerprint: self.normalizer_fingerprint, normalizer_common: self.normalizer_common,
+            normalizer_verifier: self.normalizer_verifier,
+            final_common_json: json(&final_data.common)?, final_verifier_json: json(&final_data.verifier_only)?,
+        };
+        identity.identity_hash()?;
+        Ok(DigestBitsWrapper { shared, artifact: self.artifact, identity })
+    }
+}
+
+pub struct DigestBitsWrapper {
+    shared: SharedGroth16Wrapper,
+    artifact: DigestArtifact,
+    identity: DigestBitsIdentity,
+}
+
+impl DigestBitsWrapper {
+    pub fn identity(&self) -> &DigestBitsIdentity { &self.identity }
+
+    pub fn setup(&self, artifact_dir: &str) -> anyhow::Result<()> {
+        gnark_plonky2_verifier_ffi::setup_digest_bits(self.artifact, &json(&self.identity)?, artifact_dir)
+            .map_err(|error| anyhow::anyhow!("DigestBits setup status {}: {}", error.status, error.message))
+    }
+
+    pub fn prove_groth16(&self, adapter_proof: &ProofWithPublicInputs<F, C, D>, artifact_dir: &str) -> anyhow::Result<UncompressedGroth16ProofData> {
+        anyhow::ensure!(adapter_proof.public_inputs.len() == 256, "digest PI width mismatch");
+        let mut halves = [0u128; 2];
+        for (index, bit) in adapter_proof.public_inputs.iter().enumerate() {
+            let bit = bit.to_canonical_u64();
+            anyhow::ensure!(bit <= 1, "digest input is not Boolean");
+            halves[index / 128] = (halves[index / 128] << 1) | u128::from(bit);
+        }
+        let output = self.shared.wrapped_circuit.prove(adapter_proof)?;
+        let result = gnark_plonky2_verifier_ffi::generate_digest_bits_proof(self.artifact, &json(&self.identity)?, &json(&output.proof)?, artifact_dir)
+            .map_err(|error| anyhow::anyhow!("DigestBits proving status {}: {}", error.status, error.message))?;
+        let proof: UncompressedGroth16ProofData = serde_json::from_str(&result.proof_json)?;
+        anyhow::ensure!(decode_digest_bits_public_inputs(&proof.public_inputs)? == halves, "native digest halves mismatch");
+        Ok(proof)
+    }
+}
+
+fn decode_digest_bits_public_inputs(inputs: &[String; 2]) -> anyhow::Result<[u128; 2]> {
+    let mut halves = [0u128; 2];
+    for (word, half) in inputs.iter().zip(&mut halves) {
+        anyhow::ensure!(word.len() == 64 && word.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "native digest input must be 64 lowercase hexadecimal digits");
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(word, &mut bytes)?;
+        anyhow::ensure!(bytes[..16] == [0; 16], "native digest input exceeds uint128");
+        *half = u128::from_be_bytes(bytes[16..].try_into()?);
+    }
+    Ok(halves)
+}
+
 #[serde_as]
 #[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, PartialOrd, Ord)]
 pub struct Serialized2DFeltBN254(#[serde_as(as = "serde_with::hex::Hex")] pub [u8; 32]);
@@ -216,6 +383,64 @@ impl BridgeWrapCircuit {
 mod tests {
     use super::bridge_wrap_public_inputs_keccak_bytes;
     use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
+
+    #[test]
+    fn native_digest_inputs_decode_canonical_uint128_words() {
+        use super::decode_digest_bits_public_inputs;
+        let words = [
+            "000000000000000000000000000000008123456789abcdef0123456789abcdef".to_owned(),
+            "00000000000000000000000000000000ffffffffffffffffffffffffffffffff".to_owned(),
+        ];
+        let expected = [0x8123456789abcdef0123456789abcdefu128, u128::MAX];
+        assert_eq!(decode_digest_bits_public_inputs(&words).unwrap(), expected);
+        assert_eq!(decode_digest_bits_public_inputs(&["0".repeat(64), format!("{:064x}", 1u128)]).unwrap(), [0, 1]);
+        let swapped = [words[1].clone(), words[0].clone()];
+        assert_ne!(decode_digest_bits_public_inputs(&swapped).unwrap(), expected);
+        let mut changed = words.clone();
+        changed[0].replace_range(63..64, "0");
+        assert_ne!(decode_digest_bits_public_inputs(&changed).unwrap(), expected);
+        for invalid in [expected[0].to_string(), format!("0x{}", words[0]), words[0].to_uppercase(), "0".repeat(63), "0".repeat(65), format!("1{}", "0".repeat(63)), format!("{}g", "0".repeat(63))] {
+            assert!(decode_digest_bits_public_inputs(&[invalid, words[1].clone()]).is_err());
+        }
+    }
+
+    #[test]
+    fn digest_adapter_pins_prefix_source_and_bit_order() {
+        use super::{C, D, DigestArtifact, DigestBitsAdapter, F};
+        use plonky2::{iop::witness::{PartialWitness, WitnessWrite}, plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig}};
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let inputs = builder.add_virtual_target_arr::<12>();
+        builder.register_public_inputs(&inputs);
+        let source = builder.build::<C>();
+        let adapter = DigestBitsAdapter::build(DigestArtifact::A, &source.common, &source.verifier_only).unwrap();
+        let mut wrong_width = source.common.clone();
+        wrong_width.num_public_inputs = 26;
+        assert!(DigestBitsAdapter::build(DigestArtifact::A, &wrong_width, &source.verifier_only).is_err());
+        let words = [0x80000001u32, 0xffffffff, 0, 0x01234567, 0x89abcdef, 1, 0xaaaaaaaa, 0x55555555];
+        let make_proof = |artifact: u64, high_word: bool| {
+            let mut witness = PartialWitness::new();
+            for (index, target) in inputs.iter().enumerate() {
+                let value = match index {
+                    0 => 1, 1 => 11, 2 => artifact,
+                    4 if high_word => 1u64 << 32,
+                    4..=11 => u64::from(words[index - 4]),
+                    _ => 0,
+                };
+                witness.set_target(*target, F::from_canonical_u64(value)).unwrap();
+            }
+            source.prove(witness).unwrap()
+        };
+        let proof = adapter.prove(&make_proof(1, false)).unwrap();
+        let expected: Vec<_> = words.iter().flat_map(|word| (0..32).rev().map(move |bit| F::from_canonical_u64(u64::from((word >> bit) & 1)))).collect();
+        assert_eq!(proof.public_inputs, expected);
+        adapter.circuit_data.verify(proof).unwrap();
+        assert!(adapter.prove(&make_proof(2, false)).is_err());
+        assert!(adapter.prove(&make_proof(1, true)).is_err());
+        let mut wrong_verifier = source.verifier_only.clone();
+        wrong_verifier.circuit_digest.elements[0] += F::ONE;
+        let wrong_adapter = DigestBitsAdapter::build(DigestArtifact::A, &source.common, &wrong_verifier).unwrap();
+        assert!(wrong_adapter.prove(&make_proof(1, false)).is_err());
+    }
 
     #[test]
     fn bridge_wrap_keccak_bytes_pair_swap_tree_root_limbs() {

@@ -57,6 +57,373 @@ pub struct ApiResponse<T> {
     pub error: Option<String>,
 }
 
+const AGGREGATION_BODY_LIMIT: usize = 24 * 1024 * 1024;
+const AGGREGATION_PROOF_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AggregationContext {
+    pub version: u8,
+    pub config_hash: String,
+    pub end_checkpoint_id: String,
+    pub end_checkpoint_root: [String; 4],
+    pub context_id: String,
+    pub max_proof_bytes: u32,
+    pub max_records: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublishAggregationContext {
+    #[serde(deserialize_with = "aggregation_required_option")]
+    pub expected_context_id: Option<String>,
+    pub context: AggregationContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AggregationClaimKind { Withdrawal, Reward }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AggregationAdmissionRequest {
+    pub version: u8,
+    pub context_id: String,
+    pub kind: AggregationClaimKind,
+    pub record: String,
+    pub proof: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AggregationClaim {
+    pub claim_id: String,
+    pub request: AggregationAdmissionRequest,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AggregationClaimsPage {
+    pub claims: Vec<AggregationClaim>,
+    #[serde(deserialize_with = "aggregation_required_option")]
+    pub next_after_claim_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReceiptEvidence {
+    pub chain_index: u8,
+    pub transaction_hash: String,
+    pub log_index: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsumptionEvidence {
+    pub chain_index: u8,
+    pub block_number: String,
+    pub block_hash: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum ClaimDisposition {
+    Applied { claim_id: String, receipt: ReceiptEvidence },
+    ConsumedElsewhere { claim_id: String, consumption: ConsumptionEvidence },
+    Released { claim_id: String },
+}
+
+impl ClaimDisposition {
+    pub fn claim_id(&self) -> &str {
+        match self {
+            Self::Applied { claim_id, .. } | Self::ConsumedElsewhere { claim_id, .. }
+                | Self::Released { claim_id } => claim_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum AggregationDispositions {
+    Included { context_id: String, statement_b: String, opening: String, claim_ids: Vec<String> },
+    Disposed { statement_b: String, opening: String, dispositions: Vec<ClaimDisposition> },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AggregationAcknowledgment {
+    pub statement_b: String,
+    pub acknowledged_claim_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub enum AggregationErrorCode {
+    InvalidEncoding, ProofTooLarge, InvalidProof, UnsupportedIdentity, ContextChanged,
+    ConflictingClaim, AlreadyConsumed, NoCommittedContext, Unauthorized, StateMismatch,
+    EvidenceUnavailable,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AggregationErrorData {
+    pub error_code: AggregationErrorCode,
+    #[serde(deserialize_with = "aggregation_required_option")]
+    pub current_context: Option<AggregationContext>,
+}
+
+#[derive(Debug)]
+pub enum AggregationHttpError {
+    Credential,
+    InvalidRequest,
+    BodyTooLarge,
+    InvalidResponse,
+    Transport(reqwest::Error),
+    Service { status: reqwest::StatusCode, data: AggregationErrorData },
+}
+
+impl std::fmt::Display for AggregationHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Credential => f.write_str("aggregation credential unavailable"),
+            Self::InvalidRequest => f.write_str("invalid aggregation request"),
+            Self::BodyTooLarge => f.write_str("aggregation body exceeds 24 MiB"),
+            Self::InvalidResponse => f.write_str("invalid aggregation response"),
+            Self::Transport(_) => f.write_str("aggregation transport failed"),
+            Self::Service { status, data } => write!(f, "aggregation service {}: {:?}", status, data.error_code),
+        }
+    }
+}
+
+impl std::error::Error for AggregationHttpError {}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AggregationEnvelope<T> {
+    success: bool,
+    data: T,
+    error: Option<String>,
+    #[serde(rename = "timestamp")]
+    _timestamp: String,
+}
+
+fn aggregation_required_option<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    serde::Deserialize::deserialize(deserializer)
+}
+
+fn aggregation_hex(value: &str) -> bool {
+    value.len() == 66 && value.starts_with("0x")
+        && value.as_bytes()[2..].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+fn aggregation_decimal(value: &str) -> Option<u64> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    value.parse().ok()
+}
+
+impl AggregationContext {
+    pub fn validate(&self) -> bool {
+        self.version == 1 && aggregation_hex(&self.config_hash) && aggregation_hex(&self.context_id)
+            && aggregation_decimal(&self.end_checkpoint_id).is_some()
+            && self.end_checkpoint_root.iter().all(|v| aggregation_decimal(v)
+                .is_some_and(|v| v < psy_client_data::bridge_aggregate::GOLDILOCKS_MODULUS))
+            && self.max_proof_bytes == AGGREGATION_PROOF_LIMIT as u32 && self.max_records == 1024
+    }
+}
+
+pub fn decode_aggregation_base64(value: &str, limit: usize) -> Result<Vec<u8>, AggregationHttpError> {
+    use base64::Engine;
+    if value.len() > limit.div_ceil(3) * 4 { return Err(AggregationHttpError::BodyTooLarge); }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(value)
+        .map_err(|_| AggregationHttpError::InvalidRequest)?;
+    if bytes.len() > limit { return Err(AggregationHttpError::BodyTooLarge); }
+    if base64::engine::general_purpose::STANDARD.encode(&bytes) != value {
+        return Err(AggregationHttpError::InvalidRequest);
+    }
+    Ok(bytes)
+}
+
+struct AggregationBody(Vec<u8>);
+impl std::io::Write for AggregationBody {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > AGGREGATION_BODY_LIMIT - self.0.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "aggregation body limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+fn aggregation_url(services_url: &str, route: &str) -> Result<reqwest::Url, AggregationHttpError> {
+    let mut url = reqwest::Url::parse(services_url).map_err(|_| AggregationHttpError::InvalidRequest)?;
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty()
+        || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err(AggregationHttpError::InvalidRequest);
+    }
+    url.set_path(&format!("/api/v1/bridge/aggregation/{route}"));
+    Ok(url)
+}
+
+async fn aggregation_http<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    token_file: &std::path::Path,
+    body: Option<&impl serde::Serialize>,
+) -> Result<T, AggregationHttpError> {
+    let parent = token_file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let name = token_file.file_name().ok_or(AggregationHttpError::Credential)?;
+    let token = crate::guardian::runtime::read_protected_file(parent, std::path::Path::new(name), 16384)
+        .map_err(|_| AggregationHttpError::Credential)?;
+    let token = std::str::from_utf8(&token).map_err(|_| AggregationHttpError::Credential)?;
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(AggregationHttpError::Credential);
+    }
+    let mut request = request.bearer_auth(token).timeout(Duration::from_secs(30));
+    if let Some(body) = body {
+        let mut encoded = AggregationBody(Vec::new());
+        serde_json::to_writer(&mut encoded, body).map_err(|_| AggregationHttpError::BodyTooLarge)?;
+        request = request.header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded.0);
+    }
+    let mut response = request.send().await.map_err(AggregationHttpError::Transport)?;
+    let status = response.status();
+    if response.content_length().is_some_and(|n| n > AGGREGATION_BODY_LIMIT as u64) {
+        return Err(AggregationHttpError::BodyTooLarge);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(AggregationHttpError::Transport)? {
+        if chunk.len() > AGGREGATION_BODY_LIMIT - bytes.len() { return Err(AggregationHttpError::BodyTooLarge); }
+        bytes.extend_from_slice(&chunk);
+    }
+    if status.is_success() {
+        let envelope: AggregationEnvelope<T> = serde_json::from_slice(&bytes).map_err(|_| AggregationHttpError::InvalidResponse)?;
+        if !envelope.success || envelope.error.is_some() { return Err(AggregationHttpError::InvalidResponse); }
+        Ok(envelope.data)
+    } else {
+        let envelope: AggregationEnvelope<AggregationErrorData> = serde_json::from_slice(&bytes)
+            .map_err(|_| AggregationHttpError::InvalidResponse)?;
+        let expected_status = match envelope.data.error_code {
+            AggregationErrorCode::InvalidEncoding => 400,
+            AggregationErrorCode::ProofTooLarge => 413,
+            AggregationErrorCode::InvalidProof | AggregationErrorCode::UnsupportedIdentity => 422,
+            AggregationErrorCode::ContextChanged | AggregationErrorCode::ConflictingClaim
+                | AggregationErrorCode::AlreadyConsumed | AggregationErrorCode::StateMismatch => 409,
+            AggregationErrorCode::NoCommittedContext | AggregationErrorCode::EvidenceUnavailable => 503,
+            AggregationErrorCode::Unauthorized if status.as_u16() == 403 => 403,
+            AggregationErrorCode::Unauthorized => 401,
+        };
+        let context_valid = match (&envelope.data.error_code, &envelope.data.current_context) {
+            (AggregationErrorCode::ContextChanged, Some(context)) => context.validate(),
+            (AggregationErrorCode::ContextChanged, None) | (_, Some(_)) => false,
+            (_, None) => true,
+        };
+        if envelope.success || envelope.error.is_none() || status.as_u16() != expected_status || !context_valid {
+            return Err(AggregationHttpError::InvalidResponse);
+        }
+        Err(AggregationHttpError::Service { status, data: envelope.data })
+    }
+}
+
+pub async fn get_aggregation_context(
+    http: &reqwest::Client, services_url: &str, token_file: &std::path::Path,
+) -> Result<Option<AggregationContext>, AggregationHttpError> {
+    let result: Result<AggregationContext, AggregationHttpError> =
+        aggregation_http(http.get(aggregation_url(services_url, "context")?), token_file, None::<&()>).await;
+    match result {
+        Ok(context) if context.validate() => Ok(Some(context)),
+        Ok(_) => Err(AggregationHttpError::InvalidResponse),
+        Err(AggregationHttpError::Service { status, data })
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && data.error_code == AggregationErrorCode::NoCommittedContext => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn publish_aggregation_context(
+    http: &reqwest::Client, services_url: &str, token_file: &std::path::Path,
+    request: &PublishAggregationContext,
+) -> Result<AggregationContext, AggregationHttpError> {
+    if !request.context.validate() || request.expected_context_id.as_deref().is_some_and(|id| !aggregation_hex(id)) {
+        return Err(AggregationHttpError::InvalidRequest);
+    }
+    let context: AggregationContext = aggregation_http(http.post(aggregation_url(services_url, "context")?), token_file, Some(request)).await?;
+    if context != request.context { return Err(AggregationHttpError::InvalidResponse); }
+    Ok(context)
+}
+
+pub async fn get_aggregation_claims(
+    http: &reqwest::Client, services_url: &str, token_file: &std::path::Path,
+    context_id: &str, after_claim_id: Option<&str>, limit: u8,
+) -> Result<AggregationClaimsPage, AggregationHttpError> {
+    if !aggregation_hex(context_id) || after_claim_id.is_some_and(|id| !aggregation_hex(id)) || !(1..=32).contains(&limit) {
+        return Err(AggregationHttpError::InvalidRequest);
+    }
+    let mut url = aggregation_url(services_url, "claims")?;
+    url.query_pairs_mut().append_pair("contextId", context_id).append_pair("limit", &limit.to_string());
+    if let Some(after) = after_claim_id { url.query_pairs_mut().append_pair("afterClaimId", after); }
+    let page: AggregationClaimsPage = aggregation_http(http.get(url), token_file, None::<&()>).await?;
+    if page.claims.len() > limit as usize { return Err(AggregationHttpError::InvalidResponse); }
+    let mut previous = after_claim_id;
+    for claim in &page.claims {
+        if !aggregation_hex(&claim.claim_id) || previous.is_some_and(|id| id >= claim.claim_id.as_str())
+            || claim.request.version != 1 || claim.request.context_id != context_id {
+            return Err(AggregationHttpError::InvalidResponse);
+        }
+        let record = decode_aggregation_base64(&claim.request.record, 1024).map_err(|_| AggregationHttpError::InvalidResponse)?;
+        use psy_client_data::bridge_aggregate::{WithdrawalLeaf, RewardLeaf};
+        let valid = match claim.request.kind {
+            AggregationClaimKind::Withdrawal => WithdrawalLeaf::decode(&record).and_then(|leaf| leaf.validate()),
+            AggregationClaimKind::Reward => RewardLeaf::decode(&record).and_then(|leaf| leaf.validate()),
+        };
+        if valid.is_err() { return Err(AggregationHttpError::InvalidResponse); }
+        let proof = decode_aggregation_base64(&claim.request.proof, AGGREGATION_PROOF_LIMIT)
+            .map_err(|_| AggregationHttpError::InvalidResponse)?;
+        if proof.is_empty() { return Err(AggregationHttpError::InvalidResponse); }
+        previous = Some(&claim.claim_id);
+    }
+    if let Some(cursor) = &page.next_after_claim_id {
+        if page.claims.last().map(|claim| &claim.claim_id) != Some(cursor) {
+            return Err(AggregationHttpError::InvalidResponse);
+        }
+    }
+    Ok(page)
+}
+
+pub async fn post_aggregation_dispositions(
+    http: &reqwest::Client, services_url: &str, token_file: &std::path::Path,
+    request: &AggregationDispositions,
+) -> Result<AggregationAcknowledgment, AggregationHttpError> {
+    let (statement, opening, ids): (&str, &str, Vec<&str>) = match request {
+        AggregationDispositions::Included { context_id, statement_b, opening, claim_ids } => {
+            if !aggregation_hex(context_id) { return Err(AggregationHttpError::InvalidRequest); }
+            (statement_b, opening, claim_ids.iter().map(String::as_str).collect())
+        }
+        AggregationDispositions::Disposed { statement_b, opening, dispositions } => {
+            for disposition in dispositions {
+                let valid = match disposition {
+                    ClaimDisposition::Applied { receipt, .. } => aggregation_hex(&receipt.transaction_hash) && aggregation_decimal(&receipt.log_index).is_some(),
+                    ClaimDisposition::ConsumedElsewhere { consumption, .. } => aggregation_hex(&consumption.block_hash) && aggregation_decimal(&consumption.block_number).is_some(),
+                    ClaimDisposition::Released { .. } => true,
+                };
+                if !valid { return Err(AggregationHttpError::InvalidRequest); }
+            }
+            (statement_b, opening, dispositions.iter().map(ClaimDisposition::claim_id).collect())
+        }
+    };
+    if !aggregation_hex(statement) || ids.len() > 2048 || ids.iter().any(|id| !aggregation_hex(id))
+        || ids.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != ids.len() {
+        return Err(AggregationHttpError::InvalidRequest);
+    }
+    let bytes = decode_aggregation_base64(opening, AGGREGATION_BODY_LIMIT)?;
+    psy_client_data::bridge_aggregate::BOpening::decode(&bytes).map_err(|_| AggregationHttpError::InvalidRequest)?;
+    let acknowledgment: AggregationAcknowledgment = aggregation_http(http.post(aggregation_url(services_url, "dispositions")?), token_file, Some(request)).await?;
+    if acknowledgment.statement_b != statement || !acknowledgment.acknowledged_claim_ids.iter().map(String::as_str).eq(ids) {
+        return Err(AggregationHttpError::InvalidResponse);
+    }
+    Ok(acknowledgment)
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct DepositTreeRootState {
     pub found: bool,

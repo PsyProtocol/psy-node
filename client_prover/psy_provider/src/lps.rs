@@ -23,6 +23,76 @@ use super::{provider::RpcProvider, request::*};
 
 type F = GoldilocksField;
 
+/// Checkpoint-pinned evidence; the consumer must authenticate it to its verified checkpoint root.
+#[derive(Debug, Clone)]
+pub struct WithdrawalBurnProof {
+    pub checkpoint_id: u64,
+    pub checkpoint_leaf: PsyCheckpointLeaf<F>,
+    pub global_roots: psy_client_data::qdata::checkpoint::PsyCheckpointGlobalStateRoots<F>,
+    pub checkpoint_path: MerkleProofCore<QHashOut<F>>,
+    pub user_leaf: PsyUserLeaf<F>,
+    pub user_path: MerkleProofCore<QHashOut<F>>,
+    pub contract_path: MerkleProofCore<QHashOut<F>>,
+    pub contract_leaf: PsyContractLeaf<F>,
+    pub global_contract_path: MerkleProofCore<QHashOut<F>>,
+    pub record_membership: psy_client_data::qdata::imt_proof::IMTMembershipProof<F>,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
+#[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+impl RpcProvider {
+    pub async fn get_imt_membership_proof(
+        &self,
+        input: QIMTMembershipProofRPCRequest<F>,
+    ) -> anyhow::Result<psy_client_data::qdata::imt_proof::IMTMembershipProof<F>> {
+        use plonky2::field::types::PrimeField64;
+        use psy_crypto::hash::traits::qhashable::QFieldHashable;
+        let first = input.state_slot_base.checked_add(1).ok_or_else(|| anyhow::anyhow!("IMT range overflow"))?;
+        input.validate_indices(first, 0)?;
+        let rpc_url = self.get_realm_url(input.user_id)?;
+        let request = RequestParams::<F>::GetIMTMembershipProof(input.clone());
+        let response = psy_rpc_call_back!(
+            self, rpc_url, request,
+            psy_client_data::qdata::imt_proof::IMTMembershipProof<F>
+        );
+        match response.result {
+            ResponseResult::Success(proof) => {
+                input.validate_indices(proof.merkle_proof.index, proof.leaf.next_index.to_canonical_u64())?;
+                let height = proof.merkle_proof.siblings.len();
+                let max = input.state_slot_base.checked_add(input.capacity).ok_or_else(|| anyhow::anyhow!("IMT range overflow"))?;
+                anyhow::ensure!(height <= 64 && (height == 64 || max < (1u64 << height)), "IMT map outside contract state tree");
+                anyhow::ensure!(proof.leaf.key == input.key, "IMT membership key mismatch");
+                anyhow::ensure!(proof.merkle_proof.value == proof.leaf.qfhash::<PsyHasher>(), "IMT membership preimage mismatch");
+                anyhow::ensure!(proof.merkle_proof.verify::<PsyHasher>(), "Invalid IMT membership path");
+                Ok(proof)
+            }
+            ResponseResult::Error(error) => Err(anyhow::anyhow!("get_imt_membership_proof rpc call failed: {:?}", error)),
+        }
+    }
+
+    pub async fn get_withdrawal_burn_proof(
+        &self,
+        input: QIMTMembershipProofRPCRequest<F>,
+    ) -> anyhow::Result<WithdrawalBurnProof> {
+        let checkpoint_id = input.checkpoint_id;
+        let user_id = input.user_id;
+        let contract_id = input.contract_id;
+        let record_membership = self.get_imt_membership_proof(input).await?;
+        Ok(WithdrawalBurnProof {
+            checkpoint_id,
+            checkpoint_leaf: self.get_checkpoint_leaf_data(checkpoint_id).await?,
+            global_roots: self.get_checkpoint_global_state_roots(checkpoint_id).await?,
+            checkpoint_path: self.get_checkpoint_tree_merkle_proof(checkpoint_id, checkpoint_id).await?,
+            user_leaf: self.get_user_leaf_data(checkpoint_id, user_id).await?,
+            user_path: self.get_user_tree_merkle_proof(checkpoint_id, user_id).await?,
+            contract_path: self.get_user_contract_tree_merkle_proof(checkpoint_id, user_id, contract_id).await?,
+            contract_leaf: self.get_contract_leaf_data(contract_id as u64).await?,
+            global_contract_path: self.get_contract_tree_merkle_proof(checkpoint_id, contract_id).await?,
+            record_membership,
+        })
+    }
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
 impl QTreeDataStoreReaderSync<F> for RpcProvider {
@@ -1280,9 +1350,9 @@ impl RpcProvider {
             request: RequestParams::<F>::GetCheckpointGlobalStateRoots(input),
             id: Id::Number(1),
         };
-        let response_http = self.client.post(rpc_url.clone()).json(&request).send().await?;
+        let response_http = self.client_for_url(rpc_url.as_str())?.post(rpc_url.clone()).json(&request).send().await?;
         let status = response_http.status();
-        let body = response_http.text().await?;
+        let body = crate::provider::read_rpc_response(response_http, self.has_endpoint_clients()).await?;
         let response: RpcResponse<psy_client_data::qdata::checkpoint::PsyCheckpointGlobalStateRoots<F>> = match serde_json::from_str(&body) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -1291,7 +1361,7 @@ impl RpcProvider {
                     checkpoint_id,
                     status = %status,
                     body_len = body.len(),
-                    body = %body,
+                    body = %if self.has_endpoint_clients() { "<redacted>" } else { body.as_str() },
                     error = %err,
                     "[ROOTS_RPC_DECODE_FAIL] failed to decode checkpoint roots response"
                 );

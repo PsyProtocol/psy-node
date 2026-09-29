@@ -20,7 +20,7 @@ Before starting work or delegating a task, every agent MUST read and follow the 
 
 Research, design drafting, multiple-model multi-round design review, and the design-reviewer gate MUST precede implementation. Tests may be written during implementation, but MUST NOT be executed until implementation and test authoring are complete and the post-implementation reviewer has cleared all findings. QA is the first test-execution stage; smoke tests, benchmarks, and live E2E are not exceptions. This ordering supersedes any conflicting test-order instruction elsewhere in this file; correctness, evidence, and security requirements remain mandatory.
 
-Every delegated assignment MUST state its current pipeline stage, owned files, required evidence, and whether test execution is prohibited or authorized. Styler changes require renewed affected QA evidence before final reviewer and auditor approval. Commit only after the complete pipeline passes; a commit never authorizes a push, deployment, publication, or live-account migration.
+Every delegated assignment MUST state its current pipeline stage, owned files, required evidence, and whether test execution is prohibited or authorized. Styler changes require renewed affected QA evidence before final reviewer and auditor approval. The complete pipeline gates release delivery and push; it does not gate local checkpoint commits (see Commit and Push Gates). A commit never authorizes a push, deployment, publication, or live-account migration.
 
 ## Required Terminology Reading
 
@@ -81,11 +81,11 @@ Changes to `PrivateNoteInclusionCircuit` or `DepositInclusionCircuit` (protocol 
 5. Push only when the user explicitly authorizes the exact repository, destination ref, and scope in the current task. Never force-push.
 6. Batch commits before pushing: accumulate local commits across tasks and push once per work session instead of pushing after every commit. When a push would ship a run of same-topic commits (fixup/wip/repeated-retry chains), squash them first with an interactive rebase limited to the unpushed range so remote history stays reviewable; keep semantically distinct deliveries as separate commits. Squashing may never rewrite already-pushed history.
 7. npm publication, deployment, and Git push are separate authorizations. Authorization for one does not authorize either of the others.
-8. Every staged delivery set must be reviewed by a different model before commit or push. The reviewer must read every staged diff line. Any post-review edit requires another staged-diff review.
+8. Review binds at push, not at local commit. A push or release delivery requires a different-model reviewer who reads every staged/pushed diff line; any post-review edit requires another review. Local commits may be made without independent review; risk-tiered review applies before push: protocol, storage, circuit, proof, and authorization changes always need full different-model review; tests, documentation, renames, and one-line constants need at least a self-check with mechanical verification (grep/build). Never report an unexecuted review as done.
 9. Freeze and remotely publish an upstream commit before placing its SHA in a downstream manifest or gitlink.
 10. Use one immutable `psy-node` source revision for all downstream Cargo pins in one release. Do not pin downstream repositories to the later parent-integration commit when that commit changes only generated artifacts or gitlinks.
 11. Record the exact release SHAs and npm versions in the task output. Do not rely on branch names as provenance.
-12. Commit each independent task or verified dependency milestone immediately after its scoped tests and independent review pass, before starting the next dependent milestone. Never accumulate several successful milestones into one unreviewed working-tree bundle.
+12. Prefer committing each independent task or verified milestone separately before starting the next dependent milestone. Checkpoint commits that preserve work-in-progress or prevent loss in a shared worktree are allowed at any time and may bundle related work; state the checkpoint nature in the message. A checkpoint commit is not delivery evidence and still requires the review tier above before push.
 13. Never run formatters or make style-only formatting changes unless the user explicitly requests formatting. Surgical edits must preserve surrounding formatting.
 14. Prefer surgical changes in existing files. A new module must own one named domain; `Defaults`, `Utils`, `Helpers`, and similar grab-bag modules are forbidden. TypeScript tests remain adjacent as `<name>.test.ts`.
 
@@ -388,26 +388,29 @@ Do not repin compiler, SDK, or services from `R_node` to `R_node_integration` un
 
 ## Commit and Push Gates
 
-Before every commit:
+Local commits are cheap working state: a checkpoint or backup commit is always allowed. The strict gate binds at push and release delivery.
+
+Before every commit (light gate):
 
 ```bash
 git status --short
-git diff
 git diff --cached
-git diff --check
 git diff --cached --check
 git diff --cached --name-only
 ```
 
-Required conditions:
+Required commit conditions:
 
-- every staged path is owned by the current delivery;
-- no unrelated source, lockfile, generated artifact, or gitlink is staged;
-- the staged set has passed independent review;
-- the commit message describes one coherent delivery;
-- post-commit HEAD contains exactly the reviewed staged diff.
+- every staged path is owned by the current delivery, or the commit is an explicitly labeled checkpoint of a shared worktree;
+- no secrets, generated artifacts, binaries, logs, runtime data, or machine-local configuration is staged;
+- never stage `ISSUES.md`, `TASKS.md`, or `MEMORY.md`;
+- the commit message describes what is in the commit, honestly including incompleteness for checkpoints.
 
-Before an authorized push:
+Before an authorized push (full gate):
+
+- the pushed range has passed the required review tier (Release Safety 8);
+- every staged path is owned by the current delivery; no unrelated source, lockfile, generated artifact, or gitlink is included;
+- post-push HEAD contains exactly the reviewed diff.
 
 ```bash
 destination_ref=${MATCHING_BRANCH:-mainnet-beta}
@@ -616,6 +619,7 @@ Required fields per note:
 13. Use common verbs consistently: `get` reads an existing value; `load` assembles a domain value from durable storage; `read` decodes a file or byte stream; `build` assembles a composite value without persistence; `derive` computes a deterministic hash or identity from known inputs; `create` makes a new stored or runtime object; `set` replaces a whole value; `update` changes part of a value; `apply` executes a state transition; `validate` checks untrusted or serialized input; `ensure` enforces an internal invariant and returns an error; `check` returns a state classification or health result. Do not use these as interchangeable synonyms.
 14. Order composite domain names from scope to object to representation: `checkpoint_tree_root`, `validator_tree_proof`, `user_leaf_hash`, `gathering_checkpoint_id`. State qualifiers precede the domain name (`current_`, `next_`, `last_committed_`, `remaining_`, `expected_`, `actual_`); collections use plural nouns and identifiers end in `_id` or `_ids`.
 15. `explicit` is banned as a domain name. Do not name functions, variables, types, flags, comments, or docs `explicit*`, `explicitly configured`, or `explicit alias`. A keystore path is **set** (`PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, or `KEYSTORE_PATH` is assigned a nonempty value) or **default** (`${HOME}/.psy/keystore/bridge-relayer`). A missing **set** path fails closed; a missing **default** path may auto-generate the Anvil development keystore. This file's existing adverb "explicitly" in policy English ("explicitly requested") is not a domain name; do not copy that adverb into new symbols.
+16. `custody` is banned in new or renamed symbols, fields, filenames, configuration keys, log markers, and documentation terminology. Name the concrete responsibility instead: signing authorization, exclusive key use, or complete signing history. Do not replace it with another vague synonym. Renaming existing occurrences must preserve their checks and requires updating every coupled caller, configuration, test, and document.
 
 ## Module Boundaries and Imports
 
@@ -741,11 +745,12 @@ Every new name (function, file, directory, type, concept) must pass three tests.
 1. **Does the name say WHAT it does or contains?** The name must name a concrete domain concept, not a generic category. `objects/` fails (anything could be an object); `proposals/` passes (the directory contains proposals). `put_complete` fails ("complete" is an adjective, not an object); `store_proposal` passes ("store" is the action, "proposal" is the object).
 2. **Can someone who has never seen the code understand it from the name alone?** `lookup` fails (lookup what? by what key?); `lookup_by_checkpoint` passes (self-contained). `active view` fails ("view" is a presentation term, not a domain concept); `applied set` passes ("applied" = committed to DB, "set" = the collection).
 3. **Is there a more specific word that would be equally short?** If the answer is yes, use the more specific word. Never keep a vague name because renaming feels disruptive — vague names compound into unreadable codebases.
-The pattern for functions: **verb + concrete object**. The pattern for files/directories: **concrete noun**. If the object slot is filled by a generic word (`data`, `result`, `obj`, `items`, `view`, `complete`), replace it with the actual domain noun. The same ban covers generic catch-all nouns: `metadata`, `manifest`, `info`, `payload`, `context`, `detail(s)`, `entry`, `item(s)`, `blob`, `misc` — each must be replaced by what the value actually is (e.g. `PsyProvingJobMetadata` holds reward-tree layout and dependencies → name it by those fields, not "metadata"; a reset marker file is a `reset_marker`, not a "manifest"). `metadata`/`manifest` are allowed only where the word names a real external API or an established on-disk format owned outside this workspace; new code must name the concrete content. `isolated`/`isolation` are also banned as names: say what the check actually does — untrusted records replayed against the authenticated baseline before any durable write — e.g. `verify_state_updates_against_baseline`, `baseline_replay`; do not name new functions, types, fields, or error strings with `isolat*`. `explicit` is banned as a domain name: a path or keystore is `set` or `default`, never `explicit*`. `submission` is banned as a new name: name the concrete act (`end_cap_upload`, `proof_delivery`, `vote_publication`) or reuse the established wire/type name it wraps; `Submit*`/`AlreadySubmitted` survive only as existing external API/wire names owned by current shipped interfaces.
+The pattern for functions: **verb + concrete object**. The pattern for files/directories: **concrete noun**. If the object slot is filled by a generic word (`data`, `result`, `obj`, `items`, `view`, `complete`), replace it with the actual domain noun. The same ban covers generic catch-all nouns: `metadata`, `manifest`, `info`, `payload`, `context`, `detail(s)`, `entry`, `item(s)`, `blob`, `misc` — each must be replaced by what the value actually is (e.g. `PsyProvingJobMetadata` holds reward-tree layout and dependencies → name it by those fields, not "metadata"; a reset marker file is a `reset_marker`, not a "manifest"). `metadata`/`manifest` are allowed only where the word names a real external API or an established on-disk format owned outside this workspace; new code must name the concrete content. `isolated`/`isolation` are also banned as names: say what the check actually does — untrusted records replayed against the authenticated baseline before any durable write — e.g. `verify_state_updates_against_baseline`, `baseline_replay`; do not name new functions, types, fields, or error strings with `isolat*`. `explicit` is banned as a domain name: a path or keystore is `set` or `default`, never `explicit*`. `submission` is banned as a new name: name the concrete act (`end_cap_upload`, `proof_delivery`, `vote_publication`) or reuse the established wire/type name it wraps; `Submit*`/`AlreadySubmitted` survive only as existing external API/wire names owned by current shipped interfaces. `envelope` is banned as a new name: name the concrete contents (`included_session`, `request_bytes`, `signatures`) instead of the container; do not name new functions, types, fields, columns, or error strings with `envelope`.
+
 
 ## Git Commit Rules
 
-1. Commit each independent task or milestone separately.
+1. Prefer committing each independent task or milestone separately; explicitly labeled checkpoint commits that bundle work to preserve progress are allowed (Release Safety 12).
 2. Keep messages concise, concrete, and grounded in inspected changes.
 3. Do not use vague summaries such as `update`, `misc`, or `changes`.
 4. Do not mix unrelated work in one commit.

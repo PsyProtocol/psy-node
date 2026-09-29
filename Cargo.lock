@@ -4485,9 +4485,12 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "socket2 0.6.1",
+ "system-configuration 0.5.1",
  "tokio",
+ "tower-layer",
  "tower-service",
  "tracing",
+ "windows-registry",
 ]
 
 [[package]]
@@ -7459,6 +7462,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "thiserror 2.0.17",
+ "tiny-keccak",
  "tracing",
  "ts-rs",
  "zstd 0.13.3",
@@ -7488,6 +7492,7 @@ dependencies = [
  "psy_client_data",
  "psy_config",
  "psy_crypto",
+ "psy_plonky2_basic_helpers",
  "psy_plonky2_common_circuits",
  "psy_vm",
  "rand 0.8.5",
@@ -7660,6 +7665,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "jsonrpsee",
+ "k256",
  "lazy_static",
  "parth_common",
  "parth_core",
@@ -7671,8 +7677,10 @@ dependencies = [
  "psy_api_core",
  "psy_cli_common",
  "psy_client_common",
+ "psy_client_data",
  "psy_config",
  "psy_core",
+ "psy_crypto",
  "psy_data",
  "psy_io",
  "psy_jtmb_testing_core",
@@ -7683,7 +7691,10 @@ dependencies = [
  "psy_node_redis",
  "psy_node_scylla",
  "psy_plonky2_circuits",
+ "psy_prover",
  "psy_serialize",
+ "psy_ups_circuit",
+ "psy_vm",
  "rand 0.8.5",
  "redis 0.30.0",
  "rkyv",
@@ -7695,6 +7706,7 @@ dependencies = [
  "serde_repr",
  "serde_with 3.16.1",
  "serde_yaml",
+ "sha2",
  "speedy",
  "strum 0.27.2",
  "strum_macros 0.27.2",
@@ -8267,16 +8279,20 @@ dependencies = [
  "plonky2x",
  "postcard",
  "pser",
+ "psy_client_data",
  "psy_common_circuit",
  "psy_core",
  "psy_crypto",
  "psy_data",
  "psy_dummy_prover",
+ "psy_network_circuit",
  "psy_node_core",
  "psy_node_store_memory",
  "psy_plonky2_basic_helpers",
  "psy_plonky2_common_circuits",
  "psy_serialize",
+ "psy_ups_circuit",
+ "psy_vm",
  "psy_worker_core",
  "rand 0.8.5",
  "rkyv",
@@ -8312,6 +8328,7 @@ dependencies = [
  "plonky2",
  "postcard",
  "pser",
+ "psy_client_data",
  "psy_plonky2_basic_helpers",
  "rand 0.8.5",
  "rkyv",
@@ -8385,6 +8402,7 @@ dependencies = [
  "sodalite",
  "tempfile",
  "thiserror 2.0.17",
+ "tiny-keccak",
  "tokio",
  "tower",
  "tower-http",
@@ -8473,12 +8491,19 @@ dependencies = [
  "alloy-transport-http",
  "alloy-tx-macros",
  "anyhow",
+ "base64 0.22.1",
  "bincode",
+ "bytes",
  "clap",
  "futures",
  "gnark-plonky2-verifier-ffi",
  "hex",
  "home",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "k256",
+ "libc",
  "parth_core",
  "plonky2",
  "psy_cli_common",
@@ -8495,16 +8520,21 @@ dependencies = [
  "psy_provider",
  "psy_ups_circuit",
  "psy_vm",
+ "redb",
  "reqwest 0.12.28",
+ "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
  "tiny-keccak",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls 0.26.4",
  "toml",
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-roots 1.0.4",
+ "zeroize",
 ]
 
 [[package]]
@@ -8548,6 +8578,7 @@ dependencies = [
  "psy_crypto",
  "psy_dpn_circuit",
  "psy_network_circuit",
+ "psy_plonky2_common_circuits",
  "psy_vm",
  "quick_cache",
  "rand 0.8.5",
@@ -8598,6 +8629,7 @@ dependencies = [
  "k256",
  "kvq",
  "nostr-sdk",
+ "parth_core",
  "plonky2",
  "psy_cli_common",
  "psy_client_common",
@@ -8605,8 +8637,11 @@ dependencies = [
  "psy_common_circuit",
  "psy_compiler",
  "psy_config",
+ "psy_core",
  "psy_crypto",
  "psy_dpn_circuit",
+ "psy_plonky2_circuits",
+ "psy_plonky2_common_circuits",
  "psy_prover",
  "psy_provider",
  "psy_ups_circuit",
@@ -9112,6 +9147,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redis"
 version = "0.28.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9348,12 +9392,14 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-rustls 0.26.4",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.4",
 ]
@@ -12114,6 +12160,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "wasm-tracing"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12353,6 +12412,17 @@ checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
 dependencies = [
  "windows-core",
  "windows-link",
+]
+
+[[package]]
+name = "windows-registry"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02752bf7fbdcce7f2a27a742f798510f3e5ad88dbe84871e5168e2120c3d5720"
+dependencies = [
+ "windows-link",
+ "windows-result",
+ "windows-strings",
 ]
 
 [[package]]

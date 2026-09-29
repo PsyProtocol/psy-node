@@ -189,6 +189,7 @@ pub trait QTreeDataStoreReaderSync<F: RichField>: Send + Sync {
         )
         .await
     }
+    /// `function_id` is a physical CFT leaf index; a logical function's fingerprint is at `2 * index`.
     async fn get_contract_function_tree_merkle_proof(
         &self,
         checkpoint_id: u64,

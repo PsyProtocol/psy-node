@@ -1436,8 +1436,15 @@ impl<
         user_id: u64,
         contract_id: u32,
         key: N::QHash,
+        state_slot_base: u64,
+        capacity: u64,
     ) -> QRpcResult<IMTMembershipProof<N::F, N::QHash>> {
         let height = self.contract_state_tree_height(contract_id).await.map_err(RpcError::Anyhow)?;
+        let min = state_slot_base.checked_add(1).ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("IMT range overflow")))?;
+        let max = state_slot_base.checked_add(capacity).ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("IMT range overflow")))?;
+        if capacity == 0 || height < 64 && max >= (1u64 << height) {
+            return Err(RpcError::Anyhow(anyhow::anyhow!("IMT map outside contract state tree")).into());
+        }
         // Get the leaf index for the key
         let leaf_index = self
             .db_reader
@@ -1445,6 +1452,9 @@ impl<
             .await
             .map_err(RpcError::Anyhow)?
             .ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("Key not found in IMT")))?;
+        if !(min..=max).contains(&leaf_index) {
+            return Err(RpcError::Anyhow(anyhow::anyhow!("IMT membership leaf outside requested map")).into());
+        }
 
         // Get the leaf preimage
         let leaf = self
@@ -1453,6 +1463,10 @@ impl<
             .await
             .map_err(RpcError::Anyhow)?
             .ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("Leaf preimage not found at index {}", leaf_index)))?;
+        let next_index = leaf.next_index.to_u64_value();
+        if leaf.key != key || next_index != 0 && !(min..=max).contains(&next_index) {
+            return Err(RpcError::Anyhow(anyhow::anyhow!("IMT key or successor outside requested map")).into());
+        }
 
         // Get the merkle proof for the leaf's position in the tree
         let merkle_proof = self
@@ -1460,6 +1474,9 @@ impl<
             .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, height, leaf_index)
             .await
             .map_err(RpcError::Anyhow)?;
+        if merkle_proof.index != leaf_index {
+            return Err(RpcError::Anyhow(anyhow::anyhow!("IMT membership proof index mismatch")).into());
+        }
 
         Ok(IMTMembershipProof {
             leaf,

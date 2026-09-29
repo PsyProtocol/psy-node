@@ -281,7 +281,7 @@ Numeric strings are parsed with `parseInt(..., 10)`, so malformed suffixes can s
 | `--faucet-server`                | Boolean selector                       | Starts faucet on 9998 after same-launch proxy readiness, when proxies exist.                                                                                                                                                                                                                                                                                                                                                       | `dev/locSetupV4.ts:4633-4662`                                                                 |
 | `--l1`                           | Boolean selector                       | Starts local/forked Anvil or probes external Layer 1, then deploys/reuses contracts.                                                                                                                                                                                                                                                                                                                                               | `dev/locSetupV4.ts:4404-4452`                                                                 |
 | `--relayer`                      | Boolean selector                       | Starts Envio backing services/indexer, psy-services, indexers, and relayer; external core/Layer 1 dependencies must exist in component mode.                                                                                                                                                                                                                                                                                       | `dev/locSetupV4.ts:4454-4704`                                                                 |
-| `--relayer-config PATH`          | String, local TOML path                | Supplies Envio/dependency configuration; the launcher generates a separate relayer daemon config.                                                                                                                                                                                                                                                                                                                                  | `dev/locSetupV4.ts:4454-4473`; `dev/locSetupV4.ts:4667-4699`                                  |
+| `--relayer-config PATH` | String, local TOML path | Supplies Envio/dependency configuration only; it is not the daemon config. The relayer requires `PSY_BRIDGE_DAEMON_CONFIG`. | `dev/locSetupV4.ts` (`setupProcesses`) |
 | `--bridge-proposer-daemon`       | Boolean selector                       | Enables relayer application selection but has a current duplicated-mode defect described in section 17.                                                                                                                                                                                                                                                                                                                            | `dev/locSetupV4.ts:5477,5498`; `dev/locSetupV4.ts:3950-3954`                                  |
 | `--psy-privacy-bridge`           | Boolean selector                       | Waits for Nostr and starts the bridge UI on 5177.                                                                                                                                                                                                                                                                                                                                                                                  | `dev/locSetupV4.ts:4706-4739`                                                                 |
 | `--ide`                          | Boolean selector                       | Starts the IDE on 5176.                                                                                                                                                                                                                                                                                                                                                                                                            | `dev/locSetupV4.ts:4742-4761`                                                                 |
@@ -331,45 +331,32 @@ Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime co
 | Variable                   | Default                                                                   | Effect                                                                                                 | Evidence                                                                                    |
 | -------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
 | `HOME`                     | Required                                                                  | Locates trust setup and default relayer keystore.                                                      | `dev/locSetupV4.ts:2476-2481`; `dev/locSetupV4.ts:2968-2973`                                |
-| `KEYSTORE_PATH`            | `${HOME}/.psy/keystore/bridge-relayer`                                    | Encrypted UTC JSON used by both `[relayer_wallet]` (L2 ZKSign) and `[finalize]` / `[[chains]]` (L1 secp). | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`, `daemonConfig`)                    |
-| `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` | unset | Genesis registration 2 and locSetup: first-choice UTC JSON path. Same file the relayer decrypts. | `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`; `dev/locSetupV4.ts:298-310` |
-| `BRIDGE_RELAYER_KEYSTORE_PATH` | unset | Alias if `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` is unset. | same |
-| `WALLET_PASSWORD`          | Prompt/policy; generated development keystore can use development default | Decrypts the UTC JSON for locSetup, L1 deploy, genesis generation, and the relayer.                    | `dev/locSetupPolicy.ts:615-638`; `dev/locSetupV4.ts:313-330`; `dev/locSetupV4.ts:3084-3097` |
+| `KEYSTORE_PATH` | `${HOME}/.psy/keystore/bridge-relayer` | Encrypted UTC JSON for L1 `[finalize]` / `[[chains]]` custody only; not the L2 multisig identity. | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`, `daemonConfig`) |
+| `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` | unset | First-choice L1 relayer keystore path; not a Genesis enrollment input. | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`) |
+| `BRIDGE_RELAYER_KEYSTORE_PATH` | unset | L1 keystore alias when `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` is unset. | same |
+| `WALLET_PASSWORD` | Existing prompt/development policy | Decrypts L1 deployment and relayer keystores; not consumed for public Genesis enrollment. | `dev/locSetupV4.ts` (`resolveWalletPasswordForKeystore`, `planGenesisGeneration`) |
+| `PSY_RELAYER_MULTISIG_ACCOUNT` | Required only for actual Genesis generation | Public initial two-of-three account JSON path, forwarded as `--relayer-multisig-account`; relative paths resolve against the repository root. Verified Genesis reuse does not require it. | `dev/locSetupV4.ts:2745-2797`; `Makefile:107-112` |
+| `PSY_MULTISIG_POLICY_ARTIFACT` | Required only for actual Genesis generation | Approved policy compiler artifact JSON path including ABI, forwarded as `--multisig-policy-artifact`; no default or implicit generation. | same |
+| `PSY_BRIDGE_DAEMON_CONFIG` | Required when selecting the foreground relayer (including full mode and bridge proposer) | Whole operator-provisioned TOML forwarded unchanged to `psy_relayer_cli --config`; no generated daemon TOML or default signer. Relative config and daemon input paths use the actual launch cwd. | `dev/locSetupV4.ts` (`resolveBridgeDaemonConfigPath`) |
+| `PSY_GUARDIAN_CONFIG` | Optional coherence assertion for relayer startup | If supplied, must resolve to the same public Guardian client JSON as the whole daemon config's required `guardian_config`; it cannot override that field. | `dev/locSetupV4.ts` (`resolveBridgeDaemonConfigPath`) |
 | `PSY_SKIP_KEYSTORE`        | Direct default off; Make default `1`                                      | Exact `1` skips remote trust-setup refresh/hash verification but still requires mandatory local files. | `dev/locSetupV4.ts:2487-2521`; `Makefile:14`                                                |
 | `PSY_KEYSTORE_S3_BASE_URL` | Published development asset prefix                                        | Overrides trust-setup manifest and proving-key download base.                                          | `dev/locSetupV4.ts:1657-1660`; `dev/locSetupV4.ts:2285-2295`                                |
 
-#### Using a Throwaway Bridge-Relayer Keystore
+#### Separate L1 Custody and L2 Multisig Identity
 
-`KEYSTORE_PATH` is the encrypted UTC JSON used by both `[relayer_wallet]` and `[finalize]` / `[[chains]]` in generated `daemon.toml`. The L2 identity is that file's 32-byte secret parsed as a Poseidon key (`Wallet::load` then `Hash256` then `QHashOut`), not a plaintext `private_key`. Genesis registration 2 (`user_id` `524288`) matches only when the same file was passed to `make generate-genesis-data` ([genesis-generation.md](genesis-generation.md) section 1.2.1: `PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, or `KEYSTORE_PATH`, plus `WALLET_PASSWORD`). The proving trust setup stays under `~/.psy/keystore` regardless of `KEYSTORE_PATH`.
+`KEYSTORE_PATH` and its higher-priority aliases configure encrypted L1 transaction custody only. The proving trust setup stays under `~/.psy/keystore` regardless of that variable. L2 registration 2 (`user_id` 524288) is derived from the public `MultisigAccount` and actual multisig circuit fingerprint, not from a keystore secret. Genesis seeds the initial policy at contract 6 and exports `null` at registration index 2 in `private_keys.json`; other indexed validator/faucet secrets remain secret. See [public Genesis inputs](genesis-generation.md#121-public-bridge-multisig-account).
 
-```bash
-# Throwaway UTC JSON instead of ~/.psy/keystore/bridge-relayer
-export WALLET_PASSWORD=devnet
-mkdir -p /tmp/psy-devnet-relayer
-export KEYSTORE_PATH=/tmp/psy-devnet-relayer/bridge-relayer-keystore
-cast wallet new /tmp/psy-devnet-relayer bridge-relayer-keystore --unsafe-password "$WALLET_PASSWORD"
-PSY_BRIDGE_RELAYER_KEYSTORE_PATH="$KEYSTORE_PATH" make generate-genesis-data
-make run-all
-```
+When generation is triggered, provide both `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`; the launcher validates readable public JSON inputs and passes the exact required flags. Its generator child excludes legacy secret-bearing enrollment variables without changing the parent process's L1 custody environment. If an existing Genesis snapshot passes the reuse checks, these generation inputs are not required. No automatic account replacement or live-chain regeneration is authorized by supplying them.
 
-Behavior on the first and later launches:
+L1 password behavior is unchanged: an existing keystore requires its correct password, non-interactive startup without the required password fails, and an existing keystore is not silently re-encrypted. A missing development L1 keystore can be generated from the named `LOCAL_DEVNET_RELAYER_L1_PRIVATE_KEY` fixture; that fixture is not an L2 enrollment key. Do not copy development secrets into deployment documentation.
 
-1. Path absent — the launcher auto-generates a development keystore from the Anvil development
-   private key `0xac0974…2ff80`, encrypted with `WALLET_PASSWORD` (default `"devnet"` when unset)
-   (`dev/locSetupV4.ts:2427-2588`). That file still has to be the genesis input or registration 2
-   is `deterministic_private_key(2)` and the relayer is `not_registered`.
-2. Path exists — the password must match that keystore. In a non-interactive session
-   (`WALLET_PASSWORD` unset, no TTY) startup fails with
-   `"WALLET_PASSWORD is required for an existing bridge-relayer keystore in a non-interactive
-   session"`; interactive sessions prompt instead (`dev/locSetupPolicy.ts:511-543`). An existing
-   keystore is never silently re-encrypted with the devnet default.
-3. A mismatched password is not detected at startup validation alone — it surfaces later as a
-   decrypt failure (`invalid password`) when the relayer or deployment first uses the wallet
-   (`dev/locSetupPolicy.ts:546-555`). Always pass the same `WALLET_PASSWORD` for a given
-   `KEYSTORE_PATH`.
+For relayer startup, provision `PSY_BRIDGE_DAEMON_CONFIG` and all referenced inputs before invoking the launcher. Its required public fields are `rpc_config`, `services_url`, `guardian_config`, `aggregate_setup_config`, `aggregate_artifact_dir`, `aggregation_token_file`, `withdraw_method_id`, and `aggregate_limits`. The limits table requires `max_deposits`, `reserved_withdrawals`, `reserved_rewards`, `max_a_calldata_bytes`, `max_b_calldata_bytes`, and `[[aggregate_limits.chains]]` rows containing `chain_index`, `max_deposits`, `reserved_withdrawals`, `tx_gas_limit`, and `block_gas_reserve`. No absent field becomes unlimited and no numeric defaults are generated. Zero is forwarded unchanged; Rust owns its semantic validity.
 
-The developer's real `~/.psy/keystore/bridge-relayer` is never read or modified while
-`KEYSTORE_PATH` points elsewhere; trust-setup artifacts are not affected by this variable.
+Preflight requires `Bun.TOML.parse`; unsupported runtimes and malformed TOML fail with sanitized errors, never source excerpts or TOML values. It checks unsigned integer widths (rejecting unsafe rounded JavaScript numbers), public Guardian shape, and input filesystem metadata only. Nonempty inline `private_key` fields are rejected. Token, key, password and keystore contents are not inspected by this preflight. Rust remains the authority for canonical NetworkConfig, aggregate circuit/setup identity, protected credentials, gas budgets and protocol semantics. The [bridge runbook](bridge-common-operations.md#guardian-configuration-and-enrollment) owns Guardian enrollment and archive restoration.
+
+Initial validation precedes startup purge, environment setup and process effects. With startup `--purge`, lexical and realpath containment checks reject inputs beneath the exact purge targets, including symlink aliases and absent Guardian history output paths via their nearest existing ancestor. Provision inputs outside those targets. Separate `--teardown --purge` remains a destructive operator command, not a relayer launch preflight. The launcher does not generate or repair Guardian secrets, aggregate setup, or daemon config; this change supplies no trusted-setup backup or regeneration evidence. Any separately authorized setup mutation requires a verified backup first.
+
+Saved relayer commands retain their launch cwd and effective environment. Manual `make restart` validates the replay before stopping any live application; failure leaves it running. `make rollback-resume` validates saved templates before starting any application. Each actual relayer spawn, including automatic restart and initialization retries, revalidates before log or spawn effects. A bad config after involuntary exit blocks respawn; it cannot undo that exit. Non-relayer template behavior is unchanged. Current launch/E2E QA remains pending.
 
 ### 6.4 Resources, Logging, and Supervision
 
@@ -424,7 +411,7 @@ nonempty faucet values plus the fixed runtime allowlist (`dev/locSetupV4.ts:3921
 | psy-services           | `psy-services --disable-auth`                                                         | Start marker, then `http://127.0.0.1:3000/health`.                                          | `dev/locSetupV4.ts:4545-4575`                                  |
 | psy-indexers           | `psy-indexer` Coordinator then Realm                                                  | `Starting PSY Indexer`; sequential ordering.                                                | `dev/locSetupV4.ts:4576-4630`                                  |
 | Faucet                 | `psy_user_cli faucet-server`                                                          | Waits for same-launch proxies; its TCP 9998 probe is nonblocking after spawn.               | `dev/locSetupV4.ts:4633-4662`                                  |
-| Relayer                | `psy_relayer_cli --config .../daemon.toml`                                            | Relayer marker after same-launch proxy readiness and bridge stack.                          | `dev/locSetupV4.ts:4663-4704`                                  |
+| Relayer | `psy_relayer_cli --config "$PSY_BRIDGE_DAEMON_CONFIG"` | Exact aggregate message `aggregate bridge relayer started` (with tracing prefix/fields); indexer Postgres/schema/sync and legacy relayer messages are not readiness. | `dev/locSetupV4.ts` (`relayerStartedDetector`); `psy_cli/psy_relayer_cli/src/bridge/daemon.rs` |
 | UIs                    | Vite/Bun development servers                                                          | `ready in`; ports 5177, 5176, 5178, 5179.                                                   | `dev/locSetupV4.ts:4706-4839`                                  |
 
 General initialization-hint startup retries after two seconds, with `maxRetries=3` meaning at most four attempts;
@@ -620,6 +607,28 @@ every generated Realm edge instead of using the foreground count-sensitive distr
 ## 15. Source-Accurate Command Recipes
 
 ### Supported Make lifecycle
+Before any full-mode or relayer command below, set the path to an already provisioned complete daemon TOML (prefer an absolute path). This assertion neither creates config nor authorizes setup generation:
+
+```bash
+: "${PSY_BRIDGE_DAEMON_CONFIG:?Set the path to the provisioned whole daemon TOML}"
+export PSY_BRIDGE_DAEMON_CONFIG
+```
+
+For authorized startup after the lifecycle artifact gate:
+
+```bash
+PSY_SKIP_KEYSTORE=1 PSY_SKIP_BRANCH_CHECK=1 PSY_SKIP_BUILD=1 make run-all
+```
+
+For a component-only relayer against already running dependencies:
+
+```bash
+PSY_SKIP_KEYSTORE=1 PSY_SKIP_BRANCH_CHECK=1 PSY_SKIP_BUILD=1 \
+  bun run dev/locSetupV4.ts --relayer
+```
+
+`--relayer-config` continues to select Envio/dependency TOML; do not substitute it for `PSY_BRIDGE_DAEMON_CONFIG`. Changing environment in the shell running `make restart` does not replace the live supervisor's saved environment; repair the provisioned files at their saved paths instead.
+
 
 ```bash
 make run-all

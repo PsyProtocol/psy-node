@@ -1,89 +1,110 @@
 use anyhow::{Context, Result};
 use hashbrown::HashMap;
-use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
+use plonky2::field::goldilocks_field::GoldilocksField;
 use psy_cli_common::key_utils::load_wallet_key_info;
 use psy_client_common::{
-    args::ContractCallArgs,
-    data::qhashout::QHashOut,
-    job::id::{QProvingJobDataID, QProvingJobDataIDWithRewardPreimage, GUTA_REWARDS_TREE_V2_MAX_HEIGHT},
+    args::SignType,
+    data::{base_types::hash256::Hash256, qhashout::QHashOut},
+    job::id::{QProvingJobDataID, QProvingJobDataIDWithRewardPreimage},
 };
 use psy_client_data::{
     api::reward::{PsyProoffMinerRewardProof, PsyProoffMinerRewardProofWithRewardPreimage, PsyProvingJobClaimMetadata},
     traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync},
 };
-use psy_config::network_constants::{MINING_REWARDS_CONTRACT_ID, TOKEN_CONTRACT_ID, TOKEN_CONTRACT_STATE_TREE_HEIGHT};
-use psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProofWithRewardPreimage;
-use psy_prover::session::{build_claim_calls_for_multi_checkpoints_v2, ProofWithCheckpointV2, LAST_CLAIMED_CHECKPOINT_SLOT};
 use psy_provider::provider::RpcProvider;
 
-use super::{args::ClaimRewardsArgs, submit_end_cap_proof};
-use crate::result::{CommandResult, TransactionResult, TransactionStatus};
+use super::args::ClaimRewardsArgs;
+use crate::result::CommandResult;
+use psy_client_data::config::store_config::PsyHasher;
+use psy_crypto::hash::traits::qhashable::QFieldHashable;
+use psy_ups_circuit::signature::reward_authorization::RewardAuthorizationInput;
+use psy_vm::{reward_authorization::RewardAuthorizationWitness, ups::multisig::{MultisigAccount, MultisigSignatures}};
+use super::claim_withdrawal::ClaimClient;
+use psy_prover::local::bridge_aggregate::{address, reward_record, reward_membership, multisig_authorization, select_multisig_signatures, FreshAuthorizationRequired, ClaimError};
+
+
+fn wallet_authorization(info: &psy_cli_common::key_utils::WalletKeyInfo, message: [u8; 32]) -> Result<RewardAuthorizationWitness> {
+    match info.sign_type {
+        SignType::ZKSign => Ok(RewardAuthorizationWitness::Zk { private_key: info.private_key }),
+        SignType::SECP256K1Sign | SignType::EthPersonalSECP256K1Sign => {
+            let wallet = psy_provider::wallet::secp_wallet::Wallet::from_bytes(&Hash256::from(info.private_key).0)?;
+            let compressed_public_key = wallet.compressed_public_key();
+            if info.sign_type == SignType::SECP256K1Sign { Ok(RewardAuthorizationWitness::Secp { compressed_public_key, signature_rs: wallet.sign_prehash_raw(&message)? }) }
+            else { Ok(RewardAuthorizationWitness::PersonalSign { compressed_public_key, signature_rs: wallet.sign_prehash_raw(&psy_crypto::signature::secp256k1::wallet::eth_personal_sign_digest(&message))? }) }
+        }
+        _ => anyhow::bail!("wallet identity is not a supported reward authorization family"),
+    }
+}
+
+
 
 pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
-    let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
-    let rpc_config = psy_config.get_current_network()?.clone();
-    let info = load_wallet_key_info(&args.wallet, false)?;
-
-    let provider = RpcProvider::new_with_config(&rpc_config)?;
-    let user_id = provider
-        .get_user_ids_for_public_key(info.public_key_hash)
-        .await?
-        .first()
-        .ok_or(anyhow::format_err!("no user id"))?
-        .clone();
-
-    let job_ids = load_job_ids_from_file(&args.jobs_file)?;
-    tracing::info!("Loaded {} job IDs from file", job_ids.jobs_len());
-    let job_ids = validate_and_deduplicate_jobs(job_ids, user_id, &args.jobs_file)?;
-    tracing::info!(
-        "Loaded claim jobs from {}: realm_jobs={}, coordinator_jobs={}",
-        args.jobs_file,
-        job_ids.realm_jobs.len(),
-        job_ids.coordinator_jobs.len()
-    );
-    tracing::debug!("Total jobs: {}", serde_json::to_string_pretty(&job_ids)?);
-
-    let latest_checkpoint_id = provider.get_latest_block_state().await?.checkpoint_id;
-    let last_claimed_checkpoint_id = get_last_claimed_checkpoint_id(&provider, user_id, latest_checkpoint_id).await?;
-    tracing::info!(
-        "Claim reward checkpoint state: user_id={}, latest_checkpoint_id={}, last_claimed_checkpoint_id={}",
-        user_id,
-        latest_checkpoint_id,
-        last_claimed_checkpoint_id
-    );
-    let mut proofs_with_checkpoint_id = build_realm_proofs(&provider, last_claimed_checkpoint_id, job_ids.realm_jobs).await?;
-    for (k, v) in build_proofs(&provider, last_claimed_checkpoint_id, job_ids.coordinator_jobs, 2).await? {
-        proofs_with_checkpoint_id.entry(k).or_default().extend(v);
+    anyhow::ensure!(args.multisig_account.is_some() == args.signatures.is_some(), "--multisig-account and --signatures must be supplied together");
+    let user_id = u32::try_from(args.user_id)?;
+    let recipient = address(&args.recipient)?;
+    anyhow::ensure!(recipient != [0; 20], "reward recipient must be nonzero");
+    let account: Option<MultisigAccount> = if let Some(path) = &args.multisig_account {
+        anyhow::ensure!(args.wallet.private_key.is_none() && args.wallet.keystore_path.is_none() && args.wallet.fingerprint.is_none() && args.wallet.wallet_password.is_none(), "multisig authorization conflicts with secret wallet inputs");
+        let account: MultisigAccount = serde_json::from_slice(&std::fs::read(path)?)?;
+        account.public_key_param()?;
+        Some(account)
+    } else { None };
+    let wallet = if account.is_none() {
+        anyhow::ensure!(matches!(args.wallet.sign_type, SignType::ZKSign | SignType::SECP256K1Sign | SignType::EthPersonalSECP256K1Sign), "unsupported reward wallet identity");
+        Some(load_wallet_key_info(&args.wallet, false)?)
+    } else { None };
+    let client = ClaimClient::load(&args.rpc_config, &args.aggregate_config, &args.services_url)?;
+    let jobs = validate_and_deduplicate_jobs(load_job_ids_from_file(&args.jobs_file)?, args.user_id, &args.jobs_file)?;
+    anyhow::ensure!(jobs.jobs_len() != 0, "no reward jobs selected");
+    let mut proofs = build_realm_proofs(&client.provider, jobs.realm_jobs).await?;
+    for (checkpoint, batch) in build_proofs(&client.provider, jobs.coordinator_jobs, 2).await? { proofs.entry(checkpoint).or_default().extend(batch); }
+    let mut selected = Vec::new();
+    let mut checkpoints: Vec<_> = proofs.keys().copied().collect();
+    checkpoints.sort_unstable();
+    for checkpoint in checkpoints {
+        for proof in &proofs[&checkpoint] {
+            let (record, tag) = reward_record(checkpoint, user_id, recipient, proof)?;
+            selected.push((record, tag, proof.inner.tag_tree_proof.root));
+        }
     }
-    tracing::info!(
-        "Proofs after checkpoint filtering: checkpoints={}, proofs={}",
-        proofs_with_checkpoint_id.len(),
-        proofs_with_checkpoint_id.values().map(|proofs| proofs.len()).sum::<usize>()
-    );
-
-    // Build contract call args from proofs (pass job_ids to get reward_path_info)
-    let contract_call_args = build_claim_calls_from_proofs(&provider, &proofs_with_checkpoint_id).await?;
-
-    // Execute contract calls
-    if !contract_call_args.is_empty() {
-        let (tx_hash, _end_user_leaf_hash) = submit_end_cap_proof::prove_contract_call_data_once(
-            &args.rpc_config,
-            &args.wallet,
-            psy_client_common::args::ContractCallData::new(contract_call_args),
-        )
-        .await?;
-        tracing::info!("Successfully claimed rewards with v2 proof structure");
-        Ok(CommandResult::Transaction(TransactionResult {
-            transaction_hash: tx_hash,
-            user_id: Some(user_id),
-            status: TransactionStatus::Submitted,
-            confirmed_checkpoint: None,
-            network: psy_config.current_network_name().to_string(),
-        }))
-    } else {
-        tracing::info!("No proofs to claim");
-        Ok(CommandResult::generic("claim-rewards"))
+    anyhow::ensure!(!selected.is_empty(), "no reward witnesses returned");
+    let mut context = client.context().await?;
+    for (reward, tag, tag_root) in selected {
+        loop {
+            let attempt: Result<()> = async {
+                let membership = reward_membership(&client, &context, &reward).await?;
+                anyhow::ensure!(membership.claim_checkpoint_leaf.stats.pm_rewards_commitment.gutas_root == tag_root, "reward proof does not reach authenticated full GUTA root");
+                let authorization = if let Some(account) = &account {
+                    let identity = client.circuits.entries().iter().find(|entry| entry.family == 4 && entry.level == 0 && entry.variant == 3).context("missing pinned multisig authorization identity")?.identity_fingerprint;
+                    let public_key = psy_crypto::signature::zk::data::ZKPublicKeyInfo { fingerprint: QHashOut::from_values(identity[0], identity[1], identity[2], identity[3]), public_key_param: account.public_key_param()? }.qfhash::<PsyHasher>();
+                    anyhow::ensure!(membership.authorization_user_leaf.public_key == public_key, "chosen-end account differs from multisig enrollment");
+                    let bundles: Vec<MultisigSignatures> = serde_json::from_slice(&std::fs::read(args.signatures.as_ref().context("missing multisig signatures path")?)?)?;
+                    let signatures = match select_multisig_signatures(&bundles, &membership.message()?)? {
+                        Some(signatures) => signatures,
+                        None => {
+                            let request = FreshAuthorizationRequired::new(&context, &membership)?;
+                            println!("{}", serde_json::to_string(&request)?);
+                            return Err(request.into());
+                        }
+                    };
+                    multisig_authorization(&client, &context, &reward, &membership, account, signatures).await?
+                } else {
+                    let wallet = wallet.as_ref().context("missing selected wallet")?;
+                    anyhow::ensure!(membership.authorization_user_leaf.public_key == wallet.public_key_hash, "chosen-end user identity differs from selected wallet");
+                    wallet_authorization(wallet, membership.message()?)?
+                };
+                let input = RewardAuthorizationInput { context: membership, authorization };
+                let proof = client.circuits.reward.authorization_circuits().prove(&input)?;
+                let request = client.prove_reward(&context, &input.context, &tag, &proof, &client.circuits.reward)?;
+                client.submit(&context, request).await
+            }.await;
+            match attempt {
+                Ok(()) => break,
+                Err(error) => match error.downcast_ref::<ClaimError>() { Some(ClaimError::ContextChanged(current)) => context = current.clone(), _ => return Err(error) },
+            }
+        }
     }
+    Ok(CommandResult::generic("claim-rewards"))
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -207,7 +228,6 @@ fn require_checkpoint_id(checkpoint_id: Option<u64>, source: &str) -> Result<u64
 
 pub async fn build_realm_proofs(
     provider: &RpcProvider,
-    last_claimed_checkpoint_id: u64,
     job_ids: Vec<(u64, u64, QProvingJobDataIDWithRewardPreimage)>,
 ) -> Result<HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>> {
     let job_ids_with_realm_and_unique_pending_id: HashMap<(u64, u64), Vec<QProvingJobDataIDWithRewardPreimage>> =
@@ -239,16 +259,6 @@ pub async fn build_realm_proofs(
             .generate_realm_batch_proof_miner_reward_proofs_by_realm_id(*realm_id, *unique_pending_id, job_ids)
             .await?;
 
-        if checkpoint_id <= last_claimed_checkpoint_id {
-            tracing::info!(
-                "Skipping realm {} unique_pending_id {} checkpoint {} because last_claimed_checkpoint_id is {}",
-                realm_id,
-                unique_pending_id,
-                checkpoint_id,
-                last_claimed_checkpoint_id
-            );
-            continue;
-        }
 
         total_proofs += proofs.len();
         tracing::info!(
@@ -273,7 +283,6 @@ pub async fn build_realm_proofs(
 
 pub async fn build_proofs(
     provider: &RpcProvider,
-    last_claimed_checkpoint_id: u64,
     job_ids: Vec<(u64, QProvingJobDataIDWithRewardPreimage)>,
     node_type: u8,
 ) -> Result<HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>> {
@@ -318,15 +327,6 @@ pub async fn build_proofs(
             (checkpoint_id, proofs)
         };
 
-        if checkpoint_id <= last_claimed_checkpoint_id {
-            tracing::info!(
-                "Skipping coordinator unique_pending_id {} checkpoint {} because last_claimed_checkpoint_id is {}",
-                unique_pending_id,
-                checkpoint_id,
-                last_claimed_checkpoint_id
-            );
-            continue;
-        }
 
         total_proofs += proofs.len();
         tracing::info!(
@@ -348,19 +348,6 @@ pub async fn build_proofs(
     Ok(proofs_with_unique_pending_id)
 }
 
-async fn get_last_claimed_checkpoint_id(provider: &RpcProvider, user_id: u64, latest_checkpoint_id: u64) -> Result<u64> {
-    let proof = provider
-        .get_user_contract_state_tree_merkle_proof(
-            latest_checkpoint_id,
-            user_id,
-            TOKEN_CONTRACT_ID,
-            TOKEN_CONTRACT_STATE_TREE_HEIGHT,
-            LAST_CLAIMED_CHECKPOINT_SLOT,
-        )
-        .await?;
-
-    Ok(proof.value.0.elements[1].0)
-}
 
 fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
     let buffer = std::fs::read(path)?;
@@ -398,127 +385,6 @@ fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
     Ok(claim_jobs)
 }
 
-pub async fn build_claim_calls_from_proofs(
-    provider: &RpcProvider,
-    proofs_with_unique_pending_id: &HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>,
-) -> Result<Vec<ContractCallArgs>> {
-    if proofs_with_unique_pending_id.is_empty() {
-        tracing::info!("No valid checkpoints with rewards to claim");
-        return Ok(Vec::new());
-    }
-
-    tracing::debug!("Building claim calls from proofs: {:?}", proofs_with_unique_pending_id);
-
-    let mut sorted_checkpoints: Vec<_> = proofs_with_unique_pending_id.keys().copied().collect();
-    sorted_checkpoints.sort();
-    tracing::info!("Preparing claim calls for checkpoints: {:?}", sorted_checkpoints);
-
-    let mut all_proofs_with_checkpoints = Vec::new();
-
-    for &checkpoint_id in &sorted_checkpoints {
-        let proofs = proofs_with_unique_pending_id
-            .get(&checkpoint_id)
-            .with_context(|| format!("missing proofs for checkpoint {}", checkpoint_id))?;
-        tracing::debug!("Checkpoint {} - Proofs: {}", checkpoint_id, serde_json::to_string_pretty(&proofs)?);
-
-        let checkpoint_leaf = provider.get_checkpoint_leaf_data(checkpoint_id).await?;
-        let fees_collected = checkpoint_leaf.stats.guta_fees_collected.to_canonical_u64();
-        let gutas_completed = checkpoint_leaf.stats.pm_jobs_completed.gutas_completed.to_canonical_u64();
-        tracing::info!(
-            "Checkpoint {} - Fees collected: {}, Gutas completed: {}",
-            checkpoint_id,
-            fees_collected,
-            gutas_completed
-        );
-
-        let proposed_reward = if gutas_completed > 0 { fees_collected / gutas_completed } else { 0u64 };
-
-        if proposed_reward == 0 {
-            tracing::warn!(
-                "Skipping checkpoint {} due to zero reward (fees_collected={}, gutas_completed={})",
-                checkpoint_id,
-                fees_collected,
-                gutas_completed
-            );
-            continue;
-        }
-
-        tracing::info!("Checkpoint {} - Reward: {}, Proofs: {}", checkpoint_id, proposed_reward, proofs.len());
-        for proof in proofs {
-            all_proofs_with_checkpoints.push(ProofWithCheckpointV2 {
-                checkpoint_id,
-                proof: TagTreeMerkleProofWithRewardPreimage::new(proof.inner.tag_tree_proof.clone(), proof.reward_tree_tag_preimage)
-                    .pad_to_height(GUTA_REWARDS_TREE_V2_MAX_HEIGHT as usize),
-                proposed_reward,
-            });
-        }
-    }
-
-    if all_proofs_with_checkpoints.is_empty() {
-        tracing::info!("No checkpoints with valid rewards to claim");
-        return Ok(Vec::new());
-    }
-
-    tracing::info!(
-        "Building claim calls for {} proofs across {} checkpoints",
-        all_proofs_with_checkpoints.len(),
-        sorted_checkpoints.len()
-    );
-    tracing::debug!("Proofs with checkpoints: {}", serde_json::to_string_pretty(&all_proofs_with_checkpoints)?);
-
-    let mut all_contract_calls = Vec::new();
-    let mut group_start = 0;
-    while group_start < all_proofs_with_checkpoints.len() {
-        let checkpoint_id = all_proofs_with_checkpoints[group_start].checkpoint_id;
-        let mut group_end = group_start + 1;
-        while group_end < all_proofs_with_checkpoints.len() && all_proofs_with_checkpoints[group_end].checkpoint_id == checkpoint_id {
-            group_end += 1;
-        }
-
-        let mut checkpoint_calls = build_claim_calls_for_multi_checkpoints_v2(&all_proofs_with_checkpoints[group_start..group_end]).await;
-        tracing::info!(
-            "Prepared {} reward claim calls for checkpoint {} with {} proofs",
-            checkpoint_calls.len(),
-            checkpoint_id,
-            group_end - group_start
-        );
-        all_contract_calls.append(&mut checkpoint_calls);
-        group_start = group_end;
-    }
-    for (call_index, call) in all_contract_calls.iter().enumerate() {
-        tracing::info!(
-            "Prepared reward claim call {}: contract_id={}, method={}, input_count={}",
-            call_index,
-            call.contract_id,
-            call.method_name,
-            call.inputs.len()
-        );
-    }
-
-    let last_checkpoint = all_proofs_with_checkpoints
-        .last()
-        .with_context(|| "claim proof list became empty before checkpoint finalization")?
-        .checkpoint_id;
-
-    all_contract_calls.push(ContractCallArgs {
-        contract_id: MINING_REWARDS_CONTRACT_ID as u64,
-        method_name: "end_session".to_string(),
-        inputs: vec![last_checkpoint],
-    });
-
-    all_contract_calls.push(ContractCallArgs {
-        contract_id: TOKEN_CONTRACT_ID as u64,
-        method_name: "simple_claim_pow_rewards".to_string(),
-        inputs: vec![last_checkpoint],
-    });
-
-    tracing::info!(
-        "Executing {} contract calls in single transaction, last_checkpoint={}",
-        all_contract_calls.len(),
-        last_checkpoint
-    );
-    Ok(all_contract_calls)
-}
 
 #[cfg(test)]
 mod tests {
@@ -624,13 +490,6 @@ mod tests {
             .contains("duplicate test proof"));
     }
 
-    #[test]
-    fn same_checkpoint_proofs_are_appended_not_overwritten() {
-        let mut by_checkpoint: HashMap<u64, Vec<u64>> = HashMap::new();
-        by_checkpoint.entry(9).or_default().extend([1, 2]);
-        by_checkpoint.entry(9).or_default().extend([3]);
-        assert_eq!(by_checkpoint.get(&9).unwrap(), &[1, 2, 3]);
-    }
 
     #[test]
     fn unavailable_checkpoint_is_fail_closed() {

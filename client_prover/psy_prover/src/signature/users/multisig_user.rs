@@ -5,6 +5,7 @@ use psy_client_common::data::{base_types::hash256::Hash256, qhashout::QHashOut, 
 use psy_client_data::config::store_config::{PsyHasher, PsyPlonky2Config, PsyProof};
 use psy_config::network_constants::PSY_NETWORK_MAGIC;
 use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::{secp256k1::wallet::hash_no_pad_compressed_public_key, zk::data::ZKPublicKeyInfo}};
+use psy_ups_circuit::signature::reward_authorization::{RewardAuthorizationCircuits, RewardAuthorizationContext};
 use psy_vm::ups::{circuit_manager::UPSCircuitManager, multisig::{MultisigAccount, MultisigPolicy, MultisigSignatureInput, MultisigSignatureWitness, MultisigSignatures}};
 
 use crate::{signature::{context::SignContext, traits::{SignatureCircuitInfo, SignatureUser}}, wallet::memory_wallet::PsyMemoryWallet};
@@ -13,31 +14,19 @@ use super::external_secp256k1_user::{validate_compressed_public_key, validate_si
 #[derive(Debug, Clone)]
 pub struct MultisigUser {
     account: MultisigAccount,
-    policies: Option<(MultisigPolicy, MultisigPolicy)>,
     signatures: Option<MultisigSignatures>,
 }
 
 impl MultisigUser {
     pub fn new(account: MultisigAccount) -> Result<Self> {
         account.public_key_param()?;
-        Ok(Self { account, policies: None, signatures: None })
+        Ok(Self { account, signatures: None })
     }
 
     pub fn account(&self) -> &MultisigAccount {
         &self.account
     }
 
-    pub fn policies(&self) -> Result<(&MultisigPolicy, &MultisigPolicy)> {
-        let (current, ending) = self.policies.as_ref().context("multisig policy preimages missing")?;
-        Ok((current, ending))
-    }
-
-    pub fn set_policy(&mut self, current: MultisigPolicy, ending: MultisigPolicy) -> Result<()> {
-        current.commitment()?;
-        ending.commitment()?;
-        self.policies = Some((current, ending));
-        Ok(())
-    }
 
     pub fn inject_signatures(&mut self, signatures: MultisigSignatures) -> Result<()> {
         validate_signatures(&signatures)?;
@@ -47,8 +36,7 @@ impl MultisigUser {
 
     fn signature_input(&self, witness: &MultisigSignatureWitness, sighash: QHashOut<GoldilocksField>) -> Result<MultisigSignatureInput> {
         ensure!(witness.account.public_key_param()? == self.account.public_key_param()?, "multisig witness account identity mismatch");
-        witness.current_policy.commitment()?;
-        witness.ending_policy.commitment()?;
+        let (current_policy, _) = witness.policies()?;
         let expected = witness.sig_data.get_sig_action_for_user::<PoseidonHash>(
             PSY_NETWORK_MAGIC,
             witness.sign_context.user_leaf.user_id,
@@ -57,17 +45,17 @@ impl MultisigUser {
         ).get_qhash::<PoseidonHash>();
         ensure!(expected == sighash, "multisig witness sighash mismatch");
         let signatures = self.signatures.as_ref().context("multisig signatures missing")?;
-        validate_policy_signatures(signatures, &witness.current_policy, sighash)?;
+        validate_policy_signatures(signatures, &current_policy, sighash)?;
         Ok(MultisigSignatureInput { witness: witness.clone(), signatures: signatures.clone() })
     }
 }
 
 fn validate_signatures(signatures: &MultisigSignatures) -> Result<()> {
-    ensure!((1..=8).contains(&signatures.signatures.len()), "multisig requires 1..=8 signatures");
+    ensure!(signatures.signatures.len() == 2, "multisig requires exactly two signatures");
     ensure!(signatures.member_indices.len() == signatures.signatures.len(), "multisig signature and index counts differ");
     let message = signatures.signatures[0].message;
     for (slot, (&index, signature)) in signatures.member_indices.iter().zip(&signatures.signatures).enumerate() {
-        ensure!(index < 8, "multisig member index out of range");
+        ensure!(index < 3, "multisig member index out of range");
         ensure!(slot == 0 || signatures.member_indices[slot - 1] < index, "multisig member indices must be strictly increasing");
         ensure!(signature.message == message, "multisig signatures must share one message");
         validate_compressed_public_key(CompressedPublicKey(signature.public_key))?;
@@ -76,7 +64,7 @@ fn validate_signatures(signatures: &MultisigSignatures) -> Result<()> {
     Ok(())
 }
 
-fn validate_policy_signatures(signatures: &MultisigSignatures, policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> Result<()> {
+pub fn validate_policy_signatures(signatures: &MultisigSignatures, policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> Result<()> {
     policy.validate()?;
     validate_signatures(signatures)?;
     ensure!(signatures.signatures.len() == usize::from(policy.threshold), "multisig signature count must equal current threshold");
@@ -93,6 +81,10 @@ fn validate_policy_signatures(signatures: &MultisigSignatures, policy: &Multisig
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SignatureUser for MultisigUser {
+    fn prove_reward_authorization(&self, _context: &RewardAuthorizationContext, _circuits: &RewardAuthorizationCircuits) -> Result<Option<PsyProof>> {
+        Ok(None)
+    }
+
     async fn public_key_info(&self, wallet: &PsyMemoryWallet, _circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync)) -> Result<ZKPublicKeyInfo<GoldilocksField>> {
         Ok(ZKPublicKeyInfo {
             fingerprint: wallet.get_multisig_circuit()?.get_fingerprint(),
@@ -122,71 +114,58 @@ impl SignatureUser for MultisigUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plonky2::field::types::PrimeField64;
     use psy_crypto::signature::secp256k1::wallet::secp256k1_sign;
 
-    fn signatures(sighash: QHashOut<GoldilocksField>) -> MultisigSignatures {
-        let key = k256::ecdsa::SigningKey::from_slice(&[1; 32]).unwrap();
-        MultisigSignatures { member_indices: vec![0], signatures: vec![secp256k1_sign(key, sighash).unwrap()] }
-    }
-
-    fn account(signatures: &MultisigSignatures) -> MultisigAccount {
+    fn fixture(sighash: QHashOut<GoldilocksField>) -> (MultisigAccount, MultisigSignatures) {
+        let mut members: Vec<_> = (1u8..=3).map(|byte| {
+            let key = k256::ecdsa::SigningKey::from_slice(&[byte; 32]).unwrap();
+            let signature = secp256k1_sign(key, sighash).unwrap();
+            let hash = hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(CompressedPublicKey(signature.public_key));
+            (hash, signature)
+        }).collect();
+        members.sort_by_key(|(hash, _)| hash.0.elements.map(|limb| limb.to_canonical_u64()));
         let mut member_hashes = [QHashOut::ZERO; 8];
-        member_hashes[0] = hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(
-            CompressedPublicKey(signatures.signatures[0].public_key),
-        );
-        MultisigAccount { contract_id: 42, initial_policy: MultisigPolicy { version: 1, threshold: 1, member_count: 1, member_hashes } }
+        for (index, (hash, _)) in members.iter().enumerate() { member_hashes[index] = *hash; }
+        let account = MultisigAccount { contract_id: 6, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes } };
+        (account, MultisigSignatures { member_indices: vec![0, 2], signatures: vec![members[0].1, members[2].1] })
     }
 
     #[test]
-    fn signature_reuse_requires_same_message_and_current_member() {
+    fn signatures_bind_message_and_current_members() {
         let sighash = QHashOut::from_values(1, 2, 3, 4);
-        let signatures = signatures(sighash);
-        let mut policy = account(&signatures).initial_policy;
-        assert!(validate_policy_signatures(&signatures, &policy, sighash).is_ok());
-        assert!(validate_policy_signatures(&signatures, &policy, QHashOut::from_values(1, 2, 3, 5)).is_err());
-        policy.member_hashes[0] = QHashOut::from_values(1, 0, 0, 0);
-        assert!(validate_policy_signatures(&signatures, &policy, sighash).is_err());
+        let (account, signatures) = fixture(sighash);
+        validate_policy_signatures(&signatures, &account.initial_policy, sighash).unwrap();
+        assert!(validate_policy_signatures(&signatures, &account.initial_policy, QHashOut::from_values(4, 3, 2, 1)).is_err());
+        let mut wrong_members = account.initial_policy;
+        wrong_members.member_hashes[0] = QHashOut::from_values(1, 0, 0, 0);
+        assert!(validate_policy_signatures(&signatures, &wrong_members, sighash).is_err());
     }
 
     #[test]
-    fn injection_rejects_duplicate_indices_and_mixed_messages() {
-        let mut signatures = signatures(QHashOut::from_values(1, 2, 3, 4));
-        signatures.signatures.push(signatures.signatures[0]);
-        signatures.member_indices.push(0);
-        assert!(validate_signatures(&signatures).is_err());
-        signatures.member_indices[1] = 1;
-        signatures.signatures[1] = self::signatures(QHashOut::from_values(4, 3, 2, 1)).signatures[0];
-        assert!(validate_signatures(&signatures).is_err());
+    fn injection_requires_two_distinct_current_indices_and_one_message() {
+        let (_, valid) = fixture(QHashOut::from_values(1, 2, 3, 4));
+        for indices in [vec![0], vec![0, 0], vec![2, 0], vec![0, 3]] {
+            let mut invalid = valid.clone();
+            invalid.member_indices = indices;
+            assert!(validate_signatures(&invalid).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid.signatures.pop();
+        invalid.member_indices.pop();
+        assert!(validate_signatures(&invalid).is_err());
+        let (_, other) = fixture(QHashOut::from_values(4, 3, 2, 1));
+        invalid = valid;
+        invalid.signatures[1] = other.signatures[1];
+        assert!(validate_signatures(&invalid).is_err());
     }
 
     #[test]
-    fn policy_preimages_are_required_only_for_generation() {
-        let signatures = signatures(QHashOut::from_values(1, 2, 3, 4));
-        let account = account(&signatures);
-        let mut user = MultisigUser::new(account.clone()).unwrap();
-        assert!(user.policies().is_err());
+    fn public_enrollment_identity_survives_signature_injection() {
+        let (account, signatures) = fixture(QHashOut::from_values(1, 2, 3, 4));
+        let identity = account.public_key_param().unwrap();
+        let mut user = MultisigUser::new(account).unwrap();
         user.inject_signatures(signatures).unwrap();
-        assert!(user.policies().is_err());
-        user.set_policy(account.initial_policy.clone(), account.initial_policy.clone()).unwrap();
-        let mut invalid = account.initial_policy.clone();
-        invalid.threshold = 0;
-        assert!(user.set_policy(invalid, account.initial_policy.clone()).is_err());
-        let (current, ending) = user.policies().unwrap();
-        assert_eq!(current.commitment().unwrap(), account.initial_policy.commitment().unwrap());
-        assert_eq!(ending.commitment().unwrap(), current.commitment().unwrap());
-    }
-
-    #[test]
-    fn signatures_must_meet_exact_current_threshold() {
-        let sighash = QHashOut::from_values(1, 2, 3, 4);
-        let signatures = signatures(sighash);
-        let mut policy = account(&signatures).initial_policy;
-        policy.member_hashes[1] = QHashOut::from_values(1, 0, 0, 0);
-        policy.member_count = 2;
-        policy.threshold = 2;
-        use plonky2::field::types::PrimeField64;
-        policy.member_hashes[..2].sort_by_key(|hash| hash.0.elements.map(|limb| limb.to_canonical_u64()));
-        assert!(policy.validate().is_ok());
-        assert!(validate_policy_signatures(&signatures, &policy, sighash).is_err());
+        assert_eq!(user.account().public_key_param().unwrap(), identity);
     }
 }

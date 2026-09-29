@@ -136,6 +136,8 @@ pub struct ContractConfig<F: RichField> {
     pub path: String,
     pub contract_name: String,
     pub method_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_state_tree_height: Option<u8>,
     #[serde(default)]
     pub deployer: String,
     #[serde(skip_serializing_if = "Option::is_none")]

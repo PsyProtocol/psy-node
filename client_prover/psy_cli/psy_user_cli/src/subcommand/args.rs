@@ -537,6 +537,24 @@ pub struct GenerateBatchProofMinerRewardProofsArgs {
 pub struct ClaimRewardsArgs {
     #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
+    /// Path to the aggregate network configuration
+    #[clap(long, env)]
+    pub aggregate_config: String,
+    /// psy-services URL
+    #[clap(long, env)]
+    pub services_url: String,
+    /// Ethereum reward recipient address
+    #[clap(long, env)]
+    pub recipient: String,
+    /// Reward owner user id on L2
+    #[clap(long, env)]
+    pub user_id: u64,
+    /// Path to the multisig account JSON file
+    #[clap(long, requires = "signatures", conflicts_with_all = ["private_key", "keystore_path", "wallet_password", "fingerprint"])]
+    pub multisig_account: Option<String>,
+    /// Path to the external multisig signatures JSON file
+    #[clap(long, requires = "multisig_account", conflicts_with_all = ["private_key", "keystore_path", "wallet_password", "fingerprint"])]
+    pub signatures: Option<String>,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
     /// Path to JSON file containing job IDs
@@ -881,18 +899,15 @@ pub struct DepositArgs {
 
 #[derive(Clone, Args)]
 pub struct ClaimWithdrawalArgs {
-    /// Psy RPC config file (for network name → deployment lookup)
+    /// Psy RPC config file
     #[clap(env, long, default_value = "config.json")]
     pub rpc_config: String,
+    /// Path to the aggregate network configuration
+    #[clap(long, env)]
+    pub aggregate_config: String,
     /// psy-services URL
     #[clap(long, env, default_value = "http://localhost:3000")]
     pub services_url: String,
-    /// L1 RPC URL
-    #[clap(long, env, default_value = "http://127.0.0.1:8545")]
-    pub l1_rpc_url: String,
-    /// L1 private key (required to submit the claim tx)
-    #[clap(long, short = 'p')]
-    pub private_key: String,
     /// L1 recipient address (20-byte EVM address or 32-byte hex; 20-byte
     /// inputs are auto-left-padded to bytes32)
     #[clap(long, env)]
@@ -913,14 +928,7 @@ pub struct ClaimWithdrawalArgs {
     /// chainId)
     #[clap(long = "destination-chain-index", alias = "destination-chain-id", env = "DESTINATION_CHAIN_INDEX")]
     pub destination_chain_index: u64,
-    /// Sender user id on L2; pass this to disambiguate identical withdrawals.
+    /// Sender user id on L2
     #[clap(long, env)]
-    pub sender_user_id: Option<u64>,
-    /// Prove-proxy URL for Groth16 proof generation (optional; if omitted, just
-    /// prints the proof)
-    #[clap(long, env)]
-    pub prove_proxy_url: Option<String>,
-    /// Prove-proxy bearer token (optional)
-    #[clap(long, env)]
-    pub prove_proxy_token: Option<String>,
+    pub sender_user_id: u64,
 }

@@ -182,9 +182,23 @@ where
     Ok(None)
 }
 
+pub(crate) async fn read_rpc_response(response: reqwest::Response, bounded: bool) -> anyhow::Result<String> {
+    if !bounded {
+        return Ok(response.text().await?);
+    }
+    let mut response = response.error_for_status()?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(chunk.len() <= 64 * 1024 * 1024 - body.len(), "RPC response exceeds 64 MiB");
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(body)?)
+}
+
 #[derive(Debug, Clone)]
 pub struct RpcProvider {
     pub client: Arc<Client>,
+    pub endpoint_clients: Option<HashMap<String, Arc<Client>>>,
     pub realm_configs: HashMap<u64, Vec<String>>,
     pub coordinator_configs: HashMap<u64, Vec<String>>,
     pub users_per_realm: u64,
@@ -192,6 +206,37 @@ pub struct RpcProvider {
 }
 
 impl RpcProvider {
+    pub fn new_with_endpoint_clients(
+        config: &psy_config::NetworkConfigGoldilocks,
+        endpoint_clients: HashMap<String, Arc<Client>>,
+    ) -> anyhow::Result<Self> {
+        let mut provider = Self::new_with_config(config)?;
+        provider.install_endpoint_clients(endpoint_clients)?;
+        Ok(provider)
+    }
+
+    pub fn install_endpoint_clients(&mut self, endpoint_clients: HashMap<String, Arc<Client>>) -> anyhow::Result<()> {
+        let urls: std::collections::HashSet<&str> = self.realm_configs.values()
+            .chain(self.coordinator_configs.values()).flatten().map(String::as_str).collect();
+        anyhow::ensure!(!urls.is_empty(), "Endpoint client routes are empty");
+        anyhow::ensure!(urls.len() == endpoint_clients.len() && urls.iter().all(|url| endpoint_clients.contains_key(*url)),
+            "Endpoint clients must exactly cover configured RPC URLs");
+        self.endpoint_clients = Some(endpoint_clients);
+        Ok(())
+    }
+
+    pub fn client_for_url(&self, rpc_url: &str) -> anyhow::Result<&Client> {
+        match &self.endpoint_clients {
+            Some(clients) => clients.get(rpc_url).map(Arc::as_ref)
+                .ok_or_else(|| anyhow::anyhow!("RPC URL has no approved endpoint client")),
+            None => Ok(self.client.as_ref()),
+        }
+    }
+
+    pub(crate) fn has_endpoint_clients(&self) -> bool {
+        self.endpoint_clients.is_some()
+    }
+
     pub fn new_with_config_path(config_path: &str) -> anyhow::Result<Self> {
         let psy_config = psy_config::PsyConfigGoldilocks::from_file(config_path)?;
         let network_config = psy_config.get_current_network()?;
@@ -235,6 +280,7 @@ impl RpcProvider {
 
         Ok(Self {
             client: Arc::new(client),
+            endpoint_clients: None,
             realm_configs,
             coordinator_configs,
             users_per_realm: config.users_per_realm,
@@ -251,8 +297,13 @@ macro_rules! psy_rpc_call {
                 request: $rpc_params,
                 id: Id::Number(1),
             };
-            let response = $instance.client.post($rpc_url).json(&request).send().await?;
-            let json_response: RpcResponse<String> = response.json().await?;
+            let rpc_url = $rpc_url;
+            let response = $instance.client_for_url(AsRef::<str>::as_ref(&rpc_url))?.post(rpc_url).json(&request).send().await?;
+            let json_response: RpcResponse<String> = if $instance.has_endpoint_clients() {
+                serde_json::from_str(&crate::provider::read_rpc_response(response, true).await?)?
+            } else {
+                response.json().await?
+            };
             match json_response.result {
                 ResponseResult::Success(s) => {
                     tracing::info!("{:?}", s);
@@ -283,13 +334,15 @@ macro_rules! psy_rpc_call_back {
                 Err(_) => "<serialize-request-failed>".to_string(),
             };
             tracing::info!("psy rpc call: {}", url_str);
+            let client = $instance.client_for_url(AsRef::<str>::as_ref(&url_str))?;
             #[cfg(not(target_arch = "wasm32"))]
-            let request_builder = $instance
-                .client
-                .post(url_str.clone())
-                .timeout(std::time::Duration::from_secs(360));
+            let request_builder = if $instance.has_endpoint_clients() {
+                client.post(url_str.clone())
+            } else {
+                client.post(url_str.clone()).timeout(std::time::Duration::from_secs(360))
+            };
             #[cfg(target_arch = "wasm32")]
-            let request_builder = $instance.client.post(url_str.clone());
+            let request_builder = client.post(url_str.clone());
 
             let result = request_builder
                 .json(&request_payload)
@@ -299,10 +352,7 @@ macro_rules! psy_rpc_call_back {
             match result {
                 Ok(response) => {
                     let status = response.status();
-                    let body = response
-                        .text()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?;
+                    let body = crate::provider::read_rpc_response(response, $instance.has_endpoint_clients()).await?;
 
                     match serde_json::from_str::<RpcResponse<$ret_ty>>(&body) {
                         Ok(parsed) => Ok(parsed),
@@ -312,7 +362,7 @@ macro_rules! psy_rpc_call_back {
                                 method = %method_name,
                                 status = %status,
                                 body_len = body.len(),
-                                body = %body,
+                                body = %if $instance.has_endpoint_clients() { "<redacted>" } else { body.as_str() },
                                 error = %e,
                                 "[RPC_DECODE_FAIL] failed to parse JSON-RPC response body"
                             );
@@ -512,6 +562,7 @@ impl RpcProvider {
     pub fn with_user_id_owned(&self, user_id: u64) -> Self {
         Self {
             client: self.client.clone(),
+            endpoint_clients: self.endpoint_clients.clone(),
             realm_configs: self.realm_configs.clone(),
             coordinator_configs: self.coordinator_configs.clone(),
             users_per_realm: self.users_per_realm,
@@ -1122,6 +1173,20 @@ where
     pub proof_proxy_url: String,
     pub common_circuits_data: LocalCommonCircuitsData<C::F>,
     pub _marker: PhantomData<C>,
+}
+
+impl<C: GenericConfig<D> + 'static, const D: usize> ProveProxyRpcProvider<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    fn client_for_url(&self, rpc_url: &str) -> anyhow::Result<&Client> {
+        anyhow::ensure!(rpc_url == self.proof_proxy_url, "Unexpected proof proxy URL");
+        Ok(self.client.as_ref())
+    }
+
+    fn has_endpoint_clients(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2169,6 +2234,75 @@ mod tests {
 
     use super::*;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn bounded_rpc_reader_rejects_oversized_chunked_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..65 {
+                if stream.write_all(b"100000\r\n").and_then(|_| stream.write_all(&chunk)).and_then(|_| stream.write_all(b"\r\n")).is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::builder().no_proxy().timeout(Duration::from_secs(10)).build().unwrap();
+        let response = client.get(format!("http://{}", address)).send().await.unwrap();
+        let error = read_rpc_response(response, true).await.unwrap_err();
+        assert!(error.to_string().contains("exceeds 64 MiB"));
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn injected_rpc_preserves_client_deadline() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let client = Arc::new(Client::builder().no_proxy().timeout(Duration::from_millis(30)).build().unwrap());
+        let provider = RpcProvider {
+            client: client.clone(), endpoint_clients: Some(HashMap::from([(url.clone(), client)])),
+            realm_configs: HashMap::new(), coordinator_configs: HashMap::from([(0, vec![url])]),
+            users_per_realm: 1, current_user_id: 0,
+        };
+        let result = tokio::time::timeout(Duration::from_millis(300), provider.get_user_ids_for_public_key(QHashOut::ZERO)).await;
+        assert!(result.expect("injected deadline was overridden").is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_clients_reject_missing_extra_and_unknown_routes() {
+        let client = Arc::new(Client::new());
+        let mut provider = RpcProvider {
+            client: client.clone(), endpoint_clients: None,
+            realm_configs: HashMap::from([(1, vec!["https://node/realm".to_string()])]),
+            coordinator_configs: HashMap::from([(0, vec!["https://node/coordinator".to_string()])]),
+            users_per_realm: 1, current_user_id: 0,
+        };
+        let mut clients = HashMap::from([("https://node/realm".to_string(), client.clone())]);
+        assert!(provider.install_endpoint_clients(clients.clone()).is_err());
+        clients.insert("https://node/coordinator".to_string(), client.clone());
+        provider.install_endpoint_clients(clients.clone()).unwrap();
+        assert!(provider.client_for_url("https://node/realm").is_ok());
+        assert!(provider.client_for_url("https://node/realm/").is_err());
+        assert!(provider.client_for_url("https://node/other").is_err());
+        clients.insert("https://node/other".to_string(), client);
+        assert!(provider.install_endpoint_clients(clients).is_err());
+        assert!(provider.with_user_id_owned(1).client_for_url("https://node/other").is_err());
+    }
+
     fn rpc_error(code: crate::request::ErrorCode, message: &'static str) -> crate::request::RpcError {
         crate::request::RpcError {
             code,
@@ -2246,6 +2380,7 @@ mod tests {
         let realm_urls = vec!["http://edge-0".to_string(), "http://edge-1".to_string()];
         let provider = RpcProvider {
             client: Arc::new(Client::new()),
+            endpoint_clients: None,
             realm_configs: HashMap::from([(1, realm_urls.clone())]),
             coordinator_configs: HashMap::from([(0, vec!["http://coordinator".to_string()])]),
             users_per_realm: 1_048_576,

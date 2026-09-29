@@ -82,11 +82,13 @@ A plain `psy_user_cli deposit` is an L1 transaction and is **not** an EndCap. `c
 
 ## 2. Start and Prove Readiness
 
-Use only the repository lifecycle targets. In a dedicated supervisor terminal:
+**Guardian launch prerequisite — current quality assurance (QA) pending.** Set `PSY_GUARDIAN_CONFIG` to the provisioned Guardian client JSON path before selecting the relayer. Relative paths resolve against the repository root; the launcher writes the resolved path into the daemon's top-level `guardian_config`. A launcher `--env` assignment overrides the inherited environment. Preflight validates the public JSON and scoped nested paths before automatic setup or purge, without reading nested credentials. There is no L2 single-key fallback. Guardian credentials, authorization, registration, bootstrap, and retained history remain operator prerequisites; no current launch or bridge execution pass is claimed here. Sources: `dev/locSetupV4.ts:3243-3297,4921,5895-5897`.
+
+Use only the repository lifecycle targets. The purge below is for a fresh disposable devnet, not archive recovery; do not run it against a retained Guardian account or its history. For recovery, follow the complete-archive restoration procedure below and the state-preserving lifecycle guide. In a dedicated supervisor terminal for a fresh devnet:
 
 ```bash
 PURGE=1 make shutdown
-make run-all
+PSY_GUARDIAN_CONFIG='<guardian-client-json>' make run-all
 ```
 
 Keep `make run-all` in the foreground; it intentionally remains alive as the service supervisor (`Makefile:64-67`, `dev/locSetupV4.ts:5630-5635`). Run readiness checks and every later command from a second terminal whose current directory is `<repo-root>`. Do not background or abandon the supervisor. The supervisor truncates the relayer logs for this initial launch (`dev/locSetupV4.ts:649-658,4542-4549`), so the marker below belongs to the current process. Do not continue until all checks below succeed:
@@ -107,7 +109,7 @@ grep -a 'bridge relayer started' logs/bridge_relayer_errs.txt
 
 The setup waits for services health and recognizes the stable relayer marker `bridge relayer started` (`dev/locSetupV4.ts:1141-1144,3676-3677,4418-4424`). Coordinator and realm RPC methods use the `psy_` prefix (`client_prover/psy_provider/src/request.rs:68-100`).
 
-`make run-all` generates `local_checkpoints/bridge_proposer/daemon.toml` and starts the current relayer daemon through this CLI surface (`dev/locSetupV4.ts:4519-4551`):
+The lifecycle owns the daemon launch through this command surface. It generates `local_checkpoints/bridge_proposer/daemon.toml` with `guardian_config` from the validated `PSY_GUARDIAN_CONFIG` path, retaining separate L1 signing configuration (`dev/locSetupV4.ts:4915-4944`):
 
 ```bash
 ./target/release/psy_relayer_cli \
@@ -115,6 +117,75 @@ The setup waits for services health and recognizes the stable relayer marker `br
 ```
 
 The lifecycle target owns that process. The command is shown to identify the active `psy_relayer_cli` surface; do not launch a second copy. The relayer does not support `--result-file`; its durable operational state is `local_checkpoints/bridge_proposer/daemon_state.toml`, its stdout log is `logs/bridge_relayer_logs.txt`, and tracing markers are in `logs/bridge_relayer_errs.txt` (`dev/locSetupV4.ts:3832-3837`, `psy_cli/psy_relayer_cli/src/main.rs:23-31`, `psy_cli/psy_relayer_cli/src/bridge/daemon.rs:568-599`).
+
+### Guardian configuration and enrollment
+
+The daemon TOML requires `guardian_config: String`, a path to the Guardian client JSON file; `relayer_wallet` and `append_wallet` are not L2 signing configuration. Keep the existing L1 transaction configuration separate. The following table gives the complete serialized Guardian client schema; `config_dir` is internal and is not a JSON field (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:99`; `psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:14-45`).
+
+| JSON field | Type and requirement |
+|---|---|
+| `authorization_path` | Relative path to the active immutable authorization file selected by the authorization index. |
+| `authorization_archive_path` | Relative path to the locally provisioned immutable authorization archive. |
+| `authorization_index_path` | Relative path to the version/hash index for that archive. |
+| `archive_path` | Relative path to the full relayer session archive. |
+| `endpoints` | Exactly three distinct HTTPS origins, without credentials, query, fragment, or a path other than `/`. |
+| `tls_identity_path` | Relative path to the client identity PEM used for mutual TLS when requesting Guardian signatures. |
+| `server_ca_path` | Relative path to the trusted Guardian server certificate authority PEM; built-in roots are disabled. |
+| `l1_endpoints` | Array of objects with `chain_index: u8` and `rpc_url: String`, identifying configured L1 evidence endpoints. |
+| `listen_address` | String specifying the relayer history listener address. |
+| `history_tls_certificate_path` | Relative path to the history listener certificate PEM. |
+| `history_tls_private_key_path` | Relative path to the history listener private-key PEM. |
+| `history_client_ca_path` | Relative path to the history client certificate authority PEM. |
+| `allowed_client_certificate_sha256` | Array of permitted client-certificate SHA-256 hashes, each encoded as `0x` followed by 64 lowercase hexadecimal characters. |
+
+TLS means Transport Layer Security; PEM is the certificate/key text encoding. Every configured file path is relative to the Guardian client JSON directory, contains only normal path components, and must not traverse with `..`. Protected configuration, authorization, and certificate/key files must be regular files owned by the process effective user with mode `0600`; parent directories must be owned by root or that user and not writable by group or others. Symbolic-link traversal is rejected. Provision actual deployment values and protected files outside this document; do not place signing keys in the relayer configuration. Sources: `psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:35-93`; `psy_cli/psy_relayer_cli/src/guardian/runtime.rs:19-58`.
+
+Each authorization's `ApprovedContract` retains the whole compiled artifact, including its ABI, as `compiler_artifact_json` and pins the SHA-256 of that exact UTF-8 text in `compiler_artifact_sha256`. It also retains the approved contract leaf. The artifact uses the current ABI 2.0.0; a canonical layout root or separately supplied map metadata is not a substitute for this approval. Source: `psy_cli/psy_relayer_cli/src/guardian/protocol.rs:150-185`.
+
+The Guardian validates configured active realms against the compiled realm capacity; it does not require endpoints for all 4096 possible realms. Realm identifiers must be distinct and in range, and every configured route must have its approved endpoint pin. The bridge user 524288 and every actual withdrawal burn sender need configured, approved realm routes. Missing sender routing fails closed rather than falling back to another realm. Sources: `psy_cli/psy_relayer_cli/src/guardian/runtime.rs:211-240`; `client_prover/psy_provider/src/provider.rs:954-974`.
+
+These are the implemented command forms, not instructions to run them concurrently. Replace angle-bracket arguments with provisioned relative file paths or approved public JSON. Run each Guardian service under its own lifecycle supervision; run account-mutating commands serially with the daemon stopped. Bootstrap and policy replacement also bind the configured history listener, so another process must not already own that listener.
+
+```bash
+./target/release/psy_relayer_cli guardian-service \
+  --runtime-config '<guardian-runtime-json>'
+
+./target/release/psy_relayer_cli guardian-policy \
+  --rpc-config '<network-config-json>' \
+  --guardian-config '<guardian-client-json>' \
+  --intent register \
+  --exclusive-registration-intake
+
+./target/release/psy_relayer_cli guardian-policy \
+  --rpc-config '<network-config-json>' \
+  --guardian-config '<guardian-client-json>' \
+  --intent bootstrap
+
+./target/release/psy_relayer_cli guardian-policy \
+  --rpc-config '<network-config-json>' \
+  --guardian-config '<guardian-client-json>' \
+  --intent replace \
+  --next-members-json '<JSON-array-of-three-approved-QHashOut-member-commitments>'
+```
+
+The Guardian service runtime JSON is a separate `GuardianRuntimeConfig`, not the client schema above (`psy_cli/psy_relayer_cli/src/guardian/protocol.rs:183-194`). Bootstrap obtains the initial members from the approved account authorization; it has no `--next-members-json` flag. Replacement accepts the JSON array directly, not a filename, and requires two current-member approvals. Command definitions and dispatch: `psy_cli/psy_relayer_cli/src/main.rs:41-54,84-89,188-212`; history listener and policy calls: `psy_cli/psy_relayer_cli/src/bridge/daemon.rs:2934-2948`.
+
+Before enrollment, the operator must exclusively control and drain registration intake, then maintain exclusive intake until inclusion. `--exclusive-registration-intake` acknowledges this assumption; it does not provide a server lock or compare-and-set. Enrollment targets registration index 2/user 524288, submits once, and checks canonical inclusion and the exact public-key mapping. An ambiguous submission error or raced index can leave a queued submission or a registration at another index. Do not automatically resubmit or assume rollback; inspect canonical state before manual action. See [mutable multisig interfaces](../sdkeys/signature-schemes.md#wallet-and-remote-procedure-call-interfaces).
+
+### Restore the complete Guardian archive
+
+Stop all account writers before backup or restoration. Retain and restore the entire directory named by `archive_path`, not only daemon counters or the newest nonce. Preserve every existing file byte-for-byte:
+
+| Archive entry | Retained content |
+|---|---|
+| `<nonce>/request.json` | Original request UTF-8 bytes, including the original trace JSON text. Do not parse and rewrite it. |
+| `<nonce>/signatures.json` | The selected two signatures and their sorted member indices. |
+| `<nonce>/endcap.bin` | Serialized prover output retained for the same request. |
+| `<nonce>/included.json` | Canonical session record for that nonce. |
+| `pending.json` | The unresolved request when present; preserve it until the normal inclusion path resolves it. |
+| `account.lock` | Runtime account lock file; restoring a file does not restore a process lock. Only one writer acquires the lock after restart. |
+
+An unfinished nonce does not yet have every completion artifact; do not fabricate missing files. Restore the locally provisioned immutable authorization archive and its version/hash index with the session archive, preserving the active authorization selection and protected-file permissions. A missing canonical history prefix fails closed with `HistoryUnavailable`; service offsets or daemon counters do not reconstruct authorization history. Do not purge the archive, rewrite requests, discard pending work, or register a replacement identity to bypass recovery. The daemon reconciles retained pending work on restart. Sources: `psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:48-56,149-240,250-262`; `psy_cli/psy_relayer_cli/src/bridge/daemon.rs:762-767`. Current QA for configuration, enrollment, history restoration, and restart remains pending.
 
 ## 3. Discover This Startup's Addresses
 

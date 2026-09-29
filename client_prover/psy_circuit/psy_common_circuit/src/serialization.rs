@@ -6,15 +6,10 @@
 //! `add_psy_type_b_common_gates`, which covers the UPS network circuits) need a
 //! serializer that also registers that custom gate and its generator.
 //!
-//! `PsyGateSerializer` / `PsyGeneratorSerializer` are supersets of the plonky2
-//! defaults plus the Psy `ComparisonGate` / `ComparisonGenerator`. They are the
-//! drop-in replacement for the `Default*` serializers used by
-//! `PsyBasicZKSignatureCircuit` when the serialized circuit contains
-//! comparisons.
-//!
-//! NOTE: this covers the UPS family only. The CFC contract-function circuits
-//! (DPN VM) additionally emit the full u32 + secp256k1 generator suite and need
-//! a wider registry; see the gate/generator inventory before extending this.
+//! Existing gate tags remain stable. The gate registry also covers the client
+//! secp256k1 and shared Keccak gates used by reward common-data serialization.
+//! The generator registry remains limited to stock generators and Comparison;
+//! this does not enable full secp256k1 prover-data serialization.
 
 use core::marker::PhantomData;
 
@@ -56,8 +51,11 @@ use plonky2::{
 };
 
 use crate::u32::gates::comparison::{ComparisonGate, ComparisonGenerator};
+use crate::u32::gates::{add_many_u32::U32AddManyGate, arithmetic_u32::U32ArithmeticGate, subtraction_u32::U32SubtractionGate, range_check_u32::U32RangeCheckGate};
+use psy_plonky2_basic_helpers::u32::gates::{arithmetic_u32::U32ArithmeticGate as SharedU32ArithmeticGate, subtraction_u32::U32SubtractionGate as SharedU32SubtractionGate, interleave_u32::U32InterleaveGate, uninterleave_to_b32::UninterleaveToB32Gate, uninterleave_to_u32::UninterleaveToU32Gate};
+use psy_plonky2_basic_helpers::u32::gates::comparison::ComparisonGate as SharedComparisonGate;
 
-/// Gate serializer: all plonky2 default gates + Psy `ComparisonGate`.
+/// Append-only gate registry for existing UPS and reward common data.
 #[derive(Debug)]
 pub struct PsyGateSerializer;
 
@@ -80,7 +78,17 @@ impl<F: RichField + Extendable<D>, const D: usize> GateSerializer<F, D> for PsyG
         RandomAccessGate<F, D>,
         ReducingExtensionGate<D>,
         ReducingGate<D>,
-        ComparisonGate<F, D>
+        ComparisonGate<F, D>,
+        U32ArithmeticGate<F, D>,
+        U32AddManyGate<F, D>,
+        U32SubtractionGate<F, D>,
+        U32RangeCheckGate<F, D>,
+        SharedU32ArithmeticGate<F, D>,
+        SharedU32SubtractionGate<F, D>,
+        U32InterleaveGate,
+        UninterleaveToB32Gate,
+        UninterleaveToU32Gate,
+        SharedComparisonGate<F, D>
     }
 }
 
@@ -364,5 +372,57 @@ mod tests {
             "zk-sign inner timing: build() {:.3?} | compact rebuild {:.3?} ({:.2}x)",
             build_time, rebuild_time, speedup
         );
+    }
+}
+
+#[cfg(test)]
+mod reward_common_tests {
+    use super::*;
+    use plonky2::{field::goldilocks_field::GoldilocksField as F, gates::gate::GateRef, plonk::{circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CommonCircuitData}, config::PoseidonGoldilocksConfig as C}, util::serialization::Buffer};
+
+    #[test]
+    fn existing_gate_tags_remain_decodable() {
+        let serializer = PsyGateSerializer;
+        let config = CircuitConfig::standard_recursion_config();
+        let common = CircuitBuilder::<F, 2>::new(config).build::<C>().common;
+        for (gate, tag) in [(GateRef::new(NoopGate), 9u32), (GateRef::new(ComparisonGate::<F, 2>::new(32, 16)), 16u32)] {
+            let mut bytes = Vec::new();
+            serializer.write_gate(&mut bytes, &gate, &common).unwrap();
+            assert_eq!(&bytes[..4], &tag.to_le_bytes());
+            let restored = serializer.read_gate(&mut Buffer::new(&bytes), &common).unwrap();
+            assert_eq!(restored, gate);
+        }
+    }
+
+    #[test]
+    fn shared_comparison_preserves_its_concrete_type() {
+        let serializer = PsyGateSerializer;
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        builder.add_gate(SharedComparisonGate::<F, 2>::new(32, 16), vec![]);
+        let common = builder.build::<C>().common;
+        let bytes = common.to_bytes(&serializer).unwrap();
+        let restored = CommonCircuitData::<F, 2>::from_bytes(bytes.clone(), &serializer).unwrap();
+        assert!(restored.gates.iter().any(|gate| gate.0.as_any().is::<SharedComparisonGate<F, 2>>()));
+        assert_eq!(restored.to_bytes(&serializer).unwrap(), bytes);
+        let shared = GateRef::new(SharedComparisonGate::<F, 2>::new(32, 16));
+        let mut bytes = Vec::new();
+        serializer.write_gate(&mut bytes, &shared, &common).unwrap();
+        assert_eq!(&bytes[..4], &26u32.to_le_bytes());
+        let decoded = serializer.read_gate(&mut Buffer::new(&bytes), &common).unwrap();
+        assert!(decoded.0.as_any().is::<SharedComparisonGate<F, 2>>());
+    }
+
+    #[test]
+    fn secp_and_keccak_common_data_round_trips() {
+        use crate::crypto::secp256k1::gadget::Secp256K1Gadget;
+        use plonky2::hash::poseidon::PoseidonHash;
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        Secp256K1Gadget::add_virtual_to_eth_personal_sign::<PoseidonHash, F, 2>(&mut builder);
+        let common = builder.build::<C>().common;
+        let serializer = PsyGateSerializer;
+        let bytes = common.to_bytes(&serializer).unwrap();
+        let restored = CommonCircuitData::<F, 2>::from_bytes(bytes.clone(), &serializer).unwrap();
+        assert_eq!(restored, common);
+        assert_eq!(restored.to_bytes(&serializer).unwrap(), bytes);
     }
 }

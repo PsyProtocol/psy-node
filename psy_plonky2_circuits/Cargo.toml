@@ -50,6 +50,10 @@ psy_serialize = { workspace = true }
 pser = { workspace = true }
 psy_common_circuit = { workspace = true }
 psy_crypto = { workspace = true }
+psy_client_data = { workspace = true, default-features = false }
+psy_ups_circuit = { workspace = true, default-features = false }
+psy_vm = { workspace = true, default-features = false }
+psy_network_circuit = { workspace = true, default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 jsonrpsee = { workspace = true }

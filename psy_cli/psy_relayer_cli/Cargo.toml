@@ -13,12 +13,14 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-reqwest = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time"] }
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "net", "io-util", "sync", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-postgres = "0.7"
+redb = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
 tiny-keccak = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-provider = { workspace = true }
@@ -57,3 +59,15 @@ psy_crypto = { workspace = true }
 psy_ups_circuit = { workspace = true }
 bincode = { workspace = true }
 futures = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+zeroize = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+k256 = { workspace = true }

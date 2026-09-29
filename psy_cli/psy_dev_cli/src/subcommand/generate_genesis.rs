@@ -12,8 +12,10 @@ use plonky2::{
     field::goldilocks_field::GoldilocksField,
     hash::poseidon::PoseidonHash,
 };
-use psy_cli_common::key_utils::{load_wallet_key_info, WalletSourceArgs};
-use psy_client_common::args::SignType;
+use plonky2::field::types::Field64;
+use psy_ups_circuit::signature::multisig::MultisigSignatureCircuit;
+use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy};
+use psy_client_common::data::qhashout::QHashOut as ClientHash;
 use psy_core::{
     constants::protocol::DA_CHALLENGE_WINDOW,
     user_id::{UserIdBitsStrategy5, UserIdGeneratorStrategy},
@@ -73,26 +75,13 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "genesis-contracts")]
     pub genesis_contracts: Option<PathBuf>,
 
-    /// Encrypted UTC JSON for the relayer registration. First set of PSY_BRIDGE_RELAYER_KEYSTORE_PATH, BRIDGE_RELAYER_KEYSTORE_PATH, KEYSTORE_PATH wins.
-    #[arg(long = "keystore-path", env = "KEYSTORE_PATH")]
-    pub keystore_path: Option<String>,
+    /// Public initial two-of-three account JSON; never a signer secret.
+    #[arg(long = "relayer-multisig-account")]
+    pub relayer_multisig_account: PathBuf,
 
-    #[arg(long = "psy-bridge-relayer-keystore-path", env = "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", hide = true)]
-    pub psy_bridge_relayer_keystore_path: Option<String>,
-
-    #[arg(long = "bridge-relayer-keystore-path", env = "BRIDGE_RELAYER_KEYSTORE_PATH", hide = true)]
-    pub bridge_relayer_keystore_path: Option<String>,
-
-    /// Decrypts the UTC JSON. Required when a keystore path is used.
-    #[arg(long = "wallet-password", env = "WALLET_PASSWORD")]
-    pub wallet_password: Option<String>,
-
-    /// Hex Poseidon secret for the relayer registration. Ignored when a set keystore env/flag is present.
-    #[arg(long = "private-key", env = "PRIVATE_KEY")]
-    pub private_key: Option<String>,
-
-    #[arg(long = "bridge-relayer-l2-private-key", env = "BRIDGE_RELAYER_L2_PRIVATE_KEY", hide = true)]
-    pub bridge_relayer_l2_private_key: Option<String>,
+    /// Approved local compiler multisig_policy artifact, including its ABI.
+    #[arg(long = "multisig-policy-artifact")]
+    pub multisig_policy_artifact: PathBuf,
 
     /// Dense registration index of the bridge relayer.
     #[arg(long = "relayer-registration-id", default_value_t = 2)]
@@ -169,34 +158,6 @@ pub async fn run(args: GenerateGenesisDataArgs) -> anyhow::Result<()> {
     generate_local_devnet_genesis(&args)
 }
 
-fn read_trimmed(raw: Option<String>) -> Option<String> {
-    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
-fn require_existing_keystore_file(name: &str, path: String) -> anyhow::Result<String> {
-    ensure!(
-        Path::new(&path).exists(),
-        "{name} is set to {path} but that file does not exist"
-    );
-    Ok(path)
-}
-
-fn resolve_set_keystore_path(
-    psy_bridge: Option<String>,
-    bridge: Option<String>,
-    keystore: Option<String>,
-) -> anyhow::Result<Option<String>> {
-    for (name, path) in [
-        ("PSY_BRIDGE_RELAYER_KEYSTORE_PATH", psy_bridge),
-        ("BRIDGE_RELAYER_KEYSTORE_PATH", bridge),
-        ("KEYSTORE_PATH", keystore),
-    ] {
-        if let Some(path) = path {
-            return Ok(Some(require_existing_keystore_file(name, path)?));
-        }
-    }
-    Ok(None)
-}
 
 fn deterministic_private_key(slot: u64) -> QHashOut<F> {
     QHashOut::from_values(
@@ -207,54 +168,185 @@ fn deterministic_private_key(slot: u64) -> QHashOut<F> {
     )
 }
 
-fn resolve_bridge_relayer_private_key(args: &GenerateGenesisDataArgs) -> anyhow::Result<Option<QHashOut<F>>> {
-    let set_keystore = resolve_set_keystore_path(
-        read_trimmed(args.psy_bridge_relayer_keystore_path.clone()),
-        read_trimmed(args.bridge_relayer_keystore_path.clone()),
-        read_trimmed(args.keystore_path.clone()),
-    )?;
-    let private_key = if set_keystore.is_some() {
-        None
-    } else {
-        read_trimmed(args.private_key.clone())
-            .or_else(|| read_trimmed(args.bridge_relayer_l2_private_key.clone()))
-    };
-    let keystore_path = match set_keystore {
-        Some(path) => Some(path),
-        None if private_key.is_none() => std::env::var("HOME").ok().and_then(|home| {
-            let default = format!("{home}/.psy/keystore/bridge-relayer");
-            Path::new(&default).exists().then_some(default)
-        }),
-        None => None,
-    };
-    if private_key.is_none() && keystore_path.is_none() {
-        return Ok(None);
+fn decode_relayer_multisig_account(bytes: &[u8]) -> anyhow::Result<MultisigAccount> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicPolicy {
+        version: u32,
+        threshold: u8,
+        member_count: u8,
+        member_hashes: [ClientHash<F>; 8],
     }
-    let wallet_args = WalletSourceArgs {
-        sign_type: SignType::ZKSign,
-        private_key,
-        keystore_path,
-        wallet_password: read_trimmed(args.wallet_password.clone()),
-        fingerprint: None,
-        sd_key_allowed_contract_id: args.sd_key_allowed_contract_ids.clone(),
-        sd_key_allowed_method_id: args.sd_key_allowed_method_ids.clone(),
-        sd_key_expected_tx_count: args.sd_key_expected_tx_count,
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicAccount {
+        contract_id: u32,
+        initial_policy: PublicPolicy,
+    }
+    let input: PublicAccount = serde_json::from_slice(bytes).context("invalid public multisig account")?;
+    let account = MultisigAccount {
+        contract_id: input.contract_id,
+        initial_policy: MultisigPolicy {
+            version: input.initial_policy.version,
+            threshold: input.initial_policy.threshold,
+            member_count: input.initial_policy.member_count,
+            member_hashes: input.initial_policy.member_hashes,
+        },
     };
-    let info = load_wallet_key_info(&wallet_args, false)?;
-    Ok(Some(QHashOut::<F>::from_str(&info.private_key.to_string())?))
+    account.public_key_param()?;
+    Ok(account)
 }
 
-fn load_contracts(path: &Path) -> anyhow::Result<Vec<PQBCDeployContract<QHashOut<F>>>> {
+fn read_public_input(repo_root: &Path, path: &Path) -> anyhow::Result<Vec<u8>> {
+    ensure!(!path.as_os_str().is_empty(), "public input path must not be empty");
+    let path = repo_root.join(path);
+    ensure!(path.is_file(), "public input {} must be an existing regular file", path.display());
+    std::fs::read(&path).with_context(|| format!("reading public input {}", path.display()))
+}
+
+fn initialized_multisig_user(
+    account: &MultisigAccount,
+    circuit: &MultisigSignatureCircuit,
+    initial_fee_balance: u64,
+) -> anyhow::Result<PsyCompactUserDefinition<Hash>> {
+    ensure!(initial_fee_balance > 0 && initial_fee_balance < F::ORDER, "initial fee balance must be nonzero and canonical");
+    let public_key_info = PZKPublicKeyInfo {
+        fingerprint: QHashOut(circuit.get_fingerprint().0),
+        public_key_param: QHashOut(account.public_key_param()?.0),
+    };
+    let mut policy_slots = vec![MerkleLeafNode { index: 0, value: QHashOut::from_values(1, 2, 3, 0) }];
+    policy_slots.extend(account.initial_policy.member_hashes[..3].iter().enumerate().map(|(index, member)| {
+        MerkleLeafNode { index: index as u64 + 1, value: QHashOut(member.0) }
+    }));
+    Ok(PsyCompactUserDefinition {
+        public_key_info, balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0,
+        constract_state_tree_records: vec![
+            MerkleNodeNest { parent_index: 0, children: vec![MerkleLeafNode {
+                index: 0, value: QHashOut::from_values(initial_fee_balance, 0, 0, 0),
+            }] },
+            MerkleNodeNest { parent_index: u64::from(account.contract_id), children: policy_slots },
+        ],
+    })
+}
+
+fn validate_multisig_policy_artifact(
+    contracts: &[PQBCDeployContract<Hash>],
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    use psy_client_data::config::store_config::{C, D};
+    use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
+    #[derive(serde::Deserialize)]
+    struct PolicyArtifact {
+        state_tree_height: u16,
+        circuit_definitions: Vec<DPNFunctionCircuitDefinition>,
+        abi: serde_json::Value,
+    }
+    let artifact: PolicyArtifact = serde_json::from_slice(bytes).context("invalid multisig policy compiler artifact")?;
+    ensure!(artifact.state_tree_height == 4, "multisig policy artifact must declare height 4");
+    ensure!(artifact.circuit_definitions.len() == 2
+        && ["get_policy", "set_policy"].iter().all(|name| artifact.circuit_definitions.iter().filter(|definition| definition.name == *name).count() == 1),
+        "multisig policy artifact requires exactly get_policy and set_policy");
+    ensure!(artifact.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64) == Some(4),
+        "multisig policy ABI must declare height 4");
+    let methods = artifact.abi.pointer("/contract/methods").and_then(serde_json::Value::as_array)
+        .context("multisig policy ABI methods are missing")?;
+    ensure!(methods.len() == 2, "multisig policy ABI must declare two methods");
+    for definition in &artifact.circuit_definitions {
+        let mut matches = methods.iter().filter(|method| method["name"].as_str() == Some(definition.name.as_str()));
+        let method = matches.next().context("multisig policy ABI method is missing")?;
+        ensure!(matches.next().is_none(), "multisig policy ABI method is duplicated");
+        ensure!(method["method_id"].as_u64() == Some(u64::from(definition.method_id))
+            && method["input_felt_count"].as_u64() == Some(definition.circuit_inputs.len() as u64)
+            && method["output_felt_count"].as_u64() == Some(definition.circuit_outputs.len() as u64)
+            && method["state_mutability"].as_str() == Some(if definition.is_view_function() { "view" } else { "external" }),
+            "multisig policy ABI differs from compiled method");
+    }
+    validate_policy_abi_slots(&artifact.abi)?;
+    let contract = contracts.get(6).context("Genesis contracts must contain multisig policy contract 6")?;
+    ensure!(contract.code_definition.state_tree_height == 4, "Genesis policy contract must declare height 4");
+    let (_, expected) = psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<C, D>(
+        ClientHash(contract.deployer.0), 4, &artifact.circuit_definitions,
+    )?;
+    let expected: PQBCDeployContract<Hash> = serde_json::from_value(serde_json::to_value(expected)?)?;
+    ensure!(contract == &expected, "Genesis policy code/functions differ from approved compiler artifact");
+    Ok(())
+}
+
+fn validate_policy_abi_slots(abi: &serde_json::Value) -> anyhow::Result<()> {
+    ensure!(abi["schema_version"].as_str() == Some("2.0.0"), "multisig policy requires ABI 2.0.0");
+    let fields = abi.pointer("/contract/state").and_then(serde_json::Value::as_array)
+        .context("multisig policy ABI state is missing")?;
+    let hash_type = serde_json::json!({"kind":"primitive","name":"Hash"});
+    let members_type = serde_json::json!({"kind":"array","item":hash_type,"length":3,"item_felt_size":4});
+    ensure!(fields.len() == 2 && fields[0]["name"].as_str() == Some("header")
+        && fields[0]["offset"].as_u64() == Some(0) && fields[0]["felt_size"].as_u64() == Some(4)
+        && fields[0]["type"] == hash_type
+        && fields[1]["name"].as_str() == Some("members") && fields[1]["offset"].as_u64() == Some(4)
+        && fields[1]["felt_size"].as_u64() == Some(12) && fields[1]["type"] == members_type,
+        "multisig policy ABI must expose header and three members at slots 0 through 3");
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct GenesisContractsArtifactStamp {
+    compiler_revision: String,
+    compiler_sources_hash: String,
+    artifact_sha256: String,
+    artifact_byte_size: u64,
+    token_artifact_sha256: String,
+    token_artifact_byte_size: u64,
+    token_update_artifact_sha256: String,
+    token_update_artifact_byte_size: u64,
+}
+
+fn validate_contracts_stamp(bytes: &[u8], bundle: &[u8]) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    ensure!(bytes.len() <= 65_536, "Genesis compiler stamp exceeds 65536 bytes");
+    let stamp: GenesisContractsArtifactStamp = serde_json::from_slice(bytes).context("invalid Genesis compiler stamp")?;
+    for (value, length) in [(&stamp.compiler_revision, 40), (&stamp.compiler_sources_hash, 64),
+        (&stamp.artifact_sha256, 64), (&stamp.token_artifact_sha256, 64), (&stamp.token_update_artifact_sha256, 64)] {
+        ensure!(value.len() == length && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "Genesis compiler stamp requires lowercase fixed-width hexadecimal identities");
+    }
+    let _ = (stamp.token_artifact_byte_size, stamp.token_update_artifact_byte_size);
+    ensure!(stamp.artifact_byte_size == u64::try_from(bundle.len())?, "Genesis compiler stamp byte size mismatch");
+    ensure!(stamp.artifact_sha256 == hex::encode(Sha256::digest(bundle)), "Genesis compiler stamp SHA-256 mismatch");
+    Ok(())
+}
+
+fn load_contracts(path: &Path) -> anyhow::Result<Vec<PQBCDeployContract<Hash>>> {
+    use std::io::Read;
     let genesis_bytes = std::fs::read(path)
         .with_context(|| format!("reading genesis contracts {}", path.display()))?;
-    match serde_json::from_slice(&genesis_bytes) {
-        Ok(v) => Ok(v),
-        Err(_) => {
-            let decoded = zstd::stream::decode_all(genesis_bytes.as_slice())
-                .context("decoding zstd genesis_contracts.json")?;
-            serde_json::from_slice(&decoded).context("parsing genesis_contracts.json")
-        }
+    let stamp_path = path.parent().context("Genesis contracts path has no parent")?.join(".genesis_contracts.compiler-artifact.json");
+    let stamp_file = std::fs::File::open(&stamp_path).context("opening locally approved Genesis compiler stamp")?;
+    let metadata = stamp_file.metadata()?;
+    ensure!(metadata.is_file() && metadata.len() <= 65_536, "Genesis compiler stamp must be a regular file of at most 65536 bytes");
+    let mut stamp_bytes = Vec::with_capacity(metadata.len() as usize);
+    (&stamp_file).take(65_536).read_to_end(&mut stamp_bytes)?;
+    ensure!(stamp_file.metadata()?.len() == stamp_bytes.len() as u64, "Genesis compiler stamp changed size while reading");
+    validate_contracts_stamp(&stamp_bytes, &genesis_bytes)?;
+    let decoded;
+    let json = if genesis_bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        decoded = zstd::stream::decode_all(genesis_bytes.as_slice()).context("decoding zstd genesis_contracts.json")?;
+        decoded.as_slice()
+    } else {
+        genesis_bytes.as_slice()
+    };
+    #[derive(serde::Deserialize)]
+    struct NamedDeployment {
+        name: String,
+        #[serde(flatten)]
+        deployment: PQBCDeployContract<Hash>,
     }
+    let named: Vec<NamedDeployment> = serde_json::from_slice(json).context("parsing flat named Genesis deployments")?;
+    let mut names = std::collections::HashSet::with_capacity(named.len());
+    for entry in &named {
+        ensure!(!entry.name.trim().is_empty() && names.insert(entry.name.as_str()), "Genesis contract names must be nonempty and unique");
+    }
+    ensure!(named.get(6).map(|entry| entry.name.as_str()) == Some("multisig_policy"), "Genesis contract 6 must be multisig_policy");
+    Ok(named.into_iter().map(|entry| entry.deployment).collect())
 }
 
 fn parse_qhash(hex: &str) -> anyhow::Result<QHashOut<F>> {
@@ -312,31 +404,29 @@ fn compact_user(
     }
 }
 
-fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
-    let repo_root = args.repo_root.canonicalize().with_context(|| {
-        format!("repo-root {} does not exist", args.repo_root.display())
-    })?;
-    let contracts_path = args.genesis_contracts.clone().unwrap_or_else(|| {
-        repo_root.join("psy-genesis/genesis_contracts.json")
-    });
-    let contracts = load_contracts(&contracts_path)?;
+fn genesis_users(
+    args: &GenerateGenesisDataArgs,
+    relayer: PsyCompactUserDefinition<Hash>,
+) -> anyhow::Result<(Vec<PsyCompactUserDefinition<Hash>>, Vec<Option<Hash>>)> {
     let validator_slots = parse_validator_slots(&args.validator_slots)?;
     let zk_fingerprint = zk_fingerprint(args)?;
     let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
-    let relayer_private_key = resolve_bridge_relayer_private_key(args)?;
-
+    ensure!(args.relayer_registration_id == 2 && args.relayer_user_id == 524_288,
+        "public multisig Genesis requires registration 2 and user 524288");
+    ensure!(args.coordinator_global_user_tree_height == 12 && args.realm_global_user_tree_height == 20 && args.group_realm_height == 1,
+        "public multisig Genesis requires local-devnet Strategy5 tree heights");
+    ensure!(validator_slots.len() >= 2, "dense registration 2 requires preceding validator registrations");
+    let mut relayer = Some(relayer);
     let special_zk_user_count = validator_slots.len() + 1;
     let mut users = Vec::with_capacity(special_zk_user_count + args.faucet_operator_count);
-    let mut private_keys = Vec::with_capacity(special_zk_user_count + args.faucet_operator_count);
+    let mut private_keys: Vec<Option<Hash>> = Vec::with_capacity(special_zk_user_count + args.faucet_operator_count);
 
     let mut next_registration: u64 = 0;
     let mut validator_iter = validator_slots.iter().peekable();
     while next_registration < special_zk_user_count as u64 {
         if next_registration == args.relayer_registration_id {
-            let relayer_key = relayer_private_key
-                .unwrap_or_else(|| deterministic_private_key(args.relayer_registration_id));
-            private_keys.push(relayer_key);
-            users.push(compact_user(zk_fingerprint, relayer_key, args.initial_fee_balance));
+            private_keys.push(None);
+            users.push(relayer.take().context("relayer registration already consumed")?);
             let user_id = user_id_for(args, args.relayer_registration_id);
             ensure!(
                 user_id == args.relayer_user_id,
@@ -357,7 +447,7 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
             slot.registration_id
         );
         let private_key = deterministic_private_key(slot.registration_id);
-        private_keys.push(private_key);
+        private_keys.push(Some(private_key));
         users.push(compact_user(zk_fingerprint, private_key, args.initial_fee_balance));
         let user_id = user_id_for(args, slot.registration_id);
         let realm_start = slot.realm_id << args.realm_global_user_tree_height;
@@ -376,9 +466,28 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     for i in 0..args.faucet_operator_count {
         let slot = special_zk_user_count + i;
         let private_key = deterministic_private_key(slot as u64);
-        private_keys.push(private_key);
+        private_keys.push(Some(private_key));
         users.push(compact_user(sd_key_fingerprint, private_key, args.initial_fee_balance));
     }
+    Ok((users, private_keys))
+}
+
+fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
+    let repo_root = args.repo_root.canonicalize().with_context(|| {
+        format!("repo-root {} does not exist", args.repo_root.display())
+    })?;
+    let account = decode_relayer_multisig_account(&read_public_input(&repo_root, &args.relayer_multisig_account)?)?;
+    let contracts_path = args.genesis_contracts.clone().unwrap_or_else(|| {
+        repo_root.join("psy-genesis/genesis_contracts.json")
+    });
+    let contracts = load_contracts(&contracts_path)?;
+    let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
+    validate_multisig_policy_artifact(&contracts, &read_public_input(&repo_root, &args.multisig_policy_artifact)?)?;
+    let multisig_circuit = MultisigSignatureCircuit::new()?;
+    let relayer = initialized_multisig_user(&account, &multisig_circuit, args.initial_fee_balance)?;
+    let (users, private_keys) = genesis_users(args, relayer)?;
+    let special_zk_user_count = users.len() - args.faucet_operator_count;
+
 
     let genesis_data = PsyGenesisBlockSetupData {
         contracts,
@@ -457,7 +566,8 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
         let operators: Vec<FaucetOperatorJson> = (0..args.faucet_operator_count)
             .map(|i| {
                 let slot = special_zk_user_count + i;
-                let pk = private_keys[slot];
+                let pk = private_keys.get(slot).copied().flatten()
+                    .with_context(|| format!("faucet registration {slot} requires a private key"))?;
                 let user_id = user_id_for(args, slot as u64);
                 let public_key_param = get_public_key_param::<F, PoseidonHash>(pk);
                 let pk_info = PZKPublicKeyInfo {
@@ -465,15 +575,15 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
                     public_key_param,
                 };
                 let address = pk_info.to_hash::<PoseidonHasher>();
-                FaucetOperatorJson {
+                Ok(FaucetOperatorJson {
                     user_id: user_id.to_string(),
                     address: format!("{}", address),
                     private_key: format!("{}", pk),
                     fingerprint: format!("{}", sd_key_fingerprint),
                     sign_type: "sd-key".to_string(),
-                }
+                })
             })
-            .collect();
+            .collect::<anyhow::Result<_>>()?;
 
         let faucet_operators = FaucetOperatorsJson {
             faucet_contract_id: args.faucet_contract_id,
@@ -503,7 +613,6 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
         genesis = %genesis_path.display(),
         private_keys = %private_keys_path.display(),
         faucet_operators = ?faucet_operators_written.as_ref().map(|p| p.display().to_string()),
-        relayer_from_keystore = relayer_private_key.is_some(),
         "wrote local-devnet genesis artifacts"
     );
     Ok(())
@@ -511,30 +620,336 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn policy_abi_requires_exact_visible_four_slot_storage() {
+        let abi = serde_json::json!({"schema_version":"2.0.0","contract":{"state":[
+            {"name":"header","offset":0,"felt_size":4,"type":{"kind":"primitive","name":"Hash"}},
+            {"name":"members","offset":4,"felt_size":12,"type":{"kind":"array","item":{"kind":"primitive","name":"Hash"},"length":3,"item_felt_size":4}}
+        ]}});
+        validate_policy_abi_slots(&abi).unwrap();
+        for (index, field, value) in [(0, "offset", 4), (1, "offset", 8), (1, "felt_size", 16)] {
+            let mut invalid = abi.clone();
+            invalid["contract"]["state"][index][field] = serde_json::json!(value);
+            assert!(validate_policy_abi_slots(&invalid).is_err());
+        }
+        let mut invalid = abi.clone();
+        invalid["contract"]["state"][1]["type"]["length"] = serde_json::json!(4);
+        assert!(validate_policy_abi_slots(&invalid).is_err());
+        let mut missing = abi;
+        missing["contract"].as_object_mut().unwrap().remove("state");
+        assert!(validate_policy_abi_slots(&missing).is_err());
+    }
+
     use super::*;
-
     #[test]
-    fn set_keystore_fails_closed_when_missing() {
-        let err = resolve_set_keystore_path(
-            Some("/definitely-missing-psy-relayer-keystore".into()),
-            Some("/tmp".into()),
-            None,
-        )
-        .expect_err("missing first-set path must not skip to a later existing path");
-        assert!(err.to_string().contains("does not exist"), "{err}");
+    fn contract_loader_preserves_flat_deployments_and_order() {
+        let root = std::env::temp_dir().join(format!("psy-genesis-flat-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let entries: Vec<_> = (0..7).map(|index| serde_json::json!({
+            "name": if index == 6 { "multisig_policy".to_string() } else { format!("contract{index}") },
+            "deployer": Hash::from_values(index, 0, 0, 0),
+            "code_definition": {"state_tree_height":4,"functions":[]},
+            "function_whitelist":[],"code_root":Hash::get_zero_value()
+        })).collect();
+        let path = root.join("contracts.json");
+        let bundle = serde_json::to_vec(&entries).unwrap();
+        std::fs::write(&path, &bundle).unwrap();
+        std::fs::write(root.join(".genesis_contracts.compiler-artifact.json"), serde_json::to_vec(&stamp_fixture(&bundle)).unwrap()).unwrap();
+        let contracts = load_contracts(&path).unwrap();
+        for (index, contract) in contracts.iter().enumerate() {
+            assert_eq!(contract.deployer, Hash::from_values(index as u64, 0, 0, 0));
+        }
+        assert_eq!(contracts.len(), entries.len());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn stamp_fixture(bundle: &[u8]) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        serde_json::json!({
+            "compilerRevision": "a".repeat(40), "compilerSourcesHash": "b".repeat(64),
+            "artifactSha256": hex::encode(Sha256::digest(bundle)), "artifactByteSize": bundle.len(),
+            "tokenArtifactSha256": "c".repeat(64), "tokenArtifactByteSize": 0,
+            "tokenUpdateArtifactSha256": "d".repeat(64), "tokenUpdateArtifactByteSize": 0,
+        })
     }
 
     #[test]
-    fn first_set_keystore_alias_wins() {
-        let path = resolve_set_keystore_path(None, Some("/tmp".into()), Some("/nonexistent".into()))
-            .expect("second alias exists");
-        assert_eq!(path.as_deref(), Some("/tmp"));
+    fn provenance_binds_raw_bytes_and_rejects_ambiguous_stamp() {
+        let bundle = b"[]";
+        let stamp = stamp_fixture(bundle);
+        let valid = serde_json::to_vec(&stamp).unwrap();
+        validate_contracts_stamp(&valid, bundle).unwrap();
+        assert!(validate_contracts_stamp(&valid, b"[ ]").is_err());
+        for field in ["compilerRevision", "compilerSourcesHash", "artifactSha256", "tokenArtifactSha256", "tokenUpdateArtifactSha256"] {
+            let mut invalid = stamp.clone();
+            invalid[field] = serde_json::json!("A".repeat(if field == "compilerRevision" { 40 } else { 64 }));
+            assert!(validate_contracts_stamp(&serde_json::to_vec(&invalid).unwrap(), bundle).is_err());
+        }
+        for field in stamp.as_object().unwrap().keys() {
+            let mut missing = stamp.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(validate_contracts_stamp(&serde_json::to_vec(&missing).unwrap(), bundle).is_err());
+        }
+        let mut unknown = stamp.clone();
+        unknown["extra"] = serde_json::json!(true);
+        assert!(validate_contracts_stamp(&serde_json::to_vec(&unknown).unwrap(), bundle).is_err());
+        let text = String::from_utf8(valid).unwrap();
+        let duplicate = text.replacen("\"artifactByteSize\":2", "\"artifactByteSize\":2,\"artifactByteSize\":2", 1);
+        assert!(validate_contracts_stamp(duplicate.as_bytes(), bundle).is_err());
+        assert!(validate_contracts_stamp(&vec![b' '; 65_537], bundle).is_err());
+    }
+    #[test]
+    fn contract_loader_rejects_missing_policy_and_wrapped_records_even_with_matching_stamp() {
+        let root = std::env::temp_dir().join(format!("psy-genesis-bundle-reject-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("contracts.json");
+        for bundle in [br#"[{"name":"multisig_policy","deployer":"00","code_definition":{"state_tree_height":4,"functions":[]},"function_whitelist":[],"code_root":"00"}]"#.as_slice(),
+            br#"[{"name":"multisig_policy","contract":{"deployment":{}}}]"#.as_slice()] {
+            std::fs::write(&path, bundle).unwrap();
+            std::fs::write(root.join(".genesis_contracts.compiler-artifact.json"), serde_json::to_vec(&stamp_fixture(bundle)).unwrap()).unwrap();
+            assert!(load_contracts(&path).is_err());
+        }
+        std::fs::remove_file(root.join(".genesis_contracts.compiler-artifact.json")).unwrap();
+        assert!(load_contracts(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+
+    #[test]
+    fn dense_export_keeps_validator_and_faucet_indices_without_relayer_secret() {
+        let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "policy.json"]).unwrap();
+        let account = account_fixture();
+        let relayer = PsyCompactUserDefinition {
+            public_key_info: PZKPublicKeyInfo { fingerprint: Hash::get_zero_value(), public_key_param: QHashOut(account.public_key_param().unwrap().0) },
+            balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0, constract_state_tree_records: vec![],
+        };
+        let (users, keys) = genesis_users(&args, relayer).unwrap();
+        assert_eq!(keys.len(), users.len());
+        assert_eq!(keys.len(), 15);
+        assert!(keys[2].is_none());
+        let exported = serde_json::to_value(&keys).unwrap();
+        assert!(exported[2].is_null());
+        for registration in (0..keys.len()).filter(|index| *index != 2) {
+            let key = keys[registration].expect("validator/faucet key must remain at its registration");
+            assert_eq!(key, deterministic_private_key(registration as u64));
+            assert_eq!(users[registration].public_key_info.public_key_param, get_public_key_param::<F, PoseidonHash>(key));
+        }
     }
 
     #[test]
-    fn unset_aliases_are_none() {
-        assert_eq!(resolve_set_keystore_path(None, None, None).unwrap(), None);
+    #[ignore = "requires approved PSY_GENESIS_CONTRACTS and PSY_MULTISIG_POLICY_ARTIFACT; run explicitly in QA"]
+    fn initialized_genesis_roots_authorize_first_ordinary_nonce_one() {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
+        use plonky2::{field::types::{Field, PrimeField64}, hash::poseidon::PoseidonPermutation};
+        use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+        use parth_core::protocol::core_types::{QNetworkTreeConstants, QNetworkTreeCircuitSpecificConstants};
+        use psy_core::network_config::PsyNetworkLocalDevnetConstants as N;
+        use psy_node_core::genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder;
+        use psy_client_common::data::{base_types::hash256::Hash256, secp256k1::CompressedPublicKey};
+        use psy_client_data::qdata::{user::PsyUserLeaf, user_contract_state::{SignContext, UserContractState}, ups_signature::PsyUserProvingSessionSignatureDataCompact};
+        use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::secp256k1::{core::PsyCompressedSecp256K1Signature, wallet::hash_no_pad_compressed_public_key}};
+        use psy_vm::{dpn::ops::state_cmd::data::{DPNStateCmd, DPNStateCmdGetSelfUserCurrentContractStateSlotHash}, ups::{state_reader::StateReaderResults, multisig::{MultisigSignatureInput, MultisigSignatureWitness, MultisigSignatures}}};
+        let circuit = MultisigSignatureCircuit::new().unwrap();
+        let mut keys: Vec<_> = (1u8..=3).map(|byte| {
+            let key = SigningKey::from_slice(&[byte; 32]).unwrap();
+            let compressed: [u8; 33] = key.verifying_key().to_encoded_point(true).as_bytes().try_into().unwrap();
+            let member = hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(CompressedPublicKey(compressed));
+            (member, key, compressed)
+        }).collect();
+        keys.sort_by_key(|(member, _, _)| member.0.elements.map(|limb| limb.to_canonical_u64()));
+        let mut account = account_fixture();
+        for (member, key) in account.initial_policy.member_hashes[..3].iter_mut().zip(&keys) { *member = key.0; }
+        let user = initialized_multisig_user(&account, &circuit, 100).unwrap();
+        assert!(initialized_multisig_user(&account, &circuit, 0).is_err());
+        assert!(initialized_multisig_user(&account, &circuit, F::ORDER).is_err());
+        let contracts_path = std::env::var_os("PSY_GENESIS_CONTRACTS").expect("QA must supply approved Genesis contracts");
+        let artifact_path = std::env::var_os("PSY_MULTISIG_POLICY_ARTIFACT").expect("QA must supply approved multisig compiler artifact");
+        let contracts = load_contracts(Path::new(&contracts_path)).unwrap();
+        let artifact_bytes = std::fs::read(artifact_path).unwrap();
+        validate_multisig_policy_artifact(&contracts, &artifact_bytes).unwrap();
+        let mut wrong_height = contracts.clone();
+        wrong_height[6].code_definition.state_tree_height = 5;
+        assert!(validate_multisig_policy_artifact(&wrong_height, &artifact_bytes).is_err());
+        let mut wrong_code = contracts.clone();
+        wrong_code[6].code_root = Hash::get_zero_value();
+        assert!(validate_multisig_policy_artifact(&wrong_code, &artifact_bytes).is_err());
+        let stats = PQEDCheckpointLeafStats::<F, Hash>::new_empty();
+        let genesis: PsyGenesisBlockSetupData<F, Hash> = serde_json::from_value(serde_json::json!({
+            "contracts": contracts,
+            "users": [compact_user(Hash::get_zero_value(), deterministic_private_key(0), 100), compact_user(Hash::get_zero_value(), deterministic_private_key(1), 100), user],
+            "checkpoint_stats": stats, "deposit_tree_root": Hash::get_zero_value(), "withdrawal_tree_root": Hash::get_zero_value(), "validators": []
+        })).unwrap();
+        let mut builder = GenesisDatabaseDataBuilder::new(genesis.deposit_tree_root, genesis.withdrawal_tree_root, genesis.checkpoint_stats.clone());
+        builder.setup_contracts::<PoseidonHasher, N>(&genesis, true).unwrap();
+        use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+        use psy_data::v1::qdata::contract::{PQEDContractLeafV2, CONTRACT_LEAF_SERIALIZED_SIZE};
+        let mut contract_tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, Hash>::new(N::GLOBAL_CONTRACT_TREE_HEIGHT);
+        for row in builder.contract_leaves_ffs.chunks_exact(8 + CONTRACT_LEAF_SERIALIZED_SIZE) {
+            let id = u64::from_le_bytes(row[..8].try_into().unwrap());
+            let leaf = PQEDContractLeafV2::<F, Hash>::psy_ser_from_slice(&row[8..]).unwrap();
+            let expected = &genesis.contracts[id as usize];
+            assert_eq!(leaf.deployer, expected.deployer);
+            assert_eq!(leaf.code_root, expected.code_root);
+            assert_eq!(leaf.state_tree_height.to_canonical_u64(), u64::from(expected.code_definition.state_tree_height));
+            contract_tree.set_leaf_no_proof(id, parth_core::crypto::hash::traits::QFieldHashable::qfhash::<PoseidonHasher>(&leaf));
+        }
+        assert_eq!(contract_tree.get_root(), builder.global_contract_tree_root);
+        assert!(contract_tree.get_leaf(6).verify::<PoseidonHasher>());
+        builder.setup_users::<PoseidonHasher, N>(&genesis, None, true, true).unwrap();
+        let mut global = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let mut relayer_state = None;
+        for (registration, compact) in genesis.users.iter().enumerate() {
+            let mut ucon = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, Hash>::new(N::GLOBAL_CONTRACT_TREE_HEIGHT);
+            let mut state_trees = Vec::new();
+            for record in &compact.constract_state_tree_records {
+                let mut tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, Hash>::new(genesis.get_contract_state_tree_height(record.parent_index).unwrap());
+                for slot in &record.children { tree.set_leaf_no_proof(slot.index, slot.value); }
+                ucon.set_leaf_no_proof(record.parent_index, tree.get_root());
+                state_trees.push((record.parent_index, tree));
+            }
+            let leaf = PsyUserLeaf {
+                public_key: ClientHash(compact.public_key_info.to_hash::<PoseidonHasher>().0),
+                user_state_tree_root: ClientHash(ucon.get_root().0), balance: F::from_canonical_u64(compact.balance),
+                nonce: F::from_canonical_u64(compact.nonce), last_checkpoint_id: F::from_canonical_u64(compact.last_checkpoint_id),
+                event_index: F::from_canonical_u64(compact.event_index),
+                user_id: F::from_canonical_u64(UserIdBitsStrategy5::get_user_id_from_user_registration_id(registration as u64, 12, 20, 1)),
+            };
+            global.set_leaf_no_proof(leaf.user_id.to_canonical_u64(), QHashOut(leaf.qfhash::<PoseidonHash>().0));
+            if registration == 2 {
+                let fee = &state_trees.iter().find(|(id, _)| *id == 0).unwrap().1;
+                assert!(ucon.get_leaf(0).verify::<PoseidonHasher>());
+                assert_eq!(ucon.get_leaf(0).value, fee.get_root());
+                assert!(fee.get_leaf(0).verify::<PoseidonHasher>());
+                assert_eq!(fee.get_leaf(0).value, Hash::from_values(100, 0, 0, 0));
+                let policy = &state_trees.iter().find(|(id, _)| *id == 6).unwrap().1;
+                let mut proofs = Vec::new();
+                for slot in 0..4 {
+                    proofs.push(serde_json::from_value(serde_json::to_value(ucon.get_leaf(6)).unwrap()).unwrap());
+                    proofs.push(serde_json::from_value(serde_json::to_value(policy.get_leaf(slot)).unwrap()).unwrap());
+                }
+                relayer_state = Some(StateReaderResults {
+                    state: UserContractState { checkpoint_tree_root: ClientHash::ZERO, user_leaf: leaf, start_contract_state_root: ClientHash(policy.get_root().0), contract_id: F::from_canonical_u32(6), checkpoint_id: F::ZERO },
+                    user_tree_root: ClientHash::ZERO, checkpoint: None, aux_user_leaves: vec![],
+                    state_cmds: (0..4).map(|slot| DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(DPNStateCmdGetSelfUserCurrentContractStateSlotHash { slot_index: F::from_canonical_u64(slot) })).collect(),
+                    merkel_proofs: proofs,
+                });
+            }
+        }
+        assert_eq!(global.get_root(), builder.global_user_tree_root);
+        let inclusion = global.get_leaf(524_288);
+        assert!(inclusion.verify::<PoseidonHasher>());
+        let mut start_state = relayer_state.unwrap();
+        start_state.user_tree_root = ClientHash(builder.global_user_tree_root.0);
+        let leaf = start_state.state.user_leaf;
+        assert_eq!(inclusion.value, QHashOut(leaf.qfhash::<PoseidonHash>().0));
+        assert_eq!(leaf.nonce, F::ZERO);
+        assert_ne!(leaf.user_state_tree_root, ClientHash::from_values(N::DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4[0], N::DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4[1], N::DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4[2], N::DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4[3]));
+        let sign_context = SignContext { checkpoint_tree_root: ClientHash::ZERO, user_leaf: leaf };
+        let mut ending = leaf;
+        ending.nonce = F::ONE;
+        let sig_data = PsyUserProvingSessionSignatureDataCompact {
+            start_user_leaf_hash: leaf.qfhash::<PoseidonHash>(), end_user_leaf_hash: ending.qfhash::<PoseidonHash>(),
+            checkpoint_leaf_hash: ClientHash::ZERO, tx_stack_hash: ClientHash::from_values(11, 12, 13, 14), tx_count: F::ONE,
+        };
+        let sighash = sig_data.get_sig_action_for_user::<PoseidonHash>(psy_config::network_constants::PSY_NETWORK_MAGIC, leaf.user_id, F::ONE, sign_context).get_qhash::<PoseidonHash>();
+        let message = Hash256::from(sighash);
+        let signatures = [0usize, 2].map(|index| {
+            let signature: Signature = keys[index].1.sign_prehash(&message.0).unwrap();
+            PsyCompressedSecp256K1Signature { public_key: keys[index].2, signature: signature.to_bytes().into(), message }
+        });
+        let input = MultisigSignatureInput {
+            witness: MultisigSignatureWitness { account: account.clone(), start_state: start_state.clone(), end_state: start_state, sig_data, sign_context, start_session_user_leaf: leaf, nonce: F::ONE },
+            signatures: MultisigSignatures { member_indices: vec![0, 2], signatures: signatures.to_vec() },
+        };
+        assert_eq!(input.witness.policies().unwrap(), (account.initial_policy.clone(), account.initial_policy));
+        circuit.prove(&input, sighash).unwrap();
+        let mut forged = input;
+        forged.witness.start_state.merkel_proofs[3].value = ClientHash::ZERO;
+        assert!(circuit.prove(&forged, sighash).is_err());
     }
+
+    fn account_fixture() -> MultisigAccount {
+        let mut member_hashes = [ClientHash::ZERO; 8];
+        for (index, member) in member_hashes[..3].iter_mut().enumerate() {
+            *member = ClientHash::from_values(index as u64 + 1, 0, 0, 0);
+        }
+        MultisigAccount { contract_id: 6, initial_policy: MultisigPolicy {
+            version: 1, threshold: 2, member_count: 3, member_hashes,
+        } }
+    }
+
+    #[test]
+    fn public_account_rejects_secret_unknown_duplicate_and_invalid_policy() {
+        let account = account_fixture();
+        let valid = serde_json::to_vec(&account).unwrap();
+        assert_eq!(decode_relayer_multisig_account(&valid).unwrap().public_key_param().unwrap(), account.public_key_param().unwrap());
+        for field in ["private_key", "fingerprint", "public_key_param"] {
+            let mut value = serde_json::to_value(&account).unwrap();
+            value[field] = serde_json::json!("not-an-account-field");
+            assert!(decode_relayer_multisig_account(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        let text = String::from_utf8(valid).unwrap();
+        let duplicate = text.replacen("\"contract_id\":6", "\"contract_id\":6,\"contract_id\":6", 1);
+        assert!(decode_relayer_multisig_account(duplicate.as_bytes()).is_err());
+        let duplicate = text.replacen("\"version\":1", "\"version\":1,\"version\":1", 1);
+        assert!(decode_relayer_multisig_account(duplicate.as_bytes()).is_err());
+        let mut value = serde_json::to_value(&account).unwrap();
+        value["initial_policy"]["secret"] = serde_json::json!(true);
+        assert!(decode_relayer_multisig_account(&serde_json::to_vec(&value).unwrap()).is_err());
+        for (field, invalid) in [("version", 0), ("version", 2), ("threshold", 1), ("member_count", 4)] {
+            let mut value = serde_json::to_value(&account).unwrap();
+            value["initial_policy"][field] = serde_json::json!(invalid);
+            assert!(decode_relayer_multisig_account(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        for index in [0, 1, 7] {
+            let mut invalid = account.clone();
+            invalid.initial_policy.member_hashes[index] = if index == 0 { ClientHash::ZERO } else { invalid.initial_policy.member_hashes[0] };
+            assert!(decode_relayer_multisig_account(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+        let mut invalid = account;
+        invalid.contract_id = 5;
+        assert!(decode_relayer_multisig_account(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+
+    #[test]
+    fn cli_requires_both_public_inputs_and_rejects_secret_flags() {
+        assert!(GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).is_err());
+        let public_args = ["generate-genesis-data", "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "policy.json"];
+        assert!(GenerateGenesisDataArgs::try_parse_from(public_args).is_ok());
+        for flag in ["--private-key", "--bridge-relayer-l2-private-key", "--keystore-path", "--psy-bridge-relayer-keystore-path", "--bridge-relayer-keystore-path", "--wallet-password"] {
+            let mut args = public_args.to_vec();
+            args.extend([flag, "must-not-be-consumed"]);
+            assert!(GenerateGenesisDataArgs::try_parse_from(args).is_err());
+        }
+        assert!(GenerateGenesisDataArgs::try_parse_from(&public_args[..3]).is_err());
+    }
+
+    #[test]
+    fn missing_or_directory_public_inputs_fail_closed() {
+        assert!(read_public_input(Path::new("."), Path::new("")).is_err());
+        assert!(read_public_input(Path::new("."), Path::new(".")).is_err());
+        assert!(read_public_input(Path::new("."), Path::new("/definitely-missing-public-multisig-account")).is_err());
+        assert!(validate_multisig_policy_artifact(&[], br#"{"state_tree_height":4,"circuit_definitions":[]}"#).is_err());
+    }
+
+    #[test]
+    fn malformed_public_account_does_not_create_outputs() {
+        let root = std::env::temp_dir().join(format!("psy-public-genesis-reject-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("account.json"), b"{}").unwrap();
+        std::fs::write(root.join("contracts.json"), b"[]").unwrap();
+        let args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
+            "--genesis-contracts", root.join("contracts.json").to_str().unwrap(),
+            "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "absent.json",
+        ]).unwrap();
+        assert!(generate_local_devnet_genesis(&args).is_err());
+        assert!(!root.join("genesis.json").exists());
+        assert!(!root.join("private_keys.json").exists());
+        assert!(!root.join("psy-dapp").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 
     #[test]
     fn default_relayer_registration_maps_to_default_user_id() {

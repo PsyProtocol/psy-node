@@ -1197,6 +1197,8 @@ impl<
         contract_id: u32,
         function_id: u32,
     ) -> anyhow::Result<PsyContractFunctionInclusionProof<F>> {
+        let fingerprint_leaf_index = function_id.checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("contract function fingerprint leaf index overflow"))?;
         let contract_inclusion_proof = self.get_contract_inclusion_proof(contract_id).await?;
         let contract_function_merkle_proof = self
             .cmd_store
@@ -1204,7 +1206,7 @@ impl<
                 QSRMerkleCmdGetContractFunctionTreeMerkleProof {
                     checkpoint_id: self.start_checkpoint_u64,
                     contract_id,
-                    function_id: function_id * 2,
+                    function_id: fingerprint_leaf_index,
                 },
             ))
             .await?;
@@ -1503,4 +1505,37 @@ impl<
     fn get_event_index(&self) -> F {
         self.start_event_index
     }
+}
+
+#[cfg(all(test, feature = "is_sync"))]
+mod function_inclusion_tests {
+    use super::*;
+    use plonky2::field::types::Field;
+    use crate::{config::store_config::{PsyFelt, PsyHasher}, qdata::contract::PsyContractLeaf, traits::qdatastore::{qmetadata::QMetaDataStoreWriterSync, qtreedata::{QTreeDataStoreReaderSync, QTreeDataStoreWriterSync}}};
+
+    #[test]
+    fn nonzero_function_inclusion_uses_fingerprint_not_neighboring_leaves() -> anyhow::Result<()> {
+        let store = KVQSimpleMemoryBackingStore::new();
+        let leaves: Vec<_> = (0..6).map(|index| QHashOut::<PsyFelt>::from_values(100 + index, 0, 0, 0)).collect();
+        let root = store.set_contract_function_whitelist(1, 6, &leaves)?;
+        let contract = PsyContractLeaf { function_tree_root: root, ..Default::default() };
+        store.set_contract_leaf_data(1, 6, &contract)?;
+        store.set_contract_tree_leaf_hash(1, 6, contract.qfhash::<PsyHasher>())?;
+        let mut session = PsyLocalProvingSessionStore::<PsyFelt, _, PsyHasher>::new_at(store.clone(), PsyFelt::ONE, PsyFelt::ZERO, PsyFelt::ONE, PsyFelt::ZERO, 16);
+        let inclusion = session.get_contract_function_inclusion_proof(6, 1)?;
+        assert_eq!(inclusion.contract_function_merkle_proof.index, 2);
+        assert_eq!(inclusion.get_function_verifier_fingerprint(), leaves[2]);
+        assert_eq!(inclusion.contract_function_merkle_proof.root, root);
+        assert!(inclusion.verify::<PsyHasher>());
+        for index in [2u32, 3, 4] {
+            let physical = store.get_contract_function_tree_merkle_proof(1, 6, index)?;
+            assert_eq!(physical.index, index as u64);
+            assert_eq!(physical.value, leaves[index as usize]);
+            assert_eq!(physical.root, root);
+            assert!(physical.verify::<PsyHasher>());
+        }
+        assert!(session.get_contract_function_inclusion_proof(6, 1u32 << 31).is_err());
+        Ok(())
+    }
+
 }

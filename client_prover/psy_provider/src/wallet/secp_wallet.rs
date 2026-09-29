@@ -128,6 +128,23 @@ impl Wallet {
         self.inner.public_key().to_vec()
     }
 
+    pub fn compressed_public_key(&self) -> [u8; 33] {
+        self.inner.credential().verifying_key().to_encoded_point(true).as_bytes().try_into()
+            .expect("compressed secp256k1 public keys contain 33 bytes")
+    }
+
+    pub fn sign_prehash_raw(&self, message: &[u8; 32]) -> Result<[u8; 64]> {
+        use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
+        let signature: k256::ecdsa::Signature = self.inner.credential().sign_prehash(message)?;
+        let signature = signature.normalize_s().unwrap_or(signature);
+        self.inner.credential().verifying_key().verify_prehash(message, &signature)?;
+        Ok(signature.to_bytes().into())
+    }
+
+    pub fn load_encrypted_keystore(path: &Path, password: &str) -> Result<Self> {
+        Self::from_signer(PrivateKeySigner::decrypt_keystore(path, password)?)
+    }
+
     pub fn private_key(&self) -> Vec<u8> {
         self.inner.credential().to_bytes().to_vec()
     }

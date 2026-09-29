@@ -1,7 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, statSync } from "node:fs";
+import { mkdtemp, mkdir, writeFile, rm, symlink, chmod } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import allConfig from "../psy-genesis/config.json";
 import {
     COORDINATOR_PROCESSOR_READY_MARKER,
@@ -22,6 +24,8 @@ import {
     evaluateCompilerArtifactStamp,
     injectGenesisValidators,
     isUsableGenesisData,
+    ensureGenesisFiles,
+    planGenesisGeneration,
     planPsyDappNestedSubmodulesFromDisk,
     readGenesisContractsArtifactStamp,
     resolveLocalAnvilStatePlan,
@@ -46,7 +50,6 @@ import {
     strategy5UserIdFromRegistrationId,
     LOCAL_DEVNET_RELAYER_REGISTRATION_ID,
     LOCAL_DEVNET_RELAYER_USER_ID,
-    LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY,
     planRealmP2pConfig,
     daemonRealmP2pConfig,
     realmP2pProcessorPort,
@@ -55,6 +58,12 @@ import {
     validateRealmP2pPorts,
     selectedRuntimeConfigKey,
     REALM_P2P_SUB_IDS,
+    resolveGuardianConfigPath,
+    resolveBridgeDaemonConfigPath,
+    validateRelayerTemplate,
+    relayerStartedDetector,
+    DevNetProcessManager,
+    shouldRequireGuardianConfig,
 } from "./locSetupV4";
 import type { GenesisContractsArtifactFingerprint } from "./locSetupV4";
 
@@ -450,6 +459,92 @@ describe("isUsableGenesisData", () => {
     });
 });
 
+describe("public-only Genesis generation", () => {
+    const account = () => ({ contract_id: 6, initial_policy: { version: 1, threshold: 2, member_count: 3, member_hashes: ["01", "02", "03", "00", "00", "00", "00", "00"] } });
+    const artifact = () => ({ state_tree_height: 4, circuit_definitions: [{ name: "get_policy" }, { name: "set_policy" }], abi: { contract: { state_tree_height: 4 } } });
+
+    it("forwards public paths as individual argv and strips only child secrets", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.write(`${dir}/public account.json`, JSON.stringify(account()));
+            await Bun.write(`${dir}/policy artifact.json`, JSON.stringify(artifact()));
+            const aliases = ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"];
+            const env: NodeJS.ProcessEnv = { PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json", KEEP: "present", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
+            const plan = await planGenesisGeneration(dir, env);
+            expect(plan.args).toEqual([`${dir}/target/release/psy_dev_cli`, "generate-genesis-data", "--repo-root", dir, "--relayer-multisig-account", `${dir}/public account.json`, "--multisig-policy-artifact", `${dir}/policy artifact.json`]);
+            for (const alias of aliases) {
+                expect(plan.env[alias]).toBeUndefined();
+                expect(env[alias]).toBe("test-only");
+            }
+            expect(plan.env.KEEP).toBe("present");
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("rejects missing paths, unknown and duplicate fields, and invalid fixed policies", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            const env = { PSY_RELAYER_MULTISIG_ACCOUNT: "account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy.json" };
+            await Bun.write(`${dir}/policy.json`, JSON.stringify(artifact()));
+            await expect(planGenesisGeneration(dir, {})).rejects.toThrow();
+            await expect(planGenesisGeneration(dir, env)).rejects.toThrow();
+            await expect(planGenesisGeneration(dir, { ...env, PSY_RELAYER_MULTISIG_ACCOUNT: "." })).rejects.toThrow();
+            const invalid: unknown[] = [null, {}, { ...account(), contract_id: 5 }, { ...account(), extra: true }];
+            for (const change of [{ version: 2 }, { threshold: 1 }, { member_count: 2 }, { member_hashes: ["01", "01", "03", "00", "00", "00", "00", "00"] }, { member_hashes: ["00", "02", "03", "00", "00", "00", "00", "00"] }, { member_hashes: ["01", "02", "03", "01", "00", "00", "00", "00"] }]) invalid.push({ ...account(), initial_policy: { ...account().initial_policy, ...change } });
+            for (const input of invalid.map((value) => JSON.stringify(value)).concat('{"contract_id":6,"contract_id":6,"initial_policy":' + JSON.stringify(account().initial_policy) + '}', "not JSON")) {
+                await Bun.write(`${dir}/account.json`, input);
+                await expect(planGenesisGeneration(dir, env)).rejects.toThrow();
+            }
+            await Bun.write(`${dir}/account.json`, JSON.stringify(account()));
+            await expect(planGenesisGeneration(dir, { PSY_RELAYER_MULTISIG_ACCOUNT: "account.json" })).rejects.toThrow();
+            await Bun.write(`${dir}/policy.json`, JSON.stringify({ ...artifact(), state_tree_height: 3 }));
+            await expect(planGenesisGeneration(dir, env)).rejects.toThrow();
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("launches generation with public argv and a secret-free child environment", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.write(`${dir}/psy-genesis/genesis_contracts.json`, new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]));
+            await Bun.write(`${dir}/public account.json`, JSON.stringify(account()));
+            await Bun.write(`${dir}/policy artifact.json`, JSON.stringify(artifact()));
+            const cli = `${dir}/target/release/psy_dev_cli`;
+            await Bun.write(cli, '#!/usr/bin/env bun\nawait Bun.write("child.json", JSON.stringify({ args: process.argv.slice(2), env: process.env }));\n');
+            await Bun.$`chmod +x ${cli}`.quiet();
+            const aliases = ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"];
+            const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
+            await ensureGenesisFiles(dir, env);
+            const child = await Bun.file(`${dir}/child.json`).json();
+            expect(child.args).toEqual(["generate-genesis-data", "--repo-root", dir, "--relayer-multisig-account", `${dir}/public account.json`, "--multisig-policy-artifact", `${dir}/policy artifact.json`]);
+            for (const alias of aliases) {
+                expect(child.env[alias]).toBeUndefined();
+                expect(env[alias]).toBe("test-only");
+            }
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("reuses verified Genesis without public inputs and never replaces invalid existing Genesis", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.write(`${dir}/psy-genesis/genesis_contracts.json`, new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]));
+            const genesis = '{"checkpoint_stats":{"block_time":1764248609}}';
+            await Bun.write(`${dir}/genesis.json`, genesis);
+            await ensureGenesisFiles(dir, {});
+            expect(await Bun.file(`${dir}/genesis.json`).text()).toBe(genesis);
+            await Bun.write(`${dir}/genesis.json`, "invalid");
+            await expect(ensureGenesisFiles(dir, {})).rejects.toThrow();
+            expect(await Bun.file(`${dir}/genesis.json`).text()).toBe("invalid");
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+});
+
 describe("resolveProjectsDir", () => {
     it("uses the explicit cohort directory when configured", () => {
         const originalProjectsDir = process.env.PSY_PROJECTS_DIR;
@@ -746,10 +841,6 @@ describe("realm P2P launch planning", () => {
         expect(reservedValidatorUserId(1, 2)).toBe((1 << 20) + (1 << 19));
         expect(LOCAL_DEVNET_RELAYER_REGISTRATION_ID).toBe(2);
         expect(strategy5UserIdFromRegistrationId(LOCAL_DEVNET_RELAYER_REGISTRATION_ID)).toBe(LOCAL_DEVNET_RELAYER_USER_ID);
-        expect(LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY).toBe(
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-        );
-        expect(LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY.startsWith("0x")).toBe(false);
         expect(() => reservedValidatorRegistrationId(2, 1)).toThrow(/realms 0\.\.1/);
     });
 });
@@ -789,5 +880,397 @@ describe("injectGenesisValidators", () => {
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
         }
+    });
+});
+
+describe("guardian launcher config preflight", () => {
+    const configLimitBytes = 64 * 1024 * 1024;
+    const configPathFields = [
+        "authorization_path",
+        "archive_path",
+        "tls_identity_path",
+        "server_ca_path",
+        "authorization_archive_path",
+        "authorization_index_path",
+        "history_tls_certificate_path",
+        "history_tls_private_key_path",
+        "history_client_ca_path",
+    ];
+    const publicGuardianConfig = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        authorization_path: "authorization.json",
+        archive_path: "archive/relayer-journal.json",
+        tls_identity_path: "tls/relayer.pem",
+        server_ca_path: "tls/guardian-ca.pem",
+        authorization_archive_path: "authorization/versions",
+        authorization_index_path: "authorization/index.json",
+        history_tls_certificate_path: "tls/history.pem",
+        history_tls_private_key_path: "tls/history-key.pem",
+        history_client_ca_path: "tls/history-client-ca.pem",
+        endpoints: ["https://guardian-a.example/", "https://guardian-b.example/", "https://guardian-c.example/"],
+        l1_endpoints: [{ chain_index: 0, rpc_url: "https://l1-a.example" }],
+        listen_address: "127.0.0.1:9443",
+        allowed_client_certificate_sha256: [`0x${"ab".repeat(32)}`],
+        ...overrides,
+    });
+    const inTempDir = async (run: (dir: string) => Promise<void>): Promise<void> => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await run(dir);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    };
+    const writeConfig = async (dir: string, file: string, contents: unknown): Promise<void> => {
+        await Bun.write(path.join(dir, file), typeof contents === "string" ? contents : JSON.stringify(contents));
+    };
+    const expectRejection = (dir: string, file: string, message: string): Promise<void> =>
+        expect(resolveGuardianConfigPath(dir, file)).rejects.toThrow(message);
+
+    it("accepts a bounded public GuardianClientConfig and returns the resolved config path", async () => {
+        await inTempDir(async (dir) => {
+            await writeConfig(dir, "guardian-client.json", publicGuardianConfig());
+            await Bun.$`mkdir -p ${path.join(dir, "nested")}`.quiet();
+            await writeConfig(dir, "nested/guardian-client.json", publicGuardianConfig());
+            await writeConfig(dir, "origin-variants.json", publicGuardianConfig({
+                endpoints: ["https://guardian-a.example", "https://guardian-a.example:8443", "https://guardian-b.example"],
+                allowed_client_certificate_sha256: [],
+                l1_endpoints: [],
+            }));
+            expect(await resolveGuardianConfigPath(dir, "guardian-client.json")).toBe(path.resolve(dir, "guardian-client.json"));
+            expect(await resolveGuardianConfigPath(dir, "nested/guardian-client.json")).toBe(path.resolve(dir, "nested", "guardian-client.json"));
+            expect(await resolveGuardianConfigPath(dir, path.join(dir, "guardian-client.json"))).toBe(path.join(dir, "guardian-client.json"));
+            expect(await resolveGuardianConfigPath("/", path.join(dir, "origin-variants.json"))).toBe(path.join(dir, "origin-variants.json"));
+        });
+    });
+
+    it("rejects a missing or blank PSY_GUARDIAN_CONFIG instead of falling back to a wallet", async () => {
+        await inTempDir(async (dir) => {
+            for (const missing of [undefined, "", "   "]) {
+                await expect(resolveGuardianConfigPath(dir, missing)).rejects.toThrow("supply it in the environment or --env");
+            }
+        });
+    });
+
+    it("rejects a guardian service config or any schema drift from GuardianClientConfig", async () => {
+        const missingField = publicGuardianConfig();
+        delete missingField.history_client_ca_path;
+        const cases: Array<[string, unknown]> = [
+            ["guardian service config", { ...publicGuardianConfig(), db_path: "guardian.redb", signing_key_secret_path: "key.json", signing_authorization_path: "signing-authorization.json" }],
+            ["embedded signing key material", { ...publicGuardianConfig(), signing_key_secret_path: "key.json" }],
+            ["missing field", missingField],
+            ["top level array", [publicGuardianConfig()]],
+            ["top level string", '"guardian-client"'],
+            ["top level null", "null"],
+        ];
+        await inTempDir(async (dir) => {
+            for (const [label, contents] of cases) {
+                const file = `schema-${label.replaceAll(" ", "-")}.json`;
+                await writeConfig(dir, file, contents);
+                await expectRejection(dir, file, "expected only GuardianClientConfig public fields");
+            }
+        });
+    });
+
+    it("rejects config-relative path fields that escape the config directory", async () => {
+        const violations: Array<[string, unknown]> = [
+            ["parent traversal", "../escaped/relayer.json"],
+            ["nested parent traversal", "authorization/../../escaped.json"],
+            ["absolute path", "/etc/passwd"],
+            ["current directory component", "./authorization.json"],
+            ["empty component", "authorization//index.json"],
+            ["trailing separator", "authorization/"],
+            ["empty string", ""],
+            ["non string", 7],
+            ["nul byte", "authorization\0.json"],
+        ];
+        await inTempDir(async (dir) => {
+            for (const field of configPathFields) {
+                for (const [label, value] of violations) {
+                    const file = `${field}-${label.replaceAll(" ", "-")}.json`;
+                    await writeConfig(dir, file, publicGuardianConfig({ [field]: value }));
+                    await expectRejection(dir, file, `${field} must be a nonempty config-relative path without traversal`);
+                }
+            }
+        });
+    });
+
+    it("rejects a symlinked, directory, missing or non-JSON guardian config file", async () => {
+        await inTempDir(async (dir) => {
+            await writeConfig(dir, "real.json", publicGuardianConfig());
+            await Bun.$`ln -s ${path.join(dir, "real.json")} ${path.join(dir, "link.json")}`.quiet();
+            await Bun.$`mkdir -p ${path.join(dir, "directory.json")}`.quiet();
+            await writeConfig(dir, "truncated.json", '{"authorization_path":');
+            await writeConfig(dir, "empty.json", "");
+            for (const file of ["link.json", "directory.json", "missing.json", "truncated.json", "empty.json"]) {
+                await expectRejection(dir, file, "the selected path must be a readable, non-symlink regular file containing valid JSON (at most 64 MiB).");
+            }
+            expect(await resolveGuardianConfigPath(dir, "real.json")).toBe(path.resolve(dir, "real.json"));
+        });
+    });
+
+    it("rejects a guardian config above the 64 MiB read limit and accepts one exactly at the limit", async () => {
+        await inTempDir(async (dir) => {
+            const file = "oversized.json";
+            const target = path.join(dir, file);
+            const head = '{"authorization_path":"';
+            const tail = `","archive_path":"archive/relayer-journal.json","endpoints":["https://guardian-a.example/","https://guardian-b.example/","https://guardian-c.example/"],"tls_identity_path":"tls/relayer.pem","server_ca_path":"tls/guardian-ca.pem","authorization_archive_path":"authorization/versions","authorization_index_path":"authorization/index.json","history_tls_certificate_path":"tls/history.pem","history_tls_private_key_path":"tls/history-key.pem","history_client_ca_path":"tls/history-client-ca.pem","l1_endpoints":[{"chain_index":0,"rpc_url":"https://l1-a.example"}],"listen_address":"127.0.0.1:9443","allowed_client_certificate_sha256":["0x${"ab".repeat(32)}"]}`;
+            const writer = Bun.file(target).writer();
+            writer.write(head);
+            const chunk = "a".repeat(1024 * 1024);
+            let remaining = configLimitBytes - head.length - tail.length;
+            while (remaining > 0) {
+                writer.write(remaining >= chunk.length ? chunk : chunk.slice(0, remaining));
+                remaining -= Math.min(remaining, chunk.length);
+            }
+            writer.write(tail);
+            await writer.end();
+            expect(statSync(target).size).toBe(configLimitBytes);
+            expect(await resolveGuardianConfigPath(dir, file)).toBe(target);
+            appendFileSync(target, " ");
+            expect(statSync(target).size).toBe(configLimitBytes + 1);
+            await expectRejection(dir, file, "at most 64 MiB");
+        });
+    });
+
+    it("rejects guardian endpoints that are not three distinct fixed HTTPS origins", async () => {
+        const cases: Array<[string, unknown]> = [
+            ["duplicate origin", ["https://guardian-a.example/", "https://guardian-b.example/", "https://guardian-b.example/"]],
+            ["host case only difference", ["https://guardian-a.example/", "https://Guardian-A.example/", "https://guardian-b.example/"]],
+            ["plain HTTP origin", ["http://guardian-a.example/", "https://guardian-b.example/", "https://guardian-c.example/"]],
+            ["embedded credentials", ["https://user:pass@guardian-a.example/", "https://guardian-b.example/", "https://guardian-c.example/"]],
+            ["non root path", ["https://guardian-a.example/admin", "https://guardian-b.example/", "https://guardian-c.example/"]],
+            ["query string", ["https://guardian-a.example/?x=1", "https://guardian-b.example/", "https://guardian-c.example/"]],
+            ["fragment", ["https://guardian-a.example/#frag", "https://guardian-b.example/", "https://guardian-c.example/"]],
+            ["missing host", ["https:///", "https://guardian-b.example/", "https://guardian-c.example/"]],
+            ["unparseable entry", ["not a url", "https://guardian-b.example/", "https://guardian-c.example/"]],
+            ["non string entry", ["https://guardian-a.example/", 7, "https://guardian-c.example/"]],
+            ["two entries", ["https://guardian-a.example/", "https://guardian-b.example/"]],
+            ["four entries", ["https://guardian-a.example/", "https://guardian-b.example/", "https://guardian-c.example/", "https://guardian-d.example/"]],
+            ["not an array", "https://guardian-a.example/"],
+        ];
+        await inTempDir(async (dir) => {
+            for (const [label, endpoints] of cases) {
+                const file = `endpoints-${label.replaceAll(" ", "-")}.json`;
+                await writeConfig(dir, file, publicGuardianConfig({ endpoints }));
+                await expectRejection(dir, file, "endpoints must name three distinct fixed HTTPS origins");
+            }
+        });
+    });
+
+    it("rejects invalid history listener, client certificate pins or L1 endpoint fields", async () => {
+        const cases: Array<[string, unknown]> = [
+            ["blank listen address", { listen_address: "   " }],
+            ["non string listen address", { listen_address: 9443 }],
+            ["pins not an array", { allowed_client_certificate_sha256: `0x${"ab".repeat(32)}` }],
+            ["uppercase digest", { allowed_client_certificate_sha256: [`0x${"AB".repeat(32)}`] }],
+            ["digest without prefix", { allowed_client_certificate_sha256: ["ab".repeat(32)] }],
+            ["short digest", { allowed_client_certificate_sha256: [`0x${"ab".repeat(31)}`] }],
+            ["l1 endpoints not an array", { l1_endpoints: {} }],
+            ["null l1 endpoint", { l1_endpoints: [null] }],
+            ["unknown l1 endpoint field", { l1_endpoints: [{ chain_index: 0, rpc_url: "https://l1-a.example", chain_id: 1 }] }],
+            ["chain index above u8", { l1_endpoints: [{ chain_index: 256, rpc_url: "https://l1-a.example" }] }],
+            ["negative chain index", { l1_endpoints: [{ chain_index: -1, rpc_url: "https://l1-a.example" }] }],
+            ["fractional chain index", { l1_endpoints: [{ chain_index: 1.5, rpc_url: "https://l1-a.example" }] }],
+            ["string chain index", { l1_endpoints: [{ chain_index: "0", rpc_url: "https://l1-a.example" }] }],
+            ["non string rpc url", { l1_endpoints: [{ chain_index: 0, rpc_url: 7 }] }],
+        ];
+        await inTempDir(async (dir) => {
+            for (const [label, overrides] of cases) {
+                const file = `tail-${label.replaceAll(" ", "-")}.json`;
+                await writeConfig(dir, file, publicGuardianConfig(overrides as Record<string, unknown>));
+                await expectRejection(dir, file, "invalid history listener, client certificate pins or L1 endpoint fields");
+            }
+        });
+    });
+});
+
+describe("guardian config selection precedence", () => {
+    it("requires PSY_GUARDIAN_CONFIG whenever a relayer, bridge proposer or bridge UI launches", () => {
+        // ProcessOptions.bridgeUi is set by the process-manager path, not by a CLI flag.
+        expect(shouldRequireGuardianConfig(true, {})).toBe(true);
+        expect(shouldRequireGuardianConfig(false, { relayer: true })).toBe(true);
+        expect(shouldRequireGuardianConfig(false, { bridgeProposerDaemon: true })).toBe(true);
+        expect(shouldRequireGuardianConfig(false, { bridgeUi: true })).toBe(true);
+    });
+
+    it("does not require PSY_GUARDIAN_CONFIG for memory, db or explicit-only runs", () => {
+        expect(shouldRequireGuardianConfig(false, {})).toBe(false);
+        expect(shouldRequireGuardianConfig(false, { relayer: false, bridgeProposerDaemon: false, bridgeUi: false })).toBe(false);
+    });
+});
+
+describe("whole bridge daemon config forwarding", () => {
+    const daemonToml = `rpc_config = "rpc.json"
+services_url = "http://127.0.0.1:3000"
+guardian_config = "guardian.json"
+aggregate_setup_config = "setup.json"
+aggregate_artifact_dir = "artifacts"
+aggregation_token_file = "token"
+withdraw_method_id = 4159421846
+[aggregate_limits]
+max_deposits = 1
+reserved_withdrawals = 1
+reserved_rewards = 0
+max_a_calldata_bytes = 4096
+max_b_calldata_bytes = 4096
+[[aggregate_limits.chains]]
+chain_index = 0
+max_deposits = 1
+reserved_withdrawals = 1
+tx_gas_limit = 5000000
+block_gas_reserve = 100000
+[[chains]]
+chain_index = 0
+family = "evm"
+network_id = "synthetic"
+rpc_urls = ["http://127.0.0.1:8545"]
+deployments_network = "localhost"
+keystore_path = "signer"
+password_env = "SYNTHETIC_PASSWORD"
+`;
+    const fixture = async (run: (cwd: string, env: NodeJS.ProcessEnv) => Promise<void>) => {
+        const cwd = await mkdtemp(path.join(tmpdir(), "daemon-public-preflight-"));
+        try {
+            await mkdir(path.join(cwd, "artifacts"));
+            await mkdir(path.join(cwd, "authorization"));
+            for (const file of ["rpc.json", "setup.json", "token", "signer", "public-reference"]) await writeFile(path.join(cwd, file), "synthetic metadata fixture, not credentials");
+            await writeFile(path.join(cwd, "guardian.json"), JSON.stringify({
+                authorization_path: "public-reference", archive_path: "new-history/journal.json",
+                tls_identity_path: "public-reference", server_ca_path: "public-reference",
+                authorization_archive_path: "authorization", authorization_index_path: "public-reference",
+                history_tls_certificate_path: "public-reference", history_tls_private_key_path: "public-reference",
+                history_client_ca_path: "public-reference",
+                endpoints: ["https://a.example", "https://b.example", "https://c.example"],
+                l1_endpoints: [], listen_address: "127.0.0.1:9443", allowed_client_certificate_sha256: [],
+            }));
+            await writeFile(path.join(cwd, "daemon.toml"), daemonToml);
+            await run(cwd, { PSY_BRIDGE_DAEMON_CONFIG: "daemon.toml" });
+        } finally { await rm(cwd, { recursive: true, force: true }); }
+    };
+
+    it("forwards nested TOML unchanged, resolving from launch cwd without reading protected contents", async () => {
+        await fixture(async (cwd, env) => {
+            for (const file of ["token", "signer", "public-reference"]) await chmod(path.join(cwd, file), 0);
+            expect(await resolveBridgeDaemonConfigPath(cwd, env, true)).toBe(path.join(cwd, "daemon.toml"));
+            expect(await Bun.file(path.join(cwd, "daemon.toml")).text()).toBe(daemonToml);
+            await validateRelayerTemplate(["./target/release/psy_relayer_cli", "--config", "daemon.toml"], { cwd, env: env as Record<string, string> });
+        });
+    });
+
+    it("rejects missing config, missing inputs and unsupported TOML capability without parser details", async () => {
+        await fixture(async (cwd, env) => {
+            await expect(resolveBridgeDaemonConfigPath(cwd, {})).rejects.toThrow("config path");
+            await expect(resolveBridgeDaemonConfigPath(cwd, env, false, null as never)).rejects.toThrow("Bun.TOML.parse");
+            await writeFile(path.join(cwd, "daemon.toml"), 'private_key = "SYNTHETIC-DO-NOT-REPORT"\n[broken');
+            try { await resolveBridgeDaemonConfigPath(cwd, env); throw new Error("accepted malformed TOML"); }
+            catch (error) {
+                expect(String(error)).toContain("TOML document");
+                expect(String(error)).not.toContain("SYNTHETIC-DO-NOT-REPORT");
+            }
+            await writeFile(path.join(cwd, "daemon.toml"), daemonToml);
+            await rm(path.join(cwd, "token"));
+            await expect(resolveBridgeDaemonConfigPath(cwd, env)).rejects.toThrow("aggregation_token_file metadata");
+        });
+    });
+
+    it("rejects nested inline keys without exposing their values", async () => {
+        await fixture(async (cwd, env) => {
+            await writeFile(path.join(cwd, "daemon.toml"), daemonToml + 'private_key = "SYNTHETIC-DO-NOT-REPORT"\n');
+            try { await resolveBridgeDaemonConfigPath(cwd, env); throw new Error("accepted inline key"); }
+            catch (error) {
+                expect(String(error)).toContain("inline private_key");
+                expect(String(error)).not.toContain("SYNTHETIC-DO-NOT-REPORT");
+            }
+        });
+    });
+
+    it("requires integer fields and rejects width overflow, fractional and rounded unsafe numbers", async () => {
+        await fixture(async (cwd, env) => {
+            for (const [before, after] of [
+                ["chain_index = 0", "chain_index = 256"],
+                ["max_deposits = 1", "max_deposits = 4294967296"],
+                ["reserved_rewards = 0", "reserved_rewards = -1"],
+                ["tx_gas_limit = 5000000", "tx_gas_limit = 1.5"],
+                ["block_gas_reserve = 100000", "block_gas_reserve = 9007199254740993.0"],
+                ["max_b_calldata_bytes = 4096", "# absent byte budget"],
+            ]) {
+                await writeFile(path.join(cwd, "daemon.toml"), daemonToml.replace(before, after));
+                await expect(resolveBridgeDaemonConfigPath(cwd, env)).rejects.toThrow("aggregate_limits");
+            }
+            const parsed = Bun.TOML.parse(daemonToml) as Record<string, unknown>;
+            parsed.withdraw_method_id = 1n << 64n;
+            await expect(resolveBridgeDaemonConfigPath(cwd, env, false, () => parsed)).rejects.toThrow("withdraw_method_id");
+        });
+    });
+
+    it("rejects lexical and realpath purge containment including absent history outputs", async () => {
+        await fixture(async (cwd, env) => {
+            await mkdir(path.join(cwd, "logs"));
+            await writeFile(path.join(cwd, "logs", "token"), "synthetic");
+            await symlink(path.join(cwd, "logs"), path.join(cwd, "alias"));
+            for (const token of ["logs/token", "alias/token"]) {
+                await writeFile(path.join(cwd, "daemon.toml"), daemonToml.replace('aggregation_token_file = "token"', `aggregation_token_file = "${token}"`));
+                await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("aggregation_token_file metadata");
+                expect(await resolveBridgeDaemonConfigPath(cwd, env)).toBe(path.join(cwd, "daemon.toml"));
+            }
+            await writeFile(path.join(cwd, "daemon.toml"), daemonToml);
+            const guardian = JSON.parse(await Bun.file(path.join(cwd, "guardian.json")).text());
+            guardian.archive_path = "alias/absent/journal.json";
+            await writeFile(path.join(cwd, "guardian.json"), JSON.stringify(guardian));
+            await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("archive_path metadata");
+        });
+    });
+
+    it("checks a symlinked purge target and rejects mismatched guardian or replay config", async () => {
+        await fixture(async (cwd, env) => {
+            await symlink(path.join(cwd, "artifacts"), path.join(cwd, "logs"));
+            await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("aggregate_artifact_dir metadata");
+            await expect(resolveBridgeDaemonConfigPath(cwd, { ...env, PSY_GUARDIAN_CONFIG: "other.json" })).rejects.toThrow("coherence");
+            await expect(validateRelayerTemplate(["psy_relayer_cli", "--config", "other.toml"], { cwd, env: env as Record<string, string> })).rejects.toThrow("saved --config coherence");
+        });
+    });
+
+    it("rejects manual restart before stopping live applications and resume before any spawn", async () => {
+        await fixture(async (cwd, env) => {
+            const manager = new DevNetProcessManager();
+            const relayer = processTemplate("bridge_relayer", ["psy_relayer_cli", "--config", "daemon.toml"]);
+            relayer.spawnOptions = { cwd, env: env as Record<string, string> };
+            manager.spawnedProcesses = [relayer];
+            const stop = spyOn(manager, "stopApplications").mockResolvedValue(undefined);
+            const spawn = spyOn(RunningProcess, "spawn");
+            try {
+                await rm(path.join(cwd, "token"));
+                await expect(manager.restartApplications("/not-the-launch-cwd")).rejects.toThrow("aggregation_token_file");
+                expect(stop).not.toHaveBeenCalled();
+                expect(manager.spawnedProcesses).toEqual([relayer]);
+                // Exercise saved supervisor state without starting any child processes.
+                const lifecycle = manager as unknown as {
+                    applicationLifecycleState: string;
+                    pausedApplicationProcesses: RunningProcess[];
+                    spawnFromTemplate(template: RunningProcess, banner: string, track: boolean): Promise<RunningProcess>;
+                };
+                lifecycle.applicationLifecycleState = "stopped";
+                lifecycle.pausedApplicationProcesses = [processTemplate("worker", ["psy_worker_cli"]), relayer];
+                await expect(manager.startApplications()).rejects.toThrow("aggregation_token_file");
+                await expect(lifecycle.spawnFromTemplate(relayer, "automatic restart", false)).rejects.toThrow("aggregation_token_file");
+                expect(spawn).not.toHaveBeenCalled();
+            } finally { stop.mockRestore(); spawn.mockRestore(); }
+        });
+    });
+
+    it("blocks the actual spawn before logs and leaves non-relayer validation unchanged", async () => {
+        await fixture(async (cwd, env) => {
+            await rm(path.join(cwd, "token"));
+            await expect(RunningProcess.spawn(["psy_relayer_cli", "--config", "daemon.toml"], {
+                cwd, env: env as Record<string, string>, stdoutLogFile: path.join(cwd, "never-written.log"),
+            })).rejects.toThrow("aggregation_token_file");
+            expect(await Bun.file(path.join(cwd, "never-written.log")).exists()).toBe(false);
+            await validateRelayerTemplate(["psy_worker_cli"], { cwd: "/missing", env: {} });
+        });
+    });
+
+    it("requires the aggregate daemon marker, never indexer or legacy readiness", () => {
+        expect(relayerStartedDetector("INFO aggregate bridge relayer started config=/public/daemon.toml chain_count=1")).toBe(true);
+        for (const line of ["connected to indexer postgres", "envio schema is ready", "indexer deposit sync window", "bridge relayer started", "aggregate bridge relayer startedness"]) expect(relayerStartedDetector(line)).toBe(false);
     });
 });

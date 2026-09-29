@@ -21,9 +21,9 @@ async fn main() -> anyhow::Result<()> {
 
     let psy_config = PsyConfigGoldilocks::from_file(&cfg_path.to_string_lossy())?;
     let rpc_config = psy_config.get_current_network()?.clone();
-    let keys: Vec<String> = serde_json::from_str(&std::fs::read_to_string(keys_path)?)?;
-    let user0_sk = QHashOut::<GoldilocksField>::from_str(&keys[0])?;
-    let user1_sk = QHashOut::<GoldilocksField>::from_str(&keys[1])?;
+    let keys: Vec<Option<String>> = serde_json::from_str(&std::fs::read_to_string(keys_path)?)?;
+    let user0_sk = QHashOut::<GoldilocksField>::from_str(keys.get(0).and_then(Option::as_deref).context("genesis registration 0 has no private key")?)?;
+    let user1_sk = QHashOut::<GoldilocksField>::from_str(keys.get(1).and_then(Option::as_deref).context("genesis registration 1 has no private key")?)?;
 
     let mut wallet_session = WalletSession::new(&rpc_config).await?;
     let user0_pk = wallet_session.get_zk_public_key(user0_sk).await?;

@@ -56,6 +56,7 @@ scylla = { workspace = true }
 chrono = { workspace = true }
 url = { workspace = true }
 zstd = { workspace = true }
+sha2 = { workspace = true }
 
 # start local packages
 pser = { workspace = true }
@@ -76,8 +77,16 @@ psy_config = { workspace = true }
 psy_plonky2_circuits = { workspace = true }
 psy_cli_common = { path = "../psy_cli_common" }
 psy_client_common = { workspace = true }
+psy_vm = { workspace = true }
+psy_ups_circuit = { workspace = true }
+psy_prover = { workspace = true }
+psy_client_data = { workspace = true }
 psy_jtmb_testing_core = { workspace = true }
 psy_node_scylla = { workspace = true }
 psy_node_redis = { workspace = true }
 psy_node_nats = { workspace = true }
 
+
+[dev-dependencies]
+k256 = { workspace = true }
+psy_crypto = { workspace = true }

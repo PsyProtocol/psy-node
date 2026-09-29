@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use k256::ecdsa::SigningKey;
+use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::PoseidonPermutation};
 use psy_client_common::data::{base_types::hash256::Hash256, qhashout::QHashOut};
 use psy_client_data::config::store_config::{PsyPlonky2Config, PsyProof};
@@ -11,6 +11,8 @@ use psy_crypto::signature::{
     },
     zk::data::ZKPublicKeyInfo,
 };
+use psy_ups_circuit::signature::reward_authorization::{RewardAuthorizationCircuits, RewardAuthorizationContext, RewardAuthorizationInput};
+use psy_vm::reward_authorization::RewardAuthorizationWitness;
 use psy_vm::ups::circuit_manager::UPSCircuitManager;
 
 use crate::{
@@ -41,6 +43,22 @@ impl SECP256K1User {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SignatureUser for SECP256K1User {
+    fn prove_reward_authorization(&self, context: &RewardAuthorizationContext, circuits: &RewardAuthorizationCircuits) -> Result<Option<PsyProof>> {
+        let message = context.message()?;
+        let private_key: Hash256 = self.private_key.into();
+        let key = SigningKey::from_slice(&private_key.0)?;
+        let signature: k256::ecdsa::Signature = key.sign_prehash(&message)?;
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let input = RewardAuthorizationInput {
+            context: context.clone(),
+            authorization: RewardAuthorizationWitness::Secp {
+                compressed_public_key: key.verifying_key().to_encoded_point(true).as_bytes().try_into()?,
+                signature_rs: signature.to_bytes().into(),
+            },
+        };
+        circuits.secp.prove(&input).map(Some)
+    }
+
     async fn public_key_info(
         &self,
         _wallet: &PsyMemoryWallet,

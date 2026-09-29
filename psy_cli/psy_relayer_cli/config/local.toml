@@ -1,3 +1,4 @@
+guardian_config = "guardian-client.json"
 # Reference template — locSetupV4 generates the actual daemon.toml at runtime
 # with absolute paths resolved from the current machine.
 rpc_config = "psy-genesis/config.json"
@@ -7,10 +8,6 @@ proof_dir = "local_checkpoints/bridge_proposer"
 poll_interval_secs = 15
 confirmation_lag_checkpoints = 3
 max_checkpoint_batch = 32
-
-[relayer_wallet]
-sign_type = "ZKSign"
-keystore_path = "<HOME>/.psy/keystore/bridge-relayer"
 
 [finalize]
 l1_rpc_url = "http://127.0.0.1:8545"

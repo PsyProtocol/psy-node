@@ -104,14 +104,12 @@ clean-db:
 config_gen_v2:
 	cargo run --release --package psy_plonky2_circuits --example config_gen_v2
 
-# Registration 2 (user_id 524288) is derived from an encrypted UTC JSON keystore
-# when one of these is set and the file exists:
-#   PSY_BRIDGE_RELAYER_KEYSTORE_PATH, BRIDGE_RELAYER_KEYSTORE_PATH, KEYSTORE_PATH
-# Decrypts with WALLET_PASSWORD. First set alias wins; a missing set path fails closed.
-#   WALLET_PASSWORD=… PSY_BRIDGE_RELAYER_KEYSTORE_PATH=$HOME/.psy/keystore/bridge-relayer \
-#     make generate-genesis-data
+# Public-only registration 2 (user_id 524288), independent of L1 signer custody.
+# Supply PSY_RELAYER_MULTISIG_ACCOUNT and PSY_MULTISIG_POLICY_ARTIFACT public JSON paths.
 generate-genesis-data:
-	${BIN_PREFIX}psy_dev_cli generate-genesis-data
+	@test -n "$(PSY_RELAYER_MULTISIG_ACCOUNT)" || { echo "PSY_RELAYER_MULTISIG_ACCOUNT is required" >&2; exit 1; }
+	@test -n "$(PSY_MULTISIG_POLICY_ARTIFACT)" || { echo "PSY_MULTISIG_POLICY_ARTIFACT is required" >&2; exit 1; }
+	@env -u PRIVATE_KEY -u BRIDGE_RELAYER_L2_PRIVATE_KEY -u KEYSTORE_PATH -u PSY_BRIDGE_RELAYER_KEYSTORE_PATH -u BRIDGE_RELAYER_KEYSTORE_PATH -u WALLET_PASSWORD ${BIN_PREFIX}psy_dev_cli generate-genesis-data --repo-root "$(CURDIR)" --relayer-multisig-account "$(PSY_RELAYER_MULTISIG_ACCOUNT)" --multisig-policy-artifact "$(PSY_MULTISIG_POLICY_ARTIFACT)"
 
 # Regenerates client_prover/psy_prover/src/wallet/local_circuits.json (embedded
 # zk-sign + privacy base circuits). Needed whenever the circuit-defining

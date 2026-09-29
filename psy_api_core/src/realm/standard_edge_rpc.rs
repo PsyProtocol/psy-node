@@ -305,6 +305,8 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         user_id: u64,
         contract_id: u32,
         key: Hash,
+        state_slot_base: u64,
+        capacity: u64,
     ) -> RpcResult<IMTMembershipProof<F, Hash>>;
 
     /// Get an IMT non-membership proof: proves key K does NOT exist.

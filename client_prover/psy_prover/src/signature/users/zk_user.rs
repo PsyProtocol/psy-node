@@ -4,6 +4,8 @@ use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::Poseidon
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::config::store_config::{PsyPlonky2Config, PsyProof};
 use psy_crypto::signature::zk::{data::ZKPublicKeyInfo, wallet::SimplePsyPrivateKey};
+use psy_ups_circuit::signature::reward_authorization::{RewardAuthorizationCircuits, RewardAuthorizationContext, RewardAuthorizationInput};
+use psy_vm::reward_authorization::RewardAuthorizationWitness;
 use psy_vm::ups::circuit_manager::UPSCircuitManager;
 
 use crate::{
@@ -28,6 +30,14 @@ impl ZKUser {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SignatureUser for ZKUser {
+    fn prove_reward_authorization(&self, context: &RewardAuthorizationContext, circuits: &RewardAuthorizationCircuits) -> Result<Option<PsyProof>> {
+        let input = RewardAuthorizationInput {
+            context: context.clone(),
+            authorization: RewardAuthorizationWitness::Zk { private_key: self.private_key.private_key },
+        };
+        circuits.zk.prove(&input).map(Some)
+    }
+
     async fn public_key_info(
         &self,
         wallet: &PsyMemoryWallet,

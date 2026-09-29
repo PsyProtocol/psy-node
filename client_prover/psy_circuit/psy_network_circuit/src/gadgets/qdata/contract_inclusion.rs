@@ -107,11 +107,8 @@ impl PsyContractFunctionInclusionProofGadget {
             MerkleProofGadget::add_virtual_to_get_index_bits::<H, F, D>(builder, CONTRACT_FUNCTION_TREE_HEIGHT as usize);
         // END: create targets that require witness
 
-        // ensure that the index in the function tree is aligned to four leaves (two
-        // least significant bits are 0) this is because each function takes up
-        // four leaves (fingerprint, metadata, code hash, reserved)
+        // Fingerprints occupy even leaves; the odd sibling stores method metadata.
         builder.assert_zero(cf_merkle_proof_index_bits[0].target);
-        // builder.assert_zero(cf_merkle_proof_index_bits[1].target);
 
         // ensure the function_tree_root in the contract leaf matches our function tree
         // merkle proof's root
@@ -122,8 +119,7 @@ impl PsyContractFunctionInclusionProofGadget {
 
         // START: setup computed targets
 
-        // each function has four leaves: fingerprint, metadata, code hash, reserved
-        // zero
+        // Code hashes are committed separately in the contract code root.
 
         let function_verifier_fingerprint = contract_function_merkle_proof.value;
         let method_id = contract_function_merkle_proof.siblings[0].elements[0];

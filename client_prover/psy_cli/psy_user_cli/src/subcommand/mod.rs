@@ -154,8 +154,7 @@ pub enum Commands {
     Withdraw(crate::subcommand::args::WithdrawArgs),
     /// Deposit tokens from L1 to L2 via the Router contract.
     Deposit(crate::subcommand::args::DepositArgs),
-    /// Claim a withdrawal on L1. Fetches the Merkle proof from psy-services
-    /// and optionally generates a Groth16 proof + submits to L1 Bridge.
+    /// Prove a withdrawal at the service-selected checkpoint and submit it for aggregation.
     ClaimWithdrawal(crate::subcommand::args::ClaimWithdrawalArgs),
 
     ExportPrivateKey(ExportKeyStoreArgs),

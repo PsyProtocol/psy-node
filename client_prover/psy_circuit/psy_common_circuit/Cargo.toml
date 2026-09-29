@@ -24,6 +24,7 @@ psy_client_common = { workspace = true }
 psy_client_data = { workspace = true }
 psy_vm = { workspace = true }
 psy_plonky2_common_circuits = { workspace = true }
+psy_plonky2_basic_helpers = { workspace = true, default-features = false }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 maybe-async = { workspace = true }

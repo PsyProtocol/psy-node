@@ -5,7 +5,7 @@ use anyhow::{anyhow, Context};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::TransactionRequest;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use gnark_plonky2_verifier_ffi as g16;
 use parth_core::{felt::ToU64Value, pgoldilocks::QHashOut};
 use plonky2::{
@@ -19,6 +19,7 @@ use tokio_postgres::NoTls;
 use url::Url;
 
 mod bridge;
+mod guardian;
 
 #[derive(Parser)]
 #[command(name = "psy_relayer_cli")]
@@ -32,6 +33,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run one independently verifying guardian signer with protected runtime configuration.
+    GuardianService {
+        #[arg(long)]
+        runtime_config: PathBuf,
+    },
+    /// Create a new guardian database; never use for a key with an existing signing-key journal.
+    GuardianCreateDb {
+        #[arg(long)]
+        runtime_config: PathBuf,
+    },
+    /// Register, bootstrap, or replace the bridge multisig policy.
+    GuardianPolicy {
+        #[arg(long)]
+        rpc_config: String,
+        #[arg(long)]
+        guardian_config: String,
+        /// Distinguishes register, bootstrap, and replace; circuit bootstrap remains a separate path.
+        #[arg(long)]
+        intent: GuardianPolicyIntent,
+        #[arg(long)]
+        exclusive_registration_intake: bool,
+        #[arg(long)]
+        next_members_json: Option<String>,
+    },
     /// Initialize keystore (generate or load Groth16 proving/verification keys)
     Initialize { keystore_dir: String },
     /// Export Solidity verifier contract from an initialized keystore.
@@ -51,7 +76,7 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Call StateManager.finalize with a generated bridge proof JSON.
+    /// Send one Bridge deposit aggregate or StateManager checkpoint aggregate and print its transaction hash.
     FinalizeBridgeAgg(bridge::finalize_bridge::FinalizeBridgeAggArgs),
     /// Submit a proposer-managed batch of finalized withdrawals.
     ClaimWithdrawals(bridge::claim_withdrawals::BatchWithdrawalsArgs),
@@ -59,6 +84,13 @@ enum Commands {
     ComputeDepositLeaf(bridge::compute_deposit_leaf::ComputeDepositLeafArgs),
     /// Regenerate local Groth16 keystore files for bridge wrapper circuits.
     RegenerateGroth16Keystore(bridge::regen_groth16_keystore::RegenerateGroth16KeystoreArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum GuardianPolicyIntent {
+    Register,
+    Bootstrap,
+    Replace,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +189,33 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => run_bridge_daemon(cli.config).await,
+        Some(Commands::GuardianService { runtime_config }) => guardian::service::run(&runtime_config).await.map_err(Into::into),
+        Some(Commands::GuardianCreateDb { runtime_config }) => guardian::service::create_db(&runtime_config).await.map_err(Into::into),
+        Some(Commands::GuardianPolicy { rpc_config, guardian_config, intent, exclusive_registration_intake, next_members_json }) => match intent {
+            GuardianPolicyIntent::Register => {
+                if next_members_json.is_some() {
+                    anyhow::bail!("guardian-policy register does not accept --next-members-json");
+                }
+                bridge::daemon::run_guardian_register(&rpc_config, &guardian_config, exclusive_registration_intake).await
+            }
+            GuardianPolicyIntent::Bootstrap => {
+                if exclusive_registration_intake {
+                    anyhow::bail!("guardian-policy bootstrap does not accept --exclusive-registration-intake");
+                }
+                if next_members_json.is_some() {
+                    anyhow::bail!("guardian-policy bootstrap does not accept --next-members-json");
+                }
+                bridge::daemon::run_guardian_bootstrap(&rpc_config, &guardian_config).await
+            }
+            GuardianPolicyIntent::Replace => {
+                if exclusive_registration_intake {
+                    anyhow::bail!("guardian-policy replace does not accept --exclusive-registration-intake");
+                }
+                let members_json = next_members_json.ok_or_else(|| anyhow::anyhow!("guardian-policy replace requires --next-members-json"))?;
+                let members = guardian::protocol::parse_canonical_json::<[guardian::protocol::Hash4; 3]>(members_json.as_bytes())?;
+                bridge::daemon::run_guardian_replace_policy(&rpc_config, &guardian_config, members).await
+            }
+        },
         Some(Commands::Initialize { keystore_dir }) => {
             tracing::info!("Initializing keystore at: {}", keystore_dir);
             g16::initialize(&keystore_dir);

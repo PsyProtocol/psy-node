@@ -1,4 +1,5 @@
 pub mod common;
+pub mod bridge_aggregate;
 pub mod store;
 pub use store::UserProverWorkerStore;
 

@@ -63,9 +63,6 @@ USER0_SECP_ZK_PUBLIC_KEY := 49deab842acf3d26236419d4fce1b2cb01081aef55d4ef0e566f
 USER1_PRIVATE_KEY        := $(shell jq -r '.[1]' $(PRIVATE_KEYS_FILE))
 USER1_PUBLIC_KEY         := cf62ae15751624548ad897c22fa1598ab82b7a2ad7de6e42c921d433efa10c91
 USER1_SECP_ZK_PUBLIC_KEY := ac85e11f5c8a53241502c4519567aa3f02d30b1639fc49bb94c1d61335197e1a
-USER2_PRIVATE_KEY        := $(shell jq -r '.[2]' $(PRIVATE_KEYS_FILE))
-USER2_PUBLIC_KEY         := 7fe4d043d0d6ac7383800233d503e6f94797ab6733f57c24f93a31a1cb242b21
-USER2_SECP_ZK_PUBLIC_KEY := 2b280f7354a6648e1d37499d211876d4f68d703c4dbf4dd8ccee032a4da5f220
 USER3_PRIVATE_KEY        := $(shell jq -r '.[3]' $(PRIVATE_KEYS_FILE))
 USER3_PUBLIC_KEY         := f79b7a821bb0a4e027b212c5534338617013e171d54e1131ab5f0a9dabebba82
 USER3_SECP_ZK_PUBLIC_KEY := 1e44a84db33d52243068ccfbf6519beb1e072d1128ee792fe62896a3338db2a4
@@ -119,18 +116,14 @@ random-wallet:
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) wallet random --sign-type ${SIGN_TYPE}
 
 register-user:
-	@echo "Registering all 4 users..."
+	@echo "Registering USER0 and USER1 test accounts..."
 	@RUST_LOG=error $(USER_CLI) register-user --private-key=${USER0_PRIVATE_KEY} --sign-type zk | tail -5 | jq .
 	@sleep 0.5
 	@RUST_LOG=error $(USER_CLI) register-user --private-key=${USER1_PRIVATE_KEY} --sign-type zk | tail -5 | jq .
 	@sleep 0.5
-	@RUST_LOG=error $(USER_CLI) register-user --private-key=${USER2_PRIVATE_KEY} --sign-type zk | tail -5 | jq .
-	@sleep 0.5
 	@RUST_LOG=error $(USER_CLI) register-user --private-key=${USER0_PRIVATE_KEY} --sign-type secp256k1 | tail -5 | jq .
 	@sleep 0.5
 	@RUST_LOG=error $(USER_CLI) register-user --private-key=${USER1_PRIVATE_KEY} --sign-type secp256k1 | tail -5 | jq .
-	@sleep 0.5
-	@RUST_LOG=error $(USER_CLI) register-user --private-key=${USER2_PRIVATE_KEY} --sign-type secp256k1 | tail -5 | jq .
 	@echo "Waiting 6s for users to be registered..."
 	@sleep 6
 

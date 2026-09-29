@@ -7,7 +7,6 @@ use plonky2::{
 use psy_plonky2_basic_helpers::u32::{
     gadgets::{
         arithmetic_u32::{CircuitBuilderU32, U32Target},
-        interleaved_u32::CircuitBuilderB32,
     },
     witness::WitnessU32,
 };
@@ -43,60 +42,83 @@ const KECCAKF_PILN: [usize; 24] = [
     15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
 ];
 
-// Keccak state: 25 lanes, each represented as [lo_u32, hi_u32] (LE).
-type KeccakState<'a> = &'a mut [[U32Target; 2]; 25];
+fn xor_bit<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    left: BoolTarget,
+    right: BoolTarget,
+) -> BoolTarget {
+    let sum = builder.add(left.target, right.target);
+    // Boolean inputs make a + b - 2ab Boolean without another witness.
+    BoolTarget::new_unsafe(builder.arithmetic(-F::TWO, F::ONE, left.target, right.target, sum))
+}
+
+/// XOR two u32 halves, constraining both operands to exactly 32 bits.
+pub(crate) fn xor_u32_bounded<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    left: U32Target,
+    right: U32Target,
+) -> U32Target {
+    let left = builder.split_le(left.0, 32);
+    let right = builder.split_le(right.0, 32);
+    let output: [BoolTarget; 32] = std::array::from_fn(|i| xor_bit(builder, left[i], right[i]));
+    U32Target(builder.le_sum(output.iter()))
+}
 
 /// Apply the Keccak-f[1600] permutation in-circuit (24 rounds).
 pub fn keccak_f1600<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     s: &mut [[U32Target; 2]; 25],
 ) {
-    let zero = builder.zero_u32();
-    let mut bc = [[zero; 2]; 5];
-
-    let rndc: [[U32Target; 2]; 24] = std::array::from_fn(|i| {
-        [
-            builder.constant_u32(KECCAKF_RNDC[i][0]),
-            builder.constant_u32(KECCAKF_RNDC[i][1]),
-        ]
+    let mut state: [[BoolTarget; 64]; 25] = std::array::from_fn(|lane| {
+        let lo = builder.split_le(s[lane][0].0, 32);
+        let hi = builder.split_le(s[lane][1].0, 32);
+        std::array::from_fn(|bit| if bit < 32 { lo[bit] } else { hi[bit - 32] })
     });
 
-    for rndc_i in &rndc {
-        // Theta
-        for i in 0..5 {
-            bc[i] = builder.unsafe_xor_many_u64(&[s[i], s[i + 5], s[i + 10], s[i + 15], s[i + 20]]);
-        }
-        for i in 0..5 {
-            let t1 = builder.lrot_u64(&bc[(i + 1) % 5], 1);
-            let t2 = builder.xor_u64(&bc[(i + 4) % 5], &t1);
-            for j in 0..5 {
-                s[5 * j + i] = builder.xor_u64(&s[5 * j + i], &t2);
+    for rndc in KECCAKF_RNDC {
+        let columns: [[BoolTarget; 64]; 5] = std::array::from_fn(|x| {
+            std::array::from_fn(|bit| {
+                (1..5).fold(state[x][bit], |parity, y| xor_bit(builder, parity, state[x + 5 * y][bit]))
+            })
+        });
+        for x in 0..5 {
+            for bit in 0..64 {
+                let delta = xor_bit(builder, columns[(x + 4) % 5][bit], columns[(x + 1) % 5][(bit + 63) % 64]);
+                for y in 0..5 {
+                    state[x + 5 * y][bit] = xor_bit(builder, state[x + 5 * y][bit], delta);
+                }
             }
         }
 
-        // Rho Pi (combined)
-        let mut t = s[1];
+        let mut carried = state[1];
         for i in 0..24 {
-            let j = KECCAKF_PILN[i];
-            let tmp = s[j];
-            s[j] = builder.lrot_u64(&t, KECCAKF_ROTC[i]);
-            t = tmp;
+            let lane = KECCAKF_PILN[i];
+            let old = state[lane];
+            state[lane] = std::array::from_fn(|bit| carried[(bit + 64 - KECCAKF_ROTC[i] as usize) % 64]);
+            carried = old;
         }
 
-        // Chi
-        for j in 0..5 {
-            for i in 0..5 {
-                bc[i] = s[5 * j + i];
-            }
-            for i in 0..5 {
-                let t1 = builder.not_u64(&bc[(i + 1) % 5]);
-                let t2 = builder.and_u64(&bc[(i + 2) % 5], &t1);
-                s[5 * j + i] = builder.xor_u64(&s[5 * j + i], &t2);
+        for y in 0..5 {
+            let row: [[BoolTarget; 64]; 5] = std::array::from_fn(|x| state[5 * y + x]);
+            for x in 0..5 {
+                for bit in 0..64 {
+                    let inverted = builder.not(row[(x + 1) % 5][bit]);
+                    let masked = builder.and(inverted, row[(x + 2) % 5][bit]);
+                    state[5 * y + x][bit] = xor_bit(builder, row[x][bit], masked);
+                }
             }
         }
 
-        // Iota
-        s[0] = builder.xor_u64(&s[0], rndc_i);
+        for bit in 0..64 {
+            if (rndc[bit / 32] >> (bit % 32)) & 1 != 0 {
+                state[0][bit] = builder.not(state[0][bit]);
+            }
+        }
+    }
+
+    for lane in 0..25 {
+        s[lane][0] = U32Target(builder.le_sum(state[lane][..32].iter()));
+        s[lane][1] = U32Target(builder.le_sum(state[lane][32..].iter()));
     }
 }
 
@@ -326,6 +348,123 @@ mod tests {
         let mut out = [0u8; 32];
         h.finalize(&mut out);
         out
+    }
+
+    #[test]
+    fn test_keccak256_all_ones_rate_boundary_matches_native() {
+        for len in [0, 135, 136, 137, 272] {
+            let input = vec![0xff; len];
+            let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+            let bytes: Vec<_> = (0..len).map(|_| builder.add_virtual_target()).collect();
+            let output = keccak256_bytes_targets(&mut builder, &bytes);
+            for half in output {
+                builder.register_public_input(half.0);
+            }
+            let data = builder.build::<C>();
+            let mut pw = PartialWitness::new();
+            for byte in bytes {
+                pw.set_target(byte, F::from_canonical_u32(255)).unwrap();
+            }
+            let proof = data.prove(pw).unwrap();
+            let expected = native_keccak256_helper(&input);
+            for (half, bytes) in proof.public_inputs.iter().zip(expected.chunks_exact(4)) {
+                assert_eq!(half.to_canonical_u64(), u32::from_le_bytes(bytes.try_into().unwrap()) as u64, "input length {len}");
+            }
+            data.verify(proof).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_keccak_f1600_full_state_matches_native() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let input: [[U32Target; 2]; 25] = std::array::from_fn(|_| std::array::from_fn(|_| builder.add_virtual_u32_target()));
+        let mut output = input;
+        keccak_f1600(&mut builder, &mut output);
+        for lane in output {
+            for half in lane {
+                builder.register_public_input(half.0);
+            }
+        }
+        let data = builder.build::<C>();
+        for lanes in [
+            [0; 25],
+            [u64::MAX; 25],
+            std::array::from_fn(|i| 0x0123456789abcdefu64.wrapping_mul(i as u64 + 1).rotate_left(i as u32)),
+        ] {
+            let mut expected = lanes;
+            tiny_keccak::keccakf(&mut expected);
+            let mut pw = PartialWitness::new();
+            for (targets, lane) in input.iter().zip(lanes) {
+                pw.set_u32_target(targets[0], lane as u32).unwrap();
+                pw.set_u32_target(targets[1], (lane >> 32) as u32).unwrap();
+            }
+            let proof = data.prove(pw).unwrap();
+            for (i, lane) in expected.iter().enumerate() {
+                assert_eq!(proof.public_inputs[2 * i].to_canonical_u64(), *lane as u32 as u64);
+                assert_eq!(proof.public_inputs[2 * i + 1].to_canonical_u64(), lane >> 32);
+            }
+            data.verify(proof).unwrap();
+        }
+        for index in [0, 1, 48, 49] {
+            let mut pw = PartialWitness::new();
+            for (i, half) in input.iter().flatten().enumerate() {
+                pw.set_target(half.0, F::from_canonical_u64(if i == index { 1u64 << 32 } else { 0 })).unwrap();
+            }
+            assert!(data.prove(pw).is_err(), "accepted oversized half {index}");
+        }
+    }
+
+    #[test]
+    fn test_xor_u32_bounded_values_and_width_rejection() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let left = builder.add_virtual_u32_target();
+        let right = builder.add_virtual_u32_target();
+        let output = xor_u32_bounded(&mut builder, left, right);
+        builder.register_public_input(output.0);
+        let data = builder.build::<C>();
+        for (a, b) in [(0, 0), (u32::MAX, 0), (u32::MAX, u32::MAX), (0xaaaaaaaa, 0x55555555), (0x01234567, 0x89abcdef)] {
+            let mut pw = PartialWitness::new();
+            pw.set_u32_target(left, a).unwrap();
+            pw.set_u32_target(right, b).unwrap();
+            let proof = data.prove(pw).unwrap();
+            assert_eq!(proof.public_inputs[0].to_canonical_u64(), (a ^ b) as u64);
+            data.verify(proof).unwrap();
+        }
+        for invalid in [1u64 << 32, 1u64 << 40] {
+            for (a, b) in [(invalid, 0), (0, invalid)] {
+                let mut pw = PartialWitness::new();
+                pw.set_target(left.0, F::from_canonical_u64(a)).unwrap();
+                pw.set_target(right.0, F::from_canonical_u64(b)).unwrap();
+                assert!(data.prove(pw).is_err(), "accepted oversized XOR operand");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bounded_keccak_rejects_prime_decomposition_alias() {
+
+        for permutation in [false, true] {
+            let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+            let input = builder.add_virtual_u32_target();
+            let zero = builder.zero_u32();
+            let split_gate = builder.num_gates();
+            // The pinned BaseSumGate layout places its first bit after the sum wire.
+            let first_bit = Target::wire(split_gate, 1);
+            if permutation {
+                let mut state = [[zero; 2]; 25];
+                state[0][0] = input;
+                keccak_f1600(&mut builder, &mut state);
+            } else {
+                xor_u32_bounded(&mut builder, input, zero);
+            }
+            let data = builder.build::<C>();
+            let mut pw = PartialWitness::new();
+            pw.set_target(input.0, F::ZERO).unwrap();
+            // Goldilocks p = 0xffffffff00000001 has bit zero set. Even this
+            // first counterfeit bit cannot represent field zero in 32 bits.
+            pw.set_target(first_bit, F::ONE).unwrap();
+            assert!(data.prove(pw).is_err(), "accepted prime alias (permutation={permutation})");
+        }
     }
 
     #[test]
