@@ -6,7 +6,7 @@ use std::{
 
 use async_nats::{
     Subject, ToServerAddrs, jetstream::{
-        self, consumer::{PullConsumer, pull::Config as PullConfig}, kv::Store
+        self, consumer::{FromConsumer, PullConsumer, pull::Config as PullConfig}, kv::Store
     }
 };
 use tokio::sync::RwLock;
@@ -216,9 +216,36 @@ impl NatsJetStreamClient {
     pub async fn ensure_consumer(&self, subject: &str, durable_name: &str, queue_type: QPBaseQueueType) -> anyhow::Result<()> {
         let cache_key = self.consumer_cache_key(durable_name);
 
-        if let Some(mut consumer) = self.consumer_cache.get(&cache_key).await {
-            match consumer.info().await {
-                Ok(_) => return Ok(()),
+        let mut desired = self.get_pull_config_for_queue_type(queue_type);
+        if desired.max_deliver == 0 {
+            desired.max_deliver = -1;
+        }
+        match self.get_consumer_cached(durable_name).await {
+            Ok(mut consumer) => match consumer.info().await {
+                Ok(info) => {
+                    anyhow::ensure!(info.config.filter_subject == subject,
+                        "NATS consumer subject mismatch: {}", durable_name);
+                    let mut config = PullConfig::try_from_consumer_config(info.config.clone())
+                        .map_err(|err| anyhow::anyhow!("Invalid pull consumer configuration: {}", err))?;
+                    if config.inactive_threshold != desired.inactive_threshold
+                        || config.max_deliver != desired.max_deliver
+                    {
+                        // Update in place: deleting/recreating would discard the
+                        // delivery and ACK positions of an in-flight batch.
+                        config.inactive_threshold = desired.inactive_threshold;
+                        config.max_deliver = desired.max_deliver;
+                        let updated = self.jetstream
+                            .update_consumer_on_stream(config, &self.stream_name).await?;
+                        anyhow::ensure!(
+                            updated.cached_info().config.inactive_threshold == desired.inactive_threshold
+                                && updated.cached_info().config.max_deliver == desired.max_deliver,
+                            "NATS did not apply batch consumer retention: {}", durable_name
+                        );
+                        self.consumer_cache.insert(cache_key, updated).await;
+                        tracing::info!(durable_name, "Updated batch consumer retention without resetting ACK state");
+                    }
+                    return Ok(());
+                }
                 Err(err) if Self::is_consumer_not_found_error(&err) => {
                     tracing::warn!(
                         "cached NATS consumer no longer exists, recreating: stream={}, durable={}",
@@ -228,16 +255,23 @@ impl NatsJetStreamClient {
                     self.consumer_cache.invalidate(&cache_key).await;
                 }
                 Err(err) => return Err(err.into()),
-            }
+            },
+            Err(err) if Self::is_consumer_not_found_error(&err) => {}
+            Err(err) => return Err(err),
         }
 
         let config = PullConfig {
             durable_name: Some(durable_name.to_string()),
             filter_subject: subject.to_string(),
-            ..self.get_pull_config_for_queue_type(queue_type)
+            ..desired.clone()
         };
 
         let consumer = self.jetstream.create_consumer_on_stream(config, &self.stream_name).await?;
+        anyhow::ensure!(
+            consumer.cached_info().config.inactive_threshold == desired.inactive_threshold
+                && consumer.cached_info().config.max_deliver == desired.max_deliver,
+            "NATS did not apply batch consumer retention: {}", durable_name
+        );
         self.consumer_cache.insert(cache_key, consumer).await;
         Ok(())
     }
@@ -924,22 +958,7 @@ impl QStandardQueueBase for NatsJetStreamClient {
         let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
         let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
         let queue_type = queue_key.get_queue_type();
-
-        let cache_key = format!("{}:{}", self.stream_name, durable_name);
-
-        if self.consumer_cache.get(&cache_key).await.is_some() {
-            return Ok(());
-        }
-
-        let config = PullConfig {
-            durable_name: Some(durable_name.to_string()),
-            filter_subject: subject.to_string(),
-            ..self.get_pull_config_for_queue_type(queue_type)
-        };
-
-        let consumer = self.jetstream.create_consumer_on_stream(config, &self.stream_name).await?;
-        self.consumer_cache.insert(cache_key, consumer).await;
-        Ok(())
+        self.ensure_consumer(&subject, &durable_name, queue_type).await
     }
 
     async fn recreate_consumer<QK: PCoreStandardQueueKeyForRealm>(

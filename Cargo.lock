@@ -7090,6 +7090,7 @@ dependencies = [
  "psy_core",
  "psy_data",
  "psy_node_core",
+ "psy_node_redis",
  "rand 0.8.5",
  "rkyv",
  "serde",

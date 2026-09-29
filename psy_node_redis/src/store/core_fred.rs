@@ -33,7 +33,6 @@ type RedisPool = Pool;
 
 pub const REDIS_TMP_PROOF_STORE_PREFIX: &str = "TMPPSV1";
 pub const REDIS_TMP_KV_STORE_PREFIX: &str = "TKVSV1";
-const REDIS_TMP_PROOF_FIELD_TTL_SECONDS: i64 = 600;
 
 fn get_tmp_kv_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) -> String {
     format!("{}-{}-{}-{}", REDIS_TMP_KV_STORE_PREFIX, root_prefix, realm_id, realm_sub_id)
@@ -143,11 +142,10 @@ impl StandardFredRedisStore {
     }
 
     async fn set_proof_bytes_internal(&self, ns_key: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        // A sibling job may be blocked on a repairable witness indefinitely.
+        // The processor owns reclamation via delete_all_proofs_for_pending_id
+        // after checkpoint commit; elapsed time is not evidence of completion.
         let _: () = self.client.hset(ns_key, (key, value)).await?;
-        let _: () = self
-            .client
-            .hexpire(ns_key, REDIS_TMP_PROOF_FIELD_TTL_SECONDS, None, key)
-            .await?;
         Ok(())
     }
 
