@@ -1,8 +1,8 @@
 use core::marker::PhantomData;
 
 use plonky2::{
-    field::{extension::Extendable, types::Field},
-    gates::{gate::Gate, util::StridedConstraintConsumer},
+    field::{extension::Extendable, packed::PackedField, types::Field},
+    gates::{gate::Gate, packed_util::PackedEvaluableBase, util::StridedConstraintConsumer},
     hash::hash_types::RichField,
     iop::{
         ext_target::ExtensionTarget,
@@ -14,7 +14,7 @@ use plonky2::{
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CommonCircuitData},
-        vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase},
+        vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch, EvaluationVarsBasePacked},
     },
     util::serialization::{Buffer, IoResult, Read, Write},
 };
@@ -67,17 +67,29 @@ impl<F: RichField + Extendable<D>, const D: usize> U32AddManyGate<F, D> {
         (self.num_addends + 3) * i + self.num_addends + 2
     }
 
-    pub fn limb_bits() -> usize {
+    pub const fn limb_bits() -> usize {
         2
     }
-    pub fn num_result_limbs() -> usize {
+    pub const fn num_result_limbs() -> usize {
         ceil_div_usize(32, Self::limb_bits())
     }
-    pub fn num_carry_limbs() -> usize {
+    pub const fn num_carry_limbs() -> usize {
         ceil_div_usize(LOG2_MAX_NUM_ADDENDS, Self::limb_bits())
     }
-    pub fn num_limbs() -> usize {
+    pub const fn num_limbs() -> usize {
         Self::num_result_limbs() + Self::num_carry_limbs()
+    }
+
+    // Compile-time values of the limb helpers above. The packed evaluation uses these so that no
+    // `ceil_div_usize` call (a non-inlined function in another crate) is made per row.
+    const LIMB_BITS: usize = Self::limb_bits();
+    const NUM_RESULT_LIMBS: usize = Self::num_result_limbs();
+    const NUM_LIMBS: usize = Self::num_limbs();
+
+    /// Same value as `wire_ith_output_jth_limb(i, 0)`, computed from the compile-time limb count.
+    fn wire_ith_output_first_limb(&self, i: usize) -> usize {
+        debug_assert!(i < self.num_ops);
+        (self.num_addends + 3) * self.num_ops + Self::NUM_LIMBS * i
     }
 
     pub fn wire_ith_output_jth_limb(&self, i: usize, j: usize) -> usize {
@@ -167,6 +179,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
             yield_constr.one(combined_result_limbs - output_result);
             yield_constr.one(combined_carry_limbs - output_carry);
         }
+    }
+
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
     fn eval_unfiltered_circuit(&self, builder: &mut CircuitBuilder<F, D>, vars: EvaluationTargets<D>) -> Vec<ExtensionTarget<D>> {
@@ -272,6 +288,66 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
     }
 }
 
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for U32AddManyGate<F, D> {
+    /// Packed counterpart of `eval_unfiltered_base_one`. It yields exactly the same constraints,
+    /// in the same order, for every lane; only the evaluation strategy differs (no per-row
+    /// allocation, limb counts are compile-time constants, and the limb range check uses two
+    /// multiplications instead of four).
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        let output_base = F::from_canonical_u64(1 << 32u64);
+        let limb_base = F::from_canonical_u64(1u64 << Self::LIMB_BITS);
+        let max_limb = 1usize << Self::LIMB_BITS;
+
+        for i in 0..self.num_ops {
+            // Same summation order as the scalar fold: 0 + a_0 + ... + a_{n-1}, then + carry.
+            let mut computed_output = P::ZEROS;
+            for j in 0..self.num_addends {
+                computed_output += vars.local_wires[self.wire_ith_op_jth_addend(i, j)];
+            }
+            computed_output += vars.local_wires[self.wire_ith_carry(i)];
+
+            let output_result = vars.local_wires[self.wire_ith_output_result(i)];
+            let output_carry = vars.local_wires[self.wire_ith_output_carry(i)];
+
+            let combined_output = output_carry * output_base + output_result;
+
+            yield_constr.one(combined_output - computed_output);
+
+            let mut combined_result_limbs = P::ZEROS;
+            let mut combined_carry_limbs = P::ZEROS;
+            let first_limb = self.wire_ith_output_first_limb(i);
+            for j in (0..Self::NUM_LIMBS).rev() {
+                let this_limb = vars.local_wires[first_limb + j];
+                // prod_{x < max_limb} (limb - x), the same polynomial as the scalar product.
+                let product = if max_limb == 4 {
+                    // t (t - 1) (t - 2) (t - 3) = u (u + 2) with u = t (t - 3).
+                    let u = this_limb * (this_limb - F::from_canonical_usize(3));
+                    u * (u + F::TWO)
+                } else {
+                    let mut product = P::ONES;
+                    for x in 0..max_limb {
+                        product *= this_limb - F::from_canonical_usize(x);
+                    }
+                    product
+                };
+                yield_constr.one(product);
+
+                if j < Self::NUM_RESULT_LIMBS {
+                    combined_result_limbs = combined_result_limbs * limb_base + this_limb;
+                } else {
+                    combined_carry_limbs = combined_carry_limbs * limb_base + this_limb;
+                }
+            }
+            yield_constr.one(combined_result_limbs - output_result);
+            yield_constr.one(combined_carry_limbs - output_carry);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct U32AddManyGenerator<F: RichField + Extendable<D>, const D: usize> {
     gate: U32AddManyGate<F, D>,
@@ -370,12 +446,18 @@ mod tests {
     use anyhow::Result;
     use itertools::unfold;
     use plonky2::{
-        field::{extension::quartic::QuarticExtension, goldilocks_field::GoldilocksField, types::Sample},
+        field::{
+            extension::quartic::QuarticExtension,
+            goldilocks_field::GoldilocksField,
+            packable::Packable,
+            types::{Field64, PrimeField64, Sample},
+        },
         gates::gate_testing::{test_eval_fns, test_low_degree},
         hash::hash_types::HashOut,
         plonk::config::{GenericConfig, PoseidonGoldilocksConfig},
     };
-    use rand::{rngs::OsRng, Rng};
+    use rand::{rngs::OsRng, Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
 
     use super::*;
 
@@ -471,5 +553,264 @@ mod tests {
             gate.eval_unfiltered(vars).iter().all(|x| x.is_zero()),
             "Gate constraints are not satisfied."
         );
+    }
+    /// Row-by-row reference: a verbatim copy of the default `Gate::eval_unfiltered_base_batch`,
+    /// which calls `eval_unfiltered_base_one` once per row.
+    fn eval_base_batch_row_by_row<F: RichField + Extendable<D>, G: Gate<F, D>, const D: usize>(
+        gate: &G,
+        vars_base: EvaluationVarsBaseBatch<F>,
+    ) -> Vec<F> {
+        let mut res = vec![F::ZERO; vars_base.len() * gate.num_constraints()];
+        for (i, vars_base_one) in vars_base.iter().enumerate() {
+            gate.eval_unfiltered_base_one(vars_base_one, StridedConstraintConsumer::new(&mut res, vars_base.len(), i));
+        }
+        res
+    }
+
+    /// Every configuration exercised by the equivalence tests: the ones the circuit builder
+    /// derives from the standard and a wide config for each supported addend count, plus the
+    /// hand-built shapes used by the other tests.
+    fn gate_configs<const D: usize>() -> Vec<U32AddManyGate<GoldilocksField, D>>
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        let standard = CircuitConfig::standard_recursion_config();
+        let wide = CircuitConfig {
+            num_wires: 400,
+            num_routed_wires: 200,
+            ..CircuitConfig::standard_recursion_config()
+        };
+        let mut gates = Vec::new();
+        for num_addends in 1..=MAX_NUM_ADDENDS {
+            for config in [&standard, &wide] {
+                let gate = U32AddManyGate::<GoldilocksField, D>::new_from_config(config, num_addends);
+                assert!(gate.num_ops > 0);
+                gates.push(gate);
+            }
+        }
+        for (num_addends, num_ops) in [(1, 1), (4, 3), (10, 3), (24, 1)] {
+            gates.push(U32AddManyGate {
+                num_addends,
+                num_ops,
+                _phantom: PhantomData,
+            });
+        }
+        gates
+    }
+
+    fn batch_sizes() -> Vec<usize> {
+        let width = <GoldilocksField as Packable>::Packing::WIDTH;
+        let mut sizes = vec![1, 2, 3, width, width + 1, 3 * width + 2, 32, 33, 64];
+        sizes.sort_unstable();
+        sizes.dedup();
+        sizes
+    }
+
+    /// Edge values (0, 1, small limb values, 2^32 boundaries, p - 1, and non-canonical
+    /// representatives >= p) mixed with uniform values.
+    fn random_value(rng: &mut ChaCha8Rng, edge_only: bool) -> GoldilocksField {
+        const P: u64 = GoldilocksField::ORDER;
+        let edges = [
+            0,
+            1,
+            2,
+            3,
+            4,
+            (1 << 32) - 1,
+            1 << 32,
+            P - 1,
+            P,
+            P + 1,
+            P + 3,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        if edge_only || rng.gen_range(0..3) == 0 {
+            GoldilocksField(edges[rng.gen_range(0..edges.len())])
+        } else {
+            GoldilocksField(rng.gen_range(0..P))
+        }
+    }
+
+    fn assert_batch_paths_match<const D: usize>(gate: &U32AddManyGate<GoldilocksField, D>, vars: EvaluationVarsBaseBatch<GoldilocksField>, context: &str)
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        let batch_size = vars.len();
+        let expected = eval_base_batch_row_by_row(gate, vars);
+        assert_eq!(expected.len(), gate.num_constraints() * batch_size, "{context}");
+        for (path, actual) in [
+            ("eval_unfiltered_base_batch", gate.eval_unfiltered_base_batch(vars)),
+            ("eval_unfiltered_base_batch_packed", gate.eval_unfiltered_base_batch_packed(vars)),
+        ] {
+            assert_eq!(actual.len(), expected.len(), "{path} {context}");
+            for (idx, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    a.to_canonical_u64(),
+                    e.to_canonical_u64(),
+                    "{path} {context}: constraint {} of row {} differs",
+                    idx / batch_size,
+                    idx % batch_size
+                );
+            }
+            assert_eq!(actual, expected, "{path} {context}");
+        }
+    }
+
+    #[test]
+    fn limb_constants_and_wire_layout() {
+        type G = U32AddManyGate<GoldilocksField, 2>;
+        assert_eq!(G::LIMB_BITS, G::limb_bits());
+        assert_eq!(G::NUM_RESULT_LIMBS, G::num_result_limbs());
+        assert_eq!(G::NUM_LIMBS, G::num_limbs());
+        assert_eq!(G::NUM_LIMBS, G::num_result_limbs() + G::num_carry_limbs());
+        for gate in gate_configs::<2>() {
+            for i in 0..gate.num_ops {
+                for j in 0..G::num_limbs() {
+                    assert_eq!(gate.wire_ith_output_first_limb(i) + j, gate.wire_ith_output_jth_limb(i, j));
+                }
+            }
+        }
+    }
+
+    fn packed_batch_matches_row_by_row_for<const D: usize>()
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        let width = <GoldilocksField as Packable>::Packing::WIDTH;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x0032_add0 + D as u64);
+        for gate in gate_configs::<D>() {
+            for &batch_size in &batch_sizes() {
+                for trial in 0..4 {
+                    let edge_only = trial == 0;
+                    let wires: Vec<_> = (0..gate.num_wires() * batch_size)
+                        .map(|_| random_value(&mut rng, edge_only))
+                        .collect();
+                    // Extra constants model the selector columns that the gate does not read.
+                    let constants: Vec<_> = (0..(gate.num_constants() + 2) * batch_size)
+                        .map(|_| random_value(&mut rng, edge_only))
+                        .collect();
+                    let public_inputs_hash = HashOut {
+                        elements: core::array::from_fn(|_| random_value(&mut rng, edge_only)),
+                    };
+                    let vars = EvaluationVarsBaseBatch::new(batch_size, &constants, &wires, &public_inputs_hash);
+                    let context = format!(
+                        "D={D} width={width} num_addends={} num_ops={} batch_size={batch_size} trial={trial}",
+                        gate.num_addends, gate.num_ops
+                    );
+                    assert_batch_paths_match(&gate, vars, &context);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_batch_matches_row_by_row() {
+        packed_batch_matches_row_by_row_for::<2>();
+        packed_batch_matches_row_by_row_for::<4>();
+    }
+
+    /// Valid witnesses must give all-zero constraints on both paths.
+    #[test]
+    fn packed_batch_is_zero_on_valid_witness() {
+        type F = GoldilocksField;
+        const D: usize = 2;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x0032_add1);
+        // n addends plus a carry give a carry-out of at most n, and the carry output has two
+        // 2-bit limbs (at most 15), so up to 15 addends have valid witnesses.
+        for num_addends in 1..=15 {
+            let gate = U32AddManyGate::<F, D>::new_from_config(&CircuitConfig::standard_recursion_config(), num_addends);
+            for &batch_size in &batch_sizes() {
+                let mut wires = vec![F::ZERO; gate.num_wires() * batch_size];
+                let mut set = |column: usize, row: usize, value: u64| wires[column * batch_size + row] = F::from_canonical_u64(value);
+                for row in 0..batch_size {
+                    for i in 0..gate.num_ops {
+                        let mut output = 0u64;
+                        for j in 0..num_addends {
+                            let addend = rng.gen::<u32>() as u64;
+                            output += addend;
+                            set(gate.wire_ith_op_jth_addend(i, j), row, addend);
+                        }
+                        let carry = rng.gen::<u32>() as u64;
+                        output += carry;
+                        set(gate.wire_ith_carry(i), row, carry);
+                        let (result, carry_out) = (output & 0xffff_ffff, output >> 32);
+                        set(gate.wire_ith_output_result(i), row, result);
+                        set(gate.wire_ith_output_carry(i), row, carry_out);
+                        let num_result_limbs = U32AddManyGate::<F, D>::num_result_limbs();
+                        for j in 0..U32AddManyGate::<F, D>::num_limbs() {
+                            let limb = if j < num_result_limbs { (result >> (2 * j)) & 3 } else { (carry_out >> (2 * (j - num_result_limbs))) & 3 };
+                            set(gate.wire_ith_output_jth_limb(i, j), row, limb);
+                        }
+                    }
+                }
+                let public_inputs_hash = HashOut::rand();
+                let vars = EvaluationVarsBaseBatch::new(batch_size, &[], &wires, &public_inputs_hash);
+                assert_batch_paths_match(&gate, vars, &format!("num_addends={num_addends} batch_size={batch_size}"));
+                assert!(gate.eval_unfiltered_base_batch(vars).iter().all(|c| c.is_zero()));
+            }
+        }
+    }
+
+    /// Timing comparison of the row-by-row path and the packed batch path, on 2^14 rows in
+    /// batches of 32 as in quotient polynomial computation. Run with
+    /// `cargo test --release -p psy_common_circuit u32::gates::add_many_u32::tests::bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_packed_vs_row_by_row() {
+        use std::{
+            hint::black_box,
+            time::{Duration, Instant},
+        };
+
+        type F = GoldilocksField;
+        const NUM_ROWS: usize = 1 << 14;
+        const BATCH_SIZE: usize = 32;
+        const ROUNDS: usize = 30;
+
+        let summarize = |mut samples: Vec<Duration>| {
+            samples.sort();
+            (samples[0], samples[samples.len() / 2])
+        };
+
+        for num_addends in [3, 4, 5, 8] {
+            let gate = U32AddManyGate::<F, 2>::new_from_config(&CircuitConfig::standard_recursion_config(), num_addends);
+            let batches: Vec<Vec<F>> = (0..NUM_ROWS / BATCH_SIZE).map(|_| F::rand_vec(gate.num_wires() * BATCH_SIZE)).collect();
+            let constants = F::rand_vec(2 * BATCH_SIZE);
+            let public_inputs_hash = HashOut::rand();
+            let run = |packed: bool| {
+                let start = Instant::now();
+                for wires in &batches {
+                    let vars = EvaluationVarsBaseBatch::new(BATCH_SIZE, &constants, wires, &public_inputs_hash);
+                    if packed {
+                        black_box(gate.eval_unfiltered_base_batch(black_box(vars)));
+                    } else {
+                        black_box(eval_base_batch_row_by_row(&gate, black_box(vars)));
+                    }
+                }
+                start.elapsed()
+            };
+            run(false);
+            run(true);
+            let (mut row_by_row, mut batch) = (Vec::new(), Vec::new());
+            for _ in 0..ROUNDS {
+                row_by_row.push(run(false));
+                batch.push(run(true));
+            }
+            let (r_min, r_med) = summarize(row_by_row);
+            let (b_min, b_med) = summarize(batch);
+            println!(
+                "U32AddManyGate num_addends={num_addends} num_ops={}: {NUM_ROWS} rows in batches of {BATCH_SIZE}, packing width {}",
+                gate.num_ops,
+                <F as Packable>::Packing::WIDTH
+            );
+            println!("  row_by_row                 min {r_min:>10.3?}  median {r_med:>10.3?}");
+            println!("  eval_unfiltered_base_batch min {b_min:>10.3?}  median {b_med:>10.3?}");
+            println!(
+                "  speedup (min) {:.2}x  (median) {:.2}x",
+                r_min.as_secs_f64() / b_min.as_secs_f64(),
+                r_med.as_secs_f64() / b_med.as_secs_f64()
+            );
+        }
     }
 }
