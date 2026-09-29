@@ -1,0 +1,13 @@
+{
+  "repository": "PsyProtocol/psy-services",
+  "branch": "release/testnet-stable",
+  "commit": "3e0dac657a0a1231459d179d567920dca9247f19",
+  "runtime_fix_commit": "53a8b330ac9f4d62ba117a088fd60b46f9ae2d01",
+  "base_commit": "6ce3c2ac1d739312ea346a6e774123031ea5b860",
+  "base_release": "/opt/parth/psy-services/releases/6ce3c2ac1d73-timestamps-93f18343",
+  "base_sha256": "93f183431c127025ead2ab832a57b369e33375560343b19bd1519ed3f60bdd6f",
+  "sha256": "b51b8b282c3d05b82c6efedd466338b4189825da74908545febb04d3e6e6ed40",
+  "release_id": "20260929-bb8-3e0dac6-b51b8b28",
+  "builder": "psy-services-shared-client-builder:20260924",
+  "toolchain": "nightly-2025-09-20"
+}
