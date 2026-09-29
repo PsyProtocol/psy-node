@@ -603,6 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual diagnostic: validates backups from the local runtime checkpoint directory"]
     async fn reads_all_local_coordinator_backups() -> anyhow::Result<()> {
         type Hasher = PoseidonHasher;
         type Hash = PHash;
@@ -665,6 +666,438 @@ mod tests {
             tracing::debug!("coordinator backup {} is empty after parse", path.display());
         }
 
+        Ok(())
+    }
+}
+
+/// Tests for the `CoordinatorGUTAUpdateGatherer` builder (backup writer/reader
+/// round trip, queue-item validation, finalize with a single promotion, the
+/// No-Change proof path and the revert branch), running fully offline against
+/// the in-memory temp store, mock file system and in-memory checkpoint tree.
+#[cfg(test)]
+mod gatherer_builder_tests {
+    use std::sync::{Arc, RwLock};
+
+    use parth_common::memory_stores::{
+        dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore,
+    };
+    use parth_core::{
+        crypto::hash::traits::{MerkleZeroHasher, ZeroableHash},
+        felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt},
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::{Q256BitHash, QNetworkTreeConstants},
+        utils::QPGenRandom,
+        PHash, PF, QJobIdBase,
+    };
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_data::{
+        guta::{
+            header::GlobalUserTreeAggregatorHeader,
+            header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobID},
+            stats::GUTAStats,
+            sub_tree_transition::SubTreeNodeStateTransition,
+        },
+        v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
+    };
+    use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    use crate::{
+        coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
+        queue::gatherer_builder::QueueGathererItemBuilderWithTree,
+        test_common::TestNetworkConfig,
+    };
+
+    use super::*;
+
+    type N = TestNetworkConfig;
+    type Hash = PHash;
+    type F = PF;
+    type Hasher = PoseidonHasher;
+    type TempDb = InMemoryTempStore;
+    type Fs = SimpleMockMemoryFileSystem;
+    type CheckpointTree = PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>;
+
+    const REALM_ID: u64 = 1;
+    const REALM_SUB_ID: u64 = 2;
+    const UNIQUE_PENDING_ID: u64 = 800;
+
+    fn zh(level: usize) -> Hash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    fn err_str<T>(result: anyhow::Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("expected the call to fail, but it succeeded"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn block_state() -> QEDL2BlockState {
+        QEDL2BlockState {
+            checkpoint_id: 0,
+            next_add_withdrawal_id: 0,
+            next_process_withdrawal_id: 0,
+            next_deposit_id: 0,
+            total_deposits_claimed_epoch: 0,
+            next_user_id: 0,
+            end_balance: 0,
+            next_contract_id: 0,
+        }
+    }
+
+    fn shared_status() -> Arc<RwLock<PsyCoordinatorProcessorSharedStatus<F, Hash>>> {
+        Arc::new(RwLock::new(PsyCoordinatorProcessorSharedStatus {
+            last_committed_checkpoint_id: 0,
+            unique_pending_id: UNIQUE_PENDING_ID,
+            last_committed_checkpoint_leaf: PQEDCheckpointLeaf::qp_rand_gen(),
+            last_committed_checkpoint_state_roots: PQEDCheckpointGlobalStateRoots {
+                contract_tree_root: zh(2),
+                deposit_tree_root: zh(2),
+                user_tree_root: zh(3),
+                withdrawal_tree_root: zh(2),
+                user_registration_tree_root: zh(3),
+            },
+            should_revert_last_changes: false,
+            block_state: block_state(),
+        }))
+    }
+
+    fn test_config(
+        status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<F, Hash>>>,
+        temp_db: Arc<TempDb>,
+        fs: Arc<Fs>,
+        checkpoint_tree: Arc<CheckpointTree>,
+        last_old_realm_roots: Arc<RwLock<Vec<(u64, Hash)>>>,
+    ) -> CoordinatorGUTAUpdateGathererConfig<N, TempDb, Fs> {
+        CoordinatorGUTAUpdateGathererConfig {
+            realm_id_u64: REALM_ID,
+            realm_sub_id_u64: REALM_SUB_ID,
+            status,
+            temp_db,
+            file_system: Arc::clone(&fs),
+            last_old_realm_roots,
+            backup_file_directory: "gatherer_backups".to_string(),
+            coordinator_guta_updates_circuit_whitelist: zh(30),
+            checkpoint_tree,
+            _phantom_n: std::marker::PhantomData,
+        }
+    }
+
+    /// A checkpoint tree with one committed checkpoint leaf so the planner can
+    /// resolve the current root index.
+    fn checkpoint_tree_with_one_leaf() -> Arc<CheckpointTree> {
+        let tree = CheckpointTree::new(N::CHECKPOINT_TREE_HEIGHT);
+        tree.append_leaf(0, Hash::qp_rand_gen()).expect("append checkpoint leaf");
+        Arc::new(tree)
+    }
+
+    /// One realm GUTA update header transitioning global user tree leaf
+    /// `node_index` from `old_node_value` to `new_node_value`.
+    fn update_header(checkpoint_root: Hash, node_index: u64, old_node_value: Hash, new_node_value: Hash) -> GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash> {
+        GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {
+            header: GlobalUserTreeAggregatorHeaderWithTagValue {
+                header: GlobalUserTreeAggregatorHeader {
+                    guta_circuit_whitelist: zh(30),
+                    checkpoint_tree_root: checkpoint_root,
+                    state_transition: SubTreeNodeStateTransition {
+                        old_node_value,
+                        new_node_value,
+                        node_index: F::from_u64_value(node_index),
+                        node_level: F::from_u64_value(N::GLOBAL_USER_TREE_HEIGHT as u64),
+                    },
+                    stats: GUTAStats {
+                        guta_fees_collected: F::from_u64_value(11),
+                        da_fees_collected: F::from_u64_value(12),
+                        user_ops_processed: F::from_u64_value(13),
+                        total_transactions: F::from_u64_value(14),
+                        slots_modified: F::from_u64_value(15),
+                    },
+                    total_aggregation_proofs_generated: F::from_u64_value(2),
+                },
+                new_tag_tree_node_value: Hash::qp_rand_gen(),
+            },
+            job_id: QProvingJobDataID::new_invalid_job_id(),
+        }
+    }
+
+    #[test]
+    fn backup_file_path_contains_realm_and_pending_ids() {
+        let path = get_new_coordinator_guta_update_gatherer_backup_file_path("/tmp/backups", 4, 6, 99);
+        assert!(path.starts_with("/tmp/backups"));
+        assert!(path.ends_with("coordinator_guta_update_gatherer_realm_4_sub_6_pending_99.backup"));
+    }
+
+    #[tokio::test]
+    async fn read_backup_rejects_header_level_errors() -> anyhow::Result<()> {
+        let fs = SimpleMockMemoryFileSystem::new();
+
+        // below the minimum header size of magic(4) + start_root(32)
+        fs.files.insert("too_small".to_string(), vec![0u8; 35]);
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let err = err_str(read_coordinator_guta_update_gatherer_backup_file::<Hasher, Hash, F, Fs>(&fs, "too_small", &mut tree).await);
+        assert!(err.contains("too small to be valid"), "got: {err}");
+
+        // wrong magic
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let mut bad_magic = Vec::new();
+        bad_magic.extend_from_slice(&0x31424758u32.to_le_bytes());
+        bad_magic.extend_from_slice(&tree.get_root().into_owned_32bytes());
+        fs.files.insert("bad_magic".to_string(), bad_magic);
+        let err = err_str(read_coordinator_guta_update_gatherer_backup_file::<Hasher, Hash, F, Fs>(&fs, "bad_magic", &mut tree).await);
+        assert!(err.contains("magic number mismatch"), "got: {err}");
+
+        // start root that does not match the live tree root
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let mut wrong_root = Vec::new();
+        wrong_root.extend_from_slice(&COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        wrong_root.extend_from_slice(&Hash::qp_rand_gen().into_owned_32bytes());
+        fs.files.insert("wrong_root".to_string(), wrong_root);
+        let err = err_str(read_coordinator_guta_update_gatherer_backup_file::<Hasher, Hash, F, Fs>(&fs, "wrong_root", &mut tree).await);
+        assert!(err.contains("does not match tree root"), "got: {err}");
+
+        // header only (no trailing random seed): legacy empty backup
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let start_root = tree.get_root();
+        let mut header_only = Vec::new();
+        header_only.extend_from_slice(&COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        header_only.extend_from_slice(&start_root.into_owned_32bytes());
+        fs.files.insert("header_only".to_string(), header_only);
+        let output = read_coordinator_guta_update_gatherer_backup_file::<Hasher, Hash, F, Fs>(&fs, "header_only", &mut tree).await?;
+        assert_eq!(output.total_guta_inputs, 0);
+        assert_eq!(output.random_seed_guta, Hash::get_zero_value());
+        assert_eq!(output.end_global_user_tree_root, start_root);
+
+        // trailing section not aligned to the fixed header size
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let mut bad_multiple = Vec::new();
+        bad_multiple.extend_from_slice(&COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        bad_multiple.extend_from_slice(&tree.get_root().into_owned_32bytes());
+        bad_multiple.extend_from_slice(&vec![0u8; 32 + 1]);
+        fs.files.insert("bad_multiple".to_string(), bad_multiple);
+        let err = err_str(read_coordinator_guta_update_gatherer_backup_file::<Hasher, Hash, F, Fs>(&fs, "bad_multiple", &mut tree).await);
+        assert!(err.contains("is not a multiple of"), "got: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_queues_updates_and_finalizes_single_promotion() -> anyhow::Result<()> {
+        let checkpoint_tree = checkpoint_tree_with_one_leaf();
+        let checkpoint_root = checkpoint_tree.get_root();
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let start_root = tree.get_root();
+
+        let temp_db = Arc::new(InMemoryTempStore::new("guta_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let last_old_realm_roots = Arc::new(RwLock::new(Vec::<(u64, Hash)>::new()));
+        let config = test_config(
+            shared_status(),
+            Arc::clone(&temp_db),
+            Arc::clone(&fs),
+            Arc::clone(&checkpoint_tree),
+            Arc::clone(&last_old_realm_roots),
+        );
+        let mut gatherer = CoordinatorGUTAUpdateGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+        assert!(gatherer.pending_file_path.ends_with("coordinator_guta_update_gatherer_realm_1_sub_2_pending_800.backup"));
+
+        let new_leaf = Hash::qp_rand_gen();
+        let header = update_header(checkpoint_root, 0, zh(0), new_leaf);
+        let item = header.psy_ser_to_bytes_vec()?;
+        let item_len = item.len();
+        gatherer.update_from_many_queue_items_with_tree(&mut tree, vec![item]).await?;
+        assert_eq!(gatherer.total_guta_inputs, 1);
+        assert_eq!(gatherer.guta_stats.user_ops_processed.to_u64_value(), 13);
+        assert_eq!(gatherer.total_guta_proofs_generated.to_u64_value(), 2);
+        assert_eq!(gatherer.old_realm_roots.len(), 1);
+        // the update is queued while the checkpoint root is unchanged, so the
+        // global user tree is untouched during gathering
+        assert_eq!(tree.get_e_leaf_value(0), zh(0));
+
+        let output = CoordinatorGUTAUpdateGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        assert_eq!(output.db_output.total_guta_inputs, 1);
+        assert_eq!(output.db_output.start_global_user_tree_root, start_root);
+        assert_ne!(output.db_output.end_global_user_tree_root, start_root);
+        assert_eq!(tree.get_e_leaf_value(0), new_leaf);
+        assert_eq!(tree.get_root(), output.db_output.end_global_user_tree_root);
+        // header stats (2 proofs) plus the generated promotion job(s)
+        let added: u64 = output.job_ids.iter().map(|v| v.len() as u64).sum();
+        assert!(added >= 1);
+        assert_eq!(output.db_output.total_guta_proofs_generated.to_u64_value(), 2 + added);
+        assert!(output.db_output.root_guta_header.is_some());
+        assert_eq!(output.db_output.guta_stats.user_ops_processed.to_u64_value(), 13);
+        // the old realm roots were published for the next block's revert
+        assert_eq!(*last_old_realm_roots.read().unwrap(), vec![(0u64, zh(0))]);
+
+        // backup file: magic + start_root + one item + random seed, and the
+        // reader replays it onto a fresh tree with the same end root
+        let backup_path = get_new_coordinator_guta_update_gatherer_backup_file_path("gatherer_backups", 1, 2, 800);
+        let backup_path_str = backup_path.to_string_lossy().to_string();
+        let bytes = fs.files.get(&backup_path_str).unwrap().value().clone();
+        assert_eq!(bytes.len(), 4 + 32 + item_len + 32);
+        let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let read_output = read_coordinator_guta_update_gatherer_backup_file::<Hasher, Hash, F, Fs>(&fs, &backup_path_str, &mut read_tree).await?;
+        assert_eq!(read_output.total_guta_inputs, 1);
+        assert_eq!(read_output.total_guta_proofs_generated.to_u64_value(), 2);
+        assert_eq!(read_output.guta_stats.user_ops_processed.to_u64_value(), 13);
+        assert_eq!(read_output.random_seed_guta, output.db_output.random_seed_guta);
+        assert_eq!(read_output.end_global_user_tree_root, output.db_output.end_global_user_tree_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_single_promotion_below_top_line_height_without_mutating_tree() -> anyhow::Result<()> {
+        let checkpoint_tree = checkpoint_tree_with_one_leaf();
+        let checkpoint_root = checkpoint_tree.get_root();
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let start_root = tree.get_root();
+
+        let temp_db = Arc::new(InMemoryTempStore::new("guta_invalid_level_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let last_old_realm_roots = Arc::new(RwLock::new(Vec::<(u64, Hash)>::new()));
+        let config = test_config(
+            shared_status(),
+            temp_db,
+            fs,
+            checkpoint_tree,
+            last_old_realm_roots,
+        );
+        let mut gatherer = CoordinatorGUTAUpdateGatherer::create_new_with_tree(&mut tree, 56, config).await?;
+
+        let mut header = update_header(checkpoint_root, 0, zh(0), Hash::qp_rand_gen());
+        header.header.header.state_transition.node_level = F::from_u64_value(0);
+        gatherer
+            .update_from_many_queue_items_with_tree(&mut tree, vec![header.psy_ser_to_bytes_vec()?])
+            .await?;
+
+        let err = err_str(CoordinatorGUTAUpdateGatherer::finalize_with_tree(gatherer, &mut tree).await);
+        assert!(err.contains("siblings height 32 exceeds input node level 0"), "got: {err}");
+        assert_eq!(tree.get_root(), start_root);
+        assert_eq!(tree.get_e_leaf_value(0), zh(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_invalid_queue_item_size() -> anyhow::Result<()> {
+        let checkpoint_tree = checkpoint_tree_with_one_leaf();
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let temp_db = Arc::new(InMemoryTempStore::new("guta_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let config = test_config(
+            shared_status(),
+            temp_db,
+            fs,
+            checkpoint_tree,
+            Arc::new(RwLock::new(Vec::<(u64, Hash)>::new())),
+        );
+        let mut gatherer = CoordinatorGUTAUpdateGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        let item_size = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE;
+        let err = err_str(gatherer.update_from_queue_item_with_tree(&mut tree, vec![0u8; item_size + 1]).await);
+        assert!(err.contains("Invalid queue item size"), "got: {err}");
+        // no partial state was recorded
+        assert_eq!(gatherer.total_guta_inputs, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_without_updates_fails_on_empty_checkpoint_tree() -> anyhow::Result<()> {
+        // an empty checkpoint tree cannot resolve the No-Change proof's
+        // current checkpoint root
+        let checkpoint_tree = Arc::new(CheckpointTree::new(N::CHECKPOINT_TREE_HEIGHT));
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let temp_db = Arc::new(InMemoryTempStore::new("guta_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let config = test_config(shared_status(), temp_db, fs, checkpoint_tree, Arc::new(RwLock::new(Vec::<(u64, Hash)>::new())));
+        let gatherer = CoordinatorGUTAUpdateGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        let err = err_str(CoordinatorGUTAUpdateGatherer::finalize_with_tree(gatherer, &mut tree).await);
+        assert!(err.contains("Error finalizing GUTA updates gatherer"), "got: {err}");
+        assert!(err.contains("not found in checkpoint tree"), "got: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_without_updates_generates_no_change_proof() -> anyhow::Result<()> {
+        let checkpoint_tree = checkpoint_tree_with_one_leaf();
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let start_root = tree.get_root();
+
+        let temp_db = Arc::new(InMemoryTempStore::new("guta_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let config = test_config(
+            shared_status(),
+            temp_db,
+            Arc::clone(&fs),
+            checkpoint_tree,
+            Arc::new(RwLock::new(Vec::<(u64, Hash)>::new())),
+        );
+        let gatherer = CoordinatorGUTAUpdateGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        let output = CoordinatorGUTAUpdateGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        assert_eq!(output.db_output.total_guta_inputs, 0);
+        assert_eq!(output.db_output.start_global_user_tree_root, start_root);
+        assert_eq!(output.db_output.end_global_user_tree_root, start_root);
+        assert_eq!(tree.get_root(), start_root);
+        assert!(output.db_output.root_guta_header.is_some());
+        // only the generated No-Change job
+        let added: u64 = output.job_ids.iter().map(|v| v.len() as u64).sum();
+        assert!(added >= 1);
+        assert_eq!(output.db_output.total_guta_proofs_generated.to_u64_value(), added);
+
+        // backup file: magic + start_root + random seed only
+        let backup_path = get_new_coordinator_guta_update_gatherer_backup_file_path("gatherer_backups", 1, 2, 800);
+        let backup_path_str = backup_path.to_string_lossy().to_string();
+        let bytes = fs.files.get(&backup_path_str).unwrap().value().clone();
+        assert_eq!(bytes.len(), 4 + 32 + 32);
+        let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let read_output = read_coordinator_guta_update_gatherer_backup_file::<Hasher, Hash, F, Fs>(&fs, &backup_path_str, &mut read_tree).await?;
+        assert_eq!(read_output.total_guta_inputs, 0);
+        assert_eq!(read_output.random_seed_guta, output.db_output.random_seed_guta);
+        assert_eq!(read_output.end_global_user_tree_root, start_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_revert_restores_old_realm_roots_and_resets_planner() -> anyhow::Result<()> {
+        let checkpoint_tree = checkpoint_tree_with_one_leaf();
+        let checkpoint_root = checkpoint_tree.get_root();
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        let start_root = tree.get_root();
+
+        let temp_db = Arc::new(InMemoryTempStore::new("guta_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let last_old_realm_roots = Arc::new(RwLock::new(vec![(0u64, zh(0))]));
+        let status = shared_status();
+        let config = test_config(
+            Arc::clone(&status),
+            temp_db,
+            fs,
+            Arc::clone(&checkpoint_tree),
+            Arc::clone(&last_old_realm_roots),
+        );
+        let mut gatherer = CoordinatorGUTAUpdateGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        let new_leaf = Hash::qp_rand_gen();
+        let header = update_header(checkpoint_root, 0, zh(0), new_leaf);
+        gatherer.update_from_queue_item_with_tree(&mut tree, header.psy_ser_to_bytes_vec()?).await?;
+
+        // flip the block into revert mode: the revert branch replays the
+        // previous block's old realm roots and resets the planner
+        status.write().unwrap().should_revert_last_changes = true;
+
+        let output = CoordinatorGUTAUpdateGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        assert_eq!(output.db_output.start_global_user_tree_root, start_root);
+        assert_eq!(output.db_output.end_global_user_tree_root, start_root);
+        assert_eq!(tree.get_root(), start_root);
+        assert_eq!(tree.get_e_leaf_value(0), zh(0));
+        // the queued update is abandoned: only the No-Change job remains, but
+        // the input counter keeps the recorded update
+        assert_eq!(output.db_output.total_guta_inputs, 1);
+        let added: u64 = output.job_ids.iter().map(|v| v.len() as u64).sum();
+        assert!(added >= 1);
+        // the old realm roots of THIS block were published for the next revert
+        assert_eq!(*last_old_realm_roots.read().unwrap(), vec![(0u64, zh(0))]);
         Ok(())
     }
 }

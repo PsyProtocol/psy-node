@@ -28,3 +28,17 @@ impl<F: RichField> KVQSerializable for DapenContractFunctionCircuitInput<F> {
         bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvq::traits::KVQSerializable;
+
+    #[test]
+    fn default_cfc_input_bincode_round_trips() {
+        type F = GoldilocksField;
+        let input = DapenContractFunctionCircuitInput::<F>::default();
+        let bytes = input.to_bytes().unwrap();
+        assert_eq!(DapenContractFunctionCircuitInput::<F>::from_bytes(&bytes).unwrap(), input);
+    }
+}

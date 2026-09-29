@@ -166,3 +166,128 @@ pub async fn serialize_proof_to_inputs_v2(proof: &TagTreeMerkleProofWithRewardPr
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use plonky2::{field::types::Field, hash::hash_types::HashOut};
+    use psy_crypto::hash::merkle::tag_tree::{TagTreeNodePreimage, TagTreeProofNode};
+
+    use super::*;
+
+    fn hash(values: [u64; 4]) -> QHashOut<GoldilocksField> {
+        QHashOut(HashOut {
+            elements: values.map(GoldilocksField::from_canonical_u64),
+        })
+    }
+
+    fn proof_with_one_sibling() -> TagTreeMerkleProofWithRewardPreimage<QHashOut<GoldilocksField>> {
+        TagTreeMerkleProofWithRewardPreimage {
+            inner: psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof {
+                root: hash([1, 2, 3, 4]),
+                leaf: TagTreeNodePreimage {
+                    left: hash([5, 6, 7, 8]),
+                    right: hash([9, 10, 11, 12]),
+                    tag: hash([13, 14, 15, 16]),
+                },
+                index: 17,
+                siblings: vec![TagTreeProofNode {
+                    sibling: hash([23, 24, 25, 26]),
+                    parent_tag: hash([27, 28, 29, 30]),
+                }],
+            },
+            proof_height: 18,
+            reward_tree_tag_preimage: hash([19, 20, 21, 22]),
+        }
+    }
+
+    #[tokio::test]
+    async fn serializes_proof_fields_in_contract_order() {
+        let mut inputs = vec![99];
+
+        serialize_proof_to_inputs_v2(&proof_with_one_sibling(), &mut inputs).await;
+
+        assert_eq!(
+            inputs,
+            vec![99, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_proof_list_produces_no_calls() {
+        assert!(build_claim_calls_for_multi_checkpoints_v2(&[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batches_claims_greedily_as_ten_five_two_and_one() {
+        let proof = TagTreeMerkleProofWithRewardPreimage::new(psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty(), QHashOut::ZERO);
+        let proofs = (0..18)
+            .map(|index| ProofWithCheckpointV2 {
+                checkpoint_id: 100 + index,
+                proof: proof.clone(),
+                proposed_reward: 1_000 + index,
+            })
+            .collect::<Vec<_>>();
+
+        let calls = build_claim_calls_for_multi_checkpoints_v2(&proofs).await;
+
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls.iter().map(|call| call.method_name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "claim_guta_rewards_10",
+                "claim_guta_rewards_5",
+                "claim_guta_rewards_2",
+                "claim_guta_rewards_1"
+            ]
+        );
+        for (call, batch_size) in calls.iter().zip([10usize, 5, 2, 1]) {
+            assert_eq!(call.contract_id, MINING_REWARDS_CONTRACT_ID as u64);
+            assert_eq!(call.inputs.len(), batch_size * 24);
+        }
+        assert_eq!(&calls[0].inputs[..10], &(100..110).collect::<Vec<_>>());
+        assert_eq!(&calls[0].inputs[calls[0].inputs.len() - 10..], &(1_000..1_010).collect::<Vec<_>>());
+        assert_eq!(calls[3].inputs[0], 117);
+        assert_eq!(*calls[3].inputs.last().unwrap(), 1_017);
+    }
+
+    #[tokio::test]
+    async fn batching_boundaries_choose_expected_contract_methods() {
+        let proof = TagTreeMerkleProofWithRewardPreimage::new(psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty(), QHashOut::ZERO);
+        let cases: &[(usize, &[&str])] = &[
+            (1, &["claim_guta_rewards_1"]),
+            (2, &["claim_guta_rewards_2"]),
+            (3, &["claim_guta_rewards_2", "claim_guta_rewards_1"]),
+            (5, &["claim_guta_rewards_5"]),
+            (6, &["claim_guta_rewards_5", "claim_guta_rewards_1"]),
+            (10, &["claim_guta_rewards_10"]),
+            (11, &["claim_guta_rewards_10", "claim_guta_rewards_1"]),
+            (20, &["claim_guta_rewards_10", "claim_guta_rewards_10"]),
+            (
+                23,
+                &[
+                    "claim_guta_rewards_10",
+                    "claim_guta_rewards_10",
+                    "claim_guta_rewards_2",
+                    "claim_guta_rewards_1",
+                ],
+            ),
+        ];
+
+        for (count, expected_methods) in cases {
+            let proofs = (0..*count)
+                .map(|index| ProofWithCheckpointV2 {
+                    checkpoint_id: index as u64,
+                    proof: proof.clone(),
+                    proposed_reward: 100 + index as u64,
+                })
+                .collect::<Vec<_>>();
+            let calls = build_claim_calls_for_multi_checkpoints_v2(&proofs).await;
+            assert_eq!(
+                calls.iter().map(|call| call.method_name.as_str()).collect::<Vec<_>>(),
+                *expected_methods,
+                "unexpected batching for {count} proofs"
+            );
+        }
+    }
+}

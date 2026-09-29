@@ -1087,7 +1087,10 @@ mod tests2 {
             .collect()
     }
 
-    // Helper function to validate the tree structure programmatically
+    // Validate the planner output for the current skewed-split semantics:
+    // layers[0] is the deepest level, layers[last] the root (level 0), and
+    // leaves may sit at any level because the planner splits subtrees as
+    // left = ceil(n/2), right = floor(n/2) and stops descending at size 1.
     fn validate_tree_structure(layers: &[Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>], max_level: u8, num_leaves: usize) -> Result<()> {
         // The planner splits leaves as left = ceil(n/2), right = floor(n/2),
         // so a leaf job may sit at any level of an unbalanced tree. Collect
@@ -1488,6 +1491,409 @@ mod tests_backup_v1 {
         // The reader must commit the (empty) tree changes and leave the root intact.
         assert_eq!(read_tree.get_root(), start_root);
 
+        Ok(())
+    }
+}
+
+/// Tests for the `RegisterUserGatherer` builder (backup writer/reader round
+/// trip, cursor validation, finalize and revert), running fully offline
+/// against the in-memory temp store and mock file system.
+#[cfg(test)]
+mod gatherer_builder_tests {
+    use std::sync::{Arc, RwLock};
+
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{
+        crypto::hash::traits::MerkleZeroHasher,
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::Q256BitHash,
+        utils::QPGenRandom,
+        PHash, PF,
+    };
+    use psy_data::v1::qdata::checkpoint::{
+        PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState,
+    };
+    use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+
+    use crate::{
+        coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
+        test_common::TestNetworkConfig,
+    };
+
+    use super::*;
+
+    type N = TestNetworkConfig;
+    type Hash = PHash;
+    type F = PF;
+    type Hasher = PoseidonHasher;
+    type TempDb = InMemoryTempStore;
+    type Fs = SimpleMockMemoryFileSystem;
+
+    const REALM_ID: u64 = 1;
+    const REALM_SUB_ID: u64 = 2;
+    const UNIQUE_PENDING_ID: u64 = 600;
+
+    fn zh(level: usize) -> Hash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    /// `unwrap_err` needs the Ok type to be Debug; keep the helper style of
+    /// the other gatherer test modules.
+    fn err_str<T>(result: anyhow::Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("expected the call to fail, but it succeeded"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// One 64-byte PZKPublicKeyInfo-shaped queue item (the gatherer only
+    /// checks the fixed size and hashes the raw bytes).
+    fn rand_public_key_bytes() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&Hash::qp_rand_gen().into_owned_32bytes());
+        bytes.extend_from_slice(&Hash::qp_rand_gen().into_owned_32bytes());
+        bytes
+    }
+
+    fn expected_leaf(item: &[u8]) -> Hash {
+        hash_two_from_slice::<Hash, Hasher>(item)
+    }
+
+    fn block_state(next_user_id: u64) -> QEDL2BlockState {
+        QEDL2BlockState {
+            checkpoint_id: 0,
+            next_add_withdrawal_id: 0,
+            next_process_withdrawal_id: 0,
+            next_deposit_id: 0,
+            total_deposits_claimed_epoch: 0,
+            next_user_id,
+            end_balance: 0,
+            next_contract_id: 0,
+        }
+    }
+
+    fn shared_status(user_tree_root: Hash, should_revert: bool) -> Arc<RwLock<PsyCoordinatorProcessorSharedStatus<F, Hash>>> {
+        Arc::new(RwLock::new(PsyCoordinatorProcessorSharedStatus {
+            last_committed_checkpoint_id: 0,
+            unique_pending_id: UNIQUE_PENDING_ID,
+            last_committed_checkpoint_leaf: PQEDCheckpointLeaf::qp_rand_gen(),
+            last_committed_checkpoint_state_roots: PQEDCheckpointGlobalStateRoots {
+                contract_tree_root: zh(2),
+                deposit_tree_root: zh(2),
+                user_tree_root,
+                withdrawal_tree_root: zh(2),
+                user_registration_tree_root: user_tree_root,
+            },
+            should_revert_last_changes: should_revert,
+            block_state: block_state(0),
+        }))
+    }
+
+    fn test_config(
+        status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<F, Hash>>>,
+        temp_db: Arc<TempDb>,
+        fs: Arc<Fs>,
+        last_job_next_user_id: Arc<RwLock<u64>>,
+    ) -> RegisterUserGathererConfig<N, TempDb, Fs> {
+        RegisterUserGathererConfig {
+            status,
+            realm_id_u64: REALM_ID,
+            realm_sub_id_u64: REALM_SUB_ID,
+            temp_db,
+            backup_file_directory: "gatherer_backups".to_string(),
+            register_users_circuit_whitelist: zh(31),
+            last_job_next_user_id,
+            file_system: fs,
+            _phantom_n: std::marker::PhantomData,
+        }
+    }
+
+    /// Writer layout: magic | start_next_user_id | start_root | keys... |
+    /// total_jobs | block_time.
+    fn backup_bytes(start_next_user_id: u64, start_root: Hash, keys: &[Vec<u8>], total_jobs: u64, block_time: u64) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        data.extend_from_slice(&start_next_user_id.to_le_bytes());
+        data.extend_from_slice(&start_root.into_owned_32bytes());
+        for key in keys {
+            data.extend_from_slice(key);
+        }
+        data.extend_from_slice(&total_jobs.to_le_bytes());
+        data.extend_from_slice(&block_time.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn backup_file_path_contains_realm_and_pending_ids() {
+        let path = get_new_register_user_gatherer_backup_file_path("/tmp/backups", 4, 6, 99);
+        assert!(path.starts_with("/tmp/backups"));
+        assert!(path.ends_with("register_user_gatherer_realm_4_sub_6_pending_99.backup"));
+    }
+
+    #[tokio::test]
+    async fn read_backup_rejects_header_level_errors() -> anyhow::Result<()> {
+        let fs = SimpleMockMemoryFileSystem::new();
+
+        // below the minimum header size of 4 + 8 + 32 + 8 + 8 bytes
+        fs.files.insert("too_small".to_string(), vec![0u8; 59]);
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let err = err_str(read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "too_small", &mut tree).await);
+        assert!(err.contains("too small to be valid"), "got: {err}");
+
+        // body length not a multiple of the 64-byte public key size
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let mut data = backup_bytes(0, tree.get_root(), &[], 0, 1_700_000_000);
+        data.push(0u8);
+        fs.files.insert("bad_multiple".to_string(), data);
+        let err = err_str(read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "bad_multiple", &mut tree).await);
+        assert!(err.contains("not a multiple of 64"), "got: {err}");
+
+        // start user id already occupied in the tree
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        tree.set_leaf(1, Hash::qp_rand_gen());
+        tree.commit_changes();
+        let data = backup_bytes(1, tree.get_root(), &[], 0, 1_700_000_000);
+        fs.files.insert("occupied".to_string(), data);
+        let err = err_str(read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "occupied", &mut tree).await);
+        assert!(err.contains("does not match tree zero hash"), "got: {err}");
+
+        // start root that does not match the computed pivot root
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let data = backup_bytes(0, Hash::qp_rand_gen(), &[], 0, 1_700_000_000);
+        fs.files.insert("wrong_root".to_string(), data);
+        let err = err_str(read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "wrong_root", &mut tree).await);
+        assert!(err.contains("does not match tree computed root hash"), "got: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_backup_happy_path_applies_public_keys_and_commits() -> anyhow::Result<()> {
+        let fs = SimpleMockMemoryFileSystem::new();
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let start_root = tree.get_root();
+        let key_a = rand_public_key_bytes();
+        let key_b = rand_public_key_bytes();
+        let data = backup_bytes(0, start_root, &[key_a.clone(), key_b.clone()], 5, 1_700_000_000);
+        fs.files.insert("happy".to_string(), data);
+
+        let output = read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "happy", &mut tree).await?;
+        assert_eq!(output.start_next_user_id, 0);
+        assert_eq!(output.next_user_id, 2);
+        assert_eq!(output.start_user_registration_tree_hash, start_root);
+        assert_eq!(output.total_jobs, 5);
+        assert_eq!(output.block_time, 1_700_000_000);
+
+        // ffs rows are (user id || 64-byte public key) pairs in order
+        let mut expected_ffs = Vec::new();
+        expected_ffs.extend_from_slice(&0u64.to_le_bytes());
+        expected_ffs.extend_from_slice(&key_a);
+        expected_ffs.extend_from_slice(&1u64.to_le_bytes());
+        expected_ffs.extend_from_slice(&key_b);
+        assert_eq!(output.new_user_public_keys_ffs, expected_ffs);
+        assert!(!output.new_public_key_hash_to_user_id_rows_ffs.is_empty());
+
+        // the leaves were applied to the tree and committed
+        assert_eq!(tree.get_leaf_value(0), expected_leaf(&key_a));
+        assert_eq!(tree.get_leaf_value(1), expected_leaf(&key_b));
+        let mut expected_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        expected_tree.set_leaf(0, expected_leaf(&key_a));
+        expected_tree.set_leaf(1, expected_leaf(&key_b));
+        assert_eq!(output.end_user_registration_tree_hash, expected_tree.get_root());
+        assert_eq!(tree.get_root(), expected_tree.get_root());
+        // pivot siblings for a height-32 tree
+        assert_eq!(output.user_registration_tree_update_pivot_siblings.len(), 32);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_new_validates_tree_cursor_state() -> anyhow::Result<()> {
+        let temp_db = Arc::new(InMemoryTempStore::new("register_user_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+
+        // start id already occupied: leaf 0 exists but the cursor points at 0
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        tree.set_leaf(0, Hash::qp_rand_gen());
+        tree.commit_changes();
+        let config = test_config(shared_status(tree.get_root(), false), Arc::clone(&temp_db), Arc::clone(&fs), Arc::new(RwLock::new(0u64)));
+        let err = err_str(RegisterUserGatherer::create_new_with_tree(&mut tree, 55, config).await);
+        assert!(err.contains("Starting next user id 0 does not match tree zero hash"), "got: {err}");
+
+        // gap behind the cursor: cursor at 3 but the tree is empty
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let config = test_config(shared_status(tree.get_root(), false), Arc::clone(&temp_db), Arc::clone(&fs), Arc::new(RwLock::new(3u64)));
+        let err = err_str(RegisterUserGatherer::create_new_with_tree(&mut tree, 55, config).await);
+        assert!(err.contains("minus one does not exist in tree"), "got: {err}");
+
+        // valid cursor: one registered user, cursor at 1
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        tree.set_leaf(0, Hash::qp_rand_gen());
+        tree.commit_changes();
+        let config = test_config(shared_status(tree.get_root(), false), Arc::clone(&temp_db), Arc::clone(&fs), Arc::new(RwLock::new(1u64)));
+        let gatherer = RegisterUserGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+        assert_eq!(gatherer.next_user_id, 1);
+        assert!(gatherer.pending_file_path.ends_with("register_user_gatherer_realm_1_sub_2_pending_600.backup"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_accepts_registrations_and_finalizes() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let start_root = tree.get_root();
+
+        let temp_db = Arc::new(InMemoryTempStore::new("register_user_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let last_job_next_user_id = Arc::new(RwLock::new(0u64));
+        let config = test_config(
+            shared_status(start_root, false),
+            Arc::clone(&temp_db),
+            Arc::clone(&fs),
+            Arc::clone(&last_job_next_user_id),
+        );
+        let mut gatherer = RegisterUserGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        let key_a = rand_public_key_bytes();
+        let key_b = rand_public_key_bytes();
+        gatherer.update_from_many_queue_items_with_tree(&mut tree, vec![key_a.clone(), key_b.clone()]).await?;
+        assert_eq!(gatherer.next_user_id, 2);
+        assert_eq!(gatherer.new_user_registration_tree_leaves.len(), 2);
+        // the tree only changes at finalize
+        assert_eq!(tree.get_leaf_value(0), zh(0));
+        assert_eq!(tree.get_leaf_value(1), zh(0));
+
+        let output = RegisterUserGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        assert_eq!(output.db_output.start_next_user_id, 0);
+        assert_eq!(output.db_output.next_user_id, 2);
+        assert_eq!(output.db_output.start_user_registration_tree_hash, start_root);
+        let mut expected_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        expected_tree.set_leaf(0, expected_leaf(&key_a));
+        expected_tree.set_leaf(1, expected_leaf(&key_b));
+        assert_eq!(output.db_output.end_user_registration_tree_hash, expected_tree.get_root());
+        assert_eq!(tree.get_root(), expected_tree.get_root());
+
+        let mut expected_ffs = Vec::new();
+        expected_ffs.extend_from_slice(&0u64.to_le_bytes());
+        expected_ffs.extend_from_slice(&key_a);
+        expected_ffs.extend_from_slice(&1u64.to_le_bytes());
+        expected_ffs.extend_from_slice(&key_b);
+        assert_eq!(output.db_output.new_user_public_keys_ffs, expected_ffs);
+        assert!(!output.db_output.new_public_key_hash_to_user_id_rows_ffs.is_empty());
+
+        let total: u64 = output.job_ids.iter().map(|v| v.len() as u64).sum();
+        assert!(total >= 1);
+        assert_eq!(output.db_output.total_jobs, total);
+        // protocol block_time is unix seconds
+        assert!(output.db_output.block_time >= 1 && output.db_output.block_time < 1_000_000_000_000);
+        // the shared cursor advanced past the registered users
+        assert_eq!(*last_job_next_user_id.read().unwrap(), 2);
+
+        // the backup file is a faithful round trip for the reader
+        let backup_path = get_new_register_user_gatherer_backup_file_path("gatherer_backups", 1, 2, 600);
+        let bytes = fs.files.get(&backup_path).unwrap().value().clone();
+        assert_eq!(bytes.len(), 4 + 8 + 32 + 128 + 8 + 8);
+        let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let read_output = read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, &backup_path, &mut read_tree).await?;
+        assert_eq!(read_output.next_user_id, 2);
+        assert_eq!(read_output.end_user_registration_tree_hash, output.db_output.end_user_registration_tree_hash);
+        assert_eq!(read_output.total_jobs, total);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_invalid_queue_item_size() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let temp_db = Arc::new(InMemoryTempStore::new("register_user_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let config = test_config(shared_status(tree.get_root(), false), temp_db, fs, Arc::new(RwLock::new(0u64)));
+        let mut gatherer = RegisterUserGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        let err = err_str(gatherer.update_from_queue_item_with_tree(&mut tree, vec![0u8; 63]).await);
+        assert!(err.contains("Invalid queue item size"), "got: {err}");
+        let err = err_str(gatherer.update_from_queue_item_with_tree(&mut tree, vec![0u8; 65]).await);
+        assert!(err.contains("Invalid queue item size"), "got: {err}");
+        // no partial state was recorded
+        assert_eq!(gatherer.next_user_id, 0);
+        assert!(gatherer.new_user_registration_tree_leaves.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_without_users_writes_empty_backup() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let start_root = tree.get_root();
+
+        let temp_db = Arc::new(InMemoryTempStore::new("register_user_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let config = test_config(shared_status(start_root, false), temp_db, Arc::clone(&fs), Arc::new(RwLock::new(0u64)));
+        let gatherer = RegisterUserGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        let output = RegisterUserGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        assert_eq!(output.db_output.next_user_id, 0);
+        assert_eq!(output.db_output.start_next_user_id, 0);
+        assert_eq!(output.db_output.end_user_registration_tree_hash, start_root);
+        assert_eq!(tree.get_root(), start_root);
+        assert!(output.db_output.new_user_public_keys_ffs.is_empty());
+        // the planner emits the root promotion job even with zero inputs
+        let total: u64 = output.job_ids.iter().map(|v| v.len() as u64).sum();
+        assert!(total >= 1);
+        assert_eq!(output.db_output.total_jobs, total);
+        assert!(output.db_output.block_time >= 1 && output.db_output.block_time < 1_000_000_000_000);
+
+        let backup_path = get_new_register_user_gatherer_backup_file_path("gatherer_backups", 1, 2, 600);
+        let bytes = fs.files.get(&backup_path).unwrap().value().clone();
+        assert_eq!(bytes.len(), 4 + 8 + 32 + 8 + 8);
+        assert_eq!(u64::from_le_bytes(bytes[44..52].try_into()?), total);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_revert_restores_tree_and_cursors() -> anyhow::Result<()> {
+        // two committed users, cursor at 2
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        tree.set_leaf(0, Hash::qp_rand_gen());
+        tree.set_leaf(1, Hash::qp_rand_gen());
+        tree.commit_changes();
+        let committed_root = tree.get_root();
+
+        let temp_db = Arc::new(InMemoryTempStore::new("register_user_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        let status = shared_status(committed_root, false);
+        // flip the block into revert mode while the gatherer is alive: the
+        // decision is read live from the shared status at finalize time
+        status.write().unwrap().should_revert_last_changes = true;
+        status.write().unwrap().block_state = block_state(2);
+        let config = test_config(status, temp_db, fs, Arc::new(RwLock::new(2u64)));
+        let mut gatherer = RegisterUserGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        gatherer.update_from_queue_item_with_tree(&mut tree, rand_public_key_bytes()).await?;
+        assert_eq!(gatherer.next_user_id, 3);
+
+        let output = RegisterUserGatherer::finalize_with_tree(gatherer, &mut tree).await?;
+        // the revert branch never touches the tree mid-block (leaves are only
+        // applied at finalize), so the committed state survives unchanged
+        assert_eq!(tree.get_root(), committed_root);
+        assert_eq!(output.db_output.next_user_id, 2);
+        assert_eq!(output.db_output.end_user_registration_tree_hash, committed_root);
+        assert!(output.db_output.new_user_public_keys_ffs.is_empty());
+        // the cursor was reset to the last committed value
+        assert_eq!(output.db_output.start_next_user_id, 2);
+        // planner still emits the dummy root job
+        assert!(output.db_output.total_jobs >= 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_revert_with_wrong_committed_root_fails() -> anyhow::Result<()> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let temp_db = Arc::new(InMemoryTempStore::new("register_user_gatherer_test".to_string(), 1, 2));
+        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
+        // the committed user tree root in the (create-time) shared status
+        // snapshot does not match the live tree
+        let config = test_config(shared_status(Hash::qp_rand_gen(), true), temp_db, fs, Arc::new(RwLock::new(0u64)));
+        let gatherer = RegisterUserGatherer::create_new_with_tree(&mut tree, 55, config).await?;
+
+        let err = err_str(RegisterUserGatherer::finalize_with_tree(gatherer, &mut tree).await);
+        assert!(err.contains("user registration tree root mismatch"), "got: {err}");
         Ok(())
     }
 }

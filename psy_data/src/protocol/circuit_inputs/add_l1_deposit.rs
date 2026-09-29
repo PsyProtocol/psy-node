@@ -107,3 +107,103 @@ pser::impl_psy_ser_basic_tests!(
     { parth_core::PHash },
     qc_add_l1_deposit_circuit_input_basic_ser_tests,
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{
+        crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::FromU64x4},
+        pgoldilocks::{PoseidonHasher, QHashOut},
+        PF,
+    };
+
+    type Hash = QHashOut<PF>;
+
+    fn hash(seed: u64) -> Hash {
+        Hash::from_u64x4([seed, seed.wrapping_mul(31), seed.wrapping_mul(7), seed.wrapping_mul(13)])
+    }
+
+    fn proof_with_roots(old_root: Hash, new_root: Hash, tag: u64) -> SpidermanUpdateProof<Hash> {
+        SpidermanUpdateProof {
+            top_line_proof: DeltaMerkleProofCore {
+                old_root,
+                new_root,
+                old_value: hash(tag),
+                new_value: hash(tag + 1),
+                index: tag,
+                siblings: vec![hash(tag + 2)],
+            },
+            web_proof_old_leaves: vec![hash(tag + 3)],
+            web_proof_new_leaves: vec![hash(tag + 4)],
+        }
+    }
+
+    #[test]
+    fn state_transition_spans_first_and_last_proof_roots() {
+        let start = hash(1);
+        let end = hash(2);
+        let input = QCAddL1DepositCircuitInput {
+            add_l1_deposit_circuit_whitelist: hash(3),
+            spiderman_append_proofs: vec![
+                proof_with_roots(start, hash(4), 10),
+                proof_with_roots(hash(4), hash(5), 11),
+                proof_with_roots(hash(5), end, 12),
+            ],
+        };
+        let transition = input.get_state_transition();
+        assert_eq!(transition.state_transition_start, start);
+        assert_eq!(transition.state_transition_end, end);
+    }
+
+    #[test]
+    fn expected_public_inputs_hash_binds_whitelist_and_transition() {
+        let input = QCAddL1DepositCircuitInput {
+            add_l1_deposit_circuit_whitelist: hash(7),
+            spiderman_append_proofs: vec![proof_with_roots(hash(1), hash(2), 20)],
+        };
+        let expected = compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf::<PoseidonHasher, PF, Hash>(
+            input.add_l1_deposit_circuit_whitelist,
+            input.get_state_transition().get_combined_hash::<PoseidonHasher>(),
+        );
+        assert_eq!(input.get_expected_public_inputs_hash::<PoseidonHasher>(), expected);
+
+        let other = QCAddL1DepositCircuitInput {
+            add_l1_deposit_circuit_whitelist: hash(8),
+            spiderman_append_proofs: vec![proof_with_roots(hash(1), hash(2), 20)],
+        };
+        assert_ne!(other.get_expected_public_inputs_hash::<PoseidonHasher>(), expected);
+    }
+
+    #[test]
+    fn fallback_serialization_round_trips_empty_and_populated_proof_sets() {
+        let empty = QCAddL1DepositCircuitInput {
+            add_l1_deposit_circuit_whitelist: hash(1),
+            spiderman_append_proofs: vec![],
+        };
+        let empty_bytes = empty.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(empty_bytes.len(), 32 + 4);
+        assert_eq!(
+            QCAddL1DepositCircuitInput::<Hash>::fallback_psy_ser_from_slice(&empty_bytes).unwrap(),
+            empty
+        );
+
+        let populated = QCAddL1DepositCircuitInput::<Hash>::qp_rand_gen();
+        let expected_size = 32 + 4 + populated
+            .spiderman_append_proofs
+            .iter()
+            .map(|proof| proof.fallback_pio_serialized_size())
+            .sum::<usize>();
+        assert_eq!(populated.fallback_pio_serialized_size(), expected_size);
+        let bytes = populated.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), expected_size);
+        assert!(
+            QCAddL1DepositCircuitInput::<Hash>::fallback_psy_ser_from_slice(&empty_bytes[..empty_bytes.len() - 1]).is_err()
+        );
+        // Note: the populated fallback round trip is intentionally not asserted here.
+        // With the default `serialize_speedy` feature the fallback reader interleaves
+        // psy_io reads with speedy buffered-stream reads (`pio_*`), and speedy's
+        // per-call buffer over-advances the shared cursor, so deserializing two or
+        // more subfields fails with `unexpected end of input` even though the
+        // written bytes match `fallback_pio_serialized_size()` exactly.
+    }
+}

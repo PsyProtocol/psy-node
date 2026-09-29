@@ -108,17 +108,69 @@ impl BinaryTreePlanner {
 
 #[cfg(test)]
 mod tests {
-    use super::BinaryTreePlanner;
+    use super::{gen_leaves_binary_tree_planner, BinaryTreePlanner, TreePosition};
 
     #[test]
-    fn btree_planner_graphviz() {
-        let btp = BinaryTreePlanner::new(6);
-        println!("{}", btp.get_graphviz());
+    fn tree_position_navigation_and_sentinels() {
+        let position = TreePosition::new(3, 5);
+
+        assert!(!position.is_leaf());
+        assert_eq!(position.get_span(), 8);
+        assert_eq!(position.get_left_child(), TreePosition::new(2, 10));
+        assert_eq!(position.get_right_child(), TreePosition::new(2, 11));
+        assert_eq!(position.get_parent(), TreePosition::new(4, 2));
+
+        let leaf = TreePosition::new(0, 7);
+        assert!(leaf.is_leaf());
+        assert_eq!(leaf.get_span(), 1);
+
+        let null = TreePosition::new_null();
+        assert!(null.is_null());
+        assert!(!position.is_null());
     }
-    #[test]
-    fn btree_planner_json() {
-        let btp = BinaryTreePlanner::new(6);
 
-        println!("{}", serde_json::to_string(&btp).unwrap());
+    #[test]
+    fn leaf_jobs_have_null_dependencies() {
+        let leaves = gen_leaves_binary_tree_planner(3);
+
+        assert_eq!(leaves.len(), 3);
+        for (index, job) in leaves.iter().enumerate() {
+            assert_eq!(job.position, TreePosition::new(0, index as u64));
+            assert!(job.left_job.is_null());
+            assert!(job.right_job.is_null());
+        }
+        assert!(gen_leaves_binary_tree_planner(0).is_empty());
+    }
+
+    #[test]
+    fn planner_handles_empty_single_even_and_odd_leaf_counts() {
+        assert!(BinaryTreePlanner::new(0).levels.is_empty());
+        assert!(BinaryTreePlanner::new(1).levels.is_empty());
+
+        let even = BinaryTreePlanner::new(4);
+        assert_eq!(even.levels.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(even.levels[1][0].left_job, TreePosition::new(1, 0));
+        assert_eq!(even.levels[1][0].right_job, TreePosition::new(1, 1));
+
+        let odd = BinaryTreePlanner::new(5);
+        assert_eq!(odd.levels.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1, 1]);
+        assert_eq!(odd.levels[1][0].left_job, TreePosition::new(1, 0));
+        assert_eq!(odd.levels[1][0].right_job, TreePosition::new(1, 1));
+        assert_eq!(odd.levels[2][0].left_job, TreePosition::new(2, 0));
+        assert_eq!(odd.levels[2][0].right_job, TreePosition::new(0, 4));
+    }
+
+    #[test]
+    fn graphviz_and_json_are_stable_and_round_trip() {
+        let planner = BinaryTreePlanner::new(3);
+        let graphviz = planner.get_graphviz();
+        assert_eq!(
+            graphviz,
+            "digraph G {\n\"1:0\" -> \"0:0\";\n\"1:0\" -> \"0:1\";\n\"2:0\" -> \"1:0\";\n\"2:0\" -> \"0:2\";\n}\n"
+        );
+
+        let json = serde_json::to_string(&planner).unwrap();
+        let decoded: BinaryTreePlanner = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, planner);
     }
 }

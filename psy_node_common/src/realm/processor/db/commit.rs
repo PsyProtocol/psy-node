@@ -5,7 +5,7 @@ use parth_core::{
         merkle_proof::MerkleProofCore
     ,
     protocol::core_types::QNetworkTypesConfig,
-    data::queue::queue_key::{PCoreSubjectQueueBase, QPBaseQueueType},
+    data::queue::queue_key::QPBaseQueueType,
 };
 use psy_core::
     job::job_id::ProvingJobCircuitType
@@ -323,4 +323,206 @@ where
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use parth_core::{QCoreProcCheckpointUniqueId, PHash};
+    use psy_core::job::job_id::ProvingJobCircuitType;
+    use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
+    use psy_node_core::psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseReader;
+    use psy_node_core::psy_temp_db::QTempDBPendingIdReader;
+
+    use crate::realm::processor::db::realm_db_test_env::*;
+
+    #[tokio::test]
+    async fn set_new_unique_ids_rotates_state_and_ensures_queue_consumers() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        let rid = test_realm_identifier();
+
+        // fresh state: everything parked at zero, so the first rotation also
+        // creates the genesis (unique id 0) consumers
+        assert_eq!(env.processor.state.gathering_unique_pending_id, 0);
+        assert_eq!(env.processor.state.gathering_proc_checkpoint_unique_id, 0u128);
+
+        let custom_end_root = zh(61);
+        env.processor.set_new_unique_ids(Some(custom_end_root)).await?;
+
+        // gathering moved to the freshly allocated ids, processing still at 0
+        assert_eq!(env.processor.state.gathering_unique_pending_id, 1);
+        assert_ne!(env.processor.state.gathering_proc_checkpoint_unique_id, 0u128);
+        assert_eq!(env.processor.state.processing_unique_pending_id, 0);
+        // the provided end root becomes the new gathering start root
+        assert_eq!(env.processor.state.gathering_realm_start_root, custom_end_root);
+        assert_eq!(env.processor.state.processing_realm_end_root, custom_end_root);
+
+        // one consumer for the new gathering id + one for the genesis id 0
+        assert_eq!(env.guta_queue.ensured_consumer_count(), 2);
+        assert_eq!(env.proof_queue.ensured_consumers.lock().unwrap().len(), 2);
+
+        // temp db mirrors the rotated ids
+        let gathering = env.temp_db.get_gathering_unique_pending_ids(&rid).await?;
+        assert_eq!(gathering.0, 1);
+        assert_eq!(gathering.1, env.processor.state.gathering_proc_checkpoint_unique_id);
+        let processing = env.temp_db.get_unique_pending_ids(&rid).await?;
+        assert_eq!(processing, (0, 0u128));
+
+        // second rotation: gathering graduates into processing, and only one
+        // new consumer pair is ensured (the genesis branch no longer fires)
+        env.processor.set_new_unique_ids(None).await?;
+        assert_eq!(env.processor.state.gathering_unique_pending_id, 2);
+        assert_ne!(env.processor.state.gathering_proc_checkpoint_unique_id, 0u128);
+        assert_eq!(env.processor.state.processing_unique_pending_id, 1);
+        assert_eq!(env.guta_queue.ensured_consumer_count(), 3);
+        assert_eq!(env.proof_queue.ensured_consumers.lock().unwrap().len(), 3);
+
+        // shared state wrapper stays in sync
+        let shared = env.processor.shared_state.load_core_state().await?;
+        assert_eq!(shared.gathering_unique_pending_id, 2);
+        assert_eq!(shared.processing_unique_pending_id, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_state_bails_on_inconsistent_checkpoint_tree_root() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+
+        // tamper the checkpoint tree root so the append-root checksum fails
+        let mut tampered = env.genesis.coordinator_update.clone();
+        tampered.checkpoint_sync_info.checkpoint_tree_root = zh(99);
+
+        let err = match env
+            .processor
+            .commit_state(&tampered, &env.genesis.prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![], false)
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("tampered checkpoint tree root must fail the commit"),
+        };
+        assert!(err.to_string().contains("Inconsistent checkpoint tree root"), "unexpected error: {err}");
+
+        // the checkpoint marker must NOT advance on a failed commit
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        // the pending-id mapping written up-front still points 0 -> 0
+        assert_eq!(env.db.get_checkpoint_id_for_unique_pending_id(0).await?, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_state_persists_records_and_advances_state() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let update = &env.genesis.coordinator_update;
+
+        // the l2 singleton advances together with the committed marker
+        assert_eq!(env.db.get_latest_l2_block_state().await?, update.checkpoint_sync_info.block_state);
+        assert_eq!(env.db.get_l2_block_state(0).await?, update.checkpoint_sync_info.block_state);
+
+        // core state committed the processing snapshot. Note: neither the
+        // state's committed root nor the per-checkpoint tree root stored in
+        // the db equals the coordinator's canonical checkpoint_tree_root —
+        // the canonical root is only recorded via the root -> checkpoint id
+        // mapping, asserted below
+        let state = &env.processor.state;
+        assert_eq!(state.last_committed_checkpoint_id, 0);
+        assert_ne!(state.last_committed_checkpoint_root, update.checkpoint_sync_info.checkpoint_tree_root);
+        assert_eq!(
+            env.db.get_checkpoint_id_for_checkpoint_root_hash(update.checkpoint_sync_info.checkpoint_tree_root).await?,
+            Some(0)
+        );
+        assert_eq!(state.last_committed_realm_end_root, env.genesis.prepared_updates.new_realm_root);
+        assert_eq!(state.last_committed_unique_pending_id, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_state_skips_root_check_when_flag_set_at_checkpoint_one() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+
+        // a checkpoint-1 update whose checkpoint-tree root does NOT match a
+        // local append: with skip_checkpoint_root_check = true the commit must
+        // still succeed (the backup manager was synced from the coordinator)
+        let mut update = env.make_checkpoint_one_update();
+        update.checkpoint_sync_info.checkpoint_tree_root = zh(77);
+
+        let proc_id: QCoreProcCheckpointUniqueId = 7;
+        env.processor.state.processing_checkpoint_id = 1;
+        env.processor.state.processing_checkpoint_root = update.checkpoint_sync_info.checkpoint_tree_root;
+        env.processor.state.processing_realm_start_root = local_root;
+        env.processor.state.processing_realm_end_root = local_root;
+        env.processor.state.processing_unique_pending_id = 1;
+        env.processor.state.processing_proc_checkpoint_unique_id = proc_id;
+
+        let prepared = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 1,
+            proc_checkpoint_unique_id: proc_id,
+            old_realm_root: local_root,
+            new_realm_root: local_root,
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        env.processor
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![], true)
+            .await?;
+
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        assert_eq!(env.db.get_latest_l2_block_state().await?, update.checkpoint_sync_info.block_state);
+        assert_eq!(env.db.get_checkpoint_id_for_unique_pending_id(1).await?, Some(1));
+        assert_eq!(env.db.get_unique_pending_id_for_checkpoint_id(1).await?, Some((1, proc_id)));
+        assert_eq!(
+            env.db.get_checkpoint_id_for_checkpoint_root_hash(update.checkpoint_sync_info.checkpoint_tree_root).await?,
+            Some(1)
+        );
+
+        let state = &env.processor.state;
+        assert_eq!(state.last_committed_checkpoint_id, 1);
+        assert_eq!(state.last_committed_unique_pending_id, 1);
+        assert_eq!(state.last_committed_proc_checkpoint_unique_id, proc_id);
+        assert_eq!(state.last_committed_checkpoint_root, zh(77));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_state_cleans_up_proofs_of_previous_pending_id() -> anyhow::Result<()> {
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let local_root = env.seed_consistent_coordinator_head().await?;
+
+        let update = env.make_checkpoint_one_update();
+        env.processor.state.processing_checkpoint_id = 1;
+        env.processor.state.processing_checkpoint_root = update.checkpoint_sync_info.checkpoint_tree_root;
+        env.processor.state.processing_realm_start_root = local_root;
+        env.processor.state.processing_realm_end_root = local_root;
+        env.processor.state.processing_unique_pending_id = 1;
+        env.processor.state.processing_proc_checkpoint_unique_id = 7;
+
+        let prepared = PsyPreparedRealmBlockStateUpdates::<PHash> {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 1,
+            proc_checkpoint_unique_id: 7,
+            old_realm_root: local_root,
+            new_realm_root: local_root,
+            update_global_user_tree_nodes_ffs: vec![],
+            update_user_contract_tree_nodes_ffs: vec![],
+            update_contract_state_tree_nodes_ffs: vec![],
+            update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
+        };
+        env.processor
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![], true)
+            .await?;
+        // the previous checkpoint's proofs (pending id 0) were dropped; the
+        // commit itself still reports checkpoint 1 fully persisted
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
+        Ok(())
+    }
+
 }
