@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::task;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::QFieldHashable}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
+    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::{MerkleZeroHasher, QFieldHashable}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::{QFelt64, ToU64Value}, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, compute_update_contract_content_hash, hash_to_hex};
@@ -11,7 +11,7 @@ use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
-            checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PQBCDeployContractV2, PQBCUpdateContract, PsyDeployContractQueueItemV2, PsyUpdateContractQueueItem}, public_key::PZKPublicKeyInfo
+            checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PQBCDeployContractV2, PQBCUpdateContract, PQEDContractLeafV2, PsyDeployContractQueueItemV2, PsyUpdateContractQueueItem, STATE_LAYOUT_DEPLOY_CONTRACT_ID}, public_key::PZKPublicKeyInfo
         },
     }
 };
@@ -26,7 +26,115 @@ use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabase
 use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorUpdateContractQueueKey};
 
 pub type CanonicalLayoutProofVerifier =
-    dyn Fn(&[u8]) -> anyhow::Result<()> + Send + Sync;
+    dyn Fn(&[u8]) -> anyhow::Result<[u64; 19]> + Send + Sync;
+
+fn validate_update_layout_endpoints<F: QFelt64, Hash: Q256BitHash>(
+    public_inputs: &[u64; 19],
+    contract_id: u64,
+    layout_version: u16,
+    old_leaf: &PQEDContractLeafV2<F, Hash>,
+    new_leaf: &PQEDContractLeafV2<F, Hash>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(public_inputs[0] == contract_id, "layout proof contract id does not match update request");
+    anyhow::ensure!(public_inputs[1] == layout_version as u64, "layout proof version does not match update request");
+    anyhow::ensure!(
+        Hash::from_u64x4(public_inputs[2..6].try_into().unwrap()) == old_leaf.state_layout_root
+            && public_inputs[6] == old_leaf.state_layout_field_count.to_u64_value()
+            && public_inputs[7] == old_leaf.state_layout_slot_count.to_u64_value(),
+        "layout proof old endpoint does not match on-chain contract layout"
+    );
+    anyhow::ensure!(
+        Hash::from_u64x4(public_inputs[8..12].try_into().unwrap()) == new_leaf.state_layout_root
+            && public_inputs[12] == new_leaf.state_layout_field_count.to_u64_value()
+            && public_inputs[13] == new_leaf.state_layout_slot_count.to_u64_value(),
+        "layout proof new endpoint does not match update request"
+    );
+    Ok(())
+}
+
+fn validate_deploy_layout_endpoints<F: QFelt64, Hash: Q256BitHash>(
+    public_inputs: &[u64; 19],
+    layout_version: u16,
+    empty_layout_root: Hash,
+    new_leaf: &PQEDContractLeafV2<F, Hash>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        public_inputs[0] == STATE_LAYOUT_DEPLOY_CONTRACT_ID,
+        "deploy layout proof has the wrong contract id"
+    );
+    anyhow::ensure!(
+        public_inputs[1] == layout_version as u64,
+        "deploy layout proof version does not match request"
+    );
+    anyhow::ensure!(
+        Hash::from_u64x4(public_inputs[2..6].try_into().unwrap()) == empty_layout_root
+            && public_inputs[6] == 0
+            && public_inputs[7] == 0,
+        "deploy layout proof does not start from the empty layout"
+    );
+    anyhow::ensure!(
+        Hash::from_u64x4(public_inputs[8..12].try_into().unwrap()) == new_leaf.state_layout_root
+            && public_inputs[12] == new_leaf.state_layout_field_count.to_u64_value()
+            && public_inputs[13] == new_leaf.state_layout_slot_count.to_u64_value(),
+        "deploy layout proof new endpoint does not match contract leaf"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod layout_endpoint_tests {
+    use super::{validate_deploy_layout_endpoints, validate_update_layout_endpoints};
+    use parth_core::{crypto::hash::traits::FromU64x4, felt::ToU64Value, PHash, PF};
+    use psy_data::v1::qdata::contract::PQEDContractLeafV2;
+
+    #[test]
+    fn rejects_identity_proof_for_a_newer_layout_than_chain_state() {
+        let mut old_leaf = PQEDContractLeafV2::<PF, PHash>::default();
+        old_leaf.state_layout_field_count = PF::from_owned_u64(14);
+        old_leaf.state_layout_slot_count = PF::from_owned_u64(14);
+        let mut new_leaf = old_leaf;
+        new_leaf.state_layout_field_count = PF::from_owned_u64(17);
+        new_leaf.state_layout_slot_count = PF::from_owned_u64(17);
+
+        let mut proof_inputs = [0u64; 19];
+        proof_inputs[0] = 7;
+        proof_inputs[1] = 1;
+        proof_inputs[6] = 17;
+        proof_inputs[7] = 17;
+        proof_inputs[12] = 17;
+        proof_inputs[13] = 17;
+        let error = validate_update_layout_endpoints(
+            &proof_inputs, 7, 1, &old_leaf, &new_leaf,
+        ).unwrap_err();
+        assert!(error.to_string().contains("old endpoint does not match"));
+
+        proof_inputs[6] = 14;
+        proof_inputs[7] = 14;
+        validate_update_layout_endpoints(
+            &proof_inputs, 7, 1, &old_leaf, &new_leaf,
+        ).unwrap();
+    }
+
+    #[test]
+    fn rejects_deploy_proof_with_a_different_new_layout_root() {
+        let mut leaf = PQEDContractLeafV2::<PF, PHash>::default();
+        leaf.state_layout_root = PHash::from_u64x4([1, 2, 3, 4]);
+        leaf.state_layout_field_count = PF::from_owned_u64(17);
+        leaf.state_layout_slot_count = PF::from_owned_u64(20);
+        let mut proof_inputs = [0u64; 19];
+        proof_inputs[1] = 1;
+        proof_inputs[8..12].copy_from_slice(&[5, 6, 7, 8]);
+        proof_inputs[12] = 17;
+        proof_inputs[13] = 20;
+        let error = validate_deploy_layout_endpoints(
+            &proof_inputs, 1, PHash::default(), &leaf,
+        ).unwrap_err();
+        assert!(error.to_string().contains("new endpoint"));
+
+        proof_inputs[8..12].copy_from_slice(&[1, 2, 3, 4]);
+        validate_deploy_layout_endpoints(&proof_inputs, 1, PHash::default(), &leaf).unwrap();
+    }
+}
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct CoordinatorEdgeHandler<
@@ -414,7 +522,7 @@ impl<
         &self,
         claimed_fingerprint: N::QHash,
         proof: &[u8],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<[u64; 19]> {
         anyhow::ensure!(
             claimed_fingerprint == self.canonical_layout_verifier_fingerprint,
             "canonical layout verifier fingerprint mismatch"
@@ -449,7 +557,7 @@ impl<
             "contract has too many functions defined"
         );
 
-        self.validate_canonical_layout_proof(
+        let layout_public_inputs = self.validate_canonical_layout_proof(
             deploy_contract.canonical_layout_verifier_fingerprint,
             &deploy_contract.canonical_layout_proof,
         )
@@ -481,6 +589,12 @@ impl<
                     canonical_layout_verifier_fingerprint,
                     canonical_layout_proof,
                 )?;
+        validate_deploy_layout_endpoints(
+            &layout_public_inputs,
+            layout_protocol_version,
+            N::HasherBase::get_zero_hash(psy_core::constants::protocol::STATE_LAYOUT_TREE_HEIGHT),
+            &queue_item.contract_leaf,
+        )?;
 
         let (unique_pending_id, unique_proc_checkpoint_id, queue_key) =
             self.get_deploy_contract_queue_key().await?;
@@ -553,7 +667,7 @@ impl<
             "contract state tree height is immutable"
         );
 
-        self.validate_canonical_layout_proof(
+        let layout_public_inputs = self.validate_canonical_layout_proof(
             update_contract.canonical_layout_verifier_fingerprint,
             &update_contract.canonical_layout_proof,
         )
@@ -588,6 +702,13 @@ impl<
             function_leaves,
             code_root,
             N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
+        )?;
+        validate_update_layout_endpoints(
+            &layout_public_inputs,
+            contract_id,
+            layout_protocol_version,
+            &existing_leaf,
+            &queue_item.contract_leaf,
         )?;
         let update_content_hash = compute_update_contract_content_hash(
             contract_id,

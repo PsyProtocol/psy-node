@@ -90,9 +90,7 @@ pub struct UpdateContractArgs {
     pub contract_id: u64,
     #[clap(long)]
     pub contract_path: String,
-    /// ABI JSON of the currently deployed contract layout. When omitted the old
-    /// ABI is assumed to match the new ABI in the compilation artifact supplied
-    /// to `--contract-path`.
+    /// ABI JSON of the currently deployed contract layout. Required for updates.
     #[clap(long)]
     pub old_abi_path: Option<String>,
     /// ABI JSON produced for the updated contract. When omitted the new ABI is
