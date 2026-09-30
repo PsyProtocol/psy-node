@@ -33,8 +33,10 @@ async fn main() -> anyhow::Result<()> {
             coordinator_api_urls,
             url_rotation_strategy,
             batch_size,
+            proving_pools,
+            threads_per_job,
         } => {
-            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, completed_jobs_log_file, realm_api_urls, coordinator_api_urls, url_rotation_strategy, batch_size).await?;
+            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, completed_jobs_log_file, realm_api_urls, coordinator_api_urls, url_rotation_strategy, batch_size, proving_pools, threads_per_job).await?;
         }
         Commands::WorkerTest {
             config,
@@ -47,8 +49,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             worker_test::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend).await?;
         },
-        Commands::Replay { inputs, network, role, circuit, limit, per_circuit, concurrency, passes, out, dump_proofs, require_equivalent } => {
-            tokio::task::spawn_blocking(move || replay::run(inputs, network, role, circuit, limit, per_circuit, concurrency, passes, out, dump_proofs, require_equivalent)).await??;
+        Commands::Replay { inputs, network, role, circuit, limit, per_circuit, concurrency, passes, out, dump_proofs, require_equivalent, proving_pools, threads_per_job } => {
+            tokio::task::spawn_blocking(move || replay::run(inputs, network, role, circuit, limit, per_circuit, concurrency, passes, out, dump_proofs, require_equivalent, proving_pools, threads_per_job)).await??;
         }
         Commands::GenerateKeypair => {
             keypair_helper::generate_keypair()?;

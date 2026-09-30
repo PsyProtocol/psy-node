@@ -38,8 +38,10 @@ use psy_core::{
 use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
 use parth_core::protocol::core_types::{QZKProofPublicInputsHasherReader, QZKProofVerifier};
 use psy_plonky2_circuits::{circuit_library::get_plonky2_circuit_library_and_prover_for_network, zk_verifier::PsyPlonky2ZKVerifier};
-use psy_worker_core::worker::prover_trait::PsyWorkerGenericLibraryProver;
+use psy_worker_core::worker::{prover_trait::PsyWorkerGenericLibraryProver, proving_pools::{default_total_threads, ProvingPools}};
 use serde::{de::IgnoredAny, Deserialize};
+
+use super::ProvingPoolsMode;
 
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
@@ -238,6 +240,8 @@ pub fn run(
     out: Option<String>,
     dump_proofs: Option<String>,
     require_equivalent: bool,
+    proving_pools: ProvingPoolsMode,
+    threads_per_job: Option<usize>,
 ) -> anyhow::Result<()> {
     let network: PsyChainNetworkType = network.unwrap_or_default().into();
     let (claims, summary) = load_claims(Path::new(&inputs), role.as_deref(), circuit.as_deref(), limit, per_circuit)?;
@@ -289,9 +293,22 @@ pub fn run(
             std::fs::write(Path::new(dir).join(format!("{}.recorded.proof", claim.key)), &claim.recorded_proof)?;
         }
     }
+    // The pools the worker would use with the same --batch-size.
+    let pools = match proving_pools {
+        ProvingPoolsMode::Shared => None,
+        ProvingPoolsMode::PerJob => Some(ProvingPools::new(default_total_threads(), concurrency, threads_per_job)?),
+    };
+    match &pools {
+        Some(pools) => println!("[replay] a thread pool per job: the global pool of {} threads for a job that starts alone, {} threads for each job that starts beside others", default_total_threads(), pools.narrow_threads()),
+        None => println!("[replay] all jobs share rayon's global pool of {} threads", default_total_threads()),
+    }
     // A panic inside one proof is that proof's failure, as in the worker.
     let prove = |input: JobInput, tag: Hash| -> anyhow::Result<Vec<u8>> {
-        match catch_unwind(AssertUnwindSafe(|| prover.prove_job_from_api(library, input, tag))) {
+        let job = || match &pools {
+            Some(pools) => pools.run(|| prover.prove_job_from_api(library, input, tag)),
+            None => prover.prove_job_from_api(library, input, tag),
+        };
+        match catch_unwind(AssertUnwindSafe(job)) {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("proving panicked")),
         }

@@ -9,6 +9,15 @@ pub mod dummy_end_cap_prover_lite;
 pub mod get_reputation;
 pub mod replay;
 
+/// Where the rayon work of concurrent jobs runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ProvingPoolsMode {
+    /// Every job in rayon's global pool.
+    Shared,
+    /// The global pool for a job that starts alone, a pool of its own for each job that starts beside others.
+    PerJob,
+}
+
 #[derive(Parser)]
 pub struct Cli {
     #[command(subcommand)]
@@ -55,6 +64,12 @@ pub enum Commands {
 
         #[arg(long = "batch-size", default_value = "4", help = "Number of jobs to fetch and process concurrently")]
         batch_size: usize,
+
+        #[arg(long = "proving-pools", env = "PROVING_POOLS", value_enum, default_value = "per-job", help = "Thread pools for concurrent jobs: per-job runs a job that starts alone in the global pool and each job that starts beside others in a pool of its own; shared is one pool for all, as before")]
+        proving_pools: ProvingPoolsMode,
+
+        #[arg(long = "threads-per-job", env = "THREADS_PER_JOB", help = "With --proving-pools per-job: threads of the pool of a job that starts beside others (default: half of all threads)")]
+        threads_per_job: Option<usize>,
     },
     #[command(about = "Run a proof mining worker in test mode")]
     WorkerTest {
@@ -110,6 +125,12 @@ pub enum Commands {
 
         #[arg(long = "dump-proofs", help = "Write every proof (<key>.pass<N>.proof) and the recorded one (<key>.recorded.proof) into this directory")]
         dump_proofs: Option<String>,
+
+        #[arg(long = "proving-pools", value_enum, default_value = "per-job", help = "Thread pools for concurrent jobs, as the worker's option of the same name")]
+        proving_pools: ProvingPoolsMode,
+
+        #[arg(long = "threads-per-job", help = "With --proving-pools per-job: threads of the pool of a job that starts beside others (default: half of all threads)")]
+        threads_per_job: Option<usize>,
 
         #[arg(long = "require-equivalent", help = "Fail unless the edge's verifier accepts every proof with production's public inputs, and the circuits built here equal the edge's and accept every production proof (failed proofs always fail the run)")]
         require_equivalent: bool,
