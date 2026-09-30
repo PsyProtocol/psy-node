@@ -29,6 +29,7 @@ use psy_common_circuit::{
 };
 use psy_config::network_constants::{CHECKPOINT_TREE_HEIGHT, DEFERRED_TRANSACTION_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT};
 use psy_crypto::hash::core::sha256;
+use psy_crypto::hash::traits::hasher::MerkleZeroHasher;
 use psy_network_circuit::gadgets::qdata::{
     checkpoint_state_roots::PsyCheckpointGlobalStateRootsGadget, checkpoint_stats::PsyCheckpointLeafStatsGadget, contract::PsyContractLeafGadget,
     contract_function_call::DPNProvingSessionSimpleMethodCallGadget, user::PsyUserLeafGadget,
@@ -1029,7 +1030,7 @@ impl StateReaderGadget {
         expected_contract_state_tree_root
     }
 
-    pub fn get_self_user_external_contract_slot_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+    pub fn get_self_user_external_contract_slot_hash<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
         dpn: &SimpleDPNBuilder<F, D>,
@@ -1037,6 +1038,7 @@ impl StateReaderGadget {
         slot_target_id: u64,
         contract_state_tree_height: Target,
     ) -> HashOutTarget {
+        let expected_contract_state_tree_root = self.get_self_user_external_contract_root::<H, F, D>(builder, dpn, contract_target_id);
         let contract_state_tree_ck =
             StateCommandCacheKey::new_read_self_user_external_contract_slot(contract_target_id, slot_target_id, self.contract_call_epoch);
         let (is_new_contract_state_tree, mp_cst_value, mp_cst_root, mp_cst_index) = {
@@ -1046,15 +1048,16 @@ impl StateReaderGadget {
         };
 
         let slot_value = mp_cst_value;
+        let is_uninitialized = Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+            builder, expected_contract_state_tree_root, mp_cst_root, contract_state_tree_height,
+        );
         if is_new_contract_state_tree {
-            let expected_contract_state_tree_root = self.get_self_user_external_contract_root::<H, F, D>(builder, dpn, contract_target_id);
-            builder.connect_hashes(mp_cst_root, expected_contract_state_tree_root);
-
             let slot_index = dpn.resolve_target(slot_target_id);
             builder.connect(slot_index, mp_cst_index);
             self.result_map.insert(contract_state_tree_ck, slot_value.elements.to_vec());
         }
-        slot_value
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        builder.select_hash(is_uninitialized, zero_hash, slot_value)
     }
 
     pub fn get_other_user_leaf_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
@@ -1078,7 +1081,7 @@ impl StateReaderGadget {
         mp_user_tree_value
     }
 
-    pub fn get_other_user_leaf<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+    pub fn get_other_user_leaf<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
         dpn: &SimpleDPNBuilder<F, D>,
@@ -1090,14 +1093,39 @@ impl StateReaderGadget {
         let (is_new, leaf) = self.resolve_or_insert_user_leaf_gadget::<F, D>(builder, user_leaf_ck);
 
         if is_new {
-            let actual_leaf_hash = leaf.to_hash::<H, F, D>(builder);
-
-            builder.connect_hashes(expected_leaf_hash, actual_leaf_hash);
+            let requested_user_id = dpn.resolve_target(user_target_id);
+            Self::connect_authenticated_other_user_leaf::<H, F, D>(builder, expected_leaf_hash, leaf, requested_user_id);
         }
         leaf
     }
 
-    pub fn get_other_user_contract_state_root<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+    fn connect_authenticated_other_user_leaf<
+        H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>,
+        F: RichField + Extendable<D>,
+        const D: usize,
+    >(
+        builder: &mut CircuitBuilder<F, D>,
+        expected_leaf_hash: HashOutTarget,
+        leaf: &PsyUserLeafGadget,
+        requested_user_id: Target,
+    ) {
+        let actual_leaf_hash = leaf.to_hash::<H, F, D>(builder);
+        let is_absent = builder.is_zero_hash(expected_leaf_hash);
+        builder.connect_hashes_if_false(is_absent, expected_leaf_hash, actual_leaf_hash);
+        // An unregistered user has a zero user-tree leaf. The RPC supplies a
+        // synthetic leaf with the default contract-tree root for reads.
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        let empty_contract_root = builder.constant_hash(H::get_zero_hash(GLOBAL_CONTRACT_TREE_HEIGHT as usize));
+        let zero = builder.zero();
+        builder.connect_if_true(is_absent, leaf.user_id, requested_user_id);
+        builder.connect_hashes_if_true(is_absent, leaf.public_key, zero_hash);
+        builder.connect_hashes_if_true(is_absent, leaf.user_state_tree_root, empty_contract_root);
+        for field in [leaf.balance, leaf.nonce, leaf.last_checkpoint_id, leaf.event_index] {
+            builder.connect_if_true(is_absent, field, zero);
+        }
+    }
+
+    pub fn get_other_user_contract_state_root<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
         dpn: &SimpleDPNBuilder<F, D>,
@@ -1118,7 +1146,86 @@ impl StateReaderGadget {
         }
         mp_uct.value
     }
-    pub fn get_other_user_contract_state_slot_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+
+    fn connect_external_contract_state_root_if_initialized<
+        H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>,
+        F: RichField + Extendable<D>,
+        const D: usize,
+    >(
+        builder: &mut CircuitBuilder<F, D>,
+        contract_state_root: HashOutTarget,
+        state_proof_root: HashOutTarget,
+        state_tree_height: Target,
+    ) -> BoolTarget {
+        let is_uninitialized = builder.is_zero_hash(contract_state_root);
+        builder.connect_hashes_if_false(is_uninitialized, state_proof_root, contract_state_root);
+        let mut empty_root = builder.constant_hash(H::get_zero_hash(1));
+        for height in 2..=32 {
+            let height_target = builder.constant(F::from_canonical_usize(height));
+            let at_height = builder.is_equal(state_tree_height, height_target);
+            let root_at_height = builder.constant_hash(H::get_zero_hash(height));
+            empty_root = builder.select_hash(at_height, root_at_height, empty_root);
+        }
+        builder.connect_hashes_if_true(is_uninitialized, state_proof_root, empty_root);
+        is_uninitialized
+    }
+
+    fn imt_sentinel_slot<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        dpn: &SimpleDPNBuilder<F, D>,
+        base_offset_id: u64,
+    ) -> Target {
+        // base_offset_id is an encoded DPN operand, not the bytecode's
+        // literal offset. Resolve its runtime value before computing ceil(/4).
+        let base_offset = dpn.resolve_target(base_offset_id);
+        let three = builder.constant(F::from_canonical_u64(3));
+        let rounded = builder.add(base_offset, three);
+        builder.div_rem4(rounded).0
+    }
+
+    fn connect_external_imt_get_leaf<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        leaf: &IMTLeafTargets,
+        proof_value: HashOutTarget,
+        proof_index: Target,
+        query_key: HashOutTarget,
+        is_uninitialized: BoolTarget,
+        state_slot_base: Target,
+    ) -> Vec<Target> {
+        let leaf_hash = leaf.hash::<H, F, D>(builder);
+        let key_zero = builder.is_zero_hash(leaf.key);
+        let value_zero = builder.is_zero_hash(leaf.value);
+        let next_key_zero = builder.is_zero_hash(leaf.next_key);
+        let next_index_zero = builder.is_zero(leaf.next_index);
+        let key_value_zero = builder.and(key_zero, value_zero);
+        let next_zero = builder.and(next_key_zero, next_index_zero);
+        let leaf_is_empty = builder.and(key_value_zero, next_zero);
+        let leaf_is_nonempty = builder.not(leaf_is_empty);
+
+        builder.connect_hashes_if_true(leaf_is_nonempty, leaf_hash, proof_value);
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        builder.connect_hashes_if_true(leaf_is_empty, proof_value, zero_hash);
+        builder.connect_if_true(leaf_is_empty, proof_index, state_slot_base);
+
+        let key_eq = builder.is_equal_hash(leaf.key, query_key);
+        let initialized = builder.not(is_uninitialized);
+        let nonempty_match = builder.and(leaf_is_nonempty, key_eq);
+        let is_member = builder.and(initialized, nonempty_match);
+        let is_missing = builder.not(is_member);
+        let nonempty_missing = builder.and(is_missing, leaf_is_nonempty);
+        let pred_lt_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
+        let next_key_zero = builder.is_zero_hash(leaf.next_key);
+        let query_lt_next = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
+        let next_ok = builder.or(next_key_zero, query_lt_next);
+        let non_member = builder.and(pred_lt_query, next_ok);
+        let one = builder._true();
+        builder.connect_if_true(nonempty_missing, non_member.target, one.target);
+
+        let zero = builder.zero();
+        leaf.value.elements.iter().map(|value| builder.select(is_member, *value, zero)).collect()
+    }
+
+    pub fn get_other_user_contract_state_slot_hash<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
         dpn: &SimpleDPNBuilder<F, D>,
@@ -1135,17 +1242,19 @@ impl StateReaderGadget {
         let (is_new, mp_cst) =
             self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(builder, cst_ck, contract_state_tree_height);
 
+        let is_uninitialized = Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+            builder, expected_contract_state_tree_root, mp_cst.root, contract_state_tree_height,
+        );
         if is_new {
             let expected_contract_id = dpn.resolve_target(slot_target_id);
 
             builder.connect(expected_contract_id, mp_cst.index);
-
-            builder.connect_hashes(expected_contract_state_tree_root, mp_cst.root);
         }
-        mp_cst.value
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        builder.select_hash(is_uninitialized, zero_hash, mp_cst.value)
     }
 
-    pub fn get_other_user_contract_state_slot_range<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+    pub fn get_other_user_contract_state_slot_range<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
         dpn: &SimpleDPNBuilder<F, D>,
@@ -1160,7 +1269,7 @@ impl StateReaderGadget {
 
         let r_ck = StateCommandCacheKey::new_read_other_user_contract_range(user_target_id, contract_target_id, sub_slot_target_id, length as u32, 0);
 
-        if self.result_map.contains_key(&r_ck) {
+        let values = if self.result_map.contains_key(&r_ck) {
             self.result_map.get(&r_ck).unwrap().to_owned()
         } else {
             let sub_slot_index = dpn.resolve_target(sub_slot_target_id);
@@ -1171,7 +1280,9 @@ impl StateReaderGadget {
                 length,
                 self.force_four_align,
             );
-            builder.connect_hashes(mps[0].root, expected_contract_state_tree_root);
+            Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+                builder, expected_contract_state_tree_root, mps[0].root, contract_state_tree_height,
+            );
             for (i, mp) in mps.into_iter().enumerate() {
                 let ck = StateCommandCacheKey::new_read_other_user_contract_range(
                     user_target_id,
@@ -1186,10 +1297,13 @@ impl StateReaderGadget {
             }
             self.result_map.insert(r_ck, values.clone());
             values
-        }
+        };
+        let is_uninitialized = builder.is_zero_hash(expected_contract_state_tree_root);
+        let zero = builder.zero();
+        values.into_iter().map(|value| builder.select(is_uninitialized, zero, value)).collect()
     }
 
-    pub fn get_self_user_external_contract_state_slot_single<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+    pub fn get_self_user_external_contract_state_slot_single<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
         dpn: &SimpleDPNBuilder<F, D>,
@@ -1203,21 +1317,26 @@ impl StateReaderGadget {
 
         let (is_new, mp_cst) =
             self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(builder, ck, contract_state_tree_height);
+        let is_uninitialized = Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+            builder, expected_contract_state_tree_root, mp_cst.root, contract_state_tree_height,
+        );
 
         if is_new {
             let sub_slot_index = dpn.resolve_target(sub_slot_target_id);
             let (slot_index, inner_index) = builder.div_rem4(sub_slot_index);
-            let single_value = builder.select_in_hash(mp_cst.value, inner_index);
-            builder.connect_hashes(mp_cst.root, expected_contract_state_tree_root);
+            let raw_value = builder.select_in_hash(mp_cst.value, inner_index);
+            let zero = builder.zero();
+            let single_value = builder.select(is_uninitialized, zero, raw_value);
             builder.connect(slot_index, mp_cst.index);
             self.result_map.insert(ck, vec![single_value]);
             single_value
         } else {
-            self.result_map[&ck][0]
+            let zero = builder.zero();
+            builder.select(is_uninitialized, zero, self.result_map[&ck][0])
         }
     }
 
-    pub fn get_self_user_external_contract_state_slot_range<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+    pub fn get_self_user_external_contract_state_slot_range<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
         &mut self,
         builder: &mut CircuitBuilder<F, D>,
         dpn: &SimpleDPNBuilder<F, D>,
@@ -1226,6 +1345,7 @@ impl StateReaderGadget {
         contract_state_tree_height: Target,
         length: usize,
     ) -> Vec<Target> {
+        let expected_contract_state_tree_root = self.get_self_user_external_contract_root::<H, F, D>(builder, dpn, contract_target_id);
         let r_ck = StateCommandCacheKey::new_read_self_user_external_contract_range(
             contract_target_id,
             sub_slot_target_id,
@@ -1234,11 +1354,9 @@ impl StateReaderGadget {
             0,
         );
 
-        if self.result_map.contains_key(&r_ck) {
+        let values = if self.result_map.contains_key(&r_ck) {
             self.result_map.get(&r_ck).unwrap().to_owned()
         } else {
-            let expected_contract_state_tree_root = self.get_self_user_external_contract_root::<H, F, D>(builder, dpn, contract_target_id);
-
             let sub_slot_index = dpn.resolve_target(sub_slot_target_id);
             let (values, mps) = Self::add_variable_height_merkle_proof_batch::<H, F, D>(
                 builder,
@@ -1248,7 +1366,9 @@ impl StateReaderGadget {
                 self.force_four_align,
             );
 
-            builder.connect_hashes(mps[0].root, expected_contract_state_tree_root);
+            Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+                builder, expected_contract_state_tree_root, mps[0].root, contract_state_tree_height,
+            );
             for (i, mp) in mps.into_iter().enumerate() {
                 let ck = StateCommandCacheKey::new_read_self_user_external_contract_range(
                     contract_target_id,
@@ -1264,7 +1384,10 @@ impl StateReaderGadget {
 
             self.result_map.insert(r_ck, values.clone());
             values
-        }
+        };
+        let is_uninitialized = builder.is_zero_hash(expected_contract_state_tree_root);
+        let zero = builder.zero();
+        values.into_iter().map(|value| builder.select(is_uninitialized, zero, value)).collect()
     }
 
     pub fn injest_symbolic_state_command<
@@ -1420,43 +1543,15 @@ impl StateReaderGadget {
                 }
             }
             DPNStateCmd::GetSelfUserExternalContractStateSlotHash(c) => {
-                let read_root_ck = StateCommandCacheKey::new_read_self_user_external_contract_root(c.contract_id, self.contract_call_epoch);
-                let uct_root = self.user_contract_tree_state_root;
-                let call_epoch = self.contract_call_epoch;
-                let expected_contract_state_tree_root = {
-                    let (is_new_uct, mp_uct) =
-                        self.resolve_or_insert_merkle_proof_gadget::<H, F, D>(builder, read_root_ck, GLOBAL_CONTRACT_TREE_HEIGHT as usize);
-                    let expected_contract_state_tree_root = mp_uct.value.clone();
-                    if is_new_uct {
-                        builder.connect_hashes(mp_uct.root, uct_root);
-
-                        let contract_id_target = dpn.resolve_target(c.contract_id);
-
-                        builder.connect(mp_uct.index, contract_id_target);
-                        let mp_uct: Vec<Target> = mp_uct.value.elements.to_vec();
-                        self.result_map.insert(read_root_ck, mp_uct);
-                    }
-                    expected_contract_state_tree_root
-                };
-
-                let contract_state_tree_ck = StateCommandCacheKey::new_read_self_user_external_contract_slot(c.contract_id, c.slot_index, call_epoch);
-
-                let contract_state_tree_height = dpn.resolve_target(c.contract_state_tree_height);
-                let (is_new_contract_state_tree, mp_cst) =
-                    self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(
-                        builder,
-                        contract_state_tree_ck,
-                        contract_state_tree_height,
-                    );
-
-                let slot_value = mp_cst.value.elements.to_vec();
-                if is_new_contract_state_tree {
-                    builder.connect_hashes(mp_cst.root, expected_contract_state_tree_root);
-                    let slot_index = dpn.resolve_target(c.slot_index);
-                    builder.connect(slot_index, mp_cst.index);
-                    self.result_map.insert(contract_state_tree_ck, slot_value.clone());
-                }
-                slot_value
+                self.get_self_user_external_contract_slot_hash::<H, F, D>(
+                    builder,
+                    dpn,
+                    c.contract_id,
+                    c.slot_index,
+                    dpn.resolve_target(c.contract_state_tree_height),
+                )
+                .elements
+                .to_vec()
             }
 
             DPNStateCmd::GetSelfUserExternalContractStateSlotSingle(c) => {
@@ -1486,16 +1581,21 @@ impl StateReaderGadget {
                 let (is_new, mp_cst) =
                     self.resolve_or_insert_variable_height_merkle_proof_gadget::<H, F, D>(builder, ck, contract_state_tree_height);
 
+                let is_uninitialized = Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+                    builder, expected_contract_state_tree_root, mp_cst.root, contract_state_tree_height,
+                );
                 if is_new {
                     let sub_slot_index = dpn.resolve_target(c.sub_slot_index);
                     let (slot_index, inner_index) = builder.div_rem4(sub_slot_index);
-                    let single_value = builder.select_in_hash(mp_cst.value, inner_index);
-                    builder.connect_hashes(mp_cst.root, expected_contract_state_tree_root);
+                    let raw_value = builder.select_in_hash(mp_cst.value, inner_index);
+                    let zero = builder.zero();
+                    let single_value = builder.select(is_uninitialized, zero, raw_value);
                     builder.connect(slot_index, mp_cst.index);
                     self.result_map.insert(ck, vec![single_value]);
                     vec![single_value]
                 } else {
-                    self.result_map[&ck].to_vec()
+                    let zero = builder.zero();
+                    self.result_map[&ck].iter().map(|value| builder.select(is_uninitialized, zero, *value)).collect()
                 }
             }
             DPNStateCmd::GetOtherUserContractStateSlotRange(c) => self.get_other_user_contract_state_slot_range::<H, F, D>(
@@ -2089,9 +2189,33 @@ impl StateReaderGadget {
                         ],
                     };
                     let leaf_hash = leaf.hash::<H, F, D>(builder);
+                    let leaf_key_zero = builder.is_zero_hash(leaf.key);
+                    let leaf_value_zero = builder.is_zero_hash(leaf.value);
+                    let leaf_next_key_zero = builder.is_zero_hash(leaf.next_key);
+                    let leaf_next_index_zero = builder.is_zero(leaf.next_index);
+                    let leaf_key_and_value_zero = builder.and(leaf_key_zero, leaf_value_zero);
+                    let leaf_next_zero = builder.and(leaf_next_key_zero, leaf_next_index_zero);
+                    let leaf_is_empty = builder.and(leaf_key_and_value_zero, leaf_next_zero);
+                    let leaf_is_nonempty = builder.not(leaf_is_empty);
+                    let key_eq = builder.is_equal_hash(leaf.key, query_key);
+                    let is_member = builder.and(leaf_is_nonempty, key_eq);
+                    let is_missing = builder.not(is_member);
+                    let nonempty_missing = builder.and(is_missing, leaf_is_nonempty);
+                    let pred_lt_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
+                    let next_key_zero = builder.is_zero_hash(leaf.next_key);
+                    let query_lt_next = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
+                    let next_ok = builder.or(next_key_zero, query_lt_next);
+                    let non_member = builder.and(pred_lt_query, next_ok);
+                    let one = builder._true();
+                    // A missing key must be bracketed by an authenticated
+                    // predecessor. An empty map uses its zero sentinel slot.
+                    builder.connect_if_true(nonempty_missing, non_member.target, one.target);
                     builder.connect_hashes(merkle_proof.root, self.end_contract_state_root);
-                    builder.connect_hashes(leaf_hash, merkle_proof.value);
-                    builder.connect_hashes(leaf.key, query_key);
+                    builder.connect_hashes_if_true(leaf_is_nonempty, leaf_hash, merkle_proof.value);
+                    let zero_hash = builder.constant_hash(HashOut::ZERO);
+                    builder.connect_hashes_if_true(leaf_is_empty, merkle_proof.value, zero_hash);
+                    let state_slot_base = Self::imt_sentinel_slot(builder, dpn, c.base_offset);
+                    builder.connect_if_true(leaf_is_empty, merkle_proof.index, state_slot_base);
                     self.insert_imt_read_gadget(
                         ck,
                         IMTReadGadget {
@@ -2099,7 +2223,8 @@ impl StateReaderGadget {
                             leaf: leaf.clone(),
                         },
                     );
-                    let result = leaf.value.elements.to_vec();
+                    let zero = builder.zero();
+                    let result = leaf.value.elements.iter().map(|value| builder.select(is_member, *value, zero)).collect::<Vec<_>>();
                     self.result_map.insert(ck, result.clone());
                     result
                 }
@@ -2154,8 +2279,10 @@ impl StateReaderGadget {
                     builder.connect_hashes_if_true(non_empty_case, leaf_hash, mp.value);
                     builder.connect_hashes_if_true(empty_non_member, mp.value, zero_hash);
                     builder.connect_if_true(exists, key_eq.target, one.target);
-                    //                     //
-                    // builder.connect_if_true(not_exists, non_member.target, one.target);
+                    let non_empty_non_member = builder.and(not_exists, non_empty_case);
+                    builder.connect_if_true(non_empty_non_member, non_member.target, one.target);
+                    let sentinel_slot = Self::imt_sentinel_slot(builder, dpn, c.base_offset);
+                    builder.connect_if_true(empty_non_member, mp.index, sentinel_slot);
 
                     builder.connect_hashes(mp.root, end_contract_state_root);
                     self.insert_imt_contains_gadget(ck, mp, leaf, exists.target);
@@ -2184,10 +2311,12 @@ impl StateReaderGadget {
                     }
                     expected_contract_state_tree_root
                 };
+                let is_uninitialized = builder.is_zero_hash(expected_contract_state_tree_root);
 
                 let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(c.contract_id, c.key, call_epoch);
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
-                    existing_result.clone()
+                    let zero = builder.zero();
+                    existing_result.iter().map(|value| builder.select(is_uninitialized, zero, *value)).collect()
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
@@ -2200,10 +2329,14 @@ impl StateReaderGadget {
                             dpn.resolve_target(c.key[3]),
                         ],
                     };
-                    let leaf_hash = leaf.hash::<H, F, D>(builder);
-                    builder.connect_hashes(state_slot_proof.root, expected_contract_state_tree_root);
-                    builder.connect_hashes(leaf_hash, state_slot_proof.value);
-                    builder.connect_hashes(leaf.key, query_key);
+                    Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+                        builder, expected_contract_state_tree_root, state_slot_proof.root, height,
+                    );
+                    let sentinel_slot = Self::imt_sentinel_slot(builder, dpn, c.base_offset);
+                    let result = Self::connect_external_imt_get_leaf::<H, F, D>(
+                        builder, &leaf, state_slot_proof.value, state_slot_proof.index, query_key, is_uninitialized,
+                        sentinel_slot,
+                    );
                     self.insert_imt_external_read_gadget(
                         imt_ck,
                         IMTExternalReadGadget {
@@ -2212,7 +2345,6 @@ impl StateReaderGadget {
                             leaf: leaf.clone(),
                         },
                     );
-                    let result = leaf.value.elements.to_vec();
                     self.result_map.insert(imt_ck, result.clone());
                     result
                 }
@@ -2221,10 +2353,12 @@ impl StateReaderGadget {
                 // Full chain: user tree -> user leaf -> UCT -> IMT leaf
                 let expected_contract_state_tree_root =
                     { self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id) };
+                let is_uninitialized = builder.is_zero_hash(expected_contract_state_tree_root);
 
                 let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(c.user_id, c.contract_id, c.key, self.write_epoch);
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
-                    existing_result.clone()
+                    let zero = builder.zero();
+                    existing_result.iter().map(|value| builder.select(is_uninitialized, zero, *value)).collect()
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
@@ -2237,10 +2371,14 @@ impl StateReaderGadget {
                             dpn.resolve_target(c.key[3]),
                         ],
                     };
-                    let leaf_hash = leaf.hash::<H, F, D>(builder);
-                    builder.connect_hashes(state_slot_proof.root, expected_contract_state_tree_root);
-                    builder.connect_hashes(leaf_hash, state_slot_proof.value);
-                    builder.connect_hashes(leaf.key, query_key);
+                    Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+                        builder, expected_contract_state_tree_root, state_slot_proof.root, height,
+                    );
+                    let sentinel_slot = Self::imt_sentinel_slot(builder, dpn, c.base_offset);
+                    let result = Self::connect_external_imt_get_leaf::<H, F, D>(
+                        builder, &leaf, state_slot_proof.value, state_slot_proof.index, query_key, is_uninitialized,
+                        sentinel_slot,
+                    );
                     self.insert_imt_other_user_read_gadget(
                         imt_ck,
                         IMTOtherUserReadGadget {
@@ -2248,7 +2386,6 @@ impl StateReaderGadget {
                             leaf: leaf.clone(),
                         },
                     );
-                    let result = leaf.value.elements.to_vec();
                     self.result_map.insert(imt_ck, result.clone());
                     result
                 }
@@ -2258,10 +2395,12 @@ impl StateReaderGadget {
                 // root.
                 let expected_contract_state_tree_root =
                     { self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id) };
+                let is_uninitialized = builder.is_zero_hash(expected_contract_state_tree_root);
 
                 let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(c.user_id, c.contract_id, c.key, self.write_epoch);
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
-                    existing_result.clone()
+                    let zero = builder.zero();
+                    existing_result.iter().map(|value| builder.select(is_uninitialized, zero, *value)).collect()
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
@@ -2309,13 +2448,19 @@ impl StateReaderGadget {
                     // zero hash.
                     builder.connect_hashes_if_true(non_empty_case, leaf_hash, state_slot_proof.value);
                     builder.connect_hashes_if_true(empty_non_member, state_slot_proof.value, zero_hash);
+                    let sentinel_slot = Self::imt_sentinel_slot(builder, dpn, c.base_offset);
+                    builder.connect_if_true(empty_non_member, state_slot_proof.index, sentinel_slot);
                     // exists => leaf.key == query_key
                     builder.connect_if_true(exists, key_eq.target, one.target);
                     // (!exists && !leaf_is_empty) => predecessor bracketing holds
                     let non_empty_non_member = builder.and(not_exists, non_empty_case);
                     builder.connect_if_true(non_empty_non_member, non_member.target, one.target);
 
-                    builder.connect_hashes(state_slot_proof.root, expected_contract_state_tree_root);
+                    Self::connect_external_contract_state_root_if_initialized::<H, F, D>(
+                        builder, expected_contract_state_tree_root, state_slot_proof.root, height,
+                    );
+                    let false_target = builder._false().target;
+                    builder.connect_if_true(is_uninitialized, exists.target, false_target);
 
                     self.insert_imt_contains_other_user_gadget(
                         imt_ck,
@@ -2326,7 +2471,8 @@ impl StateReaderGadget {
                         },
                     );
 
-                    let result = vec![exists.target];
+                    let zero = builder.zero();
+                    let result = vec![builder.select(is_uninitialized, zero, exists.target)];
                     self.result_map.insert(imt_ck, result.clone());
                     result
                 }
@@ -2352,7 +2498,7 @@ mod tests {
     use psy_client_common::data::qhashout::QHashOut;
     use psy_client_data::qdata::{imt_contract_state::IMTContractStateLeaf, imt_proof::IMTContractStateUpdate};
     use psy_common_circuit::traits::CreatableTarget;
-    use psy_crypto::hash::traits::hasher::{FieldQHasher, PoseidonHasher};
+    use psy_crypto::hash::traits::{hasher::{FieldQHasher, PoseidonHasher}, qhashable::QFieldHashable};
     use psy_vm::dpn::ops::{
         op_types::{encode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType},
         state_cmd::data::{DPNStateCmd, DPNStateCmdSetIMTContractStateValue},
@@ -2389,6 +2535,154 @@ mod tests {
             dummy_hash(builder),
             dummy_hash(builder),
         )
+    }
+
+    #[test]
+    fn absent_other_user_requires_canonical_synthetic_leaf() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let expected_hash = builder.add_virtual_hash();
+        let requested_user_id = builder.add_virtual_target();
+        let leaf = PsyUserLeafGadget {
+            public_key: builder.add_virtual_hash(),
+            user_state_tree_root: builder.add_virtual_hash(),
+            balance: builder.add_virtual_target(),
+            nonce: builder.add_virtual_target(),
+            last_checkpoint_id: builder.add_virtual_target(),
+            event_index: builder.add_virtual_target(),
+            user_id: builder.add_virtual_target(),
+        };
+        StateReaderGadget::connect_authenticated_other_user_leaf::<PoseidonHash, F, D>(
+            &mut builder, expected_hash, &leaf, requested_user_id,
+        );
+        let circuit = builder.build::<C>();
+
+        let witness = |public_key: HashOut<F>, state_root: HashOut<F>| {
+            let mut pw = PartialWitness::new();
+            pw.set_hash_target(expected_hash, HashOut::ZERO).unwrap();
+            pw.set_target(requested_user_id, F::from_canonical_u64(3)).unwrap();
+            pw.set_hash_target(leaf.public_key, public_key).unwrap();
+            pw.set_hash_target(leaf.user_state_tree_root, state_root).unwrap();
+            for field in [leaf.balance, leaf.nonce, leaf.last_checkpoint_id, leaf.event_index] {
+                pw.set_target(field, F::ZERO).unwrap();
+            }
+            pw.set_target(leaf.user_id, F::from_canonical_u64(3)).unwrap();
+            pw
+        };
+        let empty_root = PoseidonHash::get_zero_hash(GLOBAL_CONTRACT_TREE_HEIGHT as usize);
+        circuit.verify(circuit.prove(witness(HashOut::ZERO, empty_root)).unwrap()).unwrap();
+        assert!(circuit.prove(witness(HashOut::ZERO, HashOut::ZERO)).is_err(), "forged contract root must fail");
+        assert!(circuit.prove(witness(HashOut { elements: [F::ONE, F::ZERO, F::ZERO, F::ZERO] }, empty_root)).is_err(),
+            "forged public key must fail");
+    }
+
+    #[test]
+    fn imt_sentinel_slot_uses_resolved_base_offset() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let base_offset = builder.add_virtual_target();
+        let mut dpn = new_test_dpn(&mut builder);
+        // The compiled token method stores operand ID 15 here; the VM
+        // resolves it to the contract layout's absolute felt offset.
+        dpn.push_external_target(15, base_offset);
+        let slot = StateReaderGadget::imt_sentinel_slot(&mut builder, &dpn, 15);
+        builder.register_public_input(slot);
+        let circuit = builder.build::<C>();
+        let mut witness = PartialWitness::new();
+        witness.set_target(base_offset, F::from_canonical_u64(8_589_934_680)).unwrap();
+        let proof = circuit.prove(witness).unwrap();
+        assert_eq!(proof.public_inputs, vec![F::from_canonical_u64(2_147_483_670)]);
+        circuit.verify(proof).unwrap();
+    }
+
+    #[test]
+    fn external_empty_state_root_requires_canonical_height() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let contract_root = builder.add_virtual_hash();
+        let proof_root = builder.add_virtual_hash();
+        let height = builder.add_virtual_target();
+        StateReaderGadget::connect_external_contract_state_root_if_initialized::<PoseidonHash, F, D>(
+            &mut builder, contract_root, proof_root, height,
+        );
+        let data = builder.build::<C>();
+        let empty_height_two = PoseidonHash::get_zero_hash(2);
+
+        let mut valid_empty = PartialWitness::new();
+        valid_empty.set_hash_target(contract_root, HashOut::ZERO).unwrap();
+        valid_empty.set_hash_target(proof_root, empty_height_two).unwrap();
+        valid_empty.set_target(height, F::from_canonical_u64(2)).unwrap();
+        data.verify(data.prove(valid_empty).expect("canonical empty root must prove"))
+            .expect("canonical empty root must verify");
+
+        let mut wrong_height = PartialWitness::new();
+        wrong_height.set_hash_target(contract_root, HashOut::ZERO).unwrap();
+        wrong_height.set_hash_target(proof_root, empty_height_two).unwrap();
+        wrong_height.set_target(height, F::from_canonical_u64(3)).unwrap();
+        assert!(data.prove(wrong_height).is_err(), "empty root at the wrong height must fail");
+
+        let mut forged_absence = PartialWitness::new();
+        forged_absence.set_hash_target(contract_root, HashOut::ZERO).unwrap();
+        forged_absence.set_hash_target(proof_root, HashOut::ZERO).unwrap();
+        forged_absence.set_target(height, F::from_canonical_u64(2)).unwrap();
+        assert!(data.prove(forged_absence).is_err(), "zero outer leaf cannot bypass the inner root check");
+
+        let mut initialized = PartialWitness::new();
+        initialized.set_hash_target(contract_root, empty_height_two).unwrap();
+        initialized.set_hash_target(proof_root, empty_height_two).unwrap();
+        initialized.set_target(height, F::from_canonical_u64(2)).unwrap();
+        data.verify(data.prove(initialized).expect("initialized matching root must prove"))
+            .expect("initialized matching root must verify");
+
+        let mut wrong_initialized_path = PartialWitness::new();
+        wrong_initialized_path.set_hash_target(contract_root, empty_height_two).unwrap();
+        wrong_initialized_path.set_hash_target(proof_root, PoseidonHash::get_zero_hash(3)).unwrap();
+        wrong_initialized_path.set_target(height, F::from_canonical_u64(2)).unwrap();
+        assert!(data.prove(wrong_initialized_path).is_err(), "initialized contract must reject a mismatched state proof root");
+    }
+
+    #[test]
+    fn external_imt_missing_key_requires_authenticated_predecessor() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let leaf_targets = IMTLeafTargets::add_virtual_to(&mut builder);
+        let proof_value = builder.add_virtual_hash();
+        let proof_index = builder.add_virtual_target();
+        let query_key = builder.add_virtual_hash();
+        let uninitialized = builder.add_virtual_bool_target_safe();
+        let sentinel_slot = builder.zero();
+        let result = StateReaderGadget::connect_external_imt_get_leaf::<PoseidonHash, F, D>(
+            &mut builder, &leaf_targets, proof_value, proof_index, query_key, uninitialized, sentinel_slot,
+        );
+        builder.register_public_inputs(&result);
+        let data = builder.build::<C>();
+        let predecessor = IMTContractStateLeaf::new(
+            QHashOut::from_values(3, 0, 0, 0),
+            QHashOut::from_values(9, 0, 0, 0),
+            QHashOut::ZERO,
+            F::ZERO,
+        );
+
+        let witness = |leaf: &IMTContractStateLeaf<F>, value: HashOut<F>, index: u64, key: u64| {
+            let mut pw = PartialWitness::new();
+            leaf_targets.set_witness(&mut pw, leaf).unwrap();
+            pw.set_hash_target(proof_value, value).unwrap();
+            pw.set_target(proof_index, F::from_canonical_u64(index)).unwrap();
+            pw.set_hash_target(query_key, QHashOut::from_values(key, 0, 0, 0).0).unwrap();
+            pw.set_target(uninitialized.target, F::ZERO).unwrap();
+            pw
+        };
+
+        let missing = witness(&predecessor, predecessor.qfhash::<PoseidonHasher>().0, 1, 4);
+        let proof = data.prove(missing).expect("authenticated predecessor must prove missing key");
+        assert_eq!(proof.public_inputs, vec![F::ZERO; 4]);
+        data.verify(proof).expect("missing-key proof must verify");
+
+        let wrong_order = witness(&predecessor, predecessor.qfhash::<PoseidonHasher>().0, 1, 2);
+        assert!(data.prove(wrong_order).is_err(), "predecessor after query key must fail");
+
+        let wrong_leaf_hash = witness(&predecessor, HashOut::ZERO, 1, 4);
+        assert!(data.prove(wrong_leaf_hash).is_err(), "forged predecessor leaf hash must fail");
+
+        let empty = IMTContractStateLeaf::<F>::default();
+        let wrong_empty_index = witness(&empty, HashOut::ZERO, 1, 4);
+        assert!(data.prove(wrong_empty_index).is_err(), "empty-map sentinel must be at its base slot");
     }
 
     #[test]

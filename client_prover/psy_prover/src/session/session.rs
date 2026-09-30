@@ -6087,6 +6087,7 @@ pub(crate) mod offline_trace_pipeline_tests {
                 QSRMerkleCmdGetContractFunctionTreeMerkleProof, QSRMerkleCmdGetContractTreeMerkleProof,
                 QSRMerkleCmdGetUserContractStateTreeMerkleProof, QSRMerkleCmdGetUserContractTreeMerkleProof, QSRMerkleCmdGetUserTreeMerkleProof,
             },
+            cmd_processor::DPNStateCmdWitness,
         },
     };
     use psy_compiler::output::serialize::CompilationArtifact;
@@ -6398,6 +6399,98 @@ pub(crate) mod offline_trace_pipeline_tests {
         Ok(())
     }
 
+    fn set_empty_other_user_rpc_rules(responses: &OfflineResponses, chain: &OfflineChainFixture) -> anyhow::Result<()> {
+        let Some((leaf, user_proof, contract_proof, state_proof)) = &chain.other_user_empty_state else {
+            anyhow::bail!("offline chain has no empty other-user state fixture");
+        };
+        let Some((initialized_leaf, initialized_user_proof, initialized_contract_proof, initialized_state_proof)) =
+            &chain.other_user_initialized_state else {
+                anyhow::bail!("offline chain has no initialized other-user state fixture");
+            };
+        let Some((nonzero_leaf, nonzero_user_proof, nonzero_contract_proof, nonzero_state_proof)) =
+            &chain.other_user_nonzero_state else {
+                anyhow::bail!("offline chain has no nonzero other-user state fixture");
+            };
+        // The helper ABI places its scalar after a four-entry IMT map. The
+        // get path reads leaf 1 (the sentinel's absolute IMT index), contains
+        // falls back to sentinel leaf 0, and the scalar field is state leaf 4.
+        let empty_state_tree = OfflineTree::new(chain.contracts[0].state_tree_height);
+        let imt_state_proof = empty_state_tree.get_leaf(1);
+        let scalar_state_proof = empty_state_tree.get_leaf(4);
+        // The VM requests two adjacent proofs for each four-felt range,
+        // including the second proof when the first leaf already covers it.
+        let hash_state_proof = empty_state_tree.get_leaf(5);
+        let range_state_proof = empty_state_tree.get_leaf(6);
+        let range_next_state_proof = empty_state_tree.get_leaf(7);
+        let sentinel = psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::<F>::sentinel();
+        let own_imt_leaf = seeded_current_user_imt_leaf();
+        let mut own_state_tree = OfflineTree::new(chain.contracts[0].state_tree_height);
+        own_state_tree.set_leaf(0, seeded_current_user_imt_sentinel().qfhash::<PsyHasher>());
+        own_state_tree.set_leaf(1, own_imt_leaf.qfhash::<PsyHasher>());
+        let mut initialized_state_tree = OfflineTree::new(chain.contracts[0].state_tree_height);
+        initialized_state_tree.set_leaf(0, seeded_current_user_imt_sentinel().qfhash::<PsyHasher>());
+        initialized_state_tree.set_leaf(1, own_imt_leaf.qfhash::<PsyHasher>());
+        let rules = [
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": OFFLINE_USER_ID, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 4}), serde_json::to_value(own_state_tree.get_leaf(4))?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": OFFLINE_USER_ID, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 1}), serde_json::to_value(own_state_tree.get_leaf(1))?),
+            ("psy_get_imt_leaf_index_for_key", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": OFFLINE_USER_ID, "contract_id": OFFLINE_HELPER_CONTRACT_ID}), serde_json::json!(1)),
+            ("psy_get_imt_leaf_preimage", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": OFFLINE_USER_ID, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_index": 1}), serde_json::to_value(own_imt_leaf)?),
+            ("psy_get_user_leaf_data", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 4}), serde_json::to_value(initialized_leaf)?),
+            ("psy_get_user_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 4}), serde_json::to_value(initialized_user_proof)?),
+            ("psy_get_user_contract_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 4, "contract_id": OFFLINE_HELPER_CONTRACT_ID}), serde_json::to_value(initialized_contract_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 4, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 1}), serde_json::to_value(initialized_state_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 4, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 4}), serde_json::to_value(initialized_state_tree.get_leaf(4))?),
+            ("psy_get_user_leaf_data", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 5}), serde_json::to_value(nonzero_leaf)?),
+            ("psy_get_user_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 5}), serde_json::to_value(nonzero_user_proof)?),
+            ("psy_get_user_contract_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 5, "contract_id": OFFLINE_HELPER_CONTRACT_ID}), serde_json::to_value(nonzero_contract_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 5, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 4}), serde_json::to_value(nonzero_state_proof)?),
+            ("psy_get_user_leaf_data", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3}), serde_json::to_value(leaf)?),
+            ("psy_get_user_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3}), serde_json::to_value(user_proof)?),
+            ("psy_get_user_contract_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID}), serde_json::to_value(contract_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 0}), serde_json::to_value(state_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 1}), serde_json::to_value(imt_state_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 4}), serde_json::to_value(scalar_state_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 5}), serde_json::to_value(hash_state_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 6}), serde_json::to_value(range_state_proof)?),
+            ("psy_get_user_contract_state_tree_merkle_proof", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_id": 7}), serde_json::to_value(range_next_state_proof)?),
+            ("psy_get_imt_leaf_index_for_key", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID}), serde_json::json!(1)),
+            ("psy_get_imt_leaf_preimage", serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "leaf_index": 1}), serde_json::to_value(sentinel)?),
+        ];
+        for (method, params, result) in rules.into_iter().rev() {
+            responses.lock().insert(0, OfflineRpcRule {
+                method: method.to_string(),
+                params: Some(params),
+                response: serde_json::json!({ "result": result }),
+            });
+        }
+        responses.lock().insert(0, OfflineRpcRule {
+            method: "psy_find_imt_predecessor".to_string(),
+            params: Some(serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID})),
+            response: serde_json::json!({"error": {"code": -32603, "message": "No predecessor found"}}),
+        });
+        responses.lock().insert(0, OfflineRpcRule {
+            method: "psy_find_imt_predecessor".to_string(),
+            params: Some(serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": OFFLINE_USER_ID, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "key": "0000000000000000000000000000000000000000000000000000000000000004"})),
+            response: serde_json::json!({"result": {"leaf_index": 1, "leaf": own_imt_leaf}}),
+        });
+        responses.lock().insert(0, OfflineRpcRule {
+            method: "psy_get_imt_leaf_index_for_key".to_string(),
+            params: Some(serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": OFFLINE_USER_ID, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "key": "0000000000000000000000000000000000000000000000000000000000000004"})),
+            response: serde_json::json!({"error": {"code": -32001, "message": "Key not found in IMT"}}),
+        });
+        responses.lock().insert(0, OfflineRpcRule {
+            method: "psy_find_imt_predecessor".to_string(),
+            params: Some(serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 4, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "key": "0000000000000000000000000000000000000000000000000000000000000004"})),
+            response: serde_json::json!({"result": {"leaf_index": 1, "leaf": own_imt_leaf}}),
+        });
+        responses.lock().insert(0, OfflineRpcRule {
+            method: "psy_get_imt_leaf_index_for_key".to_string(),
+            params: Some(serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 4, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "key": "0000000000000000000000000000000000000000000000000000000000000004"})),
+            response: serde_json::json!({"error": {"code": -32001, "message": "Key not found in IMT"}}),
+        });
+        Ok(())
+    }
+
     /// The dead offline network config with every realm/coordinator RPC
     /// endpoint pointed at the loopback mock.
     pub(crate) fn loopback_network_config(port: u16) -> psy_config::NetworkConfigGoldilocks {
@@ -6509,6 +6602,66 @@ pub(crate) mod offline_trace_pipeline_tests {
         )
     }
 
+    fn seeded_other_user_reader_contract() -> SeededContract {
+        let source = r#"
+            const PSY_TOTAL_USERS: usize = 4;
+            const PSY_TOTAL_CONTRACTS: usize = 4;
+
+            #[contract]
+            pub struct OfflineOtherUserReader {
+                pub values: ContractHashMap<Hash, Hash, 4>,
+                pub value: Felt,
+                pub padding: [Felt; 3],
+                pub digest: Hash,
+                pub samples: [Felt; 4],
+            }
+
+            #[contract_implementation]
+            impl OfflineOtherUserReader {
+                #[contract_method]
+                pub fn read_other(&mut self, ctx: &ChainContext) {
+                    let missing_key: Hash = [4, 0, 0, 0];
+                    self.value = self.values.get(missing_key)[0];
+                    let key: Hash = [3, 0, 0, 0];
+                    self.value = self.values.get(key)[0];
+                    self.value = ctx.users[4].contract_state::<Self::ABI>(7).values.get(missing_key)[0];
+                    self.value = ctx.users[4].contract_state::<Self::ABI>(7).value;
+                    self.value = ctx.users[5].contract_state::<Self::ABI>(7).value;
+                    self.value = ctx.users[3].contract_state::<Self::ABI>(7).value;
+                    let other_hash: Hash = ctx.users[3].contract_state::<Self::ABI>(7).digest;
+                    self.value = other_hash[0];
+                    let other_samples: [Felt; 4] = ctx.users[3].contract_state::<Self::ABI>(7).samples;
+                    self.value = other_samples[0];
+                    self.value = ctx.users[3].contract_state::<Self::ABI>(7).values.get(key)[0];
+                    if ctx.users[3].contract_state::<Self::ABI>(7).values.contains(key) {
+                        self.value = 1;
+                    }
+                }
+            }
+        "#;
+        let output = crate::session::compile_bridge::compile_contract_output(source)
+            .unwrap_or_else(|error| panic!("other-user reader contract must compile: {}", error));
+        seeded_contract_from_defs(OFFLINE_HELPER_CONTRACT_ID, output.state_tree_height() as u8, &output.circuit_definitions, "read_other")
+    }
+
+    fn seeded_current_user_imt_leaf() -> psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf<F> {
+        psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::new(
+            QHashOut::from_values(3, 0, 0, 0),
+            QHashOut::from_values(9, 0, 0, 0),
+            QHashOut::ZERO,
+            F::ZERO,
+        )
+    }
+
+    fn seeded_current_user_imt_sentinel() -> psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf<F> {
+        psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::new(
+            QHashOut::ZERO,
+            QHashOut::ZERO,
+            QHashOut::from_values(3, 0, 0, 0),
+            F::ONE,
+        )
+    }
+
     /// Load the token compilation artifact and rebuild its deploy artifacts
     /// without any network access. A fresh checkout has the tracked Genesis
     /// copy; local generation may also provide `client_prover/token.json`.
@@ -6521,9 +6674,16 @@ pub(crate) mod offline_trace_pipeline_tests {
     fn build_seeded_token_contract() -> SeededContract {
         let local_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../token.json");
         let genesis_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../psy-genesis/token.json");
-        let path = if local_path.is_file() { &local_path } else { &genesis_path };
-        let raw = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {}", path.display(), error));
-        let artifact: CompilationArtifact = serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {}: {}", path.display(), error));
+        let artifact = [&local_path, &genesis_path]
+            .into_iter()
+            .filter(|path| path.is_file())
+            .find_map(|path| {
+                let raw = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {}", path.display(), error));
+                let artifact: CompilationArtifact =
+                    serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {}: {}", path.display(), error));
+                artifact.circuit_definitions.iter().any(|def| def.name == "burn").then_some(artifact)
+            })
+            .unwrap_or_else(|| panic!("neither {} nor {} contains the token burn circuit", local_path.display(), genesis_path.display()));
         seeded_contract_from_defs(
             TOKEN_CONTRACT_ID as u64,
             artifact.state_tree_height as u8,
@@ -6583,9 +6743,16 @@ pub(crate) mod offline_trace_pipeline_tests {
         fn_tree_proofs: Vec<Vec<MerkleProofCore<QHashOut<F>>>>,
         state_slot_proofs: Vec<MerkleProofCore<QHashOut<F>>>,
         user_contract_tree_proofs: Vec<MerkleProofCore<QHashOut<F>>>,
+        other_user_empty_state: Option<(PsyUserLeaf<F>, MerkleProofCore<QHashOut<F>>, MerkleProofCore<QHashOut<F>>, MerkleProofCore<QHashOut<F>>)>,
+        other_user_initialized_state: Option<(PsyUserLeaf<F>, MerkleProofCore<QHashOut<F>>, MerkleProofCore<QHashOut<F>>, MerkleProofCore<QHashOut<F>>)>,
+        other_user_nonzero_state: Option<(PsyUserLeaf<F>, MerkleProofCore<QHashOut<F>>, MerkleProofCore<QHashOut<F>>, MerkleProofCore<QHashOut<F>>)>,
     }
 
     pub(crate) fn build_offline_chain(public_key: QHashOut<F>, contracts: Vec<SeededContract>) -> OfflineChainFixture {
+        build_offline_chain_with_other_user(public_key, contracts, false)
+    }
+
+    fn build_offline_chain_with_other_user(public_key: QHashOut<F>, contracts: Vec<SeededContract>, add_empty_other_user: bool) -> OfflineChainFixture {
         // Per-contract function trees (whitelist leaves at consecutive
         // indices, fingerprint of fn i at leaf 2i) and state trees (leaf 0
         // holds the token balance at element 0).
@@ -6605,6 +6772,10 @@ pub(crate) mod offline_trace_pipeline_tests {
                 QHashOut::ZERO
             };
             state_tree.set_leaf(0, slot0);
+            if add_empty_other_user && contract.contract_id == OFFLINE_HELPER_CONTRACT_ID {
+                state_tree.set_leaf(0, seeded_current_user_imt_sentinel().qfhash::<PsyHasher>());
+                state_tree.set_leaf(1, seeded_current_user_imt_leaf().qfhash::<PsyHasher>());
+            }
             fn_trees.push(fn_tree);
             state_trees.push(state_tree);
         }
@@ -6648,6 +6819,55 @@ pub(crate) mod offline_trace_pipeline_tests {
         };
         let mut user_tree = OfflineTree::new(GLOBAL_USER_TREE_HEIGHT);
         user_tree.set_leaf(OFFLINE_USER_ID, user_leaf.qfhash::<PsyHasher>());
+        let (other_user_empty_state, other_user_initialized_state, other_user_nonzero_state) = if add_empty_other_user {
+            let empty_user_contract_tree = OfflineTree::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+            let other_user_leaf = PsyUserLeaf::<F> {
+                public_key: qhash_seed(1001),
+                user_state_tree_root: empty_user_contract_tree.get_root(),
+                balance: F::ZERO,
+                nonce: F::ZERO,
+                last_checkpoint_id: F::from_canonical_u64(OFFLINE_CHECKPOINT_ID - 1),
+                event_index: F::ZERO,
+                user_id: F::from_canonical_u64(3),
+            };
+            user_tree.set_leaf(3, other_user_leaf.qfhash::<PsyHasher>());
+            let empty_state_tree = OfflineTree::new(contracts[0].state_tree_height);
+
+            let mut initialized_state_tree = OfflineTree::new(contracts[0].state_tree_height);
+            initialized_state_tree.set_leaf(0, seeded_current_user_imt_sentinel().qfhash::<PsyHasher>());
+            initialized_state_tree.set_leaf(1, seeded_current_user_imt_leaf().qfhash::<PsyHasher>());
+            let mut initialized_user_contract_tree = OfflineTree::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+            initialized_user_contract_tree.set_leaf(contracts[0].contract_id, initialized_state_tree.get_root());
+            let initialized_user_leaf = PsyUserLeaf::<F> {
+                public_key: qhash_seed(1002),
+                user_state_tree_root: initialized_user_contract_tree.get_root(),
+                balance: F::ZERO,
+                nonce: F::ZERO,
+                last_checkpoint_id: F::from_canonical_u64(OFFLINE_CHECKPOINT_ID - 1),
+                event_index: F::ZERO,
+                user_id: F::from_canonical_u64(4),
+            };
+            user_tree.set_leaf(4, initialized_user_leaf.qfhash::<PsyHasher>());
+            let mut nonzero_state_tree = OfflineTree::new(contracts[0].state_tree_height);
+            nonzero_state_tree.set_leaf(4, QHashOut::from_values(42, 0, 0, 0));
+            let mut nonzero_user_contract_tree = OfflineTree::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+            nonzero_user_contract_tree.set_leaf(contracts[0].contract_id, nonzero_state_tree.get_root());
+            let nonzero_user_leaf = PsyUserLeaf::<F> {
+                public_key: qhash_seed(1003),
+                user_state_tree_root: nonzero_user_contract_tree.get_root(),
+                balance: F::ZERO,
+                nonce: F::ZERO,
+                last_checkpoint_id: F::from_canonical_u64(OFFLINE_CHECKPOINT_ID - 1),
+                event_index: F::ZERO,
+                user_id: F::from_canonical_u64(5),
+            };
+            user_tree.set_leaf(5, nonzero_user_leaf.qfhash::<PsyHasher>());
+            (
+                Some((other_user_leaf, user_tree.get_leaf(3), empty_user_contract_tree.get_leaf(contracts[0].contract_id), empty_state_tree.get_leaf(0))),
+                Some((initialized_user_leaf, user_tree.get_leaf(4), initialized_user_contract_tree.get_leaf(contracts[0].contract_id), initialized_state_tree.get_leaf(1))),
+                Some((nonzero_user_leaf, user_tree.get_leaf(5), nonzero_user_contract_tree.get_leaf(contracts[0].contract_id), nonzero_state_tree.get_leaf(4))),
+            )
+        } else { (None, None, None) };
 
         // The ups_start circuit constrains the checkpoint leaf's global chain
         // root to the hash of exactly these roots.
@@ -6703,6 +6923,9 @@ pub(crate) mod offline_trace_pipeline_tests {
             fn_tree_proofs,
             state_slot_proofs,
             user_contract_tree_proofs,
+            other_user_empty_state,
+            other_user_initialized_state,
+            other_user_nonzero_state,
         }
     }
 
@@ -6791,6 +7014,30 @@ pub(crate) mod offline_trace_pipeline_tests {
                     contract_id: contract.contract_id as u32,
                 }),
                 chain.user_contract_tree_proofs[index].clone(),
+            );
+        }
+        if let Some((other_leaf, other_user_proof, other_contract_proof, other_state_proof)) = &chain.other_user_empty_state {
+            let contract = &chain.contracts[0];
+            cmd_store.cache.user_leaf_cache.insert(
+                QSRCmdGetUserLeafData { checkpoint_id: OFFLINE_CHECKPOINT_ID, user_id: 3 },
+                *other_leaf,
+            );
+            cmd_store.cache.merkle_cmd_cache.insert(
+                QSRMerkleCmd::GetUserTreeMerkleProof(QSRMerkleCmdGetUserTreeMerkleProof { checkpoint_id: OFFLINE_CHECKPOINT_ID, user_id: 3 }),
+                other_user_proof.clone(),
+            );
+            cmd_store.cache.merkle_cmd_cache.insert(
+                QSRMerkleCmd::GetUserContractTreeMerkleProof(QSRMerkleCmdGetUserContractTreeMerkleProof {
+                    checkpoint_id: OFFLINE_CHECKPOINT_ID, user_id: 3, contract_id: contract.contract_id as u32,
+                }),
+                other_contract_proof.clone(),
+            );
+            cmd_store.cache.merkle_cmd_cache.insert(
+                QSRMerkleCmd::GetUserContractStateTreeMerkleProof(QSRMerkleCmdGetUserContractStateTreeMerkleProof {
+                    checkpoint_id: OFFLINE_CHECKPOINT_ID, user_id: 3, contract_id: contract.contract_id as u32,
+                    height: contract.state_tree_height, leaf_id: 0,
+                }),
+                other_state_proof.clone(),
             );
         }
     }
@@ -7128,6 +7375,112 @@ pub(crate) mod offline_trace_pipeline_tests {
             "offline pipeline issued unexpected RPCs: {:?}",
             leaked
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn offline_endcap_repro_empty_other_user_contract_state() -> anyhow::Result<()> {
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let pk_info = wallet_session.wallet.add_zk_private_key(QHashOut::from_values(1111, 1112, 1113, 1114)).await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+        let chain = build_offline_chain_with_other_user(public_key, vec![seeded_other_user_reader_contract(), seeded_token_contract()], true);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+        set_empty_other_user_rpc_rules(&responses, &chain)?;
+        let trace = wallet_session.generate_tx_trace(
+            public_key,
+            ContractCallData::new(vec![ContractCallArgs { contract_id: OFFLINE_HELPER_CONTRACT_ID, method_name: "read_other".to_string(), inputs: vec![] }]),
+        ).await?;
+        let commands = trace.steps.iter().filter_map(crate::trace::TraceStep::as_cfc)
+            .flat_map(|step| &step.cfc_witness.cmd_witnesses)
+            .collect::<Vec<_>>();
+        let single_reads = commands.iter().copied()
+            .filter(|cmd| matches!(cmd.state_cmd, DPNStateCmd::GetOtherUserContractStateSlotSingle(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(single_reads.len(), 3, "trace must read initialized zero, initialized nonzero, and absent other-user scalar states");
+        assert_eq!(single_reads[0].result, vec![F::ZERO]);
+        assert_eq!(single_reads[1].result, vec![F::from_canonical_u64(42)]);
+        assert_eq!(single_reads[2].result, vec![F::ZERO]);
+        let range_reads = commands.iter().copied()
+            .filter(|cmd| matches!(cmd.state_cmd, DPNStateCmd::GetOtherUserContractStateSlotRange(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(range_reads.len(), 2, "typed hash and array fields must both use cross-user range reads");
+        for read in range_reads {
+            assert_eq!(read.result, vec![F::ZERO; 4]);
+        }
+        let other_imt_reads = commands.iter().copied()
+            .filter(|cmd| matches!(cmd.state_cmd, DPNStateCmd::GetOtherUserIMTContractStateValue(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(other_imt_reads.len(), 2, "trace must read initialized and empty other-user IMT maps");
+        assert_eq!(other_imt_reads[0].result, vec![F::ZERO; 4], "missing key in initialized other-user IMT map must read as zero");
+        let initialized_imt_witness = other_imt_reads[0].witness.get_imt_other_user_read_ref();
+        assert_ne!(initialized_imt_witness.contract_state_proof.value, QHashOut::ZERO);
+        assert_eq!(initialized_imt_witness.contract_state_proof.value, initialized_imt_witness.state_slot_proof.root);
+        let current_imt_reads = commands.iter().copied()
+            .filter(|cmd| matches!(cmd.state_cmd, DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(current_imt_reads.len(), 2, "trace must read missing and existing keys from the current user's IMT map");
+        assert_eq!(current_imt_reads[0].result, vec![F::ZERO; 4], "missing current-user IMT key must read as zero");
+        assert_eq!(current_imt_reads[1].result[0], F::from_canonical_u64(9));
+        assert!(commands.iter().any(|cmd| matches!(cmd.state_cmd, DPNStateCmd::ContainsOtherUserIMTContractStateValue(_))),
+            "trace must check membership in another user's declared IMT map");
+        let read = single_reads[2];
+        let read_witness = read.witness.get_read_other_contract_state_ref();
+        assert_eq!(read_witness.contract_state_proof.value, QHashOut::ZERO);
+        assert_ne!(read_witness.contract_state_proof.value, read_witness.state_slot_proofs[0].root);
+        let imt_read = other_imt_reads[1];
+        let imt_read_witness = imt_read.witness.get_imt_other_user_read_ref();
+        assert_eq!(imt_read_witness.contract_state_proof.value, QHashOut::ZERO);
+        assert_ne!(imt_read_witness.contract_state_proof.value, imt_read_witness.state_slot_proof.root);
+        let imt_contains = commands.iter().copied().find(|cmd| matches!(cmd.state_cmd, DPNStateCmd::ContainsOtherUserIMTContractStateValue(_)))
+            .expect("trace must contain other-user IMT contains");
+        let imt_contains_witness = imt_contains.witness.get_imt_contains_other_user_ref();
+        assert_eq!(imt_contains_witness.contract_state_proof.value, QHashOut::ZERO);
+        assert_ne!(imt_contains_witness.contract_state_proof.value, imt_contains_witness.state_slot_proof.root);
+
+        let error = wallet_session.prove_tx_trace(public_key, &trace).await.expect_err("offline submit mock must reject the generated Endcap");
+        assert!(
+            format!("{error:#}").contains("offline canned rpc rejection"),
+            "expected the offline submit rejection after successful proving, got: {error:#}"
+        );
+        assert!(rpc_seen.lock().iter().any(|method| method == "psy_submit_user_end_cap"), "proof must reach Endcap submission");
+        assert!(rpc_seen.lock().iter().any(|method| method == "psy_find_imt_predecessor"),
+            "missing current-user IMT key must fetch a non-membership predecessor");
+
+        let helper_step = trace.steps.iter().filter_map(crate::trace::TraceStep::as_cfc)
+            .find(|step| step.contract_id == OFFLINE_HELPER_CONTRACT_ID)
+            .expect("trace must contain the helper CFC");
+        let helper = &chain.contracts[0];
+        let fn_circuit = DapenContractFunctionCircuit::<C, D>::new(
+            &helper.defs[helper.used_fn_id as usize],
+            helper.state_tree_height as usize,
+            UPS_SESSION_PROOF_TREE_HEIGHT as usize,
+            false,
+        );
+        fn empty_read_witness(
+            input: &mut psy_vm::vm::cfc_input::DapenContractFunctionCircuitInput<F>,
+        ) -> &mut psy_client_data::qstore::imm::cmd_processor::DPNReadOtherUserContractStateLeafMerkleProof<F> {
+            let cmd = input.cmd_witnesses.iter_mut()
+                .filter(|cmd| matches!(cmd.state_cmd, DPNStateCmd::GetOtherUserContractStateSlotSingle(_)))
+                .nth(2)
+                .expect("third scalar read must target the absent contract state");
+            match &mut cmd.witness {
+                DPNStateCmdWitness::ReadOtherUserContractState(read) => read,
+                _ => unreachable!("scalar read must carry the other-user witness"),
+            }
+        }
+        let mut wrong_user = helper_step.cfc_witness.clone();
+        empty_read_witness(&mut wrong_user).user_leaf_witness.user_tree_proof.index = 4;
+        assert!(fn_circuit.prove_base(&wrong_user).is_err(), "another user's tree proof must be rejected");
+
+        let mut wrong_contract = helper_step.cfc_witness.clone();
+        empty_read_witness(&mut wrong_contract).contract_state_proof.index = OFFLINE_HELPER_CONTRACT_ID + 1;
+        assert!(fn_circuit.prove_base(&wrong_contract).is_err(), "another contract's UCT proof must be rejected");
+
+        let mut wrong_path = helper_step.cfc_witness.clone();
+        empty_read_witness(&mut wrong_path).state_slot_proofs[0].siblings[0] = qhash_seed(9999);
+        assert!(fn_circuit.prove_base(&wrong_path).is_err(), "a mismatched inner state path must be rejected");
         Ok(())
     }
 

@@ -1791,6 +1791,7 @@ impl<
             DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(c) => {
                 let state_slot_base = imt_slot_base_from_subslot_base(c.base_offset);
                 let capacity = c.capacity;
+                let key_hash = QHashOut::from_values(c.key[0], c.key[1], c.key[2], c.key[3]);
                 let checkpoint_id = self.get_current_start_checkpoint_id_u64();
                 let user_id = self.get_current_user_id_64();
                 let contract_id_u32 = current_contract_id.to_canonical_u64() as u32;
@@ -1803,29 +1804,59 @@ impl<
                     state_slot_base,
                     capacity,
                 };
-                let leaf_slot_index = match self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await {
-                    Ok(idx) => validate_imt_leaf_index(idx, state_slot_base, capacity)?,
+                let (leaf_slot_index, leaf_preimage, exists) = match self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await {
+                    Ok(index) => {
+                        let index = validate_imt_leaf_index(index, state_slot_base, capacity)?;
+                        let lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafPreimage {
+                            checkpoint_id,
+                            user_id,
+                            contract_id: contract_id_u32,
+                            leaf_index: index,
+                        };
+                        let leaf = validate_imt_preimage(
+                            self.resolve_contract_state_imt_get_leaf_preimage_mut(&lookup).await?,
+                            state_slot_base,
+                            capacity,
+                        )?;
+                        anyhow::ensure!(imt_leaf_matches_key(&leaf, &key_hash), "IMT key-index lookup returned a different key");
+                        (index, leaf, true)
+                    }
+                    Err(err) if is_imt_key_not_found_error(&err) => {
+                        let lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdFindPredecessor {
+                            key: c.key,
+                            checkpoint_id,
+                            user_id,
+                            contract_id: contract_id_u32,
+                            state_slot_base,
+                            capacity,
+                        };
+                        let (index, leaf) = match self.resolve_contract_state_imt_find_predecessor_mut(&lookup).await {
+                            Ok((index, leaf)) => {
+                                let index = validate_imt_predecessor_leaf_index(index, state_slot_base, capacity)?;
+                                let leaf = validate_imt_preimage(leaf, state_slot_base, capacity)?;
+                                anyhow::ensure!(
+                                    is_valid_imt_non_membership_predecessor(&leaf, &key_hash),
+                                    "IMT predecessor does not bracket the missing key"
+                                );
+                                (index, leaf)
+                            }
+                            Err(pred_err) if is_imt_predecessor_not_found_error(&pred_err) => (
+                                state_slot_base,
+                                psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::default(),
+                            ),
+                            Err(pred_err) => return Err(pred_err),
+                        };
+                        (index, leaf, false)
+                    }
                     Err(err) => return Err(err),
                 };
-                let state_slot_index = F::from_canonical_u64(leaf_slot_index);
-
-                let merkle_witness = self.get_contract_state_slot(current_contract_id, state_slot_index).await?;
-
-                let leaf_preimage_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafPreimage {
-                    checkpoint_id,
-                    user_id,
-                    contract_id: contract_id_u32,
-                    leaf_index: leaf_slot_index,
-                };
-                let leaf_preimage = validate_imt_preimage(
-                    self.resolve_contract_state_imt_get_leaf_preimage_mut(&leaf_preimage_lookup).await?,
-                    state_slot_base,
-                    capacity,
-                )?;
+                let merkle_witness = self
+                    .get_contract_state_slot(current_contract_id, F::from_canonical_u64(leaf_slot_index))
+                    .await?;
 
                 Ok(PsyCmdWithInputAndWitness {
                     state_cmd: state_cmd.clone(),
-                    result: leaf_preimage.value.0.elements.to_vec(),
+                    result: if exists { leaf_preimage.value.0.elements.to_vec() } else { vec![F::ZERO; 4] },
                     witness: DPNStateCmdWitness::IMTRead(DPNIMTReadWitness {
                         leaf_preimage,
                         merkle_proof: merkle_witness,
@@ -1835,44 +1866,74 @@ impl<
             DPNStateCmd::GetSelfUserExternalIMTContractStateValue(c) => {
                 let state_slot_base = imt_slot_base_from_subslot_base(c.base_offset);
                 let capacity = c.capacity;
+                let key_hash = QHashOut::from_values(c.key[0], c.key[1], c.key[2], c.key[3]);
                 let checkpoint_id = self.get_current_start_checkpoint_id_u64();
                 let user_id = self.get_current_user_id_64();
                 let external_contract_id_u32 = c.contract_id as u32;
                 let external_contract_id_f = F::from_noncanonical_u64(c.contract_id);
 
-                let leaf_index_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafIndexForKey {
-                    key: c.key,
-                    checkpoint_id,
-                    user_id,
-                    contract_id: external_contract_id_u32,
-                    state_slot_base,
-                    capacity,
-                };
-                let leaf_slot_index = validate_imt_leaf_index(
-                    self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await?,
-                    state_slot_base,
-                    capacity,
-                )?;
-                let state_slot_index = F::from_canonical_u64(leaf_slot_index);
-
                 let uct_merkle_witness = self.get_self_user_contract_tree_leaf(external_contract_id_f).await?;
-                let state_slot_merkle_witness = self.get_contract_state_slot(external_contract_id_f, state_slot_index).await?;
-
-                let leaf_preimage_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafPreimage {
-                    checkpoint_id,
-                    user_id,
-                    contract_id: external_contract_id_u32,
-                    leaf_index: leaf_slot_index,
+                // An uninitialized external contract has no IMT index table
+                // entries. Avoid asking the backing store for a key index
+                // when its contract-state root is empty.
+                let (leaf_slot_index, leaf_preimage, exists) = if uct_merkle_witness.value == QHashOut::ZERO {
+                    (
+                        state_slot_base,
+                        psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::default(),
+                        false,
+                    )
+                } else {
+                    let leaf_index_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafIndexForKey {
+                        key: c.key,
+                        checkpoint_id,
+                        user_id,
+                        contract_id: external_contract_id_u32,
+                        state_slot_base,
+                        capacity,
+                    };
+                    match self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await {
+                        Ok(index) => {
+                            let index = validate_imt_leaf_index(index, state_slot_base, capacity)?;
+                            let lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafPreimage {
+                                checkpoint_id, user_id, contract_id: external_contract_id_u32, leaf_index: index,
+                            };
+                            let leaf = validate_imt_preimage(
+                                self.resolve_contract_state_imt_get_leaf_preimage_mut(&lookup).await?, state_slot_base, capacity,
+                            )?;
+                            anyhow::ensure!(imt_leaf_matches_key(&leaf, &key_hash), "external IMT key-index lookup returned a different key");
+                            (index, leaf, true)
+                        }
+                        Err(err) if is_imt_key_not_found_error(&err) => {
+                            let lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdFindPredecessor {
+                                key: c.key, checkpoint_id, user_id, contract_id: external_contract_id_u32, state_slot_base, capacity,
+                            };
+                            match self.resolve_contract_state_imt_find_predecessor_mut(&lookup).await {
+                                Ok((index, leaf)) => {
+                                    let index = validate_imt_predecessor_leaf_index(index, state_slot_base, capacity)?;
+                                    let leaf = validate_imt_preimage(leaf, state_slot_base, capacity)?;
+                                    anyhow::ensure!(
+                                        is_valid_imt_non_membership_predecessor(&leaf, &key_hash),
+                                        "external IMT predecessor does not bracket the missing key"
+                                    );
+                                    (index, leaf, false)
+                                }
+                                Err(pred_err) if is_imt_predecessor_not_found_error(&pred_err) => (
+                                    state_slot_base,
+                                    psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::default(),
+                                    false,
+                                ),
+                                Err(pred_err) => return Err(pred_err),
+                            }
+                        }
+                        Err(err) => return Err(err),
+                    }
                 };
-                let leaf_preimage = validate_imt_preimage(
-                    self.resolve_contract_state_imt_get_leaf_preimage_mut(&leaf_preimage_lookup).await?,
-                    state_slot_base,
-                    capacity,
-                )?;
+                let state_slot_index = F::from_canonical_u64(leaf_slot_index);
+                let state_slot_merkle_witness = self.get_contract_state_slot(external_contract_id_f, state_slot_index).await?;
 
                 Ok(PsyCmdWithInputAndWitness {
                     state_cmd: state_cmd.clone(),
-                    result: leaf_preimage.value.0.elements.to_vec(),
+                    result: if exists { leaf_preimage.value.0.elements.to_vec() } else { vec![F::ZERO; 4] },
                     witness: DPNStateCmdWitness::IMTSelfUserExternalRead(DPNIMTSelfUserExternalReadWitness {
                         contract_tree_proof: uct_merkle_witness,
                         state_slot_proof: state_slot_merkle_witness,
@@ -1883,24 +1944,10 @@ impl<
             DPNStateCmd::GetOtherUserIMTContractStateValue(c) => {
                 let state_slot_base = imt_slot_base_from_subslot_base(c.base_offset);
                 let capacity = c.capacity;
+                let key_hash = QHashOut::from_values(c.key[0], c.key[1], c.key[2], c.key[3]);
                 let checkpoint_id = self.get_current_start_checkpoint_id_u64();
                 let other_user_id_f = F::from_noncanonical_u64(c.user_id);
                 let other_contract_id_u32 = c.contract_id as u32;
-
-                let leaf_index_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafIndexForKey {
-                    key: c.key,
-                    checkpoint_id,
-                    user_id: c.user_id,
-                    contract_id: other_contract_id_u32,
-                    state_slot_base,
-                    capacity,
-                };
-                let leaf_slot_index = validate_imt_leaf_index(
-                    self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await?,
-                    state_slot_base,
-                    capacity,
-                )?;
-                let state_slot_index = F::from_canonical_u64(leaf_slot_index);
 
                 let user_leaf_witness = self.get_external_user_leaf_proof(other_user_id_f).await?;
                 let contract_tree_merkle_proof = self
@@ -1913,6 +1960,62 @@ impl<
                     ))
                     .await?;
 
+                // An uninitialized other-user contract has a zero state-tree
+                // root and therefore no IMT key index to look up. Use the
+                // empty sentinel witness; the circuit binds its state proof
+                // to the canonical empty root at the declared tree height.
+                let (leaf_slot_index, leaf_preimage, exists) = if contract_tree_merkle_proof.value == QHashOut::ZERO {
+                    (state_slot_base, psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::default(), false)
+                } else {
+                    let leaf_index_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafIndexForKey {
+                        key: c.key,
+                        checkpoint_id,
+                        user_id: c.user_id,
+                        contract_id: other_contract_id_u32,
+                        state_slot_base,
+                        capacity,
+                    };
+                    match self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await {
+                        Ok(index) => {
+                            let index = validate_imt_leaf_index(index, state_slot_base, capacity)?;
+                            let lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafPreimage {
+                                checkpoint_id, user_id: c.user_id, contract_id: other_contract_id_u32, leaf_index: index,
+                            };
+                            let leaf = validate_imt_preimage(
+                                self.resolve_contract_state_imt_get_leaf_preimage_mut(&lookup).await?, state_slot_base, capacity,
+                            )?;
+                            anyhow::ensure!(imt_leaf_matches_key(&leaf, &key_hash), "other-user IMT key-index lookup returned a different key");
+                            (index, leaf, true)
+                        }
+                        Err(err) if is_imt_key_not_found_error(&err) => {
+                            let lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdFindPredecessor {
+                                key: c.key, checkpoint_id, user_id: c.user_id,
+                                contract_id: other_contract_id_u32, state_slot_base, capacity,
+                            };
+                            match self.resolve_contract_state_imt_find_predecessor_mut(&lookup).await {
+                                Ok((index, leaf)) => {
+                                    let index = validate_imt_predecessor_leaf_index(index, state_slot_base, capacity)?;
+                                    let leaf = validate_imt_preimage(leaf, state_slot_base, capacity)?;
+                                    anyhow::ensure!(
+                                        is_valid_imt_non_membership_predecessor(&leaf, &key_hash),
+                                        "other-user IMT predecessor does not bracket the missing key"
+                                    );
+                                    (index, leaf, false)
+                                }
+                                Err(pred_err) if is_imt_predecessor_not_found_error(&pred_err) => (
+                                    state_slot_base,
+                                    psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf::default(),
+                                    false,
+                                ),
+                                Err(pred_err) => return Err(pred_err),
+                            }
+                        }
+                        Err(err) => return Err(err),
+                    }
+                };
+
+                let state_slot_index = F::from_canonical_u64(leaf_slot_index);
+
                 let state_slot_merkle_proof = self
                     .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractStateTreeMerkleProof(
                         QSRMerkleCmdGetUserContractStateTreeMerkleProof {
@@ -1924,20 +2027,9 @@ impl<
                         },
                     ))
                     .await?;
-                let leaf_preimage_lookup = psy_client_data::qstore::imm::cmd::QSRIMTCmdGetLeafPreimage {
-                    checkpoint_id,
-                    user_id: c.user_id,
-                    contract_id: other_contract_id_u32,
-                    leaf_index: leaf_slot_index,
-                };
-                let leaf_preimage = validate_imt_preimage(
-                    self.resolve_contract_state_imt_get_leaf_preimage_mut(&leaf_preimage_lookup).await?,
-                    state_slot_base,
-                    capacity,
-                )?;
                 Ok(PsyCmdWithInputAndWitness {
                     state_cmd: state_cmd.clone(),
-                    result: leaf_preimage.value.0.elements.to_vec(),
+                    result: if exists { leaf_preimage.value.0.elements.to_vec() } else { vec![F::ZERO; 4] },
                     witness: DPNStateCmdWitness::IMTOtherUserRead(DPNIMTOtherUserReadWitness {
                         user_leaf_witness,
                         contract_state_proof: contract_tree_merkle_proof,
