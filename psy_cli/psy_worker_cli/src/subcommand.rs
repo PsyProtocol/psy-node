@@ -79,7 +79,7 @@ pub enum Commands {
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
-    #[command(about = "Replay captured worker jobs offline and compare the proofs with production")]
+    #[command(about = "Replay captured worker jobs offline and check the proofs against production")]
     Replay {
         #[arg(long = "inputs", help = "Directory of captured claims (*.job.json.gz with *.proof.json.gz), searched recursively")]
         inputs: String,
@@ -108,8 +108,11 @@ pub enum Commands {
         #[arg(long = "out", help = "Write one JSON line per proof to this file")]
         out: Option<String>,
 
-        #[arg(long = "require-identical", help = "Fail unless every proof equals the one production sent (failed proofs always fail the run)")]
-        require_identical: bool,
+        #[arg(long = "dump-proofs", help = "Write every proof (<key>.pass<N>.proof) and the recorded one (<key>.recorded.proof) into this directory")]
+        dump_proofs: Option<String>,
+
+        #[arg(long = "require-equivalent", help = "Fail unless every proof verifies with production's public inputs and this build's circuits accept every production proof (failed proofs always fail the run)")]
+        require_equivalent: bool,
     },
     #[command(about = "Generate a new secp256k1 keypair")]
     GenerateKeypair,

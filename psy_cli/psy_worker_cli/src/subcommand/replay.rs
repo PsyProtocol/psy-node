@@ -3,13 +3,16 @@
 //! Reads the claim files written by the worker capture service
 //! (`<Circuit>-g<goal>-<key16>.job.json.gz` with the edge's response,
 //! `...proof.json.gz` with the proof the production worker sent back), proves
-//! each job again with the same prover the worker uses, and compares the
-//! proof bytes. Nothing here talks to the network.
+//! each job again with the same prover the worker uses, and checks the result
+//! against production. Nothing here talks to the network.
 //!
-//! The capture files do not say which network or circuit revision produced
-//! them. A build for another network or with different circuits fails or
-//! differs on every claim, exactly like a change that broke the prover, so
-//! establish a baseline with the unmodified production revision first.
+//! The prover blinds its proofs with fresh randomness, so two proofs of the
+//! same job never have the same bytes. A replayed proof is equivalent to the
+//! production one when it verifies, as the edge verifies a submission, with
+//! the public inputs of the proof production sent. Separately, every
+//! production proof is verified with this build's circuits: that fails when
+//! the build's circuits are not the ones production runs (another network, a
+//! different revision, or a change that altered a circuit).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -32,7 +35,8 @@ use psy_core::{
     job::job_id::QProvingJobDataID,
 };
 use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
-use psy_plonky2_circuits::circuit_library::get_plonky2_circuit_library_and_prover_for_network;
+use parth_core::protocol::core_types::{QZKProofPublicInputsHasherReader, QZKProofVerifier};
+use psy_plonky2_circuits::{circuit_library::get_plonky2_circuit_library_and_prover_for_network, zk_verifier::PsyPlonky2ZKVerifier};
 use psy_worker_core::worker::prover_trait::PsyWorkerGenericLibraryProver;
 use serde::{de::IgnoredAny, Deserialize};
 
@@ -102,7 +106,8 @@ struct Outcome {
     pass: usize,
     wall_ms: f64,
     proof_bytes: usize,
-    identical: bool,
+    /// Verifies with the public inputs of the proof production sent.
+    equivalent: bool,
     error: Option<String>,
 }
 
@@ -230,7 +235,8 @@ pub fn run(
     concurrency: usize,
     passes: usize,
     out: Option<String>,
-    require_identical: bool,
+    dump_proofs: Option<String>,
+    require_equivalent: bool,
 ) -> anyhow::Result<()> {
     let network: PsyChainNetworkType = network.unwrap_or_default().into();
     let (claims, summary) = load_claims(Path::new(&inputs), role.as_deref(), circuit.as_deref(), limit, per_circuit)?;
@@ -248,14 +254,38 @@ pub fn run(
 
     let setup_start = Instant::now();
     let (gcv, prover) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(network)?;
-    let library = gcv.library;
+    let verifier = PsyPlonky2ZKVerifier::<C, D>::new(gcv);
+    let library = &verifier.gcv.library;
     println!("[replay] circuits built in {:.1}s, cpu {:.1}s", setup_start.elapsed().as_secs_f64(), process_cpu_seconds()?);
+
+    // What the edge does with a submitted proof: check its public inputs and verify it.
+    let verifies = |claim: &Claim, proof: &[u8], public_inputs: Hash| -> bool {
+        let circuit_type = claim.input.base.job.job_id.circuit_type.to_u8() as u32;
+        catch_unwind(AssertUnwindSafe(|| verifier.verify_zk_proof_from_slice_check_public_inputs_hash(circuit_type, proof, public_inputs).is_ok())).unwrap_or(false)
+    };
+    // The public inputs production proved, and whether this build's circuits accept production's proof.
+    let production: Vec<Option<Hash>> = claims
+        .iter()
+        .map(|claim| {
+            let proof = PsyPlonky2ZKVerifier::<C, D>::try_proof_from_slice(&claim.recorded_proof).ok()?;
+            let public_inputs = PsyPlonky2ZKVerifier::<C, D>::get_proof_public_inputs_hash(&proof).ok()?;
+            verifies(claim, &claim.recorded_proof, public_inputs).then_some(public_inputs)
+        })
+        .collect();
+    let production_verified = production.iter().filter(|p| p.is_some()).count();
+    println!("[replay] {} of {} production proofs verify with this build's circuits", production_verified, claims.len());
 
     let concurrency = concurrency.max(1);
     let passes = passes.max(1);
+    if let Some(dir) = &dump_proofs {
+        std::fs::create_dir_all(dir)?;
+        for claim in &claims {
+            std::fs::write(Path::new(dir).join(format!("{}.recorded.proof", claim.key)), &claim.recorded_proof)?;
+        }
+    }
     // A panic inside one proof is that proof's failure, as in the worker.
     let prove = |input: JobInput, tag: Hash| -> anyhow::Result<Vec<u8>> {
-        match catch_unwind(AssertUnwindSafe(|| prover.prove_job_from_api(&library, input, tag))) {
+        match catch_unwind(AssertUnwindSafe(|| prover.prove_job_from_api(library, input, tag))) {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("proving panicked")),
         }
@@ -275,7 +305,7 @@ pub fn run(
     for pass in 0..passes {
         // The worker owns each job it proves; the copies are made before the clock starts.
         let inputs: Vec<Mutex<Option<JobInput>>> = claims.iter().map(|c| Mutex::new(Some(c.input.clone()))).collect();
-        let pass_outcomes = Mutex::new(Vec::<Outcome>::with_capacity(claims.len()));
+        let pass_outcomes = Mutex::new(Vec::<(usize, Outcome, Option<Vec<u8>>)>::with_capacity(claims.len()));
         let next = AtomicUsize::new(0);
         let cpu_before = process_cpu_seconds()?;
         let wall = Instant::now();
@@ -288,17 +318,30 @@ pub fn run(
                     let start = Instant::now();
                     let result = prove(input, claim.tag);
                     let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let (proof_bytes, identical, error) = match result {
-                        Ok(proof) => (proof.len(), proof == claim.recorded_proof, None),
-                        Err(e) => (0, false, Some(format!("{:?}", e))),
+                    let (proof, error) = match result {
+                        Ok(proof) => (Some(proof), None),
+                        Err(e) => (None, Some(format!("{:?}", e))),
                     };
-                    pass_outcomes.lock().unwrap().push(Outcome { key: claim.key.clone(), role: claim.role.clone(), circuit: claim.circuit.clone(), pass, wall_ms, proof_bytes, identical, error });
+                    let outcome = Outcome { key: claim.key.clone(), role: claim.role.clone(), circuit: claim.circuit.clone(), pass, wall_ms, proof_bytes: proof.as_ref().map_or(0, |p| p.len()), equivalent: false, error };
+                    pass_outcomes.lock().unwrap().push((index, outcome, proof));
                 });
             }
         });
         let wall_seconds = wall.elapsed().as_secs_f64();
         let cpu_seconds = process_cpu_seconds()? - cpu_before;
-        let pass_outcomes = pass_outcomes.into_inner().unwrap();
+        // The clocks have stopped: check the proofs the way the edge would.
+        let mut checked = Vec::with_capacity(claims.len());
+        for (index, mut outcome, proof) in pass_outcomes.into_inner().unwrap() {
+            if let Some(proof) = proof {
+                let claim = &claims[index];
+                outcome.equivalent = production[index].is_some_and(|public_inputs| verifies(claim, &proof, public_inputs));
+                if let Some(dir) = &dump_proofs {
+                    std::fs::write(Path::new(dir).join(format!("{}.pass{}.proof", claim.key, pass)), &proof)?;
+                }
+            }
+            checked.push(outcome);
+        }
+        let pass_outcomes = checked;
         let proved = pass_outcomes.iter().filter(|o| o.error.is_none()).count();
         pass_lines.push(format!(
             "[replay] pass {}: {} proved, {} failed in {:.2}s wall = {:.2} proofs/s, {:.3} cpu-s per proof, {:.1} cores busy",
@@ -319,7 +362,7 @@ pub fn run(
             writeln!(
                 file,
                 "{}",
-                serde_json::json!({"key": o.key, "role": o.role, "circuit": o.circuit, "pass": o.pass, "wall_ms": o.wall_ms, "proof_bytes": o.proof_bytes, "identical": o.identical, "error": o.error})
+                serde_json::json!({"key": o.key, "role": o.role, "circuit": o.circuit, "pass": o.pass, "wall_ms": o.wall_ms, "proof_bytes": o.proof_bytes, "equivalent": o.equivalent, "error": o.error})
             )?;
         }
     }
@@ -329,19 +372,19 @@ pub fn run(
     for o in outcomes.iter().filter(|o| o.pass == passes - 1) {
         by_circuit.entry((o.role.as_str(), o.circuit.as_str())).or_default().push(o);
     }
-    println!("{:<12} {:<46} {:>6} {:>9} {:>9} {:>9} {:>9} {:>6}", "role", "circuit", "proofs", "median_ms", "p95_ms", "max_ms", "identical", "failed");
+    println!("{:<12} {:<46} {:>6} {:>9} {:>9} {:>9} {:>10} {:>6}", "role", "circuit", "proofs", "median_ms", "p95_ms", "max_ms", "equivalent", "failed");
     for ((role, circuit), items) in &by_circuit {
         let mut wall: Vec<f64> = items.iter().filter(|o| o.error.is_none()).map(|o| o.wall_ms).collect();
         wall.sort_by(|a, b| a.total_cmp(b));
         println!(
-            "{:<12} {:<46} {:>6} {:>9.1} {:>9.1} {:>9.1} {:>9} {:>6}",
+            "{:<12} {:<46} {:>6} {:>9.1} {:>9.1} {:>9.1} {:>10} {:>6}",
             role,
             circuit,
             items.len(),
             quantile(&wall, 0.5),
             quantile(&wall, 0.95),
             wall.last().copied().unwrap_or(0.0),
-            items.iter().filter(|o| o.identical).count(),
+            items.iter().filter(|o| o.equivalent).count(),
             items.iter().filter(|o| o.error.is_some()).count()
         );
     }
@@ -349,17 +392,24 @@ pub fn run(
         println!("{}", line);
     }
     let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
-    let different = outcomes.iter().filter(|o| o.error.is_none() && !o.identical).count();
-    let identical = outcomes.len() - failed - different;
-    println!("[replay] concurrency {}, {} passes over {} claims: {} proofs identical to production, {} different, {} failed", concurrency, passes, claims.len(), identical, different, failed);
+    let not_equivalent = outcomes.iter().filter(|o| o.error.is_none() && !o.equivalent).count();
+    println!(
+        "[replay] concurrency {}, {} passes over {} claims: {} proofs equivalent to production, {} not, {} failed",
+        concurrency,
+        passes,
+        claims.len(),
+        outcomes.len() - failed - not_equivalent,
+        not_equivalent,
+        failed
+    );
     if let Some(o) = outcomes.iter().find(|o| o.error.is_some()) {
         println!("[replay] first failure: {} {}: {}", o.circuit, o.key, o.error.as_deref().unwrap_or(""));
     }
-    if identical == 0 {
-        println!("[replay] no proof matched production: a wrong --network or a different circuit revision looks exactly like this");
+    if production_verified < claims.len() {
+        println!("[replay] this build's circuits reject {} production proofs: wrong --network, another revision, or a changed circuit", claims.len() - production_verified);
     }
-    if failed > 0 || (require_identical && different > 0) {
-        anyhow::bail!("replay did not reproduce production: {} different, {} failed", different, failed);
+    if failed > 0 || (require_equivalent && (not_equivalent > 0 || production_verified < claims.len())) {
+        anyhow::bail!("replay did not reproduce production: {} not equivalent, {} failed, {} production proofs rejected", not_equivalent, failed, claims.len() - production_verified);
     }
     Ok(())
 }
