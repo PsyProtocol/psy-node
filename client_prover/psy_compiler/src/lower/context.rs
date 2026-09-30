@@ -34,6 +34,14 @@ pub enum SymValue {
     IMTMapRef {
         field_name: String,
     },
+    /// Marker for a ContractHashMap in another user's contract state.
+    OtherUserIMTMapRef {
+        user_id: SymFeltRef,
+        contract_id: SymFeltRef,
+        contract_state_tree_height: SymFeltRef,
+        base_offset: SymFeltRef,
+        capacity: SymFeltRef,
+    },
 }
 
 impl SymValue {
@@ -83,6 +91,7 @@ impl SymValue {
             SymValue::Array(elems) => elems.iter().flat_map(|v| v.to_felt_refs()).collect(),
             SymValue::Void => vec![],
             SymValue::IMTMapRef { .. } => vec![],
+            SymValue::OtherUserIMTMapRef { .. } => vec![],
         }
     }
 }
@@ -966,6 +975,29 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             abi_type.trim_end_matches("::ABI").to_string()
         };
 
+        // A final ContractHashMap field is represented by a marker so a
+        // following `.get()`/`.contains()` can emit the cross-user IMT state
+        // command instead of reading the map's reserved slots as ordinary
+        // contract state.
+        if abi_contract_name == self.contract_name && access_chain.len() == 1 {
+            if let AccessStep::Field(field_name) = &access_chain[0] {
+                if let Some(field) = self.layout.get_field(field_name).cloned() {
+                    if field.is_imt_map {
+                        let capacity = field
+                            .imt_capacity
+                            .ok_or_else(|| anyhow::anyhow!("IMT map field '{}' missing capacity in layout", field_name))?;
+                        return Ok(SymValue::OtherUserIMTMapRef {
+                            user_id,
+                            contract_id: contract_id.as_felt(),
+                            contract_state_tree_height: self.exec.op_const(self.layout.state_tree_height as u64),
+                            base_offset: self.exec.op_const(field.base_offset as u64),
+                            capacity: self.exec.op_const(capacity as u64),
+                        });
+                    }
+                }
+            }
+        }
+
         // Compute the offset from the access chain using the contract layout
         let (offset, read_size) = self.compute_access_chain_offset(&abi_contract_name, access_chain)?;
 
@@ -1081,6 +1113,46 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                         }
                     }
                 }
+            }
+        }
+
+        if matches!(receiver, Expr::TypedContractAccess { .. }) {
+            if let SymValue::OtherUserIMTMapRef {
+                user_id,
+                contract_id,
+                contract_state_tree_height,
+                base_offset,
+                capacity,
+            } = self.compile_expr(receiver)?
+            {
+                if args.len() != 1 {
+                    bail!(
+                        "Cross-user ContractHashMap.{}() expects exactly 1 argument (key)",
+                        method
+                    );
+                }
+                let key = self.compile_expr(&args[0])?.as_hash_coerce();
+                return match method {
+                    "get" => Ok(SymValue::Hash(self.exec.imt_get_other_user_value(
+                        contract_state_tree_height,
+                        user_id,
+                        contract_id,
+                        key,
+                        base_offset,
+                        capacity,
+                    ))),
+                    "contains" => Ok(SymValue::Bool(self.exec.imt_contains_other_user(
+                        contract_state_tree_height,
+                        user_id,
+                        contract_id,
+                        key,
+                        base_offset,
+                        capacity,
+                    ))),
+                    _ => bail!(
+                        "Cross-user ContractHashMap only supports read-only get() and contains()"
+                    ),
+                };
             }
         }
 

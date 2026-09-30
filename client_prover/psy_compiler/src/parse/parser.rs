@@ -1019,6 +1019,16 @@ impl Parser {
         loop {
             match self.peek() {
                 Some(Token::Dot) => {
+                    // Leave `.method(...)` for the outer postfix parser so
+                    // map operations on typed cross-user contract access are
+                    // represented as MethodCall over TypedContractAccess.
+                    let next_is_method_call = self
+                        .tokens
+                        .get(self.pos + 2)
+                        .is_some_and(|(token, _, _)| token == &Token::LParen);
+                    if next_is_method_call {
+                        break;
+                    }
                     self.advance();
                     let (field, _) = self.expect_ident()?;
                     access_chain.push(AccessStep::Field(field));
