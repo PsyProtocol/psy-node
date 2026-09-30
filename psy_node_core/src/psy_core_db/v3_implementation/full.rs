@@ -3890,7 +3890,7 @@ impl<
             }
         }
 
-        anyhow::bail!("No predecessor found for key")
+        Err(crate::psy_core_db::traits::full::ImtPredecessorNotFound.into())
     }
 
     async fn contract_state_imt_get_next_append_index(&self, user_id: u64, contract_id: u64) -> anyhow::Result<u64> {

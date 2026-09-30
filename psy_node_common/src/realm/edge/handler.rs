@@ -4,8 +4,9 @@ use futures::stream::{self, StreamExt};
 
 use async_trait::async_trait;
 use cf_utils::timer::DebugTimer;
-use jsonrpsee::core::RpcResult;
+use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
 use parth_core::{
+    constants::rpc::{IMT_KEY_NOT_FOUND_CODE, IMT_PREDECESSOR_NOT_FOUND_CODE},
     QProvingJobDataIDWithRewardPath, crypto::{
         hash::{
             merkle_proof::MerkleProofCore,
@@ -36,7 +37,7 @@ use psy_data::{
 };
 use psy_node_core::{
     psy_core_db::
-        traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}
+        traits::full::{ImtPredecessorNotFound, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}
     ,
     psy_temp_db::StandardEdgeAPITempDBStoreBase,
     qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
@@ -964,10 +965,11 @@ impl<
         contract_id: u32,
         key: N::QHash,
     ) -> QRpcResult<u64> {
-        res(res(self
-            .db_reader
-            .contract_state_imt_get_leaf_index_for_key(checkpoint_id, user_id, contract_id as u64, &key)
-            .await.transpose().ok_or(anyhow::format_err!("Key not found in IMT")))?)
+        match self.db_reader.contract_state_imt_get_leaf_index_for_key(checkpoint_id, user_id, contract_id as u64, &key).await {
+            Ok(Some(index)) => Ok(index),
+            Ok(None) => Err(ErrorObjectOwned::owned(IMT_KEY_NOT_FOUND_CODE, "Key not found in IMT", None::<()>)),
+            Err(err) => Err(RpcError::Anyhow(err).into()),
+        }
     }
 
     async fn get_imt_membership_proof(
@@ -984,6 +986,7 @@ impl<
             .contract_state_imt_get_leaf_index_for_key(checkpoint_id, user_id, contract_id as u64, &key)
             .await
             .map_err(RpcError::Anyhow)?
+            // Membership-proof callers also depend on the historical message.
             .ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("Key not found in IMT")))?;
 
         // Get the leaf preimage
@@ -1079,10 +1082,13 @@ impl<
         contract_id: u64,
         key: N::QHash,
     ) -> QRpcResult<(u64, IMTContractStateLeaf<N::F, N::QHash>)> {
-        res(self
-            .db_reader
-            .contract_state_imt_find_predecessor(checkpoint_id, user_id, contract_id as u64, &key)
-            .await)
+        match self.db_reader.contract_state_imt_find_predecessor(checkpoint_id, user_id, contract_id as u64, &key).await {
+            Ok(predecessor) => Ok(predecessor),
+            Err(err) if err.is::<ImtPredecessorNotFound>() => {
+                Err(ErrorObjectOwned::owned(IMT_PREDECESSOR_NOT_FOUND_CODE, "No predecessor found", None::<()>))
+            }
+            Err(err) => Err(RpcError::Anyhow(err).into()),
+        }
     }
 
     async fn get_imt_next_append_index(&self, user_id: u64, contract_id: u64) -> QRpcResult<u64> {
@@ -1947,6 +1953,7 @@ pub(crate) mod tests {
         let err = RealmEdgeRpcServer::get_imt_leaf_index_for_key(handler, 0, REALM_USER_ID, 0, zh(1))
             .await
             .expect_err("missing IMT key must fail");
+        assert_eq!(err.code(), IMT_KEY_NOT_FOUND_CODE);
         assert!(err.to_string().contains("Key not found in IMT"), "unexpected error: {err}");
 
         // membership proofs first resolve the contract height, which is unknown

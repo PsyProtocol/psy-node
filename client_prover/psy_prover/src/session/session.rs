@@ -6466,7 +6466,7 @@ pub(crate) mod offline_trace_pipeline_tests {
         responses.lock().insert(0, OfflineRpcRule {
             method: "psy_find_imt_predecessor".to_string(),
             params: Some(serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 3, "contract_id": OFFLINE_HELPER_CONTRACT_ID})),
-            response: serde_json::json!({"error": {"code": -32603, "message": "No predecessor found"}}),
+            response: serde_json::json!({"error": {"code": -32021, "message": "No predecessor found"}}),
         });
         responses.lock().insert(0, OfflineRpcRule {
             method: "psy_find_imt_predecessor".to_string(),
@@ -6476,7 +6476,7 @@ pub(crate) mod offline_trace_pipeline_tests {
         responses.lock().insert(0, OfflineRpcRule {
             method: "psy_get_imt_leaf_index_for_key".to_string(),
             params: Some(serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": OFFLINE_USER_ID, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "key": "0000000000000000000000000000000000000000000000000000000000000004"})),
-            response: serde_json::json!({"error": {"code": -32001, "message": "Key not found in IMT"}}),
+            response: serde_json::json!({"error": {"code": -32000, "message": "Key not found in IMT"}}),
         });
         responses.lock().insert(0, OfflineRpcRule {
             method: "psy_find_imt_predecessor".to_string(),
@@ -6486,7 +6486,7 @@ pub(crate) mod offline_trace_pipeline_tests {
         responses.lock().insert(0, OfflineRpcRule {
             method: "psy_get_imt_leaf_index_for_key".to_string(),
             params: Some(serde_json::json!({"checkpoint_id": OFFLINE_CHECKPOINT_ID, "user_id": 4, "contract_id": OFFLINE_HELPER_CONTRACT_ID, "key": "0000000000000000000000000000000000000000000000000000000000000004"})),
-            response: serde_json::json!({"error": {"code": -32001, "message": "Key not found in IMT"}}),
+            response: serde_json::json!({"error": {"code": -32000, "message": "Key not found in IMT"}}),
         });
         Ok(())
     }

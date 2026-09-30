@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use parth_core::{
@@ -18,6 +17,17 @@ use psy_data::{protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpoi
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
 }};
+
+#[derive(Debug)]
+pub struct ImtPredecessorNotFound;
+
+impl std::fmt::Display for ImtPredecessorNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IMT predecessor not found")
+    }
+}
+
+impl std::error::Error for ImtPredecessorNotFound {}
 
 #[async_trait]
 #[auto_impl(&, Arc)]

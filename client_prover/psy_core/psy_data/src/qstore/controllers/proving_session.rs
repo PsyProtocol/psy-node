@@ -326,7 +326,14 @@ impl<
         let local_pred = self
             .local_state_tracker
             .find_imt_predecessor(contract_id, input.state_slot_base, input.capacity, &key);
-        let remote_pred = self.cmd_store.resolve_contract_state_imt_find_predecessor_mut(input).await.ok();
+        let remote_pred = match self.cmd_store.resolve_contract_state_imt_find_predecessor_mut(input).await {
+            Ok(predecessor) => Some(predecessor),
+            Err(err) if matches!(
+                err.downcast_ref::<crate::qstore::imm::error::ImtLookupError>(),
+                Some(crate::qstore::imm::error::ImtLookupError::PredecessorNotFound)
+            ) => None,
+            Err(err) => return Err(err),
+        };
 
         // Merge local and remote predecessors. Equal keys must prefer local because
         // local carries the latest preimage after earlier writes in this proof.
@@ -337,7 +344,7 @@ impl<
             },
             (Some(local), None) => local,
             (None, Some(remote)) => remote,
-            (None, None) => return Err(anyhow::anyhow!("No predecessor found")),
+            (None, None) => return Err(crate::qstore::imm::error::ImtLookupError::PredecessorNotFound.into()),
         };
 
         tracing::info!(

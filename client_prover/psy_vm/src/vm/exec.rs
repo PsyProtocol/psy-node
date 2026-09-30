@@ -16,6 +16,7 @@ use psy_client_data::{
             PsyEventsStore, PsyLocalProvingSessionStore, PsyReadLocalProvingSessionStore, PsyReadLocalProvingSessionStoreMut,
         },
         imm::{
+            error::ImtLookupError,
             cmd::{
                 QSRCmdGetCheckpointLeafData, QSRCmdGetContractLeafData, QSRMerkleCmd, QSRMerkleCmdGetCheckpointTreeMerkleProof,
                 QSRMerkleCmdGetContractTreeMerkleProof, QSRMerkleCmdGetUserContractStateTreeMerkleProof, QSRMerkleCmdGetUserContractTreeMerkleProof,
@@ -115,13 +116,11 @@ fn validate_imt_preimage<F: RichField + PrimeField64>(
 }
 
 fn is_imt_key_not_found_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("Key not found in IMT") || msg.contains("key not found in IMT")
+    matches!(err.downcast_ref::<ImtLookupError>(), Some(ImtLookupError::KeyNotFound))
 }
 
 fn is_imt_predecessor_not_found_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("No predecessor found")
+    matches!(err.downcast_ref::<ImtLookupError>(), Some(ImtLookupError::PredecessorNotFound))
 }
 
 fn validate_contract_state_tree_height(height: u64) -> anyhow::Result<u8> {
@@ -2509,16 +2508,15 @@ mod tests {
     }
 
     #[test]
-    fn validation_helpers_recognize_supported_heights_and_known_error_text() {
+    fn validation_helpers_recognize_supported_heights_and_typed_imt_errors() {
         assert_eq!(validate_contract_state_tree_height(1).unwrap(), 1);
         assert_eq!(validate_contract_state_tree_height(32).unwrap(), 32);
         assert!(validate_contract_state_tree_height(0).is_err());
         assert!(validate_contract_state_tree_height(33).is_err());
 
-        assert!(is_imt_key_not_found_error(&anyhow::anyhow!("Key not found in IMT")));
-        assert!(is_imt_key_not_found_error(&anyhow::anyhow!("key not found in IMT")));
+        assert!(is_imt_key_not_found_error(&ImtLookupError::KeyNotFound.into()));
         assert!(!is_imt_key_not_found_error(&anyhow::anyhow!("other error")));
-        assert!(is_imt_predecessor_not_found_error(&anyhow::anyhow!("No predecessor found")));
+        assert!(is_imt_predecessor_not_found_error(&ImtLookupError::PredecessorNotFound.into()));
         assert!(!is_imt_predecessor_not_found_error(&anyhow::anyhow!("missing")));
     }
 

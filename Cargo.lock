@@ -7535,6 +7535,7 @@ dependencies = [
  "kvq",
  "maybe-async",
  "parking_lot",
+ "parth_core",
  "plonky2",
  "psy_client_common",
  "psy_client_data",

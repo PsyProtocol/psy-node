@@ -1,10 +1,12 @@
 use std::result::Result::Ok;
 
 use plonky2::field::goldilocks_field::GoldilocksField;
+use parth_core::constants::rpc::{IMT_KEY_NOT_FOUND_CODE, IMT_PREDECESSOR_NOT_FOUND_CODE};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{
     config::store_config::PsyHasher,
     dpn::event::PsyUserEventRecord,
+    qstore::imm::error::ImtLookupError,
     qdata::{
         checkpoint::PsyCheckpointLeaf,
         contract::{ContractCodeDefinition, PsyContractLeaf, SimpleContractCodeDefinition},
@@ -22,6 +24,10 @@ use tracing::{debug, error, info, instrument};
 use super::{provider::RpcProvider, request::*};
 
 type F = GoldilocksField;
+
+fn is_imt_key_not_found_rpc_error(error: &RpcError) -> bool {
+    error.code.code() == i64::from(IMT_KEY_NOT_FOUND_CODE) && error.message == "Key not found in IMT"
+}
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
@@ -1194,6 +1200,9 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
             }
             ResponseResult::Error(e) => {
                 error!("RPC call failed: {:?}", e);
+                if is_imt_key_not_found_rpc_error(&e) {
+                    return Err(ImtLookupError::KeyNotFound.into());
+                }
                 Err(anyhow::format_err!("contract_state_imt_get_leaf_index_for_key rpc call failed `{:?}`", e))
             }
         }
@@ -1230,6 +1239,9 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
             }
             ResponseResult::Error(e) => {
                 error!("RPC call failed: {:?}", e);
+                if e.code.code() == i64::from(IMT_PREDECESSOR_NOT_FOUND_CODE) {
+                    return Err(ImtLookupError::PredecessorNotFound.into());
+                }
                 Err(anyhow::format_err!("contract_state_imt_find_predecessor rpc call failed `{:?}`", e))
             }
         }
@@ -1250,6 +1262,19 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
                 Err(anyhow::format_err!("contract_state_imt_get_next_append_index rpc call failed `{:?}`", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod imt_error_tests {
+    use super::*;
+
+    #[test]
+    fn generic_server_error_is_not_an_imt_key_miss() {
+        let missing = RpcError { code: ErrorCode::ServerError(IMT_KEY_NOT_FOUND_CODE.into()), message: "Key not found in IMT".into(), data: None };
+        let failure = RpcError { code: missing.code, message: "handler failed".into(), data: None };
+        assert!(is_imt_key_not_found_rpc_error(&missing));
+        assert!(!is_imt_key_not_found_rpc_error(&failure));
     }
 }
 
