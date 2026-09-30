@@ -19,6 +19,7 @@ use crate::{
         core::PsyRealmProcessor,
         db::PsyRealmDatabaseProcessor,
         gatherers::realm_end_cap_gatherer::{RealmGUTAEndCapGatherer, RealmGUTAEndCapGathererConfig},
+        guta_resend::realm_guta_resend_after_checkpoints_from_env,
     },
 };
 
@@ -93,6 +94,7 @@ where
             ));
         }
         */
+        let guta_resend_after_checkpoints = realm_guta_resend_after_checkpoints_from_env()?;
         let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
             RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
@@ -112,6 +114,7 @@ where
                 db,
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
+                guta_resend_after_checkpoints,
             },
             guta_join_handle,
         ))
@@ -248,6 +251,10 @@ pub(crate) mod startup_tests {
 
         // processor defaults: unlimited worker wait, starting status
         assert_eq!(env.processor.proof_worker_queue_max_time_ms, u64::MAX);
+        assert_eq!(
+            env.processor.guta_resend_after_checkpoints,
+            crate::realm::processor::guta_resend::REALM_GUTA_RESEND_AFTER_CHECKPOINTS_DEFAULT
+        );
         assert_eq!(env.processor.db.status.state(), ProcessorState::Starting);
 
         // the gatherer background task is alive until aborted
