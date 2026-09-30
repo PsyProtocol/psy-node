@@ -975,11 +975,17 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             abi_type.trim_end_matches("::ABI").to_string()
         };
 
+        // This compiler only has the current contract's state layout. Using it
+        // for another ABI would silently read unrelated offsets and height.
+        if abi_contract_name != self.contract_name {
+            bail!("Cross-user contract state access with ABI '{}' requires its contract layout", abi_type);
+        }
+
         // A final ContractHashMap field is represented by a marker so a
         // following `.get()`/`.contains()` can emit the cross-user IMT state
         // command instead of reading the map's reserved slots as ordinary
         // contract state.
-        if abi_contract_name == self.contract_name && access_chain.len() == 1 {
+        if access_chain.len() == 1 {
             if let AccessStep::Field(field_name) = &access_chain[0] {
                 if let Some(field) = self.layout.get_field(field_name).cloned() {
                     if field.is_imt_map {
@@ -1116,49 +1122,40 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             }
         }
 
-        if matches!(receiver, Expr::TypedContractAccess { .. }) {
-            if let SymValue::OtherUserIMTMapRef {
-                user_id,
-                contract_id,
-                contract_state_tree_height,
-                base_offset,
-                capacity,
-            } = self.compile_expr(receiver)?
-            {
-                if args.len() != 1 {
-                    bail!(
-                        "Cross-user ContractHashMap.{}() expects exactly 1 argument (key)",
-                        method
-                    );
-                }
-                let key = self.compile_expr(&args[0])?.as_hash_coerce();
-                return match method {
-                    "get" => Ok(SymValue::Hash(self.exec.imt_get_other_user_value(
-                        contract_state_tree_height,
-                        user_id,
-                        contract_id,
-                        key,
-                        base_offset,
-                        capacity,
-                    ))),
-                    "contains" => Ok(SymValue::Bool(self.exec.imt_contains_other_user(
-                        contract_state_tree_height,
-                        user_id,
-                        contract_id,
-                        key,
-                        base_offset,
-                        capacity,
-                    ))),
-                    _ => bail!(
-                        "Cross-user ContractHashMap only supports read-only get() and contains()"
-                    ),
-                };
+        let typed_receiver = if matches!(receiver, Expr::TypedContractAccess { .. }) {
+            Some(self.compile_expr(receiver)?)
+        } else {
+            None
+        };
+        if let Some(SymValue::OtherUserIMTMapRef {
+            user_id,
+            contract_id,
+            contract_state_tree_height,
+            base_offset,
+            capacity,
+        }) = typed_receiver.as_ref()
+        {
+            if args.len() != 1 {
+                bail!("Cross-user ContractHashMap.{}() expects exactly 1 argument (key)", method);
             }
+            let key = self.compile_expr(&args[0])?.as_hash_coerce();
+            return match method {
+                "get" => Ok(SymValue::Hash(self.exec.imt_get_other_user_value(
+                    *contract_state_tree_height, *user_id, *contract_id, key, *base_offset, *capacity,
+                ))),
+                "contains" => Ok(SymValue::Bool(self.exec.imt_contains_other_user(
+                    *contract_state_tree_height, *user_id, *contract_id, key, *base_offset, *capacity,
+                ))),
+                _ => bail!("Cross-user ContractHashMap only supports read-only get() and contains()"),
+            };
         }
 
         // Handle expr.checked_add_no_overflow("msg")
         if method == "checked_add_no_overflow" {
-            let recv_val = self.compile_expr(receiver)?;
+            let recv_val = match typed_receiver {
+                Some(value) => value,
+                None => self.compile_expr(receiver)?,
+            };
             let msg = if !args.is_empty() {
                 if let Expr::StringLiteral(s, _) = &args[0] {
                     s.clone()
@@ -1192,7 +1189,10 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
         }
 
         // Handle type conversion methods on values
-        let recv_val = self.compile_expr(receiver)?;
+        let recv_val = match typed_receiver {
+            Some(value) => value,
+            None => self.compile_expr(receiver)?,
+        };
 
         match method {
             // .to_felt() — free conversion from Bool/U32 to Felt (no constraints needed)

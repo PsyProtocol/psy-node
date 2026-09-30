@@ -6,6 +6,7 @@ mod ptypes;
 pub use ptypes::*;
 pub mod felt;
 pub mod crypto;
+pub mod constants;
 pub mod data;
 pub mod protocol;
 pub mod utils;

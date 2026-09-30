@@ -1446,3 +1446,27 @@ pub struct ExampleContract {
     assert!(layout.fields[2].is_imt_map);
     assert_eq!(layout.fields[3].base_offset, 136); // 8 + 128
 }
+
+#[test]
+fn cross_user_access_rejects_unavailable_abi_layout() {
+    let source = r#"
+        const PSY_TOTAL_USERS: usize = 4;
+        const PSY_TOTAL_CONTRACTS: usize = 4;
+
+        #[contract]
+        pub struct Reader {
+            pub value: Felt,
+        }
+
+        #[contract_implementation]
+        impl Reader {
+            #[contract_method]
+            pub fn read(&mut self, ctx: &ChainContext) {
+                self.value = ctx.users[1].contract_state::<Other::ABI>(7).value;
+            }
+        }
+    "#;
+
+    let error = psy_compiler::compile(source).expect_err("another ABI must not use Reader's layout");
+    assert!(format!("{error:#}").contains("requires its contract layout"), "unexpected error: {error:#}");
+}
