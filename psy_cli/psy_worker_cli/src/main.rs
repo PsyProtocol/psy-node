@@ -1,5 +1,13 @@
 mod subcommand;
 
+// Replaying captured production jobs on the benchmark box (Ryzen 9 9900X)
+// with the AVX-512 build, jemalloc raised throughput by about 10% over glibc
+// malloc, both one job at a time and four at once, for about 0.3 GiB more
+// resident memory.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::Parser;
 
 use crate::subcommand::{keypair_helper, replay, worker, worker_test, Cli, Commands};
