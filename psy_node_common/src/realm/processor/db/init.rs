@@ -787,7 +787,7 @@ pub(crate) mod realm_db_test_env {
     use parth_core::{
         crypto::hash::{
             merkle_proof::{compute_root_merkle_proof_generic, MerkleProofCore},
-            traits::MerkleZeroHasher,
+            traits::{MerkleHasher, MerkleZeroHasher},
         },
         data::hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::SimpleMerkleNodeKey},
         node::realm_identifier::QRealmIdentifier,
@@ -845,6 +845,22 @@ pub(crate) mod realm_db_test_env {
 
     pub(crate) fn zh(level: usize) -> PHash {
         PoseidonHasher::get_zero_hash(level)
+    }
+
+    /// Root of the append-only checkpoint tree whose first leaves are `leaves` and whose
+    /// remaining leaves are empty.
+    pub(crate) fn checkpoint_tree_root_for_leaves(leaves: &[PHash]) -> PHash {
+        let mut level_nodes = leaves.to_vec();
+        for level in 0..N::CHECKPOINT_TREE_HEIGHT_USIZE {
+            if level_nodes.len() % 2 == 1 {
+                level_nodes.push(zh(level));
+            }
+            level_nodes = level_nodes
+                .chunks(2)
+                .map(|pair| PoseidonHasher::two_to_one(&pair[0], &pair[1]))
+                .collect();
+        }
+        level_nodes[0]
     }
 
     pub(crate) fn fingerprint_config() -> PsyNodeCircuitFingerprintConfig<PHash> {
@@ -921,6 +937,12 @@ pub(crate) mod realm_db_test_env {
         /// a query at id resolves to the largest key <= id
         pub realm_roots: Mutex<HashMap<u64, CheckpointedMerkleHash<PHash>>>,
         pub submitted_gutas: Mutex<Vec<(u64, Vec<u8>)>>,
+        /// headers of the accepted submissions, in the same order as `submitted_gutas`
+        pub submitted_guta_headers: Mutex<Vec<GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>>>,
+        /// every `rc_submit_guta_proof` call, accepted or not
+        pub guta_submit_attempts: Mutex<u64>,
+        /// when set, `rc_submit_guta_proof` fails after counting the attempt
+        pub fail_guta_submissions: Mutex<bool>,
         pub wait_calls: Mutex<u64>,
         /// leaves + sync infos published by the coordinator only once a waiter
         /// asks for the next checkpoint (drives the wait-loop deterministically)
@@ -962,6 +984,12 @@ pub(crate) mod realm_db_test_env {
         }
         pub(crate) fn wait_call_count(&self) -> u64 {
             *self.wait_calls.lock().unwrap()
+        }
+        pub(crate) fn set_fail_guta_submissions(&self, fail: bool) {
+            *self.fail_guta_submissions.lock().unwrap() = fail;
+        }
+        pub(crate) fn guta_submit_attempt_count(&self) -> u64 {
+            *self.guta_submit_attempts.lock().unwrap()
         }
         fn realm_root_at(&self, checkpoint_id: u64) -> CheckpointedMerkleHash<PHash> {
             let map = self.realm_roots.lock().unwrap();
@@ -1024,10 +1052,15 @@ pub(crate) mod realm_db_test_env {
         }
         async fn rc_submit_guta_proof(
             &self,
-            _input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>,
+            input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>,
             proof: Vec<u8>,
             realm_id: u64,
         ) -> anyhow::Result<()> {
+            *self.guta_submit_attempts.lock().unwrap() += 1;
+            if *self.fail_guta_submissions.lock().unwrap() {
+                anyhow::bail!("injected GUTA submission failure");
+            }
+            self.submitted_guta_headers.lock().unwrap().push(input);
             self.submitted_gutas.lock().unwrap().push((realm_id, proof));
             Ok(())
         }
@@ -1161,6 +1194,30 @@ pub(crate) mod realm_db_test_env {
             self.coordinator.seed_realm_sync_info(update.clone());
             self.coordinator.seed_realm_root(1, realm_root_at_one);
             self.coordinator.set_latest_checkpoint_id(1);
+        }
+
+        /// Stages checkpoints `1..=count` on the fake coordinator; one becomes visible per
+        /// wait call. Each carries a sync info that is valid against the checkpoint tree built
+        /// from the staged leaves, so a wait that ends in inclusion at any of them can persist
+        /// the whole range. Returns the updates in checkpoint order.
+        pub(crate) fn stage_checkpoint_chain(&self, count: u64) -> Vec<PsyRealmCoordinatorUpdate<PF, PHash>> {
+            let base = build_realm_genesis(&genesis_setup_data(2, 4))
+                .expect("second genesis builds")
+                .coordinator_update;
+            let mut leaves = vec![self.genesis_leaf_hash()];
+            let mut updates = Vec::with_capacity(count as usize);
+            for checkpoint_id in 1..=count {
+                let mut update = base.clone();
+                update.checkpoint_sync_info.checkpoint_id = checkpoint_id;
+                update.checkpoint_sync_info.block_state.checkpoint_id = checkpoint_id;
+                update.checkpoint_sync_info.block_state.next_contract_id = 2;
+                leaves.push(update.checkpoint_sync_info.checkpoint_leaf_hash);
+                update.checkpoint_sync_info.checkpoint_tree_root = checkpoint_tree_root_for_leaves(&leaves);
+                self.coordinator
+                    .stage_checkpoint(update.checkpoint_sync_info.checkpoint_leaf_hash, update.clone());
+                updates.push(update);
+            }
+            updates
         }
 
         /// Convenience state reader mirroring `get_database_check_state`.
