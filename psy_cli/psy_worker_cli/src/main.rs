@@ -8,6 +8,16 @@ mod subcommand;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// jemalloc defaults to four arenas per CPU, and every arena a proving thread
+// lands in keeps freed memory for a while. With a thread pool per job that
+// added about 1 GiB of resident memory on the benchmark box; sixteen arenas
+// removed it without slowing proofs down (eight cost 2% with one job at a
+// time). The _RJEM_MALLOC_CONF environment variable overrides this.
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: Option<&'static u8> = Some(&b"narenas:16\0"[0]);
+
 use clap::Parser;
 
 use crate::subcommand::{keypair_helper, replay, worker, worker_test, Cli, Commands};
