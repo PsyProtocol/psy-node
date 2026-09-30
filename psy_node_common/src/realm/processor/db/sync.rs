@@ -846,6 +846,41 @@ mod sync_tests {
     }
 
     #[tokio::test]
+    async fn wait_for_realm_update_measures_the_next_resend_from_the_coordinator_head() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.stage_checkpoint_chain(9);
+        // the coordinator commits checkpoints 4 and 5 while it handles the resend sent at 3
+        env.coordinator.set_checkpoints_committed_during_guta_submit(2);
+        env.coordinator.seed_realm_root(7, zh(88));
+
+        let err = wait_error(&mut env, zh(89), header, &proof, TEST_RESEND_AFTER_CHECKPOINTS).await;
+
+        // counted from the head the realm had synced when it resent (3), a second resend would
+        // fire at checkpoint 6; counted from the coordinator's head after the resend (5) it is
+        // due at 8, and the divergent root at 7 ends the wait first
+        assert!(err.contains("Realm state diverged"), "unexpected error: {err}");
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_realm_update_never_resends_with_the_largest_threshold() -> anyhow::Result<()> {
+        let mut env = env_waiting_on_old_root().await?;
+        let (header, proof) = test_submission();
+        env.stage_checkpoint_chain(3);
+        // a non-zero baseline, so that baseline + threshold would overflow
+        env.coordinator.rc_wait_for_next_checkpoint().await?;
+        env.coordinator.seed_realm_root(3, zh(88));
+
+        let err = wait_error(&mut env, zh(89), header, &proof, u64::MAX).await;
+
+        assert!(err.contains("Realm state diverged"), "unexpected error: {err}");
+        assert_eq!(env.coordinator.guta_submit_attempt_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn wait_for_realm_update_keeps_waiting_when_resend_fails() -> anyhow::Result<()> {
         let mut env = env_waiting_on_old_root().await?;
         let (header, proof) = test_submission();

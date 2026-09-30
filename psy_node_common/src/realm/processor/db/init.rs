@@ -943,6 +943,8 @@ pub(crate) mod realm_db_test_env {
         pub guta_submit_attempts: Mutex<u64>,
         /// when set, `rc_submit_guta_proof` fails after counting the attempt
         pub fail_guta_submissions: Mutex<bool>,
+        /// checkpoints the coordinator commits while it handles one `rc_submit_guta_proof` call
+        pub checkpoints_committed_during_guta_submit: Mutex<u64>,
         pub wait_calls: Mutex<u64>,
         /// leaves + sync infos published by the coordinator only once a waiter
         /// asks for the next checkpoint (drives the wait-loop deterministically)
@@ -991,6 +993,22 @@ pub(crate) mod realm_db_test_env {
         pub(crate) fn guta_submit_attempt_count(&self) -> u64 {
             *self.guta_submit_attempts.lock().unwrap()
         }
+        pub(crate) fn set_checkpoints_committed_during_guta_submit(&self, count: u64) {
+            *self.checkpoints_committed_during_guta_submit.lock().unwrap() = count;
+        }
+        /// Advances the coordinator by one checkpoint and publishes the next staged
+        /// checkpoint (leaf + sync info), if any. Returns the new latest checkpoint id.
+        fn commit_next_checkpoint(&self) -> u64 {
+            let mut latest = self.latest_checkpoint_id.lock().unwrap();
+            *latest += 1;
+            if let Some(leaf) = self.staged_leaves.lock().unwrap().pop_front() {
+                self.checkpoint_leaves.lock().unwrap().push(leaf);
+            }
+            if let Some(update) = self.staged_sync_infos.lock().unwrap().pop_front() {
+                self.seed_realm_sync_info(update);
+            }
+            *latest
+        }
         fn realm_root_at(&self, checkpoint_id: u64) -> CheckpointedMerkleHash<PHash> {
             let map = self.realm_roots.lock().unwrap();
             map.iter()
@@ -1007,17 +1025,9 @@ pub(crate) mod realm_db_test_env {
             Ok(*self.latest_checkpoint_id.lock().unwrap())
         }
         async fn rc_wait_for_next_checkpoint(&self) -> anyhow::Result<u64> {
-            let mut latest = self.latest_checkpoint_id.lock().unwrap();
-            *latest += 1;
             *self.wait_calls.lock().unwrap() += 1;
             // release one staged checkpoint (leaf + sync info), if any
-            if let Some(leaf) = self.staged_leaves.lock().unwrap().pop_front() {
-                self.checkpoint_leaves.lock().unwrap().push(leaf);
-            }
-            if let Some(update) = self.staged_sync_infos.lock().unwrap().pop_front() {
-                self.seed_realm_sync_info(update);
-            }
-            Ok(*latest)
+            Ok(self.commit_next_checkpoint())
         }
         async fn rc_get_realm_sync_info(
             &self,
@@ -1057,6 +1067,10 @@ pub(crate) mod realm_db_test_env {
             realm_id: u64,
         ) -> anyhow::Result<()> {
             *self.guta_submit_attempts.lock().unwrap() += 1;
+            let committed_meanwhile = *self.checkpoints_committed_during_guta_submit.lock().unwrap();
+            for _ in 0..committed_meanwhile {
+                self.commit_next_checkpoint();
+            }
             if *self.fail_guta_submissions.lock().unwrap() {
                 anyhow::bail!("injected GUTA submission failure");
             }
