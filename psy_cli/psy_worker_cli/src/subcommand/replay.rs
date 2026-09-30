@@ -8,11 +8,12 @@
 //!
 //! The prover blinds its proofs with fresh randomness, so two proofs of the
 //! same job never have the same bytes. A replayed proof is equivalent to the
-//! production one when it verifies, as the edge verifies a submission, with
-//! the public inputs of the proof production sent. Separately, every
-//! production proof is verified with this build's circuits: that fails when
-//! the build's circuits are not the ones production runs (another network, a
-//! different revision, or a change that altered a circuit).
+//! production one when the edge's verifier (the cached circuit library an
+//! edge node loads) accepts it with the public inputs of the proof production
+//! sent. Two more checks catch a build whose circuits are not the ones
+//! production runs (another revision, or a change that altered a circuit):
+//! the circuits built here are compared with the cached library, all circuit
+//! types at once, and every production proof is verified with them.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -106,7 +107,7 @@ struct Outcome {
     pass: usize,
     wall_ms: f64,
     proof_bytes: usize,
-    /// Verifies with the public inputs of the proof production sent.
+    /// The edge's verifier accepts it with the public inputs of the proof production sent.
     equivalent: bool,
     error: Option<String>,
 }
@@ -254,26 +255,31 @@ pub fn run(
 
     let setup_start = Instant::now();
     let (gcv, prover) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(network)?;
-    let verifier = PsyPlonky2ZKVerifier::<C, D>::new(gcv);
-    let library = &verifier.gcv.library;
+    let built = PsyPlonky2ZKVerifier::<C, D>::new(gcv);
+    let library = &built.gcv.library;
     println!("[replay] circuits built in {:.1}s, cpu {:.1}s", setup_start.elapsed().as_secs_f64(), process_cpu_seconds()?);
 
+    // The verifier an edge node runs: the circuit library generated into the source tree.
+    let edge = PsyPlonky2ZKVerifier::<C, D>::from_cached();
+    let circuits_match = built.gcv.library == edge.gcv.library;
+    println!("[replay] circuits built here {} the edge's cached circuit library", if circuits_match { "equal" } else { "DIFFER from" });
+
     // What the edge does with a submitted proof: check its public inputs and verify it.
-    let verifies = |claim: &Claim, proof: &[u8], public_inputs: Hash| -> bool {
+    let verifies = |verifier: &PsyPlonky2ZKVerifier<C, D>, claim: &Claim, proof: &[u8], public_inputs: Hash| -> bool {
         let circuit_type = claim.input.base.job.job_id.circuit_type.to_u8() as u32;
         catch_unwind(AssertUnwindSafe(|| verifier.verify_zk_proof_from_slice_check_public_inputs_hash(circuit_type, proof, public_inputs).is_ok())).unwrap_or(false)
     };
-    // The public inputs production proved, and whether this build's circuits accept production's proof.
+    // The public inputs production proved, and whether the circuits built here accept production's proof.
     let production: Vec<Option<Hash>> = claims
         .iter()
         .map(|claim| {
             let proof = PsyPlonky2ZKVerifier::<C, D>::try_proof_from_slice(&claim.recorded_proof).ok()?;
             let public_inputs = PsyPlonky2ZKVerifier::<C, D>::get_proof_public_inputs_hash(&proof).ok()?;
-            verifies(claim, &claim.recorded_proof, public_inputs).then_some(public_inputs)
+            verifies(&built, claim, &claim.recorded_proof, public_inputs).then_some(public_inputs)
         })
         .collect();
     let production_verified = production.iter().filter(|p| p.is_some()).count();
-    println!("[replay] {} of {} production proofs verify with this build's circuits", production_verified, claims.len());
+    println!("[replay] {} of {} production proofs verify with the circuits built here", production_verified, claims.len());
 
     let concurrency = concurrency.max(1);
     let passes = passes.max(1);
@@ -334,7 +340,7 @@ pub fn run(
         for (index, mut outcome, proof) in pass_outcomes.into_inner().unwrap() {
             if let Some(proof) = proof {
                 let claim = &claims[index];
-                outcome.equivalent = production[index].is_some_and(|public_inputs| verifies(claim, &proof, public_inputs));
+                outcome.equivalent = production[index].is_some_and(|public_inputs| verifies(&edge, claim, &proof, public_inputs));
                 if let Some(dir) = &dump_proofs {
                     std::fs::write(Path::new(dir).join(format!("{}.pass{}.proof", claim.key, pass)), &proof)?;
                 }
@@ -406,10 +412,16 @@ pub fn run(
         println!("[replay] first failure: {} {}: {}", o.circuit, o.key, o.error.as_deref().unwrap_or(""));
     }
     if production_verified < claims.len() {
-        println!("[replay] this build's circuits reject {} production proofs: wrong --network, another revision, or a changed circuit", claims.len() - production_verified);
+        println!("[replay] the circuits built here reject {} production proofs: another revision, or a changed circuit", claims.len() - production_verified);
     }
-    if failed > 0 || (require_equivalent && (not_equivalent > 0 || production_verified < claims.len())) {
-        anyhow::bail!("replay did not reproduce production: {} not equivalent, {} failed, {} production proofs rejected", not_equivalent, failed, claims.len() - production_verified);
+    if failed > 0 || (require_equivalent && (not_equivalent > 0 || production_verified < claims.len() || !circuits_match)) {
+        anyhow::bail!(
+            "replay did not reproduce production: {} not equivalent, {} failed, {} production proofs rejected, circuits {} the edge's",
+            not_equivalent,
+            failed,
+            claims.len() - production_verified,
+            if circuits_match { "equal" } else { "differ from" }
+        );
     }
     Ok(())
 }

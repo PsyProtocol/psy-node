@@ -111,7 +111,7 @@ pub enum Commands {
         #[arg(long = "dump-proofs", help = "Write every proof (<key>.pass<N>.proof) and the recorded one (<key>.recorded.proof) into this directory")]
         dump_proofs: Option<String>,
 
-        #[arg(long = "require-equivalent", help = "Fail unless every proof verifies with production's public inputs and this build's circuits accept every production proof (failed proofs always fail the run)")]
+        #[arg(long = "require-equivalent", help = "Fail unless the edge's verifier accepts every proof with production's public inputs, and the circuits built here equal the edge's and accept every production proof (failed proofs always fail the run)")]
         require_equivalent: bool,
     },
     #[command(about = "Generate a new secp256k1 keypair")]
