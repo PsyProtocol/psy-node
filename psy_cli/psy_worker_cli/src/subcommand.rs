@@ -7,6 +7,7 @@ pub mod keypair_helper;
 pub mod dummy_end_cap_prover;
 pub mod dummy_end_cap_prover_lite;
 pub mod get_reputation;
+pub mod replay;
 
 #[derive(Parser)]
 pub struct Cli {
@@ -77,6 +78,38 @@ pub enum Commands {
 
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
+    },
+    #[command(about = "Replay captured worker jobs offline and compare the proofs with production")]
+    Replay {
+        #[arg(long = "inputs", help = "Directory of captured claims (*.job.json.gz with *.proof.json.gz), searched recursively")]
+        inputs: String,
+
+        #[arg(long = "network", help = "The network id the jobs were captured on")]
+        network: Option<PsyNetworkTypeInput>,
+
+        #[arg(long = "role", help = "Only replay claims of this role (coordinator, realm-0, ...)")]
+        role: Option<String>,
+
+        #[arg(long = "circuit", help = "Only replay claims of this circuit type (e.g. GUTANoChange)")]
+        circuit: Option<String>,
+
+        #[arg(long = "limit", default_value_t = usize::MAX, help = "Replay at most this many claims, oldest first")]
+        limit: usize,
+
+        #[arg(long = "per-circuit", default_value_t = usize::MAX, help = "Replay at most this many claims of each role and circuit type")]
+        per_circuit: usize,
+
+        #[arg(long = "concurrency", default_value_t = 1, help = "Number of jobs proved at the same time (the worker's --batch-size)")]
+        concurrency: usize,
+
+        #[arg(long = "passes", default_value_t = 1, help = "Number of timed passes over the claims; the per-circuit table shows the last one")]
+        passes: usize,
+
+        #[arg(long = "out", help = "Write one JSON line per proof to this file")]
+        out: Option<String>,
+
+        #[arg(long = "require-identical", help = "Fail unless every proof equals the one production sent (failed proofs always fail the run)")]
+        require_identical: bool,
     },
     #[command(about = "Generate a new secp256k1 keypair")]
     GenerateKeypair,

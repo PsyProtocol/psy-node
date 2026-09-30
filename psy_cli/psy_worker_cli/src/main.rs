@@ -2,7 +2,7 @@ mod subcommand;
 
 use clap::Parser;
 
-use crate::subcommand::{keypair_helper, worker, worker_test, Cli, Commands};
+use crate::subcommand::{keypair_helper, replay, worker, worker_test, Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,6 +39,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             worker_test::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend).await?;
         },
+        Commands::Replay { inputs, network, role, circuit, limit, per_circuit, concurrency, passes, out, require_identical } => {
+            tokio::task::spawn_blocking(move || replay::run(inputs, network, role, circuit, limit, per_circuit, concurrency, passes, out, require_identical)).await??;
+        }
         Commands::GenerateKeypair => {
             keypair_helper::generate_keypair()?;
         },

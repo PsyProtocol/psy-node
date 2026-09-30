@@ -48,6 +48,7 @@ hashbrown = { workspace = true }
 dashmap = { workspace = true }
 jsonrpsee = { workspace = true }
 dotenv = { workspace = true }
+flate2 = { workspace = true }
 
 plonky2 = { workspace = true }
 
