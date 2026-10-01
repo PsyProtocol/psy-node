@@ -17,7 +17,7 @@ use psy_data::{
 };
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
-    psy_temp_db::StandardEdgeAPITempDBStoreBase,
+    psy_temp_db::{GutaInFlightRecord, StandardEdgeAPITempDBStoreBase},
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::traits::proof_store::QParthProofStore,
 };
@@ -27,6 +27,10 @@ use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, Coordinat
 
 pub type CanonicalLayoutProofVerifier =
     dyn Fn(&[u8]) -> anyhow::Result<[u64; 19]> + Send + Sync;
+
+/// Committed checkpoints during which an accepted GUTA update counts as in flight. A copy
+/// accepted at committed checkpoint c commits as c + 1 or c + 2, or never; one is margin.
+pub const GUTA_IN_FLIGHT_WINDOW_CHECKPOINTS: u64 = 3;
 
 fn validate_update_layout_endpoints<F: QFelt64, Hash: Q256BitHash>(
     public_inputs: &[u64; 19],
@@ -798,7 +802,33 @@ impl<
         let proof_bytes = Arc::new(proof_bytes);
 
         let (unique_pending_id, proc_checkpoint_id) = self.get_current_gathering_unique_pending_id_internal().await?;
-        self.ensure_guta_matches_current_coordinator_state(realm_id_u64, &input).await?;
+        let committed_checkpoint_id = self.ensure_guta_matches_current_coordinator_state(realm_id_u64, &input).await?;
+
+        // One accepted copy per realm and old root at a time. A copy accepted at committed
+        // checkpoint c can still be in the batch that commits as c + 1 or c + 2; a second copy
+        // in a later batch would fail the planner's leaf check and park the Coordinator.
+        let submitted_old_realm_root = input.header.header.state_transition.old_node_value;
+        let in_flight = self.temp_db.get_guta_in_flight(&self.realm_identifier, realm_id_u64).await?;
+        if let Some((record, _)) = &in_flight {
+            let open_from_checkpoint_id = record.accepted_at_checkpoint_id.saturating_add(GUTA_IN_FLIGHT_WINDOW_CHECKPOINTS);
+            if record.old_realm_root == submitted_old_realm_root.into_owned_32bytes()
+                && committed_checkpoint_id < open_from_checkpoint_id
+            {
+                anyhow::bail!(
+                    "GUTA update for realm_id {} from old root {:?} is already in flight: accepted at checkpoint {}, committed checkpoint is {}; it can be resubmitted from checkpoint {}",
+                    realm_id,
+                    submitted_old_realm_root,
+                    record.accepted_at_checkpoint_id,
+                    committed_checkpoint_id,
+                    open_from_checkpoint_id
+                );
+            }
+        }
+        let accepted_record = GutaInFlightRecord {
+            old_realm_root: submitted_old_realm_root.into_owned_32bytes(),
+            new_realm_root: input.header.header.state_transition.new_node_value.into_owned_32bytes(),
+            accepted_at_checkpoint_id: committed_checkpoint_id,
+        };
 
         let status = rand::random::<u64>() & 0x0fff_ffff_ffff_ffff;
         if self
@@ -844,6 +874,17 @@ impl<
                 unique_pending_id
             );
         }
+        let observed_in_flight = in_flight.as_ref().map(|(_, raw)| raw.as_slice());
+        if !self
+            .temp_db
+            .claim_guta_in_flight(&self.realm_identifier, realm_id_u64, observed_in_flight, &accepted_record)
+            .await?
+        {
+            anyhow::bail!(
+                "RACE: another GUTA update for realm_id {} was accepted concurrently",
+                realm_id
+            );
+        }
         self.proof_store
             .put_proof_bytes_for_job_id(&output_proof_job_id, unique_pending_id, &proof_bytes)
             .await?;
@@ -873,7 +914,7 @@ impl<
         &self,
         realm_id: u64,
         input: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         let latest_checkpoint_id = self.get_latest_checkpoint_id_internal().await?;
         let realm_key = SimpleMerkleNodeKey {
             level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
@@ -898,7 +939,7 @@ impl<
             );
         }
 
-        Ok(())
+        Ok(latest_checkpoint_id)
     }
 }
 
@@ -939,8 +980,9 @@ pub(crate) mod tests {
             PsyNodeCoreDatabaseContractObjectStoreWriter, PsyNodeCoreRewardsTagTreeStoreWriter,
             PsyNodeGlobalUserTreeDatabaseReader, PsyNodeGlobalUserTreeDatabaseWriter,
         },
+        psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseWriter,
         psy_temp_db::{
-            QTempDBPendingIdWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter,
+            QTempDBGutaInFlightStore, QTempDBPendingIdWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter,
         },
         store::traits::proof_store::QParthProofStoreReader,
     };
@@ -1548,11 +1590,113 @@ pub(crate) mod tests {
         )?;
         assert!(env.temp_db.contains_proof_for_job_id(job_id, 0).await?);
 
-        // a second submission for the same realm is rejected by the status guard
+        // a second submission for the same realm is rejected; the in-flight guard answers before
+        // the per-batch status guard (which `submit_guta_rejects_invalid_headers` covers)
         let mut second = guta_input();
         second.header.header.state_transition.old_node_value = current_root.value;
         let err = handler.submit_guta_internal(second, vec![]).await.expect_err("double submit must fail");
-        assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
+        assert!(err.to_string().contains("already in flight"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    /// A GUTA update for realm 0 whose old root is the committed root, so the stale check passes.
+    async fn submittable_guta_input(env: &EdgeTestEnv) -> anyhow::Result<GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>> {
+        let realm_key = parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey {
+            level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            index: 0,
+        };
+        let current_root = env.db.global_user_tree_get_node_and_checkpoint_id_max_checkpoint(0, &realm_key).await?;
+        let mut input = guta_input();
+        input.header.header.state_transition.old_node_value = current_root.value;
+        Ok(input)
+    }
+
+    /// Moves the coordinator to a new gathering batch and committed checkpoint, so the
+    /// per-batch submitted-status guard of an earlier submission no longer applies.
+    async fn advance_coordinator(env: &EdgeTestEnv, gathering_pending_id: u64, committed_checkpoint_id: u64) -> anyhow::Result<()> {
+        env.temp_db
+            .set_gathering_unique_pending_ids(&QRealmIdentifier::new(1, 2), gathering_pending_id, gathering_pending_id as u128)
+            .await?;
+        env.db.set_latest_checkpoint_id(committed_checkpoint_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_records_the_accepted_update_as_in_flight() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let input = submittable_guta_input(&env).await?;
+
+        env.handler.submit_guta_internal(input, vec![]).await?;
+
+        let (record, _) = env
+            .temp_db
+            .get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0)
+            .await?
+            .expect("an accepted update leaves an in-flight record");
+        assert_eq!(record.old_realm_root, input.header.header.state_transition.old_node_value.into_owned_32bytes());
+        assert_eq!(record.new_realm_root, input.header.header.state_transition.new_node_value.into_owned_32bytes());
+        assert_eq!(record.accepted_at_checkpoint_id, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_rejects_a_second_copy_while_the_first_may_be_in_flight() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let input = submittable_guta_input(&env).await?;
+        env.handler.submit_guta_internal(input, vec![]).await?;
+
+        // two checkpoints later the first copy may still be in the batch that commits next
+        advance_coordinator(&env, 1, 2).await?;
+        let err = env
+            .handler
+            .submit_guta_internal(input, vec![])
+            .await
+            .expect_err("a second copy inside the window must be rejected");
+
+        assert!(err.to_string().contains("already in flight"), "unexpected error: {err}");
+        assert!(err.to_string().contains("resubmitted from checkpoint 3"), "unexpected error: {err}");
+        assert_eq!(env.guta_queue.published_count(), 1);
+        // rejected before the per-batch marker is set, so it cannot block a later attempt
+        assert_eq!(
+            env.temp_db.get_submitted_status_for_pending(&QRealmIdentifier::new(1, 2), 1, 0).await?,
+            0
+        );
+        let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();
+        assert_eq!(record.accepted_at_checkpoint_id, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_accepts_a_copy_once_the_first_cannot_be_live() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let input = submittable_guta_input(&env).await?;
+        env.handler.submit_guta_internal(input, vec![]).await?;
+
+        advance_coordinator(&env, 1, 3).await?;
+        env.handler.submit_guta_internal(input, vec![]).await?;
+
+        assert_eq!(env.guta_queue.published_count(), 2);
+        let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();
+        assert_eq!(record.accepted_at_checkpoint_id, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_guta_is_not_blocked_by_a_record_for_another_old_root() -> anyhow::Result<()> {
+        let env = EdgeTestEnv::create().await?;
+        let earlier = psy_node_core::psy_temp_db::GutaInFlightRecord {
+            old_realm_root: [9u8; 32],
+            new_realm_root: [8u8; 32],
+            accepted_at_checkpoint_id: 0,
+        };
+        assert!(env.temp_db.claim_guta_in_flight(&QRealmIdentifier::new(1, 2), 0, None, &earlier).await?);
+
+        let input = submittable_guta_input(&env).await?;
+        env.handler.submit_guta_internal(input, vec![]).await?;
+
+        assert_eq!(env.guta_queue.published_count(), 1);
+        let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();
+        assert_eq!(record.old_realm_root, input.header.header.state_transition.old_node_value.into_owned_32bytes());
         Ok(())
     }
 }
