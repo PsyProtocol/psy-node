@@ -11,6 +11,7 @@ mod node_proving_state;
 mod job_claim_info;
 mod job_stats;
 mod worker_reputation;
+mod guta_in_flight;
 
 use parth_core::{protocol::core_types::QDBHashBase, QJobIdBase};
 pub use proof_metadata::*;
@@ -26,6 +27,7 @@ pub use node_proving_state::*;
 pub use job_claim_info::*;
 pub use job_stats::*;
 pub use worker_reputation::*;
+pub use guta_in_flight::*;
 
 
 pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
