@@ -134,8 +134,8 @@ pub async fn read_update_contract_gatherer_backup_file_path<
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
 
-    // ensure tree is up to date and pending changes are clean
-    tree.commit_changes();
+    // Recovery runs after the deploy reader on the same recorder. Preserve its
+    // pending nodes: the output builder uses this phase's deploy + update union.
 
     if file_len < 4 + 32 + 4 + 8 {
         return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
@@ -1387,6 +1387,46 @@ mod gatherer_builder_tests {
         bytes.extend_from_slice(&code_bytes);
         bytes.extend_from_slice(&3u64.to_le_bytes()); // total jobs
         Ok(bytes)
+    }
+
+    #[tokio::test]
+    async fn read_backup_preserves_pending_deploy_node_changes() -> anyhow::Result<()> {
+        let fs = SimpleMockMemoryFileSystem::new();
+        let old_leaf = rand_contract_leaf(7, 10);
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(24);
+        deploy_old_leaf(&mut tree, &old_leaf);
+
+        // The deploy reader leaves this block's new contract nodes uncommitted.
+        let deployed_id = CONTRACT_ID + 8;
+        let deployed_hash = rand_contract_leaf(7, 10).qfhash::<Hasher>();
+        tree.set_leaf(deployed_id, deployed_hash);
+        let update_start = tree.get_root();
+
+        let leaves = function_leaves();
+        let mut new_leaf = old_leaf;
+        new_leaf.function_tree_root = fn_tree_root_full_height(CONTRACT_ID, &leaves);
+        new_leaf.code_root = Hash::qp_rand_gen();
+        let body = backup_update_body(&old_leaf, &new_leaf, &leaves)?;
+        fs.files.insert("mixed_backup".to_string(), backup_with_body(update_start, &body));
+
+        // Normal finalization retains the union, with update nodes winning overlaps.
+        let mut normal = tree.clone();
+        normal.set_leaf(CONTRACT_ID, new_leaf.qfhash::<Hasher>());
+        let expected_nodes = normal.get_changes().clone();
+        let recovered = read_update_contract_gatherer_backup_file_path(
+            &fs, "mixed_backup", 1 << N::CONTRACT_FUNCTION_TREE_HEIGHT, &mut tree,
+        ).await?;
+        let mut actual_nodes = std::collections::HashMap::new();
+        for bytes in recovered.update_global_contract_tree_nodes_ffs.chunks_exact(
+            PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE,
+        ) {
+            let node = SimpleMerkleNode::<Hash>::pio_read_from_io(&mut &bytes[..])?;
+            actual_nodes.insert(node.key, node.value);
+        }
+        assert_eq!(recovered.end_global_contract_tree_root, normal.get_root());
+        assert_eq!(actual_nodes, expected_nodes, "recovery dropped pending deploy nodes");
+        assert_eq!(actual_nodes.get(&SimpleMerkleNodeKey::new(24, deployed_id)), Some(&deployed_hash));
+        Ok(())
     }
 
     fn backup_with_body(start_root: Hash, body: &[u8]) -> Vec<u8> {
