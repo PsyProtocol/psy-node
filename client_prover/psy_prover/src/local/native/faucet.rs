@@ -10,6 +10,7 @@ use psy_client_common::{
 };
 use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
 
+use super::faucet_tasks::{complete_claim, ClaimGuard};
 use crate::session::WalletSession;
 
 type C = PoseidonGoldilocksConfig;
@@ -342,18 +343,27 @@ impl PsyFaucetService {
 
     // Turnstile-gated entry, used by the public web frontend and the hosted
     // wallet verification page.
-    async fn claim(&self, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
+    async fn claim(self: &Arc<Self>, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
         self.verify_turnstile(input.turnstile_token.as_deref(), input.turnstile_state.as_deref())
             .await?;
-        self.claim_for_recipient(input).await
+        let faucet = self.clone();
+        // HTTP cancellation must not abandon lock cleanup or the submission record.
+        // In particular, dropping a spawn_blocking handle does not stop its work.
+        complete_claim(async move {
+            let result = faucet.claim_for_recipient(input).await;
+            if let Err(error) = &result {
+                tracing::warn!(message = error.message(), "faucet claim task failed");
+            }
+            result
+        })
+        .await
+        .map_err(|_| rpc_error("faucet claim task failed; check claimable balance before retrying"))?
     }
 
     async fn claim_for_recipient(&self, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
         let recipient_user_id = input.recipient_user_id;
-        if self.recipient_locks.insert(recipient_user_id) {
-            let result = self.claim_locked(input).await;
-            self.recipient_locks.remove(&recipient_user_id);
-            result
+        if let Some(_guard) = ClaimGuard::acquire(&self.recipient_locks, recipient_user_id) {
+            self.claim_locked(input).await
         } else {
             Err(rpc_error("faucet claim already in progress for this recipient"))
         }
@@ -396,13 +406,20 @@ impl PsyFaucetService {
         let mut tried_operator = false;
         for offset in 0..self.operators.len() {
             let operator = &self.operators[(start_index + offset) % self.operators.len()];
-            if !self.operator_locks.insert(operator.user_id) {
+            let Some(operator_guard) = ClaimGuard::acquire(&self.operator_locks, operator.user_id) else {
                 continue;
-            }
+            };
             tried_operator = true;
-
+            let started = std::time::Instant::now();
+            tracing::info!(operator_user_id = operator.user_id, "faucet operator acquired");
             let submit_result = self.submit_with_operator(operator, input.recipient_user_id, amount).await;
-            self.operator_locks.remove(&operator.user_id);
+            drop(operator_guard);
+            tracing::info!(
+                operator_user_id = operator.user_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                success = submit_result.is_ok(),
+                "faucet operator released"
+            );
 
             match submit_result {
                 Ok(tx_hash) => {
