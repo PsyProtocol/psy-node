@@ -13,6 +13,7 @@ use crate::bridge::constants::{
     DEFAULT_DEPLOYMENTS_NETWORK, DEFAULT_L1_RPC_URL, L1_TX_RECEIPT_TIMEOUT_SECS,
     L1_TX_SEND_TIMEOUT_SECS,
 };
+use crate::bridge::finalize_preflight::{submit_unless_finalized, FinalizeTarget};
 use crate::bridge::l1_provider::connect_l1_with_wallet;
 use crate::bridge::l1_signer::load_l1_wallet;
 sol! {
@@ -313,45 +314,58 @@ pub async fn run(args: FinalizeBridgeAggArgs) -> Result<()> {
         withdrawalMerkleProof: withdrawal_merkle_proof,
     };
 
-    let tx = TransactionRequest::default()
-        .to(state_manager)
-        .input(call.abi_encode().into());
-    tracing::info!(
-        state_manager = %state_manager,
-        bridge = %bridge,
-        proven_chain_index,
-        "sending finalize transaction"
-    );
-    let pending = timeout(
-        Duration::from_secs(L1_TX_SEND_TIMEOUT_SECS),
-        provider.send_transaction(tx),
-    )
-    .await
-    .context("send finalize transaction timed out")?
-    .context("send finalize transaction failed")?;
-    tracing::info!(
-        tx_hash = %pending.tx_hash(),
-        "finalize transaction submitted; waiting for receipt"
-    );
-    let receipt = timeout(
-        Duration::from_secs(L1_TX_RECEIPT_TIMEOUT_SECS),
-        pending.get_receipt(),
-    )
-    .await
-    .context("wait finalize receipt timed out")?
-    .context("wait finalize receipt failed")?;
-    anyhow::ensure!(
-        receipt.status(),
-        "finalize transaction reverted: tx_hash={}",
-        receipt.transaction_hash
-    );
-
-    tracing::info!(
-        "bridge finalized: state_manager={} bridge={} tx_hash={} block_number={:?}",
+    submit_unless_finalized(
+        &provider,
         state_manager,
-        bridge,
-        receipt.transaction_hash,
-        receipt.block_number
-    );
-    Ok(())
+        FinalizeTarget {
+            checkpoint: args.to_checkpoint,
+            checkpoint_root: new_checkpoint_root,
+            deposit_root: deposit_tree_root,
+            withdrawal_root: withdrawal_tree_root,
+        },
+        || async {
+            let tx = TransactionRequest::default()
+                .to(state_manager)
+                .input(call.abi_encode().into());
+            tracing::info!(
+                state_manager = %state_manager,
+                bridge = %bridge,
+                proven_chain_index,
+                "sending finalize transaction"
+            );
+            let pending = timeout(
+                Duration::from_secs(L1_TX_SEND_TIMEOUT_SECS),
+                provider.send_transaction(tx),
+            )
+            .await
+            .context("send finalize transaction timed out")?
+            .context("send finalize transaction failed")?;
+            tracing::info!(
+                tx_hash = %pending.tx_hash(),
+                "finalize transaction submitted; waiting for receipt"
+            );
+            let receipt = timeout(
+                Duration::from_secs(L1_TX_RECEIPT_TIMEOUT_SECS),
+                pending.get_receipt(),
+            )
+            .await
+            .context("wait finalize receipt timed out")?
+            .context("wait finalize receipt failed")?;
+            anyhow::ensure!(
+                receipt.status(),
+                "finalize transaction reverted: tx_hash={}",
+                receipt.transaction_hash
+            );
+
+            tracing::info!(
+                "bridge finalized: state_manager={} bridge={} tx_hash={} block_number={:?}",
+                state_manager,
+                bridge,
+                receipt.transaction_hash,
+                receipt.block_number
+            );
+            Ok(())
+        },
+    )
+    .await
 }
