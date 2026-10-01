@@ -49,6 +49,7 @@ moka = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 dashmap = { workspace = true }
+psy_node_redis = { workspace = true }
 
 
 # Logging
