@@ -22,7 +22,7 @@ use psy_node_core::{
     store::traits::{
         proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
         temp_db::{
-            QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase,
+            QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVCompareAndSet,
             QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
         },
     },
@@ -657,6 +657,38 @@ impl QTempDatabaseRawKVReaderBase for StandardFredRedisStore {
     async fn qtdb_raw_kv_contains_key(&self, key: &[u8]) -> anyhow::Result<bool> {
         let exists: bool = self.client.hexists(&self.kv_store_namespace, key).await?;
         Ok(exists)
+    }
+}
+
+/// Compare-and-set of one field of the key-value hash. KEYS[1] is the hash, ARGV[1] the field,
+/// ARGV[2] "1" when a current value is expected (ARGV[3]) or "0" when absence is expected,
+/// ARGV[4] the new value. An empty field counts as absent, as it does for the readers.
+const KV_COMPARE_AND_SET_SCRIPT: &str = r#"
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+if current == false or current == '' then current = nil end
+if ARGV[2] == '0' then
+  if current ~= nil then return 0 end
+elseif current == nil or current ~= ARGV[3] then
+  return 0
+end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[4])
+return 1
+"#;
+
+#[async_trait]
+impl QTempDatabaseRawKVCompareAndSet for StandardFredRedisStore {
+    async fn qtdb_raw_kv_compare_and_set(&self, key: &[u8], expected: Option<&[u8]>, new_value: &[u8]) -> anyhow::Result<bool> {
+        let args = vec![
+            Value::from(key),
+            Value::from(if expected.is_some() { "1" } else { "0" }),
+            Value::from(expected.unwrap_or(&[])),
+            Value::from(new_value),
+        ];
+        let set: i64 = self
+            .client
+            .eval(KV_COMPARE_AND_SET_SCRIPT, vec![self.kv_store_namespace.clone()], args)
+            .await?;
+        Ok(set == 1)
     }
 }
 
