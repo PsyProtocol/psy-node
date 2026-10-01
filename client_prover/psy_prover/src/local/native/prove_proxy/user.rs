@@ -501,7 +501,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
     async fn get_contract_method_common_data(&self, contract_id: u64, fn_id: u32) -> Result<QCommonCircuitData<F>, ErrorObjectOwned> {
         tracing::debug!("get_contract_method_common_data contract_id: {}, fn_id: {}", contract_id, fn_id);
-        if self.circuit_manager.contract_circuits.get(&(contract_id, fn_id)).is_none() {
+        if self.circuit_manager.contract_function_info(contract_id, fn_id).is_none() {
             tracing::warn!("contract {} is not registered, can not get fn id", contract_id);
             tracing::warn!("register contract {} first", contract_id);
             self.register_contract_circuits_inner(contract_id)
@@ -509,16 +509,11 @@ impl ProveProxyUserRpcServer for UserProveProvider {
                 .map_err(|err| ErrorObjectOwned::owned(1, "register contract circuits error", Some(err.to_string())))?;
         }
 
-        if let Some(circuit) = self.circuit_manager.contract_circuits.get(&(contract_id, fn_id)) {
-            tracing::info!(
-                "get contract {} method {} common data, fingerprint: {}",
-                contract_id,
-                fn_id,
-                circuit.get_fingerprint(),
-            );
+        if let Some(info) = self.circuit_manager.contract_function_info(contract_id, fn_id) {
+            tracing::info!("get contract {} method {} common data, fingerprint: {}", contract_id, fn_id, info.fingerprint);
             return Ok(QCommonCircuitData {
-                fingerprint: circuit.get_fingerprint(),
-                verifier_config: circuit.get_verifier_config_ref().clone().into(),
+                fingerprint: info.fingerprint,
+                verifier_config: info.verifier_only.clone().into(),
             });
         }
         Err(ErrorObjectOwned::owned(
@@ -535,18 +530,22 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         input: DapenContractFunctionCircuitInput<F>,
     ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned> {
         tracing::debug!("prove_contract_call contract_id: {}, fn_id: {}", contract_id, fn_id);
-        if self.circuit_manager.contract_circuits.get(&(contract_id, fn_id)).is_none() {
+        if self.circuit_manager.contract_function_info(contract_id, fn_id).is_none() {
             tracing::warn!("contract {} is not registered, can not get fn id", contract_id);
             tracing::warn!("register contract {} first", contract_id);
             self.register_contract_circuits_inner(contract_id)
                 .await
                 .map_err(|err| ErrorObjectOwned::owned(1, "register contract circuits error", Some(err.to_string())))?;
         }
-        if let Some(fn_circuit) = self.circuit_manager.contract_circuits.get(&(contract_id, fn_id)) {
-            let input = input.clone();
-            let fn_circuit = fn_circuit.clone();
+        if self.circuit_manager.contract_function_info(contract_id, fn_id).is_some() {
+            let circuit_manager = self.circuit_manager.clone();
 
+            // The prover circuit may have been evicted; rebuilding it can take
+            // seconds, so fetch it on the blocking pool together with proving.
             tokio::task::spawn_blocking(move || {
+                let fn_circuit = circuit_manager
+                    .contract_function_circuit(contract_id, fn_id)
+                    .map_err(|err| ErrorObjectOwned::owned(1, "fn_circuit build error", Some(err.to_string())))?;
                 fn_circuit
                     .prove_base(&input)
                     .map_err(|err| ErrorObjectOwned::owned(1, "fn_circuit proving error", Some(err.to_string())))
