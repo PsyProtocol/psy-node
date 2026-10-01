@@ -36,11 +36,18 @@ pub async fn setup_nats_psy_queue_from_connection_str(
     let addresses = connection_str.split(",").map(|s| s.to_string()).collect::<Vec<String>>();
 
     let ephemeral_timeout_ms = env_u64_ms("NATS_EPHEMERAL_ACK_WAIT_MS", 5000)?;
-    let ephemeral_inactive_threshold_ms = env_u64_ms("NATS_EPHEMERAL_INACTIVE_THRESHOLD_MS", 600_000)?;
+    // These durable consumers belong to pending batches, not wall-clock leases.
+    // A successor batch can be idle throughout an operator's witness repair.
+    // Keep legacy settings visible, but never let them delete accepted work.
+    for name in ["NATS_EPHEMERAL_INACTIVE_THRESHOLD_MS", "NATS_WORKER_INACTIVE_THRESHOLD_MS"] {
+        if env_u64_ms(name, 0)? != 0 {
+            tracing::warn!(setting = name, "Ignoring inactivity timeout: batch consumers require explicit cleanup");
+        }
+    }
     let standard_ephemeral_queue_pull_config: PullConfig = PullConfig {
         ack_policy: jetstream::consumer::AckPolicy::All,
         ack_wait: Duration::from_millis(ephemeral_timeout_ms),
-        inactive_threshold: Duration::from_millis(ephemeral_inactive_threshold_ms),
+        inactive_threshold: Duration::ZERO,
         max_deliver: 1,
         replay_policy: jetstream::consumer::ReplayPolicy::Instant,
         deliver_policy: jetstream::consumer::DeliverPolicy::All,
@@ -48,12 +55,13 @@ pub async fn setup_nats_psy_queue_from_connection_str(
         ..Default::default()
     };
     let worker_timeout_ms = env_u64_ms("NATS_WORKER_ACK_WAIT_MS", 30000)?;
-    let worker_inactive_threshold_ms = env_u64_ms("NATS_WORKER_INACTIVE_THRESHOLD_MS", 3_600_000)?;
     let worker_queue_pull_config = PullConfig {
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         ack_wait: Duration::from_millis(worker_timeout_ms),
-        inactive_threshold: Duration::from_millis(worker_inactive_threshold_ms),
-        max_deliver: 2400,
+        inactive_threshold: Duration::ZERO,
+        // Do not silently strand a job before its witness can be repaired.
+        // AckWait still bounds the redelivery rate; only successful jobs ACK.
+        max_deliver: -1,
         replay_policy: jetstream::consumer::ReplayPolicy::Instant,
         deliver_policy: jetstream::consumer::DeliverPolicy::All,
         max_ack_pending: 100000,

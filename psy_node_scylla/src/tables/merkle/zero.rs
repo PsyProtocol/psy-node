@@ -474,15 +474,13 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         while let Some(next_row_res) = stream.next().await {
             let (node_index_i64, cp_i64, value) = next_row_res?;
             let node_index = i64_to_u64_exact(node_index_i64); // Assuming utils has i64_to_u64_exact
-            if Some(node_index_i64) != prev_index {
-                if cp_i64 <= max_cp_i64 {
-                    let hash = Hash::from_slice_32bytes(&value)?;
-
-                    output_map.insert(node_index, hash);
-                }
+            // Future versions must not hide the first version in this snapshot.
+            if Some(node_index_i64) != prev_index && cp_i64 <= max_cp_i64 {
+                let hash = Hash::from_slice_32bytes(&value)?;
+                output_map.insert(node_index, hash);
                 prev_index = Some(node_index_i64);
             }
-            // Else skip historical for same index
+            // Skip older versions only after selecting a visible version.
         }
         Ok(output_map)
     }
@@ -510,15 +508,13 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         while let Some(next_row_res) = stream.next().await {
             let (node_index_i64, cp_i64, value) = next_row_res?;
             let node_index = i64_to_u64_exact(node_index_i64); // Assuming utils has i64_to_u64_exact
-            if Some(node_index_i64) != prev_index {
-                if cp_i64 <= max_cp_i64 {
-                    let hash = Hash::from_slice_32bytes(&value)?;
-
-                    output_map.insert(node_index, hash);
-                }
+            // Future versions must not hide the first version in this snapshot.
+            if Some(node_index_i64) != prev_index && cp_i64 <= max_cp_i64 {
+                let hash = Hash::from_slice_32bytes(&value)?;
+                output_map.insert(node_index, hash);
                 prev_index = Some(node_index_i64);
             }
-            // Else skip historical for same index
+            // Skip older versions only after selecting a visible version.
         }
         Ok(output_map)
     }
