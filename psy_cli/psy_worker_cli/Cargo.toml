@@ -48,6 +48,7 @@ hashbrown = { workspace = true }
 dashmap = { workspace = true }
 jsonrpsee = { workspace = true }
 dotenv = { workspace = true }
+flate2 = { workspace = true }
 
 plonky2 = { workspace = true }
 
@@ -70,3 +71,7 @@ psy_plonky2_circuits = { workspace = true }
 psy_jtmb_testing_core = { workspace = true }
 
 psy_dummy_prover = { workspace = true }
+
+# Global allocator for the native Linux binary (see src/main.rs)
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6.1"
