@@ -373,7 +373,15 @@ where
 
         // 8. Wait for Coordinator Commit
         tracing::info!("Waiting for Coordinator to include Realm Root: {:?}", guta_update.new_realm_root);
-        let sync_info = self.db.wait_for_realm_update_sync_with_coordinator(guta_update.new_realm_root).await?;
+        let sync_info = self
+            .db
+            .wait_for_realm_update_sync_with_coordinator(
+                guta_update.new_realm_root,
+                submission_header,
+                &root_job_proof,
+                self.guta_resend_after_checkpoints,
+            )
+            .await?;
         timer.lap("wait_for_realm_update_sync");
 
         // 9. Commit Local State

@@ -60,6 +60,10 @@ pub const JOB_STATS_COUNTER_TOTAL_DURATION: u8 = 1;
 pub const JOB_STATS_COUNTER_MIN_DURATION: u8 = 2;
 pub const JOB_STATS_COUNTER_MAX_DURATION: u8 = 3;
 
+pub const TEMP_TABLE_ID_GUTA_IN_FLIGHT: u16 = 0x4647; // 'GF'
+pub const TEMP_TABLE_ID_GUTA_IN_FLIGHT_BYTES: [u8; 2] = [0x47, 0x46]; // 'GF'
+pub const TEMP_TABLE_GUTA_IN_FLIGHT_KEY_SIZE: usize = 16; // 4 + 2 + 2 + 8
+
 pub const TEMP_TABLE_ID_WORKER_REPUTATION: u16 = 0x5257; // 'WR'
 pub const TEMP_TABLE_ID_WORKER_REPUTATION_BYTES: [u8; 2] = [0x57, 0x52]; // 'WR'
 pub const TEMP_TABLE_WORKER_REPUTATION_KEY_SIZE: usize = 41; // 4 + 2 + 2 + 33 (compressed public key)
@@ -570,9 +574,53 @@ pub fn tt_get_worker_reputation_key(realm_id: u32, realm_sub_id: u16, public_key
     key
 }
 
+/// Key of the Coordinator Edge's in-flight record for GUTA updates of `submitting_realm_id`.
+pub fn tt_get_guta_in_flight_key(realm_id: u32, realm_sub_id: u16, submitting_realm_id: u64) -> [u8; TEMP_TABLE_GUTA_IN_FLIGHT_KEY_SIZE] {
+    let mut key = [0u8; TEMP_TABLE_GUTA_IN_FLIGHT_KEY_SIZE];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_GUTA_IN_FLIGHT_BYTES);
+    key[8..16].copy_from_slice(&submitting_realm_id.to_le_bytes());
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guta_in_flight_table_id_is_unique_and_matches_its_bytes() {
+        let others: [u16; 14] = [
+            TEMP_TABLE_ID_WORKER_PROOF_METADATA,
+            TEMP_TABLE_ID_UNIQUE_PENDING_ID,
+            TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID,
+            TEMP_TABLE_ID_PROOF_WITNESS_DATA,
+            TEMP_TABLE_ID_SUBMIT_STATUS,
+            TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES,
+            TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES,
+            TEMP_TABLE_ID_TAG_TREE_VALUES,
+            TEMP_TABLE_ID_NODE_PROVING_STATE,
+            TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION,
+            TEMP_TABLE_ID_JOB_CLAIM,
+            TEMP_TABLE_ID_JOB_STATS,
+            TEMP_TABLE_ID_WORKER_REPUTATION,
+            TEMP_TABLE_ID_PROOF_CLAIM_TAG,
+        ];
+        assert!(!others.contains(&TEMP_TABLE_ID_GUTA_IN_FLIGHT));
+        assert_eq!(TEMP_TABLE_ID_GUTA_IN_FLIGHT.to_le_bytes(), TEMP_TABLE_ID_GUTA_IN_FLIGHT_BYTES);
+    }
+
+    #[test]
+    fn guta_in_flight_key_layout() {
+        let key = tt_get_guta_in_flight_key(0x0a0b_0c0d, 0x0e0f, 0x1122_3344_5566_7788);
+        assert_eq!(key.len(), TEMP_TABLE_GUTA_IN_FLIGHT_KEY_SIZE);
+        assert_eq!(&key[0..4], &0x0a0b_0c0du32.to_le_bytes());
+        assert_eq!(&key[4..6], &0x0e0fu16.to_le_bytes());
+        assert_eq!(&key[6..8], &TEMP_TABLE_ID_GUTA_IN_FLIGHT_BYTES);
+        assert_eq!(&key[8..16], &0x1122_3344_5566_7788u64.to_le_bytes());
+        // one record per submitting realm
+        assert_ne!(tt_get_guta_in_flight_key(1, 2, 0), tt_get_guta_in_flight_key(1, 2, 1));
+    }
 
     // For identical realm/pending/job-id, the proof claim-tag key must differ from the
     // finalized-reward key so that a worker's claimed tag can never alias a finalized
