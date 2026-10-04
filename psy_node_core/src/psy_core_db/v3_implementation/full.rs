@@ -3822,31 +3822,29 @@ impl<
                 .await?;
 
             // Find the largest key in this bucket that was born before/at checkpoint
-            for (_, leaf_key, leaf_index, birth_checkpoint) in bucket_result.iter().rev() {
-                if *birth_checkpoint <= checkpoint_id as i64 {
-                    let leaf_result = self.store
-                        .db_select_imt_leaf(
-                            &self.imt_leaf_table,
-                            user_id as i64,
-                            contract_id as i64,
-                            *leaf_index,
-                            checkpoint_id as i64,
-                        )
-                        .await?;
+            for (_, leaf_key, leaf_index, _) in super::imt_predecessor::candidates(&bucket_result, checkpoint_id as i64) {
+                let leaf_result = self.store
+                    .db_select_imt_leaf(
+                        &self.imt_leaf_table,
+                        user_id as i64,
+                        contract_id as i64,
+                        *leaf_index,
+                        checkpoint_id as i64,
+                    )
+                    .await?;
 
-                    if let Some((_, _, leaf_value, next_key, next_index)) = leaf_result {
-                        let key = N::QHash::from_bytes(leaf_key)?;
-                        let value = N::QHash::from_bytes(&leaf_value)?;
-                        let next_key_hash = N::QHash::from_bytes(&next_key)?;
-                        let next_index_felt = N::F::from_owned_u64(next_index as u64);
+                if let Some((_, _, leaf_value, next_key, next_index)) = leaf_result {
+                    let key = N::QHash::from_bytes(leaf_key)?;
+                    let value = N::QHash::from_bytes(&leaf_value)?;
+                    let next_key_hash = N::QHash::from_bytes(&next_key)?;
+                    let next_index_felt = N::F::from_owned_u64(next_index as u64);
 
-                        return Ok((*leaf_index as u64, IMTContractStateLeaf {
-                            key,
-                            value,
-                            next_key: next_key_hash,
-                            next_index: next_index_felt,
-                        }));
-                    }
+                    return Ok((*leaf_index as u64, IMTContractStateLeaf {
+                        key,
+                        value,
+                        next_key: next_key_hash,
+                        next_index: next_index_felt,
+                    }));
                 }
             }
         }
