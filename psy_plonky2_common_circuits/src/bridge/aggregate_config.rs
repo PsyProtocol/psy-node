@@ -4,7 +4,7 @@ use plonky2::{
     iop::{target::{BoolTarget, Target}, witness::WitnessWrite},
     plonk::circuit_builder::CircuitBuilder,
 };
-use psy_client_data::bridge_aggregate::{ChainConfig, NetworkConfig, BRIDGE_USER_ID, MAX_CHAINS, MAX_RECORDS};
+use psy_client_data::bridge_aggregate::{ChainConfig, NetworkConfig, BRIDGE_USER_ID, MAX_CHAINS, MAX_LEAVES};
 use psy_plonky2_basic_helpers::builder::comparison::CircuitBuilderComparison;
 
 use super::aggregate_commitment::{
@@ -130,7 +130,7 @@ impl NetworkConfigTarget {
             &[self.reward_cutover[1], self.reward_cutover[0]],
             &[self.reward_end_exclusive[1], self.reward_end_exclusive[0]]);
         builder.assert_one(interval.target);
-        let maximum = builder.constant(F::from_canonical_usize(MAX_RECORDS));
+        let maximum = builder.constant(F::from_canonical_usize(MAX_LEAVES));
         for count in [self.max_deposits, self.max_withdrawals, self.max_rewards] {
             builder.range_check(count, 32);
             builder.ensure_is_less_than_or_equal(32, count, maximum);

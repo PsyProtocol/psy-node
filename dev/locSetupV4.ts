@@ -3440,7 +3440,11 @@ export async function resolveBridgeDaemonConfigPath(
     }
     const limits = table(config.aggregate_limits, "aggregate_limits");
     for (const field of ["max_deposits", "reserved_withdrawals", "reserved_rewards"]) integer(limits[field], 32, `aggregate_limits.${field}`);
-    for (const field of ["max_a_calldata_bytes", "max_b_calldata_bytes"]) integer(limits[field], 64, `aggregate_limits.${field}`);
+    integer(limits.max_window_calldata_bytes, 64, "aggregate_limits.max_window_calldata_bytes");
+    if (BigInt(limits.max_window_calldata_bytes as number | bigint) === 0n) throw daemonConfigError("aggregate_limits.max_window_calldata_bytes");
+    for (const field of ["max_a_calldata_bytes", "max_b_calldata_bytes"]) {
+        if (Object.hasOwn(limits, field)) throw daemonConfigError(`aggregate_limits.${field}`);
+    }
     if (!Array.isArray(limits.chains) || !limits.chains.length) throw daemonConfigError("aggregate_limits.chains");
     for (const value of limits.chains) {
         const chain = table(value, "aggregate_limits.chains");

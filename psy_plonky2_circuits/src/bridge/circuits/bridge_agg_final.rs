@@ -42,6 +42,7 @@ use crate::{
             BRIDGE_AGG_CHAIN_MAX_SLOTS, BRIDGE_AGG_CHAIN_PI_LEN, GOLDILOCKS_MODULUS,
         },
         gadgets::{
+            slot_value_in_contract_state::{SlotValueInContractStateGadget, SlotValueInContractStateWitnessInput},
             tree_root_in_contract_state::{
                 TreeRootInContractStateGadget, TreeRootInContractStateWitnessInput,
             },
@@ -59,10 +60,76 @@ use crate::{
 const BRIDGE_USER_ID: u64 = 524_288;
 const DEPOSIT_TREE_CONTRACT_ID: u64 = 2;
 const WITHDRAWAL_TREE_CONTRACT_ID: u64 = 3;
-/// BridgeAgg Final public-input width:
+/// BridgeAgg Final public-input prefix width (followed by nine fields per chain):
 /// [0..4) start root, [4..12) deposit root, [12..20) withdrawal root,
 /// [20..24) end root, [24] end checkpoint index, [25] num checkpoints.
 pub const BRIDGE_AGG_FINAL_PI_LEN: usize = 26;
+
+pub const fn bridge_agg_final_pi_len(chain_count: usize) -> usize {
+    BRIDGE_AGG_FINAL_PI_LEN + 9 * chain_count
+}
+
+fn validate_endpoint_chain_indices(indices: &[u8]) {
+    assert!(!indices.is_empty() && indices.len() <= 256, "Final requires 1..=256 configured chains");
+    assert!(indices.windows(2).all(|pair| pair[0] < pair[1]), "Final chain indices must be strictly increasing");
+}
+
+#[derive(Clone, Debug)]
+pub struct BridgeAggFinalEndpointWitness<F: RichField> {
+    pub chain_index: u8,
+    pub deposit_root: TreeRootInContractStateWitnessInput<F>,
+    pub deposit_count: SlotValueInContractStateWitnessInput<F>,
+    pub withdrawal_root: TreeRootInContractStateWitnessInput<F>,
+    pub withdrawal_count: SlotValueInContractStateWitnessInput<F>,
+}
+
+pub struct BridgeAggFinalEndpointTarget {
+    pub deposit_root: TreeRootInContractStateGadget,
+    pub deposit_count: SlotValueInContractStateGadget,
+    pub withdrawal_root: TreeRootInContractStateGadget,
+    pub withdrawal_count: SlotValueInContractStateGadget,
+}
+
+fn endpoint_root_and_count<H: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>>, F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    root: &TreeRootInContractStateGadget,
+    count_slot: &SlotValueInContractStateGadget,
+    chain_index: u8,
+    contract_id: u64,
+    user_tree_root: HashOutTarget,
+) -> ([Target; 4], Target) {
+    let owner = builder.constant(F::from_canonical_u64(BRIDGE_USER_ID));
+    let contract = builder.constant(F::from_canonical_u64(contract_id));
+    for slot in [&root.slot0, &root.slot1, count_slot] {
+        builder.connect(slot.sender_user_id, owner);
+        builder.connect(slot.contract_id, contract);
+        builder.connect_hashes(slot.user_tree_root, user_tree_root);
+    }
+    let index = builder.constant(F::from_canonical_u64(16_386 + u64::from(chain_index) / 4));
+    builder.connect(count_slot.slot_index, index);
+    let count = count_slot.slot_proof.value.elements[usize::from(chain_index % 4)];
+    builder.range_check(count, 32);
+    let words: [Target; 8] = std::array::from_fn(|i| root.tree_root[i / 4].elements[i % 4]);
+    let zero = builder.zero();
+    let mut uninitialized = builder.is_equal(count, zero);
+    for word in words {
+        let is_zero = builder.is_equal(word, zero);
+        uninitialized = builder.and(uninitialized, is_zero);
+    }
+    let maximum = builder.constant(F::from_canonical_u32(u32::MAX));
+    let empty = H::get_zero_hash(32);
+    let normalized = std::array::from_fn(|i| {
+        let low = words[2 * i];
+        let high = words[2 * i + 1];
+        let high_is_maximum = builder.is_equal(high, maximum);
+        let excess = builder.mul(high_is_maximum.target, low);
+        builder.assert_zero(excess);
+        let decoded = builder.mul_const_add(F::from_canonical_u64(1u64 << 32), high, low);
+        let empty_limb = builder.constant(empty.elements[i]);
+        builder.select(uninitialized, empty_limb, decoded)
+    });
+    (normalized, count)
+}
 
 pub struct BridgeAggFinalSlotWitness<'a, F: Field> {
     pub checkpoint_delta_merkle_proof: &'a DeltaMerkleProofCore<QHashOut<F>>,
@@ -87,6 +154,8 @@ pub struct BridgeAggFinalCircuit<C: GenericConfig<D>, const D: usize> {
     pub final_checkpoint_leaf: QEDCheckpointLeafCompactGadget,
     pub deposit_root_gadget: TreeRootInContractStateGadget,
     pub withdrawal_root_gadget: TreeRootInContractStateGadget,
+    configured_chain_indices: Vec<u8>,
+    pub endpoints: Vec<BridgeAggFinalEndpointTarget>,
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
 }
@@ -96,6 +165,10 @@ where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,
     C::F: RichField + Extendable<D>,
 {
+    pub fn configured_chain_indices(&self) -> &[u8] {
+        &self.configured_chain_indices
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain_common_data: &CommonCircuitData<C::F, D>,
@@ -110,7 +183,9 @@ where
         global_contract_tree_height: usize,
         deposit_contract_state_tree_height: usize,
         withdrawal_contract_state_tree_height: usize,
+        configured_chain_indices: &[u8],
     ) -> Self {
+        validate_endpoint_chain_indices(configured_chain_indices);
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
         let one = builder.one();
@@ -258,6 +333,7 @@ where
                 global_user_tree_height,
                 global_contract_tree_height,
                 deposit_contract_state_tree_height,
+                [0, 1],
             );
         let withdrawal_root_gadget =
             TreeRootInContractStateGadget::add_virtual_to::<C::Hasher, C::F, D>(
@@ -265,6 +341,7 @@ where
                 global_user_tree_height,
                 global_contract_tree_height,
                 withdrawal_contract_state_tree_height,
+                [0, 1],
             );
         builder.connect_hashes(
             withdrawal_root_gadget.user_tree_root,
@@ -304,6 +381,31 @@ where
         builder.register_public_input(rolling_checkpoint_index);
         builder.register_public_input(total_num_checkpoints);
 
+        let mut endpoints = Vec::with_capacity(configured_chain_indices.len());
+        for &chain_index in configured_chain_indices {
+            let first_slot = 16_451 + 2 * u64::from(chain_index);
+            let deposit_root = TreeRootInContractStateGadget::add_virtual_to::<C::Hasher, C::F, D>(
+                &mut builder, global_user_tree_height, global_contract_tree_height,
+                deposit_contract_state_tree_height, [first_slot, first_slot + 1]);
+            let deposit_count = SlotValueInContractStateGadget::add_virtual_to::<C::Hasher, C::F, D>(
+                &mut builder, global_user_tree_height, global_contract_tree_height, deposit_contract_state_tree_height);
+            let withdrawal_root = TreeRootInContractStateGadget::add_virtual_to::<C::Hasher, C::F, D>(
+                &mut builder, global_user_tree_height, global_contract_tree_height,
+                withdrawal_contract_state_tree_height, [first_slot, first_slot + 1]);
+            let withdrawal_count = SlotValueInContractStateGadget::add_virtual_to::<C::Hasher, C::F, D>(
+                &mut builder, global_user_tree_height, global_contract_tree_height, withdrawal_contract_state_tree_height);
+            let (deposit, count) = endpoint_root_and_count::<C::Hasher, C::F, D>(
+                &mut builder, &deposit_root, &deposit_count, chain_index,
+                DEPOSIT_TREE_CONTRACT_ID, checkpoint_global_state_roots.user_tree_root);
+            let (withdrawal, _) = endpoint_root_and_count::<C::Hasher, C::F, D>(
+                &mut builder, &withdrawal_root, &withdrawal_count, chain_index,
+                WITHDRAWAL_TREE_CONTRACT_ID, checkpoint_global_state_roots.user_tree_root);
+            builder.register_public_inputs(&deposit);
+            builder.register_public_input(count);
+            builder.register_public_inputs(&withdrawal);
+            endpoints.push(BridgeAggFinalEndpointTarget { deposit_root, deposit_count, withdrawal_root, withdrawal_count });
+        }
+
         builder.add_qed_type_d_common_gates();
         let circuit_data = builder.build::<C>();
         let fingerprint = QHashOut(get_circuit_fingerprint_generic(
@@ -326,6 +428,8 @@ where
             final_checkpoint_leaf,
             deposit_root_gadget,
             withdrawal_root_gadget,
+            configured_chain_indices: configured_chain_indices.to_vec(),
+            endpoints,
             circuit_data,
             fingerprint,
         }
@@ -343,6 +447,7 @@ where
         checkpoint_global_state_roots: &PQEDCheckpointGlobalStateRoots<QHashOut<C::F>>,
         deposit_root_witness: &TreeRootInContractStateWitnessInput<C::F>,
         withdrawal_root_witness: &TreeRootInContractStateWitnessInput<C::F>,
+        endpoint_witnesses: &[BridgeAggFinalEndpointWitness<C::F>],
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         anyhow::ensure!(
             !terminal_slots.is_empty() && terminal_slots.len() <= BRIDGE_AGG_CHAIN_MAX_SLOTS,
@@ -351,6 +456,10 @@ where
             terminal_slots.len()
         );
 
+        anyhow::ensure!(endpoint_witnesses.len() == self.endpoints.len(), "Final endpoint witness count does not match configured chains");
+        for (&index, witness) in self.configured_chain_indices.iter().zip(endpoint_witnesses) {
+            anyhow::ensure!(index == witness.chain_index, "Final endpoint witness chain index does not match configured ordinal");
+        }
         let mut pw = PartialWitness::<C::F>::new();
         pw.set_verifier_data_target(&self.chain_verifier_target, chain_verifier_data)?;
         pw.set_proof_with_pis_target(&self.chain_proof_target, chain_proof)?;
@@ -378,6 +487,12 @@ where
             .set_witness(&mut pw, deposit_root_witness)?;
         self.withdrawal_root_gadget
             .set_witness(&mut pw, withdrawal_root_witness)?;
+        for (target, witness) in self.endpoints.iter().zip(endpoint_witnesses) {
+            target.deposit_root.set_witness(&mut pw, &witness.deposit_root)?;
+            target.deposit_count.set_witness(&mut pw, &witness.deposit_count)?;
+            target.withdrawal_root.set_witness(&mut pw, &witness.withdrawal_root)?;
+            target.withdrawal_count.set_witness(&mut pw, &witness.withdrawal_count)?;
+        }
         self.circuit_data.prove(pw)
     }
 
@@ -392,6 +507,7 @@ where
         contract_tree_height: usize,
         deposit_contract_state_tree_height: usize,
         withdrawal_contract_state_tree_height: usize,
+        configured_chain_indices: &[u8],
     ) -> Self {
         let chain_circuit = BridgeAggChainCircuit::<C, D>::new(
             checkpoint_base_fingerprint,
@@ -413,6 +529,7 @@ where
             contract_tree_height,
             deposit_contract_state_tree_height,
             withdrawal_contract_state_tree_height,
+            configured_chain_indices,
         )
     }
 
@@ -438,6 +555,8 @@ where
         contract_tree_height: usize,
         deposit_contract_state_tree_height: usize,
         withdrawal_contract_state_tree_height: usize,
+        configured_chain_indices: &[u8],
+        endpoint_witnesses: &[BridgeAggFinalEndpointWitness<C::F>],
     ) -> anyhow::Result<BridgeAggProveResult<C, D>> {
         anyhow::ensure!(
             from_checkpoint <= to_checkpoint,
@@ -510,6 +629,7 @@ where
             contract_tree_height,
             deposit_contract_state_tree_height,
             withdrawal_contract_state_tree_height,
+            configured_chain_indices,
         );
         let terminal_slots = delta_merkle_proofs[prefix_len..total]
             .iter()
@@ -527,11 +647,12 @@ where
             checkpoint_global_state_roots,
             deposit_witness,
             withdrawal_witness,
+            endpoint_witnesses,
         )?;
         anyhow::ensure!(
-            proof.public_inputs.len() == BRIDGE_AGG_FINAL_PI_LEN,
+            proof.public_inputs.len() == bridge_agg_final_pi_len(configured_chain_indices.len()),
             "Final public input width must be {}, got {}",
-            BRIDGE_AGG_FINAL_PI_LEN,
+            bridge_agg_final_pi_len(configured_chain_indices.len()),
             proof.public_inputs.len()
         );
         anyhow::ensure!(
@@ -550,6 +671,7 @@ where
             verifier_data: final_circuit.circuit_data.verifier_only,
             positive_chain_proofs,
             final_active_len: final_len,
+            configured_chain_indices: final_circuit.configured_chain_indices,
         })
     }
 }
@@ -578,6 +700,7 @@ pub struct BridgeAggProveResult<C: GenericConfig<D>, const D: usize> {
     pub verifier_data: VerifierOnlyCircuitData<C, D>,
     pub positive_chain_proofs: usize,
     pub final_active_len: usize,
+    pub configured_chain_indices: Vec<u8>,
 }
 
 fn pi_hash(pis: &[Target], start: usize) -> HashOutTarget {
@@ -914,6 +1037,130 @@ mod tests {
         (deposit, withdrawal, global_roots)
     }
 
+    fn endpoint_fixture(contract: u64, chain: u8, count: u64, words: [u64; 8]) -> (TreeRootInContractStateWitnessInput<F>, SlotValueInContractStateWitnessInput<F>) {
+        let count_index = 16_386 + u64::from(chain) / 4;
+        let first = 16_451 + 2 * u64::from(chain);
+        let mut counts = QHashOut::ZERO;
+        counts.0.elements[usize::from(chain % 4)] = F::from_canonical_u64(count);
+        let leaves = [
+            (count_index, counts),
+            (first, QHashOut(HashOut { elements: std::array::from_fn(|i| F::from_canonical_u64(words[i])) })),
+            (first + 1, QHashOut(HashOut { elements: std::array::from_fn(|i| F::from_canonical_u64(words[4 + i])) })),
+        ].into_iter().collect();
+        let slot0_proof = sparse_merkle_proof(&leaves, first, TEST_CONTRACT_STATE_TREE_HEIGHT);
+        let slot1_proof = sparse_merkle_proof(&leaves, first + 1, TEST_CONTRACT_STATE_TREE_HEIGHT);
+        let contract_value = if slot0_proof.root == zero_hash(TEST_CONTRACT_STATE_TREE_HEIGHT) { QHashOut::ZERO } else { slot0_proof.root };
+        let contract_proof = sparse_merkle_proof(&[(contract, contract_value)].into_iter().collect(), contract, 2);
+        let user_leaf = PQEDUserLeaf::new(QHashOut::ZERO, contract_proof.root, F::ONE, F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u64(BRIDGE_USER_ID));
+        let user_tree_proof = sparse_merkle_proof(&[(BRIDGE_USER_ID, user_leaf_hash(&user_leaf))].into_iter().collect(), BRIDGE_USER_ID, 20);
+        let root = TreeRootInContractStateWitnessInput { owner_user_id: BRIDGE_USER_ID, contract_id: contract, user_leaf, slot0_proof, slot1_proof, contract_proof, user_tree_proof };
+        let mut count = root.to_slot_witnesses([first, first + 1])[0].clone();
+        count.slot_index = count_index;
+        count.slot_proof = sparse_merkle_proof(&leaves, count_index, TEST_CONTRACT_STATE_TREE_HEIGHT);
+        (root, count)
+    }
+
+    fn endpoint_circuit(root: &TreeRootInContractStateWitnessInput<F>, chain: u8, contract: u64) -> (TreeRootInContractStateGadget, SlotValueInContractStateGadget, CircuitData<F, C, D>) {
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let first = 16_451 + 2 * u64::from(chain);
+        let target = TreeRootInContractStateGadget::add_virtual_to::<PoseidonHash, F, D>(&mut builder, 20, 2, TEST_CONTRACT_STATE_TREE_HEIGHT, [first, first + 1]);
+        let count = SlotValueInContractStateGadget::add_virtual_to::<PoseidonHash, F, D>(&mut builder, 20, 2, TEST_CONTRACT_STATE_TREE_HEIGHT);
+        let user_root = builder.constant_hash(root.user_tree_proof.root.0);
+        let (normalized, selected) = endpoint_root_and_count::<PoseidonHash, F, D>(&mut builder, &target, &count, chain, contract, user_root);
+        builder.register_public_inputs(&normalized);
+        builder.register_public_input(selected);
+        (target, count, builder.build::<C>())
+    }
+
+    fn prove_endpoint(target: &TreeRootInContractStateGadget, count_target: &SlotValueInContractStateGadget, data: &CircuitData<F, C, D>, root: &TreeRootInContractStateWitnessInput<F>, count: &SlotValueInContractStateWitnessInput<F>) -> anyhow::Result<Vec<F>> {
+        let mut witness = PartialWitness::new();
+        target.set_witness(&mut witness, root)?;
+        count_target.set_witness(&mut witness, count)?;
+        let proof = data.prove(witness)?;
+        let output = proof.public_inputs.clone();
+        data.verify(proof)?;
+        Ok(output)
+    }
+
+    #[test]
+    fn final_endpoint_authenticates_root_count_contract_and_index() {
+        for contract in [2, 3] {
+            let (root, count) = endpoint_fixture(contract, 5, 7, [1, 0, 2, 0, 3, 0, 4, 0]);
+            let (target, count_target, data) = endpoint_circuit(&root, 5, contract);
+            assert_eq!(prove_endpoint(&target, &count_target, &data, &root, &count).unwrap(), [1, 2, 3, 4, 7].map(F::from_canonical_u64));
+            for mutation in 0..9 {
+                let mut wrong_root = root.clone();
+                let mut wrong_count = count.clone();
+                match mutation {
+                    0 => wrong_root.slot0_proof.value.0.elements[0] += F::ONE,
+                    1 => wrong_count.slot_proof.value.0.elements[1] += F::ONE,
+                    2 => wrong_count.slot_index += 1,
+                    3 => wrong_root.slot0_proof.index += 1,
+                    4 => wrong_root.contract_id = 5 - contract,
+                    5 => wrong_count.sender_user_id += 1,
+                    6 => wrong_root.user_tree_proof.siblings[0].0.elements[0] += F::ONE,
+                    7 => wrong_count.contract_proof.siblings[0].0.elements[0] += F::ONE,
+                    8 => wrong_root.user_leaf.public_key.0.elements[0] += F::ONE,
+                    _ => unreachable!("mutation {mutation}"),
+                }
+                assert!(prove_endpoint(&target, &count_target, &data, &wrong_root, &wrong_count).is_err(), "contract {contract}, mutation {mutation}");
+            }
+            let (wrong_target, wrong_count_target, wrong_data) = endpoint_circuit(&root, 4, contract);
+            assert!(prove_endpoint(&wrong_target, &wrong_count_target, &wrong_data, &root, &count).is_err());
+        }
+    }
+
+    #[test]
+    fn final_endpoint_normalization_boundaries() {
+        for contract in [2, 3] {
+            for (count, words, expected) in [
+                (0, [0; 8], zero_hash(32).0.elements),
+                (1, [0; 8], [F::ZERO; 4]),
+                (0, [1, 0, 0, 0, 0, 0, 0, 0], [F::ONE, F::ZERO, F::ZERO, F::ZERO]),
+                (u32::MAX as u64, [0, u32::MAX as u64, 2, 0, 3, 0, 4, 0], [F::from_canonical_u64(GOLDILOCKS_MODULUS - 1), F::TWO, F::from_canonical_u64(3), F::from_canonical_u64(4)]),
+            ] {
+                let (root, count_witness) = endpoint_fixture(contract, 255, count, words);
+                let (target, count_target, data) = endpoint_circuit(&root, 255, contract);
+                let output = prove_endpoint(&target, &count_target, &data, &root, &count_witness).unwrap();
+                assert_eq!(output[..4], expected);
+                assert_eq!(output[4].to_canonical_u64(), count);
+            }
+            for (count, words) in [
+                (1u64 << 32, [0; 8]),
+                (1, [1, u32::MAX as u64, 0, 0, 0, 0, 0, 0]),
+                (1, [1u64 << 32, 0, 0, 0, 0, 0, 0, 0]),
+            ] {
+                let (root, count) = endpoint_fixture(contract, 255, count, words);
+                let (target, count_target, data) = endpoint_circuit(&root, 255, contract);
+                assert!(prove_endpoint(&target, &count_target, &data, &root, &count).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn final_rejects_empty_duplicate_and_unsorted_chain_config() {
+        for indices in [vec![], vec![5, 5], vec![5, 4]] {
+            assert!(std::panic::catch_unwind(|| validate_endpoint_chain_indices(&indices)).is_err());
+        }
+        validate_endpoint_chain_indices(&(0..=255).collect::<Vec<_>>());
+    }
+
+    fn empty_endpoint(deposit: &TreeRootInContractStateWitnessInput<F>, withdrawal: &TreeRootInContractStateWitnessInput<F>) -> BridgeAggFinalEndpointWitness<F> {
+        fn slots(global: &TreeRootInContractStateWitnessInput<F>) -> (TreeRootInContractStateWitnessInput<F>, SlotValueInContractStateWitnessInput<F>) {
+            let leaves = [(0, global.slot0_proof.value), (1, global.slot1_proof.value)].into_iter().collect();
+            let mut root = global.clone();
+            root.slot0_proof = sparse_merkle_proof(&leaves, 16_461, TEST_CONTRACT_STATE_TREE_HEIGHT);
+            root.slot1_proof = sparse_merkle_proof(&leaves, 16_462, TEST_CONTRACT_STATE_TREE_HEIGHT);
+            let mut count = root.to_slot_witnesses([16_461, 16_462])[0].clone();
+            count.slot_index = 16_387;
+            count.slot_proof = sparse_merkle_proof(&leaves, count.slot_index, TEST_CONTRACT_STATE_TREE_HEIGHT);
+            (root, count)
+        }
+        let (deposit_root, deposit_count) = slots(deposit);
+        let (withdrawal_root, withdrawal_count) = slots(withdrawal);
+        BridgeAggFinalEndpointWitness { chain_index: 5, deposit_root, deposit_count, withdrawal_root, withdrawal_count }
+    }
+
     fn prove_checkpoint(
         circuit: &CircuitData<F, C, D>,
         chain_hash: QHashOut<F>,
@@ -970,6 +1217,7 @@ mod tests {
             2,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
+            &[5],
         )
     }
 
@@ -1075,6 +1323,8 @@ mod tests {
                 2,
                 TEST_CONTRACT_STATE_TREE_HEIGHT,
                 TEST_CONTRACT_STATE_TREE_HEIGHT,
+                &[5],
+                &[empty_endpoint(&self.deposit, &self.withdrawal)],
             )
         }
     }
@@ -1091,7 +1341,7 @@ mod tests {
 
         assert_eq!(result.positive_chain_proofs, positive_chain_proofs);
         assert_eq!(result.final_active_len, final_active_len);
-        assert_eq!(result.proof.public_inputs.len(), BRIDGE_AGG_FINAL_PI_LEN);
+        assert_eq!(result.proof.public_inputs.len(), bridge_agg_final_pi_len(1));
         assert_eq!(result.proof.public_inputs[24].to_canonical_u64(), total as u64);
         assert_eq!(result.proof.public_inputs[25].to_canonical_u64(), total as u64);
         assert_eq!(
@@ -1205,6 +1455,8 @@ mod tests {
             2,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
+            &[5],
+            &[empty_endpoint(&fixture.deposit, &fixture.withdrawal)],
         )
         .unwrap();
 
@@ -1243,6 +1495,8 @@ mod tests {
             2,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
+            &[5],
+            &[empty_endpoint(&fixture.deposit, &fixture.withdrawal)],
         ) {
             Ok(_) => panic!("empty range unexpectedly proved"),
             Err(error) => error,
@@ -1283,6 +1537,8 @@ mod tests {
                 2,
                 TEST_CONTRACT_STATE_TREE_HEIGHT,
                 TEST_CONTRACT_STATE_TREE_HEIGHT,
+                &[5],
+                &[empty_endpoint(&fixture.deposit, &fixture.withdrawal)],
             )
         };
 
@@ -1378,9 +1634,10 @@ mod tests {
             1,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
+            &[5],
         );
 
-        assert_eq!(final_circuit.circuit_data.common.num_public_inputs, BRIDGE_AGG_FINAL_PI_LEN);
+        assert_eq!(final_circuit.circuit_data.common.num_public_inputs, bridge_agg_final_pi_len(1));
         assert!(chain.circuit_data.common.num_public_inputs > BRIDGE_AGG_CHAIN_PI_LEN);
     }
 
@@ -1427,6 +1684,7 @@ mod tests {
             2,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
             TEST_CONTRACT_STATE_TREE_HEIGHT,
+            &[5],
         );
         let proof = final_circuit
             .prove_base(
@@ -1441,6 +1699,7 @@ mod tests {
                 &global_roots,
                 &deposit,
                 &withdrawal,
+                &[empty_endpoint(&deposit, &withdrawal)],
             )
             .unwrap();
 
@@ -1461,7 +1720,10 @@ mod tests {
         assert_eq!(&proof.public_inputs[20..24], &terminal_delta.new_root.0.elements);
         assert_eq!(proof.public_inputs[24].to_canonical_u64(), 0);
         assert_eq!(proof.public_inputs[25].to_canonical_u64(), 1);
-        assert_eq!(proof.public_inputs.len(), BRIDGE_AGG_FINAL_PI_LEN);
+        assert_eq!(proof.public_inputs.len(), bridge_agg_final_pi_len(1));
+        assert_eq!(&proof.public_inputs[26..30], &zero_hash(32).0.elements);
+        assert_eq!(proof.public_inputs[30], F::ZERO);
+        assert_eq!(&proof.public_inputs[31..35], &zero_hash(32).0.elements);
     }
 
     #[test]
@@ -1502,6 +1764,7 @@ mod tests {
                 &global_roots,
                 &deposit,
                 &withdrawal,
+                &[empty_endpoint(&deposit, &withdrawal)],
             )
             .is_err());
     }
@@ -1549,6 +1812,7 @@ mod tests {
                 &global_roots,
                 &deposit,
                 &withdrawal,
+                &[empty_endpoint(&deposit, &withdrawal)],
             )
             .is_err());
     }
@@ -1594,6 +1858,7 @@ mod tests {
                 &global_roots,
                 &deposit,
                 &withdrawal,
+                &[empty_endpoint(&deposit, &withdrawal)],
             )
             .is_err());
     }
@@ -1639,6 +1904,7 @@ mod tests {
                 &global_roots,
                 &deposit,
                 &withdrawal,
+                &[empty_endpoint(&deposit, &withdrawal)],
             )
             .is_err());
     }

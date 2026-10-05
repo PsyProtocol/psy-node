@@ -329,10 +329,8 @@ fn aggregate_destination(
     limits: &AggregateLimits,
 ) -> anyhow::Result<(u64, Address)> {
     let selector = calldata.get(..4).context("aggregate calldata has no selector")?;
-    if selector == finalize_bridge::applyDepositAggregateCall::SELECTOR.as_slice() {
-        Ok((limits.max_a_calldata_bytes, Address::from(chain.bridge)))
-    } else if selector == finalize_bridge::finalizeCheckpointAggregateCall::SELECTOR.as_slice() {
-        Ok((limits.max_b_calldata_bytes, Address::from(chain.state_manager)))
+    if selector == finalize_bridge::applyBridgeWindowCall::SELECTOR.as_slice() {
+        Ok((limits.max_window_calldata_bytes, Address::from(chain.state_manager)))
     } else {
         anyhow::bail!("unknown aggregate calldata selector")
     }
@@ -405,8 +403,7 @@ mod tests {
             max_deposits: 1,
             reserved_withdrawals: 0,
             reserved_rewards: 0,
-            max_a_calldata_bytes: 10_000,
-            max_b_calldata_bytes: 10_000,
+            max_window_calldata_bytes: 10_000,
             chains: vec![crate::bridge::daemon::ChainLimits {
                 chain_index: CHAIN,
                 max_deposits: 1,
@@ -418,7 +415,12 @@ mod tests {
     }
 
     fn calldata() -> Bytes {
-        finalize_bridge::apply_deposit_aggregate_call([U256::from(1u8); 8], Bytes::from_static(&[9, 8, 7]))
+        finalize_bridge::BridgeWindowCall {
+            finalize_proof: [U256::ZERO; 8], checkpoint_pi: vec![U256::ZERO; 35],
+            deposit_proof: [U256::from(1u8); 8], deposit_opening: Bytes::from_static(&[9, 8, 7]),
+            withdrawal_proof: [U256::ZERO; 8], withdrawal_opening: Bytes::new(),
+            reward_proof: [U256::ZERO; 8], reward_opening: Bytes::new(),
+        }.encode()
     }
 
     fn block(gas_limit: u64) -> Block {
@@ -500,7 +502,7 @@ mod tests {
     async fn preflight_sets_exact_fields_and_operator_ceiling() {
         let (mut client, from) = sender();
         let input = calldata();
-        let to = Address::from(chain().bridge);
+        let to = Address::from(chain().state_manager);
         client.rpc_urls = vec![serve(vec![
             json!({"method":"eth_chainId","params":[],"result":"0x1"}),
             json!({"method":"eth_getBlockByNumber","params":["latest", false],"result":block(1_000)}),
@@ -522,7 +524,7 @@ mod tests {
     async fn preflight_rejects_estimate_above_block_room_before_broadcast() {
         let (mut client, from) = sender();
         let input = calldata();
-        let to = Address::from(chain().bridge);
+        let to = Address::from(chain().state_manager);
         client.rpc_urls = vec![serve(vec![
             json!({"method":"eth_chainId","params":[],"result":"0x1"}),
             json!({"method":"eth_getBlockByNumber","params":["latest", false],"result":block(150)}),
@@ -545,7 +547,7 @@ mod tests {
     async fn broadcast_sends_the_signed_prepared_transaction_once() {
         let (mut client, from) = sender();
         let input = calldata();
-        let to = Address::from(chain().bridge);
+        let to = Address::from(chain().state_manager);
         let tx = TransactionRequest::default()
             .from(from)
             .to(to)
@@ -600,10 +602,9 @@ mod tests {
     fn selector_budget_uses_the_matching_destination() {
         let chain = chain();
         let limits = limits(1, 1);
-        let deposit = calldata();
-        let checkpoint = finalize_bridge::finalize_checkpoint_aggregate_call([U256::from(2u8); 8], Bytes::new());
-        assert_eq!(aggregate_destination(&deposit, &chain, &limits).unwrap(), (10_000, Address::from(chain.bridge)));
-        assert_eq!(aggregate_destination(&checkpoint, &chain, &limits).unwrap(), (10_000, Address::from(chain.state_manager)));
+        let window = calldata();
+        assert_eq!(aggregate_destination(&window, &chain, &limits).unwrap(), (10_000, Address::from(chain.state_manager)));
+        assert!(aggregate_destination(&Bytes::from_static(&[1, 2, 3, 4]), &chain, &limits).is_err());
     }
 }
 

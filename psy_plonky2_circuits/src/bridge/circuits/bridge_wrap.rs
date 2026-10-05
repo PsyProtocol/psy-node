@@ -33,6 +33,14 @@ use parth_core::crypto::hash::traits::ToU64x4;
 use psy_common_circuit::serialization::PsyGateSerializer;
 use psy_crypto::hash::core::sha256::CoreSha256Hasher;
 
+fn digest_artifact_prefix(artifact: DigestArtifact) -> [u64; 4] {
+    match artifact {
+        DigestArtifact::DepositAggregate => [1, 11, 1, 0],
+        DigestArtifact::WithdrawalAggregate => [1, 7, 2, 0],
+        DigestArtifact::RewardAggregate => [1, 7, 3, 0],
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DigestBitsSources {
@@ -71,7 +79,7 @@ pub struct DigestBitsIdentity {
 
 impl DigestBitsIdentity {
     pub fn identity_hash(&self) -> anyhow::Result<String> {
-        anyhow::ensure!(self.schema == 1 && self.mode == "DigestBits" && matches!(self.artifact, 1 | 2), "invalid DigestBits identity");
+        anyhow::ensure!(self.schema == 1 && self.mode == "DigestBits" && matches!(self.artifact, 1 | 2 | 3), "invalid DigestBits identity");
         DigestBitsSources { node_source: self.node_source.clone(), native_source: self.native_source.clone(), plonky2_source: self.plonky2_source.clone(), wrapper_source: self.wrapper_source.clone() }.validate()?;
         anyhow::ensure!(self.normalizer_fingerprint.iter().all(|limb| *limb < 0xffff_ffff_0000_0001), "noncanonical fingerprint");
         let mut bytes = b"PsyBridge/DigestBits/1".to_vec();
@@ -110,7 +118,7 @@ impl DigestBitsAdapter {
         let normalizer = builder.add_virtual_proof_with_pis(common);
         let pinned_verifier = builder.constant_verifier_data(verifier);
         builder.verify_proof::<C>(&normalizer, &pinned_verifier, common);
-        for (target, value) in normalizer.public_inputs[..4].iter().zip([1, 11, artifact as u64, 0]) {
+        for (target, value) in normalizer.public_inputs[..4].iter().zip(digest_artifact_prefix(artifact)) {
             let constant = builder.constant(F::from_canonical_u64(value));
             builder.connect(*target, constant);
         }
@@ -262,10 +270,20 @@ type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 type F = GoldilocksField;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeIdentity {
+    pub schema: u32,
+    pub chain_indices: Vec<u8>,
+    pub final_common_json: String,
+    pub final_verifier_json: String,
+}
+
 #[derive(Debug)]
 pub struct SharedGroth16Wrapper {
     pub wrapped_circuit: WrappedCircuit<DefaultParameters, gnark_plonky2_wrapper::parameters::Groth16WrapperParameters, D>,
     pub keystore_path: String,
+    finalize_identity: Option<FinalizeIdentity>,
 }
 
 impl SharedGroth16Wrapper {
@@ -281,7 +299,23 @@ impl SharedGroth16Wrapper {
         Self {
             wrapped_circuit,
             keystore_path,
+            finalize_identity: None,
         }
+    }
+
+    pub fn setup_finalize(&self) -> anyhow::Result<()> {
+        let identity = self.finalize_identity.as_ref().ok_or_else(|| anyhow::anyhow!("not a finalize wrapper"))?;
+        gnark_plonky2_verifier_ffi::setup_finalize(&json(identity)?, &self.keystore_path)
+            .map_err(|error| anyhow::anyhow!("finalize setup: {error}"))
+    }
+
+    pub fn validate_finalize_setup(&self) -> anyhow::Result<()> {
+        let expected = self.finalize_identity.as_ref().ok_or_else(|| anyhow::anyhow!("not a finalize wrapper"))?;
+        let json = gnark_plonky2_verifier_ffi::read_finalize_setup_identity(&self.keystore_path)
+            .map_err(|error| anyhow::anyhow!("finalize identity: {error}"))?;
+        let actual: FinalizeIdentity = serde_json::from_str(&json)?;
+        anyhow::ensure!(&actual == expected, "finalize setup differs from source circuit/list identity");
+        Ok(())
     }
 
     pub fn prove_groth16(
@@ -292,6 +326,11 @@ impl SharedGroth16Wrapper {
         let wrapped_output = self.wrapped_circuit.prove(inner_proof)?;
         if let Some(path) = save_wrapped_data_path {
             wrapped_output.save(path)?;
+        }
+        if let Some(identity) = &self.finalize_identity {
+            let result = gnark_plonky2_verifier_ffi::generate_finalize_proof(&json(identity)?, &json(&wrapped_output.proof)?, &self.keystore_path)
+                .map_err(|error| anyhow::anyhow!("finalize proving: {error}"))?;
+            return Ok(serde_json::from_str(&result.proof_json)?);
         }
 
         let (proof_string, vk_string) = gnark_plonky2_verifier_ffi::generate_groth16_proof(
@@ -312,40 +351,77 @@ impl SharedGroth16Wrapper {
     }
 }
 
-fn bridge_wrap_public_inputs_keccak_bytes(public_inputs: &[F]) -> Vec<u8> {
-    public_inputs
-        .iter()
-        .enumerate()
-        .flat_map(|(i, x)| {
-            if (4..20).contains(&i) {
-                let paired_index = if i % 2 == 0 { i + 1 } else { i - 1 };
-                (public_inputs[paired_index].to_noncanonical_u64() as u32).to_be_bytes().to_vec()
-            } else {
-                x.to_noncanonical_u64().to_be_bytes().to_vec()
+fn bridge_wrap_public_inputs_keccak_bytes(public_inputs: &[F], chain_count: usize) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!((1..=256).contains(&chain_count) && public_inputs.len() == 26 + 9 * chain_count, "finalize public input width mismatch");
+    let mut bytes = Vec::with_capacity(144 + 72 * chain_count);
+    for (i, input) in public_inputs.iter().enumerate() {
+        let value = input.to_canonical_u64();
+        if (4..20).contains(&i) {
+            anyhow::ensure!(value <= u32::MAX as u64, "global root word exceeds u32");
+            let paired_index = if i % 2 == 0 { i + 1 } else { i - 1 };
+            let paired = u32::try_from(public_inputs[paired_index].to_canonical_u64())?;
+            bytes.extend_from_slice(&paired.to_be_bytes());
+        } else {
+            if i == 24 || i == 25 || (i >= 26 && (i - 26) % 9 == 4) {
+                anyhow::ensure!(value <= u32::MAX as u64, "finalize count exceeds u32");
             }
-        })
-        .collect()
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug)]
 pub struct BridgeWrapCircuit {
     pub wrapper: SimpleWrapperDynamic<C, D>,
+    configured_chain_indices: Vec<u8>,
 }
 
 impl BridgeWrapCircuit {
-    pub fn new(common_data: &CommonCircuitData<F, D>, fingerprint: QHashOut<F>, inner_verifier_data_cap_height: usize) -> Self {
-        Self {
-            wrapper: SimpleWrapperDynamic::<C, D>::new(
-                common_data,
-                fingerprint,
-                inner_verifier_data_cap_height,
-                |i| if i >= 4 && i < 20 { 32 } else { 64 },
-            ),
+    pub fn new(finalizer: &super::bridge_agg_final::BridgeAggFinalCircuit<C, D>) -> anyhow::Result<Self> {
+        let configured_chain_indices = finalizer.configured_chain_indices();
+        let common_data = &finalizer.circuit_data.common;
+        anyhow::ensure!((1..=256).contains(&configured_chain_indices.len()) && configured_chain_indices.windows(2).all(|pair| pair[0] < pair[1]), "invalid finalize chain list");
+        anyhow::ensure!(common_data.num_public_inputs == 26 + 9 * configured_chain_indices.len(), "finalize circuit width differs from chain list");
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let proof_target = builder.add_virtual_proof_with_pis(common_data);
+        let verifier_data_target = builder.add_virtual_verifier_data(finalizer.circuit_data.verifier_only.constants_sigmas_cap.height());
+        builder.verify_proof::<C>(&proof_target, &verifier_data_target, common_data);
+        let expected = builder.constant_hash(finalizer.fingerprint.0);
+        let actual = builder.get_circuit_fingerprint::<<C as plonky2::plonk::config::GenericConfig<D>>::Hasher>(&verifier_data_target);
+        builder.connect_hashes(expected, actual);
+        for (i, input) in proof_target.public_inputs.iter().enumerate() {
+            let narrow = (4..20).contains(&i);
+            let bits = builder.split_le(*input, if narrow { 32 } else { 64 });
+            if !narrow {
+                let low = builder.le_sum(bits[..32].iter());
+                let high = builder.le_sum(bits[32..].iter());
+                let max = builder.constant(F::from_canonical_u64(u32::MAX as u64));
+                let high_max = builder.is_equal(high, max);
+                let overflow = builder.mul(high_max.target, low);
+                builder.assert_zero(overflow);
+                if i == 24 || i == 25 || (i >= 26 && (i - 26) % 9 == 4) { builder.assert_zero(high); }
+            }
+            for bit in bits { builder.register_public_input(bit.target); }
         }
+        let circuit_data = builder.build::<C>();
+        let fingerprint = QHashOut(get_circuit_fingerprint_generic::<D, F, C>(&circuit_data.verifier_only));
+        Ok(Self {
+            wrapper: SimpleWrapperDynamic { proof_target, verifier_data_target, circuit_data, fingerprint },
+            configured_chain_indices: configured_chain_indices.to_vec(),
+        })
     }
 
     pub fn into_shared_groth16_wrapper(self, keystore_path: String) -> SharedGroth16Wrapper {
-        SharedGroth16Wrapper::new(self.wrapper.circuit_data, keystore_path)
+        let mut shared = SharedGroth16Wrapper::new(self.wrapper.circuit_data, keystore_path);
+        let final_data = &shared.wrapped_circuit.wrapper_circuit.data;
+        shared.finalize_identity = Some(FinalizeIdentity {
+            schema: 1,
+            chain_indices: self.configured_chain_indices,
+            final_common_json: json(&final_data.common).expect("final common data serialization"),
+            final_verifier_json: json(&final_data.verifier_only).expect("final verifier data serialization"),
+        });
+        shared
     }
 
     pub fn prove_groth16_with_shared_wrapper(
@@ -354,6 +430,8 @@ impl BridgeWrapCircuit {
         verifier_data: &VerifierOnlyCircuitData<C, D>,
         inner_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> anyhow::Result<UncompressedGroth16ProofData> {
+        anyhow::ensure!(shared_wrapper.finalize_identity.as_ref().map(|identity| identity.chain_indices.as_slice()) == Some(self.configured_chain_indices.as_slice()), "finalize wrapper chain list mismatch");
+        let flat_bytes = bridge_wrap_public_inputs_keccak_bytes(&inner_proof.public_inputs, self.configured_chain_indices.len())?;
         tracing::info!(
             "bridge_wrap pre-wrap PI count: {}",
             self.wrapper.circuit_data.common.num_public_inputs
@@ -365,7 +443,6 @@ impl BridgeWrapCircuit {
         );
         let public_inputs_hash = QHashOut::from_4_felts_slice(&inner_proof.public_inputs[20..24]);
 
-        let flat_bytes = bridge_wrap_public_inputs_keccak_bytes(&inner_proof.public_inputs);
         let mut keccak = tiny_keccak::Keccak::v256();
         let mut hash = [0u8; 32];
         tiny_keccak::Hasher::update(&mut keccak, &flat_bytes);
@@ -412,16 +489,15 @@ mod tests {
         let inputs = builder.add_virtual_target_arr::<12>();
         builder.register_public_inputs(&inputs);
         let source = builder.build::<C>();
-        let adapter = DigestBitsAdapter::build(DigestArtifact::A, &source.common, &source.verifier_only).unwrap();
         let mut wrong_width = source.common.clone();
         wrong_width.num_public_inputs = 26;
-        assert!(DigestBitsAdapter::build(DigestArtifact::A, &wrong_width, &source.verifier_only).is_err());
+        assert!(DigestBitsAdapter::build(DigestArtifact::DepositAggregate, &wrong_width, &source.verifier_only).is_err());
         let words = [0x80000001u32, 0xffffffff, 0, 0x01234567, 0x89abcdef, 1, 0xaaaaaaaa, 0x55555555];
-        let make_proof = |artifact: u64, high_word: bool| {
+        let make_proof = |prefix: [u64; 4], high_word: bool| {
             let mut witness = PartialWitness::new();
             for (index, target) in inputs.iter().enumerate() {
                 let value = match index {
-                    0 => 1, 1 => 11, 2 => artifact,
+                    0..=3 => prefix[index],
                     4 if high_word => 1u64 << 32,
                     4..=11 => u64::from(words[index - 4]),
                     _ => 0,
@@ -430,25 +506,62 @@ mod tests {
             }
             source.prove(witness).unwrap()
         };
-        let proof = adapter.prove(&make_proof(1, false)).unwrap();
         let expected: Vec<_> = words.iter().flat_map(|word| (0..32).rev().map(move |bit| F::from_canonical_u64(u64::from((word >> bit) & 1)))).collect();
-        assert_eq!(proof.public_inputs, expected);
-        adapter.circuit_data.verify(proof).unwrap();
-        assert!(adapter.prove(&make_proof(2, false)).is_err());
-        assert!(adapter.prove(&make_proof(1, true)).is_err());
-        let mut wrong_verifier = source.verifier_only.clone();
-        wrong_verifier.circuit_digest.elements[0] += F::ONE;
-        let wrong_adapter = DigestBitsAdapter::build(DigestArtifact::A, &source.common, &wrong_verifier).unwrap();
-        assert!(wrong_adapter.prove(&make_proof(1, false)).is_err());
+        for (artifact, prefix) in [
+            (DigestArtifact::DepositAggregate, [1, 11, 1, 0]),
+            (DigestArtifact::WithdrawalAggregate, [1, 7, 2, 0]),
+            (DigestArtifact::RewardAggregate, [1, 7, 3, 0]),
+        ] {
+            let adapter = DigestBitsAdapter::build(artifact, &source.common, &source.verifier_only).unwrap();
+            let proof = adapter.prove(&make_proof(prefix, false)).unwrap();
+            assert_eq!(proof.public_inputs, expected);
+            adapter.circuit_data.verify(proof).unwrap();
+            for index in 0..4 {
+                let mut wrong_prefix = prefix;
+                wrong_prefix[index] += 1;
+                assert!(adapter.prove(&make_proof(wrong_prefix, false)).is_err());
+            }
+            if artifact != DigestArtifact::DepositAggregate {
+                assert!(adapter.prove(&make_proof([1, 11, prefix[2], 0], false)).is_err());
+            }
+            assert!(adapter.prove(&make_proof(prefix, true)).is_err());
+            let mut wrong_verifier = source.verifier_only.clone();
+            wrong_verifier.circuit_digest.elements[0] += F::ONE;
+            let wrong_adapter = DigestBitsAdapter::build(artifact, &source.common, &wrong_verifier).unwrap();
+            assert!(wrong_adapter.prove(&make_proof(prefix, false)).is_err());
+        }
+    }
+
+    #[test]
+    fn digest_setup_identity_binds_family_and_source() {
+        use super::DigestBitsIdentity;
+        let mut identity = DigestBitsIdentity {
+            schema: 1, mode: "DigestBits".into(), artifact: 1,
+            node_source: "1".repeat(40), native_source: "2".repeat(40),
+            plonky2_source: "3".repeat(40), wrapper_source: "4".repeat(40),
+            normalizer_fingerprint: [1, 2, 3, 4], normalizer_common: "01".into(),
+            normalizer_verifier: "02".into(), final_common_json: "{}".into(), final_verifier_json: "{}".into(),
+        };
+        let mut hashes = std::collections::HashSet::new();
+        for artifact in [1, 2, 3] {
+            identity.artifact = artifact;
+            assert!(hashes.insert(identity.identity_hash().unwrap()));
+        }
+        let original = identity.identity_hash().unwrap();
+        identity.normalizer_verifier = "03".into();
+        assert_ne!(identity.identity_hash().unwrap(), original);
+        for artifact in [0, 4] {
+            identity.artifact = artifact;
+            assert!(identity.identity_hash().is_err());
+        }
     }
 
     #[test]
     fn bridge_wrap_keccak_bytes_pair_swap_tree_root_limbs() {
-        // Final PI width is 26: roots and checkpoint metadata (no l1_chain_index).
-        let public_inputs = (0u64..26)
+        let public_inputs = (0u64..44)
             .map(GoldilocksField::from_canonical_u64)
             .collect::<Vec<_>>();
-        let bytes = bridge_wrap_public_inputs_keccak_bytes(&public_inputs);
+        let bytes = bridge_wrap_public_inputs_keccak_bytes(&public_inputs, 2).unwrap();
 
         assert_eq!(&bytes[0..8], &0u64.to_be_bytes());
         assert_eq!(&bytes[8..16], &1u64.to_be_bytes());
@@ -470,6 +583,17 @@ mod tests {
         assert_eq!(&bytes[120..128], &23u64.to_be_bytes());
         assert_eq!(&bytes[128..136], &24u64.to_be_bytes());
         assert_eq!(&bytes[136..144], &25u64.to_be_bytes());
+        assert_eq!(bytes.len(), 144 + 72 * 2);
+        for (ordinal, value) in (26u64..44).enumerate() {
+            assert_eq!(&bytes[144 + ordinal * 8..152 + ordinal * 8], &value.to_be_bytes());
+        }
+        assert!(bridge_wrap_public_inputs_keccak_bytes(&public_inputs, 1).is_err());
+        assert!(bridge_wrap_public_inputs_keccak_bytes(&public_inputs[..26], 0).is_err());
+        for index in [4, 24, 25, 30, 39] {
+            let mut invalid = public_inputs.clone();
+            invalid[index] = GoldilocksField::from_canonical_u64(1u64 << 32);
+            assert!(bridge_wrap_public_inputs_keccak_bytes(&invalid, 2).is_err());
+        }
     }
 }
 

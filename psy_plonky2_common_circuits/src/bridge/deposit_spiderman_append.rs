@@ -17,7 +17,7 @@ use psy_plonky2_basic_helpers::builder::{
 use crate::hash::merkle::gadgets::spiderman_append_proof::SpidermanAppendProofGadget;
 use psy_client_data::bridge_aggregate::DepositLeaf;
 use super::aggregate_commitment::{
-    Bytes32Target, DepositLeafTarget, RecordTarget, U64Target, verify_deposit_record_path, word_address,
+    Bytes32Target, DepositLeafTarget, AggregateLeafTarget, U64Target, verify_deposit_leaf_path, word_address,
 };
 
 pub const DEPOSIT_SPIDERMAN_WEB_SIZE: usize = 32;
@@ -28,7 +28,7 @@ fn constrain_append<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     append: &SpidermanAppendProofGadget,
     old_count: Target,
-    record_count: Target,
+    leaf_count: Target,
     leaf_hashes: &[HashOutTarget; DEPOSIT_SPIDERMAN_WEB_SIZE],
 ) -> Target {
     let zero = builder.zero();
@@ -38,11 +38,11 @@ fn constrain_append<F: RichField + Extendable<D>, const D: usize>(
     let offset = builder.le_sum(old_bits[..5].iter());
     let top_index = builder.le_sum(old_bits[5..].iter());
     builder.connect(append.top_line_proof.index, top_index);
-    builder.range_check(record_count, 32);
-    builder.ensure_is_less_than_or_equal(32, one, record_count);
-    let web_end = builder.add(offset, record_count);
+    builder.range_check(leaf_count, 32);
+    builder.ensure_is_less_than_or_equal(32, one, leaf_count);
+    let web_end = builder.add(offset, leaf_count);
     builder.ensure_is_less_than_or_equal(32, web_end, web_size);
-    let new_count = builder.add(old_count, record_count);
+    let new_count = builder.add(old_count, leaf_count);
     builder.range_check(new_count, 32);
     let base = builder.sub(old_count, offset);
 
@@ -69,7 +69,7 @@ fn constrain_append<F: RichField + Extendable<D>, const D: usize>(
 
     for (i, leaf_hash) in leaf_hashes.iter().enumerate() {
         let ordinal = builder.constant(F::from_canonical_usize(i));
-        let active = builder.is_less_than(32, ordinal, record_count);
+        let active = builder.is_less_than(32, ordinal, leaf_count);
         let position = builder.add(offset, ordinal);
         let selected_position = builder.select(active, position, zero);
         for limb in 0..4 {
@@ -88,10 +88,10 @@ pub struct DepositSpidermanAppendInputs {
     pub end_checkpoint_root: QHashOut<GoldilocksField>,
     pub chain_index: u8,
     pub old_count: u32,
-    pub first_record: u32,
-    pub global_deposit_record_root: [u8; 32],
+    pub first_leaf: u32,
+    pub global_deposit_leaf_root: [u8; 32],
     pub global_deposit_count: u32,
-    pub record_paths: Vec<[[u8; 32]; 10]>,
+    pub leaf_paths: Vec<[[u8; 32]; 10]>,
     pub deposits: Vec<DepositLeaf>,
     pub append_proof: SpidermanUpdateProof<QHashOut<GoldilocksField>>,
 }
@@ -106,11 +106,11 @@ where C::Hasher: AlgebraicHasher<C::F> {
     pub chain_index: Target,
     pub old_count: Target,
     pub new_count: Target,
-    pub first_record: Target,
-    pub record_count: Target,
-    pub global_deposit_record_root: Bytes32Target,
+    pub first_leaf: Target,
+    pub leaf_count: Target,
+    pub global_deposit_leaf_root: Bytes32Target,
     pub global_deposit_count: Target,
-    pub record_paths: [[Bytes32Target; 10]; DEPOSIT_SPIDERMAN_WEB_SIZE],
+    pub leaf_paths: [[Bytes32Target; 10]; DEPOSIT_SPIDERMAN_WEB_SIZE],
     pub deposits: [DepositLeafTarget; DEPOSIT_SPIDERMAN_WEB_SIZE],
 }
 
@@ -127,23 +127,23 @@ where
         let end_checkpoint_root = builder.add_virtual_hash();
         let chain_index = builder.add_virtual_target();
         let old_count = builder.add_virtual_target();
-        let first_record = builder.add_virtual_target();
-        let record_count = builder.add_virtual_target();
-        let global_deposit_record_root: Bytes32Target = std::array::from_fn(|_| builder.add_virtual_target());
+        let first_leaf = builder.add_virtual_target();
+        let leaf_count = builder.add_virtual_target();
+        let global_deposit_leaf_root: Bytes32Target = std::array::from_fn(|_| builder.add_virtual_target());
         let global_deposit_count = builder.add_virtual_target();
         builder.range_check(global_deposit_count, 32);
         let maximum_count = builder.constant(C::F::from_canonical_u32(1024));
         builder.ensure_is_less_than_or_equal(32, global_deposit_count, maximum_count);
-        for target in global_deposit_record_root { builder.range_check(target, 32); }
-        let record_paths: [[Bytes32Target; 10]; DEPOSIT_SPIDERMAN_WEB_SIZE] = std::array::from_fn(|_| {
+        for target in global_deposit_leaf_root { builder.range_check(target, 32); }
+        let leaf_paths: [[Bytes32Target; 10]; DEPOSIT_SPIDERMAN_WEB_SIZE] = std::array::from_fn(|_| {
             std::array::from_fn(|_| std::array::from_fn(|_| builder.add_virtual_target()))
         });
-        for target in config_hash.into_iter().chain(end_checkpoint_id).chain([first_record]) {
+        for target in config_hash.into_iter().chain(end_checkpoint_id).chain([first_leaf]) {
             builder.range_check(target, 32);
         }
         builder.range_check(chain_index, 8);
-        let record_end = builder.add(first_record, record_count);
-        builder.range_check(record_end, 32);
+        let leaf_end = builder.add(first_leaf, leaf_count);
+        builder.range_check(leaf_end, 32);
         let append = SpidermanAppendProofGadget::add_virtual_to_allow_existing::<PoseidonHash, C::F, D>(
             &mut builder, DEPOSIT_SPIDERMAN_TOP_HEIGHT, 5,
         );
@@ -159,21 +159,21 @@ where
         let leaf_hashes = std::array::from_fn(|i| {
             let leaf = deposits[i];
             let ordinal = builder.constant(C::F::from_canonical_usize(i));
-            let active = builder.is_less_than(32, ordinal, record_count);
+            let active = builder.is_less_than(32, ordinal, leaf_count);
             let inactive = builder.not(active);
             let absolute_index = builder.add(old_count, ordinal);
             builder.connect_if_true(active, leaf.absolute_index, absolute_index);
             builder.connect_if_true(active, leaf.chain_index, chain_index);
-            let record = RecordTarget::Deposit(leaf);
-            for target in record.encode(&mut builder) {
+            let aggregate_leaf = AggregateLeafTarget::Deposit(leaf);
+            for target in aggregate_leaf.encode(&mut builder) {
                 builder.connect_zero_if_true(inactive, target);
             }
-            let commit = record.record_commit(&mut builder);
+            let commit = aggregate_leaf.leaf_commit(&mut builder);
             let zero = builder.zero();
             let commit = commit.map(|target| builder.select(active, target, zero));
-            let global_ordinal = builder.add(first_record, ordinal);
-            verify_deposit_record_path(&mut builder, active, global_deposit_record_root,
-                global_deposit_count, global_ordinal, commit, record_paths[i]);
+            let global_ordinal = builder.add(first_leaf, ordinal);
+            verify_deposit_leaf_path(&mut builder, active, global_deposit_leaf_root,
+                global_deposit_count, global_ordinal, commit, leaf_paths[i]);
             let mut words = Vec::with_capacity(41);
             words.extend(leaf.shield_address);
             words.extend(word_address(&mut builder, leaf.token));
@@ -183,7 +183,7 @@ where
             words.extend(leaf.note_commitment);
             builder.hash_n_to_hash_no_pad::<PoseidonHash>(words)
         });
-        let new_count = constrain_append(&mut builder, &append, old_count, record_count, &leaf_hashes);
+        let new_count = constrain_append(&mut builder, &append, old_count, leaf_count, &leaf_hashes);
         let prefix = [1, 1, 0, 0].map(|value| builder.constant(C::F::from_canonical_u32(value)));
         builder.register_public_inputs(&prefix);
         builder.register_public_inputs(&config_hash);
@@ -192,19 +192,19 @@ where
         builder.register_public_inputs(&[chain_index, old_count, new_count]);
         builder.register_public_inputs(&append.old_root.elements);
         builder.register_public_inputs(&append.new_root.elements);
-        builder.register_public_inputs(&[first_record, record_count]);
-        builder.register_public_inputs(&global_deposit_record_root);
+        builder.register_public_inputs(&[first_leaf, leaf_count]);
+        builder.register_public_inputs(&global_deposit_leaf_root);
         builder.register_public_input(global_deposit_count);
         let circuit_data = builder.build::<C>();
         assert_eq!(circuit_data.common.num_public_inputs, DEPOSIT_SPIDERMAN_PI_WORDS);
         Self { circuit_data, append, config_hash, end_checkpoint_id, end_checkpoint_root,
-            chain_index, old_count, new_count, first_record, record_count,
-            global_deposit_record_root, global_deposit_count, record_paths, deposits }
+            chain_index, old_count, new_count, first_leaf, leaf_count,
+            global_deposit_leaf_root, global_deposit_count, leaf_paths, deposits }
     }
 
     pub fn set_witness(&self, witness: &mut PartialWitness<C::F>, inputs: &DepositSpidermanAppendInputs) -> anyhow::Result<()> {
         anyhow::ensure!(inputs.deposits.len() <= DEPOSIT_SPIDERMAN_WEB_SIZE, "too many deposits");
-        anyhow::ensure!(inputs.record_paths.len() == inputs.deposits.len(), "one record path required per deposit");
+        anyhow::ensure!(inputs.leaf_paths.len() == inputs.deposits.len(), "one leaf path required per deposit");
         anyhow::ensure!(inputs.append_proof.top_line_proof.index == u64::from(inputs.old_count / 32),
             "deposit top index must equal old count divided by 32");
         anyhow::ensure!(inputs.append_proof.top_line_proof.siblings.len() == DEPOSIT_SPIDERMAN_TOP_HEIGHT,
@@ -213,11 +213,11 @@ where
             && inputs.append_proof.web_proof_new_leaves.len() == DEPOSIT_SPIDERMAN_WEB_SIZE,
             "deposit web must have 32 leaves");
         set_bytes(witness, &self.config_hash, &inputs.config_hash)?;
-        set_bytes(witness, &self.global_deposit_record_root, &inputs.global_deposit_record_root)?;
+        set_bytes(witness, &self.global_deposit_leaf_root, &inputs.global_deposit_leaf_root)?;
         witness.set_target(self.global_deposit_count, C::F::from_canonical_u32(inputs.global_deposit_count))?;
-        for (i, path) in self.record_paths.iter().enumerate() {
+        for (i, path) in self.leaf_paths.iter().enumerate() {
             for (level, sibling) in path.iter().enumerate() {
-                let bytes = inputs.record_paths.get(i).map(|path| path[level]).unwrap_or([0; 32]);
+                let bytes = inputs.leaf_paths.get(i).map(|path| path[level]).unwrap_or([0; 32]);
                 set_bytes(witness, sibling, &bytes)?;
             }
         }
@@ -226,8 +226,8 @@ where
         witness.set_hash_target(self.end_checkpoint_root, inputs.end_checkpoint_root.0)?;
         witness.set_target(self.chain_index, C::F::from_canonical_u32(inputs.chain_index as u32))?;
         witness.set_target(self.old_count, C::F::from_canonical_u32(inputs.old_count))?;
-        witness.set_target(self.first_record, C::F::from_canonical_u32(inputs.first_record))?;
-        witness.set_target(self.record_count, C::F::from_canonical_usize(inputs.deposits.len()))?;
+        witness.set_target(self.first_leaf, C::F::from_canonical_u32(inputs.first_leaf))?;
+        witness.set_target(self.leaf_count, C::F::from_canonical_usize(inputs.deposits.len()))?;
         self.append.set_witness(witness, &inputs.append_proof)?;
         witness.set_hash_target(self.append.old_root, inputs.append_proof.top_line_proof.old_root.0)?;
         witness.set_hash_target(self.append.new_root, inputs.append_proof.top_line_proof.new_root.0)?;
@@ -277,7 +277,7 @@ mod tests {
         pgoldilocks::PoseidonHasher,
     };
     use plonky2::{field::types::PrimeField64, plonk::config::{Hasher, PoseidonGoldilocksConfig}};
-    use psy_client_data::bridge_aggregate::{deposit_record_tree, deposit_record_path};
+    use psy_client_data::bridge_aggregate::{deposit_leaf_tree, deposit_leaf_path};
 
     type F = GoldilocksField;
     type C = PoseidonGoldilocksConfig;
@@ -309,7 +309,7 @@ mod tests {
         inputs_at(old_count, count, 97)
     }
 
-    fn inputs_at(old_count: u32, count: usize, first_record: u32) -> DepositSpidermanAppendInputs {
+    fn inputs_at(old_count: u32, count: usize, first_leaf: u32) -> DepositSpidermanAppendInputs {
         let deposits: Vec<_> = (0..count).map(|i| DepositLeaf {
             chain_index: 7,
             absolute_index: old_count.checked_add(i as u32).unwrap(),
@@ -328,23 +328,23 @@ mod tests {
         let old_value = PoseidonHasher::compute_root_from_leaves(&old_leaves).unwrap();
         let new_value = PoseidonHasher::compute_root_from_leaves(&new_leaves).unwrap();
         let siblings = (5..32).map(PoseidonHasher::get_zero_hash).collect();
-        let mut global_records: Vec<_> = (0..first_record).map(|index| DepositLeaf {
+        let mut global_leaves: Vec<_> = (0..first_leaf).map(|index| DepositLeaf {
             chain_index: 1, absolute_index: index, shield_address: [0x11; 32],
             token: [0x22; 20], l2_token_contract_id: [0x33; 32], amount: [0x44; 32],
             note_commitment: [0x66; 32],
         }).collect();
-        global_records.extend(deposits.iter().cloned());
-        let commits: Vec<_> = global_records.iter().map(|leaf| leaf.record_commit().unwrap()).collect();
+        global_leaves.extend(deposits.iter().cloned());
+        let commits: Vec<_> = global_leaves.iter().map(|leaf| leaf.leaf_commit().unwrap()).collect();
         let global_deposit_count = commits.len() as u32;
-        let tree = deposit_record_tree(&commits).unwrap();
-        let record_paths = (0..count).map(|i| {
-            deposit_record_path(&tree, global_deposit_count, first_record + i as u32).unwrap()
+        let tree = deposit_leaf_tree(&commits).unwrap();
+        let leaf_paths = (0..count).map(|i| {
+            deposit_leaf_path(&tree, global_deposit_count, first_leaf + i as u32).unwrap()
         }).collect();
         DepositSpidermanAppendInputs {
             config_hash: [0x55; 32], end_checkpoint_id: (1u64 << 40) + 7,
             end_checkpoint_root: QHashOut(PoseidonHash::hash_no_pad(&[F::ONE])),
-            chain_index: 7, old_count, first_record, deposits,
-            global_deposit_record_root: tree[0], global_deposit_count, record_paths,
+            chain_index: 7, old_count, first_leaf, deposits,
+            global_deposit_leaf_root: tree[0], global_deposit_count, leaf_paths,
             append_proof: SpidermanUpdateProof {
                 top_line_proof: DeltaMerkleProofCore::from_params::<PoseidonHasher>(
                     (old_count / 32) as u64, old_value, new_value, siblings,
@@ -378,7 +378,7 @@ mod tests {
             assert_eq!(pi[29].to_canonical_u64(), 97);
             assert_eq!(pi[30].to_canonical_u64(), count as u64);
             assert_eq!(pi[39].to_canonical_u64(), input.global_deposit_count as u64);
-            for (actual, expected) in pi[31..39].iter().zip(input.global_deposit_record_root.chunks_exact(4)) {
+            for (actual, expected) in pi[31..39].iter().zip(input.global_deposit_leaf_root.chunks_exact(4)) {
                 assert_eq!(actual.to_canonical_u64(), u32::from_be_bytes(expected.try_into().unwrap()) as u64);
             }
             circuit.verify(proof.clone()).unwrap();
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(proof.public_inputs[39].to_canonical_u64(), 1024);
         circuit.verify(proof).unwrap();
         let mut wrong_global_root = inputs(0, 1);
-        wrong_global_root.global_deposit_record_root[0] ^= 1;
+        wrong_global_root.global_deposit_leaf_root[0] ^= 1;
         reject(&circuit, &wrong_global_root);
         let mut wrong_global_count = inputs(0, 1);
         wrong_global_count.global_deposit_count += 1;
@@ -404,13 +404,13 @@ mod tests {
         oversized_global_count.global_deposit_count = 1025;
         reject(&circuit, &oversized_global_count);
         let mut wrong_global_ordinal = inputs(0, 1);
-        wrong_global_ordinal.first_record -= 1;
+        wrong_global_ordinal.first_leaf -= 1;
         reject(&circuit, &wrong_global_ordinal);
         let mut wrong_record_path = inputs(0, 1);
-        wrong_record_path.record_paths[0][0][0] ^= 1;
+        wrong_record_path.leaf_paths[0][0][0] ^= 1;
         reject(&circuit, &wrong_record_path);
         let mut reordered_paths = inputs(0, 2);
-        reordered_paths.record_paths.swap(0, 1);
+        reordered_paths.leaf_paths.swap(0, 1);
         reject(&circuit, &reordered_paths);
         let mut unmatched_global_record = inputs(0, 1);
         unmatched_global_record.deposits[0].amount[31] ^= 1;

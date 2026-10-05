@@ -60,7 +60,12 @@ enum Commands {
     /// Initialize keystore (generate or load Groth16 proving/verification keys)
     Initialize { keystore_dir: String },
     /// Export Solidity verifier contract from an initialized keystore.
-    ExportSolidityVerifier { keystore_dir: String, out_verifier_sol: String },
+    ExportSolidityVerifier {
+        keystore_dir: String,
+        out_verifier_sol: String,
+        #[arg(long)]
+        finalize: bool,
+    },
     /// Scan L2 withdrawal events and propose them to the withdrawal tree.
     ProposeWithdrawals(bridge::propose_withdrawals::ProposeWithdrawalsArgs),
     /// Prove BridgeAgg + BridgeWrap pipeline.
@@ -73,6 +78,8 @@ enum Commands {
         rpc_config: String,
         #[arg(long, default_value = bridge::constants::DEFAULT_DEPLOYMENTS_NETWORK)]
         deployments_network: String,
+        #[arg(long)]
+        aggregate_config: PathBuf,
         #[arg(long)]
         out: PathBuf,
     },
@@ -222,11 +229,15 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Initialization complete");
             Ok(())
         }
-        Some(Commands::ExportSolidityVerifier { keystore_dir, out_verifier_sol }) => {
+        Some(Commands::ExportSolidityVerifier { keystore_dir, out_verifier_sol, finalize }) => {
             if keystore_dir.is_empty() {
                 anyhow::bail!("keystore_dir cannot be empty");
             }
-            let sol = g16::export_solidity_verifier(&keystore_dir);
+            let sol = if finalize {
+                g16::export_finalize_verifier(&keystore_dir).map_err(|error| anyhow::anyhow!("finalize export failed: {error}"))?
+            } else {
+                g16::export_solidity_verifier(&keystore_dir)
+            };
             if sol.trim_start().starts_with("error:") {
                 anyhow::bail!("export solidity verifier failed for {}: {}", keystore_dir, sol.trim());
             }
@@ -247,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
             to_checkpoint,
             rpc_config,
             deployments_network,
+            aggregate_config,
             out,
         }) => {
             bridge::prove_bridge::run_prove_bridge_agg_with_result(
@@ -255,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
                 rpc_config,
                 out,
                 deployments_network,
+                aggregate_config,
             )
             .await
             .map(|_| ())

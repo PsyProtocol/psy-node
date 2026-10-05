@@ -145,14 +145,15 @@ impl ClaimDisposition {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum AggregationDispositions {
-    Included { context_id: String, statement_b: String, opening: String, claim_ids: Vec<String> },
-    Disposed { statement_b: String, opening: String, dispositions: Vec<ClaimDisposition> },
+    Included { context_id: String, family: u8, opening_digest: String, opening: String, claim_ids: Vec<String> },
+    Disposed { family: u8, opening_digest: String, opening: String, dispositions: Vec<ClaimDisposition> },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AggregationAcknowledgment {
-    pub statement_b: String,
+    pub family: u8,
+    pub opening_digest: String,
     pub acknowledged_claim_ids: Vec<String>,
 }
 
@@ -394,12 +395,12 @@ pub async fn post_aggregation_dispositions(
     http: &reqwest::Client, services_url: &str, token_file: &std::path::Path,
     request: &AggregationDispositions,
 ) -> Result<AggregationAcknowledgment, AggregationHttpError> {
-    let (statement, opening, ids): (&str, &str, Vec<&str>) = match request {
-        AggregationDispositions::Included { context_id, statement_b, opening, claim_ids } => {
+    let (family, posted_opening_digest, opening, ids): (u8, &str, &str, Vec<&str>) = match request {
+        AggregationDispositions::Included { context_id, family, opening_digest, opening, claim_ids } => {
             if !aggregation_hex(context_id) { return Err(AggregationHttpError::InvalidRequest); }
-            (statement_b, opening, claim_ids.iter().map(String::as_str).collect())
+            (*family, opening_digest.as_str(), opening, claim_ids.iter().map(String::as_str).collect())
         }
-        AggregationDispositions::Disposed { statement_b, opening, dispositions } => {
+        AggregationDispositions::Disposed { family, opening_digest, opening, dispositions } => {
             for disposition in dispositions {
                 let valid = match disposition {
                     ClaimDisposition::Applied { receipt, .. } => aggregation_hex(&receipt.transaction_hash) && aggregation_decimal(&receipt.log_index).is_some(),
@@ -408,17 +409,21 @@ pub async fn post_aggregation_dispositions(
                 };
                 if !valid { return Err(AggregationHttpError::InvalidRequest); }
             }
-            (statement_b, opening, dispositions.iter().map(ClaimDisposition::claim_id).collect())
+            (*family, opening_digest.as_str(), opening, dispositions.iter().map(ClaimDisposition::claim_id).collect())
         }
     };
-    if !aggregation_hex(statement) || ids.len() > 2048 || ids.iter().any(|id| !aggregation_hex(id))
+    if !matches!(family, 2 | 3) || !aggregation_hex(posted_opening_digest) || ids.len() > 1024 || ids.iter().any(|id| !aggregation_hex(id))
         || ids.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != ids.len() {
         return Err(AggregationHttpError::InvalidRequest);
     }
     let bytes = decode_aggregation_base64(opening, AGGREGATION_BODY_LIMIT)?;
-    psy_client_data::bridge_aggregate::BOpening::decode(&bytes).map_err(|_| AggregationHttpError::InvalidRequest)?;
+    match family {
+        2 => { psy_client_data::bridge_aggregate::WithdrawalAggregateOpening::decode(&bytes).map_err(|_| AggregationHttpError::InvalidRequest)?; }
+        3 => { psy_client_data::bridge_aggregate::RewardAggregateOpening::decode(&bytes).map_err(|_| AggregationHttpError::InvalidRequest)?; }
+        _ => return Err(AggregationHttpError::InvalidRequest),
+    }
     let acknowledgment: AggregationAcknowledgment = aggregation_http(http.post(aggregation_url(services_url, "dispositions")?), token_file, Some(request)).await?;
-    if acknowledgment.statement_b != statement || !acknowledgment.acknowledged_claim_ids.iter().map(String::as_str).eq(ids) {
+    if acknowledgment.family != family || acknowledgment.opening_digest != posted_opening_digest || !acknowledgment.acknowledged_claim_ids.iter().map(String::as_str).eq(ids) {
         return Err(AggregationHttpError::InvalidResponse);
     }
     Ok(acknowledgment)

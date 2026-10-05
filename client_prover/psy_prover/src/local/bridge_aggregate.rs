@@ -44,7 +44,8 @@ pub struct ClaimStatus {
     pub claim_id: String,
     pub state: String,
     pub context_id: String,
-    pub statement_b: Option<String>,
+    pub family: u8,
+    pub opening_digest: Option<String>,
     pub error_code: Option<String>,
     pub current_context: Option<AggregationContext>,
 }
@@ -436,8 +437,8 @@ pub async fn prove_aggregate_reward(session: &crate::session::WalletSession, pub
 }
 
 impl ClaimClient {
-    pub fn validate_status(&self, context: &AggregationContext, claim_id: &str, status: &ClaimStatus) -> Result<()> {
-        anyhow::ensure!(status.claim_id == claim_id, "claim status identity mismatch");
+    pub fn validate_status(&self, context: &AggregationContext, claim_id: &str, family: u8, status: &ClaimStatus) -> Result<()> {
+        anyhow::ensure!(status.claim_id == claim_id && matches!(family, 2 | 3) && status.family == family, "claim status identity/family mismatch");
         hex32(&status.context_id)?;
         if status.state == "queued" { anyhow::ensure!(status.context_id == context.context_id, "queued proof context mismatch"); }
         match status.state.as_str() {
@@ -446,8 +447,8 @@ impl ClaimClient {
             "queued" | "included" | "applied" => anyhow::ensure!(status.current_context.is_none() && status.error_code.is_none(), "invalid claim status fields"),
             _ => return Err(ClaimError::InvalidResponse("unknown claim state").into()),
         }
-        if status.state != "queued" { hex32(status.statement_b.as_deref().context("included/applied requires statementB")?)?; }
-        else { anyhow::ensure!(status.statement_b.is_none(), "queued claim has statementB"); }
+        if status.state != "queued" { hex32(status.opening_digest.as_deref().context("included/applied requires openingDigest")?)?; }
+        else { anyhow::ensure!(status.opening_digest.is_none(), "queued claim has openingDigest"); }
         Ok(())
     }
 }

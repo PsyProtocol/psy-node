@@ -12,7 +12,7 @@ use plonky2::{
 use psy_client_data::bridge_aggregate::{WithdrawalLeaf, BRIDGE_USER_ID, GOLDILOCKS_MODULUS};
 use psy_plonky2_basic_helpers::builder::comparison::CircuitBuilderComparison;
 
-use super::aggregate_commitment::{Bytes32Target, RecordTarget, U64Target, WithdrawalLeafTarget};
+use super::aggregate_commitment::{Bytes32Target, AggregateLeafTarget, U64Target, WithdrawalLeafTarget};
 use crate::hash::merkle::gadgets::merkle_proof::{MerkleProofGadget, OptionalMerkleProofGadget};
 
 pub const WITHDRAWAL_INCLUSION_PUBLIC_INPUTS: usize = 32;
@@ -44,8 +44,8 @@ where
     pub end_checkpoint_id: U64Target,
     pub end_checkpoint_root: HashOutTarget,
     pub withdrawal_root: HashOutTarget,
-    pub record: WithdrawalLeafTarget,
-    pub record_commit: Bytes32Target,
+    pub leaf: WithdrawalLeafTarget,
+    pub leaf_commit: Bytes32Target,
     pub merkle_proof: MerkleProofGadget,
 }
 
@@ -63,7 +63,7 @@ where
         let end_checkpoint_id: U64Target = builder.add_virtual_target_arr();
         let end_checkpoint_root = builder.add_virtual_hash();
         let withdrawal_root = builder.add_virtual_hash();
-        let record = WithdrawalLeafTarget {
+        let leaf = WithdrawalLeafTarget {
             chain_index: builder.add_virtual_target(),
             sender_user_id: builder.add_virtual_target(),
             recipient: builder.add_virtual_target_arr(),
@@ -75,24 +75,24 @@ where
             builder.range_check(*target, 32);
         }
         let zero = builder.zero();
-        for target in &record.amount[..6] { builder.connect(*target, zero); }
+        for target in &leaf.amount[..6] { builder.connect(*target, zero); }
         // p - 1 = 0xffffffff00000000: the maximal high limb requires a zero low limb.
         let max_u32 = builder.constant(GoldilocksField::from_canonical_u32(u32::MAX));
-        let max_high = builder.is_equal(record.amount[6], max_u32);
-        let excess = builder.mul(max_high.target, record.amount[7]);
+        let max_high = builder.is_equal(leaf.amount[6], max_u32);
+        let excess = builder.mul(max_high.target, leaf.amount[7]);
         builder.assert_zero(excess);
-        let amount_sum = builder.add(record.amount[6], record.amount[7]);
+        let amount_sum = builder.add(leaf.amount[6], leaf.amount[7]);
         builder.assert_non_zero(amount_sum);
-        let recipient_sum = builder.add_many(record.recipient);
+        let recipient_sum = builder.add_many(leaf.recipient);
         builder.assert_non_zero(recipient_sum);
 
-        let record_commit = RecordTarget::Withdrawal(record).record_commit(&mut builder);
-        // Preserve the existing batch circuit's 34-field source order, not wire order.
-        let source_words: Vec<Target> = std::iter::once(record.sender_user_id)
-            .chain([zero; 3]).chain(record.recipient)
-            .chain([zero; 3]).chain(record.token)
-            .chain(record.amount).chain(record.nonce)
-            .chain(std::iter::once(record.chain_index)).collect();
+        let leaf_commit = AggregateLeafTarget::Withdrawal(leaf).leaf_commit(&mut builder);
+        // Preserve the existing aggregate circuit's 34-field source order, not wire order.
+        let source_words: Vec<Target> = std::iter::once(leaf.sender_user_id)
+            .chain([zero; 3]).chain(leaf.recipient)
+            .chain([zero; 3]).chain(leaf.token)
+            .chain(leaf.amount).chain(leaf.nonce)
+            .chain(std::iter::once(leaf.chain_index)).collect();
         let leaf_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(source_words);
         let merkle_proof = MerkleProofGadget::add_virtual_to_with_options::<
             PoseidonHash, GoldilocksField, D,
@@ -106,12 +106,12 @@ where
         builder.register_public_inputs(&config_hash);
         builder.register_public_inputs(&end_checkpoint_id);
         builder.register_public_inputs(&end_checkpoint_root.elements);
-        builder.register_public_inputs(&[bridge_user, record.chain_index]);
+        builder.register_public_inputs(&[bridge_user, leaf.chain_index]);
         builder.register_public_inputs(&withdrawal_root.elements);
-        builder.register_public_inputs(&record_commit);
+        builder.register_public_inputs(&leaf_commit);
         let circuit_data = builder.build::<C>();
         Self { circuit_data, config_hash, end_checkpoint_id, end_checkpoint_root,
-            withdrawal_root, record, record_commit, merkle_proof }
+            withdrawal_root, leaf, leaf_commit, merkle_proof }
     }
 
     pub fn set_witness(
@@ -122,12 +122,12 @@ where
         pw.set_target(self.end_checkpoint_id[1], GoldilocksField::from_canonical_u32((inputs.end_checkpoint_id >> 32) as u32))?;
         set_hash(pw, self.end_checkpoint_root, inputs.end_checkpoint_root)?;
         set_hash(pw, self.withdrawal_root, inputs.withdrawal_root)?;
-        pw.set_target(self.record.chain_index, GoldilocksField::from_canonical_u32(inputs.leaf.chain_index as u32))?;
-        pw.set_target(self.record.sender_user_id, GoldilocksField::from_canonical_u32(inputs.leaf.sender_user_id))?;
-        set_bytes(pw, &self.record.recipient, &inputs.leaf.recipient)?;
-        set_bytes(pw, &self.record.token, &inputs.leaf.token)?;
-        set_bytes(pw, &self.record.amount, &inputs.leaf.amount)?;
-        set_bytes(pw, &self.record.nonce, &inputs.leaf.nonce)?;
+        pw.set_target(self.leaf.chain_index, GoldilocksField::from_canonical_u32(inputs.leaf.chain_index as u32))?;
+        pw.set_target(self.leaf.sender_user_id, GoldilocksField::from_canonical_u32(inputs.leaf.sender_user_id))?;
+        set_bytes(pw, &self.leaf.recipient, &inputs.leaf.recipient)?;
+        set_bytes(pw, &self.leaf.token, &inputs.leaf.token)?;
+        set_bytes(pw, &self.leaf.amount, &inputs.leaf.amount)?;
+        set_bytes(pw, &self.leaf.nonce, &inputs.leaf.nonce)?;
         pw.set_target(self.merkle_proof.index, GoldilocksField::from_canonical_u32(inputs.witness.leaf_index))?;
         for (target, hash) in self.merkle_proof.siblings.iter().zip(inputs.witness.siblings) {
             set_hash(pw, *target, hash)?;
@@ -226,7 +226,7 @@ mod tests {
         digest
     }
 
-    fn record_commit(leaf: &WithdrawalLeaf) -> [u8; 32] {
+    fn leaf_commit(leaf: &WithdrawalLeaf) -> [u8; 32] {
         let mut body = keccak(b"PsyBridge/TwoArtifact/1/Record").to_vec();
         for integer in [2, leaf.chain_index as u32, leaf.sender_user_id] {
             body.extend([0; 28]);
@@ -260,10 +260,10 @@ mod tests {
         expected.extend(inputs.end_checkpoint_root);
         expected.extend([BRIDGE_USER_ID as u64, inputs.leaf.chain_index as u64]);
         expected.extend(inputs.withdrawal_root);
-        expected.extend(record_commit(&inputs.leaf).chunks_exact(4).map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as u64));
+        expected.extend(leaf_commit(&inputs.leaf).chunks_exact(4).map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as u64));
         assert_eq!(proof.public_inputs.len(), WITHDRAWAL_INCLUSION_PUBLIC_INPUTS);
         assert_eq!(proof.public_inputs.iter().map(|value| value.to_canonical_u64()).collect::<Vec<_>>(), expected);
-        assert_eq!(record_commit(&inputs.leaf), inputs.leaf.record_commit().unwrap());
+        assert_eq!(leaf_commit(&inputs.leaf), inputs.leaf.leaf_commit().unwrap());
         circuit.verify_proof(proof.clone()).unwrap();
         for offset in [0, 1, 2, 3, 4, 12, 14, 18, 19, 20, 24] {
             let mut changed = proof.clone();
@@ -289,9 +289,9 @@ mod tests {
         }
         let mut pw = PartialWitness::new();
         circuit.set_witness(&mut pw, &inputs).unwrap();
-        let mut wrong_commit = record_commit(&inputs.leaf);
+        let mut wrong_commit = leaf_commit(&inputs.leaf);
         wrong_commit[0] ^= 1;
-        set_bytes(&mut pw, &circuit.record_commit, &wrong_commit).unwrap();
+        set_bytes(&mut pw, &circuit.leaf_commit, &wrong_commit).unwrap();
         rejects(&circuit, pw);
     }
 
@@ -326,9 +326,9 @@ mod tests {
         }
         for (target, value) in [
             (circuit.merkle_proof.index, 1u64 << 32),
-            (circuit.record.sender_user_id, 1u64 << 32),
-            (circuit.record.chain_index, 256),
-            (circuit.record.recipient[0], 1u64 << 32),
+            (circuit.leaf.sender_user_id, 1u64 << 32),
+            (circuit.leaf.chain_index, 256),
+            (circuit.leaf.recipient[0], 1u64 << 32),
         ] {
             let mut pw = PartialWitness::new();
             circuit.set_witness(&mut pw, &inputs).unwrap();

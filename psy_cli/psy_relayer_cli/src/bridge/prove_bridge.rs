@@ -17,7 +17,7 @@ use psy_data::{
     v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafCompact},
 };
 use serde::Deserialize;
-use crate::bridge::prove_proxy_client::{BridgeAggCheckpointLeaf, BridgeAggDeltaProof, BridgeAggSlotWitness, BridgeDepositBatchGroth16Proof, BridgeDepositBatchWitnessInput, BridgeDepositLeafInput as ProxyDepositLeafInput, ProveProxyClient};
+use crate::bridge::prove_proxy_client::{BridgeDepositBatchGroth16Proof, BridgeDepositBatchWitnessInput, BridgeDepositLeafInput as ProxyDepositLeafInput, ProveProxyClient};
 use psy_plonky2_circuits::{
     bridge::{
         circuits::{
@@ -48,8 +48,8 @@ use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::{
 };
 use psy_provider::provider::RpcProvider;
 use serde::Serialize;
-use psy_client_data::bridge_aggregate::{AOpening, BOpening, NetworkConfig, DepositLeaf, DepositRecordRange, ChainEnd, deposit_record_tree, deposit_record_path, chain_ends_hash, domain_hash, Domain};
-use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow, DepositRangeEndpoints}, checkpoint_end::CheckpointEndWitness, record_batch::{BatchContext, BatchRecords, WithdrawalBatchRecord, RewardBatchRecord, WithdrawalEndWitness}}};
+use psy_client_data::bridge_aggregate::{DepositAggregateOpening, WithdrawalAggregateOpening, RewardAggregateOpening, NetworkConfig, DepositLeaf, DepositLeafRange, deposit_leaf_tree, deposit_leaf_path};
+use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow}, inclusion_aggregate::{AggregateWindow, AggregateLeaves, WithdrawalAggregateLeaf, RewardAggregateLeaf, withdrawal_root_paths}}};
 use psy_plonky2_common_circuits::bridge::deposit_spiderman_append::DepositSpidermanAppendInputs;
 use parth_core::{pgoldilocks::PoseidonHasher, crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, MerkleZeroHasher}}};
 
@@ -76,7 +76,7 @@ const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
 const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
     psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 
-fn deposit_custody_hash(record: &DepositLeaf) -> QHashOut<F> {
+fn deposit_leaf_hash(record: &DepositLeaf) -> QHashOut<F> {
     let mut words = Vec::with_capacity(41);
     for bytes in [record.shield_address, U256::from_be_slice(&record.token).to_be_bytes::<32>(), record.l2_token_contract_id, record.amount] {
         words.extend(bytes.chunks_exact(4).map(|word| F::from_canonical_u32(u32::from_be_bytes(word.try_into().unwrap()))));
@@ -86,7 +86,7 @@ fn deposit_custody_hash(record: &DepositLeaf) -> QHashOut<F> {
     PoseidonHasher::q_hash_many(&words)
 }
 
-fn append_custody_leaf(frontier: &mut [QHashOut<F>; 32], index: u32, leaf: QHashOut<F>) -> QHashOut<F> {
+fn append_deposit_leaf(frontier: &mut [QHashOut<F>; 32], index: u32, leaf: QHashOut<F>) -> QHashOut<F> {
     let mut current = leaf;
     let mut zero = QHashOut::ZERO;
     for (level, left) in frontier.iter_mut().enumerate() {
@@ -97,10 +97,10 @@ fn append_custody_leaf(frontier: &mut [QHashOut<F>; 32], index: u32, leaf: QHash
     current
 }
 
-pub(crate) fn build_deposit_spiderman_inputs(config: &NetworkConfig, opening: &AOpening, deposit_prefixes: &[Vec<DepositLeaf>]) -> anyhow::Result<Vec<Vec<DepositSpidermanAppendInputs>>> {
+pub(crate) fn build_deposit_spiderman_inputs(config: &NetworkConfig, opening: &DepositAggregateOpening, deposit_prefixes: &[Vec<DepositLeaf>]) -> anyhow::Result<Vec<Vec<DepositSpidermanAppendInputs>>> {
     opening.validate(config)?;
-    anyhow::ensure!(deposit_prefixes.len() == config.chains.len(), "one custody prefix per configured chain required");
-    let tree = deposit_record_tree(&opening.deposit_leaves.iter().map(DepositLeaf::record_commit).collect::<Result<Vec<_>, _>>()?)?;
+    anyhow::ensure!(deposit_prefixes.len() == config.chains.len(), "one deposit prefix per configured chain required");
+    let tree = deposit_leaf_tree(&opening.deposit_leaves.iter().map(DepositLeaf::leaf_commit).collect::<Result<Vec<_>, _>>()?)?;
     let count = opening.deposit_leaves.len() as u32;
     let mut first_record = 0u32;
     let mut chains = Vec::with_capacity(config.chains.len());
@@ -108,28 +108,28 @@ pub(crate) fn build_deposit_spiderman_inputs(config: &NetworkConfig, opening: &A
         let transition = &opening.deposits[ordinal];
         let mut inputs = Vec::new();
         if transition.old_count == transition.new_count {
-            anyhow::ensure!(prefix.is_empty(), "no-op chain must not supply a custody prefix");
+            anyhow::ensure!(prefix.is_empty(), "no-op chain must not supply a deposit prefix");
             chains.push(inputs);
             continue;
         }
-        anyhow::ensure!(prefix.len() == transition.new_count as usize, "incomplete custody prefix");
+        anyhow::ensure!(prefix.len() == transition.new_count as usize, "incomplete deposit prefix");
         let records = transition.new_count - transition.old_count;
-        anyhow::ensure!(prefix[transition.old_count as usize..] == opening.deposit_leaves[first_record as usize..(first_record + records) as usize], "custody suffix differs from opening");
+        anyhow::ensure!(prefix[transition.old_count as usize..] == opening.deposit_leaves[first_record as usize..(first_record + records) as usize], "deposit suffix differs from opening");
         let mut frontier = [QHashOut::ZERO; 32];
         let mut root = PoseidonHasher::get_zero_hash(32);
         let mut web = Vec::with_capacity(32);
         let mut cursor = 0u32;
         while cursor < transition.new_count {
             if cursor == transition.old_count {
-                anyhow::ensure!(root.0.elements.map(|value| value.to_canonical_u64()) == transition.old_root, "old custody root mismatch");
+                anyhow::ensure!(root.0.elements.map(|value| value.to_canonical_u64()) == transition.old_root, "old deposit-tree root mismatch");
             }
             let end = if cursor < transition.old_count { transition.old_count.min(cursor.saturating_add(32 - cursor % 32)) }
                 else { transition.new_count.min(cursor.saturating_add(32 - cursor % 32)) };
             let mut hashes = Vec::with_capacity((end - cursor) as usize);
             for index in cursor..end {
                 let record = &prefix[index as usize];
-                anyhow::ensure!(record.chain_index == transition.chain_index && record.absolute_index == index, "custody prefix is not consecutive");
-                hashes.push(deposit_custody_hash(record));
+                anyhow::ensure!(record.chain_index == transition.chain_index && record.absolute_index == index, "deposit prefix is not consecutive");
+                hashes.push(deposit_leaf_hash(record));
             }
             let append = if cursor >= transition.old_count {
                 let mut zero = QHashOut::ZERO;
@@ -139,19 +139,19 @@ pub(crate) fn build_deposit_spiderman_inputs(config: &NetworkConfig, opening: &A
                     sibling
                 }).collect();
                 let path = MerkleProofCore { root, value: QHashOut::ZERO, index: u64::from(cursor), siblings };
-                anyhow::ensure!(web.len() == (cursor % 32) as usize && web.len() + hashes.len() <= 32, "invalid custody web boundary");
+                anyhow::ensure!(web.len() == (cursor % 32) as usize && web.len() + hashes.len() <= 32, "invalid deposit web boundary");
                 Some(SpidermanUpdateProof::append_from_from_old_new_values::<PoseidonHasher>(&path, &web, &hashes, 5))
             } else { None };
             let old_root = root;
-            for (offset, hash) in hashes.iter().enumerate() { root = append_custody_leaf(&mut frontier, cursor + offset as u32, *hash); }
+            for (offset, hash) in hashes.iter().enumerate() { root = append_deposit_leaf(&mut frontier, cursor + offset as u32, *hash); }
             if let Some(append_proof) = append {
-                anyhow::ensure!(append_proof.top_line_proof.old_root == old_root && append_proof.top_line_proof.new_root == root, "custody web root mismatch");
+                anyhow::ensure!(append_proof.top_line_proof.old_root == old_root && append_proof.top_line_proof.new_root == root, "deposit web root mismatch");
                 inputs.push(DepositSpidermanAppendInputs {
                     config_hash: opening.config_hash, end_checkpoint_id: opening.end_checkpoint_id,
                     end_checkpoint_root: QHashOut(HashOut { elements: opening.end_checkpoint_root.map(F::from_canonical_u64) }),
-                    chain_index: transition.chain_index, old_count: cursor, first_record,
-                    global_deposit_record_root: tree[0], global_deposit_count: count,
-                    record_paths: (first_record..first_record + (end - cursor)).map(|index| deposit_record_path(&tree, count, index)).collect::<Result<Vec<_>, _>>()?,
+                    chain_index: transition.chain_index, old_count: cursor, first_leaf: first_record,
+                    global_deposit_leaf_root: tree[0], global_deposit_count: count,
+                    leaf_paths: (first_record..first_record + (end - cursor)).map(|index| deposit_leaf_path(&tree, count, index)).collect::<Result<Vec<_>, _>>()?,
                     deposits: prefix[cursor as usize..end as usize].to_vec(), append_proof,
                 });
                 first_record += end - cursor;
@@ -160,72 +160,32 @@ pub(crate) fn build_deposit_spiderman_inputs(config: &NetworkConfig, opening: &A
             if end % 32 == 0 { web.clear(); }
             cursor = end;
         }
-        anyhow::ensure!(root.0.elements.map(|value| value.to_canonical_u64()) == transition.new_root, "new custody root mismatch");
+        anyhow::ensure!(root.0.elements.map(|value| value.to_canonical_u64()) == transition.new_root, "new deposit-tree root mismatch");
         chains.push(inputs);
     }
-    anyhow::ensure!(first_record == count, "custody record prefix mismatch");
+    anyhow::ensure!(first_record == count, "deposit record prefix mismatch");
     Ok(chains)
 }
 
-fn build_chain_aggregate(config: &NetworkConfig, a: &AOpening, ends: Option<&[ChainEnd]>, webs: &[Vec<ProofWithPublicInputs<F, C, D>>], tree: &[[u8; 32]], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-    let variant = usize::from(ends.is_some());
-    let context = ChainContext { config_hash: a.config_hash, end_checkpoint_id: a.end_checkpoint_id, end_checkpoint_root: a.end_checkpoint_root, global_deposit_record_root: tree[0], global_deposit_count: a.deposit_leaves.len() as u32 };
-    let mut rows = Vec::with_capacity(config.chains.len());
-    let mut proofs = Vec::with_capacity(config.chains.len().next_power_of_two());
+fn build_chain_aggregate(config: &NetworkConfig, a: &DepositAggregateOpening, webs: &[Vec<ProofWithPublicInputs<F, C, D>>], tree: &[[u8; 32]], circuits: &AggregateCircuits) -> anyhow::Result<Vec<ProofWithPublicInputs<F, C, D>>> {
+    let context = ChainContext { config_hash: a.config_hash, end_checkpoint_id: a.end_checkpoint_id, end_checkpoint_root: a.end_checkpoint_root, global_deposit_leaf_root: tree[0], global_deposit_count: a.deposit_leaves.len() as u32 };
+    let mut proofs = Vec::with_capacity(config.chains.len());
     let mut first_record = 0;
     for ordinal in 0..config.chains.len() {
-        let range = DepositRecordRange { first_record, record_count: a.deposits[ordinal].new_count - a.deposits[ordinal].old_count };
-        first_record += range.record_count;
-        let endpoints = if ends.is_some() { Some(DepositRangeEndpoints::from_tree(&a.deposit_leaves, tree, &range)?) } else { None };
-        let row = if let Some(ends) = ends { ChainRow::B { start: a.starts[ordinal].clone(), transition: a.deposits[ordinal].clone(), end: ends[ordinal].clone(), range } }
-            else { ChainRow::A { start: a.starts[ordinal].clone(), transition: a.deposits[ordinal].clone(), range } };
-        proofs.push(circuits.chains[variant].real.prove(config, &context, ordinal as u32, Some(&row), if ends.is_some() { &[] } else { &webs[ordinal] }, endpoints.as_ref())?);
-        rows.push(row);
+        let range = DepositLeafRange { first_leaf: first_record, leaf_count: a.deposits[ordinal].new_count - a.deposits[ordinal].old_count };
+        first_record += range.leaf_count;
+        let row = ChainRow { start: a.starts[ordinal].clone(), transition: a.deposits[ordinal].clone(), range };
+        proofs.push(circuits.chains.prove(config, &context, ordinal as u32, &row, &webs[ordinal])?);
     }
     anyhow::ensure!(first_record == context.global_deposit_count, "chain record prefix mismatch");
-    for ordinal in config.chains.len()..config.chains.len().next_power_of_two() {
-        proofs.push(circuits.chains[variant].empty.prove(config, &context, ordinal as u32, None, &[], None)?);
-    }
-    let mut level = 0;
-    while proofs.len() > 1 {
-        let span = 1usize << (level + 1);
-        proofs = proofs.chunks_exact(2).enumerate().map(|(parent, children)| {
-            let first = parent * span;
-            circuits.chain_levels[variant][level].prove(config, &context, first as u32, &rows[first.min(rows.len())..(first + span).min(rows.len())], &children[0], &children[1])
-        }).collect::<anyhow::Result<_>>()?;
-        level += 1;
-    }
-    proofs.pop().context("missing chain root")
+    Ok(proofs)
 }
 
-fn build_record_batches(context: &BatchContext, records: BatchRecords<'_, C, D>, circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-    let (family, count) = match &records { BatchRecords::Deposit(records) => (0, records.len()), BatchRecords::Withdrawal { records, .. } => (1, records.len()), BatchRecords::Reward(records) => (2, records.len()) };
-    let chunks = count.div_ceil(32);
-    let mut proofs = Vec::with_capacity(chunks.max(1).next_power_of_two());
-    for chunk in 0..chunks.max(1).next_power_of_two() {
-        let first = (32 * chunk).min(count);
-        let end = (first + 32).min(count);
-        let batch = match &records {
-            BatchRecords::Deposit(records) => BatchRecords::Deposit(&records[first..end]),
-            BatchRecords::Withdrawal { config, records } => BatchRecords::Withdrawal { config, records: &records[first..end] },
-            BatchRecords::Reward(records) => BatchRecords::Reward(&records[first..end]),
-        };
-        proofs.push(if chunk < chunks { circuits.batches[family].real.prove(context, chunk as u32, first as u32, Some(&batch))? }
-            else { circuits.batches[family].empty.prove(context, chunk as u32, first as u32, None)? });
-    }
-    let mut level = 0;
-    while proofs.len() > 1 {
-        proofs = proofs.chunks_exact(2).map(|children| circuits.batch_levels[family][level].prove(&children[0], &children[1])).collect::<anyhow::Result<_>>()?;
-        level += 1;
-    }
-    proofs.pop().context("missing batch root")
-}
-
-pub(crate) fn build_deposit_aggregate(config: &NetworkConfig, opening: &AOpening, web_inputs: &[Vec<DepositSpidermanAppendInputs>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+pub(crate) fn build_deposit_aggregate(config: &NetworkConfig, opening: &DepositAggregateOpening, web_inputs: &[Vec<DepositSpidermanAppendInputs>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
     circuits.validate_config(config)?;
     opening.validate(config)?;
     anyhow::ensure!(web_inputs.len() == config.chains.len(), "one web vector per configured chain required");
-    let tree = deposit_record_tree(&opening.deposit_leaves.iter().map(DepositLeaf::record_commit).collect::<Result<Vec<_>, _>>()?)?;
+    let tree = deposit_leaf_tree(&opening.deposit_leaves.iter().map(DepositLeaf::leaf_commit).collect::<Result<Vec<_>, _>>()?)?;
     let mut first = 0usize;
     let mut webs = Vec::with_capacity(web_inputs.len());
     for (ordinal, inputs) in web_inputs.iter().enumerate() {
@@ -235,85 +195,40 @@ pub(crate) fn build_deposit_aggregate(config: &NetworkConfig, opening: &AOpening
         for input in inputs {
             let end = first.checked_add(input.deposits.len()).context("web record overflow")?;
             anyhow::ensure!(!input.deposits.is_empty() && input.deposits.len() <= (32 - cursor % 32) as usize && end <= opening.deposit_leaves.len(), "invalid web record interval");
-            anyhow::ensure!(input.config_hash == opening.config_hash && input.end_checkpoint_id == opening.end_checkpoint_id && input.end_checkpoint_root.0.elements.map(|value| value.to_canonical_u64()) == opening.end_checkpoint_root && input.chain_index == transition.chain_index && input.old_count == cursor && input.first_record as usize == first && input.global_deposit_record_root == tree[0] && input.global_deposit_count as usize == opening.deposit_leaves.len() && input.deposits == opening.deposit_leaves[first..end], "web differs from complete opening");
-            cursor = cursor.checked_add(input.deposits.len() as u32).context("custody count overflow")?;
+            anyhow::ensure!(input.config_hash == opening.config_hash && input.end_checkpoint_id == opening.end_checkpoint_id && input.end_checkpoint_root.0.elements.map(|value| value.to_canonical_u64()) == opening.end_checkpoint_root && input.chain_index == transition.chain_index && input.old_count == cursor && input.first_leaf as usize == first && input.global_deposit_leaf_root == tree[0] && input.global_deposit_count as usize == opening.deposit_leaves.len() && input.deposits == opening.deposit_leaves[first..end], "web differs from complete opening");
+            cursor = cursor.checked_add(input.deposits.len() as u32).context("proved deposit count overflow")?;
             anyhow::ensure!(cursor <= transition.new_count, "web exceeds chain transition");
             proofs.push(circuits.deposit.prove(input)?);
             first = end;
         }
-        anyhow::ensure!(cursor == transition.new_count, "missing custody web");
+        anyhow::ensure!(cursor == transition.new_count, "missing deposit web");
         webs.push(proofs);
     }
     anyhow::ensure!(first == opening.deposit_leaves.len(), "missing deposit records");
-    let chain = build_chain_aggregate(config, opening, None, &webs, &tree, circuits)?;
-    let context = BatchContext { config_hash: opening.config_hash, end_id: opening.end_checkpoint_id, end_root: opening.end_checkpoint_root, chain_ends_hash: [0; 32] };
-    let batch = build_record_batches(&context, BatchRecords::Deposit(&opening.deposit_leaves), circuits)?;
-    circuits.prove_a(config, opening, &batch, &chain)
+    let chains = build_chain_aggregate(config, opening, &webs, &tree, circuits)?;
+    circuits.prove_deposit_aggregate(config, opening, &chains)
 }
 
-fn build_withdrawal_end_paths(ends: &[ChainEnd]) -> anyhow::Result<Vec<WithdrawalEndWitness>> {
-    let word = |value: u64| U256::from(value).to_be_bytes::<32>();
-    let mut tree = vec![[0; 32]; 511];
-    for ordinal in 0..256 {
-        let mut bytes = Vec::with_capacity(320);
-        bytes.extend(domain_hash(if ordinal < ends.len() { Domain::Leaf } else { Domain::Empty }));
-        bytes.extend(word(6)); bytes.extend(word(ends.len() as u64)); bytes.extend(word(ordinal as u64));
-        if let Some(end) = ends.get(ordinal) { bytes.extend(end.encode()?); }
-        tree[255 + ordinal] = keccak256(&bytes).0;
-    }
-    for level in 1..=8 {
-        let start = (1 << (8 - level)) - 1;
-        for index in start..2 * start + 1 {
-            tree[index] = keccak256([domain_hash(Domain::Node), word(6), word(level), tree[2 * index + 1], tree[2 * index + 2]].concat()).0;
-        }
-    }
-    anyhow::ensure!(tree[0] == chain_ends_hash(ends)?, "chain ends tree mismatch");
-    Ok(ends.iter().enumerate().map(|(ordinal, end)| {
-        let mut index = 255 + ordinal;
-        let siblings = std::array::from_fn(|_| {
-            let sibling = tree[if index % 2 == 0 { index - 1 } else { index + 1 }];
-            index = (index - 1) / 2;
-            sibling
-        });
-        WithdrawalEndWitness { ordinal: ordinal as u8, end: end.clone(), siblings }
-    }).collect())
-}
-
-pub(crate) fn build_checkpoint_aggregate(config: &NetworkConfig, opening: &BOpening, withdrawal_proofs: &[ProofWithPublicInputs<F, C, D>], reward_proofs: &[ProofWithPublicInputs<F, C, D>], end_witness: &CheckpointEndWitness, range_proofs: &[ProofWithPublicInputs<F, C, D>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+pub(crate) fn build_withdrawal_aggregate(config: &NetworkConfig, opening: &WithdrawalAggregateOpening, proofs: &[ProofWithPublicInputs<F, C, D>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
     circuits.validate_config(config)?;
     opening.validate(config)?;
-    let a = &opening.a;
-    anyhow::ensure!(withdrawal_proofs.len() == opening.withdrawals.len() && reward_proofs.len() == opening.rewards.len(), "one native proof per selected claim required");
-    anyhow::ensure!(end_witness.config == *config && end_witness.end_id == a.end_checkpoint_id && end_witness.end_root.0.elements.map(|value| value.to_canonical_u64()) == a.end_checkpoint_root && end_witness.chains.len() == config.chains.len(), "checkpoint end witness differs from opening");
-    let mut starts: Vec<_> = a.starts.iter().map(|start| (start.start_checkpoint_id, start.start_checkpoint_root)).collect();
-    starts.sort_unstable(); starts.dedup();
-    anyhow::ensure!(range_proofs.len() == starts.len(), "one range proof per sorted distinct start required");
-    let config_words: Vec<_> = a.config_hash.chunks_exact(4).map(|word| F::from_canonical_u32(u32::from_be_bytes(word.try_into().unwrap()))).collect();
-    for (proof, (start_id, start_root)) in range_proofs.iter().zip(&starts) {
-        let pi = &proof.public_inputs;
-        anyhow::ensure!(pi.len() == 28, "invalid checkpoint range PI width");
-        let variant = u64::from(*start_id == a.end_checkpoint_id);
-        anyhow::ensure!(pi[..4] == [1, 5, variant, 0].map(F::from_canonical_u64)
-            && pi[4..12] == config_words
-            && pi[12..14] == [a.end_checkpoint_id as u32, (a.end_checkpoint_id >> 32) as u32].map(F::from_canonical_u32)
-            && pi[14..18] == a.end_checkpoint_root.map(F::from_canonical_u64)
-            && pi[18..20] == [*start_id as u32, (*start_id >> 32) as u32].map(F::from_canonical_u32)
-            && pi[20..24] == start_root.map(F::from_canonical_u64), "checkpoint range order or context mismatch");
-    }
-    let paths = build_withdrawal_end_paths(&opening.ends)?;
-    let withdrawals = opening.withdrawals.iter().zip(withdrawal_proofs).map(|(record, proof)| {
-        let ordinal = config.chains.binary_search_by_key(&record.chain_index, |chain| chain.chain_index).map_err(|_| anyhow::anyhow!("withdrawal chain is not configured"))?;
-        Ok(WithdrawalBatchRecord { record, proof, end: &paths[ordinal] })
+    anyhow::ensure!(proofs.len() == opening.withdrawals.len(), "one proof per withdrawal required");
+    let paths = withdrawal_root_paths(config, &opening.withdrawal_roots)?;
+    let records = opening.withdrawals.iter().zip(proofs).map(|(record, proof)| {
+        let ordinal = config.chains.binary_search_by_key(&record.chain_index, |chain| chain.chain_index).map_err(|_| anyhow::anyhow!("withdrawal chain absent"))?;
+        Ok(WithdrawalAggregateLeaf { leaf: record, proof, path: &paths[ordinal] })
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    let rewards: Vec<_> = opening.rewards.iter().zip(reward_proofs).map(|(record, proof)| RewardBatchRecord { record, proof }).collect();
-    let context = BatchContext { config_hash: a.config_hash, end_id: a.end_checkpoint_id, end_root: a.end_checkpoint_root, chain_ends_hash: [0; 32] };
-    let withdrawal_context = BatchContext { chain_ends_hash: chain_ends_hash(&opening.ends)?, ..context.clone() };
-    let withdrawal = build_record_batches(&withdrawal_context, BatchRecords::Withdrawal { config, records: &withdrawals }, circuits)?;
-    let reward = build_record_batches(&context, BatchRecords::Reward(&rewards), circuits)?;
-    let tree = deposit_record_tree(&a.deposit_leaves.iter().map(DepositLeaf::record_commit).collect::<Result<Vec<_>, _>>()?)?;
-    let chain = build_chain_aggregate(config, a, Some(&opening.ends), &[], &tree, circuits)?;
-    let end = circuits.checkpoint_end.prove(end_witness)?;
-    circuits.prove_b(config, opening, &withdrawal, &reward, &chain, &end, range_proofs)
+    let window = AggregateWindow { config_hash: opening.config_hash, window_id: opening.window_id, end_id: opening.end_checkpoint_id, end_root: opening.end_checkpoint_root };
+    circuits.aggregates[0].prove(config, &window, &AggregateLeaves::Withdrawal { leaves: &records, withdrawal_roots: &opening.withdrawal_roots })
+}
+
+pub(crate) fn build_reward_aggregate(config: &NetworkConfig, opening: &RewardAggregateOpening, proofs: &[ProofWithPublicInputs<F, C, D>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+    circuits.validate_config(config)?;
+    opening.validate(config)?;
+    anyhow::ensure!(proofs.len() == opening.rewards.len(), "one proof per reward required");
+    let records = opening.rewards.iter().zip(proofs).map(|(leaf, proof)| RewardAggregateLeaf { leaf, proof }).collect::<Vec<_>>();
+    let window = AggregateWindow { config_hash: opening.config_hash, window_id: opening.window_id, end_id: opening.end_checkpoint_id, end_root: opening.end_checkpoint_root };
+    circuits.aggregates[1].prove(config, &window, &AggregateLeaves::Reward(&records))
 }
 
 fn bridge_contract_state_tree_height(contract_id: u32) -> anyhow::Result<u8> {
@@ -329,7 +244,7 @@ pub(crate) fn cached_bridge_coordinator_circuits() -> anyhow::Result<&'static QE
     if let Some(cached) = CACHE.get() {
         return Ok(cached);
     }
-    eprintln!("Building QEDCoordinatorCircuitManager via get_plonky2_circuit_library_and_prover_for_network...");
+    tracing::info!("building bridge coordinator circuits");
     let (_, circuits) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(NETWORK_TYPE)
         .map_err(|e| anyhow::anyhow!("failed to build bridge coordinator circuits: {}", e))?;
     let _ = CACHE.set(circuits);
@@ -450,13 +365,14 @@ async fn fetch_tree_root_witness(
     checkpoint_id: u64,
     owner_user_id: u64,
     contract_id: u32,
+    slots: [u64; 2],
 ) -> anyhow::Result<TreeRootInContractStateWitnessInput<F>> {
     let contract_state_tree_height = bridge_contract_state_tree_height(contract_id)?;
     let slot0_proof = provider
-        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, contract_state_tree_height, 0)
+        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, contract_state_tree_height, slots[0])
         .await?;
     let slot1_proof = provider
-        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, contract_state_tree_height, 1)
+        .get_user_contract_state_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id, contract_state_tree_height, slots[1])
         .await?;
     let contract_proof = provider
         .get_user_contract_tree_merkle_proof(checkpoint_id, owner_user_id, contract_id)
@@ -473,6 +389,28 @@ async fn fetch_tree_root_witness(
         contract_proof: to_core_merkle_proof(contract_proof),
         user_tree_proof: to_core_merkle_proof(user_tree_proof),
     })
+}
+
+async fn fetch_finalize_endpoints(provider: &RpcProvider, checkpoint: u64, indices: &[u8]) -> anyhow::Result<Vec<psy_plonky2_circuits::bridge::circuits::bridge_agg_final::BridgeAggFinalEndpointWitness<F>>> {
+    use psy_plonky2_circuits::bridge::{circuits::bridge_agg_final::BridgeAggFinalEndpointWitness, gadgets::slot_value_in_contract_state::SlotValueInContractStateWitnessInput};
+    let mut endpoints = Vec::with_capacity(indices.len());
+    for &chain_index in indices {
+        let slots = [16_451 + 2 * u64::from(chain_index), 16_452 + 2 * u64::from(chain_index)];
+        let deposit_root = fetch_tree_root_witness(provider, checkpoint, BRIDGE_USER_ID_U64, DEPOSIT_TREE_CONTRACT_ID, slots).await?;
+        let withdrawal_root = fetch_tree_root_witness(provider, checkpoint, BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID, slots).await?;
+        let mut counts = Vec::with_capacity(2);
+        for root in [&deposit_root, &withdrawal_root] {
+            let contract = u32::try_from(root.contract_id)?;
+            let slot_index = 16_386 + u64::from(chain_index) / 4;
+            counts.push(SlotValueInContractStateWitnessInput { sender_user_id: BRIDGE_USER_ID_U64, contract_id: root.contract_id, slot_index,
+                user_leaf: root.user_leaf, contract_proof: root.contract_proof.clone(), user_tree_proof: root.user_tree_proof.clone(),
+                slot_proof: to_core_merkle_proof(provider.get_user_contract_state_tree_merkle_proof(checkpoint, BRIDGE_USER_ID_U64, contract, bridge_contract_state_tree_height(contract)?, slot_index).await?) });
+        }
+        let withdrawal_count = counts.pop().context("missing withdrawal count")?;
+        let deposit_count = counts.pop().context("missing deposit count")?;
+        endpoints.push(BridgeAggFinalEndpointWitness { chain_index, deposit_root, deposit_count, withdrawal_root, withdrawal_count });
+    }
+    Ok(endpoints)
 }
 
 fn slot_value_to_u32x4(value: ClientQHashOut) -> [u32; 4] {
@@ -955,6 +893,7 @@ pub(crate) async fn prove_checkpoint_range(
     coordinator: &QEDCoordinatorCircuitManager<C, D>,
     start_checkpoint_id: u64,
     end_checkpoint_id: u64,
+    configured_chain_indices: &[u8],
 ) -> anyhow::Result<(
     BridgeAggProveResult<C, D>,
     PQEDCheckpointLeaf<F, QHashOut<F>>,
@@ -981,10 +920,7 @@ pub(crate) async fn prove_checkpoint_range(
     let checkpoint_step_commit_fingerprint = cached_lib
         .get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
         .expect("GenerateRollupStateTransitionProof not found in cached circuit library");
-    eprintln!(
-        "Pre-fetching checkpoint proofs and merkle data for checkpoints {} to {}...",
-        from_checkpoint, to_checkpoint
-    );
+    tracing::info!(from_checkpoint, to_checkpoint, "pre-fetching checkpoint proofs");
 
     let final_checkpoint_proof: ProofWithPublicInputs<F, C, D> = {
         let proof_bytes = provider.get_checkpoint_state_transition_proof(to_checkpoint).await?;
@@ -1063,10 +999,10 @@ pub(crate) async fn prove_checkpoint_range(
     };
 
     let deposit_root_witness =
-        fetch_tree_root_witness(provider, to_checkpoint, BRIDGE_USER_ID_U64, DEPOSIT_TREE_CONTRACT_ID).await?;
+        fetch_tree_root_witness(provider, to_checkpoint, BRIDGE_USER_ID_U64, DEPOSIT_TREE_CONTRACT_ID, [0, 1]).await?;
 
     let withdrawal_root_witness =
-        fetch_tree_root_witness(provider, to_checkpoint, BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID).await?;
+        fetch_tree_root_witness(provider, to_checkpoint, BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID, [0, 1]).await?;
 
     // Fetch global state roots to bind the gadget's user_tree_root to the checkpoint leaf.
     let checkpoint_global_state_roots = {
@@ -1081,7 +1017,7 @@ pub(crate) async fn prove_checkpoint_range(
         }
     };
 
-    eprintln!("Pre-fetching complete. Proving bridge aggregation...");
+    tracing::info!(from_checkpoint, to_checkpoint, "proving bridge aggregation");
 
     let result = BridgeAggFinalCircuit::<C, D>::prove_range(
         from_checkpoint,
@@ -1104,15 +1040,14 @@ pub(crate) async fn prove_checkpoint_range(
         GLOBAL_CONTRACT_TREE_HEIGHT,
         DEPOSIT_CONTRACT_STATE_TREE_HEIGHT,
         WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
+        configured_chain_indices,
+        &fetch_finalize_endpoints(provider, to_checkpoint, configured_chain_indices).await?,
     )?;
-    eprintln!(
-        "Bridge aggregation proof generated successfully. step_count: {}",
-        to_checkpoint - from_checkpoint + 1
-    );
+    tracing::info!(step_count = to_checkpoint - from_checkpoint + 1, "bridge aggregation proof generated");
 
     anyhow::ensure!(
-        result.proof.public_inputs.len() == 26,
-        "BridgeAgg proof public inputs width must be 26, got {}",
+        result.proof.public_inputs.len() == 26 + 9 * configured_chain_indices.len(),
+        "BridgeAgg proof public inputs width differs from configured chain list: {}",
         result.proof.public_inputs.len()
     );
     anyhow::ensure!(
@@ -1145,6 +1080,7 @@ pub async fn run_prove_bridge_agg_with_result(
     rpc_config: String,
     out_json: PathBuf,
     deployments_network: String,
+    aggregate_config: PathBuf,
 ) -> anyhow::Result<BridgeProveResult> {
     // Checkpoint 0 uses genesis transition proof path, not the normal
     // checkpoint_root_transition format; verified proofs start from cp 1.
@@ -1162,19 +1098,27 @@ pub async fn run_prove_bridge_agg_with_result(
     let coordinator_circuits = cached_bridge_coordinator_circuits()?;
     let l1_config = load_l1_deployment_config(&deployments_network)?;
     let provider = RpcProvider::new_with_config_path(&rpc_config)?;
+    let approved = super::regen_groth16_keystore::load_aggregate_setup_config(&aggregate_config)?;
+    let network = NetworkConfig::decode(&hex::decode(approved.network_config)?)?;
+    let indices = network.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>();
+    let checkpoint = &coordinator_circuits.checkpoint_root_transition;
+    let finalizer = BridgeAggFinalCircuit::<C, D>::prebuild_final_circuit(
+        checkpoint.get_common_circuit_data_ref(), checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(),
+        checkpoint.get_fingerprint(), checkpoint.get_fingerprint(), CHECKPOINT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT,
+        GLOBAL_CONTRACT_TREE_HEIGHT, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT, &indices);
     let (result, _, _) = prove_checkpoint_range(
         &provider,
         coordinator_circuits,
         from_checkpoint - 1,
         to_checkpoint,
+        &indices,
     ).await?;
+    anyhow::ensure!(result.configured_chain_indices == indices && result.common_data == finalizer.circuit_data.common && result.verifier_data == finalizer.circuit_data.verifier_only && result.fingerprint == finalizer.fingerprint, "standalone finalize source pin mismatch");
     let l1_chain_index = l1_config.l1_chain_index;
     let bridge_agg_proof = result.proof;
-    let bridge_agg_common = result.common_data;
-    let bridge_agg_fingerprint = result.fingerprint;
     let bridge_agg_verifier_data = result.verifier_data;
 
-    eprintln!("BridgeAgg proof public inputs: {:?}", bridge_agg_proof.public_inputs);
+    tracing::info!(public_inputs = ?bridge_agg_proof.public_inputs, "bridge aggregation public inputs");
     let felt4_to_bytes32_hex = |start: usize| -> String {
         let mut out = [0u8; 32];
         for i in 0..4 {
@@ -1219,22 +1163,14 @@ pub async fn run_prove_bridge_agg_with_result(
     )
     .await?;
     let b256_array_to_hex = |arr: [B256; 9]| arr.map(|x| format!("{:#066x}", x));
-    eprintln!("Building BridgeWrapCircuit...");
-    let bridge_wrap = BridgeWrapCircuit::new(
-        &bridge_agg_common,
-        bridge_agg_fingerprint,
-        bridge_agg_verifier_data.constants_sigmas_cap.height(),
-    );
-    let bridge_groth16_wrapper = BridgeWrapCircuit::new(
-        &bridge_agg_common,
-        bridge_agg_fingerprint,
-        bridge_agg_verifier_data.constants_sigmas_cap.height(),
-    )
-    .into_shared_groth16_wrapper(format!("{}/.psy/keystore/", home::home_dir().unwrap().display()));
+    tracing::info!("building bridge wrap circuit");
+    let bridge_wrap = BridgeWrapCircuit::new(&finalizer)?;
+    let bridge_groth16_wrapper = BridgeWrapCircuit::new(&finalizer)?
+        .into_shared_groth16_wrapper(format!("{}/.psy/keystore/", home::home_dir().context("home directory unavailable")?.display()));
 
-    eprintln!("Proving BridgeWrapCircuit (Stage 2: Groth16 wrap)...");
+    tracing::info!("proving bridge wrap circuit");
     let groth16_proof = bridge_wrap.prove_groth16_with_shared_wrapper(&bridge_groth16_wrapper, &bridge_agg_verifier_data, &bridge_agg_proof)?;
-    eprintln!("Groth16 proof generated successfully.");
+    tracing::info!("groth16 wrap generated");
 
     let solidity_proof = [
         with_0x(&groth16_proof.pi_a[0]),
@@ -1272,7 +1208,7 @@ pub async fn run_prove_bridge_agg_with_result(
     };
     let out_str = serde_json::to_string_pretty(&output)?;
     fs::write(&out_json, &out_str).with_context(|| format!("failed to write output: {}", out_json.display()))?;
-    eprintln!("Output written to {}", out_json.display());
+    tracing::info!(path = %out_json.display(), "bridge proof output written");
 
     Ok(BridgeProveResult {
         from_checkpoint,
@@ -1528,299 +1464,3 @@ pub async fn build_deposit_batch_append_calls_remote(
     Ok(calls)
 }
 
-/// Bridge aggregation proof generation using a remote Prove Proxy.
-/// Fetches all witness data locally, then sends to Prove Proxy for Groth16 proof.
-pub async fn run_prove_bridge_agg_with_result_remote(
-    from_checkpoint: u64,
-    to_checkpoint: u64,
-    rpc_config: String,
-    out_json: PathBuf,
-    deployments_network: String,
-    prove_proxy_url: &str,
-) -> anyhow::Result<BridgeProveResult> {
-    let from_checkpoint = from_checkpoint.max(1);
-    anyhow::ensure!(from_checkpoint <= to_checkpoint, "from_checkpoint must be <= to_checkpoint");
-    let num_checkpoints_aggregated = to_checkpoint - from_checkpoint + 1;
-    anyhow::ensure!(
-        num_checkpoints_aggregated >= 1,
-        "bridge aggregation requires at least 1 checkpoint, got {} (from={} to={})",
-        num_checkpoints_aggregated,
-        from_checkpoint,
-        to_checkpoint
-    );
-
-    let l1_config = load_l1_deployment_config(&deployments_network)?;
-    let provider = RpcProvider::new_with_config_path(&rpc_config)?;
-
-    eprintln!(
-        "[remote] Pre-fetching checkpoint proofs and merkle data for checkpoints {} to {}...",
-        from_checkpoint, to_checkpoint
-    );
-
-    let final_checkpoint_proof_hex = {
-        let proof_bytes = provider.get_checkpoint_state_transition_proof(to_checkpoint).await?;
-        hex::encode(&proof_bytes)
-    };
-
-    let mut delta_merkle_proofs = Vec::new();
-    let mut pre_delta_merkle_proofs = Vec::new();
-    for cp_id in from_checkpoint..=to_checkpoint {
-        let leaf_hash = provider.get_checkpoint_tree_leaf_hash(cp_id, cp_id).await?;
-        let merkle_proof = provider.get_checkpoint_tree_merkle_proof(cp_id, cp_id).await?;
-        let new_value_hex = format!("0x{:016x}{:016x}{:016x}{:016x}",
-            leaf_hash.0.elements[3].to_canonical_u64(),
-            leaf_hash.0.elements[2].to_canonical_u64(),
-            leaf_hash.0.elements[1].to_canonical_u64(),
-            leaf_hash.0.elements[0].to_canonical_u64());
-        let siblings_hex: Vec<String> = merkle_proof.siblings.iter().map(|h| {
-            format!("0x{:016x}{:016x}{:016x}{:016x}",
-                h.0.elements[3].to_canonical_u64(),
-                h.0.elements[2].to_canonical_u64(),
-                h.0.elements[1].to_canonical_u64(),
-                h.0.elements[0].to_canonical_u64())
-        }).collect();
-        delta_merkle_proofs.push(BridgeAggDeltaProof {
-            index: cp_id,
-            new_value: new_value_hex.clone(),
-            siblings: siblings_hex.clone(),
-        });
-
-        anyhow::ensure!(cp_id > 0, "from_checkpoint must be > 0");
-        let pre_id = cp_id - 1;
-        let pre_leaf_hash = provider.get_checkpoint_tree_leaf_hash(pre_id, pre_id).await?;
-        let pre_merkle_proof = provider.get_checkpoint_tree_merkle_proof(pre_id, pre_id).await?;
-        let pre_new_value_hex = format!("0x{:016x}{:016x}{:016x}{:016x}",
-            pre_leaf_hash.0.elements[3].to_canonical_u64(),
-            pre_leaf_hash.0.elements[2].to_canonical_u64(),
-            pre_leaf_hash.0.elements[1].to_canonical_u64(),
-            pre_leaf_hash.0.elements[0].to_canonical_u64());
-        let pre_siblings_hex: Vec<String> = pre_merkle_proof.siblings.iter().map(|h| {
-            format!("0x{:016x}{:016x}{:016x}{:016x}",
-                h.0.elements[3].to_canonical_u64(),
-                h.0.elements[2].to_canonical_u64(),
-                h.0.elements[1].to_canonical_u64(),
-                h.0.elements[0].to_canonical_u64())
-        }).collect();
-        pre_delta_merkle_proofs.push(BridgeAggDeltaProof {
-            index: pre_id,
-            new_value: pre_new_value_hex,
-            siblings: pre_siblings_hex,
-        });
-    }
-
-    let leaf_data = provider.get_checkpoint_leaf_data(to_checkpoint).await?;
-    let leaf_compact = leaf_data.to_compact::<psy_client_data::config::store_config::PsyHasher>();
-    let final_checkpoint_leaf = BridgeAggCheckpointLeaf {
-        global_chain_root: format!("0x{:016x}{:016x}{:016x}{:016x}",
-            leaf_compact.global_chain_root.0.elements[3].to_canonical_u64(),
-            leaf_compact.global_chain_root.0.elements[2].to_canonical_u64(),
-            leaf_compact.global_chain_root.0.elements[1].to_canonical_u64(),
-            leaf_compact.global_chain_root.0.elements[0].to_canonical_u64()),
-        stats_hash: format!("0x{:016x}{:016x}{:016x}{:016x}",
-            leaf_compact.stats_hash.0.elements[3].to_canonical_u64(),
-            leaf_compact.stats_hash.0.elements[2].to_canonical_u64(),
-            leaf_compact.stats_hash.0.elements[1].to_canonical_u64(),
-            leaf_compact.stats_hash.0.elements[0].to_canonical_u64()),
-    };
-
-    // start_chain_hash must be the chain hash immediately before `from_checkpoint`.
-    // For from_checkpoint == 1, this is the genesis checkpoint transition PI = H(H(root_0, leaf_0), genesis_fingerprint).
-    // For from_checkpoint > 1, this is checkpoint (from_checkpoint - 1)'s proof public input hash.
-    let genesis_fingerprint = {
-        let cached_lib = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
-        cached_lib
-            .get_fingerprint(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition)
-            .map_err(|e| anyhow::anyhow!("GenesisBlockCheckpointStateTransition fingerprint not found in cached circuit library: {e}"))?
-    };
-    let start_chain_hash = if from_checkpoint <= 1 {
-        use plonky2::hash::poseidon::PoseidonHash;
-        use plonky2::plonk::config::Hasher;
-        let genesis_root = to_core_hash(provider.get_checkpoint_tree_root(0).await?);
-        let genesis_leaf = to_core_hash(provider.get_checkpoint_tree_leaf_hash(0, 0).await?);
-        let root_leaf = PoseidonHash::two_to_one(genesis_root.0, genesis_leaf.0);
-        QHashOut(PoseidonHash::two_to_one(root_leaf.into(), genesis_fingerprint.0))
-    } else {
-        let prev_proof_bytes = provider
-            .get_checkpoint_state_transition_proof(from_checkpoint - 1)
-            .await?;
-        let prev_proof: ProofWithPublicInputs<F, C, D> = bincode::deserialize(&prev_proof_bytes)
-            .map_err(|e| anyhow::format_err!("failed to deserialize previous checkpoint proof: {}", e))?;
-        QHashOut::from_felt_slice(&prev_proof.public_inputs[..4])
-    };
-    let chain_start_hex = format!("0x{:016x}{:016x}{:016x}{:016x}",
-        start_chain_hash.0.elements[3].to_canonical_u64(),
-        start_chain_hash.0.elements[2].to_canonical_u64(),
-        start_chain_hash.0.elements[1].to_canonical_u64(),
-        start_chain_hash.0.elements[0].to_canonical_u64());
-
-    let qhash_to_hex = |h: parth_core::pgoldilocks::QHashOut<F>| -> String {
-        format!("0x{:016x}{:016x}{:016x}{:016x}",
-            h.0.elements[3].to_canonical_u64(),
-            h.0.elements[2].to_canonical_u64(),
-            h.0.elements[1].to_canonical_u64(),
-            h.0.elements[0].to_canonical_u64())
-    };
-    async fn merkle_proof_to_witness(
-        provider: &RpcProvider,
-        cp: u64,
-        uid: u64,
-        contract_id: u32,
-    ) -> anyhow::Result<BridgeAggSlotWitness> {
-        let contract_state_tree_height = bridge_contract_state_tree_height(contract_id)?;
-        let qhash_to_hex = |h: parth_core::pgoldilocks::QHashOut<F>| -> String {
-            format!("0x{:016x}{:016x}{:016x}{:016x}",
-                h.0.elements[3].to_canonical_u64(),
-                h.0.elements[2].to_canonical_u64(),
-                h.0.elements[1].to_canonical_u64(),
-                h.0.elements[0].to_canonical_u64())
-        };
-
-        let slot0_proof = provider
-            .get_user_contract_state_tree_merkle_proof(cp, uid, contract_id, contract_state_tree_height, 0)
-            .await?;
-        let slot1_proof = provider
-            .get_user_contract_state_tree_merkle_proof(cp, uid, contract_id, contract_state_tree_height, 1)
-            .await?;
-        let contract_proof = provider
-            .get_user_contract_tree_merkle_proof(cp, uid, contract_id)
-            .await?;
-        let user_leaf = provider.get_user_leaf_data(cp, uid).await?;
-        let user_tree_proof = provider.get_user_tree_merkle_proof(cp, uid).await?;
-
-        Ok(BridgeAggSlotWitness {
-            owner_user_id: uid,
-            contract_id: contract_id as u64,
-            user_leaf_public_key: qhash_to_hex(to_core_hash(user_leaf.public_key)),
-            user_leaf_user_state_tree_root: qhash_to_hex(to_core_hash(user_leaf.user_state_tree_root)),
-            user_leaf_balance: user_leaf.balance.to_canonical_u64(),
-            user_leaf_nonce: user_leaf.nonce.to_canonical_u64(),
-            user_leaf_last_checkpoint_id: user_leaf.last_checkpoint_id.to_canonical_u64(),
-            user_leaf_event_index: user_leaf.event_index.to_canonical_u64(),
-            user_leaf_user_id: user_leaf.user_id.to_canonical_u64(),
-            slot0_root: qhash_to_hex(to_core_hash(slot0_proof.root)),
-            slot0_value: qhash_to_hex(to_core_hash(slot0_proof.value)),
-            slot0_index: slot0_proof.index,
-            slot0_siblings: slot0_proof.siblings.iter().map(|s| qhash_to_hex(to_core_hash(*s))).collect(),
-            slot1_root: qhash_to_hex(to_core_hash(slot1_proof.root)),
-            slot1_value: qhash_to_hex(to_core_hash(slot1_proof.value)),
-            slot1_index: slot1_proof.index,
-            slot1_siblings: slot1_proof.siblings.iter().map(|s| qhash_to_hex(to_core_hash(*s))).collect(),
-            contract_root: qhash_to_hex(to_core_hash(contract_proof.root)),
-            contract_value: qhash_to_hex(to_core_hash(contract_proof.value)),
-            contract_index: contract_proof.index,
-            contract_siblings: contract_proof.siblings.iter().map(|s| qhash_to_hex(to_core_hash(*s))).collect(),
-            user_tree_root: qhash_to_hex(to_core_hash(user_tree_proof.root)),
-            user_tree_value: qhash_to_hex(to_core_hash(user_tree_proof.value)),
-            user_tree_index: user_tree_proof.index,
-            user_tree_siblings: user_tree_proof.siblings.iter().map(|s| qhash_to_hex(to_core_hash(*s))).collect(),
-        })
-    }
-    let deposit_root_witness = merkle_proof_to_witness(&provider, to_checkpoint, BRIDGE_USER_ID_U64, DEPOSIT_TREE_CONTRACT_ID).await?;
-    let withdrawal_root_witness = merkle_proof_to_witness(&provider, to_checkpoint, BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID).await?;
-
-    // Fetch global state roots to bind user_tree_root to checkpoint leaf
-    let qhash_to_hex = |h: parth_core::pgoldilocks::QHashOut<F>| -> String {
-        format!("0x{:016x}{:016x}{:016x}{:016x}",
-            h.0.elements[3].to_canonical_u64(),
-            h.0.elements[2].to_canonical_u64(),
-            h.0.elements[1].to_canonical_u64(),
-            h.0.elements[0].to_canonical_u64())
-    };
-    let state_roots = provider.get_checkpoint_global_state_roots(to_checkpoint).await?;
-    let global_state_roots = crate::bridge::prove_proxy_client::BridgeAggGlobalStateRoots {
-        contract_tree_root: qhash_to_hex(to_core_hash(state_roots.contract_tree_root)),
-        deposit_tree_root: qhash_to_hex(to_core_hash(state_roots.deposit_tree_root)),
-        user_tree_root: qhash_to_hex(to_core_hash(state_roots.user_tree_root)),
-        withdrawal_tree_root: qhash_to_hex(to_core_hash(state_roots.withdrawal_tree_root)),
-        user_registration_tree_root: qhash_to_hex(to_core_hash(state_roots.user_registration_tree_root)),
-        validator_tree_root: qhash_to_hex(to_core_hash(state_roots.validator_tree_root)),
-    };
-
-    // Get checkpoint fingerprint from cached circuit library (avoids building
-    // the full QEDCoordinatorCircuitManager — saves ~2GB RSS when prove proxy
-    // is configured and the relayer doesn't need local proving).
-    let remote_checkpoint_fp = {
-        let cached_lib = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
-        let fp = cached_lib
-            .get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
-            .map_err(|e| anyhow::anyhow!("GenerateRollupStateTransitionProof fingerprint not found in cached circuit library: {e}"))?;
-        qhash_to_hex(fp)
-    };
-
-    let input = crate::bridge::prove_proxy_client::BridgeAggWitnessInput {
-        from_checkpoint,
-        to_checkpoint,
-        final_checkpoint_proof_hex,
-        delta_merkle_proofs,
-        pre_delta_merkle_proofs,
-        chain_start: chain_start_hex,
-        checkpoint_fp: remote_checkpoint_fp,
-        final_checkpoint_leaf,
-        final_checkpoint_global_state_roots: global_state_roots,
-        deposit_witness: deposit_root_witness,
-        withdrawal_witness: withdrawal_root_witness,
-    };
-
-    eprintln!("[remote] Sending bridge agg to Prove Proxy at {}...", prove_proxy_url);
-    let proxy_client = ProveProxyClient::new(prove_proxy_url);
-    let proxy_output = proxy_client
-        .prove_bridge_agg_groth16(deployments_network.clone(), input)
-        .await?;
-    eprintln!("[remote] Bridge agg proof received from Prove Proxy.");
-    anyhow::ensure!(
-        proxy_output.end_checkpoint_index == to_checkpoint,
-        "BridgeAgg proxy output end_checkpoint_index mismatch: got={} expected={}",
-        proxy_output.end_checkpoint_index,
-        to_checkpoint
-    );
-
-    let (deposit_subtree_root, deposit_merkle_proof_b256) = fetch_tree_subroot_and_top_proof(
-        &provider,
-        to_checkpoint,
-        BRIDGE_USER_ID_U64,
-        DEPOSIT_TREE_CONTRACT_ID,
-        l1_config.l1_chain_index,
-    )
-    .await?;
-    let (withdrawal_subtree_root, withdrawal_merkle_proof_b256) = fetch_tree_subroot_and_top_proof(
-        &provider,
-        to_checkpoint,
-        BRIDGE_USER_ID_U64,
-        WITHDRAWAL_TREE_CONTRACT_ID,
-        l1_config.l1_chain_index,
-    )
-    .await?;
-    let b256_array_to_hex = |arr: [B256; 9]| arr.map(|x| format!("{:#066x}", x));
-
-    let output = ProveBridgeAggOutput {
-        from_checkpoint: proxy_output.from_checkpoint,
-        to_checkpoint: proxy_output.to_checkpoint,
-        num_checkpoints_aggregated: proxy_output.num_checkpoints_aggregated,
-        l1_chain_index: u64::from(l1_config.l1_chain_index),
-        bridge_agg_public_inputs: proxy_output.bridge_agg_public_inputs,
-        bridge_agg_public_inputs_count: proxy_output.bridge_agg_public_inputs_count,
-        groth16_proof: proxy_output.groth16_proof,
-        solidity_proof: proxy_output.solidity_proof.clone(),
-        solidity_public_inputs: proxy_output.solidity_public_inputs,
-        checkpoint_roots: proxy_output.checkpoint_roots,
-        deposit_tree_root: proxy_output.deposit_tree_root,
-        deposit_subtree_root: format!("{:#066x}", deposit_subtree_root),
-        deposit_merkle_proof: b256_array_to_hex(deposit_merkle_proof_b256),
-        withdrawal_tree_root: proxy_output.withdrawal_tree_root,
-        withdrawal_subtree_root: format!("{:#066x}", withdrawal_subtree_root),
-        withdrawal_merkle_proof: b256_array_to_hex(withdrawal_merkle_proof_b256),
-        end_checkpoint_index: proxy_output.end_checkpoint_index,
-    };
-    let out_str = serde_json::to_string_pretty(&output)?;
-    fs::write(&out_json, &out_str).with_context(|| format!("failed to write output: {}", out_json.display()))?;
-    eprintln!("Output written to {}", out_json.display());
-
-    Ok(BridgeProveResult {
-        from_checkpoint,
-        to_checkpoint,
-        num_checkpoints_aggregated,
-        proof_path: out_json,
-        deposit_tree_root: output.deposit_tree_root,
-        withdrawal_tree_root: output.withdrawal_tree_root,
-    })
-}

@@ -10,6 +10,7 @@ use psy_plonky2_basic_helpers::builder::{
     select::CircuitBuilderSelectHelpers,
 };
 use psy_plonky2_common_circuits::bridge::aggregate_commitment::RewardLeafTarget;
+use psy_plonky2_common_circuits::hash::merkle::gadgets::merkle_proof::MerkleProofGadget;
 use crate::gadgets::tag_tree::hash_tag_tree_node_circuit;
 use plonky2::plonk::{
     circuit_data::{CircuitConfig, CircuitData},
@@ -19,7 +20,7 @@ use psy_client_data::bridge_aggregate::{CircuitSetEntry, NetworkConfig, RewardLe
 use psy_common_circuit::traits::CreatableTarget;
 use psy_network_circuit::gadgets::qdata::{checkpoint::PsyCheckpointLeafGadget, user::PsyUserLeafGadget};
 use psy_plonky2_common_circuits::bridge::{
-    aggregate_commitment::RecordTarget, aggregate_config::NetworkConfigTarget,
+    aggregate_commitment::AggregateLeafTarget, aggregate_config::NetworkConfigTarget,
 };
 use psy_ups_circuit::signature::reward_authorization::{
     build_reward_authorization_message_target, RewardAuthorizationCircuits, RewardAuthorizationContext, RewardAuthorizationInput,
@@ -136,10 +137,27 @@ pub struct RewardWitness {
     pub tag: RewardTagWitness,
 }
 
+use psy_config::network_constants::CHECKPOINT_TREE_HEIGHT;
+
+fn claim_checkpoint_path(builder: &mut CircuitBuilder<F, 2>, claim_id: [Target; 2],
+    claim_hash: HashOutTarget, end_id: [Target; 2], end_root: HashOutTarget) -> MerkleProofGadget {
+    builder.assert_zero(claim_id[1]);
+    builder.assert_zero(end_id[1]);
+    builder.range_check(end_id[0], usize::from(CHECKPOINT_TREE_HEIGHT));
+    let path = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, 2>(builder, usize::from(CHECKPOINT_TREE_HEIGHT));
+    builder.connect(path.index, claim_id[0]);
+    builder.range_check(path.index, usize::from(CHECKPOINT_TREE_HEIGHT));
+    builder.connect_hashes(path.value, claim_hash);
+    builder.connect_hashes(path.root, end_root);
+    builder.ensure_is_less_than_or_equal(32, claim_id[0], end_id[0]);
+    path
+}
+
 pub struct RewardInclusionCircuit {
     pub config: NetworkConfigTarget,
     pub reward: RewardLeafTarget,
     pub claim_leaf: PsyCheckpointLeafGadget,
+    pub claim_path: MerkleProofGadget,
     pub end_leaf: PsyCheckpointLeafGadget,
     pub authorization_user_leaf: PsyUserLeafGadget,
     pub tag: RewardTagTarget,
@@ -198,7 +216,7 @@ impl RewardInclusionCircuit {
         builder.assert_zero(before_cutover.target);
         let before_end = less_u64(&mut builder, reward.claim_checkpoint_id, config.reward_end_exclusive);
         builder.assert_one(before_end.target);
-        let record_commit = RecordTarget::Reward(reward).record_commit(&mut builder);
+        let leaf_commit = AggregateLeafTarget::Reward(reward).leaf_commit(&mut builder);
         let mut recipient_is_zero = builder._true();
         let zero = builder.zero();
         for word in reward.recipient {
@@ -237,6 +255,8 @@ impl RewardInclusionCircuit {
         for (&target, &value) in pi[4..12].iter().zip(&config_hash) { builder.connect(target, value); }
         let end_id = [pi[12], pi[13]];
         let end_root = [pi[14], pi[15], pi[16], pi[17]];
+        let claim_path = claim_checkpoint_path(&mut builder, reward.claim_checkpoint_id,
+            claim_hash, end_id, HashOutTarget { elements: end_root });
         let message = build_reward_authorization_message_target(
             &mut builder, config_hash, end_id, end_root, end_hash.elements,
             user_hash.elements, claim_hash.elements, &reward,
@@ -250,11 +270,11 @@ impl RewardInclusionCircuit {
         builder.register_public_inputs(&config_hash);
         builder.register_public_inputs(&end_id);
         builder.register_public_inputs(&end_root);
-        builder.register_public_inputs(&record_commit);
+        builder.register_public_inputs(&leaf_commit);
         builder.register_public_inputs(&reward.claim_checkpoint_id);
         let circuit_data = builder.build::<C>();
         let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
-        Ok(Self { config, reward, claim_leaf, end_leaf, authorization_user_leaf, tag,
+        Ok(Self { config, reward, claim_leaf, claim_path, end_leaf, authorization_user_leaf, tag,
             authorization_proof, circuit_data, fingerprint, authorization_circuits })
     }
 
@@ -268,6 +288,7 @@ impl RewardInclusionCircuit {
         proof: &ProofWithPublicInputs<F, C, 2>) -> anyhow::Result<PartialWitness<F>>
     {
         anyhow::ensure!(config.config_hash()? == context.config_hash, "reward authorization configuration mismatch");
+        anyhow::ensure!(context.claim_checkpoint_path.len() == usize::from(CHECKPOINT_TREE_HEIGHT), "claim checkpoint path height mismatch");
         let pi = &proof.public_inputs;
         anyhow::ensure!(pi.len() == 30, "reward authorization PI layout mismatch");
         anyhow::ensure!(pi[0] == F::ONE && pi[1] == F::from_canonical_u32(4)
@@ -286,6 +307,10 @@ impl RewardInclusionCircuit {
         self.config.set_witness(&mut witness, config)?;
         self.set_reward_witness(&mut witness, &context.reward)?;
         self.claim_leaf.set_witness(&mut witness, &context.claim_checkpoint_leaf)?;
+        witness.set_target(self.claim_path.index, F::from_canonical_u64(context.reward.claim_checkpoint_id))?;
+        for (target, sibling) in self.claim_path.siblings.iter().zip(&context.claim_checkpoint_path) {
+            witness.set_hash_target(*target, sibling.0)?;
+        }
         self.end_leaf.set_witness(&mut witness, &context.end_checkpoint_leaf)?;
         self.authorization_user_leaf.set_witness(&mut witness, &context.authorization_user_leaf)?;
         self.tag.set_witness(&mut witness, tag)?;
@@ -426,6 +451,41 @@ mod tests {
             assert!(prove_tag(reward.clone(), bad, root).is_err());
         }
     }
+
+    #[test]
+    fn direct_claim_membership_rejects_path_anchor_and_bound_mutations() {
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let claim_id = builder.add_virtual_target_arr();
+        let end_id = builder.add_virtual_target_arr();
+        let claim_hash = builder.add_virtual_hash();
+        let end_root = builder.add_virtual_hash();
+        let path = claim_checkpoint_path(&mut builder, claim_id, claim_hash, end_id, end_root);
+        let circuit = builder.build::<C>();
+        let siblings: Vec<_> = (0..CHECKPOINT_TREE_HEIGHT).map(|i| hash(20 + u64::from(i)).0).collect();
+        let value = hash(7).0;
+        let mut root = value;
+        for (level, sibling) in siblings.iter().enumerate() {
+            root = if 7u32 & (1 << level) == 0 { PoseidonHash::two_to_one(root, *sibling) }
+                else { PoseidonHash::two_to_one(*sibling, root) };
+        }
+        for mutation in 0..9 {
+            let mut witness = PartialWitness::new();
+            let claim = if mutation == 3 { 6 } else { 7 };
+            let end = if mutation == 6 { 6 } else if mutation == 8 { 7 } else { 9 };
+            witness.set_target(claim_id[0], F::from_canonical_u32(claim)).unwrap();
+            witness.set_target(claim_id[1], if mutation == 4 { F::ONE } else { F::ZERO }).unwrap();
+            witness.set_target(end_id[0], F::from_canonical_u32(end)).unwrap();
+            witness.set_target(end_id[1], if mutation == 5 { F::ONE } else { F::ZERO }).unwrap();
+            witness.set_hash_target(claim_hash, if mutation == 1 { hash(99).0 } else { value }).unwrap();
+            witness.set_hash_target(end_root, if mutation == 7 { hash(99).0 } else { root }).unwrap();
+            for (level, target) in path.siblings.iter().enumerate() {
+                witness.set_hash_target(*target, if mutation == 2 && level == 0 { hash(99).0 } else { siblings[level] }).unwrap();
+            }
+            let result = circuit.prove(witness);
+            if mutation == 0 || mutation == 8 { circuit.verify(result.unwrap()).unwrap(); }
+            else { assert!(result.is_err(), "accepted direct claim mutation {mutation}"); }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -455,7 +515,7 @@ mod authorization_binding_tests {
         }
         let reward = RewardLeaf { claim_checkpoint_id: 6, user_id: 1000, height: 2,
             path_index: 0, nullifier_index: 3, recipient: [1; 20] };
-        words.extend(reward.encode().unwrap().chunks_exact(32).map(|bytes| bytes.try_into().unwrap()));
+        words.extend(reward.encode().unwrap().chunks_exact(32).map(|bytes| <[u8; 32]>::try_from(bytes).unwrap()));
         let expected = message(b"PsyBridge/TwoArtifact/1/RewardAuthorization", &words);
         for mutation in 0..6 {
             let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());

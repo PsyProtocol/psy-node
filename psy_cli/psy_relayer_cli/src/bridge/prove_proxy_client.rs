@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use psy_plonky2_circuits::bridge::circuits::bridge_wrap::UncompressedGroth16ProofData;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -62,96 +61,6 @@ pub struct BridgeDepositBatchGroth16Proof {
     pub public_inputs: Vec<u64>,
 }
 
-/// Bridge aggregation input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeAggCheckpointLeaf {
-    pub global_chain_root: String,
-    pub stats_hash: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeAggGlobalStateRoots {
-    pub contract_tree_root: String,
-    pub deposit_tree_root: String,
-    pub user_tree_root: String,
-    pub withdrawal_tree_root: String,
-    pub user_registration_tree_root: String,
-    pub validator_tree_root: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeAggSlotWitness {
-    pub owner_user_id: u64,
-    pub contract_id: u64,
-    pub user_leaf_public_key: String,
-    pub user_leaf_user_state_tree_root: String,
-    pub user_leaf_balance: u64,
-    pub user_leaf_nonce: u64,
-    pub user_leaf_last_checkpoint_id: u64,
-    pub user_leaf_event_index: u64,
-    pub user_leaf_user_id: u64,
-    pub slot0_root: String,
-    pub slot0_value: String,
-    pub slot0_index: u64,
-    pub slot0_siblings: Vec<String>,
-    pub slot1_root: String,
-    pub slot1_value: String,
-    pub slot1_index: u64,
-    pub slot1_siblings: Vec<String>,
-    pub contract_root: String,
-    pub contract_value: String,
-    pub contract_index: u64,
-    pub contract_siblings: Vec<String>,
-    pub user_tree_root: String,
-    pub user_tree_value: String,
-    pub user_tree_index: u64,
-    pub user_tree_siblings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeAggDeltaProof {
-    pub index: u64,
-    pub new_value: String,
-    pub siblings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeAggWitnessInput {
-    pub from_checkpoint: u64,
-    pub to_checkpoint: u64,
-    /// Bincode-serialized ProofWithPublicInputs for the final (to_checkpoint)
-    /// checkpoint state transition proof, hex-encoded.
-    pub final_checkpoint_proof_hex: String,
-    pub delta_merkle_proofs: Vec<BridgeAggDeltaProof>,
-    pub pre_delta_merkle_proofs: Vec<BridgeAggDeltaProof>,
-    /// Chain hash immediately before the aggregated range (chain hash of
-    /// checkpoint `from_checkpoint - 1`; for `from_checkpoint <= 1` this is the
-    /// genesis checkpoint state transition hash).
-    pub chain_start: String,
-    /// Checkpoint state transition circuit fingerprint (hex).
-    /// Passed from the caller to match the coordinator's fingerprint.
-    pub checkpoint_fp: String,
-    pub final_checkpoint_leaf: BridgeAggCheckpointLeaf,
-    pub final_checkpoint_global_state_roots: BridgeAggGlobalStateRoots,
-    pub deposit_witness: BridgeAggSlotWitness,
-    pub withdrawal_witness: BridgeAggSlotWitness,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeAggGroth16Output {
-    pub from_checkpoint: u64,
-    pub to_checkpoint: u64,
-    pub num_checkpoints_aggregated: u64,
-    pub bridge_agg_public_inputs_count: usize,
-    pub bridge_agg_public_inputs: Vec<String>,
-    pub groth16_proof: UncompressedGroth16ProofData,
-    pub solidity_proof: [String; 8],
-    pub solidity_public_inputs: [String; 2],
-    pub checkpoint_roots: Vec<String>,
-    pub deposit_tree_root: String,
-    pub withdrawal_tree_root: String,
-    pub end_checkpoint_index: u64,
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 //  JSON-RPC types for jsonrpsee-compatible HTTP calls
@@ -272,31 +181,5 @@ impl ProveProxyClient {
         self.call("psy_prove_withdrawal_batch_claim_groth16", json!([input])).await
     }
 
-    /// Delegate bridge aggregation proof generation to Prove Proxy.
-    pub async fn prove_bridge_agg_groth16(
-        &self,
-        deps_network: String,
-        input: BridgeAggWitnessInput,
-    ) -> anyhow::Result<BridgeAggGroth16Output> {
-        self.call("psy_prove_bridge_agg_groth16", json!([deps_network, input])).await
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::BridgeAggGlobalStateRoots;
-
-    #[test]
-    fn bridge_roots_json_includes_validator_tree_root() {
-        let roots = BridgeAggGlobalStateRoots {
-            contract_tree_root: "contract".into(),
-            deposit_tree_root: "deposit".into(),
-            user_tree_root: "user".into(),
-            withdrawal_tree_root: "withdrawal".into(),
-            user_registration_tree_root: "registration".into(),
-            validator_tree_root: "validator".into(),
-        };
-        let value = serde_json::to_value(roots).unwrap();
-        assert_eq!(value["validator_tree_root"], "validator");
-    }
-}

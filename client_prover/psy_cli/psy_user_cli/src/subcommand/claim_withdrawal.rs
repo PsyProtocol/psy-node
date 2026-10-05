@@ -29,18 +29,19 @@ impl ClaimClient {
         anyhow::ensure!(network_type == psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet, "source graph supports explicitly selected LocalDevnet only");
         anyhow::ensure!(network.global_user_tree_height == psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT && network.realm_user_tree_height == psy_config::network_constants::REALM_USER_TREE_HEIGHT, "provider tree constants mismatch");
         let (_, coordinator) = psy_plonky2_circuits::circuit_library::get_plonky2_circuit_library_and_prover_for_network::<PoseidonGoldilocksConfig, 2>(network_type)?;
-        let circuits = AggregateCircuits::build::<psy_core::network_config::PsyNetworkLocalDevnetConstants>(config.chains.len(), &coordinator, AggregateCircuitHeights { deposit_state_tree: psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize, withdrawal_state_tree: psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize })?;
+        let chain_indices: Vec<u8> = config.chains.iter().map(|chain| chain.chain_index).collect();
+        let circuits = AggregateCircuits::build::<psy_core::network_config::PsyNetworkLocalDevnetConstants>(&chain_indices, &coordinator, AggregateCircuitHeights { deposit_state_tree: psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize, withdrawal_state_tree: psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize })?;
         circuits.validate_config(&config)?;
         Ok(Self { circuits, client: PortableClaimClient::new(config, RpcProvider::new_with_config(network)?, services_url)? })
     }
     pub async fn submit(&self, context: &AggregationContext, request: AdmissionRequest) -> Result<()> {
         let record = STANDARD.decode(&request.record)?;
         let family = match request.kind.as_str() { "withdrawal" => 2, "reward" => 3, _ => anyhow::bail!("invalid claim kind") };
-        let claim_id = digest(&[&domain_hash(Domain::Record), &self.config.config_hash()?, &word(family), &record]);
+        let claim_id = digest(&[&domain_hash(Domain::LeafCommit), &self.config.config_hash()?, &word(family), &record]);
         let response = self.http.post(format!("{}/api/v1/bridge/aggregation/claims", self.url)).json(&request).send().await?;
         let mut status: ClaimStatus = self.response(response).await?;
         loop {
-            self.validate_status(context, &claim_id, &status)?;
+            self.validate_status(context, &claim_id, family as u8, &status)?;
             println!("{}", serde_json::to_string(&status)?);
             if status.state == "applied" { return Ok(()); }
             if status.state == "queued" { let current = self.context().await?; if current != *context { return Err(ClaimError::ContextChanged(current).into()); } }

@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use super::slot_value_in_contract_state::{SlotValueInContractStateGadget, SlotValueInContractStateWitnessInput};
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TreeRootInContractStateWitnessInput<F: RichField> {
     pub owner_user_id: u64,
     pub contract_id: u64,
@@ -25,12 +25,12 @@ pub struct TreeRootInContractStateWitnessInput<F: RichField> {
 }
 
 impl<F: RichField> TreeRootInContractStateWitnessInput<F> {
-    pub fn to_slot_witnesses(&self) -> [SlotValueInContractStateWitnessInput<F>; 2] {
+    pub fn to_slot_witnesses(&self, slot_indices: [u64; 2]) -> [SlotValueInContractStateWitnessInput<F>; 2] {
         [
             SlotValueInContractStateWitnessInput {
                 sender_user_id: self.owner_user_id,
                 contract_id: self.contract_id,
-                slot_index: 0,
+                slot_index: slot_indices[0],
                 user_leaf: self.user_leaf.clone(),
                 slot_proof: self.slot0_proof.clone(),
                 contract_proof: self.contract_proof.clone(),
@@ -39,7 +39,7 @@ impl<F: RichField> TreeRootInContractStateWitnessInput<F> {
             SlotValueInContractStateWitnessInput {
                 sender_user_id: self.owner_user_id,
                 contract_id: self.contract_id,
-                slot_index: 1,
+                slot_index: slot_indices[1],
                 user_leaf: self.user_leaf.clone(),
                 slot_proof: self.slot1_proof.clone(),
                 contract_proof: self.contract_proof.clone(),
@@ -55,6 +55,7 @@ pub struct TreeRootInContractStateGadget {
     pub slot1: SlotValueInContractStateGadget,
     pub user_tree_root: HashOutTarget,
     pub tree_root: [HashOutTarget; 2],
+    pub slot_indices: [u64; 2],
 }
 
 impl TreeRootInContractStateGadget {
@@ -63,6 +64,7 @@ impl TreeRootInContractStateGadget {
         global_user_tree_height: usize,
         global_contract_tree_height: usize,
         contract_state_tree_height: usize,
+        slot_indices: [u64; 2],
     ) -> Self {
         let slot0 = SlotValueInContractStateGadget::add_virtual_to::<H, F, D>(
             builder,
@@ -80,10 +82,10 @@ impl TreeRootInContractStateGadget {
         builder.connect_hashes(slot0.slot_proof.root, slot1.slot_proof.root);
         builder.connect_hashes(slot0.user_tree_root, slot1.user_tree_root);
 
-        let zero = builder.zero();
-        let one = builder.one();
-        builder.connect(slot0.slot_index, zero);
-        builder.connect(slot1.slot_index, one);
+        for (slot, index) in [&slot0, &slot1].into_iter().zip(slot_indices) {
+            let index = builder.constant(F::from_canonical_u64(index));
+            builder.connect(slot.slot_index, index);
+        }
 
         // Storage layout for deposit/withdrawal tree contracts:
         // slot0 = [root[0], root[1], root[2], root[3]]
@@ -121,11 +123,12 @@ impl TreeRootInContractStateGadget {
             slot1,
             user_tree_root,
             tree_root,
+            slot_indices,
         }
     }
 
     pub fn set_witness<F: RichField>(&self, pw: &mut impl Witness<F>, input: &TreeRootInContractStateWitnessInput<F>) -> anyhow::Result<()> {
-        let slot_witnesses = input.to_slot_witnesses();
+        let slot_witnesses = input.to_slot_witnesses(self.slot_indices);
         self.slot0.set_witness(pw, &slot_witnesses[0])?;
         self.slot1.set_witness(pw, &slot_witnesses[1])?;
         Ok(())

@@ -1,5 +1,4 @@
 use std::{
-    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -8,9 +7,7 @@ use anyhow::Context;
 use clap::Args;
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore, MerkleProofCore},
-        tag_tree::{hash_tag_tree_node_four, hash_tag_tree_node_single},
-        traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable},
+        merkle_proof::compute_root_merkle_proof_generic,
     },
     pgoldilocks::QHashOut,
     protocol::core_types::QNetworkTreeConstants,
@@ -21,27 +18,8 @@ use plonky2::{
     plonk::config::{Hasher, PoseidonGoldilocksConfig},
 };
 use psy_core::{
-    constants::protocol::get_default_worker_rewards_tree_tag,
     job::job_id::ProvingJobCircuitType,
     network_config::PsyNetworkLocalDevnetConstants,
-};
-use psy_data::{
-    agg::AggStateTransitionWithStats,
-    guta::{
-        header::GlobalUserTreeAggregatorHeader,
-        realm_finalize::VALIDATOR_TREE_HEIGHT,
-        stats::GUTAStats,
-        sub_tree_transition::SubTreeNodeStateTransition,
-    },
-    protocol::circuit_inputs::{
-        agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput,
-        checkpoint_transition::{QCQEDCheckpointStateTransitionInput, QCQEDCheckpointStateTransitionInputPartial},
-    },
-    v1::qdata::{
-        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafCompact, PQEDCheckpointLeafCompactWithStateRoots, PQEDCheckpointLeafStats},
-        pm_jobs_completed_stats::PPMJobsCompletedStats,
-        user::PQEDUserLeaf,
-    },
 };
 use psy_plonky2_circuits::{
     bridge::{
@@ -49,7 +27,6 @@ use psy_plonky2_circuits::{
             bridge_agg_final::BridgeAggFinalCircuit,
             bridge_wrap::{BridgeWrapCircuit, DepositBatchWrapCircuit, WithdrawalClaimWrapCircuit},
         },
-        gadgets::tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
     },
     proof_minifier::pm_chain::QEDProofMinifierChain,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
@@ -62,7 +39,7 @@ use psy_plonky2_common_circuits::bridge::{
 };
 
 use crate::bridge::{
-    constants::{BRIDGE_USER_ID_U32, BRIDGE_USER_ID_U64, DEPOSIT_TREE_CONTRACT_ID, WITHDRAWAL_TREE_CONTRACT_ID},
+    constants::{BRIDGE_USER_ID_U32, WITHDRAWAL_TREE_CONTRACT_ID},
     prove_bridge::cached_bridge_coordinator_circuits,
 };
 
@@ -136,24 +113,27 @@ pub(crate) fn validate_digest_bits_setup(dir: &Path, expected: &psy_plonky2_circ
     Ok(identity_hash)
 }
 
-fn regenerate_aggregate_pair(config_path: &Path, output: &Path) -> anyhow::Result<()> {
+fn regenerate_aggregate_proofs(config_path: &Path, output: &Path) -> anyhow::Result<()> {
     use psy_plonky2_circuits::bridge::{aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits}, circuits::bridge_wrap::{DigestArtifact, DigestBitsAdapter}};
     anyhow::ensure!(matches!(fs::symlink_metadata(output), Err(error) if error.kind() == std::io::ErrorKind::NotFound), "aggregate output must not exist");
     let approved = load_aggregate_setup_config(config_path)?;
     let config = psy_client_data::bridge_aggregate::NetworkConfig::decode(&hex::decode(&approved.network_config)?)
         .map_err(|error| anyhow::anyhow!("invalid approved aggregate configuration: {error:?}"))?;
-    let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(config.chains.len(), cached_bridge_coordinator_circuits()?, AggregateCircuitHeights {
+    let chain_indices: Vec<_> = config.chains.iter().map(|chain| chain.chain_index).collect();
+    let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(&chain_indices, cached_bridge_coordinator_circuits()?, AggregateCircuitHeights {
         deposit_state_tree: DEPOSIT_CONTRACT_STATE_TREE_HEIGHT,
         withdrawal_state_tree: WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
     })?;
     circuits.validate_config(&config)?;
     let circuit_set = psy_client_data::bridge_aggregate::encode_circuit_set(circuits.entries())?;
-    let (normalizer_a, normalizer_b) = circuits.into_normalizers();
-    let adapter_a = DigestBitsAdapter::build(DigestArtifact::A, &normalizer_a.common, &normalizer_a.verifier_only)?;
-    let adapter_b = DigestBitsAdapter::build(DigestArtifact::B, &normalizer_b.common, &normalizer_b.verifier_only)?;
-    drop((normalizer_a, normalizer_b));
-    let a = adapter_a.into_wrapper(approved.sources.clone())?;
-    let b = adapter_b.into_wrapper(approved.sources)?;
+    let (source_deposit, source_withdrawal, source_reward) = circuits.into_digest_sources();
+    let adapter_deposit = DigestBitsAdapter::build(DigestArtifact::DepositAggregate, &source_deposit.common, &source_deposit.verifier_only)?;
+    let adapter_withdrawal = DigestBitsAdapter::build(DigestArtifact::WithdrawalAggregate, &source_withdrawal.common, &source_withdrawal.verifier_only)?;
+    let adapter_reward = DigestBitsAdapter::build(DigestArtifact::RewardAggregate, &source_reward.common, &source_reward.verifier_only)?;
+    drop((source_deposit, source_withdrawal, source_reward));
+    let deposit = adapter_deposit.into_wrapper(approved.sources.clone())?;
+    let withdrawal = adapter_withdrawal.into_wrapper(approved.sources.clone())?;
+    let reward = adapter_reward.into_wrapper(approved.sources)?;
     let parent = output.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let name = output.file_name().context("aggregate output must name a directory")?;
     let mut staging_name = name.to_os_string();
@@ -163,17 +143,17 @@ fn regenerate_aggregate_pair(config_path: &Path, output: &Path) -> anyhow::Resul
     let result = (|| -> anyhow::Result<()> {
         fs::write(staging.join("circuit_set.bin"), &circuit_set)?;
         fs::File::open(staging.join("circuit_set.bin"))?.sync_all()?;
-        let mut hashes = Vec::with_capacity(2);
-        for (name, wrapper) in [("A", &a), ("B", &b)] {
+        let mut hashes = Vec::with_capacity(3);
+        for (name, wrapper) in [("DepositAggregate", &deposit), ("WithdrawalAggregate", &withdrawal), ("RewardAggregate", &reward)] {
             let directory = staging.join(name);
             wrapper.setup(directory.to_str().context("aggregate artifact path must be UTF-8")?)?;
             hashes.push(validate_digest_bits_setup(&directory, wrapper.identity())?);
         }
-        let pair = serde_json::json!({"schema": 1, "A": hashes[0], "B": hashes[1]});
-        fs::write(staging.join("pair.json"), serde_json::to_vec(&pair)?)?;
-        fs::File::open(staging.join("pair.json"))?.sync_all()?;
+        let aggregates = serde_json::json!({"schema": 1, "DepositAggregate": hashes[0], "WithdrawalAggregate": hashes[1], "RewardAggregate": hashes[2]});
+        fs::write(staging.join("setup-aggregates.json"), serde_json::to_vec(&aggregates)?)?;
+        fs::File::open(staging.join("setup-aggregates.json"))?.sync_all()?;
         fs::File::open(&staging)?.sync_all()?;
-        install_aggregate_pair(&staging, output)?;
+        install_aggregate_proofs(&staging, output)?;
         fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -182,7 +162,7 @@ fn regenerate_aggregate_pair(config_path: &Path, output: &Path) -> anyhow::Resul
 }
 
 #[cfg(target_os = "linux")]
-fn install_aggregate_pair(staging: &Path, output: &Path) -> anyhow::Result<()> {
+fn install_aggregate_proofs(staging: &Path, output: &Path) -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let staging = std::ffi::CString::new(staging.as_os_str().as_bytes())?;
     let output = std::ffi::CString::new(output.as_os_str().as_bytes())?;
@@ -192,7 +172,7 @@ fn install_aggregate_pair(staging: &Path, output: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_aggregate_pair(_staging: &Path, _output: &Path) -> anyhow::Result<()> {
+fn install_aggregate_proofs(_staging: &Path, _output: &Path) -> anyhow::Result<()> {
     anyhow::bail!("atomic no-replace aggregate publication requires Linux renameat2")
 }
 
@@ -208,15 +188,25 @@ mod aggregate_setup_tests {
     }
 
     #[test]
-    fn aggregate_pair_requires_complete_exclusive_arguments() {
-        assert!(Command::try_parse_from(["setup", "--aggregate-pair"]).is_err());
-        assert!(Command::try_parse_from(["setup", "--aggregate-config", "config.json", "--output-dir", "pair"]).is_err());
-        for option in ["--include-bridge-agg", "--skip-deposit-append", "--skip-withdrawal-claim"] {
-            assert!(Command::try_parse_from(["setup", "--aggregate-pair", "--aggregate-config", "config.json", "--output-dir", "pair", option]).is_err());
+    fn aggregate_proofs_requires_complete_exclusive_arguments() {
+        assert!(Command::try_parse_from(["setup", "--aggregate-pair", "--aggregate-config", "config.json", "--output-dir", "aggregates"]).is_err());
+        assert!(Command::try_parse_from(["setup", "--aggregate-proofs"]).is_err());
+        assert!(Command::try_parse_from(["setup", "--aggregate-config", "config.json", "--output-dir", "aggregates"]).is_err());
+        for option in ["--keystore-dir=keys", "--include-bridge-agg", "--skip-deposit-append", "--skip-withdrawal-claim"] {
+            assert!(Command::try_parse_from(["setup", "--aggregate-proofs", "--aggregate-config", "config.json", "--output-dir", "aggregates", option]).is_err());
         }
-        let command = Command::try_parse_from(["setup", "--aggregate-pair", "--aggregate-config", "config.json", "--output-dir", "pair"]).unwrap();
+        let command = Command::try_parse_from(["setup", "--aggregate-proofs", "--aggregate-config", "config.json", "--output-dir", "aggregates"]).unwrap();
         assert_eq!(command.args.aggregate_config.as_deref(), Some(Path::new("config.json")));
-        assert_eq!(command.args.output_dir.as_deref(), Some(Path::new("pair")));
+        assert_eq!(command.args.output_dir.as_deref(), Some(Path::new("aggregates")));
+    }
+
+    #[test]
+    fn finalize_setup_requires_config_and_standalone_destination() {
+        assert!(Command::try_parse_from(["setup", "--include-bridge-agg"]).is_err());
+        assert!(Command::try_parse_from(["setup", "--include-bridge-agg", "--aggregate-config", "config.json"]).is_err());
+        let command = Command::try_parse_from(["setup", "--include-bridge-agg", "--aggregate-config", "config.json", "--skip-deposit-append", "--skip-withdrawal-claim", "--keystore-dir", "fresh-finalize"]).unwrap();
+        assert!(command.args.include_bridge_agg);
+        assert_eq!(command.args.keystore_dir.as_deref(), Some(Path::new("fresh-finalize")));
     }
 
     #[cfg(target_os = "linux")]
@@ -227,15 +217,15 @@ mod aggregate_setup_tests {
         let staging = root.join("staging");
         let output = root.join("output");
         fs::create_dir(&staging).unwrap();
-        fs::write(staging.join("pair.json"), b"candidate").unwrap();
+        fs::write(staging.join("setup-aggregates.json"), b"candidate").unwrap();
         fs::create_dir(&output).unwrap();
-        fs::write(output.join("pair.json"), b"retained").unwrap();
-        assert!(install_aggregate_pair(&staging, &output).is_err());
-        assert_eq!(fs::read(output.join("pair.json")).unwrap(), b"retained");
-        assert_eq!(fs::read(staging.join("pair.json")).unwrap(), b"candidate");
+        fs::write(output.join("setup-aggregates.json"), b"retained").unwrap();
+        assert!(install_aggregate_proofs(&staging, &output).is_err());
+        assert_eq!(fs::read(output.join("setup-aggregates.json")).unwrap(), b"retained");
+        assert_eq!(fs::read(staging.join("setup-aggregates.json")).unwrap(), b"candidate");
         let fresh = root.join("fresh");
-        install_aggregate_pair(&staging, &fresh).unwrap();
-        assert_eq!(fs::read(fresh.join("pair.json")).unwrap(), b"candidate");
+        install_aggregate_proofs(&staging, &fresh).unwrap();
+        assert_eq!(fs::read(fresh.join("setup-aggregates.json")).unwrap(), b"candidate");
         assert!(!staging.exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -247,7 +237,7 @@ pub struct RegenerateGroth16KeystoreArgs {
     #[arg(long)]
     pub keystore_dir: Option<PathBuf>,
     /// Also regenerate the bridge aggregation wrapper keystore.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, requires_all = ["aggregate_config", "skip_deposit_append", "skip_withdrawal_claim"])]
     pub include_bridge_agg: bool,
     /// Do not regenerate deposit_append.
     #[arg(long, default_value_t = false)]
@@ -255,24 +245,28 @@ pub struct RegenerateGroth16KeystoreArgs {
     /// Do not regenerate withdrawal_claim.
     #[arg(long, default_value_t = false)]
     pub skip_withdrawal_claim: bool,
-    /// Generate and publish the complete A/B setup pair to a fresh destination.
+    /// Generate and publish DepositAggregate, WithdrawalAggregate and RewardAggregate setups to a fresh destination.
     #[arg(long, requires_all = ["aggregate_config", "output_dir"], conflicts_with_all = ["keystore_dir", "include_bridge_agg", "skip_deposit_append", "skip_withdrawal_claim"])]
-    pub aggregate_pair: bool,
+    pub aggregate_proofs: bool,
     /// Approved canonical configuration and reviewed source identities as JSON.
-    #[arg(long, requires = "aggregate_pair")]
+    #[arg(long)]
     pub aggregate_config: Option<PathBuf>,
-    /// Fresh directory receiving both setups in one atomic publication.
-    #[arg(long, requires = "aggregate_pair")]
+    /// Fresh directory receiving all three digest setups in one atomic publication.
+    #[arg(long, requires = "aggregate_proofs")]
     pub output_dir: Option<PathBuf>,
 }
 
 pub fn run(args: RegenerateGroth16KeystoreArgs) -> anyhow::Result<()> {
-    if args.aggregate_pair {
-        anyhow::ensure!(!args.include_bridge_agg && !args.skip_deposit_append && !args.skip_withdrawal_claim && args.keystore_dir.is_none(), "aggregate-pair cannot use old keystore options");
-        return regenerate_aggregate_pair(args.aggregate_config.as_deref().context("aggregate-pair requires aggregate-config")?, args.output_dir.as_deref().context("aggregate-pair requires output-dir")?);
+    if args.aggregate_proofs {
+        anyhow::ensure!(!args.include_bridge_agg && !args.skip_deposit_append && !args.skip_withdrawal_claim && args.keystore_dir.is_none(), "aggregate-proofs cannot use old keystore options");
+        return regenerate_aggregate_proofs(args.aggregate_config.as_deref().context("aggregate-proofs requires aggregate-config")?, args.output_dir.as_deref().context("aggregate-proofs requires output-dir")?);
     }
-    anyhow::ensure!(args.aggregate_config.is_none() && args.output_dir.is_none(), "aggregate-config and output-dir require aggregate-pair");
+    anyhow::ensure!(args.output_dir.is_none() && (args.aggregate_config.is_none() || args.include_bridge_agg), "aggregate-config requires aggregate-proofs or include-bridge-agg");
     let keystore_dir = args.keystore_dir.unwrap_or_else(default_keystore_dir);
+    if args.include_bridge_agg {
+        anyhow::ensure!(args.skip_deposit_append && args.skip_withdrawal_claim, "finalize setup requires both skip flags and a fresh standalone directory");
+        return regenerate_bridge_agg(&keystore_dir, args.aggregate_config.as_deref().context("finalize setup requires aggregate-config")?);
+    }
     fs::create_dir_all(&keystore_dir)
         .with_context(|| format!("failed to create keystore dir: {}", keystore_dir.display()))?;
 
@@ -282,361 +276,32 @@ pub fn run(args: RegenerateGroth16KeystoreArgs) -> anyhow::Result<()> {
     if !args.skip_withdrawal_claim {
         regenerate_withdrawal_claim(&keystore_dir)?;
     }
-    if args.include_bridge_agg {
-        regenerate_bridge_agg(&keystore_dir)?;
-    }
 
     println!("regenerated local Groth16 keystore files under {}", keystore_dir.display());
     Ok(())
 }
 
-fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
-    clear_groth16_files(keystore_dir)?;
-
-    println!("building bridge agg final circuit...");
-    let coordinator_circuits = cached_bridge_coordinator_circuits()?;
-    let worker_rewards_tree_tag = get_default_worker_rewards_tree_tag::<QHashOut<F>>();
-    let checkpoint_common_data = coordinator_circuits
-        .checkpoint_root_transition
-        .get_common_circuit_data_ref();
-    let checkpoint_verifier_data = coordinator_circuits
-        .checkpoint_root_transition
-        .get_verifier_config_ref();
-    let checkpoint_cap_height = checkpoint_verifier_data.constants_sigmas_cap.height();
-    let checkpoint_fingerprint = coordinator_circuits.checkpoint_root_transition.get_fingerprint();
-    let cached_lib =
-        psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
-    let checkpoint_step_commit_fingerprint = cached_lib
-        .get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
+fn regenerate_bridge_agg(keystore_dir: &Path, config_path: &Path) -> anyhow::Result<()> {
+    let approved = load_aggregate_setup_config(config_path)?;
+    let config = psy_client_data::bridge_aggregate::NetworkConfig::decode(&hex::decode(&approved.network_config)?)
+        .map_err(|error| anyhow::anyhow!("invalid approved aggregate configuration: {error:?}"))?;
+    let chain_indices: Vec<_> = config.chains.iter().map(|chain| chain.chain_index).collect();
+    let coordinator = cached_bridge_coordinator_circuits()?;
+    let checkpoint = &coordinator.checkpoint_root_transition;
+    let cached = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
+    let checkpoint_base = cached.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
         .context("GenerateRollupStateTransitionProof not found in cached circuit library")?;
-
-    let (deposit_witness, withdrawal_witness, checkpoint_global_state_roots) =
-        bridge_state_witnesses()?;
-    let register_users_state_root = checkpoint_global_state_roots.user_registration_tree_root;
-    let deploy_contracts_state_root = checkpoint_global_state_roots.contract_tree_root;
-    let user_tree_root = checkpoint_global_state_roots.user_tree_root;
-    let register_users_whitelist = PoseidonHash::q_two_to_one(
-        coordinator_circuits.append_user_registration_tree.get_fingerprint(),
-        coordinator_circuits.agg_state_transition.get_fingerprint(),
+    let finalizer = BridgeAggFinalCircuit::<C, D>::prebuild_final_circuit(
+        checkpoint.get_common_circuit_data_ref(),
+        checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(),
+        checkpoint.get_fingerprint(), checkpoint_base,
+        CHECKPOINT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT,
+        DEPOSIT_CONTRACT_STATE_TREE_HEIGHT, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
+        &chain_indices,
     );
-    let deploy_contracts_whitelist = PoseidonHash::q_two_to_one(
-        coordinator_circuits
-            .state_layout_circuits
-            .batch_deploy_contracts
-            .get_fingerprint(),
-        coordinator_circuits.agg_state_transition.get_fingerprint(),
-    );
-    let update_contracts_whitelist = PoseidonHash::q_two_to_one(
-        coordinator_circuits
-            .state_layout_circuits
-            .batch_update_contracts
-            .get_fingerprint(),
-        coordinator_circuits.agg_state_transition.get_fingerprint(),
-    );
-    let register_users_reward =
-        hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &worker_rewards_tree_tag);
-    let deploy_contracts_reward =
-        hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &worker_rewards_tree_tag);
-    let update_contracts_reward =
-        hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &worker_rewards_tree_tag);
-    let guta_reward =
-        hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &worker_rewards_tree_tag);
-
-    let register_users_proof = coordinator_circuits.dummy_agg_state_transition.prove_base(
-        register_users_whitelist,
-        register_users_state_root,
-        worker_rewards_tree_tag,
-    ).context("failed to generate dummy register-users aggregate proof")?;
-    let deploy_contracts_proof = coordinator_circuits.dummy_agg_state_transition.prove_base(
-        deploy_contracts_whitelist,
-        deploy_contracts_state_root,
-        worker_rewards_tree_tag,
-    ).context("failed to generate dummy deploy-contracts aggregate proof")?;
-    let update_contracts_proof = coordinator_circuits.dummy_agg_state_transition.prove_base(
-        update_contracts_whitelist,
-        deploy_contracts_state_root,
-        worker_rewards_tree_tag,
-    ).context("failed to generate dummy update-contracts aggregate proof")?;
-
-    let genesis_stats = PQEDCheckpointLeafStats::<F, QHashOut<F>>::new_empty();
-    let genesis_roots = checkpoint_global_state_roots;
-    let genesis_leaf = PQEDCheckpointLeaf {
-        global_chain_root: genesis_roots.qfhash::<PoseidonHash>(),
-        stats: genesis_stats,
-    };
-    let genesis_leaf_hash = genesis_leaf.qfhash::<PoseidonHash>();
-    let genesis_tree_proof = MerkleProofCore {
-        root: compute_root_merkle_proof_generic::<QHashOut<F>, PoseidonHash>(
-            genesis_leaf_hash,
-            0,
-            &zero_siblings(CHECKPOINT_TREE_HEIGHT),
-        ),
-        value: genesis_leaf_hash,
-        index: 0,
-        siblings: zero_siblings(CHECKPOINT_TREE_HEIGHT),
-    };
-    let genesis_proof = coordinator_circuits.genesis_checkpoint_root_transition.prove_base(
-        genesis_tree_proof.root,
-        genesis_leaf_hash,
-        coordinator_circuits.genesis_checkpoint_root_transition.get_fingerprint(),
-    ).context("failed to generate genesis checkpoint proof")?;
-    let genesis_chain_hash = QHashOut::<F>::from_felt_slice(&genesis_proof.public_inputs);
-
-    let checkpoint_leaf_with_roots = PQEDCheckpointLeafCompactWithStateRoots {
-        global_state_roots: genesis_roots,
-        checkpoint_leaf: PQEDCheckpointLeafCompact {
-            global_chain_root: genesis_leaf.global_chain_root,
-            stats_hash: genesis_stats.qfhash::<PoseidonHash>(),
-        },
-    };
-    let guta_checkpoint_proof = MerkleProofCore {
-        root: genesis_tree_proof.root,
-        value: checkpoint_leaf_with_roots.qfhash::<PoseidonHash>(),
-        index: 0,
-        siblings: zero_siblings(CHECKPOINT_TREE_HEIGHT),
-    };
-    let guta_proof = coordinator_circuits.guta_circuits.no_change.prove_base(
-        worker_rewards_tree_tag,
-        coordinator_circuits.guta_circuits.guta_circuit_whitelist_root,
-        &guta_checkpoint_proof,
-        &checkpoint_leaf_with_roots,
-    ).context("failed to generate GUTA no-change proof")?;
-    let guta_header = GlobalUserTreeAggregatorHeader {
-        guta_circuit_whitelist: coordinator_circuits.guta_circuits.guta_circuit_whitelist_root,
-        checkpoint_tree_root: genesis_tree_proof.root,
-        state_transition: SubTreeNodeStateTransition {
-            old_node_value: user_tree_root,
-            new_node_value: user_tree_root,
-            node_index: F::ZERO,
-            node_level: F::ZERO,
-        },
-        stats: GUTAStats::get_zero_value(),
-        total_aggregation_proofs_generated: F::ONE,
-    };
-    let register_users_transition = AggStateTransitionWithStats {
-        state_transition_start: register_users_state_root,
-        state_transition_end: register_users_state_root,
-        total_proofs_generated: 1,
-    };
-    let deploy_contracts_transition = AggStateTransitionWithStats {
-        state_transition_start: deploy_contracts_state_root,
-        state_transition_end: deploy_contracts_state_root,
-        total_proofs_generated: 1,
-    };
-    // no-op update contracts transition (start == end == deploy end root)
-    let update_contracts_transition = AggStateTransitionWithStats {
-        state_transition_start: deploy_contracts_state_root,
-        state_transition_end: deploy_contracts_state_root,
-        total_proofs_generated: 1,
-    };
-    let part_1_header = QCAggUserRegistartionDeployContractsGUTAInput {
-        register_users_state_transition: register_users_transition,
-        deploy_contracts_state_transition: deploy_contracts_transition,
-        update_contracts_state_transition: update_contracts_transition,
-        guta_proof_header: guta_header,
-    };
-    let part_1_reward = hash_tag_tree_node_four::<QHashOut<F>, PoseidonHash>(
-        &guta_reward,
-        &register_users_reward,
-        &deploy_contracts_reward,
-        &update_contracts_reward,
-        &worker_rewards_tree_tag,
-    );
-    let part_1_proof = coordinator_circuits.agg_user_register_deploy_contracts_guta.prove_base(
-        worker_rewards_tree_tag,
-        &part_1_header.register_users_state_transition.get_agg_state_transition(),
-        &register_users_proof,
-        coordinator_circuits.dummy_agg_state_transition.get_verifier_config_ref(),
-        register_users_reward,
-        F::ONE,
-        &part_1_header.deploy_contracts_state_transition.get_agg_state_transition(),
-        &deploy_contracts_proof,
-        coordinator_circuits.dummy_agg_state_transition.get_verifier_config_ref(),
-        deploy_contracts_reward,
-        F::ONE,
-        &part_1_header.update_contracts_state_transition.get_agg_state_transition(),
-        &update_contracts_proof,
-        coordinator_circuits.dummy_agg_state_transition.get_verifier_config_ref(),
-        update_contracts_reward,
-        F::ONE,
-        &coordinator_circuits.guta_circuits.no_change_whitelist_proof,
-        &part_1_header.guta_proof_header,
-        &guta_proof,
-        coordinator_circuits.guta_circuits.no_change.get_verifier_config_ref(),
-        guta_reward,
-    ).context("failed to generate coordinator part-1 proof")?;
-
-    let append_delta = DeltaMerkleProofCore {
-        old_root: genesis_tree_proof.root,
-        old_value: QHashOut::ZERO,
-        new_root: genesis_tree_proof.root,
-        new_value: QHashOut::ZERO,
-        index: 1,
-        siblings: append_siblings_after_first_leaf(genesis_leaf_hash, CHECKPOINT_TREE_HEIGHT),
-    };
-    let checkpoint_input_partial = QCQEDCheckpointStateTransitionInputPartial {
-        part_1_header,
-        old_stats: genesis_stats,
-        block_time: F::ONE,
-        final_random_seed_contribution: qhash(400),
-        pm_jobs_completed: PPMJobsCompletedStats {
-            deploy_contracts_completed: F::ONE,
-            register_users_completed: F::ONE,
-            gutas_completed: F::ONE,
-        },
-        validator_tree_root: <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(
-            VALIDATOR_TREE_HEIGHT,
-        ),
-    };
-    let checkpoint_reward_root =
-        hash_tag_tree_node_single::<QHashOut<F>, PoseidonHash>(&part_1_reward, &worker_rewards_tree_tag);
-    let final_checkpoint_leaf_full =
-        checkpoint_input_partial.get_new_checkpoint_leaf::<PoseidonHash>(checkpoint_reward_root);
-    let final_checkpoint_leaf = PQEDCheckpointLeafCompact {
-        global_chain_root: final_checkpoint_leaf_full.global_chain_root,
-        stats_hash: final_checkpoint_leaf_full.stats.qfhash::<PoseidonHash>(),
-    };
-    let mut checkpoint_input = QCQEDCheckpointStateTransitionInput {
-        partial: checkpoint_input_partial,
-        append_checkpoint_tree_proof: append_delta,
-        previous_checkpoint_proof: genesis_tree_proof,
-        genesis_checkpoint_state_transition_hash: genesis_chain_hash,
-        last_old_checkpoint_tree_leaf_hash: QHashOut::ZERO,
-        last_old_checkpoint_tree_root_hash: QHashOut::ZERO,
-        previous_chain_hash: genesis_chain_hash,
-        checkpoint_state_transition_circuit_fingerprint: checkpoint_fingerprint,
-    };
-    checkpoint_input.update_for_prover::<PoseidonHash>(checkpoint_reward_root);
-
-    let part_1_actual_public_inputs = QHashOut::<F>::from_felt_slice(&part_1_proof.public_inputs);
-    let part_1_expected_public_inputs = PoseidonHash::q_two_to_one(
-        checkpoint_input
-            .partial
-            .part_1_header
-            .get_public_inputs_hash_no_rewards_tag::<PoseidonHash>(),
-        part_1_reward,
-    );
-    anyhow::ensure!(
-        part_1_actual_public_inputs == part_1_expected_public_inputs,
-        "part-1 public inputs mismatch: actual={:?}, expected={:?}",
-        part_1_actual_public_inputs,
-        part_1_expected_public_inputs,
-    );
-
-    let expected_old_checkpoint_leaf = checkpoint_input
-        .partial
-        .get_old_checkpoint_leaf::<PoseidonHash>()
-        .qfhash::<PoseidonHash>();
-    anyhow::ensure!(
-        checkpoint_input.previous_checkpoint_proof.value == expected_old_checkpoint_leaf,
-        "previous checkpoint leaf mismatch: proof={:?}, expected={:?}",
-        checkpoint_input.previous_checkpoint_proof.value,
-        expected_old_checkpoint_leaf,
-    );
-    anyhow::ensure!(
-        checkpoint_input.previous_checkpoint_proof.root
-            == checkpoint_input.append_checkpoint_tree_proof.old_root,
-        "checkpoint Merkle roots are not contiguous",
-    );
-    anyhow::ensure!(
-        checkpoint_input.append_checkpoint_tree_proof.new_value
-            == final_checkpoint_leaf_full.qfhash::<PoseidonHash>(),
-        "new checkpoint leaf does not match append proof",
-    );
-
-    let final_checkpoint_proof = coordinator_circuits.checkpoint_root_transition.prove_base(
-        worker_rewards_tree_tag,
-        &checkpoint_input,
-        part_1_reward,
-        &part_1_proof,
-        coordinator_circuits.agg_user_register_deploy_contracts_guta.get_verifier_config_ref(),
-        &genesis_proof,
-        coordinator_circuits.genesis_checkpoint_root_transition.get_verifier_config_ref(),
-    ).context("failed to generate checkpoint transition proof")?;
-
-    let delta_merkle_proofs = vec![checkpoint_input.append_checkpoint_tree_proof.clone()];
-    let pre_delta_merkle_proofs = vec![DeltaMerkleProofCore {
-        new_value: genesis_leaf_hash,
-        ..checkpoint_input.append_checkpoint_tree_proof.clone()
-    }];
-
-    anyhow::ensure!(
-        checkpoint_step_commit_fingerprint == checkpoint_fingerprint,
-        "cached checkpoint fingerprint does not match coordinator circuit: cached={:?}, coordinator={:?}",
-        checkpoint_step_commit_fingerprint,
-        checkpoint_fingerprint,
-    );
-    let checkpoint_root_and_leaf = hash_two(
-        checkpoint_input.append_checkpoint_tree_proof.new_root,
-        checkpoint_input.append_checkpoint_tree_proof.new_value,
-    );
-    let expected_checkpoint_chain_hash = hash_two(
-        genesis_chain_hash,
-        hash_two(checkpoint_root_and_leaf, checkpoint_step_commit_fingerprint),
-    );
-    let actual_checkpoint_chain_hash =
-        QHashOut::<F>::from_felt_slice(&final_checkpoint_proof.public_inputs);
-    anyhow::ensure!(
-        actual_checkpoint_chain_hash == expected_checkpoint_chain_hash,
-        "checkpoint chain hash mismatch before bridge final: proof={:?}, expected={:?}",
-        actual_checkpoint_chain_hash,
-        expected_checkpoint_chain_hash,
-    );
-    anyhow::ensure!(
-        checkpoint_global_state_roots.qfhash::<PoseidonHash>()
-            == final_checkpoint_leaf.global_chain_root,
-        "checkpoint global state roots do not match final checkpoint leaf",
-    );
-    anyhow::ensure!(
-        deposit_witness.user_tree_proof.root == checkpoint_global_state_roots.user_tree_root
-            && withdrawal_witness.user_tree_proof.root
-                == checkpoint_global_state_roots.user_tree_root,
-        "bridge witnesses do not match checkpoint user tree root",
-    );
-
-    let result = BridgeAggFinalCircuit::<C, D>::prove_range(
-        1,
-        1,
-        genesis_chain_hash,
-        checkpoint_common_data,
-        checkpoint_cap_height,
-        checkpoint_fingerprint,
-        checkpoint_step_commit_fingerprint,
-        &final_checkpoint_proof,
-        checkpoint_verifier_data,
-        &delta_merkle_proofs,
-        &pre_delta_merkle_proofs,
-        &final_checkpoint_leaf,
-        &checkpoint_global_state_roots,
-        &deposit_witness,
-        &withdrawal_witness,
-        CHECKPOINT_TREE_HEIGHT,
-        GLOBAL_USER_TREE_HEIGHT,
-        GLOBAL_CONTRACT_TREE_HEIGHT,
-        DEPOSIT_CONTRACT_STATE_TREE_HEIGHT,
-        WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
-    ).context("failed to generate bridge aggregation final proof")?;
-
-    println!(
-        "bridge_agg final fingerprint: {:?}, wrapper keystore: {}",
-        result.fingerprint,
-        keystore_dir.display()
-    );
-    let wrap = BridgeWrapCircuit::new(
-        &result.common_data,
-        result.fingerprint,
-        result.verifier_data.constants_sigmas_cap.height(),
-    );
-    let shared_wrapper = BridgeWrapCircuit::new(
-        &result.common_data,
-        result.fingerprint,
-        result.verifier_data.constants_sigmas_cap.height(),
-    )
-    .into_shared_groth16_wrapper(format!("{}/", keystore_dir.display()));
-    println!("generating bridge_agg Groth16 setup/proof...");
-    wrap.prove_groth16_with_shared_wrapper(&shared_wrapper, &result.verifier_data, &result.proof)?;
+    let wrapper = BridgeWrapCircuit::new(&finalizer)?.into_shared_groth16_wrapper(keystore_dir.to_str().context("finalize directory must be UTF-8")?.into());
+    wrapper.setup_finalize()?;
     require_groth16_files(keystore_dir)?;
-    println!("updated {}", keystore_dir.display());
     Ok(())
 }
 
@@ -797,13 +462,6 @@ fn sample_words(seed: u32) -> [u32; 8] {
     ]
 }
 
-fn qhash(seed: u64) -> QHashOut<F> {
-    QHashOut(PoseidonHash::hash_no_pad(&[F::from_canonical_u64(seed)]))
-}
-
-fn slot_value(seed: u64) -> QHashOut<F> {
-    QHashOut::from_values(seed, seed + 1, seed + 2, seed + 3)
-}
 
 fn hash_two(left: QHashOut<F>, right: QHashOut<F>) -> QHashOut<F> {
     QHashOut(<PoseidonHash as Hasher<F>>::two_to_one(left.0, right.0))
@@ -819,13 +477,6 @@ fn zero_siblings(height: usize) -> Vec<QHashOut<F>> {
     siblings
 }
 
-fn append_siblings_after_first_leaf(first_leaf_hash: QHashOut<F>, height: usize) -> Vec<QHashOut<F>> {
-    let mut siblings = zero_siblings(height);
-    if let Some(first) = siblings.first_mut() {
-        *first = first_leaf_hash;
-    }
-    siblings
-}
 
 fn sample_withdrawal_leaf_hash() -> QHashOut<F> {
     let withdrawal = sample_withdrawal();
@@ -840,147 +491,3 @@ fn sample_withdrawal_leaf_hash() -> QHashOut<F> {
     QHashOut(PoseidonHash::hash_no_pad(&felts))
 }
 
-fn user_leaf_hash(user: &PQEDUserLeaf<F, QHashOut<F>>) -> QHashOut<F> {
-    let mut values = Vec::with_capacity(13);
-    values.extend_from_slice(&user.public_key.0.elements);
-    values.extend_from_slice(&user.user_state_tree_root.0.elements);
-    values.extend_from_slice(&[
-        user.balance,
-        user.nonce,
-        user.last_checkpoint_id,
-        user.event_index,
-        user.user_id,
-    ]);
-    QHashOut(PoseidonHash::hash_no_pad(&values))
-}
-
-fn sparse_merkle_proof(
-    leaves: &HashMap<u64, QHashOut<F>>,
-    index: u64,
-    height: usize,
-) -> MerkleProofCore<QHashOut<F>> {
-    let mut layer = leaves.clone();
-    let value = layer.get(&index).copied().unwrap_or(QHashOut::ZERO);
-    let mut siblings = Vec::with_capacity(height);
-    let mut cur = index;
-    for level in 0..height {
-        let sibling_idx = cur ^ 1;
-        let sibling = layer
-            .get(&sibling_idx)
-            .copied()
-            .unwrap_or_else(|| <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(level));
-        siblings.push(sibling);
-
-        let mut parents = HashSet::new();
-        for &k in layer.keys() {
-            parents.insert(k >> 1);
-        }
-        parents.insert(cur >> 1);
-        let mut next = HashMap::new();
-        for p in parents {
-            let left_i = p << 1;
-            let right_i = left_i + 1;
-            let left = layer
-                .get(&left_i)
-                .copied()
-                .unwrap_or_else(|| <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(level));
-            let right = layer
-                .get(&right_i)
-                .copied()
-                .unwrap_or_else(|| <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(level));
-            next.insert(p, hash_two(left, right));
-        }
-        layer = next;
-        cur >>= 1;
-    }
-    MerkleProofCore {
-        root: layer.get(&0).copied().unwrap_or_else(|| <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(height)),
-        value,
-        index,
-        siblings,
-    }
-}
-
-fn bridge_state_witnesses() -> anyhow::Result<(
-    TreeRootInContractStateWitnessInput<F>,
-    TreeRootInContractStateWitnessInput<F>,
-    PQEDCheckpointGlobalStateRoots<QHashOut<F>>,
-)> {
-    let deposit_slot0 = slot_value(1_000);
-    let deposit_slot1 = slot_value(2_000);
-    let withdrawal_slot0 = slot_value(3_000);
-    let withdrawal_slot1 = slot_value(4_000);
-
-    let mut deposit_leaves = HashMap::new();
-    deposit_leaves.insert(0, deposit_slot0);
-    deposit_leaves.insert(1, deposit_slot1);
-    let deposit_slot0_proof = sparse_merkle_proof(&deposit_leaves, 0, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT);
-    let deposit_slot1_proof = sparse_merkle_proof(&deposit_leaves, 1, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT);
-    let deposit_state_root = deposit_slot0_proof.root;
-    anyhow::ensure!(deposit_slot1_proof.root == deposit_state_root, "deposit state roots mismatch");
-
-    let mut withdrawal_leaves = HashMap::new();
-    withdrawal_leaves.insert(0, withdrawal_slot0);
-    withdrawal_leaves.insert(1, withdrawal_slot1);
-    let withdrawal_slot0_proof = sparse_merkle_proof(&withdrawal_leaves, 0, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT);
-    let withdrawal_slot1_proof = sparse_merkle_proof(&withdrawal_leaves, 1, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT);
-    let withdrawal_state_root = withdrawal_slot0_proof.root;
-    anyhow::ensure!(withdrawal_slot1_proof.root == withdrawal_state_root, "withdrawal state roots mismatch");
-
-    let mut contract_leaves = HashMap::new();
-    contract_leaves.insert(DEPOSIT_TREE_CONTRACT_ID as u64, deposit_state_root);
-    contract_leaves.insert(WITHDRAWAL_TREE_CONTRACT_ID as u64, withdrawal_state_root);
-    let deposit_contract_proof =
-        sparse_merkle_proof(&contract_leaves, DEPOSIT_TREE_CONTRACT_ID as u64, GLOBAL_CONTRACT_TREE_HEIGHT);
-    let withdrawal_contract_proof =
-        sparse_merkle_proof(&contract_leaves, WITHDRAWAL_TREE_CONTRACT_ID as u64, GLOBAL_CONTRACT_TREE_HEIGHT);
-    anyhow::ensure!(
-        deposit_contract_proof.root == withdrawal_contract_proof.root,
-        "contract tree roots mismatch"
-    );
-
-    let user_leaf = PQEDUserLeaf::new(
-        qhash(5_000),
-        deposit_contract_proof.root,
-        F::ONE,
-        F::ZERO,
-        F::ZERO,
-        F::ZERO,
-        F::from_canonical_u64(BRIDGE_USER_ID_U64),
-    );
-    let user_hash = user_leaf_hash(&user_leaf);
-    let mut user_leaves = HashMap::new();
-    user_leaves.insert(BRIDGE_USER_ID_U64, user_hash);
-    let user_tree_proof = sparse_merkle_proof(&user_leaves, BRIDGE_USER_ID_U64, GLOBAL_USER_TREE_HEIGHT);
-
-    let global_roots = PQEDCheckpointGlobalStateRoots {
-        contract_tree_root: deposit_contract_proof.root,
-        deposit_tree_root: <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(32),
-        user_tree_root: user_tree_proof.root,
-        withdrawal_tree_root: <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(32),
-        user_registration_tree_root: qhash(9_000),
-        validator_tree_root: <PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(
-            VALIDATOR_TREE_HEIGHT,
-        ),
-    };
-
-    let deposit = TreeRootInContractStateWitnessInput {
-        owner_user_id: BRIDGE_USER_ID_U64,
-        contract_id: DEPOSIT_TREE_CONTRACT_ID as u64,
-        user_leaf: user_leaf.clone(),
-        slot0_proof: deposit_slot0_proof,
-        slot1_proof: deposit_slot1_proof,
-        contract_proof: deposit_contract_proof,
-        user_tree_proof: user_tree_proof.clone(),
-    };
-    let withdrawal = TreeRootInContractStateWitnessInput {
-        owner_user_id: BRIDGE_USER_ID_U64,
-        contract_id: WITHDRAWAL_TREE_CONTRACT_ID as u64,
-        user_leaf,
-        slot0_proof: withdrawal_slot0_proof,
-        slot1_proof: withdrawal_slot1_proof,
-        contract_proof: withdrawal_contract_proof,
-        user_tree_proof,
-    };
-    Ok((deposit, withdrawal, global_roots))
-}

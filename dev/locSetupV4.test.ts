@@ -1111,8 +1111,7 @@ withdraw_method_id = 4159421846
 max_deposits = 1
 reserved_withdrawals = 1
 reserved_rewards = 0
-max_a_calldata_bytes = 4096
-max_b_calldata_bytes = 4096
+max_window_calldata_bytes = 4096
 [[aggregate_limits.chains]]
 chain_index = 0
 max_deposits = 1
@@ -1192,7 +1191,10 @@ password_env = "SYNTHETIC_PASSWORD"
                 ["reserved_rewards = 0", "reserved_rewards = -1"],
                 ["tx_gas_limit = 5000000", "tx_gas_limit = 1.5"],
                 ["block_gas_reserve = 100000", "block_gas_reserve = 9007199254740993.0"],
-                ["max_b_calldata_bytes = 4096", "# absent byte budget"],
+                ["max_window_calldata_bytes = 4096", "# absent byte budget"],
+                ["max_window_calldata_bytes = 4096", "max_window_calldata_bytes = 0"],
+                ["[aggregate_limits]", "[aggregate_limits]\nmax_a_calldata_bytes = 4096"],
+                ["[aggregate_limits]", "[aggregate_limits]\nmax_b_calldata_bytes = 4096"],
             ]) {
                 await writeFile(path.join(cwd, "daemon.toml"), daemonToml.replace(before, after));
                 await expect(resolveBridgeDaemonConfigPath(cwd, env)).rejects.toThrow("aggregate_limits");

@@ -6,7 +6,7 @@ use psy_client_data::{bridge_aggregate::{Hash4, RewardLeaf}, config::store_confi
 use psy_common_circuit::{builder::{hash::core::CircuitBuilderHashCore, comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers}, circuits::{traits::qstandard::QStandardCircuit, zk_signature3::core::PsyBasicZKSignatureCircuit, secp256k1_signature::{Secp256K1SignatureCircuit, EthPersonalSignSecp256K1SignatureCircuit}}, crypto::secp256k1::{gadget::Secp256K1Gadget, ecdsa::gadgets::biguint::{BigUintTarget, CircuitBuilderBiguint}}, traits::CreatableTarget, u32::arithmetic_u32::U32Target};
 use psy_config::network_constants::{CHECKPOINT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT};
 use psy_network_circuit::gadgets::qdata::{checkpoint::PsyCheckpointLeafGadget, checkpoint_state_roots::PsyCheckpointGlobalStateRootsGadget, user::PsyUserLeafGadget};
-use psy_plonky2_common_circuits::{bridge::aggregate_commitment::{self as encoding, RewardLeafTarget, RecordTarget}, hash::keccak::keccak256_u32_words_be_abi};
+use psy_plonky2_common_circuits::{bridge::aggregate_commitment::{self as encoding, RewardLeafTarget, AggregateLeafTarget}, hash::keccak::keccak256_u32_words_be_abi};
 use psy_vm::{reward_authorization::RewardAuthorizationWitness, ups::multisig::MultisigPolicy};
 use super::{multisig::MultisigSignatureCircuit, software_defined::get_zk_public_key_param};
 
@@ -45,7 +45,7 @@ pub fn build_reward_authorization_message_target(builder: &mut CircuitBuilder<F,
     words.extend(config_hash);
     words.extend(encoding::word_u64(builder, end_id));
     for hash in [end_root, end_leaf_hash, user_hash, claim_hash] { words.extend(encoding::encode_hash4(builder, hash)); }
-    words.extend(RecordTarget::Reward(*reward).encode(builder));
+    words.extend(AggregateLeafTarget::Reward(*reward).encode(builder));
     for &word in &words { builder.range_check(word, 32); }
     keccak256_u32_words_be_abi(builder, &words).map(|v| v.0)
 }

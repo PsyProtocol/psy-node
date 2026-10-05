@@ -161,7 +161,7 @@ tiny-keccak = { version = "2.0", features = ["sha3", "keccak"] }
 blst = "0.3"
 libp2p = { version = "0.55", default-features = false, features = ["tcp", "noise", "yamux", "gossipsub", "identify", "request-response", "relay", "dcutr", "autonat", "macros", "tokio", "dns"] }
 libp2p-identity = { version = "0.2", features = ["peerid", "ed25519"] }
-gnark-plonky2-verifier-ffi = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-verifier-ffi", rev = "35fd12a8117e53939703df6d7b98567933e65159" }
+gnark-plonky2-verifier-ffi = { git = "ssh://git@github.com/PsyProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-verifier-ffi", rev = "53bd550dba52b1a5be8832ecfa095f94341273f2" }
 alloy-signer = { version = "=1.6.3", default-features = false }
 alloy-signer-local = { version = "=1.6.3", features = ["mnemonic", "keystore"] }
 alloy-primitives = { version = "1.3.1", features = [
@@ -267,7 +267,7 @@ ts-rs = "10.1.0"
 plonky2 = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"]}
 plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934" }
 plonky2_field = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"] }
-gnark-plonky2-wrapper = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-wrapper", rev = "35fd12a8117e53939703df6d7b98567933e65159" }
+gnark-plonky2-wrapper = { git = "ssh://git@github.com/PsyProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-wrapper", rev = "53bd550dba52b1a5be8832ecfa095f94341273f2" }
 
 # ---- WASM ----
 wasm-bindgen = "0.2"
