@@ -62,7 +62,7 @@ impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
     }
 
     fn from_qfelts(felts: &[F]) -> Self {
-        if felts.len() != 13 {
+        if felts.len() != Self::q_felt_size() {
             panic!("Invalid number of elements for PsyContractLeaf");
         }
         let deployer = QHashOut::from_qfelts(&felts[0..4]);
@@ -179,5 +179,37 @@ impl From<&ContractCodeDefinition> for SimpleContractCodeDefinition {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
+    use psy_client_common::{data::qhashout::QHashOut, traits::to_qfelts::{QFeltSized, ToQFelts}};
+
+    use super::PsyContractLeaf;
+
+    type F = GoldilocksField;
+
+    fn distinct_leaf() -> PsyContractLeaf<F> {
+        PsyContractLeaf {
+            deployer: QHashOut::from_values(1, 2, 3, 4),
+            function_tree_root: QHashOut::from_values(5, 6, 7, 8),
+            code_root: QHashOut::from_values(9, 10, 11, 12),
+            state_tree_height: F::from_canonical_u64(16),
+            state_layout_root: QHashOut::from_values(13, 14, 15, 16),
+            state_layout_field_count: F::from_canonical_u64(3),
+            state_layout_slot_count: F::from_canonical_u64(8),
+        }
+    }
+
+    #[test]
+    fn nonzero_distinct_fields_roundtrip_preserves_all_nineteen() {
+        let leaf = distinct_leaf();
+        let felts = leaf.to_qfelts();
+        assert_eq!(felts.len(), PsyContractLeaf::<F>::q_felt_size());
+        assert_eq!(felts.len(), 19);
+        let recovered = PsyContractLeaf::<F>::from_qfelts(&felts);
+        assert_eq!(recovered, leaf);
     }
 }

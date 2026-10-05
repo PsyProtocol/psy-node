@@ -310,12 +310,16 @@ pub async fn run(path: &Path) -> Result<(), GuardianSignError> {
     let observer = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut warned = None;
         loop {
             tokio::select! {
                 _ = stopping.changed() => break,
                 _ = interval.tick() => {
                     let mut service = observer_service.lock().await;
-                    let _ = service.check_signing_authorization().await;
+                    match service.check_signing_authorization().await {
+                        Err(error) => warn_observer_authorization(&mut warned, Some(error)),
+                        Ok(()) => warn_observer_authorization(&mut warned, None),
+                    }
                     let _ = tokio::time::timeout(Duration::from_secs(30), service.observe()).await;
                 }
             }
@@ -470,6 +474,14 @@ impl GuardianSigner {
             serde_json::to_vec(&response).map_err(|_| GuardianSignError::JournalUnavailable)
         }).await
     }
+}
+
+fn warn_observer_authorization(warned: &mut Option<GuardianSignError>, error: Option<GuardianSignError>) {
+    let Some(error) = error else { *warned = None; return; };
+    if error == GuardianSignError::KeyUnavailable { *warned = None; return; }
+    if warned.is_some_and(|previous| previous == error) { return; }
+    *warned = Some(error);
+    tracing::warn!(code = %error, "guardian observer authorization failed");
 }
 
 fn error_response(request_id: Option<Hex32>, code: GuardianSignError) -> HttpResponse {
@@ -734,5 +746,38 @@ mod tests {
             assert_eq!(history_query(Some(query)), Err(GuardianSignError::MalformedRequest));
         }
         assert_eq!(history_query(Some("after_nonce=18446744073709551615&limit=64")), Ok((u64::MAX, 64)));
+    }
+
+    #[test]
+    fn observer_warns_journal_failure_once_until_quiet_or_success_reset() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        struct LogCapture(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.lock().expect("log").write(buf) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        fn codes(logged: &str) -> Vec<GuardianSignError> {
+            logged.split("code=").skip(1).map(|part| match part.split_whitespace().next().unwrap() {
+                "JournalUnavailable" => GuardianSignError::JournalUnavailable,
+                "AccountHalted" => GuardianSignError::AccountHalted,
+                other => panic!("unexpected observer code {other}"),
+            }).collect()
+        }
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).without_time().with_ansi(false)
+            .with_writer(move || LogCapture(writer.clone())).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut warned = None;
+            for error in [Some(GuardianSignError::JournalUnavailable), Some(GuardianSignError::JournalUnavailable), Some(GuardianSignError::KeyUnavailable), Some(GuardianSignError::JournalUnavailable), None, Some(GuardianSignError::JournalUnavailable), Some(GuardianSignError::AccountHalted), Some(GuardianSignError::AccountHalted)] {
+                warn_observer_authorization(&mut warned, error);
+            }
+        });
+        let logged = String::from_utf8(captured.lock().expect("log").clone()).unwrap();
+        assert_eq!(codes(&logged), [
+            GuardianSignError::JournalUnavailable, GuardianSignError::JournalUnavailable,
+            GuardianSignError::JournalUnavailable, GuardianSignError::AccountHalted,
+        ]);
     }
 }

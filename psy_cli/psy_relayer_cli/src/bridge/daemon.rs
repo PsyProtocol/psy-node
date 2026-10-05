@@ -39,6 +39,7 @@ const DEFAULT_PROOF_DIR: &str = "/tmp/psy_bridge_proofs";
 const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 const DEFAULT_MAX_CHECKPOINT_BATCH: u64 = 64;
 
+
 // deposit_tree storage is felt-addressed, with 4 felts packed per contract-state leaf.
 // Layout:
 //   root[8]                 -> sub-slots 0..7
@@ -527,6 +528,8 @@ struct ReceiptDispositions {
     final_proofs: Option<WindowProofs>,
     dispositions: Vec<super::api_client::ClaimDisposition>,
     reverted_receipts: Vec<RevertedReceipt>,
+    #[serde(default)]
+    posted_opening_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -924,7 +927,7 @@ async fn run_multichain(
     loop {
         if let Err(error) = advance_aggregate_round(&config, &chains, &provider, &network, &circuits, &approved.sources,
             &http, &proof_dir, &state_path, &mut state, lag, max_batch).await {
-            if error.downcast_ref::<super::api_client::AggregationHttpError>().is_none() { return Err(error); }
+            if error.downcast_ref::<ReplayBootstrapError>().is_some() || error.downcast_ref::<super::api_client::AggregationHttpError>().is_none() { return Err(error); }
             tracing::warn!(%error, "aggregate service unavailable; durable round retained");
             state = load_multichain_state(&state_path, &identity_namespace)?;
         }
@@ -1122,10 +1125,30 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
 }
 
 
+
+fn canonical_finalize_word(index: usize, word: U256) -> anyhow::Result<()> {
+    let count_slot = index >= 26 && (index - 26) % 9 == 4;
+    if (4..20).contains(&index) || count_slot {
+        ensure!(word <= U256::from(u32::MAX), "noncanonical retained finalize slot");
+    } else {
+        ensure!(word <= U256::from(u64::MAX) && u64::try_from(word).unwrap() < 0xffff_ffff_0000_0001, "noncanonical retained finalize root");
+    }
+    Ok(())
+}
+
+fn validate_retained_finalize_identity(evidence: &FinalizeEvidence, chains: usize) -> anyhow::Result<()> {
+    let pi = &evidence.checkpoint_pi;
+    ensure!(pi.len() == 26 + 9 * chains, "finalize endpoint count mismatch");
+    ensure!(evidence.proof != [U256::ZERO; 8] && pi[25] > U256::ZERO && pi[25] <= pi[24] && pi[24] <= U256::from(u32::MAX), "positive finalize endpoint mismatch");
+    for (index, word) in pi.iter().enumerate() { canonical_finalize_word(index, *word)?; }
+    Ok(())
+}
+
 fn validate_finalize_endpoints(evidence: &FinalizeEvidence, deposit: &psy_client_data::bridge_aggregate::DepositAggregateOpening, withdrawal: &psy_client_data::bridge_aggregate::WithdrawalAggregateOpening) -> anyhow::Result<()> {
     let pi = &evidence.checkpoint_pi;
-    ensure!(pi.len() == 26 + 9 * deposit.starts.len() && withdrawal.withdrawal_roots.len() == deposit.starts.len(), "finalize endpoint count mismatch");
-    ensure!(evidence.proof != [U256::ZERO; 8] && pi[25] > U256::ZERO && pi[25] <= pi[24] && pi[24] == U256::from(deposit.end_checkpoint_id) && pi[24] <= U256::from(u32::MAX) && pi[20..24] == deposit.end_checkpoint_root.map(U256::from), "positive finalize endpoint mismatch");
+    ensure!(withdrawal.withdrawal_roots.len() == deposit.starts.len(), "finalize endpoint count mismatch");
+    validate_retained_finalize_identity(evidence, deposit.starts.len())?;
+    ensure!(pi[24] == U256::from(deposit.end_checkpoint_id) && pi[20..24] == deposit.end_checkpoint_root.map(U256::from), "positive finalize endpoint mismatch");
     for (ordinal, transition) in deposit.deposits.iter().enumerate() {
         let base = 26 + 9 * ordinal;
         ensure!(pi[base..base + 4] == transition.new_root.map(U256::from) && pi[base + 4] == U256::from(transition.new_count) && pi[base + 5..base + 9] == withdrawal.withdrawal_roots[ordinal].map(U256::from), "finalize endpoint mismatch");
@@ -1166,7 +1189,7 @@ async fn prove_frozen_aggregate(config: &BridgeProposeDaemonConfig, provider: &R
     for start in a.starts.iter().filter(|start| start.start_checkpoint_id < a.end_checkpoint_id).chain(a.starts.iter().filter(|start| start.start_checkpoint_id == a.end_checkpoint_id)) {
         if start.start_checkpoint_id == a.end_checkpoint_id {
             ensure!(start.start_checkpoint_root == a.end_checkpoint_root, "replay root mismatch");
-            let evidence = reusable.as_ref().context("positive finalize evidence unavailable for replay; bootstrap must advance")?;
+            let Some(evidence) = reusable.as_ref() else { return Err(ReplayBootstrapError.into()); };
             validate_finalize_endpoints(evidence, &a, &w)?;
             finalize.push((start.chain_index, evidence.clone()));
             continue;
@@ -1176,10 +1199,7 @@ async fn prove_frozen_aggregate(config: &BridgeProposeDaemonConfig, provider: &R
         let pi = raw.proof.public_inputs.iter().map(|field| U256::from(field.to_canonical_u64())).collect::<Vec<_>>();
         ensure!(pi.len() == 26 + 9 * indices.len(), "finalize endpoint PI width mismatch");
         ensure!(pi[..4] == start.start_checkpoint_root.map(U256::from) && pi[20..24] == a.end_checkpoint_root.map(U256::from) && pi[24] == U256::from(a.end_checkpoint_id) && pi[25] == U256::from(a.end_checkpoint_id.checked_sub(start.start_checkpoint_id).context("finalize interval regressed")?), "finalize endpoint mismatch");
-        let wrap = BridgeWrapCircuit::new(&circuits.checkpoint_final)?;
-        let shared = BridgeWrapCircuit::new(&circuits.checkpoint_final)?
-            .into_shared_groth16_wrapper(format!("{}/.psy/keystore/", home::home_dir().context("home directory unavailable")?.display()));
-        let proof = wrap.prove_groth16_with_shared_wrapper(&shared, &raw.verifier_data, &raw.proof)?;
+        let proof = BridgeWrapCircuit::new(&circuits.checkpoint_final)?.prove_groth16(&raw.verifier_data, &raw.proof, format!("{}/.psy/keystore/", home::home_dir().context("home directory unavailable")?.display()))?;
         let evidence = FinalizeEvidence { proof: parse_aggregate_proof(&proof, super::finalize_bridge::finalize_statement(&pi)?)?, checkpoint_pi: pi };
         validate_finalize_endpoints(&evidence, &a, &w)?;
         reusable = Some(evidence.clone());
@@ -1425,7 +1445,7 @@ async fn record_frozen_family_dispositions(
         }
         let reverted_receipts = destinations.iter().filter_map(|destination| match &destination.submission {
             Submission::Reverted { transaction_hash, block_hash, block_number } => Some(RevertedReceipt { chain_index: destination.chain_index, transaction_hash: transaction_hash.clone(), block_hash: block_hash.clone(), block_number: *block_number }), _ => None }).collect();
-        receipt_dispositions.insert(format!("{family}:{}", hex::encode(opening_digests[family as usize - 2])), ReceiptDispositions { family, opening: save_aggregate_file(directory, &opening, "opening")?, final_proofs: final_proofs.clone(), dispositions, reverted_receipts });
+        receipt_dispositions.insert(format!("{family}:{}", hex::encode(opening_digests[family as usize - 2])), ReceiptDispositions { family, opening: save_aggregate_file(directory, &opening, "opening")?, final_proofs: final_proofs.clone(), dispositions, reverted_receipts, posted_opening_digest: None });
     }
     Ok(())
 }
@@ -1471,20 +1491,19 @@ async fn advance_aggregate_round(config: &BridgeProposeDaemonConfig, chains: &[C
     for key in state.receipt_dispositions.keys().cloned().collect::<Vec<_>>() {
         let (family_text, opening_digest) = key.split_once(':').context("receipt key family missing")?;
         let family: u8 = family_text.parse()?;
-        let receipt = &state.receipt_dispositions[&key];
-        let opening = load_aggregate_file(directory, &receipt.opening)?;
-        super::api_client::post_aggregation_dispositions(http, &config.services_url, &config.aggregation_token_file,
-            &AggregationDispositions::Disposed { family, opening_digest: format!("0x{opening_digest}"), opening: base64::engine::general_purpose::STANDARD.encode(opening), dispositions: receipt.dispositions.clone() }).await?;
-        if let Some(PendingAggregate::Frozen { a_opening, destinations, .. }) = &state.pending {
-            let active = DepositAggregateOpening::decode(&aggregate_bytes(a_opening)?)?;
-            if destinations.iter().all(|destination| matches!(destination.submission, Submission::Finalized { .. })) {
-                state.last_finalized_checkpoint = active.end_checkpoint_id;
-                state.pending = None;
-            }
+        let mut receipt = state.receipt_dispositions[&key].clone();
+        if receipt.posted_opening_digest.as_deref() != Some(opening_digest) {
+            let opening = load_aggregate_file(directory, &receipt.opening)?;
+            super::api_client::post_aggregation_dispositions(http, &config.services_url, &config.aggregation_token_file,
+                &AggregationDispositions::Disposed { family, opening_digest: format!("0x{opening_digest}"), opening: base64::engine::general_purpose::STANDARD.encode(opening), dispositions: receipt.dispositions.clone() }).await?;
+            receipt.posted_opening_digest = Some(opening_digest.to_string());
+            state.receipt_dispositions.insert(key, receipt);
+            save_multichain_state(state_path, state)?;
         }
-        state.receipt_dispositions.remove(&key);
-        save_multichain_state(state_path, state)?;
     }
+    remove_posted_receipts_outside_window(network, state)?;
+    save_multichain_state(state_path, state)?;
+    clear_completed_applied_window(directory, network, state_path, state)?;
     for chain in chains {
         let cursor = chain.l1.last_finalized_checkpoint(chain.state_manager).await?;
         let head = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
@@ -1602,7 +1621,7 @@ async fn advance_aggregate_round(config: &BridgeProposeDaemonConfig, chains: &[C
         return Err(error);
     }
     if let Err(error) = prove_frozen_aggregate(config, provider, network, circuits, sources, directory, state_path, state).await {
-        if error.downcast_ref::<DaemonStateWriteError>().is_some() { return Err(error); }
+        if error.downcast_ref::<DaemonStateWriteError>().is_some() || error.downcast_ref::<ReplayBootstrapError>().is_some() { return Err(error); }
         tracing::warn!(%error, "aggregate proving failed; retrying identical frozen inputs");
         return Ok(());
     }
@@ -1673,7 +1692,6 @@ async fn advance_aggregate_round(config: &BridgeProposeDaemonConfig, chains: &[C
     if !complete && !failed { return Ok(()); }
     let checkpoint = crate::guardian::service::load_guardian_committed_head(provider, &provider.get_coordinator_url()?).await?.checkpoint_id;
     reconcile_frozen_window(config, chains, provider, network, http, directory, state_path, state, checkpoint, !complete).await?;
-    if complete { if let Some(PendingAggregate::Frozen { a_opening, .. }) = &state.pending { state.last_finalized_checkpoint = DepositAggregateOpening::decode(&aggregate_bytes(a_opening)?)?.end_checkpoint_id; state.pending = None; save_multichain_state(state_path, state)?; } }
     Ok(())
 }
 
@@ -1834,6 +1852,83 @@ fn load_aggregate_file(directory: &Path, reference: &FileReference) -> anyhow::R
     Ok(bytes)
 }
 
+fn family_disposition_applied(state: &MultichainDaemonState, family: u8, opening_digest: [u8; 32], record_count: usize) -> bool {
+    if record_count == 0 { return true; }
+    let Some(receipt) = state.receipt_dispositions.get(&format!("{family}:{}", hex::encode(opening_digest))) else { return false; };
+    receipt.posted_opening_digest.as_deref() == Some(hex::encode(opening_digest).as_str())
+        && receipt.dispositions.len() == record_count
+        && receipt.dispositions.iter().all(|disposition| matches!(disposition, super::api_client::ClaimDisposition::Applied { .. }))
+}
+
+fn current_window_receipt_keys(network: &psy_client_data::bridge_aggregate::NetworkConfig, state: &MultichainDaemonState) -> anyhow::Result<Vec<String>> {
+    let Some(PendingAggregate::Frozen { withdrawal_opening, reward_opening, .. }) = &state.pending else { return Ok(Vec::new()); };
+    let w = psy_client_data::bridge_aggregate::WithdrawalAggregateOpening::decode(&aggregate_bytes(withdrawal_opening)?)?;
+    let r = psy_client_data::bridge_aggregate::RewardAggregateOpening::decode(&aggregate_bytes(reward_opening)?)?;
+    Ok(vec![format!("2:{}", hex::encode(w.opening_digest(network)?)), format!("3:{}", hex::encode(r.opening_digest(network)?))])
+}
+
+fn remove_posted_receipts_outside_window(network: &psy_client_data::bridge_aggregate::NetworkConfig, state: &mut MultichainDaemonState) -> anyhow::Result<()> {
+    let current = current_window_receipt_keys(network, state)?;
+    state.receipt_dispositions.retain(|key, receipt| receipt.posted_opening_digest.is_none() || current.iter().any(|marker| marker == key));
+    Ok(())
+}
+
+fn retained_end(evidence: &FinalizeEvidence, chains: usize) -> anyhow::Result<(U256, [U256; 4])> {
+    validate_retained_finalize_identity(evidence, chains)?;
+    let pi = &evidence.checkpoint_pi;
+    Ok((pi[24], [pi[20], pi[21], pi[22], pi[23]]))
+}
+
+fn opening_end(bytes: &[u8], family: u8) -> anyhow::Result<(U256, [U256; 4])> {
+    let (id, root) = match family {
+        2 => { let opening = psy_client_data::bridge_aggregate::WithdrawalAggregateOpening::decode(bytes)?; (opening.end_checkpoint_id, opening.end_checkpoint_root) }
+        3 => { let opening = psy_client_data::bridge_aggregate::RewardAggregateOpening::decode(bytes)?; (opening.end_checkpoint_id, opening.end_checkpoint_root) }
+        _ => anyhow::bail!("malformed receipt family"),
+    };
+    Ok((U256::from(id), root.map(U256::from)))
+}
+
+fn clear_completed_applied_window(directory: &Path, network: &psy_client_data::bridge_aggregate::NetworkConfig, state_path: &Path, state: &mut MultichainDaemonState) -> anyhow::Result<()> {
+    let Some(PendingAggregate::Frozen { destinations, a_opening, withdrawal_opening, reward_opening, .. }) = state.pending.clone() else { return Ok(()); };
+    if !destinations.iter().all(|destination| matches!(destination.submission, Submission::Finalized { .. })) { return Ok(()); }
+    let a = psy_client_data::bridge_aggregate::DepositAggregateOpening::decode(&aggregate_bytes(&a_opening)?)?;
+    let w = psy_client_data::bridge_aggregate::WithdrawalAggregateOpening::decode(&aggregate_bytes(&withdrawal_opening)?)?;
+    let r = psy_client_data::bridge_aggregate::RewardAggregateOpening::decode(&aggregate_bytes(&reward_opening)?)?;
+    if !family_disposition_applied(state, 2, w.opening_digest(network)?, w.withdrawals.len()) || !family_disposition_applied(state, 3, r.opening_digest(network)?, r.rewards.len()) { return Ok(()); }
+    let mut keep = vec![(U256::from(a.end_checkpoint_id), a.end_checkpoint_root.map(U256::from))];
+    for destination in &destinations { if let Some(evidence) = &destination.finalize { validate_finalize_endpoints(evidence, &a, &w)?; } }
+    for evidence in state.retained_finalize.values() { retained_end(evidence, a.starts.len())?; }
+    for receipt in state.receipt_dispositions.values() {
+        if receipt.posted_opening_digest.is_some() { continue; }
+        keep.push(opening_end(&load_aggregate_file(directory, &receipt.opening)?, receipt.family)?);
+    }
+    let markers = current_window_receipt_keys(network, state)?;
+    state.last_finalized_checkpoint = a.end_checkpoint_id;
+    state.pending = None;
+    for marker in &markers { state.receipt_dispositions.remove(marker); }
+    state.retained_finalize.retain(|_, evidence| keep.iter().any(|end| retained_end(evidence, a.starts.len()).ok().as_ref() == Some(end)));
+    save_multichain_state(state_path, state)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+#[derive(Debug)]
+struct ReplayBootstrapError;
+impl std::fmt::Display for ReplayBootstrapError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("positive finalize evidence unavailable for replay; aggregation context changed")
+    }
+}
+impl std::error::Error for ReplayBootstrapError {}
 
 #[derive(Debug)]
 struct DaemonStateWriteError(anyhow::Error);
@@ -3922,7 +4017,7 @@ impl RelayerWindow {
         current.retained_finalize.insert("aa".repeat(32), FinalizeEvidence { proof: [U256::ZERO; 8], checkpoint_pi: vec![U256::ZERO; 35] });
         current.receipt_dispositions.insert(format!("2:{}", "bb".repeat(32)), ReceiptDispositions {
             family: 2, opening: FileReference { relative_path: "aggregate-opening.opening".into(), sha256: "cc".repeat(32) },
-            final_proofs: None, dispositions: Vec::new(), reverted_receipts: Vec::new(),
+            final_proofs: None, dispositions: Vec::new(), reverted_receipts: Vec::new(), posted_opening_digest: None,
         });
         let mut document: toml::Value = toml::from_str(&toml::to_string(&current).unwrap()).unwrap();
         fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
@@ -5383,4 +5478,310 @@ deployments_network = "localhostBase"
             assert!(validate_frozen_capacity(&over, &a, &w, &r).is_err());
         }
     }
+
+    struct AggregateArtifactDir(std::path::PathBuf);
+    impl AggregateArtifactDir {
+        fn new(name: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "psy-relayer-aggregate-file-{name}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+        fn path(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for AggregateArtifactDir {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                panic!("failed to remove aggregate artifact dir {}: {error}", self.0.display());
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_file_round_trip_retains_exact_bytes() {
+        let directory = AggregateArtifactDir::new("round-trip");
+        let bytes = b"\x00aggregate-opening\xff".to_vec();
+        let first = save_aggregate_file(directory.path(), &bytes, "opening").unwrap();
+        let second = save_aggregate_file(directory.path(), &bytes, "opening").unwrap();
+        assert_eq!(first.relative_path, second.relative_path);
+        assert_eq!(first.sha256, second.sha256);
+        assert_eq!(load_aggregate_file(directory.path(), &second).unwrap(), bytes);
+        assert_eq!(std::fs::read(directory.path().join(&first.relative_path)).unwrap(), bytes);
+        assert_eq!(first.sha256, hex::encode(crate::guardian::protocol::sha256(&bytes).0));
+    }
+
+    #[test]
+    fn aggregate_file_load_rejects_tampered_bytes() {
+        let directory = AggregateArtifactDir::new("tampered");
+        let reference = save_aggregate_file(directory.path(), b"canonical", "opening").unwrap();
+        std::fs::write(directory.path().join(&reference.relative_path), b"tampered").unwrap();
+        let error = load_aggregate_file(directory.path(), &reference).unwrap_err();
+        assert!(error.to_string().contains("aggregate file digest mismatch"));
+    }
+
+    fn nonempty_window(end_checkpoint_id: u64, end_checkpoint_root: [u64; 4]) -> (psy_client_data::bridge_aggregate::DepositAggregateOpening, psy_client_data::bridge_aggregate::WithdrawalAggregateOpening, psy_client_data::bridge_aggregate::RewardAggregateOpening, AggregateLimits, FinalizeEvidence) {
+        use psy_client_data::bridge_aggregate::{ChainStart, DepositAggregateOpening, DepositTransition, RewardAggregateOpening, RewardLeaf, WithdrawalAggregateOpening, WithdrawalLeaf};
+        let network = configured_network();
+        let config_hash = network.config_hash().unwrap();
+        let withdrawal_root = [1, 2, 3, 4];
+        let start_checkpoint_id = end_checkpoint_id.saturating_sub(10);
+        let mut a = DepositAggregateOpening { config_hash, window_id: [0; 32], end_checkpoint_id, end_checkpoint_root,
+            starts: network.chains.iter().map(|chain| ChainStart { chain_index: chain.chain_index, start_checkpoint_id, start_checkpoint_root: [1, 2, 3, 4] }).collect(),
+            deposits: network.chains.iter().map(|chain| DepositTransition { chain_index: chain.chain_index, old_root: [1, 2, 3, 4], new_root: [1, 2, 3, 4], old_count: 0, new_count: 0 }).collect(),
+            deposit_leaves: Vec::new() };
+        a.window_id = a.window_id().unwrap();
+        let w = WithdrawalAggregateOpening { config_hash, window_id: a.window_id, end_checkpoint_id, end_checkpoint_root, withdrawal_roots: vec![withdrawal_root],
+            withdrawals: vec![WithdrawalLeaf { chain_index: 0, sender_user_id: 11, recipient: [9; 20], token: [8; 20], amount: { let mut amount = [0; 32]; amount[31] = 1; amount }, nonce: [6; 32] }] };
+        let r = RewardAggregateOpening { config_hash, window_id: a.window_id, end_checkpoint_id, end_checkpoint_root,
+            rewards: vec![RewardLeaf { claim_checkpoint_id: end_checkpoint_id, user_id: 4, height: 2, path_index: 0, nullifier_index: 3, recipient: [7; 20] }] };
+        let bytes = 960 + 2980 + 192 + 192;
+        let limits = AggregateLimits { max_deposits: 0, reserved_withdrawals: 1, reserved_rewards: 1, max_window_calldata_bytes: bytes,
+            chains: vec![ChainLimits { chain_index: 0, max_deposits: 0, reserved_withdrawals: 1, tx_gas_limit: 1, block_gas_reserve: 1 }] };
+        let mut pi = vec![U256::ZERO; 35];
+        pi[20..24].copy_from_slice(&end_checkpoint_root.map(U256::from));
+        pi[24] = U256::from(end_checkpoint_id);
+        pi[25] = U256::from(end_checkpoint_id - start_checkpoint_id);
+        pi[26..30].copy_from_slice(&[U256::from(1), U256::from(2), U256::from(3), U256::from(4)]);
+        pi[31..35].copy_from_slice(&withdrawal_root.map(U256::from));
+        (a, w, r, limits, FinalizeEvidence { proof: [U256::from(1); 8], checkpoint_pi: pi })
+    }
+
+    fn frozen_from(directory: &std::path::Path, a: &psy_client_data::bridge_aggregate::DepositAggregateOpening, w: &psy_client_data::bridge_aggregate::WithdrawalAggregateOpening, r: &psy_client_data::bridge_aggregate::RewardAggregateOpening, limits: AggregateLimits, finalize: Option<FinalizeEvidence>, submission: Submission, included_acknowledged: [bool; 2]) -> MultichainDaemonState {
+        let withdrawal_records = w.withdrawals.iter().map(|leaf| leaf.encode().unwrap()).collect::<Vec<_>>();
+        let reward_records = r.rewards.iter().map(|leaf| leaf.encode().unwrap()).collect::<Vec<_>>();
+        let claim_ids = withdrawal_records.iter().map(|record| aggregate_claim_id(a.config_hash, 2, record)).chain(reward_records.iter().map(|record| aggregate_claim_id(a.config_hash, 3, record))).collect();
+        let proofs = (!withdrawal_records.is_empty() || !reward_records.is_empty()).then(|| WindowProofs { deposit: save_aggregate_file(directory, b"deposit-proof", "json").unwrap(), withdrawal: (!withdrawal_records.is_empty()).then(|| save_aggregate_file(directory, b"withdrawal-proof", "json").unwrap()), reward: (!reward_records.is_empty()).then(|| save_aggregate_file(directory, b"reward-proof", "json").unwrap()) });
+        let local_proofs = proofs.iter().flat_map(|proofs| withdrawal_records.iter().map(|_| proofs.deposit.clone()).chain(reward_records.iter().map(|_| proofs.reward.clone().unwrap()))).collect();
+        let mut state = MultichainDaemonState::default();
+        state.pending = Some(PendingAggregate::Frozen { aggregate_limits: limits, producing_session: None, selected_withdrawal_leaf_hashes: Vec::new(),
+            a_opening: hex::encode(a.encode().unwrap()), withdrawal_opening: hex::encode(w.encode().unwrap()), reward_opening: hex::encode(r.encode().unwrap()),
+            claim_ids, local_proofs, final_proofs: proofs, destinations: vec![Destination { chain_index: 0, finalize, submission }], included_acknowledged });
+        state
+    }
+
+    fn empty_frozen_state(submission: Submission, included_acknowledged: [bool; 2], final_proofs: Option<WindowProofs>, finalize: Option<FinalizeEvidence>) -> MultichainDaemonState {
+        use psy_client_data::bridge_aggregate::{DepositAggregateOpening, DepositTransition, RewardAggregateOpening, WithdrawalAggregateOpening};
+        let directory = AggregateArtifactDir::new("empty-window");
+        let network = configured_network();
+        let config_hash = network.config_hash().unwrap();
+        let mut a = DepositAggregateOpening { config_hash, window_id: [0; 32], end_checkpoint_id: 20, end_checkpoint_root: [1, 2, 3, 4],
+            starts: nonempty_window(20, [1, 2, 3, 4]).0.starts, deposits: vec![DepositTransition { chain_index: 0, old_root: [1, 2, 3, 4], new_root: [1, 2, 3, 4], old_count: 0, new_count: 0 }], deposit_leaves: Vec::new() };
+        a.window_id = a.window_id().unwrap();
+        let w = WithdrawalAggregateOpening { config_hash, window_id: a.window_id, end_checkpoint_id: 20, end_checkpoint_root: [1, 2, 3, 4], withdrawal_roots: vec![[1, 2, 3, 4]], withdrawals: Vec::new() };
+        let r = RewardAggregateOpening { config_hash, window_id: a.window_id, end_checkpoint_id: 20, end_checkpoint_root: [1, 2, 3, 4], rewards: Vec::new() };
+        let limits = AggregateLimits { max_deposits: 0, reserved_withdrawals: 0, reserved_rewards: 0, max_window_calldata_bytes: 3940, chains: vec![ChainLimits { chain_index: 0, max_deposits: 0, reserved_withdrawals: 0, tx_gas_limit: 1, block_gas_reserve: 1 }] };
+        let mut state = frozen_from(directory.path(), &a, &w, &r, limits, finalize.clone(), submission, included_acknowledged);
+        if let Some(PendingAggregate::Frozen { final_proofs: slot, destinations, .. }) = &mut state.pending { *slot = final_proofs; destinations[0].finalize = finalize; }
+        state
+    }
+
+    #[test]
+    fn frozen_submission_requires_both_acknowledged_families() {
+        let directory = AggregateArtifactDir::new("acknowledged");
+        let reference = save_aggregate_file(directory.path(), b"deposit-proof", "json").unwrap();
+        let proofs = WindowProofs { deposit: reference, withdrawal: None, reward: None };
+        let finalize = FinalizeEvidence { proof: [U256::from(1); 8], checkpoint_pi: vec![U256::ZERO; 35] };
+        let acknowledged = empty_frozen_state(Submission::Sending, [true, true], Some(proofs.clone()), Some(finalize.clone()));
+        validate_aggregate_state(&acknowledged).unwrap();
+        let submitted = empty_frozen_state(Submission::Submitted { transaction_hash: "ab".repeat(32) }, [true, true], Some(proofs.clone()), Some(finalize.clone()));
+        validate_aggregate_state(&submitted).unwrap();
+        for included_acknowledged in [[false, true], [true, false], [false, false]] {
+            let sending = empty_frozen_state(Submission::Sending, included_acknowledged, Some(proofs.clone()), Some(finalize.clone()));
+            let error = validate_aggregate_state(&sending).unwrap_err();
+            assert!(error.to_string().contains("submission without complete acknowledged proofs"), "{error}");
+            let submitted = empty_frozen_state(Submission::Submitted { transaction_hash: "cd".repeat(32) }, included_acknowledged, Some(proofs.clone()), Some(finalize.clone()));
+            assert!(validate_aggregate_state(&submitted).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
+        }
+        let missing_proofs = empty_frozen_state(Submission::Sending, [true, true], None, Some(finalize.clone()));
+        assert!(validate_aggregate_state(&missing_proofs).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
+        let missing_finalize = empty_frozen_state(Submission::Submitted { transaction_hash: "ef".repeat(32) }, [true, true], Some(proofs), None);
+        assert!(validate_aggregate_state(&missing_finalize).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
+        let not_sent = empty_frozen_state(Submission::NotSent, [false, false], None, None);
+        validate_aggregate_state(&not_sent).unwrap();
+    }
+
+    fn posted_family(directory: &std::path::Path, network: &psy_client_data::bridge_aggregate::NetworkConfig, state: &MultichainDaemonState, family: u8) -> (String, ReceiptDispositions) {
+        use super::api_client::{ClaimDisposition, ReceiptEvidence};
+        let PendingAggregate::Frozen { withdrawal_opening, reward_opening, claim_ids, .. } = state.pending.clone().unwrap() else { unreachable!() };
+        let (opening, claim_id) = if family == 2 { (aggregate_bytes(&withdrawal_opening).unwrap(), claim_ids[0].clone()) } else { (aggregate_bytes(&reward_opening).unwrap(), claim_ids[1].clone()) };
+        let digest = if family == 2 { psy_client_data::bridge_aggregate::WithdrawalAggregateOpening::decode(&opening).unwrap().opening_digest(network).unwrap() } else { psy_client_data::bridge_aggregate::RewardAggregateOpening::decode(&opening).unwrap().opening_digest(network).unwrap() };
+        let reference = save_aggregate_file(directory, &opening, "opening").unwrap();
+        let receipt = ReceiptDispositions { family, opening: reference, final_proofs: None, reverted_receipts: Vec::new(), posted_opening_digest: Some(hex::encode(digest)), dispositions: vec![
+            ClaimDisposition::Applied { claim_id: format!("0x{claim_id}"), receipt: ReceiptEvidence { chain_index: 0, transaction_hash: format!("0x{}", "ab".repeat(32)), log_index: "1".into() } },
+        ] };
+        (format!("{family}:{}", hex::encode(digest)), receipt)
+    }
+
+    fn unposted_unrelated_receipt(directory: &std::path::Path, network: &psy_client_data::bridge_aggregate::NetworkConfig) -> (String, ReceiptDispositions) {
+        use super::api_client::{ClaimDisposition, ReceiptEvidence};
+        let (_, withdrawal, _, _, _) = nonempty_window(4, [8, 7, 6, 5]);
+        let opening = save_aggregate_file(directory, &withdrawal.encode().unwrap(), "opening").unwrap();
+        let digest = hex::encode(withdrawal.opening_digest(network).unwrap());
+        (format!("2:{digest}"), ReceiptDispositions { family: 2, opening, final_proofs: None, dispositions: vec![
+            ClaimDisposition::Applied { claim_id: format!("0x{}", "02".repeat(32)), receipt: ReceiptEvidence { chain_index: 0, transaction_hash: format!("0x{}", "cd".repeat(32)), log_index: "4".into() } },
+        ], reverted_receipts: Vec::new(), posted_opening_digest: None })
+    }
+
+    #[test]
+    fn one_posted_family_remains_durable_and_does_not_complete() {
+        let path = temp_state_path("one-posted-family");
+        let directory = AggregateArtifactDir::new("one-posted-family");
+        let network = configured_network();
+        let (a, w, r, limits, finalize) = nonempty_window(20, [1, 2, 3, 4]);
+        let mut state = frozen_from(directory.path(), &a, &w, &r, limits, Some(finalize), Submission::Finalized { transaction_hash: "11".repeat(32), block_hash: "22".repeat(32), block_number: 9, withdrawal_log_index: "1".into(), reward_log_index: Some("2".into()) }, [true, true]);
+        let (key, receipt) = posted_family(directory.path(), &network, &state, 2);
+        let digest = receipt.posted_opening_digest.clone().unwrap();
+        state.receipt_dispositions.insert(key, receipt);
+        save_multichain_state(&path, &state).unwrap();
+        let mut crashed = load_multichain_state(&path, "").unwrap();
+        assert_eq!(crashed.receipt_dispositions[&format!("2:{digest}")].posted_opening_digest.as_deref(), Some(digest.as_str()));
+        let PendingAggregate::Frozen { withdrawal_opening, reward_opening, .. } = crashed.pending.clone().unwrap() else { unreachable!() };
+        let withdrawal = psy_client_data::bridge_aggregate::WithdrawalAggregateOpening::decode(&aggregate_bytes(&withdrawal_opening).unwrap()).unwrap();
+        let reward = psy_client_data::bridge_aggregate::RewardAggregateOpening::decode(&aggregate_bytes(&reward_opening).unwrap()).unwrap();
+        clear_completed_applied_window(directory.path(), &network, &path, &mut crashed).unwrap();
+        let retained = load_multichain_state(&path, "").unwrap();
+        assert!(matches!(retained.pending, Some(PendingAggregate::Frozen { .. })));
+        assert!(family_disposition_applied(&retained, 2, withdrawal.opening_digest(&network).unwrap(), withdrawal.withdrawals.len()));
+        assert!(!family_disposition_applied(&retained, 3, reward.opening_digest(&network).unwrap(), reward.rewards.len()));
+    }
+
+    #[test]
+    fn retained_and_endpoint_validation_share_prefix_bounds() {
+        let (deposit, withdrawal, _, _, mut evidence) = nonempty_window(20, [1, 2, 3, 4]);
+        let accept = |evidence: &FinalizeEvidence| {
+            validate_retained_finalize_identity(evidence, deposit.starts.len()).unwrap();
+            validate_finalize_endpoints(evidence, &deposit, &withdrawal).unwrap();
+        };
+        let reject = |evidence: &FinalizeEvidence| {
+            assert!(validate_retained_finalize_identity(evidence, deposit.starts.len()).is_err());
+            assert!(validate_finalize_endpoints(evidence, &deposit, &withdrawal).is_err());
+        };
+        let order_minus_one = U256::from(0xffff_ffff_0000_0000u64);
+        let order = U256::from(0xffff_ffff_0000_0001u64);
+        evidence.checkpoint_pi[0] = order_minus_one;
+        accept(&evidence);
+        evidence.checkpoint_pi[0] = order;
+        reject(&evidence);
+        evidence.checkpoint_pi[0] = U256::ZERO;
+        evidence.checkpoint_pi[4] = U256::from(u32::MAX);
+        accept(&evidence);
+        evidence.checkpoint_pi[4] = U256::from(u32::MAX) + U256::from(1u8);
+        reject(&evidence);
+    }
+
+    fn configured_network() -> psy_client_data::bridge_aggregate::NetworkConfig {
+        use psy_client_data::bridge_aggregate::{ChainConfig, NetworkConfig, BRIDGE_USER_ID};
+        NetworkConfig { version: 1, network_magic: 0, bridge_user_id: BRIDGE_USER_ID, circuit_set_hash: [7; 32],
+            chains: vec![ChainConfig { chain_index: 0, chain_id: U256::from(1).to_be_bytes::<32>(), bridge: [1; 20], state_manager: [2; 20], bootstrap_id: 0, bootstrap_root: [1, 2, 3, 4] }],
+            ethereum_index: 0, reward_payer: [3; 20], reward_token: [4; 20], reward_per_claim: U256::from(1).to_be_bytes::<32>(), reward_token_decimals: 0,
+            reward_cutover: 0, reward_end_exclusive: 100, max_deposits: 1024, max_withdrawals: 1024, max_rewards: 1024 }
+    }
+
+    #[test]
+    fn completed_window_keeps_matching_end_and_drops_older_end() {
+        let path = temp_state_path("completed-prune");
+        let directory = AggregateArtifactDir::new("completed-prune");
+        let network = configured_network();
+        let (a, w, r, limits, current) = nonempty_window(20, [1, 2, 3, 4]);
+        let mut state = frozen_from(directory.path(), &a, &w, &r, limits, Some(current.clone()), Submission::Finalized { transaction_hash: "11".repeat(32), block_hash: "22".repeat(32), block_number: 9, withdrawal_log_index: "1".into(), reward_log_index: Some("2".into()) }, [true, true]);
+        let (withdrawal_key, withdrawal) = posted_family(directory.path(), &network, &state, 2);
+        let (reward_key, reward) = posted_family(directory.path(), &network, &state, 3);
+        state.receipt_dispositions.insert(withdrawal_key, withdrawal);
+        state.receipt_dispositions.insert(reward_key, reward);
+        state.retained_finalize.insert("aa".repeat(32), current);
+        state.retained_finalize.insert("bb".repeat(32), nonempty_window(7, [5, 6, 7, 8]).4);
+        clear_completed_applied_window(directory.path(), &network, &path, &mut state).unwrap();
+        let saved = load_multichain_state(&path, "").unwrap();
+        assert!(saved.pending.is_none());
+        assert!(saved.retained_finalize.contains_key(&"aa".repeat(32)));
+        assert!(!saved.retained_finalize.contains_key(&"bb".repeat(32)));
+    }
+
+    #[test]
+    fn malformed_retained_width_leaves_pending_and_map_unchanged() {
+        let path = temp_state_path("malformed-retained");
+        let directory = AggregateArtifactDir::new("malformed-retained");
+        let network = configured_network();
+        let (a, w, r, limits, current) = nonempty_window(20, [1, 2, 3, 4]);
+        let mut state = frozen_from(directory.path(), &a, &w, &r, limits, Some(current), Submission::Finalized { transaction_hash: "11".repeat(32), block_hash: "22".repeat(32), block_number: 9, withdrawal_log_index: "1".into(), reward_log_index: Some("2".into()) }, [true, true]);
+        let (withdrawal_key, withdrawal) = posted_family(directory.path(), &network, &state, 2);
+        let (reward_key, reward) = posted_family(directory.path(), &network, &state, 3);
+        state.receipt_dispositions.insert(withdrawal_key, withdrawal);
+        state.receipt_dispositions.insert(reward_key, reward);
+        state.retained_finalize.insert("short".repeat(16), FinalizeEvidence { proof: [U256::from(1); 8], checkpoint_pi: vec![U256::from(1); 25] });
+        let error = clear_completed_applied_window(directory.path(), &network, &path, &mut state).unwrap_err();
+        assert!(error.to_string().contains("finalize endpoint count mismatch"), "{error}");
+        assert!(matches!(state.pending, Some(PendingAggregate::Frozen { .. })));
+        assert!(state.retained_finalize.contains_key(&"short".repeat(16)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn first_posted_family_survives_reload_and_cannot_clear_pending() {
+        let path = temp_state_path("two-ack-crash");
+        let directory = AggregateArtifactDir::new("two-ack-crash");
+        let network = configured_network();
+        let (a, w, r, limits, finalize) = nonempty_window(20, [1, 2, 3, 4]);
+        let mut state = frozen_from(directory.path(), &a, &w, &r, limits, Some(finalize), Submission::Finalized { transaction_hash: "11".repeat(32), block_hash: "22".repeat(32), block_number: 9, withdrawal_log_index: "1".into(), reward_log_index: Some("2".into()) }, [true, true]);
+        let (first_key, first) = posted_family(directory.path(), &network, &state, 2);
+        let (unrelated_key, unrelated) = unposted_unrelated_receipt(directory.path(), &network);
+        state.receipt_dispositions.insert(first_key.clone(), first);
+        state.receipt_dispositions.insert(unrelated_key.clone(), unrelated);
+        save_multichain_state(&path, &state).unwrap();
+        let mut crashed = load_multichain_state(&path, "").unwrap();
+        assert!(crashed.receipt_dispositions.contains_key(&first_key));
+        assert!(crashed.receipt_dispositions.contains_key(&unrelated_key));
+        clear_completed_applied_window(directory.path(), &network, &path, &mut crashed).unwrap();
+        let after_first = load_multichain_state(&path, "").unwrap();
+        assert!(matches!(after_first.pending, Some(PendingAggregate::Frozen { .. })));
+        assert!(after_first.receipt_dispositions.contains_key(&first_key));
+        assert!(after_first.receipt_dispositions.contains_key(&unrelated_key));
+        let (second_key, second) = posted_family(directory.path(), &network, &after_first, 3);
+        let mut resumed = after_first;
+        resumed.receipt_dispositions.insert(second_key.clone(), second);
+        save_multichain_state(&path, &resumed).unwrap();
+        clear_completed_applied_window(directory.path(), &network, &path, &mut resumed).unwrap();
+        let completed = load_multichain_state(&path, "").unwrap();
+        assert!(completed.pending.is_none());
+        assert!(completed.receipt_dispositions.contains_key(&unrelated_key));
+        assert!(!completed.receipt_dispositions.contains_key(&first_key));
+        assert!(!completed.receipt_dispositions.contains_key(&second_key));
+    }
+
+    #[test]
+    fn completed_prune_keeps_an_unposted_receipt_for_a_different_end() {
+        let path = temp_state_path("unposted-end");
+        let directory = AggregateArtifactDir::new("unposted-end");
+        let network = configured_network();
+        let (a, w, r, limits, current) = nonempty_window(20, [1, 2, 3, 4]);
+        let mut state = frozen_from(directory.path(), &a, &w, &r, limits, Some(current.clone()), Submission::Finalized { transaction_hash: "11".repeat(32), block_hash: "22".repeat(32), block_number: 9, withdrawal_log_index: "1".into(), reward_log_index: Some("2".into()) }, [true, true]);
+        let (withdrawal_key, withdrawal) = posted_family(directory.path(), &network, &state, 2);
+        let (reward_key, reward) = posted_family(directory.path(), &network, &state, 3);
+        state.receipt_dispositions.insert(withdrawal_key, withdrawal);
+        state.receipt_dispositions.insert(reward_key, reward);
+        let (_, older_withdrawal, _, _, older_finalize) = nonempty_window(7, [5, 6, 7, 8]);
+        let opening = save_aggregate_file(directory.path(), &older_withdrawal.encode().unwrap(), "opening").unwrap();
+        let older_key = format!("2:{}", hex::encode(older_withdrawal.opening_digest(&network).unwrap()));
+        state.receipt_dispositions.insert(older_key.clone(), ReceiptDispositions { family: 2, opening, final_proofs: None, dispositions: Vec::new(), reverted_receipts: Vec::new(), posted_opening_digest: None });
+        state.retained_finalize.insert("aa".repeat(32), current);
+        state.retained_finalize.insert("bb".repeat(32), older_finalize);
+        clear_completed_applied_window(directory.path(), &network, &path, &mut state).unwrap();
+        let saved = load_multichain_state(&path, "").unwrap();
+        assert!(saved.pending.is_none());
+        assert!(saved.receipt_dispositions.contains_key(&older_key));
+        assert!(saved.retained_finalize.contains_key(&"aa".repeat(32)));
+        assert!(saved.retained_finalize.contains_key(&"bb".repeat(32)));
+    }
+
+
+
+
+
+
 }

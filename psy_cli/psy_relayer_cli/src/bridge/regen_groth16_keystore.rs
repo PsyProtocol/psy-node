@@ -291,6 +291,7 @@ fn regenerate_bridge_agg(keystore_dir: &Path, config_path: &Path) -> anyhow::Res
     let cached = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
     let checkpoint_base = cached.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
         .context("GenerateRollupStateTransitionProof not found in cached circuit library")?;
+    anyhow::ensure!(checkpoint.get_fingerprint() == checkpoint_base, "finalize setup fingerprint differs from cached GenerateRollupStateTransitionProof");
     let finalizer = BridgeAggFinalCircuit::<C, D>::prebuild_final_circuit(
         checkpoint.get_common_circuit_data_ref(),
         checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(),

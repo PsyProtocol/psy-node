@@ -1,13 +1,16 @@
+use anyhow::Context;
 use psy_config::network_constants::CHECKPOINT_TREE_HEIGHT;
 use parth_core::{crypto::hash::traits::ToU64x4, protocol::core_types::QNetworkCircuitConstants};
+use psy_core::job::job_id::ProvingJobCircuitType;
 use plonky2::{field::goldilocks_field::GoldilocksField as F, plonk::{circuit_data::CircuitData, config::PoseidonGoldilocksConfig as C, proof::ProofWithPublicInputs}};
+use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibraryCore;
 use psy_client_data::bridge_aggregate::{circuit_set_hash, DepositAggregateOpening, CircuitSetEntry, NetworkConfig, RewardAggregateOpening, WithdrawalAggregateOpening};
 use psy_common_circuit::serialization::PsyGateSerializer;
-use psy_plonky2_common_circuits::bridge::{deposit_spiderman_append::DepositSpidermanAppendCircuit, withdrawal_inclusion::WithdrawalInclusionCircuit};
+use psy_plonky2_common_circuits::bridge::{deposit_spiderman_append::{DepositSpidermanAppendCircuit, DEPOSIT_SPIDERMAN_PI_WORDS}, withdrawal_inclusion::{WithdrawalInclusionCircuit, WITHDRAWAL_INCLUSION_PUBLIC_INPUTS}};
 use tiny_keccak::{Hasher, Keccak};
 
 use crate::{coordinator::coordinator_helper::QEDCoordinatorCircuitManager, proof_minifier::pm_core::get_circuit_fingerprint_generic_q, qstandard::QStandardCircuit};
-use super::circuits::{bridge_agg_final::BridgeAggFinalCircuit, chain_aggregate::ChainAggregateCircuit, deposit_aggregate::DepositAggregateCircuit, inclusion_aggregate::{AggregateWindow, AggregateLeaves, InclusionAggregateCircuit, InclusionAggregateSource, RewardAggregateLeaf, WithdrawalAggregateLeaf}, reward_inclusion::RewardInclusionCircuit};
+use super::circuits::{bridge_agg_final::BridgeAggFinalCircuit, chain_aggregate::{ChainAggregateCircuit, CHAIN_PI_WORDS}, deposit_aggregate::{DepositAggregateCircuit, DEPOSIT_AGGREGATE_PI_LEN}, inclusion_aggregate::{AggregateWindow, AggregateLeaves, InclusionAggregateCircuit, InclusionAggregateSource, RewardAggregateLeaf, WithdrawalAggregateLeaf, AGGREGATE_PI_LEN}, reward_inclusion::RewardInclusionCircuit};
 
 pub struct AggregateCircuitHeights {
     pub deposit_state_tree: usize,
@@ -34,11 +37,15 @@ impl AggregateCircuits {
         anyhow::ensure!(configured_chain_indices.windows(2).all(|pair| pair[0] < pair[1]), "configured chain indices must be strictly increasing");
         let checkpoint = &coordinator.checkpoint_root_transition;
         let checkpoint_fingerprint = checkpoint.get_fingerprint();
+        let checkpoint_base = crate::generated::cached_circuit_library::get_cached_circuit_library::<F>()
+            .get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
+            .context("GenerateRollupStateTransitionProof not found in cached circuit library")?;
+        anyhow::ensure!(checkpoint_fingerprint == checkpoint_base, "coordinator fingerprint differs from cached GenerateRollupStateTransitionProof");
         anyhow::ensure!(N::CHECKPOINT_TREE_HEIGHT_USIZE == usize::from(CHECKPOINT_TREE_HEIGHT), "checkpoint height differs from the authoritative constant");
         let checkpoint_final = BridgeAggFinalCircuit::prebuild_final_circuit(
             checkpoint.get_common_circuit_data_ref(),
             checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(),
-            checkpoint_fingerprint, checkpoint_fingerprint,
+            checkpoint_fingerprint, checkpoint_base,
             N::CHECKPOINT_TREE_HEIGHT_USIZE, N::GLOBAL_USER_TREE_HEIGHT_USIZE,
             N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE, heights.deposit_state_tree,
             heights.withdrawal_state_tree, configured_chain_indices,
@@ -104,12 +111,12 @@ impl AggregateCircuits {
     fn build_entries(&self) -> anyhow::Result<Vec<CircuitSetEntry>> {
         let mut entries = self.reward.circuit_set_entries()?;
         for (family, variant, width, data) in [
-            (1, 0, 40, &self.deposit.circuit_data),
-            (2, 0, 32, &self.withdrawal.circuit_data),
-            (7, 2, 12, &self.aggregates[0].circuit_data),
-            (7, 3, 12, &self.aggregates[1].circuit_data),
-            (9, 1, 37, &self.chains.circuit_data),
-            (11, 1, 12, &self.deposit_aggregate.circuit_data),
+            (1, 0, DEPOSIT_SPIDERMAN_PI_WORDS, &self.deposit.circuit_data),
+            (2, 0, WITHDRAWAL_INCLUSION_PUBLIC_INPUTS, &self.withdrawal.circuit_data),
+            (7, 2, AGGREGATE_PI_LEN, &self.aggregates[0].circuit_data),
+            (7, 3, AGGREGATE_PI_LEN, &self.aggregates[1].circuit_data),
+            (9, 1, CHAIN_PI_WORDS, &self.chains.circuit_data),
+            (11, 1, DEPOSIT_AGGREGATE_PI_LEN, &self.deposit_aggregate.circuit_data),
         ] { entries.push(circuit_set_entry(family, 0, variant, width, data, [0; 4])?); }
         entries.sort_by_key(|entry| (entry.family, entry.level, entry.variant));
         circuit_set_hash(&entries)?;

@@ -856,6 +856,539 @@ pub fn digest_inputs(digest: Bytes32) -> [u128; 2] {
     [u128::from_be_bytes(digest[..16].try_into().unwrap()),
         u128::from_be_bytes(digest[16..].try_into().unwrap())]
 }
+pub const USER_REWARD_PROOF_FIELD_COUNT: usize = 34;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserRewardProofFields {
+    pub checkpoint_tree_root: Hash4,
+    pub user_id: u32,
+    pub recipient: [u32; 8],
+    pub total_amount: [u32; 8],
+    pub count: u32,
+    pub jobs_commitment: Hash4,
+    pub old_nullifier_root: Hash4,
+    pub new_nullifier_root: Hash4,
+}
+
+impl UserRewardProofFields {
+    pub fn from_public_inputs(inputs: &[u64]) -> Result<Self> {
+        if inputs.len() != USER_REWARD_PROOF_FIELD_COUNT {
+            return Err(BridgeProofError::InvalidProof);
+        }
+        let checkpoint_tree_root = read_hash4(inputs, 0)?;
+        let user_id = read_u32(inputs[4])?;
+        let mut recipient = [0u32; 8];
+        for (index, limb) in recipient.iter_mut().enumerate() {
+            *limb = read_u32(inputs[5 + index])?;
+        }
+        if recipient[5] != 0 || recipient[6] != 0 || recipient[7] != 0 {
+            return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth));
+        }
+        let mut total_amount = [0u32; 8];
+        for (index, limb) in total_amount.iter_mut().enumerate() {
+            *limb = read_u32(inputs[13 + index])?;
+        }
+        let count = read_u32(inputs[21])?;
+        let jobs_commitment = read_hash4(inputs, 22)?;
+        let old_nullifier_root = read_hash4(inputs, 26)?;
+        let new_nullifier_root = read_hash4(inputs, 30)?;
+        Ok(Self { checkpoint_tree_root, user_id, recipient, total_amount, count,
+            jobs_commitment, old_nullifier_root, new_nullifier_root })
+    }
+
+    pub fn to_public_inputs(&self) -> Result<[u64; USER_REWARD_PROOF_FIELD_COUNT]> {
+        if self.recipient[5] != 0 || self.recipient[6] != 0 || self.recipient[7] != 0 {
+            return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth));
+        }
+        let mut inputs = [0u64; USER_REWARD_PROOF_FIELD_COUNT];
+        write_hash4(&mut inputs, 0, self.checkpoint_tree_root)?;
+        inputs[4] = self.user_id as u64;
+        for (index, limb) in self.recipient.iter().enumerate() { inputs[5 + index] = *limb as u64; }
+        for (index, limb) in self.total_amount.iter().enumerate() { inputs[13 + index] = *limb as u64; }
+        inputs[21] = self.count as u64;
+        write_hash4(&mut inputs, 22, self.jobs_commitment)?;
+        write_hash4(&mut inputs, 26, self.old_nullifier_root)?;
+        write_hash4(&mut inputs, 30, self.new_nullifier_root)?;
+        Ok(inputs)
+    }
+}
+
+fn read_u32(value: u64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth))
+}
+
+fn read_hash4(inputs: &[u64], offset: usize) -> Result<Hash4> {
+    let value = [inputs[offset], inputs[offset + 1], inputs[offset + 2], inputs[offset + 3]];
+    validate_hash4(&value)?;
+    Ok(value)
+}
+
+fn write_hash4(inputs: &mut [u64], offset: usize, value: Hash4) -> Result<()> {
+    validate_hash4(&value)?;
+    inputs[offset..offset + 4].copy_from_slice(&value);
+    Ok(())
+}
+pub const WITHDRAWAL_PUBLICATION_FAMILY: u8 = 2;
+pub const REWARD_PUBLICATION_FAMILY: u8 = 3;
+pub const INCLUSION_AGGREGATE_CAPACITIES: [u32; 4] = [1024, 2048, 4096, 8192];
+pub const CLAIM_TREE_MAX_CAPACITY: usize = 131072;
+pub const CLAIM_TREE_MAX_DEPTH: u32 = 17;
+pub const CUMULATIVE_REWARD_LEAF_BYTES: usize = 160;
+pub const CUMULATIVE_REWARD_OPENING_CONTEXT_BYTES: usize = 256;
+pub const WITHDRAWAL_HEADER_CONTEXT_BYTES: usize = 193;
+pub const REWARD_HEADER_BYTES: usize = 257;
+const PUBLICATION_DIGEST_WORDS: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hash4Encoding {
+    CanonicalU64x4,
+    LittleEndianU32x8,
+}
+
+pub fn read_hash4_encoding(words: &[u64], encoding: Hash4Encoding) -> Result<Hash4> {
+    match encoding {
+        Hash4Encoding::CanonicalU64x4 => {
+            let value = words.try_into().map_err(|_| BridgeProofError::InvalidProof)?;
+            validate_hash4(&value)?;
+            Ok(value)
+        }
+        Hash4Encoding::LittleEndianU32x8 => {
+            if words.len() != 8 { return Err(BridgeProofError::InvalidProof); }
+            let mut value = [0u64; 4];
+            for (limb, pair) in value.iter_mut().zip(words.chunks_exact(2)) {
+                let low = read_u32(pair[0])? as u64;
+                let high = read_u32(pair[1])? as u64;
+                *limb = low | (high << 32);
+            }
+            validate_hash4(&value)?;
+            Ok(value)
+        }
+    }
+}
+
+fn publication_domain(label: &[u8]) -> Bytes32 {
+    hash_parts(&[b"PsyBridge/CumulativeReward/1/", label])
+}
+
+fn aggregate_header_domain() -> Bytes32 {
+    hash_parts(&[b"PsyBridge/TwoArtifact/1/AggregateHeader"])
+}
+
+fn write_raw_u32(writer: &mut Writer, value: u32) {
+    writer.0.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_raw_u64(writer: &mut Writer, value: u64) {
+    writer.0.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_exact<'a>(bytes: &mut &'a [u8], width: usize) -> Result<&'a [u8]> {
+    if bytes.len() < width { return Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)); }
+    let (head, rest) = bytes.split_at(width);
+    *bytes = rest;
+    Ok(head)
+}
+
+fn read_raw_u32(bytes: &mut &[u8]) -> Result<u32> {
+    Ok(u32::from_be_bytes(read_exact(bytes, 4)?.try_into().unwrap()))
+}
+
+fn read_raw_u64(bytes: &mut &[u8]) -> Result<u64> {
+    Ok(u64::from_be_bytes(read_exact(bytes, 8)?.try_into().unwrap()))
+}
+
+fn read_raw_bytes32(bytes: &mut &[u8]) -> Result<Bytes32> {
+    Ok(read_exact(bytes, 32)?.try_into().unwrap())
+}
+
+fn read_raw_address(bytes: &mut &[u8]) -> Result<Address> {
+    let word = read_raw_bytes32(bytes)?;
+    if word[..12].iter().any(|&byte| byte != 0) {
+        return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth));
+    }
+    Ok(word[12..].try_into().unwrap())
+}
+
+fn read_canonical_hash4(bytes: &mut &[u8]) -> Result<Hash4> {
+    read_hash4_encoding(&[read_raw_u64(bytes)?, read_raw_u64(bytes)?, read_raw_u64(bytes)?, read_raw_u64(bytes)?],
+        Hash4Encoding::CanonicalU64x4)
+}
+
+fn checked_u32_mul(left: u32, right: u32) -> Result<u32> {
+    left.checked_mul(right).ok_or(BridgeProofError::InvalidCount)
+}
+
+fn claim_tree_depth(aggregate_capacity: u32) -> Result<u32> {
+    if aggregate_capacity == 0 || !aggregate_capacity.is_power_of_two()
+        || aggregate_capacity > CLAIM_TREE_MAX_CAPACITY as u32
+    { return Err(BridgeProofError::InvalidCount); }
+    Ok(aggregate_capacity.trailing_zeros())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CumulativeRewardLeaf {
+    pub economic_domain: Bytes32,
+    pub user_id: u32,
+    pub total_amount: [u32; 8],
+    pub recipient: Address,
+    pub initialized: bool,
+}
+
+impl CumulativeRewardLeaf {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if !self.initialized && self.recipient != [0; 20] {
+            return Err(BridgeProofError::InvalidRewardAuthority);
+        }
+        let mut writer = Writer::new();
+        writer.bytes32(self.economic_domain)?;
+        writer.u32(self.user_id)?;
+        for limb in self.total_amount.iter().rev() { writer.0.extend_from_slice(&limb.to_be_bytes()); }
+        writer.address(self.recipient)?;
+        writer.u64(u64::from(self.initialized))?;
+        Ok(writer.0)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != CUMULATIVE_REWARD_LEAF_BYTES {
+            return Err(if bytes.len() < CUMULATIVE_REWARD_LEAF_BYTES {
+                BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)
+            } else { BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes) });
+        }
+        let mut reader = Reader(bytes);
+        let economic_domain = reader.bytes32()?;
+        let user_id = reader.u32()?;
+        let amount = reader.bytes32()?;
+        let mut total_amount = [0u32; 8];
+        for (index, chunk) in amount.chunks_exact(4).rev().enumerate() { total_amount[index] = u32::from_be_bytes(chunk.try_into().unwrap()); }
+        let recipient = reader.address()?;
+        let initialized = match reader.u64()? { 0 => false, 1 => true, _ => {
+            return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth));
+        }};
+        reader.finish()?;
+        if !initialized && recipient != [0; 20] { return Err(BridgeProofError::InvalidRewardAuthority); }
+        Ok(Self { economic_domain, user_id, total_amount, recipient, initialized })
+    }
+
+    pub fn leaf_commit(&self) -> Result<Bytes32> {
+        Ok(hash_parts(&[&publication_domain(b"Record"), &self.encode()?]))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CumulativeRewardOpening {
+    pub config_hash: Bytes32,
+    pub window_id: Bytes32,
+    pub end_checkpoint_id: u64,
+    pub end_checkpoint_root: Hash4,
+    pub rewards: Vec<CumulativeRewardLeaf>,
+}
+
+impl CumulativeRewardOpening {
+    fn validate_structure(&self) -> Result<()> {
+        validate_hash4(&self.end_checkpoint_root)?;
+        if self.rewards.len() > CLAIM_TREE_MAX_CAPACITY { return Err(BridgeProofError::InvalidCount); }
+        for (index, leaf) in self.rewards.iter().enumerate() {
+            if !leaf.initialized || leaf.recipient == [0; 20]
+                || leaf.total_amount == [0; 8]
+            { return Err(BridgeProofError::InvalidRewardAuthority); }
+            if index > 0 && self.rewards[index - 1].user_id >= leaf.user_id {
+                return Err(BridgeProofError::InvalidOrdering);
+            }
+            let _ = leaf.encode()?;
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate_structure()?;
+        let mut writer = Writer::new();
+        writer.bytes32(self.config_hash)?;
+        writer.bytes32(self.window_id)?;
+        writer.u64(self.end_checkpoint_id)?;
+        writer.hash4(self.end_checkpoint_root)?;
+        writer.u32(self.rewards.len() as u32)?;
+        for leaf in &self.rewards { writer.0.extend_from_slice(&leaf.encode()?); }
+        Ok(writer.0)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut reader = Reader(bytes);
+        let config_hash = reader.bytes32()?;
+        let window_id = reader.bytes32()?;
+        let end_checkpoint_id = reader.u64()?;
+        let end_checkpoint_root = reader.hash4()?;
+        let count = reader.u32()? as usize;
+        if count > CLAIM_TREE_MAX_CAPACITY { return Err(BridgeProofError::InvalidCount); }
+        if reader.0.len() != count * CUMULATIVE_REWARD_LEAF_BYTES {
+            return Err(if reader.0.len() < count * CUMULATIVE_REWARD_LEAF_BYTES {
+                BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)
+            } else { BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes) });
+        }
+        let mut rewards = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (leaf_bytes, rest) = reader.0.split_at(CUMULATIVE_REWARD_LEAF_BYTES);
+            reader.0 = rest;
+            rewards.push(CumulativeRewardLeaf::decode(leaf_bytes)?);
+        }
+        reader.finish()?;
+        let value = Self { config_hash, window_id, end_checkpoint_id, end_checkpoint_root, rewards };
+        value.validate_structure()?;
+        Ok(value)
+    }
+
+    pub fn opening_digest(&self) -> Result<Bytes32> {
+        Ok(hash_parts(&[&publication_domain(b"Opening"), &self.encode()?]))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InclusionAggregateHeader {
+    pub family: u8,
+    pub config_hash: Bytes32,
+    pub window_id: Bytes32,
+    pub end_checkpoint_id: u64,
+    pub end_checkpoint_root: Hash4,
+    pub aggregate_capacity: u32,
+    pub total_count: u32,
+    pub segment_count: u32,
+    pub segment_index: u32,
+    pub first_ordinal: u32,
+    pub count: u32,
+    pub withdrawal_roots: Vec<Hash4>,
+    pub old_nullifier_root: Option<Hash4>,
+    pub new_nullifier_root: Option<Hash4>,
+    pub opening_digest: Bytes32,
+    pub claim_tree_root: Bytes32,
+}
+
+impl InclusionAggregateHeader {
+    pub fn validate(&self) -> Result<()> {
+        validate_hash4(&self.end_checkpoint_root)?;
+        if !INCLUSION_AGGREGATE_CAPACITIES.contains(&self.aggregate_capacity) {
+            return Err(BridgeProofError::InvalidCount);
+        }
+        let expected_segments = if self.total_count == 0 { 0 }
+            else { self.total_count.div_ceil(self.aggregate_capacity) };
+        if self.segment_count != expected_segments { return Err(BridgeProofError::InvalidCount); }
+        if self.total_count == 0 {
+            if self.segment_index != 0 || self.first_ordinal != 0 || self.count != 0
+                || self.opening_digest != [0; 32] || self.claim_tree_root != [0; 32]
+            { return Err(BridgeProofError::InvalidCount); }
+        } else {
+            if self.segment_index >= self.segment_count { return Err(BridgeProofError::InvalidCount); }
+            let first = checked_u32_mul(self.segment_index, self.aggregate_capacity)?;
+            if self.first_ordinal != first { return Err(BridgeProofError::InvalidCount); }
+            let remaining = self.total_count - first;
+            let expected_count = remaining.min(self.aggregate_capacity);
+            if self.count == 0 || self.count != expected_count { return Err(BridgeProofError::InvalidCount); }
+        }
+        match self.family {
+            WITHDRAWAL_PUBLICATION_FAMILY => {
+                if !(1..=MAX_CHAINS).contains(&self.withdrawal_roots.len())
+                    || self.old_nullifier_root.is_some() || self.new_nullifier_root.is_some()
+                { return Err(BridgeProofError::InvalidCount); }
+                for root in &self.withdrawal_roots { validate_hash4(root)?; }
+            }
+            REWARD_PUBLICATION_FAMILY => {
+                let (Some(old_root), Some(new_root)) = (self.old_nullifier_root, self.new_nullifier_root) else {
+                    return Err(BridgeProofError::InvalidCount);
+                };
+                if !self.withdrawal_roots.is_empty() { return Err(BridgeProofError::InvalidCount); }
+                validate_hash4(&old_root)?;
+                validate_hash4(&new_root)?;
+                if self.total_count == 0 && old_root != new_root { return Err(BridgeProofError::InvalidCursor); }
+            }
+            _ => return Err(BridgeProofError::InvalidConfig),
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut writer = Writer::new();
+        writer.0.push(self.family);
+        writer.0.extend_from_slice(&self.config_hash);
+        writer.0.extend_from_slice(&self.window_id);
+        write_raw_u64(&mut writer, self.end_checkpoint_id);
+        for limb in self.end_checkpoint_root { write_raw_u64(&mut writer, limb); }
+        for value in [self.aggregate_capacity, self.total_count, self.segment_count,
+            self.segment_index, self.first_ordinal, self.count]
+        { write_raw_u32(&mut writer, value); }
+        match self.family {
+            WITHDRAWAL_PUBLICATION_FAMILY => {
+                for root in &self.withdrawal_roots {
+                    for limb in root { write_raw_u64(&mut writer, *limb); }
+                }
+            }
+            REWARD_PUBLICATION_FAMILY => {
+                for root in [self.old_nullifier_root.unwrap(), self.new_nullifier_root.unwrap()] {
+                    for limb in root { write_raw_u64(&mut writer, limb); }
+                }
+            }
+            _ => return Err(BridgeProofError::InvalidConfig),
+        }
+        writer.0.extend_from_slice(&self.opening_digest);
+        writer.0.extend_from_slice(&self.claim_tree_root);
+        Ok(writer.0)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut rest = bytes;
+        let family = *read_exact(&mut rest, 1)?.first().unwrap();
+        let config_hash = read_raw_bytes32(&mut rest)?;
+        let window_id = read_raw_bytes32(&mut rest)?;
+        let end_checkpoint_id = read_raw_u64(&mut rest)?;
+        let end_checkpoint_root = read_canonical_hash4(&mut rest)?;
+        let aggregate_capacity = read_raw_u32(&mut rest)?;
+        let total_count = read_raw_u32(&mut rest)?;
+        let segment_count = read_raw_u32(&mut rest)?;
+        let segment_index = read_raw_u32(&mut rest)?;
+        let first_ordinal = read_raw_u32(&mut rest)?;
+        let count = read_raw_u32(&mut rest)?;
+        let (withdrawal_roots, old_nullifier_root, new_nullifier_root) = match family {
+            WITHDRAWAL_PUBLICATION_FAMILY => {
+                if rest.len() < 64 { return Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)); }
+                let root_bytes = rest.len() - 64;
+                let chain_count = root_bytes / 32;
+                if !(1..=MAX_CHAINS).contains(&chain_count) { return Err(BridgeProofError::InvalidCount); }
+                let mut roots = Vec::with_capacity(chain_count);
+                for _ in 0..chain_count { roots.push(read_canonical_hash4(&mut rest)?); }
+                (roots, None, None)
+            }
+            REWARD_PUBLICATION_FAMILY => {
+                let old_root = read_canonical_hash4(&mut rest)?;
+                let new_root = read_canonical_hash4(&mut rest)?;
+                (Vec::new(), Some(old_root), Some(new_root))
+            }
+            _ => return Err(BridgeProofError::InvalidConfig),
+        };
+        let opening_digest = read_raw_bytes32(&mut rest)?;
+        let claim_tree_root = read_raw_bytes32(&mut rest)?;
+        if !rest.is_empty() { return Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)); }
+        let value = Self { family, config_hash, window_id, end_checkpoint_id, end_checkpoint_root,
+            aggregate_capacity, total_count, segment_count, segment_index, first_ordinal, count,
+            withdrawal_roots, old_nullifier_root, new_nullifier_root, opening_digest, claim_tree_root };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn header_digest(&self) -> Result<Bytes32> {
+        Ok(hash_parts(&[&aggregate_header_domain(), &self.encode()?]))
+    }
+
+    pub fn publication_words(&self) -> Result<[u32; 28]> {
+        let mut words = [0u32; 28];
+        words[0] = 1;
+        words[1] = 7;
+        words[2] = self.family as u32;
+        let mut offset = 4;
+        for digest in [self.opening_digest, self.claim_tree_root, self.header_digest()?] {
+            for chunk in digest.chunks_exact(4) {
+                words[offset] = u32::from_be_bytes(chunk.try_into().unwrap());
+                offset += 1;
+            }
+        }
+        Ok(words)
+    }
+}
+
+pub fn build_inclusion_aggregate_tree(leaf_commits: &[Bytes32], aggregate_capacity: usize) -> Result<Vec<Bytes32>> {
+    let depth = claim_tree_depth(aggregate_capacity as u32)?;
+    if aggregate_capacity > CLAIM_TREE_MAX_CAPACITY || leaf_commits.len() > aggregate_capacity {
+        return Err(BridgeProofError::InvalidCount);
+    }
+    let mut tree = vec![[0; 32]; 2 * aggregate_capacity - 1];
+    let marker = word(12);
+    let count = word(leaf_commits.len() as u64);
+    let leaf_domain = domain_hash(Domain::Leaf);
+    let empty_domain = domain_hash(Domain::Empty);
+    let node_domain = domain_hash(Domain::Node);
+    for (ordinal, node) in tree[aggregate_capacity - 1..].iter_mut().enumerate() {
+        let position = word(ordinal as u64);
+        *node = if let Some(leaf) = leaf_commits.get(ordinal) {
+            hash_parts(&[&leaf_domain, &marker, &count, &position, leaf])
+        } else {
+            hash_parts(&[&empty_domain, &marker, &count, &position])
+        };
+    }
+    for level in 1..=depth {
+        let first = (aggregate_capacity >> level) - 1;
+        let end = (aggregate_capacity >> (level - 1)) - 1;
+        let level_word = word(level as u64);
+        for index in first..end {
+            tree[index] = hash_parts(&[&node_domain, &marker, &level_word, &tree[index * 2 + 1], &tree[index * 2 + 2]]);
+        }
+    }
+    Ok(tree)
+}
+
+pub fn claim_tree_path(tree: &[Bytes32], aggregate_capacity: u32, count: u32, ordinal: u32) -> Result<Vec<Bytes32>> {
+    let depth = claim_tree_depth(aggregate_capacity)? as usize;
+    if tree.len() != 2 * aggregate_capacity as usize - 1 || count > aggregate_capacity || ordinal >= count {
+        return Err(BridgeProofError::InvalidCount);
+    }
+    let mut path = Vec::with_capacity(depth);
+    let mut index = aggregate_capacity as usize - 1 + ordinal as usize;
+    for _ in 0..depth {
+        path.push(tree[if index % 2 == 1 { index + 1 } else { index - 1 }]);
+        index = (index - 1) / 2;
+    }
+    Ok(path)
+}
+
+fn fold_claim_path(header: &InclusionAggregateHeader, leaf_commit: Bytes32, ordinal: u32, siblings: &[Bytes32]) -> Result<Bytes32> {
+    let depth = claim_tree_depth(header.aggregate_capacity)?;
+    if siblings.len() != depth as usize || ordinal >= header.count || header.count > header.aggregate_capacity {
+        return Err(BridgeProofError::InvalidCount);
+    }
+    let marker = word(12);
+    let count_word = word(header.count as u64);
+    let mut state = hash_parts(&[&domain_hash(Domain::Leaf), &marker, &count_word, &word(ordinal as u64), &leaf_commit]);
+    for (level, sibling) in siblings.iter().enumerate() {
+        let level_word = word((level + 1) as u64);
+        let (left, right) = if ordinal & (1 << level) == 0 { (&state, sibling) } else { (sibling, &state) };
+        state = hash_parts(&[&domain_hash(Domain::Node), &marker, &level_word, left, right]);
+    }
+    Ok(state)
+}
+
+pub fn verify_claim_path(header: &InclusionAggregateHeader, ordinal: u32, leaf_bytes: &[u8], siblings: &[Bytes32]) -> Result<Bytes32> {
+    header.validate()?;
+    if ordinal >= header.count || siblings.len() != claim_tree_depth(header.aggregate_capacity)? as usize {
+        return Err(BridgeProofError::InvalidCount);
+    }
+    let leaf_commit = match header.family {
+        WITHDRAWAL_PUBLICATION_FAMILY => WithdrawalLeaf::decode(leaf_bytes)?.leaf_commit()?,
+        REWARD_PUBLICATION_FAMILY => {
+            let leaf = CumulativeRewardLeaf::decode(leaf_bytes)?;
+            if !leaf.initialized || leaf.recipient == [0; 20] || leaf.total_amount == [0; 8] {
+                return Err(BridgeProofError::InvalidRewardAuthority);
+            }
+            leaf.leaf_commit()?
+        }
+        _ => return Err(BridgeProofError::InvalidConfig),
+    };
+    let root = fold_claim_path(header, leaf_commit, ordinal, siblings)?;
+    if root != header.claim_tree_root { return Err(BridgeProofError::InvalidProof); }
+    Ok(leaf_commit)
+}
+
+pub fn publication_digest_words(digest: Bytes32) -> [u32; PUBLICATION_DIGEST_WORDS] {
+    let mut words = [0u32; PUBLICATION_DIGEST_WORDS];
+    for (word, chunk) in words.iter_mut().zip(digest.chunks_exact(4)) {
+        *word = u32::from_be_bytes(chunk.try_into().unwrap());
+    }
+    words
+}
+pub fn bind_claim_tree(header: &mut InclusionAggregateHeader, leaf_commits: &[Bytes32]) -> Result<Vec<Bytes32>> {
+    header.validate()?;
+    if leaf_commits.len() != header.count as usize { return Err(BridgeProofError::InvalidCount); }
+    let tree = build_inclusion_aggregate_tree(leaf_commits, header.aggregate_capacity as usize)?;
+    header.claim_tree_root = tree[0];
+    header.validate()?;
+    Ok(tree)
+}
+
 
 pub fn withdrawal_nonce(network_magic: u64, bridge_user_id: u32, token_contract_id: u32,
     sender_user_id: u32, destination_chain_index: u8, caller_nonce: Bytes32) -> Result<Bytes32>
@@ -1286,4 +1819,228 @@ mod tests {
         assert_ne!(withdrawal_nonce(1, BRIDGE_USER_ID, 2, 3, 9, [5; 32]).unwrap(), nonce);
         assert_eq!(withdrawal_nonce(1, 0, 2, 3, 4, [5; 32]), Err(BridgeProofError::InvalidConfig));
     }
+    fn user_reward_proof() -> UserRewardProofFields {
+        UserRewardProofFields {
+            checkpoint_tree_root: [1, 2, 3, GOLDILOCKS_MODULUS - 1],
+            user_id: u32::MAX,
+            recipient: [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444, 0x5555_5555, 0, 0, 0],
+            total_amount: [7, 1, 0, 0, 0, 0, 0, 0],
+            count: 3,
+            jobs_commitment: [9, 8, 7, 6],
+            old_nullifier_root: [4, 3, 2, 1],
+            new_nullifier_root: [5, 4, 3, 2],
+        }
+    }
+
+    #[test]
+    fn user_reward_proof_fields_keep_exact_offsets_and_uint256_limbs() {
+        let proof = user_reward_proof();
+        let inputs = proof.to_public_inputs().unwrap();
+        assert_eq!(inputs.len(), 34);
+        assert_eq!(&inputs[0..4], &proof.checkpoint_tree_root);
+        assert_eq!(inputs[4], proof.user_id as u64);
+        assert_eq!(&inputs[5..13], &proof.recipient.map(|limb| limb as u64));
+        assert_eq!(&inputs[13..21], &[7, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(inputs[21], 3);
+        assert_eq!(&inputs[22..26], &proof.jobs_commitment);
+        assert_eq!(&inputs[26..30], &proof.old_nullifier_root);
+        assert_eq!(&inputs[30..34], &proof.new_nullifier_root);
+        assert_eq!(UserRewardProofFields::from_public_inputs(&inputs).unwrap(), proof);
+        let full = UserRewardProofFields { total_amount: [u32::MAX; 8], ..proof };
+        let full_inputs = full.to_public_inputs().unwrap();
+        assert_eq!(&full_inputs[13..21], &[u32::MAX as u64; 8]);
+        assert_eq!(full_inputs[13], u32::MAX as u64);
+        assert!(full_inputs[13] < GOLDILOCKS_MODULUS);
+        assert_eq!(UserRewardProofFields::from_public_inputs(&full_inputs).unwrap().total_amount, [u32::MAX; 8]);
+    }
+
+    #[test]
+    fn user_reward_proof_fields_reject_invalid_ranges_and_width() {
+        let proof = user_reward_proof();
+        let inputs = proof.to_public_inputs().unwrap();
+        assert_eq!(UserRewardProofFields::from_public_inputs(&inputs[..33]), Err(BridgeProofError::InvalidProof));
+        assert_eq!(UserRewardProofFields::from_public_inputs(&[inputs.as_slice(), &[0]].concat()), Err(BridgeProofError::InvalidProof));
+        for index in [0, 22, 26, 30] {
+            let mut noncanonical = inputs;
+            noncanonical[index] = GOLDILOCKS_MODULUS;
+            assert_eq!(UserRewardProofFields::from_public_inputs(&noncanonical),
+                Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
+        }
+        for index in [4, 5, 13, 21] {
+            let mut wide = inputs;
+            wide[index] = u32::MAX as u64 + 1;
+            assert_eq!(UserRewardProofFields::from_public_inputs(&wide),
+                Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+        }
+        for index in [10, 11, 12] {
+            let mut padded = inputs;
+            padded[index] = 1;
+            assert_eq!(UserRewardProofFields::from_public_inputs(&padded),
+                Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+            let mut encoded = proof;
+            encoded.recipient[index - 5] = 1;
+            assert_eq!(encoded.to_public_inputs(),
+                Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+        }
+        let mut modulus_amount = inputs;
+        modulus_amount[13] = GOLDILOCKS_MODULUS;
+        assert_eq!(UserRewardProofFields::from_public_inputs(&modulus_amount),
+            Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+    }
+    fn cumulative_leaf(user_id: u32) -> CumulativeRewardLeaf {
+        CumulativeRewardLeaf { economic_domain: [9; 32], user_id, total_amount: [1500, 0, 0, 0, 0, 0, 0, 0],
+            recipient: [0x11; 20], initialized: true }
+    }
+
+    fn reward_header(count: u32, capacity: u32) -> InclusionAggregateHeader {
+        let total = if count == 0 { 0 } else { count + capacity };
+        InclusionAggregateHeader {
+            family: REWARD_PUBLICATION_FAMILY, config_hash: [4; 32], window_id: [5; 32],
+            end_checkpoint_id: 1200, end_checkpoint_root: [5, 6, 7, 8], aggregate_capacity: capacity,
+            total_count: total, segment_count: if total == 0 { 0 } else { total.div_ceil(capacity) },
+            segment_index: if count == 0 { 0 } else { 1 }, first_ordinal: if count == 0 { 0 } else { capacity },
+            count, withdrawal_roots: Vec::new(), old_nullifier_root: Some([1, 2, 3, 4]),
+            new_nullifier_root: Some(if count == 0 { [1, 2, 3, 4] } else { [8, 7, 6, 5] }),
+            opening_digest: if count == 0 { [0; 32] } else { [6; 32] }, claim_tree_root: [0; 32],
+        }
+    }
+
+    #[test]
+    fn cumulative_reward_record_is_five_canonical_words() {
+        let leaf = cumulative_leaf(7);
+        let bytes = leaf.encode().unwrap();
+        assert_eq!(bytes.len(), CUMULATIVE_REWARD_LEAF_BYTES);
+        assert_eq!(&bytes[..32], &[9; 32]);
+        assert_eq!(&bytes[32..64], &word(7));
+        assert_eq!(&bytes[64..96], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05, 0xdc]);
+        assert!(bytes[96..108].iter().all(|&byte| byte == 0));
+        assert_eq!(&bytes[108..128], &[0x11; 20]);
+        assert_eq!(&bytes[128..160], &word(1));
+        assert_eq!(CumulativeRewardLeaf::decode(&bytes).unwrap(), leaf);
+        assert_eq!(leaf.leaf_commit().unwrap(), hash_parts(&[&hash_parts(&[b"PsyBridge/CumulativeReward/1/Record"]), &bytes]));
+        assert_ne!(leaf.leaf_commit().unwrap(), hash_parts(&[&domain_hash(Domain::LeafCommit), &word(3), &bytes]));
+        for mutation in [0usize, 63, 95, 127, 159] {
+            let mut changed = bytes.clone();
+            changed[mutation] ^= 1;
+            assert!(CumulativeRewardLeaf::decode(&changed).is_err()
+                || CumulativeRewardLeaf::decode(&changed).unwrap().leaf_commit().unwrap() != leaf.leaf_commit().unwrap());
+        }
+        let mut uninitialized = leaf;
+        uninitialized.initialized = false;
+        uninitialized.recipient = [0; 20];
+        uninitialized.total_amount = [0; 8];
+        assert_eq!(uninitialized.encode().unwrap()[159], 0);
+        assert!(CumulativeRewardOpening { config_hash: [4; 32], window_id: [5; 32], end_checkpoint_id: 1,
+            end_checkpoint_root: [1, 2, 3, 4], rewards: vec![uninitialized] }.encode().is_err());
+    }
+    #[test]
+    fn cumulative_opening_roundtrips_ordered_one_hundred_sixty_byte_leaves() {
+        let opening = CumulativeRewardOpening { config_hash: [4; 32], window_id: [5; 32], end_checkpoint_id: 1200,
+            end_checkpoint_root: [5, 6, 7, 8], rewards: vec![cumulative_leaf(7), cumulative_leaf(8)] };
+        let bytes = opening.encode().unwrap();
+        assert_eq!(bytes.len(), CUMULATIVE_REWARD_OPENING_CONTEXT_BYTES + CUMULATIVE_REWARD_LEAF_BYTES * 2);
+        assert_eq!(CumulativeRewardOpening::decode(&bytes).unwrap(), opening);
+        assert_eq!(opening.opening_digest().unwrap(), hash_parts(&[&hash_parts(&[b"PsyBridge/CumulativeReward/1/Opening"]), &bytes]));
+        assert_ne!(opening.opening_digest().unwrap(), hash_parts(&[&domain_hash(Domain::RewardAggregate), &bytes]));
+        let mut reversed = opening.clone();
+        reversed.rewards.reverse();
+        assert!(reversed.encode().is_err());
+    }
+    #[test]
+    fn packed_headers_reject_wrong_family_width_and_byte_order() {
+        let reward = reward_header(1, 1024);
+        let mut bound = reward.clone();
+        let commits = [cumulative_leaf(7).leaf_commit().unwrap()];
+        bind_claim_tree(&mut bound, &commits).unwrap();
+        let bytes = bound.encode().unwrap();
+        assert_eq!(bytes.len(), REWARD_HEADER_BYTES);
+        assert_eq!(InclusionAggregateHeader::decode(&bytes).unwrap(), bound);
+        assert_eq!(bound.header_digest().unwrap(), hash_parts(&[&hash_parts(&[b"PsyBridge/TwoArtifact/1/AggregateHeader"]), &bytes]));
+        let words = bound.publication_words().unwrap();
+        assert_eq!(&words[..4], &[1, 7, 3, 0]);
+        assert_eq!(&words[4..12], publication_digest_words(bound.opening_digest).as_slice());
+        assert_eq!(&words[12..20], publication_digest_words(bound.claim_tree_root).as_slice());
+        assert_eq!(&words[20..28], publication_digest_words(bound.header_digest().unwrap()).as_slice());
+        let mut digest = [0u8; 32];
+        digest[0] = 1;
+        digest[31] = 2;
+        bound.opening_digest = digest;
+        let bytes = bound.encode().unwrap();
+        let words = bound.publication_words().unwrap();
+        assert_eq!(words[4], 0x0100_0000);
+        assert_eq!(words[11], 2);
+        assert_ne!(words[4], u32::from_le_bytes(digest[..4].try_into().unwrap()));
+        let mut short = bytes.clone(); short.pop();
+        assert_eq!(InclusionAggregateHeader::decode(&short), Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)));
+        let mut long = bytes.clone(); long.push(0);
+        assert_eq!(InclusionAggregateHeader::decode(&long), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
+        let mut family = bytes.clone(); family[0] = 4;
+        assert_eq!(InclusionAggregateHeader::decode(&family), Err(BridgeProofError::InvalidConfig));
+        let mut felt = bytes.clone();
+        felt[73..81].copy_from_slice(&GOLDILOCKS_MODULUS.to_be_bytes());
+        assert_eq!(InclusionAggregateHeader::decode(&felt), Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
+        let mut paired = [0u64; 8];
+        paired[0] = 1; paired[1] = 2;
+        assert_eq!(read_hash4_encoding(&paired, Hash4Encoding::LittleEndianU32x8).unwrap(), [1 + (2 << 32), 0, 0, 0]);
+        assert!(read_hash4_encoding(&paired[..4], Hash4Encoding::LittleEndianU32x8).is_err());
+        assert!(read_hash4_encoding(&[GOLDILOCKS_MODULUS, 0, 0, 0], Hash4Encoding::CanonicalU64x4).is_err());
+        let mut withdrawal = bound.clone();
+        withdrawal.family = WITHDRAWAL_PUBLICATION_FAMILY;
+        withdrawal.withdrawal_roots = vec![[1, 2, 3, 4]; 256];
+        withdrawal.old_nullifier_root = None; withdrawal.new_nullifier_root = None;
+        let withdrawal_bytes = withdrawal.encode().unwrap();
+        assert_eq!(withdrawal_bytes.len(), WITHDRAWAL_HEADER_CONTEXT_BYTES + 32 * 256);
+        assert_eq!(InclusionAggregateHeader::decode(&withdrawal_bytes).unwrap().withdrawal_roots.len(), 256);
+        let mut one_chain = withdrawal.clone();
+        one_chain.withdrawal_roots.truncate(1);
+        assert_eq!(one_chain.encode().unwrap().len(), WITHDRAWAL_HEADER_CONTEXT_BYTES + 32);
+        let mut zero_roots = one_chain.encode().unwrap();
+        zero_roots.drain(WITHDRAWAL_HEADER_CONTEXT_BYTES..WITHDRAWAL_HEADER_CONTEXT_BYTES + 32);
+        assert_eq!(InclusionAggregateHeader::decode(&zero_roots), Err(BridgeProofError::InvalidCount));
+        let mut excess_roots = withdrawal.encode().unwrap();
+        excess_roots.splice(WITHDRAWAL_HEADER_CONTEXT_BYTES..WITHDRAWAL_HEADER_CONTEXT_BYTES, [0; 32]);
+        assert_eq!(InclusionAggregateHeader::decode(&excess_roots), Err(BridgeProofError::InvalidCount));
+        assert!(reward_header(0, 1024).encode().unwrap().ends_with(&[0; 64]));
+        assert!(reward_header(1023, 1024).encode().is_ok());
+        assert!(reward_header(1024, 1024).encode().is_ok());
+        assert!(reward_header(1025, 1024).encode().is_err());
+        assert!(build_inclusion_aggregate_tree(&[], 1).is_ok());
+        assert!(build_inclusion_aggregate_tree(&[], 131072).is_ok());
+        assert_eq!(build_inclusion_aggregate_tree(&[], 1 << 18), Err(BridgeProofError::InvalidCount));
+    }
+
+    #[test]
+    fn claim_path_rejects_wrong_leaf_index_count_root_and_padding() {
+        let leaves = [cumulative_leaf(7), cumulative_leaf(8)];
+        let commits = [leaves[0].leaf_commit().unwrap(), leaves[1].leaf_commit().unwrap()];
+        let mut header = reward_header(2, 1024);
+        let tree = bind_claim_tree(&mut header, &commits).unwrap();
+        let path = claim_tree_path(&tree, 1024, 2, 0).unwrap();
+        assert_eq!(path.len(), 10);
+        assert_eq!(verify_claim_path(&header, 0, &leaves[0].encode().unwrap(), &path).unwrap(), commits[0]);
+        let other = claim_tree_path(&tree, 1024, 2, 1).unwrap();
+        assert_eq!(verify_claim_path(&header, 1, &leaves[1].encode().unwrap(), &other).unwrap(), commits[1]);
+        assert_eq!(verify_claim_path(&header, 0, &leaves[1].encode().unwrap(), &path), Err(BridgeProofError::InvalidProof));
+        assert_eq!(verify_claim_path(&header, 1, &leaves[1].encode().unwrap(), &path), Err(BridgeProofError::InvalidProof));
+        assert_eq!(verify_claim_path(&header, 2, &leaves[0].encode().unwrap(), &path), Err(BridgeProofError::InvalidCount));
+        assert_eq!(verify_claim_path(&header, 1024, &leaves[0].encode().unwrap(), &path), Err(BridgeProofError::InvalidCount));
+        let mut count = header.clone(); count.count = 1;
+        assert!(count.validate().is_err());
+        let mut root = header.clone(); root.claim_tree_root[0] ^= 1;
+        assert_eq!(verify_claim_path(&root, 0, &leaves[0].encode().unwrap(), &path), Err(BridgeProofError::InvalidProof));
+        let mut family = header.clone(); family.family = 9;
+        assert_eq!(family.validate(), Err(BridgeProofError::InvalidConfig));
+        let empty = hash_parts(&[&domain_hash(Domain::Empty), &word(12), &word(2), &word(2)]);
+        assert_eq!(tree[1025], empty);
+        assert_eq!(tree[1023], hash_parts(&[&domain_hash(Domain::Leaf), &word(12), &word(2), &word(0), &commits[0]]));
+        let mut short = path.clone(); short.pop();
+        assert_eq!(verify_claim_path(&header, 0, &leaves[0].encode().unwrap(), &short), Err(BridgeProofError::InvalidCount));
+        let mut amount = leaves[0].clone();
+        amount.total_amount[0] = 1501;
+        let changed = amount.encode().unwrap();
+        assert_eq!(changed.len(), CUMULATIVE_REWARD_LEAF_BYTES);
+        assert_eq!(CumulativeRewardLeaf::decode(&changed).unwrap(), amount);
+        assert_eq!(verify_claim_path(&header, 0, &changed, &path), Err(BridgeProofError::InvalidProof));
+    }
+
 }

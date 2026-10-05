@@ -278,7 +278,7 @@ When triggered, the current target is:
 PSY_RELAYER_MULTISIG_ACCOUNT='<public-multisig-account-json>' PSY_MULTISIG_POLICY_ARTIFACT='<approved-policy-compiler-artifact-json>' make generate-genesis-data
 ```
 
-It runs `./target/release/psy_dev_cli generate-genesis-data` with required `--relayer-multisig-account` and `--multisig-policy-artifact` public file paths (`Makefile:107-112`). Registration 2 is derived from the initial two-of-three public account and actual multisig circuit fingerprint, with contract-6 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet keys remain secret. Root artifacts remain local operational files: never package or publish `private_keys.json` or generated private keys. L1 custody remains separate and unchanged. Current public Genesis construction and startup QA is pending; do not infer readiness from the existence of these command interfaces.
+It runs `./target/release/psy_dev_cli generate-genesis-data` with required `--relayer-multisig-account` and `--multisig-policy-artifact` public file paths (`Makefile:107-112`). Registration 2 is derived from the initial two-of-three public account and actual multisig circuit fingerprint, with contract-6 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet keys remain secret. Root artifacts remain local operational files: never package or publish `private_keys.json` or generated private keys. The L1 transaction-signing keystore remains separate and unchanged. Current public Genesis construction and startup QA is pending; do not infer readiness from the existence of these command interfaces.
 
 ### 6.2 Embedded wallet circuit trigger
 
@@ -427,21 +427,20 @@ export KEYSTORE_DIR=<home>/.psy/keystore
 ```
 
 4. Stop local consumers of selected cohorts and preserve the previous complete selected cohort plus matching Solidity verifier.
-5. Never recursively delete the keystore root. The CLI removes only the three named files in a selected directory (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:567-578`).
+5. Never recursively delete the keystore root. Only the old `deposit_append` and `withdrawal_claim` regenerators remove the three named Groth16 files in their own subdirectory before rewriting them (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:59,273-277,308-310,353-355,406-416`). Fresh aggregate publication refuses an existing destination and deletes only its own failed staging directory (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:116-161`). Finalize setup writes into the supplied directory and does not clear files first (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:266-268,284-305`).
 
 ### 9.2 Exact commands
 
-| Triggered cohorts | Regeneration | Verifier export |
-|---|---|---|
-| All three | `make regen-groth16-keystore` | `make export-all-solidity-verifier` |
-| `bridge_agg` only | `make regen-bridge-agg-keystore` | `make export-solidity-verifier` |
-| `deposit_append` only | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-withdrawal-claim` | `make export-solidity-verifier-deposit` |
-| `withdrawal_claim` only | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-deposit-append` | `make export-solidity-verifier-withdrawal` |
-| Deposit and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore` | `make export-solidity-verifier-deposit && make export-solidity-verifier-withdrawal` |
-| Bridge aggregation and deposit | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-withdrawal-claim --include-bridge-agg` | `make export-solidity-verifier && make export-solidity-verifier-deposit` |
-| Bridge aggregation and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-deposit-append --include-bridge-agg` | `make export-solidity-verifier && make export-solidity-verifier-withdrawal` |
+Current Make targets `regen-groth16-keystore`, `regen-bridge-agg-keystore`, and `export-solidity-verifier` / `export-solidity-verifier-deposit` / `export-solidity-verifier-withdrawal` are at `Makefile:131-147`. They are stale relative to the CLI: `regen-groth16-keystore` passes `--include-bridge-agg` without the required `--aggregate-config`, `--skip-deposit-append`, and `--skip-withdrawal-claim`, and the export targets omit `--finalize`. Do not run those targets for the cohorts below.
 
-The Make targets and exact verifier destinations are at `Makefile:130-146`. After generation, require every selected file to exist and be nonempty. The generator itself requires existence (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:581-586`).
+| Setup | Source command | Solidity destination |
+|---|---|---|
+| Deposit aggregate, withdrawal aggregate, and reward aggregate | `psy_relayer_cli regenerate-groth16-keystore --aggregate-proofs --aggregate-config <approved-json> --output-dir <fresh-directory>` | `<fresh-directory>/{DepositAggregate,WithdrawalAggregate,RewardAggregate}/verifier.sol`, written by native setup (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:147-156,249-260`) |
+| Finalize | `psy_relayer_cli regenerate-groth16-keystore --keystore-dir <fresh-directory> --skip-deposit-append --skip-withdrawal-claim --include-bridge-agg --aggregate-config <approved-json>`, then `psy_relayer_cli export-solidity-verifier --finalize <fresh-directory> <output.sol>` (`psy_cli/psy_relayer_cli/src/main.rs:62-67,232-239`; `psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:235-268`) | Operator-chosen path. No Make target passes `--finalize`. |
+
+The aggregate command writes `circuit_set.bin`, `setup-aggregates.json`, and all three fresh aggregate directories together, including each directory's `verifier.sol`. It rejects an existing output directory (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:116-158`). There is no `--aggregate-pair` mode. `DepositAggregateVerifier.sol`, `WithdrawalAggregateVerifier.sol`, and `RewardAggregateVerifier.sol` are not generated and do not exist; copying those setup `verifier.sol` files into reviewed contract sources remains pending and is not performed here. The finalize export is a separate source command; do not reuse an old finalize setup. No command in this runbook is authorized for execution by the current documentation change, and no setup file is claimed to exist.
+
+After generation, require every selected file to exist and be nonempty. Aggregate setup checks the five-file manifest, including `verifier.sol` (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:93-109`). Finalize setup still requires only `circuit_groth16.bin`, `pk_groth16.bin`, and `vk_groth16.bin` (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:59,420-423`).
 
 ## 10. Offline Packaging and Manifest
 
@@ -564,7 +563,7 @@ PY
 
 ### 11.1 Authorization and storage class
 
-Artifact upload requires separate exact authorization naming the target storage location and object prefix. Generation, packaging, source push, or contract deployment does not authorize upload. The public bucket configured in current source is a devnet-only default (`dev/locSetupV4.ts:1657-1660`). Custody-restricted networks must use access-controlled artifact storage; do not place their setup material in the devnet public bucket.
+Artifact upload requires separate exact authorization naming the target storage location and object prefix. Generation, packaging, source push, or contract deployment does not authorize upload. The public bucket configured in current source is a devnet-only default (`dev/locSetupV4.ts:1657-1660`). Restricted networks must use access-controlled proving-key storage; do not place their setup material in the devnet public bucket.
 
 Do not put credential values, access keys, secret keys, session tokens, or profile names in commands, documentation, logs, or release records.
 
@@ -677,9 +676,9 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 | Conditional generated DApp config | `psy-dapp/apps/bridge/src/config/faucetOperators.json` | Section 6.1 trigger only |
 | Conditional generated bundle | `client_prover/psy_prover/src/wallet/local_circuits.json` | Section 6.2 trigger only |
 | Manual replace (separate procedure) | `../psy-compiler/psy-precompiles/token/src/main.psy` and `usdt_token/src/main.psy` | Token privacy circuit fingerprints; see [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md) |
-| Selected verifier replace | `psy-contracts/src/GnarkGroth16Verifier.sol` | `bridge_agg` trigger |
-| Selected verifier replace | `psy-contracts/src/DepositBatchVerifier.sol` | `deposit_append` trigger |
-| Selected verifier replace | `psy-contracts/src/WithdrawalClaimVerifier.sol` | `withdrawal_claim` trigger |
+| Pending reviewed copy; not generated and not present | `psy-contracts/src/DepositAggregateVerifier.sol` | Deposit aggregate trigger; setup writes `<fresh-directory>/DepositAggregate/verifier.sol` only |
+| Pending reviewed copy; not generated and not present | `psy-contracts/src/WithdrawalBatchVerifier.sol` | Withdrawal batch trigger; setup writes `<fresh-directory>/WithdrawalBatch/verifier.sol` only |
+| Pending reviewed copy; not generated and not present | `psy-contracts/src/RewardBatchVerifier.sol` | Reward batch trigger; setup writes `<fresh-directory>/RewardBatch/verifier.sol` only |
 
 ```diff
 --- a/psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs
@@ -732,7 +731,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 3. **Atomic metadata and caches:** verifier JSON, fingerprint, and generated libraries jointly define compatibility. A mixed generation can reject real proofs.
 4. **Narrow Genesis and bundle triggers:** these generators write unrelated, large, or secret-bearing artifacts. Circuit metadata regeneration does not authorize their churn.
 5. **Real P2P acceptance:** the required chain proves forwarding, consensus, Coordinator admission, local commit, non-proposer FFS, and state convergence rather than only client or HTTP success.
-6. **Independent Bridge cohorts:** each cohort has distinct constraints, key files, and Solidity verifier. Regenerating an unaffected cohort increases custody and deployment risk without improving correctness.
+6. **Independent Bridge cohorts:** each cohort has distinct constraints, key files, and Solidity verifier. Regenerating an unaffected cohort increases proving-key exposure and deployment risk without improving correctness.
 7. **Manifest-last publication:** consumers never observe a manifest that advertises objects which have not passed storage readback and uncompressed hash validation.
 8. **Applicability-gated DAG:** immutable producer revisions and conditional downstream delivery prevent needless package, WASM, Genesis, DApp, Wallet, and gitlink changes.
 
@@ -740,7 +739,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 
 1. **Fail-closed network boundary:** never use localhost validation as evidence for another network. The current verifier JSON is globally shared, so a localhost-generated replacement requires every non-local consumer to remain blocked until distinct per-network verifier metadata is implemented and validated.
 2. **Private-key exclusion:** root `private_keys.json` and faucet operator private keys are secrets. Never package, upload, commit, paste, or publish them.
-3. **Proving-key custody:** `pk_groth16.bin` and compiled wrapper circuits require storage appropriate to the target network. The public devnet bucket is not valid custody storage for restricted networks.
+3. **Proving-key storage:** `pk_groth16.bin` and compiled wrapper circuits require storage appropriate to the target network. The public devnet bucket is not valid proving-key storage for restricted networks.
 4. **Separate authorization:** source delivery, package publication, artifact upload, and deployment each require their own authorization. Upload commands must not embed credentials or profile names.
 5. **Atomic verifier deployment:** deploy a Solidity verifier only with its matching complete cohort and runtime configuration.
 6. **No dummy substitution:** dummy EndCap provers, dummy verifier JSON, lookalike circuits, and fabricated submissions are never release evidence.

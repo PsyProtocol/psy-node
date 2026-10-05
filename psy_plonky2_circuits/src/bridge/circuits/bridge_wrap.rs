@@ -424,13 +424,11 @@ impl BridgeWrapCircuit {
         shared
     }
 
-    pub fn prove_groth16_with_shared_wrapper(
+    fn prove_wrapper(
         &self,
-        shared_wrapper: &SharedGroth16Wrapper,
         verifier_data: &VerifierOnlyCircuitData<C, D>,
         inner_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> anyhow::Result<UncompressedGroth16ProofData> {
-        anyhow::ensure!(shared_wrapper.finalize_identity.as_ref().map(|identity| identity.chain_indices.as_slice()) == Some(self.configured_chain_indices.as_slice()), "finalize wrapper chain list mismatch");
+    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, String)> {
         let flat_bytes = bridge_wrap_public_inputs_keccak_bytes(&inner_proof.public_inputs, self.configured_chain_indices.len())?;
         tracing::info!(
             "bridge_wrap pre-wrap PI count: {}",
@@ -442,17 +440,34 @@ impl BridgeWrapCircuit {
             wrapper_proof.public_inputs.len()
         );
         let public_inputs_hash = QHashOut::from_4_felts_slice(&inner_proof.public_inputs[20..24]);
-
         let mut keccak = tiny_keccak::Keccak::v256();
         let mut hash = [0u8; 32];
         tiny_keccak::Hasher::update(&mut keccak, &flat_bytes);
         tiny_keccak::Hasher::finalize(keccak, &mut hash);
-        tracing::info!("prove_groth16_with_shared_wrapper public inouts: keccak256: 0x{}", hex::encode(hash));
+        tracing::info!("prove_groth16 public inputs: keccak256: 0x{}", hex::encode(hash));
+        Ok((wrapper_proof, format!("/tmp/plonky2_proof/{}", public_inputs_hash)))
+    }
 
-        shared_wrapper.prove_groth16(
-            &wrapper_proof,
-            Some(&format!("/tmp/plonky2_proof/{}", public_inputs_hash)),
-        )
+    pub fn prove_groth16_with_shared_wrapper(
+        &self,
+        shared_wrapper: &SharedGroth16Wrapper,
+        verifier_data: &VerifierOnlyCircuitData<C, D>,
+        inner_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> anyhow::Result<UncompressedGroth16ProofData> {
+        anyhow::ensure!(shared_wrapper.finalize_identity.as_ref().map(|identity| identity.chain_indices.as_slice()) == Some(self.configured_chain_indices.as_slice()), "finalize wrapper chain list mismatch");
+        let (wrapper_proof, path) = self.prove_wrapper(verifier_data, inner_proof)?;
+        shared_wrapper.prove_groth16(&wrapper_proof, Some(&path))
+    }
+
+    pub fn prove_groth16(
+        self,
+        verifier_data: &VerifierOnlyCircuitData<C, D>,
+        inner_proof: &ProofWithPublicInputs<F, C, D>,
+        keystore_path: String,
+    ) -> anyhow::Result<UncompressedGroth16ProofData> {
+        let (wrapper_proof, path) = self.prove_wrapper(verifier_data, inner_proof)?;
+        let shared = self.into_shared_groth16_wrapper(keystore_path);
+        shared.prove_groth16(&wrapper_proof, Some(&path))
     }
 }
 

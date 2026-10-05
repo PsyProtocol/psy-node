@@ -9,7 +9,7 @@ Local proving service for UPS, contract calls, signatures, aggregation trees, an
 
 **Default listen address**: `0.0.0.0:9999` (process-configured).
 
-## Method inventory (30 methods)
+## Method inventory (29 methods)
 
 ## UPS
 
@@ -69,14 +69,14 @@ Local proving service for UPS, contract calls, signatures, aggregation trees, an
 |---|---|
 | `psy_prove_withdrawal_batch_claim_groth16` | `input`: `BridgeWithdrawalBatchWitnessInput` |
 | `psy_prove_deposit_batch_append_groth16` | `input`: `BridgeDepositBatchWitnessInput` |
-| `psy_prove_bridge_agg_groth16` | `deps_network`: `String`, `input`: `BridgeAggWitnessInput` |
 
 ## Removed / absent (do not use)
 
 - `psy_prove_zk_sign`
 - `psy_prove_zk_sign_inner`
+- `psy_prove_bridge_agg_groth16`
 
-Use `psy_prove_zk_sign_minifier`, `psy_prove_secp_sign`, `psy_prove_eth_personal_secp_sign`, or the software-defined sign helpers instead.
+For the removed signature methods, use `psy_prove_zk_sign_minifier`, `psy_prove_secp_sign`, `psy_prove_eth_personal_secp_sign`, or the software-defined sign helpers. Those are not a replacement for `psy_prove_bridge_agg_groth16`.
 
 ## Source
 

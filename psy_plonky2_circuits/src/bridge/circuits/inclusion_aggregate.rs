@@ -6,7 +6,7 @@ use plonky2::{
     plonk::{circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CircuitData, VerifierCircuitTarget}, config::{AlgebraicHasher, GenericConfig, Hasher}, proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget}},
     recursion::dummy_circuit::{dummy_circuit, dummy_proof},
 };
-use psy_client_data::bridge_aggregate::{Bytes32, Hash4, NetworkConfig, RewardLeaf, WithdrawalLeaf};
+use psy_client_data::bridge_aggregate::{Bytes32, Hash4, NetworkConfig, RewardLeaf, WithdrawalLeaf, BRIDGE_USER_ID};
 use psy_plonky2_basic_helpers::builder::{comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers};
 use psy_plonky2_common_circuits::bridge::{aggregate_commitment::{self as hash, Bytes32Target, Domain, AggregateLeafTarget, RewardLeafTarget, WithdrawalLeafTarget}, aggregate_config::NetworkConfigTarget};
 use super::deposit_aggregate::less_words;
@@ -243,7 +243,7 @@ where F: Extendable<D>, C::Hasher: AlgebraicHasher<F> {
     for j in 0..8 { builder.connect_if_true(active, pi[commit_start + j], commit[j]); }
     let path = match leaf {
         AggregateLeafTarget::Withdrawal(leaf) => {
-            let bridge_user = builder.constant(F::from_canonical_u32(524288));
+            let bridge_user = builder.constant(F::from_canonical_u32(BRIDGE_USER_ID));
             builder.connect_if_true(active, pi[18], bridge_user);
             builder.connect_if_true(active, pi[19], leaf.chain_index);
             Some(WithdrawalRootTarget::build(builder, active, chain_count, leaf.chain_index, pi[20..24].try_into().unwrap(), tree_root.unwrap()))

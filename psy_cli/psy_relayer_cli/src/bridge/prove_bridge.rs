@@ -1102,9 +1102,16 @@ pub async fn run_prove_bridge_agg_with_result(
     let network = NetworkConfig::decode(&hex::decode(approved.network_config)?)?;
     let indices = network.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>();
     let checkpoint = &coordinator_circuits.checkpoint_root_transition;
+    let cached = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
+    let checkpoint_base = cached.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
+        .context("GenerateRollupStateTransitionProof not found in cached circuit library")?;
+    anyhow::ensure!(
+        checkpoint.get_fingerprint() == checkpoint_base,
+        "standalone finalize fingerprint differs from cached GenerateRollupStateTransitionProof"
+    );
     let finalizer = BridgeAggFinalCircuit::<C, D>::prebuild_final_circuit(
         checkpoint.get_common_circuit_data_ref(), checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(),
-        checkpoint.get_fingerprint(), checkpoint.get_fingerprint(), CHECKPOINT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT,
+        checkpoint.get_fingerprint(), checkpoint_base, CHECKPOINT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT,
         GLOBAL_CONTRACT_TREE_HEIGHT, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT, &indices);
     let (result, _, _) = prove_checkpoint_range(
         &provider,
@@ -1165,11 +1172,9 @@ pub async fn run_prove_bridge_agg_with_result(
     let b256_array_to_hex = |arr: [B256; 9]| arr.map(|x| format!("{:#066x}", x));
     tracing::info!("building bridge wrap circuit");
     let bridge_wrap = BridgeWrapCircuit::new(&finalizer)?;
-    let bridge_groth16_wrapper = BridgeWrapCircuit::new(&finalizer)?
-        .into_shared_groth16_wrapper(format!("{}/.psy/keystore/", home::home_dir().context("home directory unavailable")?.display()));
-
     tracing::info!("proving bridge wrap circuit");
-    let groth16_proof = bridge_wrap.prove_groth16_with_shared_wrapper(&bridge_groth16_wrapper, &bridge_agg_verifier_data, &bridge_agg_proof)?;
+    let keystore = format!("{}/.psy/keystore/", home::home_dir().context("home directory unavailable")?.display());
+    let groth16_proof = bridge_wrap.prove_groth16(&bridge_agg_verifier_data, &bridge_agg_proof, keystore)?;
     tracing::info!("groth16 wrap generated");
 
     let solidity_proof = [

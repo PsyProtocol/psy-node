@@ -139,18 +139,11 @@ pub struct RewardWitness {
 
 use psy_config::network_constants::CHECKPOINT_TREE_HEIGHT;
 
-fn claim_checkpoint_path(builder: &mut CircuitBuilder<F, 2>, claim_id: [Target; 2],
-    claim_hash: HashOutTarget, end_id: [Target; 2], end_root: HashOutTarget) -> MerkleProofGadget {
-    builder.assert_zero(claim_id[1]);
-    builder.assert_zero(end_id[1]);
-    builder.range_check(end_id[0], usize::from(CHECKPOINT_TREE_HEIGHT));
-    let path = MerkleProofGadget::add_virtual_to::<PoseidonHash, F, 2>(builder, usize::from(CHECKPOINT_TREE_HEIGHT));
-    builder.connect(path.index, claim_id[0]);
-    builder.range_check(path.index, usize::from(CHECKPOINT_TREE_HEIGHT));
-    builder.connect_hashes(path.value, claim_hash);
-    builder.connect_hashes(path.root, end_root);
-    builder.ensure_is_less_than_or_equal(32, claim_id[0], end_id[0]);
-    path
+fn historical_merkle_proof(builder: &mut CircuitBuilder<F, 2>, claim_id: [Target; 2],
+    claim_leaf: &PsyCheckpointLeafGadget, end_id: [Target; 2], end_root: HashOutTarget) -> MerkleProofGadget {
+    super::historical_merkle_proof::historical_merkle_proof(
+        builder, claim_id, claim_leaf, end_id, end_root,
+    ).path
 }
 
 pub struct RewardInclusionCircuit {
@@ -255,8 +248,8 @@ impl RewardInclusionCircuit {
         for (&target, &value) in pi[4..12].iter().zip(&config_hash) { builder.connect(target, value); }
         let end_id = [pi[12], pi[13]];
         let end_root = [pi[14], pi[15], pi[16], pi[17]];
-        let claim_path = claim_checkpoint_path(&mut builder, reward.claim_checkpoint_id,
-            claim_hash, end_id, HashOutTarget { elements: end_root });
+        let claim_path = historical_merkle_proof(&mut builder, reward.claim_checkpoint_id,
+            &claim_leaf, end_id, HashOutTarget { elements: end_root });
         let message = build_reward_authorization_message_target(
             &mut builder, config_hash, end_id, end_root, end_hash.elements,
             user_hash.elements, claim_hash.elements, &reward,
@@ -454,15 +447,19 @@ mod tests {
 
     #[test]
     fn direct_claim_membership_rejects_path_anchor_and_bound_mutations() {
+        use psy_client_data::qdata::checkpoint::PsyCheckpointLeaf;
+        use psy_crypto::hash::traits::qhashable::QFieldHashable;
         let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
         let claim_id = builder.add_virtual_target_arr();
         let end_id = builder.add_virtual_target_arr();
-        let claim_hash = builder.add_virtual_hash();
+        let claim_leaf_target = PsyCheckpointLeafGadget::create_virtual(&mut builder);
         let end_root = builder.add_virtual_hash();
-        let path = claim_checkpoint_path(&mut builder, claim_id, claim_hash, end_id, end_root);
+        let proof = historical_merkle_proof(&mut builder, claim_id, &claim_leaf_target, end_id, end_root);
         let circuit = builder.build::<C>();
+        let mut leaf = PsyCheckpointLeaf::default();
+        leaf.global_chain_root = hash(3);
+        let value = leaf.qfhash::<PoseidonHash>().0;
         let siblings: Vec<_> = (0..CHECKPOINT_TREE_HEIGHT).map(|i| hash(20 + u64::from(i)).0).collect();
-        let value = hash(7).0;
         let mut root = value;
         for (level, sibling) in siblings.iter().enumerate() {
             root = if 7u32 & (1 << level) == 0 { PoseidonHash::two_to_one(root, *sibling) }
@@ -476,9 +473,11 @@ mod tests {
             witness.set_target(claim_id[1], if mutation == 4 { F::ONE } else { F::ZERO }).unwrap();
             witness.set_target(end_id[0], F::from_canonical_u32(end)).unwrap();
             witness.set_target(end_id[1], if mutation == 5 { F::ONE } else { F::ZERO }).unwrap();
-            witness.set_hash_target(claim_hash, if mutation == 1 { hash(99).0 } else { value }).unwrap();
+            let mut opened = leaf;
+            if mutation == 1 { opened.global_chain_root = hash(99); }
+            claim_leaf_target.set_witness(&mut witness, &opened).unwrap();
             witness.set_hash_target(end_root, if mutation == 7 { hash(99).0 } else { root }).unwrap();
-            for (level, target) in path.siblings.iter().enumerate() {
+            for (level, target) in proof.siblings.iter().enumerate() {
                 witness.set_hash_target(*target, if mutation == 2 && level == 0 { hash(99).0 } else { siblings[level] }).unwrap();
             }
             let result = circuit.prove(witness);
