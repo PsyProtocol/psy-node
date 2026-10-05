@@ -24,9 +24,10 @@ use plonky2::{
     },
 };
 use psy_client_data::bridge_aggregate::{
-    deposit_leaf_path, deposit_leaf_tree, DepositAggregateOpening,
+    bind_claim_tree, deposit_leaf_path, deposit_leaf_tree, DepositAggregateOpening,
     ChainConfig, ChainStart, DepositLeaf, DepositLeafRange, DepositTransition,
-    NetworkConfig, RewardAggregateOpening, RewardLeaf, WithdrawalAggregateOpening, WithdrawalLeaf,
+    InclusionAggregateHeader, NetworkConfig, RewardAggregateOpening, RewardLeaf,
+    WithdrawalAggregateOpening, WithdrawalLeaf, INCLUSION_AGGREGATE_CAPACITIES, WITHDRAWAL_PUBLICATION_FAMILY,
 };
 use psy_core::{
     constants::chain_id::PsyChainNetworkType,
@@ -58,7 +59,7 @@ use psy_plonky2_circuits::{
             bridge_agg_chain::{BridgeAggChainBoundary, BridgeAggChainCircuit},
             bridge_agg_final::{BridgeAggFinalSlotWitness, BridgeAggFinalEndpointWitness},
             chain_aggregate::{ChainContext, ChainRow},
-            inclusion_aggregate::{AggregateWindow, AggregateLeaves, RewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths},
+            inclusion_aggregate::{AggregateWindow, RewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths, WITHDRAWAL_PUBLICATION_PI_LEN},
             reward_inclusion::{RewardTagWitness, RewardWitness},
         },
         gadgets::{
@@ -435,6 +436,45 @@ fn assert_opening_digest(proof: &ProofWithPublicInputs<F, C, D>, family: u32, va
     assert_eq!(pi_bytes(&proof.public_inputs[4..12]), digest);
 }
 
+fn assert_withdrawal_publication(proof: &ProofWithPublicInputs<F, C, D>, header: &InclusionAggregateHeader) {
+    let words = header.publication_words().expect("withdrawal publication words");
+    assert_eq!(words.len(), WITHDRAWAL_PUBLICATION_PI_LEN);
+    assert_eq!(proof.public_inputs, words.map(F::from_canonical_u32));
+    assert_eq!(&proof.public_inputs[..4], &[1, 7, WITHDRAWAL_PUBLICATION_FAMILY as u32, 0].map(F::from_canonical_u32));
+    assert_eq!(pi_bytes(&proof.public_inputs[4..12]), header.opening_digest);
+    assert_eq!(pi_bytes(&proof.public_inputs[12..20]), header.claim_tree_root);
+    assert_eq!(pi_bytes(&proof.public_inputs[20..28]), header.header_digest().expect("withdrawal header digest"));
+}
+
+fn withdrawal_publication_header(config: &NetworkConfig, opening: &WithdrawalAggregateOpening) -> anyhow::Result<InclusionAggregateHeader> {
+    let count = u32::try_from(opening.withdrawals.len()).context("withdrawal publication count exceeds u32")?;
+    anyhow::ensure!(count <= INCLUSION_AGGREGATE_CAPACITIES[0], "manager withdrawal publication capacity is 1024");
+    let mut header = InclusionAggregateHeader {
+        family: WITHDRAWAL_PUBLICATION_FAMILY,
+        config_hash: opening.config_hash,
+        window_id: opening.window_id,
+        end_checkpoint_id: opening.end_checkpoint_id,
+        end_checkpoint_root: opening.end_checkpoint_root,
+        aggregate_capacity: INCLUSION_AGGREGATE_CAPACITIES[0],
+        total_count: count,
+        segment_count: u32::from(count != 0),
+        segment_index: 0,
+        first_ordinal: 0,
+        count,
+        withdrawal_roots: opening.withdrawal_roots.clone(),
+        old_nullifier_root: None,
+        new_nullifier_root: None,
+        opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest(config)? },
+        claim_tree_root: [0; 32],
+    };
+    if count != 0 {
+        let commits = opening.withdrawals.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?;
+        bind_claim_tree(&mut header, &commits)?;
+    }
+    header.validate()?;
+    Ok(header)
+}
+
 fn chain_proofs(circuits: &AggregateCircuits, config: &NetworkConfig, a: &DepositAggregateOpening,
     webs: &[Vec<ProofWithPublicInputs<F, C, D>>], tree: &[[u8; 32]],
 ) -> anyhow::Result<Vec<ProofWithPublicInputs<F, C, D>>> {
@@ -549,28 +589,15 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     let withdrawal_proofs = withdrawal_inputs.iter().map(|input| circuits.withdrawal.generate_proof(input)).collect::<anyhow::Result<Vec<_>>>()?;
     let root_paths = withdrawal_paths_for(&config, &ends)?;
     let withdrawal_leaves: Vec<_> = withdrawals.iter().zip(&withdrawal_proofs).zip(&root_paths).map(|((leaf, proof), path)| WithdrawalAggregateLeaf { leaf, proof, path }).collect();
-    let proof_w = circuits.prove_withdrawal_aggregate(&config, &withdrawals_opening, &withdrawal_leaves)?;
-    circuits.aggregates[0].circuit_data.verify(proof_w.clone())?;
-    assert_opening_digest(&proof_w, 7, 2, withdrawals_opening.opening_digest(&config)?);
+    let withdrawal_header = withdrawal_publication_header(&config, &withdrawals_opening)?;
+    let proof_w = circuits.prove_withdrawal_aggregate(&config, &withdrawals_opening, &withdrawal_header, &withdrawal_leaves)?;
+    circuits.withdrawal_aggregate.circuit_data.verify(proof_w.clone())?;
+    assert_withdrawal_publication(&proof_w, &withdrawal_header);
     let mut flat_preimage = keccak(b"PsyBridge/TwoArtifact/1/WithdrawalBatch").to_vec();
     let encoded_w = withdrawals_opening.encode()?;
     assert_eq!(encoded_w.len(), 288 + 128 * CHAIN_INDICES.len() + 192 * withdrawals.len());
     flat_preimage.extend(encoded_w);
-    assert_opening_digest(&proof_w, 7, 2, keccak(&flat_preimage));
-    for mutation in 0..4 {
-        let mut roots = withdrawals_opening.withdrawal_roots.clone();
-        let mut window = AggregateWindow { config_hash: a.config_hash, window_id: a.window_id, end_id: 1, end_root: a.end_checkpoint_root };
-        match mutation {
-            0 => roots[0][0] ^= 1,
-            1 => roots.swap(0, 1),
-            2 => window.end_id += 1,
-            _ => window.end_root[0] ^= 1,
-        }
-        let mut witness = plonky2::iop::witness::PartialWitness::new();
-        circuits.aggregates[0].set_witness(&mut witness, &config, &window,
-            &AggregateLeaves::Withdrawal { leaves: &withdrawal_leaves, withdrawal_roots: &roots })?;
-        assert!(circuits.aggregates[0].circuit_data.prove(witness).is_err(), "unbound withdrawal root/context mutation {mutation}");
-    }
+    assert_eq!(withdrawal_header.opening_digest, keccak(&flat_preimage));
     let reward_input = RewardWitness { config: config.clone(), tag: checkpoint.reward_tag.clone(), authorization: RewardAuthorizationInput {
         context: RewardAuthorizationContext {
         config_hash: a.config_hash, end_checkpoint_id: 1, end_checkpoint_root: a.end_checkpoint_root, reward,
@@ -584,7 +611,7 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     let reward_proof = circuits.reward.prove(&reward_input)?;
     let reward_leaves = [RewardAggregateLeaf { leaf: &rewards_opening.rewards[0], proof: &reward_proof }];
     let proof_r = circuits.prove_reward_aggregate(&config, &rewards_opening, &reward_leaves)?;
-    circuits.aggregates[1].circuit_data.verify(proof_r.clone())?;
+    circuits.reward_aggregate.circuit_data.verify(proof_r.clone())?;
     assert_opening_digest(&proof_r, 7, 3, rewards_opening.opening_digest(&config)?);
 
     // Opening mutations must fail canonical validation before proving.
@@ -613,7 +640,8 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
             7 => { changed.withdrawal_roots.pop(); },
             _ => changed.end_checkpoint_id += 1,
         }
-        rejects(|| circuits.prove_withdrawal_aggregate(&config, &changed, &withdrawal_leaves).map(|_| ()));
+        let changed_header = withdrawal_publication_header(&config, &changed);
+        rejects(|| changed_header.and_then(|header| circuits.prove_withdrawal_aggregate(&config, &changed, &header, &withdrawal_leaves).map(|_| ())));
     }
     for mutation in 0..4 {
         let mut changed = rewards_opening.clone();
@@ -675,40 +703,49 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     fabricated.withdrawal_root = hash4(path(&[(0, withdrawal_hash(&fabricated.leaf))], 0, 32).root);
     let fabricated_proof = circuits.withdrawal.generate_proof(&fabricated)?;
     circuits.withdrawal.circuit_data.verify(fabricated_proof.clone())?;
+    let mut fabricated_opening = withdrawals_opening.clone();
+    fabricated_opening.withdrawals[0] = fabricated.leaf.clone();
+    let fabricated_header = withdrawal_publication_header(&config, &fabricated_opening)?;
     let changed_leaves = [
         WithdrawalAggregateLeaf { leaf: &fabricated.leaf, proof: &fabricated_proof, path: &root_paths[0] },
         WithdrawalAggregateLeaf { leaf: &withdrawals[1], proof: &withdrawal_proofs[1], path: &root_paths[1] },
         WithdrawalAggregateLeaf { leaf: &withdrawals[2], proof: &withdrawal_proofs[2], path: &root_paths[2] },
     ];
     let mut witness = plonky2::iop::witness::PartialWitness::new();
-    circuits.aggregates[0].set_witness(&mut witness, &config, &AggregateWindow { config_hash: a.config_hash, window_id: a.window_id, end_id: 1, end_root: a.end_checkpoint_root }, &AggregateLeaves::Withdrawal {
-        leaves: &changed_leaves, withdrawal_roots: &withdrawals_opening.withdrawal_roots,
-    })?;
-    assert!(circuits.aggregates[0].circuit_data.prove(witness).is_err(), "fabricated withdrawal root joined digest-bound vector");
+    circuits.withdrawal_aggregate.set_witness(&mut witness, &config, &AggregateWindow { config_hash: a.config_hash, window_id: a.window_id, end_id: 1, end_root: a.end_checkpoint_root }, &fabricated_header, &changed_leaves)?;
+    assert!(circuits.withdrawal_aggregate.circuit_data.prove(witness).is_err(), "fabricated withdrawal root joined digest-bound vector");
+    let one_opening = WithdrawalAggregateOpening { withdrawals: vec![withdrawals[0].clone()], ..withdrawals_opening.clone() };
+    let one_header = withdrawal_publication_header(&config, &one_opening)?;
     let mut wrong_path = root_paths[0].clone(); wrong_path.siblings[0][0] ^= 1;
     let mut witness = plonky2::iop::witness::PartialWitness::new();
-    circuits.aggregates[0].set_witness(&mut witness, &config, &AggregateWindow { config_hash: a.config_hash, window_id: a.window_id, end_id: 1, end_root: a.end_checkpoint_root }, &AggregateLeaves::Withdrawal {
-        leaves: &[WithdrawalAggregateLeaf { leaf: &withdrawals[0], proof: &withdrawal_proofs[0], path: &wrong_path }], withdrawal_roots: &withdrawals_opening.withdrawal_roots,
-    })?;
-    assert!(circuits.aggregates[0].circuit_data.prove(witness).is_err(), "changed withdrawal-root sibling proved");
+    circuits.withdrawal_aggregate.set_witness(&mut witness, &config, &AggregateWindow { config_hash: a.config_hash, window_id: a.window_id, end_id: 1, end_root: a.end_checkpoint_root }, &one_header, &[WithdrawalAggregateLeaf { leaf: &withdrawals[0], proof: &withdrawal_proofs[0], path: &wrong_path }])?;
+    assert!(circuits.withdrawal_aggregate.circuit_data.prove(witness).is_err(), "changed withdrawal-root sibling proved");
     let empty_withdrawals = WithdrawalAggregateOpening { withdrawals: Vec::new(), ..withdrawals_opening.clone() };
+    let empty_header = withdrawal_publication_header(&config, &empty_withdrawals)?;
+    assert_eq!(empty_header.count, 0);
+    assert_eq!(empty_header.opening_digest, [0; 32]);
+    assert_eq!(empty_header.claim_tree_root, [0; 32]);
+    assert_eq!(empty_header.withdrawal_roots, withdrawals_opening.withdrawal_roots);
     let empty_rewards = RewardAggregateOpening { rewards: Vec::new(), ..rewards_opening.clone() };
-    let empty_w = circuits.prove_withdrawal_aggregate(&config, &empty_withdrawals, &[])?;
     let empty_r = circuits.prove_reward_aggregate(&config, &empty_rewards, &[])?;
-    circuits.aggregates[0].circuit_data.verify(empty_w.clone())?;
-    circuits.aggregates[1].circuit_data.verify(empty_r.clone())?;
-    assert_opening_digest(&empty_w, 7, 2, empty_withdrawals.opening_digest(&config)?);
+    circuits.reward_aggregate.circuit_data.verify(empty_r.clone())?;
     assert_opening_digest(&empty_r, 7, 3, empty_rewards.opening_digest(&config)?);
     for mutation in 0..2 {
         let mut changed = empty_withdrawals.clone();
         if mutation == 0 { changed.withdrawal_roots[2][0] ^= 1; }
         else { changed.window_id[0] ^= 1; }
-        let changed_proof = circuits.prove_withdrawal_aggregate(&config, &changed, &[])?;
-        circuits.aggregates[0].circuit_data.verify(changed_proof.clone())?;
-        assert_opening_digest(&changed_proof, 7, 2, changed.opening_digest(&config)?);
-        assert_ne!(changed_proof.public_inputs[4..], empty_w.public_inputs[4..], "empty W omitted its roots or context");
+        let changed_header = withdrawal_publication_header(&config, &changed)?;
+        assert_ne!(changed_header.encode()?, empty_header.encode()?, "empty W omitted its roots or context");
+        assert_eq!(changed_header.opening_digest, [0; 32]);
+        assert_eq!(changed_header.claim_tree_root, [0; 32]);
     }
-    rejects(|| circuits.prove_withdrawal_aggregate(&config, &withdrawals_opening, &[]).map(|_| ()));
+    rejects(|| circuits.prove_withdrawal_aggregate(&config, &withdrawals_opening, &withdrawal_header, &[]).map(|_| ()));
+    let mut wrong_pin = withdrawal_header.clone();
+    wrong_pin.opening_digest[31] ^= 1;
+    rejects(|| circuits.prove_withdrawal_aggregate(&config, &withdrawals_opening, &wrong_pin, &withdrawal_leaves).map(|_| ()));
+    let mut wrong_root = withdrawal_header.clone();
+    wrong_root.claim_tree_root[31] ^= 1;
+    rejects(|| circuits.prove_withdrawal_aggregate(&config, &withdrawals_opening, &wrong_root, &withdrawal_leaves).map(|_| ()));
     rejects(|| circuits.prove_reward_aggregate(&config, &rewards_opening, &[]).map(|_| ()));
     let mut wrong_config = config.clone(); wrong_config.circuit_set_hash[0] ^= 1;
     rejects(|| circuits.prove_deposit_aggregate(&wrong_config, &a, &chains).map(|_| ()));

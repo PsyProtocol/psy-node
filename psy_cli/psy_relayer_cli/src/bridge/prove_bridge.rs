@@ -48,8 +48,8 @@ use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::{
 };
 use psy_provider::provider::RpcProvider;
 use serde::Serialize;
-use psy_client_data::bridge_aggregate::{DepositAggregateOpening, WithdrawalAggregateOpening, RewardAggregateOpening, NetworkConfig, DepositLeaf, DepositLeafRange, deposit_leaf_tree, deposit_leaf_path};
-use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow}, inclusion_aggregate::{AggregateWindow, AggregateLeaves, WithdrawalAggregateLeaf, RewardAggregateLeaf, withdrawal_root_paths}}};
+use psy_client_data::bridge_aggregate::{bind_claim_tree, DepositAggregateOpening, DepositLeaf, DepositLeafRange, InclusionAggregateHeader, NetworkConfig, RewardAggregateOpening, WithdrawalAggregateOpening, WITHDRAWAL_PUBLICATION_FAMILY, deposit_leaf_path, deposit_leaf_tree};
+use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow}, inclusion_aggregate::{RewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths}}};
 use psy_plonky2_common_circuits::bridge::deposit_spiderman_append::DepositSpidermanAppendInputs;
 use parth_core::{pgoldilocks::PoseidonHasher, crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, MerkleZeroHasher}}};
 
@@ -209,6 +209,34 @@ pub(crate) fn build_deposit_aggregate(config: &NetworkConfig, opening: &DepositA
     circuits.prove_deposit_aggregate(config, opening, &chains)
 }
 
+const WITHDRAWAL_PUBLICATION_CAPACITY: u32 = 1024;
+
+pub(crate) fn withdrawal_publication_header(config: &NetworkConfig, opening: &WithdrawalAggregateOpening) -> anyhow::Result<InclusionAggregateHeader> {
+    let count = u32::try_from(opening.withdrawals.len()).context("withdrawal publication count exceeds u32")?;
+    anyhow::ensure!(count <= WITHDRAWAL_PUBLICATION_CAPACITY, "withdrawal publication requires another compiled segment capacity; AggregateCircuits builds only 1024");
+    let mut header = InclusionAggregateHeader {
+        family: WITHDRAWAL_PUBLICATION_FAMILY,
+        config_hash: opening.config_hash,
+        window_id: opening.window_id,
+        end_checkpoint_id: opening.end_checkpoint_id,
+        end_checkpoint_root: opening.end_checkpoint_root,
+        aggregate_capacity: WITHDRAWAL_PUBLICATION_CAPACITY,
+        total_count: count,
+        segment_count: u32::from(count != 0),
+        segment_index: 0,
+        first_ordinal: 0,
+        count,
+        withdrawal_roots: opening.withdrawal_roots.clone(),
+        old_nullifier_root: None,
+        new_nullifier_root: None,
+        opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest(config)? },
+        claim_tree_root: [0; 32],
+    };
+    let commits = opening.withdrawals.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?;
+    bind_claim_tree(&mut header, &commits)?;
+    Ok(header)
+}
+
 pub(crate) fn build_withdrawal_aggregate(config: &NetworkConfig, opening: &WithdrawalAggregateOpening, proofs: &[ProofWithPublicInputs<F, C, D>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
     circuits.validate_config(config)?;
     opening.validate(config)?;
@@ -218,8 +246,8 @@ pub(crate) fn build_withdrawal_aggregate(config: &NetworkConfig, opening: &Withd
         let ordinal = config.chains.binary_search_by_key(&record.chain_index, |chain| chain.chain_index).map_err(|_| anyhow::anyhow!("withdrawal chain absent"))?;
         Ok(WithdrawalAggregateLeaf { leaf: record, proof, path: &paths[ordinal] })
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    let window = AggregateWindow { config_hash: opening.config_hash, window_id: opening.window_id, end_id: opening.end_checkpoint_id, end_root: opening.end_checkpoint_root };
-    circuits.aggregates[0].prove(config, &window, &AggregateLeaves::Withdrawal { leaves: &records, withdrawal_roots: &opening.withdrawal_roots })
+    let header = withdrawal_publication_header(config, opening)?;
+    circuits.prove_withdrawal_aggregate(config, opening, &header, &records)
 }
 
 pub(crate) fn build_reward_aggregate(config: &NetworkConfig, opening: &RewardAggregateOpening, proofs: &[ProofWithPublicInputs<F, C, D>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
@@ -227,8 +255,7 @@ pub(crate) fn build_reward_aggregate(config: &NetworkConfig, opening: &RewardAgg
     opening.validate(config)?;
     anyhow::ensure!(proofs.len() == opening.rewards.len(), "one proof per reward required");
     let records = opening.rewards.iter().zip(proofs).map(|(leaf, proof)| RewardAggregateLeaf { leaf, proof }).collect::<Vec<_>>();
-    let window = AggregateWindow { config_hash: opening.config_hash, window_id: opening.window_id, end_id: opening.end_checkpoint_id, end_root: opening.end_checkpoint_root };
-    circuits.aggregates[1].prove(config, &window, &AggregateLeaves::Reward(&records))
+    circuits.prove_reward_aggregate(config, opening, &records)
 }
 
 fn bridge_contract_state_tree_height(contract_id: u32) -> anyhow::Result<u8> {

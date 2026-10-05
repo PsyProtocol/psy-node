@@ -4,7 +4,7 @@ use hex::FromHexError;
 use parth_core::{crypto::hash::traits::HashTo4Felts, pgoldilocks::QHashOut};
 use plonky2::{
     field::{goldilocks_field::GoldilocksField, types::PrimeField64},
-    iop::witness::{PartialWitness, WitnessWrite},
+    iop::{target::Target, witness::{PartialWitness, WitnessWrite}},
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData},
@@ -33,11 +33,32 @@ use parth_core::crypto::hash::traits::ToU64x4;
 use psy_common_circuit::serialization::PsyGateSerializer;
 use psy_crypto::hash::core::sha256::CoreSha256Hasher;
 
+const OPENING_DIGEST_PI_LEN: usize = 12;
+const OPENING_DIGEST_BITS: usize = 256;
+const WITHDRAWAL_PUBLICATION_PI_LEN: usize = 28;
+const WITHDRAWAL_PUBLICATION_BITS: usize = 768;
+const DIGEST_WORD_BITS: usize = 32;
+const PUBLICATION_DIGEST_WORDS: usize = 8;
+
+fn digest_artifact_statement(artifact: DigestArtifact) -> (usize, usize) {
+    match artifact {
+        DigestArtifact::DepositAggregate | DigestArtifact::RewardAggregate => (OPENING_DIGEST_PI_LEN, OPENING_DIGEST_BITS),
+        DigestArtifact::WithdrawalAggregate => (WITHDRAWAL_PUBLICATION_PI_LEN, WITHDRAWAL_PUBLICATION_BITS),
+    }
+}
+
 fn digest_artifact_prefix(artifact: DigestArtifact) -> [u64; 4] {
     match artifact {
         DigestArtifact::DepositAggregate => [1, 11, 1, 0],
         DigestArtifact::WithdrawalAggregate => [1, 7, 2, 0],
         DigestArtifact::RewardAggregate => [1, 7, 3, 0],
+    }
+}
+
+fn register_digest_bits(builder: &mut CircuitBuilder<F, D>, words: &[Target]) {
+    for word in words {
+        let bits = builder.split_le(*word, DIGEST_WORD_BITS);
+        for bit in bits.into_iter().rev() { builder.register_public_input(bit.target); }
     }
 }
 
@@ -113,7 +134,8 @@ pub struct DigestBitsAdapter {
 
 impl DigestBitsAdapter {
     pub fn build(artifact: DigestArtifact, common: &CommonCircuitData<F, D>, verifier: &VerifierOnlyCircuitData<C, D>) -> anyhow::Result<Self> {
-        anyhow::ensure!(common.num_public_inputs == 12, "normalizer must expose exactly 12 public inputs");
+        let (statement_len, digest_bits) = digest_artifact_statement(artifact);
+        anyhow::ensure!(common.num_public_inputs == statement_len, "normalizer public input width mismatch");
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
         let normalizer = builder.add_virtual_proof_with_pis(common);
         let pinned_verifier = builder.constant_verifier_data(verifier);
@@ -122,12 +144,13 @@ impl DigestBitsAdapter {
             let constant = builder.constant(F::from_canonical_u64(value));
             builder.connect(*target, constant);
         }
-        for word in &normalizer.public_inputs[4..12] {
-            let bits = builder.split_le(*word, 32);
-            for bit in bits.into_iter().rev() { builder.register_public_input(bit.target); }
-        }
+        let digest_words = &normalizer.public_inputs[4..];
+        anyhow::ensure!(digest_words.len() * DIGEST_WORD_BITS == digest_bits, "digest bit width mismatch");
+        register_digest_bits(&mut builder, digest_words);
+        let circuit_data = builder.build::<C>();
+        anyhow::ensure!(circuit_data.common.num_public_inputs == digest_bits, "adapter digest width mismatch");
         Ok(Self {
-            circuit_data: builder.build::<C>(), normalizer, artifact,
+            circuit_data, normalizer, artifact,
             normalizer_fingerprint: crate::proof_minifier::pm_core::get_circuit_fingerprint_generic_q::<D, F, C>(verifier).to_u64x4(),
             normalizer_common: hex::encode(common.to_bytes(&PsyGateSerializer).map_err(|error| anyhow::anyhow!("common serialization: {error:?}"))?),
             normalizer_verifier: hex::encode(verifier.to_bytes().map_err(|error| anyhow::anyhow!("verifier serialization: {error:?}"))?),
@@ -135,17 +158,21 @@ impl DigestBitsAdapter {
     }
 
     pub fn prove(&self, proof: &ProofWithPublicInputs<F, C, D>) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-        anyhow::ensure!(proof.public_inputs.len() == 12, "normalizer PI width mismatch");
+        let (statement_len, _) = digest_artifact_statement(self.artifact);
+        anyhow::ensure!(proof.public_inputs.len() == statement_len, "normalizer PI width mismatch");
         let mut witness = PartialWitness::new();
         witness.set_proof_with_pis_target(&self.normalizer, proof)?;
-        self.circuit_data.prove(witness)
+        let proved = self.circuit_data.prove(witness)?;
+        anyhow::ensure!(proved.public_inputs.len() == self.circuit_data.common.num_public_inputs, "adapter proof width mismatch");
+        Ok(proved)
     }
 
     pub fn into_wrapper(self, sources: DigestBitsSources) -> anyhow::Result<DigestBitsWrapper> {
         sources.validate()?;
+        let (_, digest_bits) = digest_artifact_statement(self.artifact);
         let shared = SharedGroth16Wrapper::new(self.circuit_data, String::new());
         let final_data = &shared.wrapped_circuit.wrapper_circuit.data;
-        anyhow::ensure!(final_data.common.num_public_inputs == 256, "final wrapper must expose 256 digest bits");
+        anyhow::ensure!(final_data.common.num_public_inputs == digest_bits, "final wrapper digest width mismatch");
         let identity = DigestBitsIdentity {
             schema: 1, mode: "DigestBits".into(), artifact: self.artifact as u32,
             node_source: sources.node_source, native_source: sources.native_source,
@@ -174,32 +201,57 @@ impl DigestBitsWrapper {
     }
 
     pub fn prove_groth16(&self, adapter_proof: &ProofWithPublicInputs<F, C, D>, artifact_dir: &str) -> anyhow::Result<UncompressedGroth16ProofData> {
-        anyhow::ensure!(adapter_proof.public_inputs.len() == 256, "digest PI width mismatch");
-        let mut halves = [0u128; 2];
-        for (index, bit) in adapter_proof.public_inputs.iter().enumerate() {
-            let bit = bit.to_canonical_u64();
-            anyhow::ensure!(bit <= 1, "digest input is not Boolean");
-            halves[index / 128] = (halves[index / 128] << 1) | u128::from(bit);
-        }
+        anyhow::ensure!(self.artifact != DigestArtifact::WithdrawalAggregate, "withdrawal publication requires six native public inputs");
+        let (_, digest_bits) = digest_artifact_statement(self.artifact);
+        let words = digest_bit_words::<2>(adapter_proof, digest_bits)?;
+        let proof = self.prove_native(adapter_proof, artifact_dir)?;
+        let decoded: UncompressedGroth16ProofData = serde_json::from_str(&proof)?;
+        anyhow::ensure!(decode_digest_words(&decoded.public_inputs)? == words, "native digest halves mismatch");
+        Ok(decoded)
+    }
+
+    pub fn prove_withdrawal_publication(&self, adapter_proof: &ProofWithPublicInputs<F, C, D>, artifact_dir: &str) -> anyhow::Result<WithdrawalPublicationProof> {
+        anyhow::ensure!(self.artifact == DigestArtifact::WithdrawalAggregate, "not a withdrawal publication wrapper");
+        let words = digest_bit_words::<6>(adapter_proof, WITHDRAWAL_PUBLICATION_BITS)?;
+        let proof = self.prove_native(adapter_proof, artifact_dir)?;
+        let decoded: WithdrawalPublicationProof = serde_json::from_str(&proof)?;
+        anyhow::ensure!(decode_digest_words(&decoded.public_inputs)? == words, "native withdrawal publication words mismatch");
+        Ok(decoded)
+    }
+
+    fn prove_native(&self, adapter_proof: &ProofWithPublicInputs<F, C, D>, artifact_dir: &str) -> anyhow::Result<String> {
         let output = self.shared.wrapped_circuit.prove(adapter_proof)?;
         let result = gnark_plonky2_verifier_ffi::generate_digest_bits_proof(self.artifact, &json(&self.identity)?, &json(&output.proof)?, artifact_dir)
             .map_err(|error| anyhow::anyhow!("DigestBits proving status {}: {}", error.status, error.message))?;
-        let proof: UncompressedGroth16ProofData = serde_json::from_str(&result.proof_json)?;
-        anyhow::ensure!(decode_digest_bits_public_inputs(&proof.public_inputs)? == halves, "native digest halves mismatch");
-        Ok(proof)
+        Ok(result.proof_json)
     }
 }
 
-fn decode_digest_bits_public_inputs(inputs: &[String; 2]) -> anyhow::Result<[u128; 2]> {
-    let mut halves = [0u128; 2];
-    for (word, half) in inputs.iter().zip(&mut halves) {
+fn digest_bit_words<const N: usize>(adapter_proof: &ProofWithPublicInputs<F, C, D>, digest_bits: usize) -> anyhow::Result<[u128; N]> {
+    anyhow::ensure!(digest_bits == N * 128 && adapter_proof.public_inputs.len() == digest_bits, "digest PI width mismatch");
+    let mut words = [0u128; N];
+    for (index, bit) in adapter_proof.public_inputs.iter().enumerate() {
+        let bit = bit.to_canonical_u64();
+        anyhow::ensure!(bit <= 1, "digest input is not Boolean");
+        words[index / 128] = (words[index / 128] << 1) | u128::from(bit);
+    }
+    Ok(words)
+}
+
+fn decode_digest_words<const N: usize>(inputs: &[String; N]) -> anyhow::Result<[u128; N]> {
+    let mut words = [0u128; N];
+    for (word, decoded) in inputs.iter().zip(&mut words) {
         anyhow::ensure!(word.len() == 64 && word.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "native digest input must be 64 lowercase hexadecimal digits");
         let mut bytes = [0u8; 32];
         hex::decode_to_slice(word, &mut bytes)?;
         anyhow::ensure!(bytes[..16] == [0; 16], "native digest input exceeds uint128");
-        *half = u128::from_be_bytes(bytes[16..].try_into()?);
+        *decoded = u128::from_be_bytes(bytes[16..].try_into()?);
     }
-    Ok(halves)
+    Ok(words)
+}
+
+fn decode_digest_bits_public_inputs(inputs: &[String; 2]) -> anyhow::Result<[u128; 2]> {
+    decode_digest_words(inputs)
 }
 
 #[serde_as]
@@ -264,6 +316,14 @@ pub struct UncompressedGroth16ProofData {
     pub pi_b: [[String; 2]; 2],
     pub pi_c: [String; 2],
     pub public_inputs: [String; 2],
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug, Hash, Ord, PartialOrd, Eq)]
+pub struct WithdrawalPublicationProof {
+    pub pi_a: [String; 2],
+    pub pi_b: [[String; 2]; 2],
+    pub pi_c: [String; 2],
+    pub public_inputs: [String; 6],
 }
 
 type C = PoseidonGoldilocksConfig;
@@ -497,6 +557,33 @@ mod tests {
     }
 
     #[test]
+    fn withdrawal_publication_words_reject_wrong_count_order_and_high_bits() {
+        use super::{decode_digest_words, WithdrawalPublicationProof};
+        let word = |value: u128| format!("{value:064x}");
+        let values = [1u128, 2, 3, 4, 5, u128::MAX];
+        let words = std::array::from_fn(|index| word(values[index]));
+        assert_eq!(decode_digest_words::<6>(&words).unwrap(), values);
+        let mut swapped = words.clone();
+        swapped.swap(0, 5);
+        assert_ne!(decode_digest_words::<6>(&swapped).unwrap(), values);
+        let mut high = words.clone();
+        high[2] = format!("01{}", "0".repeat(62));
+        assert!(decode_digest_words::<6>(&high).is_err());
+        let curve = ["0".repeat(64), "0".repeat(64)];
+        let proof = WithdrawalPublicationProof { pi_a: curve.clone(), pi_b: [curve.clone(), curve.clone()], pi_c: curve.clone(), public_inputs: words.clone() };
+        let encoded = serde_json::to_string(&proof).unwrap();
+        assert_eq!(serde_json::from_str::<WithdrawalPublicationProof>(&encoded).unwrap(), proof);
+        for count in [0, 1, 2, 5, 7] {
+            let wrong = serde_json::json!({"pi_a": [&curve[0], &curve[1]], "pi_b": [[&curve[0], &curve[1]], [&curve[0], &curve[1]]], "pi_c": [&curve[0], &curve[1]], "Commitments": "", "CommitmentPok": "0".repeat(128), "public_inputs": vec!["0".repeat(64); count]});
+            assert!(serde_json::from_value::<WithdrawalPublicationProof>(wrong).is_err(), "accepted {count} publication words");
+        }
+        let native = serde_json::json!({"pi_a": [&curve[0], &curve[1]], "pi_b": [[&curve[0], &curve[1]], [&curve[0], &curve[1]]], "pi_c": [&curve[0], &curve[1]], "Commitments": "", "CommitmentPok": "0".repeat(128), "public_inputs": words});
+        let decoded: WithdrawalPublicationProof = serde_json::from_value(native).unwrap();
+        assert_eq!(decoded, proof);
+        assert_eq!(decode_digest_words::<6>(&decoded.public_inputs).unwrap(), values);
+    }
+
+    #[test]
     fn digest_adapter_pins_prefix_source_and_bit_order() {
         use super::{C, D, DigestArtifact, DigestBitsAdapter, F};
         use plonky2::{iop::witness::{PartialWitness, WitnessWrite}, plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig}};
@@ -524,7 +611,6 @@ mod tests {
         let expected: Vec<_> = words.iter().flat_map(|word| (0..32).rev().map(move |bit| F::from_canonical_u64(u64::from((word >> bit) & 1)))).collect();
         for (artifact, prefix) in [
             (DigestArtifact::DepositAggregate, [1, 11, 1, 0]),
-            (DigestArtifact::WithdrawalAggregate, [1, 7, 2, 0]),
             (DigestArtifact::RewardAggregate, [1, 7, 3, 0]),
         ] {
             let adapter = DigestBitsAdapter::build(artifact, &source.common, &source.verifier_only).unwrap();
@@ -545,6 +631,82 @@ mod tests {
             let wrong_adapter = DigestBitsAdapter::build(artifact, &source.common, &wrong_verifier).unwrap();
             assert!(wrong_adapter.prove(&make_proof(prefix, false)).is_err());
         }
+    }
+
+    #[test]
+    fn withdrawal_publication_adapter_exposes_three_digests() {
+        use super::{C, D, DIGEST_WORD_BITS, DigestArtifact, DigestBitsAdapter, F, PUBLICATION_DIGEST_WORDS, WITHDRAWAL_PUBLICATION_BITS};
+        use plonky2::{iop::witness::{PartialWitness, WitnessWrite}, plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig}};
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let inputs = builder.add_virtual_target_arr::<28>();
+        builder.register_public_inputs(&inputs);
+        let source = builder.build::<C>();
+        for width in [12, 26] {
+            let mut wrong = source.common.clone();
+            wrong.num_public_inputs = width;
+            assert!(DigestBitsAdapter::build(DigestArtifact::WithdrawalAggregate, &wrong, &source.verifier_only).is_err());
+        }
+        assert!(DigestBitsAdapter::build(DigestArtifact::DepositAggregate, &source.common, &source.verifier_only).is_err());
+        assert!(DigestBitsAdapter::build(DigestArtifact::RewardAggregate, &source.common, &source.verifier_only).is_err());
+        let words: [u32; 24] = std::array::from_fn(|index| 0x0100_0000u32.wrapping_mul(index as u32 + 1).wrapping_add(0x89ab_cdef));
+        let make_proof = |prefix: [u64; 4], mutation: Option<(usize, u64)>| {
+            let mut witness = PartialWitness::new();
+            for (index, target) in inputs.iter().enumerate() {
+                let mut value = if index < 4 { prefix[index] } else { u64::from(words[index - 4]) };
+                if let Some((word, replacement)) = mutation {
+                    if index == word { value = replacement; }
+                }
+                witness.set_target(*target, F::from_canonical_u64(value)).unwrap();
+            }
+            source.prove(witness).unwrap()
+        };
+        let adapter = DigestBitsAdapter::build(DigestArtifact::WithdrawalAggregate, &source.common, &source.verifier_only).unwrap();
+        assert_eq!(adapter.circuit_data.common.num_public_inputs, WITHDRAWAL_PUBLICATION_BITS);
+        let proof = adapter.prove(&make_proof([1, 7, 2, 0], None)).unwrap();
+        let digest_bits = |words: &[u32]| -> Vec<_> {
+            words.iter().flat_map(|word| (0..32).rev().map(move |bit| F::from_canonical_u64(u64::from((*word >> bit) & 1)))).collect::<Vec<_>>()
+        };
+        let expected = digest_bits(&words);
+        assert_eq!(proof.public_inputs.len(), WITHDRAWAL_PUBLICATION_BITS);
+        assert_eq!(proof.public_inputs, expected);
+        let native_words = super::digest_bit_words::<6>(&proof, WITHDRAWAL_PUBLICATION_BITS).unwrap();
+        let packed = words.chunks(4).map(|chunk| chunk.iter().fold(0u128, |word, limb| (word << 32) | u128::from(*limb))).collect::<Vec<_>>();
+        assert_eq!(native_words.as_slice(), packed.as_slice());
+        let mut non_boolean = proof.clone();
+        non_boolean.public_inputs[127] = F::from_canonical_u64(2);
+        assert!(super::digest_bit_words::<6>(&non_boolean, WITHDRAWAL_PUBLICATION_BITS).is_err());
+        for digest in 0..3 {
+            let word_start = digest * PUBLICATION_DIGEST_WORDS;
+            let bit_start = word_start * DIGEST_WORD_BITS;
+            assert_eq!(
+                &proof.public_inputs[bit_start..bit_start + PUBLICATION_DIGEST_WORDS * DIGEST_WORD_BITS],
+                digest_bits(&words[word_start..word_start + PUBLICATION_DIGEST_WORDS]).as_slice(),
+            );
+        }
+        adapter.circuit_data.verify(proof.clone()).unwrap();
+        let mut mutated = proof;
+        mutated.public_inputs[0] = if mutated.public_inputs[0] == F::ZERO { F::ONE } else { F::ZERO };
+        assert!(adapter.circuit_data.verify(mutated).is_err());
+        for index in 0..4 {
+            let mut prefix = [1u64, 7, 2, 0];
+            prefix[index] += 1;
+            assert!(adapter.prove(&make_proof(prefix, None)).is_err());
+        }
+        for word in [4usize, 11, 12, 19, 20, 27] {
+            let replacement = words[word - 4].wrapping_add(1);
+            let changed = adapter.prove(&make_proof([1, 7, 2, 0], Some((word, u64::from(replacement))))).unwrap();
+            let mut changed_words = words;
+            changed_words[word - 4] = replacement;
+            let changed_bits = digest_bits(&changed_words);
+            assert_eq!(changed.public_inputs, changed_bits);
+            assert_ne!(changed.public_inputs, expected);
+            adapter.circuit_data.verify(changed).unwrap();
+            assert!(adapter.prove(&make_proof([1, 7, 2, 0], Some((word, 1u64 << 32)))).is_err());
+        }
+        let mut wrong_verifier = source.verifier_only.clone();
+        wrong_verifier.circuit_digest.elements[0] += F::ONE;
+        let wrong_adapter = DigestBitsAdapter::build(DigestArtifact::WithdrawalAggregate, &source.common, &wrong_verifier).unwrap();
+        assert!(wrong_adapter.prove(&make_proof([1, 7, 2, 0], None)).is_err());
     }
 
     #[test]

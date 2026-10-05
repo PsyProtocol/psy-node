@@ -553,6 +553,13 @@ struct FinalizeEvidence { proof: [U256; 8], checkpoint_pi: Vec<U256> }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WindowProofs { deposit: FileReference, withdrawal: Option<FileReference>, reward: Option<FileReference> }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WithdrawalPublicationArtifact {
+    proof: psy_plonky2_circuits::bridge::circuits::bridge_wrap::WithdrawalPublicationProof,
+    header: String,
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "state", deny_unknown_fields)]
@@ -903,8 +910,8 @@ async fn run_multichain(
     circuits.validate_config(&network)?;
     for (artifact, name, data) in [
         (psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestArtifact::DepositAggregate, "DepositAggregate", &circuits.deposit_aggregate.circuit_data),
-        (psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestArtifact::WithdrawalAggregate, "WithdrawalAggregate", &circuits.aggregates[0].circuit_data),
-        (psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestArtifact::RewardAggregate, "RewardAggregate", &circuits.aggregates[1].circuit_data),
+        (psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestArtifact::WithdrawalAggregate, "WithdrawalAggregate", &circuits.withdrawal_aggregate.circuit_data),
+        (psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestArtifact::RewardAggregate, "RewardAggregate", &circuits.reward_aggregate.circuit_data),
     ] {
         let adapter = psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestBitsAdapter::build(artifact, &data.common, &data.verifier_only)?;
         let wrapper = adapter.into_wrapper(approved.sources.clone())?;
@@ -1213,11 +1220,20 @@ async fn prove_frozen_aggregate(config: &BridgeProposeDaemonConfig, provider: &R
         if index < w.withdrawals.len() { withdrawals.push(proof); } else { rewards.push(proof); }
     }
     let proof_w = if w.withdrawals.is_empty() { None } else {
-        Some(prove_bridge::build_withdrawal_aggregate(network, &w, &withdrawals, circuits)?)
+        let proof = prove_bridge::build_withdrawal_aggregate(network, &w, &withdrawals, circuits)?;
+        circuits.withdrawal_aggregate.circuit_data.verify(proof.clone())?;
+        let adapter = DigestBitsAdapter::build(DigestArtifact::WithdrawalAggregate, &circuits.withdrawal_aggregate.circuit_data.common, &circuits.withdrawal_aggregate.circuit_data.verifier_only)?;
+        let adapted = adapter.prove(&proof)?;
+        let wrapper = adapter.into_wrapper(sources.clone())?;
+        let setup = config.aggregate_artifact_dir.join("WithdrawalAggregate");
+        super::regen_groth16_keystore::validate_digest_bits_setup(&setup, wrapper.identity())?;
+        let publication = wrapper.prove_withdrawal_publication(&adapted, setup.to_str().context("non-UTF8 setup path")?)?;
+        let header = prove_bridge::withdrawal_publication_header(network, &w)?;
+        Some(save_aggregate_file(directory, &serde_json::to_vec(&WithdrawalPublicationArtifact { proof: publication, header: hex::encode(header.encode()?) })?, "json")?)
     };
     let proof_r = if r.rewards.is_empty() { None } else { Some(prove_bridge::build_reward_aggregate(network, &r, &rewards, circuits)?) };
-    let mut references = Vec::with_capacity(3);
-    for (artifact, name, proof, data) in [(DigestArtifact::DepositAggregate, "DepositAggregate", Some(proof_a), &circuits.deposit_aggregate.circuit_data), (DigestArtifact::WithdrawalAggregate, "WithdrawalAggregate", proof_w, &circuits.aggregates[0].circuit_data), (DigestArtifact::RewardAggregate, "RewardAggregate", proof_r, &circuits.aggregates[1].circuit_data)] {
+    let mut references = Vec::with_capacity(2);
+    for (artifact, name, proof, data) in [(DigestArtifact::DepositAggregate, "DepositAggregate", Some(proof_a), &circuits.deposit_aggregate.circuit_data), (DigestArtifact::RewardAggregate, "RewardAggregate", proof_r, &circuits.reward_aggregate.circuit_data)] {
         let Some(proof) = proof else { references.push(None); continue; };
         data.verify(proof.clone())?;
         let adapter = DigestBitsAdapter::build(artifact, &data.common, &data.verifier_only)?;
@@ -1229,7 +1245,7 @@ async fn prove_frozen_aggregate(config: &BridgeProposeDaemonConfig, provider: &R
         references.push(Some(save_aggregate_file(directory, &serde_json::to_vec(&final_proof)?, "json")?));
     }
     let mut references = references.into_iter();
-    let proofs = WindowProofs { deposit: references.next().flatten().context("missing A proof")?, withdrawal: references.next().flatten(), reward: references.next().flatten() };
+    let proofs = WindowProofs { deposit: references.next().flatten().context("missing A proof")?, withdrawal: proof_w, reward: references.next().flatten() };
     state.retained_finalize.insert(evidence_key, reusable.context("positive finalize evidence missing")?);
     if let Some(PendingAggregate::Frozen { final_proofs, destinations, .. }) = &mut state.pending {
         *final_proofs = Some(proofs);
@@ -1250,6 +1266,29 @@ pub(crate) fn parse_aggregate_proof(proof: &psy_plonky2_circuits::bridge::circui
     let mut result = [U256::ZERO; 8];
     for (target, value) in result.iter_mut().zip(encoded) { *target = word(value)?; }
     Ok(result)
+}
+
+fn load_withdrawal_publication(directory: &Path, reference: &FileReference, network: &psy_client_data::bridge_aggregate::NetworkConfig, opening: &psy_client_data::bridge_aggregate::WithdrawalAggregateOpening) -> anyhow::Result<psy_plonky2_circuits::bridge::circuits::bridge_wrap::WithdrawalPublicationProof> {
+    use psy_client_data::bridge_aggregate::{bind_claim_tree, InclusionAggregateHeader, WITHDRAWAL_PUBLICATION_FAMILY};
+    let bytes = load_aggregate_file(directory, reference)?;
+    let artifact = serde_json::from_slice::<WithdrawalPublicationArtifact>(&bytes).map_err(|_| anyhow::anyhow!("retained nonempty withdrawal proof is not a publication artifact; schema 3 files are preserved and require operator reconciliation"))?;
+    let header_bytes = aggregate_bytes(&artifact.header)?;
+    let header = InclusionAggregateHeader::decode(&header_bytes)?;
+    ensure!(header.encode()? == header_bytes, "noncanonical withdrawal publication header");
+    let expected = prove_bridge::withdrawal_publication_header(network, opening)?;
+    ensure!(header.family == WITHDRAWAL_PUBLICATION_FAMILY && header.config_hash == opening.config_hash && header.window_id == opening.window_id && header.end_checkpoint_id == opening.end_checkpoint_id && header.end_checkpoint_root == opening.end_checkpoint_root && header.withdrawal_roots == opening.withdrawal_roots, "withdrawal publication header context mismatch");
+    ensure!(header.opening_digest == if opening.withdrawals.is_empty() { [0; 32] } else { opening.opening_digest(network)? }, "withdrawal publication opening digest mismatch");
+    let commits = opening.withdrawals.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?;
+    let mut computed = header.clone();
+    bind_claim_tree(&mut computed, &commits)?;
+    ensure!(header.claim_tree_root == computed.claim_tree_root && header.header_digest()? == expected.header_digest()?, "withdrawal publication claim or header digest mismatch");
+    let halves = |digest: [u8; 32]| -> anyhow::Result<[U256; 2]> { Ok([U256::from_be_slice(&digest[..16]), U256::from_be_slice(&digest[16..])]) };
+    let expected_halves = [halves(header.opening_digest)?, halves(header.claim_tree_root)?, halves(header.header_digest()?)?];
+    for (input, expected_half) in artifact.proof.public_inputs.iter().zip(expected_halves.into_iter().flatten()) {
+        ensure!(input.len() == 64 && input.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "withdrawal publication word must be 64 lowercase hex digits");
+        ensure!(U256::from_str_radix(input, 16)? == expected_half, "withdrawal publication digest half mismatch");
+    }
+    Ok(artifact.proof)
 }
 
 async fn aggregate_rpc(http: &reqwest::Client, chain: &ChainRuntime, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -1349,9 +1388,13 @@ fn window_call(directory: &Path, network: &psy_client_data::bridge_aggregate::Ne
         parse_aggregate_proof(&proof, opening_digest)
     };
     ensure!(proofs.withdrawal.is_some() == !w.withdrawals.is_empty() && proofs.reward.is_some() == !r.rewards.is_empty(), "batch proof presence mismatch");
+    if let Some(reference) = &proofs.withdrawal {
+        let _proof = load_withdrawal_publication(directory, reference, network, w)?;
+        anyhow::bail!("withdrawal publication contract ABI does not accept the retained six-input publication proof");
+    }
     Ok(super::finalize_bridge::BridgeWindowCall { finalize_proof: finalize.proof, checkpoint_pi: finalize.checkpoint_pi.clone(),
         deposit_proof: load(&proofs.deposit, a.opening_digest(network)?)?, deposit_opening: a.encode()?.into(),
-        withdrawal_proof: proofs.withdrawal.as_ref().map(|proof| load(proof, w.opening_digest(network)?)).transpose()?.unwrap_or([U256::ZERO; 8]), withdrawal_opening: w.encode()?.into(),
+        withdrawal_proof: [U256::ZERO; 8], withdrawal_opening: w.encode()?.into(),
         reward_proof: proofs.reward.as_ref().map(|proof| load(proof, r.opening_digest(network)?)).transpose()?.unwrap_or([U256::ZERO; 8]), reward_opening: r.encode()?.into() })
 }
 
@@ -5524,6 +5567,36 @@ deployments_network = "localhostBase"
         let error = load_aggregate_file(directory.path(), &reference).unwrap_err();
         assert!(error.to_string().contains("aggregate file digest mismatch"));
     }
+    #[test]
+    fn retained_nonempty_publication_checks_root_input_and_old_abi() {
+        use psy_plonky2_circuits::bridge::circuits::bridge_wrap::WithdrawalPublicationProof;
+        let directory = AggregateArtifactDir::new("publication-nonempty");
+        let network = configured_network();
+        let (a, opening, r, _, finalize) = nonempty_window(20, [1, 2, 3, 4]);
+        let header = prove_bridge::withdrawal_publication_header(&network, &opening).unwrap();
+        let curve = ["0".repeat(64), "0".repeat(64)];
+        let word = |digest: [u8; 32], index: usize| format!("{:064x}", u128::from_be_bytes(digest[index * 16..index * 16 + 16].try_into().unwrap()));
+        let inputs = [header.opening_digest, header.claim_tree_root, header.header_digest().unwrap()].into_iter().flat_map(|digest| [word(digest, 0), word(digest, 1)]).collect::<Vec<_>>();
+        let proof = WithdrawalPublicationProof { pi_a: curve.clone(), pi_b: [curve.clone(), curve.clone()], pi_c: curve, public_inputs: inputs.try_into().unwrap() };
+        let artifact = |header: &psy_client_data::bridge_aggregate::InclusionAggregateHeader, proof: &WithdrawalPublicationProof| serde_json::to_vec(&WithdrawalPublicationArtifact { proof: proof.clone(), header: hex::encode(header.encode().unwrap()) }).unwrap();
+        let reference = save_aggregate_file(directory.path(), &artifact(&header, &proof), "json").unwrap();
+        assert_eq!(load_withdrawal_publication(directory.path(), &reference, &network, &opening).unwrap(), proof);
+        let mut changed_header = header.clone();
+        changed_header.claim_tree_root[0] ^= 1;
+        assert!(load_withdrawal_publication(directory.path(), &save_aggregate_file(directory.path(), &artifact(&changed_header, &proof), "json").unwrap(), &network, &opening).is_err());
+        let mut changed_inputs = proof.public_inputs.clone();
+        changed_inputs[5] = format!("{:064x}", u128::from_str_radix(&changed_inputs[5], 16).unwrap() ^ 1);
+        let changed = WithdrawalPublicationProof { public_inputs: changed_inputs, ..proof.clone() };
+        assert!(load_withdrawal_publication(directory.path(), &save_aggregate_file(directory.path(), &artifact(&header, &changed), "json").unwrap(), &network, &opening).is_err());
+        let deposit_digest = a.opening_digest(&network).unwrap();
+        let deposit = save_aggregate_file(directory.path(), &serde_json::to_vec(&psy_plonky2_circuits::bridge::circuits::bridge_wrap::UncompressedGroth16ProofData { pi_a: ["0".repeat(64), "0".repeat(64)], pi_b: [["0".repeat(64), "0".repeat(64)], ["0".repeat(64), "0".repeat(64)]], pi_c: ["0".repeat(64), "0".repeat(64)], public_inputs: [word(deposit_digest, 0), word(deposit_digest, 1)] }).unwrap(), "json").unwrap();
+        let reward = save_aggregate_file(directory.path(), b"reward-proof", "json").unwrap();
+        let error = window_call(directory.path(), &network, &a, &opening, &r, &WindowProofs { deposit, withdrawal: Some(reference), reward: Some(reward) }, &finalize).unwrap_err();
+        assert!(error.to_string().contains("withdrawal publication contract ABI"));
+    }
+
+
+
 
     fn nonempty_window(end_checkpoint_id: u64, end_checkpoint_root: [u64; 4]) -> (psy_client_data::bridge_aggregate::DepositAggregateOpening, psy_client_data::bridge_aggregate::WithdrawalAggregateOpening, psy_client_data::bridge_aggregate::RewardAggregateOpening, AggregateLimits, FinalizeEvidence) {
         use psy_client_data::bridge_aggregate::{ChainStart, DepositAggregateOpening, DepositTransition, RewardAggregateOpening, RewardLeaf, WithdrawalAggregateOpening, WithdrawalLeaf};
@@ -5784,4 +5857,194 @@ deployments_network = "localhostBase"
 
 
 
+    fn protected_bytes(path: &std::path::Path, bytes: &[u8]) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap();
+        use std::io::Write;
+        file.write_all(bytes).unwrap();
+    }
+
+    struct ReplayFixtureDir(std::path::PathBuf);
+    impl ReplayFixtureDir {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock before unix epoch").as_nanos();
+            let directory = home::home_dir().unwrap().join(format!("psy-relayer-replay-bootstrap-{}-{nanos}", std::process::id()));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&directory).unwrap();
+            builder.create(directory.join("archive")).unwrap();
+            Self(directory)
+        }
+    }
+    impl Drop for ReplayFixtureDir {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) { panic!("failed to remove replay fixture dir {}: {error}", self.0.display()); }
+        }
+    }
+
+    fn replay_authorization(contract_id: u32) -> crate::guardian::protocol::ApprovedContract {
+        use crate::guardian::protocol::{ApprovedContract, CompilerArtifact, JsonText, sha256};
+        use plonky2::field::types::Field;
+        use psy_client_data::qdata::contract::PsyContractLeaf;
+        let artifact = CompilerArtifact {
+            state_tree_height: 4, circuit_definitions: Vec::new(),
+            abi: serde_json::json!({ "schema_version": "2.0.0", "contract": { "name": "replay_fixture", "state_tree_height": 4, "state": [], "methods": [] }, "types": [] }),
+        };
+        let compiler_artifact_json = JsonText::from_value(&artifact).unwrap();
+        let compiler_artifact_sha256 = sha256(compiler_artifact_json.as_str().as_bytes());
+        let mut leaf = PsyContractLeaf::default();
+        leaf.state_tree_height = GoldilocksField::from_canonical_u16(4);
+        ApprovedContract { contract_id, contract_leaf_json: JsonText::from_value(&leaf).unwrap(), compiler_artifact_json, compiler_artifact_sha256 }
+    }
+
+    fn replay_guardian_config(directory: &std::path::Path) -> PathBuf {
+        use crate::guardian::protocol::{ChainAuthorization, GuardianAuthorization, GuardianAuthorizationIndex, GuardianAuthorizationVersion, Hex, JsonText, TokenMapping, sha256};
+        use plonky2::hash::poseidon::PoseidonHash;
+        use plonky2::plonk::config::Hasher;
+        use psy_client_common::data::qhashout::QHashOut;
+        use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy};
+        let members = [
+            QHashOut::from_values(1, 2, 3, 4),
+            QHashOut::from_values(5, 6, 7, 8),
+            QHashOut::from_values(9, 10, 11, 12),
+        ];
+        let mut member_hashes = [QHashOut::default(); 8];
+        member_hashes[..3].copy_from_slice(&members);
+        let account = MultisigAccount { contract_id: 6, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes } };
+        let account_json = JsonText::from_value(&account).unwrap();
+        let fingerprint = QHashOut::from_values(13, 14, 15, 16);
+        let account_public_key = QHashOut(PoseidonHash::two_to_one(fingerprint.0, account.public_key_param().unwrap().0));
+        let authorization = GuardianAuthorization {
+            version: 1, network_magic: 1, genesis_hash: Hex([1; 32]), user_id: crate::guardian::protocol::BRIDGE_USER_ID,
+            account_json, account_public_key, multisig_fingerprint: fingerprint,
+            deposit_contract_id: 2, withdrawal_contract_id: 3, fee_contract_id: 0,
+            guta_fee: psy_config::GUTA_FEE, da_fee: psy_config::DA_FEE, max_fee: 1,
+            max_endcap_proof_bytes: crate::guardian::verify::approved_endcap_max_proof_bytes().unwrap(),
+            approved_contracts: [0, 2, 3, 6].into_iter().map(replay_authorization).collect(),
+            chains: vec![ChainAuthorization {
+                chain_index: 0, chain_id: U256::from(1), genesis_hash: Hex([2; 32]),
+                bridge: Hex([1; 20]), state_manager: Hex([2; 20]), bridge_code_hash: Hex([3; 32]),
+                bridge_implementation: Hex([4; 20]), bridge_implementation_code_hash: Hex([5; 32]),
+                state_manager_code_hash: Hex([6; 32]), state_manager_implementation: Hex([7; 20]),
+                state_manager_implementation_code_hash: Hex([8; 32]), deployment_block: 1,
+                token_mappings: vec![TokenMapping { token: Hex([9; 20]), l2_contract_id: 0 }],
+            }],
+        };
+        let bytes = serde_json::to_vec(&authorization).unwrap();
+        protected_bytes(&directory.join("archive").join("1.json"), &bytes);
+        let index = GuardianAuthorizationIndex { active_version: 1, versions: vec![GuardianAuthorizationVersion { version: 1, sha256: sha256(&bytes) }] };
+        protected_bytes(&directory.join("index.json"), &serde_json::to_vec(&index).unwrap());
+        let config = serde_json::json!({
+            "authorization_path": "archive/1.json", "archive_path": "relayer-archive",
+            "endpoints": ["https://guardian-a.invalid/", "https://guardian-b.invalid/", "https://guardian-c.invalid/"],
+            "tls_identity_path": "client.pem", "server_ca_path": "server-ca.pem",
+            "authorization_archive_path": "archive", "authorization_index_path": "index.json",
+            "l1_endpoints": [{ "chain_index": 0, "rpc_url": "http://127.0.0.1:1/" }],
+            "listen_address": "127.0.0.1:1",
+            "history_tls_certificate_path": "history.crt", "history_tls_private_key_path": "history.key", "history_client_ca_path": "history-ca.crt",
+            "allowed_client_certificate_sha256": [format!("0x{}", hex::encode([1u8; 32]))]
+        });
+        let path = directory.join("guardian-client.json");
+        protected_bytes(&path, &serde_json::to_vec(&config).unwrap());
+        path
+    }
+
+    fn replay_daemon_config(directory: &std::path::Path, guardian_config: &std::path::Path) -> BridgeProposeDaemonConfig {
+        let rpc = serde_json::json!({
+            "defaultNetwork": "replay",
+            "networks": { "replay": {
+                "magic": "0x1", "users_per_realm": 1, "global_user_tree_height": 1, "realm_user_tree_height": 1, "group_realm_height": 1,
+                "realm_configs": [{ "id": 0, "rpc_url": ["http://127.0.0.1:1/"] }],
+                "p2p": { "checkpoints_per_epoch": 1 },
+                "coordinator_configs": [{ "id": 0, "rpc_url": ["http://127.0.0.1:1/"] }],
+                "prove_proxy_url": ["http://127.0.0.1:1/"], "faucet_rpc_url": ["http://127.0.0.1:1/"], "nostr_relay_url": "ws://127.0.0.1:1/",
+                "native_currency": "replay", "native_currency_decimal": 0, "native_currency_name": "replay",
+                "fees": { "register_user_fee": 1, "deploy_contract_fee": 1, "guta_fee": 1, "da_fee": 1 }
+            } }
+        });
+        let rpc_path = directory.join("rpc-config.json");
+        std::fs::write(&rpc_path, serde_json::to_vec(&rpc).unwrap()).unwrap();
+        let raw = format!(r#"
+rpc_config = "{rpc}"
+guardian_config = "{guardian}"
+services_url = "http://127.0.0.1:1"
+withdraw_method_id = 1
+aggregate_setup_config = "aggregate-setup.json"
+aggregate_artifact_dir = "aggregate-artifacts"
+aggregation_token_file = "aggregation-token"
+
+[aggregate_limits]
+max_deposits = 0
+reserved_withdrawals = 0
+reserved_rewards = 0
+max_window_calldata_bytes = 3940
+chains = [
+  {{ chain_index = 0, max_deposits = 0, reserved_withdrawals = 0, tx_gas_limit = 1, block_gas_reserve = 1 }},
+]
+
+[[chains]]
+family = "evm"
+chain_index = 0
+network_id = "replay"
+rpc_urls = ["http://127.0.0.1:1"]
+deployments_network = "replay"
+"#, rpc = rpc_path.display(), guardian = guardian_config.display());
+        let path = directory.join("daemon.toml");
+        std::fs::write(&path, raw).unwrap();
+        load_config(&path).unwrap()
+    }
+
+    fn all_equal_empty_retained(network: &psy_client_data::bridge_aggregate::NetworkConfig, directory: &std::path::Path) -> (MultichainDaemonState, PathBuf) {
+        use psy_client_data::bridge_aggregate::{ChainStart, DepositAggregateOpening, DepositTransition, RewardAggregateOpening, WithdrawalAggregateOpening};
+        let end_checkpoint_id = 20u64;
+        let end_checkpoint_root = [1, 2, 3, 4];
+        let mut a = DepositAggregateOpening {
+            config_hash: network.config_hash().unwrap(), window_id: [0; 32], end_checkpoint_id, end_checkpoint_root,
+            starts: vec![ChainStart { chain_index: 0, start_checkpoint_id: end_checkpoint_id, start_checkpoint_root: end_checkpoint_root }],
+            deposits: vec![DepositTransition { chain_index: 0, old_root: end_checkpoint_root, new_root: end_checkpoint_root, old_count: 0, new_count: 0 }],
+            deposit_leaves: Vec::new(),
+        };
+        a.window_id = a.window_id().unwrap();
+        let w = WithdrawalAggregateOpening { config_hash: a.config_hash, window_id: a.window_id, end_checkpoint_id, end_checkpoint_root, withdrawal_roots: vec![end_checkpoint_root], withdrawals: Vec::new() };
+        let r = RewardAggregateOpening { config_hash: a.config_hash, window_id: a.window_id, end_checkpoint_id, end_checkpoint_root, rewards: Vec::new() };
+        let limits = AggregateLimits { max_deposits: 0, reserved_withdrawals: 0, reserved_rewards: 0, max_window_calldata_bytes: 3940, chains: vec![ChainLimits { chain_index: 0, max_deposits: 0, reserved_withdrawals: 0, tx_gas_limit: 1, block_gas_reserve: 1 }] };
+        let mut state = frozen_from(directory, &a, &w, &r, limits, None, Submission::NotSent, [false, false]);
+        if let Some(PendingAggregate::Frozen { final_proofs, destinations, .. }) = &mut state.pending { *final_proofs = None; destinations[0].finalize = None; }
+        assert!(state.retained_finalize.is_empty());
+        let path = directory.join("daemon-state.toml");
+        save_multichain_state(&path, &state).unwrap();
+        (state, path)
+    }
+
+    #[tokio::test]
+    async fn all_equal_start_without_retained_finalize_propagates_replay_bootstrap_error() {
+        use psy_client_data::bridge_aggregate::{ChainConfig, NetworkConfig, BRIDGE_USER_ID};
+        use psy_plonky2_circuits::bridge::aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits};
+        use psy_plonky2_circuits::bridge::circuits::bridge_wrap::DigestBitsSources;
+        let fixture = ReplayFixtureDir::new();
+        let guardian = replay_guardian_config(fixture.0.as_path());
+        let config = replay_daemon_config(fixture.0.as_path(), &guardian);
+        let provider = RpcProvider::new_with_config_path(&config.rpc_config).unwrap();
+        let circuits = AggregateCircuits::build::<psy_core::network_config::PsyNetworkLocalDevnetConstants>(
+            &[0], prove_bridge::cached_bridge_coordinator_circuits().unwrap(),
+            AggregateCircuitHeights { deposit_state_tree: psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize, withdrawal_state_tree: psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize },
+        ).unwrap();
+        let network = NetworkConfig { version: 1, network_magic: 1, bridge_user_id: BRIDGE_USER_ID, circuit_set_hash: circuits.circuit_set_hash(),
+            chains: vec![ChainConfig { chain_index: 0, chain_id: U256::from(1).to_be_bytes::<32>(), bridge: [1; 20], state_manager: [2; 20], bootstrap_id: 0, bootstrap_root: [1, 2, 3, 4] }],
+            ethereum_index: 0, reward_payer: [3; 20], reward_token: [4; 20], reward_per_claim: U256::from(1).to_be_bytes::<32>(), reward_token_decimals: 0,
+            reward_cutover: 0, reward_end_exclusive: 100, max_deposits: 1024, max_withdrawals: 1024, max_rewards: 1024 };
+        let directory = AggregateArtifactDir::new("all-equal-replay");
+        let (mut state, state_path) = all_equal_empty_retained(&network, directory.path());
+        let retained = state.clone();
+        let sources = DigestBitsSources { node_source: "local:".to_string() + &"11".repeat(32), native_source: "local:".to_string() + &"22".repeat(32), plonky2_source: "local:".to_string() + &"33".repeat(32), wrapper_source: "local:".to_string() + &"44".repeat(32) };
+        let error = advance_aggregate_round(&config, &[], &provider, &network, &circuits, &sources, &reqwest::Client::new(), directory.path(), &state_path, &mut state, 0, 1).await.unwrap_err();
+        assert!(error.downcast_ref::<ReplayBootstrapError>().is_some(), "{error}");
+        assert!(error.downcast_ref::<DaemonStateWriteError>().is_none());
+        assert_eq!(toml::to_string(&state).unwrap(), toml::to_string(&retained).unwrap());
+        assert!(state.retained_finalize.is_empty());
+        assert!(matches!(state.pending, Some(PendingAggregate::Frozen { .. })));
+    }
 }
+
+
