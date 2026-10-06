@@ -4,6 +4,7 @@ use anyhow::Context;
 use jsonrpsee::{core::async_trait, proc_macros::rpc, types::ErrorObjectOwned};
 use parth_core::pgoldilocks::QHashOut as ParthQHashOut;
 use plonky2::field::types::Field;
+use plonky2::field::types::PrimeField64;
 use psy_plonky2_circuits::{
     bridge::circuits::bridge_wrap::{DepositBatchWrapCircuit, SharedGroth16Wrapper, WithdrawalClaimWrapCircuit},
     proof_minifier::pm_chain::QEDProofMinifierChain,
@@ -265,7 +266,7 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
             Ok::<_, anyhow::Error>(BridgeWithdrawalBatchGroth16Proof {
                 solidity_proof: g16_proof_to_solidity_words(&groth16),
                 public_inputs: {
-                    let pis = proof.public_inputs.iter().map(|x| x.to_noncanonical_u64()).collect::<Vec<_>>();
+                    let pis = proof.public_inputs.iter().map(|x| x.to_canonical_u64()).collect::<Vec<_>>();
                     anyhow::ensure!(
                         pis.len() == WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS,
                         "expected {} withdrawal batch public inputs, got {}",

@@ -314,9 +314,9 @@ impl ClaimClient {
         let session_root = psy_plonky2_circuits::bridge::circuits::reward_ledger::reward_session_root(
             witness.source_checkpoint_id, witness.old_session_root, witness.jobs)?;
         let step = psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerStep {
-            proof: &bytes, old_state: &witness.old_state, new_state: &witness.new_state,
-            source_checkpoint_id: witness.source_checkpoint_id, source_leaf: &witness.source_leaf, source_path: &witness.source_path,
-            old_summary: witness.old_summary, session_root, summary_siblings: &witness.session_siblings, is_final_step: witness.is_final_step,
+            proof: bytes.clone(), old_state: witness.old_state, new_state: witness.new_state,
+            source_checkpoint_id: witness.source_checkpoint_id, source_leaf: witness.source_leaf, source_path: witness.source_path,
+            old_summary: witness.old_summary, session_root, summary_siblings: witness.session_siblings, is_final_step: witness.is_final_step,
         };
         let transition = psy_plonky2_circuits::bridge::circuits::reward_ledger::verify_reward_ledger_step(
             &circuit.circuit_data.common, &circuit.circuit_data.verifier_only, window, expected_old_root, &step)?;

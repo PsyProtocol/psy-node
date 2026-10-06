@@ -186,9 +186,12 @@ pub(crate) async fn read_rpc_response(response: reqwest::Response, bounded: bool
     if !bounded {
         return Ok(response.text().await?);
     }
-    let mut response = response.error_for_status()?;
+    let response = response.error_for_status()?;
+    use futures::StreamExt;
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
         anyhow::ensure!(chunk.len() <= 64 * 1024 * 1024 - body.len(), "RPC response exceeds 64 MiB");
         body.extend_from_slice(&chunk);
     }

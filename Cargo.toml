@@ -134,7 +134,7 @@ rustls-pemfile = "2.2"
 webpki-roots = "1.0"
 zeroize = "1.8"
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "gzip", "stream"] }
 axum = "0.8.3"
 jsonrpsee = { version = "0.26", features = ["server", "client", "macros"] }
 
@@ -161,7 +161,7 @@ tiny-keccak = { version = "2.0", features = ["sha3", "keccak"] }
 blst = "0.3"
 libp2p = { version = "0.55", default-features = false, features = ["tcp", "noise", "yamux", "gossipsub", "identify", "request-response", "relay", "dcutr", "autonat", "macros", "tokio", "dns"] }
 libp2p-identity = { version = "0.2", features = ["peerid", "ed25519"] }
-gnark-plonky2-verifier-ffi = { git = "ssh://git@github.com/PsyProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-verifier-ffi", rev = "53bd550dba52b1a5be8832ecfa095f94341273f2" }
+gnark-plonky2-verifier-ffi = { git = "ssh://git@github.com/PsyProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-verifier-ffi", rev = "83f9e671eb77d92bc9463aa4370e3ab32f4fd9c6" }
 alloy-signer = { version = "=1.6.3", default-features = false }
 alloy-signer-local = { version = "=1.6.3", features = ["mnemonic", "keystore"] }
 alloy-primitives = { version = "1.3.1", features = [
@@ -267,7 +267,7 @@ ts-rs = "10.1.0"
 plonky2 = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"]}
 plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934" }
 plonky2_field = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"] }
-gnark-plonky2-wrapper = { git = "ssh://git@github.com/PsyProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-wrapper", rev = "53bd550dba52b1a5be8832ecfa095f94341273f2" }
+gnark-plonky2-wrapper = { git = "ssh://git@github.com/PsyProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-wrapper", rev = "83f9e671eb77d92bc9463aa4370e3ab32f4fd9c6" }
 
 # ---- WASM ----
 wasm-bindgen = "0.2"
