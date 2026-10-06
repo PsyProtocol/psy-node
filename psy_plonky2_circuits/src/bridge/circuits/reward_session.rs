@@ -315,9 +315,11 @@ impl RewardSessionJobTargets {
     ) -> Self {
         let zero = builder.zero();
         let is_active = builder.add_virtual_bool_target_safe();
+        let one = builder.one();
+        let tag_user_id = builder.select(is_active, statement.fields[4], one);
         let reward = RewardLeafTarget {
             claim_checkpoint_id: [session.source_checkpoint_id, zero],
-            user_id: statement.fields[4], height: builder.add_virtual_target(),
+            user_id: tag_user_id, height: builder.add_virtual_target(),
             path_index: builder.add_virtual_target(), nullifier_index: builder.add_virtual_target(),
             recipient: std::array::from_fn(|i| statement.fields[5 + i]),
         };
@@ -1395,6 +1397,7 @@ impl RewardSessionCircuit {
     }
 }
 
+
 impl RewardSessionCircuit {
     pub fn prove_identity(
         &self, config: &psy_client_data::bridge_aggregate::NetworkConfig,
@@ -1572,7 +1575,7 @@ impl RewardSessionCircuit {
         }
         use plonky2::plonk::config::Hasher;
         use parth_core::pgoldilocks::QHashOut;
-        let preimage = plonky2::hash::hash_types::HashOut { elements: [F::from_canonical_u32(input.statement.user_id), F::ONE, F::ZERO, F::ZERO] };
+        let preimage = plonky2::hash::hash_types::HashOut { elements: [F::ONE; 4] };
         let tag = PoseidonHash::two_to_one(preimage, preimage);
         let padding = RewardSessionJobWitness {
             height: 2, path_index: 0,
