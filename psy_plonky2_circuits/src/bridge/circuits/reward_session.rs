@@ -1234,7 +1234,7 @@ fn build_reward_session_circuit(
 ) -> anyhow::Result<(CircuitData<F, PoseidonGoldilocksConfig, 2>, RewardSessionCircuitTargets)> {
     use psy_plonky2_basic_helpers::builder::comparison::CircuitBuilderComparison;
     anyhow::ensure!(capacity > 0 && capacity <= u32::MAX as usize, "invalid reward session step capacity");
-    let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+    let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_ecc_config());
     for gate in &common.gates { builder.add_gate_to_gate_set(gate.clone()); }
     let statement = RewardSessionStatement::new(&mut builder);
     let predecessors = RewardPredecessorTargets::new(&mut builder, common)?;
@@ -1359,7 +1359,7 @@ impl RewardSessionCircuit {
             EthPersonalSignSecp256K1SignatureCircuit::<PoseidonGoldilocksConfig, 2>::new().get_fingerprint().0.elements,
             MultisigSignatureCircuit::new()?.get_fingerprint().0.elements,
         ];
-        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_ecc_config());
         let origin_state = origin_state_root();
         for _ in 0..REWARD_SESSION_PROOF_FIELD_COUNT { builder.add_virtual_public_input(); }
         while builder.num_gates() < 32 { builder.add_gate(plonky2::gates::noop::NoopGate, vec![]); }
