@@ -80,7 +80,8 @@ pub const DEFAULT_USER_STATE_TREE_ROOT_U64: [u64; 4] = [
     6310665049578686403,
 ];
 pub const TOKEN_CONTRACT_ID: u32 = 0;
-pub const TOKEN_SIMPLE_BURN_METHOD_ID: u32 = 2923993647;
+// Burn method_id after the legacy prefix removal (name-derived id of "burn").
+pub const TOKEN_BURN_METHOD_ID: u32 = 3998182541;
 
 // start circuit specific config
 pub const BATCH_USER_REGISTRAITION_SUB_TREE_HEIGHT: usize = 8;

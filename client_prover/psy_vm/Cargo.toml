@@ -34,6 +34,10 @@ psy_crypto = { workspace = true }
 is_sync = [
     "maybe-async/is_sync",
     "psy_client_data/is_sync"]
+# Exposes the random differential program generator + native mirror
+# (dpn/vm/fuzz_support) so downstream crates (psy_dpn_circuit dev-deps)
+# can run circuit-side differential fuzzing against the same programs.
+fuzz-support = []
 
 [dev-dependencies]
 tokio = { workspace = true }

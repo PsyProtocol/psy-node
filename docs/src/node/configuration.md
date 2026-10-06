@@ -26,11 +26,11 @@ The main `config.json` file supports multiple networks and selects one through `
       "magic": "0x1337CF514544CF69",
       "users_per_realm": 1048576
     },
-    "sepolia": {
-      "magic": "0x1337CF514544C169",
+    "testnet": {
+      "magic": "0x1337CF514544CF69",
       "users_per_realm": 1048576
     },
-    "ethereum": {
+    "mainnet": {
       "magic": "0x1337CF514544C069",
       "users_per_realm": 1048576
     }
@@ -39,7 +39,7 @@ The main `config.json` file supports multiple networks and selects one through `
 }
 ```
 
-Applications use `defaultNetwork` unless a network is selected explicitly. The network names and magic values are defined in `psy-genesis/config.json:3-4,71-72,139-140`.
+Applications use `defaultNetwork` unless a stage is selected explicitly. The Psy stage is one of `localhost`, `testnet`, or `mainnet`, not an L1 chain name. Build-time stage magic is defined in `client_prover/psy_core/psy_config/src/stage_magic.rs` and must agree with the selected configuration.
 
 ## 2. Core Network Parameters
 
@@ -170,7 +170,7 @@ Genesis contracts contain pre-deployed bytecode and initial state:
     "precompiles": [
       {
         "name": "system_contract",
-        "deployer": ["<hash-element>"],
+        "deployer": 12345,
         "bytecode": ["<contract-bytecode>"]
       }
     ]
@@ -196,13 +196,13 @@ A network configuration can restrict accepted secp256k1 public keys:
 
 ## 5. Network Environments
 
-| Network | Purpose | Endpoint source |
+| Psy stage | Purpose | Endpoint source |
 |---|---|---|
-| `localhost` | Local development and testing | Loopback addresses in `psy-genesis/config.json:9-69` |
-| `sepolia` | Ethereum Sepolia-backed deployment configuration | `psy-genesis/config.json:71-137` |
-| `ethereum` | Ethereum-backed deployment configuration | `psy-genesis/config.json:139-204` |
+| `localhost` | Local development and testing | Selected localhost configuration |
+| `testnet` | Testing deployment stage | Selected testnet configuration |
+| `mainnet` | Production deployment stage | Selected mainnet configuration |
 
-The public testing deployment is suspended. The configured network selectors remain `localhost`, `sepolia`, and `ethereum`.
+L1 network selection is separate from the Psy stage. A configured selector does not establish that a public deployment is currently available.
 
 ## 6. Configuration Verification
 

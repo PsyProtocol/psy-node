@@ -148,7 +148,7 @@ psy_user_cli call \
 psy_user_cli call \
   --keystore-path <home>/.psy/keystore/treasury.json \
   --contract-id 0 \
-  --method-name simple_mint \
+  --method-name mint \
   --inputs "[1000000000000]" \
   --sign-type zk
 
@@ -156,7 +156,7 @@ psy_user_cli call \
 psy_user_cli call \
   --private-key <sender_private_key> \
   --contract-id 0 \
-  --method-name simple_transfer \
+  --method-name transfer \
   --inputs "[<recipient_user_id>, 250000000000]" \
   --sign-type zk
 
@@ -164,7 +164,7 @@ psy_user_cli call \
 psy_user_cli call \
   --private-key <recipient_private_key> \
   --contract-id 0 \
-  --method-name simple_claim \
+  --method-name claim \
   --inputs "[<sender_user_id>]" \
   --sign-type zk
 ```
@@ -203,7 +203,7 @@ psy_user_cli register-user \
 psy_user_cli call \
   --keystore-path <home>/.psy/keystore/miner0.json \
   --contract-id 0 \
-  --method-name simple_mint \
+  --method-name mint \
   --inputs "[1000]" \
   --sign-type zk
 ```
@@ -230,7 +230,7 @@ psy_user_cli register-user --private-key <user-private-key> --sign-type zk
 psy_user_cli call \
   --private-key <user-private-key> \
   --contract-id 0 \
-  --method-name simple_transfer \
+  --method-name transfer \
   --inputs "[1, 250000000000]" \
   --sign-type zk
 
@@ -238,7 +238,7 @@ psy_user_cli call \
 psy_user_cli call \
   --private-key <user-private-key> \
   --contract-id 0 \
-  --method-name simple_claim \
+  --method-name claim \
   --inputs "[0]" \
   --sign-type zk
 ```

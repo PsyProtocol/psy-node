@@ -225,7 +225,9 @@ impl ProvingJobCircuitType {
             | ProvingJobCircuitType::GUTAVerifyToCap
             | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
             | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
-            | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
+            | ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint
+            | ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint
+            | ProvingJobCircuitType::GUTALeftGUTARightEndCap
             | ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint
             // Persist the root GUTA child reward (left) and the output
             // commitment A (right) for the standard tagged reward node.

@@ -46,6 +46,12 @@ Local proving service for UPS, contract calls, signatures, aggregation trees, an
 | `psy_prove_dpn_software_defined_sign` | `fingerprint`, `private_key`, `input`, `sig_hash` |
 | `psy_prove_plonky2_software_defined_sign` | `fingerprint`, `private_key`, `input`, `sig_hash` |
 
+## Roles
+
+Instances select `user`, `system`, or `all` through `--role` (`PROVE_PROXY_ROLE`, default `user`). User instances construct the UPS provider; system instances construct the system provider; `all` registers both. Methods outside the selected role are not registered.
+
+Every role exposes `psy_get_prove_proxy_role`, returning `role`, `user_methods`, and `system_methods`. Wallet-facing configuration uses `prove_proxy_url`; `system_prove_proxy_url` identifies the separate system pool. Role discovery describes the registered method family, not support for DepositAggregate/SettlementAggregate identities or mandatory A/B publication. The aggregate relayer validates its local reviewed artifact set independently.
+
 ## Software-defined circuits
 
 | RPC method | Parameters |
@@ -80,4 +86,6 @@ For the removed signature methods, use `psy_prove_zk_sign_minifier`, `psy_prove_
 
 ## Source
 
-- `client_prover/psy_prover/src/local/native/prove_proxy.rs`
+- `client_prover/psy_prover/src/local/native/prove_proxy/mod.rs`
+- `client_prover/psy_prover/src/local/native/prove_proxy/user.rs`
+- `client_prover/psy_prover/src/local/native/prove_proxy/system.rs`

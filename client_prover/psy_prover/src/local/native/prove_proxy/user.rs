@@ -1,21 +1,9 @@
-use std::{
-    path::PathBuf,
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use jsonrpsee::{
     core::async_trait,
     proc_macros::rpc,
     types::{ErrorObject, ErrorObjectOwned},
-};
-use parth_core::pgoldilocks::QHashOut as ParthQHashOut;
-use plonky2::{
-    field::types::Field,
-    hash::hash_types::HashOut,
-    plonk::{
-        config::{GenericConfig, PoseidonGoldilocksConfig},
-        proof::ProofWithPublicInputs,
-    },
 };
 use psy_client_common::data::{alt::AltVerifierOnlyCircuitData, qhashout::QHashOut};
 use psy_client_data::{
@@ -37,22 +25,6 @@ use psy_crypto::{
     hash::merkle::core::{DeltaMerkleProofCore, MerkleProofCore},
     signature::secp256k1::core::PsyCompressedSecp256K1Signature,
 };
-use psy_plonky2_circuits::{
-    bridge::circuits::bridge_wrap::{
-        DepositBatchWrapCircuit, SharedGroth16Wrapper, UncompressedGroth16ProofData, WithdrawalClaimWrapCircuit,
-    },
-    proof_minifier::pm_chain::QEDProofMinifierChain,
-};
-use psy_plonky2_common_circuits::bridge::{
-    deposit_batch_append_circuit::{
-        compute_batch_append_preimage, BatchAppendInputs as DepositBatchAppendInputs, DepositBatchAppendCircuit,
-        DepositLeafData as DepositBatchLeafData, MAX_DEPOSIT_BATCH_SIZE,
-    },
-    withdrawal_batch_claim_circuit::{
-        WithdrawalBatchClaimCircuit, WithdrawalBatchClaimInputs, WithdrawalBatchClaimSlotInputs, MAX_WITHDRAWAL_CLAIM_BATCH_SIZE,
-        WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS, WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS,
-    },
-};
 use psy_provider::{
     provider::{LocalCommonCircuitsData, QCommonCircuitData, RpcProvider},
     request::{DPNSoftwareDefinedSignatureInput, QRegisterDPNSoftwareDefinedCircuitRPCRequest, QRegisterPlonky2SoftwareDefinedCircuitRPCRequest},
@@ -62,102 +34,13 @@ use psy_vm::{
     ups::{circuit_manager::UPSCircuitManager, signature::Plonky2SoftwareDefinedSignatureInput},
     vm::cfc_input::DapenContractFunctionCircuitInput,
 };
+use plonky2::plonk::proof::ProofWithPublicInputs;
 
+use super::{C, D, F};
 use crate::local::native::DPNFunctionCircuitDefinition;
 
-type C = PoseidonGoldilocksConfig;
-type F = <C as GenericConfig<D>>::F;
-const D: usize = 2;
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BridgeWithdrawalWitnessInput {
-    pub withdrawal_root: String,
-    pub sender_user_id: u32,
-    pub recipient: [u32; 8],
-    pub token: [u32; 8],
-    pub amount: [u32; 8],
-    pub nonce: [u32; 8],
-    pub destination_chain_index: u32,
-    pub leaf_index: u32,
-    pub bridge_user_id: u32,
-    pub siblings: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BridgeWithdrawalBatchWitnessInput {
-    pub bridge_user_id: u32,
-    pub withdrawals: Vec<BridgeWithdrawalWitnessInput>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BridgeWithdrawalBatchGroth16Proof {
-    pub solidity_proof: [String; 8],
-    pub public_inputs: Vec<u64>,
-    pub slot_data: Vec<u64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BridgeDepositLeafInput {
-    pub shield_address: [u32; 8],
-    pub token: [u32; 8],
-    pub l2_token_contract_id: [u32; 8],
-    pub amount: [u32; 8],
-    pub chain_index: u32,
-    pub note_commitment: [u32; 8],
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BridgeDepositBatchWitnessInput {
-    pub from_index: u32,
-    pub bridge_user_id: u32,
-    pub old_frontier: Vec<String>,
-    pub deposits: Vec<BridgeDepositLeafInput>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BridgeDepositBatchGroth16Proof {
-    pub solidity_proof: [String; 8],
-    pub public_inputs: Vec<u64>,
-}
-
-fn parse_hex_qhashout(hex: &str) -> anyhow::Result<ParthQHashOut<F>> {
-    let hex = hex.trim_start_matches("0x");
-    anyhow::ensure!(hex.len() == 64, "expected 64 hex chars, got {}", hex.len());
-    let bytes = hex::decode(hex)?;
-    let mut elems = [0u64; 4];
-    for i in 0..4 {
-        let reverse_i = 3 - i;
-        let hi = u32::from_be_bytes(bytes[reverse_i * 8..reverse_i * 8 + 4].try_into()?);
-        let lo = u32::from_be_bytes(bytes[reverse_i * 8 + 4..reverse_i * 8 + 8].try_into()?);
-        elems[i] = ((hi as u64) << 32) | (lo as u64);
-    }
-    Ok(ParthQHashOut(HashOut {
-        elements: elems.map(F::from_canonical_u64),
-    }))
-}
-
-
-fn g16_proof_to_solidity_words(groth16: &UncompressedGroth16ProofData) -> [String; 8] {
-    let with_0x = |s: &str| -> String {
-        if s.starts_with("0x") {
-            s.to_string()
-        } else {
-            format!("0x{}", s)
-        }
-    };
-    [
-        with_0x(&groth16.pi_a[0]),
-        with_0x(&groth16.pi_a[1]),
-        with_0x(&groth16.pi_b[0][1]),
-        with_0x(&groth16.pi_b[0][0]),
-        with_0x(&groth16.pi_b[1][1]),
-        with_0x(&groth16.pi_b[1][0]),
-        with_0x(&groth16.pi_c[0]),
-        with_0x(&groth16.pi_c[1]),
-    ]
-}
-
 #[rpc(server, client, namespace = "psy")]
-pub trait ProveProxyRpc {
+pub trait ProveProxyUserRpc {
     /// local proving proof generate
     #[method(name = "prove_ups_start")]
     async fn prove_ups_start(&self, input: UPSStartStepInput<F>) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
@@ -346,44 +229,17 @@ pub trait ProveProxyRpc {
         right_verifier_data: AltVerifierOnlyCircuitData<F>,
     ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
 
-    #[method(name = "prove_withdrawal_batch_claim_groth16")]
-    async fn prove_withdrawal_batch_claim_groth16(
-        &self,
-        input: BridgeWithdrawalBatchWitnessInput,
-    ) -> Result<BridgeWithdrawalBatchGroth16Proof, ErrorObjectOwned>;
-
-    #[method(name = "prove_deposit_batch_append_groth16")]
-    async fn prove_deposit_batch_append_groth16(
-        &self,
-        input: BridgeDepositBatchWitnessInput,
-    ) -> Result<BridgeDepositBatchGroth16Proof, ErrorObjectOwned>;
-
 }
 
-pub struct ProveProxyServerProvider {
+pub struct UserProveProvider {
     pub rpc_provider: RpcProvider,
     pub circuit_manager: Arc<PsyUPSStepCircuitManager<C, D>>,
     pub circuit_info: Arc<SessionCircuitInfoStore<F>>,
     pub circuits_data: LocalCommonCircuitsData<F>,
-    pub keystore_dir: Option<PathBuf>,
-    pub deployments_network: String,
-    /// Pre-built wrapping circuits shared across all prove requests.
-    pub deposit_batch_wrap_circuit: Arc<DepositBatchWrapCircuit>,
-    pub withdrawal_claim_wrap_circuit: Arc<WithdrawalClaimWrapCircuit>,
-    pub deposit_batch_groth16_wrapper: Arc<SharedGroth16Wrapper>,
-    pub withdrawal_claim_groth16_wrapper: Arc<SharedGroth16Wrapper>,
-    /// Warmup-built base circuits reused verbatim by prove requests.
-    pub deposit_append_circuit: Arc<DepositBatchAppendCircuit<C, D>>,
-    pub deposit_batch_minifier: Arc<QEDProofMinifierChain<D, F, C>>,
-    pub withdrawal_claim_circuit: Arc<WithdrawalBatchClaimCircuit<C, D>>,
 }
 
-impl ProveProxyServerProvider {
+impl UserProveProvider {
     pub async fn new_with_config(rpc_config: psy_config::NetworkConfigGoldilocks, network_magic: u64) -> anyhow::Result<Self> {
-        use psy_client_data::qstore::controllers::session_info::SessionCircuitInfoStore;
-        use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
-        use psy_plonky2_circuits::qstandard::QStandardCircuit as PlonkyQStandardCircuit;
-
         let rpc_provider = RpcProvider::new_with_config(&rpc_config)?;
 
         let circuit_manager = PsyUPSStepCircuitManager::<C, D>::new_with_config(network_magic);
@@ -507,90 +363,12 @@ impl ProveProxyServerProvider {
             }),
         };
 
-        // ── Pre-build Groth16 wrapping circuits (shared across all threads) ──
-        // These depend only on the inner circuit structure, not on runtime data.
-        // Building once at startup saves ~200ms per request (CircuitBuilder::new +
-        // builder.build).
-
-        tracing::info!("Pre-building DepositBatchWrapCircuit...");
-        let deposit_template = Arc::new(DepositBatchAppendCircuit::<C, D>::build(MAX_DEPOSIT_BATCH_SIZE, 32));
-        let deposit_minifier = Arc::new(QEDProofMinifierChain::<D, F, C>::new(
-            &deposit_template.circuit_data.verifier_only,
-            &deposit_template.circuit_data.common,
-            2,
-        ));
-        let deposit_fp = ParthQHashOut(deposit_minifier.get_fingerprint());
-        let deposit_batch_wrap_circuit = Arc::new(DepositBatchWrapCircuit::new(
-            deposit_minifier.get_common_data(),
-            deposit_fp,
-            deposit_minifier.get_verifier_data().constants_sigmas_cap.height(),
-        ));
-        let deposit_batch_groth16_wrapper = Arc::new(
-            DepositBatchWrapCircuit::new(
-                deposit_minifier.get_common_data(),
-                deposit_fp,
-                deposit_minifier.get_verifier_data().constants_sigmas_cap.height(),
-            )
-            .into_shared_groth16_wrapper(format!("{}/.psy/keystore/deposit_append/", dirs::home_dir().unwrap().display())),
-        );
-
-        tracing::info!("Pre-building WithdrawalClaimWrapCircuit...");
-        let withdrawal_template = Arc::new(WithdrawalBatchClaimCircuit::<C, D>::build(32));
-        let withdrawal_fp = ParthQHashOut(psy_plonky2_circuits::proof_minifier::pm_core::get_circuit_fingerprint_generic(
-            &withdrawal_template.circuit_data.verifier_only,
-        ));
-        let withdrawal_claim_wrap_circuit = Arc::new(WithdrawalClaimWrapCircuit::new(
-            &withdrawal_template.circuit_data.common,
-            withdrawal_fp,
-            withdrawal_template.circuit_data.verifier_only.constants_sigmas_cap.height(),
-        ));
-        let withdrawal_claim_groth16_wrapper = Arc::new(
-            WithdrawalClaimWrapCircuit::new(
-                &withdrawal_template.circuit_data.common,
-                withdrawal_fp,
-                withdrawal_template.circuit_data.verifier_only.constants_sigmas_cap.height(),
-            )
-            .into_shared_groth16_wrapper(format!("{}/.psy/keystore/withdrawal_claim/", dirs::home_dir().unwrap().display())),
-        );
-        tracing::info!("Groth16 wrapping circuits pre-built successfully.");
-
-        // Preload Groth16 keystores into the gnark Go runtime so the first proof
-        // request doesn't pay the ~15s cold-start penalty (ReadCircuit +
-        // ReadProvingKey). Each keystore is ~500MB–800MB on disk; loading
-        // lazily on first request causes relayer claim-proof-fetch timeouts.
-        tracing::info!("Preloading Groth16 keystores...");
-        for (label, keystore_path) in [
-            ("deposit_append", &deposit_batch_groth16_wrapper.keystore_path),
-            ("withdrawal_claim", &withdrawal_claim_groth16_wrapper.keystore_path),
-        ] {
-            let keystore_dir = std::path::Path::new(keystore_path);
-            if keystore_dir.join("circuit_groth16.bin").exists()
-                && keystore_dir.join("pk_groth16.bin").exists()
-                && keystore_dir.join("vk_groth16.bin").exists()
-            {
-                tracing::info!(keystore = label, path = keystore_path, "preloading Groth16 setup");
-                gnark_plonky2_verifier_ffi::initialize(keystore_path);
-                tracing::info!(keystore = label, "Groth16 setup preloaded");
-            } else {
-                tracing::warn!(keystore = label, path = keystore_path, "skipping preload — keystore files missing");
-            }
-        }
-        tracing::info!("All Groth16 keystores preloaded.");
 
         Ok(Self {
             rpc_provider,
             circuit_manager: Arc::new(circuit_manager),
             circuit_info: Arc::new(circuit_info),
             circuits_data,
-            keystore_dir: None,
-            deployments_network: "localhost".to_string(),
-            deposit_batch_wrap_circuit,
-            withdrawal_claim_wrap_circuit,
-            deposit_batch_groth16_wrapper,
-            withdrawal_claim_groth16_wrapper,
-            deposit_append_circuit: deposit_template,
-            deposit_batch_minifier: deposit_minifier,
-            withdrawal_claim_circuit: withdrawal_template,
         })
     }
 
@@ -609,181 +387,7 @@ impl ProveProxyServerProvider {
 }
 
 #[async_trait]
-impl ProveProxyRpcServer for ProveProxyServerProvider {
-    async fn prove_withdrawal_batch_claim_groth16(
-        &self,
-        input: BridgeWithdrawalBatchWitnessInput,
-    ) -> Result<BridgeWithdrawalBatchGroth16Proof, ErrorObjectOwned> {
-        tracing::debug!("prove_withdrawal_batch_claim_groth16 count={}", input.withdrawals.len());
-
-        let wrap_circuit = self.withdrawal_claim_wrap_circuit.clone();
-        let groth16_wrapper = self.withdrawal_claim_groth16_wrapper.clone();
-        let circuit = self.withdrawal_claim_circuit.clone();
-        tokio::task::spawn_blocking(move || {
-            anyhow::ensure!(
-                input.withdrawals.len() <= MAX_WITHDRAWAL_CLAIM_BATCH_SIZE,
-                "withdrawal batch too large: got {}, max {}",
-                input.withdrawals.len(),
-                MAX_WITHDRAWAL_CLAIM_BATCH_SIZE
-            );
-            anyhow::ensure!(!input.withdrawals.is_empty(), "withdrawal batch must include at least one withdrawal");
-
-            let mut slot_data = vec![0u64; MAX_WITHDRAWAL_CLAIM_BATCH_SIZE * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS];
-            let mut root: Option<ParthQHashOut<F>> = None;
-            let mut withdrawals = Vec::with_capacity(input.withdrawals.len());
-            for (i, withdrawal) in input.withdrawals.iter().enumerate() {
-                anyhow::ensure!(
-                    withdrawal.siblings.len() == 32,
-                    "withdrawal[{}] expected 32 siblings, got {}",
-                    i,
-                    withdrawal.siblings.len()
-                );
-                let parsed_root = parse_hex_qhashout(&withdrawal.withdrawal_root)?;
-                if let Some(existing) = root {
-                    anyhow::ensure!(existing == parsed_root, "withdrawal[{}] root mismatch within batch", i);
-                } else {
-                    root = Some(parsed_root);
-                }
-                let siblings = withdrawal
-                    .siblings
-                    .iter()
-                    .map(|hex| parse_hex_qhashout(hex))
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                let slot_offset = i * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS;
-                slot_data[slot_offset] = withdrawal.sender_user_id as u64;
-                for (j, word) in withdrawal.recipient.iter().enumerate() {
-                    slot_data[slot_offset + 1 + j] = *word as u64;
-                }
-                for (j, word) in withdrawal.token.iter().enumerate() {
-                    slot_data[slot_offset + 9 + j] = *word as u64;
-                }
-                for (j, word) in withdrawal.amount.iter().enumerate() {
-                    slot_data[slot_offset + 17 + j] = *word as u64;
-                }
-                for (j, word) in withdrawal.nonce.iter().enumerate() {
-                    slot_data[slot_offset + 25 + j] = *word as u64;
-                }
-                slot_data[slot_offset + 33] = withdrawal.destination_chain_index as u64;
-                withdrawals.push(WithdrawalBatchClaimSlotInputs::<F> {
-                    sender_user_id: withdrawal.sender_user_id,
-                    recipient: withdrawal.recipient,
-                    token: withdrawal.token,
-                    amount: withdrawal.amount,
-                    nonce: withdrawal.nonce,
-                    destination_chain_index: withdrawal.destination_chain_index,
-                    leaf_index: withdrawal.leaf_index,
-                    siblings,
-                });
-            }
-
-            let proof = circuit.generate_proof(&WithdrawalBatchClaimInputs::<F> {
-                withdrawal_root: root.expect("non-empty batch ensured above"),
-                bridge_user_id: input.bridge_user_id,
-                withdrawals,
-            })?;
-            let groth16 = wrap_circuit.prove_groth16_with_shared_wrapper(&groth16_wrapper, &circuit.circuit_data.verifier_only, &proof)?;
-            tracing::warn!(
-                withdrawal_claim_gnark_public_inputs = ?groth16.public_inputs,
-                "withdrawal claim gnark returned public inputs"
-            );
-
-            Ok::<_, anyhow::Error>(BridgeWithdrawalBatchGroth16Proof {
-                solidity_proof: g16_proof_to_solidity_words(&groth16),
-                public_inputs: {
-                    let pis = proof.public_inputs.iter().map(|x| x.to_noncanonical_u64()).collect::<Vec<_>>();
-                    anyhow::ensure!(
-                        pis.len() == WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS,
-                        "expected {} withdrawal batch public inputs, got {}",
-                        WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS,
-                        pis.len()
-                    );
-                    pis
-                },
-                slot_data,
-            })
-        })
-        .await
-        .map_err(|join_err| {
-            ErrorObjectOwned::owned(
-                1,
-                "prove_withdrawal_batch_claim_groth16: task schedule failed",
-                Some(format!("Thread pool task execution failed: {}", join_err)),
-            )
-        })?
-        .map_err(|err| ErrorObjectOwned::owned(1, "prove_withdrawal_batch_claim_groth16 proving error", Some(err.to_string())))
-    }
-
-    async fn prove_deposit_batch_append_groth16(
-        &self,
-        input: BridgeDepositBatchWitnessInput,
-    ) -> Result<BridgeDepositBatchGroth16Proof, ErrorObjectOwned> {
-        tracing::debug!(
-            "prove_deposit_batch_append_groth16 from_index={} count={}",
-            input.from_index,
-            input.deposits.len()
-        );
-
-        let wrap_circuit = self.deposit_batch_wrap_circuit.clone();
-        let groth16_wrapper = self.deposit_batch_groth16_wrapper.clone();
-        let circuit = self.deposit_append_circuit.clone();
-        let minifier = self.deposit_batch_minifier.clone();
-        tokio::task::spawn_blocking(move || {
-            anyhow::ensure!(
-                input.old_frontier.len() == 32,
-                "expected 32 frontier nodes, got {}",
-                input.old_frontier.len()
-            );
-            anyhow::ensure!(!input.deposits.is_empty(), "deposit batch must include at least one deposit");
-
-            let old_frontier_vec = input
-                .old_frontier
-                .iter()
-                .map(|hex| parse_hex_qhashout(hex))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let old_frontier: [ParthQHashOut<F>; 32] = old_frontier_vec
-                .try_into()
-                .map_err(|v: Vec<ParthQHashOut<F>>| anyhow::anyhow!("invalid frontier length: {}", v.len()))?;
-            let deposits = input
-                .deposits
-                .into_iter()
-                .map(|leaf| DepositBatchLeafData {
-                    shield_address: leaf.shield_address,
-                    token: leaf.token,
-                    l2_token_contract_id: leaf.l2_token_contract_id,
-                    amount: leaf.amount,
-                    chain_index: leaf.chain_index,
-                    note_commitment: leaf.note_commitment,
-                })
-                .collect::<Vec<_>>();
-            let batch_inputs = DepositBatchAppendInputs {
-                frontier: old_frontier,
-                from_index: input.from_index,
-                deposits,
-                bridge_user_id: input.bridge_user_id,
-            };
-
-            let proof = circuit.generate_proof(&batch_inputs)?;
-            let preimage = compute_batch_append_preimage(&batch_inputs);
-            let minified_proof = minifier.prove(&proof)?;
-            let groth16 = wrap_circuit.prove_groth16_with_shared_wrapper(&groth16_wrapper, minifier.get_verifier_data(), &minified_proof)?;
-
-            Ok::<_, anyhow::Error>(BridgeDepositBatchGroth16Proof {
-                solidity_proof: g16_proof_to_solidity_words(&groth16),
-                public_inputs: preimage.to_u32_words().into_iter().map(|x| x as u64).collect(),
-            })
-        })
-        .await
-        .map_err(|join_err| {
-            ErrorObjectOwned::owned(
-                1,
-                "prove_deposit_batch_append_groth16: task schedule failed",
-                Some(format!("Thread pool task execution failed: {}", join_err)),
-            )
-        })?
-        .map_err(|err| ErrorObjectOwned::owned(1, "prove_deposit_batch_append_groth16 proving error", Some(err.to_string())))
-    }
-
-
+impl ProveProxyUserRpcServer for UserProveProvider {
     async fn prove_ups_start(&self, input: UPSStartStepInput<F>) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned> {
         tracing::debug!("prove_ups_start input");
 

@@ -211,8 +211,10 @@ mod tests {
     /// PSY_TEST_REWARD_CLAIM_METADATA_FILE
     #[test]
     fn read_from_bin_file() {
-        let file_path = std::env::var("PSY_TEST_REWARD_CLAIM_METADATA_FILE")
-            .expect("Please set PSY_TEST_REWARD_CLAIM_METADATA_FILE environment variable to the binary file path");
+        let Ok(file_path) = std::env::var("PSY_TEST_REWARD_CLAIM_METADATA_FILE") else {
+            println!("PSY_TEST_REWARD_CLAIM_METADATA_FILE not set; skipping");
+            return;
+        };
 
         println!("Reading from file: {}", file_path);
 
@@ -281,7 +283,7 @@ mod tests {
                 topic: QJobTopic::GenerateStandardProof,
                 goal_id: 100,
                 slot_id: 0, // 173-byte format doesn't include slot_id
-                circuit_type: ProvingJobCircuitType::AddDeposit,
+                circuit_type: ProvingJobCircuitType::AddL1Deposit,
                 group_id: 1,
                 sub_group_id: 0,
                 task_index: 0,

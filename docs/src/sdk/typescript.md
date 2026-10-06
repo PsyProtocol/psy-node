@@ -144,7 +144,7 @@ async function transferTokens(
 ): Promise<string> {
   const call: ContractCallArgs = {
     contract_id: 0n,
-    method_name: "simple_transfer",
+    method_name: "transfer",
     inputs: [recipientUserId, amount],
   };
 
@@ -152,7 +152,7 @@ async function transferTokens(
 }
 ```
 
-A claim uses the same verified call path and the `simple_claim` token method:
+A claim uses the same verified call path and the `claim` token method:
 
 ```typescript
 async function claimTokens(
@@ -161,7 +161,7 @@ async function claimTokens(
 ): Promise<string> {
   const call: ContractCallArgs = {
     contract_id: 0n,
-    method_name: "simple_claim",
+    method_name: "claim",
     inputs: [senderUserId],
   };
 

@@ -415,6 +415,41 @@ mod tests {
     }
 
     #[test]
+    fn seeded_keccak_f1600_u32_matches_native() {
+        use rand::{rngs::StdRng, RngCore, SeedableRng};
+
+        const SEED: u64 = 13134802118721589147;
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let input: [[U32Target; 2]; 25] = std::array::from_fn(|_| std::array::from_fn(|_| builder.add_virtual_u32_target()));
+        let mut output = input;
+        keccak_f1600(&mut builder, &mut output);
+        for half in output.iter().flatten() {
+            builder.register_public_input(half.0);
+        }
+        let data = builder.build::<C>();
+        for case in 0..4 {
+            let mut lanes: [u64; 25] = std::array::from_fn(|_| rng.next_u64());
+            if case == 3 {
+                for lane in [0, 5, 10] { lanes[lane] = u64::MAX; }
+            }
+            let mut expected = lanes;
+            tiny_keccak::keccakf(&mut expected);
+            let mut witness = PartialWitness::new();
+            for (targets, lane) in input.iter().zip(lanes) {
+                witness.set_u32_target(targets[0], lane as u32).unwrap();
+                witness.set_u32_target(targets[1], (lane >> 32) as u32).unwrap();
+            }
+            let proof = data.prove(witness).unwrap();
+            for (lane, halves) in proof.public_inputs.chunks_exact(2).enumerate() {
+                let actual = halves[0].to_canonical_u64() | (halves[1].to_canonical_u64() << 32);
+                assert_eq!(actual, expected[lane], "seed {SEED}, case {case}, lane {lane}");
+            }
+            data.verify(proof).unwrap();
+        }
+    }
+
+    #[test]
     fn test_xor_u32_bounded_values_and_width_rejection() {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let left = builder.add_virtual_u32_target();

@@ -8,6 +8,7 @@ use parth_core::{
     protocol::core_types::QFHashBase,
 };
 use plonky2::plonk::{
+    circuit_data::CircuitData,
     config::{AlgebraicHasher, GenericConfig},
     proof::ProofWithPublicInputs,
 };
@@ -42,7 +43,9 @@ use super::circuits::{
 };
 use crate::{
     qstandard::QStandardCircuit,
-    utils::proof_serialization::serialize_plonky2_proof,
+    utils::proof_serialization::{
+        deserialize_plonky2_proof, serialize_plonky2_proof,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -53,6 +56,50 @@ where
     pub layout: CanonicalContractStateLayout<QHashOut<F>>,
     pub canonical_verifier_fingerprint: QHashOut<F>,
     pub canonical_proof: Vec<u8>,
+}
+
+/// Verifies network-submitted canonical layout proofs against the exact
+/// canonical wrapper circuit used to create them.
+#[derive(Debug)]
+pub struct CanonicalLayoutProofVerifier<
+    C: GenericConfig<D>,
+    const D: usize,
+> {
+    circuit_data: CircuitData<C::F, C, D>,
+    fingerprint: QHashOut<C::F>,
+}
+
+impl<C: GenericConfig<D>, const D: usize>
+    CanonicalLayoutProofVerifier<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    pub fn new(
+        layout_top_line_height: usize,
+        layout_web_tree_height: usize,
+        max_layout_aggregation_depth: usize,
+    ) -> Self {
+        let manager = StateLayoutCircuitManager::<C, D>::new_layout_only(
+            layout_top_line_height,
+            layout_web_tree_height,
+            max_layout_aggregation_depth,
+        );
+        Self {
+            fingerprint: manager.canonical_layout_append.get_fingerprint(),
+            circuit_data: manager.canonical_layout_append.circuit_data,
+        }
+    }
+
+    pub fn fingerprint(&self) -> QHashOut<C::F> {
+        self.fingerprint
+    }
+
+    pub fn verify_serialized_proof(&self, proof_bytes: &[u8]) -> anyhow::Result<()> {
+        let proof = deserialize_plonky2_proof::<C, D>(proof_bytes)?;
+        self.circuit_data
+            .verify(proof)
+            .map_err(|error| anyhow::anyhow!("invalid canonical layout proof: {error}"))
+    }
 }
 
 /// Canonical layout-aware base circuit bundle.

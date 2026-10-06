@@ -41,7 +41,7 @@ fn a_mandate_round_trips_with_everything_a_reload_needs() {
         "kind": "psy-wallet-key-v1", "private_key": "0x1", "fingerprint": "f",
         "name": "Agent account", "created_at": 1,
         "mandate": {
-            "capabilities": [{"contract_id": 0, "method_name": "simple_transfer", "method_id": 3}],
+            "capabilities": [{"contract_id": 0, "method_name": "transfer", "method_id": 3}],
             "calls_per_transaction": 1,
             "circuit_fingerprint": "abc"
         }
@@ -66,9 +66,12 @@ fn an_ordinary_backup_serializes_without_a_mandate_key() {
         kind: KeyBackup::KIND.to_string(),
         private_key: "0x1".into(),
         fingerprint: "f".into(),
+        sign_type: None,
         name: "Wallet".into(),
         created_at: 1,
         network: Some("testnet".into()),
+        public_key: None,
+        user_id: None,
         mandate: None,
         default_shield_address: None,
         nostr_pub: None,

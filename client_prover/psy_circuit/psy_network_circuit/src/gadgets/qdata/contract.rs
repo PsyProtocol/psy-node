@@ -13,7 +13,7 @@ use psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT;
 
 #[derive(Clone, Debug, PartialEq, Eq, Copy)]
 pub struct PsyContractLeafGadget {
-    pub deployer: HashOutTarget,
+    pub deployer: Target,
     pub function_tree_root: HashOutTarget,
     pub code_root: HashOutTarget,
     pub state_tree_height: Target,
@@ -24,7 +24,7 @@ pub struct PsyContractLeafGadget {
 
 impl PsyContractLeafGadget {
     pub fn set_witness<F: RichField>(&self, witness: &mut impl Witness<F>, target: &PsyContractLeaf<F>) -> anyhow::Result<()> {
-        witness.set_hash_target(self.deployer, target.deployer.0)?;
+        witness.set_target(self.deployer, target.deployer)?;
         witness.set_hash_target(self.function_tree_root, target.function_tree_root.0)?;
         witness.set_hash_target(self.code_root, target.code_root.0)?;
         witness.set_target(self.state_tree_height, target.state_tree_height)?;
@@ -33,7 +33,7 @@ impl PsyContractLeafGadget {
         witness.set_target(self.state_layout_slot_count, target.state_layout_slot_count)
     }
     pub fn to_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
-        let mut inputs = vec![builder.constant_u64(0x434c_5632)];
+        let mut inputs = vec![builder.constant_u64(0x434c_5633)];
         inputs.extend(self.to_targets());
         builder.hash_n_to_hash_no_pad::<H>(inputs)
     }
@@ -48,7 +48,7 @@ impl AlgebraicHashableTarget for PsyContractLeafGadget {
 }
 impl CreatableTarget for PsyContractLeafGadget {
     fn create_virtual<F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>) -> Self {
-        let deployer = builder.add_virtual_hash();
+        let deployer = builder.add_virtual_target();
         let function_tree_root = builder.add_virtual_hash();
         let code_root = builder.add_virtual_hash();
         let state_tree_height = builder.add_virtual_target();
@@ -84,10 +84,7 @@ impl CreatableTarget for PsyContractLeafGadget {
 impl ToTargets for PsyContractLeafGadget {
     fn to_targets(&self) -> Vec<Target> {
         let mut targets = vec![
-            self.deployer.elements[0],
-            self.deployer.elements[1],
-            self.deployer.elements[2],
-            self.deployer.elements[3],
+            self.deployer,
             self.function_tree_root.elements[0],
             self.function_tree_root.elements[1],
             self.function_tree_root.elements[2],
@@ -106,27 +103,25 @@ impl ToTargets for PsyContractLeafGadget {
 }
 impl FromTargets for PsyContractLeafGadget {
     fn from_targets(targets: &[Target]) -> Self {
-        if targets.len() != 19 {
+        if targets.len() != 16 {
             panic!(
-                "tried to create PsyContractLeafGadget from an array of {} targets, but expected an array of 19 targets",
+                "tried to create PsyContractLeafGadget from an array of {} targets, but expected an array of 16 targets",
                 targets.len()
             );
         }
-        let deployer = HashOutTarget {
-            elements: [targets[0], targets[1], targets[2], targets[3]],
-        };
+        let deployer = targets[0];
         let function_tree_root = HashOutTarget {
-            elements: [targets[4], targets[5], targets[6], targets[7]],
+            elements: [targets[1], targets[2], targets[3], targets[4]],
         };
         let code_root = HashOutTarget {
-            elements: [targets[8], targets[9], targets[10], targets[11]],
+            elements: [targets[5], targets[6], targets[7], targets[8]],
         };
-        let state_tree_height = targets[12];
+        let state_tree_height = targets[9];
         let state_layout_root = HashOutTarget {
-            elements: [targets[13], targets[14], targets[15], targets[16]],
+            elements: [targets[10], targets[11], targets[12], targets[13]],
         };
-        let state_layout_field_count = targets[17];
-        let state_layout_slot_count = targets[18];
+        let state_layout_field_count = targets[14];
+        let state_layout_slot_count = targets[15];
         Self {
             deployer,
             function_tree_root,

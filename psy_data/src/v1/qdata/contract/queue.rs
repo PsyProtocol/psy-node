@@ -12,7 +12,7 @@ use crate::v1::qdata::{
 };
 
 pub const DEPLOY_CONTRACT_QUEUE_MAGIC: [u8; 4] = *b"DCV2";
-pub const DEPLOY_CONTRACT_QUEUE_VERSION: u16 = 1;
+pub const DEPLOY_CONTRACT_QUEUE_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(C)]
@@ -27,7 +27,7 @@ pub struct PsyDeployContractQueueItemV2<F, Hash> {
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyDeployContractQueueItemV2<F, Hash> {
     pub fn new_from_layout_endpoint<Hasher>(
-        deployer: Hash,
+        deployer: u64,
         state_tree_height: u16,
         function_leaves: Vec<Hash>,
         code_root: Hash,
@@ -69,7 +69,7 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyDeployContractQueueItemV2<F, Hash> {
         let value = Self {
             rand_key_id,
             contract_leaf: PQEDContractLeafV2 {
-                deployer,
+                deployer: F::from_u64_value(deployer),
                 function_tree_root: function_tree.get_root(),
                 code_root,
                 state_tree_height: F::from_u16_value(state_tree_height),
@@ -437,7 +437,7 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyUpdateContractQueueItem<F, Hash> {
 
     pub fn new_from_leaves_and_deployer<Hasher: MerkleZeroHasher<Hash>>(
         contract_id: u64,
-        deployer: Hash,
+        deployer: u64,
         state_tree_height: u16,
         state_layout_root: Hash,
         state_layout_field_count: u64,
@@ -464,7 +464,7 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyUpdateContractQueueItem<F, Hash> {
         let function_tree_root = t.get_root();
 
         let contract_leaf = PQEDContractLeafV2 {
-            deployer,
+            deployer: F::from_u64_value(deployer),
             function_tree_root,
             code_root,
             state_tree_height: F::from_u16_value(state_tree_height),
@@ -572,7 +572,7 @@ impl<F: QPGenRandom + QFelt64, Hash: QPGenRandom> QPGenRandom
             rand_key_id,
             contract_id: rand::random::<u64>() | 1,
             contract_leaf: PQEDContractLeafV2 {
-                deployer: Hash::qp_rand_gen(),
+                deployer: F::from_u64_value(rand::random::<u64>()),
                 function_tree_root: Hash::qp_rand_gen(),
                 code_root: Hash::qp_rand_gen(),
                 state_tree_height: F::from_u16_value(32),
@@ -686,7 +686,7 @@ mod deploy_v2_queue_tests {
         PsyDeployContractQueueItemV2 {
             rand_key_id: [7; 16],
             contract_leaf: PQEDContractLeafV2 {
-                deployer: QHashOut::default(),
+                deployer: PF::from_u64_value(7),
                 function_tree_root: QHashOut::default(),
                 code_root: QHashOut::default(),
                 state_tree_height: PF::from_u64_value(8),

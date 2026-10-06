@@ -30,11 +30,11 @@ fn engine() -> (PolicyEngine, String, String) {
 #[test]
 fn a_flood_of_claim_gates_cannot_erase_a_real_payment() {
     let (mut e, _pid, tok) = engine();
-    e.authorize(&tok, "alice", 42 * PSY, "simple_transfer").unwrap();
+    e.authorize(&tok, "alice", 42 * PSY, "transfer").unwrap();
 
     // Claims authorize with amount 0, need no funds and no chain success.
     for _ in 0..300 {
-        e.authorize(&tok, SELF_RECIPIENT, 0, "simple_claim").unwrap();
+        e.authorize(&tok, SELF_RECIPIENT, 0, "claim").unwrap();
     }
 
     let log = e.spend_log(200, None);
@@ -47,11 +47,11 @@ fn a_flood_of_claim_gates_cannot_erase_a_real_payment() {
 #[test]
 fn a_flood_of_refunded_attempts_cannot_erase_a_real_payment() {
     let (mut e, _pid, tok) = engine();
-    e.authorize(&tok, "alice", 42 * PSY, "simple_transfer").unwrap();
+    e.authorize(&tok, "alice", 42 * PSY, "transfer").unwrap();
 
     // Every one of these is authorized then refunded — nothing moved.
     for _ in 0..300 {
-        let auth = e.authorize(&tok, "bob", 1 * PSY, "simple_transfer").unwrap();
+        let auth = e.authorize(&tok, "bob", 1 * PSY, "transfer").unwrap();
         e.refund(&auth, 1 * PSY);
     }
 
@@ -66,7 +66,7 @@ fn a_flood_of_refunded_attempts_cannot_erase_a_real_payment() {
 fn the_ring_is_still_bounded() {
     let (mut e, _pid, tok) = engine();
     for _ in 0..300 {
-        e.authorize(&tok, SELF_RECIPIENT, 0, "simple_claim").unwrap();
+        e.authorize(&tok, SELF_RECIPIENT, 0, "claim").unwrap();
     }
     assert!(e.spend_log_len() <= 100, "bounded memory is not negotiable either");
 }
@@ -77,7 +77,7 @@ fn real_payments_still_age_out_when_they_are_all_that_is_left() {
     // be an unbounded ring by another name.
     let (mut e, _pid, tok) = engine();
     for i in 1..=150u64 {
-        e.authorize(&tok, "alice", i * PSY, "simple_transfer").unwrap();
+        e.authorize(&tok, "alice", i * PSY, "transfer").unwrap();
     }
     assert!(e.spend_log_len() <= 100);
     let log = e.spend_log(200, None);
@@ -103,12 +103,12 @@ fn a_flood_evicts_the_earliest_refusal_and_SAYS_SO() {
         "agent-1",
         Limits { per_transaction: 5 * PSY, per_day: 1_000 * PSY, per_month: None, total_budget: None },
         None,
-        vec!["simple_transfer".into()],
+        vec!["transfer".into()],
     );
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
-    let _ = e.authorize(&tok, "mallory", 99 * PSY, "simple_transfer");
+    let _ = e.authorize(&tok, "mallory", 99 * PSY, "transfer");
     for _ in 0..300 {
-        let _ = e.authorize(&tok, SELF_RECIPIENT, 0, "simple_claim");
+        let _ = e.authorize(&tok, SELF_RECIPIENT, 0, "claim");
     }
     let blocked = e.denied_log(200, None);
     assert!(
@@ -156,13 +156,13 @@ fn a_flood_of_nonzero_denials_is_counted_not_silent() {
     let (mut e, tok) = tight_engine();
 
     // One real, high-value refusal we would want to remember.
-    let _ = e.authorize(&tok, "mallory", 99_000_000_000, "simple_transfer");
+    let _ = e.authorize(&tok, "mallory", 99_000_000_000, "transfer");
     assert_eq!(e.denied_log_dropped(), 0, "nothing dropped yet");
 
     // The attacker's flood: every row carries a nonzero, attacker-chosen
     // amount, which the old heuristic could not match.
     for _ in 0..120 {
-        let _ = e.authorize(&tok, "mallory", 2, "simple_transfer");
+        let _ = e.authorize(&tok, "mallory", 2, "transfer");
     }
 
     assert!(
@@ -176,7 +176,7 @@ fn a_flood_of_nonzero_denials_is_counted_not_silent() {
 #[test]
 fn an_untouched_ring_reports_nothing_dropped() {
     let (mut e, tok) = tight_engine();
-    let _ = e.authorize(&tok, "bob", 99_000_000_000, "simple_transfer");
+    let _ = e.authorize(&tok, "bob", 99_000_000_000, "transfer");
     assert_eq!(e.denied_log_dropped(), 0);
     assert_eq!(e.spend_log_dropped(), 0);
     assert_eq!(e.denied_log_len(), 1);

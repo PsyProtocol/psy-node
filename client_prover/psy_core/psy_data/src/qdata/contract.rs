@@ -12,7 +12,7 @@ use ts_rs::TS;
 #[ts(export, concrete(F = GoldilocksField))]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 pub struct PsyContractLeaf<F: RichField> {
-    pub deployer: QHashOut<F>,
+    pub deployer: F,
     pub function_tree_root: QHashOut<F>,
     pub code_root: QHashOut<F>,
     pub state_tree_height: F,
@@ -33,16 +33,13 @@ impl<F: RichField> KVQSerializable for PsyContractLeaf<F> {
 
 impl<F: RichField> QFeltSized for PsyContractLeaf<F> {
     fn q_felt_size() -> usize {
-        19
+        16
     }
 }
 impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
     fn to_qfelts(&self) -> Vec<F> {
         vec![
-            self.deployer.0.elements[0],
-            self.deployer.0.elements[1],
-            self.deployer.0.elements[2],
-            self.deployer.0.elements[3],
+            self.deployer,
             self.function_tree_root.0.elements[0],
             self.function_tree_root.0.elements[1],
             self.function_tree_root.0.elements[2],
@@ -65,18 +62,18 @@ impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
         if felts.len() != Self::q_felt_size() {
             panic!("Invalid number of elements for PsyContractLeaf");
         }
-        let deployer = QHashOut::from_qfelts(&felts[0..4]);
-        let function_tree_root = QHashOut::from_qfelts(&felts[4..8]);
-        let code_root = QHashOut::from_qfelts(&felts[8..12]);
-        let state_tree_height = felts[12];
+        let deployer = felts[0];
+        let function_tree_root = QHashOut::from_qfelts(&felts[1..5]);
+        let code_root = QHashOut::from_qfelts(&felts[5..9]);
+        let state_tree_height = felts[9];
         PsyContractLeaf {
             deployer,
             function_tree_root,
             code_root,
             state_tree_height,
-            state_layout_root: QHashOut::from_qfelts(&felts[13..17]),
-            state_layout_field_count: felts[17],
-            state_layout_slot_count: felts[18],
+            state_layout_root: QHashOut::from_qfelts(&felts[10..14]),
+            state_layout_field_count: felts[14],
+            state_layout_slot_count: felts[15],
         }
     }
 }
@@ -84,11 +81,8 @@ impl<F: RichField> ToQFelts<F> for PsyContractLeaf<F> {
 impl<F: RichField> QFieldHashable<F> for PsyContractLeaf<F> {
     fn qfhash<H: FieldQHasher<F>>(&self) -> QHashOut<F> {
         H::q_hash_many(&[
-            F::from_canonical_u64(0x434c_5632),
-            self.deployer.0.elements[0],
-            self.deployer.0.elements[1],
-            self.deployer.0.elements[2],
-            self.deployer.0.elements[3],
+            F::from_canonical_u64(0x434c_5633),
+            self.deployer,
             self.function_tree_root.0.elements[0],
             self.function_tree_root.0.elements[1],
             self.function_tree_root.0.elements[2],
@@ -193,7 +187,7 @@ mod tests {
 
     fn distinct_leaf() -> PsyContractLeaf<F> {
         PsyContractLeaf {
-            deployer: QHashOut::from_values(1, 2, 3, 4),
+            deployer: F::from_canonical_u64(1),
             function_tree_root: QHashOut::from_values(5, 6, 7, 8),
             code_root: QHashOut::from_values(9, 10, 11, 12),
             state_tree_height: F::from_canonical_u64(16),
@@ -204,11 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_distinct_fields_roundtrip_preserves_all_nineteen() {
+    fn nonzero_distinct_fields_roundtrip_preserves_all_fields() {
         let leaf = distinct_leaf();
         let felts = leaf.to_qfelts();
         assert_eq!(felts.len(), PsyContractLeaf::<F>::q_felt_size());
-        assert_eq!(felts.len(), 19);
+        assert_eq!(felts.len(), 16);
         let recovered = PsyContractLeaf::<F>::from_qfelts(&felts);
         assert_eq!(recovered, leaf);
     }

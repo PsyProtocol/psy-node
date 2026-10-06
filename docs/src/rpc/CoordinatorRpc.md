@@ -117,3 +117,7 @@ JSON-RPC edge API for the Coordinator node. All methods use namespace `psy`.
 
 - `psy_api_core/src/coordinator/standard_edge_rpc.rs`
 - `psy_api_core/src/worker/standard_worker_rpc.rs`
+
+## CLV3 deployer identity
+
+Contract deployment requests identify `deployer` by its on-chain `u64` user ID, not a public-key hash. Contract leaves commit that ID as one field element in the CLV3 layout. See [Contract Deployment](../language/contract_deployment.md) for the complete leaf, including code and state-layout commitments.

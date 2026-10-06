@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Bridge E2E Test Script ───────────────────────────────────────────────────
 # L1→L2→L1 round trip against a running devnet stack:
 #   1. Register user
-#   2. Faucet claim + recipient simple_claim (L2 fee balance)
+#   2. Faucet claim + recipient claim (L2 fee balance)
 #   3. L1 deposit USDT (shield address derived from r0/r1/user_id; claim
 #      material persisted BEFORE the L1 transaction)
 #   4. Wait for relayer batchAppend (provedDepositCount) + checkpoint finalize
@@ -150,9 +150,9 @@ register_user() {
   log "  user_id=$USER_ID"
 }
 
-# ─── Step 2: Faucet claim + recipient simple_claim ───────────────────────────
+# ─── Step 2: Faucet claim + recipient claim ───────────────────────────
 # The faucet operator transfer records amount_sent for the recipient; the
-# recipient must simple_claim it into their contract-0 fee balance
+# recipient must claim it into their contract-0 fee balance
 # (psy-compiler/psy-precompiles/token/src/main.psy:444-465).
 fee_balance() {
   # PSY token balance lives in the contract-0 state tree leaf 0, NOT in the
@@ -164,7 +164,7 @@ fee_balance() {
 }
 
 claim_faucet() {
-  log "Step 2: Faucet claim + simple_claim (L2 fee funding)"
+  log "Step 2: Faucet claim + claim (L2 fee funding)"
   local bal
   bal=$(fee_balance)
   if [ "${bal:-0}" -gt 0 ]; then
@@ -180,7 +180,7 @@ claim_faucet() {
     || fail "faucet claim failed: $resp"
   operator=$(echo "$resp" | jq -r '.result.operator_user_id')
   log "  faucet tx=$(echo "$resp" | jq -r '.result.tx_hash') operator=$operator already_submitted=$(echo "$resp" | jq -r '.result.already_submitted')"
-  # Submit simple_claim directly; the recipient's first UPS session starts
+  # Submit claim directly; the recipient's first UPS session starts
   # from the register-user path and credits the claim before the end-of-session
   # fee burn, so no pre-existing leaf is required.
   local claim_output claim_ok=0
@@ -189,19 +189,19 @@ claim_faucet() {
       --result-file "$RESULT_DIR/claim-psy.json" \
       call --sign-type zk -p "$USER_PK" \
       --rpc-config "$RPC_CONFIG" \
-      --contract-id 0 --method-name simple_claim \
+      --contract-id 0 --method-name claim \
       --inputs "[$operator]" --wait-until-confirmation 2>&1) && claim_ok=1 && break
-    log "  simple_claim attempt $attempt failed; operator transfer may not be included yet: $(echo "$claim_output" | grep -m1 'Error' || echo "$claim_output" | tail -1)"
+    log "  claim attempt $attempt failed; operator transfer may not be included yet: $(echo "$claim_output" | grep -m1 'Error' || echo "$claim_output" | tail -1)"
     sleep 30
   done
-  [ "$claim_ok" -eq 1 ] || fail "simple_claim failed after retries: $claim_output"
+  [ "$claim_ok" -eq 1 ] || fail "claim failed after retries: $claim_output"
   jq -e '.status == "confirmed" and .confirmed_checkpoint != null' "$RESULT_DIR/claim-psy.json" >/dev/null \
-    || fail "simple_claim not confirmed"
+    || fail "claim not confirmed"
   echo "$resp" | jq -e '.error == null and .result.operator_user_id != null' >/dev/null \
     || fail "faucet claim failed: $resp"
 
   bal=$(fee_balance)
-  [ "${bal:-0}" -gt 0 ] || fail "fee balance still 0 after simple_claim"
+  [ "${bal:-0}" -gt 0 ] || fail "fee balance still 0 after claim"
   ok "L2 fee balance funded: $bal"
 }
 

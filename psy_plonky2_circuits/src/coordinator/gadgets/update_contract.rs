@@ -175,7 +175,7 @@ impl<const D: usize> BatchUpdateContractsGadget<D> {
                 layout.new_layout_slot_count,
                 new_contract_leaves[index].state_layout_slot_count,
             );
-            builder.connect_hashes_if_true(
+            builder.connect_if_true(
                 is_updated,
                 old_contract_leaves[index].deployer,
                 new_contract_leaves[index].deployer,

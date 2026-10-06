@@ -2561,13 +2561,13 @@ async fn build_multichain_l2_plan(
         let selected_count = l2_count.checked_add(appended).context("selected deposit count overflow")?;
         remaining_deposits = remaining_deposits.checked_sub(appended).context("deposit capacity overflow")?;
         if append_business && selected_count > l2_count {
-            let snapshot = crate::bridge::api_client::fetch_services_deposit_tree_root(
+            let snapshot = crate::bridge::api_client::fetch_services_deposit_snapshot_root(
                 &http,
                 &base.services_url,
                 u64::from(chain.chain_index),
                 u64::from(selected_count),
             ).await?;
-            ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}", chain.chain_index, pending);
+            ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}", chain.chain_index, selected_count);
             let snapshot_count = snapshot.snapshot_deposit_count().context("deposit snapshot missing count")?;
             ensure!(snapshot_count == u64::from(selected_count), "deposit snapshot count mismatch for chain {}", chain.chain_index);
             calls.push(build_set_chain_root_call(

@@ -213,7 +213,7 @@ In the proving session, the external proof (note inclusion) must be inserted **b
 |-------|-------|------------|
 | `receiver does not match claiming user` | Wrong private key or wrong `r0`/`r1` | Ensure the receiver key and randoms match the shield address |
 | `nullifier already claimed` | Note was already claimed by someone | Check claim status before attempting |
-| `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund the receiver through `docs/src/dev/common-operations.md` Section 5.1; genesis `simple_mint` is not available to devnet wallets |
+| `insufficient balance for fee` | Receiver has no L2 PSY for gas | Fund the receiver through `docs/src/dev/common-operations.md` Section 5.1; genesis `mint` is not available to devnet wallets |
 | `note proof deserialization failed` | Corrupted or wrong format proof file | Regenerate the proof file |
 | `stale trace anchor` | Checkpoint advanced during proving | Regenerate trace with fresh anchor |
 | `proof tree root mismatch` | `private_note_inclusion_fingerprint` or the PI `hash([...])` list does not match the circuit that produced the session leaf | Follow `docs/src/dev/token-privacy-circuit-fingerprints.md` |

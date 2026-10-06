@@ -1,5 +1,4 @@
 pub mod faucet;
-#[cfg(feature = "gnark-wrap")]
 pub mod prove_proxy;
 
 use std::{sync::Arc, time::Duration};
@@ -84,14 +83,14 @@ pub trait Rpc {
     #[method(name = "deploy_contract")]
     async fn deploy_contract(
         &self,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
         abi: psy_compiler::abi::Abi,
     ) -> Result<String, ErrorObjectOwned>;
     #[method(name = "get_deploy_contract_cmd")]
     async fn get_deploy_contract_cmd(
         &self,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
         abi: psy_compiler::abi::Abi,
     ) -> Result<psy_client_data::qblock::cmds::deploy_contract::QBCDeployContractV2<F>, ErrorObjectOwned>;
@@ -400,7 +399,7 @@ impl RpcServer for RpcServerImpl {
 
     async fn deploy_contract(
         &self,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
         abi: psy_compiler::abi::Abi,
     ) -> Result<String, ErrorObjectOwned> {
@@ -416,7 +415,7 @@ impl RpcServer for RpcServerImpl {
 
     async fn get_deploy_contract_cmd(
         &self,
-        deployer: QHashOut<F>,
+        deployer: u64,
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
         abi: psy_compiler::abi::Abi,
     ) -> Result<psy_client_data::qblock::cmds::deploy_contract::QBCDeployContractV2<F>, ErrorObjectOwned> {

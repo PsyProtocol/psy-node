@@ -11,7 +11,7 @@ pub trait EvalCache {
 pub trait ContextInput {
     fn get_input(&self, index: u64) -> u64;
     fn get_contract_id(&self) -> u64;
-    fn get_contract_deployer(&self, contract_id: u64) -> [u64; 4];
+    fn get_contract_deployer(&self, contract_id: u64) -> u64;
     fn get_caller_contract_id(&self) -> u64;
     fn get_user_id(&self) -> u64;
     fn get_user_nonce(&self) -> u64;

@@ -110,3 +110,7 @@ These paths from prior documentation are **not** registered in the current `conf
 
 - `../psy-services/src/api/server.rs` (`configure_api_v1`, `build_app`)
 - `../psy-services/src/bin/main.rs` (`PSY_JWT_SECRET`)
+
+## Contract deployer identity
+
+For CLV3 contract metadata and deployer filters, `deployer` identifies the on-chain user ID, not a public-key hash. The services API owns its numeric or textual JSON representation; consumers must use the matching services revision.

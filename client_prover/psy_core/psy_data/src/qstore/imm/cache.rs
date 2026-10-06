@@ -253,7 +253,7 @@ impl<F: RichField, S: PsyReadCommandProcessorSync<F> + QUserIdManager + Send> Ps
     async fn resolve_get_contract_leaf_mut(&mut self, input: &QSRCmdGetContractLeafData) -> anyhow::Result<PsyContractLeaf<F>> {
         if input.contract_id == DEFAULT_CALLER_CONTRACT_ID_U64 {
             return Ok(PsyContractLeaf {
-                deployer: QHashOut::default(),
+                deployer: F::ZERO,
                 function_tree_root: QHashOut::default(),
                 code_root: QHashOut::default(),
                 state_tree_height: F::from_canonical_u8(MAX_CONTRACT_STATE_TREE_HEIGHT),

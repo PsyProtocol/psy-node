@@ -1,6 +1,9 @@
 PROVING_BACKEND := plonky2-poseidon-goldilocks
 BIN_PREFIX   := ./target/release/
 PSY_CONFIG_PATH := $(CURDIR)/psy-genesis/config.json
+# 本机开发默认 localhost 阶段；部署构建在部署脚本里显式覆盖。
+PSY_NETWORK ?= localhost
+export PSY_NETWORK
 ifneq (,$(wildcard ./.env))
 include .env
 export

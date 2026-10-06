@@ -111,6 +111,8 @@ use psy_data::qdata::{
 
 The field summaries previously listed for these types are not repeated because they were not verified against the current SDK checkout. Treat the Rust definitions in `psy_data` as the interface source.
 
+The CLV3 contract leaf represents `deployer` as the on-chain user ID, not a public-key hash. See the complete leaf layout in [Contract Deployment](../language/contract_deployment.md).
+
 ## 7. Verification Boundary
 
 Verified against the SDK checkout:

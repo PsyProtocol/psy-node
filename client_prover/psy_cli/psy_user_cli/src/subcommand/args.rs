@@ -68,6 +68,10 @@ pub struct DeployContractArgs {
     /// sources use `--keystore-path` and optional `--wallet-password`.
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
+    /// Deployer user id. Resolved from the wallet public key hash via RPC
+    /// when omitted.
+    #[clap(long, env)]
+    pub user_id: Option<u64>,
     #[clap(long)]
     pub contract_path: String,
     #[clap(long, env)]
@@ -88,6 +92,10 @@ pub struct UpdateContractArgs {
     pub fingerprint: Option<String>,
     #[clap(long)]
     pub contract_id: u64,
+    /// Deployer user id. Resolved from the wallet public key hash via RPC
+    /// when omitted.
+    #[clap(long, env)]
+    pub user_id: Option<u64>,
     #[clap(long)]
     pub contract_path: String,
     /// ABI JSON of the currently deployed contract layout. When omitted the old
@@ -560,6 +568,13 @@ pub struct ClaimRewardsArgs {
     /// Path to JSON file containing job IDs
     #[clap(long, default_value = "worker.backup")]
     pub jobs_file: String,
+    /// Write a versioned, reusable JSON reward summary to this path.
+    #[clap(long)]
+    pub summary_output: Option<String>,
+    /// Generate the reward summary without loading a wallet or submitting a
+    /// transaction.
+    #[clap(long, requires = "summary_output")]
+    pub summary_only: bool,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]
@@ -610,6 +625,11 @@ pub struct CompileAndDeployArgs {
 
     #[clap(long, env)]
     pub fingerprint: Option<String>,
+
+    /// Deployer user id. Resolved from the wallet public key hash via RPC
+    /// when omitted.
+    #[clap(long, env)]
+    pub user_id: Option<u64>,
 
     /// Output directory for compiled artifacts
     #[clap(long)]
@@ -832,8 +852,8 @@ pub struct DepositArgs {
     #[clap(long, env, default_value = "http://127.0.0.1:8545")]
     pub l1_rpc_url: String,
     /// L1 private key for signing the deposit tx
-    #[clap(long, short = 'p')]
-    pub private_key: String,
+    #[clap(long, short = 'p', required_unless_present = "resume_deposit_index")]
+    pub private_key: Option<String>,
     /// Router contract address (0x-prefixed hex)
     #[clap(long, env)]
     pub router_address: String,
@@ -895,6 +915,17 @@ pub struct DepositArgs {
     /// that claim_deposit later consumes with --deposit-proof.
     #[clap(long = "deposit-proof-output", env = "DEPOSIT_PROOF_OUTPUT")]
     pub deposit_proof_output: Option<String>,
+    /// Regenerate proof material for an existing deposit; never broadcasts a
+    /// transaction.
+    #[clap(long, requires_all = ["resume_tx_hash", "resume_chain_id", "deposit_proof_output", "note_secret", "nullifier_secret"], conflicts_with = "recipient_npub")]
+    pub resume_deposit_index: Option<u64>,
+    /// Original successful L1 deposit transaction, required in recovery mode.
+    #[clap(long, requires = "resume_deposit_index")]
+    pub resume_tx_hash: Option<String>,
+    /// Expected L1 chain ID, checked before looking up the original
+    /// transaction.
+    #[clap(long, requires = "resume_deposit_index")]
+    pub resume_chain_id: Option<u64>,
 }
 
 #[derive(Clone, Args)]

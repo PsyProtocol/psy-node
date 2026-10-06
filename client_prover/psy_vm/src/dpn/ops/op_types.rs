@@ -241,10 +241,10 @@ impl DPNOpType {
             DPNOpType::Exp | DPNOpType::ExpConstantPower | DPNOpType::ExpConstantBase => {
                 (GoldilocksField::from_canonical_u64(a).exp_u64(b)).to_canonical_u64()
             }
-            DPNOpType::Mod => a % b,
-            DPNOpType::U32And => (a & b) & 0xffffffffu64,
-            DPNOpType::U32Or => (a | b) & 0xffffffffu64,
-            DPNOpType::U32Xor => (a ^ b) & 0xffffffffu64,
+            DPNOpType::Mod | DPNOpType::ModConstantDividend | DPNOpType::ModConstantDivisor => a % b,
+            DPNOpType::U32And | DPNOpType::U32AndConstant => (a & b) & 0xffffffffu64,
+            DPNOpType::U32Or | DPNOpType::U32OrConstant => (a | b) & 0xffffffffu64,
+            DPNOpType::U32Xor | DPNOpType::U32XorConstant => (a ^ b) & 0xffffffffu64,
             // DPNOpType::U32ShiftLeft => (a << b) & 0xffffffffu64,
             // DPNOpType::U32ShiftRight => (a >> b) & 0xffffffffu64,
             DPNOpType::BoolAnd => (a & b) & 1,
@@ -255,9 +255,23 @@ impl DPNOpType {
             DPNOpType::U32Div => a / b,
             DPNOpType::U32Mod => a % b,
             DPNOpType::U32Exp => (GoldilocksField::from_canonical_u64(a).exp_u64(b)).to_canonical_u64(),
-            DPNOpType::U32ShiftLeft | DPNOpType::U32ShiftLeftConstantBitDistance | DPNOpType::U32ShiftLeftConstantValue => (a << b) & 0xffffffffu64,
+            // u32 shift folding: every bit leaves the 32-bit window once the
+            // distance reaches 32, so b >= 32 folds to 0. Shifting the u64
+            // directly panicked in debug for b >= 64 and silently wrapped the
+            // distance in release (e.g. `1u32 << 64u32` folded to 1).
+            DPNOpType::U32ShiftLeft | DPNOpType::U32ShiftLeftConstantBitDistance | DPNOpType::U32ShiftLeftConstantValue => {
+                if b >= 32 {
+                    0
+                } else {
+                    (a << b) & 0xffffffffu64
+                }
+            }
             DPNOpType::U32ShiftRight | DPNOpType::U32ShiftRightConstantBitDistance | DPNOpType::U32ShiftRightConstantValue => {
-                (a >> b) & 0xffffffffu64
+                if b >= 32 {
+                    0
+                } else {
+                    (a >> b) & 0xffffffffu64
+                }
             }
             _ => panic!("DPNOpType::eval_binary_constant not implemented for {:?}", self),
         }
@@ -309,7 +323,12 @@ impl DPNOpType {
             DPNOpType::Mod => DPNBuiltInDataType::Target,
             DPNOpType::ModConstantDividend => DPNBuiltInDataType::Target,
             DPNOpType::ModConstantDivisor => DPNBuiltInDataType::Target,
-            DPNOpType::DivRem4 => DPNBuiltInDataType::Target,
+            // DivRem4 writes a two-element [quotient, remainder] array; it
+            // used to declare the Target lane while every implementation
+            // writes target_arrays, desyncing the pool counters. No producer
+            // ever emitted it (and no serialized program contains it), so
+            // correcting the lane breaks nothing.
+            DPNOpType::DivRem4 => DPNBuiltInDataType::TargetArray,
             DPNOpType::CastU32 => DPNBuiltInDataType::U32Target,
             DPNOpType::U32And => DPNBuiltInDataType::U32Target,
             DPNOpType::U32AndConstant => DPNBuiltInDataType::U32Target,
@@ -389,13 +408,22 @@ impl DPNOpType {
             DPNOpType::Constant => true,
             DPNOpType::ConstantTrue => true,
             DPNOpType::ConstantFalse => true,
-            DPNOpType::ExpConstantPower => true,
-            DPNOpType::ExpConstantBase => true,
-            DPNOpType::ModConstantDividend => true,
-            DPNOpType::ModConstantDivisor => true,
-            DPNOpType::U32AndConstant => true,
-            DPNOpType::U32OrConstant => true,
-            DPNOpType::U32XorConstant => true,
+            // ExpConstant* carry their constant as a regular Constant child
+            // input (node-ref layout, like the shift Constant* variants
+            // below) — the flag inserted a phantom const_param slot at
+            // inputs[0], shifting every consumer's operand indices by one.
+            // DPNOpType::ExpConstantPower => true,
+            // DPNOpType::ExpConstantBase => true,
+            // Same as ExpConstant*: these carry their constant as a regular
+            // child input (node-ref layout). The `true` arms made injest_sfr
+            // insert a phantom const_param slot at inputs[0] while the
+            // consumers expected operand ids — the variants were unrouted
+            // dead code, so the mismatch never surfaced.
+            // DPNOpType::ModConstantDividend => true,
+            // DPNOpType::ModConstantDivisor => true,
+            // DPNOpType::U32AndConstant => true,
+            // DPNOpType::U32OrConstant => true,
+            // DPNOpType::U32XorConstant => true,
             // DPNOpType::U32ShiftLeftConstantBitDistance => true,
             // DPNOpType::U32ShiftLeftConstantValue => true,
             // DPNOpType::U32ShiftRightConstantBitDistance => true,

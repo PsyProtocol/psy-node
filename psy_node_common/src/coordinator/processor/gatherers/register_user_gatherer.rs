@@ -1073,6 +1073,7 @@ mod tests2 {
         data::hash::merkle_node_key::SimpleMerkleNodeKey,
         pgoldilocks::PoseidonHasher,
         utils::QPGenRandom,
+        PHash,
     };
     use std::collections::{HashMap, HashSet};
     use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
@@ -1123,12 +1124,21 @@ mod tests2 {
                     level: item.metadata.reward_tree_node_level,
                     index: item.metadata.reward_tree_node_index,
                 };
-                let hash_mode = item.metadata.reward_tree_hash_mode;
-                let num_children = item.metadata.reward_tree_node_children;
-                let deps = item.metadata.dependencies.clone();
-                key_to_info.insert(key, (item.job_id, hash_mode, num_children, deps));
-
-                if hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                if key_to_info
+                    .insert(
+                        key,
+                        (
+                            item.job_id,
+                            item.metadata.reward_tree_hash_mode,
+                            item.metadata.reward_tree_node_children,
+                            item.metadata.dependencies.clone(),
+                        ),
+                    )
+                    .is_some()
+                {
+                    return Err(anyhow!("Duplicate node key {:?}", key));
+                }
+                if item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
                     leaf_count += 1;
                 }
             }
