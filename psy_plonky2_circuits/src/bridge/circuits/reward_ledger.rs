@@ -562,4 +562,25 @@ mod tests {
         let origin = RewardLedgerStateValues { ledger_window_hash: [0; 4], ledger_root: issued, user_root: empty_user_root().unwrap(), session_count: 0, unfinished_session_count: 0 };
         assert_eq!(state_root(&origin).unwrap(), origin_state_root());
     }
+
+    #[test]
+    fn zero_state_root_matches_circuit_and_rejects_zero_output() {
+        use plonky2::{iop::witness::PartialWitness, plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig}};
+        use super::super::reward_session::RewardLedgerStateTargets;
+        let state = RewardLedgerStateValues { ledger_window_hash: [0; 4], ledger_root: [0; 4], user_root: [0; 4], session_count: 0, unfinished_session_count: 0 };
+        let expected = state_root(&state).unwrap();
+        assert_ne!(expected, [0; 4]);
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let targets = RewardLedgerStateTargets::new(&mut builder);
+        builder.register_public_inputs(&targets.root.elements);
+        let circuit = builder.build::<C>();
+        let mut witness = PartialWitness::new();
+        targets.set_witness(&mut witness, &state).unwrap();
+        let proof = circuit.prove(witness).unwrap();
+        assert_eq!(proof.public_inputs.iter().map(|limb| limb.to_canonical_u64()).collect::<Vec<_>>(), expected);
+        circuit.verify(proof.clone()).unwrap();
+        let mut changed = proof;
+        changed.public_inputs.fill(F::ZERO);
+        assert!(circuit.verify(changed).is_err());
+    }
 }

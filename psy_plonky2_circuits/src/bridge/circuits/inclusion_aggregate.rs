@@ -356,7 +356,7 @@ fn constrain_reward_payout<const CAPACITY: usize>(
     builder.conditionally_verify_proof::<PoseidonGoldilocksConfig>(active, &proof, real_vk, dummy_proof, dummy_vk, common);
     for &word in &proof.public_inputs { builder.connect_if_true(inactive, word, zero); }
     let state = RewardLedgerStateTargets::new(builder);
-    for target in state.ledger_window_hash.elements.into_iter().chain(state.ledger_root.elements).chain(state.user_root.elements).chain(state.root.elements) {
+    for target in state.ledger_window_hash.elements.into_iter().chain(state.ledger_root.elements).chain(state.user_root.elements) {
         builder.connect_if_true(inactive, target, zero);
     }
     builder.connect_if_true(inactive, state.session_count, zero);
