@@ -75,7 +75,7 @@ pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
                 let membership = reward_membership(&client, &context, &reward).await?;
                 anyhow::ensure!(membership.claim_checkpoint_leaf.stats.pm_rewards_commitment.gutas_root == tag_root, "reward proof does not reach authenticated full GUTA root");
                 let authorization = if let Some(account) = &account {
-                    let identity = client.circuits.entries().iter().find(|entry| entry.family == 4 && entry.level == 0 && entry.variant == 3).context("missing pinned multisig authorization identity")?.identity_fingerprint;
+                    let identity = client.circuits.registrations().iter().find(|registration| registration.family == 4 && registration.level == 0 && registration.variant == 3).context("missing pinned multisig authorization identity")?.identity_fingerprint;
                     let public_key = psy_crypto::signature::zk::data::ZKPublicKeyInfo { fingerprint: QHashOut::from_values(identity[0], identity[1], identity[2], identity[3]), public_key_param: account.public_key_param()? }.qfhash::<PsyHasher>();
                     anyhow::ensure!(membership.authorization_user_leaf.public_key == public_key, "chosen-end account differs from multisig enrollment");
                     let bundles: Vec<MultisigSignatures> = serde_json::from_slice(&std::fs::read(args.signatures.as_ref().context("missing multisig signatures path")?)?)?;
@@ -94,8 +94,8 @@ pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
                     wallet_authorization(wallet, membership.message()?)?
                 };
                 let input = RewardAuthorizationInput { context: membership, authorization };
-                let proof = client.circuits.reward.authorization_circuits().prove(&input)?;
-                let request = client.prove_reward(&context, &input.context, &tag, &proof, &client.circuits.reward)?;
+                let proof = client.circuits.reward_inclusion.authorization_circuits().prove(&input)?;
+                let request = client.prove_reward(&context, &input.context, &tag, &proof, &client.circuits.reward_inclusion)?;
                 client.submit(&context, request).await
             }.await;
             match attempt {

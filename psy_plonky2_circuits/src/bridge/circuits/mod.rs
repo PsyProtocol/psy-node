@@ -5,6 +5,9 @@ pub mod inclusion_aggregate;
 pub mod chain_aggregate;
 pub mod reward_inclusion;
 pub mod historical_merkle_proof;
+pub mod reward_session;
+pub mod reward_ledger;
+mod reward_session_witness;
 pub mod deposit_aggregate;
 #[cfg(all(feature = "gnark-wrap", not(target_arch = "wasm32")))]
 pub mod bridge_wrap;

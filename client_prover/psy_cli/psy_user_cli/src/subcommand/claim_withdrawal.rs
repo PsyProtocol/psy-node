@@ -5,7 +5,7 @@ use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_client_data::bridge_aggregate::{domain_hash, Domain, NetworkConfig, WithdrawalLeaf};
 use psy_plonky2_circuits::bridge::aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits};
 use psy_provider::provider::RpcProvider;
-use psy_prover::local::bridge_aggregate::{address, digest, word, AdmissionRequest, AggregationContext, ClaimClient as PortableClaimClient, ClaimError, ClaimStatus};
+use psy_prover::local::bridge_aggregate::{address, digest, word, AggregationClaimRequest, AggregationContext, ClaimClient as PortableClaimClient, ClaimError, ClaimStatus};
 use super::args::ClaimWithdrawalArgs;
 use crate::result::CommandResult;
 
@@ -34,7 +34,7 @@ impl ClaimClient {
         circuits.validate_config(&config)?;
         Ok(Self { circuits, client: PortableClaimClient::new(config, RpcProvider::new_with_config(network)?, services_url)? })
     }
-    pub async fn submit(&self, context: &AggregationContext, request: AdmissionRequest) -> Result<()> {
+    pub async fn submit(&self, context: &AggregationContext, request: AggregationClaimRequest) -> Result<()> {
         let record = STANDARD.decode(&request.record)?;
         let family = match request.kind.as_str() { "withdrawal" => 2, "reward" => 3, _ => anyhow::bail!("invalid claim kind") };
         let claim_id = digest(&[&domain_hash(Domain::LeafCommit), &self.config.config_hash()?, &word(family), &record]);

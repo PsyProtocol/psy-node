@@ -116,7 +116,11 @@ epochs. Name the epoch; do not invent a fourth.
 | Processor | Long-lived loop: gather, prove, wait for inclusion, commit. |
 | Gatherer | Background NATS consumer + planner. Owns the live in-memory tree. |
 | Planner | Builds proving jobs and FFS for one gatherer cycle. |
-| Edge | HTTP admission surface in front of a processor. EndCaps enter a Realm edge; GUTA submit enters the Coordinator edge. |
+| Edge | HTTP surface in front of a processor: proven claims enter the aggregation edge; EndCaps enter a Realm edge; GUTA submit enters the Coordinator edge. |
+| `AggregationClaimRequest` | The wire packet that hands one proven claim (record plus proof, tagged by kind and aggregation context) to the aggregation edge. One spelling across the prover, relayer, and services ends. |
+| `build_aggregation_claim` | Builds an `AggregationClaimRequest` from a proven record and its proof. |
+| `AggregateClaimResult::AggregationClaim` | CLI outcome variant carrying the built `AggregationClaimRequest`. |
+| `AggregationClaim` | Services domain value passed to `apply_claim` for a proven aggregation claim; distinct from the stored `DbBridgeAggregationClaim` row. |
 | Worker | Proves claimed jobs and submits tagged proofs back through the edge. |
 | Relayer | L1/L2 bridge daemon (`psy_relayer_cli`): deposit append, withdrawal claim, Groth16. |
 | EndCap | Final proof of one user proving session (`UPSStandardEndCapCircuit`). |
@@ -208,7 +212,6 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 | `install_staged_proposals` | Test helper installing each staged proposal in fetch outcomes; returns the installed count. |
 | `installed_proposal_count` | Number of proposals installed by that helper. |
 | `build_proposal_with_body` / `build_proposal_with_body_at_checkpoint` | Test helpers deriving a proposal and its encoded body without persistence. |
-| Retired `proposal_store/` | Abandoned directory name. Ignore it. |
 
 ## 9. Recovery words
 
@@ -306,37 +309,162 @@ Artifact approval source: `psy_cli/psy_relayer_cli/src/guardian/protocol.rs:150-
 | `AggregateWindow` | Witness value for one withdrawal or reward aggregate: `config_hash: Bytes32`, `window_id: Bytes32`, `end_id: u64`, and `end_root: Hash4`. It is not a wire object and has no public-input layout of its own. Not `BatchContext`. |
 | `AggregateLeaf` | Private codec trait in `bridge_aggregate.rs`, implemented by `WithdrawalLeaf` and `RewardLeaf`. `LEAF_WORDS` is 6; `write_leaf` and `read_leaf` encode and decode each existing leaf as six 32-byte words. It is not a new wire family. Distinct from circuit `AggregateLeafTarget`. |
 | `AggregateLeafTarget` | Public circuit enum in `aggregate_commitment.rs`: `Deposit`, `Withdrawal`, and `Reward` leaf targets. Not the private codec trait `AggregateLeaf`. |
-| `InclusionAggregateCircuit` | Withdrawal and reward inclusion aggregate circuit in `inclusion_aggregate.rs`. Source enum: `InclusionAggregateSource`. Public inputs: `AGGREGATE_PI_LEN` is 12. Slot bound: `AGGREGATE_SLOT_COUNT` is 1024. Crypto domain `Domain::Aggregate`; its frozen label remains `Batch`. Do not rename that byte string. |
-| Withdrawal root path | Private height-eight Poseidon path authenticating one opening withdrawal root. It is not serialized. |
-| Global deposit leaf root | Internal ordered height-ten Merkle root from `deposit_leaf_tree`: leaf commitments, their positions, and total count. Shared by web proofs and complete-opening normalization. |
-| Finalize endpoint extension | For each configured ordinal, nine public inputs after the retained 26-word prefix: deposit root, absolute deposit count, and withdrawal root. Total width is `26+9*C`. |
+| `WithdrawalInclusionAggregateCircuit` | Withdrawal inclusion publication circuit in `inclusion_aggregate.rs`. Its public-input width is `AGGREGATE_PI_LEN`, the sole owner registered below. Crypto domain `Domain::Aggregate`; its frozen label remains `Batch`. Do not rename that byte string. |
+| `RewardInclusionAggregateCircuit` | Reward inclusion publication circuit in `inclusion_aggregate.rs`. Its public-input width is the same `AGGREGATE_PI_LEN`. It verifies one `RewardSessionCircuit` proof per user. It is not the session circuit. |
+| Withdrawal root path | Private Poseidon path authenticating one opening withdrawal root. It is not serialized. |
+| Global deposit leaf root | Internal ordered Merkle root from `deposit_leaf_tree`: leaf commitments, their positions, and total count. Shared by web proofs and complete-opening normalization. |
+| Finalize endpoint extension | For each configured ordinal, public inputs after the retained prefix: deposit root, absolute deposit count, and withdrawal root. The prefix is not the full width. |
 | `endpointChainListHash` | Pure getter on the generated finalize verifier. It returns `keccak256("PsyBridge/FinalizeChainList/1" || uint16_big_endian(C) || ordered raw chain indices)`. |
 | `DigestBitsAdapter` | Source-pinned proof adapter exposing one `opening_digest` as 256 MSB-first bits. |
-| `EthereumRewardPayer` | Ethereum-only funded contract that consumes canonical reward keys and pays the configured fixed amount through its StateManager. |
-| `REWARD_PER_CLAIM` | Required positive immutable reward amount in the configured token's smallest units; no production value is inferred. |
-| `rewardNullifierDomain` | Stable network, bridge-user and Ethereum payer/token domain for reward consumption. |
-| Consumed reward key | Domain-bound claim checkpoint and full-root tagged-tree position; recipient changes cannot create another entitlement. |
-| Historical checkpoint Merkle proof | Claim that one checkpoint leaf at its checkpoint id is a member of the authenticated target checkpoint-tree root. Canonical name: `historical_merkle_proof`. Future adopted source filename: `historical_merkle_proof.rs`; not present, and logere is not already renamed to it. Same concept as `reward_inclusion`'s existing `claim_path`: `claim_checkpoint_path` binds the claim checkpoint leaf hash and claim checkpoint id under the end checkpoint root (`reward_inclusion.rs`). Not a state upgrade: `upgrade_checkpoint_historical_merkle_proof_gadget` (`HistoricalRootMerkleProofGadget` in `verify_guta_to_cap_upgrade_checkpoint.rs`) rewrites a header from `historical_root` to `current_root`. Distinct from the reward tag-tree path (`RewardTagTarget`) and from planner job-tree paths. No hash, public-input, user-counter, or state change. |
-| Nullifier tree | Circuit transition tree for one claim-replay key. Canonical names: `nullifier_tree`, `nullifier_key`. Adopted public inputs: `old_nullifier_root`, `new_nullifier_root`. Adopt `SPENT_TREE_HEIGHT` as `NULLIFIER_TREE_HEIGHT`; the historical branch name is explanatory only (`bridge-merkle-settlement.md` job-spent transition, height 63), and current source has neither constant. The L1 mapping is a distinct representation of the same claim-replay key domain: reward `spentRewards[keccak256(abi.encode(rewardNullifierDomain, claimCheckpointId, nullifierIndex))]` (`EthereumRewardPayer.sol`) and withdrawal `claimedNullifiers[nonce]` (`Bridge.sol`). Do not equate an index, a path, or a root with that mapping. Not `claimed_tree` or `claimed_key`. |
-| `checkpoint_tree_root` | Four-limb Poseidon checkpoint-tree root. Approved proposed user statement is exactly 34 fields: root `[0..4)`, `user_id[4]`, recipient `[5..13)` as eight little-endian u32 limbs, `total_amount[13..21)` as eight little-endian u32 limbs, `count[21]`, `jobs_commitment[22..26)`, `old_nullifier_root[26..30)`, `new_nullifier_root[30..34)`. This replaces only the user 19/27-field proposal; publication 28 and finalize `26+9*C` are distinct. Existing checkpoint-header upgrade names stay unchanged. |
-| `deposit_leaf_hash` | Private Poseidon `q_hash_many` of one `DepositLeaf` in `prove_bridge.rs`: `shield_address`, `token`, `l2_token_contract_id`, `amount`, `chain_index`, `note_commitment`, in that order. Replaces `deposit_custody_hash`. Not `DepositLeaf::leaf_commit` and not Solidity `_computeDepositLeafHash`. |
-| `append_deposit_leaf` | Private height-32 frontier update in `prove_bridge.rs`: writes the leaf into the frontier and returns the new Poseidon deposit-tree root. Replaces `append_custody_leaf`. Not guardian `append_leaf`, which stays. |
+| `EthereumRewardPayer` | Ethereum-only funded contract. Current `payRewards` consumes one boolean per job and pays immutable `REWARD_PER_CLAIM` (`EthereumRewardPayer.sol:52-95`). It is not the proposed one-session payer. |
+| `REWARD_PER_CLAIM` | Current positive immutable per-job amount in the configured token's smallest units. Not the proposed session sum `W`. No production value is inferred. |
+| `rewardNullifierDomain` | Current domain for the per-job `spentRewards` key: `keccak256(abi.encode(keccak256("PsyBridge/TwoArtifact/1/Reward"), uint256(1), networkMagic, uint32(524288), chainId, ethereumIndex, payer, rewardToken))`. |
+| Consumed reward key | Current L1 key `keccak256(abi.encode(rewardNullifierDomain, claimCheckpointId, nullifierIndex))`. One boolean per job. Not the proposed source-and-user key. |
+| Historical checkpoint Merkle proof | Claim that one checkpoint leaf at its checkpoint id is a member of the authenticated target checkpoint-tree root. Canonical name: `historical_merkle_proof`. Existing source is `historical_merkle_proof.rs`. Same membership concept as `reward_inclusion`'s `claim_path`: `claim_checkpoint_path` binds the claim checkpoint leaf hash and claim checkpoint id under the end checkpoint root. Not a state upgrade: `upgrade_checkpoint_historical_merkle_proof_gadget` (`HistoricalRootMerkleProofGadget`) rewrites a header from `historical_root` to `current_root`. Distinct from the reward tag-tree path. |
+| Session nullifier | Private temporary zero-to-one tree inside one reward session. Canonical names: `nullifier_tree`, `nullifier_key`. The key packs source, level, and index. The first own step starts empty; later own steps carry the private root through the verified predecessor's session state. It is not a publication input and is not L1 `spentRewards`. Not `claimed_tree` or `claimed_key`. |
+| `checkpoint_tree_root` | Poseidon checkpoint-tree root in `RewardSessionStatement`. That statement also carries `user_id`, `recipient`, `total_amount`, `count`, `jobs_commitment`, and the composite ledger endpoints `old_ledger_state_root` and `new_ledger_state_root`. Those endpoints are ledger state, not the private session root. Publication width and finalize width are distinct and are owned by their own registered names. Existing checkpoint-header upgrade names stay unchanged. |
+| `deposit_leaf_hash` | Private Poseidon `q_hash_many` of one `DepositLeaf` in `prove_bridge.rs`: `shield_address`, `token`, `l2_token_contract_id`, `amount`, `chain_index`, `note_commitment`, in that order. Distinct from `DepositLeaf::leaf_commit` and Solidity `_computeDepositLeafHash`. |
+| `append_deposit_leaf` | Private deposit-tree frontier update in `prove_bridge.rs`: writes the leaf into the frontier and returns the new Poseidon deposit-tree root. Distinct from guardian `append_leaf`. |
 | Deposit prefix | The per-chain `DepositLeaf` vector supplied to `build_deposit_spiderman_inputs`. Error text names a deposit prefix, deposit suffix, or deposit web, never custody. |
 | Proved deposit count | L1 `provedDepositCount` compared with the L2 deposit-tree next index. A proved count above that L2 count, or a new session whose two counts differ, is a deposit-count mismatch, not custody. The two greater-than failures use `proved deposit count exceeds L2 deposit count`; the equality failure uses `L2 deposit count differs from proved deposit count`. |
-| Reward circuit kind | One of exactly three proposed kinds: self-recursive user accumulator, reward inclusion aggregate, Groth16 wrapper. Kind count is not recursion depth; depth grows with jobs and benchmark-selected per-step capacity `k`. No distinct job/closing/four-signature/re-anchor circuit is added. |
-| `jobs_commitment` | Proposed user rolling Poseidon commitment `H(previous commitment || new jobs)` with domain/context/count/order encoding in Bridge Merkle Settlement. It is not a global transcript or terminal-user-summary root. |
-| `CumulativeRewardLeaf` | Proposed economic domain, u32 user id, uint256 `total_amount` in eight little-endian u32 limbs, 20-byte immutable recipient and initialized flag. Payout codec is 160 bytes under new cumulative domains, not the existing six-word `RewardLeaf` codec. |
-| `reward_accumulator_root` | Proposed checkpoint-authenticated earned-state root. Producer completeness establishes lifetime entitlement independently of L1 presented-job bits and delivered totals. Not currently a seventh source field. |
-| `paid_total` | Payer-owned delivered amount per economic domain/user; claim transfers only a positive cumulative delta and never changes earned authority. |
-| `InclusionAggregateHeader` | Proposed packed family-specific publication header, binding opening digest, claim root, capacity/count/segment context and configured withdrawal roots or reward nullifier endpoints. |
-| `InclusionAggregateRoot` | Proposed StateManager registry entry authenticated by publication; distinct from an accumulator leaf or payment record. |
-| `claim_tree_root` | Proposed marker-12 Keccak root over one segment's payout leaves and canonical padding. |
-| `Hash4Encoding` | Proposed explicit selector `CanonicalU64x4` or `LittleEndianU32x8`; no decoder fallback. Canonical limbs remain below Goldilocks modulus. Keccak big-endian u32 words are a different representation. |
-| `ActiveWindow` | Proposed per-destination retained manifest/progress state. Incomplete withdrawal or reward segments block the next window; root publication does not mark claims paid. |
-| Interleaved terminal-proof join | Unclosed relation proving every per-user terminal proof belongs to the selected global nullifier history. Independent valid forks and host sorting are insufficient. No wider user statement or summary root is adopted. |
-| `RewardAccumulatorLeaf` | Proposed checkpoint-owned leaf: u32 `user_id`, eight little-endian u32 `total_amount`, five little-endian u32 recipient limbs. No stored cumulative count, initialized flag, cursor or nullifier root. Recipient zero means unset. |
-| `RewardPosition` | Proposed transient producer contribution: relative level u8, relative index u32, owner user id u32, canonical Hash4 owner tag. Exact complete-list commitment is `positions_commitment`; not an L1 payout record. |
-| `positions_commitment` | Proposed authenticated commitment to a producer's complete ordered reward-position list. Separate from per-user rolling `jobs_commitment`. |
-| `set_recipient` | Proposed one-time authenticated L2 session method, not an existing precompile or claim-time signature. Proposed contract identifier7 remains unapproved and not globally collision-checked. |
+| Reward circuit kind | One of exactly three kinds: `RewardSessionCircuit`, `RewardInclusionAggregateCircuit`, and the Groth16 wrapper. Kind count is not recursion depth. Depth grows with included jobs and the per-step capacity `REWARD_SESSION_STEP_CAPACITY`. No debit, ticket, closing, or re-anchor circuit is added. |
+| Reward session | One proof chain for one `(economic_domain, source_checkpoint_id, user_id)`, proved by `RewardSessionCircuit`. Its terminal amount is `W`, the full sum of included jobs. Jobs omitted from it are forfeited. |
+| Reward ledger key | Two path limbs, user bits then source bits. Never one Goldilocks target. Economic domain is pinned tree context, not a limb. `RewardLedgerLeafTargets` writes the occupied leaf under `PsyRewardLedger/Issued/1` and never clears it. |
+| `jobs_commitment` | Session rolling Poseidon commitment. Its base is `reward_session_seed` over `PsyRewardJobs/Session/1`. `rolling_jobs_commitment` in `reward_session.rs` absorbs the step domain, the previous commitment, the counts, and each active job record. Inactive padding is excluded. Each included job contributes the configured per-claim amount; `RewardLeaf` has no amount field. |
+| `SourceCheckpointRewardLeaf` | Payout leaf: economic domain, source checkpoint id, user id, amount `W`, recipient, and initialized flag. Its commit is `source_checkpoint_reward_leaf_commit` under `PsyBridge/SourceCheckpointReward/1/Leaf`. Not the per-job `RewardLeaf` and not the reward-ledger occupancy leaf. |
+| Consumption key | Payout boolean, `keccak256(abi.encode(consumption_domain, economic_domain, uint256(source_checkpoint_id), uint256(user_id)))`. It does not replace reward-ledger occupancy. Distinct from the per-job `spentRewards` key. |
+| `InclusionAggregateHeader` | Packed family-specific publication header. It binds the opening digest, claim root, and capacity, count, and segment context. Reward hash slots are `old_ledger_state_root` and `new_ledger_state_root`, not a stored persistent job-nullifier cursor. |
+| `InclusionAggregateRoot` | StateManager registry entry authenticated by publication. Distinct from a payment record and from reward-ledger occupancy. |
+| `claim_tree_root` | Keccak root over one segment's payout leaves and canonical padding. |
+| `Hash4Encoding` | Explicit selector `CanonicalU64x4` or `LittleEndianU32x8`; no decoder fallback. Canonical limbs remain below the Goldilocks modulus. Keccak big-endian u32 words are a different representation. |
+| `ActiveWindow` | Per-destination retained manifest and progress state. Incomplete withdrawal or reward segments block the next window. Root publication does not mark claims paid. |
+| Interleaved acceptance gap | Unclosed connection from the private ledger targets to one selected publication history. Independent valid sessions and host sorting are insufficient. No wider user statement, balance, or persistent job root is adopted. |
+| `W` | Checked full sum of one reward session and the payout-leaf amount. Not a balance, debit, partial prefix, or per-job `REWARD_PER_CLAIM`. |
 
-Design contract: `docs/src/dev/bridge-merkle-settlement.md`; `bridge-proof-aggregation.md` is only an operational pointer. Existing-source terms above do not assert that proposed cumulative storage, 34-input user proofs, 28-input inclusion publication, or pull delivery are implemented. The interleaved terminal-proof join remains a design blocker. Runtime validation, setup generation and activation remain unexecuted for this proposal.
+Design contract: `docs/src/dev/bridge-merkle-settlement.md`; `bridge-proof-aggregation.md` is only an operational pointer. Reward-session, reward-ledger, and inclusion-publication names are the registered vocabulary below. The current payer remains per-job. Runtime validation, setup generation, and activation remain unexecuted.
+
+## Naming governance
+
+This section is the machinery for the `AGENTS.md` naming rules (18, 23, 24). It records dispositions and freeze state; it does not rename anything by itself.
+
+### Rule 18 dispositions
+
+| Occurrence | Class | Basis |
+|---|---|---|
+| `statement` in `reward_session.rs` (the per-step public-input statement and its accessors) | Genuine ZK statement | Rule 18 exempts a genuine ZK statement; the field roles are pinned by the `checkpoint_tree_root` entry above. |
+| `old_*` (`old_root`, `old_summary`, `old_state`, `old_session_root`, `old_user_root`) | State-transition qualifier | Rule 14 state qualifier; each pairs with the `new` endpoint of one transition. |
+| `old_ledger_state_root` / `new_ledger_state_root` | Registered ledger endpoints | Composite ledger-state endpoints. `nullifier` stays reserved for the session and tag trees. |
+| `to_canonical_biguint` | External API | Dependency-provided method. |
+| `tracing::info!` | External API | Log macro, not a symbol. |
+| `manifest` in four error strings: `empty withdrawal manifests carry no proof` (`aggregate_circuits.rs:95`, `inclusion_aggregate.rs:824`) and `empty reward manifests carry no proof` (`aggregate_circuits.rs:118`, `inclusion_aggregate.rs:488`) | Prose | Error text only. Each names an empty publication header that carries no proof. Not a registered publication type. |
+| `canonical_scalar` (`reward_session_witness.rs:123`) | Established external domain term | ECDSA canonical scalar form. The low flag requires low-S. Keep with this basis or rename in the same cutover that touches the file. |
+| `anyhow::Context` and `.context()` | External API | Dependency trait and method. Not the reward-ledger window. Do not rename these occurrences. |
+| `terminal` in auth and multisig-policy error strings | Prose | Error text only. It does not name a frozen cryptographic byte string. |
+| `canonical_scalar`, `canonical_bytes`, `read_canonical_hash4`, and `CanonicalU64x4` | Cryptographic encoding | Canonical field, scalar, or Hash4 encoding owned by this protocol. |
+| `from_canonical_*` and `to_canonical_*` | External API | Dependency field and integer conversion methods. Do not rename them. |
+| `statement` | Genuine ZK statement | The per-step public-input statement. Rule 18 exempts it. |
+| `manifest` in error strings | Prose | Error text only. It is not a registered publication type. |
+| `context` on a live external contract or generic JSON compatibility field | External API | Classify the occurrence as external. Do not rename it without an explicit mapping. |
+
+### Banned-substring sweep
+
+Run before review closes on a change and before any push, over exactly the files the change touches:
+
+```bash
+grep -inE 'context|entry|metadata|manifest|payload|blob|misc|legacy|deprecat|canonical|official|explicit|custody|persist|isolat|submission|envelope|admission' <changed files>
+grep -inE '\b(info|details|items)\b' <changed files>
+```
+
+Every hit is classified in the disposition table above or renamed; an unclassified hit blocks the review.
+
+### Frozen domain labels
+
+A label freezes when it first enters an executed test, a generated circuit artifact, or a deployment (AGENTS.md naming rule 24).
+
+| Label | Status |
+|---|---|
+| `PsyBridge/TwoArtifact/1/*` | Frozen by the shipped mainnet-beta verifier artifacts and the `BridgeOpening.sol` constants. |
+| `PsyRewardJobs/Session/1`, `PsyRewardSession/Summary/1`, `PsyRewardLedger/{State,Window,Verifier,Node,Empty,Issued,Proof}/1`, `PsyBridge/SourceCheckpointReward/1/Leaf` | Unfrozen. Source or authored tests may contain them; that presence is not execution. No executed test, generated artifact, or deployment was supplied for these labels. |
+| `PsyRewardAuthorization/CreditSession/1` | Frozen. Host-domain bytes were actually executed and remain protected. Do not rename that byte string. |
+
+### Module head words
+
+A public domain name starts with its owning module's head word, and two modules never share one (AGENTS.md naming rule 23). Registered head words: `reward` owns the bridge reward settlement with the user-authorized sub-module words `inclusion`, `session`, `ledger`, and `aggregate`; the existing `deposit`, `withdrawal`, and `checkpoint` families keep their established heads. A new concept registers its head word here at registration time.
+
+### Registered reward vocabulary (pending implementation)
+
+Final spellings registered before implementation per the registration gate; this file carries no former names. Grouped by sub-module; each name means exactly the following and nothing else.
+
+Session (`reward_session.rs`) - one proof chain per (economic domain, source checkpoint, user):
+
+| Name | Meaning |
+|---|---|
+| `RewardSessionCircuit` | Self-recursive step circuit that aggregates one session's jobs. |
+| `RewardSessionStatement` | The 34-field per-step public-input statement. |
+| `REWARD_SESSION_PROOF_FIELD_COUNT` / `REWARD_SESSION_STEP_CAPACITY` | Statement width and per-step job capacity. |
+| `RewardSessionProofFields` | Wire codec for one step proof's field set. |
+| `RewardSessionTargets`, `reward_session_seed`, `reward_session_summary` | Session targets and the two Poseidon preimages over `PsyRewardJobs/Session/1` and `PsyRewardSession/Summary/1`. |
+| `RewardSessionJobTargets` / `RewardSessionJobWitness` | One included job's circuit targets and host witness in `reward_session.rs`. |
+| `job_amount` | Amount contributed by one included job. Not the session sum `W`. |
+| `constrain_reward_session_step` | Circuit constraint for one session step in `reward_session.rs`. |
+| `set_reward_session_witness` | Witness setter for one session step in `reward_session.rs`. |
+| `SOURCE_CHECKPOINT_REWARD_OPENING_HEADER_BYTES` | Width of the source-checkpoint reward opening header in `bridge_aggregate.rs`. `inclusion_aggregate.rs` imports it to bound the opening preimage. Not a cryptographic domain string. |
+| `WITHDRAWAL_HEADER_BYTES` | Fixed prefix of one withdrawal `InclusionAggregateHeader` in `bridge_aggregate.rs`: family byte, config hash, window id, end checkpoint id, end checkpoint root, and the six segment counters, then `opening_digest` and `claim_tree_root`. Configured withdrawal roots follow this prefix. Not a cryptographic domain string. |
+| `RewardSessionAuthorization`, `REWARD_SESSION_AUTHORIZATION_DOMAIN` | Host-side authorization for one session. |
+| `is_final_step` | Flag marking the session's closing step, the only step that authenticates the claimant. |
+| `EndCheckpointTargets` | Authentication of the end checkpoint leaf, its historical path, and its global state roots. |
+| `AuthUserLeafTargets` | Registered user leaf, its height-32 membership path, and the `H(identity, param) == public_key` binding. |
+| `UserAuthTargets` | The complete claimant identity proof: scheme selector with compile-time fingerprints, registered leaf authentication, unified `public_key_param`, signature gadgets, and `auth_message`. |
+| `MultisigPolicyTargets` | Multisig scheme enrollment-policy machinery: contract 6 policy, slot and contract tree paths, two selected members. |
+| `AuthSignatureValues`, `auth_secp_signature`, `auth_message` | Canonical signature values, the secp gadget, and the signed message binding recipient, `W`, and identity. |
+| `MultisigPolicyValues` | Host values of the multisig enrollment-policy verification. |
+| `set_auth_signature` / `set_multisig_policy` | Witness setters for the auth signature and the multisig policy. |
+| `is_active_scheme` | Flag selecting the active identity scheme at the final step. |
+
+Ledger - the global once-only issuance state:
+
+| Name | Meaning |
+|---|---|
+| `RewardLedgerStateTargets` / `RewardLedgerStateValues` | Circuit targets and host values of the ledger state: `ledger_window_hash`, `ledger_root`, `user_root`, `session_count`, `unfinished_session_count`. |
+| `reward_ledger_window_hash` | Poseidon binding of config, economic domain, window, end checkpoint, tree root, start state, and verifier. |
+| `RewardLedgerWindowTargets` | The same window binding in circuit word form. |
+| `RewardLedgerWindowValues` | Host window values in `reward_ledger.rs`: `config_hash`, `economic_domain`, `window_id`, `end_checkpoint_id`, `end_checkpoint_root`, and `start_root`. The window hash also binds the verifier. The next window's `start_root` is the previous window's published and verified `new_ledger_state_root`. The first window of an economic domain starts at `origin_state_root()`. |
+| `origin_state_root()` | Function in `bridge_aggregate.rs`. One call returns the fixed protocol Poseidon hash of the origin state. `RewardSessionCircuit::new` calls it. The store does not call it and does not initialize the first window; that initialization is blocked on the configured economic domain. There is no lock. The origin state is the existing `RewardLedgerStateValues`: `ledger_window_hash` is the zero Hash4, `ledger_root` is the 64-level empty issued tree, `user_root` is the 32-level empty summary tree, and both counts are zero. The hash is not the zero Hash4. The old state root equals statement `[26..30)` on every step, so that hash already binds the opening. The first-window gap is initialization and publication of this start, not a second host pin. |
+| `ledger_window` | Wrapper field holding `RewardLedgerWindowTargets`. Not a second window type. |
+| `RewardLedgerLeafTargets` | One occupancy-leaf write at the reward ledger key under `PsyRewardLedger/Issued/1`. |
+| `RewardLedgerNodeUpdate` | One host-visible sparse user-tree write in `reward_ledger.rs`: `height`, `index`, and `hash`. Height 0 is the user-tree leaf. |
+| `RewardLedgerStep` | Public host step input in `reward_ledger.rs`: canonical proof bytes, `old_state`, `new_state`, source checkpoint, source leaf and path, `old_summary`, `session_root`, summary siblings, and `is_final_step`. Proof bytes are the only proof material. |
+| `RewardLedgerTransition` | Verified public host transition in `reward_ledger.rs`: canonical old and new ledger-state roots, `proof_id`, `transition_bytes`, and the user-tree node updates. `transition_bytes` encodes the public step, not the proof alone. |
+| `reward_ledger_proof_id` | `SHA-256(UTF8("PsyRewardLedger/Proof/1") \|\| complete user-verifier Hash4 as canonical little-endian u64 limbs \|\| canonical proof bytes)`. SHA-256, not Poseidon. The label is unfrozen. |
+| `verify_reward_ledger_step` | Host verifier of one `RewardLedgerStep` in `reward_ledger.rs`. `expected_old_root` is the store's locked trusted baseline, not a caller-selected root. It returns one `RewardLedgerTransition`. |
+| `old_ledger_state_root` / `new_ledger_state_root` | Composite ledger-state endpoints in `RewardSessionStatement` fields `[26..30)` and `[30..34)`. They are not publication public inputs. Publication is the 28-word `AGGREGATE_PI_LEN` schema: `[1,7,family,0]`, then `opening_digest`, `claim_tree_root`, and `header_digest`. Host roots use canonical little-endian Hash4 bytes. |
+| Origin state | `RewardLedgerStateValues` hashed by `origin_state_root()`: `ledger_window_hash` is the zero Hash4, `ledger_root` is the 64-level Poseidon two-to-one issued tree from the zero Hash4, `user_root` is the 32-level summary tree from `PsyRewardLedger/Empty/1`, and both counts are zero. A later window keeps its previous opening and resets only its working user root and working counts. |
+| Reward ledger key | Two u32 path limbs, user bits then source bits. |
+| `PsyRewardLedger/State/1` | Poseidon state preimage in `reward_ledger.rs`: domain, then `ledger_window_hash`, `ledger_root`, and `user_root` as canonical little-endian Hash4, then `session_count` and `unfinished_session_count` as little-endian u32. Unfrozen. |
+| `PsyRewardLedger/Window/1` | Poseidon window preimage in `reward_ledger.rs`: domain, `config_hash`, `economic_domain`, `window_id`, little-endian `end_checkpoint_id`, then `end_checkpoint_root`, `start_root`, and verifier hash as canonical little-endian Hash4. Unfrozen. |
+| `PsyRewardLedger/Verifier/1` | Poseidon verifier preimage in `reward_ledger.rs`: domain, `circuit_digest` as canonical little-endian Hash4, little-endian cap length, then each cap hash as canonical little-endian Hash4. Unfrozen. |
+| `PsyRewardLedger/Node/1` | Poseidon node preimage in `reward_ledger.rs`: domain, height byte, then left and right hashes as canonical little-endian Hash4. Unfrozen. |
+| `PsyRewardLedger/Empty/1` | Poseidon of the domain bytes alone. It is the empty summary. The empty user root repeats the node preimage above it. Unfrozen. |
+| `PsyRewardLedger/Proof/1` | SHA-256 proof-id domain. Its preimage is the `reward_ledger_proof_id` entry. Not a Poseidon label. Unfrozen. |
+
+Aggregate - the family-7 batch publication consumer:
+
+| Name | Meaning |
+|---|---|
+| `AGGREGATE_PI_LEN` | Sole owner of the 28-word publication width. |
+| `aggregate_segment` | Segment arithmetic gadget for one aggregate. |
+| `InclusionAggregateProof` / `prove_inclusion_aggregate` | Shared adapter proof and its constructor. |
+| `RewardLedgerFinalProof`, `final_proof`, `final_state`, `ledger_final_user_root` | The window's closing ledger state, its proof, and its user tree root. |
+| `reward_inclusion`, `reward_session`, `reward_aggregate` | Aggregate manager fields, one per sub-module. |
+| `RewardPayoutSlot` | One payout slot in `RewardInclusionAggregateCircuit`: session proof, ledger state, source checkpoint, and payout leaf. |
+| `constrain_reward_payout` | Circuit constraint for one `RewardPayoutSlot` in `inclusion_aggregate.rs`. |
+
+Payout leaf and registry:
+
+| Name | Meaning |
+|---|---|
+| `source_checkpoint_reward_leaf_commit` | Keccak commit of one payout leaf under `PsyBridge/SourceCheckpointReward/1/Leaf`. |
+| `SourceCheckpointRewardOpening.leaves` | The opening's payout leaves. |
+| `CircuitSetRegistration`, `circuit_set_registration`, `build_registrations`, `validate_registrations`, `registrations` | One registered circuit triplet and its registry operations. |
+
+Domain strings: `PsyRewardJobs/Session/1`, `PsyRewardSession/Summary/1`, `PsyRewardLedger/{State,Window,Verifier,Node,Empty,Issued,Proof}/1`, `PsyBridge/SourceCheckpointReward/1/Leaf`.

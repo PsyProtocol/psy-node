@@ -1,6 +1,6 @@
 # Bridge Merkle Settlement
 
-> Date: 2026-10-05. Status: **Review — blocked on the interleaved terminal-proof join; not implementation-ready**. Documentation-only protocol proposal. User-approved amount representation is uint256 in eight u32 limbs, exactly 34 public inputs. Required topology is three circuit kinds with data-dependent self-recursive user depth. No source, measurement, activation or independent approval is claimed.
+> Date: 2026-10-06. Status: **Normative one-session credit contract — not implementation-ready and not activated**. `RewardSessionStatement` is the session public-input statement. One credit and one full payment exist per `(economic_domain, source_checkpoint_id, user_id)`. A reward session is local to that triple: its job nullifier is temporary across that session's steps and is not a persistent per-job bitmap. There is no balance carry, debit, ticket registry, seventh checkpoint root, or global persistent job-nullifier root. `RewardSessionCircuit` in `reward_session.rs` is the exported session constructor. No measurement, activation, migration, or independent approval is claimed.
 
 ## Terminology and Abbreviations
 
@@ -24,26 +24,26 @@
 | `header_digest` | Hash of the packed publication header under its separate domain. |
 | `claim_tree_root` | Keccak payout-membership root of one inclusion segment. |
 | `historical_merkle_proof` | Checkpoint-leaf membership under the selected checkpoint-tree root; not a checkpoint-header upgrade. |
-| `nullifier_key` | Immutable reward-job birth coordinate. |
-| `reward_accumulator_root` | Proposed checkpoint-authenticated earned-state root; not an existing global-state field. |
-| User proving session | Existing authenticated L2 account session; UPS in existing source identifiers. |
-| `k` | Benchmark-selected maximum real jobs per same-kind user step; not a lifetime cap. |
-| `paid_total` | L1 delivered amount per economic domain and user; not earned-state authority. |
+| `nullifier_key` | Private session-local birth coordinate of one included job. Not a public input and not an L1 consumption key. |
+| Reward session | One proof chain for one `(economic_domain, source_checkpoint_id, user_id)`, proved by `RewardSessionCircuit`. Its job root is private and is committed through the session state carried by the verified predecessor. |
+| `k` | Benchmark-selected maximum real jobs per same-kind user step; not a cap on how many source checkpoints a user may credit over time. |
+| `W` | The session's checked full sum. It is the payout leaf amount. It is not a partial prefix, a balance, or a debit. |
+| Omitted job | A job born at the credited source and owned by the user that this session does not include. The user accepts that omission; it is forfeited and cannot be credited later. |
 
 ## Abstract
 
-Users accumulate jobs through one self-recursive user circuit kind; a separate reward inclusion aggregate verifies one terminal proof per user; the aggregator publishes its Groth16 wrapper. These are exactly three circuit kinds, not a fixed proof depth. Withdrawal remains a separate pipeline. L1 claims use a leaf and Keccak path, with neither user Groth16 nor signatures. Checkpoint-authenticated earned state establishes lifetime amounts; rolling job commitments and nullifier transitions authenticate presented jobs. One binding gap remains: independently valid terminal user proofs are not yet proven to belong to the same interleaved global nullifier history. This draft states that gap explicitly and does not authorize payable publication until it is closed and independently reviewed.
+One user proof credits exactly one `(economic_domain, source_checkpoint_id, user_id)` session. Its checked amount `W` and count are the full sum and count of the jobs the user chose to include. Jobs omitted from that session are forfeited. `RewardInclusionAggregateCircuit` verifies one final `RewardSessionCircuit` proof per user, and its Groth16 wrapper publishes the payout root. These are exactly three circuit kinds, not a fixed proof depth. `WithdrawalInclusionAggregateCircuit` remains a separate pipeline. The payout leaf uses a Keccak path, with neither user Groth16 nor signatures. The session nullifier prevents the same included job from being summed twice inside that session. It is discarded with the session and is not a second payment ledger. The existing deployed payer remains the per-job payer until the source-user key replaces it.
 
 ## Motivation
 
-The current `StateManager.applyBridgeWindow` verifies then iterates complete withdrawal/reward openings (`psy-contracts/src/StateManager.sol:205-253`); `EthereumRewardPayer.payRewards` pays one fixed reward per job (`psy-contracts/src/EthereumRewardPayer.sol:52-95`). The current inclusion constructor has 1024 slots and a 12-input statement (`psy_plonky2_circuits/src/bridge/circuits/inclusion_aggregate.rs:15,73,262-325`). A 100,000-user publication therefore requires segmentation and pull delivery rather than a larger on-chain payout loop. Current checkpoint global roots have six fields and a 192-byte encoding (`psy_data/src/v1/qdata/checkpoint.rs:320-327,362-370`); the earned-state extension below is a protocol proposal, not a discovered seventh field.
+The current `StateManager.applyBridgeWindow` verifies then iterates complete withdrawal/reward openings (`psy-contracts/src/StateManager.sol:205-253`). `EthereumRewardPayer.payRewards` pays `REWARD_PER_CLAIM` once per `RewardLeaf` and consumes `spentRewards[keccak256(abi.encode(rewardNullifierDomain, claimCheckpointId, nullifierIndex))]` (`psy-contracts/src/EthereumRewardPayer.sol:46-95`). That is a persistent per-job key, not one key per source and user. Inclusion publication is `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit`, both registering `AGGREGATE_PI_LEN` (`inclusion_aggregate.rs`). A large publication therefore requires segmentation and pull delivery rather than a larger on-chain payout loop. `PQEDCheckpointGlobalStateRoots` stays six roots.
 
 ## Table of Contents
 
 - [Specification](#specification)
   - [1. Scope and flow](#1-scope-and-flow)
   - [2. Proof topology and public inputs](#2-proof-topology-and-public-inputs)
-  - [3. Checkpoint-authenticated reward relation](#3-checkpoint-authenticated-reward-relation)
+  - [3. One-session credit relation](#3-one-session-credit-relation)
   - [4. Canonical encoding and claim trees](#4-canonical-encoding-and-claim-trees)
   - [5. Finalize and deposit authentication](#5-finalize-and-deposit-authentication)
   - [6. Publication and delivery](#6-publication-and-delivery)
@@ -55,7 +55,6 @@ The current `StateManager.applyBridgeWindow` verifies then iterates complete wit
 - [Module Changes](#module-changes)
 - [File Changes](#file-changes)
 - [Naming Crosswalk](#naming-crosswalk)
-- [Prior Document Content Disposition](#prior-document-content-disposition)
 - [Rationale](#rationale)
 - [Security Considerations](#security-considerations)
 - [Review and Activation Boundary](#review-and-activation-boundary)
@@ -79,7 +78,7 @@ sequenceDiagram
     Manager->>Manager: 6. Verify all evidence and atomically save roots
     User->>Payer: 7. RPC claimReward with leaf and Keccak path
     Payer->>Manager: 8. Read published claim_tree_root
-    Payer-->>User: 9. Transfer positive cumulative delta to bound recipient
+    Payer-->>User: 9. Transfer the leaf amount once for that source and user
 ```
 
 ```text
@@ -92,68 +91,112 @@ claim:      leaf + Keccak siblings -> published root -> replay/accounting checks
 
 The user owns user proving. The aggregator verifies, aggregates and wraps; it does not generate user proofs. Guardian signing policy belongs exclusively to `bridge-relayer-multisig.md` and is unchanged. User L1 claims never call a verifier or accept signatures. Publication is proposer-only and requires Groth16 evidence.
 
-Withdrawal preserves nonce replay, pending delay, threshold, lifetime limits, pause and force-claim behavior. Pull registration starts the delay when the pull is registered, not when its root is published; this timing change is explicit and requires product approval before deployment. Reward funding is checked at pull time, with no publication-time reserve of all future deltas. Insufficient funding reverts only that claim and leaves it claimable. Neither policy is presented as behavior-preserving.
+Withdrawal preserves nonce replay, pending delay, threshold, lifetime limits, pause and force-claim behavior. Pull registration starts the delay when the pull is registered, not when its root is published; this timing change is explicit and requires product approval before deployment. Reward funding is checked at pull time, with no publication-time reserve of future source-checkpoint claims. Insufficient funding reverts only that claim and leaves it claimable. Neither policy is presented as behavior-preserving.
 
 ### 2. Proof topology and public inputs
 
-**Required topology: exactly three circuit kinds.** Kind one is the self-recursive user accumulator, kind two is reward inclusion aggregation of one terminal proof per user, and kind three is its Groth16 wrapper. A user step directly constrains at most compiled `k` new jobs, checkpoint membership, job sum, accumulator membership, recipient binding and nullifier updates. It recursively verifies the same-kind own-user predecessor and, when users interleave, the same-kind global predecessor. Depth is data-dependent, `ceil(job_count/k)` user steps; it is not three layers. `k` remains a benchmark-selected circuit capacity, not a lifetime/job/checkpoint limit or an extra circuit kind. No distinct per-job tree, closing circuit, four signature circuits or re-anchor circuit is introduced. Eight distinct circuit kinds and a flat unbounded monolithic circuit are rejected. The exact three-kind count is fixed; the quantitative `k` selection remains OPEN until authorized measurements.
+**Required topology: exactly three circuit kinds.** Kind one is the self-recursive credit session, kind two is reward inclusion aggregation of one terminal proof per user, and kind three is its Groth16 wrapper. A user step directly constrains at most compiled `k` newly included jobs, source membership, the checked sum of those jobs, recipient binding, the rolling jobs commitment, and that session's nullifier transition. It recursively verifies the same-kind own-user predecessor and, when users interleave, the same-kind global predecessor. Depth is data-dependent, `ceil(included_job_count/k)` user steps; it is not three layers. `k` remains a benchmark-selected circuit capacity, not a lifetime, job, or checkpoint limit and not an extra circuit kind. No distinct per-job circuit, closing circuit, four signature circuits, balance circuit, debit circuit, or ticket registry is added.
 
 Withdrawal construction and reward construction have distinct constructors, witnesses, circuits, setup identities and runtime paths. Shared pure canonical tree/encoding helpers are allowed only for identical semantics. The rejected alternative is one family-generic circuit whose runtime selector merges withdrawal and reward relations: it weakens ownership, couples fingerprints and leaves family-specific constraints implicit. A common publication envelope does not merge the proof pipelines.
 
 #### User statement: exactly 34 fields
 
-| Offset | Field | Constraint and interpretation |
+| Offset | Field | Role in this reward session |
 |---|---|---|
-| `[0..4)` | `checkpoint_tree_root` | Four canonical Felt limbs in hash order. |
-| `[4]` | `user_id` | u32. |
-| `[5..13)` | `recipient` | Eight u32 limbs, least-significant limb first; limbs 5, 6 and 7 zero; low five form a nonzero 160-bit address distinct from payer. |
-| `[13..21)` | `total_amount` | Eight u32 limbs, least-significant limb first; full uint256 partial/terminal cumulative amount with checked recursive carry. |
-| `[21]` | `count` | u32 accumulated jobs in this proof chain; checked recursive addition. No stored lifetime count. The finite statement range is not represented as an unbounded integer. |
-| `[22..26)` | `jobs_commitment` | Four canonical Felt limbs of rolling `H(previous commitment || new jobs)`; exact encoding below. |
-| `[26..30)` | `old_nullifier_root` | Four canonical Felt limbs. |
-| `[30..34)` | `new_nullifier_root` | Four canonical Felt limbs. |
+| `[0..4)` | `checkpoint_tree_root` | Publication-end checkpoint-tree root. Four canonical Felt limbs in hash order. It authenticates the source checkpoint. It is not a free hash and not a seventh earned-state root. |
+| `[4]` | `user_id` | u32 identity of the one user credited by this session. |
+| `[5..13)` | `recipient` | Eight u32 limbs, least-significant limb first. Limbs 5, 6, and 7 are zero. The low five are the 160-bit recipient. The payout address is those five big-endian words in reverse limb order: limb 4, then 3, then 2, then 1, then 0. |
+| `[13..21)` | `total_amount` | Eight u32 limbs, least-significant limb first. Checked running sum of jobs included in this session, starting at zero. The terminal value is `W`, the full payout amount. Not a balance, a debit, a lifetime total, or a delta from another source. |
+| `[21]` | `count` | u32 count of jobs included in this session, starting at zero. Checked recursive addition. The finite statement range is not an unbounded integer. |
+| `[22..26)` | `jobs_commitment` | Four canonical Felt limbs. The base is the session seed. Each step rolls the linear Poseidon sponge specified below. |
+| `[26..30)` | `old_ledger_state_root` | Four canonical Felt limbs of the previous composite ledger-state root in `RewardSessionStatement`. The composite is the ledger window, ledger root, user root, session count, and unfinished session count. It is not the private session root. This slot equals the old state root on every step. The first step of a window binds it to that window's `start_root`. The first economic-domain window uses `origin_state_root()`. A later window uses the previous window's published `new_ledger_state_root`. This slot is not a publication public input. |
+| `[30..34)` | `new_ledger_state_root` | Four canonical Felt limbs of the next composite ledger-state root in `RewardSessionStatement`. A later global predecessor's `[30..34)` equals this step's `[26..30)`. This slot is not a publication public input. |
 
-All integer ranges are constrained in the circuit, not merely decoded natively. Addition uses eight u32 limbs with checked carries and final carry zero; overflow rejects. No Felt reduction, lifetime cap, or one-Felt amount remains. For amount `2^32+7`, limbs are `[7,1,0,0,0,0,0,0]`. This adopts 34 fields only for the user statement; it does not globally replace occurrences of 27 or alter the unrelated 28-input publication, current 28-input per-job source, 32-input withdrawal child, or finalize layout.
+The fields are one `RewardSessionStatement`. They do not also carry a balance, a debit amount, or a ticket count. Credit amount and payment amount are the same terminal `W`; no second amount slot reuses these offsets. All integer ranges are constrained by the session relation, not merely decoded natively. Addition uses eight u32 limbs with checked carries and final carry zero; overflow rejects. No Felt reduction or one-Felt amount remains. For amount `2^32+7`, limbs are `[7,1,0,0,0,0,0,0]`. This statement does not alter `AGGREGATE_PI_LEN`, the per-job source, the withdrawal child, or the finalize layout.
 
 #### Publication, deposit and finalize statements
 
-The proposed inclusion publication has 28 fields: `[1,7,family,0]`, then `opening_digest[8]`, `claim_tree_root[8]`, `header_digest[8]`, each digest split into eight big-endian u32 words. Family 2 is withdrawal; family 3 is reward. The wrapper emits 768 most-significant-bit-first bits, packed in order as six uint128 values: high then low half of each digest. User 34 fields are recursively verified inside reward inclusion, not passed to the L1 verifier.
+Inclusion publication has `AGGREGATE_PI_LEN` fields: `[1,7,family,0]`, then `opening_digest`, `claim_tree_root`, and `header_digest`, each digest split into eight big-endian u32 words. Family 2 is withdrawal; family 3 is reward. The wrapper emits 768 most-significant-bit-first bits, packed in order as six uint128 values: high then low half of each digest. The session statement is recursively verified inside `RewardInclusionAggregateCircuit`, not passed to the L1 verifier.
 
-Deposit keeps prefix `[1,11,1,0]`, 12 inputs, 256 wrapper bits and two uint128 halves. Finalize retains `26+9*C` inputs and its separate wrapper. Its retained 26-word prefix is not its full width. The current inclusion source still registers 12 inputs (`inclusion_aggregate.rs:321-325`); 28 is the proposed replacement.
+Deposit keeps prefix `[1,11,1,0]`, its own input width, 256 wrapper bits, and two uint128 halves. Finalize retains `26+9*C` inputs and its separate wrapper. Its retained 26-word prefix is not its full width. `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit` both register `AGGREGATE_PI_LEN` before build (`inclusion_aggregate.rs`).
 
 `B` is exactly one of 1024, 2048, 4096 and 8192; initial compiled capacity is 1024. Count range uses `log2(B)+1` bits. The pure tree helper supports powers of two from 1 through 131072, including empty sibling paths at capacity 1; production circuits remain limited to the four listed capacities. A helper's larger range does not authorize another production setup.
 
-### 3. Checkpoint-authenticated reward relation
+`verify_reward_ledger_step` (`reward_ledger.rs`) checks one `RewardLedgerStep` against `expected_old_root`. That argument is the store's locked trusted baseline, not a caller-selected root. Section 6 states the window baseline. `reward_ledger_proof_id` is `SHA-256(UTF8("PsyRewardLedger/Proof/1") || complete user-verifier Hash4 as canonical little-endian u64 limbs || canonical proof bytes)`. It is not a Poseidon hash. The label is unfrozen. The ordinary old-state hash already binds the opening, including the origin state. The remaining gap is first-window initialization and publication of `origin_state_root()`, not another host check.
 
-The authoritative earned-state relation, concrete witness definitions and producer completeness rules are specified in the reward relation subsection of Data Structures. Both old and new cumulative states are authenticated under checkpoint leaves, and the same user proof binds their difference to its exact job records. An asserted amount, a public root without a membership proof, or L1 `paid_total` cannot replace this relation. The accumulator is earned authority; the nullifier tree records presentation of jobs and is not an alternate earned ledger.
+### 3. One-session credit relation
 
-#### Immutable birth identity and membership
+One credit proving session belongs to exactly one `(economic_domain, source_checkpoint_id, user_id)`. Its base is amount zero, count zero, and the session seed. Each included job adds its authenticated amount and one to the count. The terminal amount is `W`, and the terminal count is the number of included jobs. The payout leaf amount equals that same `W`. There is no earlier balance, no debit, no ticket, and no residual amount. A job omitted from the session is forfeited: the user accepted that omission, and no later session for the same triple can include it.
+
+The session root is private. It starts at the canonical empty root on the first own step. Every later own step carries it inside `reward_session_summary` under `PsyRewardSession/Summary/1`, not in public PI `[26..34)`. It is never reset inside the session and never stored as a global per-job bitmap. The public roots are the composite ledger-state roots. Closing the session does not preserve the private job bits. Replay of the credit is the reward-ledger occupancy leaf plus the separate payout boolean, not either public root.
+
+#### Session-local job identity
 
 ```text
-birth_checkpoint_id = claim_checkpoint_id       u32
-level = height                                 2..=21
-index = path_index                             0 <= index < 2^(level-2)
-nullifier_index = (1 << level) - 1 + index       u32, checked
-nullifier_key = (birth_checkpoint_id << 31) | (level << 26) | index
+source        = source_checkpoint_id                 u32
+level         = height                               2..=21
+index         = path_index                           0 <= index < 2^(level-2)
+nullifier_key = (source << 31) | (level << 26) | index
 ```
 
-Bits 0..25 hold index, 26..30 level, and 31..62 birth checkpoint; bit 63 is zero. Equal keys name the same job regardless of recipient or anchor. Distinct owners or amounts for an equal key reject. These position rules preserve current source semantics (`client_prover/psy_core/psy_data/src/bridge_aggregate.rs:202-209`; `psy_plonky2_circuits/src/bridge/circuits/reward_inclusion.rs:57-92`).
+Bits 0..25 hold index, 26..30 level, and 31..62 source; bit 63 is zero. The source is fixed by the session, so equal keys name the same job coordinate inside that session. `RewardSessionCircuit` uses this key as the index of a private zero-to-one transition (`reward_session.rs`). The old leaf value is the zero hash and the new leaf value is `[1,0,0,0]`. An inactive slot does not update the private root and contributes zero. A repeated key in the session rejects. This private root is not PI `[26..34)` and is not the L1 `spentRewards` key.
 
-A historical checkpoint witness contains its checkpoint id, complete checkpoint leaf and exactly 32 Poseidon siblings. For each least-significant-first index bit, bit zero hashes `(state,sibling)` and bit one hashes `(sibling,state)`. The final root equals PI `[0..4)`. Birth id cannot exceed the authenticated end id. A checkpoint leaf hash is the existing Poseidon global-root/stats hash construction; the full stats must open, including `pm_rewards_commitment.gutas_root`. The source relation is `reward_inclusion.rs:142-153`, not `HistoricalRootMerkleProofGadget` or a header upgrade.
+Current per-job position checks remain the source of the level and index bounds (`psy_plonky2_circuits/src/bridge/circuits/reward_inclusion.rs:57-92`). A historical source witness contains the source id, the complete source checkpoint leaf, and exactly 32 Poseidon siblings. For each least-significant-first index bit, bit zero hashes `(state,sibling)` and bit one hashes `(sibling,state)`. The resulting root equals PI `[0..4)`. The source id cannot exceed the publication end id. The checkpoint leaf hash is the existing Poseidon global-root/stats hash, and the stats open `pm_rewards_commitment.gutas_root`. This is historical membership, not `HistoricalRootMerkleProofGadget` and not a header upgrade.
 
-The user circuit directly constrains the existing tagged-tree relation: nonzero tag preimage, first element equals user id, leaf tag equals Poseidon of the preimage with itself, nonzero leaf tag, authenticated tagged-tree root equals the birth checkpoint's `gutas_root`. The tagged-tree loop and its left/right order are those at `reward_inclusion.rs:83-109`; inactive path levels are zero. A user-account path is not a substitute for this reward-tree membership.
+Each active job opens the existing tagged-tree relation under that source's `gutas_root`: nonzero tag preimage, first element equal to `user_id`, leaf tag equal to Poseidon of the preimage with itself, and nonzero leaf tag. The tagged-tree order is the order at `reward_inclusion.rs:83-109`. A user-account path is not a substitute. `RewardLeaf` has no amount field (`bridge_aggregate.rs:207-208`). The amount added to `W` is exactly the configured `reward_per_claim`, reversed into eight little-endian u32 limbs (`reward_session.rs`). It is not read from the job leaf. A job born at another source or owned by another user rejects. The recipient is the session recipient, not a per-job amount witness. The recipient must differ from the configured payer.
 
-For each real new job, open bit zero under the current global root with exactly 63 siblings and close bit one with the same siblings. A step's root starts at PI `[26..30)` and ends at `[30..34)`. Duplicate/stale keys reject. No birth record or stored bytes are deleted. An interleaved step connects its old root to the verified global predecessor's new root, not to a nonadjacent own-user root. Own-user predecessor separately carries amount/count/jobs commitment and immutable identity. A zero-job base has equal roots and the canonical seed commitment; it is not a publishable reward leaf. New published user claims require positive count. These local constraints alone do not solve terminal membership in one chosen global chain; see the blocking relation below.
+#### Session seed and rolling commitment
+
+`H(bytes)` is PoseidonHashMany of one canonical field per byte. `reward_session_seed` is `H(UTF8("PsyRewardJobs/Session/1") || economic_domain[32] || LE32(source) || LE32(user_id) || five LE32 recipient limbs || checkpoint_tree_root as four LE64 || source checkpoint leaf hash as four LE64)` (`reward_session.rs`). The base jobs commitment equals this seed. The older checkpoint-seed and O/N leaf-pair preimages are rejected.
+
+`rolling_jobs_commitment` (`reward_session.rs`) has byte prefix `UTF8("PsyRewardJobs/Step/1") || previous commitment as four LE64 || LE32(previous_count) || LE32(step_count) || LE32(new_count)`. Each active job appends one record: source, level, index, nullifier index, owner, eight amount limbs, owner tag, and the activity bytes. Record integers are little-endian. Inactive records are excluded by the activity selector; their padding bytes do not enter the sponge. The hash is a linear Poseidon sponge: bytes are absorbed in chunks, an inactive chunk retains the previous permutation state, and the first four state elements are the commitment.
+
+Own-user recursion carries the same user, recipient, end root, source, and seed. Current amount is the previous amount plus this step's included sum, and current count is the previous count plus this step's included count. Both start at zero. The private session root is authenticated by the predecessor summary below. The public ledger root uses the origin relation below (`reward_session.rs`).
+
+`first_global` is `!has_global`: the first step of this window, not the first window of the economic domain. The old state root equals statement `[26..30)` on every step, so the ordinary state hash binds the opening. The first step of a window binds that slot to the trusted `start_root`. The first economic-domain `start_root` is `origin_state_root()`, the fixed protocol Poseidon hash of the origin state in `bridge_aggregate.rs`. `RewardSessionCircuit::new` calls it. The store must call it when it initializes the first window. It does not call it now, and that initialization is blocked on the configured economic domain. There is no lock. That state uses the existing `RewardLedgerStateValues` fields. `ledger_window_hash` is the zero Hash4. `ledger_root` is 64 levels of Poseidon two-to-one starting from the zero Hash4. `user_root` is the existing 32-level summary tree from `PsyRewardLedger/Empty/1`. Both counts are zero. The hash is not the zero Hash4. A later window does not replace its old opening with the origin state. Its first step resets the working user root and both working counts, then applies the ordinary open and close increments. It does not mutate the previous window's retained opening.
+
+#### Session summary
+
+`reward_session_summary` (`reward_session.rs`) hashes `UTF8("PsyRewardSession/Summary/1") || canonical LE64 of each PI [0..30) || seed as four LE64 || private session root as four LE64 || final-step as one byte`. Each of the public fields is split into low and high u32 values. A high half equal to `u32::MAX` requires its low half to be zero, so the field remains a canonical u64. The first own step connects the private session root to the canonical empty root. A later own step recomputes the predecessor summary with the final-step byte clear and the predecessor's private root, then requires that summary to equal the retained prior summary. A step therefore cannot reset the private root.
+
+#### One closed credit
+
+The terminal statement is publishable only when count is positive, `W` is positive, and the recipient is nonzero. Its payout leaf carries that exact `W`, the same user, the same source, and the same recipient. A partial prefix cannot initialize the occupied credit leaf. There is no balance leaf, no debit proof, and no ticket publication.
+
+#### Global one-credit occupancy
+
+One credit exists for one `(economic_domain, source_checkpoint_id, user_id)`. The economic domain is pinned in the credit-tree context and is not a key limb. The key is a 64-bit string of two u32 limbs, never one Goldilocks target:
+
+```text
+path bits 0..32  = user_id, least-significant bit first
+path bits 32..64 = source_checkpoint_id, least-significant bit first
+```
+
+These are the 64 least-significant Merkle path bits: user, then source. Source fits in a u32. Packing `(source<<32)|user` into one field element is rejected. Some of those u64 values are at least the Goldilocks modulus `p=18446744069414584321`, so they are not distinct canonical field elements. This key adds no public input. The 34-field width stays unchanged.
+
+The canonical empty leaf is the zero Hash4. The occupied value is nonzero and is `PsyRewardLedger/Issued/1`:
+
+```text
+H(economic_domain[32] || LE32(source) || LE32(user) || eight LE32 amount limbs || five LE32 recipient limbs || jobs_commitment as four LE64 || window hash as four LE64)
+```
+
+`RewardLedgerLeafTargets` (`reward_session.rs`) splits the key into user bits 0..32 and then source bits 32..64. It computes the root of the zero leaf and the root of the occupied value over the same siblings. A final step requires the zero-leaf root to equal the current ledger root and selects the occupied root. A nonfinal step leaves the current root unchanged. The occupied hash is constrained nonzero. Payment, a later window, or a spent payout boolean never clears that leaf. A second final step for the same triple therefore finds the occupied leaf and rejects.
+
+The payout consumption boolean is a separate record. It cannot replace this occupancy proof. The current payer's per-job `spentRewards` key cannot replace it either. These targets are present in `RewardSessionCircuit`. They do not by themselves make the current L1 payer consume this key.
+
+#### What the session statement does not close
+
+Statement fields `[26..30)` and `[30..34)` are the composite ledger-state endpoints of `RewardSessionStatement`: ledger window, ledger root, user root, session count, and unfinished session count (`reward_session.rs`). They are not publication public inputs. Publication is the 28-word schema in `inclusion_aggregate.rs`: prefix `[1,7,family,0]`, then `opening_digest`, `claim_tree_root`, and `header_digest`, each digest as eight big-endian u32 words (`AGGREGATE_PI_LEN`). The statement endpoints are not the private session root and contain no global per-job bitmap. The private session root is carried only by `reward_session_summary`. Statement `[26..30)` equals the old state root on every step. The first step of a window binds it to `start_root`, which is `origin_state_root()` for the first economic-domain window. A later step inside one window binds it to the predecessor's statement `[30..34)`. Statement `[30..34)` is the ordinary hash of the next opening. `RewardSessionCircuit` registers its 34 statement fields. The publication consumer is `RewardInclusionAggregateCircuit`, and the connection from every selected terminal to one publication history remains the interleaved admission gap. That gap does not add a public input, a per-job bitmap, or a payout-boolean substitute.
 
 ### 4. Canonical encoding and claim trees
 
 Existing labels retain the exact prefix `PsyBridge/TwoArtifact/1/` and suffixes `Config`, `CircuitSet`, `A`, `Batch`, `Record`, `Leaf`, `Node`, `Empty`, `Window`, `Reward`, `WithdrawalNonce`, `WithdrawalBatch`, and `RewardBatch` (`bridge_aggregate.rs:58-68`). Renaming source types does not rename these bytes. `word(x)` is one 32-byte unsigned big-endian word; upper padding must be zero. Existing word-encoded Hash4 is four such words, each containing a canonical u64 Felt.
 
-Withdrawal opening is the existing ordered context, configured root vector and six-word records: `288+128*C+192*N` bytes. Existing per-job reward opening is `256+192*N` bytes and remains a historical/current codec only. Source computes its flat digest as domain plus encoded opening (`inclusion_aggregate.rs:310-321`); the former document's nested reward `batchRoot` digest is not retained as a competing rule. Deposit's distinct projected `A` preimage remains unchanged.
+Withdrawal opening is the existing ordered context, configured root vector and six-word records: `288+128*C+192*N` bytes. Existing per-job reward opening is `256+192*N` bytes. Its digest is the family domain plus the encoded opening (`inclusion_aggregate.rs:310-321`). A nested reward `batchRoot` digest is not a competing rule. Deposit's distinct projected `A` preimage remains unchanged.
 
-The proposed cumulative reward protocol uses new domains `keccak256(UTF8("PsyBridge/CumulativeReward/1/Opening"))` and `keccak256(UTF8("PsyBridge/CumulativeReward/1/Record"))`. It does not reinterpret old `RewardBatch` bytes. A cumulative payout leaf is five words in order: economic domain, u32 user id, uint256 total amount, 20-byte recipient, initialized bool. Length is 160 bytes. Payable leaves require initialized=1; uninitialized earned-state leaves are never payable. Leaf commitment is Keccak of record domain followed by these bytes. Reward opening uses word-encoded `(config_hash,window_id,end_checkpoint_id,end_checkpoint_root[4],count)` followed by leaves: `256+160*N` bytes. Users strictly increase within and across segments of one window. Economic domain is the existing stable `rewardNullifierDomain` derivation (`EthereumRewardPayer.sol:46-49`), not config hash, window id or setup identity.
+The source-checkpoint reward protocol uses `PsyBridge/SourceCheckpointReward/1/Leaf` for the payout-leaf commit. Opening domain is `keccak256(UTF8("PsyBridge/SourceCheckpointReward/1/Opening"))`. Consumption domain is `keccak256(UTF8("PsyBridge/SourceCheckpointReward/1/Consumption"))`. It does not alias or reinterpret `PsyBridge/CumulativeReward/1/*` or `RewardBatch` bytes. `SourceCheckpointRewardLeaf` is six big-endian 32-byte words: word 0 `economic_domain`; word 1 `source_checkpoint_id` with its high bytes zero; word 2 `user_id`; word 3 `amount`; word 4 `recipient` as a right-aligned address; word 5 `initialized` as 0 or 1. The codec accepts a source id. A payable leaf requires `initialized`.
 
-Packed `header_bytes` contains, in order, `family:u8`, config hash 32 bytes, window id 32 bytes, end id u64, end root four u64, six u32 values `(aggregate_capacity,total_count,segment_count,segment_index,first_ordinal,count)`, family-specific roots, opening digest 32 bytes and claim root 32 bytes. All integers here are big-endian. Withdrawal-specific roots are `C` Hash4 values; reward-specific roots are old and new nullifier Hash4. No option tag or vector length is encoded. Header domain is `keccak256(UTF8("PsyBridge/TwoArtifact/1/AggregateHeader"))`. Header digest is Keccak of that domain and packed header bytes. Length is `193+32*C` for withdrawal and 257 for reward. Decoder rejects a missing/trailing byte, noncanonical Felt or wrong family.
+Packed `header_bytes` contains, in order, `family:u8`, config hash, window id, end id, end root, the segment counters, family-specific roots, opening digest, and claim root. All integers here are big-endian. Withdrawal-specific roots are one Hash4 per configured ordinal. Reward-specific roots are the segment's stated `old_ledger_state_root` and `new_ledger_state_root`. They are not a persistent per-job nullifier and are not chained across windows. No option tag or vector length is encoded. Header domain is `keccak256(UTF8("PsyBridge/TwoArtifact/1/AggregateHeader"))`. Header digest is Keccak of that domain and packed header bytes.
 
 #### Typed Hash4 boundary
 
@@ -170,7 +213,7 @@ for segment_index in 0..K:
     count = min(B, N-first_ordinal)               strictly positive
 ```
 
-All operations reject u32 overflow. Empty-family manifest sets all counts/indices to zero and both digests to bytes32 zero. Empty withdrawal still carries authenticated `C` roots; empty reward has equal stored old/new nullifier roots. Empty families register no root and supply no proof. Nonempty first manifests are byte-identical to their verified segment-zero headers in the first transaction.
+All operations reject overflow. An empty-family manifest sets all counts and indices to zero and both digests to zero. Empty withdrawal still carries authenticated configured roots. Empty reward repeats its stated ledger-state Hash4 in both slots and registers no root. Empty families supply no proof. Nonempty first manifests are byte-identical to their verified segment-zero headers in the first transaction.
 
 ### 5. Finalize and deposit authentication
 
@@ -221,23 +264,21 @@ function claimAggregateWithdrawal(bytes32 headerDigest, uint32 ordinal,
 
 This replaces the current full-opening withdrawal/reward publication parameters; it is not the current source ABI. Both claim implementations use `nonReentrant`; publication remains `onlyProposer`. Calldata arrays are bounded by compiled family counts and preflight; no arbitrary fixed two-to-four segment cap is introduced. Full openings remain off chain except the complete deposit opening. First/last witnesses are required even for a one-leaf segment and then must encode the same leaf/path.
 
-Publication order is authorization and canonical decoding; manifests and segment/boundary validation; new-window or continuation predicate; finalize and deposit verification; per-segment Groth16 verification and endpoint joins; reward root chaining; then atomic deposit, registry, progress, nullifier and cursor writes. Any failure reverts the entire transaction. No transfer or `paid_total` update occurs during publication.
+Publication order is authorization and canonical decoding; manifests and segment/boundary validation; new-window or continuation predicate; finalize and deposit verification; per-segment Groth16 verification; then atomic deposit, registry, progress, and cursor writes. Any failure reverts the entire transaction. No transfer and no consumption-key write occurs during publication. Publication does not write a persistent job-nullifier root.
 
-StateManager's registry unique key is `(config_hash,window_id,family,segment_index)`, with lookup by `header_digest`. New segments are consecutive per family. First/last paths use ordinals 0 and `count-1`, with previous last key less than next first key. Withdrawal key is `(chain_index,nonce)`; reward key is user id under fixed domain. Circuit sorting is internal; identical saved-header retries are no-ops and conflicting retries revert. Segment nullifier endpoints must chain from stored root, but this is insufficient to bind interleaved terminal user proofs to that chain. The unresolved terminal join below therefore blocks reward publication even when endpoint comparisons pass. Stale unpublished proofs return to the user for reproving; no root is edited outside the circuit.
+StateManager's registry unique key is `(config_hash,window_id,family,segment_index)`, with lookup by `header_digest`. New segments are consecutive per family. First and last paths use ordinals 0 and `count-1`. The previous segment's last boundary is strictly less than the next segment's first boundary. The withdrawal boundary is `(chain_index,nonce)`. The reward boundary is `user_id`, matching `ActiveWindow.rewardLastUserId`. It is not `(source_checkpoint_id,user_id)`, because that order would accept the same user twice when the source changed. The occupancy key remains `(economic_domain,source_checkpoint_id,user_id)` and is not this ordering key. Circuit sorting is internal. Identical saved-header retries are no-ops and conflicting retries revert. A reward header's two Hash4 slots bind that segment's stated admission-state endpoints. They are not the private session root, not a stored global job bitmap, and not chained from a previous window. Stale unpublished proofs return to the user for reproving. No root is edited outside a new proof.
 
-The first transaction contains both manifests and verified segment zero for every nonempty family. It advances the cursor once. Continuation requires identical window/end/deposit digest and family common fields `(family,B,total_count,segment_count,withdrawal_roots)`; its current cursor equals the active end and finalize is identity replay. A new window rejects until all required segments of both families are accepted. Empty-window completion is immediate after mandatory finalize/deposit checks. Progress is per destination; a successful receipt on one chain is not another chain's acceptance.
+The first transaction contains both manifests and verified segment zero for every nonempty family. It advances the checkpoint cursor once. Continuation requires identical window, end, and deposit digest, plus family common fields `(family,B,total_count,segment_count,withdrawal_roots)`. Its current cursor equals the active end and finalize is identity replay. A new window rejects until all required segments of both families are accepted. The next window's `start_root` is the previous window's published and verified `new_ledger_state_root`. The first window of an economic domain starts at `origin_state_root()`, the fixed protocol Poseidon hash of the origin state. `RewardSessionCircuit::new` calls that function. The store must call it for first-window initialization. It does not call it now, and that initialization is blocked on the configured economic domain. There is no lock. The value is not the zero Hash4 and not a store choice. Until rule 24 freezes the domain labels, changing this unfrozen value has no artifact cost. The old state root equals statement `[26..30)` on every step, so the ordinary hash already binds that opening. The remaining gap is initializing and publishing the first window at that hash. The host's locked baseline equals `start_root` on the first step of a window. Empty-window completion is immediate after mandatory finalize and deposit checks. Progress is per destination; a successful receipt on one chain is not another chain's acceptance.
 
-#### Three separate continuity checks
+#### Continuity without a persistent job root
 
-| Check | Required proof or state relation | What it does not establish |
+| Check | Required relation | What it does not establish |
 |---|---|---|
-| User step | Verify same-kind predecessors; global predecessor new root equals current step old root; current jobs perform exact zero-to-one updates; own-user predecessor carries amount, count and rolling jobs commitment. | It does not prove that an arbitrary set of terminal user proofs all belongs to the selected global history. |
-| Terminal common history | Circuit-verifiable membership of every selected terminal user proof in the same global nullifier history, using approved34 fields, per-user rolling commitment and user-linear terminal aggregation. | This remains unresolved. Neither registry ordering nor a privately asserted history root supplies it. |
-| Segment publication | New segment old root equals current stored admission root and the registered predecessor new root; commit verified successor and registry/counter atomically. | It cannot repair internally forked terminal proofs that an incomplete inclusion relation accepted. |
+| Own session step | The private session root starts empty on the first own step. A later own step authenticates it through `reward_session_summary`, with amount, count, and jobs commitment. | It does not put that private root in public PI `[26..34)` and does not persist its job bits after the session closes. |
+| Interleaved admission | A global predecessor orders steps from different sessions. The ledger-state connection in section 3 is the required relation when that ordering is used. | Current targets do not yet connect every selected terminal to one history. That is an integration gap, not a persistent-root requirement. |
+| Segment publication | The segment index is the next consecutive index, or the saved header bytes are identical on retry. The Groth16 statement binds this header and opening. | It does not repair an unconnected admission history by storing a nullifier cursor. |
 
-Current `StateManager.sol:205-253` has no reward-admission-root registry. Its checkpoint continuity and `_verifyFinalize` comparisons concern checkpoint roots, not the proposed reward nullifier root. The following is **design pseudocode**, not an existing implementation or permission to publish while the terminal relation is unresolved:
-
-**Reward publication is BLOCKED until the terminal common-history relation is completely specified, independently reviewed and implemented.** The following is only the segment-registry design conditional on that prerequisite. It defines no callable `terminalJoin` check and is not an executable replacement for the missing circuit relation.
+Current `StateManager.sol:205-253` has no reward-admission-root registry. The following is **design pseudocode**, not an existing implementation:
 
 ```text
 applyBridgeWindow, for each supplied reward segment in canonical segment order:
@@ -246,41 +287,41 @@ applyBridgeWindow, for each supplied reward segment in canonical segment order:
     key = (config_hash, window_id, family, segment_index)
     if key is already registered:
         require supplied canonical headerBytes equals retained headerBytes byte-for-byte
-        require recomputed header_digest equals the saved header_digest
         accept this segment as an idempotent retry
-        do not rewrite the stored admission root or increment its counter
+        do not increment the segment counter
         continue to the next supplied segment
     require segment_index equals nextRewardSegment
-    if segment_index == 0:
-        require header.old_nullifier_root equals current stored admission root
-        a new window uses the prior completed window's root; never reset it
-    else:
-        require segment_index - 1 is registered for this config/window/family
-        require header.old_nullifier_root equals current stored admission root
-        require current stored admission root equals predecessor.new_nullifier_root
-    verify the reward Groth16 statement binds this exact header and opening/root
-    stage this new publication's exact headerBytes and saved header_digest
-    stage stored admission root = header.new_nullifier_root exactly once
+    if segment_index != 0:
+        require segment_index - 1 is registered for this config, window and family
+    verify the reward Groth16 statement binds this exact header, opening and claim root
+    stage this headerBytes once
     stage nextRewardSegment = segment_index + 1
 after every required proof, endpoint join, boundary check and deposit effect succeeds:
-    commit all staged registry, root, counter and other window writes atomically
+    commit all staged registry, counter and other window writes atomically
 on any failure:
-    revert every write/effect in this transaction
+    revert every write in this transaction
 ```
 
-`nextRewardSegment` denotes the proposed `ActiveWindow.rewardAccepted` counter, not another stored datum. Earlier staged new segments are visible to subsequent checks in this transaction; registered retries never rewind it. Canonical `headerBytes` in the registry is the sole retained header authority; decoded roots/counts/digests are projections of those exact bytes and must not become independently writable mirrors. The current admission root is the live successor cursor. Comparing it to the registered predecessor's decoded new root checks the same transition boundary, not a second independent root authority. `header_digest` is not a literal hash chain because no previous-header field is encoded. Registry identity, sequential indices, exact retries and endpoint equality establish segment ordering only. Hash roots have no numeric monotonicity; the constrained nullifier bits are monotone zero-to-one.
+`nextRewardSegment` denotes `ActiveWindow.rewardAccepted`. Canonical `headerBytes` is the sole retained header authority. No ledger-root cursor is stored beside it. This pseudocode does not make the payer consume the source-and-user key.
 
-For example, A terminal proves `R0 -> R_A` and B terminal proves `R0 -> R_B` on separate forks. A malformed inclusion relation can verify both and expose one segment ending at `R_B`; a perfect segment registry still cannot establish A belongs to B's history. This is the missing terminal check, not a defect solved by comparing segment0 to stored root. No PI increase or free private history root is chosen.
+#### Existing payer key, stated rather than replaced
 
-Existing `Bridge.claimedNullifiers` and `EthereumRewardPayer.spentRewards` remain distinct existing delivery/consumption mappings, not the proposed admission tree. Preserve their recorded consumption across cutover; a mapping rename or new window never clears it. Publication never consumes either delivery mapping, never writes `paid_total` and never transfers a reward. The proposed cumulative payer's positive-delta accounting has its own authenticated migration requirement; it is not evidence that an old per-job key has become an admission-tree proof.
+`EthereumRewardPayer.payRewards` currently consumes one boolean per job:
 
-These document mechanisms are specified now. All code authoring is authorized before the terminal common-history join freezes. That authorization is not cryptographic GO, not payable activation, and not automatic approval; payable publication stays unresolved while the terminal proof relation is unspecified.
+```text
+spentRewards[keccak256(abi.encode(
+    rewardNullifierDomain, claimCheckpointId, nullifierIndex))]
+```
 
-Reward claim loads the published reward-family record, validates config and stable domain, decodes a 160-byte initialized leaf, requires `ordinal<count`, checks exact path length and root, then checks recipient. If `total_amount<=paid_total`, reject before subtraction. Otherwise compute `delta=total_amount-paid_total`, set paid total and first initialized recipient before external transfer, and require exact payer balance decrease, recipient balance increase and unchanged total supply. Any transfer failure reverts the accounting. Anyone can relay a claim; funds go only to the proof-bound recipient. Publication never initializes delivery recipient. Subsequent claims require the same recipient and never decrease paid total. Only configured Ethereum pays rewards; other destinations authenticate the publication but do not pay.
+`rewardNullifierDomain` is `keccak256(abi.encode(keccak256("PsyBridge/TwoArtifact/1/Reward"), uint256(1), networkMagic, uint32(524288), chainId, ethereumIndex, payer, rewardToken))` (`EthereumRewardPayer.sol:46-81`). Each consumed leaf pays immutable `REWARD_PER_CLAIM`, not a summed `W`. `Bridge.claimedNullifiers[nonce]` is the withdrawal mapping and is unrelated. Neither mapping is a source-and-user key. Preserving already-written keys does not make those keys equal the proposed key, and this document does not change the Solidity key.
+
+The proposed one-session key remains `keccak256(abi.encode(consumption_domain, economic_domain, uint256(source_checkpoint_id), uint256(user_id)))`. Using it on the current payer would be a different replay identity. No migration, key rewrite, or one-line substitution is claimed. Publication under either identity never transfers a reward by itself.
+
+A proposed reward claim loads the published reward-family record, checks config and domain, decodes the 192-byte leaf, and requires `initialized=1`, `ordinal<count`, the exact path, and the bound recipient. It transfers `amount`, which the credit relation requires to equal `W`, once. If the proposed consumption key is already set, it rejects before transfer. The payer balance must decrease by `amount`, the recipient balance must increase by `amount`, and total supply must stay unchanged. Any transfer failure reverts the key write. There is no `paid_total`, no subtraction from an earlier balance, and no residual. Anyone can relay a claim; funds go only to the leaf recipient. This claim is not implemented by `payRewards`. Only configured Ethereum pays rewards; other destinations authenticate the published root and do not transfer the reward token.
 
 Withdrawal claim loads the withdrawal registry entry, checks domain/config, six-word leaf, local chain and path, then enters existing nonce/pending/payment code. A consumed nonce rejects that claim. Publishing a root does not consume local or foreign nonces. The unchanged delay/threshold/force-claim logic stays at `Bridge.sol:643-670`; its explicit pull-time registration change remains an activation prerequisite.
 
-Events are `InclusionAggregateRootPublished(bytes32 indexed headerDigest,uint8 indexed family,bytes32 indexed windowId,uint32 segmentIndex,bytes32 claimTreeRoot,uint32 count,uint64 endCheckpointId)` and `RewardCumulativePaid(bytes32 indexed headerDigest,uint256 indexed userId,address indexed recipient,uint32 ordinal,uint256 previousPaid,uint256 totalAmount,uint256 delta)`. Existing `Finalized`, `WithdrawalPendingCreated`, and `WithdrawalClaimed` retain their own meanings. Root publication is never a payment event.
+Events are `InclusionAggregateRootPublished(bytes32 indexed headerDigest,uint8 indexed family,bytes32 indexed windowId,uint32 segmentIndex,bytes32 claimTreeRoot,uint32 count,uint64 endCheckpointId)` and `SourceCheckpointRewardPaid(bytes32 indexed headerDigest,uint256 indexed userId,address indexed recipient,uint64 sourceCheckpointId,uint256 amount)`. Existing `Finalized`, `WithdrawalPendingCreated`, and `WithdrawalClaimed` retain their own meanings. Root publication is never a payment event. There is no cumulative-payment event.
 
 ### 7. Retention and recovery
 
@@ -311,7 +352,7 @@ Inclusion reconstructs both digests and claim root from retained bytes and creat
 
 Replacement is restricted to an exact leaf-identity bijection with unchanged count and segmentation. Lock predecessor and associations, require finalized registry evidence that predecessor is unpublished, verify equality, insert successor and move associations atomically. Retain predecessor bytes. Canonical concurrent predecessor publication wins; reconcile before successor publication. Changed membership returns 409 `changed_membership_not_supported`; absent finalized admission evidence returns `admission_evidence_required`; published predecessor returns `predecessor_published`. This is a deliberate fail-closed supported operation set, not an unspecified recovery mechanism.
 
-Users or services retain birth records, tagged-tree witnesses, accumulator/checkpoint preimages and enough checkpoint-tree history to produce new paths for unpresented jobs. Re-anchor replaces only checkpoint siblings/end context, preserving birth id, level, index, owner, eligibility amount and nullifier key. A new proof recomputes its context-bound jobs commitment. Published payout leaf/path archives remain sufficient for L1 claims even when a service is unavailable; journal retention is not an on-chain authorization condition. No surviving copy means unavailable data, not a failed valid path.
+Users or services retain source checkpoint witnesses, tagged-job openings, and the session seed inputs needed to reproduce an unfinished session. A new end root replaces checkpoint siblings only. It preserves source, user, recipient, included-job identity, and `W`. An omitted job is not retained as a later entitlement. Published payout leaf and path archives remain sufficient for an L1 claim after publication. Journal retention is not an on-chain authorization condition. No surviving copy means unavailable data, not a failed valid path.
 
 ### 8. Acceptance and resource bounds
 
@@ -322,19 +363,19 @@ Users or services retain birth records, tagged-tree witnesses, accumulator/check
 | 4096 | 12 | 25 | 1696 | 16,006,400 |
 | 8192 | 13 | 13 | 1696 | 16,003,328 |
 
-Bytes are `160*N+256*K`, off chain. Raw publication proof plus header bytes are `K_w*(449+32*C)+K_r*513`; both manifests add `450+32*C`. Each new segment also includes two boundary leaf/path witnesses: withdrawal `384+64*log2(B)`, reward `320+64*log2(B)` bytes before ABI framing. Include actual ABI offsets/padding, finalize inputs, deposit opening, transaction intrinsic costs, storage and logs in receipts; these formulas alone are not a gas result. Publication work includes `O(K_w*C+C+D+(K_w+K_r)*log(B))`. Pull verifies `log2(B)` Keccak levels and zero Groth16 calls.
+Bytes are `192*N+256*K`, off chain, using the 192-byte source-checkpoint leaf. Raw publication proof plus header bytes are `K_w*(449+32*C)+K_r*513`; both manifests add `450+32*C`. Each new segment also includes two boundary leaf/path witnesses: withdrawal `384+64*log2(B)`, reward `384+64*log2(B)` bytes before ABI framing. Include actual ABI offsets, padding, finalize inputs, deposit opening, transaction intrinsic costs, storage, and logs in receipts. These formulas alone are not a gas result. Publication work includes `O(K_w*C+C+D+(K_w+K_r)*log(B))`. Pull verifies `log2(B)` Keccak levels and zero Groth16 calls.
 
 `max_deposits<=1024`, `max_withdrawals<=131072`, `max_rewards<=131072`, with target deployment reward limit 100000. All codec, circuit and Solidity checks change together. These changes invalidate config-dependent fingerprints/setups. Transaction segment count is selected by preflight within the full gas/calldata budget; no deployment segment limit is inferred without receipts.
 
 Required unexecuted QA:
 
-1. Exact 34-user offsets, all u32 ranges, canonical Felt decoding, uint256 carry/overflow, recipient upper zeros; distinguish publication 28 and finalize `26+9*C`.
-2. Exactly three reward circuit kinds on the actual construction path; same-kind self-recursion with data-dependent depth and benchmark-selected `k`, no hidden distinct job/closing/authorization circuit. Separate withdrawal/reward setup identities.
-3. Complete producer-earned accounting, old/new accumulator membership, wrong owner/rate/recipient rejection, rolling job commitment order/count/padding, immutable re-anchor, recursion carry/equality, and the two-fork terminal-join counterexample. Payable publication must reject mixed-history terminal proofs before this gate can pass.
-4. Cross-language opening/header/tree/digest vectors; C=1 and C=256; counts 0,1,B-1,B,B+1; helper depths 0 and 17 accepted, 18 rejected; production widths exactly four.
-5. Real-proof acceptance and zero/wrong proof rejection; cached-base/coordinator fingerprint mismatch before any setup; same-width wrong chain-list/type rejection; direct span 1/32 and chained 33 boundaries with every checkpoint transition authenticated.
-6. Atomic publication rollback, identity replay, duplicate/conflicting segment retry, incomplete-window blocking, empty manifests, inter-segment sorting, mixed-family continuation, canonical reorganization recovery and indeterminate Sending retention.
-7. Positive-only cumulative payout delta, unchanged recipient, first-payment authorization, insufficient reserve, exact token deltas, claim trace with no verifier/signature call, withdrawal nonce/delay behavior.
+1. Exact 34-user offsets, all u32 ranges, canonical Felt decoding, uint256 carry and overflow, and recipient upper zeros. Distinguish publication 28 and finalize `26+9*C`.
+2. Exactly three reward circuit kinds on the actual construction path. Same-kind self-recursion has data-dependent depth and benchmark-selected `k`. No hidden debit, ticket, or fourth authorization circuit. Terminal authorization reuses the selected existing primitives. Separate withdrawal and reward setup identities.
+3. One session per `(economic_domain,source_checkpoint_id,user_id)`, base zero and seed, checked `W` and count, private session-local zero-to-one job keys, public composite ledger-state roots, omitted-job forfeiture, and no persisted job root. Wrong source, owner, recipient, or repeated key rejects. Final-step authorization binds chain digest, recipient, source, amount, count, and jobs commitment. The ledger-history connection and the unfrozen gadget composition are reported, not treated as passed.
+4. Cross-language opening, header, tree, and digest vectors; C=1 and C=256; counts 0, 1, B-1, B, and B+1; helper depths 0 and 17 accepted, 18 rejected; production widths exactly four.
+5. Real-proof acceptance and zero or wrong-proof rejection; cached-base and coordinator fingerprint mismatch before any setup; same-width wrong chain-list or type rejection; direct span 1 and 32 and chained 33 boundaries with every checkpoint transition authenticated.
+6. Atomic publication rollback, identity replay, duplicate or conflicting segment retry, incomplete-window blocking, empty manifests, inter-segment sorting, mixed-family continuation, canonical reorganization recovery, and indeterminate Sending retention.
+7. One full `W` payment, unchanged recipient, one boolean consumption key, insufficient reserve, exact token deltas, no verifier or signature call in the claim, and unchanged withdrawal nonce and delay behavior. The current per-job `spentRewards` key is reported as a mismatch, not silently converted.
 8. Keep `testFullCapacityWithdrawalAggregate`'s 30,000,000-gas fixture (`psy-contracts/test/foundry/BridgeOpening.t.sol:131-147`) and report its actual success or OOG. Independently require actual complete publication receipts with `gasUsed<=8,000,000`, including maximum configured C/D, both families, first and continuation windows, boundary witnesses and all verification/deposit effects. A reward-only or mock-verifier receipt does not qualify mixed deployment. 50,000 pull gas remains an unmeasured target.
 9. Serial construction/proving/wrapping at N=1 and maximum compiled occupancy for withdrawal/reward plus configured deposit aggregate: MemoryHigh 56 GiB, MemoryMax 64 GiB, SwapMax 0, Rayon 1. Measure inclusion widths and same-kind user step capacities `k`; report depth separately from circuit-kind count. Bound failure returns to design, not silent topology or lifetime-cap changes.
 
@@ -358,22 +399,23 @@ pub struct InclusionAggregateHeader {
     pub first_ordinal: u32,
     pub count: u32,
     pub withdrawal_roots: Vec<[u64; 4]>,
-    pub old_nullifier_root: Option<[u64; 4]>,
-    pub new_nullifier_root: Option<[u64; 4]>,
+    pub old_ledger_state_root: Option<[u64; 4]>,
+    pub new_ledger_state_root: Option<[u64; 4]>,
     pub opening_digest: [u8; 32],
     pub claim_tree_root: [u8; 32],
 }
-pub struct CumulativeRewardLeaf {
+pub struct SourceCheckpointRewardLeaf {
     pub economic_domain: [u8; 32],
+    pub source_checkpoint_id: u64,
     pub user_id: u32,
-    pub total_amount: [u32; 8],
+    pub amount: [u32; 8],
     pub recipient: [u8; 20],
     pub initialized: bool,
 }
 pub enum Hash4Encoding { CanonicalU64x4, LittleEndianU32x8 }
 ```
 
-The relayer creates headers; the respective inclusion circuit constrains every field, StateManager recomputes their hash, and the service retains bytes. Family 2 requires exactly C withdrawal roots and absent nullifier roots; family 3 requires no withdrawal roots and both nullifier roots. No field is defaulted on decoding. Example: B=2048,N=100000,K=49,segment=48,first=98304,count=1696,end=1200; reward user 7 has limbs `[1500,0,0,0,0,0,0,0]`, recipient `0x1111111111111111111111111111111111111111`, initialized=true. Actual digests are calculated from the complete opening; this is a value example, not a cryptographic test vector.
+The relayer creates headers; the respective inclusion circuit constrains every field, StateManager recomputes their hash, and the service retains the bytes. Family 2 requires exactly the configured withdrawal roots and absent ledger-state roots. Family 3 requires no withdrawal roots and both `old_ledger_state_root` and `new_ledger_state_root`. No field is defaulted on decoding. One reward leaf names one source, user, amount, recipient, and `initialized=true`. Another user in the same window may name a different source. The same user cannot appear again in that window with another source. Actual digests are calculated from the canonical bytes.
 
 ```solidity
 struct InclusionAggregateRoot {
@@ -408,94 +450,60 @@ struct ActiveWindow {
 
 ### Reward relation subsection
 
-#### Proposed earned-state layout and ownership
+#### Source membership, not a seventh root
 
-Append `reward_accumulator_root` after the existing six roots. The proposed record is 224 bytes: seven Hash4 values, each four canonical u64 little-endian limbs. The authenticated protocol schema selects the record; never pad an old 192-byte record. Let `G6` be the existing global-root hash (`psy_data/src/v1/qdata/checkpoint.rs:489-493`); proposed `global_chain_root=Poseidon(G6,reward_accumulator_root)`. Checkpoint hash/serialization, target gadgets, producer/coordinator proofs, provider witnesses and caches cut over together. This is not current source behavior.
+`PQEDCheckpointGlobalStateRoots` has exactly six hashes and a 192-byte encoding: contract, deposit, user, withdrawal, user registration, and validator (`psy_data/src/v1/qdata/checkpoint.rs:320-327,362-370`). Its hash is the existing six-root hash (`checkpoint.rs:487-493`). This contract does not append a reward-accumulator root, does not define `G7`, and does not store a per-user earned leaf in a checkpoint. The source checkpoint authenticates the tagged reward tree through its existing stats. The publication-end root authenticates that source leaf. No checkpoint transition credits a balance.
 
-Coordinator alone updates the accumulator through existing prepared checkpoint updates. Leaf index is u32 `user_id` in the tree of configured `GLOBAL_USER_TREE_HEIGHT`. The complete proposed native leaf is:
+#### Session witness
 
-```rust
-pub struct RewardAccumulatorLeaf {
-    pub user_id: u32,
-    pub total_amount: [u32; 8],
-    pub recipient: [u32; 5],
-}
-pub struct RewardPosition {
-    pub relative_level: u8,
-    pub relative_index: u32,
-    pub owner_user_id: u32,
-    pub owner_tag: [u64; 4],
-}
-```
+The private witness opens one source checkpoint under the public end root. It carries the economic domain, the source id, the user, the recipient, and the session seed from section 3. Each active slot opens one tagged job born at that source and owned by that user, then updates the session-local height-63 nullifier from zero to occupied at `nullifier_key`. Inactive slots add nothing. Checked eight-limb addition and checked u32 count addition are the only arithmetic. The terminal public amount is `W`.
 
-No lifetime count, initialized flag, cursor, nullifier root or per-user domain is stored in the accumulator. Recipient zero means unset. Empty leaf hash is Hash4 zero, opened with zero amount/recipient at the selected index. Occupied hash is PoseidonHashMany of one field per byte of `UTF8("PsyRewardAccumulator/Leaf/1") || economic_domain[32] || LE32(user_id) || LE32(amount[0])..LE32(amount[7]) || LE32(recipient[0])..LE32(recipient[4])`. Require nonzero hash and amount or recipient nonzero. Domain is immutable activation input, never mutable config hash. Example: user7, amount1500, recipient `0x1111111111111111111111111111111111111111` has amount limbs `[1500,0,0,0,0,0,0,0]` and five recipient limbs all `0x11111111`; it is occupied without a stored count.
+Current source contains `RewardSessionTargets`, `RewardLedgerStateTargets`, `RewardLedgerWindowTargets`, `RewardPredecessorTargets`, `RewardSessionJobTargets`, and `rolling_jobs_commitment` (`reward_session.rs`). `RewardSessionCircuit` is the exported constructor. The rolling-step function is present. Its presence is not permission to infer a balance or a second amount.
 
-#### Complete once-only producer accounting
+#### Recipient binding
 
-This is a proposed incompatible producer statement change, not a fourth reward claim circuit kind. Existing producer statement is `legacy_pi=H(header_hash,R)` (`docs/src/dev/reward-tree-circuits.md:94-125`). Proposed statement is `H(legacy_pi,positions_commitment)`, still four fields. Every parent verifies the pinned new child fingerprint and opens header, R and positions commitment against it. Old children lacking the commitment reject after cutover; producer whitelists, caches and submit checks migrate together.
+The user chooses the recipient inside that user's own terminal proof. Statement fields `[5..10)` are the five little-endian u32 limbs of the 160-bit address, and `[10..13)` are zero. The 20-byte address is those five limbs as big-endian words in reverse limb order: limb 4, then 3, then 2, then 1, then 0 (`reward_ledger.rs`). Publication inherits that address unchanged, and the relayer cannot rewrite it. L1 pays that address. No contract identifier 7, recipient-storage import, or new signature circuit is allocated.
 
-`RewardPosition` wire is exactly 41 bytes: level u8, index LE32, owner LE32, owner_tag four canonical LE64. Records strictly increase by `(level,index)`. Owner tag is Poseidon(tag_preimage,tag_preimage), preimage first element is owner u32, both hashes nonzero. Commitment is PoseidonHashMany of byte fields for `UTF8("PsyRewardAccounting/Positions/1") || LE32(record_count) || records`. Example `(2,0,7,[1,2,3,4])` describes serialization only; it is accepted only with a preimage whose computed tag is that value. Count is transient, not accumulator state.
+Recipient binding is not sender authorization. The included job still requires the existing owner-preimage relation: nonzero tag preimage, first element equal to `user_id`, and leaf tag equal to Poseidon of that preimage with itself. A public recipient field alone does not prevent someone who knows the job witness from constructing another proof. That gap is closed only by the terminal authorization below.
 
-Each producer derives contributions from its pinned reward expression, not host metadata. A tagged node contributes its own coordinate only when its actual tag is nonzero; literal zero and opaque nonreward expressions contribute none; untagged internal hashes create no jobs. Mount child `(h,i,u,t)` at `(d,j)` as `(d+h,(j<<h)|i,u,t)` with checked arithmetic; discard only positions with resulting level above21. Complete expression mapping:
+#### Terminal authorization
 
-| Expression | Own and synthetic positions | Child mounts |
-|---|---|---|
-| No-child/EndCap | `(0,0)` | none |
-| Binary | `(0,0)` | `(1,0),(1,1)` |
-| Lift | `(0,0)` | `(1,0)` |
-| Three-child | `(0,0),(1,1)` | `(1,0),(2,2),(2,3)` |
-| Four-child | `(0,0),(1,1),(2,3)` | `(1,0),(2,2),(3,6),(3,7)` |
-| RealmFinalize63 | `(0,0)` | left root_guta only; right output is opaque |
+The terminal credit, and only the terminal credit, inlines existing key-possession and signature constraints into the one credit circuit. It does not instantiate `RewardAuthorizationCircuits` and does not recursively verify the old per-job authorization proofs. The selected built-in primitives are exactly four (`agent://MapTerminalIdentityGadgetReuse`):
 
-Synthetic positions carry their actual repeated parent tag. Zeroed EndCap branches contribute none. Checkpoint transition32 lifts part1, using exactly the four-child expression defined in `reward-tree-circuits.md:178-205`; the circuit expression is fixed, not a selectable witness mode. Parent opens every child's complete list and verifies its commitment. Deterministic two-way merge chooses the lesser next coordinate, copies the whole record and advances exactly that cursor; equal coordinates reject; termination requires all input records consumed. Constraints bind comparisons, selectors, cursor progress and copied fields. Canonical inactive padding is zero. Capacities derive from fixed expression/child capacities with depth21 truncation; full-tree position ceiling is `2^22-1`. This correctness construction has no measured fit claim.
+1. ZK private-key possession through `get_zk_public_key_param` (`software_defined.rs:423-462`).
+2. Raw secp256k1 ECDSA through `Secp256K1Gadget::add_virtual_to` (`gadget.rs:227-307`), retaining canonical, nonzero, and low-s checks.
+3. Ethereum personal-sign through `add_virtual_to_eth_personal_sign` (`gadget.rs:337-340`).
+4. Mutable two-of-three multisig through the existing policy mechanism. Contract identifier 6 and its slot paths stay pinned to that existing mechanism (`MultisigPolicyTargets`, `reward_session.rs`). This is not a new multisig contract.
 
-For activation checkpoint A, every committed C>A accounts exactly source S=C-1, including empty sources. Contiguous checkpoint transition establishes once-only consumption; no second accounting cursor exists. Authenticate previous source proof/header/R against checkpoint(S), and its complete positions list against the new producer commitment. Old accumulator root comes from checkpoint(S). At the complete checkpoint reward expression, retain exactly positions with `rewardCutover<=S<rewardEndExclusive`, `2<=level<=21`, `index<2^(level-2)` and valid u32 user index. Each earns the unchanged positive `rewardPerClaim`. A constrained whole-record sorting network orders by `(owner,level,index)` and preserves exact permutation; fold all eligible positions per owner. Merge those owners with sorted unique valid recipient-import requests; their union is the exact update set, not a host-selected subset.
+The identity equation is `PoseidonTwoToOne(pinned_identity_fingerprint, derived_public_key_param) == authorization_user_leaf.public_key`. On a final step, that leaf's user id equals PI `[4]` and every included job owner (`UserAuthTargets`, `reward_session.rs`). The signed preimage is `RewardSessionAuthorization` with config, economic domain, window, source, end, user, checkpoint context, authenticated nonce, jobs commitment, count, amount, and recipient. Recipient alone is not the message. The old `PsyBridge/TwoArtifact/1/RewardAuthorization` message does not bind `jobs_commitment`, amount, or count.
 
-For each ascending user, open old leaf under the previous intermediate root, add one fixed-rate amount for every owned position with eight-limb checked carries, preserve/import recipient, and update that same leaf path. Initial root is authenticated predecessor; final root is the new checkpoint accumulator root. Untouched users cannot change. Outside eligibility interval delta is zero. One checkpoint after the last eligible birth source credits its jobs. Earnings accrue for offline users and unset recipients; L1 admissions do not create earnings.
+A nonfinal step still supplies the same authenticated end checkpoint leaf, end global roots, and end checkpoint path. It also supplies structurally valid signature padding. Those padding signatures are not authorization. The user-leaf path is bound to the end user root only when `is_final_step` is set (`reward_session.rs`). A nonfinal user path is untrusted and is not account authentication.
 
-#### Proposed one-time recipient authority
+Unknown fingerprints fail closed. Software-defined DPN, Plonky2, and SDKey accounts exist in this repository and are not covered by these four built-ins. This contract does not map an unknown fingerprint to the ZK branch and does not claim universal account coverage. Covering one of those accounts requires that account's exact policy relation as another branch of the same credit circuit, not a fourth reward kind. This authorization prevents an unauthorized terminal credit. It does not prevent computation of an intermediate step. A free terminal boolean is not sufficient: terminal status is committed in the authenticated admission state. No review is claimed.
 
-There is no existing lifetime recipient slot in inspected source. Proposed new precompile has contract id7, state-tree height1, slot0 `[a0,a1,a2,a3]`, slot1 `[a4,0,0,0]`, with five u32 address limbs. Id7 is a proposed coordinated genesis assignment, not an existing deployed contract. Initial slots are zero. Proposed source signature is `set_recipient(recipient: [u32;5])`; it uses only authenticated user-session current-context storage, requires both old slots zero, rejects zero/payer address and writes both slots. No replacement, clearing or delegated-user method exists. Pin the approved full contract leaf/function-tree root/height, not id alone. Existing current-context storage pattern is `../psy-compiler/psy-precompiles/multisig_policy/src/main.psy:58-82`; it is evidence for the pattern, not this implementation.
+#### One closed consumption key
 
-Identifier7 is **unapproved and not globally collision-checked**. `psy-genesis/genesis_abi/abi_list.json:3-45` lists0..5 and `reward_authorization.rs:174` uses multisig6; this does not establish a complete reservation registry or prove7 free. References to7 below describe only this proposed allocation. Recipient storage semantics are specified, but allocation requires authoritative registry reconciliation and explicit coordinated contract/genesis approval before its source interface can freeze. This is an additional integration prerequisite, not a user-approved identifier or a solved deployment fact.
-
-Permissionless import names only user id. At C the coordinator opens that user's account under the already-proved new user root, account contract tree at id7, both state slots and approved contract leaf under new global contract root. Copy address only when accumulator recipient is zero; otherwise require equality. Import occurs in the first committed checkpoint containing a valid request. It is not required for all users or all earnings. User reward proof reads the checkpoint-authenticated recipient; it adds no inline four-signature system and no claim-time authorization circuit. Existing account/session authentication authorizes the original L2 setting transaction.
-
-#### Complete user witness and arithmetic
-
-Private witness opens checkpoint leaves O,N,E with complete stats/global-root preimages and exactly32 siblings, where `O<N<=E`. Each global-root preimage obeys its authenticated schema. Open old/new accumulator leaves for the same user under O/N with configured user-tree-height paths. Bind nonzero new recipient to PI recipient; preserve nonzero old recipient. A zero-to-nonzero recipient additionally opens the N account, id7 state and approved contract leaf. Bind total target to authenticated amount(N), base to amount(O). The same entitlement target/base must hold across own-user recursion; a host cannot reset it between steps.
-
-Newly credited jobs are exactly `O<=birth<N` because accounting is one checkpoint delayed. Each job supplies birth checkpoint membership, tag preimage, left/right/tag values, 21 tagged-tree siblings, 21 parent tags and 63 nullifier siblings. Distinct eligible jobs at fixed positive rate must sum exactly to `amount(N)-amount(O)`. Combined with complete producer accounting, this excludes omissions from that user's interval; it does not demand all prior lifetime jobs be presented on L1. User proof owns current interval job admission; producer owns lifetime entitlement. New publication requires positive newly admitted count. Already published leaves remain payable without another user proof.
-
-For each addition and limb i enforce `a[i]+b[i]+carry[i]=out[i]+2^32*carry[i+1]`, boolean carries, carry0=carry8=0. Local sums are below `2^33`, so no Goldilocks wrap occurs. Count addition rejects u32 overflow. This approved count field is finite; a truly unlimited count in one statement is not claimed. No stored cumulative count or amount reduction is introduced.
-
-#### Rolling jobs commitment and recursive equality contract
-
-One step contains 1..k new jobs; base contains zero. Canonical record fields are birth u32, level u8, index u32, nullifier_index u32, owner u32, eight amount u32 limbs, four canonical owner_tag u64 limbs and old/new bit bytes 0/1. Integers in this byte record are little-endian; record length is `4+1+4+4+4+32+32+2=83` bytes. Key is derived from birth/level/index, not redundantly serialized. Jobs strictly increase by key within a step. Every real record is linked to its actual membership and update witness. Padding is all-zero record bytes, constrained inactive, and excluded from the hashed real prefix.
-
-Define `H(bytes)` as PoseidonHashMany of one canonical field per byte, with exact domains and explicit lengths. Seed is `H(UTF8("PsyRewardJobs/Seed/1") || economic_domain || LE32(user_id) || checkpoint_tree_root as 4 LE64 || LE32(O) || LE32(N) || old_leaf_encoding || new_leaf_encoding)`, where accumulator leaf encoding is LE32 user, eight LE32 amount, five LE32 recipient. This binds entitlement context without creating a global transcript commitment. Step is `H(UTF8("PsyRewardJobs/Step/1") || previous_commitment as 4 LE64 || LE32(previous_count) || LE32(step_count) || LE32(new_count) || real_record_bytes)`. No padding bytes enter the hash; explicit count fixes list length. Empty base uses seed, not an all-zero hash.
-
-Own-user predecessor is the same pinned circuit kind and carries equal user, recipient, checkpoint root and entitlement context; current amount is previous amount plus exact new-job sum and current count is previous count plus step count; current jobs hash is the specified rolling step. Global predecessor is the immediately preceding same-kind step and must expose `new_nullifier_root=current.old_nullifier_root`; apply current jobs to obtain current new root. Both proofs are verified in circuit, never accepted through host sorting. A base must authenticate its earned-state base and the selected publication predecessor root. A terminal must reach the target amount exactly. The proposed 34 fields do not independently expose the seed context or terminal ancestry; the full initial/terminal recursive binding is not declared closed while the following gap remains. No executable user constructor or guessed fingerprint is frozen.
-
-#### Blocking terminal common-history relation
+The proposed payout key is one boolean consumption record:
 
 ```text
-         A terminal -> R_A
-R0 -----<
-         B terminal -> R_B
+key = keccak256(abi.encode(
+    consumption_domain, economic_domain,
+    uint256(source_checkpoint_id), uint256(user_id)))
 ```
 
-A and B independently prove valid updates from R0. Verifying both terminal proofs and selecting R_B does not prove A's admissions are in that global history. Two-child same-kind recursion makes individual steps locally sound but does not show that every supplied per-user terminal belongs to the chosen tip. This matters even when lifetime earned amounts are independently authentic: publication would claim an admission set its stored tree does not contain. Segment endpoint equality, host sorting and copied roots do not repair it. Arbitrary interleaving plus one terminal proof per user requires a circuit-verifiable common-history join that this draft does not yet supply.
+`consumption_domain` is `keccak256(UTF8("PsyBridge/SourceCheckpointReward/1/Consumption"))`. The key contains no job index, no publication window, and no amount. Unset means the full `W` is unpaid. Set means that exact credit was paid. It is never a per-job bitmap and never a balance. This key is a proposed payout identity. It is not the key implemented by the current payer; section 6 states that mismatch.
 
-No 38-field layout is adopted. A separate authenticated transcript/latest-user-summary commitment is an unapproved possible direction, not a proved minimum, sufficient construction or impossibility result for 34 fields. Nesting it into `jobs_commitment` would silently change the required per-user rolling semantics and is rejected. Opening every job in the inclusion aggregate gives job-linear work, not the requested user-linear aggregation. Forcing contiguous grouped users contradicts arbitrary interleaving. The exact unresolved relation blocks clean-design/gate and source interface freeze; it is not hidden behind an optional missing proof.
+#### Interleaving gap
 
-#### Retained checkpoint recovery
+Same-kind own recursion carries one session. A global predecessor can order steps from different users, but the current targets do not prove that every selected terminal belongs to one admission history. No wider statement is adopted. This is the same integration gap named in section 3, not a second relation and not a blocker that reintroduces a persistent job root.
 
-Use existing coordinator prepared updates/backups, saving exact successor nodes/leaves, source identity, accounting proof, seven-root bytes and old/new roots before the latest-checkpoint marker. Replay successor values from authenticated predecessor; never re-add deltas to partially applied balances. Existing write-last/deletion boundary is `psy_node_common/src/coordinator/processor/db.rs:1228-1277`. Retain source proof/list/owner openings until accounting and recovery state are durable; retain historical checkpoint/accumulator nodes and birth tag evidence for supported unpaid claims and rollback checkpoints. Re-anchor changes checkpoint siblings, not birth or entitlement identity. Changed global predecessor requires new nullifier witnesses and a new proof; already admitted keys fail zero membership and use their retained publication for payment.
+#### Retained recovery
+
+Retain the source checkpoint witness, tagged-job openings, session seed inputs, and the terminal proof long enough to reproduce the session. A new end root requires new checkpoint siblings and a new proof. It does not change the source, user, included-job identity, or `W`. There is no balance replay and no seventh-root replay. The existing coordinator write boundary remains `psy_node_common/src/coordinator/processor/db.rs:1228-1277`; this contract does not add reward state to it.
 
 ## Core Functions
 
-The existing source function is `InclusionAggregateCircuit::prove(&self, config: &NetworkConfig, window: &AggregateWindow, leaves: &AggregateLeaves<'_, C, D>) -> anyhow::Result<ProofWithPublicInputs<F, C, D>>` at `inclusion_aggregate.rs:367-370`. It calls `set_witness` then the already-built circuit's `prove`; it never appends inputs after build. The replacement preserves that construction discipline but splits the owning withdrawal and reward constructors/witnesses.
+`WithdrawalInclusionAggregateCircuit::prove` and `RewardInclusionAggregateCircuit::prove` (`inclusion_aggregate.rs`) each call `set_witness` and then the already-built circuit's `prove`. Neither appends inputs after build. `AGGREGATE_PI_LEN` is the shared publication width.
 
 Proposed concrete shared codec functions:
 
@@ -519,27 +527,27 @@ function inclusionAggregateRoot(bytes32 headerDigest)
     external view returns (InclusionAggregateRoot memory);
 ```
 
-The existing two-half `IAggregateVerifier` stays for deposits; finalize uses its separate verification path. `claimReward` calls registry lookup, cumulative-leaf decoder, Keccak path fold, paid-total/recipient checks and token balance/transfer functions. `claimAggregateWithdrawal` calls the same pure tree fold with withdrawal leaf codec and then existing nonce/pending/payment logic. No caller passes a proof object to either claim.
+The existing two-half `IAggregateVerifier` stays for deposits; finalize uses its separate verification path. `claimReward` calls registry lookup, the 192-byte source-checkpoint decoder, Keccak path fold, consumption-key and recipient checks, and token balance/transfer functions. `claimAggregateWithdrawal` calls the same pure tree fold with the withdrawal leaf codec and then existing nonce/pending/payment logic. No caller passes a proof object to either claim.
 
 ## Core Loops
 
-1. **User proving:** consume at most `k` new jobs per step. Verify own-user predecessor and actual global predecessor, bind identities/context, open each exact job and update its zero-to-one path, add checked uint256 amount and u32 count, and roll jobs commitment. Increment consumed jobs by actual step count. Repeat until the finite selected interval is complete; depth grows with jobs. The final amount must equal authenticated earned state. Reject overflow, wrong predecessor, duplicate key or capacity excess. Global interleaving requires the unresolved terminal join before inclusion can accept the final proof set.
-2. **Segment construction:** for each separate family start ordinal zero; take `min(B,remaining)`, verify its user/withdrawal proofs, construct opening/header/claim tree and prove inclusion, retain bytes, increment ordinal by count. Stop at total_count. An error leaves earlier retained artifacts intact and submits no incomplete candidate for that segment.
-3. **Publication:** wait until no Sending/Submitted transaction remains for the destination; read next accepted segment indices and root; preflight exact candidate calldata; save Sending; broadcast; save hash. Observe finalized evidence until classified. Indeterminate outcome stays retained and stops further submission. Accepted segments advance counters exactly once. Stop the window only when both families complete.
-4. **Pull:** fetch one published leaf/path, verify membership locally for user feedback, submit exact claim, then classify canonical event/state. Failed transfer leaves paid total unchanged. Retrying an already delivered total rejects; a later higher total pays only its positive delta.
+1. **User proving:** include at most `k` jobs of one source and user per step. Verify the own-user predecessor and any actual global predecessor, bind that source, open each included job, and update its session-local zero-to-one path. Add the checked amount and count from zero and roll the jobs commitment from the session seed. Repeat until the selected jobs are included. The terminal amount is `W`. Reject overflow, the wrong predecessor, another source or user, a duplicate key, or capacity excess. Jobs not selected are forfeited. The admission-history connection remains the section 3 gap.
+2. **Segment construction:** for each family, start at ordinal zero, take `min(B,remaining)`, verify its user or withdrawal proofs, construct the opening, header, and claim tree, prove inclusion, and retain the bytes. Increase the ordinal by the count and stop at `total_count`. Reward inclusion checks each leaf's source, user, recipient, and amount against that user's terminal proof. It does not require every leaf to name one source. An error leaves earlier retained artifacts intact and submits no incomplete candidate.
+3. **Publication:** wait until no Sending or Submitted transaction remains for the destination. Read the next accepted segment index, preflight the exact candidate calldata, save Sending, broadcast, and save the hash. Observe finalized evidence until it is classified. An indeterminate outcome stays retained and stops further submission. Accepted segments advance counters exactly once. Stop the window only when both families are complete.
+4. **Pull:** fetch one published leaf and path, verify membership locally for user feedback, and submit the exact claim. Classify the canonical event and state. A failed transfer leaves the consumption key unset. A repeated `(economic_domain,source_checkpoint_id,user_id)` rejects. A later source is a different key and pays its own full `W`, not a delta.
 
 ## Module Changes
 
 | Owner | Proposed responsibility | Existing evidence |
 |---|---|---|
-| Codec | Separate opening types, packed header, cumulative leaf, typed Hash4 and pure claim tree | `bridge_aggregate.rs:202-217,420-435,649-687` |
-| Self-recursive user accumulator | One kind, 34 inputs; own-user/global predecessors, direct membership/sum/nullifier constraints | Existing membership/tag gadgets `reward_inclusion.rs:57-153` are reusable constraints, not separate recursive children |
-| Withdrawal inclusion circuit | Only 32-input withdrawal child verification, configured-root membership, withdrawal header/tree | `inclusion_aggregate.rs:24-49,262-325` |
-| Reward inclusion circuit | One terminal 34-input proof per user, cumulative leaf equality and publication bindings; terminal common-history join remains blocked | Replaces current reward witness at `inclusion_aggregate.rs:51-60` |
+| Codec | `SourceCheckpointRewardLeaf`, its opening, the proposed consumption key, packed header, typed Hash4, and pure claim tree | `bridge_aggregate.rs:859-1148,649-687` |
+| Reward session | `RewardSessionCircuit`; one source and user; base zero and seed; terminal `W`; session-local nullifier | `reward_session.rs` |
+| Withdrawal inclusion circuit | Withdrawal child verification, configured-root membership, withdrawal header and tree | `WithdrawalInclusionAggregateCircuit` in `inclusion_aggregate.rs` |
+| Reward inclusion circuit | One final `RewardSessionCircuit` proof per user, payout-leaf equality, and publication bindings | `RewardInclusionAggregateCircuit` in `inclusion_aggregate.rs` |
 | Wrapper/setup | Artifact-specific 2-half or 6-half shapes and typed finalize source | `bridge_wrap.rs:116-148` |
-| Coordinator/checkpoint | Complete earned-state production and authenticated root evolution | Current six-root owner `psy_data/src/v1/qdata/checkpoint.rs:320-370` |
-| StateManager | Atomic per-transaction publication, complete-window progress, finalize/deposit joins | `StateManager.sol:205-275` |
-| Payer / Bridge | Reward positive delta / withdrawal nonce and delay | `EthereumRewardPayer.sol:52-95`; `Bridge.sol:643-670` |
+| Checkpoint schema | Remains six roots and 192 bytes; no reward-root addition | `psy_data/src/v1/qdata/checkpoint.rs:320-370` |
+| StateManager | Atomic per-transaction publication, complete-window progress, finalize and deposit joins; no persistent job-nullifier cursor | `StateManager.sol:205-275` |
+| Payer / Bridge | Current payer is per-job `REWARD_PER_CLAIM`; proposed payer is one full `W`. Withdrawal nonce and delay stay unchanged | `EthereumRewardPayer.sol:46-95`; `Bridge.sol:643-670` |
 | Relayer / service | Retained exact artifacts, family-specific proving, receipt recovery, canonical projections | `daemon.rs:1338-1459,1817-1919` |
 
 ## File Changes
@@ -550,115 +558,128 @@ This is a source-impact plan, not an applied source patch. Hunk headers below id
 |---|---|
 | `client_prover/psy_core/psy_data/src/bridge_aggregate.rs` | Retain deposit codec/preimages; add header/cumulative codec/typed Hash4/helper; separate deposit 1024 bound from window 131072 bound. |
 | `psy_plonky2_common_circuits/src/bridge/aggregate_config.rs` | Match three native config count bounds in circuit. |
-| `psy_plonky2_circuits/src/bridge/circuits/inclusion_aggregate.rs` | Replace merged family constructor with separate withdrawal/reward owning circuits; share only identical tree/encoding helpers. Register 28 publication inputs before build. |
-| User accumulator and checkpoint producer owners identified in reward relation subsection | Proposed 34-input self-recursive relation and authenticated earned state; terminal join blocks executable source interface freeze. |
-| `psy_plonky2_circuits/src/bridge/circuits/bridge_wrap.rs` | Artifact-specific inclusion width 28 versus deposit 12; typed finalize source, exact encoding and chain-list identity. |
+| `psy_plonky2_circuits/src/bridge/circuits/inclusion_aggregate.rs` | `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit` own their relations and share `AGGREGATE_PI_LEN`. |
+| `psy_plonky2_circuits/src/bridge/circuits/reward_session.rs` | `RewardSessionCircuit` is the session kind from section 3. Do not add a balance, debit, ticket registry, or seventh checkpoint root. |
+| `psy_plonky2_circuits/src/bridge/circuits/user_reward_aggregate.rs` | Superseded by `reward_session.rs`. The temporary mapping above records its names until the cutover lands. |
+| `psy_plonky2_circuits/src/bridge/circuits/bridge_wrap.rs` | Artifact-specific inclusion width `AGGREGATE_PI_LEN` versus the deposit width; typed finalize source, exact encoding, and chain-list identity. |
 | `psy_plonky2_circuits/src/bridge/circuits/bridge_agg_final.rs` | Direct span<=32 path with full transition coverage; preserve Chain prefix for larger spans. |
 | `psy_cli/psy_relayer_cli/src/bridge/prove_bridge.rs`, `regen_groth16_keystore.rs` | Independent cached-base/coordinator equality guard before construction/setup and proving; artifact-specific wrapper dispatch. |
 | `psy-contracts/src/BridgeOpening.sol` | Decode strict header/cumulative bytes and update window bounds without deposit preimage changes. |
-| `psy-contracts/src/StateManager.sol` | Replace full payout-opening ABI with section 6; registry/progress/root chain, six-half inclusion calls; no direct payout. |
+| `psy-contracts/src/StateManager.sol` | Replace the full payout-opening ABI with section 6. Keep registry and progress atomic. Do not add a persistent job-nullifier cursor or a direct payout. |
 | `psy-contracts/src/IInclusionAggregateVerifier.sol` | New six-half interface; do not change deposit `IAggregateVerifier.sol`. |
-| `psy-contracts/src/EthereumRewardPayer.sol`, `IEthereumRewardPayer.sol` | Replace per-job payment with section 6 cumulative claim and accounting; preserve economic domain/token safety. |
+| `psy-contracts/src/EthereumRewardPayer.sol`, `IEthereumRewardPayer.sol` | The proposed payout is section 6's one full `W` and source-user key. Current source remains the per-job key in section 6. This row does not claim that replacement has landed. |
 | `psy-contracts/src/Bridge.sol`, `IAggregateBridge.sol` | Pull membership before existing nonce/delay path; remove StateManager batch-registration callers in the same cutover. |
 | `psy_cli/psy_relayer_cli/src/bridge/daemon.rs` | Ordered retained segment artifacts, manifest and receipt state; preserve crash ordering. |
 | `../psy-services/src/api/handlers/inclusion_aggregate.rs`, `../psy-services/src/repositories/inclusion_aggregate.rs` | New dedicated endpoint/repository for section 7; register through existing server/module lists. Do not reuse unrelated public-transfer repository. |
 | Existing adjacent aggregate/payer/checkpoint tests | Author section 8 contracts; execution only in authorized QA. Preserve named 30M fixture. |
 
-Concrete inspected declaration hunks:
-
-```diff
---- a/psy_plonky2_circuits/src/bridge/circuits/inclusion_aggregate.rs
-+++ b/psy_plonky2_circuits/src/bridge/circuits/inclusion_aggregate.rs
-@@ -15,1 +15,1 @@
--pub const AGGREGATE_PI_LEN: usize = 12;
-+pub const AGGREGATE_PI_LEN: usize = 28;
---- a/client_prover/psy_core/psy_data/src/bridge_aggregate.rs
-+++ b/client_prover/psy_core/psy_data/src/bridge_aggregate.rs
-@@ -244,2 +244,3 @@
--            || [self.max_deposits, self.max_withdrawals, self.max_rewards].iter()
--                .any(|&count| count as usize > MAX_LEAVES)
-+            || self.max_deposits as usize > MAX_LEAVES
-+            || self.max_withdrawals > 131072
-+            || self.max_rewards > 131072
-```
-
-These hunks are only exact declaration/bound changes. They are not sufficient implementations of the interfaces above. Constructor targets, equality constraints, witness assignment, codecs, native metadata and setup consumers cut over atomically. User proof width, inclusion width and finalize width never share a blanket replacement.
+`AGGREGATE_PI_LEN` in `inclusion_aggregate.rs` is the current publication width for both inclusion circuits. Deposit, withdrawal, and reward count bounds in `bridge_aggregate.rs` remain separate. Constructor targets, equality constraints, witness assignment, codecs, native metadata, and setup consumers cut over together. Session width, publication width, and finalize width never share a blanket replacement.
 
 Setup generation remains gated. Operational command reference, not execution authorization: digest setup uses `psy_relayer_cli regenerate-groth16-keystore --aggregate-proofs --aggregate-config <approved-json> --output-dir <fresh-directory>`; finalize uses `regenerate-groth16-keystore --include-bridge-agg --aggregate-config <approved-json> --skip-deposit-append --skip-withdrawal-claim --keystore-dir <fresh-directory>`, then `export-solidity-verifier --finalize <fresh-directory> <output.sol>`. A fresh directory is mandatory; source/common/verifier/fingerprint, native proving/verifying keys and Solidity verifier constitute one atomic artifact set. Old setup files never validate changed layouts.
 
-Source/service cutover rejects old checkpoint-aggregate schemas and old cumulative-incompatible reward codecs without conversion. Archive service claims verbatim; archived included/applied/rejected claim-id or spent-key associations block fresh admission. Queued/refresh-required archive rows are not reinterpreted. Preserve already-applied migration bytes. Activation in an existing economic domain requires an authenticated earned root, presented-job nullifier root, delivered totals and initialized recipients; no implicit zero reset or fabricated migration amount. Fresh domain starts from canonical empty-tree roots, never integer zero.
+Source and service cutover reject the old per-job aggregate schema and the superseded 160-byte cumulative codec without conversion. `CumulativeRewardLeaf` is not a migration input. Archive service claims verbatim. Archived included, applied, or rejected claim-id and spent-key associations block fresh admission. Queued or refresh-required archive rows are not reinterpreted. The current payer key and the proposed source-user key are different identities, so an existing economic domain has no implicit migration. No zero root and no fabricated amount are allowed. A fresh domain starts from the canonical empty session root, never integer zero.
 
 ## Naming Crosswalk
 
-| Concept | Final spelling and equivalent siblings | Protected occurrence / disposition |
+Registered concepts only. Final spellings are those in `TERMINOLOGY.md`. This table renames no source identifier, wire field, cryptographic label, or preimage.
+
+| Concept | Registered spelling | Protected occurrences |
 |---|---|---|
-| Complete withdrawal opening | `WithdrawalAggregateOpening` | `WithdrawalBatch` remains cryptographic label; no `WAggregateOpening` alias. |
-| Complete reward opening | `RewardAggregateOpening` for existing per-job source; `CumulativeRewardLeaf` identifies proposed payout codec | `RewardBatch` remains existing label; new cumulative domains distinguish bytes. No `RAggregateOpening` alias. |
-| Opening digest | Rust `opening_digest`; JSON/Solidity `openingDigest`; deposit `deposit_opening_digest` / `depositOpeningDigest` | Distinct from `header_digest`; retire `statementB` and `aggregateStatement` fields without aliases. |
-| Publication header/root | `InclusionAggregateHeader`, `InclusionAggregateRoot`, `claim_tree_root` | Not an earned-state accumulator. |
-| Reward user amount | `total_amount`, eight little-endian u32 limbs | User width 34 only; unrelated source widths remain distinct. |
-| Job identity | `nullifier_key`, `nullifier_tree`, `old_nullifier_root`, `new_nullifier_root`, proposed `NULLIFIER_TREE_HEIGHT=63` | Current L1 `spentRewards` and withdrawal `claimedNullifiers` are protected existing mappings, not naming aliases for the tree. |
-| Checkpoint membership | `historical_merkle_proof` | Existing `claim_checkpoint_path` is source evidence; `HistoricalRootMerkleProofGadget` is a different header-upgrade operation. |
-| Earned authority | `reward_accumulator_root` | Proposed root, not existing source slot. |
-| Payout bookkeeping | `paid_total` | Payer-owned delivered amount, never entitlement proof. |
-| Encoding selector | `Hash4Encoding::{CanonicalU64x4,LittleEndianU32x8}` | Explicit widths; Keccak words not interchangeable. |
-| Codec / circuit leaf types | Existing `AggregateLeaf` / `AggregateLeafTarget` | Different types, preserve distinction. |
-| Earned leaf / contribution | `RewardAccumulatorLeaf`, `RewardPosition`, `positions_commitment` | Proposed checkpoint accounting types; transient positions are not stored cumulative counts. |
-| Circuit kind / recursion depth | Self-recursive user accumulator / data-dependent steps | Exactly three reward kinds; not a fixed three-proof depth. |
+| Complete withdrawal opening | `WithdrawalAggregateOpening` | Frozen label `WithdrawalBatch`. |
+| Complete reward opening | `RewardAggregateOpening` | Frozen label `RewardBatch`. `SourceCheckpointRewardLeaf` is the payout codec, not a rename of this opening. |
+| Opening digest | `opening_digest` | JSON/Solidity `openingDigest`; deposit `deposit_opening_digest` / `depositOpeningDigest`. Distinct from `header_digest`. |
+| Publication header | `InclusionAggregateHeader` | Binds `opening_digest`, `claim_tree_root`, segment context, and family roots. Reward slots are `old_ledger_state_root` and `new_ledger_state_root`. |
+| Publication registry entry | `InclusionAggregateRoot` | Derived lookup. Stored authority is `headerBytes`. Not reward-ledger occupancy. |
+| Segment publication argument | `InclusionSegment` | `headerBytes`, proof, and first/last leaf paths. Not a stored registry row. |
+| Window progress | `ActiveWindow` | `initialized` is window existence. Publication does not mark claims paid. |
+| Claim tree | `claim_tree_root` | Marker-12 Keccak root of one segment. Not a session-nullifier root. |
+| User amount | `total_amount` | Eight little-endian u32 limbs. Terminal value is `W`. The statement is `RewardSessionStatement`. |
+| Session job identity | `nullifier_key` | Session-local `(source<<31)\|(level<<26)\|index`. Not persistent and not L1 `spentRewards`. |
+| Checkpoint membership | `historical_merkle_proof` | Existing `claim_checkpoint_path` is the same membership. `HistoricalRootMerkleProofGadget` is a different header-upgrade operation. |
+| Reward session | `RewardSessionCircuit` | One proof chain per `(economic_domain,source_checkpoint_id,user_id)`. Omitted jobs are forfeited. |
+| Session seed | `jobs_commitment` | Base is `reward_session_seed` over `PsyRewardJobs/Session/1`. `rolling_jobs_commitment` absorbs the active job records. |
+| Session summary | `reward_session_summary` | Binds the statement, seed, and private session root under `PsyRewardSession/Summary/1`. |
+| Ledger state | `RewardLedgerStateTargets` | Window hash, `ledger_root`, `user_root`, `session_count`, and `unfinished_session_count`. |
+| Ledger window | `RewardLedgerWindowTargets` | Poseidon binding over `PsyRewardLedger/Window/1`. |
+| Ledger occupancy | `RewardLedgerLeafTargets` | Occupancy write at the reward ledger key under `PsyRewardLedger/Issued/1`. |
+| Publication endpoints | `old_ledger_state_root`, `new_ledger_state_root` | Composite ledger-state endpoints. Not session-nullifier roots. |
+| Publication width | `AGGREGATE_PI_LEN` | Sole owner of the inclusion publication width, shared by `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit`. |
+| Claimant identity | `UserAuthTargets` | Scheme selector, registered leaf, `public_key_param`, signature gadgets, and `auth_message`. Only `is_final_step` authenticates the claimant. |
+| Payout key | Consumption key | Boolean per economic domain, source, and user. Current `spentRewards` is a different per-job boolean. |
+| Hash4 selector | `Hash4Encoding` | `CanonicalU64x4`, `LittleEndianU32x8`. Keccak words are not interchangeable. |
+| Codec and circuit leaves | `AggregateLeaf`, `AggregateLeafTarget` | Different types. Preserve the distinction. |
+| Payout leaf flag | `initialized` | `SourceCheckpointRewardLeaf` field. Solidity/JSON `initialized`. Payable only when true. |
+| Registry existence | `published` | Derived from registry-key existence. Not a stored header field. |
+| Window existence | `initialized` | `ActiveWindow` field. Distinct from the payout-leaf flag. |
+| Circuit kinds | Reward circuit kind | `RewardSessionCircuit`, `RewardInclusionAggregateCircuit`, and the Groth16 wrapper. Depth is data-dependent and is not another kind. |
+| Admission connection | Interleaved admission gap | Unclosed private-target connection. No wider statement, balance, or persistent job root is adopted. |
 
-## Prior Document Content Disposition
+Temporary cutover record. Remove this table after the cutover has landed and review has accepted it.
 
-Inventory was performed against the complete 239-line `bridge-proof-aggregation.md` before replacement. This table covers every normative section; the former path becomes only an operational pointer, not another contract.
-
-| Prior content | Disposition in this authority |
+| Current source spelling | Registered spelling |
 |---|---|
-| Scope/guardian ownership, sections 1–2 | Retained section 1; guardian document untouched. |
-| Canonical domains, complete opening bytes, section 3 | Retained section 4; corrected obsolete nested reward-digest claim to source flat digest; cumulative bytes use a new domain. |
-| Deposit aggregate and endpoint joins, section 4 | Retained section 5 unchanged in authority and mandatory proof. |
-| Dynamic finalize/replay/chain-list identity, section 5 | Retained section 5, including full `26+9*C` and `144+72*C`. |
-| Withdrawal vector/private height-8 membership/sorting, section 6 | Retained withdrawal pipeline and configured-root checks; claim delivery moves nonce consumption to pull. |
-| Per-job reward authority/payment, section 7 | Source description only; replaced by checkpoint-earned user relation, nullifier presentation and cumulative pull. No parallel per-job payout. |
-| Four setup identities/source-fit warning, section 8 | Retained distinct finalize/deposit/withdrawal/reward identities and resource bounds; user layer is not another L1 setup. |
-| One atomic full-opening transaction and old events, section 9 | Replaced by atomic per-publication-transaction roots plus segmented complete-window progress; no false whole-window atomicity claim. |
-| Retry/race/reorganization, section 10 | Retained fail-closed submission evidence and canonical reconciliation in section 7; consumption moves to pull. |
-| Cutover/archive/setup commands, section 11 | Retained File Changes with no execution/activation authorization. |
-| Structures/functions/loops/modules/files | Consolidated into corresponding sections; removed obsolete combined checkpoint aggregate and merged family-circuit target. |
-| Cost/acceptance | Replaced outdated calldata arithmetic; retained serial memory bounds, added actual 8M receipts and separate 30M fixture. |
-| Rationale/security/approval | Consolidated below; old approvals never carry to the new protocol. |
+| `UserRewardAggregateCircuit` | `RewardSessionCircuit` |
+| `UserRewardTargets` | `RewardSessionStatement` |
+| `USER_REWARD_PROOF_FIELD_COUNT` | `REWARD_SESSION_PROOF_FIELD_COUNT` |
+| `USER_REWARD_STEP_CAPACITY` | `REWARD_SESSION_STEP_CAPACITY` |
+| `CreditSessionTargets` | `RewardSessionTargets` |
+| `credit_session_seed` | `reward_session_seed` |
+| `credit_session_summary` | `reward_session_summary` |
+| `CreditSessionAuthorization` | `RewardSessionAuthorization` |
+| `CreditJobTargets` | `RewardSessionJobTargets` |
+| `CreditJobWitness` | `RewardSessionJobWitness` |
+| `credited_amount` | `job_amount` |
+| `RewardLedgerStateTargets.context` / `RewardLedgerStateValues.context` | `ledger_window_hash` |
+| wrapper field `context` holding the ledger window | `ledger_window` |
+| `AdmissionStateTargets` | `RewardLedgerStateTargets` |
+| `AdmissionContextTargets` | `RewardLedgerWindowTargets` |
+| `CreditAdmissionTargets` | `RewardLedgerLeafTargets` |
+| `old_nullifier_root` / `new_nullifier_root` | `old_ledger_state_root` / `new_ledger_state_root` |
+| `InclusionAggregateCircuit` | `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit` |
+| `WITHDRAWAL_PUBLICATION_PI_LEN` | `AGGREGATE_PI_LEN` |
+| `PsyRewardJobs/CreditSession/1` | `PsyRewardJobs/Session/1` |
+| `PsyRewardAdmission/CreditSession/1` | `PsyRewardSession/Summary/1` |
+| `PsyRewardAdmission/Credit/1` | `PsyRewardLedger/Issued/1` |
+| `PsyRewardAdmission/Context/1` | `PsyRewardLedger/Window/1` |
+| `PsyRewardAdmission/State/1` | `PsyRewardLedger/State/1` |
+| `PsyRewardAdmission/{Verifier,Node,Empty}/1` | `PsyRewardLedger/{Verifier,Node,Empty}/1` |
+| `PsyBridge/SourceCheckpointReward/1/Record` | `PsyBridge/SourceCheckpointReward/1/Leaf` |
+| `AdmissionRequest` / `AggregationAdmissionRequest` | `AggregationClaimRequest` |
+| admission builder method | `build_aggregation_claim` |
+| `Admission` enum variant | `AggregationClaim` |
 
 ## Rationale
 
-- A checkpoint-earned accumulator exists because without authenticated earned authority, a valid presentation-bit transition can authorize a free lifetime total.
-- One jobs commitment exists because without binding the exact context and job list, amount/count/nullifier witnesses can describe different jobs.
-- A nullifier tree exists because without zero-to-one membership the same presented job can be admitted repeatedly; it is not a second earned or paid ledger.
-- `paid_total` exists because published cumulative leaves overlap and otherwise pay the lifetime amount repeatedly.
-- An immutable recipient exists because otherwise an unclaimed earned amount can be redirected by a new caller or configuration.
+- One session exists because one `(economic_domain,source_checkpoint_id,user_id)` has one credit and one full payment. A second session would credit omitted jobs again.
+- The session seed exists because amount and count must bind the same source, user, recipient, and included jobs.
+- The session nullifier exists only while the session is unfinished. It stops the same included job from being added twice. It is not a second payment ledger and is not retained.
+- One boolean consumption key exists because the full `W` is paid once. A per-job payment key answers a different question and is the current payer's question.
+- An omitted job is forfeited because the user chose the included set. The protocol does not keep a residual balance for the rest.
 - Segmentation exists because 100,000 users exceed every allowed compiled inclusion capacity.
 - Active-window manifests and boundary witnesses exist because without them omitted segments or cross-segment duplicates can be presented as a complete window.
-- Distinct withdrawal/reward circuits exist because their membership, ordering, replay and payment semantics are different. Sharing only pure identical algorithms avoids a runtime family-selection relation.
-- Typed finalize identity and base/step equality exist because same-width wrong sources or chain lists can otherwise use incompatible setup metadata.
+- Distinct withdrawal and reward circuits exist because their membership, ordering, replay, and payment semantics differ. Sharing only identical pure algorithms avoids a runtime family selector.
+- Typed finalize identity and base/step equality exist because a same-width wrong source or chain list can otherwise use incompatible setup metadata.
 - Retained Sending exists because an unknown broadcast outcome is not evidence permitting a second transaction.
-- Three circuit kinds retain one reusable user relation while allowing data-dependent self-recursive depth; a bounded step is not a cap on lifetime work. Interleaved terminal history still needs a proof-authenticated common-history join.
-- Realm-finalize output commitment `A` is an opaque value, not a job subtree and not a tagged claimable reward leaf. The circuit binds it as the value-only right child of the inner reward hash: `reward_subtree=H(root_guta.rewards_tree_value,A)`, `R63=H(reward_subtree,worker_reward_tag)`, and the registered public input is `PI=H(final_guta_header_hash,R63)` (`psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs:690-741`; host mirror `psy_data/src/guta/realm_finalize.rs:171-173,331-363`). A's own preimage contains no `worker_tag`. This document does not claim that public `A` or that public input discloses `worker_tag`: the tag is a circuit witness, and any tag visibility requires explicit transport such as the proposal body. EndCap admission and coordinator admission authenticate their own proof, identity, and first-writer boundaries; neither is coordinator inclusion (`psy_node_common/src/realm/edge/handler.rs:829-863,972-983`; `psy_node_common/src/coordinator/edge/handler.rs:636-733`).
-- The exact completeness recurrence and its DFS alternative are not adopted. Current producer accounting remains the ascending-user fold in the reward relation subsection. Three earlier counterexamples are withdrawn and are not retained as bugs: a zero-tag descendant under `(2,1)`, including `(3,2)`, is geometrically ineligible because every descendant of `(h,i)` with `i>=2^(h-2)` stays outside `index<2^(level-2)`; same-owner sequential addition on the current root is sound without requiring intermediate roots to commute; and a substituted base fails a pinned context chain rather than requiring base-local authentication. Those withdrawals do not select DFS, a 64-frame stack, or chunk width `k`.
-- All code authoring is authorized before the terminal common-history join freezes. That authorization is not cryptographic GO and not payable activation. It does not adopt a root-7 protocol, does not change the exact 34 user fields, does not merge withdrawal and reward, and does not turn benchmark-selected `k` into a lifetime cap.
+- Three circuit kinds retain one reusable credit relation while allowing data-dependent depth. A bounded step is not a lifetime cap.
+- Realm-finalize output commitment `A` is an opaque value, not a job subtree and not a tagged claimable reward leaf. The circuit binds it as the value-only right child of the inner reward hash: `reward_subtree=H(root_guta.rewards_tree_value,A)`, `R63=H(reward_subtree,worker_reward_tag)`, and the registered public input is `PI=H(final_guta_header_hash,R63)` (`psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs:690-741`; host mirror `psy_data/src/guta/realm_finalize.rs:171-173,331-363`). A's own preimage contains no `worker_tag`. This document does not claim that public `A` or that public input discloses `worker_tag`.
+- No checkpoint reward root is added. The six-root checkpoint schema remains the source schema.
 
 ## Security Considerations
 
-1. A named/public root is not authenticated unless its membership and recursive equality constraints reach the verified checkpoint/finalize source.
-2. Earned-state completeness and recipient initialization are checkpoint transition obligations; L1 paid totals and job-admission bits cannot repair an omitted obligation.
-3. Same immutable birth key with different user/rate/recipient context rejects. Re-anchoring never changes identity.
-4. Publication root chains start at current stored root, advance exactly once and revert atomically with all writes in that transaction.
-5. Pull accounting and exact token movement commit together; a zero/negative delta rejects before subtraction.
-6. Segmented windows are not globally atomic; incomplete progress blocks the next window, while already published valid claims remain payable.
-7. Unknown submission outcome halts resend; administrative state override does not recreate spent jobs or paid amounts.
-8. Missing artifact availability is not proof failure and does not justify accepting unbound replacement witnesses.
-9. Hash4 encodings, byte order, integer width, chain order and verifier identity are protocol inputs, not decoder conveniences.
-10. No gas, proof-capacity, runtime or deployment success is asserted here.
-11. Current implementation authority `G6` does not contain `reward_accumulator_root`. `PQEDCheckpointGlobalStateRoots` has exactly six hashes and a 192-byte encoding (`psy_data/src/v1/qdata/checkpoint.rs:320-327,362-370`), and `G6` is the six-root hash at `checkpoint.rs:489-493`. A later user note that leaf roots bind earned state does not replace the unresolved root decision and does not activate a seventh root. The private witness still opens accumulator leaves under checkpoint leaves O and N (`bridge-merkle-settlement` user-witness subsection), and the jobs seed still binds O and N. A candidate terminal equality `amount==amount(N)` therefore depends on an earned-state authority this current interface does not provide. The actual unresolved interface is the current checkpoint child statement: `checkpoint_state_transition_proofs.rs:193-204` checks `H(header,R)` and has no frontier, accumulator, or reward-root input, while `checkpoint_state_transition.rs:68-153` builds the fixed child/core circuit and checkpoint-history recursion. This is not a blanket instruction to wait, and it is not solved by relabeling that relation as one of the three reward claim kinds.
+1. A named public root is not authenticated unless its membership reaches the verified checkpoint or finalize source.
+2. The credit relation authenticates included jobs only. L1 cannot turn an omitted job into a later balance.
+3. The same session key with a different user, source, or recipient rejects. A new end root never changes that identity.
+4. Publication writes segment headers atomically. It does not advance a persistent job-nullifier cursor.
+5. The proposed payment and exact token movement commit together. A zero amount rejects.
+6. Segmented windows are not globally atomic. Incomplete progress blocks the next window, while an already published valid claim remains payable.
+7. An unknown submission outcome halts resend. An administrative override does not recreate a paid credit.
+8. Missing artifact availability is not proof failure and does not justify an unbound replacement witness.
+9. Hash4 encoding, byte order, integer width, chain order, and verifier identity are protocol inputs, not decoder conveniences.
+10. No gas, proof-capacity, runtime, or deployment success is asserted here.
+11. `PQEDCheckpointGlobalStateRoots` has exactly six hashes and a 192-byte encoding (`psy_data/src/v1/qdata/checkpoint.rs:320-327,362-370`). Its hash is the six-root hash at `checkpoint.rs:487-493`. This contract does not add a seventh root.
 
 ## Review and Activation Boundary
 
-The 34-field amount decision and three circuit kinds are adopted requirements, not remaining questions. Same-kind recursion depth is data-dependent and `k` is benchmark-selected. Withdrawal and reward remain separate pipelines. All code authoring is authorized before the terminal common-history join freezes. That authorization is not cryptographic GO, not payable activation, and not approval; it does not freeze the unresolved terminal-join source interface. The terminal common-history binding gap in the reward relation subsection remains the stated cryptographic design blocker; no free-root workaround, extra commitment, or 38-field interface is adopted or claimed necessary. Proposed checkpoint storage and the cumulative protocol are not existing code. No reward-position recursion is implemented: the unsafe base that accepted unbound context is removed as a candidate, not replaced by a shipped recursive relation. Current `G6` still has no reward root, so root-7 activation stays an unresolved decision rather than an adopted protocol change.
+`RewardSessionStatement` and the three circuit kinds are the adopted contract. Same-kind recursion depth is data-dependent and `REWARD_SESSION_STEP_CAPACITY` is benchmark-selected. Withdrawal and reward remain separate pipelines. No balance, debit, ticket registry, persistent per-job root, or seventh checkpoint root is part of the contract. The current L1 payer key remains the per-job key in section 6; the source-user key is not claimed to have replaced it.
 
-Independent GPT and Grok review of this exact version, at least two rounds under `PIPELINE.md`, then an independent design-reviewer gate, are unmet. Those gates cannot pass while the terminal join, the actual checkpoint reward-root interface, or recipient-import completion remains unspecified. This revision records the withdrawn counterexamples and the opaque-`A` boundary; it does not close them as approval and does not claim GO. Product funding, withdrawal timing, and authenticated existing-domain migration remain activation prerequisites. The author does not self-approve. This assignment executes no source implementation, tests, builds, formatter, setup generation, Git operation, or deployment.
+Global one-credit occupancy is `RewardLedgerLeafTargets`: two u32 path limbs, user then source, empty zero leaf to occupied leaf under `PsyRewardLedger/Issued/1`. It is not the current L1 key. `reward_session_summary` binds the private session root under `PsyRewardSession/Summary/1`. `UserAuthTargets` authenticates the claimant only on `is_final_step` and fails closed on an unknown fingerprint. No exported constructor connects every selected terminal to one publication history. None of these facts adds a public input or a global per-job bitmap. Independent review under `PIPELINE.md` and the design-reviewer gate are unmet. This document does not claim GO. Product funding, withdrawal timing, and an explicit migration decision remain outside this contract.

@@ -23,11 +23,15 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     },
 };
-use psy_client_data::bridge_aggregate::{
-    bind_claim_tree, deposit_leaf_path, deposit_leaf_tree, DepositAggregateOpening,
-    ChainConfig, ChainStart, DepositLeaf, DepositLeafRange, DepositTransition,
-    InclusionAggregateHeader, NetworkConfig, RewardAggregateOpening, RewardLeaf,
-    WithdrawalAggregateOpening, WithdrawalLeaf, INCLUSION_AGGREGATE_CAPACITIES, WITHDRAWAL_PUBLICATION_FAMILY,
+use psy_client_data::{
+    bridge_aggregate::{
+        bind_claim_tree, deposit_leaf_path, deposit_leaf_tree, DepositAggregateOpening,
+        ChainConfig, ChainStart, DepositLeaf, DepositLeafRange, DepositTransition,
+        InclusionAggregateHeader, NetworkConfig, RewardSessionProofFields, SourceCheckpointRewardLeaf,
+        SourceCheckpointRewardOpening, WithdrawalAggregateOpening, WithdrawalLeaf,
+        INCLUSION_AGGREGATE_CAPACITIES, REWARD_PUBLICATION_FAMILY, WITHDRAWAL_PUBLICATION_FAMILY,
+    },
+    qdata::{checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf}, user::PsyUserLeaf},
 };
 use psy_core::{
     constants::chain_id::PsyChainNetworkType,
@@ -59,8 +63,9 @@ use psy_plonky2_circuits::{
             bridge_agg_chain::{BridgeAggChainBoundary, BridgeAggChainCircuit},
             bridge_agg_final::{BridgeAggFinalSlotWitness, BridgeAggFinalEndpointWitness},
             chain_aggregate::{ChainContext, ChainRow},
-            inclusion_aggregate::{AggregateWindow, RewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths, WITHDRAWAL_PUBLICATION_PI_LEN},
-            reward_inclusion::{RewardTagWitness, RewardWitness},
+            inclusion_aggregate::{AggregateWindow, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths, AGGREGATE_PI_LEN},
+            reward_inclusion::RewardTagWitness,
+            reward_session::{RewardLedgerStateValues, RewardSessionJobWitness, RewardSessionWitness},
         },
         gadgets::{
             tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
@@ -77,7 +82,6 @@ use psy_plonky2_common_circuits::bridge::{
 use tiny_keccak::{Hasher as _, Keccak};
 use parth_core::crypto::hash::spiderman::SpidermanUpdateProof;
 use psy_crypto::signature::zk::wallet::SimplePsyPrivateKey;
-use psy_ups_circuit::signature::reward_authorization::{RewardAuthorizationContext, RewardAuthorizationInput};
 use psy_vm::reward_authorization::RewardAuthorizationWitness;
 
 type C = PoseidonGoldilocksConfig;
@@ -438,7 +442,7 @@ fn assert_opening_digest(proof: &ProofWithPublicInputs<F, C, D>, family: u32, va
 
 fn assert_withdrawal_publication(proof: &ProofWithPublicInputs<F, C, D>, header: &InclusionAggregateHeader) {
     let words = header.publication_words().expect("withdrawal publication words");
-    assert_eq!(words.len(), WITHDRAWAL_PUBLICATION_PI_LEN);
+    assert_eq!(words.len(), AGGREGATE_PI_LEN);
     assert_eq!(proof.public_inputs, words.map(F::from_canonical_u32));
     assert_eq!(&proof.public_inputs[..4], &[1, 7, WITHDRAWAL_PUBLICATION_FAMILY as u32, 0].map(F::from_canonical_u32));
     assert_eq!(pi_bytes(&proof.public_inputs[4..12]), header.opening_digest);
@@ -462,8 +466,8 @@ fn withdrawal_publication_header(config: &NetworkConfig, opening: &WithdrawalAgg
         first_ordinal: 0,
         count,
         withdrawal_roots: opening.withdrawal_roots.clone(),
-        old_nullifier_root: None,
-        new_nullifier_root: None,
+        old_ledger_state_root: None,
+        new_ledger_state_root: None,
         opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest(config)? },
         claim_tree_root: [0; 32],
     };
@@ -474,6 +478,246 @@ fn withdrawal_publication_header(config: &NetworkConfig, opening: &WithdrawalAgg
     header.validate()?;
     Ok(header)
 }
+fn poseidon_bytes(bytes: &[u8]) -> [u64; 4] {
+    hash4(QHashOut(PoseidonHash::hash_no_pad(&bytes.iter().copied().map(F::from_canonical_u8).collect::<Vec<_>>())))
+}
+
+fn append_u32(bytes: &mut Vec<u8>, value: u32) { bytes.extend_from_slice(&value.to_le_bytes()); }
+
+fn append_hash(bytes: &mut Vec<u8>, value: [u64; 4]) {
+    for limb in value { bytes.extend_from_slice(&limb.to_le_bytes()); }
+}
+
+fn empty_root(height: usize) -> [u64; 4] {
+    hash4(<PoseidonHash as MerkleZeroHasher<QHashOut<F>>>::get_zero_hash(height))
+}
+
+fn empty_summary_root() -> [u64; 4] {
+    let mut root = poseidon_bytes(b"PsyRewardLedger/Empty/1");
+    for height in 1..=32u8 {
+        let mut bytes = b"PsyRewardLedger/Node/1".to_vec();
+        bytes.push(height);
+        append_hash(&mut bytes, root);
+        append_hash(&mut bytes, root);
+        root = poseidon_bytes(&bytes);
+    }
+    root
+}
+
+fn summary_path(user_id: u32, value: [u64; 4], siblings: &[[u64; 4]; 32]) -> [u64; 4] {
+    let mut root = value;
+    for (height, sibling) in siblings.iter().enumerate() {
+        let (left, right) = if user_id & (1 << height) == 0 { (root, *sibling) } else { (*sibling, root) };
+        let mut bytes = b"PsyRewardLedger/Node/1".to_vec();
+        bytes.push((height + 1) as u8);
+        append_hash(&mut bytes, left);
+        append_hash(&mut bytes, right);
+        root = poseidon_bytes(&bytes);
+    }
+    root
+}
+
+fn verifier_hash(circuits: &AggregateCircuits) -> [u64; 4] {
+    let verifier = &circuits.reward_session.circuit_data.verifier_only;
+    let mut bytes = b"PsyRewardLedger/Verifier/1".to_vec();
+    append_hash(&mut bytes, hash4(QHashOut(verifier.circuit_digest)));
+    append_u32(&mut bytes, verifier.constants_sigmas_cap.0.len() as u32);
+    for hash in &verifier.constants_sigmas_cap.0 { append_hash(&mut bytes, hash4(QHashOut(*hash))); }
+    poseidon_bytes(&bytes)
+}
+
+fn ledger_window_hash(config_hash: [u8; 32], economic_domain: [u8; 32], window_id: [u8; 32],
+    end_checkpoint_id: u32, checkpoint_root: [u64; 4], start_root: [u64; 4], verifier: [u64; 4]) -> [u64; 4]
+{
+    let mut bytes = b"PsyRewardLedger/Window/1".to_vec();
+    bytes.extend(config_hash);
+    bytes.extend(economic_domain);
+    bytes.extend(window_id);
+    append_u32(&mut bytes, end_checkpoint_id);
+    for hash in [checkpoint_root, start_root, verifier] { append_hash(&mut bytes, hash); }
+    poseidon_bytes(&bytes)
+}
+
+fn ledger_state_root(state: &RewardLedgerStateValues) -> [u64; 4] {
+    let mut bytes = b"PsyRewardLedger/State/1".to_vec();
+    for hash in [state.ledger_window_hash, state.ledger_root, state.user_root] { append_hash(&mut bytes, hash); }
+    append_u32(&mut bytes, state.session_count);
+    append_u32(&mut bytes, state.unfinished_session_count);
+    poseidon_bytes(&bytes)
+}
+
+fn reward_publication_header(opening: &SourceCheckpointRewardOpening, old_ledger_state_root: [u64; 4], new_ledger_state_root: [u64; 4]) -> anyhow::Result<InclusionAggregateHeader> {
+    let count = u32::try_from(opening.leaves.len()).context("reward publication count exceeds u32")?;
+    anyhow::ensure!(count <= INCLUSION_AGGREGATE_CAPACITIES[0], "manager reward publication capacity is 1024");
+    let mut header = InclusionAggregateHeader {
+        family: REWARD_PUBLICATION_FAMILY, config_hash: opening.config_hash, window_id: opening.window_id,
+        end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root: opening.end_checkpoint_root,
+        aggregate_capacity: INCLUSION_AGGREGATE_CAPACITIES[0], total_count: count, segment_count: u32::from(count != 0),
+        segment_index: 0, first_ordinal: 0, count, withdrawal_roots: Vec::new(),
+        old_ledger_state_root: Some(old_ledger_state_root), new_ledger_state_root: Some(new_ledger_state_root),
+        opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest()? }, claim_tree_root: [0; 32],
+    };
+    if count != 0 {
+        bind_claim_tree(&mut header, &opening.leaves.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?)?;
+    }
+    header.validate()?;
+    Ok(header)
+}
+
+struct RewardSessionFixture<'a> {
+    opening: SourceCheckpointRewardOpening,
+    header: InclusionAggregateHeader,
+    witness: RewardSessionWitness<'a>,
+    old_state: RewardLedgerStateValues,
+    new_state: RewardLedgerStateValues,
+    source_checkpoint_id: u32,
+    source_siblings: [[u64; 4]; 32],
+    summary_siblings: [[u64; 4]; 32],
+    session_root: [u64; 4],
+    statement: RewardSessionProofFields,
+}
+
+
+fn reward_session_fixture<'a>(circuits: &AggregateCircuits, config: &'a NetworkConfig, window_id: [u8; 32], checkpoint: &CheckpointOne, private_key: QHashOut<F>, authorization: &'a RewardAuthorizationWitness, jobs: &'a [RewardSessionJobWitness]) -> anyhow::Result<RewardSessionFixture<'a>> {
+    let economic_domain = [6u8; 32];
+    let source_checkpoint_id = 1u32;
+    let end_checkpoint_id = 1u32;
+    let checkpoint_tree_root = hash4(checkpoint.tree_root);
+    let source_leaf: PsyCheckpointLeaf<F> = client_value(&checkpoint.new_leaf)?;
+    let source_leaf_hash = hash4(source_leaf.qfhash::<PoseidonHash>());
+    let end_leaf = source_leaf.clone();
+    let end_roots: PsyCheckpointGlobalStateRoots<F> = client_value(&checkpoint.state.roots)?;
+    let user_leaf: PsyUserLeaf<F> = client_value(&checkpoint.state.deposit.user_leaf)?;
+    let user_id = user_leaf.user_id.to_canonical_u64() as u32;
+    let recipient = [0x01020304u32, 0x05060708, 0x090a0b0c, 0x0d0e0f10, 0x11121314];
+    let amount = {
+        let mut amount = [0u32; 8];
+        for (index, chunk) in config.reward_per_claim.chunks_exact(4).rev().enumerate() {
+            amount[index] = u32::from_be_bytes(chunk.try_into()?);
+        }
+        amount
+    };
+    let mut seed_bytes = b"PsyRewardJobs/Session/1".to_vec();
+    seed_bytes.extend(economic_domain);
+    append_u32(&mut seed_bytes, source_checkpoint_id);
+    append_u32(&mut seed_bytes, user_id);
+    for word in recipient { append_u32(&mut seed_bytes, word); }
+    append_hash(&mut seed_bytes, checkpoint_tree_root);
+    append_hash(&mut seed_bytes, source_leaf_hash);
+    let seed = poseidon_bytes(&seed_bytes);
+    let tag = &jobs[0].tag;
+    let leaf_tag = tag.leaf_tag;
+    let nullifier_key = (u64::from(source_checkpoint_id) << 31) | (u64::from(jobs[0].height) << 26) | u64::from(jobs[0].path_index);
+    let occupied = QHashOut(HashOut { elements: [F::ONE, F::ZERO, F::ZERO, F::ZERO] });
+    let session_root = hash4(DeltaMerkleProofCore::from_params::<PoseidonHash>(nullifier_key, QHashOut::ZERO, occupied, jobs[0].nullifier_siblings.iter().copied().map(|sibling| QHashOut(HashOut { elements: sibling.map(F::from_canonical_u64) })).collect()).new_root);
+    let public_key_param = hash4(SimplePsyPrivateKey::new(client_value(&private_key)?).get_public_key_param::<PoseidonHash>());
+    let mut record = Vec::new();
+    append_u32(&mut record, source_checkpoint_id);
+    record.push(jobs[0].height);
+    append_u32(&mut record, jobs[0].path_index);
+    append_u32(&mut record, (1u32 << jobs[0].height) - 1 + jobs[0].path_index);
+    append_u32(&mut record, user_id);
+    for word in amount { append_u32(&mut record, word); }
+    append_hash(&mut record, hash4(leaf_tag));
+    record.extend([0, 1]);
+    let mut jobs_bytes = b"PsyRewardJobs/Step/1".to_vec();
+    append_hash(&mut jobs_bytes, seed);
+    for count in [0u32, 1, 1] { append_u32(&mut jobs_bytes, count); }
+    jobs_bytes.extend(record);
+    let jobs_commitment = poseidon_bytes(&jobs_bytes);
+    let verifier = verifier_hash(circuits);
+    let start_root = empty_root(64);
+    let window_hash = ledger_window_hash(config.config_hash()?, economic_domain, window_id, end_checkpoint_id, checkpoint_tree_root, start_root, verifier);
+    let old_state = RewardLedgerStateValues { ledger_window_hash: [0; 4], ledger_root: empty_root(64), user_root: empty_summary_root(), session_count: 0, unfinished_session_count: 0 };
+    let summary_siblings = empty_summary_siblings();
+    let mut statement_prefix = [0u64; 30];
+    statement_prefix[..4].copy_from_slice(&checkpoint_tree_root);
+    statement_prefix[4] = u64::from(user_id);
+    for (index, word) in recipient.into_iter().enumerate() { statement_prefix[5 + index] = u64::from(word); }
+    for (index, word) in amount.into_iter().enumerate() { statement_prefix[13 + index] = u64::from(word); }
+    statement_prefix[21] = 1;
+    statement_prefix[22..26].copy_from_slice(&jobs_commitment);
+    statement_prefix[26..30].copy_from_slice(&ledger_state_root(&old_state));
+    let mut summary_bytes = b"PsyRewardSession/Summary/1".to_vec();
+    for value in statement_prefix { summary_bytes.extend_from_slice(&value.to_le_bytes()); }
+    append_hash(&mut summary_bytes, seed);
+    append_hash(&mut summary_bytes, session_root);
+    summary_bytes.push(1);
+    let summary = poseidon_bytes(&summary_bytes);
+    let user_root = summary_path(user_id, summary, &summary_siblings);
+    let ledger_key = u64::from(user_id) | (u64::from(source_checkpoint_id) << 32);
+    let mut issued = b"PsyRewardLedger/Issued/1".to_vec();
+    issued.extend(economic_domain);
+    append_u32(&mut issued, source_checkpoint_id);
+    append_u32(&mut issued, user_id);
+    for word in amount.into_iter().chain(recipient) { append_u32(&mut issued, word); }
+    append_hash(&mut issued, jobs_commitment);
+    append_hash(&mut issued, window_hash);
+    let ledger_siblings = array_siblings(&[], ledger_key, 64);
+    let ledger_root = hash4(compute_root_merkle_proof_generic::<QHashOut<F>, PoseidonHash>(QHashOut(HashOut { elements: poseidon_bytes(&issued).map(F::from_canonical_u64) }), ledger_key, &ledger_siblings.iter().copied().map(|sibling| QHashOut(HashOut { elements: sibling.map(F::from_canonical_u64) })).collect::<Vec<_>>()));
+    let new_state = RewardLedgerStateValues { ledger_window_hash: window_hash, ledger_root, user_root, session_count: 1, unfinished_session_count: 0 };
+    let statement = RewardSessionProofFields {
+        checkpoint_tree_root, user_id, recipient: [recipient[0], recipient[1], recipient[2], recipient[3], recipient[4], 0, 0, 0],
+        total_amount: amount, count: 1, jobs_commitment, old_ledger_state_root: ledger_state_root(&old_state), new_ledger_state_root: ledger_state_root(&new_state),
+    };
+    let source_siblings = array_siblings(&[(1, hash4(checkpoint.new_leaf.qfhash::<PoseidonHash>()))], 1, 32);
+    let user_path = path(&[(u64::from(user_id), user_leaf_hash(&checkpoint.state.deposit.user_leaf))], u64::from(user_id), GLOBAL_USER_TREE_HEIGHT).siblings.iter().map(|sibling| hash4(*sibling)).collect();
+    let leaf = SourceCheckpointRewardLeaf { economic_domain, source_checkpoint_id: u64::from(source_checkpoint_id), user_id, amount, recipient: recipient_address(recipient), initialized: true };
+    let opening = SourceCheckpointRewardOpening { config_hash: config.config_hash()?, window_id, end_checkpoint_id: u64::from(end_checkpoint_id), end_checkpoint_root: checkpoint_tree_root, leaves: vec![leaf] };
+    let header = reward_publication_header(&opening, statement.old_ledger_state_root, statement.new_ledger_state_root)?;
+    let witness = RewardSessionWitness {
+        statement, config: config.clone(), economic_domain, window_id, start_root, source_checkpoint_id, end_checkpoint_id,
+        source_leaf: source_leaf.clone(), source_path: source_siblings, old_state: copy_state(&old_state), new_state: copy_state(&new_state),
+        own_state: copy_state(&old_state), old_summary: poseidon_bytes(b"PsyRewardLedger/Empty/1"), old_session_root: empty_root(63),
+        session_siblings: summary_siblings, own_siblings: summary_siblings, ledger_siblings, own_previous: None, global_previous: None,
+        jobs, is_final_step: true, end_leaf, end_path: source_siblings, end_roots, user_leaf, user_path, public_key_param,
+        authorization: Some(authorization),
+    };
+    Ok(RewardSessionFixture { opening, header, witness, old_state, new_state, source_checkpoint_id, source_siblings, summary_siblings, session_root, statement })
+}
+fn copy_state(state: &RewardLedgerStateValues) -> RewardLedgerStateValues {
+    RewardLedgerStateValues { ledger_window_hash: state.ledger_window_hash, ledger_root: state.ledger_root, user_root: state.user_root, session_count: state.session_count, unfinished_session_count: state.unfinished_session_count }
+}
+fn session_job(user_id: u32, source_checkpoint_id: u32) -> anyhow::Result<RewardSessionJobWitness> {
+    let tag_preimage = QHashOut(HashOut { elements: [F::from_canonical_u32(user_id), F::from_canonical_u64(11), F::from_canonical_u64(22), F::from_canonical_u64(33)] });
+    let leaf_tag = hash_two(tag_preimage, tag_preimage);
+    let leaf_node = hash_tag_tree_node::<QHashOut<F>, PoseidonHash>(&QHashOut::ZERO, &QHashOut::ZERO, &leaf_tag);
+    let mut tag = RewardTagWitness { tag_preimage, leaf_left: QHashOut::ZERO, leaf_right: QHashOut::ZERO, leaf_tag, siblings: [QHashOut::ZERO; 21], parent_tags: [QHashOut::ZERO; 21] };
+    tag.siblings[0] = hash_two(leaf_node, leaf_node);
+    tag.siblings[1] = hash_two(tag.siblings[0], tag.siblings[0]);
+    tag.parent_tags[0] = leaf_tag;
+    tag.parent_tags[1] = leaf_tag;
+    let nullifier_key = (u64::from(source_checkpoint_id) << 31) | (2u64 << 26);
+    Ok(RewardSessionJobWitness { height: 2, path_index: 0, tag, nullifier_siblings: array_siblings(&[], nullifier_key, 63) })
+}
+
+
+
+
+fn recipient_address(words: [u32; 5]) -> [u8; 20] {
+    let mut address = [0u8; 20];
+    for (index, word) in words.into_iter().enumerate() { address[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes()); }
+    address
+}
+
+fn empty_summary_siblings() -> [[u64; 4]; 32] {
+    let mut current = poseidon_bytes(b"PsyRewardLedger/Empty/1");
+    std::array::from_fn(|height| {
+        let sibling = current;
+        let mut bytes = b"PsyRewardLedger/Node/1".to_vec();
+        bytes.push((height + 1) as u8);
+        append_hash(&mut bytes, current);
+        append_hash(&mut bytes, current);
+        current = poseidon_bytes(&bytes);
+        sibling
+    })
+}
+
+fn array_siblings<const HEIGHT: usize>(leaves: &[(u64, [u64; 4])], index: u64, height: usize) -> [[u64; 4]; HEIGHT] {
+    siblings_from_known_leaves(leaves, index, height).try_into().expect("reward path height")
+}
+
+
 
 fn chain_proofs(circuits: &AggregateCircuits, config: &NetworkConfig, a: &DepositAggregateOpening,
     webs: &[Vec<ProofWithPublicInputs<F, C, D>>], tree: &[[u8; 32]],
@@ -493,7 +737,7 @@ fn chain_proofs(circuits: &AggregateCircuits, config: &NetworkConfig, a: &Deposi
 fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result<()> {
     let (coordinator, circuits) = circuits()?;
     let private_key: QHashOut<F> = QHashOut::from_values(11, 22, 33, 44);
-    let identity = circuits.entries().iter().find(|entry| (entry.family, entry.variant) == (4, 0)).context("missing ZK authorization pin")?.identity_fingerprint;
+    let identity = circuits.reward_session.identity_fingerprint_for_scheme(0)?;
     let param = SimplePsyPrivateKey::new(client_value(&private_key)?).get_public_key_param::<PoseidonHash>();
     let public_key = hash_two(QHashOut(HashOut { elements: identity.map(F::from_canonical_u64) }), QHashOut(param.0));
     let deposits: Vec<_> = [(0, 31), (0, 32), (1, 0)].into_iter().map(|(chain_index, absolute_index)| DepositLeaf {
@@ -541,10 +785,12 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
         deposits: ends.iter().enumerate().map(|(i, end)| DepositTransition { chain_index: end.chain_index, old_root: hash4(old_roots[i]), new_root: end.deposit_root, old_count: [31, 0, 0][i], new_count: end.deposit_count }).collect(), deposit_leaves: deposits,
     };
     a.window_id = a.window_id()?;
-    let reward = RewardLeaf { claim_checkpoint_id: 1, user_id: BRIDGE_USER_ID as u32, height: 2, path_index: 0, nullifier_index: 3, recipient: [9; 20] };
     let withdrawals_opening = WithdrawalAggregateOpening { config_hash: a.config_hash, window_id: a.window_id, end_checkpoint_id: 1, end_checkpoint_root: a.end_checkpoint_root, withdrawal_roots: ends.iter().map(|end| end.withdrawal_root).collect(), withdrawals: withdrawals.clone() };
-    let rewards_opening = RewardAggregateOpening { config_hash: a.config_hash, window_id: a.window_id, end_checkpoint_id: 1, end_checkpoint_root: a.end_checkpoint_root, rewards: vec![reward.clone()] };
-    a.validate(&config)?; withdrawals_opening.validate(&config)?; rewards_opening.validate(&config)?;
+    let reward_authorization = RewardAuthorizationWitness::Zk { private_key: client_value(&private_key)? };
+    let reward_jobs = [session_job(BRIDGE_USER_ID as u32, 1)?];
+    let reward_session = reward_session_fixture(circuits, &config, a.window_id, &checkpoint, private_key, &reward_authorization, &reward_jobs)?;
+    let rewards_opening = reward_session.opening.clone();
+    a.validate(&config)?; withdrawals_opening.validate(&config)?; rewards_opening.encode()?;
     let tree = deposit_leaf_tree(&a.deposit_leaves.iter().map(DepositLeaf::leaf_commit).collect::<Result<Vec<_>, _>>()?)?;
     let web_inputs: Vec<_> = a.deposit_leaves.iter().enumerate().map(|(i, leaf)| Ok(DepositSpidermanAppendInputs {
         config_hash: a.config_hash, end_checkpoint_id: 1, end_checkpoint_root: checkpoint.tree_root, chain_index: leaf.chain_index,
@@ -598,21 +844,19 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     assert_eq!(encoded_w.len(), 288 + 128 * CHAIN_INDICES.len() + 192 * withdrawals.len());
     flat_preimage.extend(encoded_w);
     assert_eq!(withdrawal_header.opening_digest, keccak(&flat_preimage));
-    let reward_input = RewardWitness { config: config.clone(), tag: checkpoint.reward_tag.clone(), authorization: RewardAuthorizationInput {
-        context: RewardAuthorizationContext {
-        config_hash: a.config_hash, end_checkpoint_id: 1, end_checkpoint_root: a.end_checkpoint_root, reward,
-        claim_checkpoint_leaf: client_value(&checkpoint.new_leaf)?, claim_checkpoint_path: client_value(&checkpoint.append.siblings)?,
-        end_checkpoint_leaf: client_value(&checkpoint.new_leaf)?, end_checkpoint_path: client_value(&checkpoint.append.siblings)?,
-        end_global_state_roots: client_value(&checkpoint.state.roots)?, authorization_user_leaf: client_value(&checkpoint.state.deposit.user_leaf)?,
-        authorization_user_path: client_value(&checkpoint.state.deposit.user_tree_proof.siblings)?,
-        },
-        authorization: RewardAuthorizationWitness::Zk { private_key: client_value(&private_key)? },
-    } };
-    let reward_proof = circuits.reward.prove(&reward_input)?;
-    let reward_leaves = [RewardAggregateLeaf { leaf: &rewards_opening.rewards[0], proof: &reward_proof }];
-    let proof_r = circuits.prove_reward_aggregate(&config, &rewards_opening, &reward_leaves)?;
+    let reward_proof = circuits.reward_session.prove(&reward_session.witness)?;
+    circuits.reward_session.circuit_data.verify(reward_proof.clone())?;
+    let tip = RewardLedgerFinalProof { proof: &reward_proof, state: &reward_session.new_state };
+    let reward_leaves = [SourceCheckpointRewardAggregateLeaf {
+        leaf: &rewards_opening.leaves[0], proof: &reward_proof, state: &reward_session.new_state,
+        source_checkpoint_id: reward_session.source_checkpoint_id, source_leaf: &reward_session.witness.source_leaf,
+        source_siblings: &reward_session.source_siblings, session_root: reward_session.session_root,
+        summary_siblings: &reward_session.summary_siblings,
+    }];
+    let reward_header = reward_session.header.clone();
+    let proof_r = circuits.prove_reward_aggregate(&config, &rewards_opening, &reward_header, &tip, &reward_leaves)?;
     circuits.reward_aggregate.circuit_data.verify(proof_r.clone())?;
-    assert_opening_digest(&proof_r, 7, 3, rewards_opening.opening_digest(&config)?);
+    assert_eq!(proof_r.public_inputs, reward_header.publication_words()?.map(F::from_canonical_u32));
 
     // Opening mutations must fail canonical validation before proving.
     for mutation in 0..6 {
@@ -643,15 +887,17 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
         let changed_header = withdrawal_publication_header(&config, &changed);
         rejects(|| changed_header.and_then(|header| circuits.prove_withdrawal_aggregate(&config, &changed, &header, &withdrawal_leaves).map(|_| ())));
     }
-    for mutation in 0..4 {
+    for mutation in 0..5 {
         let mut changed = rewards_opening.clone();
         match mutation {
-            0 => changed.rewards.clear(),
-            1 => changed.rewards[0].recipient[0] ^= 1,
-            2 => changed.rewards[0].claim_checkpoint_id = 2,
-            _ => changed.end_checkpoint_id = 2,
+            0 => changed.leaves.clear(),
+            1 => changed.leaves[0].recipient[0] ^= 1,
+            2 => changed.leaves[0].source_checkpoint_id = 2,
+            3 => changed.end_checkpoint_id = 2,
+            _ => changed.leaves[0].user_id = 1,
         }
-        rejects(|| circuits.prove_reward_aggregate(&config, &changed, &reward_leaves).map(|_| ()));
+        let changed_header = reward_publication_header(&changed, reward_session.statement.old_ledger_state_root, reward_session.statement.new_ledger_state_root);
+        rejects(|| changed_header.and_then(|header| circuits.prove_reward_aggregate(&config, &changed, &header, &tip, &reward_leaves).map(|_| ())));
     }
     // Witness assignment must succeed here: only the prover may reject these constraints.
     for mutation in 0..4 {
@@ -687,16 +933,26 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
             coordinator.checkpoint_root_transition.get_verifier_config_ref(), &checkpoint.new_leaf_compact, &checkpoint.state.roots,
             &checkpoint.state.deposit, &checkpoint.state.withdrawal, &changed).map(|_| ()));
     }
-    // Reward authorization mutations must fail before producing a family3 proof.
+    // Session authentication mutations must fail before producing the terminal session proof.
     for mutation in 0..4 {
-        let mut changed = RewardWitness { config: reward_input.config.clone(), authorization: reward_input.authorization.clone(), tag: reward_input.tag.clone() };
-        match mutation {
-            0 => changed.tag.siblings[0] = qhash(999),
-            1 => changed.authorization.context.reward.path_index = 2,
-            2 => changed.authorization.context.authorization_user_leaf.last_checkpoint_id = F::from_canonical_u32(2),
-            _ => changed.authorization.authorization = RewardAuthorizationWitness::Zk { private_key: client_value(&qhash(999))? },
-        }
-        rejects(|| circuits.reward.prove(&changed).map(|_| ()));
+        let base = &reward_session.witness;
+        let (jobs, authorization, user_leaf) = match mutation {
+            0 => { let mut jobs = reward_jobs.clone(); jobs[0].tag.siblings[0] = qhash(999); (jobs, reward_authorization.clone(), base.user_leaf) },
+            1 => { let mut jobs = reward_jobs.clone(); jobs[0].path_index = 2; (jobs, reward_authorization.clone(), base.user_leaf) },
+            2 => { let mut user_leaf = base.user_leaf; user_leaf.last_checkpoint_id = F::from_canonical_u32(2); (reward_jobs.clone(), reward_authorization.clone(), user_leaf) },
+            _ => (reward_jobs.clone(), RewardAuthorizationWitness::Zk { private_key: client_value(&qhash(999))? }, base.user_leaf),
+        };
+        let changed = RewardSessionWitness {
+            statement: base.statement, config: config.clone(), economic_domain: base.economic_domain, window_id: base.window_id,
+            start_root: base.start_root, source_checkpoint_id: base.source_checkpoint_id, end_checkpoint_id: base.end_checkpoint_id,
+            source_leaf: base.source_leaf.clone(), source_path: base.source_path, old_state: copy_state(&base.old_state),
+            new_state: copy_state(&base.new_state), own_state: copy_state(&base.own_state), old_summary: base.old_summary,
+            old_session_root: base.old_session_root, session_siblings: base.session_siblings, own_siblings: base.own_siblings,
+            ledger_siblings: base.ledger_siblings, own_previous: None, global_previous: None, jobs: &jobs, is_final_step: true,
+            end_leaf: base.end_leaf.clone(), end_path: base.end_path, end_roots: base.end_roots, user_leaf, user_path: base.user_path.clone(),
+            public_key_param: base.public_key_param, authorization: Some(&authorization),
+        };
+        rejects(|| circuits.reward_session.prove(&changed).map(|_| ()));
     }
     let mut fabricated = withdrawal_inputs[0].clone();
     fabricated.leaf.amount = word(999);
@@ -726,10 +982,10 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     assert_eq!(empty_header.opening_digest, [0; 32]);
     assert_eq!(empty_header.claim_tree_root, [0; 32]);
     assert_eq!(empty_header.withdrawal_roots, withdrawals_opening.withdrawal_roots);
-    let empty_rewards = RewardAggregateOpening { rewards: Vec::new(), ..rewards_opening.clone() };
-    let empty_r = circuits.prove_reward_aggregate(&config, &empty_rewards, &[])?;
-    circuits.reward_aggregate.circuit_data.verify(empty_r.clone())?;
-    assert_opening_digest(&empty_r, 7, 3, empty_rewards.opening_digest(&config)?);
+    let empty_rewards = SourceCheckpointRewardOpening { leaves: Vec::new(), ..rewards_opening.clone() };
+    let empty_reward_header = reward_publication_header(&empty_rewards, reward_session.statement.old_ledger_state_root, reward_session.statement.old_ledger_state_root)?;
+    assert_eq!(empty_reward_header.count, 0);
+    assert_eq!(empty_reward_header.opening_digest, [0; 32]);
     for mutation in 0..2 {
         let mut changed = empty_withdrawals.clone();
         if mutation == 0 { changed.withdrawal_roots[2][0] ^= 1; }
@@ -746,18 +1002,36 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     let mut wrong_root = withdrawal_header.clone();
     wrong_root.claim_tree_root[31] ^= 1;
     rejects(|| circuits.prove_withdrawal_aggregate(&config, &withdrawals_opening, &wrong_root, &withdrawal_leaves).map(|_| ()));
-    rejects(|| circuits.prove_reward_aggregate(&config, &rewards_opening, &[]).map(|_| ()));
+    rejects(|| circuits.prove_reward_aggregate(&config, &rewards_opening, &reward_header, &tip, &[]).map(|_| ()));
+    let mut wrong_source = *reward_leaves[0].source_siblings;
+    wrong_source[0][0] ^= 1;
+    let wrong_source_leaf = SourceCheckpointRewardAggregateLeaf { source_siblings: &wrong_source, ..reward_leaves[0] };
+    rejects(|| circuits.prove_reward_aggregate(&config, &rewards_opening, &reward_header, &tip, &[wrong_source_leaf]).map(|_| ()));
+    let mut forked_recipient = rewards_opening.leaves[0].clone();
+    forked_recipient.recipient[0] ^= 1;
+    let forked_opening = SourceCheckpointRewardOpening { leaves: vec![forked_recipient.clone()], ..rewards_opening.clone() };
+    let forked_header = reward_publication_header(&forked_opening, reward_session.statement.old_ledger_state_root, reward_session.statement.new_ledger_state_root)?;
+    let forked_leaf = SourceCheckpointRewardAggregateLeaf { leaf: &forked_recipient, ..reward_leaves[0] };
+    rejects(|| circuits.prove_reward_aggregate(&config, &forked_opening, &forked_header, &tip, &[forked_leaf]).map(|_| ()));
+    let mut wrong_reward_root = reward_header.clone();
+    wrong_reward_root.claim_tree_root[31] ^= 1;
+    rejects(|| circuits.prove_reward_aggregate(&config, &rewards_opening, &wrong_reward_root, &tip, &reward_leaves).map(|_| ()));
+    let mut forked_tip_state = copy_state(&reward_session.new_state);
+    forked_tip_state.ledger_root[0] ^= 1;
+    let forked_tip = RewardLedgerFinalProof { proof: &reward_proof, state: &forked_tip_state };
+    rejects(|| circuits.prove_reward_aggregate(&config, &rewards_opening, &reward_header, &forked_tip, &reward_leaves).map(|_| ()));
+
     let mut wrong_config = config.clone(); wrong_config.circuit_set_hash[0] ^= 1;
     rejects(|| circuits.prove_deposit_aggregate(&wrong_config, &a, &chains).map(|_| ()));
-    circuits.validate_entries(circuits.entries())?;
-    let mut changed_pin = circuits.entries().to_vec();
+    circuits.validate_registrations(circuits.registrations())?;
+    let mut changed_pin = circuits.registrations().to_vec();
     changed_pin[0].verifier_digest[0] ^= 1;
     psy_client_data::bridge_aggregate::circuit_set_hash(&changed_pin)?;
-    assert!(circuits.validate_entries(&changed_pin).is_err());
-    let mut removed_family = circuits.entries().to_vec();
+    assert!(circuits.validate_registrations(&changed_pin).is_err());
+    let mut removed_family = circuits.registrations().to_vec();
     removed_family.retain(|entry| entry.family != 11);
     assert!(psy_client_data::bridge_aggregate::circuit_set_hash(&removed_family).is_err());
-    assert!(circuits.validate_entries(&removed_family).is_err());
+    assert!(circuits.validate_registrations(&removed_family).is_err());
     let mut four_chains = config.clone();
     let mut fourth = four_chains.chains[2].clone();
     fourth.chain_index = 3;

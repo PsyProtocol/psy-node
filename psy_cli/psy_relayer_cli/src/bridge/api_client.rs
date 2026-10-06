@@ -85,20 +85,19 @@ pub struct PublishAggregationContext {
 pub enum AggregationClaimKind { Withdrawal, Reward }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AggregationAdmissionRequest {
-    pub version: u8,
-    pub context_id: String,
-    pub kind: AggregationClaimKind,
-    pub record: String,
-    pub proof: String,
+#[serde(tag = "version", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AggregationClaimRequest {
+    #[serde(rename = 1)]
+    Withdrawal { #[serde(rename = "contextId")] context_id: String, kind: AggregationClaimKind, record: String, proof: String },
+    #[serde(rename = 2)]
+    Reward { #[serde(rename = "contextId")] context_id: String, kind: AggregationClaimKind, record: String, transition: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AggregationClaim {
     pub claim_id: String,
-    pub request: AggregationAdmissionRequest,
+    pub request: AggregationClaimRequest,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -160,7 +159,7 @@ pub struct AggregationAcknowledgment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 pub enum AggregationErrorCode {
     InvalidEncoding, ProofTooLarge, InvalidProof, UnsupportedIdentity, ContextChanged,
-    ConflictingClaim, AlreadyConsumed, NoCommittedContext, Unauthorized, StateMismatch,
+    ConflictingClaim, AlreadyConsumed, NoCommittedContext, LedgerNotInitialized, Unauthorized, StateMismatch,
     EvidenceUnavailable,
 }
 
@@ -310,7 +309,7 @@ async fn aggregation_http<T: serde::de::DeserializeOwned>(
             AggregationErrorCode::InvalidProof | AggregationErrorCode::UnsupportedIdentity => 422,
             AggregationErrorCode::ContextChanged | AggregationErrorCode::ConflictingClaim
                 | AggregationErrorCode::AlreadyConsumed | AggregationErrorCode::StateMismatch => 409,
-            AggregationErrorCode::NoCommittedContext | AggregationErrorCode::EvidenceUnavailable => 503,
+            AggregationErrorCode::NoCommittedContext | AggregationErrorCode::LedgerNotInitialized | AggregationErrorCode::EvidenceUnavailable => 503,
             AggregationErrorCode::Unauthorized if status.as_u16() == 403 => 403,
             AggregationErrorCode::Unauthorized => 401,
         };
@@ -367,20 +366,26 @@ pub async fn get_aggregation_claims(
     if page.claims.len() > limit as usize { return Err(AggregationHttpError::InvalidResponse); }
     let mut previous = after_claim_id;
     for claim in &page.claims {
-        if !aggregation_hex(&claim.claim_id) || previous.is_some_and(|id| id >= claim.claim_id.as_str())
-            || claim.request.version != 1 || claim.request.context_id != context_id {
-            return Err(AggregationHttpError::InvalidResponse);
-        }
-        let record = decode_aggregation_base64(&claim.request.record, 1024).map_err(|_| AggregationHttpError::InvalidResponse)?;
-        use psy_client_data::bridge_aggregate::{WithdrawalLeaf, RewardLeaf};
-        let valid = match claim.request.kind {
-            AggregationClaimKind::Withdrawal => WithdrawalLeaf::decode(&record).and_then(|leaf| leaf.validate()),
-            AggregationClaimKind::Reward => RewardLeaf::decode(&record).and_then(|leaf| leaf.validate()),
+        if !aggregation_hex(&claim.claim_id) || previous.is_some_and(|id| id >= claim.claim_id.as_str()) { return Err(AggregationHttpError::InvalidResponse); }
+        let (claim_context, record, artifact) = match &claim.request {
+            AggregationClaimRequest::Withdrawal { context_id, kind, record, proof } => {
+                if *kind != AggregationClaimKind::Withdrawal { return Err(AggregationHttpError::InvalidResponse); }
+                (context_id, record, proof)
+            }
+            AggregationClaimRequest::Reward { context_id, kind, record, transition } => {
+                if *kind != AggregationClaimKind::Reward { return Err(AggregationHttpError::InvalidResponse); }
+                (context_id, record, transition)
+            }
         };
-        if valid.is_err() { return Err(AggregationHttpError::InvalidResponse); }
-        let proof = decode_aggregation_base64(&claim.request.proof, AGGREGATION_PROOF_LIMIT)
-            .map_err(|_| AggregationHttpError::InvalidResponse)?;
-        if proof.is_empty() { return Err(AggregationHttpError::InvalidResponse); }
+        if claim_context != context_id { return Err(AggregationHttpError::InvalidResponse); }
+        let record_bytes = decode_aggregation_base64(record, if matches!(claim.request, AggregationClaimRequest::Reward { .. }) { 192 } else { 1024 }).map_err(|_| AggregationHttpError::InvalidResponse)?;
+        let valid = match &claim.request {
+            AggregationClaimRequest::Withdrawal { .. } => psy_client_data::bridge_aggregate::WithdrawalLeaf::decode(&record_bytes).and_then(|leaf| leaf.validate()).is_ok(),
+            AggregationClaimRequest::Reward { .. } => record_bytes.is_empty() || psy_client_data::bridge_aggregate::SourceCheckpointRewardLeaf::decode(&record_bytes).and_then(|leaf| leaf.leaf_commit()).is_ok(),
+        };
+        if !valid { return Err(AggregationHttpError::InvalidResponse); }
+        let artifact = decode_aggregation_base64(artifact, AGGREGATION_PROOF_LIMIT).map_err(|_| AggregationHttpError::InvalidResponse)?;
+        if artifact.is_empty() { return Err(AggregationHttpError::InvalidResponse); }
         previous = Some(&claim.claim_id);
     }
     if let Some(cursor) = &page.next_after_claim_id {
@@ -389,6 +394,44 @@ pub async fn get_aggregation_claims(
         }
     }
     Ok(page)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardLedgerNode {
+    pub height: u8,
+    pub index: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardLedgerSessionState {
+    pub context_id: String,
+    pub current_root: String,
+    pub proof: String,
+    pub transition: String,
+    pub nodes: Vec<RewardLedgerNode>,
+}
+
+pub async fn get_reward_ledger_session_state(
+    http: &reqwest::Client, services_url: &str, token_file: &std::path::Path, context_id: &str,
+) -> Result<RewardLedgerSessionState, AggregationHttpError> {
+    if !aggregation_hex(context_id) { return Err(AggregationHttpError::InvalidRequest); }
+    let mut url = aggregation_url(services_url, "session-state")?;
+    url.query_pairs_mut().append_pair("contextId", context_id);
+    let state: RewardLedgerSessionState = aggregation_http(http.get(url), token_file, None::<&()>).await?;
+    if state.context_id != context_id || !aggregation_hex(&state.current_root) || state.nodes.len() != 33 { return Err(AggregationHttpError::InvalidResponse); }
+    let proof = decode_aggregation_base64(&state.proof, AGGREGATION_PROOF_LIMIT).map_err(|_| AggregationHttpError::InvalidResponse)?;
+    let transition = decode_aggregation_base64(&state.transition, AGGREGATION_PROOF_LIMIT).map_err(|_| AggregationHttpError::InvalidResponse)?;
+    if proof.is_empty() || transition.is_empty() || !transition.windows(proof.len()).any(|window| window == proof) { return Err(AggregationHttpError::InvalidResponse); }
+    let mut previous_height = None;
+    for node in &state.nodes {
+        if previous_height.is_some_and(|height| node.height != height + 1) || aggregation_decimal(&node.index).is_none() || !aggregation_hex(&node.hash) { return Err(AggregationHttpError::InvalidResponse); }
+        previous_height = Some(node.height);
+    }
+    if previous_height != Some(32) { return Err(AggregationHttpError::InvalidResponse); }
+    Ok(state)
 }
 
 pub async fn post_aggregation_dispositions(
@@ -419,7 +462,7 @@ pub async fn post_aggregation_dispositions(
     let bytes = decode_aggregation_base64(opening, AGGREGATION_BODY_LIMIT)?;
     match family {
         2 => { psy_client_data::bridge_aggregate::WithdrawalAggregateOpening::decode(&bytes).map_err(|_| AggregationHttpError::InvalidRequest)?; }
-        3 => { psy_client_data::bridge_aggregate::RewardAggregateOpening::decode(&bytes).map_err(|_| AggregationHttpError::InvalidRequest)?; }
+        3 => { psy_client_data::bridge_aggregate::SourceCheckpointRewardOpening::decode(&bytes).map_err(|_| AggregationHttpError::InvalidRequest)?; }
         _ => return Err(AggregationHttpError::InvalidRequest),
     }
     let acknowledgment: AggregationAcknowledgment = aggregation_http(http.post(aggregation_url(services_url, "dispositions")?), token_file, Some(request)).await?;

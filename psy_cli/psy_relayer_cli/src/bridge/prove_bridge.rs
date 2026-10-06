@@ -48,8 +48,8 @@ use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::{
 };
 use psy_provider::provider::RpcProvider;
 use serde::Serialize;
-use psy_client_data::bridge_aggregate::{bind_claim_tree, DepositAggregateOpening, DepositLeaf, DepositLeafRange, InclusionAggregateHeader, NetworkConfig, RewardAggregateOpening, WithdrawalAggregateOpening, WITHDRAWAL_PUBLICATION_FAMILY, deposit_leaf_path, deposit_leaf_tree};
-use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow}, inclusion_aggregate::{RewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths}}};
+use psy_client_data::bridge_aggregate::{bind_claim_tree, DepositAggregateOpening, DepositLeaf, DepositLeafRange, InclusionAggregateHeader, NetworkConfig, SourceCheckpointRewardOpening, WithdrawalAggregateOpening, REWARD_PUBLICATION_FAMILY, WITHDRAWAL_PUBLICATION_FAMILY, deposit_leaf_path, deposit_leaf_tree};
+use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow}, inclusion_aggregate::{RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths}, reward_ledger::RewardLedgerStep}};
 use psy_plonky2_common_circuits::bridge::deposit_spiderman_append::DepositSpidermanAppendInputs;
 use parth_core::{pgoldilocks::PoseidonHasher, crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, MerkleZeroHasher}}};
 
@@ -227,8 +227,8 @@ pub(crate) fn withdrawal_publication_header(config: &NetworkConfig, opening: &Wi
         first_ordinal: 0,
         count,
         withdrawal_roots: opening.withdrawal_roots.clone(),
-        old_nullifier_root: None,
-        new_nullifier_root: None,
+        old_ledger_state_root: None,
+        new_ledger_state_root: None,
         opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest(config)? },
         claim_tree_root: [0; 32],
     };
@@ -250,12 +250,56 @@ pub(crate) fn build_withdrawal_aggregate(config: &NetworkConfig, opening: &Withd
     circuits.prove_withdrawal_aggregate(config, opening, &header, &records)
 }
 
-pub(crate) fn build_reward_aggregate(config: &NetworkConfig, opening: &RewardAggregateOpening, proofs: &[ProofWithPublicInputs<F, C, D>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-    circuits.validate_config(config)?;
-    opening.validate(config)?;
-    anyhow::ensure!(proofs.len() == opening.rewards.len(), "one proof per reward required");
-    let records = opening.rewards.iter().zip(proofs).map(|(leaf, proof)| RewardAggregateLeaf { leaf, proof }).collect::<Vec<_>>();
-    circuits.prove_reward_aggregate(config, opening, &records)
+const REWARD_PUBLICATION_CAPACITY: u32 = 1024;
+
+pub(crate) fn reward_publication_header(opening: &SourceCheckpointRewardOpening, old_ledger_state_root: [u64; 4], new_ledger_state_root: [u64; 4]) -> anyhow::Result<InclusionAggregateHeader> {
+    let count = u32::try_from(opening.leaves.len()).context("reward publication count exceeds u32")?;
+    anyhow::ensure!(count <= REWARD_PUBLICATION_CAPACITY, "reward publication requires another compiled segment capacity; AggregateCircuits builds only 1024");
+    let mut header = InclusionAggregateHeader {
+        family: REWARD_PUBLICATION_FAMILY, config_hash: opening.config_hash, window_id: opening.window_id,
+        end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root: opening.end_checkpoint_root,
+        aggregate_capacity: REWARD_PUBLICATION_CAPACITY, total_count: count, segment_count: u32::from(count != 0),
+        segment_index: 0, first_ordinal: 0, count, withdrawal_roots: Vec::new(),
+        old_ledger_state_root: Some(old_ledger_state_root), new_ledger_state_root: Some(new_ledger_state_root),
+        opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest()? }, claim_tree_root: [0; 32],
+    };
+    if count != 0 {
+        bind_claim_tree(&mut header, &opening.leaves.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?)?;
+    }
+    header.validate()?;
+    Ok(header)
+}
+
+pub(crate) struct RewardAggregateInputs<'a> {
+    pub old_ledger_state_root: [u64; 4],
+    pub new_ledger_state_root: [u64; 4],
+    pub tip_proof: &'a ProofWithPublicInputs<F, C, D>,
+    pub tip_state: &'a psy_plonky2_circuits::bridge::circuits::reward_session::RewardLedgerStateValues,
+    pub payouts: &'a [RewardPayoutInputs<'a>],
+}
+
+pub(crate) struct RewardPayoutInputs<'a> {
+    pub proof: &'a ProofWithPublicInputs<F, C, D>,
+    pub step: &'a RewardLedgerStep,
+}
+
+pub(crate) fn build_reward_aggregate(config: &NetworkConfig, opening: &SourceCheckpointRewardOpening, inputs: &RewardAggregateInputs<'_>, circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+    anyhow::ensure!(!opening.leaves.is_empty(), "empty reward manifests carry no proof");
+    anyhow::ensure!(inputs.payouts.len() == opening.leaves.len(), "one retained payout step per source reward required");
+    anyhow::ensure!(inputs.tip_proof.public_inputs.len() == psy_client_data::bridge_aggregate::REWARD_SESSION_PROOF_FIELD_COUNT, "reward tip width mismatch");
+    anyhow::ensure!(inputs.tip_proof.public_inputs[30..34].iter().zip(inputs.new_ledger_state_root).all(|(field, limb)| field.to_canonical_u64() == limb), "reward tip root differs from retained ledger root");
+    let header = reward_publication_header(opening, inputs.old_ledger_state_root, inputs.new_ledger_state_root)?;
+    let tip = RewardLedgerFinalProof { proof: inputs.tip_proof, state: inputs.tip_state };
+    let records = opening.leaves.iter().zip(inputs.payouts).map(|(leaf, payout)| {
+        anyhow::ensure!(payout.step.is_final_step, "reward publication leaf is not a terminal payout");
+        anyhow::ensure!(u64::from(payout.step.source_checkpoint_id) == leaf.source_checkpoint_id, "retained source checkpoint differs from payout leaf");
+        Ok(SourceCheckpointRewardAggregateLeaf {
+            leaf, proof: payout.proof, state: &payout.step.new_state, source_checkpoint_id: payout.step.source_checkpoint_id,
+            source_leaf: &payout.step.source_leaf, source_siblings: &payout.step.source_path, session_root: payout.step.session_root,
+            summary_siblings: &payout.step.summary_siblings,
+        })
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    circuits.prove_reward_aggregate(config, opening, &header, &tip, &records)
 }
 
 fn bridge_contract_state_tree_height(contract_id: u32) -> anyhow::Result<u8> {

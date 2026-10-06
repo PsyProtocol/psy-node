@@ -16,7 +16,7 @@ use plonky2::plonk::{
     circuit_data::{CircuitConfig, CircuitData},
     proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
 };
-use psy_client_data::bridge_aggregate::{CircuitSetEntry, NetworkConfig, RewardLeaf};
+use psy_client_data::bridge_aggregate::{CircuitSetRegistration, NetworkConfig, RewardLeaf};
 use psy_common_circuit::traits::CreatableTarget;
 use psy_network_circuit::gadgets::qdata::{checkpoint::PsyCheckpointLeafGadget, user::PsyUserLeafGadget};
 use psy_plonky2_common_circuits::bridge::{
@@ -26,7 +26,7 @@ use psy_ups_circuit::signature::reward_authorization::{
     build_reward_authorization_message_target, RewardAuthorizationCircuits, RewardAuthorizationContext, RewardAuthorizationInput,
 };
 use crate::proof_minifier::pm_core::get_circuit_fingerprint_generic;
-use crate::bridge::aggregate_circuits::circuit_set_entry;
+use crate::bridge::aggregate_circuits::circuit_set_registration;
 
 pub const REWARD_INCLUSION_PI_LEN: usize = 28;
 const MAX_REWARD_HEIGHT: usize = 21;
@@ -54,7 +54,7 @@ pub struct RewardTagTarget {
 }
 
 impl RewardTagTarget {
-    fn new(builder: &mut CircuitBuilder<F, 2>, reward: &RewardLeafTarget) -> Self {
+    pub(super) fn new(builder: &mut CircuitBuilder<F, 2>, reward: &RewardLeafTarget) -> Self {
         let zero = builder.zero();
         let one = builder.one();
         builder.range_check(reward.height, 8);
@@ -109,7 +109,7 @@ impl RewardTagTarget {
         Self { tag_preimage, leaf_left, leaf_right, leaf_tag, siblings, parent_tags, root }
     }
 
-    fn set_witness(&self, witness: &mut PartialWitness<F>, input: &RewardTagWitness) -> anyhow::Result<()> {
+    pub(super) fn set_witness(&self, witness: &mut PartialWitness<F>, input: &RewardTagWitness) -> anyhow::Result<()> {
         for (target, value) in [self.tag_preimage, self.leaf_left, self.leaf_right, self.leaf_tag]
             .into_iter().zip([input.tag_preimage, input.leaf_left, input.leaf_right, input.leaf_tag]) {
             witness.set_hash_target(target, value.0)?;
@@ -165,22 +165,22 @@ impl RewardInclusionCircuit {
         &self.authorization_circuits
     }
 
-    pub fn circuit_set_entries(&self) -> anyhow::Result<Vec<CircuitSetEntry>> {
+    pub fn circuit_set_registrations(&self) -> anyhow::Result<Vec<CircuitSetRegistration>> {
         let auth = &self.authorization_circuits;
-        let mut entries = Vec::with_capacity(5);
-        entries.push(circuit_set_entry(3, 0, 0, REWARD_INCLUSION_PI_LEN, &self.circuit_data, [0; 4])?);
+        let mut registrations = Vec::with_capacity(5);
+        registrations.push(circuit_set_registration(3, 0, 0, REWARD_INCLUSION_PI_LEN, &self.circuit_data, [0; 4])?);
         for (variant, (data, identity)) in [(&auth.zk.circuit_data, auth.zk.identity_fingerprint),
             (&auth.secp.circuit_data, auth.secp.identity_fingerprint),
             (&auth.personal_sign.circuit_data, auth.personal_sign.identity_fingerprint),
             (&auth.multisig.circuit_data, auth.multisig.identity_fingerprint)].into_iter().enumerate() {
-            let entry = circuit_set_entry(4, 0, variant as u8, 30, data, identity.0.elements.map(|value| value.to_canonical_u64()))?;
+            let registration = circuit_set_registration(4, 0, variant as u8, 30, data, identity.0.elements.map(|value| value.to_canonical_u64()))?;
             anyhow::ensure!(data.common == auth.zk.circuit_data.common, "reward authorization common data mismatch");
             if variant > 0 {
-                anyhow::ensure!(entry.common_digest == entries[1].common_digest, "reward authorization common serialization mismatch");
+                anyhow::ensure!(registration.common_digest == registrations[1].common_digest, "reward authorization common serialization mismatch");
             }
-            entries.push(entry);
+            registrations.push(registration);
         }
-        Ok(entries)
+        Ok(registrations)
     }
 
     pub fn new(source_chain_count: usize) -> anyhow::Result<Self> {

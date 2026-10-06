@@ -5,9 +5,9 @@ use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{api::reward::PsyProoffMinerRewardProofWithRewardPreimage, bridge_aggregate::{domain_hash, Domain, NetworkConfig, WithdrawalLeaf, RewardLeaf, GOLDILOCKS_MODULUS}, config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
 use psy_crypto::hash::{merkle::core::MerkleProofCore, traits::qhashable::QFieldHashable};
 use psy_plonky2_common_circuits::bridge::withdrawal_inclusion::{WithdrawalInclusionCircuit, WithdrawalInclusionInputs, WithdrawalWitness};
-use psy_plonky2_circuits::bridge::circuits::reward_inclusion::{RewardInclusionCircuit, RewardTagWitness};
+use psy_plonky2_circuits::bridge::circuits::{reward_inclusion::RewardTagWitness, reward_session::{RewardSessionCircuit, RewardSessionWitness, REWARD_SESSION_STEP_CAPACITY}};
 use psy_provider::provider::RpcProvider;
-use psy_ups_circuit::signature::reward_authorization::{RewardAuthorizationContext, RewardAuthorizationInput};
+use psy_ups_circuit::signature::reward_authorization::RewardAuthorizationContext;
 use psy_vm::{reward_authorization::RewardAuthorizationWitness, ups::multisig::{MultisigAccount, MultisigSignatures, StoredMultisigPolicy}};
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +175,25 @@ impl ClaimClient {
         verify_path(&path, QHashOut::from_values(root[0], root[1], root[2], root[3]), id, leaf.qfhash::<PsyHasher>(), psy_config::network_constants::CHECKPOINT_TREE_HEIGHT as usize)?;
         Ok((leaf, roots))
     }
+    async fn post_claim<T: Serialize>(&self, request: &T) -> Result<ClaimStatus> {
+        self.response(self.http.post(format!("{}/api/v1/bridge/aggregation/claims", self.url)).json(request).send().await?).await
+    }
+    pub async fn submit_withdrawal(&self, context: &AggregationContext, request: &AggregationClaimRequest) -> Result<ClaimStatus> {
+        self.validate_context(context)?;
+        anyhow::ensure!(request.version == 1 && request.context_id == context.context_id && request.kind == "withdrawal", "withdrawal claim body mismatch");
+        let record = STANDARD.decode(&request.record)?;
+        WithdrawalLeaf::decode(&record)?;
+        anyhow::ensure!(STANDARD.decode(&request.proof)?.len() <= context.max_proof_bytes, "withdrawal proof exceeds context bound");
+        self.post_claim(request).await
+    }
+    pub async fn submit_reward_session(&self, context: &AggregationContext, request: &RewardSessionClaimRequest) -> Result<ClaimStatus> {
+        self.validate_context(context)?;
+        anyhow::ensure!(request.version == 2 && request.context_id == context.context_id && request.kind == "reward", "reward session claim body mismatch");
+        let record = STANDARD.decode(&request.record)?;
+        if !record.is_empty() { psy_client_data::bridge_aggregate::SourceCheckpointRewardLeaf::decode(&record)?; }
+        anyhow::ensure!(STANDARD.decode(&request.transition)?.len() <= context.max_proof_bytes, "reward transition exceeds context bound");
+        self.post_claim(request).await
+    }
     async fn withdrawal_root(&self, context: &AggregationContext, chain: u8) -> Result<[u64; 4]> {
         let (id, _) = self.validate_context(context)?;
         let (_, roots) = self.checkpoint(context).await?;
@@ -198,12 +217,26 @@ impl ClaimClient {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AdmissionRequest {
+pub struct AggregationClaimRequest {
     pub version: u32,
     pub context_id: String,
     pub kind: String,
     pub record: String,
     pub proof: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardSessionClaimRequest {
+    pub version: u32,
+    pub context_id: String,
+    pub kind: String,
+    pub record: String,
+    pub transition: String,
+}
+#[derive(Clone, Debug)]
+pub enum ClaimRequest {
+    Withdrawal(AggregationClaimRequest),
+    RewardSession(RewardSessionClaimRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
@@ -227,28 +260,35 @@ impl FreshAuthorizationRequired {
 
 pub struct ClaimCircuits {
     pub withdrawal: WithdrawalInclusionCircuit<PoseidonGoldilocksConfig, 2>,
-    pub reward: RewardInclusionCircuit,
+    pub reward_session: RewardSessionCircuit,
 }
 impl ClaimCircuits {
-    pub fn build(config: &NetworkConfig, registry: &[psy_client_data::bridge_aggregate::CircuitSetEntry]) -> Result<Self> {
+    pub fn build(config: &NetworkConfig, registry: &[psy_client_data::bridge_aggregate::CircuitSetRegistration]) -> Result<Self> {
         config.validate()?;
         anyhow::ensure!(psy_client_data::bridge_aggregate::circuit_set_hash(registry)? == config.circuit_set_hash, "operator circuit registry differs from configuration");
         let withdrawal = WithdrawalInclusionCircuit::build();
-        let reward = RewardInclusionCircuit::new(config.chains.len())?;
-        let mut entries = reward.circuit_set_entries()?;
-        entries.push(psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_entry(2, 0, 0, 32, &withdrawal.circuit_data, [0; 4])?);
-        for entry in entries { anyhow::ensure!(registry.iter().find(|pin| (pin.family,pin.level,pin.variant) == (entry.family,entry.level,entry.variant)) == Some(&entry), "claim circuit differs from source registry"); }
-        Ok(Self { withdrawal, reward })
+        let reward_session = RewardSessionCircuit::new(REWARD_SESSION_STEP_CAPACITY, config.chains.len())?;
+        let session = psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_registration(
+            3, 0, 0, psy_client_data::bridge_aggregate::REWARD_SESSION_PROOF_FIELD_COUNT, &reward_session.circuit_data, [0; 4])?;
+        let withdrawal_registration = psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_registration(
+            2, 0, 0, 32, &withdrawal.circuit_data, [0; 4])?;
+        anyhow::ensure!(registry.len() == 7 && registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (3, 0, 0)) == Some(&session)
+            && registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (2, 0, 0)) == Some(&withdrawal_registration)
+            && registry.iter().all(|pin| pin.identity_fingerprint == [0; 4] && pin.family != 4), "claim circuit differs from source registry");
+        Ok(Self { withdrawal, reward_session })
+    }
+    pub fn identity_fingerprint_for_scheme(&self, scheme: u8) -> Result<[u64; 4]> {
+        self.reward_session.identity_fingerprint_for_scheme(scheme)
     }
 }
 
 impl ClaimClient {
-    pub fn admission(&self, context: &AggregationContext, kind: &str, record: &[u8], proof: &[u8]) -> Result<AdmissionRequest> {
+    pub fn build_aggregation_claim(&self, context: &AggregationContext, kind: &str, record: &[u8], proof: &[u8]) -> Result<AggregationClaimRequest> {
         self.validate_context(context)?;
-        anyhow::ensure!(matches!(kind, "withdrawal" | "reward") && !proof.is_empty() && proof.len() <= context.max_proof_bytes, "invalid claim proof/kind");
-        Ok(AdmissionRequest { version: 1, context_id: context.context_id.clone(), kind: kind.to_owned(), record: STANDARD.encode(record), proof: STANDARD.encode(proof) })
+        anyhow::ensure!(kind == "withdrawal" && !proof.is_empty() && proof.len() <= context.max_proof_bytes, "invalid withdrawal claim proof");
+        Ok(AggregationClaimRequest { version: 1, context_id: context.context_id.clone(), kind: kind.to_owned(), record: STANDARD.encode(record), proof: STANDARD.encode(proof) })
     }
-    pub async fn prove_withdrawal(&self, context: &AggregationContext, leaf: &WithdrawalLeaf, circuit: &WithdrawalInclusionCircuit<PoseidonGoldilocksConfig, 2>) -> Result<AdmissionRequest> {
+    pub async fn prove_withdrawal(&self, context: &AggregationContext, leaf: &WithdrawalLeaf, circuit: &WithdrawalInclusionCircuit<PoseidonGoldilocksConfig, 2>) -> Result<AggregationClaimRequest> {
         leaf.validate()?;
         anyhow::ensure!(self.config.chains.iter().any(|chain| chain.chain_index == leaf.chain_index), "unconfigured withdrawal destination");
         let (id, root) = self.validate_context(context)?;
@@ -260,17 +300,31 @@ impl ClaimClient {
         let proof = circuit.generate_proof(&WithdrawalInclusionInputs { config_hash: self.config.config_hash()?, end_checkpoint_id: id, end_checkpoint_root: root, withdrawal_root, leaf: leaf.clone(), witness: WithdrawalWitness { leaf_index: witness.leaf_index.context("missing withdrawal index")?, siblings } })?;
         let bytes = proof.to_bytes();
         circuit.verify_proof(proof)?;
-        self.admission(context, "withdrawal", &leaf.encode()?, &bytes)
+        self.build_aggregation_claim(context, "withdrawal", &leaf.encode()?, &bytes)
     }
-    pub fn prove_reward(&self, context: &AggregationContext, authorization: &RewardAuthorizationContext, tag: &RewardTagWitness, proof: &psy_client_data::config::store_config::PsyProof, circuit: &RewardInclusionCircuit) -> Result<AdmissionRequest> {
-        let (id, root) = self.validate_context(context)?;
-        anyhow::ensure!(authorization.end_checkpoint_id == id && authorization.end_checkpoint_root == root && authorization.config_hash == self.config.config_hash()?, "reward authorization context mismatch");
-        let proof = circuit.prove_with_authorization_proof(&self.config, authorization, tag, proof)?;
+    pub fn prove_reward_session(&self, context: &AggregationContext, circuit: &RewardSessionCircuit, witness: &RewardSessionWitness<'_>, window: &psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerWindowValues, expected_old_root: [u64; 4]) -> Result<psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerTransition> {
+        let (end_checkpoint_id, end_checkpoint_root) = self.validate_context(context)?;
+        anyhow::ensure!(witness.config.config_hash()? == self.config.config_hash()? && witness.end_checkpoint_id as u64 == end_checkpoint_id
+            && hash_words(witness.end_leaf.qfhash::<PsyHasher>()) == end_checkpoint_root, "reward session end differs from aggregation context");
+        anyhow::ensure!(hex32(&context.config_hash)? == window.config_hash && window.economic_domain == witness.economic_domain
+            && window.window_id == witness.window_id && window.end_checkpoint_id == witness.end_checkpoint_id
+            && window.end_checkpoint_root == end_checkpoint_root && window.start_root == witness.start_root, "reward ledger window differs from session witness");
+        let proof = circuit.prove(witness)?;
         let bytes = proof.to_bytes();
-        circuit.verify(proof)?;
-        self.admission(context, "reward", &authorization.reward.encode()?, &bytes)
+        let session_root = psy_plonky2_circuits::bridge::circuits::reward_ledger::reward_session_root(
+            witness.source_checkpoint_id, witness.old_session_root, witness.jobs)?;
+        let step = psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerStep {
+            proof: &bytes, old_state: &witness.old_state, new_state: &witness.new_state,
+            source_checkpoint_id: witness.source_checkpoint_id, source_leaf: &witness.source_leaf, source_path: &witness.source_path,
+            old_summary: witness.old_summary, session_root, summary_siblings: &witness.session_siblings, is_final_step: witness.is_final_step,
+        };
+        let transition = psy_plonky2_circuits::bridge::circuits::reward_ledger::verify_reward_ledger_step(
+            &circuit.circuit_data.common, &circuit.circuit_data.verifier_only, window, expected_old_root, &step)?;
+        anyhow::ensure!(transition.transition_bytes.ends_with(&bytes) && transition.source_payout.is_some() == witness.is_final_step, "reward ledger transition does not match the proved step");
+        Ok(transition)
     }
 }
+
 
 pub fn select_multisig_signatures<'a>(bundles: &'a [MultisigSignatures], message: &[u8; 32]) -> Result<Option<&'a MultisigSignatures>> {
     let mut matching = bundles.iter().filter(|bundle| bundle.signatures.len() == 2 && bundle.signatures.iter().all(|signature| &signature.message.0 == message));
@@ -325,42 +379,24 @@ pub struct AggregateWithdrawalRequest {
     pub record: WithdrawalRecord,
     pub user_id: String,
 }
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RewardJob {
-    pub realm_id: Option<String>,
-    pub unique_pending_id: String,
-    pub job: psy_client_common::job::id::QProvingJobDataIDWithRewardPreimage,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "scheme", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ExternalRewardAuthorization {
-    Secp { signature: psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature },
-    PersonalSign { signature: psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature },
-    Multisig { account: MultisigAccount, signatures: Vec<MultisigSignatures> },
-}
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AggregateRewardRequest {
+pub struct RewardSessionProvingInput<'a> {
     pub config: String,
     pub registry: String,
     pub services_url: String,
     pub context: AggregationContext,
-    pub record: RewardRecord,
-    pub user_id: String,
-    pub job: RewardJob,
-    pub external_authorization: Option<ExternalRewardAuthorization>,
+    pub witness: &'a RewardSessionWitness<'a>,
+    pub window: psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerWindowValues,
+    pub expected_old_root: [u64; 4],
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AggregateClaimResult {
-    Admission { request: AdmissionRequest },
+    AggregationClaim { request: AggregationClaimRequest },
     FreshAuthorizationRequired { message: String, record: String, reward: RewardRecord, context: AggregationContext },
 }
 impl From<FreshAuthorizationRequired> for AggregateClaimResult {
     fn from(value: FreshAuthorizationRequired) -> Self { Self::FreshAuthorizationRequired { message: value.message, record: value.record, reward: value.reward, context: value.context } }
 }
-
 fn canonical_base64(value: &str) -> Result<Vec<u8>> {
     let bytes = STANDARD.decode(value)?;
     anyhow::ensure!(STANDARD.encode(&bytes) == value, "noncanonical base64");
@@ -394,46 +430,15 @@ pub async fn prove_aggregate_withdrawal(session: &crate::session::WalletSession,
     let user = client.provider.get_user_leaf_data(end, record.sender_user_id as u64).await?;
     verify_path(&client.provider.get_user_tree_merkle_proof(end, record.sender_user_id as u64).await?, roots.user_tree_root, record.sender_user_id as u64, user.qfhash::<PsyHasher>(), psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize)?;
     anyhow::ensure!(user.public_key == public_key, "withdrawal account differs from selected wallet");
-    Ok(AggregateClaimResult::Admission { request: client.prove_withdrawal(&request.context, &record, &circuits.withdrawal).await? })
+    Ok(AggregateClaimResult::AggregationClaim { request: client.prove_withdrawal(&request.context, &record, &circuits.withdrawal).await? })
 }
-pub async fn prove_aggregate_reward(session: &crate::session::WalletSession, public_key: QHashOut<F>, request: AggregateRewardRequest) -> Result<AggregateClaimResult> {
-    let (client, circuits) = build_claim_client(session, &request.config, &request.registry, &request.services_url)?;
-    let record = request.record.canonical()?;
-    anyhow::ensure!(decimal(&request.user_id)? == record.user_id as u64, "reward selected user mismatch");
-    let pending = decimal(&request.job.unique_pending_id)?;
-    let (checkpoint, mut proofs) = if let Some(realm) = &request.job.realm_id {
-        let realm = decimal(realm)?;
-        (client.provider.get_realm_checkpoint_id_for_unique_pending_id_by_realm_id(realm, pending).await?, client.provider.generate_realm_batch_proof_miner_reward_proofs_by_realm_id(realm, pending, vec![request.job.job.inner]).await?)
-    } else {
-        (client.provider.get_coordinator_checkpoint_id_for_unique_pending_id(pending).await?, client.provider.generate_coordinator_batch_proof_miner_reward_proofs(pending, vec![request.job.job.inner]).await?)
-    };
-    anyhow::ensure!(checkpoint == Some(record.claim_checkpoint_id) && proofs.len() == 1, "reward job checkpoint/proof count mismatch");
-    let proof = proofs.pop().context("missing reward proof")?;
-    anyhow::ensure!(proof.job_id == request.job.job.inner.job_data_id, "reward job identity mismatch");
-    let tag_root = proof.tag_tree_proof.root;
-    let (actual, tag) = reward_record(record.claim_checkpoint_id, record.user_id, record.recipient, &PsyProoffMinerRewardProofWithRewardPreimage { inner: proof, reward_tree_tag_preimage: request.job.job.reward_tree_tag_preimage })?;
-    anyhow::ensure!(actual == record, "reward record differs from selected job witness");
-    let context = reward_membership(&client, &request.context, &record).await?;
-    anyhow::ensure!(context.claim_checkpoint_leaf.stats.pm_rewards_commitment.gutas_root == tag_root, "reward proof does not reach authenticated GUTA root");
-    let internal = session.wallet.prove_reward_authorization(&public_key, &context, circuits.reward.authorization_circuits())?;
-    let proof = match (internal, request.external_authorization) {
-        (Some(proof), None) => proof,
-        (Some(_), Some(_)) => anyhow::bail!("external authorization supplied for key-held account"),
-        (None, None) => return Ok(FreshAuthorizationRequired::new(&request.context, &context)?.into()),
-        (None, Some(external)) => {
-            let message = context.message()?;
-            let witness = match external {
-                ExternalRewardAuthorization::Secp { signature } => { anyhow::ensure!(signature.message.0 == message, "stale reward signature"); RewardAuthorizationWitness::Secp { compressed_public_key: signature.public_key, signature_rs: signature.signature } },
-                ExternalRewardAuthorization::PersonalSign { signature } => { anyhow::ensure!(signature.message.0 == message, "stale reward signature"); RewardAuthorizationWitness::PersonalSign { compressed_public_key: signature.public_key, signature_rs: signature.signature } },
-                ExternalRewardAuthorization::Multisig { account, signatures } => {
-                    let signatures = match select_multisig_signatures(&signatures, &message)? { Some(value) => value, None => return Ok(FreshAuthorizationRequired::new(&request.context, &context)?.into()) };
-                    multisig_authorization(&client, &request.context, &record, &context, &account, signatures).await?
-                }
-            };
-            circuits.reward.authorization_circuits().prove(&RewardAuthorizationInput { context: context.clone(), authorization: witness })?
-        }
-    };
-    Ok(AggregateClaimResult::Admission { request: client.prove_reward(&request.context, &context, &tag, &proof, &circuits.reward)? })
+pub fn prove_reward_session_claim(session: &crate::session::WalletSession, public_key: QHashOut<F>, input: RewardSessionProvingInput<'_>) -> Result<RewardSessionClaimRequest> {
+    let (client, circuits) = build_claim_client(session, &input.config, &input.registry, &input.services_url)?;
+    session.wallet.get_user_by_public_key_hash(&public_key)?;
+    anyhow::ensure!(!input.witness.is_final_step || (u64::from(input.witness.statement.user_id) == input.witness.user_leaf.user_id.to_canonical_u64() && input.witness.user_leaf.public_key == public_key), "reward session user differs from selected wallet");
+    let transition = client.prove_reward_session(&input.context, &circuits.reward_session, input.witness, &input.window, input.expected_old_root)?;
+    let record = match &transition.source_payout { Some(payout) => payout.encode()?, None => Vec::new() };
+    Ok(RewardSessionClaimRequest { version: 2, context_id: input.context.context_id, kind: "reward".to_owned(), record: STANDARD.encode(record), transition: STANDARD.encode(transition.transition_bytes) })
 }
 
 impl ClaimClient {

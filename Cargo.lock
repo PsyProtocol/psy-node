@@ -8279,6 +8279,7 @@ dependencies = [
  "plonky2x",
  "postcard",
  "pser",
+ "psy_client_common",
  "psy_client_data",
  "psy_common_circuit",
  "psy_config",

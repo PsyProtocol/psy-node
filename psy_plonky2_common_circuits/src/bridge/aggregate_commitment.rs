@@ -221,7 +221,7 @@ pub fn prefix_commitment<F: RichField + Extendable<D>, const D: usize>(
     keccak_prefix_words(builder, &words, length)
 }
 
-fn keccak_prefix_words<F: RichField + Extendable<D>, const D: usize>(
+pub fn keccak_prefix_words<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>, words: &[Target], byte_length: Target,
 ) -> Bytes32Target {
     assert!(words.len() <= u32::MAX as usize / 4);

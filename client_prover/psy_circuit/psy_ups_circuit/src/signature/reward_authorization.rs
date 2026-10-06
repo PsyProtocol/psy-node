@@ -80,7 +80,7 @@ fn path(builder: &mut CircuitBuilder<F, 2>, leaf: HashOutTarget, index: Target, 
     (root, siblings)
 }
 
-fn constrain_signature(builder: &mut CircuitBuilder<F, 2>, signature: &Secp256K1Gadget) {
+pub fn constrain_signature(builder: &mut CircuitBuilder<F, 2>, signature: &Secp256K1Gadget) {
     let coordinate_maximum = builder.constant_biguint(&(Secp256K1Base::order() - 1u32));
     let scalar_maximum = builder.constant_biguint(&(Secp256K1Scalar::order() - 1u32));
     let low_s_maximum = builder.constant_biguint(&(Secp256K1Scalar::order() >> 1usize));
@@ -97,9 +97,9 @@ fn constrain_signature(builder: &mut CircuitBuilder<F, 2>, signature: &Secp256K1
     let low_s = builder.cmp_biguint(&signature.signature_s_target, &low_s_maximum); builder.assert_one(low_s.target);
 }
 
-struct PolicyTarget { version: Target, members: [HashOutTarget; 3], commitment: HashOutTarget }
+pub struct PolicyTarget { pub version: Target, pub members: [HashOutTarget; 3], pub commitment: HashOutTarget }
 impl PolicyTarget {
-    fn new(builder: &mut CircuitBuilder<F, 2>, slots: [HashOutTarget; 4]) -> Self {
+    pub fn new(builder: &mut CircuitBuilder<F, 2>, slots: [HashOutTarget; 4]) -> Self {
         let version = slots[0].elements[0]; builder.range_check(version, 32); builder.assert_non_zero(version);
         let two = builder.constant(F::from_canonical_u8(2)); let three = builder.constant(F::from_canonical_u8(3));
         builder.connect(slots[0].elements[1], two); builder.connect(slots[0].elements[2], three); builder.assert_zero(slots[0].elements[3]);
