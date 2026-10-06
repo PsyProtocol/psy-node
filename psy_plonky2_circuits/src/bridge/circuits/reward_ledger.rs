@@ -448,6 +448,67 @@ fn hash4(value: Hash4) -> anyhow::Result<Hash4> {
     Ok(value)
 }
 
+pub fn reward_hash(value: Hash4) -> anyhow::Result<Hash4> { hash4(value) }
+
+pub fn reward_hash_bytes(value: Hash4) -> anyhow::Result<[u8; 32]> { canonical_bytes(value) }
+
+pub fn reward_ledger_state_root(state: &RewardLedgerStateValues) -> anyhow::Result<Hash4> { state_root(state) }
+
+pub fn encode_reward_ledger_state(state: &RewardLedgerStateValues) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(104);
+    append_state(&mut bytes, state)?;
+    Ok(bytes)
+}
+
+pub fn decode_reward_ledger_state(bytes: &[u8]) -> anyhow::Result<RewardLedgerStateValues> {
+    let mut cursor = bytes;
+    let state = read_state(&mut cursor)?;
+    anyhow::ensure!(cursor.is_empty(), "reward ledger state has trailing bytes");
+    Ok(state)
+}
+
+pub fn encode_reward_ledger_window(window: &RewardLedgerWindowValues) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(164);
+    bytes.extend_from_slice(&window.config_hash);
+    bytes.extend_from_slice(&window.economic_domain);
+    bytes.extend_from_slice(&window.window_id);
+    append_u32(&mut bytes, window.end_checkpoint_id);
+    append_raw_hash(&mut bytes, window.end_checkpoint_root)?;
+    append_raw_hash(&mut bytes, window.start_root)?;
+    Ok(bytes)
+}
+
+pub fn decode_reward_ledger_window(bytes: &[u8]) -> anyhow::Result<RewardLedgerWindowValues> {
+    let mut cursor = bytes;
+    let window = RewardLedgerWindowValues {
+        config_hash: read_array(&mut cursor)?, economic_domain: read_array(&mut cursor)?, window_id: read_array(&mut cursor)?,
+        end_checkpoint_id: read_u32(&mut cursor)?, end_checkpoint_root: read_hash(&mut cursor)?, start_root: read_hash(&mut cursor)?,
+    };
+    anyhow::ensure!(cursor.is_empty(), "reward ledger window has trailing bytes");
+    Ok(window)
+}
+
+pub fn reward_user_empty_hash(height: u8) -> anyhow::Result<Hash4> {
+    anyhow::ensure!(height <= 32, "reward user empty height exceeds 32");
+    let mut hash = empty_summary()?;
+    for level in 1..=height { hash = node_hash(usize::from(level), hash, hash)?; }
+    Ok(hash)
+}
+
+pub fn reward_issued_empty_hash(height: u8) -> anyhow::Result<Hash4> {
+    anyhow::ensure!(height <= 64, "reward issued empty height exceeds 64");
+    let mut hash = [0u64; 4];
+    for _ in 0..height { hash = two_to_one(hash, hash)?; }
+    Ok(hash)
+}
+
+pub fn reward_user_parent_hash(height: u8, left: Hash4, right: Hash4) -> anyhow::Result<Hash4> {
+    anyhow::ensure!((1..=32).contains(&height), "reward user parent height is outside 1..=32");
+    node_hash(usize::from(height), left, right)
+}
+
+pub fn reward_issued_parent_hash(left: Hash4, right: Hash4) -> anyhow::Result<Hash4> { two_to_one(left, right) }
+
 fn hash_out(value: HashOut<F>) -> Hash4 { value.elements.map(|limb| limb.to_canonical_u64()) }
 
 fn canonical_bytes(value: Hash4) -> anyhow::Result<[u8; 32]> {
@@ -552,6 +613,15 @@ mod tests {
             };
             assert_eq!(reward_session_root(source, hash_words(delta.old_root), &[witness]).unwrap(), hash_words(delta.new_root));
         }
+    }
+
+    #[test]
+    fn empty_reward_paths_fold_to_the_empty_roots() {
+        let user_siblings = std::array::from_fn(|height| reward_user_empty_hash(height as u8).unwrap());
+        let user_leaf = reward_user_empty_hash(0).unwrap();
+        assert_eq!(summary_root(0, user_leaf, &user_siblings).unwrap(), reward_user_empty_hash(32).unwrap());
+        let issued_siblings: [[u64; 4]; 64] = std::array::from_fn(|height| reward_issued_empty_hash(height as u8).unwrap());
+        assert_eq!(poseidon_path(0, [0; 4], &issued_siblings).unwrap(), reward_issued_empty_hash(64).unwrap());
     }
 
     #[test]
