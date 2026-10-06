@@ -416,10 +416,8 @@ mod tests {
 
     fn calldata() -> Bytes {
         finalize_bridge::BridgeWindowCall {
-            finalize_proof: [U256::ZERO; 8], checkpoint_pi: vec![U256::ZERO; 35],
             deposit_proof: [U256::from(1u8); 8], deposit_opening: Bytes::from_static(&[9, 8, 7]),
-            withdrawal_proof: [U256::ZERO; 8], withdrawal_opening: Bytes::new(),
-            reward_proof: [U256::ZERO; 8], reward_opening: Bytes::new(),
+            settlement_proof: [U256::from(2u8); 8], settlement_opening: Bytes::from_static(&[6, 5, 4]),
         }.encode()
     }
 

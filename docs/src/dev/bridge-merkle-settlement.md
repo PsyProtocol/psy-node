@@ -32,7 +32,7 @@
 
 ## Abstract
 
-One user proof credits exactly one `(economic_domain, source_checkpoint_id, user_id)` session. Its checked amount `W` and count are the full sum and count of the jobs the user chose to include. Jobs omitted from that session are forfeited. `RewardInclusionAggregateCircuit` verifies one final `RewardSessionCircuit` proof per user, and its Groth16 wrapper publishes the payout root. These are exactly three circuit kinds, not a fixed proof depth. `WithdrawalInclusionAggregateCircuit` remains a separate pipeline. The payout leaf uses a Keccak path, with neither user Groth16 nor signatures. The session nullifier prevents the same included job from being summed twice inside that session. It is discarded with the session and is not a second payment ledger. The existing deployed payer remains the per-job payer until the source-user key replaces it.
+One user proof credits exactly one `(economic_domain, source_checkpoint_id, user_id)` session. Its checked amount `W` and count are the full sum and count of the jobs the user chose to include. Jobs omitted from that session are forfeited. `RewardInclusionAggregateCircuit` verifies one final `RewardSessionCircuit` proof per user. That circuit and `WithdrawalInclusionAggregateCircuit` are inner children of outer proof B. They are not L1 outer proofs, and neither has its own outer Groth16 setup. L1 has exactly two outer setups: proof A for the deposit aggregate, and proof B for the joint finalize, withdrawal, and Ethereum reward statement. Proof B is mandatory even when payouts are empty. There is no third outer setup. The payout leaf uses a Keccak path, with neither user Groth16 nor signatures. The session nullifier prevents the same included job from being summed twice inside that session. It is discarded with the session and is not a second payment ledger. The existing deployed payer remains the per-job payer until the source-user key replaces it.
 
 ## Motivation
 
@@ -82,12 +82,14 @@ sequenceDiagram
 ```
 
 ```text
-reward:     user circuit -> reward inclusion_aggregate -> Groth16 wrap -> root registry
-withdrawal: withdrawal proof -> withdrawal inclusion_aggregate -> its Groth16 wrap -> root registry
-checkpoint: authenticated contiguous transitions -> finalize -> its Groth16 wrap ----+
-deposit:    complete configured-chain deposit transition -> its Groth16 wrap --------+
+inner children:  withdrawal child and reward child are proved inside B, not as L1 outer proofs
+L1 outer A:     deposit aggregate -> its Groth16 wrap ------------------------+
+L1 outer B:     joint finalize, withdrawal, and Ethereum reward proof ------+
+                 mandatory on every destination transaction, including empty payouts
 claim:      leaf + Keccak siblings -> published root -> replay/accounting checks -> transfer
 ```
+
+Proof B unconditionally verifies the withdrawal child and the reward child with the same real pinned verifiers. A zero count is a valid input to those real circuits. An empty batch proves the empty-set family digests rebuilt from the complete opening. Empty and nonempty batches have the same fixed child proof cost. There is no dummy proof, dummy verifier, presence flag, conditional skip, or second verifier. A later proposal to skip either child is a design regression and requires re-review. The settlement parent already verifies its children unconditionally. Current child nonzero asserts still have to be migrated. This document does not claim that child zero-count support is already implemented or tested. Proof B's Plonky2 settlement source public inputs stay prefix `[2,12,2,0]`, 12 public inputs. The adapter packs those inputs as 256 bits. The Groth16 outer proof has two `uint256` values, the two uint128 halves, not those 12 source inputs.
 
 The user owns user proving. The aggregator verifies, aggregates and wraps; it does not generate user proofs. Guardian signing policy belongs exclusively to `bridge-relayer-multisig.md` and is unchanged. User L1 claims never call a verifier or accept signatures. Publication is proposer-only and requires Groth16 evidence.
 
@@ -95,7 +97,7 @@ Withdrawal preserves nonce replay, pending delay, threshold, lifetime limits, pa
 
 ### 2. Proof topology and public inputs
 
-**Required topology: exactly three circuit kinds.** Kind one is the self-recursive credit session, kind two is reward inclusion aggregation of one terminal proof per user, and kind three is its Groth16 wrapper. A user step directly constrains at most compiled `k` newly included jobs, source membership, the checked sum of those jobs, recipient binding, the rolling jobs commitment, and that session's nullifier transition. It recursively verifies the same-kind own-user predecessor and, when users interleave, the same-kind global predecessor. Depth is data-dependent, `ceil(included_job_count/k)` user steps; it is not three layers. `k` remains a benchmark-selected circuit capacity, not a lifetime, job, or checkpoint limit and not an extra circuit kind. No distinct per-job circuit, closing circuit, four signature circuits, balance circuit, debit circuit, or ticket registry is added.
+**Inner reward kinds, not a third outer setup.** The reward path has two inner kinds: the self-recursive credit session, and reward inclusion aggregation of one terminal proof per user. A user step directly constrains at most compiled `k` newly included jobs, source membership, the checked sum of those jobs, recipient binding, the rolling jobs commitment, and that session's nullifier transition. It recursively verifies the same-kind own-user predecessor and, when users interleave, the same-kind global predecessor. Depth is data-dependent, `ceil(included_job_count/k)` user steps. `k` remains a benchmark-selected circuit capacity, not a lifetime, job, or checkpoint limit and not an extra circuit kind. No distinct per-job circuit, closing circuit, four signature circuits, balance circuit, debit circuit, or ticket registry is added. L1 outer setups are only proof A and proof B. The inner withdrawal child and the inner reward child are both inside proof B. Neither is a separate outer pipeline, and there is no third outer setup.
 
 Withdrawal construction and reward construction have distinct constructors, witnesses, circuits, setup identities and runtime paths. Shared pure canonical tree/encoding helpers are allowed only for identical semantics. The rejected alternative is one family-generic circuit whose runtime selector merges withdrawal and reward relations: it weakens ownership, couples fingerprints and leaves family-specific constraints implicit. A common publication envelope does not merge the proof pipelines.
 
@@ -116,9 +118,9 @@ The fields are one `RewardSessionStatement`. They do not also carry a balance, a
 
 #### Publication, deposit and finalize statements
 
-Inclusion publication has `AGGREGATE_PI_LEN` fields: `[1,7,family,0]`, then `opening_digest`, `claim_tree_root`, and `header_digest`, each digest split into eight big-endian u32 words. Family 2 is withdrawal; family 3 is reward. The wrapper emits 768 most-significant-bit-first bits, packed in order as six uint128 values: high then low half of each digest. The session statement is recursively verified inside `RewardInclusionAggregateCircuit`, not passed to the L1 verifier.
+The historical inclusion publication statement is rejected. It had 28 public inputs, prefix `[1,7,family,0]` plus three digests, and 768 wrapper bits packed as six uint128 values. Family 2 was withdrawal and family 3 was reward. A setup with that width, prefix, source, or verifier identity is rejected. The session statement stays inside `RewardSessionCircuit`.
 
-Deposit keeps prefix `[1,11,1,0]`, its own input width, 256 wrapper bits, and two uint128 halves. Finalize retains `26+9*C` inputs and its separate wrapper. Its retained 26-word prefix is not its full width. `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit` both register `AGGREGATE_PI_LEN` before build (`inclusion_aggregate.rs`).
+L1 has exactly two outer Groth16 setups. Each verifies with `verifyProof(uint256[8] calldata proof, uint256[2] calldata publicInputs)`. Proof A is the deposit aggregate. Its two `uint256` public inputs are the two uint128 halves of that outer statement. The inner deposit source is the prefix plus eight u32 fields, 12 fields, not those two halves. Proof B is the joint finalize, withdrawal, and Ethereum reward proof. It is mandatory on every destination transaction, including empty payouts. Its inner children are the withdrawal child and the reward child. `RewardInclusionAggregateCircuit` verifies one final `RewardSessionCircuit` proof per user inside proof B. The inner finalize source has width `26+9*C`, with `1<=C<=8`; its 26-word prefix is not that full width. This document does not assign byte layouts to either outer opening. Current `AGGREGATE_PI_LEN` registration in `inclusion_aggregate.rs` is not an implementation of proof A or proof B.
 
 `B` is exactly one of 1024, 2048, 4096 and 8192; initial compiled capacity is 1024. Count range uses `log2(B)+1` bits. The pure tree helper supports powers of two from 1 through 131072, including empty sibling paths at capacity 1; production circuits remain limited to the four listed capacities. A helper's larger range does not authorize another production setup.
 
@@ -186,7 +188,7 @@ The payout consumption boolean is a separate record. It cannot replace this occu
 
 #### What the session statement does not close
 
-Statement fields `[26..30)` and `[30..34)` are the composite ledger-state endpoints of `RewardSessionStatement`: ledger window, ledger root, user root, session count, and unfinished session count (`reward_session.rs`). They are not publication public inputs. Publication is the 28-word schema in `inclusion_aggregate.rs`: prefix `[1,7,family,0]`, then `opening_digest`, `claim_tree_root`, and `header_digest`, each digest as eight big-endian u32 words (`AGGREGATE_PI_LEN`). The statement endpoints are not the private session root and contain no global per-job bitmap. The private session root is carried only by `reward_session_summary`. Statement `[26..30)` equals the old state root on every step. The first step of a window binds it to `start_root`, which is `origin_state_root()` for the first economic-domain window. A later step inside one window binds it to the predecessor's statement `[30..34)`. Statement `[30..34)` is the ordinary hash of the next opening. `RewardSessionCircuit` registers its 34 statement fields. The publication consumer is `RewardInclusionAggregateCircuit`, and the connection from every selected terminal to one publication history remains the interleaved admission gap. That gap does not add a public input, a per-job bitmap, or a payout-boolean substitute.
+Statement fields `[26..30)` and `[30..34)` are the composite ledger-state endpoints of `RewardSessionStatement`: ledger window, ledger root, user root, session count, and unfinished session count (`reward_session.rs`). They are not L1 public inputs. The inner inclusion schema in `inclusion_aggregate.rs` is 28 words: prefix `[1,7,family,0]`, then `opening_digest`, `claim_tree_root`, and `header_digest`, each digest as eight big-endian u32 words (`AGGREGATE_PI_LEN`). That schema is the inner child statement. It is not proof A's or proof B's two public inputs, and its six-uint128 wrapper is not applicable. The statement endpoints are not the private session root and contain no global per-job bitmap. The private session root is carried only by `reward_session_summary`. Statement `[26..30)` equals the old state root on every step. The first step of a window binds it to `start_root`, which is `origin_state_root()` for the first economic-domain window. A later step inside one window binds it to the predecessor's statement `[30..34)`. Statement `[30..34)` is the ordinary hash of the next opening. `RewardSessionCircuit` registers its 34 statement fields. The inner publication consumer is `RewardInclusionAggregateCircuit`, and the connection from every selected terminal to one publication history remains the interleaved admission gap. That gap does not add a public input, a per-job bitmap, or a payout-boolean substitute.
 
 ### 4. Canonical encoding and claim trees
 
@@ -217,9 +219,9 @@ All operations reject overflow. An empty-family manifest sets all counts and ind
 
 ### 5. Finalize and deposit authentication
 
-A real positive-span finalize proof is mandatory for every destination transaction, including continuation. The retained prefix is `[0..4)` start root, `[4..12)` global deposit pair encoding, `[12..20)` global withdrawal pair encoding, `[20..24)` end root, `[24]` end id and `[25]` span. For configured ordinal `o`, `b=26+9*o`: `[b..b+4)` deposit root, `[b+4]` absolute deposit count, `[b+5..b+9)` withdrawal root. Count is checked u32. `C` and ordered chain indices are circuit constants. Full width is `26+9*C` (`bridge_agg_final.rs:63-69`).
+A real positive-span finalize statement is mandatory inside proof B for every destination transaction, including continuation and including a transaction whose payouts are empty. Proof B itself is the mandatory L1 outer proof for that joint statement. The retained inner prefix is `[0..4)` start root, `[4..12)` global deposit pair encoding, `[12..20)` global withdrawal pair encoding, `[20..24)` end root, `[24]` end id and `[25]` span. For configured ordinal `o`, `b=26+9*o`: `[b..b+4)` deposit root, `[b+4]` absolute deposit count, `[b+5..b+9)` withdrawal root. Count is checked u32. `C` and ordered chain indices are circuit constants. Full inner width is `26+9*C` (`bridge_agg_final.rs:63-69`). Configured source-chain count is `1<=C<=8`.
 
-Wrapper bytes retain the original 144-byte prefix: indices `[0..4)` and `[20..26)` use big-endian u64; `[4..20)` use big-endian u32 with adjacent pairs swapped. Each extension word appends big-endian u64, including the u32 count. Full length is `144+72*C`. L1 and wrapper require this exact width and hash the same bytes. Zero proof, zero span, bootstrap substitution and an unverified named end root reject.
+The inner finalize wrapper bytes retain the original 144-byte prefix: indices `[0..4)` and `[20..26)` use big-endian u64; `[4..20)` use big-endian u32 with adjacent pairs swapped. Each extension word appends big-endian u64, including the u32 count. Full inner length is `144+72*C`. The inner wrapper hashes those bytes. That width is not proof B's two L1 public inputs, and this document does not assign those two inputs a byte encoding. Zero proof, zero span, bootstrap substitution and an unverified named end root reject. Configured `C` above 8 rejects; the fixed 256-wide Merkle lookup stays unchanged.
 
 Generated finalize verifier getter `endpointChainListHash()` is `keccak256(UTF8("PsyBridge/FinalizeChainList/1") || uint16_be(C) || raw ordered chain-index bytes)`. Installation compares it against configured chains. A same-width differently ordered chain list is not an equivalent source.
 
@@ -229,32 +231,20 @@ Generated finalize verifier getter `endpointChainListHash()` is `keccak256(UTF8(
 
 Deposit aggregate remains mandatory and authenticates every configured chain's old/new deposit root and absolute count. StateManager joins each new endpoint to the matching finalize extension and joins every withdrawal-root vector to the same extension. Deposit application remains restricted to StateManager, verifies no proof itself, and preserves local custody, pending-count and transition checks. It accepts exact end-state no-op on continuation. Neither a root name nor the reserved `withdrawalSubtreeRoot` storage is withdrawal authority.
 
-Withdrawal root witness remains private: configured ordinal u8 and exactly eight Poseidon siblings select one root from the authenticated ordered C-root vector through the height-eight lookup padded to256. Require `1<=C<=256`, exact configured membership, canonical limbs and no trailing opening bytes. No path is serialized in a withdrawal record and no additional setup is introduced. Strict opening order is `(chain_index,nonce)`; foreign-chain records never create local nonce consumption. Current source witness is `inclusion_aggregate.rs:38-49,281-307`.
+Withdrawal root witness remains private inside the inner withdrawal child: configured ordinal u8 and exactly eight Poseidon siblings select one root from the authenticated ordered C-root vector through the fixed 256-wide height-eight lookup. The lookup width stays 256. That width is not the source-chain bound. Require `1<=C<=8`, exact configured membership, canonical limbs and no trailing opening bytes. No path is serialized in a withdrawal record and no additional setup is introduced. Strict opening order is `(chain_index,nonce)`; foreign-chain records never create local nonce consumption. Current source witness is `inclusion_aggregate.rs:38-49,281-307`. This witness is not proof B's two L1 public inputs.
 
 Identity replay reuses the real positive-span proof, requires end id/root equal stored cursor and opening end, but does not require historical start root equal current end. It performs all endpoint joins and no cursor advance or `Finalized` emission. No previous-anchor or historical-success mapping is added.
 
 ### 6. Publication and delivery
 
-The complete proposed publication ABI is:
+The approved publication function is:
 
 ```solidity
-struct InclusionSegment {
-    bytes headerBytes;
-    uint256[8] proof;
-    bytes firstLeafBytes;
-    bytes32[] firstSiblings;
-    bytes lastLeafBytes;
-    bytes32[] lastSiblings;
-}
 function applyBridgeWindow(
-    uint256[8] calldata finalizeProof,
-    uint256[] calldata checkpointPublicInputs,
     uint256[8] calldata depositProof,
     bytes calldata depositOpening,
-    bytes calldata withdrawalManifest,
-    bytes calldata rewardManifest,
-    InclusionSegment[] calldata withdrawalSegments,
-    InclusionSegment[] calldata rewardSegments
+    uint256[8] calldata settlementProof,
+    bytes calldata settlementOpening
 ) external;
 function claimReward(bytes32 headerDigest, uint32 ordinal,
     bytes calldata leafBytes, bytes32[] calldata siblings) external;
@@ -262,13 +252,16 @@ function claimAggregateWithdrawal(bytes32 headerDigest, uint32 ordinal,
     bytes calldata leafBytes, bytes32[] calldata siblings) external;
 ```
 
-This replaces the current full-opening withdrawal/reward publication parameters; it is not the current source ABI. Both claim implementations use `nonReentrant`; publication remains `onlyProposer`. Calldata arrays are bounded by compiled family counts and preflight; no arbitrary fixed two-to-four segment cap is introduced. Full openings remain off chain except the complete deposit opening. First/last witnesses are required even for a one-leaf segment and then must encode the same leaf/path.
+`depositProof` and `depositOpening` are outer proof A and its complete opening. `settlementProof` and `settlementOpening` are outer proof B and its complete opening. Proof B is mandatory even when payouts are empty. This document does not define the byte encoding of either opening. The earlier `applyBridgeWindow` with per-segment proofs, manifests, and partial openings is rejected, not retained. Both openings are complete. A segmented partial-opening flow is not approved for proof A or proof B. The pull claims stay leaf plus Keccak siblings and do not take a Groth16 proof. Both claim paths use `nonReentrant`; publication remains `onlyProposer`.
 
-Publication order is authorization and canonical decoding; manifests and segment/boundary validation; new-window or continuation predicate; finalize and deposit verification; per-segment Groth16 verification; then atomic deposit, registry, progress, and cursor writes. Any failure reverts the entire transaction. No transfer and no consumption-key write occurs during publication. Publication does not write a persistent job-nullifier root.
+Publication verifies proof A and mandatory proof B, then writes deposit, registry, progress, and cursor state atomically. Any failure reverts the entire transaction. No transfer and no consumption-key write occurs during publication. Publication does not write a persistent job-nullifier root.
+
+The next window's `start_root` is the previous window's published and verified `new_ledger_state_root`. The first window of an economic domain starts at `origin_state_root()`, the fixed protocol Poseidon hash of the origin state. `RewardSessionCircuit::new` calls that function. The store must call it for first-window initialization. It does not call it now, and that initialization is blocked on the configured economic domain. There is no lock. The value is not the zero Hash4 and not a store choice. Until rule 24 freezes the domain labels, changing this unfrozen value has no artifact cost. The old state root equals statement `[26..30)` on every step, so the ordinary hash already binds that opening. The remaining gap is initializing and publishing the first window at that hash. The host's locked baseline equals `start_root` on the first step of a window. Empty-window completion is immediate after mandatory proof A and mandatory proof B. Progress is per destination; a successful receipt on one chain is not another chain's acceptance.
+
+The segmented registry, manifests, and partial openings below are not approved for proof A or proof B. They are not the `applyBridgeWindow` contract in this section. Proof A and proof B each take one complete opening.
 
 StateManager's registry unique key is `(config_hash,window_id,family,segment_index)`, with lookup by `header_digest`. New segments are consecutive per family. First and last paths use ordinals 0 and `count-1`. The previous segment's last boundary is strictly less than the next segment's first boundary. The withdrawal boundary is `(chain_index,nonce)`. The reward boundary is `user_id`, matching `ActiveWindow.rewardLastUserId`. It is not `(source_checkpoint_id,user_id)`, because that order would accept the same user twice when the source changed. The occupancy key remains `(economic_domain,source_checkpoint_id,user_id)` and is not this ordering key. Circuit sorting is internal. Identical saved-header retries are no-ops and conflicting retries revert. A reward header's two Hash4 slots bind that segment's stated admission-state endpoints. They are not the private session root, not a stored global job bitmap, and not chained from a previous window. Stale unpublished proofs return to the user for reproving. No root is edited outside a new proof.
 
-The first transaction contains both manifests and verified segment zero for every nonempty family. It advances the checkpoint cursor once. Continuation requires identical window, end, and deposit digest, plus family common fields `(family,B,total_count,segment_count,withdrawal_roots)`. Its current cursor equals the active end and finalize is identity replay. A new window rejects until all required segments of both families are accepted. The next window's `start_root` is the previous window's published and verified `new_ledger_state_root`. The first window of an economic domain starts at `origin_state_root()`, the fixed protocol Poseidon hash of the origin state. `RewardSessionCircuit::new` calls that function. The store must call it for first-window initialization. It does not call it now, and that initialization is blocked on the configured economic domain. There is no lock. The value is not the zero Hash4 and not a store choice. Until rule 24 freezes the domain labels, changing this unfrozen value has no artifact cost. The old state root equals statement `[26..30)` on every step, so the ordinary hash already binds that opening. The remaining gap is initializing and publishing the first window at that hash. The host's locked baseline equals `start_root` on the first step of a window. Empty-window completion is immediate after mandatory finalize and deposit checks. Progress is per destination; a successful receipt on one chain is not another chain's acceptance.
 
 #### Continuity without a persistent job root
 
@@ -276,7 +269,7 @@ The first transaction contains both manifests and verified segment zero for ever
 |---|---|---|
 | Own session step | The private session root starts empty on the first own step. A later own step authenticates it through `reward_session_summary`, with amount, count, and jobs commitment. | It does not put that private root in public PI `[26..34)` and does not persist its job bits after the session closes. |
 | Interleaved admission | A global predecessor orders steps from different sessions. The ledger-state connection in section 3 is the required relation when that ordering is used. | Current targets do not yet connect every selected terminal to one history. That is an integration gap, not a persistent-root requirement. |
-| Segment publication | The segment index is the next consecutive index, or the saved header bytes are identical on retry. The Groth16 statement binds this header and opening. | It does not repair an unconnected admission history by storing a nullifier cursor. |
+| Segment publication | The segment index is the next consecutive index, or the saved header bytes are identical on retry. Proof B binds this header and opening. | It does not repair an unconnected admission history by storing a nullifier cursor, and it is not a per-segment outer Groth16 proof. |
 
 Current `StateManager.sol:205-253` has no reward-admission-root registry. The following is **design pseudocode**, not an existing implementation:
 
@@ -293,7 +286,7 @@ applyBridgeWindow, for each supplied reward segment in canonical segment order:
     require segment_index equals nextRewardSegment
     if segment_index != 0:
         require segment_index - 1 is registered for this config, window and family
-    verify the reward Groth16 statement binds this exact header, opening and claim root
+    require proof B, the mandatory outer joint proof, binds this exact header, opening and claim root
     stage this headerBytes once
     stage nextRewardSegment = segment_index + 1
 after every required proof, endpoint join, boundary check and deposit effect succeeds:
@@ -369,10 +362,10 @@ Bytes are `192*N+256*K`, off chain, using the 192-byte source-checkpoint leaf. R
 
 Required unexecuted QA:
 
-1. Exact 34-user offsets, all u32 ranges, canonical Felt decoding, uint256 carry and overflow, and recipient upper zeros. Distinguish publication 28 and finalize `26+9*C`.
-2. Exactly three reward circuit kinds on the actual construction path. Same-kind self-recursion has data-dependent depth and benchmark-selected `k`. No hidden debit, ticket, or fourth authorization circuit. Terminal authorization reuses the selected existing primitives. Separate withdrawal and reward setup identities.
+1. Exact 34-user offsets, all u32 ranges, canonical Felt decoding, uint256 carry and overflow, and recipient upper zeros. Distinguish the inner 28-word inclusion schema and the inner finalize width `26+9*C` from proof A's two uint128 public inputs. The six-input inclusion verifier is not applicable.
+2. Two inner reward kinds, `RewardSessionCircuit` and `RewardInclusionAggregateCircuit`, both inside proof B, plus the inner withdrawal child in the same proof. No third outer setup. Same-kind self-recursion has data-dependent depth and benchmark-selected `k`. No hidden debit, ticket, or fourth authorization circuit. Terminal authorization reuses the selected existing primitives.
 3. One session per `(economic_domain,source_checkpoint_id,user_id)`, base zero and seed, checked `W` and count, private session-local zero-to-one job keys, public composite ledger-state roots, omitted-job forfeiture, and no persisted job root. Wrong source, owner, recipient, or repeated key rejects. Final-step authorization binds chain digest, recipient, source, amount, count, and jobs commitment. The ledger-history connection and the unfrozen gadget composition are reported, not treated as passed.
-4. Cross-language opening, header, tree, and digest vectors; C=1 and C=256; counts 0, 1, B-1, B, and B+1; helper depths 0 and 17 accepted, 18 rejected; production widths exactly four.
+4. Cross-language opening, header, tree, and digest vectors for the inner statements; configured source-chain counts C=1 and C=8, with C=256 rejected as a source-chain count; the fixed 256-wide Merkle lookup unchanged; counts 0, 1, B-1, B, and B+1; helper depths 0 and 17 accepted, 18 rejected. Production acceptance is the two outer proofs, not a C=256 source-chain deployment. The six-input inclusion verifier is not applicable.
 5. Real-proof acceptance and zero or wrong-proof rejection; cached-base and coordinator fingerprint mismatch before any setup; same-width wrong chain-list or type rejection; direct span 1 and 32 and chained 33 boundaries with every checkpoint transition authenticated.
 6. Atomic publication rollback, identity replay, duplicate or conflicting segment retry, incomplete-window blocking, empty manifests, inter-segment sorting, mixed-family continuation, canonical reorganization recovery, and indeterminate Sending retention.
 7. One full `W` payment, unchanged recipient, one boolean consumption key, insufficient reserve, exact token deltas, no verifier or signature call in the claim, and unchanged withdrawal nonce and delay behavior. The current per-job `spentRewards` key is reported as a mismatch, not silently converted.
@@ -503,7 +496,7 @@ Retain the source checkpoint witness, tagged-job openings, session seed inputs, 
 
 ## Core Functions
 
-`WithdrawalInclusionAggregateCircuit::prove` and `RewardInclusionAggregateCircuit::prove` (`inclusion_aggregate.rs`) each call `set_witness` and then the already-built circuit's `prove`. Neither appends inputs after build. `AGGREGATE_PI_LEN` is the shared publication width.
+`WithdrawalInclusionAggregateCircuit::prove` and `RewardInclusionAggregateCircuit::prove` (`inclusion_aggregate.rs`) each call `set_witness` and then the already-built circuit's `prove`. Neither appends inputs after build. `AGGREGATE_PI_LEN` is the shared inner child width. It is not the two L1 public inputs of proof A or proof B.
 
 Proposed concrete shared codec functions:
 
@@ -517,23 +510,19 @@ pub fn read_hash4(words: &[u64], encoding: Hash4Encoding)
 
 `build_inclusion_aggregate_tree` validates power-of-two capacity, depth<=17 and count<=capacity, fills real/padding leaves using section 4, then hashes each parent exactly once from bottom to top; errors use existing `InvalidCount`. Output length is `2*B-1`, root index zero. It has no I/O or proof side effect. `read_hash4` checks selected width 4 or 8, validates u32 halves when selected, reconstructs each limb, checks `<p` and rejects without decoder fallback. Existing `BridgeProofError` and `Result` are at `bridge_aggregate.rs:25-50`.
 
-The section 6 Solidity declarations are the full external source interfaces. `StateManager.applyBridgeWindow` calls canonical header/config/deposit decoders, finalize verification, deposit verification, family-specific inclusion verification and boundary-tree verification, then restricted `Bridge.applyDepositAggregate(bytes)` and registry/progress updates. Preconditions, failure rollback and no-transfer postcondition are section 6. Inclusion verification passes `[openingHigh,openingLow,rootHigh,rootLow,headerHigh,headerLow]` to the proposed interface:
+`StateManager.applyBridgeWindow` verifies outer proof A against the complete `depositOpening` and mandatory outer proof B against the complete `settlementOpening`, then calls restricted `Bridge.applyDepositAggregate(bytes)` and registry/progress updates. Preconditions, failure rollback and the no-transfer postcondition are section 6. Each outer proof uses:
 
 ```solidity
-interface IInclusionAggregateVerifier {
-    function verifyProof(uint256[8] calldata proof, uint256[6] calldata input) external view;
-}
-function inclusionAggregateRoot(bytes32 headerDigest)
-    external view returns (InclusionAggregateRoot memory);
+function verifyProof(uint256[8] calldata proof, uint256[2] calldata publicInputs) external view;
 ```
 
-The existing two-half `IAggregateVerifier` stays for deposits; finalize uses its separate verification path. `claimReward` calls registry lookup, the 192-byte source-checkpoint decoder, Keccak path fold, consumption-key and recipient checks, and token balance/transfer functions. `claimAggregateWithdrawal` calls the same pure tree fold with the withdrawal leaf codec and then existing nonce/pending/payment logic. No caller passes a proof object to either claim.
+For proof A, those two public inputs are the two uint128 halves. The inner deposit source remains prefix plus eight u32 fields. The six-uint256 inclusion verifier is rejected and is not added. `inclusionAggregateRoot` remains the registry lookup. `claimReward` uses the 192-byte source-checkpoint decoder, Keccak path fold, consumption-key and recipient checks, and the token transfer. `claimAggregateWithdrawal` uses the withdrawal leaf codec and then existing nonce, pending, and payment logic. Neither claim takes a proof.
 
 ## Core Loops
 
 1. **User proving:** include at most `k` jobs of one source and user per step. Verify the own-user predecessor and any actual global predecessor, bind that source, open each included job, and update its session-local zero-to-one path. Add the checked amount and count from zero and roll the jobs commitment from the session seed. Repeat until the selected jobs are included. The terminal amount is `W`. Reject overflow, the wrong predecessor, another source or user, a duplicate key, or capacity excess. Jobs not selected are forfeited. The admission-history connection remains the section 3 gap.
-2. **Segment construction:** for each family, start at ordinal zero, take `min(B,remaining)`, verify its user or withdrawal proofs, construct the opening, header, and claim tree, prove inclusion, and retain the bytes. Increase the ordinal by the count and stop at `total_count`. Reward inclusion checks each leaf's source, user, recipient, and amount against that user's terminal proof. It does not require every leaf to name one source. An error leaves earlier retained artifacts intact and submits no incomplete candidate.
-3. **Publication:** wait until no Sending or Submitted transaction remains for the destination. Read the next accepted segment index, preflight the exact candidate calldata, save Sending, broadcast, and save the hash. Observe finalized evidence until it is classified. An indeterminate outcome stays retained and stops further submission. Accepted segments advance counters exactly once. Stop the window only when both families are complete.
+2. **Segment construction is not approved for proof A or proof B.** The earlier per-family ordinal loop, partial opening, and per-segment inclusion proof are not the approved publication contract. Each outer proof takes one complete opening.
+3. **Publication:** wait until no Sending or Submitted transaction remains for the destination. Preflight `applyBridgeWindow` with proof A, its complete `depositOpening`, mandatory proof B, and its complete `settlementOpening`. Save Sending, broadcast, and save the hash. Observe finalized evidence until it is classified. An indeterminate outcome stays retained and stops further submission.
 4. **Pull:** fetch one published leaf and path, verify membership locally for user feedback, and submit the exact claim. Classify the canonical event and state. A failed transfer leaves the consumption key unset. A repeated `(economic_domain,source_checkpoint_id,user_id)` rejects. A later source is a different key and pays its own full `W`, not a delta.
 
 ## Module Changes
@@ -544,7 +533,7 @@ The existing two-half `IAggregateVerifier` stays for deposits; finalize uses its
 | Reward session | `RewardSessionCircuit`; one source and user; base zero and seed; terminal `W`; session-local nullifier | `reward_session.rs` |
 | Withdrawal inclusion circuit | Withdrawal child verification, configured-root membership, withdrawal header and tree | `WithdrawalInclusionAggregateCircuit` in `inclusion_aggregate.rs` |
 | Reward inclusion circuit | One final `RewardSessionCircuit` proof per user, payout-leaf equality, and publication bindings | `RewardInclusionAggregateCircuit` in `inclusion_aggregate.rs` |
-| Wrapper/setup | Artifact-specific 2-half or 6-half shapes and typed finalize source | `bridge_wrap.rs:116-148` |
+| Wrapper/setup | Two outer setups only: proof A, whose two public inputs are the two uint128 halves, and proof B. Inner deposit source is prefix plus eight u32 fields. No third outer setup. | `bridge_wrap.rs:116-148` |
 | Checkpoint schema | Remains six roots and 192 bytes; no reward-root addition | `psy_data/src/v1/qdata/checkpoint.rs:320-370` |
 | StateManager | Atomic per-transaction publication, complete-window progress, finalize and deposit joins; no persistent job-nullifier cursor | `StateManager.sol:205-275` |
 | Payer / Bridge | Current payer is per-job `REWARD_PER_CLAIM`; proposed payer is one full `W`. Withdrawal nonce and delay stay unchanged | `EthereumRewardPayer.sol:46-95`; `Bridge.sol:643-670` |
@@ -561,19 +550,19 @@ This is a source-impact plan, not an applied source patch. Hunk headers below id
 | `psy_plonky2_circuits/src/bridge/circuits/inclusion_aggregate.rs` | `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit` own their relations and share `AGGREGATE_PI_LEN`. |
 | `psy_plonky2_circuits/src/bridge/circuits/reward_session.rs` | `RewardSessionCircuit` is the session kind from section 3. Do not add a balance, debit, ticket registry, or seventh checkpoint root. |
 | `psy_plonky2_circuits/src/bridge/circuits/user_reward_aggregate.rs` | Superseded by `reward_session.rs`. The temporary mapping above records its names until the cutover lands. |
-| `psy_plonky2_circuits/src/bridge/circuits/bridge_wrap.rs` | Artifact-specific inclusion width `AGGREGATE_PI_LEN` versus the deposit width; typed finalize source, exact encoding, and chain-list identity. |
+| `psy_plonky2_circuits/src/bridge/circuits/bridge_wrap.rs` | Two outer setups. Proof A's two public inputs are the two uint128 halves. The inner deposit source is prefix plus eight u32 fields. No third outer setup. |
 | `psy_plonky2_circuits/src/bridge/circuits/bridge_agg_final.rs` | Direct span<=32 path with full transition coverage; preserve Chain prefix for larger spans. |
 | `psy_cli/psy_relayer_cli/src/bridge/prove_bridge.rs`, `regen_groth16_keystore.rs` | Independent cached-base/coordinator equality guard before construction/setup and proving; artifact-specific wrapper dispatch. |
 | `psy-contracts/src/BridgeOpening.sol` | Decode strict header/cumulative bytes and update window bounds without deposit preimage changes. |
 | `psy-contracts/src/StateManager.sol` | Replace the full payout-opening ABI with section 6. Keep registry and progress atomic. Do not add a persistent job-nullifier cursor or a direct payout. |
-| `psy-contracts/src/IInclusionAggregateVerifier.sol` | New six-half interface; do not change deposit `IAggregateVerifier.sol`. |
+| `psy-contracts/src/IInclusionAggregateVerifier.sol` | The six-half inclusion interface is not applicable. Do not add it as an outer verifier. Do not change deposit `IAggregateVerifier.sol`. |
 | `psy-contracts/src/EthereumRewardPayer.sol`, `IEthereumRewardPayer.sol` | The proposed payout is section 6's one full `W` and source-user key. Current source remains the per-job key in section 6. This row does not claim that replacement has landed. |
 | `psy-contracts/src/Bridge.sol`, `IAggregateBridge.sol` | Pull membership before existing nonce/delay path; remove StateManager batch-registration callers in the same cutover. |
 | `psy_cli/psy_relayer_cli/src/bridge/daemon.rs` | Ordered retained segment artifacts, manifest and receipt state; preserve crash ordering. |
 | `../psy-services/src/api/handlers/inclusion_aggregate.rs`, `../psy-services/src/repositories/inclusion_aggregate.rs` | New dedicated endpoint/repository for section 7; register through existing server/module lists. Do not reuse unrelated public-transfer repository. |
 | Existing adjacent aggregate/payer/checkpoint tests | Author section 8 contracts; execution only in authorized QA. Preserve named 30M fixture. |
 
-`AGGREGATE_PI_LEN` in `inclusion_aggregate.rs` is the current publication width for both inclusion circuits. Deposit, withdrawal, and reward count bounds in `bridge_aggregate.rs` remain separate. Constructor targets, equality constraints, witness assignment, codecs, native metadata, and setup consumers cut over together. Session width, publication width, and finalize width never share a blanket replacement.
+`AGGREGATE_PI_LEN` in `inclusion_aggregate.rs` is the current inner child width for both inclusion circuits. It is not the two L1 public inputs. Deposit, withdrawal, and reward count bounds in `bridge_aggregate.rs` remain separate. Constructor targets, equality constraints, witness assignment, codecs, native metadata, and setup consumers cut over together. Session width, inner inclusion width, and inner finalize width never share a blanket replacement, and none of them is proof A's or proof B's public-input width.
 
 Setup generation remains gated. Operational command reference, not execution authorization: digest setup uses `psy_relayer_cli regenerate-groth16-keystore --aggregate-proofs --aggregate-config <approved-json> --output-dir <fresh-directory>`; finalize uses `regenerate-groth16-keystore --include-bridge-agg --aggregate-config <approved-json> --skip-deposit-append --skip-withdrawal-claim --keystore-dir <fresh-directory>`, then `export-solidity-verifier --finalize <fresh-directory> <output.sol>`. A fresh directory is mandatory; source/common/verifier/fingerprint, native proving/verifying keys and Solidity verifier constitute one atomic artifact set. Old setup files never validate changed layouts.
 
@@ -603,7 +592,7 @@ Registered concepts only. Final spellings are those in `TERMINOLOGY.md`. This ta
 | Ledger window | `RewardLedgerWindowTargets` | Poseidon binding over `PsyRewardLedger/Window/1`. |
 | Ledger occupancy | `RewardLedgerLeafTargets` | Occupancy write at the reward ledger key under `PsyRewardLedger/Issued/1`. |
 | Publication endpoints | `old_ledger_state_root`, `new_ledger_state_root` | Composite ledger-state endpoints. Not session-nullifier roots. |
-| Publication width | `AGGREGATE_PI_LEN` | Sole owner of the inclusion publication width, shared by `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit`. |
+| Inner inclusion width | `AGGREGATE_PI_LEN` | Sole owner of the inner inclusion width, shared by `WithdrawalInclusionAggregateCircuit` and `RewardInclusionAggregateCircuit`. Not the two L1 public inputs of proof A or proof B. |
 | Claimant identity | `UserAuthTargets` | Scheme selector, registered leaf, `public_key_param`, signature gadgets, and `auth_message`. Only `is_final_step` authenticates the claimant. |
 | Payout key | Consumption key | Boolean per economic domain, source, and user. Current `spentRewards` is a different per-job boolean. |
 | Hash4 selector | `Hash4Encoding` | `CanonicalU64x4`, `LittleEndianU32x8`. Keccak words are not interchangeable. |
@@ -678,8 +667,21 @@ Temporary cutover record. Remove this table after the cutover has landed and rev
 10. No gas, proof-capacity, runtime, or deployment success is asserted here.
 11. `PQEDCheckpointGlobalStateRoots` has exactly six hashes and a 192-byte encoding (`psy_data/src/v1/qdata/checkpoint.rs:320-327,362-370`). Its hash is the six-root hash at `checkpoint.rs:487-493`. This contract does not add a seventh root.
 
+
+### Pre-implementation gate quotes
+
+F4, F1, and F5 below are the design-gate quotes. F4 replaces the section 8 item 4 production bound `C=256` with `MAX_SOURCE_CHAINS = 8`. The approved L1 statement is exactly two outer Groth16 proofs, A and B, each `verifyProof(uint256[8] calldata proof, uint256[2] calldata publicInputs)`. Proof B is mandatory even when payouts are empty. The six-uint256 inclusion verifier is not applicable. Dolo accepts this design intent. Fork enum mapping and consolidation run in parallel with merge. They are not a checkpoint blocker and not a merge blocker. These quotes do not claim that native implementation, setup, or pin advancement has passed. No discriminant is assigned here.
+
+**F4, source-chain bound.** `n=256` empty calldata is `2116 + 992*256 = 256,068` bytes. Under 4-gas-zero / 16-gas-nonzero calldata pricing, its all-nonzero maximum is `4,097,088` gas before execution, not a lower bound. The approved release bound is `MAX_SOURCE_CHAINS = 8`: empty call `2116 + 992*8 = 10052` bytes, maximum `160832` calldata gas; each additional 192-byte leaf adds at most `3072` gas. These enforced maxima are not measured transaction gas. A destination gas limit may be stricter. The fixed Merkle width `0..256` in `inclusion_aggregate.rs` is not this source-chain bound.
+
+**F1, freshness declaration.** The economic domain is `K(K(ASCII("PsyBridge/SourceCheckpointReward/2/EconomicDomain")) || config_hash)`. `NetworkConfig` is the sole authority. The authorized issuer is the release authority, and the declaration carries that issuer's signature. The bound fields are the config hash, the derived economic domain, the source-checkpoint range, `origin_state_root()`, and the deployment chain id. A missing signature or an invalid signature fails closed before prove or send. Verification also rejects a mismatched bound, the wrong chain, or an expired range before proving or submission. The authorized freshness-declaration artifact does not exist yet. Daemon verification of that artifact belongs to `psy_cli/psy_relayer_cli` and is not a flag or config-surface change.
+
+**F1 status read, proposed.** Evidence from agentlo: `RewardPublicationArtifact` is relayer-local (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:584-587`); the dapp and psy-wallet have no reward-status read; `psy-dapp/apps/bridge/src/pages/TransactionDetailPage.tsx:2519-2521` is withdrawal registration only. After merge, the dapp needs a proposed read that distinguishes reward publication, destination settlement, and reward payment. The read is keyed by config, window, and destination and by the source-checkpoint/user credit identity. Success for any of the three requires its own authenticated finalized receipt and state evidence. Publication is not settlement, and settlement is not payment. Pending, failed, and unknown are not success. The freshness declaration above is checked before proving or sending; this read is not that check and is not authority to prove or send. This note specifies no route and no response schema. Both remain subject to coordinated API review, and this note does not implement the read.
+
+**F5, commitment-free native mode.** The native mode is commitment-free BN254 only. The contract shape is `verifyProof(uint256[8] calldata proof, uint256[2] calldata publicInputs)`. Setup and prove reject a commitment index, commitment metadata, `Commitment`, and a non-canonical `CommitmentPok`. The pinned fork revision `53bd550dba52b1a5be8832ecfa095f94341273f2` does not provide this mode: its cached `ffi/src/lib.rs` has no `DigestArtifact` enum, and `cargo check -p psy_plonky2_circuits` reports unresolved import `gnark_plonky2_verifier_ffi::DigestArtifact`. A local unpinned checkout is not the compiled dependency. Native implementation of this mode has not passed. The fork fold-in commits the full `DigestArtifact` enum and the five functions `setup_digest_bits`, `generate_digest_bits_proof`, `setup_finalize`, `read_finalize_setup_identity`, and `generate_finalize_proof`, together with this commitment-free rule. The approved settlement statement uses prefix `[2,12,2,0]`: 12 public inputs and 256 wrapper bits. A historical 28-public-input, 768-bit identity is rejected by width, prefix, source, and verifier identity. The enum mapping remains a fork-review decision. This quote assigns no discriminant. `identity_hash` accepting `1`, `2`, and `3`, and the adapter names `DepositAggregate` and `SettlementAggregate`, are not that mapping. Prefix `[2,12,2,0]` is not an enum value. Mapping and consolidation run in parallel with merge and are not a checkpoint or merge blocker. Fork commit `53bd550d` has parent `35fd12a8` and predates the FFI ownership-leak fix `b64f96d3`. Commit `19aaccf1` is not reachable from this fork. The multi_chain pin advances `35fd12a8` to `19aaccf1`. This PsyProtocol fork keeps pin `53bd550dba52b1a5be8832ecfa095f94341273f2` during merge. Before native delivery, the fork brief mandatorily incorporates `19aaccf1`, including that ownership fix, by a reviewed merge. The merge preserves existing checkpoints. Rebase is not the chosen design, and existing history is not rewritten. This sentence authorizes no git operation, pin change, or setup.
+
 ## Review and Activation Boundary
 
-`RewardSessionStatement` and the three circuit kinds are the adopted contract. Same-kind recursion depth is data-dependent and `REWARD_SESSION_STEP_CAPACITY` is benchmark-selected. Withdrawal and reward remain separate pipelines. No balance, debit, ticket registry, persistent per-job root, or seventh checkpoint root is part of the contract. The current L1 payer key remains the per-job key in section 6; the source-user key is not claimed to have replaced it.
+`RewardSessionStatement` is the adopted session contract. The inner reward kinds are `RewardSessionCircuit` and `RewardInclusionAggregateCircuit`. `WithdrawalInclusionAggregateCircuit` is the inner withdrawal child. Both children belong to outer proof B. L1 outer setups are only proof A and proof B. There is no third outer setup. Same-kind recursion depth is data-dependent and `REWARD_SESSION_STEP_CAPACITY` is benchmark-selected. No balance, debit, ticket registry, persistent per-job root, or seventh checkpoint root is part of the contract. The current L1 payer key remains the per-job key in section 6; the source-user key is not claimed to have replaced it.
 
-Global one-credit occupancy is `RewardLedgerLeafTargets`: two u32 path limbs, user then source, empty zero leaf to occupied leaf under `PsyRewardLedger/Issued/1`. It is not the current L1 key. `reward_session_summary` binds the private session root under `PsyRewardSession/Summary/1`. `UserAuthTargets` authenticates the claimant only on `is_final_step` and fails closed on an unknown fingerprint. No exported constructor connects every selected terminal to one publication history. None of these facts adds a public input or a global per-job bitmap. Independent review under `PIPELINE.md` and the design-reviewer gate are unmet. This document does not claim GO. Product funding, withdrawal timing, and an explicit migration decision remain outside this contract.
+Global one-credit occupancy is `RewardLedgerLeafTargets`: two u32 path limbs, user then source, empty zero leaf to occupied leaf under `PsyRewardLedger/Issued/1`. It is not the current L1 key. `reward_session_summary` binds the private session root under `PsyRewardSession/Summary/1`. `UserAuthTargets` authenticates the claimant only on `is_final_step` and fails closed on an unknown fingerprint. No exported constructor connects every selected terminal to one publication history. None of these facts adds a public input or a global per-job bitmap. Dolo accepts the design intent of the three quotes above. Fork enum mapping is not a checkpoint or merge blocker. Native implementation has not passed. This document does not claim implementation GO. Product funding, withdrawal timing, and an explicit migration decision remain outside this contract.

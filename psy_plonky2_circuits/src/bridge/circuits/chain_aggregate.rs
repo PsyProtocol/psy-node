@@ -158,7 +158,7 @@ pub struct ChainAggregateCircuit<C: GenericConfig<D, F = F>, const D: usize> whe
 
 impl<C: GenericConfig<D, F = F> + 'static, const D: usize> ChainAggregateCircuit<C, D> where F: Extendable<D>, C::Hasher: AlgebraicHasher<F> {
     pub fn build(source_chain_count: usize, web: &DepositSpidermanAppendCircuit<C, D>) -> anyhow::Result<Self> {
-        anyhow::ensure!((1..=256).contains(&source_chain_count), "source chain count must be 1..256");
+        anyhow::ensure!((1..=8).contains(&source_chain_count), "source chain count must be 1..8");
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
         let context = ChainContextTarget::new(&mut builder);
         let config = NetworkConfigTarget::new(&mut builder, source_chain_count);

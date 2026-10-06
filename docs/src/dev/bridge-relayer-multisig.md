@@ -55,6 +55,8 @@ The implemented circuit reads all four policy slots on both sides and verifies e
 - [Rationale](#rationale)
 - [Security Considerations](#security-considerations)
 - [Future Acceptance](#future-acceptance)
+- [Real-network guardian acceptance](#real-network-guardian-acceptance)
+- [Aggregate acceptance ownership](#aggregate-acceptance-ownership)
 - [External Prerequisites](#external-prerequisites)
 
 ## Specification
@@ -545,7 +547,7 @@ Bootstrap requires pristine registered initial identity; initialized policy Gene
 
 ## Future Acceptance
 
-Planned acceptance is unexecuted by this documentation revision. After the required gates, the release command is `cargo test --release -p psy_relayer_cli --test guardian_acceptance -- --ignored --exact guardian_acceptance`. Existing function `guardian_acceptance` is ignored and requires `GUARDIAN_ACCEPTANCE_FIXTURE` (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:1-8,676-681`). Source presence and fixture requirements do not establish a pass. Companion aggregate acceptance remains separately owned.
+Planned acceptance is unexecuted by this documentation revision. The operator procedure is [Real-network guardian acceptance](#real-network-guardian-acceptance). After the required gates, the release command is `cargo test --release -p psy_relayer_cli --test guardian_acceptance -- --ignored --exact guardian_acceptance`. Existing function `guardian_acceptance` is ignored and requires `GUARDIAN_ACCEPTANCE_FIXTURE` (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:1-8,676-681`). Source presence and fixture requirements do not establish a pass. Companion aggregate acceptance is owned outside this runbook; see [Aggregate acceptance ownership](#aggregate-acceptance-ownership).
 
 | Case | Executable scenario and required observation |
 |---|---|
@@ -571,6 +573,140 @@ Planned acceptance is unexecuted by this documentation revision. After the requi
 | Role separation | Guardian key without proposer/pause role cannot use those L1 privileges; bad UPS domain/low-S/member index fails. |
 
 The revised authentication circuit needs focused field-proof/initial-identity mutants and dependent artifact validation at QA. Performance, independent trace determinism and current-runtime registration were not executed or claimed successful here.
+
+## Real-network guardian acceptance
+
+This is the G1 runbook. The only entry is the ignored test `guardian_acceptance`. No `psy_relayer_cli` subcommand wraps it. The test builds `psy_relayer_cli` from `psy_cli/psy_relayer_cli/src/main.rs` and discards every child stdout and stderr (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:85,256-259`). A log line from a child is not a pass signal.
+
+Run the command from the `psy-node` workspace root. Do not start or stop the shared devnet. The test does not provision a network, does not purge one, and does not call `guardian-policy --intent bootstrap` or `propose-withdrawals` (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:12-14,44-45,57-59`).
+
+### Network and artifacts already present
+
+Provide a disposable network before constructing the fixture. User 524288 must already have the public-only initialized Genesis policy, account nonce zero, and a positive fee balance. No other process may submit for that account. The network must already contain at least one genuine unconsumed indexed withdrawal, real Plonky2 aggregate artifacts, and L1 custody for the chains in the guardian authorization. This runbook does not generate Genesis, Groth16 keys, or those artifacts.
+
+The guardian RPC file named by each runtime `rpc_config_path` must have an empty `prove_proxy_url`. `load_network` rejects a nonempty list (`psy_cli/psy_relayer_cli/src/guardian/runtime.rs:205-218`). That file is not the devnet `psy-genesis/config.json` when that file contains a prove-proxy URL.
+
+### Fixture directory
+
+`GUARDIAN_ACCEPTANCE_FIXTURE` is the absolute path of one directory. The effective uid must own it, its mode must be `0700`, and it must not be a symlink. Every ancestor must be a directory owned by that uid or by root and must not be group-writable or other-writable. `/tmp` fails that ancestor check. The loader rejects a missing variable with `GUARDIAN_ACCEPTANCE_FIXTURE is required` and a relative path with `fixture must be absolute` (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:100-109,186-189`).
+
+`manifest.json` in that directory must be mode `0600`, owned by the same uid, and not a symlink. Its JSON must contain:
+
+| Field | Required value |
+|---|---|
+| `disposable` | `true` |
+| `network_magic` | integer greater than 0 and less than `0xffffffff00000001` |
+| `relayer_rpc_config`, `relayer_guardian_config`, `relayer_daemon_config`, `relayer_archive`, `next_members` | one fixture-relative path each |
+| `guardians`, `db_files`, `guardian_listen_addresses` | three entries each |
+| `relayer_history_listen_address` | one listener |
+| `timeouts.service_ready_secs`, `timeouts.session_secs` | optional; each integer from 1 through 7200. Defaults are 120 and 600 |
+
+A present `journal_database_files` key fails with `PostgreSQL journal files are not part of this fixture`. Every manifest path is relative to the fixture root and may contain only normal path components (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:15-38,191-247`).
+
+`relayer_archive` must already exist, be an empty mode-`0700` directory, and stay empty until the test writes it. A nonempty archive fails with `archive must be empty`. Each `db_files` entry must not exist, even as an empty file. Its parent directory must already exist and pass the same directory checks. The test creates each database once with `guardian-create-db`. Creating a database first fails with `database path already exists`.
+
+The four listeners are numeric socket addresses. Each address must be loopback, use a nonzero port, and be distinct. A TCP connect to each address must fail. An occupied port fails with `fixture listener already occupied or unavailable` (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:532-538`).
+
+### Relayer client config
+
+`relayer_guardian_config` is JSON decoded as `GuardianClientConfig` with unknown fields rejected (`psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:14-31`). Paths inside it are relative to that file's parent (`:41-44`). Required keys:
+
+`authorization_path`, `archive_path`, `endpoints`, `tls_identity_path`, `server_ca_path`, `authorization_archive_path`, `authorization_index_path`, `l1_endpoints`, `listen_address`, `history_tls_certificate_path`, `history_tls_private_key_path`, `history_client_ca_path`, `allowed_client_certificate_sha256`.
+
+`endpoints` has length 3. Each value is an `https` origin with path `/` and no user, password, query, or fragment (`psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:86-91`). `listen_address` must equal `relayer_history_listen_address`. The parent of the client file joined with `archive_path` must equal the manifest archive (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:219-224`).
+
+### Three guardian runtime configs
+
+`guardians` names three JSON files, one per signing key, decoded as `GuardianRuntimeConfig` with unknown fields rejected (`psy_cli/psy_relayer_cli/src/guardian/protocol.rs:201-211`). A `postgres_connection_secret_path` key fails the fixture check. Paths inside each file are relative to that file's parent. The parent joined with `db_path` must equal `db_files` at the same index. `listen_address` must equal `guardian_listen_addresses` at the same index (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:231-238`).
+
+Each runtime file also contains `authorization_path`, `authorization_archive_path`, `authorization_index_path`, `rpc_config_path`, `tls_certificate_path`, `tls_private_key_path`, `client_ca_path`, `allowed_client_certificate_sha256`, `signing_key_secret_path`, `signing_key_password_secret_path`, `signing_authorization_path`, `l2_rpc_url`, `l2_rpc_endpoint_pins`, `l1_rpc_urls`, and `history_urls`. `history_urls` has length 1 through 4 and must include the relayer history origin and the other guardians' origins so a stopped guardian can import retained history (`psy_cli/psy_relayer_cli/src/guardian/protocol.rs:501-529`; `psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:31-33`). `tls_private_key_path` and `signing_key_secret_path` must differ. `allowed_client_certificate_sha256` has length 1 through 16, all distinct.
+
+There is no guardian keystore flag. `signing_key_secret_path` is the encrypted key file and `signing_key_password_secret_path` is the password file. Both are mode `0600`. The password file is at most 4096 bytes, UTF-8, without NUL, CR, LF, or a leading BOM. The key file is at most 1 MiB. `load_signing_key` reads those files and does not consult `WALLET_PASSWORD`, `KEYSTORE_PATH`, or stdin (`psy_cli/psy_relayer_cli/src/guardian/runtime.rs:75-79,146-157`). Do not put a guardian password in the environment.
+
+`signing_authorization_path` is JSON with exactly `network_magic`, `user_id` (`524288`), `public_key`, `db_path`, `not_before_unix`, `expires_at_unix`, `exclusive_key_use` (`true`), `complete_journal` (`true`), and `revoked` (`false`) (`psy_cli/psy_relayer_cli/src/guardian/protocol.rs:223-229`). The recorded `db_path` must equal the runtime `db_path`.
+
+`next_members` is canonical JSON for `[Hash4; 3]`, the value `guardian-policy --intent replace` parses (`psy_cli/psy_relayer_cli/src/main.rs:217-223`). At least one member must differ from the Genesis initial members.
+
+### Daemon config
+
+`relayer_daemon_config` is TOML. `rpc_config` and `guardian_config` are paths relative to the fixture root, because the test sets the child current directory to that root (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:225-230,256-271`). Joining either value to the fixture root must produce the matching manifest path.
+
+`BridgeProposeDaemonConfig` also requires `services_url`, `withdraw_method_id`, `aggregate_setup_config`, `aggregate_artifact_dir`, `aggregation_token_file`, and `aggregate_limits` (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:62-89`). `aggregate_limits` requires `max_deposits`, `reserved_withdrawals`, `reserved_rewards`, `max_window_calldata_bytes`, and `chains` (`:92-110`). Set `proof_dir` to a directory inside the fixture. The unset value is `/tmp/psy_bridge_proofs` (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:38,898-919`), which is not fixture-local. The proof directory must not already contain `daemon_state_multichain.toml` from another network. The scan that this daemon will perform must contain one unconsumed withdrawal and no later incoming work.
+
+`[finalize]` and `[[chains]]` may contain `keystore_path` and `password_env`. That keystore is the L1 proposer key decrypted by `password_env`, or by `WALLET_PASSWORD` when `password_env` is absent (`psy_cli/psy_relayer_cli/src/bridge/l1_signer.rs:10-30`). It is not a guardian signing key. Leave it unset unless this disposable network's daemon must sign an L1 transaction. Do not point it at the shared devnet bridge-relayer keystore. The test passes no `--keystore-path`.
+
+### Command
+
+```bash
+GUARDIAN_ACCEPTANCE_FIXTURE=/absolute/path/to/the/fixture \
+  cargo test --release -p psy_relayer_cli --test guardian_acceptance -- --ignored --exact guardian_acceptance
+```
+
+Replace the fixture path. The package and test target are `psy_relayer_cli` and `guardian_acceptance` (`psy_cli/psy_relayer_cli/Cargo.toml:2-8`; `psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs`). The test header omits `--release`; this runbook keeps it because release mode is the required Rust test invocation. `--ignored` is required. Without it, Cargo reports the test ignored and exits 0, which is not a pass. `--exact guardian_acceptance` selects that one function.
+
+The test, not the operator, runs:
+
+| Child | Arguments |
+|---|---|
+| `psy_relayer_cli guardian-create-db` | `--runtime-config` set to each `guardians` entry |
+| `psy_relayer_cli guardian-service` | `--runtime-config` set to each `guardians` entry |
+| `psy_relayer_cli` | `--config` set to `relayer_daemon_config`, no subcommand |
+| `psy_relayer_cli guardian-policy` | `--rpc-config`, `--guardian-config`, `--intent replace`, `--next-members-json` set to the trimmed `next_members` bytes |
+
+Those flags are declared at `psy_cli/psy_relayer_cli/src/main.rs:28-59`. The default `--config` value `./psy_cli/psy_relayer_cli/config/local.toml` is not used, because the test always passes `--config`.
+
+### Pass
+
+Cargo exits 0 and prints `test guardian_acceptance ... ok`. The same output must not contain `ignored`. The test also panics on a cleanup failure after the scenario, so a pass means the scenario returned and every child the test spawned was reaped (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:676-691`).
+
+A pass leaves the three redb files and the archive, including nonce-1 and nonce-2 receipts. Those files are the retained evidence. Child logs are not available.
+
+### Fail
+
+Any of these is a failure. The panic text is the signal, because child output is discarded.
+
+| Signal | Meaning |
+|---|---|
+| `test guardian_acceptance ... ignored`, exit 0 | `--ignored` was omitted |
+| `GUARDIAN_ACCEPTANCE_FIXTURE is required` or `guardian fixture rejected` | The fixture failed a check in `Fixture::load` before any child started |
+| `fixture listener already occupied or unavailable` | A listed port already accepts TCP |
+| `database path already exists` | A `db_files` path was created before the test |
+| `archive must be empty` | The archive was reused |
+| `CLI exited before required condition` or `CLI listener readiness timed out` | `guardian-create-db`, `guardian-service`, or the daemon exited or never accepted its port. The bound is `service_ready_secs` |
+| `policy CLI failed` or `policy CLI timed out` | `guardian-policy --intent replace` failed. The bound is `session_secs` |
+| `lone guardian durable signature timed out` | One guardian did not produce a nonce-1 decision within `session_secs` |
+| `one guardian unexpectedly obtained quorum` | Nonce 1 gained signatures or an inclusion receipt while two guardians were stopped |
+| `fixture produced extra work` or `recovery advanced account instead of recovering nonce one` | A nonce-2 request appeared before rotation |
+| `crash recovery changed archived request/signatures/proof` or `crash recovery changed durable decision/signature` | Daemon restart did not reproduce the original nonce-1 bytes |
+| `offline guardian acquired a signing decision` or `catch-up fabricated an own decision` | Guardian C signed or stored nonce 1 before its own restart |
+| `rotation did not change members` or `offline B signed rotation` | Replacement did not change the stored members, or the stopped guardian signed nonce 2 |
+| `guardian acceptance overall deadline exceeded` | The scenario exceeded twelve times `session_secs` |
+| `could not reap an owned acceptance child` | A child the test spawned did not exit within 15 seconds of being killed |
+
+### Cleanup
+
+The test deletes only `relayer_archive/acceptance-original-pending.json` and kills the children it spawned (`psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs:305-311,330-333,682-686`). It does not delete the databases, the archive receipts, or the fixture, on success or failure.
+
+1. Leave the three `db_files` paths and the archive in place. Do not replace them and do not run the test again on this fixture. A second run requires a new fixture whose database paths are absent and whose archive is empty.
+2. If Cargo itself is killed before the test reaps its children, stop only `psy_relayer_cli` processes whose arguments contain this fixture's `--runtime-config` or `--config` path. Do not run `make shutdown` or `make run-all`, and do not stop the shared devnet.
+3. Do not delete a halted redb file to make a retry pass. `guardian-service` does not clear a halted account, and `guardian-create-db` refuses an existing path (`docs/src/dev/bridge-relayer-multisig.md` section 8).
+
+## Aggregate acceptance ownership
+
+`guardian_acceptance` does not accept an aggregate proof. A G1 pass is not aggregate acceptance.
+
+The acceptance contract is [Bridge Merkle Settlement](bridge-merkle-settlement.md) §8, [Acceptance and resource bounds](bridge-merkle-settlement.md#8-acceptance-and-resource-bounds). [bridge-proof-aggregation.md](bridge-proof-aggregation.md) names that document as the design authority and holds no separate contract. Section 8 records its QA list as unexecuted. This runbook does not add a procedure for that list.
+
+The settlement CLI surface is two subcommands of `psy_relayer_cli`. Neither is invoked by `guardian_acceptance`.
+
+| Command | Declaration | Dispatch |
+|---|---|---|
+| `prove-bridge-agg` | `ProveBridgeAgg` at `psy_cli/psy_relayer_cli/src/main.rs:72-85` | `psy_cli/psy_relayer_cli/src/main.rs:256-274` |
+| `finalize-bridge-agg` | `FinalizeBridgeAgg` at `psy_cli/psy_relayer_cli/src/main.rs:86-87`; arguments at `psy_cli/psy_relayer_cli/src/bridge/finalize_bridge.rs:63-81` | `psy_cli/psy_relayer_cli/src/main.rs:275` |
+
+`prove-bridge-agg` requires `--from-checkpoint`, `--to-checkpoint`, `--aggregate-config`, and `--out`. `--rpc-config` defaults to `config.json`. `--deployments-network` defaults to `localhost` (`psy_cli/psy_relayer_cli/src/bridge/constants.rs:2`). `finalize-bridge-agg` requires `--window-json`, `--config`, `--chain-index`, and `--aggregate-limits`.
+
+`psy_cli/psy_relayer_cli/tests/` contains only `guardian_acceptance.rs`. There is no aggregate-acceptance test target. Do not treat either subcommand, or the no-subcommand daemon, as a substitute for the section 8 list.
 
 ## External Prerequisites
 

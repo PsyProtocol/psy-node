@@ -126,14 +126,12 @@ fn regenerate_aggregate_proofs(config_path: &Path, output: &Path) -> anyhow::Res
     })?;
     circuits.validate_config(&config)?;
     let circuit_set = psy_client_data::bridge_aggregate::encode_circuit_set(circuits.entries())?;
-    let (source_deposit, source_withdrawal, source_reward) = circuits.into_digest_sources();
+    let (source_deposit, source_settlement) = circuits.into_digest_sources();
     let adapter_deposit = DigestBitsAdapter::build(DigestArtifact::DepositAggregate, &source_deposit.common, &source_deposit.verifier_only)?;
-    let adapter_withdrawal = DigestBitsAdapter::build(DigestArtifact::WithdrawalAggregate, &source_withdrawal.common, &source_withdrawal.verifier_only)?;
-    let adapter_reward = DigestBitsAdapter::build(DigestArtifact::RewardAggregate, &source_reward.common, &source_reward.verifier_only)?;
-    drop((source_deposit, source_withdrawal, source_reward));
+    let adapter_settlement = DigestBitsAdapter::build(DigestArtifact::SettlementAggregate, &source_settlement.common, &source_settlement.verifier_only)?;
+    drop((source_deposit, source_settlement));
     let deposit = adapter_deposit.into_wrapper(approved.sources.clone())?;
-    let withdrawal = adapter_withdrawal.into_wrapper(approved.sources.clone())?;
-    let reward = adapter_reward.into_wrapper(approved.sources)?;
+    let settlement = adapter_settlement.into_wrapper(approved.sources)?;
     let parent = output.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let name = output.file_name().context("aggregate output must name a directory")?;
     let mut staging_name = name.to_os_string();
@@ -143,13 +141,13 @@ fn regenerate_aggregate_proofs(config_path: &Path, output: &Path) -> anyhow::Res
     let result = (|| -> anyhow::Result<()> {
         fs::write(staging.join("circuit_set.bin"), &circuit_set)?;
         fs::File::open(staging.join("circuit_set.bin"))?.sync_all()?;
-        let mut hashes = Vec::with_capacity(3);
-        for (name, wrapper) in [("DepositAggregate", &deposit), ("WithdrawalAggregate", &withdrawal), ("RewardAggregate", &reward)] {
+        let mut hashes = Vec::with_capacity(2);
+        for (name, wrapper) in [("DepositAggregate", &deposit), ("SettlementAggregate", &settlement)] {
             let directory = staging.join(name);
             wrapper.setup(directory.to_str().context("aggregate artifact path must be UTF-8")?)?;
             hashes.push(validate_digest_bits_setup(&directory, wrapper.identity())?);
         }
-        let aggregates = serde_json::json!({"schema": 1, "DepositAggregate": hashes[0], "WithdrawalAggregate": hashes[1], "RewardAggregate": hashes[2]});
+        let aggregates = serde_json::json!({"schema": 2, "DepositAggregate": hashes[0], "SettlementAggregate": hashes[1]});
         fs::write(staging.join("setup-aggregates.json"), serde_json::to_vec(&aggregates)?)?;
         fs::File::open(staging.join("setup-aggregates.json"))?.sync_all()?;
         fs::File::open(&staging)?.sync_all()?;
@@ -245,7 +243,7 @@ pub struct RegenerateGroth16KeystoreArgs {
     /// Do not regenerate withdrawal_claim.
     #[arg(long, default_value_t = false)]
     pub skip_withdrawal_claim: bool,
-    /// Generate and publish DepositAggregate, WithdrawalAggregate and RewardAggregate setups to a fresh destination.
+    /// Generate and publish DepositAggregate and SettlementAggregate setups to a fresh destination.
     #[arg(long, requires_all = ["aggregate_config", "output_dir"], conflicts_with_all = ["keystore_dir", "include_bridge_agg", "skip_deposit_append", "skip_withdrawal_claim"])]
     pub aggregate_proofs: bool,
     /// Approved canonical configuration and reviewed source identities as JSON.

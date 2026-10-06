@@ -70,7 +70,7 @@ pub const fn bridge_agg_final_pi_len(chain_count: usize) -> usize {
 }
 
 fn validate_endpoint_chain_indices(indices: &[u8]) {
-    assert!(!indices.is_empty() && indices.len() <= 256, "Final requires 1..=256 configured chains");
+    assert!(!indices.is_empty() && indices.len() <= 8, "Final requires 1..=8 configured chains");
     assert!(indices.windows(2).all(|pair| pair[0] < pair[1]), "Final chain indices must be strictly increasing");
 }
 

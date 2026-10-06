@@ -135,7 +135,7 @@ where F: Extendable<D> {
 
 fn withdrawal_root_tree<const D: usize>(builder: &mut CircuitBuilder<F, D>, chains: &[(Target, [Target; 4])]) -> HashOutTarget
 where F: Extendable<D> {
-    assert!((1..=256).contains(&chains.len()));
+    assert!((1..=8).contains(&chains.len()));
     let mut nodes = (0..256).map(|ordinal| {
         let ordinal_target = builder.constant(F::from_canonical_usize(ordinal));
         let inputs = if ordinal < chains.len() {
@@ -427,7 +427,7 @@ fn constrain_reward_payout<const CAPACITY: usize>(
 impl<const CAPACITY: usize> RewardInclusionAggregateCircuit<CAPACITY> {
     pub fn new(common: &CommonCircuitData<F, 2>, verifier: &VerifierOnlyCircuitData<PoseidonGoldilocksConfig, 2>, source_chain_count: usize) -> Self {
         assert!(INCLUSION_AGGREGATE_CAPACITIES.contains(&(CAPACITY as u32)));
-        assert!((1..=256).contains(&source_chain_count));
+        assert!((1..=8).contains(&source_chain_count));
         assert_eq!(common.num_public_inputs, REWARD_SESSION_PROOF_FIELD_COUNT);
 
         let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
@@ -763,7 +763,7 @@ where F: Extendable<D>, C::Hasher: AlgebraicHasher<F> + MerkleZeroHasher<HashOut
     /// Capacity fixes padding; NetworkConfig still limits the entire window to at most 1024 withdrawals.
     pub fn new(child: &CircuitData<F, C, D>, chain_count: usize) -> Self {
         assert!(INCLUSION_AGGREGATE_CAPACITIES.contains(&(CAPACITY as u32)));
-        assert!((1..=256).contains(&chain_count));
+        assert!((1..=8).contains(&chain_count));
         assert_eq!(child.common.num_public_inputs, 32);
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let zero = builder.zero();
@@ -788,7 +788,7 @@ where F: Extendable<D>, C::Hasher: AlgebraicHasher<F> + MerkleZeroHasher<HashOut
         let first_ordinal = builder.add_virtual_target();
         let count = builder.add_virtual_target();
         aggregate_segment(&mut builder, CAPACITY, total_count, segment_count, segment_index, first_ordinal, count, config.max_withdrawals);
-        builder.assert_non_zero(count);
+
         let dummy = dummy_circuit::<F, C, D>(&child.common);
         assert_eq!(dummy.common, child.common);
         let real_vk = builder.constant_verifier_data(&child.verifier_only);
@@ -837,7 +837,7 @@ where F: Extendable<D>, C::Hasher: AlgebraicHasher<F> + MerkleZeroHasher<HashOut
         header: &InclusionAggregateHeader, leaves: &[WithdrawalAggregateLeaf<'_, C, D>]) -> anyhow::Result<()>
     {
         header.validate()?;
-        anyhow::ensure!(header.count != 0, "empty withdrawal manifests carry no proof");
+
         anyhow::ensure!(header.total_count <= config.max_withdrawals, "withdrawal publication total exceeds network limit");
         anyhow::ensure!(header.family == WITHDRAWAL_PUBLICATION_FAMILY, "withdrawal publication family mismatch");
         anyhow::ensure!(header.aggregate_capacity as usize == CAPACITY, "withdrawal publication capacity mismatch");
@@ -1146,14 +1146,12 @@ mod tests {
         let mut header = InclusionAggregateHeader {
             family: WITHDRAWAL_PUBLICATION_FAMILY, config_hash: window.config_hash, window_id: window.window_id,
             end_checkpoint_id: window.end_id, end_checkpoint_root: window.end_root, aggregate_capacity: 1024,
-            total_count: total, segment_count: u32::from(total != 0), segment_index: 0, first_ordinal: 0, count,
+            total_count: total, segment_count: if total == 0 { 0 } else { 1 }, segment_index: 0, first_ordinal: 0, count,
             withdrawal_roots: roots.to_vec(), old_ledger_state_root: None, new_ledger_state_root: None,
-            opening_digest: if total == 0 { [0; 32] } else { opening.opening_digest(config).unwrap() }, claim_tree_root: [0; 32],
+            opening_digest: opening.opening_digest(config).unwrap(), claim_tree_root: [0; 32],
         };
-        if total != 0 {
-            let commits = leaves[..count as usize].iter().map(|leaf| leaf.leaf_commit().unwrap()).collect::<Vec<_>>();
-            psy_client_data::bridge_aggregate::bind_claim_tree(&mut header, &commits).unwrap();
-        }
+        let commits = leaves[..count as usize].iter().map(|leaf| leaf.leaf_commit().unwrap()).collect::<Vec<_>>();
+        psy_client_data::bridge_aggregate::bind_claim_tree(&mut header, &commits).unwrap();
         header.validate().unwrap();
         header
     }
@@ -1177,9 +1175,17 @@ mod tests {
         assert_eq!(proof.public_inputs, words.map(F::from_canonical_u32));
         aggregate.circuit_data.verify(proof).unwrap();
         let empty = publication(&config, &window, &roots, &leaves, 0, 0);
-        assert_eq!(empty.opening_digest, [0; 32]);
-        assert_eq!(empty.claim_tree_root, [0; 32]);
-        assert!(aggregate.prove(&config, &window, &empty, &[]).is_err());
+        assert_ne!(empty.opening_digest, [0; 32]);
+        assert_ne!(empty.claim_tree_root, [0; 32]);
+        let empty_proof = aggregate.prove(&config, &window, &empty, &[]).unwrap();
+        assert_eq!(empty_proof.public_inputs, empty.publication_words().unwrap().map(F::from_canonical_u32));
+        aggregate.circuit_data.verify(empty_proof).unwrap();
+        let mut wrong_opening = empty.clone();
+        wrong_opening.opening_digest[0] ^= 1;
+        assert!(aggregate.prove(&config, &window, &wrong_opening, &[]).is_err());
+        let mut wrong_claim = empty.clone();
+        wrong_claim.claim_tree_root[0] ^= 1;
+        assert!(aggregate.prove(&config, &window, &wrong_claim, &[]).is_err());
         for mutation in 0..8u8 {
             let mut changed = header.clone();
             match mutation {

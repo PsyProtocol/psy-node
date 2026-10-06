@@ -11,53 +11,27 @@ use crate::bridge::l1_client::L1Client;
 use crate::bridge::l1_signer::load_l1_wallet;
 
 sol! {
-    function applyBridgeWindow(uint256[8] finalizeProof, uint256[] checkpointPI, uint256[8] depositProof, bytes depositOpening, uint256[8] withdrawalProof, bytes withdrawalOpening, uint256[8] rewardProof, bytes rewardOpening);
+    function applyBridgeWindow(uint256[8] depositProof, bytes depositOpening, uint256[8] settlementProof, bytes settlementOpening);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BridgeWindowCall {
-    pub finalize_proof: [U256; 8],
-    pub checkpoint_pi: Vec<U256>,
     pub deposit_proof: [U256; 8],
     pub deposit_opening: Bytes,
-    pub withdrawal_proof: [U256; 8],
-    pub withdrawal_opening: Bytes,
-    pub reward_proof: [U256; 8],
-    pub reward_opening: Bytes,
+    pub settlement_proof: [U256; 8],
+    pub settlement_opening: Bytes,
 }
 
 impl BridgeWindowCall {
     pub(crate) fn encode(&self) -> Bytes {
         applyBridgeWindowCall {
-            finalizeProof: self.finalize_proof,
-            checkpointPI: self.checkpoint_pi.clone(),
             depositProof: self.deposit_proof,
             depositOpening: self.deposit_opening.clone(),
-            withdrawalProof: self.withdrawal_proof,
-            withdrawalOpening: self.withdrawal_opening.clone(),
-            rewardProof: self.reward_proof,
-            rewardOpening: self.reward_opening.clone(),
+            settlementProof: self.settlement_proof,
+            settlementOpening: self.settlement_opening.clone(),
         }.abi_encode().into()
     }
-}
-
-pub(crate) fn finalize_statement(inputs: &[U256]) -> Result<[u8; 32]> {
-    anyhow::ensure!(inputs.len() >= 35 && inputs.len() <= 26 + 9 * 256 && (inputs.len() - 26) % 9 == 0, "finalize endpoint PI width mismatch");
-    let mut bytes = vec![0u8; 144 + 8 * (inputs.len() - 26)];
-    let mut offset = 0;
-    for index in 0..inputs.len() {
-        if (4..20).contains(&index) {
-            let value = u32::try_from(inputs[index ^ 1]).context("finalize slot exceeds u32")?;
-            bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
-            offset += 4;
-        } else {
-            let value = u64::try_from(inputs[index]).context("finalize input exceeds u64")?;
-            bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
-            offset += 8;
-        }
-    }
-    Ok(alloy_primitives::keccak256(bytes).0)
 }
 
 #[derive(Clone, Args)]
