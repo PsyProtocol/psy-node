@@ -677,6 +677,7 @@ fn assign_leaves(witness: &mut PartialWitness<F>, targets: &[Vec<Target>], leave
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plonky2::field::types::{Field64, PrimeField64};
     use plonky2::plonk::config::PoseidonGoldilocksConfig;
 
     fn native_hash4(hash: Hash4) -> [u8; 128] {

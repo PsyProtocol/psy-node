@@ -457,7 +457,7 @@ mod tests {
         let proof = historical_merkle_proof(&mut builder, claim_id, &claim_leaf_target, end_id, end_root);
         let circuit = builder.build::<C>();
         let mut leaf = PsyCheckpointLeaf::default();
-        leaf.global_chain_root = hash(3);
+        leaf.global_chain_root = psy_client_common::data::qhashout::QHashOut(hash(3).0);
         let value = leaf.qfhash::<PoseidonHash>().0;
         let siblings: Vec<_> = (0..CHECKPOINT_TREE_HEIGHT).map(|i| hash(20 + u64::from(i)).0).collect();
         let mut root = value;
@@ -474,7 +474,7 @@ mod tests {
             witness.set_target(end_id[0], F::from_canonical_u32(end)).unwrap();
             witness.set_target(end_id[1], if mutation == 5 { F::ONE } else { F::ZERO }).unwrap();
             let mut opened = leaf;
-            if mutation == 1 { opened.global_chain_root = hash(99); }
+            if mutation == 1 { opened.global_chain_root = psy_client_common::data::qhashout::QHashOut(hash(99).0); }
             claim_leaf_target.set_witness(&mut witness, &opened).unwrap();
             witness.set_hash_target(end_root, if mutation == 7 { hash(99).0 } else { root }).unwrap();
             for (level, target) in proof.siblings.iter().enumerate() {

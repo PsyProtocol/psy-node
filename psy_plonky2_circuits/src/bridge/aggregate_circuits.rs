@@ -115,9 +115,9 @@ impl AggregateCircuits {
         opening.encode()?;
         header.validate()?;
         anyhow::ensure!(header.family == psy_client_data::bridge_aggregate::REWARD_PUBLICATION_FAMILY, "reward publication family mismatch");
-        anyhow::ensure!(header.count != 0, "empty reward manifests carry no proof");
         anyhow::ensure!(header.aggregate_capacity == INCLUSION_AGGREGATE_CAPACITIES[0], "manager reward publication capacity is 1024");
-        anyhow::ensure!(header.segment_index == 0 && header.segment_count == 1 && header.first_ordinal == 0, "manager reward publication is one segment");
+        anyhow::ensure!(header.segment_index == 0 && header.first_ordinal == 0, "manager reward publication is one segment");
+        anyhow::ensure!(header.segment_count == u32::from(header.count != 0), "manager reward segment count differs from count");
         anyhow::ensure!(header.total_count <= config.max_rewards && header.total_count <= INCLUSION_AGGREGATE_CAPACITIES[0] && header.count == header.total_count, "reward publication exceeds the single segment");
         anyhow::ensure!(header.count as usize == leaves.len(), "reward publication count differs from payout proofs");
         anyhow::ensure!(header.config_hash == opening.config_hash && header.window_id == opening.window_id

@@ -1348,6 +1348,31 @@ async fn prove_frozen_aggregate(config: &BridgeProposeDaemonConfig, provider: &R
     w.validate(network)?;
     let withdrawal_proofs = load_family_proofs(directory, circuits, &local_proofs, w.withdrawals.len(), true)?;
     let withdrawal = prove_bridge::build_withdrawal_aggregate(network, &w, &withdrawal_proofs, circuits)?;
+    let reward = if r.leaves.is_empty() {
+        let end_id = prove_bridge::source_checkpoint_for_end(network, a.end_checkpoint_id)?;
+        let witness = prove_bridge::fetch_end_checkpoint_witness(provider, a.end_checkpoint_id).await?;
+        let prior = if settlement.old_reward_ledger_root == psy_client_data::bridge_aggregate::origin_state_root() {
+            None
+        } else {
+            let ledger = state.reward_ledger.as_ref().context("reward identity ledger missing")?;
+            ensure!(text_hash4(&ledger.current_root)? == settlement.old_reward_ledger_root, "reward identity ledger root mismatch");
+            let bytes = load_aggregate_file(directory, ledger.current_proof.as_ref().context("reward identity predecessor missing")?)?;
+            let id = psy_plonky2_circuits::bridge::circuits::reward_ledger::reward_ledger_proof_id(&circuits.reward_session.circuit_data.verifier_only, &bytes)?;
+            let transition = load_aggregate_file(directory, ledger.transitions.get(&hex::encode(id)).context("reward identity predecessor state missing")?)?;
+            let (_, step, _) = psy_plonky2_circuits::bridge::circuits::reward_ledger::deserialize_reward_ledger_transition(&transition)?;
+            ensure!(step.proof == bytes, "reward identity predecessor differs from retained state");
+            let proof = AggregateProof::from_bytes(bytes, &circuits.reward_session.circuit_data.common).map_err(|error| anyhow::anyhow!("reward identity predecessor decode: {error}"))?;
+            Some((proof, step.new_state))
+        };
+        ensure!(settlement.old_reward_ledger_root == settlement.new_reward_ledger_root, "empty reward changes ledger state");
+        let window = psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerWindowValues {
+            config_hash: a.config_hash, economic_domain: settlement.economic_domain, window_id: a.window_id,
+            end_checkpoint_id: end_id, end_checkpoint_root: a.end_checkpoint_root, start_root: settlement.old_reward_ledger_root,
+        };
+        let (tip, tip_state) = circuits.reward_session.prove_identity(network, &window, &witness.leaf, &witness.siblings, &witness.roots, prior.as_ref().map(|(proof, state)| (proof, state)))?;
+        let inputs = prove_bridge::RewardAggregateInputs { old_ledger_state_root: window.start_root, new_ledger_state_root: window.start_root, tip_proof: &tip, tip_state: &tip_state, payouts: &[] };
+        prove_bridge::build_reward_aggregate(network, &r, &inputs, circuits)?
+    } else {
     let ledger = state.reward_ledger.as_ref().context("reward ledger absent")?;
     let mut reward_steps = Vec::with_capacity(r.leaves.len());
     let mut reward_proofs = Vec::with_capacity(r.leaves.len());
@@ -1366,10 +1391,10 @@ async fn prove_frozen_aggregate(config: &BridgeProposeDaemonConfig, provider: &R
     let tip_index = reward_steps.iter().position(|step| step.proof == tip_bytes).context("retained reward tip is not one of the selected payouts")?;
     let payouts = reward_proofs.iter().zip(&reward_steps).map(|(proof, step)| prove_bridge::RewardPayoutInputs { proof, step }).collect::<Vec<_>>();
     let reward_inputs = prove_bridge::RewardAggregateInputs { old_ledger_state_root: settlement.old_reward_ledger_root, new_ledger_state_root: settlement.new_reward_ledger_root, tip_proof: &reward_proofs[tip_index], tip_state: &reward_steps[tip_index].new_state, payouts: &payouts };
-    let reward = prove_bridge::build_reward_aggregate(network, &r, &reward_inputs, circuits)?;
+        prove_bridge::build_reward_aggregate(network, &r, &reward_inputs, circuits)?
+    };
     let b_digest = settlement.opening_digest(network, &a).map_err(|error| anyhow::anyhow!("settlement opening: {error:?}"))?;
-    let digest_words = b_digest.chunks_exact(4).map(|word| u64::from(u32::from_be_bytes(word.try_into().unwrap()))).collect::<Vec<_>>();
-    let settlement_proof = circuits.settlement_aggregate.prove(digest_words.try_into().unwrap(), &proofs, &withdrawal, &reward)?;
+    let settlement_proof = circuits.settlement_aggregate.prove(network, &a, &settlement, &proofs, &withdrawal, &reward)?;
     circuits.settlement_aggregate.circuit_data.verify(settlement_proof.clone())?;
     let settlement_reference = wrap_opening(config, sources, directory, DigestArtifact::SettlementAggregate, &circuits.settlement_aggregate.circuit_data, &settlement_proof, b_digest)?;
     let proof_a = prove_deposit(config, network, circuits, &a).await?;

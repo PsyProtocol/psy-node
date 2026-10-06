@@ -261,11 +261,9 @@ pub(crate) fn reward_publication_header(opening: &SourceCheckpointRewardOpening,
         aggregate_capacity: REWARD_PUBLICATION_CAPACITY, total_count: count, segment_count: u32::from(count != 0),
         segment_index: 0, first_ordinal: 0, count, withdrawal_roots: Vec::new(),
         old_ledger_state_root: Some(old_ledger_state_root), new_ledger_state_root: Some(new_ledger_state_root),
-        opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest()? }, claim_tree_root: [0; 32],
+        opening_digest: opening.opening_digest()?, claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], REWARD_PUBLICATION_CAPACITY as usize)?[0],
     };
-    if count != 0 {
-        bind_claim_tree(&mut header, &opening.leaves.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?)?;
-    }
+    bind_claim_tree(&mut header, &opening.leaves.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?)?;
     header.validate()?;
     Ok(header)
 }
@@ -284,7 +282,6 @@ pub(crate) struct RewardPayoutInputs<'a> {
 }
 
 pub(crate) fn build_reward_aggregate(config: &NetworkConfig, opening: &SourceCheckpointRewardOpening, inputs: &RewardAggregateInputs<'_>, circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-    anyhow::ensure!(!opening.leaves.is_empty(), "empty reward manifests carry no proof");
     anyhow::ensure!(inputs.payouts.len() == opening.leaves.len(), "one retained payout step per source reward required");
     anyhow::ensure!(inputs.tip_proof.public_inputs.len() == psy_client_data::bridge_aggregate::REWARD_SESSION_PROOF_FIELD_COUNT, "reward tip width mismatch");
     anyhow::ensure!(inputs.tip_proof.public_inputs[30..34].iter().zip(inputs.new_ledger_state_root).all(|(field, limb)| field.to_canonical_u64() == limb), "reward tip root differs from retained ledger root");
@@ -300,6 +297,39 @@ pub(crate) fn build_reward_aggregate(config: &NetworkConfig, opening: &SourceChe
         })
     }).collect::<anyhow::Result<Vec<_>>>()?;
     circuits.prove_reward_aggregate(config, opening, &header, &tip, &records)
+}
+
+pub(crate) struct EndCheckpointWitness {
+    pub leaf: psy_client_data::qdata::checkpoint::PsyCheckpointLeaf<F>,
+    pub siblings: [[u64; 4]; 32],
+    pub roots: psy_client_data::qdata::checkpoint::PsyCheckpointGlobalStateRoots<F>,
+}
+
+pub(crate) fn source_checkpoint_for_end(config: &NetworkConfig, end_checkpoint_id: u64) -> anyhow::Result<u32> {
+    let source = u32::try_from(end_checkpoint_id).context("end checkpoint exceeds u32")?;
+    anyhow::ensure!(
+        config.reward_cutover <= end_checkpoint_id && end_checkpoint_id < config.reward_end_exclusive,
+        "end checkpoint {end_checkpoint_id} is outside reward range {}..{}; an explicit source checkpoint id is required",
+        config.reward_cutover, config.reward_end_exclusive
+    );
+    Ok(source)
+}
+
+pub(crate) async fn fetch_end_checkpoint_witness(provider: &RpcProvider, end_checkpoint_id: u64) -> anyhow::Result<EndCheckpointWitness> {
+    let leaf = provider.get_checkpoint_leaf_data(end_checkpoint_id).await?;
+    let proof = provider.get_checkpoint_tree_merkle_proof(end_checkpoint_id, end_checkpoint_id).await?;
+    let roots = provider.get_checkpoint_global_state_roots(end_checkpoint_id).await?;
+    anyhow::ensure!(proof.index == end_checkpoint_id, "end checkpoint proof index mismatch");
+    anyhow::ensure!(proof.siblings.len() == 32, "end checkpoint proof must contain 32 siblings");
+    let stored_leaf = provider.get_checkpoint_tree_leaf_hash(end_checkpoint_id, end_checkpoint_id).await?;
+    anyhow::ensure!(to_core_hash(proof.value) == to_core_hash(stored_leaf), "end checkpoint proof value differs from stored leaf hash");
+    let root = provider.get_checkpoint_tree_root(end_checkpoint_id).await?;
+    anyhow::ensure!(to_core_hash(proof.root) == to_core_hash(root), "end checkpoint proof root differs from checkpoint root");
+    let siblings = std::array::from_fn(|index| {
+        let hash = to_core_hash(proof.siblings[index]);
+        hash.0.elements.map(|limb| limb.to_canonical_u64())
+    });
+    Ok(EndCheckpointWitness { leaf, siblings, roots })
 }
 
 fn bridge_contract_state_tree_height(contract_id: u32) -> anyhow::Result<u8> {

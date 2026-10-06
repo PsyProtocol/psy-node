@@ -337,7 +337,7 @@ fn summary(fields: &RewardSessionProofFields, seed: Hash4, session_root: Hash4, 
     Ok(hash_bytes(&bytes))
 }
 
-fn state_root(state: &RewardLedgerStateValues) -> anyhow::Result<Hash4> {
+pub(super) fn state_root(state: &RewardLedgerStateValues) -> anyhow::Result<Hash4> {
     let mut bytes = domain(STATE_DOMAIN);
     for hash in [state.ledger_window_hash, state.ledger_root, state.user_root] { append_hash(&mut bytes, hash)?; }
     append_u32(&mut bytes, state.session_count);
@@ -345,7 +345,7 @@ fn state_root(state: &RewardLedgerStateValues) -> anyhow::Result<Hash4> {
     Ok(hash_bytes(&bytes))
 }
 
-fn window_hash(window: &RewardLedgerWindowValues, verifier: &VerifierOnlyCircuitData<C, 2>) -> anyhow::Result<(Hash4, Hash4)> {
+pub fn window_hash(window: &RewardLedgerWindowValues, verifier: &VerifierOnlyCircuitData<C, 2>) -> anyhow::Result<(Hash4, Hash4)> {
     let verifier_hash = verifier_hash(verifier)?;
     let mut bytes = domain(WINDOW_DOMAIN);
     bytes.extend_from_slice(&window.config_hash);
@@ -365,9 +365,9 @@ fn verifier_hash(verifier: &VerifierOnlyCircuitData<C, 2>) -> anyhow::Result<Has
 }
 
 
-fn empty_summary() -> anyhow::Result<Hash4> { Ok(hash_bytes(&domain(EMPTY_DOMAIN))) }
+pub(super) fn empty_summary() -> anyhow::Result<Hash4> { Ok(hash_bytes(&domain(EMPTY_DOMAIN))) }
 
-fn empty_user_root() -> anyhow::Result<Hash4> {
+pub(super) fn empty_user_root() -> anyhow::Result<Hash4> {
     let mut root = empty_summary()?;
     for height in 1..=32 { root = node_hash(height, root, root)?; }
     Ok(root)
@@ -530,7 +530,7 @@ mod tests {
         circuit.verify(proof.clone()).unwrap();
         let fields = RewardSessionProofFields::from_public_inputs(&values).unwrap();
         let window = RewardLedgerWindowValues { config_hash: [0; 32], economic_domain: [0x34; 32], window_id: [0; 32], end_checkpoint_id: 0, end_checkpoint_root: [3, 5, 7, 11], start_root: [0; 4] };
-        let expected = summary(&fields, session_seed(&window, 9, &fields, [13, 17, 19, 23]).unwrap(), [29, 31, 37, 41], true).unwrap();
+        let expected = super::summary(&fields, session_seed(&window, 9, &fields, [13, 17, 19, 23]).unwrap(), [29, 31, 37, 41], true).unwrap();
         assert_eq!(proof.public_inputs.iter().map(|limb| limb.to_canonical_u64()).collect::<Vec<_>>(), expected.to_vec());
     }
 
@@ -538,17 +538,20 @@ mod tests {
     fn host_session_root_matches_poseidon_delta_path() {
         use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, pgoldilocks::QHashOut};
         let source = 9u32;
-        let mut root = [0u64; 4];
-        let mut witnesses = Vec::new();
-        for (height, path_index) in [(2u8, 1u32), (3, 2)] {
+        for (height, path_index) in [(2u8, 0u32), (3, 1)] {
             let key = (u64::from(source) << 31) | (u64::from(height) << 26) | u64::from(path_index);
-            let siblings = std::array::from_fn(|index| QHashOut::from_values(index as u64 + 1, 2, 3, 4));
-            let delta = DeltaMerkleProofCore { old_root: QHashOut::from_values(root[0], root[1], root[2], root[3]), old_value: QHashOut::ZERO, new_value: QHashOut::from_values(1, 0, 0, 0), index: key, siblings: siblings.to_vec() };
+            let siblings: [QHashOut<F>; 63] = std::array::from_fn(|index| QHashOut::from_values(index as u64 + 1, 2, 3, 4));
+            let delta = DeltaMerkleProofCore::from_params::<PoseidonHash>(key, QHashOut::ZERO, QHashOut::from_values(1, 0, 0, 0), siblings.to_vec());
             assert!(delta.verify::<PoseidonHash>());
-            root = [delta.new_root.0.elements[0].to_canonical_u64(), delta.new_root.0.elements[1].to_canonical_u64(), delta.new_root.0.elements[2].to_canonical_u64(), delta.new_root.0.elements[3].to_canonical_u64()];
-            witnesses.push(super::super::reward_session::RewardSessionJobWitness { height, path_index, tag: Default::default(), nullifier_siblings: siblings.map(|hash| [hash.0.elements[0].to_canonical_u64(), hash.0.elements[1].to_canonical_u64(), hash.0.elements[2].to_canonical_u64(), hash.0.elements[3].to_canonical_u64()]) });
+            let hash_words = |hash: QHashOut<F>| hash.0.elements.map(|limb| limb.to_canonical_u64());
+            let witness = super::super::reward_session::RewardSessionJobWitness {
+                height, path_index,
+                tag: super::super::reward_inclusion::RewardTagWitness { tag_preimage: QHashOut::ZERO, leaf_left: QHashOut::ZERO,
+                    leaf_right: QHashOut::ZERO, leaf_tag: QHashOut::ZERO, siblings: [QHashOut::ZERO; 21], parent_tags: [QHashOut::ZERO; 21] },
+                nullifier_siblings: siblings.map(hash_words),
+            };
+            assert_eq!(reward_session_root(source, hash_words(delta.old_root), &[witness]).unwrap(), hash_words(delta.new_root));
         }
-        assert_eq!(reward_session_root(source, [0; 4], &witnesses).unwrap(), root);
     }
 
     #[test]

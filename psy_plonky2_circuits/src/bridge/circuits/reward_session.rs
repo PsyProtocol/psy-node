@@ -40,13 +40,6 @@ impl RewardSessionStatement {
         for index in 10..13 {
             builder.assert_zero(fields[index]);
         }
-        let zero = builder.zero();
-        let mut recipient_is_zero = builder._true();
-        for word in &fields[5..10] {
-            let is_zero = builder.is_equal(*word, zero);
-            recipient_is_zero = builder.and(recipient_is_zero, is_zero);
-        }
-        builder.assert_zero(recipient_is_zero.target);
         Self { fields }
     }
 
@@ -277,7 +270,11 @@ impl RewardPredecessorTargets {
     ) -> BoolTarget {
         let first_global = builder.not(self.has_global);
         builder.connect_hashes_if_true(first_global, statement.hash(26), ledger_window.start_root);
-        builder.connect_hashes_if_true(self.has_global, ledger_window.hash, old.ledger_window_hash);
+        let zero = builder.zero();
+        let empty = builder.is_equal(statement.fields[21], zero);
+        let nonempty = builder.not(empty);
+        let same_window = builder.and(self.has_global, nonempty);
+        builder.connect_hashes_if_true(same_window, ledger_window.hash, old.ledger_window_hash);
         let global_new = HashOutTarget {
             elements: std::array::from_fn(|i| self.global.public_inputs[30 + i]),
         };
@@ -404,12 +401,10 @@ fn rolling_jobs_commitment(
 fn constrain_reward_session_step(
     builder: &mut CircuitBuilder<F, 2>, statement: &RewardSessionStatement,
     predecessors: &RewardPredecessorTargets, session: &RewardSessionTargets,
-    jobs: &[RewardSessionJobTargets],
-) {
+    jobs: &[RewardSessionJobTargets], ledger_window: &RewardLedgerWindowTargets,
+) -> BoolTarget {
     let zero = builder.zero();
-    let mut amount = std::array::from_fn(|i| {
-        builder.select(predecessors.has_own, predecessors.own.public_inputs[13 + i], zero)
-    });
+    let mut amount = std::array::from_fn(|i| builder.select(predecessors.has_own, predecessors.own.public_inputs[13 + i], zero));
     let previous_count = builder.select(predecessors.has_own, predecessors.own.public_inputs[21], zero);
     builder.range_check(previous_count, 32);
     let mut step_count = zero;
@@ -423,19 +418,32 @@ fn constrain_reward_session_step(
         amount = add_u32_limbs(builder, amount, job.job_amount);
     }
     let is_empty = builder.is_equal(step_count, zero);
-    builder.assert_zero(is_empty.target);
+    let count_zero = builder.is_equal(statement.fields[21], zero);
+    let no_own = builder.not(predecessors.has_own);
+    let empty_count = builder.and(is_empty, count_zero);
+    let identity = builder.and(empty_count, no_own);
+    let credit = builder.not(identity);
+    builder.connect_if_true(credit, is_empty.target, zero);
     let count = builder.add(previous_count, step_count);
     builder.range_check(count, 32);
     builder.connect(count, statement.fields[21]);
-    for (computed, public) in amount.into_iter().zip(statement.amount()) {
-        builder.connect(computed, public);
+    for (computed, public) in amount.into_iter().zip(statement.amount()) { builder.connect(computed, public); }
+    let mut recipient_zero = builder._true();
+    for word in &statement.fields[5..10] {
+        let is_zero = builder.is_equal(*word, zero);
+        recipient_zero = builder.and(recipient_zero, is_zero);
+        builder.connect_if_true(identity, *word, zero);
     }
-    let previous_jobs = HashOutTarget {
-        elements: std::array::from_fn(|i| predecessors.own.public_inputs[22 + i]),
-    };
+    let recipient_nonzero = builder.not(recipient_zero);
+    let one = builder.one();
+    builder.connect_if_true(credit, recipient_nonzero.target, one);
+    for word in statement.amount() { builder.connect_if_true(identity, word, zero); }
+    let previous_jobs = HashOutTarget { elements: std::array::from_fn(|i| predecessors.own.public_inputs[22 + i]) };
     let previous_jobs = builder.select_hash(predecessors.has_own, previous_jobs, session.seed);
     let jobs_commitment = rolling_jobs_commitment(builder, previous_jobs, previous_count, step_count, count, jobs);
-    builder.connect_hashes(jobs_commitment, statement.hash(22));
+    let committed = builder.select_hash(identity, ledger_window.hash, jobs_commitment);
+    builder.connect_hashes(committed, statement.hash(22));
+    identity
 }
 
 struct RewardLedgerLeafTargets {
@@ -527,7 +535,7 @@ fn constrain_session_update(
     ledger_window: &RewardLedgerWindowTargets, old_summary: HashOutTarget,
     new_session_root: HashOutTarget, siblings: &[HashOutTarget; 32],
     empty_user_root: HashOutTarget, is_final_step: BoolTarget,
-    ledger_leaf: &RewardLedgerLeafTargets,
+    ledger_leaf: &RewardLedgerLeafTargets, identity: BoolTarget,
 ) {
     let zero = builder.zero();
     let empty_bytes = domain_bytes(builder, b"PsyRewardLedger/Empty/1");
@@ -536,7 +544,8 @@ fn constrain_session_update(
     builder.connect_hashes_if_true(first_own, empty_summary, old_summary);
     let old_user_root = summary_path_root(builder, statement.fields[4], old_summary, siblings);
     let working_user_root = builder.select_hash(predecessors.has_global, old_state.user_root, empty_user_root);
-    builder.connect_hashes(old_user_root, working_user_root);
+    let credit = builder.not(identity);
+    builder.connect_hashes_if_true(credit, old_user_root, working_user_root);
     let summary = reward_session_summary(builder, &statement.fields,
         session.seed, new_session_root, is_final_step);
     let mut summary_is_empty = builder._true();
@@ -544,21 +553,26 @@ fn constrain_session_update(
         let equal = builder.is_equal(value, empty);
         summary_is_empty = builder.and(summary_is_empty, equal);
     }
-    builder.assert_zero(summary_is_empty.target);
+    builder.connect_if_true(credit, summary_is_empty.target, zero);
     let user_root = summary_path_root(builder, statement.fields[4], summary, siblings);
-    builder.connect_hashes(new_state.user_root, user_root);
-    builder.connect_hashes(new_state.ledger_window_hash, ledger_window.hash);
-    builder.connect_hashes(new_state.ledger_root, ledger_leaf.new_root);
+    let next_user_root = builder.select_hash(identity, old_state.user_root, user_root);
+    let next_window_hash = builder.select_hash(identity, old_state.ledger_window_hash, ledger_window.hash);
+    let next_ledger_root = builder.select_hash(identity, old_state.ledger_root, ledger_leaf.new_root);
+    builder.connect_hashes(new_state.user_root, next_user_root);
+    builder.connect_hashes(new_state.ledger_window_hash, next_window_hash);
+    builder.connect_hashes(new_state.ledger_root, next_ledger_root);
     let session_count = builder.select(predecessors.has_global, old_state.session_count, zero);
     let unfinished_session_count = builder.select(predecessors.has_global, old_state.unfinished_session_count, zero);
-    let next_session_count = builder.add(session_count, first_own.target);
+    let incremented = builder.add(session_count, first_own.target);
+    let next_session_count = builder.select(identity, session_count, incremented);
     builder.range_check(next_session_count, 32);
     builder.connect(new_state.session_count, next_session_count);
     let not_final_step = builder.not(is_final_step);
     let opened = builder.and(first_own, not_final_step);
     let closed = builder.and(predecessors.has_own, is_final_step);
     let after_open = builder.add(unfinished_session_count, opened.target);
-    let next_unfinished_session_count = builder.sub(after_open, closed.target);
+    let decremented = builder.sub(after_open, closed.target);
+    let next_unfinished_session_count = builder.select(identity, unfinished_session_count, decremented);
     builder.range_check(next_unfinished_session_count, 32);
     builder.connect(new_state.unfinished_session_count, next_unfinished_session_count);
     let completed = builder.sub(next_session_count, next_unfinished_session_count);
@@ -677,6 +691,7 @@ fn auth_secp_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plonky2::field::types::PrimeField64;
     use parth_core::{crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::{MerkleHasher, MerkleZeroHasher}}, pgoldilocks::QHashOut};
     use plonky2::{hash::hash_types::HashOut, iop::witness::{PartialWitness, WitnessWrite}, plonk::{circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs}};
     use std::collections::BTreeMap;
@@ -967,10 +982,11 @@ mod tests {
     fn empty_issued_root() -> [u64; 4] {
         use plonky2::{hash::hash_types::HashOut, plonk::config::Hasher};
         let mut root = HashOut { elements: [F::ZERO; 4] };
-        for _ in 0..64 { root = PoseidonHash::two_to_one(root, root); }
+        for _ in 0..64 { root = <PoseidonHash as Hasher<F>>::two_to_one(root, root); }
         root.elements.map(|limb| limb.to_canonical_u64())
     }
 
+    #[derive(Clone, Copy)]
     struct OriginCase {
         start_root: [u64; 4],
         old_window: [u64; 4],
@@ -1009,8 +1025,9 @@ mod tests {
         builder.connect_hashes_if_true(origin, old.ledger_window_hash, zero_hash);
         builder.connect_hashes_if_true(origin, old.ledger_root, empty_issued_root);
         builder.connect_hashes_if_true(origin, old.user_root, empty_user_root);
-        builder.connect_if_true(origin, old.session_count, builder.zero());
-        builder.connect_if_true(origin, old.unfinished_session_count, builder.zero());
+        let zero = builder.zero();
+        builder.connect_if_true(origin, old.session_count, zero);
+        builder.connect_if_true(origin, old.unfinished_session_count, zero);
         builder.register_public_inputs(&statement.fields);
         let circuit = builder.build::<PoseidonGoldilocksConfig>();
         let mut witness = PartialWitness::new();
@@ -1273,8 +1290,15 @@ fn build_reward_session_circuit(
         session_root = job.next_root;
         jobs.push(job);
     }
-    constrain_reward_session_step(&mut builder, &statement, &predecessors, &session, &jobs);
+    let identity_step = constrain_reward_session_step(&mut builder, &statement, &predecessors, &session, &jobs, &ledger_window);
     let is_final_step = builder.add_virtual_bool_target_safe();
+    builder.connect_if_true(identity_step, is_final_step.target, zero);
+    let no_global = builder.not(predecessors.has_global);
+    let first_identity = builder.and(identity_step, no_global);
+    let one = builder.one();
+    builder.connect_if_true(first_identity, origin.target, one);
+    builder.connect_hashes_if_true(identity_step, statement.hash(26), ledger_window.start_root);
+    builder.connect_hashes_if_true(identity_step, old_state.root, new_state.root);
     let ledger_leaf = RewardLedgerLeafTargets::new(&mut builder, &statement, &session, &ledger_window,
         is_final_step, old_state.ledger_root);
     let empty_bytes = domain_bytes(&mut builder, b"PsyRewardLedger/Empty/1");
@@ -1298,7 +1322,7 @@ fn build_reward_session_circuit(
     builder.connect_if_true(origin, old_state.unfinished_session_count, zero);
     constrain_session_update(&mut builder, &statement, &predecessors, &session,
         &old_state, &new_state, &ledger_window, old_summary, session_root, &session_siblings,
-        empty_user_root, is_final_step, &ledger_leaf);
+        empty_user_root, is_final_step, &ledger_leaf, identity_step);
     let identity = UserAuthTargets::new(&mut builder, &statement, &session, &ledger_window,
         is_final_step, fingerprints);
     builder.register_public_inputs(&statement.fields);
@@ -1367,6 +1391,51 @@ impl RewardSessionCircuit {
         let fingerprint = self.identity_fingerprints.get(usize::from(scheme))
             .context("reward session identity scheme must be 0..3")?;
         Ok(fingerprint.map(|value| value.to_canonical_u64()))
+    }
+}
+
+impl RewardSessionCircuit {
+    pub fn prove_identity(
+        &self, config: &psy_client_data::bridge_aggregate::NetworkConfig,
+        window: &super::reward_ledger::RewardLedgerWindowValues,
+        leaf: &psy_client_data::qdata::checkpoint::PsyCheckpointLeaf<F>,
+        path: &[[u64; 4]; 32],
+        roots: &psy_client_data::qdata::checkpoint::PsyCheckpointGlobalStateRoots<F>,
+        prior: Option<(&plonky2::plonk::proof::ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>, &RewardLedgerStateValues)>,
+    ) -> anyhow::Result<(plonky2::plonk::proof::ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>, RewardLedgerStateValues)> {
+        use plonky2::{field::types::PrimeField64, hash::hash_types::HashOut, plonk::config::Hasher};
+        anyhow::ensure!(window.config_hash == config.config_hash()? && window.economic_domain == config.clone().load()?.economic_domain(), "reward identity configuration mismatch");
+        let mut empty_session = HashOut { elements: [F::ZERO; 4] };
+        for _ in 0..63 { empty_session = PoseidonHash::two_to_one(empty_session, empty_session); }
+        let state = if let Some((proof, state)) = prior {
+            self.circuit_data.verify(proof.clone())?;
+            anyhow::ensure!(proof.public_inputs[30..34].iter().zip(window.start_root).all(|(value, limb)| value.to_canonical_u64() == limb), "reward identity predecessor root mismatch");
+            *state
+        } else {
+            anyhow::ensure!(window.start_root == origin_state_root(), "reward identity predecessor missing");
+            let issued = PoseidonHash::two_to_one(empty_session, empty_session);
+            RewardLedgerStateValues { ledger_window_hash: [0; 4], ledger_root: issued.elements.map(|value| value.to_canonical_u64()),
+                user_root: super::reward_ledger::empty_user_root()?, session_count: 0, unfinished_session_count: 0 }
+        };
+        anyhow::ensure!(super::reward_ledger::state_root(&state)? == window.start_root, "reward identity state mismatch");
+        let (_, commitment) = super::reward_ledger::window_hash(window, &self.circuit_data.verifier_only)?;
+        let input = RewardSessionWitness {
+            statement: psy_client_data::bridge_aggregate::RewardSessionProofFields {
+                checkpoint_tree_root: window.end_checkpoint_root, user_id: 0, recipient: [0; 8], total_amount: [0; 8], count: 0,
+                jobs_commitment: commitment, old_ledger_state_root: window.start_root, new_ledger_state_root: window.start_root,
+            },
+            config: config.clone(), economic_domain: window.economic_domain, window_id: window.window_id, start_root: window.start_root,
+            source_checkpoint_id: window.end_checkpoint_id, end_checkpoint_id: window.end_checkpoint_id,
+            source_leaf: leaf.clone(), source_path: *path, old_state: state, new_state: state, own_state: state,
+            old_summary: super::reward_ledger::empty_summary()?, old_session_root: empty_session.elements.map(|value| value.to_canonical_u64()),
+            session_siblings: [[0; 4]; 32], own_siblings: [[0; 4]; 32], ledger_siblings: [[0; 4]; 64],
+            own_previous: None, global_previous: prior.map(|(proof, _)| proof), jobs: &[], is_final_step: false,
+            end_leaf: leaf.clone(), end_path: *path, end_roots: roots.clone(), user_leaf: Default::default(),
+            user_path: vec![[0; 4]; GLOBAL_USER_TREE_HEIGHT as usize], public_key_param: [0; 4], authorization: None,
+        };
+        let proof = self.prove(&input)?;
+        self.circuit_data.verify(proof.clone())?;
+        Ok((proof, state))
     }
 }
 
@@ -1446,8 +1515,14 @@ impl RewardSessionCircuit {
     ) -> anyhow::Result<plonky2::iop::witness::PartialWitness<F>> {
         use plonky2::iop::witness::{PartialWitness, WitnessWrite};
         use plonky2::recursion::dummy_circuit::{dummy_circuit, dummy_proof};
-        anyhow::ensure!(!input.jobs.is_empty() && input.jobs.len() <= self.capacity,
-            "reward session job count is outside circuit capacity");
+        anyhow::ensure!(input.jobs.len() <= self.capacity, "reward session job count is outside circuit capacity");
+        if input.jobs.is_empty() {
+            anyhow::ensure!(input.own_previous.is_none() && !input.is_final_step && input.statement.count == 0
+                && input.statement.total_amount == [0; 8] && input.statement.recipient == [0; 8]
+                && input.old_state == input.new_state && input.statement.old_ledger_state_root == input.statement.new_ledger_state_root,
+                "invalid reward identity transition");
+            anyhow::ensure!(input.global_previous.is_some() || input.start_root == origin_state_root(), "reward identity predecessor missing");
+        }
         anyhow::ensure!(!input.is_final_step || input.authorization.is_some(), "final-step authorization missing");
         let mut witness = PartialWitness::new();
         let targets = &self.targets;
@@ -1494,9 +1569,20 @@ impl RewardSessionCircuit {
                 witness.set_proof_with_pis_target(target, &dummy)?;
             }
         }
-        let padding = &input.jobs[0];
+        use plonky2::plonk::config::Hasher;
+        use parth_core::pgoldilocks::QHashOut;
+        let preimage = plonky2::hash::hash_types::HashOut { elements: [F::from_canonical_u32(input.statement.user_id), F::ONE, F::ZERO, F::ZERO] };
+        let tag = PoseidonHash::two_to_one(preimage, preimage);
+        let padding = RewardSessionJobWitness {
+            height: 2, path_index: 0,
+            tag: super::reward_inclusion::RewardTagWitness {
+                tag_preimage: QHashOut(preimage), leaf_left: QHashOut::default(), leaf_right: QHashOut::default(), leaf_tag: QHashOut(tag),
+                siblings: [QHashOut::default(); 21], parent_tags: [QHashOut::default(); 21],
+            },
+            nullifier_siblings: [[0; 4]; 63],
+        };
         for (index, target) in targets.jobs.iter().enumerate() {
-            let job = input.jobs.get(index).unwrap_or(padding);
+            let job = input.jobs.get(index).unwrap_or(&padding);
             anyhow::ensure!((2..=21).contains(&job.height), "reward session job height out of range");
             anyhow::ensure!(job.path_index < 1u32 << (job.height - 2), "reward session job index out of range");
             witness.set_bool_target(target.is_active, index < input.jobs.len())?;

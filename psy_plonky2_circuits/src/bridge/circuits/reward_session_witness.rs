@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(values.current_slots[0].0.elements[0], F::TWO);
         let members = values.current_slots[1..].iter().map(|hash| hash.0.elements[0].to_canonical_u64()).collect::<Vec<_>>();
         assert_eq!(members, vec![1, 2, 3]);
-        let roots = core::array::from_fn(|slot| fold(values.current_slots[slot], slot, &values.slot_paths[slot]));
+        let roots: [_; 4] = core::array::from_fn(|slot| fold(values.current_slots[slot], slot, &values.slot_paths[slot]));
         assert!(roots.iter().all(|root| *root == roots[0]));
         let mut changed = values.current_slots;
         changed[1] = QHashOut::from_values(4, 0, 0, 0);
