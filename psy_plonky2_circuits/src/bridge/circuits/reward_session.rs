@@ -1361,6 +1361,7 @@ impl RewardSessionCircuit {
         ];
         let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
         let origin_state = origin_state_root();
+        for _ in 0..REWARD_SESSION_PROOF_FIELD_COUNT { builder.add_virtual_public_input(); }
         while builder.num_gates() < 32 { builder.add_gate(plonky2::gates::noop::NoopGate, vec![]); }
         let mut common = builder.build::<PoseidonGoldilocksConfig>().common;
         for _ in 0..8 {
