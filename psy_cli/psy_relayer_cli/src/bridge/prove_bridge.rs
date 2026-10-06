@@ -229,8 +229,8 @@ pub(crate) fn withdrawal_publication_header(config: &NetworkConfig, opening: &Wi
         withdrawal_roots: opening.withdrawal_roots.clone(),
         old_ledger_state_root: None,
         new_ledger_state_root: None,
-        opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest(config)? },
-        claim_tree_root: [0; 32],
+        opening_digest: opening.opening_digest(config)?,
+        claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], WITHDRAWAL_PUBLICATION_CAPACITY as usize)?[0],
     };
     let commits = opening.withdrawals.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?;
     bind_claim_tree(&mut header, &commits)?;
