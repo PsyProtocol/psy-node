@@ -1,29 +1,12 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use anyhow::Context;
 use jsonrpsee::{core::async_trait, proc_macros::rpc, types::ErrorObjectOwned};
-use parth_core::{
-    crypto::hash::merkle_proof::DeltaMerkleProofCore as ParthDeltaMerkleProofCore, pgoldilocks::QHashOut as ParthQHashOut,
-    protocol::core_types::QNetworkTreeConstants,
-};
-use plonky2::{
-    field::types::{Field, PrimeField64},
-    plonk::{circuit_data::CommonCircuitData, proof::ProofWithPublicInputs},
-};
-use psy_config::network_constants::{DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT, WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT};
-use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants};
-use psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots;
-use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibraryCore;
+use parth_core::pgoldilocks::QHashOut as ParthQHashOut;
+use plonky2::field::types::Field;
 use psy_plonky2_circuits::{
-    bridge::{
-        circuits::{
-            bridge_agg_final::BridgeAggFinalCircuit,
-            bridge_wrap::{BridgeWrapCircuit, DepositBatchWrapCircuit, SharedGroth16Wrapper, WithdrawalClaimWrapCircuit},
-        },
-        gadgets::tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
-    },
-    circuit_library::get_plonky2_circuit_library_and_prover_for_network,
-    coordinator::coordinator_helper::QEDCoordinatorCircuitManager,
+    bridge::circuits::bridge_wrap::{DepositBatchWrapCircuit, SharedGroth16Wrapper, WithdrawalClaimWrapCircuit},
+    proof_minifier::pm_chain::QEDProofMinifierChain,
 };
 use psy_plonky2_common_circuits::bridge::{
     deposit_batch_append_circuit::{
@@ -55,23 +38,20 @@ pub trait ProveProxySystemRpc {
         input: BridgeDepositBatchWitnessInput,
     ) -> Result<BridgeDepositBatchGroth16Proof, ErrorObjectOwned>;
 
-    /// Bridge aggregation: checkpoints → BridgeAggCircuit → BridgeWrapCircuit →
-    /// Groth16
-    #[method(name = "prove_bridge_agg_groth16")]
-    async fn prove_bridge_agg_groth16(&self, deps_network: String, input: BridgeAggWitnessInput) -> Result<BridgeAggGroth16Output, ErrorObjectOwned>;
 }
 
 pub struct SystemProveProvider {
     pub deposit_batch_wrap_circuit: Arc<DepositBatchWrapCircuit>,
     pub withdrawal_claim_wrap_circuit: Arc<WithdrawalClaimWrapCircuit>,
-    pub bridge_wrap_circuit: Arc<BridgeWrapCircuit>,
     pub deposit_batch_groth16_wrapper: Arc<SharedGroth16Wrapper>,
     pub withdrawal_claim_groth16_wrapper: Arc<SharedGroth16Wrapper>,
-    pub bridge_groth16_wrapper: Arc<SharedGroth16Wrapper>,
+    pub deposit_append_circuit: Arc<DepositBatchAppendCircuit<C, D>>,
+    pub deposit_batch_minifier: Arc<QEDProofMinifierChain<D, F, C>>,
+    pub withdrawal_claim_circuit: Arc<WithdrawalBatchClaimCircuit<C, D>>,
 }
 
 impl SystemProveProvider {
-    /// Builds the bridge wrap circuits and preloads the three Groth16 keystores.
+    /// Builds the deposit and withdrawal circuits and preloads their Groth16 keystores.
     /// Does not touch the coordinator RPC or the UPS circuit manager.
     pub fn new() -> anyhow::Result<Self> {
         let home = dirs::home_dir().context("cannot locate system prove-proxy keystore HOME")?;
@@ -79,12 +59,11 @@ impl SystemProveProvider {
     }
 
     fn new_with_keystore_root(root: &std::path::Path) -> anyhow::Result<Self> {
-        use psy_plonky2_circuits::qstandard::QStandardCircuit;
 
         // Check every required file before expensive circuit construction. The
         // synchronous FFI initialization below also decodes each group before
         // this provider can be registered as system-capable.
-        for (label, directory) in [("bridge", ""), ("deposit_append", "deposit_append"), ("withdrawal_claim", "withdrawal_claim")] {
+        for (label, directory) in [("deposit_append", "deposit_append"), ("withdrawal_claim", "withdrawal_claim")] {
             for name in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
                 let path = root.join(directory).join(name);
                 let file = std::fs::File::open(&path)
@@ -141,52 +120,6 @@ impl SystemProveProvider {
             .into_shared_groth16_wrapper(format!("{}/withdrawal_claim/", root.display())),
         );
 
-        tracing::info!("Pre-building BridgeWrapCircuit...");
-        let coordinator_circuits = cached_bridge_coordinator_circuits()?;
-        let checkpoint_common_data: &CommonCircuitData<F, D> = coordinator_circuits.checkpoint_root_transition.get_common_circuit_data_ref();
-        let checkpoint_verifier_data = coordinator_circuits.checkpoint_root_transition.get_verifier_config_ref();
-        let checkpoint_cap_height = checkpoint_verifier_data.constants_sigmas_cap.height();
-        let coordinator_checkpoint_fp = coordinator_circuits.checkpoint_root_transition.get_fingerprint();
-        // step_commit must use the cached library fingerprint (same as RCP circuit
-        // genesis proving), NOT base_fingerprint or minifier get_fingerprint().
-        let cached_lib = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
-        let coordinator_checkpoint_step_commit_fp = cached_lib
-            .get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
-            .expect("GenerateRollupStateTransitionProof not found in cached circuit library");
-
-        tracing::info!(
-            "[PROXY] checkpoint minifier_fp={:?} step_commit_fp(cached)={:?}",
-            coordinator_checkpoint_fp.0.elements,
-            coordinator_checkpoint_step_commit_fp.0.elements,
-        );
-
-        let bridge_agg_template = BridgeAggFinalCircuit::<C, D>::prebuild_final_circuit(
-            checkpoint_common_data,
-            checkpoint_cap_height,
-            coordinator_checkpoint_fp,
-            coordinator_checkpoint_step_commit_fp,
-            32,
-            PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE,
-            PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
-            DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
-            WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
-        );
-        let bridge_agg_fingerprint = bridge_agg_template.get_fingerprint();
-        let bridge_agg_common = bridge_agg_template.get_common_circuit_data_ref();
-        let bridge_agg_verifier = bridge_agg_template.get_verifier_config_ref();
-        let bridge_wrap_circuit = Arc::new(BridgeWrapCircuit::new(
-            bridge_agg_common,
-            bridge_agg_fingerprint,
-            bridge_agg_verifier.constants_sigmas_cap.height(),
-        ));
-        let bridge_groth16_wrapper = Arc::new(
-            BridgeWrapCircuit::new(
-                bridge_agg_common,
-                bridge_agg_fingerprint,
-                bridge_agg_verifier.constants_sigmas_cap.height(),
-            )
-            .into_shared_groth16_wrapper(format!("{}/", root.display())),
-        );
 
         tracing::info!("Groth16 wrapping circuits pre-built successfully.");
 
@@ -196,7 +129,6 @@ impl SystemProveProvider {
         // lazily on first request causes relayer claim-proof-fetch timeouts.
         tracing::info!("Preloading Groth16 keystores...");
         for (label, keystore_path) in [
-            ("bridge", &bridge_groth16_wrapper.keystore_path),
             ("deposit_append", &deposit_batch_groth16_wrapper.keystore_path),
             ("withdrawal_claim", &withdrawal_claim_groth16_wrapper.keystore_path),
         ] {
@@ -209,10 +141,11 @@ impl SystemProveProvider {
         Ok(Self {
             deposit_batch_wrap_circuit,
             withdrawal_claim_wrap_circuit,
-            bridge_wrap_circuit,
             deposit_batch_groth16_wrapper,
             withdrawal_claim_groth16_wrapper,
-            bridge_groth16_wrapper,
+            deposit_append_circuit: Arc::new(deposit_template),
+            deposit_batch_minifier: Arc::new(deposit_minifier),
+            withdrawal_claim_circuit: Arc::new(withdrawal_template),
         })
     }
 }
@@ -223,11 +156,11 @@ mod setup_tests {
 
     #[test]
     fn system_startup_rejects_missing_empty_or_non_file_setup_before_building_circuits() {
-        for directory in ["", "deposit_append", "withdrawal_claim"] {
+        for directory in ["deposit_append", "withdrawal_claim"] {
             for name in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
                 for failure in ["missing", "empty", "directory"] {
                     let root = tempfile::tempdir().unwrap();
-                    for group in ["", "deposit_append", "withdrawal_claim"] {
+                    for group in ["deposit_append", "withdrawal_claim"] {
                         std::fs::create_dir_all(root.path().join(group)).unwrap();
                         for file in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
                             std::fs::write(root.path().join(group).join(file), b"placeholder").unwrap();
@@ -249,16 +182,6 @@ mod setup_tests {
     }
 }
 
-fn cached_bridge_coordinator_circuits() -> anyhow::Result<&'static QEDCoordinatorCircuitManager<C, D>> {
-    static CACHE: OnceLock<anyhow::Result<QEDCoordinatorCircuitManager<C, D>>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            tracing::info!("Building QEDCoordinatorCircuitManager for bridge agg...");
-            get_plonky2_circuit_library_and_prover_for_network::<C, D>(PsyChainNetworkType::LocalDevnet).map(|(_, circuits)| circuits)
-        })
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("failed to build/retrieve cached bridge circuits: {}", e))
-}
 
 #[async_trait]
 impl ProveProxySystemRpcServer for SystemProveProvider {
@@ -270,6 +193,7 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
 
         let wrap_circuit = self.withdrawal_claim_wrap_circuit.clone();
         let groth16_wrapper = self.withdrawal_claim_groth16_wrapper.clone();
+        let circuit = self.withdrawal_claim_circuit.clone();
         tokio::task::spawn_blocking(move || {
             anyhow::ensure!(
                 input.withdrawals.len() <= MAX_WITHDRAWAL_CLAIM_BATCH_SIZE,
@@ -327,7 +251,6 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
                 });
             }
 
-            let circuit = WithdrawalBatchClaimCircuit::<C, D>::build(32);
             let proof = circuit.generate_proof(&WithdrawalBatchClaimInputs::<F> {
                 withdrawal_root: root.expect("non-empty batch ensured above"),
                 bridge_user_id: input.bridge_user_id,
@@ -377,6 +300,8 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
 
         let wrap_circuit = self.deposit_batch_wrap_circuit.clone();
         let groth16_wrapper = self.deposit_batch_groth16_wrapper.clone();
+        let circuit = self.deposit_append_circuit.clone();
+        let minifier = self.deposit_batch_minifier.clone();
         tokio::task::spawn_blocking(move || {
             anyhow::ensure!(
                 input.old_frontier.len() == 32,
@@ -412,17 +337,8 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
                 bridge_user_id: input.bridge_user_id,
             };
 
-            let circuit = DepositBatchAppendCircuit::<C, D>::build(
-                psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::MAX_DEPOSIT_BATCH_SIZE,
-                32,
-            );
             let proof = circuit.generate_proof(&batch_inputs)?;
             let preimage = compute_batch_append_preimage(&batch_inputs);
-            let minifier = psy_plonky2_circuits::proof_minifier::pm_chain::QEDProofMinifierChain::<D, F, C>::new(
-                &circuit.circuit_data.verifier_only,
-                &circuit.circuit_data.common,
-                2,
-            );
             let minified_proof = minifier.prove(&proof)?;
             let groth16 = wrap_circuit.prove_groth16_with_shared_wrapper(&groth16_wrapper, minifier.get_verifier_data(), &minified_proof)?;
 
@@ -442,253 +358,4 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
         .map_err(|err| ErrorObjectOwned::owned(1, "prove_deposit_batch_append_groth16 proving error", Some(err.to_string())))
     }
 
-    async fn prove_bridge_agg_groth16(
-        &self,
-        _deps_network: String,
-        input: BridgeAggWitnessInput,
-    ) -> Result<BridgeAggGroth16Output, ErrorObjectOwned> {
-        tracing::debug!("prove_bridge_agg_groth16 from={} to={}", input.from_checkpoint, input.to_checkpoint);
-
-        let from_checkpoint = input.from_checkpoint.max(1);
-        let to_checkpoint = input.to_checkpoint;
-        if from_checkpoint > to_checkpoint {
-            return Err(ErrorObjectOwned::owned(
-                1,
-                "prove_bridge_agg_groth16: from_checkpoint must be <= to_checkpoint",
-                None::<()>,
-            ));
-        }
-        let num_checkpoints_aggregated = to_checkpoint - from_checkpoint + 1;
-
-        let wrap_circuit = self.bridge_wrap_circuit.clone();
-        let groth16_wrapper = self.bridge_groth16_wrapper.clone();
-        tokio::task::spawn_blocking(move || -> Result<BridgeAggGroth16Output, ErrorObjectOwned> {
-            use psy_plonky2_circuits::qstandard::QStandardCircuit;
-            let coordinator_circuits = cached_bridge_coordinator_circuits()
-                .map_err(|e| ErrorObjectOwned::owned(1, "failed to load bridge circuits", Some(e.to_string())))?;
-
-            let checkpoint_common_data: &CommonCircuitData<F, D> =
-                coordinator_circuits.checkpoint_root_transition.get_common_circuit_data_ref();
-            let checkpoint_verifier_data =
-                coordinator_circuits.checkpoint_root_transition.get_verifier_config_ref();
-            let cap_height = checkpoint_verifier_data.constants_sigmas_cap.height();
-            let coordinator_checkpoint_fp =
-                coordinator_circuits.checkpoint_root_transition.get_fingerprint();
-            let checkpoint_state_transition_fingerprint = parse_hex_qhashout_to_qhash(&input.checkpoint_fp)
-                .map_err(|e| ErrorObjectOwned::owned(1, "parse checkpoint_fp", Some(e.to_string())))?;
-            if checkpoint_state_transition_fingerprint != coordinator_checkpoint_fp {
-                return Err(ErrorObjectOwned::owned(
-                    1,
-                    "checkpoint_fp mismatch",
-                    Some(format!(
-                        "bridge agg witness checkpoint_fp differs from proxy coordinator fingerprint: input={:?} coordinator={:?}",
-                        checkpoint_state_transition_fingerprint,
-                        coordinator_checkpoint_fp
-                    )),
-                ));
-            }
-            // step_commit must use the cached library fingerprint (same as RCP circuit genesis proving).
-            let cached_lib = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
-            let checkpoint_step_commit_fingerprint = cached_lib
-                .get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
-                .expect("GenerateRollupStateTransitionProof not found in cached circuit library");
-
-            // Deserialize the final (to_checkpoint) checkpoint proof from bincode hex
-            let final_checkpoint_proof_bytes = hex::decode(
-                input.final_checkpoint_proof_hex.trim_start_matches("0x"),
-            )
-            .map_err(|e| ErrorObjectOwned::owned(1, "hex decode final checkpoint proof", Some(e.to_string())))?;
-            let final_checkpoint_proof: ProofWithPublicInputs<F, C, D> =
-                bincode::deserialize(&final_checkpoint_proof_bytes)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "bincode deserialize final checkpoint proof", Some(e.to_string())))?;
-
-            // Parse delta merkle proofs
-            use plonky2::hash::poseidon::PoseidonHash;
-            let parse_delta = |dp: &BridgeAggDeltaProof| -> anyhow::Result<ParthDeltaMerkleProofCore<parth_core::pgoldilocks::QHashOut<F>>> {
-                let new_value = parse_hex_qhashout_to_qhash(&dp.new_value)?;
-                let siblings = dp.siblings.iter().map(|s| parse_hex_qhashout_to_qhash(s)).collect::<Result<Vec<_>, _>>()?;
-                Ok(ParthDeltaMerkleProofCore::from_params::<PoseidonHash>(
-                    dp.index,
-                    parth_core::pgoldilocks::QHashOut::default(),
-                    new_value,
-                    siblings,
-                ))
-            };
-
-            let delta_merkle_proofs: Vec<ParthDeltaMerkleProofCore<parth_core::pgoldilocks::QHashOut<F>>> = input.delta_merkle_proofs
-                .iter()
-                .map(parse_delta)
-                .collect::<anyhow::Result<Vec<_>>>()
-                .map_err(|e| ErrorObjectOwned::owned(1, "parse delta proofs", Some(e.to_string())))?;
-
-            let pre_delta_merkle_proofs: Vec<ParthDeltaMerkleProofCore<parth_core::pgoldilocks::QHashOut<F>>> = input.pre_delta_merkle_proofs
-                .iter()
-                .map(parse_delta)
-                .collect::<anyhow::Result<Vec<_>>>()
-                .map_err(|e| ErrorObjectOwned::owned(1, "parse pre-delta proofs", Some(e.to_string())))?;
-
-            // `chain_start` is the chain hash immediately before the aggregated range
-            // (chain hash of checkpoint `from_checkpoint - 1`; for `from_checkpoint <= 1`
-            // this is the genesis checkpoint state transition hash).
-            let start_chain_hash = parse_hex_qhashout_to_qhash(&input.chain_start)
-                .map_err(|e| ErrorObjectOwned::owned(1, "parse chain_start", Some(e.to_string())))?;
-
-            let final_leaf = psy_data::v1::qdata::checkpoint::PQEDCheckpointLeafCompact {
-                global_chain_root: parse_hex_qhashout_to_qhash(&input.final_checkpoint_leaf.global_chain_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse final leaf chain root", Some(e.to_string())))?,
-                stats_hash: parse_hex_qhashout_to_qhash(&input.final_checkpoint_leaf.stats_hash)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse final leaf stats hash", Some(e.to_string())))?,
-            };
-
-            // Parse global state roots (anchors the user_tree_root to the verified checkpoint)
-            let parse_qhash = |hex: &str| -> anyhow::Result<parth_core::pgoldilocks::QHashOut<F>> {
-                parse_hex_qhashout_to_qhash(hex)
-            };
-            let global_state_roots = PQEDCheckpointGlobalStateRoots {
-                contract_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.contract_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse contract_tree_root", Some(e.to_string())))?,
-                deposit_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.deposit_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse deposit_tree_root", Some(e.to_string())))?,
-                user_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.user_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse user_tree_root", Some(e.to_string())))?,
-                withdrawal_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.withdrawal_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse withdrawal_tree_root", Some(e.to_string())))?,
-                user_registration_tree_root: parse_qhash(&input.final_checkpoint_global_state_roots.user_registration_tree_root)
-                    .map_err(|e| ErrorObjectOwned::owned(1, "parse user_registration_tree_root", Some(e.to_string())))?,
-            };
-
-            // Parse witnesses (slot witnesses are the full TreeRootInContractStateWitnessInput)
-            let parse_slot_witness = |w: &BridgeAggSlotWitness| -> anyhow::Result<TreeRootInContractStateWitnessInput<F>> {
-                let user_leaf = psy_data::v1::qdata::user::PQEDUserLeaf::<F, parth_core::pgoldilocks::QHashOut<F>> {
-                    public_key: parse_hex_qhashout_to_qhash(&w.user_leaf_public_key)?,
-                    user_state_tree_root: parse_hex_qhashout_to_qhash(&w.user_leaf_user_state_tree_root)?,
-                    balance: F::from_canonical_u64(w.user_leaf_balance),
-                    nonce: F::from_canonical_u64(w.user_leaf_nonce),
-                    last_checkpoint_id: F::from_canonical_u64(w.user_leaf_last_checkpoint_id),
-                    event_index: F::from_canonical_u64(w.user_leaf_event_index),
-                    user_id: F::from_canonical_u64(w.user_leaf_user_id),
-                };
-
-                let mk_proof = |root: &str, value: &str, index: u64, sibs: &[String]| -> anyhow::Result<parth_core::crypto::hash::merkle_proof::MerkleProofCore<parth_core::pgoldilocks::QHashOut<F>>> {
-                    Ok(parth_core::crypto::hash::merkle_proof::MerkleProofCore {
-                        root: parse_hex_qhashout_to_qhash(root)?,
-                        value: parse_hex_qhashout_to_qhash(value)?,
-                        index,
-                        siblings: sibs.iter().map(|s| parse_hex_qhashout_to_qhash(s)).collect::<Result<Vec<_>, _>>()?,
-                    })
-                };
-
-                Ok(TreeRootInContractStateWitnessInput {
-                    owner_user_id: w.owner_user_id,
-                    contract_id: w.contract_id,
-                    user_leaf,
-                    slot0_proof: mk_proof(&w.slot0_root, &w.slot0_value, w.slot0_index, &w.slot0_siblings)?,
-                    slot1_proof: mk_proof(&w.slot1_root, &w.slot1_value, w.slot1_index, &w.slot1_siblings)?,
-                    contract_proof: mk_proof(&w.contract_root, &w.contract_value, w.contract_index, &w.contract_siblings)?,
-                    user_tree_proof: mk_proof(&w.user_tree_root, &w.user_tree_value, w.user_tree_index, &w.user_tree_siblings)?,
-                })
-            };
-
-            let deposit_witness = parse_slot_witness(&input.deposit_witness)
-                .map_err(|e| ErrorObjectOwned::owned(1, "parse deposit witness", Some(e.to_string())))?;
-            let withdrawal_witness = parse_slot_witness(&input.withdrawal_witness)
-                .map_err(|e| ErrorObjectOwned::owned(1, "parse withdrawal witness", Some(e.to_string())))?;
-
-            tracing::info!(
-                "Proving bridge aggregation for checkpoints {} to {}...",
-                from_checkpoint,
-                to_checkpoint
-            );
-
-            let result = BridgeAggFinalCircuit::<C, D>::prove_range(
-                from_checkpoint,
-                to_checkpoint,
-                start_chain_hash,
-                checkpoint_common_data,
-                cap_height,
-                checkpoint_state_transition_fingerprint,
-                checkpoint_step_commit_fingerprint,
-                &final_checkpoint_proof,
-                &checkpoint_verifier_data,
-                &delta_merkle_proofs,
-                &pre_delta_merkle_proofs,
-                &final_leaf,
-                &global_state_roots,
-                &deposit_witness,
-                &withdrawal_witness,
-                32, // CHECKPOINT_TREE_HEIGHT
-                PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE,
-                PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
-                DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
-                WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
-            )
-            .map_err(|e| ErrorObjectOwned::owned(1, "bridge_agg prove_range failed", Some(e.to_string())))?;
-
-            let bridge_agg_proof = result.proof;
-            let bridge_agg_verifier_data = result.verifier_data;
-
-            tracing::info!("Proving BridgeWrapCircuit (Groth16 wrap)...");
-            let groth16_proof = wrap_circuit
-                .prove_groth16_with_shared_wrapper(&groth16_wrapper, &bridge_agg_verifier_data, &bridge_agg_proof)
-                .map_err(|e| ErrorObjectOwned::owned(1, "bridge_wrap Groth16 failed", Some(e.to_string())))?;
-
-            // Format outputs
-            let groth16_pi = &bridge_agg_proof.public_inputs;
-            let checkpoint_roots = vec![
-                felt4_to_bytes32_hex(&groth16_pi[0..4]),
-                felt4_to_bytes32_hex(&groth16_pi[20..24]),
-            ];
-            let deposit_tree_root = u32x8_to_bytes32_hex(&groth16_pi[4..12]);
-            let withdrawal_tree_root = u32x8_to_bytes32_hex(&groth16_pi[12..20]);
-            let end_checkpoint_index = groth16_pi[24].to_canonical_u64();
-            if end_checkpoint_index != to_checkpoint {
-                return Err(ErrorObjectOwned::owned(
-                    1,
-                    "prove_bridge_agg_groth16: end_checkpoint_index mismatch",
-                    Some(format!("pi={} expected={}", end_checkpoint_index, to_checkpoint)),
-                ));
-            }
-
-            let solidity_words = g16_proof_to_solidity_words(&groth16_proof);
-            let pub_inputs_0 = groth16_proof.public_inputs[0].clone();
-            let pub_inputs_1 = groth16_proof.public_inputs[1].clone();
-            let public_inputs_str: Vec<String> = groth16_pi.iter().map(|x| x.to_canonical_u64().to_string()).collect();
-            let num_pis = groth16_pi.len();
-
-            Ok(BridgeAggGroth16Output {
-                from_checkpoint,
-                to_checkpoint,
-                num_checkpoints_aggregated,
-                bridge_agg_public_inputs_count: num_pis,
-                bridge_agg_public_inputs: public_inputs_str,
-                groth16_proof,
-                solidity_proof: [
-                    solidity_words[0].clone(),
-                    solidity_words[1].clone(),
-                    solidity_words[2].clone(),
-                    solidity_words[3].clone(),
-                    solidity_words[4].clone(),
-                    solidity_words[5].clone(),
-                    solidity_words[6].clone(),
-                    solidity_words[7].clone(),
-                ],
-                solidity_public_inputs: [
-                    pub_inputs_0,
-                    pub_inputs_1,
-                ],
-                checkpoint_roots,
-                deposit_tree_root,
-                withdrawal_tree_root,
-                end_checkpoint_index,
-            })
-        })
-        .await
-        .map_err(|join_err| {
-            ErrorObjectOwned::owned(
-                1,
-                "prove_bridge_agg_groth16: task schedule failed",
-                Some(format!("Thread pool task execution failed: {}", join_err)),
-            )
-        })?
-    }
 }
