@@ -9,7 +9,9 @@ use psy_common_circuit::serialization::PsyGateSerializer;
 use psy_plonky2_common_circuits::bridge::{deposit_spiderman_append::{DepositSpidermanAppendCircuit, DEPOSIT_SPIDERMAN_PI_WORDS}, withdrawal_inclusion::{WithdrawalInclusionCircuit, WITHDRAWAL_INCLUSION_PUBLIC_INPUTS}};
 use tiny_keccak::{Hasher, Keccak};
 
-use crate::{coordinator::coordinator_helper::QEDCoordinatorCircuitManager, proof_minifier::pm_core::get_circuit_fingerprint_generic_q, qstandard::QStandardCircuit};
+use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic_q, qstandard::QStandardCircuit};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::coordinator::coordinator_helper::QEDCoordinatorCircuitManager;
 use super::circuits::{bridge_agg_final::BridgeAggFinalCircuit, chain_aggregate::{ChainAggregateCircuit, CHAIN_PI_WORDS}, deposit_aggregate::{DepositAggregateCircuit, DEPOSIT_AGGREGATE_PI_LEN}, inclusion_aggregate::{AggregateWindow, RewardInclusionAggregateCircuit, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, WithdrawalInclusionAggregateCircuit, AGGREGATE_PI_LEN}, reward_session::{RewardSessionCircuit, REWARD_SESSION_STEP_CAPACITY}, settlement_aggregate::{SettlementAggregateCircuit, SETTLEMENT_AGGREGATE_PI_LEN}};
 
 pub struct AggregateCircuitHeights {
@@ -33,6 +35,7 @@ pub struct AggregateCircuits {
 }
 
 impl AggregateCircuits {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn build<N: QNetworkCircuitConstants>(configured_chain_indices: &[u8], coordinator: &QEDCoordinatorCircuitManager<C, 2>, heights: AggregateCircuitHeights) -> anyhow::Result<Self> {
         let source_chain_count = configured_chain_indices.len();
         anyhow::ensure!((1..=8).contains(&source_chain_count), "source chain count must be 1..8");
