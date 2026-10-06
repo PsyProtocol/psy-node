@@ -10,8 +10,8 @@ set -euo pipefail
 #   4. Wait for relayer batchAppend (provedDepositCount) + checkpoint finalize
 #   5. L2 claim-deposit with the sender-generated inclusion proof
 #   6. L2 withdraw (burn)
-#   7. Relayer batchClaimWithdrawal (registers pending) → script sends
-#      claimPendingWithdrawal after claimableAt (relayer never does)
+#   7. Relayer applyBridgeWindow publishes the withdrawal header. The script
+#      sends claimPendingWithdrawal after that pending claim is claimable.
 #   8. Verify L1 USDT balance = initial - deposit + withdraw and L2 claim state
 #
 # Prerequisites: make run-all running; release binaries built.
@@ -395,15 +395,90 @@ l2_withdraw() {
   ok "withdraw confirmed"
 }
 
-# ─── Step 7: Relayer batch claim + user claimPendingWithdrawal ────────────────
-# batchClaimWithdrawal only REGISTERS a pending withdrawal; the token transfer
-# happens in claimPendingWithdrawal, which the relayer never sends.
+# ─── Step 7: Settlement publication + user claimPendingWithdrawal ─────────────
+# applyBridgeWindow emits DepositAggregateApplied and InclusionAggregateRootPublished
+# on Bridge. It does not set claimedNullifiers. claimPendingWithdrawal still pays.
 wait_l1_claim() {
-  log "Step 7: Wait for relayer batchClaimWithdrawal, then claimPendingWithdrawal"
+  log "Step 7: Wait for applyBridgeWindow, then claimPendingWithdrawal"
+  local from_block cursor
+  from_block=$(cast block-number --rpc-url "$RPC_URL")
+  cursor=$(cast_call "$STATE_MANAGER" "lastFinalizedCheckpointId()(uint64)" | awk '{print $1}')
 
-  wait_for "withdrawal nullifier claimed" \
-    "[ \"\$(cast_call '$BRIDGE' 'claimedNullifiers(bytes32)(bool)' '$WITHDRAW_NONCE')\" = \"true\" ]"
-  ok "relayer registered pending withdrawal"
+  bridge_window_published() {
+    python3 - "$RPC_URL" "$BRIDGE" "$STATE_MANAGER" "$from_block" "$cursor" "$RESULT_DIR/bridge-window.json" <<'PY'
+import json, subprocess, sys
+rpc, bridge, state_manager, frm, cursor, out_path = sys.argv[1:7]
+cursor = int(cursor)
+
+def run(args):
+    return subprocess.run(args, capture_output=True, text=True)
+
+def event_topic(signature):
+    proc = run(["cast", "sig-event", signature])
+    if proc.returncode != 0:
+        sys.exit(1)
+    return proc.stdout.strip().lower()
+
+def logs(signature):
+    proc = run(["cast", "logs", "--from-block", frm, "--address", bridge, "--rpc-url", rpc, "--json", signature])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    parsed = json.loads(proc.stdout)
+    return parsed if isinstance(parsed, list) else []
+
+def word(data, index):
+    raw = data[2:] if data.startswith("0x") else data
+    return int(raw[index * 64:(index + 1) * 64], 16)
+
+deposit_sig = "DepositAggregateApplied(bytes32,uint32,bytes32)"
+published_sig = "InclusionAggregateRootPublished(bytes32,uint8,bytes32,uint32,bytes32,uint32,uint64)"
+deposit_topic = event_topic(deposit_sig)
+published_topic = event_topic(published_sig)
+by_tx = {}
+for entry in logs(deposit_sig) + logs(published_sig):
+    by_tx.setdefault(entry["transactionHash"].lower(), []).append(entry)
+for tx, items in by_tx.items():
+    published = next((entry for entry in items if entry["topics"][0].lower() == published_topic), None)
+    deposit = next((entry for entry in items if entry["topics"][0].lower() == deposit_topic), None)
+    if published is None or deposit is None:
+        continue
+    family = int(published["topics"][2], 16)
+    count = word(published["data"], 2)
+    end_id = word(published["data"], 3)
+    if family != 2 or count == 0 or end_id <= cursor:
+        continue
+    cursor_now = run(["cast", "call", state_manager, "lastFinalizedCheckpointId()(uint64)", "--rpc-url", rpc])
+    if cursor_now.returncode != 0:
+        sys.exit(1)
+    finalized = int(cursor_now.stdout.split()[0])
+    if finalized < end_id:
+        continue
+    data = published["data"][2:] if published["data"].startswith("0x") else published["data"]
+    deposit_data = deposit["data"][2:] if deposit["data"].startswith("0x") else deposit["data"]
+    record = {
+        "transactionHash": tx,
+        "headerDigest": published["topics"][1],
+        "family": family,
+        "windowId": published["topics"][3],
+        "segmentIndex": word(published["data"], 0),
+        "claimTreeRoot": "0x" + data[64:128],
+        "count": count,
+        "endCheckpointId": end_id,
+        "depositOpeningDigest": deposit["topics"][1],
+        "endCount": word(deposit["data"], 0),
+        "endRoot": "0x" + deposit_data[64:128],
+        "lastFinalizedCheckpointId": finalized,
+    }
+    with open(out_path, "w") as handle:
+        json.dump(record, handle)
+    sys.exit(0)
+sys.exit(1)
+PY
+  }
+
+  wait_for "DepositAggregateApplied and InclusionAggregateRootPublished" bridge_window_published
+  log "  header=$(jq -r '.headerDigest' "$RESULT_DIR/bridge-window.json") family=$(jq -r '.family' "$RESULT_DIR/bridge-window.json") count=$(jq -r '.count' "$RESULT_DIR/bridge-window.json") endCheckpointId=$(jq -r '.endCheckpointId' "$RESULT_DIR/bridge-window.json")"
+  ok "applyBridgeWindow published the withdrawal header"
 
   local pending claimable
   wait_for "pending withdrawal registered" "
