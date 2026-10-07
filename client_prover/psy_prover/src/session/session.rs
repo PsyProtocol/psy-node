@@ -1181,6 +1181,8 @@ pub struct EndCapContractSlotUpdate {
     pub new_value: u64,
 }
 
+const USER_SESSION_SHARDS: usize = 4096;
+
 #[derive(Debug, thiserror::Error)]
 #[error("end cap submission rejected after proving deterministic leaf {end_user_leaf_hash}: {source}")]
 pub struct EndCapSubmissionError {
@@ -2564,7 +2566,10 @@ impl WalletSession {
             st_provider,
             #[cfg(not(target_arch = "wasm32"))]
             local_proving_job_manager: JobManager::empty(),
-            user_session_mgrs: DashMap::new(),
+            // Proving holds a shard's write lock across awaits, so two users in one
+            // shard prove one after the other. The default shard count (4x CPUs)
+            // makes that likely for a server signing for ten operators at once.
+            user_session_mgrs: DashMap::with_shard_amount(USER_SESSION_SHARDS),
         })
     }
 
