@@ -2165,6 +2165,7 @@ mod registration_checkpoint_tests {
             st_provider: provider,
             local_proving_job_manager: JobManager::empty(),
             user_session_mgrs: DashMap::new(),
+            sign_while_finalizing: false,
         }
     }
 

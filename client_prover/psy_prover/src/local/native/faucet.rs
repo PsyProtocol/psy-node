@@ -1087,7 +1087,9 @@ mod tests {
             wallet_session,
             claim_records: DashMap::new(),
             recipient_locks: DashSet::new(),
-            operator_locks: DashSet::new(),
+            operator_pool: OperatorPool::new(1, Duration::from_secs(120)),
+            operator_wait: Duration::ZERO,
+            claim_counter: AtomicU64::new(0),
             window_checkpoints: 10,
             turnstile_secret: turnstile_secret.map(str::to_string),
             require_turnstile,
@@ -1113,7 +1115,7 @@ mod tests {
                 .await
                 .expect("offline wallet session should initialize"),
         );
-        let service = offline_service(wallet_session.clone(), None, false, None, &[]);
+        let service = Arc::new(offline_service(wallet_session.clone(), None, false, None, &[]));
 
         let public_config = service.public_config();
         assert!(public_config.enabled);
@@ -1183,7 +1185,7 @@ mod tests {
         );
         offline::set_offline_responses(&responses, &chain).expect("offline chain rules must install");
 
-        let mut service = offline_service(wallet_session, None, false, None, &[]);
+        let service = Arc::new(offline_service(wallet_session.clone(), None, false, None, &[]));
 
         // a previously recorded claim for this window replays instead of
         // re-submitting
@@ -1202,10 +1204,10 @@ mod tests {
         assert_eq!(replayed.operator_user_id, 7);
 
         // every operator already mid-submit: nothing is tried
-        service.operator_locks.insert(7);
+        let lease = service.operator_pool.try_acquire(&[]).unwrap();
         let busy = service.claim_for_recipient(claim_request(9)).await.err().unwrap();
         assert!(busy.message().contains("all faucet operators are busy"));
-        service.operator_locks.remove(&7);
+        drop(lease);
 
         // the unregistered operator key fails the contract call, surfacing as
         // the operator-submit error
@@ -1213,8 +1215,9 @@ mod tests {
         assert!(failed.message().contains("faucet operator submit failed"));
 
         // with no operators at all the service refuses up front
-        service.operators.clear();
-        let empty = service.claim(claim_request(11)).await.err().unwrap();
+        let mut empty_service = offline_service(wallet_session, None, false, None, &[]);
+        empty_service.operators.clear();
+        let empty = Arc::new(empty_service).claim(claim_request(11)).await.err().unwrap();
         assert!(empty.message().contains("no faucet operators configured"));
     }
 
@@ -1362,6 +1365,7 @@ mod tests {
             user_id: offline::OFFLINE_USER_ID,
             public_key,
         };
+        let service = Arc::new(service);
 
         // the operator proves the claim call and the submit succeeds: the
         // response reports a fresh claim for this window and records it
@@ -1372,6 +1376,16 @@ mod tests {
         assert_eq!(completed.amount, "500");
         assert!(!completed.tx_hash.is_empty());
         assert!(service.claim_records.get(&(12, 3)).is_some());
+
+        // The mock submit does not advance its leaf. Model inclusion before
+        // reusing the operator for the independent rejection path below.
+        let pending = service.operator_pool.pending();
+        assert_eq!(pending.len(), 1);
+        let (index, pending) = pending[0];
+        assert_eq!(
+            service.operator_pool.settle(index, pending, Some(pending.end_user_leaf_hash), Instant::now()),
+            Some(Settle::Included)
+        );
 
         // a new recipient in the same window hits the chain's already-claimed
         // rejection, which the service reports after trying every operator
