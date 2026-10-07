@@ -1413,9 +1413,10 @@ where
     ) -> anyhow::Result<(u64, DPNFunctionCircuitDefinition)> {
         let cache_method = method_name.clone();
         let cache_key = crate::contract_fn_cache::Method::Name(&cache_method);
-        if let Some(resolved) = self.contract_fn_cache.resolved(contract_id, contract_code, cache_key) {
-            return Ok(resolved);
-        }
+        let generation = match self.contract_fn_cache.resolved(contract_id, contract_code, cache_key) {
+            Ok(resolved) => return Ok(resolved),
+            Err(generation) => generation,
+        };
         tracing::info!("resolve method `{}` of contract {}", method_name, contract_id);
         let response = psy_rpc_call_back!(
             self,
@@ -1431,7 +1432,7 @@ where
             ResponseResult::Success((fn_id, circuit_def)) => {
                 tracing::info!("get fn id `{}` of contract {}", fn_id, contract_id);
                 self.contract_fn_cache
-                    .store_resolved(contract_id, contract_code, cache_key, (fn_id, circuit_def.clone()));
+                    .store_resolved(contract_id, generation, cache_key, (fn_id, circuit_def.clone()));
                 Ok((fn_id, circuit_def))
             }
             ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
@@ -1445,9 +1446,10 @@ where
         method_id: u32,
     ) -> anyhow::Result<(u64, DPNFunctionCircuitDefinition)> {
         let cache_key = crate::contract_fn_cache::Method::Id(method_id);
-        if let Some(resolved) = self.contract_fn_cache.resolved(contract_id, contract_code, cache_key) {
-            return Ok(resolved);
-        }
+        let generation = match self.contract_fn_cache.resolved(contract_id, contract_code, cache_key) {
+            Ok(resolved) => return Ok(resolved),
+            Err(generation) => generation,
+        };
         tracing::info!("resolve method `{}` of contract {}", method_id, contract_id);
         let response = psy_rpc_call_back!(
             self,
@@ -1463,7 +1465,7 @@ where
             ResponseResult::Success((fn_id, circuit_def)) => {
                 tracing::info!("get fn id `{}` of contract {}", fn_id, contract_id);
                 self.contract_fn_cache
-                    .store_resolved(contract_id, contract_code, cache_key, (fn_id, circuit_def.clone()));
+                    .store_resolved(contract_id, generation, cache_key, (fn_id, circuit_def.clone()));
                 Ok((fn_id, circuit_def))
             }
             ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
@@ -1471,9 +1473,10 @@ where
     }
 
     async fn get_contract_method_common_data(&self, contract_id: u64, fn_id: u32) -> anyhow::Result<(QHashOut<C::F>, VerifierOnlyCircuitData<C, D>)> {
-        if let Some(common_data) = self.contract_fn_cache.common_data(contract_id, fn_id) {
-            return Ok(common_data);
-        }
+        let generation = match self.contract_fn_cache.common_data(contract_id, fn_id) {
+            Ok(common_data) => return Ok(common_data),
+            Err(generation) => generation,
+        };
         tracing::info!("get method `{}` common data of contract {}", fn_id, contract_id);
         let response = psy_rpc_call_back!(
             self,
@@ -1491,7 +1494,9 @@ where
                     serde_json::to_string(&data.verifier_config)?,
                 );
                 let common_data = (data.fingerprint, data.verifier_config.to_verifier_data());
-                self.contract_fn_cache.store_common_data(contract_id, fn_id, common_data.clone());
+                if let Some(generation) = generation {
+                    self.contract_fn_cache.store_common_data(contract_id, generation, fn_id, common_data.clone());
+                }
                 Ok(common_data)
             }
             ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
