@@ -374,3 +374,8 @@ plonky2 = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9
 plonky2_field = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
 plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
 plonky2_util = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+
+# Devnet-only callback fix; remove this local patch and adopt a reviewed Git revision before release.
+[patch."ssh://git@github.com/PsyProtocol/gnark-plonky2-verifier.git"]
+gnark-plonky2-verifier-ffi = { path = "../../gnark-plonky2-verifier/ffi" }
+gnark-plonky2-wrapper = { path = "../../gnark-plonky2-verifier/prover" }
