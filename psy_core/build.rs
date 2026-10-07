@@ -12,8 +12,8 @@ fn main() {
     let mut constants = String::new();
     for (network, name) in [
         ("localhost", "PSY_CHAIN_ID_LOCAL_DEVNET"),
-        ("sepolia", "PSY_CHAIN_ID_PSY_PUBLIC_TESTNET"),
-        ("ethereum", "PSY_CHAIN_ID_PSY_MAINNET"),
+        ("testnet", "PSY_CHAIN_ID_PSY_PUBLIC_TESTNET"),
+        ("mainnet", "PSY_CHAIN_ID_PSY_MAINNET"),
     ] {
         let value = config["networks"][network]["magic"].as_str()
             .unwrap_or_else(|| panic!("Missing magic for network {network}"));
