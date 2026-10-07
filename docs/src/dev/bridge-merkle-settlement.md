@@ -1,10 +1,10 @@
-# Bridge Merkle Settlement
+# Bridge Window Finalization
 
 > Date: 2026-10-06. Status: **Normative one-session credit contract — not implementation-ready and not activated**. `RewardSessionStatement` is the session public-input statement. One credit and one full payment exist per `(economic_domain, source_checkpoint_id, user_id)`. A reward session is local to that triple: its job nullifier is temporary across that session's steps and is not a persistent per-job bitmap. There is no balance carry, debit, ticket registry, seventh checkpoint root, or global persistent job-nullifier root. `RewardSessionCircuit` in `reward_session.rs` is the exported session constructor. No measurement, activation, migration, or independent approval is claimed.
 
 ## Terminology and Abbreviations
 
-`TERMINOLOGY.md` owns spellings. This document owns the settlement contract. A source citation describes existing behavior; a **proposed** declaration specifies the replacement and is not a claim that the declaration exists.
+`TERMINOLOGY.md` owns spellings. This document owns the window-finalization contract. A source citation describes existing behavior; a **proposed** declaration specifies the replacement and is not a claim that the declaration exists.
 
 | Term | Definition |
 |---|---|
@@ -198,7 +198,7 @@ The adapter unconditionally verifies the level-8 root under descriptor 8 and one
 
 The adapter starts from the zero Keccak state and absorbs 288 bytes: the 32-byte Opening domain digest plus the 256-byte opening header, in calls of 136, 136, and 16 bytes. Header order is config hash, window id, ABI end id, four ABI end-root words, and ABI total count. That state connects to the root incoming stream. The root outgoing stream is finalized once. Publication stays `[1,7,3,0] || opening_digest[8] || claim_tree_root[8] || header_digest[8]`.
 
-`settlement_digest` still hashes one monolithic F4 preimage, including `batch_root`, inside `SettlementAggregateCircuit`. That cost is unresolved. It is not a stream carry and it is not a hierarchy node. No measured settlement-proving cost is claimed. The reward hierarchy and this settlement hash are separate.
+`window_finalization_digest` hashes one monolithic F4 preimage, including `batch_root`, inside `WindowFinalizationCircuit`: `K(D(B) || config_hash || W(end_id) || H4(end_root) || aDigest || global roots || W(n) || slots || endpoints || W(w) || W(r) || ledger roots || economic_domain || W(batch_count) || batch_root)`. The direct standalone 32-byte `window_id` word is removed from this parent preimage. `aDigest` binds `window_id` indirectly because the deposit opening digest includes that word. A nonempty `batch_root` binds it indirectly through `batch_commit`. An empty `batch_root` is independent of `window_id`; `aDigest` and the L1 equality of the two opening window ids still bind it. That cost is unresolved. It is not a stream carry and it is not a hierarchy node. No measured window-finalization proving cost is claimed. The reward hierarchy and this digest are separate.
 
 ### 3. One-session credit relation
 
@@ -317,8 +317,8 @@ The approved publication function is:
 function applyBridgeWindow(
     uint256[8] calldata depositProof,
     bytes calldata depositOpening,
-    uint256[8] calldata settlementProof,
-    bytes calldata settlementOpening
+    uint256[8] calldata windowFinalizationProof,
+    bytes calldata windowFinalizationOpening
 ) external;
 function claimReward(bytes32 headerDigest, uint32 ordinal,
     bytes calldata leafBytes, bytes32[] calldata siblings) external;
@@ -326,7 +326,7 @@ function claimAggregateWithdrawal(bytes32 headerDigest, uint32 ordinal,
     bytes calldata leafBytes, bytes32[] calldata siblings) external;
 ```
 
-`depositProof` and `depositOpening` are outer proof A and its complete opening. `settlementProof` and `settlementOpening` are outer proof B and its complete opening. Proof B is mandatory even when payouts are empty. This document does not define the byte encoding of either opening. The earlier `applyBridgeWindow` with per-segment proofs, manifests, and partial openings is rejected, not retained. Both openings are complete. A segmented partial-opening flow is not approved for proof A or proof B. The pull claims stay leaf plus Keccak siblings and do not take a Groth16 proof. Both claim paths use `nonReentrant`; publication remains `onlyProposer`.
+`depositProof` and `depositOpening` are outer proof A and its complete opening. `windowFinalizationProof` and `windowFinalizationOpening` are outer proof B and its complete opening. Proof B is mandatory even when payouts are empty. This document does not define the byte encoding of either opening. The earlier `applyBridgeWindow` with per-segment proofs, manifests, and partial openings is rejected, not retained. Both openings are complete. A segmented partial-opening flow is not approved for proof A or proof B. The pull claims stay leaf plus Keccak siblings and do not take a Groth16 proof. Both claim paths use `nonReentrant`; publication remains `onlyProposer`.
 
 Publication verifies proof A and mandatory proof B, then writes deposit, registry, progress, and cursor state atomically. Any failure reverts the entire transaction. No transfer and no consumption-key write occurs during publication. Publication does not write a persistent job-nullifier root.
 
@@ -584,7 +584,7 @@ pub fn read_hash4(words: &[u64], encoding: Hash4Encoding)
 
 `build_inclusion_aggregate_tree` validates power-of-two capacity, depth<=17 and count<=capacity, fills real/padding leaves using section 4, then hashes each parent exactly once from bottom to top; errors use existing `InvalidCount`. Output length is `2*B-1`, root index zero. It has no I/O or proof side effect. `read_hash4` checks selected width 4 or 8, validates u32 halves when selected, reconstructs each limb, checks `<p` and rejects without decoder fallback. Existing `BridgeProofError` and `Result` are at `bridge_aggregate.rs:25-50`.
 
-`StateManager.applyBridgeWindow` verifies outer proof A against the complete `depositOpening` and mandatory outer proof B against the complete `settlementOpening`, then calls restricted `Bridge.applyDepositAggregate(bytes)` and registry/progress updates. Preconditions, failure rollback and the no-transfer postcondition are section 6. Each outer proof uses:
+`StateManager.applyBridgeWindow` verifies outer proof A against the complete `depositOpening` and mandatory outer proof B against the complete `windowFinalizationOpening`, then calls restricted `Bridge.applyDepositAggregate(bytes)` and registry/progress updates. Preconditions, failure rollback and the no-transfer postcondition are section 6. Each outer proof uses:
 
 ```solidity
 function verifyProof(uint256[8] calldata proof, uint256[2] calldata publicInputs) external view;
@@ -596,7 +596,7 @@ For proof A, those two public inputs are the two uint128 halves. The inner depos
 
 1. **User proving:** include at most `k` jobs of one source and user per step. Verify the own-user predecessor and any actual global predecessor, bind that source, open each included job, and update its session-local zero-to-one path. Add the checked amount and count from zero and roll the jobs commitment from the session seed. Repeat until the selected jobs are included. The terminal amount is `W`. Reject overflow, the wrong predecessor, another source or user, a duplicate key, or capacity excess. Jobs not selected are forfeited. The admission-history connection remains the section 3 gap.
 2. **Segment construction is not approved for proof A or proof B.** The earlier per-family ordinal loop, partial opening, and per-segment inclusion proof are not the approved publication contract. Each outer proof takes one complete opening.
-3. **Publication:** wait until no Sending or Submitted transaction remains for the destination. Preflight `applyBridgeWindow` with proof A, its complete `depositOpening`, mandatory proof B, and its complete `settlementOpening`. Save Sending, broadcast, and save the hash. Observe finalized evidence until it is classified. An indeterminate outcome stays retained and stops further submission.
+3. **Publication:** wait until no Sending or Submitted transaction remains for the destination. Preflight `applyBridgeWindow` with proof A, its complete `depositOpening`, mandatory proof B, and its complete `windowFinalizationOpening`. Save Sending, broadcast, and save the hash. Observe finalized evidence until it is classified. An indeterminate outcome stays retained and stops further submission.
 4. **Pull:** fetch one published leaf and path, verify membership locally for user feedback, and submit the exact claim. Classify the canonical event and state. A failed transfer leaves the consumption key unset. A repeated `(economic_domain,source_checkpoint_id,user_id)` rejects. A later source is a different key and pays its own full `W`, not a delta.
 
 ## Module Changes
@@ -752,7 +752,7 @@ F4, F1, and F5 below are the design-gate quotes. F4 replaces the section 8 item 
 
 **F1 status read, proposed.** Evidence from agentlo: `RewardPublicationArtifact` is relayer-local (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:584-587`); the dapp and psy-wallet have no reward-status read; `psy-dapp/apps/bridge/src/pages/TransactionDetailPage.tsx:2519-2521` is withdrawal registration only. After merge, the dapp needs a proposed read that distinguishes reward publication, destination settlement, and reward payment. The read is keyed by config, window, and destination and by the source-checkpoint/user credit identity. Success for any of the three requires its own authenticated finalized receipt and state evidence. Publication is not settlement, and settlement is not payment. Pending, failed, and unknown are not success. The freshness declaration above is checked before proving or sending; this read is not that check and is not authority to prove or send. This note specifies no route and no response schema. Both remain subject to coordinated API review, and this note does not implement the read.
 
-**F5, commitment-free native mode.** The native mode is commitment-free BN254 only. The contract shape is `verifyProof(uint256[8] calldata proof, uint256[2] calldata publicInputs)`. Setup and prove reject a commitment index, commitment metadata, `Commitment`, and a non-canonical `CommitmentPok`. Revision `53bd550dba52b1a5be8832ecfa095f94341273f2` is the historical baseline that did not provide this mode: its cached `ffi/src/lib.rs` has no `DigestArtifact` enum. The current root pin is `83f9e671eb77d92bc9463aa4370e3ab32f4fd9c6` for both `gnark-plonky2-verifier-ffi` and `gnark-plonky2-wrapper` (`Cargo.toml`). That pin is a source checkpoint, not a native-behavior pass. A local unpinned checkout is not the compiled dependency. Native implementation of this mode has not passed. The fork fold-in commits the full `DigestArtifact` enum and the five functions `setup_digest_bits`, `generate_digest_bits_proof`, `setup_finalize`, `read_finalize_setup_identity`, and `generate_finalize_proof`, together with this commitment-free rule. The approved settlement statement uses prefix `[2,12,2,0]`: 12 public inputs and 256 wrapper bits. A historical 28-public-input, 768-bit identity is rejected by width, prefix, source, and verifier identity. The enum mapping remains a fork-review decision. This quote assigns no discriminant. `identity_hash` accepting `1`, `2`, and `3`, and the adapter names `DepositAggregate` and `SettlementAggregate`, are not that mapping. Prefix `[2,12,2,0]` is not an enum value. Mapping and consolidation run in parallel with merge and are not a checkpoint or merge blocker. Native delivery must implement and review the missing APIs against the current pinned revision. This correction authorizes no history rewrite, pin change, or setup.
+**F5, commitment-free native mode.** The native mode is commitment-free BN254 only. The contract shape is `verifyProof(uint256[8] calldata proof, uint256[2] calldata publicInputs)`. Setup and prove reject a commitment index, commitment metadata, `Commitment`, and a non-canonical `CommitmentPok`. Revision `53bd550dba52b1a5be8832ecfa095f94341273f2` is the historical baseline that did not provide this mode: its cached `ffi/src/lib.rs` has no `DigestArtifact` enum. The current root pin is `83f9e671eb77d92bc9463aa4370e3ab32f4fd9c6` for both `gnark-plonky2-verifier-ffi` and `gnark-plonky2-wrapper` (`Cargo.toml`). That pin is a source checkpoint, not a native-behavior pass. A local unpinned checkout is not the compiled dependency. Native implementation of this mode has not passed. The fork fold-in commits the full `DigestArtifact` enum and the five functions `setup_digest_bits`, `generate_digest_bits_proof`, `setup_finalize`, `read_finalize_setup_identity`, and `generate_finalize_proof`, together with this commitment-free rule. The approved window-finalization statement uses prefix `[2,12,2,0]`: 12 public inputs and 256 wrapper bits. A historical 28-public-input, 768-bit identity is rejected by width, prefix, source, and verifier identity. The enum mapping remains a fork-review decision. This quote assigns no discriminant. `identity_hash` accepting `1`, `2`, and `3`, and the adapter names `DepositAggregate` and `WindowFinalization`, are not that mapping. Prefix `[2,12,2,0]` is not an enum value. Mapping and consolidation run in parallel with merge and are not a checkpoint or merge blocker. Native delivery must implement and review the missing APIs against the current pinned revision. This correction authorizes no history rewrite, pin change, or setup.
 
 ## Review and Activation Boundary
 

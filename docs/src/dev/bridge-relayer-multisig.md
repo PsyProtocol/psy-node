@@ -695,7 +695,7 @@ The test deletes only `relayer_archive/acceptance-original-pending.json` and kil
 
 `guardian_acceptance` does not accept an aggregate proof. A G1 pass is not aggregate acceptance.
 
-The acceptance contract is [Bridge Merkle Settlement](bridge-merkle-settlement.md) §8, [Acceptance and resource bounds](bridge-merkle-settlement.md#8-acceptance-and-resource-bounds). [bridge-proof-aggregation.md](bridge-proof-aggregation.md) names that document as the design authority and holds no separate contract. Section 8 records its QA list as unexecuted. This runbook does not add a procedure for that list.
+The acceptance contract is [Bridge Window Finalization](bridge-merkle-settlement.md) §8, [Acceptance and resource bounds](bridge-merkle-settlement.md#8-acceptance-and-resource-bounds). [bridge-proof-aggregation.md](bridge-proof-aggregation.md) names that document as the design authority and holds no separate contract. Section 8 records its QA list as unexecuted. This runbook does not add a procedure for that list.
 
 The settlement CLI surface is two subcommands of `psy_relayer_cli`. Neither is invoked by `guardian_acceptance`.
 

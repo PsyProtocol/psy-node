@@ -50,7 +50,7 @@ Local proving service for UPS, contract calls, signatures, aggregation trees, an
 
 Instances select `user`, `system`, or `all` through `--role` (`PROVE_PROXY_ROLE`, default `user`). User instances construct the UPS provider; system instances construct the system provider; `all` registers both. Methods outside the selected role are not registered.
 
-Every role exposes `psy_get_prove_proxy_role`, returning `role`, `user_methods`, and `system_methods`. Wallet-facing configuration uses `prove_proxy_url`; `system_prove_proxy_url` identifies the separate system pool. Role discovery describes the registered method family, not support for DepositAggregate/SettlementAggregate identities or mandatory A/B publication. The aggregate relayer validates its local reviewed artifact set independently.
+Every role exposes `psy_get_prove_proxy_role`, returning `role`, `user_methods`, and `system_methods`. Wallet-facing configuration uses `prove_proxy_url`; `system_prove_proxy_url` identifies the separate system pool. Role discovery describes the registered method family, not support for DepositAggregate/WindowFinalization identities or mandatory A/B publication. The aggregate relayer validates its local reviewed artifact set independently.
 
 ## Software-defined circuits
 

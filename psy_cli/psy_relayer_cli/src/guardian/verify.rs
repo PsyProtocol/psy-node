@@ -362,7 +362,7 @@ pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, 
     if !traces_equal(&supplied,&replayed)? { return Err(GuardianSignError::StateMismatch.into()); }
     verify_trace_contracts(context.history,authorization,&replayed)?;
     let fees: Vec<_> = replayed.steps.iter().filter_map(|step|if let TraceStep::BurnFee(step)=step {Some(step)} else {None}).collect();
-    if fees.len()!=1 || fees[0].contract_id!=0 || fees[0].method_id!=psy_config::TOKEN_SIMPLE_BURN_METHOD_ID || fees[0].method_name!="simple_burn" { return Err(GuardianSignError::UnsupportedCall.into()); }
+    if fees.len()!=1 || fees[0].contract_id!=0 || fees[0].method_id!=psy_config::TOKEN_BURN_METHOD_ID || fees[0].method_name!="burn" { return Err(GuardianSignError::UnsupportedCall.into()); }
     let replayed_witness = trace_policy(&replayed,authorization)?;
     let (current_policy,ending_policy) = replayed_witness.policies().map_err(|_|GuardianSignError::PolicyMismatch)?;
     let message = Hash256::from(replayed.finalization.sig_hash).0;

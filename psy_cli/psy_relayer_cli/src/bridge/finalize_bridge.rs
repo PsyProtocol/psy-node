@@ -11,7 +11,7 @@ use crate::bridge::l1_client::L1Client;
 use crate::bridge::l1_signer::load_l1_wallet;
 
 sol! {
-    function applyBridgeWindow(uint256[8] depositProof, bytes depositOpening, uint256[8] settlementProof, bytes settlementOpening);
+    function applyBridgeWindow(uint256[8] depositProof, bytes depositOpening, uint256[8] windowFinalizationProof, bytes windowFinalizationOpening);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -19,8 +19,8 @@ sol! {
 pub(crate) struct BridgeWindowCall {
     pub deposit_proof: [U256; 8],
     pub deposit_opening: Bytes,
-    pub settlement_proof: [U256; 8],
-    pub settlement_opening: Bytes,
+    pub window_finalization_proof: [U256; 8],
+    pub window_finalization_opening: Bytes,
 }
 
 impl BridgeWindowCall {
@@ -28,8 +28,8 @@ impl BridgeWindowCall {
         applyBridgeWindowCall {
             depositProof: self.deposit_proof,
             depositOpening: self.deposit_opening.clone(),
-            settlementProof: self.settlement_proof,
-            settlementOpening: self.settlement_opening.clone(),
+            windowFinalizationProof: self.window_finalization_proof,
+            windowFinalizationOpening: self.window_finalization_opening.clone(),
         }.abi_encode().into()
     }
 }

@@ -10,7 +10,7 @@ use plonky2::{
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
 };
-use psy_client_data::bridge_aggregate::{DepositAggregateOpening, Hash4, NetworkConfig, SettlementOpening, SourceCheckpointRewardOpening, WithdrawalAggregateOpening, MAX_LEAVES};
+use psy_client_data::bridge_aggregate::{DepositAggregateOpening, Hash4, NetworkConfig, WindowFinalizationOpening, SourceCheckpointRewardOpening, WithdrawalAggregateOpening, MAX_LEAVES};
 use psy_plonky2_basic_helpers::builder::{comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers};
 use psy_plonky2_common_circuits::{
     bridge::aggregate_commitment::{self as hash, keccak_prefix_words, Bytes32Target},
@@ -21,11 +21,11 @@ use tiny_keccak::Hasher as _;
 use super::inclusion_aggregate::set_bytes;
 
 type F = GoldilocksField;
-pub const SETTLEMENT_AGGREGATE_PI_LEN: usize = 12;
+pub const WINDOW_FINALIZATION_PI_LEN: usize = 12;
 const MAX_SOURCE_CHAINS: usize = 8;
 const MAX_PAYOUTS: usize = MAX_LEAVES;
 
-pub struct SettlementAggregateCircuit<C: GenericConfig<D, F = F>, const D: usize>
+pub struct WindowFinalizationCircuit<C: GenericConfig<D, F = F>, const D: usize>
 where
     F: Extendable<D>,
 {
@@ -57,7 +57,7 @@ where
     deposit_digest: Bytes32Target,
 }
 
-impl<C: GenericConfig<D, F = F>, const D: usize> SettlementAggregateCircuit<C, D>
+impl<C: GenericConfig<D, F = F>, const D: usize> WindowFinalizationCircuit<C, D>
 where
     F: Extendable<D>,
     C::Hasher: AlgebraicHasher<F>,
@@ -131,11 +131,11 @@ where
         connect_common_finalization(&mut builder, &finalizations, chain_count);
         let deposit_digest = builder.add_virtual_target_arr();
         for word in deposit_digest { builder.range_check(word, 32); }
-        let (withdrawal_digest, withdrawal_count, withdrawal_leaf_words) = family_opening(
+        let (withdrawal_digest, withdrawal_count, withdrawal_leaf_words) = build_opening_digest(
             &mut builder, b"PsyBridge/TwoArtifact/1/WithdrawalBatch", config_hash, window_id, end_id, end_root,
             Some(&withdrawal_roots),
         );
-        let (reward_digest, reward_count, reward_leaf_words) = family_opening(
+        let (reward_digest, reward_count, reward_leaf_words) = build_opening_digest(
             &mut builder, b"PsyBridge/SourceCheckpointReward/1/Opening", config_hash, window_id, end_id, end_root, None,
         );
         connect_child_digest(&mut builder, &withdrawal, &withdrawal_digest);
@@ -151,7 +151,7 @@ where
         for (old, new) in old_reward_ledger_root.iter().zip(new_reward_ledger_root) {
             builder.connect_if_true(reward_empty, *old, new);
         }
-        let opening_digest = settlement_digest(&mut builder, chain_count, config_hash, window_id, end_id, end_root,
+        let opening_digest = window_finalization_digest(&mut builder, chain_count, config_hash, window_id, end_id, end_root,
             deposit_digest, global_deposit_root, global_withdrawal_root, &start_roots, &checkpoint_counts,
             &deposit_roots, &deposit_counts, &withdrawal_roots, withdrawal_count, reward_count,
             old_reward_ledger_root, new_reward_ledger_root, economic_domain, &withdrawal_leaf_words, &reward_leaf_words);
@@ -159,7 +159,7 @@ where
         builder.register_public_inputs(&prefix);
         builder.register_public_inputs(&opening_digest);
         let circuit_data = builder.build::<C>();
-        anyhow::ensure!(circuit_data.common.num_public_inputs == SETTLEMENT_AGGREGATE_PI_LEN, "settlement public width mismatch");
+        anyhow::ensure!(circuit_data.common.num_public_inputs == WINDOW_FINALIZATION_PI_LEN, "window finalization public width mismatch");
         Ok(Self { circuit_data, finalizations, withdrawal, reward, opening_digest, withdrawal_digest, reward_digest,
             config_hash, window_id, end_id, end_root, global_deposit_root, global_withdrawal_root, start_roots,
             checkpoint_counts, deposit_roots, deposit_counts, withdrawal_roots, old_reward_ledger_root,
@@ -168,47 +168,47 @@ where
     }
 
     pub fn prove(
-        &self, config: &NetworkConfig, deposit: &DepositAggregateOpening, settlement: &SettlementOpening,
+        &self, config: &NetworkConfig, deposit: &DepositAggregateOpening, window_finalization: &WindowFinalizationOpening,
         finalizations: &[ProofWithPublicInputs<F, C, D>],
         withdrawal: &ProofWithPublicInputs<F, C, D>, reward: &ProofWithPublicInputs<F, C, D>,
     ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
         anyhow::ensure!(finalizations.len() == self.finalizations.len(), "configured finalization count mismatch");
-        let digest = settlement.opening_digest(config, deposit)?;
+        let digest = window_finalization.opening_digest(config, deposit)?;
         let mut witness = PartialWitness::new();
-        set_bytes(&mut witness, &self.config_hash, &settlement.config_hash)?;
-        set_bytes(&mut witness, &self.window_id, &settlement.window_id)?;
-        witness.set_target(self.end_id, F::from_canonical_u64(settlement.end_checkpoint_id)).context("end id")?;
-        set_hash4(&mut witness, self.end_root, settlement.end_checkpoint_root)?;
-        set_u32x8(&mut witness, self.global_deposit_root, settlement.global_deposit_root)?;
-        set_u32x8(&mut witness, self.global_withdrawal_root, settlement.global_withdrawal_root)?;
-        for (index, slot) in settlement.finalizations.iter().enumerate() {
+        set_bytes(&mut witness, &self.config_hash, &window_finalization.config_hash)?;
+        set_bytes(&mut witness, &self.window_id, &window_finalization.window_id)?;
+        witness.set_target(self.end_id, F::from_canonical_u64(window_finalization.end_checkpoint_id)).context("end id")?;
+        set_hash4(&mut witness, self.end_root, window_finalization.end_checkpoint_root)?;
+        set_u32x8(&mut witness, self.global_deposit_root, window_finalization.global_deposit_root)?;
+        set_u32x8(&mut witness, self.global_withdrawal_root, window_finalization.global_withdrawal_root)?;
+        for (index, slot) in window_finalization.finalizations.iter().enumerate() {
             set_hash4(&mut witness, self.start_roots[index], slot.start_checkpoint_root)?;
             witness.set_target(self.checkpoint_counts[index], F::from_canonical_u32(slot.checkpoint_count))?;
         }
-        for (index, endpoint) in settlement.endpoints.iter().enumerate() {
+        for (index, endpoint) in window_finalization.endpoints.iter().enumerate() {
             set_hash4(&mut witness, self.deposit_roots[index], endpoint.deposit_root)?;
             witness.set_target(self.deposit_counts[index], F::from_canonical_u32(endpoint.deposit_count))?;
             set_hash4(&mut witness, self.withdrawal_roots[index], endpoint.withdrawal_root)?;
         }
-        set_hash4(&mut witness, self.old_reward_ledger_root, settlement.old_reward_ledger_root)?;
-        set_hash4(&mut witness, self.new_reward_ledger_root, settlement.new_reward_ledger_root)?;
-        set_bytes(&mut witness, &self.economic_domain, &settlement.economic_domain)?;
-        witness.set_target(self.withdrawal_count, F::from_canonical_usize(settlement.withdrawals.len()))?;
-        witness.set_target(self.reward_count, F::from_canonical_usize(settlement.rewards.len()))?;
-        assign_leaves(&mut witness, &self.withdrawal_leaf_words, &word_leaves(&settlement.withdrawals.iter().map(|leaf| leaf.encode()).collect::<Result<Vec<_>, _>>()?)?)?;
-        assign_leaves(&mut witness, &self.reward_leaf_words, &word_leaves(&settlement.rewards.iter().map(|leaf| leaf.encode()).collect::<Result<Vec<_>, _>>()?)?)?;
+        set_hash4(&mut witness, self.old_reward_ledger_root, window_finalization.old_reward_ledger_root)?;
+        set_hash4(&mut witness, self.new_reward_ledger_root, window_finalization.new_reward_ledger_root)?;
+        set_bytes(&mut witness, &self.economic_domain, &window_finalization.economic_domain)?;
+        witness.set_target(self.withdrawal_count, F::from_canonical_usize(window_finalization.withdrawals.len()))?;
+        witness.set_target(self.reward_count, F::from_canonical_usize(window_finalization.rewards.len()))?;
+        assign_leaves(&mut witness, &self.withdrawal_leaf_words, &word_leaves(&window_finalization.withdrawals.iter().map(|leaf| leaf.encode()).collect::<Result<Vec<_>, _>>()?)?)?;
+        assign_leaves(&mut witness, &self.reward_leaf_words, &word_leaves(&window_finalization.rewards.iter().map(|leaf| leaf.encode()).collect::<Result<Vec<_>, _>>()?)?)?;
         set_bytes(&mut witness, &self.deposit_digest, &deposit.opening_digest(config)?)?;
         let withdrawal_opening = WithdrawalAggregateOpening {
-            config_hash: settlement.config_hash, window_id: settlement.window_id,
-            end_checkpoint_id: settlement.end_checkpoint_id, end_checkpoint_root: settlement.end_checkpoint_root,
-            withdrawal_roots: settlement.endpoints.iter().map(|endpoint| endpoint.withdrawal_root).collect(),
-            withdrawals: settlement.withdrawals.clone(),
+            config_hash: window_finalization.config_hash, window_id: window_finalization.window_id,
+            end_checkpoint_id: window_finalization.end_checkpoint_id, end_checkpoint_root: window_finalization.end_checkpoint_root,
+            withdrawal_roots: window_finalization.endpoints.iter().map(|endpoint| endpoint.withdrawal_root).collect(),
+            withdrawals: window_finalization.withdrawals.clone(),
         };
         set_bytes(&mut witness, &self.withdrawal_digest, &withdrawal_opening.opening_digest(config)?)?;
         let reward_opening = SourceCheckpointRewardOpening {
-            config_hash: settlement.config_hash, window_id: settlement.window_id,
-            end_checkpoint_id: settlement.end_checkpoint_id, end_checkpoint_root: settlement.end_checkpoint_root,
-            leaves: settlement.rewards.clone(),
+            config_hash: window_finalization.config_hash, window_id: window_finalization.window_id,
+            end_checkpoint_id: window_finalization.end_checkpoint_id, end_checkpoint_root: window_finalization.end_checkpoint_root,
+            leaves: window_finalization.rewards.clone(),
         };
         set_bytes(&mut witness, &self.reward_digest, &reward_opening.opening_digest()?)?;
         for (target, proof) in self.finalizations.iter().zip(finalizations) {
@@ -218,7 +218,7 @@ where
         witness.set_proof_with_pis_target(&self.reward, reward).context("reward witness")?;
         let proof = self.circuit_data.prove(witness)?;
         let words = digest.chunks_exact(4).map(|bytes| F::from_canonical_u32(u32::from_be_bytes(bytes.try_into().unwrap())));
-        anyhow::ensure!(proof.public_inputs[4..].iter().copied().eq(words), "settlement public digest differs from opening");
+        anyhow::ensure!(proof.public_inputs[4..].iter().copied().eq(words), "window finalization public digest differs from opening");
         Ok(proof)
     }
 
@@ -259,7 +259,7 @@ where
     for (child, family) in proof.public_inputs[4..12].iter().zip(digest) { builder.connect(*child, *family); }
 }
 
-fn family_opening<const D: usize>(
+fn build_opening_digest<const D: usize>(
     builder: &mut CircuitBuilder<F, D>, domain_label: &[u8], config_hash: Bytes32Target, window_id: Bytes32Target,
     end_id: Target, end_root: [Target; 4], roots: Option<&[[Target; 4]]>,
 ) -> (Bytes32Target, Target, Vec<Vec<Target>>)
@@ -316,7 +316,7 @@ where
     hash::constant_bytes32(builder, digest)
 }
 
-fn settlement_digest<const D: usize>(
+fn window_finalization_digest<const D: usize>(
     builder: &mut CircuitBuilder<F, D>, chain_count: usize, config_hash: Bytes32Target, window_id: Bytes32Target,
     end_id: Target, end_root: [Target; 4], deposit_digest: Bytes32Target, global_deposit_root: [Target; 8],
     global_withdrawal_root: [Target; 8], start_roots: &[[Target; 4]], checkpoint_counts: &[Target],
@@ -327,10 +327,9 @@ fn settlement_digest<const D: usize>(
 where
     F: Extendable<D>,
 {
-    let settlement_domain = domain_bytes(builder, b"PsyBridge/TwoArtifact/2/B");
-    let mut bytes = bytes32_bytes(builder, settlement_domain).to_vec();
+    let window_finalization_domain = domain_bytes(builder, b"PsyBridge/TwoArtifact/2/B");
+    let mut bytes = bytes32_bytes(builder, window_finalization_domain).to_vec();
     bytes.extend(bytes32_bytes(builder, config_hash));
-    bytes.extend(bytes32_bytes(builder, window_id));
     bytes.extend(word_bytes(builder, end_id));
     bytes.extend(hash4_bytes(builder, end_root));
     bytes.extend(bytes32_bytes(builder, deposit_digest));
@@ -661,7 +660,7 @@ fn set_u32x8(witness: &mut PartialWitness<F>, targets: [Target; 8], value: [u32;
 
 fn word_leaves(leaves: &[Vec<u8>]) -> anyhow::Result<Vec<Vec<u8>>> {
     leaves.iter().map(|bytes| {
-        anyhow::ensure!(bytes.len() == 192, "settlement leaf width mismatch");
+        anyhow::ensure!(bytes.len() == 192, "window finalization leaf width mismatch");
         Ok(bytes.clone())
     }).collect()
 }

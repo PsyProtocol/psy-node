@@ -538,7 +538,7 @@ impl WithdrawalAggregateOpening {
 }
 
 pub const MAX_SOURCE_CHAINS: usize = 8;
-pub const SETTLEMENT_OPENING_HEADER_BYTES: usize = 1152;
+pub const WINDOW_FINALIZATION_OPENING_HEADER_BYTES: usize = 1152;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizationSlot {
@@ -554,7 +554,7 @@ pub struct FinalizationEndpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SettlementOpening {
+pub struct WindowFinalizationOpening {
     pub config_hash: Bytes32,
     pub window_id: Bytes32,
     pub end_checkpoint_id: u64,
@@ -607,11 +607,11 @@ impl FinalizationEndpoint {
     }
 }
 
-fn settlement_domain() -> Bytes32 {
+fn window_finalization_domain() -> Bytes32 {
     hash_parts(&[b"PsyBridge/TwoArtifact/2/B"])
 }
 
-fn settlement_tree_domain(label: &[u8]) -> Bytes32 {
+fn window_finalization_tree_domain(label: &[u8]) -> Bytes32 {
     hash_parts(&[b"PsyBridge/TwoArtifact/2/", label])
 }
 
@@ -619,7 +619,7 @@ fn chunk_count(leaves: usize) -> usize {
     leaves.div_ceil(AGGREGATE_SIZE)
 }
 
-impl SettlementOpening {
+impl WindowFinalizationOpening {
     fn validate_structure(&self) -> Result<()> {
         validate_hash4(&self.end_checkpoint_root)?;
         let chains = self.finalizations.len();
@@ -742,7 +742,7 @@ impl SettlementOpening {
         let mut nodes = Vec::with_capacity(width);
         for ordinal in 0..width {
             if ordinal >= batch_count {
-                nodes.push(hash_parts(&[&settlement_tree_domain(b"Empty"), &word(batch_count as u64), &word(ordinal as u64)]));
+                nodes.push(hash_parts(&[&window_finalization_tree_domain(b"Empty"), &word(batch_count as u64), &word(ordinal as u64)]));
                 continue;
             }
             let (family, first, leaves): (u64, usize, Vec<Vec<u8>>) = if ordinal < withdrawal_chunks {
@@ -756,7 +756,7 @@ impl SettlementOpening {
                     .iter().map(|leaf| leaf.encode()).collect::<Result<_>>()?)
             };
             let mut body = Vec::new();
-            body.extend_from_slice(&settlement_tree_domain(b"Batch"));
+            body.extend_from_slice(&window_finalization_tree_domain(b"Batch"));
             body.extend_from_slice(&self.config_hash);
             body.extend_from_slice(&self.window_id);
             body.extend_from_slice(&word(self.end_checkpoint_id));
@@ -764,14 +764,14 @@ impl SettlementOpening {
             for value in [family, ordinal as u64, first as u64, leaves.len() as u64] { body.extend_from_slice(&word(value)); }
             for leaf in &leaves { body.extend_from_slice(leaf); }
             let batch_commit = hash_parts(&[&body]);
-            nodes.push(hash_parts(&[&settlement_tree_domain(b"Leaf"), &word(batch_count as u64),
+            nodes.push(hash_parts(&[&window_finalization_tree_domain(b"Leaf"), &word(batch_count as u64),
                 &word(ordinal as u64), &word(family), &batch_commit]));
         }
         let mut level = 1u64;
         while nodes.len() > 1 {
             let parents = nodes.len() / 2;
             for index in 0..parents {
-                nodes[index] = hash_parts(&[&settlement_tree_domain(b"Node"), &word(level),
+                nodes[index] = hash_parts(&[&window_finalization_tree_domain(b"Node"), &word(level),
                     &nodes[index * 2], &nodes[index * 2 + 1]]);
             }
             nodes.truncate(parents);
@@ -789,9 +789,8 @@ impl SettlementOpening {
             || self.finalizations.len() != deposit.starts.len()
         { return Err(BridgeProofError::InvalidConfig); }
         let mut body = Vec::new();
-        body.extend_from_slice(&settlement_domain());
+        body.extend_from_slice(&window_finalization_domain());
         body.extend_from_slice(&self.config_hash);
-        body.extend_from_slice(&self.window_id);
         body.extend_from_slice(&word(self.end_checkpoint_id));
         for limb in self.end_checkpoint_root { body.extend_from_slice(&word(limb)); }
         body.extend_from_slice(&deposit.opening_digest(config)?);
@@ -2432,9 +2431,9 @@ mod tests {
         assert_eq!(verify_claim_path(&header, 0, &changed, &path), Err(BridgeProofError::InvalidProof));
     }
 
-    fn settlement(config: &NetworkConfig, rewards: Vec<SourceCheckpointRewardLeaf>) -> SettlementOpening {
+    fn window_finalization(config: &NetworkConfig, rewards: Vec<SourceCheckpointRewardLeaf>) -> WindowFinalizationOpening {
         let deposit = opening(config, 0);
-        SettlementOpening {
+        WindowFinalizationOpening {
             config_hash: deposit.config_hash, window_id: deposit.window_id,
             end_checkpoint_id: deposit.end_checkpoint_id, end_checkpoint_root: deposit.end_checkpoint_root,
             global_deposit_root: [1, 0, 0, 0, 0, 0, 0, 0], global_withdrawal_root: [2, 0, 0, 0, 0, 0, 0, 0],
@@ -2447,23 +2446,23 @@ mod tests {
     }
 
     #[test]
-    fn settlement_opening_roundtrips_exact_length_and_rejects_malformed_input() {
+    fn window_finalization_opening_roundtrips_exact_length_and_rejects_malformed_input() {
         let network = config(2);
         let reward = source_checkpoint_leaf(7, 42);
-        let opening = settlement(&network, vec![reward]);
+        let opening = window_finalization(&network, vec![reward]);
         let bytes = opening.encode().unwrap();
-        assert_eq!(bytes.len(), SETTLEMENT_OPENING_HEADER_BYTES + 448 * 2 + 192);
-        assert_eq!(SettlementOpening::decode(&bytes).unwrap(), opening);
-        assert_eq!(settlement(&network, Vec::new()).encode().unwrap().len(), SETTLEMENT_OPENING_HEADER_BYTES + 448 * 2);
+        assert_eq!(bytes.len(), WINDOW_FINALIZATION_OPENING_HEADER_BYTES + 448 * 2 + 192);
+        assert_eq!(WindowFinalizationOpening::decode(&bytes).unwrap(), opening);
+        assert_eq!(window_finalization(&network, Vec::new()).encode().unwrap().len(), WINDOW_FINALIZATION_OPENING_HEADER_BYTES + 448 * 2);
         for length in [0, 32, bytes.len() - 1] {
-            assert_eq!(SettlementOpening::decode(&bytes[..length]), Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)));
+            assert_eq!(WindowFinalizationOpening::decode(&bytes[..length]), Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)));
         }
         let mut trailing = bytes.clone(); trailing.push(0);
-        assert_eq!(SettlementOpening::decode(&trailing), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
-        let mut wide = bytes.clone(); wide[95] = 1;
-        assert_eq!(SettlementOpening::decode(&wide), Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+        assert_eq!(WindowFinalizationOpening::decode(&trailing), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
+        let mut wide = bytes.clone(); wide[64] = 1;
+        assert_eq!(WindowFinalizationOpening::decode(&wide), Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
         let mut felt = bytes.clone(); felt[160..192].copy_from_slice(&word(GOLDILOCKS_MODULUS));
-        assert_eq!(SettlementOpening::decode(&felt), Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
+        assert_eq!(WindowFinalizationOpening::decode(&felt), Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
         let mut nine = opening.clone(); nine.finalizations.resize(9, nine.finalizations[0].clone()); nine.endpoints.resize(9, nine.endpoints[0].clone());
         assert_eq!(nine.encode(), Err(BridgeProofError::InvalidCount));
         let mut zero_span = opening.clone(); zero_span.finalizations[0].checkpoint_count = 0;
@@ -2474,16 +2473,16 @@ mod tests {
         assert_eq!(unordered.encode(), Err(BridgeProofError::InvalidOrdering));
         let mut foreign_domain = opening.clone(); foreign_domain.rewards[0].economic_domain[0] ^= 1;
         assert_eq!(foreign_domain.encode(), Err(BridgeProofError::InvalidRewardAuthority));
-        let mut moved_root = settlement(&network, Vec::new()); moved_root.new_reward_ledger_root[0] ^= 1;
+        let mut moved_root = window_finalization(&network, Vec::new()); moved_root.new_reward_ledger_root[0] ^= 1;
         assert_eq!(moved_root.encode(), Err(BridgeProofError::InvalidCursor));
     }
 
     #[test]
-    fn settlement_digest_uses_f4_preimage_and_distinct_family_roots() {
+    fn window_finalization_digest_excludes_direct_window_and_keeps_distinct_family_roots() {
         let network = config(1);
         let deposit = opening(&network, 1);
         let reward = source_checkpoint_leaf(7, 42);
-        let mut opening = settlement(&network, vec![reward.clone()]);
+        let mut opening = window_finalization(&network, vec![reward.clone()]);
         opening.config_hash = deposit.config_hash; opening.window_id = deposit.window_id;
         opening.end_checkpoint_id = deposit.end_checkpoint_id; opening.end_checkpoint_root = deposit.end_checkpoint_root;
         opening.withdrawals = vec![WithdrawalLeaf { chain_index: 0, sender_user_id: 1, recipient: [1; 20], token: [2; 20], amount: word(1), nonce: word(1) },
@@ -2502,7 +2501,6 @@ mod tests {
         let mut quoted = Vec::new();
         quoted.extend_from_slice(&hash_parts(&[b"PsyBridge/TwoArtifact/2/B"]));
         quoted.extend_from_slice(&opening.config_hash);
-        quoted.extend_from_slice(&opening.window_id);
         quoted.extend_from_slice(&word(opening.end_checkpoint_id));
         for limb in opening.end_checkpoint_root { quoted.extend_from_slice(&word(limb)); }
         quoted.extend_from_slice(&deposit.opening_digest(&network).unwrap());
@@ -2522,11 +2520,29 @@ mod tests {
         quoted.extend_from_slice(&word(2));
         quoted.extend_from_slice(&opening.batch_root().unwrap());
         assert_eq!(digest, hash_parts(&[&quoted]));
+        let mut included = quoted.clone();
+        included.splice(64..64, opening.window_id.to_vec());
+        assert_ne!(digest, hash_parts(&[&included]));
+        let mut other_window = opening.clone();
+        other_window.window_id[0] ^= 1;
+        assert_eq!(other_window.opening_digest(&network, &deposit), Err(BridgeProofError::InvalidConfig));
+        assert_ne!(other_window.encode().unwrap(), opening.encode().unwrap());
+        assert_ne!(other_window.batch_root().unwrap(), opening.batch_root().unwrap());
+        let mut other_quoted = quoted.clone();
+        let root_start = other_quoted.len() - 32;
+        other_quoted[root_start..].copy_from_slice(&other_window.batch_root().unwrap());
+        assert_ne!(hash_parts(&[&other_quoted]), digest);
+        let mut other_withdrawal = withdrawal.clone();
+        other_withdrawal.window_id[0] ^= 1;
+        assert_ne!(other_withdrawal.opening_digest(&network).unwrap(), withdrawal.opening_digest(&network).unwrap());
+        let mut other_reward = reward_opening.clone();
+        other_reward.window_id[0] ^= 1;
+        assert_ne!(other_reward.opening_digest().unwrap(), reward_opening.opening_digest().unwrap());
         let mut second_count = quoted.clone();
-        let after_chain_count = 32 * (1 + 2 + 1 + 4 + 1 + 8 + 8 + 1);
+        let after_chain_count = 32 * (1 + 1 + 1 + 4 + 1 + 8 + 8 + 1);
         second_count.splice(after_chain_count..after_chain_count, word(1));
         assert_ne!(digest, hash_parts(&[&second_count]));
-        let empty = settlement(&network, Vec::new());
+        let empty = window_finalization(&network, Vec::new());
         assert_eq!(empty.batch_root().unwrap(), hash_parts(&[&hash_parts(&[b"PsyBridge/TwoArtifact/2/Empty"]), &word(0), &word(0)]));
         assert_ne!(opening.batch_root().unwrap(), empty.batch_root().unwrap());
         let loaded = network.clone().load().unwrap();

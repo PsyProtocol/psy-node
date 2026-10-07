@@ -42,14 +42,14 @@ const PUBLICATION_DIGEST_WORDS: usize = 8;
 fn digest_artifact_statement(artifact: DigestArtifact) -> (usize, usize) {
     match artifact {
         DigestArtifact::DepositAggregate => (OPENING_DIGEST_PI_LEN, OPENING_DIGEST_BITS),
-        DigestArtifact::SettlementAggregate => (super::settlement_aggregate::SETTLEMENT_AGGREGATE_PI_LEN, OPENING_DIGEST_BITS),
+        DigestArtifact::WindowFinalization => (super::window_finalization::WINDOW_FINALIZATION_PI_LEN, OPENING_DIGEST_BITS),
     }
 }
 
 fn digest_artifact_prefix(artifact: DigestArtifact) -> [u64; 4] {
     match artifact {
         DigestArtifact::DepositAggregate => [1, 11, 1, 0],
-        DigestArtifact::SettlementAggregate => [2, 12, 2, 0],
+        DigestArtifact::WindowFinalization => [2, 12, 2, 0],
     }
 }
 
@@ -199,7 +199,7 @@ impl DigestBitsWrapper {
     }
 
     pub fn prove_groth16(&self, adapter_proof: &ProofWithPublicInputs<F, C, D>, artifact_dir: &str) -> anyhow::Result<UncompressedGroth16ProofData> {
-        anyhow::ensure!(matches!(self.artifact, DigestArtifact::DepositAggregate | DigestArtifact::SettlementAggregate), "unsupported shared artifact");
+        anyhow::ensure!(matches!(self.artifact, DigestArtifact::DepositAggregate | DigestArtifact::WindowFinalization), "unsupported shared artifact");
         let (_, digest_bits) = digest_artifact_statement(self.artifact);
         let words = digest_bit_words::<2>(adapter_proof, digest_bits)?;
         let proof = self.prove_native(adapter_proof, artifact_dir)?;

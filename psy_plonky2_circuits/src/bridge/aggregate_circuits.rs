@@ -12,7 +12,7 @@ use tiny_keccak::{Hasher, Keccak};
 use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic_q, qstandard::QStandardCircuit};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::coordinator::coordinator_helper::QEDCoordinatorCircuitManager;
-use super::circuits::{bridge_agg_final::BridgeAggFinalCircuit, chain_aggregate::{ChainAggregateCircuit, CHAIN_PI_WORDS}, deposit_aggregate::{DepositAggregateCircuit, DEPOSIT_AGGREGATE_PI_LEN}, inclusion_aggregate::{AggregateWindow, RewardInclusionAggregateCircuit, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, WithdrawalInclusionAggregateCircuit, AGGREGATE_PI_LEN}, reward_session::{RewardSessionCircuit, REWARD_SESSION_STEP_CAPACITY}, settlement_aggregate::{SettlementAggregateCircuit, SETTLEMENT_AGGREGATE_PI_LEN}};
+use super::circuits::{bridge_agg_final::BridgeAggFinalCircuit, chain_aggregate::{ChainAggregateCircuit, CHAIN_PI_WORDS}, deposit_aggregate::{DepositAggregateCircuit, DEPOSIT_AGGREGATE_PI_LEN}, inclusion_aggregate::{AggregateWindow, RewardInclusionAggregateCircuit, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, WithdrawalInclusionAggregateCircuit, AGGREGATE_PI_LEN}, reward_session::{RewardSessionCircuit, REWARD_SESSION_STEP_CAPACITY}, window_finalization::{WindowFinalizationCircuit, WINDOW_FINALIZATION_PI_LEN}};
 
 pub struct AggregateCircuitHeights {
     pub deposit_state_tree: usize,
@@ -29,7 +29,7 @@ pub struct AggregateCircuits {
     pub reward_aggregate: RewardInclusionAggregateCircuit,
     pub chains: ChainAggregateCircuit<C, 2>,
     pub deposit_aggregate: DepositAggregateCircuit<C, 2>,
-    pub settlement_aggregate: SettlementAggregateCircuit<C, 2>,
+    pub window_finalization: WindowFinalizationCircuit<C, 2>,
     circuit_set_hash: [u8; 32],
     registrations: Vec<CircuitSetRegistration>,
 }
@@ -62,9 +62,9 @@ impl AggregateCircuits {
         let reward_aggregate = RewardInclusionAggregateCircuit::new(&reward_session.circuit_data.common, &reward_session.circuit_data.verifier_only, source_chain_count)?;
         let chains = ChainAggregateCircuit::build(source_chain_count, &deposit)?;
         let deposit_aggregate = DepositAggregateCircuit::new(source_chain_count, &chains.circuit_data);
-        let settlement_aggregate = SettlementAggregateCircuit::new(source_chain_count, &checkpoint_final.circuit_data.common, &checkpoint_final.circuit_data.verifier_only, &withdrawal_aggregate.circuit_data.common, &withdrawal_aggregate.circuit_data.verifier_only, &reward_aggregate.circuit_data.common, &reward_aggregate.circuit_data.verifier_only)?;
+        let window_finalization = WindowFinalizationCircuit::new(source_chain_count, &checkpoint_final.circuit_data.common, &checkpoint_final.circuit_data.verifier_only, &withdrawal_aggregate.circuit_data.common, &withdrawal_aggregate.circuit_data.verifier_only, &reward_aggregate.circuit_data.common, &reward_aggregate.circuit_data.verifier_only)?;
         let mut bundle = Self { deposit, withdrawal, reward_session, checkpoint_final, withdrawal_aggregate, reward_aggregate, chains,
-            deposit_aggregate, settlement_aggregate, registrations: Vec::new(), circuit_set_hash: [0; 32] };
+            deposit_aggregate, window_finalization, registrations: Vec::new(), circuit_set_hash: [0; 32] };
         bundle.registrations = bundle.build_registrations()?;
         bundle.circuit_set_hash = circuit_set_hash(&bundle.registrations)?;
         Ok(bundle)
@@ -137,7 +137,7 @@ impl AggregateCircuits {
     }
 
     pub fn into_digest_sources(self) -> (CircuitData<F, C, 2>, CircuitData<F, C, 2>) {
-        (self.deposit_aggregate.circuit_data, self.settlement_aggregate.circuit_data)
+        (self.deposit_aggregate.circuit_data, self.window_finalization.circuit_data)
     }
 
     fn build_registrations(&self) -> anyhow::Result<Vec<CircuitSetRegistration>> {
@@ -150,7 +150,7 @@ impl AggregateCircuits {
             (7, 3, AGGREGATE_PI_LEN, &self.reward_aggregate.circuit_data),
             (9, 1, CHAIN_PI_WORDS, &self.chains.circuit_data),
             (11, 1, DEPOSIT_AGGREGATE_PI_LEN, &self.deposit_aggregate.circuit_data),
-            (12, 2, SETTLEMENT_AGGREGATE_PI_LEN, &self.settlement_aggregate.circuit_data),
+            (12, 2, WINDOW_FINALIZATION_PI_LEN, &self.window_finalization.circuit_data),
         ] { registrations.push(circuit_set_registration(family, 0, variant, width, data, [0; 4])?); }
         registrations.extend_from_slice(self.reward_aggregate.registrations());
         registrations.sort_by_key(|registration| (registration.family, registration.level, registration.variant));
