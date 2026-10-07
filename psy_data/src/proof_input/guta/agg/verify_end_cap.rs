@@ -278,7 +278,6 @@ impl<F: QFelt64, Hash: Copy> VerifySingleEndCapInputV2<F, Hash> {
 impl<F: QFelt64, Hash: QFHashBase<F>> VerifySingleEndCapInputV2<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self, global_user_tree_height: u8) -> Hash {
         let new_guta_header = self.get_new_guta_header(global_user_tree_height);
-        println!("VerifySingleEndCapInputV2 new_guta_header: {:?}", new_guta_header);
         new_guta_header.qfhash::<Hasher>()
     }
 }
@@ -490,5 +489,151 @@ impl<F: QFelt64, Hash: Copy + PartialEq> VerifySingleEndCapInput<F, Hash> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3;
+    use parth_core::{crypto::hash::traits::{FromU64x4, QFieldHashable}, felt::FromPrimitiveValuesFelt, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+
+    type Hash = QHashOut<PF>;
+
+    /// Builds an end cap whose witness is genuinely consistent: the merkle proof
+    /// comes from a real in-memory tree, and the checkpoint root is the historical
+    /// root of that proof.
+    fn consistent_end_cap(height: u8, leaf_index: u64, salt: u64) -> VerifyEndCapSimpleStandardInput<PF, Hash> {
+        let mut tree = SimpleMemoryMerkleStoreV3::<PoseidonHasher, Hash>::new(height);
+        let leaf_value = Hash::from_u64x4([salt, salt + 1, salt + 2, salt + 3]);
+        let delta = tree.set_leaf(leaf_index, leaf_value);
+        let proof = MerkleProofCore {
+            root: delta.new_root,
+            value: leaf_value,
+            index: leaf_index,
+            siblings: delta.siblings.clone(),
+        };
+        let (historical_root, current_root) =
+            compute_historical_and_current_merkle_roots_core_gt::<Hash, PoseidonHasher>(&proof);
+        assert_eq!(current_root, proof.root);
+        VerifyEndCapSimpleStandardInput {
+            guta_stats: GUTAStats::qp_rand_gen(),
+            checkpoint_root: historical_root,
+            checkpoint_historical_merkle_proof: proof,
+        }
+    }
+
+    #[test]
+    fn simple_witness_accepts_consistent_proof_and_rejects_root_tampering() {
+        let end_cap = consistent_end_cap(4, 3, 11);
+        assert!(end_cap.check_witness::<PoseidonHasher>().is_ok());
+
+        // Historical check still passes, but the recorded current root no longer matches.
+        let mut bad_current = end_cap.clone();
+        bad_current.checkpoint_historical_merkle_proof.root = Hash::from_u64x4([1, 2, 3, 4]);
+        assert!(bad_current.check_witness::<PoseidonHasher>().is_err());
+
+        // Tampered checkpoint root fails the historical comparison.
+        let mut bad_historical = end_cap.clone();
+        bad_historical.checkpoint_root = Hash::from_u64x4([5, 6, 7, 8]);
+        assert!(bad_historical.check_witness::<PoseidonHasher>().is_err());
+    }
+
+    #[test]
+    fn single_end_cap_witness_accepts_consistent_input() {
+        let input = VerifySingleEndCapInput {
+            guta_circuit_whitelist: Hash::qp_rand_gen(),
+            a_end_cap: consistent_end_cap(5, 6, 21),
+            start_user_leaf_hash: Hash::qp_rand_gen(),
+            end_user_leaf_hash: Hash::qp_rand_gen(),
+            user_id: PF::from_u64_value(77),
+        };
+        assert!(input.check_witness::<PoseidonHasher>(5).is_ok());
+    }
+
+    #[test]
+    fn two_end_cap_witness_accepts_matching_roots_and_rejects_mismatch() {
+        let a = consistent_end_cap(4, 1, 31);
+        let mut b = a.clone();
+        b.guta_stats = GUTAStats::qp_rand_gen();
+        let input = VerifyTwoEndCapCircuitInput {
+            guta_circuit_whitelist: Hash::qp_rand_gen(),
+            a_end_cap: a,
+            b_end_cap: b,
+            nca_proof: PartialUpdateNearestCommonAncestorProof::qp_rand_gen(),
+        };
+        assert!(input.check_witness::<PoseidonHasher>().is_ok());
+
+        // Both end caps are individually consistent but committed to different roots.
+        let mut mismatched = input.clone();
+        mismatched.b_end_cap = consistent_end_cap(4, 2, 57);
+        let err = mismatched.check_witness::<PoseidonHasher>().unwrap_err();
+        assert!(err.to_string().contains("two endcap current checkpoint root not match"));
+    }
+
+    #[test]
+    fn single_end_cap_v2_new_header_shifts_index_and_clamps_level() {
+        let mut input = VerifySingleEndCapInputV2::<PF, Hash>::qp_rand_gen();
+        input.user_id = PF::from_u64_value(0b10100);
+        input.global_user_tree_sub_root_transition.siblings = vec![Hash::qp_rand_gen(); 3];
+
+        let header = input.get_new_guta_header(5);
+        assert_eq!(header.state_transition.node_index, PF::from_u64_value(0b10100 >> 3));
+        assert_eq!(header.state_transition.node_level, PF::from_u64_value(5 - 3));
+        assert_eq!(header.state_transition.old_node_value, input.global_user_tree_sub_root_transition.old_root);
+        assert_eq!(header.state_transition.new_node_value, input.global_user_tree_sub_root_transition.new_root);
+
+        // Level clamps to zero when the sub-root transition is taller than the tree.
+        let clamped = input.get_new_guta_header(2);
+        assert_eq!(clamped.state_transition.node_level, PF::from_u64_value(0));
+    }
+
+    #[test]
+    fn single_end_cap_helpers_project_expected_fields() {
+        let input = VerifySingleEndCapInput::<PF, Hash>::qp_rand_gen();
+        let child = input.get_guta_header_a(17);
+        let combined = input.get_new_guta_header(17);
+        let result = input.get_end_result_a();
+        assert_eq!(child.state_transition.old_node_value, input.start_user_leaf_hash);
+        assert_eq!(combined.checkpoint_tree_root, input.a_end_cap.checkpoint_historical_merkle_proof.root);
+        assert_eq!(result.end_user_leaf_hash, input.end_user_leaf_hash);
+        assert!(input.check_witness::<PoseidonHasher>(17).is_err());
+    }
+
+    #[test]
+    fn single_end_cap_v2_helpers_project_proof_and_hash_header() {
+        let input = VerifySingleEndCapInputV2::<PF, Hash>::qp_rand_gen();
+        let height = input.global_user_tree_sub_root_transition.siblings.len() as u8 + 2;
+        let child = input.get_guta_header_a(height);
+        let combined = input.get_new_guta_header(height);
+        let result = input.get_end_result_a();
+        assert_eq!(child.state_transition.old_node_value, input.global_user_tree_sub_root_transition.old_value);
+        assert_eq!(combined.state_transition.new_node_value, input.global_user_tree_sub_root_transition.new_root);
+        assert_eq!(result.user_id, input.user_id);
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(height), combined.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn two_end_caps_expose_results_combined_stats_and_invalid_witness() {
+        let mut input = VerifyTwoEndCapCircuitInput::<PF, Hash>::qp_rand_gen();
+        // get_level_a/get_level_b do unchecked u8 additions; keep the randomly
+        // generated NCA level and sibling counts small enough to stay within u8.
+        input.nca_proof.nearest_common_ancestor_level %= 16;
+        input.nca_proof.child_a.siblings.truncate(8);
+        input.nca_proof.child_b.siblings.truncate(8);
+        let a = input.get_end_result_a();
+        let b = input.get_end_result_b();
+        assert_eq!(a.start_user_leaf_hash, input.nca_proof.child_a.old_value);
+        assert_eq!(b.end_user_leaf_hash, input.nca_proof.child_b.new_value);
+        let header = input.get_new_guta_header::<PoseidonHasher>();
+        assert_eq!(header.guta_circuit_whitelist, input.guta_circuit_whitelist);
+        assert_eq!(header.total_aggregation_proofs_generated, PF::from_u64_value(1));
+        assert!(input.check_witness::<PoseidonHasher>().is_err());
+    }
+
+    #[test]
+    fn simple_witness_rejects_inconsistent_random_proof() {
+        let input = VerifyEndCapSimpleStandardInput::<PF, Hash>::qp_rand_gen();
+        assert!(input.check_witness::<PoseidonHasher>().is_err());
     }
 }

@@ -362,3 +362,15 @@ psy_ups_circuit = { path = "./client_prover/psy_circuit/psy_ups_circuit", defaul
 psy_dpn_circuit = { path = "./client_prover/psy_circuit/psy_dpn_circuit", default-features = false }
 
 [profile.release]
+
+# The proving hot paths (batched Poseidon Merkle hashing, packed gate
+# evaluation, fused FFT layers) live on a plonky2-hwa branch. Third-party
+# crates pin the older revision themselves, so the revision is replaced for
+# the whole dependency graph instead of being bumped above. The URL differs
+# from the patched one only by a doubled slash because Cargo refuses to patch a
+# source with itself.
+[patch."https://github.com/PsyProtocol/plonky2-hwa"]
+plonky2 = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_field = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_util = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }

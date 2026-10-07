@@ -1,5 +1,4 @@
-use psy_client_data::abi::Abi;
-use psy_client_data::qdata::contract::ContractCodeDefinition;
+use psy_client_data::{abi::Abi, qdata::contract::ContractCodeDefinition};
 
 use crate::dpn::vm::def::DPNFunctionCircuitDefinition;
 
@@ -39,5 +38,56 @@ impl ContractOutput {
     /// Get state tree height.
     pub fn state_tree_height(&self) -> u16 {
         self.contract_code.state_tree_height
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use psy_client_data::{
+        abi::{AbiContract, AbiMethod, StateMutability},
+        qdata::contract::ContractFunctionCodeDefinition,
+    };
+
+    #[test]
+    fn serializes_contract_code_and_reports_abi_metadata() {
+        let output = ContractOutput {
+            contract_code: ContractCodeDefinition {
+                state_tree_height: 12,
+                functions: vec![ContractFunctionCodeDefinition {
+                    method_id: 7,
+                    num_inputs: 1,
+                    num_outputs: 1,
+                    vm_type: 0,
+                    code: vec![1, 2],
+                }],
+            },
+            circuit_definitions: vec![],
+            abi: Abi {
+                schema_version: "1".into(),
+                contract: AbiContract {
+                    name: "Example".into(),
+                    state_tree_height: 12,
+                    state: vec![],
+                    methods: vec![AbiMethod {
+                        name: "run".into(),
+                        method_id: 7,
+                        state_mutability: StateMutability::External,
+                        inputs: vec![],
+                        outputs: vec![],
+                        input_felt_count: 0,
+                        output_felt_count: 0,
+                        vm_type: None,
+                    }],
+                },
+                types: vec![],
+            },
+        };
+        let bytes = output.to_bytes().unwrap();
+        let decoded: ContractCodeDefinition = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, output.contract_code);
+        assert_eq!(output.method_count(), 1);
+        assert_eq!(output.state_tree_height(), 12);
+        assert!(output.abi_to_json().unwrap().contains("Example"));
     }
 }

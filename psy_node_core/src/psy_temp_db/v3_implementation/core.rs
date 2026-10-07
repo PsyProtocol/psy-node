@@ -10,11 +10,11 @@ const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 
 use crate::{
     psy_temp_db::{
-        tt_get_worker_reputation_key,
+        tt_get_worker_reputation_key, tt_get_guta_in_flight_key, GutaInFlightRecord, QTempDBGutaInFlightStore,
         CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{
-        QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
+        QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVCompareAndSet, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
     },
 };
 /*
@@ -978,5 +978,31 @@ mod tests {
                 .map(|h: Hash256| h.into_owned_32bytes()),
             None
         );
+    }
+}
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync> QTempDBGutaInFlightStore for T {
+    async fn get_guta_in_flight(
+        &self,
+        rid: &QRealmIdentifier,
+        submitting_realm_id: u64,
+    ) -> anyhow::Result<Option<(GutaInFlightRecord, Vec<u8>)>> {
+        let key = tt_get_guta_in_flight_key(rid.realm_id, rid.realm_sub_id, submitting_realm_id);
+        match self.qtdb_raw_kv_get_value(&key).await? {
+            Some(raw) if !raw.is_empty() => Ok(Some((GutaInFlightRecord::from_bytes(&raw)?, raw))),
+            _ => Ok(None),
+        }
+    }
+
+    async fn claim_guta_in_flight(
+        &self,
+        rid: &QRealmIdentifier,
+        submitting_realm_id: u64,
+        observed: Option<&[u8]>,
+        record: &GutaInFlightRecord,
+    ) -> anyhow::Result<bool> {
+        let key = tt_get_guta_in_flight_key(rid.realm_id, rid.realm_sub_id, submitting_realm_id);
+        self.qtdb_raw_kv_compare_and_set(&key, observed, &record.to_bytes()).await
     }
 }

@@ -179,3 +179,58 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<104> for PUPSEndCapRes
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use parth_core::{
+        crypto::hash::traits::{FieldQHasher, HashTo4Felts},
+        data::serializable::QPDSerializable,
+        felt::{FromPrimitiveValuesFelt, QFeltSized},
+        pgoldilocks::PoseidonHasher,
+        utils::QPGenRandom,
+        PHash, PF,
+    };
+
+    use super::PUPSEndCapResultCompact;
+
+    type TargetType = PUPSEndCapResultCompact<PF, PHash>;
+
+    #[test]
+    fn qfhash_with_guta_height_matches_direct_computation() {
+        let value = TargetType::qp_rand_gen();
+        let height: u8 = 20;
+        let start = value.start_user_leaf_hash.to_4_felts();
+        let end = value.end_user_leaf_hash.to_4_felts();
+        let combo = PoseidonHasher::q_hash_many(&[
+            value.user_id,
+            start[0],
+            start[1],
+            start[2],
+            start[3],
+            end[0],
+            end[1],
+            end[2],
+            end[3],
+            PF::from_u8_value(height),
+        ]);
+        let expected = PoseidonHasher::q_two_to_one(value.checkpoint_tree_root_hash, combo);
+        assert_eq!(value.qfhash_with_guta_height::<PoseidonHasher>(height), expected);
+        // a different tree height must produce a different hash
+        assert_ne!(value.qfhash_with_guta_height::<PoseidonHasher>(height + 1), expected);
+    }
+
+    #[test]
+    fn qpd_bincode_serialization_round_trip_and_error() {
+        let value = TargetType::qp_rand_gen();
+        let bytes = value.to_bytes().unwrap();
+        assert_eq!(TargetType::from_bytes(&bytes).unwrap(), value);
+        assert!(TargetType::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        assert!(TargetType::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn q_felt_size_matches_field_layout() {
+        // 3 hashes x 4 felts + user_id
+        assert_eq!(<TargetType as QFeltSized>::q_felt_size(), 13);
+    }
+}
+

@@ -49,6 +49,15 @@ pub trait QTempDatabaseRawKVWriterBase {
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
+pub trait QTempDatabaseRawKVCompareAndSet {
+    /// Atomically sets `key` to `new_value` only if its current value equals `expected`, where
+    /// `None` means absent (an empty stored value counts as absent, as it does for the readers).
+    /// Returns whether the value was set.
+    async fn qtdb_raw_kv_compare_and_set(&self, key: &[u8], expected: Option<&[u8]>, new_value: &[u8]) -> anyhow::Result<bool>;
+}
+
+#[async_trait]
 pub trait QTempDatabaseRawCounterReaderBase {
     async fn qtdb_raw_counter_get_value(&self, key: &[u8]) -> anyhow::Result<i64>;
 }

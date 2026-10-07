@@ -2,4 +2,4 @@ pub mod coordinator_guta_planner;
 pub mod realm_guta_planner;
 
 #[cfg(test)]
-mod realm_guta_planner_tests;
+pub(crate) mod realm_guta_planner_tests;

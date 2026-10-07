@@ -118,3 +118,53 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF, parth_core::PHash },
     psy_guta_node_update
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::HashTo4Felts, pgoldilocks::{PoseidonHasher, QHashOut}, PF};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn header_hash_follows_documented_composition() {
+        let header = GlobalUserTreeAggregatorHeader::<PF, Hash>::qp_rand_gen();
+
+        let state_transition_hash = header.state_transition.qfhash::<PoseidonHasher>();
+        let stats_hash = header.stats.qfhash::<PoseidonHasher>();
+        let state_transition_and_stats_hash = PoseidonHasher::q_two_to_one(
+            state_transition_hash,
+            stats_hash,
+        );
+        let state_stats_checkpoint_hash = PoseidonHasher::q_two_to_one(
+            header.checkpoint_tree_root,
+            state_transition_and_stats_hash,
+        );
+        let header_with_whitelist_hash_felts = PoseidonHasher::q_two_to_one(
+            header.guta_circuit_whitelist,
+            state_stats_checkpoint_hash,
+        ).to_4_felts();
+        let expected = PoseidonHasher::q_hash_many(&[
+            header_with_whitelist_hash_felts[0],
+            header_with_whitelist_hash_felts[1],
+            header_with_whitelist_hash_felts[2],
+            header_with_whitelist_hash_felts[3],
+            header.total_aggregation_proofs_generated,
+        ]);
+
+        assert_eq!(header.qfhash::<PoseidonHasher>(), expected);
+    }
+
+    #[test]
+    fn header_hash_is_sensitive_to_each_committed_field() {
+        let mut header = GlobalUserTreeAggregatorHeader::<PF, Hash>::qp_rand_gen();
+        let baseline = header.qfhash::<PoseidonHasher>();
+
+        header.checkpoint_tree_root = Hash::from_values(1, 2, 3, 4);
+        assert_ne!(header.qfhash::<PoseidonHasher>(), baseline);
+
+        let with_new_checkpoint = header.qfhash::<PoseidonHasher>();
+        header.guta_circuit_whitelist = Hash::from_values(5, 6, 7, 8);
+        assert_ne!(header.qfhash::<PoseidonHasher>(), with_new_checkpoint);
+    }
+}

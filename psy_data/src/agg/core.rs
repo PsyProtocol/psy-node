@@ -1,5 +1,4 @@
 use parth_core::crypto::hash::traits::{FieldQHasher, MerkleHasher, PCircuitWitness, ZeroableHash};
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::protocol::core_types::Q256BitHash;
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
@@ -345,5 +344,124 @@ impl<Hash: Copy + ZeroableHash> AggStateTransitionWithEventsInput<Hash> {
             left_proof_is_leaf: true,
             right_proof_is_leaf: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use parth_core::{
+        crypto::hash::traits::PCircuitWitness,
+        pgoldilocks::{PoseidonHasher, QHashOut},
+        PF,
+    };
+
+    use super::*;
+
+    type Hash = QHashOut<PF>;
+
+    fn hash(value: u64) -> Hash {
+        Hash::from_values(value, 0, 0, 0)
+    }
+
+    #[test]
+    fn transition_construction_tracking_and_dummy_values() {
+        let transition = AggStateTransition::new(hash(1), hash(2));
+        assert_eq!(transition.get_start_root(), hash(1));
+        assert_eq!(transition.get_end_root(), hash(2));
+        assert_eq!(
+            transition.get_combined_hash::<PoseidonHasher>(),
+            PoseidonHasher::two_to_one(&hash(1), &hash(2))
+        );
+        assert_eq!(transition.get_state_transition(), transition);
+
+        let dummy = AggStateTransition::get_dummy_value(hash(9));
+        assert_eq!(dummy.state_transition_start, hash(9));
+        assert_eq!(dummy.state_transition_end, hash(9));
+        assert_eq!(AggStateTransition::<Hash>::default().state_transition_start, Hash::default());
+    }
+
+    #[test]
+    fn transition_input_condenses_and_combines_both_sides() {
+        let input = AggStateTransitionInput {
+            left_input: AggStateTransition::new(hash(1), hash(2)),
+            right_input: AggStateTransition::new(hash(2), hash(3)),
+            left_proof_is_leaf: true,
+            right_proof_is_leaf: true,
+        };
+        assert_eq!(input.condense(), AggStateTransition::new(hash(1), hash(3)));
+        assert_eq!(input.get_start_root(), hash(1));
+        assert_eq!(input.get_end_root(), hash(3));
+
+        let right = AggStateTransition::new(hash(3), hash(4));
+        let with_right = input.combine_with_right_leaf(&right);
+        assert_eq!(with_right.left_input, input.condense());
+        assert_eq!(with_right.right_input, right);
+        assert!(!with_right.left_proof_is_leaf && with_right.right_proof_is_leaf);
+
+        let left = AggStateTransition::new(hash(0), hash(1));
+        let with_left = input.combine_with_left_leaf(&left);
+        assert_eq!(with_left.left_input, left);
+        assert_eq!(with_left.right_input, input.condense());
+        assert!(with_left.left_proof_is_leaf && !with_left.right_proof_is_leaf);
+
+        let expected = PoseidonHasher::two_to_one(
+            &input.left_input.get_combined_hash::<PoseidonHasher>(),
+            &input.right_input.get_combined_hash::<PoseidonHasher>(),
+        );
+        assert_eq!(input.get_expected_public_inputs_hash::<PoseidonHasher>(), expected);
+    }
+
+    #[test]
+    fn event_inputs_condense_and_combine_both_sides() {
+        let left = AggStateTransitionWithEvents {
+            state_transition_start: hash(1),
+            state_transition_end: hash(2),
+            event_hash: hash(10),
+        };
+        let right = AggStateTransitionWithEvents {
+            state_transition_start: hash(2),
+            state_transition_end: hash(3),
+            event_hash: hash(11),
+        };
+        let input = AggStateTransitionWithEventsInput {
+            left_input: left,
+            right_input: right,
+            left_proof_is_leaf: true,
+            right_proof_is_leaf: true,
+        };
+        let condensed = input.condense::<PoseidonHasher>();
+        assert_eq!(condensed.state_transition_start, hash(1));
+        assert_eq!(condensed.state_transition_end, hash(3));
+        assert_eq!(condensed.event_hash, PoseidonHasher::two_to_one(&hash(10), &hash(11)));
+        assert_eq!(input.get_state_transition_with_events::<PoseidonHasher>(), condensed);
+
+        let right_input = AggStateTransitionWithEventsInput::get_dummy_value(hash(3));
+        let combined_right = input.combine_with_right_leaf::<PoseidonHasher, _>(&right_input);
+        assert!(combined_right.right_proof_is_leaf);
+        let left_input = AggStateTransitionWithEventsInput::get_dummy_value(hash(0));
+        let combined_left = input.combine_with_left_leaf::<PoseidonHasher, _>(&left_input);
+        assert!(combined_left.left_proof_is_leaf);
+
+        let plain = condensed.get_state_transition();
+        assert_eq!(plain, AggStateTransition::new(hash(1), hash(3)));
+        assert_eq!(plain.get_events_hash(), Hash::default());
+    }
+
+    #[test]
+    fn event_transitions_default_and_dummy_values() {
+        let default = AggStateTransitionWithEvents::<Hash>::default();
+        assert_eq!(default.state_transition_start, Hash::default());
+        assert_eq!(default.state_transition_end, Hash::default());
+        assert_eq!(default.event_hash, Hash::default());
+
+        let dummy = AggStateTransitionWithEvents::get_dummy_value(hash(5));
+        assert_eq!(dummy.state_transition_start, hash(5));
+        assert_eq!(dummy.state_transition_end, hash(5));
+        assert_eq!(dummy.event_hash, Hash::get_zero_value());
+
+        let dummy_input = AggStateTransitionWithEventsInput::get_dummy_value(hash(5));
+        assert_eq!(dummy_input.left_input, dummy);
+        assert_eq!(dummy_input.right_input, dummy);
+        assert!(!dummy_input.left_proof_is_leaf && !dummy_input.right_proof_is_leaf);
     }
 }

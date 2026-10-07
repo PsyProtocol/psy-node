@@ -115,9 +115,102 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
 impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {}
 
 
-pser::impl_psy_ser_basic_tests!(
+pser::impl_psy_ser_basic_tests_fallback!(
     QCAggUserRegistartionDeployContractsGUTAInput,
     // Note the use of concrete types here
     {  parth_core::PF, parth_core::PHash },
     qc_agg_user_registration_deploy_contracts_guta_input_ser_tests
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{
+        crypto::hash::traits::{FromU64x4, MerkleHasher, QFieldHashable},
+        felt::{FromPrimitiveValuesFelt, ToU64Value},
+        pgoldilocks::{PoseidonHasher, QHashOut},
+        utils::QPGenRandom,
+        PF,
+    };
+
+    type Hash = QHashOut<PF>;
+
+    fn hash(seed: u64) -> Hash {
+        Hash::from_u64x4([
+            seed,
+            seed.wrapping_mul(31),
+            seed.wrapping_mul(7),
+            seed.wrapping_mul(13),
+        ])
+    }
+
+    fn transition_with(start: u64, end: u64, proofs: u64) -> AggStateTransitionWithStats<Hash> {
+        AggStateTransitionWithStats {
+            state_transition_start: hash(start),
+            state_transition_end: hash(end),
+            total_proofs_generated: proofs,
+        }
+    }
+
+    fn controlled_input() -> QCAggUserRegistartionDeployContractsGUTAInput<PF, Hash> {
+        let mut input = QCAggUserRegistartionDeployContractsGUTAInput::qp_rand_gen();
+        input.register_users_state_transition = transition_with(1, 2, 3);
+        input.deploy_contracts_state_transition = transition_with(4, 5, 6);
+        input.update_contracts_state_transition = transition_with(7, 8, 9);
+        input.guta_proof_header.total_aggregation_proofs_generated = PF::from_u64_value(11);
+        input
+    }
+
+    #[test]
+    fn public_inputs_hash_chains_transitions_guta_header_and_stats() {
+        let input = controlled_input();
+
+        let combined_start = PoseidonHasher::two_to_one(
+            &input.register_users_state_transition.state_transition_start,
+            &input.deploy_contracts_state_transition.state_transition_start,
+        );
+        let combined_end = PoseidonHasher::two_to_one(
+            &input.register_users_state_transition.state_transition_end,
+            &input.update_contracts_state_transition.state_transition_end,
+        );
+        let combined_transition = PoseidonHasher::two_to_one(&combined_start, &combined_end);
+        let guta_hash = input.guta_proof_header.qfhash::<PoseidonHasher>();
+        let combo_without_stats = PoseidonHasher::two_to_one(&combined_transition, &guta_hash);
+        let stats_hash = Hash::from_u64x4([
+            input.deploy_contracts_state_transition.total_proofs_generated,
+            input.register_users_state_transition.total_proofs_generated,
+            input.guta_proof_header.total_aggregation_proofs_generated.to_u64_value(),
+            0,
+        ]);
+        let expected = PoseidonHasher::two_to_one(&combo_without_stats, &stats_hash);
+
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), expected);
+
+        let mut more_proofs = controlled_input();
+        more_proofs.register_users_state_transition.total_proofs_generated += 1;
+        assert_ne!(
+            more_proofs.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn fallback_serialization_round_trips_and_matches_declared_fixed_size() {
+        let value = QCAggUserRegistartionDeployContractsGUTAInput::<PF, Hash>::qp_rand_gen();
+        assert!(QCAggUserRegistartionDeployContractsGUTAInput::<PF, Hash>::IS_FIXED_SIZE);
+        assert_eq!(
+            value.fallback_pio_serialized_size(),
+            QCAggUserRegistartionDeployContractsGUTAInput::<PF, Hash>::FIXED_SIZE
+        );
+
+        let bytes = value.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), value.fallback_pio_serialized_size());
+        // The speedy-backed `pio_read_from_io` now reads unbuffered, so the
+        // fallback reader no longer over-advances the shared cursor and the
+        // full fallback round trip is deterministic.
+        assert_eq!(
+            QCAggUserRegistartionDeployContractsGUTAInput::<PF, Hash>::fallback_psy_ser_from_slice(&bytes).unwrap(),
+            value
+        );
+    }
+}

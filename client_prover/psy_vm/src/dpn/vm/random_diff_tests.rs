@@ -244,8 +244,8 @@ impl ContextInput for VecInput<'_> {
     fn get_contract_id(&self) -> u64 {
         0
     }
-    fn get_contract_deployer(&self, _contract_id: u64) -> [u64; 4] {
-        [0; 4]
+    fn get_contract_deployer(&self, _contract_id: u64) -> u64 {
+        0
     }
     fn get_caller_contract_id(&self) -> u64 {
         0

@@ -169,3 +169,95 @@ impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase for PsyRealmUserUpdateQue
         Self::IS_FIXED_SIZE
     }
 }
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{data::queue::queue_key::PCoreQueueItemBase, PF, PHash};
+    use psy_core::job::job_id::ProvingJobCircuitType;
+
+    #[test]
+    fn queue_item_round_trips_and_enforces_its_fixed_prefix() {
+        let item = PsyRealmUserUpdateQueueItem::<PF, PHash>::qp_rand_gen();
+        let encoded = item.encode_queue_item_vec().unwrap();
+        let min_size = PsyRealmUserUpdateQueueItem::<PF, PHash>::get_size_hint();
+
+        assert!(PsyRealmUserUpdateQueueItem::<PF, PHash>::is_queue_item(&encoded));
+        assert!(!PsyRealmUserUpdateQueueItem::<PF, PHash>::is_queue_item(&encoded[..min_size - 1]));
+        assert!(!PsyRealmUserUpdateQueueItem::<PF, PHash>::has_fixed_size());
+        assert_eq!(item.get_restorable_job_id().len(), QJOB_ID_SERIALIZED_SIZE);
+
+        let decoded = PsyRealmUserUpdateQueueItem::<PF, PHash>::decode_queue_item_ref(&encoded).unwrap();
+        assert_eq!(decoded.job_id, item.job_id);
+        assert_eq!(decoded.expected_fake_checkpoint_id, item.expected_fake_checkpoint_id);
+        assert_eq!(decoded.old_user_leaf_hash, item.old_user_leaf_hash);
+        assert_eq!(decoded.new_user_leaf_hash, item.new_user_leaf_hash);
+        assert_eq!(decoded.events, item.events);
+    }
+
+    fn felt(value: u64) -> PF {
+        use parth_core::felt::FromPrimitiveValuesFelt;
+        PF::from_u64_value(value)
+    }
+
+    fn event(checkpoint_id: u64, event_index: u64) -> PsyUserEventRecord<PF> {
+        PsyUserEventRecord {
+            checkpoint_id: felt(checkpoint_id),
+            user_id: felt(1),
+            contract_id: felt(2),
+            method_id: felt(3),
+            event_index: felt(event_index),
+            data: vec![felt(4), felt(5)],
+        }
+    }
+
+    #[test]
+    fn constructor_round_trips_items_with_events_and_matches_size_formula() {
+        let item = PsyRealmUserUpdateQueueItem::<PF, PHash>::new(
+            QProvingJobDataID::new_proof_job_id(7, 1, ProvingJobCircuitType::UserEndCap, 0, 3),
+            42,
+            PHash::from_values(1, 0, 0, 0),
+            PHash::from_values(2, 0, 0, 0),
+            PQEDUserLeaf::new(
+                PHash::from_values(3, 0, 0, 0),
+                PHash::from_values(4, 0, 0, 0),
+                felt(100),
+                felt(7),
+                felt(9),
+                felt(11),
+                felt(13),
+            ),
+            GUTAStats {
+                guta_fees_collected: felt(1),
+                da_fees_collected: felt(2),
+                user_ops_processed: felt(3),
+                total_transactions: felt(4),
+                slots_modified: felt(5),
+            },
+            vec![event(100, 0), event(101, 1)],
+        );
+
+        assert_eq!(item.events.len(), 2);
+        assert_eq!(item.expected_fake_checkpoint_id, 42);
+
+        let encoded = item.encode_queue_item_vec().unwrap();
+        assert_eq!(
+            encoded.len(),
+            QJOB_ID_SERIALIZED_SIZE
+                + 8
+                + 32
+                + 32
+                + PQEDUserLeaf::<PF, PHash>::FIXED_SIZE
+                + GUTAStats::<PF>::FIXED_SIZE
+                + 4
+                + item.events.iter().map(|e| e.pio_serialized_size()).sum::<usize>()
+        );
+        assert!(PsyRealmUserUpdateQueueItem::<PF, PHash>::is_queue_item(&encoded));
+
+        let decoded = PsyRealmUserUpdateQueueItem::<PF, PHash>::decode_queue_item_ref(&encoded).unwrap();
+        assert_eq!(decoded, item);
+        assert_eq!(decoded.events, item.events);
+        assert_eq!(decoded.new_user_leaf.user_id, felt(13));
+        assert_eq!(decoded.stats.total_transactions, felt(4));
+    }
+}

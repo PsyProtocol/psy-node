@@ -76,4 +76,7 @@ pub struct PsyRealmProcessor<
     pub file_system: Arc<FileSystem>,
     pub guta_gatherer_backup_directory: String,
     pub guta_gatherer_join: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>,
+
+    /// Coordinator checkpoints an accepted GUTA submission may stay unincluded before it is resent.
+    pub guta_resend_after_checkpoints: u64,
 }

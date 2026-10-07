@@ -599,6 +599,58 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_bloom_config_hash_function_count() {
+        // -ln(0.5) / ln(2) == 1 and -ln(0.25) / ln(2) == 2.
+        assert_eq!(BloomConfig::new(100, 0.5).num_hashes(), 1);
+        assert_eq!(BloomConfig::new(100, 0.25).num_hashes(), 2);
+        // The documented 0.1% rate needs 9 hash functions.
+        assert_eq!(BloomConfig::new(CAPACITY, FALSE_POSITIVE_RATE).num_hashes(), 9);
+        // Extremely small false positive rates clamp to 32 hash functions.
+        assert_eq!(BloomConfig::new(100, 1e-12).num_hashes(), 32);
+    }
+
+    #[test]
+    fn test_bloom_config_bit_and_byte_counts() {
+        // 8 * -ln(0.25) / ln(2)^2 == 23.08... -> 24 bits -> 3 bytes.
+        let config = BloomConfig::new(8, 0.25);
+        assert_eq!(config.num_bits(), 24);
+        assert_eq!(config.num_bytes(), 3);
+        assert_eq!(config.num_bytes(), (config.num_bits() + 7) / 8);
+
+        // 1000 * -ln(0.001) / ln(2)^2 == 14377.9... -> 14378 bits -> 1798 bytes.
+        let config = BloomConfig::new(CAPACITY, FALSE_POSITIVE_RATE);
+        assert_eq!(config.num_bits(), 14378);
+        assert_eq!(config.num_bytes(), 1798);
+
+        // A zero-capacity filter needs no bits at all.
+        let empty = BloomConfig::new(0, 0.25);
+        assert_eq!(empty.num_bits(), 0);
+        assert_eq!(empty.num_bytes(), 0);
+    }
+
+    #[test]
+    fn test_bloom_config_default_matches_documented_values() {
+        let default = BloomConfig::default();
+        assert_eq!(default, BloomConfig::new(1024, 0.001));
+        assert_eq!(default.capacity, 1024);
+        assert_eq!(default.false_positive_rate, 0.001);
+    }
+
+    #[test]
+    fn test_bloom_filter_size_bytes_and_inner_mut() {
+        let config = BloomConfig::new(CAPACITY, FALSE_POSITIVE_RATE);
+        let mut filter = QPBloomFilter::new(config);
+
+        // fastbloom-rs does not expose the size directly, so this stays zero.
+        assert_eq!(filter.size_bytes(), 0);
+
+        // The mutable inner handle can be used to add items directly.
+        filter.inner_mut().add(b"through inner mut");
+        assert!(filter.contains(b"through inner mut"));
+        assert!(filter.inner().contains(b"through inner mut"));
+    }
+
     #[cfg(feature = "rand_gen")]
     #[test]
     fn test_bloom_filter_add_events_random() -> anyhow::Result<()> {

@@ -199,4 +199,68 @@ mod test_psy_ser_pm_reward_commitment {
         assert!(values == deserialized, "Empty vector round trip serialization failed");
         Ok(())
     }
+
+    #[test]
+    fn combine_with_hashes_each_root_pairwise() {
+        use parth_core::crypto::hash::traits::MerkleHasher;
+        use parth_core::pgoldilocks::PoseidonHasher;
+
+        let a = PsySerTestTargetType::qp_rand_gen();
+        let b = PsySerTestTargetType::qp_rand_gen();
+        let combined = a.combine_with::<PoseidonHasher>(&b);
+        assert_eq!(
+            combined.register_users_root,
+            PoseidonHasher::two_to_one(&a.register_users_root, &b.register_users_root)
+        );
+        assert_eq!(combined.gutas_root, PoseidonHasher::two_to_one(&a.gutas_root, &b.gutas_root));
+        assert_eq!(
+            combined.deploy_contracts_root,
+            PoseidonHasher::two_to_one(&a.deploy_contracts_root, &b.deploy_contracts_root)
+        );
+    }
+
+    #[test]
+    fn commitment_hash_matches_direct_two_to_one_chain() {
+        use parth_core::crypto::hash::traits::MerkleHasher;
+        use parth_core::pgoldilocks::PoseidonHasher;
+
+        let value = PsySerTestTargetType::qp_rand_gen();
+        let expected = PoseidonHasher::two_to_one(
+            &PoseidonHasher::two_to_one(&value.register_users_root, &value.gutas_root),
+            &value.deploy_contracts_root,
+        );
+        assert_eq!(value.get_commitment_hash::<PoseidonHasher>(), expected);
+    }
+
+    #[test]
+    fn qfelts_round_trip_preserves_all_three_roots() {
+        use parth_core::felt::{QFeltSized, ToQFelts};
+
+        let value = PsySerTestTargetType::qp_rand_gen();
+        let felts: Vec<parth_core::PF> = value.to_qfelts();
+        assert_eq!(felts.len(), PsySerTestTargetType::q_felt_size());
+        assert_eq!(felts.len(), super::PM_REWARD_COMMITMENT_SIZE);
+        let restored = PsySerTestTargetType::from_qfelts(&felts);
+        assert_eq!(restored, value);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid number of elements for PPMRewardCommitment")]
+    fn from_qfelts_rejects_wrong_felt_count() {
+        use parth_core::felt::ToQFelts;
+
+        let value = PsySerTestTargetType::qp_rand_gen();
+        let felts: Vec<parth_core::PF> = value.to_qfelts();
+        let _ = PsySerTestTargetType::from_qfelts(&felts[..super::PM_REWARD_COMMITMENT_SIZE - 1]);
+    }
+
+    #[test]
+    fn default_commitment_is_all_zero_roots() {
+        use parth_core::crypto::hash::traits::ZeroableHash;
+
+        let value = PsySerTestTargetType::default();
+        assert_eq!(value.register_users_root, parth_core::PHash::get_zero_value());
+        assert_eq!(value.gutas_root, parth_core::PHash::get_zero_value());
+        assert_eq!(value.deploy_contracts_root, parth_core::PHash::get_zero_value());
+    }
 }
