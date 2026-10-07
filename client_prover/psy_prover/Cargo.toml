@@ -70,7 +70,7 @@ http = { workspace = true }
 clap = { workspace = true }
 dashmap = { workspace = true }
 quick_cache = { workspace = true }
-gnark-plonky2-verifier-ffi = { workspace = true, optional = true }
+gnark-plonky2-verifier-ffi = { workspace = true }
 
 # WASM-only dependencies
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -87,7 +87,6 @@ js-sys = { workspace = true }
 flate2 = { workspace = true }
 
 [features]
-gnark-wrap = ["dep:gnark-plonky2-verifier-ffi", "psy_plonky2_circuits/gnark-wrap"]
 # default = ["is_sync"]
 is_sync = [
     "maybe-async/is_sync",

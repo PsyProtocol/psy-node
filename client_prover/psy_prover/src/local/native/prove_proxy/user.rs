@@ -1068,7 +1068,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
     }
 }
 
-#[cfg(all(test, feature = "gnark-wrap"))]
+#[cfg(test)]
 mod hash_encoding_tests {
     use plonky2::field::types::{Field, PrimeField64};
 

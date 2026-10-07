@@ -5,9 +5,7 @@
 
 pub mod user;
 
-#[cfg(feature = "gnark-wrap")]
 pub mod system;
-#[cfg(feature = "gnark-wrap")]
 pub mod types;
 
 use jsonrpsee::{

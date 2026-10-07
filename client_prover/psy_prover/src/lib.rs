@@ -98,15 +98,8 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
         role,
         move || Ok(user.expect("user provider built when role serves user").into_rpc().into()),
         || {
-            #[cfg(feature = "gnark-wrap")]
-            {
-                use crate::local::native::prove_proxy::system::{ProveProxySystemRpcServer, SystemProveProvider};
-                Ok(SystemProveProvider::new()?.into_rpc().into())
-            }
-            #[cfg(not(feature = "gnark-wrap"))]
-            {
-                anyhow::bail!("role `{}` needs system proofs, but this binary was built without the `gnark-wrap` feature", role.as_str())
-            }
+            use crate::local::native::prove_proxy::system::{ProveProxySystemRpcServer, SystemProveProvider};
+            Ok(SystemProveProvider::new()?.into_rpc().into())
         },
     )?;
 

@@ -175,11 +175,11 @@ These are reference procedures, not permission to stop the running stack, commit
 
    ```bash
    RUST_MIN_STACK=134217728 cargo run --release -p psy_plonky2_circuits \
-     --example config_gen_v2 --no-default-features \
+     --example config_gen_v2 \
      --features std,serialize_rkyv,serialize_speedy,serialize_postcard
    ```
 
-5. Require both generated cache files to report `up to date` on the second run. Never use `make config_gen_v2` or omit `--no-default-features`: default `gnark-wrap` enters Groth16 setup.
+5. Require both generated cache files to report `up to date` on the second run. `gen_write_config` (`psy_plonky2_circuits/examples/config_gen_v2.rs:315-343`) compares and replaces only the two cache files and does not call Groth16 setup. That exclusion is unconditional.
 6. Rebuild the affected release binaries. When deploying incompatible circuit artifacts to local devnet, use the authorized paired purge/restart procedure, not a keep-data contract swap. Re-register users, exercise faucet claim, resubmit a real EndCap, and require the full forwarding/vote/certificate/inclusion/FFS chain and equal roots.
 
 ### 3.2 Function-circuit regeneration chain

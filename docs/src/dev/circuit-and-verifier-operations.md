@@ -228,7 +228,6 @@ Run exactly from `<repo-root>` after Section 4 promotion or any cache trigger:
 RUST_MIN_STACK=134217728 \
 cargo run --release -p psy_plonky2_circuits \
   --example config_gen_v2 \
-  --no-default-features \
   --features std,serialize_rkyv,serialize_speedy,serialize_postcard
 ```
 
@@ -239,18 +238,7 @@ psy_plonky2_circuits/src/generated/cached_circuit_library.rs
 psy_plonky2_circuits/src/generated/cached_common_data.rs
 ```
 
-The writer compares and replaces only those paths (`psy_plonky2_circuits/examples/config_gen_v2.rs:448-474`).
-
-### 5.2 Forbidden cache command
-
-Do not run either of these for cache-only work:
-
-```bash
-make config_gen_v2
-cargo run --release --package psy_plonky2_circuits --example config_gen_v2
-```
-
-The crate default features include `gnark-wrap`, while the required command explicitly disables defaults. The generator conditionally enters Groth16 setup under that feature (`psy_plonky2_circuits/Cargo.toml:7-13`; `psy_plonky2_circuits/examples/config_gen_v2.rs:256-259,353-445`). Cache generation must not delete, generate, or export Bridge setup material.
+The writer `gen_write_config` compares and replaces only those paths (`psy_plonky2_circuits/examples/config_gen_v2.rs:315-343`). It does not call Groth16 setup. That exclusion is unconditional: the function has no feature gate.
 
 ### 5.3 Stability loop
 

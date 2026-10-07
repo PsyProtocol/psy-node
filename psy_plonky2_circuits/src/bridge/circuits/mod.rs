@@ -10,7 +10,7 @@ pub mod reward_ledger;
 mod reward_session_witness;
 pub mod deposit_aggregate;
 pub mod settlement_aggregate;
-#[cfg(all(feature = "gnark-wrap", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod bridge_wrap;
 
 pub use bridge_agg::BridgeAggProveResult;

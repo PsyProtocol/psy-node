@@ -89,6 +89,4 @@ serde_cbor = { workspace = true }
 zstd = { workspace = true }
 
 [features]
-default = ["gnark-wrap"]
-gnark-wrap = ["psy_prover/gnark-wrap"]
 is_sync = ["psy_prover/is_sync"]
