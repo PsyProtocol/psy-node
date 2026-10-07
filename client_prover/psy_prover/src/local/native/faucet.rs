@@ -218,6 +218,8 @@ impl PsyFaucetService {
         // intact so WalletSession can send CPU-heavy proving work to stateless
         // prove-proxy replicas instead of proving locally.
         let mut wallet_session = WalletSession::new(&rpc_config).await?;
+        // Claims prove on the blocking pool (see submit_with_operator).
+        wallet_session.sign_while_finalizing = true;
         let allowed_contract_ids: Vec<u64> = config
             .sd_key_allowed_contract_ids
             .clone()
@@ -580,7 +582,7 @@ impl PsyFaucetService {
 
 const MAX_STALE_RETRIES: usize = 2;
 const OPERATOR_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const SETTLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 async fn settle_loop(service: Weak<PsyFaucetService>) {
     loop {
