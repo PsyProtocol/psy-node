@@ -3423,7 +3423,10 @@ impl WalletSession {
         let sighash = user_session_mgr.get_sighash(PSY_NETWORK_MAGIC, nonce);
 
         tracing::info!("zk sign for signhash: {}, nonce: {}", sighash.to_string(), nonce);
+        let mut lap = std::time::Instant::now();
         let signature_result = self.wallet.sign_with_public_key(&public_key, &sign_context, sighash).await?;
+        let signature_ms = lap.elapsed().as_millis() as u64;
+        lap = std::time::Instant::now();
         let SignatureResult {
             proof: signature_proof,
             circuit_info,
@@ -3433,6 +3436,8 @@ impl WalletSession {
             .proof_tree_state
             .finalize_tree(self.wallet.random_circuit_manager().as_ref())
             .await?;
+        let finalize_tree_ms = lap.elapsed().as_millis() as u64;
+        lap = std::time::Instant::now();
 
         let public_key_param = pk_info.public_key_param;
 
@@ -3462,6 +3467,15 @@ impl WalletSession {
                 circuit_verifier_config,
             )
             .await?;
+        // Separates the local signature proof from the End Cap proof, which
+        // goes to the prove proxy when one is configured.
+        tracing::info!(
+            target: "psy_prover::sign_timing",
+            signature_ms,
+            finalize_tree_ms,
+            end_cap_ms = lap.elapsed().as_millis() as u64,
+            "signed and proved end cap"
+        );
         Ok(end_cap_proof)
     }
 

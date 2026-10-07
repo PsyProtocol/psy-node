@@ -1,4 +1,5 @@
 pub mod faucet;
+mod faucet_operators;
 mod faucet_tasks;
 pub mod prove_proxy;
 

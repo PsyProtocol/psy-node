@@ -1,4 +1,12 @@
-use std::{env, str::FromStr, sync::Arc};
+use std::{
+    env,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
+    time::{Duration, Instant},
+};
 
 use base64::Engine;
 use dashmap::{DashMap, DashSet};
@@ -8,10 +16,14 @@ use psy_client_common::{
     args::{ContractCallArgs, ContractCallData},
     data::qhashout::QHashOut,
 };
-use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
+use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::qmetadata::QMetaDataStoreReaderSync};
+use psy_crypto::hash::traits::qhashable::QFieldHashable;
 
-use super::faucet_tasks::{complete_claim, ClaimGuard};
-use crate::session::WalletSession;
+use super::{
+    faucet_operators::{Lease, OperatorPool, Settle, Unavailable},
+    faucet_tasks::{complete_claim, ClaimGuard},
+};
+use crate::session::{EndCapSubmissionError, WalletSession};
 
 type C = PoseidonGoldilocksConfig;
 type F = <C as GenericConfig<D>>::F;
@@ -98,7 +110,10 @@ struct PsyFaucetService {
     wallet_session: Arc<WalletSession>,
     claim_records: DashMap<(u64, u64), PsyFaucetClaimRecord>,
     recipient_locks: DashSet<u64>,
-    operator_locks: DashSet<u64>,
+    operator_pool: OperatorPool<QHashOut<F>>,
+    // How long a claim waits for an operator before answering "busy".
+    operator_wait: Duration,
+    claim_counter: AtomicU64,
     window_checkpoints: u64,
     turnstile_secret: Option<String>,
     require_turnstile: bool,
@@ -196,6 +211,8 @@ impl PsyFaucetService {
         let turnstile_allowed_hostnames = parse_csv_env("PSY_FAUCET_TURNSTILE_ALLOWED_HOSTNAMES");
         let window_checkpoints = parse_u64_env("PSY_FAUCET_WINDOW_CHECKPOINTS", 120)?;
         anyhow::ensure!(window_checkpoints > 0, "PSY_FAUCET_WINDOW_CHECKPOINTS must be > 0");
+        let operator_wait = Duration::from_secs(parse_u64_env("PSY_FAUCET_OPERATOR_WAIT_SECS", 30)?);
+        let settle_timeout = Duration::from_secs(parse_u64_env("PSY_FAUCET_SETTLE_TIMEOUT_SECS", 120)?);
 
         // Faucet is now a standalone RPC service. Keep rpc_config.prove_proxy_url
         // intact so WalletSession can send CPU-heavy proving work to stateless
@@ -252,23 +269,65 @@ impl PsyFaucetService {
             turnstile_action = ?turnstile_action,
             turnstile_allowed_hostnames = ?turnstile_allowed_hostnames,
             prove_proxy_urls = ?rpc_config.prove_proxy_url,
+            operator_wait_secs = operator_wait.as_secs(),
+            settle_timeout_secs = settle_timeout.as_secs(),
             "psy faucet server mode enabled"
         );
 
-        Ok(Some(Arc::new(Self {
+        let operator_pool = OperatorPool::new(operators.len(), settle_timeout);
+        let service = Arc::new(Self {
             config,
             operators,
             wallet_session: Arc::new(wallet_session),
             claim_records: DashMap::new(),
             recipient_locks: DashSet::new(),
-            operator_locks: DashSet::new(),
+            operator_pool,
+            operator_wait,
+            claim_counter: AtomicU64::new(0),
             window_checkpoints,
             turnstile_secret,
             require_turnstile,
             turnstile_action,
             turnstile_allowed_hostnames,
             http_client: reqwest::Client::new(),
-        })))
+        });
+        tokio::spawn(settle_loop(Arc::downgrade(&service)));
+        Ok(Some(service))
+    }
+
+    // Returns operators whose submitted End Cap is now on chain (or overdue)
+    // to the rotation. Runs for the life of the service.
+    async fn settle_pending_operators(&self) {
+        for (index, pending) in self.operator_pool.pending() {
+            let operator = &self.operators[index];
+            let on_chain = match self.operator_leaf_hash(operator.user_id).await {
+                Ok(hash) => Some(hash),
+                Err(err) => {
+                    tracing::warn!(operator_user_id = operator.user_id, error = %err, "faucet operator leaf read failed");
+                    None
+                }
+            };
+            if let Some(outcome) = self.operator_pool.settle(index, pending, on_chain, Instant::now()) {
+                let settle_ms = pending.submitted_at.elapsed().as_millis() as u64;
+                match outcome {
+                    Settle::Included => {
+                        tracing::info!(operator_user_id = operator.user_id, settle_ms, "faucet operator settled")
+                    }
+                    Settle::TimedOut => tracing::warn!(
+                        operator_user_id = operator.user_id,
+                        settle_ms,
+                        "faucet operator End Cap not seen on chain before the settle timeout; returning it to rotation"
+                    ),
+                }
+            }
+        }
+    }
+
+    async fn operator_leaf_hash(&self, user_id: u64) -> anyhow::Result<QHashOut<F>> {
+        let provider = self.wallet_session.st_provider.with_user_id_owned(user_id);
+        let checkpoint_id = provider.get_latest_block_state().await?.checkpoint_id;
+        let leaf = provider.get_user_leaf_data(checkpoint_id, user_id).await?;
+        Ok(leaf.qfhash::<PsyHasher>())
     }
 
     fn public_config(&self) -> PsyFaucetPublicConfig {
@@ -395,34 +454,58 @@ impl PsyFaucetService {
             .faucet_per_claim_amount
             .parse::<u64>()
             .map_err(|err| rpc_error_with_data("invalid faucet amount", err.to_string()))?;
-        let start_index = if self.operators.is_empty() {
+        if self.operators.is_empty() {
             return Err(rpc_error("no faucet operators configured"));
-        } else {
-            (input.recipient_user_id as usize) % self.operators.len()
-        };
+        }
 
+        let claim_id = self.claim_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut excluded: Vec<usize> = Vec::new();
         let mut last_already_claimed: Option<String> = None;
-        let mut last_error: Option<String> = None;
-        let mut tried_operator = false;
-        for offset in 0..self.operators.len() {
-            let operator = &self.operators[(start_index + offset) % self.operators.len()];
-            let Some(operator_guard) = ClaimGuard::acquire(&self.operator_locks, operator.user_id) else {
-                continue;
+        let mut stale_retries = 0;
+        loop {
+            let wait_started = Instant::now();
+            let mut lease = match self.acquire_operator(&excluded).await {
+                Ok(lease) => lease,
+                Err(_) if last_already_claimed.is_some() => {
+                    return Err(rpc_error_with_data(
+                        "faucet already claimed in the current window",
+                        last_already_claimed.unwrap_or_default(),
+                    ));
+                }
+                Err(_) => return Err(rpc_error("all faucet operators are busy; retry shortly")),
             };
-            tried_operator = true;
-            let started = std::time::Instant::now();
-            tracing::info!(operator_user_id = operator.user_id, "faucet operator acquired");
-            let submit_result = self.submit_with_operator(operator, input.recipient_user_id, amount).await;
-            drop(operator_guard);
+            let wait_ms = wait_started.elapsed().as_millis() as u64;
+            let index = lease.index();
+            let operator = &self.operators[index];
+            let started = Instant::now();
+            tracing::info!(claim_id, operator_user_id = operator.user_id, wait_ms, "faucet operator acquired");
+            let (timings, submit_result) = self.submit_with_operator(operator, input.recipient_user_id, amount).await;
+            let failure = submit_result.as_ref().err().map(|err| classify_failure(err));
+            if let Some(end_user_leaf_hash) = match (&submit_result, &failure) {
+                (Ok(end_user_leaf_hash), _) => Some(*end_user_leaf_hash),
+                (Err(_), Some(Failure::Submission { end_user_leaf_hash })) => Some(*end_user_leaf_hash),
+                _ => None,
+            } {
+                lease.mark_submitted(end_user_leaf_hash);
+            }
+            drop(lease);
             tracing::info!(
+                claim_id,
+                recipient_user_id = input.recipient_user_id,
                 operator_user_id = operator.user_id,
+                wait_ms,
+                session_ms = timings.session_ms,
+                contract_ms = timings.contract_ms,
+                sign_submit_ms = timings.sign_submit_ms,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 success = submit_result.is_ok(),
+                failure = failure.as_ref().map(Failure::kind),
                 "faucet operator released"
             );
 
-            match submit_result {
-                Ok(tx_hash) => {
+            let err = match submit_result {
+                Ok(end_user_leaf_hash) => {
+                    let tx_hash = end_user_leaf_hash.to_string();
                     let record = PsyFaucetClaimRecord {
                         tx_hash: tx_hash.clone(),
                         operator_user_id: operator.user_id,
@@ -438,48 +521,140 @@ impl PsyFaucetService {
                         already_submitted: false,
                     });
                 }
-                Err(err) if is_already_claimed_error(&err) => {
-                    last_already_claimed = Some(err);
-                    continue;
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+            match failure {
+                _ if is_already_claimed_error(&message) => {
+                    last_already_claimed = Some(message);
+                    excluded.push(index);
                 }
-                Err(err) => {
-                    last_error = Some(err);
-                    break;
+                // Nothing reached the edge, so another operator can safely
+                // take the claim.
+                Some(Failure::StaleBeforeSubmit) if stale_retries < MAX_STALE_RETRIES => {
+                    stale_retries += 1;
+                    excluded.push(index);
                 }
+                _ => return Err(rpc_error_with_data("faucet operator submit failed", message)),
             }
         }
-
-        if let Some(err) = last_error {
-            return Err(rpc_error_with_data("faucet operator submit failed", err));
-        }
-        if !tried_operator {
-            return Err(rpc_error("all faucet operators are busy; retry shortly"));
-        }
-        Err(rpc_error_with_data(
-            "faucet already claimed in the current window",
-            last_already_claimed.unwrap_or_else(|| "all faucet operators are busy".to_string()),
-        ))
     }
 
-    async fn submit_with_operator(&self, operator: &PsyFaucetOperator, recipient_user_id: u64, amount: u64) -> Result<String, String> {
+    // Waits up to `operator_wait` for an idle, settled operator. Operators in
+    // `excluded` already failed this claim and are never retried.
+    async fn acquire_operator(&self, excluded: &[usize]) -> Result<Lease<'_, QHashOut<F>>, Unavailable> {
+        let deadline = Instant::now() + self.operator_wait;
+        loop {
+            match self.operator_pool.try_acquire(excluded) {
+                Ok(lease) => return Ok(lease),
+                Err(unavailable) if excluded.len() >= self.operators.len() || Instant::now() >= deadline => return Err(unavailable),
+                Err(_) => tokio::time::sleep(OPERATOR_POLL_INTERVAL).await,
+            }
+        }
+    }
+
+    async fn submit_with_operator(
+        &self,
+        operator: &PsyFaucetOperator,
+        recipient_user_id: u64,
+        amount: u64,
+    ) -> (PhaseTimings, anyhow::Result<QHashOut<F>>) {
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id: self.config.faucet_contract_id,
             method_name: self.config.faucet_method_name.clone(),
             inputs: vec![recipient_user_id, amount],
         }]);
 
-        // Proving is CPU-bound and `exec_contract_call` runs it inline (no
-        // internal spawn_blocking, unlike the dedicated prove_* RPCs). Drive it
-        // on the blocking pool so several concurrent operator claims don't
-        // saturate the async worker threads and stall the jsonrpsee event loop.
+        // Proving is CPU-bound and the session runs it inline (no internal
+        // spawn_blocking, unlike the dedicated prove_* RPCs). Drive it on the
+        // blocking pool so several concurrent operator claims don't saturate
+        // the async worker threads and stall the jsonrpsee event loop.
         let session = self.wallet_session.clone();
         let public_key = operator.public_key;
         let handle = tokio::runtime::Handle::current();
-        let tx_hash = tokio::task::spawn_blocking(move || handle.block_on(session.exec_contract_call(public_key, call_data)))
+        tokio::task::spawn_blocking(move || handle.block_on(run_contract_call(&session, public_key, call_data)))
             .await
-            .map_err(|join_err| format!("faucet submit task panicked: {join_err}"))?
-            .map_err(|err| err.to_string())?;
-        Ok(tx_hash.to_string())
+            .unwrap_or_else(|join_err| (PhaseTimings::default(), Err(anyhow::anyhow!("faucet submit task panicked: {join_err}"))))
+    }
+}
+
+const MAX_STALE_RETRIES: usize = 2;
+const OPERATOR_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+async fn settle_loop(service: Weak<PsyFaucetService>) {
+    loop {
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+        let Some(service) = service.upgrade() else { return };
+        service.settle_pending_operators().await;
+    }
+}
+
+#[derive(Debug, Default)]
+struct PhaseTimings {
+    session_ms: u64,
+    contract_ms: u64,
+    sign_submit_ms: u64,
+}
+
+// The steps of `WalletSession::exec_contract_call`, timed one by one.
+async fn run_contract_call(
+    session: &WalletSession,
+    public_key: QHashOut<F>,
+    call_data: ContractCallData,
+) -> (PhaseTimings, anyhow::Result<QHashOut<F>>) {
+    let mut timings = PhaseTimings::default();
+    let mut lap = Instant::now();
+    let mut elapsed = || {
+        let ms = lap.elapsed().as_millis() as u64;
+        lap = Instant::now();
+        ms
+    };
+    if let Err(err) = session.start_session(public_key).await {
+        timings.session_ms = elapsed();
+        return (timings, Err(err));
+    }
+    timings.session_ms = elapsed();
+    if let Err(err) = session.prove_contract_call(public_key, call_data.contract_calls).await {
+        timings.contract_ms = elapsed();
+        return (timings, Err(err));
+    }
+    timings.contract_ms = elapsed();
+    let result = session.sign_and_submit(public_key, call_data.software_defined_call).await;
+    timings.sign_submit_ms = elapsed();
+    (timings, result)
+}
+
+enum Failure {
+    // Rejected by our own checks before anything was sent: the operator's
+    // chain state moved while this claim was proved.
+    StaleBeforeSubmit,
+    // The End Cap may have reached the edge.
+    Submission { end_user_leaf_hash: QHashOut<F> },
+    Other,
+}
+
+impl Failure {
+    fn kind(&self) -> &'static str {
+        match self {
+            Failure::StaleBeforeSubmit => "stale_before_submit",
+            Failure::Submission { .. } => "submission",
+            Failure::Other => "other",
+        }
+    }
+}
+
+fn classify_failure(err: &anyhow::Error) -> Failure {
+    if let Some(submission) = err.downcast_ref::<EndCapSubmissionError>() {
+        return Failure::Submission {
+            end_user_leaf_hash: submission.end_user_leaf_hash,
+        };
+    }
+    let message = format!("{err:#}").to_ascii_lowercase();
+    if message.contains("stale") || message.contains("another similar tx") {
+        Failure::StaleBeforeSubmit
+    } else {
+        Failure::Other
     }
 }
 
