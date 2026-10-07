@@ -347,7 +347,7 @@ fn inspect_bridge_registry() -> anyhow::Result<()> {
     use parth_core::crypto::hash::traits::FromU64x4;
     use anyhow::Context;
     use psy_client_data::bridge_aggregate::CircuitSetRegistration;
-    use psy_plonky2_circuits::{bridge::aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits}, circuit_library::core::get_plonky2_circuit_library_and_prover_for_network};
+    use psy_plonky2_circuits::{bridge::aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits}, circuit_library::get_plonky2_circuit_library_and_prover_for_network};
     let (_, coordinator) = get_plonky2_circuit_library_and_prover_for_network::<PoseidonGoldilocksConfig, 2>(PsyChainNetworkType::LocalDevnet)?;
     let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(&[0], &coordinator, AggregateCircuitHeights {
         deposit_state_tree: psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
