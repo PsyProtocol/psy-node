@@ -4593,7 +4593,7 @@ export class DevNetProcessManager {
                     {
                         cwd,
                         ...coordinatorLogPaths,
-                        initializationTimeoutMs: 120_000,
+                        initializationTimeoutMs: 300_000,
                         env: this.getEnv(),
                         appendLogs: attempt > 1,
                         logBanner: `===== coordinator processor readiness attempt ${attempt}/${totalAttempts} =====`,
@@ -4704,7 +4704,7 @@ export class DevNetProcessManager {
                                         {
                                             cwd,
                                             ...realmLogPaths,
-                                            initializationTimeoutMs: 180_000,
+                                            initializationTimeoutMs: 600_000,
                                             env: this.getEnv(),
                                             appendLogs: attempt > 1,
                                             logBanner: `===== realm ${realmId} sub ${subId} processor readiness attempt ${attempt}/${totalAttempts} =====`,
