@@ -19,6 +19,19 @@ pub type Hash4Target = [Target; 4];
 /// Integer limbs in recursive PI order: low u32, high u32.
 pub type U64Target = [Target; 2];
 
+/// Full partial-XOR state; each lane is [low u32, high u32].
+#[derive(Clone, Copy)]
+pub struct KeccakStreamTargets {
+    pub state: [[U32Target; 2]; 25],
+    pub byte_offset: Target,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct KeccakStreamValues {
+    pub state: [[u32; 2]; 25],
+    pub byte_offset: u8,
+}
+
 #[derive(Clone, Copy)]
 pub enum Domain {
     Config, CircuitSet, DepositAggregate, WithdrawalAggregate, RewardAggregate, Aggregate, LeafCommit, Leaf, Node, Empty, Window, Reward,
@@ -295,6 +308,140 @@ pub fn keccak_prefix_words<F: RichField + Extendable<D>, const D: usize>(
     })
 }
 
+/// Append a zero-tailed big-endian word prefix without final padding.
+pub fn keccak_stream_absorb<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>, stream: KeccakStreamTargets,
+    words: &[Target; 34], byte_length: Target,
+) -> KeccakStreamTargets {
+    for half in stream.state.iter().flatten() {
+        builder.range_check(half.0, 32);
+    }
+    let offset_bits = builder.split_le(stream.byte_offset, 8);
+    let last = builder.constant(F::from_canonical_usize(135));
+    builder.ensure_is_less_than_or_equal(8, stream.byte_offset, last);
+    builder.range_check(byte_length, 8);
+    let rate = builder.constant(F::from_canonical_usize(136));
+    builder.ensure_is_less_than_or_equal(8, byte_length, rate);
+    let zero = builder.zero();
+    let mut shifted = [zero; 272];
+    for (i, &word) in words.iter().enumerate() {
+        let bits = builder.split_le(word, 32);
+        for byte in 0..4 {
+            let start = (3 - byte) * 8;
+            let value = builder.le_sum(bits[start..start + 8].iter());
+            let index = builder.constant(F::from_canonical_usize(i * 4 + byte));
+            let real = builder.is_less_than(8, index, byte_length);
+            let inactive = builder.not(real);
+            let suffix = builder.mul(inactive.target, value);
+            builder.assert_zero(suffix);
+            shifted[i * 4 + byte] = value;
+        }
+    }
+    for (bit, &enabled) in offset_bits.iter().enumerate() {
+        shifted = std::array::from_fn(|j| {
+            let source = if j >= 1 << bit { shifted[j - (1 << bit)] } else { zero };
+            builder.select(enabled, source, shifted[j])
+        });
+    }
+    let mut state = stream.state;
+    for half in 0..34 {
+        let mut word = zero;
+        for byte in (0..4).rev() {
+            word = builder.mul_const_add(F::from_canonical_u32(256), word, shifted[half * 4 + byte]);
+        }
+        state[half / 2][half % 2] = xor_u32_bounded(builder, state[half / 2][half % 2], U32Target(word));
+    }
+    let mut permuted = state;
+    keccak_f1600(builder, &mut permuted);
+    let sum = builder.add(stream.byte_offset, byte_length);
+    let full = builder.is_greater_than_or_equal(9, sum, rate);
+    for lane in 0..25 {
+        for half in 0..2 {
+            state[lane][half] = U32Target(builder.select(full, permuted[lane][half].0, state[lane][half].0));
+        }
+    }
+    for half in 0..34 {
+        let mut word = zero;
+        for byte in (0..4).rev() {
+            word = builder.mul_const_add(F::from_canonical_u32(256), word, shifted[136 + half * 4 + byte]);
+        }
+        state[half / 2][half % 2] = xor_u32_bounded(builder, state[half / 2][half % 2], U32Target(word));
+    }
+    let byte_offset = builder.mul_const_add(-F::from_canonical_usize(136), full.target, sum);
+    KeccakStreamTargets { state, byte_offset }
+}
+
+pub fn keccak_stream_finalize<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>, stream: KeccakStreamTargets,
+) -> Bytes32Target {
+    for half in stream.state.iter().flatten() {
+        builder.range_check(half.0, 32);
+    }
+    builder.range_check(stream.byte_offset, 8);
+    let last = builder.constant(F::from_canonical_usize(135));
+    builder.ensure_is_less_than_or_equal(8, stream.byte_offset, last);
+    let zero = builder.zero();
+    let padding: [Target; 136] = std::array::from_fn(|j| {
+        let index = builder.constant(F::from_canonical_usize(j));
+        let start = builder.is_equal(stream.byte_offset, index);
+        if j == 135 {
+            builder.add_const(start.target, F::from_canonical_u8(128))
+        } else {
+            start.target
+        }
+    });
+    let mut state = stream.state;
+    for half in 0..34 {
+        let mut word = zero;
+        for byte in (0..4).rev() {
+            word = builder.mul_const_add(F::from_canonical_u32(256), word, padding[half * 4 + byte]);
+        }
+        state[half / 2][half % 2] = xor_u32_bounded(builder, state[half / 2][half % 2], U32Target(word));
+    }
+    keccak_f1600(builder, &mut state);
+    std::array::from_fn(|i| {
+        let bits = builder.split_le(state[i / 2][i % 2].0, 32);
+        let mut word = zero;
+        for byte in 0..4 {
+            let value = builder.le_sum(bits[byte * 8..byte * 8 + 8].iter());
+            word = builder.mul_const_add(F::from_canonical_u32(256), word, value);
+        }
+        word
+    })
+}
+
+pub fn keccak_stream_absorb_values(
+    stream: &mut KeccakStreamValues, words: &[u32; 34], byte_length: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(stream.byte_offset < 136, "Keccak stream offset exceeds rate");
+    anyhow::ensure!(byte_length <= 136, "Keccak stream length exceeds rate");
+    let bytes: [u8; 136] = std::array::from_fn(|i| words[i / 4].to_be_bytes()[i % 4]);
+    anyhow::ensure!(bytes[byte_length..].iter().all(|&byte| byte == 0), "Keccak stream suffix is nonzero");
+    let mut lanes: [u64; 25] = std::array::from_fn(|i| stream.state[i][0] as u64 | ((stream.state[i][1] as u64) << 32));
+    let mut offset = stream.byte_offset as usize;
+    for &byte in &bytes[..byte_length] {
+        lanes[offset / 8] ^= (byte as u64) << (8 * (offset % 8));
+        offset += 1;
+        if offset == 136 {
+            tiny_keccak::keccakf(&mut lanes);
+            offset = 0;
+        }
+    }
+    stream.state = std::array::from_fn(|i| [lanes[i] as u32, (lanes[i] >> 32) as u32]);
+    stream.byte_offset = offset as u8;
+    Ok(())
+}
+
+pub fn keccak_stream_finalize_values(stream: KeccakStreamValues) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(stream.byte_offset < 136, "Keccak stream offset exceeds rate");
+    let mut lanes: [u64; 25] = std::array::from_fn(|i| stream.state[i][0] as u64 | ((stream.state[i][1] as u64) << 32));
+    let offset = stream.byte_offset as usize;
+    lanes[offset / 8] ^= 1u64 << (8 * (offset % 8));
+    lanes[16] ^= 0x80u64 << 56;
+    tiny_keccak::keccakf(&mut lanes);
+    Ok(std::array::from_fn(|i| lanes[i / 8].to_le_bytes()[i % 8]))
+}
+
 pub fn aggregate_commit<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>, config_hash: Bytes32Target,
     end_id: U64Target, end_root: Hash4Target, first_chunk: Target,
@@ -493,6 +640,231 @@ mod tests {
             bytes[i * 4..i * 4 + 4].copy_from_slice(&(value.to_canonical_u64() as u32).to_be_bytes());
         }
         bytes
+    }
+
+    fn stream_words(bytes: &[u8]) -> [u32; 34] {
+        let mut block = [0u8; 136];
+        block[..bytes.len()].copy_from_slice(bytes);
+        std::array::from_fn(|i| u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap()))
+    }
+
+    fn stream_targets(builder: &mut CircuitBuilder<F, 2>) -> KeccakStreamTargets {
+        KeccakStreamTargets {
+            state: std::array::from_fn(|_| std::array::from_fn(|_| U32Target(builder.add_virtual_target()))),
+            byte_offset: builder.add_virtual_target(),
+        }
+    }
+
+    fn set_stream(witness: &mut PartialWitness<F>, targets: KeccakStreamTargets, values: KeccakStreamValues) {
+        for (target, value) in targets.state.iter().flatten().zip(values.state.iter().flatten()) {
+            witness.set_target(target.0, F::from_canonical_u32(*value)).unwrap();
+        }
+        witness.set_target(targets.byte_offset, F::from_canonical_u8(values.byte_offset)).unwrap();
+    }
+
+    #[test]
+    fn stream_native_digest_boundaries_and_error_atomicity() {
+        for size in [0, 1, 4, 135, 136, 137, 271, 272, 288] {
+            let bytes: Vec<u8> = (0..size).map(|i| (i * 17 + 1) as u8).collect();
+            for width in [1, 135, 136] {
+                let mut stream = KeccakStreamValues::default();
+                for part in bytes.chunks(width) {
+                    keccak_stream_absorb_values(&mut stream, &stream_words(part), part.len()).unwrap();
+                }
+                assert_eq!(keccak_stream_finalize_values(stream).unwrap(), native_hash(&bytes));
+            }
+        }
+        let mut endian = KeccakStreamValues::default();
+        keccak_stream_absorb_values(&mut endian, &stream_words(&[1, 2, 3, 4]), 4).unwrap();
+        assert_eq!(endian.state[0], [0x04030201, 0]);
+        assert_eq!(endian.byte_offset, 4);
+        let state = std::array::from_fn(|i| [0x89abcdefu32.wrapping_mul(i as u32 + 1), 0xfedcba98 ^ i as u32]);
+        for offset in [0, 1, 135] {
+            let mut stream = KeccakStreamValues { state, byte_offset: offset };
+            keccak_stream_absorb_values(&mut stream, &[0; 34], 0).unwrap();
+            assert_eq!(stream.state, state);
+            assert_eq!(stream.byte_offset, offset);
+        }
+        for (offset, length, suffix) in [(136, 0, None), (255, 0, None), (1, 137, None), (1, usize::MAX, None), (1, 0, Some(0)), (1, 1, Some(1)), (1, 24, Some(135))] {
+            let mut stream = KeccakStreamValues { state, byte_offset: offset };
+            let mut bytes = [0u8; 136];
+            if let Some(index) = suffix { bytes[index] = 1; }
+            assert!(keccak_stream_absorb_values(&mut stream, &stream_words(&bytes), length).is_err());
+            assert_eq!(stream.state, state);
+            assert_eq!(stream.byte_offset, offset);
+        }
+        for offset in [136, 255] {
+            assert!(keccak_stream_finalize_values(KeccakStreamValues { state, byte_offset: offset }).is_err());
+        }
+    }
+
+    #[test]
+    fn stream_absorb_preserves_arbitrary_state_and_crosses_rate() {
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let input = stream_targets(&mut builder);
+        let words: [Target; 34] = builder.add_virtual_targets(34).try_into().unwrap();
+        let length = builder.add_virtual_target();
+        let output = keccak_stream_absorb(&mut builder, input, &words, length);
+        for half in output.state.iter().flatten() { builder.register_public_input(half.0); }
+        builder.register_public_input(output.byte_offset);
+        let data = builder.build::<C>();
+        for (offset, size) in [(0, 0), (1, 0), (135, 0), (0, 1), (1, 1), (0, 136), (1, 136), (135, 1), (135, 136)] {
+            let input_values = KeccakStreamValues {
+                state: std::array::from_fn(|i| [0x89abcdefu32.wrapping_mul(i as u32 + 1), 0xfedcba98 ^ i as u32]),
+                byte_offset: offset,
+            };
+            let bytes: Vec<u8> = (0..size).map(|i| (i * 17 + 1) as u8).collect();
+            let mut expected = input_values;
+            keccak_stream_absorb_values(&mut expected, &stream_words(&bytes), size).unwrap();
+            let mut witness = PartialWitness::new();
+            set_stream(&mut witness, input, input_values);
+            witness.set_target(length, F::from_canonical_usize(size)).unwrap();
+            for (target, word) in words.iter().zip(stream_words(&bytes)) {
+                witness.set_target(*target, F::from_canonical_u32(word)).unwrap();
+            }
+            let proof = data.prove(witness).unwrap();
+            for (value, half) in proof.public_inputs[..50].iter().zip(expected.state.iter().flatten()) {
+                assert_eq!(value.to_canonical_u64(), *half as u64);
+            }
+            assert_eq!(proof.public_inputs[50].to_canonical_u64(), expected.byte_offset as u64);
+            data.verify(proof).unwrap();
+        }
+    }
+
+    #[test]
+    fn stream_circuit_matches_native_multiblock() {
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let zero = builder.zero();
+        let mut stream = KeccakStreamTargets { state: [[U32Target(zero); 2]; 25], byte_offset: zero };
+        let words: [[Target; 34]; 3] = std::array::from_fn(|_| builder.add_virtual_targets(34).try_into().unwrap());
+        let lengths: [Target; 3] = std::array::from_fn(|_| builder.add_virtual_target());
+        for i in 0..3 {
+            stream = keccak_stream_absorb(&mut builder, stream, &words[i], lengths[i]);
+        }
+        let digest = keccak_stream_finalize(&mut builder, stream);
+        builder.register_public_inputs(&digest);
+        let data = builder.build::<C>();
+        for (size, first_size) in [(0, 0), (1, 1), (4, 4), (135, 135), (136, 136), (136, 135), (137, 136), (271, 135), (272, 136), (288, 136), (288, 135)] {
+            let bytes: Vec<u8> = (0..size).map(|i| (i * 17 + 1) as u8).collect();
+            let mut values = KeccakStreamValues::default();
+            let mut witness = PartialWitness::new();
+            let mut start = 0;
+            for i in 0..3 {
+                let end = if i == 0 { first_size } else { (start + 136).min(size) };
+                let part = &bytes[start..end];
+                let block = stream_words(part);
+                keccak_stream_absorb_values(&mut values, &block, part.len()).unwrap();
+                witness.set_target(lengths[i], F::from_canonical_usize(part.len())).unwrap();
+                for (target, word) in words[i].iter().zip(block) {
+                    witness.set_target(*target, F::from_canonical_u32(word)).unwrap();
+                }
+                start = end;
+            }
+            assert_eq!(start, size);
+            let proof = data.prove(witness).unwrap();
+            assert_eq!(digest_bytes(&proof.public_inputs), keccak_stream_finalize_values(values).unwrap());
+            assert_eq!(digest_bytes(&proof.public_inputs), native_hash(&bytes));
+            data.verify(proof).unwrap();
+        }
+    }
+
+    #[test]
+    fn stream_rejects_suffix_endpoint_and_bound_digest_mutations() {
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let first = stream_targets(&mut builder);
+        let words: [Target; 34] = builder.add_virtual_targets(34).try_into().unwrap();
+        let length = builder.add_virtual_target();
+        let second = keccak_stream_absorb(&mut builder, first, &words, length);
+        let witnessed = stream_targets(&mut builder);
+        for (expected, supplied) in second.state.iter().flatten().zip(witnessed.state.iter().flatten()) {
+            builder.connect(expected.0, supplied.0);
+        }
+        builder.connect(second.byte_offset, witnessed.byte_offset);
+        let suffix_words: [Target; 34] = builder.add_virtual_targets(34).try_into().unwrap();
+        let suffix_length = builder.add_virtual_target();
+        let third = keccak_stream_absorb(&mut builder, witnessed, &suffix_words, suffix_length);
+        let digest = keccak_stream_finalize(&mut builder, third);
+        let expected_digest: Bytes32Target = builder.add_virtual_targets(8).try_into().unwrap();
+        for (actual, expected) in digest.iter().zip(expected_digest) { builder.connect(*actual, expected); }
+        builder.register_public_inputs(&digest);
+        let data = builder.build::<C>();
+        let message: [u8; 272] = std::array::from_fn(|i| (i * 17 + 1) as u8);
+        let mut middle = KeccakStreamValues::default();
+        keccak_stream_absorb_values(&mut middle, &stream_words(&message[..136]), 136).unwrap();
+        let digest_bytes = native_hash(&message);
+        let mut digest_words = [0u32; 8];
+        for (word, bytes) in digest_words.iter_mut().zip(digest_bytes.chunks_exact(4)) {
+            *word = u32::from_be_bytes(bytes.try_into().unwrap());
+        }
+        let head: [u8; 136] = message[..136].try_into().unwrap();
+        let suffix: [u8; 136] = message[136..].try_into().unwrap();
+        for index in 0..6 {
+            let mut endpoint = middle;
+            let mut suffix = suffix;
+            let suffix_size = if index == 4 { 135 } else { 136 };
+            if index == 1 { endpoint.state[0][0] ^= 1; }
+            if index == 2 { endpoint.state[24][1] ^= 1; }
+            if index == 3 { endpoint.byte_offset += 1; }
+            if index == 5 { suffix[0] ^= 1; }
+            let mut witness = PartialWitness::new();
+            set_stream(&mut witness, first, KeccakStreamValues::default());
+            set_stream(&mut witness, witnessed, endpoint);
+            witness.set_target(length, F::from_canonical_usize(136)).unwrap();
+            witness.set_target(suffix_length, F::from_canonical_usize(suffix_size)).unwrap();
+            for (target, word) in words.iter().zip(stream_words(&head)) {
+                witness.set_target(*target, F::from_canonical_u32(word)).unwrap();
+            }
+            for (target, word) in suffix_words.iter().zip(stream_words(&suffix)) {
+                witness.set_target(*target, F::from_canonical_u32(word)).unwrap();
+            }
+            for (target, word) in expected_digest.iter().zip(digest_words) {
+                witness.set_target(*target, F::from_canonical_u32(word)).unwrap();
+            }
+            let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match data.prove(witness) { Ok(proof) => data.verify(proof).is_ok(), Err(_) => false }
+            })).unwrap_or(false);
+            assert_eq!(valid, index == 0);
+        }
+    }
+
+    #[test]
+    fn stream_rejects_malformed_state_scalars_words_and_zero_tail() {
+        for finalize_only in [false, true] {
+            let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+            let input = stream_targets(&mut builder);
+            let words: [Target; 34] = builder.add_virtual_targets(34).try_into().unwrap();
+            let length = builder.add_virtual_target();
+            let stream = if finalize_only { input } else { keccak_stream_absorb(&mut builder, input, &words, length) };
+            let digest = keccak_stream_finalize(&mut builder, stream);
+            builder.register_public_inputs(&digest);
+            let data = builder.build::<C>();
+            // Case zero must verify before any rejection can count as evidence.
+            for case in 0..if finalize_only { 7 } else { 13 } {
+                let mut witness = PartialWitness::new();
+                for (index, half) in input.state.iter().flatten().enumerate() {
+                    let oversized = match case { 3 => index == 0, 4 => index == 1, 5 => index == 48, 6 => index == 49, _ => false };
+                    witness.set_target(half.0, F::from_canonical_u64(if oversized { 1u64 << 32 } else { 0 })).unwrap();
+                }
+                let offset = match case { 1 => 136, 2 => F::ORDER - 1, _ => 0 };
+                let size = match case { 7 => 137, 8 => F::ORDER - 1, 11 => 1, 12 => 24, _ => 0 };
+                witness.set_target(input.byte_offset, F::from_canonical_u64(offset)).unwrap();
+                witness.set_target(length, F::from_canonical_u64(size)).unwrap();
+                for (index, &word) in words.iter().enumerate() {
+                    let value = match (case, index) {
+                        (9, 0) => 1u64 << 32,
+                        (10, 0) => 0x01000000,
+                        (11, 0) => 0x00010000,
+                        (12, 33) => 1,
+                        _ => 0,
+                    };
+                    witness.set_target(word, F::from_canonical_u64(value)).unwrap();
+                }
+                let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match data.prove(witness) { Ok(proof) => data.verify(proof).is_ok(), Err(_) => false }
+                })).unwrap_or(false);
+                assert_eq!(valid, case == 0, "finalize_only={finalize_only}, case={case}");
+            }
+        }
     }
 
     #[test]

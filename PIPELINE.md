@@ -51,14 +51,29 @@ Rules that apply to **every** commit, checkpoint commits included:
 | Styler | Passing QA evidence. | Behavior-preserving, in-scope refactoring or an explicit no-change decision. As the final naming backstop, the styler sweeps the changed surface against every applicable `AGENTS.md` Naming rule, the Naming Quality Checklist, and the current frozen mapping, and records a rule 18 disposition for each substring hit (a justified non-violation or protected occurrence is not a failure). Record that sweep as exit evidence. No feature expansion or unrelated cleanup; no formatter execution without explicit user authorization. Any edit requires static review and refreshed affected QA evidence before final approval. |
 | Reviewer final | Styler handoff, current static-review pass, and current QA evidence. | Independent pass on the final candidate, acceptance criteria, scope, and evidence. Review every line of the exact staged delivery diff using a model different from the author of the changes. |
 | Auditor | Final reviewer pass and exact staged delivery candidate. | Independent audit of gate compliance, authorization, security, scope, evidence provenance, and staged contents; no unresolved findings. |
-| Checkpoint commit | Any progress-preserving moment: completed subtask, verified milestone, or backup point; you are moving to the next one. | Authorized committer creates a scoped commit and records its identifier. Not an approval; does not authorize a push. |
-| Delivery commit | Auditor pass on the unchanged, independently reviewed staged candidate; delivery authorization. | Authorized committer creates the delivery commit and records its identifier. A commit does not authorize a push. |
+
+Commit acts are not stages: checkpoint commits are allowed at any progress-preserving moment and delivery commits close the pipeline, both under the rules in [Commit Classes](#commit-classes).
+
+## Terminal Events and Bounded Loops
+
+Every delegated task and every status report must end in one of three terminal events:
+
+1. **Committed artifact** — the commit identifier of the scoped checkpoint or delivery commit.
+2. **Executable evidence** — a report with concrete numbers, command output, or `<file>:<line>` findings.
+3. **Named blocker** — the exact missing fact, the inspected evidence, and the lookup needed to resolve it.
+
+Pure process states are not progress. A status that only says collecting, awaiting, reviewing, coordinating, or preparing is not a terminal event and must not appear twice in a row for the same task. If a wait is genuinely necessary, name the owner being waited on and the exact expected artifact.
+
+Loops are bounded by findings, not by rounds:
+
+- **Static review/fix loop:** triage every finding as blocking (correctness, security, scope, or an acceptance criterion) or non-blocking (recorded in `ISSUES.md` for a later change). A round with zero blocking findings ends the loop and passes the gate. A repeated sweep that produces no new finding is prohibited; narrow the question instead (`AGENTS.md` Subagent Context rule 5).
+- **Wait loops:** a wait is bounded when the owner and the expected artifact are named. Two consecutive status reports without a terminal event trigger escalation: the coordinator narrows the task to one concrete question and an updated current-state brief; a third stalled round triggers direct takeover with a stopped-editing handoff (`AGENTS.md` Multi-Agent Ownership).
 
 ## Hard Execution Boundary
 
 Before the post-implementation reviewer gate passes, agents MUST NOT run tests. This prohibition includes baseline tests, reproductions, unit tests, integration tests, end-to-end tests, smoke checks, benchmarks, throwaway validation scripts, and launching the program to exercise changed behavior. Renaming execution as investigation, verification, or an experiment does not create an exception.
 
-Static source reads, static diff inspection, design analysis, and test authoring are permitted. Do not use builds, linters, formatters, generators, or other executable checks as a substitute for the prohibited early verification. Schedule executable verification in QA, subject to the user's command restrictions and repository safety rules. A task that prohibits a command remains prohibited after the gate.
+Static source reads, static diff inspection, design analysis, and test authoring are permitted. Compile checks, type checks, lint runs, and builds are also permitted at any time as construction feedback; they are not test execution, and their passing output is never a substitute for executed test evidence in QA. The gated actions remain: running the test suite, benchmarks, smoke checks, live E2E, or launching the program to exercise changed behavior before the post-implementation reviewer pass. Renaming execution as investigation, verification, or an experiment does not create an exception.
 
 Never claim that an unexecuted check passed. Planned verification, static reasoning, historical output, and execution against an older candidate are not current execution evidence. If required evidence cannot be obtained, record the missing prerequisite and leave the gate blocked.
 

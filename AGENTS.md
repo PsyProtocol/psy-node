@@ -18,7 +18,7 @@ It supplements higher-level agent rules. The stricter rule wins.
 
 Before starting work or delegating a task, every agent MUST read and follow the repository-root [PIPELINE.md](PIPELINE.md). That document is the single authority for stage order, review gates, test execution, repair loops, and commit readiness; do not duplicate or bypass its workflow.
 
-Research, design drafting, multiple-model multi-round design review, and the design-reviewer gate MUST precede implementation. Tests may be written during implementation, but MUST NOT be executed until implementation and test authoring are complete and the post-implementation reviewer has cleared all findings. QA is the first test-execution stage; smoke tests, benchmarks, and live E2E are not exceptions. This ordering supersedes any conflicting test-order instruction elsewhere in this file; correctness, evidence, and security requirements remain mandatory.
+Research, design drafting, multiple-model multi-round design review, and the design-reviewer gate MUST precede implementation. Tests may be written during implementation, but MUST NOT be executed until implementation and test authoring are complete and the post-implementation reviewer has cleared all findings. QA is the first test-execution stage; smoke tests, benchmarks, and live E2E are not exceptions. This ordering governs test-order questions across the repository; where another instruction conflicts, the stricter rule wins, and an unresolved conflict is stopped and reported rather than bypassed. Correctness, evidence, and security requirements remain mandatory.
 
 Every delegated assignment MUST state its current pipeline stage, owned files, required evidence, and whether test execution is prohibited or authorized. Styler changes require renewed affected QA evidence before final reviewer and auditor approval. The complete pipeline gates release delivery and push; it does not gate local checkpoint commits (see Commit and Push Gates). A commit never authorizes a push, deployment, publication, or live-account migration.
 
@@ -427,6 +427,15 @@ Push only the named repository and exact authorized destination ref. Never push 
 
 `AGENTS.md` is intentionally ignored by the repository's current `.gitignore`. When this policy file is the explicitly authorized delivery, stage exactly it with `git add -f AGENTS.md`. `ISSUES.md`, `TASKS.md`, and `MEMORY.md` are local working state and must never be staged or force-added. Force-adding any other ignored path is forbidden.
 
+## Merge and History Governance
+
+1. Before squashing or rewriting unpushed history, create a backup branch at the pre-rewrite HEAD and verify tree equivalence afterward: `git diff <pre-rewrite-HEAD> HEAD` must be empty. Drive interactive rebases through `GIT_SEQUENCE_EDITOR` scripts rather than live editing.
+2. Resolve merge conflicts by ownership, not by side. Before resolving, classify every conflicted file to its owning lane and record one policy per class: ours-wins when our implementation supersedes theirs, theirs-wins only for surfaces they own that we did not rewrite, merge-both when both sides carry additive work. Gate surfaces owned by another reviewer keep their review before staging.
+3. Circuit, config, and fingerprint conflicts resolve to the side consistent with the winning implementation set, never to the newer number.
+4. Submodule gitlink conflicts keep our recorded SHA until the child commit is verified reachable on the destination remote.
+5. A post-merge compile classifies every error by origin - ours, theirs, or fork-gap - and fixes ours first; fork-gap entries are enumerated before any fix attempt.
+6. One named agent executes a merge or history rewrite; other lanes pause their history operations on detection of the concurrent operation instead of racing it.
+
 ## Failure and Recovery Rules
 
 1. Stop the release DAG at the first failed generation, provenance, build, test, pack, reachability, publication, deployment, or clone gate.
@@ -511,6 +520,7 @@ Violating any rule below requires an immediate fix before other work continues.
 17. **Exact scope and stopping rule.** Complete every cumulative user instruction and named acceptance criterion, including directly required correctness work, but do not add adjacent improvements, recursive cleanup, speculative hardening, or optional redesign. Once requested behavior has executable evidence and every requested verification, review, documentation, and required cleanup item is complete, stop.
 18. **No stopping before the goal is fully met.** Work continues until every deliverable has current executable evidence. A phase boundary, sub-step, pending review, or infrastructure stall is never a reason to stop the turn or park the objective; unblocked reachable work continues in the same turn. Waiting on external input is allowed only when the information is unreachable by any tool, and the stop must state exactly what is missing and what was tried.
 19. **Decision ownership.** The user makes only the most important decisions and design rulings (approval boundaries, external-authority changes, irreversible operations such as push/deploy/publish, and explicit scope changes). Everything else — implementation choices, bug-fix approaches, internal API shapes, repair strategies, sequencing within an agreed milestone — is decided by the working agent with stated reasoning. Never bounce a decision back to the user that the agent can resolve from repository evidence; when a rule genuinely requires user agreement (this file says so explicitly), state the choice made and the alternative rejected rather than presenting an options list.
+20. **Operational autonomy until the queue is empty.** An agent in an active session MUST NOT stop or yield to the user until every item in its tracked todo list and its session goal has reached a terminal event, or a listed blocker meets the unreachability bar in rule 18. Asking the user a question is a last resort with the same bar: before any stop or question that cites missing information or a missing provision, the agent MUST enumerate in its report every derivation, generation, compilation, or repository-lookup path it attempted, and prove each was exhausted. A provision is NOT unreachable when the agent can generate compliant material itself (for example, devnet identities, dev keys, deterministic fixtures, or locally compilable artifacts); generating it is the required action, recorded with its derivation, and the chosen material is stated with the alternative rejected. A stop or question that names a missing provision without those attempted paths is a rule violation, and the coordinator treats the next stall as grounds for takeover.
 
 ## Multi-Agent Ownership
 
@@ -519,6 +529,7 @@ Violating any rule below requires an immediate fix before other work continues.
 3. Every delegated task must name owned and forbidden files, observable acceptance, and this evidence contract: unexecuted tests, builds, browser journeys, and screenshots are `PENDING`; an executed failing check is `FAILED`; authored assertions, screenshot filenames, and a completion message are not execution evidence. The coordinating agent reviews the diff and raw command output, not the subagent's claim.
 4. Do not run final verification, broad tests, or review-as-approval while any active agent is still editing a participating file. Obtain an explicit stopped-editing handoff first.
 5. When an agent discovers adjacent work, append it to `ISSUES.md` and report it rather than expanding the assigned task. Public API, protocol, persistence-format, or architecture changes outside the assigned acceptance criteria require user approval before implementation. Do not promote an issue into `TASKS.md` without explicit user agreement.
+6. Every delegated task and status report ends in a terminal event per `PIPELINE.md` (Terminal Events and Bounded Loops): a commit identifier, executable evidence with numbers or `<file>:<line>` findings, or a named blocker with the exact missing fact. A status that only says collecting, awaiting, reviewing, or preparing is not progress and must not be reported twice in a row for the same task. Two consecutive reports without a terminal event trigger escalation: the coordinator narrows the task to one concrete question and an updated current-state brief; a third stalled round triggers direct takeover with a stopped-editing handoff. A takeover first snapshots the shared state - a backup branch for history operations - and announces the takeover in the owner's channel, so no other lane races the same history while ownership moves.
 
 ### Subagent Context and Investigation Boundaries
 
@@ -544,6 +555,7 @@ The cumulative contract of user-requested work.
 3. Append or merge new user requests. Do not delete, weaken, rewrite as complete, deprioritize, or displace an earlier open item unless the user explicitly cancels or changes it.
 4. In-session Todo lists must mirror `TASKS.md`. Never create, append, split, replace, reorder, or expand Todo items without the user's explicit agreement. A newly discovered defect belongs in `ISSUES.md` unless it is directly required for an already agreed task's acceptance.
 5. Status updates may only mark agreed items `pending`, `in_progress`, `done`, or `dropped` according to current evidence. They must not silently change scope.
+6. Update an item's status at its terminal event, not at a process milestone: work whose implementation is complete and committed is marked `done` when the commit identifier and executable evidence are recorded, even if a later review stage is still open. Do not leave finished, committed work in `in_progress` while waiting on ceremony, and do not mark work `done` before the evidence exists.
 
 Required fields per item:
 
@@ -791,6 +803,7 @@ Every review must satisfy all items below.
 9. Every `<file>:<line>` reference must resolve at the reviewed commit.
 10. Review documents contain no sensitive values or machine-local paths.
 11. Every section is complete or marked `Not applicable`.
+12. Every finding names the contract or boundary that owns the code under review; attribute a diff line to its owning path before drawing any conclusion from it. An observation about one boundary is never reported as a defect of another.
 
 ### Review Coverage
 

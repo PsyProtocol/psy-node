@@ -342,6 +342,51 @@ fn gen_write_config() -> anyhow::Result<()> {
 
     Ok(())
 }
-fn main() {
-    gen_write_config().unwrap();
+
+fn inspect_bridge_registry() -> anyhow::Result<()> {
+    use parth_core::crypto::hash::traits::FromU64x4;
+    use anyhow::Context;
+    use psy_client_data::bridge_aggregate::CircuitSetRegistration;
+    use psy_plonky2_circuits::{bridge::aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits}, circuit_library::core::get_plonky2_circuit_library_and_prover_for_network};
+    let (_, coordinator) = get_plonky2_circuit_library_and_prover_for_network::<PoseidonGoldilocksConfig, 2>(PsyChainNetworkType::LocalDevnet)?;
+    let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(&[0], &coordinator, AggregateCircuitHeights {
+        deposit_state_tree: psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
+        withdrawal_state_tree: psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
+    })?;
+    let registrations = circuits.registrations();
+    anyhow::ensure!(registrations.len() == 17, "bridge registry is not the closed seventeen-entry set");
+    let pin = |family: u16, level: u8, variant: u8| registrations.iter().find(|registration|
+        (registration.family, registration.level, registration.variant) == (family, level, variant));
+    let fingerprint = |registration: &CircuitSetRegistration| QHashOut::<GoldilocksField>::from_u64x4(registration.fingerprint).to_string();
+    for registration in registrations {
+        anyhow::ensure!(registration.identity_fingerprint == [0; 4] && registration.fingerprint != [0; 4], "bridge registration pin is missing or carries an identity");
+        println!("bridge-registration family={} level={} variant={} pi={} fingerprint={}",
+            registration.family, registration.level, registration.variant, registration.pi_words, fingerprint(registration));
+    }
+    let session = pin(3, 0, 0).context("session registration missing")?;
+    let adapter = pin(7, 0, 3).context("reward adapter registration missing")?;
+    let settlement = pin(12, 0, 2).context("settlement registration missing")?;
+    let chunk = pin(13, 0, 3).context("reward chunk registration missing")?;
+    anyhow::ensure!(session.pi_words == 34 && adapter.pi_words == 28 && settlement.pi_words == 12 && chunk.pi_words == 131, "bridge registration width mismatch");
+    println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=chunk arity=4 verification=conditional fingerprint-parent={} fingerprint-child={}",
+        chunk.family, chunk.level, chunk.variant, session.family, session.level, session.variant, fingerprint(chunk), fingerprint(session));
+    for parent_level in 1..=8u8 {
+        let parent = pin(13, parent_level, 3).context("reward combine registration missing")?;
+        let child = pin(13, parent_level - 1, 3).unwrap();
+        anyhow::ensure!(parent.pi_words == 131 && parent.fingerprint != child.fingerprint, "reward combine registration mismatch");
+        println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=combine arity=2 verification=unconditional fingerprint-parent={} fingerprint-child={}",
+            parent.family, parent.level, parent.variant, child.family, child.level, child.variant, fingerprint(parent), fingerprint(child));
+    }
+    let root = pin(13, 8, 3).unwrap();
+    println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=adapter arity=1 verification=unconditional fingerprint-parent={} fingerprint-child={}",
+        adapter.family, adapter.level, adapter.variant, root.family, root.level, root.variant, fingerprint(adapter), fingerprint(root));
+    println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=adapter arity=1 verification=unconditional fingerprint-parent={} fingerprint-child={}",
+        adapter.family, adapter.level, adapter.variant, session.family, session.level, session.variant, fingerprint(adapter), fingerprint(session));
+    println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=settlement arity=1 verification=unconditional fingerprint-parent={} fingerprint-child={}",
+        settlement.family, settlement.level, settlement.variant, adapter.family, adapter.level, adapter.variant, fingerprint(settlement), fingerprint(adapter));
+    Ok(())
+}
+fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--inspect-bridge-registry") { return inspect_bridge_registry(); }
+    gen_write_config()
 }

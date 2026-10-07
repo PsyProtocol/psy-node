@@ -81,6 +81,7 @@ use psy_plonky2_common_circuits::bridge::{
 };
 use tiny_keccak::{Hasher as _, Keccak};
 use parth_core::crypto::hash::spiderman::SpidermanUpdateProof;
+use psy_crypto::hash::traits::qhashable::QFieldHashable as _;
 use psy_crypto::signature::zk::wallet::SimplePsyPrivateKey;
 use psy_vm::reward_authorization::RewardAuthorizationWitness;
 
@@ -161,7 +162,7 @@ fn path(leaves: &[(u64, QHashOut<F>)], index: u64, height: usize) -> MerkleProof
         position >>= 1;
     }
     MerkleProofCore {
-        root: nodes[&0],
+        root: nodes.get(&0).copied().unwrap_or_else(|| PoseidonHasher::get_zero_hash(height)),
         value,
         index,
         siblings,
@@ -433,6 +434,21 @@ fn withdrawal_paths_for(config: &NetworkConfig, ends: &[ChainState]) -> anyhow::
 fn client_value<T: serde::de::DeserializeOwned>(value: &impl serde::Serialize) -> anyhow::Result<T> {
     Ok(serde_json::from_value(serde_json::to_value(value)?)?)
 }
+fn client_hash(value: psy_client_common::data::qhashout::QHashOut<F>) -> QHashOut<F> {
+    QHashOut(HashOut { elements: value.0.elements })
+}
+
+fn copy_job(job: &RewardSessionJobWitness) -> RewardSessionJobWitness {
+    let tag = &job.tag;
+    RewardSessionJobWitness {
+        height: job.height, path_index: job.path_index, nullifier_siblings: job.nullifier_siblings,
+        tag: RewardTagWitness {
+            tag_preimage: tag.tag_preimage, leaf_left: tag.leaf_left, leaf_right: tag.leaf_right, leaf_tag: tag.leaf_tag,
+            siblings: tag.siblings, parent_tags: tag.parent_tags,
+        },
+    }
+}
+
 
 fn assert_opening_digest(proof: &ProofWithPublicInputs<F, C, D>, family: u32, variant: u32, digest: [u8; 32]) {
     assert_eq!(proof.public_inputs.len(), 12);
@@ -555,11 +571,10 @@ fn reward_publication_header(opening: &SourceCheckpointRewardOpening, old_ledger
         aggregate_capacity: INCLUSION_AGGREGATE_CAPACITIES[0], total_count: count, segment_count: u32::from(count != 0),
         segment_index: 0, first_ordinal: 0, count, withdrawal_roots: Vec::new(),
         old_ledger_state_root: Some(old_ledger_state_root), new_ledger_state_root: Some(new_ledger_state_root),
-        opening_digest: if count == 0 { [0; 32] } else { opening.opening_digest()? }, claim_tree_root: [0; 32],
+        opening_digest: opening.opening_digest()?,
+        claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], INCLUSION_AGGREGATE_CAPACITIES[0] as usize)?[0],
     };
-    if count != 0 {
-        bind_claim_tree(&mut header, &opening.leaves.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?)?;
-    }
+    bind_claim_tree(&mut header, &opening.leaves.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?)?;
     header.validate()?;
     Ok(header)
 }
@@ -584,7 +599,7 @@ fn reward_session_fixture<'a>(circuits: &AggregateCircuits, config: &'a NetworkC
     let end_checkpoint_id = 1u32;
     let checkpoint_tree_root = hash4(checkpoint.tree_root);
     let source_leaf: PsyCheckpointLeaf<F> = client_value(&checkpoint.new_leaf)?;
-    let source_leaf_hash = hash4(source_leaf.qfhash::<PoseidonHash>());
+    let source_leaf_hash = hash4(client_hash(source_leaf.qfhash::<PoseidonHash>()));
     let end_leaf = source_leaf.clone();
     let end_roots: PsyCheckpointGlobalStateRoots<F> = client_value(&checkpoint.state.roots)?;
     let user_leaf: PsyUserLeaf<F> = client_value(&checkpoint.state.deposit.user_leaf)?;
@@ -610,7 +625,7 @@ fn reward_session_fixture<'a>(circuits: &AggregateCircuits, config: &'a NetworkC
     let nullifier_key = (u64::from(source_checkpoint_id) << 31) | (u64::from(jobs[0].height) << 26) | u64::from(jobs[0].path_index);
     let occupied = QHashOut(HashOut { elements: [F::ONE, F::ZERO, F::ZERO, F::ZERO] });
     let session_root = hash4(DeltaMerkleProofCore::from_params::<PoseidonHash>(nullifier_key, QHashOut::ZERO, occupied, jobs[0].nullifier_siblings.iter().copied().map(|sibling| QHashOut(HashOut { elements: sibling.map(F::from_canonical_u64) })).collect()).new_root);
-    let public_key_param = hash4(SimplePsyPrivateKey::new(client_value(&private_key)?).get_public_key_param::<PoseidonHash>());
+    let public_key_param = hash4(client_hash(SimplePsyPrivateKey::new(client_value(&private_key)?).get_public_key_param::<PoseidonHash>()));
     let mut record = Vec::new();
     append_u32(&mut record, source_checkpoint_id);
     record.push(jobs[0].height);
@@ -714,7 +729,9 @@ fn empty_summary_siblings() -> [[u64; 4]; 32] {
 }
 
 fn array_siblings<const HEIGHT: usize>(leaves: &[(u64, [u64; 4])], index: u64, height: usize) -> [[u64; 4]; HEIGHT] {
-    siblings_from_known_leaves(leaves, index, height).try_into().expect("reward path height")
+    let nodes: Vec<_> = leaves.iter().map(|(index, hash)| (*index, QHashOut(HashOut { elements: hash.map(F::from_canonical_u64) }))).collect();
+    let siblings = path(&nodes, index, height).siblings;
+    siblings.into_iter().map(hash4).collect::<Vec<_>>().try_into().expect("reward path height")
 }
 
 
@@ -738,8 +755,8 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     let (coordinator, circuits) = circuits()?;
     let private_key: QHashOut<F> = QHashOut::from_values(11, 22, 33, 44);
     let identity = circuits.reward_session.identity_fingerprint_for_scheme(0)?;
-    let param = SimplePsyPrivateKey::new(client_value(&private_key)?).get_public_key_param::<PoseidonHash>();
-    let public_key = hash_two(QHashOut(HashOut { elements: identity.map(F::from_canonical_u64) }), QHashOut(param.0));
+    let param = client_hash(SimplePsyPrivateKey::new(client_value(&private_key)?).get_public_key_param::<PoseidonHash>());
+    let public_key = hash_two(QHashOut(HashOut { elements: identity.map(F::from_canonical_u64) }), param);
     let deposits: Vec<_> = [(0, 31), (0, 32), (1, 0)].into_iter().map(|(chain_index, absolute_index)| DepositLeaf {
         chain_index, absolute_index, shield_address: word(11), token: [5; 20], l2_token_contract_id: word(12),
         amount: word(13), note_commitment: word(14 + u64::from(absolute_index)),
@@ -937,10 +954,10 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     for mutation in 0..4 {
         let base = &reward_session.witness;
         let (jobs, authorization, user_leaf) = match mutation {
-            0 => { let mut jobs = reward_jobs.clone(); jobs[0].tag.siblings[0] = qhash(999); (jobs, reward_authorization.clone(), base.user_leaf) },
-            1 => { let mut jobs = reward_jobs.clone(); jobs[0].path_index = 2; (jobs, reward_authorization.clone(), base.user_leaf) },
-            2 => { let mut user_leaf = base.user_leaf; user_leaf.last_checkpoint_id = F::from_canonical_u32(2); (reward_jobs.clone(), reward_authorization.clone(), user_leaf) },
-            _ => (reward_jobs.clone(), RewardAuthorizationWitness::Zk { private_key: client_value(&qhash(999))? }, base.user_leaf),
+            0 => { let mut jobs = [copy_job(&reward_jobs[0])]; jobs[0].tag.siblings[0] = qhash(999); (jobs, reward_authorization.clone(), base.user_leaf) },
+            1 => { let mut jobs = [copy_job(&reward_jobs[0])]; jobs[0].path_index = 2; (jobs, reward_authorization.clone(), base.user_leaf) },
+            2 => { let mut user_leaf = base.user_leaf; user_leaf.last_checkpoint_id = F::from_canonical_u32(2); ([copy_job(&reward_jobs[0])], reward_authorization.clone(), user_leaf) },
+            _ => ([copy_job(&reward_jobs[0])], RewardAuthorizationWitness::Zk { private_key: client_value(&qhash(999))? }, base.user_leaf),
         };
         let changed = RewardSessionWitness {
             statement: base.statement, config: config.clone(), economic_domain: base.economic_domain, window_id: base.window_id,
@@ -985,7 +1002,8 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     let empty_rewards = SourceCheckpointRewardOpening { leaves: Vec::new(), ..rewards_opening.clone() };
     let empty_reward_header = reward_publication_header(&empty_rewards, reward_session.statement.old_ledger_state_root, reward_session.statement.old_ledger_state_root)?;
     assert_eq!(empty_reward_header.count, 0);
-    assert_eq!(empty_reward_header.opening_digest, [0; 32]);
+    assert_eq!(empty_reward_header.opening_digest, empty_rewards.opening_digest()?);
+    assert_ne!(empty_reward_header.opening_digest, [0; 32]);
     for mutation in 0..2 {
         let mut changed = empty_withdrawals.clone();
         if mutation == 0 { changed.withdrawal_roots[2][0] ^= 1; }

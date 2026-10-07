@@ -363,6 +363,18 @@ function resolveBridgeRelayerKeystorePath(): string {
     return path.join(homeDir, ".psy", "keystore", "bridge-relayer");
 }
 
+/** Env additions handing the genesis-registered SD-key faucet operators to the faucet server. */
+async function loadFaucetOperatorsEnv(cwd: string): Promise<{ [key: string]: string }> {
+    const operatorsPath = path.join(cwd, "psy-dapp", "apps", "bridge", "src", "config", "faucetOperators.json");
+    if (!(await exists(operatorsPath))) {
+        console.warn(`[DevNet] faucet operators file missing; faucet-server starts without SD-key operators: ${operatorsPath}`);
+        return {};
+    }
+    const encoded = (await Bun.file(operatorsPath).text()).trim();
+    if (!encoded) return {};
+    return { PSY_FAUCET_OPERATORS_JSON_B64: Buffer.from(encoded, "utf8").toString("base64") };
+}
+
 async function resolveWalletPassword(): Promise<string> {
     const keystorePath = resolveBridgeRelayerKeystorePath();
     const keystoreExists = await exists(keystorePath);
@@ -2947,6 +2959,7 @@ async function ensureDevEnvironment(
         requireDocker?: boolean;
         requireAnvil?: boolean;
         requireBun?: boolean;
+        skipUiDeps?: boolean;
         env?: NodeJS.ProcessEnv;
     },
 ): Promise<void> {
@@ -2982,7 +2995,8 @@ async function ensureDevEnvironment(
     await ensureAllReposCloned();
     const contractsDir = path.join(cwd, "psy-contracts");
     const sdk = await ensurePsySdkArtifacts(cwd);
-    await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
+    // UI dependency installs only serve UI stages; chain-only launches skip them.
+    if (!opts?.skipUiDeps) await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
     const { generated } = await ensureKeystoreFiles(contractsDir);
     // Only set default WALLET_PASSWORD when we generated the keystore this run.
     if (generated && !process.env.WALLET_PASSWORD) {
@@ -5139,6 +5153,7 @@ export class DevNetProcessManager {
         if (options.faucetServer || startAll) {
             await waitForProveProxy("faucet-server");
             const faucetPort = 9998;
+            const faucetOperatorsEnv = await loadFaucetOperatorsEnv(cwd);
             const faucetProc = await RunningProcess.spawnWithInitializationHintWithRetry(
                 [
                     './target/release/psy_user_cli',
@@ -5149,7 +5164,7 @@ export class DevNetProcessManager {
                     'psy-genesis/config.json',
                 ],
                 faucetServerStartedDetector,
-                { cwd, ...getLogPaths('faucet_server', false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
+                { cwd, ...getLogPaths('faucet_server', false), maxRetries: 3, retryDelayMs: 2000, env: { ...this.getEnv(), ...faucetOperatorsEnv } }
             );
             this.track(faucetProc);
             void waitForTcpPort('127.0.0.1', faucetPort, {
@@ -6194,6 +6209,7 @@ Usage: bun run dev/locSetupV4.ts [options]
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
             requireBun: !hasOnlyOptions || psyPrivacyBridge || ide || modeAWebWalletBridge,
+            skipUiDeps: hasOnlyOptions && !psyPrivacyBridge && !ide && !explorer && !modeAWebWalletBridge,
             env: envVars,
         });
     }

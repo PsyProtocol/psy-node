@@ -319,7 +319,7 @@ Artifact approval source: `psy_cli/psy_relayer_cli/src/guardian/protocol.rs:150-
 | `AggregateLeaf` | Private codec trait in `bridge_aggregate.rs`, implemented by `WithdrawalLeaf` and `RewardLeaf`. `LEAF_WORDS` is 6; `write_leaf` and `read_leaf` encode and decode each existing leaf as six 32-byte words. It is not a new wire family. Distinct from circuit `AggregateLeafTarget`. |
 | `AggregateLeafTarget` | Public circuit enum in `aggregate_commitment.rs`: `Deposit`, `Withdrawal`, and `Reward` leaf targets. Not the private codec trait `AggregateLeaf`. |
 | `WithdrawalInclusionAggregateCircuit` | Withdrawal inclusion publication circuit in `inclusion_aggregate.rs`. Its public-input width is `AGGREGATE_PI_LEN`, the sole owner registered below. Crypto domain `Domain::Aggregate`; its frozen label remains `Batch`. Do not rename that byte string. |
-| `RewardInclusionAggregateCircuit` | Reward inclusion publication circuit in `inclusion_aggregate.rs`. Its public-input width is the same `AGGREGATE_PI_LEN`. It verifies one `RewardSessionCircuit` proof per user. It is not the session circuit. |
+| `RewardInclusionAggregateCircuit` | Retained reward final adapter in `inclusion_aggregate.rs`. Its public `circuit_data` is only the adapter graph. Public-input width is `AGGREGATE_PI_LEN`, 28 words: `[1,7,3,0]`, `opening_digest`, `claim_tree_root`, and `header_digest`. It verifies one family-13 level-8 root and one real 34-field `RewardSessionCircuit` tip. It does not verify one session proof per user and it is not the session circuit. |
 | Withdrawal root path | Private Poseidon path authenticating one opening withdrawal root. It is not serialized. |
 | Global deposit leaf root | Internal ordered Merkle root from `deposit_leaf_tree`: leaf commitments, their positions, and total count. Shared by web proofs and complete-opening normalization. |
 | Finalize endpoint extension | For each configured ordinal, public inputs after the retained prefix: deposit root, absolute deposit count, and withdrawal root. The prefix is not the full width. |
@@ -336,7 +336,7 @@ Artifact approval source: `psy_cli/psy_relayer_cli/src/guardian/protocol.rs:150-
 | `append_deposit_leaf` | Private deposit-tree frontier update in `prove_bridge.rs`: writes the leaf into the frontier and returns the new Poseidon deposit-tree root. Distinct from guardian `append_leaf`. |
 | Deposit prefix | The per-chain `DepositLeaf` vector supplied to `build_deposit_spiderman_inputs`. Error text names a deposit prefix, deposit suffix, or deposit web, never custody. |
 | Proved deposit count | L1 `provedDepositCount` compared with the L2 deposit-tree next index. A proved count above that L2 count, or a new session whose two counts differ, is a deposit-count mismatch, not custody. The two greater-than failures use `proved deposit count exceeds L2 deposit count`; the equality failure uses `L2 deposit count differs from proved deposit count`. |
-| Reward circuit kind | One of exactly three kinds: `RewardSessionCircuit`, `RewardInclusionAggregateCircuit`, and the Groth16 wrapper. Kind count is not recursion depth. Depth grows with included jobs and the per-step capacity `REWARD_SESSION_STEP_CAPACITY`. No debit, ticket, closing, or re-anchor circuit is added. |
+| Reward circuit kind | Session, nine internal hierarchy nodes, the retained final adapter, and the Groth16 wrapper are distinct circuits. Kind count is not recursion depth. `REWARD_SESSION_STEP_CAPACITY` selects session step size only. No debit, ticket, closing, or re-anchor circuit is added. |
 | Reward session | One proof chain for one `(economic_domain, source_checkpoint_id, user_id)`, proved by `RewardSessionCircuit`. Its terminal amount is `W`, the full sum of included jobs. Jobs omitted from it are forfeited. |
 | Reward ledger key | Two path limbs, user bits then source bits. Never one Goldilocks target. Economic domain is pinned tree context, not a limb. `RewardLedgerLeafTargets` writes the occupied leaf under `PsyRewardLedger/Issued/1` and never clears it. |
 | `jobs_commitment` | Session rolling Poseidon commitment. Its base is `reward_session_seed` over `PsyRewardJobs/Session/1`. `rolling_jobs_commitment` in `reward_session.rs` absorbs the step domain, the previous commitment, the counts, and each active job record. Inactive padding is excluded. Each included job contributes the configured per-claim amount; `RewardLeaf` has no amount field. |
@@ -402,9 +402,22 @@ A label freezes when it first enters an executed test, a generated circuit artif
 
 A public domain name starts with its owning module's head word, and two modules never share one (AGENTS.md naming rule 23). Registered head words: `reward` owns reward `inclusion`, `session`, `ledger`, and `aggregate`; `settlement` owns the joint bridge opening and aggregate circuit, with `opening`, `digest`, and `batch` sub-words. Settlement batch helpers use the registered `batch` prefix and `chunk_count` derivation above. The existing `deposit`, `withdrawal`, and `checkpoint` families retain their heads.
 
-### Registered reward vocabulary (pending implementation)
+The existing `keccak` head owns Keccak operations, including the bridge-facing bounded stream helpers beside `keccak_prefix_words`; it introduces no new hash domain.
 
-Final spellings registered before implementation per the registration gate; this file carries no former names. Grouped by sub-module; each name means exactly the following and nothing else.
+### Keccak stream helpers
+
+| Name | Meaning |
+|---|---|
+| `KeccakStreamTargets` / `KeccakStreamValues` | Circuit/native siblings carrying all 25 Keccak lanes as low-u32/high-u32 pairs and `byte_offset`. The incomplete rate prefix is already XORed into the state; bytes after the offset retain the previous permutation output. Native default is the zero initial state. |
+| `byte_offset` | Position of the next byte XOR, in 0 through 135, in both stream representations. Stream byte `j` occupies lane `j/8`, shift `8*(j%8)`. |
+| `keccak_stream_absorb` / `keccak_stream_absorb_values` | Circuit/native bounded append of at most 136 bytes from exactly 34 big-endian u32 words, requiring a zero suffix. XOR the prefix at the offset, permute when a rate block completes, and retain the remaining partial state without padding. Native validation precedes mutation. |
+| `keccak_stream_finalize` / `keccak_stream_finalize_values` | Circuit/native final digest: XOR `0x01` at the offset and `0x80` at rate byte 135, permute once, and return the first 32 lane bytes. Circuit digest words retain `Bytes32Target` big-endian byte order. |
+
+`U32Target`, `Bytes32Target`, `keccak_f1600`, `tiny_keccak::keccakf`, and dependency `from_canonical_*` conversions retain their existing spellings. These helpers do not change cryptographic domain bytes or publication layouts.
+
+### Registered reward vocabulary
+
+Session, ledger, payout, and publication names below are the current spellings. Hierarchy names describe the implemented internal reward graph. They are not external aggregate segments.
 
 Session (`reward_session.rs`) - one proof chain per (economic domain, source checkpoint, user):
 
@@ -458,7 +471,7 @@ Ledger - the global once-only issuance state:
 | `PsyRewardLedger/Empty/1` | Poseidon of the domain bytes alone. It is the empty summary. The empty user root repeats the node preimage above it. Unfrozen. |
 | `PsyRewardLedger/Proof/1` | SHA-256 proof-id domain. Its preimage is the `reward_ledger_proof_id` entry. Not a Poseidon label. Unfrozen. |
 
-Aggregate - the family-7 batch publication consumer:
+Aggregate - publication and the internal reward hierarchy:
 
 | Name | Meaning |
 |---|---|
@@ -467,8 +480,15 @@ Aggregate - the family-7 batch publication consumer:
 | `InclusionAggregateProof` / `prove_inclusion_aggregate` | Shared adapter proof and its constructor. |
 | `RewardLedgerFinalProof`, `final_proof`, `final_state`, `ledger_final_user_root` | The window's closing ledger state, its proof, and its user tree root. |
 | `reward_inclusion`, `reward_session`, `reward_aggregate` | Aggregate manager fields, one per sub-module. |
-| `RewardPayoutSlot` | One payout slot in `RewardInclusionAggregateCircuit`: session proof, ledger state, source checkpoint, and payout leaf. |
+| `RewardPayoutSlot` | One of 4 payout slots in `RewardInclusionChunkCircuit`: session proof, ledger state, source checkpoint, and payout leaf. Not a slot of the final adapter. |
 | `constrain_reward_payout` | Circuit constraint for one `RewardPayoutSlot` in `inclusion_aggregate.rs`. |
+| `REWARD_AGGREGATE_NODE_PI_LEN` | Internal node width, 131 fields. Family 13, variant 3, levels 0 through 8. Not `AGGREGATE_PI_LEN` and not the 34-field session statement. |
+| `RewardInclusionChunkCircuit` | Level-0 circuit. Exactly 4 slots and one owned shared `dummy_proof` target. Proves one internal range, including an empty or partial range. Not an external segment. |
+| `RewardInclusionCombineCircuit` | One combine level from 1 through 8. Both children use the constant verifier of descriptor `level-1`. No dummy business child and no skip flag. |
+| `REWARD_CHUNK_ABSORB_CALLS` | The fixed count of bounded Keccak appends in one reward chunk, `ceil(S * SOURCE_CHECKPOINT_REWARD_LEAF_BYTES / 136)`, where `S` is `REWARD_CHUNK_SLOTS`. |
+| `RewardAggregateNodeTargets` | The 131-field node statement: shared bindings, range, boundary users, claim subtree root, and incoming plus outgoing Keccak streams. |
+| `dummy_proof` | Chunk-owned shared proof target. Every chunk witness assigns the unmodified genuine auxiliary dummy proof, including a full chunk. Inactive slot targets are separate and are not this target. |
+| `registrations` | On the reward adapter, the nine internal descriptors. On `AggregateCircuits`, the sorted closed 17-entry set. Identity fingerprints stay `[0; 4]`. |
 
 Payout leaf and registry:
 
@@ -477,5 +497,6 @@ Payout leaf and registry:
 | `source_checkpoint_reward_leaf_commit` | Keccak commit of one payout leaf under `PsyBridge/SourceCheckpointReward/1/Leaf`. |
 | `SourceCheckpointRewardOpening.leaves` | The opening's payout leaves. |
 | `CircuitSetRegistration`, `circuit_set_registration`, `build_registrations`, `validate_registrations`, `registrations` | One registered circuit triplet and its registry operations. |
+| `CIRCUIT_SET_FAMILIES` | Closed ordered 17-entry registry in `bridge_aggregate.rs`: `(1,0,0,40) (2,0,0,32) (3,0,0,34) (7,0,2,28) (7,0,3,28) (9,0,1,37) (11,0,1,12) (12,0,2,12) (13,0,3,131)` through `(13,8,3,131)`. Wire version stays 2. Old 7-entry, 8-entry, and 14-entry sets are rejected. The nine `(13,*,3,131)` rows are internal hierarchy nodes, not extra publication families. |
 
 Domain strings: `PsyRewardJobs/Session/1`, `PsyRewardSession/Summary/1`, `PsyRewardLedger/{State,Window,Verifier,Node,Empty,Issued,Proof}/1`, `PsyBridge/SourceCheckpointReward/1/Leaf`.

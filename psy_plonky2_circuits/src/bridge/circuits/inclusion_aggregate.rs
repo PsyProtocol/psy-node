@@ -3,18 +3,21 @@ use plonky2::{
     field::{extension::Extendable, goldilocks_field::GoldilocksField, types::{Field, Field64, PrimeField64}},
     hash::{hash_types::{HashOut, HashOutTarget}, poseidon::PoseidonHash},
     iop::{target::{BoolTarget, Target}, witness::{PartialWitness, WitnessWrite}},
-    plonk::{circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData}, config::{AlgebraicHasher, GenericConfig, Hasher, PoseidonGoldilocksConfig}, proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget}},
+    plonk::{circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData}, config::{AlgebraicHasher, GenericConfig, Hasher, PoseidonGoldilocksConfig}, proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget}},
     recursion::dummy_circuit::{dummy_circuit, dummy_proof},
 };
-use psy_client_data::bridge_aggregate::{Bytes32, Hash4, InclusionAggregateHeader, NetworkConfig, SourceCheckpointRewardLeaf, SourceCheckpointRewardOpening, WithdrawalLeaf, BRIDGE_USER_ID, CLAIM_TREE_MAX_CAPACITY, INCLUSION_AGGREGATE_CAPACITIES, REWARD_PUBLICATION_FAMILY, SOURCE_CHECKPOINT_REWARD_OPENING_HEADER_BYTES, REWARD_SESSION_PROOF_FIELD_COUNT, WITHDRAWAL_PUBLICATION_FAMILY};
+use psy_client_data::bridge_aggregate::{Bytes32, CircuitSetRegistration, Hash4, InclusionAggregateHeader, NetworkConfig, SourceCheckpointRewardLeaf, SourceCheckpointRewardOpening, WithdrawalLeaf, BRIDGE_USER_ID, CLAIM_TREE_MAX_CAPACITY, INCLUSION_AGGREGATE_CAPACITIES, REWARD_PUBLICATION_FAMILY, SOURCE_CHECKPOINT_REWARD_LEAF_BYTES, SOURCE_CHECKPOINT_REWARD_OPENING_HEADER_BYTES, REWARD_SESSION_PROOF_FIELD_COUNT, WITHDRAWAL_PUBLICATION_FAMILY};
 use psy_client_data::qdata::checkpoint::PsyCheckpointLeaf;
-use psy_common_circuit::traits::{CreatableTarget, ToTargets};
+use psy_common_circuit::{serialization::PsyGateSerializer, traits::{CreatableTarget, ToTargets}};
 use psy_network_circuit::gadgets::qdata::checkpoint::PsyCheckpointLeafGadget;
 use psy_plonky2_basic_helpers::builder::{comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers};
-use psy_plonky2_common_circuits::{bridge::{aggregate_commitment::{self as hash, Bytes32Target, Domain, AggregateLeafTarget, WithdrawalLeafTarget}, aggregate_config::NetworkConfigTarget}, hash::keccak::keccak256_bytes_targets};
+use psy_plonky2_basic_helpers::u32::gadgets::arithmetic_u32::U32Target;
+use psy_plonky2_common_circuits::{bridge::{aggregate_commitment::{self as hash, keccak_stream_absorb, keccak_stream_absorb_values, keccak_stream_finalize, keccak_stream_finalize_values, Bytes32Target, Domain, KeccakStreamTargets, KeccakStreamValues, AggregateLeafTarget, WithdrawalLeafTarget}, aggregate_config::NetworkConfigTarget}, hash::keccak::keccak256_bytes_targets};
 use super::deposit_aggregate::less_words;
 use super::historical_merkle_proof::{historical_merkle_proof, HistoricalMerkleProofTarget};
 use super::reward_session::{reward_ledger_window_hash, reward_session_seed, reward_session_summary, summary_path_root, RewardLedgerStateTargets, RewardLedgerStateValues, RewardLedgerWindowTargets};
+use crate::proof_minifier::pm_core::get_circuit_fingerprint_generic_q;
+use parth_core::crypto::hash::traits::ToU64x4;
 use tiny_keccak::Hasher as _;
 
 type F = GoldilocksField;
@@ -28,8 +31,25 @@ const WITHDRAWAL_ROOT_NODE: u64 = 0x57524f4f544e;
 #[repr(u8)]
 pub enum AggregateFamily { Withdrawal = 2, Reward = 3 }
 
-pub struct RewardInclusionAggregateCircuit<const CAPACITY: usize> {
+/// Internal reward hierarchy statement width.
+pub const REWARD_AGGREGATE_NODE_PI_LEN: usize = 131;
+/// Slots joined by one reward chunk. A power of two, and a divisor of the publication capacity.
+pub const REWARD_CHUNK_SLOTS: usize = 4;
+const REWARD_PUBLICATION_CAPACITY: usize = 1024;
+/// Chunk descriptor plus one descriptor per combine level: `1 + log2(C / S)`.
+pub const REWARD_HIERARCHY_LEVELS: usize = 9;
+/// Bounded Keccak appends that absorb one reward chunk: `ceil(S * leaf bytes / 136)`.
+pub const REWARD_CHUNK_ABSORB_CALLS: usize =
+    (REWARD_CHUNK_SLOTS * SOURCE_CHECKPOINT_REWARD_LEAF_BYTES).div_ceil(136);
+const REWARD_AGGREGATE_NODE_FAMILY: u8 = 13;
+const REWARD_AGGREGATE_NODE_VARIANT: u8 = 3;
+
+pub struct RewardInclusionAggregateCircuit {
     pub circuit_data: CircuitData<F, PoseidonGoldilocksConfig, 2>,
+    session: VerifierCircuitData<F, PoseidonGoldilocksConfig, 2>,
+    nodes: [VerifierCircuitData<F, PoseidonGoldilocksConfig, 2>; REWARD_HIERARCHY_LEVELS],
+    source_chain_count: usize,
+    registrations: [CircuitSetRegistration; REWARD_HIERARCHY_LEVELS],
     config: NetworkConfigTarget,
     config_hash: Bytes32Target,
     window_id: Bytes32Target,
@@ -46,10 +66,9 @@ pub struct RewardInclusionAggregateCircuit<const CAPACITY: usize> {
     count: Target,
     opening_digest: Bytes32Target,
     claim_tree_root: Bytes32Target,
+    root_proof: ProofWithPublicInputsTarget<2>,
     final_proof: ProofWithPublicInputsTarget<2>,
     final_state: RewardLedgerStateTargets,
-    slots: Vec<RewardPayoutSlot>,
-    user_common: CommonCircuitData<F, 2>,
 }
 
 pub struct WithdrawalInclusionAggregateCircuit<C: GenericConfig<D, F = F>, const D: usize, const CAPACITY: usize>
@@ -119,7 +138,8 @@ struct RewardPayoutSlot {
     source: HistoricalMerkleProofTarget,
     session_root: HashOutTarget,
     summary_siblings: [HashOutTarget; 32],
-    leaf_words: Vec<Target>,
+    leaf_words: [Target; 48],
+    commit: Bytes32Target,
 }
 
 
@@ -290,17 +310,7 @@ fn source_checkpoint_reward_leaf_commit(builder: &mut CircuitBuilder<F, 2>, body
     psy_plonky2_common_circuits::hash::keccak::keccak256_u32_words_be_abi(builder, &preimage).map(|word| word.0)
 }
 
-fn source_checkpoint_reward_opening(
-    builder: &mut CircuitBuilder<F, 2>, header: &[Target], leaves: &[Vec<Target>], count: Target,
-) -> Bytes32Target {
-    assert_eq!(header.len(), SOURCE_CHECKPOINT_REWARD_OPENING_HEADER_BYTES / 4);
-    let mut words = source_domain(builder, b"Opening").to_vec();
-    words.extend_from_slice(header);
-    for leaf in leaves { words.extend_from_slice(leaf); }
-    let header_bytes = builder.constant(F::from_canonical_usize(32 + SOURCE_CHECKPOINT_REWARD_OPENING_HEADER_BYTES));
-    let length = builder.mul_const_add(F::from_canonical_usize(192), count, header_bytes);
-    hash::keccak_prefix_words(builder, &words, length)
-}
+
 fn bytes32_to_bytes(builder: &mut CircuitBuilder<F, 2>, words: Bytes32Target) -> [Target; 32] {
     let mut bytes = [builder.zero(); 32];
     for (index, word) in words.into_iter().enumerate() {
@@ -315,7 +325,7 @@ fn bytes32_to_bytes(builder: &mut CircuitBuilder<F, 2>, words: Bytes32Target) ->
 
 fn amount_words(builder: &mut CircuitBuilder<F, 2>, amount: &[Target; 8]) -> [Target; 8] {
     std::array::from_fn(|index| {
-        let limb = amount[index];
+        let limb = amount[7 - index];
         builder.range_check(limb, 32);
         hash::word(&mut *builder, limb, 32)[7]
     })
@@ -342,7 +352,7 @@ fn reward_ledger_window(
     (RewardLedgerWindowTargets { config_hash, economic_domain, window_id, end_checkpoint_id, end_checkpoint_root, start_root, verifier_hash, hash }, config_words, window_words, old_ledger_state_root)
 }
 
-fn constrain_reward_payout<const CAPACITY: usize>(
+fn constrain_reward_payout(
     builder: &mut CircuitBuilder<F, 2>, index: usize, count: Target, previous_user: Option<Target>,
     common: &CommonCircuitData<F, 2>, real_vk: &VerifierCircuitTarget, dummy_proof: &ProofWithPublicInputsTarget<2>,
     dummy_vk: &VerifierCircuitTarget, ledger_window: &RewardLedgerWindowTargets, ledger_final_user_root: HashOutTarget,
@@ -350,7 +360,7 @@ fn constrain_reward_payout<const CAPACITY: usize>(
     let zero = builder.zero();
     let one = builder.one();
     let slot = builder.constant(F::from_canonical_usize(index));
-    let active = builder.is_less_than(CAPACITY.ilog2() as usize + 1, slot, count);
+    let active = builder.is_less_than(REWARD_CHUNK_SLOTS.ilog2() as usize + 1, slot, count);
     let inactive = builder.not(active);
     let proof = builder.add_virtual_proof_with_pis(common);
     builder.conditionally_verify_proof::<PoseidonGoldilocksConfig>(active, &proof, real_vk, dummy_proof, dummy_vk, common);
@@ -407,120 +417,663 @@ fn constrain_reward_payout<const CAPACITY: usize>(
     let summary = reward_session_summary(builder, &proof.public_inputs, seed, session_root, final_step);
     let summary_root = summary_path_root(builder, user_id, summary, &summary_siblings);
     builder.connect_hashes_if_true(active, summary_root, ledger_final_user_root);
-    let mut leaf_words = Vec::with_capacity(48);
+    let mut encoded = Vec::with_capacity(48);
     for chunk in ledger_window.economic_domain.chunks(4) {
         let mut word = builder.zero();
         for byte in chunk { word = builder.mul_const_add(F::from_canonical_u32(256), word, *byte); }
-        leaf_words.push(word);
+        encoded.push(word);
     }
-    leaf_words.extend(hash::word(builder, source_index, 32));
-    leaf_words.extend(hash::word(builder, user_id, 32));
-    leaf_words.extend(amount_words(builder, &std::array::from_fn(|i| proof.public_inputs[13 + i])));
-    leaf_words.extend(hash::word_address(builder, recipient));
-    leaf_words.extend(hash::word(builder, one, 1));
-    for &word in &leaf_words { builder.connect_if_true(inactive, word, zero); }
-    RewardPayoutSlot { proof, state, source_checkpoint_id, source, session_root, summary_siblings, leaf_words }
+    encoded.extend(hash::word(builder, source_index, 32));
+    encoded.extend(hash::word(builder, user_id, 32));
+    encoded.extend(amount_words(builder, &std::array::from_fn(|i| proof.public_inputs[13 + i])));
+    encoded.extend(hash::word_address(builder, recipient));
+    encoded.extend(hash::word(builder, one, 1));
+    let leaf_words = std::array::from_fn(|index| builder.select(active, encoded[index], zero));
+    let raw_commit = source_checkpoint_reward_leaf_commit(builder, &encoded);
+    let commit = std::array::from_fn(|index| builder.select(active, raw_commit[index], zero));
+    RewardPayoutSlot { proof, state, source_checkpoint_id, source, session_root, summary_siblings, leaf_words, commit }
 }
 
+struct RewardAggregateNodeTargets {
+    ledger_window_hash: HashOutTarget,
+    new_ledger_state_root: HashOutTarget,
+    ledger_final_user_root: HashOutTarget,
+    total_count: Target,
+    first_ordinal: Target,
+    count: Target,
+    first_user: Target,
+    last_user: Target,
+    claim_root: Bytes32Target,
+    incoming: KeccakStreamTargets,
+    outgoing: KeccakStreamTargets,
+}
 
+struct RewardInclusionChunkCircuit {
+    circuit_data: CircuitData<F, PoseidonGoldilocksConfig, 2>,
+    config: NetworkConfigTarget,
+    config_hash: Bytes32Target,
+    window_id: Bytes32Target,
+    economic_domain: [Target; 32],
+    start_root: HashOutTarget,
+    end_id: Target,
+    end_root: HashOutTarget,
+    old_ledger_state_root: HashOutTarget,
+    final_state: RewardLedgerStateTargets,
+    total_count: Target,
+    first_ordinal: Target,
+    incoming: KeccakStreamTargets,
+    dummy_proof: ProofWithPublicInputsTarget<2>,
+    slots: [RewardPayoutSlot; REWARD_CHUNK_SLOTS],
+}
 
-impl<const CAPACITY: usize> RewardInclusionAggregateCircuit<CAPACITY> {
-    pub fn new(common: &CommonCircuitData<F, 2>, verifier: &VerifierOnlyCircuitData<PoseidonGoldilocksConfig, 2>, source_chain_count: usize) -> Self {
-        assert!(INCLUSION_AGGREGATE_CAPACITIES.contains(&(CAPACITY as u32)));
-        assert!((1..=8).contains(&source_chain_count));
-        assert_eq!(common.num_public_inputs, REWARD_SESSION_PROOF_FIELD_COUNT);
+struct RewardInclusionCombineCircuit {
+    circuit_data: CircuitData<F, PoseidonGoldilocksConfig, 2>,
+    left: ProofWithPublicInputsTarget<2>,
+    right: ProofWithPublicInputsTarget<2>,
+}
 
+fn virtual_stream(builder: &mut CircuitBuilder<F, 2>) -> KeccakStreamTargets {
+    KeccakStreamTargets {
+        state: std::array::from_fn(|_| [U32Target(builder.add_virtual_target()), U32Target(builder.add_virtual_target())]),
+        byte_offset: builder.add_virtual_target(),
+    }
+}
+
+fn constant_stream(builder: &mut CircuitBuilder<F, 2>, stream: &KeccakStreamValues) -> KeccakStreamTargets {
+    KeccakStreamTargets {
+        state: std::array::from_fn(|lane| std::array::from_fn(|half| U32Target(builder.constant(F::from_canonical_u32(stream.state[lane][half]))))),
+        byte_offset: builder.constant(F::from_canonical_u8(stream.byte_offset)),
+    }
+}
+
+fn connect_stream(builder: &mut CircuitBuilder<F, 2>, left: &KeccakStreamTargets, right: &KeccakStreamTargets) {
+    for (left_lane, right_lane) in left.state.iter().zip(&right.state) {
+        builder.connect(left_lane[0].0, right_lane[0].0);
+        builder.connect(left_lane[1].0, right_lane[1].0);
+    }
+    builder.connect(left.byte_offset, right.byte_offset);
+}
+
+fn subtract_clamped(builder: &mut CircuitBuilder<F, 2>, value: Target, bound: Target) -> Target {
+    let below = builder.is_less_than(32, value, bound);
+    let difference = builder.sub(value, bound);
+    let zero = builder.zero();
+    builder.select(below, zero, difference)
+}
+
+fn register_node(builder: &mut CircuitBuilder<F, 2>, level: usize, node: &RewardAggregateNodeTargets) {
+    let prefix = [1u32, REWARD_AGGREGATE_NODE_FAMILY as u32, REWARD_AGGREGATE_NODE_VARIANT as u32, level as u32]
+        .map(|value| builder.constant(F::from_canonical_u32(value)));
+    builder.register_public_inputs(&prefix);
+    builder.register_public_inputs(&node.ledger_window_hash.elements);
+    builder.register_public_inputs(&node.new_ledger_state_root.elements);
+    builder.register_public_inputs(&node.ledger_final_user_root.elements);
+    builder.register_public_input(node.total_count);
+    builder.register_public_input(node.first_ordinal);
+    builder.register_public_input(node.count);
+    builder.register_public_input(node.first_user);
+    builder.register_public_input(node.last_user);
+    builder.register_public_inputs(&node.claim_root);
+    for lane in &node.incoming.state {
+        builder.register_public_input(lane[0].0);
+        builder.register_public_input(lane[1].0);
+    }
+    builder.register_public_input(node.incoming.byte_offset);
+    for lane in &node.outgoing.state {
+        builder.register_public_input(lane[0].0);
+        builder.register_public_input(lane[1].0);
+    }
+    builder.register_public_input(node.outgoing.byte_offset);
+}
+
+fn checked_node_prefix(builder: &mut CircuitBuilder<F, 2>, proof: &ProofWithPublicInputsTarget<2>, level: usize) -> RewardAggregateNodeTargets {
+    let inputs = &proof.public_inputs;
+    for (target, value) in inputs[..4].iter().zip([1u32, REWARD_AGGREGATE_NODE_FAMILY as u32, REWARD_AGGREGATE_NODE_VARIANT as u32, level as u32]) {
+        let expected = builder.constant(F::from_canonical_u32(value));
+        builder.connect(*target, expected);
+    }
+    RewardAggregateNodeTargets {
+        ledger_window_hash: HashOutTarget { elements: std::array::from_fn(|index| inputs[4 + index]) },
+        new_ledger_state_root: HashOutTarget { elements: std::array::from_fn(|index| inputs[8 + index]) },
+        ledger_final_user_root: HashOutTarget { elements: std::array::from_fn(|index| inputs[12 + index]) },
+        total_count: inputs[16],
+        first_ordinal: inputs[17],
+        count: inputs[18],
+        first_user: inputs[19],
+        last_user: inputs[20],
+        claim_root: std::array::from_fn(|index| inputs[21 + index]),
+        incoming: KeccakStreamTargets {
+            state: std::array::from_fn(|lane| [U32Target(inputs[29 + lane * 2]), U32Target(inputs[30 + lane * 2])]),
+            byte_offset: inputs[79],
+        },
+        outgoing: KeccakStreamTargets {
+            state: std::array::from_fn(|lane| [U32Target(inputs[80 + lane * 2]), U32Target(inputs[81 + lane * 2])]),
+            byte_offset: inputs[130],
+        },
+    }
+}
+
+fn node_registration(level: u8, data: &CircuitData<F, PoseidonGoldilocksConfig, 2>) -> anyhow::Result<CircuitSetRegistration> {
+    anyhow::ensure!(data.common.num_public_inputs == REWARD_AGGREGATE_NODE_PI_LEN, "reward hierarchy public-input width mismatch");
+    let fingerprint = get_circuit_fingerprint_generic_q::<2, F, PoseidonGoldilocksConfig>(&data.verifier_only).to_u64x4();
+    anyhow::ensure!(fingerprint != [0; 4], "missing reward hierarchy pin");
+    let digest = |bytes: &[u8]| {
+        let mut hasher = tiny_keccak::Keccak::v256();
+        hasher.update(bytes);
+        let mut result = [0u8; 32];
+        hasher.finalize(&mut result);
+        result
+    };
+    Ok(CircuitSetRegistration {
+        family: REWARD_AGGREGATE_NODE_FAMILY as u16, level, variant: REWARD_AGGREGATE_NODE_VARIANT,
+        pi_words: REWARD_AGGREGATE_NODE_PI_LEN as u16, fingerprint,
+        common_digest: digest(&data.common.to_bytes(&PsyGateSerializer).map_err(|error| anyhow::anyhow!("common serialization: {error:?}"))?),
+        verifier_digest: digest(&data.verifier_only.to_bytes().map_err(|error| anyhow::anyhow!("verifier serialization: {error:?}"))?),
+        identity_fingerprint: [0; 4],
+    })
+}
+
+fn verifier_data(data: &CircuitData<F, PoseidonGoldilocksConfig, 2>) -> VerifierCircuitData<F, PoseidonGoldilocksConfig, 2> {
+    VerifierCircuitData { verifier_only: data.verifier_only.clone(), common: data.common.clone() }
+}
+#[cfg(test)]
+fn proc_status_field(phase: &str, name: &str) -> anyhow::Result<String> {
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|error| anyhow::anyhow!("reward phase status: {error}"))?;
+    status.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key == name).then(|| value.trim().to_string())
+    }).ok_or_else(|| anyhow::anyhow!("reward phase {phase} missing {name}"))
+}
+#[cfg(test)]
+fn report_chunk_phase(builder: &CircuitBuilder<F, 2>, started: std::time::Instant, phase: &str) -> anyhow::Result<()> {
+    eprintln!(
+        "[reward-constructor] phase={phase} elapsed_ms={} gates={} vm_rss={} vm_hwm={}",
+        started.elapsed().as_millis(), builder.num_gates(), proc_status_field(phase, "VmRSS")?, proc_status_field(phase, "VmHWM")?,
+    );
+    Ok(())
+}
+#[cfg(test)]
+fn report_prove_phase(started: std::time::Instant, phase: &str) -> anyhow::Result<()> {
+    eprint!("[reward-prove] phase={phase} elapsed_ms={}", started.elapsed().as_millis());
+    std::io::Write::flush(&mut std::io::stderr())?;
+    let rss = proc_status_field(phase, "VmRSS")?;
+    let hwm = proc_status_field(phase, "VmHWM")?;
+    eprintln!(" vm_rss={rss} vm_hwm={hwm}");
+    std::io::Write::flush(&mut std::io::stderr())?;
+    Ok(())
+}
+
+impl RewardInclusionChunkCircuit {
+    fn new(common: &CommonCircuitData<F, 2>, verifier: &VerifierOnlyCircuitData<PoseidonGoldilocksConfig, 2>, source_chain_count: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..=8).contains(&source_chain_count), "reward source chain count is outside 1..=8");
+        anyhow::ensure!(common.num_public_inputs == REWARD_SESSION_PROOF_FIELD_COUNT, "reward session width mismatch");
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=chunk-new-entry");
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
         let config = NetworkConfigTarget::new(&mut builder, source_chain_count);
         let real_vk = builder.constant_verifier_data(verifier);
         let (ledger_window, config_words, window_words, old_ledger_state_root) = reward_ledger_window(&mut builder, &config, &real_vk);
         builder.connect_hashes(ledger_window.start_root, old_ledger_state_root);
-        let aggregate_capacity = builder.constant(F::from_canonical_usize(CAPACITY));
+        let total_count = builder.add_virtual_target();
+        let first_ordinal = builder.add_virtual_target();
+        builder.range_check(total_count, 32);
+        builder.range_check(first_ordinal, 32);
+        let publication_limit = builder.constant(F::from_canonical_usize(REWARD_PUBLICATION_CAPACITY));
+        builder.ensure_is_less_than_or_equal(32, total_count, publication_limit);
+        builder.ensure_is_less_than_or_equal(32, total_count, config.max_rewards);
+        let span = builder.constant(F::from_canonical_usize(REWARD_CHUNK_SLOTS));
+        let mut matched = builder._false();
+        for candidate in 0..REWARD_PUBLICATION_CAPACITY / REWARD_CHUNK_SLOTS {
+            let value = builder.constant(F::from_canonical_usize(candidate));
+            let aligned = builder.mul(value, span);
+            let equal = builder.is_equal(first_ordinal, aligned);
+            matched = builder.or(matched, equal);
+        }
+        let one = builder.one();
+        builder.connect(matched.target, one);
+        let remaining = subtract_clamped(&mut builder, total_count, first_ordinal);
+        let partial = builder.is_less_than(32, remaining, span);
+        let count = builder.select(partial, remaining, span);
+        let zero = builder.zero();
+        let empty = builder.is_equal(count, zero);
+        let (dummy_proof, dummy_vk) = builder.dummy_proof_and_constant_vk_no_generator::<PoseidonGoldilocksConfig>(common)
+            .map_err(|error| anyhow::anyhow!("reward chunk dummy target: {error:?}"))?;
+        let final_state = RewardLedgerStateTargets::new(&mut builder);
+        let window_empty = builder.is_equal(total_count, zero);
+        let nonempty_window = builder.not(window_empty);
+        builder.connect_hashes_if_true(nonempty_window, final_state.ledger_window_hash, ledger_window.hash);
+        builder.connect_if_true(nonempty_window, final_state.session_count, total_count);
+        builder.connect_if_true(nonempty_window, final_state.unfinished_session_count, zero);
+        #[cfg(test)]
+        report_chunk_phase(&builder, started, "chunk-shared-setup")?;
+        let mut previous_user = None;
+        let mut slots = Vec::with_capacity(REWARD_CHUNK_SLOTS);
+        for index in 0..REWARD_CHUNK_SLOTS {
+            slots.push(constrain_reward_payout(&mut builder, index, count, previous_user, common, &real_vk, &dummy_proof, &dummy_vk, &ledger_window, final_state.user_root));
+            previous_user = Some(slots[index].proof.public_inputs[4]);
+            #[cfg(test)]
+            report_chunk_phase(&builder, started, &format!("chunk-payout-slot index={index}"))?;
+        }
+        let mut first_user = zero;
+        let mut last_user = zero;
+        for (index, slot) in slots.iter().enumerate() {
+            let position = builder.constant(F::from_canonical_usize(index));
+            let next = builder.constant(F::from_canonical_usize(index + 1));
+            let not_empty = builder.not(empty);
+            let at_zero = builder.is_equal(position, zero);
+            let is_first = builder.and(not_empty, at_zero);
+            let is_last = builder.is_equal(next, count);
+            first_user = builder.select(is_first, slot.proof.public_inputs[4], first_user);
+            last_user = builder.select(is_last, slot.proof.public_inputs[4], last_user);
+        }
+        builder.connect_if_true(empty, first_user, zero);
+        builder.connect_if_true(empty, last_user, zero);
+        let mut nodes = Vec::with_capacity(REWARD_CHUNK_SLOTS);
+        for (index, slot) in slots.iter().enumerate() {
+            let position = builder.constant(F::from_canonical_usize(index));
+            let ordinal = builder.add(first_ordinal, position);
+            let real = builder.is_less_than(REWARD_CHUNK_SLOTS.ilog2() as usize + 1, position, count);
+            let leaf = claim_leaf(&mut builder, total_count, ordinal, slot.commit);
+            let empty_leaf = claim_empty(&mut builder, total_count, ordinal);
+            nodes.push(std::array::from_fn(|word| builder.select(real, leaf[word], empty_leaf[word])));
+        }
+        #[cfg(test)]
+        report_chunk_phase(&builder, started, "chunk-claim-leaves")?;
+        for level in 1..=REWARD_CHUNK_SLOTS.trailing_zeros() {
+            nodes = nodes.chunks_exact(2).map(|pair| claim_parent(&mut builder, level, pair[0], pair[1])).collect();
+        }
+        #[cfg(test)]
+        report_chunk_phase(&builder, started, "chunk-claim-parents")?;
+        let incoming = virtual_stream(&mut builder);
+        let mut stream = incoming;
+        for call in 0..REWARD_CHUNK_ABSORB_CALLS {
+            let start = 136 * call;
+            let mut words = [zero; 34];
+            for (slot_index, slot) in slots.iter().enumerate() {
+                for (word_index, &word) in slot.leaf_words.iter().enumerate() {
+                    let byte_start = slot_index * SOURCE_CHECKPOINT_REWARD_LEAF_BYTES + word_index * 4;
+                    if byte_start + 4 <= start || byte_start >= start + 136 { continue; }
+                    let destination = (byte_start - start) / 4;
+                    words[destination] = word;
+                }
+            }
+            let produced = builder.mul_const(F::from_canonical_usize(SOURCE_CHECKPOINT_REWARD_LEAF_BYTES), count);
+            let consumed = builder.constant(F::from_canonical_usize(start));
+            let available = subtract_clamped(&mut builder, produced, consumed);
+            let rate = builder.constant(F::from_canonical_usize(136));
+            let clipped = builder.is_less_than(32, available, rate);
+            let byte_length = builder.select(clipped, available, rate);
+            stream = keccak_stream_absorb(&mut builder, stream, &words, byte_length);
+            #[cfg(test)]
+            report_chunk_phase(&builder, started, &format!("chunk-stream-absorb call={call}"))?;
+        }
+        let node = RewardAggregateNodeTargets {
+            ledger_window_hash: ledger_window.hash, new_ledger_state_root: final_state.root,
+            ledger_final_user_root: final_state.user_root, total_count, first_ordinal, count, first_user, last_user,
+            claim_root: nodes[0], incoming, outgoing: stream,
+        };
+        register_node(&mut builder, 0, &node);
+        #[cfg(test)]
+        report_chunk_phase(&builder, started, "chunk-before-build")?;
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=chunk-build-entry");
+        let circuit_data = builder.build::<PoseidonGoldilocksConfig>();
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=chunk-build elapsed_ms={}", started.elapsed().as_millis());
+        anyhow::ensure!(circuit_data.common.num_public_inputs == REWARD_AGGREGATE_NODE_PI_LEN, "reward chunk width mismatch");
+
+        let slots = slots.try_into().map_err(|_| anyhow::anyhow!("reward chunk slot width mismatch"))?;
+        Ok(Self {
+            circuit_data, config, config_hash: config_words, window_id: window_words,
+            economic_domain: ledger_window.economic_domain, start_root: ledger_window.start_root,
+            end_id: ledger_window.end_checkpoint_id, end_root: ledger_window.end_checkpoint_root, old_ledger_state_root,
+            final_state, total_count, first_ordinal, incoming: node.incoming, dummy_proof, slots,
+        })
+    }
+}
+
+impl RewardInclusionCombineCircuit {
+    fn new(level: usize, child: &VerifierCircuitData<F, PoseidonGoldilocksConfig, 2>) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..REWARD_HIERARCHY_LEVELS).contains(&level), "reward combine level is outside 1..=8");
+        anyhow::ensure!(child.common.num_public_inputs == REWARD_AGGREGATE_NODE_PI_LEN, "reward child width mismatch");
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=combine-new-entry level={level}");
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let verifier = builder.constant_verifier_data(&child.verifier_only);
+        let left_proof = builder.add_virtual_proof_with_pis(&child.common);
+        let right_proof = builder.add_virtual_proof_with_pis(&child.common);
+        builder.verify_proof::<PoseidonGoldilocksConfig>(&left_proof, &verifier, &child.common);
+        builder.verify_proof::<PoseidonGoldilocksConfig>(&right_proof, &verifier, &child.common);
+        let left = checked_node_prefix(&mut builder, &left_proof, level - 1);
+        let right = checked_node_prefix(&mut builder, &right_proof, level - 1);
+        builder.connect_hashes(left.ledger_window_hash, right.ledger_window_hash);
+        builder.connect_hashes(left.new_ledger_state_root, right.new_ledger_state_root);
+        builder.connect_hashes(left.ledger_final_user_root, right.ledger_final_user_root);
+        builder.connect(left.total_count, right.total_count);
+        let span = builder.constant(F::from_canonical_usize(REWARD_CHUNK_SLOTS << level));
+        let half = builder.constant(F::from_canonical_usize(REWARD_CHUNK_SLOTS << (level - 1)));
+        let mut matched = builder._false();
+        for candidate in 0..REWARD_PUBLICATION_CAPACITY / (REWARD_CHUNK_SLOTS << level) {
+            let value = builder.constant(F::from_canonical_usize(candidate));
+            let aligned = builder.mul(value, span);
+            let equal = builder.is_equal(left.first_ordinal, aligned);
+            matched = builder.or(matched, equal);
+        }
+        let one = builder.one();
+        builder.connect(matched.target, one);
+        let right_first = builder.add(left.first_ordinal, half);
+        builder.connect(right.first_ordinal, right_first);
+        let left_remaining = subtract_clamped(&mut builder, left.total_count, left.first_ordinal);
+        let right_remaining = subtract_clamped(&mut builder, right.total_count, right.first_ordinal);
+        let left_partial = builder.is_less_than(32, left_remaining, half);
+        let right_partial = builder.is_less_than(32, right_remaining, half);
+        let left_count = builder.select(left_partial, left_remaining, half);
+        builder.connect(left.count, left_count);
+        let right_count = builder.select(right_partial, right_remaining, half);
+        builder.connect(right.count, right_count);
+        let parent_remaining = subtract_clamped(&mut builder, left.total_count, left.first_ordinal);
+        let parent_partial = builder.is_less_than(32, parent_remaining, span);
+        let count = builder.select(parent_partial, parent_remaining, span);
+        let summed = builder.add(left.count, right.count);
+        builder.connect(count, summed);
+        let zero = builder.zero();
+        let left_empty = builder.is_equal(left.count, zero);
+        let right_empty = builder.is_equal(right.count, zero);
+        builder.connect_if_true(left_empty, left.first_user, zero);
+        builder.connect_if_true(left_empty, left.last_user, zero);
+        builder.connect_if_true(right_empty, right.first_user, zero);
+        builder.connect_if_true(right_empty, right.last_user, zero);
+        let left_nonempty = builder.not(left_empty);
+        let right_nonempty = builder.not(right_empty);
+        let both = builder.and(left_nonempty, right_nonempty);
+        let ordered = builder.is_less_than(32, left.last_user, right.first_user);
+        builder.connect_if_true(both, ordered.target, one);
+        let first_user = builder.select(left_empty, right.first_user, left.first_user);
+        let last_user = builder.select(right_empty, left.last_user, right.last_user);
+        connect_stream(&mut builder, &left.outgoing, &right.incoming);
+        let claim_root = claim_parent(&mut builder, REWARD_CHUNK_SLOTS.trailing_zeros() + level as u32, left.claim_root, right.claim_root);
+        let node = RewardAggregateNodeTargets {
+            ledger_window_hash: left.ledger_window_hash, new_ledger_state_root: left.new_ledger_state_root,
+            ledger_final_user_root: left.ledger_final_user_root, total_count: left.total_count,
+            first_ordinal: left.first_ordinal, count, first_user, last_user, claim_root,
+            incoming: left.incoming, outgoing: right.outgoing,
+        };
+        register_node(&mut builder, level, &node);
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=combine-build-entry level={level}");
+        let circuit_data = builder.build::<PoseidonGoldilocksConfig>();
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=combine-build level={level} elapsed_ms={}", started.elapsed().as_millis());
+        anyhow::ensure!(circuit_data.common.num_public_inputs == REWARD_AGGREGATE_NODE_PI_LEN, "reward combine width mismatch");
+        Ok(Self { circuit_data, left: left_proof, right: right_proof })
+    }
+
+    fn prove(&self, left: ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>, right: ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>) -> anyhow::Result<ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>> {
+        let mut witness = PartialWitness::new();
+        witness.set_proof_with_pis_target(&self.left, &left)?;
+        witness.set_proof_with_pis_target(&self.right, &right)?;
+        drop(left);
+        drop(right);
+        self.circuit_data.prove(witness)
+    }
+}
+
+fn set_stream(witness: &mut PartialWitness<F>, target: &KeccakStreamTargets, value: &KeccakStreamValues) -> anyhow::Result<()> {
+    for (lane_target, lane) in target.state.iter().zip(value.state) {
+        witness.set_target(lane_target[0].0, F::from_canonical_u32(lane[0]))?;
+        witness.set_target(lane_target[1].0, F::from_canonical_u32(lane[1]))?;
+    }
+    witness.set_target(target.byte_offset, F::from_canonical_u8(value.byte_offset))
+}
+
+fn stream_from_proof(proof: &ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>, outgoing: bool) -> anyhow::Result<KeccakStreamValues> {
+    let base = if outgoing { 80 } else { 29 };
+    let inputs = &proof.public_inputs;
+    anyhow::ensure!(inputs.len() == REWARD_AGGREGATE_NODE_PI_LEN, "reward node width mismatch");
+    let state = std::array::from_fn(|lane| [
+        inputs[base + lane * 2].to_canonical_u64() as u32,
+        inputs[base + lane * 2 + 1].to_canonical_u64() as u32,
+    ]);
+    Ok(KeccakStreamValues { state, byte_offset: inputs[base + 50].to_canonical_u64() as u8 })
+}
+
+
+impl RewardInclusionChunkCircuit {
+    fn prove(
+        &self, config: &NetworkConfig, header: &InclusionAggregateHeader, final_state: &RewardLedgerStateValues,
+        first_ordinal: u32, incoming: &KeccakStreamValues, leaves: &[SourceCheckpointRewardAggregateLeaf<'_>],
+        retained_dummy_proof: &ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>,
+        inactive_slot_proof: &ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>,
+    ) -> anyhow::Result<ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>> {
+        anyhow::ensure!(leaves.len() <= REWARD_CHUNK_SLOTS, "reward chunk exceeds 4 slots");
+        let mut witness = PartialWitness::new();
+        self.config.set_witness(&mut witness, config)?;
+        set_bytes(&mut witness, &self.config_hash, &header.config_hash)?;
+        set_bytes(&mut witness, &self.window_id, &header.window_id)?;
+        let economic_domain = config.clone().load()?.economic_domain();
+        anyhow::ensure!(leaves.iter().all(|leaf| leaf.leaf.economic_domain == economic_domain), "reward economic domain differs inside one chunk");
+        for (target, byte) in self.economic_domain.iter().zip(economic_domain) { witness.set_target(*target, F::from_canonical_u8(byte))?; }
+        let old_root = header.old_ledger_state_root.ok_or_else(|| anyhow::anyhow!("reward publication ledger-state roots missing"))?;
+        set_hash4(&mut witness, self.start_root.elements, old_root)?;
+        witness.set_target(self.end_id, F::from_canonical_u32(header.end_checkpoint_id as u32))?;
+        set_hash4(&mut witness, self.end_root.elements, header.end_checkpoint_root)?;
+        set_hash4(&mut witness, self.old_ledger_state_root.elements, old_root)?;
+        self.final_state.set_witness(&mut witness, final_state)?;
+        witness.set_target(self.total_count, F::from_canonical_u32(header.total_count))?;
+        witness.set_target(self.first_ordinal, F::from_canonical_u32(first_ordinal))?;
+        set_stream(&mut witness, &self.incoming, incoming)?;
+        witness.set_proof_with_pis_target(&self.dummy_proof, retained_dummy_proof)?;
+        let empty_leaf = PsyCheckpointLeaf::default();
+        let zero_state = RewardLedgerStateValues { ledger_window_hash: [0; 4], ledger_root: [0; 4], user_root: [0; 4], session_count: 0, unfinished_session_count: 0 };
+        for (index, slot) in self.slots.iter().enumerate() {
+            if let Some(leaf) = leaves.get(index) {
+                anyhow::ensure!(leaf.proof.public_inputs.len() == REWARD_SESSION_PROOF_FIELD_COUNT, "reward leaf width mismatch");
+                anyhow::ensure!(leaf.leaf.source_checkpoint_id == u64::from(leaf.source_checkpoint_id), "reward source checkpoint differs from leaf");
+                set_bytes(&mut witness, &slot.leaf_words, &leaf.leaf.encode()?)?;
+                witness.set_proof_with_pis_target(&slot.proof, leaf.proof)?;
+                slot.state.set_witness(&mut witness, leaf.state)?;
+                witness.set_target(slot.source_checkpoint_id, F::from_canonical_u32(leaf.source_checkpoint_id))?;
+                slot.source.checkpoint_leaf.set_witness(&mut witness, leaf.source_leaf)?;
+                for (target, sibling) in slot.source.path.siblings.iter().zip(leaf.source_siblings) { set_hash4(&mut witness, target.elements, *sibling)?; }
+                set_hash4(&mut witness, slot.session_root.elements, leaf.session_root)?;
+                for (target, sibling) in slot.summary_siblings.iter().zip(leaf.summary_siblings) { set_hash4(&mut witness, target.elements, *sibling)?; }
+            } else {
+                set_bytes(&mut witness, &slot.leaf_words, &[0u8; SOURCE_CHECKPOINT_REWARD_LEAF_BYTES])?;
+                witness.set_proof_with_pis_target(&slot.proof, inactive_slot_proof)?;
+                slot.state.set_witness(&mut witness, &zero_state)?;
+                witness.set_target(slot.source_checkpoint_id, F::ZERO)?;
+                slot.source.checkpoint_leaf.set_witness(&mut witness, &empty_leaf)?;
+                for sibling in slot.source.path.siblings.iter().chain(&slot.summary_siblings) { set_hash4(&mut witness, sibling.elements, [0; 4])?; }
+                set_hash4(&mut witness, slot.session_root.elements, [0; 4])?;
+            }
+        }
+        self.circuit_data.prove(witness)
+    }
+}
+
+fn opening_prefix_stream(header: &InclusionAggregateHeader) -> anyhow::Result<KeccakStreamValues> {
+    let mut bytes = source_domain_bytes(b"Opening").to_vec();
+    bytes.extend(header.config_hash);
+    bytes.extend(header.window_id);
+    bytes.extend([0u8; 24]);
+    bytes.extend(header.end_checkpoint_id.to_be_bytes());
+    for limb in header.end_checkpoint_root {
+        bytes.extend([0u8; 24]);
+        bytes.extend(limb.to_be_bytes());
+    }
+    bytes.extend([0u8; 28]);
+    bytes.extend(header.total_count.to_be_bytes());
+    anyhow::ensure!(bytes.len() == 288, "reward opening prefix width mismatch");
+    let mut stream = KeccakStreamValues::default();
+    for (call, length) in [(0usize, 136usize), (1, 136), (2, 16)] {
+        let start = 136 * call;
+        let mut words = [0u32; 34];
+        for (index, chunk) in bytes[start..start + length].chunks_exact(4).enumerate() {
+            words[index] = u32::from_be_bytes(chunk.try_into().unwrap());
+        }
+        keccak_stream_absorb_values(&mut stream, &words, length)?;
+    }
+    Ok(stream)
+}
+
+fn source_domain_bytes(label: &[u8]) -> [u8; 32] {
+    let mut keccak = tiny_keccak::Keccak::v256();
+    keccak.update(b"PsyBridge/SourceCheckpointReward/1/");
+    keccak.update(label);
+    let mut digest = [0u8; 32];
+    keccak.finalize(&mut digest);
+    digest
+}
+
+impl RewardInclusionAggregateCircuit {
+    pub fn new(common: &CommonCircuitData<F, 2>, verifier: &VerifierOnlyCircuitData<PoseidonGoldilocksConfig, 2>, source_chain_count: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..=8).contains(&source_chain_count), "reward source chain count is outside 1..=8");
+        anyhow::ensure!(REWARD_CHUNK_SLOTS.is_power_of_two(), "reward chunk slots are not a power of two");
+        anyhow::ensure!(REWARD_PUBLICATION_CAPACITY % REWARD_CHUNK_SLOTS == 0, "reward publication capacity is not a multiple of chunk slots");
+        anyhow::ensure!(
+            REWARD_HIERARCHY_LEVELS == 1 + (REWARD_PUBLICATION_CAPACITY / REWARD_CHUNK_SLOTS).trailing_zeros() as usize,
+            "reward hierarchy levels do not cover the chunk tree",
+        );
+        anyhow::ensure!(
+            REWARD_CHUNK_SLOTS.trailing_zeros() + REWARD_HIERARCHY_LEVELS as u32 - 1 == REWARD_PUBLICATION_CAPACITY.trailing_zeros(),
+            "reward claim depth does not reach the publication tree",
+        );
+        anyhow::ensure!(common.num_public_inputs == REWARD_SESSION_PROOF_FIELD_COUNT, "reward session width mismatch");
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let mut nodes = Vec::with_capacity(REWARD_HIERARCHY_LEVELS);
+        let mut registrations = Vec::with_capacity(REWARD_HIERARCHY_LEVELS);
+        let chunk = RewardInclusionChunkCircuit::new(common, verifier, source_chain_count)?;
+        registrations.push(node_registration(0, &chunk.circuit_data)?);
+        nodes.push(verifier_data(&chunk.circuit_data));
+        drop(chunk);
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=adapter-chunk elapsed_ms={}", started.elapsed().as_millis());
+        for level in 1..REWARD_HIERARCHY_LEVELS {
+            #[cfg(test)]
+            let level_started = std::time::Instant::now();
+            let combine = RewardInclusionCombineCircuit::new(level, &nodes[level - 1])?;
+            registrations.push(node_registration(level as u8, &combine.circuit_data)?);
+            nodes.push(verifier_data(&combine.circuit_data));
+            #[cfg(test)]
+            eprintln!("[reward-constructor] phase=adapter-combine level={level} elapsed_ms={}", level_started.elapsed().as_millis());
+        }
+        let root = nodes.last().expect("reward hierarchy root").clone();
+        #[cfg(test)]
+        let adapter_started = std::time::Instant::now();
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let config = NetworkConfigTarget::new(&mut builder, source_chain_count);
+        let session_vk = builder.constant_verifier_data(verifier);
+        let (ledger_window, config_words, window_words, old_ledger_state_root) = reward_ledger_window(&mut builder, &config, &session_vk);
+        builder.connect_hashes(ledger_window.start_root, old_ledger_state_root);
+        let aggregate_capacity = builder.constant(F::from_canonical_usize(REWARD_PUBLICATION_CAPACITY));
         let total_count = builder.add_virtual_target();
         let segment_count = builder.add_virtual_target();
         let segment_index = builder.add_virtual_target();
         let first_ordinal = builder.add_virtual_target();
         let count = builder.add_virtual_target();
-        aggregate_segment(&mut builder, CAPACITY, total_count, segment_count, segment_index, first_ordinal, count, config.max_rewards);
+        aggregate_segment(&mut builder, REWARD_PUBLICATION_CAPACITY, total_count, segment_count, segment_index, first_ordinal, count, config.max_rewards);
         let zero = builder.zero();
         let one = builder.one();
         builder.connect(segment_index, zero);
-        let empty = builder.is_equal(total_count, zero);
-        let nonempty = builder.not(empty);
-        let expected_segments = builder.select(empty, zero, one);
+        let publication_empty = builder.is_equal(total_count, zero);
+        let expected_segments = builder.select(publication_empty, zero, one);
         builder.connect(segment_count, expected_segments);
         builder.connect(first_ordinal, zero);
         builder.connect(count, total_count);
-        let single_segment_limit = builder.constant(F::from_canonical_usize(1024));
-        builder.ensure_is_less_than_or_equal(32, total_count, single_segment_limit);
-        let (dummy_proof, dummy_vk) = builder.dummy_proof_and_constant_vk_no_generator::<PoseidonGoldilocksConfig>(common).expect("user reward dummy");
+        builder.ensure_is_less_than_or_equal(32, total_count, aggregate_capacity);
+        let root_vk = builder.constant_verifier_data(&root.verifier_only);
+        let root_proof = builder.add_virtual_proof_with_pis(&root.common);
+        builder.verify_proof::<PoseidonGoldilocksConfig>(&root_proof, &root_vk, &root.common);
+        let root_node = checked_node_prefix(&mut builder, &root_proof, REWARD_HIERARCHY_LEVELS - 1);
         let final_proof = builder.add_virtual_proof_with_pis(common);
-        builder.verify_proof::<PoseidonGoldilocksConfig>(&final_proof, &real_vk, common);
+        builder.verify_proof::<PoseidonGoldilocksConfig>(&final_proof, &session_vk, common);
         let final_state = RewardLedgerStateTargets::new(&mut builder);
+        let empty = builder.is_equal(total_count, zero);
+        let nonempty = builder.not(empty);
         builder.connect_hashes_if_true(nonempty, final_state.ledger_window_hash, ledger_window.hash);
-        let tip_start = HashOutTarget { elements: std::array::from_fn(|i| final_proof.public_inputs[26 + i]) };
-        let tip_end = HashOutTarget { elements: std::array::from_fn(|i| final_proof.public_inputs[30 + i]) };
-        let tip_window = HashOutTarget { elements: std::array::from_fn(|i| final_proof.public_inputs[22 + i]) };
+        let tip_start = HashOutTarget { elements: std::array::from_fn(|index| final_proof.public_inputs[26 + index]) };
+        let tip_end = HashOutTarget { elements: std::array::from_fn(|index| final_proof.public_inputs[30 + index]) };
+        let tip_window = HashOutTarget { elements: std::array::from_fn(|index| final_proof.public_inputs[22 + index]) };
         builder.connect_hashes_if_true(empty, tip_start, old_ledger_state_root);
         builder.connect_hashes_if_true(empty, tip_end, old_ledger_state_root);
         builder.connect_hashes_if_true(empty, tip_window, ledger_window.hash);
         builder.connect_if_true(empty, final_proof.public_inputs[21], zero);
-        builder.connect_hashes(final_state.root, HashOutTarget { elements: std::array::from_fn(|i| final_proof.public_inputs[30 + i]) });
-        builder.connect_hashes(HashOutTarget { elements: std::array::from_fn(|i| final_proof.public_inputs[i]) }, ledger_window.end_checkpoint_root);
+        builder.connect_hashes(final_state.root, tip_end);
+        builder.connect_hashes(HashOutTarget { elements: std::array::from_fn(|index| final_proof.public_inputs[index]) }, ledger_window.end_checkpoint_root);
         builder.connect_if_true(nonempty, final_state.session_count, total_count);
         builder.connect_if_true(nonempty, final_state.unfinished_session_count, zero);
-        let mut slots = Vec::with_capacity(CAPACITY);
-        let mut previous_user = None;
-        let mut commits = [hash::constant_bytes32(&mut builder, [0; 32]); CAPACITY];
-        for index in 0..CAPACITY {
-            let slot = constrain_reward_payout::<CAPACITY>(&mut builder, index, count, previous_user, common, &real_vk, &dummy_proof, &dummy_vk, &ledger_window, final_state.user_root);
-            commits[index] = source_checkpoint_reward_leaf_commit(&mut builder, &slot.leaf_words);
-            previous_user = Some(slot.proof.public_inputs[4]);
-            slots.push(slot);
-        }
+        builder.connect_hashes(root_node.ledger_window_hash, ledger_window.hash);
+        builder.connect_hashes(root_node.new_ledger_state_root, final_state.root);
+        builder.connect_hashes(root_node.ledger_final_user_root, final_state.user_root);
+        builder.connect(root_node.total_count, total_count);
+        builder.connect(root_node.first_ordinal, zero);
+        builder.connect(root_node.count, total_count);
         let mut opening_header = config_words.to_vec();
         opening_header.extend(window_words);
         opening_header.extend(hash::word(&mut builder, ledger_window.end_checkpoint_id, 32));
         opening_header.extend(hash::encode_hash4(&mut builder, ledger_window.end_checkpoint_root.elements));
-        opening_header.extend(hash::word(&mut builder, count, 32));
-        let leaf_words = slots.iter().map(|slot| slot.leaf_words.clone()).collect::<Vec<_>>();
-        let opening_digest = source_checkpoint_reward_opening(&mut builder, &opening_header, &leaf_words, count);
-        let claim_root = claim_tree_root::<2, CAPACITY>(&mut builder, &commits, count);
+        opening_header.extend(hash::word(&mut builder, total_count, 32));
+        let mut prefix = source_domain(&mut builder, b"Opening").to_vec();
+        prefix.extend(opening_header);
+        let mut stream = constant_stream(&mut builder, &KeccakStreamValues::default());
+        for (call, length) in [(0usize, 136usize), (1, 136), (2, 16)] {
+            let start = 136 * call;
+            let words = std::array::from_fn(|index| prefix.get(start / 4 + index).copied().unwrap_or(zero));
+            let byte_length = builder.constant(F::from_canonical_usize(length));
+            stream = keccak_stream_absorb(&mut builder, stream, &words, byte_length);
+        }
+        connect_stream(&mut builder, &stream, &root_node.incoming);
+        let opening_digest = keccak_stream_finalize(&mut builder, root_node.outgoing);
         let family = builder.constant(F::from_canonical_u8(REWARD_PUBLICATION_FAMILY));
-        let end_id = [ledger_window.end_checkpoint_id, zero];
-        let header_digest = header_digest_targets(&mut builder, family, config_words, window_words, end_id, ledger_window.end_checkpoint_root.elements,
-            [aggregate_capacity, total_count, segment_count, segment_index, first_ordinal, count],
-            &[old_ledger_state_root.elements, std::array::from_fn(|i| final_proof.public_inputs[30 + i])], opening_digest, claim_root);
-        let prefix = [1, 7, REWARD_PUBLICATION_FAMILY as u32, 0].map(|value| builder.constant(F::from_canonical_u32(value)));
-        builder.register_public_inputs(&prefix);
+        let header_digest = header_digest_targets(&mut builder, family, config_words, window_words, [ledger_window.end_checkpoint_id, zero],
+            ledger_window.end_checkpoint_root.elements, [aggregate_capacity, total_count, segment_count, segment_index, first_ordinal, count],
+            &[old_ledger_state_root.elements, tip_end.elements], opening_digest, root_node.claim_root);
+        let publication = [1, 7, REWARD_PUBLICATION_FAMILY as u32, 0].map(|value| builder.constant(F::from_canonical_u32(value)));
+        builder.register_public_inputs(&publication);
         builder.register_public_inputs(&opening_digest);
-        builder.register_public_inputs(&claim_root);
+        builder.register_public_inputs(&root_node.claim_root);
         builder.register_public_inputs(&header_digest);
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=adapter-build-entry");
         let circuit_data = builder.build::<PoseidonGoldilocksConfig>();
-        assert_eq!(circuit_data.common.num_public_inputs, AGGREGATE_PI_LEN);
-        Self { circuit_data, config, config_hash: config_words, window_id: window_words, economic_domain: ledger_window.economic_domain,
-            start_root: ledger_window.start_root, end_id: ledger_window.end_checkpoint_id, end_root: ledger_window.end_checkpoint_root, old_ledger_state_root,
-            aggregate_capacity, total_count, segment_count, segment_index, first_ordinal, count, opening_digest, claim_tree_root: claim_root,
-            final_proof, final_state, slots, user_common: common.clone() }
+        #[cfg(test)]
+        eprintln!("[reward-constructor] phase=adapter-build elapsed_ms={}", adapter_started.elapsed().as_millis());
+        anyhow::ensure!(circuit_data.common.num_public_inputs == AGGREGATE_PI_LEN, "reward publication width mismatch");
+        Ok(Self {
+            circuit_data, session: VerifierCircuitData { verifier_only: verifier.clone(), common: common.clone() },
+            nodes: nodes.try_into().map_err(|_| anyhow::anyhow!("reward hierarchy descriptor width mismatch"))?,
+            source_chain_count, registrations: registrations.try_into().map_err(|_| anyhow::anyhow!("reward hierarchy registration width mismatch"))?,
+            config, config_hash: config_words, window_id: window_words, economic_domain: ledger_window.economic_domain,
+            start_root: ledger_window.start_root, end_id: ledger_window.end_checkpoint_id, end_root: ledger_window.end_checkpoint_root,
+            old_ledger_state_root, aggregate_capacity, total_count, segment_count, segment_index, first_ordinal, count,
+            opening_digest, claim_tree_root: root_node.claim_root, root_proof, final_proof, final_state,
+        })
     }
 
-    pub fn set_witness(&self, witness: &mut PartialWitness<F>, config: &NetworkConfig, opening: &SourceCheckpointRewardOpening,
-        header: &InclusionAggregateHeader, tip: &RewardLedgerFinalProof<'_>, leaves: &[SourceCheckpointRewardAggregateLeaf<'_>]) -> anyhow::Result<()>
+    pub fn registrations(&self) -> &[CircuitSetRegistration] { &self.registrations }
+
+    fn set_adapter_witness(&self, witness: &mut PartialWitness<F>, config: &NetworkConfig, opening: &SourceCheckpointRewardOpening,
+        header: &InclusionAggregateHeader, tip: &RewardLedgerFinalProof<'_>, root: &ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>) -> anyhow::Result<()>
     {
         header.validate()?;
         opening.encode()?;
         anyhow::ensure!(header.family == REWARD_PUBLICATION_FAMILY, "reward publication family mismatch");
+        anyhow::ensure!(header.aggregate_capacity == REWARD_PUBLICATION_CAPACITY as u32, "reward publication capacity is 1024");
         anyhow::ensure!(header.segment_index == 0 && header.first_ordinal == 0, "reward publication is one segment");
         anyhow::ensure!(header.segment_count == u32::from(header.count != 0), "reward publication segment count differs from count");
-        anyhow::ensure!(header.total_count as usize == leaves.len() && header.count as usize == leaves.len(), "reward publication count differs from leaves");
-        anyhow::ensure!(header.total_count <= config.max_rewards && header.total_count <= 1024, "reward publication exceeds the single segment");
+        anyhow::ensure!(header.total_count == header.count && header.total_count as usize == opening.leaves.len(), "reward publication count differs from leaves");
+        anyhow::ensure!(header.total_count <= config.max_rewards && header.total_count <= REWARD_PUBLICATION_CAPACITY as u32, "reward publication exceeds 1024");
         anyhow::ensure!(header.withdrawal_roots.is_empty(), "reward publication carries withdrawal roots");
         let (Some(old_root), Some(new_root)) = (header.old_ledger_state_root, header.new_ledger_state_root) else { anyhow::bail!("reward publication ledger-state roots missing"); };
         anyhow::ensure!(header.config_hash == opening.config_hash && header.window_id == opening.window_id
             && header.end_checkpoint_id == opening.end_checkpoint_id && header.end_checkpoint_root == opening.end_checkpoint_root,
             "reward aggregate window differs from opening");
         anyhow::ensure!(config.config_hash()? == header.config_hash, "aggregate configuration mismatch");
-        anyhow::ensure!(opening.leaves.len() == leaves.len() && opening.leaves.iter().zip(leaves).all(|(leaf, payout)| leaf == payout.leaf), "reward opening differs from leaves");
         anyhow::ensure!(tip.proof.public_inputs.len() == REWARD_SESSION_PROOF_FIELD_COUNT, "reward tip width mismatch");
         if header.count != 0 {
             anyhow::ensure!(tip.state.session_count == header.total_count && tip.state.unfinished_session_count == 0, "reward tip does not close the window");
@@ -532,7 +1085,7 @@ impl<const CAPACITY: usize> RewardInclusionAggregateCircuit<CAPACITY> {
         set_bytes(witness, &self.config_hash, &header.config_hash)?;
         set_bytes(witness, &self.window_id, &header.window_id)?;
         let economic_domain = config.clone().load()?.economic_domain();
-        anyhow::ensure!(leaves.iter().all(|leaf| leaf.leaf.economic_domain == economic_domain), "reward economic domain differs inside one publication");
+        anyhow::ensure!(opening.leaves.iter().all(|leaf| leaf.economic_domain == economic_domain), "reward economic domain differs inside one publication");
         for (target, byte) in self.economic_domain.iter().zip(economic_domain) { witness.set_target(*target, F::from_canonical_u8(byte))?; }
         set_hash4(witness, self.start_root.elements, old_root)?;
         witness.set_target(self.end_id, F::from_canonical_u32(header.end_checkpoint_id as u32))?;
@@ -546,42 +1099,84 @@ impl<const CAPACITY: usize> RewardInclusionAggregateCircuit<CAPACITY> {
         witness.set_target(self.count, F::from_canonical_u32(header.count))?;
         set_bytes(witness, &self.opening_digest, &header.opening_digest)?;
         set_bytes(witness, &self.claim_tree_root, &header.claim_tree_root)?;
+        witness.set_proof_with_pis_target(&self.root_proof, root)?;
         witness.set_proof_with_pis_target(&self.final_proof, tip.proof)?;
-        self.final_state.set_witness(witness, tip.state)?;
-        let dummy_data = plonky2::recursion::dummy_circuit::dummy_circuit::<F, PoseidonGoldilocksConfig, 2>(&self.user_common);
-        let dummy = dummy_proof(&dummy_data, Default::default())?;
-        let empty_leaf = PsyCheckpointLeaf::default();
-        for (index, slot) in self.slots.iter().enumerate() {
-            if let Some(leaf) = leaves.get(index) {
-                anyhow::ensure!(leaf.proof.public_inputs.len() == REWARD_SESSION_PROOF_FIELD_COUNT, "reward leaf width mismatch");
-                anyhow::ensure!(leaf.leaf.source_checkpoint_id == u64::from(leaf.source_checkpoint_id), "reward source checkpoint differs from leaf");
-                set_bytes(witness, &slot.leaf_words, &leaf.leaf.encode()?)?;
-                witness.set_proof_with_pis_target(&slot.proof, leaf.proof)?;
-                slot.state.set_witness(witness, leaf.state)?;
-                witness.set_target(slot.source_checkpoint_id, F::from_canonical_u32(leaf.source_checkpoint_id))?;
-                slot.source.checkpoint_leaf.set_witness(witness, leaf.source_leaf)?;
-                for (target, sibling) in slot.source.path.siblings.iter().zip(leaf.source_siblings) { set_hash4(witness, target.elements, *sibling)?; }
-                set_hash4(witness, slot.session_root.elements, leaf.session_root)?;
-                for (target, sibling) in slot.summary_siblings.iter().zip(leaf.summary_siblings) { set_hash4(witness, target.elements, *sibling)?; }
-            } else {
-                for &word in &slot.leaf_words { witness.set_target(word, F::ZERO)?; }
-                witness.set_proof_with_pis_target(&slot.proof, &dummy)?;
-                slot.state.set_witness(witness, &RewardLedgerStateValues { ledger_window_hash: [0; 4], ledger_root: [0; 4], user_root: [0; 4], session_count: 0, unfinished_session_count: 0 })?;
-                witness.set_target(slot.source_checkpoint_id, F::ZERO)?;
-                slot.source.checkpoint_leaf.set_witness(witness, &empty_leaf)?;
-                for sibling in slot.source.path.siblings.iter().chain(&slot.summary_siblings) { set_hash4(witness, sibling.elements, [0; 4])?; }
-                set_hash4(witness, slot.session_root.elements, [0; 4])?;
-            }
-        }
-        Ok(())
+        self.final_state.set_witness(witness, tip.state)
     }
 
     pub fn prove(&self, config: &NetworkConfig, opening: &SourceCheckpointRewardOpening, header: &InclusionAggregateHeader,
         tip: &RewardLedgerFinalProof<'_>, leaves: &[SourceCheckpointRewardAggregateLeaf<'_>]) -> anyhow::Result<ProofWithPublicInputs<F, PoseidonGoldilocksConfig, 2>>
     {
+        anyhow::ensure!(leaves.len() == opening.leaves.len() && opening.leaves.iter().zip(leaves).all(|(leaf, payout)| leaf == payout.leaf), "reward opening differs from leaves");
+        #[cfg(test)]
+        let prove_started = std::time::Instant::now();
+        #[cfg(test)]
+        report_prove_phase(prove_started, "chunk-build-entry")?;
+        let chunk = RewardInclusionChunkCircuit::new(&self.session.common, &self.session.verifier_only, self.source_chain_count)?;
+        #[cfg(test)]
+        report_prove_phase(prove_started, "chunk-build-done")?;
+        anyhow::ensure!(node_registration(0, &chunk.circuit_data)? == self.registrations[0], "reward chunk descriptor changed");
+        #[cfg(test)]
+        report_prove_phase(prove_started, "dummy-circuit-entry")?;
+        let dummy_data = dummy_circuit::<F, PoseidonGoldilocksConfig, 2>(&self.session.common);
+        #[cfg(test)]
+        report_prove_phase(prove_started, "dummy-circuit-done")?;
+        #[cfg(test)]
+        report_prove_phase(prove_started, "dummy-proof-entry")?;
+        let retained_dummy_proof = dummy_proof(&dummy_data, Default::default())?;
+        #[cfg(test)]
+        report_prove_phase(prove_started, "dummy-proof-done")?;
+        let mut inactive_slot_proof = retained_dummy_proof.clone();
+        inactive_slot_proof.public_inputs = vec![F::ZERO; self.session.common.num_public_inputs];
+        drop(dummy_data);
+        let mut incoming = opening_prefix_stream(header)?;
+        let mut proofs = Vec::with_capacity(REWARD_PUBLICATION_CAPACITY / REWARD_CHUNK_SLOTS);
+        for index in 0..REWARD_PUBLICATION_CAPACITY / REWARD_CHUNK_SLOTS {
+            let start = index * REWARD_CHUNK_SLOTS;
+            let end = (start + REWARD_CHUNK_SLOTS).min(leaves.len());
+            let slice = if start < leaves.len() { &leaves[start..end] } else { &[] };
+            #[cfg(test)]
+            report_prove_phase(prove_started, &format!("chunk-proof-entry index={index}"))?;
+            let proof = chunk.prove(config, header, tip.state, start as u32, &incoming, slice, &retained_dummy_proof, &inactive_slot_proof)?;
+            #[cfg(test)]
+            report_prove_phase(prove_started, &format!("chunk-proof-done index={index}"))?;
+            incoming = stream_from_proof(&proof, true)?;
+            proofs.push(proof);
+        }
+        drop(chunk);
+        drop(retained_dummy_proof);
+        drop(inactive_slot_proof);
+        for level in 1..REWARD_HIERARCHY_LEVELS {
+            #[cfg(test)]
+            report_prove_phase(prove_started, &format!("combine-build-entry level={level}"))?;
+            let combine = RewardInclusionCombineCircuit::new(level, &self.nodes[level - 1])?;
+            #[cfg(test)]
+            report_prove_phase(prove_started, &format!("combine-build-done level={level}"))?;
+            anyhow::ensure!(node_registration(level as u8, &combine.circuit_data)? == self.registrations[level], "reward combine descriptor changed");
+            let mut parents = Vec::with_capacity(proofs.len() / 2);
+            let mut children = proofs.into_iter();
+            while let Some(left) = children.next() {
+                let right = children.next().ok_or_else(|| anyhow::anyhow!("reward combine child is unpaired"))?;
+                #[cfg(test)]
+                let child_index = parents.len();
+                #[cfg(test)]
+                report_prove_phase(prove_started, &format!("combine-proof-entry level={level} index={child_index}"))?;
+                let parent = combine.prove(left, right)?;
+                #[cfg(test)]
+                report_prove_phase(prove_started, &format!("combine-proof-done level={level} index={child_index}"))?;
+                parents.push(parent);
+            }
+            proofs = parents;
+        }
+        anyhow::ensure!(proofs.len() == 1, "reward hierarchy did not reduce to one root");
         let mut witness = PartialWitness::new();
-        self.set_witness(&mut witness, config, opening, header, tip, leaves)?;
-        self.circuit_data.prove(witness)
+        self.set_adapter_witness(&mut witness, config, opening, header, tip, &proofs[0])?;
+        #[cfg(test)]
+        report_prove_phase(prove_started, "adapter-prove-entry")?;
+        let proof = self.circuit_data.prove(witness)?;
+        #[cfg(test)]
+        report_prove_phase(prove_started, "adapter-prove-done")?;
+        Ok(proof)
     }
 }
 
@@ -976,11 +1571,139 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reward_publication_proves_empty_and_rejects_digest_tampering() {
+    fn reward_identity_checkpoint(config: &NetworkConfig, window_id: [u8; 32]) -> (
+        super::super::reward_ledger::RewardLedgerWindowValues,
+        PsyCheckpointLeaf<F>,
+        [[u64; 4]; 32],
+        psy_client_data::qdata::checkpoint::PsyCheckpointGlobalStateRoots<F>,
+    ) {
         use psy_crypto::hash::traits::qhashable::QFieldHashable;
         use plonky2::plonk::config::Hasher;
+        let roots = psy_client_data::qdata::checkpoint::PsyCheckpointGlobalStateRoots::<F>::default();
+        let leaf = PsyCheckpointLeaf { global_chain_root: roots.qfhash::<PoseidonHash>(), stats: Default::default() };
+        let path = [[0u64; 4]; 32];
+        let mut root = leaf.qfhash::<PoseidonHash>().0;
+        for (height, sibling) in path.iter().enumerate() {
+            let sibling = HashOut { elements: sibling.map(F::from_canonical_u64) };
+            root = if (7u32 >> height) & 1 == 0 { PoseidonHash::two_to_one(root, sibling) } else { PoseidonHash::two_to_one(sibling, root) };
+        }
+        let window = super::super::reward_ledger::RewardLedgerWindowValues {
+            config_hash: config.config_hash().unwrap(), economic_domain: config.clone().load().unwrap().economic_domain(), window_id,
+            end_checkpoint_id: 7, end_checkpoint_root: root.elements.map(|value| value.to_canonical_u64()),
+            start_root: psy_client_data::bridge_aggregate::origin_state_root(),
+        };
+        (window, leaf, path, roots)
+    }
+
+    #[test]
+    fn reward_publication_proves_empty_and_rejects_digest_tampering() {
         let config = config(&[0]);
+        let (window, leaf, path, roots) = reward_identity_checkpoint(&config, [5; 32]);
+        eprintln!("[reward-constructor] phase=session-new-entry");
+        let session = super::super::reward_session::RewardSessionCircuit::new(1, 1).unwrap();
+        let started = std::time::Instant::now();
+        eprintln!("[reward-constructor] phase=identity-prove-entry");
+        let (proof, state) = session.prove_identity(&config, &window, &leaf, &path, &roots, None).unwrap();
+        eprintln!("[reward-publication] phase=identity-tip elapsed_ms={}", started.elapsed().as_millis());
+        session.circuit_data.verify(proof.clone()).unwrap();
+        let common = session.circuit_data.common.clone();
+        let verifier = session.circuit_data.verifier_only.clone();
+        drop(session);
+        let started = std::time::Instant::now();
+        let aggregate = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        eprintln!("[reward-publication] phase=empty-publication-circuit elapsed_ms={}", started.elapsed().as_millis());
+        let opening = SourceCheckpointRewardOpening { config_hash: window.config_hash, window_id: window.window_id,
+            end_checkpoint_id: 7, end_checkpoint_root: window.end_checkpoint_root, leaves: Vec::new() };
+        let header = InclusionAggregateHeader { family: REWARD_PUBLICATION_FAMILY, config_hash: opening.config_hash,
+            window_id: opening.window_id, end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root: opening.end_checkpoint_root,
+            aggregate_capacity: 1024, total_count: 0, segment_count: 0, segment_index: 0, first_ordinal: 0, count: 0,
+            withdrawal_roots: Vec::new(), old_ledger_state_root: Some(window.start_root), new_ledger_state_root: Some(window.start_root),
+            opening_digest: opening.opening_digest().unwrap(),
+            claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], 1024).unwrap()[0] };
+        let tip = RewardLedgerFinalProof { proof: &proof, state: &state };
+        let started = std::time::Instant::now();
+        let published = aggregate.prove(&config, &opening, &header, &tip, &[]).unwrap();
+        eprintln!("[reward-publication] phase=empty-publication-prove elapsed_ms={}", started.elapsed().as_millis());
+        assert_eq!(keccak_stream_finalize_values(opening_prefix_stream(&header).unwrap()).unwrap(), opening.opening_digest().unwrap());
+        assert_eq!(published.public_inputs, header.publication_words().unwrap().map(F::from_canonical_u32));
+        aggregate.circuit_data.verify(published).unwrap();
+        let mut changed = header.clone();
+        changed.opening_digest[0] ^= 1;
+        assert!(aggregate.prove(&config, &opening, &changed, &tip, &[]).is_err());
+        let mut changed = header.clone();
+        changed.claim_tree_root[0] ^= 1;
+        assert!(aggregate.prove(&config, &opening, &changed, &tip, &[]).is_err());
+        let mut changed = header.clone();
+        changed.new_ledger_state_root.as_mut().unwrap()[0] ^= 1;
+        assert!(aggregate.prove(&config, &opening, &changed, &tip, &[]).is_err());
+    }
+
+    #[test]
+    fn reward_session_identity_rejects_cross_window_predecessor_and_state_tampering() {
+        let config = config(&[0]);
+        let (window, leaf, path, roots) = reward_identity_checkpoint(&config, [5; 32]);
+        eprintln!("[reward-constructor] phase=session-new-entry");
+        let session = super::super::reward_session::RewardSessionCircuit::new(1, 1).unwrap();
+        let started = std::time::Instant::now();
+        eprintln!("[reward-constructor] phase=identity-prove-entry");
+        let (proof, state) = session.prove_identity(&config, &window, &leaf, &path, &roots, None).unwrap();
+        eprintln!("[reward-session-identity] phase=origin-proof elapsed_ms={}", started.elapsed().as_millis());
+        session.circuit_data.verify(proof.clone()).unwrap();
+        let mut next_window = window.clone();
+        next_window.window_id[0] ^= 1;
+        let started = std::time::Instant::now();
+        eprintln!("[reward-constructor] phase=identity-prove-entry");
+        let (next, next_state) = session.prove_identity(&config, &next_window, &leaf, &path, &roots, Some((&proof, &state))).unwrap();
+        eprintln!("[reward-session-identity] phase=cross-window-proof elapsed_ms={}", started.elapsed().as_millis());
+        session.circuit_data.verify(next.clone()).unwrap();
+        assert_eq!(next_state, state);
+        assert_eq!(next.public_inputs[26..34], proof.public_inputs[26..34]);
+        assert_ne!(next.public_inputs[22..26], proof.public_inputs[22..26]);
+        let common = session.circuit_data.common.clone();
+        let verifier = session.circuit_data.verifier_only.clone();
+        drop(session);
+        let started = std::time::Instant::now();
+        let aggregate = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        eprintln!("[reward-session-identity] phase=cross-window-publication-circuit elapsed_ms={}", started.elapsed().as_millis());
+        let opening = SourceCheckpointRewardOpening { config_hash: window.config_hash, window_id: window.window_id,
+            end_checkpoint_id: 7, end_checkpoint_root: window.end_checkpoint_root, leaves: Vec::new() };
+        let header = InclusionAggregateHeader { family: REWARD_PUBLICATION_FAMILY, config_hash: opening.config_hash,
+            window_id: opening.window_id, end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root: opening.end_checkpoint_root,
+            aggregate_capacity: 1024, total_count: 0, segment_count: 0, segment_index: 0, first_ordinal: 0, count: 0,
+            withdrawal_roots: Vec::new(), old_ledger_state_root: Some(window.start_root), new_ledger_state_root: Some(window.start_root),
+            opening_digest: opening.opening_digest().unwrap(),
+            claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], 1024).unwrap()[0] };
+        let mut next_opening = opening;
+        next_opening.window_id = next_window.window_id;
+        let mut next_header = header;
+        next_header.window_id = next_window.window_id;
+        next_header.opening_digest = next_opening.opening_digest().unwrap();
+        let started = std::time::Instant::now();
+        let published = aggregate.prove(&config, &next_opening, &next_header,
+            &RewardLedgerFinalProof { proof: &next, state: &next_state }, &[]).unwrap();
+        eprintln!("[reward-session-identity] phase=cross-window-publication-prove elapsed_ms={}", started.elapsed().as_millis());
+        assert_eq!(published.public_inputs, next_header.publication_words().unwrap().map(F::from_canonical_u32));
+        aggregate.circuit_data.verify(published).unwrap();
+        drop(aggregate);
+        eprintln!("[reward-constructor] phase=tamper-session-new-entry");
+        let session = super::super::reward_session::RewardSessionCircuit::new(1, 1).unwrap();
+        let started = std::time::Instant::now();
+        let mut invalid_predecessor = proof.clone();
+        invalid_predecessor.public_inputs[30] += F::ONE;
+        eprintln!("[reward-constructor] phase=identity-prove-entry");
+        assert!(session.prove_identity(&config, &next_window, &leaf, &path, &roots, Some((&invalid_predecessor, &state))).is_err());
+        let mut invalid_state = state;
+        invalid_state.session_count += 1;
+        eprintln!("[reward-constructor] phase=identity-prove-entry");
+        assert!(session.prove_identity(&config, &next_window, &leaf, &path, &roots, Some((&proof, &invalid_state))).is_err());
+        eprintln!("[reward-session-identity] phase=tamper-rejection elapsed_ms={}", started.elapsed().as_millis());
+        drop(session);
+    }
+    #[test]
+    fn reward_hierarchy_rejects_inactive_encoding_dummy_and_stream_mutations() {
+        use psy_crypto::hash::traits::qhashable::QFieldHashable;
+        let config = config(&[0]);
+        eprintln!("[reward-constructor] phase=session-new-entry");
         let session = super::super::reward_session::RewardSessionCircuit::new(1, 1).unwrap();
         let roots = psy_client_data::qdata::checkpoint::PsyCheckpointGlobalStateRoots::<F>::default();
         let leaf = PsyCheckpointLeaf { global_chain_root: roots.qfhash::<PoseidonHash>(), stats: Default::default() };
@@ -995,9 +1718,11 @@ mod tests {
             end_checkpoint_id: 7, end_checkpoint_root: root.elements.map(|value| value.to_canonical_u64()),
             start_root: psy_client_data::bridge_aggregate::origin_state_root(),
         };
+        eprintln!("[reward-constructor] phase=identity-prove-entry");
         let (proof, state) = session.prove_identity(&config, &window, &leaf, &path, &roots, None).unwrap();
-        session.circuit_data.verify(proof.clone()).unwrap();
-        let aggregate = RewardInclusionAggregateCircuit::<1024>::new(&session.circuit_data.common, &session.circuit_data.verifier_only, 1);
+        let common = session.circuit_data.common.clone();
+        let verifier = session.circuit_data.verifier_only.clone();
+        drop(session);
         let opening = SourceCheckpointRewardOpening { config_hash: window.config_hash, window_id: window.window_id,
             end_checkpoint_id: 7, end_checkpoint_root: window.end_checkpoint_root, leaves: Vec::new() };
         let header = InclusionAggregateHeader { family: REWARD_PUBLICATION_FAMILY, config_hash: opening.config_hash,
@@ -1006,32 +1731,183 @@ mod tests {
             withdrawal_roots: Vec::new(), old_ledger_state_root: Some(window.start_root), new_ledger_state_root: Some(window.start_root),
             opening_digest: opening.opening_digest().unwrap(),
             claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], 1024).unwrap()[0] };
-        let tip = RewardLedgerFinalProof { proof: &proof, state: &state };
-        let published = aggregate.prove(&config, &opening, &header, &tip, &[]).unwrap();
-        assert_eq!(published.public_inputs[4..12], header.opening_digest.chunks_exact(4).map(|word| F::from_canonical_u32(u32::from_be_bytes(word.try_into().unwrap()))).collect::<Vec<_>>());
-        aggregate.circuit_data.verify(published).unwrap();
-        let mut changed = header.clone();
-        changed.opening_digest[0] ^= 1;
-        assert!(aggregate.prove(&config, &opening, &changed, &tip, &[]).is_err());
-        let mut changed = header.clone();
-        changed.claim_tree_root[0] ^= 1;
-        assert!(aggregate.prove(&config, &opening, &changed, &tip, &[]).is_err());
-        let mut changed = header.clone();
-        changed.new_ledger_state_root.as_mut().unwrap()[0] ^= 1;
-        assert!(aggregate.prove(&config, &opening, &changed, &tip, &[]).is_err());
-        let mut next_window = window.clone();
-        next_window.window_id[0] ^= 1;
-        let (next, next_state) = session.prove_identity(&config, &next_window, &leaf, &path, &roots, Some((&proof, &state))).unwrap();
-        session.circuit_data.verify(next.clone()).unwrap();
-        assert_eq!(next_state, state);
-        assert_eq!(next.public_inputs[26..34], proof.public_inputs[26..34]);
-        assert_ne!(next.public_inputs[22..26], proof.public_inputs[22..26]);
-        let mut invalid_predecessor = proof.clone();
-        invalid_predecessor.public_inputs[30] += F::ONE;
-        assert!(session.prove_identity(&config, &next_window, &leaf, &path, &roots, Some((&invalid_predecessor, &state))).is_err());
-        let mut invalid_state = state;
-        invalid_state.session_count += 1;
-        assert!(session.prove_identity(&config, &next_window, &leaf, &path, &roots, Some((&proof, &invalid_state))).is_err());
+        let chunk = RewardInclusionChunkCircuit::new(&common, &verifier, 1).unwrap();
+        let dummy_data = dummy_circuit::<F, PoseidonGoldilocksConfig, 2>(&common);
+        let retained = dummy_proof(&dummy_data, Default::default()).unwrap();
+        drop(dummy_data);
+        let mut inactive = retained.clone();
+        inactive.public_inputs.fill(F::ZERO);
+        let incoming = opening_prefix_stream(&header).unwrap();
+        let mut shifted = incoming;
+        shifted.state[3][1] ^= 0x0100_0000;
+        let proved = chunk.prove(&config, &header, &state, 0, &shifted, &[], &retained, &inactive).unwrap();
+        chunk.circuit_data.verify(proved.clone()).unwrap();
+        assert!(proved.public_inputs[19].is_zero() && proved.public_inputs[20].is_zero(), "empty chunk boundary users are nonzero");
+        let base = |incoming: &KeccakStreamValues| {
+            let mut witness = PartialWitness::new();
+            chunk.config.set_witness(&mut witness, &config).unwrap();
+            set_bytes(&mut witness, &chunk.config_hash, &header.config_hash).unwrap();
+            set_bytes(&mut witness, &chunk.window_id, &header.window_id).unwrap();
+            for (target, byte) in chunk.economic_domain.iter().zip(window.economic_domain) { witness.set_target(*target, F::from_canonical_u8(byte)).unwrap(); }
+            set_hash4(&mut witness, chunk.start_root.elements, window.start_root).unwrap();
+            witness.set_target(chunk.end_id, F::from_canonical_u32(header.end_checkpoint_id as u32)).unwrap();
+            set_hash4(&mut witness, chunk.end_root.elements, header.end_checkpoint_root).unwrap();
+            set_hash4(&mut witness, chunk.old_ledger_state_root.elements, window.start_root).unwrap();
+            chunk.final_state.set_witness(&mut witness, &state).unwrap();
+            witness.set_target(chunk.total_count, F::ZERO).unwrap();
+            witness.set_target(chunk.first_ordinal, F::ZERO).unwrap();
+            set_stream(&mut witness, &chunk.incoming, incoming).unwrap();
+            witness.set_proof_with_pis_target(&chunk.dummy_proof, &retained).unwrap();
+            let empty_leaf = PsyCheckpointLeaf::default();
+            let zero_state = RewardLedgerStateValues { ledger_window_hash: [0; 4], ledger_root: [0; 4], user_root: [0; 4], session_count: 0, unfinished_session_count: 0 };
+            for slot in &chunk.slots {
+                set_bytes(&mut witness, &slot.leaf_words, &[0u8; SOURCE_CHECKPOINT_REWARD_LEAF_BYTES]).unwrap();
+                witness.set_proof_with_pis_target(&slot.proof, &inactive).unwrap();
+                slot.state.set_witness(&mut witness, &zero_state).unwrap();
+                witness.set_target(slot.source_checkpoint_id, F::ZERO).unwrap();
+                slot.source.checkpoint_leaf.set_witness(&mut witness, &empty_leaf).unwrap();
+                for sibling in slot.source.path.siblings.iter().chain(&slot.summary_siblings) { set_hash4(&mut witness, sibling.elements, [0; 4]).unwrap(); }
+                set_hash4(&mut witness, slot.session_root.elements, [0; 4]).unwrap();
+            }
+            witness
+        };
+        let accepted = chunk.circuit_data.prove(base(&shifted)).unwrap();
+        chunk.circuit_data.verify(accepted).unwrap();
+        let mut inactive_word = base(&shifted);
+        inactive_word.target_values.insert(chunk.slots[0].leaf_words[0], F::ONE);
+        assert!(chunk.circuit_data.prove(inactive_word).is_err(), "accepted a nonzero inactive payout word");
+        for changed in [KeccakStreamValues { byte_offset: 41, ..shifted }, {
+            let mut changed = shifted;
+            changed.state[0][0] ^= 1;
+            changed
+        }] {
+            let accepted = chunk.circuit_data.prove(base(&changed)).unwrap();
+            let outgoing = stream_from_proof(&accepted, true).unwrap();
+            assert_eq!(outgoing.state, changed.state);
+            assert_eq!(outgoing.byte_offset, changed.byte_offset);
+            chunk.circuit_data.verify(accepted).unwrap();
+        }
+        let mut bad_ordinal = base(&shifted);
+        bad_ordinal.target_values.insert(chunk.first_ordinal, F::ONE);
+        assert!(chunk.circuit_data.prove(bad_ordinal).is_err(), "accepted an unaligned chunk ordinal");
+        let mut bad_count = base(&shifted);
+        bad_count.target_values.insert(chunk.total_count, F::from_canonical_u32(1025));
+        assert!(chunk.circuit_data.prove(bad_count).is_err(), "accepted a count above 1024");
+        let mut dummy_assignment = PartialWitness::new();
+        dummy_assignment.set_proof_with_pis_target(&chunk.dummy_proof, &retained).unwrap();
+        let mut omitted_dummy = base(&shifted);
+        for target in dummy_assignment.target_values.keys() { omitted_dummy.target_values.remove(target); }
+        assert!(chunk.circuit_data.prove(omitted_dummy).is_err(), "accepted an unassigned shared dummy proof");
+        let mut corrupt_dummy = base(&shifted);
+        corrupt_dummy.target_values.insert(chunk.dummy_proof.public_inputs[0], retained.public_inputs[0] + F::ONE);
+        assert!(chunk.circuit_data.prove(corrupt_dummy).is_err(), "accepted a corrupted shared dummy proof");
+        let combine = RewardInclusionCombineCircuit::new(1, &verifier_data(&chunk.circuit_data)).unwrap();
+        let right = chunk.prove(&config, &header, &state, REWARD_CHUNK_SLOTS as u32, &shifted, &[], &retained, &inactive).unwrap();
+        let parent = combine.prove(proved.clone(), right).unwrap();
+        combine.circuit_data.verify(parent).unwrap();
+        let right = chunk.prove(&config, &header, &state, REWARD_CHUNK_SLOTS as u32, &incoming, &[], &retained, &inactive).unwrap();
+        chunk.circuit_data.verify(right.clone()).unwrap();
+        assert!(combine.prove(proved, right).is_err(), "accepted disconnected genuine child streams");
+        drop(combine);
+        drop(chunk);
+        let aggregate = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        for (stream, accepted) in [(incoming, true), (shifted, false)] {
+            let chunk = RewardInclusionChunkCircuit::new(&common, &verifier, 1).unwrap();
+            let mut proofs = (0..REWARD_PUBLICATION_CAPACITY / REWARD_CHUNK_SLOTS).map(|index| chunk.prove(&config, &header, &state, (index * REWARD_CHUNK_SLOTS) as u32,
+                &stream, &[], &retained, &inactive).unwrap()).collect::<Vec<_>>();
+            drop(chunk);
+            for level in 1..REWARD_HIERARCHY_LEVELS {
+                let combine = RewardInclusionCombineCircuit::new(level, &aggregate.nodes[level - 1]).unwrap();
+                let mut parents = Vec::with_capacity(proofs.len() / 2);
+                let mut children = proofs.into_iter();
+                while let Some(left) = children.next() { parents.push(combine.prove(left, children.next().unwrap()).unwrap()); }
+                drop(combine);
+                proofs = parents;
+            }
+            let root = proofs.pop().unwrap();
+            aggregate.nodes[REWARD_HIERARCHY_LEVELS - 1].verify(root.clone()).unwrap();
+            let mut adapter = PartialWitness::new();
+            aggregate.set_adapter_witness(&mut adapter, &config, &opening, &header,
+                &RewardLedgerFinalProof { proof: &proof, state: &state }, &root).unwrap();
+            let result = aggregate.circuit_data.prove(adapter);
+            if accepted {
+                let published = result.unwrap();
+                assert_eq!(published.public_inputs, header.publication_words().unwrap().map(F::from_canonical_u32));
+                aggregate.circuit_data.verify(published).unwrap();
+            } else { assert!(result.is_err(), "accepted a genuine level-8 root with a mutated prefix stream"); }
+        }
+    }
+
+    #[test]
+    fn reward_amount_words_reverse_native_little_endian_limbs() {
+        let leaf = SourceCheckpointRewardLeaf { economic_domain: [6; 32], source_checkpoint_id: 7,
+            user_id: 9, amount: [1, 2, 3, 4, 5, 6, 7, 8], recipient: [9; 20], initialized: true };
+        let encoded = leaf.encode().unwrap();
+        assert_eq!(&encoded[96..100], &8u32.to_be_bytes());
+        assert_eq!(&encoded[124..128], &1u32.to_be_bytes());
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let amount = leaf.amount.map(|value| builder.constant(F::from_canonical_u32(value)));
+        let mut words = hash::constant_bytes32(&mut builder, leaf.economic_domain).to_vec();
+        let source = builder.constant(F::from_canonical_u64(leaf.source_checkpoint_id));
+        words.extend(hash::word(&mut builder, source, 32));
+        let user = builder.constant(F::from_canonical_u32(leaf.user_id));
+        words.extend(hash::word(&mut builder, user, 32));
+        words.extend(amount_words(&mut builder, &amount));
+        let recipient = std::array::from_fn(|i| builder.constant(F::from_canonical_u32(
+            u32::from_be_bytes(leaf.recipient[i * 4..i * 4 + 4].try_into().unwrap()))));
+        words.extend(hash::word_address(&mut builder, recipient));
+        let one = builder.one();
+        words.extend(hash::word(&mut builder, one, 1));
+        let commit = source_checkpoint_reward_leaf_commit(&mut builder, &words);
+        builder.register_public_inputs(&words);
+        builder.register_public_inputs(&commit);
+        let opening = SourceCheckpointRewardOpening { config_hash: [7; 32], window_id: [5; 32],
+            end_checkpoint_id: 7, end_checkpoint_root: [1, 2, 3, 4], leaves: vec![leaf.clone()] };
+        let mut prefix = source_domain(&mut builder, b"Opening").to_vec();
+        prefix.extend(hash::constant_bytes32(&mut builder, opening.config_hash));
+        prefix.extend(hash::constant_bytes32(&mut builder, opening.window_id));
+        prefix.extend(hash::word(&mut builder, source, 32));
+        let root = opening.end_checkpoint_root.map(|value| builder.constant(F::from_canonical_u64(value)));
+        prefix.extend(hash::encode_hash4(&mut builder, root));
+        prefix.extend(hash::word(&mut builder, one, 32));
+        prefix.extend(words);
+        let zero = builder.zero();
+        let mut stream = constant_stream(&mut builder, &KeccakStreamValues::default());
+        for part in prefix.chunks(34) {
+            let input = std::array::from_fn(|i| part.get(i).copied().unwrap_or(zero));
+            let length = builder.constant(F::from_canonical_usize(part.len() * 4));
+            stream = keccak_stream_absorb(&mut builder, stream, &input, length);
+        }
+        let digest = keccak_stream_finalize(&mut builder, stream);
+        builder.register_public_inputs(&digest);
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        let proof = data.prove(PartialWitness::new()).unwrap();
+        let expected = encoded.into_iter().chain(leaf.leaf_commit().unwrap()).chain(opening.opening_digest().unwrap()).collect::<Vec<_>>();
+        assert_eq!(proof.public_inputs, expected.chunks_exact(4).map(|word|
+            F::from_canonical_u32(u32::from_be_bytes(word.try_into().unwrap()))).collect::<Vec<_>>());
+        data.verify(proof).unwrap();
+    }
+
+    #[test]
+    fn reward_registrations_are_sorted_hierarchy_descriptors() {
+        eprintln!("[reward-constructor] phase=session-new-entry");
+        let session = super::super::reward_session::RewardSessionCircuit::new(1, 1).unwrap();
+        let common = session.circuit_data.common.clone();
+        let verifier = session.circuit_data.verifier_only.clone();
+        drop(session);
+        let aggregate = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        let registrations = aggregate.registrations().to_vec();
+        assert_eq!(registrations.len(), REWARD_HIERARCHY_LEVELS);
+        assert_eq!(aggregate.circuit_data.common.num_public_inputs, AGGREGATE_PI_LEN);
+        for (level, registration) in registrations.iter().enumerate() {
+            assert_eq!((registration.family, registration.level, registration.variant, registration.pi_words),
+                (REWARD_AGGREGATE_NODE_FAMILY as u16, level as u8, REWARD_AGGREGATE_NODE_VARIANT, REWARD_AGGREGATE_NODE_PI_LEN as u16));
+            assert_ne!(registration.fingerprint, [0; 4]);
+            assert_eq!(registration.identity_fingerprint, [0; 4]);
+        }
+        drop(aggregate);
+        let rebuilt = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        assert_eq!(rebuilt.registrations(), registrations.as_slice());
     }
     #[test]
     fn active_source_path_rejects_sibling_mutation_and_inactive_zero_stands() {

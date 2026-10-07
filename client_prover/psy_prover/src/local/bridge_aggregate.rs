@@ -272,7 +272,7 @@ impl ClaimCircuits {
             3, 0, 0, psy_client_data::bridge_aggregate::REWARD_SESSION_PROOF_FIELD_COUNT, &reward_session.circuit_data, [0; 4])?;
         let withdrawal_registration = psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_registration(
             2, 0, 0, 32, &withdrawal.circuit_data, [0; 4])?;
-        anyhow::ensure!(registry.len() == 7 && registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (3, 0, 0)) == Some(&session)
+        anyhow::ensure!(registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (3, 0, 0)) == Some(&session)
             && registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (2, 0, 0)) == Some(&withdrawal_registration)
             && registry.iter().all(|pin| pin.identity_fingerprint == [0; 4] && pin.family != 4), "claim circuit differs from source registry");
         Ok(Self { withdrawal, reward_session })

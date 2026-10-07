@@ -58,7 +58,8 @@ pub struct ApiResponse<T> {
 }
 
 const AGGREGATION_BODY_LIMIT: usize = 24 * 1024 * 1024;
-const AGGREGATION_PROOF_LIMIT: usize = 16 * 1024 * 1024;
+pub const AGGREGATION_PROOF_LIMIT: usize = 16 * 1024 * 1024;
+const REWARD_SNAPSHOT_BODY_LIMIT: usize = 65 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -84,13 +85,67 @@ pub struct PublishAggregationContext {
 #[serde(rename_all = "lowercase")]
 pub enum AggregationClaimKind { Withdrawal, Reward }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "version", rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregationClaimRequest {
-    #[serde(rename = 1)]
-    Withdrawal { #[serde(rename = "contextId")] context_id: String, kind: AggregationClaimKind, record: String, proof: String },
-    #[serde(rename = 2)]
-    Reward { #[serde(rename = "contextId")] context_id: String, kind: AggregationClaimKind, record: String, transition: String },
+    Withdrawal { context_id: String, kind: AggregationClaimKind, record: String, proof: String },
+    Reward { context_id: String, kind: AggregationClaimKind, record: String, transition: String },
+}
+impl serde::Serialize for AggregationClaimRequest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let (version, expected, record, artifact, artifact_name) = match self {
+            Self::Withdrawal { kind: AggregationClaimKind::Withdrawal, record, proof, .. } => (1u64, AggregationClaimKind::Withdrawal, record.as_str(), proof.as_str(), "proof"),
+            Self::Reward { kind: AggregationClaimKind::Reward, record, transition, .. } => (2, AggregationClaimKind::Reward, record.as_str(), transition.as_str(), "transition"),
+            _ => return Err(serde::ser::Error::custom("claim version does not match its kind")),
+        };
+        let context_id = match self { Self::Withdrawal { context_id, .. } | Self::Reward { context_id, .. } => context_id.as_str() };
+        let mut map = serializer.serialize_map(Some(5))?;
+        map.serialize_entry("version", &version)?;
+        map.serialize_entry("contextId", context_id)?;
+        map.serialize_entry("kind", &expected)?;
+        map.serialize_entry("record", record)?;
+        map.serialize_entry(artifact_name, artifact)?;
+        map.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for AggregationClaimRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RequestVisitor;
+        impl<'de> serde::de::Visitor<'de> for RequestVisitor {
+            type Value = AggregationClaimRequest;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("aggregation claim request version 1 or 2") }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut version = None;
+                let mut context_id = None;
+                let mut kind = None;
+                let mut record = None;
+                let mut proof = None;
+                let mut transition = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" if version.is_none() => version = Some(map.next_value::<u64>()?),
+                        "contextId" if context_id.is_none() => context_id = Some(map.next_value::<String>()?),
+                        "kind" if kind.is_none() => kind = Some(map.next_value::<AggregationClaimKind>()?),
+                        "record" if record.is_none() => record = Some(map.next_value::<String>()?),
+                        "proof" if proof.is_none() => proof = Some(map.next_value::<String>()?),
+                        "transition" if transition.is_none() => transition = Some(map.next_value::<String>()?),
+                        _ => return Err(serde::de::Error::unknown_field(&key, &["version", "contextId", "kind", "record", "proof", "transition"])),
+                    }
+                }
+                let version = version.ok_or_else(|| serde::de::Error::missing_field("version"))?;
+                let context_id = context_id.ok_or_else(|| serde::de::Error::missing_field("contextId"))?;
+                let kind = kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+                let record = record.ok_or_else(|| serde::de::Error::missing_field("record"))?;
+                match (version, kind) {
+                    (1, AggregationClaimKind::Withdrawal) if transition.is_none() => Ok(AggregationClaimRequest::Withdrawal { context_id, kind, record, proof: proof.ok_or_else(|| serde::de::Error::missing_field("proof"))? }),
+                    (2, AggregationClaimKind::Reward) if proof.is_none() => Ok(AggregationClaimRequest::Reward { context_id, kind, record, transition: transition.ok_or_else(|| serde::de::Error::missing_field("transition"))? }),
+                    (1 | 2, _) => Err(serde::de::Error::custom("claim version does not match its fields")),
+                    _ => Err(serde::de::Error::custom("unsupported aggregation claim version")),
+                }
+            }
+        }
+        deserializer.deserialize_map(RequestVisitor)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -245,10 +300,10 @@ pub fn decode_aggregation_base64(value: &str, limit: usize) -> Result<Vec<u8>, A
     Ok(bytes)
 }
 
-struct AggregationBody(Vec<u8>);
+struct AggregationBody(Vec<u8>, usize);
 impl std::io::Write for AggregationBody {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > AGGREGATION_BODY_LIMIT - self.0.len() {
+        if bytes.len() > self.1 - self.0.len() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "aggregation body limit"));
         }
         self.0.extend_from_slice(bytes);
@@ -271,6 +326,7 @@ async fn aggregation_http<T: serde::de::DeserializeOwned>(
     request: reqwest::RequestBuilder,
     token_file: &std::path::Path,
     body: Option<&impl serde::Serialize>,
+    body_limit: usize,
 ) -> Result<T, AggregationHttpError> {
     let parent = token_file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
     let name = token_file.file_name().ok_or(AggregationHttpError::Credential)?;
@@ -282,18 +338,18 @@ async fn aggregation_http<T: serde::de::DeserializeOwned>(
     }
     let mut request = request.bearer_auth(token).timeout(Duration::from_secs(30));
     if let Some(body) = body {
-        let mut encoded = AggregationBody(Vec::new());
+        let mut encoded = AggregationBody(Vec::new(), body_limit);
         serde_json::to_writer(&mut encoded, body).map_err(|_| AggregationHttpError::BodyTooLarge)?;
         request = request.header(reqwest::header::CONTENT_TYPE, "application/json").body(encoded.0);
     }
     let mut response = request.send().await.map_err(AggregationHttpError::Transport)?;
     let status = response.status();
-    if response.content_length().is_some_and(|n| n > AGGREGATION_BODY_LIMIT as u64) {
+    if response.content_length().is_some_and(|n| n > body_limit as u64) {
         return Err(AggregationHttpError::BodyTooLarge);
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(AggregationHttpError::Transport)? {
-        if chunk.len() > AGGREGATION_BODY_LIMIT - bytes.len() { return Err(AggregationHttpError::BodyTooLarge); }
+        if chunk.len() > body_limit - bytes.len() { return Err(AggregationHttpError::BodyTooLarge); }
         bytes.extend_from_slice(&chunk);
     }
     if status.is_success() {
@@ -329,7 +385,7 @@ pub async fn get_aggregation_context(
     http: &reqwest::Client, services_url: &str, token_file: &std::path::Path,
 ) -> Result<Option<AggregationContext>, AggregationHttpError> {
     let result: Result<AggregationContext, AggregationHttpError> =
-        aggregation_http(http.get(aggregation_url(services_url, "context")?), token_file, None::<&()>).await;
+        aggregation_http(http.get(aggregation_url(services_url, "context")?), token_file, None::<&()>, AGGREGATION_BODY_LIMIT).await;
     match result {
         Ok(context) if context.validate() => Ok(Some(context)),
         Ok(_) => Err(AggregationHttpError::InvalidResponse),
@@ -347,7 +403,7 @@ pub async fn publish_aggregation_context(
     if !request.context.validate() || request.expected_context_id.as_deref().is_some_and(|id| !aggregation_hex(id)) {
         return Err(AggregationHttpError::InvalidRequest);
     }
-    let context: AggregationContext = aggregation_http(http.post(aggregation_url(services_url, "context")?), token_file, Some(request)).await?;
+    let context: AggregationContext = aggregation_http(http.post(aggregation_url(services_url, "context")?), token_file, Some(request), AGGREGATION_BODY_LIMIT).await?;
     if context != request.context { return Err(AggregationHttpError::InvalidResponse); }
     Ok(context)
 }
@@ -362,7 +418,7 @@ pub async fn get_aggregation_claims(
     let mut url = aggregation_url(services_url, "claims")?;
     url.query_pairs_mut().append_pair("contextId", context_id).append_pair("limit", &limit.to_string());
     if let Some(after) = after_claim_id { url.query_pairs_mut().append_pair("afterClaimId", after); }
-    let page: AggregationClaimsPage = aggregation_http(http.get(url), token_file, None::<&()>).await?;
+    let page: AggregationClaimsPage = aggregation_http(http.get(url), token_file, None::<&()>, AGGREGATION_BODY_LIMIT).await?;
     if page.claims.len() > limit as usize { return Err(AggregationHttpError::InvalidResponse); }
     let mut previous = after_claim_id;
     for claim in &page.claims {
@@ -420,7 +476,7 @@ pub async fn get_reward_ledger_session_state(
     if !aggregation_hex(context_id) { return Err(AggregationHttpError::InvalidRequest); }
     let mut url = aggregation_url(services_url, "session-state")?;
     url.query_pairs_mut().append_pair("contextId", context_id);
-    let state: RewardLedgerSessionState = aggregation_http(http.get(url), token_file, None::<&()>).await?;
+    let state: RewardLedgerSessionState = aggregation_http(http.get(url), token_file, None::<&()>, AGGREGATION_BODY_LIMIT).await?;
     if state.context_id != context_id || !aggregation_hex(&state.current_root) || state.nodes.len() != 33 { return Err(AggregationHttpError::InvalidResponse); }
     let proof = decode_aggregation_base64(&state.proof, AGGREGATION_PROOF_LIMIT).map_err(|_| AggregationHttpError::InvalidResponse)?;
     let transition = decode_aggregation_base64(&state.transition, AGGREGATION_PROOF_LIMIT).map_err(|_| AggregationHttpError::InvalidResponse)?;
@@ -432,6 +488,126 @@ pub async fn get_reward_ledger_session_state(
     }
     if previous_height != Some(32) { return Err(AggregationHttpError::InvalidResponse); }
     Ok(state)
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RewardLedgerTree { User, Issued }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardLedgerSnapshotNode {
+    pub tree: RewardLedgerTree,
+    pub hash: String,
+    pub height: u8,
+    pub left_hash: String,
+    pub right_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardLedgerSnapshotWindow {
+    pub config_hash: String,
+    pub economic_domain: String,
+    pub window_id: String,
+    pub end_checkpoint_id: String,
+    pub end_checkpoint_root: String,
+    pub start_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardLedgerSnapshotState {
+    pub ledger_window_hash: String,
+    pub ledger_root: String,
+    pub user_root: String,
+    pub session_count: String,
+    pub unfinished_session_count: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardLedgerSnapshotTip {
+    pub proof_id: String,
+    pub proof: String,
+    pub transition: String,
+    pub new_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardLedgerPriorContext {
+    pub context_id: String,
+    pub revision: String,
+    pub tip_proof: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardLedgerSnapshot {
+    pub context_id: String,
+    pub revision: String,
+    pub root: String,
+    #[serde(deserialize_with = "aggregation_required_option")]
+    pub predecessor_root: Option<String>,
+    pub window: RewardLedgerSnapshotWindow,
+    pub state: RewardLedgerSnapshotState,
+    #[serde(deserialize_with = "aggregation_required_option")]
+    pub tip: Option<RewardLedgerSnapshotTip>,
+    #[serde(deserialize_with = "aggregation_required_option")]
+    pub prior_context: Option<RewardLedgerPriorContext>,
+    pub nodes: Vec<RewardLedgerSnapshotNode>,
+    #[serde(deserialize_with = "aggregation_required_option")]
+    pub user_id: Option<String>,
+    #[serde(deserialize_with = "aggregation_required_option")]
+    pub source_checkpoint_id: Option<String>,
+}
+
+fn reward_snapshot_hash(value: &str) -> bool { aggregation_hex(value) }
+
+fn reward_snapshot_decimal(value: &str) -> bool { aggregation_decimal(value).is_some() }
+
+impl RewardLedgerSnapshot {
+    pub fn validate(&self) -> bool {
+        let origin = self.revision == "0" && self.prior_context.is_none();
+        let rotated = self.revision == "0" && self.prior_context.is_some();
+        reward_snapshot_hash(&self.context_id) && reward_snapshot_decimal(&self.revision)
+            && reward_snapshot_hash(&self.root)
+            && self.predecessor_root.as_deref().is_none_or(reward_snapshot_hash)
+            && (self.revision == "0") == self.predecessor_root.is_none()
+            && reward_snapshot_hash(&self.window.config_hash)
+            && reward_snapshot_hash(&self.window.economic_domain)
+            && reward_snapshot_hash(&self.window.window_id)
+            && reward_snapshot_decimal(&self.window.end_checkpoint_id)
+            && reward_snapshot_hash(&self.window.end_checkpoint_root)
+            && reward_snapshot_hash(&self.window.start_root)
+            && reward_snapshot_hash(&self.state.ledger_window_hash)
+            && reward_snapshot_hash(&self.state.ledger_root)
+            && reward_snapshot_hash(&self.state.user_root)
+            && reward_snapshot_decimal(&self.state.session_count)
+            && reward_snapshot_decimal(&self.state.unfinished_session_count)
+            && self.tip.as_ref().is_none_or(|tip| reward_snapshot_hash(&tip.proof_id) && reward_snapshot_hash(&tip.new_root)
+                && tip.new_root == self.root
+                && decode_aggregation_base64(&tip.proof, AGGREGATION_PROOF_LIMIT).is_ok_and(|proof| !proof.is_empty())
+                && decode_aggregation_base64(&tip.transition, AGGREGATION_PROOF_LIMIT).is_ok_and(|transition| !transition.is_empty()))
+            && self.prior_context.as_ref().is_none_or(|prior| reward_snapshot_hash(&prior.context_id)
+                && prior.context_id != self.context_id && reward_snapshot_decimal(&prior.revision)
+                && decode_aggregation_base64(&prior.tip_proof, AGGREGATION_PROOF_LIMIT).is_ok_and(|proof| !proof.is_empty()))
+            && self.nodes.len() <= 97
+            && self.nodes.iter().all(|node| reward_snapshot_hash(&node.hash) && reward_snapshot_hash(&node.left_hash)
+                && reward_snapshot_hash(&node.right_hash))
+            && origin == (self.user_id.is_none() && self.source_checkpoint_id.is_none() && self.tip.is_none())
+            && (!rotated || (self.user_id.is_none() && self.source_checkpoint_id.is_none() && self.tip.is_some() && self.predecessor_root.is_none()))
+            && self.user_id.as_deref().is_none_or(|id| reward_snapshot_decimal(id) && id.parse::<u64>().is_ok_and(|id| id <= u64::from(u32::MAX)))
+            && self.source_checkpoint_id.as_deref().is_none_or(|source| reward_snapshot_decimal(source)
+                && source.parse::<u64>().is_ok_and(|source| source <= self.window.end_checkpoint_id.parse::<u64>().unwrap_or(u64::MAX)))
+    }
+}
+pub async fn publish_reward_ledger_snapshot(
+    http: &reqwest::Client, services_url: &str, token_file: &std::path::Path, snapshot: &RewardLedgerSnapshot,
+) -> Result<(), AggregationHttpError> {
+    if !snapshot.validate() { return Err(AggregationHttpError::InvalidRequest); }
+    let _: serde_json::Value = aggregation_http(http.post(aggregation_url(services_url, "reward-ledger")?), token_file, Some(snapshot), REWARD_SNAPSHOT_BODY_LIMIT).await?;
+    Ok(())
 }
 
 pub async fn post_aggregation_dispositions(
@@ -465,7 +641,7 @@ pub async fn post_aggregation_dispositions(
         3 => { psy_client_data::bridge_aggregate::SourceCheckpointRewardOpening::decode(&bytes).map_err(|_| AggregationHttpError::InvalidRequest)?; }
         _ => return Err(AggregationHttpError::InvalidRequest),
     }
-    let acknowledgment: AggregationAcknowledgment = aggregation_http(http.post(aggregation_url(services_url, "dispositions")?), token_file, Some(request)).await?;
+    let acknowledgment: AggregationAcknowledgment = aggregation_http(http.post(aggregation_url(services_url, "dispositions")?), token_file, Some(request), AGGREGATION_BODY_LIMIT).await?;
     if acknowledgment.family != family || acknowledgment.opening_digest != posted_opening_digest || !acknowledgment.acknowledged_claim_ids.iter().map(String::as_str).eq(ids) {
         return Err(AggregationHttpError::InvalidResponse);
     }
@@ -683,5 +859,56 @@ mod tests {
             per_chain.query(),
             Some("source_chain_index=1&snapshot_deposit_count=4")
         );
+    }
+
+    fn hash() -> String { format!("0x{}", "11".repeat(32)) }
+
+    fn snapshot(prior: bool, tip: bool) -> super::RewardLedgerSnapshot {
+        use base64::Engine;
+        super::RewardLedgerSnapshot {
+            context_id: hash(), revision: "0".into(), root: hash(), predecessor_root: None,
+            window: super::RewardLedgerSnapshotWindow { config_hash: hash(), economic_domain: hash(), window_id: hash(), end_checkpoint_id: "1".into(), end_checkpoint_root: hash(), start_root: hash() },
+            state: super::RewardLedgerSnapshotState { ledger_window_hash: hash(), ledger_root: hash(), user_root: hash(), session_count: "0".into(), unfinished_session_count: "0".into() },
+            tip: tip.then(|| super::RewardLedgerSnapshotTip { proof_id: hash(), proof: base64::engine::general_purpose::STANDARD.encode([1]), transition: base64::engine::general_purpose::STANDARD.encode([2]), new_root: hash() }),
+            prior_context: prior.then(|| super::RewardLedgerPriorContext { context_id: format!("0x{}", "22".repeat(32)), revision: "1".into(), tip_proof: base64::engine::general_purpose::STANDARD.encode([3]) }),
+            nodes: Vec::new(), user_id: None, source_checkpoint_id: None,
+        }
+    }
+
+    #[test]
+    fn origin_snapshot_rejects_a_tip_and_rotated_snapshot_requires_one() {
+        assert!(snapshot(false, false).validate());
+        assert!(!snapshot(false, true).validate());
+        assert!(snapshot(true, true).validate());
+        assert!(!snapshot(true, false).validate());
+    }
+
+    fn claim_body(version: serde_json::Value, kind: &str, artifact: &str, artifact_value: &str) -> serde_json::Value {
+        serde_json::json!({"version": version, "contextId": "ctx", "kind": kind, "record": "record", artifact: artifact_value})
+    }
+
+    #[test]
+    fn claim_versions_round_trip_as_numbers_and_reject_other_versions() {
+        let withdrawal = super::AggregationClaimRequest::Withdrawal { context_id: "ctx".into(), kind: super::AggregationClaimKind::Withdrawal, record: "record".into(), proof: "proof".into() };
+        let reward = super::AggregationClaimRequest::Reward { context_id: "ctx".into(), kind: super::AggregationClaimKind::Reward, record: "record".into(), transition: "transition".into() };
+        assert_eq!(serde_json::to_value(&withdrawal).unwrap(), claim_body(serde_json::json!(1), "withdrawal", "proof", "proof"));
+        assert_eq!(serde_json::to_value(&reward).unwrap(), claim_body(serde_json::json!(2), "reward", "transition", "transition"));
+        assert_eq!(serde_json::from_value::<super::AggregationClaimRequest>(claim_body(serde_json::json!(1), "withdrawal", "proof", "proof")).unwrap(), withdrawal);
+        assert_eq!(serde_json::from_value::<super::AggregationClaimRequest>(claim_body(serde_json::json!(2), "reward", "transition", "transition")).unwrap(), reward);
+        for rejected in [
+            claim_body(serde_json::json!(0), "withdrawal", "proof", "proof"),
+            claim_body(serde_json::json!(3), "reward", "transition", "transition"),
+            claim_body(serde_json::json!("1"), "withdrawal", "proof", "proof"),
+            claim_body(serde_json::json!(1), "reward", "proof", "proof"),
+            claim_body(serde_json::json!(2), "withdrawal", "transition", "transition"),
+            claim_body(serde_json::json!(1), "withdrawal", "transition", "transition"),
+            claim_body(serde_json::json!(2), "reward", "proof", "proof"),
+        ] {
+            assert!(serde_json::from_value::<super::AggregationClaimRequest>(rejected).is_err());
+        }
+        let mismatched = super::AggregationClaimRequest::Withdrawal { context_id: "ctx".into(), kind: super::AggregationClaimKind::Reward, record: "record".into(), proof: "proof".into() };
+        assert!(serde_json::to_value(&mismatched).is_err());
+        let duplicated = r#"{"version":1,"version":1,"contextId":"ctx","kind":"withdrawal","record":"record","proof":"proof"}"#;
+        assert!(serde_json::from_str::<super::AggregationClaimRequest>(duplicated).is_err());
     }
 }

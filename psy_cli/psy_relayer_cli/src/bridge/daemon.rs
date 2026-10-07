@@ -20,7 +20,8 @@ use psy_client_data::traits::qdatastore::qtreedata::QTreeDataStoreReaderSync;
 
 use psy_prover::session::WalletSession;
 use psy_provider::provider::RpcProvider;
-use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
+use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}};
+use plonky2::plonk::config::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
@@ -470,7 +471,7 @@ fn aggregate_selected_counts(limits: &AggregateLimits, selected: &[String], clai
     for claim in claims {
         match claim.kind {
             2 => { let record = aggregate_bytes(&claim.record)?; let leaf = psy_client_data::bridge_aggregate::WithdrawalLeaf::decode(&record)?; records.insert(record, leaf.chain_index); }
-            3 => { rewards = rewards.checked_add(1).context("reward count overflow")?; }
+            3 => { if !claim.record.is_empty() { rewards = rewards.checked_add(1).context("reward count overflow")?; } }
             _ => anyhow::bail!("unsupported selected claim kind"),
         }
     }
@@ -527,6 +528,9 @@ struct FileReference { relative_path: String, sha256: String }
 #[serde(deny_unknown_fields)]
 struct RewardLedgerWindow {
     context_id: String,
+    revision: u64,
+    root: String,
+    predecessor_root: Option<String>,
     config_hash: String,
     economic_domain: String,
     window_id: String,
@@ -534,12 +538,52 @@ struct RewardLedgerWindow {
     end_checkpoint_id: u64,
     end_checkpoint_root: String,
     start_root: String,
-    current_root: String,
-    current_proof_id: Option<String>,
-    current_transition: Option<FileReference>,
-    current_proof: Option<FileReference>,
-    nodes: std::collections::BTreeMap<String, FileReference>,
+    state: RewardLedgerStateRecord,
+    tip: Option<RewardLedgerTipRecord>,
+    prior_context: Option<RewardLedgerPriorRecord>,
+    nodes: std::collections::BTreeMap<String, RewardLedgerNodeRecord>,
+    node_delta: Vec<String>,
     transitions: std::collections::BTreeMap<String, FileReference>,
+    user_id: Option<u32>,
+    source_checkpoint_id: Option<u64>,
+    published: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RewardLedgerStateRecord {
+    ledger_window_hash: String,
+    ledger_root: String,
+    user_root: String,
+    session_count: u32,
+    unfinished_session_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RewardLedgerTipRecord {
+    proof_id: String,
+    proof: FileReference,
+    transition: FileReference,
+    new_root: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RewardLedgerPriorRecord {
+    context_id: String,
+    revision: u64,
+    tip_proof: FileReference,
+    root: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RewardLedgerNodeRecord {
+    tree: String,
+    height: u8,
+    left_hash: String,
+    right_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -979,6 +1023,15 @@ fn aggregate_claim_id(config_hash: [u8; 32], kind: u8, record: &[u8]) -> String 
     bytes.extend(record);
     hex::encode(alloy_primitives::keccak256(bytes))
 }
+fn reward_claim_id(config_hash: [u8; 32], record: &[u8], transition: &[u8]) -> String {
+    use psy_client_data::bridge_aggregate::{domain_hash, Domain};
+    let mut bytes = domain_hash(Domain::LeafCommit).to_vec();
+    bytes.extend(config_hash);
+    bytes.extend(U256::from(3u8).to_be_bytes::<32>());
+    bytes.extend(record);
+    bytes.extend(alloy_primitives::keccak256(transition));
+    hex::encode(alloy_primitives::keccak256(bytes))
+}
 
 fn withdrawal_record(withdrawal: &propose_withdrawals::PendingWithdrawal) -> anyhow::Result<psy_client_data::bridge_aggregate::WithdrawalLeaf> {
     fn bytes(words: [u32; 8]) -> [u8; 32] { let mut result = [0; 32]; for (part, word) in result.chunks_exact_mut(4).zip(words) { part.copy_from_slice(&word.to_be_bytes()); } result }
@@ -991,74 +1044,197 @@ fn withdrawal_record(withdrawal: &propose_withdrawals::PendingWithdrawal) -> any
 }
 
 fn text_hash4(value: &str) -> anyhow::Result<[u64; 4]> {
-    let bytes = aggregate_bytes(value)?;
+    let text = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = aggregate_bytes(text)?;
     ensure!(bytes.len() == 32, "reward ledger root width");
     Ok(std::array::from_fn(|index| u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap())))
 }
-fn hash4_text(value: [u64; 4]) -> String { hex::encode(value.into_iter().flat_map(|limb| limb.to_le_bytes()).collect::<Vec<_>>()) }
+fn hash4_text(value: [u64; 4]) -> String { format!("0x{}", hex::encode(value.into_iter().flat_map(|limb| limb.to_le_bytes()).collect::<Vec<_>>())) }
+fn reward_hash_bytes(value: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = aggregate_bytes(value.strip_prefix("0x").unwrap_or(value))?;
+    ensure!(bytes.len() == 32, "reward hash width");
+    Ok(bytes.try_into().unwrap())
+}
 fn reward_window_values(window: &RewardLedgerWindow) -> anyhow::Result<psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerWindowValues> {
     Ok(psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerWindowValues {
-        config_hash: aggregate_bytes(&window.config_hash)?.try_into().map_err(|_| anyhow::anyhow!("reward window config width"))?,
-        economic_domain: aggregate_bytes(&window.economic_domain)?.try_into().map_err(|_| anyhow::anyhow!("reward window domain width"))?,
-        window_id: aggregate_bytes(&window.window_id)?.try_into().map_err(|_| anyhow::anyhow!("reward window id width"))?,
+        config_hash: reward_hash_bytes(&window.config_hash)?,
+        economic_domain: reward_hash_bytes(&window.economic_domain)?,
+        window_id: reward_hash_bytes(&window.window_id)?,
         end_checkpoint_id: u32::try_from(window.end_checkpoint_id)?,
         end_checkpoint_root: text_hash4(&window.end_checkpoint_root)?, start_root: text_hash4(&window.start_root)?,
     })
 }
-fn node_key(height: u8, index: u64) -> String { format!("{height}:{index}") }
-fn node_bytes(node: &psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerNodeUpdate) -> [u8; 41] {
-    let mut bytes = [0; 41];
-    bytes[0] = node.height;
-    bytes[1..9].copy_from_slice(&node.index.to_le_bytes());
-    bytes[9..41].copy_from_slice(&node.hash);
-    bytes
+fn reward_state_values(state: &RewardLedgerStateRecord) -> anyhow::Result<psy_plonky2_circuits::bridge::circuits::reward_session::RewardLedgerStateValues> {
+    Ok(psy_plonky2_circuits::bridge::circuits::reward_session::RewardLedgerStateValues {
+        ledger_window_hash: text_hash4(&state.ledger_window_hash)?, ledger_root: text_hash4(&state.ledger_root)?,
+        user_root: text_hash4(&state.user_root)?, session_count: state.session_count, unfinished_session_count: state.unfinished_session_count,
+    })
+}
+fn reward_state_record(state: &psy_plonky2_circuits::bridge::circuits::reward_session::RewardLedgerStateValues) -> RewardLedgerStateRecord {
+    RewardLedgerStateRecord { ledger_window_hash: hash4_text(state.ledger_window_hash), ledger_root: hash4_text(state.ledger_root), user_root: hash4_text(state.user_root), session_count: state.session_count, unfinished_session_count: state.unfinished_session_count }
+}
+fn reward_origin_state() -> anyhow::Result<RewardLedgerStateRecord> {
+    use psy_plonky2_circuits::bridge::circuits::reward_ledger::{reward_issued_empty_hash, reward_ledger_state_root, reward_user_empty_hash};
+    let state = psy_plonky2_circuits::bridge::circuits::reward_session::RewardLedgerStateValues { ledger_window_hash: [0; 4], ledger_root: reward_issued_empty_hash(64)?, user_root: reward_user_empty_hash(32)?, session_count: 0, unfinished_session_count: 0 };
+    ensure!(reward_ledger_state_root(&state)? == psy_client_data::bridge_aggregate::origin_state_root(), "reward origin root mismatch");
+    Ok(reward_state_record(&state))
+}
+fn reward_node_key(tree: &str, hash: &str) -> String { format!("{tree}:{hash}") }
+fn reward_changed_nodes(root: [u64; 4], leaf: [u64; 4], index: u64, siblings: &[[u64; 4]], issued: bool) -> anyhow::Result<Vec<(String, RewardLedgerNodeRecord)>> {
+    use psy_plonky2_circuits::bridge::circuits::reward_ledger::{reward_issued_parent_hash, reward_user_parent_hash};
+    let tree = if issued { "issued" } else { "user" };
+    let mut nodes = Vec::new();
+    let mut value = leaf;
+    for (height, sibling) in siblings.iter().enumerate() {
+        let bit = ((index >> height) & 1) == 1;
+        let (left, right) = if bit { (*sibling, value) } else { (value, *sibling) };
+        value = if issued { reward_issued_parent_hash(left, right)? } else { reward_user_parent_hash((height + 1) as u8, left, right)? };
+        nodes.push((reward_node_key(tree, &hash4_text(value)), RewardLedgerNodeRecord { tree: tree.to_string(), height: (height + 1) as u8, left_hash: hash4_text(left), right_hash: hash4_text(right) }));
+    }
+    ensure!(value == root, "reward changed path does not fold to its root");
+    Ok(nodes)
+}
+fn reward_issued_siblings(nodes: &std::collections::BTreeMap<String, RewardLedgerNodeRecord>, root: [u64; 4], index: u64) -> anyhow::Result<[[u64; 4]; 64]> {
+    use psy_plonky2_circuits::bridge::circuits::reward_ledger::{reward_issued_empty_hash, reward_issued_parent_hash};
+    let mut siblings = [[0; 4]; 64];
+    let mut cursor = root;
+    for height in (0..64).rev() {
+        let parent = u8::try_from(height + 1).unwrap();
+        if cursor == reward_issued_empty_hash(parent)? {
+            siblings[height] = reward_issued_empty_hash(u8::try_from(height).unwrap())?;
+            cursor = if height == 0 { [0; 4] } else { reward_issued_empty_hash(u8::try_from(height).unwrap())? };
+            continue;
+        }
+        let node = nodes.get(&reward_node_key("issued", &hash4_text(cursor))).with_context(|| format!("issued sibling missing at height {height}"))?;
+        ensure!(node.height == u8::try_from(height + 1).unwrap(), "stored issued node height mismatch");
+        let left = text_hash4(&node.left_hash)?;
+        let right = text_hash4(&node.right_hash)?;
+        ensure!(reward_issued_parent_hash(left, right)? == cursor, "stored issued node does not fold");
+        let bit = ((index >> height) & 1) == 1;
+        siblings[height] = if bit { left } else { right };
+        cursor = if bit { right } else { left };
+    }
+    ensure!(cursor == [0; 4], "issued path does not fold to the empty leaf");
+    let mut check = [0; 4];
+    for (height, sibling) in siblings.iter().enumerate() {
+        let bit = ((index >> height) & 1) == 1;
+        check = if bit { reward_issued_parent_hash(*sibling, check)? } else { reward_issued_parent_hash(check, *sibling)? };
+    }
+    ensure!(check == root, "issued siblings do not fold to the old root");
+    Ok(siblings)
+}
+fn initialize_reward_ledger(network: &psy_client_data::bridge_aggregate::NetworkConfig, opening: &psy_client_data::bridge_aggregate::DepositAggregateOpening, context_id: &str, previous: Option<&RewardLedgerWindow>) -> anyhow::Result<RewardLedgerWindow> {
+    let domain = network.clone().load().map_err(|error| anyhow::anyhow!("economic domain: {error:?}"))?.economic_domain();
+    let (state, prior, start, nodes, transitions, tip) = if let Some(previous) = previous {
+        ensure!(previous.published, "prior reward context is not accepted");
+        ensure!(text_hash4(&previous.root)? == text_hash4(&previous.start_root)? || previous.revision > 0, "prior reward tip is not its accepted root");
+        let prior = previous.tip.as_ref().map(|tip| RewardLedgerPriorRecord { context_id: format!("0x{}", previous.context_id), revision: previous.revision, tip_proof: tip.proof.clone(), root: previous.root.clone() });
+        ensure!(prior.is_some() == (text_hash4(&previous.root)? != psy_client_data::bridge_aggregate::origin_state_root()), "rotated predecessor proof does not match its root");
+        (previous.state.clone(), prior, previous.root.clone(), previous.nodes.clone(), previous.transitions.clone(), previous.tip.clone())
+    } else {
+        (reward_origin_state()?, None, hash4_text(psy_client_data::bridge_aggregate::origin_state_root()), Default::default(), Default::default(), None)
+    };
+    Ok(RewardLedgerWindow {
+        context_id: context_id.trim_start_matches("0x").to_string(), revision: 0, root: start.clone(), predecessor_root: None,
+        config_hash: format!("0x{}", hex::encode(opening.config_hash)), economic_domain: format!("0x{}", hex::encode(domain)), window_id: format!("0x{}", hex::encode(opening.window_id)),
+        end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root: hash4_text(opening.end_checkpoint_root), start_root: start, state, tip, prior_context: prior,
+        nodes, node_delta: Vec::new(), transitions, user_id: None, source_checkpoint_id: None, published: false,
+    })
 }
 fn apply_reward_ledger_transition(directory: &Path, data: &plonky2::plonk::circuit_data::CircuitData<GoldilocksField, plonky2::plonk::config::PoseidonGoldilocksConfig, 2>, opening: &psy_client_data::bridge_aggregate::DepositAggregateOpening, context_id: &str, record: &[u8], transition: &[u8], state: &MultichainDaemonState) -> anyhow::Result<RewardLedgerWindow> {
     use psy_plonky2_circuits::bridge::circuits::reward_ledger::{deserialize_reward_ledger_transition, reward_ledger_proof_id, verify_reward_ledger_step};
     let (window, step, supplied_nodes) = deserialize_reward_ledger_transition(transition)?;
     ensure!(window.config_hash == opening.config_hash && window.window_id == opening.window_id && u64::from(window.end_checkpoint_id) == opening.end_checkpoint_id && window.end_checkpoint_root == opening.end_checkpoint_root, "reward transition window differs from the aggregate opening");
-    ensure!(window.start_root != [0; 4], "reward ledger genesis root cannot be zero");
-    let Some(existing) = state.reward_ledger.clone() else {
-        anyhow::bail!("reward ledger economic domain is absent from NetworkConfig; first window initialization is unavailable");
-    };
+    let existing = state.reward_ledger.clone().context("reward ledger is not initialized")?;
+    ensure!(existing.published, "reward ledger snapshot is not accepted");
     ensure!(reward_window_values(&existing)? == window && existing.context_id == context_id.trim_start_matches("0x"), "published reward ledger continuation unavailable");
-    ensure!(text_hash4(&existing.start_root)? == window.start_root, "reward ledger start root differs from the retained window");
-    let mut ledger = existing;
     let raw_proof_id = reward_ledger_proof_id(&data.verifier_only, &step.proof)?;
-    let proof_id = hex::encode(raw_proof_id);
-    if let Some(reference) = ledger.transitions.get(&proof_id) {
-        let retained = load_aggregate_file(directory, reference)?;
-        ensure!(retained == transition, "retained reward transition differs for the same proof id");
-        let (retained_window, retained_step, _) = deserialize_reward_ledger_transition(&retained)?;
-        ensure!(retained_window == window, "retained reward transition window differs");
-        let proof = AggregateProof::from_bytes(retained_step.proof.clone(), &data.common).map_err(|error| anyhow::anyhow!("retained reward proof: {error}"))?;
-        let inputs = proof.public_inputs.iter().map(|value| value.to_canonical_u64()).collect::<Vec<_>>();
-        let fields = psy_client_data::bridge_aggregate::RewardSessionProofFields::from_public_inputs(&inputs).map_err(|error| anyhow::anyhow!("retained reward statement: {error}"))?;
-        let payout = if retained_step.is_final_step {
-            let mut recipient = [0u8; 20];
-            for index in 0..5 { recipient[index * 4..index * 4 + 4].copy_from_slice(&fields.recipient[4 - index].to_be_bytes()); }
-            psy_client_data::bridge_aggregate::SourceCheckpointRewardLeaf { economic_domain: window.economic_domain, source_checkpoint_id: u64::from(retained_step.source_checkpoint_id), user_id: fields.user_id, amount: fields.total_amount, recipient, initialized: true }.encode()?
-        } else { Vec::new() };
-        ensure!(payout == record, "retained reward transition record differs");
-        return Ok(ledger);
+    let proof_id = hash4_text(std::array::from_fn(|index| u64::from_le_bytes(raw_proof_id[index * 8..index * 8 + 8].try_into().unwrap())));
+    if let Some(retained) = existing.transitions.get(&proof_id) {
+        let retained_bytes = load_aggregate_file(directory, retained)?;
+        ensure!(retained_bytes == transition, "retained reward transition differs for the same proof id");
+        let (retained_window, retained_step, retained_nodes) = deserialize_reward_ledger_transition(&retained_bytes)?;
+        let retained_root = psy_plonky2_circuits::bridge::circuits::reward_ledger::reward_ledger_state_root(&retained_step.old_state)?;
+        let retained_verified = verify_reward_ledger_step(&data.common, &data.verifier_only, &retained_window, retained_root, &retained_step)?;
+        ensure!(retained_verified.transition_bytes == retained_bytes && retained_verified.nodes == retained_nodes && retained_verified.proof_id == raw_proof_id, "retained reward transition is not canonical");
+        let retained_record = retained_verified.source_payout.as_ref().map(|leaf| leaf.encode()).transpose()?.unwrap_or_default();
+        ensure!(retained_record == record, "retained reward payout differs for the same proof id");
+        return Ok(existing);
     }
-    let verified = verify_reward_ledger_step(&data.common, &data.verifier_only, &window, text_hash4(&ledger.current_root)?, &step).context("reward ledger step does not extend the locked root; ordered predecessor or published continuation is missing")?;
+    let verified = verify_reward_ledger_step(&data.common, &data.verifier_only, &window, text_hash4(&existing.root)?, &step).context("reward ledger step does not extend the locked root")?;
     ensure!(verified.transition_bytes == transition && verified.nodes == supplied_nodes && verified.nodes.len() == 33 && verified.proof_id == raw_proof_id, "reward transition is not the verified canonical transition");
     match &verified.source_payout {
         Some(leaf) => ensure!(leaf.encode()? == record, "source payout differs from the verified transition"),
         None => ensure!(record.is_empty(), "nonfinal reward transition carries a payout record"),
     }
-    ensure!(hex::encode(verified.old_root) == ledger.current_root, "reward transition does not extend the locked root");
-    for node in &verified.nodes { ledger.nodes.insert(node_key(node.height, node.index), save_aggregate_file(directory, &node_bytes(node), "node")?); }
-    ledger.current_root = hex::encode(verified.new_root);
-    ledger.current_proof_id = Some(proof_id.clone());
+    let proof = AggregateProof::from_bytes(step.proof.clone(), &data.common).map_err(|error| anyhow::anyhow!("reward proof decode: {error}"))?;
+    let inputs = proof.public_inputs.iter().map(|value| value.to_canonical_u64()).collect::<Vec<_>>();
+    let fields = psy_client_data::bridge_aggregate::RewardSessionProofFields::from_public_inputs(&inputs).map_err(|error| anyhow::anyhow!("reward statement: {error}"))?;
+    let old_root = text_hash4(&existing.root)?;
+    ensure!(fields.old_ledger_state_root == old_root && hash4_text(fields.new_ledger_state_root) == hash4_text(text_hash4(&hex::encode(verified.new_root))?), "reward tip root mismatch");
+    let first_window = old_root == window.start_root;
+    let mut ledger = existing;
+    ledger.revision = ledger.revision.checked_add(1).context("reward revision overflow")?;
+    ledger.predecessor_root = Some(ledger.root.clone());
+    ledger.root = hash4_text(fields.new_ledger_state_root);
+    ledger.state = reward_state_record(&step.new_state);
+    ledger.user_id = Some(fields.user_id);
+    ledger.source_checkpoint_id = Some(u64::from(step.source_checkpoint_id));
+    if !first_window { ledger.prior_context = None; }
+    let user_leaf = verified.nodes.iter().find(|node| node.height == 0).context("verified user leaf missing")?;
+    ensure!(user_leaf.index == u64::from(fields.user_id), "verified user leaf index mismatch");
+    ledger.node_delta.clear();
+    for (key, node) in reward_changed_nodes(step.new_state.user_root, text_hash4(&hex::encode(user_leaf.hash))?, u64::from(fields.user_id), &step.summary_siblings, false)? {
+        ledger.node_delta.push(key.clone());
+        ledger.nodes.entry(key).or_insert(node);
+    }
+    if step.new_state.ledger_root != step.old_state.ledger_root {
+        ensure!(step.is_final_step, "nonfinal reward issued root changed");
+        let index = u64::from(fields.user_id) | (u64::from(step.source_checkpoint_id) << 32);
+        let siblings = reward_issued_siblings(&ledger.nodes, step.old_state.ledger_root, index)?;
+        let _ = reward_changed_nodes(step.old_state.ledger_root, [0; 4], index, &siblings, true)?;
+        let mut issued = b"PsyRewardLedger/Issued/1".to_vec();
+        issued.extend(window.economic_domain);
+        issued.extend_from_slice(&step.source_checkpoint_id.to_le_bytes());
+        issued.extend_from_slice(&fields.user_id.to_le_bytes());
+        for word in fields.total_amount.into_iter().chain(fields.recipient[..5].iter().copied()) { issued.extend_from_slice(&word.to_le_bytes()); }
+        for value in [fields.jobs_commitment, step.new_state.ledger_window_hash] { for limb in value { issued.extend_from_slice(&limb.to_le_bytes()); } }
+        let occupied = plonky2::hash::poseidon::PoseidonHash::hash_no_pad(&issued.iter().copied().map(plonky2::field::goldilocks_field::GoldilocksField::from_canonical_u8).collect::<Vec<_>>()).elements.map(|limb| limb.to_canonical_u64());
+        for (key, node) in reward_changed_nodes(step.new_state.ledger_root, occupied, index, &siblings, true)? { ledger.node_delta.push(key.clone()); ledger.nodes.insert(key, node); }
+    }
     let transition_file = save_aggregate_file(directory, transition, "transition")?;
-    ledger.current_transition = Some(transition_file.clone());
-    ledger.current_proof = Some(save_aggregate_file(directory, &step.proof, "proof")?);
-    ledger.transitions.insert(proof_id, transition_file);
+    ledger.transitions.insert(proof_id.clone(), transition_file.clone());
+    ledger.tip = Some(RewardLedgerTipRecord { proof_id, proof: save_aggregate_file(directory, &step.proof, "proof")?, transition: transition_file, new_root: ledger.root.clone() });
+    ledger.published = false;
     Ok(ledger)
 }
-
+fn reward_snapshot(directory: &Path, ledger: &RewardLedgerWindow) -> anyhow::Result<super::api_client::RewardLedgerSnapshot> {
+    use base64::Engine;
+    let encode_part = |reference: &FileReference| -> anyhow::Result<String> {
+        let bytes = load_aggregate_file(directory, reference)?;
+        ensure!(bytes.len() <= super::api_client::AGGREGATION_PROOF_LIMIT, "reward snapshot part exceeds 16MiB");
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    };
+    let tip = ledger.tip.as_ref().map(|tip| -> anyhow::Result<_> {
+        Ok(super::api_client::RewardLedgerSnapshotTip { proof_id: tip.proof_id.clone(), proof: encode_part(&tip.proof)?, transition: encode_part(&tip.transition)?, new_root: tip.new_root.clone() })
+    }).transpose()?;
+    let prior = ledger.prior_context.as_ref().map(|prior| -> anyhow::Result<_> {
+        Ok(super::api_client::RewardLedgerPriorContext { context_id: prior.context_id.clone(), revision: prior.revision.to_string(), tip_proof: encode_part(&prior.tip_proof)? })
+    }).transpose()?;
+    let nodes = ledger.node_delta.iter().map(|key| {
+        let node = ledger.nodes.get(key).with_context(|| format!("reward revision node missing: {key}"))?;
+        let hash = key.split_once(':').context("reward node key")?.1.to_string();
+        Ok(super::api_client::RewardLedgerSnapshotNode { tree: match node.tree.as_str() { "user" => super::api_client::RewardLedgerTree::User, "issued" => super::api_client::RewardLedgerTree::Issued, _ => anyhow::bail!("reward node tree") }, hash, height: node.height, left_hash: node.left_hash.clone(), right_hash: node.right_hash.clone() })
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(super::api_client::RewardLedgerSnapshot { context_id: format!("0x{}", ledger.context_id), revision: ledger.revision.to_string(), root: ledger.root.clone(), predecessor_root: ledger.predecessor_root.clone(), window: super::api_client::RewardLedgerSnapshotWindow { config_hash: ledger.config_hash.clone(), economic_domain: ledger.economic_domain.clone(), window_id: ledger.window_id.clone(), end_checkpoint_id: ledger.end_checkpoint_id.to_string(), end_checkpoint_root: ledger.end_checkpoint_root.clone(), start_root: ledger.start_root.clone() }, state: super::api_client::RewardLedgerSnapshotState { ledger_window_hash: ledger.state.ledger_window_hash.clone(), ledger_root: ledger.state.ledger_root.clone(), user_root: ledger.state.user_root.clone(), session_count: ledger.state.session_count.to_string(), unfinished_session_count: ledger.state.unfinished_session_count.to_string() }, tip, prior_context: prior, nodes, user_id: ledger.user_id.map(|id| id.to_string()), source_checkpoint_id: ledger.source_checkpoint_id.map(|id| id.to_string()) })
+}
+async fn publish_saved_reward_ledger(config: &BridgeProposeDaemonConfig, http: &reqwest::Client, directory: &Path, state_path: &Path, state: &mut MultichainDaemonState) -> anyhow::Result<()> {
+    let Some(ledger) = state.reward_ledger.clone().filter(|ledger| !ledger.published) else { return Ok(()); };
+    let snapshot = reward_snapshot(directory, &ledger)?;
+    super::api_client::publish_reward_ledger_snapshot(http, &config.services_url, &config.aggregation_token_file, &snapshot).await?;
+    if let Some(saved) = &mut state.reward_ledger { saved.published = true; }
+    save_multichain_state(state_path, state)
+}
 async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[ChainRuntime], provider: &RpcProvider, network: &psy_client_data::bridge_aggregate::NetworkConfig,
     circuits: &psy_plonky2_circuits::bridge::aggregate_circuits::AggregateCircuits, http: &reqwest::Client,
     directory: &Path, state_path: &Path, state: &mut MultichainDaemonState) -> anyhow::Result<()> {
@@ -1074,6 +1250,13 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
     }
     super::api_client::publish_aggregation_context(http, &config.services_url, &config.aggregation_token_file,
         &super::api_client::PublishAggregationContext { expected_context_id: current.map(|context| context.context_id), context: context.clone() }).await?;
+    let rotated = state.reward_ledger.as_ref().is_some_and(|ledger| ledger.context_id != context.context_id.trim_start_matches("0x"));
+    if state.reward_ledger.is_none() || rotated {
+        let previous = rotated.then(|| state.reward_ledger.clone()).flatten();
+        state.reward_ledger = Some(initialize_reward_ledger(network, &a, &context.context_id, previous.as_ref())?);
+        save_multichain_state(state_path, state)?;
+    }
+    publish_saved_reward_ledger(config, http, directory, state_path, state).await?;
     let guardian = super::guardian_client::GuardianClientConfig::load(Path::new(&config.guardian_config))?;
     let authorization = guardian.authorization()?;
     let rpc_config = psy_config::PsyConfigGoldilocks::from_file(&config.rpc_config)?;
@@ -1118,7 +1301,8 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
                 _ => anyhow::bail!("queued claim version does not match its family"),
             };
             let record = super::api_client::decode_aggregation_base64(record_text, if kind == 3 { 192 } else { 1024 })?;
-            let claim_id = aggregate_claim_id(a.config_hash, kind, &record);
+            let bytes = super::api_client::decode_aggregation_base64(artifact_text, 16 * 1024 * 1024)?;
+            let claim_id = if kind == 3 { reward_claim_id(a.config_hash, &record, &bytes) } else { aggregate_claim_id(a.config_hash, kind, &record) };
             ensure!(claim.claim_id == format!("0x{claim_id}"), "claim identity mismatch");
             let retained = selected_claims.iter().position(|selected| selected.claim_id == claim_id);
             let mut promoted_hash = None;
@@ -1130,8 +1314,7 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
                     let Some(hash) = historical_withdrawals.get(&record) else { continue; };
                     promoted_hash = Some(hash.clone());
                 }
-            } else if retained.is_none() && selected_claims.iter().filter(|claim| claim.kind == 3).count() >= aggregate_limits.reserved_rewards as usize { continue; }
-            let bytes = super::api_client::decode_aggregation_base64(artifact_text, 16 * 1024 * 1024)?;
+            } else if !record.is_empty() && retained.is_none() && selected_claims.iter().filter(|claim| claim.kind == 3 && !claim.record.is_empty()).count() >= aggregate_limits.reserved_rewards as usize { continue; }
             let mut next_reward_ledger = None;
             if kind == 2 {
                 let leaf = WithdrawalLeaf::decode(&record)?;
@@ -1152,8 +1335,10 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
                 ensure!(inputs.get(24..32) == Some(words.as_slice()), "claim record mismatch");
                 data.verify(proof)?;
             } else {
-                let payout = SourceCheckpointRewardLeaf::decode(&record)?;
-                ensure!(payout.encode()? == record, "noncanonical source payout");
+                if !record.is_empty() {
+                    let payout = SourceCheckpointRewardLeaf::decode(&record)?;
+                    ensure!(payout.encode()? == record, "noncanonical source payout");
+                }
                 next_reward_ledger = Some(apply_reward_ledger_transition(directory, &circuits.reward_session.circuit_data, &a, &context.context_id, &record, &bytes, state)?);
             }
             if let Some(hash) = promoted_hash {
@@ -1177,14 +1362,17 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
                 let (_, count) = local_withdrawals.iter_mut().find(|(index, _)| *index == leaf.chain_index).context("historical withdrawal destination absent")?;
                 *count = count.checked_add(1).context("withdrawal count overflow")?;
             }
-            let selected = SelectedClaim { claim_id, kind, record: hex::encode(record), proof: Some(save_aggregate_file(directory, &bytes, "proof")?), proof_context_id: Some(context.context_id.trim_start_matches("0x").into()) };
-            if let Some(index) = retained { ensure!(selected_claims[index].record == selected.record && selected_claims[index].kind == kind, "retained claim changed"); selected_claims[index] = selected; }
-            else { selected_claims.push(selected); }
+            if kind != 3 || !record.is_empty() {
+                let selected = SelectedClaim { claim_id, kind, record: hex::encode(record), proof: Some(save_aggregate_file(directory, &bytes, "proof")?), proof_context_id: Some(context.context_id.trim_start_matches("0x").into()) };
+                if let Some(index) = retained { ensure!(selected_claims[index].record == selected.record && selected_claims[index].kind == kind, "retained claim changed"); selected_claims[index] = selected; }
+                else { selected_claims.push(selected); }
+            }
             let previous_pending = state.pending.clone();
             let previous_ledger = state.reward_ledger.clone();
             state.pending = Some(PendingAggregate::Collecting { aggregate_limits: aggregate_limits.clone(), producing_session: producing_session.clone(), selected_withdrawal_leaf_hashes: selected_withdrawal_leaf_hashes.clone(), a_opening: a_opening.clone(), withdrawal_endpoint: withdrawal_endpoint.clone(), selected_claims: selected_claims.clone() });
             if let Some(next) = next_reward_ledger { state.reward_ledger = Some(next); }
             if let Err(error) = save_multichain_state(state_path, state) { state.pending = previous_pending; state.reward_ledger = previous_ledger; return Err(error); }
+            publish_saved_reward_ledger(config, http, directory, state_path, state).await?;
         }
         state.pending = Some(PendingAggregate::Collecting { aggregate_limits: aggregate_limits.clone(), producing_session: producing_session.clone(), selected_withdrawal_leaf_hashes: selected_withdrawal_leaf_hashes.clone(), a_opening: a_opening.clone(), withdrawal_endpoint: withdrawal_endpoint.clone(), selected_claims: selected_claims.clone() });
         save_multichain_state(state_path, state)?;
@@ -1194,6 +1382,7 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
     state.pending = Some(PendingAggregate::Collecting { aggregate_limits: aggregate_limits.clone(), producing_session: producing_session.clone(), selected_withdrawal_leaf_hashes: selected_withdrawal_leaf_hashes.clone(), a_opening: a_opening.clone(), withdrawal_endpoint: withdrawal_endpoint.clone(), selected_claims: selected_claims.clone() });
     save_multichain_state(state_path, state)?;
     if selected_claims.iter().any(|claim| claim.proof.is_none() || claim.proof_context_id.as_deref() != Some(context.context_id.trim_start_matches("0x"))) { return Ok(()); }
+    if state.reward_ledger.as_ref().is_some_and(|ledger| ledger.state.unfinished_session_count != 0) { return Ok(()); }
     for hash in &selected_withdrawal_leaf_hashes {
         let withdrawal = state.pending_claim_withdrawals.get(hash).or_else(|| state.retired_claim_withdrawals.get(hash).map(|entry| &entry.withdrawal)).context("selected withdrawal metadata missing")?;
         let id = aggregate_claim_id(a.config_hash, 2, &withdrawal_record(withdrawal)?.encode()?);
@@ -1202,6 +1391,7 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
     let mut ordered = selected_claims.into_iter().map(|claim| -> anyhow::Result<_> {
         let bytes = aggregate_bytes(&claim.record)?;
         let key = if claim.kind == 2 { let leaf = WithdrawalLeaf::decode(&bytes)?; (u64::from(leaf.chain_index), leaf.nonce) }
+            else if bytes.is_empty() { (u64::MAX, [0u8; 32]) }
             else { let leaf = SourceCheckpointRewardLeaf::decode(&bytes)?; (leaf.source_checkpoint_id, U256::from(leaf.user_id).to_be_bytes::<32>()) };
         Ok(((claim.kind, key), claim))
     }).collect::<anyhow::Result<Vec<_>>>()?;
@@ -1209,14 +1399,14 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
     let selected_claims = ordered.into_iter().map(|(_, claim)| claim).collect::<Vec<_>>();
     let withdrawal_roots: Vec<[u64; 4]> = serde_json::from_slice(&aggregate_bytes(&withdrawal_endpoint)?)?;
     let withdrawals = selected_claims.iter().filter(|claim| claim.kind == 2).map(|claim| WithdrawalLeaf::decode(&aggregate_bytes(&claim.record)?).map_err(Into::into)).collect::<anyhow::Result<Vec<_>>>()?;
-    let rewards = selected_claims.iter().filter(|claim| claim.kind == 3).map(|claim| SourceCheckpointRewardLeaf::decode(&aggregate_bytes(&claim.record)?).map_err(Into::into)).collect::<anyhow::Result<Vec<_>>>()?;
+    let rewards = selected_claims.iter().filter(|claim| claim.kind == 3 && !claim.record.is_empty()).map(|claim| SourceCheckpointRewardLeaf::decode(&aggregate_bytes(&claim.record)?).map_err(Into::into)).collect::<anyhow::Result<Vec<_>>>()?;
     let economic_domain = network.clone().load().map_err(|error| anyhow::anyhow!("economic domain: {error:?}"))?.economic_domain();
     let (old_reward_ledger_root, new_reward_ledger_root) = if rewards.is_empty() {
-        let root = state.reward_ledger.as_ref().map(|ledger| text_hash4(&ledger.current_root)).transpose()?.unwrap_or_else(psy_client_data::bridge_aggregate::origin_state_root);
+        let root = state.reward_ledger.as_ref().map(|ledger| text_hash4(&ledger.root)).transpose()?.unwrap_or_else(psy_client_data::bridge_aggregate::origin_state_root);
         (root, root)
     } else {
         let ledger = state.reward_ledger.as_ref().context("reward ledger absent")?;
-        (text_hash4(&ledger.start_root)?, text_hash4(&ledger.current_root)?)
+        (text_hash4(&ledger.start_root)?, text_hash4(&ledger.root)?)
     };
     let indices = network.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>();
     let identity = finalization_identity(circuits, &indices)?;
@@ -1355,10 +1545,10 @@ async fn prove_frozen_aggregate(config: &BridgeProposeDaemonConfig, provider: &R
             None
         } else {
             let ledger = state.reward_ledger.as_ref().context("reward identity ledger missing")?;
-            ensure!(text_hash4(&ledger.current_root)? == settlement.old_reward_ledger_root, "reward identity ledger root mismatch");
-            let bytes = load_aggregate_file(directory, ledger.current_proof.as_ref().context("reward identity predecessor missing")?)?;
-            let id = psy_plonky2_circuits::bridge::circuits::reward_ledger::reward_ledger_proof_id(&circuits.reward_session.circuit_data.verifier_only, &bytes)?;
-            let transition = load_aggregate_file(directory, ledger.transitions.get(&hex::encode(id)).context("reward identity predecessor state missing")?)?;
+            ensure!(text_hash4(&ledger.root)? == settlement.old_reward_ledger_root, "reward identity ledger root mismatch");
+            let tip = ledger.tip.as_ref().context("reward identity predecessor missing")?;
+            let bytes = load_aggregate_file(directory, &tip.proof)?;
+            let transition = load_aggregate_file(directory, &tip.transition)?;
             let (_, step, _) = psy_plonky2_circuits::bridge::circuits::reward_ledger::deserialize_reward_ledger_transition(&transition)?;
             ensure!(step.proof == bytes, "reward identity predecessor differs from retained state");
             let proof = AggregateProof::from_bytes(bytes, &circuits.reward_session.circuit_data.common).map_err(|error| anyhow::anyhow!("reward identity predecessor decode: {error}"))?;
@@ -1378,21 +1568,23 @@ async fn prove_frozen_aggregate(config: &BridgeProposeDaemonConfig, provider: &R
     let mut reward_proofs = Vec::with_capacity(r.leaves.len());
     for reference in local_proofs.iter().skip(w.withdrawals.len()) {
         let bytes = load_aggregate_file(directory, reference)?;
-        let transition = load_aggregate_file(directory, ledger.transitions.get(&hex::encode(psy_plonky2_circuits::bridge::circuits::reward_ledger::reward_ledger_proof_id(&circuits.reward_session.circuit_data.verifier_only, &bytes)?)).context("retained reward transition missing")?)?;
-        let (window, step, _) = psy_plonky2_circuits::bridge::circuits::reward_ledger::deserialize_reward_ledger_transition(&transition)?;
-        ensure!(step.proof == bytes && reward_window_values(ledger)? == window, "retained reward transition left its window");
+        let (window, step, _) = psy_plonky2_circuits::bridge::circuits::reward_ledger::deserialize_reward_ledger_transition(&bytes)?;
+        let raw_proof_id = psy_plonky2_circuits::bridge::circuits::reward_ledger::reward_ledger_proof_id(&circuits.reward_session.circuit_data.verifier_only, &step.proof)?;
+        let proof_id = hash4_text(std::array::from_fn(|index| u64::from_le_bytes(raw_proof_id[index * 8..index * 8 + 8].try_into().unwrap())));
+        ensure!(load_aggregate_file(directory, ledger.transitions.get(&proof_id).context("retained reward transition missing")?)? == bytes, "retained reward transition differs from the selected artifact");
+        ensure!(reward_window_values(ledger)? == window, "retained reward transition left its window");
         let proof = AggregateProof::from_bytes(step.proof.clone(), &circuits.reward_session.circuit_data.common).map_err(|error| anyhow::anyhow!("retained reward proof decode: {error}"))?;
         circuits.reward_session.circuit_data.verify(proof.clone())?;
         reward_steps.push(step);
         reward_proofs.push(proof);
     }
     ensure!(reward_proofs.len() == r.leaves.len(), "retained reward proof count mismatch");
-    let tip_bytes = load_aggregate_file(directory, ledger.current_proof.as_ref().context("retained reward tip missing")?)?;
+    let tip_bytes = load_aggregate_file(directory, &ledger.tip.as_ref().context("retained reward tip missing")?.proof)?;
     let tip_index = reward_steps.iter().position(|step| step.proof == tip_bytes).context("retained reward tip is not one of the selected payouts")?;
     let payouts = reward_proofs.iter().zip(&reward_steps).map(|(proof, step)| prove_bridge::RewardPayoutInputs { proof, step }).collect::<Vec<_>>();
     let reward_inputs = prove_bridge::RewardAggregateInputs { old_ledger_state_root: settlement.old_reward_ledger_root, new_ledger_state_root: settlement.new_reward_ledger_root, tip_proof: &reward_proofs[tip_index], tip_state: &reward_steps[tip_index].new_state, payouts: &payouts };
-        prove_bridge::build_reward_aggregate(network, &r, &reward_inputs, circuits)?
-    };
+    prove_bridge::build_reward_aggregate(network, &r, &reward_inputs, circuits)?
+};
     let b_digest = settlement.opening_digest(network, &a).map_err(|error| anyhow::anyhow!("settlement opening: {error:?}"))?;
     let settlement_proof = circuits.settlement_aggregate.prove(network, &a, &settlement, &proofs, &withdrawal, &reward)?;
     circuits.settlement_aggregate.circuit_data.verify(settlement_proof.clone())?;
@@ -1696,7 +1888,8 @@ async fn advance_aggregate_round(config: &BridgeProposeDaemonConfig, chains: &[C
     use base64::Engine;
     use psy_client_data::bridge_aggregate::{DepositAggregateOpening, WithdrawalAggregateOpening, SourceCheckpointRewardOpening};
     use super::api_client::{AggregationDispositions, ClaimDisposition, ReceiptEvidence, ConsumptionEvidence};
-    validate_aggregate_state(state)?;
+    validate_aggregate_state(directory, state)?;
+    publish_saved_reward_ledger(config, http, directory, state_path, state).await?;
     if let Some(pending) = &state.pending { pending.limits().validate(network)?; }
     for key in state.receipt_dispositions.keys().cloned().collect::<Vec<_>>() {
         let (family_text, opening_digest) = key.split_once(':').context("receipt key family missing")?;
@@ -1943,16 +2136,16 @@ fn load_multichain_state(path: &Path, namespace: &str) -> anyhow::Result<Multich
     let state: MultichainDaemonState = toml::from_str(&raw).context("old daemon state requires operator reconciliation before atomic-window cutover")?;
     ensure!(state.schema == 4, "unsupported aggregate state schema; operator reconciliation required");
     ensure!(state.identity_namespace == namespace, "multichain daemon state belongs to a different chain cohort");
-    validate_aggregate_state(&state)?;
+    validate_aggregate_state(path.parent().unwrap_or(Path::new(".")), &state)?;
     Ok(state)
 }
 
 fn save_multichain_state(path: &Path, state: &MultichainDaemonState) -> anyhow::Result<()> {
-    validate_aggregate_state(state)?;
+    validate_aggregate_state(path.parent().unwrap_or(Path::new(".")), state)?;
     save_daemon_bytes(path, toml::to_string(state)?.as_bytes())
 }
 
-fn validate_aggregate_state(state: &MultichainDaemonState) -> anyhow::Result<()> {
+fn validate_aggregate_state(directory: &Path, state: &MultichainDaemonState) -> anyhow::Result<()> {
     fn hash(value: &str) -> anyhow::Result<()> { ensure!(aggregate_bytes(value)?.len() == 32, "aggregate hash width mismatch"); Ok(()) }
     fn file(reference: &FileReference) -> anyhow::Result<()> {
         hash(&reference.sha256)?;
@@ -1999,8 +2192,10 @@ fn validate_aggregate_state(state: &MultichainDaemonState) -> anyhow::Result<()>
                 for claim in selected_claims {
                     hash(&claim.claim_id)?; ensure!(ids.insert(&claim.claim_id), "duplicate selected claim");
                     let bytes = aggregate_bytes(&claim.record)?;
-                    let encoded = match claim.kind { 2 => psy_client_data::bridge_aggregate::WithdrawalLeaf::decode(&bytes)?.encode()?, 3 => psy_client_data::bridge_aggregate::SourceCheckpointRewardLeaf::decode(&bytes)?.encode()?, _ => anyhow::bail!("unsupported selected claim kind") };
-                    ensure!(encoded == bytes && aggregate_claim_id(a.config_hash, claim.kind, &bytes) == claim.claim_id, "selected record identity mismatch");
+                    let encoded = match claim.kind { 2 => psy_client_data::bridge_aggregate::WithdrawalLeaf::decode(&bytes)?.encode()?, 3 if bytes.is_empty() => Vec::new(), 3 => psy_client_data::bridge_aggregate::SourceCheckpointRewardLeaf::decode(&bytes)?.encode()?, _ => anyhow::bail!("unsupported selected claim kind") };
+                    let transition = claim.proof.as_ref().map(|proof| load_aggregate_file(directory, proof)).transpose()?.unwrap_or_default();
+                    let id = if claim.kind == 3 { reward_claim_id(a.config_hash, &bytes, &transition) } else { aggregate_claim_id(a.config_hash, claim.kind, &bytes) };
+                    ensure!(encoded == bytes && id == claim.claim_id, "selected record identity mismatch");
                     ensure!(claim.proof.is_some() == claim.proof_context_id.is_some(), "partial selected proof reference");
                     if let Some(proof) = &claim.proof { file(proof)?; }
                     if let Some(context) = &claim.proof_context_id { hash(context)?; }
@@ -2014,9 +2209,11 @@ fn validate_aggregate_state(state: &MultichainDaemonState) -> anyhow::Result<()>
                 ensure!(a.encode()? == aggregate_bytes(a_opening)? && settlement.encode().map_err(|error| anyhow::anyhow!("settlement opening: {error:?}"))? == aggregate_bytes(settlement_opening)?, "noncanonical frozen opening");
                 ensure!(claim_ids.len() == settlement.withdrawals.len() + settlement.rewards.len() && local_proofs.len() == claim_ids.len(), "frozen opening claim count mismatch");
                 validate_frozen_capacity(aggregate_limits, &a, &settlement)?;
-                for (id, record) in claim_ids.iter().zip(settlement.withdrawals.iter().map(|record| record.encode().map(|bytes| (2, bytes))).chain(settlement.rewards.iter().map(|record| record.encode().map(|bytes| (3, bytes))))) {
+                for (index, (id, record)) in claim_ids.iter().zip(settlement.withdrawals.iter().map(|record| record.encode().map(|bytes| (2u8, bytes))).chain(settlement.rewards.iter().map(|record| record.encode().map(|bytes| (3u8, bytes))))).enumerate() {
                     let (kind, bytes) = record?;
-                    ensure!(*id == aggregate_claim_id(a.config_hash, kind, &bytes), "frozen claim identity mismatch");
+                    let transition = load_aggregate_file(directory, &local_proofs[index])?;
+                    let expected = if kind == 3 { reward_claim_id(a.config_hash, &bytes, &transition) } else { aggregate_claim_id(a.config_hash, kind, &bytes) };
+                    ensure!(*id == expected, "frozen claim identity mismatch");
                 }
                 for proof in local_proofs { file(proof)?; }
                 if let Some(proofs) = final_proofs { file(&proofs.deposit)?; file(&proofs.settlement)?; }
@@ -5673,7 +5870,7 @@ deployments_network = "localhostBase"
             a.window_id = a.window_id().unwrap();
             let w = WithdrawalAggregateOpening { config_hash: a.config_hash, window_id: a.window_id, end_checkpoint_id: a.end_checkpoint_id, end_checkpoint_root: a.end_checkpoint_root,
                 withdrawal_roots: vec![[1, 2, 3, 4]; chains.len()],
-                withdrawals: (0..withdrawals).map(|index| WithdrawalLeaf { chain_index: chains[0], sender_user_id: index, recipient: [9; 20], token: [8; 20], amount: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], nonce: { let mut nonce = [6; 32]; nonce[31] = index as u8; nonce } }).collect() };
+                withdrawals: (0..withdrawals).map(|index| WithdrawalLeaf { chain_index: chains[0], sender_user_id: index, recipient: [9; 20], token: [8; 20], amount: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], nonce: { let mut nonce = [6; 32]; nonce[31] = index as u8; nonce } }).collect() };
             let r = SourceCheckpointRewardOpening { config_hash: a.config_hash, window_id: a.window_id, end_checkpoint_id: a.end_checkpoint_id, end_checkpoint_root: a.end_checkpoint_root,
                 leaves: (0..rewards).map(|index| SourceCheckpointRewardLeaf { economic_domain: [9; 32], source_checkpoint_id: 10, user_id: index + 1, amount: [1, 0, 0, 0, 0, 0, 0, 0], recipient: [7; 20], initialized: true }).collect() };
             (a, w, r)
@@ -5695,7 +5892,7 @@ deployments_network = "localhostBase"
             a.config_hash = network.config_hash().unwrap();
             a.window_id = a.window_id().unwrap();
             let settlement = build_settlement_opening(&network, &a, &w.withdrawal_roots, w.withdrawals.clone(), r.leaves.clone(), [9; 32], [1, 2, 3, 4], [1, 2, 3, 4], [0; 8], [0; 8], a.starts.iter().map(|start| psy_client_data::bridge_aggregate::FinalizationSlot { start_checkpoint_root: start.start_checkpoint_root, checkpoint_count: 1 }).collect()).unwrap();
-            let call = super::finalize_bridge::BridgeWindowCall { deposit_proof: [U256::from(1u8); 8], deposit_opening: a.encode().unwrap().into(), settlement_proof: [U256::from(2u8); 8], settlement_opening: settlement.encode().unwrap().into() };
+            let call = crate::bridge::finalize_bridge::BridgeWindowCall { deposit_proof: [U256::from(1u8); 8], deposit_opening: a.encode().unwrap().into(), settlement_proof: [U256::from(2u8); 8], settlement_opening: settlement.encode().unwrap().into() };
             let actual = u64::try_from(call.encode().len()).unwrap();
             let limits = limits_for(&chains, 1, 1, 1, actual);
             validate_frozen_capacity(&limits, &a, &settlement).unwrap();
@@ -5792,8 +5989,9 @@ deployments_network = "localhostBase"
     fn frozen_from(directory: &std::path::Path, a: &psy_client_data::bridge_aggregate::DepositAggregateOpening, w: &psy_client_data::bridge_aggregate::WithdrawalAggregateOpening, r: &psy_client_data::bridge_aggregate::SourceCheckpointRewardOpening, limits: AggregateLimits, finalize: Option<FinalizeEvidence>, submission: Submission, included_acknowledged: [bool; 2]) -> MultichainDaemonState {
         let withdrawal_records = w.withdrawals.iter().map(|leaf| leaf.encode().unwrap()).collect::<Vec<_>>();
         let reward_records = r.leaves.iter().map(|leaf| leaf.encode().unwrap()).collect::<Vec<_>>();
-        let claim_ids = withdrawal_records.iter().map(|record| aggregate_claim_id(a.config_hash, 2, record)).chain(reward_records.iter().map(|record| aggregate_claim_id(a.config_hash, 3, record))).collect();
         let proofs = Some(WindowProofs { deposit: save_aggregate_file(directory, b"deposit-proof", "json").unwrap(), settlement: save_aggregate_file(directory, b"settlement-proof", "json").unwrap() });
+        let transition = b"deposit-proof";
+        let claim_ids = withdrawal_records.iter().map(|record| aggregate_claim_id(a.config_hash, 2, record)).chain(reward_records.iter().map(|record| reward_claim_id(a.config_hash, record, transition))).collect();
         let local_proofs = withdrawal_records.iter().chain(reward_records.iter()).map(|_| proofs.as_ref().unwrap().deposit.clone()).collect();
         let settlement = build_settlement_opening(&configured_network(), a, &w.withdrawal_roots, w.withdrawals.clone(), r.leaves.clone(), [9; 32], [1, 2, 3, 4], [1, 2, 3, 4], [0; 8], [0; 8], a.starts.iter().map(|start| psy_client_data::bridge_aggregate::FinalizationSlot { start_checkpoint_root: start.start_checkpoint_root, checkpoint_count: 1 }).collect()).unwrap();
         let mut state = MultichainDaemonState::default();
@@ -5803,7 +6001,7 @@ deployments_network = "localhostBase"
         state
     }
 
-    fn empty_frozen_state(submission: Submission, included_acknowledged: [bool; 2], final_proofs: Option<WindowProofs>, finalize: Option<FinalizeEvidence>) -> MultichainDaemonState {
+    fn empty_frozen_state(submission: Submission, included_acknowledged: [bool; 2], final_proofs: Option<WindowProofs>, finalize: Option<FinalizeEvidence>) -> (AggregateArtifactDir, MultichainDaemonState) {
         use psy_client_data::bridge_aggregate::{DepositAggregateOpening, DepositTransition, SourceCheckpointRewardOpening, WithdrawalAggregateOpening};
         let directory = AggregateArtifactDir::new("empty-window");
         let network = configured_network();
@@ -5816,7 +6014,7 @@ deployments_network = "localhostBase"
         let limits = AggregateLimits { max_deposits: 0, reserved_withdrawals: 0, reserved_rewards: 0, max_window_calldata_bytes: 3940, chains: vec![ChainLimits { chain_index: 0, max_deposits: 0, reserved_withdrawals: 0, tx_gas_limit: 1, block_gas_reserve: 1 }] };
         let mut state = frozen_from(directory.path(), &a, &w, &r, limits, finalize.clone(), submission, included_acknowledged);
         if let Some(PendingAggregate::Frozen { final_proofs: slot, destinations, .. }) = &mut state.pending { *slot = final_proofs; destinations[0].finalize = finalize; }
-        state
+        (directory, state)
     }
 
     #[test]
@@ -5824,29 +6022,29 @@ deployments_network = "localhostBase"
         let directory = AggregateArtifactDir::new("acknowledged");
         let reference = save_aggregate_file(directory.path(), b"deposit-proof", "json").unwrap();
         let settlement = save_aggregate_file(directory.path(), b"settlement-proof", "json").unwrap();
-        let proofs = WindowProofs { deposit: reference, settlement };
+        let proofs = WindowProofs { deposit: reference.clone(), settlement };
         let finalize = FinalizeEvidence { bf_identity: "11".repeat(32), raw_proof: reference };
-        let acknowledged = empty_frozen_state(Submission::Sending, [true, true], Some(proofs.clone()), Some(finalize.clone()));
-        validate_aggregate_state(&acknowledged).unwrap();
-        let submitted = empty_frozen_state(Submission::Submitted { transaction_hash: "ab".repeat(32) }, [true, true], Some(proofs.clone()), Some(finalize.clone()));
-        validate_aggregate_state(&submitted).unwrap();
+        let (directory, acknowledged) = empty_frozen_state(Submission::Sending, [true, true], Some(proofs.clone()), Some(finalize.clone()));
+        validate_aggregate_state(directory.path(), &acknowledged).unwrap();
+        let (directory, submitted) = empty_frozen_state(Submission::Submitted { transaction_hash: "ab".repeat(32) }, [true, true], Some(proofs.clone()), Some(finalize.clone()));
+        validate_aggregate_state(directory.path(), &submitted).unwrap();
         for included_acknowledged in [[false, true], [true, false], [false, false]] {
-            let sending = empty_frozen_state(Submission::Sending, included_acknowledged, Some(proofs.clone()), Some(finalize.clone()));
-            let error = validate_aggregate_state(&sending).unwrap_err();
+            let (directory, sending) = empty_frozen_state(Submission::Sending, included_acknowledged, Some(proofs.clone()), Some(finalize.clone()));
+            let error = validate_aggregate_state(directory.path(), &sending).unwrap_err();
             assert!(error.to_string().contains("submission without complete acknowledged proofs"), "{error}");
-            let submitted = empty_frozen_state(Submission::Submitted { transaction_hash: "cd".repeat(32) }, included_acknowledged, Some(proofs.clone()), Some(finalize.clone()));
-            assert!(validate_aggregate_state(&submitted).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
+            let (directory, submitted) = empty_frozen_state(Submission::Submitted { transaction_hash: "cd".repeat(32) }, included_acknowledged, Some(proofs.clone()), Some(finalize.clone()));
+            assert!(validate_aggregate_state(directory.path(), &submitted).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
         }
-        let missing_proofs = empty_frozen_state(Submission::Sending, [true, true], None, Some(finalize.clone()));
-        assert!(validate_aggregate_state(&missing_proofs).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
-        let missing_finalize = empty_frozen_state(Submission::Submitted { transaction_hash: "ef".repeat(32) }, [true, true], Some(proofs), None);
-        assert!(validate_aggregate_state(&missing_finalize).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
-        let not_sent = empty_frozen_state(Submission::NotSent, [false, false], None, None);
-        validate_aggregate_state(&not_sent).unwrap();
+        let (directory, missing_proofs) = empty_frozen_state(Submission::Sending, [true, true], None, Some(finalize.clone()));
+        assert!(validate_aggregate_state(directory.path(), &missing_proofs).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
+        let (directory, missing_finalize) = empty_frozen_state(Submission::Submitted { transaction_hash: "ef".repeat(32) }, [true, true], Some(proofs), None);
+        assert!(validate_aggregate_state(directory.path(), &missing_finalize).unwrap_err().to_string().contains("submission without complete acknowledged proofs"));
+        let (directory, not_sent) = empty_frozen_state(Submission::NotSent, [false, false], None, None);
+        validate_aggregate_state(directory.path(), &not_sent).unwrap();
     }
 
     fn posted_family(directory: &std::path::Path, network: &psy_client_data::bridge_aggregate::NetworkConfig, state: &MultichainDaemonState, family: u8) -> (String, ReceiptDispositions) {
-        use super::api_client::{ClaimDisposition, ReceiptEvidence};
+        use crate::bridge::api_client::{ClaimDisposition, ReceiptEvidence};
         let PendingAggregate::Frozen { settlement_opening, claim_ids, .. } = state.pending.clone().unwrap() else { unreachable!() };
         let settlement = psy_client_data::bridge_aggregate::SettlementOpening::decode(&aggregate_bytes(&settlement_opening).unwrap()).unwrap();
         let (opening, claim_id, digest) = if family == 2 {
@@ -5864,7 +6062,7 @@ deployments_network = "localhostBase"
     }
 
     fn unposted_unrelated_receipt(directory: &std::path::Path, network: &psy_client_data::bridge_aggregate::NetworkConfig) -> (String, ReceiptDispositions) {
-        use super::api_client::{ClaimDisposition, ReceiptEvidence};
+        use crate::bridge::api_client::{ClaimDisposition, ReceiptEvidence};
         let (_, withdrawal, _, _, _) = nonempty_window(4, [8, 7, 6, 5]);
         let opening = save_aggregate_file(directory, &withdrawal.encode().unwrap(), "opening").unwrap();
         let digest = hex::encode(withdrawal.opening_digest(network).unwrap());
@@ -5951,7 +6149,7 @@ deployments_network = "localhostBase"
         state.receipt_dispositions.insert(reward_key, reward);
         state.retained_finalize.insert("short".repeat(16), FinalizeEvidence { bf_identity: "11".repeat(32), raw_proof: FileReference { relative_path: "aggregate-short.proof".into(), sha256: "22".repeat(32) } });
         let before = toml::to_string(&state).unwrap();
-        assert!(validate_aggregate_state(&state).is_err());
+        assert!(validate_aggregate_state(directory.path(), &state).is_err());
         assert_eq!(toml::to_string(&state).unwrap(), before);
         assert!(state.pending.is_some());
     }
@@ -6202,6 +6400,16 @@ deployments_network = "replay"
         assert_eq!(toml::to_string(&state).unwrap(), toml::to_string(&retained).unwrap());
         assert!(state.retained_finalize.is_empty());
         assert!(matches!(state.pending, Some(PendingAggregate::Frozen { .. })));
+    }
+
+    #[test]
+    fn equal_reward_records_with_different_transitions_have_different_ids() {
+        let record = [7u8; 32];
+        let first = reward_claim_id([9; 32], &record, b"transition-a");
+        let second = reward_claim_id([9; 32], &record, b"transition-b");
+        assert_ne!(first, second);
+        assert_eq!(first, reward_claim_id([9; 32], &record, b"transition-a"));
+        assert_ne!(aggregate_claim_id([9; 32], 2, &record), reward_claim_id([9; 32], &record, &record));
     }
 }
 

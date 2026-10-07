@@ -8511,6 +8511,7 @@ dependencies = [
  "psy_cli_common",
  "psy_client_common",
  "psy_client_data",
+ "psy_common_circuit",
  "psy_config",
  "psy_core",
  "psy_crypto",

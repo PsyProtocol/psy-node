@@ -159,7 +159,7 @@ pub fn validate_approved_contract(approved: &ApprovedContract) -> Result<Option<
         let mutability=if definition.is_view_function() {"view"} else {"external"};
         if matches.next().is_some() || method["name"].as_str()!=Some(definition.name.as_str()) || method["input_felt_count"].as_u64()!=Some(definition.circuit_inputs.len() as u64) || method["output_felt_count"].as_u64()!=Some(definition.circuit_outputs.len() as u64) || method["state_mutability"].as_str()!=Some(mutability) { return Err(GuardianSignError::AuthorizationMismatch); }
     }
-    let (_,deployment)=psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<plonky2::plonk::config::PoseidonGoldilocksConfig,2>(leaf.deployer,artifact.state_tree_height as u8,&artifact.circuit_definitions).map_err(|_|GuardianSignError::AuthorizationMismatch)?;
+    let (_,deployment)=psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<plonky2::plonk::config::PoseidonGoldilocksConfig,2>(leaf.deployer.to_canonical_u64(),artifact.state_tree_height as u8,&artifact.circuit_definitions).map_err(|_|GuardianSignError::AuthorizationMismatch)?;
     let deployment=deployment.into_with_whitelist_root::<PsyHasher>().map_err(|_|GuardianSignError::AuthorizationMismatch)?;
     if deployment.code_root!=leaf.code_root || deployment.function_whitelist_root!=leaf.function_tree_root { return Err(GuardianSignError::AuthorizationMismatch); }
     if approved.contract_id==6 && artifact.state_tree_height!=4 { return Err(GuardianSignError::PolicyMismatch); }
@@ -362,7 +362,7 @@ pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, 
     if !traces_equal(&supplied,&replayed)? { return Err(GuardianSignError::StateMismatch.into()); }
     verify_trace_contracts(context.history,authorization,&replayed)?;
     let fees: Vec<_> = replayed.steps.iter().filter_map(|step|if let TraceStep::BurnFee(step)=step {Some(step)} else {None}).collect();
-    if fees.len()!=1 || fees[0].contract_id!=0 || fees[0].method_id!=psy_config::network_constants::TOKEN_SIMPLE_BURN_METHOD_ID || fees[0].method_name!="simple_burn" { return Err(GuardianSignError::UnsupportedCall.into()); }
+    if fees.len()!=1 || fees[0].contract_id!=0 || fees[0].method_id!=psy_config::TOKEN_SIMPLE_BURN_METHOD_ID || fees[0].method_name!="simple_burn" { return Err(GuardianSignError::UnsupportedCall.into()); }
     let replayed_witness = trace_policy(&replayed,authorization)?;
     let (current_policy,ending_policy) = replayed_witness.policies().map_err(|_|GuardianSignError::PolicyMismatch)?;
     let message = Hash256::from(replayed.finalization.sig_hash).0;
@@ -713,9 +713,9 @@ mod tests {
             let text=std::fs::read_to_string(directory.join(name).join("target").join(format!("{name}.json")))?;
             let artifact_json=JsonText::<CompilerArtifact>::parse(text)?;
             let artifact=artifact_json.decode()?;
-            let (_,deployment)=psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<plonky2::plonk::config::PoseidonGoldilocksConfig,2>(Hash4::ZERO,artifact.state_tree_height.try_into()?,&artifact.circuit_definitions)?;
+            let (_,deployment)=psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<plonky2::plonk::config::PoseidonGoldilocksConfig,2>(0,artifact.state_tree_height.try_into()?,&artifact.circuit_definitions)?;
             let deployment=deployment.into_with_whitelist_root::<PsyHasher>()?;
-            let leaf=PsyContractLeaf {deployer:deployment.deployer,function_tree_root:deployment.function_whitelist_root,code_root:deployment.code_root,state_tree_height:F::from_canonical_u16(artifact.state_tree_height),state_layout_root:Hash4::ZERO,state_layout_field_count:F::ZERO,state_layout_slot_count:F::ZERO};
+            let leaf=PsyContractLeaf::<F> {deployer:F::from_canonical_u64(deployment.deployer),function_tree_root:deployment.function_whitelist_root,code_root:deployment.code_root,state_tree_height:F::from_canonical_u16(artifact.state_tree_height),state_layout_root:Hash4::ZERO,state_layout_field_count:F::ZERO,state_layout_slot_count:F::ZERO};
             let approved=ApprovedContract {contract_id:contract_id as u32,contract_leaf_json:JsonText::from_value(&leaf)?,compiler_artifact_sha256:sha256(artifact_json.as_str().as_bytes()),compiler_artifact_json:artifact_json};
             let map=history.approved_artifact(&approved)?;
             if matches!(contract_id,0|4) {

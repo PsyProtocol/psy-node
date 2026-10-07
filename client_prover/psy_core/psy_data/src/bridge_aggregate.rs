@@ -1070,7 +1070,7 @@ mod deposit_leaf_tests {
         let mut noncanonical = encoded.clone(); noncanonical[32] = 1;
         assert_eq!(decode_circuit_set(&noncanonical),
             Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
-        for (family, level, variant) in [(1u16, 0u8, 0u8), (7, 0, 2), (7, 0, 3), (9, 0, 1), (11, 0, 1)] {
+        for (family, level, variant) in [(1u16, 0u8, 0u8), (7, 0, 2), (7, 0, 3), (9, 0, 1), (11, 0, 1), (12, 0, 2), (13, 0, 3), (13, 5, 3), (13, 8, 3)] {
             let mut obsolete = registrations.clone();
             let index = obsolete.iter().position(|registration| (registration.family, registration.level, registration.variant)
                 == (family, level, variant)).unwrap();
@@ -1090,7 +1090,7 @@ mod deposit_leaf_tests {
         assert_eq!(circuit_set_hash(&extra), Err(BridgeProofError::InvalidCount));
         for removed in [(4u16, 0u8, 0u8), (4, 0, 1), (4, 0, 2), (4, 0, 3),
             (5, 0, 0), (6, 0, 0), (8, 1, 1), (10, 1, 1),
-            (7, 0, 1), (7, 0, 129), (9, 0, 2), (11, 0, 2)] {
+            (7, 0, 1), (7, 0, 129), (9, 0, 2), (11, 0, 2), (12, 0, 1), (13, 9, 3), (13, 0, 2)] {
             let mut replaced = registrations.clone();
             replaced[1] = CircuitSetRegistration {
                 family: removed.0, level: removed.1, variant: removed.2, pi_words: 12,
@@ -1782,9 +1782,12 @@ impl RewardLeaf {
     }
 }
 
-const CIRCUIT_SET_FAMILIES: [(u16, u8, u8, u16); 7] = [
+const CIRCUIT_SET_FAMILIES: [(u16, u8, u8, u16); 17] = [
     (1, 0, 0, 40), (2, 0, 0, 32), (3, 0, 0, 34),
-    (7, 0, 2, 28), (7, 0, 3, 28), (9, 0, 1, 37), (11, 0, 1, 12),
+    (7, 0, 2, 28), (7, 0, 3, 28), (9, 0, 1, 37), (11, 0, 1, 12), (12, 0, 2, 12),
+    (13, 0, 3, 131), (13, 1, 3, 131), (13, 2, 3, 131),
+    (13, 3, 3, 131), (13, 4, 3, 131), (13, 5, 3, 131),
+    (13, 6, 3, 131), (13, 7, 3, 131), (13, 8, 3, 131),
 ];
 
 fn validate_circuit_set(registrations: &[CircuitSetRegistration]) -> Result<()> {

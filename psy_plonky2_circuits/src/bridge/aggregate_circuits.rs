@@ -26,7 +26,7 @@ pub struct AggregateCircuits {
     pub reward_session: RewardSessionCircuit,
     pub checkpoint_final: BridgeAggFinalCircuit<C, 2>,
     pub withdrawal_aggregate: WithdrawalInclusionAggregateCircuit<C, 2, 1024>,
-    pub reward_aggregate: RewardInclusionAggregateCircuit<1024>,
+    pub reward_aggregate: RewardInclusionAggregateCircuit,
     pub chains: ChainAggregateCircuit<C, 2>,
     pub deposit_aggregate: DepositAggregateCircuit<C, 2>,
     pub settlement_aggregate: SettlementAggregateCircuit<C, 2>,
@@ -59,7 +59,7 @@ impl AggregateCircuits {
         let withdrawal = WithdrawalInclusionCircuit::build();
         let reward_session = RewardSessionCircuit::new(REWARD_SESSION_STEP_CAPACITY, source_chain_count)?;
         let withdrawal_aggregate = WithdrawalInclusionAggregateCircuit::<C, 2, 1024>::new(&withdrawal.circuit_data, source_chain_count);
-        let reward_aggregate = RewardInclusionAggregateCircuit::<1024>::new(&reward_session.circuit_data.common, &reward_session.circuit_data.verifier_only, source_chain_count);
+        let reward_aggregate = RewardInclusionAggregateCircuit::new(&reward_session.circuit_data.common, &reward_session.circuit_data.verifier_only, source_chain_count)?;
         let chains = ChainAggregateCircuit::build(source_chain_count, &deposit)?;
         let deposit_aggregate = DepositAggregateCircuit::new(source_chain_count, &chains.circuit_data);
         let settlement_aggregate = SettlementAggregateCircuit::new(source_chain_count, &checkpoint_final.circuit_data.common, &checkpoint_final.circuit_data.verifier_only, &withdrawal_aggregate.circuit_data.common, &withdrawal_aggregate.circuit_data.verifier_only, &reward_aggregate.circuit_data.common, &reward_aggregate.circuit_data.verifier_only)?;
@@ -141,7 +141,7 @@ impl AggregateCircuits {
     }
 
     fn build_registrations(&self) -> anyhow::Result<Vec<CircuitSetRegistration>> {
-        let mut registrations = Vec::with_capacity(7);
+        let mut registrations = Vec::with_capacity(17);
         for (family, variant, width, data) in [
             (1, 0, DEPOSIT_SPIDERMAN_PI_WORDS, &self.deposit.circuit_data),
             (2, 0, WITHDRAWAL_INCLUSION_PUBLIC_INPUTS, &self.withdrawal.circuit_data),
@@ -152,6 +152,7 @@ impl AggregateCircuits {
             (11, 1, DEPOSIT_AGGREGATE_PI_LEN, &self.deposit_aggregate.circuit_data),
             (12, 2, SETTLEMENT_AGGREGATE_PI_LEN, &self.settlement_aggregate.circuit_data),
         ] { registrations.push(circuit_set_registration(family, 0, variant, width, data, [0; 4])?); }
+        registrations.extend_from_slice(self.reward_aggregate.registrations());
         registrations.sort_by_key(|registration| (registration.family, registration.level, registration.variant));
         circuit_set_hash(&registrations)?;
         Ok(registrations)

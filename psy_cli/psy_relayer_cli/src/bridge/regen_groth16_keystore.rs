@@ -125,7 +125,7 @@ fn regenerate_aggregate_proofs(config_path: &Path, output: &Path) -> anyhow::Res
         withdrawal_state_tree: WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
     })?;
     circuits.validate_config(&config)?;
-    let circuit_set = psy_client_data::bridge_aggregate::encode_circuit_set(circuits.entries())?;
+    let circuit_set = psy_client_data::bridge_aggregate::encode_circuit_set(circuits.registrations())?;
     let (source_deposit, source_settlement) = circuits.into_digest_sources();
     let adapter_deposit = DigestBitsAdapter::build(DigestArtifact::DepositAggregate, &source_deposit.common, &source_deposit.verifier_only)?;
     let adapter_settlement = DigestBitsAdapter::build(DigestArtifact::SettlementAggregate, &source_settlement.common, &source_settlement.verifier_only)?;
@@ -315,7 +315,7 @@ fn regenerate_deposit_append(keystore_dir: &Path) -> anyhow::Result<()> {
         frontier: [QHashOut::ZERO; DEPOSIT_BATCH_TREE_HEIGHT],
         from_index: 0,
         deposits: vec![sample_deposit()],
-        bridge_user_id: BRIDGE_USER_ID_U64 as u32,
+        bridge_user_id: BRIDGE_USER_ID_U32,
     };
     let proof = circuit.generate_proof(&inputs)?;
     let minifier =

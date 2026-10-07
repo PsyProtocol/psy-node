@@ -116,7 +116,7 @@ pub(crate) fn build_deposit_spiderman_inputs(config: &NetworkConfig, opening: &D
         let records = transition.new_count - transition.old_count;
         anyhow::ensure!(prefix[transition.old_count as usize..] == opening.deposit_leaves[first_record as usize..(first_record + records) as usize], "deposit suffix differs from opening");
         let mut frontier = [QHashOut::ZERO; 32];
-        let mut root = PoseidonHasher::get_zero_hash(32);
+        let mut root: QHashOut<F> = PoseidonHasher::get_zero_hash(32);
         let mut web = Vec::with_capacity(32);
         let mut cursor = 0u32;
         while cursor < transition.new_count {

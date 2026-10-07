@@ -265,7 +265,7 @@ fn validate_multisig_policy_artifact(
     let contract = contracts.get(6).context("Genesis contracts must contain multisig policy contract 6")?;
     ensure!(contract.code_definition.state_tree_height == 4, "Genesis policy contract must declare height 4");
     let (_, expected) = psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<C, D>(
-        ClientHash(contract.deployer.0), 4, &artifact.circuit_definitions,
+        contract.deployer, 4, &artifact.circuit_definitions,
     )?;
     let expected: PQBCDeployContract<Hash> = serde_json::from_value(serde_json::to_value(expected)?)?;
     ensure!(contract == &expected, "Genesis policy code/functions differ from approved compiler artifact");

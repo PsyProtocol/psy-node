@@ -2,7 +2,7 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_network::{EthereumWallet, NetworkWallet, TransactionBuilder};
+use alloy_network::{Ethereum, EthereumWallet, NetworkWallet, TransactionBuilder};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionReceipt, TransactionRequest};
@@ -21,6 +21,7 @@ use crate::bridge::{
     finalize_bridge,
     l1_provider::connect_l1_readonly,
     l1_signer::load_l1_wallet,
+    propose_withdrawals,
 };
 
 const L1_RETRY_MAX_ATTEMPTS: usize = 10;
@@ -216,7 +217,7 @@ impl L1Client {
             .context("current block gas does not exceed saved reserve")?;
         let gas = chain_limits.tx_gas_limit.min(room);
         ensure!(gas > 0, "aggregate gas ceiling is zero");
-        let from = wallet.default_signer_address();
+        let from = NetworkWallet::<Ethereum>::default_signer_address(wallet);
         let estimated = TransactionRequest::default()
             .from(from)
             .to(destination)
@@ -279,7 +280,7 @@ impl L1Client {
         let priority = tx.max_priority_fee_per_gas.context("prepared aggregate transaction has no priority fee")?;
         ensure!(value == U256::ZERO && gas > 0, "prepared aggregate transaction is not executable");
         let wallet = self.wallet.as_ref().context("aggregate sender is not bound")?;
-        ensure!(wallet.default_signer_address() == from, "broadcast signer does not match prepared sender");
+        ensure!(NetworkWallet::<Ethereum>::default_signer_address(wallet) == from, "broadcast signer does not match prepared sender");
         let unsigned = tx.build_unsigned().context("prepared aggregate transaction is incomplete")?;
         ensure!(
             unsigned.kind() == alloy_primitives::TxKind::Call(to)
@@ -292,7 +293,7 @@ impl L1Client {
                 && unsigned.max_priority_fee_per_gas() == Some(priority),
             "unsigned aggregate transaction differs from prepared transaction"
         );
-        let envelope = wallet.sign_transaction_from(from, unsigned).await.context("sign prepared aggregate transaction failed")?;
+        let envelope = NetworkWallet::<Ethereum>::sign_transaction_from(wallet, from, unsigned).await.context("sign prepared aggregate transaction failed")?;
         ensure!(
             envelope.kind() == alloy_primitives::TxKind::Call(to)
                 && envelope.value() == value
@@ -313,6 +314,17 @@ impl L1Client {
         .context("aggregate send timed out")?
         .context("aggregate send failed")?;
         Ok(*pending.tx_hash())
+    }
+
+    pub(crate) async fn get_aggregate_receipt(
+        &self,
+        hash: B256,
+    ) -> anyhow::Result<Option<TransactionReceipt>> {
+        let provider = self.bound_provider()?;
+        provider
+            .get_transaction_receipt(hash)
+            .await
+            .context("read aggregate transaction receipt failed")
     }
 
     fn bound_provider(&self) -> anyhow::Result<impl Provider> {
@@ -472,7 +484,13 @@ mod tests {
                 socket.read_exact(&mut body).await.unwrap();
                 let actual: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(actual["method"], expected["method"], "{}", actual);
-                assert_eq!(actual["params"], expected["params"], "{}", actual);
+                let actual_params = actual.get("params").unwrap_or(&Value::Null);
+                let expected_params = expected.get("params").unwrap_or(&Value::Null);
+                assert!(
+                    actual_params == expected_params
+                        || (expected_params.as_array().is_some_and(Vec::is_empty) && actual.get("params").is_none()),
+                    "params mismatch: actual={actual} expected={expected}"
+                );
                 let mut response = json!({"jsonrpc":"2.0","id":actual["id"]});
                 response["result"] = expected["result"].clone();
                 let encoded = response.to_string();
@@ -594,6 +612,67 @@ mod tests {
         assert_eq!(envelope.chain_id(), Some(1));
         assert_eq!(envelope.max_fee_per_gas(), 4);
         assert_eq!(envelope.max_priority_fee_per_gas(), Some(2));
+    }
+
+    fn receipt(hash: B256, to: Address, status: &str, log_index: &str) -> Value {
+        json!({
+            "type": "0x2",
+            "status": status,
+            "cumulativeGasUsed": "0x64",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": [{
+                "address": to,
+                "topics": [format!("{:#x}", B256::repeat_byte(3)), format!("{:#x}", B256::repeat_byte(4))],
+                "data": "0x0102",
+                "blockHash": format!("{:#x}", B256::repeat_byte(2)),
+                "blockNumber": "0x7",
+                "transactionHash": format!("{hash:#x}"),
+                "transactionIndex": "0x0",
+                "logIndex": log_index,
+                "removed": false
+            }],
+            "transactionHash": format!("{hash:#x}"),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{:#x}", B256::repeat_byte(2)),
+            "blockNumber": "0x7",
+            "gasUsed": "0x64",
+            "effectiveGasPrice": "0x1",
+            "from": format!("{:#x}", Address::repeat_byte(5)),
+            "to": to
+        })
+    }
+
+    #[tokio::test]
+    async fn aggregate_receipt_preserves_status_block_and_logs() {
+        let (mut client, _) = sender();
+        let hash = B256::repeat_byte(8);
+        let to = Address::from(chain().state_manager);
+        client.rpc_urls = vec![serve(vec![
+            json!({"method":"eth_getTransactionReceipt","params":[hash],"result":null}),
+        ]).await];
+        let missing = tokio::time::timeout(Duration::from_secs(5), client.get_aggregate_receipt(hash)).await.unwrap().unwrap();
+        assert!(missing.is_none());
+
+        for (status, log_index) in [("0x1", "0x3"), ("0x0", "0x4")] {
+            client.rpc_urls = vec![serve(vec![
+                json!({"method":"eth_getTransactionReceipt","params":[hash],"result":receipt(hash, to, status, log_index)}),
+            ]).await];
+            let found = tokio::time::timeout(Duration::from_secs(5), client.get_aggregate_receipt(hash)).await.unwrap().unwrap().unwrap();
+            let value = serde_json::to_value(&found).unwrap();
+            assert_eq!(value["transactionHash"], format!("{hash:#x}"));
+            assert_eq!(value["to"], format!("{to:#x}"));
+            assert_eq!(value["status"], status);
+            assert_eq!(value["blockNumber"], "0x7");
+            assert_eq!(value["blockHash"], format!("{:#x}", B256::repeat_byte(2)));
+            assert_eq!(value["logs"][0]["removed"], false);
+            assert_eq!(value["logs"][0]["logIndex"], log_index);
+            assert_eq!(value["logs"][0]["transactionHash"], format!("{hash:#x}"));
+            assert_eq!(value["logs"][0]["blockHash"], value["blockHash"]);
+            assert_eq!(value["logs"][0]["blockNumber"], value["blockNumber"]);
+            assert_eq!(value["logs"][0]["address"], format!("{to:#x}"));
+            assert_eq!(value["logs"][0]["topics"].as_array().unwrap().len(), 2);
+            assert_eq!(found.status(), status == "0x1");
+        }
     }
 
     #[test]
