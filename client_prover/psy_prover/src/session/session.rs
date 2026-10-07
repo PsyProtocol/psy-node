@@ -2209,13 +2209,13 @@ impl WalletSession {
         // The signature proof and the proof-tree aggregation do not depend on
         // each other. With a prove proxy the aggregation is remote while the
         // signature is proved here, so run them at the same time.
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         let (signature_result, finalize_result, signature_ms, finalize_tree_ms) = self
             .sign_while_finalizing(&public_key, &sign_context, sighash, &mut user_session_mgr.proof_tree_state)
             .await;
         finalize_result?;
         let signature_result = signature_result?;
-        let mut lap = std::time::Instant::now();
+        let mut lap = web_time::Instant::now();
         let parallel_ms = started.elapsed().as_millis() as u64;
         let SignatureResult {
             proof: signature_proof,
@@ -2280,11 +2280,11 @@ impl WalletSession {
                 if self.sign_while_finalizing && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
                     return std::thread::scope(|scope| {
                         let finalizing = scope.spawn(|| {
-                            let started = std::time::Instant::now();
+                            let started = web_time::Instant::now();
                             let result = handle.block_on(proof_tree_state.finalize_tree(circuit_mgr));
                             (result, started.elapsed().as_millis() as u64)
                         });
-                        let started = std::time::Instant::now();
+                        let started = web_time::Instant::now();
                         let signature = futures::executor::block_on(self.wallet.sign_with_public_key(public_key, sign_context, sighash));
                         let signature_ms = started.elapsed().as_millis() as u64;
                         let (finalized, finalize_ms) = finalizing
@@ -2295,10 +2295,10 @@ impl WalletSession {
                 }
             }
         }
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         let signature = self.wallet.sign_with_public_key(public_key, sign_context, sighash).await;
         let signature_ms = started.elapsed().as_millis() as u64;
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         let finalized = proof_tree_state.finalize_tree(circuit_mgr).await;
         (signature, finalized, signature_ms, started.elapsed().as_millis() as u64)
     }
