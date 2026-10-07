@@ -1087,8 +1087,14 @@ where
     pub client: Arc<Client>,
     pub proof_proxy_url: String,
     pub common_circuits_data: LocalCommonCircuitsData<C::F>,
+    pub contract_fn_cache: Arc<ProxyContractFunctionCache<C, D>>,
     pub _marker: PhantomData<C>,
 }
+
+pub type ProxyContractFunctionCache<C, const D: usize> = crate::contract_fn_cache::ContractFunctionCache<
+    (u64, DPNFunctionCircuitDefinition),
+    (QHashOut<<C as GenericConfig<D>>::F>, VerifierOnlyCircuitData<C, D>),
+>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
@@ -1166,6 +1172,7 @@ where
             client: Arc::new(client),
             common_circuits_data,
             proof_proxy_url,
+            contract_fn_cache: Default::default(),
             _marker: PhantomData,
         })
     }
@@ -1208,6 +1215,7 @@ where
             client: Arc::new(client),
             common_circuits_data,
             proof_proxy_url,
+            contract_fn_cache: Default::default(),
             _marker: PhantomData,
         })
     }
@@ -1403,6 +1411,11 @@ where
         contract_code: &ContractCodeDefinition,
         method_name: String,
     ) -> anyhow::Result<(u64, DPNFunctionCircuitDefinition)> {
+        let cache_method = method_name.clone();
+        let cache_key = crate::contract_fn_cache::Method::Name(&cache_method);
+        if let Some(resolved) = self.contract_fn_cache.resolved(contract_id, contract_code, cache_key) {
+            return Ok(resolved);
+        }
         tracing::info!("resolve method `{}` of contract {}", method_name, contract_id);
         let response = psy_rpc_call_back!(
             self,
@@ -1417,6 +1430,8 @@ where
         match response.result {
             ResponseResult::Success((fn_id, circuit_def)) => {
                 tracing::info!("get fn id `{}` of contract {}", fn_id, contract_id);
+                self.contract_fn_cache
+                    .store_resolved(contract_id, contract_code, cache_key, (fn_id, circuit_def.clone()));
                 Ok((fn_id, circuit_def))
             }
             ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
@@ -1429,6 +1444,10 @@ where
         contract_code: &ContractCodeDefinition,
         method_id: u32,
     ) -> anyhow::Result<(u64, DPNFunctionCircuitDefinition)> {
+        let cache_key = crate::contract_fn_cache::Method::Id(method_id);
+        if let Some(resolved) = self.contract_fn_cache.resolved(contract_id, contract_code, cache_key) {
+            return Ok(resolved);
+        }
         tracing::info!("resolve method `{}` of contract {}", method_id, contract_id);
         let response = psy_rpc_call_back!(
             self,
@@ -1443,6 +1462,8 @@ where
         match response.result {
             ResponseResult::Success((fn_id, circuit_def)) => {
                 tracing::info!("get fn id `{}` of contract {}", fn_id, contract_id);
+                self.contract_fn_cache
+                    .store_resolved(contract_id, contract_code, cache_key, (fn_id, circuit_def.clone()));
                 Ok((fn_id, circuit_def))
             }
             ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
@@ -1450,6 +1471,9 @@ where
     }
 
     async fn get_contract_method_common_data(&self, contract_id: u64, fn_id: u32) -> anyhow::Result<(QHashOut<C::F>, VerifierOnlyCircuitData<C, D>)> {
+        if let Some(common_data) = self.contract_fn_cache.common_data(contract_id, fn_id) {
+            return Ok(common_data);
+        }
         tracing::info!("get method `{}` common data of contract {}", fn_id, contract_id);
         let response = psy_rpc_call_back!(
             self,
@@ -1466,7 +1490,9 @@ where
                     data.fingerprint.to_string(),
                     serde_json::to_string(&data.verifier_config)?,
                 );
-                Ok((data.fingerprint, data.verifier_config.to_verifier_data()))
+                let common_data = (data.fingerprint, data.verifier_config.to_verifier_data());
+                self.contract_fn_cache.store_common_data(contract_id, fn_id, common_data.clone());
+                Ok(common_data)
             }
             ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
         }
