@@ -28,8 +28,34 @@ export function pinFaucetPerClaimAmount(json: string): string {
     return JSON.stringify(config);
 }
 
-export function resolveScyllaMemory(value: string | undefined): string {
-    return value?.trim() || DEFAULT_SCYLLA_MEMORY;
+export function resolveScyllaMemory(value: string | undefined, totalMemoryBytes?: number): string {
+    const requested = value?.trim();
+    if (requested) return requested;
+    if (totalMemoryBytes !== undefined) return deriveScyllaMemoryFromTotalBytes(totalMemoryBytes);
+    return DEFAULT_SCYLLA_MEMORY;
+}
+
+export const SCYLLA_MEMORY_SYSTEM_SHARE = 0.25;
+export const MINIMUM_SCYLLA_MEMORY_GB = 2;
+
+export function parseLinuxMemInfoTotalBytes(text: string): number | undefined {
+    const match = /^MemTotal:\s*(\d+)\s*kB$/m.exec(text);
+    if (!match) return undefined;
+    const kilobytes = Number(match[1]);
+    return Number.isSafeInteger(kilobytes) && kilobytes > 0 ? kilobytes * 1024 : undefined;
+}
+
+export function parseMacosMemSizeBytes(text: string): number | undefined {
+    const bytes = Number(text.trim());
+    return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : undefined;
+}
+
+export function deriveScyllaMemoryFromTotalBytes(totalMemoryBytes: number): string {
+    const gibibytes = Math.max(
+        MINIMUM_SCYLLA_MEMORY_GB,
+        Math.floor((totalMemoryBytes * SCYLLA_MEMORY_SYSTEM_SHARE) / 2 ** 30),
+    );
+    return `${gibibytes}G`;
 }
 
 export function applyEnvioCpuSetToCompose(composeYaml: string, runtimeCpuSet: string | undefined): string {

@@ -38,6 +38,8 @@ import {
     resolveCpuPartition,
     resolveCpuPartitionForAffinity,
     resolvePositiveIntegerSetting,
+    parseLinuxMemInfoTotalBytes,
+    parseMacosMemSizeBytes,
     resolveRayonThreadCount,
     resolveScyllaMemory,
     resolveWalletPasswordPolicy,
@@ -159,6 +161,21 @@ describe("runtime infrastructure settings", () => {
         expect(resolveScyllaMemory(undefined)).toBe("8G");
         expect(resolveScyllaMemory(" ")).toBe("8G");
         expect(resolveScyllaMemory("12G")).toBe("12G");
+    });
+
+    it("derives Scylla memory from detected system RAM with a 2G floor", () => {
+        expect(resolveScyllaMemory(undefined, 123 * 2 ** 30)).toBe("30G");
+        expect(resolveScyllaMemory(undefined, 16 * 2 ** 30)).toBe("4G");
+        expect(resolveScyllaMemory(undefined, 4 * 2 ** 30)).toBe("2G");
+        expect(resolveScyllaMemory("64G", 123 * 2 ** 30)).toBe("64G");
+    });
+
+    it("parses MemTotal and hw.memsize total memory strictly", () => {
+        expect(parseLinuxMemInfoTotalBytes("MemTotal:       131936944 kB\nMemFree:      1000 kB\n")).toBe(131936944 * 1024);
+        expect(parseLinuxMemInfoTotalBytes("MemTotal: 0 kB")).toBeUndefined();
+        expect(parseLinuxMemInfoTotalBytes("no match")).toBeUndefined();
+        expect(parseMacosMemSizeBytes("137438953472\n")).toBe(137438953472);
+        expect(parseMacosMemSizeBytes("")).toBeUndefined();
     });
 
     it("injects both Envio services into the generated base compose idempotently", () => {

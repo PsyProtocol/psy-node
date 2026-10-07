@@ -31,6 +31,8 @@ import {
     isTransientScyllaSchemaFailure,
     nextSpawnRetryDelayMs,
     parseFatalProcessorErrorMarker,
+    parseLinuxMemInfoTotalBytes,
+    parseMacosMemSizeBytes,
     parseRealmProcessorFailureLine,
     parseLscpuTopology,
     planSupervisedRestart,
@@ -140,6 +142,7 @@ type RuntimeResourceSettings = {
     runtimeCpuSet?: string;
     scyllaCpuSet?: string;
     scyllaSmp: string;
+    scyllaMemory: string;
     env: { [key: string]: string };
 };
 
@@ -210,6 +213,18 @@ async function resolveRuntimeResourceSettings(
         }
     }
 
+    let totalMemoryBytes: number | undefined;
+    try {
+        if (process.platform === "darwin") {
+            const memoryResult = await runAndCapture(["sysctl", "-n", "hw.memsize"]);
+            if (memoryResult.code === 0) totalMemoryBytes = parseMacosMemSizeBytes(memoryResult.stdout);
+        } else {
+            totalMemoryBytes = parseLinuxMemInfoTotalBytes(fs.readFileSync("/proc/meminfo", "utf8"));
+        }
+    } catch {
+        totalMemoryBytes = undefined;
+    }
+    const scyllaMemory = resolveScyllaMemory(env.SCYLLA_MEMORY, totalMemoryBytes);
     const rayonThreads = resolvePositiveIntegerSetting(
         env.RAYON_NUM_THREADS,
         resolveRayonThreadCount(runtimePhysicalCoreCount, provingProcessCount),
@@ -224,6 +239,7 @@ async function resolveRuntimeResourceSettings(
         RAYON_NUM_THREADS: rayonThreads.toString(),
         PSY_WORKER_BATCH_SIZE: workerBatchSize.toString(),
         SCYLLA_SMP: scyllaSmp.toString(),
+        SCYLLA_MEMORY: scyllaMemory,
     };
     if (runtimeCpuSet) resourceEnv.PSY_RUNTIME_CPUSET = runtimeCpuSet;
     if (scyllaCpuSet) resourceEnv.SCYLLA_CPUSET = scyllaCpuSet;
@@ -233,6 +249,7 @@ async function resolveRuntimeResourceSettings(
         runtimeCpuSet,
         scyllaCpuSet,
         scyllaSmp: scyllaSmp.toString(),
+        scyllaMemory,
         env: resourceEnv,
     };
 }
@@ -2115,6 +2132,9 @@ async function ensureAllBinariesBuilt(cwd: string): Promise<void> {
 
     // Always run cargo build --release for psy-node. Cargo's incremental
     // compilation skips unchanged crates while still picking up source changes.
+    // psy_config's build script fingerprints PSY_CONFIG_PATH, so the build pins
+    // the stable genesis config; the per-run generated runtime config stays a
+    // runtime-only child setting.
     console.log("[AutoSetup] Building psy-node binaries (incremental)...");
     const nodeCode = await runStreaming(
         ["cargo", "build", "--release", "--locked",
@@ -2124,6 +2144,7 @@ async function ensureAllBinariesBuilt(cwd: string): Promise<void> {
          "--bin", "psy_user_cli",
          "--bin", "psy_dev_cli"],
         cwd,
+        { PSY_CONFIG_PATH: path.join(cwd, "psy-genesis", "config.json"), PSY_NETWORK: resolveStage() },
     );
     if (nodeCode !== 0) {
         throw new Error(`[AutoSetup] Failed to build psy-node binaries (exit ${nodeCode})`);
@@ -3306,10 +3327,10 @@ async function runAndCapture(cmd: string[], cwd?: string): Promise<{ code: numbe
     return { code, stdout, stderr };
 }
 
-async function runStreaming(cmd: string[], cwd?: string): Promise<number> {
+async function runStreaming(cmd: string[], cwd?: string, envOverrides?: { [key: string]: string }): Promise<number> {
     const proc = Bun.spawn(cmd, {
         cwd,
-        env: cwd ? { ...process.env, PWD: cwd } : undefined,
+        env: cwd ? { ...process.env, PWD: cwd, ...envOverrides } : undefined,
         stdout: "inherit",
         stderr: "inherit",
     });
@@ -5403,7 +5424,7 @@ export class DevNetProcessManager {
             "--experimental-features=lwt",
             "--cas-contention-timeout-in-ms", scyllaCasTimeout,
             "--write-request-timeout-in-ms", scyllaWriteTimeout,
-            "--memory", resolveScyllaMemory(env.SCYLLA_MEMORY),
+            "--memory", runtimeResources.env.SCYLLA_MEMORY,
         ];
         if (!runtimeResources.scyllaCpuSet) {
             scyllaCommand.push("--overprovisioned", "1");
