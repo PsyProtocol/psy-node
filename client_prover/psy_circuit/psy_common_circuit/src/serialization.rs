@@ -88,7 +88,8 @@ impl<F: RichField + Extendable<D>, const D: usize> GateSerializer<F, D> for PsyG
         U32InterleaveGate,
         UninterleaveToB32Gate,
         UninterleaveToU32Gate,
-        SharedComparisonGate<F, D>
+        SharedComparisonGate<F, D>,
+        BaseSumGate<4>
     }
 }
 
