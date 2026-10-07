@@ -49,7 +49,7 @@ use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::{
 use psy_provider::provider::RpcProvider;
 use serde::Serialize;
 use psy_client_data::bridge_aggregate::{bind_claim_tree, DepositAggregateOpening, DepositLeaf, DepositLeafRange, InclusionAggregateHeader, NetworkConfig, SourceCheckpointRewardOpening, WithdrawalAggregateOpening, REWARD_PUBLICATION_FAMILY, WITHDRAWAL_PUBLICATION_FAMILY, deposit_leaf_path, deposit_leaf_tree};
-use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow}, inclusion_aggregate::{RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths}, reward_ledger::RewardLedgerStep}};
+use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow}, settlement_aggregate::{RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths}, reward_ledger::RewardLedgerStep}};
 use psy_plonky2_common_circuits::bridge::deposit_spiderman_append::DepositSpidermanAppendInputs;
 use parth_core::{pgoldilocks::PoseidonHasher, crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, MerkleZeroHasher}}};
 

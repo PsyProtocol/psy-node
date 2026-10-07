@@ -5,7 +5,7 @@ use plonky2::{
 };
 use psy_plonky2_basic_helpers::builder::{comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers};
 use psy_plonky2_common_circuits::bridge::aggregate_commitment::{self as hash, Bytes32Target, AggregateLeafTarget};
-use super::inclusion_aggregate::set_bytes;
+use super::settlement_aggregate::set_bytes;
 
 type F = GoldilocksField;
 pub const DEPOSIT_AGGREGATE_PI_LEN: usize = 12;

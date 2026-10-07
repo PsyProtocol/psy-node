@@ -18,7 +18,7 @@ use psy_plonky2_common_circuits::{
 };
 use tiny_keccak::Hasher as _;
 
-use super::inclusion_aggregate::set_bytes;
+use super::settlement_aggregate::set_bytes;
 
 type F = GoldilocksField;
 pub const WINDOW_FINALIZATION_PI_LEN: usize = 12;

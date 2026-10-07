@@ -1,7 +1,7 @@
 pub mod bridge_agg;
 pub mod bridge_agg_chain;
 pub mod bridge_agg_final;
-pub mod inclusion_aggregate;
+pub mod settlement_aggregate;
 pub mod chain_aggregate;
 pub mod reward_inclusion;
 pub mod historical_merkle_proof;

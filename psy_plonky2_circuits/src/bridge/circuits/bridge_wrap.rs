@@ -35,7 +35,7 @@ use psy_crypto::hash::core::sha256::CoreSha256Hasher;
 
 const OPENING_DIGEST_PI_LEN: usize = 12;
 const OPENING_DIGEST_BITS: usize = 256;
-const AGGREGATE_BITS: usize = super::inclusion_aggregate::AGGREGATE_PI_LEN * 128;
+const AGGREGATE_BITS: usize = super::settlement_aggregate::AGGREGATE_PI_LEN * 128;
 const DIGEST_WORD_BITS: usize = 32;
 const PUBLICATION_DIGEST_WORDS: usize = 8;
 

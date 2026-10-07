@@ -327,8 +327,8 @@ Artifact approval source: `psy_cli/psy_relayer_cli/src/guardian/protocol.rs:150-
 | `batch_root` / `batch_leaf` / `batch_empty` / `batch_parent` / `batch_depth` | Tree width is `next_power_of_two(max(1,batch_count))`; depth is its base-two logarithm. With `K` denoting Keccak-256, real leaf `j` is `K(D(Leaf)\|\|W(batch_count)\|\|W(j)\|\|W(family)\|\|batchCommit)`, padding is `K(D(Empty)\|\|W(batch_count)\|\|W(j))`, and a parent is `K(D(Node)\|\|W(height)\|\|left\|\|right)` with height starting at 1. Zero batches give `batch_empty(0)` directly, not a zero digest or a fixed-depth padded root. |
 | `AggregateLeaf` | Private codec trait in `bridge_aggregate.rs`, implemented by `WithdrawalLeaf` and `RewardLeaf`. `LEAF_WORDS` is 6; `write_leaf` and `read_leaf` encode and decode each existing leaf as six 32-byte words. It is not a new wire family. Distinct from circuit `AggregateLeafTarget`. |
 | `AggregateLeafTarget` | Public circuit enum in `aggregate_commitment.rs`: `Deposit`, `Withdrawal`, and `Reward` leaf targets. Not the private codec trait `AggregateLeaf`. |
-| `WithdrawalInclusionAggregateCircuit` | Withdrawal inclusion publication circuit in `inclusion_aggregate.rs`. Its public-input width is `AGGREGATE_PI_LEN`, the sole owner registered below. Crypto domain `Domain::Aggregate`; its frozen label remains `Batch`. Do not rename that byte string. |
-| `RewardInclusionAggregateCircuit` | Retained reward final adapter in `inclusion_aggregate.rs`. Its public `circuit_data` is only the adapter graph. Public-input width is `AGGREGATE_PI_LEN`, 28 words: `[1,7,3,0]`, `opening_digest`, `claim_tree_root`, and `header_digest`. It verifies one family-13 level-8 root and one real 34-field `RewardSessionCircuit` tip. It does not verify one session proof per user and it is not the session circuit. |
+| `WithdrawalSettlementAggregateCircuit` | Withdrawal settlement publication circuit in `settlement_aggregate.rs`. Its public-input width is `AGGREGATE_PI_LEN`, the sole owner registered below. Crypto domain `Domain::Aggregate`; its frozen label remains `Batch`. Do not rename that byte string. Not `WithdrawalInclusionCircuit`, and not `InclusionAggregateHeader`. |
+| `RewardSettlementAggregateCircuit` | Retained reward settlement adapter in `settlement_aggregate.rs`. Its public `circuit_data` is only the adapter graph. Public-input width is `AGGREGATE_PI_LEN`, 28 words: `[1,7,3,0]`, `opening_digest`, `claim_tree_root`, and `header_digest`. It verifies one family-13 level-8 root and one real 34-field `RewardSessionCircuit` tip. It does not verify one session proof per user and it is not the session circuit. Not `RewardInclusionChunkCircuit` or `RewardInclusionCombineCircuit`. |
 | Withdrawal root path | Private Poseidon path authenticating one opening withdrawal root. It is not serialized. |
 | Global deposit leaf root | Internal ordered Merkle root from `deposit_leaf_tree`: leaf commitments, their positions, and total count. Shared by web proofs and complete-opening normalization. |
 | Finalize endpoint extension | For each configured ordinal, public inputs after the retained prefix: deposit root, absolute deposit count, and withdrawal root. The prefix is not the full width. |
@@ -359,7 +359,7 @@ Artifact approval source: `psy_cli/psy_relayer_cli/src/guardian/protocol.rs:150-
 | Interleaved acceptance gap | Unclosed connection from the private ledger targets to one selected publication history. Independent valid sessions and host sorting are insufficient. No wider user statement, balance, or persistent job root is adopted. |
 | `W` | Checked full sum of one reward session and the payout-leaf amount. Not a balance, debit, partial prefix, or per-job `REWARD_PER_CLAIM`. |
 
-Design contract: `docs/src/dev/bridge-merkle-settlement.md`; `bridge-proof-aggregation.md` is only an operational pointer. The filename is a protected document path and is not renamed. Reward-session, reward-ledger, and inclusion-publication names are the registered vocabulary below. The current payer remains per-job. Runtime validation, setup generation, and activation remain unexecuted.
+Design contract: `docs/src/dev/bridge-merkle-settlement.md`; `bridge-proof-aggregation.md` is only an operational pointer. The filename is a protected document path and is not renamed. The settlement inner circuits are `WithdrawalSettlementAggregateCircuit` and `RewardSettlementAggregateCircuit` in `settlement_aggregate.rs`. Inclusion publication stays `InclusionAggregateHeader`, `InclusionAggregateRoot`, `InclusionAggregateProof`, and `build_inclusion_aggregate_tree`. Those publication names are not the settlement circuits. Reward-session and reward-ledger names remain the registered vocabulary below. The current payer remains per-job. Runtime validation, setup generation, and activation remain unexecuted.
 
 ## Naming governance
 
@@ -383,12 +383,21 @@ This section is the machinery for the `AGENTS.md` naming rules (18, 23, 24). It 
 | `statement` | Genuine ZK statement | The per-step public-input statement. Rule 18 exempts it. |
 | `manifest` in error strings | Prose | Error text only. It is not a registered publication type. |
 | `context` on a live external contract or generic JSON compatibility field | External API | Classify the occurrence as external. Do not rename it without an explicit mapping. |
-| `SettlementAggregateApplied` | External event topic | Event name stays. Renaming it would change topic0. |
+| `SettlementAggregateApplied` | External event topic | Event name stays. Renaming it would change topic0. It is not `WithdrawalSettlementAggregateCircuit` or `RewardSettlementAggregateCircuit`. |
+| `InclusionAggregateHeader` | External publication header | Packed header type and its Solidity twin stay. Not either settlement aggregate circuit. |
+| `InclusionAggregateRoot` | External registry entry | StateManager registry entry and the `InclusionAggregateRootPublished` event stay. Not either settlement aggregate circuit. |
+| `InclusionAggregateProof` | External Groth16 proof codec | Proof struct in `bridge_wrap.rs` stays. Not either settlement aggregate circuit. |
+| `build_inclusion_aggregate_tree` | External claim-tree constructor | Native constructor in `bridge_aggregate.rs` stays. It is not the settlement aggregate module. |
+| `settlement_aggregate` | Owned circuit module | Module `psy_plonky2_circuits/src/bridge/circuits/settlement_aggregate.rs`. Head word `settlement_aggregate` owns only `WithdrawalSettlementAggregateCircuit` and `RewardSettlementAggregateCircuit`. It does not own the header, proof, root, or claim-tree constructor above. |
 | persisted JSON key `settlement_opening` | External stored key | Renamed Rust fields keep `#[serde(rename = "settlement_opening")]`. The stored key and its data hash stay unchanged. |
 | `WindowProofs.window_finalization` | Persisted proof reference | Rust field name. Wire key stays `settlement` through `#[serde(rename = "settlement")]`. |
 | artifact directory and schema key `WindowFinalization` | Fresh generated artifact path | Replaces `SettlementAggregate` in the setup directory name and schema-2 JSON key. No compatibility alias. ASCII domain bytes do not change. Generation is a separate authorized package. |
 | `DigestArtifact::WindowFinalization = 2` | FFI discriminant | Owned sibling enum variant. The name cuts over with its callers; numeric value 2 stays. |
 | `settlement_wait_seconds`, `settlement_checkpoint_state`, `settlement_compile_evidence`, `settlement_current_compile`, `settlement_delivery_sequence`, `settlement_postmerge_audit`, `settlement_postmerge_compile`, `settlement_postmerge_evidence`, `settlement_proxy_repair` | Excluded prose | Not part of the window-finalization cutover. Do not rename these occurrences. |
+| `ChainContext`, `ChainContextTarget`, `register_deposit_context`, `connect_deposit_context` | Excluded chain statement | Owned chain statement in `chain_aggregate.rs:21`, `chain_aggregate.rs:37`, `chain_aggregate.rs:62`, and `chain_aggregate.rs:66`. Excluded from the two-type settlement-aggregate cutover. Do not rename them. |
+| `context` on `ChainContext` and `ChainContextTarget` | Excluded chain statement | The chain statement named above. Not a settlement-aggregate circuit name. Do not rename it in this cutover. |
+| `QMetaDataStoreReaderSync` and module `qmetadata` | Existing storage API | Trait in `client_prover/psy_core/psy_data/src/traits/qdatastore/qmetadata.rs:16` and its module. Existing storage API. Excluded from this cutover. Do not rename them. |
+| `custody` local in `psy_plonky2_circuits/tests/bridge_aggregate.rs:768-788`, closure parameter `entry` at line 1050, and `phase=*-entry` diagnostic strings in `settlement_aggregate.rs` | Retained test prose | Existing test fixture variable, closure parameter, and diagnostic strings. Outside the frozen two-type settlement-aggregate cutover. Not a new domain name. Do not rename them and do not change their behavior. |
 
 ### Banned-substring sweep
 
@@ -412,10 +421,11 @@ A label freezes when it first enters an executed test, a generated circuit artif
 | `PsyBridge/TwoArtifact/2/B`, `PsyBridge/TwoArtifact/2/Batch`, `PsyBridge/TwoArtifact/2/Leaf`, `PsyBridge/TwoArtifact/2/Empty`, `PsyBridge/TwoArtifact/2/Node` | No executed test, generated circuit artifact, or deployment was supplied for these labels. Protected for the current window-finalization cutover: do not rename these byte strings. |
 | `PsyBridge/SourceCheckpointReward/1/Opening` | No executed test, generated circuit artifact, or deployment was supplied for this label. Protected for the current window-finalization cutover: preserve these bytes and do not rename them. |
 | `PsyRewardAuthorization/CreditSession/1` | Frozen. Host-domain bytes were actually executed and remain protected. Do not rename that byte string. |
+| `Domain::Aggregate` label `Batch` | Frozen before this cutover. The settlement-aggregate rename on 2026-10-08 does not change the byte string. No artifact regeneration is authorized by this naming cutover. |
 
 ### Module head words
 
-A public domain name starts with its owning module's head word, and two modules never share one (AGENTS.md naming rule 23). Registered head words: `reward` owns reward `inclusion`, `session`, `ledger`, and `aggregate`; `window_finalization` owns the joint bridge opening and aggregate circuit, with `opening`, `digest`, and `batch` sub-words. `build_opening_digest` is the circuit helper that reconstructs the two child opening digests. Window-finalization batch helpers use the registered `batch` prefix and `chunk_count` derivation above. The existing `deposit`, `withdrawal`, and `checkpoint` families retain their heads.
+A public domain name starts with its owning module's head word, and two modules never share one (AGENTS.md naming rule 23). Registered head words: `reward` owns reward `inclusion`, `session`, `ledger`, and `aggregate`; `window_finalization` owns the joint bridge opening and aggregate circuit, with `opening`, `digest`, and `batch` sub-words; `settlement_aggregate` owns only `WithdrawalSettlementAggregateCircuit` and `RewardSettlementAggregateCircuit` in `settlement_aggregate.rs`. `build_opening_digest` is the circuit helper that reconstructs the two child opening digests. Window-finalization batch helpers use the registered `batch` prefix and `chunk_count` derivation above. The existing `deposit`, `withdrawal`, and `checkpoint` families retain their heads. `InclusionAggregateHeader`, `InclusionAggregateProof`, `InclusionAggregateRoot`, and `build_inclusion_aggregate_tree` are not members of `settlement_aggregate`.
 
 The existing `keccak` head owns Keccak operations, including the bridge-facing bounded stream helpers beside `keccak_prefix_words`; it introduces no new hash domain.
 
@@ -447,7 +457,7 @@ Session (`reward_session.rs`) - one proof chain per (economic domain, source che
 | `job_amount` | Amount contributed by one included job. Not the session sum `W`. |
 | `constrain_reward_session_step` | Circuit constraint for one session step in `reward_session.rs`. |
 | `set_reward_session_witness` | Witness setter for one session step in `reward_session.rs`. |
-| `SOURCE_CHECKPOINT_REWARD_OPENING_HEADER_BYTES` | Width of the source-checkpoint reward opening header in `bridge_aggregate.rs`. `inclusion_aggregate.rs` imports it to bound the opening preimage. Not a cryptographic domain string. |
+| `SOURCE_CHECKPOINT_REWARD_OPENING_HEADER_BYTES` | Width of the source-checkpoint reward opening header in `bridge_aggregate.rs`. `settlement_aggregate.rs` imports it to bound the opening preimage. Not a cryptographic domain string. |
 | `WITHDRAWAL_HEADER_BYTES` | Fixed prefix of one withdrawal `InclusionAggregateHeader` in `bridge_aggregate.rs`: family byte, config hash, window id, end checkpoint id, end checkpoint root, and the six segment counters, then `opening_digest` and `claim_tree_root`. Configured withdrawal roots follow this prefix. Not a cryptographic domain string. |
 | `RewardSessionAuthorization`, `REWARD_SESSION_AUTHORIZATION_DOMAIN` | Host-side authorization for one session. |
 | `is_final_step` | Flag marking the session's closing step, the only step that authenticates the claimant. |
@@ -496,7 +506,7 @@ Aggregate - publication and the internal reward hierarchy:
 | `RewardLedgerFinalProof`, `final_proof`, `final_state`, `ledger_final_user_root` | The window's closing ledger state, its proof, and its user tree root. |
 | `reward_inclusion`, `reward_session`, `reward_aggregate` | Aggregate manager fields, one per sub-module. |
 | `RewardPayoutSlot` | One of 4 payout slots in `RewardInclusionChunkCircuit`: session proof, ledger state, source checkpoint, and payout leaf. Not a slot of the final adapter. |
-| `constrain_reward_payout` | Circuit constraint for one `RewardPayoutSlot` in `inclusion_aggregate.rs`. |
+| `constrain_reward_payout` | Circuit constraint for one `RewardPayoutSlot` in `settlement_aggregate.rs`. |
 | `REWARD_AGGREGATE_NODE_PI_LEN` | Internal node width, 131 fields. Family 13, variant 3, levels 0 through 8. Not `AGGREGATE_PI_LEN` and not the 34-field session statement. |
 | `RewardInclusionChunkCircuit` | Level-0 circuit. Exactly 4 slots and one owned shared `dummy_proof` target. Proves one internal range, including an empty or partial range. Not an external segment. |
 | `RewardInclusionCombineCircuit` | One combine level from 1 through 8. Both children use the constant verifier of descriptor `level-1`. No dummy business child and no skip flag. |

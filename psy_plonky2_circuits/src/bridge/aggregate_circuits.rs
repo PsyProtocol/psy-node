@@ -12,7 +12,7 @@ use tiny_keccak::{Hasher, Keccak};
 use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic_q, qstandard::QStandardCircuit};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::coordinator::coordinator_helper::QEDCoordinatorCircuitManager;
-use super::circuits::{bridge_agg_final::BridgeAggFinalCircuit, chain_aggregate::{ChainAggregateCircuit, CHAIN_PI_WORDS}, deposit_aggregate::{DepositAggregateCircuit, DEPOSIT_AGGREGATE_PI_LEN}, inclusion_aggregate::{AggregateWindow, RewardInclusionAggregateCircuit, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, WithdrawalInclusionAggregateCircuit, AGGREGATE_PI_LEN}, reward_session::{RewardSessionCircuit, REWARD_SESSION_STEP_CAPACITY}, window_finalization::{WindowFinalizationCircuit, WINDOW_FINALIZATION_PI_LEN}};
+use super::circuits::{bridge_agg_final::BridgeAggFinalCircuit, chain_aggregate::{ChainAggregateCircuit, CHAIN_PI_WORDS}, deposit_aggregate::{DepositAggregateCircuit, DEPOSIT_AGGREGATE_PI_LEN}, settlement_aggregate::{AggregateWindow, RewardSettlementAggregateCircuit, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, WithdrawalSettlementAggregateCircuit, AGGREGATE_PI_LEN}, reward_session::{RewardSessionCircuit, REWARD_SESSION_STEP_CAPACITY}, window_finalization::{WindowFinalizationCircuit, WINDOW_FINALIZATION_PI_LEN}};
 
 pub struct AggregateCircuitHeights {
     pub deposit_state_tree: usize,
@@ -25,8 +25,8 @@ pub struct AggregateCircuits {
     pub withdrawal: WithdrawalInclusionCircuit<C, 2>,
     pub reward_session: RewardSessionCircuit,
     pub checkpoint_final: BridgeAggFinalCircuit<C, 2>,
-    pub withdrawal_aggregate: WithdrawalInclusionAggregateCircuit<C, 2, 1024>,
-    pub reward_aggregate: RewardInclusionAggregateCircuit,
+    pub withdrawal_aggregate: WithdrawalSettlementAggregateCircuit<C, 2, 1024>,
+    pub reward_aggregate: RewardSettlementAggregateCircuit,
     pub chains: ChainAggregateCircuit<C, 2>,
     pub deposit_aggregate: DepositAggregateCircuit<C, 2>,
     pub window_finalization: WindowFinalizationCircuit<C, 2>,
@@ -58,8 +58,8 @@ impl AggregateCircuits {
         let deposit = DepositSpidermanAppendCircuit::build();
         let withdrawal = WithdrawalInclusionCircuit::build();
         let reward_session = RewardSessionCircuit::new(REWARD_SESSION_STEP_CAPACITY, source_chain_count)?;
-        let withdrawal_aggregate = WithdrawalInclusionAggregateCircuit::<C, 2, 1024>::new(&withdrawal.circuit_data, source_chain_count);
-        let reward_aggregate = RewardInclusionAggregateCircuit::new(&reward_session.circuit_data.common, &reward_session.circuit_data.verifier_only, source_chain_count)?;
+        let withdrawal_aggregate = WithdrawalSettlementAggregateCircuit::<C, 2, 1024>::new(&withdrawal.circuit_data, source_chain_count);
+        let reward_aggregate = RewardSettlementAggregateCircuit::new(&reward_session.circuit_data.common, &reward_session.circuit_data.verifier_only, source_chain_count)?;
         let chains = ChainAggregateCircuit::build(source_chain_count, &deposit)?;
         let deposit_aggregate = DepositAggregateCircuit::new(source_chain_count, &chains.circuit_data);
         let window_finalization = WindowFinalizationCircuit::new(source_chain_count, &checkpoint_final.circuit_data.common, &checkpoint_final.circuit_data.verifier_only, &withdrawal_aggregate.circuit_data.common, &withdrawal_aggregate.circuit_data.verifier_only, &reward_aggregate.circuit_data.common, &reward_aggregate.circuit_data.verifier_only)?;

@@ -69,10 +69,10 @@ impl ChainContextTarget {
         builder.connect_if_true(active, self.global_deposit_count, count);
     }
     pub fn set_witness(&self, witness: &mut PartialWitness<F>, context: &ChainContext) -> anyhow::Result<()> {
-        super::inclusion_aggregate::set_bytes(witness, &self.config_hash, &context.config_hash)?;
+        super::settlement_aggregate::set_bytes(witness, &self.config_hash, &context.config_hash)?;
         set_u64(witness, self.end_id, context.end_checkpoint_id)?;
         set_hash(witness, self.end_root, context.end_checkpoint_root)?;
-        super::inclusion_aggregate::set_bytes(witness, &self.global_deposit_leaf_root, &context.global_deposit_leaf_root)?;
+        super::settlement_aggregate::set_bytes(witness, &self.global_deposit_leaf_root, &context.global_deposit_leaf_root)?;
         witness.set_target(self.global_deposit_count, F::from_canonical_u32(context.global_deposit_count))
     }
 }

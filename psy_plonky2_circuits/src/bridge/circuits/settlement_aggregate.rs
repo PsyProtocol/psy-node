@@ -44,7 +44,7 @@ pub const REWARD_CHUNK_ABSORB_CALLS: usize =
 const REWARD_AGGREGATE_NODE_FAMILY: u8 = 13;
 const REWARD_AGGREGATE_NODE_VARIANT: u8 = 3;
 
-pub struct RewardInclusionAggregateCircuit {
+pub struct RewardSettlementAggregateCircuit {
     pub circuit_data: CircuitData<F, PoseidonGoldilocksConfig, 2>,
     session: VerifierCircuitData<F, PoseidonGoldilocksConfig, 2>,
     nodes: [VerifierCircuitData<F, PoseidonGoldilocksConfig, 2>; REWARD_HIERARCHY_LEVELS],
@@ -71,7 +71,7 @@ pub struct RewardInclusionAggregateCircuit {
     final_state: RewardLedgerStateTargets,
 }
 
-pub struct WithdrawalInclusionAggregateCircuit<C: GenericConfig<D, F = F>, const D: usize, const CAPACITY: usize>
+pub struct WithdrawalSettlementAggregateCircuit<C: GenericConfig<D, F = F>, const D: usize, const CAPACITY: usize>
 where F: Extendable<D> {
     pub circuit_data: CircuitData<F, C, D>,
     config: NetworkConfigTarget,
@@ -929,7 +929,7 @@ fn source_domain_bytes(label: &[u8]) -> [u8; 32] {
     digest
 }
 
-impl RewardInclusionAggregateCircuit {
+impl RewardSettlementAggregateCircuit {
     pub fn new(common: &CommonCircuitData<F, 2>, verifier: &VerifierOnlyCircuitData<PoseidonGoldilocksConfig, 2>, source_chain_count: usize) -> anyhow::Result<Self> {
         anyhow::ensure!((1..=8).contains(&source_chain_count), "reward source chain count is outside 1..=8");
         anyhow::ensure!(REWARD_CHUNK_SLOTS.is_power_of_two(), "reward chunk slots are not a power of two");
@@ -1365,7 +1365,7 @@ where F: Extendable<D> {
     builder.ensure_is_less_than_or_equal(count_bits, count, capacity_target);
 }
 
-impl<C: GenericConfig<D, F = F>, const D: usize, const CAPACITY: usize> WithdrawalInclusionAggregateCircuit<C, D, CAPACITY>
+impl<C: GenericConfig<D, F = F>, const D: usize, const CAPACITY: usize> WithdrawalSettlementAggregateCircuit<C, D, CAPACITY>
 where F: Extendable<D>, C::Hasher: AlgebraicHasher<F> + MerkleZeroHasher<HashOut<F>> {
     /// Capacity fixes padding; NetworkConfig still limits the entire window to at most 1024 withdrawals.
     pub fn new(child: &CircuitData<F, C, D>, chain_count: usize) -> Self {
@@ -1610,7 +1610,7 @@ mod tests {
         let verifier = session.circuit_data.verifier_only.clone();
         drop(session);
         let started = std::time::Instant::now();
-        let aggregate = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        let aggregate = RewardSettlementAggregateCircuit::new(&common, &verifier, 1).unwrap();
         eprintln!("[reward-publication] phase=empty-publication-circuit elapsed_ms={}", started.elapsed().as_millis());
         let opening = SourceCheckpointRewardOpening { config_hash: window.config_hash, window_id: window.window_id,
             end_checkpoint_id: 7, end_checkpoint_root: window.end_checkpoint_root, leaves: Vec::new() };
@@ -1663,7 +1663,7 @@ mod tests {
         let verifier = session.circuit_data.verifier_only.clone();
         drop(session);
         let started = std::time::Instant::now();
-        let aggregate = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        let aggregate = RewardSettlementAggregateCircuit::new(&common, &verifier, 1).unwrap();
         eprintln!("[reward-session-identity] phase=cross-window-publication-circuit elapsed_ms={}", started.elapsed().as_millis());
         let opening = SourceCheckpointRewardOpening { config_hash: window.config_hash, window_id: window.window_id,
             end_checkpoint_id: 7, end_checkpoint_root: window.end_checkpoint_root, leaves: Vec::new() };
@@ -1810,7 +1810,7 @@ mod tests {
         assert!(combine.prove(proved, right).is_err(), "accepted disconnected genuine child streams");
         drop(combine);
         drop(chunk);
-        let aggregate = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        let aggregate = RewardSettlementAggregateCircuit::new(&common, &verifier, 1).unwrap();
         for (stream, accepted) in [(incoming, true), (shifted, false)] {
             let chunk = RewardInclusionChunkCircuit::new(&common, &verifier, 1).unwrap();
             let mut proofs = (0..REWARD_PUBLICATION_CAPACITY / REWARD_CHUNK_SLOTS).map(|index| chunk.prove(&config, &header, &state, (index * REWARD_CHUNK_SLOTS) as u32,
@@ -1895,7 +1895,7 @@ mod tests {
         let common = session.circuit_data.common.clone();
         let verifier = session.circuit_data.verifier_only.clone();
         drop(session);
-        let aggregate = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        let aggregate = RewardSettlementAggregateCircuit::new(&common, &verifier, 1).unwrap();
         let registrations = aggregate.registrations().to_vec();
         assert_eq!(registrations.len(), REWARD_HIERARCHY_LEVELS);
         assert_eq!(aggregate.circuit_data.common.num_public_inputs, AGGREGATE_PI_LEN);
@@ -1906,7 +1906,7 @@ mod tests {
             assert_eq!(registration.identity_fingerprint, [0; 4]);
         }
         drop(aggregate);
-        let rebuilt = RewardInclusionAggregateCircuit::new(&common, &verifier, 1).unwrap();
+        let rebuilt = RewardSettlementAggregateCircuit::new(&common, &verifier, 1).unwrap();
         assert_eq!(rebuilt.registrations(), registrations.as_slice());
     }
     #[test]
@@ -2083,7 +2083,7 @@ mod tests {
         let (child, first) = withdrawal_child(&config, &window, &leaves[0], roots[0]);
         let (_, second) = withdrawal_child(&config, &window, &leaves[1], roots[0]);
         let proofs = [first, second];
-        let aggregate = WithdrawalInclusionAggregateCircuit::<_, 2, 1024>::new(&child, 1);
+        let aggregate = WithdrawalSettlementAggregateCircuit::<_, 2, 1024>::new(&child, 1);
         assert_eq!(aggregate.circuit_data.common.num_public_inputs, AGGREGATE_PI_LEN);
         let records = leaves.iter().zip(&proofs).map(|(leaf, proof)| WithdrawalAggregateLeaf { leaf, proof, path: &paths[0] }).collect::<Vec<_>>();
         let header = publication(&config, &window, &roots, &leaves, 1, 1);

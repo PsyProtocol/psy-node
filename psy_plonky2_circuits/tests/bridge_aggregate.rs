@@ -63,7 +63,7 @@ use psy_plonky2_circuits::{
             bridge_agg_chain::{BridgeAggChainBoundary, BridgeAggChainCircuit},
             bridge_agg_final::{BridgeAggFinalSlotWitness, BridgeAggFinalEndpointWitness},
             chain_aggregate::{ChainContext, ChainRow},
-            inclusion_aggregate::{AggregateWindow, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths, AGGREGATE_PI_LEN},
+            settlement_aggregate::{AggregateWindow, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths, AGGREGATE_PI_LEN},
             reward_inclusion::RewardTagWitness,
             reward_session::{RewardLedgerStateValues, RewardSessionJobWitness, RewardSessionWitness},
         },
@@ -427,7 +427,7 @@ fn source_hash(bytes: &[u8]) -> QHashOut<F> {
     QHashOut(PoseidonHash::hash_no_pad(&words))
 }
 
-fn withdrawal_paths_for(config: &NetworkConfig, ends: &[ChainState]) -> anyhow::Result<Vec<psy_plonky2_circuits::bridge::circuits::inclusion_aggregate::WithdrawalRootPath>> {
+fn withdrawal_paths_for(config: &NetworkConfig, ends: &[ChainState]) -> anyhow::Result<Vec<psy_plonky2_circuits::bridge::circuits::settlement_aggregate::WithdrawalRootPath>> {
     withdrawal_root_paths(config, &ends.iter().map(|end| end.withdrawal_root).collect::<Vec<_>>())
 }
 
