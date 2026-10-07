@@ -1161,10 +1161,18 @@ password_env = "SYNTHETIC_PASSWORD"
         await fixture(async (cwd, env) => {
             await expect(resolveBridgeDaemonConfigPath(cwd, {})).rejects.toThrow("config path");
             await expect(resolveBridgeDaemonConfigPath(cwd, env, false, null as never)).rejects.toThrow("Bun.TOML.parse");
-            await writeFile(path.join(cwd, "daemon.toml"), 'private_key = "SYNTHETIC-DO-NOT-REPORT"\n[broken');
-            try { await resolveBridgeDaemonConfigPath(cwd, env); throw new Error("accepted malformed TOML"); }
+            await writeFile(path.join(cwd, "daemon.toml"), 'broken = "SYNTHETIC-DO-NOT-REPORT\n');
+            const malformedConfig = resolveBridgeDaemonConfigPath(cwd, env);
+            await expect(malformedConfig).rejects.toBeInstanceOf(Error);
+            try { await malformedConfig; }
             catch (error) {
-                expect(String(error)).toContain("TOML document");
+                expect(String(error)).not.toContain("SYNTHETIC-DO-NOT-REPORT");
+            }
+            await writeFile(path.join(cwd, "daemon.toml"), 'private_key = "SYNTHETIC-DO-NOT-REPORT"\n[broken');
+            const malformedConfigWithKey = resolveBridgeDaemonConfigPath(cwd, env);
+            await expect(malformedConfigWithKey).rejects.toBeInstanceOf(Error);
+            try { await malformedConfigWithKey; }
+            catch (error) {
                 expect(String(error)).not.toContain("SYNTHETIC-DO-NOT-REPORT");
             }
             await writeFile(path.join(cwd, "daemon.toml"), daemonToml);
