@@ -47,7 +47,7 @@ pub async fn setup_nats_psy_queue_from_connection_str(
         max_ack_pending: 100000,
         ..Default::default()
     };
-    let worker_timeout_ms = env_u64_ms("NATS_WORKER_ACK_WAIT_MS", 30000)?;
+    let worker_timeout_ms = psy_node_core::queue::worker_queue::worker_queue_ack_wait_ms()?;
     let worker_inactive_threshold_ms = env_u64_ms("NATS_WORKER_INACTIVE_THRESHOLD_MS", 3_600_000)?;
     let worker_queue_pull_config = PullConfig {
         ack_policy: jetstream::consumer::AckPolicy::Explicit,

@@ -37,6 +37,7 @@ struct Queue {
 /// and development environments.
 #[derive(Debug, Clone)]
 pub struct InMemoryTempStore {
+    fetch_replay: Arc<psy_node_core::psy_temp_db::WorkerFetchReplayMemory>,
     /// Mimics Redis bucketed proof hashes. Stores pending_id -> (job_id -> proof_bytes).
     proof_store: Arc<DashMap<u64, Arc<DashMap<Vec<u8>, Vec<u8>>>>>,
     /// Mimics the Redis HASH for KV pairs.
@@ -63,6 +64,7 @@ impl InMemoryTempStore {
     /// * `realm_sub_id` - The secondary realm identifier.
     pub fn new(root_prefix: String, realm_id: u64, realm_sub_id: u64) -> Self {
         Self {
+            fetch_replay: psy_node_core::psy_temp_db::WorkerFetchReplayMemory::shared(),
             proof_store: Arc::new(DashMap::new()),
             kv_store: Arc::new(DashMap::new()),
             counter_store: Arc::new(DashMap::new()),
@@ -533,6 +535,13 @@ impl QTempDatabaseRawKVCompareAndSet for InMemoryTempStore {
 }
 
 impl QAutoImplementGeneric for InMemoryTempStore {}
+
+#[async_trait]
+impl psy_node_core::psy_temp_db::QTempDBWorkerFetchReplayStore for InMemoryTempStore {
+    async fn consume_worker_fetch(&self, rid: &parth_core::node::realm_identifier::QRealmIdentifier, signer: &[u8; 33], digest: &[u8; 32], expires_at_ms: u64) -> anyhow::Result<bool> {
+        self.fetch_replay.consume(psy_node_core::psy_temp_db::worker_fetch_replay_key(rid, signer, digest), expires_at_ms)
+    }
+}
 
 #[cfg(test)]
 mod compare_and_set_tests {
