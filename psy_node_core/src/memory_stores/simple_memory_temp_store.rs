@@ -13,6 +13,7 @@ use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStor
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryTempStore {
+    fetch_replay: Arc<crate::psy_temp_db::WorkerFetchReplayMemory>,
     pub kv_map: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
     pub counter_map: Arc<RwLock<HashMap<Vec<u8>, i64>>>,
     pub proof_map: Arc<RwLock<HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>>>,
@@ -20,10 +21,18 @@ pub struct SimpleMemoryTempStore {
 impl SimpleMemoryTempStore {
     pub fn new() -> Self {
         Self {
+            fetch_replay: crate::psy_temp_db::WorkerFetchReplayMemory::shared(),
             kv_map: Arc::new(RwLock::new(HashMap::new())),
             counter_map: Arc::new(RwLock::new(HashMap::new())),
             proof_map: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+#[async_trait]
+impl crate::psy_temp_db::QTempDBWorkerFetchReplayStore for SimpleMemoryTempStore {
+    async fn consume_worker_fetch(&self, rid: &parth_core::node::realm_identifier::QRealmIdentifier, signer: &[u8; 33], digest: &[u8; 32], expires_at_ms: u64) -> anyhow::Result<bool> {
+        self.fetch_replay.consume(crate::psy_temp_db::worker_fetch_replay_key(rid, signer, digest), expires_at_ms)
     }
 }
 

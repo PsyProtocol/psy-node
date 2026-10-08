@@ -112,11 +112,24 @@ impl<
         signature: &QEDCompressedSecp256K1Signature,
         request: &SimpleTimedRequest,
     ) -> anyhow::Result<WorkerAdmission> {
+        if request.request_type != parth_core::crypto::secp256k1::REQUEST_TYPE_REQUEST_PROOF_WORK {
+            anyhow::bail!("invalid request type for fetching work");
+        }
         if !verify_api_signature(&signature, &request) {
             anyhow::bail!("invalid signature from miner");
         }
         if request_expired(request.valid_until, chrono::Utc::now().timestamp_millis() as u64) {
             anyhow::bail!("request expired: valid until {} ms", request.valid_until);
+        }
+        let expires_at = request.valid_until
+            .checked_add(crate::constants::worker_reputation::WORKER_REQUEST_CLOCK_SKEW_MS)
+            .and_then(|deadline| deadline.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("invalid request expiry"))?;
+        if !self.temp_db.consume_worker_fetch(
+            &self.realm_identifier, &signature.public_key,
+            &signature.message.into_owned_32bytes(), expires_at,
+        ).await? {
+            anyhow::bail!("worker fetch request already used or expired; sign a new request");
         }
         self.temp_db
             .admit_worker(&self.realm_identifier, &signature.public_key, worker_queue_ack_wait_ms()?)

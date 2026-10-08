@@ -673,6 +673,29 @@ redis.call('HSET', KEYS[1], ARGV[1], ARGV[4])
 return 1
 "#;
 
+// Redis time makes the expiry check and reservation atomic across Edge processes. These
+// are separate expiring keys, never a TTL on the shared KV hash or checkpoint proof data.
+const WORKER_FETCH_REPLAY_SCRIPT: &str = r#"
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local ttl = tonumber(ARGV[1]) - now
+if ttl <= 0 then return 0 end
+if ttl > 300000 then return redis.error_reply('worker fetch expiry too far in future') end
+if redis.call('SET', KEYS[1], '1', 'NX', 'PX', ttl) then return 1 end
+return 0
+"#;
+
+#[async_trait]
+impl psy_node_core::psy_temp_db::QTempDBWorkerFetchReplayStore for StandardFredRedisStore {
+    async fn consume_worker_fetch(&self, rid: &parth_core::node::realm_identifier::QRealmIdentifier, signer: &[u8; 33], digest: &[u8; 32], expires_at_ms: u64) -> anyhow::Result<bool> {
+        // Coordinator and Realm have different DB namespaces but accept the same signatures.
+        // All Edge instances must point to the same Redis database for this guard.
+        let key = psy_node_core::psy_temp_db::worker_fetch_replay_key(rid, signer, digest);
+        let consumed: i64 = self.client.eval(WORKER_FETCH_REPLAY_SCRIPT, vec![key], vec![expires_at_ms.to_string()]).await?;
+        Ok(consumed == 1)
+    }
+}
+
 #[async_trait]
 impl QTempDatabaseRawKVCompareAndSet for StandardFredRedisStore {
     async fn qtdb_raw_kv_compare_and_set(&self, key: &[u8], expected: Option<&[u8]>, new_value: &[u8]) -> anyhow::Result<bool> {
