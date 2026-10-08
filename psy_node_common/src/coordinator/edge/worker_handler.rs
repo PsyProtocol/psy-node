@@ -30,7 +30,7 @@ use parth_core::crypto::secp256k1::REQUEST_TYPE_SUBMIT_PROOF;
 use psy_node_core::queue::worker_queue::worker_queue_ack_wait_ms;
 
 use crate::{
-    reputation::{policy::ReputationEvent, WorkerAdmission, WorkerReputationOps},
+    reputation::{WorkerAdmission, WorkerReputationOps},
     coordinator::{edge::handler::CoordinatorEdgeHandler, queue_key::CoordinatorProvingWorkQueueKey},
 };
 fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &SimpleTimedRequest) -> bool {
@@ -148,15 +148,26 @@ impl<
         }
     }
 
-    async fn charge_invalid_proof(&self, public_key: &[u8; 33], unique_pending_id: u64, job_id: &N::JobId) {
+    async fn charge_invalid_proof(
+        &self,
+        signer: &[u8; 33],
+        job_claim: &Option<([u8; 33], u64)>,
+        unique_pending_id: u64,
+        job_id: &N::JobId,
+    ) {
+        let Some((claim_public_key, claim_time_ms)) = job_claim.as_ref() else {
+            tracing::debug!("invalid proof for job {:?} has no claim record; no reputation change", job_id);
+            return;
+        };
         if let Err(err) = self
             .temp_db
-            .apply_worker_reputation_event(
+            .settle_job_claim_invalid_proof(
                 &self.realm_identifier,
-                public_key,
-                ReputationEvent::InvalidProof,
                 unique_pending_id,
-                &format!("{:?}", job_id),
+                *job_id,
+                signer,
+                claim_public_key,
+                *claim_time_ms,
             )
             .await
         {
@@ -490,7 +501,7 @@ impl<
         let debug_public_inputs = match parsed_public_inputs {
             Ok(public_inputs) => public_inputs,
             Err(err) => {
-                self.charge_invalid_proof(&signature.public_key, unique_pending_id, &job_id).await;
+                self.charge_invalid_proof(&signature.public_key, &job_claim, unique_pending_id, &job_id).await;
                 return Err(err);
             }
         };
@@ -510,7 +521,7 @@ impl<
             }
         }).await?;
         if let Err(err) = verification {
-            self.charge_invalid_proof(&signature.public_key, unique_pending_id, &job_id).await;
+            self.charge_invalid_proof(&signature.public_key, &job_claim, unique_pending_id, &job_id).await;
             return Err(err);
         }
 

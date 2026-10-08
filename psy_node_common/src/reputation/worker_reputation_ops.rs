@@ -246,6 +246,62 @@ pub trait WorkerReputationOps: QTempDBWorkerReputationStore + Sync {
         }
         anyhow::bail!("job claim settlement lost {} compare-and-set races", REPUTATION_CAS_ATTEMPTS)
     }
+
+    /// Charges an invalid proof to the claimant of `(claim_public_key, claim_time_ms)`, at most
+    /// once per claim, and only when the submit was signed by that claimant.
+    ///
+    /// The submit signature covers the claim tag but not the job or the proof bytes, and the Edge
+    /// does not check its expiry, so a captured request replayed with other proof bytes passes
+    /// signature verification. Closing the claim on the first charge bounds the damage to one
+    /// charge per claim generation, and a claim that already succeeded cannot be charged. It does
+    /// not stop an attacker who sees the signed submit in flight and delivers altered bytes first:
+    /// that charges the claimant once and forfeits its success reward. Removing that needs the
+    /// signature to bind the job id and a proof hash, a worker and SDK change.
+    ///
+    /// If the charge itself fails after the claim was closed, the claim stays closed uncharged.
+    async fn settle_job_claim_invalid_proof<JobId>(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        job_id: JobId,
+        signer: &[u8; 33],
+        claim_public_key: &[u8; 33],
+        claim_time_ms: u64,
+    ) -> anyhow::Result<()>
+    where
+        Self: QTempDBJobClaimRecordStore<JobId>,
+        JobId: Copy + std::fmt::Debug + Send + Sync + 'static,
+    {
+        if signer != claim_public_key {
+            tracing::info!(upid = unique_pending_id, job = ?job_id, "invalid proof not signed by the claimant; no reputation change");
+            return Ok(());
+        }
+        for _ in 0..REPUTATION_CAS_ATTEMPTS {
+            let Some((claim, raw)) = self.get_job_claim_record(rid, unique_pending_id, job_id).await? else {
+                return Ok(());
+            };
+            if claim.settled || claim.public_key != *claim_public_key || claim.claim_time_ms != claim_time_ms {
+                tracing::debug!(upid = unique_pending_id, job = ?job_id, "job claim already settled or replaced; invalid proof not charged");
+                return Ok(());
+            }
+            let settled = JobClaimRecord { settled: true, ..claim };
+            if self
+                .compare_and_set_job_claim_record(rid, unique_pending_id, job_id, Some(&raw), &settled)
+                .await?
+            {
+                return self
+                    .apply_worker_reputation_event(
+                        rid,
+                        claim_public_key,
+                        ReputationEvent::InvalidProof,
+                        unique_pending_id,
+                        &format!("{:?}", job_id),
+                    )
+                    .await;
+            }
+        }
+        anyhow::bail!("job claim settlement lost {} compare-and-set races", REPUTATION_CAS_ATTEMPTS)
+    }
 }
 
 impl<T: QTempDBWorkerReputationStore + Sync> WorkerReputationOps for T {}
@@ -532,6 +588,63 @@ mod tests {
 
         assert_eq!(score(&store, &A).await, 1);
         assert_eq!(store.admit_worker(&rid(), &A, LEASE).await.unwrap(), WorkerAdmission::Eligible);
+    }
+
+    async fn claim_of(store: &InMemoryTempStore) -> JobClaimRecord {
+        store.get_job_claim_record(&rid(), 7, job()).await.unwrap().unwrap().0
+    }
+
+    #[tokio::test]
+    async fn invalid_proof_is_charged_once_per_claim() {
+        let store = store();
+        store.record_job_claim(&rid(), 7, job(), &A, false, LEASE).await.unwrap();
+        let claim = claim_of(&store).await;
+        for _ in 0..3 {
+            store
+                .settle_job_claim_invalid_proof(&rid(), 7, job(), &A, &A, claim.claim_time_ms)
+                .await
+                .unwrap();
+        }
+        assert_eq!(score(&store, &A).await, 0);
+        assert!(claim_of(&store).await.settled);
+        // The charged claim is closed, so its lapse is not charged again either.
+        store.record_job_claim(&rid(), 7, job(), &B, false, 0).await.unwrap();
+        let after = store.get_worker_reputation_record(&rid(), &A).await.unwrap().0;
+        assert_eq!(after.strikes, 1);
+    }
+
+    #[tokio::test]
+    async fn replayed_bad_proof_after_success_is_not_charged() {
+        let store = store();
+        store.record_job_claim(&rid(), 7, job(), &A, false, LEASE).await.unwrap();
+        let claim = claim_of(&store).await;
+        store.settle_job_claim_success(&rid(), 7, job(), &A, claim.claim_time_ms, LEASE).await.unwrap();
+        store
+            .settle_job_claim_invalid_proof(&rid(), 7, job(), &A, &A, claim.claim_time_ms)
+            .await
+            .unwrap();
+        assert_eq!(score(&store, &A).await, 6);
+    }
+
+    #[tokio::test]
+    async fn invalid_proof_from_a_non_claimant_or_old_claim_is_not_charged() {
+        let store = store();
+        store.record_job_claim(&rid(), 7, job(), &A, false, LEASE).await.unwrap();
+        let a_claim = claim_of(&store).await;
+        // Signed by B with A's tag: nobody is charged.
+        store
+            .settle_job_claim_invalid_proof(&rid(), 7, job(), &B, &A, a_claim.claim_time_ms)
+            .await
+            .unwrap();
+        assert_eq!((score(&store, &A).await, score(&store, &B).await), (5, 5));
+        // A claim generation that has been replaced is not charged.
+        store.record_job_claim(&rid(), 7, job(), &B, false, LEASE).await.unwrap();
+        store
+            .settle_job_claim_invalid_proof(&rid(), 7, job(), &A, &A, a_claim.claim_time_ms)
+            .await
+            .unwrap();
+        assert_eq!((score(&store, &A).await, score(&store, &B).await), (5, 5));
+        assert!(!claim_of(&store).await.settled);
     }
 
     #[tokio::test]
