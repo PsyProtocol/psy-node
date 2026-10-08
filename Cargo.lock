@@ -7610,6 +7610,7 @@ dependencies = [
  "psy_plonky2_common_circuits",
  "psy_prover",
  "psy_provider",
+ "psy_rpc_pool",
  "psy_ups_circuit",
  "psy_vm",
  "reqwest 0.12.28",
@@ -7619,9 +7620,18 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "psy_rpc_pool"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
