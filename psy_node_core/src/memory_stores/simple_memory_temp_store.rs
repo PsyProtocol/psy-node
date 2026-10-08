@@ -9,7 +9,7 @@ use parth_core::{
 };
 use std::{collections::HashMap, sync::{Arc, RwLock}};
 
-use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
+use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVCompareAndSet, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryTempStore {
@@ -173,6 +173,19 @@ impl QTempDatabaseRawKVReaderBase for SimpleMemoryTempStore {
     }
     async fn qtdb_raw_kv_contains_key(&self, key: &[u8]) -> anyhow::Result<bool> {
         Ok(self.kv_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?.contains_key(key))
+    }
+}
+#[async_trait]
+impl QTempDatabaseRawKVCompareAndSet for SimpleMemoryTempStore {
+    async fn qtdb_raw_kv_compare_and_set(&self, key: &[u8], expected: Option<&[u8]>, new_value: &[u8]) -> anyhow::Result<bool> {
+        // The write lock spans the comparison and the write, so the pair is atomic.
+        let mut kv_map = self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let current = kv_map.get(key).map(|value| value.as_slice()).filter(|value| !value.is_empty());
+        if current != expected {
+            return Ok(false);
+        }
+        kv_map.insert(key.to_vec(), new_value.to_vec());
+        Ok(true)
     }
 }
 #[async_trait]

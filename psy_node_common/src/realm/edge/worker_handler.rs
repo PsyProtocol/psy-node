@@ -25,9 +25,10 @@ use psy_node_core::{
 };
 
 use parth_core::crypto::secp256k1::REQUEST_TYPE_SUBMIT_PROOF;
+use psy_node_core::queue::worker_queue::worker_queue_ack_wait_ms;
 
 use crate::{
-    reputation::WorkerReputationOps,
+    reputation::{policy::ReputationEvent, WorkerAdmission, WorkerReputationOps},
     realm::{edge::handler::RealmEdgeHandler, queue_key::RealmProvingWorkQueueKey},
 };
 
@@ -110,15 +111,38 @@ impl<
         &self,
         signature: &QEDCompressedSecp256K1Signature,
         request: &SimpleTimedRequest,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<WorkerAdmission> {
         if !verify_api_signature(&signature, &request) {
             anyhow::bail!("invalid signature from miner");
         }
-        let reputation = self.temp_db.get_worker_reputation(&self.realm_identifier, &signature.public_key).await?;
-        if reputation <= 0 {
-            anyhow::bail!("worker not eligible: reputation must be positive");
+        self.temp_db
+            .admit_worker(&self.realm_identifier, &signature.public_key, worker_queue_ack_wait_ms()?)
+            .await
+    }
+
+    /// Frees a probation slot reserved for a fetch that handed out no job.
+    async fn release_unused_probation(&self, public_key: &[u8; 33], admission: WorkerAdmission, fetch_failed: bool) {
+        if let (true, WorkerAdmission::Probation { reserved_at_ms }) = (fetch_failed, admission) {
+            if let Err(err) = self.temp_db.release_probation(&self.realm_identifier, public_key, reserved_at_ms).await {
+                tracing::warn!("failed to release probation slot: {:?}", err);
+            }
         }
-        Ok(())
+    }
+
+    async fn charge_invalid_proof(&self, public_key: &[u8; 33], unique_pending_id: u64, job_id: &N::JobId) {
+        if let Err(err) = self
+            .temp_db
+            .apply_worker_reputation_event(
+                &self.realm_identifier,
+                public_key,
+                ReputationEvent::InvalidProof,
+                unique_pending_id,
+                &format!("{:?}", job_id),
+            )
+            .await
+        {
+            tracing::error!("invalid-proof reputation update failed for job {:?}: {:?}", job_id, err);
+        }
     }
 
     pub async fn get_worker_reputation_internal(&self, public_key: &[u8; 33]) -> anyhow::Result<u64> {
@@ -182,8 +206,15 @@ impl<
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
     ) -> anyhow::Result<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>> {
-        self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
-
+        let admission = self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
+        let public_key = signature.public_key;
+        let result = self.get_proving_work_internal_admitted().await;
+        self.release_unused_probation(&public_key, admission, result.is_err()).await;
+        result
+    }
+    async fn get_proving_work_internal_admitted(
+        &self,
+    ) -> anyhow::Result<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>> {
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
 
         let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
@@ -245,10 +276,19 @@ impl<
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
     ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
+        let admission = self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
+        let public_key = signature.public_key;
+        let result = self.get_proving_work_with_child_proofs_internal_admitted(signature, request).await;
+        self.release_unused_probation(&public_key, admission, result.is_err()).await;
+        result
+    }
+    async fn get_proving_work_with_child_proofs_internal_admitted(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+    ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
         let mut timer = DebugTimer::new("get_proving_work_with_child_proofs_internal");
         //tracing::debug!("get_proving_work_with_child_proofs_internal called");
-        self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
-        timer.lap_micros("verify_miner_api_signature_and_check_reputation");
 
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
@@ -360,14 +400,17 @@ impl<
             )
             .await?;
         timer.lap_micros("set_proof_claim_tag");
-        let claim_time_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let already_submitted = self
+            .has_job_id_already_been_submitted(unique_pending_id, response.job.job_id.get_output_id())
+            .await?;
         self.temp_db
-            .set_job_claim(
+            .record_job_claim(
                 &self.realm_identifier,
                 unique_pending_id,
                 response.job.job_id.get_output_id(),
                 &signature.public_key,
-                claim_time_ms,
+                already_submitted,
+                worker_queue_ack_wait_ms()?,
             )
             .await?;
         timer.lap_micros("set_job_claim");
@@ -401,7 +444,8 @@ impl<
         timer.lap_micros("get_current_unique_pending_id_internal");
         let proof_bytes = Arc::new(proof_bytes);
 
-        // HACK: check to make sure the tag matches. If not, job was completed by another worker (stolen) - slash submitter.
+        // A mismatch means the job was re-assigned after this claim's lease ran out. The new claimant
+        // finishes it, so the stale result is dropped unverified and costs no reputation.
         // The expected tag is read from the dedicated claim-tag key namespace, not the
         // finalized reward-tree value key, so it can never observe a finalized reward value.
         let expected_tag = self
@@ -409,10 +453,15 @@ impl<
             .get_proof_claim_tag(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id())
             .await?;
         if expected_tag != tag {
-            self.temp_db
-                .apply_reputation_slash_on_tag_mismatch(&self.realm_identifier, &signature.public_key)
-                .await?;
-            anyhow::bail!("Submitted tag does not match expected tag for job id");
+            tracing::info!(
+                event = "worker_reputation",
+                reason = "stale_claim",
+                worker = %hex::encode(&signature.public_key),
+                upid = unique_pending_id,
+                job = ?job_id,
+                "stale submit rejected without penalty"
+            );
+            anyhow::bail!("stale claim: job was re-assigned; result discarded");
         }
         timer.lap_micros("get_proof_claim_tag");
 
@@ -457,7 +506,16 @@ impl<
             hex::encode(&full_expected_public_inputs_hash.into_owned_32bytes()),
             hex::encode(&metadata.expected_public_inputs_hash.into_owned_32bytes())
         );
-        let debug_public_inputs = N::ZKVerifier::get_proof_public_inputs_hash(&N::ZKVerifier::try_proof_from_slice(&proof_bytes)?)?;
+        let parsed_public_inputs: anyhow::Result<_> = (|| {
+            Ok(N::ZKVerifier::get_proof_public_inputs_hash(&N::ZKVerifier::try_proof_from_slice(&proof_bytes)?)?)
+        })();
+        let debug_public_inputs = match parsed_public_inputs {
+            Ok(public_inputs) => public_inputs,
+            Err(err) => {
+                self.charge_invalid_proof(&signature.public_key, unique_pending_id, &job_id).await;
+                return Err(err);
+            }
+        };
         timer.lap_micros("get_proof_public_inputs_hash");
         tracing::debug!(
             "Debug: extracted public inputs hash from proof: {:?}",
@@ -466,7 +524,7 @@ impl<
         print_hash("debug_public_inputs", &debug_public_inputs);
 
         let proof_verifier = self.proof_verifier.clone();
-        task::spawn_blocking({
+        let verification = task::spawn_blocking({
             let proof_bytes = proof_bytes.clone();
             move || {
                 proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
@@ -475,7 +533,11 @@ impl<
                     full_expected_public_inputs_hash,
                 )
             }
-        }).await??;
+        }).await?;
+        if let Err(err) = verification {
+            self.charge_invalid_proof(&signature.public_key, unique_pending_id, &job_id).await;
+            return Err(err);
+        }
         timer.lap_micros("verify_zk_proof_from_slice_check_public_inputs_hash");
 
         // HACK: now set the correct reward tree value
@@ -503,9 +565,18 @@ impl<
             (chrono::Utc::now().timestamp_millis() as u64).saturating_sub(*claim_time_ms)
         });
         if let Some((public_key, claim_time_ms)) = job_claim.as_ref() {
-            self.temp_db
-                .apply_reputation_on_submit(&self.realm_identifier, public_key, *claim_time_ms)
-                .await?;
+            // A failed reputation update must not fail a verified, stored proof before its ACK.
+            let settled = match worker_queue_ack_wait_ms() {
+                Ok(lease_ms) => {
+                    self.temp_db
+                        .settle_job_claim_success(&self.realm_identifier, unique_pending_id, job_id, public_key, *claim_time_ms, lease_ms)
+                        .await
+                }
+                Err(err) => Err(err),
+            };
+            if let Err(err) = settled {
+                tracing::error!("submit_proof_raw: reputation settlement failed for job {:?}: {:?}", job_id, err);
+            }
             timer.lap_micros("update_worker_reputation");
         } else {
             tracing::debug!("submit_proof_raw: no job_claim record for job_id {:?}, skipping reputation update", job_id);

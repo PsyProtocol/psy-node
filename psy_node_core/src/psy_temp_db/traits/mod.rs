@@ -43,6 +43,7 @@ pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>:
     QTempDBJobClaimInfoStore<JobId> +
     QTempDBJobStatsStore +
     QTempDBWorkerReputationStore +
+    QTempDBJobClaimRecordStore<JobId> +
     QTempDBGutaInFlightStore
 {
 
@@ -64,6 +65,7 @@ impl<
     QTempDBJobClaimInfoStore<JobId> +
     QTempDBJobStatsStore +
     QTempDBWorkerReputationStore +
+    QTempDBJobClaimRecordStore<JobId> +
     QTempDBGutaInFlightStore,
 > StandardEdgeAPITempDBStoreBase<JobId, Hash> for T {
 }

@@ -115,3 +115,24 @@ pub trait QStandardWorkerQueueSubscriber: QStandardWorkerQueue {
         Ok(())
     }
 }
+
+/// Milliseconds a worker holds a claimed job before the queue redelivers it (the worker lease).
+pub const WORKER_QUEUE_ACK_WAIT_ENV: &str = "NATS_WORKER_ACK_WAIT_MS";
+pub const DEFAULT_WORKER_QUEUE_ACK_WAIT_MS: u64 = 30_000;
+
+/// The worker lease, read the same way by the queue that enforces it and by the Edge that judges
+/// whether a claim outlived it.
+pub fn worker_queue_ack_wait_ms() -> anyhow::Result<u64> {
+    match std::env::var(WORKER_QUEUE_ACK_WAIT_ENV) {
+        Ok(value) => value.parse::<u64>().map_err(|err| {
+            anyhow::anyhow!(
+                "invalid {} value {:?}; expected milliseconds as u64: {}",
+                WORKER_QUEUE_ACK_WAIT_ENV,
+                value,
+                err
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_WORKER_QUEUE_ACK_WAIT_MS),
+        Err(err) => Err(anyhow::anyhow!("failed to read {}: {}", WORKER_QUEUE_ACK_WAIT_ENV, err)),
+    }
+}
