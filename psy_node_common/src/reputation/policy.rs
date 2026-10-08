@@ -4,8 +4,8 @@
 use psy_node_core::psy_temp_db::{JobClaimRecord, WorkerReputationRecord};
 
 use crate::constants::worker_reputation::{
-    MAX_WORKER_REPUTATION, REPUTATION_COOLDOWN_BASE_MS, REPUTATION_COOLDOWN_MAX_MS, REPUTATION_INVALID_PROOF_PENALTY,
-    REPUTATION_LEASE_EXPIRY_PENALTY, REPUTATION_ON_TIME_REWARD, REPUTATION_STRIKE_RESET_STREAK,
+    MAX_WORKER_REPUTATION, REPUTATION_COOLDOWN_BASE_MS, REPUTATION_COOLDOWN_MAX_MS, REPUTATION_LEASE_EXPIRY_PENALTY,
+    REPUTATION_ON_TIME_REWARD, REPUTATION_STRIKE_RESET_STREAK, WORKER_REQUEST_CLOCK_SKEW_MS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,8 +16,6 @@ pub enum ReputationEvent {
     LateSuccess,
     /// A claim outlived its lease without a submit and the job was claimed again.
     LeaseExpired,
-    /// A submitted proof was malformed or failed verification.
-    InvalidProof,
 }
 
 impl ReputationEvent {
@@ -26,7 +24,6 @@ impl ReputationEvent {
             Self::OnTimeSuccess => "on_time_success",
             Self::LateSuccess => "late_success",
             Self::LeaseExpired => "lease_expiry",
-            Self::InvalidProof => "invalid_proof",
         }
     }
 }
@@ -103,7 +100,6 @@ pub fn apply(record: &WorkerReputationRecord, event: ReputationEvent, now_ms: u6
             return (next != *record).then_some(next);
         }
         ReputationEvent::LeaseExpired => REPUTATION_LEASE_EXPIRY_PENALTY,
-        ReputationEvent::InvalidProof => REPUTATION_INVALID_PROOF_PENALTY,
     };
     if cooldown_until(record, now_ms).is_some() {
         return None;
@@ -138,6 +134,14 @@ pub fn release_probation(record: &WorkerReputationRecord, reserved_at_ms: u64) -
 /// A redelivery sooner than one full lease (consumer recreation, Edge restart) is not.
 pub fn previous_claim_lapsed(previous: &JobClaimRecord, already_submitted: bool, now_ms: u64, lease_ms: u64) -> bool {
     !previous.settled && !already_submitted && now_ms.saturating_sub(previous.claim_time_ms) >= lease_ms
+}
+
+/// Whether a signed request is past its `valid_until`, allowing for clock skew. The Edge checked
+/// only the signature before, so a captured request could be replayed indefinitely; a replayed
+/// fetch would claim jobs in the signer's name and, now that lapsed claims are charged, drain its
+/// reputation.
+pub fn request_expired(valid_until_ms: u64, now_ms: u64) -> bool {
+    now_ms > valid_until_ms.saturating_add(WORKER_REQUEST_CLOCK_SKEW_MS)
 }
 
 pub fn submit_event(claim_time_ms: u64, now_ms: u64, lease_ms: u64) -> ReputationEvent {
@@ -186,9 +190,7 @@ mod tests {
     fn penalties_floor_at_zero_and_record_the_time() {
         let next = apply(&rec(15), ReputationEvent::LeaseExpired, 7).unwrap();
         assert_eq!((next.score, next.last_penalty_ms, next.strikes), (14, 7, 0));
-        let next = apply(&rec(15), ReputationEvent::InvalidProof, 7).unwrap();
-        assert_eq!(next.score, 10);
-        let next = apply(&rec(3), ReputationEvent::InvalidProof, 7).unwrap();
+        let next = apply(&rec(0), ReputationEvent::LeaseExpired, u64::MAX).unwrap();
         assert_eq!((next.score, next.strikes), (0, 1));
     }
 
@@ -202,7 +204,7 @@ mod tests {
     fn penalties_during_cooldown_are_absorbed() {
         let zero = apply(&rec(1), ReputationEvent::LeaseExpired, 0).unwrap();
         assert_eq!(apply(&zero, ReputationEvent::LeaseExpired, MIN), None);
-        assert_eq!(apply(&zero, ReputationEvent::InvalidProof, 2 * MIN - 1), None);
+        assert_eq!(apply(&zero, ReputationEvent::LeaseExpired, 2 * MIN - 1), None);
         // After the cooldown, a failure (a probation claim) is the next strike.
         let next = apply(&zero, ReputationEvent::LeaseExpired, 2 * MIN).unwrap();
         assert_eq!((next.score, next.strikes, next.last_penalty_ms), (0, 2, 2 * MIN));
@@ -298,6 +300,14 @@ mod tests {
         assert!(!previous_claim_lapsed(&claim, true, 1_000 + LEASE, LEASE));
         let settled = JobClaimRecord { settled: true, ..claim };
         assert!(!previous_claim_lapsed(&settled, false, 1_000 + LEASE, LEASE));
+    }
+
+    #[test]
+    fn requests_expire_after_valid_until_plus_skew() {
+        let skew = WORKER_REQUEST_CLOCK_SKEW_MS;
+        assert!(!request_expired(1_000, 1_000 + skew));
+        assert!(request_expired(1_000, 1_000 + skew + 1));
+        assert!(!request_expired(u64::MAX, u64::MAX));
     }
 
     #[test]

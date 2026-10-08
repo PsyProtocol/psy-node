@@ -28,7 +28,7 @@ use parth_core::crypto::secp256k1::REQUEST_TYPE_SUBMIT_PROOF;
 use psy_node_core::queue::worker_queue::worker_queue_ack_wait_ms;
 
 use crate::{
-    reputation::{WorkerAdmission, WorkerReputationOps},
+    reputation::{policy::request_expired, WorkerAdmission, WorkerReputationOps},
     realm::{edge::handler::RealmEdgeHandler, queue_key::RealmProvingWorkQueueKey},
 };
 
@@ -115,6 +115,9 @@ impl<
         if !verify_api_signature(&signature, &request) {
             anyhow::bail!("invalid signature from miner");
         }
+        if request_expired(request.valid_until, chrono::Utc::now().timestamp_millis() as u64) {
+            anyhow::bail!("request expired: valid until {} ms", request.valid_until);
+        }
         self.temp_db
             .admit_worker(&self.realm_identifier, &signature.public_key, worker_queue_ack_wait_ms()?)
             .await
@@ -129,31 +132,18 @@ impl<
         }
     }
 
-    async fn charge_invalid_proof(
-        &self,
-        signer: &[u8; 33],
-        job_claim: &Option<([u8; 33], u64)>,
-        unique_pending_id: u64,
-        job_id: &N::JobId,
-    ) {
-        let Some((claim_public_key, claim_time_ms)) = job_claim.as_ref() else {
-            tracing::debug!("invalid proof for job {:?} has no claim record; no reputation change", job_id);
-            return;
-        };
-        if let Err(err) = self
-            .temp_db
-            .settle_job_claim_invalid_proof(
-                &self.realm_identifier,
-                unique_pending_id,
-                *job_id,
-                signer,
-                claim_public_key,
-                *claim_time_ms,
-            )
-            .await
-        {
-            tracing::error!("invalid-proof reputation update failed for job {:?}: {:?}", job_id, err);
-        }
+    /// Logs a rejected proof without charging anyone: the submit signature covers the claim tag
+    /// but not the job or the proof bytes, so a rejected proof cannot be attributed to its signer.
+    fn report_invalid_proof(&self, signer: &[u8; 33], unique_pending_id: u64, job_id: &N::JobId, err: &anyhow::Error) {
+        tracing::warn!(
+            event = "worker_reputation",
+            reason = "invalid_proof_not_charged",
+            worker = %hex::encode(signer),
+            upid = unique_pending_id,
+            job = ?job_id,
+            "proof rejected: {:?}",
+            err
+        );
     }
 
     pub async fn get_worker_reputation_internal(&self, public_key: &[u8; 33]) -> anyhow::Result<u64> {
@@ -446,6 +436,13 @@ impl<
         if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
             anyhow::bail!("invalid signature for submit_proof_raw");
         }
+        if request_expired(request.valid_until, chrono::Utc::now().timestamp_millis() as u64) {
+            anyhow::bail!("request expired: valid until {} ms", request.valid_until);
+        }
+        // The signature covers the tag in the request, not the tag argument; they must agree.
+        if N::QHash::from_ref_32bytes(&request.tag) != tag {
+            anyhow::bail!("submitted tag does not match the signed request");
+        }
         job_id = job_id.get_output_id();
         let mut timer = DebugTimer::new("submit_proof_raw_internal");
         let (current_unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
@@ -523,7 +520,7 @@ impl<
         let debug_public_inputs = match parsed_public_inputs {
             Ok(public_inputs) => public_inputs,
             Err(err) => {
-                self.charge_invalid_proof(&signature.public_key, &job_claim, unique_pending_id, &job_id).await;
+                self.report_invalid_proof(&signature.public_key, unique_pending_id, &job_id, &err);
                 return Err(err);
             }
         };
@@ -546,7 +543,7 @@ impl<
             }
         }).await?;
         if let Err(err) = verification {
-            self.charge_invalid_proof(&signature.public_key, &job_claim, unique_pending_id, &job_id).await;
+            self.report_invalid_proof(&signature.public_key, unique_pending_id, &job_id, &err);
             return Err(err);
         }
         timer.lap_micros("verify_zk_proof_from_slice_check_public_inputs_hash");
