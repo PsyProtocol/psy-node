@@ -11,7 +11,7 @@ use std::{
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
 use anyhow::{Context, ensure};
@@ -123,7 +123,10 @@ pub(crate) struct L1Config {
     pub family: String,
     pub chain_index: u8,
     pub network_id: String,
+    #[serde(default)]
     pub rpc_urls: Vec<String>,
+    #[serde(default)]
+    pub rpc_providers: Vec<crate::bridge::rpc_providers::RpcProviderConfig>,
     pub deployments_network: String,
     #[serde(default)]
     pub state_manager: Option<String>,
@@ -150,13 +153,18 @@ impl L1Config {
     ) -> anyhow::Result<BridgeProposeDaemonConfig> {
         let mut config = base.clone();
         config.chains.clear();
-        config.finalize.l1_rpc_url = Some(
-            self.rpc_urls
-                .first()
-                .cloned()
-                .context("EVM chain rpc_urls must not be empty")?,
+        // Raw, user-supplied fields: warn here (not inside `resolve_rpc_providers`,
+        // which downstream callers also invoke with already-derived config).
+        crate::bridge::rpc_providers::warn_if_rpc_urls_ignored(
+            &self.network_id, &self.rpc_providers, &self.rpc_urls,
         );
-        config.finalize.l1_rpc_fallback_url = self.rpc_urls.get(1).cloned();
+        let providers = crate::bridge::rpc_providers::resolve_rpc_providers(
+            &self.network_id, &self.rpc_providers, &self.rpc_urls,
+        )?;
+        // The first provider URL is the scope identity for provider factories.
+        config.finalize.l1_rpc_url = Some(providers[0].url.clone());
+        config.finalize.l1_rpc_fallback_url = None;
+        config.finalize.l1_rpc_providers = providers;
         config.finalize.deployments_network = Some(self.deployments_network.clone());
         config.finalize.state_manager = self.state_manager.clone();
         config.finalize.bridge_address = self.bridge_address.clone();
@@ -165,6 +173,24 @@ impl L1Config {
         config.finalize.password_env = self.password_env.clone();
         Ok(config)
     }
+}
+
+/// URL list for the single-chain `[finalize]` path. The default URL is only a
+/// stand-in for a missing config; with `l1_rpc_providers` set it would be
+/// reported as an ignored `rpc_urls` entry the operator never wrote.
+fn legacy_rpc_urls(finalize: &DaemonFinalizeConfig) -> Vec<String> {
+    let primary = match finalize.l1_rpc_url.clone() {
+        Some(url) => Some(url),
+        None if finalize.l1_rpc_providers.is_empty() => Some(DEFAULT_L1_RPC_URL.to_string()),
+        None => None,
+    };
+    let mut rpc_urls: Vec<String> = primary.into_iter().collect();
+    if let Some(url) = finalize.l1_rpc_fallback_url.clone() {
+        if !url.trim().is_empty() && !rpc_urls.contains(&url) {
+            rpc_urls.push(url);
+        }
+    }
+    rpc_urls
 }
 
 fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L1Config>> {
@@ -180,21 +206,12 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
             .map(|protocol| protocol.chain.l1_chain_index)
             .or_else(|| (deployments_network == "localhost").then_some(0))
             .context("deployment is missing protocol.chain.l1ChainIndex")?;
-        let mut rpc_urls = vec![config
-            .finalize
-            .l1_rpc_url
-            .clone()
-            .unwrap_or_else(|| DEFAULT_L1_RPC_URL.to_string())];
-        if let Some(url) = config.finalize.l1_rpc_fallback_url.clone() {
-            if !url.trim().is_empty() && !rpc_urls.contains(&url) {
-                rpc_urls.push(url);
-            }
-        }
         vec![L1Config {
             family: default_evm_family(),
             chain_index,
             network_id: deployments_network.clone(),
-            rpc_urls,
+            rpc_urls: legacy_rpc_urls(&config.finalize),
+            rpc_providers: config.finalize.l1_rpc_providers.clone(),
             deployments_network,
             state_manager: config.finalize.state_manager.clone(),
             bridge_address: config.finalize.bridge_address.clone(),
@@ -209,7 +226,11 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
     let mut seen = HashSet::with_capacity(chains.len());
     for chain in &chains {
         ensure!(chain.family.eq_ignore_ascii_case("evm"), "unsupported bridge chain family {}", chain.family);
-        ensure!(!chain.rpc_urls.is_empty(), "chain {} has no RPC URL", chain.network_id);
+        ensure!(
+            !chain.rpc_urls.is_empty() || !chain.rpc_providers.is_empty(),
+            "chain {} has no RPC URL",
+            chain.network_id
+        );
         ensure!(
             seen.insert(chain.chain_index),
             "duplicate bridge chain_index {}",
@@ -234,6 +255,8 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
 pub(crate) struct DaemonFinalizeConfig {
     pub l1_rpc_url: Option<String>,
     pub l1_rpc_fallback_url: Option<String>,
+    #[serde(default)]
+    pub l1_rpc_providers: Vec<crate::bridge::rpc_providers::RpcProviderConfig>,
     pub deployments_network: Option<String>,
     pub state_manager: Option<String>,
     pub bridge_address: Option<String>,
@@ -845,7 +868,7 @@ async fn run_multichain(
         let state_manager = resolve_state_manager_address(&effective)?;
         chains.push(ChainRuntime {
             chain_index: chain.chain_index,
-            l1: L1Client::from_finalize_config(&effective.finalize),
+            l1: L1Client::from_finalize_config(&effective.finalize, &chain.network_id)?,
             config: effective,
             bridge,
             state_manager,
@@ -1034,7 +1057,10 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
     tracing::info!(prove_proxy = %proxy_url_at_startup, "system prove proxy configured; local Groth16 warmup skipped");
 
     let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
-    let l1 = L1Client::from_finalize_config(&config.finalize);
+    let l1 = L1Client::from_finalize_config(
+        &config.finalize,
+        config.finalize.deployments_network.as_deref().unwrap_or("l1"),
+    )?;
     let bridge_address = resolve_bridge_address(&config)?;
     let bridge = bridge_address
         .parse::<Address>()
@@ -1496,7 +1522,7 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
     let rpc_url = l1_rpc
         .parse()
         .with_context(|| format!("invalid L1 rpc url: {}", l1_rpc))?;
-    let provider = ProviderBuilder::new().wallet(wallet).connect_http(rpc_url);
+    let provider = crate::bridge::l1_provider::connect_l1_with_wallet(rpc_url, wallet)?;
     let proved_before = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
     let expected_proved_after = U256::from(target_deposit_count);
     ensure!(
@@ -1964,7 +1990,7 @@ pub(crate) fn resolve_bridge_address(config: &BridgeProposeDaemonConfig) -> anyh
         .ok_or_else(|| anyhow::anyhow!("Bridge not found in {}", path.display()))
 }
 
-fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Address> {
+pub(crate) fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Address> {
     if let Some(addr) = config.finalize.state_manager.as_deref() {
         return addr
             .parse::<Address>()
@@ -1978,11 +2004,12 @@ fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) -> anyhow::
     crate::bridge::api_client::resolve_contract_address_from_deployments(network, "StateManager")
 }
 
-pub(crate) async fn run_l2_bridge_round_with_l1_provider(
+pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
     config: &BridgeProposeDaemonConfig,
     provider: &RpcProvider,
-    l1_provider: &impl Provider,
-    bridge: Address,
+    source_chain_index: u64,
+    proved_deposit_count: u32,
+    pending_deposit_count: u32,
     from_checkpoint: u64,
     to_checkpoint: u64,
     confirmation_lag_checkpoints: u64,
@@ -1997,17 +2024,6 @@ pub(crate) async fn run_l2_bridge_round_with_l1_provider(
         .unwrap_or_else(|| Path::new(DEFAULT_PROOF_DIR));
     let state_path = proof_dir.join("daemon_state.toml");
     propose_args.poll_timeout_secs = 0;
-    let deployments_network = config
-        .finalize
-        .deployments_network
-        .as_deref()
-        .unwrap_or(DEFAULT_DEPLOYMENTS_NETWORK);
-    let state_manager = resolve_state_manager_address(config)?;
-    let source_chain_index =
-        u64::from(crate::bridge::api_client::resolve_l1_chain_index(l1_provider, deployments_network, state_manager).await?);
-
-    let proved_deposit_count = fetch_proved_deposit_count(l1_provider, bridge).await?;
-    let pending_deposit_count = fetch_pending_deposit_count(l1_provider, bridge).await?;
     ensure!(
         pending_deposit_count >= proved_deposit_count,
         "pendingDepositCount is behind provedDepositCount: pending={} proved={}",
@@ -2108,8 +2124,6 @@ pub(crate) async fn run_l2_bridge_round_with_l1_provider(
             &config.services_url,
             source_chain_index,
             provider,
-            l1_provider,
-            bridge,
             &propose_args,
             from_checkpoint,
             to_checkpoint,
@@ -2562,8 +2576,6 @@ async fn build_l2_call_plan(
     services_url: &str,
     source_chain_index: u64,
     provider: &RpcProvider,
-    _l1_provider: &impl Provider,
-    _bridge: Address,
     propose_args: &ProposeWithdrawalsArgs,
     from_checkpoint: u64,
     to_checkpoint: u64,
@@ -2732,7 +2744,7 @@ async fn build_multichain_l2_plan(
     for chain in chains {
         let (proved, pending) = chain
             .l1
-            .with_retry("read_deposit_progress", 10, |url| {
+            .with_rpc_failover("read_deposit_progress", |url| {
                 let url = url.to_string();
                 async move {
                     let l1_provider = crate::bridge::l1_provider::connect_l1_readonly(
@@ -3242,12 +3254,12 @@ async fn chunk_deposit_batch_append_by_gas(
     chunks
 }
 
-async fn fetch_proved_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
+pub(crate) async fn fetch_proved_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
     let proved = crate::bridge::api_client::eth_call_u256(provider, bridge, provedDepositCountCall {}).await?;
     u32::try_from(proved).context("provedDepositCount exceeds u32")
 }
 
-async fn fetch_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
+pub(crate) async fn fetch_pending_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
     let pending = crate::bridge::api_client::eth_call_u256(provider, bridge, pendingDepositCountCall {}).await?;
     u32::try_from(pending).context("pendingDepositCount exceeds u32")
 }
@@ -5383,7 +5395,7 @@ mod tests {
 
     // ── inner-loop catch-up break (run_l2_bridge_round mid-round stop) ────
 
-    /// Mirrors the mid-loop guard in `run_l2_bridge_round_with_l1_provider`:
+    /// Mirrors the mid-loop guard in `run_l2_bridge_round_with_l1_snapshot`:
     /// while still in a normal round (`is_catchup_batch == false`), re-check the
     /// window against the latest planning checkpoint and break once the gap
     /// has crossed into catch-up. Catch-up rounds never take this path
@@ -6089,6 +6101,91 @@ deployments_network = "localhostBase"
         assert_eq!(config.chains.len(), 3);
         assert_eq!(config.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert!(config.chains.iter().all(|chain| chain.family == "evm"));
+    }
+
+    #[test]
+    fn legacy_urls_skip_the_default_when_finalize_providers_are_set() {
+        let provider = crate::bridge::rpc_providers::RpcProviderConfig {
+            name: "alchemy".into(),
+            url: "https://a".into(),
+            priority_weight: 10,
+            operator: String::new(),
+            quota_group: String::new(),
+        };
+        let providers_only = DaemonFinalizeConfig {
+            l1_rpc_providers: vec![provider.clone()],
+            ..DaemonFinalizeConfig::default()
+        };
+        assert!(legacy_rpc_urls(&providers_only).is_empty());
+
+        // An explicit l1_rpc_url next to providers is a real conflict and stays visible.
+        let both = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_providers: vec![provider],
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&both), vec!["https://z".to_string()]);
+    }
+
+    #[test]
+    fn legacy_urls_default_and_deduplicate_without_providers() {
+        assert_eq!(
+            legacy_rpc_urls(&DaemonFinalizeConfig::default()),
+            vec![DEFAULT_L1_RPC_URL.to_string()]
+        );
+        let finalize = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_fallback_url: Some("https://z".into()),
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&finalize), vec!["https://z".to_string()]);
+        let finalize = DaemonFinalizeConfig {
+            l1_rpc_url: Some("https://z".into()),
+            l1_rpc_fallback_url: Some("https://a".into()),
+            ..DaemonFinalizeConfig::default()
+        };
+        assert_eq!(legacy_rpc_urls(&finalize), vec!["https://z".to_string(), "https://a".to_string()]);
+    }
+
+    #[test]
+    fn chain_rpc_providers_take_precedence_and_legacy_urls_keep_order() {
+        let raw = r#"
+rpc_config = "config.json"
+services_url = "http://127.0.0.1:3000"
+withdraw_method_id = 1
+
+[[chains]]
+chain_index = 0
+network_id = "sepolia"
+deployments_network = "sepolia"
+rpc_urls = ["https://ignored"]
+[[chains.rpc_providers]]
+name = "alchemy"
+url = "https://a"
+priority_weight = 11
+[[chains.rpc_providers]]
+name = "infura"
+url = "https://i"
+
+[[chains]]
+chain_index = 1
+network_id = "bscTestnet"
+deployments_network = "bscTestnet"
+rpc_urls = ["https://z", "https://a"]
+"#;
+        let config: BridgeProposeDaemonConfig = toml::from_str(raw).unwrap();
+        let first = config.chains[0].effective_config(&config).unwrap().finalize;
+        assert_eq!(first.l1_rpc_url.as_deref(), Some("https://a"));
+        assert_eq!(
+            first.l1_rpc_providers.iter().map(|p| (p.name.as_str(), p.priority_weight)).collect::<Vec<_>>(),
+            vec![("alchemy", 11), ("infura", 10)]
+        );
+        let second = config.chains[1].effective_config(&config).unwrap().finalize;
+        assert_eq!(
+            second.l1_rpc_providers.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://z", "https://a"]
+        );
+        assert_eq!(second.l1_rpc_fallback_url, None);
     }
 
     fn write_temp_rpc_config(system_urls: &str) -> std::path::PathBuf {
