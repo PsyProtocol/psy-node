@@ -23,13 +23,13 @@ impl CallOutcome {
         !matches!(self, Self::Success | Self::Application)
     }
 
-    /// Rate-limit failure: marks the quota group as failed (spec §5.1).
+    /// Rate-limit classification for diagnostics; routing remains list-ordered.
     pub fn is_quota_failure(self) -> bool {
         matches!(self, Self::RateLimited)
     }
 
-    /// Infrastructure failure: marks the operator (and its quota group) as
-    /// failed (spec §5.1).
+    /// Infrastructure failure classification; sibling endpoints retain their
+    /// own health and cooldown state.
     pub fn is_infra_failure(self) -> bool {
         matches!(self, Self::Timeout | Self::Transport | Self::Server | Self::InvalidResponse)
     }
@@ -47,6 +47,7 @@ impl CallOutcome {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HealthPolicy {
+    pub failure_cooldown: Duration,
     pub half_life: Duration,
     pub quarantine_after: u32,
     pub quarantine_for: Duration,
@@ -68,6 +69,7 @@ pub(crate) struct Health {
     penalty_at: Option<Instant>,
     consecutive_failures: u32,
     quarantined_until: Option<Instant>,
+    retry_after: Option<Instant>,
     probe_in_flight: bool,
     latency_ewma: Option<Duration>,
 }
@@ -87,15 +89,16 @@ impl Health {
         self.quarantined_until.is_some_and(|until| now < until)
     }
 
-    /// Past the quarantine deadline but not yet proven healthy.
-    fn on_probation(&self, now: Instant) -> bool {
-        self.quarantined_until.is_some_and(|until| now >= until)
+    /// Past the failure cooldown (and quarantine, if any), awaiting validation.
+    pub(crate) fn on_probation(&self, now: Instant) -> bool {
+        self.retry_after.is_some_and(|until| now >= until) && !self.quarantined(now)
     }
 
     /// Whether normal selection may route here. A provider on probation
     /// accepts one probe at a time.
     pub(crate) fn available(&self, now: Instant) -> bool {
-        !(self.quarantined(now) || self.on_probation(now) && self.probe_in_flight)
+        !(self.quarantined(now) || self.retry_after.is_some_and(|until| now < until)
+            || self.probe_in_flight)
     }
 
     /// Returns true when this attempt is the probe for a provider on probation.
@@ -134,6 +137,14 @@ impl Health {
         }
         if !outcome.is_failure() {
             self.consecutive_failures = 0;
+            self.retry_after = None;
+            // A successful limited recovery trial is fresh evidence. Without
+            // this, a recovered earlier entry would immediately lose to an
+            // untried later entry's synthetic full-health score.
+            if probe && outcome == CallOutcome::Success {
+                self.penalty = 0.0;
+                self.penalty_at = Some(now);
+            }
             return if self.quarantined_until.take().is_some() {
                 Transition::Restored
             } else {
@@ -142,6 +153,7 @@ impl Health {
         }
         self.penalty = self.penalty(now, policy.half_life) + outcome.penalty();
         self.penalty_at = Some(now);
+        self.retry_after = Some(now + policy.failure_cooldown);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         // Any failure while quarantined or on probation renews the quarantine.
         if self.quarantined_until.is_some()
@@ -195,6 +207,7 @@ mod tests {
 
     fn policy() -> HealthPolicy {
         HealthPolicy {
+            failure_cooldown: Duration::from_secs(30),
             half_life: Duration::from_secs(60),
             quarantine_after: 5,
             quarantine_for: Duration::from_secs(30 * 60),

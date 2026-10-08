@@ -8,9 +8,9 @@ psy-services or prove-proxy HTTP calls. Each configured L1 chain owns one
 Chains never share health state. It replaces the earlier per-request
 primary/backup cooldown policy.
 
-Full design: `psy-memory/rpc_provider_pool/design.md`. That document is the
-source of truth for scoring, quarantine and selection; this page covers
-configuration, log lines and known risks for this delivery.
+The ordered adaptive policy below supersedes the earlier weight and
+failure-domain routing in `psy-memory/rpc_provider_pool/design.md`.
+This is a local candidate change, not an online rollout.
 
 ## Configuration
 
@@ -20,22 +20,18 @@ Per EVM chain in the multichain daemon config:
 [[chains.rpc_providers]]
 name = "alchemy-jason"
 url = "https://..."
-weight = 11   # optional alias of priority_weight (default 10); set only one
+weight = 11   # legacy metadata only; no longer overrides list order
 operator = "alchemy"                   # optional
 quota_group = "alchemy-account-jason"  # optional
 ```
 
 - `rpc_providers` takes precedence when present on a chain.
-- `weight` is accepted as an alias of `priority_weight` (same field; set one
-  or the other, not both).
+- `weight` is accepted as an alias of `priority_weight` for config compatibility
+  (same field; set one or the other, not both). Neither affects selection now.
 - The existing `rpc_urls = [...]` stays valid: each URL becomes a provider
-  with weight 10 and a generated name (`<chain>-rpc-<index>`). Declaration
-  order decides only the first attempt (every generated provider starts at
-  weight 10, so Best falls back to config order); after a failure within a
-  request, the next provider is chosen by failure domain (operator/quota
-  group; see Routing order below), not simply the next one in the list. See
-  "Upgrading existing configs" below for what this changes for an unchanged
-  legacy config.
+  with legacy weight 10 and a generated name (`<chain>-rpc-<index>`).
+  Declaration order expresses preference initially and whenever health scores
+  are within tolerance. See Routing order and Upgrading existing configs below.
 - Duplicate URLs are dropped, keeping the first occurrence. The check is a
   plain string comparison on the trimmed URL, not a normalized comparison.
 
@@ -62,13 +58,10 @@ the URL (see below).
 Each provider entry may also set `operator` and `quota_group` (spec
 §5.1, §7.2.1):
 
-- `operator`: the shared infrastructure failure domain, e.g. `alchemy`,
-  `infura`, `nodereal`. A failure classified as an infrastructure failure
-  (Timeout, Transport, Server, InvalidResponse) fails over away from this
-  provider's whole operator first.
+- `operator`: diagnostic shared infrastructure label, e.g. `alchemy`,
+  `infura`, `nodereal`. It does not override the ordered health selection.
 - `quota_group`: the shared rate-limit/credit domain, e.g. an account or
-  subscription. A `RateLimited` failure fails over away from this provider's
-  quota group first.
+  subscription. It is diagnostic metadata, not a routing tier.
 - Health, penalties, consecutive failures and quarantine stay per provider.
   A failure never penalizes a sibling provider that shares the same operator
   or quota group.
@@ -99,24 +92,41 @@ Each provider entry may also set `operator` and `quota_group` (spec
   providers, set the same explicit `quota_group` value on every member of
   the group.
 
-**Routing order** within one request (spec §5.1): every untried provider is
-given a tier — lower is tried first — and Best (tolerance, then weight, then
-config order) applies within the lowest available tier:
+**Routing order** uses health and the declared list:
 
-- After an infrastructure failure (Timeout, Transport, Server,
-  InvalidResponse): a different operator first; then the same operator with
-  a different quota group; then the same quota group.
-- After a `RateLimited` failure: a different quota group at a different
-  operator first; then a different quota group at the same operator; then
-  the same quota group.
-- Application errors return immediately (no failover, no penalty) and mark
-  nothing.
-- On the first attempt every tier is equal, so plain Best applies.
-- No sibling penalties: a failure only ever affects the failed provider's
-  own health/quarantine state, never a same-operator or same-quota-group
-  sibling's.
-- A lower-tier provider beats a healthier or higher-weight provider in a
-  worse tier, as long as it is not quarantined (spec §5.1).
+- New providers start equally healthy, so the first entry is selected.
+- Normally select the earliest eligible entry within two health points of
+  the healthiest entry. Scores reflect availability failures, not latency;
+  EWMA latency remains observational. Healthy traffic does not fan out to
+  benchmark every endpoint.
+- A failure lowers only that provider's score and starts a 30-second cooldown.
+  A request marked safe to replay tries untried eligible candidates; an
+  unsafe request still gets at most one attempt.
+- After an attempt fails, an earlier failed entry whose cooldown has expired
+  gets a limited recovery trial before moving farther down the list. If it
+  also fails, continue to the next candidate. Each entry is attempted at
+  most once per logical request, within the total deadline.
+- While the current endpoint works, an earlier failed entry can be selected
+  for a trial once its decayed penalty puts it within the normal tolerance.
+  Cooldown expiry alone is not a promise of an immediate probe: probes are
+  driven by incoming requests, not a background loop.
+- Only one recovery trial per provider may be in flight. Success clears its
+  failure streak and penalty, so an earlier recovered provider can remain
+  preferred. Cancellation releases the slot without adding a penalty.
+- Business errors return immediately without failover or penalty. A valid
+  JSON-RPC response carrying a revert or invalid-params error still confirms
+  endpoint recovery in the Relayer adapter. The generic pool's separate
+  `Application` outcome clears cooldown without resetting historical penalty.
+- Five consecutive failures quarantine a provider for 30 minutes. A failed
+  post-quarantine trial renews quarantine. If every untried provider is
+  cooling down, quarantined or already being probed, return the last attempt
+  error (or `Unavailable` if none ran); never bypass those protections.
+
+Example: A fails and B succeeds. After A's cooldown, if B fails, try A;
+if A still fails, try C, then D as needed. A successful candidate returns
+the current request immediately; subsequent requests use the updated scores.
+The pool does not replay a business workflow or create a second transaction
+to compare endpoints. Raw-transaction retries keep the exact signed bytes.
 
 **Startup WARN:** once per pool (chain), if every provider ends up with the
 same operator (after defaults/inference), a WARN logs `label` and
@@ -126,38 +136,16 @@ Never includes a URL.
 
 ### Upgrading existing configs
 
-An unchanged legacy config (`rpc_urls`, or `l1_rpc_url`/`l1_rpc_fallback_url`)
-now gets an inferred `operator` per URL and a `quota_group` equal to each
-provider's generated name (see Defaults above). The failure-domain routing
-in Routing order applies to it exactly as it does to an explicit
-`rpc_providers` list, with these consequences:
+Both legacy URL lists and explicit provider tables use the same new policy.
+Reorder the list to express preference (for example local, public, paid);
+old weights and operator/quota labels remain parseable and visible in snapshots,
+but no longer override that order. Shared-account keys are still not independent
+backups: selecting meaningful alternatives is the operator's responsibility.
 
-- **Failover order can change.** Example: `rpc_urls = [alchemy key A,
-  alchemy key B, infura]`. Before, a timeout/connection failure or a 5xx on
-  key A always went next to key B (plain declaration order), and so did a
-  rate limit on key A. Now: an infrastructure failure (Timeout, Transport,
-  Server, InvalidResponse) on key A goes to infura first, not key B —
-  infura is a different operator (`infura` vs the inferred `alchemy` shared
-  by keys A and B). A rate limit on key A also goes to infura first: a
-  different quota group at a different operator is preferred over a
-  different quota group at the same operator, and infura is both a
-  different quota group and a different operator from key A, while key B is
-  only a different quota group.
-- **Single-URL chains, and chains whose URLs all share one inferred
-  operator, log the same-operator WARN at every startup** (see Startup WARN
-  above) — this is expected, not a new problem, and fires even for a
-  single-provider chain.
-- **Two local nodes both reachable at `127.0.0.1`** (e.g. on different
-  ports) infer the same operator (the whole host, `127.0.0.1`), so a
-  failure on one is treated as same-operator for routing purposes even
-  though they are different processes.
-- **Legacy keys cannot override inference.** `rpc_urls`, `l1_rpc_url` and
-  `l1_rpc_fallback_url` have no field to set `operator`/`quota_group`
-  explicitly, so the inference heuristic always applies to them — including
-  its multi-part public-suffix caveat (e.g. a host under `co.uk`, see
-  Defaults above). Migrate the affected chain to `rpc_providers` with an
-  explicit `operator`/`quota_group` per entry to fix or opt out of
-  inference.
+This changes single-provider behavior too: a failed provider is not hammered
+by every subsequent request during cooldown. Callers must handle temporary
+unavailability without discarding pending business work. This candidate does
+not add durable transaction tracking or change daemon scheduling.
 
 ## v1 parameters
 
@@ -171,11 +159,12 @@ in Routing order applies to it exactly as it does to an explicit
 | Penalty: Success / Application | 0 |
 | Penalty half-life | 60s |
 | Selection tolerance | 2 (health points) |
+| Cooldown after each failure | 30s |
 | Quarantine after | 5 consecutive failures |
 | Quarantine duration | 30 minutes |
 | Attempt timeout | 15s |
 | Total request timeout | 30s |
-| Max attempts | 3 (capped at provider count) |
+| Max attempts | Provider count by default, each at most once; optional lower PoolConfig cap |
 | Latency EWMA alpha | 0.2 (observational only; does not affect health) |
 
 These are tunable v1 guesses. Adjust from observed production logs.
@@ -183,24 +172,20 @@ These are tunable v1 guesses. Adjust from observed production logs.
 ## Logs to watch
 
 - `RPC provider attempt failed` (WARN) — fields: `pool` (chain name),
-  `provider`, `outcome`, `method`, `failover` (whether another attempt will
-  run). Emitted on every failed attempt.
+  `provider`, `outcome`, `method`, `failover` (whether policy and budget permit
+  another attempt). Emitted on every failed attempt.
 - `RPC provider quarantined` (INFO, field `minutes`) — a provider entered or
-  renewed quarantine: 5 consecutive failures triggered it, a failed
-  post-quarantine probe renewed it, or a least-bad fallback attempt failed on
-  a provider that was already quarantined. The provider stops receiving
+  renewed quarantine: 5 consecutive failures triggered it or a failed
+  post-quarantine probe renewed it. The provider stops receiving
   normal traffic for `minutes` (30 by default).
-- `RPC provider restored` (INFO) — a quarantined provider succeeded and its
-  quarantine was lifted: either a post-quarantine probe succeeded, or a
-  least-bad fallback attempt succeeded on a still-quarantined provider.
+- `RPC provider restored` (INFO) — a post-quarantine trial returned a
+  non-provider-fault result and its quarantine was lifted.
 
-**Operator note:** a pool where every provider is quarantined keeps serving
-traffic through the least-bad provider (the selection fallback picks the
-best-scoring provider even when none is technically "available"), so
-`RPC provider quarantined` log lines alone do not mean the chain is down.
-Every failed attempt logs `RPC provider attempt failed` (WARN), including
-the final attempt in a request (`failover=false` on that one) — a WARN by
-itself is not necessarily an operator-actionable event.
+**Operator note:** all endpoints unavailable produces a bounded error, not
+forced traffic through a quarantined endpoint. Every failed attempt logs
+`RPC provider attempt failed` (WARN). `failover=true` means the policy and
+budget permit another attempt, not that an eligible endpoint is guaranteed
+to remain available. A WARN alone is not necessarily an actionable outage.
 
 Logs and errors returned to callers never contain provider URLs, request
 parameters or provider response bodies. Provider URLs can embed API keys.
@@ -215,7 +200,7 @@ need that data and it never contains a URL.
 - `ProviderPool::new` returns `Result<Self, PoolBuildError>`: an empty
   provider list or a duplicate provider name is rejected at construction,
   not at call time.
-- After a provider's quarantine expires, only one probe attempt is in flight
+- After a provider's cooldown or quarantine expires, only one probe attempt is in flight
   at a time. Concurrent requests during that window treat the provider as
   unavailable and go to another provider; they do not each send their own
   probe. If the probing attempt is cancelled before it completes, its slot

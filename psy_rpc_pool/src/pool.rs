@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     future::Future,
     sync::{Mutex, MutexGuard, PoisonError},
     time::Duration,
@@ -17,15 +16,16 @@ pub const DEFAULT_PRIORITY_WEIGHT: i32 = 10;
 pub struct ProviderSpec<C> {
     /// Log label. Must not be a URL: provider URLs can embed API keys.
     pub name: String,
+    /// Legacy metadata; selection uses health then declaration order.
     pub priority_weight: i32,
     /// Shared infrastructure failure domain, e.g. `alchemy`, `infura`.
     /// Defaults to `name` (unnormalized); an explicit value is trimmed and
     /// lowercased. Defaults and explicit values share one namespace, so an
     /// unlabeled provider can coincide with another provider's explicit
-    /// label if their names collide after normalization. See spec §5.1.
+    /// label if their names collide after normalization. Diagnostic only.
     pub operator: String,
     /// Shared rate-limit/credit domain, e.g. an account or subscription.
-    /// Same default and namespace rules as `operator`. See spec §5.1.
+    /// Same default and namespace rules as `operator`. Diagnostic only.
     pub quota_group: String,
     pub client: C,
 }
@@ -83,6 +83,8 @@ pub enum RetryPolicy {
 
 #[derive(Debug)]
 pub enum PoolError<E> {
+    /// Every eligible provider is cooling down or has a recovery probe in flight.
+    Unavailable,
     /// The last attempted provider's error.
     Provider(E),
     /// The last attempt exceeded its time budget.
@@ -111,7 +113,9 @@ pub struct PoolConfig {
     pub attempt_timeout: Duration,
     pub total_timeout: Duration,
     pub max_attempts: usize,
-    /// Health gap within which static priority decides.
+    /// Minimum wait after each provider failure before a recovery trial.
+    pub failure_cooldown: Duration,
+    /// Health gap within which declaration order decides.
     pub tolerance: f64,
     pub half_life: Duration,
     pub quarantine_after: u32,
@@ -124,7 +128,8 @@ impl Default for PoolConfig {
         Self {
             attempt_timeout: Duration::from_secs(15),
             total_timeout: Duration::from_secs(30),
-            max_attempts: 3,
+            max_attempts: usize::MAX,
+            failure_cooldown: Duration::from_secs(30),
             tolerance: 2.0,
             half_life: Duration::from_secs(60),
             quarantine_after: 5,
@@ -137,6 +142,7 @@ impl Default for PoolConfig {
 impl PoolConfig {
     fn health_policy(&self) -> HealthPolicy {
         HealthPolicy {
+            failure_cooldown: self.failure_cooldown,
             half_life: self.half_life,
             quarantine_after: self.quarantine_after,
             quarantine_for: self.quarantine_for,
@@ -245,16 +251,14 @@ impl<C: Clone> ProviderPool<C> {
         let deadline = Instant::now() + self.config.total_timeout;
         let max_attempts = self.config.max_attempts.clamp(1, self.providers.len());
         let mut tried = vec![false; self.providers.len()];
-        // Per-request failure domains (spec §5.1): which operators had an
-        // infrastructure failure, which quota groups are rate-limited or
-        // behind an infra failure, and which operators were touched by any
-        // failure at all (infra or quota).
-        let mut infra_failed_operators = HashSet::new();
-        let mut failed_quota_groups = HashSet::new();
-        let mut touched_operators = HashSet::new();
         let mut last = None;
         for attempt in 1..=max_attempts {
-            let mut guard = self.begin(&tried, &infra_failed_operators, &failed_quota_groups, &touched_operators);
+            if Instant::now() >= deadline {
+                return last.unwrap_or(Err(PoolError::Timeout));
+            }
+            let Some(mut guard) = self.begin(&tried) else {
+                return last.unwrap_or(Err(PoolError::Unavailable));
+            };
             let index = guard.index;
             tried[index] = true;
             let started = Instant::now();
@@ -272,14 +276,6 @@ impl<C: Clone> ProviderPool<C> {
                 return result;
             }
             let provider = &self.providers[index];
-            if outcome.is_infra_failure() {
-                infra_failed_operators.insert(provider.operator.clone());
-                touched_operators.insert(provider.operator.clone());
-                failed_quota_groups.insert(provider.quota_group.clone());
-            } else if outcome.is_quota_failure() {
-                failed_quota_groups.insert(provider.quota_group.clone());
-                touched_operators.insert(provider.operator.clone());
-            }
             let stop = policy == RetryPolicy::NoRetry || attempt == max_attempts || now >= deadline;
             tracing::warn!(
                 pool = %self.label,
@@ -302,10 +298,7 @@ impl<C: Clone> ProviderPool<C> {
     fn begin(
         &self,
         tried: &[bool],
-        infra_failed_operators: &HashSet<String>,
-        failed_quota_groups: &HashSet<String>,
-        touched_operators: &HashSet<String>,
-    ) -> AttemptGuard<'_, C> {
+    ) -> Option<AttemptGuard<'_, C>> {
         let now = Instant::now();
         let mut health = self.lock();
         let candidates: Vec<Candidate> = health
@@ -313,24 +306,25 @@ impl<C: Clone> ProviderPool<C> {
             .enumerate()
             .filter(|(index, _)| !tried[*index])
             .map(|(index, h)| {
-                let provider = &self.providers[index];
                 Candidate {
                     index,
                     health: h.health(now, self.config.half_life),
                     available: h.available(now),
-                    priority_weight: provider.priority_weight,
-                    tier: (
-                        infra_failed_operators.contains(&provider.operator),
-                        failed_quota_groups.contains(&provider.quota_group),
-                        touched_operators.contains(&provider.operator),
-                    ),
                 }
             })
             .collect();
-        let index = select_best(&candidates, self.config.tolerance)
-            .expect("attempts never exceed the provider count");
+        let best = select_best(&candidates, self.config.tolerance)?;
+        // After the current choice fails, trial an earlier failed provider
+        // whose cooldown has elapsed before moving farther down the list.
+        // Reservation under the same lock limits it to one concurrent trial.
+        let index = if tried.iter().any(|tried| *tried) {
+            candidates.iter().filter(|c| c.available && c.index < best
+                && health[c.index].on_probation(now)).map(|c| c.index).min().unwrap_or(best)
+        } else {
+            best
+        };
         let probe = health[index].begin_attempt(now);
-        AttemptGuard { pool: self, index, probe, recorded: false }
+        Some(AttemptGuard { pool: self, index, probe, recorded: false })
     }
 
     fn record(
@@ -446,7 +440,7 @@ mod tests {
     /// Tolerance above 100 makes static priority always win among available
     /// providers, so one provider can be driven into quarantine.
     fn sticky() -> PoolConfig {
-        PoolConfig { tolerance: 1000.0, ..PoolConfig::default() }
+        PoolConfig { tolerance: 1000.0, failure_cooldown: Duration::ZERO, ..PoolConfig::default() }
     }
 
     async fn call(
@@ -480,11 +474,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn healthy_pool_uses_highest_weight_then_config_order() {
+    async fn healthy_pool_uses_config_order_even_with_higher_later_weights() {
         let world = World::default();
         let pool = pool(&[("a", 10), ("b", 11), ("c", 11)]);
-        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "b");
-        assert_eq!(world.calls(), vec!["b"]);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a");
+        assert_eq!(world.calls(), vec!["a"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -500,6 +494,101 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a");
         assert_eq!(world.calls(), vec!["a", "b", "b", "a"]);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a");
+        assert_eq!(health_of(&pool, "a").health, 100.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_can_reach_fourth_provider_without_repeating_any() {
+        let world = World::default();
+        let pool = pool(&[("a", 1), ("b", 100), ("c", 100), ("d", 100)]);
+        for name in ["a", "b", "c"] { world.set(name, Mode::Fail(CallOutcome::Server)); }
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "d");
+        assert_eq!(world.calls(), vec!["a", "b", "c", "d"]);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "d");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_current_trials_earlier_cooled_candidate_before_later_entries() {
+        let world = World::default();
+        let pool = pool(&[("a", 10), ("b", 10), ("c", 10), ("d", 10)]);
+        world.set("a", Mode::Fail(CallOutcome::Server));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "b");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        world.set("b", Mode::Fail(CallOutcome::Server));
+        world.set("c", Mode::Fail(CallOutcome::Server));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "d");
+        assert_eq!(world.calls(), vec!["a", "b", "b", "a", "c", "d"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovered_earlier_candidate_can_rescue_a_failed_current() {
+        let world = World::default();
+        let pool = pool(&[("a", 10), ("b", 10), ("c", 10)]);
+        world.set("a", Mode::Fail(CallOutcome::Server));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "b");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        world.set("a", Mode::Ok);
+        world.set("b", Mode::Fail(CallOutcome::Server));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a");
+        assert_eq!(world.calls(), vec!["a", "b", "b", "a"]);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a");
+        assert_eq!(health_of(&pool, "a").health, 100.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_failure_cools_down_even_when_every_provider_failed() {
+        let world = World::default();
+        let pool = pool(&[("a", 10)]);
+        world.set("a", Mode::Fail(CallOutcome::Server));
+        call(&pool, &world, Safe).await.unwrap_err();
+        world.set("a", Mode::Ok);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(matches!(call(&pool, &world, Safe).await, Err(PoolError::Unavailable)));
+        assert_eq!(world.calls(), vec!["a"]);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sole_provider_recovery_does_not_fan_out_and_cancel_releases_slot() {
+        let world = World::default();
+        let pool = pool(&[("a", 10)]);
+        world.set("a", Mode::Fail(CallOutcome::Server));
+        call(&pool, &world, Safe).await.unwrap_err();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        world.set("a", Mode::Hang);
+        let (p, w) = (pool.clone(), world.clone());
+        let probe = tokio::spawn(async move { call(&p, &w, Safe).await });
+        while world.calls().len() < 2 { tokio::task::yield_now().await; }
+        for _ in 0..3 {
+            assert!(matches!(call(&pool, &world, Safe).await, Err(PoolError::Unavailable)));
+        }
+        assert_eq!(world.calls(), vec!["a", "a"]);
+        probe.abort();
+        assert!(probe.await.unwrap_err().is_cancelled());
+        world.set("a", Mode::Ok);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_request_budget_never_invokes_transport() {
+        let world = World::default();
+        let pool = pool_with(&[("a", 10)], PoolConfig { total_timeout: Duration::ZERO, ..PoolConfig::default() });
+        assert!(matches!(call(&pool, &world, Safe).await, Err(PoolError::Timeout)));
+        assert!(world.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn separate_chain_pools_do_not_share_failure_state() {
+        let world = World::default();
+        let first = pool(&[("a", 10)]);
+        let second = pool(&[("a", 10)]);
+        world.set("a", Mode::Fail(CallOutcome::Server));
+        call(&first, &world, Safe).await.unwrap_err();
+        world.set("a", Mode::Ok);
+        assert_eq!(call(&second, &world, Safe).await.unwrap(), "a");
+        assert!(matches!(call(&first, &world, Safe).await, Err(PoolError::Unavailable)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -525,9 +614,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn attempts_are_capped_at_three_and_last_error_is_returned() {
+    async fn explicit_attempt_cap_and_last_error_are_preserved() {
         let world = World::default();
-        let pool = pool(&[("a", 15), ("b", 14), ("c", 13), ("d", 12), ("e", 11)]);
+        let pool = pool_with(&[("a", 15), ("b", 14), ("c", 13), ("d", 12), ("e", 11)],
+            PoolConfig { max_attempts: 3, ..PoolConfig::default() });
         for name in ["a", "b", "c", "d", "e"] { world.set(name, Mode::Fail(CallOutcome::Server)); }
         world.set("c", Mode::Fail(CallOutcome::RateLimited));
         let error = call(&pool, &world, Safe).await.unwrap_err();
@@ -581,13 +671,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn all_quarantined_still_serves_from_least_bad() {
+    async fn all_quarantined_waits_for_recovery_instead_of_hammering() {
         let world = World::default();
-        let pool = pool(&[("a", 10)]);
+        let pool = pool_with(&[("a", 10)], sticky());
         world.set("a", Mode::Fail(CallOutcome::Server));
         for _ in 0..5 { call(&pool, &world, NoRetry).await.unwrap_err(); }
         assert!(health_of(&pool, "a").quarantined);
         world.set("a", Mode::Ok);
+        assert!(matches!(call(&pool, &world, NoRetry).await, Err(PoolError::Unavailable)));
+        assert_eq!(world.calls().len(), 5);
+        tokio::time::advance(Duration::from_secs(1800)).await;
         assert_eq!(call(&pool, &world, NoRetry).await.unwrap(), "a");
         assert!(!health_of(&pool, "a").quarantined);
     }
@@ -659,7 +752,7 @@ mod tests {
         assert_eq!(a.health, 100.0);
     }
 
-    // -- Failure domains: operator and quota group (spec §5.1) --------------
+    // Operator/quota labels remain diagnostic metadata, not routing tiers.
 
     /// The trio used across the failure-domain tests below.
     fn trio() -> Arc<ProviderPool<&'static str>> {
@@ -671,35 +764,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn infra_failure_prefers_a_different_operator() {
+    async fn infra_failure_preserves_order_instead_of_skipping_operators() {
         let world = World::default();
         let pool = trio();
         world.set("a1", Mode::Fail(CallOutcome::Transport));
-        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "i1");
-        assert_eq!(world.calls(), vec!["a1", "i1"]);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
+        assert_eq!(world.calls(), vec!["a1", "a2"]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn quota_failure_prefers_a_different_operator_and_quota_group() {
+    async fn quota_failure_preserves_order_instead_of_skipping_operators() {
         let world = World::default();
         let pool = trio();
         world.set("a1", Mode::Fail(CallOutcome::RateLimited));
-        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "i1");
-        assert_eq!(world.calls(), vec!["a1", "i1"]);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
+        assert_eq!(world.calls(), vec!["a1", "a2"]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_quarantined_operator_is_skipped_for_an_available_worse_tier() {
+    async fn a_quarantined_provider_is_skipped_for_an_available_sibling() {
         let world = World::default();
-        // Guards against taking the lowest tier over ALL untried candidates
-        // (quarantined or not): i1 is in the best tier (infura, untouched)
-        // but quarantined, so the available a2 (worse tier) must still win.
-        // i1 is given the highest weight here (opposite of `trio()`) and a
-        // huge tolerance (as in `sticky()`) so plain NoRetry calls keep
-        // targeting it despite its health dropping, priming its quarantine;
-        // a1/a2's relative order (a1 > a2) is unaffected either way.
+        // Drive the first entry into quarantine, then preserve the order of
+        // the remaining candidates irrespective of their operator labels.
         let pool = pool_labeled_with(
-            &[("a1", 11, "alchemy", "qa1"), ("a2", 10, "alchemy", "qa2"), ("i1", 12, "infura", "qi1")],
+            &[("i1", 12, "infura", "qi1"), ("a1", 11, "alchemy", "qa1"), ("a2", 10, "alchemy", "qa2")],
             sticky(),
         );
         world.set("i1", Mode::Fail(CallOutcome::Server));
@@ -712,19 +800,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn two_infra_failures_exhaust_operators_before_the_same_operator_serves() {
+    async fn two_infra_failures_reach_the_third_entry_in_order() {
         let world = World::default();
         let pool = trio();
         // Server (not Timeout) per the brief: two 15s timeouts plus the 30s
         // total deadline would cut off the third attempt.
         world.set("a1", Mode::Fail(CallOutcome::Server));
-        world.set("i1", Mode::Fail(CallOutcome::Server));
-        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
-        assert_eq!(world.calls(), vec!["a1", "i1", "a2"]);
+        world.set("a2", Mode::Fail(CallOutcome::Server));
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "i1");
+        assert_eq!(world.calls(), vec!["a1", "a2", "i1"]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn quota_failure_prefers_a_different_quota_group_over_a_sibling_in_the_same_group() {
+    async fn quota_failure_does_not_override_declared_sibling_order() {
         let world = World::default();
         let pool = pool_labeled(&[
             ("a1", 12, "alchemy", "qa1"),
@@ -732,16 +820,12 @@ mod tests {
             ("a2", 10, "alchemy", "qa2"),
         ]);
         world.set("a1", Mode::Fail(CallOutcome::RateLimited));
-        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
-        assert_eq!(world.calls(), vec!["a1", "a2"]);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a1b");
+        assert_eq!(world.calls(), vec!["a1", "a1b"]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn infra_failure_prefers_a_different_quota_group_at_the_same_operator_over_the_same_quota_group() {
-        // No other operator is present, so infra tiering is exercised
-        // within one operator: step 2 (same operator, different quota
-        // group: a2) must still beat step 3 (same quota group: a1b), even
-        // though a1b's higher weight would win under plain Best.
+    async fn infra_failure_does_not_override_declared_sibling_order() {
         let world = World::default();
         let pool = pool_labeled(&[
             ("a1", 12, "alchemy", "qa1"),
@@ -749,8 +833,8 @@ mod tests {
             ("a2", 10, "alchemy", "qa2"),
         ]);
         world.set("a1", Mode::Fail(CallOutcome::Server));
-        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a2");
-        assert_eq!(world.calls(), vec!["a1", "a2"]);
+        assert_eq!(call(&pool, &world, Safe).await.unwrap(), "a1b");
+        assert_eq!(world.calls(), vec!["a1", "a1b"]);
     }
 
     #[tokio::test(start_paused = true)]

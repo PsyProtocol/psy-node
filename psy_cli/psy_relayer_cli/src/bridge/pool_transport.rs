@@ -33,6 +33,7 @@ impl PoolTransport {
             .await
             .map_err(|error| match error {
                 PoolError::Provider(error) => redact(error),
+                PoolError::Unavailable => TransportErrorKind::custom_str("L1 RPC providers cooling down or recovery probe in flight"),
                 PoolError::Timeout => TransportErrorKind::custom_str("L1 RPC attempt timed out"),
             })
     }
@@ -297,6 +298,47 @@ mod tests {
         mocks[1].fail(429);
         rpc.call(packet("eth_call")).await.unwrap();
         assert_eq!(mocks.iter().map(Mock::count).collect::<Vec<_>>(), vec![1, 1, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_attempt_budget_can_reach_fourth_provider() {
+        let (mut rpc, mocks) = fixture_n(4);
+        for mock in &mocks[..3] { mock.fail(503); }
+        rpc.call(packet("eth_blockNumber")).await.unwrap();
+        assert_eq!(mocks.iter().map(Mock::count).collect::<Vec<_>>(), vec![1, 1, 1, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooled_earlier_provider_rescues_failed_current_and_stays_preferred() {
+        let (mut rpc, mocks) = fixture_n(3);
+        mocks[0].fail(503);
+        rpc.call(packet("eth_blockNumber")).await.unwrap();
+        assert_eq!(mocks.iter().map(Mock::count).collect::<Vec<_>>(), vec![1, 1, 0]);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        mocks[0].recover();
+        mocks[1].fail(503);
+        rpc.call(packet("eth_blockNumber")).await.unwrap();
+        assert_eq!(mocks.iter().map(Mock::count).collect::<Vec<_>>(), vec![2, 2, 0]);
+        rpc.call(packet("eth_blockNumber")).await.unwrap();
+        assert_eq!(mocks.iter().map(Mock::count).collect::<Vec<_>>(), vec![3, 2, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_failed_endpoints_wait_for_cooldown_without_more_rpc_calls() {
+        let (mut rpc, p, b) = fixture();
+        p.fail(503);
+        b.fail(503);
+        assert!(rpc.call(packet("eth_call")).await.is_err());
+        p.recover();
+        b.recover();
+        for _ in 0..10 {
+            let error = rpc.call(packet("eth_call")).await.unwrap_err();
+            assert!(error.to_string().contains("cooling down"));
+        }
+        assert_eq!((p.count(), b.count()), (1, 1));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        rpc.call(packet("eth_call")).await.unwrap();
+        assert_eq!((p.count(), b.count()), (2, 1));
     }
 
     #[tokio::test(start_paused = true)]
