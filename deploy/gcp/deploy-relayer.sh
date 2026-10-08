@@ -37,6 +37,7 @@ if multichain_enabled; then
   primary_chain="$(multichain_primary_chain)"
   RELAYER_DEPLOYMENTS_NETWORK="$(jq -r '.network' <<<"$primary_chain")"
   RELAYER_LOCAL_DEPLOYMENTS_DIR="$PARTH_DIR/psy-contracts/deployments/$RELAYER_DEPLOYMENTS_NETWORK"
+  # Preserve an explicit RPC override only after schema and canonical registry checks.
   RELAYER_CHAINS_JSON="$(multichain_relayer_chains_json)"
 fi
 

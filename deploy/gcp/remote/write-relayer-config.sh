@@ -1,6 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+validate_relayer_chains() {
+  # Suppress parser diagnostics too: malformed JSON can contain authenticated URLs.
+  jq -es '
+    def text: type == "string" and (explode | all(.[]; . >= 32 and . != 127));
+    def url: text and test("^https?://[^[:space:]]+$");
+    def weight: type == "number" and floor == . and . >= -2147483648 and . <= 2147483647;
+    def provider:
+      type == "object"
+      and ((keys - ["name", "url", "operator", "quota_group", "priority_weight", "weight"]) | length == 0)
+      and (.url | url)
+      and (to_entries | all(.[];
+        if .key == "name" or .key == "operator" or .key == "quota_group" then (.value | text) else true end));
+    def providers:
+      type == "array" and all(.[];
+        provider
+        and (if has("priority_weight") then (.priority_weight | weight) else true end)
+        and (if has("weight") then (.weight | weight) else true end)
+        and (has("priority_weight") and has("weight") | not));
+    length == 1 and (.[0] |
+      type == "array" and length >= 2
+      and all(.[];
+        type == "object" and .family == "evm"
+        and (.chain_index | type == "number" and floor == . and . >= 0 and . <= 255)
+        and (.network_id | text and length > 0)
+        and (.deployments_network | text and length > 0)
+        and (if has("rpc_urls") then (.rpc_urls | type == "array" and all(.[]; url)) else true end)
+        and (if has("rpc_providers") then (.rpc_providers | providers) else true end)
+        and (((.rpc_urls // []) | length) > 0 or ((.rpc_providers // []) | length) > 0))
+      and ([.[].chain_index] | length == (unique | length)))
+  ' <<<"${RELAYER_CHAINS_JSON:-}" >/dev/null 2>&1 || {
+    echo "invalid RELAYER_CHAINS_JSON" >&2
+    return 1
+  }
+}
+
+# Local deployment preflight reuses the exact writer schema without any writes.
+if [ "${1:-}" = "--validate-chains" ] && [ "$#" -eq 1 ]; then
+  validate_relayer_chains
+  exit 0
+fi
+[ "$#" -eq 0 ] || { echo "unexpected writer arguments" >&2; exit 2; }
+if [ -n "${RELAYER_CHAINS_JSON:-}" ]; then
+  validate_relayer_chains
+fi
+
 : "${RELAYER_CONFIG:=/etc/parth/bridge-relayer.toml}"
 : "${RELAYER_POLL_INTERVAL_SECS:=15}"
 : "${RELAYER_CONFIRMATION_LAG_CHECKPOINTS:=3}"
@@ -69,22 +114,7 @@ if [ -z "$RELAYER_L2_PRIVATE_KEY" ] && [ -z "$RELAYER_L2_KEYSTORE_PATH" ]; then
   exit 1
 fi
 
-if [ -n "$RELAYER_CHAINS_JSON" ]; then
-  jq -e '
-    type == "array" and length >= 2
-    and all(.[ ];
-      (.family == "evm")
-      and (.chain_index | type == "number" and floor == . and . >= 0 and . <= 255)
-      and (.network_id | type == "string" and length > 0)
-      and (.deployments_network | type == "string" and length > 0)
-      and (.rpc_urls | type == "array" and length > 0 and all(.[]; type == "string" and length > 0))
-    )
-    and ([.[].chain_index] | length == (unique | length))
-  ' <<<"$RELAYER_CHAINS_JSON" >/dev/null || {
-    echo "invalid RELAYER_CHAINS_JSON" >&2
-    exit 1
-  }
-else
+if [ -z "$RELAYER_CHAINS_JSON" ]; then
   [ -n "$RELAYER_L1_RPC_URL" ] || {
     echo "RELAYER_L1_RPC_URL is required in single-chain mode" >&2
     exit 1
@@ -123,14 +153,21 @@ fi
       printf 'family = "%s"\n' "$(toml_escape "$(jq -r '.family' <<<"$chain")")"
       printf 'chain_index = %s\n' "$(jq -r '.chain_index' <<<"$chain")"
       printf 'network_id = "%s"\n' "$(toml_escape "$(jq -r '.network_id' <<<"$chain")")"
-      printf 'rpc_urls = ['
-      first=1
-      while IFS= read -r rpc_url; do
-        [ "$first" = "1" ] || printf ', '
-        printf '"%s"' "$(toml_escape "$rpc_url")"
-        first=0
-      done < <(jq -r '.rpc_urls[]' <<<"$chain")
-      printf ']\n'
+      if jq -e '(.rpc_providers // []) | length > 0' <<<"$chain" >/dev/null; then
+        # Inline tables keep subsequent wallet/contract fields on the parent chain.
+        jq -r '.rpc_providers | map("{ " +
+          (to_entries | map(.key + " = " + (.value | tojson)) | join(", ")) + " }") |
+          "rpc_providers = [" + join(", ") + "]"' <<<"$chain"
+      else
+        printf 'rpc_urls = ['
+        first=1
+        while IFS= read -r rpc_url; do
+          [ "$first" = "1" ] || printf ', '
+          printf '"%s"' "$(toml_escape "$rpc_url")"
+          first=0
+        done < <(jq -r '.rpc_urls[]' <<<"$chain")
+        printf ']\n'
+      fi
       printf 'deployments_network = "%s"\n' "$(toml_escape "$(jq -r '.deployments_network' <<<"$chain")")"
       if [ -n "$RELAYER_FINALIZE_KEYSTORE_PATH" ]; then
         printf 'keystore_path = "%s"\n' "$(toml_escape "$RELAYER_FINALIZE_KEYSTORE_PATH")"

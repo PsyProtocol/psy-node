@@ -151,18 +151,37 @@ multichain_envio_chains_json() {
 }
 
 multichain_relayer_chains_json() {
-  local runtime_file
+  local runtime_file generated
   runtime_file="$(multichain_runtime_file)"
   multichain_require_runtime || return
-  jq -c '[.chains[] | {
+  generated="$(jq -c '[.chains[] | {
     family: "evm",
     chain_index,
     network_id: .network,
-    rpc_urls: ([.rpc_url, (.rpc_fallback_url // "")] | map(select(length > 0)) | unique),
+    # From 79778b79700cd474bba2008d4835578287bfda14: unique sorts preference order.
+    rpc_urls: ([.rpc_url, (.rpc_fallback_url // "")] | map(select(length > 0))
+      | reduce .[] as $url ([]; if index([$url]) then . else . + [$url] end)),
     deployments_network: .network,
     bridge_address: .contracts.Bridge,
     state_manager: .contracts.StateManager
-  }]' "$runtime_file"
+  }]' "$runtime_file")" || return
+
+  if [ -n "${RELAYER_CHAINS_JSON:-}" ]; then
+    # The override is Relayer-only: never change shared/public upstream fields.
+    RELAYER_CHAINS_JSON="$RELAYER_CHAINS_JSON" \
+      bash "$(dirname "${BASH_SOURCE[0]}")/../remote/write-relayer-config.sh" --validate-chains || return
+    printf '%s\n%s\n' "$generated" "$RELAYER_CHAINS_JSON" | jq -es '
+      length == 2 and
+      (.[0] | sort_by(.chain_index) | map(del(.rpc_urls, .rpc_providers))) ==
+      (.[1] | sort_by(.chain_index) | map(del(.rpc_urls, .rpc_providers)))
+    ' >/dev/null 2>&1 || {
+      echo "RELAYER_CHAINS_JSON must preserve the canonical chain registry and contract fields" >&2
+      return 1
+    }
+    printf '%s\n' "$RELAYER_CHAINS_JSON"
+  else
+    printf '%s\n' "$generated"
+  fi
 }
 
 multichain_services_l1_json() {
