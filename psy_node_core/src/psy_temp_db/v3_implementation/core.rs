@@ -10,7 +10,7 @@ const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key, tt_get_guta_in_flight_key, GutaInFlightRecord, QTempDBGutaInFlightStore,
-        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
+        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, QTempDBJobClaimRecordStore, JobClaimRecord, WorkerReputationRecord, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{
         QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVCompareAndSet, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
@@ -721,34 +721,64 @@ impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempD
     }
 }
 
-/// Initial reputation for new workers (no prior record). Must be positive to allow claiming.
-pub const INITIAL_WORKER_REPUTATION: u64 = 5;
-
 #[async_trait]
 impl<D: QTempDatabaseRawKVReaderBase + Sync> QTempDBWorkerReputationReader for D {
     async fn get_worker_reputation(&self, rid: &QRealmIdentifier, public_key: &[u8; 33]) -> anyhow::Result<u64> {
+        Ok(self.get_worker_reputation_record(rid, public_key).await?.0.score)
+    }
+
+    async fn get_worker_reputation_record(
+        &self,
+        rid: &QRealmIdentifier,
+        public_key: &[u8; 33],
+    ) -> anyhow::Result<(WorkerReputationRecord, Option<Vec<u8>>)> {
         let key = tt_get_worker_reputation_key(rid.realm_id, rid.realm_sub_id, public_key);
-        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
-        match value_bytes {
-            Some(v) if v.len() >= 8 => Ok(u64::from_le_bytes(v[0..8].try_into().unwrap())),
-            _ => Ok(INITIAL_WORKER_REPUTATION),
-        }
+        let raw = self.qtdb_raw_kv_get_value(&key).await?.filter(|raw| !raw.is_empty());
+        Ok((WorkerReputationRecord::from_stored(raw.as_deref())?, raw))
     }
 }
 
 #[async_trait]
-impl<D: QTempDatabaseRawKVWriterBase + Sync> QTempDBWorkerReputationWriter for D {
-    async fn set_worker_reputation(
+impl<D: QTempDatabaseRawKVCompareAndSet + Sync> QTempDBWorkerReputationWriter for D {
+    async fn compare_and_set_worker_reputation_record(
         &self,
         rid: &QRealmIdentifier,
         public_key: &[u8; 33],
-        reputation: u64,
-    ) -> anyhow::Result<()> {
+        observed: Option<&[u8]>,
+        record: &WorkerReputationRecord,
+    ) -> anyhow::Result<bool> {
         let key = tt_get_worker_reputation_key(rid.realm_id, rid.realm_sub_id, public_key);
-        self.qtdb_raw_kv_put_value(&key, &reputation.to_le_bytes()).await
+        self.qtdb_raw_kv_compare_and_set(&key, observed, &record.to_bytes()).await
     }
 }
 
+#[async_trait]
+impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync> QTempDBJobClaimRecordStore<JobId> for D {
+    async fn get_job_claim_record(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        job_id: JobId,
+    ) -> anyhow::Result<Option<(JobClaimRecord, Vec<u8>)>> {
+        let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+        match self.qtdb_raw_kv_get_value(&key).await? {
+            Some(raw) if !raw.is_empty() => Ok(Some((JobClaimRecord::from_bytes(&raw)?, raw))),
+            _ => Ok(None),
+        }
+    }
+
+    async fn compare_and_set_job_claim_record(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        job_id: JobId,
+        observed: Option<&[u8]>,
+        record: &JobClaimRecord,
+    ) -> anyhow::Result<bool> {
+        let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+        self.qtdb_raw_kv_compare_and_set(&key, observed, &record.to_bytes()).await
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1024,5 +1054,92 @@ impl<T: QTempDatabaseRawKVReaderBase + QTempDatabaseRawKVCompareAndSet + Sync> Q
     ) -> anyhow::Result<bool> {
         let key = tt_get_guta_in_flight_key(rid.realm_id, rid.realm_sub_id, submitting_realm_id);
         self.qtdb_raw_kv_compare_and_set(&key, observed, &record.to_bytes()).await
+    }
+}
+
+#[cfg(test)]
+mod worker_reputation_store_tests {
+    use parth_core::node::realm_identifier::QRealmIdentifier;
+    use psy_core::job::job_id::{ProvingJobCircuitType, ProvingJobDataType, QJobTopic, QProvingJobDataID};
+
+    use crate::memory_stores::simple_memory_temp_store::SimpleMemoryTempStore;
+    use crate::psy_temp_db::{
+        tt_get_worker_reputation_key, JobClaimRecord, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter,
+        QTempDBJobClaimRecordStore, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, WorkerReputationRecord,
+    };
+    use crate::store::traits::temp_db::QTempDatabaseRawKVWriterBase;
+
+    const KEY: [u8; 33] = [3u8; 33];
+
+    fn rid() -> QRealmIdentifier {
+        QRealmIdentifier::new(1, 0)
+    }
+
+    fn job() -> QProvingJobDataID {
+        QProvingJobDataID {
+            topic: QJobTopic::GenerateStandardProof,
+            goal_id: 492380,
+            circuit_type: ProvingJobCircuitType::BatchDeployContractsAggregate,
+            group_id: 1,
+            sub_group_id: 2,
+            task_index: 3,
+            data_type: ProvingJobDataType::StandardProof,
+            data_index: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_worker_reads_the_initial_record() -> anyhow::Result<()> {
+        let store = SimpleMemoryTempStore::new();
+        let (record, raw) = store.get_worker_reputation_record(&rid(), &KEY).await?;
+        assert_eq!(record, WorkerReputationRecord::initial());
+        assert_eq!(raw, None);
+        assert_eq!(store.get_worker_reputation(&rid(), &KEY).await?, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_value_is_read_and_replaced_by_compare_and_set() -> anyhow::Result<()> {
+        let store = SimpleMemoryTempStore::new();
+        let key = tt_get_worker_reputation_key(1, 0, &KEY);
+        store.qtdb_raw_kv_put_value(&key, &100u64.to_le_bytes()).await?;
+
+        let (record, raw) = store.get_worker_reputation_record(&rid(), &KEY).await?;
+        assert_eq!(record.score, 15);
+        assert_eq!(raw.as_deref(), Some(&100u64.to_le_bytes()[..]));
+
+        let next = WorkerReputationRecord { score: 14, ..record };
+        assert!(!store.compare_and_set_worker_reputation_record(&rid(), &KEY, None, &next).await?);
+        assert!(store.compare_and_set_worker_reputation_record(&rid(), &KEY, raw.as_deref(), &next).await?);
+        assert!(!store.compare_and_set_worker_reputation_record(&rid(), &KEY, raw.as_deref(), &next).await?);
+        assert_eq!(store.get_worker_reputation_record(&rid(), &KEY).await?.0, next);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_value_is_an_error_not_a_new_worker() -> anyhow::Result<()> {
+        let store = SimpleMemoryTempStore::new();
+        let key = tt_get_worker_reputation_key(1, 0, &KEY);
+        store.qtdb_raw_kv_put_value(&key, &[1u8, 2, 3]).await?;
+        assert!(store.get_worker_reputation(&rid(), &KEY).await.is_err());
+        assert!(store.get_worker_reputation_record(&rid(), &KEY).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_record_settles_by_compare_and_set_and_stays_legacy_readable() -> anyhow::Result<()> {
+        let store = SimpleMemoryTempStore::new();
+        store.set_job_claim(&rid(), 7, job(), &KEY, 1_000).await?;
+
+        let (claim, raw) = store.get_job_claim_record(&rid(), 7, job()).await?.expect("claim");
+        assert_eq!(claim, JobClaimRecord::open(KEY, 1_000));
+
+        let settled = JobClaimRecord { settled: true, ..claim };
+        assert!(store.compare_and_set_job_claim_record(&rid(), 7, job(), Some(&raw), &settled).await?);
+        assert!(!store.compare_and_set_job_claim_record(&rid(), 7, job(), Some(&raw), &settled).await?);
+        assert_eq!(store.get_job_claim_record(&rid(), 7, job()).await?.expect("claim").0, settled);
+        assert_eq!(store.get_job_claim(&rid(), 7, job()).await?, Some((KEY, 1_000)));
+        assert!(store.get_job_claim_record(&rid(), 8, job()).await?.is_none());
+        Ok(())
     }
 }

@@ -284,6 +284,10 @@ pub struct WalletSession {
     pub local_proving_job_manager: JobManager<TraceProofJobId, TraceProofJobOutput>,
 
     pub user_session_mgrs: DashMap<QHashOut<F>, UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>>,
+    /// Prove the signature on the calling thread while another thread drives
+    /// the proof-tree aggregation. Only for callers that run proving on a
+    /// blocking thread of a multi-threaded runtime, such as the faucet.
+    pub sign_while_finalizing: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -316,6 +320,8 @@ pub struct EndCapContractSlotUpdate {
     pub old_value: u64,
     pub new_value: u64,
 }
+
+const USER_SESSION_SHARDS: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 #[error("end cap submission rejected after proving deterministic leaf {end_user_leaf_hash}: {source}")]
@@ -1337,7 +1343,11 @@ impl WalletSession {
             st_provider,
             #[cfg(not(target_arch = "wasm32"))]
             local_proving_job_manager: JobManager::empty(),
-            user_session_mgrs: DashMap::new(),
+            // Proving holds a shard's write lock across awaits, so two users in one
+            // shard prove one after the other. The default shard count (4x CPUs)
+            // makes that likely for a server signing for ten operators at once.
+            user_session_mgrs: DashMap::with_shard_amount(USER_SESSION_SHARDS),
+            sign_while_finalizing: false,
         })
     }
 
@@ -2196,16 +2206,21 @@ impl WalletSession {
         let sighash = user_session_mgr.get_sighash(PSY_NETWORK_MAGIC, nonce);
 
         tracing::info!("zk sign for signhash: {}, nonce: {}", sighash.to_string(), nonce);
-        let signature_result = self.wallet.sign_with_public_key(&public_key, &sign_context, sighash).await?;
+        // The signature proof and the proof-tree aggregation do not depend on
+        // each other. With a prove proxy the aggregation is remote while the
+        // signature is proved here, so run them at the same time.
+        let started = web_time::Instant::now();
+        let (signature_result, finalize_result, signature_ms, finalize_tree_ms) = self
+            .sign_while_finalizing(&public_key, &sign_context, sighash, &mut user_session_mgr.proof_tree_state)
+            .await;
+        finalize_result?;
+        let signature_result = signature_result?;
+        let mut lap = web_time::Instant::now();
+        let parallel_ms = started.elapsed().as_millis() as u64;
         let SignatureResult {
             proof: signature_proof,
             circuit_info,
         } = signature_result;
-
-        user_session_mgr
-            .proof_tree_state
-            .finalize_tree(self.wallet.random_circuit_manager().as_ref())
-            .await?;
 
         let public_key_param = pk_info.public_key_param;
 
@@ -2235,7 +2250,57 @@ impl WalletSession {
                 circuit_verifier_config,
             )
             .await?;
+        // Separates the local signature proof from the End Cap proof, which
+        // goes to the prove proxy when one is configured.
+        tracing::info!(
+            target: "psy_prover::sign_timing",
+            signature_ms,
+            finalize_tree_ms,
+            parallel_ms,
+            end_cap_ms = lap.elapsed().as_millis() as u64,
+            "signed and proved end cap"
+        );
         Ok(end_cap_proof)
+    }
+
+    // Returns (signature, finalize result, signature ms, finalize ms).
+    async fn sign_while_finalizing(
+        &self,
+        public_key: &QHashOut<F>,
+        sign_context: &SignContext,
+        sighash: QHashOut<F>,
+        proof_tree_state: &mut psy_common_circuit::treeprover::qrecursion::standard::manager::portable::core::PortableQTreeRecursionManager<C, D>,
+    ) -> (anyhow::Result<SignatureResult>, anyhow::Result<()>, u64, u64) {
+        let circuit_mgr = self.wallet.random_circuit_manager().as_ref();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Driving the aggregation from another thread needs runtime workers
+            // that keep its I/O moving while this thread is busy proving.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                if self.sign_while_finalizing && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                    return std::thread::scope(|scope| {
+                        let finalizing = scope.spawn(|| {
+                            let started = web_time::Instant::now();
+                            let result = handle.block_on(proof_tree_state.finalize_tree(circuit_mgr));
+                            (result, started.elapsed().as_millis() as u64)
+                        });
+                        let started = web_time::Instant::now();
+                        let signature = futures::executor::block_on(self.wallet.sign_with_public_key(public_key, sign_context, sighash));
+                        let signature_ms = started.elapsed().as_millis() as u64;
+                        let (finalized, finalize_ms) = finalizing
+                            .join()
+                            .unwrap_or_else(|_| (Err(anyhow::anyhow!("proof tree finalize thread panicked")), 0));
+                        (signature, finalized, signature_ms, finalize_ms)
+                    });
+                }
+            }
+        }
+        let started = web_time::Instant::now();
+        let signature = self.wallet.sign_with_public_key(public_key, sign_context, sighash).await;
+        let signature_ms = started.elapsed().as_millis() as u64;
+        let started = web_time::Instant::now();
+        let finalized = proof_tree_state.finalize_tree(circuit_mgr).await;
+        (signature, finalized, signature_ms, started.elapsed().as_millis() as u64)
     }
 
     pub async fn sign(

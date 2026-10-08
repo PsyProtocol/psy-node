@@ -9,10 +9,11 @@ use parth_core::{
 };
 use std::{collections::HashMap, sync::{Arc, RwLock}};
 
-use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
+use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVCompareAndSet, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryTempStore {
+    fetch_replay: Arc<crate::psy_temp_db::WorkerFetchReplayMemory>,
     pub kv_map: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
     pub counter_map: Arc<RwLock<HashMap<Vec<u8>, i64>>>,
     pub proof_map: Arc<RwLock<HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>>>,
@@ -20,10 +21,18 @@ pub struct SimpleMemoryTempStore {
 impl SimpleMemoryTempStore {
     pub fn new() -> Self {
         Self {
+            fetch_replay: crate::psy_temp_db::WorkerFetchReplayMemory::shared(),
             kv_map: Arc::new(RwLock::new(HashMap::new())),
             counter_map: Arc::new(RwLock::new(HashMap::new())),
             proof_map: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+#[async_trait]
+impl crate::psy_temp_db::QTempDBWorkerFetchReplayStore for SimpleMemoryTempStore {
+    async fn consume_worker_fetch(&self, rid: &parth_core::node::realm_identifier::QRealmIdentifier, signer: &[u8; 33], digest: &[u8; 32], expires_at_ms: u64) -> anyhow::Result<bool> {
+        self.fetch_replay.consume(crate::psy_temp_db::worker_fetch_replay_key(rid, signer, digest), expires_at_ms)
     }
 }
 
@@ -173,6 +182,19 @@ impl QTempDatabaseRawKVReaderBase for SimpleMemoryTempStore {
     }
     async fn qtdb_raw_kv_contains_key(&self, key: &[u8]) -> anyhow::Result<bool> {
         Ok(self.kv_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?.contains_key(key))
+    }
+}
+#[async_trait]
+impl QTempDatabaseRawKVCompareAndSet for SimpleMemoryTempStore {
+    async fn qtdb_raw_kv_compare_and_set(&self, key: &[u8], expected: Option<&[u8]>, new_value: &[u8]) -> anyhow::Result<bool> {
+        // The write lock spans the comparison and the write, so the pair is atomic.
+        let mut kv_map = self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let current = kv_map.get(key).map(|value| value.as_slice()).filter(|value| !value.is_empty());
+        if current != expected {
+            return Ok(false);
+        }
+        kv_map.insert(key.to_vec(), new_value.to_vec());
+        Ok(true)
     }
 }
 #[async_trait]
