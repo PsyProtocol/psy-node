@@ -1,0 +1,21 @@
+{
+  "repository": "PsyProtocol/psy-services",
+  "source_branch": "fix/l1-rpc-failover-20261009",
+  "source_commit": "31f7eb8dfbbb13652a028dd217db0d6b28273fba",
+  "pool_repository": "PsyProtocol/psy-node",
+  "pool_commit": "da1373980cb810d949098537491eb6f13e55737f",
+  "protocol_node_commit": "e68ccc034f4cdd3580913bd2245456ecbdc711a4",
+  "binary_sha256": "5c6a375362ff4627a57b32c6b6fb1a22954c68a9c56b3c5dbf6ac801c8c02fe8",
+  "local_overrides": false,
+  "platform": "Debian Bookworm x86_64",
+  "toolchain": "nightly-2025-09-20",
+  "PSY_NETWORK": "localhost",
+  "build": "cargo +nightly-2025-09-20 build --offline --locked --release --bin psy-services",
+  "validation": {
+    "services_unit_tests": 885,
+    "services_database_tests": 204,
+    "pool_tests": 51,
+    "clippy": "--offline --locked --release --all-targets -- -D warnings",
+    "prior_ignored_database_test_not_run": "test_extract_end_cap_hashes"
+  }
+}
