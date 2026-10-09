@@ -36,6 +36,9 @@ sol! {
 
 #[derive(Clone, Args)]
 pub struct FinalizeBridgeAggArgs {
+    /// Optional guarded BSC fee policy as JSON (all prices in wei).
+    #[arg(long)]
+    pub l1_fee_policy: Option<super::l1_fees::BscFeePolicy>,
     #[arg(long)]
     pub proof_json: PathBuf,
     #[arg(long)]
@@ -322,6 +325,8 @@ pub async fn run(args: FinalizeBridgeAggArgs) -> Result<()> {
         proven_chain_index,
         "sending finalize transaction"
     );
+    let mut tx = tx;
+    super::l1_fees::prepare_l1_fees(&provider, &mut tx, args.l1_fee_policy.as_ref()).await?;
     let pending = timeout(
         Duration::from_secs(L1_TX_SEND_TIMEOUT_SECS),
         provider.send_transaction(tx),
