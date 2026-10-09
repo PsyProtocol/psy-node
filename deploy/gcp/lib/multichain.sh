@@ -151,10 +151,15 @@ multichain_envio_chains_json() {
 }
 
 multichain_relayer_chains_json() {
-  local runtime_file generated
+  local runtime_file generated override
   runtime_file="$(multichain_runtime_file)"
   multichain_require_runtime || return
-  generated="$(jq -c '[.chains[] | {
+  jq -e 'all(.chains[]; if .network == "bscTestnet" then .chain_id == 97 else true end)' \
+    "$runtime_file" >/dev/null 2>&1 || {
+    echo "BSC Testnet fee policy requires canonical chain ID 97" >&2
+    return 1
+  }
+  generated="$(jq -c '[.chains[] | . as $source | {
     family: "evm",
     chain_index,
     network_id: .network,
@@ -164,24 +169,44 @@ multichain_relayer_chains_json() {
     deployments_network: .network,
     bridge_address: .contracts.Bridge,
     state_manager: .contracts.StateManager
-  }]' "$runtime_file")" || return
+  } + (if $source.network == "bscTestnet" and $source.chain_id == 97 then {
+    fee_policy: {
+      expected_chain_id: 97,
+      min_priority_fee_wei: 1000000000,
+      max_priority_fee_wei: 1000000000,
+      max_fee_per_gas_wei: 1000000000
+    }
+  } else {} end)]' "$runtime_file")" || return
 
   if [ -n "${RELAYER_CHAINS_JSON:-}" ]; then
     # The override is Relayer-only: never change shared/public upstream fields.
-    RELAYER_CHAINS_JSON="$RELAYER_CHAINS_JSON" \
+    # Older RPC-only overrides inherit the approved BSC defaults. Explicit null
+    # or invalid policies must fail validation, not silently disable protection.
+    override="$(jq -ces --argjson defaults "$generated" '
+      if length != 1 then error("expected one value") else .[0] end |
+      map(. as $chain |
+        ($defaults | map(select(.chain_index == $chain.chain_index)) | .[0]) as $default |
+        if (has("fee_policy") | not) and ($default | has("fee_policy"))
+        then . + {fee_policy: $default.fee_policy} else . end)
+    ' <<<"$RELAYER_CHAINS_JSON" 2>/dev/null)" || {
+      echo "invalid RELAYER_CHAINS_JSON" >&2
+      return 1
+    }
+    RELAYER_CHAINS_JSON="$override" \
       bash "$(dirname "${BASH_SOURCE[0]}")/../remote/write-relayer-config.sh" --validate-chains || return
-    printf '%s\n%s\n' "$generated" "$RELAYER_CHAINS_JSON" | jq -es '
+    printf '%s\n%s\n' "$generated" "$override" | jq -es '
       length == 2 and
-      (.[0] | sort_by(.chain_index) | map(del(.rpc_urls, .rpc_providers))) ==
-      (.[1] | sort_by(.chain_index) | map(del(.rpc_urls, .rpc_providers)))
+      (.[0] | sort_by(.chain_index) | map(del(.rpc_urls, .rpc_providers, .fee_policy))) ==
+      (.[1] | sort_by(.chain_index) | map(del(.rpc_urls, .rpc_providers, .fee_policy)))
     ' >/dev/null 2>&1 || {
       echo "RELAYER_CHAINS_JSON must preserve the canonical chain registry and contract fields" >&2
       return 1
     }
-    printf '%s\n' "$RELAYER_CHAINS_JSON"
-  else
-    printf '%s\n' "$generated"
+    generated="$override"
   fi
+  RELAYER_CHAINS_JSON="$generated" \
+    bash "$(dirname "${BASH_SOURCE[0]}")/../remote/write-relayer-config.sh" --validate-chains || return
+  printf '%s\n' "$generated"
 }
 
 multichain_services_l1_json() {

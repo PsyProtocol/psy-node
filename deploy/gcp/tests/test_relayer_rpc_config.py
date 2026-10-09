@@ -13,6 +13,12 @@ ROOT = Path(__file__).resolve().parents[3]
 HELPER = ROOT / "deploy/gcp/lib/multichain.sh"
 WRITER = ROOT / "deploy/gcp/remote/write-relayer-config.sh"
 SECRET = "SYNTHETIC_RPC_CREDENTIAL"
+LIVE_BSC_POLICY = {
+    "expected_chain_id": 97,
+    "min_priority_fee_wei": 1_000_000_000,
+    "max_priority_fee_wei": 1_000_000_000,
+    "max_fee_per_gas_wei": 1_000_000_000,
+}
 
 
 class RelayerRpcConfigTests(unittest.TestCase):
@@ -231,6 +237,104 @@ class RelayerRpcConfigTests(unittest.TestCase):
         runtime["chains"][0]["rpc_url"] = "http://127.0.0.1:18545"
         self.runtime.write_text(json.dumps(runtime))
         self.assert_rejected_without_secrets(self.helper(override=self.providers()))
+
+    def test_bsc_default_policy_roundtrips_without_affecting_other_chains(self):
+        self.assertEqual(self.legacy[1]["fee_policy"], LIVE_BSC_POLICY)
+        self.assertEqual(self.writer(self.legacy).returncode, 0)
+        parsed = tomllib.loads(self.output.read_text())
+        self.assertEqual(parsed["chains"][1]["fee_policy"], LIVE_BSC_POLICY)
+        for index in (0, 2):
+            self.assertNotIn("fee_policy", self.legacy[index])
+            self.assertNotIn("fee_policy", parsed["chains"][index])
+        self.assertNotIn("finalize", parsed)
+        self.assertNotIn("fee_policy", parsed)
+
+    def test_old_rpc_only_override_inherits_policy(self):
+        chains = self.providers()
+        del chains[1]["fee_policy"]
+        generated = self.helper(override=chains)
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        actual = json.loads(generated.stdout)
+        self.assertEqual(actual[1]["fee_policy"], LIVE_BSC_POLICY)
+        del actual[1]["fee_policy"]
+        self.assertEqual(actual, chains)
+        self.assertEqual(self.writer(generated.stdout).returncode, 0)
+
+    def test_custom_bsc_budget_is_preserved(self):
+        chains = self.providers()
+        policy = dict(LIVE_BSC_POLICY, max_priority_fee_wei=2_000_000_000,
+                      max_fee_per_gas_wei=10_000_000_000)
+        chains[1]["fee_policy"] = policy
+        generated = self.helper(override=chains)
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        self.assertEqual(self.writer(generated.stdout).returncode, 0)
+        self.assertEqual(tomllib.loads(self.output.read_text())["chains"][1]["fee_policy"], policy)
+
+    def test_direct_writer_cannot_drop_bsc_policy(self):
+        chains = self.providers()
+        del chains[1]["fee_policy"]
+        original = b"existing live config"
+        self.output.write_bytes(original)
+        self.assert_rejected_without_secrets(self.writer(chains))
+        self.assertEqual(self.output.read_bytes(), original)
+        self.assertFalse((self.directory / "proofs").exists())
+
+    def test_invalid_fee_policy_is_rejected_before_overwrite(self):
+        original = b"existing live config"
+        self.output.write_bytes(original)
+        invalid = [None, {}, [], SECRET]
+        for field, value in (("expected_chain_id", 1), ("min_priority_fee_wei", 0),
+                ("min_priority_fee_wei", -1), ("min_priority_fee_wei", 1.5),
+                ("min_priority_fee_wei", True), ("min_priority_fee_wei", "1000000000"),
+                ("min_priority_fee_wei", 2_000_000_000), ("max_fee_per_gas_wei", 1),
+                ("max_fee_per_gas_wei", 2 ** 53), ("max_priority_fee_wei", None),
+                ("unknown", SECRET)):
+            invalid.append(dict(LIVE_BSC_POLICY, **{field: value}))
+        for field in LIVE_BSC_POLICY:
+            invalid.append({key: value for key, value in LIVE_BSC_POLICY.items() if key != field})
+        for policy in invalid:
+            with self.subTest(policy=policy):
+                chains = self.providers()
+                chains[1]["fee_policy"] = policy
+                self.assert_rejected_without_secrets(self.helper(override=chains))
+                self.assert_rejected_without_secrets(self.writer(chains))
+                self.assertEqual(self.output.read_bytes(), original)
+                self.assertFalse((self.directory / "proofs").exists())
+
+    def test_fee_policy_cannot_be_attached_to_other_networks(self):
+        for index in (0, 2):
+            chains = self.providers()
+            chains[index]["fee_policy"] = dict(LIVE_BSC_POLICY)
+            self.assert_rejected_without_secrets(self.helper(override=chains))
+            self.assert_rejected_without_secrets(self.writer(chains, validate_only=True))
+
+    def test_wrong_bsc_runtime_chain_id_cannot_generate_policy(self):
+        runtime = json.loads(self.runtime.read_text())
+        runtime["chains"][1]["chain_id"] = 56
+        self.runtime.write_text(json.dumps(runtime))
+        self.env["MULTICHAIN_L1_CHAINS_JSON"] = json.dumps(runtime["chains"])
+        self.env["MULTICHAIN_L1_RPC_PROVIDER"] = "any"
+        self.assert_rejected_without_secrets(self.helper())
+        self.assert_rejected_without_secrets(self.helper(override=self.providers()))
+
+    def test_decimal_policy_values_remain_toml_integers(self):
+        chains = self.providers()
+        chains[1]["fee_policy"]["max_fee_per_gas_wei"] = 9007199254740991
+        self.assertEqual(self.writer(chains).returncode, 0)
+        policy = tomllib.loads(self.output.read_text())["chains"][1]["fee_policy"]
+        self.assertEqual(policy, chains[1]["fee_policy"])
+        self.assertTrue(all(type(value) is int for value in policy.values()))
+
+    def test_bsc_names_must_agree(self):
+        for field in ("network_id", "deployments_network"):
+            chains = self.providers()
+            chains[1][field] = "baseSepolia"
+            self.assert_rejected_without_secrets(self.writer(chains, validate_only=True))
+
+    def test_fee_policy_validation_is_read_only(self):
+        self.assertEqual(self.writer(self.providers(), validate_only=True).returncode, 0)
+        self.assertFalse(self.output.exists())
+        self.assertFalse((self.directory / "proofs").exists())
 
 
 if __name__ == "__main__":

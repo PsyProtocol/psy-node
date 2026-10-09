@@ -40,14 +40,41 @@ Quotes exceeding the caps defer sending rather than being clamped. Do not
 increase the budget without approval or apply this policy to Sepolia/Base.
 Preserve the named RPC pool order and private URLs from the previous record.
 
-**Configuration generation remains a deployment gate:** this source integration
-does not add fee-policy support to `write-relayer-config.sh` or its chain-input
-generator. Do not regenerate/replace the live TOML using that path until it has
-been updated and tested to preserve this table. A binary-only rollout must keep
-the existing verified configuration. Code alone does not enable the policy.
-Likewise, the historical full-cohort `source-versions.env` is not a valid source
+**Deployment configuration support:** `multichain_relayer_chains_json` now adds
+the policy above for canonical BSC Testnet chain ID 97 only. Existing RPC-only
+`RELAYER_CHAINS_JSON` overrides inherit it. An explicit `fee_policy` on that BSC
+entry is validated and preserved, allowing approved budget changes without
+changing shared Services/Envio/public RPC configuration. Explicit null or invalid
+policies fail; they never disable protection silently. Other chains cannot carry
+this policy. Runtime manifest and network identity checks remain enforced.
+
+`write-relayer-config.sh` validates the entire chain list before touching the
+output and writes `fee_policy` as a TOML inline table under its owning chain.
+Direct multichain writer calls with BSC but no policy are rejected; use the
+generator to upgrade older RPC-only inputs. Fees must be positive plain decimal
+JSON integers no larger than 9007199254740991 (jq exact-integer limit), with
+minimum <= priority cap <= total cap. Missing/unknown fields are rejected.
+Single-chain config generation remains unchanged and is not covered by this
+multichain deployment support.
+
+The generator is declarative: it does not read the current remote TOML to infer
+custom budgets. Before a later rollout, compare its parsed output against the
+live config and explicitly include any approved non-default BSC budget in
+`RELAYER_CHAINS_JSON`. These script changes do not themselves alter the live
+configuration, deploy a binary, or authorize higher spending. Keep the existing
+verified config for binary-only updates. Code alone does not enable the policy.
+
+The historical full-cohort `source-versions.env` is not a valid source
 selection for rebuilding this component hotfix; pin the reviewed Relayer source
-explicitly. No global runtime pin is advanced by this integration.
+explicitly (d1f0e4fc or a reviewed descendant/backport with fee support).
+No global runtime pin is advanced by this integration.
+
+Offline checks (synthetic credentials, temporary files, no live RPC):
+
+```bash
+python3 deploy/gcp/tests/test_relayer_rpc_config.py
+bash deploy/gcp/tests/test-multichain-relayer-rpc-order.sh
+```
 
 ## Recovery and acceptance evidence
 

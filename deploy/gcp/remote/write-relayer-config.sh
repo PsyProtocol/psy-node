@@ -7,6 +7,17 @@ validate_relayer_chains() {
     def text: type == "string" and (explode | all(.[]; . >= 32 and . != 127));
     def url: text and test("^https?://[^[:space:]]+$");
     def weight: type == "number" and floor == . and . >= -2147483648 and . <= 2147483647;
+    # Decimal integers only, bounded to jq exact-integer precision and TOML i64.
+    def fee_integer:
+      type == "number" and floor == . and . > 0 and . <= 9007199254740991
+      and (tostring | test("^[0-9]+$"));
+    def fee_policy:
+      type == "object"
+      and (keys == ["expected_chain_id", "max_fee_per_gas_wei", "max_priority_fee_wei", "min_priority_fee_wei"])
+      and .expected_chain_id == 97
+      and all(.[]; fee_integer)
+      and .min_priority_fee_wei <= .max_priority_fee_wei
+      and .max_priority_fee_wei <= .max_fee_per_gas_wei;
     def provider:
       type == "object"
       and ((keys - ["name", "url", "operator", "quota_group", "priority_weight", "weight"]) | length == 0)
@@ -26,6 +37,10 @@ validate_relayer_chains() {
         and (.chain_index | type == "number" and floor == . and . >= 0 and . <= 255)
         and (.network_id | text and length > 0)
         and (.deployments_network | text and length > 0)
+        and (if .network_id == "bscTestnet" or .deployments_network == "bscTestnet"
+          then .network_id == "bscTestnet" and .deployments_network == "bscTestnet"
+            and (.fee_policy | fee_policy)
+          else (has("fee_policy") | not) end)
         and (if has("rpc_urls") then (.rpc_urls | type == "array" and all(.[]; url)) else true end)
         and (if has("rpc_providers") then (.rpc_providers | providers) else true end)
         and (((.rpc_urls // []) | length) > 0 or ((.rpc_providers // []) | length) > 0))
@@ -179,6 +194,11 @@ fi
       bridge_address="$(jq -r '.bridge_address // ""' <<<"$chain")"
       [ -z "$state_manager" ] || printf 'state_manager = "%s"\n' "$(toml_escape "$state_manager")"
       [ -z "$bridge_address" ] || printf 'bridge_address = "%s"\n' "$(toml_escape "$bridge_address")"
+      if jq -e 'has("fee_policy")' <<<"$chain" >/dev/null; then
+        # Inline table avoids moving the following chain fields into a subtable.
+        jq -r '.fee_policy | to_entries | map(.key + " = " + (.value | tostring)) |
+          "fee_policy = { " + join(", ") + " }"' <<<"$chain"
+      fi
       printf '\n'
     done < <(jq -c 'sort_by(.chain_index)[]' <<<"$RELAYER_CHAINS_JSON")
   else
