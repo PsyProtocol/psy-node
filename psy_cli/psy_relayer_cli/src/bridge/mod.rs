@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod deposit_logs;
 pub mod finalize_bridge;
 pub mod l1_provider;
+pub mod l1_fees;
 pub mod l1_client;
 mod pool_transport;
 pub mod prove_proxy_client;
