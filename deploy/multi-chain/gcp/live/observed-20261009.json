@@ -1,0 +1,499 @@
+{
+  "schema_version": 1,
+  "hosts": [
+    {
+      "host": "gcp-cp-ce",
+      "actual_hostname": "cp-ce.asia-southeast1-b.c.psy-testnet.internal",
+      "observed_at_utc": "2026-10-09T06:52:49.772125+00:00",
+      "units": [
+        {
+          "unit": "parth-coordinator-processor.service",
+          "systemd": {
+            "MainPID": "1259828",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "13658976326074",
+            "Id": "parth-coordinator-processor.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth/releases/20260918161924/target/release/psy_node_cli",
+          "sha256": "0c99368e55ebb01ee31de1d77199b4afd8f48d8118895c996a263ee9827df155",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-realm-processor@0.service",
+          "systemd": {
+            "MainPID": "1671504",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "14402810431584",
+            "Id": "parth-realm-processor@0.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-realm-processor@0.service.d/92-guta-only-20261001.conf",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth/node-hotfixes/20261001-guta-72da74e3/target/release/psy_node_cli",
+          "sha256": "bda82589c26bd914ead5bd77b8e6de136e0703797d0135fcddf3c2ff8dd8bb03",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-realm-processor@1.service",
+          "systemd": {
+            "MainPID": "1672024",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "14402819057466",
+            "Id": "parth-realm-processor@1.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-realm-processor@1.service.d/92-guta-only-20261001.conf",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth/node-hotfixes/20261001-guta-72da74e3/target/release/psy_node_cli",
+          "sha256": "bda82589c26bd914ead5bd77b8e6de136e0703797d0135fcddf3c2ff8dd8bb03",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-coordinator-edge@0.service",
+          "systemd": {
+            "MainPID": "1703518",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "14437747444069",
+            "Id": "parth-coordinator-edge@0.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-coordinator-edge@0.service.d/92-guta-only-20261001.conf /etc/systemd/system/parth-coordinator-edge@0.service.d/99-worker-reputation-20261008.conf",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth-edge-reputation/20261008-876c1432da30/target/release/psy_node_cli",
+          "sha256": "55abcc1bee0683e3529ab9f3e86c6711d0492f12999ec0a2f20ad20584ee4702",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-realm-edge@0.service",
+          "systemd": {
+            "MainPID": "1751187",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "14516117531054",
+            "Id": "parth-realm-edge@0.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-realm-edge@0.service.d/95-imt-predecessor-20261004.conf /etc/systemd/system/parth-realm-edge@0.service.d/99-worker-reputation-20261008.conf /etc/systemd/system/parth-realm-edge@0.service.d/zz-endcap-handoff-20261009.conf",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth-endcap-handoff/20261009-4ff86c815de7/target/release/psy_node_cli",
+          "sha256": "ced042f895026fc3fe0086d983a2e1a20b6a6ecbbb91664d4207137599c4618b",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-realm-edge@1.service",
+          "systemd": {
+            "MainPID": "1752066",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "14516234579045",
+            "Id": "parth-realm-edge@1.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-realm-edge@1.service.d/95-imt-predecessor-20261004.conf /etc/systemd/system/parth-realm-edge@1.service.d/99-worker-reputation-20261008.conf /etc/systemd/system/parth-realm-edge@1.service.d/zz-endcap-handoff-20261009.conf",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth-endcap-handoff/20261009-4ff86c815de7/target/release/psy_node_cli",
+          "sha256": "ced042f895026fc3fe0086d983a2e1a20b6a6ecbbb91664d4207137599c4618b",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-psy-services.service",
+          "systemd": {
+            "MainPID": "1637580",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "14350289057056",
+            "Id": "parth-psy-services.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system.control/parth-psy-services.service.d/50-MemoryHigh.conf /etc/systemd/system.control/parth-psy-services.service.d/50-MemoryMax.conf /etc/systemd/system/parth-psy-services.service.d/95-nostr-scan-state.conf",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth/psy-services/releases/20261007-claimable-b6dd702-95a29f85/target/release/psy-services",
+          "sha256": "95a29f85d00ac92ca58db471e8686112bfb29a764d1af9858f11bac8e84e362a",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-psy-indexer@coordinator.service",
+          "systemd": {
+            "MainPID": "787475",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "13233192442435",
+            "Id": "parth-psy-indexer@coordinator.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth/psy-services/releases/7c1e1f616739-ced23fcb58b5/target/release/psy-indexer",
+          "sha256": "611f5975dd9291c6e8253491689f018b3935a4e70ec5fd6d8a7044fdddf8e770",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-psy-indexer@realm-0.service",
+          "systemd": {
+            "MainPID": "787481",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "13233192444132",
+            "Id": "parth-psy-indexer@realm-0.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth/psy-services/releases/7c1e1f616739-ced23fcb58b5/target/release/psy-indexer",
+          "sha256": "611f5975dd9291c6e8253491689f018b3935a4e70ec5fd6d8a7044fdddf8e770",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-psy-indexer@realm-1.service",
+          "systemd": {
+            "MainPID": "787483",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "13233192445229",
+            "Id": "parth-psy-indexer@realm-1.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth/psy-services/releases/7c1e1f616739-ced23fcb58b5/target/release/psy-indexer",
+          "sha256": "611f5975dd9291c6e8253491689f018b3935a4e70ec5fd6d8a7044fdddf8e770",
+          "identity_verified": true
+        }
+      ],
+      "files": [
+        {
+          "path": "/opt/parth/current/genesis.json",
+          "resolved_path": "/opt/parth/releases/20260918161924/genesis.json",
+          "sha256": "569e58c901cdf7bd9edfc25bab70c4b0aafe0f5d2ec782781290d963ae63b710"
+        }
+      ]
+    },
+    {
+      "host": "gcp-faucet",
+      "actual_hostname": "faucet.asia-southeast1-b.c.psy-testnet.internal",
+      "observed_at_utc": "2026-10-09T06:53:21.482432+00:00",
+      "units": [
+        {
+          "unit": "parth-relayer.service",
+          "systemd": {
+            "MainPID": "1922020",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "6654588517154",
+            "Id": "parth-relayer.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-relayer.service.d/95-rpc-pool-20261008.conf /etc/systemd/system/parth-relayer.service.d/96-bsc-fees-20261009.conf",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth-relayer-fee-releases/20261009-bsc-fees/target/release/psy_relayer_cli",
+          "sha256": "1152584f5b1db2399c3713865776f25e4433a5c5c046151184db2a739320bd7e",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-faucet-server.service",
+          "systemd": {
+            "MainPID": "0",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "0",
+            "Id": "parth-faucet-server.service",
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "DropInPaths": "/etc/systemd/system/parth-faucet-server.service.d/95-faucet-cancel-safe.conf",
+            "UnitFileState": "disabled"
+          },
+          "executable": null,
+          "sha256": null,
+          "identity_verified": false
+        }
+      ],
+      "files": [
+        {
+          "path": "/etc/parth/bridge-relayer.toml",
+          "resolved_path": "/etc/parth/bridge-relayer.toml",
+          "sha256": "6bdba497f75300d67f83e70835f8e2dd3b7d7b2ac499a559ca220feae1711ca5"
+        }
+      ]
+    },
+    {
+      "host": "gcp-coordinator-worker",
+      "actual_hostname": "coordinator-worker.asia-southeast1-a.c.psy-testnet.internal",
+      "observed_at_utc": "2026-10-09T06:53:20.806474+00:00",
+      "units": [
+        {
+          "unit": "parth-faucet-server.service",
+          "systemd": {
+            "MainPID": "2326085",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "13524302450045",
+            "Id": "parth-faucet-server.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-faucet-server.service.d/60-faucet-perf.conf",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/opt/parth/faucet/releases/20261007-perf-cache-b244e5f48ab2/psy_user_cli",
+          "sha256": "b244e5f48ab2ba0b3c63d87dd5bc864656f03d772e4d64a0f4a526aa1065b4af",
+          "identity_verified": true
+        }
+      ],
+      "files": []
+    },
+    {
+      "host": "gcp-postgres",
+      "actual_hostname": "postgres.asia-southeast1-b.c.psy-testnet.internal",
+      "observed_at_utc": "2026-10-09T06:53:21.657854+00:00",
+      "units": [
+        {
+          "unit": "parth-envio.service",
+          "systemd": {
+            "MainPID": "398307",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "14516266664117",
+            "Id": "parth-envio.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "",
+            "UnitFileState": "enabled"
+          },
+          "executable": "/usr/bin/node",
+          "sha256": "f3f93db342d5ac5bb61656d0599a603a73779e98befd9342171e550002725f4d",
+          "identity_verified": true
+        }
+      ],
+      "files": [
+        {
+          "path": "/opt/parth/envio/current/schema.graphql",
+          "resolved_path": "/opt/parth/envio/releases/20261009-local-rpc-sepolia/psy-relayer-envio/schema.graphql",
+          "sha256": "fedbeb938b537706458abaf6f62ee25214b814b7adbdd78c0bb90011fa4a729c"
+        },
+        {
+          "path": "/opt/parth/envio/current/package.json",
+          "resolved_path": "/opt/parth/envio/releases/20261009-local-rpc-sepolia/psy-relayer-envio/package.json",
+          "sha256": "26a05ec3aede0289d34d6bbc3930648dcd1154a252f0328d845b4c316c303a35"
+        },
+        {
+          "path": "/opt/parth/envio/current/node_modules/envio/src/db/EntityHistory.res.js",
+          "resolved_path": "/opt/parth/envio/releases/20261009-local-rpc-sepolia/psy-relayer-envio/node_modules/.pnpm/envio@2.32.10_typescript@5.6.3/node_modules/envio/src/db/EntityHistory.res.js",
+          "sha256": "8ddf8ee554ef7e2506b1e766fe42c1ae0544edf25883b48574021143596cd1fa"
+        },
+        {
+          "path": "/opt/parth/envio/current/node_modules/envio/src/sources/RpcSource.res.js",
+          "resolved_path": "/opt/parth/envio/releases/20261009-local-rpc-sepolia/psy-relayer-envio/node_modules/.pnpm/envio@2.32.10_typescript@5.6.3/node_modules/envio/src/sources/RpcSource.res.js",
+          "sha256": "32a9c6a8682d23e2643b6a7f5fb278f82f22e4b3167f0fd39c1678d53c78dded"
+        }
+      ]
+    },
+    {
+      "host": "arc99x1",
+      "actual_hostname": "arc99x1",
+      "observed_at_utc": "2026-10-09T06:53:36.206984+00:00",
+      "units": [
+        {
+          "unit": "parth-prove-proxy@user.service",
+          "systemd": {
+            "Id": "parth-prove-proxy@user.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-prove-proxy@user.service.d/90-user-avx512.conf /etc/systemd/system/parth-prove-proxy@user.service.d/95-cpu-combo-20260930.conf /etc/systemd/system/parth-prove-proxy@user.service.d/99-gpu-user-20261002.conf",
+            "UnitFileState": "enabled",
+            "MainPID": "6872",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "13854879826"
+          },
+          "executable": "/opt/parth/user-gpu-releases/20261002-8c6232b00a22/psy_user_cli",
+          "sha256": "8c6232b00a22b13b6bc0b1a2cc12c76e4a004f2229cc9cc15abdd5a012186686",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-prove-proxy@system.service",
+          "systemd": {
+            "Id": "parth-prove-proxy@system.service",
+            "LoadState": "loaded",
+            "ActiveState": "failed",
+            "SubState": "failed",
+            "DropInPaths": "/etc/systemd/system/parth-prove-proxy@system.service.d/95-cpu-combo-20260930.conf",
+            "UnitFileState": "disabled",
+            "MainPID": "0",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "16759763"
+          },
+          "executable": null,
+          "sha256": null,
+          "identity_verified": false
+        },
+        {
+          "unit": "parth-user-proxy-lb.service",
+          "systemd": {
+            "Id": "parth-user-proxy-lb.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "",
+            "UnitFileState": "enabled",
+            "MainPID": "976",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "16740835"
+          },
+          "executable": "/usr/bin/nginx",
+          "sha256": "5cafda33449bb441edc63c75191e5e1b0554e80d7871fa5e54db8746be9f5a58",
+          "identity_verified": true
+        }
+      ],
+      "files": [
+        {
+          "path": "/etc/parth/user-proxy-lb.conf",
+          "resolved_path": "/etc/parth/user-proxy-lb.conf",
+          "sha256": "99c2dd540bad1df5ca112a1a36fad529f3baa251a8ccdde4783a3cad196d4902"
+        }
+      ]
+    },
+    {
+      "host": "arc99x2",
+      "actual_hostname": "arc99x2",
+      "observed_at_utc": "2026-10-09T06:53:38.582701+00:00",
+      "units": [
+        {
+          "unit": "parth-offsite-worker@coordinator.service",
+          "systemd": {
+            "Id": "parth-offsite-worker@coordinator.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-offsite-worker@coordinator.service.d/60-worker-avx512-20261001.conf",
+            "UnitFileState": "enabled",
+            "MainPID": "865",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "24406910"
+          },
+          "executable": "/opt/parth/worker-releases/20261001-013d70b0-avx512/target/release/psy_worker_cli",
+          "sha256": "62c94a2ec5ca589a7e08311ac0f3e18babcea89e2f361bf880dfac6bd85472be",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-offsite-worker@realm-0.service",
+          "systemd": {
+            "Id": "parth-offsite-worker@realm-0.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-offsite-worker@realm-0.service.d/60-worker-avx512-20261001.conf",
+            "UnitFileState": "enabled",
+            "MainPID": "866",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "24408820"
+          },
+          "executable": "/opt/parth/worker-releases/20261001-013d70b0-avx512/target/release/psy_worker_cli",
+          "sha256": "62c94a2ec5ca589a7e08311ac0f3e18babcea89e2f361bf880dfac6bd85472be",
+          "identity_verified": true
+        },
+        {
+          "unit": "parth-offsite-worker@realm-1.service",
+          "systemd": {
+            "Id": "parth-offsite-worker@realm-1.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-offsite-worker@realm-1.service.d/60-worker-avx512-20261001.conf",
+            "UnitFileState": "enabled",
+            "MainPID": "867",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "24409731"
+          },
+          "executable": "/opt/parth/worker-releases/20261001-013d70b0-avx512/target/release/psy_worker_cli",
+          "sha256": "62c94a2ec5ca589a7e08311ac0f3e18babcea89e2f361bf880dfac6bd85472be",
+          "identity_verified": true
+        }
+      ],
+      "files": []
+    },
+    {
+      "host": "arc99x3",
+      "actual_hostname": "arc99x3",
+      "observed_at_utc": "2026-10-09T06:53:40.552993+00:00",
+      "units": [
+        {
+          "unit": "parth-prove-proxy@user.service",
+          "systemd": {
+            "Id": "parth-prove-proxy@user.service",
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "DropInPaths": "/etc/systemd/system/parth-prove-proxy@user.service.d/90-memory-release-20260924.conf /etc/systemd/system/parth-prove-proxy@user.service.d/91-avx512-release-20260929.conf /etc/systemd/system/parth-prove-proxy@user.service.d/93-batch-gate-fft-release-20260929.conf /etc/systemd/system/parth-prove-proxy@user.service.d/99-listen-all.conf",
+            "UnitFileState": "disabled",
+            "MainPID": "0",
+            "NRestarts": "0",
+            "ExecMainStartTimestampMonotonic": "0"
+          },
+          "executable": null,
+          "sha256": null,
+          "identity_verified": false
+        },
+        {
+          "unit": "parth-prove-proxy@system.service",
+          "systemd": {
+            "Id": "parth-prove-proxy@system.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system/parth-prove-proxy@system.service.d/90-memory-release-20260922.conf /etc/systemd/system/parth-prove-proxy@system.service.d/91-jemalloc-release-20260924.conf /etc/systemd/system/parth-prove-proxy@system.service.d/92-avx512-release-20260929.conf /etc/systemd/system/parth-prove-proxy@system.service.d/93-batch-gate-fft-release-20260929.conf",
+            "UnitFileState": "enabled",
+            "MainPID": "2665",
+            "NRestarts": "1",
+            "ExecMainStartTimestampMonotonic": "1188755860"
+          },
+          "executable": "/opt/parth/prove-proxy-memory-releases/20260929-system-0d958525-v4-batch-gate-fft-lto/target/release/psy_user_cli",
+          "sha256": "ffffcb1d4230c559b1164d75c29fbd2ba00884cd19c78fdc4a9395eb8fd2fca5",
+          "identity_verified": true
+        }
+      ],
+      "files": []
+    },
+    {
+      "host": "arc99x4",
+      "actual_hostname": "arc99x4",
+      "observed_at_utc": "2026-10-09T06:53:42.572441+00:00",
+      "units": [
+        {
+          "unit": "parth-prove-proxy@user.service",
+          "systemd": {
+            "Id": "parth-prove-proxy@user.service",
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "DropInPaths": "/etc/systemd/system.control/parth-prove-proxy@user.service.d/50-MemoryMax.conf /etc/systemd/system/parth-prove-proxy@user.service.d/99-listen-all.conf",
+            "UnitFileState": "enabled",
+            "MainPID": "428050",
+            "NRestarts": "1",
+            "ExecMainStartTimestampMonotonic": "495339742191"
+          },
+          "executable": "/home/parth-user-proxy/20261001-user-combo/psy_user_cli",
+          "sha256": "e780e5bb9b304f157f87056f69e0d34da0ed8c3cbd60d7842e612a5c9133c523",
+          "identity_verified": true
+        }
+      ],
+      "files": []
+    }
+  ]
+}

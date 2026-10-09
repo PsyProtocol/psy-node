@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "kind": "observed-live-component-map-not-build-input",
+  "observed_date_utc": "2026-10-09",
+  "deployment_repository": "PsyProtocol/psy-node",
+  "deployment_ref": "deploy/multi-chain-gcp",
+  "compared_deployment_commit": "9199c6288b4392a55b487e23484a8fcb3271f27c",
+  "complete": false,
+  "deployment_authorized": false,
+  "scope": "Backend application artifacts and local ingress. Excludes frontend/wallet/SDK publication and infrastructure package inventory.",
+  "snapshot": "observed-20261009.json",
+  "genesis": {
+    "source_commit": "cb3ea4a1e743c3c01037ae968e10f27389788a7d",
+    "sha256": "569e58c901cdf7bd9edfc25bab70c4b0aafe0f5d2ec782781290d963ae63b710",
+    "magic": "0x1337CF514544CF69",
+    "replace": false
+  },
+  "components": [
+    {
+      "id": "coordinator-processor",
+      "host": "gcp-cp-ce",
+      "units": [
+        "parth-coordinator-processor.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": "32bfd3da73b4f05b9dfe2f3aa2f6b2278aa2a3b6",
+      "expected_binary_sha256": "0c99368e55ebb01ee31de1d77199b4afd8f48d8118895c996a263ee9827df155",
+      "branch_mapping": "historical_baseline_present",
+      "evidence": "Original cohort identity plus current /proc hash; do NOT advance CP to the deployment branch tip."
+    },
+    {
+      "id": "realm-processors",
+      "host": "gcp-cp-ce",
+      "units": [
+        "parth-realm-processor@0.service",
+        "parth-realm-processor@1.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": "72da74e30afe6a87bf0168bfc156fc155159939a",
+      "source_ref": "release/guta-only-20261001",
+      "expected_binary_sha256": "bda82589c26bd914ead5bd77b8e6de136e0703797d0135fcddf3c2ff8dd8bb03",
+      "branch_mapping": "selected_fixes_integrated",
+      "evidence": "GUTA-only source and immutable artifact in tmp/guta-only-20261001/artifact/manifest.json; broader pending-lifetime fixes in branch are NOT deployed by this binary."
+    },
+    {
+      "id": "coordinator-edge",
+      "host": "gcp-cp-ce",
+      "units": [
+        "parth-coordinator-edge@0.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": "876c1432da302941acfba8485763e3f0549ec284",
+      "expected_binary_sha256": "55abcc1bee0683e3529ab9f3e86c6711d0492f12999ec0a2f20ad20584ee4702",
+      "branch_mapping": "selected_fixes_integrated",
+      "evidence": "../edge-reputation/candidate-artifact.json and VERIFICATION.md. Stable integration 1c0863fa is not exact build source."
+    },
+    {
+      "id": "realm-edges",
+      "host": "gcp-cp-ce",
+      "units": ["parth-realm-edge@0.service", "parth-realm-edge@1.service"],
+      "repository": "PsyProtocol/psy-node",
+      "source_ref": "hotfix/endcap-handoff-live-20261009",
+      "source_commit": "4ff86c815de7c904c3c141b02926540a68e9a74b",
+      "expected_binary_sha256": "ced042f895026fc3fe0086d983a2e1a20b6a6ecbbb91664d4207137599c4618b",
+      "branch_mapping": "selected_fixes_integrated",
+      "evidence": "../endcap-handoff/DEPLOYED-20261009.md; original 70cf6edc, live backport 4ff86c81, stable integration 6eb53500, deploy merge 9f4bcff5. Coordinator Edge was NOT replaced."
+    },
+    {
+      "id": "relayer",
+      "host": "gcp-faucet",
+      "units": [
+        "parth-relayer.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": "d1f0e4fc3b69d9bed90c1e829d4928cc68125bc8",
+      "expected_binary_sha256": "1152584f5b1db2399c3713865776f25e4433a5c5c046151184db2a739320bd7e",
+      "branch_mapping": "selected_fixes_integrated",
+      "evidence": "../relayer-rpc/DEPLOYED-20261009-BSC-FEES.md. Stable integration 585022a3 differs from exact live source; current config hash is recorded in snapshot."
+    },
+    {
+      "id": "services-api",
+      "host": "gcp-cp-ce",
+      "units": [
+        "parth-psy-services.service"
+      ],
+      "repository": "PsyProtocol/psy-services",
+      "source_commit": "b6dd702ad0a0d15a2a9df252795db5e13dce8fb7",
+      "source_ref": "release/testnet-stable",
+      "expected_binary_sha256": "95a29f85d00ac92ca58db471e8686112bfb29a764d1af9858f11bac8e84e362a",
+      "branch_mapping": "external_repo_pin_recorded",
+      "evidence": "Live BUILD-MANIFEST.env source matched running hash; keep Services source in its own repository. MemoryHigh 8 GiB, MemoryMax 12 GiB; retain 95-nostr-scan-state.conf."
+    },
+    {
+      "id": "l2-indexers",
+      "host": "gcp-cp-ce",
+      "units": [
+        "parth-psy-indexer@coordinator.service",
+        "parth-psy-indexer@realm-0.service",
+        "parth-psy-indexer@realm-1.service"
+      ],
+      "repository": "PsyProtocol/psy-services",
+      "source_commit": "7c1e1f61673949bb7343529d4dd51d66f631d236",
+      "source_ref": "fix/bridge-shared-http-client",
+      "expected_binary_sha256": "611f5975dd9291c6e8253491689f018b3935a4e70ec5fd6d8a7044fdddf8e770",
+      "branch_mapping": "external_repo_pin_recorded",
+      "evidence": "Live indexer release BUILD-MANIFEST.env and three /proc hashes. Indexers did NOT advance with API b6dd702."
+    },
+    {
+      "id": "faucet",
+      "host": "gcp-coordinator-worker",
+      "units": [
+        "parth-faucet-server.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": null,
+      "expected_binary_sha256": "b244e5f48ab2ba0b3c63d87dd5bc864656f03d772e4d64a0f4a526aa1065b4af",
+      "branch_mapping": "source_attestation_pending",
+      "evidence": "b244e5f4 is a binary hash, NOT a git commit. Optimization notes associate build with 619ba2ba + 5c83064a (included via PR21); release has no build manifest. Do not assert rebuilt 9bde3801 equals this binary."
+    },
+    {
+      "id": "x2-workers",
+      "host": "arc99x2",
+      "units": [
+        "parth-offsite-worker@coordinator.service",
+        "parth-offsite-worker@realm-0.service",
+        "parth-offsite-worker@realm-1.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": "013d70b0880fd6f1c5d2296823947888f56c49b7",
+      "source_ref": "perf/worker-efficiency-20260930",
+      "expected_binary_sha256": "62c94a2ec5ca589a7e08311ac0f3e18babcea89e2f361bf880dfac6bd85472be",
+      "branch_mapping": "runtime_backport_pending",
+      "evidence": "tmp/worker-avx512-x2-release-20261001/manifest.json plus operator-sudo /proc verification on 2026-10-09. Exact source published on perf/worker-efficiency-20260930 and contained in multi_chain, but worker allocator/thread-pool changes absent from deploy tip. AVX-512, fat LTO, one codegen unit."
+    },
+    {
+      "id": "x1-user-proxy",
+      "host": "arc99x1",
+      "units": [
+        "parth-prove-proxy@user.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": null,
+      "expected_binary_sha256": "8c6232b00a22b13b6bc0b1a2cc12c76e4a004f2229cc9cc15abdd5a012186686",
+      "branch_mapping": "composite_source_and_rollout_archival_pending",
+      "evidence": "Operator-sudo /proc hash matched. Remote gpu-lab/bin/psy_user_cli-16a4a4b9-063f9d25-gpu-v4.manifest.json ties this binary to dirty Node 16a4a4b9, clean plonky2-hwa 063f9d25, CUDA and x86-64-v4/fat LTO. Exact dirty patch remains unattested; not reproducible from a single Node SHA.",
+      "build_inputs": {
+        "node_base": "16a4a4b9",
+        "node_state": "dirty",
+        "manifest_diff_hash_prefix": "1f87e3c151aa12cd",
+        "plonky2_hwa": "063f9d25",
+        "zeknox_library_sha256": "bbc84fbe8fa79fdacd13b6886147db22fc60d6a5425607d52094ddda88e0eb28",
+        "flags": "--features cuda; -C target-cpu=x86-64-v4; fat LTO; codegen-units=1"
+      }
+    },
+    {
+      "id": "x3-system-proxy",
+      "host": "arc99x3",
+      "units": [
+        "parth-prove-proxy@system.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": null,
+      "expected_binary_sha256": "ffffcb1d4230c559b1164d75c29fbd2ba00884cd19c78fdc4a9395eb8fd2fca5",
+      "branch_mapping": "composite_source_and_rollout_archival_pending",
+      "evidence": "Operator-sudo /proc hash matched historical pinned artifact. tmp/prove-proxy-x3-system-combo-20260929/HANDOFF.md records base 0d958525dedac7d5b156ac84a773e0266019afd8 + U32 patch + plonky2 736572e9dd3ca93566471cf5a2a1cb67a13fe01d plus local-path Cargo changes. Private source archives exist on x3; this map does not assert remote publication or reproducibility."
+    },
+    {
+      "id": "x4-user-proxy",
+      "host": "arc99x4",
+      "units": [
+        "parth-prove-proxy@user.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": null,
+      "expected_binary_sha256": "e780e5bb9b304f157f87056f69e0d34da0ed8c3cbd60d7842e612a5c9133c523",
+      "branch_mapping": "composite_source_and_rollout_archival_pending",
+      "evidence": "Operator-sudo /proc hash matched historical package/MANIFEST.txt: 116b9955 + U32 packed-gate patch (32989870) + local plonky2 ff75fcc48ae1057b6dbb298571bdd58e806683de; AVX-512/fat LTO. Not a clean single-commit build; dependency publication remains unverified."
+    },
+    {
+      "id": "envio",
+      "host": "gcp-postgres",
+      "units": [
+        "parth-envio.service"
+      ],
+      "repository": "PsyProtocol/psy-node",
+      "source_commit": "af6620fe2377b01fcc9fc62c9e59057bc1303c80",
+      "source_ref": "fix/envio-deposit-timestamps-20260928",
+      "source_scope": "historical timestamp/history subtree provenance, not the entire current release",
+      "observed_release": "/opt/parth/envio/releases/20261009-local-rpc-sepolia/psy-relayer-envio",
+      "expected_binary_sha256": null,
+      "branch_mapping": "runtime_backport_pending",
+      "evidence": "Historical source release was 20260928-history-af6620fe; current installed-file paths resolve to 20261009-local-rpc-sepolia. Previously unpublished af6620fe history fix published on 2026-10-09 after independent review. Schema/package and patched EntityHistory/RpcSource hashes in snapshot. Envio 2.32.10 plus separate RPC patch. Node executable hash is interpreter identity, not application attestation. Does not assert whole current release or loaded JS equality, nor stable/deploy backport completion."
+    },
+    {
+      "id": "user-ingress",
+      "host": "arc99x1",
+      "units": [
+        "parth-user-proxy-lb.service"
+      ],
+      "repository": null,
+      "source_commit": null,
+      "expected_binary_sha256": null,
+      "branch_mapping": "rollout_archival_pending",
+      "evidence": "Nginx platform package; config hash and current 75:0:25 upstream weights observed. Pool installer and role-split scripts remain outside deployment branch."
+    }
+  ],
+  "topology": {
+    "user_pool": {
+      "entry": "arc99x1",
+      "weights": {
+        "arc99x1": 75,
+        "arc99x3": 0,
+        "arc99x4": 25
+      }
+    },
+    "system_proxy": "arc99x3",
+    "disabled_roles": [
+      "arc99x1/system",
+      "arc99x3/user"
+    ],
+    "faucet_host": "gcp-coordinator-worker",
+    "worker_host": "arc99x2"
+  },
+  "constraints": [
+    "Never select the deployment branch tip as the build source of all components.",
+    "Unknown or composite source provenance blocks rebuild/replacement, not continued use of the current verified artifact.",
+    "Hashes of installed files are not running executable attestations.",
+    "This map is not a health check and does not authorize runtime, config, database or circuit changes."
+  ]
+}
