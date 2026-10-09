@@ -248,7 +248,49 @@ impl<C: Clone> ProviderPool<C> {
         Fut: Future<Output = Result<T, E>>,
         K: Fn(&Result<T, E>) -> CallOutcome,
     {
-        let deadline = Instant::now() + self.config.total_timeout;
+        self.call_inner(policy, method, Instant::now() + self.config.total_timeout,
+            |_| true, |result| { let outcome = result.map(&classify).unwrap_or(CallOutcome::Timeout); (Some(outcome), outcome.is_failure()) },
+            f, false).await
+    }
+
+    /// Query-aware adapter entry point. The caller's absolute deadline includes
+    /// time already spent queuing and on other calls in the same operation.
+    /// `eligible` can skip a known missing capability without changing health.
+    /// Classification separates health from retry: `(Some(Application), true)` tries
+    /// another endpoint without penalizing a healthy but unsuitable provider.
+    /// `(None, true)` skips recording entirely when an adapter reused an
+    /// already-recorded failure without making a new observation. In particular,
+    /// this must not reset cooldown like a fresh Application response would.
+    /// The classifier receives `None` on attempt timeout, allowing adapters to
+    /// distinguish a timed-out wire call from local single-flight waiting.
+    /// Expired recovery candidates receive one guarded trial in list order.
+    /// Existing `call` behavior and defaults are deliberately unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_filtered<T, E, F, Fut, K, A>(
+        &self, policy: RetryPolicy, method: &str, deadline: Instant,
+        eligible: A, classify: K, f: F,
+    ) -> Result<T, PoolError<E>>
+    where
+        F: Fn(C) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        K: Fn(Option<&Result<T, E>>) -> (Option<CallOutcome>, bool),
+        A: Fn(&C) -> bool,
+    {
+        self.call_inner(policy, method, deadline, eligible, classify, f, true).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_inner<T, E, F, Fut, K, A>(
+        &self, policy: RetryPolicy, method: &str, deadline: Instant,
+        eligible: A, classify: K, f: F, probe_recovered: bool,
+    ) -> Result<T, PoolError<E>>
+    where
+        F: Fn(C) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        K: Fn(Option<&Result<T, E>>) -> (Option<CallOutcome>, bool),
+        A: Fn(&C) -> bool,
+    {
+        let deadline = deadline.min(Instant::now() + self.config.total_timeout);
         let max_attempts = self.config.max_attempts.clamp(1, self.providers.len());
         let mut tried = vec![false; self.providers.len()];
         let mut last = None;
@@ -256,7 +298,7 @@ impl<C: Clone> ProviderPool<C> {
             if Instant::now() >= deadline {
                 return last.unwrap_or(Err(PoolError::Timeout));
             }
-            let Some(mut guard) = self.begin(&tried) else {
+            let Some(mut guard) = self.begin(&tried, &eligible, probe_recovered) else {
                 return last.unwrap_or(Err(PoolError::Unavailable));
             };
             let index = guard.index;
@@ -265,14 +307,24 @@ impl<C: Clone> ProviderPool<C> {
             let budget = self.config.attempt_timeout.min(deadline.saturating_duration_since(started));
             let result = tokio::time::timeout(budget, f(self.providers[index].client.clone())).await;
             let now = Instant::now();
-            let (outcome, result) = match result {
-                Ok(result) => (classify(&result), result.map_err(PoolError::Provider)),
-                Err(_) => (CallOutcome::Timeout, Err(PoolError::Timeout)),
+            let (outcome, retry, result) = match result {
+                Ok(result) => {
+                    let (outcome, retry) = classify(Some(&result));
+                    (outcome, retry, result.map_err(PoolError::Provider))
+                }
+                Err(_) => {
+                    let (outcome, retry) = classify(None);
+                    (outcome, retry, Err(PoolError::Timeout))
+                },
             };
-            let latency = (outcome != CallOutcome::Timeout).then(|| now - started);
-            self.record(index, outcome, latency, now, guard.probe);
-            guard.recorded = true;
-            if !outcome.is_failure() {
+            if let Some(outcome) = outcome {
+                let latency = (outcome != CallOutcome::Timeout).then(|| now - started);
+                self.record(index, outcome, latency, now, guard.probe);
+                guard.recorded = true;
+            }
+            let observed = outcome.is_some();
+            let outcome = outcome.unwrap_or(CallOutcome::Application);
+            if !retry {
                 return result;
             }
             let provider = &self.providers[index];
@@ -283,6 +335,7 @@ impl<C: Clone> ProviderPool<C> {
                 operator = %provider.operator,
                 quota_group = %provider.quota_group,
                 ?outcome,
+                observed,
                 method,
                 failover = !stop,
                 "RPC provider attempt failed"
@@ -298,13 +351,15 @@ impl<C: Clone> ProviderPool<C> {
     fn begin(
         &self,
         tried: &[bool],
+        eligible: &impl Fn(&C) -> bool,
+        probe_recovered: bool,
     ) -> Option<AttemptGuard<'_, C>> {
         let now = Instant::now();
         let mut health = self.lock();
         let candidates: Vec<Candidate> = health
             .iter()
             .enumerate()
-            .filter(|(index, _)| !tried[*index])
+            .filter(|(index, _)| !tried[*index] && eligible(&self.providers[*index].client))
             .map(|(index, h)| {
                 Candidate {
                     index,
@@ -317,7 +372,7 @@ impl<C: Clone> ProviderPool<C> {
         // After the current choice fails, trial an earlier failed provider
         // whose cooldown has elapsed before moving farther down the list.
         // Reservation under the same lock limits it to one concurrent trial.
-        let index = if tried.iter().any(|tried| *tried) {
+        let index = if probe_recovered || tried.iter().any(|tried| *tried) {
             candidates.iter().filter(|c| c.available && c.index < best
                 && health[c.index].on_probation(now)).map(|c| c.index).min().unwrap_or(best)
         } else {
@@ -872,4 +927,90 @@ mod tests {
         assert_eq!(blank.operator, "p");
         assert_eq!(blank.quota_group, "p");
     }
+    #[tokio::test(start_paused = true)]
+    async fn capability_retry_is_neutral_and_filter_skips_without_attempts() {
+        let p = pool(&[("a", 10), ("b", 10)]);
+        let world = World::default();
+        world.set("a", Mode::Fail(CallOutcome::Application));
+        let run = |result: Option<&Result<&'static str, CallOutcome>>| {
+            let outcome = result.map(classify).unwrap_or(CallOutcome::Timeout);
+            (Some(outcome), result.is_none_or(Result::is_err))
+        };
+        let got = p.call_filtered(Safe, "history", Instant::now() + Duration::from_secs(6),
+            |_| true, run, |name| world.run(name)).await.unwrap();
+        assert_eq!(got, "b");
+        assert_eq!(world.calls(), vec!["a", "b"]);
+        assert_eq!(p.snapshot()[0].health, 100.0);
+        assert_eq!(p.snapshot()[0].consecutive_failures, 0);
+        world.set("a", Mode::Ok);
+        assert_eq!(p.call_filtered(Safe, "history", Instant::now() + Duration::from_secs(6),
+            |name| *name != "a", run, |name| world.run(name)).await.unwrap(), "b");
+        assert_eq!(call(&p, &world, Safe).await.unwrap(), "a");
+        assert!(matches!(p.call_filtered(Safe, "history", Instant::now(), |_| true,
+            run, |name| world.run(name)).await, Err(PoolError::Timeout)));
+        assert!(matches!(p.call_filtered(Safe, "history", Instant::now() + Duration::from_secs(6), |_| false,
+            run, |name| world.run(name)).await, Err(PoolError::Unavailable)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn filtered_recovery_probes_preferred_endpoint_once_and_cancellation_releases_it() {
+        let p = pool(&[("a", 10), ("b", 10)]);
+        let world = World::default();
+        world.set("a", Mode::Fail(CallOutcome::Transport));
+        assert_eq!(call(&p, &world, Safe).await.unwrap(), "b");
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let gate = Arc::new(Notify::new());
+        world.set("a", Mode::Gate(gate));
+        let task = {
+            let p = p.clone(); let world = world.clone();
+            tokio::spawn(async move {
+                p.call_filtered(Safe, "recover", Instant::now() + Duration::from_secs(6), |_| true,
+                    |r| { let o = r.map(classify).unwrap_or(CallOutcome::Timeout); (Some(o), o.is_failure()) }, |name| world.run(name)).await
+            })
+        };
+        tokio::task::yield_now().await;
+        for _ in 0..10 {
+            assert_eq!(p.call_filtered(Safe, "recover", Instant::now() + Duration::from_secs(6), |_| true,
+                |r| { let o = r.map(classify).unwrap_or(CallOutcome::Timeout); (Some(o), o.is_failure()) }, |name| world.run(name)).await.unwrap(), "b");
+        }
+        assert_eq!(world.calls().iter().filter(|name| **name == "a").count(), 2);
+        task.abort(); let _ = task.await;
+        world.set("a", Mode::Ok);
+        assert_eq!(p.call_filtered(Safe, "recover", Instant::now() + Duration::from_secs(6), |_| true,
+            |r| { let o = r.map(classify).unwrap_or(CallOutcome::Timeout); (Some(o), o.is_failure()) }, |name| world.run(name)).await.unwrap(), "a");
+        assert_eq!(p.snapshot()[0].health, 100.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_deadline_bounds_filtered_retries_and_no_retry_remains_one_attempt() {
+        let p = pool(&[("a", 10), ("b", 10)]);
+        let world = World::default();
+        world.set("a", Mode::Hang);
+        let start = Instant::now();
+        assert!(matches!(p.call_filtered(Safe, "deadline", start + Duration::from_millis(120), |_| true,
+            |r| { let o = r.map(classify).unwrap_or(CallOutcome::Timeout); (Some(o), o.is_failure()) }, |name| world.run(name)).await, Err(PoolError::Timeout)));
+        assert_eq!(Instant::now() - start, Duration::from_millis(120));
+        assert_eq!(world.calls(), vec!["a"]);
+        let p = pool(&[("a", 10), ("b", 10)]);
+        world.set("a", Mode::Fail(CallOutcome::Application));
+        let before = world.calls().len();
+        assert!(p.call_filtered(NoRetry, "single", Instant::now() + Duration::from_secs(6), |_| true,
+            |r| (Some(r.map(classify).unwrap_or(CallOutcome::Timeout)), true), |name| world.run(name)).await.is_err());
+        assert_eq!(world.calls().len(), before + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_wait_timeout_can_release_probe_without_recording_provider_failure() {
+        let p = pool(&[("a", 10)]);
+        let world = World::default();
+        world.set("a", Mode::Hang);
+        let result = p.call_filtered(Safe, "identity-wait", Instant::now() + Duration::from_secs(1),
+            |_| true, |r| { assert!(r.is_none()); (None, true) }, |name| world.run(name)).await;
+        assert!(matches!(result, Err(PoolError::Timeout)));
+        assert_eq!(p.snapshot()[0].consecutive_failures, 0);
+        assert_eq!(p.snapshot()[0].health, 100.0);
+        world.set("a", Mode::Ok);
+        assert_eq!(call(&p, &world, Safe).await.unwrap(), "a");
+    }
+
 }
