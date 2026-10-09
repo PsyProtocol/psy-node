@@ -36,7 +36,7 @@ manifest, preserve the old-chain Genesis/setup, and compare current state first.
 | Coordinator Edge | Node `876c1432` | Exact hotfix artifact; stable fixes integrated as `1c0863fa` and predecessors |
 | Realm Edges 0/1 | Node `4ff86c81` | EndCap handoff live backport; stable `6eb53500`, deploy merge `9f4bcff5`; separate from Coordinator Edge |
 | Relayer | Node `d1f0e4fc` | Selected changes integrated as `585022a3`; fee policy support in `21af7e5f` |
-| Services API | Services `b6dd702` | External repository; API pin recorded here, not copied into Node source |
+| Services API | Services `31f7eb8` | L1 RPC failover; see `../services-rpc/DEPLOYED-20261009.md`; stable source pin, Indexers unchanged |
 | Three L2 Indexers | Services `7c1e1f6` | Different from API version; do not update them implicitly with Services |
 | Faucet | Binary SHA256 starts `b244e5f4` | This is NOT a Git SHA. Notes associate it with `619ba2ba` + `5c83064a`; exact build-source attestation missing |
 | x2 Workers | Node `013d70b0`, AVX-512 | Missing runtime allocator/thread-pool backports and installation tooling |
@@ -52,7 +52,9 @@ manifest, so its hash is authoritative while its exact Git source stays null.
 Proxy composite source descriptions are historical build evidence, not proof
 that the dependency revisions/patches are remotely published or reproduced.
 
-All eight hosts were sampled at 06:52:49-06:53:42 UTC on 2026-10-09. The four
+All eight hosts were initially sampled at 06:52:49-06:53:42 UTC on 2026-10-09.
+The gcp-cp-ce snapshot was refreshed after the 07:28:59 UTC Services rollout;
+only its Services process changed. Other hosts retain their original timestamps. The four
 offsite snapshots were collected with operator sudo. All mapped, expected
 application binary hashes now match running `/proc/PID/exe`; there are no
 remaining permission gaps in this snapshot. This is not a workload health test.

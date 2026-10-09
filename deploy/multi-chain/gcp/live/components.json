@@ -84,11 +84,11 @@
         "parth-psy-services.service"
       ],
       "repository": "PsyProtocol/psy-services",
-      "source_commit": "b6dd702ad0a0d15a2a9df252795db5e13dce8fb7",
+      "source_commit": "31f7eb8dfbbb13652a028dd217db0d6b28273fba",
       "source_ref": "release/testnet-stable",
-      "expected_binary_sha256": "95a29f85d00ac92ca58db471e8686112bfb29a764d1af9858f11bac8e84e362a",
+      "expected_binary_sha256": "5c6a375362ff4627a57b32c6b6fb1a22954c68a9c56b3c5dbf6ac801c8c02fe8",
       "branch_mapping": "external_repo_pin_recorded",
-      "evidence": "Live BUILD-MANIFEST.env source matched running hash; keep Services source in its own repository. MemoryHigh 8 GiB, MemoryMax 12 GiB; retain 95-nostr-scan-state.conf."
+      "evidence": "../services-rpc/DEPLOYED-20261009.md and artifact.json; running /proc hash verified. Services-only L1 RPC update; MemoryHigh 8 GiB, MemoryMax 12 GiB and 95-nostr-scan-state.conf preserved."
     },
     {
       "id": "l2-indexers",
@@ -103,7 +103,7 @@
       "source_ref": "fix/bridge-shared-http-client",
       "expected_binary_sha256": "611f5975dd9291c6e8253491689f018b3935a4e70ec5fd6d8a7044fdddf8e770",
       "branch_mapping": "external_repo_pin_recorded",
-      "evidence": "Live indexer release BUILD-MANIFEST.env and three /proc hashes. Indexers did NOT advance with API b6dd702."
+      "evidence": "Live indexer release BUILD-MANIFEST.env and three /proc hashes. Indexers did NOT advance with API b6dd702 or 31f7eb8."
     },
     {
       "id": "faucet",

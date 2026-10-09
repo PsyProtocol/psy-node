@@ -4,7 +4,7 @@
     {
       "host": "gcp-cp-ce",
       "actual_hostname": "cp-ce.asia-southeast1-b.c.psy-testnet.internal",
-      "observed_at_utc": "2026-10-09T06:52:49.772125+00:00",
+      "observed_at_utc": "2026-10-09T07:29:25.531316+00:00",
       "units": [
         {
           "unit": "parth-coordinator-processor.service",
@@ -111,18 +111,18 @@
         {
           "unit": "parth-psy-services.service",
           "systemd": {
-            "MainPID": "1637580",
+            "MainPID": "1755862",
             "NRestarts": "0",
-            "ExecMainStartTimestampMonotonic": "14350289057056",
+            "ExecMainStartTimestampMonotonic": "14518742053064",
             "Id": "parth-psy-services.service",
             "LoadState": "loaded",
             "ActiveState": "active",
             "SubState": "running",
-            "DropInPaths": "/etc/systemd/system.control/parth-psy-services.service.d/50-MemoryHigh.conf /etc/systemd/system.control/parth-psy-services.service.d/50-MemoryMax.conf /etc/systemd/system/parth-psy-services.service.d/95-nostr-scan-state.conf",
+            "DropInPaths": "/etc/systemd/system.control/parth-psy-services.service.d/50-MemoryHigh.conf /etc/systemd/system.control/parth-psy-services.service.d/50-MemoryMax.conf /etc/systemd/system/parth-psy-services.service.d/95-nostr-scan-state.conf /etc/systemd/system/parth-psy-services.service.d/99-l1-rpc-failover-20261009.conf",
             "UnitFileState": "enabled"
           },
-          "executable": "/opt/parth/psy-services/releases/20261007-claimable-b6dd702-95a29f85/target/release/psy-services",
-          "sha256": "95a29f85d00ac92ca58db471e8686112bfb29a764d1af9858f11bac8e84e362a",
+          "executable": "/opt/parth/psy-services/releases/20261009-rpc-31f7eb8dfbbb-5c6a375362ff/target/release/psy-services",
+          "sha256": "5c6a375362ff4627a57b32c6b6fb1a22954c68a9c56b3c5dbf6ac801c8c02fe8",
           "identity_verified": true
         },
         {
