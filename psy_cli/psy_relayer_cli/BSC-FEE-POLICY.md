@@ -1,9 +1,11 @@
 # Live-compatible BSC fee policy
 
-Candidate base: `db37dce542f10570dfb66b75b222ca76fab29912` (the deployed
-Relayer RPC pool source). This selectively ports the fee policy from the
-uncommitted `psy-node-relayer-bsc-fee-20261006` candidate. It is not a merge of
-that candidate or a new network release.
+Original protection: `d1f0e4fc3b69d9bed90c1e829d4928cc68125bc8`, based on
+the deployed RPC pool `db37dce542f10570dfb66b75b222ca76fab29912`.
+The cost-aware extension is prepared against maintenance baseline
+`6eb535003bdab1fcdb27386dbcb93e8aa9727998`; its fee helper matches the live
+protection before this extension. This is not an authorization to deploy the
+whole maintenance branch over a component-specific live release.
 
 ## Scope
 
@@ -43,12 +45,62 @@ can use `[finalize.fee_policy]`. Standalone finalize/withdrawal commands accept
 `--l1-fee-policy` as JSON with the same fields. Unknown policy fields, zero
 minimum, inverted caps, and an expected chain ID other than 97 are rejected.
 
+### Cost-aware BSC mode (explicit opt-in)
+
+The October 9 audit found 650 successful transactions costing 0.213767839 tBNB
+by 20:21 UTC+8, all at 1 gwei. The live minimum, priority cap and total cap were
+all 1 gwei. Local priority quotes were 0.1 gwei; Alchemy quoted 1 gwei while its
+positive recent fee-history samples were typically 0.1 gwei. Thus simply lowering
+the minimum does not prevent provider failover from raising the price again.
+
+Proposed BSC-only configuration, requiring a separate approved rollout:
+
+```toml
+[chains.fee_policy]
+expected_chain_id = 97
+quote_strategy = "recent_history"
+min_priority_fee_wei = 100000000
+max_priority_fee_wei = 1000000000
+max_fee_per_gas_wei = 1000000000
+```
+
+- Use the same ten-block, 20th-percentile history request (no additional RPCs).
+  Ignore empty/zero reward rows. With at least three positive rows, take their
+  upper median and add 20% headroom, rounded up; do not take the maximum with
+  the provider priority quote in this mode. Three rows are a minimum evidence
+  threshold, not a guarantee of inclusion; a single outlier cannot lift the median.
+- If history has fewer than three positive rows, use a positive priority quote.
+  This supports the local node's observed one-row/zero-reward response. If the
+  priority quote is also missing/zero, refuse to send rather than invent a quote
+  or trust a single low history sample. Alchemy fallback may still cost 1 gwei
+  when history is insufficient; safety takes precedence over savings.
+- Apply the configured minimum and enforce both caps as before. An over-budget
+  history estimate is refused, not replaced with a cheaper provider suggestion
+  or clamped to the cap. Base-fee budget and overflow checks remain unchanged.
+- At a 0.1 gwei median the bid is 0.12 gwei; with empty local history and a
+  0.1 gwei priority quote it is 0.1 gwei. Identical gas usage would cost roughly
+  88–90% less than at 1 gwei; actual confirmation latency must be validated.
+- Omitted `quote_strategy` defaults to `"conservative"` and preserves old behavior.
+  Changing the binary alone or retaining a 1 gwei minimum will not lower fees.
+  Unknown strategy names are rejected. Both TOML and standalone JSON accept it.
+- Logs include strategy, selected source, positive sample count, configured floor
+  and final prices, without RPC credentials.
+
+No checkpoint cadence, automatic fee escalation, replacement transactions or
+nonce handling changes are included. Before activation, record latest/pending
+nonces and reconcile any pending transaction. Preserve the old binary and TOML;
+update the candidate binary and BSC table together, then verify real receipt
+prices, confirmation latency and progression of all three chains. If lower bids
+stall, do not blindly restart/rebroadcast: preserve the hash/nonce and use a
+separately authorized pending-transaction recovery. Binary rollback also requires
+restoring the old TOML because old binaries reject the new strategy field.
+
 ## Fee preparation
 
 - Check the RPC chain ID and reject a conflicting explicit transaction chain ID.
 - Require a latest block with a base fee; a zero base fee is valid, a missing
   field is not silently converted to zero.
-- Read `eth_maxPriorityFeePerGas` and ten-block fee history at percentile 20.
+- In the default `conservative` mode, read `eth_maxPriorityFeePerGas` and ten-block fee history at percentile 20.
   Take the greater positive suggestion/median positive reward, then apply the
   configured minimum. Empty, zero, or failed history can use a positive priority
   suggestion; failed priority can use positive history. Without either, refuse.

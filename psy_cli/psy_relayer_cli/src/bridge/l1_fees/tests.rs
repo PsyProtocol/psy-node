@@ -17,7 +17,92 @@ fn policy() -> BscFeePolicy {
         min_priority_fee_wei: 100_000_000,
         max_priority_fee_wei: 2_000_000_000,
         max_fee_per_gas_wei: 10_000_000_000,
+        quote_strategy: BscQuoteStrategy::Conservative,
     }
+}
+
+fn calculate_fees(p: &BscFeePolicy, base: u128, priority: Option<u128>, rewards: &[Vec<u128>]) -> Result<(u128, u128)> {
+    estimate_fees(p, base, priority, rewards).map(|fees| (fees.tip, fees.max_fee))
+}
+
+fn economical_policy() -> BscFeePolicy {
+    BscFeePolicy {
+        min_priority_fee_wei: 100_000_000,
+        max_priority_fee_wei: 1_000_000_000,
+        max_fee_per_gas_wei: 1_000_000_000,
+        quote_strategy: BscQuoteStrategy::RecentHistory,
+        ..policy()
+    }
+}
+
+#[test]
+fn recent_history_avoids_static_provider_overquote_with_headroom() {
+    // Observed BSC scenario: local quote 0.1 gwei, Alchemy quote 1 gwei,
+    // recent positive rewards mostly 0.1 gwei interspersed with zero rewards.
+    let rewards = vec![vec![0], vec![100_000_000], vec![100_000_000],
+        vec![], vec![110_000_000], vec![100_000_000], vec![900_000_000]];
+    for priority in [None, Some(0), Some(100_000_000), Some(1_000_000_000), Some(u128::MAX)] {
+        let fees = estimate_fees(&economical_policy(), 0, priority, &rewards).unwrap();
+        assert_eq!((fees.tip, fees.max_fee), (120_000_000, 120_000_000));
+        assert_eq!(fees.source, "recent_history_with_headroom");
+        assert_eq!(fees.positive_history_samples, 5);
+    }
+    assert_eq!(calculate_fees(&policy(), 0, Some(1_000_000_000), &rewards).unwrap(),
+        (1_000_000_000, 1_000_000_000));
+}
+
+#[test]
+fn sparse_or_zero_history_falls_back_but_never_invents_a_quote() {
+    for rewards in [vec![], vec![vec![0]; 10], vec![vec![100_000_000]],
+        vec![vec![100_000_000]; 2]] {
+        for priority in [100_000_000, 1_000_000_000] {
+            let fees = estimate_fees(&economical_policy(), 0, Some(priority), &rewards).unwrap();
+            assert_eq!(fees.tip, priority);
+            assert_eq!(fees.source, "priority_fallback");
+        }
+        for priority in [None, Some(0)] {
+            assert!(estimate_fees(&economical_policy(), 0, priority, &rewards)
+                .unwrap_err().downcast_ref::<FeeSourceError>().is_some());
+        }
+    }
+    assert_eq!(calculate_fees(&economical_policy(), 0, Some(1), &[]).unwrap(),
+        (100_000_000, 100_000_000));
+}
+
+#[test]
+fn recent_history_preserves_floor_caps_and_base_fee_budget() {
+    let rewards = vec![vec![100_000_000]; 3];
+    let mut p = economical_policy();
+    p.min_priority_fee_wei = 1_000_000_000;
+    assert_eq!(calculate_fees(&p, 0, Some(100_000_000), &rewards).unwrap(),
+        (1_000_000_000, 1_000_000_000));
+    p = economical_policy();
+    assert_eq!(calculate_fees(&p, 100_000_000, None, &rewards).unwrap(),
+        (120_000_000, 320_000_000));
+    assert!(calculate_fees(&p, 500_000_000, None, &rewards).is_err());
+    assert!(calculate_fees(&p, 0, Some(1), &vec![vec![900_000_000]; 3]).is_err());
+    assert!(calculate_fees(&p, 0, None, &vec![vec![u128::MAX]; 3]).is_err());
+    assert!(calculate_fees(&p, u128::MAX, None, &rewards).is_err());
+    assert!(calculate_fees(&p, 0, Some(2_000_000_000), &[]).is_err());
+}
+
+#[test]
+fn history_headroom_rounds_up_and_filters_empty_zero_rewards() {
+    let mut p = economical_policy();
+    p.min_priority_fee_wei = 1;
+    assert_eq!(calculate_fees(&p, 0, None,
+        &[vec![], vec![0], vec![6], vec![8], vec![7], vec![9]]).unwrap(), (10, 10));
+}
+
+#[test]
+fn quote_strategy_is_explicit_and_old_configs_keep_their_behavior() {
+    let old = r#"{"expected_chain_id":97,"min_priority_fee_wei":1000000000,"max_priority_fee_wei":1000000000,"max_fee_per_gas_wei":1000000000}"#;
+    let p: BscFeePolicy = old.parse().unwrap();
+    assert_eq!(p.quote_strategy, BscQuoteStrategy::Conservative);
+    let new = r#"{"expected_chain_id":97,"min_priority_fee_wei":100000000,"max_priority_fee_wei":1000000000,"max_fee_per_gas_wei":1000000000,"quote_strategy":"recent_history"}"#;
+    let p: BscFeePolicy = new.parse().unwrap();
+    assert_eq!(p.quote_strategy, BscQuoteStrategy::RecentHistory);
+    assert!(new.replace("recent_history", "typo").parse::<BscFeePolicy>().is_err());
 }
 
 #[test]
@@ -199,6 +284,46 @@ async fn real_alloy_fillers_preserve_fees_and_sign_without_broadcast() {
         let calls = rpc.calls.lock().unwrap();
         assert_eq!(calls.iter().filter(|m| *m == "eth_feeHistory").count(), 1);
         assert!(!calls.iter().any(|m| m.starts_with("eth_send")));
+    }
+}
+
+#[tokio::test]
+async fn recent_history_is_preserved_by_real_fillers_without_broadcast() {
+    let rewards = json!([["0x5f5e100"], ["0x0"], ["0x5f5e100"], ["0x5f5e100"]]);
+    for priority in [json!("0x3b9aca00"), Value::Null] {
+        let rpc = MockRpc::new(97, priority, rewards.clone());
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(PrivateKeySigner::random()))
+            .connect_http(rpc.url.clone());
+        let mut tx = TransactionRequest::default().to(alloy_primitives::Address::ZERO);
+        prepare_l1_fees(&provider, &mut tx, Some(&economical_policy())).await.unwrap();
+        let signed = provider.fill(tx).await.unwrap();
+        let envelope = signed.as_envelope().unwrap();
+        assert!(envelope.is_eip1559());
+        assert_eq!(envelope.chain_id(), Some(97));
+        assert_eq!(envelope.max_priority_fee_per_gas(), Some(120_000_000));
+        assert_eq!(envelope.max_fee_per_gas(), 120_000_000);
+        let calls = rpc.calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|m| *m == "eth_feeHistory").count(), 1);
+        assert!(!calls.iter().any(|m| m.starts_with("eth_send")));
+    }
+}
+
+#[tokio::test]
+async fn recent_history_refuses_over_budget_or_unusable_sources_before_fill() {
+    for (priority, rewards) in [
+        (json!("0x5f5e100"), json!(vec![vec!["0x3b9aca00"]; 3])),
+        (Value::Null, json!([["0x5f5e100"]])),
+        (Value::Null, Value::Null),
+    ] {
+        let rpc = MockRpc::new(97, priority, rewards);
+        let provider = ProviderBuilder::new().connect_http(rpc.url.clone());
+        let mut tx = TransactionRequest::default();
+        let before = tx.clone();
+        let error = prepare_l1_fees(&provider, &mut tx, Some(&economical_policy())).await.unwrap_err();
+        assert!(is_fee_preparation_error(&error));
+        assert_eq!(tx, before);
+        assert!(!rpc.calls.lock().unwrap().iter().any(|m| m.starts_with("eth_send")));
     }
 }
 

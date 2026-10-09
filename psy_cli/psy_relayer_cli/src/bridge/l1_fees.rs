@@ -10,6 +10,17 @@ use serde::Deserialize;
 // its failover finish; the old candidate's 4s cutoff cancelled it too early.
 const FEE_RPC_TIMEOUT: Duration = Duration::from_secs(35);
 const FEE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(70);
+const MIN_POSITIVE_HISTORY_SAMPLES: usize = 3;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BscQuoteStrategy {
+    /// Preserve the original policy for configurations that omit the new field.
+    #[default]
+    Conservative,
+    /// Prefer observed inclusion prices over provider-specific static quotes.
+    RecentHistory,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +29,8 @@ pub struct BscFeePolicy {
     pub min_priority_fee_wei: u64,
     pub max_priority_fee_wei: u64,
     pub max_fee_per_gas_wei: u64,
+    #[serde(default)]
+    pub quote_strategy: BscQuoteStrategy,
 }
 
 impl BscFeePolicy {
@@ -68,25 +81,53 @@ pub fn is_fee_preparation_error(error: &anyhow::Error) -> bool {
         || error.downcast_ref::<FeeSourceError>().is_some()
 }
 
-fn calculate_fees(
+#[derive(Debug)]
+struct FeeEstimate {
+    tip: u128,
+    max_fee: u128,
+    source: &'static str,
+    positive_history_samples: usize,
+}
+
+fn estimate_fees(
     policy: &BscFeePolicy,
     base_fee: u128,
     priority_suggestion: Option<u128>,
     rewards: &[Vec<u128>],
-) -> Result<(u128, u128)> {
+) -> Result<FeeEstimate> {
     policy.validate()?;
     let mut samples: Vec<u128> = rewards.iter().filter_map(|row| row.first().copied())
         .filter(|fee| *fee > 0).collect();
     samples.sort_unstable();
     let history_tip = samples.get(samples.len() / 2).copied();
-    let suggested_tip = priority_suggestion.filter(|fee| *fee > 0).max(history_tip)
-        .ok_or(FeeSourceError("no positive priority suggestion or history; refusing unprotected fallback"))?;
+    let priority = priority_suggestion.filter(|fee| *fee > 0);
+    let (suggested_tip, source) = match policy.quote_strategy {
+        BscQuoteStrategy::Conservative => (
+            priority.max(history_tip).ok_or(FeeSourceError(
+                "no positive priority suggestion or history; refusing unprotected fallback",
+            ))?,
+            "conservative_max",
+        ),
+        BscQuoteStrategy::RecentHistory if samples.len() >= MIN_POSITIVE_HISTORY_SAMPLES => {
+            let median = samples[samples.len() / 2];
+            // 20% inclusion headroom, rounded UP. Avoid multiplication overflow.
+            let margin = median / 5 + u128::from(median % 5 != 0);
+            (median.checked_add(margin).context("history fee headroom overflow")?,
+                "recent_history_with_headroom")
+        }
+        BscQuoteStrategy::RecentHistory => (
+            priority.ok_or(FeeSourceError(
+                "insufficient positive fee history and no positive priority suggestion",
+            ))?,
+            "priority_fallback",
+        ),
+    };
     let tip = suggested_tip.max(u128::from(policy.min_priority_fee_wei));
     ensure!(tip <= u128::from(policy.max_priority_fee_wei), "required priority fee exceeds configured cap");
     let max_fee = base_fee.checked_mul(2).and_then(|v| v.checked_add(tip))
         .context("EIP-1559 fee arithmetic overflow")?;
     ensure!(max_fee <= u128::from(policy.max_fee_per_gas_wei), "required max fee exceeds configured cap");
-    Ok((tip, max_fee))
+    Ok(FeeEstimate { tip, max_fee, source, positive_history_samples: samples.len() })
 }
 
 fn fill_or_validate(
@@ -144,10 +185,13 @@ pub async fn prepare_l1_fees<P: Provider>(
             .ok_or(FeeSourceError("latest block has no EIP-1559 base fee"))?;
         let rewards = history.ok().and_then(|r| r.ok()).and_then(|h| h.reward).unwrap_or_default();
         let suggestion = priority.ok().and_then(|r| r.ok()).filter(|fee| *fee > 0);
-        let (tip, max_fee) = calculate_fees(policy, base_fee.into(), suggestion, &rewards)?;
-        fill_or_validate(tx, policy, tip, max_fee)?;
+        let fees = estimate_fees(policy, base_fee.into(), suggestion, &rewards)?;
+        fill_or_validate(tx, policy, fees.tip, fees.max_fee)?;
         tx.chain_id = Some(chain_id);
         tracing::info!(chain_id, policy = "bsc_guarded_eip1559", base_fee_wei = base_fee,
+            quote_strategy = ?policy.quote_strategy, quote_source = fees.source,
+            positive_history_samples = fees.positive_history_samples,
+            configured_floor_wei = policy.min_priority_fee_wei,
             priority_rpc_wei = ?suggestion, history_rows = rewards.len(),
             max_priority_fee_wei = ?tx.max_priority_fee_per_gas,
             max_fee_per_gas_wei = ?tx.max_fee_per_gas, gas_limit = ?tx.gas,
