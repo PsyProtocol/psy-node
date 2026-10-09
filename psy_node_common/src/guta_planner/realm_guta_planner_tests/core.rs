@@ -27,7 +27,7 @@ mod tests {
     use psy_io::tokio::TokioLikeFileSystem;
     use psy_node_core::{
         file::memory_fs::SimpleMockMemoryFileSystem,
-        psy_temp_db::QTempDBProofWitnessReader,
+        psy_temp_db::{QTempDBProofWitnessReader, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter},
     };
     use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
@@ -368,6 +368,95 @@ mod tests {
         assert_eq!(planner.total_end_caps_processed, 1);
         assert!(planner.end_cap_straggler.is_some());
         assert!(planner.user_leaf_updates_ffs.len() > 0);
+        Ok(())
+    }
+
+    /// The realm edge republishes an end cap into the next batch when the batch
+    /// rotates while it publishes, so both copies can reach the planner. The
+    /// realm tree carries over between batches, so once the first copy is
+    /// included the restaged copy no longer matches the user's leaf and must be
+    /// skipped rather than applied twice.
+    #[tokio::test]
+    async fn restaged_end_cap_copy_is_skipped_after_the_first_copy_is_included() -> anyhow::Result<()> {
+        let (mut chain_state, user_a, _user_b) = test_chain_with_two_users_and_one_contract().await?;
+        chain_state.unique_pending_id += 1;
+        let first_pending_id = chain_state.unique_pending_id;
+        let item_a = chain_state.run_ups_for_user(user_a, &one_contract_update()).await?;
+
+        let realm_tree_height = N::REALM_GLOBAL_USER_TREE_HEIGHT;
+        let mut realm_tree = RecTree::new(realm_tree_height);
+        let backup_file_system = SimpleMockMemoryFileSystem::new();
+        let mut backup_file = backup_file_system.file_like_fs_create("backups/restaged_copy_test").await?;
+        let new_planner = |unique_pending_id: u64, realm_root: Hash| {
+            RealmGUTAPlanner::<F, Hash>::new(
+                chain_state.chain_id,
+                chain_state.realm_identifier,
+                chain_state.checkpoint_tree_root,
+                chain_state.checkpoint_id,
+                unique_pending_id,
+                realm_root,
+                realm_tree_height,
+                N::GLOBAL_USER_TREE_HEIGHT,
+                chain_state.guta_circuit_whitelist,
+            )
+        };
+
+        let mut first_batch = new_planner(first_pending_id, realm_tree.get_root());
+        let first_batch_min_user_id = first_batch.realm_user_min_id;
+        let added = first_batch
+            .add_end_cap_job(
+                &chain_state.checkpoint_tree,
+                &mut realm_tree,
+                &mut backup_file,
+                chain_state.temp_db.clone(),
+                &item_a.psy_ser_to_bytes_vec()?,
+                item_a.clone(),
+            )
+            .await?;
+        assert_eq!(added, 1);
+        // a lone end cap is written into the realm tree when its batch is finalized,
+        // which the gatherer always does before it starts gathering the next batch
+        first_batch
+            .finalize_with_reward_ids(&chain_state.checkpoint_tree, &mut realm_tree, chain_state.temp_db.clone(), 0, 0)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected a planner output for the first batch"))?;
+        let min_user_id = first_batch_min_user_id;
+        let included_leaf = realm_tree.get_leaf_value(user_a - min_user_id);
+        assert_eq!(included_leaf, item_a.new_user_leaf_hash);
+
+        // the edge restages the same end cap, with all of its artifacts, into the next batch
+        let restaged_pending_id = first_pending_id + 1;
+        let contract_updates = chain_state
+            .temp_db
+            .get_contract_updates_for_user(&chain_state.realm_identifier, first_pending_id, user_a)
+            .await?
+            .expect("contract updates of the first copy");
+        chain_state
+            .temp_db
+            .set_contract_updates_for_user(&chain_state.realm_identifier, restaged_pending_id, user_a, contract_updates)
+            .await?;
+        let mut restaged = item_a.clone();
+        restaged.job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+            user_a,
+            N::GLOBAL_USER_TREE_HEIGHT,
+            restaged_pending_id,
+        )?;
+
+        let mut next_batch = new_planner(restaged_pending_id, realm_tree.get_root());
+        let added = next_batch
+            .add_end_cap_job(
+                &chain_state.checkpoint_tree,
+                &mut realm_tree,
+                &mut backup_file,
+                chain_state.temp_db.clone(),
+                &restaged.psy_ser_to_bytes_vec()?,
+                restaged,
+            )
+            .await?;
+        assert_eq!(added, 0, "the restaged copy must not be applied a second time");
+        assert_eq!(next_batch.total_end_caps_processed, 0);
+        assert!(next_batch.end_cap_straggler.is_none());
+        assert_eq!(realm_tree.get_leaf_value(user_a - min_user_id), included_leaf);
         Ok(())
     }
 }
