@@ -367,6 +367,7 @@ async fn claim_withdrawal_chunks(
         config.finalize.keystore_path.as_deref().map(Path::new),
         config.finalize.password_env.as_deref().unwrap_or("WALLET_PASSWORD"),
         prove_proxy_url,
+        config.finalize.fee_policy.as_ref(),
     )
     .await?;
     total.requested += report.requested;

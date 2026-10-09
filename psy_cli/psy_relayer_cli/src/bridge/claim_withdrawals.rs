@@ -74,15 +74,17 @@ pub struct BatchWithdrawalsReport {
     #[serde(default)]
     pub failure_reasons: HashMap<String, String>,
     /// Withdrawals held back for a reason that resolves on its own, and that
-    /// therefore must not spend one of the claim's limited attempts. Today
-    /// that means waiting for bridge liquidity: the claim is correct, the
-    /// bridge simply cannot pay it yet.
+    /// therefore must not spend one of the claim's limited attempts, such as
+    /// waiting for bridge liquidity or an acceptable pre-broadcast fee quote.
     #[serde(default)]
     pub deferrals: HashMap<String, String>,
 }
 
 #[derive(Clone, Args)]
 pub struct BatchWithdrawalsArgs {
+    /// Optional guarded BSC fee policy as JSON (all prices in wei).
+    #[arg(long)]
+    pub l1_fee_policy: Option<super::l1_fees::BscFeePolicy>,
     #[arg(long)]
     pub input_json: PathBuf,
     #[arg(long)]
@@ -529,6 +531,7 @@ pub async fn submit_batch(
     keystore_path: Option<&Path>,
     password_env: &str,
     prove_proxy_url: Option<&str>,
+    fee_policy: Option<&super::l1_fees::BscFeePolicy>,
 ) -> Result<BatchWithdrawalsReport> {
     let _phantom_c: std::marker::PhantomData<C> = std::marker::PhantomData;
     if withdrawals.is_empty() {
@@ -557,6 +560,21 @@ pub async fn submit_batch(
         .parse()
         .with_context(|| format!("invalid L1 rpc url: {}", l1_rpc_url))?;
     let provider = connect_l1_with_wallet(rpc_url, wallet)?;
+    // All fee preparation failures occur before broadcast, so preserve claims
+    // without spending their limited attempts, even during an RPC outage.
+    if let Err(error) = super::l1_fees::prepare_l1_fees(
+        &provider, &mut TransactionRequest::default(), fee_policy,
+    ).await {
+        tracing::warn!(%error, "withdrawal fees deferred before proof generation");
+        return Ok(BatchWithdrawalsReport {
+            requested: withdrawals.len(),
+            submitted_count: 0,
+            already_claimed_count: 0,
+            resolved_leaf_hashes: Vec::new(),
+            failure_reasons: HashMap::new(),
+            deferrals: withdrawals.iter().map(|w| (w.leaf_hash.clone(), error.to_string())).collect(),
+        });
+    }
     let http = build_default_http_client()?;
 
     let mut submitted_count = 0usize;
@@ -916,7 +934,14 @@ pub async fn submit_batch(
             }
         };
 
-        let tx = TransactionRequest::default().to(bridge).input(call_data.clone().into());
+        let mut tx = TransactionRequest::default().to(bridge).input(call_data.clone().into());
+        if let Err(error) = super::l1_fees::prepare_l1_fees(&provider, &mut tx, fee_policy).await {
+            tracing::warn!(%error, "withdrawal fee policy deferred chunk before broadcast");
+            for claim in &meta.chunk {
+                deferrals.insert(claim.withdrawal.leaf_hash.clone(), error.to_string());
+            }
+            continue;
+        }
         let gas = match provider.estimate_gas(tx.clone()).await {
             Ok(gas) => gas,
             Err(err) => {
@@ -1070,17 +1095,21 @@ pub async fn run(args: BatchWithdrawalsArgs) -> Result<()> {
         args.keystore_path.as_deref(),
         &args.password_env,
         None,
+        args.l1_fee_policy.as_ref(),
     )
     .await?;
 
     println!(
-        "batch withdrawals: requested={}, submitted_count={}, already_claimed_count={}, resolved={}, failed={}",
+        "batch withdrawals: requested={}, submitted_count={}, already_claimed_count={}, resolved={}, failed={}, deferred={}",
         report.requested,
         report.submitted_count,
         report.already_claimed_count,
         report.resolved_leaf_hashes.len(),
-        report.failure_reasons.len()
+        report.failure_reasons.len(),
+        report.deferrals.len()
     );
+    anyhow::ensure!(args.l1_fee_policy.is_none() || report.deferrals.is_empty(),
+        "withdrawal claims deferred; not all requested claims were submitted");
     Ok(())
 }
 
