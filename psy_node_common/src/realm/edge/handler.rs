@@ -55,6 +55,11 @@ use crate::realm::{
 };
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
+/// How many times one end-cap submission may follow the gathering batch into a
+/// newer batch. Batches rotate tens of seconds apart and a submission takes
+/// milliseconds, so one restage is already rare; running out means the batch is
+/// rotating abnormally and the caller must not be told the end cap was accepted.
+const MAX_END_CAP_RESTAGES: usize = 3;
 pub struct RealmEdgeHandler<
     N: QNetworkTypesConfig,
     S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -426,8 +431,6 @@ impl<
             .await?;
         timer.lap_micros("checkpoint_tree_get_merkle_proof");
 
-        let job_id =
-            QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
         //println!("checkpoint_tree_proof: {:#?}", checkpoint_tree_proof);
         //println!("verify_checkpoint_tree_proof: {}", checkpoint_tree_proof.verify::<N::HasherBase>());
         let historical_root = checkpoint_tree_proof.get_append_root::<N::HasherBase>();
@@ -485,8 +488,120 @@ impl<
         }).await??;
         timer.lap_micros("verify_zk_proof");
 
-        // TODO: maybe modify the job_id.sub_group_id
+        // One random value per submission, reused in whichever batch the end cap
+        // lands in: it is both the submit-guard status and the fake checkpoint id
+        // the processor matches against the stored contract updates.
         let rand_status = rand::random::<u64>();
+
+        // The processor rotates the gathering batch on its own schedule, and an
+        // end cap belongs to the batch whose queue it reaches. Its proof, job id,
+        // contract updates, slot updates and submit guard must all live under that
+        // batch's pending id: a queue item drained by one batch whose contract
+        // updates sit under another is skipped by the processor, after this RPC
+        // already reported success.
+        //
+        // So stage under the batch that is gathering right now, publish to that
+        // batch's queue, and once the publish is acknowledged check that the batch
+        // is still gathering. If it is, the processor rotates only after the item
+        // is in the stream and drains it with that batch. If it rotated, the copy
+        // may have missed the drain: stage again under the new batch and publish
+        // there too. A copy that was drained after all is applied once; the later
+        // copy no longer matches the user's leaf and the processor skips it.
+        let mut staged: Option<(u64, PsyRealmUserUpdateQueueItem<N::F, N::QHash>)> = None;
+        let mut restages = 0usize;
+        loop {
+            let (live_pending_id, live_proc_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+            let staged_pending_id = staged.as_ref().map(|(staged_pending_id, _)| *staged_pending_id);
+            if staged_pending_id != Some(live_pending_id) {
+                if let Some(staged_pending_id) = staged_pending_id {
+                    if restages == MAX_END_CAP_RESTAGES {
+                        anyhow::bail!(
+                            "gathering batch rotated {} times while publishing the end cap for user_id {} (last staged at unique_pending_id {}); \
+                             a copy may still be included, check the user leaf before resubmitting",
+                            restages + 1,
+                            user_id,
+                            staged_pending_id
+                        );
+                    }
+                    restages += 1;
+                    tracing::warn!(
+                        user_id,
+                        from_unique_pending_id = staged_pending_id,
+                        to_unique_pending_id = live_pending_id,
+                        "Gathering batch rotated during end-cap submission; restaging into the new batch"
+                    );
+                }
+                let queue_item = self
+                    .stage_user_end_cap(&mut timer, live_pending_id, user_id, &user_end_cap_input, &proof_bytes, old_leaf_hash, rand_status)
+                    .await?;
+                staged = Some((live_pending_id, queue_item));
+            }
+            let (_, queue_item) = staged.as_ref().expect("an end cap is staged in the live batch");
+
+            let queue_key = RealmUserUpdateQueueKey {
+                realm_id: self.realm_id_u64,
+                realm_sub_id: self.realm_sub_id_u64,
+                unique_id: live_proc_id,
+                task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral,
+                _phantom_queue_item: std::marker::PhantomData,
+            };
+
+            // Ensure the consumer for live_proc_id exists BEFORE publishing. If
+            // the processor has already drained and deleted the consumer for this
+            // generation, publishing to an ephemeral queue with no consumer silently
+            // drops the message. By ensuring the consumer here, we guarantee the
+            // message will be buffered and picked up by the gatherer on its next
+            // drain cycle — even if the processor has already rotated past this ID.
+            // The consumer we create is idempotent: if it already exists this is a
+            // no-op; if it was deleted, it is recreated with DeliverPolicy::All so
+            // all pending messages are replayed.
+            if let Err(e) = self.user_update_queue.ensure_consumer(
+                &queue_key,
+                self.realm_id_u64,
+                self.realm_sub_id_u64,
+                live_proc_id,
+                0,
+            ).await {
+                tracing::warn!(
+                    "Failed to ensure consumer for live_proc_id {} before publish (continuing): {}",
+                    live_proc_id, e
+                );
+            }
+
+            self.user_update_queue
+                .publish_ephemeral_queue_item_ref(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, live_proc_id, 0, queue_item)
+                .await?;
+            timer.lap_micros("publish_ephemeral_queue_item_ref");
+
+            let (settled_pending_id, _) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+            if settled_pending_id == live_pending_id {
+                break;
+            }
+        }
+        timer.lap_group("handle_user_end_cap_proof_submission total");
+
+        Ok(())
+    }
+
+    /// Stores everything the processor and the workers look up for this end cap
+    /// under batch `unique_pending_id` — submit guard, proof, contract updates and
+    /// slot updates — and returns the queue item that points at it. Calling it
+    /// again for a newer batch moves the end cap there; what it left under the
+    /// older batch stays, since a copy published there may already be drained.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_user_end_cap(
+        &self,
+        timer: &mut DebugTimer,
+        unique_pending_id: u64,
+        user_id: u64,
+        user_end_cap_input: &SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        proof_bytes: &[u8],
+        old_leaf_hash: N::QHash,
+        rand_status: u64,
+    ) -> anyhow::Result<PsyRealmUserUpdateQueueItem<N::F, N::QHash>> {
+        let job_id =
+            QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
 
         let fake_checkpoint_id = rand_status;
         let context = QBlobWriterContextMetadataHeader::new_at_now(
@@ -499,7 +614,7 @@ impl<
             user_id,
         );
         let contract_update_data_for_user =
-            validate_end_cap_and_generate_node_data_for_edge::<N::F, N::QHash, N::HasherBase>(&context, user_id, &user_end_cap_input)?;
+            validate_end_cap_and_generate_node_data_for_edge::<N::F, N::QHash, N::HasherBase>(&context, user_id, user_end_cap_input)?;
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
         timer.lap_micros("ensure_user_has_not_submitted (3)");
         self.temp_db
@@ -523,7 +638,7 @@ impl<
 
         timer.lap_micros("get_submitted_status_for_pending (final)");
         self.proof_store
-            .put_proof_bytes_for_job_id(job_id, unique_pending_id, &proof_bytes)
+            .put_proof_bytes_for_job_id(job_id, unique_pending_id, proof_bytes)
             .await?;
         timer.lap_micros("put_proof_bytes_for_job_id");
         if self
@@ -544,7 +659,7 @@ impl<
         let slot_updates_payload = match self.build_user_end_cap_slot_updates(
             unique_pending_id,
             user_id,
-            &user_end_cap_input,
+            user_end_cap_input,
         ) {
             Ok(payload) => Some(payload),
             Err(err) => {
@@ -598,63 +713,17 @@ impl<
         }
         timer.lap_micros("set_user_end_cap_slot_updates");
 
-        // Re-read gathering proc ID right before publish to avoid a race with
-        // process_block.set_new_unique_ids, which may have advanced the ID
-        // during the async proof verification / storage calls above. Publishing
-        // to a stale (already-drained) queue silently drops the endcap.
-        let (_, live_proc_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
-
-        let queue_key = RealmUserUpdateQueueKey {
-            realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_sub_id_u64,
-            unique_id: live_proc_id,
-            task_group: 0,
-            queue_type: QPBaseQueueType::StandardEphemeral,
-            _phantom_queue_item: std::marker::PhantomData,
-        };
         let new_user_leaf = user_end_cap_input.core.new_user_leaf.clone();
         let new_user_leaf_hash = new_user_leaf.qfhash::<N::HasherBase>();
-        // Keep original job_id (proof stored under it). Only refresh queue key.
-
-        let queue_item = PsyRealmUserUpdateQueueItem {
-            job_id: job_id,
+        Ok(PsyRealmUserUpdateQueueItem {
+            job_id,
             expected_fake_checkpoint_id: fake_checkpoint_id,
             old_user_leaf_hash: old_leaf_hash,
             new_user_leaf_hash,
             new_user_leaf,
             stats: user_end_cap_input.core.stats,
-            events: user_end_cap_input.events,
-        };
-
-        // Ensure the consumer for live_proc_id exists BEFORE publishing. If
-        // the processor has already drained and deleted the consumer for this
-        // generation, publishing to an ephemeral queue with no consumer silently
-        // drops the message. By ensuring the consumer here, we guarantee the
-        // message will be buffered and picked up by the gatherer on its next
-        // drain cycle — even if the processor has already rotated past this ID.
-        // The consumer we create is idempotent: if it already exists this is a
-        // no-op; if it was deleted, it is recreated with DeliverPolicy::All so
-        // all pending messages are replayed.
-        if let Err(e) = self.user_update_queue.ensure_consumer(
-            &queue_key,
-            self.realm_id_u64,
-            self.realm_sub_id_u64,
-            live_proc_id,
-            0,
-        ).await {
-            tracing::warn!(
-                "Failed to ensure consumer for live_proc_id {} before publish (continuing): {}",
-                live_proc_id, e
-            );
-        }
-
-        self.user_update_queue
-            .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, live_proc_id, 0, queue_item)
-            .await?;
-        timer.lap_micros("publish_ephemeral_queue_item_owned");
-        timer.lap_group("handle_user_end_cap_proof_submission total");
-
-        Ok(())
+            events: user_end_cap_input.events.clone(),
+        })
     }
 
 }
@@ -1142,5 +1211,994 @@ impl<
             .try_into()
             .map_err(|_| RpcError::InvalidInput("public_key must be 33 bytes (compressed secp256k1)".to_string()))?;
         res(self.get_worker_reputation_internal(&key).await)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::test_common::{
+        create_test_unified_db, FakeEphemeralQueuePublisher, FakeWorkerQueueSubscriber, TestNetworkConfig,
+        TestUnifiedDatabaseStore, TestZKVerifier,
+    };
+    use parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3;
+    use parth_core::{
+        crypto::hash::tag_tree::{TagTreeMerkleProof, TagTreeNodePreimage, TagTreeProofNode},
+        data::queue::queue_key::PCoreQueueItemBase,
+        felt::{FromPrimitiveValuesFelt, ZeroableFelt},
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::{
+            Q256BitHash, QNetworkHashTypes, QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants,
+            QNetworkZKTypes,
+        },
+        utils::QPGenRandom,
+        PF, PHash,
+    };
+    use psy_data::{
+        guta::stats::GUTAStats,
+        proof_input::guta::{
+            end_cap_input::{ContractStateUpdate, ContractStateUpdateHistory},
+            SubmitUserEndCapNonProofCoreInput,
+        },
+        queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
+        v1::qdata::user_end_cap_result::PUPSEndCapResultCompact,
+    };
+    use psy_node_core::{
+        psy_core_db::traits::full::{
+            PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointTreeDatabaseReader,
+            PsyNodeCoreDatabaseBasicContractInfoStoreWriter, PsyNodeCoreDatabaseUserStoreWriter,
+        },
+        psy_temp_db::{
+            QTempDBJobStatsStore, QTempDBPendingIdWriter, QTempDBSubmitStatusWriter,
+            QTempDBUserContractUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter,
+        },
+        store::traits::proof_store::QParthProofStoreReader,
+    };
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
+
+    pub(crate) type N = TestNetworkConfig;
+
+    pub(crate) const TEST_CHAIN_ID: u32 = 9;
+    pub(crate) const TEST_NODE_ID: u32 = 4;
+    pub(crate) const TEST_REALM_ID: u64 = 1;
+    pub(crate) const TEST_REALM_SUB_ID: u64 = 2;
+    /// A user id that lives inside realm 1 (user ids are partitioned by
+    /// `realm_id * (1 << REALM_GLOBAL_USER_TREE_HEIGHT)`).
+    pub(crate) const REALM_USER_ID: u64 = (1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) + 42;
+    /// A user id that lives inside the next realm (realm 2).
+    const OTHER_REALM_USER_ID: u64 = (2u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT) + 42;
+    const CONTRACT_COUNT: usize = 5;
+    /// All contract state trees and the user contract tree live at the global
+    /// contract tree height, so an untouched UCT leaf (zero hash at that height)
+    /// equals the empty-root of a fresh contract state tree.
+    const CONTRACT_TREE_HEIGHT: u8 = N::GLOBAL_CONTRACT_TREE_HEIGHT;
+
+    pub(crate) fn zh(level: usize) -> PHash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    pub(crate) fn test_realm_identifier() -> QRealmIdentifier {
+        QRealmIdentifier::new(TEST_REALM_ID as u32, TEST_REALM_SUB_ID as u16)
+    }
+
+    /// A ZK "verifier" whose proof type is the public-inputs hash itself: proofs
+    /// are the 32-byte hash, and reading the public inputs echoes the proof back.
+    /// This lets the end-cap submission happy path carry a genuinely matching
+    /// public-inputs hash without any real proving, while staying fully
+    /// deterministic and parallel-safe (no shared mutable state).
+    ///
+    /// `on_verify`, when set, runs inside proof verification, which is where a
+    /// processor batch rotation most often lands in production.
+    #[derive(Default)]
+    pub(crate) struct EndCapEchoVerifier {
+        pub(crate) on_verify: Option<Box<dyn Fn() + Send + Sync>>,
+    }
+
+    impl QZKProofPublicInputsHasherReader<PHash, PHash> for EndCapEchoVerifier {
+        fn get_proof_public_inputs_hash(proof: &PHash) -> anyhow::Result<PHash> {
+            Ok(*proof)
+        }
+        fn try_proof_from_slice(bytes: &[u8]) -> anyhow::Result<PHash> {
+            Ok(PHash::from_ref_32bytes(&bytes.try_into()?))
+        }
+    }
+
+    impl QZKProofVerifier<PHash, PHash> for EndCapEchoVerifier {
+        fn verify_zk_proof(&self, _circuit_type: u32, _proof: &PHash) -> anyhow::Result<PHash> {
+            if let Some(on_verify) = &self.on_verify {
+                on_verify();
+            }
+            Ok(PoseidonHasher::get_zero_hash(1))
+        }
+        fn verify_zk_proof_from_slice_check_public_inputs_hash(
+            &self,
+            _circuit_type: u32,
+            _proof_bytes: &[u8],
+            _expected_public_inputs_hash: PHash,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Network config identical to TestNetworkConfig except the ZK verifier is
+    /// the echo verifier above; used for the end-cap submission paths that check
+    /// the public-inputs hash of the submitted proof.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct EndCapTestNetworkConfig {}
+
+    impl QNetworkTreeCircuitSpecificConstants for EndCapTestNetworkConfig {
+        const GUTA_CIRCUIT_WHITELIST_TREE_HEIGHT: u8 = 4;
+        const MAX_USERS_TO_REGISTER_PER_PROOF: usize = 32;
+        const ONLY_REGISTER_USERS_MAX_USERS_PER_PROOF: usize = 64;
+        const BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT: usize = 8;
+        const BATCH_USER_REGISTRATION_MAX_SUB_TREES: usize = 4;
+        const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize = 8;
+
+        const DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4: [u64; 4] =
+            [3896366420105793420, 17410332186442776169, 7329967984378645716, 6310665049578686403];
+
+        const END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4: [u64; 4] =
+            [1412692327731855940, 17963365021580141687, 10532510199226356508, 3943799806037696098];
+    }
+
+    impl QNetworkTreeConstants for EndCapTestNetworkConfig {
+        const CHECKPOINT_TREE_HEIGHT_USIZE: usize = 32;
+        const CHECKPOINT_TREE_HEIGHT: u8 = Self::CHECKPOINT_TREE_HEIGHT_USIZE as u8;
+
+        const GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 32;
+        const GLOBAL_USER_TREE_HEIGHT: u8 = Self::GLOBAL_USER_TREE_HEIGHT_USIZE as u8;
+
+        const GLOBAL_CONTRACT_TREE_HEIGHT_USIZE: usize = 24;
+        const GLOBAL_CONTRACT_TREE_HEIGHT: u8 = Self::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE as u8;
+
+        const CONTRACT_FUNCTION_TREE_HEIGHT_USIZE: usize = 16;
+        const CONTRACT_FUNCTION_TREE_HEIGHT: u8 = Self::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE as u8;
+
+        const COORDINATOR_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 12;
+        const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = Self::COORDINATOR_GLOBAL_USER_TREE_HEIGHT_USIZE as u8;
+
+        const REALM_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 20;
+        const REALM_GLOBAL_USER_TREE_HEIGHT: u8 = Self::REALM_GLOBAL_USER_TREE_HEIGHT_USIZE as u8;
+
+        const MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE: usize = 32;
+        const MAX_CONTRACT_STATE_TREE_HEIGHT: u8 = Self::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE as u8;
+
+        const GROUP_REALM_HEIGHT: u8 = 1;
+
+        const MAX_USERS: u64 = 1 << Self::GLOBAL_USER_TREE_HEIGHT;
+
+        const MAX_REALMS: u32 = 1 << Self::COORDINATOR_GLOBAL_USER_TREE_HEIGHT;
+
+        const MAX_USERS_PER_REALM: u32 = 1 << Self::REALM_GLOBAL_USER_TREE_HEIGHT;
+    }
+
+    impl QNetworkHashTypes for EndCapTestNetworkConfig {
+        type QHash = PHash;
+        type HasherBase = PoseidonHasher;
+        type F = PF;
+    }
+
+    impl QNetworkZKTypes for EndCapTestNetworkConfig {
+        type ZKProof = PHash;
+        type ZKVerifier = EndCapEchoVerifier;
+    }
+
+    impl QNetworkTypesConfig for EndCapTestNetworkConfig {
+        type JobId = QProvingJobDataID;
+    }
+
+    pub(crate) type RealmEdgeHandlerFor<N> = RealmEdgeHandler<
+        N,
+        TestUnifiedDatabaseStore,
+        TestUnifiedDatabaseStore,
+        FakeEphemeralQueuePublisher,
+        FakeWorkerQueueSubscriber,
+        InMemoryTempStore,
+        InMemoryTempStore,
+    >;
+
+    /// Realm edge handler wired to a fresh in-memory database, temp/proof store
+    /// and fake queues, mirroring how `server.rs` builds the production handler.
+    /// The hash/field types are pinned to the in-memory store's config, so any
+    /// network config sharing them (TestNetworkConfig, the echo config) fits.
+    pub(crate) struct RealmEdgeTestEnv<N>
+    where
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID> + QNetworkHashTypes<F = PF, QHash = PHash>,
+    {
+        pub(crate) handler: RealmEdgeHandlerFor<N>,
+        pub(crate) db: Arc<TestUnifiedDatabaseStore>,
+        pub(crate) temp_db: Arc<InMemoryTempStore>,
+        pub(crate) user_update_queue: Arc<FakeEphemeralQueuePublisher>,
+        pub(crate) work_queue: Arc<FakeWorkerQueueSubscriber>,
+    }
+
+    impl<N> RealmEdgeTestEnv<N>
+    where
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID> + QNetworkHashTypes<F = PF, QHash = PHash>,
+    {
+        pub(crate) async fn create(proof_verifier: Arc<N::ZKVerifier>) -> anyhow::Result<Self> {
+            let db = Arc::new(create_test_unified_db().await?);
+            let tag_tree_rewards_store = Arc::clone(&db);
+            let temp_db = Arc::new(InMemoryTempStore::new("realm_edge_test".to_string(), 1, 2));
+            let proof_store = Arc::clone(&temp_db);
+            let user_update_queue = Arc::new(FakeEphemeralQueuePublisher::new());
+            let work_queue = Arc::new(FakeWorkerQueueSubscriber::new());
+            let handler = RealmEdgeHandler::new(
+                Arc::clone(&db),
+                tag_tree_rewards_store,
+                Arc::clone(&temp_db),
+                proof_store,
+                Arc::clone(&user_update_queue),
+                Arc::clone(&work_queue),
+                test_realm_identifier(),
+                TEST_CHAIN_ID,
+                TEST_NODE_ID,
+                proof_verifier,
+            );
+            // A fresh InMemoryTempStore errors on pending-id reads; seed both
+            // counters so handler reads behave like production (ids at 0).
+            let rid = test_realm_identifier();
+            temp_db.set_unique_pending_ids(&rid, 0, 0).await?;
+            temp_db.set_gathering_unique_pending_ids(&rid, 0, 0).await?;
+            Ok(Self { handler, db, temp_db, user_update_queue, work_queue })
+        }
+    }
+
+    pub(crate) type StandardEnv = RealmEdgeTestEnv<TestNetworkConfig>;
+    pub(crate) type EndCapEnv = RealmEdgeTestEnv<EndCapTestNetworkConfig>;
+
+    async fn end_cap_env() -> anyhow::Result<EndCapEnv> {
+        RealmEdgeTestEnv::create(Arc::new(EndCapEchoVerifier::default())).await
+    }
+
+    /// Seeds contract state tree height metadata for contracts 0..CONTRACT_COUNT
+    /// at checkpoint 0 (reads use max-checkpoint semantics, so this is visible
+    /// at MAX_CHECKPOINT_ID).
+    async fn seed_contract_heights(env: &EndCapEnv) -> anyhow::Result<()> {
+        let heights = (0..CONTRACT_COUNT as u64).map(|id| (id, CONTRACT_TREE_HEIGHT)).collect::<Vec<_>>();
+        env.db.set_contract_tree_heights(0, &heights).await
+    }
+
+    /// The append root the handler will compute for the checkpoint-tree proof of
+    /// leaf 0 (the only committed checkpoint on a fresh database is 0).
+    pub(crate) async fn checkpoint_tree_append_root_zero(db: &TestUnifiedDatabaseStore) -> anyhow::Result<PHash> {
+        let proof = db.checkpoint_tree_get_merkle_proof(u64::MAX - 0xFFFF, 0).await?;
+        Ok(proof.get_append_root::<PoseidonHasher>())
+    }
+
+    /// Builds a self-consistent end-cap submission input for `user_id` whose
+    /// every gate matches a fresh realm database:
+    /// - the user has no committed leaf, so the start hash is the zero value
+    ///   (the handler derives the same from the empty global user tree);
+    /// - the user contract tree starts empty (root = zero hash at the contract
+    ///   tree height), matching the handler's fallback zero user leaf;
+    /// - checkpoint ids are 0 on both sides.
+    fn gen_end_cap_input(user_id: u64, checkpoint_tree_root: PHash) -> SubmitUserEndCapNonProofInput<PF, PHash> {
+        type Hasher = PoseidonHasher;
+        let mut user_contract_tree = SimpleMemoryMerkleStoreV3::<Hasher, PHash>::new(CONTRACT_TREE_HEIGHT);
+        let mut contract_state_updates = Vec::with_capacity(CONTRACT_COUNT);
+        for contract_id in 0..CONTRACT_COUNT as u64 {
+            let mut contract_state_tree = SimpleMemoryMerkleStoreV3::<Hasher, PHash>::new(CONTRACT_TREE_HEIGHT);
+            // deterministic per-contract leaf writes: distinct slots per contract
+            let updates = (0..8u64)
+                .map(|i| {
+                    let leaf_id = contract_id * 16 + i;
+                    let value = PHash::from_values(1000 + contract_id * 10 + i, 0, 0, 0);
+                    contract_state_tree.set_leaf(leaf_id, value)
+                })
+                .collect::<Vec<_>>();
+            let end_root = contract_state_tree.get_root();
+            let user_contract_tree_update_proof = user_contract_tree.set_leaf(contract_id, end_root);
+            contract_state_updates.push(ContractStateUpdateHistory {
+                user_contract_tree_update_proof,
+                updates: updates
+                    .into_iter()
+                    .map(|delta_proof| ContractStateUpdate::Positional { delta_proof })
+                    .collect(),
+            });
+        }
+        let new_user_contract_tree_root = user_contract_tree.get_root();
+
+        let user_id_f = PF::from_u64_value(user_id);
+        // exactly the fallback leaf the handler serves for a missing user
+        let old_user_leaf = PQEDUserLeaf {
+            public_key: PHash::get_zero_value(),
+            user_state_tree_root: zh(CONTRACT_TREE_HEIGHT as usize),
+            balance: PF::ZERO_VALUE,
+            nonce: PF::ZERO_VALUE,
+            last_checkpoint_id: PF::ZERO_VALUE,
+            event_index: PF::ZERO_VALUE,
+            user_id: user_id_f,
+        };
+        assert!(old_user_leaf.is_first_transaction_old_user_leaf());
+
+        let new_user_leaf = PQEDUserLeaf {
+            user_id: user_id_f,
+            last_checkpoint_id: PF::ZERO_VALUE,
+            user_state_tree_root: new_user_contract_tree_root,
+            public_key: PHash::from_values(user_id, 7, 8, 9),
+            balance: PF::from_u64_value(1_000_000),
+            nonce: PF::from_u64_value(1),
+            event_index: PF::from_u64_value(1),
+        };
+        let state_transition = PUPSEndCapResultCompact {
+            start_user_leaf_hash: PHash::get_zero_value(),
+            end_user_leaf_hash: new_user_leaf.qfhash::<Hasher>(),
+            checkpoint_tree_root_hash: checkpoint_tree_root,
+            user_id: user_id_f,
+        };
+        let stats = GUTAStats {
+            guta_fees_collected: PF::from_u64_value(1000),
+            da_fees_collected: PF::from_u64_value(1000 * 8 * CONTRACT_COUNT as u64),
+            user_ops_processed: PF::from_u64_value(1),
+            total_transactions: PF::from_u64_value(CONTRACT_COUNT as u64),
+            slots_modified: PF::from_u64_value(8 * CONTRACT_COUNT as u64),
+        };
+        let core = SubmitUserEndCapNonProofCoreInput {
+            checkpoint_id: PF::ZERO_VALUE,
+            state_transition,
+            new_user_leaf,
+            stats,
+        };
+        SubmitUserEndCapNonProofInput { core, contract_state_updates, events: vec![] }
+    }
+
+    /// A submission input + proof bytes pair that passes every gate of
+    /// `handle_user_end_cap_proof_submission` on the given fresh env.
+    async fn valid_end_cap_submission(env: &EndCapEnv) -> anyhow::Result<(SubmitUserEndCapNonProofInput<PF, PHash>, Vec<u8>)> {
+        let checkpoint_root = checkpoint_tree_append_root_zero(&env.db).await?;
+        let input = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
+        let expected_hash = input
+            .core
+            .get_proof_public_inputs_hash::<PoseidonHasher>(EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT);
+        let proof_bytes = expected_hash.into_owned_32bytes().to_vec();
+        Ok((input, proof_bytes))
+    }
+
+    #[tokio::test]
+    async fn user_belongs_to_realm_partitions_ids_by_realm_prefix() -> anyhow::Result<()> {
+        let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        let handler = &env.handler;
+        let users_per_realm = 1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
+
+        // realm 1 owns [1 * users_per_realm, 2 * users_per_realm)
+        assert!(!handler.user_belongs_to_realm(users_per_realm - 1));
+        assert!(handler.user_belongs_to_realm(users_per_realm));
+        assert!(handler.user_belongs_to_realm(REALM_USER_ID));
+        assert!(handler.user_belongs_to_realm(2 * users_per_realm - 1));
+        assert!(!handler.user_belongs_to_realm(2 * users_per_realm));
+        assert!(!handler.user_belongs_to_realm(OTHER_REALM_USER_ID));
+
+        // the RPC mirror computes the same partition
+        assert!(RealmEdgeRpcServer::check_user_id_in_realm(handler, REALM_USER_ID).await?);
+        assert!(!RealmEdgeRpcServer::check_user_id_in_realm(handler, OTHER_REALM_USER_ID).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_id_mappings_and_submit_guard() -> anyhow::Result<()> {
+        let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        let handler = &env.handler;
+
+        // no mappings exist on a fresh database
+        assert_eq!(handler.get_checkpoint_id_for_unique_pending_id_internal(0).await?, None);
+        assert_eq!(
+            RealmEdgeRpcServer::get_unique_pending_id_for_checkpoint_id(handler, 0).await?,
+            None
+        );
+
+        // seed both directions of the mapping
+        env.db.set_unique_pending_id_checkpoint_id_mapping(7, 3).await?;
+        env.db.set_checkpoint_id_to_unique_pending_id_mapping(3, 7, &11u128).await?;
+        assert_eq!(handler.get_checkpoint_id_for_unique_pending_id_internal(7).await?, Some(3));
+        assert_eq!(
+            RealmEdgeRpcServer::get_unique_pending_id_for_checkpoint_id(handler, 3).await?,
+            Some((7, 11u128))
+        );
+
+        // the submit guard passes while no status is recorded, then rejects
+        handler.ensure_user_has_not_submitted(REALM_USER_ID, 0).await?;
+        env.temp_db
+            .set_submitted_status_for_pending(&handler.realm_identifier, 0, REALM_USER_ID, 5)
+            .await?;
+        let err = handler
+            .ensure_user_has_not_submitted(REALM_USER_ID, 0)
+            .await
+            .expect_err("a submitted user must be rejected");
+        assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stats_require_pending_mapping_and_aggregate_durations() -> anyhow::Result<()> {
+        let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        let handler = &env.handler;
+
+        // no pending-id mapping exists on a fresh database
+        let err = handler
+            .get_job_stats_internal(0)
+            .await
+            .expect_err("stats for a checkpoint without pending mapping must fail");
+        assert!(err.to_string().contains("no unique pending id"), "unexpected error: {err}");
+
+        // map checkpoint 3 to pending id 7 in both directions; stats default to zero
+        env.db.set_unique_pending_id_checkpoint_id_mapping(7, 3).await?;
+        env.db.set_checkpoint_id_to_unique_pending_id_mapping(3, 7, &11u128).await?;
+        let stats = handler.get_job_stats_internal(3).await?;
+        assert_eq!(stats.unique_pending_id, 7);
+        assert_eq!(stats.total_completed, 0);
+        assert_eq!(stats.total_duration_ms, 0);
+        assert_eq!(stats.min_duration_ms, None);
+        assert_eq!(stats.max_duration_ms, None);
+
+        // recorded job durations aggregate through the temp db
+        env.temp_db.increment_job_stats(&handler.realm_identifier, 7, 25).await?;
+        env.temp_db.increment_job_stats(&handler.realm_identifier, 7, 40).await?;
+        let stats = RealmEdgeRpcServer::get_job_stats(handler, 3).await?;
+        assert_eq!(stats.unique_pending_id, 7);
+        assert_eq!(stats.total_completed, 2);
+        assert_eq!(stats.total_duration_ms, 65);
+        assert_eq!(stats.min_duration_ms, Some(25));
+        assert_eq!(stats.max_duration_ms, Some(40));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contract_height_cache_fetches_from_db_and_gates_unknown_contracts() -> anyhow::Result<()> {
+        let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        let handler = &env.handler;
+
+        // unknown contract: no height metadata in the realm db yet
+        let err = handler
+            .contract_state_tree_height(0)
+            .await
+            .expect_err("missing height metadata must be rejected");
+        assert!(
+            err.to_string().contains("contract 0 state tree height metadata is not available"),
+            "unexpected error: {err}"
+        );
+
+        // seed heights for contracts 0..5 at checkpoint 0; the fetch reads at
+        // MAX_CHECKPOINT_ID but max-checkpoint semantics finds them
+        let heights = (0..CONTRACT_COUNT as u64).map(|id| (id, CONTRACT_TREE_HEIGHT)).collect::<Vec<_>>();
+        env.db.set_contract_tree_heights(0, &heights).await?;
+        handler.ensure_contract_heights_in_cache(&[0, 2, 4]).await?;
+        assert_eq!(handler.contract_state_tree_height(0).await?, CONTRACT_TREE_HEIGHT);
+        assert!(handler.contract_state_tree_height_cache.mapping.get(&2).is_some());
+
+        // heights already cached are not re-fetched, so an unknown id beside a
+        // cached one is only rejected when it actually misses the cache
+        let err = handler
+            .contract_state_tree_height(9)
+            .await
+            .expect_err("unknown contract id must still be rejected");
+        assert!(
+            err.to_string().contains("contract 9 state tree height metadata is not available"),
+            "unexpected error: {err}"
+        );
+
+        // RPC surface: raw heights from the db and a height-dependent root read
+        let raw = RealmEdgeRpcServer::get_contract_tree_state_heights(handler, 0, vec![0, 2]).await?;
+        assert_eq!(raw, vec![CONTRACT_TREE_HEIGHT; 2]);
+        let root = RealmEdgeRpcServer::get_user_contract_state_tree_root(handler, 0, REALM_USER_ID, 0).await?;
+        assert_eq!(root, zh(CONTRACT_TREE_HEIGHT as usize));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_end_cap_slot_updates_round_trip_through_temp_db() -> anyhow::Result<()> {
+        let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        let handler = &env.handler;
+
+        // nothing stored yet
+        assert!(handler.get_user_end_cap_slot_updates_internal(0, REALM_USER_ID).await?.is_none());
+
+        let payload = RealmEndCapSlotUpdates {
+            realm_id: TEST_REALM_ID,
+            realm_sub_id: TEST_REALM_SUB_ID,
+            unique_pending_id: 3,
+            user_id: REALM_USER_ID,
+            contracts: vec![RealmContractSlotUpdates {
+                contract_id: 1,
+                slot_updates: vec![RealmSlotUpdate { slot: 5, old_value: 0, new_value: 7 }],
+            }],
+        };
+        env.temp_db
+            .set_user_end_cap_slot_updates(
+                &handler.realm_identifier,
+                3,
+                REALM_USER_ID,
+                bincode::serialize(&payload)?,
+            )
+            .await?;
+        // the structs are not PartialEq, so compare through the bincode bytes
+        // the handler round-trips
+        let read_back = handler
+            .get_user_end_cap_slot_updates_internal(3, REALM_USER_ID)
+            .await?
+            .expect("stored slot updates must be readable");
+        assert_eq!(bincode::serialize(&read_back)?, bincode::serialize(&payload)?);
+        let rpc_read = RealmEdgeRpcServer::get_user_end_cap_slot_updates(handler, 3, REALM_USER_ID)
+            .await?
+            .expect("stored slot updates must be readable via RPC");
+        assert_eq!(bincode::serialize(&rpc_read)?, bincode::serialize(&payload)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_user_end_cap_rejects_invalid_submissions() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let handler = &env.handler;
+        let checkpoint_root = checkpoint_tree_append_root_zero(&env.db).await?;
+
+        // checkpoint id must match the new user leaf's last checkpoint id
+        let mut mismatch = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
+        mismatch.core.new_user_leaf.last_checkpoint_id = PF::from_u64_value(1);
+        let err = handler
+            .handle_user_end_cap_proof_submission(mismatch, vec![])
+            .await
+            .expect_err("checkpoint mismatch must fail");
+        assert!(
+            err.to_string().contains("does not match new_user_leaf last_checkpoint_id"),
+            "unexpected error: {err}"
+        );
+
+        // user from another realm
+        let foreign = gen_end_cap_input(OTHER_REALM_USER_ID, checkpoint_root);
+        let err = handler
+            .handle_user_end_cap_proof_submission(foreign, vec![])
+            .await
+            .expect_err("user outside the realm must fail");
+        assert!(err.to_string().contains("does not belong to this realm"), "unexpected error: {err}");
+
+        // empty contract state updates
+        let mut empty = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
+        empty.contract_state_updates = vec![];
+        let err = handler
+            .handle_user_end_cap_proof_submission(empty, vec![])
+            .await
+            .expect_err("empty updates must fail");
+        assert!(err.to_string().contains("contract_state_updates cannot be empty"), "unexpected error: {err}");
+
+        // end-cap checkpoint ahead of the node's current checkpoint
+        let mut future = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
+        future.core.checkpoint_id = PF::from_u64_value(1);
+        future.core.new_user_leaf.last_checkpoint_id = PF::from_u64_value(1);
+        let err = handler
+            .handle_user_end_cap_proof_submission(future, vec![])
+            .await
+            .expect_err("future checkpoint must fail");
+        assert!(err.to_string().contains("but current checkpoint is"), "unexpected error: {err}");
+
+        // stale start leaf hash
+        let mut bad_start = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
+        bad_start.core.state_transition.start_user_leaf_hash = PHash::from_values(4242, 0, 0, 0);
+        let err = handler
+            .handle_user_end_cap_proof_submission(bad_start, vec![])
+            .await
+            .expect_err("wrong start hash must fail");
+        assert!(err.to_string().contains("Invalid start_user_leaf_hash"), "unexpected error: {err}");
+
+        // wrong checkpoint tree root
+        let bad_root = gen_end_cap_input(REALM_USER_ID, PHash::from_values(777, 0, 0, 0));
+        let proof_bytes = bad_root
+            .core
+            .get_proof_public_inputs_hash::<PoseidonHasher>(EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT)
+            .into_owned_32bytes()
+            .to_vec();
+        let err = handler
+            .handle_user_end_cap_proof_submission(bad_root, proof_bytes)
+            .await
+            .expect_err("wrong checkpoint tree root must fail");
+        assert!(
+            err.to_string().contains("Invalid checkpoint tree proof historical root"),
+            "unexpected error: {err}"
+        );
+
+        // proof bytes that decode to a different public-inputs hash
+        let (input, _) = valid_end_cap_submission(&env).await?;
+        let err = handler
+            .handle_user_end_cap_proof_submission(input, PHash::get_zero_value().into_owned_32bytes().to_vec())
+            .await
+            .expect_err("mismatched public inputs hash must fail");
+        assert!(err.to_string().contains("Public inputs hash mismatch"), "unexpected error: {err}");
+
+        // inconsistent new user leaf (end hash does not hash to the new leaf)
+        let mut bad_leaf = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
+        bad_leaf.core.state_transition.end_user_leaf_hash = PHash::from_values(8888, 0, 0, 0);
+        let proof_bytes = bad_leaf
+            .core
+            .get_proof_public_inputs_hash::<PoseidonHasher>(EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT)
+            .into_owned_32bytes()
+            .to_vec();
+        let err = handler
+            .handle_user_end_cap_proof_submission(bad_leaf, proof_bytes)
+            .await
+            .expect_err("inconsistent new user leaf must fail");
+        assert!(err.to_string().contains("invalid new_user_leaf"), "unexpected error: {err}");
+
+        // user whose committed leaf is already at a later checkpoint
+        env.db
+            .set_user_leaf(
+                0,
+                &PQEDUserLeaf {
+                    public_key: PHash::from_values(77, 0, 0, 0),
+                    user_state_tree_root: zh(CONTRACT_TREE_HEIGHT as usize),
+                    balance: PF::from_u64_value(1),
+                    nonce: PF::ZERO_VALUE,
+                    last_checkpoint_id: PF::from_u64_value(5),
+                    event_index: PF::ZERO_VALUE,
+                    user_id: PF::from_u64_value(REALM_USER_ID),
+                },
+            )
+            .await?;
+        let stale = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
+        let err = handler
+            .handle_user_end_cap_proof_submission(stale, vec![])
+            .await
+            .expect_err("stale user checkpoint must fail");
+        assert!(err.to_string().contains("but user's last checkpoint is 5"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_user_end_cap_happy_path_publishes_and_stores() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let handler = &env.handler;
+        let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+        let new_user_leaf = input.core.new_user_leaf.clone();
+
+        handler.handle_user_end_cap_proof_submission(input, proof_bytes.clone()).await?;
+
+        // the end-cap queue item was published under the live proc id
+        assert_eq!(env.user_update_queue.published_count(), 1);
+        let published = env.user_update_queue.published_bytes_for(0);
+        assert_eq!(published.len(), 1);
+        let queue_item = PsyRealmUserUpdateQueueItem::<PF, PHash>::decode_queue_item_ref(&published[0])?;
+        assert_eq!(queue_item.job_id.circuit_type, ProvingJobCircuitType::UserEndCap);
+        assert_eq!(queue_item.job_id.task_index, REALM_USER_ID as u32);
+        assert_eq!(queue_item.job_id.goal_id, 0);
+        assert_eq!(queue_item.new_user_leaf.user_id, new_user_leaf.user_id);
+        assert_eq!(queue_item.new_user_leaf.user_state_tree_root, new_user_leaf.user_state_tree_root);
+        assert_eq!(queue_item.new_user_leaf.balance, new_user_leaf.balance);
+        assert_eq!(queue_item.old_user_leaf_hash, PHash::get_zero_value());
+        assert_eq!(queue_item.new_user_leaf_hash, new_user_leaf.qfhash::<PoseidonHasher>());
+
+        // the proof is stored under the derived end-cap job id
+        let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+            REALM_USER_ID,
+            N::GLOBAL_USER_TREE_HEIGHT,
+            0,
+        )?;
+        assert!(env.temp_db.contains_proof_for_job_id(job_id, 0).await?);
+
+        // the slot updates payload is stored and readable back
+        let slot_updates = handler.get_user_end_cap_slot_updates_internal(0, REALM_USER_ID).await?;
+        let slot_updates = slot_updates.expect("slot updates must be stored");
+        assert_eq!(slot_updates.realm_id, TEST_REALM_ID);
+        assert_eq!(slot_updates.realm_sub_id, TEST_REALM_SUB_ID);
+        assert_eq!(slot_updates.unique_pending_id, 0);
+        assert_eq!(slot_updates.user_id, REALM_USER_ID);
+        assert_eq!(slot_updates.contracts.len(), CONTRACT_COUNT);
+        for (index, contract) in slot_updates.contracts.iter().enumerate() {
+            assert_eq!(contract.contract_id, index as u32);
+            assert!(!contract.slot_updates.is_empty());
+        }
+
+        // a second submission for the same user is rejected by the status guard
+        let (second, second_proof) = valid_end_cap_submission(&env).await?;
+        let err = handler
+            .handle_user_end_cap_proof_submission(second, second_proof)
+            .await
+            .expect_err("double submission must fail");
+        assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    /// The batch the processor rotates to in the handoff tests.
+    const ROTATED_PENDING_ID: u64 = 1;
+    const ROTATED_PROC_ID: u128 = 11;
+
+    /// Stands in for `set_new_unique_ids` on the processor: moves the gathering
+    /// batch the edge reads to (`unique_pending_id`, `proc_id`).
+    fn rotate_gathering_batch(temp_db: &InMemoryTempStore, unique_pending_id: u64, proc_id: u128) {
+        futures::executor::block_on(temp_db.set_gathering_unique_pending_ids(
+            &test_realm_identifier(),
+            unique_pending_id,
+            proc_id,
+        ))
+        .expect("rotate gathering batch");
+    }
+
+    /// End-cap env whose proof verification runs `on_verify` once against the
+    /// env's temp store, the moment a production rotation usually lands in.
+    async fn end_cap_env_with_verify_hook(
+        on_verify: impl Fn(&InMemoryTempStore) + Send + Sync + 'static,
+    ) -> anyhow::Result<EndCapEnv> {
+        let temp_db_slot: Arc<std::sync::OnceLock<Arc<InMemoryTempStore>>> = Arc::new(std::sync::OnceLock::new());
+        let hook_slot = Arc::clone(&temp_db_slot);
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let verifier = EndCapEchoVerifier {
+            on_verify: Some(Box::new(move || {
+                if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    on_verify(hook_slot.get().expect("temp db slot is filled before submission"));
+                }
+            })),
+        };
+        let env = RealmEdgeTestEnv::create(Arc::new(verifier)).await?;
+        let _ = temp_db_slot.set(Arc::clone(&env.temp_db));
+        Ok(env)
+    }
+
+    /// Asserts that the end cap published to queue `proc_id` and every artifact
+    /// the processor and workers will look up for it belong to batch
+    /// `unique_pending_id`.
+    async fn assert_end_cap_staged_in(env: &EndCapEnv, unique_pending_id: u64, proc_id: u128) -> anyhow::Result<()> {
+        let published = env.user_update_queue.published_bytes_for(proc_id);
+        assert_eq!(published.len(), 1, "exactly one end cap must reach queue {proc_id}");
+        let queue_item = PsyRealmUserUpdateQueueItem::<PF, PHash>::decode_queue_item_ref(&published[0])?;
+        let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+            REALM_USER_ID,
+            EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT,
+            unique_pending_id,
+        )?;
+        assert_eq!(queue_item.job_id, job_id, "queue item must point at batch {unique_pending_id}");
+        assert!(
+            env.temp_db.contains_proof_for_job_id(job_id, unique_pending_id).await?,
+            "proof must be in the proof bucket of batch {unique_pending_id}"
+        );
+        assert!(
+            env.temp_db
+                .get_contract_updates_for_user(&test_realm_identifier(), unique_pending_id, REALM_USER_ID)
+                .await?
+                .is_some(),
+            "contract updates must be stored under batch {unique_pending_id}"
+        );
+        let slot_updates = env
+            .handler
+            .get_user_end_cap_slot_updates_internal(unique_pending_id, REALM_USER_ID)
+            .await?
+            .expect("slot updates must be stored under the publishing batch");
+        assert_eq!(slot_updates.unique_pending_id, unique_pending_id);
+        env.handler
+            .ensure_user_has_not_submitted(REALM_USER_ID, unique_pending_id)
+            .await
+            .expect_err("the submit guard must be armed in the publishing batch");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_cap_is_restaged_when_the_batch_rotates_during_verification() -> anyhow::Result<()> {
+        let env = end_cap_env_with_verify_hook(|temp_db| {
+            rotate_gathering_batch(temp_db, ROTATED_PENDING_ID, ROTATED_PROC_ID)
+        })
+        .await?;
+        seed_contract_heights(&env).await?;
+        let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+
+        env.handler.handle_user_end_cap_proof_submission(input, proof_bytes).await?;
+
+        assert_end_cap_staged_in(&env, ROTATED_PENDING_ID, ROTATED_PROC_ID).await?;
+        assert_eq!(env.user_update_queue.published_count(), 1, "nothing may be sent to the closed batch");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_cap_is_republished_when_the_batch_rotates_after_publish() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let temp_db = Arc::clone(&env.temp_db);
+        let mut rotated = false;
+        env.user_update_queue.set_after_publish_hook(Box::new(move |_| {
+            if !rotated {
+                rotated = true;
+                rotate_gathering_batch(&temp_db, ROTATED_PENDING_ID, ROTATED_PROC_ID);
+            }
+        }));
+        let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+
+        env.handler.handle_user_end_cap_proof_submission(input, proof_bytes).await?;
+
+        // The first copy may or may not have been drained with batch 0; it stays
+        // where it is, and a second, complete copy goes to the new batch.
+        let first = env.user_update_queue.published_bytes_for(0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(PsyRealmUserUpdateQueueItem::<PF, PHash>::decode_queue_item_ref(&first[0])?.job_id.goal_id, 0);
+        assert_end_cap_staged_in(&env, ROTATED_PENDING_ID, ROTATED_PROC_ID).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_cap_restage_refuses_a_batch_where_the_user_already_submitted() -> anyhow::Result<()> {
+        let env = end_cap_env_with_verify_hook(|temp_db| {
+            rotate_gathering_batch(temp_db, ROTATED_PENDING_ID, ROTATED_PROC_ID);
+            futures::executor::block_on(temp_db.set_submitted_status_for_pending(
+                &test_realm_identifier(),
+                ROTATED_PENDING_ID,
+                REALM_USER_ID,
+                99,
+            ))
+            .expect("seed competing submission");
+        })
+        .await?;
+        seed_contract_heights(&env).await?;
+        let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+
+        let err = env
+            .handler
+            .handle_user_end_cap_proof_submission(input, proof_bytes)
+            .await
+            .expect_err("restaging into a batch the user already submitted to must fail");
+
+        assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
+        assert_eq!(env.user_update_queue.published_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn end_cap_submission_gives_up_when_the_batch_keeps_rotating() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let temp_db = Arc::clone(&env.temp_db);
+        let mut next_pending_id = 0u64;
+        env.user_update_queue.set_after_publish_hook(Box::new(move |_| {
+            next_pending_id += 1;
+            rotate_gathering_batch(&temp_db, next_pending_id, 100 + next_pending_id as u128);
+        }));
+        let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
+
+        let err = env
+            .handler
+            .handle_user_end_cap_proof_submission(input, proof_bytes)
+            .await
+            .expect_err("an end cap that never settles in one batch must not be reported as accepted");
+
+        assert!(err.to_string().contains("rotated"), "unexpected error: {err}");
+        let published = env.user_update_queue.published_count();
+        assert!(published > 1 && published < 10, "restaging must retry, but boundedly (published {published})");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submit_user_end_cap_batch_splits_success_and_failure() -> anyhow::Result<()> {
+        let env = end_cap_env().await?;
+        seed_contract_heights(&env).await?;
+        let handler = &env.handler;
+
+        let (valid, valid_proof) = valid_end_cap_submission(&env).await?;
+        let checkpoint_root = checkpoint_tree_append_root_zero(&env.db).await?;
+        let invalid = gen_end_cap_input(OTHER_REALM_USER_ID, checkpoint_root);
+
+        let (success, failed) = RealmEdgeRpcServer::submit_user_end_cap_batch(
+            handler,
+            vec![(valid, valid_proof), (invalid, vec![])],
+        )
+        .await?;
+        assert_eq!(success, vec![REALM_USER_ID]);
+        assert_eq!(failed, vec![OTHER_REALM_USER_ID]);
+        // exactly the valid submission reached the queue
+        assert_eq!(env.user_update_queue.published_count(), 1);
+
+        // the single-submit RPC wrapper reports "ok" for a fresh valid user
+        let (again, again_proof) = {
+            let checkpoint_root = checkpoint_tree_append_root_zero(&env.db).await?;
+            let input = gen_end_cap_input(REALM_USER_ID + 1, checkpoint_root);
+            let expected_hash = input
+                .core
+                .get_proof_public_inputs_hash::<PoseidonHasher>(EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT);
+            (input, expected_hash.into_owned_32bytes().to_vec())
+        };
+        let result = RealmEdgeRpcServer::submit_user_end_cap(handler, again, again_proof).await?;
+        assert_eq!(result, "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_reward_proofs_merge_top_proof_root() -> anyhow::Result<()> {
+        let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        let handler = &env.handler;
+
+        // the coordinator-level top proof must exist for the pending id
+        let err = handler
+            .generate_batch_proof_miner_reward_proofs_internal(0, vec![])
+            .await
+            .expect_err("missing top proof must fail");
+        assert!(err.to_string().contains("Rewards tree proof not found"), "unexpected error: {err}");
+
+        // seed one rewards tag tree node and a non-trivial top proof
+        let root_key = SimpleMerkleNodeKey::new_root();
+        env.db.rewards_tag_tree_set_node_tag(0, root_key, zh(40), zh(41)).await?;
+        let top_proof = TagTreeMerkleProof {
+            root: zh(50),
+            leaf: TagTreeNodePreimage {
+                left: zh(51),
+                right: zh(52),
+                tag: zh(53),
+            },
+            index: 1,
+            siblings: vec![TagTreeProofNode { sibling: zh(54), parent_tag: zh(55) }],
+        };
+        env.db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(0, &top_proof).await?;
+
+        // capture the realm-local proof before the merge
+        let local = env
+            .db
+            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(0, &[root_key])
+            .await?;
+        assert_eq!(local.len(), 1);
+
+        // empty request: no proofs
+        let empty = handler.generate_batch_proof_miner_reward_proofs_internal(0, vec![]).await?;
+        assert!(empty.is_empty());
+
+        let job_ids = vec![QProvingJobDataIDWithRewardPath::new(
+            QProvingJobDataID::qp_rand_gen(),
+            root_key.to_reward_path_info(),
+        )];
+        let proofs = handler.generate_batch_proof_miner_reward_proofs_internal(0, job_ids).await?;
+        assert_eq!(proofs.len(), 1);
+        // the merged proof is re-rooted at the top proof with the merged index
+        assert_eq!(proofs[0].tag_tree_proof.root, top_proof.root);
+        assert_eq!(
+            proofs[0].tag_tree_proof.index,
+            local[0].index | (top_proof.index << local[0].siblings.len())
+        );
+        assert_eq!(
+            proofs[0].tag_tree_proof.siblings.len(),
+            local[0].siblings.len() + top_proof.siblings.len()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rpc_reader_wrappers_serve_fresh_database_state() -> anyhow::Result<()> {
+        let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
+        let handler = &env.handler;
+
+        // fresh database: latest checkpoint id is 0 and tree reads succeed
+        assert_eq!(RealmEdgeRpcServer::get_latest_checkpoint_id(handler).await?, 0);
+        let root = RealmEdgeRpcServer::get_latest_checkpoint_tree_root(handler).await?;
+        assert_eq!(root, RealmEdgeRpcServer::get_checkpoint_tree_root(handler, 0).await?);
+        assert_eq!(root, zh(N::CHECKPOINT_TREE_HEIGHT_USIZE));
+        let user_root = RealmEdgeRpcServer::get_user_tree_root(handler, 0).await?;
+        assert_eq!(user_root, zh(N::GLOBAL_USER_TREE_HEIGHT_USIZE));
+        assert_eq!(
+            RealmEdgeRpcServer::get_user_tree_leaf_hash(handler, 0, REALM_USER_ID).await?,
+            PHash::get_zero_value()
+        );
+
+        // batch user leaf reads validate the id list
+        let err = RealmEdgeRpcServer::get_user_leaves_batch(handler, 0, vec![])
+            .await
+            .expect_err("empty user id list must fail");
+        assert!(err.to_string().contains("user_ids cannot be empty"), "unexpected error: {err}");
+
+        // the top rewards-tree proof for a checkpoint that has none must fail
+        let err = RealmEdgeRpcServer::get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(handler, 0)
+            .await
+            .expect_err("missing rewards tree proof must fail");
+        assert!(err.to_string().contains("Rewards tree proof not found"), "unexpected error: {err}");
+
+        // IMT endpoints report missing leaves and keys
+        let err = RealmEdgeRpcServer::get_imt_leaf_preimage(handler, 0, REALM_USER_ID, 0, 0)
+            .await
+            .expect_err("missing IMT leaf must fail");
+        assert!(err.to_string().contains("Leaf preimage not found at index 0"), "unexpected error: {err}");
+        let err = RealmEdgeRpcServer::get_imt_leaf_index_for_key(handler, 0, REALM_USER_ID, 0, zh(1))
+            .await
+            .expect_err("missing IMT key must fail");
+        assert!(err.to_string().contains("Key not found in IMT"), "unexpected error: {err}");
+
+        // membership proofs first resolve the contract height, which is unknown
+        let err = RealmEdgeRpcServer::get_imt_membership_proof(handler, 0, REALM_USER_ID, 9, zh(1))
+            .await
+            .expect_err("unknown contract height must fail");
+        assert!(
+            err.to_string().contains("contract 9 state tree height metadata is not available"),
+            "unexpected error: {err}"
+        );
+        Ok(())
     }
 }
