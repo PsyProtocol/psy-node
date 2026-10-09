@@ -119,6 +119,8 @@ pub(crate) struct BridgeProposeDaemonConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct L1Config {
+    #[serde(default)]
+    pub fee_policy: Option<super::l1_fees::BscFeePolicy>,
     #[serde(default = "default_evm_family")]
     pub family: String,
     pub chain_index: u8,
@@ -165,6 +167,7 @@ impl L1Config {
         config.finalize.l1_rpc_url = Some(providers[0].url.clone());
         config.finalize.l1_rpc_fallback_url = None;
         config.finalize.l1_rpc_providers = providers;
+        config.finalize.fee_policy = self.fee_policy.clone();
         config.finalize.deployments_network = Some(self.deployments_network.clone());
         config.finalize.state_manager = self.state_manager.clone();
         config.finalize.bridge_address = self.bridge_address.clone();
@@ -194,6 +197,8 @@ fn legacy_rpc_urls(finalize: &DaemonFinalizeConfig) -> Vec<String> {
 }
 
 fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L1Config>> {
+    ensure!(config.chains.is_empty() || config.finalize.fee_policy.is_none(),
+        "with [[chains]], configure fees in [chains.fee_policy], not [finalize.fee_policy]");
     let mut chains = if config.chains.is_empty() {
         let deployments_network = config
             .finalize
@@ -207,6 +212,7 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
             .or_else(|| (deployments_network == "localhost").then_some(0))
             .context("deployment is missing protocol.chain.l1ChainIndex")?;
         vec![L1Config {
+            fee_policy: config.finalize.fee_policy.clone(),
             family: default_evm_family(),
             chain_index,
             network_id: deployments_network.clone(),
@@ -225,6 +231,11 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
     ensure!(!chains.is_empty(), "bridge relayer requires at least one chain");
     let mut seen = HashSet::with_capacity(chains.len());
     for chain in &chains {
+        if let Some(policy) = &chain.fee_policy {
+            policy.validate()?;
+            ensure!(chain.network_id == "bscTestnet" && chain.deployments_network == "bscTestnet",
+                "BSC fee policy may only be enabled for bscTestnet");
+        }
         ensure!(chain.family.eq_ignore_ascii_case("evm"), "unsupported bridge chain family {}", chain.family);
         ensure!(
             !chain.rpc_urls.is_empty() || !chain.rpc_providers.is_empty(),
@@ -253,6 +264,8 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct DaemonFinalizeConfig {
+    #[serde(default)]
+    pub fee_policy: Option<super::l1_fees::BscFeePolicy>,
     pub l1_rpc_url: Option<String>,
     pub l1_rpc_fallback_url: Option<String>,
     #[serde(default)]
@@ -927,7 +940,7 @@ async fn run_multichain(
 
         let mut round_withdrawals = Vec::new();
         let to_checkpoint = if state.pending_finalization_range.is_none() {
-            let (progress, plan) = match build_multichain_l2_plan(
+            let (_progress, plan) = match build_multichain_l2_plan(
                 &config, &provider, &chains, latest, from_checkpoint, window.to_checkpoint,
                 !window.is_catchup_batch, &propose_args,
             ).await {
@@ -950,24 +963,40 @@ async fn run_multichain(
             } else {
                 window.to_checkpoint
             };
-            // Settle each chain's L1 deposit accumulator before finalization.
-            for item in progress {
-                let chain = chains.iter().find(|c| c.chain_index == item.chain_index).unwrap();
-                let target = fetch_deposit_tree_next_index(&provider, endpoint, u64::from(item.chain_index)).await?;
-                if target > u64::from(item.proved_deposit_count) {
-                    chain.l1.submit_deposit_batch_appends(&chain.config, u32::try_from(target)?).await?;
-                }
-            }
-            let range = PendingFinalizationRange { from_checkpoint, to_checkpoint: endpoint };
-            state.pending_finalization_range = Some(range);
-            insert_pending_claims(&round_withdrawals, &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
-            save_multichain_state(&state_path, &state)?;
             endpoint
         } else {
             window.to_checkpoint
         };
 
         let range = PendingFinalizationRange { from_checkpoint, to_checkpoint };
+        let chain_cursors = chains.iter()
+            .map(|chain| (chain.chain_index, cursors[&chain.chain_index]))
+            .collect::<Vec<_>>();
+        if !persist_and_sync_multichain_range(
+            &state_path, &mut state, range, &round_withdrawals, &chain_cursors,
+            |chain_index, endpoint| {
+                let chain = chains.iter().find(|chain| chain.chain_index == chain_index).unwrap();
+                let provider = &provider;
+                async move {
+                    let target = fetch_deposit_tree_next_index(provider, endpoint, u64::from(chain_index)).await?;
+                    let target = u32::try_from(target)?;
+                    sync_deposit_if_behind(
+                        target,
+                        chain.l1.with_rpc_failover("read_deposit_sync_progress", |url| {
+                            let url = url.to_string();
+                            async move {
+                                let provider = crate::bridge::l1_provider::connect_l1_readonly(url.parse()?)?;
+                                fetch_proved_deposit_count(&provider, chain.bridge).await
+                            }
+                        }),
+                        || chain.l1.submit_deposit_batch_appends(&chain.config, target),
+                    ).await
+                }
+            },
+        ).await? {
+            tokio::time::sleep(poll_interval).await;
+            continue;
+        }
         let shared_path = proof_dir.join(format!("bridge_proof_{}.json", to_checkpoint));
         let needs_finalize = chains.iter().any(|chain| cursors[&chain.chain_index] < to_checkpoint);
         if needs_finalize && !shared_path.exists() {
@@ -987,6 +1016,7 @@ async fn run_multichain(
                 tracing::error!(chain_index=chain.chain_index, %error, "build per-chain witness failed"); continue;
             }
             let finalize_args = FinalizeBridgeAggArgs {
+                l1_fee_policy: chain.config.finalize.fee_policy.clone(),
                 proof_json: chain_path.clone(), to_checkpoint, rpc_config: config.rpc_config.clone(),
                 l1_rpc_url: chain.config.finalize.l1_rpc_url.clone().unwrap(),
                 deployments_network: chain.config.finalize.deployments_network.clone().unwrap(),
@@ -1372,6 +1402,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
         // ═══════════════════════════════════════════════════════════════════
 
         let finalize_args = FinalizeBridgeAggArgs {
+            l1_fee_policy: config.finalize.fee_policy.clone(),
             proof_json: proof_path.clone(),
             to_checkpoint,
             rpc_config: config.rpc_config.clone(),
@@ -1539,6 +1570,11 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
         return Ok(());
     }
 
+    // Refuse unaffordable fees before proving, then refresh before sending.
+    super::l1_fees::prepare_l1_fees(
+        &provider, &mut TransactionRequest::default(), config.finalize.fee_policy.as_ref(),
+    ).await?;
+
     let calls = if let Some(proxy_url) = prove_proxy_url {
         prove_bridge::build_deposit_batch_append_calls_remote(
             l1_rpc,
@@ -1636,6 +1672,8 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
             "sending deposit batchAppend aggregate3 tx"
         );
 
+        let mut tx = tx;
+        super::l1_fees::prepare_l1_fees(&provider, &mut tx, config.finalize.fee_policy.as_ref()).await?;
         let pending = provider
             .send_transaction(tx)
             .await
@@ -1826,6 +1864,56 @@ fn load_multichain_state(path: &Path, namespace: &str) -> anyhow::Result<Multich
     let state: MultichainDaemonState = toml::from_str(&raw)?;
     ensure!(state.identity_namespace == namespace, "multichain daemon state belongs to a different chain cohort");
     Ok(state)
+}
+
+// L1 may already be ahead of an older catch-up target. Keep the actual append
+// function's strict target check, and skip satisfied historical targets here.
+async fn sync_deposit_if_behind<Read, Append, AppendFuture>(
+    target: u32,
+    read_proved: Read,
+    append: Append,
+) -> anyhow::Result<()>
+where
+    Read: Future<Output = anyhow::Result<u32>>,
+    Append: FnOnce() -> AppendFuture,
+    AppendFuture: Future<Output = anyhow::Result<()>>,
+{
+    if read_proved.await? >= target { return Ok(()); }
+    append().await
+}
+
+// Both fresh and resumed ranges pass this gate before proof/finalize. A fee
+// refusal retains the landing endpoint and claims, without spending attempts.
+async fn persist_and_sync_multichain_range<Sync, SyncFuture>(
+    path: &Path,
+    state: &mut MultichainDaemonState,
+    range: PendingFinalizationRange,
+    withdrawals: &[propose_withdrawals::PendingWithdrawal],
+    chain_cursors: &[(u8, u64)],
+    mut sync: Sync,
+) -> anyhow::Result<bool>
+where
+    Sync: FnMut(u8, u64) -> SyncFuture,
+    SyncFuture: Future<Output = anyhow::Result<()>>,
+{
+    ensure!(state.pending_finalization_range.is_none_or(|saved| saved == range),
+        "cannot replace an unfinished multichain range");
+    state.pending_finalization_range = Some(range);
+    insert_pending_claims(withdrawals, &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+    save_multichain_state(path, state)?;
+
+    for &(chain_index, cursor) in chain_cursors {
+        if !chain_finalization_required(cursor, range)? { continue; }
+        if let Err(error) = sync(chain_index, range.to_checkpoint).await {
+            if super::l1_fees::is_fee_preparation_error(&error) {
+                tracing::warn!(chain_index, %error,
+                    "deposit fees unavailable; durable range and claims retained, deferring round");
+                return Ok(false);
+            }
+            return Err(error);
+        }
+    }
+    Ok(true)
 }
 
 fn save_multichain_state(path: &Path, state: &MultichainDaemonState) -> anyhow::Result<()> {
@@ -6186,6 +6274,182 @@ rpc_urls = ["https://z", "https://a"]
             vec!["https://z", "https://a"]
         );
         assert_eq!(second.l1_rpc_fallback_url, None);
+    }
+
+    #[test]
+    fn l1_fees_named_pool_policy_is_chain_local_and_legacy_config_still_loads() {
+        let config: BridgeProposeDaemonConfig = toml::from_str(r#"
+rpc_config = "config.json"
+services_url = "http://127.0.0.1:1"
+withdraw_method_id = 1
+[[chains]]
+chain_index = 0
+network_id = "sepolia"
+deployments_network = "sepolia"
+rpc_urls = ["http://127.0.0.1:1"]
+[[chains]]
+chain_index = 1
+network_id = "bscTestnet"
+deployments_network = "bscTestnet"
+rpc_providers = [{ name = "first", url = "http://127.0.0.1:2" }, { name = "second", url = "http://127.0.0.1:3" }]
+[chains.fee_policy]
+expected_chain_id = 97
+min_priority_fee_wei = 1000000000
+max_priority_fee_wei = 2000000000
+max_fee_per_gas_wei = 10000000000
+[[chains]]
+chain_index = 2
+network_id = "baseSepolia"
+deployments_network = "baseSepolia"
+rpc_urls = ["http://127.0.0.1:4"]
+"#).unwrap();
+        let chains = &config.chains;
+        assert_eq!(chains.len(), 3);
+        let bsc = chains[1].effective_config(&config).unwrap();
+        assert_eq!(bsc.finalize.fee_policy.as_ref().unwrap().min_priority_fee_wei, 1_000_000_000);
+        assert_eq!(bsc.finalize.l1_rpc_providers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
+        for index in [0, 2] {
+            assert!(chains[index].effective_config(&bsc).unwrap().finalize.fee_policy.is_none());
+        }
+        let mut invalid = config.clone();
+        invalid.finalize.fee_policy = bsc.finalize.fee_policy.clone();
+        assert!(configured_chains(&invalid).unwrap_err().to_string().contains("not [finalize.fee_policy]"));
+        invalid.finalize.fee_policy = None;
+        invalid.chains[0].fee_policy = bsc.finalize.fee_policy.clone();
+        assert!(configured_chains(&invalid).unwrap_err().to_string().contains("only be enabled for bscTestnet"));
+        let mut legacy = config;
+        legacy.chains[1].fee_policy = None;
+        assert!(legacy.chains.iter().all(|c| c.fee_policy.is_none()));
+    }
+
+    #[test]
+    fn l1_fees_deferrals_do_not_spend_claim_attempts() {
+        let withdrawal = withdrawal_for_chain("fee-pending", 1);
+        let mut pending = HashMap::from([(withdrawal.leaf_hash.clone(), withdrawal.clone())]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let report = claim_withdrawals::BatchWithdrawalsReport {
+            requested: 1,
+            submitted_count: 0,
+            already_claimed_count: 0,
+            resolved_leaf_hashes: Vec::new(),
+            failure_reasons: HashMap::new(),
+            deferrals: HashMap::from([(withdrawal.leaf_hash.clone(), "fee source unavailable".into())]),
+        };
+        for round in 0..10 {
+            record_claim_result(&[withdrawal.clone()], &Ok(report.clone()), &mut pending, &mut retry, &mut retired, round);
+        }
+        assert_eq!(pending.len(), 1);
+        assert!(retry.is_empty());
+        assert!(retired.is_empty());
+    }
+
+    #[tokio::test]
+    async fn l1_fees_deposit_sync_skips_satisfied_targets_and_fails_closed_on_read_error() {
+        for (proved, expected_calls) in [(166, 1), (167, 0), (168, 0)] {
+            let mut calls = 0;
+            sync_deposit_if_behind(167, std::future::ready(Ok(proved)), || {
+                calls += 1;
+                std::future::ready(Ok(()))
+            }).await.unwrap();
+            assert_eq!(calls, expected_calls);
+        }
+        let result = sync_deposit_if_behind(167,
+            std::future::ready(Err(anyhow::anyhow!("injected RPC failure"))), || {
+                panic!("append must not run without a successful progress read");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(()))
+            }).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn l1_fees_durable_range_survives_refusal_and_resume_syncs_before_finalize() {
+        let path = temp_state_path("fee-range-resume");
+        let withdrawal = withdrawal_for_chain("landed-bsc", 1);
+        let range = PendingFinalizationRange { from_checkpoint: 198846, to_checkpoint: 198905 };
+        let mut state = MultichainDaemonState {
+            identity_namespace: "fee-resume".into(),
+            last_finalized_checkpoint: 198845,
+            ..Default::default()
+        };
+        let mut attempted = Vec::new();
+        let ready = persist_and_sync_multichain_range(
+            &path, &mut state, range, &[withdrawal.clone()],
+            &[(0, 198845), (1, 198845), (2, 198845)],
+            |chain, endpoint| {
+                // Fault injection runs only after the actual production save.
+                let saved = load_multichain_state(&path, "fee-resume").unwrap();
+                assert_eq!(saved.pending_finalization_range, Some(range));
+                assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
+                attempted.push((chain, endpoint));
+                std::future::ready(if chain == 1 {
+                    Err(anyhow::Error::from(super::super::l1_fees::FeeSourceError("injected fee refusal")))
+                } else { Ok(()) })
+            },
+        ).await.unwrap();
+        assert!(!ready, "fee refusal must block proof/finalize dispatch");
+        assert_eq!(attempted, vec![(0, range.to_checkpoint), (1, range.to_checkpoint)]);
+
+        let mut restarted = load_multichain_state(&path, "fee-resume").unwrap();
+        assert_eq!(restarted.last_finalized_checkpoint, 198845);
+        assert!(restarted.finalized_chains.is_empty());
+        assert!(restarted.claim_retry.is_empty());
+        assert!(restarted.retired_claim_withdrawals.is_empty());
+        attempted.clear();
+        let ready = persist_and_sync_multichain_range(
+            &path, &mut restarted, range, &[],
+            &[(0, range.to_checkpoint), (1, 198845), (2, 198845)],
+            |chain, endpoint| {
+                attempted.push((chain, endpoint));
+                std::future::ready(Ok(()))
+            },
+        ).await.unwrap();
+        assert!(ready);
+        // A finalized chain is skipped, but every unfinished chain is synced
+        // again at the original endpoint before finalization can proceed.
+        assert_eq!(attempted, vec![(1, range.to_checkpoint), (2, range.to_checkpoint)]);
+        let saved = load_multichain_state(&path, "fee-resume").unwrap();
+        assert_eq!(saved.pending_finalization_range, Some(range));
+        assert_eq!(saved.pending_claim_withdrawals.len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn l1_fees_durable_range_save_failure_blocks_deposit_dispatch() {
+        let path = temp_state_path("fee-range-save-failure");
+        fs::create_dir(&path).unwrap();
+        let mut state = MultichainDaemonState::default();
+        let range = PendingFinalizationRange { from_checkpoint: 10, to_checkpoint: 80 };
+        let result = persist_and_sync_multichain_range(
+            &path, &mut state, range, &[], &[(1, 9)],
+            |_, _| {
+                panic!("deposit dispatch must not run if the ledger cannot be installed");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(()))
+            },
+        ).await;
+        assert!(result.is_err());
+        fs::remove_dir(&path).unwrap();
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        if tmp.exists() { fs::remove_file(tmp).unwrap(); }
+    }
+
+    #[tokio::test]
+    async fn l1_fees_durable_range_retains_claims_on_non_fee_deposit_error() {
+        let path = temp_state_path("fee-range-rpc-error");
+        let mut state = MultichainDaemonState { identity_namespace: "rpc-error".into(), ..Default::default() };
+        let range = PendingFinalizationRange { from_checkpoint: 1, to_checkpoint: 5 };
+        let withdrawal = withdrawal_for_chain("landed-rpc-error", 1);
+        let result = persist_and_sync_multichain_range(
+            &path, &mut state, range, &[withdrawal.clone()], &[(1, 0)],
+            |_, _| std::future::ready(Err(anyhow::anyhow!("injected deposit RPC error"))),
+        ).await;
+        assert!(result.is_err());
+        let saved = load_multichain_state(&path, "rpc-error").unwrap();
+        assert_eq!(saved.pending_finalization_range, Some(range));
+        assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
+        fs::remove_file(path).unwrap();
     }
 
     fn write_temp_rpc_config(system_urls: &str) -> std::path::PathBuf {
