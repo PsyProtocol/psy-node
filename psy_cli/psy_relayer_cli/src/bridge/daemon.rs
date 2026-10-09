@@ -6307,6 +6307,17 @@ rpc_urls = ["http://127.0.0.1:4"]
         assert_eq!(chains.len(), 3);
         let bsc = chains[1].effective_config(&config).unwrap();
         assert_eq!(bsc.finalize.fee_policy.as_ref().unwrap().min_priority_fee_wei, 1_000_000_000);
+        assert_eq!(bsc.finalize.fee_policy.as_ref().unwrap().quote_strategy,
+            super::super::l1_fees::BscQuoteStrategy::Conservative);
+        let mut economical = config.clone();
+        economical.chains[1].fee_policy.as_mut().unwrap().quote_strategy =
+            super::super::l1_fees::BscQuoteStrategy::RecentHistory;
+        let effective = economical.chains[1].effective_config(&economical).unwrap();
+        assert_eq!(effective.finalize.fee_policy.as_ref().unwrap().quote_strategy,
+            super::super::l1_fees::BscQuoteStrategy::RecentHistory);
+        for index in [0, 2] {
+            assert!(economical.chains[index].effective_config(&effective).unwrap().finalize.fee_policy.is_none());
+        }
         assert_eq!(bsc.finalize.l1_rpc_providers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
         for index in [0, 2] {
             assert!(chains[index].effective_config(&bsc).unwrap().finalize.fee_policy.is_none());
