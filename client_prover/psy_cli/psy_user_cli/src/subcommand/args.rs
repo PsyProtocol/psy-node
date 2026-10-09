@@ -47,8 +47,13 @@ pub enum WalletCommands {
         allowed_contract_id: Vec<u64>,
         #[arg(long, action = clap::ArgAction::Append, required = true)]
         allowed_method_id: Vec<u32>,
-        #[arg(long, default_value_t = 2)]
-        expected_tx_count: u64,
+        /// Minimum number of transactions accepted by the policy.
+        #[arg(long)]
+        min_tx_count: Option<u64>,
+        /// Maximum number of transactions accepted by the policy and circuit
+        /// capacity.
+        #[arg(long)]
+        max_tx_count: Option<u64>,
     },
 }
 

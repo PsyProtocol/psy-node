@@ -120,8 +120,13 @@ impl<'a> CompilerContext<'a> {
 
         // Find all contract methods and helpers
         let methods: Vec<&CheckedMethod> = self.checked.methods.iter().collect();
-        let helper_methods: HashMap<String, &CheckedMethod> =
+        let mut helper_methods: HashMap<String, &CheckedMethod> =
             methods.iter().filter(|m| !m.is_contract_method).map(|m| (m.name.clone(), *m)).collect();
+        for (target, methods) in &self.checked.inherent_methods {
+            for method in methods {
+                helper_methods.insert(format!("{}::{}", target, method.name), method);
+            }
+        }
 
         // Compile each #[contract_method]
         for method in &methods {
@@ -185,6 +190,7 @@ impl<'a> CompilerContext<'a> {
         let mut method_ctx = MethodCompileContext {
             exec: &mut exec,
             locals,
+            return_value: None,
             layout,
             struct_layouts: &self.checked.struct_layouts,
             constants: &self.checked.constants,
@@ -253,6 +259,7 @@ impl<'a> CompilerContext<'a> {
 struct MethodCompileContext<'a, 'b> {
     exec: &'a mut QExecContext,
     locals: HashMap<String, SymValue>,
+    return_value: Option<SymValue>,
     layout: &'b ContractStateLayout,
     struct_layouts: &'b HashMap<String, StructLayout>,
     constants: &'b HashMap<String, u64>,
@@ -375,8 +382,10 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
 
                 Ok(())
             }
-            Stmt::Return { .. } => {
-                // Contract methods are void, return is a no-op
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    self.return_value = Some(self.compile_expr(value)?);
+                }
                 Ok(())
             }
         }
@@ -389,8 +398,45 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
                 self.locals.insert(name.clone(), value);
                 Ok(())
             }
-            Expr::FieldAccess(receiver, field, _) => self.compile_state_write(receiver, Some(field), None, value),
+            Expr::FieldAccess(receiver, field, _) => {
+                if let Expr::Ident(name, _) = receiver.as_ref() {
+                    if let Some(local_value) = self.locals.get_mut(name) {
+                        if let SymValue::Struct { fields, .. } = local_value {
+                            let (_, field_value) = fields
+                                .iter_mut()
+                                .find(|(field_name, _)| field_name == field)
+                                .ok_or_else(|| anyhow::anyhow!("Field {} not found in local struct", field))?;
+                            *field_value = value;
+                            return Ok(());
+                        }
+                    }
+                }
+                // `self.array[i].field` and `self.array[i].field[j]` are
+                // represented as a field access whose receiver contains the
+                // state-array element access. Preserve that whole chain for
+                // write offset calculation.
+                if let Expr::IndexAccess(array_access, inner_index, _) = receiver.as_ref() {
+                    if let Expr::FieldAccess(array_receiver, array_field, _) = array_access.as_ref() {
+                        if matches!(array_receiver.as_ref(), Expr::Ident(name, _) if name == "self") {
+                            return self.compile_array_element_field_write(array_field, inner_index, field, None, value);
+                        }
+                    }
+                }
+                self.compile_state_write(receiver, Some(field), None, value)
+            }
             Expr::IndexAccess(arr, idx, _) => {
+                // `self.array[i].field[j]` has an outer index on a field
+                // access. The inner index selects the state-array element;
+                // the outer one selects within its fixed-size field.
+                if let Expr::FieldAccess(state_element, field, _) = arr.as_ref() {
+                    if let Expr::IndexAccess(array_access, element_index, _) = state_element.as_ref() {
+                        if let Expr::FieldAccess(array_receiver, array_field, _) = array_access.as_ref() {
+                            if matches!(array_receiver.as_ref(), Expr::Ident(name, _) if name == "self") {
+                                return self.compile_array_element_field_write(array_field, element_index, field, Some(idx), value);
+                            }
+                        }
+                    }
+                }
                 // Could be self.array[idx].field = val  or  self.array[idx] = val
                 // We handle the simple case: the target is already a fully resolved path
                 self.compile_state_write(arr, None, Some(idx), value)
@@ -502,6 +548,9 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
         // Check for self.field
         if let Expr::Ident(name, _) = receiver {
             if name == "self" {
+                if let Some(value @ SymValue::Struct { .. }) = self.locals.get(name) {
+                    return self.get_struct_field(value, field);
+                }
                 return self.compile_self_field_read(field);
             }
             if name == "ctx" {
@@ -924,6 +973,63 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
         Ok(())
     }
 
+    /// Write an array field (or one of its elements) inside a struct element
+    /// of a ContractStateArray, e.g. `self.users[uid].values[index] = value`.
+    fn compile_array_element_field_write(
+        &mut self,
+        array_field: &str,
+        element_index_expr: &Expr,
+        struct_field: &str,
+        nested_index_expr: Option<&Expr>,
+        value: SymValue,
+    ) -> Result<()> {
+        let contract_field = self
+            .layout
+            .get_field(array_field)
+            .ok_or_else(|| anyhow::anyhow!("Unknown contract field: {}", array_field))?
+            .clone();
+        let element_type = match &contract_field.ty {
+            ResolvedType::ContractStateArray { element, .. } => match element.as_ref() {
+                ResolvedType::Struct(name) => name.clone(),
+                _ => bail!("Array element is not a struct"),
+            },
+            _ => bail!("Field '{}' is not a ContractStateArray", array_field),
+        };
+        let struct_layout = self
+            .struct_layouts
+            .get(&element_type)
+            .ok_or_else(|| anyhow::anyhow!("Unknown struct type: {}", element_type))?;
+        let field_layout = struct_layout
+            .fields
+            .iter()
+            .find(|field| field.name == struct_field)
+            .ok_or_else(|| anyhow::anyhow!("Unknown field '{}' in struct '{}'", struct_field, element_type))?;
+        let field_type = field_layout.ty.clone();
+        let mut offset = self.exec.op_const(contract_field.base_offset as u64);
+        let element_index = self.compile_expr(element_index_expr)?.as_felt();
+        let element_stride = self.exec.op_const(contract_field.element_felt_size.unwrap_or(0) as u64);
+        let element_offset = self.exec.op_mul(element_index, element_stride);
+        offset = self.exec.op_add(offset, element_offset);
+        let field_offset = self.exec.op_const(field_layout.offset as u64);
+        offset = self.exec.op_add(offset, field_offset);
+
+        let refs = if let Some(nested_index_expr) = nested_index_expr {
+            let nested_element = match &field_type {
+                ResolvedType::Array { element, .. } => element.as_ref(),
+                _ => bail!("Field '{}' in struct '{}' is not an array", struct_field, element_type),
+            };
+            let nested_index = self.compile_expr(nested_index_expr)?.as_felt();
+            let stride = self.exec.op_const(nested_element.felt_size(self.struct_layouts)? as u64);
+            let nested_offset = self.exec.op_mul(nested_index, stride);
+            offset = self.exec.op_add(offset, nested_offset);
+            value.to_felt_refs()
+        } else {
+            value.to_felt_refs()
+        };
+        self.exec.cset_state_range_at(offset, &refs);
+        Ok(())
+    }
+
     // ─── Context field access ────────────────────────────────────────────
 
     fn compile_ctx_field(&mut self, field: &str) -> Result<SymValue> {
@@ -1101,6 +1207,14 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
     // ─── Method calls ────────────────────────────────────────────────────
 
     fn compile_method_call(&mut self, receiver: &Expr, method: &str, args: &[Expr]) -> Result<SymValue> {
+        if let Expr::Ident(name, _) = receiver {
+            if let Some(SymValue::Struct { name: struct_name, .. }) = self.locals.get(name) {
+                let key = format!("{}::{}", struct_name, method);
+                if let Some(helper) = self.helpers.get(&key).copied() {
+                    return self.compile_inherent_method_call(name, helper, args);
+                }
+            }
+        }
         // Handle self.method_name(args) — helper function call
         if let Expr::Ident(name, _) = receiver {
             if name == "self" {
@@ -1285,6 +1399,7 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
 
         // Inline the helper: bind params to args and execute body
         let saved_locals = self.locals.clone();
+        let saved_return_value = self.return_value.take();
 
         // Skip &mut self and ctx params, bind the rest.
         // Note: &mut self is the receiver and not in the args list, so we don't
@@ -1324,10 +1439,52 @@ impl<'a, 'b> MethodCompileContext<'a, 'b> {
             self.compile_stmt(stmt)?;
         }
 
+        let return_value = self.return_value.take().unwrap_or(SymValue::Void);
         // Restore locals
         self.locals = saved_locals;
+        self.return_value = saved_return_value;
 
-        Ok(SymValue::Void)
+        Ok(return_value)
+    }
+
+    fn compile_inherent_method_call(&mut self, receiver_name: &str, method: &CheckedMethod, args: &[Expr]) -> Result<SymValue> {
+        let receiver = self
+            .locals
+            .get(receiver_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Unknown receiver: {}", receiver_name))?;
+        let mut compiled_args = Vec::new();
+        for arg in args {
+            compiled_args.push(self.compile_expr(arg)?);
+        }
+        let parameters: Vec<_> = method
+            .params
+            .iter()
+            .filter(|param| !matches!(param.ty, crate::types::resolver::ResolvedParamType::SelfRef { .. }))
+            .collect();
+        if parameters.len() != compiled_args.len() {
+            bail!("{} expects {} arguments, got {}", method.name, parameters.len(), compiled_args.len());
+        }
+
+        let saved_locals = self.locals.clone();
+        let saved_return_value = self.return_value.take();
+        self.locals.insert("self".to_string(), receiver);
+        for (param, value) in parameters.into_iter().zip(compiled_args) {
+            self.locals.insert(param.name.clone(), value);
+        }
+        for stmt in &method.body {
+            self.compile_stmt(stmt)?;
+        }
+        let return_value = self.return_value.take().unwrap_or(SymValue::Void);
+        let updated_receiver = self
+            .locals
+            .get("self")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Missing struct receiver after method call"))?;
+        self.locals = saved_locals;
+        self.locals.insert(receiver_name.to_string(), updated_receiver);
+        self.return_value = saved_return_value;
+        Ok(return_value)
     }
 
     fn compile_function_call(&mut self, name: &str, args: &[Expr]) -> Result<SymValue> {

@@ -294,7 +294,8 @@ get-sd-key-fingerprint:
     	--allowed-method-id 3375543263 \
 		--allowed-method-id 2789897329 \
 		--allowed-method-id 3998182541 \
-		--expected-tx-count 3
+		--min-tx-count 1 \
+		--max-tx-count 3
 
 make register-sd-key-user:
 	@RUST_LOG=$${RUST_LOG:-info} $(USER_CLI) register-user \
@@ -313,7 +314,8 @@ faucet:
     	--sd-key-allowed-method-id 3375543263 \
 		--sd-key-allowed-method-id 2789897329 \
 		--sd-key-allowed-method-id 3998182541 \
-    	--sd-key-expected-tx-count 3 \
+		--sd-key-min-tx-count 1 \
+		--sd-key-max-tx-count 3 \
     	--contract-id 5 \
     	--method-name faucet \
     	--inputs '[0, 666000000000]'
@@ -329,7 +331,8 @@ error-faucet:
     	--sd-key-allowed-method-id 3375543263 \
 		--sd-key-allowed-method-id 2789897329 \
 		--sd-key-allowed-method-id 3998182541 \
-    	--sd-key-expected-tx-count 3 \
+		--sd-key-min-tx-count 1 \
+		--sd-key-max-tx-count 3 \
     	--contract-id 0 \
     	--method-name transfer \
     	--inputs '[0, 666000000000]' \

@@ -52,15 +52,16 @@ use serde_json;
 
 use super::request::{
     Id, QAddWithdrawalRPCRequest, QClaimDepositRPCRequest, QDeployContractRPCRequest, QGetUserIdsRPCRequest, QRegisterUserRPCRequest,
-    QSubmitEndCapRPCRequest, QTokenTransferRPCRequest, QUpdateContractRPCRequest, RequestParams, ResponseResult, RpcRequest, RpcResponse, Version,
+    QSubmitEndCapRPCRequest, QTokenTransferRPCRequest, QUpdateContractRPCRequest, RequestParams, ResponseResult, RpcRequest, RpcResponse,
+    Version,
 };
 use crate::{
     request::{
-        DPNSoftwareDefinedSignatureProofRPCRequest, QBaseProofMinifierRPCRequest, QBlockStateRPCRequest,
+        QBaseProofMinifierRPCRequest, QBlockStateRPCRequest,
         QGenerateBatchProofMinerRewardProofsRPCRequest, QGetCheckpointIdForUniquePendingIdRPCRequest, QGetContractMethodCommonDataRPCRequest,
         QGetFnIdRPCRequest, QGetUserEndCapSlotUpdatesRPCRequest, QLatestBlockStateRPCRequest, QLeftAggRightLeafRpcRequestV2,
         QLeftLeafRightAggRpcRequestV2, QProveContractCallRPCRequest, QProveUpsStartRPCRequest, QProveUpsStartRegisterUserRPCRequest,
-        QRegisterCircuitsRPCRequest, QRegisterDPNSoftwareDefinedCircuitRPCRequest, QRegisterPlonky2SoftwareDefinedCircuitRPCRequest,
+        QRegisterCircuitsRPCRequest, QRegisterSDKeyDPNCircuitRPCRequest, QRegisterSDKeyPlonky2CircuitRPCRequest,
         QResolveContractFunctionByMethodIdRPCRequest, QResolveContractFunctionByMethodNameRPCRequest, QSecpSignatureProofRPCRequest,
         QSignatureMinifierProofRPCRequest, QSingleLeafRpcRequestV2, QTwoAggRpcRequsetV2, QTwoLeafRpcRequestV2, QUpsCfcDeferredTxRPCRequest,
         QUpsCfcStandardTxRPCRequest, QUpsEndCapRPCRequestV2, QUserSubTreeMerkleProofRPCRequest, RealmEndCapSlotUpdates, RequestParamsV2,
@@ -434,7 +435,6 @@ impl QUserRpcProvider for RpcProvider {
     }
 
     async fn deploy_contract<F: RichField>(&self, req: QDeployContractRPCRequest<F>) -> anyhow::Result<String> {
-        req.deploy_contract.validate_shape()?;
         let url = self.get_coordinator_url()?;
         let response = psy_rpc_call_back!(self, url, RequestParams::<F>::DeployContract(req), String);
         match response.result {
@@ -450,13 +450,12 @@ impl QUserRpcProvider for RpcProvider {
     }
 
     async fn update_contract<F: RichField>(&self, req: QUpdateContractRPCRequest<F>) -> anyhow::Result<String> {
-        req.update_contract.validate_shape()?;
         let url = self.get_coordinator_url()?;
         let response = psy_rpc_call_back!(self, url, RequestParams::<F>::UpdateContract(req), String);
         match response.result {
-            ResponseResult::Success(update_content_hash) => {
-                tracing::debug!("updated contract {}", update_content_hash);
-                Ok(update_content_hash)
+            ResponseResult::Success(update_uuid) => {
+                tracing::debug!("updated contract {}", update_uuid);
+                Ok(update_uuid)
             }
             ResponseResult::Error(e) => {
                 tracing::error!("RPC call failed: {:?}", e);
@@ -1679,47 +1678,16 @@ where
         }
     }
 
-    async fn register_dpn_software_defined_circuit(
-        &self,
-        fn_def: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition,
-        contract_id: u64,
-        contract_state_tree_height: u8,
-        session_proof_tree_height: u8,
-        force_four_align: bool,
-    ) -> anyhow::Result<QHashOut<C::F>> {
-        tracing::info!("register_dpn_software_defined_circuit: ");
-        let request = QRegisterDPNSoftwareDefinedCircuitRPCRequest {
-            fn_def,
-            contract_id,
-            contract_state_tree_height,
-            session_proof_tree_height,
-            force_four_align,
-        };
-        let response = psy_rpc_call_back!(
-            self,
-            &self.proof_proxy_url,
-            RequestParams::<C::F>::RegisterDPNSoftwareDefinedCircuit(request),
-            QHashOut<C::F>
-        );
-        match response.result {
-            ResponseResult::Success(fingerprint) => {
-                tracing::info!("get sdc fingerprint: {}", fingerprint.to_string());
-                Ok(fingerprint)
-            }
-            ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
-        }
-    }
-
-    async fn register_plonky2_software_defined_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<C::F>> {
-        tracing::info!("register_plonky2_software_defined_circuit: ");
-        let request = QRegisterPlonky2SoftwareDefinedCircuitRPCRequest {
+    async fn register_sd_key_plonky2_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<C::F>> {
+        tracing::info!("register_sd_key_plonky2_circuit: ");
+        let request = QRegisterSDKeyPlonky2CircuitRPCRequest {
             contract_state_tree_height,
             input_len,
         };
         let response = psy_rpc_call_back!(
             self,
             &self.proof_proxy_url,
-            RequestParams::<C::F>::RegisterPlonky2SoftwareDefinedCircuit(request),
+            RequestParams::<C::F>::RegisterSDKeyPlonky2Circuit(request),
             QHashOut<C::F>
         );
         match response.result {
@@ -1731,42 +1699,14 @@ where
         }
     }
 
-    async fn prove_dpn_software_defined_sign(
-        &self,
-        fingerprint: QHashOut<C::F>,
-        private_key: QHashOut<C::F>,
-        input: psy_vm::ups::signature::DPNSoftwareDefinedSignatureInput,
-        sig_hash: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        tracing::info!("prove_dpn_software_defined_sign:");
-        let response = psy_rpc_call_back!(
-            self,
-            &self.proof_proxy_url,
-            RequestParams::<C::F>::DPNSoftwareDefinedSignatureProof(DPNSoftwareDefinedSignatureProofRPCRequest {
-                fingerprint,
-                private_key,
-                input,
-                sig_hash,
-            }),
-            ProofWithPublicInputs<C::F, C, D>
-        );
-        match response.result {
-            ResponseResult::Success(proof) => {
-                tracing::info!("get proof: {}", serde_json::to_string_pretty(&proof.public_inputs)?);
-                Ok(proof)
-            }
-            ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
-        }
-    }
-
-    async fn prove_plonky2_software_defined_sign(
+    async fn prove_sd_key_plonky2_sign(
         &self,
         _fingerprint: QHashOut<C::F>,
         _private_key: QHashOut<C::F>,
-        _input: psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput,
+        _input: psy_vm::ups::signature::SDKeyPlonky2CircuitWitnessInput,
         _sig_hash: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        tracing::info!("prove_plonky2_software_defined_sign:");
+        tracing::info!("prove_sd_key_plonky2_sign:");
         // Now that we have StateReaderResults which can be serialized, this can be
         // implemented For now, return an error until the RPC request is
         // implemented

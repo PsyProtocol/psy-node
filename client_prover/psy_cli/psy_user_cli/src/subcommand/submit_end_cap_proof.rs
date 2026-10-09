@@ -13,10 +13,10 @@ use crate::result::{CommandResult, TransactionResult, TransactionStatus};
 
 fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_ids: &[u32]) -> anyhow::Result<Vec<(u64, u32)>> {
     if allowed_contract_ids.is_empty() {
-        anyhow::bail!("sdk-key sign needs at least one --sdk-key-allowed-contract-id");
+        anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-contract-id");
     }
     if allowed_method_ids.is_empty() {
-        anyhow::bail!("sdk-key sign needs at least one --sdk-key-allowed-method-id");
+        anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-method-id");
     }
 
     if allowed_contract_ids.len() == allowed_method_ids.len() {
@@ -37,15 +37,16 @@ fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_id
             .collect());
     }
 
-    anyhow::bail!("sdk-key allowed contract_id and method_id lists must have the same length, or one list must contain exactly one value");
+    anyhow::bail!("sd-key allowed contract_id and method_id lists must have the same length, or one list must contain exactly one value");
 }
 
-async fn validate_sdk_key_allowed_calls(
+async fn validate_sd_key_allowed_calls(
     provider: &RpcProvider,
     contract_calls: &[ContractCallArgs],
     allowed_contract_ids: &[u64],
     allowed_method_ids: &[u32],
-    expected_tx_count: u64,
+    min_tx_count: u64,
+    max_tx_count: u64,
 ) -> anyhow::Result<()> {
     let allowed_pairs = allowed_contract_method_pairs(allowed_contract_ids, allowed_method_ids)?;
 
@@ -64,12 +65,13 @@ async fn validate_sdk_key_allowed_calls(
 
         if !allowed_pairs.contains(&(call.contract_id, method)) {
             anyhow::bail!(
-                "SDK key policy denied call_index={} contract_id={} method_name={} method_id={}; expected_tx_count={}; allowed_pairs={:?}",
+                "SD key policy denied call_index={} contract_id={} method_name={} method_id={}; tx_count_range=[{}, {}]; allowed_pairs={:?}",
                 call_index,
                 call.contract_id,
                 call.method_name,
                 method,
-                expected_tx_count,
+                min_tx_count,
+                max_tx_count,
                 allowed_pairs
             );
         }
@@ -85,13 +87,13 @@ pub async fn configure_wallet_session_for_signer(
     contract_calls: &[ContractCallArgs],
 ) -> anyhow::Result<()> {
     match wallet.sign_type {
-        SignType::SoftwareDefinedPlonky2Sign => {
+        SignType::SDKeyPlonky2Sign => {
             let fingerprint = wallet_session
                 .wallet
-                .register_plonky2_software_defined_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
+                .register_sd_key_plonky2_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
                 .await?;
 
-            if let Some(mut _circuit) = wallet_session.wallet.get_plonky2_software_defined_circuit_mut(&fingerprint) {
+            if let Some(mut _circuit) = wallet_session.wallet.get_sd_key_plonky2_circuit_mut(&fingerprint) {
                 // state_reader must do the same thing while generating
                 // witnesses
             }
@@ -103,37 +105,28 @@ pub async fn configure_wallet_session_for_signer(
                 fingerprint,
             );
         }
-        SignType::SoftwareDefinedDPNSign => {
-            let user_sdc: DPNFunctionCircuitDefinition = serde_json::from_str(&std::fs::read_to_string("sdc.json")?)?;
-            let fingerprint = wallet_session.wallet.register_psy_software_defined_circuit(user_sdc, false).await?;
-            anyhow::ensure!(
-                signer_fingerprint == fingerprint,
-                "software-defined-dpn fingerprint mismatch: expected={}, actual={}",
-                signer_fingerprint,
-                fingerprint,
-            );
-        }
-        SignType::SDKeySign => {
+        SignType::SDKeyDpnSign => {
             let allowed_contract_ids = &wallet.sd_key_allowed_contract_id;
             if allowed_contract_ids.is_empty() {
-                anyhow::bail!("sdk-key sign needs at least one --sdk-key-allowed-contract-id");
+                anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-contract-id");
             }
             let allowed_method_ids = &wallet.sd_key_allowed_method_id;
             if allowed_method_ids.is_empty() {
-                anyhow::bail!("sdk-key sign needs at least one --sdk-key-allowed-method-id");
+                anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-method-id");
             }
-            let expected_tx_count = wallet.sd_key_expected_tx_count;
-            validate_sdk_key_allowed_calls(
+            let (min_tx_count, max_tx_count) = wallet.sd_key_tx_count_range();
+            validate_sd_key_allowed_calls(
                 &wallet_session.st_provider,
                 contract_calls,
                 allowed_contract_ids,
                 allowed_method_ids,
-                expected_tx_count,
+                min_tx_count,
+                max_tx_count,
             )
             .await?;
-            let fingerprint = wallet_session
-                .register_sd_key_circuit(allowed_contract_ids, allowed_method_ids, expected_tx_count)
-                .await?;
+            let (function, config) =
+                psy_vm::ups::sd_key::build_allow_method_policy_range(allowed_contract_ids, allowed_method_ids, min_tx_count, max_tx_count)?;
+            let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
             anyhow::ensure!(
                 signer_fingerprint == fingerprint,
                 "sd-key fingerprint mismatch: expected={}, actual={}",

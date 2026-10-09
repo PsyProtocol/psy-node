@@ -182,9 +182,7 @@ fn contract_method_return_paths_work() {
 }
 
 #[test]
-fn helper_return_value_should_work_but_currently_fails() {
-    // Intentionally failing regression test:
-    // helper return values should be usable in expressions and state writes.
+fn helper_return_value_can_be_used_in_expressions_and_state_writes() {
     let ctx = default_context();
     let result = execute(FUNCTION_SOURCE, "use_helper_return", &ctx, &[7]);
     assert!(result.success, "expected success, failure={:?}", result.failure);

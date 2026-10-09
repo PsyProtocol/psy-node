@@ -33,9 +33,10 @@ use psy_crypto::{
 
 use crate::{
     dpn::vm::def::DPNFunctionCircuitDefinition,
-    ups::signature::{DPNSoftwareDefinedSignatureInput, Plonky2SoftwareDefinedSignatureInput},
+    ups::{sd_key::SDKeyDpnCircuitWitnessInput, signature::SDKeyPlonky2CircuitWitnessInput},
     vm::cfc_input::DapenContractFunctionCircuitInput,
 };
+use psy_client_data::dpn::sd_key::SDKeyConfig;
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async(?Send))]
@@ -116,30 +117,27 @@ where
         signature: PsyCompressedSecp256K1Signature,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 
-    async fn register_dpn_software_defined_circuit(
-        &self,
-        fn_def: DPNFunctionCircuitDefinition,
-        contract_id: u64,
-        contract_state_tree_height: u8,
-        session_proof_tree_height: u8,
-        force_four_align: bool,
-    ) -> anyhow::Result<QHashOut<C::F>>;
+    async fn register_sd_key_dpn_circuit(&self, _fn_def: DPNFunctionCircuitDefinition, _config: SDKeyConfig) -> anyhow::Result<QHashOut<C::F>> {
+        unimplemented!("register_sd_key_dpn_circuit")
+    }
 
-    async fn register_plonky2_software_defined_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<C::F>>;
-
-    async fn prove_dpn_software_defined_sign(
+    async fn prove_sd_key_dpn_sign(
         &self,
         fingerprint: QHashOut<C::F>,
         private_key: QHashOut<C::F>,
-        input: DPNSoftwareDefinedSignatureInput,
+        input: SDKeyDpnCircuitWitnessInput,
         sig_hash: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        unimplemented!("prove_sd_key_dpn_sign")
+    }
 
-    async fn prove_plonky2_software_defined_sign(
+    async fn register_sd_key_plonky2_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<C::F>>;
+
+    async fn prove_sd_key_plonky2_sign(
         &self,
         fingerprint: QHashOut<C::F>,
         private_key: QHashOut<C::F>,
-        input: Plonky2SoftwareDefinedSignatureInput,
+        input: SDKeyPlonky2CircuitWitnessInput,
         sig_hash: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 
@@ -310,50 +308,21 @@ where
         (**self).prove_eth_personal_secp_sign(signature).await
     }
 
-    async fn register_dpn_software_defined_circuit(
-        &self,
-        fn_def: DPNFunctionCircuitDefinition,
-        contract_id: u64,
-        contract_state_tree_height: u8,
-        session_proof_tree_height: u8,
-        force_four_align: bool,
-    ) -> anyhow::Result<QHashOut<C::F>> {
+    async fn register_sd_key_plonky2_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<C::F>> {
         (**self)
-            .register_dpn_software_defined_circuit(
-                fn_def,
-                contract_id,
-                contract_state_tree_height,
-                session_proof_tree_height,
-                force_four_align,
-            )
+            .register_sd_key_plonky2_circuit(contract_state_tree_height, input_len)
             .await
     }
 
-    async fn register_plonky2_software_defined_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<C::F>> {
-        (**self)
-            .register_plonky2_software_defined_circuit(contract_state_tree_height, input_len)
-            .await
-    }
-
-    async fn prove_dpn_software_defined_sign(
+    async fn prove_sd_key_plonky2_sign(
         &self,
         fingerprint: QHashOut<C::F>,
         private_key: QHashOut<C::F>,
-        input: DPNSoftwareDefinedSignatureInput,
-        sig_hash: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        (**self).prove_dpn_software_defined_sign(fingerprint, private_key, input, sig_hash).await
-    }
-
-    async fn prove_plonky2_software_defined_sign(
-        &self,
-        fingerprint: QHashOut<C::F>,
-        private_key: QHashOut<C::F>,
-        input: Plonky2SoftwareDefinedSignatureInput,
+        input: SDKeyPlonky2CircuitWitnessInput,
         sig_hash: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         (**self)
-            .prove_plonky2_software_defined_sign(fingerprint, private_key, input, sig_hash)
+            .prove_sd_key_plonky2_sign(fingerprint, private_key, input, sig_hash)
             .await
     }
 
@@ -558,50 +527,21 @@ where
         (**self).prove_eth_personal_secp_sign(signature).await
     }
 
-    async fn register_dpn_software_defined_circuit(
-        &self,
-        fn_def: DPNFunctionCircuitDefinition,
-        contract_id: u64,
-        contract_state_tree_height: u8,
-        session_proof_tree_height: u8,
-        force_four_align: bool,
-    ) -> anyhow::Result<QHashOut<C::F>> {
+    async fn register_sd_key_plonky2_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<C::F>> {
         (**self)
-            .register_dpn_software_defined_circuit(
-                fn_def,
-                contract_id,
-                contract_state_tree_height,
-                session_proof_tree_height,
-                force_four_align,
-            )
+            .register_sd_key_plonky2_circuit(contract_state_tree_height, input_len)
             .await
     }
 
-    async fn register_plonky2_software_defined_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<C::F>> {
-        (**self)
-            .register_plonky2_software_defined_circuit(contract_state_tree_height, input_len)
-            .await
-    }
-
-    async fn prove_dpn_software_defined_sign(
+    async fn prove_sd_key_plonky2_sign(
         &self,
         fingerprint: QHashOut<C::F>,
         private_key: QHashOut<C::F>,
-        input: DPNSoftwareDefinedSignatureInput,
-        sig_hash: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        (**self).prove_dpn_software_defined_sign(fingerprint, private_key, input, sig_hash).await
-    }
-
-    async fn prove_plonky2_software_defined_sign(
-        &self,
-        fingerprint: QHashOut<C::F>,
-        private_key: QHashOut<C::F>,
-        input: Plonky2SoftwareDefinedSignatureInput,
+        input: SDKeyPlonky2CircuitWitnessInput,
         sig_hash: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         (**self)
-            .prove_plonky2_software_defined_sign(fingerprint, private_key, input, sig_hash)
+            .prove_sd_key_plonky2_sign(fingerprint, private_key, input, sig_hash)
             .await
     }
 

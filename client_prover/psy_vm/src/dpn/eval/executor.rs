@@ -13,6 +13,7 @@ use plonky2::{
     hash::poseidon::PoseidonHash,
     plonk::config::{GenericHashOut, Hasher},
 };
+use psy_client_data::dpn::sd_key::{SDKEY_MAX_CALLDATA_WORDS, MAX_INTROSPECTABLE_TRANSACTIONS};
 use serde::{Deserialize, Serialize};
 use tiny_keccak::{Hasher as _, Keccak};
 
@@ -126,9 +127,20 @@ pub struct ExecutionContext {
     pub checkpoint_id: u64,
     pub nonce: u64,
     pub user_public_key_hash: [u64; 4],
-    /// Full 4-element session proof tree root, mirroring the witness
-    /// executor's `session_proof_tree_root` (GetSessionProofTreeRoot).
     pub session_proof_tree_root: [u64; 4],
+    /// Ordered CFC transaction log visible to read-only DPN introspection.
+    pub transaction_log: Vec<TransactionIntrospectionEntry>,
+    pub transaction_stack_hash: [u64; 4],
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransactionIntrospectionEntry {
+    pub contract_id: u64,
+    pub caller_contract_id: u64,
+    pub method_id: u64,
+    pub inputs_hash: [u64; 4],
+    pub inputs_length: u64,
+    pub inputs: Vec<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -387,11 +399,7 @@ impl<S: StateBackend> VmExecutor<S> {
 
     /// Execute a contract function with the given context and inputs
     pub fn execute(&mut self, circuit: &DPNFunctionCircuitDefinition, context: &ExecutionContext, inputs: &[u64]) -> anyhow::Result<ExecutionResult> {
-        // Untrusted-definition gate: reject malformed programs before the
-        // evaluation arms can panic on them.
-        crate::dpn::vm::validate::validate_function_definition(circuit)
-            .map_err(|e| anyhow::anyhow!("dapen function definition failed validation: {e}"))?;
-
+        circuit.validate_state_command_resolution_semantics()?;
         // Clear write overlays for fresh execution
         self.write_overlay.clear();
         self.imt_write_overlay.clear();
@@ -515,17 +523,19 @@ impl<S: StateBackend> VmExecutor<S> {
                 };
                 let full_hash: Vec<u64> = hash_elements.iter().map(|f| f.to_canonical_u64()).collect();
                 registers.hash_out_arrays.insert(def.index, full_hash);
-            } else if matches!(def.op_type, DPNOpType::GetUserPublicKeyHash) {
-                // Context hashes resolve like computed hashes: the scalar
-                // arm above returns element 0, the full 4-element hash is
-                // registered for TargetAt — same as the witness executor.
-                registers
-                    .hash_out_arrays
-                    .insert(def.index, context.user_public_key_hash.to_vec());
-            } else if matches!(def.op_type, DPNOpType::GetSessionProofTreeRoot) {
-                registers
-                    .hash_out_arrays
-                    .insert(def.index, context.session_proof_tree_root.to_vec());
+            } else if def.op_type == DPNOpType::GetUserPublicKeyHash {
+                registers.hash_out_arrays.insert(def.index, context.user_public_key_hash.to_vec());
+            } else if def.op_type == DPNOpType::GetSessionProofTreeRoot {
+                registers.hash_out_arrays.insert(def.index, context.session_proof_tree_root.to_vec());
+            } else if def.op_type == DPNOpType::GetTransactionStackHash {
+                registers.hash_out_arrays.insert(def.index, context.transaction_stack_hash.to_vec());
+            } else if def.op_type == DPNOpType::GetTransactionInputsHash {
+                let index = registers.get_by_encoded_id(def.inputs[0]) as usize;
+                let entry = context
+                    .transaction_log
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("transaction index {} out of bounds", index))?;
+                registers.hash_out_arrays.insert(def.index, entry.inputs_hash.to_vec());
             } else if def.op_type == DPNOpType::Keccak256 {
                 let words: Vec<u64> = def.inputs.iter().map(|&id| registers.get_by_encoded_id(id)).collect();
                 let full_words: Vec<u64> = semantics::keccak_u32_words_be(&words)?.into_iter().map(|x| x as u64).collect();
@@ -845,10 +855,95 @@ impl<S: StateBackend> VmExecutor<S> {
                 // Returns first element of hash; array result handled separately
                 Ok(context.user_public_key_hash[0])
             }
-            DPNOpType::GetSessionProofTreeRoot => {
-                // Scalar view of the tree root; the full hash is registered
-                // for TargetAt in the post-step below, matching the witness.
-                Ok(context.session_proof_tree_root[0])
+            DPNOpType::GetSessionProofTreeRoot => Ok(context.session_proof_tree_root[0]),
+            DPNOpType::GetTransactionCount => Ok(context.transaction_log.len() as u64),
+            DPNOpType::GetTransactionStackHash => Ok(context.transaction_stack_hash[0]),
+            DPNOpType::GetTransactionContractId => {
+                let index = resolve(
+                    def.inputs
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("GetTransactionContractId requires an index"))?,
+                );
+                context
+                    .transaction_log
+                    .get(index as usize)
+                    .map(|entry| entry.contract_id)
+                    .ok_or_else(|| anyhow::anyhow!("transaction index {} out of bounds", index))
+            }
+            DPNOpType::GetTransactionCallerContractId => {
+                let index = resolve(
+                    def.inputs
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("GetTransactionCallerContractId requires an index"))?,
+                );
+                context
+                    .transaction_log
+                    .get(index as usize)
+                    .map(|entry| entry.caller_contract_id)
+                    .ok_or_else(|| anyhow::anyhow!("transaction index {} out of bounds", index))
+            }
+            DPNOpType::GetTransactionMethodId => {
+                let index = resolve(
+                    def.inputs
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("GetTransactionMethodId requires an index"))?,
+                );
+                context
+                    .transaction_log
+                    .get(index as usize)
+                    .map(|entry| entry.method_id)
+                    .ok_or_else(|| anyhow::anyhow!("transaction index {} out of bounds", index))
+            }
+            DPNOpType::GetTransactionInputsHash => {
+                let index = resolve(
+                    def.inputs
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("GetTransactionInputsHash requires an index"))?,
+                );
+                let entry = context
+                    .transaction_log
+                    .get(index as usize)
+                    .ok_or_else(|| anyhow::anyhow!("transaction index {} out of bounds", index))?;
+                Ok(entry.inputs_hash[0])
+            }
+            DPNOpType::GetTransactionInputLength => {
+                let index = resolve(
+                    def.inputs
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("GetTransactionInputLength requires an index"))?,
+                );
+                context
+                    .transaction_log
+                    .get(index as usize)
+                    .map(|entry| entry.inputs_length)
+                    .ok_or_else(|| anyhow::anyhow!("transaction index {} out of bounds", index))
+            }
+            DPNOpType::GetTransactionInputWord => {
+                let tx_index = resolve(
+                    def.inputs
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("GetTransactionInputWord requires a transaction index"))?,
+                );
+                let word_index = resolve(
+                    def.inputs
+                        .get(1)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("GetTransactionInputWord requires a word index"))?,
+                );
+                let entry = context
+                    .transaction_log
+                    .get(tx_index as usize)
+                    .ok_or_else(|| anyhow::anyhow!("transaction index {} out of bounds", tx_index))?;
+                if tx_index >= MAX_INTROSPECTABLE_TRANSACTIONS as u64 || word_index >= SDKEY_MAX_CALLDATA_WORDS as u64 {
+                    return Err(anyhow::anyhow!("transaction introspection index out of bounds"));
+                }
+                Ok(entry.inputs.get(word_index as usize).copied().unwrap_or(0))
             }
 
             // Hashing
@@ -1794,6 +1889,8 @@ mod input_binding_tests {
             nonce: 0,
             user_public_key_hash: [0; 4],
             session_proof_tree_root: [0; 4],
+            transaction_log: vec![],
+            transaction_stack_hash: [0; 4],
         }
     }
 
@@ -1866,6 +1963,8 @@ mod nor_lane_tests {
             nonce: 0,
             user_public_key_hash: [0; 4],
             session_proof_tree_root: [0; 4],
+            transaction_log: vec![],
+            transaction_stack_hash: [0; 4],
         };
         let mut executor = VmExecutor::new(InMemoryStateBackend::new());
         let err = executor.execute(&defn, &ctx, &[4, 0]).unwrap_err();
@@ -1896,6 +1995,8 @@ mod tests {
             nonce: 11,
             user_public_key_hash: [1, 2, 3, 4],
             session_proof_tree_root: [0; 4],
+            transaction_log: vec![],
+            transaction_stack_hash: [0; 4],
         }
     }
 

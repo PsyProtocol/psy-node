@@ -3,6 +3,7 @@ use psy_cli_common::key_utils::load_wallet_key_info;
 use psy_client_common::args::SignType;
 use psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT;
 use psy_prover::session::WalletSession;
+use psy_prover::wallet::memory_wallet::SdKeyCircuitDefinition;
 use psy_provider::provider::RpcProvider;
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
 
@@ -47,10 +48,10 @@ pub async fn run(args: ProveTxTraceArgs) -> anyhow::Result<CommandResult> {
     let checkpoint_before = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
     let mut wallet_session = WalletSession::new(&rpc_config).await?;
     match args.session.wallet.sign_type {
-        SignType::SoftwareDefinedPlonky2Sign => {
+        SignType::SDKeyPlonky2Sign => {
             let fingerprint = wallet_session
                 .wallet
-                .register_plonky2_software_defined_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
+                .register_sd_key_plonky2_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
                 .await?;
             anyhow::ensure!(
                 info.fingerprint == fingerprint,
@@ -59,17 +60,7 @@ pub async fn run(args: ProveTxTraceArgs) -> anyhow::Result<CommandResult> {
                 fingerprint,
             );
         }
-        SignType::SoftwareDefinedDPNSign => {
-            let user_sdc: DPNFunctionCircuitDefinition = serde_json::from_str(&std::fs::read_to_string("sdc.json")?)?;
-            let fingerprint = wallet_session.wallet.register_psy_software_defined_circuit(user_sdc, false).await?;
-            anyhow::ensure!(
-                info.fingerprint == fingerprint,
-                "software-defined-dpn fingerprint mismatch: expected={}, actual={}",
-                info.fingerprint,
-                fingerprint,
-            );
-        }
-        SignType::SDKeySign => {
+        SignType::SDKeyDpnSign => {
             let source = trace
                 .steps
                 .iter()
@@ -79,17 +70,26 @@ pub async fn run(args: ProveTxTraceArgs) -> anyhow::Result<CommandResult> {
                     _ => None,
                 })
                 .ok_or_else(|| anyhow::anyhow!("trace is missing terminal ZkSign step for sd-key proving"))?;
-            let psy_prover::trace::TraceSignCircuitSource::SdKey {
-                allowed_contract_ids,
-                allowed_method_ids,
-                expected_tx_count,
-            } = source
-            else {
-                anyhow::bail!("sd-key trace is missing TraceSignCircuitSource::SdKey");
+            let definition = match source {
+                psy_prover::trace::TraceSignCircuitSource::SdKeyDpn { function_def, config } => SdKeyCircuitDefinition::Dpn {
+                    function: bincode::deserialize(function_def)?,
+                    config: config.clone(),
+                },
+                psy_prover::trace::TraceSignCircuitSource::SdKeyPlonky2 {
+                    contract_state_tree_height,
+                    input_len,
+                } => SdKeyCircuitDefinition::Plonky2 {
+                    contract_state_tree_height: *contract_state_tree_height,
+                    input_len: *input_len,
+                },
+                _ => anyhow::bail!("trace is missing an SD-key signing circuit"),
             };
-            let fingerprint = wallet_session
-                .register_sd_key_circuit(allowed_contract_ids, allowed_method_ids, *expected_tx_count)
-                .await?;
+            let fingerprint = match definition {
+                SdKeyCircuitDefinition::Dpn { function, config } => wallet_session.wallet.register_sd_key_dpn_circuit(function, config).await?,
+                SdKeyCircuitDefinition::Plonky2 { contract_state_tree_height, input_len } => {
+                    wallet_session.wallet.register_sd_key_plonky2_circuit(contract_state_tree_height, input_len).await?
+                }
+            };
             anyhow::ensure!(
                 info.fingerprint == fingerprint,
                 "sd-key fingerprint mismatch: expected={}, actual={}",

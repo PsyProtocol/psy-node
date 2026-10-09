@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Result;
 use psy_cli_common::key_utils::load_wallet_key_info;
-use psy_prover::wallet::memory_wallet::get_allow_method_sd_key_fingerprint;
+use psy_prover::wallet::memory_wallet::get_allow_method_sd_key_fingerprint_range;
 use psy_provider::wallet::secp_wallet::Wallet;
 use rpassword::read_password;
 
@@ -73,7 +73,9 @@ pub fn run(args: WalletArgs) -> Result<CommandResult> {
                     fingerprint: None,
                     sd_key_allowed_contract_id: vec![],
                     sd_key_allowed_method_id: vec![],
-                    sd_key_expected_tx_count: 2,
+                    sd_key_min_tx_count: None,
+                    sd_key_max_tx_count: None,
+                    sd_key_definition: None,
                 },
                 true,
             )?;
@@ -96,11 +98,18 @@ pub fn run(args: WalletArgs) -> Result<CommandResult> {
         WalletCommands::SdKeyFingerprint {
             allowed_contract_id,
             allowed_method_id,
-            expected_tx_count,
+            min_tx_count,
+            max_tx_count,
         } => {
+            let (min_tx_count, max_tx_count) = match (min_tx_count, max_tx_count) {
+                (Some(min), Some(max)) => (min, max),
+                (Some(min), None) => (min, min),
+                (None, Some(max)) => (1, max),
+                (None, None) => (2, 2),
+            };
             println!(
                 "{}",
-                get_allow_method_sd_key_fingerprint(&allowed_contract_id, &allowed_method_id, expected_tx_count)?
+                get_allow_method_sd_key_fingerprint_range(&allowed_contract_id, &allowed_method_id, min_tx_count, max_tx_count)?
             );
             Ok(CommandResult::generic("wallet-sd-key-fingerprint"))
         }

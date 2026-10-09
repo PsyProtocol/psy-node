@@ -298,19 +298,20 @@ async fn create_wallet_session(
     let mut wallet_session = WalletSession::new(&rpc_config).await?;
     let info = load_wallet_key_info(&wallet_args, false)?;
     match wallet_args.sign_type {
-        SignType::SoftwareDefinedPlonky2Sign => {
+        SignType::SDKeyPlonky2Sign => {
             let fingerprint = wallet_session
                 .wallet
-                .register_plonky2_software_defined_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
+                .register_sd_key_plonky2_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
                 .await?;
             assert_eq!(info.fingerprint, fingerprint, "software-defined-plonky2-sign key fingerprint mismatch");
         }
-        SignType::SoftwareDefinedDPNSign => {
+        SignType::SDKeyDpnSign => {
             let user_sdc: DPNFunctionCircuitDefinition =
                 serde_json::from_str(&std::fs::read_to_string(DEFAULT_SDC_PATH)?)?;
+            let config = psy_vm::ups::sd_key::sd_key_config_for_dpn_function(&user_sdc);
             let fingerprint = wallet_session
                 .wallet
-                .register_psy_software_defined_circuit(user_sdc, false)
+                .register_sd_key_dpn_circuit(user_sdc, config)
                 .await?;
             assert_eq!(info.fingerprint, fingerprint, "software-defined-dpn-sign key fingerprint mismatch");
         }
@@ -329,7 +330,9 @@ fn resolve_bridge_wallet_args(args: Option<WalletSourceArgs>) -> WalletSourceArg
         fingerprint: None,
         sd_key_allowed_contract_id: vec![],
         sd_key_allowed_method_id: vec![],
-        sd_key_expected_tx_count: 2,
+        sd_key_min_tx_count: None,
+        sd_key_max_tx_count: None,
+        sd_key_definition: None,
     });
     if wallet_args.keystore_path.is_none() {
         wallet_args.keystore_path = env::var("KEYSTORE_PATH").ok().filter(|v| !v.trim().is_empty());

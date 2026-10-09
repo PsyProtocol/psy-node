@@ -1367,11 +1367,16 @@ impl WalletManager {
         // Compile the mandate into a circuit. Its fingerprint IS the mandate's
         // public identity, and is what makes the constraint auditable.
         let (contract_ids, method_ids): (Vec<u64>, Vec<u32>) = capabilities.iter().map(|c| (c.contract_id, c.method_id)).unzip();
+        let (function, config) = psy_prover::session::WalletSession::build_allow_method_sd_key_definition(
+            &contract_ids,
+            &method_ids,
+            calls_per_transaction,
+        )?;
         let fingerprint = self
             .state(network)
             .await?
             .session
-            .register_sd_key_circuit(&contract_ids, &method_ids, calls_per_transaction)
+            .register_sd_key_dpn_circuit(function, config)
             .await
             .context("failed to build the agent's SDKey circuit")?;
 
@@ -1527,11 +1532,16 @@ impl WalletManager {
         };
         let private_key = Self::parse_key(&backup.private_key)?;
         let (contract_ids, method_ids): (Vec<u64>, Vec<u32>) = mandate.capabilities.iter().map(|c| (c.contract_id, c.method_id)).unzip();
+        let (function, config) = psy_prover::session::WalletSession::build_allow_method_sd_key_definition(
+            &contract_ids,
+            &method_ids,
+            mandate.calls_per_transaction,
+        )?;
         let fingerprint = self
             .state(network)
             .await?
             .session
-            .register_sd_key_circuit(&contract_ids, &method_ids, mandate.calls_per_transaction)
+            .register_sd_key_dpn_circuit(function, config)
             .await
             .context("failed to rebuild the agent's SDKey circuit from its recorded mandate")?;
         // A mismatch means the recorded mandate does not compile to the circuit

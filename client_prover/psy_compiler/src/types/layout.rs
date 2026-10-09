@@ -335,7 +335,7 @@ pub fn resolve_type(
             })
         }
         Type::Named(name) => {
-            if name == "ChainContext" || name == "Self" {
+            if name == "ChainContext" || name == "SDKeyContext" || name == "Self" {
                 Ok(ResolvedType::Struct(name.clone()))
             } else if struct_names.contains_key(name) {
                 Ok(ResolvedType::Struct(name.clone()))

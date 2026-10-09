@@ -8,6 +8,31 @@ Beyond the built-in ZK and SECP256K1 signature schemes, Psy enables truly progra
 
 Software-defined signatures enable authentication schemes that go beyond simple cryptographic signatures. Users can define custom circuits that implement complex authorization logic.
 
+### Authenticated transaction introspection
+
+An SD-key authorization method can inspect earlier transactions in the same proving session. Transaction and calldata indices must be compile-time constants:
+
+```psy
+#[contract_method]
+pub fn authorize(&mut self, ctx: &ChainContext, sd: &SDKeyContext) {
+    require(sd.num_transactions >= 1, "missing transaction");
+    require(sd.tx[0].contract_id == 42, "wrong contract");
+    require(sd.tx[0].caller_contract_id == 0, "wrong caller");
+    require(sd.tx[0].method_id == 7, "wrong method");
+    require(sd.tx[0].inputs_length >= 2, "short calldata");
+    require(sd.tx[0].inputs[1] == 500, "amount exceeds policy");
+}
+```
+
+The authenticated fields are `contract_id`, `caller_contract_id`, `method_id`,
+`inputs_length`, `inputs_hash`, and individual `inputs[word]`. The SD context
+also exposes `num_transactions` and `transaction_stack_hash`. A circuit may
+inspect at most 32 transactions and 128 Felt calldata words per transaction.
+
+SD keys that read `self` state must be compiled with the target contract ID
+using a contract-aware compiler entry point. Compilation fails if state is read
+without that binding; it never silently binds the state proof to contract zero.
+
 ### Basic Extended Signature
 
 **Using Psy Language:**

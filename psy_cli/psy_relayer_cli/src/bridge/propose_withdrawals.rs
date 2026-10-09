@@ -696,16 +696,17 @@ pub async fn run_and_get_withdrawal_root(
     let info = load_wallet_key_info(&args.wallet, false)?;
 
     match args.wallet.sign_type {
-        SignType::SoftwareDefinedPlonky2Sign => {
+        SignType::SDKeyPlonky2Sign => {
             let fingerprint = wallet_session
                 .wallet
-                .register_plonky2_software_defined_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
+                .register_sd_key_plonky2_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
                 .await?;
             assert_eq!(info.fingerprint, fingerprint, "software-defined-plonky2-sign key fingerprint mismatch");
         }
-        SignType::SoftwareDefinedDPNSign => {
+        SignType::SDKeyDpnSign => {
             let user_sdc: DPNFunctionCircuitDefinition = serde_json::from_str(&std::fs::read_to_string("sdc.json")?)?;
-            let fingerprint = wallet_session.wallet.register_psy_software_defined_circuit(user_sdc, false).await?;
+            let config = psy_vm::ups::sd_key::sd_key_config_for_dpn_function(&user_sdc);
+            let fingerprint = wallet_session.wallet.register_sd_key_dpn_circuit(user_sdc, config).await?;
             assert_eq!(info.fingerprint, fingerprint, "software-defined-dpn-sign key fingerprint mismatch");
         }
         _ => {}

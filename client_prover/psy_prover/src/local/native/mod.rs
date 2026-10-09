@@ -332,9 +332,14 @@ impl RpcServer for RpcServerImpl {
         let wallet_session = self.wallet_session.clone();
         tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move {
+                let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy(
+                    &allowed_contract_ids,
+                    &allowed_method_ids,
+                    expected_tx_count,
+                )?;
                 wallet_session
                     .write()
-                    .register_sd_key_circuit(&allowed_contract_ids, &allowed_method_ids, expected_tx_count)
+                    .register_sd_key_dpn_circuit(function, config)
                     .await
             })
         })

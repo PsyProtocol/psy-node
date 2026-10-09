@@ -258,6 +258,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_psy_faucet_server_fails_without_operator_configuration() {
+        let _lock = crate::test_support::lock_faucet_env();
+        let _env = crate::test_support::FaucetEnvGuard::cleared();
         let config_path = write_dead_network_config("faucet");
 
         let args = PsyFaucetServerArgs {

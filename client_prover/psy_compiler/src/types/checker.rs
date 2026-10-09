@@ -13,6 +13,7 @@ pub struct CheckedProgram {
     pub contract_layout: ContractStateLayout,
     pub contract_name: String,
     pub methods: Vec<CheckedMethod>,
+    pub inherent_methods: HashMap<String, Vec<CheckedMethod>>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,12 +150,35 @@ impl TypeChecker {
             });
         }
 
+        let mut inherent_methods = HashMap::new();
+        for (target, source_methods) in &resolved.inherent_methods {
+            let mut checked_methods = Vec::new();
+            for method in source_methods {
+                if method.is_contract_method {
+                    bail!("Struct method {}::{} cannot be a contract method", target, method.name);
+                }
+                self.check_method_body(method, &resolved.constants, &contract_layout, &resolved.struct_layouts)?;
+                checked_methods.push(CheckedMethod {
+                    name: method.name.clone(),
+                    is_contract_method: false,
+                    is_pub: method.is_pub,
+                    generics: method.generics.clone(),
+                    params: method.params.clone(),
+                    return_type: method.return_type.clone(),
+                    body: method.body.clone(),
+                    span: method.span,
+                });
+            }
+            inherent_methods.insert(target.clone(), checked_methods);
+        }
+
         Ok(CheckedProgram {
             constants: resolved.constants.clone(),
             struct_layouts: resolved.struct_layouts.clone(),
             contract_layout,
             contract_name,
             methods,
+            inherent_methods,
         })
     }
 
@@ -426,8 +450,10 @@ pub fn compute_method_id(contract_name: &str, method_name: &str, params: &[Resol
         .filter_map(|p| match &p.ty {
             ResolvedParamType::SelfRef { .. } => None,
             ResolvedParamType::Typed { ty, .. } => {
-                if *ty == ResolvedType::Struct("ChainContext".to_string()) {
-                    None // ChainContext is implicit
+                if *ty == ResolvedType::Struct("ChainContext".to_string())
+                    || *ty == ResolvedType::Struct("SDKeyContext".to_string())
+                {
+                    None // compiler-provided contexts are implicit
                 } else {
                     Some(format!("{:?}", ty))
                 }

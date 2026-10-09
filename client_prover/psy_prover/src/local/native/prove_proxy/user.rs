@@ -27,11 +27,11 @@ use psy_crypto::{
 };
 use psy_provider::{
     provider::{LocalCommonCircuitsData, QCommonCircuitData, RpcProvider},
-    request::{DPNSoftwareDefinedSignatureInput, QRegisterDPNSoftwareDefinedCircuitRPCRequest, QRegisterPlonky2SoftwareDefinedCircuitRPCRequest},
+    request::{QRegisterSDKeyDPNCircuitRPCRequest, QRegisterSDKeyPlonky2CircuitRPCRequest},
 };
 use psy_ups_circuit::circuit_manager::core::PsyUPSStepCircuitManager;
 use psy_vm::{
-    ups::{circuit_manager::UPSCircuitManager, signature::Plonky2SoftwareDefinedSignatureInput},
+    ups::{circuit_manager::UPSCircuitManager, signature::SDKeyPlonky2CircuitWitnessInput},
     vm::cfc_input::DapenContractFunctionCircuitInput,
 };
 use plonky2::plonk::proof::ProofWithPublicInputs;
@@ -120,33 +120,24 @@ pub trait ProveProxyUserRpc {
         signature: PsyCompressedSecp256K1Signature,
     ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
 
-    #[method(name = "register_dpn_software_defined_circuit")]
-    async fn register_dpn_software_defined_circuit(
+    #[method(name = "register_sd_key_dpn_circuit")]
+    async fn register_sd_key_dpn_circuit(
         &self,
-        request: QRegisterDPNSoftwareDefinedCircuitRPCRequest,
+        request: QRegisterSDKeyDPNCircuitRPCRequest,
     ) -> Result<QHashOut<F>, ErrorObjectOwned>;
 
-    #[method(name = "register_plonky2_software_defined_circuit")]
-    async fn register_plonky2_software_defined_circuit(
+    #[method(name = "register_sd_key_plonky2_circuit")]
+    async fn register_sd_key_plonky2_circuit(
         &self,
-        request: QRegisterPlonky2SoftwareDefinedCircuitRPCRequest,
+        request: QRegisterSDKeyPlonky2CircuitRPCRequest,
     ) -> Result<QHashOut<F>, ErrorObjectOwned>;
 
-    #[method(name = "prove_dpn_software_defined_sign")]
-    async fn prove_dpn_software_defined_sign(
+    #[method(name = "prove_sd_key_plonky2_sign")]
+    async fn prove_sd_key_plonky2_sign(
         &self,
         fingerprint: QHashOut<F>,
         private_key: QHashOut<F>,
-        input: DPNSoftwareDefinedSignatureInput,
-        sig_hash: QHashOut<F>,
-    ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
-
-    #[method(name = "prove_plonky2_software_defined_sign")]
-    async fn prove_plonky2_software_defined_sign(
-        &self,
-        fingerprint: QHashOut<F>,
-        private_key: QHashOut<F>,
-        input: Plonky2SoftwareDefinedSignatureInput,
+        input: SDKeyPlonky2CircuitWitnessInput,
         sig_hash: QHashOut<F>,
     ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
 
@@ -751,18 +742,18 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         })
     }
 
-    async fn register_dpn_software_defined_circuit(
+    async fn register_sd_key_dpn_circuit(
         &self,
-        _request: QRegisterDPNSoftwareDefinedCircuitRPCRequest,
+        _request: QRegisterSDKeyDPNCircuitRPCRequest,
     ) -> Result<QHashOut<F>, ErrorObjectOwned> {
-        todo!("register_dpn_software_defined_circuit");
+        todo!("register_sd_key_dpn_circuit");
     }
 
-    async fn register_plonky2_software_defined_circuit(
+    async fn register_sd_key_plonky2_circuit(
         &self,
-        _request: QRegisterPlonky2SoftwareDefinedCircuitRPCRequest,
+        _request: QRegisterSDKeyPlonky2CircuitRPCRequest,
     ) -> Result<QHashOut<F>, ErrorObjectOwned> {
-        todo!("register_plonky2_software_defined_circuit");
+        todo!("register_sd_key_plonky2_circuit");
         // let input = SoftwareDefinedSignatureInput::Psy(input);
         // let sdc = SoftwareDefinedSignatureCircuit::new(&input).await;
 
@@ -775,30 +766,16 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         // Ok(fingerprint)
     }
 
-    async fn prove_dpn_software_defined_sign(
+    async fn prove_sd_key_plonky2_sign(
         &self,
         fingerprint: QHashOut<F>,
         private_key: QHashOut<F>,
-        input: DPNSoftwareDefinedSignatureInput,
+        input: SDKeyPlonky2CircuitWitnessInput,
         sig_hash: QHashOut<F>,
     ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned> {
-        tracing::debug!("prove_dpn_software_defined_sign");
+        tracing::debug!("prove_sd_key_plonky2_sign");
         self.circuit_manager
-            .prove_dpn_software_defined_sign(fingerprint, private_key, input, sig_hash)
-            .await
-            .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
-    }
-
-    async fn prove_plonky2_software_defined_sign(
-        &self,
-        fingerprint: QHashOut<F>,
-        private_key: QHashOut<F>,
-        input: Plonky2SoftwareDefinedSignatureInput,
-        sig_hash: QHashOut<F>,
-    ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned> {
-        tracing::debug!("prove_plonky2_software_defined_sign");
-        self.circuit_manager
-            .prove_plonky2_software_defined_sign(fingerprint, private_key, input, sig_hash)
+            .prove_sd_key_plonky2_sign(fingerprint, private_key, input, sig_hash)
             .await
             .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
     }

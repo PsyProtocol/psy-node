@@ -24,10 +24,10 @@ pub async fn run(args: GenerateTxTraceArgs) -> anyhow::Result<CommandResult> {
     let contract_call_data: ContractCallData = args.session.to_contract_call_data()?;
     let mut wallet_session = WalletSession::new(&rpc_config).await?;
     match args.session.wallet.sign_type {
-        psy_client_common::args::SignType::SoftwareDefinedPlonky2Sign => {
+        psy_client_common::args::SignType::SDKeyPlonky2Sign => {
             let fingerprint = wallet_session
                 .wallet
-                .register_plonky2_software_defined_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
+                .register_sd_key_plonky2_circuit(MAX_CONTRACT_STATE_TREE_HEIGHT, 0)
                 .await?;
             anyhow::ensure!(
                 info.fingerprint == fingerprint,
@@ -36,25 +36,15 @@ pub async fn run(args: GenerateTxTraceArgs) -> anyhow::Result<CommandResult> {
                 fingerprint,
             );
         }
-        psy_client_common::args::SignType::SoftwareDefinedDPNSign => {
-            let user_sdc: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition =
-                serde_json::from_str(&std::fs::read_to_string("sdc.json")?)?;
-            let fingerprint = wallet_session.wallet.register_psy_software_defined_circuit(user_sdc, false).await?;
-            anyhow::ensure!(
-                info.fingerprint == fingerprint,
-                "software-defined-dpn fingerprint mismatch: expected={}, actual={}",
-                info.fingerprint,
-                fingerprint,
-            );
-        }
-        psy_client_common::args::SignType::SDKeySign => {
-            let fingerprint = wallet_session
-                .register_sd_key_circuit(
-                    &args.session.wallet.sd_key_allowed_contract_id,
-                    &args.session.wallet.sd_key_allowed_method_id,
-                    args.session.wallet.sd_key_expected_tx_count,
-                )
-                .await?;
+        psy_client_common::args::SignType::SDKeyDpnSign => {
+            let (min_tx_count, max_tx_count) = args.session.wallet.sd_key_tx_count_range();
+            let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy_range(
+                &args.session.wallet.sd_key_allowed_contract_id,
+                &args.session.wallet.sd_key_allowed_method_id,
+                min_tx_count,
+                max_tx_count,
+            )?;
+            let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
             anyhow::ensure!(
                 info.fingerprint == fingerprint,
                 "sd-key fingerprint mismatch: expected={}, actual={}",

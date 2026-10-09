@@ -128,9 +128,11 @@ impl Parser {
             Some(Token::Use) => self.parse_use_decl().map(Item::UseDecl),
             Some(Token::Trait) => self.parse_trait_def(false).map(Item::TraitDef),
             Some(Token::Impl) => {
-                // Plain `impl TraitName for StructName { ... }` (without
-                // #[contract_implementation])
-                self.parse_trait_impl_block().map(Item::TraitImplBlock)
+                if matches!(self.tokens.get(self.pos + 2).map(|(token, _, _)| token), Some(Token::LBrace)) {
+                    self.parse_inherent_impl_block().map(Item::ImplBlock)
+                } else {
+                    self.parse_trait_impl_block().map(Item::TraitImplBlock)
+                }
             }
             Some(Token::Pub) => {
                 // Could be `pub struct`, `pub mod`, `pub use`, or `pub trait` — peek further
@@ -316,6 +318,7 @@ impl Parser {
             contract_name,
             methods,
             span: start.merge(end),
+            is_contract_impl: true,
         })
     }
 
@@ -377,6 +380,25 @@ impl Parser {
             return_type,
             default_body,
             span: start.merge(end),
+        })
+    }
+
+    /// Parse `impl StructName { methods }`
+    fn parse_inherent_impl_block(&mut self) -> Result<ImplBlock> {
+        let start = self.peek_span();
+        self.expect(&Token::Impl)?;
+        let (contract_name, _) = self.expect_ident()?;
+        self.expect(&Token::LBrace)?;
+        let mut methods = Vec::new();
+        while !self.at(&Token::RBrace) && !self.at_end() {
+            methods.push(self.parse_method_def()?);
+        }
+        let end = self.expect(&Token::RBrace)?;
+        Ok(ImplBlock {
+            contract_name,
+            methods,
+            span: start.merge(end),
+            is_contract_impl: false,
         })
     }
 

@@ -60,6 +60,10 @@ pub struct DapenCFCUserTransactionCallStartContext<F: RichField> {
 
     pub start_deferred_tx_debt_tree_root: QHashOut<F>,
 
+    /// Commitment to transactions completed before this CFC starts.
+    pub previous_tx_stack_hash: QHashOut<F>,
+    pub previous_tx_count: F,
+
     // user info
     pub start_user_balance: F,
     pub start_user_event_index: F,
@@ -73,14 +77,22 @@ impl<F: RichField> QFieldHashable<F> for DapenCFCUserTransactionCallStartContext
         let call_data_hash = self.call_data.qfhash::<H>();
 
         let call_data_debt_combo = H::q_two_to_one(call_data_hash, debt_combo);
+        let previous_tx_context_hash = H::q_hash_many(&[
+            self.previous_tx_count,
+            self.previous_tx_stack_hash.0.elements[0],
+            self.previous_tx_stack_hash.0.elements[1],
+            self.previous_tx_stack_hash.0.elements[2],
+            self.previous_tx_stack_hash.0.elements[3],
+        ]);
 
         let state_call_combo = H::q_two_to_one(uct_cst_combo, call_data_debt_combo);
+        let state_call_tx_combo = H::q_two_to_one(state_call_combo, previous_tx_context_hash);
 
         H::q_hash_many(&[
-            state_call_combo.0.elements[0],
-            state_call_combo.0.elements[1],
-            state_call_combo.0.elements[2],
-            state_call_combo.0.elements[3],
+            state_call_tx_combo.0.elements[0],
+            state_call_tx_combo.0.elements[1],
+            state_call_tx_combo.0.elements[2],
+            state_call_tx_combo.0.elements[3],
             self.start_user_balance,
             self.start_user_event_index,
         ])

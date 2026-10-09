@@ -478,14 +478,14 @@ Register a DPN software-defined signature circuit.
 
 ---
 
-### psy_register_plonky2_software_defined_circuit
+### psy_register_sd_key_plonky2_circuit
 
 Register a Plonky2 software-defined signature circuit.
 
 **Parameters**:
 ```json
 {
-  "request": "QRegisterPlonky2SoftwareDefinedCircuitRPCRequest"
+  "request": "QRegisterSDKeyPlonky2CircuitRPCRequest"
 }
 ```
 
@@ -527,16 +527,16 @@ Generate proof for DPN software-defined signature.
 
 ---
 
-### psy_prove_plonky2_software_defined_sign
+### psy_prove_sd_key_plonky2_sign
 
-Generate proof for Plonky2 software-defined signature.
+Generate proof for a Plonky2 SD-key signature.
 
 **Parameters**:
 ```json
 {
   "fingerprint": "QHashOut<F>",
   "private_key": "QHashOut<F>",
-  "input": "Plonky2SoftwareDefinedSignatureInput",
+  "circuit_inputs": "Vec<GoldilocksField>",
   "sig_hash": "QHashOut<F>"
 }
 ```
@@ -548,7 +548,7 @@ Generate proof for Plonky2 software-defined signature.
 }
 ```
 
-**Description**: Generates a proof for a custom signature circuit written in Plonky2.
+**Status**: Reserved; Plonky2 SD-key proving is not implemented.
 
 ---
 

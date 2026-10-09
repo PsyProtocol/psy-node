@@ -107,6 +107,20 @@ pub enum DPNOpType {
     GetCallerContractId = 79,
     GetSessionProofTreeRoot = 80,
     Keccak256 = 81,
+
+    /// Read the number of entries in the authenticated transaction log.
+    GetTransactionCount = 82,
+    /// Read the current transaction-log commitment.
+    GetTransactionStackHash = 83,
+    /// Read a transaction-log entry by its transaction index.
+    GetTransactionContractId = 84,
+    GetTransactionMethodId = 85,
+    GetTransactionInputsHash = 86,
+    /// Read the calldata length of a transaction by transaction index.
+    GetTransactionInputLength = 87,
+    /// Read one Felt calldata word by transaction index and word index.
+    GetTransactionInputWord = 88,
+    GetTransactionCallerContractId = 89,
 }
 
 impl From<u16> for DPNOpType {
@@ -185,6 +199,14 @@ impl From<u16> for DPNOpType {
             79 => DPNOpType::GetCallerContractId,
             80 => DPNOpType::GetSessionProofTreeRoot,
             81 => DPNOpType::Keccak256,
+            82 => DPNOpType::GetTransactionCount,
+            83 => DPNOpType::GetTransactionStackHash,
+            84 => DPNOpType::GetTransactionContractId,
+            85 => DPNOpType::GetTransactionMethodId,
+            86 => DPNOpType::GetTransactionInputsHash,
+            87 => DPNOpType::GetTransactionInputLength,
+            88 => DPNOpType::GetTransactionInputWord,
+            89 => DPNOpType::GetTransactionCallerContractId,
             _ => panic!("Unknown DPNOpType: {}", value),
         }
     }
@@ -350,6 +372,14 @@ impl DPNOpType {
             DPNOpType::GetNonce => DPNBuiltInDataType::Target,
             DPNOpType::GetUserPublicKeyHash => DPNBuiltInDataType::HashOut,
             DPNOpType::GetSessionProofTreeRoot => DPNBuiltInDataType::HashOut,
+            DPNOpType::GetTransactionCount => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionStackHash => DPNBuiltInDataType::HashOut,
+            DPNOpType::GetTransactionContractId => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionMethodId => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionInputsHash => DPNBuiltInDataType::HashOut,
+            DPNOpType::GetTransactionInputLength => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionInputWord => DPNBuiltInDataType::Target,
+            DPNOpType::GetTransactionCallerContractId => DPNBuiltInDataType::Target,
             DPNOpType::GetStateQueryResult => DPNBuiltInDataType::HashOut,
             DPNOpType::GetStateQueryResultSingle => DPNBuiltInDataType::Target,
             DPNOpType::GetStateCommandResultHash => DPNBuiltInDataType::HashOut,
@@ -384,6 +414,8 @@ impl DPNOpType {
             DPNOpType::GetNonce => true,
             DPNOpType::GetUserPublicKeyHash => true,
             DPNOpType::GetSessionProofTreeRoot => true,
+            DPNOpType::GetTransactionCount => true,
+            DPNOpType::GetTransactionStackHash => true,
             _ => false,
         }
     }
@@ -400,6 +432,8 @@ impl DPNOpType {
             DPNOpType::GetNonce => false,
             DPNOpType::GetUserPublicKeyHash => false,
             DPNOpType::GetSessionProofTreeRoot => false,
+            DPNOpType::GetTransactionCount => false,
+            DPNOpType::GetTransactionStackHash => false,
             _ => true,
         }
     }
@@ -514,6 +548,14 @@ impl std::fmt::Display for DPNOpType {
             DPNOpType::Secp256k1Verify => "Secp256k1Verify",
             DPNOpType::HashTwoToOne => "HashTwoToOne",
             DPNOpType::Keccak256 => "Keccak256",
+            DPNOpType::GetTransactionCount => "GetTransactionCount",
+            DPNOpType::GetTransactionStackHash => "GetTransactionStackHash",
+            DPNOpType::GetTransactionContractId => "GetTransactionContractId",
+            DPNOpType::GetTransactionMethodId => "GetTransactionMethodId",
+            DPNOpType::GetTransactionInputsHash => "GetTransactionInputsHash",
+            DPNOpType::GetTransactionInputLength => "GetTransactionInputLength",
+            DPNOpType::GetTransactionInputWord => "GetTransactionInputWord",
+            DPNOpType::GetTransactionCallerContractId => "GetTransactionCallerContractId",
         };
         write!(f, "DPNOpType::{}", r)
     }
@@ -739,6 +781,9 @@ mod op_type_contract_tests {
         DPNOpType::U32Add, DPNOpType::U32Sub, DPNOpType::U32Mul, DPNOpType::U32Div, DPNOpType::CastFelt,
         DPNOpType::CastBool, DPNOpType::BoolInputTarget, DPNOpType::U32Mod, DPNOpType::U32Exp, DPNOpType::Secp256k1Verify,
         DPNOpType::HashTwoToOne, DPNOpType::GetCallerContractId, DPNOpType::GetSessionProofTreeRoot, DPNOpType::Keccak256,
+        DPNOpType::GetTransactionCount, DPNOpType::GetTransactionStackHash, DPNOpType::GetTransactionContractId,
+        DPNOpType::GetTransactionMethodId, DPNOpType::GetTransactionInputsHash, DPNOpType::GetTransactionInputLength,
+        DPNOpType::GetTransactionInputWord, DPNOpType::GetTransactionCallerContractId,
     ];
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -773,7 +818,10 @@ mod op_type_contract_tests {
             DPNOpType::TargetAt => OpcodeBoundaryKind::Indexed,
             DPNOpType::CastU32 | DPNOpType::CastFelt | DPNOpType::CastBool => OpcodeBoundaryKind::Cast,
             DPNOpType::GetUserId | DPNOpType::GetContractId | DPNOpType::GetCheckpointId | DPNOpType::GetNonce
-            | DPNOpType::GetUserPublicKeyHash | DPNOpType::GetCallerContractId | DPNOpType::GetSessionProofTreeRoot => OpcodeBoundaryKind::Context,
+            | DPNOpType::GetUserPublicKeyHash | DPNOpType::GetCallerContractId | DPNOpType::GetSessionProofTreeRoot
+            | DPNOpType::GetTransactionCount | DPNOpType::GetTransactionStackHash | DPNOpType::GetTransactionContractId
+            | DPNOpType::GetTransactionMethodId | DPNOpType::GetTransactionInputsHash | DPNOpType::GetTransactionInputLength
+            | DPNOpType::GetTransactionInputWord | DPNOpType::GetTransactionCallerContractId => OpcodeBoundaryKind::Context,
             DPNOpType::GetStateQueryResult | DPNOpType::GetStateQueryResultSingle | DPNOpType::GetStateCommandResultHash
             | DPNOpType::GetStateCommandResultSingle | DPNOpType::GetStateCommandResultArray => OpcodeBoundaryKind::StateResult,
             DPNOpType::HashNoPad | DPNOpType::HashTwoToOne | DPNOpType::Keccak256 | DPNOpType::Secp256k1Verify => OpcodeBoundaryKind::Cryptographic,
@@ -795,7 +843,19 @@ mod op_type_contract_tests {
                 OpcodeBoundaryKind::VariableArity => assert!(!op.is_inputless(), "{op}"),
                 OpcodeBoundaryKind::Indexed => assert_eq!(op, DPNOpType::TargetAt),
                 OpcodeBoundaryKind::Cast => assert!(matches!(op, DPNOpType::CastU32 | DPNOpType::CastFelt | DPNOpType::CastBool)),
-                OpcodeBoundaryKind::Context => assert!(op.is_inputless(), "{op}"),
+                OpcodeBoundaryKind::Context => assert!(
+                    op.is_inputless()
+                        || matches!(
+                            op,
+                            DPNOpType::GetTransactionContractId
+                                | DPNOpType::GetTransactionMethodId
+                                | DPNOpType::GetTransactionInputsHash
+                                | DPNOpType::GetTransactionInputLength
+                                | DPNOpType::GetTransactionInputWord
+                                | DPNOpType::GetTransactionCallerContractId
+                        ),
+                    "{op}"
+                ),
                 OpcodeBoundaryKind::StateResult => assert!(matches!(expected_type, DPNBuiltInDataType::Target | DPNBuiltInDataType::HashOut | DPNBuiltInDataType::TargetArray), "{op}"),
                 OpcodeBoundaryKind::Cryptographic => assert!(!op.is_inputless(), "{op}"),
                 OpcodeBoundaryKind::ExplicitlyUnsupported => assert!(matches!(op, DPNOpType::HashPad | DPNOpType::CalculateMerkleRoot)),
@@ -807,12 +867,12 @@ mod op_type_contract_tests {
     #[test]
     fn reserved_and_out_of_range_wire_opcodes_are_all_rejected() {
         let valid = ALL.iter().map(DPNOpType::get_enc_value).collect::<HashSet<_>>();
-        for encoded in 0..=81 {
+        for encoded in 0..=89 {
             if !valid.contains(&encoded) {
                 assert!(std::panic::catch_unwind(|| DPNOpType::from(encoded)).is_err(), "reserved opcode {encoded}");
             }
         }
-        for encoded in [82, 255, 256, u16::MAX] {
+        for encoded in [90, 255, 256, u16::MAX] {
             assert!(std::panic::catch_unwind(|| DPNOpType::from(encoded)).is_err(), "out-of-range opcode {encoded}");
         }
     }
@@ -879,7 +939,10 @@ mod op_type_contract_tests {
                 | DPNOpType::GetStateQueryResultSingle | DPNOpType::GetStateCommandResultHash | DPNOpType::GetStateCommandResultSingle
                 | DPNOpType::GetStateCommandResultArray | DPNOpType::U32InputTarget | DPNOpType::ConstantU32 | DPNOpType::CastFelt
                 | DPNOpType::CastBool | DPNOpType::BoolInputTarget | DPNOpType::Secp256k1Verify | DPNOpType::HashTwoToOne
-                | DPNOpType::GetCallerContractId | DPNOpType::GetSessionProofTreeRoot | DPNOpType::Keccak256 => {
+                | DPNOpType::GetCallerContractId | DPNOpType::GetSessionProofTreeRoot | DPNOpType::Keccak256
+                | DPNOpType::GetTransactionCount | DPNOpType::GetTransactionStackHash | DPNOpType::GetTransactionContractId
+                | DPNOpType::GetTransactionMethodId | DPNOpType::GetTransactionInputsHash | DPNOpType::GetTransactionInputLength
+                | DPNOpType::GetTransactionInputWord | DPNOpType::GetTransactionCallerContractId => {
                     assert!(std::panic::catch_unwind(|| op.eval_binary_constant(0, 0)).is_err(), "runtime-only opcode accepted binary evaluation: {op}");
                     assert!(std::panic::catch_unwind(|| op.eval_unary_constant(0)).is_err(), "runtime-only opcode accepted unary evaluation: {op}");
                 }

@@ -30,9 +30,10 @@ use psy_common_circuit::{
     },
 };
 use psy_config::network_constants::{
-    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT, TOKEN_CONTRACT_STATE_TREE_HEIGHT,
-    UPS_CIRCUIT_WHITELIST_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT,
+    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT, UPS_CIRCUIT_WHITELIST_TREE_HEIGHT,
+    UPS_SESSION_PROOF_TREE_HEIGHT,
 };
+use psy_config::TOKEN_CONTRACT_STATE_TREE_HEIGHT;
 use psy_crypto::{
     common::witnesses::qrecursion::proof_data::{AggProofRecord, SimpleQTreeRecursionManagerInclusionProofs},
     hash::{
@@ -488,39 +489,36 @@ where
             .map_err(|error| anyhow::anyhow!("failed to prove EIP-191 secp256k1 signature: {error}"))
     }
 
-    async fn register_dpn_software_defined_circuit(
+    async fn register_sd_key_dpn_circuit(
         &self,
         _fn_def: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition,
-        _contract_id: u64,
-        _contract_state_tree_height: u8,
-        _session_proof_tree_height: u8,
-        _force_four_align: bool,
+        _config: psy_client_data::dpn::sd_key::SDKeyConfig,
     ) -> anyhow::Result<QHashOut<C::F>> {
-        unimplemented!("register_dpn_software_defined_circuit");
+        unimplemented!("register_sd_key_dpn_circuit");
     }
 
-    async fn register_plonky2_software_defined_circuit(&self, _contract_state_tree_height: u8, _input_len: usize) -> anyhow::Result<QHashOut<C::F>> {
-        unimplemented!("register_plonky2_software_defined_circuit");
+    async fn register_sd_key_plonky2_circuit(&self, _contract_state_tree_height: u8, _input_len: usize) -> anyhow::Result<QHashOut<C::F>> {
+        unimplemented!("register_sd_key_plonky2_circuit");
     }
 
-    async fn prove_dpn_software_defined_sign(
+    async fn prove_sd_key_dpn_sign(
         &self,
         _fingerprint: QHashOut<C::F>,
         _private_key: QHashOut<C::F>,
-        _input: psy_vm::ups::signature::DPNSoftwareDefinedSignatureInput,
+        _input: psy_vm::ups::sd_key::SDKeyDpnCircuitWitnessInput,
         _sig_hash: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        unimplemented!("prove_dpn_software_defined_sign");
+        unimplemented!("prove_sd_key_dpn_sign");
     }
 
-    async fn prove_plonky2_software_defined_sign(
+    async fn prove_sd_key_plonky2_sign(
         &self,
         _fingerprint: QHashOut<C::F>,
         _private_key: QHashOut<C::F>,
-        _input: psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput,
+        _input: psy_vm::ups::signature::SDKeyPlonky2CircuitWitnessInput,
         _sig_hash: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        unimplemented!("prove_plonky2_software_defined_sign");
+        unimplemented!("prove_sd_key_plonky2_sign");
     }
 
     async fn prove_ups_end_cap(

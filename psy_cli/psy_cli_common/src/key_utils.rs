@@ -16,8 +16,8 @@ use psy_crypto::{
 use psy_client_data::config::store_config::PsyHasher;
 use psy_prover::wallet::memory_wallet::{get_eth_personal_secp256k1_fingerprint, get_secp256k1_fingerprint, get_zk_fingerprint};
 use psy_provider::wallet::secp_wallet::Wallet;
-use psy_ups_circuit::signature::sd_key::get_sd_key_public_key_param;
-use psy_ups_circuit::signature::software_defined::get_sdc_public_key_param;
+use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
+use psy_ups_circuit::signature::sd_key_plonky2::get_sdc_public_key_param;
 use serde::{Deserialize, Serialize};
 
 pub use psy_client_common::args::WalletSourceArgs;
@@ -91,51 +91,7 @@ pub fn load_wallet_key_info(args: &WalletSourceArgs, allow_generate: bool) -> Re
                 generated,
             })
         }
-        SignType::SoftwareDefinedDPNSign => {
-            let (private_key, generated) = load_or_create_key(args, allow_generate)?;
-            let fingerprint = QHashOut::<GoldilocksField>::from_str(
-                args.fingerprint
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("software defined dpn sign need fingerprint"))?,
-            )?;
-            let public_key_param = get_sdc_public_key_param::<GoldilocksField>(&private_key);
-            let public_key_hash = ZKPublicKeyInfo {
-                fingerprint,
-                public_key_param,
-            }
-            .qfhash::<PsyHasher>();
-            Ok(WalletKeyInfo {
-                sign_type: SignType::SoftwareDefinedDPNSign,
-                private_key,
-                fingerprint,
-                public_key_param,
-                public_key_hash,
-                generated,
-            })
-        }
-        SignType::SoftwareDefinedPlonky2Sign => {
-            let (private_key, generated) = load_or_create_key(args, allow_generate)?;
-            let fingerprint = QHashOut::<GoldilocksField>::from_str(
-                args.fingerprint
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("software defined plonky2 sign need fingerprint"))?,
-            )?;
-            let public_key_param = get_sdc_public_key_param::<GoldilocksField>(&private_key);
-            let public_key_hash = ZKPublicKeyInfo {
-                fingerprint,
-                public_key_param,
-            }
-            .qfhash::<PsyHasher>();
-            Ok(WalletKeyInfo {
-                sign_type: SignType::SoftwareDefinedPlonky2Sign,
-                private_key,
-                fingerprint,
-                public_key_param,
-                public_key_hash,
-                generated,
-            })
-        }
-        SignType::SDKeySign => {
+        SignType::SDKeyDpnSign | SignType::SDKeyPlonky2Sign => {
             let (private_key, generated) = load_or_create_key(args, allow_generate)?;
             let fingerprint = QHashOut::<GoldilocksField>::from_str(
                 args.fingerprint
@@ -149,7 +105,7 @@ pub fn load_wallet_key_info(args: &WalletSourceArgs, allow_generate: bool) -> Re
             }
             .qfhash::<PsyHasher>();
             Ok(WalletKeyInfo {
-                sign_type: SignType::SDKeySign,
+                sign_type: args.sign_type.clone(),
                 private_key,
                 fingerprint,
                 public_key_param,

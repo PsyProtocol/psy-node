@@ -11,9 +11,7 @@ use plonky2::{
     },
     plonk::{circuit_data::VerifierOnlyCircuitData, config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs},
 };
-use psy_client_common::data::{
-    alt::AltVerifierOnlyCircuitData, base_types::hash256::Hash256, qhashout::QHashOut, secp256k1::CompressedPublicKey,
-};
+use psy_client_common::data::{alt::AltVerifierOnlyCircuitData, base_types::hash256::Hash256, qhashout::QHashOut, secp256k1::CompressedPublicKey};
 use psy_client_data::{
     config::store_config::PsyHasher,
     dpn::sd_key::SDKeyConfig,
@@ -21,16 +19,13 @@ use psy_client_data::{
     qdata::contract::ContractCodeDefinition,
     qstore::imm::cmd_processor::PsyReadCommandProcessorSync,
 };
-use psy_common_circuit::{
-    circuits::{
-        traits::qstandard::QStandardCircuit,
-        zk_signature3::core::{PsyBasicZKSignatureCircuit, PsyBasicZKSignatureInnerCircuit},
-    },
-    proof_minifier::pm_core::get_circuit_fingerprint_generic,
+use psy_common_circuit::circuits::{
+    traits::qstandard::QStandardCircuit,
+    zk_signature3::core::{PsyBasicZKSignatureCircuit, PsyBasicZKSignatureInnerCircuit},
 };
 use psy_config::network_constants::{
     DEFAULT_CALLER_CONTRACT_ID_U64, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT,
-    TOKEN_CONTRACT_STATE_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT,
+    UPS_SESSION_PROOF_TREE_HEIGHT,
 };
 use psy_crypto::{
     hash::traits::qhashable::QFieldHashable,
@@ -47,8 +42,8 @@ use psy_dpn_circuit::circuits::privacy::{
     shield_deposit_claim::{ShieldDepositClaimCircuit, ShieldDepositClaimInnerCircuit},
 };
 use psy_ups_circuit::signature::{
-    sd_key::SDKeyCircuitGadget,
-    software_defined::{DPNSoftwareDefinedSignatureGadget, Plonky2SoftwareDefinedSignatureGadget},
+    sd_key_dpn::SDKeyDpnCircuitGadget,
+    sd_key_plonky2::SDKeyPlonky2CircuitGadget,
 };
 use psy_vm::ups::{circuit_manager::UPSCircuitManager, state_reader::StateReader};
 
@@ -56,8 +51,7 @@ use crate::signature::{
     context::SignContext,
     traits::{SignatureResult, SignatureUser},
     users::{
-        EthPersonalSignSECP256K1User, ExternalEthPersonalSignUser, ExternalSecp256K1User, SDKeyUser, SECP256K1User, SoftwareDefinedDpnUser,
-        SoftwareDefinedPlonky2User, ZKUser,
+        EthPersonalSignSECP256K1User, ExternalEthPersonalSignUser, ExternalSecp256K1User, SDKeyDpnUser, SECP256K1User, ZKUser,
     },
 };
 
@@ -65,11 +59,23 @@ type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 type F = GoldilocksField;
 
-#[derive(Clone, Debug)]
-pub struct SDKeyPolicy {
-    pub allowed_contract_ids: Vec<u64>,
-    pub allowed_method_ids: Vec<u32>,
-    pub expected_tx_count: u64,
+/// Authorization mode an SD-key fingerprint was registered with. The mode is
+/// recorded in the wallet-local circuit registry at registration time; a
+/// fingerprint can only ever belong to one mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdKeyMode {
+    /// Pre-built Plonky2 software-defined signature circuit.
+    Plonky2,
+    /// Programmable read-only DPN authorization function.
+    Dpn,
+}
+
+pub enum SdKeyCircuitDefinition {
+    Plonky2 { contract_state_tree_height: u8, input_len: usize },
+    Dpn {
+        function: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition,
+        config: SDKeyConfig,
+    },
 }
 
 // 65e0169bfffd55f1c0ea9f76c111a5b15e652322ee253c1a9604a10d59066b50
@@ -110,105 +116,25 @@ pub fn get_eth_personal_secp256k1_fingerprint<F: RichField>() -> QHashOut<F> {
     })
 }
 
-fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_ids: &[u32]) -> anyhow::Result<Vec<(u64, u32)>> {
-    if allowed_contract_ids.is_empty() {
-        bail!("SD key allowed contract_id list must not be empty");
-    }
-    if allowed_method_ids.is_empty() {
-        bail!("SD key allowed method_id list must not be empty");
-    }
-
-    if allowed_contract_ids.len() == allowed_method_ids.len() {
-        return Ok(allowed_contract_ids.iter().copied().zip(allowed_method_ids.iter().copied()).collect());
-    }
-
-    if allowed_contract_ids.len() == 1 {
-        return Ok(allowed_method_ids
-            .iter()
-            .copied()
-            .map(|method_id| (allowed_contract_ids[0], method_id))
-            .collect());
-    }
-
-    if allowed_method_ids.len() == 1 {
-        return Ok(allowed_contract_ids
-            .iter()
-            .copied()
-            .map(|contract_id| (contract_id, allowed_method_ids[0]))
-            .collect());
-    }
-
-    bail!("SD key allowed contract_id and method_id lists must have the same length, or one list must contain exactly one value");
-}
-
-fn assert_contract_method_in_allowed_pairs(
-    builder: &mut plonky2::plonk::circuit_builder::CircuitBuilder<F, D>,
-    contract_id_target: plonky2::iop::target::Target,
-    method_id_target: plonky2::iop::target::Target,
-    allowed_pairs: &[(u64, u32)],
-) -> anyhow::Result<()> {
-    if allowed_pairs.is_empty() {
-        bail!("SD key allowed contract/method pair list must not be empty");
-    }
-
-    let mut is_allowed = builder._false();
-    for (contract_id, method_id) in allowed_pairs {
-        let expected_contract_id = builder.constant(F::from_canonical_u64(*contract_id));
-        let expected_method_id = builder.constant(F::from_canonical_u64(*method_id as u64));
-        let contract_matches = builder.is_equal(contract_id_target, expected_contract_id);
-        let method_matches = builder.is_equal(method_id_target, expected_method_id);
-        let pair_matches = builder.and(contract_matches, method_matches);
-        is_allowed = builder.or(is_allowed, pair_matches);
-    }
-    builder.assert_one(is_allowed.target);
-
-    Ok(())
-}
-
-fn build_allow_method_sd_key_circuit(
-    allowed_contract_ids: &[u64],
-    allowed_method_ids: &[u32],
-    expected_tx_count: u64,
-) -> anyhow::Result<SDKeyCircuitGadget> {
-    if expected_tx_count == 0 {
-        bail!("SD key expected_tx_count must be greater than zero");
-    }
-    if expected_tx_count > u32::MAX as u64 {
-        bail!("SD key expected_tx_count exceeds u32 range: {}", expected_tx_count);
-    }
-
-    let config = plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config();
-    let mut builder = plonky2::plonk::circuit_builder::CircuitBuilder::<F, D>::new(config);
-    let sd_config = SDKeyConfig {
-        num_introspectable_transactions: expected_tx_count as u32,
-        can_read_state: false,
-        contract_state_tree_height: MAX_CONTRACT_STATE_TREE_HEIGHT,
-        requires_secp256k1: false,
-        num_secp256k1_slots: 0,
-    };
-
-    let mut gadget = SDKeyCircuitGadget::add_virtual_to(&mut builder, &sd_config, 0);
-    let expected_tx_count_target = builder.constant(F::from_canonical_u64(expected_tx_count));
-    let allowed_pairs = allowed_contract_method_pairs(allowed_contract_ids, allowed_method_ids)?;
-    for tx_index in 0..expected_tx_count as usize {
-        assert_contract_method_in_allowed_pairs(
-            &mut builder,
-            gadget.tx_introspection.get_tx_contract_id(tx_index),
-            gadget.tx_introspection.get_tx_method_id(tx_index),
-            &allowed_pairs,
-        )?;
-    }
-    builder.connect(gadget.tx_introspection.get_tx_count(), expected_tx_count_target);
-    gadget.build_circuit(builder)?;
-    Ok(gadget)
-}
 
 pub fn get_allow_method_sd_key_fingerprint(
     allowed_contract_ids: &[u64],
     allowed_method_ids: &[u32],
     expected_tx_count: u64,
 ) -> anyhow::Result<QHashOut<GoldilocksField>> {
-    Ok(build_allow_method_sd_key_circuit(allowed_contract_ids, allowed_method_ids, expected_tx_count)?.get_fingerprint())
+    let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy(allowed_contract_ids, allowed_method_ids, expected_tx_count)?;
+    Ok(SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &config)?.get_fingerprint())
+}
+
+pub fn get_allow_method_sd_key_fingerprint_range(
+    allowed_contract_ids: &[u64],
+    allowed_method_ids: &[u32],
+    min_tx_count: u64,
+    max_tx_count: u64,
+) -> anyhow::Result<QHashOut<GoldilocksField>> {
+    let (function, config) =
+        psy_vm::ups::sd_key::build_allow_method_policy_range(allowed_contract_ids, allowed_method_ids, min_tx_count, max_tx_count)?;
+    Ok(SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &config)?.get_fingerprint())
 }
 
 pub fn get_public_key_info<F: RichField>(private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
@@ -257,7 +183,7 @@ impl FallbackMinifierCircuits {
             PrivateNoteInclusionCircuit::<C, D>::new(
                 GLOBAL_USER_TREE_HEIGHT as usize,
                 GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-                TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
+                MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
                 PRIVATE_NOTE_TREE_HEIGHT,
             )
         })
@@ -327,7 +253,7 @@ fn load_or_build_local_circuit<T>(
 const PRIVATE_NOTE_INCLUSION_HEIGHTS: (usize, usize, usize, usize) = (
     GLOBAL_USER_TREE_HEIGHT as usize,
     GLOBAL_CONTRACT_TREE_HEIGHT as usize,
-    TOKEN_CONTRACT_STATE_TREE_HEIGHT as usize,
+    MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
     PRIVATE_NOTE_TREE_HEIGHT,
 );
 
@@ -361,10 +287,9 @@ pub struct PsyWalletLocalCircuits {
     zk_signature_inner: OnceLock<PsyBasicZKSignatureInnerCircuit<C, D>>,
     private_note_inclusion: OnceLock<PrivateNoteInclusionInnerCircuit<C, D>>,
     shield_deposit_claim: OnceLock<ShieldDepositClaimInnerCircuit<C, D>>,
-    psy_software_defined_circuits: DashMap<QHashOut<F>, DPNSoftwareDefinedSignatureGadget>,
-    plonky2_software_defined_circuits: DashMap<QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>,
-    sd_key_circuits: DashMap<QHashOut<F>, SDKeyCircuitGadget>,
-    sd_key_policies: DashMap<QHashOut<F>, SDKeyPolicy>,
+    sd_key_plonky2_circuits: DashMap<QHashOut<F>, SDKeyPlonky2CircuitGadget>,
+    sd_key_circuits: DashMap<QHashOut<F>, SDKeyDpnCircuitGadget>,
+    sd_key_modes: DashMap<QHashOut<F>, SdKeyMode>,
 }
 
 impl PsyWalletLocalCircuits {
@@ -506,72 +431,63 @@ impl PsyWalletLocalCircuits {
         self.shield_deposit_claim().get_verifier_config_ref().clone()
     }
 
-    pub fn has_psy_software_defined_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
-        self.psy_software_defined_circuits.contains_key(fingerprint)
-    }
-
-    pub fn has_plonky2_software_defined_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
-        self.plonky2_software_defined_circuits.contains_key(fingerprint)
+    pub fn has_sd_key_plonky2_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
+        self.sd_key_plonky2_circuits.contains_key(fingerprint)
     }
 
     pub fn has_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
         self.sd_key_circuits.contains_key(fingerprint)
     }
 
-    pub fn insert_psy_software_defined_circuit(&self, fingerprint: QHashOut<F>, circuit: DPNSoftwareDefinedSignatureGadget) {
-        self.psy_software_defined_circuits.insert(fingerprint, circuit);
+    pub fn insert_sd_key_plonky2_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKeyPlonky2CircuitGadget) {
+        self.sd_key_plonky2_circuits.insert(fingerprint, circuit);
     }
 
-    pub fn insert_plonky2_software_defined_circuit(&self, fingerprint: QHashOut<F>, circuit: Plonky2SoftwareDefinedSignatureGadget) {
-        self.plonky2_software_defined_circuits.insert(fingerprint, circuit);
-    }
-
-    pub fn insert_sd_key_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKeyCircuitGadget) {
+    pub fn insert_sd_key_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKeyDpnCircuitGadget) {
         self.sd_key_circuits.insert(fingerprint, circuit);
     }
 
-    pub fn insert_sd_key_policy(&self, fingerprint: QHashOut<F>, policy: SDKeyPolicy) {
-        self.sd_key_policies.insert(fingerprint, policy);
+    /// Record the authorization mode for an SD-key fingerprint. A fingerprint
+    /// already recorded with a different mode is rejected.
+    pub fn record_sd_key_mode(&self, fingerprint: QHashOut<F>, mode: SdKeyMode) -> anyhow::Result<()> {
+        if let Some(existing) = self.sd_key_modes.get(&fingerprint) {
+            anyhow::ensure!(
+                *existing == mode,
+                "SD-key fingerprint {} is already registered with mode {:?}; refusing to re-register as {:?}",
+                fingerprint,
+                *existing,
+                mode
+            );
+            return Ok(());
+        }
+        self.sd_key_modes.insert(fingerprint, mode);
+        Ok(())
     }
 
-    pub fn get_psy_software_defined_circuit(
+    pub fn get_sd_key_mode(&self, fingerprint: &QHashOut<F>) -> Option<SdKeyMode> {
+        self.sd_key_modes.get(fingerprint).map(|entry| *entry.value())
+    }
+
+    pub fn get_sd_key_plonky2_circuit(
         &self,
         fingerprint: &QHashOut<F>,
-    ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, DPNSoftwareDefinedSignatureGadget>> {
-        self.psy_software_defined_circuits.get(fingerprint)
+    ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKeyPlonky2CircuitGadget>> {
+        self.sd_key_plonky2_circuits.get(fingerprint)
     }
 
-    pub fn get_psy_software_defined_circuit_mut(
+    pub fn get_sd_key_plonky2_circuit_mut(
         &self,
         fingerprint: &QHashOut<F>,
-    ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, DPNSoftwareDefinedSignatureGadget>> {
-        self.psy_software_defined_circuits.get_mut(fingerprint)
+    ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKeyPlonky2CircuitGadget>> {
+        self.sd_key_plonky2_circuits.get_mut(fingerprint)
     }
 
-    pub fn get_plonky2_software_defined_circuit(
-        &self,
-        fingerprint: &QHashOut<F>,
-    ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>> {
-        self.plonky2_software_defined_circuits.get(fingerprint)
-    }
-
-    pub fn get_plonky2_software_defined_circuit_mut(
-        &self,
-        fingerprint: &QHashOut<F>,
-    ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>> {
-        self.plonky2_software_defined_circuits.get_mut(fingerprint)
-    }
-
-    pub fn get_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKeyCircuitGadget>> {
+    pub fn get_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKeyDpnCircuitGadget>> {
         self.sd_key_circuits.get(fingerprint)
     }
 
-    pub fn get_sd_key_circuit_mut(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKeyCircuitGadget>> {
+    pub fn get_sd_key_circuit_mut(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKeyDpnCircuitGadget>> {
         self.sd_key_circuits.get_mut(fingerprint)
-    }
-
-    pub fn get_sd_key_policy(&self, fingerprint: &QHashOut<F>) -> Option<SDKeyPolicy> {
-        self.sd_key_policies.get(fingerprint).map(|entry| entry.value().clone())
     }
 }
 
@@ -692,7 +608,6 @@ impl PsyMemoryWallet {
         anyhow::bail!("no prove manager exposes the expected EIP-191 circuit metadata")
     }
 
-
     /// Register trace-provided contract circuits on every proving manager.
     ///
     /// Stateless step proving creates no long-lived session manager, so the
@@ -720,27 +635,19 @@ impl PsyMemoryWallet {
         Ok(())
     }
 
-    pub fn has_psy_software_defined_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
-        self.local_circuits.has_psy_software_defined_circuit(fingerprint)
+    pub fn has_sd_key_plonky2_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
+        self.local_circuits.has_sd_key_plonky2_circuit(fingerprint)
     }
 
-    pub fn has_plonky2_software_defined_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
-        self.local_circuits.has_plonky2_software_defined_circuit(fingerprint)
-    }
-
-    pub fn has_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
+    pub fn has_sd_key_dpn_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
         self.local_circuits.has_sd_key_circuit(fingerprint)
     }
 
-    pub fn insert_psy_software_defined_circuit(&self, fingerprint: QHashOut<F>, circuit: DPNSoftwareDefinedSignatureGadget) {
-        self.local_circuits.insert_psy_software_defined_circuit(fingerprint, circuit);
+    pub fn insert_sd_key_plonky2_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKeyPlonky2CircuitGadget) {
+        self.local_circuits.insert_sd_key_plonky2_circuit(fingerprint, circuit);
     }
 
-    pub fn insert_plonky2_software_defined_circuit(&self, fingerprint: QHashOut<F>, circuit: Plonky2SoftwareDefinedSignatureGadget) {
-        self.local_circuits.insert_plonky2_software_defined_circuit(fingerprint, circuit);
-    }
-
-    pub fn insert_sd_key_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKeyCircuitGadget) {
+    pub fn insert_sd_key_dpn_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKeyDpnCircuitGadget) {
         self.local_circuits.insert_sd_key_circuit(fingerprint, circuit);
     }
 
@@ -764,11 +671,19 @@ impl PsyMemoryWallet {
         self.signature_users.insert(pk_hash, user);
         Ok(pk_info)
     }
-    /// Held-key counterpart of [`Self::register_external_eth_personal_user`].
+
+    /// Held-key counterpart of [`Self::register_external_eth_personal_user`]:
+    /// installs an [`EthPersonalSignSECP256K1User`] that keeps the private key
+    /// in the wallet and signs EIP-191 (`personal_sign`) digests locally.
+    /// Shares the eth_personal circuit fingerprint with the external variant,
+    /// so the same key maps to the SAME `pk_hash`/identity either way.
     pub async fn add_eth_personal_secp_private_key(&mut self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         let user: Arc<dyn SignatureUser> = Arc::new(EthPersonalSignSECP256K1User::new(private_key));
-        let pk_info = user.public_key_info(self, self.eth_personal_circuit_manager().await?.as_ref()).await?;
-        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), user);
+        let manager = self.eth_personal_circuit_manager().await?;
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let pk_hash = pk_info.qfhash::<PsyHasher>();
+        self.signature_users.insert(pk_hash, user);
         Ok(pk_info)
     }
 
@@ -778,19 +693,14 @@ impl PsyMemoryWallet {
     /// the entry is replaced via [`Self::inject_secp_signature`] with a
     /// MetaMask signature over the session sighash.
     pub async fn register_external_secp_user(&mut self, compressed_public_key: CompressedPublicKey) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let user: Arc<dyn SignatureUser> = Arc::new(ExternalSecp256K1User::new(compressed_public_key)?);
-        let pk_info = user.public_key_info(self, self.random_circuit_manager().as_ref()).await?;
-        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), user);
-        Ok(pk_info)
-    }
-    /// Install an EIP-191 external user PK-first using the compatible proving cohort.
-    pub async fn register_external_eth_personal_user(
-        &mut self,
-        compressed_public_key: CompressedPublicKey,
-    ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let user: Arc<dyn SignatureUser> = Arc::new(ExternalEthPersonalSignUser::new(compressed_public_key)?);
-        let pk_info = user.public_key_info(self, self.eth_personal_circuit_manager().await?.as_ref()).await?;
-        self.signature_users.insert(pk_info.qfhash::<PsyHasher>(), user);
+        let user = ExternalSecp256K1User::new(compressed_public_key)
+            .map_err(|e| anyhow::anyhow!("invalid external secp256k1 public key: {e}"))?;
+        let user: Arc<dyn SignatureUser> = Arc::new(user);
+        let manager = self.random_circuit_manager();
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let pk_hash = pk_info.qfhash::<PsyHasher>();
+        self.signature_users.insert(pk_hash, user);
         Ok(pk_info)
     }
 
@@ -803,58 +713,79 @@ impl PsyMemoryWallet {
         expected_public_key: QHashOut<F>,
         signature: PsyCompressedSecp256K1Signature,
     ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let user: Arc<dyn SignatureUser> = Arc::new(ExternalSecp256K1User::with_signature(signature)?);
-        self.replace_external_signature_user(expected_public_key, user, "secp256k1").await
+        let user = ExternalSecp256K1User::with_signature(signature)
+            .map_err(|e| anyhow::anyhow!("invalid external secp256k1 signature: {e}"))?;
+        let user: Arc<dyn SignatureUser> = Arc::new(user);
+        let manager = self.random_circuit_manager();
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let actual_public_key = pk_info.qfhash::<PsyHasher>();
+        if actual_public_key != expected_public_key {
+            bail!(
+                "injected secp256k1 signature belongs to public key `{}`, expected registered public key `{}`",
+                actual_public_key,
+                expected_public_key
+            );
+        }
+        if !self.signature_users.contains_key(&expected_public_key) {
+            bail!("registered external secp256k1 user `{}` not found in wallet", expected_public_key);
+        }
+        self.signature_users.insert(expected_public_key, user);
+        Ok(pk_info)
     }
-    /// Replace a registered EIP-191 PK-only user with a validated signature user.
+
+    /// Mode-A MetaMask `personal_sign` (EIP-191): install an eth_personal user
+    /// PK-first — ONLY the compressed public key, no signature yet. Enough for
+    /// on-chain registration and trace generation. Proving (`sign()`) fails
+    /// until the entry is replaced via [`Self::inject_eth_personal_signature`]
+    /// with a MetaMask signature over the session sighash.
+    ///
+    /// Because this user reports the eth_personal circuit fingerprint, the
+    /// resulting `pk_hash` is a DISTINCT identity from the classic-secp one for
+    /// the same public key.
+    pub async fn register_external_eth_personal_user(&mut self, compressed_public_key: CompressedPublicKey) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user = ExternalEthPersonalSignUser::new(compressed_public_key)
+            .map_err(|e| anyhow::anyhow!("invalid external EIP-191 public key: {e}"))?;
+        let user: Arc<dyn SignatureUser> = Arc::new(user);
+        let manager = self.eth_personal_circuit_manager().await?;
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let pk_hash = pk_info.qfhash::<PsyHasher>();
+        self.signature_users.insert(pk_hash, user);
+        Ok(pk_info)
+    }
+
+    /// Inject a MetaMask `personal_sign` signature over the session sighash:
+    /// REPLACES the wallet entry with a signature-carrying
+    /// [`ExternalEthPersonalSignUser`]. The signature's `(r,s)` is over
+    /// `keccak256(EIP-191 prefix || sighash)`; the EIP-191 circuit re-derives
+    /// that keccak in-circuit. Call this after trace generation, once per
+    /// transaction.
     pub async fn inject_eth_personal_signature(
         &mut self,
         expected_public_key: QHashOut<F>,
         signature: PsyCompressedSecp256K1Signature,
     ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let user: Arc<dyn SignatureUser> = Arc::new(ExternalEthPersonalSignUser::with_signature(signature)?);
-        if !self.signature_users.contains_key(&expected_public_key) {
-            bail!("registered external EIP-191 user `{}` not found in wallet", expected_public_key);
-        }
-        let pk_info = {
-            let manager = self.eth_personal_circuit_manager().await?;
-            user.public_key_info(self, manager.as_ref()).await?
-        };
+        let user = ExternalEthPersonalSignUser::with_signature(signature)
+            .map_err(|e| anyhow::anyhow!("invalid external EIP-191 signature: {e}"))?;
+        let user: Arc<dyn SignatureUser> = Arc::new(user);
+        let manager = self.eth_personal_circuit_manager().await?;
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
         let actual_public_key = pk_info.qfhash::<PsyHasher>();
         if actual_public_key != expected_public_key {
             bail!(
-                "injected EIP-191 signature belongs to public key `{}`, expected `{}`",
+                "injected eth-personal signature belongs to public key `{}`, expected registered public key `{}`",
                 actual_public_key,
                 expected_public_key
             );
         }
-        self.signature_users.insert(expected_public_key, user);
-        Ok(pk_info)
-    }
-
-    async fn replace_external_signature_user(
-        &mut self,
-        expected_public_key: QHashOut<F>,
-        user: Arc<dyn SignatureUser>,
-        label: &str,
-    ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         if !self.signature_users.contains_key(&expected_public_key) {
-            bail!("registered external {} user `{}` not found in wallet", label, expected_public_key);
-        }
-        let pk_info = user.public_key_info(self, self.random_circuit_manager().as_ref()).await?;
-        let actual_public_key = pk_info.qfhash::<PsyHasher>();
-        if actual_public_key != expected_public_key {
-            bail!(
-                "injected {} signature belongs to public key `{}`, expected `{}`",
-                label,
-                actual_public_key,
-                expected_public_key
-            );
+            bail!("registered external eth-personal user `{}` not found in wallet", expected_public_key);
         }
         self.signature_users.insert(expected_public_key, user);
         Ok(pk_info)
     }
-
 
     pub async fn get_zk_pk_info(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         let simple_key = SimplePsyPrivateKey { private_key };
@@ -877,12 +808,17 @@ impl PsyMemoryWallet {
         })
     }
 
-    /// EIP-191 (`personal_sign`) counterpart of [`Self::get_secp_pk_info`].
+    /// EIP-191 (`personal_sign`) counterpart of [`Self::get_secp_pk_info`]:
+    /// same `public_key_param` derivation, but reports the eth_personal
+    /// circuit fingerprint.
     pub async fn get_eth_personal_secp_pk_info(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let public_key = get_secp_public_key(private_key)?;
+        let pub_compressed = psy_crypto::signature::secp256k1::wallet::get_secp_public_key(private_key)?;
+        let public_key_param =
+            psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(pub_compressed);
+        let fingerprint = self.eth_personal_circuit_manager().await?.eth_personal_secp_circuit_fingerprint().await?;
         Ok(ZKPublicKeyInfo {
-            fingerprint: self.eth_personal_circuit_manager().await?.eth_personal_secp_circuit_fingerprint().await?,
-            public_key_param: hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(public_key),
+            fingerprint,
+            public_key_param,
         })
     }
 
@@ -909,6 +845,7 @@ impl PsyMemoryWallet {
         context: &SignContext,
         sighash: QHashOut<F>,
     ) -> anyhow::Result<SignatureResult> {
+        context.validate()?;
         let user_guard = self
             .signature_users
             .get(public_key)
@@ -916,12 +853,12 @@ impl PsyMemoryWallet {
         let user = user_guard.value().clone();
         drop(user_guard);
 
-        let manager = if context.fingerprint == get_eth_personal_secp256k1_fingerprint() {
+        let circuit_manager = if context.fingerprint == get_eth_personal_secp256k1_fingerprint() {
             self.eth_personal_circuit_manager().await?
         } else {
             self.random_circuit_manager()
         };
-        let manager_ref = manager.as_ref();
+        let manager_ref = circuit_manager.as_ref();
 
         let proof = user.sign(self, manager_ref, context, sighash).await?;
         let circuit_info = user.circuit_info(self, manager_ref, context).await?;
@@ -944,36 +881,25 @@ impl PsyMemoryWallet {
             .ok_or_else(|| anyhow::anyhow!("User with public key hash {} not found", pk_hash))
     }
 
-    pub async fn add_software_defined_dpn_private_key(
+    pub async fn add_sd_key_plonky2_private_key(
+        &mut self,
+        _private_key: QHashOut<F>,
+        _fingerprint: QHashOut<F>,
+    ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        anyhow::bail!("SD-key Plonky2 mode is not implemented")
+    }
+
+    pub async fn add_sd_key_dpn_private_key(
         &mut self,
         private_key: QHashOut<F>,
         fingerprint: QHashOut<F>,
     ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let user: Arc<dyn SignatureUser> = Arc::new(SoftwareDefinedDpnUser::new(private_key, fingerprint));
-        let manager = self.random_circuit_manager();
-        let manager_ref = manager.as_ref();
-        let pk_info = user.public_key_info(self, manager_ref).await?;
-        let pk_hash = pk_info.qfhash::<PsyHasher>();
-        self.signature_users.insert(pk_hash, user);
-        Ok(pk_info)
-    }
-
-    pub async fn add_software_defined_plonky2_private_key(
-        &mut self,
-        private_key: QHashOut<F>,
-        fingerprint: QHashOut<F>,
-    ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let user: Arc<dyn SignatureUser> = Arc::new(SoftwareDefinedPlonky2User::new(private_key, fingerprint));
-        let manager = self.random_circuit_manager();
-        let manager_ref = manager.as_ref();
-        let pk_info = user.public_key_info(self, manager_ref).await?;
-        let pk_hash = pk_info.qfhash::<PsyHasher>();
-        self.signature_users.insert(pk_hash, user);
-        Ok(pk_info)
-    }
-
-    pub async fn add_sd_key_private_key(&mut self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let user: Arc<dyn SignatureUser> = Arc::new(SDKeyUser::new(private_key, fingerprint));
+        anyhow::ensure!(
+            self.local_circuits.get_sd_key_mode(&fingerprint) == Some(SdKeyMode::Dpn),
+            "SD-key DPN fingerprint {} is not registered in Dpn mode",
+            fingerprint
+        );
+        let user: Arc<dyn SignatureUser> = Arc::new(SDKeyDpnUser::new(private_key, fingerprint));
         let manager = self.random_circuit_manager();
         let manager_ref = manager.as_ref();
         let pk_info = user.public_key_info(self, manager_ref).await?;
@@ -986,10 +912,8 @@ impl PsyMemoryWallet {
         let manager = self.random_circuit_manager();
         let zk_fingerprint = self.zk_circuit_fingerprint().await?;
         let secp_fingerprint = manager.secp_circuit_fingerprint().await?;
-        // Tolerate prove-proxies that predate the EIP-191 circuit: the lookup
-        // fails there, so no held-key eth-personal user can be created — but
-        // every other user type must keep working.
-        let eth_personal_fingerprint = manager.eth_personal_secp_circuit_fingerprint().await.ok();
+        // A mixed prover cohort may contain older managers without EIP-191.
+        let eth_personal_fingerprint = self.eth_personal_circuit_manager().await.ok().map(|_| get_eth_personal_secp256k1_fingerprint());
 
         if fingerprint == zk_fingerprint {
             self.add_zk_private_key(private_key).await
@@ -998,17 +922,27 @@ impl PsyMemoryWallet {
         } else if Some(fingerprint) == eth_personal_fingerprint {
             self.add_eth_personal_secp_private_key(private_key).await
         } else {
-            if self.local_circuits.has_psy_software_defined_circuit(&fingerprint) {
-                self.add_software_defined_dpn_private_key(private_key, fingerprint).await
-            } else if self.local_circuits.has_plonky2_software_defined_circuit(&fingerprint) {
-                self.add_software_defined_plonky2_private_key(private_key, fingerprint).await
-            } else if self.local_circuits.has_sd_key_circuit(&fingerprint) {
-                self.add_sd_key_private_key(private_key, fingerprint).await
-            } else {
-                bail!(
-                    "Software defined circuit with fingerprint {} is not registered. Please register the circuit first.",
-                    fingerprint
-                );
+            // SD keys dispatch on the mode recorded at registration time; an
+            // unknown fingerprint or a mode/circuit mismatch is an explicit
+            // error rather than a guessed user type.
+            match self.local_circuits.get_sd_key_mode(&fingerprint) {
+                Some(SdKeyMode::Plonky2) => {
+                    anyhow::bail!("SD-key Plonky2 mode is not implemented")
+                }
+                Some(SdKeyMode::Dpn) => {
+                    anyhow::ensure!(
+                        self.local_circuits.has_sd_key_circuit(&fingerprint),
+                        "Dpn SD-key fingerprint {} has no registered circuit",
+                        fingerprint
+                    );
+                    self.add_sd_key_dpn_private_key(private_key, fingerprint).await
+                }
+                None => {
+                    bail!(
+                        "Software defined circuit with fingerprint {} is not registered. Please register the circuit first.",
+                        fingerprint
+                    );
+                }
             }
         }
     }
@@ -1059,11 +993,7 @@ impl PsyMemoryWallet {
     }
 
     /// EIP-191 (`personal_sign`) counterpart of [`Self::secp256k1_sign`].
-    pub fn eth_personal_secp256k1_sign(
-        &self,
-        private_key: QHashOut<F>,
-        sig_hash: QHashOut<F>,
-    ) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
+    pub fn eth_personal_secp256k1_sign(&self, private_key: QHashOut<F>, sig_hash: QHashOut<F>) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
         psy_crypto::signature::secp256k1::wallet::secp256k1_sign_eth_personal(
             k256::ecdsa::SigningKey::from_slice(&Hash256::from(private_key).0)?,
             sig_hash,
@@ -1090,128 +1020,54 @@ impl PsyMemoryWallet {
 }
 
 impl PsyMemoryWallet {
-    pub async fn register_psy_software_defined_circuit(
-        &self,
-        fn_def: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition,
-        force_four_align: bool,
-    ) -> anyhow::Result<QHashOut<F>> {
-        if !fn_def.is_view_function() {
-            bail!("Cannot register view function as software defined circuit");
-        }
-
-        let config = plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config();
-        let mut builder = plonky2::plonk::circuit_builder::CircuitBuilder::<F, D>::new(config);
-
-        let mut gadget = DPNSoftwareDefinedSignatureGadget::add_virtual_to(
-            &mut builder,
-            &fn_def,
-            DEFAULT_CALLER_CONTRACT_ID_U64,
-            MAX_CONTRACT_STATE_TREE_HEIGHT,
-            UPS_SESSION_PROOF_TREE_HEIGHT,
-            force_four_align,
-        );
-        gadget.build_circuit(builder)?;
-        let fingerprint = gadget.get_fingerprint();
-
-        tracing::info!("register PSY software defined circuit: {}", fingerprint.to_string());
-
-        if self.local_circuits.has_psy_software_defined_circuit(&fingerprint) {
-            tracing::warn!("PSY software defined circuit `{}` is already registered", fingerprint.to_string());
-        }
-        self.local_circuits.insert_psy_software_defined_circuit(fingerprint, gadget);
-
-        Ok(fingerprint)
+    pub async fn register_sd_key_plonky2_circuit(&self, _contract_state_tree_height: u8, _input_len: usize) -> anyhow::Result<QHashOut<F>> {
+        anyhow::bail!("SD-key Plonky2 mode is not implemented");
     }
 
-    pub async fn register_plonky2_software_defined_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<F>> {
-        let config = plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config();
-        let mut builder = plonky2::plonk::circuit_builder::CircuitBuilder::<F, D>::new(config);
-
-        let mut gadget = Plonky2SoftwareDefinedSignatureGadget::add_virtual_to(&mut builder, contract_state_tree_height, input_len);
-        gadget.build_circuit(builder)?;
-        let fingerprint = gadget.get_fingerprint();
-
-        tracing::info!("register PLONKY2 software defined circuit: {}", fingerprint.to_string());
-
-        if self.local_circuits.has_plonky2_software_defined_circuit(&fingerprint) {
-            tracing::warn!("PLONKY2 software defined circuit `{}` is already registered", fingerprint.to_string());
-        }
-        self.local_circuits.insert_plonky2_software_defined_circuit(fingerprint, gadget);
-
-        Ok(fingerprint)
-    }
-
-    pub async fn register_allow_method_sd_key_circuit(
+    /// Register a programmable, read-only DPN function as an SDKey circuit.
+    /// The function definition is retained by the gadget so the proving
+    /// session can reconstruct VM state-reader witnesses from live LPS data.
+    pub async fn register_sd_key_dpn_circuit(
         &self,
-        allowed_contract_ids: &[u64],
-        allowed_method_ids: &[u32],
-        expected_tx_count: u64,
+        function: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition,
+        config: SDKeyConfig,
     ) -> anyhow::Result<QHashOut<F>> {
-        let gadget = build_allow_method_sd_key_circuit(allowed_contract_ids, allowed_method_ids, expected_tx_count)?;
-        let fingerprint = gadget.get_fingerprint();
-
-        tracing::info!(
-            "register allow-method SD key circuit: fingerprint={}, contract_ids={:?}, method_ids={:?}, expected_tx_count={}",
-            fingerprint.to_string(),
-            allowed_contract_ids,
-            allowed_method_ids,
-            expected_tx_count
-        );
-
-        if self.local_circuits.has_sd_key_circuit(&fingerprint) {
-            tracing::warn!("SD key circuit `{}` is already registered", fingerprint.to_string());
+        function.validate_sd_key_read_only()?;
+        if !function.is_view_function() {
+            bail!("programmable SDKey function must be read-only/view-only");
         }
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &config)?;
+        let fingerprint = gadget.get_fingerprint();
+        tracing::info!("register programmable SD key circuit: {}", fingerprint);
         self.local_circuits.insert_sd_key_circuit(fingerprint, gadget);
-        self.local_circuits.insert_sd_key_policy(
-            fingerprint,
-            SDKeyPolicy {
-                allowed_contract_ids: allowed_contract_ids.to_vec(),
-                allowed_method_ids: allowed_method_ids.to_vec(),
-                expected_tx_count,
-            },
-        );
-
+        self.local_circuits.record_sd_key_mode(fingerprint, SdKeyMode::Dpn)?;
         Ok(fingerprint)
     }
 
-    pub fn get_psy_software_defined_circuit(
+    pub fn get_sd_key_plonky2_circuit(
         &self,
         fingerprint: &QHashOut<F>,
-    ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, DPNSoftwareDefinedSignatureGadget>> {
-        self.local_circuits.get_psy_software_defined_circuit(fingerprint)
+    ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKeyPlonky2CircuitGadget>> {
+        self.local_circuits.get_sd_key_plonky2_circuit(fingerprint)
     }
 
-    pub fn get_psy_software_defined_circuit_mut(
+    pub fn get_sd_key_plonky2_circuit_mut(
         &self,
         fingerprint: &QHashOut<F>,
-    ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, DPNSoftwareDefinedSignatureGadget>> {
-        self.local_circuits.get_psy_software_defined_circuit_mut(fingerprint)
+    ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKeyPlonky2CircuitGadget>> {
+        self.local_circuits.get_sd_key_plonky2_circuit_mut(fingerprint)
     }
 
-    pub fn get_plonky2_software_defined_circuit(
-        &self,
-        fingerprint: &QHashOut<F>,
-    ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>> {
-        self.local_circuits.get_plonky2_software_defined_circuit(fingerprint)
-    }
-
-    pub fn get_plonky2_software_defined_circuit_mut(
-        &self,
-        fingerprint: &QHashOut<F>,
-    ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>> {
-        self.local_circuits.get_plonky2_software_defined_circuit_mut(fingerprint)
-    }
-
-    pub fn get_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKeyCircuitGadget>> {
+    pub fn get_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKeyDpnCircuitGadget>> {
         self.local_circuits.get_sd_key_circuit(fingerprint)
     }
 
-    pub fn get_sd_key_circuit_mut(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKeyCircuitGadget>> {
+    pub fn get_sd_key_circuit_mut(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKeyDpnCircuitGadget>> {
         self.local_circuits.get_sd_key_circuit_mut(fingerprint)
     }
 
-    pub fn get_sd_key_policy(&self, fingerprint: &QHashOut<F>) -> Option<SDKeyPolicy> {
-        self.local_circuits.get_sd_key_policy(fingerprint)
+    pub fn get_sd_key_mode(&self, fingerprint: &QHashOut<F>) -> Option<SdKeyMode> {
+        self.local_circuits.get_sd_key_mode(fingerprint)
     }
 }
 
@@ -1223,7 +1079,10 @@ mod tests {
     use anyhow::Result;
     use plonky2::{field::goldilocks_field::GoldilocksField, plonk::config::PoseidonGoldilocksConfig};
     use psy_client_common::data::qhashout::QHashOut;
+    use psy_client_data::dpn::sd_key::MAX_INTROSPECTABLE_TRANSACTIONS;
     use psy_common_circuit::circuits::{secp256k1_signature::Secp256K1SignatureCircuit, traits::qstandard::QStandardCircuit};
+    use psy_common_circuit::proof_minifier::pm_core::get_circuit_fingerprint_generic;
+    use psy_config::TOKEN_CONTRACT_STATE_TREE_HEIGHT;
 
     use super::*;
 
@@ -1246,38 +1105,15 @@ mod tests {
     }
 
     #[test]
-    fn allowed_contract_method_pairs_support_zip_and_broadcast() {
-        assert_eq!(allowed_contract_method_pairs(&[1, 2], &[10, 20]).unwrap(), vec![(1, 10), (2, 20)]);
-        assert_eq!(allowed_contract_method_pairs(&[7], &[10, 20]).unwrap(), vec![(7, 10), (7, 20)]);
-        assert_eq!(allowed_contract_method_pairs(&[1, 2], &[99]).unwrap(), vec![(1, 99), (2, 99)]);
-    }
-
-    #[test]
-    fn allowed_contract_method_pairs_reject_invalid_shapes() {
-        assert!(allowed_contract_method_pairs(&[], &[1])
-            .unwrap_err()
-            .to_string()
-            .contains("contract_id list"));
-        assert!(allowed_contract_method_pairs(&[1], &[])
-            .unwrap_err()
-            .to_string()
-            .contains("method_id list"));
-        assert!(allowed_contract_method_pairs(&[1, 2], &[3, 4, 5])
-            .unwrap_err()
-            .to_string()
-            .contains("same length"));
-    }
-
-    #[test]
-    fn allow_method_circuit_rejects_invalid_transaction_counts_early() {
-        assert!(build_allow_method_sd_key_circuit(&[1], &[2], 0)
+    fn allow_method_policy_rejects_invalid_transaction_counts_early() {
+        assert!(get_allow_method_sd_key_fingerprint(&[1], &[2], 0)
             .unwrap_err()
             .to_string()
             .contains("greater than zero"));
-        assert!(build_allow_method_sd_key_circuit(&[1], &[2], u32::MAX as u64 + 1)
+        assert!(get_allow_method_sd_key_fingerprint(&[1], &[2], MAX_INTROSPECTABLE_TRANSACTIONS as u64 + 1)
             .unwrap_err()
             .to_string()
-            .contains("exceeds u32 range"));
+            .contains("MAX_INTROSPECTABLE_TRANSACTIONS"));
     }
 
     #[test]
@@ -1303,24 +1139,19 @@ mod tests {
     }
 
     #[test]
-    fn local_circuit_registry_tracks_sd_key_policy_without_loading_circuits() {
+    fn local_circuit_registry_tracks_sd_key_mode_without_loading_circuits() {
         let circuits = PsyWalletLocalCircuits::default();
         let fingerprint = get_zk_fingerprint::<F>();
         assert!(!circuits.has_sd_key_circuit(&fingerprint));
-        assert!(circuits.get_sd_key_policy(&fingerprint).is_none());
+        assert!(circuits.get_sd_key_mode(&fingerprint).is_none());
 
-        circuits.insert_sd_key_policy(
-            fingerprint,
-            SDKeyPolicy {
-                allowed_contract_ids: vec![7, 8],
-                allowed_method_ids: vec![11],
-                expected_tx_count: 2,
-            },
-        );
-        let policy = circuits.get_sd_key_policy(&fingerprint).unwrap();
-        assert_eq!(policy.allowed_contract_ids, vec![7, 8]);
-        assert_eq!(policy.allowed_method_ids, vec![11]);
-        assert_eq!(policy.expected_tx_count, 2);
+        circuits.record_sd_key_mode(fingerprint, SdKeyMode::Dpn).unwrap();
+        assert_eq!(circuits.get_sd_key_mode(&fingerprint), Some(SdKeyMode::Dpn));
+        // re-recording the same mode is idempotent
+        circuits.record_sd_key_mode(fingerprint, SdKeyMode::Dpn).unwrap();
+        // a conflicting mode is rejected
+        let error = circuits.record_sd_key_mode(fingerprint, SdKeyMode::Plonky2).unwrap_err();
+        assert!(error.to_string().contains("already registered with mode"));
     }
 
     #[test]
@@ -1375,7 +1206,8 @@ mod tests {
         assert_eq!(secp_info.public_key_param, eth_info.public_key_param);
 
         // sd-key users dispatch through the registered sd-key circuit
-        let sd_key_fingerprint = session.write().register_sd_key_circuit(&[3], &[4], 2).await.unwrap();
+        let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy(&[3], &[4], 2).unwrap();
+        let sd_key_fingerprint = session.write().register_sd_key_dpn_circuit(function, config).await.unwrap();
         let sd_key_info = session.write().wallet.get_or_create_user(key, sd_key_fingerprint).await.unwrap();
         assert_eq!(sd_key_info.fingerprint, sd_key_fingerprint);
 
@@ -1430,15 +1262,18 @@ mod tests {
         let personal_hash = personal_external.qfhash::<psy_client_data::config::store_config::PsyHasher>();
 
         let signature = session.read().wallet.secp256k1_sign(key, sighash).unwrap();
+        let foreign = session.read().wallet.secp256k1_sign(other_key, sighash).unwrap();
+        let foreign_pk_info = session.read().wallet.get_secp_pk_info(other_key).await.unwrap();
+        let foreign_hash = foreign_pk_info.qfhash::<psy_client_data::config::store_config::PsyHasher>();
+        assert!(session.read().wallet.get_user_by_public_key_hash(&foreign_hash).is_err());
         let error = session
             .write()
             .wallet
-            .inject_secp_signature(QHashOut::ZERO, signature.clone())
+            .inject_secp_signature(foreign_hash, foreign.clone())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not found in wallet"));
 
-        let foreign = session.read().wallet.secp256k1_sign(other_key, sighash).unwrap();
         let error = session.write().wallet.inject_secp_signature(external_hash, foreign).await.unwrap_err();
         assert!(error.to_string().contains("belongs to public key"));
 
@@ -1526,52 +1361,46 @@ mod tests {
             .expect("setter should lower to a mutating function")
             .clone();
 
-        let (psy_fingerprint, plonky2_fingerprint) = {
+        let psy_fingerprint = {
             let read = session.read();
             let wallet = &read.wallet;
 
-            let error = wallet.register_psy_software_defined_circuit(mutating_def, false).await.unwrap_err();
-            assert!(error.to_string().contains("Cannot register view function"));
+            let error = wallet
+                .register_sd_key_dpn_circuit(mutating_def, psy_vm::ups::sd_key::sd_key_config_for_dpn_function(&view_def))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("non-read-only state command"));
 
-            let psy_fingerprint = wallet.register_psy_software_defined_circuit(view_def.clone(), false).await.unwrap();
+            let psy_config = psy_vm::ups::sd_key::sd_key_config_for_dpn_function(&view_def);
+            let psy_fingerprint = wallet.register_sd_key_dpn_circuit(view_def.clone(), psy_config.clone()).await.unwrap();
             assert_ne!(psy_fingerprint, QHashOut::<F>::ZERO);
-            assert!(wallet.has_psy_software_defined_circuit(&psy_fingerprint));
-            // re-registration keeps the fingerprint and only warns
+            assert!(wallet.local_circuits.has_sd_key_circuit(&psy_fingerprint));
+            assert_eq!(wallet.get_sd_key_mode(&psy_fingerprint), Some(SdKeyMode::Dpn));
+            // re-registration keeps the fingerprint
             assert_eq!(
-                wallet.register_psy_software_defined_circuit(view_def.clone(), false).await.unwrap(),
+                wallet.register_sd_key_dpn_circuit(view_def.clone(), psy_config.clone()).await.unwrap(),
                 psy_fingerprint
             );
 
-            let plonky2_fingerprint = wallet.register_plonky2_software_defined_circuit(10, 4).await.unwrap();
-            assert_ne!(plonky2_fingerprint, QHashOut::<F>::ZERO);
-            assert!(wallet.has_plonky2_software_defined_circuit(&plonky2_fingerprint));
-            assert!(!wallet.has_plonky2_software_defined_circuit(&psy_fingerprint));
-            assert_eq!(
-                wallet.register_plonky2_software_defined_circuit(10, 4).await.unwrap(),
-                plonky2_fingerprint
-            );
+            assert!(wallet.register_sd_key_plonky2_circuit(10, 4).await.unwrap_err().to_string().contains("not implemented"));
 
-            (psy_fingerprint, plonky2_fingerprint)
+            psy_fingerprint
         };
 
         // the registered fingerprints create users through the dispatch
         let key = QHashOut::<F>::from_values(151, 152, 153, 154);
         let psy_info = session.write().wallet.get_or_create_user(key, psy_fingerprint).await.unwrap();
         assert_eq!(psy_info.fingerprint, psy_fingerprint);
-        let plonky2_info = session.write().wallet.get_or_create_user(key, plonky2_fingerprint).await.unwrap();
-        assert_eq!(plonky2_info.fingerprint, plonky2_fingerprint);
 
-        // registered sd-key circuits expose their gadget and policy accessors
-        let sd_key_fingerprint = session.write().register_sd_key_circuit(&[3], &[4], 2).await.unwrap();
+        // registered sd-key circuits expose their gadget and mode accessors
+        let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy(&[3], &[4], 2).unwrap();
+        let sd_key_fingerprint = session.write().register_sd_key_dpn_circuit(function, config).await.unwrap();
         {
             let read = session.read();
             let wallet = &read.wallet;
             assert!(wallet.get_sd_key_circuit(&sd_key_fingerprint).is_some());
             assert!(wallet.get_sd_key_circuit_mut(&sd_key_fingerprint).is_some());
-            let policy = wallet
-                .get_sd_key_policy(&sd_key_fingerprint)
-                .expect("allow-method sd key circuit carries its policy");
-            assert_eq!(policy.expected_tx_count, 2);
+            assert_eq!(wallet.get_sd_key_mode(&sd_key_fingerprint), Some(SdKeyMode::Dpn));
             assert!(wallet.local_circuits().get_sd_key_circuit_mut(&sd_key_fingerprint).is_some());
             assert!(!wallet
                 .fallback_private_note_inclusion_minifier_verifier_data()
@@ -2231,13 +2060,13 @@ mod tests {
         let wallet = &session.read().wallet;
 
         // sd-key allow-method circuit: registering twice keeps the fingerprint
-        let sd_fingerprint = wallet.register_allow_method_sd_key_circuit(&[7], &[2], 3).await?;
-        assert!(wallet.has_sd_key_circuit(&sd_fingerprint));
-        assert_eq!(wallet.register_allow_method_sd_key_circuit(&[7], &[2], 3).await?, sd_fingerprint);
+        let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy(&[7], &[2], 3)?;
+        let sd_fingerprint = wallet.register_sd_key_dpn_circuit(function.clone(), config.clone()).await?;
+        assert!(wallet.local_circuits.has_sd_key_circuit(&sd_fingerprint));
+        assert_eq!(wallet.register_sd_key_dpn_circuit(function, config).await?, sd_fingerprint);
 
         // plonky2 software-defined flavor
-        let plonky2_fingerprint = wallet.register_plonky2_software_defined_circuit(8, 4).await?;
-        assert!(wallet.has_plonky2_software_defined_circuit(&plonky2_fingerprint));
+        assert!(wallet.register_sd_key_plonky2_circuit(8, 4).await.unwrap_err().to_string().contains("not implemented"));
 
         // psy software-defined flavor needs a view function; the helper
         // contract's getter qualifies, its setter does not
@@ -2277,11 +2106,16 @@ mod tests {
             .cloned()
             .expect("the setter must compile to a mutating function");
 
-        let psy_fingerprint = wallet.register_psy_software_defined_circuit(view_def, false).await?;
-        assert!(wallet.has_psy_software_defined_circuit(&psy_fingerprint));
+        let psy_config = psy_vm::ups::sd_key::sd_key_config_for_dpn_function(&view_def);
+        let psy_fingerprint = wallet.register_sd_key_dpn_circuit(view_def, psy_config.clone()).await?;
+        assert!(wallet.local_circuits.has_sd_key_circuit(&psy_fingerprint));
+        assert_eq!(wallet.get_sd_key_mode(&psy_fingerprint), Some(SdKeyMode::Dpn));
 
-        let error = wallet.register_psy_software_defined_circuit(mutating_def, false).await.unwrap_err();
-        assert!(error.to_string().contains("Cannot register view function"));
+        let error = wallet
+            .register_sd_key_dpn_circuit(mutating_def, psy_config.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-read-only state command"));
         Ok(())
     }
 }

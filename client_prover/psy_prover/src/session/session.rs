@@ -22,6 +22,7 @@ use psy_client_common::{
 };
 use psy_client_data::{
     config::store_config::PsyHasher,
+    dpn::sd_key::SDKeyConfig,
     guta::end_cap_input::SubmitUserEndCapNonProofInput,
     qblock::cmds::deploy_contract::{get_code_root_by_code_hashes, QBCDeployContract, QBCUpdateContract},
     qdata::{
@@ -61,13 +62,13 @@ use psy_crypto::{
             qhashable::QFieldHashable,
         },
     },
-    signature::zk::data::ZKPublicKeyInfo,
+    signature::{secp256k1::core::PsyCompressedSecp256K1Signature, zk::data::ZKPublicKeyInfo},
 };
 use psy_dpn_circuit::circuits::cfc::DapenContractFunctionCircuit;
 pub use psy_provider::session::TxStatus;
 use psy_provider::{
     provider::{ProveProxyRpcProvider, QUserRpcProvider, RpcProvider},
-    request::{DPNSoftwareDefinedSignatureInput, QRegisterUserRPCRequest, QSubmitEndCapRPCRequest, QUpdateContractRPCRequest},
+            request::{QRegisterUserRPCRequest, QSubmitEndCapRPCRequest, QUpdateContractRPCRequest},
 };
 #[cfg(not(target_arch = "wasm32"))]
 use psy_provider::request::QDeployContractRPCRequest;
@@ -79,7 +80,7 @@ use psy_vm::{
         vm::def::{derive_state_tree_height, DPNFunctionCircuitDefinition},
     },
     ups::{
-        circuit_manager::UPSCircuitManager, sd_key::SDKeyCircuitWitnessInput, signature::Plonky2SoftwareDefinedSignatureInput,
+        circuit_manager::UPSCircuitManager, sd_key::SDKeyDpnCircuitWitnessInput, signature::SDKeyPlonky2CircuitWitnessInput,
         state_reader::StateReader,
     },
 };
@@ -89,7 +90,7 @@ use serde::{Deserialize, Serialize};
 use crate::trace::proof_schedule::{graph_id_from_trace, GraphId, JobManager, JobStatus, TraceProofJobId, TraceProofPlan};
 use crate::{
     signature::{
-        context::SignContext,
+        context::{SdKeySignInput, SignContext},
         traits::{SignatureCircuitInfo, SignatureResult},
     },
     trace::{
@@ -135,6 +136,19 @@ fn select_builtin_sign_circuit(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod coverage_unit_tests {
     use super::*;
+
+    #[test]
+    fn sd_key_transaction_count_accepts_range_without_padding_session_entries() {
+        let (_, range_config) = psy_vm::ups::sd_key::build_allow_method_policy_range(&[5], &[4], 3, 64).unwrap();
+        validate_sd_key_transaction_count(&range_config, 3, "session").unwrap();
+        validate_sd_key_transaction_count(&range_config, 64, "trace").unwrap();
+        assert!(validate_sd_key_transaction_count(&range_config, 2, "session").is_err());
+        assert!(validate_sd_key_transaction_count(&range_config, 65, "trace").is_err());
+
+        let (_, exact_config) = psy_vm::ups::sd_key::build_allow_method_policy(&[5], &[4], 2).unwrap();
+        validate_sd_key_transaction_count(&exact_config, 2, "session").unwrap();
+        assert!(validate_sd_key_transaction_count(&exact_config, 1, "session").is_err());
+    }
 
     fn minimal_trace(steps: Vec<crate::trace::TraceStep>) -> crate::trace::TxTrace {
         crate::trace::TxTrace {
@@ -1088,6 +1102,35 @@ where
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 type F = GoldilocksField;
+
+fn validate_sd_key_transaction_count(config: &SDKeyConfig, actual_count: usize, source: &str) -> anyhow::Result<()> {
+    let capacity = config.num_introspectable_transactions as usize;
+    if let Some(policy) = &config.transaction_count_policy {
+        anyhow::ensure!(
+            policy.max_tx_count as usize == capacity,
+            "SD key policy maximum {} does not match circuit capacity {}",
+            policy.max_tx_count,
+            capacity
+        );
+        anyhow::ensure!(
+            actual_count >= policy.min_tx_count as usize && actual_count <= policy.max_tx_count as usize,
+            "SD key {} has {} txs, outside configured range {}..={}",
+            source,
+            actual_count,
+            policy.min_tx_count,
+            policy.max_tx_count
+        );
+    } else {
+        anyhow::ensure!(
+            actual_count == capacity,
+            "SD key circuit expects {} introspectable txs, but {} has {} txs",
+            capacity,
+            source,
+            actual_count
+        );
+    }
+    Ok(())
+}
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
 pub async fn prove_func<R, CM: UPSCircuitManager<C, D> + ?Sized>(
@@ -1606,38 +1649,28 @@ impl<'a> TraceBuildSession<'a> {
         };
         let (sign_circuit_source, zksign_fingerprint) = if let Some(source) = builtin_source {
             (source, pk_info.fingerprint)
-        } else if self.wallet_session.wallet.has_psy_software_defined_circuit(&pk_info.fingerprint) {
-            let sdc = self
-                .wallet_session
-                .wallet
-                .get_psy_software_defined_circuit(&pk_info.fingerprint)
-                .ok_or_else(|| anyhow::format_err!("PSY software defined circuit `{}` not found", pk_info.fingerprint))?;
+        } else if self.wallet_session.wallet.has_sd_key_plonky2_circuit(&pk_info.fingerprint) {
             (
-                TraceSignCircuitSource::PsySoftwareDefined {
-                    circuit_def: bincode::serialize(&sdc.fn_def)?,
-                    force_four_align: sdc.force_four_align,
-                },
-                pk_info.fingerprint,
-            )
-        } else if self.wallet_session.wallet.has_plonky2_software_defined_circuit(&pk_info.fingerprint) {
-            (
-                TraceSignCircuitSource::Plonky2SoftwareDefined {
+                TraceSignCircuitSource::SdKeyPlonky2 {
                     contract_state_tree_height: MAX_CONTRACT_STATE_TREE_HEIGHT,
                     input_len: 0,
                 },
                 pk_info.fingerprint,
             )
-        } else if self.wallet_session.wallet.has_sd_key_circuit(&pk_info.fingerprint) {
-            let policy = self
+        } else if self.wallet_session.wallet.has_sd_key_dpn_circuit(&pk_info.fingerprint) {
+            let sd_key = self
                 .wallet_session
                 .wallet
-                .get_sd_key_policy(&pk_info.fingerprint)
-                .ok_or_else(|| anyhow::format_err!("SD key policy `{}` not found", pk_info.fingerprint))?;
+                .get_sd_key_circuit(&pk_info.fingerprint)
+                .ok_or_else(|| anyhow::format_err!("SD key circuit `{}` not found", pk_info.fingerprint))?;
+            let definition = sd_key
+                .dpn_state_reader_definition
+                .as_ref()
+                .ok_or_else(|| anyhow::format_err!("SD key circuit `{}` is missing its DPN definition", pk_info.fingerprint))?;
             (
-                TraceSignCircuitSource::SdKey {
-                    allowed_contract_ids: policy.allowed_contract_ids,
-                    allowed_method_ids: policy.allowed_method_ids,
-                    expected_tx_count: policy.expected_tx_count,
+                TraceSignCircuitSource::SdKeyDpn {
+                    function_def: definition.to_sd_key_trace_bytes()?,
+                    config: sd_key.config.clone(),
                 },
                 pk_info.fingerprint,
             )
@@ -1657,47 +1690,19 @@ impl<'a> TraceBuildSession<'a> {
                 Vec::new(),
                 AltVerifierOnlyCircuitData::from(&circuit_manager.eth_personal_secp_circuit_verifier_config().await?),
             ),
-            TraceSignCircuitSource::PsySoftwareDefined { .. } => {
+            TraceSignCircuitSource::SdKeyPlonky2 { .. } => {
                 let sign_context = self
                     .wallet_session
-                    .build_psy_software_defined_context(
-                        &software_defined_call,
-                        pk_info.fingerprint,
-                        user_session_mgr,
-                        SignContext::new(pk_info.fingerprint),
-                    )
+                    .build_sd_key_plonky2_context(&software_defined_call, pk_info.fingerprint, user_session_mgr)
                     .await?;
-                let witness = sign_context
-                    .psy_signature_input
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("PSY software-defined witness missing after build"))?;
+                let witness = match sign_context.sd_key_signature_input.as_ref() {
+                    Some(SdKeySignInput::Plonky2(input)) => input,
+                    _ => anyhow::bail!("PLONKY2 software-defined witness missing after build"),
+                };
                 let verifier = self
                     .wallet_session
                     .wallet
-                    .get_psy_software_defined_circuit(&pk_info.fingerprint)
-                    .ok_or_else(|| anyhow::format_err!("PSY software defined circuit `{}` not found", pk_info.fingerprint))?;
-                (
-                    bincode::serialize(witness)?,
-                    AltVerifierOnlyCircuitData::from(
-                        verifier
-                            .get_verifier_config_ref()
-                            .ok_or_else(|| anyhow::anyhow!("PSY software-defined verifier config missing"))?,
-                    ),
-                )
-            }
-            TraceSignCircuitSource::Plonky2SoftwareDefined { .. } => {
-                let sign_context = self
-                    .wallet_session
-                    .build_plonky2_software_defined_context(&software_defined_call, pk_info.fingerprint, user_session_mgr)
-                    .await?;
-                let witness = sign_context
-                    .plonky2_signature_input
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("PLONKY2 software-defined witness missing after build"))?;
-                let verifier = self
-                    .wallet_session
-                    .wallet
-                    .get_plonky2_software_defined_circuit(&pk_info.fingerprint)
+                    .get_sd_key_plonky2_circuit(&pk_info.fingerprint)
                     .ok_or_else(|| anyhow::format_err!("PLONKY2 software defined circuit `{}` not found", pk_info.fingerprint))?;
                 (
                     bincode::serialize(witness)?,
@@ -1708,22 +1713,22 @@ impl<'a> TraceBuildSession<'a> {
                     ),
                 )
             }
-            TraceSignCircuitSource::SdKey { .. } => {
+            TraceSignCircuitSource::SdKeyDpn { .. } => {
                 let sign_context = self
                     .wallet_session
-                    .build_sd_key_context(&software_defined_call, pk_info.fingerprint, user_session_mgr)
+                    .build_sd_key_dpn_context(&software_defined_call, pk_info.fingerprint, user_session_mgr)
                     .await?;
-                let witness = sign_context
-                    .sd_key_signature_input
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("SD key witness missing after build"))?;
+                let witness = match sign_context.sd_key_signature_input.as_ref() {
+                    Some(SdKeySignInput::Dpn(input)) => input,
+                    _ => anyhow::bail!("SD key witness missing after build"),
+                };
                 let verifier = self
                     .wallet_session
                     .wallet
                     .get_sd_key_circuit(&pk_info.fingerprint)
                     .ok_or_else(|| anyhow::format_err!("SD key circuit `{}` not found", pk_info.fingerprint))?;
                 (
-                    bincode::serialize(witness)?,
+                    witness.to_trace_bytes()?,
                     AltVerifierOnlyCircuitData::from(
                         verifier
                             .get_verifier_config_ref()
@@ -2760,15 +2765,20 @@ impl WalletSession {
         Ok(public_key)
     }
 
-    pub async fn register_sd_key_circuit(
+    pub async fn register_sd_key_dpn_circuit(
         &mut self,
+        function: DPNFunctionCircuitDefinition,
+        config: SDKeyConfig,
+    ) -> anyhow::Result<QHashOut<F>> {
+        self.wallet.register_sd_key_dpn_circuit(function, config).await
+    }
+
+    pub fn build_allow_method_sd_key_definition(
         allowed_contract_ids: &[u64],
         allowed_method_ids: &[u32],
         expected_tx_count: u64,
-    ) -> anyhow::Result<QHashOut<F>> {
-        self.wallet
-            .register_allow_method_sd_key_circuit(allowed_contract_ids, allowed_method_ids, expected_tx_count)
-            .await
+    ) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
+        psy_vm::ups::sd_key::build_allow_method_policy(allowed_contract_ids, allowed_method_ids, expected_tx_count)
     }
 
     pub async fn update_circuit_mgr(&self, public_key: QHashOut<F>) -> anyhow::Result<()> {
@@ -3404,17 +3414,13 @@ impl WalletSession {
         let mut sign_context = SignContext::new(pk_info.fingerprint);
 
         {
-            if self.wallet.has_psy_software_defined_circuit(&pk_info.fingerprint) {
+            if self.wallet.has_sd_key_plonky2_circuit(&pk_info.fingerprint) {
                 sign_context = self
-                    .build_psy_software_defined_context(&software_defined_call, pk_info.fingerprint, &mut user_session_mgr, sign_context)
+                    .build_sd_key_plonky2_context(&software_defined_call, pk_info.fingerprint, &mut user_session_mgr)
                     .await?;
-            } else if self.wallet.has_plonky2_software_defined_circuit(&pk_info.fingerprint) {
+            } else if self.wallet.has_sd_key_dpn_circuit(&pk_info.fingerprint) {
                 sign_context = self
-                    .build_plonky2_software_defined_context(&software_defined_call, pk_info.fingerprint, &mut user_session_mgr)
-                    .await?;
-            } else if self.wallet.has_sd_key_circuit(&pk_info.fingerprint) {
-                sign_context = self
-                    .build_sd_key_context(&software_defined_call, pk_info.fingerprint, &mut user_session_mgr)
+                    .build_sd_key_dpn_context(&software_defined_call, pk_info.fingerprint, &mut user_session_mgr)
                     .await?;
             };
         }
@@ -3550,31 +3556,12 @@ impl WalletSession {
             crate::trace::TraceSignCircuitSource::ZkBuiltin
             | crate::trace::TraceSignCircuitSource::SecpBuiltin
             | crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin => Ok(()),
-            crate::trace::TraceSignCircuitSource::PsySoftwareDefined {
-                circuit_def,
-                force_four_align,
-            } => {
-                if !self.wallet.has_psy_software_defined_circuit(&fingerprint) {
-                    let fn_def: DPNFunctionCircuitDefinition = bincode::deserialize(circuit_def)?;
-                    let registered = self.wallet.register_psy_software_defined_circuit(fn_def, *force_four_align).await?;
-                    anyhow::ensure!(
-                        registered == fingerprint,
-                        "PSY software-defined trace fingerprint mismatch: trace={} rebuilt={}",
-                        fingerprint,
-                        registered
-                    );
-                }
-                Ok(())
-            }
-            crate::trace::TraceSignCircuitSource::Plonky2SoftwareDefined {
+            crate::trace::TraceSignCircuitSource::SdKeyPlonky2 {
                 contract_state_tree_height,
                 input_len,
             } => {
-                if !self.wallet.has_plonky2_software_defined_circuit(&fingerprint) {
-                    let registered = self
-                        .wallet
-                        .register_plonky2_software_defined_circuit(*contract_state_tree_height, *input_len)
-                        .await?;
+                if !self.wallet.has_sd_key_plonky2_circuit(&fingerprint) {
+                    let registered = self.wallet.register_sd_key_plonky2_circuit(*contract_state_tree_height, *input_len).await?;
                     anyhow::ensure!(
                         registered == fingerprint,
                         "Plonky2 software-defined trace fingerprint mismatch: trace={} rebuilt={}",
@@ -3584,18 +3571,15 @@ impl WalletSession {
                 }
                 Ok(())
             }
-            crate::trace::TraceSignCircuitSource::SdKey {
-                allowed_contract_ids,
-                allowed_method_ids,
-                expected_tx_count,
+            crate::trace::TraceSignCircuitSource::SdKeyDpn {
+                function_def,
+                config,
             } => {
-                let registered = self
-                    .wallet
-                    .register_allow_method_sd_key_circuit(allowed_contract_ids, allowed_method_ids, *expected_tx_count)
-                    .await?;
+                let function = DPNFunctionCircuitDefinition::from_sd_key_trace_bytes(function_def)?;
+                let registered = self.wallet.register_sd_key_dpn_circuit(function, config.clone()).await?;
                 anyhow::ensure!(
                     registered == fingerprint,
-                    "SD key trace fingerprint mismatch: trace={} rebuilt={}",
+                    "SDKey-DPN trace fingerprint mismatch: trace={} rebuilt={}",
                     fingerprint,
                     registered
                 );
@@ -3604,45 +3588,7 @@ impl WalletSession {
         }
     }
 
-    async fn build_psy_software_defined_context(
-        &self,
-        call_data: &DPNSoftwareDefinedCallData,
-        fingerprint: QHashOut<F>,
-        user_session_mgr: &mut UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>,
-        sign_context: SignContext,
-    ) -> anyhow::Result<SignContext> {
-        let sdc = self
-            .wallet
-            .get_psy_software_defined_circuit(&fingerprint)
-            .ok_or_else(|| anyhow::format_err!("PSY software defined circuit `{}` not found", fingerprint))?;
-
-        let cfc_call_inputs = call_data.inputs.iter().map(|x| F::from_noncanonical_u64(*x)).collect::<Vec<_>>();
-
-        if !sdc.fn_def.is_view_function() {
-            anyhow::bail!("software-defined signing function must be view-only");
-        }
-        let cfc_proof_input = user_session_mgr
-            .exec_deferred_contract_call_local(F::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64), &sdc.fn_def, cfc_call_inputs)
-            .await?;
-
-        let signature_input = DPNSoftwareDefinedSignatureInput { cfc_input: cfc_proof_input };
-
-        let current_header = user_session_mgr.get_current_ups_header();
-        let current_checkpoint_id = current_header.session_start_context.checkpoint_id.to_canonical_u64();
-        let user_id = current_header.session_start_context.start_session_user_leaf.user_id.to_canonical_u64();
-        let start_contract_state_tree_root = current_header.current_state.user_leaf.user_state_tree_root;
-        let checkpoint_tree_root = current_header.session_start_context.checkpoint_tree_root;
-
-        Ok(sign_context.with_psy_signature_input(
-            signature_input,
-            current_checkpoint_id,
-            user_id,
-            start_contract_state_tree_root,
-            checkpoint_tree_root,
-        ))
-    }
-
-    async fn build_plonky2_software_defined_context(
+    async fn build_sd_key_plonky2_context(
         &self,
         call_data: &DPNSoftwareDefinedCallData,
         fingerprint: QHashOut<F>,
@@ -3673,7 +3619,7 @@ impl WalletSession {
         )
         .await;
 
-        let plonky2_input = Plonky2SoftwareDefinedSignatureInput {
+        let plonky2_input = SDKeyPlonky2CircuitWitnessInput {
             state_reader_results: state_reader.to_results(),
             circuit_inputs,
         };
@@ -3681,8 +3627,8 @@ impl WalletSession {
         Ok(SignContext::new(fingerprint)
             .with_contract_id(Some(DEFAULT_CALLER_CONTRACT_ID_U64))
             .with_sign_inputs(call_data.inputs.clone())
-            .with_plonky2_signature_input(
-                plonky2_input,
+            .with_sd_key_input(
+                SdKeySignInput::Plonky2(plonky2_input),
                 checkpoint_id,
                 user_id,
                 transaction_record.user_contract_tree_update_proof.old_value,
@@ -3690,7 +3636,7 @@ impl WalletSession {
             ))
     }
 
-    async fn build_sd_key_context(
+    async fn build_sd_key_dpn_context(
         &self,
         call_data: &DPNSoftwareDefinedCallData,
         fingerprint: QHashOut<F>,
@@ -3701,33 +3647,110 @@ impl WalletSession {
             .get_sd_key_circuit(&fingerprint)
             .ok_or_else(|| anyhow::format_err!("SD key circuit `{}` not found", fingerprint))?;
         let config = sd_key.config.clone();
+        let definition = sd_key
+            .dpn_state_reader_definition
+            .clone()
+            .ok_or_else(|| anyhow::format_err!("SD key circuit `{}` is missing its DPN definition", fingerprint))?;
         drop(sd_key);
 
         let transaction_infos = user_session_mgr.sd_key_transaction_infos();
-        let expected_slots = config.num_introspectable_transactions as usize;
-        if transaction_infos.len() != expected_slots {
-            anyhow::bail!(
-                "SD key circuit expects {} introspectable txs, but session has {} txs",
-                expected_slots,
-                transaction_infos.len()
-            );
-        }
+        let transaction_inputs = user_session_mgr.sd_key_transaction_inputs();
+        validate_sd_key_transaction_count(&config, transaction_infos.len(), "session")?;
+        anyhow::ensure!(
+            transaction_inputs.len() == transaction_infos.len(),
+            "SD key session has {} transaction infos but {} input vectors",
+            transaction_infos.len(),
+            transaction_inputs.len()
+        );
 
-        let current_header = user_session_mgr.get_current_ups_header();
+        let current_header = user_session_mgr.get_current_ups_header().clone();
         let checkpoint_id = current_header.session_start_context.checkpoint_id.to_canonical_u64();
         let user_id = current_header.session_start_context.start_session_user_leaf.user_id.to_canonical_u64();
         let circuit_inputs = call_data.inputs.iter().map(|x| F::from_noncanonical_u64(*x)).collect::<Vec<_>>();
         let tx_stack_hash = user_session_mgr.current_tx_hash_stack();
         let tx_count = user_session_mgr.current_tx_count();
-        let start_contract_state_tree_root = current_header.current_state.user_leaf.user_state_tree_root;
+        anyhow::ensure!(
+            tx_count.to_canonical_u64() as usize == transaction_infos.len(),
+            "SD key session tx_count {} does not match {} transactions",
+            tx_count.to_canonical_u64(),
+            transaction_infos.len()
+        );
         let checkpoint_tree_root = current_header.session_start_context.checkpoint_tree_root;
 
-        let signature_input = SDKeyCircuitWitnessInput {
+        let (
+            dpn_state_command_witnesses,
+            dpn_state_reader_context,
+            signature_context,
+            contract_state_root_proof,
+            start_contract_state_root,
+        ) = if definition.state_commands.is_empty() {
+            (vec![], None, None, None, QHashOut::ZERO)
+        } else {
+            // Reuse the DPN VM's local execution path to resolve the exact
+            // state commands and their authenticated witnesses. This mirrors
+            // the former software-defined DPN signer, which executed its
+            // read-only function locally before proving the signature.
+            let cfc_input = user_session_mgr
+                .exec_deferred_contract_call(
+                    F::from_canonical_u64(config.contract_id),
+                    F::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64),
+                    &definition,
+                    circuit_inputs.clone(),
+                )
+                .await?;
+
+            let contract_state_root_proof = user_session_mgr
+                .require_lps_mut()?
+                .get_self_user_contract_tree_leaf(F::from_canonical_u64(config.contract_id))
+                .await?;
+            let start_contract_state_root = contract_state_root_proof.value;
+            let nonce = user_session_mgr.require_lps()?.get_nonce();
+            let current_user_leaf = current_header.current_state.user_leaf;
+            let mut end_user_leaf = current_user_leaf;
+            end_user_leaf.nonce = nonce;
+            let signature_data =
+                psy_client_data::qdata::ups_signature::PsyUserProvingSessionSignatureDataCompact {
+                    start_user_leaf_hash: current_header.session_start_context.start_session_user_leaf.qfhash::<PoseidonHash>(),
+                    end_user_leaf_hash: end_user_leaf.qfhash::<PoseidonHash>(),
+                    checkpoint_leaf_hash: current_header.session_start_context.checkpoint_leaf_hash,
+                    tx_stack_hash,
+                    tx_count,
+                };
+            let state_context = psy_vm::ups::sd_key::SDKeyDPNStateReaderContext {
+                user_contract_tree_state_root: current_user_leaf.user_state_tree_root,
+                deferred_tx_tree_root: current_header.current_state.deferred_tx_debt_tree_root,
+                session_proof_tree_root: cfc_input.session_proof_tree_root,
+                checkpoint_tree_root,
+                chain_state_roots: user_session_mgr.get_current_global_state_roots().clone(),
+                checkpoint_stats: user_session_mgr.get_current_checkpoint_leaf().stats,
+            };
+            let signature_context = psy_vm::ups::sd_key::SDKeySignatureContext {
+                signature_data,
+                current_user_leaf,
+                nonce,
+                checkpoint_tree_root,
+            };
+            (
+                cfc_input.cmd_witnesses,
+                Some(state_context),
+                Some(signature_context),
+                Some(contract_state_root_proof),
+                start_contract_state_root,
+            )
+        };
+
+        let signature_input = SDKeyDpnCircuitWitnessInput {
             circuit_inputs,
             transaction_infos,
+            transaction_inputs,
             tx_stack_hash,
             tx_count,
             state_reader_results: None,
+            dpn_state_command_witnesses,
+            dpn_state_reader_context,
+            signature_context,
+            contract_state_root_proof,
+            start_contract_state_root,
             secp256k1_slots: vec![],
             checkpoint_id: F::from_canonical_u64(checkpoint_id),
             user_id: F::from_canonical_u64(user_id),
@@ -3735,16 +3758,16 @@ impl WalletSession {
 
         Ok(SignContext::new(fingerprint)
             .with_sign_inputs(call_data.inputs.clone())
-            .with_sd_key_signature_input(
-                signature_input,
+            .with_sd_key_input(
+                SdKeySignInput::Dpn(signature_input),
                 checkpoint_id,
                 user_id,
-                start_contract_state_tree_root,
+                start_contract_state_root,
                 checkpoint_tree_root,
             ))
     }
 
-    async fn build_sd_key_context_step(
+    async fn build_sd_key_dpn_context_step(
         &self,
         call_data: &DPNSoftwareDefinedCallData,
         fingerprint: QHashOut<F>,
@@ -3753,11 +3776,11 @@ impl WalletSession {
         current_header: &UserProvingSessionHeader<F>,
     ) -> anyhow::Result<SignContext> {
         let _ = user_session_mgr;
-        self.build_sd_key_context_from_trace(call_data, fingerprint, trace_steps, current_header)
+        self.build_sd_key_dpn_context_from_trace(call_data, fingerprint, trace_steps, current_header)
             .await
     }
 
-    async fn build_sd_key_context_from_trace(
+    async fn build_sd_key_dpn_context_from_trace(
         &self,
         call_data: &DPNSoftwareDefinedCallData,
         fingerprint: QHashOut<F>,
@@ -3771,32 +3794,47 @@ impl WalletSession {
         let config = sd_key.config.clone();
         drop(sd_key);
 
-        let transaction_infos = trace_steps
+        let cfc_steps: Vec<_> = trace_steps.iter().filter_map(crate::trace::TraceStep::as_cfc).collect();
+        let transaction_infos = cfc_steps
             .iter()
-            .filter_map(crate::trace::TraceStep::as_cfc)
             .map(|cfc| {
                 psy_client_data::dpn::sd_key::SDKeyTransactionInfo::from(cfc.cfc_witness.tx_input_ctx.transaction_call_start_ctx.call_data.clone())
             })
             .collect::<Vec<_>>();
-        let expected_slots = config.num_introspectable_transactions as usize;
-        if transaction_infos.len() != expected_slots {
-            anyhow::bail!(
-                "SD key circuit expects {} introspectable txs, but trace has {} txs",
-                expected_slots,
-                transaction_infos.len()
-            );
-        }
+        let transaction_inputs = cfc_steps
+            .iter()
+            .map(|cfc| cfc.cfc_witness.inputs.clone())
+            .collect::<Vec<_>>();
+        validate_sd_key_transaction_count(&config, transaction_infos.len(), "trace")?;
+        anyhow::ensure!(
+            transaction_inputs.len() == transaction_infos.len(),
+            "SD key trace has {} transaction infos but {} input vectors",
+            transaction_infos.len(),
+            transaction_inputs.len()
+        );
+        anyhow::ensure!(
+            current_header.current_state.tx_count.to_canonical_u64() as usize == transaction_infos.len(),
+            "SD key trace tx_count {} does not match {} transactions",
+            current_header.current_state.tx_count.to_canonical_u64(),
+            transaction_infos.len()
+        );
 
         let checkpoint_id = current_header.session_start_context.checkpoint_id.to_canonical_u64();
         let user_id = current_header.session_start_context.start_session_user_leaf.user_id.to_canonical_u64();
         let circuit_inputs = call_data.inputs.iter().map(|x| F::from_noncanonical_u64(*x)).collect::<Vec<_>>();
         let checkpoint_tree_root = current_header.session_start_context.checkpoint_tree_root;
-        let signature_input = SDKeyCircuitWitnessInput {
+        let signature_input = SDKeyDpnCircuitWitnessInput {
             circuit_inputs,
             transaction_infos,
+            transaction_inputs,
             tx_stack_hash: current_header.current_state.tx_hash_stack,
             tx_count: current_header.current_state.tx_count,
             state_reader_results: None,
+            dpn_state_command_witnesses: vec![],
+            dpn_state_reader_context: None,
+            signature_context: None,
+            contract_state_root_proof: None,
+            start_contract_state_root: QHashOut::ZERO,
             secp256k1_slots: vec![],
             checkpoint_id: F::from_canonical_u64(checkpoint_id),
             user_id: F::from_canonical_u64(user_id),
@@ -3804,8 +3842,8 @@ impl WalletSession {
 
         Ok(SignContext::new(fingerprint)
             .with_sign_inputs(call_data.inputs.clone())
-            .with_sd_key_signature_input(
-                signature_input,
+            .with_sd_key_input(
+                SdKeySignInput::Dpn(signature_input),
                 checkpoint_id,
                 user_id,
                 current_header.current_state.user_leaf.user_state_tree_root,
@@ -3902,6 +3940,7 @@ impl WalletSession {
         circuit_defs: Vec<DPNFunctionCircuitDefinition>,
     ) -> anyhow::Result<String> {
         let update_cmd = self.get_update_contract_cmd(contract_id, deployer, circuit_defs)?;
+        update_cmd.validate_shape()?;
 
         let update_content_hash = self
             .st_provider
@@ -5528,51 +5567,57 @@ impl WalletSession {
             crate::trace::TraceSignCircuitSource::ZkBuiltin
             | crate::trace::TraceSignCircuitSource::SecpBuiltin
             | crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin => SignContext::new(pk_info.fingerprint),
-            crate::trace::TraceSignCircuitSource::PsySoftwareDefined { .. } => {
-                anyhow::ensure!(
-                    !zs.sign_witness.is_empty(),
-                    "stateless graph signing requires trace sign_witness for PSY software-defined signing"
-                );
-                let signature_input: DPNSoftwareDefinedSignatureInput = bincode::deserialize(&zs.sign_witness)?;
-                SignContext::new(pk_info.fingerprint).with_psy_signature_input(
-                    signature_input,
-                    trace.finalization.submit_end_cap_input.core.checkpoint_id.to_canonical_u64(),
-                    trace.meta.user_id,
-                    current_header.current_state.user_leaf.user_state_tree_root,
-                    trace.finalization.submit_end_cap_input.core.state_transition.checkpoint_tree_root_hash,
-                )
-            }
-            crate::trace::TraceSignCircuitSource::Plonky2SoftwareDefined { .. } => {
+            crate::trace::TraceSignCircuitSource::SdKeyPlonky2 { .. } => {
                 anyhow::ensure!(
                     !zs.sign_witness.is_empty(),
                     "stateless graph signing requires trace sign_witness for Plonky2 software-defined signing"
                 );
-                let signature_input: Plonky2SoftwareDefinedSignatureInput = bincode::deserialize(&zs.sign_witness)?;
+                let signature_input: SDKeyPlonky2CircuitWitnessInput = bincode::deserialize(&zs.sign_witness)?;
                 SignContext::new(pk_info.fingerprint)
                     .with_contract_id(Some(DEFAULT_CALLER_CONTRACT_ID_U64))
                     .with_sign_inputs(trace.finalization.software_defined_call.inputs.clone())
-                    .with_plonky2_signature_input(
-                        signature_input,
+                    .with_sd_key_input(
+                        SdKeySignInput::Plonky2(signature_input),
                         trace.finalization.submit_end_cap_input.core.checkpoint_id.to_canonical_u64(),
                         trace.meta.user_id,
                         current_header.current_state.user_leaf.user_state_tree_root,
                         trace.finalization.submit_end_cap_input.core.state_transition.checkpoint_tree_root_hash,
                     )
             }
-            crate::trace::TraceSignCircuitSource::SdKey { .. } => {
+            crate::trace::TraceSignCircuitSource::SdKeyDpn { function_def, .. } => {
                 if !zs.sign_witness.is_empty() {
-                    let signature_input: SDKeyCircuitWitnessInput = bincode::deserialize(&zs.sign_witness)?;
+                    let signature_input = SDKeyDpnCircuitWitnessInput::from_trace_bytes(&zs.sign_witness)?;
+                    let definition = DPNFunctionCircuitDefinition::from_sd_key_trace_bytes(function_def)?;
+                    if !definition.state_commands.is_empty() {
+                        anyhow::ensure!(
+                            signature_input.dpn_state_reader_context.is_some()
+                                && signature_input.signature_context.is_some()
+                                && signature_input.contract_state_root_proof.is_some(),
+                            "stateful SDKey-DPN trace witness is missing authenticated state context"
+                        );
+                        anyhow::ensure!(
+                            signature_input.dpn_state_command_witnesses.len() == definition.state_commands.len(),
+                            "stateful SDKey-DPN trace witness has {} state command witnesses; expected {}",
+                            signature_input.dpn_state_command_witnesses.len(),
+                            definition.state_commands.len()
+                        );
+                    }
                     SignContext::new(pk_info.fingerprint)
                         .with_sign_inputs(trace.finalization.software_defined_call.inputs.clone())
-                        .with_sd_key_signature_input(
-                            signature_input,
+                        .with_sd_key_input(
+                            SdKeySignInput::Dpn(signature_input),
                             current_header.session_start_context.checkpoint_id.to_canonical_u64(),
                             current_header.session_start_context.start_session_user_leaf.user_id.to_canonical_u64(),
                             current_header.current_state.user_leaf.user_state_tree_root,
                             current_header.session_start_context.checkpoint_tree_root,
                         )
                 } else {
-                    self.build_sd_key_context_from_trace(
+                    let definition = DPNFunctionCircuitDefinition::from_sd_key_trace_bytes(function_def)?;
+                    anyhow::ensure!(
+                        definition.state_commands.is_empty(),
+                        "stateful SDKey-DPN trace has no authenticated signing witness; regenerate it with the current prover"
+                    );
+                    self.build_sd_key_dpn_context_from_trace(
                         &trace.finalization.software_defined_call,
                         pk_info.fingerprint,
                         &trace.steps,
@@ -5848,35 +5893,14 @@ impl WalletSession {
             crate::trace::TraceSignCircuitSource::ZkBuiltin
             | crate::trace::TraceSignCircuitSource::SecpBuiltin
             | crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin => {}
-            crate::trace::TraceSignCircuitSource::PsySoftwareDefined { .. } => {
+            crate::trace::TraceSignCircuitSource::SdKeyPlonky2 { .. } => {
                 if !zs.sign_witness.is_empty() {
-                    let signature_input: DPNSoftwareDefinedSignatureInput = bincode::deserialize(&zs.sign_witness)?;
-                    sign_context = sign_context.with_psy_signature_input(
-                        signature_input,
-                        trace.finalization.submit_end_cap_input.core.checkpoint_id.to_canonical_u64(),
-                        trace.meta.user_id,
-                        prev_header.current_state.user_leaf.user_state_tree_root,
-                        trace.finalization.submit_end_cap_input.core.state_transition.checkpoint_tree_root_hash,
-                    );
-                } else {
-                    sign_context = self
-                        .build_psy_software_defined_context(
-                            &trace.finalization.software_defined_call,
-                            pk_info.fingerprint,
-                            &mut user_session_mgr,
-                            sign_context,
-                        )
-                        .await?;
-                }
-            }
-            crate::trace::TraceSignCircuitSource::Plonky2SoftwareDefined { .. } => {
-                if !zs.sign_witness.is_empty() {
-                    let signature_input: Plonky2SoftwareDefinedSignatureInput = bincode::deserialize(&zs.sign_witness)?;
+                    let signature_input: SDKeyPlonky2CircuitWitnessInput = bincode::deserialize(&zs.sign_witness)?;
                     sign_context = SignContext::new(pk_info.fingerprint)
                         .with_contract_id(Some(DEFAULT_CALLER_CONTRACT_ID_U64))
                         .with_sign_inputs(trace.finalization.software_defined_call.inputs.clone())
-                        .with_plonky2_signature_input(
-                            signature_input,
+                        .with_sd_key_input(
+                            SdKeySignInput::Plonky2(signature_input),
                             trace.finalization.submit_end_cap_input.core.checkpoint_id.to_canonical_u64(),
                             trace.meta.user_id,
                             prev_header.current_state.user_leaf.user_state_tree_root,
@@ -5884,25 +5908,45 @@ impl WalletSession {
                         );
                 } else {
                     sign_context = self
-                        .build_plonky2_software_defined_context(&trace.finalization.software_defined_call, pk_info.fingerprint, &mut user_session_mgr)
+                        .build_sd_key_plonky2_context(&trace.finalization.software_defined_call, pk_info.fingerprint, &mut user_session_mgr)
                         .await?;
                 }
             }
-            crate::trace::TraceSignCircuitSource::SdKey { .. } => {
+            crate::trace::TraceSignCircuitSource::SdKeyDpn { function_def, .. } => {
                 if !zs.sign_witness.is_empty() {
-                    let signature_input: SDKeyCircuitWitnessInput = bincode::deserialize(&zs.sign_witness)?;
+                    let signature_input = SDKeyDpnCircuitWitnessInput::from_trace_bytes(&zs.sign_witness)?;
+                    let definition = DPNFunctionCircuitDefinition::from_sd_key_trace_bytes(function_def)?;
+                    if !definition.state_commands.is_empty() {
+                        anyhow::ensure!(
+                            signature_input.dpn_state_reader_context.is_some()
+                                && signature_input.signature_context.is_some()
+                                && signature_input.contract_state_root_proof.is_some(),
+                            "stateful SDKey-DPN trace witness is missing authenticated state context"
+                        );
+                        anyhow::ensure!(
+                            signature_input.dpn_state_command_witnesses.len() == definition.state_commands.len(),
+                            "stateful SDKey-DPN trace witness has {} state command witnesses; expected {}",
+                            signature_input.dpn_state_command_witnesses.len(),
+                            definition.state_commands.len()
+                        );
+                    }
                     sign_context = SignContext::new(pk_info.fingerprint)
                         .with_sign_inputs(trace.finalization.software_defined_call.inputs.clone())
-                        .with_sd_key_signature_input(
-                            signature_input,
+                        .with_sd_key_input(
+                            SdKeySignInput::Dpn(signature_input),
                             prev_header.session_start_context.checkpoint_id.to_canonical_u64(),
                             prev_header.session_start_context.start_session_user_leaf.user_id.to_canonical_u64(),
                             prev_header.current_state.user_leaf.user_state_tree_root,
                             prev_header.session_start_context.checkpoint_tree_root,
                         );
                 } else {
+                    let definition = DPNFunctionCircuitDefinition::from_sd_key_trace_bytes(function_def)?;
+                    anyhow::ensure!(
+                        definition.state_commands.is_empty(),
+                        "stateful SDKey-DPN trace has no authenticated signing witness; regenerate it with the current prover"
+                    );
                     sign_context = self
-                        .build_sd_key_context_step(
+                        .build_sd_key_dpn_context_step(
                             &trace.finalization.software_defined_call,
                             pk_info.fingerprint,
                             &user_session_mgr,
@@ -7852,13 +7896,12 @@ pub(crate) mod offline_trace_pipeline_tests {
         // and the burn step always targets the token's fixed burn method
         let set_value_method_id = helper.defs.iter().find(|def| def.name == "set_value").unwrap().method_id;
 
-        let sd_fingerprint = wallet_session
-            .register_sd_key_circuit(
-                &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
-                &[set_value_method_id, TOKEN_BURN_METHOD_ID],
-                2,
-            )
-            .await?;
+        let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy(
+            &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
+            &[set_value_method_id, TOKEN_BURN_METHOD_ID],
+            2,
+        )?;
+        let sd_fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
         let private_key = QHashOut::from_values(961, 962, 963, 964);
         let pk_info = wallet_session.wallet.get_or_create_user(private_key, sd_fingerprint).await?;
         assert_eq!(pk_info.fingerprint, sd_fingerprint);
@@ -7905,13 +7948,12 @@ pub(crate) mod offline_trace_pipeline_tests {
         // positions: the standard tx records set_value's compiled method id
         // and the burn step always targets the token's fixed burn method
         let set_value_method_id = helper.defs.iter().find(|def| def.name == "set_value").unwrap().method_id;
-        let sd_fingerprint = wallet_session
-            .register_sd_key_circuit(
-                &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
-                &[set_value_method_id, TOKEN_BURN_METHOD_ID],
-                2,
-            )
-            .await?;
+        let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy(
+            &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
+            &[set_value_method_id, TOKEN_BURN_METHOD_ID],
+            2,
+        )?;
+        let sd_fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
         let pk_info = wallet_session
             .wallet
             .get_or_create_user(QHashOut::from_values(971, 972, 973, 974), sd_fingerprint)
@@ -7941,6 +7983,18 @@ pub(crate) mod offline_trace_pipeline_tests {
             .await?;
         let trace = std::sync::Arc::new(builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?);
 
+        let zksign = trace
+            .steps
+            .last()
+            .and_then(|step| match step {
+                crate::trace::TraceStep::ZkSign(zksign) => Some(zksign),
+                _ => None,
+            })
+            .expect("trace ends with its signing step");
+        assert!(!zksign.sign_witness.is_empty(), "SDKey DPN trace must persist the signing witness for offline finalization");
+        let persisted_witness = SDKeyDpnCircuitWitnessInput::from_trace_bytes(&zksign.sign_witness)?;
+        assert_eq!(persisted_witness.transaction_infos.len(), 2);
+
         let wallet_session = std::sync::Arc::new(wallet_session);
         let current_header = &trace
             .steps
@@ -7950,7 +8004,7 @@ pub(crate) mod offline_trace_pipeline_tests {
             .expect("the SD key trace contains a CFC step")
             .end_header;
         let sign_context = wallet_session
-            .build_sd_key_context_from_trace(
+            .build_sd_key_dpn_context_from_trace(
                 &trace.finalization.software_defined_call,
                 sd_fingerprint,
                 &trace.steps,
@@ -7958,9 +8012,12 @@ pub(crate) mod offline_trace_pipeline_tests {
             )
             .await?;
         assert_eq!(sign_context.fingerprint, sd_fingerprint);
-        assert_eq!(sign_context.sd_key_signature_input.as_ref().unwrap().transaction_infos.len(), 2);
+        match sign_context.sd_key_signature_input.as_ref().unwrap() {
+            SdKeySignInput::Dpn(input) => assert_eq!(input.transaction_infos.len(), 2),
+            SdKeySignInput::Plonky2(_) => panic!("expected SDKey DPN witness"),
+        }
         let missing_tx = wallet_session
-            .build_sd_key_context_from_trace(
+            .build_sd_key_dpn_context_from_trace(
                 &trace.finalization.software_defined_call,
                 sd_fingerprint,
                 &[],
@@ -7976,6 +8033,84 @@ pub(crate) mod offline_trace_pipeline_tests {
             .prove_trace_jobs_by_graph(public_key, trace, &plan)
             .await?;
         assert_ne!(tx_hash, QHashOut::<F>::ZERO);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn offline_stateful_sd_key_dpn_trace_signs_with_state_witness() -> anyhow::Result<()> {
+        use psy_vm::dpn::ops::{op_types::{encode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType}, state_cmd::data::DPNStateCmdGetSelfUserCurrentContractStateSlotSingle};
+
+        let (port, _rpc_seen, responses) = spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&loopback_network_config(port)).await?;
+        let helper = seeded_helper_contract();
+        let token = seeded_token_contract();
+        let set_value_method_id = helper.defs.iter().find(|def| def.name == "set_value").unwrap().method_id;
+        let (mut function, mut config) = psy_vm::ups::sd_key::build_allow_method_policy(
+            &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
+            &[set_value_method_id, TOKEN_BURN_METHOD_ID],
+            2,
+        )?;
+        let next_target = function.definitions.iter().filter(|def| def.data_type == DPNBuiltInDataType::Target).count();
+        let next_bool = function.definitions.iter().filter(|def| def.data_type == DPNBuiltInDataType::Bool).count();
+        let slot_id = encode_indexed_op_id(DPNBuiltInDataType::Target, next_target);
+        function.definitions.push(DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: next_target, op_type: DPNOpType::Constant, inputs: vec![0] });
+        function.state_commands.push(DPNStateCmd::GetSelfUserCurrentContractStateSlotSingle(
+            DPNStateCmdGetSelfUserCurrentContractStateSlotSingle { sub_slot_index: slot_id },
+        ));
+        function.state_command_resolution_indices.push(function.definitions.len());
+        let value_id = encode_indexed_op_id(DPNBuiltInDataType::Target, next_target + 1);
+        function.definitions.push(DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: next_target + 1, op_type: DPNOpType::GetStateCommandResultSingle, inputs: vec![0] });
+        let zero_id = encode_indexed_op_id(DPNBuiltInDataType::Target, next_target + 2);
+        function.definitions.push(DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: next_target + 2, op_type: DPNOpType::Constant, inputs: vec![0] });
+        let positive_id = encode_indexed_op_id(DPNBuiltInDataType::Bool, next_bool);
+        function.definitions.push(DPNIndexedVarDef { data_type: DPNBuiltInDataType::Bool, index: next_bool, op_type: DPNOpType::Gt, inputs: vec![value_id, zero_id] });
+        let old_authorized = function.circuit_outputs[0];
+        let combined_id = encode_indexed_op_id(DPNBuiltInDataType::Bool, next_bool + 1);
+        function.definitions.push(DPNIndexedVarDef { data_type: DPNBuiltInDataType::Bool, index: next_bool + 1, op_type: DPNOpType::BoolAnd, inputs: vec![old_authorized, positive_id] });
+        function.circuit_outputs = vec![combined_id];
+        config.contract_id = OFFLINE_HELPER_CONTRACT_ID;
+        config.contract_state_tree_height = helper.state_tree_height;
+
+        let sd_fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
+        let pk_info = wallet_session.wallet.get_or_create_user(QHashOut::from_values(975, 976, 977, 978), sd_fingerprint).await?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+        let chain = build_offline_chain(public_key, vec![helper, token]);
+        set_offline_responses(&responses, &chain)?;
+        set_offline_chain_rpc_rules(&responses, &chain, public_key)?;
+        let cmd_provider = wallet_session.st_provider.clone();
+        let mut builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+        builder.trace_call(ContractCallArgs { contract_id: OFFLINE_HELPER_CONTRACT_ID, method_name: "set_value".into(), inputs: vec![9] }).await?;
+        let trace = builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?;
+        let zksign = match trace.steps.last() { Some(crate::trace::TraceStep::ZkSign(zksign)) => zksign, _ => anyhow::bail!("missing sign step") };
+        let witness = SDKeyDpnCircuitWitnessInput::from_trace_bytes(&zksign.sign_witness)?;
+        assert_eq!(witness.dpn_state_command_witnesses.len(), 1);
+        assert!(witness.dpn_state_reader_context.is_some());
+        assert_eq!(witness.dpn_state_command_witnesses[0].witness.get_merkle_proof_ref().root, witness.start_contract_state_root);
+        let state_context = witness.dpn_state_reader_context.as_ref().unwrap();
+        let signature_context = witness.signature_context.as_ref().unwrap();
+        let expected_checkpoint_leaf_hash = PsyCheckpointLeaf {
+            global_chain_root: state_context.chain_state_roots.qfhash::<PsyHasher>(),
+            stats: state_context.checkpoint_stats,
+        }.qfhash::<PsyHasher>();
+        assert_eq!(signature_context.signature_data.checkpoint_leaf_hash, expected_checkpoint_leaf_hash);
+        let mut end_user_leaf = signature_context.current_user_leaf;
+        end_user_leaf.nonce = signature_context.nonce;
+        assert_eq!(signature_context.signature_data.end_user_leaf_hash, end_user_leaf.qfhash::<PsyHasher>());
+        let native_sign_context = psy_client_data::qdata::user_contract_state::SignContext::new(
+            signature_context.checkpoint_tree_root,
+            signature_context.current_user_leaf,
+        );
+        let expected_sig_hash = QHashOut(signature_context.signature_data
+            .get_sig_action_for_user::<PsyHasher>(
+                psy_config::network_constants::PSY_NETWORK_MAGIC,
+                witness.user_id,
+                signature_context.nonce,
+                native_sign_context,
+            )
+            .get_hash::<PoseidonHash>());
+        assert_eq!(trace.finalization.sig_hash, expected_sig_hash);
+        let current_header = &trace.steps.iter().filter_map(crate::trace::TraceStep::as_cfc).last().unwrap().end_header;
+        wallet_session.sign_trace_finalization(public_key, &trace, current_header).await?;
         Ok(())
     }
 

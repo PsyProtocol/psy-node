@@ -158,11 +158,11 @@ pub fn trading_bot_auth(
 }
 ```
 
-**Using Plonky2 Circuits (Low-level):**
+**Plonky2 SD-key interface (reserved; registration is not implemented):**
 ```rust
 // Register circuit using Plonky2 directly
 let fingerprint = circuit_manager
-    .register_plonky2_software_defined_circuit(32, 4)
+    .register_sd_key_plonky2_circuit(32, 4)
     .await?;
 
 // Deploy DPNSoftwareDefinedCallData

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use psy_client_data::dpn::sd_key::SDKeyConfig;
+use psy_client_data::dpn::sd_key::{SDKeyConfig, SDKEY_MAX_CALLDATA_WORDS, MAX_INTROSPECTABLE_TRANSACTIONS};
 use psy_vm::dpn::{
     ops::{context_trait::DPNContext, exec_context::QExecContext, sym_felt::SymFeltRef},
     vm::{compile::PsyCompileResult, def::DPNFunctionCircuitDefinition},
@@ -13,25 +13,25 @@ use crate::{
     types::{checker::*, layout::*},
 };
 
-/// Output of the SDK key compilation pipeline.
+/// Output of the SD key compilation pipeline.
 #[derive(Debug, Clone)]
-pub struct SDKKeyCompileOutput {
+pub struct SDKeyCompileOutput {
     /// The compiled authorization circuit definition.
     pub circuit_def: DPNFunctionCircuitDefinition,
-    /// The SDK key configuration derived from the contract.
+    /// The SD key configuration derived from the contract.
     pub config: SDKeyConfig,
     /// The contract name (used as the key definition name).
     pub name: String,
 }
 
-/// Compiler context for SDK key compilation.
+/// Compiler context for SD key compilation.
 ///
-/// Similar to the standard CompilerContext but with SDK key-specific features:
+/// Similar to the standard CompilerContext but with SD key-specific features:
 /// - Transaction introspection via `tx` context object
 /// - Read-only state access (no mutations allowed)
 /// - Secp256k1 verification tracking
 /// - Checkpoint state reading
-pub struct SDKKeyCompilerContext<'a> {
+pub struct SDKeyCompilerContext<'a> {
     pub checked: &'a CheckedProgram,
     assertion_messages: Vec<&'static str>,
     /// Track how many transactions are introspected.
@@ -40,25 +40,34 @@ pub struct SDKKeyCompilerContext<'a> {
     state_reading_used: bool,
     /// Track secp256k1 verification count.
     num_secp256k1_verifications: u32,
+    /// Contract whose state this key is allowed to read.
+    contract_id: Option<u64>,
 }
 
-impl<'a> SDKKeyCompilerContext<'a> {
+impl<'a> SDKeyCompilerContext<'a> {
     pub fn new(checked: &'a CheckedProgram) -> Self {
-        SDKKeyCompilerContext {
+        SDKeyCompilerContext {
             checked,
             assertion_messages: Vec::new(),
             num_introspected_transactions: 0,
             state_reading_used: false,
             num_secp256k1_verifications: 0,
+            contract_id: None,
         }
     }
 
-    /// Compile the SDK key definition from the checked program.
+    pub fn new_for_contract(checked: &'a CheckedProgram, contract_id: u64) -> Self {
+        let mut compiler = Self::new(checked);
+        compiler.contract_id = Some(contract_id);
+        compiler
+    }
+
+    /// Compile the SD key definition from the checked program.
     ///
     /// The contract must have a single `authorize` method (or a method
     /// annotated as the authorization entry point). This method defines
     /// the key's authorization logic.
-    pub fn compile_sdk_key(&mut self) -> Result<SDKKeyCompileOutput> {
+    pub fn compile_sd_key(&mut self) -> Result<SDKeyCompileOutput> {
         let layout = &self.checked.contract_layout;
 
         // Find the authorization method
@@ -71,19 +80,26 @@ impl<'a> SDKKeyCompilerContext<'a> {
             .iter()
             .find(|m| m.is_contract_method && m.name == "authorize")
             .or_else(|| methods.iter().find(|m| m.is_contract_method))
-            .ok_or_else(|| anyhow::anyhow!("No authorization method found. SDK key contracts must have an 'authorize' method."))?;
+            .ok_or_else(|| anyhow::anyhow!("No authorization method found. SD key contracts must have an 'authorize' method."))?;
 
         let circuit_def = self.compile_authorize_method(auth_method, &helper_methods)?;
 
+        let contract_id = match (self.state_reading_used, self.contract_id) {
+            (true, None) => bail!("SD key reads contract state, but no contract_id was supplied; use a contract-aware SD key compile API"),
+            (_, Some(contract_id)) => contract_id,
+            (false, None) => 0,
+        };
         let config = SDKeyConfig {
             num_introspectable_transactions: self.num_introspected_transactions,
+            transaction_count_policy: None,
             can_read_state: self.state_reading_used,
             contract_state_tree_height: layout.state_tree_height as u8,
             requires_secp256k1: self.num_secp256k1_verifications > 0,
             num_secp256k1_slots: self.num_secp256k1_verifications,
+            contract_id,
         };
 
-        Ok(SDKKeyCompileOutput {
+        Ok(SDKeyCompileOutput {
             circuit_def,
             config,
             name: self.checked.contract_name.clone(),
@@ -108,8 +124,8 @@ impl<'a> SDKKeyCompilerContext<'a> {
                     if *ty == ResolvedType::Struct("ChainContext".to_string()) {
                         continue;
                     }
-                    if *ty == ResolvedType::Struct("SDKKeyContext".to_string()) {
-                        continue; // SDK key context is handled via special
+                    if *ty == ResolvedType::Struct("SDKeyContext".to_string()) {
+                        continue; // SD key context is handled via special
                                   // getters
                     }
                     let sym = create_inputs_for_type(&self.checked, &mut exec, ty)?;
@@ -118,8 +134,8 @@ impl<'a> SDKKeyCompilerContext<'a> {
             }
         }
 
-        // Compile the body with SDK key restrictions
-        let mut method_ctx = SDKKeyMethodCompileContext {
+        // Compile the body with SD key restrictions
+        let mut method_ctx = SDKeyMethodCompileContext {
             exec: &mut exec,
             locals,
             layout,
@@ -186,8 +202,8 @@ fn create_inputs_for_type(checked: &CheckedProgram, exec: &mut QExecContext, ty:
     }
 }
 
-/// Per-method compilation context for SDK key authorization logic.
-struct SDKKeyMethodCompileContext<'a, 'b> {
+/// Per-method compilation context for SD key authorization logic.
+struct SDKeyMethodCompileContext<'a, 'b> {
     exec: &'a mut QExecContext,
     locals: HashMap<String, SymValue>,
     layout: &'b ContractStateLayout,
@@ -201,7 +217,7 @@ struct SDKKeyMethodCompileContext<'a, 'b> {
     num_secp256k1_verifications: &'a mut u32,
 }
 
-impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
+impl<'a, 'b> SDKeyMethodCompileContext<'a, 'b> {
     fn leak_str(&mut self, s: &str) -> &'static str {
         let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
         self.assertion_messages.push(leaked);
@@ -276,7 +292,7 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
                 Ok(())
             }
             Stmt::While { condition, body, .. } => {
-                // While loops in SDK keys are treated like guarded blocks
+                // While loops in SD keys are treated like guarded blocks
                 let cond = self.compile_expr(condition)?;
                 let cond_ref = cond.as_felt();
                 if cond_ref.is_constant_type() && cond_ref.get_constant_value() == 0 {
@@ -300,25 +316,25 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
                 Ok(())
             }
             Expr::FieldAccess(receiver, _field, _) => {
-                // SDK keys are read-only for contract state
+                // SD keys are read-only for contract state
                 if let Expr::Ident(name, _) = receiver.as_ref() {
                     if name == "self" {
-                        bail!("SDK key authorization circuits cannot modify contract state. State access is read-only.");
+                        bail!("SD key authorization circuits cannot modify contract state. State access is read-only.");
                     }
                 }
-                bail!("Unsupported assignment target in SDK key")
+                bail!("Unsupported assignment target in SD key")
             }
             Expr::IndexAccess(arr, _idx, _) => {
                 if let Expr::FieldAccess(self_expr, _field, _) = arr.as_ref() {
                     if let Expr::Ident(self_name, _) = self_expr.as_ref() {
                         if self_name == "self" {
-                            bail!("SDK key authorization circuits cannot modify contract state. State access is read-only.");
+                            bail!("SD key authorization circuits cannot modify contract state. State access is read-only.");
                         }
                     }
                 }
-                bail!("Unsupported assignment target in SDK key")
+                bail!("Unsupported assignment target in SD key")
             }
-            _ => bail!("Invalid assignment target in SDK key"),
+            _ => bail!("Invalid assignment target in SD key"),
         }
     }
 
@@ -340,7 +356,7 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
                     Ok(val.clone())
                 } else if let Some(c) = self.constants.get(name) {
                     Ok(SymValue::Felt(self.exec.op_const(*c)))
-                } else if name == "self" || name == "ctx" || name == "sdk" {
+                } else if name == "self" || name == "ctx" || name == "sd" {
                     Ok(SymValue::Void)
                 } else {
                     bail!("Undefined variable: {}", name)
@@ -426,17 +442,17 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
             if name == "ctx" {
                 return self.compile_ctx_field(field);
             }
-            // sdk.num_transactions — total transaction count in the proving session
-            if name == "sdk" {
+            // sd.num_transactions — total transaction count in the proving session
+            if name == "sd" {
                 return self.compile_sdk_field(field);
             }
         }
 
-        // Check for sdk.tx[n].field — transaction introspection
+        // Check for sd.tx[n].field — transaction introspection
         if let Expr::IndexAccess(arr_expr, idx_expr, _) = receiver {
-            if let Expr::FieldAccess(sdk_expr, arr_field, _) = arr_expr.as_ref() {
-                if let Expr::Ident(sdk_name, _) = sdk_expr.as_ref() {
-                    if sdk_name == "sdk" && arr_field == "tx" {
+            if let Expr::FieldAccess(sd_expr, arr_field, _) = arr_expr.as_ref() {
+                if let Expr::Ident(sd_name, _) = sd_expr.as_ref() {
+                    if sd_name == "sd" && arr_field == "tx" {
                         return self.compile_tx_introspection_field(idx_expr, field);
                     }
                 }
@@ -470,25 +486,20 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
 
     // ─── Transaction introspection ──────────────────────────────────────
 
-    /// Maximum number of transactions that can be introspected in an SDK key
-    /// circuit. This limits circuit size growth from transaction
-    /// introspection slots.
-    const MAX_TX_INTROSPECTION_SLOTS: u32 = 64;
-
-    /// Compile access to sdk.tx[n].field where n must be a compile-time
+    /// Compile access to sd.tx[n].field where n must be a compile-time
     /// constant.
     fn compile_tx_introspection_field(&mut self, idx_expr: &Expr, field: &str) -> Result<SymValue> {
         let n = self.eval_const_expr(idx_expr)?;
 
         // Track the max transaction index
         let tx_index = n as u32;
-        if tx_index >= Self::MAX_TX_INTROSPECTION_SLOTS {
+        if tx_index >= MAX_INTROSPECTABLE_TRANSACTIONS {
             bail!(
                 "Transaction index {} exceeds maximum allowed introspectable transactions ({}). \
-                 sdk.tx[n] requires a compile-time constant index in range 0..{}.",
+                 sd.tx[n] requires a compile-time constant index in range 0..{}.",
                 tx_index,
-                Self::MAX_TX_INTROSPECTION_SLOTS,
-                Self::MAX_TX_INTROSPECTION_SLOTS
+                MAX_INTROSPECTABLE_TRANSACTIONS,
+                MAX_INTROSPECTABLE_TRANSACTIONS
             );
         }
         if tx_index >= *self.num_introspected_transactions {
@@ -501,36 +512,24 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
         // with a special encoding.
         match field {
             "contract_id" => {
-                // Encode as a constant-indexed getter
-                // The circuit gadget will map this to the right target
                 let n_const = self.exec.op_const(n);
-                let magic = self.exec.op_const(0x5458_434F4E5452u64); // "TXCONTR"
-                let result = self.exec.hash(&[magic, n_const]);
-                Ok(SymValue::Felt(result[0]))
+                Ok(SymValue::Felt(self.exec.get_transaction_contract_id(n_const)))
             }
             "method_id" => {
                 let n_const = self.exec.op_const(n);
-                let magic = self.exec.op_const(0x54584D4554484Fu64); // "TXMETHO"
-                let result = self.exec.hash(&[magic, n_const]);
-                Ok(SymValue::Felt(result[0]))
+                Ok(SymValue::Felt(self.exec.get_transaction_method_id(n_const)))
             }
             "caller_contract_id" => {
                 let n_const = self.exec.op_const(n);
-                let magic = self.exec.op_const(0x545843414C4C52u64); // "TXCALLR"
-                let result = self.exec.hash(&[magic, n_const]);
-                Ok(SymValue::Felt(result[0]))
+                Ok(SymValue::Felt(self.exec.get_transaction_caller_contract_id(n_const)))
             }
             "inputs_length" => {
                 let n_const = self.exec.op_const(n);
-                let magic = self.exec.op_const(0x5458494E4C454Eu64); // "TXINLEN"
-                let result = self.exec.hash(&[magic, n_const]);
-                Ok(SymValue::Felt(result[0]))
+                Ok(SymValue::Felt(self.exec.get_transaction_input_length(n_const)))
             }
             "inputs_hash" => {
                 let n_const = self.exec.op_const(n);
-                let magic = self.exec.op_const(0x5458494E48415348u64); // "TXINHASH"
-                let result = self.exec.hash(&[magic, n_const]);
-                Ok(SymValue::Hash(result))
+                Ok(SymValue::Hash(self.exec.get_transaction_inputs_hash(n_const)))
             }
             _ => bail!(
                 "Unknown transaction field: {}. Available: contract_id, method_id, caller_contract_id, inputs_length, inputs_hash",
@@ -610,44 +609,68 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
         }
     }
 
-    // ─── SDK context field access ───────────────────────────────────────
+    // ─── SD context field access ───────────────────────────────────────
 
     fn compile_sdk_field(&mut self, field: &str) -> Result<SymValue> {
         match field {
             "num_transactions" => {
-                // The total number of transactions in the proving session.
-                // This is a runtime value provided by the tx introspection gadget.
-                // Encoded as a magic constant hash so the DPN circuit builder
-                // can resolve it to the actual tx_count target.
-                let magic = self.exec.op_const(0x53444B5458434E54u64); // "SDKTXCNT"
-                let result = self.exec.hash(&[magic]);
-                Ok(SymValue::Felt(result[0]))
+                Ok(SymValue::Felt(self.exec.get_transaction_count()))
+            }
+            "transaction_stack_hash" => {
+                Ok(SymValue::Hash(self.exec.get_transaction_stack_hash()))
             }
             "tx" => {
-                // sdk.tx is accessed via index: sdk.tx[n], handled by compile_index_access
+                // sd.tx is accessed via index: sd.tx[n], handled by compile_index_access
                 Ok(SymValue::Void)
             }
-            _ => bail!("Unknown SDKKeyContext field: {}. Available: num_transactions, tx", field),
+            _ => bail!("Unknown SDKeyContext field: {}. Available: num_transactions, transaction_stack_hash, tx", field),
         }
     }
 
     // ─── Index access ────────────────────────────────────────────────────
 
     fn compile_index_access(&mut self, arr_expr: &Expr, idx_expr: &Expr) -> Result<SymValue> {
-        // Check for sdk.tx[n]
-        if let Expr::FieldAccess(sdk_expr, field, _) = arr_expr {
-            if let Expr::Ident(sdk_name, _) = sdk_expr.as_ref() {
-                if sdk_name == "sdk" && field == "tx" {
+        // sd.tx[tx_index].inputs[word_index]
+        if let Expr::FieldAccess(tx_expr, field, _) = arr_expr {
+            if field == "inputs" {
+                if let Expr::IndexAccess(tx_array, tx_idx_expr, _) = tx_expr.as_ref() {
+                    if let Expr::FieldAccess(sd_expr, tx_field, _) = tx_array.as_ref() {
+                        if matches!(sd_expr.as_ref(), Expr::Ident(name, _) if name == "sd") && tx_field == "tx" {
+                            let tx_index = self.eval_const_expr(tx_idx_expr)?;
+                            let word_index = self.eval_const_expr(idx_expr)?;
+                            if tx_index >= MAX_INTROSPECTABLE_TRANSACTIONS as u64 {
+                                bail!("Transaction index {} exceeds maximum allowed introspectable transactions ({})", tx_index, MAX_INTROSPECTABLE_TRANSACTIONS);
+                            }
+                            if word_index >= SDKEY_MAX_CALLDATA_WORDS as u64 {
+                                bail!("Transaction calldata word index {} exceeds maximum allowed words ({})", word_index, SDKEY_MAX_CALLDATA_WORDS);
+                            }
+                            let required_count = tx_index as u32 + 1;
+                            if required_count > *self.num_introspected_transactions {
+                                *self.num_introspected_transactions = required_count;
+                            }
+                            let tx_index = self.exec.op_const(tx_index);
+                            let word_index = self.exec.op_const(word_index);
+                            return Ok(SymValue::Felt(self.exec.get_transaction_input_word(tx_index, word_index)));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for sd.tx[n]
+        if let Expr::FieldAccess(sd_expr, field, _) = arr_expr {
+            if let Expr::Ident(sd_name, _) = sd_expr.as_ref() {
+                if sd_name == "sd" && field == "tx" {
                     // Return a transaction accessor struct
                     let n = self.eval_const_expr(idx_expr)?;
                     let tx_index = n as u32;
-                    if tx_index >= Self::MAX_TX_INTROSPECTION_SLOTS {
+                    if tx_index >= MAX_INTROSPECTABLE_TRANSACTIONS {
                         bail!(
                             "Transaction index {} exceeds maximum allowed introspectable transactions ({}). \
-                             sdk.tx[n] requires a compile-time constant index in range 0..{}.",
+                             sd.tx[n] requires a compile-time constant index in range 0..{}.",
                             tx_index,
-                            Self::MAX_TX_INTROSPECTION_SLOTS,
-                            Self::MAX_TX_INTROSPECTION_SLOTS
+                            MAX_INTROSPECTABLE_TRANSACTIONS,
+                            MAX_INTROSPECTABLE_TRANSACTIONS
                         );
                     }
                     if tx_index >= *self.num_introspected_transactions {
@@ -926,9 +949,9 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
             match &param.ty {
                 crate::types::resolver::ResolvedParamType::SelfRef { .. } => continue,
                 crate::types::resolver::ResolvedParamType::Typed { ty, .. } => {
-                    // ChainContext and SDKKeyContext are implicit parameters —
+                    // ChainContext and SDKeyContext are implicit parameters —
                     // the caller does not pass them, so don't consume from compiled_args.
-                    if *ty == ResolvedType::Struct("ChainContext".to_string()) || *ty == ResolvedType::Struct("SDKKeyContext".to_string()) {
+                    if *ty == ResolvedType::Struct("ChainContext".to_string()) || *ty == ResolvedType::Struct("SDKeyContext".to_string()) {
                         continue;
                     }
                     if arg_idx < compiled_args.len() {
@@ -1092,7 +1115,7 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
         }
     }
 
-    // ─── ContractHashMap operations (read-only for SDK keys) ─────────────
+    // ─── ContractHashMap operations (read-only for SD keys) ─────────────
 
     fn compile_imt_map_method_call(&mut self, field_name: &str, method: &str, args: &[Expr]) -> Result<SymValue> {
         *self.state_reading_used = true;
@@ -1128,7 +1151,7 @@ impl<'a, 'b> SDKKeyMethodCompileContext<'a, 'b> {
             }
             "set" | "insert" | "update" => {
                 bail!(
-                    "SDK key authorization circuits cannot modify ContractHashMap ({}). Use .get() for read-only access.",
+                    "SD key authorization circuits cannot modify ContractHashMap ({}). Use .get() for read-only access.",
                     method
                 )
             }

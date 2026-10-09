@@ -68,9 +68,9 @@ const NETWORK_TYPE: PsyChainNetworkType = PsyChainNetworkType::LocalDevnet;
 const GLOBAL_USER_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE;
 const GLOBAL_CONTRACT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
 const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
-    psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+    psy_config::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
-    psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+    psy_config::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 
 fn bridge_contract_state_tree_height(contract_id: u32) -> anyhow::Result<u8> {
     match contract_id {

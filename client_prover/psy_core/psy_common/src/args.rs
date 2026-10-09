@@ -24,12 +24,10 @@ pub enum SignType {
     SECP256K1Sign,
     #[clap(name = "eth-personal-secp256k1")]
     EthPersonalSECP256K1Sign,
-    #[clap(name = "software-defined-dpn")]
-    SoftwareDefinedDPNSign,
-    #[clap(name = "software-defined-plonky2")]
-    SoftwareDefinedPlonky2Sign,
-    #[clap(name = "sd-key")]
-    SDKeySign,
+    #[clap(name = "sd-key-dpn")]
+    SDKeyDpnSign,
+    #[clap(name = "sd-key-plonky2")]
+    SDKeyPlonky2Sign,
 }
 
 impl SignType {
@@ -38,9 +36,8 @@ impl SignType {
             "zk" => Ok(SignType::ZKSign),
             "secp256k1" => Ok(SignType::SECP256K1Sign),
             "eth-personal-secp256k1" => Ok(SignType::EthPersonalSECP256K1Sign),
-            "software-defined-dpn" => Ok(SignType::SoftwareDefinedDPNSign),
-            "software-defined-plonky2" => Ok(SignType::SoftwareDefinedPlonky2Sign),
-            "sd-key" => Ok(SignType::SDKeySign),
+            "sd-key-dpn" => Ok(SignType::SDKeyDpnSign),
+            "sd-key-plonky2" => Ok(SignType::SDKeyPlonky2Sign),
             _ => Err(format!("Unknown sign type: {}", s)),
         }
     }
@@ -73,14 +70,19 @@ impl ContractCallData {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// Arguments for a read-only view call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewCallData {
     pub contract_calls: Vec<ContractCallArgs>,
+    pub software_defined_call: DPNSoftwareDefinedCallData,
 }
 
 impl ViewCallData {
     pub fn new(contract_calls: Vec<ContractCallArgs>) -> Self {
-        Self { contract_calls }
+        Self {
+            contract_calls,
+            software_defined_call: DPNSoftwareDefinedCallData::default(),
+        }
     }
 }
 
@@ -106,9 +108,38 @@ pub struct WalletSourceArgs {
     #[clap(long, action = clap::ArgAction::Append)]
     #[serde(default)]
     pub sd_key_allowed_method_id: Vec<u32>,
-    #[clap(long, default_value_t = 2)]
+    /// Minimum number of transactions allowed by the SD key policy.
+    #[clap(long)]
     #[serde(default)]
-    pub sd_key_expected_tx_count: u64,
+    pub sd_key_min_tx_count: Option<u64>,
+    /// Maximum number of transactions allowed by the SD key policy and circuit
+    /// capacity.
+    #[clap(long)]
+    #[serde(default)]
+    pub sd_key_max_tx_count: Option<u64>,
+    /// JSON file containing a programmable SDKey definition. The file must
+    /// contain `{ "function": <DPNFunctionCircuitDefinition>,
+    /// "config": <SDKeyConfig> }`.
+    #[clap(long, env = "SD_KEY_DEFINITION")]
+    pub sd_key_definition: Option<String>,
+}
+
+impl WalletSessionArgs {
+    /// Resolve the configured range. With neither bound specified, use 2.
+    pub fn sd_key_tx_count_range(&self) -> (u64, u64) {
+        self.wallet.sd_key_tx_count_range()
+    }
+}
+
+impl WalletSourceArgs {
+    pub fn sd_key_tx_count_range(&self) -> (u64, u64) {
+        match (self.sd_key_min_tx_count, self.sd_key_max_tx_count) {
+            (Some(min), Some(max)) => (min, max),
+            (Some(min), None) => (min, min),
+            (None, Some(max)) => (1, max),
+            (None, None) => (2, 2),
+        }
+    }
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]
@@ -194,8 +225,8 @@ pub struct ProverArgs {
 
 /// Which proof families a prove-proxy instance serves.
 ///
-/// `user`   — wallet proofs: UPS session chain, contract calls, signatures, minifiers.
-/// `system` — relayer proofs: the three bridge Groth16 methods.
+/// `user`   — wallet proofs: UPS session chain, contract calls, signatures,
+/// minifiers. `system` — relayer proofs: the three bridge Groth16 methods.
 /// `all`    — both; intended for single-machine local testnets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ProveProxyRole {

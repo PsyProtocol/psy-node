@@ -362,6 +362,16 @@ pub trait DPNContext<F: ContextFelt>: Debug + Clone {
     fn get_user_public_key_hash(&mut self) -> [F; 4];
     fn get_session_proof_tree_root(&mut self) -> [F; 4];
 
+    // Preceding transaction introspection
+    fn get_transaction_count(&mut self) -> F;
+    fn get_transaction_stack_hash(&mut self) -> [F; 4];
+    fn get_transaction_contract_id(&mut self, index: F) -> F;
+    fn get_transaction_caller_contract_id(&mut self, index: F) -> F;
+    fn get_transaction_method_id(&mut self, index: F) -> F;
+    fn get_transaction_inputs_hash(&mut self, index: F) -> [F; 4];
+    fn get_transaction_input_length(&mut self, index: F) -> F;
+    fn get_transaction_input_word(&mut self, transaction_index: F, word_index: F) -> F;
+
     // Checkpoint stats helper functions
     fn get_checkpoint_stats(&mut self, checkpoint_id: F) -> Vec<F>;
     fn get_register_users_root(&mut self, checkpoint_id: F) -> [F; 4];

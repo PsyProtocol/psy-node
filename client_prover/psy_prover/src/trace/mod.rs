@@ -4,7 +4,7 @@ use psy_client_common::{
     data::{alt::AltVerifierOnlyCircuitData, qhashout::QHashOut},
 };
 use psy_client_data::{
-    dpn::cfc_context_input::DapenCFCUserTransactionInputContext,
+    dpn::{cfc_context_input::DapenCFCUserTransactionInputContext, sd_key::SDKeyConfig},
     guta::{api::ContractStateUpdate, end_cap_input::SubmitUserEndCapNonProofInput, stats::GUTAStats},
     qdata::{
         checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf},
@@ -201,6 +201,8 @@ pub struct TxMetadata {
     pub storage_data: TxStorageData,
 }
 
+/// Metadata returned for a simulated contract call. For fee-free view calls the
+/// transaction hash is `None` and the storage write list is empty.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SimulatedTxMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -633,21 +635,20 @@ pub enum TraceSignCircuitSource {
     ZkBuiltin,
     SecpBuiltin,
     EthPersonalSecpBuiltin,
-    SdKey {
-        allowed_contract_ids: Vec<u64>,
-        allowed_method_ids: Vec<u32>,
-        expected_tx_count: u64,
+    /// SD-key authorization circuit backed by a read-only DPN function
+    /// definition (this includes the allow-method policy, which is compiled
+    /// to the same DPN representation). The `function_def` payload is the
+    /// bincode-serialized DPN function definition; `config` is needed to
+    /// rebuild the gadget.
+    SdKeyDpn {
+        function_def: Vec<u8>,
+        config: SDKeyConfig,
     },
-    Plonky2SoftwareDefined {
+    SdKeyPlonky2 {
         #[serde(default = "default_plonky2_sdc_contract_state_tree_height")]
         contract_state_tree_height: u8,
         #[serde(default)]
         input_len: usize,
-    },
-    PsySoftwareDefined {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        circuit_def: Vec<u8>,
-        force_four_align: bool,
     },
 }
 
@@ -718,19 +719,26 @@ mod simulation_tests {
 
     #[test]
     fn sign_circuit_source_serde_applies_defaults_and_tags() {
-        let plonky: TraceSignCircuitSource = serde_json::from_value(serde_json::json!({
-            "kind": "plonky2_software_defined"
-        }))
-        .unwrap();
-        match plonky {
-            TraceSignCircuitSource::Plonky2SoftwareDefined {
-                contract_state_tree_height,
-                input_len,
-            } => {
-                assert_eq!(contract_state_tree_height, psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT);
-                assert_eq!(input_len, 0);
+        for kind in ["sd_key_plonky2"] {
+            let plonky: TraceSignCircuitSource = serde_json::from_value(serde_json::json!({ "kind": kind })).unwrap();
+            match plonky {
+                TraceSignCircuitSource::SdKeyPlonky2 {
+                    contract_state_tree_height,
+                    input_len,
+                } => {
+                    assert_eq!(contract_state_tree_height, psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT);
+                    assert_eq!(input_len, 0);
+                    assert_eq!(
+                        serde_json::to_value(TraceSignCircuitSource::SdKeyPlonky2 {
+                            contract_state_tree_height,
+                            input_len,
+                        })
+                        .unwrap()["kind"],
+                        "sd_key_plonky2"
+                    );
+                }
+                _ => panic!("unexpected sign circuit source"),
             }
-            _ => panic!("unexpected sign circuit source"),
         }
 
         for kind in ["zk_builtin", "secp_builtin", "eth_personal_secp_builtin"] {
@@ -738,22 +746,17 @@ mod simulation_tests {
             assert_eq!(serde_json::to_value(source).unwrap()["kind"], kind);
         }
 
-        let sd_key = TraceSignCircuitSource::SdKey {
-            allowed_contract_ids: vec![1, 2],
-            allowed_method_ids: vec![3],
-            expected_tx_count: 4,
+        let sd_key = TraceSignCircuitSource::SdKeyDpn {
+            function_def: vec![1, 2, 3],
+            config: SDKeyConfig::default(),
         };
         let json = serde_json::to_value(sd_key).unwrap();
-        assert_eq!(json["kind"], "sd_key");
-        assert_eq!(json["expected_tx_count"], 4);
+        assert_eq!(json["kind"], "sd_key_dpn");
+        assert_eq!(json["function_def"], serde_json::json!([1, 2, 3]));
+        let restored: TraceSignCircuitSource = serde_json::from_value(json).unwrap();
+        assert!(matches!(restored, TraceSignCircuitSource::SdKeyDpn { function_def, .. } if function_def == [1, 2, 3]));
+        assert!(serde_json::from_value::<TraceSignCircuitSource>(serde_json::json!({ "kind": "sd_key_dpn" })).is_err());
 
-        let psy = TraceSignCircuitSource::PsySoftwareDefined {
-            circuit_def: Vec::new(),
-            force_four_align: true,
-        };
-        let json = serde_json::to_value(psy).unwrap();
-        assert!(json.get("circuit_def").is_none());
-        assert_eq!(json["force_four_align"], true);
     }
 
     #[test]

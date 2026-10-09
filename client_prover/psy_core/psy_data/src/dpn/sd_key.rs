@@ -10,6 +10,14 @@ use ts_rs::TS;
 
 use crate::dpn::proving_session::DPNProvingSessionCompactMethodCall;
 
+/// Maximum number of transactions available to transaction introspection.
+pub const MAX_INTROSPECTABLE_TRANSACTIONS: u32 = 64;
+/// Bits needed to compare a transaction count against the inclusive capacity.
+pub const SDKEY_TX_COUNT_BITS: usize = (u32::BITS - (MAX_INTROSPECTABLE_TRANSACTIONS + 1).leading_zeros()) as usize;
+
+/// Maximum number of Felt words available from each transaction's calldata.
+pub const SDKEY_MAX_CALLDATA_WORDS: u32 = 128;
+
 /// Compact transaction info for SD key introspection.
 ///
 /// Each transaction in a proving session can be introspected by the SD key
@@ -97,14 +105,33 @@ impl<F: RichField> KVQSerializable for SDKeyTransactionInfo<F> {
 /// Configuration for a software-defined key circuit.
 ///
 /// Defines what capabilities the key circuit has and what it can introspect.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
+#[ts(export)]
+pub struct SDKeyAllowedTransactionCall {
+    pub contract_id: u64,
+    pub method_id: u32,
+}
+
+/// Optional allow-method policy with a bounded, variable transaction count.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
+#[ts(export)]
+pub struct SDKeyTransactionCountPolicy {
+    pub min_tx_count: u32,
+    pub max_tx_count: u32,
+    pub allowed_calls: Vec<SDKeyAllowedTransactionCall>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default, TS)]
 #[ts(export)]
 pub struct SDKeyConfig {
-    /// Number of transactions the key circuit can introspect (compile-time
-    /// constant). Each introspectable transaction adds circuit constraints
-    /// for the merkle proof of that transaction's position in the
-    /// tx_stack_hash chain.
+    /// Maximum number of transactions the key circuit can introspect. This is
+    /// the fixed capacity of the circuit; the actual count is a witness.
     pub num_introspectable_transactions: u32,
+
+    /// Optional policy for circuits that authorize a range of transaction
+    /// counts and restrict the calls in active transaction slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_count_policy: Option<SDKeyTransactionCountPolicy>,
 
     /// Whether this key circuit can read contract state at the current
     /// checkpoint.
@@ -118,6 +145,9 @@ pub struct SDKeyConfig {
 
     /// Number of secp256k1 signature verification slots in the circuit.
     pub num_secp256k1_slots: u32,
+
+    /// Contract id used for DPN state reads.
+    pub contract_id: u64,
 }
 
 /// Compiled output of an SD key definition.

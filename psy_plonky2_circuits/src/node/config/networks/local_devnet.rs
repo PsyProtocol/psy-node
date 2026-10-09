@@ -168,6 +168,17 @@ mod tests {
     use super::*;
 
     type F = GoldilocksField;
+
+    fn get_genesis_sd_key_fingerprint() -> anyhow::Result<QHashOut<F>> {
+        let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy_range(
+            &[5, 0, 0],
+            &[3375543263, 2789897329, 3998182541],
+            3,
+            64,
+        )?;
+        let fingerprint = psy_ups_circuit::signature::sd_key_dpn::SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &config)?.get_fingerprint();
+        Ok(QHashOut(fingerprint.0))
+    }
     type Hash = QHashOut<F>;
 
     #[test]
@@ -234,7 +245,9 @@ mod tests {
             fingerprint: None,
             sd_key_allowed_contract_id: vec![5, 0, 0],
             sd_key_allowed_method_id: vec![3375543263, 2789897329, 3998182541],
-            sd_key_expected_tx_count: 3,
+            sd_key_min_tx_count: Some(3),
+            sd_key_max_tx_count: Some(64),
+            sd_key_definition: None,
         };
         let info = load_wallet_key_info(&wallet_args, false)?;
         Ok(Some(QHashOut::<F>::from_str(&info.private_key.to_string())?))
@@ -282,7 +295,7 @@ mod tests {
         let mut private_keys = Vec::with_capacity(1 << 19);
 
         let zk_fingerprint = QHashOut::<F>::from_values(ZK_FINGERPRINT_U64[0], ZK_FINGERPRINT_U64[1], ZK_FINGERPRINT_U64[2], ZK_FINGERPRINT_U64[3]);
-        let sd_key_fingerprint = QHashOut::<F>::from_str("86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278")?;
+        let sd_key_fingerprint = get_genesis_sd_key_fingerprint()?;
 
         let relayer_private_key = resolve_bridge_relayer_private_key()?;
 
@@ -397,8 +410,10 @@ mod tests {
             faucet_method_id: u64,
             #[serde(rename = "faucetPerClaimAmount")]
             faucet_per_claim_amount: String,
-            #[serde(rename = "sdKeyExpectedTxCount")]
-            sd_key_expected_tx_count: u32,
+            #[serde(rename = "sdKeyMinTxCount")]
+            sd_key_min_tx_count: u32,
+            #[serde(rename = "sdKeyMaxTxCount")]
+            sd_key_max_tx_count: u32,
             #[serde(rename = "sdKeyAllowedContractIds")]
             sd_key_allowed_contract_ids: Vec<u64>,
             #[serde(rename = "sdKeyAllowedMethodIds")]
@@ -443,7 +458,8 @@ mod tests {
             faucet_method_name: "faucet".to_string(),
             faucet_method_id: 3375543263,
             faucet_per_claim_amount: "1000000000000".to_string(),
-            sd_key_expected_tx_count: 3,
+            sd_key_min_tx_count: 3,
+            sd_key_max_tx_count: 64,
             sd_key_allowed_contract_ids: vec![5, 0, 0],
             sd_key_allowed_method_ids: vec![3375543263, 2789897329, 3998182541],
             operators,
