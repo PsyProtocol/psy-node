@@ -423,6 +423,9 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
                 &circuit.circuit_data.common,
                 2,
             );
+            // The minifier owns its circuit data; release the large base circuit
+            // before minification and Groth16 wrapping allocate their workspaces.
+            drop(circuit);
             let minified_proof = minifier.prove(&proof)?;
             let groth16 = wrap_circuit.prove_groth16_with_shared_wrapper(&groth16_wrapper, minifier.get_verifier_data(), &minified_proof)?;
 
