@@ -7310,6 +7310,7 @@ dependencies = [
  "pser",
  "psy_cli_common",
  "psy_client_common",
+ "psy_config",
  "psy_core",
  "psy_data",
  "psy_dummy_prover",

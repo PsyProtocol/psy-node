@@ -410,7 +410,12 @@ impl SDKeyDpnCircuitGadget {
                 let method_id = builder.constant(GF::from_canonical_u64(call.method_id as u64));
                 let contract_matches = builder.is_equal(slot.contract_id, contract_id);
                 let method_matches = builder.is_equal(slot.method_id, method_id);
-                let pair_matches = builder.and(contract_matches, method_matches);
+                let mut pair_matches = builder.and(contract_matches, method_matches);
+                if let Some(caller_id) = call.caller_contract_id {
+                    let caller_id = builder.constant(GF::from_canonical_u64(caller_id));
+                    let caller_matches = builder.is_equal(slot.caller_contract_id, caller_id);
+                    pair_matches = builder.and(pair_matches, caller_matches);
+                }
                 allowed = builder.or(allowed, pair_matches);
             }
             let slot_allowed = builder.or(inactive, allowed);
@@ -1735,6 +1740,33 @@ mod tests {
         let (disallowed, inputs) = make_tx_info(5, 43, &[]);
         let witness = build_witness(vec![disallowed], vec![inputs], 3);
         assert!(gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn allow_caller_and_method_range_rejects_direct_transfer() {
+        let (definition, config) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+            &[DEFAULT_CALLER_CONTRACT_ID_U64, 5, DEFAULT_CALLER_CONTRACT_ID_U64],
+            &[5, 0, 0],
+            &[10, 20, 30],
+            3,
+            3,
+        )
+        .unwrap();
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap();
+        let (mut faucet, faucet_inputs) = make_tx_info(5, 10, &[]);
+        faucet.caller_contract_id = GF::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64);
+        let (mut transfer, transfer_inputs) = make_tx_info(0, 20, &[]);
+        transfer.caller_contract_id = GF::from_canonical_u64(5);
+        let (mut burn, burn_inputs) = make_tx_info(0, 30, &[]);
+        burn.caller_contract_id = GF::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64);
+        let inputs = vec![faucet_inputs, transfer_inputs, burn_inputs];
+
+        let valid = build_witness(vec![faucet, transfer, burn], inputs.clone(), 3);
+        gadget.prove(dummy_private_key(), &valid, dummy_sighash()).await.unwrap();
+
+        transfer.caller_contract_id = GF::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64);
+        let direct_transfer = build_witness(vec![faucet, transfer, burn], inputs, 3);
+        assert!(gadget.prove(dummy_private_key(), &direct_transfer, dummy_sighash()).await.is_err());
     }
 
     fn allow_method_sd_key_config(expected_tx_count: u64) -> SDKeyConfig {

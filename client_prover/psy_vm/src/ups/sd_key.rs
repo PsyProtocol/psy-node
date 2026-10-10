@@ -367,7 +367,11 @@ pub fn build_allow_method_policy_range(
             max_tx_count: max_tx_count as u32,
             allowed_calls: pairs
                 .into_iter()
-                .map(|(contract_id, method_id)| psy_client_data::dpn::sd_key::SDKeyAllowedTransactionCall { contract_id, method_id })
+                .map(|(contract_id, method_id)| psy_client_data::dpn::sd_key::SDKeyAllowedTransactionCall {
+                    contract_id,
+                    method_id,
+                    caller_contract_id: None,
+                })
                 .collect(),
         }),
         can_read_state: false,
@@ -375,6 +379,51 @@ pub fn build_allow_method_policy_range(
         requires_secp256k1: false,
         num_secp256k1_slots: 0,
         contract_id: allowed_contract_ids.first().copied().unwrap_or(0),
+    };
+    Ok((function, config))
+}
+
+/// Like `build_allow_method_policy_range`, but each allowed call also has a
+/// required caller contract. User-initiated calls use
+/// `DEFAULT_CALLER_CONTRACT_ID_U64`; deferred calls use the invoking contract.
+pub fn build_allow_caller_and_method_policy_range(
+    allowed_caller_contract_ids: &[u64],
+    allowed_contract_ids: &[u64],
+    allowed_method_ids: &[u32],
+    min_tx_count: u64,
+    max_tx_count: u64,
+) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
+    let pairs = allowed_contract_method_pairs(allowed_contract_ids, allowed_method_ids)?;
+    anyhow::ensure!(
+        allowed_caller_contract_ids.len() == pairs.len(),
+        "SD key caller_id list must have one entry per allowed (contract_id, method_id) pair"
+    );
+    let (_, mut config) = build_allow_method_policy_range(allowed_contract_ids, allowed_method_ids, min_tx_count, max_tx_count)?;
+    config.transaction_count_policy = Some(psy_client_data::dpn::sd_key::SDKeyTransactionCountPolicy {
+        min_tx_count: min_tx_count as u32,
+        max_tx_count: max_tx_count as u32,
+        allowed_calls: pairs
+            .into_iter()
+            .zip(allowed_caller_contract_ids.iter().copied())
+            .map(|((contract_id, method_id), caller_contract_id)| psy_client_data::dpn::sd_key::SDKeyAllowedTransactionCall {
+                contract_id,
+                method_id,
+                caller_contract_id: Some(caller_contract_id),
+            })
+            .collect(),
+    });
+    let mut builder = DpnDefBuilder::new();
+    let authorized = builder.bool_op(DPNOpType::ConstantTrue, vec![]);
+    let function = DPNFunctionCircuitDefinition {
+        name: "allow_caller_and_method_sd_key_policy".to_string(),
+        method_id: 0,
+        circuit_inputs: vec![],
+        circuit_outputs: vec![authorized],
+        state_commands: vec![],
+        state_command_resolution_indices: vec![],
+        assertions: vec![],
+        definitions: builder.definitions,
+        events: vec![],
     };
     Ok((function, config))
 }
@@ -464,6 +513,18 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("MAX_INTROSPECTABLE_TRANSACTIONS"));
+    }
+
+    #[test]
+    fn allow_caller_and_method_policy_range_requires_aligned_callers() {
+        let (_, config) = build_allow_caller_and_method_policy_range(&[7, 5], &[5, 0], &[10, 20], 1, 3).unwrap();
+        let calls = config.transaction_count_policy.unwrap().allowed_calls;
+        assert_eq!(calls[0].caller_contract_id, Some(7));
+        assert_eq!(calls[1].caller_contract_id, Some(5));
+        assert!(build_allow_caller_and_method_policy_range(&[7], &[5, 0], &[10, 20], 1, 3)
+            .unwrap_err()
+            .to_string()
+            .contains("one entry per allowed"));
     }
 
     #[test]

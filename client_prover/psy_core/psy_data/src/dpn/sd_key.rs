@@ -110,6 +110,9 @@ impl<F: RichField> KVQSerializable for SDKeyTransactionInfo<F> {
 pub struct SDKeyAllowedTransactionCall {
     pub contract_id: u64,
     pub method_id: u32,
+    /// None preserves the legacy allow-method behavior for this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_contract_id: Option<u64>,
 }
 
 /// Optional allow-method policy with a bounded, variable transaction count.

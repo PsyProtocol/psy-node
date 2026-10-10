@@ -170,7 +170,12 @@ mod tests {
     type F = GoldilocksField;
 
     fn get_genesis_sd_key_fingerprint() -> anyhow::Result<QHashOut<F>> {
-        let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy_range(
+        let (function, config) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+            &[
+                psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64,
+                5,
+                psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64,
+            ],
             &[5, 0, 0],
             &[3375543263, 2789897329, 3998182541],
             3,
@@ -418,6 +423,8 @@ mod tests {
             sd_key_allowed_contract_ids: Vec<u64>,
             #[serde(rename = "sdKeyAllowedMethodIds")]
             sd_key_allowed_method_ids: Vec<u32>,
+            #[serde(rename = "sdKeyAllowedCallerContractIds")]
+            sd_key_allowed_caller_contract_ids: Vec<u64>,
             operators: Vec<FaucetOperatorJson>,
         }
 
@@ -462,6 +469,11 @@ mod tests {
             sd_key_max_tx_count: 64,
             sd_key_allowed_contract_ids: vec![5, 0, 0],
             sd_key_allowed_method_ids: vec![3375543263, 2789897329, 3998182541],
+            sd_key_allowed_caller_contract_ids: vec![
+                psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64,
+                5,
+                psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64,
+            ],
             operators,
         };
 

@@ -61,6 +61,7 @@ struct PsyFaucetOperatorsConfig {
     sd_key_max_tx_count: Option<u64>,
     sd_key_allowed_contract_ids: Option<Vec<u64>>,
     sd_key_allowed_method_ids: Option<Vec<u32>>,
+    sd_key_allowed_caller_contract_ids: Option<Vec<u64>>,
     operators: Vec<PsyFaucetOperatorConfig>,
 }
 
@@ -193,7 +194,10 @@ impl PsyFaucetService {
             !config.faucet_per_claim_amount.trim().is_empty(),
             "PSY_FAUCET_OPERATORS_JSON.faucetPerClaimAmount is empty"
         );
-        config.faucet_per_claim_amount.parse::<u64>()?;
+        anyhow::ensure!(
+            config.faucet_per_claim_amount.parse::<u64>()? >= 2,
+            "PSY_FAUCET_OPERATORS_JSON.faucetPerClaimAmount must be at least 2 for two faucet calls"
+        );
 
         let turnstile_secret = env::var("PSY_FAUCET_TURNSTILE_SECRET").ok().filter(|value| !value.trim().is_empty());
         let require_turnstile = parse_bool_env("PSY_FAUCET_REQUIRE_TURNSTILE", turnstile_secret.is_some());
@@ -218,9 +222,18 @@ impl PsyFaucetService {
             .clone()
             .unwrap_or_else(|| vec![config.faucet_contract_id]);
         let allowed_method_ids: Vec<u32> = config.sd_key_allowed_method_ids.clone().unwrap_or_else(|| vec![config.faucet_method_id]);
+        let allowed_caller_contract_ids = config
+            .sd_key_allowed_caller_contract_ids
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("faucet config requires sdKeyAllowedCallerContractIds"))?;
         let (min_tx_count, max_tx_count) = resolve_tx_count_range(&config)?;
-        let (function, sd_key_config) =
-            psy_vm::ups::sd_key::build_allow_method_policy_range(&allowed_contract_ids, &allowed_method_ids, min_tx_count, max_tx_count)?;
+        let (function, sd_key_config) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+            allowed_caller_contract_ids,
+            &allowed_contract_ids,
+            &allowed_method_ids,
+            min_tx_count,
+            max_tx_count,
+        )?;
         let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, sd_key_config).await?;
 
         let mut operators = Vec::with_capacity(config.operators.len());
@@ -556,6 +569,7 @@ mod tests {
             "faucetPerClaimAmount": "500",
             "sdKeyMinTxCount": 2,
             "sdKeyMaxTxCount": 2,
+            "sdKeyAllowedCallerContractIds": [psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64],
             "operators": [{
                 "userId": "7",
                 "address": "address",
@@ -657,6 +671,7 @@ mod tests {
             "faucetPerClaimAmount": "500",
             "sdKeyMinTxCount": 2,
             "sdKeyMaxTxCount": 2,
+            "sdKeyAllowedCallerContractIds": [psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64],
             "operators": [{
                 "userId": "7",
                 "address": "address",
@@ -676,6 +691,7 @@ mod tests {
         assert_eq!(resolve_tx_count_range(&config).unwrap(), (2, 2));
         assert!(config.sd_key_allowed_contract_ids.is_none());
         assert!(config.sd_key_allowed_method_ids.is_none());
+        assert_eq!(config.sd_key_allowed_caller_contract_ids, Some(vec![psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64]));
         assert_eq!(config.operators.len(), 1);
         assert_eq!(config.operators[0].user_id, "7");
         assert_eq!(config.operators[0].address, "address");
