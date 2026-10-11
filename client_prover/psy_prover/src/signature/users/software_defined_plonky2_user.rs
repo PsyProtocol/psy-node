@@ -98,7 +98,23 @@ impl SignatureUser for SoftwareDefinedPlonky2User {
 mod tests {
     use std::str::FromStr;
 
+    use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
+    use psy_client_data::qdata::{
+        ups_signature::PsyUserProvingSessionSignatureDataCompact, user::PsyUserLeaf, user_contract_state::SignContext as SessionSignContext,
+    };
+
     use super::*;
+
+    fn empty_state_reader() -> psy_vm::ups::state_reader::StateReaderResults<GoldilocksField> {
+        psy_vm::ups::state_reader::StateReaderResults {
+            state: Default::default(),
+            user_tree_root: QHashOut::default(),
+            checkpoint: None,
+            aux_user_leaves: Vec::new(),
+            state_cmds: Vec::new(),
+            merkel_proofs: Vec::new(),
+        }
+    }
 
     #[test]
     fn constructor_preserves_key_and_fingerprint() {
@@ -112,17 +128,21 @@ mod tests {
     fn psy_input() -> psy_provider::request::DPNSoftwareDefinedSignatureInput {
         psy_provider::request::DPNSoftwareDefinedSignatureInput {
             cfc_input: Default::default(),
+            sig_data: PsyUserProvingSessionSignatureDataCompact::default(),
+            sign_context: SessionSignContext::default(),
+            start_session_user_leaf: PsyUserLeaf::default(),
+            nonce: GoldilocksField::ZERO,
         }
     }
 
     fn plonky2_input() -> psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput {
         psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput {
-            state_reader_results: psy_vm::ups::state_reader::StateReaderResults {
-                state: Default::default(),
-                state_cmds: Vec::new(),
-                merkel_proofs: Vec::new(),
-            },
+            state_reader_results: empty_state_reader(),
             circuit_inputs: Vec::new(),
+            sig_data: PsyUserProvingSessionSignatureDataCompact::default(),
+            sign_context: SessionSignContext::default(),
+            start_session_user_leaf: PsyUserLeaf::default(),
+            nonce: GoldilocksField::ZERO,
         }
     }
 

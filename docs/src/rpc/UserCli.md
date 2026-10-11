@@ -95,6 +95,13 @@ Client CLI for wallet, contract deploy/call, tree/metadata queries, proving help
 | Privacy | `private-transfer`, `private-claim`, `derive-shield` |
 | Misc | `tx`, `faucet-server`, `get-psy-sdc-fingerprint`, `get-user-event-data`, `get-user-leaf` |
 
+## Reward setup
+
+`claim-rewards` reads one shared setup JSON. Required fields are `network_config` and `circuit_set`, both lowercase hex without `0x`, and `sources` with `node_source`, `native_source`, `plonky2_source`, and `wrapper_source`. `withdrawal_policies` is ignored archive metadata. Unknown fields are rejected. The circuit-set hash must equal `network_config.circuit_set_hash`.
+
+Reward component tests cover the segment, merge, root, batch, bridge-claim, nullifier, anchor, codec, and payer units. They are not an operational claim path. This tree has no reward-only L1 entry: do not treat `claim-rewards` as an L1 payout command.
+
+
 ## Source
 
 - `client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs`

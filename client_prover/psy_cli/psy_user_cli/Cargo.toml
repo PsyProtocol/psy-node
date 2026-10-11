@@ -58,6 +58,8 @@ rpassword = { workspace = true }
 # Native-only dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { workspace = true }
+fs2 = { workspace = true }
+psy_plonky2_circuits = { path = "../../../psy_plonky2_circuits", default-features = false, features = ["std"] }
 alloy-primitives = { workspace = true }
 alloy-consensus = "=1.6.3"
 alloy-eips = "=1.6.3"
@@ -81,6 +83,7 @@ shadow-rs = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
+parth_core = { workspace = true }
 serde_cbor = { workspace = true }
 zstd = { workspace = true }
 

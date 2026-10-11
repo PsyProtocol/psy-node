@@ -95,9 +95,32 @@ impl SignContext {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use plonky2::field::goldilocks_field::GoldilocksField as GF;
     use plonky2::{field::types::Field, hash::hash_types::HashOut};
+    use psy_client_data::qdata::{
+        ups_signature::PsyUserProvingSessionSignatureDataCompact, user::PsyUserLeaf, user_contract_state::SignContext as SessionSignContext,
+    };
 
     use super::*;
+
+    fn empty_sig_data() -> PsyUserProvingSessionSignatureDataCompact<GF> {
+        PsyUserProvingSessionSignatureDataCompact::default()
+    }
+
+    fn empty_sign_context() -> SessionSignContext<GF> {
+        SessionSignContext::default()
+    }
+
+    fn empty_state_reader() -> psy_vm::ups::state_reader::StateReaderResults<GF> {
+        psy_vm::ups::state_reader::StateReaderResults {
+            state: Default::default(),
+            user_tree_root: QHashOut::default(),
+            checkpoint: None,
+            aux_user_leaves: Vec::new(),
+            state_cmds: Vec::new(),
+            merkel_proofs: Vec::new(),
+        }
+    }
 
     fn hash(values: [u64; 4]) -> QHashOut<GoldilocksField> {
         QHashOut(HashOut {
@@ -141,6 +164,10 @@ mod tests {
         let checkpoint_root = hash([17, 18, 19, 20]);
         let signature_input = DPNSoftwareDefinedSignatureInput {
             cfc_input: Default::default(),
+            sig_data: empty_sig_data(),
+            sign_context: empty_sign_context(),
+            start_session_user_leaf: PsyUserLeaf::default(),
+            nonce: GF::ZERO,
         };
 
         let context = SignContext::new(fingerprint).with_psy_signature_input(signature_input, 7, 8, state_root, checkpoint_root);
@@ -157,12 +184,12 @@ mod tests {
     #[test]
     fn plonky2_signature_input_builder_populates_session_fields() {
         let signature_input = Plonky2SoftwareDefinedSignatureInput {
-            state_reader_results: psy_vm::ups::state_reader::StateReaderResults {
-                state: Default::default(),
-                state_cmds: Vec::new(),
-                merkel_proofs: Vec::new(),
-            },
+            state_reader_results: empty_state_reader(),
             circuit_inputs: Vec::new(),
+            sig_data: empty_sig_data(),
+            sign_context: empty_sign_context(),
+            start_session_user_leaf: PsyUserLeaf::default(),
+            nonce: GF::ZERO,
         };
 
         let context =

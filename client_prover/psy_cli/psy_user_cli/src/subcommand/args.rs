@@ -541,20 +541,26 @@ pub struct GenerateBatchProofMinerRewardProofsArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct ClaimRewardsArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env)]
     pub rpc_config: String,
+    #[clap(long, env, help = "Approved setup JSON shared with services: network_config and circuit_set canonical hex, reviewed sources, and optional opaque archive withdrawal_policies metadata.")]
+    pub aggregate_config: String,
+    #[clap(long, env, help = "psy-services URL")]
+    pub services_url: String,
+    #[clap(long, env, help = "Ethereum reward recipient address")]
+    pub recipient: String,
+    #[clap(long, env, help = "Reward owner user id on L2")]
+    pub user_id: u64,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
-    /// Path to JSON file containing job IDs
-    #[clap(long, default_value = "worker.backup")]
+    #[clap(long, default_value = "worker.backup", help = "Path to JSON file containing job IDs")]
     pub jobs_file: String,
-    /// Write a versioned, reusable JSON reward summary to this path.
-    #[clap(long)]
-    pub summary_output: Option<String>,
-    /// Generate the reward summary without loading a wallet or submitting a
-    /// transaction.
-    #[clap(long, requires = "summary_output")]
-    pub summary_only: bool,
+    #[clap(long, env, help = "Ethereum JSON-RPC used to read the configured payer root")]
+    pub l1_rpc_url: String,
+    #[clap(long, env, help = "Fixed hexadecimal block tag for the payer root read")]
+    pub l1_block: String,
+    #[clap(long, env, help = "Path to one reward consumption state file, outside keystore storage")]
+    pub consumed_state: String,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]

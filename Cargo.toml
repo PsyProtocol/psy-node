@@ -118,6 +118,7 @@ tokio-reactor-trait = "2"
 tokio-util = "0.7"
 futures = "0.3.0"
 futures-util = "0.3.28"
+fs2 = "0.4"
 async-nats = "0.43.1"
 
 # ---- Networking / HTTP ----

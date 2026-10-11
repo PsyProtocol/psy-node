@@ -18,6 +18,7 @@ plonky2 = { workspace = true }
 tracing = { workspace = true }
 ts-rs = { workspace = true }
 thiserror = { workspace = true }
+tiny-keccak = { workspace = true }
 
 psy_client_common = { workspace = true }
 psy_config = { workspace = true }

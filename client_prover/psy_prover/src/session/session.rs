@@ -6744,6 +6744,7 @@ pub(crate) mod offline_trace_pipeline_tests {
             user_tree_root: user_tree.get_root(),
             withdrawal_tree_root: qhash_seed(522),
             user_registration_tree_root: qhash_seed(523),
+            validator_tree_root: psy_client_data::qdata::checkpoint::empty_validator_tree_root(),
         };
         let mut checkpoint_leaf = PsyCheckpointLeaf::<F>::default();
         checkpoint_leaf.global_chain_root = global_state_roots.qfhash::<PsyHasher>();
