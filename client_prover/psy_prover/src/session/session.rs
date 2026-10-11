@@ -79,8 +79,8 @@ use psy_vm::{
         vm::def::{derive_state_tree_height, DPNFunctionCircuitDefinition},
     },
     ups::{
-        circuit_manager::UPSCircuitManager, sd_key::SDKeyCircuitWitnessInput, signature::Plonky2SoftwareDefinedSignatureInput,
-        state_reader::StateReader,
+        circuit_manager::UPSCircuitManager, multisig::{MultisigAccount, MultisigSignatureWitness, MultisigSignatures}, sd_key::SDKeyCircuitWitnessInput, signature::Plonky2SoftwareDefinedSignatureInput,
+        state_reader::{StateReader, StateReaderResults},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1506,6 +1506,7 @@ pub struct TraceBuildSession<'a> {
     trace_arena: TraceArenaBuilder,
     ups_start_witness_input: psy_client_data::ups::start_step::UPSStartStepInput<F>,
     ups_start_registration_proof: Option<psy_crypto::hash::merkle::core::MerkleProofCore<QHashOut<F>>>,
+    multisig_start_state: Option<StateReaderResults<F>>,
 }
 impl<'a> TraceBuildSession<'a> {
     pub async fn add_external_proof(
@@ -1612,6 +1613,8 @@ impl<'a> TraceBuildSession<'a> {
         };
         let (sign_circuit_source, zksign_fingerprint) = if let Some(source) = builtin_source {
             (source, pk_info.fingerprint)
+        } else if self.wallet_session.wallet.get_multisig_user(&self.public_key).is_ok() {
+            (TraceSignCircuitSource::Multisig, pk_info.fingerprint)
         } else if self.wallet_session.wallet.has_psy_software_defined_circuit(&pk_info.fingerprint) {
             let sdc = self
                 .wallet_session
@@ -1663,6 +1666,27 @@ impl<'a> TraceBuildSession<'a> {
                 Vec::new(),
                 AltVerifierOnlyCircuitData::from(&circuit_manager.eth_personal_secp_circuit_verifier_config().await?),
             ),
+            TraceSignCircuitSource::Multisig => {
+                let user = self.wallet_session.wallet.get_multisig_user(&self.public_key)?;
+                let start_state = self.multisig_start_state.take()
+                    .ok_or_else(|| anyhow::anyhow!("multisig START state snapshot missing"))?;
+                let end_state = WalletSession::build_multisig_state(user.account().contract_id, user_session_mgr, false).await?;
+                let (sig_data, sign_context, start_session_user_leaf) =
+                    psy_vm::ups::signature::sig_hash_fields_from_header_poseidon(&user_session_mgr.get_current_ups_header(), nonce);
+                let witness = MultisigSignatureWitness {
+                    account: user.account().clone(),
+                    start_state,
+                    end_state,
+                    sig_data,
+                    sign_context,
+                    start_session_user_leaf,
+                    nonce,
+                };
+                WalletSession::validate_multisig_witness(&witness)?;
+                let circuit = self.wallet_session.wallet.get_multisig_circuit()?;
+                anyhow::ensure!(circuit.get_fingerprint() == pk_info.fingerprint, "multisig fingerprint mismatch");
+                (serde_json::to_vec(&witness)?, AltVerifierOnlyCircuitData::from(circuit.get_verifier_config_ref()))
+            }
             TraceSignCircuitSource::PsySoftwareDefined { .. } => {
                 let sign_context = self
                     .wallet_session
@@ -2740,6 +2764,22 @@ impl WalletSession {
         tracing::info!("{} user `{}` registered", label, public_key);
         Ok(public_key)
     }
+    pub async fn register_multisig_user(&mut self, account: MultisigAccount) -> anyhow::Result<QHashOut<F>> {
+        let pk_info = self.wallet.register_multisig_user(account)?;
+        self.register_external_pk_info_on_chain(pk_info, "multisig").await
+    }
+
+    pub async fn add_multisig_user(&mut self, account: MultisigAccount) -> anyhow::Result<QHashOut<F>> {
+        let pk_info = self.wallet.register_multisig_user(account)?;
+        let public_key = pk_info.qfhash::<PsyHasher>();
+        let user_id = self.resolve_registered_user_id(public_key).await?;
+        self.update_circuit_mgr_for_user_id(public_key, user_id).await?;
+        Ok(public_key)
+    }
+
+    pub async fn inject_multisig_signatures(&mut self, public_key: QHashOut<F>, signatures: MultisigSignatures) -> anyhow::Result<QHashOut<F>> {
+        self.wallet.inject_multisig_signatures(public_key, signatures)
+    }
 
     pub async fn add_user(&mut self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> anyhow::Result<QHashOut<F>> {
         let pk_info = self.wallet.get_or_create_user(private_key, fingerprint).await?;
@@ -3044,7 +3084,15 @@ impl WalletSession {
     }
 
     pub async fn begin_trace_build(&self, public_key: QHashOut<F>) -> anyhow::Result<TraceBuildSession<'_>> {
-        let mut user_session_mgr = self.build_transaction_preview_session(public_key).await?;
+        let user_session_mgr = self.build_transaction_preview_session(public_key).await?;
+        self.build_trace_session(public_key, user_session_mgr).await
+    }
+
+    async fn build_trace_session(
+        &self,
+        public_key: QHashOut<F>,
+        mut user_session_mgr: UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>,
+    ) -> anyhow::Result<TraceBuildSession<'_>> {
         let setup_result = async {
             let ups_start_witness_input = user_session_mgr.get_ups_start_witness().await?;
             let ups_start_registration_proof: Option<psy_crypto::hash::merkle::core::MerkleProofCore<QHashOut<F>>> =
@@ -3069,6 +3117,10 @@ impl WalletSession {
         }
         .await;
         let (ups_start_witness_input, ups_start_registration_proof) = setup_result?;
+        let multisig_start_state = match self.wallet.get_multisig_user(&public_key) {
+            Ok(user) => Some(Self::build_multisig_state(user.account().contract_id, &mut user_session_mgr, true).await?),
+            Err(_) => None,
+        };
         Ok(TraceBuildSession {
             wallet_session: self,
             public_key,
@@ -3076,6 +3128,7 @@ impl WalletSession {
             trace_arena: TraceArenaBuilder::new(),
             ups_start_witness_input,
             ups_start_registration_proof,
+            multisig_start_state,
         })
     }
 
@@ -3616,6 +3669,11 @@ impl WalletSession {
             crate::trace::TraceSignCircuitSource::ZkBuiltin
             | crate::trace::TraceSignCircuitSource::SecpBuiltin
             | crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin => Ok(()),
+            crate::trace::TraceSignCircuitSource::Multisig => {
+                let circuit = self.wallet.get_multisig_circuit()?;
+                anyhow::ensure!(circuit.get_fingerprint() == fingerprint, "multisig trace fingerprint mismatch");
+                Ok(())
+            }
             crate::trace::TraceSignCircuitSource::PsySoftwareDefined {
                 circuit_def,
                 force_four_align,
@@ -3719,6 +3777,82 @@ impl WalletSession {
             start_contract_state_tree_root,
             checkpoint_tree_root,
         ))
+    }
+    fn validate_multisig_witness(witness: &MultisigSignatureWitness) -> anyhow::Result<()> {
+        witness.policies()?;
+        Ok(())
+    }
+
+    fn multisig_context_from_trace(
+        &self,
+        step: &crate::trace::ZkSignStep,
+        trace: &crate::trace::TxTrace,
+        header: &UserProvingSessionHeader<F>,
+    ) -> anyhow::Result<SignContext> {
+        let witness: MultisigSignatureWitness = serde_json::from_slice(&step.sign_witness)?;
+        Self::validate_multisig_witness(&witness)?;
+        let (sig_data, sign_context, start_leaf) =
+            psy_vm::ups::signature::sig_hash_fields_from_header_poseidon(header, trace.finalization.nonce);
+        anyhow::ensure!(
+            witness.sig_data == sig_data && witness.sign_context == sign_context
+                && witness.start_session_user_leaf == start_leaf && witness.nonce == trace.finalization.nonce,
+            "multisig witness does not match trace header"
+        );
+        anyhow::ensure!(witness.account.public_key_param()? == step.public_key_param, "multisig trace account parameter mismatch");
+        anyhow::ensure!(
+            PsyHasher::q_two_to_one(step.fingerprint, step.public_key_param) == trace.meta.public_key,
+            "multisig trace public key mismatch"
+        );
+        self.trace_sign_verifier(step)?;
+        Ok(SignContext::new(step.fingerprint).with_multisig_signature_witness(witness))
+    }
+
+    fn trace_sign_verifier(&self, step: &crate::trace::ZkSignStep) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        let verifier = step.sign_verifier_data_alt.to_verifier_data::<C, D>();
+        if matches!(step.sign_circuit_source, crate::trace::TraceSignCircuitSource::Multisig) {
+            let circuit = self.wallet.get_multisig_circuit()?;
+            anyhow::ensure!(circuit.get_fingerprint() == step.fingerprint, "multisig verifier fingerprint mismatch");
+            anyhow::ensure!(
+                bincode::serialize(&verifier)? == bincode::serialize(circuit.get_verifier_config_ref())?,
+                "multisig saved verifier differs from circuit"
+            );
+        }
+        Ok(verifier)
+    }
+
+    async fn build_multisig_state(
+        contract_id: u32,
+        user_session_mgr: &mut UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>,
+        start: bool,
+    ) -> anyhow::Result<StateReaderResults<F>> {
+        let header = user_session_mgr.get_current_ups_header();
+        let user_leaf = if start {
+            header.session_start_context.start_session_user_leaf.clone()
+        } else {
+            header.current_state.user_leaf.clone()
+        };
+        let state = UserContractState::new(
+            header.session_start_context.checkpoint_tree_root,
+            user_leaf,
+            QHashOut::default(),
+            F::from_canonical_u32(contract_id),
+            header.session_start_context.checkpoint_id,
+        );
+        let mut reader: StateReader<F, D, RpcProvider> = StateReader::new(
+            state,
+            user_session_mgr.require_lps()?.get_cmd_store().clone(),
+            user_session_mgr.require_lps()?.get_state_tree_store().clone(),
+        ).await;
+        for slot_index in 0..4 {
+            reader.get_self_user_current_contract_state_slot_hash(F::from_canonical_usize(slot_index)).await?;
+        }
+        let mut results = reader.to_results();
+        let slot_proof = results.merkel_proofs.get(1)
+            .ok_or_else(|| anyhow::anyhow!("multisig slot proof missing"))?;
+        anyhow::ensure!(slot_proof.siblings.len() == 4, "multisig contract requires CSTATE height 4");
+        results.state.start_contract_state_root = slot_proof.root;
+        psy_vm::ups::multisig::StoredMultisigPolicy::load(&results)?;
+        Ok(results)
     }
 
     async fn build_plonky2_software_defined_context(
@@ -5615,6 +5749,9 @@ impl WalletSession {
             crate::trace::TraceSignCircuitSource::ZkBuiltin
             | crate::trace::TraceSignCircuitSource::SecpBuiltin
             | crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin => SignContext::new(pk_info.fingerprint),
+            crate::trace::TraceSignCircuitSource::Multisig => {
+                self.multisig_context_from_trace(zs, trace, current_header)?
+            }
             crate::trace::TraceSignCircuitSource::PsySoftwareDefined { .. } => {
                 anyhow::ensure!(
                     !zs.sign_witness.is_empty(),
@@ -5817,7 +5954,7 @@ impl WalletSession {
                 zs.fingerprint,
                 zs.public_key_param,
                 signature_proof,
-                zs.sign_verifier_data_alt.to_verifier_data::<C, D>(),
+                self.trace_sign_verifier(&zs)?,
                 Some(zs.proof_tree_end_root),
             )
             .await?;
@@ -5935,6 +6072,9 @@ impl WalletSession {
             crate::trace::TraceSignCircuitSource::ZkBuiltin
             | crate::trace::TraceSignCircuitSource::SecpBuiltin
             | crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin => {}
+            crate::trace::TraceSignCircuitSource::Multisig => {
+                sign_context = self.multisig_context_from_trace(&zs, trace, &prev_header)?;
+            }
             crate::trace::TraceSignCircuitSource::PsySoftwareDefined { .. } => {
                 if !zs.sign_witness.is_empty() {
                     let signature_input: DPNSoftwareDefinedSignatureInput = bincode::deserialize(&zs.sign_witness)?;
@@ -6744,6 +6884,7 @@ pub(crate) mod offline_trace_pipeline_tests {
             user_tree_root: user_tree.get_root(),
             withdrawal_tree_root: qhash_seed(522),
             user_registration_tree_root: qhash_seed(523),
+            validator_tree_root: psy_client_data::qdata::checkpoint::empty_validator_tree_root(),
         };
         let mut checkpoint_leaf = PsyCheckpointLeaf::<F>::default();
         checkpoint_leaf.global_chain_root = global_state_roots.qfhash::<PsyHasher>();
@@ -6941,6 +7082,7 @@ pub(crate) mod offline_trace_pipeline_tests {
             trace_arena: TraceArenaBuilder::new(),
             ups_start_witness_input,
             ups_start_registration_proof: None,
+            multisig_start_state: None,
         })
     }
 

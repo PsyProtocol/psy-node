@@ -161,6 +161,7 @@ pub struct DogePsySignatureCombinedHashGadget {
     pub compressed_public_key: [Target; 9],
     pub message_hash: HashOutTarget,
     pub combined_hash: HashOutTarget,
+    pub public_key_hash: HashOutTarget,
 }
 impl DogePsySignatureCombinedHashGadget {
     pub fn add_virtual_to<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>) -> Self {
@@ -181,6 +182,7 @@ impl DogePsySignatureCombinedHashGadget {
             compressed_public_key,
             message_hash,
             combined_hash,
+            public_key_hash: hash_public_key,
         }
     }
 
@@ -218,6 +220,7 @@ pub struct Secp256K1Gadget {
     pub signature_r_target: BigUintTarget,
     pub signature_s_target: BigUintTarget,
     pub combined_hash: HashOutTarget,
+    pub public_key_hash: HashOutTarget,
 }
 
 impl Secp256K1Gadget {
@@ -300,6 +303,7 @@ impl Secp256K1Gadget {
             signature_r_target,
             signature_s_target,
             combined_hash: combo_gadget.combined_hash,
+            public_key_hash: combo_gadget.public_key_hash,
         }
     }
 

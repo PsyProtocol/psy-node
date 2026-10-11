@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use anyhow::bail;
 use base64::Engine;
@@ -47,17 +47,18 @@ use psy_dpn_circuit::circuits::privacy::{
     shield_deposit_claim::{ShieldDepositClaimCircuit, ShieldDepositClaimInnerCircuit},
 };
 use psy_ups_circuit::signature::{
+    multisig::MultisigSignatureCircuit,
     sd_key::SDKeyCircuitGadget,
     software_defined::{DPNSoftwareDefinedSignatureGadget, Plonky2SoftwareDefinedSignatureGadget},
 };
-use psy_vm::ups::{circuit_manager::UPSCircuitManager, state_reader::StateReader};
+use psy_vm::ups::{circuit_manager::UPSCircuitManager, multisig::{MultisigAccount, MultisigSignatures}, state_reader::StateReader};
 
 use crate::signature::{
     context::SignContext,
     traits::{SignatureResult, SignatureUser},
     users::{
         EthPersonalSignSECP256K1User, ExternalEthPersonalSignUser, ExternalSecp256K1User, SDKeyUser, SECP256K1User, SoftwareDefinedDpnUser,
-        SoftwareDefinedPlonky2User, ZKUser,
+        MultisigUser, SoftwareDefinedPlonky2User, ZKUser,
     },
 };
 
@@ -227,6 +228,8 @@ pub fn get_public_key_info<F: RichField>(private_key: QHashOut<F>, fingerprint: 
 }
 pub struct PsyMemoryWallet {
     signature_users: DashMap<QHashOut<F>, Arc<dyn SignatureUser>>,
+    multisig_users: DashMap<QHashOut<F>, Arc<MultisigUser>>,
+    multisig_circuit: LazyLock<anyhow::Result<MultisigSignatureCircuit>>,
     local_circuits: PsyWalletLocalCircuits,
     circuit_manager: Vec<Box<dyn UPSCircuitManager<C, D> + Send + Sync>>,
     fallback_minifiers: FallbackMinifierCircuits,
@@ -588,6 +591,8 @@ impl PsyMemoryWallet {
     ) -> Self {
         Self {
             signature_users: DashMap::new(),
+            multisig_users: DashMap::new(),
+            multisig_circuit: LazyLock::new(MultisigSignatureCircuit::new),
             local_circuits,
             circuit_manager,
             fallback_minifiers: FallbackMinifierCircuits::default(),
@@ -597,6 +602,45 @@ impl PsyMemoryWallet {
 
     pub fn local_circuits(&self) -> &PsyWalletLocalCircuits {
         &self.local_circuits
+    }
+    pub fn get_multisig_circuit(&self) -> anyhow::Result<&MultisigSignatureCircuit> {
+        self.multisig_circuit
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("multisig circuit construction failed: {}", error))
+    }
+
+    pub fn register_multisig_user(&mut self, account: MultisigAccount) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user = Arc::new(MultisigUser::new(account)?);
+        let info = ZKPublicKeyInfo {
+            fingerprint: self.get_multisig_circuit()?.get_fingerprint(),
+            public_key_param: user.account().public_key_param()?,
+        };
+        let public_key = info.qfhash::<PsyHasher>();
+        if self.signature_users.contains_key(&public_key) {
+            let existing = self.get_multisig_user(&public_key)?;
+            anyhow::ensure!(existing.account().public_key_param()? == info.public_key_param, "multisig account identity mismatch");
+            return Ok(info);
+        }
+        self.multisig_users.insert(public_key, user.clone());
+        self.signature_users.insert(public_key, user);
+        Ok(info)
+    }
+
+    pub fn get_multisig_user(&self, public_key: &QHashOut<F>) -> anyhow::Result<Arc<MultisigUser>> {
+        self.multisig_users.get(public_key).map(|user| user.clone())
+            .ok_or_else(|| anyhow::anyhow!("wallet user `{}` is not multisig", public_key))
+    }
+
+    pub fn inject_multisig_signatures(
+        &mut self,
+        public_key: QHashOut<F>,
+        signatures: MultisigSignatures,
+    ) -> anyhow::Result<QHashOut<F>> {
+        let mut user = (*self.get_multisig_user(&public_key)?).clone();
+        user.inject_signatures(signatures)?;
+        self.multisig_users.insert(public_key, Arc::new(user.clone()));
+        self.signature_users.insert(public_key, Arc::new(user));
+        Ok(public_key)
     }
 
     pub fn fallback_private_note_inclusion_minifier_fingerprint(&self) -> QHashOut<F> {

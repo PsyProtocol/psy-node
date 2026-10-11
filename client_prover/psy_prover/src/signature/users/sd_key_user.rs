@@ -167,6 +167,10 @@ mod tests {
             .with_psy_signature_input(
                 psy_provider::request::DPNSoftwareDefinedSignatureInput {
                     cfc_input: Default::default(),
+                    sig_data: psy_client_data::qdata::ups_signature::PsyUserProvingSessionSignatureDataCompact::default(),
+                    sign_context: psy_client_data::qdata::user_contract_state::SignContext::default(),
+                    start_session_user_leaf: psy_client_data::qdata::user::PsyUserLeaf::default(),
+                    nonce: GoldilocksField::ZERO,
                 },
                 1,
                 2,

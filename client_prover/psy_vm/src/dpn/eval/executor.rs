@@ -1806,6 +1806,7 @@ mod burn_staked_balance_tests {
             checkpoint_id: 12,
             nonce: 0,
             user_public_key_hash: [0; 4],
+            session_proof_tree_root: [0; 4],
         };
         let mut executor = VmExecutor::new(InMemoryStateBackend::new());
         for amount in [0, 1, (1u64 << 60) - 1] {
@@ -2136,8 +2137,9 @@ mod tests {
         let mut writes = Vec::new();
         let mut counts = OpCounts::default();
         let mut results = Vec::new();
+        let mut user_balance = None;
         for (index, command) in commands.iter().enumerate() {
-            results.push(executor.process_state_command(command, index, &context(), &registers, &mut reads, &mut writes, &mut counts).unwrap().unwrap());
+            results.push(executor.process_state_command(command, index, &context(), &registers, &mut reads, &mut writes, &mut user_balance, &mut counts).unwrap().unwrap());
         }
         assert_eq!(results[0], vec![1, 2, 3, 4, 10, 11, 12, 13]);
         assert_eq!(results[1], vec![10, 11, 12, 13]);
@@ -2287,7 +2289,8 @@ mod tests {
         let mut reads = Vec::new();
         let mut writes = Vec::new();
         let mut counts = OpCounts::default();
-        executor.process_state_command(&command, 0, &context(), &registers, &mut reads, &mut writes, &mut counts).unwrap();
+        let mut user_balance = None;
+        executor.process_state_command(&command, 0, &context(), &registers, &mut reads, &mut writes, &mut user_balance, &mut counts).unwrap();
         assert!(!executor.write_overlay.contains_key(&(7, 8, 1)));
         assert_eq!(executor.write_overlay.get(&(7, 9, 1)), Some(&22));
         assert_eq!(writes[0].condition, true);
