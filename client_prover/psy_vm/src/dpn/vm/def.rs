@@ -142,4 +142,16 @@ mod tests {
         });
         assert!(!event_only.is_view_function());
     }
+
+    #[test]
+    fn derive_state_tree_height_handles_empty_ranges_imt_spans_and_saturation() {
+        assert_eq!(derive_state_tree_height(&[]), 4);
+        assert_eq!(derive_state_tree_height(&[definition(vec![])]), 4);
+        let range = definition(vec![DPNStateCmd::set_contract_state_slot_range(1, 7, vec![2, 3, 4])]);
+        assert_eq!(derive_state_tree_height(&[range]), 4);
+        let imt = definition(vec![DPNStateCmd::set_imt_contract_state_value(1, 8, 2, [0; 4], [1; 4])]);
+        assert!(derive_state_tree_height(&[imt]) >= 4);
+        let huge = definition(vec![DPNStateCmd::set_contract_state_slot_single(1, u64::MAX, 1)]);
+        assert_eq!(derive_state_tree_height(&[huge]), 64);
+    }
 }

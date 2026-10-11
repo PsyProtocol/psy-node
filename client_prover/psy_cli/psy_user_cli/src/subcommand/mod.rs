@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{command, Parser, Subcommand};
 use psy_client_common::args::{ExportKeyStoreArgs, ProverArgs, PsyFaucetServerArgs, WalletSessionArgs};
+use psy_provider::provider::{QUserRpcProvider, RpcProvider};
 
 pub mod args;
 pub mod compile;
@@ -10,10 +11,26 @@ pub mod contract_abi_upload;
 pub mod deploy_contract;
 pub mod faucet_server;
 pub mod local_prover;
-#[cfg(feature = "gnark-wrap")]
 pub mod prove_proxy;
 pub mod simulate;
 pub mod update_contract;
+
+/// Resolve the deployer user id for contract deploy/update commands: an
+/// explicit `--user-id` wins, otherwise the first user id registered for the
+/// wallet's public key hash is used.
+pub(crate) async fn resolve_deployer_user_id(
+    rpc_provider: &RpcProvider,
+    public_key_hash: psy_client_common::data::qhashout::QHashOut<psy_client_data::config::store_config::F>,
+    user_id: Option<u64>,
+) -> anyhow::Result<u64> {
+    if let Some(user_id) = user_id {
+        return Ok(user_id);
+    }
+    let existing_ids = rpc_provider.get_user_ids_for_public_key(public_key_hash).await?;
+    existing_ids.first().copied().ok_or_else(|| {
+        anyhow::anyhow!("no user id found for public key hash {}; run `register-user` first", public_key_hash)
+    })
+}
 
 cfg_if::cfg_if! {
     if #[cfg(not(target_arch = "wasm32"))] {
@@ -110,7 +127,6 @@ pub enum Commands {
 
     // local proving
     LocalProver(ProverArgs),
-    #[cfg(feature = "gnark-wrap")]
     ProveProxy(psy_client_common::args::ProveProxyArgs),
     FaucetServer(PsyFaucetServerArgs),
 

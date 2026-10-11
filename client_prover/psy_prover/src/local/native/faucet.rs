@@ -1,4 +1,12 @@
-use std::{env, str::FromStr, sync::Arc};
+use std::{
+    env,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
+    time::{Duration, Instant},
+};
 
 use base64::Engine;
 use dashmap::{DashMap, DashSet};
@@ -8,9 +16,14 @@ use psy_client_common::{
     args::{ContractCallArgs, ContractCallData},
     data::qhashout::QHashOut,
 };
-use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
+use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::qmetadata::QMetaDataStoreReaderSync};
+use psy_crypto::hash::traits::qhashable::QFieldHashable;
 
-use crate::session::WalletSession;
+use super::{
+    faucet_operators::{Lease, OperatorPool, Settle, Unavailable},
+    faucet_tasks::{complete_claim, ClaimGuard},
+};
+use crate::session::{EndCapSubmissionError, WalletSession};
 
 type C = PoseidonGoldilocksConfig;
 type F = <C as GenericConfig<D>>::F;
@@ -93,11 +106,14 @@ struct PsyFaucetService {
     // `&self`, and the per-user state lives in DashMaps keyed by operator
     // public key. Concurrent claims for different operators touch disjoint
     // entries, so a shared `Arc<WalletSession>` lets them prove in parallel.
-    // Same-operator mutual exclusion is handled by `operator_locks` below.
+    // Same-operator mutual exclusion is handled by `operator_pool` below.
     wallet_session: Arc<WalletSession>,
     claim_records: DashMap<(u64, u64), PsyFaucetClaimRecord>,
-    recipient_locks: Arc<dashmap::DashSet<u64>>,
-    operator_locks: Arc<dashmap::DashSet<u64>>,
+    recipient_locks: DashSet<u64>,
+    operator_pool: OperatorPool<QHashOut<F>>,
+    // How long a claim waits for an operator before answering "busy".
+    operator_wait: Duration,
+    claim_counter: AtomicU64,
     window_checkpoints: u64,
     turnstile_secret: Option<String>,
     require_turnstile: bool,
@@ -195,11 +211,15 @@ impl PsyFaucetService {
         let turnstile_allowed_hostnames = parse_csv_env("PSY_FAUCET_TURNSTILE_ALLOWED_HOSTNAMES");
         let window_checkpoints = parse_u64_env("PSY_FAUCET_WINDOW_CHECKPOINTS", 120)?;
         anyhow::ensure!(window_checkpoints > 0, "PSY_FAUCET_WINDOW_CHECKPOINTS must be > 0");
+        let operator_wait = Duration::from_secs(parse_u64_env("PSY_FAUCET_OPERATOR_WAIT_SECS", 30)?);
+        let settle_timeout = Duration::from_secs(parse_u64_env("PSY_FAUCET_SETTLE_TIMEOUT_SECS", 120)?);
 
         // Faucet is now a standalone RPC service. Keep rpc_config.prove_proxy_url
         // intact so WalletSession can send CPU-heavy proving work to stateless
         // prove-proxy replicas instead of proving locally.
         let mut wallet_session = WalletSession::new(&rpc_config).await?;
+        // Claims prove on the blocking pool (see submit_with_operator).
+        wallet_session.sign_while_finalizing = true;
         let allowed_contract_ids: Vec<u64> = config
             .sd_key_allowed_contract_ids
             .clone()
@@ -251,23 +271,65 @@ impl PsyFaucetService {
             turnstile_action = ?turnstile_action,
             turnstile_allowed_hostnames = ?turnstile_allowed_hostnames,
             prove_proxy_urls = ?rpc_config.prove_proxy_url,
+            operator_wait_secs = operator_wait.as_secs(),
+            settle_timeout_secs = settle_timeout.as_secs(),
             "psy faucet server mode enabled"
         );
 
-        Ok(Some(Arc::new(Self {
+        let operator_pool = OperatorPool::new(operators.len(), settle_timeout);
+        let service = Arc::new(Self {
             config,
             operators,
             wallet_session: Arc::new(wallet_session),
             claim_records: DashMap::new(),
-            recipient_locks: Arc::new(DashSet::new()),
-            operator_locks: Arc::new(DashSet::new()),
+            recipient_locks: DashSet::new(),
+            operator_pool,
+            operator_wait,
+            claim_counter: AtomicU64::new(0),
             window_checkpoints,
             turnstile_secret,
             require_turnstile,
             turnstile_action,
             turnstile_allowed_hostnames,
             http_client: reqwest::Client::new(),
-        })))
+        });
+        tokio::spawn(settle_loop(Arc::downgrade(&service)));
+        Ok(Some(service))
+    }
+
+    // Returns operators whose submitted End Cap is now on chain (or overdue)
+    // to the rotation. Runs for the life of the service.
+    async fn settle_pending_operators(&self) {
+        for (index, pending) in self.operator_pool.pending() {
+            let operator = &self.operators[index];
+            let on_chain = match self.operator_leaf_hash(operator.user_id).await {
+                Ok(hash) => Some(hash),
+                Err(err) => {
+                    tracing::warn!(operator_user_id = operator.user_id, error = %err, "faucet operator leaf read failed");
+                    None
+                }
+            };
+            if let Some(outcome) = self.operator_pool.settle(index, pending, on_chain, Instant::now()) {
+                let settle_ms = pending.submitted_at.elapsed().as_millis() as u64;
+                match outcome {
+                    Settle::Included => {
+                        tracing::info!(operator_user_id = operator.user_id, settle_ms, "faucet operator settled")
+                    }
+                    Settle::TimedOut => tracing::warn!(
+                        operator_user_id = operator.user_id,
+                        settle_ms,
+                        "faucet operator End Cap not seen on chain before the settle timeout; returning it to rotation"
+                    ),
+                }
+            }
+        }
+    }
+
+    async fn operator_leaf_hash(&self, user_id: u64) -> anyhow::Result<QHashOut<F>> {
+        let provider = self.wallet_session.st_provider.with_user_id_owned(user_id);
+        let checkpoint_id = provider.get_latest_block_state().await?.checkpoint_id;
+        let leaf = provider.get_user_leaf_data(checkpoint_id, user_id).await?;
+        Ok(leaf.qfhash::<PsyHasher>())
     }
 
     fn public_config(&self) -> PsyFaucetPublicConfig {
@@ -341,42 +403,33 @@ impl PsyFaucetService {
     }
 }
 
-struct DashSetEntryGuard<T: Copy + Eq + std::hash::Hash>(Arc<dashmap::DashSet<T>>, T);
-
-impl<T: Copy + Eq + std::hash::Hash> Drop for DashSetEntryGuard<T> {
-    fn drop(&mut self) {
-        self.0.remove(&self.1);
-    }
-}
-
 impl PsyFaucetService {
     // Turnstile-gated entry, used by the public web frontend and the hosted
     // wallet verification page.
     async fn claim(self: &Arc<Self>, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
         self.verify_turnstile(input.turnstile_token.as_deref(), input.turnstile_state.as_deref())
             .await?;
-        self.claim_for_recipient(input).await
+        let faucet = self.clone();
+        // HTTP cancellation must not abandon lock cleanup or the submission record.
+        // In particular, dropping a spawn_blocking handle does not stop its work.
+        complete_claim(async move {
+            let result = faucet.claim_for_recipient(input).await;
+            if let Err(error) = &result {
+                tracing::warn!(message = error.message(), "faucet claim task failed");
+            }
+            result
+        })
+        .await
+        .map_err(|_| rpc_error("faucet claim task failed; check claimable balance before retrying"))?
     }
 
     async fn claim_for_recipient(self: &Arc<Self>, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
         let recipient_user_id = input.recipient_user_id;
-        if !self.recipient_locks.insert(recipient_user_id) {
-            return Err(rpc_error("faucet claim already in progress for this recipient"));
+        if let Some(_guard) = ClaimGuard::acquire(&self.recipient_locks, recipient_user_id) {
+            self.claim_locked(input).await
+        } else {
+            Err(rpc_error("faucet claim already in progress for this recipient"))
         }
-        // The claim runs in a detached task that owns the lock guards: a client
-        // disconnect drops this RPC future but never the locks, so the
-        // recipient/operator mutex windows span the whole proving-and-submit
-        // work exactly once.
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let worker = Arc::clone(self);
-        tokio::spawn(async move {
-            let _recipient_guard = DashSetEntryGuard(Arc::clone(&worker.recipient_locks), recipient_user_id);
-            let result = worker.claim_locked(input).await;
-            let _ = result_tx.send(result);
-        });
-        result_rx
-            .await
-            .map_err(|_| rpc_error("faucet claim task terminated"))?
     }
 
     async fn claim_locked(&self, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
@@ -405,27 +458,58 @@ impl PsyFaucetService {
             .faucet_per_claim_amount
             .parse::<u64>()
             .map_err(|err| rpc_error_with_data("invalid faucet amount", err.to_string()))?;
-        let start_index = if self.operators.is_empty() {
+        if self.operators.is_empty() {
             return Err(rpc_error("no faucet operators configured"));
-        } else {
-            (input.recipient_user_id as usize) % self.operators.len()
-        };
+        }
 
+        let claim_id = self.claim_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut excluded: Vec<usize> = Vec::new();
         let mut last_already_claimed: Option<String> = None;
-        let mut last_error: Option<String> = None;
-        let mut tried_operator = false;
-        for offset in 0..self.operators.len() {
-            let operator = &self.operators[(start_index + offset) % self.operators.len()];
-            if !self.operator_locks.insert(operator.user_id) {
-                continue;
+        let mut stale_retries = 0;
+        loop {
+            let wait_started = Instant::now();
+            let mut lease = match self.acquire_operator(&excluded).await {
+                Ok(lease) => lease,
+                Err(_) if last_already_claimed.is_some() => {
+                    return Err(rpc_error_with_data(
+                        "faucet already claimed in the current window",
+                        last_already_claimed.unwrap_or_default(),
+                    ));
+                }
+                Err(_) => return Err(rpc_error("all faucet operators are busy; retry shortly")),
+            };
+            let wait_ms = wait_started.elapsed().as_millis() as u64;
+            let index = lease.index();
+            let operator = &self.operators[index];
+            let started = Instant::now();
+            tracing::info!(claim_id, operator_user_id = operator.user_id, wait_ms, "faucet operator acquired");
+            let (timings, submit_result) = self.submit_with_operator(operator, input.recipient_user_id, amount).await;
+            let failure = submit_result.as_ref().err().map(|err| classify_failure(err));
+            if let Some(end_user_leaf_hash) = match (&submit_result, &failure) {
+                (Ok(end_user_leaf_hash), _) => Some(*end_user_leaf_hash),
+                (Err(_), Some(Failure::Submission { end_user_leaf_hash })) => Some(*end_user_leaf_hash),
+                _ => None,
+            } {
+                lease.mark_submitted(end_user_leaf_hash);
             }
-            tried_operator = true;
-            let _operator_guard = DashSetEntryGuard(Arc::clone(&self.operator_locks), operator.user_id);
+            drop(lease);
+            tracing::info!(
+                claim_id,
+                recipient_user_id = input.recipient_user_id,
+                operator_user_id = operator.user_id,
+                wait_ms,
+                session_ms = timings.session_ms,
+                contract_ms = timings.contract_ms,
+                sign_submit_ms = timings.sign_submit_ms,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                success = submit_result.is_ok(),
+                failure = failure.as_ref().map(Failure::kind),
+                "faucet operator released"
+            );
 
-            let submit_result = self.submit_with_operator(operator, input.recipient_user_id, amount).await;
-
-            match submit_result {
-                Ok(tx_hash) => {
+            let err = match submit_result {
+                Ok(end_user_leaf_hash) => {
+                    let tx_hash = end_user_leaf_hash.to_string();
                     let record = PsyFaucetClaimRecord {
                         tx_hash: tx_hash.clone(),
                         operator_user_id: operator.user_id,
@@ -441,48 +525,140 @@ impl PsyFaucetService {
                         already_submitted: false,
                     });
                 }
-                Err(err) if is_already_claimed_error(&err) => {
-                    last_already_claimed = Some(err);
-                    continue;
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+            match failure {
+                _ if is_already_claimed_error(&message) => {
+                    last_already_claimed = Some(message);
+                    excluded.push(index);
                 }
-                Err(err) => {
-                    last_error = Some(err);
-                    break;
+                // Nothing reached the edge, so another operator can safely
+                // take the claim.
+                Some(Failure::StaleBeforeSubmit) if stale_retries < MAX_STALE_RETRIES => {
+                    stale_retries += 1;
+                    excluded.push(index);
                 }
+                _ => return Err(rpc_error_with_data("faucet operator submit failed", message)),
             }
         }
-
-        if let Some(err) = last_error {
-            return Err(rpc_error_with_data("faucet operator submit failed", err));
-        }
-        if !tried_operator {
-            return Err(rpc_error("all faucet operators are busy; retry shortly"));
-        }
-        Err(rpc_error_with_data(
-            "faucet already claimed in the current window",
-            last_already_claimed.unwrap_or_else(|| "all faucet operators are busy".to_string()),
-        ))
     }
 
-    async fn submit_with_operator(&self, operator: &PsyFaucetOperator, recipient_user_id: u64, amount: u64) -> Result<String, String> {
+    // Waits up to `operator_wait` for an idle, settled operator. Operators in
+    // `excluded` already failed this claim and are never retried.
+    async fn acquire_operator(&self, excluded: &[usize]) -> Result<Lease<'_, QHashOut<F>>, Unavailable> {
+        let deadline = Instant::now() + self.operator_wait;
+        loop {
+            match self.operator_pool.try_acquire(excluded) {
+                Ok(lease) => return Ok(lease),
+                Err(unavailable) if excluded.len() >= self.operators.len() || Instant::now() >= deadline => return Err(unavailable),
+                Err(_) => tokio::time::sleep(OPERATOR_POLL_INTERVAL).await,
+            }
+        }
+    }
+
+    async fn submit_with_operator(
+        &self,
+        operator: &PsyFaucetOperator,
+        recipient_user_id: u64,
+        amount: u64,
+    ) -> (PhaseTimings, anyhow::Result<QHashOut<F>>) {
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id: self.config.faucet_contract_id,
             method_name: self.config.faucet_method_name.clone(),
             inputs: vec![recipient_user_id, amount],
         }]);
 
-        // Proving is CPU-bound and `exec_contract_call` runs it inline (no
-        // internal spawn_blocking, unlike the dedicated prove_* RPCs). Drive it
-        // on the blocking pool so several concurrent operator claims don't
-        // saturate the async worker threads and stall the jsonrpsee event loop.
+        // Proving is CPU-bound and the session runs it inline (no internal
+        // spawn_blocking, unlike the dedicated prove_* RPCs). Drive it on the
+        // blocking pool so several concurrent operator claims don't saturate
+        // the async worker threads and stall the jsonrpsee event loop.
         let session = self.wallet_session.clone();
         let public_key = operator.public_key;
         let handle = tokio::runtime::Handle::current();
-        let tx_hash = tokio::task::spawn_blocking(move || handle.block_on(session.exec_contract_call(public_key, call_data)))
+        tokio::task::spawn_blocking(move || handle.block_on(run_contract_call(&session, public_key, call_data)))
             .await
-            .map_err(|join_err| format!("faucet submit task panicked: {join_err}"))?
-            .map_err(|err| err.to_string())?;
-        Ok(tx_hash.to_string())
+            .unwrap_or_else(|join_err| (PhaseTimings::default(), Err(anyhow::anyhow!("faucet submit task panicked: {join_err}"))))
+    }
+}
+
+const MAX_STALE_RETRIES: usize = 2;
+const OPERATOR_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+async fn settle_loop(service: Weak<PsyFaucetService>) {
+    loop {
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+        let Some(service) = service.upgrade() else { return };
+        service.settle_pending_operators().await;
+    }
+}
+
+#[derive(Debug, Default)]
+struct PhaseTimings {
+    session_ms: u64,
+    contract_ms: u64,
+    sign_submit_ms: u64,
+}
+
+// The steps of `WalletSession::exec_contract_call`, timed one by one.
+async fn run_contract_call(
+    session: &WalletSession,
+    public_key: QHashOut<F>,
+    call_data: ContractCallData,
+) -> (PhaseTimings, anyhow::Result<QHashOut<F>>) {
+    let mut timings = PhaseTimings::default();
+    let mut lap = Instant::now();
+    let mut elapsed = || {
+        let ms = lap.elapsed().as_millis() as u64;
+        lap = Instant::now();
+        ms
+    };
+    if let Err(err) = session.start_session(public_key).await {
+        timings.session_ms = elapsed();
+        return (timings, Err(err));
+    }
+    timings.session_ms = elapsed();
+    if let Err(err) = session.prove_contract_call(public_key, call_data.contract_calls).await {
+        timings.contract_ms = elapsed();
+        return (timings, Err(err));
+    }
+    timings.contract_ms = elapsed();
+    let result = session.sign_and_submit(public_key, call_data.software_defined_call).await;
+    timings.sign_submit_ms = elapsed();
+    (timings, result)
+}
+
+enum Failure {
+    // Rejected by our own checks before anything was sent: the operator's
+    // chain state moved while this claim was proved.
+    StaleBeforeSubmit,
+    // The End Cap may have reached the edge.
+    Submission { end_user_leaf_hash: QHashOut<F> },
+    Other,
+}
+
+impl Failure {
+    fn kind(&self) -> &'static str {
+        match self {
+            Failure::StaleBeforeSubmit => "stale_before_submit",
+            Failure::Submission { .. } => "submission",
+            Failure::Other => "other",
+        }
+    }
+}
+
+fn classify_failure(err: &anyhow::Error) -> Failure {
+    if let Some(submission) = err.downcast_ref::<EndCapSubmissionError>() {
+        return Failure::Submission {
+            end_user_leaf_hash: submission.end_user_leaf_hash,
+        };
+    }
+    let message = format!("{err:#}").to_ascii_lowercase();
+    if message.contains("stale") || message.contains("another similar tx") {
+        Failure::StaleBeforeSubmit
+    } else {
+        Failure::Other
     }
 }
 
@@ -516,5 +692,714 @@ impl PsyFaucetRpcServer for PsyFaucetServerProvider {
 
     async fn claim_faucet(&self, input: PsyFaucetClaimRequest) -> Result<PsyFaucetClaimResponse, ErrorObjectOwned> {
         self.faucet.claim(input).await
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    use psy_client_data::config::store_config::PsyHasher;
+    use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::zk::data::ZKPublicKeyInfo};
+    use psy_ups_circuit::signature::sd_key::get_sd_key_public_key_param;
+
+    use super::*;
+
+    static FAUCET_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_faucet_env() -> MutexGuard<'static, ()> {
+        FAUCET_ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    const FAUCET_ENV_NAMES: &[&str] = &[
+        "PSY_FAUCET_OPERATORS_JSON",
+        "PSY_FAUCET_OPERATORS_JSON_B64",
+        "PSY_FAUCET_TURNSTILE_SECRET",
+        "PSY_FAUCET_REQUIRE_TURNSTILE",
+        "PSY_FAUCET_TURNSTILE_ACTION",
+        "PSY_FAUCET_TURNSTILE_ALLOWED_HOSTNAMES",
+        "PSY_FAUCET_WINDOW_CHECKPOINTS",
+    ];
+
+    struct FaucetEnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl FaucetEnvGuard {
+        fn cleared() -> Self {
+            let previous = FAUCET_ENV_NAMES.iter().map(|&name| (name, env::var(name).ok())).collect();
+            for name in FAUCET_ENV_NAMES {
+                env::remove_var(name);
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for FaucetEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn test_network_config() -> psy_config::NetworkConfigGoldilocks {
+        serde_json::from_value(serde_json::json!({
+            "magic": format!("0x{:016X}", crate::PSY_NETWORK_MAGIC),
+            "users_per_realm": 8,
+            "global_user_tree_height": 8,
+            "realm_user_tree_height": 4,
+            "group_realm_height": 4,
+            "realm_configs": [],
+            "coordinator_configs": [],
+            "prove_proxy_url": [],
+            "faucet_rpc_url": [],
+            "nostr_relay_url": "ws://127.0.0.1:1",
+            "native_currency": "PSY",
+            "native_currency_decimal": 18,
+            "native_currency_name": "Psy",
+            "fees": {
+                "register_user_fee": 0,
+                "deploy_contract_fee": 0,
+                "guta_fee": 0,
+                "da_fee": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    fn valid_operators_json() -> serde_json::Value {
+        serde_json::json!({
+            "faucetContractId": 3,
+            "faucetMethodName": "claim",
+            "faucetMethodId": 4,
+            "faucetPerClaimAmount": "500",
+            "sdKeyExpectedTxCount": 2,
+            "operators": [{
+                "userId": "7",
+                "address": "address",
+                "privateKey": "key",
+                "fingerprint": "fingerprint",
+                "signType": "sd-key"
+            }]
+        })
+    }
+
+    fn env_name(suffix: &str) -> String {
+        format!("PSY_PROVER_FAUCET_TEST_{}_{}", std::process::id(), suffix)
+    }
+
+    #[test]
+    fn environment_parsers_handle_defaults_and_normalization() {
+        let bool_name = env_name("BOOL");
+        let number_name = env_name("NUMBER");
+        let csv_name = env_name("CSV");
+
+        env::remove_var(&bool_name);
+        env::remove_var(&number_name);
+        env::remove_var(&csv_name);
+        assert!(parse_bool_env(&bool_name, true));
+        assert_eq!(parse_u64_env(&number_name, 17).unwrap(), 17);
+        assert!(parse_csv_env(&csv_name).is_empty());
+
+        for truthy in ["1", " true ", "YES", "On"] {
+            env::set_var(&bool_name, truthy);
+            assert!(parse_bool_env(&bool_name, false));
+        }
+        env::set_var(&bool_name, "no");
+        assert!(!parse_bool_env(&bool_name, true));
+
+        env::set_var(&number_name, " 42 ");
+        assert_eq!(parse_u64_env(&number_name, 0).unwrap(), 42);
+        env::set_var(&number_name, " ");
+        assert_eq!(parse_u64_env(&number_name, 9).unwrap(), 9);
+        env::set_var(&number_name, "invalid");
+        assert!(parse_u64_env(&number_name, 0).is_err());
+
+        env::set_var(&csv_name, " One, two ,,THREE ");
+        assert_eq!(parse_csv_env(&csv_name), vec!["one", "two", "three"]);
+
+        env::remove_var(bool_name);
+        env::remove_var(number_name);
+        env::remove_var(csv_name);
+    }
+
+    #[test]
+    fn already_claimed_detection_is_case_insensitive_and_specific() {
+        assert!(is_already_claimed_error("Faucet already claimed"));
+        assert!(is_already_claimed_error("ALREADY CLAIMED FOR WINDOW 4"));
+        assert!(!is_already_claimed_error("operator is busy"));
+    }
+
+    #[test]
+    fn rpc_error_helpers_set_message_and_optional_data() {
+        let plain = rpc_error("plain failure");
+        assert_eq!(plain.code(), 1);
+        assert_eq!(plain.message(), "plain failure");
+        assert!(plain.data().is_none());
+
+        let detailed = rpc_error_with_data("detailed failure", "reason");
+        assert_eq!(detailed.code(), 1);
+        assert_eq!(detailed.message(), "detailed failure");
+        assert_eq!(detailed.data().map(|data| data.get()), Some("\"reason\""));
+    }
+
+    #[test]
+    fn request_and_turnstile_payloads_apply_serde_defaults() {
+        let request: PsyFaucetClaimRequest = serde_json::from_value(serde_json::json!({
+            "recipient_user_id": 8
+        }))
+        .unwrap();
+        assert_eq!(request.recipient_user_id, 8);
+        assert!(request.recipient_public_key.is_none());
+        assert!(request.turnstile_token.is_none());
+        assert!(request.turnstile_state.is_none());
+
+        let response: TurnstileVerifyResponse = serde_json::from_value(serde_json::json!({
+            "success": false,
+            "error-codes": ["invalid-input-response"]
+        }))
+        .unwrap();
+        assert!(!response.success);
+        assert_eq!(response.error_codes, vec!["invalid-input-response"]);
+        assert!(response.hostname.is_none());
+        assert!(response.action.is_none());
+        assert!(response.cdata.is_none());
+    }
+
+    #[test]
+    fn operator_config_accepts_sdk_key_expected_count_alias() {
+        let config: PsyFaucetOperatorsConfig = serde_json::from_value(serde_json::json!({
+            "faucetContractId": 3,
+            "faucetMethodName": "claim",
+            "faucetMethodId": 4,
+            "faucetPerClaimAmount": "500",
+            "sdkKeyExpectedTxCount": 2,
+            "operators": [{
+                "userId": "7",
+                "address": "address",
+                "privateKey": "key",
+                "fingerprint": "fingerprint",
+                "signType": "sd-key"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(config.faucet_contract_id, 3);
+        assert_eq!(config.faucet_method_name, "claim");
+        assert_eq!(config.faucet_method_id, 4);
+        assert_eq!(config.faucet_per_claim_amount, "500");
+        assert_eq!(config.sd_key_expected_tx_count, 2);
+        assert!(config.sd_key_allowed_contract_ids.is_none());
+        assert!(config.sd_key_allowed_method_ids.is_none());
+        assert_eq!(config.operators.len(), 1);
+        assert_eq!(config.operators[0].user_id, "7");
+        assert_eq!(config.operators[0].address, "address");
+        assert_eq!(config.operators[0].private_key, "key");
+        assert_eq!(config.operators[0].fingerprint, "fingerprint");
+        assert_eq!(config.operators[0].sign_type, "sd-key");
+    }
+
+    #[tokio::test]
+    async fn from_env_returns_none_when_faucet_is_not_configured() {
+        let _lock = lock_faucet_env();
+        let _env = FaucetEnvGuard::cleared();
+
+        assert!(PsyFaucetService::from_env(test_network_config()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn from_env_rejects_invalid_configuration_before_wallet_setup() {
+        let _lock = lock_faucet_env();
+        let _env = FaucetEnvGuard::cleared();
+
+        env::set_var("PSY_FAUCET_OPERATORS_JSON_B64", "not-base64!");
+        assert!(PsyFaucetService::from_env(test_network_config())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Invalid"));
+
+        env::remove_var("PSY_FAUCET_OPERATORS_JSON_B64");
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", "not-json");
+        assert!(PsyFaucetService::from_env(test_network_config()).await.is_err());
+
+        let mut config = valid_operators_json();
+        config["operators"] = serde_json::json!([]);
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", config.to_string());
+        assert!(PsyFaucetService::from_env(test_network_config())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("has no operators"));
+
+        let mut config = valid_operators_json();
+        config["faucetPerClaimAmount"] = serde_json::json!("  ");
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", config.to_string());
+        assert!(PsyFaucetService::from_env(test_network_config())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("faucetPerClaimAmount is empty"));
+
+        let mut config = valid_operators_json();
+        config["faucetPerClaimAmount"] = serde_json::json!("five hundred");
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", config.to_string());
+        assert!(PsyFaucetService::from_env(test_network_config()).await.is_err());
+
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", valid_operators_json().to_string());
+        env::set_var("PSY_FAUCET_REQUIRE_TURNSTILE", "true");
+        assert!(PsyFaucetService::from_env(test_network_config())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("requires PSY_FAUCET_TURNSTILE_SECRET"));
+
+        env::set_var("PSY_FAUCET_REQUIRE_TURNSTILE", "false");
+        env::set_var("PSY_FAUCET_WINDOW_CHECKPOINTS", "0");
+        assert!(PsyFaucetService::from_env(test_network_config())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("must be > 0"));
+    }
+
+    #[tokio::test]
+    async fn from_env_decodes_base64_configuration_before_validation() {
+        let _lock = lock_faucet_env();
+        let _env = FaucetEnvGuard::cleared();
+        let config = serde_json::json!({
+            "faucetContractId": 3,
+            "faucetMethodName": "claim",
+            "faucetMethodId": 4,
+            "faucetPerClaimAmount": "500",
+            "sdKeyExpectedTxCount": 2,
+            "operators": []
+        });
+        env::set_var(
+            "PSY_FAUCET_OPERATORS_JSON_B64",
+            base64::engine::general_purpose::STANDARD.encode(config.to_string()),
+        );
+
+        assert!(PsyFaucetService::from_env(test_network_config())
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("has no operators"));
+    }
+
+    #[tokio::test]
+    async fn faucet_server_provider_requires_operator_configuration() {
+        let _lock = lock_faucet_env();
+        let _env = FaucetEnvGuard::cleared();
+
+        let error = PsyFaucetServerProvider::new_with_config(test_network_config()).await.err().unwrap();
+        assert!(error.to_string().contains("PSY_FAUCET_OPERATORS_JSON"));
+    }
+
+    /// The per-operator identity checks run before any chain access: an
+    /// unsupported sign type is rejected first, then a config fingerprint that
+    /// differs from the deterministic sd-key circuit fingerprint of
+    /// (contract, method, tx count).
+    #[tokio::test]
+    async fn from_env_rejects_operator_identity_mismatches() {
+        let _lock = lock_faucet_env();
+        let _env = FaucetEnvGuard::cleared();
+
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", valid_operators_json().to_string());
+        let error = PsyFaucetService::from_env(crate::test_support::dead_network_config())
+            .await
+            .err()
+            .unwrap();
+        // the fixture's placeholder fingerprint never matches the computed
+        // sd-key fingerprint
+        assert!(error.to_string().contains("fingerprint mismatch"), "unexpected error: {error}");
+
+        let mut config = valid_operators_json();
+        config["operators"][0]["signType"] = serde_json::json!("secp256k1");
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", config.to_string());
+        let error = PsyFaucetService::from_env(crate::test_support::dead_network_config())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unsupported signType"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn from_env_builds_the_wallet_and_circuit_before_the_chain_lookup_fails() {
+        let _lock = lock_faucet_env();
+        let _env = FaucetEnvGuard::cleared();
+
+        // the sd-key circuit fingerprint is deterministic for a given
+        // (contract_ids, method_ids, tx_count) triple, so the shared offline
+        // session can precompute what from_env will register
+        let shared = crate::test_support::shared_offline_wallet_session().await;
+        let fingerprint = shared.write().register_sd_key_circuit(&[3], &[4], 2).await.unwrap();
+
+        let private_key = QHashOut::<F>::from_values(11, 12, 13, 14);
+        let address = ZKPublicKeyInfo {
+            fingerprint,
+            public_key_param: get_sd_key_public_key_param(&private_key),
+        }
+        .qfhash::<PsyHasher>()
+        .to_string();
+
+        let mut config = valid_operators_json();
+        config["operators"][0]["address"] = serde_json::json!(address);
+        config["operators"][0]["privateKey"] = serde_json::json!(private_key.to_string());
+        config["operators"][0]["fingerprint"] = serde_json::json!(fingerprint.to_string());
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", config.to_string());
+
+        // the offline session initializes, the sd-key circuit registers with a
+        // matching fingerprint, and the operator user lookup then fails on the
+        // dead RPC registration index
+        let error = PsyFaucetService::from_env(crate::test_support::dead_network_config())
+            .await
+            .err()
+            .unwrap();
+        let message = error.to_string();
+        assert!(
+            message.contains("not registered for explicit user_id") || message.contains("connection refused"),
+            "unexpected from_env failure: {message}"
+        );
+    }
+
+    fn offline_service(
+        wallet_session: Arc<WalletSession>,
+        turnstile_secret: Option<&str>,
+        require_turnstile: bool,
+        turnstile_action: Option<&str>,
+        turnstile_allowed_hostnames: &[&str],
+    ) -> PsyFaucetService {
+        let config: PsyFaucetOperatorsConfig = serde_json::from_value(valid_operators_json()).unwrap();
+        PsyFaucetService {
+            config,
+            operators: vec![PsyFaucetOperator {
+                user_id: 7,
+                public_key: QHashOut::ZERO,
+            }],
+            wallet_session,
+            claim_records: DashMap::new(),
+            recipient_locks: DashSet::new(),
+            operator_pool: OperatorPool::new(1, Duration::from_secs(120)),
+            operator_wait: Duration::ZERO,
+            claim_counter: AtomicU64::new(0),
+            window_checkpoints: 10,
+            turnstile_secret: turnstile_secret.map(str::to_string),
+            require_turnstile,
+            turnstile_action: turnstile_action.map(str::to_string),
+            turnstile_allowed_hostnames: turnstile_allowed_hostnames.iter().map(|hostname| hostname.to_string()).collect(),
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    fn claim_request(recipient_user_id: u64) -> PsyFaucetClaimRequest {
+        PsyFaucetClaimRequest {
+            recipient_user_id,
+            recipient_public_key: None,
+            turnstile_token: None,
+            turnstile_state: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn faucet_service_offline_claim_and_config_surfaces() {
+        let wallet_session = Arc::new(
+            WalletSession::new(&crate::test_support::dead_network_config())
+                .await
+                .expect("offline wallet session should initialize"),
+        );
+        let service = Arc::new(offline_service(wallet_session.clone(), None, false, None, &[]));
+
+        let public_config = service.public_config();
+        assert!(public_config.enabled);
+        assert_eq!(public_config.faucet_contract_id, 3);
+        assert_eq!(public_config.faucet_method_name, "claim");
+        assert_eq!(public_config.amount, "500");
+        assert_eq!(public_config.window_checkpoints, 10);
+        assert_eq!(public_config.operator_user_ids, vec![7]);
+        assert!(!public_config.turnstile_required);
+
+        // turnstile is skipped entirely when unconfigured and not required
+        assert!(service.verify_turnstile(None, None).await.is_ok());
+        assert!(service.verify_turnstile(Some("  "), None).await.is_ok());
+
+        // a recipient already mid-claim is rejected before any chain access
+        service.recipient_locks.insert(8);
+        let busy = service.claim_for_recipient(claim_request(8)).await.err().unwrap();
+        assert!(busy.message().contains("already in progress"));
+        assert!(service.recipient_locks.contains(&8));
+        service.recipient_locks.remove(&8);
+
+        // with the lock free, the claim proceeds until the dead-RPC checkpoint
+        // fetch fails
+        let checkpoint = service.claim(claim_request(8)).await.err().unwrap();
+        assert!(checkpoint.message().contains("failed to fetch latest checkpoint"));
+
+        // a configured secret without a token is rejected before any HTTP call
+        let secreted = offline_service(wallet_session.clone(), Some("secret"), true, None, &[]);
+        let missing = secreted.verify_turnstile(None, None).await.err().unwrap();
+        assert!(missing.message().contains("missing Turnstile token"));
+        let lenient = offline_service(wallet_session.clone(), Some("secret"), false, None, &[]);
+        assert!(lenient.verify_turnstile(None, None).await.is_ok());
+        // a configured-but-optional secret with a blank token skips the HTTP
+        // verification entirely
+        assert!(lenient.verify_turnstile(Some(" "), None).await.is_ok());
+
+        // required-but-unconfigured turnstile is rejected up front
+        let requiring = offline_service(wallet_session, None, true, None, &[]);
+        let unconfigured = requiring.verify_turnstile(None, None).await.err().unwrap();
+        assert!(unconfigured.message().contains("required but not configured"));
+
+        let rpc = PsyFaucetServerProvider { faucet: Arc::new(requiring) };
+        let config = rpc.get_psy_faucet_config().await.unwrap();
+        assert!(config.turnstile_required);
+        let error = rpc.claim_faucet(claim_request(9)).await.err().unwrap();
+        assert!(error.message().contains("required but not configured"));
+    }
+
+    /// `claim_locked` walks every branch once the checkpoint fetch succeeds:
+    /// the recorded-claim replay, the busy-operator bail-out, the failed
+    /// operator submit, and the no-operators guard. The loopback chain serves
+    /// the latest block state (checkpoint 33, window size 10 → window 3); the
+    /// fixture operator's zero key is unregistered, so its submit fails.
+    #[tokio::test]
+    async fn faucet_claim_paths_walk_every_branch_against_the_offline_chain() {
+        use crate::session::session::offline_trace_pipeline_tests as offline;
+
+        let (port, _rpc_seen, responses) = offline::spawn_offline_rpc().await;
+        let wallet_session = Arc::new(
+            WalletSession::new(&offline::loopback_network_config(port))
+                .await
+                .expect("offline wallet session should initialize"),
+        );
+        let chain = offline::build_offline_chain(
+            QHashOut::ZERO,
+            vec![offline::seeded_helper_contract(), offline::seeded_token_contract()],
+        );
+        offline::set_offline_responses(&responses, &chain).expect("offline chain rules must install");
+
+        let service = Arc::new(offline_service(wallet_session.clone(), None, false, None, &[]));
+
+        // a previously recorded claim for this window replays instead of
+        // re-submitting
+        service.claim_records.insert(
+            (8, 3),
+            PsyFaucetClaimRecord {
+                tx_hash: "recorded-tx".to_string(),
+                operator_user_id: 7,
+                amount: "500".to_string(),
+            },
+        );
+        let replayed = service.claim(claim_request(8)).await.unwrap();
+        assert!(replayed.already_submitted);
+        assert_eq!(replayed.tx_hash, "recorded-tx");
+        assert_eq!(replayed.window_id, 3);
+        assert_eq!(replayed.operator_user_id, 7);
+
+        // every operator already mid-submit: nothing is tried
+        let lease = service.operator_pool.try_acquire(&[]).unwrap();
+        let busy = service.claim_for_recipient(claim_request(9)).await.err().unwrap();
+        assert!(busy.message().contains("all faucet operators are busy"));
+        drop(lease);
+
+        // the unregistered operator key fails the contract call, surfacing as
+        // the operator-submit error
+        let failed = service.claim(claim_request(10)).await.err().unwrap();
+        assert!(failed.message().contains("faucet operator submit failed"));
+
+        // with no operators at all the service refuses up front
+        let mut empty_service = offline_service(wallet_session, None, false, None, &[]);
+        empty_service.operators.clear();
+        let empty = Arc::new(empty_service).claim(claim_request(11)).await.err().unwrap();
+        assert!(empty.message().contains("no faucet operators configured"));
+    }
+
+    /// A fully valid operator config boots the faucet against the offline
+    /// chain: `from_env` registers the sd-key circuit, resolves the operator
+    /// through the (shadowed) registration index, and `run_psy_faucet_server`
+    /// serves the public config RPC before the test aborts the server task.
+    #[tokio::test]
+    async fn from_env_boots_the_faucet_server_against_the_offline_chain() {
+        use psy_client_common::args::PsyFaucetServerArgs;
+
+        use crate::session::session::offline_trace_pipeline_tests as offline;
+
+        let _lock = lock_faucet_env();
+        let _env = FaucetEnvGuard::cleared();
+
+        let (port, _rpc_seen, responses) = offline::spawn_offline_rpc().await;
+
+        // the sd-key fingerprint is deterministic, so the shared offline
+        // session can precompute what from_env will register for
+        // contract 3 / method 4 / tx_count 2
+        let shared = crate::test_support::shared_offline_wallet_session().await;
+        let fingerprint = shared.write().register_sd_key_circuit(&[3], &[4], 2).await.unwrap();
+
+        let private_key = QHashOut::<F>::from_values(11, 12, 13, 14);
+        let public_key = ZKPublicKeyInfo {
+            fingerprint,
+            public_key_param: get_sd_key_public_key_param(&private_key),
+        }
+        .qfhash::<PsyHasher>();
+
+        let chain = offline::build_offline_chain(
+            public_key,
+            vec![offline::seeded_helper_contract(), offline::seeded_token_contract()],
+        );
+        offline::set_offline_responses(&responses, &chain).expect("offline chain rules must install");
+        offline::set_offline_chain_rpc_rules(&responses, &chain, public_key).expect("offline chain rpc rules must install");
+        // shadow the registration index: the operator key resolves to the
+        // fixture user, so add_user_with_user_id accepts the explicit hint
+        responses.lock().insert(
+            0,
+            offline::OfflineRpcRule {
+                method: "psy_get_user_ids_for_public_key".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": [offline::OFFLINE_USER_ID] }),
+            },
+        );
+
+        let mut config = valid_operators_json();
+        config["operators"][0]["userId"] = serde_json::json!("2");
+        config["operators"][0]["address"] = serde_json::json!(public_key.to_string());
+        config["operators"][0]["privateKey"] = serde_json::json!(private_key.to_string());
+        config["operators"][0]["fingerprint"] = serde_json::json!(fingerprint.to_string());
+        env::set_var("PSY_FAUCET_OPERATORS_JSON", config.to_string());
+
+        let network = serde_json::to_value(offline::loopback_network_config(port)).unwrap();
+        let file_config = serde_json::json!({ "networks": { "local": network }, "defaultNetwork": "local" });
+        let config_path = std::env::temp_dir().join(format!("psy-prover-faucet-live-{}.json", std::process::id()));
+        std::fs::write(&config_path, file_config.to_string()).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let faucet_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let args = PsyFaucetServerArgs {
+            listen_addr: format!("127.0.0.1:{faucet_port}"),
+            rpc_config: config_path.to_string_lossy().into_owned(),
+        };
+        let task = tokio::spawn(crate::run_psy_faucet_server(args));
+
+        // poll until the JSON-RPC service answers; that only happens once
+        // from_env built the faucet against the offline chain
+        let client = reqwest::Client::new();
+        let mut served = String::new();
+        for _ in 0..12 {
+            if task.is_finished() {
+                let result = task.await.expect("faucet server task panicked");
+                panic!("faucet server exited before serving its public config: {result:?}");
+            }
+            if let Ok(response) = client
+                .post(format!("http://127.0.0.1:{faucet_port}"))
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"psy_get_psy_faucet_config","params":[]}"#.to_string())
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if let Ok(body) = response.text().await {
+                    let is_public_config = body.contains("\"faucet_method_name\"");
+                    served = body;
+                    if is_public_config {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert!(served.contains("\"faucet_method_name\""), "faucet server should serve its public config, got: {}", served);
+        assert!(!task.is_finished());
+        task.abort();
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// A registered operator drives `claim` end-to-end against the offline
+    /// chain: a successful canned submit completes the claim and records it
+    /// for the window, while the chain's already-claimed rejection for a new
+    /// recipient surfaces through the already-claimed arm after proving.
+    #[tokio::test]
+    async fn faucet_claim_completes_and_reports_window_already_claimed() {
+        use crate::session::session::offline_trace_pipeline_tests as offline;
+
+        let (port, _rpc_seen, responses) = offline::spawn_offline_rpc().await;
+        let mut wallet_session = WalletSession::new(&offline::loopback_network_config(port)).await.expect("offline wallet session should initialize");
+        let pk_info = wallet_session
+            .wallet
+            .add_zk_private_key(QHashOut::from_values(931, 932, 933, 934))
+            .await
+            .unwrap();
+        let public_key = pk_info.qfhash::<PsyHasher>();
+
+        let chain = offline::build_offline_chain(
+            public_key,
+            vec![
+                offline::seeded_helper_contract(),
+                offline::seeded_token_contract(),
+                offline::seeded_faucet_contract(),
+            ],
+        );
+        offline::set_offline_responses(&responses, &chain).expect("offline chain rules must install");
+        offline::set_offline_chain_rpc_rules(&responses, &chain, public_key).expect("offline chain rpc rules must install");
+
+        // shadow the canned submit rejection with a success: the client
+        // discards the RPC's tx hash, so any TxHash-shaped result works
+        responses.lock().insert(
+            0,
+            offline::OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "result": serde_json::to_value(&QHashOut::<F>::ZERO).unwrap() }),
+            },
+        );
+
+        let mut service = offline_service(Arc::new(wallet_session), None, false, None, &[]);
+        service.operators[0] = PsyFaucetOperator {
+            user_id: offline::OFFLINE_USER_ID,
+            public_key,
+        };
+        let service = Arc::new(service);
+
+        // the operator proves the claim call and the submit succeeds: the
+        // response reports a fresh claim for this window and records it
+        let completed = service.claim(claim_request(12)).await.unwrap();
+        assert!(!completed.already_submitted);
+        assert_eq!(completed.window_id, 3);
+        assert_eq!(completed.operator_user_id, offline::OFFLINE_USER_ID);
+        assert_eq!(completed.amount, "500");
+        assert!(!completed.tx_hash.is_empty());
+        assert!(service.claim_records.get(&(12, 3)).is_some());
+
+        // The mock submit does not advance its leaf. Model inclusion before
+        // reusing the operator for the independent rejection path below.
+        let pending = service.operator_pool.pending();
+        assert_eq!(pending.len(), 1);
+        let (index, pending) = pending[0];
+        assert_eq!(
+            service.operator_pool.settle(index, pending, Some(pending.end_user_leaf_hash), Instant::now()),
+            Some(Settle::Included)
+        );
+
+        // a new recipient in the same window hits the chain's already-claimed
+        // rejection, which the service reports after trying every operator
+        responses.lock().insert(
+            0,
+            offline::OfflineRpcRule {
+                method: "psy_submit_user_end_cap".to_string(),
+                params: None,
+                response: serde_json::json!({ "error": { "code": -32603, "message": "faucet already claimed for this window" } }),
+            },
+        );
+        let rejected = service.claim(claim_request(13)).await.err().unwrap();
+        assert!(rejected.message().contains("faucet already claimed in the current window"));
     }
 }

@@ -2,7 +2,7 @@ use std::{array, fs, path::PathBuf, str::FromStr, sync::Arc, sync::OnceLock};
 
 use anyhow::Context;
 use alloy_primitives::{keccak256, Address, B256, Bytes, U256};
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::Provider;
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
 use alloy_sol_types::{sol, SolCall, SolEvent};
 use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, pgoldilocks::QHashOut, protocol::core_types::QNetworkTreeConstants};
@@ -566,7 +566,7 @@ async fn fetch_deposit_batch_inputs(
     let rpc_url = l1_rpc_url
         .parse()
         .with_context(|| format!("invalid L1 rpc url: {}", l1_rpc_url))?;
-    let provider = ProviderBuilder::new().connect_http(rpc_url);
+    let provider = crate::bridge::l1_provider::connect_l1_readonly(rpc_url)?;
 
     let proved_count = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
     let pending_count = crate::bridge::api_client::eth_call_u256(&provider, bridge, pendingDepositCountCall {}).await?;

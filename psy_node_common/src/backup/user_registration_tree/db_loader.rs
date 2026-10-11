@@ -116,7 +116,7 @@ pub async fn load_global_user_registration_tree_append_only_pivot_from_db<
     }
     // SANITY CHECK: ensure the leaf node is not zero hash, as we already checked to
     // ensure the root is not a zero hash
-    if current_value == Hasher::get_zero_hash(tree_height as usize) {
+    if current_value == Hasher::get_zero_hash(0) {
         // Tree is empty
         anyhow::bail!("Failed to load user registration tree from DB: reached leaf node with zero hash, but root is not zero hash");
     }
@@ -155,7 +155,7 @@ pub async fn load_global_user_registration_tree_append_only_pivot_from_db<
         let value = user_db_reader
             .user_registration_tree_get_node(checkpoint_id, SimpleMerkleNodeKey::new(tree_height, start_required_user_id))
             .await?;
-        if value == Hasher::get_zero_hash(tree_height as usize) {
+        if value == Hasher::get_zero_hash(0) {
             anyhow::bail!(
                 "Failed to load user registration tree from DB: leaf node for user ID {} is zero hash, but tree root is not zero hash",
                 start_required_user_id
@@ -206,4 +206,179 @@ pub async fn load_global_user_registration_tree_append_only_pivot_from_db<
         tree.get_root()
     );
     Ok((next_user_id, tree))
+}
+
+#[cfg(test)]
+mod tests {
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{pgoldilocks::PoseidonHasher, protocol::core_types::QNetworkTreeConstants, PHash};
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeUserRegistrationTreeDatabaseReader,
+        PsyNodeUserRegistrationTreeDatabaseWriter,
+    };
+
+    use crate::test_common::{create_test_unified_db, TestNetworkConfig, TestUnifiedDatabaseStore};
+
+    use super::*;
+
+    type Hasher = PoseidonHasher;
+    type Hash = PHash;
+
+    const HEIGHT: u8 = TestNetworkConfig::GLOBAL_USER_TREE_HEIGHT;
+    const CP: u64 = 3;
+
+    fn zh(level: usize) -> Hash {
+        PoseidonHasher::get_zero_hash(level)
+    }
+
+    fn leaf(i: u64) -> Hash {
+        PHash::from_values(i * 16 + 1, 0x0AAA_1BBB_2CCC_3DDD, i + 17, 0x7DDD_6CCC_5BBB_4AAA)
+    }
+
+    async fn seed_leaves(db: &TestUnifiedDatabaseStore, checkpoint_id: u64, count: u64) -> anyhow::Result<()> {
+        for i in 0..count {
+            db.user_registration_tree_set_leaf_hash(checkpoint_id, i, leaf(i)).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_only_load_populates_leaves_across_complete_batches_and_remainder() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 13).await?;
+
+        // 12 leaves to load with batch size 5: two complete batches + remainder of 2
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(HEIGHT);
+        load_append_only_user_registration_tree_into_memory(&db, &mut tree, CP, 0, 12, 5).await?;
+
+        for i in 0..=12u64 {
+            assert_eq!(tree.get_leaf_value(i), leaf(i), "leaf {i} must match the db value");
+        }
+        assert_eq!(tree.get_root(), db.user_registration_tree_get_root_hash(CP).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_only_load_with_exact_batch_multiple_skips_remainder() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 11).await?;
+
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(HEIGHT);
+        load_append_only_user_registration_tree_into_memory(&db, &mut tree, CP, 0, 10, 5).await?;
+
+        for i in 0..=10u64 {
+            assert_eq!(tree.get_leaf_value(i), leaf(i));
+        }
+        assert_eq!(tree.get_root(), db.user_registration_tree_get_root_hash(CP).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_only_load_from_non_zero_start_index() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 9).await?;
+
+        // loading a tail window [4, 8) still reconstructs the full root because
+        // the leading proof at index 4 pulls in all left-side siblings
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(HEIGHT);
+        load_append_only_user_registration_tree_into_memory(&db, &mut tree, CP, 4, 8, 3).await?;
+
+        for i in 4..=8u64 {
+            assert_eq!(tree.get_leaf_value(i), leaf(i));
+        }
+        assert_eq!(tree.get_root(), db.user_registration_tree_get_root_hash(CP).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_on_empty_tree_returns_zero_next_id_and_empty_root() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        let (next_user_id, tree) =
+            load_global_user_registration_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, 0, 4).await?;
+
+        assert_eq!(next_user_id, 0);
+        assert_eq!(tree.get_root(), zh(HEIGHT as usize));
+        assert_eq!(tree.get_leaf_value(0), zh(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_returns_next_user_id_with_matching_root_and_last_leaf() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 5).await?;
+
+        // pivot lands on the rightmost non-zero leaf (id 4); two previous leaves
+        // are pulled in on top of it
+        let (next_user_id, tree) =
+            load_global_user_registration_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, CP, 2).await?;
+
+        assert_eq!(next_user_id, 5);
+        assert_eq!(tree.get_root(), db.user_registration_tree_get_root_hash(CP).await?);
+        assert_eq!(tree.get_leaf_value(4), leaf(4));
+        assert_eq!(tree.get_leaf_value(2), leaf(2));
+        // the next append slot is still empty
+        assert_eq!(tree.get_leaf_value(5), zh(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_rejects_gap_in_append_only_user_registration_tree() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        // An append-only tree cannot have an empty history followed by an occupied
+        // leaf. With the pivot at 4 and a two-leaf history window, leaf 2 is the
+        // integrity-check target and must be rejected as an empty leaf.
+        db.user_registration_tree_set_leaf_hash(CP, 4, leaf(4)).await?;
+
+        let result = load_global_user_registration_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(
+            &db, HEIGHT, CP, 2,
+        )
+        .await;
+
+        assert!(result.is_err(), "sparse append-only user-registration tree must be rejected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_clamps_required_previous_leaves_to_available_history() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 5).await?;
+
+        // required=100 but only ids 0..=4 exist: the whole history is loaded
+        let (next_user_id, tree) =
+            load_global_user_registration_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, CP, 100).await?;
+
+        assert_eq!(next_user_id, 5);
+        assert_eq!(tree.get_root(), db.user_registration_tree_get_root_hash(CP).await?);
+        assert_eq!(tree.get_leaf_value(0), leaf(0));
+        assert_eq!(tree.get_leaf_value(4), leaf(4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_with_zero_required_previous_leaves_skips_bulk_fetch() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, CP, 5).await?;
+
+        let (next_user_id, tree) =
+            load_global_user_registration_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, CP, 0).await?;
+
+        // only the two pivot proofs are injested, but the root still matches
+        assert_eq!(next_user_id, 5);
+        assert_eq!(tree.get_root(), db.user_registration_tree_get_root_hash(CP).await?);
+        assert_eq!(tree.get_leaf_value(4), leaf(4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pivot_load_reads_the_latest_committed_version_at_or_before_checkpoint() -> anyhow::Result<()> {
+        let db = create_test_unified_db().await?;
+        seed_leaves(&db, 1, 5).await?;
+        // checkpoint 2 adds nothing, so reading at 2 must still see version 1
+        let (next_user_id, tree) =
+            load_global_user_registration_tree_append_only_pivot_from_db::<Hasher, TestUnifiedDatabaseStore, Hash>(&db, HEIGHT, 2, 2).await?;
+
+        assert_eq!(next_user_id, 5);
+        assert_eq!(tree.get_root(), db.user_registration_tree_get_root_hash(1).await?);
+        Ok(())
+    }
 }

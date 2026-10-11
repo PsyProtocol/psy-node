@@ -240,7 +240,8 @@ fn resolve_network(args: &ChainInfoArgs) -> anyhow::Result<ResolvedNetwork> {
     let mut cfg = PsyConfigGoldilocks::from_file(&args.config)
         .map_err(|e| anyhow::anyhow!("failed to load config {}: {}", args.config, e))?;
     if let Some(network_name) = &args.network {
-        cfg.use_network(network_name)
+        // chain-info 是查看工具：允许查看不属于本二进制身份的网络。
+        cfg.use_network_unchecked(network_name)
             .map_err(|e| anyhow::anyhow!("failed to select network {}: {}", network_name, e))?;
     }
     let network_name = cfg.current_network_name().to_string();

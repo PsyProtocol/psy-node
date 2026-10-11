@@ -1,3 +1,4 @@
+pub mod contract_fn_cache;
 pub mod request;
 
 #[macro_use]

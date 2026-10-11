@@ -90,7 +90,7 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
 impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for SubTreeNodeStateTransition<F, Hash> {}
 
 
-pser::impl_psy_ser_basic_tests!(
+pser::impl_psy_ser_basic_tests_fallback!(
     SubTreeNodeStateTransition,
     // Note the use of concrete types here
     {  parth_core::PF, parth_core::PHash },
@@ -102,3 +102,46 @@ impl_qpd_serialize_params!(
     SubTreeNodeStateTransition,
     { F: QFelt64, Hash: QDBHashBase } => { F, Hash }
 );
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::HashTo4Felts, pgoldilocks::{PoseidonHasher, QHashOut}, PF};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn transition_hash_follows_documented_composition() {
+        let transition = SubTreeNodeStateTransition::<PF, Hash>::qp_rand_gen();
+
+        let old_node_value = transition.old_node_value.to_4_felts();
+        let new_node_value = transition.new_node_value.to_4_felts();
+        let expected = PoseidonHasher::q_hash_many(&[
+            transition.node_index,
+            old_node_value[0],
+            old_node_value[1],
+            old_node_value[2],
+            old_node_value[3],
+            new_node_value[0],
+            new_node_value[1],
+            new_node_value[2],
+            new_node_value[3],
+            transition.node_level,
+        ]);
+
+        assert_eq!(transition.qfhash::<PoseidonHasher>(), expected);
+    }
+
+    #[test]
+    fn transition_hash_is_sensitive_to_each_node_value() {
+        let mut transition = SubTreeNodeStateTransition::<PF, Hash>::qp_rand_gen();
+        let baseline = transition.qfhash::<PoseidonHasher>();
+
+        transition.old_node_value = Hash::from_values(1, 2, 3, 4);
+        assert_ne!(transition.qfhash::<PoseidonHasher>(), baseline);
+
+        let with_new_old_value = transition.qfhash::<PoseidonHasher>();
+        transition.new_node_value = Hash::from_values(1, 2, 3, 4);
+        assert_ne!(transition.qfhash::<PoseidonHasher>(), with_new_old_value);
+    }
+}

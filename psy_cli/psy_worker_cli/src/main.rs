@@ -1,8 +1,26 @@
 mod subcommand;
 
+// Replaying captured production jobs on the benchmark box (Ryzen 9 9900X)
+// with the AVX-512 build, jemalloc raised throughput by about 10% over glibc
+// malloc, both one job at a time and four at once, for about 0.3 GiB more
+// resident memory.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc defaults to four arenas per CPU, and every arena a proving thread
+// lands in keeps freed memory for a while. With a thread pool per job that
+// added about 1 GiB of resident memory on the benchmark box; sixteen arenas
+// removed it without slowing proofs down (eight cost 2% with one job at a
+// time). The _RJEM_MALLOC_CONF environment variable overrides this.
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: Option<&'static u8> = Some(&b"narenas:16\0"[0]);
+
 use clap::Parser;
 
-use crate::subcommand::{keypair_helper, worker, worker_test, Cli, Commands};
+use crate::subcommand::{keypair_helper, replay, worker, worker_test, Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,8 +42,10 @@ async fn main() -> anyhow::Result<()> {
             coordinator_api_urls,
             url_rotation_strategy,
             batch_size,
+            proving_pools,
+            threads_per_job,
         } => {
-            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, completed_jobs_log_file, realm_api_urls, coordinator_api_urls, url_rotation_strategy, batch_size).await?;
+            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, completed_jobs_log_file, realm_api_urls, coordinator_api_urls, url_rotation_strategy, batch_size, proving_pools, threads_per_job).await?;
         }
         Commands::WorkerTest {
             config,
@@ -38,6 +58,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             worker_test::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend).await?;
         },
+        Commands::Replay { inputs, network, role, circuit, limit, per_circuit, concurrency, passes, out, dump_proofs, require_equivalent, proving_pools, threads_per_job } => {
+            tokio::task::spawn_blocking(move || replay::run(inputs, network, role, circuit, limit, per_circuit, concurrency, passes, out, dump_proofs, require_equivalent, proving_pools, threads_per_job)).await??;
+        }
         Commands::GenerateKeypair => {
             keypair_helper::generate_keypair()?;
         },

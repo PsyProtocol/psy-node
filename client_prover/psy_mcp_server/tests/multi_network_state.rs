@@ -49,8 +49,8 @@ fn identical_claim_ids_are_persisted_in_different_network_subtrees() {
     let a = make_deposit("network-a").persist(&root).unwrap();
     let b = make_deposit("network-b").persist(&root).unwrap();
     assert_ne!(a, b);
-    assert!(a.ends_with("networks/network-a/deposits/deposit-42.json"));
-    assert!(b.ends_with("networks/network-b/deposits/deposit-42.json"));
+    assert!(a.ends_with("networks/network-a/deposits/1/deposit-42.json"));
+    assert!(b.ends_with("networks/network-b/deposits/1/deposit-42.json"));
 
     let commitment = [9, 10, 11, 12];
     let note_a = wallet::PrivateNoteRecovery::path_in(&root, "network-a", &commitment).unwrap();
@@ -73,15 +73,15 @@ fn spend_and_denied_logs_retain_their_network() {
     let mut engine = PolicyEngine::new();
 
     engine.set_current_wallet("network-a", 7);
-    let policy_a = engine.create_policy("a", limits.clone(), None, vec!["simple_transfer".into()]);
+    let policy_a = engine.create_policy("a", limits.clone(), None, vec!["transfer".into()]);
     let (token_a, _) = engine.issue_session(&policy_a, 60, None).unwrap();
-    engine.authorize(&token_a, "8", 1, "simple_transfer").unwrap();
+    engine.authorize(&token_a, "8", 1, "transfer").unwrap();
 
     engine.set_current_wallet("network-b", 7);
-    let policy_b = engine.create_policy("b", limits, None, vec!["simple_transfer".into()]);
+    let policy_b = engine.create_policy("b", limits, None, vec!["transfer".into()]);
     let (token_b, _) = engine.issue_session(&policy_b, 60, None).unwrap();
-    engine.authorize(&token_b, "8", 1, "simple_transfer").unwrap();
-    let _ = engine.authorize(&token_b, "8", 101, "simple_transfer");
+    engine.authorize(&token_b, "8", 1, "transfer").unwrap();
+    let _ = engine.authorize(&token_b, "8", 101, "transfer");
 
     let spends = engine.spend_log(10, None);
     // Logs are returned newest first.

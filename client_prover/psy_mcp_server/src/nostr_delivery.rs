@@ -209,11 +209,17 @@ pub fn build_deposit_backup_events(recipient_npub: &str, note: &crate::wallet::D
         .and_then(|value| value.as_str())
         .unwrap_or("0")
         .to_string();
+    let token_contract_id = format!("0x{:064x}", note.l2_token_contract_id);
+    let proof_snapshot_count = deposit_proof.get("proved_deposit_count").cloned();
+    let deposit_root = deposit_proof.get("deposit_root").cloned();
+    let nullifier_hash = deposit_proof
+        .get("nullifier_hash")
+        .cloned()
+        .or_else(|| deposit_proof.get("nullifier").cloned());
     let proof_content = serde_json::json!({
         "type": "psy_deposit_proof",
-        "version": 2,
         "backup_id": backup_id,
-        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis().to_string(),
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
         "deposit_proof": deposit_proof,
         "metadata": {
             "note_commitment": backup_id,
@@ -226,11 +232,14 @@ pub fn build_deposit_backup_events(recipient_npub: &str, note: &crate::wallet::D
             "chain_local_deposit_index": local_index,
             "deposit_index": local_index,
             "contract_id": note.l2_token_contract_id.to_string(),
-            "token_contract_id": note.l2_token_contract_id.to_string(),
+            "token_contract_id": token_contract_id.clone(),
+            "deposit_root": deposit_root,
+            "nullifier_hash": nullifier_hash,
+            "proved_deposit_count": proof_snapshot_count,
         }
     })
     .to_string();
-    let proof_tags = vec![
+    let mut proof_tags = vec![
         Tag::public_key(receiver_pk),
         value_tag("t", ["psy_deposit_proof".to_string()]),
         value_tag("backup_id", [backup_id.clone()]),
@@ -239,8 +248,8 @@ pub fn build_deposit_backup_events(recipient_npub: &str, note: &crate::wallet::D
         value_tag("deposit_index", [note.expected_deposit_index.to_string()]),
         value_tag("global_deposit_index", [note.expected_deposit_index.to_string()]),
         value_tag("chain_local_deposit_index", [local_index]),
-        value_tag("token_contract_id", [note.l2_token_contract_id.to_string()]),
     ];
+    proof_tags.push(value_tag("token_contract_id", [token_contract_id]));
     let proof_event = EventBuilder::new(Kind::GiftWrap, proof_content)
         .tags(proof_tags)
         .sign_with_keys(&Keys::generate())

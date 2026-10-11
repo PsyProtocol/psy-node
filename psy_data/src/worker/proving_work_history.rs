@@ -182,7 +182,7 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
 
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 impl<Hash: Q256BitHash, JobId: QJobIdBase> psy_serialize::AutoImplementFallbackPsySerializeCanonical
-    for PsyProvingJobMetadata<Hash, JobId>
+    for PsyProvingJobClaimMetadata<Hash, JobId>
 {
 }
 
@@ -192,3 +192,117 @@ pser::impl_psy_ser_basic_tests_fallback!(
     psy_proving_job_claim_metadata_basic_tests
 );
 
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{pgoldilocks::PoseidonHasher, PHash};
+
+    fn hash(value: u64) -> PHash {
+        PHash::from_values(value, 0, 0, 0)
+    }
+
+    fn metadata(mode: u8) -> PsyProvingJobClaimMetadata<PHash, u8> {
+        PsyProvingJobClaimMetadata {
+            reward_tree_hash_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claim_reward_modes_validate_children_and_hash_consistently() {
+        let tag = hash(9);
+        let cases = [
+            (PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, vec![]),
+            (PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, vec![hash(1), hash(2)]),
+            (PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, vec![hash(1), hash(2), hash(3)]),
+            (PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN, vec![hash(1), hash(2), hash(3), hash(4)]),
+            (PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, vec![hash(1)]),
+        ];
+        for (mode, children) in cases {
+            assert_ne!(
+                metadata(mode)
+                    .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children)
+                    .unwrap(),
+                PHash::default()
+            );
+        }
+
+        assert!(metadata(PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[hash(1)])
+            .is_err());
+        assert!(metadata(PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[hash(1), hash(2)])
+            .is_err());
+        assert!(metadata(PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[hash(1), hash(2), hash(3)])
+            .is_err());
+        assert!(metadata(PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[])
+            .is_err());
+        assert!(metadata(255)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[])
+            .is_err());
+    }
+
+    #[test]
+    fn claim_default_matches_realm_no_hash_leaf() {
+        let value = PsyProvingJobClaimMetadata::<PHash, u8>::default();
+        assert_eq!(value.job_id, u8::default());
+        assert_eq!(value.reward_tree_tag, PHash::default());
+        assert_eq!(value.reward_tree_tag_preimage, PHash::default());
+        assert_eq!(value.proving_duration_ms, 0);
+        assert_eq!(value.job_submitted_at, 0);
+        assert_eq!(value.unique_pending_id, 0);
+        assert_eq!(value.realm_id, 0);
+        assert_eq!(value.realm_sub_id, 0);
+        assert_eq!(value.reward_tree_node_key, SimpleMerkleNodeKey { index: 0, level: 0 });
+        assert_eq!(value.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN);
+        assert_eq!(value.reward_tree_node_children, 0);
+        assert_eq!(value.node_type, PROVING_JOB_NODE_TYPE_REALM);
+        assert_eq!(value.api_url_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn claim_tag_formulas_match_tag_tree_helpers() {
+        let tag = hash(9);
+        let zero = PHash::get_zero_value();
+
+        // No-hash mode folds the tag together with two zero children.
+        let no_hash = metadata(PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[])
+            .unwrap();
+        assert_eq!(no_hash, hash_tag_tree_node::<PHash, PoseidonHasher>(&zero, &zero, &tag));
+
+        // Standard mode hashes the two children together with the tag.
+        let children = [hash(1), hash(2)];
+        let standard = metadata(PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children)
+            .unwrap();
+        assert_eq!(standard, hash_tag_tree_node::<PHash, PoseidonHasher>(&children[0], &children[1], &tag));
+
+        // 3-children double-reward nests [c0, [c1, c2]] with a zero right sibling.
+        let children3 = [hash(1), hash(2), hash(3)];
+        let double = metadata(PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children3)
+            .unwrap();
+        let left = hash_tag_tree_node::<PHash, PoseidonHasher>(&children3[0], &children3[1], &tag);
+        let right = hash_tag_tree_node::<PHash, PoseidonHasher>(&children3[2], &zero, &tag);
+        assert_eq!(double, hash_tag_tree_node::<PHash, PoseidonHasher>(&left, &right, &tag));
+
+        // Lift-child mode pads the single child with a zero sibling.
+        let lift = metadata(PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &[hash(1)])
+            .unwrap();
+        assert_eq!(lift, hash_tag_tree_node::<PHash, PoseidonHasher>(&hash(1), &zero, &tag));
+
+        // 4-children mode uses the dedicated four-way tag tree helper.
+        let children4 = [hash(1), hash(2), hash(3), hash(4)];
+        let four = metadata(PROOF_REWARD_TREE_HASH_MODE_4_CHILDREN)
+            .get_new_rewards_tag_tree_value::<PoseidonHasher>(tag, &children4)
+            .unwrap();
+        assert_eq!(
+            four,
+            hash_tag_tree_node_four::<PHash, PoseidonHasher>(&children4[0], &children4[1], &children4[2], &children4[3], &tag)
+        );
+    }
+}

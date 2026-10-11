@@ -1017,3 +1017,633 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod process_block_tests {
+    use std::sync::Arc;
+
+    use parth_core::{
+        crypto::hash::traits::MerkleZeroHasher, node::realm_identifier::QRealmIdentifier, PHash,
+    };
+    use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+    use psy_data::worker::{
+        metadata::{PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN},
+        metadata_with_job_id::PsyProvingJobMetadataWithJobId,
+    };
+    use psy_node_core::{
+        psy_temp_db::{QTempDBNodeProvingStateReader, QTempDBRewardsTreeWriter},
+        queue::worker_queue::QStandardWorkerQueueSubscriber,
+        store::traits::proof_store::QParthProofStoreWriter,
+    };
+
+    use crate::coordinator::processor::core::startup::startup_tests::{CoordinatorProcessorTestEnv, N};
+
+    use super::PsyCoordinatorProcessor;
+
+    type TestJobs = Vec<Vec<PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>>>;
+
+    fn zh(level: usize) -> PHash {
+        parth_core::pgoldilocks::PoseidonHasher::get_zero_hash(level)
+    }
+
+    fn job(
+        circuit: ProvingJobCircuitType,
+        salt: u64,
+    ) -> PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID> {
+        PsyProvingJobMetadataWithJobId {
+            job_id: QProvingJobDataID::new_proof_job_id(salt, 0, circuit, 0, 0),
+            metadata: PsyProvingJobMetadata {
+                expected_public_inputs_hash: zh(7),
+                reward_tree_node_index: 0,
+                reward_tree_node_level: 0,
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+                reward_tree_node_children: 0,
+                dependencies: vec![],
+            },
+        }
+    }
+
+    fn one_level(circuit: ProvingJobCircuitType, salt: u64) -> TestJobs {
+        vec![vec![job(circuit, salt)]]
+    }
+
+    fn realm_identifier() -> QRealmIdentifier {
+        QRealmIdentifier::new(1, 2)
+    }
+
+    /// Drains the shared fake worker queue and persists a proof plus reward
+    /// tree value for every published job, standing in for the proving
+    /// workers. Artifacts are written under a range of pending ids so the
+    /// daemon keeps working no matter how far the processor rotates its ids.
+    async fn run_prover_daemon(
+        env: &CoordinatorProcessorTestEnv,
+        max_runtime_ms: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let queue_key = env.processor.db.get_proof_worker_queue_key();
+        let proof_queue = Arc::clone(&env.proof_work_queue);
+        let temp_db = Arc::clone(&env.temp_db);
+        tokio::spawn(async move {
+            let rid = realm_identifier();
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(max_runtime_ms);
+            while tokio::time::Instant::now() < deadline {
+                let items = proof_queue
+                    .dump_entire_worker_queue::<
+                        crate::coordinator::queue_key::CoordinatorProvingWorkQueueKey<
+                            PHash,
+                            QProvingJobDataID,
+                        >,
+                    >(&queue_key, 1, 2, 0, 0, 256)
+                    .await
+                    .unwrap_or_default();
+                let had_items = !items.is_empty();
+                for item in items {
+                    let output_id = item.job_id.get_output_id();
+                    for uid in 0u64..=4 {
+                        let _ = temp_db
+                            .put_proof_bytes_for_job_id(output_id, uid, b"coord test proof")
+                            .await;
+                        let _ = temp_db
+                            .set_proof_miner_rewards_tree_value(&rid, uid, output_id, zh(9))
+                            .await;
+                    }
+                }
+                if !had_items {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        })
+    }
+
+    fn root_ids_of(
+        guta: ProvingJobCircuitType,
+        register: ProvingJobCircuitType,
+        deploy: ProvingJobCircuitType,
+        update: ProvingJobCircuitType,
+    ) -> (
+        PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>,
+        PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>,
+        PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>,
+        PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>,
+    ) {
+        (job(guta, 1), job(register, 2), job(deploy, 3), job(update, 4))
+    }
+
+    #[tokio::test]
+    async fn get_root_job_ids_errors_when_any_job_list_is_missing() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+
+        // every list must exist and carry at least one root job
+        let register = one_level(ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate, 2);
+        let deploy = one_level(ProvingJobCircuitType::DummyBatchDeployContractsAggregate, 3);
+        let update = one_level(ProvingJobCircuitType::DummyBatchUpdateContractsAggregate, 4);
+        let guta = one_level(ProvingJobCircuitType::GUTANoChange, 1);
+        let cases: [(&str, TestJobs, TestJobs, TestJobs, TestJobs); 4] = [
+            ("No GUTA jobs found", vec![], register.clone(), deploy.clone(), update.clone()),
+            ("No Register User jobs found", guta.clone(), vec![], deploy.clone(), update.clone()),
+            ("No Deploy Contract jobs found", guta.clone(), register.clone(), vec![], update.clone()),
+            ("No Update Contract jobs found", guta.clone(), register.clone(), deploy.clone(), vec![]),
+        ];
+        for (expected_message, guta, register, deploy, update) in cases {
+            let error = match processor.get_root_job_ids(&guta, &register, &deploy, &update) {
+                Err(e) => e.to_string(),
+                Ok(_) => anyhow::bail!("a missing job list must fail root-job selection: {expected_message}"),
+            };
+            assert!(error.contains(expected_message), "unexpected error: {error}");
+        }
+
+        // a list that exists but has an empty last level is rejected too
+        let error = match processor.get_root_job_ids(&vec![vec![]], &register, &deploy, &update) {
+            Err(e) => e.to_string(),
+            Ok(_) => anyhow::bail!("an empty last level must fail root-job selection"),
+        };
+        assert!(
+            error.contains("No GUTA jobs found at last level"),
+            "unexpected error: {error}"
+        );
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_root_job_ids_reports_no_changes_only_for_all_dummy_roots() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+
+        let (guta, register, deploy, update) = root_ids_of(
+            ProvingJobCircuitType::GUTANoChange,
+            ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate,
+            ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate,
+        );
+        let result = processor.get_root_job_ids(
+            &vec![vec![guta]],
+            &vec![vec![register]],
+            &vec![vec![deploy]],
+            &vec![vec![update]],
+        )?;
+        assert!(
+            result.is_none(),
+            "all-dummy roots must be reported as a no-change block"
+        );
+
+        // a single real GUTA root job is enough to consider the block real
+        let (guta, register, deploy, update) = root_ids_of(
+            ProvingJobCircuitType::GUTATwoEndCap,
+            ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate,
+            ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate,
+        );
+        let roots = processor
+            .get_root_job_ids(
+                &vec![vec![guta.clone()]],
+                &vec![vec![register.clone()]],
+                &vec![vec![deploy.clone()]],
+                &vec![vec![update.clone()]],
+            )?
+            .expect("a real GUTA root must produce root job ids");
+        assert_eq!(roots.0, guta.job_id);
+        assert_eq!(roots.1, register.job_id);
+        assert_eq!(roots.2, deploy.job_id);
+        assert_eq!(roots.3, update.job_id);
+
+        // likewise a single real update-contract root job
+        let (guta, register, deploy, update) = root_ids_of(
+            ProvingJobCircuitType::GUTANoChange,
+            ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate,
+            ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
+            ProvingJobCircuitType::BatchUpdateContracts,
+        );
+        let roots = processor
+            .get_root_job_ids(
+                &vec![vec![guta]],
+                &vec![vec![register]],
+                &vec![vec![deploy]],
+                &vec![vec![update]],
+            )?
+            .expect("a real update-contract root must produce root job ids");
+        assert_eq!(roots.3.circuit_type, ProvingJobCircuitType::BatchUpdateContracts);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_worker_jobs_if_exists_skips_out_of_range_and_empty_levels() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+        let queue_key = processor.db.get_proof_worker_queue_key();
+
+        let jobs: TestJobs = vec![vec![], vec![job(ProvingJobCircuitType::GUTATwoEndCap, 11)]];
+        let empty_level = processor.publish_worker_jobs_if_exists(&queue_key, 0, &jobs).await?;
+        assert!(empty_level.is_none(), "an empty level must not be published");
+        let out_of_range = processor.publish_worker_jobs_if_exists(&queue_key, jobs.len(), &jobs).await?;
+        assert!(out_of_range.is_none(), "a level beyond the job lists must not be published");
+        assert_eq!(*env.proof_work_queue.published_count.lock().unwrap(), 0);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_worker_jobs_if_exists_publishes_only_that_level() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+        let queue_key = processor.db.get_proof_worker_queue_key();
+
+        let level_zero = job(ProvingJobCircuitType::GUTATwoEndCap, 21);
+        let level_one = job(ProvingJobCircuitType::GUTATwoEndCap, 22);
+        let jobs: TestJobs = vec![vec![level_zero.clone()], vec![level_one]];
+        let barrier = processor
+            .publish_worker_jobs_if_exists(&queue_key, 0, &jobs)
+            .await?
+            .expect("a non-empty in-range level must be published");
+        let _ = barrier;
+        assert_eq!(*env.proof_work_queue.published_count.lock().unwrap(), 1);
+
+        // the published item round-trips through the queue as the level-0 job
+        let drained = env
+            .proof_work_queue
+            .dump_entire_worker_queue::<
+                crate::coordinator::queue_key::CoordinatorProvingWorkQueueKey<PHash, QProvingJobDataID>,
+            >(&queue_key, 1, 2, 0, 0, 16)
+            .await?;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].job_id, level_zero.job_id);
+        assert_eq!(
+            drained[0].metadata.expected_public_inputs_hash,
+            level_zero.metadata.expected_public_inputs_hash
+        );
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_jobs_publishes_every_level_and_records_proving_state() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let CoordinatorProcessorTestEnv {
+            processor,
+            temp_db,
+            proof_work_queue,
+            guta_gatherer_handle,
+            register_gatherer_handle,
+            deploy_gatherer_handle,
+            ..
+        } = env;
+        let mut processor = processor;
+        let guta_jobs: TestJobs = vec![
+            vec![job(ProvingJobCircuitType::GUTATwoEndCap, 31)],
+            vec![job(ProvingJobCircuitType::GUTATwoEndCap, 32)],
+        ];
+        let register_jobs = one_level(ProvingJobCircuitType::AppendUserRegistrationTree, 33);
+        let deploy_jobs = one_level(ProvingJobCircuitType::BatchDeployContracts, 34);
+        let update_jobs = one_level(ProvingJobCircuitType::BatchUpdateContracts, 35);
+
+        let mut proving_state = psy_data::node::node_proving_state::PsyNodeProvingState::new_standard_realm(
+            1,
+            2,
+            processor.db.ids.unique_pending_id,
+            processor.db.ids.checkpoint_id,
+            0,
+            6,
+        );
+        let barriers = processor
+            .publish_jobs(
+                &mut proving_state,
+                &guta_jobs,
+                &register_jobs,
+                &deploy_jobs,
+                &update_jobs,
+                Some(0),
+                None,
+                false,
+            )
+            .await?;
+
+        // level 0 publishes from all four lists, level 1 only from the
+        // (longer) guta list: five publications, five barriers
+        assert_eq!(*proof_work_queue.published_count.lock().unwrap(), 5);
+        assert_eq!(barriers.len(), 5);
+        assert_eq!(proving_state.current_proving_level, 1);
+
+        // the last written proving state names the last published level
+        let persisted = temp_db.get_psy_node_proving_state(&realm_identifier()).await?;
+        assert_eq!(persisted.current_proving_level, 1);
+        guta_gatherer_handle.abort();
+        register_gatherer_handle.abort();
+        deploy_gatherer_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_jobs_clamps_level_range_to_available_levels() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let CoordinatorProcessorTestEnv {
+            processor,
+            proof_work_queue,
+            guta_gatherer_handle,
+            register_gatherer_handle,
+            deploy_gatherer_handle,
+            ..
+        } = env;
+        let processor = processor;
+        let guta_jobs: TestJobs = vec![
+            vec![job(ProvingJobCircuitType::GUTATwoEndCap, 41)],
+            vec![job(ProvingJobCircuitType::GUTATwoEndCap, 42)],
+        ];
+        let register_jobs = one_level(ProvingJobCircuitType::AppendUserRegistrationTree, 43);
+        let deploy_jobs = one_level(ProvingJobCircuitType::BatchDeployContracts, 44);
+        let update_jobs = one_level(ProvingJobCircuitType::BatchUpdateContracts, 45);
+        let mut proving_state = psy_data::node::node_proving_state::PsyNodeProvingState::new_standard_realm(
+            1, 2, 0, 0, 0, 6,
+        );
+
+        // max_level clamps the range to just level 0
+        let barriers = processor
+            .publish_jobs(
+                &mut proving_state,
+                &guta_jobs,
+                &register_jobs,
+                &deploy_jobs,
+                &update_jobs,
+                Some(0),
+                Some(1),
+                false,
+            )
+            .await?;
+        assert_eq!(*proof_work_queue.published_count.lock().unwrap(), 4);
+        assert_eq!(barriers.len(), 4);
+
+        // min_level beyond the longest list clamps to an empty range
+        let barriers = processor
+            .publish_jobs(
+                &mut proving_state,
+                &guta_jobs,
+                &register_jobs,
+                &deploy_jobs,
+                &update_jobs,
+                Some(9),
+                None,
+                false,
+            )
+            .await?;
+        assert_eq!(barriers.len(), 0);
+        assert_eq!(*proof_work_queue.published_count.lock().unwrap(), 4);
+        guta_gatherer_handle.abort();
+        register_gatherer_handle.abort();
+        deploy_gatherer_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_level_proofs_returns_immediately_without_jobs() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+        let register_jobs = one_level(ProvingJobCircuitType::AppendUserRegistrationTree, 51);
+        let empty: TestJobs = vec![];
+        processor
+            .wait_for_level_proofs(5, [&empty, &register_jobs, &empty, &empty])
+            .await?;
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_level_proofs_times_out_when_proofs_never_appear() -> anyhow::Result<()> {
+        let mut env = CoordinatorProcessorTestEnv::create().await?;
+        env.processor.proof_worker_queue_max_time_ms = 150;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+
+        let missing = job(ProvingJobCircuitType::GUTATwoEndCap, 61);
+        let jobs: TestJobs = vec![vec![missing]];
+        let started = std::time::Instant::now();
+        let error = processor
+            .wait_for_level_proofs(0, [&jobs, &jobs, &jobs, &jobs])
+            .await
+            .expect_err("a level-0 job without a persisted proof must time out")
+            .to_string();
+        assert!(
+            error.contains("timed out waiting for level 0 proofs"),
+            "unexpected error: {error}"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_level_proofs_passes_once_proofs_are_persisted() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+
+        let ready = job(ProvingJobCircuitType::GUTATwoEndCap, 71);
+        env.temp_db
+            .put_proof_bytes_for_job_id(ready.job_id.get_output_id(), processor.db.ids.unique_pending_id, b"proof")
+            .await?;
+        let jobs: TestJobs = vec![vec![ready]];
+        processor.wait_for_level_proofs(0, [&jobs, &jobs, &jobs, &jobs]).await?;
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_and_wait_for_job_ready_requires_proof_and_reward() -> anyhow::Result<()> {
+        let mut env = CoordinatorProcessorTestEnv::create().await?;
+        env.processor.proof_worker_queue_max_time_ms = 150;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+        let unique_pending_id = processor.db.ids.unique_pending_id;
+        let target = job(ProvingJobCircuitType::GenerateRollupStateTransitionProof, 81);
+        let output_id = target.job_id.get_output_id();
+
+        // nothing persisted: the helper must keep polling until the deadline
+        let error = processor
+            .publish_and_wait_for_job_ready(&target, "test job")
+            .await
+            .expect_err("a job without proof or reward must time out")
+            .to_string();
+        assert!(
+            error.contains("Timed out waiting for persisted proof and reward tree value"),
+            "unexpected error: {error}"
+        );
+
+        // a proof without its reward tree value must still not pass
+        env.temp_db.put_proof_bytes_for_job_id(output_id, unique_pending_id, b"proof").await?;
+        let error = processor
+            .publish_and_wait_for_job_ready(&target, "test job")
+            .await
+            .expect_err("a proof without a reward value must time out")
+            .to_string();
+        assert!(
+            error.contains("Timed out waiting for persisted proof and reward tree value"),
+            "unexpected error: {error}"
+        );
+
+        // both artifacts present: the call resolves with the persisted pair
+        let reward = zh(12);
+        env.temp_db
+            .set_proof_miner_rewards_tree_value(&realm_identifier(), unique_pending_id, output_id, reward)
+            .await?;
+        let (proof_bytes, reward_value) =
+            processor.publish_and_wait_for_job_ready(&target, "test job").await?;
+        assert_eq!(proof_bytes, b"proof".to_vec());
+        assert_eq!(reward_value, reward);
+
+        // each attempt published the job exactly once
+        assert_eq!(*env.proof_work_queue.published_count.lock().unwrap(), 3);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_results_from_gatherers_bails_when_ids_undifferentiated_after_genesis() -> anyhow::Result<()> {
+        let mut env = CoordinatorProcessorTestEnv::create().await?;
+        // model a processor past genesis whose ids were never rotated
+        env.processor.db.ids.checkpoint_id = 1;
+        env.processor.db.ids.next_checkpoint_id = 2;
+        env.processor.db.ids.unique_pending_id = 0;
+        env.processor.db.ids.proc_checkpoint_unique_id = 0;
+        env.processor.db.ids.gathering_unique_pending_id = 0;
+        env.processor.db.ids.gathering_proc_checkpoint_unique_id = 0;
+
+        let error = match env.processor.get_results_from_gatherers().await {
+            Err(e) => e.to_string(),
+            Ok(_) => anyhow::bail!("undifferentiated ids past genesis must bail"),
+        };
+        assert!(
+            error.contains("Cannot gather results when unique ids have not been updated."),
+            "unexpected error: {error}"
+        );
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_results_from_gatherers_rotates_ids_and_yields_dummy_root_jobs() -> anyhow::Result<()> {
+        let mut env = CoordinatorProcessorTestEnv::create().await?;
+        let unique_before = env.processor.db.ids.unique_pending_id;
+        let gathering_before = env.processor.db.ids.gathering_unique_pending_id;
+
+        let (proving_state, guta_jobs, register_jobs, deploy_jobs, update_jobs, _output_builder) =
+            env.processor.get_results_from_gatherers().await?;
+
+        // one rotation: the old gathering pair graduated to processing and
+        // gathering advanced to the next pending id
+        let ids = &env.processor.db.ids;
+        assert_eq!(ids.unique_pending_id, gathering_before);
+        assert_eq!(ids.gathering_unique_pending_id, gathering_before + 1);
+        assert_ne!(ids.gathering_proc_checkpoint_unique_id, ids.proc_checkpoint_unique_id);
+        assert!(ids.unique_pending_id >= unique_before);
+
+        // with no queue items every gatherer finalizes to its dummy/no-change
+        // root job
+        assert_eq!(guta_jobs.len(), 1);
+        assert_eq!(guta_jobs[0].len(), 1);
+        assert_eq!(guta_jobs[0][0].job_id.circuit_type, ProvingJobCircuitType::GUTANoChange);
+        assert_eq!(
+            register_jobs[0][0].job_id.circuit_type,
+            ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate
+        );
+        assert_eq!(
+            deploy_jobs[0][0].job_id.circuit_type,
+            ProvingJobCircuitType::DummyBatchDeployContractsAggregate
+        );
+        assert_eq!(
+            update_jobs[0][0].job_id.circuit_type,
+            ProvingJobCircuitType::DummyBatchUpdateContractsAggregate
+        );
+
+        // the proving state starts at level zero and the needs_revert flag is
+        // cleared
+        assert_eq!(proving_state.current_proving_level, 0);
+        assert!(!env.processor.db.needs_revert);
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_genesis_checkpoint_state_transition_proof_publishes_genesis_job() -> anyhow::Result<()> {
+        let env = CoordinatorProcessorTestEnv::create().await?;
+        let processor: &PsyCoordinatorProcessor<N, _, _, _, _, _, _, _, _, _> = &env.processor;
+        let published_before = *env.proof_work_queue.published_count.lock().unwrap();
+
+        processor.plan_genesis_checkpoint_state_transition_proof().await?;
+
+        assert_eq!(*env.proof_work_queue.published_count.lock().unwrap(), published_before + 1);
+        // the genesis job lands on the worker queue
+        let queue_key = processor.db.get_proof_worker_queue_key();
+        let drained = env
+            .proof_work_queue
+            .dump_entire_worker_queue::<
+                crate::coordinator::queue_key::CoordinatorProvingWorkQueueKey<PHash, QProvingJobDataID>,
+            >(&queue_key, 1, 2, 0, 0, 16)
+            .await?;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].job_id.circuit_type,
+            ProvingJobCircuitType::GenesisBlockCheckpointStateTransition
+        );
+        env.abort_gatherers();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_block_drives_all_proving_phases_until_the_chain_commitment_check() -> anyhow::Result<()> {
+        let mut env = CoordinatorProcessorTestEnv::create().await?;
+        // bound every worker waits so a missed artifact fails fast instead of
+        // hanging
+        env.processor.proof_worker_queue_max_time_ms = 20_000;
+        let daemon = run_prover_daemon(&env, 60_000).await;
+
+        let CoordinatorProcessorTestEnv {
+            processor,
+            db,
+            proof_work_queue,
+            guta_gatherer_handle,
+            register_gatherer_handle,
+            deploy_gatherer_handle,
+            ..
+        } = env;
+        let mut processor = processor;
+        let unique_pending_id_after = processor.db.ids.unique_pending_id + 1;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            processor.process_block(),
+        )
+        .await
+        .expect("process_block must terminate within the test timeout");
+        daemon.abort();
+        guta_gatherer_handle.abort();
+        register_gatherer_handle.abort();
+        deploy_gatherer_handle.abort();
+
+        // The full pipeline (gatherers -> dummy level-0 jobs -> genesis
+        // transition proof -> aggregate part-1 job -> checkpoint state
+        // transition job) runs against the fake proving infrastructure; the
+        // last step, commit_state, verifies the checkpoint proof
+        // public-input hash against the chain hash, and the test verifier's
+        // fixed zero hash cannot match, so the run must end exactly there.
+        let error = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => anyhow::bail!("the chain commitment check must reject the fake proof"),
+        };
+        assert!(
+            error.contains("Checkpoint proof public-input hash mismatch for checkpoint ID 1"),
+            "unexpected error: {error}"
+        );
+
+        // the ids rotated for the block but the checkpoint stayed uncommitted
+        assert_eq!(processor.db.ids.unique_pending_id, unique_pending_id_after);
+        assert_eq!(processor.db.ids.checkpoint_id, 0);
+        assert_eq!(db.get_latest_checkpoint_id().await?, 0);
+
+        // every phase published its proving job: four gatherer dummy roots,
+        // the genesis transition, the aggregate part-1 job and the checkpoint
+        // state transition job
+        let published = *proof_work_queue.published_count.lock().unwrap();
+        assert!(published >= 7, "expected at least 7 published proving jobs, got {published}");
+
+        // the worker-queue consumer cleanup only runs after a successful
+        // commit
+        assert!(proof_work_queue.deleted_consumers.lock().unwrap().is_empty());
+        Ok(())
+    }
+}

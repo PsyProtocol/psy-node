@@ -144,7 +144,7 @@ async function transferTokens(
 ): Promise<string> {
   const call: ContractCallArgs = {
     contract_id: 0n,
-    method_name: "simple_transfer",
+    method_name: "transfer",
     inputs: [recipientUserId, amount],
   };
 
@@ -152,7 +152,7 @@ async function transferTokens(
 }
 ```
 
-A claim uses the same verified call path and the `simple_claim` token method:
+A claim uses the same verified call path and the `claim` token method:
 
 ```typescript
 async function claimTokens(
@@ -161,7 +161,7 @@ async function claimTokens(
 ): Promise<string> {
   const call: ContractCallArgs = {
     contract_id: 0n,
-    method_name: "simple_claim",
+    method_name: "claim",
     inputs: [senderUserId],
   };
 
@@ -204,7 +204,7 @@ Verified against the SDK checkout:
 2. `createMemoryWalletProvider` takes a complete `PsyNetworkConfig` and returns a promise.
 3. `PsyUserWalletProvider` is constructed internally from a network identifier, coordinator provider, realm provider, signer provider, and prover; it does not accept a single network configuration argument.
 4. `PsyUserWallet.execContractCall` requires the public-key hash as its first argument.
-5. `simple_transfer` and `simple_claim` exist in the checked-in token contract Application Binary Interface.
+5. `transfer` and `claim` are the token method names in the multi-chain Genesis artifact cohort.
 6. The contract generator and basic demo scripts exist at the documented paths.
 
 The network constants and application helper functions in this guide are illustrative because their values and confirmation policy depend on the deployment.

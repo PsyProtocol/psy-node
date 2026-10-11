@@ -26,11 +26,11 @@ The main `config.json` file supports multiple networks and selects one through `
       "magic": "0x1337CF514544CF69",
       "users_per_realm": 1048576
     },
-    "sepolia": {
-      "magic": "0x1337CF514544C169",
+    "testnet": {
+      "magic": "0x1337CF514544CF69",
       "users_per_realm": 1048576
     },
-    "ethereum": {
+    "mainnet": {
       "magic": "0x1337CF514544C069",
       "users_per_realm": 1048576
     }
@@ -39,7 +39,7 @@ The main `config.json` file supports multiple networks and selects one through `
 }
 ```
 
-Applications use `defaultNetwork` unless a network is selected explicitly. The network names and magic values are defined in `psy-genesis/config.json:3-4,71-72,139-140`.
+Applications will use the `defaultNetwork` configuration unless explicitly switched to another network. The Psy stage name (the `networks` key, and `defaultNetwork`) is one of exactly three values: `localhost`, `testnet`, or `mainnet` — it is not an L1 chain name.
 
 ## 2. Core Network Parameters
 
@@ -170,7 +170,7 @@ Genesis contracts contain pre-deployed bytecode and initial state:
     "precompiles": [
       {
         "name": "system_contract",
-        "deployer": ["<hash-element>"],
+        "deployer": 12345,
         "bytecode": ["<contract-bytecode>"]
       }
     ]
@@ -198,11 +198,11 @@ A network configuration can restrict accepted secp256k1 public keys:
 
 | Network | Purpose | Endpoint source |
 |---|---|---|
-| `localhost` | Local development and testing | Loopback addresses in `psy-genesis/config.json:9-69` |
-| `sepolia` | Ethereum Sepolia-backed deployment configuration | `psy-genesis/config.json:71-137` |
-| `ethereum` | Ethereum-backed deployment configuration | `psy-genesis/config.json:139-204` |
+| `localhost` | Local development and testing | `networks.localhost` in `psy-genesis/config.json` |
+| `testnet` | Public testing deployment configuration | `networks.testnet` in `psy-genesis/config.json` |
+| `mainnet` | Production deployment configuration | `networks.mainnet` in `psy-genesis/config.json` |
 
-The public testing deployment is suspended. The configured network selectors remain `localhost`, `sepolia`, and `ethereum`.
+L1 chain names such as `sepolia` and `ethereum` are separate from these Psy stage selectors.
 
 ## 6. Configuration Verification
 

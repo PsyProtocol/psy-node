@@ -22,26 +22,33 @@ fn compiler_root() -> PathBuf {
 }
 
 fn provenance_stamp_path() -> PathBuf {
-    workspace_root().join("psy-genesis/.genesis_contracts.compiler-artifact.json")
+    genesis_root().join(".genesis_contracts.compiler-artifact.json")
 }
 
 fn genesis_contracts_path() -> PathBuf {
-    workspace_root().join("psy-genesis/genesis_contracts.json")
+    genesis_root().join("genesis_contracts.json")
 }
 
 fn token_artifact_path() -> PathBuf {
-    workspace_root().join("psy-genesis/token.json")
+    genesis_root().join("token.json")
+}
+
+fn genesis_root() -> PathBuf {
+    // Validate candidate artifacts before advancing the release gitlink.
+    std::env::var_os("PSY_TEST_GENESIS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("psy-genesis"))
 }
 
 fn token_abi_path() -> PathBuf {
-    workspace_root().join("psy-genesis/genesis_abi/PsyTokenContract.json")
+    genesis_root().join("genesis_abi/PsyTokenContract.json")
 }
 
 fn usdt_abi_path() -> PathBuf {
-    workspace_root().join("psy-genesis/genesis_abi/USDTTokenContract.json")
+    genesis_root().join("genesis_abi/USDTTokenContract.json")
 }
 fn abi_manifest_path() -> PathBuf {
-    workspace_root().join("psy-genesis/genesis_abi/abi_list.json")
+    genesis_root().join("genesis_abi/abi_list.json")
 }
 
 // --- JSON helpers --------------------------------------------------------
@@ -51,27 +58,18 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("failed to parse {}: {}", path.display(), e))
 }
 
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 fn read_methods(path: &Path) -> Vec<Value> {
     let artifact = read_json(path);
-    match artifact {
-        Value::Array(methods) => methods,
-        Value::Object(mut fields) => fields
-            .remove("circuit_definitions")
-            .and_then(|value| value.as_array().cloned())
-            .unwrap_or_else(|| panic!("{} has no circuit_definitions method array", path.display())),
-        other => panic!("{} is not a method array or artifact object (found {})", path.display(), json_kind(&other)),
-    }
+    assert!(artifact.is_object(), "{} must be a compiler artifact envelope", path.display());
+    let height = artifact["state_tree_height"].as_u64()
+        .unwrap_or_else(|| panic!("{} must have an integer state_tree_height", path.display()));
+    assert!(artifact["abi"].is_object(), "{} must have an ABI object", path.display());
+    assert_eq!(
+        Some(height), genesis_contract("token").pointer("/code_definition/state_tree_height").and_then(Value::as_u64),
+        "{} state tree height differs from embedded Genesis", path.display()
+    );
+    artifact["circuit_definitions"].as_array()
+        .unwrap_or_else(|| panic!("{} must have a circuit_definitions array", path.display())).clone()
 }
 
 fn method<'a>(methods: &'a [Value], name: &str) -> &'a Value {
@@ -255,8 +253,8 @@ fn deployed_token_artifact_exposes_claim_events_for_all_claim_paths() {
     let methods = read_methods(&token_artifact_path());
 
     assert!(
-        event_len(&methods, "simple_claim") >= 1,
-        "psy-genesis/token.json simple_claim must expose ClaimEvent"
+        event_len(&methods, "claim") >= 1,
+        "psy-genesis/token.json claim must expose ClaimEvent"
     );
     assert!(
         event_len(&methods, "private_claim") >= 1,
@@ -351,7 +349,7 @@ fn genesis_contracts_provenance_stamp_matches_checked_out_compiler_and_artifact(
 
     for (label, path, expected_hash, expected_size) in [
         ("token.json", token_artifact_path(), token_sha256, token_byte_size),
-        ("token.update.json", workspace_root().join("psy-genesis/token.update.json"), token_update_sha256, token_update_byte_size),
+        ("token.update.json", genesis_root().join("token.update.json"), token_update_sha256, token_update_byte_size),
     ] {
         let bytes = fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
         assert_eq!(expected_hash, hex::encode(Sha256::digest(&bytes)), "{} is stale: hash mismatch", label);
@@ -386,7 +384,7 @@ fn deployed_token_artifact_matches_genesis_for_claim_event_presence() {
     let genesis_token = genesis_methods("token");
     let genesis_usdt = genesis_methods("usdt_token");
 
-    for name in ["simple_claim", "private_claim", "claim_deposit"] {
+    for name in ["claim", "private_claim", "claim_deposit"] {
         assert_eq!(
             event_len(&deployed, name),
             event_len(&genesis_token, name),
@@ -471,7 +469,7 @@ fn assert_manifest_precompile(contract_id: u64, name: &str, abi_path: &str, abi_
     assert_eq!(precompile.get("name").and_then(Value::as_str), Some(name));
     assert_eq!(precompile.get("abi_path").and_then(Value::as_str), Some(abi_path));
 
-    let referenced_abi_path = workspace_root().join("psy-genesis/genesis_abi").join(abi_path);
+    let referenced_abi_path = genesis_root().join("genesis_abi").join(abi_path);
     let referenced_abi = read_json(&referenced_abi_path);
     assert_eq!(
         referenced_abi.pointer("/contract/name").and_then(Value::as_str),

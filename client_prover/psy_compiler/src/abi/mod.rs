@@ -200,7 +200,7 @@ pub enum TypeRef {
     },
     Array {
         item: Box<TypeRef>,
-        length: u32,
+        length: u64,
         item_felt_size: usize,
     },
     Map {
@@ -556,7 +556,7 @@ impl TypeRef {
                 let item_felt_size = element.felt_size(struct_layouts).unwrap_or(0);
                 TypeRef::Array {
                     item,
-                    length: (*count).try_into().unwrap_or(u32::MAX),
+                    length: (*count).try_into().unwrap_or(u64::MAX),
                     item_felt_size,
                 }
             }
@@ -565,7 +565,7 @@ impl TypeRef {
                 let item_felt_size = element.felt_size(struct_layouts).unwrap_or(0);
                 TypeRef::Array {
                     item,
-                    length: (*count).try_into().unwrap_or(u32::MAX),
+                    length: (*count).try_into().unwrap_or(u64::MAX),
                     item_felt_size,
                 }
             }

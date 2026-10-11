@@ -331,7 +331,13 @@ macro_rules! __impl_psy_canonical_serialize_for_speedy_internal {
             #[inline(always)]
             fn pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
                 use speedy::Readable;
-                Self::read_from_stream_buffered_with_ctx(speedy::LittleEndian::default(), reader)
+                // Deliberately unbuffered: the buffered stream reader eagerly pulls up to
+                // 8 KiB from the shared reader, which silently misaligns any manual psy_io
+                // reads that follow a nested pio_read_from_io call (e.g. inside
+                // FallbackPsySerializeCanonical implementations that mix child reads with
+                // direct psy_read_* calls). The unbuffered reader consumes exactly the
+                // bytes this type needs and nothing more.
+                Self::read_from_stream_unbuffered_with_ctx(speedy::LittleEndian::default(), reader)
                     .map_err(anyhow::Error::from)
             }
 
@@ -357,13 +363,14 @@ macro_rules! __impl_psy_canonical_serialize_for_speedy_internal {
                     Some(n) => {
                         let mut vec = Vec::with_capacity(n);
                         for _ in 0..n {
-                            vec.push(Self::read_from_stream_buffered_with_ctx(speedy::LittleEndian::default(), &mut *reader)?);
+                            // Unbuffered, same rationale as `pio_read_from_io` above.
+                            vec.push(Self::read_from_stream_unbuffered_with_ctx(speedy::LittleEndian::default(), &mut *reader)?);
                         }
                         Ok(vec)
                     }
                     None => {
                         // `known_count` is None, so we rely on Speedy to read the length prefix from the stream.
-                        Vec::<Self>::read_from_stream_buffered_with_ctx(speedy::LittleEndian::default(), reader)
+                        Vec::<Self>::read_from_stream_unbuffered_with_ctx(speedy::LittleEndian::default(), reader)
                             .map_err(anyhow::Error::from)
                     }
                 }

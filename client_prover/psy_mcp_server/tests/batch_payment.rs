@@ -38,7 +38,7 @@ fn spent(e: &mut PolicyEngine, pid: &str) -> (u64, u64, u64) {
 fn a_clean_batch_is_authorized_and_charged_exactly_once() {
     let (mut e, pid, tok) = engine_with(limits(100 * PSY, 100 * PSY), None);
     let legs = [("alice", 10 * PSY), ("bob", 20 * PSY), ("carol", 5 * PSY)];
-    e.authorize_batch(&tok, &legs, "simple_transfer").expect("clean batch is allowed");
+    e.authorize_batch(&tok, &legs, "transfer").expect("clean batch is allowed");
     assert_eq!(spent(&mut e, &pid), (35 * PSY, 35 * PSY, 35 * PSY), "the sum of the legs, no more and no less");
 }
 
@@ -46,7 +46,7 @@ fn a_clean_batch_is_authorized_and_charged_exactly_once() {
 fn every_leg_lands_in_the_spend_history() {
     let (mut e, _pid, tok) = engine_with(limits(100 * PSY, 100 * PSY), None);
     let legs = [("alice", 1 * PSY), ("bob", 2 * PSY)];
-    e.authorize_batch(&tok, &legs, "simple_transfer").unwrap();
+    e.authorize_batch(&tok, &legs, "transfer").unwrap();
     let log = e.spend_log(50, None);
     assert!(log.len() >= 2, "an owner reviewing history must see each payment, not one lump");
     assert!(log.iter().any(|r| r.recipient == "alice"));
@@ -61,7 +61,7 @@ fn a_leg_over_the_per_payment_cap_rejects_the_whole_batch_and_spends_nothing() {
     let before = spent(&mut e, &pid);
     // leg 1 and 3 are fine; leg 2 is over the per-payment cap.
     let legs = [("alice", 5 * PSY), ("bob", 50 * PSY), ("carol", 5 * PSY)];
-    let err = e.authorize_batch(&tok, &legs, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize_batch(&tok, &legs, "transfer").unwrap_err().to_string();
     assert!(err.contains("nothing was sent"), "the caller must be told the batch did not partially apply: {err}");
     assert!(err.contains("payment 2"), "the refusal must say WHICH payment: {err}");
     assert_eq!(spent(&mut e, &pid), before, "a refused batch must not consume any budget");
@@ -73,7 +73,7 @@ fn the_cumulative_total_is_checked_not_just_each_leg() {
     let (mut e, pid, tok) = engine_with(limits(40 * PSY, 100 * PSY), None);
     let before = spent(&mut e, &pid);
     let legs = [("alice", 40 * PSY), ("bob", 40 * PSY), ("carol", 40 * PSY)];
-    let err = e.authorize_batch(&tok, &legs, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize_batch(&tok, &legs, "transfer").unwrap_err().to_string();
     assert!(err.contains("daily cap"), "the running total must be charged against the day: {err}");
     assert_eq!(spent(&mut e, &pid), before, "still nothing spent");
 }
@@ -86,7 +86,7 @@ fn a_non_allowlisted_recipient_anywhere_rejects_the_whole_batch() {
     );
     let before = spent(&mut e, &pid);
     let legs = [("alice", 1 * PSY), ("mallory", 1 * PSY)];
-    let err = e.authorize_batch(&tok, &legs, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize_batch(&tok, &legs, "transfer").unwrap_err().to_string();
     assert!(err.contains("allowlist"), "{err}");
     assert_eq!(spent(&mut e, &pid), before, "the allowlisted leg must not slip through on its own");
 }
@@ -97,7 +97,7 @@ fn a_paused_policy_refuses_the_batch() {
     e.pause(&pid);
     let before = spent(&mut e, &pid);
     let legs = [("alice", 1 * PSY)];
-    let err = e.authorize_batch(&tok, &legs, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize_batch(&tok, &legs, "transfer").unwrap_err().to_string();
     assert!(err.contains("paused"), "{err}");
     assert_eq!(spent(&mut e, &pid), before);
 }
@@ -106,7 +106,7 @@ fn a_paused_policy_refuses_the_batch() {
 fn refusals_are_visible_to_the_owner_as_blocked_attempts() {
     let (mut e, _pid, tok) = engine_with(limits(10 * PSY, 1_000 * PSY), None);
     let legs = [("alice", 5 * PSY), ("bob", 50 * PSY)];
-    let _ = e.authorize_batch(&tok, &legs, "simple_transfer");
+    let _ = e.authorize_batch(&tok, &legs, "transfer");
     let blocked = e.denied_log(50, None);
     assert!(
         blocked.iter().any(|d| d.recipient == "bob"),
@@ -122,7 +122,7 @@ fn a_refused_leg_does_not_cascade_into_spurious_refusals() {
     // never going to happen.
     let (mut e, _pid, tok) = engine_with(limits(100 * PSY, 30 * PSY), None);
     let legs = [("alice", 10 * PSY), ("bob", 90 * PSY), ("carol", 10 * PSY)];
-    let err = e.authorize_batch(&tok, &legs, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize_batch(&tok, &legs, "transfer").unwrap_err().to_string();
     assert!(err.contains("1 of 3 payments"), "only bob should be refused: {err}");
     assert!(err.contains("payment 2"), "{err}");
     assert!(!err.contains("payment 3"), "carol was affordable and must not be blamed: {err}");
@@ -133,7 +133,7 @@ fn a_refused_leg_does_not_cascade_into_spurious_refusals() {
 #[test]
 fn an_empty_batch_is_refused() {
     let (mut e, _pid, tok) = engine_with(limits(100 * PSY, 1_000 * PSY), None);
-    assert!(e.authorize_batch(&tok, &[], "simple_transfer").is_err());
+    assert!(e.authorize_batch(&tok, &[], "transfer").is_err());
 }
 
 #[test]
@@ -141,7 +141,7 @@ fn an_oversized_batch_is_refused_before_any_evaluation() {
     let (mut e, pid, tok) = engine_with(limits(1_000 * PSY, 1_000_000 * PSY), None);
     let before = spent(&mut e, &pid);
     let legs: Vec<(&str, u64)> = (0..=MAX_BATCH_PAYMENTS).map(|_| ("alice", 1 * PSY)).collect();
-    let err = e.authorize_batch(&tok, &legs, "simple_transfer").unwrap_err().to_string();
+    let err = e.authorize_batch(&tok, &legs, "transfer").unwrap_err().to_string();
     assert!(err.contains("nothing was sent"), "{err}");
     assert_eq!(spent(&mut e, &pid), before);
 }
@@ -149,19 +149,19 @@ fn an_oversized_batch_is_refused_before_any_evaluation() {
 #[test]
 fn a_batch_needs_a_valid_live_session() {
     let (mut e, _pid, tok) = engine_with(limits(100 * PSY, 1_000 * PSY), None);
-    assert!(e.authorize_batch("not-a-token", &[("alice", 1 * PSY)], "simple_transfer").is_err());
+    assert!(e.authorize_batch("not-a-token", &[("alice", 1 * PSY)], "transfer").is_err());
     e.expire_session_for_test(&tok);
-    assert!(e.authorize_batch(&tok, &[("alice", 1 * PSY)], "simple_transfer").is_err());
+    assert!(e.authorize_batch(&tok, &[("alice", 1 * PSY)], "transfer").is_err());
 }
 
 #[test]
 fn a_disallowed_method_refuses_the_batch() {
     let mut e = PolicyEngine::new();
-    let pid = e.create_policy("agent-1", limits(100 * PSY, 1_000 * PSY), None, vec!["simple_claim".into()]);
+    let pid = e.create_policy("agent-1", limits(100 * PSY, 1_000 * PSY), None, vec!["claim".into()]);
     let (tok, _) = e.issue_session(&pid, 60, None).unwrap();
     let before = spent(&mut e, &pid);
     let err = e
-        .authorize_batch(&tok, &[("alice", 1 * PSY)], "simple_transfer")
+        .authorize_batch(&tok, &[("alice", 1 * PSY)], "transfer")
         .unwrap_err()
         .to_string();
     assert!(err.contains("not allowed"), "{err}");
@@ -174,6 +174,6 @@ fn a_repeated_recipient_is_allowed_and_charged_twice() {
     // catch a human typing a payee twice. An agent paying one seller for two
     // items is ordinary; the caps still bound the total.
     let (mut e, pid, tok) = engine_with(limits(100 * PSY, 1_000 * PSY), None);
-    e.authorize_batch(&tok, &[("alice", 3 * PSY), ("alice", 4 * PSY)], "simple_transfer").unwrap();
+    e.authorize_batch(&tok, &[("alice", 3 * PSY), ("alice", 4 * PSY)], "transfer").unwrap();
     assert_eq!(spent(&mut e, &pid).0, 7 * PSY);
 }

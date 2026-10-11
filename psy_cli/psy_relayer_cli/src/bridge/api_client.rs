@@ -82,16 +82,45 @@ pub async fn fetch_services_deposit_tree_root(
     source_chain_index: u64,
     target_deposit_count: u64,
 ) -> anyhow::Result<DepositTreeRootState> {
-    let mut url = reqwest::Url::parse(&format!(
-        "{}/api/v1/bridge/deposit-tree-root",
-        services_url.trim_end_matches('/'),
-    ))?;
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("source_chain_index", &source_chain_index.to_string());
-        let target_deposit_count = target_deposit_count.to_string();
-        query.append_pair("target_deposit_count", &target_deposit_count);
-    }
+    fetch_services_deposit_tree_root_with_count(
+        http,
+        services_url,
+        source_chain_index,
+        "target_deposit_count",
+        target_deposit_count,
+    )
+    .await
+}
+
+pub async fn fetch_services_deposit_snapshot_root(
+    http: &reqwest::Client,
+    services_url: &str,
+    source_chain_index: u64,
+    snapshot_deposit_count: u64,
+) -> anyhow::Result<DepositTreeRootState> {
+    fetch_services_deposit_tree_root_with_count(
+        http,
+        services_url,
+        source_chain_index,
+        "snapshot_deposit_count",
+        snapshot_deposit_count,
+    )
+    .await
+}
+
+async fn fetch_services_deposit_tree_root_with_count(
+    http: &reqwest::Client,
+    services_url: &str,
+    source_chain_index: u64,
+    count_parameter: &'static str,
+    deposit_count: u64,
+) -> anyhow::Result<DepositTreeRootState> {
+    let url = build_services_deposit_tree_root_url(
+        services_url,
+        source_chain_index,
+        count_parameter,
+        deposit_count,
+    )?;
     let resp: ApiResponse<DepositTreeRootState> =
         get_services_json(http, url.as_str(), "deposit_tree_root").await?;
     if !resp.success {
@@ -101,6 +130,24 @@ pub async fn fetch_services_deposit_tree_root(
         );
     }
     resp.data.ok_or_else(|| anyhow::anyhow!("deposit_tree_root response missing data"))
+}
+
+fn build_services_deposit_tree_root_url(
+    services_url: &str,
+    source_chain_index: u64,
+    count_parameter: &'static str,
+    deposit_count: u64,
+) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/api/v1/bridge/deposit-tree-root",
+        services_url.trim_end_matches('/'),
+    ))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("source_chain_index", &source_chain_index.to_string());
+        query.append_pair(count_parameter, &deposit_count.to_string());
+    }
+    Ok(url)
 }
 
 pub async fn get_services_json<T: serde::de::DeserializeOwned>(
@@ -190,4 +237,36 @@ pub async fn resolve_l1_chain_index<P: Provider>(
         state_manager
     );
     Ok(onchain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_services_deposit_tree_root_url;
+
+    #[test]
+    fn deposit_tree_root_url_distinguishes_global_and_per_chain_counts() {
+        let global = build_services_deposit_tree_root_url(
+            "http://services.example/",
+            0,
+            "target_deposit_count",
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            global.query(),
+            Some("source_chain_index=0&target_deposit_count=9")
+        );
+
+        let per_chain = build_services_deposit_tree_root_url(
+            "http://services.example/",
+            1,
+            "snapshot_deposit_count",
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            per_chain.query(),
+            Some("source_chain_index=1&snapshot_deposit_count=4")
+        );
+    }
 }

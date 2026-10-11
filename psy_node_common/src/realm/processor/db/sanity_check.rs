@@ -60,3 +60,15 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod sanity_check_tests {
+    use crate::realm::processor::db::realm_db_test_env::*;
+
+    #[tokio::test]
+    async fn run_sanity_check_is_ok_on_fresh_processor() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        env.processor.run_sanity_check("sanity_check_tests").await?;
+        Ok(())
+    }
+}

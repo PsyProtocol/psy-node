@@ -6,8 +6,14 @@ use psy_core::constants::{
 };
 use psy_jtmb_testing_core::{circuit_library::worker::get_simple_proof_miner_worker_for_network_jtmb, protocol_types::JTMBPoseidonGoldilocksConfig};
 use psy_plonky2_circuits::circuit_library::get_simple_proof_miner_worker_for_network;
-use psy_worker_core::config::{worker_cli_config::WorkerCliConfig, worker_config::WorkerStartupConfig};
+use psy_worker_core::{
+    config::{worker_cli_config::WorkerCliConfig, worker_config::WorkerStartupConfig},
+    worker::proving_pools::{default_total_threads, ProvingPools},
+};
+use std::sync::Arc;
 use tracing::{error, info};
+
+use super::ProvingPoolsMode;
 
 fn print_banner() {
     println!(
@@ -41,6 +47,7 @@ pub async fn run_worker_inner(
     config: WorkerStartupConfig,
     proving_backend: PsyChainProvingBackendType,
     batch_size: usize,
+    pools: Option<Arc<ProvingPools>>,
 ) -> anyhow::Result<()> {
     // Placeholder for actual worker logic
 
@@ -49,7 +56,7 @@ pub async fn run_worker_inner(
         const D: usize = 2;
         let worker = get_simple_proof_miner_worker_for_network::<C, D>(network, config).await?;
 
-        worker.run_worker_loop(100, batch_size).await?;
+        worker.run_worker_loop_with_pools(100, batch_size, pools).await?;
     } else if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
         let worker = get_simple_proof_miner_worker_for_network_jtmb::<JTMBPoseidonGoldilocksConfig>(network, config).await?;
         worker.run_worker_loop(100, batch_size).await?;
@@ -70,6 +77,8 @@ pub async fn run(
     coordinator_api_urls: Vec<String>,
     url_rotation_strategy: PsyAPIURLRotationStrategyInput,
     batch_size: usize,
+    proving_pools: ProvingPoolsMode,
+    threads_per_job: Option<usize>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Worker starting...");
@@ -93,11 +102,21 @@ pub async fn run(
     let proving_backend = proving_backend
             .unwrap_or(PsyChainProvingBackendTypeInput::Plonky2PoseidonGoldilocks)
             .into();
+    // Per-job pools were only measured with the plonky2 prover.
+    let pools = match proving_pools {
+        ProvingPoolsMode::PerJob if proving_backend == PsyChainProvingBackendType::Plonky2PoseidonGoldilocks => {
+            let pools = ProvingPools::new(default_total_threads(), batch_size, threads_per_job)?;
+            info!("A thread pool per job: the global pool of {} threads for a job that starts alone, {} threads for each job that starts beside others", default_total_threads(), pools.narrow_threads());
+            Some(Arc::new(pools))
+        }
+        _ => None,
+    };
     let handle = tokio::spawn(run_worker_inner(
         network,
         config,
         proving_backend,
         batch_size,
+        pools,
     ));
     handles.push(handle);
     /*

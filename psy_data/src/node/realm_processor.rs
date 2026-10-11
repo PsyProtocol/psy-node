@@ -199,3 +199,67 @@ impl<Hash: QHashBase> RealmProcessorCoreStateWrapper<Hash> {
         Ok(state)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parth_core::{pgoldilocks::QHashOut, utils::QPGenRandom, PF};
+
+    type Hash = QHashOut<PF>;
+
+    fn state() -> RealmProcessorCoreState<Hash> {
+        RealmProcessorCoreState::new_basic(
+            9,
+            QRealmIdentifier::new(3, 4),
+            10,
+            11,
+            QCoreProcCheckpointUniqueId::qp_rand_gen(),
+            Hash::qp_rand_gen(),
+            Hash::qp_rand_gen(),
+        )
+    }
+
+    #[test]
+    fn lifecycle_moves_gathering_processing_and_committed_state() {
+        let mut value = state();
+        assert_eq!(value.realm_id_u64, value.realm_identifier.realm_id as u64);
+        assert_eq!(value.realm_sub_id_u64, value.realm_identifier.realm_sub_id as u64);
+        assert!(value.psy_debug_print().contains("RealmProcessorCoreState"));
+
+        value.update_synced_checkpoint(20, Hash::qp_rand_gen()).unwrap();
+        let end_root = Hash::qp_rand_gen();
+        value.finish_gathering(
+            end_root,
+            21,
+            Hash::qp_rand_gen(),
+            22,
+            QCoreProcCheckpointUniqueId::qp_rand_gen(),
+        ).unwrap();
+        assert_eq!(value.processing_realm_end_root, end_root);
+        value.commit_processing().unwrap();
+        assert_eq!(value.last_committed_realm_end_root, end_root);
+
+        value.revert_processing(
+            30,
+            QCoreProcCheckpointUniqueId::qp_rand_gen(),
+            31,
+            QCoreProcCheckpointUniqueId::qp_rand_gen(),
+        ).unwrap();
+        assert!(value.should_revert_processing_changes);
+        assert!(value.finish_gathering(Hash::qp_rand_gen(), 40, Hash::qp_rand_gen(), 41, QCoreProcCheckpointUniqueId::qp_rand_gen()).is_err());
+    }
+
+    #[tokio::test]
+    async fn wrapper_loads_and_replaces_core_state() {
+        let original = state();
+        let wrapper = RealmProcessorCoreStateWrapper::new(original);
+        assert_eq!(wrapper.load_core_state().await.unwrap().chain_id, 9);
+        let mut replacement = state();
+        replacement.chain_id = 77;
+        replacement.processing_checkpoint_id = 88;
+        wrapper.update_from_core_state(&replacement).await.unwrap();
+        let loaded = wrapper.load_core_state().await.unwrap();
+        assert_eq!(loaded.chain_id, 9, "copy_from intentionally preserves identity fields");
+        assert_eq!(loaded.processing_checkpoint_id, 88);
+    }
+}

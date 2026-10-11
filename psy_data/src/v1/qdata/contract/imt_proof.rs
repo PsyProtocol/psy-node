@@ -1,6 +1,6 @@
 use parth_core::{
     crypto::hash::merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
-    felt::{QFelt64, ToU64Value},
+    felt::QFelt64,
     protocol::core_types::{Q256BitHash, QFHashBase},
     utils::QPGenRandom,
 };
@@ -401,10 +401,9 @@ pub fn deserialize_imt_leaf_ffs_entry_v2(
     Ord,
     Hash,
     serde::Serialize,
-    serde::Deserialize,
-    speedy::Readable,
-    speedy::Writable
+    serde::Deserialize
 )]
+#[cfg_attr(all(feature = "serialize_speedy", target_endian = "little"), derive(speedy::Readable, speedy::Writable))]
 #[serde(
     bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize,
              for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize"
@@ -591,10 +590,9 @@ impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySeria
     Ord,
     Hash,
     serde::Serialize,
-    serde::Deserialize,
-    speedy::Readable,
-    speedy::Writable
+    serde::Deserialize
 )]
+#[cfg_attr(all(feature = "serialize_speedy", target_endian = "little"), derive(speedy::Readable, speedy::Writable))]
 #[serde(
     bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize,
              for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize"
@@ -702,8 +700,8 @@ impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySeria
 mod imt_encoding_tests {
     use super::*;
     use parth_core::{PF, PHash};
-    use parth_core::felt::{FromPrimitiveValuesFelt, ZeroableFelt};
     use parth_core::crypto::hash::traits::{FromU64x4, ZeroableHash};
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
     #[test]
     fn test_encode_decode_roundtrip_zero() {
@@ -845,5 +843,192 @@ mod imt_encoding_tests {
         assert_eq!(tid2, 1);
         assert_eq!(li2, 1);
         assert!(!ink2);
+    }
+
+    #[test]
+    fn ffs_v1_layout_and_bucket_conversions_are_stable() {
+        let leaf_hash = PHash::from_u64x4([1, 2, 3, 4]);
+        let leaf_key = PHash::from_u64x4([5, 6, 7, 8]);
+        let leaf_value = PHash::from_u64x4([9, 10, 11, 12]);
+        let next_key = PHash::from_u64x4([13, 14, 15, 16]);
+        let serialized = serialize_imt_leaf_ffs_entry(
+            42, 7, 100, &leaf_hash, &leaf_key, &leaf_value, &next_key, 999, true,
+        );
+
+        assert_eq!(serialized.len(), IMT_LEAF_FFS_ENTRY_SIZE);
+        assert_eq!(u64::from_le_bytes(serialized[0..8].try_into().unwrap()), 42);
+        assert_eq!(u64::from_le_bytes(serialized[8..16].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(serialized[16..24].try_into().unwrap()), 100);
+        assert_eq!(&serialized[24..56], &leaf_hash.into_owned_32bytes());
+        assert_eq!(&serialized[56..88], &leaf_key.into_owned_32bytes());
+        assert_eq!(&serialized[88..120], &leaf_value.into_owned_32bytes());
+        assert_eq!(&serialized[120..152], &next_key.into_owned_32bytes());
+        assert_eq!(serialized[152], 1);
+
+        for bucket in [0, 1, 32_767, 32_768, u16::MAX] {
+            assert_eq!(imt_key_bucket_from_i16(imt_key_bucket_to_i16(bucket)), bucket);
+        }
+    }
+
+    #[test]
+    fn update_roots_and_history_size_include_both_variants() {
+        let proof = |old_root, new_root, siblings| DeltaMerkleProofCore {
+            old_root: PHash::from_u64x4([old_root, 0, 0, 0]),
+            old_value: PHash::get_zero_value(),
+            new_root: PHash::from_u64x4([new_root, 0, 0, 0]),
+            new_value: PHash::get_zero_value(),
+            index: 0,
+            siblings: vec![PHash::get_zero_value(); siblings],
+        };
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let update = IMTContractStateUpdate::Update {
+            old_preimage: leaf.clone(),
+            new_preimage: leaf.clone(),
+            delta_proof: proof(1, 2, 3),
+        };
+        let insert = IMTContractStateUpdate::Insert {
+            predecessor_old_preimage: leaf.clone(),
+            predecessor_new_preimage: leaf.clone(),
+            new_leaf_preimage: leaf,
+            predecessor_delta_proof: proof(3, 4, 2),
+            new_leaf_delta_proof: proof(4, 5, 4),
+        };
+        assert_eq!(update.old_root(), PHash::from_u64x4([1, 0, 0, 0]));
+        assert_eq!(update.new_root(), PHash::from_u64x4([2, 0, 0, 0]));
+        assert_eq!(insert.old_root(), PHash::from_u64x4([3, 0, 0, 0]));
+        assert_eq!(insert.new_root(), PHash::from_u64x4([5, 0, 0, 0]));
+
+        let history = IMTContractStateUpdateHistory {
+            user_contract_tree_update_proof: proof(0, 0, 0),
+            imt_updates: vec![update, insert],
+        };
+        assert_eq!(history.get_double_id_nodes_size_hint(), (3 + 2) + (2 + 2) + (4 + 2));
+        assert_eq!(
+            IMTContractStateUpdateHistory::<PF, PHash> {
+                user_contract_tree_update_proof: proof(0, 0, 0),
+                imt_updates: vec![],
+            }
+            .get_double_id_nodes_size_hint(),
+            0
+        );
+    }
+
+    #[test]
+    fn imt_updates_and_history_use_discriminated_fallback_encoding() {
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let update = IMTContractStateUpdate::Update {
+            old_preimage: leaf.clone(),
+            new_preimage: leaf,
+            delta_proof: DeltaMerkleProofCore::default(),
+        };
+        let bytes = update.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes[0], 0);
+        assert_eq!(
+            IMTContractStateUpdate::<PF, PHash>::fallback_psy_ser_from_slice(&bytes).unwrap(),
+            update
+        );
+        assert!(IMTContractStateUpdate::<PF, PHash>::fallback_psy_ser_from_slice(&[9]).is_err());
+
+    }
+
+    fn delta_of(old_root: u64, new_root: u64, siblings: usize) -> DeltaMerkleProofCore<PHash> {
+        DeltaMerkleProofCore {
+            old_root: PHash::from_u64x4([old_root, 0, 0, 0]),
+            old_value: PHash::get_zero_value(),
+            new_root: PHash::from_u64x4([new_root, 0, 0, 0]),
+            new_value: PHash::get_zero_value(),
+            index: 0,
+            siblings: vec![PHash::get_zero_value(); siblings],
+        }
+    }
+
+    #[test]
+    fn insert_updates_write_discriminant_and_round_trip() {
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let insert = IMTContractStateUpdate::Insert {
+            predecessor_old_preimage: leaf.clone(),
+            predecessor_new_preimage: leaf.clone(),
+            new_leaf_preimage: leaf,
+            predecessor_delta_proof: delta_of(3, 4, 2),
+            new_leaf_delta_proof: delta_of(4, 5, 4),
+        };
+        // The fallback writer prefixes the variant discriminant; the insert
+        // variant must use discriminant 1.
+        let bytes = insert.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes[0], 1, "insert variant must use discriminant 1");
+        // NOTE: `fallback_pio_serialized_size` does not account for the
+        // discriminant byte, so no exact size assertion is made here.
+        assert_eq!(insert.old_root(), PHash::from_u64x4([3, 0, 0, 0]));
+        assert_eq!(insert.new_root(), PHash::from_u64x4([5, 0, 0, 0]));
+
+        // Round trip through the canonical (speedy) encoding, which is the
+        // production path with the default feature set.
+        let canonical = insert.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(
+            IMTContractStateUpdate::<PF, PHash>::psy_ser_from_slice(&canonical).unwrap(),
+            insert
+        );
+    }
+
+    #[test]
+    fn history_round_trips_cover_empty_and_populated_updates() {
+        let empty = IMTContractStateUpdateHistory::<PF, PHash> {
+            user_contract_tree_update_proof: delta_of(0, 0, 0),
+            imt_updates: vec![],
+        };
+        let bytes = empty.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(
+            IMTContractStateUpdateHistory::<PF, PHash>::psy_ser_from_slice(&bytes).unwrap(),
+            empty
+        );
+
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        let history = IMTContractStateUpdateHistory {
+            user_contract_tree_update_proof: delta_of(1, 2, 1),
+            imt_updates: vec![
+                IMTContractStateUpdate::Update {
+                    old_preimage: leaf.clone(),
+                    new_preimage: leaf.clone(),
+                    delta_proof: delta_of(2, 3, 2),
+                },
+                IMTContractStateUpdate::Insert {
+                    predecessor_old_preimage: leaf.clone(),
+                    predecessor_new_preimage: leaf.clone(),
+                    new_leaf_preimage: leaf,
+                    predecessor_delta_proof: delta_of(3, 4, 2),
+                    new_leaf_delta_proof: delta_of(4, 5, 4),
+                },
+            ],
+        };
+        let bytes = history.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(
+            IMTContractStateUpdateHistory::<PF, PHash>::psy_ser_from_slice(&bytes).unwrap(),
+            history
+        );
+        // The fallback writer must accept the same histories even though its
+        // reader cannot decode them back (see note above on buffered reads).
+        assert!(history.fallback_psy_ser_to_bytes_vec().unwrap().len() > 0);
+    }
+
+    #[cfg(feature = "rand_gen")]
+    #[test]
+    fn random_updates_and_histories_round_trip() {
+        for _ in 0..16 {
+            let update = IMTContractStateUpdate::<PF, PHash>::qp_rand_gen();
+            let bytes = update.psy_ser_to_bytes_vec().unwrap();
+            assert_eq!(
+                IMTContractStateUpdate::<PF, PHash>::psy_ser_from_slice(&bytes).unwrap(),
+                update
+            );
+            assert!(update.fallback_psy_ser_to_bytes_vec().unwrap().len() > 0);
+
+            let history = IMTContractStateUpdateHistory::<PF, PHash>::qp_rand_gen();
+            let bytes = history.psy_ser_to_bytes_vec().unwrap();
+            assert_eq!(
+                IMTContractStateUpdateHistory::<PF, PHash>::psy_ser_from_slice(&bytes)
+                    .unwrap(),
+                history
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 # Prover Proxy RPC
 
-> Regenerated 2026-09-08 from live `client_prover/psy_prover/src/local/native/prove_proxy.rs`
+> RPC inventory follows `client_prover/psy_prover/src/local/native/prove_proxy/`.
 > (namespace `psy` → wire names `psy_<method>`).
 
 ## Abstract
@@ -9,7 +9,28 @@ Local proving service for UPS, contract calls, signatures, aggregation trees, an
 
 **Default listen address**: `0.0.0.0:9999` (process-configured).
 
-## Method inventory (30 methods)
+### Roles
+
+Every instance runs exactly one role, chosen with `--role` (env `PROVE_PROXY_ROLE`, default `user`):
+
+| Role | Registers | Built at startup | Intended for |
+|---|---|---|---|
+| `user` | UPS session chain, proof-tree aggregation, contract circuits, signature and minifier proofs, circuit queries | UPS circuit manager | wallet-facing pool (CLI, web wallet, faucet-server, MCP) |
+| `system` | `psy_prove_withdrawal_batch_claim_groth16`, `psy_prove_deposit_batch_append_groth16`, `psy_prove_bridge_agg_groth16` | bridge wrap circuits, three Groth16 keystores | relayer pool |
+| `all` | both | both | single-machine local testnets |
+
+A method outside the instance's role is not registered; calling it returns JSON-RPC `-32601 Method not found`.
+
+Every role also registers `psy_get_prove_proxy_role`:
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "result": { "role": "user", "user_methods": true, "system_methods": false } }
+```
+
+Clients pick the pool through `config.json`: wallets use `prove_proxy_url`; the relayer reads `system_prove_proxy_url` and refuses to start when it is missing for the current network. `psy_user_cli claim-withdrawal --prove-proxy-url` must point at a `system` or `all` instance.
+
+---
+## Method inventory
 
 ## UPS
 
@@ -46,6 +67,7 @@ Local proving service for UPS, contract calls, signatures, aggregation trees, an
 | `psy_prove_dpn_software_defined_sign` | `fingerprint`, `private_key`, `input`, `sig_hash` |
 | `psy_prove_plonky2_software_defined_sign` | `fingerprint`, `private_key`, `input`, `sig_hash` |
 
+
 ## Software-defined circuits
 
 | RPC method | Parameters |
@@ -80,4 +102,6 @@ Use `psy_prove_zk_sign_minifier`, `psy_prove_secp_sign`, `psy_prove_eth_personal
 
 ## Source
 
-- `client_prover/psy_prover/src/local/native/prove_proxy.rs`
+- `client_prover/psy_prover/src/local/native/prove_proxy/mod.rs`
+- `client_prover/psy_prover/src/local/native/prove_proxy/user.rs`
+- `client_prover/psy_prover/src/local/native/prove_proxy/system.rs`
