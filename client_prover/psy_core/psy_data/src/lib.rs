@@ -1,5 +1,6 @@
 pub mod abi;
 pub mod api;
+pub mod bridge_aggregate;
 pub mod config;
 pub mod dpn;
 pub mod guta;

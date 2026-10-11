@@ -11,6 +11,7 @@ serde = { workspace = true }
 serde_repr = { workspace = true }
 hex = { workspace = true }
 plonky2 = { workspace = true }
+tiny-keccak = { workspace = true }
 bincode = { workspace = true }
 serde_json = { workspace = true }
 maybe-async = { workspace = true }
