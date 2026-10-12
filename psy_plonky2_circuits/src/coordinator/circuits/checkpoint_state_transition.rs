@@ -136,6 +136,9 @@ where
             public_inputs_gadget,
             checkpoint_id
         );
+        // Genesis root/leaf remain transition inputs, matching the QED edge trust
+        // model. The coordinator edge validates checkpoint 1 against its canonical
+        // checkpoint 0 before accepting the proof.
         let public_inputs_hash = public_inputs_gadget.get_chain_hash_from_previous::<C::Hasher, C::F, D>(
             &mut builder,
             verify_previous_checkpoint_proof_gadget.previous_chain_hash,
@@ -160,6 +163,10 @@ where
         } else {
             None
         };
+        if let Some(chain) = &minifier_chain {
+            assert_eq!(chain.get_common_data(), checkpoint_state_transition_genesis_common_data,
+                "checkpoint recursive shape must match genesis (including degree/FRI/PI/gates)");
+        }
         Self {
             base_circuit_data,
             child_proofs_gadget,
@@ -232,7 +239,7 @@ where
             &mut pw,
             witness.last_old_checkpoint_tree_leaf_hash,
             witness.last_old_checkpoint_tree_root_hash,
-            witness.previous_chain_hash,
+            witness.start_chain_hash,
             previous_checkpoint_state_transition_proof,
             previous_checkpoint_state_transition_verifier_data,
         )?;

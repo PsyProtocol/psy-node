@@ -309,6 +309,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         circuit_fingerprint_config: &PsyNodeCircuitFingerprintConfig<N::QHash>,
         reward_tree_root: N::QHash,
         genesis_checkpoint_state_transition_hash: N::QHash,
+        start_chain_hash: N::QHash,
         block_time: u64,
     ) -> anyhow::Result<QCQEDCheckpointStateTransitionInput<N::F, N::QHash>> {
         //tracing::info!("last committed checkpoint leaf: {:?} ", last_committed.checkpoint_leaf);
@@ -383,6 +384,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             last_old_checkpoint_tree_root_hash: last_committed.checkpoint_state_transition.old_checkpoint_tree_root,
             genesis_checkpoint_state_transition_hash,
             previous_chain_hash: last_committed.last_chain_hash,
+            start_chain_hash,
             checkpoint_state_transition_circuit_fingerprint:
                 circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
         };
@@ -417,6 +419,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         circuit_fingerprint_config: &PsyNodeCircuitFingerprintConfig<N::QHash>,
         agg_part_1_reward_tree_value: N::QHash,
         genesis_checkpoint_state_transition_hash: N::QHash,
+        start_chain_hash: N::QHash,
         block_time: u64,
     ) -> anyhow::Result<(PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>, (N::JobId, Vec<u8>))> {
         let witness = self.get_checkpoint_state_transition_witness(
@@ -427,6 +430,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             circuit_fingerprint_config,
             agg_part_1_reward_tree_value,
             genesis_checkpoint_state_transition_hash,
+            start_chain_hash,
             block_time,
         )?;
         let witness_bytes = witness.psy_ser_to_bytes_vec()?;
@@ -1259,7 +1263,7 @@ mod output_builder_tests {
         let builder = make_builder(false);
 
         let witness = builder
-            .get_checkpoint_state_transition_witness(0, 1, &tree, &last_committed, &fingerprint_config, zh(50), zh(60), 999)
+            .get_checkpoint_state_transition_witness(0, 1, &tree, &last_committed, &fingerprint_config, zh(50), zh(60), zh(70), 999)
             .unwrap();
 
         assert_eq!(witness.previous_checkpoint_proof.value, old_leaf_hash);
@@ -1278,6 +1282,7 @@ mod output_builder_tests {
         assert_eq!(witness.last_old_checkpoint_tree_leaf_hash, last_committed.checkpoint_state_transition.old_checkpoint_leaf_hash);
         assert_eq!(witness.last_old_checkpoint_tree_root_hash, last_committed.checkpoint_state_transition.old_checkpoint_tree_root);
         assert_eq!(witness.previous_chain_hash, last_committed.last_chain_hash);
+        assert_eq!(witness.start_chain_hash, zh(70));
         assert_eq!(witness.genesis_checkpoint_state_transition_hash, zh(60));
         assert_eq!(witness.checkpoint_state_transition_circuit_fingerprint, zh(25));
         assert_eq!(witness.partial.block_time, PF::from_u64_value(999));
@@ -1287,7 +1292,7 @@ mod output_builder_tests {
         // a stale tree (leaf built from different stats) must be rejected
         let stale_last_committed = sample_last_committed(PQEDCheckpointLeafStats::qp_rand_gen());
         let err = builder
-            .get_checkpoint_state_transition_witness(0, 1, &tree, &stale_last_committed, &fingerprint_config, zh(50), zh(60), 999)
+            .get_checkpoint_state_transition_witness(0, 1, &tree, &stale_last_committed, &fingerprint_config, zh(50), zh(60), zh(70), 999)
             .unwrap_err();
         assert!(err.to_string().contains("old leaf mismatch"), "unexpected error: {err}");
     }
@@ -1300,12 +1305,12 @@ mod output_builder_tests {
         let mut builder = make_builder(false);
 
         let reference = builder
-            .get_checkpoint_state_transition_witness(0, 1, &tree, &last_committed, &fingerprint_config, zh(50), zh(60), 999)
+            .get_checkpoint_state_transition_witness(0, 1, &tree, &last_committed, &fingerprint_config, zh(50), zh(60), zh(70), 999)
             .unwrap();
         let expected_siblings = reference.append_checkpoint_tree_proof.siblings.clone();
 
         let (job, (witness_id, witness_bytes)) = builder
-            .get_checkpoint_state_transition_job(0, 1, &tree, &last_committed, &fingerprint_config, zh(50), zh(60), 999)
+            .get_checkpoint_state_transition_job(0, 1, &tree, &last_committed, &fingerprint_config, zh(50), zh(60), zh(70), 999)
             .unwrap();
 
         assert_eq!(
@@ -1326,6 +1331,9 @@ mod output_builder_tests {
         assert!(!witness_bytes.is_empty());
 
         // the siblings needed to append the new checkpoint leaf are captured
+        let restored = QCQEDCheckpointStateTransitionInput::<PF, PHash>::psy_ser_from_slice(&witness_bytes).unwrap();
+        assert_eq!(restored.start_chain_hash, zh(70));
+        assert_eq!(restored.previous_chain_hash, last_committed.last_chain_hash);
         assert_eq!(builder.append_checkpoint_tree_siblings, expected_siblings);
     }
 }

@@ -246,6 +246,8 @@ pub struct QCQEDCheckpointStateTransitionInput<F, Hash> {
     pub last_old_checkpoint_tree_root_hash: Hash,
     pub previous_chain_hash: Hash,
     pub checkpoint_state_transition_circuit_fingerprint: Hash,
+    /// Opening of the predecessor's cumulative PI: chain_(i-2). Unused at i=1.
+    pub start_chain_hash: Hash,
 }
 impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInput<F, Hash> {
     pub fn update_with_new_reward_tree_root<Hasher: FieldQHasher<F, Hash>>(&mut self, reward_tree_root: Hash) {
@@ -274,6 +276,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCQEDCheckpointStateTran
             last_old_checkpoint_tree_leaf_hash: Hash::qp_rand_gen(),
             last_old_checkpoint_tree_root_hash: Hash::qp_rand_gen(),
             previous_chain_hash: Hash::qp_rand_gen(),
+            start_chain_hash: Hash::qp_rand_gen(),
             checkpoint_state_transition_circuit_fingerprint: Hash::qp_rand_gen(),
         }
     }
@@ -356,7 +359,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
     fn fallback_pio_serialized_size(&self) -> usize {
         self.partial.pio_serialized_size()
         + self.append_checkpoint_tree_proof.pio_serialized_size()
-        + self.previous_checkpoint_proof.pio_serialized_size() + 32*5
+        + self.previous_checkpoint_proof.pio_serialized_size() + 32*6
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -368,6 +371,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
         writer.psy_write_bytes_fixed(&self.last_old_checkpoint_tree_root_hash.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.previous_chain_hash.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.checkpoint_state_transition_circuit_fingerprint.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.start_chain_hash.into_owned_32bytes())?;
         Ok(())
     }
     
@@ -380,6 +384,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
         let last_old_checkpoint_tree_root_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let previous_chain_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let checkpoint_state_transition_circuit_fingerprint = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let start_chain_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         Ok(Self {
             partial,
             append_checkpoint_tree_proof,
@@ -389,6 +394,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
             last_old_checkpoint_tree_root_hash,
             previous_chain_hash,
             checkpoint_state_transition_circuit_fingerprint,
+            start_chain_hash,
         })
     }
 }

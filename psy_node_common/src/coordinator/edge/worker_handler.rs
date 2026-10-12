@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::task;
 use parth_core::{
     crypto::{
-        hash::{tag_tree::hash_tag_tree_node_single, traits::{MerkleHasher, ZeroableHash}},
+        hash::{merkle_proof::compute_root_merkle_proof_generic, traits::{FieldQHasher, MerkleHasher, ZeroableHash}},
         secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
     },
     data::queue::queue_key::QPBaseQueueType,
@@ -346,6 +346,40 @@ impl<
             .await?;
         let witness: QCQEDCheckpointStateTransitionInput<N::F, N::QHash> =
             QCQEDCheckpointStateTransitionInput::<N::F, N::QHash>::psy_ser_from_owned_bytes_vec(witness_bytes)?;
+        anyhow::ensure!(witness.append_checkpoint_tree_proof.index == job_id.goal_id,
+            "checkpoint transition witness index does not match proving job checkpoint id");
+
+        // Checkpoint 1 is the trust boundary for the cumulative chain: its
+        // predecessor is the canonical genesis checkpoint stored by the edge.
+        // The circuit keeps these values as inputs, so validate them here.
+        if witness.append_checkpoint_tree_proof.index == 1 {
+            let canonical_genesis = self.db_reader.checkpoint_tree_get_merkle_proof(0, 0).await?;
+            anyhow::ensure!(canonical_genesis.index == 0, "canonical checkpoint 0 proof has unexpected index");
+            anyhow::ensure!(
+                compute_root_merkle_proof_generic::<N::QHash, N::HasherBase>(canonical_genesis.value, canonical_genesis.index, &canonical_genesis.siblings) == canonical_genesis.root,
+                "canonical checkpoint 0 Merkle proof is invalid"
+            );
+
+            let previous = &witness.previous_checkpoint_proof;
+            anyhow::ensure!(previous.index == 0, "checkpoint 1 predecessor proof must open checkpoint 0 leaf");
+            anyhow::ensure!(previous.root == canonical_genesis.root && previous.value == canonical_genesis.value,
+                "checkpoint 1 predecessor does not match canonical checkpoint 0");
+            anyhow::ensure!(
+                compute_root_merkle_proof_generic::<N::QHash, N::HasherBase>(previous.value, previous.index, &previous.siblings) == previous.root,
+                "checkpoint 1 predecessor Merkle proof is invalid"
+            );
+            anyhow::ensure!(witness.append_checkpoint_tree_proof.old_root == canonical_genesis.root,
+                "checkpoint 1 old checkpoint root differs from canonical checkpoint 0");
+            // The append proof opens the empty slot at index 1; genesis is
+            // the predecessor leaf at index 0, checked above.
+            anyhow::ensure!(witness.genesis_checkpoint_state_transition_hash == self.db_reader.get_verifiable_checkpoint_state_transition_and_zkp(0).await?.info.state_transition.genesis_checkpoint_state_transition_hash,
+                "checkpoint 1 genesis transition hash differs from canonical checkpoint 0");
+
+            let root_leaf = N::HasherBase::q_two_to_one(canonical_genesis.root, canonical_genesis.value);
+            let expected_chain_0 = N::HasherBase::q_two_to_one(root_leaf, self.genesis_checkpoint_state_transition_fingerprint);
+            anyhow::ensure!(witness.previous_chain_hash == expected_chain_0,
+                "checkpoint 1 previous chain hash differs from canonical genesis commitment");
+        }
         let expected_public_inputs_hash = witness.get_chain_hash_with_fingerprint_and_reward_root::<N::HasherBase>(
             witness.previous_chain_hash,
             self.checkpoint_state_transition_circuit_fingerprint,
