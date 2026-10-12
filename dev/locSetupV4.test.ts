@@ -1152,7 +1152,7 @@ password_env = "SYNTHETIC_PASSWORD"
             await mkdir(path.join(cwd, "authorization"));
             for (const file of ["rpc.json", "signer", "public-reference"]) await writeFile(path.join(cwd, file), "synthetic metadata fixture, not credentials");
             await writeFile(path.join(cwd, "guardian.json"), JSON.stringify({
-                authorization_path: "public-reference", archive_path: "new-history/journal.json",
+                authorization_path: "public-reference", archive_path: "archive",
                 tls_identity_path: "public-reference", server_ca_path: "public-reference",
                 authorization_archive_path: "authorization", authorization_index_path: "public-reference",
                 history_tls_certificate_path: "public-reference", history_tls_private_key_path: "public-reference",
@@ -1251,6 +1251,65 @@ password_env = "SYNTHETIC_PASSWORD"
             guardian.archive_path = "alias/absent/journal.json";
             await writeFile(path.join(cwd, "guardian.json"), JSON.stringify(guardian));
             await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("archive_path metadata");
+        });
+    });
+
+    it("accepts a real or absent relayer archive directory and rejects a regular file through restart and resume", async () => {
+        await fixture(async (cwd, env) => {
+            const guardianPath = path.join(cwd, "guardian.json");
+            const guardian = JSON.parse(await Bun.file(guardianPath).text());
+            const archive = path.join(cwd, "archive");
+            const spawnOptions = { cwd, env: env as Record<string, string> };
+            await rm(archive, { recursive: true, force: true });
+            expect(await resolveBridgeDaemonConfigPath(cwd, env, true)).toBe(path.join(cwd, "daemon.toml"));
+            await validateRelayerTemplate(["psy_relayer_cli", "--config", "daemon.toml"], spawnOptions);
+            expect(await Bun.file(archive).exists()).toBe(false);
+
+            await mkdir(path.join(archive, "7"), { recursive: true });
+            await writeFile(path.join(archive, "7", "request.json"), "retained signing history");
+            expect(await resolveBridgeDaemonConfigPath(cwd, env, true)).toBe(path.join(cwd, "daemon.toml"));
+            await validateRelayerTemplate(["psy_relayer_cli", "--config", "daemon.toml"], spawnOptions);
+            const manager = new DevNetProcessManager();
+            const relayer = processTemplate("bridge_relayer", ["psy_relayer_cli", "--config", "daemon.toml"]);
+            relayer.spawnOptions = spawnOptions;
+            const lifecycle = manager as unknown as {
+                applicationLifecycleState: string;
+                pausedApplicationProcesses: RunningProcess[];
+                spawnedProcesses: RunningProcess[];
+            };
+            lifecycle.applicationLifecycleState = "running";
+            lifecycle.spawnedProcesses = [relayer];
+            lifecycle.pausedApplicationProcesses = [];
+            const stop = spyOn(manager, "stopApplications").mockImplementation(async () => {
+                lifecycle.applicationLifecycleState = "stopped";
+                lifecycle.spawnedProcesses = [];
+                lifecycle.pausedApplicationProcesses = [relayer];
+            });
+            const spawnSentinel = new Error("archive preflight reached spawn sentinel");
+            const spawn = spyOn(RunningProcess, "spawn").mockRejectedValue(spawnSentinel);
+            try {
+                // The saved config matches, so this proves preflight reaches spawn rather than a config mismatch.
+                await expect(manager.restartApplications(cwd)).rejects.toBe(spawnSentinel);
+                expect(stop).toHaveBeenCalledOnce();
+                expect(lifecycle.applicationLifecycleState).toBe("stopped");
+                expect(lifecycle.pausedApplicationProcesses).toEqual([relayer]);
+                await expect(manager.startApplications(cwd)).rejects.toBe(spawnSentinel);
+                expect(spawn).toHaveBeenCalledTimes(2);
+            } finally {
+                stop.mockRestore();
+                spawn.mockRestore();
+            }
+            expect(lifecycle.applicationLifecycleState).toBe("stopped");
+            expect(lifecycle.pausedApplicationProcesses).toEqual([relayer]);
+            expect(lifecycle.spawnedProcesses).toEqual([]);
+            expect(await Bun.file(path.join(archive, "7", "request.json")).text()).toBe("retained signing history");
+
+            guardian.archive_path = "archive-file";
+            await writeFile(guardianPath, JSON.stringify(guardian));
+            await writeFile(path.join(cwd, "archive-file"), "not a directory");
+            await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("archive_path metadata");
+            await expect(RunningProcess.spawn(["psy_relayer_cli", "--config", "daemon.toml"], spawnOptions)).rejects.toThrow("archive_path metadata");
+            expect(await Bun.file(path.join(archive, "7", "request.json")).text()).toBe("retained signing history");
         });
     });
 

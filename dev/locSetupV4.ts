@@ -3435,7 +3435,7 @@ function daemonConfigError(field: string): Error {
     return new Error(`[DevNet] PSY_BRIDGE_DAEMON_CONFIG: invalid or unavailable ${field}; operator provisioning required`);
 }
 
-async function validateDaemonPath(file: string, kind: "file" | "directory" | "output", purgeTargets: readonly string[], field: string): Promise<void> {
+async function validateDaemonPath(file: string, kind: "file" | "directory" | "output" | "output-directory", purgeTargets: readonly string[], field: string): Promise<void> {
     const contains = (parent: string, child: string) => {
         const relative = path.relative(parent, child);
         return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -3459,9 +3459,9 @@ async function validateDaemonPath(file: string, kind: "file" | "directory" | "ou
         }
         try {
             const stat = await fs.promises.stat(file);
-            if (kind === "directory" ? !stat.isDirectory() : !stat.isFile()) throw daemonConfigError(field);
+            if ((kind === "directory" || kind === "output-directory") ? !stat.isDirectory() : !stat.isFile()) throw daemonConfigError(field);
         } catch (error) {
-            if (kind !== "output" || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            if ((kind !== "output" && kind !== "output-directory") || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
     } catch { throw daemonConfigError(field); }
 }
@@ -3534,7 +3534,7 @@ export async function resolveBridgeDaemonConfigPath(
     catch { throw daemonConfigError("guardian_config public JSON"); }
     for (const field of ["authorization_path", "archive_path", "tls_identity_path", "server_ca_path", "authorization_archive_path", "authorization_index_path", "history_tls_certificate_path", "history_tls_private_key_path", "history_client_ca_path"]) {
         await validateDaemonPath(path.resolve(path.dirname(guardianPath), guardian[field] as string),
-            field === "archive_path" ? "output" : field === "authorization_archive_path" ? "directory" : "file", purgeTargets, `guardian_config.${field} metadata`);
+            field === "archive_path" ? "output-directory" : field === "authorization_archive_path" ? "directory" : "file", purgeTargets, `guardian_config.${field} metadata`);
     }
     return configPath;
 }
@@ -5986,6 +5986,7 @@ async function runMain() {
     const l1 = !!values["l1"];
     const relayer = !!values["relayer"] || !!values["bridge-proposer-daemon"];
     const bridgeProposerDaemon = relayer;
+    const relayerConfig = values["relayer-config"] as string;
     const psyPrivacyBridge = !!values["psy-privacy-bridge"];
     const ide = !!values["ide"];
     const explorer = !!values["explorer"];

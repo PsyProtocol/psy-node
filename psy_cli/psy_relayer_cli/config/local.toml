@@ -1,6 +1,6 @@
 guardian_config = "guardian-client.json"
-# Reference template — locSetupV4 generates the actual daemon.toml at runtime
-# with absolute paths resolved from the current machine.
+# Operator-supplied reference template. The launcher forwards PSY_BRIDGE_DAEMON_CONFIG unchanged
+# and does not generate daemon.toml. Legacy Envio dependency paths remain distinct from that daemon config.
 rpc_config = "psy-genesis/config.json"
 services_url = "http://127.0.0.1:3000"
 withdraw_method_id = 3055054724
