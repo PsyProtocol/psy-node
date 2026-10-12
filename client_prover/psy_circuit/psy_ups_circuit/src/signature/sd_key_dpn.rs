@@ -577,6 +577,9 @@ impl SDKeyDpnCircuitGadget {
         let current_user_leaf = PsyUserLeafGadget::create_virtual(&mut builder);
         let nonce = builder.add_virtual_target();
         builder.connect(current_user_leaf.user_id, gadget.user_id);
+        // UPS start copies its checkpoint ID into the current user leaf, and
+        // the endcap enforces the same equality. This leaf is signed below.
+        builder.connect(current_user_leaf.last_checkpoint_id, gadget.checkpoint_id);
         if let Some(context_targets) = context_targets.as_ref() {
             builder.connect_hashes(current_user_leaf.user_state_tree_root, context_targets.user_contract_tree_state_root);
             let contract_state_root_proof =
@@ -1314,6 +1317,7 @@ mod tests {
     fn attach_test_signature_context(witness: &mut SDKeyDpnCircuitWitnessInput) {
         let mut current_user_leaf = PsyUserLeaf::default();
         current_user_leaf.user_id = witness.user_id;
+        current_user_leaf.last_checkpoint_id = witness.checkpoint_id;
         let nonce = current_user_leaf.nonce;
         let signature_data = PsyUserProvingSessionSignatureDataCompact {
             start_user_leaf_hash: QHashOut::ZERO,
@@ -1375,6 +1379,57 @@ mod tests {
 
         let error = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap_err();
         assert!(error.to_string().contains("GetSessionProofTreeRoot"));
+    }
+
+    #[tokio::test]
+    async fn dpn_function_binds_checkpoint_id_to_signed_user_leaf() {
+        let definition = DPNFunctionCircuitDefinition {
+            name: "checkpoint_id_is_authenticated".to_string(),
+            method_id: 0,
+            circuit_inputs: vec![],
+            circuit_outputs: vec![],
+            state_commands: vec![],
+            state_command_resolution_indices: vec![],
+            assertions: vec![DPNAssertEqInfoIndexed {
+                left: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+                right: encode_indexed_op_id(DPNBuiltInDataType::Target, 1),
+                message: "checkpoint id mismatch".to_string(),
+            }],
+            definitions: vec![
+                DPNIndexedVarDef {
+                    data_type: DPNBuiltInDataType::Target,
+                    index: 0,
+                    op_type: DPNOpType::GetCheckpointId,
+                    inputs: vec![],
+                },
+                DPNIndexedVarDef {
+                    data_type: DPNBuiltInDataType::Target,
+                    index: 1,
+                    op_type: DPNOpType::Constant,
+                    inputs: vec![7],
+                },
+            ],
+            events: vec![],
+        };
+        let config = SDKeyConfig {
+            num_introspectable_transactions: 0,
+            transaction_count_policy: None,
+            can_read_state: false,
+            contract_state_tree_height: 0,
+            requires_secp256k1: false,
+            num_secp256k1_slots: 0,
+            contract_id: 0,
+        };
+
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap();
+        let mut witness = build_dpn_witness(vec![]);
+        witness.checkpoint_id = GF::from_canonical_u64(7);
+        attach_test_signature_context(&mut witness);
+        let sighash = witness_sighash(&witness);
+        gadget.prove(dummy_private_key(), &witness, sighash).await.unwrap();
+
+        witness.checkpoint_id = GF::from_canonical_u64(8);
+        assert!(gadget.prove(dummy_private_key(), &witness, sighash).await.is_err());
     }
 
     #[tokio::test]
@@ -2025,6 +2080,7 @@ mod tests {
         let user_id = state_reader_results.state.user_leaf.user_id;
         let nonce = state_reader_results.state.user_leaf.nonce;
         let mut current_user_leaf = state_reader_results.state.user_leaf;
+        current_user_leaf.last_checkpoint_id = checkpoint_id;
         let mut user_contract_tree = SimpleMerkleTree::<PoseidonHasher, QHashOut<GF>>::new(GLOBAL_CONTRACT_TREE_HEIGHT);
         user_contract_tree.set_leaf(5, start_contract_state_root);
         let contract_state_root_proof = user_contract_tree.get_leaf(5);
