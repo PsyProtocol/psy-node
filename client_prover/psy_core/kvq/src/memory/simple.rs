@@ -17,6 +17,12 @@ impl KVQSimpleMemoryBackingStore {
     pub fn clear(&self) {
         self.map.write().clear();
     }
+    /// Consume an exclusively owned store without cloning its entries.
+    pub fn into_entries(self) -> anyhow::Result<Vec<KVQPair<Vec<u8>, Vec<u8>>>> {
+        let map = Arc::try_unwrap(self.map)
+            .map_err(|_| anyhow::anyhow!("cannot consume a shared memory store"))?;
+        Ok(map.into_inner().into_iter().map(|(key, value)| KVQPair { key, value }).collect())
+    }
 }
 
 impl KVQBinaryStore for KVQSimpleMemoryBackingStore {
@@ -318,5 +324,29 @@ impl KVQBinaryStoreAsync for KVQSimpleMemoryBackingStore {
     async fn set_and_delete_many(&self, sets: &[KVQPair<&Vec<u8>, &Vec<u8>>], deletes: &[Vec<u8>]) -> anyhow::Result<()> {
         <Self as KVQBinaryStore>::set_and_delete_many(self, sets, deletes)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn into_entries_consumes_unique_store() {
+        let store = KVQSimpleMemoryBackingStore::new();
+        KVQBinaryStore::set(&store, vec![1], vec![2]).unwrap();
+        let entries = store.into_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, vec![1]);
+        assert_eq!(entries[0].value, vec![2]);
+    }
+
+    #[test]
+    fn into_entries_rejects_shared_store_without_changing_it() {
+        let store = KVQSimpleMemoryBackingStore::new();
+        KVQBinaryStore::set(&store, vec![1], vec![2]).unwrap();
+        assert!(store.clone().into_entries().is_err());
+        assert_eq!(KVQBinaryStore::get_exact(&store, &vec![1]).unwrap(), vec![2]);
+        assert_eq!(store.into_entries().unwrap().len(), 1);
     }
 }

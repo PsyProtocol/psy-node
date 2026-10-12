@@ -189,7 +189,7 @@ mod behavior_tests {
 
         let decoded = PsyRealmUserUpdateQueueItem::<PF, PHash>::decode_queue_item_ref(&encoded).unwrap();
         assert_eq!(decoded.job_id, item.job_id);
-        assert_eq!(decoded.expected_fake_checkpoint_id, item.expected_fake_checkpoint_id);
+        assert_eq!(decoded.submission_nonce, item.submission_nonce);
         assert_eq!(decoded.old_user_leaf_hash, item.old_user_leaf_hash);
         assert_eq!(decoded.new_user_leaf_hash, item.new_user_leaf_hash);
         assert_eq!(decoded.events, item.events);
@@ -238,7 +238,7 @@ mod behavior_tests {
         );
 
         assert_eq!(item.events.len(), 2);
-        assert_eq!(item.expected_fake_checkpoint_id, 42);
+        assert_eq!(item.submission_nonce, 42);
 
         let encoded = item.encode_queue_item_vec().unwrap();
         assert_eq!(

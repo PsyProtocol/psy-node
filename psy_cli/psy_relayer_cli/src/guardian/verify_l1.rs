@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use alloy_primitives::{keccak256, U256};
 use alloy_rpc_types_eth::Log;
 use alloy_sol_types::SolEvent;
-use plonky2::field::{goldilocks_field::GoldilocksField as F, types::Field};
+use plonky2::field::{goldilocks_field::GoldilocksField as F, types::{Field, PrimeField64}};
 use psy_client_data::config::store_config::PsyHasher;
 use psy_client_data::bridge_aggregate::DepositLeaf;
 use psy_crypto::hash::traits::hasher::{FieldQHasher, MerkleZeroHasher};
@@ -14,18 +14,26 @@ use super::protocol::*;
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct VerifiedDepositPrefix {
-    count: u32,
-    frontier: [Hash4;32],
-    root: Hash4,
-    anchor: DepositAnchor,
-    event_block: u64,
-    previous_count: u32,
-    previous_root: Hash4,
+    pub(crate) count: u32,
+    pub(crate) frontier: [Hash4;32],
+    pub(crate) root: Hash4,
+    pub(crate) anchor: DepositAnchor,
+    pub(crate) event_block: u64,
+    pub(crate) previous_count: u32,
+    pub(crate) previous_root: Hash4,
+    occupied_partial_page_hashes: Vec<Hash4>,
 }
 impl VerifiedDepositPrefix {
-    fn extends(&self, anchor: &DepositAnchor) -> bool { self.count==anchor.old_count && self.anchor.block_number<=anchor.block_number }
+    pub(crate) fn empty(chain_index: u8) -> Self {
+        Self { count: 0, frontier: [Hash4::ZERO;32], root: <PsyHasher as MerkleZeroHasher<Hash4>>::get_zero_hash(32), anchor: DepositAnchor { chain_index, block_number: 0, block_hash: Hex([0;32]), old_count: 0, new_count: 0 }, event_block: 0, previous_count: 0, previous_root: <PsyHasher as MerkleZeroHasher<Hash4>>::get_zero_hash(32), occupied_partial_page_hashes: Vec::new() }
+    }
+    fn extends(&self, anchor: &DepositAnchor) -> bool { self.count==anchor.old_count && self.anchor.block_number<=anchor.block_number && self.occupied_partial_page_hashes.len() == (self.count % 32) as usize }
+    pub(crate) fn occupied_partial_page_hashes(&self) -> &[Hash4] { &self.occupied_partial_page_hashes }
+    pub(crate) fn with_occupied(mut self, hashes: Vec<Hash4>) -> Self { self.occupied_partial_page_hashes = hashes; self }
+    pub(crate) fn matches_opening(&self, chain_index: u8, count: u32, root: [u64;4]) -> bool { self.anchor.chain_index == chain_index && self.count == count && self.root.0.elements.map(|limb| limb.to_canonical_u64()) == root }
 }
 
 struct CustodyRpc<'a> { endpoint: &'a ChainEndpoint, client: reqwest::Client }
@@ -149,7 +157,7 @@ async fn verify_deposit_interval(history: &super::verify::GuardianHistory, endpo
     if pending < U256::from(anchor.new_count) { return Err(GuardianSignError::EvidenceMismatch.into()); }
     let approval=sha256(&serde_json::to_vec(chain).map_err(|_|GuardianSignError::AuthorizationMismatch)?);
     let key=(approval.0,endpoint.rpc_url.clone());
-    let mut prefixes=history.custody_prefixes.lock().await;
+    let mut prefixes=history.deposit_prefixes.lock().await;
     let cached=prefixes.get(&key);
     if let Some(prefix)=cached {
         let canonical=canonical_finalized_anchor_hash(endpoint,chain,&prefix.anchor).await?;
@@ -162,18 +170,27 @@ async fn verify_deposit_interval(history: &super::verify::GuardianHistory, endpo
     let mut root=reusable.map_or_else(||<PsyHasher as MerkleZeroHasher<Hash4>>::get_zero_hash(32),|prefix|prefix.root);
     let mut old_root=root;
     let mut event_block=reusable.map_or(chain.deployment_block,|prefix|prefix.event_block);
+    let mut occupied_partial_page_hashes=reusable.map_or_else(Vec::new,|prefix|prefix.occupied_partial_page_hashes.clone());
     let advance=cached.is_none_or(|prefix|anchor.new_count>prefix.count);
     let (mut events, latest_event_block) = fetch_deposit_events(&rpc,chain,anchor,from_count,event_block,&pinned).await?;
     event_block = latest_event_block;
     for index in from_count..anchor.new_count {
-        let (leaf, _) = events.remove(&index).ok_or(GuardianSignError::EvidenceUnavailable)?;
-        root = append_leaf(&mut frontier,index,leaf);
+        let leaf = events.remove(&index).map(|(leaf, _)| leaf).ok_or(GuardianSignError::EvidenceUnavailable)?;
+        root = append_verified_deposit_leaf(&mut frontier, &mut occupied_partial_page_hashes, index, leaf);
         if index + 1 == anchor.old_count { old_root = root; }
     }
+    if occupied_partial_page_hashes.len() != (anchor.new_count % 32) as usize { return Err(GuardianSignError::EvidenceMismatch.into()); }
     verify_ancestor(&rpc,anchor.block_number,anchor.block_hash.0,&rpc.block(json!("finalized")).await?).await?;
-    if advance { prefixes.insert(key,VerifiedDepositPrefix {count:anchor.new_count,frontier,root,anchor:anchor.clone(),event_block,previous_count:anchor.old_count,previous_root:old_root}); }
+    if advance { prefixes.insert(key,VerifiedDepositPrefix {count:anchor.new_count,frontier,root,anchor:anchor.clone(),event_block,previous_count:anchor.old_count,previous_root:old_root,occupied_partial_page_hashes}); }
     Ok((old_root,root))
 }
+
+fn append_verified_deposit_leaf(frontier: &mut [Hash4;32], occupied_partial_page_hashes: &mut Vec<Hash4>, index: u32, leaf: Hash4) -> Hash4 {
+    occupied_partial_page_hashes.push(leaf);
+    if (index + 1) % 32 == 0 { occupied_partial_page_hashes.clear(); }
+    append_leaf(frontier, index, leaf)
+}
+
 
 async fn fetch_deposit_events(rpc: &CustodyRpc<'_>, chain: &ChainAuthorization, anchor: &DepositAnchor, from_count: u32, mut event_block: u64, pinned: &Value) -> Result<(BTreeMap<u32,(Hash4,DepositLeaf)>,u64)> {
     let mut events = BTreeMap::new();
@@ -256,12 +273,26 @@ mod tests {
     #[test]
     fn custody_frontier_only_reuses_contiguous_forward_interval() {
         let anchor=DepositAnchor {chain_index:0,block_number:100,block_hash:Hex([1;32]),old_count:0,new_count:2};
-        let prefix=VerifiedDepositPrefix {count:2,frontier:[Hash4::ZERO;32],root:Hash4::ZERO,anchor:anchor.clone(),event_block:99,previous_count:0,previous_root:Hash4::ZERO};
+        let prefix=VerifiedDepositPrefix {count:2,frontier:[Hash4::ZERO;32],root:Hash4::ZERO,anchor:anchor.clone(),event_block:99,previous_count:0,previous_root:Hash4::ZERO,occupied_partial_page_hashes:vec![Hash4::ZERO;2]};
         let mut next=DepositAnchor {old_count:2,new_count:3,block_number:101,..anchor};
         assert!(prefix.extends(&next));
         next.old_count=1; assert!(!prefix.extends(&next));
         next.old_count=2; next.block_number=99; assert!(!prefix.extends(&next));
         next.block_number=100; assert!(prefix.extends(&next));
+    }
+
+    #[test]
+    fn warm_prefix_keeps_only_current_partial_page_hashes() {
+        let anchor=DepositAnchor {chain_index:0,block_number:100,block_hash:Hex([1;32]),old_count:30,new_count:35};
+        let prefix=VerifiedDepositPrefix {count:30,frontier:[Hash4::ZERO;32],root:Hash4::ZERO,anchor:anchor.clone(),event_block:90,previous_count:0,previous_root:Hash4::ZERO,occupied_partial_page_hashes:vec![Hash4::ZERO;30]};
+        assert!(prefix.extends(&anchor));
+        assert_eq!(prefix.occupied_partial_page_hashes().len(), 30);
+        let completed=DepositAnchor {old_count:32,new_count:40,..anchor};
+        let boundary=VerifiedDepositPrefix {count:32,occupied_partial_page_hashes:Vec::new(),..prefix.clone()};
+        assert!(boundary.extends(&completed));
+        assert!(boundary.occupied_partial_page_hashes().is_empty());
+        let stale=VerifiedDepositPrefix {occupied_partial_page_hashes:vec![Hash4::ZERO;29],..prefix};
+        assert!(!stale.extends(&anchor));
     }
 
     #[test]
@@ -271,5 +302,15 @@ mod tests {
         assert!(matches!(verify_cached_anchor_hash(Hex([2;32]),Hex([1;32])),Err(GuardianAccountError::Conflict(HaltReason::FinalityConflict))));
         let unavailable=GuardianAccountError::from(GuardianSignError::EvidenceUnavailable);
         assert!(matches!(unavailable,GuardianAccountError::Unavailable(GuardianSignError::EvidenceUnavailable)));
+    }
+
+    #[test]
+    fn production_page_boundary_keeps_thirty_one_then_clears() {
+        let mut frontier = [Hash4::ZERO;32];
+        let mut occupied = Vec::new();
+        for index in 0..33 {
+            append_verified_deposit_leaf(&mut frontier, &mut occupied, index, Hash4::ZERO);
+            assert_eq!(occupied.len(), ((index + 1) % 32) as usize);
+        }
     }
 }

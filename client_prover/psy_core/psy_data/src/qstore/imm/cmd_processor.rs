@@ -169,6 +169,10 @@ pub struct DPNIMTContainsWitness<F: RichField> {
     pub exists: bool,
     pub leaf_preimage: IMTContractStateLeaf<F>,
     pub merkle_proof: MerkleProofCore<QHashOut<F>>,
+    /// Starting sentinel at the operation's starting CSTATE root.
+    pub sentinel_preimage: IMTContractStateLeaf<F>,
+    /// Membership path of `sentinel_preimage` under that same root.
+    pub sentinel_merkle_proof: MerkleProofCore<QHashOut<F>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
@@ -180,6 +184,10 @@ pub struct DPNIMTContainsOtherUserWitness<F: RichField> {
     pub contract_state_proof: MerkleProofCore<QHashOut<F>>,
     pub state_slot_proof: MerkleProofCore<QHashOut<F>>,
     pub leaf_preimage: IMTContractStateLeaf<F>,
+    /// Starting sentinel at the operation's starting CSTATE root.
+    pub sentinel_preimage: IMTContractStateLeaf<F>,
+    /// Membership path of `sentinel_preimage` under that same root.
+    pub sentinel_merkle_proof: MerkleProofCore<QHashOut<F>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
@@ -188,6 +196,10 @@ pub struct DPNIMTContainsOtherUserWitness<F: RichField> {
 pub struct DPNIMTReadWitness<F: RichField> {
     pub leaf_preimage: IMTContractStateLeaf<F>,
     pub merkle_proof: MerkleProofCore<QHashOut<F>>,
+    /// Starting sentinel at the operation's starting CSTATE root.
+    pub sentinel_preimage: IMTContractStateLeaf<F>,
+    /// Membership path of `sentinel_preimage` under that same root.
+    pub sentinel_merkle_proof: MerkleProofCore<QHashOut<F>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
@@ -197,6 +209,10 @@ pub struct DPNIMTSelfUserExternalReadWitness<F: RichField> {
     pub contract_tree_proof: MerkleProofCore<QHashOut<F>>,
     pub state_slot_proof: MerkleProofCore<QHashOut<F>>,
     pub leaf_preimage: IMTContractStateLeaf<F>,
+    /// Starting sentinel at the operation's starting CSTATE root.
+    pub sentinel_preimage: IMTContractStateLeaf<F>,
+    /// Membership path of `sentinel_preimage` under that same root.
+    pub sentinel_merkle_proof: MerkleProofCore<QHashOut<F>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
@@ -207,6 +223,10 @@ pub struct DPNIMTOtherUserReadWitness<F: RichField> {
     pub contract_state_proof: MerkleProofCore<QHashOut<F>>,
     pub state_slot_proof: MerkleProofCore<QHashOut<F>>,
     pub leaf_preimage: IMTContractStateLeaf<F>,
+    /// Starting sentinel at the operation's starting CSTATE root.
+    pub sentinel_preimage: IMTContractStateLeaf<F>,
+    /// Membership path of `sentinel_preimage` under that same root.
+    pub sentinel_merkle_proof: MerkleProofCore<QHashOut<F>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
@@ -215,11 +235,41 @@ pub struct DPNIMTOtherUserReadWitness<F: RichField> {
 pub struct DPNIMTSetWitness<F: RichField> {
     pub delta_merkle_proofs: Vec<DeltaMerkleProofCore<QHashOut<F>>>,
     pub is_insert: bool,
-    pub insert_has_predecessor: bool,
     pub old_leaf: IMTContractStateLeaf<F>,
     pub new_leaf: IMTContractStateLeaf<F>,
     pub predecessor_old_leaf: IMTContractStateLeaf<F>,
     pub predecessor_new_leaf: IMTContractStateLeaf<F>,
+    /// Starting sentinel authenticated at R0.
+    pub sentinel_preimage: IMTContractStateLeaf<F>,
+    /// Membership path of `sentinel_preimage` under the starting CSTATE root.
+    pub sentinel_merkle_proof: MerkleProofCore<QHashOut<F>>,
+    /// Sentinel immediately before the final count write, at R2. Zero for an ordinary update.
+    pub sentinel_old_leaf: IMTContractStateLeaf<F>,
+    /// Sentinel immediately after the final count write, at R3. Zero for an ordinary update.
+    pub sentinel_new_leaf: IMTContractStateLeaf<F>,
+}
+
+/// Delta-vector lengths selected by a set command before any proof is indexed.
+pub const IMT_SET_DISABLED_DELTA_LEN: usize = 0;
+pub const IMT_SET_UPDATE_DELTA_LEN: usize = 1;
+pub const IMT_SET_INSERT_DELTA_LEN: usize = 3;
+
+impl<F: RichField> DPNIMTSetWitness<F> {
+    /// Return the delta vector only after its mode length is exact.
+    ///
+    /// A disabled conditional set has length 0, an ordinary update has length 1,
+    /// and an insertion has length 3 in the order predecessor, member, sentinel.
+    /// Callers index only the returned slice.
+    pub fn delta_proofs(&self) -> anyhow::Result<&[DeltaMerkleProofCore<QHashOut<F>>]> {
+        match (self.is_insert, self.delta_merkle_proofs.len()) {
+            (_, IMT_SET_DISABLED_DELTA_LEN) | (false, IMT_SET_UPDATE_DELTA_LEN) | (true, IMT_SET_INSERT_DELTA_LEN) => {
+                Ok(&self.delta_merkle_proofs)
+            }
+            (_, actual) => anyhow::bail!(
+                "IMT set delta length {actual} does not match disabled 0, update 1, or insert 3"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
@@ -501,7 +551,7 @@ pub trait PsyReadCommandProcessorSync<F: RichField> {
     async fn resolve_contract_state_imt_find_predecessor(
         &self,
         input: &crate::qstore::imm::cmd::QSRIMTCmdFindPredecessor,
-    ) -> anyhow::Result<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>;
+    ) -> anyhow::Result<Option<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>>;
 
     async fn resolve_contract_state_imt_get_next_append_index(
         &self,
@@ -535,7 +585,7 @@ pub trait PsyReadCommandProcessorSyncMut<F: RichField> {
     async fn resolve_contract_state_imt_find_predecessor_mut(
         &mut self,
         input: &crate::qstore::imm::cmd::QSRIMTCmdFindPredecessor,
-    ) -> anyhow::Result<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>;
+    ) -> anyhow::Result<Option<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>>;
 
     async fn resolve_contract_state_imt_get_next_append_index_mut(
         &mut self,
@@ -544,3 +594,112 @@ pub trait PsyReadCommandProcessorSyncMut<F: RichField> {
 }
 /*
  */
+
+#[cfg(test)]
+mod tests {
+    use plonky2::field::goldilocks_field::GoldilocksField;
+
+    use super::*;
+
+    type F = GoldilocksField;
+
+    fn delta(index: u64) -> DeltaMerkleProofCore<QHashOut<F>> {
+        DeltaMerkleProofCore {
+            old_root: QHashOut::from_values(index, 0, 0, 0),
+            old_value: QHashOut::ZERO,
+            new_root: QHashOut::from_values(index + 1, 0, 0, 0),
+            new_value: QHashOut::ZERO,
+            index,
+            siblings: vec![QHashOut::ZERO],
+        }
+    }
+
+    fn set_witness(is_insert: bool, count: usize) -> DPNIMTSetWitness<F> {
+        let leaf = IMTContractStateLeaf::default();
+        DPNIMTSetWitness {
+            delta_merkle_proofs: (0..count as u64).map(delta).collect(),
+            is_insert,
+            old_leaf: leaf,
+            new_leaf: leaf,
+            predecessor_old_leaf: leaf,
+            predecessor_new_leaf: leaf,
+            sentinel_preimage: leaf,
+            sentinel_merkle_proof: MerkleProofCore::default(),
+            sentinel_old_leaf: leaf,
+            sentinel_new_leaf: leaf,
+        }
+    }
+
+    #[test]
+    fn delta_lengths_are_checked_before_indexing() {
+        assert_eq!(set_witness(false, 0).delta_proofs().unwrap().len(), 0);
+        assert_eq!(set_witness(true, 0).delta_proofs().unwrap().len(), 0);
+        assert_eq!(set_witness(false, 1).delta_proofs().unwrap()[0].index, 0);
+        let inserted = set_witness(true, 3).delta_proofs().unwrap();
+        assert_eq!(inserted.iter().map(|proof| proof.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        assert!(set_witness(true, 1).delta_proofs().is_err());
+        assert!(set_witness(true, 2).delta_proofs().is_err());
+        assert!(set_witness(false, 3).delta_proofs().is_err());
+    }
+
+    #[test]
+    fn read_contains_and_set_witnesses_round_trip_with_sentinels() {
+        let leaf = IMTContractStateLeaf::<F>::default();
+        let sentinel_proof = MerkleProofCore {
+            root: QHashOut::from_values(8, 0, 0, 0),
+            value: QHashOut::ZERO,
+            index: 4,
+            siblings: vec![QHashOut::from_values(9, 0, 0, 0)],
+        };
+        let read = DPNStateCmdWitness::IMTRead(DPNIMTReadWitness {
+            leaf_preimage: leaf,
+            merkle_proof: MerkleProofCore::default(),
+            sentinel_preimage: leaf,
+            sentinel_merkle_proof: sentinel_proof.clone(),
+        });
+        let contains = DPNStateCmdWitness::IMTContains(DPNIMTContainsWitness {
+            exists: false,
+            leaf_preimage: leaf,
+            merkle_proof: MerkleProofCore::default(),
+            sentinel_preimage: leaf,
+            sentinel_merkle_proof: sentinel_proof.clone(),
+        });
+        let external = DPNStateCmdWitness::IMTSelfUserExternalRead(DPNIMTSelfUserExternalReadWitness {
+            contract_tree_proof: MerkleProofCore::default(),
+            state_slot_proof: MerkleProofCore::default(),
+            leaf_preimage: leaf,
+            sentinel_preimage: leaf,
+            sentinel_merkle_proof: sentinel_proof.clone(),
+        });
+        let other_user = DPNReadOtherUserLeafMerkleProof {
+            user_tree_proof: MerkleProofCore::default(),
+            user_leaf: PsyUserLeaf::default(),
+        };
+        let other_read = DPNStateCmdWitness::IMTOtherUserRead(DPNIMTOtherUserReadWitness {
+            user_leaf_witness: other_user.clone(),
+            contract_state_proof: MerkleProofCore::default(),
+            state_slot_proof: MerkleProofCore::default(),
+            leaf_preimage: leaf,
+            sentinel_preimage: leaf,
+            sentinel_merkle_proof: sentinel_proof.clone(),
+        });
+        let other_contains = DPNStateCmdWitness::IMTContainsOtherUser(DPNIMTContainsOtherUserWitness {
+            exists: true,
+            user_leaf_witness: other_user,
+            contract_state_proof: MerkleProofCore::default(),
+            state_slot_proof: MerkleProofCore::default(),
+            leaf_preimage: leaf,
+            sentinel_preimage: leaf,
+            sentinel_merkle_proof: sentinel_proof,
+        });
+        let set = DPNStateCmdWitness::IMTSet(set_witness(true, 3));
+
+        for witness in [read, contains, external, other_read, other_contains, set] {
+            let bytes = bincode::serialize(&witness).unwrap();
+            let restored: DPNStateCmdWitness<F> = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(restored, witness);
+            assert!(bincode::deserialize::<DPNStateCmdWitness<F>>(&bytes[..bytes.len() / 2]).is_err());
+        }
+    }
+}

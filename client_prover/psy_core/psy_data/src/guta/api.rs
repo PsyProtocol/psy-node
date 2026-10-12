@@ -123,6 +123,11 @@ impl<F: RichField> PsyContractStateUpdateHistory<F> {
         }
 
         let expected_height = contract_helper.get_contract_height(self.user_contract_tree_update_proof.index)? as usize;
+        for update in &self.contract_state_tree_updates {
+            if let ContractStateUpdate::IMT { update } = update {
+                update.validate_imt_update()?;
+            }
+        }
         for update in self.contract_state_tree_updates.iter() {
             match update {
                 ContractStateUpdate::Positional { delta_proof } => {
@@ -139,9 +144,13 @@ impl<F: RichField> PsyContractStateUpdateHistory<F> {
                     IMTContractStateUpdate::Insert {
                         predecessor_delta_proof,
                         new_leaf_delta_proof,
+                        sentinel_delta_proof,
                         ..
                     } => {
-                        if predecessor_delta_proof.siblings.len() != expected_height || new_leaf_delta_proof.siblings.len() != expected_height {
+                        if predecessor_delta_proof.siblings.len() != expected_height
+                            || new_leaf_delta_proof.siblings.len() != expected_height
+                            || sentinel_delta_proof.siblings.len() != expected_height
+                        {
                             anyhow::bail!("imt insert proof height mismatch");
                         }
                     }
@@ -157,6 +166,9 @@ impl<F: RichField> PsyContractStateUpdateHistory<F> {
         let contract_id = self.user_contract_tree_update_proof.index as u32;
 
         for p in self.contract_state_tree_updates.iter() {
+            if let ContractStateUpdate::IMT { update } = p {
+                update.validate_imt_update()?;
+            }
             match p {
                 ContractStateUpdate::Positional { delta_proof } => {
                     injestor.verify_injest_delta_merkle_proof::<H>(contract_id, delta_proof)?;
@@ -166,12 +178,38 @@ impl<F: RichField> PsyContractStateUpdateHistory<F> {
                         injestor.verify_injest_delta_merkle_proof::<H>(contract_id, delta_proof)?;
                     }
                     IMTContractStateUpdate::Insert {
+                        predecessor_old_preimage,
+                        predecessor_new_preimage,
+                        new_leaf_preimage,
                         predecessor_delta_proof,
                         new_leaf_delta_proof,
+                        sentinel_old_preimage,
+                        sentinel_new_preimage,
+                        sentinel_delta_proof,
                         ..
                     } => {
+                        for proof in [predecessor_delta_proof, new_leaf_delta_proof, sentinel_delta_proof] {
+                            if proof.siblings.len() > 64 || (proof.siblings.len() < 64 && proof.index >= (1u64 << proof.siblings.len())) {
+                                anyhow::bail!("imt insert proof index out of bounds");
+                            }
+                        }
+                        let virgin_predecessor = predecessor_delta_proof.old_value == QHashOut::ZERO
+                            && predecessor_old_preimage.is_sentinel();
+                        if (!virgin_predecessor && predecessor_old_preimage.qfhash::<H>() != predecessor_delta_proof.old_value)
+                            || predecessor_new_preimage.qfhash::<H>() != predecessor_delta_proof.new_value
+                            || new_leaf_delta_proof.old_value != QHashOut::ZERO
+                            || new_leaf_preimage.qfhash::<H>() != new_leaf_delta_proof.new_value
+                        {
+                            anyhow::bail!("imt insert preimage mismatch");
+                        }
+                        if sentinel_old_preimage.qfhash::<H>() != sentinel_delta_proof.old_value
+                            || sentinel_new_preimage.qfhash::<H>() != sentinel_delta_proof.new_value
+                        {
+                            anyhow::bail!("imt sentinel preimage mismatch");
+                        }
                         injestor.verify_injest_delta_merkle_proof::<H>(contract_id, predecessor_delta_proof)?;
                         injestor.verify_injest_delta_merkle_proof::<H>(contract_id, new_leaf_delta_proof)?;
+                        injestor.verify_injest_delta_merkle_proof::<H>(contract_id, sentinel_delta_proof)?;
                     }
                 },
             }

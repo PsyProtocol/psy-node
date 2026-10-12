@@ -114,6 +114,8 @@ mod behavior_tests {
             update_user_registration_tree_nodes_ffs: vec![6],
             new_user_public_keys_ffs: vec![7, 8, 9, 10],
             new_public_key_hash_to_user_id_rows_ffs: vec![],
+            update_validator_tree_nodes_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            new_validator_leaf_preimages: vec![crate::p2p::ValidatorLeafPreimage::qp_rand_gen()],
             update_global_user_tree_nodes_ffs: vec![11, 12],
             new_realm_guta_reward_tree_node_keys_ffs: vec![13],
             checkpoint_tree_update_proof: DeltaMerkleProofCore::qp_rand_gen(),

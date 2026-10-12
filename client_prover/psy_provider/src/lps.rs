@@ -1275,7 +1275,7 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
         user_id: u64,
         contract_id: u64,
         key: &QHashOut<F>,
-    ) -> anyhow::Result<(u64, psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf<F>)> {
+    ) -> anyhow::Result<Option<(u64, psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf<F>)>> {
         info!(
             "Finding IMT predecessor checkpoint_id: {}, user_id: {}, contract_id: {}",
             checkpoint_id, user_id, contract_id
@@ -1291,13 +1291,11 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
             self,
             rpc_url,
             RequestParams::<F>::FindIMTPredecessor(input),
-            QFindIMTPredecessorResponse<F>
+            Option<QFindIMTPredecessorResponse<F>>
         );
         match response.result {
-            ResponseResult::Success(resp) => {
-                info!("Successfully found IMT predecessor at index: {}", resp.leaf_index);
-                Ok((resp.leaf_index, resp.leaf))
-            }
+            ResponseResult::Success(None) => Ok(None),
+            ResponseResult::Success(Some(resp)) => Ok(Some((resp.leaf_index, resp.leaf))),
             ResponseResult::Error(e) => {
                 error!("RPC call failed: {:?}", e);
                 Err(anyhow::format_err!("contract_state_imt_find_predecessor rpc call failed `{:?}`", e))

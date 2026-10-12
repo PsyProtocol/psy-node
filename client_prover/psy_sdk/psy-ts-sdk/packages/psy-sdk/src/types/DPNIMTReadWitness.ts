@@ -3,4 +3,4 @@ import type { IMTContractStateLeaf } from "./IMTContractStateLeaf";
 import type { MerkleProofCore } from "./MerkleProofCore";
 import type { QHashOut } from "./QHashOut";
 
-export type DPNIMTReadWitness = { leaf_preimage: IMTContractStateLeaf, merkle_proof: MerkleProofCore<QHashOut>, };
+export type DPNIMTReadWitness = { leaf_preimage: IMTContractStateLeaf, merkle_proof: MerkleProofCore<QHashOut>, sentinel_preimage: IMTContractStateLeaf, sentinel_merkle_proof: MerkleProofCore<QHashOut>, };

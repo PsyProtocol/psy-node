@@ -65,8 +65,10 @@ impl<F: QFelt64, Hash: Q256BitHash> ContractStateUpdate<F, Hash> {
                 IMTContractStateUpdate::Insert {
                     predecessor_delta_proof,
                     new_leaf_delta_proof,
+                    sentinel_delta_proof,
                     ..
-                } => predecessor_delta_proof.siblings.len() + 2 + new_leaf_delta_proof.siblings.len() + 2,
+                } => predecessor_delta_proof.siblings.len() + 2 + new_leaf_delta_proof.siblings.len() + 2
+                    + sentinel_delta_proof.siblings.len() + 2,
             },
         }
     }
@@ -397,13 +399,16 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug> SubmitUser
                         IMTContractStateUpdate::Insert {
                             predecessor_delta_proof,
                             new_leaf_delta_proof,
+                            sentinel_delta_proof,
                             ..
                         } => {
                             if predecessor_delta_proof.siblings.len() != expected_height
                                 || new_leaf_delta_proof.siblings.len() != expected_height
+                                || sentinel_delta_proof.siblings.len() != expected_height
                             {
                                 anyhow::bail!("imt insert proof height mismatch");
                             }
+                            update.validate_imt_update()?;
                         }
                     },
                 }
@@ -448,6 +453,13 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug> SubmitUser
     where
         Hash: QFHashBase<F>,
     {
+        for history in &self.contract_state_updates {
+            for update in &history.updates {
+                if let ContractStateUpdate::IMT { update } = update {
+                    update.validate_imt_update()?;
+                }
+            }
+        }
         let contract_updates = self
             .contract_state_updates
             .iter()
@@ -466,17 +478,18 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug> SubmitUser
                             IMTContractStateUpdate::Insert {
                                 predecessor_delta_proof,
                                 new_leaf_delta_proof,
+                                sentinel_delta_proof,
                                 ..
                             } => {
-                                // An insert touches two leaves: the predecessor
-                                // (its next_key/next_index pointers change) and the
-                                // newly appended leaf. Each carries its own delta proof
-                                // against the contract state tree, so both are emitted.
+                                // Emit all three sequential writes, including the final sentinel count.
                                 let mut updates = delta_proof_to_slot_updates::<F, Hash>(
                                     predecessor_delta_proof,
                                 );
                                 updates.extend(delta_proof_to_slot_updates::<F, Hash>(
                                     new_leaf_delta_proof,
+                                ));
+                                updates.extend(delta_proof_to_slot_updates::<F, Hash>(
+                                    sentinel_delta_proof,
                                 ));
                                 updates
                             }
@@ -912,19 +925,22 @@ mod tests {
                 predecessor_new_preimage: IMTContractStateLeaf::default(),
                 new_leaf_preimage: IMTContractStateLeaf::default(),
                 predecessor_delta_proof: delta(10, 11, 2),
-                new_leaf_delta_proof: delta(20, 21, 3),
+                new_leaf_delta_proof: delta(11, 12, 2),
+                sentinel_old_preimage: IMTContractStateLeaf::default(),
+                sentinel_new_preimage: IMTContractStateLeaf::default(),
+                sentinel_delta_proof: delta(12, 13, 2),
             },
         };
         assert_eq!(insert.old_root(), PHash::from_u64x4([10, 0, 0, 0]));
-        assert_eq!(insert.new_root(), PHash::from_u64x4([21, 0, 0, 0]));
-        // predecessor siblings (2) + 2 + new leaf siblings (3) + 2
-        assert_eq!(insert.get_double_id_nodes_size_hint(), 9);
+        assert_eq!(insert.new_root(), PHash::from_u64x4([13, 0, 0, 0]));
+        // Three deltas, each with two siblings and two leaf/root nodes.
+        assert_eq!(insert.get_double_id_nodes_size_hint(), 12);
 
         let history = ContractStateUpdateHistory {
             user_contract_tree_update_proof: delta(0, 0, 0),
             updates: vec![insert],
         };
-        assert_eq!(history.get_double_id_nodes_size_hint(), 9);
+        assert_eq!(history.get_double_id_nodes_size_hint(), 12);
     }
 
     fn assert_ensure_err(result: anyhow::Result<()>, needle: &str) {
@@ -1120,6 +1136,16 @@ mod tests {
                 predecessor_old_preimage: IMTContractStateLeaf::default(),
                 predecessor_new_preimage: IMTContractStateLeaf::default(),
                 new_leaf_preimage: IMTContractStateLeaf::default(),
+                sentinel_old_preimage: IMTContractStateLeaf::default(),
+                sentinel_new_preimage: IMTContractStateLeaf::default(),
+                sentinel_delta_proof: DeltaMerkleProofCore {
+                    old_root: new_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: siblings.clone(),
+                },
                 predecessor_delta_proof: DeltaMerkleProofCore {
                     old_root,
                     old_value: PHash::get_zero_value(),
@@ -1150,6 +1176,16 @@ mod tests {
                 predecessor_old_preimage: IMTContractStateLeaf::default(),
                 predecessor_new_preimage: IMTContractStateLeaf::default(),
                 new_leaf_preimage: IMTContractStateLeaf::default(),
+                sentinel_old_preimage: IMTContractStateLeaf::default(),
+                sentinel_new_preimage: IMTContractStateLeaf::default(),
+                sentinel_delta_proof: DeltaMerkleProofCore {
+                    old_root: new_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: siblings.clone(),
+                },
                 predecessor_delta_proof: DeltaMerkleProofCore {
                     old_root,
                     old_value: PHash::get_zero_value(),
@@ -1223,6 +1259,16 @@ mod tests {
                 predecessor_old_preimage: IMTContractStateLeaf::default(),
                 predecessor_new_preimage: IMTContractStateLeaf::default(),
                 new_leaf_preimage: IMTContractStateLeaf::default(),
+                sentinel_old_preimage: IMTContractStateLeaf::default(),
+                sentinel_new_preimage: IMTContractStateLeaf::default(),
+                sentinel_delta_proof: DeltaMerkleProofCore {
+                    old_root: new_root,
+                    old_value: PHash::get_zero_value(),
+                    new_root,
+                    new_value: PHash::get_zero_value(),
+                    index,
+                    siblings: vec![PHash::get_zero_value(); 9],
+                },
                 predecessor_delta_proof: DeltaMerkleProofCore {
                     old_root,
                     old_value: PHash::get_zero_value(),
@@ -1237,7 +1283,7 @@ mod tests {
                     new_root,
                     new_value: PHash::get_zero_value(),
                     index,
-                    siblings: vec![PHash::get_zero_value(); 3],
+                    siblings: vec![PHash::get_zero_value(); 9],
                 },
             },
         };
@@ -1301,7 +1347,7 @@ mod tests {
                 delta_proof: slot_delta([5, 5, 5, 5], [6, 5, 5, 5], 2),
             },
         };
-        // An insert emits the predecessor proof followed by the new leaf proof.
+        // An insert emits predecessor, member, and sentinel proofs in order.
         let imt_insert = ContractStateUpdate::IMT {
             update: IMTContractStateUpdate::Insert {
                 predecessor_old_preimage: leaf.clone(),
@@ -1309,6 +1355,9 @@ mod tests {
                 new_leaf_preimage: leaf,
                 predecessor_delta_proof: slot_delta([7, 7, 7, 7], [7, 7, 8, 7], 9),
                 new_leaf_delta_proof: slot_delta([0, 0, 0, 0], [0, 3, 0, 0], 5),
+                sentinel_old_preimage: IMTContractStateLeaf::default(),
+                sentinel_new_preimage: IMTContractStateLeaf::default(),
+                sentinel_delta_proof: slot_delta([1, 0, 0, 0], [2, 0, 0, 0], 9),
             },
         };
         // No felt changes: the whole contract is filtered out of the result.
@@ -1336,10 +1385,20 @@ mod tests {
         assert_eq!(updates[0].slot_updates[0].new_value, PHash::from_u64x4([1, 2, 3, 9]).to_4_felts()[3]);
 
         assert_eq!(updates[1].contract_id, 22);
-        assert_eq!(updates[1].slot_updates.len(), 3);
+        assert_eq!(updates[1].slot_updates.len(), 4);
         assert_eq!(updates[1].slot_updates[0].slot, 2 * 4 + 0);
         assert_eq!(updates[1].slot_updates[1].slot, 9 * 4 + 2);
         assert_eq!(updates[1].slot_updates[2].slot, 5 * 4 + 1);
+        assert_eq!(updates[1].slot_updates[3].slot, 9 * 4);
+        assert_eq!(updates[1].slot_updates[3].old_value.to_u64_value(), 1);
+        assert_eq!(updates[1].slot_updates[3].new_value.to_u64_value(), 2);
+        let mut bad = input.clone();
+        if let ContractStateUpdate::IMT { update: IMTContractStateUpdate::Insert { sentinel_delta_proof, .. } } =
+            &mut bad.contract_state_updates[1].updates[1]
+        {
+            sentinel_delta_proof.old_root = PHash::from_u64x4([99, 0, 0, 0]);
+        }
+        assert!(bad.get_slot_updates().is_err());
         Ok(())
     }
 
@@ -1379,7 +1438,10 @@ mod tests {
                     predecessor_new_preimage: leaf.clone(),
                     new_leaf_preimage: leaf,
                     predecessor_delta_proof: delta(5, 6, 2),
-                    new_leaf_delta_proof: delta(6, 7, 3),
+                    new_leaf_delta_proof: delta(6, 7, 2),
+                    sentinel_old_preimage: IMTContractStateLeaf::default(),
+                    sentinel_new_preimage: IMTContractStateLeaf::default(),
+                    sentinel_delta_proof: delta(7, 8, 2),
                 },
             },
         ];
@@ -1418,6 +1480,9 @@ mod tests {
                         new_leaf_preimage: leaf,
                         predecessor_delta_proof: delta(2, 3, 2),
                         new_leaf_delta_proof: delta(3, 4, 2),
+                        sentinel_old_preimage: IMTContractStateLeaf::default(),
+                        sentinel_new_preimage: IMTContractStateLeaf::default(),
+                        sentinel_delta_proof: delta(4, 5, 2),
                     },
                 },
             ],

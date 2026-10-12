@@ -7,6 +7,8 @@ use plonky2::{
 use psy_client_data::bridge_aggregate::{ChainConfig, NetworkConfig, BRIDGE_USER_ID, MAX_CHAINS, MAX_LEAVES};
 use psy_plonky2_basic_helpers::builder::comparison::CircuitBuilderComparison;
 
+pub use psy_client_data::bridge_aggregate::DEPOSIT_RECORD_CAPACITY;
+
 use super::aggregate_commitment::{
     commitment, encode_hash4, word, word_address, word_u64, AddressTarget,
     Bytes32Target, Domain, Hash4Target, U64Target,
@@ -79,9 +81,6 @@ pub struct NetworkConfigTarget {
     pub reward_token: AddressTarget,
     pub reward_per_claim: Bytes32Target,
     pub reward_token_decimals: Target,
-    pub reward_cutover: U64Target,
-    pub reward_end_exclusive: U64Target,
-    pub max_deposits: Target,
     pub max_withdrawals: Target,
     pub max_rewards: Target,
 }
@@ -101,9 +100,6 @@ impl NetworkConfigTarget {
             reward_token: builder.add_virtual_target_arr(),
             reward_per_claim: builder.add_virtual_target_arr(),
             reward_token_decimals: builder.add_virtual_target(),
-            reward_cutover: builder.add_virtual_target_arr(),
-            reward_end_exclusive: builder.add_virtual_target_arr(),
-            max_deposits: builder.add_virtual_target(),
             max_withdrawals: builder.add_virtual_target(),
             max_rewards: builder.add_virtual_target(),
         };
@@ -119,19 +115,14 @@ impl NetworkConfigTarget {
         builder.range_check(self.ethereum_index, 8);
         builder.range_check(self.reward_token_decimals, 8);
         for target in self.network_magic.iter().chain(&self.circuit_set_hash)
-            .chain(&self.reward_payer).chain(&self.reward_token).chain(&self.reward_per_claim)
-            .chain(&self.reward_cutover).chain(&self.reward_end_exclusive) {
+            .chain(&self.reward_payer).chain(&self.reward_token).chain(&self.reward_per_claim) {
             builder.range_check(*target, 32);
         }
         assert_nonzero(builder, &self.reward_payer);
         assert_nonzero(builder, &self.reward_token);
         assert_nonzero(builder, &self.reward_per_claim);
-        let interval = less_than_words(builder,
-            &[self.reward_cutover[1], self.reward_cutover[0]],
-            &[self.reward_end_exclusive[1], self.reward_end_exclusive[0]]);
-        builder.assert_one(interval.target);
         let maximum = builder.constant(F::from_canonical_usize(MAX_LEAVES));
-        for count in [self.max_deposits, self.max_withdrawals, self.max_rewards] {
+        for count in [self.max_withdrawals, self.max_rewards] {
             builder.range_check(count, 32);
             builder.ensure_is_less_than_or_equal(32, count, maximum);
         }
@@ -162,9 +153,6 @@ impl NetworkConfigTarget {
         words.extend(word_address(builder, self.reward_token));
         words.extend(self.reward_per_claim);
         words.extend(word(builder, self.reward_token_decimals, 8));
-        words.extend(word_u64(builder, self.reward_cutover));
-        words.extend(word_u64(builder, self.reward_end_exclusive));
-        words.extend(word(builder, self.max_deposits, 32));
         words.extend(word(builder, self.max_withdrawals, 32));
         words.extend(word(builder, self.max_rewards, 32));
         words
@@ -182,7 +170,7 @@ impl NetworkConfigTarget {
             (self.version, config.version), (self.bridge_user_id, config.bridge_user_id),
             (self.ethereum_index, config.ethereum_index as u32),
             (self.reward_token_decimals, config.reward_token_decimals as u32),
-            (self.max_deposits, config.max_deposits), (self.max_withdrawals, config.max_withdrawals),
+            (self.max_withdrawals, config.max_withdrawals),
             (self.max_rewards, config.max_rewards),
         ] { witness.set_target(target, F::from_canonical_u32(value))?; }
         set_u64(witness, self.network_magic, config.network_magic)?;
@@ -191,8 +179,6 @@ impl NetworkConfigTarget {
         set_bytes(witness, &self.reward_payer, &config.reward_payer)?;
         set_bytes(witness, &self.reward_token, &config.reward_token)?;
         set_bytes(witness, &self.reward_per_claim, &config.reward_per_claim)?;
-        set_u64(witness, self.reward_cutover, config.reward_cutover)?;
-        set_u64(witness, self.reward_end_exclusive, config.reward_end_exclusive)?;
         Ok(())
     }
 }
@@ -292,8 +278,7 @@ mod tests {
             circuit_set_hash: [0x55; 32], chains, ethereum_index: 4,
             reward_payer: [0x33; 20], reward_token: [0x44; 20],
             reward_per_claim: [0xff; 32], reward_token_decimals: 18,
-            reward_cutover: (1u64 << 40) - 1, reward_end_exclusive: 1u64 << 40,
-            max_deposits: 1024, max_withdrawals: 0, max_rewards: 31,
+            max_withdrawals: 1024, max_rewards: 1024,
         }
     }
 
@@ -323,6 +308,8 @@ mod tests {
         let mut expected = config.encode().unwrap();
         expected.extend(config.config_hash().unwrap());
         assert_eq!(bytes, expected);
+        assert_eq!(encoded.len() * 4, config.encode().unwrap().len());
+        assert_eq!(DEPOSIT_RECORD_CAPACITY, 32);
         data.verify(proof.clone()).unwrap();
         let mut wrong_digest = proof;
         *wrong_digest.public_inputs.last_mut().unwrap() += F::ONE;
@@ -342,7 +329,6 @@ mod tests {
             (target.version, 2), (target.bridge_user_id, BRIDGE_USER_ID as u64 + 1),
             (target.ethereum_index, 2), (target.max_rewards, 1025),
             (target.reward_token_decimals, 256), (target.chains[1].chain_index, 1),
-            (target.reward_cutover[1], 256),
             (target.circuit_set_hash[0], 1u64 << 32),
         ] {
             let mut witness = PartialWitness::new();

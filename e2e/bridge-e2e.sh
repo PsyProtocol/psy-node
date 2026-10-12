@@ -10,7 +10,7 @@ set -euo pipefail
 #   4. Wait for relayer batchAppend (provedDepositCount) + checkpoint finalize
 #   5. L2 claim-deposit with the sender-generated inclusion proof
 #   6. L2 withdraw (burn)
-#   7. Relayer applyBridgeWindow publishes the withdrawal header. The script
+#   7. Relayer applyBridgeOpening publishes the withdrawal header. The script
 #      sends claimPendingWithdrawal after that pending claim is claimable.
 #   8. Verify L1 USDT balance = initial - deposit + withdraw and L2 claim state
 #
@@ -395,11 +395,11 @@ l2_withdraw() {
   ok "withdraw confirmed"
 }
 
-# ─── Step 7: Settlement publication + user claimPendingWithdrawal ─────────────
-# applyBridgeWindow emits DepositAggregateApplied and InclusionAggregateRootPublished
+# ─── Step 7: Claim publication + user claimPendingWithdrawal ─────────────
+# applyBridgeOpening emits DepositAggregateApplied and InclusionAggregateRootPublished
 # on Bridge. It does not set claimedNullifiers. claimPendingWithdrawal still pays.
 wait_l1_claim() {
-  log "Step 7: Wait for applyBridgeWindow, then claimPendingWithdrawal"
+  log "Step 7: Wait for applyBridgeOpening, then claimPendingWithdrawal"
   local from_block cursor
   from_block=$(cast block-number --rpc-url "$RPC_URL")
   cursor=$(cast_call "$STATE_MANAGER" "lastFinalizedCheckpointId()(uint64)" | awk '{print $1}')
@@ -478,7 +478,7 @@ PY
 
   wait_for "DepositAggregateApplied and InclusionAggregateRootPublished" bridge_window_published
   log "  header=$(jq -r '.headerDigest' "$RESULT_DIR/bridge-window.json") family=$(jq -r '.family' "$RESULT_DIR/bridge-window.json") count=$(jq -r '.count' "$RESULT_DIR/bridge-window.json") endCheckpointId=$(jq -r '.endCheckpointId' "$RESULT_DIR/bridge-window.json")"
-  ok "applyBridgeWindow published the withdrawal header"
+  ok "applyBridgeOpening published the withdrawal header"
 
   local pending claimable
   wait_for "pending withdrawal registered" "
@@ -499,14 +499,14 @@ PY
   ok "claimPendingWithdrawal sent"
 
   # L1_BAL_INITIAL was captured after the deposit locked its funds in the
-  # Bridge, so the settlement identity is initial + withdraw (the deposit
+  # Bridge, so the claim identity is initial + withdraw (the deposit
   # side already moved out of the free balance).
   local expected=$((L1_BAL_INITIAL + WITHDRAW_AMOUNT))
   wait_for "pending cleared and L1 USDT balance == $expected" "
     [ \"\$(cast_call '$BRIDGE' 'pendingWithdrawals(bytes32)(address,address,uint256,uint64)' '$WITHDRAW_NONCE' 2>/dev/null | tail -n +3 | head -1 | tr -d '[:space:]')\" -eq 0 ] \
     && [ \"\$(cast_call '$USDT' 'balanceOf(address)(uint256)' '$USER_ADDR' | awk '{print \$1}')\" -eq $expected ]
   "
-  ok "L1 settlement complete"
+  ok "L1 claim complete"
 }
 
 final_verify() {

@@ -2112,7 +2112,7 @@ impl<'a> TraceBuildSession<'a> {
         let call_data_json = serde_json::to_value(&call_data)?;
         let trace = self.finalize_tx_trace_with_opts(call_data.software_defined_call).await?;
         let generated = crate::trace::GeneratedTxTraceJson::from_trace(&trace, call_data_json)?;
-        let metadata = crate::trace::TxMetadata::from_trace(&trace).into();
+        let metadata = crate::trace::TxMetadata::from_trace(&trace)?.into();
         Ok(crate::trace::SimulatedTxJson {
             generated: Some(generated),
             metadata,
@@ -4450,120 +4450,6 @@ impl WalletSession {
             .await?;
         Ok(update_content_hash)
     }
-
-    // pub async fn get_claim_rewards_call_args(&self, mut job_infos: Vec<JobInfo>)
-    // -> anyhow::Result<Vec<ContractCallArgs>> {     job_infos.
-    // retain(|job_info| job_info.job_id.circuit_type.is_guta_job());
-
-    //     if job_infos.is_empty() {
-    //         tracing::info!("No valid GUTA jobs found after filtering");
-    //         return Ok(Vec::new());
-    //     }
-
-    //     let mut checkpoint_jobs: HashMap<u64,
-    // Vec<VariableHeightRewardMerkleProof>> = HashMap::new();
-
-    //     match self.st_provider.get_job_proofs(job_infos).await {
-    //         Ok(results) => {
-    //             for (root_job_id, job_proof) in results {
-    //                 let actual_checkpoint_id = root_job_id.goal_id;
-    //                 checkpoint_jobs
-    //                     .entry(actual_checkpoint_id)
-    //                     .or_insert_with(Vec::new)
-    //
-    // .push(job_proof.pad_to_height(GUTA_REWARDS_TREE_MAX_HEIGHT));
-    // }         }
-    //         Err(e) => {
-    //             tracing::warn!("Failed to get job proofs: {}", e);
-    //         }
-    //     }
-
-    //     if checkpoint_jobs.is_empty() {
-    //         tracing::info!("No valid checkpoints with rewards to claim");
-    //         return Ok(Vec::new());
-    //     }
-
-    //     let mut sorted_checkpoints: Vec<_> =
-    // checkpoint_jobs.keys().copied().collect();     sorted_checkpoints.sort();
-
-    //     let mut all_proofs_with_checkpoints = Vec::new();
-
-    //     for &checkpoint_id in &sorted_checkpoints {
-    //         let proofs = checkpoint_jobs.get(&checkpoint_id).unwrap();
-
-    //         let checkpoint_leaf =
-    // self.st_provider.get_checkpoint_leaf_data(checkpoint_id).await?;
-    //         let fees_collected =
-    // checkpoint_leaf.stats.guta_fees_collected.to_canonical_u64();         let
-    // gutas_completed =
-    // checkpoint_leaf.stats.pm_jobs_completed.gutas_completed.to_canonical_u64();
-
-    //         let proposed_reward = if gutas_completed > 0 { fees_collected /
-    // gutas_completed } else { 0u64 };
-
-    //         if proposed_reward == 0 {
-    //             tracing::warn!(
-    //                 "Skipping checkpoint {} due to zero reward
-    // (fees_collected={}, gutas_completed={})",                 checkpoint_id,
-    //                 fees_collected,
-    //                 gutas_completed
-    //             );
-    //             continue;
-    //         }
-
-    //         tracing::info!("Checkpoint {} - Reward: {}, Jobs: {}", checkpoint_id,
-    // proposed_reward, proofs.len());         for proof in proofs {
-    //             all_proofs_with_checkpoints.push(ProofWithCheckpoint {
-    //                 checkpoint_id,
-    //                 proof: proof.clone(),
-    //                 proposed_reward,
-    //             });
-    //         }
-    //     }
-
-    //     if all_proofs_with_checkpoints.is_empty() {
-    //         tracing::info!("No checkpoints with valid rewards to claim");
-    //         return Ok(Vec::new());
-    //     }
-
-    //     let mut all_contract_calls =
-    // build_claim_calls_for_multi_checkpoints(&all_proofs_with_checkpoints).await;
-
-    //     if all_contract_calls.is_empty() {
-    //         tracing::info!("No checkpoints with valid rewards to claim");
-    //         return Ok(Vec::new());
-    //     }
-
-    //     let last_checkpoint =
-    // all_proofs_with_checkpoints.last().unwrap().checkpoint_id;
-
-    //     all_contract_calls.push(ContractCallArgs {
-    //         contract_id: MINING_REWARDS_CONTRACT_ID as u64,
-    //         method_name: "end_session".to_string(),
-    //         inputs: vec![last_checkpoint],
-    //     });
-
-    //     all_contract_calls.push(ContractCallArgs {
-    //         contract_id: TOKEN_CONTRACT_ID as u64,
-    //         method_name: "claim_pow_rewards".to_string(),
-    //         inputs: vec![last_checkpoint],
-    //     });
-
-    //     if all_contract_calls.is_empty() {
-    //         tracing::info!("No rewards to claim");
-    //         return Ok(Vec::new());
-    //     }
-
-    //     tracing::info!("Executing {} contract calls in single transaction",
-    // all_contract_calls.len());     Ok(all_contract_calls)
-    // }
-
-    // pub async fn claim_rewards(&self, user_pk_hash: QHashOut<F>, job_infos:
-    // Vec<JobInfo>) -> anyhow::Result<()> {     let contract_call_args =
-    // self.get_claim_rewards_call_args(job_infos).await?;
-    //     self.exec_contract_call(user_pk_hash,
-    // ContractCallData::new(contract_call_args)).await?;     Ok(())
-    // }
 
     pub async fn get_zk_public_key(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         self.wallet.get_zk_pk_info(private_key).await

@@ -4,61 +4,44 @@ use hex::FromHexError;
 use parth_core::{crypto::hash::traits::HashTo4Felts, pgoldilocks::QHashOut};
 use plonky2::{
     field::{goldilocks_field::GoldilocksField, types::PrimeField64},
+    hash::poseidon::PoseidonHash,
     iop::{target::Target, witness::{PartialWitness, WitnessWrite}},
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData},
-        config::PoseidonGoldilocksConfig,
+        config::{GenericHashOut, Hasher, PoseidonGoldilocksConfig},
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
 };
-use psy_core::job::job_id::QProvingJobDataID;
+use plonky2x::backend::wrapper::wrap::WrappedCircuit;
+use plonky2x::frontend::builder::CircuitBuilder as WrapperBuilder;
+use plonky2x::prelude::DefaultParameters;
 use psy_plonky2_basic_helpers::builder::verify::CircuitBuilderVerifyProofHelpers;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::to_string as json;
 use serde_with::serde_as;
-use plonky2x::backend::wrapper::wrap::WrappedCircuit;
-use plonky2x::frontend::builder::CircuitBuilder as WrapperBuilder;
-use plonky2x::prelude::DefaultParameters;
 
 use crate::{
+    bridge::circuits::bridge_aggregate::bridge_aggregate_pi_len,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    simple_wrapper::dynamic::SimpleWrapperDynamic,
 };
+use gnark_plonky2_wrapper::plonky2_config::PoseidonBN254Hash;
 
-pub use gnark_plonky2_verifier_ffi::DigestArtifact;
 use plonky2::field::types::Field;
-use parth_core::crypto::hash::traits::ToU64x4;
 use psy_common_circuit::serialization::PsyGateSerializer;
 use psy_crypto::hash::core::sha256::CoreSha256Hasher;
+use psy_client_common::traits::to_qfelts::ToQFelts;
+use psy_client_data::qdata::contract::PsyContractLeaf;
 
-const OPENING_DIGEST_PI_LEN: usize = 12;
-const OPENING_DIGEST_BITS: usize = 256;
-const AGGREGATE_BITS: usize = super::settlement_aggregate::AGGREGATE_PI_LEN * 128;
-const DIGEST_WORD_BITS: usize = 32;
-const PUBLICATION_DIGEST_WORDS: usize = 8;
+use super::bridge_claim::BridgeTokenPolicy;
 
-fn digest_artifact_statement(artifact: DigestArtifact) -> (usize, usize) {
-    match artifact {
-        DigestArtifact::DepositAggregate => (OPENING_DIGEST_PI_LEN, OPENING_DIGEST_BITS),
-        DigestArtifact::WindowFinalization => (super::window_finalization::WINDOW_FINALIZATION_PI_LEN, OPENING_DIGEST_BITS),
-    }
-}
-
-fn digest_artifact_prefix(artifact: DigestArtifact) -> [u64; 4] {
-    match artifact {
-        DigestArtifact::DepositAggregate => [1, 11, 1, 0],
-        DigestArtifact::WindowFinalization => [2, 12, 2, 0],
-    }
-}
-
-fn register_digest_bits(builder: &mut CircuitBuilder<F, D>, words: &[Target]) {
-    for word in words {
-        let bits = builder.split_le(*word, DIGEST_WORD_BITS);
-        for bit in bits.into_iter().rev() { builder.register_public_input(bit.target); }
-    }
-}
+const OPENING_PREFIX: [u64; 4] = [4, 12, 0, 0];
+const DEPOSIT_CAPACITY: u32 = 32;
+const WITHDRAWAL_CAPACITY: u32 = 32;
+const REWARD_CAPACITY: u32 = 32;
+const CONTRACT_LEAF_DOMAIN: u64 = 0x434c_5633;
+const GOLDILOCKS_MODULUS: u64 = 0xffff_ffff_0000_0001;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,177 +62,323 @@ impl DigestBitsSources {
     }
 }
 
+fn canonical_limbs(limbs: &[u64]) -> bool {
+    limbs.iter().all(|limb| *limb < GOLDILOCKS_MODULUS)
+}
+
+fn append_length(bytes: &mut Vec<u8>, value: &[u8]) {
+    bytes.extend((value.len() as u64).to_be_bytes());
+    bytes.extend(value);
+}
+
+fn canonical_hex(value: &str, width: Option<usize>) -> anyhow::Result<Vec<u8>> {
+    let decoded = hex::decode(value)?;
+    anyhow::ensure!(!decoded.is_empty() && hex::encode(&decoded) == value, "noncanonical identity hex");
+    if let Some(width) = width { anyhow::ensure!(decoded.len() == width, "identity hex width mismatch"); }
+    Ok(decoded)
+}
+
+fn circuit_bytes(common: &CommonCircuitData<F, D>, verifier: &VerifierOnlyCircuitData<C, D>) -> anyhow::Result<(String, String)> {
+    let common = hex::encode(common.to_bytes(&PsyGateSerializer).map_err(|error| anyhow::anyhow!("common serialization: {error:?}"))?);
+    let verifier = hex::encode(verifier.to_bytes().map_err(|error| anyhow::anyhow!("verifier serialization: {error:?}"))?);
+    Ok((common, verifier))
+}
+
+fn wrapper_fingerprint(verifier: &VerifierOnlyCircuitData<BN, D>) -> [u64; 4] {
+    let mut fields = Vec::new();
+    for hash in &verifier.constants_sigmas_cap.0 { fields.extend(hash.to_vec()); }
+    fields.extend(verifier.circuit_digest.to_vec());
+    let bytes = PoseidonBN254Hash::hash_no_pad(&fields).to_bytes();
+    std::array::from_fn(|index| u64::from_be_bytes(bytes[index * 8..index * 8 + 8].try_into().expect("bn254 hash is 32 bytes")))
+}
+
+fn source_fingerprint(verifier: &VerifierOnlyCircuitData<C, D>) -> [u64; 4] {
+    get_circuit_fingerprint_generic::<D, F, C>(verifier).elements.map(|field| F::to_canonical_u64(&field))
+}
+
+/// Configured chain index, bootstrap checkpoint identifier, and bootstrap root.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct DigestBitsIdentity {
+pub struct BridgeOpeningChain {
+    pub chain_index: u8,
+    pub bootstrap_id: u64,
+    pub bootstrap_root: [u64; 4],
+}
+
+/// Token projection compiled into the opening identity and exported verifier.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeOpeningTokenPolicy {
+    pub chain_index: u8,
+    pub contract_id: u32,
+    pub token: String,
+    pub full_leaf_hash: String,
+    pub map_base: u32,
+    pub capacity: u32,
+    pub height: u8,
+}
+
+impl BridgeOpeningTokenPolicy {
+    fn from_policy(policy: &BridgeTokenPolicy) -> anyhow::Result<Self> {
+        anyhow::ensure!(policy.token_contract_id < 1 << 24 && policy.capacity > 0, "token policy exceeds its installed bounds");
+        anyhow::ensure!(u64::from(policy.map_base) + u64::from(policy.capacity) < 1 << 32, "token map exceeds its address space");
+        let height = policy.approved_leaf.state_tree_height.to_canonical_u64();
+        anyhow::ensure!(height == 32, "approved contract leaf height is not 32");
+        let mut token = [0u8; 20];
+        for (index, limb) in policy.token_address.iter().enumerate() {
+            anyhow::ensure!(index >= 3 || *limb == 0, "token address exceeds 160 bits");
+            if index >= 3 { token[(index - 3) * 4..(index - 2) * 4].copy_from_slice(&limb.to_be_bytes()); }
+        }
+        let mut preimage = vec![F::from_canonical_u64(CONTRACT_LEAF_DOMAIN)];
+        preimage.extend(policy.approved_leaf.to_qfelts());
+        anyhow::ensure!(preimage.len() == 17, "approved contract leaf preimage width mismatch");
+        let hash = PoseidonHash::hash_no_pad(&preimage);
+        Ok(Self {
+            chain_index: policy.chain_index, contract_id: policy.token_contract_id, token: hex::encode(token),
+            full_leaf_hash: hex::encode(hash.to_bytes()), map_base: policy.map_base, capacity: policy.capacity, height: u8::try_from(height)?,
+        })
+    }
+}
+
+/// Setup binding for one installed version-4 opening graph.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeOpeningIdentity {
     pub schema: u32,
     pub mode: String,
-    pub artifact: u32,
+    pub version: u32,
+    pub deposit_capacity: u32,
+    pub withdrawal_capacity: u32,
+    pub reward_capacity: u32,
+    pub chain_count: u32,
+    pub raw_pi_width: u32,
     pub node_source: String,
     pub native_source: String,
     pub plonky2_source: String,
     pub wrapper_source: String,
-    pub normalizer_fingerprint: [u64; 4],
-    pub normalizer_common: String,
-    pub normalizer_verifier: String,
-    pub final_common_json: String,
-    pub final_verifier_json: String,
+    pub config_hash: String,
+    pub chains: Vec<BridgeOpeningChain>,
+    pub token_policies: Vec<BridgeOpeningTokenPolicy>,
+    pub source_fingerprint: [u64; 4],
+    pub wrapper_fingerprint: [u64; 4],
+    pub child_fingerprint: [u64; 4],
+    pub top_fingerprint: [u64; 4],
+    pub source_common: String,
+    pub source_verifier: String,
+    pub child_common_json: String,
+    pub child_verifier_json: String,
+    pub top_common_json: String,
+    pub top_verifier_json: String,
+    pub wrapper_common_json: String,
+    pub wrapper_verifier_json: String,
 }
 
-impl DigestBitsIdentity {
+impl BridgeOpeningIdentity {
     pub fn identity_hash(&self) -> anyhow::Result<String> {
-        anyhow::ensure!(self.schema == 1 && self.mode == "DigestBits" && matches!(self.artifact, 1 | 2 | 3), "invalid DigestBits identity");
+        let width = bridge_aggregate_pi_len(self.chains.len());
+        anyhow::ensure!(self.schema == 1 && self.mode == "BridgeOpening" && self.version == 4, "invalid bridge opening identity");
+        anyhow::ensure!(self.deposit_capacity == DEPOSIT_CAPACITY && self.withdrawal_capacity == WITHDRAWAL_CAPACITY && self.reward_capacity == REWARD_CAPACITY, "bridge opening capacity mismatch");
+        anyhow::ensure!((1..=8).contains(&self.chain_count) && self.chain_count as usize == self.chains.len() && self.raw_pi_width as usize == width, "bridge opening width mismatch");
         DigestBitsSources { node_source: self.node_source.clone(), native_source: self.native_source.clone(), plonky2_source: self.plonky2_source.clone(), wrapper_source: self.wrapper_source.clone() }.validate()?;
-        anyhow::ensure!(self.normalizer_fingerprint.iter().all(|limb| *limb < 0xffff_ffff_0000_0001), "noncanonical fingerprint");
-        let mut bytes = b"PsyBridge/DigestBits/1".to_vec();
-        bytes.extend(self.schema.to_be_bytes());
-        bytes.extend(self.artifact.to_be_bytes());
-        fn append(bytes: &mut Vec<u8>, value: &[u8]) {
-            bytes.extend((value.len() as u64).to_be_bytes());
-            bytes.extend(value);
+        for limbs in [&self.source_fingerprint, &self.wrapper_fingerprint, &self.child_fingerprint, &self.top_fingerprint] {
+            anyhow::ensure!(canonical_limbs(limbs), "noncanonical fingerprint");
         }
-        for value in [&self.mode, &self.node_source, &self.native_source, &self.plonky2_source, &self.wrapper_source] { append(&mut bytes, value.as_bytes()); }
-        for limb in self.normalizer_fingerprint { bytes.extend(limb.to_be_bytes()); }
-        for value in [&self.normalizer_common, &self.normalizer_verifier] {
-            let decoded = hex::decode(value)?;
-            anyhow::ensure!(hex::encode(&decoded) == *value, "noncanonical identity hex");
-            append(&mut bytes, &decoded);
+        anyhow::ensure!(self.chains.windows(2).all(|pair| pair[0].chain_index < pair[1].chain_index), "bridge opening chains are not strictly ordered");
+        anyhow::ensure!(self.chains.iter().all(|chain| canonical_limbs(&chain.bootstrap_root)), "noncanonical bridge bootstrap root");
+        let mut seen = std::collections::BTreeSet::new();
+        for policy in &self.token_policies {
+            anyhow::ensure!(self.chains.iter().any(|chain| chain.chain_index == policy.chain_index), "token policy chain is not configured");
+            anyhow::ensure!(policy.contract_id < 1 << 24 && policy.capacity > 0 && policy.height == 32, "invalid bridge opening token policy");
+            anyhow::ensure!(u64::from(policy.map_base) + u64::from(policy.capacity) < 1 << 32, "token map exceeds its address space");
+            anyhow::ensure!(seen.insert((policy.chain_index, policy.contract_id)), "duplicate bridge opening token policy");
+            canonical_hex(&policy.token, Some(20))?;
+            canonical_hex(&policy.full_leaf_hash, Some(32))?;
         }
-        append(&mut bytes, self.final_common_json.as_bytes());
-        append(&mut bytes, self.final_verifier_json.as_bytes());
+        let config_hash = canonical_hex(&self.config_hash, Some(32))?;
+        let source_common = canonical_hex(&self.source_common, None)?;
+        let source_verifier = canonical_hex(&self.source_verifier, None)?;
+        for value in [&self.child_common_json, &self.child_verifier_json, &self.top_common_json, &self.top_verifier_json, &self.wrapper_common_json, &self.wrapper_verifier_json] {
+            serde_json::from_str::<serde_json::Value>(value)?;
+        }
+        let mut bytes = b"PsyBridge/BridgeOpening/4".to_vec();
+        for value in [self.schema, self.version, self.deposit_capacity, self.withdrawal_capacity, self.reward_capacity, self.chain_count, self.raw_pi_width] {
+            bytes.extend(value.to_be_bytes());
+        }
+        for value in [&self.mode, &self.node_source, &self.native_source, &self.plonky2_source, &self.wrapper_source] { append_length(&mut bytes, value.as_bytes()); }
+        for limbs in [self.source_fingerprint, self.wrapper_fingerprint, self.child_fingerprint, self.top_fingerprint] {
+            for limb in limbs { bytes.extend(limb.to_be_bytes()); }
+        }
+        for value in [source_common, source_verifier, self.child_common_json.as_bytes().to_vec(), self.child_verifier_json.as_bytes().to_vec(), self.top_common_json.as_bytes().to_vec(), self.top_verifier_json.as_bytes().to_vec(), self.wrapper_common_json.as_bytes().to_vec(), self.wrapper_verifier_json.as_bytes().to_vec()] {
+            append_length(&mut bytes, &value);
+        }
+        bytes.extend(config_hash);
+        for chain in &self.chains {
+            bytes.push(chain.chain_index);
+            bytes.extend(chain.bootstrap_id.to_be_bytes());
+            for limb in chain.bootstrap_root { bytes.extend(limb.to_be_bytes()); }
+        }
+        for policy in &self.token_policies {
+            bytes.push(policy.chain_index);
+            bytes.extend(policy.contract_id.to_be_bytes());
+            bytes.extend(canonical_hex(&policy.token, Some(20))?);
+            bytes.extend(canonical_hex(&policy.full_leaf_hash, Some(32))?);
+            bytes.extend(policy.map_base.to_be_bytes());
+            bytes.extend(policy.capacity.to_be_bytes());
+            bytes.push(policy.height);
+        }
         Ok(hex::encode(CoreSha256Hasher::hash_bytes(&bytes).0))
     }
-}
 
-pub struct DigestBitsAdapter {
-    pub circuit_data: CircuitData<F, C, D>,
-    normalizer: ProofWithPublicInputsTarget<D>,
-    artifact: DigestArtifact,
-    normalizer_fingerprint: [u64; 4],
-    normalizer_common: String,
-    normalizer_verifier: String,
-}
-
-impl DigestBitsAdapter {
-    pub fn build(artifact: DigestArtifact, common: &CommonCircuitData<F, D>, verifier: &VerifierOnlyCircuitData<C, D>) -> anyhow::Result<Self> {
-        let (statement_len, digest_bits) = digest_artifact_statement(artifact);
-        anyhow::ensure!(common.num_public_inputs == statement_len, "normalizer public input width mismatch");
-        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
-        let normalizer = builder.add_virtual_proof_with_pis(common);
-        let pinned_verifier = builder.constant_verifier_data(verifier);
-        builder.verify_proof::<C>(&normalizer, &pinned_verifier, common);
-        for (target, value) in normalizer.public_inputs[..4].iter().zip(digest_artifact_prefix(artifact)) {
-            let constant = builder.constant(F::from_canonical_u64(value));
-            builder.connect(*target, constant);
-        }
-        let digest_words = &normalizer.public_inputs[4..];
-        anyhow::ensure!(digest_words.len() * DIGEST_WORD_BITS == digest_bits, "digest bit width mismatch");
-        register_digest_bits(&mut builder, digest_words);
-        let circuit_data = builder.build::<C>();
-        anyhow::ensure!(circuit_data.common.num_public_inputs == digest_bits, "adapter digest width mismatch");
-        Ok(Self {
-            circuit_data, normalizer, artifact,
-            normalizer_fingerprint: crate::proof_minifier::pm_core::get_circuit_fingerprint_generic_q::<D, F, C>(verifier).to_u64x4(),
-            normalizer_common: hex::encode(common.to_bytes(&PsyGateSerializer).map_err(|error| anyhow::anyhow!("common serialization: {error:?}"))?),
-            normalizer_verifier: hex::encode(verifier.to_bytes().map_err(|error| anyhow::anyhow!("verifier serialization: {error:?}"))?),
-        })
+    /// Confirms that declared source bytes are the bytes of the supplied verifier.
+    pub fn matches_source(&self, common: &CommonCircuitData<F, D>, verifier: &VerifierOnlyCircuitData<C, D>) -> anyhow::Result<bool> {
+        let (common, verifier_bytes) = circuit_bytes(common, verifier)?;
+        Ok(self.source_common == common && self.source_verifier == verifier_bytes && self.source_fingerprint == source_fingerprint(verifier))
     }
 
-    pub fn prove(&self, proof: &ProofWithPublicInputs<F, C, D>) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-        let (statement_len, _) = digest_artifact_statement(self.artifact);
-        anyhow::ensure!(proof.public_inputs.len() == statement_len, "normalizer PI width mismatch");
+    /// Appends this identity's withdrawal-policy getter without changing the generic verifier.
+    pub fn render_verifier(&self, generic_verifier: &str) -> anyhow::Result<String> {
+        self.identity_hash()?;
+        anyhow::ensure!(!generic_verifier.is_empty() && !generic_verifier.starts_with("error:"), "generic verifier export failed");
+        anyhow::ensure!(generic_verifier.contains("contract Verifier"), "generic verifier has no Verifier contract");
+        let product = self.product_verifier_contract()?;
+        let generic = generic_verifier.trim_end_matches(['\n', '\r']);
+        if let Some(base) = generic.strip_suffix(product.trim_end_matches('\n')) {
+            anyhow::ensure!(!base.contains("function withdrawalTokenPolicyHash"), "generic verifier already defines withdrawalTokenPolicyHash");
+            return Ok(generic_verifier.to_string());
+        }
+        anyhow::ensure!(!generic_verifier.contains("function withdrawalTokenPolicyHash") && !generic_verifier.contains("contract BridgeOpeningProductVerifier"), "generic verifier already contains product policy metadata");
+        Ok(format!("{generic}\n{product}"))
+    }
+
+    fn product_verifier_contract(&self) -> anyhow::Result<String> {
+        let mut contract = String::from("contract BridgeOpeningProductVerifier is Verifier {\n    function withdrawalTokenPolicyHash(uint8 chainIndex, uint32 contractId) external pure returns (bytes32) {\n");
+        for policy in &self.token_policies {
+            let token = canonical_hex(&policy.token, Some(20))?;
+            let leaf = canonical_hex(&policy.full_leaf_hash, Some(32))?;
+            let hash = policy_hash(policy.chain_index, policy.contract_id, &token, &leaf, policy.map_base, policy.capacity, policy.height);
+            contract.push_str(&format!("        if (chainIndex == {} && contractId == {}) return {};\n", policy.chain_index, policy.contract_id, hash));
+        }
+        contract.push_str("        revert();\n    }\n}\n");
+        Ok(contract)
+    }
+}
+
+/// Cross-config conversion of one pinned `BridgeAggregateCircuit` proof.
+pub struct BridgeOpeningWrapper {
+    proof: ProofWithPublicInputsTarget<D>,
+    circuit_data: CircuitData<F, BN, D>,
+    identity: BridgeOpeningIdentity,
+}
+
+impl BridgeOpeningWrapper {
+    pub fn build(
+        source_common: &CommonCircuitData<F, D>, source_verifier: &VerifierOnlyCircuitData<C, D>,
+        claim_common: &CommonCircuitData<F, D>, claim_verifier: &VerifierOnlyCircuitData<C, D>,
+        sources: DigestBitsSources, config_hash: [u8; 32], chains: &[BridgeOpeningChain], policies: &[BridgeTokenPolicy],
+    ) -> anyhow::Result<Self> {
+        sources.validate()?;
+        let chain_count = chains.len();
+        let width = bridge_aggregate_pi_len(chain_count);
+        anyhow::ensure!((1..=8).contains(&chain_count) && chains.windows(2).all(|pair| pair[0].chain_index < pair[1].chain_index), "invalid bridge opening chain list");
+        anyhow::ensure!(source_common.num_public_inputs == width, "bridge aggregate public input width mismatch");
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let proof = builder.add_virtual_proof_with_pis(source_common);
+        let verifier = builder.constant_verifier_data(source_verifier);
+        builder.verify_proof::<C>(&proof, &verifier, source_common);
+        for (target, value) in proof.public_inputs[..4].iter().zip(OPENING_PREFIX) {
+            let prefix = builder.constant(F::from_canonical_u64(value));
+            builder.connect(*target, prefix);
+        }
+        builder.register_public_inputs(&proof.public_inputs);
+        let circuit_data = builder.build::<BN>();
+        anyhow::ensure!(circuit_data.common.num_public_inputs == width, "bridge opening pass-through width mismatch");
+        let (source_common_bytes, source_verifier_bytes) = circuit_bytes(source_common, source_verifier)?;
+        let identity = BridgeOpeningIdentity {
+            schema: 1, mode: "BridgeOpening".into(), version: 4, deposit_capacity: DEPOSIT_CAPACITY,
+            withdrawal_capacity: WITHDRAWAL_CAPACITY, reward_capacity: REWARD_CAPACITY, chain_count: chain_count as u32, raw_pi_width: width as u32,
+            node_source: sources.node_source, native_source: sources.native_source, plonky2_source: sources.plonky2_source, wrapper_source: sources.wrapper_source,
+            config_hash: hex::encode(config_hash), chains: chains.to_vec(),
+            token_policies: policies.iter().map(BridgeOpeningTokenPolicy::from_policy).collect::<anyhow::Result<_>>()?,
+            source_fingerprint: source_fingerprint(source_verifier), wrapper_fingerprint: wrapper_fingerprint(&circuit_data.verifier_only),
+            child_fingerprint: source_fingerprint(claim_verifier), top_fingerprint: source_fingerprint(source_verifier),
+            source_common: source_common_bytes, source_verifier: source_verifier_bytes,
+            child_common_json: json(claim_common)?, child_verifier_json: json(claim_verifier)?,
+            top_common_json: json(source_common)?, top_verifier_json: json(source_verifier)?,
+            wrapper_common_json: json(&circuit_data.common)?, wrapper_verifier_json: json(&circuit_data.verifier_only)?,
+        };
+        identity.identity_hash()?;
+        Ok(Self { proof, circuit_data, identity })
+    }
+
+    pub fn identity(&self) -> &BridgeOpeningIdentity { &self.identity }
+
+    pub fn prove(&self, source_proof: &ProofWithPublicInputs<F, C, D>) -> anyhow::Result<ProofWithPublicInputs<F, BN, D>> {
+        anyhow::ensure!(source_proof.public_inputs.len() == self.circuit_data.common.num_public_inputs, "bridge source proof width mismatch");
         let mut witness = PartialWitness::new();
-        witness.set_proof_with_pis_target(&self.normalizer, proof)?;
+        witness.set_proof_with_pis_target(&self.proof, source_proof)?;
         let proved = self.circuit_data.prove(witness)?;
-        anyhow::ensure!(proved.public_inputs.len() == self.circuit_data.common.num_public_inputs, "adapter proof width mismatch");
+        anyhow::ensure!(proved.public_inputs == source_proof.public_inputs, "bridge opening raw public inputs changed");
+        self.circuit_data.verify(proved.clone())?;
         Ok(proved)
     }
 
-    pub fn into_wrapper(self, sources: DigestBitsSources) -> anyhow::Result<DigestBitsWrapper> {
-        sources.validate()?;
-        let (_, digest_bits) = digest_artifact_statement(self.artifact);
-        let shared = SharedGroth16Wrapper::new(self.circuit_data, String::new());
-        let final_data = &shared.wrapped_circuit.wrapper_circuit.data;
-        anyhow::ensure!(final_data.common.num_public_inputs == digest_bits, "final wrapper digest width mismatch");
-        let identity = DigestBitsIdentity {
-            schema: 1, mode: "DigestBits".into(), artifact: self.artifact as u32,
-            node_source: sources.node_source, native_source: sources.native_source,
-            plonky2_source: sources.plonky2_source, wrapper_source: sources.wrapper_source,
-            normalizer_fingerprint: self.normalizer_fingerprint, normalizer_common: self.normalizer_common,
-            normalizer_verifier: self.normalizer_verifier,
-            final_common_json: json(&final_data.common)?, final_verifier_json: json(&final_data.verifier_only)?,
-        };
-        identity.identity_hash()?;
-        Ok(DigestBitsWrapper { shared, artifact: self.artifact, identity })
-    }
-}
-
-pub struct DigestBitsWrapper {
-    shared: SharedGroth16Wrapper,
-    artifact: DigestArtifact,
-    identity: DigestBitsIdentity,
-}
-
-impl DigestBitsWrapper {
-    pub fn identity(&self) -> &DigestBitsIdentity { &self.identity }
-
-    pub fn setup(&self, artifact_dir: &str) -> anyhow::Result<()> {
-        gnark_plonky2_verifier_ffi::setup_digest_bits(self.artifact, &json(&self.identity)?, artifact_dir)
-            .map_err(|error| anyhow::anyhow!("DigestBits setup status {}: {}", error.status, error.message))
-    }
-
-    pub fn prove_groth16(&self, adapter_proof: &ProofWithPublicInputs<F, C, D>, artifact_dir: &str) -> anyhow::Result<UncompressedGroth16ProofData> {
-        anyhow::ensure!(matches!(self.artifact, DigestArtifact::DepositAggregate | DigestArtifact::WindowFinalization), "unsupported shared artifact");
-        let (_, digest_bits) = digest_artifact_statement(self.artifact);
-        let words = digest_bit_words::<2>(adapter_proof, digest_bits)?;
-        let proof = self.prove_native(adapter_proof, artifact_dir)?;
-        let decoded: UncompressedGroth16ProofData = serde_json::from_str(&proof)?;
-        anyhow::ensure!(decode_digest_words(&decoded.public_inputs)? == words, "native digest halves mismatch");
+    pub fn prove_groth16(&self, source_proof: &ProofWithPublicInputs<F, C, D>, artifact_dir: &str) -> anyhow::Result<UncompressedGroth16ProofData> {
+        let converted = self.prove(source_proof)?;
+        let (proof_json, verifier_json) = gnark_plonky2_verifier_ffi::generate_groth16_proof(&json(&self.circuit_data.common)?, &json(&converted)?, &json(&self.circuit_data.verifier_only)?, artifact_dir);
+        anyhow::ensure!(!proof_json.starts_with("error:") && !verifier_json.starts_with("error:"), "generate_groth16_proof failed: {proof_json}{verifier_json}");
+        let decoded: UncompressedGroth16ProofData = serde_json::from_str(&proof_json)?;
+        check_returned_public_inputs(&decoded.public_inputs, &source_proof.public_inputs)?;
         Ok(decoded)
     }
-
-    fn prove_native(&self, adapter_proof: &ProofWithPublicInputs<F, C, D>, artifact_dir: &str) -> anyhow::Result<String> {
-        let output = self.shared.wrapped_circuit.prove(adapter_proof)?;
-        let result = gnark_plonky2_verifier_ffi::generate_digest_bits_proof(self.artifact, &json(&self.identity)?, &json(&output.proof)?, artifact_dir)
-            .map_err(|error| anyhow::anyhow!("DigestBits proving status {}: {}", error.status, error.message))?;
-        Ok(result.proof_json)
-    }
 }
 
-fn digest_bit_words<const N: usize>(adapter_proof: &ProofWithPublicInputs<F, C, D>, digest_bits: usize) -> anyhow::Result<[u128; N]> {
-    anyhow::ensure!(digest_bits == N * 128 && adapter_proof.public_inputs.len() == digest_bits, "digest PI width mismatch");
-    let mut words = [0u128; N];
-    for (index, bit) in adapter_proof.public_inputs.iter().enumerate() {
-        let bit = bit.to_canonical_u64();
-        anyhow::ensure!(bit <= 1, "digest input is not Boolean");
-        words[index / 128] = (words[index / 128] << 1) | u128::from(bit);
+fn check_returned_public_inputs(returned: &[String], source: &[F]) -> anyhow::Result<()> {
+    anyhow::ensure!(returned.len() == source.len(), "bridge opening public input count mismatch");
+    for (returned, source) in returned.iter().zip(source) {
+        anyhow::ensure!(decode_goldilocks_word(returned)? == source.to_canonical_u64(), "bridge opening public input mismatch");
     }
-    Ok(words)
+    Ok(())
 }
 
-fn decode_digest_words<const N: usize>(inputs: &[String; N]) -> anyhow::Result<[u128; N]> {
-    let mut words = [0u128; N];
-    for (word, decoded) in inputs.iter().zip(&mut words) {
-        anyhow::ensure!(word.len() == 64 && word.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "native digest input must be 64 lowercase hexadecimal digits");
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(word, &mut bytes)?;
-        anyhow::ensure!(bytes[..16] == [0; 16], "native digest input exceeds uint128");
-        *decoded = u128::from_be_bytes(bytes[16..].try_into()?);
-    }
-    Ok(words)
+fn decode_goldilocks_word(word: &str) -> anyhow::Result<u64> {
+    anyhow::ensure!(word.len() == 64 && word.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), "public input must be 64 lowercase hexadecimal digits");
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(word, &mut bytes)?;
+    anyhow::ensure!(bytes[..24] == [0; 24], "public input exceeds Goldilocks");
+    let value = u64::from_be_bytes(bytes[24..].try_into()?);
+    anyhow::ensure!(value < GOLDILOCKS_MODULUS, "public input is outside Goldilocks");
+    Ok(value)
 }
 
-fn decode_digest_bits_public_inputs(inputs: &[String; 2]) -> anyhow::Result<[u128; 2]> {
-    decode_digest_words(inputs)
+fn policy_hash(chain_index: u8, contract_id: u32, token: &[u8], full_leaf_hash: &[u8], map_base: u32, capacity: u32, height: u8) -> String {
+    assert!(token.len() == 20 && full_leaf_hash.len() == 32, "policy hash ABI word width");
+    let mut encoded = Vec::with_capacity(7 * 32);
+    encoded.extend([0u8; 31]);
+    encoded.push(chain_index);
+    encoded.extend([0u8; 28]);
+    encoded.extend(contract_id.to_be_bytes());
+    encoded.extend([0u8; 12]);
+    encoded.extend(token);
+    encoded.extend(full_leaf_hash);
+    encoded.extend([0u8; 28]);
+    encoded.extend(map_base.to_be_bytes());
+    encoded.extend([0u8; 28]);
+    encoded.extend(capacity.to_be_bytes());
+    encoded.extend([0u8; 31]);
+    encoded.push(height);
+    debug_assert_eq!(encoded.len(), 7 * 32);
+    let mut keccak = tiny_keccak::Keccak::v256();
+    tiny_keccak::Hasher::update(&mut keccak, &encoded);
+    let mut digest = [0u8; 32];
+    tiny_keccak::Hasher::finalize(keccak, &mut digest);
+    format!("0x{}", hex::encode(digest))
 }
 
 #[serde_as]
 #[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, PartialOrd, Ord)]
 pub struct Serialized2DFeltBN254(#[serde_as(as = "serde_with::hex::Hex")] pub [u8; 32]);
 impl Default for Serialized2DFeltBN254 {
-    fn default() -> Self {
-        Self([0u8; 32])
-    }
+    fn default() -> Self { Self([0u8; 32]) }
 }
 
 impl Serialized2DFeltBN254 {
@@ -260,17 +389,13 @@ impl Serialized2DFeltBN254 {
         array.copy_from_slice(&bytes);
         Ok(Self(array))
     }
-    pub fn to_hex_string(&self) -> String {
-        hex::encode(&self.0)
-    }
+    pub fn to_hex_string(&self) -> String { hex::encode(self.0) }
     pub fn rand() -> Self {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
-        Serialized2DFeltBN254(bytes)
+        Self(bytes)
     }
-    pub fn is_zero(&self) -> bool {
-        self.0.iter().all(|&x| x == 0)
-    }
+    pub fn is_zero(&self) -> bool { self.0.iter().all(|&x| x == 0) }
     pub fn from_slice(data: &[u8]) -> Self {
         let mut array = [0u8; 32];
         array.copy_from_slice(data);
@@ -279,24 +404,15 @@ impl Serialized2DFeltBN254 {
 }
 
 impl Display for Serialized2DFeltBN254 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", hex::encode(self.0)) }
 }
-
 impl TryFrom<&str> for Serialized2DFeltBN254 {
     type Error = FromHexError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Serialized2DFeltBN254::from_hex_string(value)
-    }
+    fn try_from(value: &str) -> Result<Self, Self::Error> { Self::from_hex_string(value) }
 }
 impl TryFrom<String> for Serialized2DFeltBN254 {
     type Error = FromHexError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Serialized2DFeltBN254::from_hex_string(&value)
-    }
+    fn try_from(value: String) -> Result<Self, Self::Error> { Self::from_hex_string(&value) }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug, Hash, Ord, PartialOrd, Eq)]
@@ -304,11 +420,11 @@ pub struct UncompressedGroth16ProofData {
     pub pi_a: [String; 2],
     pub pi_b: [[String; 2]; 2],
     pub pi_c: [String; 2],
-    pub public_inputs: [String; 2],
+    pub public_inputs: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug, Hash, Ord, PartialOrd, Eq)]
-pub struct InclusionAggregateProof {
+pub struct ClaimPublicationProof {
     pub pi_a: [String; 2],
     pub pi_b: [[String; 2]; 2],
     pub pi_c: [String; 2],
@@ -316,23 +432,181 @@ pub struct InclusionAggregateProof {
 }
 
 type C = PoseidonGoldilocksConfig;
+type BN = gnark_plonky2_wrapper::plonky2_config::PoseidonBN254GoldilocksConfig;
 const D: usize = 2;
 type F = GoldilocksField;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FinalizeIdentity {
-    pub schema: u32,
-    pub chain_indices: Vec<u8>,
-    pub final_common_json: String,
-    pub final_verifier_json: String,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plonky2::iop::witness::{PartialWitness, WitnessWrite};
+
+    fn sources() -> DigestBitsSources {
+        DigestBitsSources { node_source: "1".repeat(40), native_source: "2".repeat(40), plonky2_source: "3".repeat(40), wrapper_source: "4".repeat(40) }
+    }
+    fn chain(index: u8) -> BridgeOpeningChain {
+        BridgeOpeningChain { chain_index: index, bootstrap_id: u64::from(index), bootstrap_root: [1, 2, 3, 4] }
+    }
+    fn policy(chain_index: u8, contract_id: u32) -> BridgeTokenPolicy {
+        BridgeTokenPolicy {
+            chain_index, token_contract_id: contract_id, token_address: [0, 0, 0, 0x01020304, 5, 6, 7, 8],
+            approved_leaf: PsyContractLeaf { deployer: F::from_canonical_u64(9), state_tree_height: F::from_canonical_u64(32), ..PsyContractLeaf::default() },
+            map_base: 8, capacity: 4,
+        }
+    }
+    fn source(chains: usize) -> CircuitData<F, C, D> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let inputs = builder.add_virtual_targets(bridge_aggregate_pi_len(chains));
+        builder.register_public_inputs(&inputs);
+        builder.build()
+    }
+
+    #[test]
+    fn opening_forwards_exact_width_and_rejects_wrong_source() {
+        for chains in [1usize, 8] {
+            let source_circuit = source(chains);
+            let child = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config()).build::<C>();
+            let policies = [policy(1, 7)];
+            let chain_list = (1..=chains as u8).map(chain).collect::<Vec<_>>();
+            let wrapper = BridgeOpeningWrapper::build(&source_circuit.common, &source_circuit.verifier_only, &child.common, &child.verifier_only, sources(), [0x11; 32], &chain_list, &policies).unwrap();
+            assert!(wrapper.identity().matches_source(&source_circuit.common, &source_circuit.verifier_only).unwrap());
+            assert!(!wrapper.identity().matches_source(&child.common, &child.verifier_only).unwrap());
+            assert_eq!(wrapper.circuit_data.common.num_public_inputs, bridge_aggregate_pi_len(chains));
+            assert_eq!(bridge_aggregate_pi_len(8), 9340);
+            let mut values = vec![0u64; bridge_aggregate_pi_len(chains)];
+            values[..4].copy_from_slice(&OPENING_PREFIX);
+            values[11] = 0x01020304;
+            let prove = |values: &[u64], data: &CircuitData<F, C, D>| {
+                let mut witness = PartialWitness::new();
+                for (target, value) in data.prover_only.public_inputs.iter().zip(values) { witness.set_target(*target, F::from_canonical_u64(*value)).unwrap(); }
+                data.prove(witness).unwrap()
+            };
+            let proof = prove(&values, &source_circuit);
+            let converted = wrapper.prove(&proof).unwrap();
+            assert_eq!(converted.public_inputs, proof.public_inputs);
+            wrapper.circuit_data.verify(converted).unwrap();
+            values[0] += 1;
+            assert!(wrapper.prove(&prove(&values, &source_circuit)).is_err());
+            let mut wrong_verifier = source_circuit.verifier_only.clone();
+            wrong_verifier.circuit_digest.elements[0] += F::ONE;
+            let wrong = BridgeOpeningWrapper::build(&source_circuit.common, &wrong_verifier, &child.common, &child.verifier_only, sources(), [0x11; 32], &chain_list, &policies).unwrap();
+            let mut accepted = values.clone();
+            accepted[0] -= 1;
+            assert!(wrong.prove(&prove(&accepted, &source_circuit)).is_err());
+        }
+    }
+
+    #[test]
+    fn opening_identity_rejects_noncanonical_policy_and_width() {
+        let source = source(1);
+        let wrapper = BridgeOpeningWrapper::build(&source.common, &source.verifier_only, &source.common, &source.verifier_only, sources(), [0x22; 32], &[chain(1)], &[policy(1, 7)]).unwrap();
+        let mut identity = wrapper.identity().clone();
+        let original = identity.identity_hash().unwrap();
+        identity.config_hash = hex::encode([0x33; 32]);
+        assert_ne!(identity.identity_hash().unwrap(), original);
+        identity.config_hash = hex::encode([0x22; 32]);
+        identity.token_policies[0].full_leaf_hash = hex::encode([0x44; 32]);
+        assert_ne!(identity.identity_hash().unwrap(), original);
+        identity.token_policies[0].token = hex::encode([0u8; 21]);
+        assert!(identity.identity_hash().is_err());
+        identity.token_policies[0].token = wrapper.identity().token_policies[0].token.clone();
+        identity.token_policies[0].height = 31;
+        assert!(identity.identity_hash().is_err());
+        identity.token_policies[0].height = 32;
+        identity.raw_pi_width -= 1;
+        assert!(identity.identity_hash().is_err());
+        identity.raw_pi_width += 1;
+        identity.chains[0].bootstrap_root[0] = GOLDILOCKS_MODULUS;
+        assert!(identity.identity_hash().is_err());
+        identity.mode = "DepositOpening".into();
+        assert!(identity.identity_hash().is_err());
+        let mut unknown = serde_json::to_value(wrapper.identity()).unwrap();
+        unknown["reward_cutover"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<BridgeOpeningIdentity>(unknown).is_err());
+    }
+
+    #[test]
+    fn returned_vector_rejects_count_order_and_noncanonical_scalars() {
+        let word = |value: u64| format!("{value:064x}");
+        let source = [4u64, 12, 0, GOLDILOCKS_MODULUS - 1].map(F::from_canonical_u64);
+        let words = source.iter().map(|value| word(value.to_canonical_u64())).collect::<Vec<_>>();
+        check_returned_public_inputs(&words, &source).unwrap();
+        let mut swapped = words.clone();
+        swapped.swap(0, 3);
+        assert!(check_returned_public_inputs(&swapped, &source).is_err());
+        assert!(check_returned_public_inputs(&words[..3], &source).is_err());
+        assert!(check_returned_public_inputs(&[words.clone(), vec![word(0)]].concat(), &source).is_err());
+        for invalid in [
+            format!("0x{}", words[0]), words[0].to_uppercase(), "0".repeat(63), "0".repeat(65),
+            format!("{}g", "0".repeat(63)), format!("{:064x}", u128::from(GOLDILOCKS_MODULUS)),
+            format!("01{}", "0".repeat(62)), format!("{:064x}", u128::from(u64::MAX)),
+        ] {
+            let mut rejected = words.clone();
+            rejected[3] = invalid;
+            assert!(check_returned_public_inputs(&rejected, &source).is_err());
+        }
+    }
+
+    #[test]
+    fn product_verifier_appends_exact_policy_getter_without_changing_base() {
+        let source = source(2);
+        let wrapper = BridgeOpeningWrapper::build(&source.common, &source.verifier_only, &source.common, &source.verifier_only, sources(), [0x22; 32], &[chain(1), chain(2)], &[policy(1, 7), policy(2, 9)]).unwrap();
+        let identity = wrapper.identity();
+        let generic = "contract Verifier {\n    function verifyProof(uint256[8] calldata proof, uint256[] calldata input) public view {\n        success := staticcall(gas(), PRECOMPILE_VERIFY, f, 0x300, f, 0x20);\n    }\n}\n";
+        let rendered = identity.render_verifier(generic).unwrap();
+        assert!(rendered.starts_with(generic.trim_end()));
+        assert!(rendered.contains("contract BridgeOpeningProductVerifier is Verifier"));
+        assert!(rendered.contains("function withdrawalTokenPolicyHash(uint8 chainIndex, uint32 contractId) external pure returns (bytes32)"));
+        let first = policy_hash(1, 7, &hex::decode(&identity.token_policies[0].token).unwrap(), &hex::decode(&identity.token_policies[0].full_leaf_hash).unwrap(), 8, 4, 32);
+        let second = policy_hash(2, 9, &hex::decode(&identity.token_policies[1].token).unwrap(), &hex::decode(&identity.token_policies[1].full_leaf_hash).unwrap(), 8, 4, 32);
+        assert!(rendered.contains(&format!("if (chainIndex == 1 && contractId == 7) return {first};")));
+        assert!(rendered.contains(&format!("if (chainIndex == 2 && contractId == 9) return {second};")));
+        assert!(rendered.contains("revert();"));
+        assert_eq!(identity.render_verifier(&rendered).unwrap(), rendered);
+        assert_eq!(identity.render_verifier(rendered.trim_end()).unwrap(), rendered);
+        assert!(identity.render_verifier("").is_err());
+        assert!(identity.render_verifier("error: missing key").is_err());
+        assert!(identity.render_verifier("contract Other {}").is_err());
+        assert!(identity.render_verifier(&format!("{generic}\nfunction withdrawalTokenPolicyHash(uint8,uint32)")).is_err());
+        let mut changed = rendered.clone();
+        changed.push_str("/*changed*/");
+        let different = rendered.replacen("contractId == 7", "contractId == 8", 1);
+        assert!(identity.render_verifier(&different).is_err());
+        assert!(identity.render_verifier(&changed).is_err());
+    }
+
+    #[test]
+    fn policy_hash_matches_abi_encode_of_seven_words() {
+        let token = [0u8, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let leaf = [0x21u8; 32];
+        let mut word = |high: usize, value: &[u8]| { let mut out = vec![0u8; 32 - value.len()]; out.extend(value); assert_eq!(out.len(), 32); assert!(out[..high].iter().all(|byte| *byte == 0)); out };
+        let encoded = [word(31, &[3]), word(28, &7u32.to_be_bytes()), word(12, &token), leaf.to_vec(), word(28, &8u32.to_be_bytes()), word(28, &4u32.to_be_bytes()), word(31, &[32])].concat();
+        assert_eq!(encoded.len(), 224);
+        let mut keccak = tiny_keccak::Keccak::v256();
+        tiny_keccak::Hasher::update(&mut keccak, &encoded);
+        let mut digest = [0u8; 32];
+        tiny_keccak::Hasher::finalize(keccak, &mut digest);
+        assert_eq!(policy_hash(3, 7, &token, &leaf, 8, 4, 32), format!("0x{}", hex::encode(digest)));
+    }
+
+    #[test]
+    fn claim_publication_words_reject_wrong_count() {
+        let curve = ["0".repeat(64), "0".repeat(64)];
+        let words = std::array::from_fn(|index| format!("{:064x}", index + 1));
+        let proof = ClaimPublicationProof { pi_a: curve.clone(), pi_b: [curve.clone(), curve.clone()], pi_c: curve.clone(), public_inputs: words };
+        let encoded = serde_json::to_string(&proof).unwrap();
+        assert_eq!(serde_json::from_str::<ClaimPublicationProof>(&encoded).unwrap(), proof);
+        for count in [0, 1, 2, 5, 7] {
+            let wrong = serde_json::json!({"pi_a": [&curve[0], &curve[1]], "pi_b": [[&curve[0], &curve[1]], [&curve[0], &curve[1]]], "pi_c": [&curve[0], &curve[1]], "Commitments": "", "CommitmentPok": "0".repeat(128), "public_inputs": vec!["0".repeat(64); count]});
+            assert!(serde_json::from_value::<ClaimPublicationProof>(wrong).is_err(), "accepted {count} aggregate words");
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct SharedGroth16Wrapper {
     pub wrapped_circuit: WrappedCircuit<DefaultParameters, gnark_plonky2_wrapper::parameters::Groth16WrapperParameters, D>,
     pub keystore_path: String,
-    finalize_identity: Option<FinalizeIdentity>,
 }
 
 impl SharedGroth16Wrapper {
@@ -340,350 +614,19 @@ impl SharedGroth16Wrapper {
         let wrapper_builder = WrapperBuilder::<DefaultParameters, D>::new();
         let mut circuit = wrapper_builder.build();
         circuit.data = circuit_data;
-        let wrapped_circuit = WrappedCircuit::<
-            DefaultParameters,
-            gnark_plonky2_wrapper::parameters::Groth16WrapperParameters,
-            D,
-        >::build(circuit);
-        Self {
-            wrapped_circuit,
-            keystore_path,
-            finalize_identity: None,
-        }
+        let wrapped_circuit = WrappedCircuit::<DefaultParameters, gnark_plonky2_wrapper::parameters::Groth16WrapperParameters, D>::build(circuit);
+        Self { wrapped_circuit, keystore_path }
     }
 
-    pub fn setup_finalize(&self) -> anyhow::Result<()> {
-        let identity = self.finalize_identity.as_ref().ok_or_else(|| anyhow::anyhow!("not a finalize wrapper"))?;
-        gnark_plonky2_verifier_ffi::setup_finalize(&json(identity)?, &self.keystore_path)
-            .map_err(|error| anyhow::anyhow!("finalize setup: {error}"))
-    }
-
-    pub fn validate_finalize_setup(&self) -> anyhow::Result<()> {
-        let expected = self.finalize_identity.as_ref().ok_or_else(|| anyhow::anyhow!("not a finalize wrapper"))?;
-        let json = gnark_plonky2_verifier_ffi::read_finalize_setup_identity(&self.keystore_path)
-            .map_err(|error| anyhow::anyhow!("finalize identity: {error}"))?;
-        let actual: FinalizeIdentity = serde_json::from_str(&json)?;
-        anyhow::ensure!(&actual == expected, "finalize setup differs from source circuit/list identity");
-        Ok(())
-    }
-
-    pub fn prove_groth16(
-        &self,
-        inner_proof: &ProofWithPublicInputs<F, C, D>,
-        save_wrapped_data_path: Option<&str>,
-    ) -> anyhow::Result<UncompressedGroth16ProofData> {
+    pub fn prove_groth16(&self, inner_proof: &ProofWithPublicInputs<F, C, D>, save_wrapped_data_path: Option<&str>) -> anyhow::Result<UncompressedGroth16ProofData> {
         let wrapped_output = self.wrapped_circuit.prove(inner_proof)?;
-        if let Some(path) = save_wrapped_data_path {
-            wrapped_output.save(path)?;
-        }
-        if let Some(identity) = &self.finalize_identity {
-            let result = gnark_plonky2_verifier_ffi::generate_finalize_proof(&json(identity)?, &json(&wrapped_output.proof)?, &self.keystore_path)
-                .map_err(|error| anyhow::anyhow!("finalize proving: {error}"))?;
-            return Ok(serde_json::from_str(&result.proof_json)?);
-        }
-
-        let (proof_string, vk_string) = gnark_plonky2_verifier_ffi::generate_groth16_proof(
-            &json(&wrapped_output.common_data)?,
-            &json(&wrapped_output.proof)?,
-            &json(&wrapped_output.verifier_data)?,
-            &self.keystore_path,
-        );
-        if proof_string.starts_with("error:") {
-            anyhow::bail!("generate_groth16_proof failed: {}", proof_string);
-        }
-        if vk_string.starts_with("error:") {
-            anyhow::bail!("generate_groth16_proof failed: {}", vk_string);
-        }
-
-        let proof_data = serde_json::from_str::<UncompressedGroth16ProofData>(&proof_string)?;
-        Ok(proof_data)
-    }
-}
-
-fn bridge_wrap_public_inputs_keccak_bytes(public_inputs: &[F], chain_count: usize) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!((1..=8).contains(&chain_count) && public_inputs.len() == 26 + 9 * chain_count, "finalize public input width mismatch");
-    let mut bytes = Vec::with_capacity(144 + 72 * chain_count);
-    for (i, input) in public_inputs.iter().enumerate() {
-        let value = input.to_canonical_u64();
-        if (4..20).contains(&i) {
-            anyhow::ensure!(value <= u32::MAX as u64, "global root word exceeds u32");
-            let paired_index = if i % 2 == 0 { i + 1 } else { i - 1 };
-            let paired = u32::try_from(public_inputs[paired_index].to_canonical_u64())?;
-            bytes.extend_from_slice(&paired.to_be_bytes());
-        } else {
-            if i == 24 || i == 25 || (i >= 26 && (i - 26) % 9 == 4) {
-                anyhow::ensure!(value <= u32::MAX as u64, "finalize count exceeds u32");
-            }
-            bytes.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-    Ok(bytes)
-}
-
-#[derive(Debug)]
-pub struct BridgeWrapCircuit {
-    pub wrapper: SimpleWrapperDynamic<C, D>,
-    configured_chain_indices: Vec<u8>,
-}
-
-impl BridgeWrapCircuit {
-    pub fn new(finalizer: &super::bridge_agg_final::BridgeAggFinalCircuit<C, D>) -> anyhow::Result<Self> {
-        let configured_chain_indices = finalizer.configured_chain_indices();
-        let common_data = &finalizer.circuit_data.common;
-        anyhow::ensure!((1..=8).contains(&configured_chain_indices.len()) && configured_chain_indices.windows(2).all(|pair| pair[0] < pair[1]), "invalid finalize chain list");
-        anyhow::ensure!(common_data.num_public_inputs == 26 + 9 * configured_chain_indices.len(), "finalize circuit width differs from chain list");
-        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
-        let proof_target = builder.add_virtual_proof_with_pis(common_data);
-        let verifier_data_target = builder.add_virtual_verifier_data(finalizer.circuit_data.verifier_only.constants_sigmas_cap.height());
-        builder.verify_proof::<C>(&proof_target, &verifier_data_target, common_data);
-        let expected = builder.constant_hash(finalizer.fingerprint.0);
-        let actual = builder.get_circuit_fingerprint::<<C as plonky2::plonk::config::GenericConfig<D>>::Hasher>(&verifier_data_target);
-        builder.connect_hashes(expected, actual);
-        for (i, input) in proof_target.public_inputs.iter().enumerate() {
-            let narrow = (4..20).contains(&i);
-            let bits = builder.split_le(*input, if narrow { 32 } else { 64 });
-            if !narrow {
-                let low = builder.le_sum(bits[..32].iter());
-                let high = builder.le_sum(bits[32..].iter());
-                let max = builder.constant(F::from_canonical_u64(u32::MAX as u64));
-                let high_max = builder.is_equal(high, max);
-                let overflow = builder.mul(high_max.target, low);
-                builder.assert_zero(overflow);
-                if i == 24 || i == 25 || (i >= 26 && (i - 26) % 9 == 4) { builder.assert_zero(high); }
-            }
-            for bit in bits { builder.register_public_input(bit.target); }
-        }
-        let circuit_data = builder.build::<C>();
-        let fingerprint = QHashOut(get_circuit_fingerprint_generic::<D, F, C>(&circuit_data.verifier_only));
-        Ok(Self {
-            wrapper: SimpleWrapperDynamic { proof_target, verifier_data_target, circuit_data, fingerprint },
-            configured_chain_indices: configured_chain_indices.to_vec(),
-        })
-    }
-
-    pub fn into_shared_groth16_wrapper(self, keystore_path: String) -> SharedGroth16Wrapper {
-        let mut shared = SharedGroth16Wrapper::new(self.wrapper.circuit_data, keystore_path);
-        let final_data = &shared.wrapped_circuit.wrapper_circuit.data;
-        shared.finalize_identity = Some(FinalizeIdentity {
-            schema: 1,
-            chain_indices: self.configured_chain_indices,
-            final_common_json: json(&final_data.common).expect("final common data serialization"),
-            final_verifier_json: json(&final_data.verifier_only).expect("final verifier data serialization"),
-        });
-        shared
-    }
-
-    fn prove_wrapper(
-        &self,
-        verifier_data: &VerifierOnlyCircuitData<C, D>,
-        inner_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, String)> {
-        let flat_bytes = bridge_wrap_public_inputs_keccak_bytes(&inner_proof.public_inputs, self.configured_chain_indices.len())?;
-        tracing::info!(
-            "bridge_wrap pre-wrap PI count: {}",
-            self.wrapper.circuit_data.common.num_public_inputs
-        );
-        let wrapper_proof = self.wrapper.prove_base(inner_proof, verifier_data)?;
-        tracing::info!(
-            "bridge_wrap wrapper proof PI count: {}",
-            wrapper_proof.public_inputs.len()
-        );
-        let public_inputs_hash = QHashOut::from_4_felts_slice(&inner_proof.public_inputs[20..24]);
-        let mut keccak = tiny_keccak::Keccak::v256();
-        let mut hash = [0u8; 32];
-        tiny_keccak::Hasher::update(&mut keccak, &flat_bytes);
-        tiny_keccak::Hasher::finalize(keccak, &mut hash);
-        tracing::info!("prove_groth16 public inputs: keccak256: 0x{}", hex::encode(hash));
-        Ok((wrapper_proof, format!("/tmp/plonky2_proof/{}", public_inputs_hash)))
-    }
-
-    pub fn prove_groth16_with_shared_wrapper(
-        &self,
-        shared_wrapper: &SharedGroth16Wrapper,
-        verifier_data: &VerifierOnlyCircuitData<C, D>,
-        inner_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> anyhow::Result<UncompressedGroth16ProofData> {
-        anyhow::ensure!(shared_wrapper.finalize_identity.as_ref().map(|identity| identity.chain_indices.as_slice()) == Some(self.configured_chain_indices.as_slice()), "finalize wrapper chain list mismatch");
-        let (wrapper_proof, path) = self.prove_wrapper(verifier_data, inner_proof)?;
-        shared_wrapper.prove_groth16(&wrapper_proof, Some(&path))
-    }
-
-    pub fn prove_groth16(
-        self,
-        verifier_data: &VerifierOnlyCircuitData<C, D>,
-        inner_proof: &ProofWithPublicInputs<F, C, D>,
-        keystore_path: String,
-    ) -> anyhow::Result<UncompressedGroth16ProofData> {
-        let (wrapper_proof, path) = self.prove_wrapper(verifier_data, inner_proof)?;
-        let shared = self.into_shared_groth16_wrapper(keystore_path);
-        shared.prove_groth16(&wrapper_proof, Some(&path))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::bridge_wrap_public_inputs_keccak_bytes;
-    use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
-
-    #[test]
-    fn native_digest_inputs_decode_canonical_uint128_words() {
-        use super::decode_digest_bits_public_inputs;
-        let words = [
-            "000000000000000000000000000000008123456789abcdef0123456789abcdef".to_owned(),
-            "00000000000000000000000000000000ffffffffffffffffffffffffffffffff".to_owned(),
-        ];
-        let expected = [0x8123456789abcdef0123456789abcdefu128, u128::MAX];
-        assert_eq!(decode_digest_bits_public_inputs(&words).unwrap(), expected);
-        assert_eq!(decode_digest_bits_public_inputs(&["0".repeat(64), format!("{:064x}", 1u128)]).unwrap(), [0, 1]);
-        let swapped = [words[1].clone(), words[0].clone()];
-        assert_ne!(decode_digest_bits_public_inputs(&swapped).unwrap(), expected);
-        let mut changed = words.clone();
-        changed[0].replace_range(63..64, "0");
-        assert_ne!(decode_digest_bits_public_inputs(&changed).unwrap(), expected);
-        for invalid in [expected[0].to_string(), format!("0x{}", words[0]), words[0].to_uppercase(), "0".repeat(63), "0".repeat(65), format!("1{}", "0".repeat(63)), format!("{}g", "0".repeat(63))] {
-            assert!(decode_digest_bits_public_inputs(&[invalid, words[1].clone()]).is_err());
-        }
-    }
-
-    #[test]
-    fn inclusion_aggregate_words_reject_wrong_count_order_and_high_bits() {
-        use super::{decode_digest_words, InclusionAggregateProof};
-        let word = |value: u128| format!("{value:064x}");
-        let values = [1u128, 2, 3, 4, 5, u128::MAX];
-        let words = std::array::from_fn(|index| word(values[index]));
-        assert_eq!(decode_digest_words::<6>(&words).unwrap(), values);
-        let mut swapped = words.clone();
-        swapped.swap(0, 5);
-        assert_ne!(decode_digest_words::<6>(&swapped).unwrap(), values);
-        let mut high = words.clone();
-        high[2] = format!("01{}", "0".repeat(62));
-        assert!(decode_digest_words::<6>(&high).is_err());
-        let curve = ["0".repeat(64), "0".repeat(64)];
-        let proof = InclusionAggregateProof { pi_a: curve.clone(), pi_b: [curve.clone(), curve.clone()], pi_c: curve.clone(), public_inputs: words.clone() };
-        let encoded = serde_json::to_string(&proof).unwrap();
-        assert_eq!(serde_json::from_str::<InclusionAggregateProof>(&encoded).unwrap(), proof);
-        for count in [0, 1, 2, 5, 7] {
-            let wrong = serde_json::json!({"pi_a": [&curve[0], &curve[1]], "pi_b": [[&curve[0], &curve[1]], [&curve[0], &curve[1]]], "pi_c": [&curve[0], &curve[1]], "Commitments": "", "CommitmentPok": "0".repeat(128), "public_inputs": vec!["0".repeat(64); count]});
-            assert!(serde_json::from_value::<InclusionAggregateProof>(wrong).is_err(), "accepted {count} aggregate words");
-        }
-        let native = serde_json::json!({"pi_a": [&curve[0], &curve[1]], "pi_b": [[&curve[0], &curve[1]], [&curve[0], &curve[1]]], "pi_c": [&curve[0], &curve[1]], "Commitments": "", "CommitmentPok": "0".repeat(128), "public_inputs": words});
-        let decoded: InclusionAggregateProof = serde_json::from_value(native).unwrap();
-        assert_eq!(decoded, proof);
-        assert_eq!(decode_digest_words::<6>(&decoded.public_inputs).unwrap(), values);
-    }
-
-    #[test]
-    fn digest_adapter_pins_prefix_source_and_bit_order() {
-        use super::{C, D, DigestArtifact, DigestBitsAdapter, F};
-        use plonky2::{iop::witness::{PartialWitness, WitnessWrite}, plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig}};
-        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
-        let inputs = builder.add_virtual_target_arr::<12>();
-        builder.register_public_inputs(&inputs);
-        let source = builder.build::<C>();
-        let mut wrong_width = source.common.clone();
-        wrong_width.num_public_inputs = 26;
-        assert!(DigestBitsAdapter::build(DigestArtifact::DepositAggregate, &wrong_width, &source.verifier_only).is_err());
-        let words = [0x80000001u32, 0xffffffff, 0, 0x01234567, 0x89abcdef, 1, 0xaaaaaaaa, 0x55555555];
-        let make_proof = |prefix: [u64; 4], high_word: bool| {
-            let mut witness = PartialWitness::new();
-            for (index, target) in inputs.iter().enumerate() {
-                let value = match index {
-                    0..=3 => prefix[index],
-                    4 if high_word => 1u64 << 32,
-                    4..=11 => u64::from(words[index - 4]),
-                    _ => 0,
-                };
-                witness.set_target(*target, F::from_canonical_u64(value)).unwrap();
-            }
-            source.prove(witness).unwrap()
-        };
-        let expected: Vec<_> = words.iter().flat_map(|word| (0..32).rev().map(move |bit| F::from_canonical_u64(u64::from((word >> bit) & 1)))).collect();
-        for (artifact, prefix) in [
-            (DigestArtifact::DepositAggregate, [1u64, 11, 1, 0]),
-        ] {
-            let adapter = DigestBitsAdapter::build(artifact, &source.common, &source.verifier_only).unwrap();
-            let proof = adapter.prove(&make_proof(prefix, false)).unwrap();
-            assert_eq!(proof.public_inputs, expected);
-            adapter.circuit_data.verify(proof).unwrap();
-            for index in 0..4 {
-                let mut wrong_prefix = prefix;
-                wrong_prefix[index] += 1;
-                assert!(adapter.prove(&make_proof(wrong_prefix, false)).is_err());
-            }
-            if artifact != DigestArtifact::DepositAggregate {
-                assert!(adapter.prove(&make_proof([1, 11, prefix[2], 0], false)).is_err());
-            }
-            assert!(adapter.prove(&make_proof(prefix, true)).is_err());
-            let mut wrong_verifier = source.verifier_only.clone();
-            wrong_verifier.circuit_digest.elements[0] += F::ONE;
-            let wrong_adapter = DigestBitsAdapter::build(artifact, &source.common, &wrong_verifier).unwrap();
-            assert!(wrong_adapter.prove(&make_proof(prefix, false)).is_err());
-        }
-    }
-
-
-    #[test]
-    fn digest_setup_identity_binds_family_and_source() {
-        use super::DigestBitsIdentity;
-        let mut identity = DigestBitsIdentity {
-            schema: 1, mode: "DigestBits".into(), artifact: 1,
-            node_source: "1".repeat(40), native_source: "2".repeat(40),
-            plonky2_source: "3".repeat(40), wrapper_source: "4".repeat(40),
-            normalizer_fingerprint: [1, 2, 3, 4], normalizer_common: "01".into(),
-            normalizer_verifier: "02".into(), final_common_json: "{}".into(), final_verifier_json: "{}".into(),
-        };
-        let mut hashes = std::collections::HashSet::new();
-        for artifact in [1, 2, 3] {
-            identity.artifact = artifact;
-            assert!(hashes.insert(identity.identity_hash().unwrap()));
-        }
-        let original = identity.identity_hash().unwrap();
-        identity.normalizer_verifier = "03".into();
-        assert_ne!(identity.identity_hash().unwrap(), original);
-        for artifact in [0, 4] {
-            identity.artifact = artifact;
-            assert!(identity.identity_hash().is_err());
-        }
-    }
-
-    #[test]
-    fn bridge_wrap_keccak_bytes_pair_swap_tree_root_limbs() {
-        let public_inputs = (0u64..44)
-            .map(GoldilocksField::from_canonical_u64)
-            .collect::<Vec<_>>();
-        let bytes = bridge_wrap_public_inputs_keccak_bytes(&public_inputs, 2).unwrap();
-
-        assert_eq!(&bytes[0..8], &0u64.to_be_bytes());
-        assert_eq!(&bytes[8..16], &1u64.to_be_bytes());
-        assert_eq!(&bytes[16..24], &2u64.to_be_bytes());
-        assert_eq!(&bytes[24..32], &3u64.to_be_bytes());
-
-        // Tree-root limbs [4..20) are serialized as adjacent swapped u32 pairs.
-        assert_eq!(&bytes[32..36], &5u32.to_be_bytes());
-        assert_eq!(&bytes[36..40], &4u32.to_be_bytes());
-        assert_eq!(&bytes[40..44], &7u32.to_be_bytes());
-        assert_eq!(&bytes[44..48], &6u32.to_be_bytes());
-        assert_eq!(&bytes[80..84], &17u32.to_be_bytes());
-        assert_eq!(&bytes[84..88], &16u32.to_be_bytes());
-        assert_eq!(&bytes[88..92], &19u32.to_be_bytes());
-        assert_eq!(&bytes[92..96], &18u32.to_be_bytes());
-
-        // Checkpoint metadata [20..26) remains full u64 limbs (no pair-swap).
-        assert_eq!(&bytes[96..104], &20u64.to_be_bytes());
-        assert_eq!(&bytes[120..128], &23u64.to_be_bytes());
-        assert_eq!(&bytes[128..136], &24u64.to_be_bytes());
-        assert_eq!(&bytes[136..144], &25u64.to_be_bytes());
-        assert_eq!(bytes.len(), 144 + 72 * 2);
-        for (ordinal, value) in (26u64..44).enumerate() {
-            assert_eq!(&bytes[144 + ordinal * 8..152 + ordinal * 8], &value.to_be_bytes());
-        }
-        assert!(bridge_wrap_public_inputs_keccak_bytes(&public_inputs, 1).is_err());
-        assert!(bridge_wrap_public_inputs_keccak_bytes(&public_inputs[..26], 0).is_err());
-        for index in [4, 24, 25, 30, 39] {
-            let mut invalid = public_inputs.clone();
-            invalid[index] = GoldilocksField::from_canonical_u64(1u64 << 32);
-            assert!(bridge_wrap_public_inputs_keccak_bytes(&invalid, 2).is_err());
-        }
+        if let Some(path) = save_wrapped_data_path { wrapped_output.save(path)?; }
+        let (proof_string, vk_string) = gnark_plonky2_verifier_ffi::generate_groth16_proof(&json(&wrapped_output.common_data)?, &json(&wrapped_output.proof)?, &json(&wrapped_output.verifier_data)?, &self.keystore_path);
+        if proof_string.starts_with("error:") { anyhow::bail!("generate_groth16_proof failed: {}", proof_string); }
+        if vk_string.starts_with("error:") { anyhow::bail!("generate_groth16_proof failed: {}", vk_string); }
+        let decoded: UncompressedGroth16ProofData = serde_json::from_str(&proof_string)?;
+        anyhow::ensure!(decoded.public_inputs.len() == wrapped_output.common_data.num_public_inputs, "groth16 public input width mismatch");
+        Ok(decoded)
     }
 }
 
@@ -696,99 +639,28 @@ pub struct DepositBatchWrapCircuit {
 
 impl DepositBatchWrapCircuit {
     pub fn new(common_data: &CommonCircuitData<F, D>, fingerprint: QHashOut<F>, inner_verifier_data_cap_height: usize) -> Self {
-        let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config);
-
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let proof_target = builder.add_virtual_proof_with_pis(common_data);
         let verifier_data_target = builder.add_virtual_verifier_data(inner_verifier_data_cap_height);
         builder.verify_proof::<C>(&proof_target, &verifier_data_target, common_data);
-
         let expected_fingerprint = builder.constant_hash(fingerprint.into());
-        let actual_fingerprint =
-            builder.get_circuit_fingerprint::<<C as plonky2::plonk::config::GenericConfig<D>>::Hasher>(&verifier_data_target);
+        let actual_fingerprint = builder.get_circuit_fingerprint::<<C as plonky2::plonk::config::GenericConfig<D>>::Hasher>(&verifier_data_target);
         builder.connect_hashes(expected_fingerprint, actual_fingerprint);
-
-        // gnark worker groups every 64 consecutive LE bits into one u64 limb and
-        // serialises with BigEndian.PutUint64, which places the HIGH 32-bit word
-        // first.  To make the resulting keccak input match the natural word order
-        // (word[0]_BE, word[1]_BE, …) we register each pair in SWAPPED order:
-        // [word1_bits, word0_bits] so that gnark reconstructs limb = word1 + word0<<32
-        // and BE serialisation yields [word0_BE, word1_BE].
-        for pair in proof_target.public_inputs.chunks(2) {
-            if pair.len() == 2 {
-                let bits1 = builder.split_le(pair[1], 32);
-                for bit in &bits1 {
-                    builder.register_public_input(bit.target);
-                }
-                let bits0 = builder.split_le(pair[0], 32);
-                for bit in &bits0 {
-                    builder.register_public_input(bit.target);
-                }
-            } else {
-                // Odd trailing element: register normally, then pad to 64 bits.
-                let bits = builder.split_le(pair[0], 32);
-                for bit in &bits {
-                    builder.register_public_input(bit.target);
-                }
-                let zero = builder.zero();
-                let pad_bits = builder.split_le(zero, 32);
-                for bit in &pad_bits {
-                    builder.register_public_input(bit.target);
-                }
-            }
-        }
-
-        let circuit_data = builder.build::<C>();
-        Self {
-            proof_target,
-            verifier_data_target,
-            circuit_data,
-        }
+        builder.register_public_inputs(&proof_target.public_inputs);
+        Self { proof_target, verifier_data_target, circuit_data: builder.build::<C>() }
     }
 
-    pub fn into_shared_groth16_wrapper(self, keystore_path: String) -> SharedGroth16Wrapper {
-        SharedGroth16Wrapper::new(self.circuit_data, keystore_path)
-    }
+    pub fn into_shared_groth16_wrapper(self, keystore_path: String) -> SharedGroth16Wrapper { SharedGroth16Wrapper::new(self.circuit_data, keystore_path) }
 
-    pub fn prove_groth16_with_shared_wrapper(
-        &self,
-        shared_wrapper: &SharedGroth16Wrapper,
-        verifier_data: &VerifierOnlyCircuitData<C, D>,
-        inner_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> anyhow::Result<UncompressedGroth16ProofData> {
-        tracing::info!(
-            "deposit_batch pre-wrap PI count: {}, inner proof PI count: {}",
-            self.circuit_data.common.num_public_inputs,
-            inner_proof.public_inputs.len()
-        );
-        let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&self.proof_target, inner_proof)?;
-        pw.set_verifier_data_target(&self.verifier_data_target, verifier_data)?;
-        let wrapper_proof = self.circuit_data.prove(pw)?;
-        tracing::info!(
-            "deposit_batch wrapper proof PI count: {}",
-            wrapper_proof.public_inputs.len()
-        );
+    pub fn prove_groth16_with_shared_wrapper(&self, shared_wrapper: &SharedGroth16Wrapper, verifier_data: &VerifierOnlyCircuitData<C, D>, inner_proof: &ProofWithPublicInputs<F, C, D>) -> anyhow::Result<UncompressedGroth16ProofData> {
+        anyhow::ensure!(inner_proof.public_inputs.len() == self.proof_target.public_inputs.len(), "deposit public input width mismatch");
+        let mut witness = PartialWitness::new();
+        witness.set_proof_with_pis_target(&self.proof_target, inner_proof)?;
+        witness.set_verifier_data_target(&self.verifier_data_target, verifier_data)?;
+        let wrapper_proof = self.circuit_data.prove(witness)?;
+        anyhow::ensure!(wrapper_proof.public_inputs == inner_proof.public_inputs, "deposit public inputs changed");
         let public_inputs_hash = QHashOut::from_4_felts_slice(&inner_proof.public_inputs[0..4]);
-
-        let mut flat_bytes: Vec<u8> = inner_proof
-            .public_inputs
-            .iter()
-            .flat_map(|x| (x.to_noncanonical_u64() as u32).to_be_bytes().to_vec())
-            .collect();
-        if inner_proof.public_inputs.len() % 2 == 1 {
-            flat_bytes.extend_from_slice(&0u32.to_be_bytes());
-        }
-        let mut keccak = tiny_keccak::Keccak::v256();
-        let mut hash = [0u8; 32];
-        tiny_keccak::Hasher::update(&mut keccak, &flat_bytes);
-        tiny_keccak::Hasher::finalize(keccak, &mut hash);
-        tracing::info!("deposit_batch prove_groth16_with_shared_wrapper public inputs: keccak256: 0x{}", hex::encode(hash));
-
-        shared_wrapper.prove_groth16(
-            &wrapper_proof,
-            Some(&format!("/tmp/plonky2_proof/{}", public_inputs_hash)),
-        )
+        shared_wrapper.prove_groth16(&wrapper_proof, Some(&format!("/tmp/plonky2_proof/{public_inputs_hash}")))
     }
 }
 
@@ -801,84 +673,27 @@ pub struct WithdrawalClaimWrapCircuit {
 
 impl WithdrawalClaimWrapCircuit {
     pub fn new(common_data: &CommonCircuitData<F, D>, fingerprint: QHashOut<F>, inner_verifier_data_cap_height: usize) -> Self {
-        let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config);
-
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let proof_target = builder.add_virtual_proof_with_pis(common_data);
         let verifier_data_target = builder.add_virtual_verifier_data(inner_verifier_data_cap_height);
         builder.verify_proof::<C>(&proof_target, &verifier_data_target, common_data);
-
         let expected_fingerprint = builder.constant_hash(fingerprint.into());
-        let actual_fingerprint =
-            builder.get_circuit_fingerprint::<<C as plonky2::plonk::config::GenericConfig<D>>::Hasher>(&verifier_data_target);
+        let actual_fingerprint = builder.get_circuit_fingerprint::<<C as plonky2::plonk::config::GenericConfig<D>>::Hasher>(&verifier_data_target);
         builder.connect_hashes(expected_fingerprint, actual_fingerprint);
-
-        // Swap pair order so gnark's 64-bit BE limb grouping produces natural word order.
-        // See DepositBatchWrapCircuit::new for detailed explanation.
-        for pair in proof_target.public_inputs.chunks(2) {
-            if pair.len() == 2 {
-                let bits1 = builder.split_le(pair[1], 32);
-                for bit in &bits1 {
-                    builder.register_public_input(bit.target);
-                }
-                let bits0 = builder.split_le(pair[0], 32);
-                for bit in &bits0 {
-                    builder.register_public_input(bit.target);
-                }
-            } else {
-                let bits = builder.split_le(pair[0], 32);
-                for bit in &bits {
-                    builder.register_public_input(bit.target);
-                }
-                let zero = builder.zero();
-                let pad_bits = builder.split_le(zero, 32);
-                for bit in &pad_bits {
-                    builder.register_public_input(bit.target);
-                }
-            }
-        }
-
-        let circuit_data = builder.build::<C>();
-        Self {
-            proof_target,
-            verifier_data_target,
-            circuit_data,
-        }
+        builder.register_public_inputs(&proof_target.public_inputs);
+        Self { proof_target, verifier_data_target, circuit_data: builder.build::<C>() }
     }
 
-    pub fn into_shared_groth16_wrapper(self, keystore_path: String) -> SharedGroth16Wrapper {
-        SharedGroth16Wrapper::new(self.circuit_data, keystore_path)
-    }
+    pub fn into_shared_groth16_wrapper(self, keystore_path: String) -> SharedGroth16Wrapper { SharedGroth16Wrapper::new(self.circuit_data, keystore_path) }
 
-    pub fn prove_groth16_with_shared_wrapper(
-        &self,
-        shared_wrapper: &SharedGroth16Wrapper,
-        verifier_data: &VerifierOnlyCircuitData<C, D>,
-        inner_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> anyhow::Result<UncompressedGroth16ProofData> {
-        let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&self.proof_target, inner_proof)?;
-        pw.set_verifier_data_target(&self.verifier_data_target, verifier_data)?;
-        let wrapper_proof = self.circuit_data.prove(pw)?;
+    pub fn prove_groth16_with_shared_wrapper(&self, shared_wrapper: &SharedGroth16Wrapper, verifier_data: &VerifierOnlyCircuitData<C, D>, inner_proof: &ProofWithPublicInputs<F, C, D>) -> anyhow::Result<UncompressedGroth16ProofData> {
+        anyhow::ensure!(inner_proof.public_inputs.len() == self.proof_target.public_inputs.len(), "withdrawal public input width mismatch");
+        let mut witness = PartialWitness::new();
+        witness.set_proof_with_pis_target(&self.proof_target, inner_proof)?;
+        witness.set_verifier_data_target(&self.verifier_data_target, verifier_data)?;
+        let wrapper_proof = self.circuit_data.prove(witness)?;
+        anyhow::ensure!(wrapper_proof.public_inputs == inner_proof.public_inputs, "withdrawal public inputs changed");
         let public_inputs_hash = QHashOut::from_4_felts_slice(&inner_proof.public_inputs[0..4]);
-
-        let flat_bytes: Vec<u8> = inner_proof
-            .public_inputs
-            .iter()
-            .flat_map(|x| (x.to_noncanonical_u64() as u32).to_be_bytes().to_vec())
-            .collect();
-        let mut keccak = tiny_keccak::Keccak::v256();
-        let mut hash = [0u8; 32];
-        tiny_keccak::Hasher::update(&mut keccak, &flat_bytes);
-        tiny_keccak::Hasher::finalize(keccak, &mut hash);
-        tracing::info!(
-            "withdrawal_claim prove_groth16_with_shared_wrapper inner public inputs keccak (Bridge calldata order, pre-gnark packing): 0x{}",
-            hex::encode(hash)
-        );
-
-        shared_wrapper.prove_groth16(
-            &wrapper_proof,
-            Some(&format!("/tmp/plonky2_proof/{}", public_inputs_hash)),
-        )
+        shared_wrapper.prove_groth16(&wrapper_proof, Some(&format!("/tmp/plonky2_proof/{public_inputs_hash}")))
     }
 }

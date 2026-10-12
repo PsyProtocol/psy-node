@@ -74,7 +74,7 @@ JSON-RPC edge API for a Realm node. All methods use namespace `psy`.
 |---|---|
 | `psy_get_imt_leaf_preimage` | `checkpoint_id`: `u64`, `user_id`: `u64`, `contract_id`: `u32`, `leaf_index`: `u64` |
 | `psy_get_imt_leaf_index_for_key` | `checkpoint_id`: `u64`, `user_id`: `u64`, `contract_id`: `u32`, `key`: `Hash` |
-| `psy_find_imt_predecessor` | `checkpoint_id`: `u64`, `user_id`: `u64`, `contract_id`: `u64`, `key`: `Hash` |
+| `psy_find_imt_predecessor` | `checkpoint_id`: `u64`, `user_id`: `u64`, `contract_id`: `u64`, `key`: `Hash`. Success is the existing `{leaf_index, leaf}` or JSON `null` when no predecessor exists; leaf fields stay required. Database and transport failures stay RPC errors |
 | `psy_get_imt_next_append_index` | `user_id`: `u64`, `contract_id`: `u64` |
 | `psy_get_imt_membership_proof` | `checkpoint_id`: `u64`, `user_id`: `u64`, `contract_id`: `u32`, `key`: `Hash`, `state_slot_base`: `u64`, `capacity`: `u64`; membership and nonzero successor indices must be in `state_slot_base + 1 ..= state_slot_base + capacity` |
 | `psy_get_imt_non_membership_proof` | `checkpoint_id`: `u64`, `user_id`: `u64`, `contract_id`: `u32`, `key`: `Hash` |

@@ -445,8 +445,8 @@ mod tests {
             _user_id: u64,
             _contract_id: u64,
             _key: &PGoldilocksHash,
-        ) -> anyhow::Result<(u64, IMTContractStateLeaf<PGoldilocksFelt, PGoldilocksHash>)> {
-            Ok((0, IMTContractStateLeaf::default()))
+        ) -> anyhow::Result<Option<(u64, IMTContractStateLeaf<PGoldilocksFelt, PGoldilocksHash>)>> {
+            Ok(None)
         }
 
         async fn contract_state_imt_get_next_append_index(&self, user_id: u64, contract_id: u64) -> anyhow::Result<u64> {

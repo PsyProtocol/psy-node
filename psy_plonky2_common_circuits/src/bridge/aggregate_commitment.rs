@@ -1,10 +1,13 @@
 use plonky2::{
     field::extension::Extendable,
-    hash::hash_types::RichField,
-    iop::target::{BoolTarget, Target},
+    hash::{hash_types::RichField, poseidon::PoseidonHash},
+    iop::target::Target,
     plonk::circuit_builder::CircuitBuilder,
 };
 use tiny_keccak::{Hasher, Keccak};
+use psy_client_data::bridge_aggregate::{
+    DEPOSIT_ACCUMULATOR_SEED_DOMAIN, DEPOSIT_ACCUMULATOR_FOLD_DOMAIN,
+};
 
 use psy_plonky2_basic_helpers::{
     builder::comparison::CircuitBuilderComparison,
@@ -129,6 +132,47 @@ pub struct DepositLeafTarget {
     pub l2_token_contract_id: Bytes32Target,
     pub amount: Bytes32Target,
     pub note_commitment: Bytes32Target,
+}
+
+impl DepositLeafTarget {
+    pub fn poseidon_hash<F: RichField + Extendable<D>, const D: usize>(
+        &self, builder: &mut CircuitBuilder<F, D>,
+    ) -> Hash4Target {
+        let mut fields = Vec::with_capacity(41);
+        fields.extend(self.shield_address);
+        fields.extend(word_address(builder, self.token));
+        fields.extend(self.l2_token_contract_id);
+        fields.extend(self.amount);
+        fields.push(self.chain_index);
+        fields.extend(self.note_commitment);
+        builder.hash_n_to_hash_no_pad::<PoseidonHash>(fields).elements
+    }
+}
+
+pub fn deposit_accumulator_seed<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>, config_hash: Bytes32Target,
+    end_checkpoint_id: U64Target, end_checkpoint_root: Hash4Target,
+    global_deposit_count: Target,
+) -> Hash4Target {
+    let mut fields = Vec::with_capacity(16);
+    fields.push(builder.constant(F::from_canonical_u64(DEPOSIT_ACCUMULATOR_SEED_DOMAIN)));
+    fields.extend(config_hash);
+    fields.extend(end_checkpoint_id);
+    fields.extend(end_checkpoint_root);
+    fields.push(global_deposit_count);
+    builder.hash_n_to_hash_no_pad::<PoseidonHash>(fields).elements
+}
+
+pub fn deposit_accumulator_fold<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>, accumulator: Hash4Target, ordinal: Target,
+    chain_index: Target, absolute_index: Target, leaf_hash: Hash4Target,
+) -> Hash4Target {
+    let mut fields = Vec::with_capacity(12);
+    fields.push(builder.constant(F::from_canonical_u64(DEPOSIT_ACCUMULATOR_FOLD_DOMAIN)));
+    fields.extend(accumulator);
+    fields.extend([ordinal, chain_index, absolute_index]);
+    fields.extend(leaf_hash);
+    builder.hash_n_to_hash_no_pad::<PoseidonHash>(fields).elements
 }
 
 #[derive(Clone, Copy)]
@@ -463,124 +507,6 @@ pub fn aggregate_commit<F: RichField + Extendable<D>, const D: usize>(
     prefix_commitment(builder, Domain::Aggregate, &body, &leaves, leaf_count, 1)
 }
 
-fn deposit_leaf_header<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>, count: Target, ordinal: Target,
-) -> Vec<Target> {
-    builder.range_check(count, 11);
-    let maximum = builder.constant(F::from_canonical_u32(1024));
-    builder.ensure_is_less_than_or_equal(11, count, maximum);
-    let marker = builder.constant(F::from_canonical_u8(12));
-    let mut body = word(builder, marker, 8).to_vec();
-    body.extend(word(builder, count, 11));
-    body.extend(word(builder, ordinal, 10));
-    body
-}
-
-pub fn deposit_leaf_node_leaf<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>, count: Target, ordinal: Target,
-    leaf_commit: Bytes32Target,
-) -> Bytes32Target {
-    let mut body = deposit_leaf_header(builder, count, ordinal);
-    body.extend(leaf_commit);
-    commitment(builder, Domain::Leaf, &body)
-}
-
-pub fn deposit_leaf_empty<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>, count: Target, ordinal: Target,
-) -> Bytes32Target {
-    let body = deposit_leaf_header(builder, count, ordinal);
-    commitment(builder, Domain::Empty, &body)
-}
-
-pub fn deposit_leaf_node<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>, level: u8,
-    left: Bytes32Target, right: Bytes32Target,
-) -> Bytes32Target {
-    assert!((1..=10).contains(&level));
-    let marker = builder.constant(F::from_canonical_u8(12));
-    let level = builder.constant(F::from_canonical_u8(level));
-    let mut body = word(builder, marker, 8).to_vec();
-    body.extend(word(builder, level, 8));
-    body.extend(left);
-    body.extend(right);
-    commitment(builder, Domain::Node, &body)
-}
-
-pub fn deposit_leaf_root<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>, leaf_commits: &[Bytes32Target; 1024], count: Target,
-) -> Bytes32Target {
-    let mut nodes = Vec::with_capacity(1024);
-    for (j, leaf_commit) in leaf_commits.iter().enumerate() {
-        let ordinal = builder.constant(F::from_canonical_usize(j));
-        let real = builder.is_less_than(11, ordinal, count);
-        let inactive = builder.not(real);
-        for &word in leaf_commit {
-            builder.range_check(word, 32);
-            let padding = builder.mul(inactive.target, word);
-            builder.assert_zero(padding);
-        }
-        let leaf = deposit_leaf_node_leaf(builder, count, ordinal, *leaf_commit);
-        let empty = deposit_leaf_empty(builder, count, ordinal);
-        nodes.push(std::array::from_fn(|i| builder.select(real, leaf[i], empty[i])));
-    }
-    for level in 1..=10 {
-        nodes = nodes.chunks_exact(2)
-            .map(|pair| deposit_leaf_node(builder, level, pair[0], pair[1])).collect();
-    }
-    nodes[0]
-}
-
-pub fn verify_deposit_leaf_path<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>, active: BoolTarget, root: Bytes32Target,
-    count: Target, ordinal: Target, leaf_commit: Bytes32Target,
-    siblings: [Bytes32Target; 10],
-) {
-    builder.assert_bool(active);
-    let zero = builder.zero();
-    let selected_ordinal = builder.select(active, ordinal, zero);
-    let bits = builder.split_le(selected_ordinal, 10);
-    let in_range = builder.is_less_than(11, selected_ordinal, count);
-    let outside = builder.not(in_range);
-    let invalid = builder.mul(active.target, outside.target);
-    builder.assert_zero(invalid);
-    let inactive = builder.not(active);
-    for word in leaf_commit.into_iter().chain(siblings.into_iter().flatten()) {
-        builder.range_check(word, 32);
-        let padding = builder.mul(inactive.target, word);
-        builder.assert_zero(padding);
-    }
-    let mut node = deposit_leaf_node_leaf(builder, count, selected_ordinal, leaf_commit);
-    for (level, sibling) in siblings.into_iter().enumerate() {
-        let left = std::array::from_fn(|i| builder.select(bits[level], sibling[i], node[i]));
-        let right = std::array::from_fn(|i| builder.select(bits[level], node[i], sibling[i]));
-        node = deposit_leaf_node(builder, level as u8 + 1, left, right);
-    }
-    for i in 0..8 {
-        builder.range_check(root[i], 32);
-        let difference = builder.sub(node[i], root[i]);
-        let invalid = builder.mul(active.target, difference);
-        builder.assert_zero(invalid);
-    }
-}
-
-/// Rows are canonical encoded A rows; inactive capacity rows must be all zero.
-pub fn chain_rows_hash<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>, variant: u8, first: Target,
-    rows: &[Vec<Target>], count: Target,
-) -> Bytes32Target {
-    assert!(variant == 1 || variant == 2);
-    assert!(rows.len() <= 256);
-    let row_words = if variant == 1 { 152 } else { 232 };
-    assert!(rows.iter().all(|row| row.len() == row_words));
-    let family = builder.constant(F::from_canonical_u8(9));
-    let variant = builder.constant(F::from_canonical_u8(variant));
-    let mut header = word(builder, family, 16).to_vec();
-    header.extend(word(builder, variant, 8));
-    header.extend(word(builder, first, 32));
-    header.extend(word(builder, count, 32));
-    prefix_commitment(builder, Domain::LeafCommit, &header, rows, count, 0)
-}
-
 pub fn aggregate_leaf<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>, family: u32, ordinal: Target, aggregate: Bytes32Target,
 ) -> Bytes32Target {
@@ -625,6 +551,53 @@ mod tests {
 
     type F = GoldilocksField;
     type C = PoseidonGoldilocksConfig;
+
+    #[test]
+    fn deposit_poseidon_helpers_match_native_encodings() {
+        use psy_client_data::bridge_aggregate as native;
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        let config = std::array::from_fn(|i| i as u8);
+        let checkpoint_id = 0x123456789abcdef0u64;
+        let checkpoint_root = [0, 1, 1u64 << 32, native::GOLDILOCKS_MODULUS - 1];
+        let config_target = constant_bytes32(&mut builder, config);
+        let id_target = [checkpoint_id as u32, (checkpoint_id >> 32) as u32]
+            .map(|value| builder.constant(F::from_canonical_u32(value)));
+        let root_target = checkpoint_root.map(|value| builder.constant(F::from_canonical_u64(value)));
+        let count = builder.constant(F::from_canonical_u32(1024));
+        let seed = deposit_accumulator_seed(&mut builder, config_target, id_target, root_target, count);
+        let native_seed = native::deposit_accumulator_seed(config, checkpoint_id, checkpoint_root, 1024).unwrap();
+        let leaf = native::DepositLeaf {
+            chain_index: 255, absolute_index: u32::MAX - 1, shield_address: [0x81; 32],
+            token: [0x42; 20], l2_token_contract_id: [0x23; 32], amount: [0xff; 32],
+            note_commitment: [0x54; 32],
+        };
+        let leaf_target = DepositLeafTarget {
+            chain_index: builder.constant(F::from_canonical_u8(leaf.chain_index)),
+            absolute_index: builder.constant(F::from_canonical_u32(leaf.absolute_index)),
+            shield_address: constant_bytes32(&mut builder, leaf.shield_address),
+            token: std::array::from_fn(|i| builder.constant(F::from_canonical_u32(
+                u32::from_be_bytes(leaf.token[i * 4..i * 4 + 4].try_into().unwrap())))),
+            l2_token_contract_id: constant_bytes32(&mut builder, leaf.l2_token_contract_id),
+            amount: constant_bytes32(&mut builder, leaf.amount),
+            note_commitment: constant_bytes32(&mut builder, leaf.note_commitment),
+        };
+        AggregateLeafTarget::Deposit(leaf_target).encode(&mut builder);
+        let leaf_hash = leaf_target.poseidon_hash(&mut builder);
+        let ordinal = builder.constant(F::from_canonical_u32(1023));
+        let folded = deposit_accumulator_fold(&mut builder, seed, ordinal,
+            leaf_target.chain_index, leaf_target.absolute_index, leaf_hash);
+        for output in [seed, leaf_hash, folded] {
+            builder.register_public_inputs(&output);
+        }
+        let data = builder.build::<C>();
+        let proof = data.prove(PartialWitness::new()).unwrap();
+        let expected = [native_seed, leaf.poseidon_hash().unwrap(),
+            native::deposit_accumulator_fold(native_seed, 1023, leaf.chain_index,
+                leaf.absolute_index, leaf.poseidon_hash().unwrap()).unwrap()];
+        assert_eq!(proof.public_inputs, expected.into_iter().flatten()
+            .map(F::from_canonical_u64).collect::<Vec<_>>());
+        data.verify(proof).unwrap();
+    }
 
     fn native_hash(bytes: &[u8]) -> [u8; 32] {
         let mut hash = Keccak::v256();
@@ -967,104 +940,5 @@ mod tests {
             assert_eq!(words[7].to_canonical_u64(), value & 0xffff_ffff);
         }
         data.verify(proof).unwrap();
-    }
-
-    #[test]
-    fn chain_row_hash_matches_host_empty_and_real_prefix() {
-        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
-        let first = builder.add_virtual_target();
-        let count = builder.add_virtual_target();
-        let row = builder.add_virtual_targets(152);
-        let digest = chain_rows_hash(&mut builder, 1, first, &[row.clone()], count);
-        builder.register_public_inputs(&digest);
-        let data = builder.build::<C>();
-        for active in [0usize, 1] {
-            let mut witness = PartialWitness::new();
-            witness.set_target(first, F::from_canonical_u32(7)).unwrap();
-            witness.set_target(count, F::from_canonical_usize(active)).unwrap();
-            let mut body = native_hash(b"PsyBridge/TwoArtifact/1/Record").to_vec();
-            for value in [9u32, 1, 7, active as u32] {
-                body.extend([0u8; 28]);
-                body.extend(value.to_be_bytes());
-            }
-            for (i, &target) in row.iter().enumerate() {
-                let value = if active == 1 { i as u32 + 1 } else { 0 };
-                witness.set_target(target, F::from_canonical_u32(value)).unwrap();
-                if active == 1 { body.extend(value.to_be_bytes()); }
-            }
-            let proof = data.prove(witness).unwrap();
-            assert_eq!(digest_bytes(&proof.public_inputs), native_hash(&body));
-            data.verify(proof).unwrap();
-        }
-    }
-
-    #[test]
-    fn deposit_leaf_root_matches_host_at_count_boundaries() {
-        use psy_client_data::bridge_aggregate::deposit_leaf_tree;
-        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
-        let commits: [Bytes32Target; 1024] = std::array::from_fn(|_| {
-            builder.add_virtual_targets(8).try_into().unwrap()
-        });
-        let count = builder.add_virtual_target();
-        let root = deposit_leaf_root(&mut builder, &commits, count);
-        builder.register_public_inputs(&root);
-        let data = builder.build::<C>();
-        for size in [0usize, 1, 1023, 1024] {
-            let records: Vec<_> = (0..size).map(|i| native_hash(&(i as u32).to_be_bytes())).collect();
-            let tree = deposit_leaf_tree(&records).unwrap();
-            let mut witness = PartialWitness::new();
-            witness.set_target(count, F::from_canonical_usize(size)).unwrap();
-            for (i, targets) in commits.iter().enumerate() {
-                let bytes = records.get(i).copied().unwrap_or([0; 32]);
-                for (target, bytes) in targets.iter().zip(bytes.chunks_exact(4)) {
-                    witness.set_target(*target, F::from_canonical_u32(u32::from_be_bytes(bytes.try_into().unwrap()))).unwrap();
-                }
-            }
-            let proof = data.prove(witness).unwrap();
-            assert_eq!(digest_bytes(&proof.public_inputs), tree[0]);
-            data.verify(proof).unwrap();
-        }
-    }
-
-    #[test]
-    fn deposit_path_rejects_wrong_position_count_and_sibling() {
-        use psy_client_data::bridge_aggregate::{deposit_leaf_path, deposit_leaf_tree};
-        let records = [native_hash(b"first deposit"), native_hash(b"second deposit")];
-        let tree = deposit_leaf_tree(&records).unwrap();
-        let path = deposit_leaf_path(&tree, 2, 1).unwrap();
-        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
-        let active = builder.add_virtual_bool_target_safe();
-        let root = constant_bytes32(&mut builder, tree[0]);
-        let count = builder.add_virtual_target();
-        let ordinal = builder.add_virtual_target();
-        let record: Bytes32Target = builder.add_virtual_targets(8).try_into().unwrap();
-        let siblings: [Bytes32Target; 10] = std::array::from_fn(|_| builder.add_virtual_targets(8).try_into().unwrap());
-        verify_deposit_leaf_path(&mut builder, active, root, count, ordinal, record, siblings);
-        let data = builder.build::<C>();
-        // Inactive ordinal1024 must be selected away, not rejected by10-bit decomposition.
-        for case in 0..7 {
-            let enabled = case != 4 && case != 5;
-            let index = match case { 1 => 0, 4 | 5 => 1024, 6 => 2, _ => 1 };
-            let mut witness = PartialWitness::new();
-            witness.set_bool_target(active, enabled).unwrap();
-            witness.set_target(count, F::from_canonical_u32(if case == 2 { 3 } else { 2 })).unwrap();
-            witness.set_target(ordinal, F::from_canonical_u32(index)).unwrap();
-            let mut record_bytes = if enabled { records[1] } else { [0; 32] };
-            if case == 5 { record_bytes[0] = 1; }
-            for (target, bytes) in record.iter().zip(record_bytes.chunks_exact(4)) {
-                witness.set_target(*target, F::from_canonical_u32(u32::from_be_bytes(bytes.try_into().unwrap()))).unwrap();
-            }
-            for (level, targets) in siblings.iter().enumerate() {
-                let mut bytes = if enabled { path[level] } else { [0; 32] };
-                if case == 3 && level == 0 { bytes[0] ^= 1; }
-                for (target, bytes) in targets.iter().zip(bytes.chunks_exact(4)) {
-                    witness.set_target(*target, F::from_canonical_u32(u32::from_be_bytes(bytes.try_into().unwrap()))).unwrap();
-                }
-            }
-            let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match data.prove(witness) { Ok(proof) => data.verify(proof).is_ok(), Err(_) => false }
-            })).unwrap_or(false);
-            assert_eq!(valid, case == 0 || case == 4);
-        }
     }
 }

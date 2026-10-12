@@ -1,16 +1,20 @@
 use anyhow::{Context as _, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use plonky2::{field::{goldilocks_field::GoldilocksField as F, types::PrimeField64}, plonk::config::PoseidonGoldilocksConfig};
-use psy_client_common::data::qhashout::QHashOut;
-use psy_client_data::{api::reward::PsyProoffMinerRewardProofWithRewardPreimage, bridge_aggregate::{domain_hash, Domain, NetworkConfig, WithdrawalLeaf, RewardLeaf, GOLDILOCKS_MODULUS}, config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
-use psy_crypto::hash::{merkle::core::MerkleProofCore, traits::qhashable::QFieldHashable};
-use psy_plonky2_common_circuits::bridge::withdrawal_inclusion::{WithdrawalInclusionCircuit, WithdrawalInclusionInputs, WithdrawalWitness};
-use psy_plonky2_circuits::bridge::circuits::{reward_inclusion::RewardTagWitness, reward_session::{RewardSessionCircuit, RewardSessionWitness, REWARD_SESSION_STEP_CAPACITY}};
-use psy_provider::provider::RpcProvider;
+use plonky2::{field::{goldilocks_field::GoldilocksField as F, types::PrimeField64}, hash::{hash_types::HashOut, poseidon::PoseidonHash}, plonk::config::{AlgebraicHasher, PoseidonGoldilocksConfig}};
+use plonky2::field::types::Field;
+use plonky2::hash::hash_types::RichField;
+use plonky2::plonk::config::Hasher;
+use psy_crypto::hash::traits::qhashable::QFieldHashable;
+use psy_crypto::hash::merkle::core::MerkleProofCore;
+use psy_client_common::{data::qhashout::QHashOut, traits::to_qfelts::ToQFelts};
+use psy_client_data::{api::reward::PsyProoffMinerRewardProofWithRewardPreimage, bridge_aggregate::{NetworkConfig, RewardClaim, RewardLeaf, WithdrawalBurnRecord, GOLDILOCKS_MODULUS}, config::store_config::PsyHasher, qdata::{checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf}, imt_contract_state::IMTContractStateLeaf, user::PsyUserLeaf, user_contract_state::UserContractState}, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
+use psy_config::network_constants::{CHECKPOINT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT};
+use psy_plonky2_circuits::bridge::{circuits::{bridge_claim::{BridgeTokenPolicy, BridgeWithdrawalClaimCircuit, BridgeWithdrawalClaimInput, BridgeWithdrawalClaimWitness}, reward_chain::{AuthenticatedJobWitness, RewardTagWitness, RewardMergeCircuit, RewardMergeWitness, RewardRootCircuit, RewardRootWitness, RewardSegmentCircuit, RewardSegmentSourceWitness, RewardSegmentWitness, REWARD_LEAF_CAPACITY, REWARD_MERGE_STATEMENT_LEN, REWARD_ROOT_STATEMENT_LEN, REWARD_SEGMENT_STATEMENT_LEN}}, gadgets::reward_nullifier::{RewardNullifierSourceWitness, INNER_EMPTY_ROOT, REWARD_NULLIFIER_EMPTY_LEAF, REWARD_NULLIFIER_EMPTY_ROOT, REWARD_NULLIFIER_INNER_HEIGHT, REWARD_NULLIFIER_OCCUPIED_LEAF, REWARD_NULLIFIER_OUTER_HEIGHT}};
+use psy_provider::{lps::WithdrawalBurnProof, provider::RpcProvider};
 use psy_ups_circuit::signature::reward_authorization::RewardAuthorizationContext;
 use psy_vm::{reward_authorization::RewardAuthorizationWitness, ups::multisig::{MultisigAccount, MultisigSignatures, StoredMultisigPolicy}};
 use serde::{Deserialize, Serialize};
-
+use std::collections::BTreeMap;
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimError {
     #[error("aggregation context changed; fresh witness and authorization required")]
@@ -76,49 +80,14 @@ pub fn reward_record(checkpoint: u64, user_id: u32, recipient: [u8; 20], proof: 
     let height = u8::try_from(tag.siblings.len())?;
     anyhow::ensure!((2..=21).contains(&height), "reward proof must reach full GUTA root");
     let path_index = u32::try_from(tag.index)?;
-    let record = RewardLeaf { claim_checkpoint_id: checkpoint, user_id, height, path_index, nullifier_index: ((1u32 << height) - 1).checked_add(path_index).context("reward nullifier overflow")?, recipient };
-    record.validate()?;
+    let claim = RewardLeaf { claim_checkpoint_id: checkpoint, user_id, height, path_index, nullifier_index: ((1u32 << height) - 1).checked_add(path_index).context("reward nullifier overflow")?, recipient };
+    claim.validate()?;
     let mut siblings = [parth_core::pgoldilocks::QHashOut(QHashOut::<F>::ZERO.0); 21];
     let mut parent_tags = siblings;
     for (i, node) in tag.siblings.iter().enumerate() { siblings[i] = parth_core::pgoldilocks::QHashOut(node.sibling.0); parent_tags[i] = parth_core::pgoldilocks::QHashOut(node.parent_tag.0); }
-    Ok((record, RewardTagWitness { tag_preimage: parth_core::pgoldilocks::QHashOut(proof.reward_tree_tag_preimage.0), leaf_left: parth_core::pgoldilocks::QHashOut(tag.leaf.left.0), leaf_right: parth_core::pgoldilocks::QHashOut(tag.leaf.right.0), leaf_tag: parth_core::pgoldilocks::QHashOut(tag.leaf.tag.0), siblings, parent_tags }))
+    Ok((claim, RewardTagWitness { tag_preimage: parth_core::pgoldilocks::QHashOut(proof.reward_tree_tag_preimage.0), leaf_left: parth_core::pgoldilocks::QHashOut(tag.leaf.left.0), leaf_right: parth_core::pgoldilocks::QHashOut(tag.leaf.right.0), leaf_tag: parth_core::pgoldilocks::QHashOut(tag.leaf.tag.0), siblings, parent_tags }))
 }
 
-pub async fn reward_membership(client: &ClaimClient, context: &AggregationContext, reward: &RewardLeaf) -> Result<RewardAuthorizationContext> {
-    let (end, root) = client.validate_context(context)?;
-    anyhow::ensure!(reward.claim_checkpoint_id <= end && reward.claim_checkpoint_id >= client.config.reward_cutover && reward.claim_checkpoint_id < client.config.reward_end_exclusive, "reward checkpoint outside configured claim interval or selected end");
-    let (end_leaf, roots) = client.checkpoint(context).await?;
-    let claim_leaf = client.provider.get_checkpoint_leaf_data(reward.claim_checkpoint_id).await?;
-    let claim_path = client.provider.get_checkpoint_tree_merkle_proof(end, reward.claim_checkpoint_id).await?;
-    let end_path = client.provider.get_checkpoint_tree_merkle_proof(end, end).await?;
-    let root_hash = QHashOut::from_values(root[0], root[1], root[2], root[3]);
-    verify_path(&claim_path, root_hash, reward.claim_checkpoint_id, claim_leaf.qfhash::<PsyHasher>(), psy_config::network_constants::CHECKPOINT_TREE_HEIGHT as usize)?;
-    verify_path(&end_path, root_hash, end, end_leaf.qfhash::<PsyHasher>(), psy_config::network_constants::CHECKPOINT_TREE_HEIGHT as usize)?;
-    let user = client.provider.get_user_leaf_data(end, reward.user_id as u64).await?;
-    let user_path = client.provider.get_user_tree_merkle_proof(end, reward.user_id as u64).await?;
-    verify_path(&user_path, roots.user_tree_root, reward.user_id as u64, user.qfhash::<PsyHasher>(), psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize)?;
-    Ok(RewardAuthorizationContext { config_hash: client.config.config_hash()?, end_checkpoint_id: end, end_checkpoint_root: root, reward: reward.clone(), claim_checkpoint_leaf: claim_leaf, end_checkpoint_leaf: end_leaf, end_global_state_roots: roots, authorization_user_leaf: user, claim_checkpoint_path: claim_path.siblings, end_checkpoint_path: end_path.siblings, authorization_user_path: user_path.siblings })
-}
-
-pub async fn multisig_authorization(client: &ClaimClient, context: &AggregationContext, reward: &RewardLeaf, membership: &RewardAuthorizationContext, account: &MultisigAccount, signatures: &MultisigSignatures) -> Result<RewardAuthorizationWitness> {
-    account.public_key_param()?;
-    anyhow::ensure!(signatures.signatures.len() == 2 && signatures.member_indices.len() == 2 && signatures.member_indices[0] < signatures.member_indices[1] && signatures.member_indices[1] < 3, "multisig requires two ordered current-member signatures");
-    let message = membership.message()?;
-    anyhow::ensure!(signatures.signatures.iter().all(|signature| signature.message.0 == message), "multisig signatures must cover exact reward authorization message");
-    let (end, _) = client.validate_context(context)?;
-    let contract = client.provider.get_user_contract_tree_merkle_proof(end, reward.user_id as u64, account.contract_id).await?;
-    verify_path(&contract, membership.authorization_user_leaf.user_state_tree_root, account.contract_id as u64, contract.value, psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize)?;
-    let mut policy_slots = [QHashOut::ZERO; 4];
-    let mut policy_slot_paths = [[QHashOut::ZERO; 4]; 4];
-    for slot in 0..4 {
-        let path = client.provider.get_user_contract_state_tree_merkle_proof(end, reward.user_id as u64, account.contract_id, 4, slot as u64).await?;
-        verify_path(&path, contract.value, slot as u64, path.value, 4)?;
-        policy_slots[slot] = path.value;
-        policy_slot_paths[slot] = path.siblings.try_into().map_err(|_| anyhow::anyhow!("multisig policy path height"))?;
-    }
-    StoredMultisigPolicy { header: policy_slots[0], members: [policy_slots[1], policy_slots[2], policy_slots[3]] }.policy()?;
-    Ok(RewardAuthorizationWitness::Multisig { contract_id: account.contract_id, initial_policy: account.initial_policy.clone(), policy_slots, contract_state_paths: std::array::from_fn(|_| contract.siblings.clone()), policy_slot_paths, member_indices: [signatures.member_indices[0], signatures.member_indices[1]], compressed_public_keys: [signatures.signatures[0].public_key, signatures.signatures[1].public_key], signatures_rs: [signatures.signatures[0].signature, signatures.signatures[1].signature] })
-}
 
 pub struct ClaimClient {
     pub config: NetworkConfig,
@@ -135,11 +104,12 @@ impl ClaimClient {
 impl ClaimClient {
     pub fn validate_context(&self, context: &AggregationContext) -> Result<(u64, [u64; 4])> {
         let id = decimal(&context.end_checkpoint_id)?;
+        let end = u32::try_from(id).context("selected end exceeds u32")?;
         let mut root = [0; 4];
         for (out, text) in root.iter_mut().zip(&context.end_checkpoint_root) { *out = decimal(text)?; anyhow::ensure!(*out < GOLDILOCKS_MODULUS, "noncanonical context root"); }
         let config = self.config.config_hash()?;
-        let root_bytes: Vec<u8> = root.iter().flat_map(|v| word(*v)).collect();
-        anyhow::ensure!(context.version == 1 && context.max_proof_bytes == 16_777_216 && context.max_records == 1024 && hex32(&context.config_hash)? == config && context.context_id == digest(&[&domain_hash(Domain::Window), &config, &word(id), &root_bytes]), "context identity/configuration mismatch");
+        let expected = psy_client_data::bridge_aggregate::claim_context_id(config, end, root).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        anyhow::ensure!(context.version == 4 && context.max_proof_bytes == 16_777_216 && context.max_records == 32 && hex32(&context.config_hash)? == config && hex32(&context.context_id)? == expected, "context identity/configuration mismatch");
         Ok((id, root))
     }
     pub async fn response<T: serde::de::DeserializeOwned>(&self, mut response: reqwest::Response) -> Result<T> {
@@ -181,37 +151,30 @@ impl ClaimClient {
     pub async fn submit_withdrawal(&self, context: &AggregationContext, request: &AggregationClaimRequest) -> Result<ClaimStatus> {
         self.validate_context(context)?;
         anyhow::ensure!(request.version == 1 && request.context_id == context.context_id && request.kind == "withdrawal", "withdrawal claim body mismatch");
-        let record = STANDARD.decode(&request.record)?;
-        WithdrawalLeaf::decode(&record)?;
+        let claim = STANDARD.decode(&request.record)?;
+        decode_withdrawal_burn(&claim)?;
         anyhow::ensure!(STANDARD.decode(&request.proof)?.len() <= context.max_proof_bytes, "withdrawal proof exceeds context bound");
         self.post_claim(request).await
     }
-    pub async fn submit_reward_session(&self, context: &AggregationContext, request: &RewardSessionClaimRequest) -> Result<ClaimStatus> {
+    pub async fn submit_reward(&self, context: &AggregationContext, request: &RewardClaimRequest) -> Result<ClaimStatus> {
         self.validate_context(context)?;
-        anyhow::ensure!(request.version == 2 && request.context_id == context.context_id && request.kind == "reward", "reward session claim body mismatch");
-        let record = STANDARD.decode(&request.record)?;
-        if !record.is_empty() { psy_client_data::bridge_aggregate::SourceCheckpointRewardLeaf::decode(&record)?; }
-        anyhow::ensure!(STANDARD.decode(&request.transition)?.len() <= context.max_proof_bytes, "reward transition exceeds context bound");
+        anyhow::ensure!(request.version == 2 && request.context_id == context.context_id && request.kind == "reward", "reward claim body mismatch");
+        anyhow::ensure!(STANDARD.decode(&request.anchor)?.len() == 2696, "reward anchor is not 2696 bytes");
+        anyhow::ensure!(STANDARD.decode(&request.proof)?.len() <= context.max_proof_bytes, "reward proof exceeds context bound");
         self.post_claim(request).await
     }
-    async fn withdrawal_root(&self, context: &AggregationContext, chain: u8) -> Result<[u64; 4]> {
-        let (id, _) = self.validate_context(context)?;
-        let (_, roots) = self.checkpoint(context).await?;
-        let user_id = self.config.bridge_user_id as u64;
-        let user = self.provider.get_user_leaf_data(id, user_id).await?;
-        verify_path(&self.provider.get_user_tree_merkle_proof(id, user_id).await?, roots.user_tree_root, user_id, user.qfhash::<PsyHasher>(), psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize)?;
-        let contract = self.provider.get_user_contract_tree_merkle_proof(id, user_id, 3).await?;
-        verify_path(&contract, user.user_state_tree_root, 3, contract.value, psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize)?;
-        let mut words = [0u32; 8];
-        for part in 0..2 {
-            let slot = 16_451 + 2 * u64::from(chain) + part as u64;
-            let path = self.provider.get_user_contract_state_tree_merkle_proof(id, user_id, 3, psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT, slot).await?;
-            verify_path(&path, contract.value, slot, path.value, psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize)?;
-            for (out, felt) in words[part * 4..part * 4 + 4].iter_mut().zip(path.value.0.elements) { *out = u32::try_from(felt.to_canonical_u64())?; }
-        }
-        let root = std::array::from_fn(|i| u64::from(words[2*i]) | (u64::from(words[2*i+1]) << 32));
-        anyhow::ensure!(root.iter().all(|v| *v < GOLDILOCKS_MODULUS), "noncanonical withdrawal root");
-        Ok(root)
+    pub fn prove_prepared_withdrawal(&self, context: &AggregationContext, claim: &WithdrawalBurnRecord, proof: &WithdrawalBurnProof, sentinel: &psy_client_data::qdata::imt_proof::IMTMembershipProof<F>, ordinal: u8, circuit: &BridgeWithdrawalClaimCircuit) -> Result<AggregationClaimRequest> {
+        let (end_id, end_root) = self.validate_context(context)?;
+        let end = u32::try_from(end_id).context("selected end exceeds u32")?;
+        anyhow::ensure!(proof.checkpoint_id == end_id, "withdrawal burn proof is not at the selected end");
+        let policy = circuit.policies().get(usize::from(ordinal)).context("policy ordinal out of range")?;
+        anyhow::ensure!(policy.approved_leaf.state_tree_height == F::from_canonical_u32(32), "withdrawal policy state height is not 32");
+        let bytes = encode_withdrawal_burn(claim)?;
+        let input = withdrawal_claim_input(end, end_root, claim, proof, sentinel, ordinal, policy)?;
+        let witness = circuit.set_witness(&input)?;
+        let proved = circuit.circuit_data.prove(witness)?;
+        circuit.circuit_data.verify(proved.clone())?;
+        self.build_aggregation_claim(context, "withdrawal", &bytes, &proved.to_bytes())
     }
 }
 
@@ -224,104 +187,229 @@ pub struct AggregationClaimRequest {
     pub record: String,
     pub proof: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RewardSessionClaimRequest {
+pub struct RewardClaimRequest {
     pub version: u32,
     pub context_id: String,
     pub kind: String,
-    pub record: String,
-    pub transition: String,
+    pub proof: String,
+    pub anchor: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardConsumptionState {
+    pub version: u32,
+    pub config_hash: String,
+    pub chain_id: String,
+    pub payer: String,
+    pub user_id: u32,
+    pub confirmed: BTreeMap<u32, Vec<u32>>,
+    pub pending: Option<RewardPendingClaim>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardPendingSelection {
+    pub realm_jobs: Vec<(u64, u64, psy_client_common::job::id::QProvingJobDataIDWithRewardPreimage)>,
+    pub coordinator_jobs: Vec<(u64, psy_client_common::job::id::QProvingJobDataIDWithRewardPreimage)>,
+}
+impl RewardPendingSelection {
+    pub fn jobs_len(&self) -> usize { self.realm_jobs.len() + self.coordinator_jobs.len() }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RewardPendingClaim {
+    pub jobs: RewardPendingSelection,
+    pub coordinates: BTreeMap<u32, Vec<u32>>,
+    pub request: RewardClaimRequest,
+    pub record: Vec<u8>,
+}
+pub fn reward_root_bytes(root: HashOut<F>) -> Result<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    for (index, limb) in root.elements.into_iter().enumerate() {
+        let value = limb.to_canonical_u64();
+        anyhow::ensure!(value < GOLDILOCKS_MODULUS, "noncanonical reward nullifier root");
+        bytes[index * 8..index * 8 + 8].copy_from_slice(&value.to_be_bytes());
+    }
+    Ok(bytes)
+}
+fn reward_coordinate(source: u32, height: u8, path_index: u32) -> Result<(u32, u32)> {
+    anyhow::ensure!((2..=21).contains(&height), "reward nullifier height is outside 2..=21");
+    let offset = (1u32 << height) - 1;
+    let inner = offset.checked_add(path_index).context("reward nullifier overflow")?;
+    anyhow::ensure!(inner < 1u32 << REWARD_NULLIFIER_INNER_HEIGHT, "reward inner coordinate exceeds its tree");
+    Ok((source, inner))
+}
+pub fn rebuild_reward_tree(coordinates: &BTreeMap<u32, Vec<u32>>) -> Result<(BTreeMap<(usize, u64), HashOut<F>>, BTreeMap<u32, (BTreeMap<(usize, u64), HashOut<F>>, HashOut<F>)>, HashOut<F>)> {
+    let mut outer = BTreeMap::new();
+    let mut inners = BTreeMap::new();
+    let mut root = *REWARD_NULLIFIER_EMPTY_ROOT;
+    for (source, values) in coordinates {
+        anyhow::ensure!(values.windows(2).all(|pair| pair[0] < pair[1]), "reward coordinates are not strictly ordered");
+        let mut nodes = BTreeMap::new();
+        let mut inner = *INNER_EMPTY_ROOT;
+        for value in values {
+            inner = insert_nullifier::<REWARD_NULLIFIER_INNER_HEIGHT>(&mut nodes, REWARD_NULLIFIER_EMPTY_LEAF, u64::from(*value), REWARD_NULLIFIER_OCCUPIED_LEAF)?.new_root;
+        }
+        root = insert_nullifier::<REWARD_NULLIFIER_OUTER_HEIGHT>(&mut outer, *INNER_EMPTY_ROOT, u64::from(*source), inner)?.new_root;
+        inners.insert(*source, (nodes, inner));
+    }
+    Ok((outer, inners, root))
 }
 #[derive(Clone, Debug)]
 pub enum ClaimRequest {
     Withdrawal(AggregationClaimRequest),
-    RewardSession(RewardSessionClaimRequest),
+    Reward(RewardClaimRequest),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
-#[error("fresh external reward authorization required for message {message}")]
-pub struct FreshAuthorizationRequired {
-    pub message: String,
-    pub record: String,
-    pub reward: RewardRecord,
-    pub context: AggregationContext,
-}
-impl FreshAuthorizationRequired {
-    pub fn new(context: &AggregationContext, authorization: &RewardAuthorizationContext) -> Result<Self> {
-        let leaf = &authorization.reward;
-        let reward = RewardRecord { claim_checkpoint_id: leaf.claim_checkpoint_id.to_string(), user_id: leaf.user_id.to_string(), height: leaf.height, path_index: leaf.path_index, nullifier_index: leaf.nullifier_index, recipient: format!("0x{}", hex::encode(leaf.recipient)) };
-        let record = leaf.encode()?;
-        let decoded = reward.canonical()?;
-        anyhow::ensure!(&decoded == leaf && decoded.encode()? == record, "reward challenge echo differs from canonical record");
-        Ok(Self { message: format!("0x{}", hex::encode(authorization.message()?)), record: STANDARD.encode(record), reward, context: context.clone() })
-    }
-}
 
 pub struct ClaimCircuits {
-    pub withdrawal: WithdrawalInclusionCircuit<PoseidonGoldilocksConfig, 2>,
-    pub reward_session: RewardSessionCircuit,
+    pub reward_segment: RewardSegmentCircuit,
+    pub reward_merge: RewardMergeCircuit,
+    pub reward_root: RewardRootCircuit,
 }
 impl ClaimCircuits {
     pub fn build(config: &NetworkConfig, registry: &[psy_client_data::bridge_aggregate::CircuitSetRegistration]) -> Result<Self> {
         config.validate()?;
         anyhow::ensure!(psy_client_data::bridge_aggregate::circuit_set_hash(registry)? == config.circuit_set_hash, "operator circuit registry differs from configuration");
-        let withdrawal = WithdrawalInclusionCircuit::build();
-        let reward_session = RewardSessionCircuit::new(REWARD_SESSION_STEP_CAPACITY, config.chains.len())?;
-        let session = psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_registration(
-            3, 0, 0, psy_client_data::bridge_aggregate::REWARD_SESSION_PROOF_FIELD_COUNT, &reward_session.circuit_data, [0; 4])?;
-        let withdrawal_registration = psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_registration(
-            2, 0, 0, 32, &withdrawal.circuit_data, [0; 4])?;
-        anyhow::ensure!(registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (3, 0, 0)) == Some(&session)
-            && registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (2, 0, 0)) == Some(&withdrawal_registration)
-            && registry.iter().all(|pin| pin.identity_fingerprint == [0; 4] && pin.family != 4), "claim circuit differs from source registry");
-        Ok(Self { withdrawal, reward_session })
-    }
-    pub fn identity_fingerprint_for_scheme(&self, scheme: u8) -> Result<[u64; 4]> {
-        self.reward_session.identity_fingerprint_for_scheme(scheme)
+        let reward_segment = RewardSegmentCircuit::new();
+        let reward_merge = RewardMergeCircuit::new(&reward_segment);
+        let reward_root = RewardRootCircuit::new(&reward_merge);
+        let segment = psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_registration(14, 0, 1, REWARD_SEGMENT_STATEMENT_LEN, &reward_segment.circuit_data, [0; 4])?;
+        let merge = psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_registration(14, 0, 0, reward_merge.circuit_data.common.num_public_inputs, &reward_merge.circuit_data, [0; 4])?;
+        let root = psy_plonky2_circuits::bridge::aggregate_circuits::circuit_set_registration(15, 0, 0, REWARD_ROOT_STATEMENT_LEN, &reward_root.circuit_data, [0; 4])?;
+        anyhow::ensure!(registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (14, 0, 1)) == Some(&segment)
+            && registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (14, 0, 0)) == Some(&merge)
+            && registry.iter().find(|pin| (pin.family, pin.level, pin.variant) == (15, 0, 0)) == Some(&root), "reward segment, merge, or root differs from source registry");
+        Ok(Self { reward_segment, reward_merge, reward_root })
     }
 }
 
 impl ClaimClient {
-    pub fn build_aggregation_claim(&self, context: &AggregationContext, kind: &str, record: &[u8], proof: &[u8]) -> Result<AggregationClaimRequest> {
+    pub fn build_aggregation_claim(&self, context: &AggregationContext, kind: &str, claim: &[u8], proof: &[u8]) -> Result<AggregationClaimRequest> {
         self.validate_context(context)?;
         anyhow::ensure!(kind == "withdrawal" && !proof.is_empty() && proof.len() <= context.max_proof_bytes, "invalid withdrawal claim proof");
-        Ok(AggregationClaimRequest { version: 1, context_id: context.context_id.clone(), kind: kind.to_owned(), record: STANDARD.encode(record), proof: STANDARD.encode(proof) })
+        Ok(AggregationClaimRequest { version: 1, context_id: context.context_id.clone(), kind: kind.to_owned(), record: STANDARD.encode(claim), proof: STANDARD.encode(proof) })
     }
-    pub async fn prove_withdrawal(&self, context: &AggregationContext, leaf: &WithdrawalLeaf, circuit: &WithdrawalInclusionCircuit<PoseidonGoldilocksConfig, 2>) -> Result<AggregationClaimRequest> {
-        leaf.validate()?;
-        anyhow::ensure!(self.config.chains.iter().any(|chain| chain.chain_index == leaf.chain_index), "unconfigured withdrawal destination");
-        let (id, root) = self.validate_context(context)?;
-        let withdrawal_root = self.withdrawal_root(context, leaf.chain_index).await?;
-        let response = self.http.get(format!("{}/api/v1/bridge/withdrawal-claim-proof", self.url)).query(&[("contextId", context.context_id.clone()), ("checkpointId", id.to_string()), ("recipient", format!("0x{}", hex::encode(leaf.recipient))), ("token_address", format!("0x{}", hex::encode(leaf.token))), ("amount", format!("0x{}", hex::encode(leaf.amount))), ("nonce", format!("0x{}", hex::encode(leaf.nonce))), ("destination_chain_index", leaf.chain_index.to_string()), ("sender_user_id", leaf.sender_user_id.to_string())]).send().await?;
-        let witness: WithdrawalProof = self.response(response).await?;
-        anyhow::ensure!(witness.found && witness.checkpoint_id == Some(id), "withdrawal witness not found at chosen checkpoint");
-        let siblings = witness.siblings.context("missing withdrawal siblings")?.iter().map(|s| poseidon_hex(s)).collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("withdrawal requires32 siblings"))?;
-        let proof = circuit.generate_proof(&WithdrawalInclusionInputs { config_hash: self.config.config_hash()?, end_checkpoint_id: id, end_checkpoint_root: root, withdrawal_root, leaf: leaf.clone(), witness: WithdrawalWitness { leaf_index: witness.leaf_index.context("missing withdrawal index")?, siblings } })?;
-        let bytes = proof.to_bytes();
-        circuit.verify_proof(proof)?;
-        self.build_aggregation_claim(context, "withdrawal", &leaf.encode()?, &bytes)
-    }
-    pub fn prove_reward_session(&self, context: &AggregationContext, circuit: &RewardSessionCircuit, witness: &RewardSessionWitness<'_>, window: &psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerWindowValues, expected_old_root: [u64; 4]) -> Result<psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerTransition> {
-        let (end_checkpoint_id, end_checkpoint_root) = self.validate_context(context)?;
-        anyhow::ensure!(witness.config.config_hash()? == self.config.config_hash()? && witness.end_checkpoint_id as u64 == end_checkpoint_id
-            && hash_words(witness.end_leaf.qfhash::<PsyHasher>()) == end_checkpoint_root, "reward session end differs from aggregation context");
-        anyhow::ensure!(hex32(&context.config_hash)? == window.config_hash && window.economic_domain == witness.economic_domain
-            && window.window_id == witness.window_id && window.end_checkpoint_id == witness.end_checkpoint_id
-            && window.end_checkpoint_root == end_checkpoint_root && window.start_root == witness.start_root, "reward ledger window differs from session witness");
-        let proof = circuit.prove(witness)?;
-        let bytes = proof.to_bytes();
-        let session_root = psy_plonky2_circuits::bridge::circuits::reward_ledger::reward_session_root(
-            witness.source_checkpoint_id, witness.old_session_root, witness.jobs)?;
-        let step = psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerStep {
-            proof: bytes.clone(), old_state: witness.old_state, new_state: witness.new_state,
-            source_checkpoint_id: witness.source_checkpoint_id, source_leaf: witness.source_leaf, source_path: witness.source_path,
-            old_summary: witness.old_summary, session_root, summary_siblings: witness.session_siblings, is_final_step: witness.is_final_step,
+    pub async fn prove_withdrawal(&self, context: &AggregationContext, claim: &WithdrawalBurnRecord, policies: &[BridgeTokenPolicy], circuit: &BridgeWithdrawalClaimCircuit) -> Result<AggregationClaimRequest> {
+        let (end, _) = self.validate_context(context)?;
+        let matches = policies.iter().enumerate().filter(|(_, policy)| policy.chain_index == claim.chain_index && policy.token_contract_id == claim.contract_id).map(|(index, _)| index).collect::<Vec<_>>();
+        anyhow::ensure!(matches.len() == 1, "withdrawal policy selection is not unique");
+        let ordinal = u8::try_from(matches[0])?;
+        let policy = &policies[usize::from(ordinal)];
+        let proof = self.provider.get_withdrawal_burn_proof(psy_provider::request::QIMTMembershipProofRPCRequest {
+            checkpoint_id: end, user_id: u64::from(claim.user_id), contract_id: claim.contract_id,
+            key: withdrawal_burn_key(&claim.nonce), state_slot_base: u64::from(policy.map_base), capacity: u64::from(policy.capacity),
+        }).await?;
+        let sentinel = psy_client_data::qdata::imt_proof::IMTMembershipProof {
+            leaf: self.provider.contract_state_imt_get_leaf_preimage(end, u64::from(claim.user_id), u64::from(claim.contract_id), u64::from(policy.map_base)).await?,
+            merkle_proof: self.provider.get_user_contract_state_tree_merkle_proof(end, u64::from(claim.user_id), claim.contract_id, 32, u64::from(policy.map_base)).await?,
         };
-        let transition = psy_plonky2_circuits::bridge::circuits::reward_ledger::verify_reward_ledger_step(
-            &circuit.circuit_data.common, &circuit.circuit_data.verifier_only, window, expected_old_root, &step)?;
-        anyhow::ensure!(transition.transition_bytes.ends_with(&bytes) && transition.source_payout.is_some() == witness.is_final_step, "reward ledger transition does not match the proved step");
-        Ok(transition)
+        self.prove_prepared_withdrawal(context, claim, &proof, &sentinel, ordinal, circuit)
+    }
+    pub async fn prove_reward(&self, context: &AggregationContext, segment: &RewardSegmentCircuit, merge: &RewardMergeCircuit, root: &RewardRootCircuit, user_id: u32, recipient: [u32; 8], private_key: HashOut<F>, jobs: &BTreeMap<u32, Vec<AuthenticatedJobWitness>>, confirmed: &BTreeMap<u32, Vec<u32>>) -> Result<(RewardClaimRequest, Vec<u8>, BTreeMap<u32, Vec<u32>>)> {
+        let (end_id, end_root) = self.validate_context(context)?;
+        let anchor_id = u32::try_from(end_id)?;
+        anyhow::ensure!(recipient[5..].iter().all(|limb| *limb == 0) && recipient != [0; 8], "reward recipient must be a nonzero 160-bit address");
+        anyhow::ensure!(!jobs.is_empty() && jobs.values().all(|batch| !batch.is_empty()), "reward source has no jobs");
+        let anchor_leaf = self.provider.get_checkpoint_leaf_data(end_id).await?;
+        let anchor_path = self.provider.get_checkpoint_tree_merkle_proof(end_id, end_id).await?;
+        let checkpoint_root = QHashOut::from_values(end_root[0], end_root[1], end_root[2], end_root[3]);
+        verify_path(&anchor_path, checkpoint_root, end_id, anchor_leaf.qfhash::<PsyHasher>(), CHECKPOINT_TREE_HEIGHT as usize)?;
+        const SEGMENT_OLD_NULLIFIER: usize = 5;
+        const SEGMENT_NEW_NULLIFIER: usize = 9;
+        let (mut outer_nodes, mut prior_inners, initial_root) = rebuild_reward_tree(confirmed)?;
+        let mut old_root = initial_root;
+        let mut segments = Vec::new();
+        for (source_id, batch) in jobs {
+            anyhow::ensure!(*source_id <= anchor_id, "reward source is newer than the admission anchor");
+            let source_leaf = self.provider.get_checkpoint_leaf_data(u64::from(*source_id)).await?;
+            let source_path = self.provider.get_checkpoint_tree_merkle_proof(end_id, u64::from(*source_id)).await?;
+            verify_path(&source_path, checkpoint_root, u64::from(*source_id), source_leaf.qfhash::<PsyHasher>(), CHECKPOINT_TREE_HEIGHT as usize)?;
+            let completed = u128::from(source_leaf.stats.pm_jobs_completed.gutas_completed.to_canonical_u64());
+            let fees = u128::from(source_leaf.stats.guta_fees_collected.to_canonical_u64());
+            let coordinate = |job: &AuthenticatedJobWitness| -> Result<u64> {
+                let offset = 1u32.checked_shl(u32::from(job.height)).context("reward nullifier height exceeds u32")?.checked_sub(1).context("reward nullifier height is zero")?;
+                let index = offset.checked_add(job.path_index).context("reward nullifier overflow")?;
+                Ok((u64::from(*source_id) << REWARD_NULLIFIER_INNER_HEIGHT) + u64::from(index))
+            };
+            let mut ordered = batch.clone();
+            ordered.sort_by_key(|job| coordinate(job).unwrap_or(u64::MAX));
+            let keys = ordered.iter().map(coordinate).collect::<Result<Vec<_>>>()?;
+            anyhow::ensure!(keys.windows(2).all(|pair| pair[0] < pair[1]), "reward jobs are not strictly ordered");
+            let (mut inner_nodes, mut inner_root) = prior_inners.remove(source_id).unwrap_or_else(|| (BTreeMap::new(), *INNER_EMPTY_ROOT));
+            for chunk in ordered.chunks(REWARD_LEAF_CAPACITY) {
+                let chunk_keys = chunk.iter().map(|job| reward_coordinate(*source_id, job.height, job.path_index).map(|(_, inner)| inner)).collect::<Result<Vec<_>>>()?;
+                let prior = confirmed.get(source_id).map(Vec::as_slice).unwrap_or(&[]);
+                anyhow::ensure!(chunk_keys.iter().all(|key| prior.binary_search(key).is_err()), "reward coordinate was already consumed");
+                let jobs_count = u128::try_from(chunk.len())?;
+                anyhow::ensure!(completed > 0, "reward source has no completed jobs");
+                let amount = (jobs_count * fees) / completed;
+                let chunk_start = inner_root;
+                let mut inner_siblings = Vec::with_capacity(chunk.len());
+                for job in chunk {
+                    let update = insert_nullifier::<REWARD_NULLIFIER_INNER_HEIGHT>(&mut inner_nodes, REWARD_NULLIFIER_EMPTY_LEAF, u64::from(coordinate(job)? & ((1u64 << REWARD_NULLIFIER_INNER_HEIGHT) - 1)), REWARD_NULLIFIER_OCCUPIED_LEAF)?;
+                    inner_siblings.push(update.siblings);
+                    inner_root = update.new_root;
+                }
+                let source_index = u64::from(*source_id);
+                let before = outer_nodes.get(&(0, source_index)).copied().unwrap_or(*INNER_EMPTY_ROOT);
+                let before_siblings: [HashOut<F>; REWARD_NULLIFIER_OUTER_HEIGHT] = std::array::from_fn(|level| outer_nodes.get(&(level, (source_index >> level) ^ 1)).copied().unwrap_or_else(|| empty_subtree(*INNER_EMPTY_ROOT, level)));
+                let mut before_root = before;
+                for level in 0..REWARD_NULLIFIER_OUTER_HEIGHT {
+                    let sibling = before_siblings[level];
+                    before_root = if (source_index >> level) & 1 == 1 { PoseidonHash::two_to_one(sibling, before_root) } else { PoseidonHash::two_to_one(before_root, sibling) };
+                }
+                anyhow::ensure!(before_root == old_root && before == chunk_start, "reward outer pre-update proof mismatch");
+                let outer = insert_nullifier::<REWARD_NULLIFIER_OUTER_HEIGHT>(&mut outer_nodes, *INNER_EMPTY_ROOT, source_index, inner_root)?;
+                segments.push((RewardSegmentWitness {
+                    user_id, anchor_checkpoint_id: anchor_id, checkpoint_tree_root: checkpoint_root.0, old_nullifier_root: old_root,
+                    source: RewardSegmentSourceWitness {
+                        source_checkpoint_id: *source_id, checkpoint_leaf: source_leaf.clone(), checkpoint_siblings: fixed_siblings(&source_path, u64::from(*source_id), source_leaf.qfhash::<PsyHasher>(), checkpoint_root)?,
+                        amount_limbs: [amount as u32, (amount >> 32) as u32], jobs: chunk.to_vec(),
+                        nullifier: RewardNullifierSourceWitness { old_inner_root: chunk_start, outer_siblings: outer.siblings, inner_siblings },
+                    },
+                }, outer.new_root));
+                old_root = outer.new_root;
+            }
+        }
+        let mut proofs = Vec::with_capacity(segments.len());
+        for (input, new_root) in &segments {
+            let proof = segment.prove(input)?;
+            anyhow::ensure!(proof.public_inputs.len() == REWARD_SEGMENT_STATEMENT_LEN, "reward segment statement width mismatch");
+            let read = |offset| QHashOut::from_values(proof.public_inputs[offset].to_canonical_u64(), proof.public_inputs[offset + 1].to_canonical_u64(), proof.public_inputs[offset + 2].to_canonical_u64(), proof.public_inputs[offset + 3].to_canonical_u64()).0;
+            anyhow::ensure!(read(SEGMENT_OLD_NULLIFIER) == input.old_nullifier_root, "reward segment initial root mismatch");
+            anyhow::ensure!(read(SEGMENT_NEW_NULLIFIER) == *new_root, "reward segment computed root mismatch");
+            proofs.push(merge.prove(&RewardMergeWitness::Leaf { segment: proof })?);
+        }
+        while proofs.len() > 1 {
+            let mut reduced = Vec::with_capacity(proofs.len().div_ceil(2));
+            let mut round = proofs.into_iter();
+            while let Some(left) = round.next() {
+                reduced.push(match round.next() {
+                    Some(right) => merge.prove(&RewardMergeWitness::Pair { left, right })?,
+                    None => left,
+                });
+            }
+            proofs = reduced;
+        }
+        let global_roots = self.provider.get_checkpoint_global_state_roots(end_id).await?;
+        anyhow::ensure!(global_roots.qfhash::<PsyHasher>() == anchor_leaf.global_chain_root, "reward anchor global roots mismatch");
+        let user = self.provider.get_user_leaf_data(end_id, u64::from(user_id)).await?;
+        let user_path = self.provider.get_user_tree_merkle_proof(end_id, u64::from(user_id)).await?;
+        verify_path(&user_path, global_roots.user_tree_root, u64::from(user_id), user.alghash::<PoseidonHash>(), GLOBAL_USER_TREE_HEIGHT as usize)?;
+        let merge_proof = proofs.pop().context("reward merge has no proof")?;
+        anyhow::ensure!(merge_proof.public_inputs.len() >= REWARD_MERGE_STATEMENT_LEN, "reward merge statement is short");
+        let proved = root.prove(&RewardRootWitness {
+            recipient, anchor_checkpoint_id: anchor_id, anchor_leaf, anchor_siblings: fixed_siblings(&anchor_path, end_id, anchor_leaf.qfhash::<PsyHasher>(), checkpoint_root)?,
+            global_roots, user_leaf: user, user_siblings: fixed_siblings(&user_path, u64::from(user_id), user.alghash::<PoseidonHash>(), global_roots.user_tree_root)?, private_key, merge_proof,
+        })?;
+        root.circuit_data.verify(proved.clone())?;
+        let claim = RewardClaim::from_public_inputs(self.config.ethereum_index, &proved.public_inputs.iter().map(|value| value.to_canonical_u64()).collect::<Vec<_>>().try_into().map_err(|_| ClaimError::InvalidResponse("reward root width"))?)?;
+        anyhow::ensure!(claim.user_id == user_id && claim.old_nullifier_root == hash_words(QHashOut(initial_root)), "reward root statement mismatch");
+        let mut added_coordinates = BTreeMap::new();
+        for (source, batch) in jobs { let mut values = batch.iter().map(|job| reward_coordinate(*source, job.height, job.path_index).map(|(_, inner)| inner)).collect::<Result<Vec<_>>>()?; values.sort_unstable(); added_coordinates.insert(*source, values); }
+        Ok((RewardClaimRequest { version: 2, context_id: context.context_id.clone(), kind: "reward".to_owned(), proof: STANDARD.encode(proved.to_bytes()), anchor: STANDARD.encode(encode_reward_anchor(anchor_id, &anchor_leaf, &anchor_path, &global_roots, &user, &user_path)?) }, claim.encode()?, added_coordinates))
     }
 }
 
@@ -339,34 +427,20 @@ pub fn select_multisig_signatures<'a>(bundles: &'a [MultisigSignatures], message
 pub struct WithdrawalRecord {
     pub chain_index: u8,
     pub sender_user_id: String,
+    pub contract_id: String,
     pub recipient: String,
-    pub token: String,
     pub amount: String,
     pub nonce: String,
 }
 impl WithdrawalRecord {
-    pub fn canonical(&self) -> Result<WithdrawalLeaf> {
-        let amount = decimal_word(&self.amount)?;
-        let leaf = WithdrawalLeaf { chain_index: self.chain_index, sender_user_id: u32::try_from(decimal(&self.sender_user_id)?)?, recipient: address(&self.recipient)?, token: address(&self.token)?, amount, nonce: hex32(&self.nonce)? };
-        leaf.validate()?;
-        Ok(leaf)
-    }
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RewardRecord {
-    pub claim_checkpoint_id: String,
-    pub user_id: String,
-    pub height: u8,
-    pub path_index: u32,
-    pub nullifier_index: u32,
-    pub recipient: String,
-}
-impl RewardRecord {
-    pub fn canonical(&self) -> Result<RewardLeaf> {
-        let leaf = RewardLeaf { claim_checkpoint_id: decimal(&self.claim_checkpoint_id)?, user_id: u32::try_from(decimal(&self.user_id)?)?, height: self.height, path_index: self.path_index, nullifier_index: self.nullifier_index, recipient: address(&self.recipient)? };
-        leaf.validate()?;
-        Ok(leaf)
+    pub fn canonical(&self) -> Result<WithdrawalBurnRecord> {
+        let claim = WithdrawalBurnRecord {
+            chain_index: self.chain_index, user_id: u32::try_from(decimal(&self.sender_user_id)?)?,
+            contract_id: u32::try_from(decimal(&self.contract_id)?)?, recipient: address(&self.recipient)?,
+            amount: decimal_word(&self.amount)?, nonce: hex32(&self.nonce)?,
+        };
+        decode_withdrawal_burn(&encode_withdrawal_burn(&claim)?)?;
+        Ok(claim)
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -379,23 +453,11 @@ pub struct AggregateWithdrawalRequest {
     pub record: WithdrawalRecord,
     pub user_id: String,
 }
-pub struct RewardSessionProvingInput<'a> {
-    pub config: String,
-    pub registry: String,
-    pub services_url: String,
-    pub context: AggregationContext,
-    pub witness: &'a RewardSessionWitness<'a>,
-    pub window: psy_plonky2_circuits::bridge::circuits::reward_ledger::RewardLedgerWindowValues,
-    pub expected_old_root: [u64; 4],
-}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AggregateClaimResult {
     AggregationClaim { request: AggregationClaimRequest },
-    FreshAuthorizationRequired { message: String, record: String, reward: RewardRecord, context: AggregationContext },
-}
-impl From<FreshAuthorizationRequired> for AggregateClaimResult {
-    fn from(value: FreshAuthorizationRequired) -> Self { Self::FreshAuthorizationRequired { message: value.message, record: value.record, reward: value.reward, context: value.context } }
+    FreshAuthorizationRequired { message: String, record: String, context: AggregationContext },
 }
 fn canonical_base64(value: &str) -> Result<Vec<u8>> {
     let bytes = STANDARD.decode(value)?;
@@ -420,25 +482,17 @@ fn build_claim_client(session: &crate::session::WalletSession, config: &str, reg
     provider.current_user_id = 0;
     Ok((ClaimClient::new(config, provider, url)?, circuits))
 }
-pub async fn prove_aggregate_withdrawal(session: &crate::session::WalletSession, public_key: QHashOut<F>, request: AggregateWithdrawalRequest) -> Result<AggregateClaimResult> {
-    let (client, circuits) = build_claim_client(session, &request.config, &request.registry, &request.services_url)?;
-    let record = request.record.canonical()?;
-    anyhow::ensure!(decimal(&request.user_id)? == record.sender_user_id as u64, "withdrawal selected user mismatch");
+pub async fn prove_aggregate_withdrawal(session: &crate::session::WalletSession, public_key: QHashOut<F>, request: AggregateWithdrawalRequest, policies: &[BridgeTokenPolicy], circuit: &BridgeWithdrawalClaimCircuit) -> Result<AggregateClaimResult> {
+    let (client, _) = build_claim_client(session, &request.config, &request.registry, &request.services_url)?;
+    let claim = request.record.canonical()?;
+    anyhow::ensure!(decimal(&request.user_id)? == u64::from(claim.user_id), "withdrawal selected user mismatch");
     session.wallet.get_user_by_public_key_hash(&public_key)?;
     let (end, _) = client.validate_context(&request.context)?;
     let (_, roots) = client.checkpoint(&request.context).await?;
-    let user = client.provider.get_user_leaf_data(end, record.sender_user_id as u64).await?;
-    verify_path(&client.provider.get_user_tree_merkle_proof(end, record.sender_user_id as u64).await?, roots.user_tree_root, record.sender_user_id as u64, user.qfhash::<PsyHasher>(), psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize)?;
+    let user = client.provider.get_user_leaf_data(end, u64::from(claim.user_id)).await?;
+    verify_path(&client.provider.get_user_tree_merkle_proof(end, u64::from(claim.user_id)).await?, roots.user_tree_root, u64::from(claim.user_id), user.qfhash::<PsyHasher>(), psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize)?;
     anyhow::ensure!(user.public_key == public_key, "withdrawal account differs from selected wallet");
-    Ok(AggregateClaimResult::AggregationClaim { request: client.prove_withdrawal(&request.context, &record, &circuits.withdrawal).await? })
-}
-pub fn prove_reward_session_claim(session: &crate::session::WalletSession, public_key: QHashOut<F>, input: RewardSessionProvingInput<'_>) -> Result<RewardSessionClaimRequest> {
-    let (client, circuits) = build_claim_client(session, &input.config, &input.registry, &input.services_url)?;
-    session.wallet.get_user_by_public_key_hash(&public_key)?;
-    anyhow::ensure!(!input.witness.is_final_step || (u64::from(input.witness.statement.user_id) == input.witness.user_leaf.user_id.to_canonical_u64() && input.witness.user_leaf.public_key == public_key), "reward session user differs from selected wallet");
-    let transition = client.prove_reward_session(&input.context, &circuits.reward_session, input.witness, &input.window, input.expected_old_root)?;
-    let record = match &transition.source_payout { Some(payout) => payout.encode()?, None => Vec::new() };
-    Ok(RewardSessionClaimRequest { version: 2, context_id: input.context.context_id, kind: "reward".to_owned(), record: STANDARD.encode(record), transition: STANDARD.encode(transition.transition_bytes) })
+    Ok(AggregateClaimResult::AggregationClaim { request: client.prove_withdrawal(&request.context, &claim, policies, circuit).await? })
 }
 
 impl ClaimClient {
@@ -457,3 +511,126 @@ impl ClaimClient {
         Ok(())
     }
 }
+
+fn decode_withdrawal_burn(bytes: &[u8]) -> Result<WithdrawalBurnRecord> {
+    anyhow::ensure!(bytes.len() == 320, "withdrawal burn record is not 320 bytes");
+    let word = |index: usize| {
+        let start = index * 32;
+        anyhow::ensure!(bytes[start..start + 24].iter().all(|byte| *byte == 0), "withdrawal burn word is not canonical");
+        Ok(u64::from_be_bytes(bytes[start + 24..start + 32].try_into().unwrap()))
+    };
+    let bytes32 = |index: usize| -> Result<[u8; 32]> { Ok(bytes[index * 32..index * 32 + 32].try_into().unwrap()) };
+    anyhow::ensure!(word(0)? == 1 && word(5)? == 0 && word(6)? == 0 && word(7)? == 0, "withdrawal burn padding mismatch");
+    let recipient = bytes32(8)?;
+    anyhow::ensure!(recipient[..12] == [0; 12], "withdrawal recipient exceeds 160 bits");
+    Ok(WithdrawalBurnRecord {
+        chain_index: u8::try_from(word(1)?)?, user_id: u32::try_from(word(2)?)?, contract_id: u32::try_from(word(3)?)?,
+        nonce: bytes32(4)?, recipient: recipient[12..].try_into().unwrap(), amount: bytes32(9)?,
+    })
+}
+
+fn encode_withdrawal_burn(claim: &WithdrawalBurnRecord) -> Result<Vec<u8>> {
+    anyhow::ensure!(claim.contract_id <= 0x00ff_ffff && claim.amount != [0; 32] && claim.recipient != [0; 20], "invalid withdrawal burn record");
+    let mut bytes = Vec::with_capacity(320);
+    for value in [1u64, u64::from(claim.chain_index), u64::from(claim.user_id), u64::from(claim.contract_id)] { bytes.extend_from_slice(&word(value)); }
+    bytes.extend_from_slice(&claim.nonce);
+    bytes.extend_from_slice(&word(0)); bytes.extend_from_slice(&word(0)); bytes.extend_from_slice(&word(0));
+    bytes.extend_from_slice(&[0; 12]); bytes.extend_from_slice(&claim.recipient);
+    bytes.extend_from_slice(&claim.amount);
+    let decoded = decode_withdrawal_burn(&bytes)?;
+    anyhow::ensure!(decoded == *claim, "withdrawal burn codec is not canonical");
+    Ok(bytes)
+}
+
+fn be_limbs(bytes: &[u8; 32]) -> [u32; 8] {
+    std::array::from_fn(|index| u32::from_be_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap()))
+}
+
+fn withdrawal_burn_key(nonce: &[u8; 32]) -> QHashOut<F> {
+    let nonce_hash = PoseidonHash::hash_no_pad(&be_limbs(nonce).map(F::from_canonical_u32));
+    QHashOut(PoseidonHash::hash_no_pad(&[F::from_canonical_u64(6), nonce_hash.elements[0], nonce_hash.elements[1], nonce_hash.elements[2], nonce_hash.elements[3]]))
+}
+
+
+fn fixed_siblings<const N: usize>(path: &MerkleProofCore<QHashOut<F>>, index: u64, value: QHashOut<F>, root: QHashOut<F>) -> Result<[HashOut<F>; N]> {
+    verify_path(path, root, index, value, N)?;
+    Ok(std::array::from_fn(|index| path.siblings[index].0))
+}
+
+struct MerkleUpdate<const N: usize> { siblings: [HashOut<F>; N], new_root: HashOut<F> }
+fn empty_subtree(leaf: HashOut<F>, height: usize) -> HashOut<F> {
+    let mut root = leaf;
+    for _ in 0..height { root = PoseidonHash::two_to_one(root, root); }
+    root
+}
+fn insert_nullifier<const N: usize>(nodes: &mut BTreeMap<(usize, u64), HashOut<F>>, leaf: HashOut<F>, index: u64, new_value: HashOut<F>) -> Result<MerkleUpdate<N>> {
+    anyhow::ensure!(index < 1u64 << N, "reward nullifier index exceeds its tree");
+    let siblings = std::array::from_fn(|level| nodes.get(&(level, (index >> level) ^ 1)).copied().unwrap_or_else(|| empty_subtree(leaf, level)));
+    let mut cursor = new_value;
+    nodes.insert((0, index), new_value);
+    for level in 0..N {
+        let parent = index >> (level + 1);
+        let right = (index >> level) & 1 == 1;
+        cursor = if right { PoseidonHash::two_to_one(siblings[level], cursor) } else { PoseidonHash::two_to_one(cursor, siblings[level]) };
+        nodes.insert((level + 1, parent), cursor);
+    }
+    Ok(MerkleUpdate { siblings, new_root: cursor })
+}
+fn encode_reward_anchor(anchor_id: u32, leaf: &PsyCheckpointLeaf<F>, path: &MerkleProofCore<QHashOut<F>>, roots: &PsyCheckpointGlobalStateRoots<F>, user: &PsyUserLeaf<F>, user_path: &MerkleProofCore<QHashOut<F>>) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(2696);
+    let felt = |value: F| { anyhow::ensure!(value.to_canonical_u64() < GOLDILOCKS_MODULUS, "noncanonical reward anchor field"); Ok(value.to_canonical_u64().to_le_bytes()) };
+    let hash = |bytes: &mut Vec<u8>, value: &QHashOut<F>| -> Result<()> { for limb in value.0.elements { bytes.extend_from_slice(&felt(limb)?); } Ok(()) };
+    bytes.extend_from_slice(&(u64::from(anchor_id)).to_le_bytes());
+    hash(&mut bytes, &leaf.global_chain_root)?;
+    for value in leaf.stats.to_qfelts() { bytes.extend_from_slice(&felt(value)?); }
+    for value in roots.to_qfelts() { bytes.extend_from_slice(&felt(value)?); }
+    anyhow::ensure!(path.siblings.len() == 32, "reward anchor checkpoint path is not height 32");
+    for sibling in &path.siblings { hash(&mut bytes, sibling)?; }
+    for value in [user.public_key, user.user_state_tree_root] { hash(&mut bytes, &value)?; }
+    for value in [user.balance, user.nonce, user.last_checkpoint_id, user.event_index, user.user_id] { bytes.extend_from_slice(&felt(value)?); }
+    anyhow::ensure!(user_path.siblings.len() == 32, "reward anchor user path is not height 32");
+    for sibling in &user_path.siblings { hash(&mut bytes, sibling)?; }
+    anyhow::ensure!(bytes.len() == 2696, "reward anchor codec is not canonical");
+    Ok(bytes)
+}
+
+fn withdrawal_claim_input(end: u32, end_root: [u64; 4], claim: &WithdrawalBurnRecord, proof: &WithdrawalBurnProof, sentinel: &psy_client_data::qdata::imt_proof::IMTMembershipProof<F>, ordinal: u8, policy: &BridgeTokenPolicy) -> Result<BridgeWithdrawalClaimInput> {
+    let end_hash = QHashOut::from_values(end_root[0], end_root[1], end_root[2], end_root[3]);
+    verify_path(&proof.checkpoint_path, end_hash, u64::from(end), proof.checkpoint_leaf.qfhash::<PsyHasher>(), psy_config::network_constants::CHECKPOINT_TREE_HEIGHT as usize)?;
+    anyhow::ensure!(proof.global_roots.qfhash::<PsyHasher>() == proof.checkpoint_leaf.global_chain_root, "withdrawal global roots mismatch");
+    anyhow::ensure!(proof.user_leaf.user_id == F::from_canonical_u32(claim.user_id), "withdrawal user mismatch");
+    verify_path(&proof.user_path, proof.global_roots.user_tree_root, u64::from(claim.user_id), proof.user_leaf.alghash::<PoseidonHash>(), psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize)?;
+    anyhow::ensure!(proof.contract_leaf == policy.approved_leaf, "withdrawal contract leaf differs from installed policy");
+    anyhow::ensure!(proof.contract_path.value != QHashOut::default(), "active withdrawal CSTATE root is empty");
+    verify_path(&proof.contract_path, proof.user_leaf.user_state_tree_root, u64::from(claim.contract_id), proof.contract_path.value, psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize)?;
+    verify_path(&proof.global_contract_path, proof.global_roots.contract_tree_root, u64::from(claim.contract_id), contract_leaf_hash(&proof.contract_leaf), psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize)?;
+    let state_root = proof.contract_path.value;
+    let member = &proof.record_membership;
+    anyhow::ensure!(member.merkle_proof.root == state_root && member.leaf.key == withdrawal_burn_key(&claim.nonce), "withdrawal namespace-6 membership mismatch");
+    anyhow::ensure!(sentinel.leaf.key == QHashOut::default() && sentinel.leaf.value.0.elements[0] != F::ZERO && sentinel.leaf.value.0.elements[1..].iter().all(|limb| *limb == F::ZERO) && sentinel.merkle_proof.index == u64::from(policy.map_base) && sentinel.merkle_proof.root == state_root, "withdrawal sentinel is not a positive installed map");
+    Ok(BridgeWithdrawalClaimInput {
+        end_checkpoint_id: end, end_checkpoint_root: end_hash.0, end_gusr: proof.global_roots.user_tree_root.0, end_gcon: proof.global_roots.contract_tree_root.0,
+        claims: vec![BridgeWithdrawalClaimWitness {
+            policy_ordinal: ordinal,
+            user_contract: UserContractState { checkpoint_tree_root: proof.checkpoint_path.root, user_leaf: proof.user_leaf, start_contract_state_root: state_root, contract_id: F::from_canonical_u32(claim.contract_id), checkpoint_id: F::from_canonical_u32(u32::from(claim.chain_index)) },
+            user_siblings: fixed_siblings(&proof.user_path, u64::from(claim.user_id), proof.user_leaf.alghash::<PoseidonHash>(), proof.global_roots.user_tree_root)?,
+            contract_siblings: fixed_siblings(&proof.contract_path, u64::from(claim.contract_id), state_root, proof.user_leaf.user_state_tree_root)?,
+            global_contract_siblings: fixed_siblings(&proof.global_contract_path, u64::from(claim.contract_id), contract_leaf_hash(&proof.contract_leaf), proof.global_roots.contract_tree_root)?,
+            member_index: u32::try_from(member.merkle_proof.index)?, member: member.leaf,
+            member_siblings: fixed_siblings(&member.merkle_proof, member.merkle_proof.index, imt_leaf_hash(&member.leaf), state_root)?,
+            sentinel: sentinel.leaf, sentinel_siblings: fixed_siblings(&sentinel.merkle_proof, u64::from(policy.map_base), imt_leaf_hash(&sentinel.leaf), state_root)?,
+            recipient: { let mut limbs = [0; 8]; limbs[3..].copy_from_slice(&be_limbs(&{ let mut bytes = [0; 32]; bytes[12..].copy_from_slice(&claim.recipient); bytes })[3..]); limbs },
+            token_address: policy.token_address, amount: be_limbs(&claim.amount), nonce: be_limbs(&claim.nonce),
+        }],
+    })
+}
+
+fn contract_leaf_hash(leaf: &psy_client_data::qdata::contract::PsyContractLeaf<F>) -> QHashOut<F> {
+    let inputs = std::iter::once(F::from_canonical_u64(0x434c_5633)).chain(leaf.to_qfelts()).collect::<Vec<_>>();
+    QHashOut(PoseidonHash::hash_no_pad(&inputs))
+}
+
+fn imt_leaf_hash(leaf: &IMTContractStateLeaf<F>) -> QHashOut<F> {
+    QHashOut(PoseidonHash::hash_no_pad(&leaf.to_qfelts()))
+}
+

@@ -416,14 +416,21 @@ pub enum IMTContractStateUpdate<F, Hash> {
         new_preimage: IMTContractStateLeaf<F, Hash>,
         delta_proof: DeltaMerkleProofCore<Hash>,
     },
-    /// Key insertion: new key added, predecessor pointers updated.
-    /// Produces two delta merkle proofs applied sequentially.
+    /// Key insertion: predecessor splice, member insertion, then sentinel count.
+    /// Produces three delta merkle proofs applied sequentially.
+    /// Discriminant 1 is unchanged.
     Insert {
         predecessor_old_preimage: IMTContractStateLeaf<F, Hash>,
         predecessor_new_preimage: IMTContractStateLeaf<F, Hash>,
         new_leaf_preimage: IMTContractStateLeaf<F, Hash>,
         predecessor_delta_proof: DeltaMerkleProofCore<Hash>,
         new_leaf_delta_proof: DeltaMerkleProofCore<Hash>,
+        /// Sentinel at R2, after the member write and any predecessor splice at B.
+        sentinel_old_preimage: IMTContractStateLeaf<F, Hash>,
+        /// Sentinel at R3, after the final count write.
+        sentinel_new_preimage: IMTContractStateLeaf<F, Hash>,
+        /// Third delta, R2 to R3. Its new root is the insertion's final root.
+        sentinel_delta_proof: DeltaMerkleProofCore<Hash>,
     },
 }
 
@@ -446,8 +453,36 @@ impl<F, Hash> IMTContractStateUpdate<F, Hash> {
     {
         match self {
             IMTContractStateUpdate::Update { delta_proof, .. } => delta_proof.new_root,
-            IMTContractStateUpdate::Insert { new_leaf_delta_proof, .. } => new_leaf_delta_proof.new_root,
+            IMTContractStateUpdate::Insert { sentinel_delta_proof, .. } => sentinel_delta_proof.new_root,
         }
+    }
+
+    /// Validate an untrusted serialized insertion before it is published or accepted.
+    ///
+    /// Predecessor, member, and sentinel deltas must join root to root and use one path height.
+    pub fn validate_imt_update(&self) -> anyhow::Result<()>
+    where
+        Hash: PartialEq,
+    {
+        if let IMTContractStateUpdate::Insert {
+            predecessor_delta_proof,
+            new_leaf_delta_proof,
+            sentinel_delta_proof,
+            ..
+        } = self
+        {
+            if predecessor_delta_proof.new_root != new_leaf_delta_proof.old_root
+                || new_leaf_delta_proof.new_root != sentinel_delta_proof.old_root
+            {
+                anyhow::bail!("IMT insert delta roots are not adjacent");
+            }
+            if predecessor_delta_proof.siblings.len() != new_leaf_delta_proof.siblings.len()
+                || new_leaf_delta_proof.siblings.len() != sentinel_delta_proof.siblings.len()
+            {
+                anyhow::bail!("IMT insert delta path heights differ");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -471,6 +506,9 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for IMTContractStateUpdate<F
                 new_leaf_preimage: IMTContractStateLeaf::qp_rand_gen(),
                 predecessor_delta_proof: DeltaMerkleProofCore::qp_rand_gen(),
                 new_leaf_delta_proof: DeltaMerkleProofCore::qp_rand_gen(),
+                sentinel_old_preimage: IMTContractStateLeaf::qp_rand_gen(),
+                sentinel_new_preimage: IMTContractStateLeaf::qp_rand_gen(),
+                sentinel_delta_proof: DeltaMerkleProofCore::qp_rand_gen(),
             }
         }
     }
@@ -488,19 +526,27 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for IMTContrac
                 old_preimage,
                 new_preimage,
                 delta_proof,
-            } => old_preimage.pio_serialized_size() + new_preimage.pio_serialized_size() + delta_proof.pio_serialized_size(),
+            } => {
+                1 + old_preimage.pio_serialized_size() + new_preimage.pio_serialized_size() + delta_proof.pio_serialized_size()
+            }
             IMTContractStateUpdate::Insert {
                 predecessor_old_preimage,
                 predecessor_new_preimage,
                 new_leaf_preimage,
                 predecessor_delta_proof,
                 new_leaf_delta_proof,
+                sentinel_old_preimage,
+                sentinel_new_preimage,
+                sentinel_delta_proof,
             } => {
-                predecessor_old_preimage.pio_serialized_size()
+                1 + predecessor_old_preimage.pio_serialized_size()
                     + predecessor_new_preimage.pio_serialized_size()
                     + new_leaf_preimage.pio_serialized_size()
                     + predecessor_delta_proof.pio_serialized_size()
                     + new_leaf_delta_proof.pio_serialized_size()
+                    + sentinel_old_preimage.pio_serialized_size()
+                    + sentinel_new_preimage.pio_serialized_size()
+                    + sentinel_delta_proof.pio_serialized_size()
             }
         }
     }
@@ -523,6 +569,9 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for IMTContrac
                 new_leaf_preimage,
                 predecessor_delta_proof,
                 new_leaf_delta_proof,
+                sentinel_old_preimage,
+                sentinel_new_preimage,
+                sentinel_delta_proof,
             } => {
                 writer.psy_write_u8(1)?; // variant discriminant
                 predecessor_old_preimage.pio_write_to_io(writer)?;
@@ -530,6 +579,9 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for IMTContrac
                 new_leaf_preimage.pio_write_to_io(writer)?;
                 predecessor_delta_proof.pio_write_to_io(writer)?;
                 new_leaf_delta_proof.pio_write_to_io(writer)?;
+                sentinel_old_preimage.pio_write_to_io(writer)?;
+                sentinel_new_preimage.pio_write_to_io(writer)?;
+                sentinel_delta_proof.pio_write_to_io(writer)?;
             }
         }
         Ok(())
@@ -554,12 +606,18 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for IMTContrac
                 let new_leaf_preimage = IMTContractStateLeaf::<F, Hash>::pio_read_from_io(reader)?;
                 let predecessor_delta_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
                 let new_leaf_delta_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
+                let sentinel_old_preimage = IMTContractStateLeaf::<F, Hash>::pio_read_from_io(reader)?;
+                let sentinel_new_preimage = IMTContractStateLeaf::<F, Hash>::pio_read_from_io(reader)?;
+                let sentinel_delta_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
                 Ok(IMTContractStateUpdate::Insert {
                     predecessor_old_preimage,
                     predecessor_new_preimage,
                     new_leaf_preimage,
                     predecessor_delta_proof,
                     new_leaf_delta_proof,
+                    sentinel_old_preimage,
+                    sentinel_new_preimage,
+                    sentinel_delta_proof,
                 })
             }
             _ => anyhow::bail!("Invalid discriminant for IMTContractStateUpdate"),
@@ -623,11 +681,13 @@ impl<F, Hash> IMTContractStateUpdateHistory<F, Hash> {
                     IMTContractStateUpdate::Insert {
                         predecessor_delta_proof,
                         new_leaf_delta_proof,
+                        sentinel_delta_proof,
                         ..
                     } => {
-                        // Insert produces two delta proofs: predecessor update + new leaf
+                        // Insert produces three delta proofs: predecessor, member, then sentinel.
                         count += predecessor_delta_proof.siblings.len() + 2;
                         count += new_leaf_delta_proof.siblings.len() + 2;
+                        count += sentinel_delta_proof.siblings.len() + 2;
                     }
                 }
             }
@@ -889,20 +949,23 @@ mod imt_encoding_tests {
         let insert = IMTContractStateUpdate::Insert {
             predecessor_old_preimage: leaf.clone(),
             predecessor_new_preimage: leaf.clone(),
-            new_leaf_preimage: leaf,
+            new_leaf_preimage: leaf.clone(),
             predecessor_delta_proof: proof(3, 4, 2),
             new_leaf_delta_proof: proof(4, 5, 4),
+            sentinel_old_preimage: leaf.clone(),
+            sentinel_new_preimage: leaf,
+            sentinel_delta_proof: proof(5, 6, 1),
         };
         assert_eq!(update.old_root(), PHash::from_u64x4([1, 0, 0, 0]));
         assert_eq!(update.new_root(), PHash::from_u64x4([2, 0, 0, 0]));
         assert_eq!(insert.old_root(), PHash::from_u64x4([3, 0, 0, 0]));
-        assert_eq!(insert.new_root(), PHash::from_u64x4([5, 0, 0, 0]));
+        assert_eq!(insert.new_root(), PHash::from_u64x4([6, 0, 0, 0]));
 
         let history = IMTContractStateUpdateHistory {
             user_contract_tree_update_proof: proof(0, 0, 0),
             imt_updates: vec![update, insert],
         };
-        assert_eq!(history.get_double_id_nodes_size_hint(), (3 + 2) + (2 + 2) + (4 + 2));
+        assert_eq!(history.get_double_id_nodes_size_hint(), (3 + 2) + (2 + 2) + (4 + 2) + (1 + 2));
         assert_eq!(
             IMTContractStateUpdateHistory::<PF, PHash> {
                 user_contract_tree_update_proof: proof(0, 0, 0),
@@ -923,6 +986,7 @@ mod imt_encoding_tests {
         };
         let bytes = update.fallback_psy_ser_to_bytes_vec().unwrap();
         assert_eq!(bytes[0], 0);
+        assert_eq!(bytes.len(), update.pio_serialized_size());
         assert_eq!(
             IMTContractStateUpdate::<PF, PHash>::fallback_psy_ser_from_slice(&bytes).unwrap(),
             update
@@ -948,18 +1012,20 @@ mod imt_encoding_tests {
         let insert = IMTContractStateUpdate::Insert {
             predecessor_old_preimage: leaf.clone(),
             predecessor_new_preimage: leaf.clone(),
-            new_leaf_preimage: leaf,
+            new_leaf_preimage: leaf.clone(),
             predecessor_delta_proof: delta_of(3, 4, 2),
             new_leaf_delta_proof: delta_of(4, 5, 4),
+            sentinel_old_preimage: leaf.clone(),
+            sentinel_new_preimage: leaf,
+            sentinel_delta_proof: delta_of(5, 6, 1),
         };
         // The fallback writer prefixes the variant discriminant; the insert
         // variant must use discriminant 1.
         let bytes = insert.fallback_psy_ser_to_bytes_vec().unwrap();
         assert_eq!(bytes[0], 1, "insert variant must use discriminant 1");
-        // NOTE: `fallback_pio_serialized_size` does not account for the
-        // discriminant byte, so no exact size assertion is made here.
+        assert_eq!(bytes.len(), insert.pio_serialized_size());
         assert_eq!(insert.old_root(), PHash::from_u64x4([3, 0, 0, 0]));
-        assert_eq!(insert.new_root(), PHash::from_u64x4([5, 0, 0, 0]));
+        assert_eq!(insert.new_root(), PHash::from_u64x4([6, 0, 0, 0]));
 
         // Round trip through the canonical (speedy) encoding, which is the
         // production path with the default feature set.
@@ -994,9 +1060,12 @@ mod imt_encoding_tests {
                 IMTContractStateUpdate::Insert {
                     predecessor_old_preimage: leaf.clone(),
                     predecessor_new_preimage: leaf.clone(),
-                    new_leaf_preimage: leaf,
+                    new_leaf_preimage: leaf.clone(),
                     predecessor_delta_proof: delta_of(3, 4, 2),
                     new_leaf_delta_proof: delta_of(4, 5, 4),
+                    sentinel_old_preimage: leaf.clone(),
+                    sentinel_new_preimage: leaf,
+                    sentinel_delta_proof: delta_of(5, 6, 1),
                 },
             ],
         };
@@ -1030,5 +1099,73 @@ mod imt_encoding_tests {
                 history
             );
         }
+    }
+
+    fn chained_insert(heights: [usize; 3]) -> IMTContractStateUpdate<PF, PHash> {
+        let leaf = IMTContractStateLeaf::<PF, PHash>::default();
+        IMTContractStateUpdate::Insert {
+            predecessor_old_preimage: leaf.clone(),
+            predecessor_new_preimage: leaf.clone(),
+            new_leaf_preimage: leaf.clone(),
+            predecessor_delta_proof: delta_of(3, 4, heights[0]),
+            new_leaf_delta_proof: delta_of(4, 5, heights[1]),
+            sentinel_old_preimage: leaf.clone(),
+            sentinel_new_preimage: leaf,
+            sentinel_delta_proof: delta_of(5, 6, heights[2]),
+        }
+    }
+
+    #[test]
+    fn insert_encoding_keeps_discriminant_and_appends_sentinel() {
+        let insert = chained_insert([2, 4, 1]);
+        let bytes = insert.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes[0], 1);
+        // Two fixed leaves plus one delta, after the retained predecessor and member payload.
+        let two_leaf_delta = 104 + 104 + delta_of(5, 6, 1).pio_serialized_size();
+        assert_eq!(insert.pio_serialized_size(), bytes.len());
+        assert!(insert.pio_serialized_size() > two_leaf_delta);
+
+        let restored = IMTContractStateUpdate::<PF, PHash>::fallback_psy_ser_from_slice(&bytes).unwrap();
+        match restored {
+            IMTContractStateUpdate::Insert {
+                predecessor_delta_proof,
+                new_leaf_delta_proof,
+                sentinel_delta_proof,
+                ..
+            } => {
+                assert_eq!(predecessor_delta_proof.siblings.len(), 2);
+                assert_eq!(new_leaf_delta_proof.siblings.len(), 4);
+                assert_eq!(sentinel_delta_proof.siblings.len(), 1);
+                assert_eq!(predecessor_delta_proof.new_root, new_leaf_delta_proof.old_root);
+                assert_eq!(new_leaf_delta_proof.new_root, sentinel_delta_proof.old_root);
+                assert_eq!(insert.new_root(), sentinel_delta_proof.new_root);
+            }
+            IMTContractStateUpdate::Update { .. } => panic!("insert decoded as update"),
+        }
+
+        // A payload ending after the second delta is the former two-write encoding.
+        let truncated = &bytes[..bytes.len() - two_leaf_delta];
+        assert!(IMTContractStateUpdate::<PF, PHash>::fallback_psy_ser_from_slice(truncated).is_err());
+    }
+
+    #[test]
+    fn validate_imt_update_rejects_broken_root_adjacency_and_unequal_heights() {
+        let valid = chained_insert([2, 2, 2]);
+        assert!(valid.validate_imt_update().is_ok());
+
+        let mut broken_join = chained_insert([2, 2, 2]);
+        if let IMTContractStateUpdate::Insert {
+            new_leaf_delta_proof,
+            sentinel_delta_proof,
+            ..
+        } = &mut broken_join
+        {
+            sentinel_delta_proof.old_root = PHash::from_u64x4([9, 0, 0, 0]);
+            assert_ne!(new_leaf_delta_proof.new_root, sentinel_delta_proof.old_root);
+        }
+        assert!(broken_join.validate_imt_update().is_err());
+
+        let unequal = chained_insert([2, 3, 2]);
+        assert!(unequal.validate_imt_update().is_err());
     }
 }

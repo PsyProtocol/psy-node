@@ -25,11 +25,11 @@ use plonky2::{
 };
 use psy_client_data::{
     bridge_aggregate::{
-        bind_claim_tree, deposit_leaf_path, deposit_leaf_tree, DepositAggregateOpening,
-        ChainConfig, ChainStart, DepositLeaf, DepositLeafRange, DepositTransition,
-        InclusionAggregateHeader, NetworkConfig, RewardSessionProofFields, SourceCheckpointRewardLeaf,
+        bind_claim_tree, deposit_aggregate_pi_len, DepositAggregateOpening,
+        ChainConfig, ChainStart, DepositLeaf, DepositTransition,
+        ClaimPublicationHeader, NetworkConfig, RewardSessionProofFields, SourceCheckpointRewardLeaf,
         SourceCheckpointRewardOpening, WithdrawalAggregateOpening, WithdrawalLeaf,
-        INCLUSION_AGGREGATE_CAPACITIES, REWARD_PUBLICATION_FAMILY, WITHDRAWAL_PUBLICATION_FAMILY,
+        CLAIM_TREE_CAPACITIES, REWARD_PUBLICATION_FAMILY, WITHDRAWAL_PUBLICATION_FAMILY,
     },
     qdata::{checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf}, user::PsyUserLeaf},
 };
@@ -62,8 +62,7 @@ use psy_plonky2_circuits::{
         circuits::{
             bridge_agg_chain::{BridgeAggChainBoundary, BridgeAggChainCircuit},
             bridge_agg_final::{BridgeAggFinalSlotWitness, BridgeAggFinalEndpointWitness},
-            chain_aggregate::{ChainContext, ChainRow},
-            settlement_aggregate::{AggregateWindow, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths, AGGREGATE_PI_LEN},
+            aggregate::{AggregateWindow, RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths, AGGREGATE_PI_LEN},
             reward_inclusion::RewardTagWitness,
             reward_session::{RewardLedgerStateValues, RewardSessionJobWitness, RewardSessionWitness},
         },
@@ -106,7 +105,11 @@ const CHAIN_INDICES: [u8; 3] = [0, 1, 2];
 fn circuits() -> anyhow::Result<&'static (QEDCoordinatorCircuitManager<C, D>, AggregateCircuits)> {
     static CACHE: LazyLock<anyhow::Result<(QEDCoordinatorCircuitManager<C, D>, AggregateCircuits)>> = LazyLock::new(|| {
         let (_, coordinator) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(PsyChainNetworkType::LocalDevnet)?;
-        let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(&CHAIN_INDICES, &coordinator, AggregateCircuitHeights {
+        let (checkpoint_common_data, checkpoint_cap_height, checkpoint_fingerprint) = {
+            let checkpoint = &coordinator.checkpoint_root_transition;
+            (checkpoint.get_common_circuit_data_ref(), checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(), checkpoint.get_fingerprint())
+        };
+        let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(&CHAIN_INDICES, checkpoint_common_data, checkpoint_cap_height, checkpoint_fingerprint, AggregateCircuitHeights {
             deposit_state_tree: DEPOSIT_STATE_TREE_HEIGHT,
             withdrawal_state_tree: WITHDRAWAL_STATE_TREE_HEIGHT,
         })?;
@@ -401,15 +404,8 @@ fn hash4(value: QHashOut<F>) -> [u64; 4] {
 }
 
 fn deposit_hash(leaf: &DepositLeaf) -> QHashOut<F> {
-    let mut bytes = Vec::with_capacity(164);
-    bytes.extend(leaf.shield_address);
-    bytes.extend([0; 12]);
-    bytes.extend(leaf.token);
-    bytes.extend(leaf.l2_token_contract_id);
-    bytes.extend(leaf.amount);
-    bytes.extend(u32::from(leaf.chain_index).to_be_bytes());
-    bytes.extend(leaf.note_commitment);
-    source_hash(&bytes)
+    let hash = leaf.poseidon_hash().expect("deposit leaf poseidon hash");
+    QHashOut(HashOut { elements: hash.map(F::from_canonical_u64) })
 }
 
 fn withdrawal_hash(leaf: &WithdrawalLeaf) -> QHashOut<F> {
@@ -427,7 +423,7 @@ fn source_hash(bytes: &[u8]) -> QHashOut<F> {
     QHashOut(PoseidonHash::hash_no_pad(&words))
 }
 
-fn withdrawal_paths_for(config: &NetworkConfig, ends: &[ChainState]) -> anyhow::Result<Vec<psy_plonky2_circuits::bridge::circuits::settlement_aggregate::WithdrawalRootPath>> {
+fn withdrawal_paths_for(config: &NetworkConfig, ends: &[ChainState]) -> anyhow::Result<Vec<psy_plonky2_circuits::bridge::circuits::aggregate::WithdrawalRootPath>> {
     withdrawal_root_paths(config, &ends.iter().map(|end| end.withdrawal_root).collect::<Vec<_>>())
 }
 
@@ -450,13 +446,8 @@ fn copy_job(job: &RewardSessionJobWitness) -> RewardSessionJobWitness {
 }
 
 
-fn assert_opening_digest(proof: &ProofWithPublicInputs<F, C, D>, family: u32, variant: u32, digest: [u8; 32]) {
-    assert_eq!(proof.public_inputs.len(), 12);
-    assert_eq!(&proof.public_inputs[..4], &[1, family, variant, 0].map(F::from_canonical_u32));
-    assert_eq!(pi_bytes(&proof.public_inputs[4..12]), digest);
-}
 
-fn assert_withdrawal_publication(proof: &ProofWithPublicInputs<F, C, D>, header: &InclusionAggregateHeader) {
+fn assert_withdrawal_publication(proof: &ProofWithPublicInputs<F, C, D>, header: &ClaimPublicationHeader) {
     let words = header.publication_words().expect("withdrawal publication words");
     assert_eq!(words.len(), AGGREGATE_PI_LEN);
     assert_eq!(proof.public_inputs, words.map(F::from_canonical_u32));
@@ -466,16 +457,16 @@ fn assert_withdrawal_publication(proof: &ProofWithPublicInputs<F, C, D>, header:
     assert_eq!(pi_bytes(&proof.public_inputs[20..28]), header.header_digest().expect("withdrawal header digest"));
 }
 
-fn withdrawal_publication_header(config: &NetworkConfig, opening: &WithdrawalAggregateOpening) -> anyhow::Result<InclusionAggregateHeader> {
+fn withdrawal_publication_header(config: &NetworkConfig, opening: &WithdrawalAggregateOpening) -> anyhow::Result<ClaimPublicationHeader> {
     let count = u32::try_from(opening.withdrawals.len()).context("withdrawal publication count exceeds u32")?;
-    anyhow::ensure!(count <= INCLUSION_AGGREGATE_CAPACITIES[0], "manager withdrawal publication capacity is 1024");
-    let mut header = InclusionAggregateHeader {
+    anyhow::ensure!(count <= CLAIM_TREE_CAPACITIES[0], "manager withdrawal publication capacity is 1024");
+    let mut header = ClaimPublicationHeader {
         family: WITHDRAWAL_PUBLICATION_FAMILY,
         config_hash: opening.config_hash,
         window_id: opening.window_id,
         end_checkpoint_id: opening.end_checkpoint_id,
         end_checkpoint_root: opening.end_checkpoint_root,
-        aggregate_capacity: INCLUSION_AGGREGATE_CAPACITIES[0],
+        aggregate_capacity: CLAIM_TREE_CAPACITIES[0],
         total_count: count,
         segment_count: u32::from(count != 0),
         segment_index: 0,
@@ -562,17 +553,17 @@ fn ledger_state_root(state: &RewardLedgerStateValues) -> [u64; 4] {
     poseidon_bytes(&bytes)
 }
 
-fn reward_publication_header(opening: &SourceCheckpointRewardOpening, old_ledger_state_root: [u64; 4], new_ledger_state_root: [u64; 4]) -> anyhow::Result<InclusionAggregateHeader> {
+fn reward_publication_header(opening: &SourceCheckpointRewardOpening, old_ledger_state_root: [u64; 4], new_ledger_state_root: [u64; 4]) -> anyhow::Result<ClaimPublicationHeader> {
     let count = u32::try_from(opening.leaves.len()).context("reward publication count exceeds u32")?;
-    anyhow::ensure!(count <= INCLUSION_AGGREGATE_CAPACITIES[0], "manager reward publication capacity is 1024");
-    let mut header = InclusionAggregateHeader {
+    anyhow::ensure!(count <= CLAIM_TREE_CAPACITIES[0], "manager reward publication capacity is 1024");
+    let mut header = ClaimPublicationHeader {
         family: REWARD_PUBLICATION_FAMILY, config_hash: opening.config_hash, window_id: opening.window_id,
         end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root: opening.end_checkpoint_root,
-        aggregate_capacity: INCLUSION_AGGREGATE_CAPACITIES[0], total_count: count, segment_count: u32::from(count != 0),
+        aggregate_capacity: CLAIM_TREE_CAPACITIES[0], total_count: count, segment_count: u32::from(count != 0),
         segment_index: 0, first_ordinal: 0, count, withdrawal_roots: Vec::new(),
         old_ledger_state_root: Some(old_ledger_state_root), new_ledger_state_root: Some(new_ledger_state_root),
         opening_digest: opening.opening_digest()?,
-        claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], INCLUSION_AGGREGATE_CAPACITIES[0] as usize)?[0],
+        claim_tree_root: psy_client_data::bridge_aggregate::build_claim_tree(&[], CLAIM_TREE_CAPACITIES[0] as usize)?[0],
     };
     bind_claim_tree(&mut header, &opening.leaves.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?)?;
     header.validate()?;
@@ -581,7 +572,7 @@ fn reward_publication_header(opening: &SourceCheckpointRewardOpening, old_ledger
 
 struct RewardSessionFixture<'a> {
     opening: SourceCheckpointRewardOpening,
-    header: InclusionAggregateHeader,
+    header: ClaimPublicationHeader,
     witness: RewardSessionWitness<'a>,
     old_state: RewardLedgerStateValues,
     new_state: RewardLedgerStateValues,
@@ -736,19 +727,31 @@ fn array_siblings<const HEIGHT: usize>(leaves: &[(u64, [u64; 4])], index: u64, h
 
 
 
-fn chain_proofs(circuits: &AggregateCircuits, config: &NetworkConfig, a: &DepositAggregateOpening,
-    webs: &[Vec<ProofWithPublicInputs<F, C, D>>], tree: &[[u8; 32]],
-) -> anyhow::Result<Vec<ProofWithPublicInputs<F, C, D>>> {
-    let context = ChainContext { config_hash: a.config_hash, end_checkpoint_id: a.end_checkpoint_id,
-        end_checkpoint_root: a.end_checkpoint_root, global_deposit_leaf_root: tree[0], global_deposit_count: a.deposit_leaves.len() as u32 };
-    let mut first = 0;
-    (0..CHAIN_INDICES.len()).map(|ordinal| {
-        let range = DepositLeafRange { first_leaf: first, leaf_count: a.deposits[ordinal].new_count - a.deposits[ordinal].old_count };
-        first += range.leaf_count;
-        let row = ChainRow { start: a.starts[ordinal].clone(), transition: a.deposits[ordinal].clone(), range };
-        circuits.chains.prove(config, &context, ordinal as u32, &row, &webs[ordinal])
-    }).collect()
+fn deposit_public_inputs(opening: &DepositAggregateOpening) -> Vec<F> {
+    let mut expected = vec![2u64, 11, 1, 0];
+    let bytes = |value: &[u8]| value.chunks_exact(4).map(|word| u64::from(u32::from_be_bytes(word.try_into().unwrap()))).collect::<Vec<_>>();
+    expected.extend(bytes(&opening.config_hash));
+    expected.extend(bytes(&opening.window_id));
+    expected.extend([opening.end_checkpoint_id as u32 as u64, opening.end_checkpoint_id >> 32]);
+    expected.extend(opening.end_checkpoint_root);
+    expected.push(opening.deposit_leaves.len() as u64);
+    for (start, transition) in opening.starts.iter().zip(&opening.deposits) {
+        expected.extend([u64::from(start.chain_index), start.start_checkpoint_id as u32 as u64, start.start_checkpoint_id >> 32]);
+        expected.extend(start.start_checkpoint_root);
+        expected.extend(transition.old_root);
+        expected.extend(transition.new_root);
+        expected.extend([u64::from(transition.old_count), u64::from(transition.new_count)]);
+    }
+    for leaf in &opening.deposit_leaves {
+        expected.extend([u64::from(leaf.chain_index), u64::from(leaf.absolute_index)]);
+        for value in [&leaf.shield_address[..], &leaf.token[..], &leaf.l2_token_contract_id[..], &leaf.amount[..], &leaf.note_commitment[..]] {
+            expected.extend(bytes(value));
+        }
+    }
+    expected.resize(deposit_aggregate_pi_len(opening.starts.len()), 0);
+    expected.into_iter().map(F::from_canonical_u64).collect()
 }
+
 
 #[test]
 fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result<()> {
@@ -765,27 +768,38 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
         chain_index, sender_user_id: 1000, recipient: [8; 20], token: [5; 20], amount: word(7), nonce: word(u64::from(chain_index) + 1),
     }).collect();
     let withdrawal_paths: Vec<_> = withdrawals.iter().map(|leaf| path(&[(0, withdrawal_hash(leaf))], 0, WITHDRAWAL_TREE_HEIGHT)).collect();
-    let mut custody: Vec<Vec<(u64, QHashOut<F>)>> = vec![(0..31).map(|i| (i, qhash(i + 1))).collect(), Vec::new(), Vec::new()];
+    let mut deposit_hashes: Vec<Vec<(u64, QHashOut<F>)>> = vec![(0..31).map(|i| (i, qhash(i + 1))).collect(), Vec::new(), Vec::new()];
     let empty_root = PoseidonHasher::get_zero_hash(32);
-    let old_roots = [path(&custody[0], 0, 32).root, empty_root, empty_root];
-    let mut append_proofs = Vec::new();
-    for leaf in &deposits {
+    let old_roots = [path(&deposit_hashes[0], 0, 32).root, empty_root, empty_root];
+    let mut pages = Vec::new();
+    let mut first_leaf = 0u32;
+    let mut page_start = None;
+    for (index, leaf) in deposits.iter().enumerate() {
+        let next = deposits.get(index + 1);
+        let closes = next.is_none_or(|next| next.chain_index != leaf.chain_index || next.absolute_index / 32 != leaf.absolute_index / 32);
+        if page_start.is_none() { page_start = Some(index); }
+        if !closes { continue; }
+        let start = page_start.take().expect("page start");
         let chain = leaf.chain_index as usize;
-        let base = u64::from(leaf.absolute_index / 32) * 32;
-        let old_path = path(&custody[chain].iter().copied().chain([(u64::from(leaf.absolute_index), QHashOut::ZERO)]).collect::<Vec<_>>(), u64::from(leaf.absolute_index), 32);
-        let old_leaves: Vec<_> = (base..base + 32).map(|index| custody[chain].iter().find(|(i, _)| *i == index).map_or(QHashOut::ZERO, |(_, hash)| *hash)).collect();
-        let mut new_leaves = old_leaves.clone();
-        new_leaves[leaf.absolute_index as usize % 32] = deposit_hash(leaf);
-        append_proofs.push(SpidermanUpdateProof {
-            top_line_proof: DeltaMerkleProofCore::from_params::<PoseidonHasher>(base / 32,
-                PoseidonHasher::compute_root_from_leaves(&old_leaves).context("old web")?,
-                PoseidonHasher::compute_root_from_leaves(&new_leaves).context("new web")?, old_path.siblings[5..].to_vec()),
-            web_proof_old_leaves: old_leaves, web_proof_new_leaves: new_leaves,
+        let base = u64::from(deposits[start].absolute_index / 32) * 32;
+        let old_leaves: Vec<_> = (base..base + 32).map(|index| deposit_hashes[chain].iter().find(|(i, _)| *i == index).map_or(QHashOut::ZERO, |(_, hash)| *hash)).collect();
+        let old_path = path(&deposit_hashes[chain].iter().copied().chain([(base, QHashOut::ZERO)]).collect::<Vec<_>>(), base, 32);
+        for record in &deposits[start..=index] { deposit_hashes[chain].push((u64::from(record.absolute_index), deposit_hash(record))); }
+        let new_leaves: Vec<_> = (base..base + 32).map(|index| deposit_hashes[chain].iter().find(|(i, _)| *i == index).map_or(QHashOut::ZERO, |(_, hash)| *hash)).collect();
+        let leaf_count = (index - start + 1) as u32;
+        pages.push(DepositSpidermanAppendInputs {
+            chain_index: leaf.chain_index, old_count: deposits[start].absolute_index, first_leaf, leaf_count,
+            append_proof: SpidermanUpdateProof {
+                top_line_proof: DeltaMerkleProofCore::from_params::<PoseidonHasher>(base / 32,
+                    PoseidonHasher::compute_root_from_leaves(&old_leaves).context("old page")?,
+                    PoseidonHasher::compute_root_from_leaves(&new_leaves).context("new page")?, old_path.siblings[5..].to_vec()),
+                web_proof_old_leaves: old_leaves, web_proof_new_leaves: new_leaves,
+            },
         });
-        custody[chain].push((u64::from(leaf.absolute_index), deposit_hash(leaf)));
+        first_leaf += leaf_count;
     }
     let ends: Vec<_> = (0..3).map(|chain| ChainState {
-        chain_index: chain as u8, deposit_root: hash4(if chain == 2 { empty_root } else { path(&custody[chain], 0, 32).root }),
+        chain_index: chain as u8, deposit_root: hash4(if chain == 2 { empty_root } else { path(&deposit_hashes[chain], 0, 32).root }),
         deposit_count: [33, 1, 0][chain], withdrawal_root: hash4(withdrawal_paths[chain].root),
     }).collect();
     let checkpoint = checkpoint(coordinator, bridge_state(&ends, public_key))?;
@@ -794,7 +808,7 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
         circuit_set_hash: circuits.circuit_set_hash(),
         chains: (0..3).map(|chain_index| ChainConfig { chain_index, chain_id: word(u64::from(chain_index) + 1), bridge: [1; 20], state_manager: [2; 20], bootstrap_id: 0, bootstrap_root: hash4(checkpoint.genesis_tree_root) }).collect(),
         ethereum_index: 0, reward_payer: [3; 20], reward_token: [4; 20], reward_per_claim: word(1), reward_token_decimals: 18,
-        reward_cutover: 0, reward_end_exclusive: 2, max_deposits: 1024, max_withdrawals: 1024, max_rewards: 1024,
+        max_withdrawals: 1024, max_rewards: 1024,
     };
     let mut a = DepositAggregateOpening {
         config_hash: config.config_hash()?, window_id: [0; 32], end_checkpoint_id: 1, end_checkpoint_root: hash4(checkpoint.tree_root),
@@ -808,18 +822,10 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     let reward_session = reward_session_fixture(circuits, &config, a.window_id, &checkpoint, private_key, &reward_authorization, &reward_jobs)?;
     let rewards_opening = reward_session.opening.clone();
     a.validate(&config)?; withdrawals_opening.validate(&config)?; rewards_opening.encode()?;
-    let tree = deposit_leaf_tree(&a.deposit_leaves.iter().map(DepositLeaf::leaf_commit).collect::<Result<Vec<_>, _>>()?)?;
-    let web_inputs: Vec<_> = a.deposit_leaves.iter().enumerate().map(|(i, leaf)| Ok(DepositSpidermanAppendInputs {
-        config_hash: a.config_hash, end_checkpoint_id: 1, end_checkpoint_root: checkpoint.tree_root, chain_index: leaf.chain_index,
-        old_count: leaf.absolute_index, first_leaf: i as u32, global_deposit_leaf_root: tree[0], global_deposit_count: 3,
-        leaf_paths: vec![deposit_leaf_path(&tree, 3, i as u32)?], deposits: vec![leaf.clone()], append_proof: append_proofs[i].clone(),
-    })).collect::<anyhow::Result<_>>()?;
-    let mut webs = vec![Vec::new(), Vec::new(), Vec::new()];
-    for input in &web_inputs { webs[input.chain_index as usize].push(circuits.deposit.prove(input)?); }
-    let chains = chain_proofs(circuits, &config, &a, &webs, &tree)?;
-    let proof_a = circuits.prove_deposit_aggregate(&config, &a, &chains)?;
+    let proof_a = circuits.prove_deposit_aggregate(&config, &a, &pages)?;
     circuits.deposit_aggregate.circuit_data.verify(proof_a.clone())?;
-    assert_opening_digest(&proof_a, 11, 1, a.opening_digest(&config)?);
+    assert_eq!(proof_a.public_inputs, deposit_public_inputs(&a));
+
 
     let endpoints = ends.iter().enumerate().map(|(ordinal, end)| {
         let root = |contract: usize| TreeRootInContractStateWitnessInput {
@@ -886,7 +892,7 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
             4 => changed.deposits[0].new_count += 1,
             _ => { changed.starts.pop(); changed.deposits.pop(); },
         }
-        rejects(|| circuits.prove_deposit_aggregate(&config, &changed, &chains).map(|_| ()));
+        rejects(|| circuits.prove_deposit_aggregate(&config, &changed, &pages).map(|_| ()));
     }
     for mutation in 0..9 {
         let mut changed = withdrawals_opening.clone();
@@ -916,25 +922,15 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
         let changed_header = reward_publication_header(&changed, reward_session.statement.old_ledger_state_root, reward_session.statement.new_ledger_state_root);
         rejects(|| changed_header.and_then(|header| circuits.prove_reward_aggregate(&config, &changed, &header, &tip, &reward_leaves).map(|_| ())));
     }
-    // Witness assignment must succeed here: only the prover may reject these constraints.
     for mutation in 0..4 {
-        let original = &web_inputs[0];
-        let mut changed = DepositSpidermanAppendInputs {
-            config_hash: original.config_hash, end_checkpoint_id: original.end_checkpoint_id,
-            end_checkpoint_root: original.end_checkpoint_root, chain_index: original.chain_index,
-            old_count: original.old_count, first_leaf: original.first_leaf,
-            global_deposit_leaf_root: original.global_deposit_leaf_root, global_deposit_count: original.global_deposit_count,
-            leaf_paths: original.leaf_paths.clone(), deposits: original.deposits.clone(), append_proof: original.append_proof.clone(),
-        };
+        let mut changed = pages.clone();
         match mutation {
-            0 => changed.leaf_paths[0][0][0] ^= 1,
-            1 => changed.first_leaf = 1,
-            2 => changed.append_proof.web_proof_old_leaves[31] = qhash(999),
-            _ => changed.deposits[0].absolute_index += 1,
+            0 => changed[0].first_leaf = 1,
+            1 => changed.swap(0, 1),
+            2 => changed[0].append_proof.web_proof_old_leaves[31] = qhash(999),
+            _ => changed[0].leaf_count -= 1,
         }
-        let mut witness = plonky2::iop::witness::PartialWitness::new();
-        circuits.deposit.set_witness(&mut witness, &changed)?;
-        assert!(circuits.deposit.circuit_data.prove(witness).is_err(), "invalid web constraints proved");
+        rejects(|| circuits.prove_deposit_aggregate(&config, &a, &changed).map(|_| ()));
     }
     // Endpoint storage authentication now belongs exclusively to the finalizer.
     for mutation in 0..4 {
@@ -1040,7 +1036,7 @@ fn real_multichain_artifacts_bind_nonempty_complete_openings() -> anyhow::Result
     rejects(|| circuits.prove_reward_aggregate(&config, &rewards_opening, &reward_header, &forked_tip, &reward_leaves).map(|_| ()));
 
     let mut wrong_config = config.clone(); wrong_config.circuit_set_hash[0] ^= 1;
-    rejects(|| circuits.prove_deposit_aggregate(&wrong_config, &a, &chains).map(|_| ()));
+    rejects(|| circuits.prove_deposit_aggregate(&wrong_config, &a, &pages).map(|_| ()));
     circuits.validate_registrations(circuits.registrations())?;
     let mut changed_pin = circuits.registrations().to_vec();
     changed_pin[0].verifier_digest[0] ^= 1;

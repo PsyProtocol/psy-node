@@ -1609,8 +1609,8 @@ fn network_l1_token(wallet: &WalletManager, network: &NetworkId, chain_index: u3
     wallet.l1_token_address(network, chain_index, token)
 }
 
-/// Slot holding the note-tree root in the token contract's state.
-const NOTE_ROOT_SLOT: u64 = 2_147_483_649;
+/// Leaf holding the note-tree root in the token contract's state.
+const NOTE_ROOT_SLOT: u64 = 0;
 
 impl ServerHandler for PsyWalletServer {
     fn get_info(&self) -> ServerInfo {

@@ -1,4 +1,4 @@
-use std::{array, fs, path::PathBuf, str::FromStr, sync::Arc, sync::OnceLock};
+use std::{array, fs, path::{Path, PathBuf}, str::FromStr, sync::Arc, sync::OnceLock};
 
 use anyhow::Context;
 use alloy_primitives::{keccak256, Address, B256, Bytes, U256};
@@ -16,18 +16,24 @@ use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::ProvingJob
 use psy_data::{
     v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafCompact},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::bridge::prove_proxy_client::{BridgeDepositBatchGroth16Proof, BridgeDepositBatchWitnessInput, BridgeDepositLeafInput as ProxyDepositLeafInput, ProveProxyClient};
 use psy_plonky2_circuits::{
     bridge::{
+        aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits},
         circuits::{
-            bridge_agg_final::BridgeAggFinalCircuit,
-            bridge_agg::BridgeAggProveResult,
-            bridge_wrap::{BridgeWrapCircuit, DepositBatchWrapCircuit, UncompressedGroth16ProofData},
+            bridge_agg_final::{bridge_agg_final_pi_len, BridgeAggFinalCircuit, BridgeAggProveResult},
+            bridge_aggregate::bridge_aggregate_pi_len,
+            bridge_claim::{
+                BridgeRewardClaimInput, BridgeRewardClaimWitness,
+                BridgeTokenPolicy, BridgeWithdrawalClaimCircuit, BridgeWithdrawalClaimInput,
+                BridgeWithdrawalClaimWitness, BRIDGE_CLAIM_CAPACITY, BRIDGE_REWARD_CLAIM_STATEMENT_LEN,
+                BRIDGE_WITHDRAWAL_CLAIM_STATEMENT_LEN,
+            },
+            reward_chain::REWARD_ROOT_STATEMENT_LEN,
+            reward_claim_batch::{RewardClaimBatchMode, RewardClaimBatchWitness, REWARD_CLAIM_BATCH_STATEMENT_LEN},
         },
-        gadgets::{
-            tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
-        },
+        gadgets::tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
     },
     circuit_library::get_plonky2_circuit_library_and_prover_for_network,
     coordinator::coordinator_helper::QEDCoordinatorCircuitManager,
@@ -47,12 +53,9 @@ use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::{
     MAX_DEPOSIT_BATCH_SIZE,
 };
 use psy_provider::provider::RpcProvider;
-use serde::Serialize;
-use psy_client_data::bridge_aggregate::{bind_claim_tree, DepositAggregateOpening, DepositLeaf, DepositLeafRange, InclusionAggregateHeader, NetworkConfig, SourceCheckpointRewardOpening, WithdrawalAggregateOpening, REWARD_PUBLICATION_FAMILY, WITHDRAWAL_PUBLICATION_FAMILY, deposit_leaf_path, deposit_leaf_tree};
-use psy_plonky2_circuits::bridge::{aggregate_circuits::AggregateCircuits, circuits::{chain_aggregate::{ChainContext, ChainRow}, settlement_aggregate::{RewardLedgerFinalProof, SourceCheckpointRewardAggregateLeaf, WithdrawalAggregateLeaf, withdrawal_root_paths}, reward_ledger::RewardLedgerStep}};
-use psy_plonky2_common_circuits::bridge::deposit_spiderman_append::DepositSpidermanAppendInputs;
+use psy_client_data::bridge_aggregate::{DepositAggregateOpening, DepositLeaf, Hash4, NetworkConfig};
+use psy_plonky2_common_circuits::bridge::deposit_spiderman_append::{DepositSpidermanAppendInputs, DEPOSIT_SPIDERMAN_PAGE_CAPACITY};
 use parth_core::{pgoldilocks::PoseidonHasher, crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, MerkleZeroHasher}}};
-
 use crate::bridge::constants::{
     BRIDGE_USER_ID_U64, DEPOSIT_TREE_AGG_SLOT_BASE, DEPOSIT_TREE_CHAIN_ROOT_SLOT_BASE,
     DEPOSIT_TREE_CONTRACT_ID, MAX_CONCURRENT_PROXY_PROOFS, TOP_TREE_HEIGHT,
@@ -76,14 +79,9 @@ const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
 const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
     psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 
-fn deposit_leaf_hash(record: &DepositLeaf) -> QHashOut<F> {
-    let mut words = Vec::with_capacity(41);
-    for bytes in [record.shield_address, U256::from_be_slice(&record.token).to_be_bytes::<32>(), record.l2_token_contract_id, record.amount] {
-        words.extend(bytes.chunks_exact(4).map(|word| F::from_canonical_u32(u32::from_be_bytes(word.try_into().unwrap()))));
-    }
-    words.push(F::from_canonical_u8(record.chain_index));
-    words.extend(record.note_commitment.chunks_exact(4).map(|word| F::from_canonical_u32(u32::from_be_bytes(word.try_into().unwrap()))));
-    PoseidonHasher::q_hash_many(&words)
+
+fn deposit_leaf_hash(record: &DepositLeaf) -> anyhow::Result<QHashOut<F>> {
+    Ok(QHashOut(HashOut { elements: record.poseidon_hash()?.map(F::from_canonical_u64) }))
 }
 
 fn append_deposit_leaf(frontier: &mut [QHashOut<F>; 32], index: u32, leaf: QHashOut<F>) -> QHashOut<F> {
@@ -97,240 +95,350 @@ fn append_deposit_leaf(frontier: &mut [QHashOut<F>; 32], index: u32, leaf: QHash
     current
 }
 
-pub(crate) fn build_deposit_spiderman_inputs(config: &NetworkConfig, opening: &DepositAggregateOpening, deposit_prefixes: &[Vec<DepositLeaf>]) -> anyhow::Result<Vec<Vec<DepositSpidermanAppendInputs>>> {
+pub(crate) fn build_deposit_spiderman_inputs(config: &NetworkConfig, opening: &DepositAggregateOpening, deposit_prefixes: &[crate::guardian::verify_l1::VerifiedDepositPrefix]) -> anyhow::Result<Vec<DepositSpidermanAppendInputs>> {
+    use plonky2::field::types::PrimeField64;
     opening.validate(config)?;
     anyhow::ensure!(deposit_prefixes.len() == config.chains.len(), "one deposit prefix per configured chain required");
-    let tree = deposit_leaf_tree(&opening.deposit_leaves.iter().map(DepositLeaf::leaf_commit).collect::<Result<Vec<_>, _>>()?)?;
     let count = opening.deposit_leaves.len() as u32;
     let mut first_record = 0u32;
-    let mut chains = Vec::with_capacity(config.chains.len());
+    let mut pages = Vec::new();
     for (ordinal, prefix) in deposit_prefixes.iter().enumerate() {
         let transition = &opening.deposits[ordinal];
-        let mut inputs = Vec::new();
-        if transition.old_count == transition.new_count {
-            anyhow::ensure!(prefix.is_empty(), "no-op chain must not supply a deposit prefix");
-            chains.push(inputs);
-            continue;
-        }
-        anyhow::ensure!(prefix.len() == transition.new_count as usize, "incomplete deposit prefix");
-        let records = transition.new_count - transition.old_count;
-        anyhow::ensure!(prefix[transition.old_count as usize..] == opening.deposit_leaves[first_record as usize..(first_record + records) as usize], "deposit suffix differs from opening");
-        let mut frontier = [QHashOut::ZERO; 32];
-        let mut root: QHashOut<F> = PoseidonHasher::get_zero_hash(32);
-        let mut web = Vec::with_capacity(32);
-        let mut cursor = 0u32;
+        anyhow::ensure!(prefix.matches_opening(transition.chain_index, transition.old_count, transition.old_root), "retained prefix differs from opening");
+        anyhow::ensure!(prefix.occupied_partial_page_hashes().len() == (transition.old_count % 32) as usize, "occupied partial-page hash count mismatch");
+        if transition.old_count == transition.new_count { continue; }
+        let records = transition.new_count.checked_sub(transition.old_count).context("deposit prefix count underflow")?;
+        let suffix = first_record.checked_add(records).context("deposit record prefix overflow")?;
+        anyhow::ensure!(suffix <= count, "deposit record prefix exceeds opening");
+        let added = &opening.deposit_leaves[first_record as usize..suffix as usize];
+        let mut frontier = prefix.frontier.map(to_core_hash);
+        let mut root = to_core_hash(prefix.root);
+        let mut web = prefix.occupied_partial_page_hashes().iter().copied().map(to_core_hash).collect::<Vec<_>>();
+        let mut cursor = transition.old_count;
         while cursor < transition.new_count {
-            if cursor == transition.old_count {
-                anyhow::ensure!(root.0.elements.map(|value| value.to_canonical_u64()) == transition.old_root, "old deposit-tree root mismatch");
-            }
-            let end = if cursor < transition.old_count { transition.old_count.min(cursor.saturating_add(32 - cursor % 32)) }
-                else { transition.new_count.min(cursor.saturating_add(32 - cursor % 32)) };
-            let mut hashes = Vec::with_capacity((end - cursor) as usize);
+            let room = 32 - cursor % 32;
+            let remaining = transition.new_count - cursor;
+            let width = room.min(remaining);
+            let end = cursor.checked_add(width).context("deposit page boundary overflow")?;
+            let mut hashes = Vec::with_capacity(width as usize);
             for index in cursor..end {
-                let record = &prefix[index as usize];
+                let record = &added[(index - transition.old_count) as usize];
                 anyhow::ensure!(record.chain_index == transition.chain_index && record.absolute_index == index, "deposit prefix is not consecutive");
-                hashes.push(deposit_leaf_hash(record));
+                hashes.push(deposit_leaf_hash(record)?);
             }
-            let append = if cursor >= transition.old_count {
-                let mut zero = QHashOut::ZERO;
-                let siblings = frontier.iter().enumerate().map(|(level, left)| {
-                    let sibling = if (cursor >> level) & 1 == 0 { zero } else { *left };
-                    zero = PoseidonHasher::q_two_to_one(zero, zero);
-                    sibling
-                }).collect();
-                let path = MerkleProofCore { root, value: QHashOut::ZERO, index: u64::from(cursor), siblings };
-                anyhow::ensure!(web.len() == (cursor % 32) as usize && web.len() + hashes.len() <= 32, "invalid deposit web boundary");
-                Some(SpidermanUpdateProof::append_from_from_old_new_values::<PoseidonHasher>(&path, &web, &hashes, 5))
-            } else { None };
+            let mut zero = QHashOut::ZERO;
+            let siblings = frontier.iter().enumerate().map(|(level, left)| {
+                let sibling = if (cursor >> level) & 1 == 0 { zero } else { *left };
+                zero = PoseidonHasher::q_two_to_one(zero, zero);
+                sibling
+            }).collect();
+            let path = MerkleProofCore { root, value: QHashOut::ZERO, index: u64::from(cursor), siblings };
+            anyhow::ensure!(web.len() == (cursor % 32) as usize && web.len() + hashes.len() <= 32, "invalid deposit page boundary");
+            let append_proof = SpidermanUpdateProof::append_from_from_old_new_values::<PoseidonHasher>(&path, &web, &hashes, 5);
             let old_root = root;
             for (offset, hash) in hashes.iter().enumerate() { root = append_deposit_leaf(&mut frontier, cursor + offset as u32, *hash); }
-            if let Some(append_proof) = append {
-                anyhow::ensure!(append_proof.top_line_proof.old_root == old_root && append_proof.top_line_proof.new_root == root, "deposit web root mismatch");
-                inputs.push(DepositSpidermanAppendInputs {
-                    config_hash: opening.config_hash, end_checkpoint_id: opening.end_checkpoint_id,
-                    end_checkpoint_root: QHashOut(HashOut { elements: opening.end_checkpoint_root.map(F::from_canonical_u64) }),
-                    chain_index: transition.chain_index, old_count: cursor, first_leaf: first_record,
-                    global_deposit_leaf_root: tree[0], global_deposit_count: count,
-                    leaf_paths: (first_record..first_record + (end - cursor)).map(|index| deposit_leaf_path(&tree, count, index)).collect::<Result<Vec<_>, _>>()?,
-                    deposits: prefix[cursor as usize..end as usize].to_vec(), append_proof,
-                });
-                first_record += end - cursor;
-            }
+            anyhow::ensure!(append_proof.top_line_proof.old_root == old_root && append_proof.top_line_proof.new_root == root, "deposit page root mismatch");
+            pages.push(DepositSpidermanAppendInputs { chain_index: transition.chain_index, old_count: cursor, first_leaf: first_record, leaf_count: width, append_proof });
+            first_record += width;
             web.extend(hashes);
             if end % 32 == 0 { web.clear(); }
             cursor = end;
         }
         anyhow::ensure!(root.0.elements.map(|value| value.to_canonical_u64()) == transition.new_root, "new deposit-tree root mismatch");
-        chains.push(inputs);
     }
     anyhow::ensure!(first_record == count, "deposit record prefix mismatch");
-    Ok(chains)
+    anyhow::ensure!(pages.len() <= DEPOSIT_SPIDERMAN_PAGE_CAPACITY, "deposit page capacity exceeded");
+    Ok(pages)
 }
 
-fn build_chain_aggregate(config: &NetworkConfig, a: &DepositAggregateOpening, webs: &[Vec<ProofWithPublicInputs<F, C, D>>], tree: &[[u8; 32]], circuits: &AggregateCircuits) -> anyhow::Result<Vec<ProofWithPublicInputs<F, C, D>>> {
-    let context = ChainContext { config_hash: a.config_hash, end_checkpoint_id: a.end_checkpoint_id, end_checkpoint_root: a.end_checkpoint_root, global_deposit_leaf_root: tree[0], global_deposit_count: a.deposit_leaves.len() as u32 };
-    let mut proofs = Vec::with_capacity(config.chains.len());
-    let mut first_record = 0;
-    for ordinal in 0..config.chains.len() {
-        let range = DepositLeafRange { first_leaf: first_record, leaf_count: a.deposits[ordinal].new_count - a.deposits[ordinal].old_count };
-        first_record += range.leaf_count;
-        let row = ChainRow { start: a.starts[ordinal].clone(), transition: a.deposits[ordinal].clone(), range };
-        proofs.push(circuits.chains.prove(config, &context, ordinal as u32, &row, &webs[ordinal])?);
-    }
-    anyhow::ensure!(first_record == context.global_deposit_count, "chain record prefix mismatch");
-    Ok(proofs)
-}
-
-pub(crate) fn build_deposit_aggregate(config: &NetworkConfig, opening: &DepositAggregateOpening, web_inputs: &[Vec<DepositSpidermanAppendInputs>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+pub(crate) fn build_deposit_aggregate(config: &NetworkConfig, opening: &DepositAggregateOpening, pages: &[DepositSpidermanAppendInputs], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
     circuits.validate_config(config)?;
     opening.validate(config)?;
-    anyhow::ensure!(web_inputs.len() == config.chains.len(), "one web vector per configured chain required");
-    let tree = deposit_leaf_tree(&opening.deposit_leaves.iter().map(DepositLeaf::leaf_commit).collect::<Result<Vec<_>, _>>()?)?;
-    let mut first = 0usize;
-    let mut webs = Vec::with_capacity(web_inputs.len());
-    for (ordinal, inputs) in web_inputs.iter().enumerate() {
-        let transition = &opening.deposits[ordinal];
-        let mut cursor = transition.old_count;
-        let mut proofs = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let end = first.checked_add(input.deposits.len()).context("web record overflow")?;
-            anyhow::ensure!(!input.deposits.is_empty() && input.deposits.len() <= (32 - cursor % 32) as usize && end <= opening.deposit_leaves.len(), "invalid web record interval");
-            anyhow::ensure!(input.config_hash == opening.config_hash && input.end_checkpoint_id == opening.end_checkpoint_id && input.end_checkpoint_root.0.elements.map(|value| value.to_canonical_u64()) == opening.end_checkpoint_root && input.chain_index == transition.chain_index && input.old_count == cursor && input.first_leaf as usize == first && input.global_deposit_leaf_root == tree[0] && input.global_deposit_count as usize == opening.deposit_leaves.len() && input.deposits == opening.deposit_leaves[first..end], "web differs from complete opening");
-            cursor = cursor.checked_add(input.deposits.len() as u32).context("proved deposit count overflow")?;
-            anyhow::ensure!(cursor <= transition.new_count, "web exceeds chain transition");
-            proofs.push(circuits.deposit.prove(input)?);
-            first = end;
+    anyhow::ensure!(pages.len() <= DEPOSIT_SPIDERMAN_PAGE_CAPACITY, "deposit page capacity exceeded");
+    let mut first = 0u32;
+    let mut cursor = None;
+    for page in pages {
+        let transition = opening.deposits.iter().find(|transition| transition.chain_index == page.chain_index).context("deposit page chain absent")?;
+        let start = opening.deposits.iter().take_while(|row| row.chain_index != page.chain_index).try_fold(0u32, |sum, row| -> anyhow::Result<u32> {
+            sum.checked_add(row.new_count.checked_sub(row.old_count).context("deposit page count underflow")?).context("deposit page ordinal overflow")
+        })?;
+        let end = page.old_count.checked_add(page.leaf_count).context("deposit page count overflow")?;
+        anyhow::ensure!(page.leaf_count > 0 && page.old_count >= transition.old_count && end <= transition.new_count, "deposit page leaves its chain");
+        anyhow::ensure!(page.old_count % 32 + page.leaf_count <= 32, "deposit page crossing");
+        let ordinal = start.checked_add(page.old_count - transition.old_count).context("deposit page ordinal overflow")?;
+        anyhow::ensure!(page.first_leaf == first && page.first_leaf == ordinal, "deposit page order mismatch");
+        if let Some((chain, count)) = cursor {
+            anyhow::ensure!(page.chain_index > chain || (page.chain_index == chain && page.old_count == count), "deposit pages are not canonical");
         }
-        anyhow::ensure!(cursor == transition.new_count, "missing deposit web");
-        webs.push(proofs);
+        cursor = Some((page.chain_index, end));
+        first = first.checked_add(page.leaf_count).context("deposit page ordinal overflow")?;
     }
-    anyhow::ensure!(first == opening.deposit_leaves.len(), "missing deposit records");
-    let chains = build_chain_aggregate(config, opening, &webs, &tree, circuits)?;
-    circuits.prove_deposit_aggregate(config, opening, &chains)
+    anyhow::ensure!(first as usize == opening.deposit_leaves.len(), "missing deposit pages");
+    circuits.deposit_aggregate.prove(config, opening, pages)
 }
 
-const WITHDRAWAL_PUBLICATION_CAPACITY: u32 = 1024;
+pub(crate) fn prove_withdrawal_claims(
+    circuit: &BridgeWithdrawalClaimCircuit,
+    input: &BridgeWithdrawalClaimInput,
+) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+    anyhow::ensure!(input.claims.len() <= BRIDGE_CLAIM_CAPACITY, "withdrawal claim capacity is 32");
+    let proof = circuit.prove(input)?;
+    circuit.circuit_data.verify(proof.clone())?;
+    anyhow::ensure!(proof.public_inputs.len() == BRIDGE_WITHDRAWAL_CLAIM_STATEMENT_LEN, "withdrawal claim public width mismatch");
+    anyhow::ensure!(proof.public_inputs[0] == F::from_canonical_usize(input.claims.len()), "withdrawal claim count mismatch");
+    Ok(proof)
+}
 
-pub(crate) fn withdrawal_publication_header(config: &NetworkConfig, opening: &WithdrawalAggregateOpening) -> anyhow::Result<InclusionAggregateHeader> {
-    let count = u32::try_from(opening.withdrawals.len()).context("withdrawal publication count exceeds u32")?;
-    anyhow::ensure!(count <= WITHDRAWAL_PUBLICATION_CAPACITY, "withdrawal publication requires another compiled segment capacity; AggregateCircuits builds only 1024");
-    let mut header = InclusionAggregateHeader {
-        family: WITHDRAWAL_PUBLICATION_FAMILY,
-        config_hash: opening.config_hash,
-        window_id: opening.window_id,
-        end_checkpoint_id: opening.end_checkpoint_id,
-        end_checkpoint_root: opening.end_checkpoint_root,
-        aggregate_capacity: WITHDRAWAL_PUBLICATION_CAPACITY,
-        total_count: count,
-        segment_count: u32::from(count != 0),
-        segment_index: 0,
-        first_ordinal: 0,
-        count,
-        withdrawal_roots: opening.withdrawal_roots.clone(),
-        old_ledger_state_root: None,
-        new_ledger_state_root: None,
-        opening_digest: opening.opening_digest(config)?,
-        claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], WITHDRAWAL_PUBLICATION_CAPACITY as usize)?[0],
+fn hash_siblings<const N: usize>(proof: &psy_crypto::hash::merkle::core::MerkleProofCore<ClientQHashOut>) -> anyhow::Result<[HashOut<F>; N]> {
+    anyhow::ensure!(proof.siblings.len() == N, "merkle path height {N} got {}", proof.siblings.len());
+    Ok(std::array::from_fn(|index| to_core_hash(proof.siblings[index]).0))
+}
+
+pub(crate) fn withdrawal_burn_key(nonce: [u32; 8]) -> HashOut<F> {
+    use plonky2::plonk::config::Hasher;
+    let nonce_hash = plonky2::hash::poseidon::PoseidonHash::hash_no_pad(&nonce.map(F::from_canonical_u32));
+    let mut inputs = vec![F::from_canonical_u64(6)];
+    inputs.extend(nonce_hash.elements);
+    plonky2::hash::poseidon::PoseidonHash::hash_no_pad(&inputs)
+}
+
+fn be_u32_words(bytes: &[u8; 32]) -> [u32; 8] {
+    std::array::from_fn(|index| {
+        let start = 4 * index;
+        u32::from_be_bytes([bytes[start], bytes[start + 1], bytes[start + 2], bytes[start + 3]])
+    })
+}
+
+fn recipient_words(address: &[u8; 20]) -> [u32; 8] {
+    let mut words = [0u32; 8];
+    for index in 0..5 {
+        let start = 4 * index;
+        words[3 + index] = u32::from_be_bytes([address[start], address[start + 1], address[start + 2], address[start + 3]]);
+    }
+    words
+}
+
+fn validate_withdrawal_words(recipient: [u32; 8], amount: [u32; 8]) -> anyhow::Result<()> {
+    anyhow::ensure!(recipient[..3].iter().all(|limb| *limb == 0), "recipient exceeds 160 bits");
+    anyhow::ensure!(amount[..6].iter().all(|limb| *limb == 0), "withdrawal amount exceeds 64 bits");
+    let amount_value = (u64::from(amount[6]) << 32) | u64::from(amount[7]);
+    anyhow::ensure!(amount_value > 0 && amount_value < 0xffff_ffff_0000_0001, "withdrawal amount is outside Goldilocks");
+    Ok(())
+}
+
+fn amount_words(bytes: &[u8; 32]) -> anyhow::Result<[u32; 8]> {
+    let words = be_u32_words(bytes);
+    validate_withdrawal_words([0; 8], words)?;
+    Ok(words)
+}
+
+fn withdrawal_policy_ordinals(policies: &[BridgeTokenPolicy], records: &[psy_client_data::bridge_aggregate::WithdrawalBurnRecord]) -> anyhow::Result<Vec<u8>> {
+    let mut installed = std::collections::HashMap::<(u8, u32), u8>::with_capacity(policies.len());
+    for (position, policy) in policies.iter().enumerate() {
+        let ordinal = u8::try_from(position).context("withdrawal policy ordinal exceeds u8")?;
+        anyhow::ensure!(installed.insert((policy.chain_index, policy.token_contract_id), ordinal).is_none(), "withdrawal policy match is ambiguous");
+    }
+    records.iter().map(|record| installed.get(&(record.chain_index, record.contract_id)).copied().context("withdrawal policy is not installed")).collect()
+}
+
+pub(crate) async fn fetch_withdrawal_claim_witness(
+    provider: &RpcProvider,
+    policies: &[BridgeTokenPolicy],
+    checkpoint_id: u64,
+    user_id: u64,
+    policy_ordinal: u8,
+    nonce: [u32; 8],
+    recipient: [u32; 8],
+    amount: [u32; 8],
+) -> anyhow::Result<BridgeWithdrawalClaimWitness> {
+    let policy = policies.get(policy_ordinal as usize).context("withdrawal policy ordinal is not installed")?;
+    validate_withdrawal_words(recipient, amount)?;
+    let key = withdrawal_burn_key(nonce);
+    let request = psy_provider::request::QIMTMembershipProofRPCRequest {
+        checkpoint_id, user_id, contract_id: policy.token_contract_id, key: psy_client_common::data::qhashout::QHashOut(key),
+        state_slot_base: u64::from(policy.map_base), capacity: u64::from(policy.capacity),
     };
-    let commits = opening.withdrawals.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?;
-    bind_claim_tree(&mut header, &commits)?;
-    Ok(header)
-}
-
-pub(crate) fn build_withdrawal_aggregate(config: &NetworkConfig, opening: &WithdrawalAggregateOpening, proofs: &[ProofWithPublicInputs<F, C, D>], circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-    circuits.validate_config(config)?;
-    opening.validate(config)?;
-    anyhow::ensure!(proofs.len() == opening.withdrawals.len(), "one proof per withdrawal required");
-    let paths = withdrawal_root_paths(config, &opening.withdrawal_roots)?;
-    let records = opening.withdrawals.iter().zip(proofs).map(|(record, proof)| {
-        let ordinal = config.chains.binary_search_by_key(&record.chain_index, |chain| chain.chain_index).map_err(|_| anyhow::anyhow!("withdrawal chain absent"))?;
-        Ok(WithdrawalAggregateLeaf { leaf: record, proof, path: &paths[ordinal] })
-    }).collect::<anyhow::Result<Vec<_>>>()?;
-    let header = withdrawal_publication_header(config, opening)?;
-    circuits.prove_withdrawal_aggregate(config, opening, &header, &records)
-}
-
-const REWARD_PUBLICATION_CAPACITY: u32 = 1024;
-
-pub(crate) fn reward_publication_header(opening: &SourceCheckpointRewardOpening, old_ledger_state_root: [u64; 4], new_ledger_state_root: [u64; 4]) -> anyhow::Result<InclusionAggregateHeader> {
-    let count = u32::try_from(opening.leaves.len()).context("reward publication count exceeds u32")?;
-    anyhow::ensure!(count <= REWARD_PUBLICATION_CAPACITY, "reward publication requires another compiled segment capacity; AggregateCircuits builds only 1024");
-    let mut header = InclusionAggregateHeader {
-        family: REWARD_PUBLICATION_FAMILY, config_hash: opening.config_hash, window_id: opening.window_id,
-        end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root: opening.end_checkpoint_root,
-        aggregate_capacity: REWARD_PUBLICATION_CAPACITY, total_count: count, segment_count: u32::from(count != 0),
-        segment_index: 0, first_ordinal: 0, count, withdrawal_roots: Vec::new(),
-        old_ledger_state_root: Some(old_ledger_state_root), new_ledger_state_root: Some(new_ledger_state_root),
-        opening_digest: opening.opening_digest()?, claim_tree_root: psy_client_data::bridge_aggregate::build_inclusion_aggregate_tree(&[], REWARD_PUBLICATION_CAPACITY as usize)?[0],
+    let burned = provider.get_withdrawal_burn_proof(request).await?;
+    anyhow::ensure!(burned.checkpoint_id == checkpoint_id && burned.user_leaf.user_id.to_canonical_u64() == user_id, "burn proof identifies another user or checkpoint");
+    anyhow::ensure!(burned.contract_path.index == u64::from(policy.token_contract_id), "burn contract path is not the approved token contract");
+    anyhow::ensure!(burned.global_contract_path.index == u64::from(policy.token_contract_id), "global contract path is not the approved token contract");
+    let member = burned.record_membership;
+    anyhow::ensure!(member.merkle_proof.index > u64::from(policy.map_base), "burn membership includes the sentinel slot");
+    use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
+    let map_base = u64::from(policy.map_base);
+    let sentinel = provider.contract_state_imt_get_leaf_preimage(checkpoint_id, user_id, u64::from(policy.token_contract_id), map_base).await?;
+    let sentinel_proof = provider.get_user_contract_state_tree_merkle_proof(checkpoint_id, user_id, policy.token_contract_id, bridge_contract_state_tree_height(policy.token_contract_id)?, map_base).await?;
+    let user_contract = psy_client_data::qdata::user_contract_state::UserContractState {
+        checkpoint_tree_root: burned.checkpoint_path.root,
+        user_leaf: burned.user_leaf,
+        start_contract_state_root: burned.contract_path.value,
+        contract_id: F::from_canonical_u32(policy.token_contract_id),
+        checkpoint_id: F::from_canonical_u32(u32::from(policy.chain_index)),
     };
-    bind_claim_tree(&mut header, &opening.leaves.iter().map(|leaf| leaf.leaf_commit()).collect::<Result<Vec<_>, _>>()?)?;
-    header.validate()?;
-    Ok(header)
+    Ok(BridgeWithdrawalClaimWitness {
+        policy_ordinal,
+        user_contract,
+        user_siblings: hash_siblings(&burned.user_path)?,
+        contract_siblings: hash_siblings(&burned.contract_path)?,
+        global_contract_siblings: hash_siblings(&burned.global_contract_path)?,
+        member_index: u32::try_from(member.merkle_proof.index).context("burn membership index exceeds u32")?,
+        member: member.leaf,
+        member_siblings: hash_siblings(&member.merkle_proof)?,
+        sentinel,
+        sentinel_siblings: hash_siblings(&sentinel_proof)?,
+        recipient,
+        token_address: policy.token_address,
+        amount,
+        nonce,
+    })
 }
 
-pub(crate) struct RewardAggregateInputs<'a> {
-    pub old_ledger_state_root: [u64; 4],
-    pub new_ledger_state_root: [u64; 4],
-    pub tip_proof: &'a ProofWithPublicInputs<F, C, D>,
-    pub tip_state: &'a psy_plonky2_circuits::bridge::circuits::reward_session::RewardLedgerStateValues,
-    pub payouts: &'a [RewardPayoutInputs<'a>],
+pub(crate) fn prove_reward_claims(
+    circuits: &AggregateCircuits,
+    input: &BridgeRewardClaimInput,
+) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+    let batch_count = input.batch_proof.public_inputs.first().context("reward batch statement missing")?.to_canonical_u64() as usize;
+    anyhow::ensure!(input.claims.len() == batch_count && batch_count <= BRIDGE_CLAIM_CAPACITY, "reward claim count differs from its batch proof");
+    let proof = circuits.reward_claim.prove(input)?;
+    anyhow::ensure!(proof.public_inputs.len() == BRIDGE_REWARD_CLAIM_STATEMENT_LEN, "reward claim public width mismatch");
+    anyhow::ensure!(proof.public_inputs[0] == F::from_canonical_usize(batch_count), "reward claim count mismatch");
+    Ok(proof)
 }
 
-pub(crate) struct RewardPayoutInputs<'a> {
-    pub proof: &'a ProofWithPublicInputs<F, C, D>,
-    pub step: &'a RewardLedgerStep,
+pub(crate) fn prove_empty_reward_batch(circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+    let proof = circuits.reward_batch.prove(&RewardClaimBatchWitness {
+        mode: RewardClaimBatchMode::Empty, statements: Vec::new(), tip: None, children: None,
+    })?;
+    anyhow::ensure!(proof.public_inputs.len() >= REWARD_CLAIM_BATCH_STATEMENT_LEN, "empty reward batch statement missing");
+    anyhow::ensure!(proof.public_inputs[0] == F::ZERO, "empty reward batch count is not zero");
+    anyhow::ensure!(proof.public_inputs[1..REWARD_CLAIM_BATCH_STATEMENT_LEN].iter().all(|field| *field == F::ZERO), "empty reward batch statement is not zero");
+    Ok(proof)
 }
 
-pub(crate) fn build_reward_aggregate(config: &NetworkConfig, opening: &SourceCheckpointRewardOpening, inputs: &RewardAggregateInputs<'_>, circuits: &AggregateCircuits) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-    anyhow::ensure!(inputs.payouts.len() == opening.leaves.len(), "one retained payout step per source reward required");
-    anyhow::ensure!(inputs.tip_proof.public_inputs.len() == psy_client_data::bridge_aggregate::REWARD_SESSION_PROOF_FIELD_COUNT, "reward tip width mismatch");
-    anyhow::ensure!(inputs.tip_proof.public_inputs[30..34].iter().zip(inputs.new_ledger_state_root).all(|(field, limb)| field.to_canonical_u64() == limb), "reward tip root differs from retained ledger root");
-    let header = reward_publication_header(opening, inputs.old_ledger_state_root, inputs.new_ledger_state_root)?;
-    let tip = RewardLedgerFinalProof { proof: inputs.tip_proof, state: inputs.tip_state };
-    let records = opening.leaves.iter().zip(inputs.payouts).map(|(leaf, payout)| {
-        anyhow::ensure!(payout.step.is_final_step, "reward publication leaf is not a terminal payout");
-        anyhow::ensure!(u64::from(payout.step.source_checkpoint_id) == leaf.source_checkpoint_id, "retained source checkpoint differs from payout leaf");
-        Ok(SourceCheckpointRewardAggregateLeaf {
-            leaf, proof: payout.proof, state: &payout.step.new_state, source_checkpoint_id: payout.step.source_checkpoint_id,
-            source_leaf: &payout.step.source_leaf, source_siblings: &payout.step.source_path, session_root: payout.step.session_root,
-            summary_siblings: &payout.step.summary_siblings,
-        })
-    }).collect::<anyhow::Result<Vec<_>>>()?;
-    circuits.prove_reward_aggregate(config, opening, &header, &tip, &records)
+pub(crate) fn prove_reward_root_batch(
+    circuits: &AggregateCircuits,
+    roots: &[ProofWithPublicInputs<F, C, D>],
+) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+    anyhow::ensure!(!roots.is_empty() && roots.len() <= BRIDGE_CLAIM_CAPACITY, "nonempty reward batch requires 1..=32 root proofs");
+    let mut proofs = Vec::with_capacity(roots.len());
+    for root in roots {
+        anyhow::ensure!(root.public_inputs.len() == REWARD_ROOT_STATEMENT_LEN, "reward root statement is not 30 fields");
+        proofs.push(circuits.reward_batch.prove(&RewardClaimBatchWitness {
+            mode: RewardClaimBatchMode::Leaf,
+            statements: vec![std::array::from_fn(|index| root.public_inputs[index])],
+            tip: Some(root.clone()),
+            children: None,
+        })?);
+    }
+    while proofs.len() > 1 {
+        let mut folded = Vec::new();
+        let mut index = 0;
+        while index < proofs.len() {
+            if index + 1 == proofs.len() {
+                folded.push(proofs[index].clone());
+                break;
+            }
+            let left = child_statements(&proofs[index])?;
+            let right = child_statements(&proofs[index + 1])?;
+            let mut combined = left.1;
+            combined.extend_from_slice(&right.1[..right.0]);
+            let proof = circuits.reward_batch.prove(&RewardClaimBatchWitness {
+                mode: RewardClaimBatchMode::Pair,
+                statements: combined,
+                tip: None,
+                children: Some([proofs[index].clone(), proofs[index + 1].clone()]),
+            })?;
+            anyhow::ensure!(proof.public_inputs[0].to_canonical_u64() as usize == left.0 + right.0, "folded reward batch count mismatch");
+            folded.push(proof);
+            index += 2;
+        }
+        proofs = folded;
+    }
+    let proof = proofs.pop().unwrap();
+    circuits.reward_batch.circuit_data.verify(proof.clone())?;
+    anyhow::ensure!(proof.public_inputs[0].to_canonical_u64() as usize == roots.len(), "reward batch does not cover every root proof");
+    Ok(proof)
 }
 
-pub(crate) struct EndCheckpointWitness {
-    pub leaf: psy_client_data::qdata::checkpoint::PsyCheckpointLeaf<F>,
-    pub siblings: [[u64; 4]; 32],
-    pub roots: psy_client_data::qdata::checkpoint::PsyCheckpointGlobalStateRoots<F>,
+fn child_statements(proof: &ProofWithPublicInputs<F, C, D>) -> anyhow::Result<(usize, Vec<[F; REWARD_ROOT_STATEMENT_LEN]>)> {
+    let count = proof.public_inputs.first().context("reward batch child has no count")?.to_canonical_u64() as usize;
+    anyhow::ensure!(count > 0 && count <= BRIDGE_CLAIM_CAPACITY, "reward batch child count is outside 1..=32");
+    anyhow::ensure!(proof.public_inputs.len() >= 1 + count * REWARD_ROOT_STATEMENT_LEN, "reward batch child statement is truncated");
+    Ok((count, (0..count).map(|slot| {
+        let start = 1 + slot * REWARD_ROOT_STATEMENT_LEN;
+        std::array::from_fn(|index| proof.public_inputs[start + index])
+    }).collect()))
 }
 
-pub(crate) fn source_checkpoint_for_end(config: &NetworkConfig, end_checkpoint_id: u64) -> anyhow::Result<u32> {
-    let source = u32::try_from(end_checkpoint_id).context("end checkpoint exceeds u32")?;
-    anyhow::ensure!(
-        config.reward_cutover <= end_checkpoint_id && end_checkpoint_id < config.reward_end_exclusive,
-        "end checkpoint {end_checkpoint_id} is outside reward range {}..{}; an explicit source checkpoint id is required",
-        config.reward_cutover, config.reward_end_exclusive
-    );
-    Ok(source)
+pub(crate) fn prove_bridge_aggregate(
+    circuits: &AggregateCircuits,
+    deposit: &ProofWithPublicInputs<F, C, D>,
+    withdrawal: &ProofWithPublicInputs<F, C, D>,
+    reward: &ProofWithPublicInputs<F, C, D>,
+    finalizations: &[ProofWithPublicInputs<F, C, D>],
+    zero_span: &[bool],
+) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+    let chain_count = circuits.checkpoint_final.configured_chain_indices().len();
+    anyhow::ensure!(finalizations.len() == chain_count && zero_span.len() == chain_count, "one selected finalization per configured chain required");
+    let width = bridge_agg_final_pi_len(chain_count);
+    for (index, (proof, &membership)) in finalizations.iter().zip(zero_span).enumerate() {
+        let verifier = if membership { &circuits.checkpoint_membership.circuit_data } else { &circuits.checkpoint_final.circuit_data };
+        verifier.verify(proof.clone()).with_context(|| format!("selected finalization {index} failed verification"))?;
+        let span = proof.public_inputs[17];
+        anyhow::ensure!(membership == (span == F::ZERO), "zero span must select the membership finalizer");
+    }
+    let proof = circuits.bridge_aggregate.prove(deposit, withdrawal, reward, finalizations, zero_span)?;
+    circuits.bridge_aggregate.circuit_data.verify(proof.clone())?;
+    anyhow::ensure!(proof.public_inputs.len() == bridge_aggregate_pi_len(chain_count), "bridge aggregate width differs from 8316+128*C");
+    anyhow::ensure!(proof.public_inputs[..4] == [F::from_canonical_u32(4), F::from_canonical_u32(12), F::ZERO, F::ZERO], "bridge aggregate prefix is not version 4");
+    Ok(proof)
 }
 
-pub(crate) async fn fetch_end_checkpoint_witness(provider: &RpcProvider, end_checkpoint_id: u64) -> anyhow::Result<EndCheckpointWitness> {
-    let leaf = provider.get_checkpoint_leaf_data(end_checkpoint_id).await?;
-    let proof = provider.get_checkpoint_tree_merkle_proof(end_checkpoint_id, end_checkpoint_id).await?;
-    let roots = provider.get_checkpoint_global_state_roots(end_checkpoint_id).await?;
-    anyhow::ensure!(proof.index == end_checkpoint_id, "end checkpoint proof index mismatch");
-    anyhow::ensure!(proof.siblings.len() == 32, "end checkpoint proof must contain 32 siblings");
-    let stored_leaf = provider.get_checkpoint_tree_leaf_hash(end_checkpoint_id, end_checkpoint_id).await?;
-    anyhow::ensure!(to_core_hash(proof.value) == to_core_hash(stored_leaf), "end checkpoint proof value differs from stored leaf hash");
-    let root = provider.get_checkpoint_tree_root(end_checkpoint_id).await?;
-    anyhow::ensure!(to_core_hash(proof.root) == to_core_hash(root), "end checkpoint proof root differs from checkpoint root");
-    let siblings = std::array::from_fn(|index| {
-        let hash = to_core_hash(proof.siblings[index]);
-        hash.0.elements.map(|limb| limb.to_canonical_u64())
-    });
-    Ok(EndCheckpointWitness { leaf, siblings, roots })
+pub(crate) fn build_bridge_circuits<N: parth_core::protocol::core_types::QNetworkCircuitConstants>(
+    coordinator: &QEDCoordinatorCircuitManager<C, D>,
+    chain_indices: &[u8],
+    withdrawal_policies: Vec<BridgeTokenPolicy>,
+    ethereum_index: u8,
+) -> anyhow::Result<AggregateCircuits> {
+    let checkpoint = &coordinator.checkpoint_root_transition;
+    AggregateCircuits::build::<N>(
+        chain_indices,
+        checkpoint.get_common_circuit_data_ref(),
+        checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(),
+        checkpoint.get_fingerprint(),
+        AggregateCircuitHeights { deposit_state_tree: DEPOSIT_CONTRACT_STATE_TREE_HEIGHT },
+        withdrawal_policies,
+        ethereum_index,
+    )
 }
+
+pub(crate) struct OpeningProof {
+    pub proof: ProofWithPublicInputs<F, C, D>,
+    pub opening_bytes: Vec<u8>,
+    pub opening_digest: [u8; 32],
+}
+
+pub(crate) fn bind_opening_digest(proof: &ProofWithPublicInputs<F, C, D>, opening_bytes: &[u8], opening_digest: [u8; 32]) -> anyhow::Result<OpeningProof> {
+    use tiny_keccak::{Hasher as _, Keccak};
+    let decoded = psy_client_data::bridge_aggregate::BridgeOpening::decode(opening_bytes).map_err(|error| anyhow::anyhow!("opening bytes: {error:?}"))?;
+    let canonical = decoded.encode().map_err(|error| anyhow::anyhow!("opening bytes: {error:?}"))?;
+    anyhow::ensure!(canonical == opening_bytes, "opening bytes are not canonical");
+    let digest = decoded.opening_digest().map_err(|error| anyhow::anyhow!("opening digest: {error:?}"))?;
+    anyhow::ensure!(digest == opening_digest, "opening digest differs from opening bytes");
+    let mut domain_hasher = Keccak::v256();
+    domain_hasher.update(b"PsyBridge/Opening/4");
+    let mut domain = [0u8; 32];
+    domain_hasher.finalize(&mut domain);
+    let mut outer = Keccak::v256();
+    outer.update(&domain);
+    outer.update(opening_bytes);
+    let mut actual = [0u8; 32];
+    outer.finalize(&mut actual);
+    anyhow::ensure!(actual == opening_digest, "opening digest preimage mismatch");
+    anyhow::ensure!(proof.public_inputs.len() >= 4, "opening proof has no prefix");
+    Ok(OpeningProof { proof: proof.clone(), opening_bytes: opening_bytes.to_vec(), opening_digest })
+}
+
 
 fn bridge_contract_state_tree_height(contract_id: u32) -> anyhow::Result<u8> {
     match contract_id {
@@ -498,18 +606,18 @@ async fn fetch_finalize_endpoints(provider: &RpcProvider, checkpoint: u64, indic
     for &chain_index in indices {
         let slots = [16_451 + 2 * u64::from(chain_index), 16_452 + 2 * u64::from(chain_index)];
         let deposit_root = fetch_tree_root_witness(provider, checkpoint, BRIDGE_USER_ID_U64, DEPOSIT_TREE_CONTRACT_ID, slots).await?;
-        let withdrawal_root = fetch_tree_root_witness(provider, checkpoint, BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID, slots).await?;
-        let mut counts = Vec::with_capacity(2);
-        for root in [&deposit_root, &withdrawal_root] {
-            let contract = u32::try_from(root.contract_id)?;
-            let slot_index = 16_386 + u64::from(chain_index) / 4;
-            counts.push(SlotValueInContractStateWitnessInput { sender_user_id: BRIDGE_USER_ID_U64, contract_id: root.contract_id, slot_index,
-                user_leaf: root.user_leaf, contract_proof: root.contract_proof.clone(), user_tree_proof: root.user_tree_proof.clone(),
-                slot_proof: to_core_merkle_proof(provider.get_user_contract_state_tree_merkle_proof(checkpoint, BRIDGE_USER_ID_U64, contract, bridge_contract_state_tree_height(contract)?, slot_index).await?) });
-        }
-        let withdrawal_count = counts.pop().context("missing withdrawal count")?;
-        let deposit_count = counts.pop().context("missing deposit count")?;
-        endpoints.push(BridgeAggFinalEndpointWitness { chain_index, deposit_root, deposit_count, withdrawal_root, withdrawal_count });
+        let contract = u32::try_from(deposit_root.contract_id)?;
+        let slot_index = 16_386 + u64::from(chain_index) / 4;
+        let deposit_count = SlotValueInContractStateWitnessInput {
+            sender_user_id: BRIDGE_USER_ID_U64,
+            contract_id: deposit_root.contract_id,
+            slot_index,
+            user_leaf: deposit_root.user_leaf,
+            contract_proof: deposit_root.contract_proof.clone(),
+            user_tree_proof: deposit_root.user_tree_proof.clone(),
+            slot_proof: to_core_merkle_proof(provider.get_user_contract_state_tree_merkle_proof(checkpoint, BRIDGE_USER_ID_U64, contract, bridge_contract_state_tree_height(contract)?, slot_index).await?),
+        };
+        endpoints.push(BridgeAggFinalEndpointWitness { chain_index, deposit_root, deposit_count });
     }
     Ok(endpoints)
 }
@@ -608,20 +716,11 @@ pub struct ProveBridgeAggOutput {
     pub from_checkpoint: u64,
     pub to_checkpoint: u64,
     pub num_checkpoints_aggregated: u64,
-    /// L1 chain index used for this proof (read from config; no longer a circuit PI).
     pub l1_chain_index: u64,
     pub bridge_agg_public_inputs_count: usize,
     pub bridge_agg_public_inputs: Vec<String>,
-    pub groth16_proof: UncompressedGroth16ProofData,
-    pub solidity_proof: [String; 8],
-    pub solidity_public_inputs: [String; 2],
-    pub checkpoint_roots: Vec<String>,
-    pub deposit_tree_root: String,
-    pub deposit_subtree_root: String,
-    pub deposit_merkle_proof: [String; 9],
-    pub withdrawal_tree_root: String,
-    pub withdrawal_subtree_root: String,
-    pub withdrawal_merkle_proof: [String; 9],
+    pub opening_bytes: String,
+    pub opening_digest: String,
     pub end_checkpoint_index: u64,
 }
 
@@ -658,8 +757,7 @@ pub struct BridgeProveResult {
     pub to_checkpoint: u64,
     pub num_checkpoints_aggregated: u64,
     pub proof_path: PathBuf,
-    pub deposit_tree_root: String,
-    pub withdrawal_tree_root: String,
+    pub opening_digest: String,
 }
 
 fn with_0x(s: &str) -> String {
@@ -1102,10 +1200,6 @@ pub(crate) async fn prove_checkpoint_range(
     let deposit_root_witness =
         fetch_tree_root_witness(provider, to_checkpoint, BRIDGE_USER_ID_U64, DEPOSIT_TREE_CONTRACT_ID, [0, 1]).await?;
 
-    let withdrawal_root_witness =
-        fetch_tree_root_witness(provider, to_checkpoint, BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID, [0, 1]).await?;
-
-    // Fetch global state roots to bind the gadget's user_tree_root to the checkpoint leaf.
     let checkpoint_global_state_roots = {
         let roots = provider.get_checkpoint_global_state_roots(to_checkpoint).await?;
         PQEDCheckpointGlobalStateRoots {
@@ -1135,29 +1229,27 @@ pub(crate) async fn prove_checkpoint_range(
         &final_checkpoint_leaf,
         &checkpoint_global_state_roots,
         &deposit_root_witness,
-        &withdrawal_root_witness,
         CHECKPOINT_TREE_HEIGHT,
         GLOBAL_USER_TREE_HEIGHT,
         GLOBAL_CONTRACT_TREE_HEIGHT,
         DEPOSIT_CONTRACT_STATE_TREE_HEIGHT,
-        WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT,
         configured_chain_indices,
         &fetch_finalize_endpoints(provider, to_checkpoint, configured_chain_indices).await?,
     )?;
     tracing::info!(step_count = to_checkpoint - from_checkpoint + 1, "bridge aggregation proof generated");
 
     anyhow::ensure!(
-        result.proof.public_inputs.len() == 26 + 9 * configured_chain_indices.len(),
-        "BridgeAgg proof public inputs width differs from configured chain list: {}",
+        result.proof.public_inputs.len() == bridge_agg_final_pi_len(configured_chain_indices.len()),
+        "BridgeAgg proof public inputs width differs from 18+5*C: {}",
         result.proof.public_inputs.len()
     );
     anyhow::ensure!(
-        result.proof.public_inputs[25].to_canonical_u64() == num_checkpoints_aggregated,
-        "BridgeAgg public input num_checkpoints_aggregated mismatch: pi={} expected={}",
-        result.proof.public_inputs[25].to_canonical_u64(),
+        result.proof.public_inputs[17].to_canonical_u64() == num_checkpoints_aggregated,
+        "BridgeAgg public input span mismatch: pi={} expected={}",
+        result.proof.public_inputs[17].to_canonical_u64(),
         num_checkpoints_aggregated
     );
-    let end_checkpoint_index = result.proof.public_inputs[24].to_canonical_u64();
+    let end_checkpoint_index = result.proof.public_inputs[16].to_canonical_u64();
     anyhow::ensure!(
         end_checkpoint_index == to_checkpoint,
         "BridgeAgg public input end_checkpoint_index mismatch: pi={} expected={}",
@@ -1175,6 +1267,171 @@ pub(crate) async fn prove_checkpoint_range(
     Ok((result, full_checkpoint_leaf, end_checkpoint_path))
 }
 
+pub(crate) async fn prove_checkpoint_membership(
+    provider: &RpcProvider,
+    coordinator: &QEDCoordinatorCircuitManager<C, D>,
+    checkpoint_id: u64,
+    configured_chain_indices: &[u8],
+    trusted_checkpoint_root: HashOut<F>,
+) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+    let cached = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
+    let checkpoint_base = cached.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof).context("GenerateRollupStateTransitionProof not found in cached circuit library")?;
+    let checkpoint = &coordinator.checkpoint_root_transition;
+    let membership = psy_plonky2_circuits::bridge::circuits::bridge_agg_final::BridgeAggFinalMembershipCircuit::<C, D>::prebuild_membership_circuit(
+        checkpoint.get_common_circuit_data_ref(), checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(), checkpoint.get_fingerprint(), checkpoint_base,
+        CHECKPOINT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT, configured_chain_indices,
+    );
+    let leaf_data = provider.get_checkpoint_leaf_data(checkpoint_id).await?;
+    let compact = leaf_data.to_compact::<psy_client_data::config::store_config::PsyHasher>();
+    let leaf = PQEDCheckpointLeafCompact { global_chain_root: to_core_hash(compact.global_chain_root), stats_hash: to_core_hash(compact.stats_hash) };
+    let proof = provider.get_checkpoint_tree_merkle_proof(checkpoint_id, checkpoint_id).await?;
+    let path = MerkleProofCore { root: to_core_hash(proof.root), value: to_core_hash(proof.value), index: checkpoint_id, siblings: proof.siblings.into_iter().map(to_core_hash).collect() };
+    anyhow::ensure!(path.root.0 == trusted_checkpoint_root, "membership path root differs from the opening end root");
+    let roots = provider.get_checkpoint_global_state_roots(checkpoint_id).await?;
+    let global = PQEDCheckpointGlobalStateRoots { contract_tree_root: to_core_hash(roots.contract_tree_root), deposit_tree_root: to_core_hash(roots.deposit_tree_root), user_tree_root: to_core_hash(roots.user_tree_root), withdrawal_tree_root: to_core_hash(roots.withdrawal_tree_root), user_registration_tree_root: to_core_hash(roots.user_registration_tree_root), validator_tree_root: to_core_hash(roots.validator_tree_root) };
+    let proved = membership.prove(&leaf, &path, &global, &fetch_finalize_endpoints(provider, checkpoint_id, configured_chain_indices).await?, trusted_checkpoint_root)?;
+    anyhow::ensure!(proved.public_inputs.len() == bridge_agg_final_pi_len(configured_chain_indices.len()) && proved.public_inputs[16].to_canonical_u64() == checkpoint_id && proved.public_inputs[17] == F::ZERO, "membership finalizer does not bind the zero span");
+    Ok(proved)
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpeningWitness {
+    pub opening: String,
+    pub deposit_prefixes: Vec<crate::guardian::verify_l1::VerifiedDepositPrefix>,
+    pub rewards: Vec<OpeningRewardWitness>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpeningRewardWitness {
+    pub proof: String,
+    pub anchor: String,
+}
+
+
+pub(crate) async fn prove_bridge_opening(
+    from_checkpoint: u64,
+    to_checkpoint: u64,
+    rpc_config: &str,
+    aggregate_config: &Path,
+    opening_bytes: &[u8],
+    witness: &OpeningWitness,
+) -> anyhow::Result<(OpeningProof, psy_plonky2_circuits::bridge::circuits::bridge_wrap::BridgeOpeningWrapper)> {
+    use plonky2::plonk::config::Hasher;
+    use psy_crypto::hash::traits::qhashable::QFieldHashable;
+    use psy_plonky2_circuits::bridge::circuits::bridge_wrap::{BridgeOpeningChain, BridgeOpeningWrapper};
+    let from_checkpoint = from_checkpoint.max(1);
+    anyhow::ensure!(from_checkpoint <= to_checkpoint, "from_checkpoint must be <= to_checkpoint");
+    let coordinator_circuits = cached_bridge_coordinator_circuits()?;
+    let provider = RpcProvider::new_with_config_path(rpc_config)?;
+    let approved = psy_plonky2_circuits::bridge::aggregate_circuits::load_aggregate_setup_config(aggregate_config)?;
+    let network = NetworkConfig::decode(&hex::decode(&approved.network_config)?)?;
+    let indices = network.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>();
+    let circuits = build_bridge_circuits::<PsyNetworkLocalDevnetConstants>(
+        coordinator_circuits, &indices, approved.withdrawal_policies.clone(), network.ethereum_index,
+    )?;
+    circuits.validate_config(&network)?;
+    let opening = psy_client_data::bridge_aggregate::BridgeOpening::decode(opening_bytes)
+        .map_err(|error| anyhow::anyhow!("bridge opening: {error:?}"))?;
+    opening.validate_config(&network).map_err(|error| anyhow::anyhow!("bridge opening config: {error:?}"))?;
+    let canonical = opening.encode().map_err(|error| anyhow::anyhow!("bridge opening: {error:?}"))?;
+    anyhow::ensure!(canonical == opening_bytes, "bridge opening bytes are not canonical");
+    let witness_opening = canonical_base64(&witness.opening).context("witness opening is not canonical standard base64")?;
+    anyhow::ensure!(witness_opening == opening_bytes, "witness opening differs from the supplied opening bytes");
+    anyhow::ensure!(u64::from(opening.end_checkpoint_id) == to_checkpoint, "opening end checkpoint differs from the requested checkpoint");
+    anyhow::ensure!(witness.rewards.len() == opening.rewards.len(), "reward witness count differs from the opening");
+    let opening_digest = opening.opening_digest().map_err(|error| anyhow::anyhow!("opening digest: {error:?}"))?;
+
+    let mut finalizations = Vec::with_capacity(opening.chains.len());
+    let mut zero_span = Vec::with_capacity(opening.chains.len());
+    for row in &opening.chains {
+        let start_id = u64::from(row.start_checkpoint_id);
+        let span = to_checkpoint.checked_sub(start_id).context("opening start follows the end checkpoint")?;
+        let proof = if span == 0 {
+            prove_checkpoint_membership(&provider, coordinator_circuits, to_checkpoint, &indices, HashOut { elements: std::array::from_fn(|index| F::from_canonical_u64(row.start_checkpoint_root[index])) }).await?
+        } else {
+            let (proved, _, _) = prove_checkpoint_range(&provider, coordinator_circuits, start_id, to_checkpoint, &indices).await?;
+            anyhow::ensure!(proved.common_data == circuits.checkpoint_final.circuit_data.common && proved.verifier_data == circuits.checkpoint_final.circuit_data.verifier_only && proved.fingerprint == circuits.checkpoint_final.fingerprint, "checkpoint source pin mismatch");
+            proved.proof
+        };
+        let inputs = proof.public_inputs.iter().map(|field| field.to_canonical_u64()).collect::<Vec<_>>();
+        anyhow::ensure!(inputs[12..16] == opening.end_checkpoint_root && inputs[16] == to_checkpoint && inputs[17] == span, "selected finalization does not bind the opening endpoint");
+        if span == 0 {
+            anyhow::ensure!(inputs[..4] == opening.end_checkpoint_root, "zero-span finalization changed the checkpoint root");
+        } else {
+            anyhow::ensure!(inputs[..4] == row.start_checkpoint_root, "positive finalization does not start at the opening cursor");
+        }
+        zero_span.push(span == 0);
+        finalizations.push(proof);
+    }
+    let end_checkpoint_root = HashOut { elements: std::array::from_fn(|index| finalizations[0].public_inputs[12 + index]) };
+    anyhow::ensure!(end_checkpoint_root.elements.map(|limb| limb.to_canonical_u64()) == opening.end_checkpoint_root, "selected checkpoint root differs from the opening");
+    let end_gusr = HashOut { elements: std::array::from_fn(|index| finalizations[0].public_inputs[4 + index]) };
+    anyhow::ensure!(end_gusr.elements.map(|limb| limb.to_canonical_u64()) == opening.end_user_root, "selected user root differs from the opening");
+
+    let mut deposit_opening = DepositAggregateOpening {
+        config_hash: opening.config_hash,
+        window_id: [0; 32],
+        end_checkpoint_id: to_checkpoint,
+        end_checkpoint_root: opening.end_checkpoint_root,
+        starts: opening.chains.iter().map(|row| psy_client_data::bridge_aggregate::ChainStart {
+            chain_index: row.chain_index, start_checkpoint_id: u64::from(row.start_checkpoint_id), start_checkpoint_root: row.start_checkpoint_root,
+        }).collect(),
+        deposits: opening.chains.iter().map(|row| psy_client_data::bridge_aggregate::DepositTransition {
+            chain_index: row.chain_index, old_root: row.old_deposit_root, new_root: row.new_deposit_root, old_count: row.old_count, new_count: row.new_count,
+        }).collect(),
+        deposit_leaves: opening.deposits.clone(),
+    };
+    deposit_opening.window_id = deposit_opening.window_id().map_err(|error| anyhow::anyhow!("deposit window: {error:?}"))?;
+    let pages = build_deposit_spiderman_inputs(&network, &deposit_opening, &witness.deposit_prefixes)?;
+    let deposit = build_deposit_aggregate(&network, &deposit_opening, &pages, &circuits)?;
+    let policies = circuits.withdrawal_policies();
+    let ordinals = withdrawal_policy_ordinals(policies, &opening.withdrawals)?;
+    let mut withdrawal_claims = Vec::with_capacity(opening.withdrawals.len());
+    for (record, ordinal) in opening.withdrawals.iter().zip(ordinals) {
+        withdrawal_claims.push(fetch_withdrawal_claim_witness(&provider, policies, u64::from(opening.end_checkpoint_id), u64::from(record.user_id), ordinal, be_u32_words(&record.nonce), recipient_words(&record.recipient), amount_words(&record.amount)?).await?);
+    }
+    let withdrawal = prove_withdrawal_claims(&circuits.withdrawal_claim, &BridgeWithdrawalClaimInput {
+        end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root, end_gusr,
+        end_gcon: HashOut { elements: std::array::from_fn(|index| finalizations[0].public_inputs[8 + index]) },
+        claims: withdrawal_claims,
+    })?;
+
+    let mut roots = Vec::with_capacity(witness.rewards.len());
+    let mut claims = Vec::with_capacity(witness.rewards.len());
+    for (index, reward) in witness.rewards.iter().enumerate() {
+        let proof_bytes = canonical_base64(&reward.proof).context("reward root proof is not canonical standard base64")?;
+        let root = ProofWithPublicInputs::<F, C, D>::from_bytes(proof_bytes.clone(), &circuits.reward_root.circuit_data.common).context("reward root proof")?;
+        anyhow::ensure!(root.to_bytes() == proof_bytes && root.public_inputs.len() == REWARD_ROOT_STATEMENT_LEN, "reward root proof is not canonical");
+        let statement: [u64; REWARD_ROOT_STATEMENT_LEN] = std::array::from_fn(|field| root.public_inputs[field].to_canonical_u64());
+        let claim = psy_client_data::bridge_aggregate::RewardClaim::from_public_inputs(network.ethereum_index, &statement)
+            .map_err(|error| anyhow::anyhow!("reward claim: {error:?}"))?;
+        anyhow::ensure!(claim == opening.rewards[index], "reward root statement differs from the opening");
+        let anchor = canonical_base64(&reward.anchor).context("reward anchor is not canonical standard base64")?;
+        anyhow::ensure!(anchor.len() == 2696, "reward anchor width");
+        let anchor_fields = decode_reward_anchor(&anchor)?;
+        let statement_index = u32::try_from(index)?;
+        let selected = provider.get_checkpoint_tree_merkle_proof(to_checkpoint, anchor_fields[0]).await?;
+        claims.push(validate_reward_anchor(statement_index, &anchor_fields, &statement, to_checkpoint, end_checkpoint_root, &selected)?);
+        roots.push(root);
+    }
+    let batch = if roots.is_empty() { prove_empty_reward_batch(&circuits)? } else { prove_reward_root_batch(&circuits, &roots)? };
+    let reward = prove_reward_claims(&circuits, &BridgeRewardClaimInput {
+        end_checkpoint_id: opening.end_checkpoint_id, end_checkpoint_root, claims, batch_proof: batch,
+    })?;
+    let aggregate = prove_bridge_aggregate(&circuits, &deposit, &withdrawal, &reward, &finalizations, &zero_span)?;
+    let bound = bind_opening_digest(&aggregate, opening_bytes, opening_digest)?;
+    let chains = network.chains.iter().map(|chain| BridgeOpeningChain {
+        chain_index: chain.chain_index, bootstrap_id: chain.bootstrap_id, bootstrap_root: chain.bootstrap_root,
+    }).collect::<Vec<_>>();
+    let wrapper = BridgeOpeningWrapper::build(
+        &circuits.bridge_aggregate.circuit_data.common, &circuits.bridge_aggregate.circuit_data.verifier_only,
+        &circuits.withdrawal_claim.circuit_data.common, &circuits.withdrawal_claim.circuit_data.verifier_only,
+        approved.sources, network.config_hash().map_err(|error| anyhow::anyhow!("approved configuration hash: {error:?}"))?, &chains, circuits.withdrawal_policies(),
+    )?;
+    Ok((bound, wrapper))
+}
+
 pub async fn run_prove_bridge_agg_with_result(
     from_checkpoint: u64,
     to_checkpoint: u64,
@@ -1182,148 +1439,217 @@ pub async fn run_prove_bridge_agg_with_result(
     out_json: PathBuf,
     deployments_network: String,
     aggregate_config: PathBuf,
+    opening_bytes: Vec<u8>,
+    witness: OpeningWitness,
+    artifact_dir: PathBuf,
 ) -> anyhow::Result<BridgeProveResult> {
-    // Checkpoint 0 uses genesis transition proof path, not the normal
-    // checkpoint_root_transition format; verified proofs start from cp 1.
     let from_checkpoint = from_checkpoint.max(1);
     anyhow::ensure!(from_checkpoint <= to_checkpoint, "from_checkpoint must be <= to_checkpoint");
     let num_checkpoints_aggregated = to_checkpoint - from_checkpoint + 1;
-    anyhow::ensure!(
-        num_checkpoints_aggregated >= 1,
-        "bridge aggregation requires at least 1 checkpoint, got {} (from={} to={})",
-        num_checkpoints_aggregated,
-        from_checkpoint,
-        to_checkpoint
-    );
-
-    let coordinator_circuits = cached_bridge_coordinator_circuits()?;
-    let l1_config = load_l1_deployment_config(&deployments_network)?;
-    let provider = RpcProvider::new_with_config_path(&rpc_config)?;
-    let approved = super::regen_groth16_keystore::load_aggregate_setup_config(&aggregate_config)?;
-    let network = NetworkConfig::decode(&hex::decode(approved.network_config)?)?;
-    let indices = network.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>();
-    let checkpoint = &coordinator_circuits.checkpoint_root_transition;
-    let cached = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
-    let checkpoint_base = cached.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
-        .context("GenerateRollupStateTransitionProof not found in cached circuit library")?;
-    anyhow::ensure!(
-        checkpoint.get_fingerprint() == checkpoint_base,
-        "standalone finalize fingerprint differs from cached GenerateRollupStateTransitionProof"
-    );
-    let finalizer = BridgeAggFinalCircuit::<C, D>::prebuild_final_circuit(
-        checkpoint.get_common_circuit_data_ref(), checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(),
-        checkpoint.get_fingerprint(), checkpoint_base, CHECKPOINT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT,
-        GLOBAL_CONTRACT_TREE_HEIGHT, DEPOSIT_CONTRACT_STATE_TREE_HEIGHT, WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT, &indices);
-    let (result, _, _) = prove_checkpoint_range(
-        &provider,
-        coordinator_circuits,
-        from_checkpoint - 1,
-        to_checkpoint,
-        &indices,
-    ).await?;
-    anyhow::ensure!(result.configured_chain_indices == indices && result.common_data == finalizer.circuit_data.common && result.verifier_data == finalizer.circuit_data.verifier_only && result.fingerprint == finalizer.fingerprint, "standalone finalize source pin mismatch");
-    let l1_chain_index = l1_config.l1_chain_index;
-    let bridge_agg_proof = result.proof;
-    let bridge_agg_verifier_data = result.verifier_data;
-
-    tracing::info!(public_inputs = ?bridge_agg_proof.public_inputs, "bridge aggregation public inputs");
-    let felt4_to_bytes32_hex = |start: usize| -> String {
-        let mut out = [0u8; 32];
-        for i in 0..4 {
-            let v = bridge_agg_proof.public_inputs[start + (3 - i)].to_canonical_u64();
-            out[i * 8..(i + 1) * 8].copy_from_slice(&v.to_be_bytes());
-        }
-        format!("0x{}", hex::encode(out))
-    };
-    let u32x8_to_bytes32_hex = |start: usize| -> String {
-        let mut out = [0u8; 32];
-        for i in 0..8 {
-            let v = bridge_agg_proof.public_inputs[start + i].to_canonical_u64() as u32;
-            out[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
-        }
-        format!("0x{}", hex::encode(out))
-    };
-    let mut checkpoint_roots = Vec::with_capacity(2);
-    checkpoint_roots.push(felt4_to_bytes32_hex(0));
-    checkpoint_roots.push(felt4_to_bytes32_hex(20));
-    let deposit_tree_root = u32x8_to_bytes32_hex(4);
-    let withdrawal_tree_root = u32x8_to_bytes32_hex(12);
-    let end_checkpoint_index = bridge_agg_proof.public_inputs[24].to_canonical_u64();
-    tracing::info!(
-        deployments_network,
-        l1_chain_index,
-        "resolved L1 chain index for bridge top-tree proofs"
-    );
-    let (deposit_subtree_root, deposit_merkle_proof_b256) = fetch_tree_subroot_and_top_proof(
-        &provider,
-        to_checkpoint,
-        BRIDGE_USER_ID_U64,
-        DEPOSIT_TREE_CONTRACT_ID,
-        l1_chain_index,
-    )
-    .await?;
-    let (withdrawal_subtree_root, withdrawal_merkle_proof_b256) = fetch_tree_subroot_and_top_proof(
-        &provider,
-        to_checkpoint,
-        BRIDGE_USER_ID_U64,
-        WITHDRAWAL_TREE_CONTRACT_ID,
-        l1_chain_index,
-    )
-    .await?;
-    let b256_array_to_hex = |arr: [B256; 9]| arr.map(|x| format!("{:#066x}", x));
-    tracing::info!("building bridge wrap circuit");
-    let bridge_wrap = BridgeWrapCircuit::new(&finalizer)?;
-    tracing::info!("proving bridge wrap circuit");
-    let keystore = format!("{}/.psy/keystore/", home::home_dir().context("home directory unavailable")?.display());
-    let groth16_proof = bridge_wrap.prove_groth16(&bridge_agg_verifier_data, &bridge_agg_proof, keystore)?;
-    tracing::info!("groth16 wrap generated");
-
-    let solidity_proof = [
-        with_0x(&groth16_proof.pi_a[0]),
-        with_0x(&groth16_proof.pi_a[1]),
-        with_0x(&groth16_proof.pi_b[0][1]),
-        with_0x(&groth16_proof.pi_b[0][0]),
-        with_0x(&groth16_proof.pi_b[1][1]),
-        with_0x(&groth16_proof.pi_b[1][0]),
-        with_0x(&groth16_proof.pi_c[0]),
-        with_0x(&groth16_proof.pi_c[1]),
-    ];
-    let solidity_public_inputs = [with_0x(&groth16_proof.public_inputs[0]), with_0x(&groth16_proof.public_inputs[1])];
-    let output = ProveBridgeAggOutput {
-        from_checkpoint,
-        to_checkpoint,
-        num_checkpoints_aggregated,
-        l1_chain_index: u64::from(l1_chain_index),
-        bridge_agg_public_inputs_count: bridge_agg_proof.public_inputs.len(),
-        bridge_agg_public_inputs: bridge_agg_proof
-            .public_inputs
-            .iter()
-            .map(|x| x.to_canonical_u64().to_string())
-            .collect(),
-        groth16_proof,
-        solidity_proof,
-        solidity_public_inputs,
-        checkpoint_roots,
-        deposit_tree_root,
-        deposit_subtree_root: format!("{:#066x}", deposit_subtree_root),
-        deposit_merkle_proof: b256_array_to_hex(deposit_merkle_proof_b256),
-        withdrawal_tree_root,
-        withdrawal_subtree_root: format!("{:#066x}", withdrawal_subtree_root),
-        withdrawal_merkle_proof: b256_array_to_hex(withdrawal_merkle_proof_b256),
-        end_checkpoint_index,
-    };
-    let out_str = serde_json::to_string_pretty(&output)?;
-    fs::write(&out_json, &out_str).with_context(|| format!("failed to write output: {}", out_json.display()))?;
-    tracing::info!(path = %out_json.display(), "bridge proof output written");
-
+    let _l1_config = load_l1_deployment_config(&deployments_network)?;
+    let (bound, wrapper) = prove_bridge_opening(from_checkpoint, to_checkpoint, &rpc_config, &aggregate_config, &opening_bytes, &witness).await?;
+    let opening_dir = artifact_dir.join("BridgeOpening");
+    crate::bridge::regen_groth16_keystore::validate_bridge_opening_setup(&opening_dir, wrapper.identity())?;
+    let artifact = opening_dir.to_str().context("BridgeOpening artifact path must be UTF-8")?;
+    let groth16 = wrapper.prove_groth16(&bound.proof, artifact)?;
+    if let Some(parent) = out_json.parent().filter(|path| !path.as_os_str().is_empty()) { fs::create_dir_all(parent)?; }
+    fs::write(&out_json, serde_json::to_vec(&groth16)?)?;
     Ok(BridgeProveResult {
-        from_checkpoint,
-        to_checkpoint,
-        num_checkpoints_aggregated,
-        proof_path: out_json,
-        deposit_tree_root: output.deposit_tree_root.clone(),
-        withdrawal_tree_root: output.withdrawal_tree_root.clone(),
+        from_checkpoint, to_checkpoint, num_checkpoints_aggregated, proof_path: out_json, opening_digest: hex::encode(bound.opening_digest),
     })
+}
+fn canonical_base64(value: &str) -> anyhow::Result<Vec<u8>> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(value)?;
+    anyhow::ensure!(base64::engine::general_purpose::STANDARD.encode(&bytes) == value, "base64 is not canonical");
+    Ok(bytes)
+}
+
+fn decode_reward_anchor(anchor: &[u8]) -> anyhow::Result<[u64; 337]> {
+    anyhow::ensure!(anchor.len() == 2696, "reward anchor width");
+    let mut fields = [0u64; 337];
+    for (index, chunk) in anchor.chunks_exact(8).enumerate() {
+        let field = u64::from_le_bytes(chunk.try_into().unwrap());
+        anyhow::ensure!(field < 0xffff_ffff_0000_0001, "reward anchor field is outside Goldilocks");
+        fields[index] = field;
+    }
+    Ok(fields)
+}
+
+fn decoded_checkpoint_leaf(fields: &[u64; 337]) -> anyhow::Result<psy_client_data::qdata::checkpoint::PsyCheckpointLeaf<F>> {
+    use psy_client_common::traits::to_qfelts::{QFeltSized, ToQFelts};
+    use psy_client_data::qdata::checkpoint::PsyCheckpointLeaf;
+    let width = PsyCheckpointLeaf::<F>::q_felt_size();
+    anyhow::ensure!(width == 43 && 1 + width + 24 == 68, "checkpoint leaf and roots no longer occupy anchor fields 1..68");
+    let felts = fields[1..1 + width].iter().copied().map(F::from_canonical_u64).collect::<Vec<_>>();
+    Ok(PsyCheckpointLeaf::from_qfelts(&felts))
+}
+
+fn validate_reward_anchor(
+    statement_index: u32,
+    anchor_fields: &[u64; 337],
+    statement: &[u64; REWARD_ROOT_STATEMENT_LEN],
+    end_checkpoint_id: u64,
+    end_checkpoint_root: HashOut<F>,
+    selected: &psy_crypto::hash::merkle::core::MerkleProofCore<ClientQHashOut>,
+) -> anyhow::Result<BridgeRewardClaimWitness> {
+    use plonky2::plonk::config::Hasher;
+    use psy_crypto::hash::traits::qhashable::QFieldHashable;
+    let anchor_checkpoint_id = anchor_fields[0];
+    anyhow::ensure!(anchor_checkpoint_id <= u64::from(u32::MAX) && anchor_checkpoint_id <= end_checkpoint_id, "reward anchor checkpoint is outside the selected range");
+    let anchor_checkpoint_id = anchor_checkpoint_id as u32;
+    let anchor_leaf = decoded_checkpoint_leaf(anchor_fields)?.qfhash::<plonky2::hash::poseidon::PoseidonHash>().0;
+    let admission_siblings: [HashOut<F>; CHECKPOINT_TREE_HEIGHT] = std::array::from_fn(|level| HashOut { elements: std::array::from_fn(|limb| F::from_canonical_u64(anchor_fields[68 + level * 4 + limb])) });
+    let mut admission_root = anchor_leaf;
+    let mut cursor = u64::from(anchor_checkpoint_id);
+    for sibling in admission_siblings {
+        admission_root = if cursor & 1 == 0 { plonky2::hash::poseidon::PoseidonHash::two_to_one(admission_root, sibling) } else { plonky2::hash::poseidon::PoseidonHash::two_to_one(sibling, admission_root) };
+        cursor >>= 1;
+    }
+    anyhow::ensure!(admission_root.elements.map(|limb| limb.to_canonical_u64()) == statement[26..30], "reward anchor is not under its checkpoint root");
+    anyhow::ensure!(selected.index == u64::from(anchor_checkpoint_id) && selected.siblings.len() == CHECKPOINT_TREE_HEIGHT, "selected anchor path does not identify the anchor checkpoint");
+    anyhow::ensure!(to_core_hash(selected.value).0 == anchor_leaf, "selected anchor path authenticates another leaf");
+    let selected_root = to_core_hash(selected.root);
+    let selected_siblings: [HashOut<F>; CHECKPOINT_TREE_HEIGHT] = std::array::from_fn(|level| to_core_hash(selected.siblings[level]).0);
+    anyhow::ensure!(selected_root.0 == end_checkpoint_root, "selected anchor path does not bind the end checkpoint");
+    let (anchor_root, current_root) = parth_core::crypto::hash::merkle_proof::compute_historical_and_current_merkle_roots_core_gt::<HashOut<F>, plonky2::hash::poseidon::PoseidonHash>(&MerkleProofCore {
+        root: end_checkpoint_root, value: anchor_leaf, index: u64::from(anchor_checkpoint_id), siblings: selected_siblings.to_vec(),
+    });
+    anyhow::ensure!(current_root == end_checkpoint_root, "fetched anchor path does not reach the selected end root");
+    anyhow::ensure!(statement[26..30] == anchor_root.elements.map(|limb| limb.to_canonical_u64()), "reward root is not the historical root of the selected anchor");
+    Ok(BridgeRewardClaimWitness { statement_index, anchor_checkpoint_id, anchor_leaf, anchor_siblings: selected_siblings })
+}
+#[cfg(test)]
+mod withdrawal_conversion_tests {
+    use super::{amount_words, be_u32_words, recipient_words, withdrawal_policy_ordinals, BridgeTokenPolicy, F};
+    use plonky2::field::types::Field;
+    use psy_client_data::bridge_aggregate::WithdrawalBurnRecord;
+    use psy_client_data::qdata::contract::PsyContractLeaf;
+
+    fn policy(chain: u8, contract: u32) -> BridgeTokenPolicy {
+        BridgeTokenPolicy {
+            chain_index: chain, token_contract_id: contract, token_address: [0; 8],
+            approved_leaf: PsyContractLeaf { state_tree_height: F::from_canonical_usize(1), ..PsyContractLeaf::default() },
+            map_base: 8, capacity: 4,
+        }
+    }
+    fn record(chain: u8, contract: u32) -> WithdrawalBurnRecord {
+        WithdrawalBurnRecord { chain_index: chain, user_id: 1, contract_id: contract, nonce: [0; 32], recipient: [1; 20], amount: [0; 32] }
+    }
+
+    #[test]
+    fn recipient_keeps_leading_zero_words() {
+        let address = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+            0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50,
+        ];
+        let words = recipient_words(&address);
+        assert_eq!(&words[..3], &[0, 0, 0]);
+        assert_eq!(&words[3..], &[0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff10, 0x20304050]);
+    }
+
+    #[test]
+    fn nonce_preserves_words_above_goldilocks() {
+        let mut nonce = [0u8; 32];
+        nonce[0..8].copy_from_slice(&u64::MAX.to_be_bytes());
+        nonce[8..16].copy_from_slice(&0xffff_ffff_0000_0001u64.to_be_bytes());
+        let words = be_u32_words(&nonce);
+        assert_eq!(&words[..4], &[u32::MAX, u32::MAX, u32::MAX, 1]);
+        assert_eq!(&words[4..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn amount_accepts_power_of_two_and_modulus_minus_one() {
+        let mut power = [0u8; 32];
+        power[24..32].copy_from_slice(&(1u64 << 32).to_be_bytes());
+        assert_eq!(amount_words(&power).unwrap()[6..], [1, 0]);
+        let mut below = [0u8; 32];
+        below[24..32].copy_from_slice(&0xffff_ffff_0000_0000u64.to_be_bytes());
+        assert_eq!(amount_words(&below).unwrap()[6..], [u32::MAX, 0]);
+    }
+
+    #[test]
+    fn amount_rejects_zero_and_modulus() {
+        assert!(amount_words(&[0; 32]).is_err());
+        let mut modulus = [0u8; 32];
+        modulus[24..32].copy_from_slice(&0xffff_ffff_0000_0001u64.to_be_bytes());
+        assert!(amount_words(&modulus).is_err());
+    }
+
+    #[test]
+    fn policy_ordinals_follow_opening_order() {
+        let policies = vec![policy(1, 7), policy(2, 9)];
+        let records = vec![record(2, 9), record(1, 7)];
+        assert_eq!(withdrawal_policy_ordinals(&policies, &records).unwrap(), vec![1, 0]);
+        let mut ambiguous = policies.clone();
+        ambiguous.push(policy(2, 9));
+        assert!(withdrawal_policy_ordinals(&ambiguous, &records).is_err());
+        assert!(withdrawal_policy_ordinals(&policies[..1], &records).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reward_anchor_tests {
+    use super::{validate_reward_anchor, ClientQHashOut, CHECKPOINT_TREE_HEIGHT, F};
+    use plonky2::field::types::{Field, PrimeField64};
+    use plonky2::hash::hash_types::HashOut;
+    use psy_client_common::traits::to_qfelts::{QFeltSized, ToQFelts};
+    use psy_client_data::qdata::checkpoint::PsyCheckpointLeaf;
+    use psy_crypto::hash::{merkle::utils::simple_merkle_tree::SimpleMerkleTree, traits::qhashable::QFieldHashable};
+
+    fn hash(value: HashOut<F>) -> ClientQHashOut { psy_client_common::data::qhashout::QHashOut(value) }
+    fn fields_from_leaf(id: u64, leaf: &PsyCheckpointLeaf<F>, siblings: &[HashOut<F>; CHECKPOINT_TREE_HEIGHT]) -> [u64; 337] {
+        let mut fields = [0u64; 337];
+        fields[0] = id;
+        for (index, felt) in leaf.to_qfelts().into_iter().enumerate() { fields[1 + index] = felt.to_canonical_u64(); }
+        for (level, sibling) in siblings.iter().enumerate() {
+            for (limb, element) in sibling.elements.iter().enumerate() { fields[68 + level * 4 + limb] = element.to_canonical_u64(); }
+        }
+        fields
+    }
+    fn fixture() -> ([u64; 337], [u64; REWARD_ROOT_STATEMENT_LEN], u64, HashOut<F>, psy_crypto::hash::merkle::core::MerkleProofCore<ClientQHashOut>) {
+        let mut tree = SimpleMerkleTree::<plonky2::hash::poseidon::PoseidonHash, HashOut<F>>::new(CHECKPOINT_TREE_HEIGHT as u8);
+        let leaf = PsyCheckpointLeaf::<F>::default();
+        tree.set_leaf(7, leaf.qfhash::<plonky2::hash::poseidon::PoseidonHash>().0);
+        let admission = tree.get_leaf(7);
+        tree.set_leaf(11, HashOut { elements: [F::from_canonical_u64(9), F::ZERO, F::ZERO, F::ZERO] });
+        let selected = tree.get_leaf(7);
+        assert_ne!(admission.siblings, selected.siblings);
+        let fields = fields_from_leaf(7, &leaf, &std::array::from_fn(|level| admission.siblings[level]));
+        let mut statement = [0u64; REWARD_ROOT_STATEMENT_LEN];
+        statement[26..30].copy_from_slice(&admission.root.elements.map(|limb| limb.to_canonical_u64()));
+        let selected = psy_crypto::hash::merkle::core::MerkleProofCore { root: hash(selected.root), value: hash(selected.value), index: selected.index, siblings: selected.siblings.into_iter().map(hash).collect() };
+        (fields, statement, 11, selected.root.0, selected)
+    }
+
+    #[test]
+    fn older_admission_differs_from_selected_end_siblings() {
+        let (fields, statement, end_id, end_root, selected) = fixture();
+        let witness = validate_reward_anchor(4, &fields, &statement, end_id, end_root, &selected).unwrap();
+        assert_eq!(witness.statement_index, 4);
+        assert_eq!(witness.anchor_checkpoint_id, 7);
+        assert_eq!(witness.anchor_leaf, selected.value.0);
+        assert_eq!(witness.anchor_siblings, std::array::from_fn(|level| selected.siblings[level].0));
+    }
+
+    #[test]
+    fn altered_admission_path_is_rejected() {
+        let (mut fields, statement, end_id, end_root, selected) = fixture();
+        fields[68] ^= 1;
+        assert!(validate_reward_anchor(0, &fields, &statement, end_id, end_root, &selected).is_err());
+    }
+
+    #[test]
+    fn short_and_long_selected_paths_reject_before_indexing() {
+        let (fields, statement, end_id, end_root, selected) = fixture();
+        for length in [31usize, 33] {
+            let mut siblings = selected.siblings.clone();
+            siblings.resize(length, hash(HashOut::ZERO));
+            let mut selected = selected.clone();
+            selected.siblings = siblings;
+            assert!(validate_reward_anchor(0, &fields, &statement, end_id, end_root, &selected).is_err());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1369,6 +1695,127 @@ mod top_tree_tests {
         }
 
         assert_eq!(chain_two_value, root_from_chain_one);
+    }
+}
+
+#[cfg(test)]
+mod deposit_frontier_tests {
+    use super::{append_deposit_leaf, build_deposit_spiderman_inputs, deposit_leaf_hash};
+    use parth_core::{crypto::hash::traits::MerkleZeroHasher, pgoldilocks::PoseidonHasher};
+    use plonky2::field::types::PrimeField64;
+    use psy_client_data::bridge_aggregate::{
+        Bytes32, ChainConfig, ChainStart,
+        DepositAggregateOpening, DepositLeaf, DepositTransition, NetworkConfig, BRIDGE_USER_ID,
+    };
+
+    fn word(value: u64) -> Bytes32 {
+        let mut bytes = [0u8; 32];
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        bytes
+    }
+
+    fn config() -> NetworkConfig {
+        NetworkConfig {
+            version: 1, network_magic: 0, bridge_user_id: BRIDGE_USER_ID,
+            circuit_set_hash: [7; 32],
+            chains: (0..2).map(|index| ChainConfig {
+                chain_index: index, chain_id: word(u64::from(index) + 1),
+                bridge: [1; 20], state_manager: [2; 20], bootstrap_id: 0,
+                bootstrap_root: [1, 2, 3, 4],
+            }).collect(),
+            ethereum_index: 0, reward_payer: [3; 20], reward_token: [4; 20],
+            reward_per_claim: word(1), reward_token_decimals: 0,
+            max_withdrawals: 1024, max_rewards: 1024,
+        }
+    }
+
+    #[test]
+    fn prior_chain_seven_then_local_thirty_to_thirty_five_uses_two_frontiers() {
+        let network = config();
+        let mut leaves = Vec::new();
+        for (chain, absolute_index) in (0..7).map(|index| (0u8, index)).chain((30..35).map(|index| (1u8, index))) {
+            leaves.push(DepositLeaf {
+                chain_index: chain, absolute_index, shield_address: [9; 32], token: [0; 20],
+                l2_token_contract_id: word(1), amount: word(u64::from(absolute_index) + 1),
+                note_commitment: word(u64::from(chain) + 8),
+            });
+        }
+        let mut prior = [parth_core::pgoldilocks::QHashOut::ZERO; 32];
+        let mut prior_old = PoseidonHasher::get_zero_hash(32);
+        let mut prior_root = prior_old;
+        for (index, leaf) in leaves[..7].iter().enumerate() {
+            prior_root = append_deposit_leaf(&mut prior, index as u32, deposit_leaf_hash(leaf).unwrap());
+        }
+        let mut second_prefix = (0..30).map(|index| DepositLeaf {
+            chain_index: 1, absolute_index: index, shield_address: word(u64::from(index) + 20),
+            token: [3; 20], l2_token_contract_id: word(2), amount: word(u64::from(index) + 40),
+            note_commitment: word(u64::from(index) + 70),
+        }).collect::<Vec<_>>();
+        second_prefix.extend_from_slice(&leaves[7..]);
+        let mut local = [parth_core::pgoldilocks::QHashOut::ZERO; 32];
+        let mut old_root = PoseidonHasher::get_zero_hash(32);
+        for (index, leaf) in second_prefix[..30].iter().enumerate() {
+            old_root = append_deposit_leaf(&mut local, index as u32, deposit_leaf_hash(leaf).unwrap());
+        }
+        let retained_frontier = local;
+        let split = {
+            let mut frontier = local;
+            let mut root = old_root;
+            for (offset, leaf) in second_prefix[30..32].iter().enumerate() {
+                root = append_deposit_leaf(&mut frontier, 30 + offset as u32, deposit_leaf_hash(leaf).unwrap());
+            }
+            root
+        };
+        let mut new_root = old_root;
+        for (offset, leaf) in second_prefix[30..].iter().enumerate() {
+            new_root = append_deposit_leaf(&mut local, 30 + offset as u32, deposit_leaf_hash(leaf).unwrap());
+        }
+        let root = |value: parth_core::pgoldilocks::QHashOut<plonky2::field::goldilocks_field::GoldilocksField>| {
+            value.0.elements.map(|limb| limb.to_canonical_u64())
+        };
+        let mut opening = DepositAggregateOpening {
+            config_hash: network.config_hash().unwrap(), window_id: [0; 32],
+            end_checkpoint_id: 1, end_checkpoint_root: [5, 6, 7, 8],
+            starts: network.chains.iter().map(|chain| ChainStart {
+                chain_index: chain.chain_index, start_checkpoint_id: 0,
+                start_checkpoint_root: chain.bootstrap_root,
+            }).collect(),
+            deposits: vec![
+                DepositTransition { chain_index: 0, old_root: root(prior_old), new_root: root(prior_root), old_count: 0, new_count: 7 },
+                DepositTransition { chain_index: 1, old_root: root(old_root), new_root: root(new_root), old_count: 30, new_count: 35 },
+            ],
+            deposit_leaves: leaves.clone(),
+        };
+        opening.window_id = opening.window_id().unwrap();
+        let mut retained_second = crate::guardian::verify_l1::VerifiedDepositPrefix::empty(1);
+        retained_second.count = 30;
+        retained_second.frontier = retained_frontier.map(|hash| psy_client_common::data::qhashout::QHashOut(hash.0));
+        retained_second.root = psy_client_common::data::qhashout::QHashOut(old_root.0);
+        retained_second = retained_second.with_occupied(second_prefix[..30].iter().map(|leaf| psy_client_common::data::qhashout::QHashOut(deposit_leaf_hash(leaf).unwrap().0)).collect());
+        let retained = [crate::guardian::verify_l1::VerifiedDepositPrefix::empty(0), retained_second];
+        let pages = build_deposit_spiderman_inputs(&network, &opening, &retained).unwrap();
+        assert_eq!(pages.len(), 3);
+        assert_eq!((pages[0].chain_index, pages[0].first_leaf, pages[0].leaf_count, pages[0].old_count), (0, 0, 7, 0));
+        assert_eq!(pages[0].append_proof.top_line_proof.old_root, prior_old);
+        assert_eq!(pages[0].append_proof.top_line_proof.new_root, prior_root);
+        assert!(pages[0].append_proof.web_proof_old_leaves.iter().all(|leaf| *leaf == parth_core::pgoldilocks::QHashOut::ZERO));
+        let expected = [(1u8, 7u32, 2u32, 30u32, old_root, split), (1, 9, 3, 32, split, new_root)];
+        for (page, (chain, first, width, old_count, page_old, page_new)) in pages[1..].iter().zip(expected) {
+            assert_eq!((page.chain_index, page.first_leaf, page.leaf_count, page.old_count), (chain, first, width, old_count));
+            assert_eq!(page.append_proof.top_line_proof.old_root, page_old);
+            assert_eq!(page.append_proof.top_line_proof.new_root, page_new);
+            let occupied = (old_count % 32) as usize;
+            for (actual, retained) in page.append_proof.web_proof_old_leaves[..occupied].iter().zip(&retained[1].occupied_partial_page_hashes()[..occupied]) {
+                assert_eq!(*actual, super::to_core_hash(*retained));
+            }
+            assert!(page.append_proof.web_proof_old_leaves[occupied..].iter().all(|leaf| *leaf == parth_core::pgoldilocks::QHashOut::ZERO));
+        }
+        assert_ne!(pages[1].append_proof.top_line_proof.old_root, pages[1].append_proof.top_line_proof.new_root);
+        let mut crossed = opening.clone();
+        crossed.deposits[1].old_count = 31;
+        crossed.deposit_leaves.drain(8..9);
+        let mut crossed_prefix = retained[1].clone(); crossed_prefix.count = 31;
+        assert!(build_deposit_spiderman_inputs(&network, &crossed, &[retained[0].clone(), crossed_prefix]).is_err());
     }
 }
 
@@ -1568,5 +2015,65 @@ pub async fn build_deposit_batch_append_calls_remote(
     }
 
     Ok(calls)
+}
+
+pub(crate) fn selected_finalizer_is_membership(public_inputs: &[F], chain_count: usize) -> anyhow::Result<bool> {
+    anyhow::ensure!(public_inputs.len() == bridge_agg_final_pi_len(chain_count), "finalizer width differs from 18+5*C");
+    let span = public_inputs[17];
+
+    if span == F::ZERO {
+        anyhow::ensure!(public_inputs[..4] == public_inputs[12..16], "zero span changed the checkpoint root");
+        anyhow::ensure!(public_inputs.len() == 18 + 5 * chain_count, "every chain publishes a deposit endpoint");
+        Ok(true)
+    } else {
+        anyhow::ensure!(span.to_canonical_u64() > 0, "positive span is not canonical");
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod opening_selection_tests {
+    use super::selected_finalizer_is_membership;
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::Field;
+
+    #[test]
+    fn positive_span_uses_end_and_span_offsets() {
+        let mut inputs = vec![GoldilocksField::ZERO; 28];
+        inputs[16] = GoldilocksField::from_canonical_u64(11);
+        inputs[17] = GoldilocksField::from_canonical_u64(4);
+        assert_eq!(inputs.len(), psy_plonky2_circuits::bridge::circuits::bridge_agg_final::bridge_agg_final_pi_len(2));
+        assert!(!selected_finalizer_is_membership(&inputs, 2).unwrap());
+    }
+
+    #[test]
+    fn zero_span_rejects_a_changed_root() {
+        let mut inputs = vec![GoldilocksField::from_canonical_u64(9); 23];
+        inputs[16] = GoldilocksField::from_canonical_u64(7);
+        inputs[17] = GoldilocksField::ZERO;
+        for index in 0..4 { inputs[12 + index] = inputs[index]; }
+        assert!(selected_finalizer_is_membership(&inputs, 1).unwrap());
+        inputs[12] += GoldilocksField::ONE;
+        assert!(selected_finalizer_is_membership(&inputs, 1).is_err());
+    }
+
+    #[test]
+    fn noncanonical_opening_bytes_fail_before_any_proof() {
+        assert!(psy_client_data::bridge_aggregate::BridgeOpening::decode(&[0, 1, 2, 3]).is_err());
+        assert!(psy_client_data::bridge_aggregate::BridgeOpening::decode(&[4, 0, 0, 0, 1]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod aggregate_proof_command_tests {
+    #[test]
+    fn proof_only_command_does_not_read_a_deployment_file() {
+        let source = include_str!("prove_bridge.rs");
+        let producer = source.split("pub(crate) async fn prove_bridge_opening").nth(1).unwrap().split("pub async fn run_prove_bridge_agg_with_result").next().unwrap();
+        assert!(!producer.contains("load_l1_deployment_config"), "proof-only producer must not read deployments");
+        let normal = source.split("pub async fn run_prove_bridge_agg_with_result").nth(1).unwrap();
+        assert!(normal.contains("load_l1_deployment_config"), "normal prove keeps its deployment preflight");
+        assert!(!normal.contains("digest_inputs"), "normal prove must not accept a two-word digest");
+    }
 }
 

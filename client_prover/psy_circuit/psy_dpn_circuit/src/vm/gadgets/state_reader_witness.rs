@@ -1,6 +1,15 @@
-use plonky2::{hash::hash_types::RichField, iop::witness::Witness};
+use plonky2::{
+    field::types::Field,
+    hash::{
+        hash_types::{HashOut, RichField},
+        poseidon::PoseidonHash,
+    },
+    iop::witness::Witness,
+    plonk::config::Hasher,
+};
 use psy_client_common::data::qhashout::QHashOut;
-use psy_client_data::qdata::user::PsyUserLeaf;
+use psy_client_data::qdata::{imt_contract_state::IMTContractStateLeaf, user::PsyUserLeaf};
+use psy_common_circuit::hash::merkle::gadgets::{delta_merkle_proof::DeltaMerkleProofGadget, merkle_proof::MerkleProofGadget};
 use psy_crypto::hash::merkle::core::{DeltaMerkleProofCore, MerkleProofCore};
 use psy_vm::{
     dpn::{ops::state_cmd::data::DPNStateCmd, vm::def::DPNFunctionCircuitDefinition},
@@ -79,6 +88,44 @@ impl StateReaderGadget {
             );
         }
         Ok(())
+    }
+
+    /// Level-specific empty-tree siblings: the leaf-level zero hash followed by
+    /// successive self-hashes, matching `MerkleZeroHasher::get_zero_hash(level)`
+    /// and the in-circuit `two_to_one` root computation.
+    fn level_specific_empty_siblings<F: RichField>(height: usize) -> Vec<QHashOut<F>> {
+        let mut level = HashOut::<F>::ZERO;
+        (0..height)
+            .map(|_| {
+                let sibling = QHashOut(level);
+                level = PoseidonHash::two_to_one(level, level);
+                sibling
+            })
+            .collect()
+    }
+
+    /// Fill an unused delta proof with index 0, zero old/new values, and
+    /// level-specific empty siblings. The gadget still computes its roots from
+    /// the assigned siblings, so they stay internally consistent and are never
+    /// forced to zero.
+    fn set_witness_unused_delta_proof<W: Witness<F>, F: RichField>(
+        &self,
+        witness: &mut W,
+        gadget: &DeltaMerkleProofGadget,
+    ) -> anyhow::Result<()> {
+        let empty_siblings = Self::level_specific_empty_siblings::<F>(self.contract_state_tree_height);
+        gadget.set_witness(witness, F::ZERO, QHashOut::ZERO, QHashOut::ZERO, &empty_siblings)
+    }
+
+    /// Fill an unused merkle proof with index 0, a zero leaf value, and
+    /// level-specific empty siblings; the root stays computed, not zero.
+    fn set_witness_unused_merkle_proof<W: Witness<F>, F: RichField>(
+        &self,
+        witness: &mut W,
+        gadget: &MerkleProofGadget,
+    ) -> anyhow::Result<()> {
+        let empty_siblings = Self::level_specific_empty_siblings::<F>(self.contract_state_tree_height);
+        gadget.set_witness_generic::<W, F>(witness, F::ZERO, QHashOut::ZERO, &empty_siblings)
     }
 
     fn set_witness_for_key_dmp<W: Witness<F>, F: RichField>(
@@ -465,8 +512,12 @@ impl StateReaderGadget {
                 wb_state.inc_write_epoch();
             }
             DPNStateCmd::SetIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_write_imt_current_contract(c.condition, 0, wb_state.write_epoch);
+                let ck = StateCommandCacheKey::new_write_imt_current_contract(c.condition, c.base_offset, c.capacity, c.key, wb_state.write_epoch);
                 let imt_set_witness = cmd_witness.witness.get_imt_set_ref();
+                // Host delta vector is validated before any indexing: a disabled
+                // set carries none, an update one, an insertion three in
+                // predecessor, member, sentinel order.
+                let delta_proofs = imt_set_witness.delta_proofs()?;
 
                 let Some(reader_ref_key) = self.gadget_map.get(&ck).copied() else {
                     anyhow::bail!("missing state reader key for imt set witness: {:?}", ck);
@@ -477,44 +528,81 @@ impl StateReaderGadget {
                         let gadget = &self.imt_set_requests[index];
 
                         witness.set_target(gadget.is_insert.target, if imt_set_witness.is_insert { F::ONE } else { F::ZERO })?;
-                        witness.set_target(
-                            gadget.insert_has_predecessor.target,
-                            if imt_set_witness.insert_has_predecessor { F::ONE } else { F::ZERO },
-                        )?;
 
-                        gadget.update_old_leaf.set_witness(witness, &imt_set_witness.old_leaf)?;
-                        gadget.update_new_leaf.set_witness(witness, &imt_set_witness.new_leaf)?;
-                        gadget
-                            .update_delta_proof
-                            .set_witness_core_proof_q(witness, &imt_set_witness.delta_merkle_proofs[0])?;
-
-                        if imt_set_witness.delta_merkle_proofs.len() < 2 {
-                            anyhow::bail!(
-                                "IMT set witness expects at least 2 delta merkle proofs, got {}",
-                                imt_set_witness.delta_merkle_proofs.len()
-                            );
+                        match delta_proofs {
+                            [] => {
+                                // Disabled set: every leaf target zero and every
+                                // unused proof gadget filled with index 0, zero
+                                // values, and level-specific empty siblings; the
+                                // computed roots stay unconstrained, not zero.
+                                gadget.update_old_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.update_new_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.insert_predecessor_old_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.insert_predecessor_new_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.insert_new_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.sentinel_preimage.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.sentinel_old_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.sentinel_new_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                self.set_witness_unused_delta_proof::<W, F>(witness, &gadget.update_delta_proof)?;
+                                self.set_witness_unused_delta_proof::<W, F>(witness, &gadget.insert_predecessor_delta_proof)?;
+                                self.set_witness_unused_delta_proof::<W, F>(witness, &gadget.insert_new_leaf_delta_proof)?;
+                                self.set_witness_unused_delta_proof::<W, F>(witness, &gadget.insert_sentinel_delta_proof)?;
+                                self.set_witness_unused_merkle_proof::<W, F>(witness, &gadget.sentinel_merkle_proof)?;
+                            }
+                            [update_delta] => {
+                                // Ordinary update: the single member delta plus
+                                // the current sentinel authentication; insertion
+                                // leaves and deltas stay empty.
+                                gadget.update_old_leaf.set_witness(witness, &imt_set_witness.old_leaf)?;
+                                gadget.update_new_leaf.set_witness(witness, &imt_set_witness.new_leaf)?;
+                                gadget.update_delta_proof.set_witness_core_proof_q(witness, update_delta)?;
+                                gadget.insert_predecessor_old_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.insert_predecessor_new_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.insert_new_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.sentinel_old_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.sentinel_new_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                self.set_witness_unused_delta_proof::<W, F>(witness, &gadget.insert_predecessor_delta_proof)?;
+                                self.set_witness_unused_delta_proof::<W, F>(witness, &gadget.insert_new_leaf_delta_proof)?;
+                                self.set_witness_unused_delta_proof::<W, F>(witness, &gadget.insert_sentinel_delta_proof)?;
+                                gadget.sentinel_preimage.set_witness(witness, &imt_set_witness.sentinel_preimage)?;
+                                gadget
+                                    .sentinel_merkle_proof
+                                    .set_witness_core_proof_q_generic::<W, F>(witness, &imt_set_witness.sentinel_merkle_proof)?;
+                            }
+                            [predecessor_delta, member_delta, sentinel_delta] => {
+                                // Insertion: predecessor, member, and sentinel
+                                // deltas join R0->R1->R2->R3; the starting
+                                // sentinel_preimage and the post-member
+                                // sentinel_old_leaf stay distinct; the update
+                                // gadget stays empty.
+                                gadget.update_old_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                gadget.update_new_leaf.set_witness(witness, &IMTContractStateLeaf::sentinel())?;
+                                self.set_witness_unused_delta_proof::<W, F>(witness, &gadget.update_delta_proof)?;
+                                gadget.insert_predecessor_old_leaf.set_witness(witness, &imt_set_witness.predecessor_old_leaf)?;
+                                gadget.insert_predecessor_new_leaf.set_witness(witness, &imt_set_witness.predecessor_new_leaf)?;
+                                gadget.insert_new_leaf.set_witness(witness, &imt_set_witness.new_leaf)?;
+                                gadget.insert_predecessor_delta_proof.set_witness_core_proof_q(witness, predecessor_delta)?;
+                                gadget.insert_new_leaf_delta_proof.set_witness_core_proof_q(witness, member_delta)?;
+                                gadget.insert_sentinel_delta_proof.set_witness_core_proof_q(witness, sentinel_delta)?;
+                                gadget.sentinel_preimage.set_witness(witness, &imt_set_witness.sentinel_preimage)?;
+                                gadget
+                                    .sentinel_merkle_proof
+                                    .set_witness_core_proof_q_generic::<W, F>(witness, &imt_set_witness.sentinel_merkle_proof)?;
+                                gadget.sentinel_old_leaf.set_witness(witness, &imt_set_witness.sentinel_old_leaf)?;
+                                gadget.sentinel_new_leaf.set_witness(witness, &imt_set_witness.sentinel_new_leaf)?;
+                            }
+                            other => anyhow::bail!(
+                                "IMT set witness delta length {} is neither disabled 0, update 1, nor insert 3",
+                                other.len()
+                            ),
                         }
-                        let predecessor_proof = &imt_set_witness.delta_merkle_proofs[0];
-                        let new_leaf_proof = &imt_set_witness.delta_merkle_proofs[1];
-
-                        gadget
-                            .insert_predecessor_old_leaf
-                            .set_witness(witness, &imt_set_witness.predecessor_old_leaf)?;
-                        gadget
-                            .insert_predecessor_new_leaf
-                            .set_witness(witness, &imt_set_witness.predecessor_new_leaf)?;
-                        gadget.insert_new_leaf.set_witness(witness, &imt_set_witness.new_leaf)?;
-                        gadget
-                            .insert_predecessor_delta_proof
-                            .set_witness_core_proof_q(witness, predecessor_proof)?;
-                        gadget.insert_new_leaf_delta_proof.set_witness_core_proof_q(witness, new_leaf_proof)?;
                     }
                     v => anyhow::bail!("SetIMTContractStateValue expects IMTSet reference key type, but got {:?}", v),
                 }
                 wb_state.inc_write_epoch();
             }
             DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_read_imt_current_contract(c.key, wb_state.write_epoch);
+                let ck = StateCommandCacheKey::new_read_imt_current_contract(c.base_offset, c.capacity, c.key, wb_state.write_epoch);
                 let read_witness = cmd_witness.witness.get_imt_read_ref();
                 let Some(reader_ref_key) = self.gadget_map.get(&ck).copied() else {
                     anyhow::bail!("missing state reader key for imt current read witness: {:?}", ck);
@@ -529,12 +617,16 @@ impl StateReaderGadget {
                             &read_witness.merkle_proof.siblings,
                         )?;
                         gadget.leaf.set_witness(witness, &read_witness.leaf_preimage)?;
+                        gadget.sentinel_preimage.set_witness(witness, &read_witness.sentinel_preimage)?;
+                        gadget
+                            .sentinel_merkle_proof
+                            .set_witness_core_proof_q_generic::<W, F>(witness, &read_witness.sentinel_merkle_proof)?;
                     }
                     v => anyhow::bail!("IMT current read expects IMTRead key type, but got {:?}", v),
                 }
             }
             DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_read_imt_contains_current_contract(c.key, wb_state.write_epoch);
+                let ck = StateCommandCacheKey::new_read_imt_contains_current_contract(c.base_offset, c.capacity, c.key, wb_state.write_epoch);
                 let contains_witness = cmd_witness.witness.get_imt_contains_ref();
                 self.set_witness_for_key_imt_contains_mp(witness, &ck, &contains_witness.merkle_proof)?;
                 let Some(reader_ref_key) = self.gadget_map.get(&ck).copied() else {
@@ -544,6 +636,9 @@ impl StateReaderGadget {
                     StateReaderReferenceKeyType::IMTContains => {
                         let index = reader_ref_key.gadget_index;
                         self.imt_contains_leaf_requests[index].set_witness(witness, &contains_witness.leaf_preimage)?;
+                        self.imt_contains_sentinel_requests[index].set_witness(witness, &contains_witness.sentinel_preimage)?;
+                        self.imt_contains_sentinel_proofs[index]
+                            .set_witness_core_proof_q_generic::<W, F>(witness, &contains_witness.sentinel_merkle_proof)?;
                         witness.set_target(
                             self.imt_contains_exists_targets[index],
                             if contains_witness.exists { F::ONE } else { F::ZERO },
@@ -556,7 +651,14 @@ impl StateReaderGadget {
                 let read_witness = cmd_witness.witness.get_imt_self_user_external_read_ref();
                 let uct_ck = StateCommandCacheKey::new_read_self_user_external_contract_root(c.contract_id, wb_state.contract_call_epoch);
                 self.set_witness_for_key_mp(witness, &uct_ck, &read_witness.contract_tree_proof)?;
-                let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(c.contract_id, c.key, wb_state.contract_call_epoch);
+                let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(
+                    c.contract_id,
+                    c.base_offset,
+                    c.capacity,
+                    c.contract_state_tree_height,
+                    c.key,
+                    wb_state.contract_call_epoch,
+                );
                 let Some(reader_ref_key) = self.gadget_map.get(&imt_ck).copied() else {
                     anyhow::bail!("missing state reader key for imt external read witness: {:?}", imt_ck);
                 };
@@ -577,6 +679,11 @@ impl StateReaderGadget {
                             &read_witness.state_slot_proof.siblings,
                         )?;
                         gadget.leaf.set_witness(witness, &read_witness.leaf_preimage)?;
+                        gadget.sentinel_preimage.set_witness(witness, &read_witness.sentinel_preimage)?;
+                        Self::validate_dynamic_merkle_proof_height(cmd_witness, &read_witness.sentinel_merkle_proof)?;
+                        gadget
+                            .sentinel_merkle_proof
+                            .set_witness_core_proof_q_generic::<W, F>(witness, &read_witness.sentinel_merkle_proof)?;
                     }
                     v => anyhow::bail!("IMT external read expects IMTExternalRead key type, but got {:?}", v),
                 }
@@ -587,7 +694,15 @@ impl StateReaderGadget {
                 let user_tree_ck = StateCommandCacheKey::new_read_other_user_leaf_hash(c.user_id);
                 let user_leaf_ck = StateCommandCacheKey::new_read_other_user_leaf(c.user_id);
                 let uct_ck = StateCommandCacheKey::new_read_other_user_contract_root(c.user_id, c.contract_id);
-                let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(c.user_id, c.contract_id, c.key, wb_state.write_epoch);
+                let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(
+                    c.user_id,
+                    c.contract_id,
+                    c.base_offset,
+                    c.capacity,
+                    c.contract_state_tree_height,
+                    c.key,
+                    wb_state.write_epoch,
+                );
 
                 self.set_witness_for_key_mp(witness, &user_tree_ck, &read_witness.user_leaf_witness.user_tree_proof)?;
                 self.set_witness_for_key_user_leaf(witness, &user_leaf_ck, &read_witness.user_leaf_witness.user_leaf)?;
@@ -606,6 +721,11 @@ impl StateReaderGadget {
                             &read_witness.state_slot_proof.siblings,
                         )?;
                         gadget.leaf.set_witness(witness, &read_witness.leaf_preimage)?;
+                        gadget.sentinel_preimage.set_witness(witness, &read_witness.sentinel_preimage)?;
+                        Self::validate_dynamic_merkle_proof_height(cmd_witness, &read_witness.sentinel_merkle_proof)?;
+                        gadget
+                            .sentinel_merkle_proof
+                            .set_witness_core_proof_q_generic::<W, F>(witness, &read_witness.sentinel_merkle_proof)?;
                     }
                     v => anyhow::bail!("IMT other-user read expects IMTOtherUserRead key type, but got {:?}", v),
                 }
@@ -616,7 +736,15 @@ impl StateReaderGadget {
                 let user_tree_ck = StateCommandCacheKey::new_read_other_user_leaf_hash(c.user_id);
                 let user_leaf_ck = StateCommandCacheKey::new_read_other_user_leaf(c.user_id);
                 let uct_ck = StateCommandCacheKey::new_read_other_user_contract_root(c.user_id, c.contract_id);
-                let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(c.user_id, c.contract_id, c.key, wb_state.write_epoch);
+                let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(
+                    c.user_id,
+                    c.contract_id,
+                    c.base_offset,
+                    c.capacity,
+                    c.contract_state_tree_height,
+                    c.key,
+                    wb_state.write_epoch,
+                );
 
                 self.set_witness_for_key_mp(witness, &user_tree_ck, &read_witness.user_leaf_witness.user_tree_proof)?;
                 self.set_witness_for_key_user_leaf(witness, &user_leaf_ck, &read_witness.user_leaf_witness.user_leaf)?;
@@ -636,6 +764,11 @@ impl StateReaderGadget {
                         )?;
                         gadget.leaf.set_witness(witness, &read_witness.leaf_preimage)?;
                         witness.set_target(gadget.exists, if read_witness.exists { F::ONE } else { F::ZERO })?;
+                        gadget.sentinel_preimage.set_witness(witness, &read_witness.sentinel_preimage)?;
+                        Self::validate_dynamic_merkle_proof_height(cmd_witness, &read_witness.sentinel_merkle_proof)?;
+                        gadget
+                            .sentinel_merkle_proof
+                            .set_witness_core_proof_q_generic::<W, F>(witness, &read_witness.sentinel_merkle_proof)?;
                     }
                     v => anyhow::bail!("IMT contains other-user expects IMTContainsOtherUser key type, but got {:?}", v),
                 }
@@ -678,5 +811,29 @@ impl StateReaderGadget {
             })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use psy_crypto::hash::traits::hasher::MerkleZeroHasher;
+
+    type F = GoldilocksField;
+
+    #[test]
+    fn level_specific_empty_siblings_match_zero_hash_chain() {
+        let siblings = StateReaderGadget::level_specific_empty_siblings::<F>(8);
+        let expected: Vec<QHashOut<F>> = (0..8).map(|level| PoseidonHash::get_zero_hash(level)).collect();
+        assert_eq!(siblings, expected);
+        assert_eq!(siblings[0], QHashOut::ZERO, "level 0 must be the raw zero leaf");
+        assert_ne!(siblings[1], siblings[0], "level 1 must fold the zero leaf");
+    }
+
+    #[test]
+    fn level_specific_empty_siblings_cover_supported_heights() {
+        assert_eq!(StateReaderGadget::level_specific_empty_siblings::<F>(1).len(), 1);
+        assert_eq!(StateReaderGadget::level_specific_empty_siblings::<F>(32).len(), 32);
     }
 }

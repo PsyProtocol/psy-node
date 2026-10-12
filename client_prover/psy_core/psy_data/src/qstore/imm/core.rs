@@ -118,9 +118,9 @@ impl<T: KVQBinaryStore> QMetaDataStoreReaderSync<F> for T {
         user_id: u64,
         contract_id: u64,
         key: &QHashOut<F>,
-    ) -> anyhow::Result<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)> {
+    ) -> anyhow::Result<Option<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>> {
         let _ = (checkpoint_id, user_id, contract_id, key);
-        anyhow::bail!("No predecessor found for key")
+        Ok(None)
     }
 
     async fn contract_state_imt_get_next_append_index(&self, user_id: u64, contract_id: u64) -> anyhow::Result<u64> {

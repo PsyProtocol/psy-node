@@ -607,7 +607,7 @@ mod tests {
             let hash_words = |hash: QHashOut<F>| hash.0.elements.map(|limb| limb.to_canonical_u64());
             let witness = super::super::reward_session::RewardSessionJobWitness {
                 height, path_index,
-                tag: super::super::reward_inclusion::RewardTagWitness { tag_preimage: QHashOut::ZERO, leaf_left: QHashOut::ZERO,
+                tag: super::reward_chain::RewardTagWitness { tag_preimage: QHashOut::ZERO, leaf_left: QHashOut::ZERO,
                     leaf_right: QHashOut::ZERO, leaf_tag: QHashOut::ZERO, siblings: [QHashOut::ZERO; 21], parent_tags: [QHashOut::ZERO; 21] },
                 nullifier_siblings: siblings.map(hash_words),
             };

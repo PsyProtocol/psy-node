@@ -15,11 +15,9 @@ use psy_plonky2_circuits::{
     },
     circuit_library::get_plonky2_circuit_library_and_prover_for_network,
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
+    qstandard::QStandardCircuit,
 };
-use psy_plonky2_common_circuits::bridge::{
-    deposit_spiderman_append::{DepositSpidermanAppendCircuit, DEPOSIT_SPIDERMAN_PI_WORDS},
-    withdrawal_inclusion::{WithdrawalInclusionCircuit, WITHDRAWAL_INCLUSION_PUBLIC_INPUTS},
-};
+use psy_plonky2_common_circuits::bridge::withdrawal_inclusion::{WithdrawalInclusionCircuit, WITHDRAWAL_INCLUSION_PUBLIC_INPUTS};
 
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
@@ -37,19 +35,6 @@ fn save_common_verifier(name: &str, data: &CircuitData<GoldilocksField, C, D>) -
     let verifier = data.verifier_only.to_bytes().map_err(|error| anyhow::anyhow!("verifier serialization: {error:?}"))?;
     fs::write(directory.join("common.bin"), common).context("write common circuit data")?;
     fs::write(directory.join("verifier.bin"), verifier).context("write verifier circuit data")?;
-    Ok(())
-}
-
-#[test]
-#[ignore = "builds the deposit spiderman append leaf"]
-fn print_deposit_spiderman_append() -> anyhow::Result<()> {
-    println!("deposit_spiderman_append=before");
-    let deposit = DepositSpidermanAppendCircuit::<C, D>::build();
-    let registration = circuit_set_registration(1, 0, 0, DEPOSIT_SPIDERMAN_PI_WORDS, &deposit.circuit_data, [0; 4])?;
-    print_registration("deposit_spiderman_append", &registration)?;
-    save_common_verifier("deposit_spiderman_append", &deposit.circuit_data)?;
-    println!("deposit_spiderman_append=after");
-    drop(deposit);
     Ok(())
 }
 
@@ -112,9 +97,15 @@ fn print_checkpoint_zero_root() -> anyhow::Result<()> {
 #[ignore = "builds the full aggregate circuit graph"]
 fn print_circuit_set_hash() -> anyhow::Result<()> {
     let (_, coordinator) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(PsyChainNetworkType::LocalDevnet)?;
+    let (checkpoint_common_data, checkpoint_cap_height, checkpoint_fingerprint) = {
+        let checkpoint = &coordinator.checkpoint_root_transition;
+        (checkpoint.get_common_circuit_data_ref(), checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(), checkpoint.get_fingerprint())
+    };
     let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(
         &[0],
-        &coordinator,
+        checkpoint_common_data,
+        checkpoint_cap_height,
+        checkpoint_fingerprint,
         AggregateCircuitHeights {
             deposit_state_tree: psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
             withdrawal_state_tree: psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,

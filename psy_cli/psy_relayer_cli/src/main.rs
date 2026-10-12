@@ -59,12 +59,14 @@ enum Commands {
     },
     /// Initialize keystore (generate or load Groth16 proving/verification keys)
     Initialize { keystore_dir: String },
-    /// Export Solidity verifier contract from an initialized keystore.
-    ExportSolidityVerifier {
-        keystore_dir: String,
-        out_verifier_sol: String,
+    /// Export the installed product opening verifier after strict setup validation.
+    ExportOpeningVerifier {
         #[arg(long)]
-        finalize: bool,
+        aggregate_config: PathBuf,
+        #[arg(long)]
+        artifact_dir: PathBuf,
+        #[arg(long)]
+        out_verifier_sol: PathBuf,
     },
     /// Scan L2 withdrawal events and propose them to the withdrawal tree.
     ProposeWithdrawals(bridge::propose_withdrawals::ProposeWithdrawalsArgs),
@@ -80,6 +82,30 @@ enum Commands {
         deployments_network: String,
         #[arg(long)]
         aggregate_config: PathBuf,
+
+        /// Witness JSON: base64 opening, chain-aligned prefixes, and ordered reward proofs.
+        #[arg(long)]
+        witness_json: PathBuf,
+        /// Existing operator aggregate artifact directory whose child is BridgeOpening.
+        #[arg(long)]
+        artifact_dir: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Prove one aggregate opening and write canonical bound proof bytes. No keystore or deployment file.
+    ProveBridgeAggregateProof {
+        #[arg(long)]
+        from_checkpoint: u64,
+        #[arg(long)]
+        to_checkpoint: u64,
+        #[arg(long, default_value = "config.json")]
+        rpc_config: String,
+        #[arg(long)]
+        aggregate_config: PathBuf,
+        /// Witness JSON: base64 opening, chain-aligned prefixes, and ordered reward proofs.
+        #[arg(long)]
+        witness_json: PathBuf,
+        /// Destination for canonical ProofWithPublicInputs bytes.
         #[arg(long)]
         out: PathBuf,
     },
@@ -229,27 +255,32 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Initialization complete");
             Ok(())
         }
-        Some(Commands::ExportSolidityVerifier { keystore_dir, out_verifier_sol, finalize }) => {
-            if keystore_dir.is_empty() {
-                anyhow::bail!("keystore_dir cannot be empty");
+        Some(Commands::ExportOpeningVerifier { aggregate_config, artifact_dir, out_verifier_sol }) => {
+            let approved = psy_plonky2_circuits::bridge::aggregate_circuits::load_aggregate_setup_config(&aggregate_config)?;
+            let network = psy_client_data::bridge_aggregate::NetworkConfig::decode(&hex::decode(&approved.network_config)?)?;
+            let coordinator = bridge::prove_bridge::cached_bridge_coordinator_circuits()?;
+            let indices = network.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>();
+            let circuits = bridge::prove_bridge::build_bridge_circuits::<psy_core::network_config::PsyNetworkLocalDevnetConstants>(
+                coordinator, &indices, approved.withdrawal_policies.clone(), network.ethereum_index,
+            )?;
+            circuits.validate_config(&network)?;
+            let opening_chains = network.chains.iter().map(|chain| psy_plonky2_circuits::bridge::circuits::bridge_wrap::BridgeOpeningChain {
+                chain_index: chain.chain_index, bootstrap_id: chain.bootstrap_id, bootstrap_root: chain.bootstrap_root,
+            }).collect::<Vec<_>>();
+            let bridge_data = &circuits.bridge_aggregate.circuit_data;
+            let claim_data = circuits.withdrawal_claim_data();
+            let opening = psy_plonky2_circuits::bridge::circuits::bridge_wrap::BridgeOpeningWrapper::build(
+                &bridge_data.common, &bridge_data.verifier_only, &claim_data.common, &claim_data.verifier_only,
+                approved.sources, network.config_hash().map_err(|error| anyhow::anyhow!("approved configuration hash: {error:?}"))?, &opening_chains, circuits.withdrawal_policies(),
+            )?;
+            let opening_dir = artifact_dir.join("BridgeOpening");
+            bridge::regen_groth16_keystore::validate_bridge_opening_setup(&opening_dir, opening.identity())?;
+            let sol = fs::read_to_string(opening_dir.join("verifier.sol"))?;
+            if let Some(parent) = out_verifier_sol.parent().filter(|path| !path.as_os_str().is_empty()) {
+                fs::create_dir_all(parent).with_context(|| format!("failed to create dir: {:?}", parent))?;
             }
-            let sol = if finalize {
-                g16::export_finalize_verifier(&keystore_dir).map_err(|error| anyhow::anyhow!("finalize export failed: {error}"))?
-            } else {
-                g16::export_solidity_verifier(&keystore_dir)
-            };
-            if sol.trim_start().starts_with("error:") {
-                anyhow::bail!("export solidity verifier failed for {}: {}", keystore_dir, sol.trim());
-            }
-            if let Some(parent) = Path::new(&out_verifier_sol).parent() {
-                if !parent.as_os_str().is_empty() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create dir: {:?}", parent))?;
-                }
-            }
-            fs::write(&out_verifier_sol, &sol)
-                .with_context(|| format!("failed to write verifier: {}", out_verifier_sol))?;
-            println!("exported solidity verifier: {}", out_verifier_sol);
+            fs::write(&out_verifier_sol, &sol).with_context(|| format!("failed to write verifier: {}", out_verifier_sol.display()))?;
+            println!("exported solidity verifier: {}", out_verifier_sol.display());
             Ok(())
         }
         Some(Commands::ProposeWithdrawals(args)) => bridge::propose_withdrawals::run(args).await,
@@ -259,8 +290,13 @@ async fn main() -> anyhow::Result<()> {
             rpc_config,
             deployments_network,
             aggregate_config,
+            witness_json,
+            artifact_dir,
             out,
         }) => {
+            use base64::Engine;
+            let witness: bridge::prove_bridge::OpeningWitness = serde_json::from_slice(&fs::read(&witness_json)?)?;
+            let opening_bytes = base64::engine::general_purpose::STANDARD.decode(witness.opening.as_bytes())?;
             bridge::prove_bridge::run_prove_bridge_agg_with_result(
                 from_checkpoint,
                 to_checkpoint,
@@ -268,9 +304,30 @@ async fn main() -> anyhow::Result<()> {
                 out,
                 deployments_network,
                 aggregate_config,
+                opening_bytes,
+                witness,
+                artifact_dir,
             )
             .await
             .map(|_| ())
+        }
+        Some(Commands::ProveBridgeAggregateProof {
+            from_checkpoint,
+            to_checkpoint,
+            rpc_config,
+            aggregate_config,
+            witness_json,
+            out,
+        }) => {
+            use base64::Engine;
+            let witness: bridge::prove_bridge::OpeningWitness = serde_json::from_slice(&fs::read(&witness_json)?)?;
+            let opening_bytes = base64::engine::general_purpose::STANDARD.decode(witness.opening.as_bytes())?;
+            let (bound, _wrapper) = bridge::prove_bridge::prove_bridge_opening(
+                from_checkpoint, to_checkpoint, &rpc_config, &aggregate_config, &opening_bytes, &witness,
+            ).await?;
+            if let Some(parent) = out.parent().filter(|path| !path.as_os_str().is_empty()) { fs::create_dir_all(parent)?; }
+            fs::write(&out, bound.proof.to_bytes())?;
+            Ok(())
         }
         Some(Commands::FinalizeBridgeAgg(args)) => bridge::finalize_bridge::run(args).await,
         Some(Commands::ClaimWithdrawals(args)) => bridge::claim_withdrawals::run(args).await,

@@ -19,7 +19,7 @@ PSY_SKIP_BUILD ?= 1
 PURGE ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test check check-all deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online restart-all mint-relayer-deposit-withdrawal
+.PHONY: all build clean test check check-all deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore export-solidity-verifier psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online
 
 all: build
 
@@ -151,6 +151,7 @@ generate-local-circuits:
 	cargo test --release -p psy_prover generate_local_circuits_json -- --ignored --nocapture
 
 data := ./psy_cli/psy_relayer_cli/data
+AGGREGATE_CONFIG ?= $(HOME)/.psy/keystore/aggregate_setup.json
 KEYSTORE_DIR ?= $(HOME)/.psy/keystore
 generate-groth16:
 	${BIN_PREFIX}/psy_relayer_cli generate-groth16  ${data}/common_circuit_data.json \
@@ -161,19 +162,9 @@ generate-groth16:
 													  ${data}/out_vk.json
 
 regen-groth16-keystore:
-	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR) --include-bridge-agg
+	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR)
 
-regen-bridge-agg-keystore:
-	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR) --skip-deposit-append --skip-withdrawal-claim --include-bridge-agg
 
 keystore := $(KEYSTORE_DIR)
 export-solidity-verifier:
-	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore} ./psy-contracts/src/GnarkGroth16Verifier.sol
-
-export-solidity-verifier-deposit:
-	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/deposit_append ./psy-contracts/src/DepositBatchVerifier.sol
-
-export-solidity-verifier-withdrawal:
-	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/withdrawal_claim ./psy-contracts/src/WithdrawalClaimVerifier.sol
-
-export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal
+	${BIN_PREFIX}/psy_relayer_cli export-opening-verifier --aggregate-config $(AGGREGATE_CONFIG) --artifact-dir ${keystore} --out-verifier-sol ./psy-contracts/src/GnarkGroth16Verifier.sol

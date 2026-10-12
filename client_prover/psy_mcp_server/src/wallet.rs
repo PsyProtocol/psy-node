@@ -1796,6 +1796,11 @@ fn validate_cached_identity(backup: &crate::keystore::KeyBackup, pk_hash: QHashO
 
 /// The note tree is 20 levels deep (2^20 notes per user/contract).
 const NOTE_TREE_HEIGHT: usize = 20;
+const NOTE_FRONTIER_BASE_LEAF: u64 = 1;
+const NOTE_COUNT_LEAF: u64 = 2_147_483_669;
+const NOTE_COUNT_LIMB: usize = 1;
+const BALANCE_LEAF: u64 = 21;
+const BALANCE_LIMB: usize = 0;
 
 /// A private transfer that settled on chain AND carries the inclusion proof the
 /// recipient needs. Both halves are required: settlement alone leaves the note
@@ -1852,7 +1857,7 @@ impl WalletManager {
 
         let provider = self.state(network).await?.session.st_provider.with_user_id_owned(sender_user_id);
         let checkpoint_before = self.latest_checkpoint(network).await?;
-        let baseline_count = Self::read_note_count(&provider, sender_user_id, contract_id, note_root_slot, checkpoint_before)
+        let baseline_count = Self::read_note_count(&provider, sender_user_id, contract_id, checkpoint_before)
             .await
             .unwrap_or(0);
 
@@ -1877,7 +1882,7 @@ impl WalletManager {
             if latest <= checkpoint_before {
                 continue;
             }
-            let count = match Self::read_note_count(&provider, sender_user_id, contract_id, note_root_slot, latest).await {
+            let count = match Self::read_note_count(&provider, sender_user_id, contract_id, latest).await {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -1888,7 +1893,6 @@ impl WalletManager {
                 &provider,
                 sender_user_id,
                 contract_id,
-                note_root_slot,
                 amount,
                 owner,
                 note_commitment,
@@ -2005,12 +2009,11 @@ impl WalletManager {
         })
     }
 
-    /// Note count for (user, contract) — stored one slot below the note root.
+    /// Note count for (user, contract): leaf 2147483669, limb 1.
     async fn read_note_count(
         provider: &psy_provider::provider::RpcProvider,
         sender_user_id: u64,
         contract_id: u64,
-        note_root_slot: u64,
         checkpoint_id: u64,
     ) -> Result<u64> {
         let proof = provider
@@ -2019,10 +2022,10 @@ impl WalletManager {
                 sender_user_id,
                 contract_id as u32,
                 psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
-                note_root_slot.saturating_sub(1),
+                NOTE_COUNT_LEAF,
             )
             .await?;
-        Ok(proof.value.0.elements[3].to_canonical_u64())
+        Ok(proof.value.0.elements[NOTE_COUNT_LIMB].to_canonical_u64())
     }
 
     /// Rebuild the append-only note-tree membership proof for the new note.
@@ -2033,13 +2036,12 @@ impl WalletManager {
         provider: &psy_provider::provider::RpcProvider,
         sender_user_id: u64,
         contract_id: u64,
-        note_root_slot: u64,
         amount: u64,
         owner: QHashOut<F>,
         note_commitment: QHashOut<F>,
         checkpoint_id: u64,
     ) -> Result<MerkleProofCore<QHashOut<F>>> {
-        let note_index = Self::read_note_count(provider, sender_user_id, contract_id, note_root_slot, checkpoint_id)
+        let note_index = Self::read_note_count(provider, sender_user_id, contract_id, checkpoint_id)
             .await?
             .saturating_sub(1);
 
@@ -2051,7 +2053,7 @@ impl WalletManager {
                     sender_user_id,
                     contract_id as u32,
                     psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
-                    note_root_slot + 1 + level,
+                    NOTE_FRONTIER_BASE_LEAF + level,
                 )
                 .await?;
             last_path.push(proof.value);
@@ -2953,7 +2955,7 @@ mod qhash_encoding_tests {
 
 impl WalletManager {
     /// Spendable public balance for a token contract, read from the chain
-    /// (contract state leaf 0, felt 0) at the latest checkpoint.
+    /// (contract state leaf 21, limb 0) at the latest checkpoint.
     pub async fn balance(&self, network: &NetworkId, contract_id: u64) -> Result<u64> {
         let user = self.require_user(network).await?;
         let checkpoint = self.latest_checkpoint(network).await?;
@@ -2964,9 +2966,9 @@ impl WalletManager {
                 user.user_id,
                 contract_id as u32,
                 psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as u8,
-                0,
+                BALANCE_LEAF,
             )
             .await?;
-        Ok(proof.value.0.elements[0].to_canonical_u64())
+        Ok(proof.value.0.elements[BALANCE_LIMB].to_canonical_u64())
     }
 }

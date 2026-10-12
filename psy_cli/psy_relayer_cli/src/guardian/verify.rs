@@ -36,7 +36,7 @@ pub struct VerifiedGuardianSession {
 #[derive(Default)]
 pub struct GuardianHistory {
     approved_artifacts: std::sync::Mutex<BTreeMap<([u8;32],[u8;32]),Option<ApprovedTokenMap>>>,
-    pub(crate) custody_prefixes: tokio::sync::Mutex<BTreeMap<([u8;32],String),super::verify_l1::VerifiedDepositPrefix>>,
+    pub(crate) deposit_prefixes: tokio::sync::Mutex<BTreeMap<([u8;32],String),super::verify_l1::VerifiedDepositPrefix>>,
     nonce: u64,
     ending_leaf: Option<Hash4>,
     chains: BTreeMap<u8,(u32,[Hash4;32],Hash4)>,
@@ -48,6 +48,18 @@ impl GuardianHistory {
     pub fn validate_authorization_artifacts(&self, authorization: &GuardianAuthorization) -> Result<()> {
         for approved in &authorization.approved_contracts { self.approved_artifact(approved)?; }
         Ok(())
+    }
+
+    pub(crate) async fn seed_deposit_prefix(&self, chain: &ChainAuthorization, endpoint: &ChainEndpoint, prefix: super::verify_l1::VerifiedDepositPrefix) -> anyhow::Result<()> {
+        let approval = sha256(&serde_json::to_vec(chain).map_err(|_| GuardianSignError::AuthorizationMismatch)?);
+        let mut prefixes = self.deposit_prefixes.lock().await;
+        prefixes.insert((approval.0, endpoint.rpc_url.clone()), prefix);
+        Ok(())
+    }
+
+    pub(crate) async fn deposit_prefix(&self, chain: &ChainAuthorization, endpoint: &ChainEndpoint) -> anyhow::Result<Option<super::verify_l1::VerifiedDepositPrefix>> {
+        let approval = sha256(&serde_json::to_vec(chain).map_err(|_| GuardianSignError::AuthorizationMismatch)?);
+        Ok(self.deposit_prefixes.lock().await.get(&(approval.0, endpoint.rpc_url.clone())).cloned())
     }
 
     fn approved_artifact(&self, approved: &ApprovedContract) -> Result<Option<ApprovedTokenMap>> {

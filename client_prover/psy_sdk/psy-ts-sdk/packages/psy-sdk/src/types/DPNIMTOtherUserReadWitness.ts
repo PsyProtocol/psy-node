@@ -4,4 +4,4 @@ import type { IMTContractStateLeaf } from "./IMTContractStateLeaf";
 import type { MerkleProofCore } from "./MerkleProofCore";
 import type { QHashOut } from "./QHashOut";
 
-export type DPNIMTOtherUserReadWitness = { user_leaf_witness: DPNReadOtherUserLeafMerkleProof, contract_state_proof: MerkleProofCore<QHashOut>, state_slot_proof: MerkleProofCore<QHashOut>, leaf_preimage: IMTContractStateLeaf, };
+export type DPNIMTOtherUserReadWitness = { user_leaf_witness: DPNReadOtherUserLeafMerkleProof, contract_state_proof: MerkleProofCore<QHashOut>, state_slot_proof: MerkleProofCore<QHashOut>, leaf_preimage: IMTContractStateLeaf, sentinel_preimage: IMTContractStateLeaf, sentinel_merkle_proof: MerkleProofCore<QHashOut>, };

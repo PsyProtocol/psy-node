@@ -53,6 +53,8 @@ pub enum PsyStateOperation<F: RichField> {
         leaf_index: u64,
         from_version: u32,
         to_version: u32,
+        state_slot_base: u64,
+        capacity: u64,
     },
     IMTInsert {
         op_seq: u64,
@@ -63,6 +65,10 @@ pub enum PsyStateOperation<F: RichField> {
         new_leaf_index: u64,
         new_leaf_from_version: u32,
         new_leaf_to_version: u32,
+        state_slot_base: u64,
+        capacity: u64,
+        sentinel_from_version: u32,
+        sentinel_to_version: u32,
     },
 }
 
@@ -76,7 +82,7 @@ pub struct PsyContractStateTracker<F: RichField> {
     pub total_slots_modified: u32,
     pub start_state_root: QHashOut<F>,
     pub end_state_root: QHashOut<F>,
-    pub imt_keys: IndexMap<QHashOut<F>, PsyIMTLocalStateSet<F>>,
+    pub imt_keys: IndexMap<(u64, u64, QHashOut<F>), PsyIMTLocalStateSet<F>>,
     pub imt_preimages: HashMap<QHashOut<F>, IMTContractStateLeaf<F>>,
     pub imt_next_append_index: u64,
     pub total_keys_modified: u32,
@@ -199,6 +205,7 @@ impl<F: RichField> PsyContractStateTracker<F> {
     pub fn find_imt_predecessor(&self, state_slot_base: u64, capacity: u64, key: &QHashOut<F>) -> Option<(u64, IMTContractStateLeaf<F>)> {
         self.imt_keys
             .values()
+            .filter(|entry| entry.state_slot_base == state_slot_base && entry.capacity == capacity)
             .filter(|entry| Self::is_leaf_index_in_imt_range(entry.leaf_index, state_slot_base, capacity))
             .filter(|entry| compare_qhashout_keys(&entry.key, key) == std::cmp::Ordering::Less)
             .max_by(|a, b| compare_qhashout_keys(&a.key, &b.key))
@@ -207,7 +214,7 @@ impl<F: RichField> PsyContractStateTracker<F> {
 
     pub fn get_imt_leaf_index_for_key(&self, state_slot_base: u64, capacity: u64, key: &QHashOut<F>) -> Option<u64> {
         self.imt_keys
-            .get(key)
+            .get(&(state_slot_base, capacity, *key))
             .and_then(|entry| Self::is_leaf_index_in_imt_range(entry.leaf_index, state_slot_base, capacity).then_some(entry.leaf_index))
     }
 
@@ -224,6 +231,7 @@ impl<F: RichField> PsyContractStateTracker<F> {
         self.imt_keys
             .values()
             .filter(|entry| entry.is_insert)
+            .filter(|entry| entry.state_slot_base == state_slot_base && entry.capacity == capacity)
             .filter(|entry| Self::is_leaf_index_in_imt_range(entry.leaf_index, state_slot_base, capacity))
             .map(|entry| entry.leaf_index)
             .max()
@@ -240,6 +248,8 @@ impl<F: RichField> PsyContractStateTracker<F> {
         leaf_index: u64,
         old_preimage: IMTContractStateLeaf<F>,
         new_preimage: IMTContractStateLeaf<F>,
+        state_slot_base: u64,
+        capacity: u64,
     ) -> i32 {
         let old_hash = old_preimage.qfhash::<PsyHasher>();
         let new_hash = new_preimage.qfhash::<PsyHasher>();
@@ -247,7 +257,8 @@ impl<F: RichField> PsyContractStateTracker<F> {
         self.persist_imt_preimage(old_preimage);
         self.persist_imt_preimage(new_preimage);
 
-        let inc = match self.imt_keys.get_mut(&key) {
+        let scope = (state_slot_base, capacity, key);
+        let inc = match self.imt_keys.get_mut(&scope) {
             Some(entry) => {
                 entry.end_preimage = new_preimage;
                 if !entry.is_insert && entry.end_preimage == entry.start_preimage {
@@ -258,10 +269,12 @@ impl<F: RichField> PsyContractStateTracker<F> {
             }
             None => {
                 self.imt_keys.insert(
-                    key,
+                    scope,
                     PsyIMTLocalStateSet {
                         key,
                         leaf_index,
+                        state_slot_base,
+                        capacity,
                         start_preimage: old_preimage,
                         end_preimage: new_preimage,
                         is_insert: false,
@@ -272,7 +285,7 @@ impl<F: RichField> PsyContractStateTracker<F> {
         };
 
         if inc == -1 {
-            self.imt_keys.shift_remove(&key);
+            self.imt_keys.shift_remove(&scope);
         }
 
         if inc > 0 {
@@ -288,6 +301,8 @@ impl<F: RichField> PsyContractStateTracker<F> {
             leaf_index,
             from_version,
             to_version,
+            state_slot_base,
+            capacity,
         });
 
         inc
@@ -302,6 +317,10 @@ impl<F: RichField> PsyContractStateTracker<F> {
         new_leaf_preimage: IMTContractStateLeaf<F>,
         pred_dmp_old_value: QHashOut<F>,
         new_leaf_dmp_old_value: QHashOut<F>,
+        state_slot_base: u64,
+        capacity: u64,
+        sentinel_old_preimage: IMTContractStateLeaf<F>,
+        sentinel_new_preimage: IMTContractStateLeaf<F>,
     ) -> i32 {
         self.advance_imt_next_append_index_for_insert(new_leaf_index);
 
@@ -309,18 +328,26 @@ impl<F: RichField> PsyContractStateTracker<F> {
         // the preimage. For unwritten slots the tree stores ZERO, not
         // hash(default_leaf), so using qfhash() would record the wrong initial
         // slot version and cause "Wire set twice" when the state is reset and
-        // rebuilt during proving.
+        // rebuilt during proving. The sentinel's physical old hash is computed
+        // after the predecessor splice: a virgin splice at B leaves a transient
+        // hashed count-zero leaf, never the stable physical zero.
         let pred_new_hash = predecessor_new_preimage.qfhash::<PsyHasher>();
         let new_leaf_new_hash = new_leaf_preimage.qfhash::<PsyHasher>();
+        let sentinel_old_hash = sentinel_old_preimage.qfhash::<PsyHasher>();
+        let sentinel_new_hash = sentinel_new_preimage.qfhash::<PsyHasher>();
 
         let (predecessor_from_version, predecessor_to_version) = self.append_slot_version(predecessor_leaf_index, pred_dmp_old_value, pred_new_hash);
         let (new_leaf_from_version, new_leaf_to_version) = self.append_slot_version(new_leaf_index, new_leaf_dmp_old_value, new_leaf_new_hash);
+        let (sentinel_from_version, sentinel_to_version) = self.append_slot_version(state_slot_base, sentinel_old_hash, sentinel_new_hash);
 
         self.persist_imt_preimage(predecessor_old_preimage);
         self.persist_imt_preimage(predecessor_new_preimage);
         self.persist_imt_preimage(new_leaf_preimage);
+        self.persist_imt_preimage(sentinel_old_preimage);
+        self.persist_imt_preimage(sentinel_new_preimage);
 
-        let pred_inc = match self.imt_keys.get_mut(&predecessor_old_preimage.key) {
+        let pred_scope = (state_slot_base, capacity, predecessor_old_preimage.key);
+        let pred_inc = match self.imt_keys.get_mut(&pred_scope) {
             Some(entry) => {
                 entry.end_preimage = predecessor_new_preimage;
                 if !entry.is_insert && entry.end_preimage == entry.start_preimage {
@@ -331,10 +358,12 @@ impl<F: RichField> PsyContractStateTracker<F> {
             }
             None => {
                 self.imt_keys.insert(
-                    predecessor_old_preimage.key,
+                    pred_scope,
                     PsyIMTLocalStateSet {
                         key: predecessor_old_preimage.key,
                         leaf_index: predecessor_leaf_index,
+                        state_slot_base,
+                        capacity,
                         start_preimage: predecessor_old_preimage,
                         end_preimage: predecessor_new_preimage,
                         is_insert: false,
@@ -345,10 +374,11 @@ impl<F: RichField> PsyContractStateTracker<F> {
         };
 
         if pred_inc == -1 {
-            self.imt_keys.shift_remove(&predecessor_old_preimage.key);
+            self.imt_keys.shift_remove(&pred_scope);
         }
 
-        let new_inc = match self.imt_keys.get_mut(&new_leaf_preimage.key) {
+        let new_scope = (state_slot_base, capacity, new_leaf_preimage.key);
+        let new_inc = match self.imt_keys.get_mut(&new_scope) {
             Some(entry) => {
                 entry.end_preimage = new_leaf_preimage;
                 if !entry.is_insert && entry.end_preimage == entry.start_preimage {
@@ -359,10 +389,12 @@ impl<F: RichField> PsyContractStateTracker<F> {
             }
             None => {
                 self.imt_keys.insert(
-                    new_leaf_preimage.key,
+                    new_scope,
                     PsyIMTLocalStateSet {
                         key: new_leaf_preimage.key,
                         leaf_index: new_leaf_index,
+                        state_slot_base,
+                        capacity,
                         start_preimage: IMTContractStateLeaf::default(),
                         end_preimage: new_leaf_preimage,
                         is_insert: true,
@@ -373,7 +405,26 @@ impl<F: RichField> PsyContractStateTracker<F> {
         };
 
         if new_inc == -1 {
-            self.imt_keys.shift_remove(&new_leaf_preimage.key);
+            self.imt_keys.shift_remove(&new_scope);
+        }
+
+        let sentinel_scope = (state_slot_base, capacity, QHashOut::ZERO);
+        match self.imt_keys.get_mut(&sentinel_scope) {
+            Some(entry) => entry.end_preimage = sentinel_new_preimage,
+            None => {
+                self.imt_keys.insert(
+                    sentinel_scope,
+                    PsyIMTLocalStateSet {
+                        key: QHashOut::ZERO,
+                        leaf_index: state_slot_base,
+                        state_slot_base,
+                        capacity,
+                        start_preimage: sentinel_old_preimage,
+                        end_preimage: sentinel_new_preimage,
+                        is_insert: false,
+                    },
+                );
+            }
         }
 
         let total_inc = pred_inc + new_inc;
@@ -393,6 +444,10 @@ impl<F: RichField> PsyContractStateTracker<F> {
             new_leaf_index,
             new_leaf_from_version,
             new_leaf_to_version,
+            state_slot_base,
+            capacity,
+            sentinel_from_version,
+            sentinel_to_version,
         });
         total_inc
     }
@@ -448,12 +503,14 @@ impl<F: RichField> PsyLocalStateTracker<F> {
         leaf_index: u64,
         old_preimage: IMTContractStateLeaf<F>,
         new_preimage: IMTContractStateLeaf<F>,
+        state_slot_base: u64,
+        capacity: u64,
     ) {
         let inc = match self.contracts.get_mut(&contract_id) {
-            Some(c) => c.notify_imt_update(key, leaf_index, old_preimage, new_preimage),
+            Some(c) => c.notify_imt_update(key, leaf_index, old_preimage, new_preimage, state_slot_base, capacity),
             None => {
                 let mut tracker = PsyContractStateTracker::new(contract_id);
-                let result = tracker.notify_imt_update(key, leaf_index, old_preimage, new_preimage);
+                let result = tracker.notify_imt_update(key, leaf_index, old_preimage, new_preimage, state_slot_base, capacity);
                 self.contracts.insert(contract_id, tracker);
                 result
             }
@@ -475,6 +532,10 @@ impl<F: RichField> PsyLocalStateTracker<F> {
         new_leaf_preimage: IMTContractStateLeaf<F>,
         pred_dmp_old_value: QHashOut<F>,
         new_leaf_dmp_old_value: QHashOut<F>,
+        state_slot_base: u64,
+        capacity: u64,
+        sentinel_old_preimage: IMTContractStateLeaf<F>,
+        sentinel_new_preimage: IMTContractStateLeaf<F>,
     ) {
         let inc = match self.contracts.get_mut(&contract_id) {
             Some(c) => c.notify_imt_insert(
@@ -485,6 +546,10 @@ impl<F: RichField> PsyLocalStateTracker<F> {
                 new_leaf_preimage,
                 pred_dmp_old_value,
                 new_leaf_dmp_old_value,
+                state_slot_base,
+                capacity,
+                sentinel_old_preimage,
+                sentinel_new_preimage,
             ),
             None => {
                 let mut tracker = PsyContractStateTracker::new(contract_id);
@@ -496,6 +561,10 @@ impl<F: RichField> PsyLocalStateTracker<F> {
                     new_leaf_preimage,
                     pred_dmp_old_value,
                     new_leaf_dmp_old_value,
+                    state_slot_base,
+                    capacity,
+                    sentinel_old_preimage,
+                    sentinel_new_preimage,
                 );
                 self.contracts.insert(contract_id, tracker);
                 result
@@ -553,6 +622,8 @@ impl<F: RichField> PsyLocalStateTracker<F> {
 pub struct PsyIMTLocalStateSet<F: RichField> {
     pub key: QHashOut<F>,
     pub leaf_index: u64,
+    pub state_slot_base: u64,
+    pub capacity: u64,
     pub start_preimage: IMTContractStateLeaf<F>,
     pub end_preimage: IMTContractStateLeaf<F>,
     pub is_insert: bool,
@@ -589,6 +660,83 @@ mod tests {
             index: slot,
             siblings: vec![],
         }
+    }
+
+    const MAP_BASE: u64 = 0;
+    const MAP_CAPACITY: u64 = u64::MAX;
+
+    fn scope_key(base: u64, capacity: u64, key: QHashOut<F>) -> (u64, u64, QHashOut<F>) {
+        (base, capacity, key)
+    }
+
+    fn update(
+        tracker: &mut PsyContractStateTracker<F>,
+        key: QHashOut<F>,
+        leaf_index: u64,
+        old_preimage: IMTContractStateLeaf<F>,
+        new_preimage: IMTContractStateLeaf<F>,
+    ) -> i32 {
+        tracker.notify_imt_update(key, leaf_index, old_preimage, new_preimage, MAP_BASE, MAP_CAPACITY)
+    }
+
+    fn update_in(
+        tracker: &mut PsyContractStateTracker<F>,
+        base: u64,
+        capacity: u64,
+        key: QHashOut<F>,
+        leaf_index: u64,
+        old_preimage: IMTContractStateLeaf<F>,
+        new_preimage: IMTContractStateLeaf<F>,
+    ) -> i32 {
+        tracker.notify_imt_update(key, leaf_index, old_preimage, new_preimage, base, capacity)
+    }
+
+    fn insert(
+        tracker: &mut PsyContractStateTracker<F>,
+        predecessor_leaf_index: u64,
+        predecessor_old_preimage: IMTContractStateLeaf<F>,
+        predecessor_new_preimage: IMTContractStateLeaf<F>,
+        new_leaf_index: u64,
+        new_leaf_preimage: IMTContractStateLeaf<F>,
+        pred_old_hash: QHashOut<F>,
+        new_old_hash: QHashOut<F>,
+    ) -> i32 {
+        insert_in(
+            tracker, MAP_BASE, MAP_CAPACITY, predecessor_leaf_index, predecessor_old_preimage,
+            predecessor_new_preimage, new_leaf_index, new_leaf_preimage, pred_old_hash, new_old_hash,
+        )
+    }
+
+    fn insert_in(
+        tracker: &mut PsyContractStateTracker<F>,
+        base: u64,
+        capacity: u64,
+        predecessor_leaf_index: u64,
+        predecessor_old_preimage: IMTContractStateLeaf<F>,
+        predecessor_new_preimage: IMTContractStateLeaf<F>,
+        new_leaf_index: u64,
+        new_leaf_preimage: IMTContractStateLeaf<F>,
+        pred_old_hash: QHashOut<F>,
+        new_old_hash: QHashOut<F>,
+    ) -> i32 {
+        let sentinel_old = if predecessor_leaf_index == base { predecessor_new_preimage } else { predecessor_old_preimage };
+        let sentinel_new = sentinel_old.with_new_value(h(1));
+        tracker.notify_imt_insert(
+            predecessor_leaf_index, predecessor_old_preimage, predecessor_new_preimage,
+            new_leaf_index, new_leaf_preimage, pred_old_hash, new_old_hash,
+            base, capacity, sentinel_old, sentinel_new,
+        )
+    }
+
+    fn top_update(
+        tracker: &mut PsyLocalStateTracker<F>,
+        contract_id: u64,
+        key: QHashOut<F>,
+        leaf_index: u64,
+        old_preimage: IMTContractStateLeaf<F>,
+        new_preimage: IMTContractStateLeaf<F>,
+    ) {
+        tracker.notify_imt_update(contract_id, key, leaf_index, old_preimage, new_preimage, MAP_BASE, MAP_CAPACITY);
     }
 
     #[test]
@@ -718,9 +866,9 @@ mod tests {
     fn find_predecessor_uses_key_order_not_insertion_order() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         // Insert in non-sorted order on purpose.
-        t.notify_imt_update(h(30), 1, leaf(30, 1, 100, 0), leaf(30, 2, 100, 0));
-        t.notify_imt_update(h(10), 2, leaf(10, 1, 30, 1), leaf(10, 2, 30, 1));
-        t.notify_imt_update(h(20), 3, leaf(20, 1, 30, 1), leaf(20, 2, 30, 1));
+        let _ = update(&mut t, h(30), 1, leaf(30, 1, 100, 0), leaf(30, 2, 100, 0));
+        let _ = update(&mut t, h(10), 2, leaf(10, 1, 30, 1), leaf(10, 2, 30, 1));
+        let _ = update(&mut t, h(20), 3, leaf(20, 1, 30, 1), leaf(20, 2, 30, 1));
 
         let (idx, pred) = t.find_imt_predecessor(0, u64::MAX, &h(25)).expect("predecessor must exist");
         assert_eq!(idx, 3);
@@ -730,7 +878,7 @@ mod tests {
     #[test]
     fn find_predecessor_returns_latest_local_preimage() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        t.notify_imt_update(h(10), 1, leaf(10, 1, 0, 0), leaf(10, 9, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 1, 0, 0), leaf(10, 9, 0, 0));
 
         let (_idx, pred) = t.find_imt_predecessor(0, u64::MAX, &h(11)).expect("predecessor must exist");
         assert_eq!(pred.value, h(9));
@@ -745,7 +893,7 @@ mod tests {
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10 = leaf(10, 1, 0, 0);
         // notify_imt_insert counts both sentinel (pred_inc=1) and new leaf (new_inc=1)
-        let inc = t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
+        let inc = insert(&mut t, 0, s0, s1, 1, leaf_10, h(0), h(0));
         assert_eq!(inc, 2);
         assert_eq!(t.total_keys_modified, 2);
         assert_eq!(t.imt_next_append_index, 2);
@@ -757,8 +905,8 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10 = leaf(10, 7, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
-        let entry = t.imt_keys.get(&h(10)).expect("entry must exist");
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_10, h(0), h(0));
+        let entry = t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).expect("entry must exist");
         assert_eq!(entry.start_preimage, IMTContractStateLeaf::default());
         assert_eq!(entry.end_preimage.value, h(7));
         assert!(entry.is_insert);
@@ -773,13 +921,13 @@ mod tests {
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10 = leaf(10, 0, 0, 0);
         // Insert creates sentinel + leaf = 2 keys
-        t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_10, h(0), h(0));
         assert_eq!(t.total_keys_modified, 2);
         // Update existing key
-        let inc = t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 2, 0, 0));
+        let inc = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 2, 0, 0));
         assert_eq!(inc, 0);
         assert_eq!(t.total_keys_modified, 2);
-        let entry = t.imt_keys.get(&h(10)).expect("entry must exist");
+        let entry = t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).expect("entry must exist");
         assert_eq!(entry.end_preimage.value, h(2));
         // start_preimage preserved from initial insert
         assert_eq!(entry.start_preimage, IMTContractStateLeaf::default());
@@ -791,14 +939,14 @@ mod tests {
     fn net_zero_update_removes_key_and_decrements_count() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         // Simulate a pre-existing key (not an insert)
-        let inc1 = t.notify_imt_update(h(10), 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
+        let inc1 = update(&mut t, h(10), 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
         assert_eq!(inc1, 1);
         assert_eq!(t.total_keys_modified, 1);
         // Revert to original value → net-zero
-        let inc2 = t.notify_imt_update(h(10), 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0));
+        let inc2 = update(&mut t, h(10), 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0));
         assert_eq!(inc2, -1);
         assert_eq!(t.total_keys_modified, 0);
-        assert!(t.imt_keys.get(&h(10)).is_none());
+        assert!(t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).is_none());
     }
 
     #[test]
@@ -809,12 +957,12 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10 = leaf(10, 5, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_10, h(0), h(0));
         // Update back to default (same as start_preimage for inserts)
-        let inc = t.notify_imt_update(h(10), 1, leaf(10, 5, 0, 0), leaf(10, 0, 0, 0));
+        let inc = update(&mut t, h(10), 1, leaf(10, 5, 0, 0), leaf(10, 0, 0, 0));
         // is_insert=true means net-zero check is skipped
         assert_eq!(inc, 0);
-        assert!(t.imt_keys.get(&h(10)).is_some());
+        assert!(t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).is_some());
     }
 
     // --- next_append_index ---
@@ -826,12 +974,12 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_10, h(0), h(0));
         assert_eq!(t.imt_next_append_index, 2);
 
         let s2 = leaf(0, 0, 20, 3);
         let leaf_20 = leaf(20, 1, 0, 0);
-        t.notify_imt_insert(1, leaf(10, 1, 0, 0), leaf(10, 1, 20, 3), 2, leaf_20, h(0), h(0));
+        let _ = insert(&mut t, 1, leaf(10, 1, 0, 0), leaf(10, 1, 20, 3), 2, leaf_20, h(0), h(0));
         assert_eq!(t.imt_next_append_index, 3);
     }
 
@@ -841,7 +989,7 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 100);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 99, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 99, leaf_10, h(0), h(0));
         assert_eq!(t.imt_next_append_index, 100);
     }
 
@@ -856,8 +1004,8 @@ mod tests {
     #[test]
     fn find_predecessor_returns_none_when_target_smaller_than_all_keys() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
-        t.notify_imt_update(h(20), 2, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update(&mut t, h(20), 2, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
         // h(5) is less than all keys
         assert!(t.find_imt_predecessor(0, u64::MAX, &h(5)).is_none());
     }
@@ -865,7 +1013,7 @@ mod tests {
     #[test]
     fn find_predecessor_skips_equal_key() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
         // predecessor of h(10) itself is nothing (no key strictly less than 10)
         assert!(t.find_imt_predecessor(0, u64::MAX, &h(10)).is_none());
     }
@@ -874,17 +1022,18 @@ mod tests {
     fn imt_insert_keeps_structural_predecessor_when_value_unchanged() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         let base = 100;
+        let capacity = 32;
 
         let sentinel_0 = leaf(0, 0, 0, 0);
         let sentinel_1 = leaf(0, 0, 10, base + 1);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(base, sentinel_0, sentinel_1, base + 1, leaf_10, h(0), h(0));
+        let _ = insert_in(&mut t, base, capacity, base, sentinel_0, sentinel_1, base + 1, leaf_10, h(0), h(0));
 
         let sentinel_2 = leaf(0, 0, 5, base + 2);
         let leaf_5 = leaf(5, 1, 10, base + 1);
-        t.notify_imt_insert(base, sentinel_1, sentinel_2, base + 2, leaf_5, sentinel_1.qfhash::<PsyHasher>(), h(0));
+        let _ = insert_in(&mut t, base, capacity, base, sentinel_1, sentinel_2, base + 2, leaf_5, sentinel_1.qfhash::<PsyHasher>(), h(0));
 
-        let (idx, pred) = t.find_imt_predecessor(base, 32, &h(4)).expect("sentinel predecessor must be retained");
+        let (idx, pred) = t.find_imt_predecessor(base, capacity, &h(4)).expect("sentinel predecessor must be retained");
         assert_eq!(idx, base);
         assert_eq!(pred, sentinel_2);
     }
@@ -894,8 +1043,8 @@ mod tests {
     #[test]
     fn top_level_tracker_isolates_contracts() {
         let mut top = PsyLocalStateTracker::<F>::new();
-        top.notify_imt_update(1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
-        top.notify_imt_update(2, h(20), 1, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
+        top_update(&mut top, 1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        top_update(&mut top, 2, h(20), 1, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
 
         assert!(top.get_imt_leaf_index_for_key(1, 0, u64::MAX, &h(10)).is_some());
         assert!(top.get_imt_leaf_index_for_key(1, 0, u64::MAX, &h(20)).is_none()); // h(20) belongs to contract 2
@@ -905,17 +1054,17 @@ mod tests {
     #[test]
     fn top_level_total_keys_modified_aggregates_across_contracts() {
         let mut top = PsyLocalStateTracker::<F>::new();
-        top.notify_imt_update(1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
-        top.notify_imt_update(2, h(20), 1, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
+        top_update(&mut top, 1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        top_update(&mut top, 2, h(20), 1, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
         assert_eq!(top.total_keys_modified, 2);
     }
 
     #[test]
     fn top_level_net_zero_decrements_aggregate_count() {
         let mut top = PsyLocalStateTracker::<F>::new();
-        top.notify_imt_update(1, h(10), 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
+        top_update(&mut top, 1, h(10), 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
         assert_eq!(top.total_keys_modified, 1);
-        top.notify_imt_update(1, h(10), 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0));
+        top_update(&mut top, 1, h(10), 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0));
         assert_eq!(top.total_keys_modified, 0);
     }
 
@@ -924,7 +1073,7 @@ mod tests {
     #[test]
     fn get_leaf_index_for_key_returns_correct_index() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
         assert_eq!(t.get_imt_leaf_index_for_key(0, u64::MAX, &h(10)), Some(1));
         assert_eq!(t.get_imt_leaf_index_for_key(0, u64::MAX, &h(99)), None);
     }
@@ -932,7 +1081,7 @@ mod tests {
     #[test]
     fn get_leaf_preimage_by_leaf_index_returns_end_preimage() {
         let mut top = PsyLocalStateTracker::<F>::new();
-        top.notify_imt_update(1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 7, 0, 0));
+        top_update(&mut top, 1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 7, 0, 0));
         let preimage = top.get_imt_leaf_preimage_by_leaf_index(1, 1).expect("must exist");
         assert_eq!(preimage.value, h(7));
         assert!(top.get_imt_leaf_preimage_by_leaf_index(1, 99).is_none());
@@ -946,7 +1095,7 @@ mod tests {
         let sentinel_0 = leaf(0, 0, 0, 0);
         let sentinel_1 = leaf(0, 0, 10, base + 1);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(base, sentinel_0, sentinel_1, base + 1, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, base, sentinel_0, sentinel_1, base + 1, leaf_10, h(0), h(0));
 
         // Sentinel should be retrievable at leaf_index = base
         let sentinel = t.get_imt_leaf_preimage_by_leaf_index(base).expect("sentinel must exist");
@@ -958,14 +1107,9 @@ mod tests {
     #[test]
     fn find_imt_predecessor_filters_by_capacity_range() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        // Insert at leaf_index=1000, outside base=0, capacity=100
-        t.notify_imt_update(h(10), 1000, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
-        // Insert at leaf_index=50, inside range
-        t.notify_imt_update(h(20), 50, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
+        let _ = update_in(&mut t, 1000, 10, h(10), 1000, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update_in(&mut t, 0, 100, h(20), 50, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
 
-        // Search for predecessor of h(15) within base=0, capacity=100
-        // key=10 is at slot 1000 (out of range), key=20 > h(15)
-        // No valid predecessor in range
         assert!(t.find_imt_predecessor(0, 100, &h(15)).is_none());
     }
 
@@ -973,19 +1117,17 @@ mod tests {
     fn chained_inserts_maintain_predecessor_chain() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         let base = 100;
+        let capacity = 32;
 
-        // Simulate three keys at different state slots
-        t.notify_imt_update(h(10), base + 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
-        t.notify_imt_update(h(20), base + 2, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
-        t.notify_imt_update(h(15), base + 3, leaf(15, 0, 0, 0), leaf(15, 1, 0, 0));
+        let _ = update_in(&mut t, base, capacity, h(10), base + 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update_in(&mut t, base, capacity, h(20), base + 2, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
+        let _ = update_in(&mut t, base, capacity, h(15), base + 3, leaf(15, 0, 0, 0), leaf(15, 1, 0, 0));
 
-        // predecessor of h(12) should be key=10
-        let (idx, pred) = t.find_imt_predecessor(base, 32, &h(12)).expect("must exist");
+        let (idx, pred) = t.find_imt_predecessor(base, capacity, &h(12)).expect("must exist");
         assert_eq!(pred.key, h(10));
         assert_eq!(idx, base + 1);
 
-        // predecessor of h(18) should be key=15
-        let (idx2, pred2) = t.find_imt_predecessor(base, 32, &h(18)).expect("must exist");
+        let (idx2, pred2) = t.find_imt_predecessor(base, capacity, &h(18)).expect("must exist");
         assert_eq!(pred2.key, h(15));
         assert_eq!(idx2, base + 3);
     }
@@ -996,30 +1138,19 @@ mod tests {
     fn imt_insert_predecessor_net_zero_removes_entry() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         let base = 100;
+        let capacity = 32;
 
-        // Step 1: Update key=10 (not an insert)
-        t.notify_imt_update(h(10), base + 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
+        let _ = update_in(&mut t, base, capacity, h(10), base + 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
         assert_eq!(t.total_keys_modified, 1);
-        assert!(t.imt_keys.get(&h(10)).is_some());
+        assert!(t.imt_keys.get(&scope_key(base, capacity, h(10))).is_some());
 
-        // Step 2: Insert key=20 with key=10 as predecessor, reverting key=10 to its
-        // start value
-        t.notify_imt_insert(
-            base + 1,
-            leaf(10, 7, 0, 0),
-            leaf(10, 5, 0, 0),
-            base + 2,
-            leaf(20, 1, 10, base + 1),
-            h(0),
-            h(0),
+        let _ = insert_in(
+            &mut t, base, capacity, base + 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0),
+            base + 2, leaf(20, 1, 10, base + 1), h(0), h(0),
         );
 
-        // key=10 should be removed (net-zero: is_insert=false, end==start)
-        assert!(t.imt_keys.get(&h(10)).is_none());
-        // key=20 should exist
-        assert!(t.imt_keys.get(&h(20)).is_some());
-        // total_keys_modified: was 1, pred removed (-1), new added (+1) = net 0, still
-        // 1
+        assert!(t.imt_keys.get(&scope_key(base, capacity, h(10))).is_none());
+        assert!(t.imt_keys.get(&scope_key(base, capacity, h(20))).is_some());
         assert_eq!(t.total_keys_modified, 1);
     }
 
@@ -1028,9 +1159,9 @@ mod tests {
     #[test]
     fn imt_update_multiple_overwrites_preserve_latest_preimage() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
-        t.notify_imt_update(h(10), 1, leaf(10, 1, 0, 0), leaf(10, 2, 0, 0));
-        t.notify_imt_update(h(10), 1, leaf(10, 2, 0, 0), leaf(10, 3, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 1, 0, 0), leaf(10, 2, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 2, 0, 0), leaf(10, 3, 0, 0));
 
         let (_idx, pred) = t.find_imt_predecessor(0, u64::MAX, &h(11)).expect("must exist");
         assert_eq!(pred.value, h(3));
@@ -1046,7 +1177,7 @@ mod tests {
     fn get_imt_next_append_index_ignores_updates_only_inserts() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         // Update (not insert) key=5 at a different slot
-        t.notify_imt_update(h(5), 99, leaf(5, 0, 0, 0), leaf(5, 1, 0, 0));
+        let _ = update(&mut t, h(5), 99, leaf(5, 0, 0, 0), leaf(5, 1, 0, 0));
         // No inserts yet
         assert_eq!(t.get_imt_next_append_index(0, u64::MAX), None);
 
@@ -1054,7 +1185,7 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 6);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 5, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 5, leaf_10, h(0), h(0));
         assert_eq!(t.get_imt_next_append_index(0, u64::MAX), Some(6));
     }
 
@@ -1066,13 +1197,13 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 6);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 5, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 5, leaf_10, h(0), h(0));
         assert_eq!(t.imt_next_append_index, 6);
 
         // Insert at leaf_index=3 -> cursor should stay 6 (not regress to 4)
         let s2 = leaf(0, 0, 20, 4);
         let leaf_20 = leaf(20, 1, 10, 5);
-        t.notify_imt_insert(5, leaf(10, 1, 0, 0), leaf(10, 1, 20, 4), 3, leaf_20, h(0), h(0));
+        let _ = insert(&mut t, 5, leaf(10, 1, 0, 0), leaf(10, 1, 20, 4), 3, leaf_20, h(0), h(0));
         assert_eq!(t.imt_next_append_index, 6);
     }
 
@@ -1081,20 +1212,13 @@ mod tests {
     #[test]
     fn is_leaf_index_in_imt_range_boundary_conditions() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        // Insert at exactly base=100
-        t.notify_imt_update(h(10), 100, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
-        // Insert at exactly base+capacity=132 (base=100, capacity=32)
-        t.notify_imt_update(h(20), 132, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
-        // Insert just below base
-        t.notify_imt_update(h(30), 99, leaf(30, 0, 0, 0), leaf(30, 1, 0, 0));
-        // Insert just above capacity
-        t.notify_imt_update(h(40), 133, leaf(40, 0, 0, 0), leaf(40, 1, 0, 0));
+        let _ = update_in(&mut t, 100, 32, h(10), 100, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update_in(&mut t, 100, 32, h(20), 132, leaf(20, 0, 0, 0), leaf(20, 1, 0, 0));
+        let _ = update_in(&mut t, 0, 99, h(30), 99, leaf(30, 0, 0, 0), leaf(30, 1, 0, 0));
+        let _ = update_in(&mut t, 133, 1, h(40), 133, leaf(40, 0, 0, 0), leaf(40, 1, 0, 0));
 
-        // In-range lookups should succeed
         assert_eq!(t.get_imt_leaf_index_for_key(100, 32, &h(10)), Some(100));
         assert_eq!(t.get_imt_leaf_index_for_key(100, 32, &h(20)), Some(132));
-
-        // Out-of-range lookups should fail
         assert_eq!(t.get_imt_leaf_index_for_key(100, 32, &h(30)), None);
         assert_eq!(t.get_imt_leaf_index_for_key(100, 32, &h(40)), None);
     }
@@ -1105,14 +1229,14 @@ mod tests {
     fn has_imt_insert_activity_false_for_updates_only() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         // Only updates, no inserts
-        t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
         assert!(!t.has_imt_insert_activity());
 
         // After an insert, should be true
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 20, 2);
         let leaf_20 = leaf(20, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 1, leaf_20, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_20, h(0), h(0));
         assert!(t.has_imt_insert_activity());
     }
 
@@ -1124,17 +1248,17 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10_v1 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 1, leaf_10_v1, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_10_v1, h(0), h(0));
         assert_eq!(t.total_keys_modified, 2);
 
         // Insert same key again with different value
         let leaf_10_v2 = leaf(10, 5, 0, 0);
-        let inc = t.notify_imt_insert(0, s1, s1, 1, leaf_10_v2, h(0), h(0));
+        let inc = insert(&mut t, 0, s1, s1, 1, leaf_10_v2, h(0), h(0));
         // new_inc = 0 (key exists, is_insert=true, not net-zero)
         // pred_inc depends on sentinel; sentinel exists → 0
         assert_eq!(inc, 0);
         assert_eq!(t.total_keys_modified, 2);
-        let entry = t.imt_keys.get(&h(10)).expect("must exist");
+        let entry = t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).expect("must exist");
         assert!(entry.is_insert);
         assert_eq!(entry.end_preimage.value, h(5));
     }
@@ -1148,15 +1272,15 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_10, h(0), h(0));
 
         // Insert key=20 with predecessor=10
         let s2 = leaf(0, 0, 20, 3);
         let leaf_20 = leaf(20, 1, 10, 1);
-        t.notify_imt_insert(1, leaf_10, leaf(10, 1, 20, 3), 2, leaf_20, h(0), h(0));
+        let _ = insert(&mut t, 1, leaf_10, leaf(10, 1, 20, 3), 2, leaf_20, h(0), h(0));
 
         // Predecessor (key=10) should have updated next pointers
-        let pred = t.imt_keys.get(&h(10)).expect("must exist");
+        let pred = t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).expect("must exist");
         assert_eq!(pred.end_preimage.next_key, h(20));
         assert_eq!(pred.end_preimage.next_index, F::from_canonical_u64(3));
     }
@@ -1168,7 +1292,7 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_10, h(0), h(0));
 
         // Insert key=20 with predecessor=10, updating predecessor back to start-like
         // value Since predecessor is_insert=true, net-zero is skipped even if
@@ -1177,13 +1301,13 @@ mod tests {
         let leaf_20 = leaf(20, 1, 10, 1);
         let pred_old = leaf(10, 1, 0, 0);
         let pred_new = leaf(10, 0, 20, 3); // value back to 0 (same as default start)
-        let inc = t.notify_imt_insert(1, pred_old, pred_new, 2, leaf_20, h(0), h(0));
+        let inc = insert(&mut t, 1, pred_old, pred_new, 2, leaf_20, h(0), h(0));
 
         // pred_inc = 0 (exists, is_insert=true, net-zero skipped)
         // new_inc = 1 (new key)
         assert_eq!(inc, 1);
-        assert!(t.imt_keys.get(&h(10)).is_some());
-        assert!(t.imt_keys.get(&h(20)).is_some());
+        assert!(t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).is_some());
+        assert!(t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(20))).is_some());
         assert_eq!(t.total_keys_modified, 3);
     }
 
@@ -1193,39 +1317,25 @@ mod tests {
     fn find_imt_predecessor_after_chained_operations() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         let base = 100;
+        let capacity = 32;
 
-        // Insert 10, 30, 20 (out of order)
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, base + 1);
-        t.notify_imt_insert(base, s0, s1, base + 1, leaf(10, 1, 0, 0), h(0), h(0));
+        let _ = insert_in(&mut t, base, capacity, base, s0, s1, base + 1, leaf(10, 1, 0, 0), h(0), h(0));
 
-        let s2 = leaf(0, 0, 30, base + 2);
-        t.notify_imt_insert(
-            base + 1,
-            leaf(10, 1, 0, 0),
-            leaf(10, 1, 30, base + 2),
-            base + 2,
-            leaf(30, 1, 0, 0),
-            h(0),
-            h(0),
+        let _ = insert_in(
+            &mut t, base, capacity, base + 1, leaf(10, 1, 0, 0), leaf(10, 1, 30, base + 2),
+            base + 2, leaf(30, 1, 0, 0), h(0), h(0),
         );
 
-        let s3 = leaf(0, 0, 20, base + 3);
-        t.notify_imt_insert(
-            base + 1,
-            leaf(10, 1, 30, base + 2),
-            leaf(10, 1, 20, base + 3),
-            base + 3,
-            leaf(20, 1, 30, base + 2),
-            h(0),
-            h(0),
+        let _ = insert_in(
+            &mut t, base, capacity, base + 1, leaf(10, 1, 30, base + 2), leaf(10, 1, 20, base + 3),
+            base + 3, leaf(20, 1, 30, base + 2), h(0), h(0),
         );
 
-        // Update key=20
-        t.notify_imt_update(h(20), base + 3, leaf(20, 1, 30, base + 2), leaf(20, 9, 30, base + 2));
+        let _ = update_in(&mut t, base, capacity, h(20), base + 3, leaf(20, 1, 30, base + 2), leaf(20, 9, 30, base + 2));
 
-        // predecessor of 25 should be 20 (not 10 or 30)
-        let (_idx, pred) = t.find_imt_predecessor(base, 32, &h(25)).expect("must exist");
+        let (_idx, pred) = t.find_imt_predecessor(base, capacity, &h(25)).expect("must exist");
         assert_eq!(pred.key, h(20));
         assert_eq!(pred.value, h(9));
     }
@@ -1234,16 +1344,16 @@ mod tests {
     fn find_imt_predecessor_with_deleted_entry_in_middle() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         // key=10: update (not insert), then net-zero removed
-        t.notify_imt_update(h(10), 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
-        t.notify_imt_update(h(10), 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0));
-        assert!(t.imt_keys.get(&h(10)).is_none());
+        let _ = update(&mut t, h(10), 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0));
+        assert!(t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).is_none());
 
         // Insert key=20 and key=30
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 20, 2);
-        t.notify_imt_insert(0, s0, s1, 1, leaf(20, 1, 0, 0), h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf(20, 1, 0, 0), h(0), h(0));
         let s2 = leaf(0, 0, 30, 3);
-        t.notify_imt_insert(1, leaf(20, 1, 0, 0), leaf(20, 1, 30, 3), 2, leaf(30, 1, 0, 0), h(0), h(0));
+        let _ = insert(&mut t, 1, leaf(20, 1, 0, 0), leaf(20, 1, 30, 3), 2, leaf(30, 1, 0, 0), h(0), h(0));
 
         // predecessor of 25 should be 20 (10 was removed)
         let (_idx, pred) = t.find_imt_predecessor(0, u64::MAX, &h(25)).expect("must exist");
@@ -1255,15 +1365,11 @@ mod tests {
     #[test]
     fn get_imt_next_append_index_returns_none_when_all_inserts_out_of_range() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        // Insert at leaf_index=1000
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 1001);
-        t.notify_imt_insert(1000, s0, s1, 1000, leaf(10, 1, 0, 0), h(0), h(0));
+        let _ = insert_in(&mut t, 1000, 10, 1000, s0, s1, 1000, leaf(10, 1, 0, 0), h(0), h(0));
 
-        // Query with base=0, capacity=100 → insert at 1000 is out of range
         assert_eq!(t.get_imt_next_append_index(0, 100), None);
-
-        // Query with base=1000, capacity=10 → insert at 1000 is in range
         assert_eq!(t.get_imt_next_append_index(1000, 10), Some(1001));
     }
 
@@ -1275,13 +1381,13 @@ mod tests {
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 10, 2);
         let leaf_10 = leaf(10, 1, 0, 0);
-        t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf_10, h(0), h(0));
 
         // Update the inserted key
-        let inc = t.notify_imt_update(h(10), 1, leaf(10, 1, 0, 0), leaf(10, 5, 0, 0));
+        let inc = update(&mut t, h(10), 1, leaf(10, 1, 0, 0), leaf(10, 5, 0, 0));
         assert_eq!(inc, 0);
 
-        let entry = t.imt_keys.get(&h(10)).expect("must exist");
+        let entry = t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).expect("must exist");
         assert!(entry.is_insert, "is_insert must remain true after update");
         assert_eq!(entry.end_preimage.value, h(5));
         assert_eq!(entry.start_preimage, IMTContractStateLeaf::default());
@@ -1293,18 +1399,18 @@ mod tests {
     fn imt_key_recreated_after_net_zero_gets_new_start_preimage() {
         let mut t = PsyContractStateTracker::<F>::new(1);
         // Create key via update (not insert)
-        t.notify_imt_update(h(10), 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 5, 0, 0), leaf(10, 7, 0, 0));
         assert_eq!(t.total_keys_modified, 1);
 
         // Net-zero remove
-        t.notify_imt_update(h(10), 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0));
-        assert!(t.imt_keys.get(&h(10)).is_none());
+        let _ = update(&mut t, h(10), 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0));
+        assert!(t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).is_none());
         assert_eq!(t.total_keys_modified, 0);
 
         // Recreate with different start
-        let inc = t.notify_imt_update(h(10), 1, leaf(10, 5, 0, 0), leaf(10, 9, 0, 0));
+        let inc = update(&mut t, h(10), 1, leaf(10, 5, 0, 0), leaf(10, 9, 0, 0));
         assert_eq!(inc, 1);
-        let entry = t.imt_keys.get(&h(10)).expect("must exist");
+        let entry = t.imt_keys.get(&scope_key(MAP_BASE, MAP_CAPACITY, h(10))).expect("must exist");
         assert_eq!(entry.start_preimage.value, h(5));
         assert_eq!(entry.end_preimage.value, h(9));
         assert!(!entry.is_insert);
@@ -1329,11 +1435,11 @@ mod tests {
         // Positional write
         t.notify_update_slot_dmp(&dmp(42, 0, 1, 100, 101));
         // IMT update
-        t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
         // IMT insert
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 20, 2);
-        t.notify_imt_insert(0, s0, s1, 1, leaf(20, 1, 0, 0), h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf(20, 1, 0, 0), h(0), h(0));
 
         assert_eq!(t.ops.len(), 3);
         let op_seqs: Vec<u64> = t
@@ -1356,13 +1462,13 @@ mod tests {
         assert_eq!(t.total_slots_modified, 0);
 
         // IMT update should not affect total_slots_modified
-        t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
         assert_eq!(t.total_slots_modified, 0);
 
         // IMT insert should not affect total_slots_modified
         let s0 = leaf(0, 0, 0, 0);
         let s1 = leaf(0, 0, 20, 2);
-        t.notify_imt_insert(0, s0, s1, 1, leaf(20, 1, 0, 0), h(0), h(0));
+        let _ = insert(&mut t, 0, s0, s1, 1, leaf(20, 1, 0, 0), h(0), h(0));
         assert_eq!(t.total_slots_modified, 0);
 
         // Positional write should affect total_slots_modified
@@ -1373,7 +1479,7 @@ mod tests {
     #[test]
     fn imt_only_root_transition_is_tracked() {
         let mut top = PsyLocalStateTracker::<F>::new();
-        top.notify_imt_update(1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        top_update(&mut top, 1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
         top.note_contract_state_root_transition(1, h(100), h(101));
 
         let result = top.get_contract_result(1).expect("contract 1 result");
@@ -1385,7 +1491,7 @@ mod tests {
     fn mixed_positional_and_imt_write_keeps_final_root_from_imt() {
         let mut top = PsyLocalStateTracker::<F>::new();
         top.notify_update_slot_dmp(1, &dmp(42, 0, 1, 100, 101));
-        top.notify_imt_insert(1, 0, leaf(0, 0, 0, 0), leaf(0, 0, 20, 2), 1, leaf(20, 1, 0, 0), h(0), h(0));
+        let _ = insert(top.contracts.get_mut(&1).unwrap(), 1, 0, leaf(0, 0, 0, 0), leaf(0, 0, 20, 2), 1, leaf(20, 1, 0, 0), h(0), h(0));
         top.note_contract_state_root_transition(1, h(101), h(103));
 
         let result = top.get_contract_result(1).expect("contract 1 result");
@@ -1398,7 +1504,7 @@ mod tests {
     #[test]
     fn to_result_preserves_full_imt_state() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        t.notify_imt_update(h(10), 1, leaf(10, 0, 0, 0), leaf(10, 5, 0, 0));
+        let _ = update(&mut t, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 5, 0, 0));
 
         let result = t.to_result();
         assert_eq!(result.contract_id, 1);
@@ -1412,11 +1518,72 @@ mod tests {
     #[test]
     fn get_imt_leaf_index_for_key_returns_none_when_out_of_range() {
         let mut t = PsyContractStateTracker::<F>::new(1);
-        t.notify_imt_update(h(10), 1000, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        let _ = update(&mut t, h(10), 1000, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
 
         // In range
         assert_eq!(t.get_imt_leaf_index_for_key(0, u64::MAX, &h(10)), Some(1000));
         // Out of range (base too high)
         assert_eq!(t.get_imt_leaf_index_for_key(2000, 100, &h(10)), None);
+    }
+
+    #[test]
+    fn same_key_in_distinct_maps_does_not_cross_scope() {
+        let mut t = PsyContractStateTracker::<F>::new(1);
+        let _ = update_in(&mut t, 10, 8, h(10), 11, leaf(10, 1, 0, 0), leaf(10, 2, 0, 0));
+        let _ = update_in(&mut t, 40, 8, h(10), 41, leaf(10, 3, 0, 0), leaf(10, 4, 0, 0));
+
+        assert_eq!(t.get_imt_leaf_index_for_key(10, 8, &h(10)), Some(11));
+        assert_eq!(t.get_imt_leaf_index_for_key(40, 8, &h(10)), Some(41));
+        assert_eq!(t.find_imt_predecessor(10, 8, &h(11)).unwrap().0, 11);
+        assert!(t.find_imt_predecessor(40, 4, &h(11)).is_none());
+    }
+
+    #[test]
+    fn virgin_sentinel_predecessor_records_transient_hash_then_count() {
+        let mut t = PsyContractStateTracker::<F>::new(1);
+        let base = 100;
+        let capacity = 8;
+        let spliced = leaf(0, 0, 10, base + 1);
+        let counted = spliced.with_new_value(h(1));
+        let _ = insert_in(&mut t, base, capacity, base, leaf(0, 0, 0, 0), spliced, base + 1, leaf(10, 1, 0, 0), QHashOut::ZERO, QHashOut::ZERO);
+
+        let versions = t.slots.get(&base).expect("sentinel versions");
+        assert_eq!(versions, &vec![QHashOut::ZERO, spliced.qfhash::<PsyHasher>(), counted.qfhash::<PsyHasher>()]);
+        match &t.ops[0] {
+            PsyStateOperation::IMTInsert {
+                state_slot_base, capacity: op_capacity, sentinel_from_version, sentinel_to_version,
+                predecessor_from_version, predecessor_to_version, ..
+            } => {
+                assert_eq!(*state_slot_base, base);
+                assert_eq!(*op_capacity, capacity);
+                assert_eq!((*predecessor_from_version, *predecessor_to_version), (0, 1));
+                assert_eq!((*sentinel_from_version, *sentinel_to_version), (1, 2));
+            }
+            op => panic!("expected insert, got {:?}", op),
+        }
+        assert_eq!(t.get_imt_leaf_preimage_by_leaf_index(base), Some(counted));
+    }
+
+    #[test]
+    fn member_predecessor_insert_publishes_final_sentinel_preimage() {
+        let mut t = PsyContractStateTracker::<F>::new(1);
+        let base = 100;
+        let capacity = 8;
+        let sentinel_old = leaf(0, 1, 10, base + 1);
+        let sentinel_new = sentinel_old.with_new_value(h(2));
+        let old_hash = sentinel_old.qfhash::<PsyHasher>();
+        t.notify_imt_insert(
+            base + 1, leaf(10, 1, 0, 0), leaf(10, 1, 20, base + 2),
+            base + 2, leaf(20, 1, 0, 0), old_hash, QHashOut::ZERO,
+            base, capacity, sentinel_old, sentinel_new,
+        );
+
+        let sentinel = t.imt_keys.get(&scope_key(base, capacity, QHashOut::ZERO)).expect("sentinel scope");
+        assert_eq!(sentinel.start_preimage, sentinel_old);
+        assert_eq!(sentinel.end_preimage, sentinel_new);
+        let versions = t.slots.get(&base).expect("sentinel versions");
+        assert_eq!(versions.first(), Some(&old_hash));
+        assert_eq!(versions.last(), Some(&sentinel_new.qfhash::<PsyHasher>()));
+        assert_ne!(versions[0], QHashOut::ZERO);
     }
 }

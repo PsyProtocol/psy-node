@@ -1497,7 +1497,8 @@ impl<
             .db_reader
             .contract_state_imt_find_predecessor(checkpoint_id, user_id, contract_id as u64, &key)
             .await
-            .map_err(RpcError::Anyhow)?;
+            .map_err(RpcError::Anyhow)?
+            .ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("No predecessor found for key")))?;
 
         // Get the merkle proof for the predecessor's position
         let merkle_proof = self
@@ -1525,7 +1526,8 @@ impl<
             .db_reader
             .contract_state_imt_find_predecessor(checkpoint_id, user_id, contract_id as u64, &key)
             .await
-            .map_err(RpcError::Anyhow)?;
+            .map_err(RpcError::Anyhow)?
+            .ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("No predecessor found for key")))?;
 
         // Get merkle proof for predecessor
         let predecessor_merkle_proof = self
@@ -1555,7 +1557,7 @@ impl<
         user_id: u64,
         contract_id: u64,
         key: N::QHash,
-    ) -> QRpcResult<(u64, IMTContractStateLeaf<N::F, N::QHash>)> {
+    ) -> QRpcResult<Option<(u64, IMTContractStateLeaf<N::F, N::QHash>)>> {
         res(self
             .db_reader
             .contract_state_imt_find_predecessor(checkpoint_id, user_id, contract_id as u64, &key)

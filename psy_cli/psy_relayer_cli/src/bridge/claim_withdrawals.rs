@@ -332,47 +332,47 @@ async fn pending_block<P: Provider>(provider: &P, tag: serde_json::Value) -> Res
         serde_json::from_value(block["timestamp"].clone())?))
 }
 
-enum PendingSettlement {
+enum PendingClaim {
     Ready,
     Settled,
     Deferred(&'static str),
     Failed(&'static str),
 }
 
-async fn pending_settlement_state<P: Provider>(
+async fn pending_claim_state<P: Provider>(
     provider: &P, bridge: Address, chain: &psy_client_data::bridge_aggregate::ChainConfig,
     config_hash: B256, withdrawal: &PendingWithdrawal,
-) -> Result<PendingSettlement> {
+) -> Result<PendingClaim> {
     let (hash, number, timestamp) = pending_block(provider, serde_json::json!("finalized")).await?;
     let chain_id: U256 = provider.raw_request("eth_chainId".into(), ()).await?;
-    anyhow::ensure!(chain_id == U256::from_be_bytes(chain.chain_id), "pending settlement chain changed");
+    anyhow::ensure!(chain_id == U256::from_be_bytes(chain.chain_id), "pending claim chain changed");
     let code: Bytes = provider.raw_request("eth_getCode".into(), (bridge,
         serde_json::json!({"blockHash": hash, "requireCanonical": true}))).await?;
-    anyhow::ensure!(!code.is_empty(), "pending settlement Bridge has no code");
+    anyhow::ensure!(!code.is_empty(), "pending claim Bridge has no code");
     anyhow::ensure!(pending_call(provider, bridge, configHashCall {}, hash).await? == config_hash
         && pending_call(provider, bridge, l1ChainIndexCall {}, hash).await? == chain.chain_index
         && pending_call(provider, bridge, aggregateStateManagerCall {}, hash).await? == Address::from(chain.state_manager),
-        "pending settlement Bridge authority mismatch");
+        "pending claim Bridge authority mismatch");
     let nonce = withdrawal_nullifier_from_nonce(withdrawal.nonce);
     let registered = pending_call(provider, bridge, claimedNullifiersCall { nullifier: nonce }, hash).await?;
     let pending = pending_call(provider, bridge, pendingWithdrawalsCall { nonce }, hash).await?;
     let state = if pending.amount == U256::ZERO {
         if pending.token != Address::ZERO || pending.recipient != Address::ZERO || pending.claimableAt != 0 {
-            PendingSettlement::Failed("invalid deleted pending withdrawal tuple")
+            PendingClaim::Failed("invalid deleted pending withdrawal tuple")
         } else if registered {
             // Approved Bridge/governance continuity is required; proxy code is not an implementation attestation.
-            PendingSettlement::Settled
+            PendingClaim::Settled
         } else {
-            PendingSettlement::Deferred("withdrawal registration is not finalized")
+            PendingClaim::Deferred("withdrawal registration is not finalized")
         }
     } else if !registered || pending.token != u32x8_to_address(withdrawal.token_address)
         || pending.recipient != u32x8_to_address(withdrawal.recipient)
         || pending.amount != u32x8_to_u256(withdrawal.amount) {
-        PendingSettlement::Failed("pending withdrawal does not match selected record")
+        PendingClaim::Failed("pending withdrawal does not match selected record")
     } else if timestamp < U256::from(pending.claimableAt) {
-        PendingSettlement::Deferred("pending withdrawal is not mature")
+        PendingClaim::Deferred("pending withdrawal is not mature")
     } else if pending_call(provider, bridge, getPauseFlagsCall { token: pending.token }, hash).await?.effectiveFlags & 4 != 0 {
-        PendingSettlement::Deferred("pending withdrawal claims are paused")
+        PendingClaim::Deferred("pending withdrawal claims are paused")
     } else {
         let custody_token = if pending.token == Address::ZERO {
             let addresses = pending_call(provider, bridge, addressesProviderCall {}, hash).await?;
@@ -384,11 +384,11 @@ async fn pending_settlement_state<P: Provider>(
             weth
         } else { pending.token };
         if pending_call(provider, custody_token, balanceOfCall { account: bridge }, hash).await? < pending.amount {
-            PendingSettlement::Deferred("insufficient pending withdrawal custody")
-        } else { PendingSettlement::Ready }
+            PendingClaim::Deferred("insufficient pending withdrawal custody")
+        } else { PendingClaim::Ready }
     };
     anyhow::ensure!(pending_block(provider, serde_json::json!(number)).await?.0 == hash,
-        "pending settlement evidence block is no longer canonical");
+        "pending claim evidence block is no longer canonical");
     Ok(state)
 }
 
@@ -413,14 +413,14 @@ pub(crate) async fn claim_pending_withdrawals(
     let provider = connect_l1_with_wallet(l1_rpc_url.parse()?, wallet)?;
     let chain_id: U256 = provider.raw_request("eth_chainId".into(), ()).await?;
     let chain = network.chains.iter().find(|chain| U256::from_be_bytes(chain.chain_id) == chain_id && Address::from(chain.bridge) == bridge)
-        .context("pending settlement chain and Bridge are not approved")?;
+        .context("pending claim chain and Bridge are not approved")?;
     anyhow::ensure!(withdrawals.iter().all(|withdrawal| withdrawal.destination_chain_index == u64::from(chain.chain_index)),
         "pending withdrawal destination mismatch");
     let config_hash = B256::from(network.config_hash()?);
     for withdrawal in withdrawals {
-        let state = pending_settlement_state(&provider, bridge, chain, config_hash, withdrawal).await;
+        let state = pending_claim_state(&provider, bridge, chain, config_hash, withdrawal).await;
         let state = match state {
-            Ok(PendingSettlement::Ready) => {
+            Ok(PendingClaim::Ready) => {
                 let nonce = withdrawal_nullifier_from_nonce(withdrawal.nonce);
                 let tx = TransactionRequest::default().to(bridge).input(claimPendingWithdrawalCall { nonce }.abi_encode().into());
                 let outcome = async {
@@ -455,13 +455,13 @@ pub(crate) async fn claim_pending_withdrawals(
                         report.resolved_leaf_hashes.push(withdrawal.leaf_hash.clone());
                         continue;
                     }
-                    Ok(Some(false)) => match pending_settlement_state(&provider, bridge, chain, config_hash, withdrawal).await {
-                        Ok(PendingSettlement::Ready) => Ok(PendingSettlement::Failed("pending withdrawal payout reverted")),
+                    Ok(Some(false)) => match pending_claim_state(&provider, bridge, chain, config_hash, withdrawal).await {
+                        Ok(PendingClaim::Ready) => Ok(PendingClaim::Failed("pending withdrawal payout reverted")),
                         other => other,
                     },
-                    Ok(None) => Ok(PendingSettlement::Failed("pending payout receipt identity or event mismatch")),
-                    Err(error) => match pending_settlement_state(&provider, bridge, chain, config_hash, withdrawal).await {
-                        Ok(PendingSettlement::Ready) | Err(_) => {
+                    Ok(None) => Ok(PendingClaim::Failed("pending payout receipt identity or event mismatch")),
+                    Err(error) => match pending_claim_state(&provider, bridge, chain, config_hash, withdrawal).await {
+                        Ok(PendingClaim::Ready) | Err(_) => {
                             report.deferrals.insert(withdrawal.leaf_hash.clone(), format!("pending payout unresolved: {error:#}"));
                             continue;
                         }
@@ -472,14 +472,14 @@ pub(crate) async fn claim_pending_withdrawals(
             other => other,
         };
         match state {
-            Ok(PendingSettlement::Settled) => {
+            Ok(PendingClaim::Settled) => {
                 report.already_claimed_count += 1;
                 report.resolved_leaf_hashes.push(withdrawal.leaf_hash.clone());
             }
-            Ok(PendingSettlement::Deferred(reason)) => { report.deferrals.insert(withdrawal.leaf_hash.clone(), reason.to_string()); }
-            Ok(PendingSettlement::Failed(reason)) => { report.failure_reasons.insert(withdrawal.leaf_hash.clone(), reason.to_string()); }
-            Err(error) => { report.deferrals.insert(withdrawal.leaf_hash.clone(), format!("pending settlement evidence unavailable: {error:#}")); }
-            Ok(PendingSettlement::Ready) => unreachable!("ready pending withdrawal was handled above"),
+            Ok(PendingClaim::Deferred(reason)) => { report.deferrals.insert(withdrawal.leaf_hash.clone(), reason.to_string()); }
+            Ok(PendingClaim::Failed(reason)) => { report.failure_reasons.insert(withdrawal.leaf_hash.clone(), reason.to_string()); }
+            Err(error) => { report.deferrals.insert(withdrawal.leaf_hash.clone(), format!("pending claim evidence unavailable: {error:#}")); }
+            Ok(PendingClaim::Ready) => unreachable!("ready pending withdrawal was handled above"),
         }
     }
     Ok(report)

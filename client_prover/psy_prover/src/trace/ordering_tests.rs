@@ -923,27 +923,35 @@ fn imt_witnesses_project_current_external_and_other_user_reads() {
         DPNIMTContainsOtherUserWitness, DPNIMTContainsWitness, DPNIMTOtherUserReadWitness, DPNIMTReadWitness, DPNIMTSelfUserExternalReadWitness,
         DPNReadOtherUserLeafMerkleProof, DPNStateCmdWitness,
     };
-    use psy_crypto::hash::merkle::core::MerkleProofCore;
+    use plonky2::field::types::Field;
+    use plonky2::hash::poseidon::PoseidonHash;
+    use psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf;
+    use psy_crypto::hash::{merkle::utils::simple_merkle_tree::SimpleMerkleTree, traits::qhashable::QFieldHashable};
     use psy_vm::{dpn::ops::state_cmd::data::DPNStateCmd, vm::exec::PsyCmdWithInputAndWitness};
 
-    let value = QHashOut::<F>::from_values(9, 8, 7, 6);
-    let proof = |index| MerkleProofCore {
-        root: value,
-        value,
-        index,
-        siblings: Vec::new(),
-    };
+    let key = [1, 2, 3, 4];
+    let leaf_preimage = IMTContractStateLeaf::new(
+        QHashOut::from_values(1, 2, 3, 4), QHashOut::from_values(9, 8, 7, 6), QHashOut::ZERO, F::ZERO,
+    );
+    let sentinel_preimage = IMTContractStateLeaf::new(
+        QHashOut::ZERO, QHashOut::from_values(1, 0, 0, 0), leaf_preimage.key, F::ONE,
+    );
+    let mut tree = SimpleMerkleTree::<PoseidonHash, QHashOut<F>>::new(8);
+    tree.set_leaf(0, sentinel_preimage.qfhash::<PoseidonHash>());
+    tree.set_leaf(1, leaf_preimage.qfhash::<PoseidonHash>());
+    let value = leaf_preimage.qfhash::<PoseidonHash>();
     let other_user_leaf = || DPNReadOtherUserLeafMerkleProof {
         user_tree_proof: Default::default(),
         user_leaf: Default::default(),
     };
-    let key = [1, 2, 3, 4];
     let witnesses = vec![
         PsyCmdWithInputAndWitness {
             state_cmd: DPNStateCmd::get_self_user_current_imt_contract_state_value(0, 16, key),
             witness: DPNStateCmdWitness::IMTRead(DPNIMTReadWitness {
-                leaf_preimage: Default::default(),
-                merkle_proof: proof(10),
+                leaf_preimage,
+                merkle_proof: tree.get_leaf(1),
+                sentinel_preimage,
+                sentinel_merkle_proof: tree.get_leaf(0),
             }),
             result: Vec::new(),
         },
@@ -951,8 +959,10 @@ fn imt_witnesses_project_current_external_and_other_user_reads() {
             state_cmd: DPNStateCmd::get_self_user_external_imt_contract_state_value(20, 8, 0, 16, key),
             witness: DPNStateCmdWitness::IMTSelfUserExternalRead(DPNIMTSelfUserExternalReadWitness {
                 contract_tree_proof: Default::default(),
-                state_slot_proof: proof(11),
-                leaf_preimage: Default::default(),
+                state_slot_proof: tree.get_leaf(1),
+                leaf_preimage,
+                sentinel_preimage,
+                sentinel_merkle_proof: tree.get_leaf(0),
             }),
             result: Vec::new(),
         },
@@ -961,8 +971,10 @@ fn imt_witnesses_project_current_external_and_other_user_reads() {
             witness: DPNStateCmdWitness::IMTOtherUserRead(DPNIMTOtherUserReadWitness {
                 user_leaf_witness: other_user_leaf(),
                 contract_state_proof: Default::default(),
-                state_slot_proof: proof(12),
-                leaf_preimage: Default::default(),
+                state_slot_proof: tree.get_leaf(1),
+                leaf_preimage,
+                sentinel_preimage,
+                sentinel_merkle_proof: tree.get_leaf(0),
             }),
             result: Vec::new(),
         },
@@ -970,19 +982,23 @@ fn imt_witnesses_project_current_external_and_other_user_reads() {
             state_cmd: DPNStateCmd::contains_self_user_current_imt_contract_state_value(0, 16, key),
             witness: DPNStateCmdWitness::IMTContains(DPNIMTContainsWitness {
                 exists: true,
-                leaf_preimage: Default::default(),
-                merkle_proof: proof(13),
+                leaf_preimage,
+                merkle_proof: tree.get_leaf(1),
+                sentinel_preimage,
+                sentinel_merkle_proof: tree.get_leaf(0),
             }),
             result: Vec::new(),
         },
         PsyCmdWithInputAndWitness {
-            state_cmd: DPNStateCmd::contains_other_user_imt_contract_state_value(31, 41, 8, 0, 16, key),
+            state_cmd: DPNStateCmd::contains_other_user_imt_contract_state_value(31, 41, 8, 0, 16, [2, 2, 3, 4]),
             witness: DPNStateCmdWitness::IMTContainsOtherUser(DPNIMTContainsOtherUserWitness {
                 exists: false,
                 user_leaf_witness: other_user_leaf(),
                 contract_state_proof: Default::default(),
-                state_slot_proof: proof(14),
-                leaf_preimage: Default::default(),
+                state_slot_proof: tree.get_leaf(1),
+                leaf_preimage,
+                sentinel_preimage,
+                sentinel_merkle_proof: tree.get_leaf(0),
             }),
             result: Vec::new(),
         },
@@ -995,7 +1011,7 @@ fn imt_witnesses_project_current_external_and_other_user_reads() {
             .iter()
             .map(|read| (read.user_id, read.contract_id, read.slot_index))
             .collect::<Vec<_>>(),
-        vec![(7, 8, 10), (7, 20, 11), (30, 40, 12), (7, 8, 13), (31, 41, 14)]
+        vec![(7, 8, 1), (7, 20, 1), (30, 40, 1), (7, 8, 1), (31, 41, 1)]
     );
     assert!(storage.reads.iter().all(|read| read.value == value));
 }

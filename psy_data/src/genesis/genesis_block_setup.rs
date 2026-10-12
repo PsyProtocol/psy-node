@@ -79,12 +79,24 @@ mod tests {
 
     #[cfg(feature = "rand_gen")]
     fn setup_data(contracts: Vec<PQBCDeployContract<Hash>>) -> PsyGenesisBlockSetupData<PF, Hash> {
+        // Valid ed25519 identity multihash: 0x00 0x24 || 0x08 0x01 0x12 0x20 || 32 key bytes.
+        let mut node_id = [0u8; 38];
+        node_id[..6].copy_from_slice(&[0x00, 0x24, 0x08, 0x01, 0x12, 0x20]);
         PsyGenesisBlockSetupData {
             contracts,
             users: vec![],
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: QHashOut::<PF>::from_values(4, 0, 0, 0),
             withdrawal_tree_root: QHashOut::<PF>::from_values(5, 0, 0, 0),
+            validators: vec![GenesisValidator {
+                realm_id: 1,
+                validator_user_id: (1u64 << 20) | 1,
+                node_id,
+                bls_public_key: crate::p2p::BlsSecretKey::key_gen(&[11u8; 32])
+                    .unwrap()
+                    .public_key()
+                    .to_bytes(),
+            }],
         }
     }
 

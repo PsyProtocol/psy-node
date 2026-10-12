@@ -16,7 +16,7 @@ use psy_plonky2_common_circuits::{
     bridge::aggregate_commitment::RewardLeafTarget,
     hash::merkle::gadgets::delta_merkle_proof::DeltaMerkleProofGadget,
 };
-use super::reward_inclusion::RewardTagTarget;
+use super::reward_chain::RewardTagTarget;
 use psy_plonky2_common_circuits::hash::keccak::keccak256_bytes_targets;
 use psy_plonky2_common_circuits::hash::merkle::gadgets::merkle_proof::{MerkleProofGadget, OptionalMerkleProofGadget};
 use psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT;
@@ -1255,15 +1255,7 @@ fn build_reward_session_circuit(
             builder.connect(value, ledger_window.config_hash[index * 4 + byte]);
         }
     }
-    let source_low = builder.is_less_than(32, session.source_checkpoint_id, config.reward_cutover[0]);
     let zero = builder.zero();
-    builder.assert_zero(config.reward_cutover[1]);
-    builder.assert_zero(source_low.target);
-    let end_high_zero = builder.is_equal(config.reward_end_exclusive[1], zero);
-    let source_before_end = builder.is_less_than(32, session.source_checkpoint_id, config.reward_end_exclusive[0]);
-    let not_before = builder.not(source_before_end);
-    let invalid_source = builder.and(end_high_zero, not_before);
-    builder.assert_zero(invalid_source.target);
     let mut is_payer = builder._true();
     for index in 0..5 {
         let equal = builder.is_equal(statement.fields[5 + index], config.reward_payer[4 - index]);
@@ -1455,7 +1447,7 @@ pub struct RewardLedgerStateValues {
 pub struct RewardSessionJobWitness {
     pub height: u8,
     pub path_index: u32,
-    pub tag: super::reward_inclusion::RewardTagWitness,
+    pub tag: super::reward_chain::RewardTagWitness,
     pub nullifier_siblings: [[u64; 4]; 63],
 }
 
@@ -1579,7 +1571,7 @@ impl RewardSessionCircuit {
         let tag = PoseidonHash::two_to_one(preimage, preimage);
         let padding = RewardSessionJobWitness {
             height: 2, path_index: 0,
-            tag: super::reward_inclusion::RewardTagWitness {
+            tag: super::reward_chain::RewardTagWitness {
                 tag_preimage: QHashOut(preimage), leaf_left: QHashOut::default(), leaf_right: QHashOut::default(), leaf_tag: QHashOut(tag),
                 siblings: [QHashOut::default(); 21], parent_tags: [QHashOut::default(); 21],
             },

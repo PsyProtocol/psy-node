@@ -76,7 +76,7 @@ pub trait QMetaDataStoreReaderSync<F: RichField>: Send + Sync {
         user_id: u64,
         contract_id: u64,
         key: &QHashOut<F>,
-    ) -> anyhow::Result<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>;
+    ) -> anyhow::Result<Option<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>>;
 
     async fn contract_state_imt_get_next_append_index(&self, user_id: u64, contract_id: u64) -> anyhow::Result<u64>;
 }

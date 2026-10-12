@@ -31,7 +31,7 @@ pub struct PsyCmdDataStoreCache<F: RichField> {
     pub merkle_cmd_cache: HashMap<QSRMerkleCmd, MerkleProofCore<QHashOut<F>>>,
 
     pub imt_leaf_preimage_cache: HashMap<super::cmd::QSRIMTCmdGetLeafPreimage, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>>,
-    pub imt_predecessor_cache: HashMap<super::cmd::QSRIMTCmdFindPredecessor, (u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>,
+    pub imt_predecessor_cache: HashMap<super::cmd::QSRIMTCmdFindPredecessor, Option<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>>,
     pub imt_index_cache: HashMap<super::cmd::QSRIMTCmdGetLeafIndexForKey, u64>,
     pub imt_next_append_index_cache: HashMap<super::cmd::QSRIMTCmdGetNextAppendIndex, u64>,
 }
@@ -334,9 +334,9 @@ impl<F: RichField, S: PsyReadCommandProcessorSync<F> + QUserIdManager + Send> Ps
     async fn resolve_contract_state_imt_find_predecessor_mut(
         &mut self,
         input: &crate::qstore::imm::cmd::QSRIMTCmdFindPredecessor,
-    ) -> anyhow::Result<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)> {
+    ) -> anyhow::Result<Option<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>> {
         if self.cache.imt_predecessor_cache.contains_key(&input) {
-            Ok(self.cache.imt_predecessor_cache.get(&input).unwrap().clone())
+            Ok(self.cache.imt_predecessor_cache.get(input).unwrap().clone())
         } else {
             let result = self.read_store.resolve_contract_state_imt_find_predecessor(input).await?;
             self.cache.imt_predecessor_cache.insert(*input, result);
@@ -352,5 +352,113 @@ impl<F: RichField, S: PsyReadCommandProcessorSync<F> + QUserIdManager + Send> Ps
         // transactions commit. A stale cached value causes "slot not empty" errors
         // when another session commits between our session start and VM execution.
         self.read_store.resolve_contract_state_imt_get_next_append_index(input).await
+    }
+}
+
+#[cfg(all(test, feature = "is_sync"))]
+mod tests {
+    use kvq::memory::simple::KVQSimpleMemoryBackingStore;
+    use plonky2::field::goldilocks_field::GoldilocksField;
+
+    use super::*;
+    use crate::qdata::imt_contract_state::IMTContractStateLeaf;
+
+    type F = GoldilocksField;
+
+    struct FailingReader;
+
+    impl QUserIdManager for FailingReader {
+        fn get_user_id(&self) -> u64 {
+            0
+        }
+
+        fn set_user_id(&mut self, _user_id: u64) {}
+    }
+
+    impl PsyReadCommandProcessorSync<F> for FailingReader {
+        async fn resolve_batch(&self, _input: &PsyReadCommandBatchInput) -> anyhow::Result<PsyReadCommandBatchOutput<F>> {
+            unreachable!()
+        }
+        async fn resolve_get_hash(&self, _input: &QSRHashCmd) -> anyhow::Result<QHashOut<F>> {
+            unreachable!()
+        }
+        async fn resolve_get_merkle_proof(&self, _input: &QSRMerkleCmd) -> anyhow::Result<MerkleProofCore<QHashOut<F>>> {
+            unreachable!()
+        }
+        async fn resolve_get_user_leaf(&self, _input: &QSRCmdGetUserLeafData) -> anyhow::Result<PsyUserLeaf<F>> {
+            unreachable!()
+        }
+        async fn resolve_get_contract_leaf(&self, _input: &QSRCmdGetContractLeafData) -> anyhow::Result<PsyContractLeaf<F>> {
+            unreachable!()
+        }
+        async fn resolve_get_contract_code(&self, _input: &QSRCmdGetContractCodeDefinition) -> anyhow::Result<ContractCodeDefinition> {
+            unreachable!()
+        }
+        async fn resolve_get_checkpoint_leaf(&self, _input: &QSRCmdGetCheckpointLeafData) -> anyhow::Result<PsyCheckpointLeaf<F>> {
+            unreachable!()
+        }
+        async fn resolve_get_block_state(&self, _input: &QSRCmdGetBlockState) -> anyhow::Result<PsyBlockState> {
+            unreachable!()
+        }
+        async fn resolve_get_latest_block_state(&self) -> anyhow::Result<PsyBlockState> {
+            unreachable!()
+        }
+        async fn resolve_contract_state_imt_get_leaf_preimage(
+            &self,
+            _input: &super::cmd::QSRIMTCmdGetLeafPreimage,
+        ) -> anyhow::Result<IMTContractStateLeaf<F>> {
+            unreachable!()
+        }
+        async fn resolve_contract_state_imt_get_leaf_index_for_key(
+            &self,
+            _input: &super::cmd::QSRIMTCmdGetLeafIndexForKey,
+        ) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn resolve_contract_state_imt_find_predecessor(
+            &self,
+            _input: &super::cmd::QSRIMTCmdFindPredecessor,
+        ) -> anyhow::Result<Option<(u64, IMTContractStateLeaf<F>)>> {
+            anyhow::bail!("predecessor transport failed")
+        }
+        async fn resolve_contract_state_imt_get_next_append_index(
+            &self,
+            _input: &super::cmd::QSRIMTCmdGetNextAppendIndex,
+        ) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+    }
+
+    fn query() -> super::cmd::QSRIMTCmdFindPredecessor {
+        super::cmd::QSRIMTCmdFindPredecessor {
+            checkpoint_id: 1,
+            user_id: 7,
+            contract_id: 6,
+            state_slot_base: 4,
+            capacity: 3,
+            key: [20, 0, 0, 0],
+        }
+    }
+
+    #[test]
+    fn cached_predecessor_absence_is_a_hit() -> anyhow::Result<()> {
+        let mut store = PsyCmdStoreWithCache::<F, KVQSimpleMemoryBackingStore>::new(1, KVQSimpleMemoryBackingStore::new());
+        let query = query();
+        assert_eq!(store.resolve_contract_state_imt_find_predecessor_mut(&query)?, None);
+        assert_eq!(store.cache.imt_predecessor_cache.get(&query), Some(&None));
+        assert_eq!(store.resolve_contract_state_imt_find_predecessor_mut(&query)?, None);
+
+        let found = (5, IMTContractStateLeaf::default());
+        store.cache.imt_predecessor_cache.insert(query, Some(found));
+        assert_eq!(store.resolve_contract_state_imt_find_predecessor_mut(&query)?, Some(found));
+        Ok(())
+    }
+
+    #[test]
+    fn predecessor_transport_error_is_not_absence() {
+        let mut store = PsyCmdStoreWithCache::<F, FailingReader>::new(1, FailingReader);
+        let err = store.resolve_contract_state_imt_find_predecessor_mut(&query()).unwrap_err();
+        assert!(err.to_string().contains("predecessor transport failed"));
+        assert!(!store.cache.imt_predecessor_cache.contains_key(&query()));
     }
 }

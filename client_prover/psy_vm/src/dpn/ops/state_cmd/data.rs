@@ -167,6 +167,30 @@ mod command_matrix_tests {
         .is_err());
         assert!(std::panic::catch_unwind(|| decode(&[c(u8::MAX as u64)])).is_err());
     }
+
+    #[test]
+    fn imt_commands_keep_operand_widths_and_resolve_boundary_inputs() {
+        let set = DPNStateCmd::set_imt_contract_state_value(0, 5, 1, [2, 0, 0, 0], [0; 4]);
+        assert_eq!(set.get_output_felt_size(), 8);
+        assert_eq!(set.get_inputs().len(), 11);
+        let resolved = set.convert_to_u64(&[0, 5, 1, 2, 0, 0, 0, 0, 0, 0, 0]);
+        let DPNStateCmd::SetIMTContractStateValue(resolved) = resolved else {
+            panic!("unexpected state command variant");
+        };
+        assert_eq!(resolved.condition, 0);
+        assert_eq!(resolved.base_offset, 5);
+        assert_eq!(resolved.capacity, 1);
+
+        let full = DPNStateCmd::set_imt_contract_state_value(1, u64::MAX, 0, [u64::MAX; 4], [1, 0, 0, 0]);
+        let full_inputs = full.get_inputs();
+        assert_eq!(full.convert_to_u64(&full_inputs).get_inputs(), full_inputs);
+
+        let read = DPNStateCmd::get_self_user_current_imt_contract_state_value(0, 1, [0; 4]);
+        let contains = DPNStateCmd::contains_self_user_current_imt_contract_state_value(4, u64::MAX, [9, 0, 0, 0]);
+        assert_eq!(read.get_inputs(), vec![0, 1, 0, 0, 0, 0]);
+        assert_eq!(contains.get_output_felt_size(), 1);
+        assert_eq!(contains.convert_to_u64(&contains.get_inputs()).get_inputs()[1], u64::MAX);
+    }
 }
 
 impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmdSetContractStateSlotHash<T> {

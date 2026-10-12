@@ -8,6 +8,48 @@ pub const BRIDGE_USER_ID: u32 = 524288;
 pub const MAX_CHAINS: usize = 256;
 pub const MAX_LEAVES: usize = 1024;
 pub const AGGREGATE_SIZE: usize = 32;
+/// Single fixed deposit record bound. Circuit unroll, native and Solidity opening
+/// validation, and setup identity use this bound; local scheduling budgets may be smaller.
+pub const DEPOSIT_RECORD_CAPACITY: usize = 32;
+
+pub fn deposit_aggregate_pi_len(chain_count: usize) -> usize {
+    27 + 17 * chain_count + 39 * DEPOSIT_RECORD_CAPACITY
+}
+
+pub const DEPOSIT_ACCUMULATOR_SEED_DOMAIN: u64 = 0x44465331;
+pub const DEPOSIT_ACCUMULATOR_FOLD_DOMAIN: u64 = 0x44464631;
+
+fn deposit_poseidon(words: &[u64]) -> Result<Hash4> {
+    use plonky2::{field::goldilocks_field::GoldilocksField, field::types::{Field, PrimeField64}, hash::poseidon::PoseidonHash, plonk::config::Hasher};
+    if words.iter().any(|word| *word >= GOLDILOCKS_MODULUS) {
+        return Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt));
+    }
+    Ok(PoseidonHash::hash_no_pad(&words.iter().copied().map(GoldilocksField::from_canonical_u64).collect::<Vec<_>>()).elements.map(|word| word.to_canonical_u64()))
+}
+
+pub fn deposit_accumulator_seed(config_hash: Bytes32, end_checkpoint_id: u64, end_checkpoint_root: Hash4, global_deposit_count: u32) -> Result<Hash4> {
+    let mut words = [0; 16];
+    words[0] = DEPOSIT_ACCUMULATOR_SEED_DOMAIN;
+    for (word, bytes) in words[1..9].iter_mut().zip(config_hash.chunks_exact(4)) {
+        *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
+    }
+    words[9] = end_checkpoint_id as u32 as u64;
+    words[10] = end_checkpoint_id >> 32;
+    words[11..15].copy_from_slice(&end_checkpoint_root);
+    words[15] = global_deposit_count as u64;
+    deposit_poseidon(&words)
+}
+
+pub fn deposit_accumulator_fold(accumulator: Hash4, ordinal: u32, chain_index: u8, absolute_index: u32, leaf_hash: Hash4) -> Result<Hash4> {
+    let mut words = [0; 12];
+    words[0] = DEPOSIT_ACCUMULATOR_FOLD_DOMAIN;
+    words[1..5].copy_from_slice(&accumulator);
+    words[5] = ordinal as u64;
+    words[6] = chain_index as u64;
+    words[7] = absolute_index as u64;
+    words[8..12].copy_from_slice(&leaf_hash);
+    deposit_poseidon(&words)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EncodingError {
@@ -210,6 +252,297 @@ wire_struct!(RewardLeaf {
 wire_struct!(DepositLeafRange {
     first_leaf: u32 => u32, leaf_count: u32 => u32,
 });
+pub const BRIDGE_OPENING_VERSION: u32 = 4;
+pub const BRIDGE_OPENING_CHAIN_CAPACITY: usize = 8;
+pub const BRIDGE_RECORD_CAPACITY: usize = 32;
+pub const BRIDGE_OPENING_MAX_BYTES: usize = 37_344;
+pub const BRIDGE_REWARD_CONTRACT_ID: u32 = 7;
+pub const REWARD_CLAIM_BYTES: usize = 480;
+pub const REWARD_ROOT_STATEMENT_LEN: usize = 30;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RewardClaim {
+    pub chain_index: u8,
+    pub user_id: u32,
+    pub contract_id: u32,
+    pub old_nullifier_root: Hash4,
+    pub new_nullifier_root: Hash4,
+    pub count: u32,
+    pub recipient: Address,
+    pub amount: Bytes32,
+}
+
+impl RewardClaim {
+    pub fn from_public_inputs(chain_index: u8, inputs: &[u64; REWARD_ROOT_STATEMENT_LEN]) -> Result<Self> {
+        let user_id = read_u32(inputs[0])?;
+        let mut recipient_limbs = [0u32; 8];
+        for (index, limb) in recipient_limbs.iter_mut().enumerate() { *limb = read_u32(inputs[1 + index])?; }
+        if recipient_limbs[5] != 0 || recipient_limbs[6] != 0 || recipient_limbs[7] != 0 {
+            return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth));
+        }
+        let old_nullifier_root = read_hash4(inputs, 9)?;
+        let new_nullifier_root = read_hash4(inputs, 13)?;
+        let count = read_u32(inputs[17])?;
+        let mut amount = [0u8; 32];
+        for index in 0..8 {
+            amount[28 - index * 4..32 - index * 4].copy_from_slice(&read_u32(inputs[18 + index])?.to_be_bytes());
+        }
+        let _anchor = read_hash4(inputs, 26)?;
+        let mut recipient = [0u8; 20];
+        for index in 0..5 { recipient[16 - index * 4..20 - index * 4].copy_from_slice(&recipient_limbs[index].to_be_bytes()); }
+        let value = Self { chain_index, user_id, contract_id: BRIDGE_REWARD_CONTRACT_ID,
+            old_nullifier_root, new_nullifier_root, count, recipient, amount };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        self.validate()?;
+        writer.u8(2)?; writer.u8(self.chain_index)?; writer.u32(self.user_id)?;
+        writer.u32(self.contract_id)?;
+        writer.hash4(self.old_nullifier_root)?; writer.hash4(self.new_nullifier_root)?;
+        writer.u32(self.count)?; writer.address(self.recipient)?; writer.bytes32(self.amount)
+    }
+
+    fn read(reader: &mut Reader<'_>) -> Result<Self> {
+        if reader.u8()? != 2 { return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)); }
+        let value = Self { chain_index: reader.u8()?, user_id: reader.u32()?, contract_id: reader.u32()?,
+            old_nullifier_root: reader.hash4()?, new_nullifier_root: reader.hash4()?,
+            count: reader.u32()?, recipient: reader.address()?, amount: reader.bytes32()? };
+        value.validate()?; Ok(value)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new(); self.write(&mut writer)?;
+        if writer.0.len() != REWARD_CLAIM_BYTES { return Err(BridgeProofError::InvalidCount); }
+        Ok(writer.0)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != REWARD_CLAIM_BYTES {
+            return Err(BridgeProofError::InvalidEncoding(if bytes.len() < REWARD_CLAIM_BYTES { EncodingError::MissingBytes } else { EncodingError::TrailingBytes }));
+        }
+        let mut reader = Reader(bytes); let value = Self::read(&mut reader)?; reader.finish()?; Ok(value)
+    }
+    fn validate(&self) -> Result<()> {
+        validate_hash4(&self.old_nullifier_root)?; validate_hash4(&self.new_nullifier_root)?;
+        if self.contract_id != BRIDGE_REWARD_CONTRACT_ID || self.amount == [0; 32] || self.recipient == [0; 20]
+        { return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)); }
+        Ok(())
+    }
+}
+
+pub fn packed_root(value: Hash4) -> Result<Bytes32> {
+    validate_hash4(&value)?;
+    let high = (u128::from(value[0]) << 64) | u128::from(value[1]);
+    let low = (u128::from(value[2]) << 64) | u128::from(value[3]);
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&high.to_be_bytes());
+    bytes[16..].copy_from_slice(&low.to_be_bytes());
+    Ok(bytes)
+}
+pub fn claim_context_id(config_hash: Bytes32, end_checkpoint_id: u32, end_checkpoint_root: Hash4) -> Result<Bytes32> {
+    validate_hash4(&end_checkpoint_root)?;
+    let mut body = Vec::with_capacity(192);
+    body.extend_from_slice(&hash_parts(&[b"PsyBridge/ClaimContext/4"]));
+    body.extend_from_slice(&config_hash);
+    body.extend_from_slice(&word(end_checkpoint_id as u64));
+    for limb in end_checkpoint_root { body.extend_from_slice(&word(limb)); }
+    Ok(hash_parts(&[&body]))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeChainRow {
+    pub chain_index: u8,
+    pub start_checkpoint_id: u32,
+    pub start_checkpoint_root: Hash4,
+    pub old_deposit_root: Hash4,
+    pub new_deposit_root: Hash4,
+    pub old_count: u32,
+    pub new_count: u32,
+}
+
+impl BridgeChainRow {
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        writer.u8(self.chain_index)?; writer.u32(self.start_checkpoint_id)?; writer.hash4(self.start_checkpoint_root)?;
+        writer.hash4(self.old_deposit_root)?; writer.hash4(self.new_deposit_root)?;
+        writer.u32(self.old_count)?; writer.u32(self.new_count)
+    }
+    fn read(reader: &mut Reader<'_>) -> Result<Self> {
+        Ok(Self { chain_index: reader.u8()?, start_checkpoint_id: reader.u32()?, start_checkpoint_root: reader.hash4()?,
+            old_deposit_root: reader.hash4()?, new_deposit_root: reader.hash4()?, old_count: reader.u32()?, new_count: reader.u32()? })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WithdrawalBurnRecord {
+    pub chain_index: u8,
+    pub user_id: u32,
+    pub contract_id: u32,
+    pub nonce: Bytes32,
+    pub recipient: Address,
+    pub amount: Bytes32,
+}
+
+impl WithdrawalBurnRecord {
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        if self.contract_id > 0x00ff_ffff || self.amount == [0; 32] || self.amount >= word(GOLDILOCKS_MODULUS) || self.recipient == [0; 20] {
+            return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth));
+        }
+        writer.u8(1)?; writer.u8(self.chain_index)?; writer.u32(self.user_id)?; writer.u32(self.contract_id)?;
+        writer.bytes32(self.nonce)?; writer.u64(0)?; writer.u64(0)?; writer.u32(0)?;
+        writer.address(self.recipient)?; writer.bytes32(self.amount)
+    }
+    fn read(reader: &mut Reader<'_>) -> Result<Self> {
+        if reader.u8()? != 1 { return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)); }
+        let value = Self { chain_index: reader.u8()?, user_id: reader.u32()?, contract_id: reader.u32()?, nonce: reader.bytes32()?,
+            recipient: {
+                if reader.u64()? != 0 || reader.u64()? != 0 || reader.u32()? != 0 {
+                    return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth));
+                }
+                reader.address()?
+            }, amount: reader.bytes32()? };
+        if value.contract_id > 0x00ff_ffff || value.amount == [0; 32] || value.amount >= word(GOLDILOCKS_MODULUS) || value.recipient == [0; 20] {
+            return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth));
+        }
+        Ok(value)
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new();
+        self.write(&mut writer)?;
+        if writer.0.len() != 320 { return Err(BridgeProofError::InvalidCount); }
+        Ok(writer.0)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 320 {
+            return Err(BridgeProofError::InvalidEncoding(if bytes.len() < 320 { EncodingError::MissingBytes } else { EncodingError::TrailingBytes }));
+        }
+        let mut reader = Reader(bytes);
+        let value = Self::read(&mut reader)?;
+        reader.finish()?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeOpening {
+    pub config_hash: Bytes32,
+    pub end_checkpoint_id: u32,
+    pub end_checkpoint_root: Hash4,
+    pub end_user_root: Hash4,
+    pub chains: Vec<BridgeChainRow>,
+    pub deposits: Vec<DepositLeaf>,
+    pub withdrawals: Vec<WithdrawalBurnRecord>,
+    pub rewards: Vec<RewardClaim>,
+}
+
+impl BridgeOpening {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate_structure()?;
+        let mut writer = Writer::new();
+        writer.u32(BRIDGE_OPENING_VERSION)?; writer.bytes32(self.config_hash)?; writer.u32(self.end_checkpoint_id)?;
+        writer.hash4(self.end_checkpoint_root)?; writer.hash4(self.end_user_root)?;
+        writer.count(self.chains.len(), BRIDGE_OPENING_CHAIN_CAPACITY)?;
+        writer.count(self.deposits.len(), BRIDGE_RECORD_CAPACITY)?;
+        writer.count(self.withdrawals.len(), BRIDGE_RECORD_CAPACITY)?;
+        writer.count(self.rewards.len(), BRIDGE_RECORD_CAPACITY)?;
+        for chain in &self.chains { chain.write(&mut writer)?; }
+        for deposit in &self.deposits { deposit.write(&mut writer)?; }
+        for withdrawal in &self.withdrawals { withdrawal.write(&mut writer)?; }
+        for reward in &self.rewards { reward.write(&mut writer)?; }
+        if writer.0.len() > BRIDGE_OPENING_MAX_BYTES { return Err(BridgeProofError::InvalidCount); }
+        Ok(writer.0)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > BRIDGE_OPENING_MAX_BYTES { return Err(BridgeProofError::InvalidCount); }
+        let mut reader = Reader(bytes);
+        if reader.u32()? != BRIDGE_OPENING_VERSION { return Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)); }
+        let config_hash = reader.bytes32()?;
+        let end_checkpoint_id = reader.u32()?;
+        let end_checkpoint_root = reader.hash4()?;
+        let end_user_root = reader.hash4()?;
+        let chain_count = reader.count(BRIDGE_OPENING_CHAIN_CAPACITY, 16)?;
+        if chain_count == 0 { return Err(BridgeProofError::InvalidCount); }
+        let deposit_count = reader.count(BRIDGE_RECORD_CAPACITY, 7)?;
+        let withdrawal_count = reader.count(BRIDGE_RECORD_CAPACITY, 10)?;
+        let reward_count = reader.count(BRIDGE_RECORD_CAPACITY, 15)?;
+        let mut chains = Vec::with_capacity(chain_count);
+        for _ in 0..chain_count { chains.push(BridgeChainRow::read(&mut reader)?); }
+        let mut deposits = Vec::with_capacity(deposit_count);
+        for _ in 0..deposit_count { deposits.push(DepositLeaf::read(&mut reader)?); }
+        let mut withdrawals = Vec::with_capacity(withdrawal_count);
+        for _ in 0..withdrawal_count { withdrawals.push(WithdrawalBurnRecord::read(&mut reader)?); }
+        let mut rewards = Vec::with_capacity(reward_count);
+        for _ in 0..reward_count { rewards.push(RewardClaim::read(&mut reader)?); }
+        reader.finish()?;
+        let value = Self { config_hash, end_checkpoint_id, end_checkpoint_root, end_user_root, chains, deposits, withdrawals, rewards };
+        value.validate_structure()?;
+        Ok(value)
+    }
+
+    pub fn opening_digest(&self) -> Result<Bytes32> {
+        Ok(hash_parts(&[&hash_parts(&[b"PsyBridge/Opening/4"]), &self.encode()?]))
+    }
+
+    pub fn validate_config(&self, config: &NetworkConfig) -> Result<()> {
+        config.validate()?;
+        self.validate_structure()?;
+        if self.config_hash != config.config_hash()? || self.chains.len() != config.chains.len() {
+            return Err(BridgeProofError::InvalidConfig);
+        }
+        for (row, chain) in self.chains.iter().zip(&config.chains) {
+            if row.chain_index != chain.chain_index { return Err(BridgeProofError::InvalidOrdering); }
+            if u64::from(row.start_checkpoint_id) < chain.bootstrap_id
+                || (u64::from(row.start_checkpoint_id) == chain.bootstrap_id && row.start_checkpoint_root != chain.bootstrap_root)
+            { return Err(BridgeProofError::InvalidCursor); }
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<()> {
+        validate_hash4(&self.end_checkpoint_root)?;
+        validate_hash4(&self.end_user_root)?;
+        if !(1..=BRIDGE_OPENING_CHAIN_CAPACITY).contains(&self.chains.len())
+            || self.deposits.len() > BRIDGE_RECORD_CAPACITY
+            || self.withdrawals.len() > BRIDGE_RECORD_CAPACITY
+            || self.rewards.len() > BRIDGE_RECORD_CAPACITY
+        { return Err(BridgeProofError::InvalidCount); }
+        for (index, row) in self.chains.iter().enumerate() {
+            validate_hash4(&row.start_checkpoint_root)?;
+            validate_hash4(&row.old_deposit_root)?;
+            validate_hash4(&row.new_deposit_root)?;
+            if index > 0 && self.chains[index - 1].chain_index >= row.chain_index {
+                return Err(BridgeProofError::InvalidOrdering);
+            }
+            if row.old_count > row.new_count { return Err(BridgeProofError::InvalidDepositState); }
+            if row.old_count == row.new_count && row.old_deposit_root != row.new_deposit_root {
+                return Err(BridgeProofError::InvalidDepositState);
+            }
+            if u64::from(row.start_checkpoint_id) > u64::from(self.end_checkpoint_id)
+                || (row.start_checkpoint_id == self.end_checkpoint_id && row.start_checkpoint_root != self.end_checkpoint_root)
+            { return Err(BridgeProofError::InvalidCursor); }
+        }
+        let mut position = 0usize;
+        for row in &self.chains {
+            let count = (row.new_count - row.old_count) as usize;
+            if count > self.deposits.len() - position { return Err(BridgeProofError::InvalidCount); }
+            for (offset, leaf) in self.deposits[position..position + count].iter().enumerate() {
+                if leaf.chain_index != row.chain_index || leaf.absolute_index != row.old_count + offset as u32 {
+                    return Err(BridgeProofError::InvalidDepositState);
+                }
+            }
+            position += count;
+        }
+        if position != self.deposits.len() { return Err(BridgeProofError::InvalidCount); }
+        for pair in self.withdrawals.windows(2) {
+            if (pair[0].chain_index, pair[0].user_id, pair[0].contract_id, pair[0].nonce)
+                >= (pair[1].chain_index, pair[1].user_id, pair[1].contract_id, pair[1].nonce)
+            { return Err(BridgeProofError::InvalidOrdering); }
+        }
+        Ok(())
+    }
+}
 wire_struct!(CircuitSetRegistration {
     family: u16 => u16, level: u8 => u8, variant: u8 => u8, pi_words: u16 => u16,
     fingerprint: Hash4 => hash4, common_digest: Bytes32 => bytes32,
@@ -228,9 +561,6 @@ pub struct NetworkConfig {
     pub reward_token: Address,
     pub reward_per_claim: Bytes32,
     pub reward_token_decimals: u8,
-    pub reward_cutover: u64,
-    pub reward_end_exclusive: u64,
-    pub max_deposits: u32,
     pub max_withdrawals: u32,
     pub max_rewards: u32,
 }
@@ -240,9 +570,8 @@ impl NetworkConfig {
         if self.version != 1 || self.bridge_user_id != BRIDGE_USER_ID
             || self.chains.is_empty() || self.chains.len() > MAX_CHAINS
             || self.reward_payer == [0; 20] || self.reward_token == [0; 20]
-            || self.reward_per_claim == [0; 32] || self.reward_cutover >= self.reward_end_exclusive
-            || [self.max_deposits, self.max_withdrawals, self.max_rewards].iter()
-                .any(|&count| count as usize > MAX_LEAVES)
+            || self.reward_per_claim == [0; 32]
+            || [self.max_withdrawals, self.max_rewards].iter().any(|&count| count as usize > MAX_LEAVES)
             || !self.chains.iter().any(|chain| chain.chain_index == self.ethereum_index)
         { return Err(BridgeProofError::InvalidConfig); }
         for (i, chain) in self.chains.iter().enumerate() {
@@ -265,9 +594,7 @@ impl NetworkConfig {
         for chain in &self.chains { chain.write(&mut writer)?; }
         writer.u8(self.ethereum_index)?; writer.address(self.reward_payer)?;
         writer.address(self.reward_token)?; writer.bytes32(self.reward_per_claim)?;
-        writer.u8(self.reward_token_decimals)?; writer.u64(self.reward_cutover)?;
-        writer.u64(self.reward_end_exclusive)?; writer.u32(self.max_deposits)?;
-        writer.u32(self.max_withdrawals)?; writer.u32(self.max_rewards)?;
+        writer.u8(self.reward_token_decimals)?; writer.u32(self.max_withdrawals)?; writer.u32(self.max_rewards)?;
         Ok(writer.0)
     }
 
@@ -282,9 +609,7 @@ impl NetworkConfig {
             version, network_magic, bridge_user_id, circuit_set_hash, chains,
             ethereum_index: reader.u8()?, reward_payer: reader.address()?,
             reward_token: reader.address()?, reward_per_claim: reader.bytes32()?,
-            reward_token_decimals: reader.u8()?, reward_cutover: reader.u64()?,
-            reward_end_exclusive: reader.u64()?, max_deposits: reader.u32()?,
-            max_withdrawals: reader.u32()?, max_rewards: reader.u32()?,
+            reward_token_decimals: reader.u8()?, max_withdrawals: reader.u32()?, max_rewards: reader.u32()?,
         };
         reader.finish()?; value.validate()?; Ok(value)
     }
@@ -351,7 +676,7 @@ impl DepositAggregateOpening {
         for start in &self.starts { start.write(writer)?; }
         writer.count(self.deposits.len(), MAX_CHAINS)?;
         for transition in &self.deposits { transition.write(writer)?; }
-        writer.count(self.deposit_leaves.len(), MAX_LEAVES)?;
+        writer.count(self.deposit_leaves.len(), DEPOSIT_RECORD_CAPACITY)?;
         for leaf in &self.deposit_leaves { leaf.write(writer)?; }
         Ok(())
     }
@@ -364,7 +689,7 @@ impl DepositAggregateOpening {
         let count = reader.count(MAX_CHAINS, 11)?;
         let mut deposits = Vec::with_capacity(count);
         for _ in 0..count { deposits.push(DepositTransition::read(reader)?); }
-        let count = reader.count(MAX_LEAVES, 7)?;
+        let count = reader.count(DEPOSIT_RECORD_CAPACITY, 7)?;
         let mut deposit_leaves = Vec::with_capacity(count);
         for _ in 0..count { deposit_leaves.push(DepositLeaf::read(reader)?); }
         let value = Self { config_hash, window_id, end_checkpoint_id, end_checkpoint_root,
@@ -383,7 +708,7 @@ impl DepositAggregateOpening {
     fn validate_structure(&self) -> Result<()> {
         validate_hash4(&self.end_checkpoint_root)?;
         if self.starts.is_empty() || self.starts.len() > MAX_CHAINS
-            || self.deposits.len() != self.starts.len() || self.deposit_leaves.len() > MAX_LEAVES
+            || self.deposits.len() != self.starts.len() || self.deposit_leaves.len() > DEPOSIT_RECORD_CAPACITY
         { return Err(BridgeProofError::InvalidCount); }
         let mut position = 0usize;
         for (ordinal, (start, transition)) in self.starts.iter().zip(&self.deposits).enumerate() {
@@ -418,7 +743,7 @@ impl DepositAggregateOpening {
     pub fn validate(&self, config: &NetworkConfig) -> Result<()> {
         config.validate()?; self.validate_structure()?;
         if self.config_hash != config.config_hash()? { return Err(BridgeProofError::InvalidConfig); }
-        if self.starts.len() != config.chains.len() || self.deposit_leaves.len() > config.max_deposits as usize {
+        if self.starts.len() != config.chains.len() || self.deposit_leaves.len() > DEPOSIT_RECORD_CAPACITY {
             return Err(BridgeProofError::InvalidCount);
         }
         for (start, chain) in self.starts.iter().zip(&config.chains) {
@@ -441,18 +766,7 @@ impl DepositAggregateOpening {
     }
     pub fn opening_digest(&self, config: &NetworkConfig) -> Result<Bytes32> {
         self.validate(config)?;
-        let mut writer = Writer::new();
-        writer.bytes32(self.config_hash)?; writer.bytes32(self.window_id)?;
-        writer.u64(self.end_checkpoint_id)?; writer.hash4(self.end_checkpoint_root)?;
-        writer.count(self.starts.len(), MAX_CHAINS)?;
-        for start in &self.starts { start.write(&mut writer)?; }
-        writer.count(self.deposits.len(), MAX_CHAINS)?;
-        for transition in &self.deposits { transition.write(&mut writer)?; }
-        let leaves = self.deposit_leaves.len();
-        let chunks = (leaves + AGGREGATE_SIZE - 1) / AGGREGATE_SIZE;
-        writer.u32(leaves as u32)?; writer.u32(chunks as u32)?;
-        writer.bytes32(deposit_aggregate_root(self)?)?;
-        Ok(commit(Domain::DepositAggregate, &writer.0))
+        Ok(commit(Domain::DepositAggregate, &self.encode()?))
     }
 }
 
@@ -901,47 +1215,6 @@ pub fn deposit_aggregate_root(a: &DepositAggregateOpening) -> Result<Bytes32> {
     deposit_chunk_root(a.config_hash, a.end_checkpoint_id, a.end_checkpoint_root, &a.deposit_leaves)
 }
 
-pub fn deposit_leaf_tree(leaf_commits: &[Bytes32]) -> Result<Vec<Bytes32>> {
-    if leaf_commits.len() > MAX_LEAVES { return Err(BridgeProofError::InvalidCount); }
-    let mut tree = vec![[0; 32]; 2 * MAX_LEAVES - 1];
-    let marker = word(12);
-    let count = word(leaf_commits.len() as u64);
-    let leaf_domain = domain_hash(Domain::Leaf);
-    let empty_domain = domain_hash(Domain::Empty);
-    let node_domain = domain_hash(Domain::Node);
-    for (ordinal, node) in tree[MAX_LEAVES-1..].iter_mut().enumerate() {
-        let position = word(ordinal as u64);
-        *node = if let Some(leaf) = leaf_commits.get(ordinal) {
-            hash_parts(&[&leaf_domain, &marker, &count, &position, leaf])
-        } else {
-            hash_parts(&[&empty_domain, &marker, &count, &position])
-        };
-    }
-    for level in 1..=10 {
-        let first = (MAX_LEAVES >> level) - 1;
-        let end = (MAX_LEAVES >> (level-1)) - 1;
-        let level_word = word(level as u64);
-        for index in first..end {
-            tree[index] = hash_parts(&[&node_domain, &marker, &level_word,
-                &tree[index*2+1], &tree[index*2+2]]);
-        }
-    }
-    Ok(tree)
-}
-
-pub fn deposit_leaf_path(tree: &[Bytes32], count: u32, ordinal: u32) -> Result<[Bytes32; 10]> {
-    if tree.len() != 2 * MAX_LEAVES - 1 || count > MAX_LEAVES as u32 || ordinal >= count {
-        return Err(BridgeProofError::InvalidCount);
-    }
-    let mut path = [[0; 32]; 10];
-    let mut index = MAX_LEAVES - 1 + ordinal as usize;
-    for sibling in &mut path {
-        *sibling = tree[if index % 2 == 1 { index+1 } else { index-1 }];
-        index = (index-1) / 2;
-    }
-    Ok(path)
-}
-
 #[cfg(test)]
 mod deposit_leaf_tests {
     use super::*;
@@ -963,98 +1236,29 @@ mod deposit_leaf_tests {
     }
 
     #[test]
-    fn tree_binds_domains_count_positions_and_padding() {
-        let leaves = [word(77), word(77), word(99)];
-        let tree = deposit_leaf_tree(&leaves).unwrap();
-        for ordinal in 0..MAX_LEAVES {
-            let expected = if ordinal < leaves.len() {
-                hash_parts(&[&domain_hash(Domain::Leaf), &word(12), &word(3),
-                    &word(ordinal as u64), &leaves[ordinal]])
-            } else {
-                hash_parts(&[&domain_hash(Domain::Empty), &word(12), &word(3), &word(ordinal as u64)])
-            };
-            assert_eq!(tree[MAX_LEAVES-1+ordinal], expected);
-        }
-        assert_ne!(tree[1023], tree[1024]);
-        assert_ne!(tree[1026], tree[1027]);
-        assert_ne!(tree[1023], hash_parts(&[&domain_hash(Domain::Leaf), &word(1), &word(3), &word(0), &leaves[0]]));
-        assert_ne!(tree[1026], hash_parts(&[&domain_hash(Domain::Leaf), &word(12), &word(3), &word(3), &[0; 32]]));
-        assert_eq!(tree[0], hash_parts(&[&domain_hash(Domain::Node), &word(12), &word(10), &tree[1], &tree[2]]));
-        assert_ne!(tree[0], hash_parts(&[&domain_hash(Domain::Node), &word(6), &word(10), &tree[1], &tree[2]]));
-        let shorter = deposit_leaf_tree(&leaves[..2]).unwrap();
-        assert_ne!(tree[0], shorter[0]);
-        assert_ne!(tree[1023], shorter[1023]);
-        assert_ne!(tree[1027], shorter[1027]);
-        let mut reordered = leaves; reordered.swap(0, 2);
-        assert_ne!(tree[0], deposit_leaf_tree(&reordered).unwrap()[0]);
-    }
-
-    #[test]
-    fn zero_partial_and_full_trees_have_exact_height_ten_paths() {
-        for count in [0, 1, 33, 1024] {
-            let leaves: Vec<_> = (0..count).map(|ordinal| word(ordinal as u64 + 1)).collect();
-            let tree = deposit_leaf_tree(&leaves).unwrap();
-            assert_eq!(tree.len(), 2047);
-            for level in 1..=10 {
-                let first = (MAX_LEAVES >> level) - 1;
-                let end = (MAX_LEAVES >> (level-1)) - 1;
-                for index in first..end {
-                    assert_eq!(tree[index], hash_parts(&[&domain_hash(Domain::Node), &word(12),
-                        &word(level as u64), &tree[2*index+1], &tree[2*index+2]]));
-                }
-            }
-            if count == 0 {
-                for ordinal in 0..MAX_LEAVES {
-                    assert_eq!(tree[1023+ordinal], hash_parts(&[&domain_hash(Domain::Empty),
-                        &word(12), &word(0), &word(ordinal as u64)]));
-                }
-            }
-            for (ordinal, leaf) in leaves.iter().enumerate() {
-                let path = deposit_leaf_path(&tree, count as u32, ordinal as u32).unwrap();
-                let mut root = hash_parts(&[&domain_hash(Domain::Leaf), &word(12),
-                    &word(count as u64), &word(ordinal as u64), leaf]);
-                for (height, sibling) in path.iter().enumerate() {
-                    let (left, right) = if (ordinal >> height) & 1 == 0 {
-                        (&root, sibling)
-                    } else { (sibling, &root) };
-                    root = hash_parts(&[&domain_hash(Domain::Node), &word(12),
-                        &word(height as u64 + 1), left, right]);
-                }
-                assert_eq!(root, tree[0]);
-            }
-            assert_eq!(deposit_leaf_path(&tree, count as u32, count as u32), Err(BridgeProofError::InvalidCount));
-        }
-    }
-
-    #[test]
-    fn path_and_tree_reject_invalid_counts_and_buffers() {
-        assert_eq!(deposit_leaf_tree(&vec![[0; 32]; 1025]), Err(BridgeProofError::InvalidCount));
-        let tree = deposit_leaf_tree(&[[1; 32]]).unwrap();
-        for (count, ordinal) in [(0, 0), (1, 1), (1025, 0), (u32::MAX, 0), (1, u32::MAX)] {
-            assert_eq!(deposit_leaf_path(&tree, count, ordinal), Err(BridgeProofError::InvalidCount));
-        }
-        assert_eq!(deposit_leaf_path(&[], 1, 0), Err(BridgeProofError::InvalidCount));
-        assert_eq!(deposit_leaf_path(&tree[..2046], 1, 0), Err(BridgeProofError::InvalidCount));
-        let mut oversized = tree; oversized.push([0; 32]);
-        assert_eq!(deposit_leaf_path(&oversized, 1, 0), Err(BridgeProofError::InvalidCount));
-    }
-
-    #[test]
     fn registry_is_closed_registered_family_set() {
-        let mut registrations: Vec<CircuitSetRegistration> = CIRCUIT_SET_FAMILIES.iter()
+        let keys = [
+            (11u16, 0u8, 1u8, deposit_aggregate_pi_len(8) as u16),
+            (14, 0, 0, 90), (14, 0, 1, 22), (15, 0, 0, 30), (16, 0, 0, 1_029),
+            (17, 0, 0, 2_574), (18, 0, 0, 3_846),
+            (19, 0, 1, 18 + 5 * 8), (19, 0, 2, 18 + 5 * 8),
+            (20, 0, 0, (8_316 + 128 * 8) as u16),
+        ];
+        assert_eq!(keys.len(), 10);
+        let mut registrations: Vec<CircuitSetRegistration> = keys.iter()
             .map(|&(family, level, variant, pi_words)| CircuitSetRegistration {
                 family, level, variant, pi_words,
                 fingerprint: [1; 4], common_digest: [2; 32], verifier_digest: [3; 32],
                 identity_fingerprint: [0; 4],
             }).collect();
-        assert_eq!(registrations.len(), CIRCUIT_SET_FAMILIES.len());
+        assert_eq!(registrations.len(), keys.len());
         let digest = circuit_set_hash(&registrations).unwrap();
         let encoded = encode_circuit_set(&registrations).unwrap();
         assert_eq!(decode_circuit_set(&encoded).unwrap(), registrations);
         assert_eq!(commit(Domain::CircuitSet, &encoded), digest);
         let mut reader = Reader(&encoded);
         assert_eq!(reader.u32().unwrap(), 2);
-        assert_eq!(reader.count(CIRCUIT_SET_FAMILIES.len(), 14).unwrap(), CIRCUIT_SET_FAMILIES.len());
+        assert_eq!(reader.count(keys.len(), 14).unwrap(), keys.len());
         for registration in &registrations { assert_eq!(CircuitSetRegistration::read(&mut reader).unwrap(), *registration); }
         reader.finish().unwrap();
         let mut trailing = encoded.clone(); trailing.push(0);
@@ -1069,7 +1273,7 @@ mod deposit_leaf_tests {
         let mut noncanonical = encoded.clone(); noncanonical[32] = 1;
         assert_eq!(decode_circuit_set(&noncanonical),
             Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
-        for (family, level, variant) in [(1u16, 0u8, 0u8), (7, 0, 2), (7, 0, 3), (9, 0, 1), (11, 0, 1), (12, 0, 2), (13, 0, 3), (13, 5, 3), (13, 8, 3)] {
+        for (family, level, variant) in [(11u16, 0u8, 1u8), (14, 0, 0), (19, 0, 1), (19, 0, 2), (20, 0, 0)] {
             let mut obsolete = registrations.clone();
             let index = obsolete.iter().position(|registration| (registration.family, registration.level, registration.variant)
                 == (family, level, variant)).unwrap();
@@ -1078,6 +1282,31 @@ mod deposit_leaf_tests {
         }
         let mut changed = registrations.clone(); changed[0].fingerprint[0] += 1;
         assert_ne!(circuit_set_hash(&changed).unwrap(), digest);
+        for chain_count in 1..=8 {
+            let mut admitted = registrations.clone();
+            for registration in &mut admitted {
+                registration.pi_words = registered_pi_words(registration.family, registration.level, registration.variant, chain_count).unwrap();
+            }
+            assert_eq!(admitted[0].pi_words as usize, 27 + 17 * chain_count + 39 * DEPOSIT_RECORD_CAPACITY);
+            assert_eq!(admitted[9].pi_words as usize, 8_316 + 128 * chain_count);
+            assert!(circuit_set_hash(&admitted).is_ok());
+        }
+        for width in [0u16, 12, deposit_aggregate_pi_len(1) as u16 - 1, deposit_aggregate_pi_len(8) as u16 + 1, deposit_aggregate_pi_len(9) as u16] {
+            let mut rejected = registrations.clone();
+            rejected[0].pi_words = width;
+            assert_eq!(circuit_set_hash(&rejected), Err(BridgeProofError::InvalidConfig));
+        }
+        for removed in [(1u16, 0u8, 1u8), (9, 0, 2)] {
+            let mut obsolete = registrations.clone();
+            obsolete[4] = CircuitSetRegistration {
+                family: removed.0, level: removed.1, variant: removed.2,
+                pi_words: if removed.0 == 1 { 40 } else { 33 },
+                fingerprint: [1; 4], common_digest: [2; 32], verifier_digest: [3; 32],
+                identity_fingerprint: [0; 4],
+            };
+            obsolete.sort_by_key(|registration| (registration.family, registration.level, registration.variant));
+            assert_eq!(circuit_set_hash(&obsolete), Err(BridgeProofError::InvalidConfig));
+        }
         let mut duplicate = registrations.clone(); duplicate[1] = duplicate[0].clone();
         assert_eq!(circuit_set_hash(&duplicate), Err(BridgeProofError::InvalidOrdering));
         let mut unordered = registrations.clone(); unordered.swap(0, 1);
@@ -1218,7 +1447,7 @@ fn write_hash4(inputs: &mut [u64], offset: usize, value: Hash4) -> Result<()> {
 }
 pub const WITHDRAWAL_PUBLICATION_FAMILY: u8 = 2;
 pub const REWARD_PUBLICATION_FAMILY: u8 = 3;
-pub const INCLUSION_AGGREGATE_CAPACITIES: [u32; 4] = [1024, 2048, 4096, 8192];
+pub const CLAIM_TREE_CAPACITIES: [u32; 4] = [1024, 2048, 4096, 8192];
 pub const CLAIM_TREE_MAX_CAPACITY: usize = 131072;
 pub const CLAIM_TREE_MAX_DEPTH: u32 = 17;
 pub const SOURCE_CHECKPOINT_REWARD_LEAF_BYTES: usize = 192;
@@ -1454,7 +1683,7 @@ impl SourceCheckpointRewardOpening {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InclusionAggregateHeader {
+pub struct ClaimPublicationHeader {
     pub family: u8,
     pub config_hash: Bytes32,
     pub window_id: Bytes32,
@@ -1473,17 +1702,17 @@ pub struct InclusionAggregateHeader {
     pub claim_tree_root: Bytes32,
 }
 
-impl InclusionAggregateHeader {
+impl ClaimPublicationHeader {
     pub fn validate(&self) -> Result<()> {
         validate_hash4(&self.end_checkpoint_root)?;
-        if !INCLUSION_AGGREGATE_CAPACITIES.contains(&self.aggregate_capacity) {
+        if !CLAIM_TREE_CAPACITIES.contains(&self.aggregate_capacity) {
             return Err(BridgeProofError::InvalidCount);
         }
         let expected_segments = if self.total_count == 0 { 0 }
             else { self.total_count.div_ceil(self.aggregate_capacity) };
         if self.segment_count != expected_segments { return Err(BridgeProofError::InvalidCount); }
         if self.total_count == 0 {
-            let empty_root = build_inclusion_aggregate_tree(&[], self.aggregate_capacity as usize)?[0];
+            let empty_root = build_claim_tree(&[], self.aggregate_capacity as usize)?[0];
             if self.segment_index != 0 || self.first_ordinal != 0 || self.count != 0
                 || self.opening_digest != self.empty_opening_digest()? || self.claim_tree_root != empty_root
             { return Err(BridgeProofError::InvalidCount); }
@@ -1626,7 +1855,7 @@ impl InclusionAggregateHeader {
     }
 }
 
-pub fn build_inclusion_aggregate_tree(leaf_commits: &[Bytes32], aggregate_capacity: usize) -> Result<Vec<Bytes32>> {
+pub fn build_claim_tree(leaf_commits: &[Bytes32], aggregate_capacity: usize) -> Result<Vec<Bytes32>> {
     let depth = claim_tree_depth(aggregate_capacity as u32)?;
     if aggregate_capacity > CLAIM_TREE_MAX_CAPACITY || leaf_commits.len() > aggregate_capacity {
         return Err(BridgeProofError::InvalidCount);
@@ -1670,7 +1899,7 @@ pub fn claim_tree_path(tree: &[Bytes32], aggregate_capacity: u32, count: u32, or
     Ok(path)
 }
 
-fn fold_claim_path(header: &InclusionAggregateHeader, leaf_commit: Bytes32, ordinal: u32, siblings: &[Bytes32]) -> Result<Bytes32> {
+fn fold_claim_path(header: &ClaimPublicationHeader, leaf_commit: Bytes32, ordinal: u32, siblings: &[Bytes32]) -> Result<Bytes32> {
     let depth = claim_tree_depth(header.aggregate_capacity)?;
     if siblings.len() != depth as usize || ordinal >= header.count || header.count > header.aggregate_capacity {
         return Err(BridgeProofError::InvalidCount);
@@ -1686,7 +1915,7 @@ fn fold_claim_path(header: &InclusionAggregateHeader, leaf_commit: Bytes32, ordi
     Ok(state)
 }
 
-pub fn verify_claim_path(header: &InclusionAggregateHeader, ordinal: u32, leaf_bytes: &[u8], siblings: &[Bytes32]) -> Result<Bytes32> {
+pub fn verify_claim_path(header: &ClaimPublicationHeader, ordinal: u32, leaf_bytes: &[u8], siblings: &[Bytes32]) -> Result<Bytes32> {
     header.validate()?;
     if ordinal >= header.count || siblings.len() != claim_tree_depth(header.aggregate_capacity)? as usize {
         return Err(BridgeProofError::InvalidCount);
@@ -1712,10 +1941,10 @@ pub fn publication_digest_words(digest: Bytes32) -> [u32; PUBLICATION_DIGEST_WOR
     }
     words
 }
-pub fn bind_claim_tree(header: &mut InclusionAggregateHeader, leaf_commits: &[Bytes32]) -> Result<Vec<Bytes32>> {
+pub fn bind_claim_tree(header: &mut ClaimPublicationHeader, leaf_commits: &[Bytes32]) -> Result<Vec<Bytes32>> {
     header.validate()?;
     if leaf_commits.len() != header.count as usize { return Err(BridgeProofError::InvalidCount); }
-    let tree = build_inclusion_aggregate_tree(leaf_commits, header.aggregate_capacity as usize)?;
+    let tree = build_claim_tree(leaf_commits, header.aggregate_capacity as usize)?;
     header.claim_tree_root = tree[0];
     header.validate()?;
     Ok(tree)
@@ -1747,6 +1976,22 @@ pub fn reward_nullifier(config: &NetworkConfig, leaf: &RewardLeaf) -> Result<Byt
 }
 
 impl DepositLeaf {
+    pub fn poseidon_hash(&self) -> Result<Hash4> {
+        let mut token = [0u8; 32];
+        token[12..].copy_from_slice(&self.token);
+        let mut words = [0u64; 41];
+        for (index, value) in [&self.shield_address, &token, &self.l2_token_contract_id, &self.amount].into_iter().enumerate() {
+            for (offset, bytes) in value.chunks_exact(4).enumerate() {
+                words[index * 8 + offset] = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
+            }
+        }
+        words[32] = self.chain_index as u64;
+        for (offset, bytes) in self.note_commitment.chunks_exact(4).enumerate() {
+            words[33 + offset] = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
+        }
+        deposit_poseidon(&words)
+    }
+
     pub fn leaf_commit(&self) -> Result<Bytes32> {
         Ok(hash_parts(&[&domain_hash(Domain::LeafCommit), &word(1), &self.encode()?]))
     }
@@ -1781,29 +2026,53 @@ impl RewardLeaf {
     }
 }
 
-const CIRCUIT_SET_FAMILIES: [(u16, u8, u8, u16); 17] = [
-    (1, 0, 0, 40), (2, 0, 0, 32), (3, 0, 0, 34),
-    (7, 0, 2, 28), (7, 0, 3, 28), (9, 0, 1, 37), (11, 0, 1, 12), (12, 0, 2, 12),
-    (13, 0, 3, 131), (13, 1, 3, 131), (13, 2, 3, 131),
-    (13, 3, 3, 131), (13, 4, 3, 131), (13, 5, 3, 131),
-    (13, 6, 3, 131), (13, 7, 3, 131), (13, 8, 3, 131),
+const CIRCUIT_SET_FAMILIES: [(u16, u8, u8, u16); 10] = [
+    (11, 0, 1, 0),
+    (14, 0, 0, 90),
+    (14, 0, 1, 22),
+    (15, 0, 0, 30),
+    (16, 0, 0, 1_029),
+    (17, 0, 0, 2_574),
+    (18, 0, 0, 3_846),
+    (19, 0, 1, 0),
+    (19, 0, 2, 0),
+    (20, 0, 0, 0),
 ];
+pub fn circuit_set_family(index: usize) -> Option<(u16, u8, u8, u16)> {
+    CIRCUIT_SET_FAMILIES.get(index).copied()
+}
+
+fn registered_pi_words(family: u16, level: u8, variant: u8, chain_count: usize) -> Option<u16> {
+    let words = match (family, level, variant) {
+        (11, 0, 1) => deposit_aggregate_pi_len(chain_count),
+        (14, 0, 0) => 90,
+        (14, 0, 1) => 22,
+        (15, 0, 0) => 30,
+        (16, 0, 0) => 1_029,
+        (17, 0, 0) => 2_574,
+        (18, 0, 0) => 3_846,
+        (19, 0, 1) | (19, 0, 2) => 18 + 5 * chain_count,
+        (20, 0, 0) => 8_316 + 128 * chain_count,
+        _ => return None,
+    };
+    u16::try_from(words).ok()
+}
 
 fn validate_circuit_set(registrations: &[CircuitSetRegistration]) -> Result<()> {
-    // Every key in the closed family/level/variant table occurs once, in order.
     if registrations.len() != CIRCUIT_SET_FAMILIES.len() { return Err(BridgeProofError::InvalidCount); }
+    let chain_count = registrations.iter().find(|registration| (registration.family, registration.level, registration.variant) == (11, 0, 1))
+        .and_then(|registration| (1..=BRIDGE_OPENING_CHAIN_CAPACITY).find(|&count| registration.pi_words as usize == deposit_aggregate_pi_len(count)))
+        .ok_or(BridgeProofError::InvalidConfig)?;
     for pair in registrations.windows(2) {
         let previous = (pair[0].family, pair[0].level, pair[0].variant);
         let key = (pair[1].family, pair[1].level, pair[1].variant);
         if previous >= key { return Err(BridgeProofError::InvalidOrdering); }
     }
-    for (registration, &(family, level, variant, pi_words)) in registrations.iter().zip(&CIRCUIT_SET_FAMILIES) {
-        if (registration.family, registration.level, registration.variant, registration.pi_words) != (family, level, variant, pi_words) {
-            return Err(BridgeProofError::InvalidConfig);
-        }
-        if registration.fingerprint == [0; 4] || registration.identity_fingerprint != [0; 4] {
-            return Err(BridgeProofError::InvalidConfig);
-        }
+    for (registration, &(family, level, variant, _)) in registrations.iter().zip(&CIRCUIT_SET_FAMILIES) {
+        if (registration.family, registration.level, registration.variant) != (family, level, variant)
+            || registered_pi_words(family, level, variant, chain_count) != Some(registration.pi_words)
+            || registration.fingerprint == [0; 4] || registration.identity_fingerprint != [0; 4]
+        { return Err(BridgeProofError::InvalidConfig); }
         validate_hash4(&registration.fingerprint)?;
         validate_hash4(&registration.identity_fingerprint)?;
     }
@@ -1847,9 +2116,8 @@ mod tests {
                 bootstrap_root: [1, 2, 3, 4],
             }).collect(),
             ethereum_index: 0, reward_payer: [3; 20], reward_token: [4; 20],
-            reward_per_claim: word(1), reward_token_decimals: 0,
-            reward_cutover: 0, reward_end_exclusive: 100,
-            max_deposits: 1024, max_withdrawals: 1024, max_rewards: 1024,
+            reward_per_claim: [1; 32], reward_token_decimals: 18,
+            max_withdrawals: 1024, max_rewards: 1024,
         }
     }
 
@@ -1907,16 +2175,20 @@ mod tests {
     #[test]
     fn configuration_enforces_account_bounds_and_required_economics() {
         let config = config(256);
-        assert_eq!(NetworkConfig::decode(&config.encode().unwrap()).unwrap(), config);
+        let encoded = config.encode().unwrap();
+        assert_eq!(encoded.len(), 384 + 288 * 256);
+        assert_eq!(NetworkConfig::decode(&encoded).unwrap(), config);
         let mut changed = config.clone(); changed.bridge_user_id += 1;
         assert_eq!(changed.validate(), Err(BridgeProofError::InvalidConfig));
         let mut changed = config.clone(); changed.reward_per_claim = [0; 32];
         assert_eq!(changed.validate(), Err(BridgeProofError::InvalidConfig));
         let mut changed = config.clone(); changed.max_rewards = 1025;
         assert_eq!(changed.validate(), Err(BridgeProofError::InvalidConfig));
+        let mut changed = config.clone(); changed.max_withdrawals = 1025;
+        assert_eq!(changed.validate(), Err(BridgeProofError::InvalidConfig));
         let mut changed = config.clone(); changed.chains[1].chain_id = changed.chains[0].chain_id;
         assert_eq!(changed.validate(), Err(BridgeProofError::InvalidConfig));
-        let mut bytes = config.encode().unwrap(); bytes[128..160].copy_from_slice(&word(257));
+        let mut bytes = encoded; bytes[128..160].copy_from_slice(&word(257));
         assert_eq!(NetworkConfig::decode(&bytes), Err(BridgeProofError::InvalidCount));
     }
 
@@ -1944,9 +2216,10 @@ mod tests {
     #[test]
     fn zero_odd_and_full_aggregates_hash_actual_leaves() {
         let network = config(1);
-        for count in [0, 1, 31, 32, 33, 1024] {
+        for count in [0, 1, 31, 32] {
             let a = opening(&network, count);
             assert_eq!(DepositAggregateOpening::decode(&a.encode().unwrap()).unwrap(), a);
+            assert_eq!(a.opening_digest(&network).unwrap(), hash_parts(&[&domain_hash(Domain::DepositAggregate), &a.encode().unwrap()]));
             assert_eq!(deposit_aggregate_root(&a).unwrap(), reference_deposit_root(&a));
             let withdrawal = withdrawal_opening(&network, count);
             assert_eq!(withdrawal.encode().unwrap().len(), 288 + 128 * network.chains.len() + 192 * count);
@@ -1962,8 +2235,26 @@ mod tests {
                 assert_ne!(mutated_withdrawal.opening_digest(&network).unwrap(), withdrawal.opening_digest(&network).unwrap());
             }
         }
-        assert!(opening(&network, 1025).encode().is_err());
+        assert!(opening(&network, DEPOSIT_RECORD_CAPACITY + 1).encode().is_err());
         assert!(withdrawal_opening(&network, 1025).encode().is_err());
+        let accepted = opening(&network, DEPOSIT_RECORD_CAPACITY);
+        assert_eq!(accepted.encode().unwrap().len(), 320 + 544 + 224 * DEPOSIT_RECORD_CAPACITY);
+        assert!(accepted.validate(&network).is_ok());
+        let mut over_capacity = accepted.clone();
+        over_capacity.deposit_leaves.push(DepositLeaf {
+            chain_index: network.chains[0].chain_index, absolute_index: DEPOSIT_RECORD_CAPACITY as u32,
+            shield_address: [9; 32], token: [0; 20], l2_token_contract_id: word(1),
+            amount: word(1), note_commitment: [8; 32],
+        });
+        over_capacity.deposits[0].new_count = DEPOSIT_RECORD_CAPACITY as u32 + 1;
+        over_capacity.deposits[0].new_root = [4, 3, 2, 1];
+        over_capacity.window_id = over_capacity.window_id().unwrap();
+        assert_eq!(over_capacity.validate(&network), Err(BridgeProofError::InvalidCount));
+        let encoded = network.encode().unwrap();
+        assert_eq!(encoded.len(), 384 + 288);
+        let mut restored = encoded.clone();
+        restored.splice(encoded.len() - 64..encoded.len() - 64, word(DEPOSIT_RECORD_CAPACITY as u64));
+        assert_eq!(NetworkConfig::decode(&restored), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
     }
 
     #[test]
@@ -2032,7 +2323,7 @@ mod tests {
     #[test]
     fn complete_openings_reject_missing_foreign_rows_and_leaves() {
         let network = config(2);
-        let a = opening(&network, 33);
+        let a = opening(&network, 32);
         let mut missing = a.clone();
         missing.deposit_leaves.pop();
         assert_eq!(missing.validate(&network), Err(BridgeProofError::InvalidCount));
@@ -2050,9 +2341,9 @@ mod tests {
     #[test]
     fn aggregate_chunk_crosses_chain_boundary_without_restart() {
         let network = config(2);
-        let mut a = opening(&network, 33);
+        let mut a = opening(&network, 32);
         a.deposits[0].new_count = 31;
-        a.deposits[1].new_count = 2;
+        a.deposits[1].new_count = 1;
         a.deposits[1].new_root = [8, 7, 6, 5];
         for (index, leaf) in a.deposit_leaves[31..].iter_mut().enumerate() {
             leaf.chain_index = 1;
@@ -2180,9 +2471,9 @@ mod tests {
             amount: [1500, 0, 0, 0, 0, 0, 0, 0], recipient: [0x11; 20], initialized: true }
     }
 
-    fn reward_header(count: u32, capacity: u32) -> InclusionAggregateHeader {
+    fn reward_header(count: u32, capacity: u32) -> ClaimPublicationHeader {
         let total = if count == 0 { 0 } else { count + capacity };
-        let mut header = InclusionAggregateHeader {
+        let mut header = ClaimPublicationHeader {
             family: REWARD_PUBLICATION_FAMILY, config_hash: [4; 32], window_id: [5; 32],
             end_checkpoint_id: 1200, end_checkpoint_root: [5, 6, 7, 8], aggregate_capacity: capacity,
             total_count: total, segment_count: if total == 0 { 0 } else { total.div_ceil(capacity) },
@@ -2193,7 +2484,7 @@ mod tests {
         };
         if count == 0 {
             header.opening_digest = header.empty_opening_digest().unwrap();
-            header.claim_tree_root = build_inclusion_aggregate_tree(&[], capacity as usize).unwrap()[0];
+            header.claim_tree_root = build_claim_tree(&[], capacity as usize).unwrap()[0];
         }
         header
     }
@@ -2337,7 +2628,7 @@ mod tests {
         bind_claim_tree(&mut bound, &commits).unwrap();
         let bytes = bound.encode().unwrap();
         assert_eq!(bytes.len(), REWARD_HEADER_BYTES);
-        assert_eq!(InclusionAggregateHeader::decode(&bytes).unwrap(), bound);
+        assert_eq!(ClaimPublicationHeader::decode(&bytes).unwrap(), bound);
         assert_eq!(bound.header_digest().unwrap(), hash_parts(&[&hash_parts(&[b"PsyBridge/TwoArtifact/1/AggregateHeader"]), &bytes]));
         let words = bound.publication_words().unwrap();
         assert_eq!(&words[..4], &[1, 7, 3, 0]);
@@ -2354,14 +2645,14 @@ mod tests {
         assert_eq!(words[11], 2);
         assert_ne!(words[4], u32::from_le_bytes(digest[..4].try_into().unwrap()));
         let mut short = bytes.clone(); short.pop();
-        assert_eq!(InclusionAggregateHeader::decode(&short), Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)));
+        assert_eq!(ClaimPublicationHeader::decode(&short), Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)));
         let mut long = bytes.clone(); long.push(0);
-        assert_eq!(InclusionAggregateHeader::decode(&long), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
+        assert_eq!(ClaimPublicationHeader::decode(&long), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
         let mut family = bytes.clone(); family[0] = 4;
-        assert_eq!(InclusionAggregateHeader::decode(&family), Err(BridgeProofError::InvalidConfig));
+        assert_eq!(ClaimPublicationHeader::decode(&family), Err(BridgeProofError::InvalidConfig));
         let mut felt = bytes.clone();
         felt[73..81].copy_from_slice(&GOLDILOCKS_MODULUS.to_be_bytes());
-        assert_eq!(InclusionAggregateHeader::decode(&felt), Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
+        assert_eq!(ClaimPublicationHeader::decode(&felt), Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
         let mut paired = [0u64; 8];
         paired[0] = 1; paired[1] = 2;
         assert_eq!(read_hash4_encoding(&paired, Hash4Encoding::LittleEndianU32x8).unwrap(), [1 + (2 << 32), 0, 0, 0]);
@@ -2373,16 +2664,16 @@ mod tests {
         withdrawal.old_ledger_state_root = None; withdrawal.new_ledger_state_root = None;
         let withdrawal_bytes = withdrawal.encode().unwrap();
         assert_eq!(withdrawal_bytes.len(), WITHDRAWAL_HEADER_BYTES + 32 * 256);
-        assert_eq!(InclusionAggregateHeader::decode(&withdrawal_bytes).unwrap().withdrawal_roots.len(), 256);
+        assert_eq!(ClaimPublicationHeader::decode(&withdrawal_bytes).unwrap().withdrawal_roots.len(), 256);
         let mut one_chain = withdrawal.clone();
         one_chain.withdrawal_roots.truncate(1);
         assert_eq!(one_chain.encode().unwrap().len(), WITHDRAWAL_HEADER_BYTES + 32);
         let mut zero_roots = one_chain.encode().unwrap();
         zero_roots.drain(WITHDRAWAL_HEADER_BYTES..WITHDRAWAL_HEADER_BYTES + 32);
-        assert_eq!(InclusionAggregateHeader::decode(&zero_roots), Err(BridgeProofError::InvalidCount));
+        assert_eq!(ClaimPublicationHeader::decode(&zero_roots), Err(BridgeProofError::InvalidCount));
         let mut excess_roots = withdrawal.encode().unwrap();
         excess_roots.splice(WITHDRAWAL_HEADER_BYTES..WITHDRAWAL_HEADER_BYTES, [0; 32]);
-        assert_eq!(InclusionAggregateHeader::decode(&excess_roots), Err(BridgeProofError::InvalidCount));
+        assert_eq!(ClaimPublicationHeader::decode(&excess_roots), Err(BridgeProofError::InvalidCount));
         let empty_reward = reward_header(0, 1024);
         let empty_reward_bytes = empty_reward.encode().unwrap();
         assert_eq!(&empty_reward_bytes[empty_reward_bytes.len() - 64..empty_reward_bytes.len() - 32], &empty_reward.opening_digest);
@@ -2392,9 +2683,9 @@ mod tests {
         assert!(reward_header(1023, 1024).encode().is_ok());
         assert!(reward_header(1024, 1024).encode().is_ok());
         assert!(reward_header(1025, 1024).encode().is_err());
-        assert!(build_inclusion_aggregate_tree(&[], 1).is_ok());
-        assert!(build_inclusion_aggregate_tree(&[], 131072).is_ok());
-        assert_eq!(build_inclusion_aggregate_tree(&[], 1 << 18), Err(BridgeProofError::InvalidCount));
+        assert!(build_claim_tree(&[], 1).is_ok());
+        assert!(build_claim_tree(&[], 131072).is_ok());
+        assert_eq!(build_claim_tree(&[], 1 << 18), Err(BridgeProofError::InvalidCount));
     }
 
     #[test]
@@ -2555,5 +2846,166 @@ mod tests {
         assert_ne!(other_magic.config_hash_for_domain_derivation().unwrap(), network.config_hash_for_domain_derivation().unwrap());
         assert_eq!(other_magic.config_hash_for_domain_derivation().unwrap(), other_magic.config_hash().unwrap());
     }
+
+    fn ablation_leaf_node(commit: &[u8; 32], count: u64, position: u64, with_position: bool, with_count: bool) -> Bytes32 {
+        let mut parts: Vec<Vec<u8>> = vec![domain_hash(Domain::Leaf).to_vec(), word(12).to_vec()];
+        if with_count { parts.push(word(count).to_vec()); }
+        if with_position { parts.push(word(position).to_vec()); }
+        parts.push(commit.to_vec());
+        let slices: Vec<&[u8]> = parts.iter().map(|part| part.as_slice()).collect();
+        hash_parts(&slices)
+    }
+
+    fn ablation_empty_node(count: u64, position: u64) -> Bytes32 {
+        hash_parts(&[&domain_hash(Domain::Empty), &word(12), &word(count), &word(position)])
+    }
+
+    #[test]
+    fn ablation_empty_domain_separates_zero_commit() {
+        for count in [2u64, 4] {
+            for position in [0u64, 3] {
+                let occupied = hash_parts(&[&domain_hash(Domain::Leaf), &word(12), &word(count), &word(position), &[0u8; 32]]);
+                assert_ne!(occupied, ablation_empty_node(count, position), "real scheme must separate a zero commit from padding at count={count} position={position}");
+                let ablated_occupied = ablation_leaf_node(&[0u8; 32], count, position, true, true);
+                let ablated_empty = hash_parts(&[&domain_hash(Domain::Leaf), &word(12), &word(count), &word(position), &[0u8; 32]]);
+                assert_eq!(ablated_occupied, ablated_empty, "ablated empties-as-zero-commit-leaves collide at count={count} position={position}");
+            }
+        }
+    }
+
+    #[test]
+    fn ablation_position_binding_blocks_ordinal_substitution() {
+        let commit = hash_parts(&[b"ablation-commit"]);
+        assert_ne!(ablation_leaf_node(&commit, 2, 0, true, true), ablation_leaf_node(&commit, 2, 1, true, true), "real scheme must bind ordinals");
+        assert_eq!(ablation_leaf_node(&commit, 2, 0, false, true), ablation_leaf_node(&commit, 2, 1, false, true), "removing position binding enables one path at every ordinal");
+    }
+
+    #[test]
+    fn ablation_count_binding_blocks_cross_shape_replay() {
+        let commit = hash_parts(&[b"ablation-commit"]);
+        assert_ne!(ablation_leaf_node(&commit, 2, 0, true, true), ablation_leaf_node(&commit, 4, 0, true, true), "real scheme must bind window fill");
+        assert_eq!(ablation_leaf_node(&commit, 2, 0, true, false), ablation_leaf_node(&commit, 4, 0, true, false), "removing count binding enables sparse-to-dense path replay");
+    }
+
+    fn reward_inputs(user_id: u32, count: u32, amount: [u32; 8], recipient: [u32; 8], old_root: Hash4, new_root: Hash4) -> [u64; 30] {
+        let mut inputs = [0u64; 30];
+        inputs[0] = user_id as u64;
+        for (index, limb) in recipient.into_iter().enumerate() { inputs[1 + index] = limb as u64; }
+        inputs[9..13].copy_from_slice(&old_root);
+        inputs[13..17].copy_from_slice(&new_root);
+        inputs[17] = count as u64;
+        for (index, limb) in amount.into_iter().enumerate() { inputs[18 + index] = limb as u64; }
+        inputs[26..30].copy_from_slice(&[9, 8, 7, 6]);
+        inputs
+    }
+
+    fn version4_opening(network: &NetworkConfig, rewards: Vec<RewardClaim>) -> BridgeOpening {
+        BridgeOpening {
+            config_hash: network.config_hash().unwrap(), end_checkpoint_id: 1,
+            end_checkpoint_root: [5, 6, 7, 8], end_user_root: [4, 3, 2, 1],
+            chains: network.chains.iter().map(|chain| BridgeChainRow {
+                chain_index: chain.chain_index, start_checkpoint_id: 0, start_checkpoint_root: chain.bootstrap_root,
+                old_deposit_root: [1, 2, 3, 4], new_deposit_root: [1, 2, 3, 4], old_count: 0, new_count: 0,
+            }).collect(),
+            deposits: Vec::new(), withdrawals: Vec::new(), rewards,
+        }
+    }
+
+    #[test]
+    fn reward_claim_roundtrip_preserves_full_amount_and_roots() {
+        let amount = [0x01020304u32, 0x05060708, 0x090a0b0c, 0x0d0e0f10, 0x11121314, 0x15161718, 0x191a1b1c, 0x1d1e1f20];
+        let recipient = [0x11111111u32, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0, 0, 0];
+        let old_root = [1, 2, 3, GOLDILOCKS_MODULUS - 1];
+        let new_root = [8, 7, 6, 5];
+        let inputs = reward_inputs(u32::MAX, 1, amount, recipient, old_root, new_root);
+        let claim = RewardClaim::from_public_inputs(3, &inputs).unwrap();
+        assert_eq!(claim.chain_index, 3);
+        assert_eq!(claim.user_id, u32::MAX);
+        assert_eq!(claim.contract_id, BRIDGE_REWARD_CONTRACT_ID);
+        assert_eq!(claim.count, 1);
+        assert_eq!(claim.old_nullifier_root, old_root);
+        assert_eq!(claim.new_nullifier_root, new_root);
+        assert_eq!(claim.recipient, [0x55, 0x55, 0x55, 0x55, 0x44, 0x44, 0x44, 0x44, 0x33, 0x33, 0x33, 0x33, 0x22, 0x22, 0x22, 0x22, 0x11, 0x11, 0x11, 0x11]);
+        let mut expected_amount = [0u8; 32];
+        for (index, limb) in amount.into_iter().enumerate() { expected_amount[28 - index * 4..32 - index * 4].copy_from_slice(&limb.to_be_bytes()); }
+        assert_eq!(claim.amount, expected_amount);
+        let encoded = claim.encode().unwrap();
+        assert_eq!(encoded.len(), REWARD_CLAIM_BYTES);
+        assert_eq!(RewardClaim::decode(&encoded).unwrap(), claim);
+        assert_eq!(&packed_root(old_root).unwrap()[24..], &(GOLDILOCKS_MODULUS - 1).to_be_bytes());
+        assert_eq!(&packed_root(old_root).unwrap()[..8], &1u64.to_be_bytes());
+        assert_ne!(packed_root(old_root).unwrap().to_vec(), hash4_bytes(old_root).unwrap().to_vec());
+    }
+
+    #[test]
+    fn reward_claim_rejects_reduced_width_and_zero_values() {
+        let amount = [1u32, 0, 0, 0, 0, 0, 0, 0];
+        let recipient = [1u32, 0, 0, 0, 0, 0, 0, 0];
+        let inputs = reward_inputs(1, 2, amount, recipient, [1, 2, 3, 4], [5, 6, 7, 8]);
+        let claim = RewardClaim::from_public_inputs(0, &inputs).unwrap();
+        for mutation in [
+            reward_inputs(1, 2, [0; 8], recipient, [1, 2, 3, 4], [5, 6, 7, 8]),
+            reward_inputs(1, 2, amount, [0; 8], [1, 2, 3, 4], [5, 6, 7, 8]),
+        ] {
+            assert_eq!(RewardClaim::from_public_inputs(0, &mutation), Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+        }
+        let mut high_recipient = inputs;
+        high_recipient[6] = 1;
+        assert_eq!(RewardClaim::from_public_inputs(0, &high_recipient), Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+        let mut wide_limb = inputs;
+        wide_limb[1] = u32::MAX as u64 + 1;
+        assert_eq!(RewardClaim::from_public_inputs(0, &wide_limb), Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+        let mut noncanonical = inputs;
+        noncanonical[9] = GOLDILOCKS_MODULUS;
+        assert_eq!(RewardClaim::from_public_inputs(0, &noncanonical), Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
+        let mut encoded = claim.encode().unwrap();
+        encoded[31] = 8;
+        assert_eq!(RewardClaim::decode(&encoded), Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+        encoded = claim.encode().unwrap();
+        encoded.push(0);
+        assert_eq!(RewardClaim::decode(&encoded), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
+        assert_eq!(RewardClaim::decode(&encoded[..479]), Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)));
+        assert_eq!(packed_root([GOLDILOCKS_MODULUS, 0, 0, 0]), Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
+    }
+
+    #[test]
+    fn version4_opening_digest_is_domain_separated_and_bounded() {
+        let network = config(1);
+        let claim = RewardClaim::from_public_inputs(0, &reward_inputs(7, 1, [1, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], [1, 2, 3, 4], [5, 6, 7, 8])).unwrap();
+        let opening = version4_opening(&network, vec![claim]);
+        let bytes = opening.encode().unwrap();
+        assert_eq!(bytes.len(), 32 * (15 + 16 + 15));
+        assert!(bytes.len() <= BRIDGE_OPENING_MAX_BYTES);
+        assert_eq!(BridgeOpening::decode(&bytes).unwrap(), opening);
+        assert_eq!(opening.opening_digest().unwrap(), hash_parts(&[&hash_parts(&[b"PsyBridge/Opening/4"]), &bytes]));
+        assert_eq!(opening.validate_config(&network), Ok(()));
+        let context = claim_context_id(opening.config_hash, opening.end_checkpoint_id, opening.end_checkpoint_root).unwrap();
+        let mut context_body = hash_parts(&[b"PsyBridge/ClaimContext/4"]).to_vec();
+        context_body.extend_from_slice(&opening.config_hash);
+        context_body.extend_from_slice(&word(opening.end_checkpoint_id as u64));
+        for limb in opening.end_checkpoint_root { context_body.extend_from_slice(&word(limb)); }
+        assert_eq!(context, hash_parts(&[&context_body]));
+        assert_ne!(context, opening.opening_digest().unwrap());
+        let mut trailing = bytes.clone(); trailing.push(0);
+        assert_eq!(BridgeOpening::decode(&trailing), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
+        let mut old_version = bytes.clone(); old_version[31] = 3;
+        assert_eq!(BridgeOpening::decode(&old_version), Err(BridgeProofError::InvalidEncoding(EncodingError::InvalidWidth)));
+        let mut other = network.clone(); other.circuit_set_hash[0] ^= 1;
+        assert_eq!(opening.validate_config(&other), Err(BridgeProofError::InvalidConfig));
+        let mut noncanonical = opening.clone(); noncanonical.end_checkpoint_root[0] = GOLDILOCKS_MODULUS;
+        assert_eq!(noncanonical.encode(), Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
+        assert_eq!(claim_context_id(opening.config_hash, opening.end_checkpoint_id, noncanonical.end_checkpoint_root),
+            Err(BridgeProofError::InvalidEncoding(EncodingError::NoncanonicalFelt)));
+        let repeated = version4_opening(&network, vec![claim, claim]);
+        assert_eq!(repeated.encode().unwrap().len(), 32 * (15 + 16 + 15 * 2));
+        assert_eq!(BridgeOpening::decode(&repeated.encode().unwrap()).unwrap(), repeated);
+        let mut overflow = opening.clone();
+        overflow.rewards = vec![opening.rewards[0].clone(); BRIDGE_RECORD_CAPACITY + 1];
+        assert_eq!(overflow.encode(), Err(BridgeProofError::InvalidCount));
+        let full = version4_opening(&config(BRIDGE_OPENING_CHAIN_CAPACITY), Vec::new());
+        assert_eq!(full.encode().unwrap().len(), 32 * (15 + 16 * BRIDGE_OPENING_CHAIN_CAPACITY));
+        assert!(32 * (15 + 16 * BRIDGE_OPENING_CHAIN_CAPACITY + 7 * BRIDGE_RECORD_CAPACITY + 10 * BRIDGE_RECORD_CAPACITY + 15 * BRIDGE_RECORD_CAPACITY) == BRIDGE_OPENING_MAX_BYTES);
+    }
+
 
 }

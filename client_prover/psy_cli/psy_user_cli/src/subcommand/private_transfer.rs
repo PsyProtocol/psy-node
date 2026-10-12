@@ -40,6 +40,9 @@ use crate::subcommand::{
     submit_end_cap_proof,
 };
 const NOTE_TREE_HEIGHT: usize = 20; // 2^20 = 1048576 notes
+const NOTE_FRONTIER_BASE_LEAF: u64 = 1;
+const NOTE_COUNT_LEAF: u64 = 2_147_483_669;
+const NOTE_COUNT_LIMB: usize = 1;
 
 async fn get_contract_state_tree_height(provider: &RpcProvider, contract_id: u64) -> anyhow::Result<u8> {
     let height = provider
@@ -533,7 +536,6 @@ async fn build_membership_proof_from_previous_checkpoint(
     provider: &RpcProvider,
     sender_user_id: u64,
     contract_id: u64,
-    note_root_slot: u64,
     amount: u64,
     owner: QHashOut<F>,
     note_commitment: QHashOut<F>,
@@ -542,7 +544,7 @@ async fn build_membership_proof_from_previous_checkpoint(
     let user_provider = provider.with_user_id_owned(sender_user_id);
     let contract_state_tree_height = get_contract_state_tree_height(provider, contract_id).await?;
 
-    let note_count_slot = note_root_slot.saturating_sub(1);
+    let note_count_slot = NOTE_COUNT_LEAF;
     let note_count_proof = user_provider
         .get_user_contract_state_tree_merkle_proof(
             checkpoint_id,
@@ -552,19 +554,20 @@ async fn build_membership_proof_from_previous_checkpoint(
             note_count_slot,
         )
         .await?;
-    let note_index = note_count_proof.value.0.elements[3].to_canonical_u64();
+    let note_index = note_count_proof.value.0.elements[NOTE_COUNT_LIMB].to_canonical_u64();
     tracing::info!(
-        "build_membership_proof checkpoint={} contract_id={} note_count_slot={} note_count_value={} parsed_note_index(elements[3])={}",
+        "build_membership_proof checkpoint={} contract_id={} note_count_leaf={} note_count_limb={} note_count_value={} parsed_note_index={}",
         checkpoint_id,
         contract_id,
         note_count_slot,
+        NOTE_COUNT_LIMB,
         note_count_proof.value,
         note_index
     );
 
     let mut last_path: Vec<QHashOut<F>> = Vec::with_capacity(20);
     for level in 0..20u64 {
-        let slot = note_root_slot + 1 + level;
+        let slot = NOTE_FRONTIER_BASE_LEAF + level;
         let proof = user_provider
             .get_user_contract_state_tree_merkle_proof(
                 checkpoint_id,
@@ -837,7 +840,6 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<CommandResult> {
         &provider,
         sender_user_id,
         args.contract_id,
-        args.note_root_slot,
         args.amount,
         owner_hash,
         note_commitment_q,
@@ -850,7 +852,7 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<CommandResult> {
         note_membership_proof.value,
         note_membership_proof.root
     );
-    let note_count_slot = args.note_root_slot.saturating_sub(1);
+    let note_count_slot = NOTE_COUNT_LEAF;
     let checkpoint_after = match wait_checkpoint_with_note_slots_change(
         &provider,
         sender_user_id,

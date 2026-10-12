@@ -1768,6 +1768,34 @@ mod tests {
     }
 
     #[test]
+    fn find_imt_predecessor_distinguishes_absence_leaf_and_transport_error() {
+        let absent = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let decoded: RpcResponse<Option<QFindIMTPredecessorResponse<GoldilocksField>>> =
+            serde_json::from_str(absent).expect("null predecessor is success");
+        assert_eq!(decoded.result, ResponseResult::Success(None));
+
+        let found = r#"{"jsonrpc":"2.0","id":1,"result":{"leaf_index":7,"leaf":{"key":"0400000000000000030000000000000002000000000000000100000000000000","value":"0800000000000000070000000000000006000000000000000500000000000000","next_key":"0c000000000000000b000000000000000a000000000000000900000000000000","next_index":13}}}"#;
+        let decoded: RpcResponse<Option<QFindIMTPredecessorResponse<GoldilocksField>>> =
+            serde_json::from_str(found).expect("present predecessor is success");
+        let ResponseResult::Success(Some(response)) = decoded.result else {
+            panic!("present predecessor decoded as absence or error");
+        };
+        assert_eq!(response.leaf_index, 7);
+        assert_eq!(response.leaf.key, QHashOut::from_values(1, 2, 3, 4));
+        assert_eq!(response.leaf.value, QHashOut::from_values(5, 6, 7, 8));
+        assert_eq!(response.leaf.next_key, QHashOut::from_values(9, 10, 11, 12));
+        assert_eq!(response.leaf.next_index, GoldilocksField::from_canonical_u64(13));
+
+        let omitted_leaf = r#"{"jsonrpc":"2.0","id":1,"result":{"leaf_index":7,"leaf":{"value":"0800000000000000070000000000000006000000000000000500000000000000","next_key":"0c000000000000000b000000000000000a000000000000000900000000000000","next_index":13}}}"#;
+        assert!(serde_json::from_str::<RpcResponse<Option<QFindIMTPredecessorResponse<GoldilocksField>>>>(omitted_leaf).is_err());
+
+        let failed = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"database unavailable"}}"#;
+        let decoded: RpcResponse<Option<QFindIMTPredecessorResponse<GoldilocksField>>> =
+            serde_json::from_str(failed).expect("transport failure remains an error result");
+        assert!(matches!(decoded.result, ResponseResult::Error(_)));
+    }
+
+    #[test]
     fn eth_personal_signature_request_round_trip_preserves_exact_bytes() {
         let signature = PsyCompressedSecp256K1Signature {
             public_key: core::array::from_fn(|index| index as u8),

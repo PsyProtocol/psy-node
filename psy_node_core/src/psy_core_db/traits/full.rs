@@ -197,14 +197,14 @@ pub trait PsyNodeContractStateIMTDatabaseReader<F, Hash> {
     ) -> anyhow::Result<Option<u64>>;
 
     /// Find the predecessor leaf for a given key (for non-membership proofs and insertions).
-    /// Returns (leaf_index, leaf_preimage) of the predecessor.
+    /// `Ok(None)` is genuine absence. Database and decode failures stay `Err`.
     async fn contract_state_imt_find_predecessor(
         &self,
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u64,
         key: &Hash,
-    ) -> anyhow::Result<(u64, psy_data::v1::qdata::contract::IMTContractStateLeaf<F, Hash>)>;
+    ) -> anyhow::Result<Option<(u64, psy_data::v1::qdata::contract::IMTContractStateLeaf<F, Hash>)>>;
 
     /// Get the next append index for a contract's IMT.
     async fn contract_state_imt_get_next_append_index(

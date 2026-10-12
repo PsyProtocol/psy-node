@@ -292,7 +292,7 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         user_id: u64,
         contract_id: u64,
         key: Hash,
-    ) -> RpcResult<(u64, IMTContractStateLeaf<F, Hash>)>;
+    ) -> RpcResult<Option<(u64, IMTContractStateLeaf<F, Hash>)>>;
 
     #[method(name = "get_imt_next_append_index")]
     async fn get_imt_next_append_index(&self, user_id: u64, contract_id: u64) -> RpcResult<u64>;

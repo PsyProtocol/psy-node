@@ -35,6 +35,11 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
         if csu.updates.is_empty() {
             anyhow::bail!("Contract state updates cannot be empty");
         }
+        for update in &csu.updates {
+            if let ContractStateUpdate::IMT { update } = update {
+                update.validate_imt_update()?;
+            }
+        }
 
         let computed_end_root = single_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
             user_id,
@@ -136,19 +141,54 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
                         serialized_leaves.extend_from_slice(&serialized);
                     }
                     IMTContractStateUpdate::Insert {
+                        predecessor_old_preimage,
                         predecessor_new_preimage,
                         new_leaf_preimage,
                         predecessor_delta_proof,
                         new_leaf_delta_proof,
+                        sentinel_old_preimage,
+                        sentinel_new_preimage,
+                        sentinel_delta_proof,
                         ..
                     } => {
+                        for proof in [predecessor_delta_proof, new_leaf_delta_proof, sentinel_delta_proof] {
+                            if proof.siblings.len() > 64 || (proof.siblings.len() < 64 && proof.index >= (1u64 << proof.siblings.len())) {
+                                anyhow::bail!("IMT insert proof index out of bounds");
+                            }
+                        }
+                        let virgin_predecessor = predecessor_delta_proof.old_value == null_hash
+                            && predecessor_old_preimage.key == null_hash
+                            && predecessor_old_preimage.value == null_hash
+                            && predecessor_old_preimage.next_key == null_hash
+                            && predecessor_old_preimage.next_index.to_u64_value() == 0;
+                        if (!virgin_predecessor && predecessor_old_preimage.qfhash::<Hasher>() != predecessor_delta_proof.old_value)
+                            || predecessor_new_preimage.qfhash::<Hasher>() != predecessor_delta_proof.new_value
+                            || new_leaf_delta_proof.old_value != null_hash
+                            || new_leaf_preimage.qfhash::<Hasher>() != new_leaf_delta_proof.new_value
+                        {
+                            anyhow::bail!("IMT insert preimage mismatch");
+                        }
+                        if sentinel_old_preimage.qfhash::<Hasher>() != sentinel_delta_proof.old_value
+                            || sentinel_new_preimage.qfhash::<Hasher>() != sentinel_delta_proof.new_value
+                        {
+                            anyhow::bail!("IMT sentinel preimage mismatch");
+                        }
+                        let computed_sentinel = double_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
+                            user_id,
+                            contract_id,
+                            sentinel_delta_proof.siblings.len() as u8,
+                            sentinel_delta_proof,
+                        )?;
+                        if computed_sentinel != sentinel_delta_proof.new_root || next_cst_root != sentinel_delta_proof.new_root {
+                            anyhow::bail!("IMT insert root chain mismatch at sentinel");
+                        }
                         let computed_new_leaf = double_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
                             user_id,
                             contract_id,
                             new_leaf_delta_proof.siblings.len() as u8,
                             new_leaf_delta_proof,
                         )?;
-                        if computed_new_leaf != new_leaf_delta_proof.new_root || next_cst_root != new_leaf_delta_proof.new_root {
+                        if computed_new_leaf != new_leaf_delta_proof.new_root || sentinel_delta_proof.old_root != new_leaf_delta_proof.new_root {
                             anyhow::bail!("IMT insert root chain mismatch at new leaf");
                         }
 
@@ -165,6 +205,19 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
                         }
                         next_cst_root = predecessor_delta_proof.old_root;
 
+                        // The recorder consumes newest writes first, including when the predecessor is the sentinel.
+                        let sentinel_serialized = serialize_imt_leaf_ffs_entry_v2(
+                            user_id,
+                            contract_id,
+                            sentinel_delta_proof.index,
+                            &sentinel_delta_proof.new_value,
+                            &sentinel_new_preimage.key,
+                            &sentinel_new_preimage.value,
+                            &sentinel_new_preimage.next_key,
+                            sentinel_new_preimage.next_index.to_u64_value(),
+                            false,
+                        );
+                        serialized_leaves.extend_from_slice(&sentinel_serialized);
                         let pred_leaf_hash = predecessor_new_preimage.qfhash::<Hasher>();
                         let pred_next_index = predecessor_new_preimage.next_index.to_u64_value();
                         let pred_serialized = serialize_imt_leaf_ffs_entry_v2(
@@ -436,14 +489,14 @@ mod tests {
     {
         let seeded_hash = |seed: u64| Hash::from_owned_32bytes(seed.to_le_bytes().into_iter().chain([0u8; 24]).collect::<Vec<u8>>().try_into().unwrap());
         let pred_before = IMTContractStateLeaf {
-            key: seeded_hash(10),
-            value: seeded_hash(100),
+            key: Hash::get_zero_value(),
+            value: Hash::get_zero_value(),
             next_key: Hash::get_zero_value(),
             next_index: F::from_owned_u64(0),
         };
         let pred_after = IMTContractStateLeaf {
-            key: seeded_hash(10),
-            value: seeded_hash(100),
+            key: Hash::get_zero_value(),
+            value: Hash::get_zero_value(),
             next_key: seeded_hash(20),
             next_index: F::from_owned_u64(1),
         };
@@ -454,15 +507,21 @@ mod tests {
             next_index: F::from_owned_u64(0),
         };
         let pred_updated = IMTContractStateLeaf {
-            key: seeded_hash(10),
-            value: seeded_hash(101),
-            next_key: seeded_hash(20),
-            next_index: F::from_owned_u64(1),
+            key: seeded_hash(20),
+            value: seeded_hash(201),
+            next_key: Hash::get_zero_value(),
+            next_index: F::from_owned_u64(0),
         };
 
         let predecessor_delta_proof = ctree.set_leaf(0, pred_after.qfhash::<Hasher>());
         let new_leaf_delta_proof = ctree.set_leaf(1, new_leaf.qfhash::<Hasher>());
-        let update_delta_proof = ctree.set_leaf(0, pred_updated.qfhash::<Hasher>());
+        let sentinel_old_preimage = pred_after.clone();
+        let sentinel_new_preimage = IMTContractStateLeaf {
+            value: seeded_hash(1),
+            ..sentinel_old_preimage.clone()
+        };
+        let sentinel_delta_proof = ctree.set_leaf(0, sentinel_new_preimage.qfhash::<Hasher>());
+        let update_delta_proof = ctree.set_leaf(1, pred_updated.qfhash::<Hasher>());
 
         vec![
             ContractStateUpdate::IMT {
@@ -472,11 +531,14 @@ mod tests {
                     new_leaf_preimage: new_leaf.clone(),
                     predecessor_delta_proof,
                     new_leaf_delta_proof,
+                    sentinel_old_preimage,
+                    sentinel_new_preimage,
+                    sentinel_delta_proof,
                 },
             },
             ContractStateUpdate::IMT {
                 update: IMTContractStateUpdate::Update {
-                    old_preimage: pred_after,
+                    old_preimage: new_leaf,
                     new_preimage: pred_updated,
                     delta_proof: update_delta_proof,
                 },
@@ -627,8 +689,21 @@ mod tests {
                         new_leaf_preimage,
                         predecessor_delta_proof,
                         new_leaf_delta_proof,
+                        sentinel_new_preimage,
+                        sentinel_delta_proof,
                         ..
                     } => {
+                        expected_entries.push((
+                            user_id,
+                            contract_id,
+                            sentinel_delta_proof.index,
+                            sentinel_new_preimage.qfhash::<Hasher>().into_owned_32bytes(),
+                            sentinel_new_preimage.key.into_owned_32bytes(),
+                            sentinel_new_preimage.value.into_owned_32bytes(),
+                            sentinel_new_preimage.next_key.into_owned_32bytes(),
+                            sentinel_new_preimage.next_index.to_u64_value(),
+                            false,
+                        ));
                         expected_entries.push((
                             user_id,
                             contract_id,
@@ -663,6 +738,34 @@ mod tests {
             assert_eq!(deserialize_imt_leaf_ffs_entry_v2(entry_bytes)?, *expected);
         }
         Ok(())
+    }
+
+    #[test]
+    fn validate_end_cap_rejects_invalid_sentinel_delta() {
+        type F = parth_core::PF;
+        let (_, end_cap, _) = gen_fake_valid_submit_user_end_cap_non_proof_input::<F, PHash, PoseidonHasher>(32, 24, true);
+        for mutation in 0..5 {
+            let mut bad = end_cap.clone();
+            let ContractStateUpdate::IMT { update: IMTContractStateUpdate::Insert {
+                sentinel_old_preimage,
+                sentinel_new_preimage,
+                sentinel_delta_proof,
+                ..
+            } } = &mut bad.contract_state_updates[0].updates[0] else {
+                panic!("expected insertion fixture");
+            };
+            match mutation {
+                0 => sentinel_delta_proof.old_root = PHash::get_zero_value(),
+                1 => sentinel_delta_proof.new_root = PHash::get_zero_value(),
+                2 => sentinel_delta_proof.siblings[0] = PHash::from_values(999, 0, 0, 0),
+                3 => sentinel_old_preimage.value = PHash::from_values(999, 0, 0, 0),
+                4 => sentinel_new_preimage.value = PHash::from_values(999, 0, 0, 0),
+                _ => unreachable!(),
+            }
+            assert!(validate_end_cap_and_generate_node_data_for_edge::<F, PHash, PoseidonHasher>(
+                &test_context(), 42, &bad,
+            ).is_err(), "sentinel mutation {mutation} must be rejected");
+        }
     }
 
 

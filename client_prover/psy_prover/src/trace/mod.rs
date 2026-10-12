@@ -1,3 +1,4 @@
+use anyhow::Context;
 use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
 use psy_client_common::{
     args::DPNSoftwareDefinedCallData,
@@ -261,14 +262,23 @@ impl TxStorageData {
         storage
     }
 
-    pub fn from_trace(trace: &TxTrace) -> Self {
+    pub fn from_trace(trace: &TxTrace) -> anyhow::Result<Self> {
         let mut storage = Self::from_steps(trace.meta.user_id, &trace.steps);
-        storage.extend_from_user_ec_input(&trace.finalization.submit_end_cap_input);
-        storage
+        storage.extend_from_user_ec_input(&trace.finalization.submit_end_cap_input)?;
+        Ok(storage)
     }
 
-    fn extend_from_user_ec_input(&mut self, input: &SubmitUserEndCapNonProofInput<F>) {
+    fn extend_from_user_ec_input(&mut self, input: &SubmitUserEndCapNonProofInput<F>) -> anyhow::Result<()> {
         let user_id = input.core.state_transition.user_id.to_canonical_u64();
+        for contract_update in &input.contract_state_updates {
+            for update in &contract_update.contract_state_tree_updates {
+                if let ContractStateUpdate::IMT { update } = update {
+                    update.validate_imt_update().with_context(|| {
+                        format!("invalid IMT storage update for user {} contract {}", user_id, contract_update.user_contract_tree_update_proof.index)
+                    })?;
+                }
+            }
+        }
         for contract_update in &input.contract_state_updates {
             let contract_id = contract_update.user_contract_tree_update_proof.index;
             for update in &contract_update.contract_state_tree_updates {
@@ -283,6 +293,7 @@ impl TxStorageData {
                         IMTContractStateUpdate::Insert {
                             predecessor_delta_proof,
                             new_leaf_delta_proof,
+                            sentinel_delta_proof,
                             ..
                         } => {
                             self.push_write(
@@ -299,11 +310,19 @@ impl TxStorageData {
                                 new_leaf_delta_proof.old_value,
                                 new_leaf_delta_proof.new_value,
                             );
+                            self.push_write(
+                                user_id,
+                                contract_id,
+                                sentinel_delta_proof.index,
+                                sentinel_delta_proof.old_value,
+                                sentinel_delta_proof.new_value,
+                            );
                         }
                     },
                 }
             }
         }
+        Ok(())
     }
 
     fn extend_from_cmd_witnesses(&mut self, current_user_id: u64, current_contract_id: u64, cmd_witnesses: &[PsyCmdWithInputAndWitness<F>]) {
@@ -407,16 +426,16 @@ fn contract_call_results(steps: &[TraceStep]) -> Vec<ContractCallResultArgs> {
 }
 
 impl TxMetadata {
-    pub fn from_trace(trace: &TxTrace) -> Self {
-        TxMetadata {
+    pub fn from_trace(trace: &TxTrace) -> anyhow::Result<Self> {
+        Ok(TxMetadata {
             tx_hash: trace.finalization.tx_hash,
             end_cap_data: TxEndCapData::from_user_ec_input(&trace.finalization.submit_end_cap_input),
             contract_call_data: ContractCallResultData {
                 contract_calls: contract_call_results(&trace.steps),
                 software_defined_call: trace.finalization.software_defined_call.clone(),
             },
-            storage_data: TxStorageData::from_trace(trace),
-        }
+            storage_data: TxStorageData::from_trace(trace)?,
+        })
     }
 }
 
@@ -890,6 +909,28 @@ mod simulation_tests {
     }
 
     fn end_cap_input(user_id: u64) -> SubmitUserEndCapNonProofInput<F> {
+        use plonky2::hash::poseidon::PoseidonHash;
+        use psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf;
+        use psy_crypto::hash::{merkle::utils::simple_merkle_tree::SimpleMerkleTree, traits::qhashable::QFieldHashable};
+
+        let mut tree = SimpleMerkleTree::<PoseidonHash, QHashOut<F>>::new(4);
+        let old_preimage = IMTContractStateLeaf::new(qhash(20), qhash(21), QHashOut::ZERO, F::ZERO);
+        let new_preimage = old_preimage.with_new_value(qhash(22));
+        let sentinel_old_preimage = IMTContractStateLeaf::new(
+            QHashOut::ZERO, QHashOut::from_values(1, 0, 0, 0), old_preimage.key, F::from_canonical_u64(4),
+        );
+        tree.set_leaf(3, sentinel_old_preimage.qfhash::<PoseidonHash>());
+        tree.set_leaf(4, old_preimage.qfhash::<PoseidonHash>());
+        tree.set_leaf(1, qhash(10));
+        let positional_delta_proof = tree.set_leaf(1, qhash(11));
+        let delta_proof = tree.set_leaf(4, new_preimage.qfhash::<PoseidonHash>());
+        let new_leaf_preimage = IMTContractStateLeaf::new(qhash(40), qhash(41), QHashOut::ZERO, F::ZERO);
+        let predecessor_new_preimage = new_preimage.with_new_next(new_leaf_preimage.key, F::from_canonical_u64(5));
+        let predecessor_delta_proof = tree.set_leaf(4, predecessor_new_preimage.qfhash::<PoseidonHash>());
+        let new_leaf_delta_proof = tree.set_leaf(5, new_leaf_preimage.qfhash::<PoseidonHash>());
+        let sentinel_new_preimage = sentinel_old_preimage.with_new_value(QHashOut::from_values(2, 0, 0, 0));
+        let sentinel_delta_proof = tree.set_leaf(3, sentinel_new_preimage.qfhash::<PoseidonHash>());
+        let no_op_delta_proof = tree.set_leaf(7, QHashOut::ZERO);
         let mut input = SubmitUserEndCapNonProofInput::<F>::default();
         input.core.checkpoint_id = F::from_canonical_u64(33);
         input.core.state_transition.user_id = F::from_canonical_u64(user_id);
@@ -897,30 +938,33 @@ mod simulation_tests {
         input.core.state_transition.end_user_leaf_hash = qhash(2);
         input.core.state_transition.checkpoint_tree_root_hash = qhash(3);
         input.contract_state_updates = vec![PsyContractStateUpdateHistory {
-            user_contract_tree_update_proof: state_delta_proof(11, qhash(70), qhash(71)),
+            user_contract_tree_update_proof: state_delta_proof(11, positional_delta_proof.old_root, sentinel_delta_proof.new_root),
             contract_state_tree_updates: vec![
                 ContractStateUpdate::Positional {
-                    delta_proof: state_delta_proof(1, qhash(10), qhash(11)),
+                    delta_proof: positional_delta_proof,
                 },
                 ContractStateUpdate::IMT {
                     update: IMTContractStateUpdate::Update {
-                        old_preimage: Default::default(),
-                        new_preimage: Default::default(),
-                        delta_proof: state_delta_proof(2, qhash(20), qhash(21)),
+                        old_preimage,
+                        new_preimage,
+                        delta_proof,
                     },
                 },
                 ContractStateUpdate::IMT {
                     update: IMTContractStateUpdate::Insert {
-                        predecessor_old_preimage: Default::default(),
-                        predecessor_new_preimage: Default::default(),
-                        new_leaf_preimage: Default::default(),
-                        predecessor_delta_proof: state_delta_proof(3, qhash(30), qhash(31)),
-                        new_leaf_delta_proof: state_delta_proof(4, qhash(40), qhash(41)),
+                        predecessor_old_preimage: new_preimage,
+                        predecessor_new_preimage,
+                        new_leaf_preimage,
+                        predecessor_delta_proof,
+                        new_leaf_delta_proof,
+                        sentinel_old_preimage,
+                        sentinel_new_preimage,
+                        sentinel_delta_proof,
                     },
                 },
                 // no-op positional update: old == new must be skipped
                 ContractStateUpdate::Positional {
-                    delta_proof: state_delta_proof(5, qhash(50), qhash(50)),
+                    delta_proof: no_op_delta_proof,
                 },
             ],
         }];
@@ -1027,7 +1071,7 @@ mod simulation_tests {
             finalization(end_cap_input(9)),
         );
 
-        let metadata = TxMetadata::from_trace(&trace);
+        let metadata = TxMetadata::from_trace(&trace).unwrap();
 
         assert_eq!(metadata.tx_hash, qhash(80));
         assert_eq!(metadata.end_cap_data.checkpoint_id, 33);
@@ -1048,11 +1092,11 @@ mod simulation_tests {
         assert_eq!(call.inputs, vec![7, 8]);
         assert_eq!(call.outputs, vec![9]);
 
-        // storage writes: positional + IMT update + IMT insert (two proofs);
+        // storage writes: positional + IMT update + IMT insert (three proofs);
         // the no-op positional update (old == new) is skipped
         assert!(metadata.storage_data.reads.is_empty());
         let writes = &metadata.storage_data.writes;
-        assert_eq!(writes.len(), 4);
+        assert_eq!(writes.len(), 5);
         for write in writes {
             assert_eq!(write.user_id, 9);
             assert_eq!(write.contract_id, 11);
@@ -1060,11 +1104,38 @@ mod simulation_tests {
         assert_eq!(writes[0].slot_index, 1);
         assert_eq!(writes[0].old_value, qhash(10));
         assert_eq!(writes[0].new_value, qhash(11));
-        assert_eq!(writes[1].slot_index, 2);
-        assert_eq!(writes[2].slot_index, 3);
-        assert_eq!(writes[3].slot_index, 4);
-        assert_eq!(writes[3].old_value, qhash(40));
-        assert_eq!(writes[3].new_value, qhash(41));
+        assert_eq!(writes[1].slot_index, 4);
+        assert_eq!(writes[2].slot_index, 4);
+        assert_eq!(writes[3].slot_index, 5);
+        assert_eq!(writes[4].slot_index, 3);
+        let ContractStateUpdate::IMT { update } = &trace.finalization.submit_end_cap_input.contract_state_updates[0].contract_state_tree_updates[2] else {
+            panic!("expected insertion");
+        };
+        let IMTContractStateUpdate::Insert { predecessor_delta_proof, new_leaf_delta_proof, sentinel_delta_proof, .. } = update else {
+            panic!("expected insertion");
+        };
+        for (write, delta) in writes[2..].iter().zip([predecessor_delta_proof, new_leaf_delta_proof, sentinel_delta_proof]) {
+            assert_eq!(write.slot_index, delta.index);
+            assert_eq!(write.old_value, delta.old_value);
+            assert_eq!(write.new_value, delta.new_value);
+        }
+        assert_eq!(update.new_root(), sentinel_delta_proof.new_root);
+        assert_eq!(trace.finalization.submit_end_cap_input.contract_state_updates[0].user_contract_tree_update_proof.new_value, update.new_root());
+    }
+
+    #[test]
+    fn storage_projection_rejects_invalid_imt_join_before_writes() {
+        let mut input = end_cap_input(9);
+        let ContractStateUpdate::IMT { update: IMTContractStateUpdate::Insert { sentinel_delta_proof, .. } } =
+            &mut input.contract_state_updates[0].contract_state_tree_updates[2] else {
+                panic!("expected insertion");
+            };
+        sentinel_delta_proof.old_root = QHashOut::ZERO;
+        let mut storage = TxStorageData::default();
+        assert!(storage.extend_from_user_ec_input(&input).is_err());
+        assert!(storage.writes.is_empty());
+        let trace = trace_with(Vec::new(), finalization(input));
+        assert!(TxMetadata::from_trace(&trace).is_err());
     }
 
     #[test]

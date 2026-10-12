@@ -502,22 +502,42 @@ fn assert_manifest_precompile(contract_id: u64, name: &str, abi_path: &str, abi_
 
 #[test]
 fn canonical_abi_manifest_matches_genesis_contracts() {
-    assert_manifest_precompile(0, "token", "PsyTokenContract.json", "PsyTokenContract", "token");
-    assert_manifest_precompile(
-        1,
-        "mining_rewards",
-        "PsyPOWMiningRewardsClaimContract.json",
-        "PsyPOWMiningRewardsClaimContract",
-        "mining_rewards",
+    let manifest = read_json(&abi_manifest_path());
+    let precompiles = manifest
+        .get("precompiles")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{} has no precompiles array", abi_manifest_path().display()));
+    let ids: Vec<u64> = precompiles
+        .iter()
+        .map(|precompile| {
+            precompile
+                .get("contract_id")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| panic!("precompile entry has no integer contract_id"))
+        })
+        .collect();
+    assert_eq!(ids, (0..6).collect::<Vec<u64>>(), "final registry must be six dense contract ids");
+    assert!(
+        precompiles.iter().all(|precompile| precompile.get("name").and_then(Value::as_str) != Some("mining_rewards")),
+        "mining_rewards must be absent from the final registry"
     );
-    assert_manifest_precompile(2, "deposit_tree", "PsyDepositTreeContract.json", "PsyDepositTreeContract", "deposit_tree");
+
+    assert_manifest_precompile(0, "token", "PsyTokenContract.json", "PsyTokenContract", "token");
+    assert_manifest_precompile(1, "deposit_tree", "PsyDepositTreeContract.json", "PsyDepositTreeContract", "deposit_tree");
     assert_manifest_precompile(
-        3,
+        2,
         "withdrawal_tree",
         "PsyWithdrawalTreeContract.json",
         "PsyWithdrawalTreeContract",
         "withdrawal_tree",
     );
-    assert_manifest_precompile(4, "usdt", "USDTTokenContract.json", "USDTTokenContract", "usdt_token");
-    assert_manifest_precompile(5, "faucet", "PsyFaucetContract.json", "PsyFaucetContract", "faucet");
+    assert_manifest_precompile(3, "usdt", "USDTTokenContract.json", "USDTTokenContract", "usdt_token");
+    assert_manifest_precompile(4, "faucet", "PsyFaucetContract.json", "PsyFaucetContract", "faucet");
+    assert_manifest_precompile(
+        5,
+        "multisig_policy",
+        "MultisigPolicyContract.json",
+        "MultisigPolicyContract",
+        "multisig_policy",
+    );
 }

@@ -75,6 +75,7 @@ psy_node_common = { workspace = true }
 psy_node_cli = { workspace = true }
 psy_config = { workspace = true }
 psy_plonky2_circuits = { workspace = true }
+psy_plonky2_basic_helpers = { workspace = true }
 psy_cli_common = { path = "../psy_cli_common" }
 psy_client_common = { workspace = true }
 psy_vm = { workspace = true }

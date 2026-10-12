@@ -175,7 +175,7 @@ impl L1Client {
         ).await?;
         tracing::info!(to_checkpoint, requested = report.requested,
             submitted_count = report.submitted_count, already_claimed_count = report.already_claimed_count,
-            resolved = report.resolved_leaf_hashes.len(), "pending withdrawal settlement finished");
+            resolved = report.resolved_leaf_hashes.len(), "pending withdrawal claim finished");
         Ok(report)
     }
 
@@ -341,7 +341,7 @@ fn aggregate_destination(
     limits: &AggregateLimits,
 ) -> anyhow::Result<(u64, Address)> {
     let selector = calldata.get(..4).context("aggregate calldata has no selector")?;
-    if selector == finalize_bridge::applyBridgeWindowCall::SELECTOR.as_slice() {
+    if selector == finalize_bridge::applyBridgeOpeningCall::SELECTOR.as_slice() {
         Ok((limits.max_window_calldata_bytes, Address::from(chain.state_manager)))
     } else {
         anyhow::bail!("unknown aggregate calldata selector")
@@ -402,9 +402,6 @@ mod tests {
             reward_token: [4; 20],
             reward_per_claim: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
             reward_token_decimals: 18,
-            reward_cutover: 0,
-            reward_end_exclusive: 100,
-            max_deposits: 1024,
             max_withdrawals: 1024,
             max_rewards: 1024,
         }
@@ -427,10 +424,7 @@ mod tests {
     }
 
     fn calldata() -> Bytes {
-        finalize_bridge::BridgeWindowCall {
-            deposit_proof: [U256::from(1u8); 8], deposit_opening: Bytes::from_static(&[9, 8, 7]),
-            window_finalization_proof: [U256::from(2u8); 8], window_finalization_opening: Bytes::from_static(&[6, 5, 4]),
-        }.encode()
+        finalize_bridge::BridgeOpeningCall { proof: [U256::from(1u8); 8], opening: Bytes::from_static(&[9, 8, 7]) }.encode()
     }
 
     fn block(gas_limit: u64) -> Block {

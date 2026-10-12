@@ -155,7 +155,7 @@ impl<F: RichField, R: PsyComboDataStoreReaderSync<F> + Sync> PsyReadCommandProce
     async fn resolve_contract_state_imt_find_predecessor(
         &self,
         input: &crate::qstore::imm::cmd::QSRIMTCmdFindPredecessor,
-    ) -> anyhow::Result<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)> {
+    ) -> anyhow::Result<Option<(u64, crate::qdata::imt_contract_state::IMTContractStateLeaf<F>)>> {
         self.contract_state_imt_find_predecessor(
             input.checkpoint_id,
             input.user_id,

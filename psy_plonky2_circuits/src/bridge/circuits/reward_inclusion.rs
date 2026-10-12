@@ -205,10 +205,6 @@ impl RewardInclusionCircuit {
             path_index: builder.add_virtual_target(), nullifier_index: builder.add_virtual_target(),
             recipient: std::array::from_fn(|_| builder.add_virtual_target()),
         };
-        let before_cutover = less_u64(&mut builder, reward.claim_checkpoint_id, config.reward_cutover);
-        builder.assert_zero(before_cutover.target);
-        let before_end = less_u64(&mut builder, reward.claim_checkpoint_id, config.reward_end_exclusive);
-        builder.assert_one(before_end.target);
         let leaf_commit = AggregateLeafTarget::Reward(reward).leaf_commit(&mut builder);
         let mut recipient_is_zero = builder._true();
         let zero = builder.zero();

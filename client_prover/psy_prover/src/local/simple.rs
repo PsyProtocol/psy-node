@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::{collections::HashMap, marker::PhantomData};
 
 use plonky2::{
@@ -76,6 +77,15 @@ where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
 {
     pub fn submit_proof(&mut self, proof_input: SubmitUserEndCapProofAPIInput<F, C, D>) -> anyhow::Result<()> {
+        for contract_update in &proof_input.input.contract_state_updates {
+            for update in &contract_update.contract_state_tree_updates {
+                if let psy_client_data::guta::api::ContractStateUpdate::IMT { update } = update {
+                    update.validate_imt_update().with_context(|| {
+                        format!("invalid IMT submission for contract {}", contract_update.user_contract_tree_update_proof.index)
+                    })?;
+                }
+            }
+        }
         let user_id = proof_input.input.core.state_transition.user_id.to_canonical_u64();
         let proof_id = QProvingJobDataID::end_cap_proof(self.latest_block_state.checkpoint_id, 0, 0, user_id as u32);
         self.proof_store.set_proof_by_id(proof_id, &proof_input.proof)?;
@@ -112,6 +122,7 @@ where
                         psy_client_data::qdata::imt_proof::IMTContractStateUpdate::Insert {
                             predecessor_delta_proof,
                             new_leaf_delta_proof,
+                            sentinel_delta_proof,
                             ..
                         } => {
                             let height = predecessor_delta_proof.siblings.len() as u8;
@@ -130,6 +141,14 @@ where
                                 height,
                                 new_leaf_delta_proof.index,
                                 new_leaf_delta_proof.new_value,
+                            )?;
+                            self.state_store.set_user_state_tree_leaf_hash(
+                                new_checkpoint_id,
+                                user_id,
+                                contract_id,
+                                height,
+                                sentinel_delta_proof.index,
+                                sentinel_delta_proof.new_value,
                             )?;
                         }
                     },

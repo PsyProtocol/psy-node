@@ -60,10 +60,11 @@ impl ClearEntireTreeGadget {
     }
 }
 
+/// Shared IMT write. `condition` selects the live transition; disabled sets
+/// keep every raw witness zero while the delta gadgets still compute roots.
 #[derive(Clone, Debug)]
 pub struct IMTSetGadget {
     pub is_insert: BoolTarget,
-    pub insert_has_predecessor: BoolTarget,
     pub update_old_leaf: IMTLeafTargets,
     pub update_new_leaf: IMTLeafTargets,
     pub update_delta_proof: DeltaMerkleProofGadget,
@@ -72,12 +73,19 @@ pub struct IMTSetGadget {
     pub insert_new_leaf: IMTLeafTargets,
     pub insert_predecessor_delta_proof: DeltaMerkleProofGadget,
     pub insert_new_leaf_delta_proof: DeltaMerkleProofGadget,
+    pub sentinel_preimage: IMTLeafTargets,
+    pub sentinel_merkle_proof: MerkleProofGadget,
+    pub sentinel_old_leaf: IMTLeafTargets,
+    pub sentinel_new_leaf: IMTLeafTargets,
+    pub insert_sentinel_delta_proof: DeltaMerkleProofGadget,
 }
 
 #[derive(Clone, Debug)]
 pub struct IMTReadGadget {
     pub merkle_proof: MerkleProofGadget,
     pub leaf: IMTLeafTargets,
+    pub sentinel_preimage: IMTLeafTargets,
+    pub sentinel_merkle_proof: MerkleProofGadget,
 }
 
 #[derive(Clone, Debug)]
@@ -85,12 +93,16 @@ pub struct IMTExternalReadGadget {
     pub contract_tree_proof: MerkleProofGadget,
     pub state_slot_proof: VariableHeightMerkleProofGadget,
     pub leaf: IMTLeafTargets,
+    pub sentinel_preimage: IMTLeafTargets,
+    pub sentinel_merkle_proof: VariableHeightMerkleProofGadget,
 }
 
 #[derive(Clone, Debug)]
 pub struct IMTOtherUserReadGadget {
     pub state_slot_proof: VariableHeightMerkleProofGadget,
     pub leaf: IMTLeafTargets,
+    pub sentinel_preimage: IMTLeafTargets,
+    pub sentinel_merkle_proof: VariableHeightMerkleProofGadget,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +110,8 @@ pub struct IMTContainsOtherUserGadget {
     pub state_slot_proof: VariableHeightMerkleProofGadget,
     pub leaf: IMTLeafTargets,
     pub exists: Target,
+    pub sentinel_preimage: IMTLeafTargets,
+    pub sentinel_merkle_proof: VariableHeightMerkleProofGadget,
 }
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
@@ -396,18 +410,24 @@ pub struct CKGetContractLeaf {
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 pub struct CKWriteIMTCurrentContract {
     pub condition_target_id: u64,
-    pub proof_index: u64,
+    pub base_offset_target_id: u64,
+    pub capacity_target_id: u64,
+    pub key_targets: [u64; 4],
     pub write_epoch: u32,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 pub struct CKReadIMTCurrentContract {
+    pub base_offset_target_id: u64,
+    pub capacity_target_id: u64,
     pub key_targets: [u64; 4],
     pub write_epoch: u32,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 pub struct CKReadIMTContainsCurrentContract {
+    pub base_offset_target_id: u64,
+    pub capacity_target_id: u64,
     pub key_targets: [u64; 4],
     pub write_epoch: u32,
 }
@@ -415,6 +435,9 @@ pub struct CKReadIMTContainsCurrentContract {
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 pub struct CKReadIMTSelfUserExternalContract {
     pub contract_target_id: u64,
+    pub base_offset_target_id: u64,
+    pub capacity_target_id: u64,
+    pub height_target_id: u64,
     pub key_targets: [u64; 4],
     pub contract_call_epoch: u32,
 }
@@ -423,6 +446,9 @@ pub struct CKReadIMTSelfUserExternalContract {
 pub struct CKReadIMTOtherUserContract {
     pub user_target_id: u64,
     pub contract_target_id: u64,
+    pub base_offset_target_id: u64,
+    pub capacity_target_id: u64,
+    pub height_target_id: u64,
     pub key_targets: [u64; 4],
     pub write_epoch: u32,
 }
@@ -431,6 +457,9 @@ pub struct CKReadIMTOtherUserContract {
 pub struct CKReadIMTContainsOtherUserContract {
     pub user_target_id: u64,
     pub contract_target_id: u64,
+    pub base_offset_target_id: u64,
+    pub capacity_target_id: u64,
+    pub height_target_id: u64,
     pub key_targets: [u64; 4],
     pub write_epoch: u32,
 }
@@ -612,38 +641,93 @@ impl StateCommandCacheKey {
     }
 
     // IMT cache key constructors
-    pub fn new_write_imt_current_contract(condition_target_id: u64, proof_index: u64, write_epoch: u32) -> Self {
+    pub fn new_write_imt_current_contract(
+        condition_target_id: u64,
+        base_offset_target_id: u64,
+        capacity_target_id: u64,
+        key_targets: [u64; 4],
+        write_epoch: u32,
+    ) -> Self {
         Self::WriteIMTCurrentContract(CKWriteIMTCurrentContract {
             condition_target_id,
-            proof_index,
+            base_offset_target_id,
+            capacity_target_id,
+            key_targets,
             write_epoch,
         })
     }
-    pub fn new_read_imt_current_contract(key_targets: [u64; 4], write_epoch: u32) -> Self {
-        Self::ReadIMTCurrentContract(CKReadIMTCurrentContract { key_targets, write_epoch })
+    pub fn new_read_imt_current_contract(base_offset_target_id: u64, capacity_target_id: u64, key_targets: [u64; 4], write_epoch: u32) -> Self {
+        Self::ReadIMTCurrentContract(CKReadIMTCurrentContract {
+            base_offset_target_id,
+            capacity_target_id,
+            key_targets,
+            write_epoch,
+        })
     }
-    pub fn new_read_imt_contains_current_contract(key_targets: [u64; 4], write_epoch: u32) -> Self {
-        Self::ReadIMTContainsCurrentContract(CKReadIMTContainsCurrentContract { key_targets, write_epoch })
+    pub fn new_read_imt_contains_current_contract(
+        base_offset_target_id: u64,
+        capacity_target_id: u64,
+        key_targets: [u64; 4],
+        write_epoch: u32,
+    ) -> Self {
+        Self::ReadIMTContainsCurrentContract(CKReadIMTContainsCurrentContract {
+            base_offset_target_id,
+            capacity_target_id,
+            key_targets,
+            write_epoch,
+        })
     }
-    pub fn new_read_imt_self_user_external_contract(contract_target_id: u64, key_targets: [u64; 4], contract_call_epoch: u32) -> Self {
+    pub fn new_read_imt_self_user_external_contract(
+        contract_target_id: u64,
+        base_offset_target_id: u64,
+        capacity_target_id: u64,
+        height_target_id: u64,
+        key_targets: [u64; 4],
+        contract_call_epoch: u32,
+    ) -> Self {
         Self::ReadIMTSelfUserExternalContract(CKReadIMTSelfUserExternalContract {
             contract_target_id,
+            base_offset_target_id,
+            capacity_target_id,
+            height_target_id,
             key_targets,
             contract_call_epoch,
         })
     }
-    pub fn new_read_imt_other_user_contract(user_target_id: u64, contract_target_id: u64, key_targets: [u64; 4], write_epoch: u32) -> Self {
+    pub fn new_read_imt_other_user_contract(
+        user_target_id: u64,
+        contract_target_id: u64,
+        base_offset_target_id: u64,
+        capacity_target_id: u64,
+        height_target_id: u64,
+        key_targets: [u64; 4],
+        write_epoch: u32,
+    ) -> Self {
         Self::ReadIMTOtherUserContract(CKReadIMTOtherUserContract {
             user_target_id,
             contract_target_id,
+            base_offset_target_id,
+            capacity_target_id,
+            height_target_id,
             key_targets,
             write_epoch,
         })
     }
-    pub fn new_imt_contains_other_user_contract(user_target_id: u64, contract_target_id: u64, key_targets: [u64; 4], write_epoch: u32) -> Self {
+    pub fn new_imt_contains_other_user_contract(
+        user_target_id: u64,
+        contract_target_id: u64,
+        base_offset_target_id: u64,
+        capacity_target_id: u64,
+        height_target_id: u64,
+        key_targets: [u64; 4],
+        write_epoch: u32,
+    ) -> Self {
         Self::ReadIMTContainsOtherUserContract(CKReadIMTContainsOtherUserContract {
             user_target_id,
             contract_target_id,
+            base_offset_target_id,
+            capacity_target_id,
+            height_target_id,
             key_targets,
             write_epoch,
         })
@@ -663,7 +747,9 @@ pub struct StateReaderGadget {
     pub contract_leaf_requests: Vec<PsyContractLeafGadget>,
     pub contract_leaf_proofs: Vec<MerkleProofGadget>,
     pub imt_contains_proofs: Vec<MerkleProofGadget>,
+    pub imt_contains_sentinel_proofs: Vec<MerkleProofGadget>,
     pub imt_contains_leaf_requests: Vec<IMTLeafTargets>,
+    pub imt_contains_sentinel_requests: Vec<IMTLeafTargets>,
     pub imt_contains_exists_targets: Vec<Target>,
     pub imt_set_requests: Vec<IMTSetGadget>,
     pub imt_read_requests: Vec<IMTReadGadget>,
@@ -722,7 +808,9 @@ impl StateReaderGadget {
             contract_leaf_requests: vec![],
             contract_leaf_proofs: vec![],
             imt_contains_proofs: vec![],
+            imt_contains_sentinel_proofs: vec![],
             imt_contains_leaf_requests: vec![],
+            imt_contains_sentinel_requests: vec![],
             imt_contains_exists_targets: vec![],
             imt_set_requests: vec![],
             imt_read_requests: vec![],
@@ -932,10 +1020,14 @@ impl StateReaderGadget {
         proof: MerkleProofGadget,
         leaf: IMTLeafTargets,
         exists_target: Target,
+        sentinel: IMTLeafTargets,
+        sentinel_proof: MerkleProofGadget,
     ) -> StateReaderReferenceKey {
         let ref_key = StateReaderReferenceKey::new_imt_contains_key(self.imt_contains_leaf_requests.len());
         self.imt_contains_proofs.push(proof);
+        self.imt_contains_sentinel_proofs.push(sentinel_proof);
         self.imt_contains_leaf_requests.push(leaf);
+        self.imt_contains_sentinel_requests.push(sentinel);
         self.imt_contains_exists_targets.push(exists_target);
         self.gadget_map.insert(key, ref_key);
         ref_key
@@ -1268,6 +1360,180 @@ impl StateReaderGadget {
             values
         }
     }
+    fn checked_state_height<F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>, height: Target) -> Target {
+        builder.range_check(height, 6);
+        let mut selected = builder.zero();
+        let mut matched = builder._false();
+        for bits in 1..=32usize {
+            let candidate = builder.constant(F::from_canonical_usize(bits));
+            let is_candidate = builder.is_equal(height, candidate);
+            selected = builder.select(is_candidate, candidate, selected);
+            matched = builder.or(matched, is_candidate);
+        }
+        builder.connect(matched.target, builder.one());
+        selected
+    }
+
+    /// `verify_imt_map_bounds`: `b=4*q+r`, `0<=r<4`, `B=q+(r!=0)`, positive `C`,
+    /// and `B+C<2^h`.
+    fn verify_imt_map_bounds<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        base_offset: Target,
+        capacity: Target,
+        height_bits: Target,
+    ) -> (Target, Target) {
+        let (quotient, remainder) = builder.div_rem4(base_offset);
+        let remainder_nonzero = builder.is_not_zero(remainder);
+        let physical_base = builder.add(quotient, remainder_nonzero.target);
+        builder.range_check(physical_base, 32);
+        builder.range_check(capacity, 32);
+        let one = builder.one();
+        let capacity_positive = builder.is_less_than(32, builder.zero(), capacity);
+        builder.connect(capacity_positive.target, one);
+        let occupied = builder.add(physical_base, capacity);
+        let mut tree_size = builder.one();
+        for bits in 1..=32usize {
+            tree_size = builder.add(tree_size, tree_size);
+            let is_height = builder.is_equal(height_bits, builder.constant(F::from_canonical_usize(bits)));
+            let within_tree = builder.is_less_than(33, occupied, tree_size);
+            let accepted = builder.select(is_height, within_tree.target, one);
+            builder.connect(accepted, one);
+        }
+        (physical_base, capacity)
+    }
+
+    fn connect_leaf_zero_if_true<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        condition: BoolTarget,
+        leaf: &IMTLeafTargets,
+    ) {
+        for limb in 0..4 {
+            builder.connect_zero_if_true(condition, leaf.key.elements[limb]);
+            builder.connect_zero_if_true(condition, leaf.value.elements[limb]);
+            builder.connect_zero_if_true(condition, leaf.next_key.elements[limb]);
+        }
+        builder.connect_zero_if_true(condition, leaf.next_index);
+    }
+
+    fn connect_index_in_open_interval<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        condition: BoolTarget,
+        index: Target,
+        physical_base: Target,
+        count: Target,
+    ) {
+        let one = builder.one();
+        let first_member = builder.add(physical_base, one);
+        let last_member = builder.add(physical_base, count);
+        let at_or_above_first = builder.is_less_than_or_equal(33, first_member, index);
+        let at_or_below_last = builder.is_less_than_or_equal(33, index, last_member);
+        let in_interval = builder.and(at_or_above_first, at_or_below_last);
+        builder.connect_if_true(condition, in_interval.target, builder._true().target);
+    }
+
+    /// Authenticate the sentinel at `B` and expose its allocated count.
+    /// Stable initialized sentinels have positive `n` and a successor in `[B+1,B+n]`;
+    /// stable virgin state is the physical zero slot with an all-zero preimage.
+    fn constrain_authenticated_sentinel<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        active: BoolTarget,
+        root: HashOutTarget,
+        physical_base: Target,
+        capacity: Target,
+        sentinel: &IMTLeafTargets,
+        proof_root: HashOutTarget,
+        proof_value: HashOutTarget,
+        proof_index: Target,
+    ) -> (BoolTarget, Target) {
+        let sentinel_hash = sentinel.hash::<H, F, D>(builder);
+        let one = builder.one();
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        let slot_is_zero = builder.is_zero_hash(proof_value);
+        let count = sentinel.value.elements[0];
+
+        builder.connect_hashes_if_true(active, proof_root, root);
+        builder.connect_if_true(active, proof_index, physical_base);
+        for limb in 0..4 {
+            builder.connect_zero_if_true(active, sentinel.key.elements[limb]);
+            if limb != 0 {
+                builder.connect_zero_if_true(active, sentinel.value.elements[limb]);
+            }
+        }
+        builder.range_check(count, 32);
+        let count_within_capacity = builder.is_less_than_or_equal(32, count, capacity);
+        builder.connect_if_true(active, count_within_capacity.target, builder._true().target);
+
+        let initialized = builder.and(active, builder.not(slot_is_zero));
+        let virgin = builder.and(active, slot_is_zero);
+        builder.connect_hashes_if_true(initialized, sentinel_hash, proof_value);
+        Self::connect_leaf_zero_if_true(builder, virgin, sentinel);
+
+        let count_positive = builder.is_less_than(32, builder.zero(), count);
+        builder.connect_if_true(initialized, count_positive.target, one);
+        let successor_present = builder.not(builder.is_zero_hash(sentinel.next_key));
+        let successor_index_present = builder.is_not_zero(sentinel.next_index);
+        let successor_linked = builder.and(successor_present, successor_index_present);
+        builder.connect_if_true(initialized, successor_linked.target, one);
+        Self::connect_index_in_open_interval(builder, initialized, sentinel.next_index, physical_base, count);
+        let next_key_zero = builder.is_zero_hash(sentinel.next_key);
+        let next_index_zero = builder.is_zero(sentinel.next_index);
+        let virgin_successor_absent = builder.and(next_key_zero, next_index_zero);
+        builder.connect_if_true(virgin, virgin_successor_absent.target, one);
+        builder.connect_hashes_if_true(virgin, proof_value, zero_hash);
+        (slot_is_zero, count)
+    }
+
+    fn connect_query_nonzero<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        active: BoolTarget,
+        query_key: HashOutTarget,
+    ) {
+        let query_nonzero = builder.not(builder.is_zero_hash(query_key));
+        builder.connect_if_true(active, query_nonzero.target, builder._true().target);
+    }
+
+
+    fn connect_predecessor_role<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        active: BoolTarget,
+        predecessor: &IMTLeafTargets,
+        predecessor_index: Target,
+        physical_base: Target,
+        count: Target,
+    ) {
+        let one = builder._true();
+        let at_sentinel = builder.is_equal(predecessor_index, physical_base);
+        let sentinel_role = builder.and(active, at_sentinel);
+        for limb in 0..4 {
+            builder.connect_zero_if_true(sentinel_role, predecessor.key.elements[limb]);
+        }
+        let member_role = builder.and(active, builder.not(at_sentinel));
+        Self::connect_index_in_open_interval(builder, member_role, predecessor_index, physical_base, count);
+        let member_key_nonzero = builder.not(builder.is_zero_hash(predecessor.key));
+        builder.connect_if_true(member_role, member_key_nonzero.target, one.target);
+        Self::connect_successor_pair(builder, active, predecessor.next_key, predecessor.next_index, physical_base, count);
+    }
+
+    fn connect_successor_pair<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        active: BoolTarget,
+        next_key: HashOutTarget,
+        next_index: Target,
+        physical_base: Target,
+        count: Target,
+    ) {
+        let key_absent = builder.is_zero_hash(next_key);
+        let index_absent = builder.is_zero(next_index);
+        let both_absent = builder.and(key_absent, index_absent);
+        let key_present = builder.not(key_absent);
+        let index_present = builder.not(index_absent);
+        let both_present = builder.and(key_present, index_present);
+        let paired = builder.or(both_absent, both_present);
+        builder.connect_if_true(active, paired.target, builder._true().target);
+        let present = builder.and(active, both_present);
+        Self::connect_index_in_open_interval(builder, present, next_index, physical_base, count);
+    }
+
 
     pub fn injest_symbolic_state_command<
         H: AlgebraicHasher<F> + psy_crypto::hash::traits::hasher::MerkleZeroHasher<HashOut<F>>,
@@ -1706,109 +1972,11 @@ impl StateReaderGadget {
                 result
             }
             DPNStateCmd::SetIMTContractStateValue(c) => {
-                // ================================================================
-                // SetIMTContractStateValue — Insert or Update a leaf in an
-                // Indexed Merkle Tree (sorted linked-list over a Merkle tree).
-                //
-                // # IMT Leaf Structure
-                //
-                //   Each leaf is a struct with 13 field elements hashed by Poseidon:
-                //
-                //     IMTLeaf { key, value, next_key, next_index }
-                //              (4)   (4)     (4)        (1)
-                //
-                //   Leaves form a sorted singly-linked list ordered by key.
-                //   next_key/next_index point to the successor; zero = end of list.
-                //
-                // # Slot Layout
-                //
-                //     slot index:  [ base ] [ base+1 ] [ base+2 ] ...
-                //     contents:    sentinel   leaf 1     leaf 2   ...
-                //
-                //   slot[base] = sentinel (key=0, value=0), always present.
-                //   slot[base+N] = tree leaf N.
-                //   Empty (never-written) slots store ZERO in the Merkle tree.
-                //
-                // # Operation Modes (mutually exclusive via witness booleans)
-                //
-                //   condition=0 ............ NOOP (all constraints gated off)
-                //   condition=1, is_insert=0 UPDATE (change value, keep linked-list pointers)
-                //   condition=1, is_insert=1 INSERT (add new leaf, splice into sorted list)
-                //
-                // ## UPDATE
-                //
-                //   Key already exists at some slot. Only the value changes:
-                //
-                //     Before:  ... -> [key=K, val=V_old, next=...] -> ...
-                //     After:   ... -> [key=K, val=V_new, next=...] -> ...
-                //
-                //   One DMP:  slot[i]: hash(old_leaf) -> hash(new_leaf)
-                //   Constraints: key, next_key, next_index unchanged.
-                //
-                // ## INSERT (two sub-cases)
-                //
-                //   Key does not exist. We must splice a new leaf into the sorted list.
-                //   This always requires TWO DMPs executed in sequence:
-                //
-                //     DMP 1: update the predecessor slot (change its next pointer)
-                //     DMP 2: write the new leaf into an empty slot
-                //
-                //   The state root chains:
-                //
-                //     end_state_root
-                //         |
-                //         v
-                //     pred_dmp.old_root == end_state_root
-                //         | (update predecessor's next pointer)
-                //         v
-                //     pred_dmp.new_root == new_leaf_dmp.old_root
-                //         | (write new leaf into empty slot)
-                //         v
-                //     new_leaf_dmp.new_root  ==>  new end_state_root
-                //
-                //   ### INSERT with predecessor (insert_has_predecessor = true)
-                //
-                //     Predecessor is a real leaf with key < new_key.
-                //     Splice new leaf between predecessor and its successor:
-                //
-                //     Before: ... -> [pred: key=A, next=(C,idx_C)] -> [C] -> ...
-                //     After:  ... -> [pred: key=A, next=(B,idx_B)] -> [new: key=B,
-                // next=(C,idx_C)] -> [C] -> ...
-                //
-                //     Ordering enforced: A < B < C  (or C==0 if pred was tail)
-                //
-                //   ### INSERT without predecessor (insert_has_predecessor = false)
-                //
-                //     New key is smaller than all existing keys.
-                //     Predecessor is the sentinel (key=0, value=0).
-                //
-                //     First insert (empty IMT):
-                //
-                //       Before: [sentinel: next=(0,0)]              (virgin, slot=ZERO in tree)
-                //       After:  [sentinel: next=(B,idx_B)] -> [new: key=B, next=(0,0)]
-                //
-                //       pred_dmp: ZERO -> hash(sentinel_new)
-                //       leaf_dmp: ZERO -> hash(new_leaf)
-                //
-                //     Subsequent insert (new key is the new minimum):
-                //
-                //       Before: [sentinel: next=(A,idx_A)] -> [A] -> ...
-                //       After:  [sentinel: next=(B,idx_B)] -> [new: key=B, next=(A,idx_A)] ->
-                // [A] -> ...
-                //
-                //       Ordering enforced: B < A  (or A==0 if list was empty)
-                //
-                // ================================================================
-
                 let condition = dpn.resolve_bool(builder, c.condition);
                 let is_insert = builder.add_virtual_bool_target_safe();
                 let is_update = builder.not(is_insert);
-                let insert_has_predecessor = builder.add_virtual_bool_target_safe();
-                let insert_empty_predecessor = builder.not(insert_has_predecessor);
                 let condition_and_insert = builder.and(condition, is_insert);
                 let condition_and_update = builder.and(condition, is_update);
-                let condition_and_insert_with_predecessor = builder.and(condition_and_insert, insert_has_predecessor);
-                let condition_and_insert_without_predecessor = builder.and(condition_and_insert, insert_empty_predecessor);
                 let key_target = HashOutTarget {
                     elements: [
                         dpn.resolve_target(c.key[0]),
@@ -1825,263 +1993,201 @@ impl StateReaderGadget {
                         dpn.resolve_target(c.value[3]),
                     ],
                 };
+                let base_offset = dpn.resolve_target(c.base_offset);
+                let capacity = dpn.resolve_target(c.capacity);
+                let state_height = builder.constant(F::from_canonical_usize(self.contract_state_tree_height));
+                let (physical_base, map_capacity) = Self::verify_imt_map_bounds(builder, base_offset, capacity, state_height);
+                let one = builder.one();
+                let true_target = builder._true();
+                let zero_hash = builder.constant_hash(HashOut::ZERO);
 
+                let sentinel = IMTLeafTargets::add_virtual_to(builder);
+                let sentinel_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
+                let (sentinel_virgin, starting_count) = Self::constrain_authenticated_sentinel::<H, F, D>(
+                    builder,
+                    condition,
+                    self.end_contract_state_root,
+                    physical_base,
+                    map_capacity,
+                    &sentinel,
+                    sentinel_proof.root,
+                    sentinel_proof.value,
+                    sentinel_proof.index,
+                );
                 let update_old_leaf = IMTLeafTargets::add_virtual_to(builder);
                 let update_new_leaf = IMTLeafTargets::add_virtual_to(builder);
                 let update_delta_proof = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
-
-                let update_old_leaf_hash = update_old_leaf.hash::<H, F, D>(builder);
-                let update_new_leaf_hash = update_new_leaf.hash::<H, F, D>(builder);
-                // UPDATE path constraints (only enforced when condition_and_update = 1):
-
-                // The leaf stored in the Merkle tree is the hash of the leaf struct.
-                // Bind old/new leaf hashes to the delta proof's old/new slot values,
-                // proving the delta proof covers exactly these two leaves.
-                builder.connect_hashes_if_true(condition_and_update, update_old_leaf_hash, update_delta_proof.old_value);
-                builder.connect_hashes_if_true(condition_and_update, update_new_leaf_hash, update_delta_proof.new_value);
-
-                // An UPDATE must not move the leaf to a different position in the linked list:
-                // key, next_key, and next_index must stay the same across the update.
-                builder.connect_hashes_if_true(condition_and_update, update_old_leaf.key, update_new_leaf.key);
-                builder.connect_hashes_if_true(condition_and_update, update_old_leaf.next_key, update_new_leaf.next_key);
-                builder.connect_if_true(condition_and_update, update_old_leaf.next_index, update_new_leaf.next_index);
-
-                // The delta proof's old_root must equal the current accumulated state root,
-                // chaining this write onto the previous state transition.
+                let update_old_hash = update_old_leaf.hash::<H, F, D>(builder);
+                let update_new_hash = update_new_leaf.hash::<H, F, D>(builder);
                 builder.connect_hashes_if_true(condition_and_update, update_delta_proof.old_root, self.end_contract_state_root);
-
-                // The leaf being updated must be the one whose key matches the requested key,
-                // and the new value must match the requested value.
+                builder.connect_hashes_if_true(condition_and_update, update_old_hash, update_delta_proof.old_value);
+                builder.connect_hashes_if_true(condition_and_update, update_new_hash, update_delta_proof.new_value);
                 builder.connect_hashes_if_true(condition_and_update, update_old_leaf.key, key_target);
                 builder.connect_hashes_if_true(condition_and_update, update_new_leaf.key, key_target);
                 builder.connect_hashes_if_true(condition_and_update, update_new_leaf.value, value_target);
+                builder.connect_hashes_if_true(condition_and_update, update_old_leaf.key, update_new_leaf.key);
+                builder.connect_hashes_if_true(condition_and_update, update_old_leaf.next_key, update_new_leaf.next_key);
+                builder.connect_if_true(condition_and_update, update_old_leaf.next_index, update_new_leaf.next_index);
+                Self::connect_index_in_open_interval(builder, condition_and_update, update_delta_proof.index, physical_base, starting_count);
+                Self::connect_successor_pair(builder, condition_and_update, update_old_leaf.next_key, update_old_leaf.next_index, physical_base, starting_count);
+                Self::connect_query_nonzero(builder, condition, key_target);
 
-                let insert_predecessor_old_leaf = IMTLeafTargets::add_virtual_to(builder);
-                let insert_predecessor_new_leaf = IMTLeafTargets::add_virtual_to(builder);
-                let insert_new_leaf = IMTLeafTargets::add_virtual_to(builder);
-                let insert_predecessor_delta_proof = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
-                let insert_new_leaf_delta_proof = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
-
-                let insert_pred_old_hash = insert_predecessor_old_leaf.hash::<H, F, D>(builder);
-                let insert_pred_new_hash = insert_predecessor_new_leaf.hash::<H, F, D>(builder);
-                let insert_new_leaf_hash = insert_new_leaf.hash::<H, F, D>(builder);
-                let one = builder._true();
-                let zero_hash = builder.constant_hash(HashOut::ZERO);
-
-                // Predecessor DMP old_value consistency.
-                //
-                //   pred_dmp.old_value is what the Merkle tree currently stores at the
-                //   predecessor's slot.  Two cases:
-                //
-                //     Case A — slot was previously written (normal):
-                //       old_value = hash(pred_old_leaf)   =>  verify hash match
-                //
-                //     Case B — virgin sentinel (first insert into this IMT):
-                //       old_value = ZERO  (slot never written)
-                //       hash(default_leaf) = poseidon(0..0) != ZERO
-                //       =>  cannot do hash match; instead verify pred_old is all-zeros
-                //
-                let pred_dmp_old_is_zero = builder.is_zero_hash(insert_predecessor_delta_proof.old_value);
-                let pred_dmp_old_not_zero = builder.not(pred_dmp_old_is_zero);
-                let sentinel_next_zero = builder.is_zero_hash(insert_predecessor_old_leaf.next_key);
-                let new_lt_sentinel_next = is_qhashout_lt::<F, D>(builder, insert_new_leaf.key, insert_predecessor_old_leaf.next_key);
-                let sentinel_ordering_ok = builder.or(sentinel_next_zero, new_lt_sentinel_next);
-                // When old_value != 0: verify hash(pred_old) == old_value
-                let cond_hash_check = builder.and(condition_and_insert, pred_dmp_old_not_zero);
-                builder.connect_hashes_if_true(cond_hash_check, insert_pred_old_hash, insert_predecessor_delta_proof.old_value);
-                // When old_value == 0 (virgin slot): pred_old must be entirely zero
-                let cond_virgin = builder.and(condition_and_insert, pred_dmp_old_is_zero);
-                for i in 0..4 {
-                    builder.connect_zero_if_true(cond_virgin, insert_predecessor_old_leaf.key.elements[i]);
-                    builder.connect_zero_if_true(cond_virgin, insert_predecessor_old_leaf.value.elements[i]);
-                    builder.connect_zero_if_true(cond_virgin, insert_predecessor_old_leaf.next_key.elements[i]);
+                let predecessor_old = IMTLeafTargets::add_virtual_to(builder);
+                let predecessor_new = IMTLeafTargets::add_virtual_to(builder);
+                let inserted_leaf = IMTLeafTargets::add_virtual_to(builder);
+                let predecessor_delta = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
+                let member_delta = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
+                let sentinel_delta = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
+                let sentinel_old = IMTLeafTargets::add_virtual_to(builder);
+                let sentinel_new = IMTLeafTargets::add_virtual_to(builder);
+                let predecessor_old_hash = predecessor_old.hash::<H, F, D>(builder);
+                let predecessor_new_hash = predecessor_new.hash::<H, F, D>(builder);
+                let inserted_hash = inserted_leaf.hash::<H, F, D>(builder);
+                let room_for_insert = builder.is_less_than(32, starting_count, map_capacity);
+                builder.connect_if_true(condition_and_insert, room_for_insert.target, true_target.target);
+                let allocated_index = builder.add(builder.add(physical_base, starting_count), one);
+                builder.connect_hashes_if_true(condition_and_insert, predecessor_delta.old_root, self.end_contract_state_root);
+                builder.connect_hashes_if_true(condition_and_insert, predecessor_delta.new_root, member_delta.old_root);
+                builder.connect_hashes_if_true(condition_and_insert, member_delta.new_root, sentinel_delta.old_root);
+                builder.connect_hashes_if_true(condition_and_insert, predecessor_new_hash, predecessor_delta.new_value);
+                builder.connect_hashes_if_true(condition_and_insert, inserted_hash, member_delta.new_value);
+                for limb in 0..4 {
+                    builder.connect_zero_if_true(condition_and_insert, member_delta.old_value.elements[limb]);
                 }
-                builder.connect_zero_if_true(cond_virgin, insert_predecessor_old_leaf.next_index);
-                builder.connect_hashes_if_true(condition_and_insert, insert_pred_new_hash, insert_predecessor_delta_proof.new_value);
-                builder.connect_hashes_if_true(condition_and_insert, insert_new_leaf_hash, insert_new_leaf_delta_proof.new_value);
-                builder.connect_hashes_if_true(condition_and_insert, insert_new_leaf.key, key_target);
-                builder.connect_hashes_if_true(condition_and_insert, insert_new_leaf.value, value_target);
-                builder.connect_hashes_if_true(
+                builder.connect_if_true(condition_and_insert, member_delta.index, allocated_index);
+                builder.connect_if_true(condition_and_insert, sentinel_delta.index, physical_base);
+                let predecessor_differs = builder.is_not_equal(predecessor_delta.index, allocated_index);
+                builder.connect_if_true(condition_and_insert, predecessor_differs.target, true_target.target);
+                builder.connect_hashes_if_true(condition_and_insert, inserted_leaf.key, key_target);
+                builder.connect_hashes_if_true(condition_and_insert, inserted_leaf.value, value_target);
+
+                let predecessor_is_sentinel = builder.is_equal(predecessor_delta.index, physical_base);
+                let sentinel_predecessor = builder.and(condition_and_insert, predecessor_is_sentinel);
+                let member_predecessor = builder.and(condition_and_insert, builder.not(predecessor_is_sentinel));
+                let initialized_insert = builder.and(condition_and_insert, builder.not(sentinel_virgin));
+                let initialized_member_predecessor = builder.and(initialized_insert, member_predecessor);
+                builder.connect_hashes_if_true(initialized_member_predecessor, predecessor_old_hash, predecessor_delta.old_value);
+                builder.connect_hashes_if_true(sentinel_predecessor, predecessor_old.key, sentinel.key);
+                builder.connect_hashes_if_true(sentinel_predecessor, predecessor_old.value, sentinel.value);
+                builder.connect_hashes_if_true(sentinel_predecessor, predecessor_old.next_key, sentinel.next_key);
+                builder.connect_if_true(sentinel_predecessor, predecessor_old.next_index, sentinel.next_index);
+                let virgin_insert = builder.and(condition_and_insert, sentinel_virgin);
+                builder.connect_hashes_if_true(virgin_insert, predecessor_delta.old_value, zero_hash);
+                Self::connect_leaf_zero_if_true(builder, virgin_insert, &predecessor_old);
+                builder.connect_if_true(virgin_insert, predecessor_is_sentinel.target, true_target.target);
+                Self::connect_predecessor_role(
+                    builder,
                     condition_and_insert,
-                    insert_predecessor_delta_proof.new_root,
-                    insert_new_leaf_delta_proof.old_root,
+                    &predecessor_old,
+                    predecessor_delta.index,
+                    physical_base,
+                    starting_count,
                 );
-                builder.connect_hashes_if_true(
+                let predecessor_before_query = is_qhashout_lt::<F, D>(builder, predecessor_old.key, key_target);
+                let inherited_successor_absent = builder.is_zero_hash(predecessor_old.next_key);
+                let query_before_successor = is_qhashout_lt::<F, D>(builder, key_target, predecessor_old.next_key);
+                let successor_gap = builder.or(inherited_successor_absent, query_before_successor);
+                let strict_absence = builder.and(predecessor_before_query, successor_gap);
+                builder.connect_if_true(condition_and_insert, strict_absence.target, true_target.target);
+                builder.connect_hashes_if_true(member_predecessor, predecessor_old.key, predecessor_new.key);
+                builder.connect_hashes_if_true(member_predecessor, predecessor_old.value, predecessor_new.value);
+                builder.connect_hashes_if_true(sentinel_predecessor, predecessor_new.key, sentinel.key);
+                for limb in 1..4 {
+                    builder.connect_if_true(sentinel_predecessor, predecessor_new.value.elements[limb], sentinel.value.elements[limb]);
+                }
+                builder.connect_if_true(sentinel_predecessor, predecessor_new.value.elements[0], starting_count);
+                builder.connect_hashes_if_true(condition_and_insert, inserted_leaf.next_key, predecessor_old.next_key);
+                builder.connect_if_true(condition_and_insert, inserted_leaf.next_index, predecessor_old.next_index);
+                builder.connect_hashes_if_true(condition_and_insert, predecessor_new.next_key, inserted_leaf.key);
+                builder.connect_if_true(condition_and_insert, predecessor_new.next_index, allocated_index);
+                Self::connect_successor_pair(
+                    builder,
                     condition_and_insert,
-                    insert_predecessor_delta_proof.old_root,
-                    self.end_contract_state_root,
+                    inserted_leaf.next_key,
+                    inserted_leaf.next_index,
+                    physical_base,
+                    starting_count,
                 );
-                // The new leaf must be written into a never-used slot (old_value == ZERO).
-                // The new leaf must be written into a never-used slot (old_value == ZERO).
-                for i in 0..4 {
-                    builder.connect_zero_if_true(condition_and_insert, insert_new_leaf_delta_proof.old_value.elements[i]);
+
+                let sentinel_old_hash = sentinel_old.hash::<H, F, D>(builder);
+                let sentinel_new_hash = sentinel_new.hash::<H, F, D>(builder);
+                let next_count = builder.add(starting_count, one);
+                builder.connect_hashes_if_true(initialized_insert, sentinel_old_hash, sentinel_delta.old_value);
+                builder.connect_hashes_if_true(virgin_insert, sentinel_delta.old_value, predecessor_new_hash);
+                builder.connect_hashes_if_true(condition_and_insert, sentinel_new_hash, sentinel_delta.new_value);
+                builder.connect_hashes_if_true(condition_and_insert, sentinel_old.key, sentinel.key);
+                builder.connect_hashes_if_true(condition_and_insert, sentinel_new.key, sentinel.key);
+                for limb in 1..4 {
+                    builder.connect_if_true(condition_and_insert, sentinel_old.value.elements[limb], sentinel.value.elements[limb]);
+                    builder.connect_if_true(condition_and_insert, sentinel_new.value.elements[limb], sentinel.value.elements[limb]);
                 }
+                builder.connect_if_true(condition_and_insert, sentinel_old.value.elements[0], starting_count);
+                builder.connect_if_true(condition_and_insert, sentinel_new.value.elements[0], next_count);
+                builder.connect_hashes_if_true(member_predecessor, sentinel_old.next_key, sentinel.next_key);
+                builder.connect_if_true(member_predecessor, sentinel_old.next_index, sentinel.next_index);
+                builder.connect_hashes_if_true(sentinel_predecessor, sentinel_old.next_key, inserted_leaf.key);
+                builder.connect_if_true(sentinel_predecessor, sentinel_old.next_index, allocated_index);
+                builder.connect_hashes_if_true(condition_and_insert, sentinel_new.next_key, sentinel_old.next_key);
+                builder.connect_if_true(condition_and_insert, sentinel_new.next_index, sentinel_old.next_index);
+                Self::connect_index_in_open_interval(builder, condition_and_insert, sentinel_new.next_index, physical_base, next_count);
 
-                // INSERT with predecessor:
-                //
-                //   ... -> [pred_old: key=A, val=V, next=(C, idx_C)] -> [C] -> ...
-                //                          |
-                //                          v  (splice)
-                //   ... -> [pred_new: key=A, val=V, next=(B, idx_B)] -> [new: key=B, next=(C,
-                // idx_C)] -> [C] -> ...
-                //
-                //   Pointer rewiring:
-                //     new_leaf.next      = pred_old.next       (inherit successor)
-                //     pred_new.next_key  = new_leaf.key        (predecessor -> new leaf)
-                //     pred_new.next_index = new_leaf_dmp.index
-                //     pred key/value unchanged
-                //
-                //   Ordering: A < B AND (B < C OR C == 0)
-                //
-                {
-                    builder.connect_hashes_if_true(
-                        condition_and_insert_with_predecessor,
-                        insert_predecessor_old_leaf.key,
-                        insert_predecessor_new_leaf.key,
-                    );
-                    builder.connect_hashes_if_true(
-                        condition_and_insert_with_predecessor,
-                        insert_predecessor_old_leaf.value,
-                        insert_predecessor_new_leaf.value,
-                    );
-                    builder.connect_hashes_if_true(
-                        condition_and_insert_with_predecessor,
-                        insert_new_leaf.next_key,
-                        insert_predecessor_old_leaf.next_key,
-                    );
-                    builder.connect_if_true(
-                        condition_and_insert_with_predecessor,
-                        insert_new_leaf.next_index,
-                        insert_predecessor_old_leaf.next_index,
-                    );
-                    builder.connect_hashes_if_true(
-                        condition_and_insert_with_predecessor,
-                        insert_predecessor_new_leaf.next_key,
-                        insert_new_leaf.key,
-                    );
-                    // pred_new.next_index = new_leaf_dmp.index
-                    builder.connect_if_true(
-                        condition_and_insert_with_predecessor,
-                        insert_predecessor_new_leaf.next_index,
-                        insert_new_leaf_delta_proof.index,
-                    );
+                let not_condition = builder.not(condition);
+                Self::connect_leaf_zero_if_true(builder, not_condition, &update_old_leaf);
+                Self::connect_leaf_zero_if_true(builder, not_condition, &update_new_leaf);
+                Self::connect_leaf_zero_if_true(builder, not_condition, &predecessor_old);
+                Self::connect_leaf_zero_if_true(builder, not_condition, &predecessor_new);
+                Self::connect_leaf_zero_if_true(builder, not_condition, &inserted_leaf);
+                Self::connect_leaf_zero_if_true(builder, not_condition, &sentinel);
+                Self::connect_leaf_zero_if_true(builder, not_condition, &sentinel_old);
+                Self::connect_leaf_zero_if_true(builder, not_condition, &sentinel_new);
+                builder.connect_if_true(not_condition, is_insert.target, builder.zero());
+                Self::connect_leaf_zero_if_true(builder, condition_and_update, &predecessor_old);
+                Self::connect_leaf_zero_if_true(builder, condition_and_update, &predecessor_new);
+                Self::connect_leaf_zero_if_true(builder, condition_and_update, &inserted_leaf);
+                Self::connect_leaf_zero_if_true(builder, condition_and_update, &sentinel_old);
+                Self::connect_leaf_zero_if_true(builder, condition_and_update, &sentinel_new);
+                Self::connect_leaf_zero_if_true(builder, condition_and_insert, &update_old_leaf);
+                Self::connect_leaf_zero_if_true(builder, condition_and_insert, &update_new_leaf);
 
-                    let pred_lt_new = is_qhashout_lt::<F, D>(builder, insert_predecessor_old_leaf.key, insert_new_leaf.key);
-                    let next_key_is_zero = builder.is_zero_hash(insert_predecessor_old_leaf.next_key);
-                    let new_lt_next = is_qhashout_lt::<F, D>(builder, insert_new_leaf.key, insert_predecessor_old_leaf.next_key);
-                    let ordering_ok = builder.or(next_key_is_zero, new_lt_next);
-                    builder.connect_if_true(condition_and_insert_with_predecessor, pred_lt_new.target, one.target);
-                    builder.connect_if_true(condition_and_insert_with_predecessor, ordering_ok.target, one.target);
-                }
-
-                // INSERT without predecessor (sentinel is the predecessor):
-                //
-                //   First insert (virgin sentinel):
-                //
-                //     [sentinel: key=0, val=0, next=(0,0)]    (slot = ZERO in tree)
-                //                      |
-                //                      v
-                //     [sentinel: key=0, val=0, next=(B,idx)] -> [new: key=B, next=(0,0)]
-                //
-                //   Subsequent insert (new key B is new minimum, old minimum was A):
-                //
-                //     [sentinel: next=(A, idx_A)] -> [A] -> ...
-                //                      |
-                //                      v
-                //     [sentinel: next=(B, idx_B)] -> [new: key=B, next=(A, idx_A)] -> [A] ->
-                // ...
-                //
-                //   Same splice logic as with_predecessor, plus:
-                //     - sentinel key and value are always zero
-                //     - no need to check sentinel.key < new.key (0 < any nonzero key)
-                //     - ordering: B < A  (or A == 0 if list was empty)
-                //
-                {
-                    // Sentinel key and value are always zero.
-                    for i in 0..4 {
-                        builder.connect_zero_if_true(condition_and_insert_without_predecessor, insert_predecessor_old_leaf.key.elements[i]);
-                        builder.connect_zero_if_true(condition_and_insert_without_predecessor, insert_predecessor_old_leaf.value.elements[i]);
-                        builder.connect_zero_if_true(condition_and_insert_without_predecessor, insert_predecessor_new_leaf.key.elements[i]);
-                        builder.connect_zero_if_true(condition_and_insert_without_predecessor, insert_predecessor_new_leaf.value.elements[i]);
-                    }
-                    // 1. new_leaf.next = sentinel_old.next (inherit successor)
-                    builder.connect_hashes_if_true(
-                        condition_and_insert_without_predecessor,
-                        insert_new_leaf.next_key,
-                        insert_predecessor_old_leaf.next_key,
-                    );
-                    builder.connect_if_true(
-                        condition_and_insert_without_predecessor,
-                        insert_new_leaf.next_index,
-                        insert_predecessor_old_leaf.next_index,
-                    );
-                    // 2. sentinel_new.next_key = new_leaf.key (sentinel points to new leaf)
-                    builder.connect_hashes_if_true(
-                        condition_and_insert_without_predecessor,
-                        insert_predecessor_new_leaf.next_key,
-                        insert_new_leaf.key,
-                    );
-                    // sentinel_new.next_index = new_leaf_dmp.index
-                    builder.connect_if_true(
-                        condition_and_insert_without_predecessor,
-                        insert_predecessor_new_leaf.next_index,
-                        insert_new_leaf_delta_proof.index,
-                    );
-                    // 3. ordering: new_leaf.key < sentinel_old.next_key OR
-                    //    sentinel_old.next_key == 0
-                    // TEMP debug: disable the no-predecessor ordering assertion
-                    // while narrowing the 1 != 0 branch
-                    // conflict in first-insert IMT claim_deposit proving.
-                    // builder.connect_if_true(condition_and_insert_without_predecessor, sentinel_ordering_ok.target, one.target);
-                }
-
-                // State root multiplexing:
-                //
-                //   is_insert=1: new_root comes from the INSERT chain (new_leaf_dmp.new_root)
-                //   is_insert=0: new_root comes from the UPDATE DMP (update_dmp.new_root)
-                //   condition=0: root unchanged (NOOP)
-                //
-                //   condition=0:  end_state_root (unchanged)
-                //   condition=1:  is_insert ? new_leaf_dmp.new_root : update_dmp.new_root
-                //
-                let write_new_root = builder.select_hash(is_insert, insert_new_leaf_delta_proof.new_root, update_delta_proof.new_root);
+                let write_new_root = builder.select_hash(is_insert, sentinel_delta.new_root, update_delta_proof.new_root);
                 let new_end_state_root = builder.select_hash(condition, write_new_root, self.end_contract_state_root);
                 self.end_contract_state_root = new_end_state_root;
-
-                // Result returned to DPN bytecode: [old_value, new_value] of the operated leaf.
-                let result_old_value = builder.select_hash(is_insert, zero_hash, update_old_leaf.value);
-                let result_new_value = builder.select_hash(is_insert, insert_new_leaf.value, update_new_leaf.value);
+                let result_old_value = builder.select_hash(condition_and_update, update_old_leaf.value, zero_hash);
+                let result_new_value = builder.select_hash(condition, value_target, zero_hash);
                 let mut result = result_old_value.elements.to_vec();
                 result.extend_from_slice(&result_new_value.elements);
-
-                let ck = StateCommandCacheKey::new_write_imt_current_contract(c.condition, 0, self.write_epoch);
+                let ck = StateCommandCacheKey::new_write_imt_current_contract(c.condition, c.base_offset, c.capacity, c.key, self.write_epoch);
                 self.insert_imt_set_gadget(
                     ck,
                     IMTSetGadget {
                         is_insert,
-                        insert_has_predecessor,
                         update_old_leaf,
                         update_new_leaf,
                         update_delta_proof,
-                        insert_predecessor_old_leaf,
-                        insert_predecessor_new_leaf,
-                        insert_new_leaf,
-                        insert_predecessor_delta_proof,
-                        insert_new_leaf_delta_proof,
+                        insert_predecessor_old_leaf: predecessor_old,
+                        insert_predecessor_new_leaf: predecessor_new,
+                        insert_new_leaf: inserted_leaf,
+                        insert_predecessor_delta_proof: predecessor_delta,
+                        insert_new_leaf_delta_proof: member_delta,
+                        sentinel_preimage: sentinel,
+                        sentinel_merkle_proof: sentinel_proof,
+                        sentinel_old_leaf: sentinel_old,
+                        sentinel_new_leaf: sentinel_new,
+                        insert_sentinel_delta_proof: sentinel_delta,
                     },
                 );
-
                 self.write_epoch += 1;
-
                 result
             }
             DPNStateCmd::GetSelfUserCurrentIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_read_imt_current_contract(c.key, self.write_epoch);
+                let ck = StateCommandCacheKey::new_read_imt_current_contract(c.base_offset, c.capacity, c.key, self.write_epoch);
                 if let Some(existing_result) = self.result_map.get(&ck) {
                     existing_result.clone()
                 } else {
                     let merkle_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
+                    let sentinel = IMTLeafTargets::add_virtual_to(builder);
+                    let sentinel_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
                     let query_key = HashOutTarget {
                         elements: [
                             dpn.resolve_target(c.key[0]),
@@ -2090,15 +2196,51 @@ impl StateReaderGadget {
                             dpn.resolve_target(c.key[3]),
                         ],
                     };
+                    let (physical_base, map_capacity) = Self::verify_imt_map_bounds(
+                        builder,
+                        dpn.resolve_target(c.base_offset),
+                        dpn.resolve_target(c.capacity),
+                        builder.constant(F::from_canonical_usize(self.contract_state_tree_height)),
+                    );
+                    let active = builder._true();
+                    let (_virgin, count) = Self::constrain_authenticated_sentinel::<H, F, D>(
+                        builder,
+                        active,
+                        self.end_contract_state_root,
+                        physical_base,
+                        map_capacity,
+                        &sentinel,
+                        sentinel_proof.root,
+                        sentinel_proof.value,
+                        sentinel_proof.index,
+                    );
                     let leaf_hash = leaf.hash::<H, F, D>(builder);
                     builder.connect_hashes(merkle_proof.root, self.end_contract_state_root);
                     builder.connect_hashes(leaf_hash, merkle_proof.value);
                     builder.connect_hashes(leaf.key, query_key);
+                    Self::connect_query_nonzero(builder, active, query_key);
+                    Self::connect_index_in_open_interval(
+                        builder,
+                        active,
+                        merkle_proof.index,
+                        physical_base,
+                        count,
+                    );
+                    Self::connect_successor_pair(
+                        builder,
+                        active,
+                        leaf.next_key,
+                        leaf.next_index,
+                        physical_base,
+                        count,
+                    );
                     self.insert_imt_read_gadget(
                         ck,
                         IMTReadGadget {
                             merkle_proof,
                             leaf: leaf.clone(),
+                            sentinel_preimage: sentinel,
+                            sentinel_merkle_proof: sentinel_proof,
                         },
                     );
                     let result = leaf.value.elements.to_vec();
@@ -2107,28 +2249,16 @@ impl StateReaderGadget {
                 }
             }
             DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(c) => {
-                let ck = StateCommandCacheKey::new_read_imt_contains_current_contract(c.key, self.write_epoch);
+                let ck = StateCommandCacheKey::new_read_imt_contains_current_contract(c.base_offset, c.capacity, c.key, self.write_epoch);
                 if let Some(existing_result) = self.result_map.get(&ck) {
                     existing_result.clone()
                 } else {
                     let end_contract_state_root = self.end_contract_state_root;
                     let mp = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
-
-                    // Witnessed IMT leaf preimage and existence selector.
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
+                    let sentinel = IMTLeafTargets::add_virtual_to(builder);
+                    let sentinel_proof = MerkleProofGadget::add_virtual_to::<H, F, D>(builder, self.contract_state_tree_height);
                     let exists = builder.add_virtual_bool_target_safe();
-
-                    let leaf_hash = leaf.hash::<H, F, D>(builder);
-                    let zero_hash = builder.constant_hash(HashOut::ZERO);
-                    let leaf_key_zero = builder.is_zero_hash(leaf.key);
-                    let leaf_value_zero = builder.is_zero_hash(leaf.value);
-                    let leaf_next_key_zero = builder.is_zero_hash(leaf.next_key);
-                    let leaf_next_index_zero = builder.is_zero(leaf.next_index);
-                    let leaf_key_and_value_zero = builder.and(leaf_key_zero, leaf_value_zero);
-                    let leaf_next_zero = builder.and(leaf_next_key_zero, leaf_next_index_zero);
-                    let leaf_is_empty = builder.and(leaf_key_and_value_zero, leaf_next_zero);
-
-                    // key targets from command input
                     let query_key = HashOutTarget {
                         elements: [
                             dpn.resolve_target(c.key[0]),
@@ -2137,39 +2267,75 @@ impl StateReaderGadget {
                             dpn.resolve_target(c.key[3]),
                         ],
                     };
-
-                    // Membership branch: leaf.key == query_key
+                    let (physical_base, map_capacity) = Self::verify_imt_map_bounds(
+                        builder,
+                        dpn.resolve_target(c.base_offset),
+                        dpn.resolve_target(c.capacity),
+                        builder.constant(F::from_canonical_usize(self.contract_state_tree_height)),
+                    );
+                    let active = builder._true();
+                    let (virgin, count) = Self::constrain_authenticated_sentinel::<H, F, D>(
+                        builder,
+                        active,
+                        end_contract_state_root,
+                        physical_base,
+                        map_capacity,
+                        &sentinel,
+                        sentinel_proof.root,
+                        sentinel_proof.value,
+                        sentinel_proof.index,
+                    );
+                    let leaf_hash = leaf.hash::<H, F, D>(builder);
                     let key_eq = builder.is_equal_hash(leaf.key, query_key);
-
-                    // Non-membership branch: leaf.key < query_key and (query_key < leaf.next_key ||
-                    // leaf.next_key == 0)
-                    let pred_lt_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
-                    let next_key_zero = builder.is_zero_hash(leaf.next_key);
-                    let query_lt_next = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
-                    let next_ok = builder.or(next_key_zero, query_lt_next);
-                    let non_member = builder.and(pred_lt_query, next_ok);
-
-                    let one = builder._true();
                     let not_exists = builder.not(exists);
-                    let empty_non_member = builder.and(not_exists, leaf_is_empty);
-                    let non_empty_case = builder.not(empty_non_member);
-                    builder.connect_hashes_if_true(non_empty_case, leaf_hash, mp.value);
-                    builder.connect_hashes_if_true(empty_non_member, mp.value, zero_hash);
-                    builder.connect_if_true(exists, key_eq.target, one.target);
-                    //                     //
-                    // builder.connect_if_true(not_exists, non_member.target, one.target);
-
+                    let membership = exists;
+                    let initialized = builder.not(virgin);
+                    let initialized_absence = builder.and(not_exists, initialized);
+                    let virgin_absence = builder.and(not_exists, virgin);
                     builder.connect_hashes(mp.root, end_contract_state_root);
-                    self.insert_imt_contains_gadget(ck, mp, leaf, exists.target);
-
+                    builder.connect_hashes_if_true(membership, leaf_hash, mp.value);
+                    builder.connect_hashes_if_true(initialized_absence, leaf_hash, mp.value);
+                    builder.connect_hashes_if_true(virgin_absence, mp.value, builder.constant_hash(HashOut::ZERO));
+                    builder.connect_if_true(membership, key_eq.target, builder._true().target);
+                    builder.connect_if_true(virgin_absence, mp.index, physical_base);
+                    Self::connect_query_nonzero(builder, active, query_key);
+                    Self::connect_index_in_open_interval(
+                        builder,
+                        membership,
+                        mp.index,
+                        physical_base,
+                        count,
+                    );
+                    Self::connect_successor_pair(
+                        builder,
+                        membership,
+                        leaf.next_key,
+                        leaf.next_index,
+                        physical_base,
+                        count,
+                    );
+                    Self::connect_predecessor_role(
+                        builder,
+                        initialized_absence,
+                        &leaf,
+                        mp.index,
+                        physical_base,
+                        count,
+                    );
+                    let predecessor_before_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
+                    let successor_absent = builder.is_zero_hash(leaf.next_key);
+                    let query_before_successor = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
+                    let successor_gap = builder.or(successor_absent, query_before_successor);
+                    let strict_absence = builder.and(predecessor_before_query, successor_gap);
+                    builder.connect_if_true(initialized_absence, strict_absence.target, builder._true().target);
+                    builder.connect_if_true(virgin, exists.target, builder.zero());
+                    self.insert_imt_contains_gadget(ck, mp, leaf, exists.target, sentinel, sentinel_proof);
                     let result = vec![exists.target];
                     self.result_map.insert(ck, result.clone());
                     result
                 }
             }
             DPNStateCmd::GetSelfUserExternalIMTContractStateValue(c) => {
-                // Two proofs: UCT lookup (contract root in user's contract tree) + IMT leaf
-                // lookup
                 let read_root_ck = StateCommandCacheKey::new_read_self_user_external_contract_root(c.contract_id, self.contract_call_epoch);
                 let uct_root = self.user_contract_tree_state_root;
                 let call_epoch = self.contract_call_epoch;
@@ -2181,37 +2347,61 @@ impl StateReaderGadget {
                         builder.connect_hashes(mp_uct.root, uct_root);
                         let contract_id_target = dpn.resolve_target(c.contract_id);
                         builder.connect(mp_uct.index, contract_id_target);
-                        let mp_uct: Vec<Target> = mp_uct.value.elements.to_vec();
-                        self.result_map.insert(read_root_ck, mp_uct);
+                        self.result_map.insert(read_root_ck, mp_uct.value.elements.to_vec());
                     }
                     expected_contract_state_tree_root
                 };
-
-                let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(c.contract_id, c.key, call_epoch);
+                let imt_ck = StateCommandCacheKey::new_read_imt_self_user_external_contract(
+                    c.contract_id,
+                    c.base_offset,
+                    c.capacity,
+                    c.contract_state_tree_height,
+                    c.key,
+                    call_epoch,
+                );
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     existing_result.clone()
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
+                    let checked_height = Self::checked_state_height(builder, height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+                    let sentinel_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
-                    let query_key = HashOutTarget {
-                        elements: [
-                            dpn.resolve_target(c.key[0]),
-                            dpn.resolve_target(c.key[1]),
-                            dpn.resolve_target(c.key[2]),
-                            dpn.resolve_target(c.key[3]),
-                        ],
-                    };
+                    let sentinel = IMTLeafTargets::add_virtual_to(builder);
+                    let query_key = HashOutTarget { elements: dpn.resolve_targets_sized::<4>(&c.key) };
+                    let (physical_base, map_capacity) = Self::verify_imt_map_bounds(
+                        builder,
+                        dpn.resolve_target(c.base_offset),
+                        dpn.resolve_target(c.capacity),
+                        checked_height,
+                    );
+                    let active = builder._true();
+                    let (_virgin, count) = Self::constrain_authenticated_sentinel::<H, F, D>(
+                        builder,
+                        active,
+                        expected_contract_state_tree_root,
+                        physical_base,
+                        map_capacity,
+                        &sentinel,
+                        sentinel_proof.root,
+                        sentinel_proof.value,
+                        sentinel_proof.index,
+                    );
                     let leaf_hash = leaf.hash::<H, F, D>(builder);
                     builder.connect_hashes(state_slot_proof.root, expected_contract_state_tree_root);
                     builder.connect_hashes(leaf_hash, state_slot_proof.value);
                     builder.connect_hashes(leaf.key, query_key);
+                    Self::connect_query_nonzero(builder, active, query_key);
+                    Self::connect_index_in_open_interval(builder, active, state_slot_proof.index, physical_base, count);
+                    Self::connect_successor_pair(builder, active, leaf.next_key, leaf.next_index, physical_base, count);
                     self.insert_imt_external_read_gadget(
                         imt_ck,
                         IMTExternalReadGadget {
                             contract_tree_proof: self.merkle_proofs[self.gadget_map[&read_root_ck].gadget_index].clone(),
                             state_slot_proof,
                             leaf: leaf.clone(),
+                            sentinel_preimage: sentinel,
+                            sentinel_merkle_proof: sentinel_proof,
                         },
                     );
                     let result = leaf.value.elements.to_vec();
@@ -2220,34 +2410,59 @@ impl StateReaderGadget {
                 }
             }
             DPNStateCmd::GetOtherUserIMTContractStateValue(c) => {
-                // Full chain: user tree -> user leaf -> UCT -> IMT leaf
                 let expected_contract_state_tree_root =
-                    { self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id) };
-
-                let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(c.user_id, c.contract_id, c.key, self.write_epoch);
+                    self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id);
+                let imt_ck = StateCommandCacheKey::new_read_imt_other_user_contract(
+                    c.user_id,
+                    c.contract_id,
+                    c.base_offset,
+                    c.capacity,
+                    c.contract_state_tree_height,
+                    c.key,
+                    self.write_epoch,
+                );
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     existing_result.clone()
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
+                    let checked_height = Self::checked_state_height(builder, height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+                    let sentinel_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
-                    let query_key = HashOutTarget {
-                        elements: [
-                            dpn.resolve_target(c.key[0]),
-                            dpn.resolve_target(c.key[1]),
-                            dpn.resolve_target(c.key[2]),
-                            dpn.resolve_target(c.key[3]),
-                        ],
-                    };
+                    let sentinel = IMTLeafTargets::add_virtual_to(builder);
+                    let query_key = HashOutTarget { elements: dpn.resolve_targets_sized::<4>(&c.key) };
+                    let (physical_base, map_capacity) = Self::verify_imt_map_bounds(
+                        builder,
+                        dpn.resolve_target(c.base_offset),
+                        dpn.resolve_target(c.capacity),
+                        checked_height,
+                    );
+                    let active = builder._true();
+                    let (_virgin, count) = Self::constrain_authenticated_sentinel::<H, F, D>(
+                        builder,
+                        active,
+                        expected_contract_state_tree_root,
+                        physical_base,
+                        map_capacity,
+                        &sentinel,
+                        sentinel_proof.root,
+                        sentinel_proof.value,
+                        sentinel_proof.index,
+                    );
                     let leaf_hash = leaf.hash::<H, F, D>(builder);
                     builder.connect_hashes(state_slot_proof.root, expected_contract_state_tree_root);
                     builder.connect_hashes(leaf_hash, state_slot_proof.value);
                     builder.connect_hashes(leaf.key, query_key);
+                    Self::connect_query_nonzero(builder, active, query_key);
+                    Self::connect_index_in_open_interval(builder, active, state_slot_proof.index, physical_base, count);
+                    Self::connect_successor_pair(builder, active, leaf.next_key, leaf.next_index, physical_base, count);
                     self.insert_imt_other_user_read_gadget(
                         imt_ck,
                         IMTOtherUserReadGadget {
                             state_slot_proof,
                             leaf: leaf.clone(),
+                            sentinel_preimage: sentinel,
+                            sentinel_merkle_proof: sentinel_proof,
                         },
                     );
                     let result = leaf.value.elements.to_vec();
@@ -2256,78 +2471,86 @@ impl StateReaderGadget {
                 }
             }
             DPNStateCmd::ContainsOtherUserIMTContractStateValue(c) => {
-                // Resolve external root chain: user tree -> user leaf -> UCT -> contract IMT
-                // root.
                 let expected_contract_state_tree_root =
-                    { self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id) };
-
-                let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(c.user_id, c.contract_id, c.key, self.write_epoch);
+                    self.get_other_user_contract_state_root::<H, F, D>(builder, dpn, c.user_id, c.contract_id);
+                let imt_ck = StateCommandCacheKey::new_imt_contains_other_user_contract(
+                    c.user_id,
+                    c.contract_id,
+                    c.base_offset,
+                    c.capacity,
+                    c.contract_state_tree_height,
+                    c.key,
+                    self.write_epoch,
+                );
                 if let Some(existing_result) = self.result_map.get(&imt_ck) {
                     existing_result.clone()
                 } else {
                     let height = dpn.resolve_target(c.contract_state_tree_height);
+                    let checked_height = Self::checked_state_height(builder, height);
                     let state_slot_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
+                    let sentinel_proof = VariableHeightMerkleProofGadget::add_virtual_to_full::<H, F, D>(builder, 32, Some(height));
                     let leaf = IMTLeafTargets::add_virtual_to(builder);
+                    let sentinel = IMTLeafTargets::add_virtual_to(builder);
                     let exists = builder.add_virtual_bool_target_safe();
-
+                    let query_key = HashOutTarget { elements: dpn.resolve_targets_sized::<4>(&c.key) };
+                    let (physical_base, map_capacity) = Self::verify_imt_map_bounds(
+                        builder,
+                        dpn.resolve_target(c.base_offset),
+                        dpn.resolve_target(c.capacity),
+                        checked_height,
+                    );
+                    let active = builder._true();
+                    let (virgin, count) = Self::constrain_authenticated_sentinel::<H, F, D>(
+                        builder,
+                        active,
+                        expected_contract_state_tree_root,
+                        physical_base,
+                        map_capacity,
+                        &sentinel,
+                        sentinel_proof.root,
+                        sentinel_proof.value,
+                        sentinel_proof.index,
+                    );
                     let leaf_hash = leaf.hash::<H, F, D>(builder);
-                    let zero_hash = builder.constant_hash(HashOut::ZERO);
-
-                    // Detect a fully-empty leaf preimage (empty IMT non-membership predecessor).
-                    let leaf_key_zero = builder.is_zero_hash(leaf.key);
-                    let leaf_value_zero = builder.is_zero_hash(leaf.value);
-                    let leaf_next_key_zero = builder.is_zero_hash(leaf.next_key);
-                    let leaf_next_index_zero = builder.is_zero(leaf.next_index);
-                    let leaf_key_and_value_zero = builder.and(leaf_key_zero, leaf_value_zero);
-                    let leaf_next_zero = builder.and(leaf_next_key_zero, leaf_next_index_zero);
-                    let leaf_is_empty = builder.and(leaf_key_and_value_zero, leaf_next_zero);
-
-                    let query_key = HashOutTarget {
-                        elements: [
-                            dpn.resolve_target(c.key[0]),
-                            dpn.resolve_target(c.key[1]),
-                            dpn.resolve_target(c.key[2]),
-                            dpn.resolve_target(c.key[3]),
-                        ],
-                    };
-
-                    // Membership branch: leaf.key == query_key
                     let key_eq = builder.is_equal_hash(leaf.key, query_key);
-
-                    // Non-membership branch: leaf.key < query_key && (query_key < leaf.next_key
-                    // || leaf.next_key == 0)
-                    let pred_lt_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
-                    let next_key_zero = builder.is_zero_hash(leaf.next_key);
-                    let query_lt_next = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
-                    let next_ok = builder.or(next_key_zero, query_lt_next);
-                    let non_member = builder.and(pred_lt_query, next_ok);
-
-                    let one = builder._true();
                     let not_exists = builder.not(exists);
-                    let empty_non_member = builder.and(not_exists, leaf_is_empty);
-                    let non_empty_case = builder.not(empty_non_member);
-                    // Mirror ContainsSelf: leaf must hash to mp.value unless this is the
-                    // empty-tree non-membership case, in which case the state slot is the
-                    // zero hash.
-                    builder.connect_hashes_if_true(non_empty_case, leaf_hash, state_slot_proof.value);
-                    builder.connect_hashes_if_true(empty_non_member, state_slot_proof.value, zero_hash);
-                    // exists => leaf.key == query_key
-                    builder.connect_if_true(exists, key_eq.target, one.target);
-                    // (!exists && !leaf_is_empty) => predecessor bracketing holds
-                    let non_empty_non_member = builder.and(not_exists, non_empty_case);
-                    builder.connect_if_true(non_empty_non_member, non_member.target, one.target);
-
+                    let initialized = builder.not(virgin);
+                    let initialized_absence = builder.and(not_exists, initialized);
+                    let virgin_absence = builder.and(not_exists, virgin);
                     builder.connect_hashes(state_slot_proof.root, expected_contract_state_tree_root);
-
+                    builder.connect_hashes_if_true(exists, leaf_hash, state_slot_proof.value);
+                    builder.connect_hashes_if_true(initialized_absence, leaf_hash, state_slot_proof.value);
+                    builder.connect_hashes_if_true(virgin_absence, state_slot_proof.value, builder.constant_hash(HashOut::ZERO));
+                    builder.connect_if_true(exists, key_eq.target, builder._true().target);
+                    builder.connect_if_true(virgin_absence, state_slot_proof.index, physical_base);
+                    Self::connect_query_nonzero(builder, active, query_key);
+                    Self::connect_index_in_open_interval(builder, exists, state_slot_proof.index, physical_base, count);
+                    Self::connect_successor_pair(builder, exists, leaf.next_key, leaf.next_index, physical_base, count);
+                    Self::connect_predecessor_role(
+                        builder,
+                        initialized_absence,
+                        &leaf,
+                        state_slot_proof.index,
+                        physical_base,
+                        count,
+                    );
+                    let predecessor_before_query = is_qhashout_lt::<F, D>(builder, leaf.key, query_key);
+                    let successor_absent = builder.is_zero_hash(leaf.next_key);
+                    let query_before_successor = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
+                    let successor_gap = builder.or(successor_absent, query_before_successor);
+                    let strict_absence = builder.and(predecessor_before_query, successor_gap);
+                    builder.connect_if_true(initialized_absence, strict_absence.target, builder._true().target);
+                    builder.connect_if_true(virgin, exists.target, builder.zero());
                     self.insert_imt_contains_other_user_gadget(
                         imt_ck,
                         IMTContainsOtherUserGadget {
                             state_slot_proof,
                             leaf,
                             exists: exists.target,
+                            sentinel_preimage: sentinel,
+                            sentinel_merkle_proof: sentinel_proof,
                         },
                     );
-
                     let result = vec![exists.target];
                     self.result_map.insert(imt_ck, result.clone());
                     result
@@ -2341,7 +2564,6 @@ impl StateReaderGadget {
 
 #[cfg(test)]
 mod tests {
-    use kvq::memory::simple::KVQSimpleMemoryBackingStore;
     use plonky2::{
         field::types::Field,
         hash::poseidon::PoseidonHash,
@@ -2353,9 +2575,12 @@ mod tests {
         },
     };
     use psy_client_common::data::qhashout::QHashOut;
-    use psy_client_data::qdata::{imt_contract_state::IMTContractStateLeaf, imt_proof::IMTContractStateUpdate};
+    use psy_client_data::qdata::imt_contract_state::IMTContractStateLeaf;
     use psy_common_circuit::traits::CreatableTarget;
-    use psy_crypto::hash::traits::hasher::{FieldQHasher, PoseidonHasher};
+    use psy_crypto::hash::{
+        merkle::{core::{DeltaMerkleProofCore, MerkleProofCore}, utils::simple_merkle_tree::SimpleMerkleTree},
+        traits::hasher::{FieldQHasher, PoseidonHasher},
+    };
     use psy_vm::dpn::ops::{
         op_types::{encode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType},
         state_cmd::data::{DPNStateCmd, DPNStateCmdSetIMTContractStateValue},
@@ -2366,606 +2591,234 @@ mod tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
-    type Store = KVQSimpleMemoryBackingStore;
-    type IMT = psy_client_data::models::imt::IndexedMerkleTree<Store, F, PoseidonHash>;
-    const TEST_TREE_HEIGHT: usize = 8;
+    type Tree = SimpleMerkleTree<PoseidonHash, QHashOut<F>>;
+    const HEIGHT: usize = 8;
+    const CAPACITY: u64 = 4;
 
-    fn dummy_hash(builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
-        HashOutTarget {
-            elements: [
-                builder.add_virtual_target(),
-                builder.add_virtual_target(),
-                builder.add_virtual_target(),
-                builder.add_virtual_target(),
-            ],
+    struct ThreeWrite {
+        predecessor_old: IMTContractStateLeaf<F>,
+        predecessor_new: IMTContractStateLeaf<F>,
+        member: IMTContractStateLeaf<F>,
+        sentinel_r0: IMTContractStateLeaf<F>,
+        sentinel_r2: IMTContractStateLeaf<F>,
+        sentinel_r3: IMTContractStateLeaf<F>,
+        predecessor_delta: DeltaMerkleProofCore<QHashOut<F>>,
+        member_delta: DeltaMerkleProofCore<QHashOut<F>>,
+        sentinel_delta: DeltaMerkleProofCore<QHashOut<F>>,
+        sentinel_proof: MerkleProofCore<QHashOut<F>>,
+    }
+
+    fn hashed(leaf: &IMTContractStateLeaf<F>) -> QHashOut<F> {
+        leaf.qfhash::<PoseidonHasher>()
+    }
+
+    fn zero_delta() -> DeltaMerkleProofCore<QHashOut<F>> {
+        DeltaMerkleProofCore {
+            old_root: QHashOut::ZERO,
+            old_value: QHashOut::ZERO,
+            new_root: QHashOut::ZERO,
+            new_value: QHashOut::ZERO,
+            index: 0,
+            siblings: vec![QHashOut::ZERO; HEIGHT],
         }
     }
 
-    fn new_test_dpn(builder: &mut CircuitBuilder<F, D>) -> SimpleDPNBuilder<F, D> {
-        SimpleDPNBuilder::new_with_contract_ctx(
-            Vec::new(),
-            builder.zero(),
-            builder.zero(),
-            builder.zero(),
-            builder.zero(),
-            builder.zero(),
-            dummy_hash(builder),
-            dummy_hash(builder),
-        )
+    fn virgin_insert(base: u64, key: QHashOut<F>, value: QHashOut<F>) -> ThreeWrite {
+        let mut tree = Tree::new(HEIGHT as u8);
+        let sentinel_proof = tree.get_leaf(base);
+        let member_index = base + 1;
+        let member = IMTContractStateLeaf::new(key, value, QHashOut::ZERO, F::ZERO);
+        let predecessor_new = IMTContractStateLeaf::new(QHashOut::ZERO, QHashOut::ZERO, key, F::from_canonical_u64(member_index));
+        let predecessor_delta = tree.set_leaf(base, hashed(&predecessor_new));
+        let member_delta = tree.set_leaf(member_index, hashed(&member));
+        let sentinel_r3 = IMTContractStateLeaf::new(QHashOut::ZERO, QHashOut::from_values(1, 0, 0, 0), key, F::from_canonical_u64(member_index));
+        let sentinel_delta = tree.set_leaf(base, hashed(&sentinel_r3));
+        ThreeWrite {
+            predecessor_old: IMTContractStateLeaf::default(),
+            predecessor_new,
+            member,
+            sentinel_r0: IMTContractStateLeaf::default(),
+            sentinel_r2: predecessor_new,
+            sentinel_r3,
+            predecessor_delta,
+            member_delta,
+            sentinel_delta,
+            sentinel_proof,
+        }
+    }
+
+    fn member_predecessor_insert(base: u64, first: QHashOut<F>, second: QHashOut<F>, value: QHashOut<F>) -> ThreeWrite {
+        let mut tree = Tree::new(HEIGHT as u8);
+        let first_member = IMTContractStateLeaf::new(first, QHashOut::from_values(1, 0, 0, 0), QHashOut::ZERO, F::ZERO);
+        let first_sentinel = IMTContractStateLeaf::new(QHashOut::ZERO, QHashOut::from_values(1, 0, 0, 0), first, F::from_canonical_u64(base + 1));
+        tree.set_leaf(base, hashed(&first_sentinel));
+        tree.set_leaf(base + 1, hashed(&first_member));
+        let sentinel_proof = tree.get_leaf(base);
+        let predecessor_new = first_member.with_new_next(second, F::from_canonical_u64(base + 2));
+        let member = IMTContractStateLeaf::new(second, value, QHashOut::ZERO, F::ZERO);
+        let predecessor_delta = tree.set_leaf(base + 1, hashed(&predecessor_new));
+        let member_delta = tree.set_leaf(base + 2, hashed(&member));
+        let sentinel_r3 = IMTContractStateLeaf::new(QHashOut::ZERO, QHashOut::from_values(2, 0, 0, 0), first, F::from_canonical_u64(base + 1));
+        let sentinel_delta = tree.set_leaf(base, hashed(&sentinel_r3));
+        ThreeWrite {
+            predecessor_old: first_member,
+            predecessor_new,
+            member,
+            sentinel_r0: first_sentinel,
+            sentinel_r2: first_sentinel,
+            sentinel_r3,
+            predecessor_delta,
+            member_delta,
+            sentinel_delta,
+            sentinel_proof,
+        }
+    }
+
+    fn reader(builder: &mut CircuitBuilder<F, D>, root: HashOut<F>) -> (SimpleDPNBuilder<F, D>, StateReaderGadget) {
+        let zero = builder.constant_hash(HashOut::ZERO);
+        let dpn = SimpleDPNBuilder::new_with_contract_ctx(Vec::new(), builder.zero(), builder.zero(), builder.zero(), builder.zero(), builder.zero(), HashOutTarget { elements: core::array::from_fn(|_| builder.add_virtual_target()) }, HashOutTarget { elements: core::array::from_fn(|_| builder.add_virtual_target()) });
+        let reader = StateReaderGadget::new(PsyCheckpointGlobalStateRootsGadget::create_virtual(builder), zero, zero, builder.constant_hash(root), HEIGHT, zero, HEIGHT, false, PsyCheckpointLeafStatsGadget::create_virtual(builder), zero);
+        (dpn, reader)
+    }
+
+    fn command(base: u64, capacity: u64) -> DPNStateCmd<u64> {
+        DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
+            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+            base_offset: base,
+            capacity,
+            key: core::array::from_fn(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, (i + 1) as u64)),
+            value: core::array::from_fn(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, (i + 5) as u64)),
+        })
+    }
+
+    fn push_inputs(builder: &mut CircuitBuilder<F, D>, dpn: &mut SimpleDPNBuilder<F, D>) -> Vec<Target> {
+        (0..9).map(|index| {
+            let target = builder.add_virtual_target();
+            dpn.push_external_target(index, target);
+            target
+        }).collect()
+    }
+
+    fn assign_inputs(pw: &mut PartialWitness<F>, targets: &[Target], key: QHashOut<F>, value: QHashOut<F>, condition: F) {
+        pw.set_target(targets[0], condition).unwrap();
+        for (target, limb) in targets[1..5].iter().copied().zip(key.0.elements) {
+            pw.set_target(target, limb).unwrap();
+        }
+        for (target, limb) in targets[5..9].iter().copied().zip(value.0.elements) {
+            pw.set_target(target, limb).unwrap();
+        }
+    }
+
+    fn assign_insert(pw: &mut PartialWitness<F>, gadget: &IMTSetGadget, write: &ThreeWrite) {
+        pw.set_bool_target(gadget.is_insert, true).unwrap();
+        gadget.update_old_leaf.set_witness(pw, &IMTContractStateLeaf::default()).unwrap();
+        gadget.update_new_leaf.set_witness(pw, &IMTContractStateLeaf::default()).unwrap();
+        gadget.update_delta_proof.set_witness_core_proof_q(pw, &zero_delta()).unwrap();
+        gadget.insert_predecessor_old_leaf.set_witness(pw, &write.predecessor_old).unwrap();
+        gadget.insert_predecessor_new_leaf.set_witness(pw, &write.predecessor_new).unwrap();
+        gadget.insert_new_leaf.set_witness(pw, &write.member).unwrap();
+        gadget.insert_predecessor_delta_proof.set_witness_core_proof_q(pw, &write.predecessor_delta).unwrap();
+        gadget.insert_new_leaf_delta_proof.set_witness_core_proof_q(pw, &write.member_delta).unwrap();
+        gadget.insert_sentinel_delta_proof.set_witness_core_proof_q(pw, &write.sentinel_delta).unwrap();
+        gadget.sentinel_preimage.set_witness(pw, &write.sentinel_r0).unwrap();
+        gadget.sentinel_merkle_proof.set_witness_generic(pw, F::from_canonical_u64(write.sentinel_proof.index), write.sentinel_proof.value, &write.sentinel_proof.siblings).unwrap();
+        gadget.sentinel_old_leaf.set_witness(pw, &write.sentinel_r2).unwrap();
+        gadget.sentinel_new_leaf.set_witness(pw, &write.sentinel_r3).unwrap();
+    }
+
+    fn prove_insert(base: u64, key: QHashOut<F>, value: QHashOut<F>, write: &ThreeWrite) {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let (mut dpn, mut state_reader) = reader(&mut builder, write.predecessor_delta.old_root.0);
+        let targets = push_inputs(&mut builder, &mut dpn);
+        let mut cmd = command(encode_indexed_op_id(DPNBuiltInDataType::Target, 100), encode_indexed_op_id(DPNBuiltInDataType::Target, 101));
+        dpn.process_var_def(&mut builder, &DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: 100, op_type: DPNOpType::Constant, inputs: vec![base] });
+        dpn.process_var_def(&mut builder, &DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: 101, op_type: DPNOpType::Constant, inputs: vec![CAPACITY] });
+        if let DPNStateCmd::SetIMTContractStateValue(set) = &mut cmd {
+            set.base_offset = encode_indexed_op_id(DPNBuiltInDataType::Target, 100);
+            set.capacity = encode_indexed_op_id(DPNBuiltInDataType::Target, 101);
+        }
+        state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+        builder.register_public_inputs(&state_reader.end_contract_state_root.elements);
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        assign_inputs(&mut pw, &targets, key, value, F::ONE);
+        assign_insert(&mut pw, &state_reader.imt_set_requests[0], write);
+        let proof = data.prove(pw).expect("three-write IMT insertion should prove");
+        assert_eq!(proof.public_inputs[0], write.sentinel_delta.new_root.0.elements[0]);
+        data.verify(proof).expect("three-write IMT insertion should verify");
     }
 
     #[test]
-    fn state_reader_imt_set_first_insert_proves() {
-        let store = Store::new();
-        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
-        let key = QHashOut::from_values(10, 0, 0, 0);
+    fn state_reader_imt_virgin_and_member_predecessor_insertions_prove() {
+        let first = QHashOut::from_values(10, 0, 0, 0);
         let value = QHashOut::from_values(100, 200, 300, 400);
+        prove_insert(1, first, value, &virgin_insert(1, first, value));
+        let second = QHashOut::from_values(30, 0, 0, 0);
+        prove_insert(1, second, value, &member_predecessor_insert(1, first, second, value));
+    }
 
-        let update = imt.insert(&store, key, value).unwrap();
-        let (predecessor_old_leaf, predecessor_new_leaf, new_leaf, predecessor_delta_proof, new_leaf_delta_proof) = match update {
-            IMTContractStateUpdate::Insert {
-                predecessor_old_preimage,
-                predecessor_new_preimage,
-                new_leaf_preimage,
-                predecessor_delta_proof,
-                new_leaf_delta_proof,
-            } => (
-                predecessor_old_preimage,
-                predecessor_new_preimage,
-                new_leaf_preimage,
-                predecessor_delta_proof,
-                new_leaf_delta_proof,
-            ),
-            _ => panic!("expected insert"),
-        };
-
-        let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config);
-        let mut dpn = new_test_dpn(&mut builder);
-
-        let condition_target = builder.add_virtual_target();
-        let key_targets: [Target; 4] = core::array::from_fn(|_| builder.add_virtual_target());
-        let value_targets: [Target; 4] = core::array::from_fn(|_| builder.add_virtual_target());
-        dpn.push_external_target(0, condition_target);
-        for (i, target) in key_targets.iter().copied().enumerate() {
-            dpn.push_external_target(i + 1, target);
+    #[test]
+    fn state_reader_imt_update_preserves_sentinel_count() {
+        let mut tree = Tree::new(HEIGHT as u8);
+        let key = QHashOut::from_values(10, 0, 0, 0);
+        let old = IMTContractStateLeaf::new(key, QHashOut::from_values(1, 0, 0, 0), QHashOut::ZERO, F::ZERO);
+        let sentinel = IMTContractStateLeaf::new(QHashOut::ZERO, QHashOut::from_values(1, 0, 0, 0), key, F::ONE);
+        tree.set_leaf(0, hashed(&sentinel));
+        tree.set_leaf(1, hashed(&old));
+        let updated = old.with_new_value(QHashOut::from_values(9, 0, 0, 0));
+        let update_delta = tree.set_leaf(1, hashed(&updated));
+        let sentinel_proof = tree.get_leaf(0);
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let (mut dpn, mut state_reader) = reader(&mut builder, update_delta.old_root.0);
+        let targets = push_inputs(&mut builder, &mut dpn);
+        dpn.process_var_def(&mut builder, &DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: 101, op_type: DPNOpType::Constant, inputs: vec![CAPACITY] });
+        state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &command(0, encode_indexed_op_id(DPNBuiltInDataType::Target, 101)));
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        assign_inputs(&mut pw, &targets, key, updated.value, F::ONE);
+        let gadget = &state_reader.imt_set_requests[0];
+        pw.set_bool_target(gadget.is_insert, false).unwrap();
+        gadget.update_old_leaf.set_witness(&mut pw, &old).unwrap();
+        gadget.update_new_leaf.set_witness(&mut pw, &updated).unwrap();
+        gadget.update_delta_proof.set_witness_core_proof_q(&mut pw, &update_delta).unwrap();
+        gadget.sentinel_preimage.set_witness(&mut pw, &sentinel).unwrap();
+        gadget.sentinel_merkle_proof.set_witness_generic(&mut pw, F::ZERO, sentinel_proof.value, &sentinel_proof.siblings).unwrap();
+        for leaf in [&gadget.insert_predecessor_old_leaf, &gadget.insert_predecessor_new_leaf, &gadget.insert_new_leaf, &gadget.sentinel_old_leaf, &gadget.sentinel_new_leaf] {
+            leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
         }
-        for (i, target) in value_targets.iter().copied().enumerate() {
-            dpn.push_external_target(i + 5, target);
+        for delta in [&gadget.insert_predecessor_delta_proof, &gadget.insert_new_leaf_delta_proof, &gadget.insert_sentinel_delta_proof] {
+            delta.set_witness_core_proof_q(&mut pw, &zero_delta()).unwrap();
         }
+        let proof = data.prove(pw).expect("ordinary IMT update should prove");
+        data.verify(proof).expect("ordinary IMT update should verify");
+    }
 
-        let start_root = builder.constant_hash(predecessor_delta_proof.old_root.0);
-        let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
-        let checkpoint_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
-        let checkpoint_tree_root = zero_hash;
-
-        let mut state_reader = StateReaderGadget::new(
-            checkpoint_roots,
-            zero_hash,
-            zero_hash,
-            start_root,
-            TEST_TREE_HEIGHT,
-            zero_hash,
-            TEST_TREE_HEIGHT,
-            false,
-            checkpoint_stats,
-            checkpoint_tree_root,
-        );
-
-        let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
-            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
-            base_offset: 0,
-            capacity: 0,
-            key: [
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 1),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 2),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 3),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 4),
-            ],
-            value: [
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 5),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 6),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 7),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 8),
-            ],
-        });
-
-        let result = state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+    #[test]
+    fn state_reader_imt_disabled_set_keeps_root_and_returns_zeros() {
+        let start = HashOut { elements: [F::from_canonical_u64(7), F::ZERO, F::ZERO, F::ZERO] };
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let (mut dpn, mut state_reader) = reader(&mut builder, start);
+        let targets = push_inputs(&mut builder, &mut dpn);
+        dpn.process_var_def(&mut builder, &DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: 101, op_type: DPNOpType::Constant, inputs: vec![CAPACITY] });
+        let result = state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &command(0, encode_indexed_op_id(DPNBuiltInDataType::Target, 101)));
         builder.register_public_inputs(&state_reader.end_contract_state_root.elements);
         builder.register_public_inputs(&result);
-
         let data = builder.build::<C>();
         let mut pw = PartialWitness::new();
-        pw.set_target(condition_target, F::ONE).unwrap();
-        for (target, value) in key_targets.iter().copied().zip(key.0.elements.into_iter()) {
-            pw.set_target(target, value).unwrap();
-        }
-        for (target, value) in value_targets.iter().copied().zip(value.0.elements.into_iter()) {
-            pw.set_target(target, value).unwrap();
-        }
-
+        assign_inputs(&mut pw, &targets, QHashOut::from_values(3, 0, 0, 0), QHashOut::from_values(4, 0, 0, 0), F::ZERO);
         let gadget = &state_reader.imt_set_requests[0];
-        pw.set_target(gadget.is_insert.target, F::ONE).unwrap();
-        pw.set_target(gadget.insert_has_predecessor.target, F::ONE).unwrap();
-        gadget.update_old_leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
-        gadget.update_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
-        gadget
-            .update_delta_proof
-            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
-            .unwrap();
-        gadget.insert_predecessor_old_leaf.set_witness(&mut pw, &predecessor_old_leaf).unwrap();
-        gadget.insert_predecessor_new_leaf.set_witness(&mut pw, &predecessor_new_leaf).unwrap();
-        gadget.insert_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
-        gadget
-            .insert_predecessor_delta_proof
-            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
-            .unwrap();
-        gadget
-            .insert_new_leaf_delta_proof
-            .set_witness_core_proof_q(&mut pw, &new_leaf_delta_proof)
-            .unwrap();
-
-        let proof = data.prove(pw).expect("state reader IMT first insert should prove");
-        assert_eq!(proof.public_inputs[0], new_leaf_delta_proof.new_root.0.elements[0]);
-        assert_eq!(proof.public_inputs[4], F::ZERO);
-        assert_eq!(proof.public_inputs[8], new_leaf.value.0.elements[0]);
-        data.verify(proof).expect("state reader IMT first insert should verify");
-    }
-
-    #[test]
-    fn state_reader_imt_set_from_hash_outputs_proves() {
-        let sender_user_id = F::from_canonical_u64(11);
-        let recipient = [
-            F::from_canonical_u64(21),
-            F::from_canonical_u64(22),
-            F::from_canonical_u64(23),
-            F::from_canonical_u64(24),
-            F::from_canonical_u64(25),
-            F::from_canonical_u64(26),
-            F::from_canonical_u64(27),
-            F::from_canonical_u64(28),
-        ];
-        let token = [
-            F::from_canonical_u64(31),
-            F::from_canonical_u64(32),
-            F::from_canonical_u64(33),
-            F::from_canonical_u64(34),
-            F::from_canonical_u64(35),
-            F::from_canonical_u64(36),
-            F::from_canonical_u64(37),
-            F::from_canonical_u64(38),
-        ];
-        let amount = [
-            F::from_canonical_u64(41),
-            F::from_canonical_u64(42),
-            F::from_canonical_u64(43),
-            F::from_canonical_u64(44),
-            F::from_canonical_u64(45),
-            F::from_canonical_u64(46),
-            F::from_canonical_u64(47),
-            F::from_canonical_u64(48),
-        ];
-        let nonce = [
-            F::from_canonical_u64(51),
-            F::from_canonical_u64(52),
-            F::from_canonical_u64(53),
-            F::from_canonical_u64(54),
-            F::from_canonical_u64(55),
-            F::from_canonical_u64(56),
-            F::from_canonical_u64(57),
-            F::from_canonical_u64(58),
-        ];
-        let destination_chain = F::from_canonical_u64(61);
-
-        let leaf_hash = PoseidonHasher::q_hash_many(
-            &core::iter::once(sender_user_id)
-                .chain(recipient)
-                .chain(token)
-                .chain(amount)
-                .chain(nonce)
-                .chain(core::iter::once(destination_chain))
-                .collect::<Vec<_>>(),
-        );
-        let record_key = PoseidonHasher::q_hash_many(&nonce);
-
-        let store = Store::new();
-        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
-        let update = imt.insert(&store, record_key, leaf_hash).unwrap();
-        let (predecessor_old_leaf, predecessor_new_leaf, new_leaf, predecessor_delta_proof, new_leaf_delta_proof) = match update {
-            IMTContractStateUpdate::Insert {
-                predecessor_old_preimage,
-                predecessor_new_preimage,
-                new_leaf_preimage,
-                predecessor_delta_proof,
-                new_leaf_delta_proof,
-            } => (
-                predecessor_old_preimage,
-                predecessor_new_preimage,
-                new_leaf_preimage,
-                predecessor_delta_proof,
-                new_leaf_delta_proof,
-            ),
-            _ => panic!("expected insert"),
-        };
-
-        let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config);
-        let mut dpn = new_test_dpn(&mut builder);
-
-        let mut external_targets = Vec::new();
-        for index in 0..35usize {
-            let target = builder.add_virtual_target();
-            dpn.push_external_target(index, target);
-            external_targets.push(target);
+        pw.set_bool_target(gadget.is_insert, false).unwrap();
+        for leaf in [&gadget.update_old_leaf, &gadget.update_new_leaf, &gadget.insert_predecessor_old_leaf, &gadget.insert_predecessor_new_leaf, &gadget.insert_new_leaf, &gadget.sentinel_preimage, &gadget.sentinel_old_leaf, &gadget.sentinel_new_leaf] {
+            leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
         }
-
-        let leaf_hash_op = DPNIndexedVarDef {
-            data_type: DPNBuiltInDataType::HashOut,
-            index: 0,
-            op_type: DPNOpType::HashNoPad,
-            inputs: (0..34).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
-        };
-        let record_key_op = DPNIndexedVarDef {
-            data_type: DPNBuiltInDataType::HashOut,
-            index: 1,
-            op_type: DPNOpType::HashNoPad,
-            inputs: (25..33).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
-        };
-        dpn.process_var_def(&mut builder, &leaf_hash_op);
-        dpn.process_var_def(&mut builder, &record_key_op);
-
-        for limb in 0..4usize {
-            let const_op = DPNIndexedVarDef {
-                data_type: DPNBuiltInDataType::Target,
-                index: 100 + limb,
-                op_type: DPNOpType::Constant,
-                inputs: vec![limb as u64],
-            };
-            dpn.process_var_def(&mut builder, &const_op);
-
-            let key_limb_op = DPNIndexedVarDef {
-                data_type: DPNBuiltInDataType::Target,
-                index: 200 + limb,
-                op_type: DPNOpType::TargetAt,
-                inputs: vec![
-                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 1),
-                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
-                ],
-            };
-            dpn.process_var_def(&mut builder, &key_limb_op);
-
-            let value_limb_op = DPNIndexedVarDef {
-                data_type: DPNBuiltInDataType::Target,
-                index: 204 + limb,
-                op_type: DPNOpType::TargetAt,
-                inputs: vec![
-                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0),
-                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
-                ],
-            };
-            dpn.process_var_def(&mut builder, &value_limb_op);
+        let opening = zero_delta();
+        gadget.sentinel_merkle_proof.set_witness_generic(&mut pw, F::ZERO, QHashOut::ZERO, &opening.siblings).unwrap();
+        for delta in [&gadget.update_delta_proof, &gadget.insert_predecessor_delta_proof, &gadget.insert_new_leaf_delta_proof, &gadget.insert_sentinel_delta_proof] {
+            delta.set_witness_core_proof_q(&mut pw, &opening).unwrap();
         }
-
-        let start_root = builder.constant_hash(predecessor_delta_proof.old_root.0);
-        let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
-        let checkpoint_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
-        let mut state_reader = StateReaderGadget::new(
-            checkpoint_roots,
-            zero_hash,
-            zero_hash,
-            start_root,
-            TEST_TREE_HEIGHT,
-            zero_hash,
-            TEST_TREE_HEIGHT,
-            false,
-            checkpoint_stats,
-            zero_hash,
-        );
-
-        let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
-            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 34),
-            base_offset: 0,
-            capacity: 0,
-            key: [
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 200),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 201),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 202),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 203),
-            ],
-            value: [
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 204),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 205),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 206),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 207),
-            ],
-        });
-        state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
-        builder.register_public_inputs(&state_reader.end_contract_state_root.elements);
-
-        let data = builder.build::<C>();
-        let mut pw = PartialWitness::new();
-        let external_values = core::iter::once(sender_user_id)
-            .chain(recipient)
-            .chain(token)
-            .chain(amount)
-            .chain(nonce)
-            .chain([destination_chain, F::ONE])
-            .collect::<Vec<_>>();
-        for (target, value) in external_targets.into_iter().zip(external_values.into_iter()) {
-            pw.set_target(target, value).unwrap();
-        }
-
-        let gadget = &state_reader.imt_set_requests[0];
-        pw.set_target(gadget.is_insert.target, F::ONE).unwrap();
-        pw.set_target(gadget.insert_has_predecessor.target, F::ZERO).unwrap();
-        gadget.update_old_leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
-        gadget.update_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
-        gadget
-            .update_delta_proof
-            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
-            .unwrap();
-        gadget.insert_predecessor_old_leaf.set_witness(&mut pw, &predecessor_old_leaf).unwrap();
-        gadget.insert_predecessor_new_leaf.set_witness(&mut pw, &predecessor_new_leaf).unwrap();
-        gadget.insert_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
-        gadget
-            .insert_predecessor_delta_proof
-            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
-            .unwrap();
-        gadget
-            .insert_new_leaf_delta_proof
-            .set_witness_core_proof_q(&mut pw, &new_leaf_delta_proof)
-            .unwrap();
-
-        let proof = data.prove(pw).expect("hash outputs feeding IMT set should prove");
-        assert_eq!(proof.public_inputs[0], new_leaf_delta_proof.new_root.0.elements[0]);
-        data.verify(proof).expect("hash outputs feeding IMT set should verify");
-    }
-
-    #[test]
-    fn state_reader_imt_set_with_namespaced_hash_key_proves() {
-        let sender_user_id = F::from_canonical_u64(11);
-        let recipient = [
-            F::from_canonical_u64(21),
-            F::from_canonical_u64(22),
-            F::from_canonical_u64(23),
-            F::from_canonical_u64(24),
-            F::from_canonical_u64(25),
-            F::from_canonical_u64(26),
-            F::from_canonical_u64(27),
-            F::from_canonical_u64(28),
-        ];
-        let token = [
-            F::from_canonical_u64(31),
-            F::from_canonical_u64(32),
-            F::from_canonical_u64(33),
-            F::from_canonical_u64(34),
-            F::from_canonical_u64(35),
-            F::from_canonical_u64(36),
-            F::from_canonical_u64(37),
-            F::from_canonical_u64(38),
-        ];
-        let amount = [
-            F::from_canonical_u64(41),
-            F::from_canonical_u64(42),
-            F::from_canonical_u64(43),
-            F::from_canonical_u64(44),
-            F::from_canonical_u64(45),
-            F::from_canonical_u64(46),
-            F::from_canonical_u64(47),
-            F::from_canonical_u64(48),
-        ];
-        let nonce = [
-            F::from_canonical_u64(51),
-            F::from_canonical_u64(52),
-            F::from_canonical_u64(53),
-            F::from_canonical_u64(54),
-            F::from_canonical_u64(55),
-            F::from_canonical_u64(56),
-            F::from_canonical_u64(57),
-            F::from_canonical_u64(58),
-        ];
-        let destination_chain = F::from_canonical_u64(61);
-        let namespace = F::from_canonical_u64(6);
-
-        let record_key = PoseidonHasher::q_hash_many(&nonce);
-        let namespaced_key = PoseidonHasher::q_hash_many(&core::iter::once(namespace).chain(record_key.0.elements).collect::<Vec<_>>());
-        let leaf_hash = PoseidonHasher::q_hash_many(
-            &core::iter::once(sender_user_id)
-                .chain(recipient)
-                .chain(token)
-                .chain(amount)
-                .chain(nonce)
-                .chain(core::iter::once(destination_chain))
-                .collect::<Vec<_>>(),
-        );
-
-        let store = Store::new();
-        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
-        let update = imt.insert(&store, namespaced_key, leaf_hash).unwrap();
-        let (predecessor_old_leaf, predecessor_new_leaf, new_leaf, predecessor_delta_proof, new_leaf_delta_proof) = match update {
-            IMTContractStateUpdate::Insert {
-                predecessor_old_preimage,
-                predecessor_new_preimage,
-                new_leaf_preimage,
-                predecessor_delta_proof,
-                new_leaf_delta_proof,
-            } => (
-                predecessor_old_preimage,
-                predecessor_new_preimage,
-                new_leaf_preimage,
-                predecessor_delta_proof,
-                new_leaf_delta_proof,
-            ),
-            _ => panic!("expected insert"),
-        };
-
-        let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config);
-        let mut dpn = new_test_dpn(&mut builder);
-
-        let mut external_targets = Vec::new();
-        for index in 0..35usize {
-            let target = builder.add_virtual_target();
-            dpn.push_external_target(index, target);
-            external_targets.push(target);
-        }
-
-        let record_key_op = DPNIndexedVarDef {
-            data_type: DPNBuiltInDataType::HashOut,
-            index: 0,
-            op_type: DPNOpType::HashNoPad,
-            inputs: (25..33).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
-        };
-        dpn.process_var_def(&mut builder, &record_key_op);
-
-        for limb in 0..4usize {
-            let const_op = DPNIndexedVarDef {
-                data_type: DPNBuiltInDataType::Target,
-                index: 100 + limb,
-                op_type: DPNOpType::Constant,
-                inputs: vec![limb as u64],
-            };
-            dpn.process_var_def(&mut builder, &const_op);
-
-            let record_key_limb_op = DPNIndexedVarDef {
-                data_type: DPNBuiltInDataType::Target,
-                index: 200 + limb,
-                op_type: DPNOpType::TargetAt,
-                inputs: vec![
-                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0),
-                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
-                ],
-            };
-            dpn.process_var_def(&mut builder, &record_key_limb_op);
-        }
-
-        let namespace_op = DPNIndexedVarDef {
-            data_type: DPNBuiltInDataType::Target,
-            index: 300,
-            op_type: DPNOpType::Constant,
-            inputs: vec![6],
-        };
-        dpn.process_var_def(&mut builder, &namespace_op);
-
-        let namespaced_key_op = DPNIndexedVarDef {
-            data_type: DPNBuiltInDataType::HashOut,
-            index: 1,
-            op_type: DPNOpType::HashNoPad,
-            inputs: core::iter::once(encode_indexed_op_id(DPNBuiltInDataType::Target, 300))
-                .chain((0..4).map(|limb| encode_indexed_op_id(DPNBuiltInDataType::Target, 200 + limb)))
-                .collect(),
-        };
-        dpn.process_var_def(&mut builder, &namespaced_key_op);
-
-        for limb in 0..4usize {
-            let namespaced_key_limb_op = DPNIndexedVarDef {
-                data_type: DPNBuiltInDataType::Target,
-                index: 220 + limb,
-                op_type: DPNOpType::TargetAt,
-                inputs: vec![
-                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 1),
-                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
-                ],
-            };
-            dpn.process_var_def(&mut builder, &namespaced_key_limb_op);
-        }
-
-        let leaf_hash_op = DPNIndexedVarDef {
-            data_type: DPNBuiltInDataType::HashOut,
-            index: 2,
-            op_type: DPNOpType::HashNoPad,
-            inputs: (0..34).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
-        };
-        dpn.process_var_def(&mut builder, &leaf_hash_op);
-
-        for limb in 0..4usize {
-            let value_limb_op = DPNIndexedVarDef {
-                data_type: DPNBuiltInDataType::Target,
-                index: 240 + limb,
-                op_type: DPNOpType::TargetAt,
-                inputs: vec![
-                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 2),
-                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
-                ],
-            };
-            dpn.process_var_def(&mut builder, &value_limb_op);
-        }
-
-        let start_root = builder.constant_hash(predecessor_delta_proof.old_root.0);
-        let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
-        let checkpoint_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
-        let mut state_reader = StateReaderGadget::new(
-            checkpoint_roots,
-            zero_hash,
-            zero_hash,
-            start_root,
-            TEST_TREE_HEIGHT,
-            zero_hash,
-            TEST_TREE_HEIGHT,
-            false,
-            checkpoint_stats,
-            zero_hash,
-        );
-
-        let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
-            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 34),
-            base_offset: 0,
-            capacity: 0,
-            key: [
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 220),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 221),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 222),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 223),
-            ],
-            value: [
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 240),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 241),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 242),
-                encode_indexed_op_id(DPNBuiltInDataType::Target, 243),
-            ],
-        });
-        state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
-        builder.register_public_inputs(&state_reader.end_contract_state_root.elements);
-
-        let data = builder.build::<C>();
-        let mut pw = PartialWitness::new();
-        let external_values = core::iter::once(sender_user_id)
-            .chain(recipient)
-            .chain(token)
-            .chain(amount)
-            .chain(nonce)
-            .chain([destination_chain, F::ONE])
-            .collect::<Vec<_>>();
-        for (target, value) in external_targets.into_iter().zip(external_values.into_iter()) {
-            pw.set_target(target, value).unwrap();
-        }
-
-        let gadget = &state_reader.imt_set_requests[0];
-        pw.set_target(gadget.is_insert.target, F::ONE).unwrap();
-        pw.set_target(gadget.insert_has_predecessor.target, F::ONE).unwrap();
-        gadget.update_old_leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
-        gadget.update_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
-        gadget
-            .update_delta_proof
-            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
-            .unwrap();
-        gadget.insert_predecessor_old_leaf.set_witness(&mut pw, &predecessor_old_leaf).unwrap();
-        gadget.insert_predecessor_new_leaf.set_witness(&mut pw, &predecessor_new_leaf).unwrap();
-        gadget.insert_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
-        gadget
-            .insert_predecessor_delta_proof
-            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
-            .unwrap();
-        gadget
-            .insert_new_leaf_delta_proof
-            .set_witness_core_proof_q(&mut pw, &new_leaf_delta_proof)
-            .unwrap();
-
-        let proof = data.prove(pw).expect("namespaced hash key feeding IMT set should prove");
-        assert_eq!(proof.public_inputs[0], new_leaf_delta_proof.new_root.0.elements[0]);
-        data.verify(proof).expect("namespaced hash key feeding IMT set should verify");
+        let proof = data.prove(pw).expect("disabled IMT set should prove");
+        assert_eq!(&proof.public_inputs[..4], &start.elements);
+        assert!(proof.public_inputs[4..].iter().all(|limb| *limb == F::ZERO));
+        data.verify(proof).expect("disabled IMT set should verify");
     }
 }

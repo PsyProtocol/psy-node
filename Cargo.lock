@@ -3955,6 +3955,7 @@ dependencies = [
 [[package]]
 name = "gnark-plonky2-verifier-ffi"
 version = "0.1.0"
+source = "git+ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git?rev=35fd12a8117e53939703df6d7b98567933e65159#35fd12a8117e53939703df6d7b98567933e65159"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -3965,6 +3966,7 @@ dependencies = [
 [[package]]
 name = "gnark-plonky2-wrapper"
 version = "0.1.0"
+source = "git+ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git?rev=35fd12a8117e53939703df6d7b98567933e65159#35fd12a8117e53939703df6d7b98567933e65159"
 dependencies = [
  "anyhow",
  "ff",
@@ -7688,6 +7690,7 @@ dependencies = [
  "psy_node_nats",
  "psy_node_redis",
  "psy_node_scylla",
+ "psy_plonky2_basic_helpers",
  "psy_plonky2_circuits",
  "psy_prover",
  "psy_serialize",
@@ -8624,6 +8627,7 @@ dependencies = [
  "console_error_panic_hook",
  "dashmap",
  "dotenv",
+ "fs2",
  "futures-util",
  "hashbrown 0.14.5",
  "hex",

@@ -104,14 +104,21 @@ pub enum IMTContractStateUpdate<F: RichField> {
         new_preimage: IMTContractStateLeaf<F>,
         delta_proof: DeltaMerkleProofCore<QHashOut<F>>,
     },
-    /// Key insertion: new key added, predecessor pointers updated.
-    /// Produces two delta merkle proofs applied sequentially.
+    /// Key insertion: predecessor splice, member insertion, then sentinel count.
+    /// Produces three delta merkle proofs applied sequentially.
+    /// Discriminant 1 is unchanged.
     Insert {
         predecessor_old_preimage: IMTContractStateLeaf<F>,
         predecessor_new_preimage: IMTContractStateLeaf<F>,
         new_leaf_preimage: IMTContractStateLeaf<F>,
         predecessor_delta_proof: DeltaMerkleProofCore<QHashOut<F>>,
         new_leaf_delta_proof: DeltaMerkleProofCore<QHashOut<F>>,
+        /// Sentinel at R2, after the member write and any predecessor splice at B.
+        sentinel_old_preimage: IMTContractStateLeaf<F>,
+        /// Sentinel at R3, after the final count write.
+        sentinel_new_preimage: IMTContractStateLeaf<F>,
+        /// Third delta, R2 to R3. Its new root is the insertion's final root.
+        sentinel_delta_proof: DeltaMerkleProofCore<QHashOut<F>>,
     },
 }
 
@@ -128,8 +135,33 @@ impl<F: RichField> IMTContractStateUpdate<F> {
     pub fn new_root(&self) -> QHashOut<F> {
         match self {
             IMTContractStateUpdate::Update { delta_proof, .. } => delta_proof.new_root,
-            IMTContractStateUpdate::Insert { new_leaf_delta_proof, .. } => new_leaf_delta_proof.new_root,
+            IMTContractStateUpdate::Insert { sentinel_delta_proof, .. } => sentinel_delta_proof.new_root,
         }
+    }
+
+    /// Validate an untrusted serialized insertion before it is published or accepted.
+    ///
+    /// Predecessor, member, and sentinel deltas must join root to root and use one path height.
+    pub fn validate_imt_update(&self) -> anyhow::Result<()> {
+        if let IMTContractStateUpdate::Insert {
+            predecessor_delta_proof,
+            new_leaf_delta_proof,
+            sentinel_delta_proof,
+            ..
+        } = self
+        {
+            if predecessor_delta_proof.new_root != new_leaf_delta_proof.old_root
+                || new_leaf_delta_proof.new_root != sentinel_delta_proof.old_root
+            {
+                anyhow::bail!("IMT insert delta roots are not adjacent");
+            }
+            if predecessor_delta_proof.siblings.len() != new_leaf_delta_proof.siblings.len()
+                || new_leaf_delta_proof.siblings.len() != sentinel_delta_proof.siblings.len()
+            {
+                anyhow::bail!("IMT insert delta path heights differ");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -565,5 +597,69 @@ mod tests {
             ],
         };
         assert!(history.ensure_basic_consistency(None).is_err());
+    }
+
+    fn delta(old_root: u64, new_root: u64, siblings: usize) -> DeltaMerkleProofCore<QHashOut<F>> {
+        DeltaMerkleProofCore {
+            old_root: QHashOut::from_values(old_root, 0, 0, 0),
+            old_value: QHashOut::ZERO,
+            new_root: QHashOut::from_values(new_root, 0, 0, 0),
+            new_value: QHashOut::ZERO,
+            index: 0,
+            siblings: vec![QHashOut::ZERO; siblings],
+        }
+    }
+
+    fn chained_insert(heights: [usize; 3]) -> IMTContractStateUpdate<F> {
+        let leaf = IMTContractStateLeaf::sentinel();
+        IMTContractStateUpdate::Insert {
+            predecessor_old_preimage: leaf,
+            predecessor_new_preimage: leaf,
+            new_leaf_preimage: leaf,
+            predecessor_delta_proof: delta(3, 4, heights[0]),
+            new_leaf_delta_proof: delta(4, 5, heights[1]),
+            sentinel_old_preimage: leaf,
+            sentinel_new_preimage: leaf,
+            sentinel_delta_proof: delta(5, 6, heights[2]),
+        }
+    }
+
+    #[test]
+    fn insert_bincode_appends_sentinel_after_member_fields() {
+        let insert = chained_insert([2, 2, 2]);
+        let bytes = bincode::serialize(&insert).unwrap();
+        let restored: IMTContractStateUpdate<F> = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored, insert);
+        assert_eq!(insert.new_root(), QHashOut::from_values(6, 0, 0, 0));
+        assert_eq!(insert.old_root(), QHashOut::from_values(3, 0, 0, 0));
+
+        let update = IMTContractStateUpdate::Update {
+            old_preimage: IMTContractStateLeaf::sentinel(),
+            new_preimage: IMTContractStateLeaf::sentinel(),
+            delta_proof: delta(1, 2, 1),
+        };
+        let update_bytes = bincode::serialize(&update).unwrap();
+        // Serde's externally tagged enum keeps distinct variant names; insert is not update.
+        assert_ne!(bytes, update_bytes);
+        assert!(bincode::deserialize::<IMTContractStateUpdate<F>>(&bytes[..bytes.len() / 2]).is_err());
+    }
+
+    #[test]
+    fn validate_imt_update_rejects_broken_join_and_unequal_heights() {
+        assert!(chained_insert([2, 2, 2]).validate_imt_update().is_ok());
+
+        let mut broken = chained_insert([2, 2, 2]);
+        if let IMTContractStateUpdate::Insert { sentinel_delta_proof, .. } = &mut broken {
+            sentinel_delta_proof.old_root = QHashOut::from_values(9, 0, 0, 0);
+        }
+        assert!(broken.validate_imt_update().is_err());
+        assert!(chained_insert([2, 3, 2]).validate_imt_update().is_err());
+        assert!(IMTContractStateUpdate::Update {
+            old_preimage: IMTContractStateLeaf::sentinel(),
+            new_preimage: IMTContractStateLeaf::sentinel(),
+            delta_proof: delta(1, 2, 0),
+        }
+        .validate_imt_update()
+        .is_ok());
     }
 }

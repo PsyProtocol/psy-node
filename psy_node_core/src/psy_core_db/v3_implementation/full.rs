@@ -4040,7 +4040,7 @@ impl<
         user_id: u64,
         contract_id: u64,
         key: &N::QHash,
-    ) -> anyhow::Result<(u64, IMTContractStateLeaf<N::F, N::QHash>)> {
+    ) -> anyhow::Result<Option<(u64, IMTContractStateLeaf<N::F, N::QHash>)>> {
         use parth_core::data::serializable::QPDSerializable;
         use parth_core::felt::ToU64Value;
 
@@ -4076,19 +4076,26 @@ impl<
                     )
                     .await?;
 
-                if let Some((_, _, leaf_value, next_key, next_index)) = leaf_result {
-                    let key = N::QHash::from_bytes(&leaf_key)?;
-                    let value = N::QHash::from_bytes(&leaf_value)?;
-                    let next_key_hash = N::QHash::from_bytes(&next_key)?;
-                    let next_index_felt = N::F::from_owned_u64(next_index as u64);
+                let (_, _, leaf_value, next_key, next_index) = leaf_result.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "IMT predecessor leaf missing: tree_id={}, tree_sub_id={}, leaf_index={}, checkpoint_id={}",
+                        user_id,
+                        contract_id,
+                        leaf_index,
+                        checkpoint_id,
+                    )
+                })?;
+                let key = N::QHash::from_bytes(&leaf_key)?;
+                let value = N::QHash::from_bytes(&leaf_value)?;
+                let next_key_hash = N::QHash::from_bytes(&next_key)?;
+                let next_index_felt = N::F::from_owned_u64(next_index as u64);
 
-                    return Ok((leaf_index as u64, IMTContractStateLeaf {
-                        key,
-                        value,
-                        next_key: next_key_hash,
-                        next_index: next_index_felt,
-                    }));
-                }
+                return Ok(Some((leaf_index as u64, IMTContractStateLeaf {
+                    key,
+                    value,
+                    next_key: next_key_hash,
+                    next_index: next_index_felt,
+                })));
             }
         }
 
@@ -4117,19 +4124,26 @@ impl<
                         )
                         .await?;
 
-                    if let Some((_, _, leaf_value, next_key, next_index)) = leaf_result {
-                        let key = N::QHash::from_bytes(leaf_key)?;
-                        let value = N::QHash::from_bytes(&leaf_value)?;
-                        let next_key_hash = N::QHash::from_bytes(&next_key)?;
-                        let next_index_felt = N::F::from_owned_u64(next_index as u64);
+                    let (_, _, leaf_value, next_key, next_index) = leaf_result.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "IMT predecessor leaf missing: tree_id={}, tree_sub_id={}, leaf_index={}, checkpoint_id={}",
+                            user_id,
+                            contract_id,
+                            leaf_index,
+                            checkpoint_id,
+                        )
+                    })?;
+                    let key = N::QHash::from_bytes(leaf_key)?;
+                    let value = N::QHash::from_bytes(leaf_value)?;
+                    let next_key_hash = N::QHash::from_bytes(next_key)?;
+                    let next_index_felt = N::F::from_owned_u64(*next_index as u64);
 
-                        return Ok((*leaf_index as u64, IMTContractStateLeaf {
-                            key,
-                            value,
-                            next_key: next_key_hash,
-                            next_index: next_index_felt,
-                        }));
-                    }
+                    return Ok(Some((*leaf_index as u64, IMTContractStateLeaf {
+                        key,
+                        value,
+                        next_key: next_key_hash,
+                        next_index: next_index_felt,
+                    })));
                 }
             }
         }
@@ -4158,22 +4172,29 @@ impl<
                         checkpoint_id as i64,
                     )
                     .await?;
-                if let Some((_, leaf_key, leaf_value, next_key, next_index)) = leaf_result {
-                    let key = N::QHash::from_bytes(&leaf_key)?;
-                    let value = N::QHash::from_bytes(&leaf_value)?;
-                    let next_key_hash = N::QHash::from_bytes(&next_key)?;
-                    let next_index_felt = N::F::from_owned_u64(next_index as u64);
-                    return Ok((leaf_index as u64, IMTContractStateLeaf {
-                        key,
-                        value,
-                        next_key: next_key_hash,
-                        next_index: next_index_felt,
-                    }));
-                }
+                let (_, leaf_key, leaf_value, next_key, next_index) = leaf_result.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "IMT predecessor leaf missing: tree_id={}, tree_sub_id={}, leaf_index={}, checkpoint_id={}",
+                        user_id,
+                        contract_id,
+                        leaf_index,
+                        checkpoint_id,
+                    )
+                })?;
+                let key = N::QHash::from_bytes(&leaf_key)?;
+                let value = N::QHash::from_bytes(&leaf_value)?;
+                let next_key_hash = N::QHash::from_bytes(&next_key)?;
+                let next_index_felt = N::F::from_owned_u64(next_index as u64);
+                return Ok(Some((leaf_index as u64, IMTContractStateLeaf {
+                    key,
+                    value,
+                    next_key: next_key_hash,
+                    next_index: next_index_felt,
+                })));
             }
         }
 
-        anyhow::bail!("No predecessor found for key")
+        Ok(None)
     }
 
     async fn contract_state_imt_get_next_append_index(&self, user_id: u64, contract_id: u64) -> anyhow::Result<u64> {

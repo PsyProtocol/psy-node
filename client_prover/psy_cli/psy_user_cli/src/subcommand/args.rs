@@ -566,13 +566,15 @@ pub struct ClaimRewardsArgs {
     /// Path to JSON file containing job IDs
     #[clap(long, default_value = "worker.backup")]
     pub jobs_file: String,
-    /// Write a versioned, reusable JSON reward summary to this path.
-    #[clap(long)]
-    pub summary_output: Option<String>,
-    /// Generate the reward summary without loading a wallet or submitting a
-    /// transaction.
-    #[clap(long, requires = "summary_output")]
-    pub summary_only: bool,
+    /// Ethereum JSON-RPC used to read the configured payer root
+    #[clap(long, env)]
+    pub l1_rpc_url: String,
+    /// Fixed hexadecimal block tag for the payer root read
+    #[clap(long, env)]
+    pub l1_block: String,
+    /// Path to one reward consumption state file, outside keystore storage
+    #[clap(long, env)]
+    pub consumed_state: String,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]
@@ -725,7 +727,7 @@ pub struct PrivateTransferArgs {
     pub amount: u64,
     #[clap(long, alias = "owner")]
     pub receiver: Option<String>,
-    #[clap(long, default_value = "2147483649")]
+    #[clap(long, default_value = "0")]
     pub note_root_slot: u64,
     #[clap(long, default_value_t = u64::MAX)]
     pub checkpoint_id: u64,
@@ -941,10 +943,6 @@ pub struct ClaimWithdrawalArgs {
     /// inputs are auto-left-padded to bytes32)
     #[clap(long, env)]
     pub recipient: String,
-    /// L1 token address (20-byte EVM address or 32-byte hex; 20-byte inputs
-    /// are auto-left-padded to bytes32)
-    #[clap(long, env)]
-    pub token_address: String,
     /// Withdrawal amount (wei)
     #[clap(long, env)]
     pub amount: String,

@@ -1,12 +1,12 @@
 # Bridge Common Operations
 
-This repository-only developer runbook covers local-devnet deposit, claim, withdrawal, and relayer settlement alongside [common operations](common-operations.md).
+This repository-only developer runbook covers local-devnet deposit, claim, withdrawal, and relayer claim alongside [common operations](common-operations.md).
 
 > Repository-only bridge runbook. Generic wallet, registration, and PSY funding procedures are owned by [`docs/src/dev/common-operations.md`](common-operations.md).
 
 ## Abstract
 
-This guide is the executable local-devnet procedure for one L1 deposit, one L2 claim-deposit, one L2 withdrawal, and relayer settlement. Run every command from `<repo-root>`. Replace only angle-bracket values. Never place a real private key or wallet password in this document, a result file, or a shell history shared with other users.
+This guide is the executable local-devnet procedure for one L1 deposit, one L2 claim-deposit, one L2 withdrawal, and relayer claim. Run every command from `<repo-root>`. Replace only angle-bracket values. Never place a real private key or wallet password in this document, a result file, or a shell history shared with other users.
 
 Related: [`docs/src/dev/devnet_lifecycle.md`](devnet_lifecycle.md) for startup and shutdown; [`docs/src/dev/deposit-withdrawal.md`](deposit-withdrawal.md) for bridge architecture.
 
@@ -485,7 +485,7 @@ CLEARED_JSON="$(cast call "$BRIDGE" 'pendingWithdrawals(bytes32)(address,address
 test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 ```
 
-`claimedNullifiers(nonce) == true` proves registration/idempotency. Recipient balance increase plus cleared `pendingWithdrawals[nonce]` prove settlement. `claimPendingWithdrawal` enforces `claimableAt`, deletes the pending entry, and then transfers tokens (`psy-contracts/src/Bridge.sol:825-859`).
+`claimedNullifiers(nonce) == true` proves registration/idempotency. Recipient balance increase plus cleared `pendingWithdrawals[nonce]` prove the claim. `claimPendingWithdrawal` enforces `claimableAt`, deletes the pending entry, and then transfers tokens (`psy-contracts/src/Bridge.sol:825-859`).
 
 ## 12. Observable-State Matrix
 
@@ -502,7 +502,7 @@ test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 | Deposit indexed as claimed          | services                                        | matching item has `claimed: true`                                                            | `GET /api/v1/get/bridge/deposits?shield_address=<bytes32>` |
 | L2 withdrawal                       | user EndCap                                     | `withdraw.json.status == "confirmed"`                                                        | result file                                                |
 | Relayer withdrawal registration     | relayer L2 EndCap and L1 transaction            | finalization cursor increases; `claimedNullifiers(nonce) == true`; pending amount is nonzero | StateManager and Bridge views                              |
-| User L1 settlement                  | user L1 transaction                             | recipient balance rises; pending amount becomes zero                                         | `claimPendingWithdrawal`, Bridge and token views           |
+| User L1 claim                  | user L1 transaction                             | recipient balance rises; pending amount becomes zero                                         | `claimPendingWithdrawal`, Bridge and token views           |
 
 Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-proof routes (`../psy-services/src/api/server.rs:135-153`, `../psy-services/src/api/server.rs:318-345`). Deposit `claimed` is matched per deposit identity, not inferred from counts (`../psy-services/src/api/handlers/bridge.rs:1331-1359`, `../psy-services/src/api/handlers/bridge.rs:1431-1451`). For direct RPC probes, use `psy_get_latest_checkpoint_id` and `psy_get_imt_leaf_index_for_key`; query the realm tip only, never a coordinator-derived stale checkpoint (`client_prover/psy_provider/src/request.rs:82-87`, `client_prover/psy_provider/src/request.rs:257-265`).
 
@@ -532,7 +532,7 @@ Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-p
 | `InvalidProvenChainIndex()`                                                                                                                                                 | Finalize proof targets the wrong Bridge chain index                               | Correct the relayer deployment/network configuration                                                                                 |
 | `InvalidCheckpointContinuity()`                                                                                                                                             | Finalize proof does not continue from L1 finalized state                          | Discard the stale proof and let the daemon rebuild from `lastFinalizedCheckpointId + 1`                                              |
 | `NullifierAlreadyClaimed()` or relayer `already_claimed_count > 0`                                                                                                          | Withdrawal registration already happened                                          | Require `claimedNullifiers(nonce) == true`, then inspect/settle the pending withdrawal                                               |
-| Recipient balance does not rise after a successful pending claim                                                                                                            | Settlement transfer failed or token balance is insufficient                       | Inspect the pending entry, receipt, and Bridge token balance; do not label it proof-not-ready                                        |
+| Recipient balance does not rise after a successful pending claim                                                                                                            | Claim transfer failed or token balance is insufficient                       | Inspect the pending entry, receipt, and Bridge token balance; do not label it proof-not-ready                                        |
 
 The deposit proof response reasons are stable machine-readable values (`../psy-services/src/api/handlers/bridge.rs:1555-1721`). StateManager exposes the exact finalize errors (`psy-contracts/src/StateManager.sol:63-76`, `psy-contracts/src/StateManager.sol:173-212`).
 

@@ -3,6 +3,7 @@ import type { DPNCheckpointGlobalStateRootsWitness } from "./DPNCheckpointGlobal
 import type { DPNCheckpointLeafStatsWitness } from "./DPNCheckpointLeafStatsWitness";
 import type { DPNClearEntireTreeWitness } from "./DPNClearEntireTreeWitness";
 import type { DPNContractLeafWitness } from "./DPNContractLeafWitness";
+import type { DPNIMTContainsOtherUserWitness } from "./DPNIMTContainsOtherUserWitness";
 import type { DPNIMTContainsWitness } from "./DPNIMTContainsWitness";
 import type { DPNIMTOtherUserReadWitness } from "./DPNIMTOtherUserReadWitness";
 import type { DPNIMTReadWitness } from "./DPNIMTReadWitness";
@@ -14,4 +15,4 @@ import type { DeltaMerkleProofCore } from "./DeltaMerkleProofCore";
 import type { MerkleProofCore } from "./MerkleProofCore";
 import type { QHashOut } from "./QHashOut";
 
-export type DPNStateCmdWitness = { "MerkleProof": MerkleProofCore<QHashOut> } | { "DeltaMerkleProof": DeltaMerkleProofCore } | { "MerkleProofArray": Array<MerkleProofCore<QHashOut>> } | { "DeltaMerkleProofArray": Array<DeltaMerkleProofCore> } | { "ReadOtherUserContractState": DPNReadOtherUserContractStateLeafMerkleProof } | { "InvokeExternalContractFunctionDeferred": DPNInvokeDeferredMethodCallWitness } | { "CheckpointLeafStats": DPNCheckpointLeafStatsWitness } | { "CheckpointGlobalStateRoots": DPNCheckpointGlobalStateRootsWitness } | { "ClearEntireTree": DPNClearEntireTreeWitness } | { "ContractLeaf": DPNContractLeafWitness } | { "IMTSet": DPNIMTSetWitness } | { "IMTContains": DPNIMTContainsWitness } | { "IMTRead": DPNIMTReadWitness } | { "IMTSelfUserExternalRead": DPNIMTSelfUserExternalReadWitness } | { "IMTOtherUserRead": DPNIMTOtherUserReadWitness } | { "TargetArray": Array<bigint> } | { "TargetArray2D": Array<Array<bigint>> };
+export type DPNStateCmdWitness = { "MerkleProof": MerkleProofCore<QHashOut> } | { "DeltaMerkleProof": DeltaMerkleProofCore } | { "MerkleProofArray": Array<MerkleProofCore<QHashOut>> } | { "DeltaMerkleProofArray": Array<DeltaMerkleProofCore> } | { "ReadOtherUserContractState": DPNReadOtherUserContractStateLeafMerkleProof } | { "InvokeExternalContractFunctionDeferred": DPNInvokeDeferredMethodCallWitness } | { "CheckpointLeafStats": DPNCheckpointLeafStatsWitness } | { "CheckpointGlobalStateRoots": DPNCheckpointGlobalStateRootsWitness } | { "ClearEntireTree": DPNClearEntireTreeWitness } | { "ContractLeaf": DPNContractLeafWitness } | { "IMTSet": DPNIMTSetWitness } | { "IMTContains": DPNIMTContainsWitness } | { "IMTContainsOtherUser": DPNIMTContainsOtherUserWitness } | { "IMTRead": DPNIMTReadWitness } | { "IMTSelfUserExternalRead": DPNIMTSelfUserExternalReadWitness } | { "IMTOtherUserRead": DPNIMTOtherUserReadWitness } | { "TargetArray": Array<bigint> } | { "TargetArray2D": Array<Array<bigint>> };

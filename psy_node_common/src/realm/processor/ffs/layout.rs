@@ -186,15 +186,16 @@ where
         } else {
             first_key_index.insert(key_id, leaf_index);
         }
-        if let Some((first_key, first_new)) = first.get(&id) {
-            if is_new_key && !first_new_keys.contains(&key_id) {
-                anyhow::bail!("InvalidStateUpdates: duplicate IMT key changed derived next fields");
-            }
-            if !*first_new && is_new_key {
+        if let Some((first_key, slot_born)) = first.get(&id) {
+            if *slot_born || (is_new_key && first_new_keys.contains(&key_id)) {
                 anyhow::bail!("InvalidStateUpdates: duplicate IMT key changed derived next fields");
             }
             if *first_key != leaf_key {
                 anyhow::bail!("InvalidStateUpdates: duplicate IMT key changed derived next fields");
+            }
+            if is_new_key {
+                first.insert(id, (leaf_key, true));
+                first_new_keys.insert(key_id);
             }
         } else {
             first.insert(id, (leaf_key, is_new_key));
@@ -322,7 +323,7 @@ mod tests {
             1, 0, 3, &first_hash, &first_key, &first_value, &first_next_key, 0, false,
         );
         let second_entry = psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
-            1, 0, 3, &first_hash, &first_key, &first_value, &first_next_key, 7, true,
+            1, 0, 3, &first_hash, &first_key, &first_value, &first_next_key, 7, false,
         );
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&first_entry);
@@ -401,5 +402,92 @@ mod tests {
             .expect_err("terminal IMT next_index=0 with nonzero next_key must fail");
         assert!(error.to_string().contains("InvalidStateUpdates"), "{error}");
         assert!(error.to_string().contains("terminal next_key"), "{error}");
+    }
+
+    fn imt_entry(
+        index: u64,
+        key: [u8; 32],
+        value: [u8; 32],
+        next_key: [u8; 32],
+        next_index: u64,
+        is_new_key: bool,
+    ) -> Vec<u8> {
+        let leaf = IMTContractStateLeaf::<PGoldilocksFelt, PGoldilocksHash> {
+            key: PGoldilocksHash::from_owned_32bytes(key),
+            value: PGoldilocksHash::from_owned_32bytes(value),
+            next_key: PGoldilocksHash::from_owned_32bytes(next_key),
+            next_index: parth_core::felt::FromPrimitiveValuesFelt::from_u64_value(next_index),
+        };
+        let leaf_hash = leaf.qfhash::<PoseidonHasher>();
+        psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            1,
+            0,
+            index,
+            &leaf_hash,
+            &PGoldilocksHash::from_owned_32bytes(key),
+            &PGoldilocksHash::from_owned_32bytes(value),
+            &PGoldilocksHash::from_owned_32bytes(next_key),
+            next_index,
+            is_new_key,
+        )
+        .to_vec()
+    }
+
+    fn expect_imt(bytes: &[u8], ok: bool) {
+        let result = require_imt_leaf_ffs_consistency::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(bytes);
+        if ok {
+            result.expect("shaped IMT birth stream must pass");
+        } else {
+            let error = result.expect_err("malformed IMT birth stream must fail");
+            assert!(error.to_string().contains("InvalidStateUpdates"), "{error}");
+        }
+    }
+
+    #[test]
+    fn imt_birth_is_last_row_for_its_slot_and_key() {
+        let update_key = [0x22u8; 32];
+        let birth_key = [0x55u8; 32];
+        let sentinel_key = [0u8; 32];
+        let value = [0x33u8; 32];
+        let zero = [0u8; 32];
+        let born = imt_entry(3, birth_key, value, zero, 0, true);
+        let updated = imt_entry(3, birth_key, [0x66u8; 32], zero, 0, false);
+        let sentinel = imt_entry(0, sentinel_key, [0x01u8; 32], birth_key, 3, false);
+        let predecessor = imt_entry(1, update_key, value, birth_key, 3, false);
+        let mut shaped = Vec::new();
+        shaped.extend_from_slice(&updated);
+        shaped.extend_from_slice(&sentinel);
+        shaped.extend_from_slice(&predecessor);
+        shaped.extend_from_slice(&born);
+        expect_imt(&shaped, true);
+
+        let mut double_birth = born.clone();
+        double_birth.extend_from_slice(&born);
+        expect_imt(&double_birth, false);
+
+        let mut older_after_birth = born.clone();
+        older_after_birth.extend_from_slice(&updated);
+        expect_imt(&older_after_birth, false);
+
+        let reassigned = imt_entry(3, update_key, value, zero, 0, false);
+        let mut key_reassigned = updated.clone();
+        key_reassigned.extend_from_slice(&reassigned);
+        expect_imt(&key_reassigned, false);
+
+        let second_index = imt_entry(9, birth_key, value, zero, 0, false);
+        let mut two_indices = born.clone();
+        two_indices.extend_from_slice(&second_index);
+        expect_imt(&two_indices, false);
+
+        let other_key = imt_entry(3, update_key, value, zero, 0, true);
+        let mut same_index_new_key = born.clone();
+        same_index_new_key.extend_from_slice(&other_key);
+        expect_imt(&same_index_new_key, false);
+
+        let old_key_update = imt_entry(1, update_key, value, birth_key, 3, false);
+        let unregistered = imt_entry(4, update_key, value, zero, 0, true);
+        let mut unregistered_old_key = old_key_update;
+        unregistered_old_key.extend_from_slice(&unregistered);
+        expect_imt(&unregistered_old_key, false);
     }
 }

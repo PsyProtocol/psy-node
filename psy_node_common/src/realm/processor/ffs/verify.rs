@@ -1,6 +1,6 @@
 //! Read-only history verification and baseline FFS replay.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use anyhow::Context;
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
@@ -220,13 +220,14 @@ where
             {
                 let (tree_id, tree_sub_id, leaf_index, leaf_hash, leaf_key, _, next_key, next_index, is_new_key) =
                     deserialize_imt_leaf_ffs_entry_v2(chunk)?;
-                finals.entry((tree_id, tree_sub_id, leaf_index)).or_insert((
-                    leaf_hash,
-                    leaf_key,
-                    next_key,
-                    next_index,
-                    is_new_key,
-                ));
+                match finals.entry((tree_id, tree_sub_id, leaf_index)) {
+                    Entry::Vacant(vacant) => {
+                        vacant.insert((leaf_hash, leaf_key, next_key, next_index, is_new_key));
+                    }
+                    Entry::Occupied(mut occupied) => {
+                        occupied.get_mut().4 |= is_new_key;
+                    }
+                }
             }
         }
         let heights = load_previous_contract_heights(
@@ -621,6 +622,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realm::processor::db::realm_db_test_env::{N, RealmDbTestEnv};
+    use psy_node_core::psy_core_db::traits::full::PsyNodeContractStateIMTDatabaseWriter;
 
     #[test]
     fn empty_imt_zero_key_sentinel_only_when_all_three_hold() {
@@ -632,5 +635,87 @@ mod tests {
         let mut cst = UNWRITTEN_CST_LEAF;
         cst[0] = 1;
         assert!(!is_empty_imt_zero_key_sentinel(false, cst, ZERO_SENTINEL_KEY));
+    }
+
+    fn imt_row(
+        index: u64,
+        key: [u8; 32],
+        value: [u8; 32],
+        next_key: [u8; 32],
+        next_index: u64,
+        is_new_key: bool,
+    ) -> [u8; IMT_LEAF_FFS_ENTRY_SIZE_V2] {
+        psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+            1,
+            1,
+            index,
+            &N::QHash::from_owned_32bytes(value),
+            &N::QHash::from_owned_32bytes(key),
+            &N::QHash::from_owned_32bytes(value),
+            &N::QHash::from_owned_32bytes(next_key),
+            next_index,
+            is_new_key,
+        )
+    }
+
+    #[tokio::test]
+    async fn imt_birth_uses_previous_checkpoint_novelty() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        let birth_key = [0x55u8; 32];
+        let predecessor_key = [0x22u8; 32];
+        let newest = [0x66u8; 32];
+        let zero = [0u8; 32];
+        // Shaped stream [update(false), sentinel(false), predecessor(false), birth(true)]:
+        // first-wins keeps the newest row's leaf, is_new is OR'd across the slot's rows.
+        let mut finals = HashMap::new();
+        finals.insert((1, 1, 3), (newest, birth_key, zero, 0, true));
+        finals.insert((1, 1, 0), ([0x01; 32], ZERO_SENTINEL_KEY, birth_key, 3, false));
+        finals.insert((1, 1, 1), ([0x33; 32], predecessor_key, birth_key, 3, false));
+        let mut replayed = HashMap::new();
+        replayed.insert((1, 1, 3), N::QHash::from_owned_32bytes(newest));
+        replayed.insert((1, 1, 0), N::QHash::from_owned_32bytes([0x01; 32]));
+        replayed.insert((1, 1, 1), N::QHash::from_owned_32bytes([0x33; 32]));
+        let heights = HashMap::from([(1u64, 8u8)]);
+        // The predecessor is an old key indexed at the previous checkpoint.
+        let predecessor_row = imt_row(1, predecessor_key, [0x33; 32], birth_key, 3, true);
+        env.db.contract_state_imt_set_leaves_ffs(0, &predecessor_row).await?;
+
+        env.processor.verify_imt_from_previous(0, finals.clone(), &replayed, &heights).await?;
+
+        // The old first-wins marker routed born-then-updated here and rejected it;
+        // a virgin key without its birth row must stay rejected.
+        let mut unmarked = finals.clone();
+        unmarked.insert((1, 1, 3), (newest, birth_key, zero, 0, false));
+        let old_marker = env
+            .processor
+            .verify_imt_from_previous(0, unmarked, &replayed, &heights)
+            .await
+            .expect_err("a virgin key without its birth row must stay rejected");
+        assert!(old_marker.to_string().contains("no authenticated index"), "{old_marker}");
+
+        let birth_row = imt_row(3, birth_key, [0x33; 32], zero, 0, true);
+        env.db.contract_state_imt_set_leaves_ffs(0, &birth_row).await?;
+        let reborn = env
+            .processor
+            .verify_imt_from_previous(0, finals.clone(), &replayed, &heights)
+            .await
+            .expect_err("re-birth of an indexed key must fail");
+        assert!(reborn.to_string().contains("already indexed"), "{reborn}");
+
+        // A previous preimage at the birth index without a key index entry.
+        let occupied_key = [0x77u8; 32];
+        let occupied_row = imt_row(4, occupied_key, [0x33; 32], zero, 0, false);
+        env.db.contract_state_imt_set_leaves_ffs(0, &occupied_row).await?;
+        let mut occupied = HashMap::new();
+        occupied.insert((1, 1, 4), ([0x77; 32], occupied_key, zero, 0, true));
+        let mut occupied_replay = HashMap::new();
+        occupied_replay.insert((1, 1, 4), N::QHash::from_owned_32bytes([0x77; 32]));
+        let overwrite = env
+            .processor
+            .verify_imt_from_previous(0, occupied, &occupied_replay, &heights)
+            .await
+            .expect_err("birth into a slot with a previous preimage must fail");
+        assert!(overwrite.to_string().contains("overwrites an authenticated index"), "{overwrite}");
+        Ok(())
     }
 }

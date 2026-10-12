@@ -349,12 +349,19 @@ fn inspect_bridge_registry() -> anyhow::Result<()> {
     use psy_client_data::bridge_aggregate::CircuitSetRegistration;
     use psy_plonky2_circuits::{bridge::aggregate_circuits::{AggregateCircuitHeights, AggregateCircuits}, circuit_library::get_plonky2_circuit_library_and_prover_for_network};
     let (_, coordinator) = get_plonky2_circuit_library_and_prover_for_network::<PoseidonGoldilocksConfig, 2>(PsyChainNetworkType::LocalDevnet)?;
-    let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(&[0], &coordinator, AggregateCircuitHeights {
+    let (checkpoint_common_data, checkpoint_cap_height, checkpoint_fingerprint) = {
+        let checkpoint = &coordinator.checkpoint_root_transition;
+        (checkpoint.get_common_circuit_data_ref(), checkpoint.get_verifier_config_ref().constants_sigmas_cap.height(), checkpoint.get_fingerprint())
+    };
+    let circuits = AggregateCircuits::build::<PsyNetworkLocalDevnetConstants>(&[0], checkpoint_common_data, checkpoint_cap_height, checkpoint_fingerprint, AggregateCircuitHeights {
         deposit_state_tree: psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
-        withdrawal_state_tree: psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize,
-    })?;
+    }, vec![psy_plonky2_circuits::bridge::circuits::bridge_claim::BridgeTokenPolicy {
+        chain_index: 0, token_contract_id: 7, token_address: [0, 0, 0, 4, 5, 6, 7, 8],
+        approved_leaf: psy_client_data::qdata::contract::PsyContractLeaf { state_tree_height: GoldilocksField::from_canonical_usize(32), ..Default::default() },
+        map_base: 8, capacity: 4,
+    }], 0)?;
     let registrations = circuits.registrations();
-    anyhow::ensure!(registrations.len() == 17, "bridge registry is not the closed seventeen-entry set");
+    anyhow::ensure!(registrations.len() == 10, "bridge registry is not the closed ten-entry set");
     let pin = |family: u16, level: u8, variant: u8| registrations.iter().find(|registration|
         (registration.family, registration.level, registration.variant) == (family, level, variant));
     let fingerprint = |registration: &CircuitSetRegistration| QHashOut::<GoldilocksField>::from_u64x4(registration.fingerprint).to_string();
@@ -363,27 +370,35 @@ fn inspect_bridge_registry() -> anyhow::Result<()> {
         println!("bridge-registration family={} level={} variant={} pi={} fingerprint={}",
             registration.family, registration.level, registration.variant, registration.pi_words, fingerprint(registration));
     }
-    let session = pin(3, 0, 0).context("session registration missing")?;
-    let adapter = pin(7, 0, 3).context("reward adapter registration missing")?;
-    let settlement = pin(12, 0, 2).context("settlement registration missing")?;
-    let chunk = pin(13, 0, 3).context("reward chunk registration missing")?;
-    anyhow::ensure!(session.pi_words == 34 && adapter.pi_words == 28 && settlement.pi_words == 12 && chunk.pi_words == 131, "bridge registration width mismatch");
-    println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=chunk arity=4 verification=conditional fingerprint-parent={} fingerprint-child={}",
-        chunk.family, chunk.level, chunk.variant, session.family, session.level, session.variant, fingerprint(chunk), fingerprint(session));
-    for parent_level in 1..=8u8 {
-        let parent = pin(13, parent_level, 3).context("reward combine registration missing")?;
-        let child = pin(13, parent_level - 1, 3).unwrap();
-        anyhow::ensure!(parent.pi_words == 131 && parent.fingerprint != child.fingerprint, "reward combine registration mismatch");
-        println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=combine arity=2 verification=unconditional fingerprint-parent={} fingerprint-child={}",
-            parent.family, parent.level, parent.variant, child.family, child.level, child.variant, fingerprint(parent), fingerprint(child));
-    }
-    let root = pin(13, 8, 3).unwrap();
-    println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=adapter arity=1 verification=unconditional fingerprint-parent={} fingerprint-child={}",
-        adapter.family, adapter.level, adapter.variant, root.family, root.level, root.variant, fingerprint(adapter), fingerprint(root));
-    println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=adapter arity=1 verification=unconditional fingerprint-parent={} fingerprint-child={}",
-        adapter.family, adapter.level, adapter.variant, session.family, session.level, session.variant, fingerprint(adapter), fingerprint(session));
-    println!("bridge-inclusion-edge parent={}/{}/{} child={}/{}/{} role=settlement arity=1 verification=unconditional fingerprint-parent={} fingerprint-child={}",
-        settlement.family, settlement.level, settlement.variant, adapter.family, adapter.level, adapter.variant, fingerprint(settlement), fingerprint(adapter));
+    let deposit = pin(11, 0, 1).context("deposit aggregate registration missing")?;
+    let reward_merge = pin(14, 0, 0).context("reward merge registration missing")?;
+    let reward_segment = pin(14, 0, 1).context("reward segment registration missing")?;
+    let reward_root = pin(15, 0, 0).context("reward root registration missing")?;
+    let reward_batch = pin(16, 0, 0).context("reward batch registration missing")?;
+    let withdrawal_claim = pin(17, 0, 0).context("withdrawal claim registration missing")?;
+    let reward_claim = pin(18, 0, 0).context("reward claim registration missing")?;
+    let checkpoint_final = pin(19, 0, 1).context("checkpoint final registration missing")?;
+    let checkpoint_membership = pin(19, 0, 2).context("checkpoint membership registration missing")?;
+    let bridge_aggregate = pin(20, 0, 0).context("bridge aggregate registration missing")?;
+    anyhow::ensure!(
+        registrations.first().map(|registration| (registration.family, registration.level, registration.variant)) == Some((11, 0, 1))
+            && pin(1, 0, 0).is_none() && pin(1, 0, 1).is_none()
+            && pin(3, 0, 0).is_none() && pin(7, 0, 3).is_none() && pin(9, 0, 1).is_none() && pin(9, 0, 2).is_none()
+            && pin(12, 0, 2).is_none() && pin(13, 0, 3).is_none()
+            && deposit.pi_words as usize == psy_client_data::bridge_aggregate::deposit_aggregate_pi_len(1)
+            && circuits.deposit_aggregate.circuit_data.common.num_public_inputs == deposit.pi_words as usize
+            && circuits.reward_merge.circuit_data.common.num_public_inputs == reward_merge.pi_words as usize
+            && circuits.reward_segment.circuit_data.common.num_public_inputs == reward_segment.pi_words as usize
+            && circuits.reward_root.circuit_data.common.num_public_inputs == reward_root.pi_words as usize,
+        "closed set starts at family 11 and constructed widths match the registrations",
+    );
+    anyhow::ensure!(
+        reward_merge.pi_words == 90 && reward_segment.pi_words == 22 && reward_root.pi_words == 30
+            && reward_batch.pi_words == 1_029 && withdrawal_claim.pi_words == 2_574 && reward_claim.pi_words == 3_846
+            && checkpoint_final.pi_words as usize == 18 + 5 && checkpoint_membership.pi_words == checkpoint_final.pi_words
+            && bridge_aggregate.pi_words as usize == 8_316 + 128,
+        "bridge registration width mismatch",
+    );
     Ok(())
 }
 fn main() -> anyhow::Result<()> {
