@@ -145,9 +145,11 @@ cd <workspace>/psy-compiler
 make gen-deploy-json
 ```
 
-Preconditions and the full DAG position are in `AGENTS.md` (`Ordered Release State Machine` §3): the compiler tree must be clean and exactly at the pinned `R_compiler`; the target defaults `PSY_GENESIS` to `../psy-node/psy-genesis`, writes its `genesis_contracts.json`, refreshes its `genesis_abi/`, writes the compiler provenance stamp, and copies `token.json` and `token.update.json` there (not into `psy-node/client_prover/token.json`).
+The compiler tree must be clean and exactly at the selected `R_compiler`. The user publishes that commit by SSH; if its reachability is already proven, do not publish it again. `make gen-deploy-json` reads `git rev-parse HEAD` and `git ls-tree` at that revision, so a dirty compiler or a later uncommitted lockfile change is not the stamp. Finalize the node pin and `Cargo.lock`, then generate. The target defaults `PSY_GENESIS` to `../psy-node/psy-genesis`, writes `genesis_contracts.json`, refreshes `genesis_abi/`, writes `.genesis_contracts.compiler-artifact.json`, and copies `token.json` and `token.update.json` there. The stamp must contain `compilerRevision`, `compilerSourcesHash`, and SHA-256/size for `genesis_contracts.json`, `token.json`, and `token.update.json`. Changing the compiler pin or `Cargo.lock` changes that provenance and requires regeneration; do not hand-edit the JSON.
 
-If `genesis_contracts.json` content changed, the node-side root `genesis.json` (§1) is affected through `genesis_contracts.json` as a construction input — regenerate it and check the `TOKEN_CONTRACT_STATE_TREE_HEIGHT` consequence per [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md).
+That command writes the node checkout only. It does not update sibling `../psy-genesis`, `../psy-sdk/psy-genesis`, `../psy-dapp/psy-genesis`, or `../psy-wallet/psy-genesis`. After review, the user publishes those bytes as `R_genesis`. Then check out that already-pushed SHA in every affected gitlink.
+
+If `genesis_contracts.json` content changed, regenerate root `genesis.json` (§1) and check the `TOKEN_CONTRACT_STATE_TREE_HEIGHT` consequence per [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md). A stamp or compiler-revision refresh alone does not authorize that regeneration.
 
 ## 3. P2P Validator Injection into `genesis.json`
 Devnet core startup rewrites the `validators` list of the file passed as `--genesis-data-path` from the selected public-only runtime network config. Each Realm's ordered validator array is flattened into Genesis with `realm_id`, `validator_user_id`, `node_id`, and `bls_public_key`; sub-id is derived later as the one-based array position. The launcher pins `PSY_NETWORK` to the same config key selected by the node (`localhost` for `local-devnet`) and exports the generated config as `PSY_CONFIG_PATH`.
@@ -178,7 +180,7 @@ Genesis construction fails closed when a Realm exceeds the P2P validator cap (`M
 | Set `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` / `BRIDGE_RELAYER_KEYSTORE_PATH` / `KEYSTORE_PATH` points at a missing file | Fail closed; do not fall through to `deterministic_private_key(2)`. Create the UTC JSON with `cast` first ([§1.2.1](#121-bridge-relayer-keystore)) |
 | Relayer logs `not_registered` for user `524288` | Genesis registration 2 was not derived from the relayer's keystore. Recreate the keystore, regenerate genesis with that path, then start a new chain. Do not paste a plaintext `private_key` into `daemon.toml` on a live chain. |
 | `validators` entries differ from the selected runtime membership | Core startup injects the selected ordered validators; component-only startup does not rewrite them. Diagnose configuration drift before the next authorized core startup. |
-| Provenance mismatch in `psy-genesis` stamp | Rebuild from the committed clean compiler revision; never hand-edit provenance JSON |
+| Provenance mismatch in `psy-genesis` stamp | Rebuild `make gen-deploy-json` from the committed clean compiler revision after its node pin and lockfile are final; never hand-edit provenance JSON |
 | `private_keys.json` leaked | Treat as secret compromise; rotate and remove from every distribution channel |
 
 ## Security Considerations

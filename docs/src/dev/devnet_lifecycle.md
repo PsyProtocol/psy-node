@@ -60,29 +60,99 @@ PSY_SKIP_KEYSTORE=1
 
 Do not set `PSY_NO_AUTO_RESTART=1` when `make restart`, `make rollback-stop`, or `make rollback-resume` will be used. Those targets require the foreground supervisor to remain active. `PSY_SKIP_BUILD=1` is valid only after the release binaries and compiler-generated artifacts have been verified against the current source. `Makefile:13-15` defines the defaults; `dev/locSetupV4.ts` rejects stale Psy SDK compiler artifacts.
 
-Before startup, initialize required submodules at their recorded gitlink SHAs, install frozen dependencies in `./psy-dapp` and the standalone `./psy-dapp/mode-a-web-wallet-bridge` workspace, and build release `psy_node_cli`, `psy_worker_cli`, `psy_dev_cli`, `psy_relayer_cli`, `psy_user_cli`, `psy-services`, and `psy-indexer`. Install `../psy-wallet` dependencies only when the wallet surface is exercised. Use `PSY_SKIP_BUILD=1` only after those binaries are newer than their changed sources.
+Before startup, from a clean `<repo-root>`, check out the recorded DApp pin despite `update = none`, then initialize every nested link at its recorded SHA:
+
+```bash
+git submodule update --init --checkout -- psy-genesis psy-contracts psy-dapp
+git -C psy-dapp submodule update --init -- psy-genesis psy-contracts
+git -C ../psy-sdk submodule update --init -- psy-genesis
+```
+
+Run `git -C ../psy-wallet submodule update --init -- psy-genesis` only when the wallet surface is exercised. Root `git submodule update --init --recursive` does not populate `psy-dapp`. Do not use `--remote` or move a tracking branch. Install frozen dependencies in `./psy-dapp` and `./psy-dapp/mode-a-web-wallet-bridge`. Install `../psy-wallet` dependencies only when the wallet surface is exercised. Build release `psy_node_cli`, `psy_worker_cli`, `psy_dev_cli`, `psy_relayer_cli`, `psy_user_cli`, `psy-services`, and `psy-indexer`. Use `PSY_SKIP_BUILD=1` only after those binaries are newer than their changed sources.
 
 Never run a formatter. Root `rustfmt.toml` and `client_prover/rustfmt.toml` set `disable_all_formatting = true`.
 
 ## 2. Artifact Gate
 
-Before startup, compare the current compiler revision with both artifact stamps:
+Before startup, compare both stamps with the selected clean sibling compiler. The source hash is the committed-tree fingerprint from `readCompilerProvenance`: eligible blobs at `HEAD`, sorted by UTF-8 path, each hashed as `path || NUL || blob || NUL`. Both `compilerRevision` fields and both `compilerSourcesHash` fields must equal that result. Genesis must also record the current SHA-256 and size of its three payloads:
 
 ```bash
-COMPILER_REV=$(git -C ../psy-compiler rev-parse HEAD)
-test "$(jq -r '.compilerRevision' ../psy-sdk/psy-ts-sdk/packages/psy-sdk/.compiler-artifact.json)" = "$COMPILER_REV"
-test "$(jq -r '.compilerRevision' psy-genesis/.genesis_contracts.compiler-artifact.json)" = "$COMPILER_REV"
+set -euo pipefail
+compiler_changes=$(git -C ../psy-compiler status --porcelain --untracked-files=all)
+test -z "$compiler_changes"
+python3 - <<'PY'
+import hashlib, json, pathlib, subprocess, sys
+compiler = pathlib.Path("../psy-compiler")
+def git(*args, input=None):
+    result = subprocess.run(["git", *args], cwd=compiler, input=input, stdout=subprocess.PIPE)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+    return result.stdout
+def source(path):
+    path = path.replace("\\", "/")
+    lower = path.lower()
+    if path == ".compiler-artifact.json":
+        return False
+    if path in {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "Makefile"}:
+        return True
+    if pathlib.PurePosixPath(path).name in {"build.rs", "precompiles.json", "package.json"}:
+        return True
+    return any(lower.endswith(ext) for ext in (".rs", ".psy", ".toml", ".lock"))
+revision = git("rev-parse", "HEAD").decode().strip()
+entries = []
+for row in git("ls-tree", "-r", "--full-tree", revision).decode().splitlines():
+    meta, path = row.split("\t", 1)
+    mode, kind, oid = meta.split()
+    if kind == "blob" and source(path):
+        entries.append((path, oid))
+entries.sort(key=lambda item: item[0].encode())
+payload = "".join(oid + "\n" for _, oid in entries).encode()
+blobs = {}
+if payload:
+    raw = git("cat-file", "--batch", input=payload)
+    offset = 0
+    for path, oid in entries:
+        end = raw.index(b"\n", offset)
+        parsed = raw[offset:end].decode().split()
+        if parsed != [oid, "blob", parsed[2]]:
+            sys.exit(1)
+        start = end + 1
+        blobs[path] = raw[start:start + int(parsed[2])]
+        offset = start + int(parsed[2]) + 1
+digest = hashlib.sha256()
+for path, _ in entries:
+    digest.update(path.encode())
+    digest.update(b"\0")
+    digest.update(blobs[path])
+    digest.update(b"\0")
+expected = {"compilerRevision": revision, "compilerSourcesHash": digest.hexdigest()}
+sdk = json.loads(pathlib.Path("../psy-sdk/psy-ts-sdk/packages/psy-sdk/.compiler-artifact.json").read_text())
+genesis = json.loads(pathlib.Path("psy-genesis/.genesis_contracts.compiler-artifact.json").read_text())
+failed = False
+for stamp in (sdk, genesis):
+    for field in ("compilerRevision", "compilerSourcesHash"):
+        if stamp.get(field) != expected[field]:
+            failed = True
+root = pathlib.Path("psy-genesis")
+for name, digest_key, size_key in (
+    ("genesis_contracts.json", "artifactSha256", "artifactByteSize"),
+    ("token.json", "tokenArtifactSha256", "tokenArtifactByteSize"),
+    ("token.update.json", "tokenUpdateArtifactSha256", "tokenUpdateArtifactByteSize"),
+):
+    data = (root / name).read_bytes()
+    if hashlib.sha256(data).hexdigest() != genesis.get(digest_key) or len(data) != genesis.get(size_key):
+        failed = True
+sys.exit(1 if failed else 0)
+PY
 ```
 
-If either comparison fails:
+Repair only the stale output:
 
-```bash
-make -C ../psy-compiler gen-deploy-json
-CARGO_NET_GIT_FETCH_WITH_CLI=true pnpm --dir ../psy-sdk/psy-ts-sdk/packages/psy-sdk build
-make build
-```
+- Compiler-produced Genesis content or its stamp is stale: rerun `make -C ../psy-compiler gen-deploy-json` from the final clean pin and lockfile.
+- SDK compiler identity or generated WASM is stale: `CARGO_NET_GIT_FETCH_WITH_CLI=true PSY_NETWORK=localhost pnpm --dir ../psy-sdk/psy-ts-sdk/packages/psy-sdk build`. This generates both prover targets and the compiler stamp. Keep generated `bigint` exports; do not copy another package's bindings or cast them to `number`.
+- A required node, services, or indexer binary is missing or older than its sources: `make build` in the owning repository.
 
-Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions. `dev/locSetupV4.ts:2669-2725` verifies the Genesis payload and stamp before process startup. Regenerate root `genesis.json` with `make generate-genesis-data` after regenerating compiler/Genesis contract artifacts; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
+Do not rebuild all three because one comparison failed. Regenerate root `genesis.json` only when a [§6.1](circuit-and-verifier-operations.md#61-genesis-trigger) construction input changed; a stamp or compiler-revision refresh alone does not. Do not weaken the provenance check. Do not add a Cargo `[patch]` or `[replace]` override for the pinned Psy node revision; the existing plonky2-hwa patch in each repository is not inherited across git pins. `dev/locSetupV4.ts:2796-2850` verifies the Genesis payload and full stamp before process startup.
 
 ## 3. Fresh Start
 
