@@ -214,7 +214,16 @@ PATH="$TMP_DIR/bin:$PATH" \
 NOSTR_HOME="$TMP_DIR/nostr" \
 NOSTR_DOMAIN="nostr-stg.example.test" \
 PUBLIC_L1_RPC_ROUTES_JSON="$routes_json" \
+PUBLIC_COORDINATOR_DOMAIN="coordinator-stg.example.test" \
+PUBLIC_COORDINATOR_UPSTREAM="10.148.0.25:1337 10.148.0.25:1347 10.148.0.25:1357" \
   bash "$REPO_ROOT/deploy/gcp/remote/update-caddy-entrypoints.sh" >/dev/null
+
+grep -Fq 'reverse_proxy 10.148.0.25:1337 10.148.0.25:1347 10.148.0.25:1357 {' "$TMP_DIR/nostr/Caddyfile"
+[ "$(grep -Fc 'lb_policy round_robin' "$TMP_DIR/nostr/Caddyfile")" = 1 ]
+if grep -Eq 'lb_try_duration|lb_retry_match' "$TMP_DIR/nostr/Caddyfile"; then
+  echo 'node pool must not add ambiguous JSON-RPC POST retries' >&2
+  exit 1
+fi
 
 for domain in rpc-eth-stg.example.test rpc-bsc-stg.example.test rpc-base-stg.example.test; do
   [ "$(grep -Fxc "$domain {" "$TMP_DIR/nostr/Caddyfile")" = "1" ] \

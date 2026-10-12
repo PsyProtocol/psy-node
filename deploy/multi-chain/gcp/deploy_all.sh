@@ -67,13 +67,19 @@ set +a
 [ -z "${DEPLOY_ALL_LAST_STEP:-}" ] || fail "use --until ID instead of legacy DEPLOY_ALL_LAST_STEP"
 
 declare -a order=() selected=()
-declare -A scripts=() descriptions=() skipped=()
+declare -A scripts=() descriptions=() skipped=() topology_steps=()
 while IFS=$'\t' read -r id script description; do
   [[ "$id" =~ ^[0-9]{2}$ ]] || continue
   order+=("$id")
-  scripts[$id]="$REPO_ROOT/deploy/gcp/fresh-staging/$script"
+  if [[ "$script" == topology:* ]]; then
+    [ -n "${DEPLOY_TOPOLOGY_FILE:-}" ] || fail 'topology steps require DEPLOY_TOPOLOGY_FILE'
+    topology_steps[$id]="${script#topology:}"
+    scripts[$id]="$SCRIPT_DIR/fresh-topology/steps.py"
+  else
+    scripts[$id]="$REPO_ROOT/deploy/gcp/fresh-staging/$script"
+  fi
   descriptions[$id]="$description"
-done < "$SCRIPT_DIR/steps.tsv"
+done < "${DEPLOY_STEPS_FILE:-$SCRIPT_DIR/steps.tsv}"
 
 for id in "$from_step" "$until_step" "$only_step"; do
   [ -z "$id" ] || [ -n "${scripts[$id]:-}" ] || fail "unknown step: $id"
@@ -121,14 +127,30 @@ fi
 echo "[multichain-deploy] config: $config_to_read"
 echo "[multichain-deploy] source pins: $DEPLOY_SOURCE_VERSIONS_FILE"
 echo "[multichain-deploy] chains: Sepolia=0 (11155111), BSC=1 (97), Base=2 (84532)"
-echo "[multichain-deploy] prove host: ${OFFSITE_PROVE_PROXY_HOST:-unset}; offsite workers: ${OFFSITE_WORKER_HOST:-unset}"
+if [ -n "${DEPLOY_TOPOLOGY_FILE:-}" ]; then
+  echo "[multichain-deploy] topology: $DEPLOY_TOPOLOGY_FILE; host roles are inventory-driven"
+else
+  echo "[multichain-deploy] prove host: ${OFFSITE_PROVE_PROXY_HOST:-unset}; offsite workers: ${OFFSITE_WORKER_HOST:-unset}"
+fi
 for id in "${selected[@]}"; do
   [ -f "${scripts[$id]}" ] || fail "missing script: ${scripts[$id]}"
   printf '%s  %s\n    %s\n' "$id" "${descriptions[$id]}" "${scripts[$id]#"$REPO_ROOT"/}"
+  if [ "$plan_only" = "1" ] && [ -n "${topology_steps[$id]:-}" ]; then
+    python3 "${scripts[$id]}" "${topology_steps[$id]}" --topology "$DEPLOY_TOPOLOGY_FILE"
+  fi
 done
 if [ "$plan_only" = "1" ]; then
   echo "[multichain-deploy] plan only; no source preparation, network checks or deployment performed"
   exit 0
+fi
+
+# Fail before *any* stop/reset while the split-fleet reset and artifact gates
+# remain unresolved. The legacy host enumeration is not safe for this fleet.
+if [ -n "${DEPLOY_TOPOLOGY_FILE:-}" ]; then
+  for id in "${selected[@]}"; do
+    [[ "${descriptions[$id]}" != BLOCKED* ]] || fail "step $id is not implemented for this topology: ${descriptions[$id]}"
+  done
+  python3 "$SCRIPT_DIR/fresh-topology/steps.py" readiness --topology "$DEPLOY_TOPOLOGY_FILE"
 fi
 
 if [ "${CONFIRM_MULTICHAIN_REPLACES_CURRENT_STAGING:-0}" != "1" ] \
@@ -191,8 +213,14 @@ run_step_script() {
   local step="$1"
   # Step 10 writes the manifest. Every downstream consumer must see the full
   # registry, including when it is invoked alone or after an interrupted run.
-  case "$step" in 11|12|16|17|18|27|30) multichain_require_runtime || return ;; esac
-  bash "${scripts[$step]}"
+  case "$step" in 11|12|16|17|18|27|30|40|41|42|43|44|45|46|47) multichain_require_runtime || return ;; esac
+  if [ -n "${topology_steps[$step]:-}" ]; then
+    python3 "${scripts[$step]}" "${topology_steps[$step]}" \
+      --topology "$DEPLOY_TOPOLOGY_FILE" --config "$GCP_DEPLOY_CONFIG" \
+      --versions "$DEPLOY_SOURCE_VERSIONS_FILE" --apply
+  else
+    bash "${scripts[$step]}"
+  fi
 }
 
 for id in "${selected[@]}"; do

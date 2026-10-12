@@ -139,12 +139,26 @@ append_public_proxy() {
   local upstream="$2"
   local target="$2"
   local rewrite_path=""
+  local pool_policy=""
 
   [ -n "$domain" ] || return 0
   [ -n "$upstream" ] || {
     echo "missing upstream for public domain: $domain" >&2
     exit 1
   }
+
+  # Split-fleet node pools contain private host:port targets, never RPC keys.
+  # Do not enable retries of potentially submitted JSON-RPC POST requests.
+  if [[ "$upstream" == *" "* ]]; then
+    local member
+    for member in $upstream; do
+      [[ "$member" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || {
+        echo "invalid multi-upstream node pool for $domain" >&2
+        exit 1
+      }
+    done
+    pool_policy='        lb_policy round_robin'
+  fi
 
   if [[ "$upstream" =~ ^https?://[^/]+/.+ ]]; then
     if [[ "$upstream" == https://* ]]; then
@@ -183,6 +197,7 @@ EOF
 
   cat >>"$next" <<EOF
     reverse_proxy ${target} {
+${pool_policy}
         header_up Host {upstream_hostport}
         header_down -Access-Control-Allow-Origin
         header_down -Access-Control-Allow-Methods

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-10-12",
+  "mode": "fresh-same-fleet",
+  "hosts": {
+    "gcp-cp-ce": {"ip": "10.148.0.25", "location": "gcp", "future_processor_size": "4 vCPU / 8 GiB; not approved or applied"},
+    "gcp-edge-1": {"ip": "10.148.0.36", "location": "gcp"},
+    "gcp-edge-2": {"ip": "10.148.0.35", "location": "gcp"},
+    "gcp-realm-processor": {"ip": "10.148.0.37", "location": "gcp"},
+    "gcp-psy-service": {"ip": "10.148.0.38", "location": "gcp"},
+    "gcp-c4d-1": {"ip": null, "location": "gcp"},
+    "gcp-coordinator-worker": {"ip": "10.148.0.33", "location": "gcp"},
+    "gcp-faucet": {"ip": null, "location": "gcp"},
+    "gcp-scylla": {"ip": "10.148.0.23", "location": "gcp"},
+    "gcp-redis": {"ip": "10.148.0.12", "location": "gcp"},
+    "gcp-nats": {"ip": "10.148.0.20", "location": "gcp"},
+    "gcp-postgres": {"ip": "10.148.0.24", "location": "gcp"},
+    "gcp-nostr": {"ip": "10.148.0.29", "location": "gcp"},
+    "gcp-gateway": {"ip": "10.148.0.32", "location": "gcp"},
+    "arc99x1": {"ip": "10.250.0.13", "location": "offsite"},
+    "arc99x2": {"ip": "10.250.0.14", "location": "offsite"},
+    "arc99x3": {"ip": "10.250.0.12", "location": "offsite"},
+    "arc99x4": {"ip": null, "location": "offsite"}
+  },
+  "coordinator": {
+    "processor": "gcp-cp-ce",
+    "edges": [
+      {"host": "gcp-cp-ce", "instance": "0", "port": 1337},
+      {"host": "gcp-cp-ce", "instance": "1", "port": 1347},
+      {"host": "gcp-cp-ce", "instance": "2", "port": 1357}
+    ],
+    "indexer": "gcp-cp-ce"
+  },
+  "realms": [
+    {"id": 0, "sub_id": 1, "processor": "gcp-realm-processor", "indexer": "gcp-realm-processor",
+     "edges": [{"host": "gcp-cp-ce", "instance": "0", "port": 1338}, {"host": "gcp-edge-1", "instance": "0", "port": 1338}, {"host": "gcp-edge-2", "instance": "0", "port": 1338}]},
+    {"id": 1, "sub_id": 1, "processor": "gcp-cp-ce", "indexer": "gcp-cp-ce",
+     "edges": [{"host": "gcp-cp-ce", "instance": "1", "port": 1339}, {"host": "gcp-edge-1", "instance": "1", "port": 1339}, {"host": "gcp-edge-2", "instance": "1", "port": 1339}]}
+  ],
+  "services": {"host": "gcp-psy-service", "port": 3000},
+  "faucet": {"host": "gcp-coordinator-worker", "port": 9998},
+  "relayer": {"host": "gcp-faucet", "batch_size": 64},
+  "workers": {"host": "gcp-c4d-1", "coordinator": 1, "realm_0": 2, "realm_1": 2, "key_indexes": null},
+  "infrastructure": {"scylla": "gcp-scylla", "redis": "gcp-redis", "nats": "gcp-nats", "postgres": "gcp-postgres", "envio": "gcp-postgres", "caddy": "gcp-nostr", "nostr": "gcp-nostr", "gateway": "gcp-gateway"},
+  "proxies": {
+    "user_entry": "arc99x1",
+    "user_weights": {"arc99x1": 75, "arc99x2": 0, "arc99x3": 0, "arc99x4": 25},
+    "installed_user_hosts": ["arc99x1", "arc99x2", "arc99x4"],
+    "system_host": "arc99x3",
+    "note": "x2 is installed but not in live traffic. A zero weight is not a drained backend."
+  },
+  "chains": [{"name": "sepolia", "index": 0, "chain_id": 11155111}, {"name": "bscTestnet", "index": 1, "chain_id": 97}, {"name": "baseSepolia", "index": 2, "chain_id": 84532}],
+  "release_blockers": [
+    "Confirm explicit worker key_indexes against the new Genesis; intentionally shared reward identities are allowed, implicit default identities are not.",
+    "Freeze new-cohort source pins, ABI, Genesis, SDK, wallet and proving artifacts together; historical source-versions.env is not the next release lock.",
+    "Complete explicit stop/reset inventories including old drop-ins, alternate release paths, offsite services, Nostr and indexer cursors. Do not reuse the legacy broad cleanup.",
+    "Port offsite GPU/CPU user and system installers to the new cohort and verify fingerprints; preserve operator-run sudo and WireGuard identities.",
+    "Generate monitoring coverage for this full fleet; remove old role expectations; install monitoring last.",
+    "Validate the final private RPC profiles, fee policies, Envio patches, database schema and all three L1 deployments before publishing clients."
+  ]
+}

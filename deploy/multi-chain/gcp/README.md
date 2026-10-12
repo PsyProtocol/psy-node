@@ -1,5 +1,11 @@
 # Public multichain GCP deployment
 
+> October 12 topology preparation: the live fleet has expanded beyond this
+> historical single-host recipe. See [the same-fleet fresh deployment plan and
+> step adapter](fresh-topology/README.md). `config.split.example.env` enables its
+> offline plan; real execution is blocked until the recorded release/reset gates
+> are completed. Do not use the historical stop/clear steps on the expanded fleet.
+
 This profile deploys one Psy L2 connected to three EVM testnets:
 
 | Protocol index | Deployment network | EVM chain ID | Public RPC hostname |
@@ -8,7 +14,7 @@ This profile deploys one Psy L2 connected to three EVM testnets:
 | 1 | `bscTestnet` | 97 | `rpc-bsc-stg.psy-protocol.xyz` |
 | 2 | `baseSepolia` | 84532 | `rpc-base-stg.psy-protocol.xyz` |
 
-It reuses the current GCP machine topology, offsite workers on `arc99x4`, and
+The historical profile reused the GCP topology, offsite workers on `arc99x4`, and
 offsite prove-proxy on `arc99x3`. It replaces the current staging L2 and
 database state; it does not create a parallel environment.
 
