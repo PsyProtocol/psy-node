@@ -3684,7 +3684,24 @@ impl WalletSession {
             contract_state_root_proof,
             start_contract_state_root,
         ) = if definition.state_commands.is_empty() {
-            (vec![], None, None, None, QHashOut::ZERO)
+            let current_user_leaf = current_header.current_state.user_leaf;
+            let nonce = user_session_mgr.require_lps()?.get_nonce();
+            let mut end_user_leaf = current_user_leaf;
+            end_user_leaf.nonce = nonce;
+            let signature_data = psy_client_data::qdata::ups_signature::PsyUserProvingSessionSignatureDataCompact {
+                start_user_leaf_hash: current_header.session_start_context.start_session_user_leaf.qfhash::<PoseidonHash>(),
+                end_user_leaf_hash: end_user_leaf.qfhash::<PoseidonHash>(),
+                checkpoint_leaf_hash: current_header.session_start_context.checkpoint_leaf_hash,
+                tx_stack_hash,
+                tx_count,
+            };
+            let signature_context = psy_vm::ups::sd_key::SDKeySignatureContext {
+                signature_data,
+                current_user_leaf,
+                nonce,
+                checkpoint_tree_root,
+            };
+            (vec![], None, Some(signature_context), None, QHashOut::ZERO)
         } else {
             // Reuse the DPN VM's local execution path to resolve the exact
             // state commands and their authenticated witnesses. This mirrors
@@ -3774,9 +3791,10 @@ impl WalletSession {
         user_session_mgr: &UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>,
         trace_steps: &[crate::trace::TraceStep],
         current_header: &UserProvingSessionHeader<F>,
+        nonce: F,
     ) -> anyhow::Result<SignContext> {
         let _ = user_session_mgr;
-        self.build_sd_key_dpn_context_from_trace(call_data, fingerprint, trace_steps, current_header)
+        self.build_sd_key_dpn_context_from_trace(call_data, fingerprint, trace_steps, current_header, nonce)
             .await
     }
 
@@ -3786,6 +3804,7 @@ impl WalletSession {
         fingerprint: QHashOut<F>,
         trace_steps: &[crate::trace::TraceStep],
         current_header: &UserProvingSessionHeader<F>,
+        nonce: F,
     ) -> anyhow::Result<SignContext> {
         let sd_key = self
             .wallet
@@ -3823,6 +3842,21 @@ impl WalletSession {
         let user_id = current_header.session_start_context.start_session_user_leaf.user_id.to_canonical_u64();
         let circuit_inputs = call_data.inputs.iter().map(|x| F::from_noncanonical_u64(*x)).collect::<Vec<_>>();
         let checkpoint_tree_root = current_header.session_start_context.checkpoint_tree_root;
+        let current_user_leaf = current_header.current_state.user_leaf;
+        let mut end_user_leaf = current_user_leaf;
+        end_user_leaf.nonce = nonce;
+        let signature_context = psy_vm::ups::sd_key::SDKeySignatureContext {
+            signature_data: psy_client_data::qdata::ups_signature::PsyUserProvingSessionSignatureDataCompact {
+                start_user_leaf_hash: current_header.session_start_context.start_session_user_leaf.qfhash::<PoseidonHash>(),
+                end_user_leaf_hash: end_user_leaf.qfhash::<PoseidonHash>(),
+                checkpoint_leaf_hash: current_header.session_start_context.checkpoint_leaf_hash,
+                tx_stack_hash: current_header.current_state.tx_hash_stack,
+                tx_count: current_header.current_state.tx_count,
+            },
+            current_user_leaf,
+            nonce,
+            checkpoint_tree_root,
+        };
         let signature_input = SDKeyDpnCircuitWitnessInput {
             circuit_inputs,
             transaction_infos,
@@ -3832,7 +3866,7 @@ impl WalletSession {
             state_reader_results: None,
             dpn_state_command_witnesses: vec![],
             dpn_state_reader_context: None,
-            signature_context: None,
+            signature_context: Some(signature_context),
             contract_state_root_proof: None,
             start_contract_state_root: QHashOut::ZERO,
             secp256k1_slots: vec![],
@@ -5622,6 +5656,7 @@ impl WalletSession {
                         pk_info.fingerprint,
                         &trace.steps,
                         current_header,
+                        trace.finalization.nonce,
                     )
                     .await?
                 }
@@ -5952,6 +5987,7 @@ impl WalletSession {
                             &user_session_mgr,
                             &trace.steps,
                             &prev_header,
+                            trace.finalization.nonce,
                         )
                         .await?;
                 }
@@ -7896,11 +7932,20 @@ pub(crate) mod offline_trace_pipeline_tests {
         // and the burn step always targets the token's fixed burn method
         let set_value_method_id = helper.defs.iter().find(|def| def.name == "set_value").unwrap().method_id;
 
-        let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy(
+        let (mut function, config) = psy_vm::ups::sd_key::build_allow_method_policy(
             &[OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
             &[set_value_method_id, TOKEN_BURN_METHOD_ID],
             2,
         )?;
+        // The LPS selects the next nonce (the fixture's stored user nonce is
+        // 5), and both live signing and trace finalization must authorize 6.
+        use psy_vm::dpn::ops::op_types::{encode_indexed_op_id, DPNAssertEqInfoIndexed, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType};
+        let next_target = function.definitions.iter().filter(|def| def.data_type == DPNBuiltInDataType::Target).count();
+        let nonce_id = encode_indexed_op_id(DPNBuiltInDataType::Target, next_target);
+        let expected_id = encode_indexed_op_id(DPNBuiltInDataType::Target, next_target + 1);
+        function.definitions.push(DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: next_target, op_type: DPNOpType::GetNonce, inputs: vec![] });
+        function.definitions.push(DPNIndexedVarDef { data_type: DPNBuiltInDataType::Target, index: next_target + 1, op_type: DPNOpType::Constant, inputs: vec![6] });
+        function.assertions.push(DPNAssertEqInfoIndexed { left: nonce_id, right: expected_id, message: "SD key nonce mismatch".into() });
         let sd_fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
         let private_key = QHashOut::from_values(961, 962, 963, 964);
         let pk_info = wallet_session.wallet.get_or_create_user(private_key, sd_fingerprint).await?;
@@ -7994,6 +8039,7 @@ pub(crate) mod offline_trace_pipeline_tests {
         assert!(!zksign.sign_witness.is_empty(), "SDKey DPN trace must persist the signing witness for offline finalization");
         let persisted_witness = SDKeyDpnCircuitWitnessInput::from_trace_bytes(&zksign.sign_witness)?;
         assert_eq!(persisted_witness.transaction_infos.len(), 2);
+        assert_eq!(persisted_witness.signature_context.as_ref().unwrap().nonce, trace.finalization.nonce);
 
         let wallet_session = std::sync::Arc::new(wallet_session);
         let current_header = &trace
@@ -8009,6 +8055,7 @@ pub(crate) mod offline_trace_pipeline_tests {
                 sd_fingerprint,
                 &trace.steps,
                 current_header,
+                trace.finalization.nonce,
             )
             .await?;
         assert_eq!(sign_context.fingerprint, sd_fingerprint);
@@ -8022,6 +8069,7 @@ pub(crate) mod offline_trace_pipeline_tests {
                 sd_fingerprint,
                 &[],
                 current_header,
+                trace.finalization.nonce,
             )
             .await
             .expect_err("the SD key policy requires two introspectable transactions");

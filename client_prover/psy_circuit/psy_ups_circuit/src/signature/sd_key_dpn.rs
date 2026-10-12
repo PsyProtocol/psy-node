@@ -551,11 +551,6 @@ impl SDKeyDpnCircuitGadget {
         }
 
         let input_len = definition.circuit_inputs.iter().max().map(|idx| *idx as usize + 1).unwrap_or(0);
-        let uses_nonce = definition
-            .definitions
-            .iter()
-            .any(|definition| definition.op_type == psy_vm::dpn::ops::op_types::DPNOpType::GetNonce);
-
         let mut effective_sd_config = sd_config.clone();
         // Programmable DPN functions use the VM StateReaderGadget below, not
         // the fixed-policy reader owned by add_virtual_to.
@@ -570,16 +565,6 @@ impl SDKeyDpnCircuitGadget {
         // Programmable DPN authorization functions can inspect the complete
         // bounded calldata of every preceding transaction.
         let mut gadget = Self::add_virtual_to(&mut builder, &effective_sd_config, input_len, SDKEY_MAX_CALLDATA_WORDS);
-
-        if definition.state_commands.is_empty() && !uses_nonce {
-            let nonce = builder.zero();
-            gadget.add_dpn_function_constraints_shared(&mut builder, definition, None, nonce)?;
-            // Retain the definition even on the stateless fast path so trace
-            // generation can rebuild the exact circuit from the gadget alone.
-            gadget.dpn_state_reader_definition = Some(definition.clone());
-            gadget.build_circuit(builder)?;
-            return Ok(gadget);
-        }
 
         let context_targets = (!definition.state_commands.is_empty()).then(|| SDKeyDPNStateReaderContextTargets {
             chain_state_roots: PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder),
@@ -655,6 +640,8 @@ impl SDKeyDpnCircuitGadget {
             gadget.dpn_state_reader_definition = Some(definition.clone());
         } else {
             gadget.add_dpn_function_constraints_shared(&mut builder, definition, None, nonce)?;
+            // Trace generation needs the definition even without state reads.
+            gadget.dpn_state_reader_definition = Some(definition.clone());
         }
         gadget.build_circuit(builder)?;
         Ok(gadget)
@@ -1181,7 +1168,7 @@ mod tests {
         let (checkpoint_id, user_id) = state_reader_results
             .as_ref()
             .map_or((GF::ZERO, GF::ZERO), |r| (r.state.checkpoint_id, r.state.user_leaf.user_id));
-        SDKeyDpnCircuitWitnessInput {
+        let mut witness = SDKeyDpnCircuitWitnessInput {
             circuit_inputs: vec![],
             transaction_infos,
             transaction_inputs,
@@ -1196,7 +1183,9 @@ mod tests {
             secp256k1_slots: vec![],
             checkpoint_id,
             user_id,
-        }
+        };
+        attach_test_signature_context(&mut witness);
+        witness
     }
 
     fn make_state_reader_results(
@@ -1261,17 +1250,6 @@ mod tests {
         })
     }
 
-    fn dummy_sighash() -> QHashOut<GF> {
-        QHashOut(plonky2::hash::hash_types::HashOut {
-            elements: [
-                GF::from_canonical_u64(0x1111111111111111),
-                GF::from_canonical_u64(0x2222222222222222),
-                GF::from_canonical_u64(0x3333333333333333),
-                GF::from_canonical_u64(0x4444444444444444),
-            ],
-        })
-    }
-
     fn build_dpn_greater_than_100_function() -> DPNFunctionCircuitDefinition {
         let input_target_id = encode_indexed_op_id(DPNBuiltInDataType::Target, 0);
         let constant_100_id = encode_indexed_op_id(DPNBuiltInDataType::Target, 1);
@@ -1313,7 +1291,7 @@ mod tests {
     }
 
     fn build_dpn_witness(circuit_inputs: Vec<GF>) -> SDKeyDpnCircuitWitnessInput {
-        SDKeyDpnCircuitWitnessInput {
+        let mut witness = SDKeyDpnCircuitWitnessInput {
             circuit_inputs,
             transaction_infos: vec![],
             transaction_inputs: vec![],
@@ -1328,7 +1306,43 @@ mod tests {
             secp256k1_slots: vec![],
             checkpoint_id: GF::ZERO,
             user_id: GF::ZERO,
-        }
+        };
+        attach_test_signature_context(&mut witness);
+        witness
+    }
+
+    fn attach_test_signature_context(witness: &mut SDKeyDpnCircuitWitnessInput) {
+        let mut current_user_leaf = PsyUserLeaf::default();
+        current_user_leaf.user_id = witness.user_id;
+        let nonce = current_user_leaf.nonce;
+        let signature_data = PsyUserProvingSessionSignatureDataCompact {
+            start_user_leaf_hash: QHashOut::ZERO,
+            end_user_leaf_hash: current_user_leaf.qfhash::<PoseidonHasher>(),
+            checkpoint_leaf_hash: QHashOut::ZERO,
+            tx_stack_hash: witness.tx_stack_hash,
+            tx_count: witness.tx_count,
+        };
+        witness.signature_context = Some(SDKeySignatureContext {
+            signature_data,
+            current_user_leaf,
+            nonce,
+            checkpoint_tree_root: QHashOut::ZERO,
+        });
+    }
+
+    fn witness_sighash(witness: &SDKeyDpnCircuitWitnessInput) -> QHashOut<GF> {
+        let context = witness.signature_context.as_ref().unwrap();
+        context.signature_data
+            .get_sig_action_for_user::<PoseidonHasher>(
+                PSY_NETWORK_MAGIC,
+                witness.user_id,
+                context.nonce,
+                SignContext {
+                    checkpoint_tree_root: context.checkpoint_tree_root,
+                    user_leaf: context.current_user_leaf,
+                },
+            )
+            .get_qhash::<PoseidonHasher>()
     }
 
     #[test]
@@ -1488,7 +1502,7 @@ mod tests {
         let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&dpn_def, &sd_config).unwrap();
 
         let witness = build_dpn_witness(vec![GF::from_noncanonical_u64(200)]);
-        gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap();
+        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1507,7 +1521,7 @@ mod tests {
         let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&dpn_def, &sd_config).unwrap();
 
         let witness = build_dpn_witness(vec![GF::from_noncanonical_u64(50)]);
-        assert!(gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err());
+        assert!(gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err());
     }
 
     /// Build the smallest programmable SDKey function that authenticates the
@@ -1571,7 +1585,7 @@ mod tests {
 
         let (tx_info, inputs) = make_tx_info(5, expected_method_id as u32, &[7]);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
-        gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap();
+        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1592,7 +1606,7 @@ mod tests {
 
         let (tx_info, inputs) = make_tx_info(5, 41, &[7]);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
-        assert!(gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err());
+        assert!(gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err());
     }
 
     /// Build a programmable SDKey function that reads one calldata word from
@@ -1665,7 +1679,7 @@ mod tests {
 
         let (tx_info, inputs) = make_tx_info(5, 42, &[11, 22]);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
-        gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap();
+        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1680,7 +1694,7 @@ mod tests {
         inputs[1] = GF::from_canonical_u64(23);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
         assert!(
-            gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err(),
+            gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err(),
             "tampered calldata must fail its inputs_hash binding"
         );
     }
@@ -1694,7 +1708,7 @@ mod tests {
         let (tx_info, inputs) = make_tx_info(5, 42, &[11]);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
         assert!(
-            gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err(),
+            gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err(),
             "transaction index equal to tx_count must be out of range"
         );
     }
@@ -1705,7 +1719,7 @@ mod tests {
         let sd_config = one_transaction_sd_key_config();
         let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&dpn_def, &sd_config).unwrap();
         let witness = build_witness(vec![], vec![], 0);
-        assert!(gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err());
+        assert!(gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err());
     }
 
     #[tokio::test]
@@ -1717,7 +1731,7 @@ mod tests {
         let mut witness = build_witness(vec![tx_info], vec![inputs], 1);
         witness.tx_count = GF::ZERO;
 
-        let error = gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap_err();
+        let error = gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap_err();
         assert!(error.to_string().contains("does not match transaction info count 0"));
     }
 
@@ -1731,15 +1745,15 @@ mod tests {
             let infos = calls.iter().map(|(info, _)| *info).collect();
             let inputs = calls.into_iter().map(|(_, inputs)| inputs).collect();
             let witness = build_witness(infos, inputs, 3);
-            gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap();
+            gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
         }
 
         let empty = build_witness(vec![], vec![], 3);
-        assert!(gadget.prove(dummy_private_key(), &empty, dummy_sighash()).await.is_err());
+        assert!(gadget.prove(dummy_private_key(), &empty, witness_sighash(&empty)).await.is_err());
 
         let (disallowed, inputs) = make_tx_info(5, 43, &[]);
         let witness = build_witness(vec![disallowed], vec![inputs], 3);
-        assert!(gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err());
+        assert!(gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err());
     }
 
     #[tokio::test]
@@ -1762,11 +1776,11 @@ mod tests {
         let inputs = vec![faucet_inputs, transfer_inputs, burn_inputs];
 
         let valid = build_witness(vec![faucet, transfer, burn], inputs.clone(), 3);
-        gadget.prove(dummy_private_key(), &valid, dummy_sighash()).await.unwrap();
+        gadget.prove(dummy_private_key(), &valid, witness_sighash(&valid)).await.unwrap();
 
         transfer.caller_contract_id = GF::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64);
         let direct_transfer = build_witness(vec![faucet, transfer, burn], inputs, 3);
-        assert!(gadget.prove(dummy_private_key(), &direct_transfer, dummy_sighash()).await.is_err());
+        assert!(gadget.prove(dummy_private_key(), &direct_transfer, witness_sighash(&direct_transfer)).await.is_err());
     }
 
     fn allow_method_sd_key_config(expected_tx_count: u64) -> SDKeyConfig {
@@ -1792,7 +1806,20 @@ mod tests {
         let (tx0, inputs0) = make_tx_info(5, 6, &[1, 2]);
         let (tx1, inputs1) = make_tx_info(5, 6, &[3]);
         let witness = build_witness(vec![tx0, tx1], vec![inputs0, inputs1], 2);
-        gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap();
+        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allow_method_policy_rejects_sighash_for_another_transaction_stack() {
+        let gadget = build_allow_method_gadget(&[5], &[6], 1);
+        let (allowed, allowed_inputs) = make_tx_info(5, 6, &[1]);
+        let witness = build_witness(vec![allowed], vec![allowed_inputs], 1);
+        let (disallowed, disallowed_inputs) = make_tx_info(5, 7, &[1]);
+        let other_witness = build_witness(vec![disallowed], vec![disallowed_inputs], 1);
+        let other_sighash = witness_sighash(&other_witness);
+        assert_ne!(witness_sighash(&witness), other_sighash);
+        assert!(gadget.prove(dummy_private_key(), &witness, other_sighash).await.is_err());
+        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1802,7 +1829,7 @@ mod tests {
         let (tx0, inputs0) = make_tx_info(5, 6, &[]);
         let (tx1, inputs1) = make_tx_info(7, 8, &[]);
         let witness = build_witness(vec![tx0, tx1], vec![inputs0, inputs1], 2);
-        gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap();
+        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1810,7 +1837,7 @@ mod tests {
         let gadget = build_allow_method_gadget(&[5], &[6], 1);
         let (tx0, inputs0) = make_tx_info(5, 7, &[]);
         let witness = build_witness(vec![tx0], vec![inputs0], 1);
-        assert!(gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err());
+        assert!(gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err());
     }
 
     #[tokio::test]
@@ -1818,7 +1845,7 @@ mod tests {
         let gadget = build_allow_method_gadget(&[5], &[6], 1);
         let (tx0, inputs0) = make_tx_info(6, 6, &[]);
         let witness = build_witness(vec![tx0], vec![inputs0], 1);
-        assert!(gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err());
+        assert!(gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err());
     }
 
     #[tokio::test]
@@ -1829,7 +1856,7 @@ mod tests {
         let (tx1, inputs1) = make_tx_info(9, 6, &[]);
         let witness = build_witness(vec![tx0, tx1], vec![inputs0, inputs1], 2);
         assert!(
-            gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err(),
+            gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err(),
             "a violating transaction in a later slot must be rejected"
         );
     }
@@ -1841,7 +1868,7 @@ mod tests {
         let mut witness = build_witness(vec![tx0], vec![inputs0], 1);
         witness.tx_stack_hash.0.elements[0] += GF::ONE;
         assert!(
-            gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err(),
+            gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err(),
             "a tampered tx stack hash must break the introspection chain"
         );
     }
@@ -1855,7 +1882,7 @@ mod tests {
         let oversized_inputs = vec![11; SDKEY_MAX_CALLDATA_WORDS as usize + 1];
         let (tx_info, inputs) = make_tx_info(5, 42, &oversized_inputs);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
-        let error = gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap_err();
+        let error = gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap_err();
         assert!(
             error.to_string().contains("MAX_CALLDATA_WORDS"),
             "unexpected oversized calldata error: {error:#}"
@@ -1871,7 +1898,7 @@ mod tests {
         let calldata = (0..SDKEY_MAX_CALLDATA_WORDS as u64).collect::<Vec<_>>();
         let (tx_info, inputs) = make_tx_info(5, 42, &calldata);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
-        gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap();
+        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1883,7 +1910,7 @@ mod tests {
         let (tx_info, inputs) = make_tx_info(5, 42, &[]);
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
         assert!(
-            gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err(),
+            gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err(),
             "word zero is outside an empty calldata value"
         );
     }
@@ -1899,7 +1926,7 @@ mod tests {
         let witness = build_witness(vec![tx_info], vec![inputs], 1);
 
         assert!(
-            gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.is_err(),
+            gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err(),
             "a padded calldata target must not be readable as an arbitrary witness value"
         );
     }
@@ -1923,7 +1950,7 @@ mod tests {
             transaction_inputs.push(inputs);
         }
         let witness = build_witness(transaction_infos, transaction_inputs, MAX_INTROSPECTABLE_TRANSACTIONS);
-        gadget.prove(dummy_private_key(), &witness, dummy_sighash()).await.unwrap();
+        gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.unwrap();
     }
 
     #[test]

@@ -34,8 +34,8 @@ pub struct SDKeyDPNStateReaderContext<F: RichField> {
     pub checkpoint_stats: PsyCheckpointLeafStats<F>,
 }
 
-/// UPS end-cap signature preimage used to anchor programmable state reads to
-/// the same session context as `sig_hash`.
+/// UPS end-cap signature preimage used to bind programmable authorization,
+/// including stateless transaction introspection, to `sig_hash`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "F: Serialize + serde::de::DeserializeOwned")]
 pub struct SDKeySignatureContext<F: RichField> {
@@ -88,8 +88,9 @@ pub struct SDKeyDpnCircuitWitnessInput {
     #[serde(default)]
     pub dpn_state_reader_context: Option<SDKeyDPNStateReaderContext<GF>>,
 
-    /// Required when a programmable SDKey reads state. The circuit recomputes
-    /// the UPS sighash from this preimage and binds its roots to the VM reader.
+    /// Required for every programmable SDKey proof. The circuit recomputes
+    /// the UPS sighash from this preimage; stateful proofs also bind its roots
+    /// to the VM reader.
     #[serde(default)]
     pub signature_context: Option<SDKeySignatureContext<GF>>,
 
