@@ -1,7 +1,7 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { appendFileSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, rm, symlink, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import allConfig from "../psy-genesis/config.json";
@@ -9,11 +9,14 @@ import {
     COORDINATOR_PROCESSOR_READY_MARKER,
     REALM_PROCESSOR_READY_MARKER,
     isExactProcessorReadyLine,
-    s3CurlArgs,
+    r2CurlArgs,
     psyServicesDatabaseCommands,
     pinFaucetPerClaimAmount,
 } from "./locSetupPolicy";
 import {
+    downloadKeystoreObject,
+    fetchKeystoreManifest,
+    groupVerifies,
     ANVIL_STATE_PATH,
     ROLLBACK_STOP_SENTINEL_CONTENT,
     ROLLBACK_STOP_SENTINEL_PATH,
@@ -101,46 +104,73 @@ describe("pinFaucetPerClaimAmount", () => {
     });
 });
 
-describe("s3CurlArgs", () => {
-    it("builds a shell-free curl argv that is fail-closed, follows redirects, and shows progress", () => {
-        const args = s3CurlArgs("https://psy-protocol-devnet.s3.example/key.bin.zst", "/tmp/key.bin.zst.tmp");
-
-        // No shell: the binary is invoked directly.
-        expect(args[0]).toBe("curl");
-        expect(args).not.toContain("bash");
-        expect(args).not.toContain("-c");
-
-        // Fail-closed: HTTP 4xx/5xx must produce a non-zero exit.
-        expect(args).toContain("-f");
-
-        // Errors still surface on piped (non-TTY) stderr.
-        expect(args).toContain("-S");
-
-        // Follow S3/CDN redirects.
-        expect(args).toContain("-L");
-
-        // Visible progress forced even though stderr is piped.
-        expect(args).toContain("--progress-bar");
-
-        // Progress is never silenced.
-        expect(args).not.toContain("-s");
-        expect(args).not.toContain("--silent");
-        expect(args).not.toContain("--no-progress-meter");
-
-        // Body is written to the destination temp file (atomic temp/extract flow
-        // is the caller's responsibility); the URL is the final positional arg.
-        const oIdx = args.indexOf("-o");
-        expect(oIdx).toBeGreaterThan(-1);
-        expect(args[oIdx + 1]).toBe("/tmp/key.bin.zst.tmp");
-        expect(args[args.length - 1]).toBe("https://psy-protocol-devnet.s3.example/key.bin.zst");
+describe("public R2 keystore", () => {
+    it("uses literal anonymous HTTPS argv and rejects HTTP errors and insecure redirects", () => {
+        const dest = "/tmp/keystore space/'$(touch nope); key.zst";
+        expect(r2CurlArgs("localhost-abc123", "pk_groth16.bin.zst", dest)).toEqual([
+            "curl", "-q", "-f", "-S", "-L", "--proto", "=https", "--proto-redir", "=https", "-o", dest,
+            "https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev/localhost-abc123/pk_groth16.bin.zst",
+        ]);
+        for (const prefix of [undefined, "", "..", "a..b", "localhost/digest", "a b", "a\n", "a\\b", "a".repeat(129)]) {
+            expect(() => r2CurlArgs(prefix, "sha256sums.json", dest)).toThrow("PSY_KEYSTORE_R2_PREFIX");
+        }
+        for (const prefix of ["a", "a".repeat(128), "localhost-a_b.c-1"]) {
+            expect(r2CurlArgs(prefix, "sha256sums.json", dest).at(-1)).toBe(`https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev/${prefix}/sha256sums.json`);
+        }
     });
 
-    it("preserves the destination and url verbatim for arbitrary paths", () => {
-        const weird = "<workspace>/keystore/sub dir/circuit.bin.zst";
-        const args = s3CurlArgs("https://x.example/a/b/c", weird);
-        const oIdx = args.indexOf("-o");
-        expect(args[oIdx + 1]).toBe(weird);
-        expect(args[args.length - 1]).toBe("https://x.example/a/b/c");
+    it("fails closed on fetch, spawn and malformed manifests without logging secrets", async () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "psy-r2-"));
+        const manifestPath = path.join(dir, "sha256sums.json");
+        const previous = process.env.PSY_KEYSTORE_R2_PREFIX;
+        process.env.PSY_KEYSTORE_R2_PREFIX = "localhost-test";
+        const sentinel = "SECRET_SENTINEL_DO_NOT_LOG";
+        const log = spyOn(console, "log").mockImplementation(() => {});
+        const warn = spyOn(console, "warn").mockImplementation(() => {});
+        const error = spyOn(console, "error").mockImplementation(() => {});
+        const nativeSpawn = Bun.spawn.bind(Bun);
+        const spawn = spyOn(Bun, "spawn");
+        try {
+            // Exercise real stdout/stderr output with the downloader's stdio policy.
+            spawn.mockImplementation(((_args: unknown, options: Bun.SpawnOptions<"ignore", "ignore", "ignore">) => nativeSpawn([
+                process.execPath, "-e", `console.log('${sentinel}'); console.error('${sentinel}'); process.exit(22)`,
+            ], options)) as typeof Bun.spawn);
+            const manifest = { version: 1, files: {} as Record<string, { size: number; sha256: string }> };
+            for (const prefix of ["", "deposit_append/", "withdrawal_claim/"]) {
+                for (const name of ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"]) {
+                    manifest.files[prefix + name] = { size: 3, sha256: createHash("sha256").update("abc").digest("hex") };
+                }
+            }
+            writeFileSync(manifestPath, JSON.stringify(manifest));
+            // curl -f reports HTTP 4xx/5xx as exit 22; a retained manifest cannot rescue it.
+            await expect(fetchKeystoreManifest(manifestPath)).rejects.toThrow("exit 22");
+            expect(spawn.mock.calls[0][0]).toEqual(r2CurlArgs("localhost-test", "sha256sums.json", manifestPath));
+            expect(spawn.mock.calls[0][1]).toEqual({ stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+            spawn.mockImplementation(() => { throw new Error(sentinel); });
+            await expect(downloadKeystoreObject("sha256sums.json", manifestPath)).rejects.toThrow("exit unavailable");
+            spawn.mockImplementation((() => ({ exited: Promise.resolve(0) })) as typeof Bun.spawn);
+            await expect(fetchKeystoreManifest(manifestPath)).resolves.toEqual(manifest);
+            for (const invalid of [sentinel, "null", JSON.stringify({ ...manifest, version: 2 }),
+                JSON.stringify({ version: 1, files: {} }),
+                JSON.stringify({ ...manifest, files: { ...manifest.files, "pk_groth16.bin": { size: 3, sha256: sentinel } } }),
+                JSON.stringify({ ...manifest, files: { ...manifest.files, "pk_groth16.bin": { size: -1, sha256: "a".repeat(64) } } })]) {
+                writeFileSync(manifestPath, invalid);
+                await expect(fetchKeystoreManifest(manifestPath)).rejects.toThrow("Invalid sha256sums.json");
+            }
+            writeFileSync(path.join(dir, "pk_groth16.bin"), "abc");
+            expect(await groupVerifies(manifest, dir, ["pk_groth16.bin"])).toBe(true);
+            writeFileSync(path.join(dir, "pk_groth16.bin"), "abd");
+            expect(await groupVerifies(manifest, dir, ["pk_groth16.bin"])).toBe(false);
+            writeFileSync(path.join(dir, "pk_groth16.bin"), "abcd");
+            expect(await groupVerifies(manifest, dir, ["pk_groth16.bin"])).toBe(false);
+            expect(JSON.stringify([...log.mock.calls, ...warn.mock.calls, ...error.mock.calls])).not.toContain(sentinel);
+        } finally {
+            spawn.mockRestore();
+            log.mockRestore(); warn.mockRestore(); error.mockRestore();
+            if (previous === undefined) delete process.env.PSY_KEYSTORE_R2_PREFIX;
+            else process.env.PSY_KEYSTORE_R2_PREFIX = previous;
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 });
 
@@ -153,7 +183,7 @@ describe("runStreamingCaptureStderr", () => {
             { stderrSink: (c) => chunks.push(c) },
         );
 
-        // The exit code reaches the caller, so downloadS3File can fail-closed.
+        // Generic command callers still receive the original exit code.
         expect(result.code).toBe(4);
 
         // Diagnostics are captured for the error message...

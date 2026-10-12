@@ -493,25 +493,13 @@ export function planSupervisedRestart(opts: {
     return { action: "restart", restartCount: restartCount + 1, delayMs: nextRestartDelayMs(restartCount + 1), streak: nextStreak };
 }
 
-/**
- * Build the argv for a shell-free S3 (or any HTTP) fetch with curl, used by the
- * keystore trust-setup downloader. Pure so it can be unit-tested directly.
- *
- *   -f              fail-closed: non-zero exit on HTTP 4xx/5xx, so a truncated
- *                   or partial download never silently becomes the keystore.
- *   -S              still print error messages when stderr is not a TTY.
- *   -L              follow redirects (S3 presigned/CDN redirects).
- *   --progress-bar  force a visible progress meter even though stderr is piped
- *                   (curl suppresses its meter for non-TTY stderr by default),
- *                   so the ~hundreds-of-MB keystore downloads show live progress.
- *   -o <destPath>   write the body to the destination temp file; the atomic
- *                   temp/extract flow is handled by the caller.
- *
- * No --silent/--no-progress-meter: progress must stay visible. The argv is
- * passed straight to Bun.spawn (no shell).
- */
-export function s3CurlArgs(url: string, destPath: string): string[] {
-    return ["curl", "-f", "-S", "-L", "--progress-bar", "-o", destPath, url];
+/** Anonymous public R2 reads; no shell, curl config, or authentication required. */
+export function r2CurlArgs(prefix: string | undefined, key: string, destPath: string): string[] {
+    if (!prefix || !/^[A-Za-z0-9._-]{1,128}$/.test(prefix) || prefix.includes("..")) {
+        throw new Error("[AutoSetup] PSY_KEYSTORE_R2_PREFIX is required: one 1–128 character segment using letters, digits, '.', '_' or '-', without '..' (use localhost-<digest>)");
+    }
+    const url = `https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev/${prefix}/${key}`;
+    return ["curl", "-q", "-f", "-S", "-L", "--proto", "=https", "--proto-redir", "=https", "-o", destPath, url];
 }
 
 /**

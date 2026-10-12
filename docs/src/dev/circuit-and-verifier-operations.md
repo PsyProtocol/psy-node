@@ -386,26 +386,59 @@ The repository ownership and consumer table is at `AGENTS.md:75-93`; the applica
 ### 8.2 Release DAG
 
 ```text
-freeze and publish psy-node source revision R_node
-  ├── affected psy-compiler Cargo pins use R_node
-  ├── affected psy-services Cargo pins use R_node
-  ├── psy-sdk Cargo pins use the same R_node before WASM builds
+publish consumed psy-node source revision R_node before any consumer pin
+  ├── affected psy-compiler Cargo pins use pushed R_node
+  ├── affected psy-services Cargo pins use pushed R_node
+  ├── psy-sdk Cargo pins use the same pushed R_node before WASM generation
   └── psy-contracts changes only for L1/verifier/deployment/config inputs
 
-R_node + clean affected compiler revision
-  ├── rebuild SDK Rust
-  ├── rebuild prover WASM
-  ├── rebuild compiler WASM when compiler input changed
+pushed R_node + clean affected compiler revision
+  ├── generate SDK prover WASM for web and nodejs and compiler WASM
+  ├── keep generated bigint bindings; do not copy or cast them back to number
   ├── rebuild TypeScript packages and compare packed output
   └── generate Genesis only when Section 6.1 triggers
 
-published Genesis / contracts / authorized package versions
+published child revisions / authorized package versions
+  ├── publish each changed child and prove its SHA is on its remote destination
+  ├── update every affected gitlink, including nested SDK/DApp/Wallet links
   ├── update DApp only after required package registry confirmation
-  ├── update Wallet only after required package registry confirmation
-  └── update Genesis gitlinks only when Genesis changed
+  └── update Wallet only after required package registry confirmation
 
 commit parent psy-node generated outputs and child gitlinks last
 ```
+
+`R_node` is one consumed source revision. The user publishes that reviewed producer commit by SSH to the named destination; this procedure never pushes. If reachability is already proven, continue. Otherwise prove it before any consumer pin:
+
+```bash
+destination_ref=${MATCHING_BRANCH:-mainnet-beta}
+git -C <workspace>/psy-node fetch origin "$destination_ref"
+git -C <workspace>/psy-node merge-base --is-ancestor "$R_NODE" "origin/$destination_ref"
+```
+
+The later parent integration commit may add generated outputs and gitlinks, but consumers stay on `R_node` unless that later commit changes a consumed crate. Apply the same user-only SSH publication and reachability proof to every changed child before its gitlink moves. Parent gitlinks are last.
+
+A root checkout does not update nested gitlinks. `psy-node/.gitmodules:8-12` sets `psy-dapp` to `update = none`; SDK and Wallet each have their own `psy-genesis` gitlink, and DApp separately links both `psy-genesis` and `psy-contracts`. On a clean checkout, first run `git submodule update --init --checkout -- psy-dapp`, then check out the already-pushed child SHA inside each affected repository and stage that repository's gitlink. Do not use `--remote` or move a tracking branch. Do not assume the node parent, DApp, SDK, or Wallet links move together.
+
+Keep the existing `[patch."https://github.com/PsyProtocol/plonky2-hwa"]` sections in node, compiler, SDK, and services. They replace the proving backend across the dependency graph; do not add a second patch or a `[replace]` override for the pinned `psy-node` revision, and do not expect a root patch to be inherited by a git-pinned consumer.
+
+SDK WASM bindings are generated, not copied. From `../psy-sdk/psy-ts-sdk/packages/psy-sdk`, `pnpm build` runs `prepare:wasm`: `build:wasm` generates both `web` and `nodejs` prover bindings, and `build:wasm-compiler` writes `.compiler-artifact.json`. Commit the generated `bigint` exports. Do not replace them with `number` casts or copy an older `.d.ts` over the generated files. The package scripts default `PSY_NETWORK` to `testnet`; export `PSY_NETWORK=localhost` for a localhost cohort. Do not add a manual `wasm-pack` invocation to this procedure. SDK `make build` repeats wasm-pack, `build:wasm`, and `pnpm build`, so use the package command once.
+
+npm publication is separate from source publication and from consumer lockfile updates. A new package needs an unused version and its own authorization. DApp or Wallet may move to an existing compatible registry version without that new publication. `publish:psy-sdk`, `publish:utils`, `publish:contract-sdk`, and `publish:all` bump before publishing, so do not use them after `version:patch:*`.
+
+R2 publication has two paths. A prefix whose manifest and all nine files already passed validation is reused; do not upload it again. A separately authorized new cohort needs a fresh `localhost-<digest>` prefix. Before its first upload, require HTTP 404 for all six object names:
+
+```bash
+set -euo pipefail
+export PSY_KEYSTORE_R2_PREFIX='localhost-<digest>'
+export ARTIFACT_URL="https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev/$PSY_KEYSTORE_R2_PREFIX"
+for object in circuit_groth16.bin.zst pk_groth16.bin.zst vk_groth16.bin.zst \
+  deposit_append.tar.zst withdrawal_claim.tar.zst sha256sums.json; do
+  code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$ARTIFACT_URL/$object")
+  test "$code" = 404
+done
+```
+
+An unexpected object, partial upload, or hash mismatch blocks further writes to that prefix. Select another fresh prefix for the new cohort; do not overwrite the partial prefix and do not discard a fully verified cohort.
 
 The producer-before-consumer order and immutable node pin are defined at `AGENTS.md:113-137,167-182`. SDK pins must use the frozen node revision before WASM generation (`AGENTS.md:210-233`). Package publication is permitted only when packed bytes or a public contract changed and the exact package and version are authorized; registry confirmation precedes DApp or Wallet updates (`AGENTS.md:265-303`). Do not bump or publish unchanged packages. Do not advance a Genesis gitlink when Genesis did not change.
 
@@ -564,22 +597,25 @@ PY
 
 ### 11.1 Authorization and storage class
 
-Artifact upload requires separate exact authorization naming the target storage location and object prefix. Generation, packaging, source push, or contract deployment does not authorize upload. The public bucket configured in current source is a devnet-only default (`dev/locSetupV4.ts:1657-1660`). Custody-restricted networks must use access-controlled artifact storage; do not place their setup material in the devnet public bucket.
+Artifact upload requires separate exact authorization naming the target storage location and object prefix. Generation, packaging, source push, or contract deployment does not authorize upload. Public trust-setup objects live in Cloudflare R2 bucket `psy-proving-keystores`. Uploads require authenticated Wrangler with `--remote`; anyone can download via `https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev` without login or Wrangler. Wallet/UTC JSON and credentials are never publication objects.
 
 Do not put credential values, access keys, secret keys, session tokens, or profile names in commands, documentation, logs, or release records.
 
 ### 11.2 Objects first, manifest last
 
-After exact upload authorization, set the authorized URI and use generic commands only:
+For a new authorized cohort, select a fresh immutable prefix `localhost-<digest>` and pass the Section 8.2 vacancy test before the first upload. A fully verified existing prefix is reused without upload. `PSY_KEYSTORE_R2_PREFIX` must be one segment matching `[A-Za-z0-9._-]{1,128}`, with no `..`, slash, or whitespace. It is not a URL and has no default or legacy alias; the consumer uses the fixed public HTTPS base above. Upload authentication is inherited by Wrangler; never inspect or copy credential files into release evidence. Keep raw Wrangler output out of shared logs. Large-object upload/multipart support must be resolved by the publisher before publication; do not split objects or change the manifest schema to bypass an upload limit.
 
 ```bash
-export ARTIFACT_URI=s3://<authorized-bucket>/<authorized-prefix>
+set -e
+export PSY_KEYSTORE_R2_PREFIX='localhost-<digest>' # substitute the authorized digest
+export ARTIFACT_PREFIX="psy-proving-keystores/$PSY_KEYSTORE_R2_PREFIX"
+export ARTIFACT_URL="https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev/$PSY_KEYSTORE_R2_PREFIX"
 
-aws s3 cp "$PACKAGE_DIR/circuit_groth16.bin.zst" "$ARTIFACT_URI/circuit_groth16.bin.zst"
-aws s3 cp "$PACKAGE_DIR/pk_groth16.bin.zst" "$ARTIFACT_URI/pk_groth16.bin.zst"
-aws s3 cp "$PACKAGE_DIR/vk_groth16.bin.zst" "$ARTIFACT_URI/vk_groth16.bin.zst"
-aws s3 cp "$PACKAGE_DIR/deposit_append.tar.zst" "$ARTIFACT_URI/deposit_append.tar.zst"
-aws s3 cp "$PACKAGE_DIR/withdrawal_claim.tar.zst" "$ARTIFACT_URI/withdrawal_claim.tar.zst"
+wrangler r2 object put "$ARTIFACT_PREFIX/circuit_groth16.bin.zst" --file "$PACKAGE_DIR/circuit_groth16.bin.zst" --remote
+wrangler r2 object put "$ARTIFACT_PREFIX/pk_groth16.bin.zst" --file "$PACKAGE_DIR/pk_groth16.bin.zst" --remote
+wrangler r2 object put "$ARTIFACT_PREFIX/vk_groth16.bin.zst" --file "$PACKAGE_DIR/vk_groth16.bin.zst" --remote
+wrangler r2 object put "$ARTIFACT_PREFIX/deposit_append.tar.zst" --file "$PACKAGE_DIR/deposit_append.tar.zst" --remote
+wrangler r2 object put "$ARTIFACT_PREFIX/withdrawal_claim.tar.zst" --file "$PACKAGE_DIR/withdrawal_claim.tar.zst" --remote
 ```
 
 Do not upload `sha256sums.json` yet.
@@ -591,11 +627,11 @@ export READBACK_DIR=<tmp>/psy-groth16-readback
 rm -rf "$READBACK_DIR"
 mkdir -p "$READBACK_DIR"
 
-aws s3 cp "$ARTIFACT_URI/circuit_groth16.bin.zst" "$READBACK_DIR/circuit_groth16.bin.zst"
-aws s3 cp "$ARTIFACT_URI/pk_groth16.bin.zst" "$READBACK_DIR/pk_groth16.bin.zst"
-aws s3 cp "$ARTIFACT_URI/vk_groth16.bin.zst" "$READBACK_DIR/vk_groth16.bin.zst"
-aws s3 cp "$ARTIFACT_URI/deposit_append.tar.zst" "$READBACK_DIR/deposit_append.tar.zst"
-aws s3 cp "$ARTIFACT_URI/withdrawal_claim.tar.zst" "$READBACK_DIR/withdrawal_claim.tar.zst"
+curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/circuit_groth16.bin.zst" "$ARTIFACT_URL/circuit_groth16.bin.zst"
+curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/pk_groth16.bin.zst" "$ARTIFACT_URL/pk_groth16.bin.zst"
+curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/vk_groth16.bin.zst" "$ARTIFACT_URL/vk_groth16.bin.zst"
+curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/deposit_append.tar.zst" "$ARTIFACT_URL/deposit_append.tar.zst"
+curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/withdrawal_claim.tar.zst" "$ARTIFACT_URL/withdrawal_claim.tar.zst"
 
 cmp "$PACKAGE_DIR/circuit_groth16.bin.zst" "$READBACK_DIR/circuit_groth16.bin.zst"
 cmp "$PACKAGE_DIR/pk_groth16.bin.zst" "$READBACK_DIR/pk_groth16.bin.zst"
@@ -605,13 +641,13 @@ cmp "$PACKAGE_DIR/withdrawal_claim.tar.zst" "$READBACK_DIR/withdrawal_claim.tar.
 cp "$PACKAGE_DIR/sha256sums.json" "$READBACK_DIR/sha256sums.json"
 ```
 
-In a subshell, set `PACKAGE_DIR="$READBACK_DIR"` and repeat Section 10.4; exit the subshell before Section 11.4 so the original package directory remains selected. Any byte, decompression, path, size, or hash mismatch blocks manifest publication.
+In a subshell, set `PACKAGE_DIR="$READBACK_DIR"` and repeat Section 10.4 to validate all nine uncompressed files (circuit, proving key and verifying key for root, deposit append and withdrawal claim); exit the subshell before Section 11.4 so the original package directory remains selected. Any byte, decompression, path, size, or hash mismatch blocks manifest publication.
 
 ### 11.4 Publish manifest last and confirm
 
 ```bash
-aws s3 cp "$PACKAGE_DIR/sha256sums.json" "$ARTIFACT_URI/sha256sums.json"
-aws s3 cp "$ARTIFACT_URI/sha256sums.json" "$READBACK_DIR/sha256sums.json"
+wrangler r2 object put "$ARTIFACT_PREFIX/sha256sums.json" --file "$PACKAGE_DIR/sha256sums.json" --remote
+curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/sha256sums.json" "$ARTIFACT_URL/sha256sums.json"
 cmp "$PACKAGE_DIR/sha256sums.json" "$READBACK_DIR/sha256sums.json"
 ```
 
@@ -619,16 +655,16 @@ The manifest is the publication commit point. Never replace it before all five o
 
 ### 11.5 Clean consumer download proof
 
-Consumer verification must use an empty `<home>/.psy/keystore`, must run without `PSY_SKIP_KEYSTORE`, and must successfully fetch and parse the manifest before accepting downloaded files. The current startup path skips all download and hash verification when `PSY_SKIP_KEYSTORE=1` (`dev/locSetupV4.ts:2485-2523`). It also contains an offline existence-only fallback when manifest fetch fails (`dev/locSetupV4.ts:2436-2451,2539-2553`). Neither path is publication proof.
+Consumer verification must use an empty `<home>/.psy/keystore`, must run without `PSY_SKIP_KEYSTORE`, and must successfully fetch and parse the version-1 manifest with valid sizes and SHA-256 hashes for all nine files before accepting downloaded files. Manifest fetch/parse/version/coverage failures are fatal; size/hash mismatches require replacement and successful post-download verification. There is no automatic existence-only fallback. Exact `PSY_SKIP_KEYSTORE=1` preserves the explicit local mode requiring nine nonempty files, but that mode is not publication proof. The launcher uses anonymous HTTPS curl, disables curl configuration loading, rejects HTTP errors and non-HTTPS redirects, and suppresses raw subprocess output/spawn errors; download failures report only the object URL and exit status.
 
 For release evidence:
 
 1. Use a clean disposable home directory.
 2. Ensure `PSY_SKIP_KEYSTORE` is unset.
-3. Point `PSY_KEYSTORE_S3_BASE_URL` at the authorized object prefix when it differs from the devnet default.
+3. Set `PSY_KEYSTORE_R2_PREFIX` to the published `localhost-<digest>` segment. Consumers need curl, not Wrangler, cloud credentials, or a login.
 4. Launch the normal consumer startup path.
-5. Require a successful `sha256sums.json` fetch and `verified OK` for every downloaded group (`dev/locSetupV4.ts:2539-2619`).
-6. Reject existence-only fallback, retained local files, or `PSY_SKIP_KEYSTORE=1` as proof.
+5. Require a successful `sha256sums.json` fetch and `verified OK` for every downloaded group.
+6. Reject retained local files or `PSY_SKIP_KEYSTORE=1` as clean-download proof; repeat Section 10.4 against the read-back manifest for all nine files.
 
 ## 12. Verification and Failure Handling
 
@@ -740,7 +776,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 
 1. **Fail-closed network boundary:** never use localhost validation as evidence for another network. The current verifier JSON is globally shared, so a localhost-generated replacement requires every non-local consumer to remain blocked until distinct per-network verifier metadata is implemented and validated.
 2. **Private-key exclusion:** root `private_keys.json` and faucet operator private keys are secrets. Never package, upload, commit, paste, or publish them.
-3. **Proving-key custody:** `pk_groth16.bin` and compiled wrapper circuits require storage appropriate to the target network. The public devnet bucket is not valid custody storage for restricted networks.
+3. **Public proving artifacts:** the authorized R2 bucket `psy-proving-keystores` serves this localhost proving-artifact release publicly. Publish only the nine circuit/proving/verifying files through the package in Section 10; exclude signing keys, passwords, validator secrets, and setup randomness. Public availability does not authorize use on an unvalidated network.
 4. **Separate authorization:** source delivery, package publication, artifact upload, and deployment each require their own authorization. Upload commands must not embed credentials or profile names.
 5. **Atomic verifier deployment:** deploy a Solidity verifier only with its matching complete cohort and runtime configuration.
 6. **No dummy substitution:** dummy EndCap provers, dummy verifier JSON, lookalike circuits, and fabricated submissions are never release evidence.
