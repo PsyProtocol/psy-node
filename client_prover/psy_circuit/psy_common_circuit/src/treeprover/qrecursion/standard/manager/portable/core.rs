@@ -324,6 +324,8 @@ where
     // The serial steps start by pairing queued leaves front to back, and those
     // pairs do not depend on each other. Proving them at once yields the same
     // records in the same order, which matters when each proof is a remote call.
+    // Select using maybe-async's unified feature, not this crate's is_sync feature.
+    #[maybe_async::async_impl]
     async fn prove_leaf_pairs_concurrently<T: PortableQTreeRecursion<C, D> + ?Sized>(&mut self, circuit_mgr: &T) -> anyhow::Result<()> {
         let pair_count = self.leaf_proofs.len() / 2;
         if pair_count < 2 {
@@ -331,6 +333,21 @@ where
         }
         let leaves: Vec<_> = self.leaf_proofs.drain(..pair_count * 2).collect();
         let records = futures::future::try_join_all(leaves.chunks(2).map(|pair| self.prove_two_leaf(circuit_mgr, &pair[0], &pair[1]))).await?;
+        self.agg_proofs.extend(records);
+        Ok(())
+    }
+
+    #[maybe_async::sync_impl]
+    fn prove_leaf_pairs_concurrently<T: PortableQTreeRecursion<C, D> + ?Sized>(&mut self, circuit_mgr: &T) -> anyhow::Result<()> {
+        let pair_count = self.leaf_proofs.len() / 2;
+        if pair_count < 2 {
+            return Ok(());
+        }
+        let leaves: Vec<_> = self.leaf_proofs.drain(..pair_count * 2).collect();
+        let mut records = Vec::with_capacity(pair_count);
+        for pair in leaves.chunks(2) {
+            records.push(self.prove_two_leaf(circuit_mgr, &pair[0], &pair[1])?);
+        }
         self.agg_proofs.extend(records);
         Ok(())
     }

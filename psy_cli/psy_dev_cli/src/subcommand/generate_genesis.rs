@@ -15,7 +15,7 @@ use plonky2::{
 use psy_cli_common::key_utils::{load_wallet_key_info, WalletSourceArgs};
 use psy_client_common::args::SignType;
 use psy_core::{
-    constants::protocol::DA_CHALLENGE_WINDOW,
+    constants::protocol::{DA_CHALLENGE_WINDOW, TOKEN_BURN_METHOD_ID},
     user_id::{UserIdBitsStrategy5, UserIdGeneratorStrategy},
 };
 use psy_data::{
@@ -161,7 +161,8 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "sd-key-allowed-contract-id", default_values_t = vec![5u64, 0, 0])]
     pub sd_key_allowed_contract_ids: Vec<u64>,
 
-    #[arg(long = "sd-key-allowed-method-id", default_values_t = vec![3375543263u32, 354447671, 2923993647])]
+    /// Faucet, token transfer, and fee burn methods from the current precompile ABI.
+    #[arg(long = "sd-key-allowed-method-id", default_values_t = vec![3375543263u32, 2789897329, TOKEN_BURN_METHOD_ID])]
     pub sd_key_allowed_method_ids: Vec<u32>,
 }
 
