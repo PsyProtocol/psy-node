@@ -48,7 +48,7 @@ import {
     psySdkGenesisSubmoduleNeedsInit,
     planPsyDappNestedSubmoduleInit,
     isCompilerFingerprintSource,
-    s3CurlArgs,
+    r2CurlArgs,
     psyServicesDatabaseCommands,
     pinFaucetPerClaimAmount,
 } from "./locSetupPolicy";
@@ -1785,11 +1785,6 @@ async function waitForLogPattern(
 
 // --- Auto setup: clone repos, build binaries, install deps, download keystore ---
 
-const S3_BASE_URL = (
-    process.env.PSY_KEYSTORE_S3_BASE_URL
-    || "https://psy-protocol-devnet.s3.ap-southeast-1.amazonaws.com/assets/keystore"
-).replace(/\/+$/, "");
-
 const REPO_CONFIGS = [
     { name: "psy-services", url: "https://github.com/PsyProtocol/psy-services.git", branch: "mainnet-beta" },
     { name: "psy-wallet", url: "https://github.com/PsyProtocol/psy-wallet.git", branch: "mainnet-beta" },
@@ -2415,23 +2410,27 @@ async function ensurePsySdkArtifacts(workspaceDir: string): Promise<{ rebuilt: b
     return { rebuilt: true };
 }
 
-async function downloadS3File(key: string, destPath: string): Promise<void> {
-    const url = `${S3_BASE_URL}/${key}`;
-    console.log(`[AutoSetup] Downloading ${key}...`);
-    // Stream curl's stderr (progress meter + error messages) to the terminal so
-    // large keystore downloads show live progress, while still capturing it for
-    // the fail-closed diagnostic below. -f keeps non-2xx fatal, --progress-bar
-    // forces the meter even though stderr is piped, and the body still goes to
-    // the temp file via -o (atomic temp/extract flow handled by the caller).
-    const result = await runStreamingCaptureStderr(s3CurlArgs(url, destPath));
-    if (result.code !== 0) {
-        throw new Error(`[AutoSetup] Failed to download ${key} from ${url} to ${destPath}.\nManual recovery: download from ${url} and place at ${destPath}.\n${result.stderr}`);
+export async function downloadKeystoreObject(key: string, destPath: string): Promise<void> {
+    const args = r2CurlArgs(process.env.PSY_KEYSTORE_R2_PREFIX, key, destPath);
+    const object = args[args.length - 1];
+    console.log(`[AutoSetup] Downloading ${object}...`);
+    let code: number;
+    try {
+        // Public HTTPS needs no Wrangler or login. Keep raw subprocess output
+        // and spawn errors out of launcher diagnostics.
+        const proc = Bun.spawn(args, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+        code = await proc.exited;
+    } catch {
+        throw new Error(`[AutoSetup] Failed to download ${object} (exit unavailable)`);
+    }
+    if (code !== 0) {
+        throw new Error(`[AutoSetup] Failed to download ${object} (exit ${code})`);
     }
 }
 
 async function downloadAndExtractTar(key: string, destDir: string): Promise<void> {
     const tmpFile = path.join(destDir, path.basename(key) + ".tmp");
-    await downloadS3File(key, tmpFile);
+    await downloadKeystoreObject(key, tmpFile);
     console.log(`[AutoSetup] Extracting ${key}...`);
     // Use zstd + tar pipe for cross-platform compat (macOS BSD tar doesn't support --zstd)
     const result = await runAndCapture(["bash", "-c", `zstd -d < "${tmpFile}" | tar xf - -C "${destDir}"`]);
@@ -2524,6 +2523,28 @@ type KeystoreManifestFile = { sha256: string; size: number };
 type KeystoreManifest = { version: number; files: Record<string, KeystoreManifestFile> };
 type KeystoreGroup = { type: "zst" | "tar"; key: string; entries: string[] };
 
+export async function fetchKeystoreManifest(manifestPath: string): Promise<KeystoreManifest> {
+    await downloadKeystoreObject("sha256sums.json", manifestPath);
+    try {
+        const parsed = JSON.parse(await fs.promises.readFile(manifestPath, "utf8"));
+        if (parsed?.version !== 1 || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) {
+            throw new Error("invalid manifest");
+        }
+        for (const dir of ["", "deposit_append/", "withdrawal_claim/"]) {
+            for (const name of ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"]) {
+                const entry = parsed.files[dir + name];
+                if (!entry || typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(entry.sha256)
+                    || !Number.isSafeInteger(entry.size) || entry.size <= 0) {
+                    throw new Error("invalid manifest entry");
+                }
+            }
+        }
+        return parsed;
+    } catch {
+        throw new Error("[AutoSetup] Invalid sha256sums.json: require version 1 and size/sha256 entries for all nine trust-setup files");
+    }
+}
+
 async function digestFile(filePath: string): Promise<{ sha256: string; size: number }> {
     const handle = await fs.promises.open(filePath, "r");
     try {
@@ -2566,24 +2587,7 @@ async function verifyKeystoreEntry(
         return false;
     }
 }
-// Preserve offline restarts by falling back to existence checks when the manifest is unavailable.
-async function entryOk(
-    manifest: KeystoreManifest | null,
-    keystoreDir: string,
-    relPath: string,
-): Promise<boolean> {
-    if (manifest) return verifyKeystoreEntry(manifest, keystoreDir, relPath);
-    return exists(path.join(keystoreDir, relPath));
-}
-
-async function groupIsCurrent(manifest: KeystoreManifest | null, keystoreDir: string, entries: readonly string[]): Promise<boolean> {
-    for (const entry of entries) {
-        if (!(await entryOk(manifest, keystoreDir, entry))) return false;
-    }
-    return true;
-}
-
-async function groupVerifies(manifest: KeystoreManifest, keystoreDir: string, entries: readonly string[]): Promise<boolean> {
+export async function groupVerifies(manifest: KeystoreManifest, keystoreDir: string, entries: readonly string[]): Promise<boolean> {
     for (const entry of entries) {
         if (!(await verifyKeystoreEntry(manifest, keystoreDir, entry))) return false;
     }
@@ -2621,9 +2625,8 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
     await mkdir(path.dirname(bridgeRelayerPath), { recursive: true });
     let generated = false;
 
-    // Skip S3 download/hash verification when local keystores are intentionally managed
-    // (e.g. regenerated after circuit changes). Existence-only checks still apply below
-    // for the bridge-relayer wallet keystore.
+    // Explicit local-only mode preserves the existing nonempty-file checks.
+    // No remote failure may implicitly select this mode.
     if (process.env.PSY_SKIP_KEYSTORE === "1") {
         console.warn("[AutoSetup] PSY_SKIP_KEYSTORE=1 — skipping trust-setup download/hash verification; keeping local ~/.psy/keystore as-is");
         const requiredTrustSetupEntries = [
@@ -2675,23 +2678,11 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
         await assertExistingBridgeRelayerKeystorePassword(bridgeRelayerPath, contractsDir);
     }
 
-    // 2. Fetch the sha256sums.json manifest (tiny) that pins every trust-setup artifact.
-    //    If S3 is unreachable, degrade to existence-check only (no hash verification)
-    //    so an offline restart with a complete keystore still works.
+    // 2. Remote mode requires a valid manifest, even for a complete local setup.
     const manifestPath = path.join(keystoreDir, "sha256sums.json");
-    let manifest: KeystoreManifest | null = null;
-    try {
-        await downloadS3File("sha256sums.json", manifestPath);
-        const parsed = JSON.parse(await fs.promises.readFile(manifestPath, "utf8")) as KeystoreManifest;
-        if (parsed.version !== 1) {
-            throw new Error(`unsupported version ${parsed.version} (expected 1)`);
-        }
-        manifest = parsed;
-    } catch (error) {
-        console.warn(`[AutoSetup] Could not fetch/parse sha256sums.json (${error}). Falling back to existence-check only.`);
-    }
+    const manifest = await fetchKeystoreManifest(manifestPath);
 
-    // 3. Trust-setup groups. Each group is fetched atomically from one S3 object;
+    // 3. Trust-setup groups. Each group is fetched from one public R2 object;
     //    every member file is hash-verified against the manifest before and after.
     const groups: KeystoreGroup[] = [
         { type: "zst", key: "circuit_groth16.bin.zst", entries: ["circuit_groth16.bin"] },
@@ -2718,7 +2709,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
     ];
 
     for (const group of groups) {
-        if (await groupIsCurrent(manifest, keystoreDir, group.entries)) {
+        if (await groupVerifies(manifest, keystoreDir, group.entries)) {
             console.log(`[AutoSetup] ${group.key}: up to date, skipping`);
             continue;
         }
@@ -2727,7 +2718,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
             const destPath = path.join(keystoreDir, group.entries[0]);
             const tmpPath = path.join(keystoreDir, group.key + ".downloading");
             await rm(destPath).catch(() => undefined);
-            await downloadS3File(group.key, tmpPath);
+            await downloadKeystoreObject(group.key, tmpPath);
             console.log(`[AutoSetup] Decompressing ${group.key}...`);
             const decompressedTmp = destPath + ".decompressing";
             const result = await runAndCapture(["zstd", "-d", tmpPath, "-o", decompressedTmp, "--force"]);
@@ -2745,17 +2736,13 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
             await downloadAndExtractTar(group.key, keystoreDir);
         }
 
-        // A manifest makes post-download verification mandatory; without one,
-        // successful download/extraction remains the only available signal.
-        if (manifest) {
-            if (!(await groupVerifies(manifest, keystoreDir, group.entries))) {
-                throw new Error(
-                    `[AutoSetup] ${group.key}: post-download verification failed ` +
-                    `(size/sha256 mismatch vs sha256sums.json).`,
-                );
-            }
-            console.log(`[AutoSetup] ${group.key}: verified OK`);
+        if (!(await groupVerifies(manifest, keystoreDir, group.entries))) {
+            throw new Error(
+                `[AutoSetup] ${group.key}: post-download verification failed ` +
+                `(size/sha256 mismatch vs sha256sums.json).`,
+            );
         }
+        console.log(`[AutoSetup] ${group.key}: verified OK`);
     }
 
     return { generated };
@@ -5901,7 +5888,8 @@ Usage: bun run dev/locSetupV4.ts [options]
    - Set VITE_NETWORK=<sepolia|ethereum> and VITE_FORK=true to run anvil in fork mode; this forks the L1 named by VITE_NETWORK regardless of VITE_PSY_STAGE (VITE_PSY_STAGE picks the Psy genesis block, VITE_NETWORK+VITE_FORK pick the L1 to fork — e.g. VITE_PSY_STAGE=localhost VITE_NETWORK=sepolia VITE_FORK=true runs a local Psy chain forking public Sepolia); requires SEPOLIA_RPC_URL or ETH_RPC_URL to be set
    - Optionally set VITE_FORK_BLOCK_NUMBER=<block> to pin the fork block
    - PSY_SKIP_BRANCH_CHECK=0  explicitly enable repo fetch/checkout (default: leave every HEAD untouched)
-   - PSY_SKIP_KEYSTORE=1      keep local ~/.psy/keystore (skip S3 download/hash refresh)
+   - PSY_SKIP_KEYSTORE=1      keep local ~/.psy/keystore (skip public R2 download/hash refresh)
+   - PSY_KEYSTORE_R2_PREFIX   required for downloads: single segment localhost-<digest> in psy-proving-keystores
    - PSY_SKIP_BUILD=1         use existing Rust release binaries; fail if any are missing
    - PSY_NO_AUTO_RESTART=1    disable supervised child-process auto-restart
    - SCYLLA_SMP=<n>           Scylla shard count (default: auto from reserved CPUs)
