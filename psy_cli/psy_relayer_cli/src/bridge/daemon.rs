@@ -39,7 +39,6 @@ use crate::bridge::{
     claim_withdrawals,
     constants::{
         BRIDGE_USER_ID_U64, DEFAULT_DEPLOYMENTS_NETWORK, DEFAULT_L1_RPC_URL, DEPOSIT_TREE_CONTRACT_ID, WITHDRAWAL_TREE_CONTRACT_ID,
-        L1_GROTH16_CALL_GAS_FALLBACK, L1_MULTICALL_GAS_BUDGET,
         REALM_CHECKPOINT_POLL_INTERVAL_SECS, REALM_CHECKPOINT_POLL_TIMEOUT_SECS, DEFAULT_SDC_PATH,
     },
     finalize_bridge::{self, FinalizeBridgeAggArgs},
@@ -1602,9 +1601,7 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
         return Ok(());
     }
 
-    let aggregate_chunks = chunk_deposit_batch_append_by_gas(
-        &provider,
-        multicall3,
+    let aggregate_chunks = single_deposit_batch_append_transactions(
         calls
             .iter()
             .map(|call| Call3 {
@@ -1613,12 +1610,15 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
                 callData: call.call_data.clone(),
             })
             .collect(),
-    )
-    .await; 
+    )?;
     let aggregate_chunk_count = aggregate_chunks.len();
 
-    for (chunk_index, aggregate_calls) in aggregate_chunks.into_iter().enumerate() {
-        let chunk_len = aggregate_calls.len();
+    for (chunk_index, aggregate) in aggregate_chunks.into_iter().enumerate() {
+        let chunk_len = aggregate.calls.len();
+        let batch = &calls[chunk_index];
+        let current = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
+        ensure!(current == U256::from(batch.from_index),
+            "deposit batchAppend cursor changed before sending: expected={} actual={}", batch.from_index, current);
         let deposit_batch_commits = calls
             .iter()
             .map(|call| {
@@ -1635,9 +1635,6 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
                 )
             })
             .collect::<Vec<_>>();
-        let aggregate = aggregate3Call {
-            calls: aggregate_calls,
-        };
         let tx = TransactionRequest::default()
             .to(multicall3)
             .input(Bytes::from(aggregate.abi_encode()).into());
@@ -1687,12 +1684,18 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
             "deposit batchAppend aggregate3 transaction reverted: tx_hash={}",
             receipt.transaction_hash
         );
+        let current = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
+        ensure!(current == U256::from(batch.to_index),
+            "deposit batchAppend cursor mismatch after receipt: tx_hash={} expected={} actual={}",
+            receipt.transaction_hash, batch.to_index, current);
         tracing::info!(
             tx_hash = %receipt.transaction_hash,
             block_number = ?receipt.block_number,
             chunk_index,
             chunk_len,
             aggregate_chunk_count,
+            from_index = batch.from_index,
+            proved_after = batch.to_index,
             "deposit batchAppend aggregate3 chunk confirmed"
         );
     }
@@ -3265,81 +3268,20 @@ async fn wait_until_checkpoint_confirmed(
     }
 }
 
-/// Estimate gas for a batch deposit append by estimating on the full
-/// multicall3 aggregate3 wrapper instead of individual bridge calls.
-/// Individual bridge `batchAppend` calls can revert during estimation
-/// because `fromIndex != provedDepositCount` for the second+ call in
-/// isolation, but inside multicall3 the sequential execution carries
-/// state forward correctly.
-async fn estimate_multicall_batch_append_gas(
-    provider: &impl Provider,
-    multicall3: Address,
-    calls: &[Call3],
-) -> Vec<u64> {
-    if calls.is_empty() {
-        return Vec::new();
-    }
+// Reserve 8 KiB for the signed transaction envelope below a 128 KiB txpool
+// limit. The deployed ABI uses about 68 KiB for ONE batchAppend even when the
+// batch is partial (slotData is fixed size). Two calls exceed that limit.
+const DEPOSIT_APPEND_CALLDATA_LIMIT: usize = 128 * 1024 - 8 * 1024;
 
-    // Try estimating on the full aggregate first (this executes calls
-    // sequentially, matching real multicall3 behavior).
-    let full_aggregate = aggregate3Call {
-        calls: calls.to_vec(),
-    };
-    let full_tx = TransactionRequest::default()
-        .to(multicall3)
-        .input(Bytes::from(full_aggregate.abi_encode()).into());
-
-    let total_gas = match provider.estimate_gas(full_tx).await {
-        Ok(gas) => u64::try_from(gas).unwrap_or(u64::MAX),
-        Err(_) => {
-            // If the full aggregate cannot be estimated (e.g. too large),
-            // use the full multicall budget as the total estimate.
-            tracing::warn!(
-                n = calls.len(),
-                budget = L1_MULTICALL_GAS_BUDGET,
-                fallback_per_call = L1_GROTH16_CALL_GAS_FALLBACK,
-                "full aggregate gas estimation failed; using budget as total"
-            );
-            L1_MULTICALL_GAS_BUDGET
-        }
-    };
-
-    // Divide total gas evenly across calls, capping each at budget.
-    let n = calls.len() as u64;
-    let per_call = core::cmp::min(total_gas / n, L1_MULTICALL_GAS_BUDGET / n).max(1);
-    vec![per_call; calls.len()]
-}
-
-/// Chunk deposit batch append calls into multicall3-compatible groups
-/// using multicall-level gas estimation (avoiding per-call estimation
-/// that reverts with `InvalidBatchRange` for later calls).
-async fn chunk_deposit_batch_append_by_gas(
-    provider: &impl Provider,
-    multicall3: Address,
-    calls: Vec<Call3>,
-) -> Vec<Vec<Call3>> {
-    let gases = estimate_multicall_batch_append_gas(provider, multicall3, &calls).await;
-
-    let budget = L1_MULTICALL_GAS_BUDGET.max(1);
-    let mut chunks = Vec::new();
-    let mut current = Vec::new();
-    let mut current_gas = 0u64;
-
-    for (idx, call) in calls.into_iter().enumerate() {
-        let gas = gases.get(idx).copied().unwrap_or(L1_GROTH16_CALL_GAS_FALLBACK).max(1);
-        if !current.is_empty() && current_gas.saturating_add(gas) > budget {
-            chunks.push(current);
-            current = Vec::new();
-            current_gas = 0;
-        }
-        current.push(call);
-        current_gas = current_gas.saturating_add(gas);
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+fn single_deposit_batch_append_transactions(calls: Vec<Call3>) -> anyhow::Result<Vec<aggregate3Call>> {
+    calls.into_iter().map(|call| {
+        let aggregate = aggregate3Call { calls: vec![call] };
+        let size = aggregate.abi_encode().len();
+        ensure!(size <= DEPOSIT_APPEND_CALLDATA_LIMIT,
+            "single deposit batchAppend calldata exceeds safe transaction budget: bytes={} limit={}",
+            size, DEPOSIT_APPEND_CALLDATA_LIMIT);
+        Ok(aggregate)
+    }).collect()
 }
 
 pub(crate) async fn fetch_proved_deposit_count(provider: &impl Provider, bridge: Address) -> anyhow::Result<u32> {
@@ -3383,6 +3325,43 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn deposit_append_abi_exceeds_txpool_limit_when_two_calls_are_aggregated() {
+        let batch = prove_bridge::batchAppendCall {
+            proof: [U256::ZERO; 8],
+            publicInputs: vec![U256::ZERO; 795],
+            slotData: [U256::ZERO; 1312],
+        };
+        let calldata = Bytes::from(batch.abi_encode());
+        assert_eq!(calldata.len(), 67_748);
+        let calls = (0..3).map(|i| Call3 {
+            target: Address::from([i; 20]), allowFailure: false, callData: calldata.clone(),
+        }).collect::<Vec<_>>();
+        let oversized = aggregate3Call { calls: calls[..2].to_vec() };
+        assert_eq!(oversized.abi_encode().len(), 135_940);
+        assert!(oversized.abi_encode().len() > 128 * 1024);
+        let txs = single_deposit_batch_append_transactions(calls.clone()).unwrap();
+        assert_eq!(txs.len(), calls.len());
+        for (tx, original) in txs.iter().zip(&calls) {
+            assert_eq!(tx.calls.len(), 1);
+            assert_eq!(tx.calls[0].target, original.target);
+            assert_eq!(tx.calls[0].callData, original.callData);
+            assert!(!tx.calls[0].allowFailure);
+            assert_eq!(tx.abi_encode().len(), 68_004);
+            assert!(tx.abi_encode().len() + 8 * 1024 <= 128 * 1024);
+        }
+    }
+
+    #[test]
+    fn deposit_append_rejects_oversized_single_call_before_broadcast() {
+        let call = Call3 {
+            target: Address::ZERO, allowFailure: false,
+            callData: Bytes::from(vec![0; DEPOSIT_APPEND_CALLDATA_LIMIT]),
+        };
+        assert!(single_deposit_batch_append_transactions(vec![call]).is_err());
+        assert!(single_deposit_batch_append_transactions(Vec::new()).unwrap().is_empty());
+    }
 
     fn temp_state_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
