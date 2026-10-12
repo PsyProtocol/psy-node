@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
-        types::{Field, PrimeField64},
+        types::{Field, Field64, PrimeField64},
     },
     hash::{hash_types::HashOut, poseidon::PoseidonHash},
     plonk::{
@@ -996,6 +996,19 @@ mod signer_mode_selection_tests {
     }
 }
 
+#[cfg(test)]
+mod pinned_session_nonce_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_nonce_rejects_field_wrap_and_integer_overflow() {
+        assert_eq!(WalletSession::next_session_nonce(0).unwrap(), 1);
+        assert_eq!(WalletSession::next_session_nonce(F::ORDER - 2).unwrap(), F::ORDER - 1);
+        assert!(WalletSession::next_session_nonce(F::ORDER - 1).is_err());
+        assert!(WalletSession::next_session_nonce(u64::MAX).is_err());
+    }
+}
+
 pub fn gen_contract_deploy_and_circuits_for_functions<C: GenericConfig<D>, const D: usize>(
     deployer: u64,
     contract_state_tree_height: u8,
@@ -1509,6 +1522,18 @@ pub struct TraceBuildSession<'a> {
     multisig_start_state: Option<StateReaderResults<F>>,
 }
 impl<'a> TraceBuildSession<'a> {
+    pub fn required_fee(&self) -> anyhow::Result<u64> {
+        let lps = self.user_session_mgr.require_lps()?;
+        let slots = u64::try_from(lps.get_total_modified_slots_for_fee())?;
+        let slots = slots.checked_add(u64::from(!lps.has_positional_slot_update(psy_config::network_constants::TOKEN_CONTRACT_ID as u64, 0)))
+            .ok_or_else(|| anyhow::anyhow!("fee slot count overflow"))?;
+        let fee = psy_config::DA_FEE.checked_mul(slots).and_then(|fee| fee.checked_add(psy_config::GUTA_FEE))
+            .ok_or_else(|| anyhow::anyhow!("session fee overflow"))?;
+        anyhow::ensure!(fee < F::ORDER, "session fee is not canonical");
+        Ok(fee)
+    }
+}
+impl<'a> TraceBuildSession<'a> {
     pub async fn add_external_proof(
         &mut self,
         fingerprint: QHashOut<F>,
@@ -1568,6 +1593,8 @@ impl<'a> TraceBuildSession<'a> {
         if !self.trace_arena.steps.iter().any(|step| step.contract_id().is_some()) {
             anyhow::bail!("No contract calls to execute");
         }
+
+        self.required_fee()?;
 
         let user_session_mgr = &mut self.user_session_mgr;
         let cm = self.wallet_session.wallet.random_circuit_manager();
@@ -2171,9 +2198,12 @@ mod registration_checkpoint_tests {
     /// Realm 0 points at a dead port: registration state is global and must be
     /// served by the coordinator even when the realm is unavailable or behind.
     fn mock_provider(coordinator_url: String) -> RpcProvider {
+        let realm_url = "http://127.0.0.1:1".to_string();
+        let client = std::sync::Arc::new(reqwest::Client::new());
         RpcProvider {
-            client: std::sync::Arc::new(reqwest::Client::new()),
-            realm_configs: HashMap::from([(0, vec!["http://127.0.0.1:1".to_string()])]),
+            client: client.clone(),
+            endpoint_clients: Some(HashMap::from([(realm_url.clone(), client.clone()), (coordinator_url.clone(), client)])),
+            realm_configs: HashMap::from([(0, vec![realm_url])]),
             coordinator_configs: HashMap::from([(0, vec![coordinator_url])]),
             users_per_realm: 1_048_576,
             current_user_id: 0,
@@ -2491,7 +2521,15 @@ impl WalletSession {
     pub async fn new(rpc_config: &psy_config::NetworkConfigGoldilocks) -> anyhow::Result<Self> {
         tracing::info!("init rpc provider");
         let st_provider = RpcProvider::new_with_config(rpc_config)?;
+        Self::build_wallet_session(rpc_config, st_provider).await
+    }
 
+    pub async fn new_with_provider(rpc_config: &psy_config::NetworkConfigGoldilocks, st_provider: RpcProvider) -> anyhow::Result<Self> {
+        anyhow::ensure!(rpc_config.prove_proxy_url.iter().all(|url| url.trim().is_empty()), "injected provider sessions require local proving managers");
+        Self::build_wallet_session(rpc_config, st_provider).await
+    }
+
+    async fn build_wallet_session(rpc_config: &psy_config::NetworkConfigGoldilocks, st_provider: RpcProvider) -> anyhow::Result<Self> {
         tracing::info!("init wallet");
         tracing::info!("init ups step circuit manager");
         let mut main_circuits: Vec<Box<dyn UPSCircuitManager<C, D> + Send + Sync>> = Vec::new();
@@ -2767,6 +2805,45 @@ impl WalletSession {
     pub async fn register_multisig_user(&mut self, account: MultisigAccount) -> anyhow::Result<QHashOut<F>> {
         let pk_info = self.wallet.register_multisig_user(account)?;
         self.register_external_pk_info_on_chain(pk_info, "multisig").await
+    }
+
+    /// Requires exclusively controlled and drained registration intake until inclusion.
+    /// A submission error is ambiguous: never automatically repeat this operation.
+    pub async fn register_bridge_multisig_user(
+        &mut self,
+        account: MultisigAccount,
+        exclusive_registration_intake: bool,
+    ) -> anyhow::Result<QHashOut<F>> {
+        anyhow::ensure!(exclusive_registration_intake, "exclusive drained registration intake is required");
+        anyhow::ensure!(get_registration_id_from_user_id(524288) == 2 && psy_crypto::common::user_id::get_user_id_from_registration_id(2) == 524288, "bridge registration mapping mismatch");
+        let info = self.wallet.register_multisig_user(account)?;
+        let public_key = info.qfhash::<PsyHasher>();
+        let mut block = self.st_provider.get_coordinator_latest_block_state().await?;
+        let registered = self.st_provider.get_user_registration_tree_leaf_hash(block.checkpoint_id, 2).await?;
+        if registered == public_key {
+            let ids = self.st_provider.get_user_ids_for_public_key(public_key).await?;
+            anyhow::ensure!(ids == vec![524288], "bridge registered identity mapping conflict");
+            return Ok(public_key);
+        }
+        anyhow::ensure!(registered == QHashOut::ZERO, "AccountIdentityConflict: bridge registration slot is occupied");
+        anyhow::ensure!(block.next_user_id == 2, "bridge registration requires next registration index 2");
+        anyhow::ensure!(self.st_provider.get_user_ids_for_public_key(public_key).await?.is_empty(), "bridge public key already registered at another index");
+        self.st_provider.register_user(QRegisterUserRPCRequest { public_key: info }).await
+            .map_err(|error| anyhow::anyhow!("bridge registration submission outcome is unknown; registration may have occurred; inspect slot 2 and public key {} before any manual action; do not resubmit: {}", public_key, error))?;
+        loop {
+            self.st_provider.wait_next_checkpoint(block.checkpoint_id, None, 1).await?;
+            block = self.st_provider.get_coordinator_latest_block_state().await?;
+            let registered = self.st_provider.get_user_registration_tree_leaf_hash(block.checkpoint_id, 2).await?;
+            if registered == public_key {
+                let ids = self.st_provider.get_user_ids_for_public_key(public_key).await?;
+                anyhow::ensure!(ids == vec![524288], "bridge registration mapping {:?} is not exactly user524288; registration may have occurred at another index; no rollback or resubmission", ids);
+                return Ok(public_key);
+            }
+            if registered != QHashOut::ZERO || block.next_user_id != 2 {
+                let ids = self.st_provider.get_user_ids_for_public_key(public_key).await;
+                anyhow::bail!("AccountIdentityConflict: bridge registration raced; slot2 key={}, submitted key={}, observed user ids={:?}; submission may remain queued or have registered another index; no rollback or resubmission", registered, public_key, ids);
+            }
+        }
     }
 
     pub async fn add_multisig_user(&mut self, account: MultisigAccount) -> anyhow::Result<QHashOut<F>> {
@@ -3086,6 +3163,56 @@ impl WalletSession {
     pub async fn begin_trace_build(&self, public_key: QHashOut<F>) -> anyhow::Result<TraceBuildSession<'_>> {
         let user_session_mgr = self.build_transaction_preview_session(public_key).await?;
         self.build_trace_session(public_key, user_session_mgr).await
+    }
+
+    /// The root must be independently authenticated by the caller, not supplied by a signing request.
+    pub async fn begin_trace_build_at_checkpoint(
+        &self,
+        public_key: QHashOut<F>,
+        user_id: u64,
+        checkpoint_id: u64,
+        expected_nonce: u64,
+        verified_checkpoint_tree_root: QHashOut<F>,
+    ) -> anyhow::Result<TraceBuildSession<'_>> {
+        anyhow::ensure!(user_id < (1u64 << psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT) && checkpoint_id < (1u64 << psy_config::network_constants::CHECKPOINT_TREE_HEIGHT), "pinned session location out of range");
+        let provider = self.st_provider.with_user_id_owned(user_id);
+        let proof = provider.get_user_tree_merkle_proof(checkpoint_id, user_id).await?;
+        let is_new_user = proof.value == QHashOut::ZERO;
+        let (nonce, event_index) = if is_new_user {
+            (1, F::ZERO)
+        } else {
+            let leaf = provider.get_user_leaf_data(checkpoint_id, user_id).await?;
+            anyhow::ensure!(leaf.qfhash::<PsyHasher>() == proof.value && leaf.public_key == public_key && leaf.user_id.to_canonical_u64() == user_id, "pinned account leaf mismatch");
+            (Self::next_session_nonce(leaf.nonce.to_canonical_u64())?, leaf.event_index)
+        };
+        anyhow::ensure!(nonce == expected_nonce, "pinned session nonce mismatch");
+        let mut lps = PsyLocalProvingSessionStore::new_at(provider, F::from_canonical_u64(checkpoint_id), F::from_canonical_u64(user_id), F::from_canonical_u64(nonce), event_index, UPS_SESSION_PROOF_TREE_HEIGHT as usize);
+        lps.set_is_new_user(is_new_user);
+        let circuit_mgr = self.wallet.random_circuit_manager();
+        let manager = UserProvingSessionManager::new(lps, self.circuit_info.clone(), circuit_mgr.ups_circuit_whitelist_root().await?).await?;
+        let builder = self.build_trace_session(public_key, manager).await?;
+        let input = &builder.ups_start_witness_input;
+        let context = &input.ups_header.session_start_context;
+        anyhow::ensure!(context.checkpoint_id.to_canonical_u64() == checkpoint_id && context.checkpoint_tree_root == verified_checkpoint_tree_root, "pinned checkpoint context mismatch");
+        anyhow::ensure!(input.checkpoint_tree_proof.siblings.len() == psy_config::network_constants::CHECKPOINT_TREE_HEIGHT as usize && proof.siblings.len() == psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize, "pinned proof height mismatch");
+        anyhow::ensure!(input.checkpoint_tree_proof.index == checkpoint_id && input.checkpoint_tree_proof.root == verified_checkpoint_tree_root && input.checkpoint_tree_proof.value == input.checkpoint_leaf.qfhash::<PsyHasher>() && input.checkpoint_tree_proof.verify::<PsyHasher>(), "invalid pinned checkpoint membership");
+        anyhow::ensure!(context.checkpoint_leaf_hash == input.checkpoint_tree_proof.value && input.state_roots.qfhash::<PsyHasher>() == input.checkpoint_leaf.global_chain_root, "pinned global roots mismatch");
+        anyhow::ensure!(input.user_tree_proof == proof && proof.index == user_id && proof.root == input.state_roots.user_tree_root && proof.verify::<PsyHasher>(), "invalid pinned account membership");
+        let leaf = &context.start_session_user_leaf;
+        anyhow::ensure!(leaf.public_key == public_key && leaf.user_id.to_canonical_u64() == user_id, "pinned account identity mismatch");
+        if let Some(registration) = &builder.ups_start_registration_proof {
+            anyhow::ensure!(registration.siblings.len() == psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize, "pinned registration height mismatch");
+            anyhow::ensure!(registration.index == get_registration_id_from_user_id(user_id) && registration.root == input.state_roots.user_registration_tree_root && registration.value == public_key && registration.verify::<PsyHasher>(), "invalid pinned registration membership");
+        } else {
+            anyhow::ensure!(leaf.qfhash::<PsyHasher>() == proof.value && Self::next_session_nonce(leaf.nonce.to_canonical_u64())? == nonce && leaf.event_index == event_index, "pinned starting leaf changed");
+        }
+        Ok(builder)
+    }
+
+    fn next_session_nonce(start_nonce: u64) -> anyhow::Result<u64> {
+        let nonce = start_nonce.checked_add(1).ok_or_else(|| anyhow::anyhow!("session nonce overflow"))?;
+        anyhow::ensure!(nonce < F::ORDER, "session nonce is not canonical");
+        Ok(nonce)
     }
 
     async fn build_trace_session(

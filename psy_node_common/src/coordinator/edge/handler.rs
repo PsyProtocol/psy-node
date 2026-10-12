@@ -975,6 +975,131 @@ impl<
 
         Ok(latest_checkpoint_id)
     }
+    /// Mandatory Realm-finalize admission gate.
+    ///
+    /// Reuses the existing tree lookup, scheduled-proposer calculation and BLS
+    /// FastAggregateVerify. The scheduled proposer's certificate vote over the
+    /// proposal identity D is the off-circuit BLS authorization.
+    async fn verify_guta_certificate(
+        &self,
+        realm_id: u32,
+        input: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        proof_bytes: &[u8],
+        proposal_bytes: Option<&[u8]>,
+        certificate_bytes: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        validate_external_guta_admission(input.job_type_u32)?;
+        let proposal = Proposal::decode_exact(proposal_bytes.ok_or_else(|| {
+            anyhow::anyhow!("rotation enabled but GUTA Proposal missing for realm {realm_id}")
+        })?)
+        .map_err(|error| anyhow::anyhow!("invalid GUTA Proposal for realm {realm_id}: {error}"))?;
+        let certificate = Certificate::decode_exact(certificate_bytes.ok_or_else(|| {
+            anyhow::anyhow!("rotation enabled but GUTA Certificate missing for realm {realm_id}")
+        })?)
+        .map_err(|error| anyhow::anyhow!("invalid GUTA Certificate for realm {realm_id}: {error}"))?;
+        anyhow::ensure!(proposal.compute_proposal_id() == proposal.proposal_id, "GUTA proposal_id mismatch");
+        anyhow::ensure!(proposal.chain_id == self.chain_id, "GUTA Proposal chain_id mismatch");
+        anyhow::ensure!(proposal.realm_id == realm_id, "GUTA Proposal realm mismatch");
+        anyhow::ensure!(proposal.finalizer_proof_hash == sha256(proof_bytes), "GUTA Proposal proof hash mismatch");
+
+        let canonical_base_checkpoint_id = self
+            .db_reader
+            .get_checkpoint_id_for_checkpoint_root_hash(input.header.header.checkpoint_tree_root)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("GUTA checkpoint tree root has no canonical checkpoint ID"))?;
+        anyhow::ensure!(
+            proposal.base_checkpoint_id == canonical_base_checkpoint_id,
+            "GUTA Proposal proof-base checkpoint does not match submitted checkpoint tree root"
+        );
+        let proof_base_roots = self
+            .db_reader
+            .get_checkpoint_global_state_roots(proposal.base_checkpoint_id)
+            .await?;
+
+        let (validator_sub_ids, keys, _user_ids, _) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
+            &*self.db_reader,
+            self.chain_id,
+            proposal.base_checkpoint_id,
+            realm_id,
+            &proof_base_roots.validator_tree_root,
+        )
+        .await?;
+        anyhow::ensure!(
+            !validator_sub_ids.is_empty(),
+            "validator tree has no leaves for realm {realm_id} at checkpoint {}",
+            proposal.base_checkpoint_id
+        );
+        let proof_base_validator_tree_root = proof_base_roots.validator_tree_root.into_owned_32bytes();
+        require_nonzero_validator_tree_root(&proposal.validator_tree_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        require_nonzero_validator_tree_root(&proof_base_validator_tree_root)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        anyhow::ensure!(
+            validator_tree_root_matches_proof_base(
+                &proposal.validator_tree_root,
+                &proof_base_validator_tree_root,
+            ),
+            "GUTA Proposal validator_tree_root does not match proof-base checkpoint"
+        );
+
+        let target_checkpoint_id = proposal
+            .base_checkpoint_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
+        let rotation = parth_common::realm_rotation::RealmRotationConfig {
+            checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH,
+            validator_sub_ids: validator_sub_ids.clone(),
+        };
+        let epoch = parth_common::realm_rotation::epoch(target_checkpoint_id, CHECKPOINTS_PER_EPOCH);
+        let anchor_checkpoint_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, CHECKPOINTS_PER_EPOCH);
+        let anchor_leaf = self.db_reader.get_checkpoint_leaf_data(anchor_checkpoint_id).await?;
+        let anchor_felts = anchor_leaf.stats.random_seed.to_4_felts();
+        let anchor_seed = [
+            anchor_felts[0].to_u64_value(),
+            anchor_felts[1].to_u64_value(),
+            anchor_felts[2].to_u64_value(),
+            anchor_felts[3].to_u64_value(),
+        ];
+        let scheduled_proposer = rotation
+            .proposer_sub_id(realm_id, target_checkpoint_id, anchor_seed)?
+            .ok_or_else(|| anyhow::anyhow!("rotation enabled without a scheduled proposer"))?;
+        if proposal.proposer_sub_id != scheduled_proposer {
+            return Err(GutaSubmitError::retryable(
+                RealmFinalizeSubmitCode::NotScheduledProposer,
+                format!(
+                    "GUTA Proposal proposer {} is not scheduled proposer {} for target {}",
+                    proposal.proposer_sub_id,
+                    scheduled_proposer,
+                    target_checkpoint_id
+                ),
+            ).into());
+        }
+
+        validate_certificate(&proposal, &certificate, &validator_sub_ids, &keys).map_err(|error| {
+            GutaSubmitError::illegal(
+                RealmFinalizeSubmitCode::InvalidCertificate,
+                format!("invalid GUTA Certificate for realm {realm_id}: {error}"),
+            )
+        })?;
+        anyhow::ensure!(
+            votes_meet_wait(validator_sub_ids.len(), &certificate.signer_sub_ids()),
+            "GUTA Certificate for realm {realm_id} below replication wait"
+        );
+        anyhow::ensure!(
+            certificate_includes_proposer(&certificate, proposal.proposer_sub_id),
+            "GUTA Certificate for realm {realm_id} does not include proposer sub_id {}",
+            proposal.proposer_sub_id
+        );
+        tracing::info!(
+            "realm P2P certificate admitted realm={} proposal={} proposer_sub_id={} signers={} signer_sub_ids={:?}",
+            realm_id,
+            hex::encode(proposal.proposal_id),
+            proposal.proposer_sub_id,
+            certificate.popcount(),
+            certificate.signer_sub_ids()
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1734,131 +1859,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Mandatory Realm-finalize admission gate.
-    ///
-    /// Reuses the existing tree lookup, scheduled-proposer calculation and BLS
-    /// FastAggregateVerify. The scheduled proposer's certificate vote over the
-    /// proposal identity D is the off-circuit BLS authorization.
-    async fn verify_guta_certificate(
-        &self,
-        realm_id: u32,
-        input: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
-        proof_bytes: &[u8],
-        proposal_bytes: Option<&[u8]>,
-        certificate_bytes: Option<&[u8]>,
-    ) -> anyhow::Result<()> {
-        validate_external_guta_admission(input.job_type_u32)?;
-        let proposal = Proposal::decode_exact(proposal_bytes.ok_or_else(|| {
-            anyhow::anyhow!("rotation enabled but GUTA Proposal missing for realm {realm_id}")
-        })?)
-        .map_err(|error| anyhow::anyhow!("invalid GUTA Proposal for realm {realm_id}: {error}"))?;
-        let certificate = Certificate::decode_exact(certificate_bytes.ok_or_else(|| {
-            anyhow::anyhow!("rotation enabled but GUTA Certificate missing for realm {realm_id}")
-        })?)
-        .map_err(|error| anyhow::anyhow!("invalid GUTA Certificate for realm {realm_id}: {error}"))?;
-        anyhow::ensure!(proposal.compute_proposal_id() == proposal.proposal_id, "GUTA proposal_id mismatch");
-        anyhow::ensure!(proposal.chain_id == self.chain_id, "GUTA Proposal chain_id mismatch");
-        anyhow::ensure!(proposal.realm_id == realm_id, "GUTA Proposal realm mismatch");
-        anyhow::ensure!(proposal.finalizer_proof_hash == sha256(proof_bytes), "GUTA Proposal proof hash mismatch");
-
-        let canonical_base_checkpoint_id = self
-            .db_reader
-            .get_checkpoint_id_for_checkpoint_root_hash(input.header.header.checkpoint_tree_root)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("GUTA checkpoint tree root has no canonical checkpoint ID"))?;
-        anyhow::ensure!(
-            proposal.base_checkpoint_id == canonical_base_checkpoint_id,
-            "GUTA Proposal proof-base checkpoint does not match submitted checkpoint tree root"
-        );
-        let proof_base_roots = self
-            .db_reader
-            .get_checkpoint_global_state_roots(proposal.base_checkpoint_id)
-            .await?;
-
-        let (validator_sub_ids, keys, _user_ids, _) = load_realm_validators_from_tree::<N::HasherBase, N::QHash, _>(
-            &*self.db_reader,
-            self.chain_id,
-            proposal.base_checkpoint_id,
-            realm_id,
-            &proof_base_roots.validator_tree_root,
-        )
-        .await?;
-        anyhow::ensure!(
-            !validator_sub_ids.is_empty(),
-            "validator tree has no leaves for realm {realm_id} at checkpoint {}",
-            proposal.base_checkpoint_id
-        );
-        let proof_base_validator_tree_root = proof_base_roots.validator_tree_root.into_owned_32bytes();
-        require_nonzero_validator_tree_root(&proposal.validator_tree_root)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        require_nonzero_validator_tree_root(&proof_base_validator_tree_root)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        anyhow::ensure!(
-            validator_tree_root_matches_proof_base(
-                &proposal.validator_tree_root,
-                &proof_base_validator_tree_root,
-            ),
-            "GUTA Proposal validator_tree_root does not match proof-base checkpoint"
-        );
-
-        let target_checkpoint_id = proposal
-            .base_checkpoint_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("GUTA Proposal proof-base checkpoint overflow"))?;
-        let rotation = parth_common::realm_rotation::RealmRotationConfig {
-            checkpoints_per_epoch: CHECKPOINTS_PER_EPOCH,
-            validator_sub_ids: validator_sub_ids.clone(),
-        };
-        let epoch = parth_common::realm_rotation::epoch(target_checkpoint_id, CHECKPOINTS_PER_EPOCH);
-        let anchor_checkpoint_id = parth_common::realm_rotation::anchor_checkpoint_id(epoch, CHECKPOINTS_PER_EPOCH);
-        let anchor_leaf = self.db_reader.get_checkpoint_leaf_data(anchor_checkpoint_id).await?;
-        let anchor_felts = anchor_leaf.stats.random_seed.to_4_felts();
-        let anchor_seed = [
-            anchor_felts[0].to_u64_value(),
-            anchor_felts[1].to_u64_value(),
-            anchor_felts[2].to_u64_value(),
-            anchor_felts[3].to_u64_value(),
-        ];
-        let scheduled_proposer = rotation
-            .proposer_sub_id(realm_id, target_checkpoint_id, anchor_seed)?
-            .ok_or_else(|| anyhow::anyhow!("rotation enabled without a scheduled proposer"))?;
-        if proposal.proposer_sub_id != scheduled_proposer {
-            return Err(GutaSubmitError::retryable(
-                RealmFinalizeSubmitCode::NotScheduledProposer,
-                format!(
-                    "GUTA Proposal proposer {} is not scheduled proposer {} for target {}",
-                    proposal.proposer_sub_id,
-                    scheduled_proposer,
-                    target_checkpoint_id
-                ),
-            ).into());
-        }
-
-        validate_certificate(&proposal, &certificate, &validator_sub_ids, &keys).map_err(|error| {
-            GutaSubmitError::illegal(
-                RealmFinalizeSubmitCode::InvalidCertificate,
-                format!("invalid GUTA Certificate for realm {realm_id}: {error}"),
-            )
-        })?;
-        anyhow::ensure!(
-            votes_meet_wait(validator_sub_ids.len(), &certificate.signer_sub_ids()),
-            "GUTA Certificate for realm {realm_id} below replication wait"
-        );
-        anyhow::ensure!(
-            certificate_includes_proposer(&certificate, proposal.proposer_sub_id),
-            "GUTA Certificate for realm {realm_id} does not include proposer sub_id {}",
-            proposal.proposer_sub_id
-        );
-        tracing::info!(
-            "realm P2P certificate admitted realm={} proposal={} proposer_sub_id={} signers={} signer_sub_ids={:?}",
-            realm_id,
-            hex::encode(proposal.proposal_id),
-            proposal.proposer_sub_id,
-            certificate.popcount(),
-            certificate.signer_sub_ids()
-        );
-        Ok(())
-    }
 
 }
 

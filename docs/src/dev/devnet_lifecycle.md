@@ -82,7 +82,7 @@ CARGO_NET_GIT_FETCH_WITH_CLI=true pnpm --dir ../psy-sdk/psy-ts-sdk/packages/psy-
 make build
 ```
 
-Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions. `dev/locSetupV4.ts:2669-2725` verifies the Genesis payload and stamp before process startup. Regenerate root `genesis.json` with `make generate-genesis-data` after regenerating compiler/Genesis contract artifacts; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
+Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions. `dev/locSetupV4.ts:2669-2725` verifies the Genesis payload and stamp before process startup. Regenerate root `genesis.json` with `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT` set for `make generate-genesis-data` after regenerating compiler/Genesis contract artifacts; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
 
 ## 3. Fresh Start
 
@@ -217,7 +217,7 @@ The earlier checkpoint-289-to-0 run proved L2 rollback, convergence, and transac
 | Failure | Action |
 |---|---|
 | `compiler revision changed` | Regenerate compiler/Genesis contract artifacts, regenerate root `genesis.json`, rebuild affected release binaries, then run the artifact checks. |
-| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data`; stale embedded circuit definitions can fail prove-proxy circuit construction. |
+| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data` with both public inputs `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`; stale embedded circuit definitions can fail prove-proxy circuit construction. |
 | Cargo cannot authenticate to `git@github.com` | Set `CARGO_NET_GIT_FETCH_WITH_CLI=true`; repair empty cached submodules without deleting the whole Cargo git cache. |
 | Submodule fetch reports `early EOF` | Retry the same authenticated command. |
 | Scylla `raft operation add_entry timed out` during fresh schema creation | Run `PURGE=1 make shutdown` then `make run-all`; do not reuse the partial Scylla volume. |
