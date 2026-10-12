@@ -56,6 +56,7 @@ psy_client_data = { workspace = true }
 psy_ups_circuit = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+psy_api_core = { workspace = true }
 jsonrpsee = { workspace = true }
 home = { workspace = true }
 plonky2x = { git = "https://github.com/logere/succinctx", rev = "eec027a324be98827b4b91b4054f4cac7044ced4" }

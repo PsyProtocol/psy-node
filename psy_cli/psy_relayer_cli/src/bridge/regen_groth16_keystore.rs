@@ -210,6 +210,8 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         worker_rewards_tree_tag,
     ).context("failed to generate dummy update-contracts aggregate proof")?;
 
+    // This is a dummy proving fixture; keep the synthetic genesis stats used
+    // by the original keystore generator.
     let genesis_stats = PQEDCheckpointLeafStats::<F, QHashOut<F>>::new_empty();
     let genesis_roots = checkpoint_global_state_roots;
     let genesis_leaf = PQEDCheckpointLeaf {
@@ -329,7 +331,7 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
     let checkpoint_input_partial = QCQEDCheckpointStateTransitionInputPartial {
         part_1_header,
         old_stats: genesis_stats,
-        block_time: F::ONE,
+        block_time: genesis_stats.block_time + F::ONE,
         final_random_seed_contribution: qhash(400),
         pm_jobs_completed: PPMJobsCompletedStats {
             deploy_contracts_completed: F::ONE,
@@ -356,8 +358,12 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         last_old_checkpoint_tree_leaf_hash: QHashOut::ZERO,
         last_old_checkpoint_tree_root_hash: QHashOut::ZERO,
         previous_chain_hash: genesis_chain_hash,
+        // Only checkpoint 1 ignores the older cumulative commitment.
+        start_chain_hash: QHashOut::ZERO,
         checkpoint_state_transition_circuit_fingerprint: checkpoint_fingerprint,
     };
+    anyhow::ensure!(checkpoint_input.append_checkpoint_tree_proof.index == 1,
+        "bridge keystore fixture uses a genesis predecessor and zero older hash; target must be checkpoint 1");
     checkpoint_input.update_for_prover::<PoseidonHash>(checkpoint_reward_root);
 
     let part_1_actual_public_inputs = QHashOut::<F>::from_felt_slice(&part_1_proof.public_inputs);

@@ -14,6 +14,7 @@ pub struct VerifyRecursiveCheckpointStateTransitionProofGadget<const D: usize> {
     pub last_old_checkpoint_tree_leaf_hash: HashOutTarget,
     pub last_old_checkpoint_tree_root_hash: HashOutTarget,
     pub previous_chain_hash: HashOutTarget,
+    pub start_chain_hash: HashOutTarget,
 }
 
 impl<const D: usize> VerifyRecursiveCheckpointStateTransitionProofGadget<D> {
@@ -37,10 +38,7 @@ impl<const D: usize> VerifyRecursiveCheckpointStateTransitionProofGadget<D> {
         let last_old_checkpoint_tree_leaf_hash = builder.add_virtual_hash();
         let last_old_checkpoint_tree_root_hash = builder.add_virtual_hash();
 
-        // NOTE:
-        // In cumulative-chain mode, the previous proof public inputs are an opaque chain commitment.
-        // We must not re-derive/constraint previous transition hash here using legacy transition semantics.
-        // previous proof validity + fingerprint checks + PI linkage below are sufficient.
+        let start_chain_hash = builder.add_virtual_hash();
 
         let previous_proof_fingerprint = builder.get_circuit_fingerprint::<C::Hasher>(&previous_checkpoint_state_transition_verifier_data);
 
@@ -75,12 +73,26 @@ impl<const D: usize> VerifyRecursiveCheckpointStateTransitionProofGadget<D> {
         // Do not add a second witness-provided target for this value.
         let previous_chain_hash = actual_previous_proof_public_inputs_hash;
 
+        // Open the verified predecessor PI using this step's old state. The
+        // older chain hash is a preimage witness, not a separately trusted PI.
+        // A different old state would require a second preimage of the hash.
+        let old_state_hash = builder.hash_two_to_one::<C::Hasher>(
+            current_public_inputs_gadget.checkpoint_transition.old_checkpoint_tree_root,
+            current_public_inputs_gadget.checkpoint_transition.old_checkpoint_leaf_hash,
+        );
+        let previous_step_hash = builder.hash_two_to_one::<C::Hasher>(old_state_hash, previous_proof_fingerprint);
+        let recursive_previous_pi = builder.hash_two_to_one::<C::Hasher>(start_chain_hash, previous_step_hash);
+        let genesis_previous_pi = builder.hash_two_to_one::<C::Hasher>(old_state_hash, genesis_checkpoint_transition_proof_fingerprint);
+        builder.connect_hashes_if_true(is_previous_proof_genensis_block, previous_chain_hash, genesis_previous_pi);
+        builder.connect_hashes_if_false(is_previous_proof_genensis_block, previous_chain_hash, recursive_previous_pi);
+
         Self {
             previous_checkpoint_state_transition_verifier_data,
             previous_checkpoint_state_transition_proof_target,
             last_old_checkpoint_tree_leaf_hash,
             last_old_checkpoint_tree_root_hash,
             previous_chain_hash,
+            start_chain_hash,
         }
     }
     pub fn set_witness_params<C: GenericConfig<D, F = F>, F: RichField + Extendable<D>>(
@@ -88,7 +100,7 @@ impl<const D: usize> VerifyRecursiveCheckpointStateTransitionProofGadget<D> {
         witness: &mut impl Witness<F>,
         last_old_checkpoint_tree_leaf_hash: QHashOut<F>,
         last_old_checkpoint_tree_root_hash: QHashOut<F>,
-        _previous_chain_hash: QHashOut<F>,
+        start_chain_hash: QHashOut<F>,
         previous_checkpoint_state_transition_proof: &ProofWithPublicInputs<F, C, D>,
         previous_checkpoint_state_transition_verifier_data: &VerifierOnlyCircuitData<C, D>,
     ) -> anyhow::Result<()>
@@ -97,6 +109,7 @@ impl<const D: usize> VerifyRecursiveCheckpointStateTransitionProofGadget<D> {
     {
         witness.set_hash_target(self.last_old_checkpoint_tree_leaf_hash, last_old_checkpoint_tree_leaf_hash.0)?;
         witness.set_hash_target(self.last_old_checkpoint_tree_root_hash, last_old_checkpoint_tree_root_hash.0)?;
+        witness.set_hash_target(self.start_chain_hash, start_chain_hash.0)?;
         witness.set_verifier_data_target::<C, D>(&self.previous_checkpoint_state_transition_verifier_data, previous_checkpoint_state_transition_verifier_data)?;
         witness.set_proof_with_pis_target::<C, D>(&self.previous_checkpoint_state_transition_proof_target, previous_checkpoint_state_transition_proof)?;
         
@@ -245,7 +258,7 @@ mod tests {
     fn genesis_checkpoint_id_one_accepts_genesis_proof_and_verifier_key() {
         let genesis_circuit = QEDCheckpointStateTransitionGenesisCircuit::<C, D>::new();
         let genesis_proof = genesis_circuit
-            .prove_base(qhash(10), qhash(20), qhash(30))
+            .prove_base(qhash(10), qhash(20), genesis_circuit.fingerprint)
             .unwrap();
 
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
@@ -269,6 +282,8 @@ mod tests {
         let harness = builder.build::<C>();
 
         let mut pw = PartialWitness::<F>::new();
+        pw.set_hash_target(current_public_inputs_gadget.checkpoint_transition.old_checkpoint_tree_root, qhash(10).0).unwrap();
+        pw.set_hash_target(current_public_inputs_gadget.checkpoint_transition.old_checkpoint_leaf_hash, qhash(20).0).unwrap();
         // For genesis branch, declared_fp can be anything (connect_hashes_if_false is inactive).
         pw.set_hash_target(
             current_public_inputs_gadget.checkpoint_state_transition_circuit_fingerprint,
@@ -290,7 +305,7 @@ mod tests {
 
 
     #[test]
-    fn non_genesis_checkpoint_accepts_matching_verifier_key() {
+    fn non_genesis_checkpoint_rejects_genesis_commitment_even_with_matching_verifier_key() {
         // Build a harness that verifies a predecessor proof under the *same* common data
         // as the genesis circuit, and set declared_fp == genesis fingerprint so that
         // connect_hashes_if_false passes (prev_fp == declared_fp == genesis_fp).
@@ -335,6 +350,8 @@ mod tests {
                 &genesis_circuit.circuit_data.verifier_only,
             )
             .unwrap();
-        harness.prove(pw).unwrap();
+        pw.set_hash_target(current_public_inputs_gadget.checkpoint_transition.old_checkpoint_tree_root, qhash(10).0).unwrap();
+        pw.set_hash_target(current_public_inputs_gadget.checkpoint_transition.old_checkpoint_leaf_hash, qhash(20).0).unwrap();
+        assert!(harness.prove(pw).is_err());
     }
 }

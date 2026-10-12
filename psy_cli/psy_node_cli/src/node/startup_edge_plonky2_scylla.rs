@@ -107,6 +107,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 config.network.get_chain_id(),
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                fingerprint_config.genesis_checkpoint_state_transition_fingerprint,
                 canonical_layout_verifier_fingerprint,
                 verify_canonical_layout_proof,
             );

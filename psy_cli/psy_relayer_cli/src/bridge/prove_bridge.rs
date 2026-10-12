@@ -732,14 +732,15 @@ pub async fn run_prove_bridge_agg_with_result(
     let checkpoint_verifier_data = coordinator_circuits.checkpoint_root_transition.get_verifier_config_ref();
     let cap_height = checkpoint_verifier_data.constants_sigmas_cap.height();
     let checkpoint_state_transition_fingerprint = coordinator_circuits.checkpoint_root_transition.get_fingerprint();
-    // For step_commit, use the SAME fingerprint that RCP circuit used during genesis proving.
-    // This is NOT base_fingerprint or minifier fingerprint, but the cached library fingerprint
-    // for GenerateRollupStateTransitionProof (circuit type 32).
+    // The cached step commitment fingerprint must be the constructed final
+    // minified checkpoint fingerprint, never the base circuit fingerprint.
     use psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library;
     let cached_lib = get_cached_circuit_library::<F>();
     let checkpoint_step_commit_fingerprint = cached_lib
         .get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
         .expect("GenerateRollupStateTransitionProof not found in cached circuit library");
+    assert_eq!(checkpoint_step_commit_fingerprint, checkpoint_state_transition_fingerprint,
+        "bridge step commitment fingerprint must equal final minified checkpoint verifier fingerprint");
     let l1_config = load_l1_deployment_config(&deployments_network)?;
 
     let provider = RpcProvider::new_with_config_path(&rpc_config)?;

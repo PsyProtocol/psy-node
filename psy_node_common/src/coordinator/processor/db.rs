@@ -237,6 +237,34 @@ impl<
 
         Ok(canonical_genesis_checkpoint_state_transition_hash)
     }
+    /// Read the cumulative PI used to open a later predecessor proof.
+    pub async fn get_checkpoint_chain_hash(&self, checkpoint_id: u64) -> anyhow::Result<N::QHash> {
+        if checkpoint_id == 0 {
+            return Ok(self.genesis_verifiable_state_transition.state_transition
+                .get_chain_0_from_genesis_leaf::<N::HasherBase>(
+                    &self.circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint,
+                ));
+        }
+        let stored = self.db.get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id).await?;
+        let proof = N::ZKVerifier::try_proof_from_slice(&stored.zk_proof)?;
+        N::ZKVerifier::get_proof_public_inputs_hash(&proof)
+    }
+
+    // The coordinator is a single writer under &mut self; this recheck also
+    // rejects stale work after a restore/replay. It is not a distributed lease.
+    async fn ensure_checkpoint_predecessor_unchanged(&self, unique_pending_id: u64, proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId) -> anyhow::Result<()> {
+        anyhow::ensure!(unique_pending_id == self.ids.unique_pending_id
+            && proc_checkpoint_unique_id == self.ids.proc_checkpoint_unique_id,
+            "stale checkpoint proving generation: predecessor {}", self.ids.checkpoint_id);
+        let persisted_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
+        anyhow::ensure!(persisted_checkpoint_id == self.ids.checkpoint_id,
+            "checkpoint history changed during proving: expected predecessor {}, persisted {}", self.ids.checkpoint_id, persisted_checkpoint_id);
+        let persisted_chain_hash = self.get_checkpoint_chain_hash(self.ids.checkpoint_id).await?;
+        anyhow::ensure!(persisted_chain_hash == self.last_committed.last_chain_hash,
+            "checkpoint predecessor PI changed during proving: checkpoint {}", self.ids.checkpoint_id);
+        Ok(())
+    }
+
     pub async fn get_next_checkpoint_id(&self) -> anyhow::Result<u64> {
         let latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
         Ok(latest_checkpoint_id + 1)
@@ -1115,6 +1143,7 @@ checkpoint_backup_copy_status={}
             N::ZKVerifier::get_proof_public_inputs_hash(&checkpoint_proof)?
         };
         if checkpoint_id != 0 {
+            self.ensure_checkpoint_predecessor_unchanged(coordinator_update.unique_pending_id, coordinator_update.proc_checkpoint_unique_id).await?;
             ensure_non_genesis_checkpoint_chain_commitment::<N::F, N::QHash, N::HasherBase>(
                 checkpoint_id,
                 self.last_committed.last_chain_hash,
@@ -1885,7 +1914,7 @@ mod integration_tests {
     };
     use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTreeConstants, utils::QPGenRandom, PHash, PF};
     use psy_node_core::psy_core_db::traits::full::{
-        PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointTransitionZKProofDatabaseReader,
+        PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointTransitionZKProofDatabaseReader,
         PsyNodeContractFunctionTreeDatabaseReader, PsyNodeCoreDatabaseBasicContractInfoStoreReader,
         PsyNodeCoreDatabaseContractObjectStoreReader, PsyNodeGlobalContractTreeDatabaseReader,
     };
@@ -2012,6 +2041,31 @@ mod integration_tests {
             env.processor.ensure_genesis_applied_from_setup_data(psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(), &env.genesis_data).await?;
             Ok(env)
         }
+    }
+
+    #[tokio::test]
+    async fn predecessor_commit_gate_rejects_stale_generation_and_changed_history() -> anyhow::Result<()> {
+        let mut env = CoordinatorDbTestEnv::create_with_genesis_committed().await?;
+        let pending = env.processor.ids.unique_pending_id;
+        let proc_id = env.processor.ids.proc_checkpoint_unique_id;
+        env.processor.ensure_checkpoint_predecessor_unchanged(pending, proc_id).await?;
+        assert!(env.processor.ensure_checkpoint_predecessor_unchanged(pending + 1, proc_id).await.unwrap_err().to_string().contains("stale checkpoint proving generation"));
+        assert!(env.processor.ensure_checkpoint_predecessor_unchanged(pending, proc_id + 1).await.is_err());
+        let original = env.processor.last_committed.last_chain_hash;
+        env.processor.last_committed.last_chain_hash = zh(99);
+        assert!(env.processor.ensure_checkpoint_predecessor_unchanged(pending, proc_id).await.unwrap_err().to_string().contains("predecessor PI changed"));
+        env.processor.last_committed.last_chain_hash = original;
+        env.db.set_latest_checkpoint_id(1).await?;
+        assert!(env.processor.ensure_checkpoint_predecessor_unchanged(pending, proc_id).await.unwrap_err().to_string().contains("history changed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_chain_opening_requires_a_stored_proof() -> anyhow::Result<()> {
+        let env = CoordinatorDbTestEnv::create_with_genesis_committed().await?;
+        assert_eq!(env.processor.get_checkpoint_chain_hash(0).await?, env.processor.last_committed.last_chain_hash);
+        assert!(env.processor.get_checkpoint_chain_hash(2).await.is_err());
+        Ok(())
     }
 
     #[tokio::test]
