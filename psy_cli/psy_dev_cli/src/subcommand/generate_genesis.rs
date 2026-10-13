@@ -35,11 +35,14 @@ use psy_plonky2_circuits::node::config::networks::local_devnet::{
     get_public_key_param, ZK_FINGERPRINT_U64,
 };
 
+mod guardians_root;
+
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
 const DEFAULT_SD_KEY_FINGERPRINT: &str = "38755910c4dfb3c9bef528a4af697edced7e2607a6b769d054c4985a7000f0eb";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
+const GUARDIANS_ROOT_MAX_FEE_DEFAULT: u64 = 2_000_000_000;
 
 #[derive(Clone, Debug)]
 struct ValidatorSlot {
@@ -152,9 +155,34 @@ pub struct GenerateGenesisDataArgs {
     /// Faucet, token transfer, and fee burn methods from the current precompile ABI.
     #[arg(long = "sd-key-allowed-method-id", default_values_t = vec![3375543263u32, 2789897329, TOKEN_BURN_METHOD_ID])]
     pub sd_key_allowed_method_ids: Vec<u32>,
+
+    /// --guardians-root output directory. Reads the existing genesis and writes guardian
+    /// configuration instead of genesis.json, private_keys.json, or faucetOperators.json.
+    #[arg(long = "guardians-root")]
+    pub guardians_root: Option<PathBuf>,
+
+    /// --guardians-root input: authorized chains JSON array. Required with --guardians-root.
+    #[arg(long = "chains")]
+    pub chains: Option<PathBuf>,
+
+    /// --guardians-root input: authorized L1 endpoint JSON array. Required with --guardians-root.
+    #[arg(long = "l1-endpoints")]
+    pub l1_endpoints: Option<PathBuf>,
+
+    /// --guardians-root input: approved contract JSON array. Required with --guardians-root.
+    #[arg(long = "approved-contracts")]
+    pub approved_contracts: Option<PathBuf>,
+
+    /// --guardians-root authorization fee cap. Must be at least the compiled GUTA_FEE + DA_FEE floor.
+    #[arg(long = "max-fee")]
+    pub max_fee: Option<u64>,
 }
 
 pub async fn run(args: GenerateGenesisDataArgs) -> anyhow::Result<()> {
+    if args.guardians_root.is_some() {
+        return guardians_root::run_guardians_root(&args);
+    }
+    guardians_root::reject_publish_branch_flags(&args)?;
     generate_local_devnet_genesis(&args)
 }
 
@@ -645,7 +673,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let entries: Vec<_> = (0..7).map(|index| serde_json::json!({
             "name": if index == 6 { "multisig_policy".to_string() } else { format!("contract{index}") },
-            "deployer": Hash::from_values(index, 0, 0, 0),
+            "deployer": index,
             "code_definition": {"state_tree_height":4,"functions":[]},
             "function_whitelist":[],"code_root":Hash::get_zero_value()
         })).collect();
@@ -655,7 +683,7 @@ mod tests {
         std::fs::write(root.join(".genesis_contracts.compiler-artifact.json"), serde_json::to_vec(&stamp_fixture(&bundle)).unwrap()).unwrap();
         let contracts = load_contracts(&path).unwrap();
         for (index, contract) in contracts.iter().enumerate() {
-            assert_eq!(contract.deployer, Hash::from_values(index as u64, 0, 0, 0));
+            assert_eq!(contract.deployer, index as u64);
         }
         assert_eq!(contracts.len(), entries.len());
         std::fs::remove_dir_all(root).unwrap();
@@ -786,7 +814,7 @@ mod tests {
             let id = u64::from_le_bytes(row[..8].try_into().unwrap());
             let leaf = PQEDContractLeafV2::<F, Hash>::psy_ser_from_slice(&row[8..]).unwrap();
             let expected = &genesis.contracts[id as usize];
-            assert_eq!(leaf.deployer, expected.deployer);
+            assert_eq!(leaf.deployer, F::from_u64_value(expected.deployer));
             assert_eq!(leaf.code_root, expected.code_root);
             assert_eq!(leaf.state_tree_height.to_canonical_u64(), u64::from(expected.code_definition.state_tree_height));
             contract_tree.set_leaf_no_proof(id, parth_core::crypto::hash::traits::QFieldHashable::qfhash::<PoseidonHasher>(&leaf));

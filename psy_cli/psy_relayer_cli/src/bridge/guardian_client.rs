@@ -7,71 +7,40 @@ use psy_client_common::data::{base_types::hash256::Hash256, qhashout::QHashOut};
 use psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature;
 use psy_prover::signature::users::multisig_user::validate_policy_signatures;
 use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatures};
-use serde::Deserialize;
 
-use crate::guardian::protocol::{self, GuardianAuthorization, GuardianSignRequest, GuardianSignResponse, GuardianSignErrorResponse, GuardianSessionRecord, GuardianSessionsResponse, JsonText, MAX_BODY_BYTES};
+use guardian_common::endcap::approved_endcap_max_proof_bytes;
+use guardian_common::protocol::{self, GuardianAuthorization, GuardianClientConfig as SharedGuardianClientConfig, GuardianSignRequest, GuardianSignResponse, GuardianSignErrorResponse, GuardianSessionRecord, GuardianSessionsResponse, JsonText, MAX_BODY_BYTES};
+use guardian_common::runtime::load_authorization_archive;
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct GuardianClientConfig {
-    pub authorization_path: PathBuf,
-    pub archive_path: PathBuf,
-    pub endpoints: [String; 3],
-    pub tls_identity_path: PathBuf,
-    pub server_ca_path: PathBuf,
-    pub authorization_archive_path: PathBuf,
-    pub authorization_index_path: PathBuf,
-    pub l1_endpoints: Vec<protocol::ChainEndpoint>,
-    pub listen_address: String,
-    pub history_tls_certificate_path: PathBuf,
-    pub history_tls_private_key_path: PathBuf,
-    pub history_client_ca_path: PathBuf,
-    pub allowed_client_certificate_sha256: Vec<protocol::Hex32>,
-    #[serde(skip)]
-    config_dir: PathBuf,
+pub(crate) struct LoadedGuardianConfig {
+    pub root: guardian_common::protocol::GuardianConfig,
+    pub archive: guardian_common::runtime::AuthorizationArchive,
+    pub config_dir: PathBuf,
 }
 
-impl GuardianClientConfig {
+impl LoadedGuardianConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).map(Path::to_owned).unwrap_or(std::env::current_dir()?);
-        let filename = path.file_name().context("guardian config filename missing")?;
-        let bytes = crate::guardian::runtime::read_protected_file(&parent, Path::new(filename), MAX_BODY_BYTES)?;
-        let mut config: Self = serde_json::from_slice(&bytes)?;
-        config.config_dir = parent.to_owned();
-        for value in [&config.authorization_path, &config.archive_path, &config.tls_identity_path, &config.server_ca_path, &config.authorization_archive_path, &config.authorization_index_path, &config.history_tls_certificate_path, &config.history_tls_private_key_path, &config.history_client_ca_path] {
-            ensure!(value.is_relative() && value.components().all(|c| matches!(c, std::path::Component::Normal(_))), "guardian paths must be config-relative");
-        }
-        config.archive_path = parent.join(&config.archive_path);
-        Ok(config)
+        let root = guardian_common::protocol::GuardianConfig::load(path)?;
+        let archive = load_authorization_archive(path, approved_endcap_max_proof_bytes()?)?;
+        let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+        let config_dir = absolute.parent().filter(|parent| !parent.as_os_str().is_empty()).context("guardian config directory missing")?.to_path_buf();
+        Ok(Self { root, archive, config_dir })
     }
 
-    pub fn authorization(&self) -> anyhow::Result<GuardianAuthorization> {
-        let index = protocol::GuardianAuthorizationIndex::parse(&self.read(&self.authorization_index_path)?)?;
-        ensure!(self.authorization_path == index.archive_file(&self.authorization_archive_path, index.active_version)?, "active authorization path mismatch");
-        let authorization = index.resolve(index.active_version, &self.read(&self.authorization_path)?)?;
-        authorization.validate(psy_config::GUTA_FEE, psy_config::DA_FEE, crate::guardian::verify::approved_endcap_max_proof_bytes()?)?;
-        Ok(authorization)
+    pub fn client(&self) -> &SharedGuardianClientConfig { &self.root.client }
+
+    pub fn authorization(&self) -> anyhow::Result<&GuardianAuthorization> {
+        Ok(&self.archive.active().0)
     }
 
-    pub fn historical_authorization(&self, version: u32) -> anyhow::Result<GuardianAuthorization> {
-        let index = protocol::GuardianAuthorizationIndex::parse(&self.read(&self.authorization_index_path)?)?;
-        let authorization = index.resolve(version, &self.read(&index.archive_file(&self.authorization_archive_path, version)?)?)?;
-        authorization.validate(psy_config::GUTA_FEE, psy_config::DA_FEE, crate::guardian::verify::approved_endcap_max_proof_bytes()?)?;
-        Ok(authorization)
-    }
-
-    fn read(&self, path: &Path) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
-        Ok(crate::guardian::runtime::read_protected_file(&self.config_dir, path, MAX_BODY_BYTES)?)
+    pub fn historical_authorization(&self, version: u32) -> anyhow::Result<&GuardianAuthorization> {
+        Ok(&self.archive.resolve(version)?.0)
     }
 
     pub async fn serve_history(&self) -> anyhow::Result<()> {
         crate::guardian::service::serve_relayer_history(
-            &self.listen_address,
-            self.read(&self.history_tls_certificate_path)?.to_vec(),
-            self.read(&self.history_tls_private_key_path)?,
-            self.read(&self.history_client_ca_path)?.to_vec(),
-            self.allowed_client_certificate_sha256.clone(),
-            std::sync::Arc::new(RelayerArchive::open(&self.archive_path)?),
+            &self.client().listen_address.to_string(),
+            std::sync::Arc::new(RelayerArchive::open(&self.config_dir.join(&self.client().archive_path))?),
         ).await.map_err(Into::into)
     }
 }
@@ -82,19 +51,51 @@ pub(crate) struct GuardianClient {
 }
 
 impl GuardianClient {
-    pub fn new(config: &GuardianClientConfig) -> anyhow::Result<Self> {
+    pub fn new(config: &SharedGuardianClientConfig) -> anyhow::Result<Self> {
         let endpoints = config.endpoints.iter().map(|text| {
             let url = url::Url::parse(text)?;
-            ensure!(url.scheme() == "https" && url.host().is_some() && url.username().is_empty() && url.password().is_none() && url.path() == "/" && url.query().is_none() && url.fragment().is_none(), "guardian endpoint must be a fixed HTTPS origin");
+            ensure!(url.scheme() == "http" && url.host().is_some() && url.username().is_empty() && url.password().is_none() && (url.path() == "/" || url.path().is_empty()) && url.query().is_none() && url.fragment().is_none() && url.port().unwrap_or(80) != 0, "guardian endpoint must be a fixed HTTP origin");
             Ok(url)
         }).collect::<anyhow::Result<Vec<_>>>()?;
         ensure!(endpoints[0] != endpoints[1] && endpoints[0] != endpoints[2] && endpoints[1] != endpoints[2], "guardian origins must be distinct");
-        let identity = reqwest::Identity::from_pem(&config.read(&config.tls_identity_path)?)?;
-        let ca = reqwest::Certificate::from_pem(&config.read(&config.server_ca_path)?)?;
-        let http = reqwest::Client::builder().use_rustls_tls().tls_built_in_root_certs(false)
-            .add_root_certificate(ca).identity(identity).redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10)).build()?;
+        let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(620)).build()?;
         Ok(Self { http, endpoints: endpoints.try_into().map_err(|_| anyhow::anyhow!("three guardian endpoints required"))? })
+    }
+
+    pub async fn session_record(&self, after_nonce: u64) -> anyhow::Result<Option<GuardianSessionRecord>> {
+        let nonce = after_nonce.checked_add(1).context("history nonce overflow")?;
+        let mut selected: Option<GuardianSessionRecord> = None;
+        let mut saw_conflict = false;
+        for origin in &self.endpoints {
+            let mut url = origin.clone();
+            url.set_path("/v1/sessions");
+            url.query_pairs_mut().append_pair("after_nonce", &after_nonce.to_string()).append_pair("limit", "1");
+            let Ok(mut response) = self.http.get(url).send().await else { continue };
+            if !response.status().is_success() { continue; }
+            let mut body = Vec::new();
+            let mut failed = false;
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if body.len().checked_add(chunk.len()).is_some_and(|n| n <= MAX_BODY_BYTES) => body.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    _ => { failed = true; break; }
+                }
+            }
+            if failed { continue; }
+            let Ok(page) = protocol::parse_canonical_json::<GuardianSessionsResponse>(&body) else { continue };
+            if page.validate_page(after_nonce, 1).is_err() { continue; }
+            let Some(record) = page.sessions.into_iter().next() else { continue };
+            let Ok(request) = record.request_json.decode() else { saw_conflict = true; continue };
+            if request.session_nonce != nonce { saw_conflict = true; continue; }
+            match &selected {
+                Some(saved) if serde_json::to_vec(saved)? != serde_json::to_vec(&record)? => saw_conflict = true,
+                Some(_) => {}
+                None => selected = Some(record),
+            }
+        }
+        if saw_conflict { anyhow::bail!("authenticated guardian history conflict"); }
+        Ok(selected)
     }
 
     pub async fn collect(&self, request_json: &JsonText<GuardianSignRequest>, policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> anyhow::Result<MultisigSignatures> {
@@ -123,8 +124,20 @@ impl GuardianClient {
         }
         let mut accepted = Vec::with_capacity(3);
         while let Some(response) = pending.next().await {
-            let Ok(response) = response else { continue; };
-            let Ok(signature) = verify_response(&request, policy, message, &response) else { continue; };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(error = %error, "guardian sign response rejected");
+                    continue;
+                }
+            };
+            let signature = match verify_response(&request, policy, message, &response) {
+                Ok(signature) => signature,
+                Err(error) => {
+                    tracing::warn!(member = response.member_index, error = %error, "guardian sign response failed local verification");
+                    continue;
+                }
+            };
             accepted.push((response.member_index, signature));
             if let Some(signatures) = select_signatures(&mut accepted, policy, sighash) { return Ok(signatures); }
         }
@@ -254,12 +267,26 @@ impl RelayerArchive {
 
     pub fn save_record(&self, record: &GuardianSessionRecord, authorization: &GuardianAuthorization) -> anyhow::Result<()> {
         let request = record.validate(authorization)?;
-        let pending = self.pending_request()?.context("session record has no pending request")?;
-        ensure!(pending.as_str() == record.request_json.as_str(), "included request differs from frozen pending request");
+        let (archived, _) = self.load_session(request.session_nonce, request.request_id()?)?;
+        ensure!(archived.as_str() == record.request_json.as_str(), "included request differs from archived request");
+        // Repairing an older receipt must not consume another request's marker.
+        let remove_pending = match fs::read_to_string(self.path.join("pending.json")) {
+            Ok(bytes) => JsonText::<GuardianSignRequest>::parse(bytes)?.as_str() == record.request_json.as_str(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
         save_immutable(&self.path.join(request.session_nonce.to_string()).join("included.json"), &serde_json::to_vec(record)?)?;
-        fs::remove_file(self.path.join("pending.json"))?;
+        if remove_pending { self.remove_pending_marker()?; }
         File::open(&self.path)?.sync_all()?;
         Ok(())
+    }
+
+    fn remove_pending_marker(&self) -> anyhow::Result<()> {
+        match fs::remove_file(self.path.join("pending.json")) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("removing pending guardian request"),
+        }
     }
 
     pub fn sessions(&self, after_nonce: u64, limit: u8) -> anyhow::Result<GuardianSessionsResponse> {
@@ -357,7 +384,7 @@ mod tests {
     #[test]
     fn exact_session_lookup_distinguishes_absence_from_orphaned_evidence() {
         let (path, archive) = archive();
-        let request = protocol::codec_request_fixture();
+        let request = crate::guardian::test_fixture::codec_request_fixture();
         let request_id = request.request_id().unwrap();
         let error = archive.load_session(request.session_nonce, request_id).unwrap_err();
         assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::NotFound);
@@ -378,7 +405,7 @@ mod tests {
     #[test]
     fn exact_session_lookup_ignores_pending_and_rejects_identity_or_inclusion_corruption() {
         let (path, archive) = archive();
-        let request = protocol::codec_request_fixture();
+        let request = crate::guardian::test_fixture::codec_request_fixture();
         let request_id = request.request_id().unwrap();
         let original = JsonText::from_value(&request).unwrap();
         archive.save_request(&original).unwrap();
@@ -405,7 +432,7 @@ mod tests {
     fn structurally_valid_request_archive_recovers_without_releasing_nonce() {
         let (path, archive) = archive();
         let lock = archive.lock().unwrap();
-        let request = protocol::codec_request_fixture();
+        let request = crate::guardian::test_fixture::codec_request_fixture();
         let original = JsonText::from_value(&request).unwrap();
         archive.save_request(&original).unwrap();
         let mut changed = request.clone();
@@ -506,6 +533,40 @@ mod tests {
         fs::write(path.join("pending.json"), b"corrupt request").unwrap();
         assert!(archive.pending_request().is_err());
         assert_eq!(fs::read(path.join("pending.json")).unwrap(), b"corrupt request");
+        drop(lock);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn lost_receipt_save_tolerates_absent_pending_marker_only() {
+        let (path, archive) = archive();
+        let lock = archive.lock().unwrap();
+        let request = crate::guardian::test_fixture::codec_request_fixture();
+        archive.save_request(&JsonText::from_value(&request).unwrap()).unwrap();
+        let pending = path.join("pending.json");
+        fs::remove_file(&pending).unwrap();
+        let record = GuardianSessionRecord {
+            request_json: JsonText::from_value(&request).unwrap(),
+            signatures_json: JsonText::from_value(&MultisigSignatures { member_indices: vec![0, 2], signatures: vec![PsyCompressedSecp256K1Signature { public_key: [2; 33], signature: [1; 64], message: Hash256([0; 32]) }; 2] }).unwrap(),
+            endcap_input_json: JsonText::from_value(&psy_client_data::guta::end_cap_input::SubmitUserEndCapNonProofInput::<GoldilocksField>::default()).unwrap(),
+            endcap_proof_hex: "0x00".to_owned(), included_checkpoint_id: 1, included_checkpoint_hash: QHashOut::from_values(1, 2, 3, 4),
+        };
+        let authorization = GuardianAuthorization {
+            version: request.authorization_version, network_magic: request.network_magic, genesis_hash: request.genesis_hash, user_id: request.user_id,
+            account_json: JsonText::from_value(&psy_vm::ups::multisig::MultisigAccount { contract_id: 6, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes: [QHashOut::from_values(1, 2, 3, 4); 8] } }).unwrap(), account_public_key: QHashOut::ZERO, multisig_fingerprint: QHashOut::ZERO,
+            deposit_contract_id: 2, withdrawal_contract_id: 3, fee_contract_id: 0, guta_fee: 0, da_fee: 0, max_fee: 0, max_endcap_proof_bytes: 1, endcap_verifier_fingerprint: QHashOut::from_values(1, 2, 3, 4), chains: vec![], approved_contracts: vec![],
+        };
+        archive.save_record(&record, &authorization).unwrap();
+        let saved = fs::read(path.join("1/included.json")).unwrap();
+        fs::remove_file(path.join("1/included.json")).unwrap();
+        archive.save_record(&record, &authorization).unwrap();
+        assert_eq!(fs::read(path.join("1/included.json")).unwrap(), saved);
+        archive.save_record(&record, &authorization).unwrap();
+        assert!(!pending.exists());
+        archive.remove_pending_marker().unwrap();
+        fs::create_dir(&pending).unwrap();
+        assert!(archive.remove_pending_marker().is_err());
+        assert!(pending.is_dir());
         drop(lock);
         fs::remove_dir_all(path).unwrap();
     }

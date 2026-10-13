@@ -2521,38 +2521,48 @@ impl WalletSession {
     pub async fn new(rpc_config: &psy_config::NetworkConfigGoldilocks) -> anyhow::Result<Self> {
         tracing::info!("init rpc provider");
         let st_provider = RpcProvider::new_with_config(rpc_config)?;
-        Self::build_wallet_session(rpc_config, st_provider).await
+        Self::build_wallet_session(rpc_config, st_provider, None).await
     }
 
-    pub async fn new_with_provider(rpc_config: &psy_config::NetworkConfigGoldilocks, st_provider: RpcProvider) -> anyhow::Result<Self> {
-        anyhow::ensure!(rpc_config.prove_proxy_url.iter().all(|url| url.trim().is_empty()), "injected provider sessions require local proving managers");
-        Self::build_wallet_session(rpc_config, st_provider).await
+    pub async fn new_with_provider(rpc_config: &psy_config::NetworkConfigGoldilocks, st_provider: RpcProvider, endcap_verifier_fingerprint: Option<QHashOut<F>>) -> anyhow::Result<Self> {
+        Self::build_wallet_session(rpc_config, st_provider, endcap_verifier_fingerprint).await
     }
 
-    async fn build_wallet_session(rpc_config: &psy_config::NetworkConfigGoldilocks, st_provider: RpcProvider) -> anyhow::Result<Self> {
+    async fn build_wallet_session(rpc_config: &psy_config::NetworkConfigGoldilocks, st_provider: RpcProvider, endcap_verifier_fingerprint: Option<QHashOut<F>>) -> anyhow::Result<Self> {
         tracing::info!("init wallet");
         tracing::info!("init ups step circuit manager");
         let mut main_circuits: Vec<Box<dyn UPSCircuitManager<C, D> + Send + Sync>> = Vec::new();
 
-        let proxy_urls: Vec<_> = rpc_config.prove_proxy_url.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-
-        for proxy_url in &proxy_urls {
-            match ProveProxyRpcProvider::new_with_config((*proxy_url).to_string()).await {
-                Ok(main_circuit) => main_circuits.push(Box::new(main_circuit)),
-                Err(e) => {
-                    tracing::warn!("prove proxy url `{}` is invalid, skip: {}", proxy_url, e);
-                }
+        let proxy_urls: Vec<_> = if endcap_verifier_fingerprint.is_some() {
+            if !(1..=8).contains(&rpc_config.prove_proxy_url.len()) {
+                anyhow::bail!("prove proxy configured ({:?}) is outside the 1 to 8 URL bound", rpc_config.prove_proxy_url);
             }
+            rpc_config.prove_proxy_url.iter().map(|url| url.trim()).collect()
+        } else {
+            rpc_config.prove_proxy_url.iter().map(|url| url.trim()).filter(|url| !url.is_empty()).collect()
+        };
+        if endcap_verifier_fingerprint.is_some() && proxy_urls.iter().any(|url| url.is_empty()) {
+            anyhow::bail!("prove proxy configured ({:?}) contains an empty URL", proxy_urls);
+        }
+        for proxy_url in &proxy_urls {
+            let main_circuit = ProveProxyRpcProvider::new_with_config((*proxy_url).to_string()).await.map_err(|error| {
+                anyhow::anyhow!("prove proxy url `{proxy_url}` is unavailable: {error}; refusing to fall back to local circuit manager")
+            })?;
+            main_circuits.push(Box::new(main_circuit));
         }
         if main_circuits.is_empty() {
-            if !proxy_urls.is_empty() {
-                anyhow::bail!(
-                    "prove proxy configured ({:?}) but none are reachable; refusing to fall back to local circuit manager",
-                    proxy_urls
-                );
+            if endcap_verifier_fingerprint.is_some() {
+                anyhow::bail!("guardian proving requires a configured prove proxy");
             }
             tracing::warn!("no prove proxy configured, use local circuit manager");
             main_circuits.push(Box::new(PsyUPSStepCircuitManager::<C, D>::new_with_config(PSY_NETWORK_MAGIC)));
+        }
+        if let Some(expected) = endcap_verifier_fingerprint {
+            for manager in &main_circuits {
+                let verifier = manager.ups_end_cap_circuit_verifier_config().await?;
+                let fingerprint = QHashOut(psy_common_circuit::proof_minifier::pm_core::get_circuit_fingerprint_generic::<D, F, C>(&verifier));
+                anyhow::ensure!(fingerprint == expected, "endcap verifier fingerprint mismatch");
+            }
         }
 
         let mut canonical_eth_personal_metadata = None;
@@ -3189,7 +3199,17 @@ impl WalletSession {
         let mut lps = PsyLocalProvingSessionStore::new_at(provider, F::from_canonical_u64(checkpoint_id), F::from_canonical_u64(user_id), F::from_canonical_u64(nonce), event_index, UPS_SESSION_PROOF_TREE_HEIGHT as usize);
         lps.set_is_new_user(is_new_user);
         let circuit_mgr = self.wallet.random_circuit_manager();
-        let manager = UserProvingSessionManager::new(lps, self.circuit_info.clone(), circuit_mgr.ups_circuit_whitelist_root().await?).await?;
+        let mut manager = UserProvingSessionManager::new(lps, self.circuit_info.clone(), circuit_mgr.ups_circuit_whitelist_root().await?).await?;
+        // Mirror the proof schedule's UPS-start leaf (initial_state_from_trace). This pinned
+        // build path creates a fresh manager without initialize_transaction_session, so the
+        // leaf must be injected here; the interactive build path injects via prove_ups_start.
+        let pinned_is_new_user = manager.require_lps()?.is_new_user();
+        let pinned_fingerprint = if pinned_is_new_user { circuit_mgr.ups_start_register_user_circuit_fingerprint().await? } else { circuit_mgr.ups_start_circuit_fingerprint().await? };
+        manager.proof_tree_state.injest_single_leaf_value(
+            pinned_fingerprint,
+            manager.proof_tree_state.get_proof_tree_root().await,
+            manager.get_current_ups_header().qfhash::<PsyHasher>(),
+        ).await;
         let builder = self.build_trace_session(public_key, manager).await?;
         let input = &builder.ups_start_witness_input;
         let context = &input.ups_header.session_start_context;

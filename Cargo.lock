@@ -4010,6 +4010,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "guardian_common"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "bincode",
+ "hex",
+ "home",
+ "libc",
+ "plonky2",
+ "psy_client_common",
+ "psy_client_data",
+ "psy_config",
+ "psy_crypto",
+ "psy_plonky2_basic_helpers",
+ "psy_prover",
+ "psy_provider",
+ "psy_vm",
+ "redb",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7661,9 +7689,11 @@ dependencies = [
  "dashmap",
  "dotenv",
  "futures",
+ "guardian_common",
  "hashbrown 0.14.5",
  "hex",
  "hex-literal",
+ "home",
  "jsonrpsee",
  "k256",
  "lazy_static",
@@ -8496,6 +8526,7 @@ dependencies = [
  "clap",
  "futures",
  "gnark-plonky2-verifier-ffi",
+ "guardian_common",
  "hex",
  "home",
  "http-body-util",
@@ -8520,22 +8551,20 @@ dependencies = [
  "psy_provider",
  "psy_rpc_pool",
  "psy_ups_circuit",
+ "psy_user_cli",
  "psy_vm",
  "redb",
  "reqwest 0.12.28",
- "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
  "tiny-keccak",
  "tokio",
  "tokio-postgres",
- "tokio-rustls 0.26.4",
  "toml",
  "tower",
  "tracing",
  "tracing-subscriber",
  "url",
- "webpki-roots 1.0.4",
  "zeroize",
 ]
 

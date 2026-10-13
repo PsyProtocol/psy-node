@@ -206,11 +206,10 @@ struct WithdrawalProposerState {
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Resolve the psy-services base URL from CLI arg, env, or config.
-fn resolve_services_url(cli_url: &Option<String>, psy_config: &psy_config::PsyConfigGoldilocks) -> anyhow::Result<String> {
+fn resolve_services_url(cli_url: &Option<String>, network: &psy_config::NetworkConfigGoldilocks) -> anyhow::Result<String> {
     if let Some(url) = cli_url {
         return Ok(url.trim_end_matches('/').to_string());
     }
-    let network = psy_config.get_current_network()?;
     if let Some(urls) = &network.api_services_url {
         if let Some(first) = urls.first() {
             return Ok(first.trim_end_matches('/').to_string());
@@ -463,10 +462,11 @@ pub async fn fetch_pending_bridge_withdrawals(
     _from_checkpoint: u64,
     _to_checkpoint_exclusive: u64,
     chain_offsets: &[(u64, u64)],
+    guardian: &super::guardian_client::LoadedGuardianConfig,
 ) -> anyhow::Result<Vec<PendingWithdrawal>> {
-    let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
+
     let http = build_default_http_client()?;
-    let services_url = resolve_services_url(&args.services_url, &psy_config)?;
+    let services_url = resolve_services_url(&args.services_url, &guardian.root.network)?;
 
     let requested: Vec<(u64, u64)> = if chain_offsets.is_empty() {
         args.destination_chain_indices
@@ -600,8 +600,9 @@ pub async fn build_withdrawal_round_plan(
     args: &ProposeWithdrawalsArgs,
     from_checkpoint: u64,
     to_checkpoint_exclusive: u64,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
 ) -> anyhow::Result<WithdrawalRoundPlan> {
-    let discovered = fetch_pending_bridge_withdrawals(args, from_checkpoint, to_checkpoint_exclusive, &[]).await?;
+    let discovered = fetch_pending_bridge_withdrawals(args, from_checkpoint, to_checkpoint_exclusive, &[], guardian).await?;
     let mut plan = WithdrawalRoundPlan::default();
     for withdrawal in discovered {
         plan.append_withdrawals.push(withdrawal.clone());
@@ -614,8 +615,9 @@ pub async fn discover_withdrawals(
     args: &ProposeWithdrawalsArgs,
     from_checkpoint: u64,
     to_checkpoint_exclusive: u64,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
 ) -> anyhow::Result<Vec<PendingWithdrawal>> {
-    Ok(build_withdrawal_round_plan(args, from_checkpoint, to_checkpoint_exclusive)
+    Ok(build_withdrawal_round_plan(args, from_checkpoint, to_checkpoint_exclusive, guardian)
         .await?
         .append_withdrawals)
 }
@@ -641,10 +643,11 @@ pub async fn run_and_get_withdrawal_root(
     args: ProposeWithdrawalsArgs,
     from_checkpoint: u64,
     to_checkpoint_exclusive: u64,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
+    guardian_provider: &psy_provider::provider::RpcProvider,
 ) -> anyhow::Result<ProposeResult> {
-    let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
-    let rpc_config = psy_config.get_current_network()?.clone();
-    let provider = RpcProvider::new_with_config(&rpc_config)?;
+
+    let provider = guardian_provider;
     let http = build_default_http_client()?;
 
     let latest_checkpoint = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
@@ -678,7 +681,7 @@ pub async fn run_and_get_withdrawal_root(
 
     // Ensure psy-services/indexer has caught up past our scan range before
     // querying, so we know the result is definitive.
-    let services_url = resolve_services_url(&args.services_url, &psy_config)?;
+    let services_url = resolve_services_url(&args.services_url, &guardian.root.network)?;
     let services_latest_checkpoint = fetch_services_latest_checkpoint(&http, &services_url).await?;
     if services_latest_checkpoint <= to_checkpoint_inclusive {
         anyhow::bail!(
@@ -687,7 +690,7 @@ pub async fn run_and_get_withdrawal_root(
         );
     }
 
-    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, &[]).await?;
+    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, &[], guardian).await?;
 
     if discovered.is_empty() {
         tracing::info!(from_checkpoint, to_checkpoint_exclusive, "no withdrawal events found in range");
@@ -709,9 +712,8 @@ pub async fn run_and_get_withdrawal_root(
     // Standalone signing uses the existing guardian submission flow.
     let calls = super::daemon::build_withdrawal_batch_calls(&discovered);
     let checkpoint = super::daemon::submit_guardian_calls(
-        &args.rpc_config,
-        &args.guardian_config,
-        &provider,
+        guardian,
+        guardian_provider,
         calls,
         &discovered,
     )
@@ -727,8 +729,11 @@ pub async fn run_and_get_withdrawal_root(
 }
 
 pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
+    let history = super::guardian_client::LoadedGuardianConfig::load(std::path::Path::new(&args.guardian_config))?;
+    let external = psy_config::PsyConfigGoldilocks::builder().path(&args.rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
+    history.root.validate_rpc_network(external.get_current_network()?)?;
+    let provider = guardian_common::runtime::load_network(&history.root, history.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
     let (from_checkpoint, requested_to_checkpoint_exclusive) = resolve_scan_range(&args)?;
-    let provider = RpcProvider::new_with_config_path(&args.rpc_config)?;
     let latest_checkpoint = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
     let to_checkpoint_exclusive = requested_to_checkpoint_exclusive.min(latest_checkpoint);
 
@@ -740,10 +745,10 @@ pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
         "resolved withdrawal scan range"
     );
 
-    let history = super::guardian_client::GuardianClientConfig::load(std::path::Path::new(&args.guardian_config))?;
+
     tokio::select! {
         result = history.serve_history() => { result?; anyhow::bail!("guardian history listener stopped"); },
-        result = run_and_get_withdrawal_root(args.clone(), from_checkpoint, to_checkpoint_exclusive) => { result?; },
+        result = run_and_get_withdrawal_root(args.clone(), from_checkpoint, to_checkpoint_exclusive, &history, &provider) => { result?; },
     }
     save_state_checkpoint(&args.state_file, to_checkpoint_exclusive)?;
     Ok(())

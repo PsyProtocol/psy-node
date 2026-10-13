@@ -1,14 +1,16 @@
-use std::{convert::Infallible, future::Future, io::BufReader, path::Path, sync::Arc, time::Duration};
+use std::{convert::Infallible, future::Future, io::ErrorKind, path::{Component, Path, PathBuf}, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
-use tokio_rustls::{rustls::{self, server::WebPkiClientVerifier, RootCertStore}, TlsAcceptor};
 
-use super::protocol::{sha256, GuardianRuntimeConfig, GuardianSignError, GuardianSignErrorResponse, Hex32, MAX_BODY_BYTES};
-use super::{protocol::*, runtime::{AuthorizationArchive, SigningAuthorizationFile}, verify::{GuardianVerificationContext, GuardianAccountError}};
+use guardian_common::db::GuardianDb;
+use guardian_common::endcap::approved_endcap_max_proof_bytes;
+use guardian_common::protocol::{parse_canonical_json, sha256, validate_hash, GuardianAccount, GuardianAccountState, GuardianAuthorization, GuardianRuntimeConfig, GuardianSessionRecord, GuardianSignError, GuardianSignErrorResponse, GuardianSignRequest, GuardianSessionsResponse, HaltReason, Hash4, Hex, Hex32, GOLDILOCKS_MODULUS, MAX_BODY_BYTES};
+use guardian_common::runtime::{create_db_file, load_authorization_archive, load_network, load_signing_key, open_db_file, resolve_operator_db_path, AuthorizationArchive};
+use super::verify::{GuardianVerificationContext, GuardianAccountError};
 use psy_client_common::data::base_types::hash256::Hash256;
 use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
 use psy_crypto::hash::traits::qhashable::QFieldHashable;
@@ -63,29 +65,17 @@ struct GuardianService {
     authorizations: Vec<GuardianAuthorization>,
     wallet: psy_prover::session::session::WalletSession,
     signer: GuardianSigner,
-    signing_authorization_file: SigningAuthorizationFile,
     history_client: reqwest::Client,
     history: super::verify::GuardianHistory,
 }
-
 impl GuardianService {
-    async fn check_signing_authorization(&mut self) -> Result<(), GuardianSignError> {
-        let authorization = &self.archive.active().0;
-        match self.signing_authorization_file.check(authorization) {
-            Err(GuardianSignError::AccountHalted) => {
-                self.signer.db.halt_account(authorization.network_magic, authorization.user_id, HaltReason::SigningAuthorizationInvalid).await?;
-                Err(GuardianSignError::AccountHalted)
-            }
-            result => result,
-        }
-    }
-
     async fn observe_saved_anchors(&mut self, head: GuardianCommittedHead) -> Result<(), GuardianSignError> {
+        tracing::info!("[anchors] enter");
         let authorization = self.archive.active().0.clone();
         let mut after = None;
         loop {
             let page = self.signer.db.load_sessions(authorization.network_magic, authorization.user_id, after, 1).await?;
-            if page.is_empty() { break; }
+            if page.is_empty() { tracing::info!("[anchors] sessions exhausted"); break; }
             after = page.last().map(|entry| entry.nonce);
             let context = GuardianVerificationContext { wallet: &self.wallet, provider: &self.wallet.st_provider, verified_checkpoint_id: head.checkpoint_id,
                 verified_checkpoint_tree_root: head.checkpoint_tree_root, l1_endpoints: &self.config.l1_rpc_urls, history: &self.history };
@@ -95,7 +85,8 @@ impl GuardianService {
         after = None;
         loop {
             let page = self.signer.db.load_signed(authorization.network_magic, authorization.user_id, after, 1).await?;
-            if page.is_empty() { break; }
+            if page.is_empty() { tracing::info!("[anchors] signed exhausted"); break; }
+            tracing::info!(count = page.len(), "[anchors] verifying signed records");
             after = page.last().map(|entry| entry.nonce);
             for signed in &page {
                 let request = GuardianSignRequest::from_canonical_bytes(&signed.request_bytes)?;
@@ -110,8 +101,18 @@ impl GuardianService {
             }
             let context = GuardianVerificationContext { wallet: &self.wallet, provider: &self.wallet.st_provider, verified_checkpoint_id: head.checkpoint_id,
                 verified_checkpoint_tree_root: head.checkpoint_tree_root, l1_endpoints: &self.config.l1_rpc_urls, history: &self.history };
+            let saved = self.signer.db.load_account(authorization.network_magic, authorization.user_id).await?;
+            let unimported = page.iter().all(|signed| saved.imported_nonce.is_none_or(|imported| imported < signed.nonce));
             let result = super::verify::verify_guardian_saved_anchors(&context, &page, &self.authorizations, &[]).await;
-            self.save_account_result(result).await?;
+            match result {
+                Ok(()) => {}
+                Err(GuardianAccountError::Unavailable(GuardianSignError::EvidenceUnavailable)) if unimported => {
+                    // The saved session was never included; its L1 anchor evidence may no longer be
+                    // readable. The signature is inert until included and a rebuilt request re-signs.
+                    tracing::warn!(nonces = ?page.iter().map(|signed| signed.nonce).collect::<Vec<_>>(), "skipping anchor re-verification for un-included saved signatures with unavailable evidence");
+                }
+                Err(error) => self.save_account_result(Err(error)).await?,
+            }
         }
         Ok(())
     }
@@ -165,7 +166,9 @@ impl GuardianService {
             return Err(GuardianSignError::AccountHalted);
         }
         verify_genesis(provider, head, &authorization).await?;
+        tracing::info!(checkpoint_id = head.checkpoint_id, "[observe] genesis verified");
         self.observe_saved_anchors(head).await?;
+        tracing::info!("[observe] saved anchors verified");
         loop {
             let page = self.signer.db.load_sessions(authorization.network_magic, authorization.user_id, Some(self.history.nonce()), 1).await?;
             let Some(retained) = page.into_iter().next() else { break; };
@@ -217,7 +220,7 @@ impl GuardianService {
     }
 }
 
-async fn save_guardian_account_result<T>(db: &mut super::db::GuardianDb, network: u64, user: u64, result: Result<T, GuardianAccountError>) -> Result<T, GuardianSignError> {
+async fn save_guardian_account_result<T>(db: &mut GuardianDb, network: u64, user: u64, result: Result<T, GuardianAccountError>) -> Result<T, GuardianSignError> {
     match result {
         Ok(value) => Ok(value),
         Err(GuardianAccountError::Unavailable(error)) => Err(error),
@@ -229,82 +232,93 @@ async fn save_guardian_account_result<T>(db: &mut super::db::GuardianDb, network
 }
 
 fn enroll_guardian_account(wallet: &mut psy_prover::wallet::memory_wallet::PsyMemoryWallet, account: psy_vm::ups::multisig::MultisigAccount, fingerprint: Hash4, public_key: Hash4) -> Result<(), GuardianSignError> {
-    let identity = wallet.register_multisig_user(account).map_err(|_| GuardianSignError::AccountIdentityConflict)?;
+    let identity = wallet.register_recorded_multisig_user(account, fingerprint).map_err(|_| GuardianSignError::AccountIdentityConflict)?;
     if identity.fingerprint != fingerprint || identity.qfhash::<PsyHasher>() != public_key {
         return Err(GuardianSignError::AccountIdentityConflict);
     }
     Ok(())
 }
 
-pub async fn create_db(path: &Path) -> Result<(), GuardianSignError> {
-    let directory = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = path.file_name().ok_or(GuardianSignError::AuthorizationMismatch)?;
-    let bytes = super::runtime::read_protected_file(directory, Path::new(name), MAX_BODY_BYTES)?;
-    let config: GuardianRuntimeConfig = parse_canonical_json(&bytes)?;
-    let archive = AuthorizationArchive::load(directory, &config, super::verify::approved_endcap_max_proof_bytes()?)?;
-    let active = &archive.active().0;
-    let (network, provider) = super::runtime::load_network(directory, &config, active)?;
-    let mut wallet = psy_prover::session::session::WalletSession::new_with_provider(&network, provider).await.map_err(|_| GuardianSignError::KeyUnavailable)?;
-    enroll_guardian_account(&mut wallet.wallet, active.account_json.decode()?, active.multisig_fingerprint, active.account_public_key)?;
-    let key = super::runtime::load_signing_key(directory, &config)?;
-    let public_key = key.compressed_public_key();
-    let bytes = super::runtime::read_protected_file(directory, Path::new(&config.signing_authorization_path), MAX_BODY_BYTES)?;
-    let approval: SigningAuthorization = parse_canonical_json(&bytes)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| GuardianSignError::KeyUnavailable)?.as_secs();
-    approval.validate(active, &config, Hex(public_key), now)?;
-    let head = tokio::time::timeout(Duration::from_secs(30), load_guardian_committed_head(&wallet.st_provider, &config.l2_rpc_url)).await
-        .map_err(|_| GuardianSignError::EvidenceUnavailable)??;
-    verify_genesis(&wallet.st_provider, head, active).await?;
-    let genesis = wallet.st_provider.get_checkpoint_leaf_data(0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-    let account = GuardianAccount { network_magic: active.network_magic, user_id: active.user_id,
-        state: GuardianAccountState::Active, last_checkpoint_id: 0, last_checkpoint_hash: genesis.qfhash::<PsyHasher>(), imported_nonce: None,
-        authorization_version: active.version, halt_reason: None };
-    let (file, parent) = super::runtime::create_db_file(directory, Path::new(&config.db_path))?;
-    let db = super::db::GuardianDb::create(file, public_key, &account).await?;
-    parent.sync_all().map_err(|_| GuardianSignError::JournalUnavailable)?;
-    drop(db);
+fn resolve_db_path(config_path: &Path, db_path: &Path) -> Result<(PathBuf, PathBuf), GuardianSignError> {
+    let raw = db_path.as_os_str().as_encoded_bytes();
+    if raw.is_empty() || raw.ends_with(b"/") { return Err(GuardianSignError::AuthorizationMismatch); }
+    resolve_operator_db_path(config_path, db_path)
+}
+
+fn authenticate_key_slot(account: &psy_vm::ups::multisig::MultisigAccount, guardian_id: u8, public_key: [u8; 33]) -> Result<(), GuardianSignError> {
+    use plonky2::hash::poseidon::PoseidonPermutation;
+    use psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key;
+    let compressed = psy_client_common::data::secp256k1::CompressedPublicKey::new_from_slice(&public_key);
+    let member = hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(compressed);
+    let expected = account.initial_policy.member_hashes.get(usize::from(guardian_id.checked_sub(1).ok_or(GuardianSignError::AuthorizationMismatch)?))
+        .ok_or(GuardianSignError::AuthorizationMismatch)?;
+    if member != *expected { return Err(GuardianSignError::AccountIdentityConflict); }
     Ok(())
 }
 
-pub async fn run(path: &Path) -> Result<(), GuardianSignError> {
-    let directory = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = path.file_name().ok_or(GuardianSignError::AuthorizationMismatch)?;
-    let bytes = super::runtime::read_protected_file(directory, Path::new(name), MAX_BODY_BYTES)?;
-    let config: GuardianRuntimeConfig = parse_canonical_json(&bytes)?;
-    let archive = AuthorizationArchive::load(directory, &config, super::verify::approved_endcap_max_proof_bytes()?)?;
+async fn open_or_create_journal(directory: &Path, relative: &Path, public_key: [u8; 33], account: &GuardianAccount) -> Result<GuardianDb, GuardianSignError> {
+    match open_db_file(directory, relative) {
+        Ok(file) => {
+            if file.metadata().map_err(|_| GuardianSignError::KeyUnavailable)?.len() == 0 {
+                return Err(GuardianSignError::JournalUnavailable);
+            }
+            GuardianDb::open(file, public_key).await
+        }
+        Err(GuardianSignError::KeyUnavailable) if final_component_missing(directory, relative) => {
+            let (file, parent) = create_db_file(directory, relative)?;
+            let db = GuardianDb::create(file, public_key, account).await?;
+            parent.sync_all().map_err(|_| GuardianSignError::JournalUnavailable)?;
+            Ok(db)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn final_component_missing(directory: &Path, relative: &Path) -> bool {
+    let path = directory.join(relative);
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == ErrorKind::NotFound => path.parent().is_some_and(|parent| parent.is_dir()),
+        _ => false,
+    }
+}
+
+
+pub async fn run(config_path: &Path, guardian_id: u8, db_path: &Path) -> Result<(), GuardianSignError> {
+    if !(1..=3).contains(&guardian_id) { return Err(GuardianSignError::AuthorizationMismatch); }
+    let (db_directory, db_relative) = resolve_db_path(config_path, db_path)?;
+    let proof_bound = approved_endcap_max_proof_bytes()?;
+    let loaded = guardian_common::protocol::GuardianConfig::load(config_path)?;
+    let archive = load_authorization_archive(config_path, proof_bound)?;
+    let runtime = loaded.build_runtime_config(config_path, guardian_id, db_path, &archive.index)?;
+    runtime.validate(&archive.active().0, &archive.index)?;
     let active = archive.active().0.clone();
-    let (network, provider) = super::runtime::load_network(directory, &config, &active)?;
-    let mut wallet = psy_prover::session::session::WalletSession::new_with_provider(&network, provider).await.map_err(|_| GuardianSignError::KeyUnavailable)?;
+    let provider = load_network(&loaded, &active)?;
+    let mut wallet = psy_prover::session::session::WalletSession::new_with_provider(&loaded.network, provider, Some(active.endcap_verifier_fingerprint)).await.map_err(|_| GuardianSignError::KeyUnavailable)?;
     enroll_guardian_account(&mut wallet.wallet, active.account_json.decode()?, active.multisig_fingerprint, active.account_public_key)?;
-    let key = super::runtime::load_signing_key(directory, &config)?;
+    let key = load_signing_key(&runtime)?;
     let public_key = key.compressed_public_key();
-    let file = super::runtime::open_db_file(directory, Path::new(&config.db_path))?;
-    let mut signing_authorization_file = SigningAuthorizationFile::load(directory, &config, Hex(public_key), &file)?;
-    signing_authorization_file.check(&active)?;
-    let mut db = super::db::GuardianDb::open(file, public_key).await?;
-    let head = tokio::time::timeout(Duration::from_secs(30), load_guardian_committed_head(&wallet.st_provider, &config.l2_rpc_url)).await
+    authenticate_key_slot(&active.account_json.decode()?, guardian_id, public_key)?;
+    let head = tokio::time::timeout(Duration::from_secs(30), load_guardian_committed_head(&wallet.st_provider, &runtime.l2_rpc_url)).await
         .map_err(|_| GuardianSignError::EvidenceUnavailable)??;
     verify_genesis(&wallet.st_provider, head, &active).await?;
+    let genesis = wallet.st_provider.get_checkpoint_leaf_data(0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+    let created = GuardianAccount { network_magic: active.network_magic, user_id: active.user_id,
+        state: GuardianAccountState::Active, last_checkpoint_id: 0, last_checkpoint_hash: genesis.qfhash::<PsyHasher>(), imported_nonce: None,
+        authorization_version: active.version, halt_reason: None };
+    let mut db = open_or_create_journal(&db_directory, &db_relative, public_key, &created).await?;
     db.load_account(active.network_magic, active.user_id).await?;
-    let certificate = super::runtime::read_protected_file(directory, Path::new(&config.tls_certificate_path), MAX_BODY_BYTES)?;
-    let tls_key = super::runtime::read_protected_file(directory, Path::new(&config.tls_private_key_path), MAX_BODY_BYTES)?;
-    let ca = super::runtime::read_protected_file(directory, Path::new(&config.client_ca_path), MAX_BODY_BYTES)?;
-    let acceptor = tls_acceptor(&certificate, &tls_key, &ca)?;
-    let mut identity = zeroize::Zeroizing::new(certificate.to_vec());
-    identity.extend_from_slice(&tls_key);
     let history_client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(30))
-        .identity(reqwest::Identity::from_pem(&identity).map_err(|_| GuardianSignError::KeyUnavailable)?)
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca).map_err(|_| GuardianSignError::AuthorizationMismatch)?)
         .build().map_err(|_| GuardianSignError::KeyUnavailable)?;
     let authorizations = archive.authorizations();
     let history = super::verify::GuardianHistory::new();
     for authorization in &authorizations {
-        history.validate_authorization_artifacts(authorization)?;
+        history.validate_authorization_artifacts(authorization, &wallet).await?;
     }
-    let service = Arc::new(tokio::sync::Mutex::new(GuardianService { config: config.clone(), archive, authorizations, wallet,
-        signer: GuardianSigner { db, key, public_key }, signing_authorization_file, history_client, history }));
-    let listener = TcpListener::bind(&config.listen_address).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+    let config = runtime.clone();
+    let service = Arc::new(tokio::sync::Mutex::new(GuardianService { config, archive, authorizations, wallet,
+        signer: GuardianSigner { db, key, public_key }, history_client, history }));
+    let listener = TcpListener::bind(&runtime.listen_address).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
     let observer_service = service.clone();
     let (stop, mut stopping) = tokio::sync::watch::channel(false);
     let observer = tokio::spawn(async move {
@@ -316,17 +330,15 @@ pub async fn run(path: &Path) -> Result<(), GuardianSignError> {
                 _ = stopping.changed() => break,
                 _ = interval.tick() => {
                     let mut service = observer_service.lock().await;
-                    match service.check_signing_authorization().await {
-                        Err(error) => warn_observer_authorization(&mut warned, Some(error)),
-                        Ok(()) => warn_observer_authorization(&mut warned, None),
-                    }
-                    let _ = tokio::time::timeout(Duration::from_secs(30), service.observe()).await;
+                    let observed = tokio::time::timeout(Duration::from_secs(30), service.observe()).await;
+                    let observer_error = match observed { Err(_) => Some(GuardianSignError::EvidenceUnavailable), Ok(result) => result.err() };
+                    warn_observer_authorization(&mut warned, observer_error);
                 }
             }
         }
     });
     let shutdown_service = service.clone();
-    let result = serve_tls(listener, acceptor, config.allowed_client_certificate_sha256, move |request| {
+    let result = serve_http(listener, move |request| {
         let service = service.clone();
         async move { handle_request(service, request).await }
     }).await;
@@ -371,52 +383,55 @@ async fn handle_request(service: Arc<tokio::sync::Mutex<GuardianService>>, reque
     };
     let signing = tokio::spawn(async move {
     let _permit = permit;
-    let mut service = tokio::time::timeout(Duration::from_secs(120), service.lock()).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-    let prepared = tokio::time::timeout(Duration::from_secs(120), async {
-        service.check_signing_authorization().await?;
-        for burn in &request.withdrawal_records {
-            service.wallet.st_provider.get_realm_url(u64::from(burn.sender_user_id)).map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-        }
-        let head = service.observe().await?;
+    let mut service = tokio::time::timeout(Duration::from_secs(600), service.lock()).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+    let cached = {
         let existing = service.signer.db.lookup_signed(request.network_magic, request.user_id, request.session_nonce).await?;
         let canonical_bytes = request.canonical_bytes()?;
         if request.authorization_version != service.archive.index.active_version && existing.as_ref().is_none_or(|signed| signed.request_bytes != canonical_bytes) {
             return Err(GuardianSignError::AuthorizationMismatch);
         }
-        let mut prefix = None;
-        if service.history.nonce() >= request.session_nonce {
-            if existing.as_ref().is_none_or(|signed| signed.request_bytes != canonical_bytes || signed.signature.is_none()) {
-                return Err(GuardianSignError::NonceConflict);
+        existing.filter(|signed| signed.request_bytes == canonical_bytes && signed.signature.is_some())
+    };
+    let result = if cached.is_some() {
+        let public_key = service.signer.public_key;
+        authorize_cached_response(&mut service.signer.db, &request, public_key).await
+    } else {
+        let prepared = tokio::time::timeout(Duration::from_secs(600), async {
+            for burn in &request.withdrawal_records {
+                service.wallet.st_provider.get_realm_url(u64::from(burn.sender_user_id)).map_err(|_| GuardianSignError::EvidenceUnavailable)?;
             }
-            let mut history = super::verify::GuardianHistory::new();
-            while history.nonce().checked_add(1).is_some_and(|nonce| nonce < request.session_nonce) {
-                let page = service.signer.db.load_sessions(request.network_magic, request.user_id, Some(history.nonce()), 1).await?;
-                let session = page.first().ok_or(GuardianSignError::HistoryUnavailable)?;
-                history.apply(session)?;
-            }
-            prefix = Some(history);
-        }
-        let (authorization, bytes) = service.archive.resolve(request.authorization_version)?;
-        let context = GuardianVerificationContext { wallet: &service.wallet, provider: &service.wallet.st_provider, verified_checkpoint_id: head.checkpoint_id,
-            verified_checkpoint_tree_root: head.checkpoint_tree_root, l1_endpoints: &service.config.l1_rpc_urls, history: prefix.as_ref().unwrap_or(&service.history) };
-        let result = super::verify::verify_guardian_session(&context, authorization, &request).await;
-        let bytes = bytes.clone();
-        let verified = save_guardian_account_result(&mut service.signer.db, request.network_magic, request.user_id, result).await?;
-        Ok::<_, GuardianSignError>((verified, bytes))
-    }).await;
-    let result = match prepared {
-        Ok(Ok((verified, bytes))) => {
-            match service.check_signing_authorization().await {
-                Err(error) => Err(error),
-                Ok(()) => {
-                    let active = service.archive.active().0.clone();
-                    let GuardianService { signer, signing_authorization_file, .. } = &mut *service;
-                    signer.sign_verified(&request, &bytes, &verified, signing_authorization_file, &active).await
+            let canonical_bytes = request.canonical_bytes()?;
+            let existing = service.signer.db.lookup_signed(request.network_magic, request.user_id, request.session_nonce).await?;
+            let head = service.observe().await?;
+            let mut prefix = None;
+            if service.history.nonce() >= request.session_nonce {
+                if existing.as_ref().is_none_or(|signed| signed.request_bytes != canonical_bytes || signed.signature.is_none()) {
+                    return Err(GuardianSignError::NonceConflict);
                 }
+                let mut history = super::verify::GuardianHistory::new();
+                while history.nonce().checked_add(1).is_some_and(|nonce| nonce < request.session_nonce) {
+                    let page = service.signer.db.load_sessions(request.network_magic, request.user_id, Some(history.nonce()), 1).await?;
+                    let session = page.first().ok_or(GuardianSignError::HistoryUnavailable)?;
+                    history.apply(session)?;
+                }
+                prefix = Some(history);
             }
+            let (authorization, bytes) = service.archive.resolve(request.authorization_version)?;
+            let context = GuardianVerificationContext { wallet: &service.wallet, provider: &service.wallet.st_provider, verified_checkpoint_id: head.checkpoint_id,
+                verified_checkpoint_tree_root: head.checkpoint_tree_root, l1_endpoints: &service.config.l1_rpc_urls, history: prefix.as_ref().unwrap_or(&service.history) };
+            let result = super::verify::verify_guardian_session(&context, authorization, &request).await;
+            let bytes = bytes.clone();
+            let verified = save_guardian_account_result(&mut service.signer.db, request.network_magic, request.user_id, result).await?;
+            Ok::<_, GuardianSignError>((verified, bytes))
+        }).await;
+        match prepared {
+            Ok(Ok((verified, bytes))) => {
+                let GuardianService { signer, .. } = &mut *service;
+                signer.sign_verified(&request, &bytes, &verified).await
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(GuardianSignError::EvidenceUnavailable),
         }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(GuardianSignError::EvidenceUnavailable),
     };
     result
     });
@@ -424,8 +439,29 @@ async fn handle_request(service: Arc<tokio::sync::Mutex<GuardianService>>, reque
     match result { Ok(body) => json_response(200, body), Err(error) => error_response(Some(request_id), error) }
 }
 
+/// Re-authorizes a cached signature against durable account state before release;
+/// `authorize_response` owns the halt gate and the request-bytes binding.
+async fn authorize_cached_response(db: &mut GuardianDb, request: &GuardianSignRequest, public_key: [u8; 33]) -> Result<Vec<u8>, GuardianSignError> {
+    let canonical_bytes = request.canonical_bytes()?;
+    db.authorize_response(request.network_magic, request.user_id, request.session_nonce, &canonical_bytes, |signed| {
+        let authorization: GuardianAuthorization = parse_canonical_json(&signed.authorization_bytes).map_err(|_| GuardianSignError::JournalUnavailable)?;
+        let account = authorization.account_json.decode().map_err(|_| GuardianSignError::JournalUnavailable)?;
+        let commitment = account.initial_policy.commitment().map_err(|_| GuardianSignError::PolicyMismatch)?;
+        let compressed = psy_client_common::data::secp256k1::CompressedPublicKey::new_from_slice(&public_key);
+        let member_hash = psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key::<GoldilocksField, plonky2::hash::poseidon::PoseidonPermutation<GoldilocksField>>(compressed);
+        let member_index = account.initial_policy.member_hashes[..3].iter().position(|member| *member == member_hash).ok_or(GuardianSignError::PolicyMismatch)? as u8;
+        let response = guardian_common::protocol::GuardianSignResponse {
+            request_id: sha256(&signed.request_bytes), network_magic: signed.network_magic, user_id: signed.user_id,
+            session_nonce: signed.nonce, policy_commitment: commitment, member_index,
+            message: Hex(signed.message), public_key: Hex(public_key),
+            signature: Hex(signed.signature.ok_or(GuardianSignError::JournalUnavailable)?),
+        };
+        serde_json::to_vec(&response).map_err(|_| GuardianSignError::JournalUnavailable)
+    }).await
+}
+
 struct GuardianSigner {
-    db: super::db::GuardianDb,
+    db: GuardianDb,
     key: psy_provider::wallet::secp_wallet::Wallet,
     public_key: [u8; 33],
 }
@@ -433,15 +469,13 @@ struct GuardianSigner {
 impl GuardianSigner {
     async fn sign_verified(
         &mut self,
-        request: &super::protocol::GuardianSignRequest,
+        request: &GuardianSignRequest,
         authorization_bytes: &[u8],
         verified: &super::verify::VerifiedGuardianSession,
-        signing_authorization_file: &mut SigningAuthorizationFile,
-        active_authorization: &GuardianAuthorization,
     ) -> Result<Vec<u8>, GuardianSignError> {
         use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::PoseidonPermutation};
         use psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key;
-        use super::protocol::{sha256, GuardianSigned, GuardianSignResponse, Hex};
+        use guardian_common::protocol::{GuardianSigned, GuardianSignResponse};
         let public_key = psy_client_common::data::secp256k1::CompressedPublicKey::new_from_slice(&self.public_key);
         let member_hash = hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(public_key);
         let commitment = verified.current_policy.commitment().map_err(|_| GuardianSignError::PolicyMismatch)?;
@@ -457,12 +491,6 @@ impl GuardianSigner {
         if reserved.signature.is_none() {
             let signature = self.key.sign_prehash_raw(&reserved.message).map_err(|_| GuardianSignError::KeyUnavailable)?;
             self.db.save_guardian_signature(reserved.network_magic, reserved.user_id, reserved.nonce, &reserved.request_bytes, signature).await?;
-        }
-        if let Err(error) = signing_authorization_file.check(active_authorization) {
-            if error == GuardianSignError::AccountHalted {
-                self.db.halt_account(request.network_magic, request.user_id, HaltReason::SigningAuthorizationInvalid).await?;
-            }
-            return Err(error);
         }
         self.db.authorize_response(request.network_magic, request.user_id, request.session_nonce, &signed.request_bytes, |signed| {
             let response = GuardianSignResponse {
@@ -485,6 +513,7 @@ fn warn_observer_authorization(warned: &mut Option<GuardianSignError>, error: Op
 }
 
 fn error_response(request_id: Option<Hex32>, code: GuardianSignError) -> HttpResponse {
+    tracing::warn!(code = %code, "guardian sign request refused");
     let body = serde_json::to_vec(&GuardianSignErrorResponse::new(request_id, code))
         .expect("guardian error response is serializable");
     json_response(code.http_status(), body)
@@ -531,34 +560,12 @@ fn history_query(query: Option<&str>) -> Result<(u64, u32), GuardianSignError> {
 }
 
 
-fn tls_acceptor(certificate: &[u8], private_key: &[u8], client_ca: &[u8]) -> Result<TlsAcceptor, GuardianSignError> {
-    let certificates = rustls_pemfile::certs(&mut BufReader::new(certificate))
-        .collect::<Result<Vec<_>, _>>().map_err(|_| GuardianSignError::KeyUnavailable)?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(private_key))
-        .map_err(|_| GuardianSignError::KeyUnavailable)?.ok_or(GuardianSignError::KeyUnavailable)?;
-    let mut roots = RootCertStore::empty();
-    for certificate in rustls_pemfile::certs(&mut BufReader::new(client_ca)) {
-        roots.add(certificate.map_err(|_| GuardianSignError::AuthorizationMismatch)?)
-            .map_err(|_| GuardianSignError::AuthorizationMismatch)?;
-    }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-        .build().map_err(|_| GuardianSignError::AuthorizationMismatch)?;
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions().map_err(|_| GuardianSignError::AuthorizationMismatch)?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(certificates, key).map_err(|_| GuardianSignError::KeyUnavailable)?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
-}
-
-async fn serve_tls<F, Fut>(listener: TcpListener, acceptor: TlsAcceptor, pins: Vec<Hex32>, handler: F) -> Result<(), GuardianSignError>
+async fn serve_http<F, Fut>(listener: TcpListener, handler: F) -> Result<(), GuardianSignError>
 where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = HttpResponse> + Send + 'static,
 {
     let permits = Arc::new(Semaphore::new(4));
-    let pins = Arc::new(pins);
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -570,29 +577,19 @@ where
             accepted = listener.accept() => {
                 let (socket, _) = accepted.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
                 let Ok(permit) = permits.clone().try_acquire_owned() else { drop(socket); continue; };
-                let acceptor = acceptor.clone();
-                let pins = pins.clone();
                 let handler = handler.clone();
                 connections.spawn(async move {
                     let _permit = permit;
-                    let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await else { return; };
-                    let authorized = stream.get_ref().1.peer_certificates()
-                        .and_then(|chain| chain.first())
-                        .is_some_and(|certificate| pins.contains(&sha256(certificate.as_ref())));
                     let service = hyper::service::service_fn(move |request| {
                         let handler = handler.clone();
-                        async move {
-                            let response = if authorized { handler(request).await }
-                                else { error_response(None, GuardianSignError::UnauthorizedCaller) };
-                            Ok::<_, Infallible>(response)
-                        }
+                        async move { Ok::<_, Infallible>(handler(request).await) }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .keep_alive(false)
                         .timer(TokioTimer::new())
                         .header_read_timeout(Duration::from_secs(10))
                         .max_buf_size(16 * 1024)
-                        .serve_connection(TokioIo::new(stream), service).await;
+                        .serve_connection(TokioIo::new(socket), service).await;
                 });
             }
         }
@@ -604,18 +601,10 @@ where
 
 pub async fn serve_relayer_history(
     listen_address: &str,
-    certificate_pem: Vec<u8>,
-    private_key_pem: zeroize::Zeroizing<Vec<u8>>,
-    client_ca_pem: Vec<u8>,
-    allowed_client_certificate_sha256: Vec<Hex32>,
     archive: Arc<crate::bridge::guardian_client::RelayerArchive>,
 ) -> Result<(), GuardianSignError> {
-    if !(1..=16).contains(&allowed_client_certificate_sha256.len()) {
-        return Err(GuardianSignError::AuthorizationMismatch);
-    }
-    let acceptor = tls_acceptor(&certificate_pem, &private_key_pem, &client_ca_pem)?;
     let listener = TcpListener::bind(listen_address).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-    serve_tls(listener, acceptor, allowed_client_certificate_sha256, move |request| {
+    serve_http(listener, move |request| {
         let archive = archive.clone();
         async move {
             if request.method() != hyper::Method::GET || request.uri().path() != "/v1/sessions" {
@@ -638,6 +627,7 @@ pub async fn serve_relayer_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guardian_common::protocol::BRIDGE_USER_ID;
 
 
     #[tokio::test]
@@ -650,7 +640,7 @@ mod tests {
         let public_key = key.compressed_public_key();
         let account = GuardianAccount { network_magic: 90101, user_id: BRIDGE_USER_ID, state: GuardianAccountState::Active,
             last_checkpoint_id: 0, last_checkpoint_hash: Hash4::ZERO, imported_nonce: None, authorization_version: 1, halt_reason: None };
-        let mut db = super::super::db::GuardianDb::create(file, public_key, &account).await.unwrap();
+        let mut db = GuardianDb::create(file, public_key, &account).await.unwrap();
         assert_eq!(save_guardian_account_result::<()>(&mut db, 90101, BRIDGE_USER_ID,
             Err(GuardianAccountError::Unavailable(GuardianSignError::EvidenceUnavailable))).await, Err(GuardianSignError::EvidenceUnavailable));
         assert_eq!(db.load_account(90101, BRIDGE_USER_ID).await.unwrap().state, GuardianAccountState::Active);
@@ -661,7 +651,7 @@ mod tests {
             Err(GuardianAccountError::Conflict(HaltReason::FinalityConflict))).await, Err(GuardianSignError::AccountHalted));
         drop(db);
         let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
-        let mut db = super::super::db::GuardianDb::open(file, public_key).await.unwrap();
+        let mut db = GuardianDb::open(file, public_key).await.unwrap();
         let retained = db.load_account(90101, BRIDGE_USER_ID).await.unwrap();
         assert_eq!(retained.state, GuardianAccountState::Halted);
         assert_eq!(retained.halt_reason, Some(HaltReason::FinalityConflict));
@@ -779,5 +769,29 @@ mod tests {
             GuardianSignError::JournalUnavailable, GuardianSignError::JournalUnavailable,
             GuardianSignError::JournalUnavailable, GuardianSignError::AccountHalted,
         ]);
+    }
+
+    #[tokio::test]
+    async fn halted_account_fails_closed_for_cached_sign_response() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = std::env::temp_dir().join(format!("guardian-cached-{}-{}.redb", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path).unwrap();
+        let key = psy_provider::wallet::secp_wallet::Wallet::from_bytes(&[3; 32]).unwrap();
+        let public_key = key.compressed_public_key();
+        let request = crate::guardian::test_fixture::codec_request_fixture();
+        let account = GuardianAccount { network_magic: request.network_magic, user_id: BRIDGE_USER_ID, state: GuardianAccountState::Active,
+            last_checkpoint_id: 0, last_checkpoint_hash: Hash4::ZERO, imported_nonce: None, authorization_version: 1, halt_reason: None };
+        let mut db = GuardianDb::create(file, public_key, &account).await.unwrap();
+        let signed = guardian_common::protocol::GuardianSigned {
+            network_magic: request.network_magic, user_id: request.user_id, nonce: request.session_nonce,
+            request_bytes: request.canonical_bytes().unwrap(), authorization_bytes: vec![2],
+            starting_leaf_hash: Hash4::ZERO, ending_leaf_hash: Hash4::ZERO, message: [3; 32], signature: None,
+        };
+        db.reserve_guardian_nonce(&signed).await.unwrap();
+        db.save_guardian_signature(signed.network_magic, signed.user_id, signed.nonce, &signed.request_bytes, [3; 64]).await.unwrap();
+        assert_eq!(authorize_cached_response(&mut db, &request, public_key).await.unwrap_err(), GuardianSignError::JournalUnavailable);
+        db.halt_account(signed.network_magic, signed.user_id, HaltReason::AppendHistoryMismatch).await.unwrap();
+        assert_eq!(authorize_cached_response(&mut db, &request, public_key).await, Err(GuardianSignError::AccountHalted));
+        std::fs::remove_file(path).unwrap();
     }
 }

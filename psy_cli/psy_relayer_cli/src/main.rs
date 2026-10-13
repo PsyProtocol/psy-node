@@ -33,15 +33,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run one independently verifying guardian signer with protected runtime configuration.
+    /// Run one independently verifying guardian signer from the public root config.
     GuardianService {
         #[arg(long)]
-        runtime_config: PathBuf,
-    },
-    /// Create a new guardian database; never use for a key with an existing signing-key journal.
-    GuardianCreateDb {
+        config: PathBuf,
         #[arg(long)]
-        runtime_config: PathBuf,
+        guardian_id: u8,
+        #[arg(long)]
+        db_path: PathBuf,
     },
     /// Register, bootstrap, or replace the bridge multisig policy.
     GuardianPolicy {
@@ -189,8 +188,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => run_bridge_daemon(cli.config).await,
-        Some(Commands::GuardianService { runtime_config }) => guardian::service::run(&runtime_config).await.map_err(Into::into),
-        Some(Commands::GuardianCreateDb { runtime_config }) => guardian::service::create_db(&runtime_config).await.map_err(Into::into),
+        Some(Commands::GuardianService { config, guardian_id, db_path }) => guardian::service::run(&config, guardian_id, &db_path).await.map_err(Into::into),
         Some(Commands::GuardianPolicy { rpc_config, guardian_config, intent, exclusive_registration_intake, next_members_json }) => match intent {
             GuardianPolicyIntent::Register => {
                 if next_members_json.is_some() {
@@ -209,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("guardian-policy replace does not accept exclusive registration intake");
                 }
                 let members_json = next_members_json.ok_or_else(|| anyhow::anyhow!("guardian-policy replace requires --next-members-json"))?;
-                let members = guardian::protocol::parse_canonical_json::<[guardian::protocol::Hash4; 3]>(members_json.as_bytes())?;
+                let members = guardian_common::protocol::parse_canonical_json::<[guardian_common::protocol::Hash4; 3]>(members_json.as_bytes())?;
                 bridge::daemon::run_guardian_replace_policy(&rpc_config, &guardian_config, members).await
             }
         },

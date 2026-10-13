@@ -1864,7 +1864,7 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod external_guta_admission_tests {
     use super::*;
 
     #[test]

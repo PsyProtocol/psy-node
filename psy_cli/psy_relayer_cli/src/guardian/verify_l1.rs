@@ -10,7 +10,7 @@ use psy_crypto::hash::traits::hasher::{FieldQHasher, MerkleZeroHasher};
 use serde_json::{json, Value};
 
 use crate::bridge::deposit_logs::DepositRecorded;
-use super::protocol::*;
+use guardian_common::protocol::*;
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 

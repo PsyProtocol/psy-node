@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, ensure};
-use plonky2::{field::{goldilocks_field::GoldilocksField as F, types::{Field, PrimeField64}}, hash::poseidon::PoseidonHash, plonk::circuit_data::CommonCircuitData};
+use plonky2::{field::{goldilocks_field::GoldilocksField as F, types::{Field, PrimeField64}}, hash::poseidon::PoseidonHash};
 use psy_client_common::{args::{ContractCallArgs, ContractCallData}, data::{base_types::hash256::Hash256, qhashout::QHashOut}};
 use psy_client_data::{config::store_config::PsyHasher, qdata::{checkpoint::{PsyCheckpointLeaf, PsyCheckpointGlobalStateRoots}, contract::PsyContractLeaf}, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
 use psy_config::network_constants::{CHECKPOINT_TREE_HEIGHT, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, TOKEN_BURN_METHOD_ID};
@@ -10,7 +10,8 @@ use psy_provider::{provider::RpcProvider, request::QIMTMembershipProofRPCRequest
 use psy_prover::{session::session::WalletSession, trace::{TxTrace, TraceStep}};
 use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatureWitness, StoredMultisigPolicy};
 
-use super::protocol::*;
+use guardian_common::endcap::approved_endcap_max_proof_bytes;
+use guardian_common::protocol::*;
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 
@@ -45,8 +46,8 @@ pub struct GuardianHistory {
     nonces: BTreeSet<(u8,[u32;8])>,
 }
 impl GuardianHistory {
-    pub fn validate_authorization_artifacts(&self, authorization: &GuardianAuthorization) -> Result<()> {
-        for approved in &authorization.approved_contracts { self.approved_artifact(approved)?; }
+    pub async fn validate_authorization_artifacts(&self, authorization: &GuardianAuthorization, wallet: &WalletSession) -> Result<()> {
+        for approved in &authorization.approved_contracts { self.approved_artifact(approved, wallet).await?; }
         Ok(())
     }
 
@@ -62,14 +63,16 @@ impl GuardianHistory {
         Ok(self.deposit_prefixes.lock().await.get(&(approval.0, endpoint.rpc_url.clone())).cloned())
     }
 
-    fn approved_artifact(&self, approved: &ApprovedContract) -> Result<Option<ApprovedTokenMap>> {
+    async fn approved_artifact(&self, approved: &ApprovedContract, wallet: &WalletSession) -> Result<Option<ApprovedTokenMap>> {
         if sha256(approved.compiler_artifact_json.as_str().as_bytes())!=approved.compiler_artifact_sha256 { return Err(GuardianSignError::AuthorizationMismatch); }
         let leaf=approved.contract_leaf_json.decode()?;
         let key=(approved.compiler_artifact_sha256.0,sha256(&serde_json::to_vec(&(approved.contract_id,leaf)).map_err(|_|GuardianSignError::AuthorizationMismatch)?).0);
-        let mut cache=self.approved_artifacts.lock().map_err(|_|GuardianSignError::EvidenceUnavailable)?;
-        if let Some(map)=cache.get(&key) { return Ok(map.clone()); }
-        let map=validate_approved_contract(approved)?;
-        cache.insert(key,map.clone());
+        {
+            let cache=self.approved_artifacts.lock().map_err(|_|GuardianSignError::EvidenceUnavailable)?;
+            if let Some(map)=cache.get(&key) { return Ok(map.clone()); }
+        }
+        let map=validate_approved_contract(approved, wallet).await?;
+        self.approved_artifacts.lock().map_err(|_|GuardianSignError::EvidenceUnavailable)?.insert(key,map.clone());
         Ok(map)
     }
     pub fn new() -> Self { Self::default() }
@@ -157,7 +160,7 @@ pub struct ApprovedTokenMap {
     pub capacity: u64,
 }
 
-pub fn validate_approved_contract(approved: &ApprovedContract) -> Result<Option<ApprovedTokenMap>> {
+pub async fn validate_approved_contract(approved: &ApprovedContract, wallet: &WalletSession) -> Result<Option<ApprovedTokenMap>> {
     let artifact=approved.compiler_artifact()?;
     let leaf=approved.contract_leaf_json.decode()?;
     if artifact.state_tree_height>32 || artifact.state_tree_height<4 || u64::from(artifact.state_tree_height)!=leaf.state_tree_height.to_canonical_u64() || artifact.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64)!=Some(u64::from(artifact.state_tree_height)) || artifact.abi["schema_version"]!="2.0.0" || artifact.circuit_definitions.is_empty() { return Err(GuardianSignError::AuthorizationMismatch); }
@@ -171,9 +174,8 @@ pub fn validate_approved_contract(approved: &ApprovedContract) -> Result<Option<
         let mutability=if definition.is_view_function() {"view"} else {"external"};
         if matches.next().is_some() || method["name"].as_str()!=Some(definition.name.as_str()) || method["input_felt_count"].as_u64()!=Some(definition.circuit_inputs.len() as u64) || method["output_felt_count"].as_u64()!=Some(definition.circuit_outputs.len() as u64) || method["state_mutability"].as_str()!=Some(mutability) { return Err(GuardianSignError::AuthorizationMismatch); }
     }
-    let (_,deployment)=psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<plonky2::plonk::config::PoseidonGoldilocksConfig,2>(leaf.deployer.to_canonical_u64(),artifact.state_tree_height as u8,&artifact.circuit_definitions).map_err(|_|GuardianSignError::AuthorizationMismatch)?;
-    let deployment=deployment.into_with_whitelist_root::<PsyHasher>().map_err(|_|GuardianSignError::AuthorizationMismatch)?;
-    if deployment.code_root!=leaf.code_root || deployment.function_whitelist_root!=leaf.function_tree_root { return Err(GuardianSignError::AuthorizationMismatch); }
+    let deployment=trusted_proxy_contract_root(wallet,u64::from(approved.contract_id),leaf.deployer.to_canonical_u64(),artifact.state_tree_height,&artifact.circuit_definitions).await?;
+    if deployment.code_root!=leaf.code_root || deployment.function_tree_root!=leaf.function_tree_root { return Err(GuardianSignError::AuthorizationMismatch); }
     if approved.contract_id==6 && artifact.state_tree_height!=4 { return Err(GuardianSignError::PolicyMismatch); }
     if !matches!(approved.contract_id,0|4) { return Ok(None); }
     let state=artifact.abi.pointer("/contract/state").and_then(serde_json::Value::as_array).ok_or(GuardianSignError::AuthorizationMismatch)?;
@@ -188,6 +190,29 @@ pub fn validate_approved_contract(approved: &ApprovedContract) -> Result<Option<
     let withdraw=artifact.circuit_definitions.iter().find(|definition|definition.name=="withdraw").ok_or(GuardianSignError::AuthorizationMismatch)?;
     verify_withdraw_map_constants(withdraw,base,capacity)?;
     Ok(Some(ApprovedTokenMap {subslot_base:base,capacity}))
+}
+async fn trusted_proxy_contract_root(wallet: &WalletSession, contract_id: u64, deployer: u64, state_tree_height: u16, definitions: &[psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition]) -> Result<PsyContractLeaf<F>> {
+    use psy_client_data::qdata::contract::ContractCodeDefinition;
+    use psy_vm::dpn::contract::{dapen_fc_to_cfc_code_definition, hash_dpn_function};
+    use psy_vm::ups::circuit_manager::UPSCircuitManager;
+    let functions=definitions.iter().map(dapen_fc_to_cfc_code_definition).collect::<Vec<_>>();
+    let code=ContractCodeDefinition { state_tree_height, functions };
+    let manager=wallet.wallet.random_circuit_manager();
+    let mut leaves=Vec::with_capacity(definitions.len()*2);
+    let mut hashes=Vec::with_capacity(definitions.len());
+    for (position, definition) in definitions.iter().enumerate() {
+        let (fn_id, resolved)=manager.resolve_contract_function_by_method_name(contract_id, &code, definition.name.clone()).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+        if fn_id!=position as u64 || resolved!=*definition { return Err(GuardianSignError::AuthorizationMismatch); }
+        let (fingerprint, _)=manager.get_contract_method_common_data(contract_id, fn_id as u32).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+        leaves.push(fingerprint);
+        let inputs_outputs=((definition.circuit_outputs.len() as u64)<<32) | (definition.circuit_inputs.len() as u64);
+        leaves.push(Hash4::from_values(u64::from(definition.method_id), inputs_outputs, 0, 0));
+        hashes.push(hash_dpn_function::<F>(definition));
+    }
+    let code_root=psy_client_data::qblock::cmds::deploy_contract::get_code_root_by_code_hashes::<F, PsyHasher>(&hashes, psy_config::network_constants::CONTRACT_FUNCTION_TREE_HEIGHT-1);
+    let mut tree=psy_crypto::hash::merkle::utils::simple_merkle_tree::SimpleMerkleTree::<PsyHasher, Hash4>::new(psy_config::network_constants::CONTRACT_FUNCTION_TREE_HEIGHT);
+    for (index, leaf) in leaves.iter().enumerate() { tree.set_leaf(index as u64, *leaf); }
+    Ok(PsyContractLeaf { deployer: F::from_canonical_u64(deployer), function_tree_root: tree.get_root(), code_root, state_tree_height: F::from_canonical_u16(state_tree_height), state_layout_root: Hash4::ZERO, state_layout_field_count: F::ZERO, state_layout_slot_count: F::ZERO })
 }
 
 fn verify_withdraw_map_constants(definition: &psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition, base: u64, capacity: u64) -> Result<()> {
@@ -230,19 +255,19 @@ fn verify_withdraw_map_constants(definition: &psy_vm::dpn::vm::def::DPNFunctionC
     Ok(())
 }
 
-fn verify_approved_contract(history: &GuardianHistory, approved: &ApprovedContract, leaf: &PsyContractLeaf<F>) -> Result<Option<ApprovedTokenMap>> {
+async fn verify_approved_contract(history: &GuardianHistory, approved: &ApprovedContract, leaf: &PsyContractLeaf<F>, wallet: &WalletSession) -> Result<Option<ApprovedTokenMap>> {
     if approved.contract_leaf_json.decode()?!=*leaf { return Err(GuardianSignError::AuthorizationMismatch); }
-    history.approved_artifact(approved)
+    history.approved_artifact(approved, wallet).await
 }
 
-pub fn verify_withdrawal_burn(history: &GuardianHistory, authorization: &GuardianAuthorization, record: &WithdrawalBurnRecord, proof: &psy_provider::lps::WithdrawalBurnProof, verified_checkpoint_root: Hash4) -> Result<()> {
+pub async fn verify_withdrawal_burn(history: &GuardianHistory, authorization: &GuardianAuthorization, record: &WithdrawalBurnRecord, proof: &psy_provider::lps::WithdrawalBurnProof, verified_checkpoint_root: Hash4, wallet: &WalletSession) -> Result<()> {
     record.amount_u64()?;
     record.recipient_address()?;
     let token = record.token_address()?;
     if authorization.chain(record.destination_chain_index)?.token_mappings.iter().filter(|mapping| mapping.token == token && mapping.l2_contract_id == record.token_contract_id).count() != 1 { return Err(GuardianSignError::EvidenceMismatch); }
     verify_checkpoint(proof.checkpoint_id, &proof.checkpoint_leaf, &proof.global_roots, &proof.checkpoint_path, verified_checkpoint_root)?;
     let approved = approved_contract(authorization, record.token_contract_id)?;
-    let map = verify_approved_contract(history,approved,&proof.contract_leaf)?.ok_or(GuardianSignError::EvidenceMismatch)?;
+    let map = verify_approved_contract(history,approved,&proof.contract_leaf,wallet).await?.ok_or(GuardianSignError::EvidenceMismatch)?;
     let (base,capacity)=(map.subslot_base/4,map.capacity);
     verify_path(&proof.global_contract_path, proof.global_roots.contract_tree_root, u64::from(record.token_contract_id), proof.contract_leaf.qfhash::<PsyHasher>(), GLOBAL_CONTRACT_TREE_HEIGHT as usize)?;
     if proof.user_leaf.user_id.to_canonical_u64() != u64::from(record.sender_user_id) { return Err(GuardianSignError::EvidenceMismatch); }
@@ -258,11 +283,11 @@ pub fn verify_withdrawal_burn(history: &GuardianHistory, authorization: &Guardia
 pub async fn get_withdrawal_burn_proof(context: &GuardianVerificationContext<'_>, authorization: &GuardianAuthorization, checkpoint_id: u64, record: &WithdrawalBurnRecord) -> Result<psy_provider::lps::WithdrawalBurnProof> {
     if checkpoint_id > context.verified_checkpoint_id { return Err(GuardianSignError::EvidenceUnavailable); }
     let approved = approved_contract(authorization, record.token_contract_id)?;
-    let map = verify_approved_contract(context.history,approved,&approved.contract_leaf_json.decode()?)?.ok_or(GuardianSignError::EvidenceMismatch)?;
+    let map = verify_approved_contract(context.history,approved,&approved.contract_leaf_json.decode()?,context.wallet).await?.ok_or(GuardianSignError::EvidenceMismatch)?;
     let (base,capacity)=(map.subslot_base/4,map.capacity);
     let mut proof = context.provider.get_withdrawal_burn_proof(QIMTMembershipProofRPCRequest { checkpoint_id, user_id: u64::from(record.sender_user_id), contract_id: record.token_contract_id, key: withdrawal_key(record), state_slot_base: base, capacity }).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
     proof.checkpoint_path = context.provider.get_checkpoint_tree_merkle_proof(context.verified_checkpoint_id, checkpoint_id).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-    verify_withdrawal_burn(context.history,authorization,record,&proof,context.verified_checkpoint_tree_root)?;
+    verify_withdrawal_burn(context.history,authorization,record,&proof,context.verified_checkpoint_tree_root,context.wallet).await?;
     Ok(proof)
 }
 
@@ -275,14 +300,14 @@ fn hash_words(hash: Hash4) -> [u64; 8] {
 async fn read_subslots(context: &GuardianVerificationContext<'_>, trace: &TxTrace, contract_id: u32, start: u64, count: usize, height: u8) -> Result<Vec<u64>> {
     let checkpoint = trace.anchor.start_checkpoint_id;
     let user = &trace.ups_start_witness.ups_header.session_start_context.start_session_user_leaf;
-    let contract = context.provider.get_user_contract_tree_merkle_proof(checkpoint,trace.meta.user_id,contract_id).await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
+    let contract = context.provider.get_user_contract_tree_merkle_proof(checkpoint,trace.meta.user_id,contract_id).await.map_err(|error| { tracing::warn!(checkpoint, contract_id, error = %error, "contract inclusion proof unavailable"); GuardianSignError::EvidenceUnavailable })?;
     verify_path(&contract,user.user_state_tree_root,u64::from(contract_id),contract.value,GLOBAL_CONTRACT_TREE_HEIGHT as usize)?;
     let root = if contract.value == Hash4::ZERO { <PsyHasher as MerkleZeroHasher<Hash4>>::get_zero_hash(height as usize) } else { contract.value };
     let end = start.checked_add(count as u64).ok_or(GuardianSignError::EvidenceMismatch)?;
     let mut values = Vec::with_capacity(count);
     let mut slot = start / 4;
     while slot * 4 < end {
-        let proof = context.provider.get_user_contract_state_tree_merkle_proof(checkpoint,trace.meta.user_id,contract_id,height,slot).await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
+        let proof = context.provider.get_user_contract_state_tree_merkle_proof(checkpoint,trace.meta.user_id,contract_id,height,slot).await.map_err(|error| { tracing::warn!(checkpoint, contract_id, slot, height, error = %error, "contract state proof unavailable"); GuardianSignError::EvidenceUnavailable })?;
         verify_path(&proof,root,slot,proof.value,height as usize)?;
         for (index,field) in proof.value.0.elements.iter().enumerate() { let subslot = slot * 4 + index as u64; if subslot >= start && subslot < end { values.push(field.to_canonical_u64()); } }
         slot += 1;
@@ -320,7 +345,7 @@ fn policy_call(operation: GuardianOperation, witness: &MultisigSignatureWitness)
     Ok(ContractCallArgs { contract_id:6,method_name:"set_policy".into(),inputs })
 }
 
-pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, authorization: &GuardianAuthorization, request: &GuardianSignRequest) -> Result<VerifiedGuardianSession,GuardianAccountError> {
+async fn verify_guardian_session_evidence(context: &GuardianVerificationContext<'_>, authorization: &GuardianAuthorization, request: &GuardianSignRequest) -> Result<(VerifiedGuardianSession, ContractCallData, Hash4),GuardianAccountError> {
     authorization.validate(psy_config::GUTA_FEE,psy_config::DA_FEE,approved_endcap_max_proof_bytes()?)?;
     request.validate_authorization(authorization)?;
     let supplied = request.decode_trace()?;
@@ -328,8 +353,6 @@ pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, 
     if checkpoint > context.verified_checkpoint_id { return Err(GuardianSignError::EvidenceUnavailable.into()); }
     let checkpoint_path = context.provider.get_checkpoint_tree_merkle_proof(context.verified_checkpoint_id,checkpoint).await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
     verify_checkpoint(checkpoint,&supplied.anchor.checkpoint_leaf,&supplied.anchor.global_state_roots,&checkpoint_path,context.verified_checkpoint_tree_root)?;
-    let historical_root = historical_checkpoint_root(&checkpoint_path);
-    let mut builder = context.wallet.begin_trace_build_at_checkpoint(authorization.account_public_key,authorization.user_id,checkpoint,request.session_nonce,historical_root).await.map_err(|_|GuardianSignError::StateMismatch)?;
     let witness = trace_policy(&supplied,authorization)?;
     let (current_policy,ending_policy) = witness.policies().map_err(|_|GuardianSignError::PolicyMismatch)?;
     let mut calls = Vec::new();
@@ -367,23 +390,28 @@ pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, 
     } else { calls.push(policy_call(request.operation,&witness)?); }
     let expected = ContractCallData::new(calls);
     if serde_json::to_value(&expected).map_err(|_|GuardianSignError::MalformedRequest)? != request.trace_json.decode()?.call_data { return Err(GuardianSignError::UnsupportedCall.into()); }
-    for call in expected.contract_calls { builder.trace_call(call).await.map_err(|_|GuardianSignError::StateMismatch)?; }
-    let fee = builder.required_fee().map_err(|_|GuardianSignError::StateMismatch)?;
-    if fee >= GOLDILOCKS_MODULUS || fee > authorization.max_fee { return Err(GuardianSignError::UnsupportedCall.into()); }
-    let replayed = builder.finalize_tx_trace(expected.software_defined_call).await.map_err(|_|GuardianSignError::StateMismatch)?;
-    if !traces_equal(&supplied,&replayed)? { return Err(GuardianSignError::StateMismatch.into()); }
-    verify_trace_contracts(context.history,authorization,&replayed)?;
-    let fees: Vec<_> = replayed.steps.iter().filter_map(|step|if let TraceStep::BurnFee(step)=step {Some(step)} else {None}).collect();
+    verify_trace_contracts(context.history,authorization,&supplied,context.wallet).await?;
+    let fees: Vec<_> = supplied.steps.iter().filter_map(|step|if let TraceStep::BurnFee(step)=step {Some(step)} else {None}).collect();
     if fees.len()!=1 || fees[0].contract_id!=0 || fees[0].method_id!=TOKEN_BURN_METHOD_ID || fees[0].method_name!="burn" { return Err(GuardianSignError::UnsupportedCall.into()); }
-    let replayed_witness = trace_policy(&replayed,authorization)?;
-    let (current_policy,ending_policy) = replayed_witness.policies().map_err(|_|GuardianSignError::PolicyMismatch)?;
-    let message = Hash256::from(replayed.finalization.sig_hash).0;
-    let ending_leaf_hash = replayed.finalization.submit_end_cap_input.core.new_user_leaf.qfhash::<PsyHasher>();
-    validate_future_endcap_proof_size(&JsonText::from_value(request)?,&replayed.finalization.submit_end_cap_input,authorization.max_endcap_proof_bytes)?;
-    Ok(VerifiedGuardianSession { trace:replayed,current_policy,ending_policy,starting_leaf_hash:start_hash,ending_leaf_hash,message,withdrawal_appends:appends })
+    let message = Hash256::from(supplied.finalization.sig_hash).0;
+    let ending_leaf_hash = supplied.finalization.submit_end_cap_input.core.new_user_leaf.qfhash::<PsyHasher>();
+    validate_future_endcap_proof_size(&JsonText::from_value(request)?,&supplied.finalization.submit_end_cap_input,authorization.max_endcap_proof_bytes)?;
+    Ok((VerifiedGuardianSession { trace:supplied,current_policy,ending_policy,starting_leaf_hash:start_hash,ending_leaf_hash,message,withdrawal_appends:appends }, expected, historical_checkpoint_root(&checkpoint_path)))
 }
 
-fn verify_trace_contracts(history: &GuardianHistory, authorization: &GuardianAuthorization, trace: &TxTrace) -> Result<()> {
+pub async fn verify_guardian_session(context: &GuardianVerificationContext<'_>, authorization: &GuardianAuthorization, request: &GuardianSignRequest) -> Result<VerifiedGuardianSession,GuardianAccountError> {
+    let (verified, expected, historical_root) = verify_guardian_session_evidence(context,authorization,request).await?;
+    let checkpoint = verified.trace.anchor.start_checkpoint_id;
+    let mut builder = context.wallet.begin_trace_build_at_checkpoint(authorization.account_public_key,authorization.user_id,checkpoint,request.session_nonce,historical_root).await.map_err(|_|GuardianSignError::StateMismatch)?;
+    for call in &expected.contract_calls { builder.trace_call(call.clone()).await.map_err(|_|GuardianSignError::StateMismatch)?; }
+    let fee = builder.required_fee().map_err(|_|GuardianSignError::StateMismatch)?;
+    if fee >= GOLDILOCKS_MODULUS || fee > authorization.max_fee { return Err(GuardianSignError::UnsupportedCall.into()); }
+    let replayed = builder.finalize_tx_trace(expected.software_defined_call.clone()).await.map_err(|_|GuardianSignError::StateMismatch)?;
+    if !traces_equal(&verified.trace,&replayed)? { return Err(GuardianSignError::StateMismatch.into()); }
+    Ok(VerifiedGuardianSession { trace:replayed,..verified })
+}
+
+async fn verify_trace_contracts(history: &GuardianHistory, authorization: &GuardianAuthorization, trace: &TxTrace, wallet: &WalletSession) -> Result<()> {
     let mut codes = BTreeSet::new();
     for code in &trace.contract_codes {
         if !codes.insert(code.contract_id) { return Err(GuardianSignError::EvidenceMismatch); }
@@ -402,7 +430,7 @@ fn verify_trace_contracts(history: &GuardianHistory, authorization: &GuardianAut
         let approved = approved_contract(authorization,id)?;
         let inclusion = &step.cfc_inclusion_proof;
         let contract = &inclusion.contract_inclusion_proof;
-        verify_approved_contract(history,approved,&contract.contract_leaf)?;
+        verify_approved_contract(history,approved,&contract.contract_leaf,wallet).await?;
         verify_path(&contract.contract_tree_merkle_proof,trace.anchor.global_state_roots.contract_tree_root,step.contract_id,contract.contract_leaf.qfhash::<PsyHasher>(),GLOBAL_CONTRACT_TREE_HEIGHT as usize)?;
         let fingerprint_index=step.fn_id.checked_mul(2).ok_or(GuardianSignError::EvidenceMismatch)?;
         verify_path(&inclusion.contract_function_merkle_proof,contract.contract_leaf.function_tree_root,u64::from(fingerprint_index),step.cfc_fingerprint,psy_config::network_constants::CONTRACT_FUNCTION_TREE_HEIGHT as usize)?;
@@ -421,59 +449,7 @@ fn historical_checkpoint_root(path: &MerkleProofCore<Hash4>) -> Hash4 {
     current
 }
 
-/// Exact `bincode::serialize` size for a valid D=2 Poseidon EndCap proof.
-/// Serde encodes every Vec length as u64; fields, extension elements and hashes
-/// occupy 8, 16 and 32 bytes. This counts shape, not proof validity.
-pub fn approved_endcap_proof_bound(common: &CommonCircuitData<F, 2>) -> anyhow::Result<usize> {
-    let c = &common.config;
-    let f = &common.fri_params;
-    ensure!(c.fri_config.cap_height == f.config.cap_height
-        && c.fri_config.rate_bits == f.config.rate_bits
-        && c.fri_config.num_query_rounds == f.config.num_query_rounds,
-        "inconsistent EndCap FRI configuration");
-    let bytes = (|| -> Option<usize> {
-        let power = |bits: usize| 1usize.checked_shl(u32::try_from(bits).ok()?);
-        let challenges = c.num_challenges;
-        let preprocessed = common.num_constants.checked_add(c.num_routed_wires)?;
-        let lookups = challenges.checked_mul(common.num_lookup_polys)?;
-        let partial = challenges.checked_mul(common.num_partial_products)?;
-        let quotient = challenges.checked_mul(common.quotient_degree_factor)?;
-        let openings = preprocessed.checked_add(c.num_wires)?
-            .checked_add(challenges.checked_mul(2)?)?
-            .checked_add(lookups.checked_mul(2)?)?
-            .checked_add(partial)?.checked_add(quotient)?;
-        let salt = plonky2::plonk::plonk_common::salt_size(f.hiding);
-        let leaves = preprocessed.checked_add(c.num_wires)?
-            .checked_add(challenges)?.checked_add(partial)?.checked_add(lookups)?
-            .checked_add(quotient)?.checked_add(salt.checked_mul(3)?)?;
-        let mut depth = f.degree_bits.checked_add(f.config.rate_bits)?
-            .checked_sub(f.config.cap_height)?;
-        let mut query_bytes = leaves.checked_mul(8)?
-            .checked_add(depth.checked_mul(32)?.checked_add(16)?.checked_mul(4)?)?
-            .checked_add(16)?;
-        let mut final_bits = f.degree_bits;
-        for &arity_bits in &f.reduction_arity_bits {
-            depth = depth.checked_sub(arity_bits)?;
-            final_bits = final_bits.checked_sub(arity_bits)?;
-            query_bytes = query_bytes.checked_add(power(arity_bits)?.checked_mul(16)?)?
-                .checked_add(16)?.checked_add(depth.checked_mul(32)?)?;
-        }
-        let cap_bytes = power(f.config.cap_height)?.checked_mul(32)?.checked_add(8)?;
-        let caps = f.reduction_arity_bits.len().checked_add(3)?.checked_mul(cap_bytes)?;
-        caps.checked_add(openings.checked_mul(16)?)?.checked_add(9 * 8)?
-            .checked_add(query_bytes.checked_mul(f.config.num_query_rounds)?)?
-            .checked_add(power(final_bits)?.checked_mul(16)?)?
-            .checked_add(40)?
-            .checked_add(common.num_public_inputs.checked_mul(8)?)
-    })().ok_or_else(|| anyhow!("invalid or overflowing EndCap proof shape"))?;
-    Ok(bytes)
-}
 
-pub(crate) fn approved_endcap_max_proof_bytes() -> Result<u32> {
-    let common = psy_plonky2_basic_helpers::lookalike::standard::get_end_cap_type_e_common_data::<plonky2::plonk::config::PoseidonGoldilocksConfig,2>();
-    u32::try_from(approved_endcap_proof_bound(&common).map_err(|_|GuardianSignError::AuthorizationMismatch)?)
-        .map_err(|_|GuardianSignError::AuthorizationMismatch)
-}
 
 async fn verify_session_leaf(context: &GuardianVerificationContext<'_>, authorization: &GuardianAuthorization, record: &GuardianSessionRecord, ending_leaf: &psy_client_data::qdata::user::PsyUserLeaf<F>) -> Result<()> {
     let id = record.included_checkpoint_id;
@@ -488,10 +464,76 @@ async fn verify_session_leaf(context: &GuardianVerificationContext<'_>, authoriz
     verify_path(&user,roots.user_tree_root,authorization.user_id,ending_leaf.qfhash::<PsyHasher>(),GLOBAL_USER_TREE_HEIGHT as usize)
 }
 
+// Recovery authenticates the operation commitment, not arbitrary execution-witness JSON.
+// It must not execute the calls again against the live IMT allocator.
+fn verify_guardian_session_commitment(authorization: &GuardianAuthorization, request: &GuardianSignRequest, trace: &TxTrace, expected: &ContractCallData, historical_root: Hash4) -> Result<()> {
+    use psy_client_data::{dpn::proving_session::DPNProvingSessionSimpleMethodCall, qdata::{ups_signature::PsyUserProvingSessionSignatureDataCompact, user_contract_state::SignContext}, qstore::controllers::register_helpers::get_new_empty_user_leaf};
+    let start = &trace.ups_start_witness.ups_header.session_start_context;
+    let leaf = &start.start_session_user_leaf;
+    let core = &trace.finalization.submit_end_cap_input.core;
+    let checkpoint = trace.anchor.start_checkpoint_id;
+    let user_id = F::from_canonical_u64(authorization.user_id);
+    let nonce = F::from_canonical_u64(request.session_nonce);
+    if start.checkpoint_id.to_canonical_u64()!=checkpoint || start.checkpoint_tree_root!=historical_root || start.checkpoint_leaf_hash!=trace.anchor.checkpoint_leaf.qfhash::<PsyHasher>() || leaf.user_id!=user_id || leaf.public_key!=authorization.account_public_key {
+        return Err(GuardianSignError::StateMismatch);
+    }
+    let path = &trace.ups_start_witness.user_tree_proof;
+    verify_path(path,trace.anchor.global_state_roots.user_tree_root,authorization.user_id,path.value,GLOBAL_USER_TREE_HEIGHT as usize)?;
+    if path.value==Hash4::ZERO {
+        if *leaf!=get_new_empty_user_leaf(user_id,authorization.account_public_key) || request.session_nonce!=1 { return Err(GuardianSignError::StateMismatch); }
+        let registration = trace.ups_start_witness.user_registration_tree_proof.as_ref().ok_or(GuardianSignError::EvidenceMismatch)?;
+        verify_path(registration,trace.anchor.global_state_roots.user_registration_tree_root,psy_crypto::common::user_id::get_registration_id_from_user_id(authorization.user_id),authorization.account_public_key,GLOBAL_USER_TREE_HEIGHT as usize)?;
+    } else if trace.ups_start_witness.user_registration_tree_proof.is_some() || path.value!=leaf.qfhash::<PsyHasher>() {
+        return Err(GuardianSignError::StateMismatch);
+    }
+    if leaf.nonce.to_canonical_u64().checked_add(1)!=Some(request.session_nonce) || core.state_transition.start_user_leaf_hash!=path.value || core.state_transition.start_user_leaf_hash!=guardian_proved_start_hash(leaf) || core.state_transition.checkpoint_tree_root_hash!=historical_root || core.state_transition.user_id!=user_id {
+        return Err(GuardianSignError::StateMismatch);
+    }
+    if core.new_user_leaf.user_id!=user_id || core.new_user_leaf.public_key!=authorization.account_public_key || core.new_user_leaf.nonce!=nonce || core.new_user_leaf.last_checkpoint_id.to_canonical_u64()!=checkpoint || core.checkpoint_id.to_canonical_u64()!=checkpoint || core.new_user_leaf.qfhash::<PsyHasher>()!=core.state_transition.end_user_leaf_hash {
+        return Err(GuardianSignError::StateMismatch);
+    }
+    let witness = trace_policy(trace,authorization)?;
+    let mut end = core.new_user_leaf;
+    end.nonce = leaf.nonce;
+    let sign_context = SignContext { checkpoint_tree_root:historical_root,user_leaf:end };
+    if witness.start_session_user_leaf!=*leaf || witness.sign_context!=sign_context || witness.start_state.state.checkpoint_id!=start.checkpoint_id || witness.end_state.state.checkpoint_id!=start.checkpoint_id || witness.nonce!=nonce {
+        return Err(GuardianSignError::PolicyMismatch);
+    }
+    // The verified EndCap commits these fee fields and enforces the fee schedule.
+    let fee = core.stats.guta_fees_collected.to_canonical_u64().checked_add(core.stats.da_fees_collected.to_canonical_u64()).ok_or(GuardianSignError::UnsupportedCall)?;
+    if fee>=GOLDILOCKS_MODULUS || fee>authorization.max_fee { return Err(GuardianSignError::UnsupportedCall); }
+    let mut stack = Hash4::ZERO;
+    for call in &expected.contract_calls {
+        let id = u32::try_from(call.contract_id).map_err(|_|GuardianSignError::UnsupportedCall)?;
+        let artifact = approved_contract(authorization,id)?.compiler_artifact()?;
+        let mut methods = artifact.circuit_definitions.iter().filter(|method|method.name==call.method_name);
+        let method = methods.next().ok_or(GuardianSignError::UnsupportedCall)?;
+        if methods.next().is_some() || call.inputs.len()!=method.circuit_inputs.len() || call.inputs.iter().any(|input|*input>=GOLDILOCKS_MODULUS) { return Err(GuardianSignError::UnsupportedCall); }
+        let call = DPNProvingSessionSimpleMethodCall::new(F::from_canonical_u32(id),F::from_canonical_u32(method.method_id),call.inputs.iter().copied().map(F::from_canonical_u64).collect());
+        stack = PsyHasher::q_two_to_one(stack,call.qfhash::<PsyHasher>());
+    }
+    let fee_call = DPNProvingSessionSimpleMethodCall::new(F::ZERO,F::from_canonical_u32(TOKEN_BURN_METHOD_ID),vec![F::from_canonical_u64(fee)]);
+    stack = PsyHasher::q_two_to_one(stack,fee_call.qfhash::<PsyHasher>());
+    let count = u64::try_from(expected.contract_calls.len()).ok().and_then(|count|count.checked_add(1)).filter(|count|*count<GOLDILOCKS_MODULUS).ok_or(GuardianSignError::UnsupportedCall)?;
+    let sig_data = PsyUserProvingSessionSignatureDataCompact { start_user_leaf_hash:leaf.qfhash::<PsyHasher>(),end_user_leaf_hash:core.state_transition.end_user_leaf_hash,checkpoint_leaf_hash:start.checkpoint_leaf_hash,tx_stack_hash:stack,tx_count:F::from_canonical_u64(count) };
+    if core.stats.total_transactions!=sig_data.tx_count || witness.sig_data!=sig_data { return Err(GuardianSignError::StateMismatch); }
+    let message = sig_data.get_sig_action_for_user::<PsyHasher>(authorization.network_magic,user_id,nonce,sign_context).get_qhash::<PsyHasher>();
+    if message!=trace.finalization.sig_hash { return Err(GuardianSignError::StateMismatch); }
+    Ok(())
+}
+
+fn guardian_proved_start_hash(leaf: &psy_client_data::qdata::user::PsyUserLeaf<F>) -> Hash4 {
+    // Match the EndCap circuit's default-state-root selector, not a trace flag.
+    if leaf.user_state_tree_root==psy_config::get_default_user_state_tree_root::<F>() { Hash4::ZERO } else { leaf.qfhash::<PsyHasher>() }
+}
+
 pub async fn verify_session(context: &GuardianVerificationContext<'_>, authorization: &GuardianAuthorization, record: GuardianSessionRecord) -> Result<GuardianSession,GuardianAccountError> {
     use plonky2::plonk::{config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs, circuit_data::VerifierCircuitData};
     let request = record.validate(authorization)?;
-    let verified = verify_guardian_session(context,authorization,&request).await?;
+    // Included records verify through evidence plus proof/signature/inclusion binding; the
+    // execution replay cannot reproduce a trace after the session's own transition is included.
+    let (verified, expected_calls, historical_root) = verify_guardian_session_evidence(context,authorization,&request).await?;
+    verify_guardian_session_commitment(authorization,&request,&verified.trace,&expected_calls,historical_root)?;
     let signatures = record.signatures_json.decode()?;
     psy_prover::signature::users::multisig_user::validate_policy_signatures(&signatures,&verified.current_policy,verified.trace.finalization.sig_hash).map_err(|_|GuardianSignError::PolicyMismatch)?;
     let input = record.endcap_input_json.decode()?;
@@ -502,9 +544,15 @@ pub async fn verify_session(context: &GuardianVerificationContext<'_>, authoriza
     if bincode::serialize(&proof).map_err(|_|GuardianSignError::EvidenceMismatch)? != bytes { return Err(GuardianSignError::EvidenceMismatch.into()); }
     let expected = input.core.get_proof_public_inputs_hash::<PsyHasher>();
     if proof.public_inputs.as_slice() != expected.0.elements { return Err(GuardianSignError::EvidenceMismatch.into()); }
-    let manager = context.wallet.wallet.random_circuit_manager();
-    let verifier_only = manager.ups_end_cap_circuit_verifier_config().await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
-    VerifierCircuitData { verifier_only,common }.verify(proof).map_err(|_|GuardianSignError::EvidenceMismatch)?;
+    let mut verifier_only=None;
+    for manager in context.wallet.wallet.circuit_managers() {
+        let verifier=manager.ups_end_cap_circuit_verifier_config().await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+        let fingerprint=QHashOut(psy_common_circuit::proof_minifier::pm_core::get_circuit_fingerprint_generic::<2, F, PoseidonGoldilocksConfig>(&verifier));
+        if fingerprint!=authorization.endcap_verifier_fingerprint { return Err(GuardianSignError::AuthorizationMismatch.into()); }
+        verifier_only=Some(verifier);
+    }
+    let verifier_only=verifier_only.ok_or(GuardianSignError::EvidenceUnavailable)?;
+    VerifierCircuitData { verifier_only, common }.verify(proof).map_err(|_| GuardianSignError::EvidenceMismatch)?;
     verify_session_leaf(context,authorization,&record,&input.core.new_user_leaf).await?;
     if input.core.new_user_leaf.nonce.to_canonical_u64()!=request.session_nonce { return Err(GuardianSignError::StateMismatch.into()); }
     Ok(GuardianSession { network_magic:request.network_magic,user_id:request.user_id,nonce:request.session_nonce,record,starting_leaf_hash:verified.starting_leaf_hash,ending_leaf_hash:verified.ending_leaf_hash,withdrawal_appends:verified.withdrawal_appends })
@@ -520,7 +568,8 @@ async fn verify_saved_request(context: &GuardianVerificationContext<'_>, authori
     let trace = request.decode_trace()?;
     let id = trace.anchor.start_checkpoint_id;
     if id > context.verified_checkpoint_id { return Err(GuardianSignError::EvidenceUnavailable.into()); }
-    let path = context.provider.get_checkpoint_tree_merkle_proof(context.verified_checkpoint_id,id).await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
+    let path = context.provider.get_checkpoint_tree_merkle_proof(context.verified_checkpoint_id,id).await.map_err(|error| { tracing::warn!(verified = context.verified_checkpoint_id, anchor_start = id, error = %error, "[anchor] saved request proof failed"); GuardianSignError::EvidenceUnavailable })?;
+    // Authenticate the saved checkpoint before consulting its L1 deposit anchors.
     verify_saved_checkpoint(&path,context.verified_checkpoint_tree_root,id,trace.anchor.checkpoint_leaf.qfhash::<PsyHasher>())?;
     for anchor in &request.deposit_anchors {
         let endpoint = context.l1_endpoints.iter().find(|endpoint|endpoint.chain_index==anchor.chain_index).ok_or(GuardianSignError::EvidenceUnavailable)?;
@@ -583,12 +632,25 @@ pub async fn verified_account_nonce(context: &GuardianVerificationContext<'_>, a
     let roots = context.provider.get_checkpoint_global_state_roots(id).await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
     let path = context.provider.get_checkpoint_tree_merkle_proof(id,id).await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
     verify_checkpoint(id,&checkpoint,&roots,&path,context.verified_checkpoint_tree_root)?;
-    let user = context.provider.get_user_leaf_data(id,authorization.user_id).await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
-    let user_path = context.provider.get_user_tree_merkle_proof(id,authorization.user_id).await.map_err(|_|GuardianSignError::EvidenceUnavailable)?;
+    let user = context.provider.get_user_leaf_data(id, authorization.user_id).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+    let user_path = user_tree_proof(context.provider, id, authorization.user_id).await?;
     verify_path(&user_path,roots.user_tree_root,authorization.user_id,user_path.value,GLOBAL_USER_TREE_HEIGHT as usize)?;
     if user_path.value == Hash4::ZERO { return Ok(0); }
     if user_path.value != user.qfhash::<PsyHasher>() || user.public_key != authorization.account_public_key || user.user_id.to_canonical_u64()!=authorization.user_id { return Err(GuardianSignError::AccountIdentityConflict); }
     Ok(user.nonce.to_canonical_u64())
+}
+async fn user_tree_proof(provider: &psy_provider::provider::RpcProvider, checkpoint_id: u64, user_id: u64) -> Result<psy_crypto::hash::merkle::core::MerkleProofCore<psy_client_common::data::qhashout::QHashOut<F>>> {
+    for attempt in 0..8 {
+        match provider.get_user_tree_merkle_proof(checkpoint_id, user_id).await {
+            Ok(path) => return Ok(path),
+            Err(error) if error.to_string() == format!("get_user_tree_merkle_proof rpc call failed `RpcError {{ code: ServerError(-32001), message: \"User tree proof not found for checkpoint_id {checkpoint_id}\", data: None }}`") && attempt < 7 => {
+                tracing::warn!(checkpoint_id, attempt, "user tree proof not yet readable");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(_) => return Err(GuardianSignError::EvidenceUnavailable),
+        }
+    }
+    Err(GuardianSignError::EvidenceUnavailable)
 }
 
 fn decode_endcap_proof(bytes: &[u8], bound: u32) -> Result<plonky2::plonk::proof::ProofWithPublicInputs<F,plonky2::plonk::config::PoseidonGoldilocksConfig,2>> {
@@ -600,6 +662,88 @@ fn decode_endcap_proof(bytes: &[u8], bound: u32) -> Result<plonky2::plonk::proof
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_commitment_fixture() -> (GuardianAuthorization, GuardianSignRequest, TxTrace, ContractCallData, Hash4) {
+        use psy_crypto::hash::merkle::utils::simple_merkle_tree::SimpleMerkleTree;
+        use psy_client_data::{dpn::proving_session::DPNProvingSessionSimpleMethodCall, qdata::{user::PsyUserLeaf,user_contract_state::{UserContractState,SignContext},ups_signature::PsyUserProvingSessionSignatureDataCompact}};
+        use psy_vm::{ups::{multisig::MultisigAccount,state_reader::StateReaderResults},dpn::ops::state_cmd::data::{DPNStateCmd,DPNStateCmdGetSelfUserCurrentContractStateSlotHash}};
+        let members = [Hash4::from_values(1,0,0,0),Hash4::from_values(2,0,0,0),Hash4::from_values(3,0,0,0)];
+        let policy = StoredMultisigPolicy {header:Hash4::from_values(1,2,3,0),members}.policy().unwrap();
+        let account = MultisigAccount {contract_id:6,initial_policy:policy};
+        let fingerprint = Hash4::from_values(9,8,7,6);
+        let public_key = PsyHasher::q_two_to_one(fingerprint,account.public_key_param().unwrap());
+        let mut policy_tree = SimpleMerkleTree::<PsyHasher,Hash4>::new(4);
+        for (index,value) in std::iter::once(Hash4::from_values(1,2,3,0)).chain(members).enumerate() { policy_tree.set_leaf(index as u64,value); }
+        let mut contracts = SimpleMerkleTree::<PsyHasher,Hash4>::new(GLOBAL_CONTRACT_TREE_HEIGHT);
+        contracts.set_leaf(6,policy_tree.get_root());
+        let leaf = PsyUserLeaf {public_key,user_state_tree_root:contracts.get_root(),user_id:F::from_canonical_u64(BRIDGE_USER_ID),nonce:F::ONE,..Default::default()};
+        let mut users = SimpleMerkleTree::<PsyHasher,Hash4>::new(GLOBAL_USER_TREE_HEIGHT);
+        users.set_leaf(BRIDGE_USER_ID,leaf.qfhash::<PsyHasher>());
+        let root = Hash4::from_values(5,6,7,8);
+        let state = StateReaderResults {state:UserContractState::new(root,leaf,policy_tree.get_root(),F::from_canonical_u64(6),F::from_canonical_u64(7)),user_tree_root:users.get_root(),checkpoint:None,aux_user_leaves:vec![],state_cmds:(0..4).map(|index|DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(DPNStateCmdGetSelfUserCurrentContractStateSlotHash {slot_index:F::from_canonical_u64(index)})).collect(),merkel_proofs:(0..4).flat_map(|index|[contracts.get_leaf(6),policy_tree.get_leaf(index)]).collect()};
+        let method = |name: &str,method_id| psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition {name:name.into(),method_id,circuit_inputs:vec![],circuit_outputs:vec![],assertions:vec![],events:vec![],definitions:vec![],state_commands:vec![],state_command_resolution_indices:vec![]};
+        let artifact = CompilerArtifact {state_tree_height:4,circuit_definitions:vec![method("first",1),method("second",2)],abi:serde_json::json!({"schema_version":"2.0.0","contract":{"state_tree_height":4}})};
+        let artifact_json = JsonText::from_value(&artifact).unwrap();
+        let authorization = GuardianAuthorization {version:1,network_magic:90101,genesis_hash:Hex([1;32]),user_id:BRIDGE_USER_ID,account_json:JsonText::from_value(&account).unwrap(),account_public_key:public_key,multisig_fingerprint:fingerprint,deposit_contract_id:2,withdrawal_contract_id:3,fee_contract_id:0,guta_fee:1,da_fee:1,max_fee:100,max_endcap_proof_bytes:1,endcap_verifier_fingerprint:Hash4::from_values(1,1,1,1),approved_contracts:vec![ApprovedContract {contract_id:3,contract_leaf_json:JsonText::from_value(&PsyContractLeaf::<F>::default()).unwrap(),compiler_artifact_sha256:sha256(artifact_json.as_str().as_bytes()),compiler_artifact_json:artifact_json}],chains:vec![]};
+        let mut request = super::super::test_fixture::codec_request_fixture();
+        let mut trace = request.decode_trace().unwrap();
+        request.session_nonce = 2;
+        trace.meta.public_key = public_key;
+        trace.anchor.start_checkpoint_id = 7;
+        trace.anchor.global_state_roots.user_tree_root = users.get_root();
+        trace.ups_start_witness.user_tree_proof = users.get_leaf(BRIDGE_USER_ID);
+        trace.ups_start_witness.ups_header.session_start_context = psy_client_data::ups::ups_context_input::UserProvingSessionStartContext {checkpoint_id:F::from_canonical_u64(7),checkpoint_tree_root:root,checkpoint_leaf_hash:trace.anchor.checkpoint_leaf.qfhash::<PsyHasher>(),start_session_user_leaf:leaf};
+        let mut end = leaf;
+        end.last_checkpoint_id = F::from_canonical_u64(7);
+        let sign_context = SignContext {checkpoint_tree_root:root,user_leaf:end};
+        end.nonce = F::from_canonical_u64(2);
+        trace.finalization.nonce = end.nonce;
+        let core = &mut trace.finalization.submit_end_cap_input.core;
+        core.checkpoint_id = end.last_checkpoint_id;
+        core.new_user_leaf = end;
+        core.state_transition = psy_client_data::qdata::ups_end_cap_result::UPSEndCapResultCompact {start_user_leaf_hash:leaf.qfhash::<PsyHasher>(),end_user_leaf_hash:end.qfhash::<PsyHasher>(),checkpoint_tree_root_hash:root,user_id:leaf.user_id};
+        core.stats.guta_fees_collected = F::ONE;
+        core.stats.da_fees_collected = F::ONE;
+        core.stats.total_transactions = F::from_canonical_u64(2);
+        let call = DPNProvingSessionSimpleMethodCall::new(F::from_canonical_u64(3),F::ONE,vec![]);
+        let burn = DPNProvingSessionSimpleMethodCall::new(F::ZERO,F::from_canonical_u32(TOKEN_BURN_METHOD_ID),vec![F::from_canonical_u64(2)]);
+        let stack = PsyHasher::q_two_to_one(PsyHasher::q_two_to_one(Hash4::ZERO,call.qfhash::<PsyHasher>()),burn.qfhash::<PsyHasher>());
+        let sig_data = PsyUserProvingSessionSignatureDataCompact {start_user_leaf_hash:leaf.qfhash::<PsyHasher>(),end_user_leaf_hash:end.qfhash::<PsyHasher>(),checkpoint_leaf_hash:trace.anchor.checkpoint_leaf.qfhash::<PsyHasher>(),tx_stack_hash:stack,tx_count:F::from_canonical_u64(2)};
+        trace.finalization.sig_hash = sig_data.get_sig_action_for_user::<PsyHasher>(authorization.network_magic,leaf.user_id,end.nonce,sign_context).get_qhash::<PsyHasher>();
+        let mut end_state = state.clone();
+        end_state.state.user_leaf = sign_context.user_leaf;
+        let witness = MultisigSignatureWitness {account:account.clone(),start_state:state,end_state,sig_data,sign_context,start_session_user_leaf:leaf,nonce:end.nonce};
+        trace.steps.push(TraceStep::ZkSign(psy_prover::trace::ZkSignStep {fingerprint,proof_tree_start_root:Hash4::ZERO,proof_tree_end_root:Hash4::ZERO,sign_circuit_source:psy_prover::trace::TraceSignCircuitSource::Multisig,sign_witness:serde_json::to_vec(&witness).unwrap(),public_key_param:account.public_key_param().unwrap(),sign_verifier_data_alt:psy_client_common::data::alt::AltVerifierOnlyCircuitData {constants_sigmas_cap:vec![],circuit_digest:Hash4::ZERO}}));
+        let expected = ContractCallData::new(vec![ContractCallArgs {contract_id:3,method_name:"first".into(),inputs:vec![]}]);
+        (authorization,request,trace,expected,root)
+    }
+
+    #[test]
+    fn recovered_calls_bind_to_signed_commitment_without_execution() {
+        let (authorization,request,trace,mut calls,root) = recovery_commitment_fixture();
+        assert!(verify_guardian_session_commitment(&authorization,&request,&trace,&calls,root).is_ok());
+        calls.contract_calls[0].method_name = "second".into();
+        assert!(matches!(verify_guardian_session_commitment(&authorization,&request,&trace,&calls,root),Err(GuardianSignError::StateMismatch)));
+        calls.contract_calls[0].method_name = "first".into();
+        let mut spliced = trace.clone();
+        spliced.finalization.submit_end_cap_input.core.new_user_leaf.balance += F::ONE;
+        assert!(verify_guardian_session_commitment(&authorization,&request,&spliced,&calls,root).is_err());
+        assert!(verify_guardian_session_commitment(&authorization,&request,&trace,&calls,Hash4::ZERO).is_err());
+        let mut wrong_fee = trace.clone();
+        wrong_fee.finalization.submit_end_cap_input.core.stats.da_fees_collected += F::ONE;
+        assert!(verify_guardian_session_commitment(&authorization,&request,&wrong_fee,&calls,root).is_err());
+    }
+
+    #[test]
+    fn recovered_start_hash_matches_endcap_default_root_selector() {
+        let mut leaf = psy_client_data::qstore::controllers::register_helpers::get_new_empty_user_leaf(F::from_canonical_u64(BRIDGE_USER_ID),Hash4::from_values(1,2,3,4));
+        assert_ne!(leaf.qfhash::<PsyHasher>(),Hash4::ZERO);
+        assert_eq!(guardian_proved_start_hash(&leaf),Hash4::ZERO);
+        leaf.nonce = F::ONE;
+        assert_eq!(guardian_proved_start_hash(&leaf),Hash4::ZERO);
+        leaf.user_state_tree_root = Hash4::from_values(4,3,2,1);
+        assert_eq!(guardian_proved_start_hash(&leaf),leaf.qfhash::<PsyHasher>());
+    }
 
     #[test]
     fn proof_path_cannot_select_another_root_location_or_height() {
@@ -651,7 +795,7 @@ mod tests {
 
     fn session(nonce: u64, start: Hash4, end: Hash4, appends: Vec<WithdrawalAppendRecord>) -> GuardianSession {
         GuardianSession { network_magic:90101,user_id:BRIDGE_USER_ID,nonce,starting_leaf_hash:start,ending_leaf_hash:end,withdrawal_appends:appends,record:GuardianSessionRecord {
-            request_json:JsonText::from_value(&super::super::protocol::codec_request_fixture()).unwrap(),
+            request_json:JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap(),
             signatures_json:JsonText::from_value(&psy_vm::ups::multisig::MultisigSignatures { member_indices:vec![],signatures:vec![] }).unwrap(),
             endcap_input_json:JsonText::from_value(&psy_client_data::guta::end_cap_input::SubmitUserEndCapNonProofInput::<F>::default()).unwrap(),
             endcap_proof_hex:"0x".into(),included_checkpoint_id:1,included_checkpoint_hash:Hash4::ZERO,
@@ -689,6 +833,8 @@ mod tests {
         let mut path=MerkleProofCore {root,index:0,value,siblings};
         assert!(verify_saved_checkpoint(&path,root,0,value).is_ok());
         assert!(matches!(verify_saved_checkpoint(&path,root,0,Hash4::ZERO),Err(GuardianAccountError::Conflict(HaltReason::CheckpointConflict))));
+        assert!(matches!(verify_saved_checkpoint(&path,Hash4::ZERO,0,value),Err(GuardianAccountError::Unavailable(GuardianSignError::EvidenceMismatch))));
+        assert!(matches!(verify_saved_checkpoint(&path,root,1,value),Err(GuardianAccountError::Unavailable(GuardianSignError::EvidenceMismatch))));
         path.siblings[0]=value;
         assert!(matches!(verify_saved_checkpoint(&path,root,0,Hash4::ZERO),Err(GuardianAccountError::Unavailable(GuardianSignError::EvidenceMismatch))));
     }
@@ -715,10 +861,12 @@ mod tests {
         assert!(verify_withdraw_map_constants(&definition,base,capacity).is_err());
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires approved real compiler artifacts in GUARDIAN_COMPILER_ARTIFACTS"]
-    fn real_compiler_artifacts_validate_all_precompiles_and_reject_substitution() -> anyhow::Result<()> {
+    async fn real_compiler_artifacts_validate_all_precompiles_and_reject_substitution() -> anyhow::Result<()> {
         let directory=std::path::PathBuf::from(std::env::var("GUARDIAN_COMPILER_ARTIFACTS")?);
+        let network=psy_config::PsyConfigGoldilocks::builder().path("config.json").network(psy_config::CURRENT_NETWORK).build()?.get_current_network()?.clone();
+        let wallet=WalletSession::new(&network).await?;
         let names=["token","mining_rewards","deposit_tree","withdrawal_tree","usdt_token","faucet","multisig_policy"];
         let history=GuardianHistory::new();
         for (contract_id,name) in names.iter().enumerate() {
@@ -729,7 +877,7 @@ mod tests {
             let deployment=deployment.into_with_whitelist_root::<PsyHasher>()?;
             let leaf=PsyContractLeaf::<F> {deployer:F::from_canonical_u64(deployment.deployer),function_tree_root:deployment.function_whitelist_root,code_root:deployment.code_root,state_tree_height:F::from_canonical_u16(artifact.state_tree_height),state_layout_root:Hash4::ZERO,state_layout_field_count:F::ZERO,state_layout_slot_count:F::ZERO};
             let approved=ApprovedContract {contract_id:contract_id as u32,contract_leaf_json:JsonText::from_value(&leaf)?,compiler_artifact_sha256:sha256(artifact_json.as_str().as_bytes()),compiler_artifact_json:artifact_json};
-            let map=history.approved_artifact(&approved)?;
+            let map=history.approved_artifact(&approved,&wallet).await?;
             if matches!(contract_id,0|4) {
                 let map=map.ok_or_else(||anyhow::anyhow!("token map descriptor missing"))?;
                 assert_eq!(map.capacity,1048576);
@@ -740,53 +888,20 @@ mod tests {
                 field["offset"]=serde_json::json!(map.subslot_base+4);
                 let mut substituted=approved.clone(); substituted.compiler_artifact_json=JsonText::from_value(&changed)?;
                 substituted.compiler_artifact_sha256=sha256(substituted.compiler_artifact_json.as_str().as_bytes());
-                assert!(validate_approved_contract(&substituted).is_err(),"ABI offset substitution accepted for {name}");
+                assert!(validate_approved_contract(&substituted,&wallet).await.is_err(),"ABI offset substitution accepted for {name}");
             } else { assert!(map.is_none()); }
             if contract_id==6 { assert_eq!(artifact.state_tree_height,4); }
             let mut wrong_digest=approved.clone(); wrong_digest.compiler_artifact_sha256.0[0]^=1;
-            assert!(history.approved_artifact(&wrong_digest).is_err());
+            assert!(history.approved_artifact(&wrong_digest,&wallet).await.is_err());
             let mut wrong_leaf=leaf; wrong_leaf.code_root.0.elements[0]+=F::ONE;
             let mut changed=approved.clone(); changed.contract_leaf_json=JsonText::from_value(&wrong_leaf)?;
-            assert!(validate_approved_contract(&changed).is_err(),"code-root substitution accepted for {name}");
+            assert!(validate_approved_contract(&changed,&wallet).await.is_err(),"code-root substitution accepted for {name}");
             changed=approved.clone();
             let mut changed_artifact=artifact; changed_artifact.state_tree_height=changed_artifact.state_tree_height.saturating_add(1);
             changed.compiler_artifact_json=JsonText::from_value(&changed_artifact)?;
             changed.compiler_artifact_sha256=sha256(changed.compiler_artifact_json.as_str().as_bytes());
-            assert!(validate_approved_contract(&changed).is_err(),"height substitution accepted for {name}");
+            assert!(validate_approved_contract(&changed,&wallet).await.is_err(),"height substitution accepted for {name}");
         }
         Ok(())
-    }
-
-    #[test]
-    fn bound_matches_library_serialization() {
-        let mut builder = plonky2::plonk::circuit_builder::CircuitBuilder::<F, 2>::new(plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config());
-        let value = builder.zero();
-        builder.register_public_input(value);
-        let circuit = builder.build::<plonky2::plonk::config::PoseidonGoldilocksConfig>();
-        let proof = circuit.prove(plonky2::iop::witness::PartialWitness::new()).unwrap();
-        assert_eq!(approved_endcap_proof_bound(&circuit.common).unwrap(), bincode::serialize(&proof).unwrap().len());
-        circuit.verify(proof).unwrap();
-    }
-
-    #[test]
-    fn rejects_overflow_and_impossible_merkle_depths() {
-        let builder = plonky2::plonk::circuit_builder::CircuitBuilder::<F, 2>::new(plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config());
-        let common = builder.build::<plonky2::plonk::config::PoseidonGoldilocksConfig>().common;
-        let mut invalid = common.clone();
-        invalid.num_public_inputs = usize::MAX;
-        assert!(approved_endcap_proof_bound(&invalid).is_err());
-        invalid = common.clone();
-        invalid.fri_params.degree_bits = usize::MAX;
-        assert!(approved_endcap_proof_bound(&invalid).is_err());
-        invalid = common.clone();
-        invalid.fri_params.reduction_arity_bits = vec![common.fri_params.degree_bits + 1];
-        assert!(approved_endcap_proof_bound(&invalid).is_err());
-        invalid = common.clone();
-        invalid.config.fri_config.cap_height = usize::BITS as usize;
-        invalid.fri_params.config.cap_height = usize::BITS as usize;
-        assert!(approved_endcap_proof_bound(&invalid).is_err());
-        invalid = common;
-        invalid.fri_params.config.num_query_rounds += 1;
-        assert!(approved_endcap_proof_bound(&invalid).is_err());
     }
 }

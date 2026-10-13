@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fmt, marker::PhantomData, path::{Component, Path, PathBuf}};
+use std::{collections::{BTreeMap, BTreeSet}, fmt, marker::PhantomData, net::SocketAddr, path::{Component, Path, PathBuf}};
 
 use alloy_primitives::U256;
 use plonky2::{field::{goldilocks_field::GoldilocksField, types::PrimeField64}, hash::poseidon::PoseidonHash, plonk::config::Hasher};
@@ -10,7 +10,7 @@ use psy_vm::ups::multisig::{MultisigAccount, MultisigSignatures};
 use serde::{de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor}, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 pub const GOLDILOCKS_MODULUS: u64 = 0xffff_ffff_0000_0001;
 pub const BRIDGE_USER_ID: u64 = 524288;
 pub type Hash4 = QHashOut<GoldilocksField>;
@@ -107,9 +107,13 @@ impl<'de> Deserialize<'de> for UniqueJson {
         d.deserialize_any(JsonVisitor)
     }
 }
-pub fn parse_canonical_json<T: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<T, GuardianSignError> {
+pub(crate) fn parse_duplicate_free_json(bytes: &[u8]) -> Result<Value, GuardianSignError> {
     if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::MalformedRequest); }
     let UniqueJson(parsed) = serde_json::from_slice(bytes).map_err(|_| GuardianSignError::MalformedRequest)?;
+    Ok(parsed)
+}
+pub fn parse_canonical_json<T: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<T, GuardianSignError> {
+    let parsed = parse_duplicate_free_json(bytes)?;
     let typed: T = serde_json::from_value(parsed.clone()).map_err(|_| GuardianSignError::MalformedRequest)?;
     if serde_json::to_value(&typed).map_err(|_| GuardianSignError::MalformedRequest)? != parsed {
         return Err(GuardianSignError::MalformedRequest);
@@ -181,7 +185,7 @@ pub struct GuardianAuthorization {
     pub version: u32, pub network_magic: u64, pub genesis_hash: Hex32, pub user_id: u64,
     pub account_json: JsonText<MultisigAccount>, pub account_public_key: Hash4, pub multisig_fingerprint: Hash4,
     pub deposit_contract_id: u32, pub withdrawal_contract_id: u32, pub fee_contract_id: u32,
-    pub guta_fee: u64, pub da_fee: u64, pub max_fee: u64, pub max_endcap_proof_bytes: u32,
+    pub guta_fee: u64, pub da_fee: u64, pub max_fee: u64, pub max_endcap_proof_bytes: u32, pub endcap_verifier_fingerprint: Hash4,
     pub approved_contracts: Vec<ApprovedContract>, pub chains: Vec<ChainAuthorization>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,35 +202,45 @@ pub struct ChainAuthorization {
 #[serde(deny_unknown_fields)]
 pub struct TokenMapping { pub token: Hex20, pub l2_contract_id: u32 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GuardianRuntimeConfig {
-    pub authorization_path: String, pub authorization_archive_path: String, pub authorization_index_path: String,
-    pub rpc_config_path: String, pub listen_address: String, pub tls_certificate_path: String, pub tls_private_key_path: String,
-    pub client_ca_path: String, pub allowed_client_certificate_sha256: Vec<Hex32>,
-    pub db_path: String, pub signing_key_secret_path: String,
-    pub signing_key_password_secret_path: String, pub signing_authorization_path: String,
-    pub l2_rpc_url: String, pub l2_rpc_endpoint_pins: Vec<L2RpcEndpointPin>,
-    pub l1_rpc_urls: Vec<ChainEndpoint>, pub history_urls: Vec<String>,
+pub struct GuardianConfig {
+    pub network: psy_config::NetworkConfigGoldilocks,
+    pub guardians: BTreeMap<u8, GuardianSignerConfig>,
+    pub client: GuardianClientConfig,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianSignerConfig {
+    pub listen_address: SocketAddr,
+    pub signing_key_secret_path: PathBuf,
+    pub signing_key_password_secret_path: PathBuf,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianClientConfig {
+    pub endpoints: [String; 3],
+    pub archive_path: PathBuf,
+    pub listen_address: SocketAddr,
+    pub l1_endpoints: Vec<ChainEndpoint>,
+}
+/// Derived startup fields for one selected guardian. Not serialized.
+#[derive(Debug, Clone)]
+pub struct GuardianRuntimeConfig {
+    pub authorization_path: String,
+    pub authorization_archive_path: String,
+    pub authorization_index_path: String,
+    pub listen_address: String,
+    pub db_path: String,
+    pub signing_key_secret_path: String,
+    pub signing_key_password_secret_path: String,
+    pub l2_rpc_url: String,
+    pub l1_rpc_urls: Vec<ChainEndpoint>,
+    pub history_urls: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainEndpoint { pub chain_index: u8, pub rpc_url: String }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum L2RpcEndpointRole { Coordinator = 0, Realm = 1 }
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct L2RpcEndpointPin {
-    pub role: L2RpcEndpointRole, pub config_id: u64, pub rpc_url: String, pub tls_certificate_sha256: Option<Hex32>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SigningAuthorization {
-    pub network_magic: u64, pub user_id: u64, pub public_key: Hex33,
-    pub db_path: String, pub not_before_unix: u64, pub expires_at_unix: u64,
-    pub exclusive_key_use: bool, pub complete_journal: bool, pub revoked: bool,
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardianAuthorizationIndex { pub active_version: u32, pub versions: Vec<GuardianAuthorizationVersion> }
@@ -303,7 +317,7 @@ pub struct GuardianSessionsResponse { pub sessions: Vec<GuardianSessionRecord>, 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuardianAccountState { Active, Halted }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HaltReason { FinalityConflict, CheckpointConflict, NonceConsumedDifferently, IncludedTransitionMissing, AppendHistoryMismatch, SigningAuthorizationInvalid }
+pub enum HaltReason { FinalityConflict, CheckpointConflict, NonceConsumedDifferently, IncludedTransitionMissing, AppendHistoryMismatch }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardianAccount {
@@ -419,12 +433,14 @@ impl GuardianAuthorization {
     }
     pub fn validate(&self, guta_fee: u64, da_fee: u64, max_endcap_proof_bytes: u32) -> Result<(), GuardianSignError> {
         let mismatch = GuardianSignError::AuthorizationMismatch;
+        let floor = guta_fee.checked_add(da_fee).ok_or(mismatch)?;
         if self.version == 0 || !canonical_field(self.network_magic) || self.genesis_hash.0 == [0; 32] || self.user_id != BRIDGE_USER_ID
             || self.deposit_contract_id != 2 || self.withdrawal_contract_id != 3 || self.fee_contract_id != 0
-            || self.guta_fee != guta_fee || self.da_fee != da_fee
+            || self.guta_fee != guta_fee || self.da_fee != da_fee || self.max_fee < floor
             || self.max_endcap_proof_bytes == 0 || self.max_endcap_proof_bytes != max_endcap_proof_bytes
             || self.chains.is_empty() || self.chains.len() > 256 { return Err(mismatch); }
-        validate_hash(self.account_public_key)?; validate_hash(self.multisig_fingerprint)?;
+        validate_hash(self.account_public_key)?; validate_hash(self.multisig_fingerprint)?; validate_hash(self.endcap_verifier_fingerprint)?;
+        if self.endcap_verifier_fingerprint == Hash4::ZERO { return Err(mismatch); }
         let account = self.account_json.decode()?;
         if account.contract_id != 6 || account.initial_policy.threshold != 2 || account.initial_policy.member_count != 3 { return Err(GuardianSignError::PolicyMismatch); }
         for member in account.initial_policy.member_hashes { validate_hash(member)?; }
@@ -487,46 +503,55 @@ impl GuardianAuthorizationIndex {
 fn relative_path(value: &str) -> bool {
     !value.is_empty() && Path::new(value).components().all(|c| matches!(c, Component::Normal(_)))
 }
-fn validate_endpoint(value: &str, origin_only: bool) -> Result<(), GuardianSignError> {
+/// L1 endpoints retain HTTPS-or-loopback. Guardian and history origins are HTTP only.
+pub(crate) fn validate_endpoint(value: &str, origin_only: bool, http_only: bool) -> Result<(), GuardianSignError> {
     let url = url::Url::parse(value).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
     let loopback = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(), Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         Some(url::Host::Domain(host)) => host == "localhost", None => false,
     };
-    if !(url.scheme() == "https" || (url.scheme() == "http" && loopback)) || url.host().is_none()
-        || !url.username().is_empty() || url.password().is_some() || url.fragment().is_some()
+    let scheme_ok = if http_only {
+        url.scheme() == "http" && url.port().is_none_or(|port| port != 0)
+    } else {
+        url.scheme() == "https" || (url.scheme() == "http" && loopback)
+    };
+    if !scheme_ok || url.host().is_none() || !url.username().is_empty() || url.password().is_some() || url.fragment().is_some()
         || (origin_only && (url.path() != "/" || url.query().is_some())) { return Err(GuardianSignError::AuthorizationMismatch); }
     Ok(())
+}
+pub(crate) fn http_origin(value: &str) -> Result<String, GuardianSignError> {
+    let url = url::Url::parse(value).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
+    validate_endpoint(value, true, true)?;
+    let port = url.port().unwrap_or(80);
+    let host = url.host_str().ok_or(GuardianSignError::AuthorizationMismatch)?.to_ascii_lowercase();
+    Ok(format!("http://{host}:{port}"))
+}
+pub(crate) fn history_origin(address: SocketAddr) -> Result<String, GuardianSignError> {
+    if address.ip().is_unspecified() || address.port() == 0 { return Err(GuardianSignError::AuthorizationMismatch); }
+    let origin = if address.is_ipv6() { format!("http://[{}]:{}/", address.ip(), address.port()) } else { format!("http://{address}/") };
+    validate_endpoint(&origin, true, true)?;
+    Ok(origin)
 }
 impl GuardianRuntimeConfig {
     pub fn validate(&self, authorization: &GuardianAuthorization, index: &GuardianAuthorizationIndex) -> Result<(), GuardianSignError> {
         index.validate()?;
-        for path in [&self.authorization_path, &self.authorization_archive_path, &self.authorization_index_path, &self.tls_certificate_path,
-            &self.tls_private_key_path, &self.client_ca_path, &self.db_path, &self.signing_key_secret_path,
-            &self.rpc_config_path, &self.signing_key_password_secret_path, &self.signing_authorization_path] {
+        for path in [&self.authorization_path, &self.authorization_archive_path, &self.authorization_index_path] {
             if !relative_path(path) { return Err(GuardianSignError::AuthorizationMismatch); }
         }
         if Path::new(&self.authorization_path) != index.archive_file(Path::new(&self.authorization_archive_path), index.active_version)?
-            || authorization.version != index.active_version || self.listen_address.parse::<std::net::SocketAddr>().is_err()
-            || self.tls_private_key_path == self.signing_key_secret_path
-            || !(1..=16).contains(&self.allowed_client_certificate_sha256.len())
-            || self.allowed_client_certificate_sha256.iter().collect::<BTreeSet<_>>().len() != self.allowed_client_certificate_sha256.len()
-            || !(1..=4).contains(&self.history_urls.len()) || self.l1_rpc_urls.len() != authorization.chains.len() { return Err(GuardianSignError::AuthorizationMismatch); }
-        let mut routes = BTreeSet::new();
-        for pin in &self.l2_rpc_endpoint_pins {
-            let url = pin.validate()?;
-            if !routes.insert((pin.role, pin.config_id, url.to_string())) { return Err(GuardianSignError::AuthorizationMismatch); }
-        }
-        if !self.l2_rpc_endpoint_pins.iter().any(|pin| pin.role == L2RpcEndpointRole::Coordinator && pin.rpc_url == self.l2_rpc_url) {
-            return Err(GuardianSignError::AuthorizationMismatch);
+            || authorization.version != index.active_version || self.listen_address.parse::<SocketAddr>().is_err()
+            || self.history_urls.is_empty() || self.l1_rpc_urls.len() != authorization.chains.len() { return Err(GuardianSignError::AuthorizationMismatch); }
+        let mut history = BTreeSet::new();
+        for endpoint in &self.history_urls {
+            validate_endpoint(endpoint, true, true)?;
+            if !history.insert(endpoint) { return Err(GuardianSignError::AuthorizationMismatch); }
         }
         let mut chains = BTreeSet::new();
         for endpoint in &self.l1_rpc_urls {
             authorization.chain(endpoint.chain_index)?;
             if !chains.insert(endpoint.chain_index) { return Err(GuardianSignError::AuthorizationMismatch); }
-            validate_endpoint(&endpoint.rpc_url, false)?;
+            validate_endpoint(&endpoint.rpc_url, false, false)?;
         }
-        for endpoint in &self.history_urls { validate_endpoint(endpoint, true)?; }
         Ok(())
     }
 }
@@ -765,11 +790,15 @@ mod tests {
     fn endpoint_and_archive_paths_cannot_escape_or_embed_credentials() {
         for value in ["", "../archive", "/archive", "archive/../other"] { assert!(!relative_path(value)); }
         assert!(relative_path("archive/1.json"));
-        assert!(validate_endpoint("https://history.example/", true).is_ok());
-        assert!(validate_endpoint("http://127.0.0.1:9000/", true).is_ok());
-        for value in ["http://history.example/", "https://user:secret@history.example/", "https://history.example/path", "https://history.example/?x=1"] {
-            assert!(validate_endpoint(value, true).is_err());
+        assert!(validate_endpoint("http://history.example/", true, true).is_ok());
+        assert!(validate_endpoint("http://127.0.0.1:9000/", true, true).is_ok());
+        assert!(validate_endpoint("http://[::1]:9000/", true, true).is_ok());
+        assert!(validate_endpoint("https://history.example/", true, true).is_err());
+        for value in ["http://user:secret@history.example/", "http://history.example/path", "http://history.example/?x=1", "http://history.example/#fragment", "http://127.0.0.1:0/"] {
+            assert!(validate_endpoint(value, true, true).is_err());
         }
+        assert!(validate_endpoint("https://l1.example/rpc", false, false).is_ok());
+        assert!(validate_endpoint("http://history.example/rpc", false, false).is_err());
     }
 }
 
@@ -905,164 +934,6 @@ mod bounds_tests {
         assert!(page.validate_page(6, 1).is_err());
         assert!(page.validate_page(7, 0).is_err());
         assert!(page.validate_page(7, 65).is_err());
-    }
-}
-
-impl L2RpcEndpointPin {
-    pub fn validate(&self) -> Result<url::Url, GuardianSignError> {
-        let invalid = GuardianSignError::AuthorizationMismatch;
-        let url = url::Url::parse(&self.rpc_url).map_err(|_| invalid)?;
-        let (_, after_scheme) = self.rpc_url.split_once("://").ok_or(invalid)?;
-        let raw_path = after_scheme.find('/').map(|i| &after_scheme[i..]).unwrap_or("");
-        if self.rpc_url.contains('\\') || raw_path.contains('%') || raw_path.split('/').any(|segment| segment == "." || segment == "..")
-            || self.rpc_url.chars().any(|c| c.is_control() || c.is_whitespace())
-            || url.host().is_none() || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
-            return Err(invalid);
-        }
-        match (url.scheme(), url.host(), self.tls_certificate_sha256) {
-            ("https", Some(_), Some(_)) => {}
-            ("http", Some(url::Host::Ipv4(ip)), None) if ip == std::net::Ipv4Addr::LOCALHOST => {
-                let authority = after_scheme.split('/').next().unwrap_or("");
-                if authority.split(':').next() != Some("127.0.0.1") { return Err(invalid); }
-            }
-            ("http", Some(url::Host::Ipv6(ip)), None) if ip == std::net::Ipv6Addr::LOCALHOST => {
-                let authority = after_scheme.split('/').next().unwrap_or("");
-                if authority != "[::1]" && !authority.starts_with("[::1]:") { return Err(invalid); }
-            }
-            _ => return Err(invalid),
-        }
-        Ok(url)
-    }
-}
-impl SigningAuthorization {
-    pub fn validate(&self, authorization: &GuardianAuthorization, runtime: &GuardianRuntimeConfig, journal_public_key: Hex33, now_unix: u64) -> Result<(), GuardianSignError> {
-        if !canonical_field(self.network_magic) || self.network_magic != authorization.network_magic || self.user_id != BRIDGE_USER_ID
-            || self.user_id != authorization.user_id || self.public_key != journal_public_key || !matches!(self.public_key.0[0], 2 | 3)
-            || !relative_path(&self.db_path) || self.db_path != runtime.db_path
-            || !self.exclusive_key_use || !self.complete_journal || self.revoked || self.not_before_unix >= self.expires_at_unix
-            || now_unix < self.not_before_unix || now_unix >= self.expires_at_unix { return Err(GuardianSignError::KeyUnavailable); }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod runtime_pin_tests {
-    use super::*;
-
-    fn pin(url: &str, certificate: bool) -> L2RpcEndpointPin {
-        L2RpcEndpointPin { role: L2RpcEndpointRole::Coordinator, config_id: 0, rpc_url: url.into(), tls_certificate_sha256: certificate.then_some(Hex([1; 32])) }
-    }
-
-    #[test]
-    fn l2_route_approval_preserves_path_and_normalizes_origin_only() {
-        assert_eq!(pin("https://NODE.example:443/realm/2", true).validate().unwrap().as_str(), "https://node.example/realm/2");
-        assert_ne!(pin("https://node.example/realm/1", true).validate().unwrap(), pin("https://node.example/realm/2", true).validate().unwrap());
-        assert!(pin("http://127.0.0.1:9000/", false).validate().is_ok());
-        assert!(pin("http://[::1]:9000/", false).validate().is_ok());
-        for url in ["http://localhost/", "http://127.0.0.2/", "http://127.1/", "http://2130706433/", "http://[0:0:0:0:0:0:0:1]/"] {
-            assert!(pin(url, false).validate().is_err());
-        }
-    }
-
-    #[test]
-    fn l2_routes_reject_aliases_credentials_queries_and_wrong_pin_presence() {
-        for url in ["https://node.example/a/../b", "https://node.example/a/./b", "https://node.example/%2e/b", "https://node.example/%61", "https://user:password@node.example/", "https://node.example/?q=1", "https://node.example/#fragment", "https://node.example/a\\b"] {
-            assert!(pin(url, true).validate().is_err());
-        }
-        assert!(pin("https://node.example/", false).validate().is_err());
-        assert!(pin("http://127.0.0.1/", true).validate().is_err());
-        assert_eq!(L2RpcEndpointRole::Coordinator as u8, 0);
-        assert_eq!(L2RpcEndpointRole::Realm as u8, 1);
-        assert!(parse_canonical_json::<L2RpcEndpointPin>(br#"{"role":"Coordinator","config_id":0,"rpc_url":"https://node.example/","tls_certificate_sha256":null,"extra":true}"#).is_err());
-    }
-}
-
-#[cfg(test)]
-mod signing_authorization_tests {
-    use super::*;
-    use bincode::Options;
-
-    #[test]
-    fn signing_authorization_binds_key_path_interval_and_all_assertions() {
-        let account = MultisigAccount { contract_id: 6, initial_policy: psy_vm::ups::multisig::MultisigPolicy {
-            version: 1, threshold: 2, member_count: 3, member_hashes: [Hash4::ZERO; 8],
-        } };
-        let authorization = GuardianAuthorization {
-            version: 1, network_magic: 90101, genesis_hash: Hex([1; 32]), user_id: BRIDGE_USER_ID,
-            account_json: JsonText::from_value(&account).unwrap(), account_public_key: Hash4::ZERO, multisig_fingerprint: Hash4::ZERO,
-            deposit_contract_id: 2, withdrawal_contract_id: 3, fee_contract_id: 0, guta_fee: 1, da_fee: 1, max_fee: 100,
-            max_endcap_proof_bytes: 1024, approved_contracts: vec![], chains: vec![],
-        };
-        let runtime = GuardianRuntimeConfig {
-            authorization_path: "archive/1.json".into(), authorization_archive_path: "archive".into(), authorization_index_path: "index.json".into(),
-            rpc_config_path: "rpc.json".into(), listen_address: "127.0.0.1:9000".into(), tls_certificate_path: "tls.crt".into(),
-            tls_private_key_path: "tls.key".into(), client_ca_path: "ca.crt".into(), allowed_client_certificate_sha256: vec![Hex([1; 32])],
-            db_path: "guardian.redb".into(), signing_key_secret_path: "key.json".into(),
-            signing_key_password_secret_path: "key.password".into(), signing_authorization_path: "signing-authorization.json".into(),
-            l2_rpc_url: "http://127.0.0.1:9001/".into(), l2_rpc_endpoint_pins: vec![], l1_rpc_urls: vec![], history_urls: vec![],
-        };
-        let mut key = [1; 33]; key[0] = 2; let key = Hex(key);
-        let approval = SigningAuthorization {
-            network_magic: 90101, user_id: BRIDGE_USER_ID, public_key: key, db_path: "guardian.redb".into(),
-            not_before_unix: 100, expires_at_unix: 200, exclusive_key_use: true, complete_journal: true, revoked: false,
-        };
-        assert!(approval.validate(&authorization, &runtime, key, 100).is_ok());
-        assert!(approval.validate(&authorization, &runtime, key, 199).is_ok());
-        for now in [99, 200, u64::MAX] { assert!(approval.validate(&authorization, &runtime, key, now).is_err()); }
-        let mut wrong_key = key; wrong_key.0[1] ^= 1;
-        assert!(approval.validate(&authorization, &runtime, wrong_key, 150).is_err());
-        for mutation in 0..7 {
-            let mut invalid = approval.clone();
-            match mutation {
-                0 => invalid.exclusive_key_use = false,
-                1 => invalid.complete_journal = false,
-                2 => invalid.revoked = true,
-                3 => invalid.network_magic = GOLDILOCKS_MODULUS,
-                4 => invalid.user_id += 1,
-                5 => invalid.db_path = "other.redb".into(),
-                _ => invalid.expires_at_unix = invalid.not_before_unix,
-            }
-            assert!(invalid.validate(&authorization, &runtime, key, 150).is_err());
-        }
-        let mut json = serde_json::to_value(&approval).unwrap(); json["connection_secret"] = Value::String("not permitted".into());
-        assert!(parse_canonical_json::<SigningAuthorization>(&serde_json::to_vec(&json).unwrap()).is_err());
-        for keep_db_path in [false, true] {
-            let mut json = serde_json::to_value(&approval).unwrap();
-            if !keep_db_path { json.as_object_mut().unwrap().remove("db_path"); }
-            json["postgres_connection_secret_path"] = Value::String("database.secret".into());
-            assert!(parse_canonical_json::<SigningAuthorization>(&serde_json::to_vec(&json).unwrap()).is_err());
-            let mut json = serde_json::to_value(&runtime).unwrap();
-            if !keep_db_path { json.as_object_mut().unwrap().remove("db_path"); }
-            json["postgres_connection_secret_path"] = Value::String("database.secret".into());
-            assert!(parse_canonical_json::<GuardianRuntimeConfig>(&serde_json::to_vec(&json).unwrap()).is_err());
-        }
-        for (old_key, new_key, value) in [("exclusive_custody", "exclusive_key_use", serde_json::to_value(&approval).unwrap()), ("custody_attestation_path", "signing_authorization_path", serde_json::to_value(&runtime).unwrap())] {
-            let mut replaced = value.clone();
-            let retained = replaced.as_object_mut().unwrap().remove(new_key).unwrap();
-            replaced[old_key] = retained;
-            let bytes = serde_json::to_vec(&replaced).unwrap();
-            if old_key == "exclusive_custody" { assert!(parse_canonical_json::<SigningAuthorization>(&bytes).is_err()); }
-            else { assert!(parse_canonical_json::<GuardianRuntimeConfig>(&bytes).is_err()); }
-            let mut both = value;
-            both[old_key] = both[new_key].clone();
-            let bytes = serde_json::to_vec(&both).unwrap();
-            if old_key == "exclusive_custody" { assert!(parse_canonical_json::<SigningAuthorization>(&bytes).is_err()); }
-            else { assert!(parse_canonical_json::<GuardianRuntimeConfig>(&bytes).is_err()); }
-        }
-        let account = GuardianAccount { network_magic: 90101, user_id: BRIDGE_USER_ID, state: GuardianAccountState::Halted,
-            last_checkpoint_id: 0, last_checkpoint_hash: Hash4::default(), imported_nonce: None, authorization_version: 1,
-            halt_reason: Some(HaltReason::SigningAuthorizationInvalid) };
-        let codec = bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes();
-        let mut bytes = codec.serialize(&account).unwrap();
-        let ordinal = bytes.len() - 4;
-        bytes[ordinal..].copy_from_slice(&5u32.to_le_bytes());
-        let decoded: GuardianAccount = codec.deserialize(&bytes).unwrap();
-        assert_eq!(decoded.halt_reason, Some(HaltReason::SigningAuthorizationInvalid));
-        for path in ["", "../guardian.redb", "/guardian.redb"] {
-            let mut invalid = approval.clone(); invalid.db_path = path.into();
-            let mut config = runtime.clone(); config.db_path = path.into();
-            assert!(invalid.validate(&authorization, &config, key, 150).is_err());
-        }
     }
 }
 

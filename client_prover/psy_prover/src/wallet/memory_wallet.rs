@@ -625,6 +625,20 @@ impl PsyMemoryWallet {
         self.signature_users.insert(public_key, user);
         Ok(info)
     }
+    pub fn register_recorded_multisig_user(&mut self, account: MultisigAccount, fingerprint: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        anyhow::ensure!(fingerprint != QHashOut::ZERO, "recorded multisig fingerprint is zero");
+        let user = Arc::new(MultisigUser::new(account)?);
+        let info = ZKPublicKeyInfo { fingerprint, public_key_param: user.account().public_key_param()? };
+        let public_key = info.qfhash::<PsyHasher>();
+        if self.signature_users.contains_key(&public_key) {
+            let existing = self.get_multisig_user(&public_key)?;
+            anyhow::ensure!(existing.account().public_key_param()? == info.public_key_param, "multisig account identity mismatch");
+            return Ok(info);
+        }
+        self.multisig_users.insert(public_key, user.clone());
+        self.signature_users.insert(public_key, user);
+        Ok(info)
+    }
 
     pub fn get_multisig_user(&self, public_key: &QHashOut<F>) -> anyhow::Result<Arc<MultisigUser>> {
         self.multisig_users.get(public_key).map(|user| user.clone())
@@ -721,6 +735,9 @@ impl PsyMemoryWallet {
     pub fn random_circuit_manager(&self) -> &Box<dyn UPSCircuitManager<C, D> + Send + Sync> {
         let index = rand::random::<usize>() % self.circuit_manager.len();
         &self.circuit_manager[index]
+    }
+    pub fn circuit_managers(&self) -> &[Box<dyn UPSCircuitManager<C, D> + Send + Sync>] {
+        &self.circuit_manager
     }
 
     pub(crate) async fn eth_personal_circuit_manager(&self) -> anyhow::Result<&Box<dyn UPSCircuitManager<C, D> + Send + Sync>> {

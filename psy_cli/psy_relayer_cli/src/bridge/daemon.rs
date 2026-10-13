@@ -30,7 +30,7 @@ use psy_provider::{
 use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
 use serde::{Deserialize, Serialize};
 
-use crate::guardian::protocol::GuardianSignRequest;
+use guardian_common::protocol::GuardianSignRequest;
 use crate::bridge::{
     claim_attempts,
     claim_withdrawals,
@@ -97,7 +97,6 @@ pub(crate) struct BridgeProposeDaemonConfig {
     pub confirmation_lag_checkpoints: Option<u64>,
     #[serde(default)]
     pub max_checkpoint_batch: Option<u64>,
-    pub withdrawal_scan_lookback_checkpoints: Option<u64>,
     pub guardian_config: String,
     /// Canonical guardian history retained across daemon rounds; never serialized.
     #[serde(skip)]
@@ -143,8 +142,8 @@ fn default_evm_family() -> String { "evm".to_string() }
 
 struct RelayerHistory {
     history: crate::guardian::verify::GuardianHistory,
-    sessions: Vec<crate::guardian::protocol::GuardianSession>,
-    approvals: std::collections::BTreeMap<u32, crate::guardian::protocol::Hex32>,
+    sessions: Vec<guardian_common::protocol::GuardianSession>,
+    approvals: std::collections::BTreeMap<u32, guardian_common::protocol::Hex32>,
 }
 
 impl Default for RelayerHistory {
@@ -364,6 +363,20 @@ fn ensure_owned_producing(producing: &Option<ProducingSession>, request: &Guardi
     Ok(())
 }
 
+fn clear_confirmed_producing(producing: &mut Option<ProducingSession>, request: &GuardianSignRequest) -> anyhow::Result<bool> {
+    let matches = producing.as_ref().is_some_and(|owner| owner.session_nonce == request.session_nonce)
+        && producing.as_ref().map(|owner| owner.request_id.as_str()) == Some(hex::encode(request.request_id()?.0).as_str());
+    if matches { *producing = None; }
+    Ok(matches)
+}
+
+fn clear_landed_producing(state: &mut MultichainDaemonState, retained: &RelayerHistory, landed: u64) -> anyhow::Result<bool> {
+    for session in &retained.sessions {
+        if session.record.included_checkpoint_id == landed && clear_confirmed_producing(&mut state.producing_session, &session.record.request_json.decode()?)? { return Ok(true); }
+    }
+    Ok(false)
+}
+
 fn record_producing_in_ledger(
     producing: &mut Option<ProducingSession>,
     pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
@@ -381,7 +394,11 @@ fn record_producing_in_ledger(
                 && withdrawal.amount == record.amount
                 && withdrawal.recipient == record.recipient
                 && withdrawal.nonce == record.nonce
-        }).context("guardian request missing selected withdrawal metadata")?;
+        }).or_else(|| pending.values().find(|withdrawal| {
+            withdrawal.sender_user_id == u64::from(record.sender_user_id) && withdrawal.contract_id == u64::from(record.token_contract_id) && withdrawal.destination_chain_index == u64::from(record.destination_chain_index) && withdrawal.token_address == record.token && withdrawal.amount == record.amount && withdrawal.recipient == record.recipient && withdrawal.nonce == record.nonce
+        })).or_else(|| retired.values().map(|entry| &entry.withdrawal).find(|withdrawal| {
+            withdrawal.sender_user_id == u64::from(record.sender_user_id) && withdrawal.contract_id == u64::from(record.token_contract_id) && withdrawal.destination_chain_index == u64::from(record.destination_chain_index) && withdrawal.token_address == record.token && withdrawal.amount == record.amount && withdrawal.recipient == record.recipient && withdrawal.nonce == record.nonce
+        })).context("guardian request missing selected withdrawal metadata")?;
         let existing = pending.get(&selected.leaf_hash)
             .or_else(|| retired.get(&selected.leaf_hash).map(|entry| &entry.withdrawal));
         if let Some(existing) = existing {
@@ -889,12 +906,16 @@ async fn materialize_chain_proof(
 pub async fn run(args: RunDaemonArgs) -> anyhow::Result<()> {
     let loaded = load_config(&args.config)?;
     let chain_configs = configured_chains(&loaded)?;
-    let history_config = super::guardian_client::GuardianClientConfig::load(Path::new(&loaded.guardian_config))?;
+    let history_config = super::guardian_client::LoadedGuardianConfig::load(Path::new(&loaded.guardian_config))?;
+    let external = psy_config::PsyConfigGoldilocks::builder().path(&loaded.rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
+    let external_network = external.get_current_network()?;
+    history_config.root.validate_rpc_network(external_network)?;
+    let provider = guardian_common::runtime::load_network(&history_config.root, history_config.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
     let daemon = async {
         if chain_configs.len() == 1 {
-            return run_single_chain(chain_configs[0].effective_config(&loaded)?, &args.config).await;
+            return run_single_chain(chain_configs[0].effective_config(&loaded)?, &args.config, &history_config, &provider).await;
         }
-        run_multichain(loaded, chain_configs, &args.config).await
+        run_multichain(loaded, chain_configs, &args.config, &history_config, &provider).await
     };
     tokio::select! {
         result = history_config.serve_history() => result,
@@ -906,6 +927,8 @@ async fn run_multichain(
     config: BridgeProposeDaemonConfig,
     chain_configs: Vec<L1Config>,
     config_path: &Path,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
+    provider: &RpcProvider,
 ) -> anyhow::Result<()> {
     ensure!(config.max_concurrent_l2_batches.unwrap_or(1) == 1, "multisig account permits one inflight session");
     let proof_dir = config.proof_dir.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_PROOF_DIR));
@@ -924,13 +947,13 @@ async fn run_multichain(
             state_manager,
         });
     }
-    let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
+
     let poll_interval = Duration::from_secs(config.poll_interval_secs.unwrap_or(30));
     let lag = config.confirmation_lag_checkpoints.unwrap_or(3);
     let max_batch = config.max_checkpoint_batch.unwrap_or(DEFAULT_MAX_CHECKPOINT_BATCH);
     validate_max_checkpoint_batch(max_batch)?;
     let state_path = proof_dir.join("daemon_state_multichain.toml");
-    let proxy = resolve_system_prove_proxy_url(&config)?;
+    let proxy = resolve_system_prove_proxy_url(&guardian.root.network)?;
     verify_system_prove_proxy(&proxy).await?;
     tracing::info!(prove_proxy = %proxy, "system prove proxy configured");
     tracing::info!(config=%config_path.display(), chain_count=chains.len(), %identity_namespace, "multichain bridge relayer started");
@@ -969,19 +992,36 @@ async fn run_multichain(
             }
         }
 
-        let latest = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+        let mut latest = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
         if last_coordinator_head == Some(latest) {
             stalled_rounds += 1;
         } else {
             last_coordinator_head = Some(latest);
             stalled_rounds = 0;
         }
-        let (from_checkpoint, window) = if let Some(range) = state.pending_finalization_range {
+        let (mut from_checkpoint, mut window) = if let Some(range) = state.pending_finalization_range {
             (range.from_checkpoint, RelayerWindow { to_checkpoint: range.to_checkpoint, confirmed_to_checkpoint: Some(range.to_checkpoint), is_catchup_batch: false })
         } else {
             select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?
         };
-        if window.to_checkpoint < from_checkpoint { tokio::time::sleep(poll_interval).await; continue; }
+        let archive = super::guardian_client::RelayerArchive::open(&guardian.config_dir.join(&guardian.client().archive_path))?;
+        let mut pending_landed = None;
+        if archive.pending_request()?.is_some() {
+            let mut guardian_history = config.guardian_history.lock().await;
+            let mut owner = MultichainProducingOwner(&state_path, &mut state);
+            let landed = submit_guardian_operation(guardian, provider, Vec::new(), &[], guardian_common::protocol::GuardianOperation::Bridge, None, &mut guardian_history, Some(&mut owner)).await?;
+            wait_until_checkpoint_confirmed(provider, landed, lag, REALM_CHECKPOINT_POLL_TIMEOUT_SECS, REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
+            if clear_landed_producing(&mut state, &guardian_history, landed)? {
+                save_multichain_state(&state_path, &state)?;
+            }
+            pending_landed = Some(landed);
+            last_round_submitted_l2_work = true;
+            latest = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+            if state.pending_finalization_range.is_none() {
+                (from_checkpoint, window) = select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?;
+            }
+        }
+        if window.to_checkpoint < from_checkpoint && pending_landed.is_none() { tokio::time::sleep(poll_interval).await; continue; }
         let propose_args = ProposeWithdrawalsArgs {
             rpc_config: config.rpc_config.clone(),
             guardian_config: config.guardian_config.clone(),
@@ -1006,7 +1046,7 @@ async fn run_multichain(
             }
             let (_progress, plan) = match build_multichain_l2_plan(
                 &config, &provider, &chains, latest, from_checkpoint, window.to_checkpoint,
-                !window.is_catchup_batch, &propose_args,
+                !window.is_catchup_batch, &propose_args, guardian,
             ).await {
                 Ok(value) => value,
                 Err(error) => {
@@ -1017,10 +1057,9 @@ async fn run_multichain(
                 }
             };
             round_withdrawals = plan.withdrawals.clone();
-            let submitted_l2_work = !plan.calls.is_empty();
-            last_round_submitted_l2_work = submitted_l2_work;
             let mut guardian_history = config.guardian_history.lock().await;
-            let landed = match submit_multichain_l2_plan(&config, &provider, &plan, &state_path, &mut state, &mut guardian_history, lag).await {
+            let previous_nonce = guardian_history.history.nonce();
+            let landed = match submit_multichain_l2_plan(&config, provider, &plan, &state_path, &mut state, &mut guardian_history, lag, guardian).await {
                 Ok(value) => value,
                 Err(error) => {
                     tracing::error!(%error, backoff_secs = l2_retry_backoff.as_secs(), "multichain guardian L2 submission failed");
@@ -1029,8 +1068,11 @@ async fn run_multichain(
                     continue;
                 }
             };
+            let fresh_landed = guardian_history.history.nonce() > previous_nonce;
+            let submitted_l2_work = fresh_landed || pending_landed.is_some();
+            last_round_submitted_l2_work = submitted_l2_work;
             l2_retry_backoff = Duration::from_secs(RELAYER_MIN_RETRY_BACKOFF_SECS);
-            if state.producing_session.take().is_some() {
+            if fresh_landed && clear_landed_producing(&mut state, &guardian_history, landed)? {
                 save_multichain_state(&state_path, &state)?;
             }
             if !window.has_confirmed_range() {
@@ -1038,8 +1080,9 @@ async fn run_multichain(
                 tokio::time::sleep(poll_interval).await;
                 continue;
             }
+            let landed = pending_landed.map_or(landed, |pending| pending.max(landed));
             let endpoint = if submitted_l2_work {
-                select_finalize_to_checkpoint(window.to_checkpoint, landed)
+                select_finalize_to_checkpoint(window.to_checkpoint, landed.max(window.to_checkpoint))
             } else {
                 window.to_checkpoint
             };
@@ -1069,7 +1112,7 @@ async fn run_multichain(
                                 fetch_proved_deposit_count(&provider, chain.bridge).await
                             }
                         }),
-                        || chain.l1.submit_deposit_batch_appends(&chain.config, target),
+                        || chain.l1.submit_deposit_batch_appends(&chain.config, target, &guardian.root.network),
                     ).await
                 }
             },
@@ -1132,7 +1175,7 @@ async fn run_multichain(
                     .filter(|w| w.destination_chain_index == u64::from(chain.chain_index))
                     .collect::<Vec<_>>();
                 if claims.is_empty() { continue; }
-                let result = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint).await;
+                let result = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint, &guardian.root.network).await;
                 record_claim_result(
                     &claims,
                     &result,
@@ -1153,7 +1196,7 @@ async fn run_multichain(
     }
 }
 
-async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path) -> anyhow::Result<()> {
+async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path, guardian: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider) -> anyhow::Result<()> {
     let proof_dir = config
         .proof_dir
         .clone()
@@ -1162,11 +1205,11 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
     tracing::info!(config = %config_path.display(), proof_dir = %proof_dir.display(), "bridge relayer started");
 
     // Phase 4.4: skip local circuit/Groth16 warmup when remote prove proxy is configured
-    let proxy_url_at_startup = resolve_system_prove_proxy_url(&config)?;
+    let proxy_url_at_startup = resolve_system_prove_proxy_url(&guardian.root.network)?;
     verify_system_prove_proxy(&proxy_url_at_startup).await?;
     tracing::info!(prove_proxy = %proxy_url_at_startup, "system prove proxy configured; local Groth16 warmup skipped");
 
-    let provider = RpcProvider::new_with_config_path(&config.rpc_config)?;
+
     let l1 = L1Client::from_finalize_config(
         &config.finalize,
         config.finalize.deployments_network.as_deref().unwrap_or("l1"),
@@ -1261,6 +1304,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
         let l2_round = match l1.run_l2_bridge_round(
             &config,
             &provider,
+            guardian,
             bridge,
             from_checkpoint,
             to_checkpoint,
@@ -1278,7 +1322,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                     from_checkpoint,
                     latest_checkpoint,
                     to_checkpoint,
-                    error = %err,
+                    error = ?err,
                     "bridge daemon run_l2_bridge_round failed"
                 );
                 tokio::time::sleep(poll_interval).await;
@@ -1345,6 +1389,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                     state.last_finalized_checkpoint,
                     is_catchup_batch,
                     confirmation_lag_checkpoints,
+                    &guardian.root.network,
                     max_checkpoint_batch,
                 ),
             )
@@ -1394,6 +1439,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                     state.last_finalized_checkpoint,
                     is_catchup_batch,
                     confirmation_lag_checkpoints,
+                    &guardian.root.network,
                     max_checkpoint_batch,
                 ),
             )
@@ -1436,7 +1482,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
         if let Some(target_deposit_count) = deposit_append_target {
             if let Err(err) = dispatch_post_l2_phase(
                 &post_l2_phase_permit,
-                l1.submit_deposit_batch_appends(&config, target_deposit_count),
+                l1.submit_deposit_batch_appends(&config, target_deposit_count, &guardian.root.network),
             )
             .await
             {
@@ -1455,7 +1501,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
         //  PHASE 3 ─ Proof Generation (bridge aggregation + Groth16 wrap)
         // ═══════════════════════════════════════════════════════════════════
 
-        let prove_proxy_url = resolve_system_prove_proxy_url(&config)?;
+        let prove_proxy_url = resolve_system_prove_proxy_url(&guardian.root.network)?;
         let prove_result = match dispatch_post_l2_phase(
             &post_l2_phase_permit,
             l1.load_or_build_proof(
@@ -1539,6 +1585,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path)
                         to_checkpoint,
                         is_catchup_batch,
                         confirmation_lag_checkpoints,
+                        &guardian.root.network,
                         max_checkpoint_batch,
                     ),
                 )
@@ -1830,11 +1877,7 @@ fn warmup_bridge_resources() -> anyhow::Result<()> {
 /// Reads `system_prove_proxy_url` for the current network. There is no
 /// fallback to `prove_proxy_url`: that pool runs the `user` role and does not
 /// register the bridge methods, so routing there would only fail later.
-pub(crate) fn resolve_system_prove_proxy_url(config: &BridgeProposeDaemonConfig) -> anyhow::Result<String> {
-    let rpc_config = psy_config::PsyConfigGoldilocks::from_file(&config.rpc_config)
-        .with_context(|| format!("failed to load rpc config {}", config.rpc_config))?;
-    let network_name = rpc_config.current_network_name().to_string();
-    let network = rpc_config.get_current_network()?;
+pub(crate) fn resolve_system_prove_proxy_url(network: &psy_config::NetworkConfigGoldilocks) -> anyhow::Result<String> {
     network
         .system_prove_proxy_url
         .iter()
@@ -1843,9 +1886,7 @@ pub(crate) fn resolve_system_prove_proxy_url(config: &BridgeProposeDaemonConfig)
         .map(str::to_string)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "network `{}` in {} has no `system_prove_proxy_url`; the relayer needs a prove-proxy running role=system or role=all",
-                network_name,
-                config.rpc_config
+                "loaded network has no `system_prove_proxy_url`; the relayer needs a prove-proxy running role=system or role=all"
             )
         })
 }
@@ -2175,6 +2216,7 @@ pub(crate) fn resolve_state_manager_address(config: &BridgeProposeDaemonConfig) 
 pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
     config: &BridgeProposeDaemonConfig,
     provider: &RpcProvider,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
     source_chain_index: u64,
     proved_deposit_count: u32,
     pending_deposit_count: u32,
@@ -2245,6 +2287,14 @@ pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
     //  ── L2 Call Planning & Submission Loop ──
     // ═══════════════════════════════════════════════════════════════════
 
+    let pending_archive = super::guardian_client::RelayerArchive::open(&guardian.config_dir.join(&guardian.client().archive_path))?;
+    if pending_archive.pending_request()?.is_some() {
+        let mut guardian_history = config.guardian_history.lock().await;
+        let landed = submit_guardian_operation(guardian, provider, Vec::new(), &[], guardian_common::protocol::GuardianOperation::Bridge, None, &mut guardian_history, None).await?;
+        wait_until_checkpoint_confirmed(provider, landed, confirmation_lag_checkpoints, REALM_CHECKPOINT_POLL_TIMEOUT_SECS, REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
+        to_checkpoint = to_checkpoint.max(landed);
+        submitted_l2_work = true;
+    }
     loop {
         let planning_checkpoint = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
         let deposit_next_index = u32::try_from(
@@ -2299,6 +2349,7 @@ pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
             pending_deposit_count,
             proved_deposit_count,
             is_catchup_batch,
+            guardian,
         )
         .await?;
         record_claim_withdrawals(
@@ -2322,7 +2373,7 @@ pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
             .await;
         }
 
-        let landed_checkpoint = submit_l2_call_plan(config, provider, &plan, confirmation_lag_checkpoints).await?;
+        let landed_checkpoint = submit_l2_call_plan(config, provider, &plan, confirmation_lag_checkpoints, guardian).await?;
 
         submitted_l2_work = true;
         // Advance to_checkpoint to the actual landing checkpoint so
@@ -2580,6 +2631,7 @@ async fn settle_pending_claim_withdrawals(
     claim_cursor_checkpoint: u64,
     mut is_catchup_batch: bool,
     confirmation_lag_checkpoints: u64,
+    network: &psy_config::NetworkConfigGoldilocks,
     max_checkpoint_batch: u64,
 ) -> bool {
     let now_unix = claim_attempts::now_unix();
@@ -2628,7 +2680,7 @@ async fn settle_pending_claim_withdrawals(
     }
 
     let result = l1
-        .claim_withdrawals(&to_claim, config, claim_cursor_checkpoint)
+        .claim_withdrawals(&to_claim, config, claim_cursor_checkpoint, network)
         .await;
     record_claim_result(
         &to_claim,
@@ -2740,6 +2792,7 @@ async fn build_l2_call_plan(
     pending_deposit_count: u32,
     proved_deposit_count: u32,
     is_catchup_batch: bool,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
 ) -> anyhow::Result<L2CallPlan> {
     let latest_checkpoint = if !is_catchup_batch {
         provider
@@ -2852,6 +2905,7 @@ async fn build_l2_call_plan(
             withdrawal_from_checkpoint,
             to_checkpoint.saturating_add(1),
             &[(source_chain_index, l2_withdrawal_next_index)],
+            guardian,
         )
         .await?
     } else {
@@ -2892,6 +2946,7 @@ async fn build_multichain_l2_plan(
     to_checkpoint: u64,
     append_business: bool,
     propose_args: &ProposeWithdrawalsArgs,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
 ) -> anyhow::Result<(Vec<ChainRoundProgress>, MultichainL2CallPlan)> {
     let http = crate::bridge::api_client::build_default_http_client()?;
     let mut progress = Vec::with_capacity(chains.len());
@@ -2964,6 +3019,7 @@ async fn build_multichain_l2_plan(
             from_checkpoint.max(1),
             to_checkpoint.saturating_add(1),
             &withdrawal_chain_offsets,
+            guardian,
         ).await?
     } else {
         Vec::new()
@@ -2980,18 +3036,18 @@ async fn submit_multichain_l2_plan(
     state: &mut MultichainDaemonState,
     retained: &mut RelayerHistory,
     confirmation_lag_checkpoints: u64,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
 ) -> anyhow::Result<u64> {
     if plan.calls.is_empty() {
         return Ok(provider.get_coordinator_latest_block_state().await?.checkpoint_id);
     }
     let mut owner = MultichainProducingOwner(state_path, state);
     let landed = submit_guardian_operation(
-        &config.rpc_config,
-        &config.guardian_config,
+        guardian,
         provider,
         plan.calls.clone(),
         &plan.withdrawals,
-        crate::guardian::protocol::GuardianOperation::Bridge,
+        guardian_common::protocol::GuardianOperation::Bridge,
         None,
         retained,
         Some(&mut owner),
@@ -3196,6 +3252,7 @@ async fn submit_l2_call_plan(
     provider: &RpcProvider,
     plan: &L2CallPlan,
     confirmation_lag_checkpoints: u64,
+    guardian: &super::guardian_client::LoadedGuardianConfig,
 ) -> anyhow::Result<u64> {
     if plan.batch_calls.is_empty() {
         return Ok(provider.get_coordinator_latest_block_state().await?.checkpoint_id);
@@ -3208,12 +3265,11 @@ async fn submit_l2_call_plan(
     // ledger is persisted by persist_claim_withdrawals_before_l2_submit before
     // this call, so no daemon producing owner row is required here.
     let landed = submit_guardian_operation(
-        &config.rpc_config,
-        &config.guardian_config,
+        guardian,
         provider,
         plan.batch_calls.clone(),
         &plan.withdrawals,
-        crate::guardian::protocol::GuardianOperation::Bridge,
+        guardian_common::protocol::GuardianOperation::Bridge,
         None,
         &mut guardian_history,
         None,
@@ -3380,77 +3436,86 @@ async fn fetch_deposit_tree_next_index(
 
 
 
-pub(crate) async fn submit_guardian_calls(rpc_config: &str, guardian_config: &str, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<u64> {
-    submit_guardian_operation(rpc_config, guardian_config, provider, calls, withdrawals, crate::guardian::protocol::GuardianOperation::Bridge, None, &mut RelayerHistory::default(), None).await
+pub(crate) async fn submit_guardian_calls(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<u64> {
+    submit_guardian_operation(config, provider, calls, withdrawals, guardian_common::protocol::GuardianOperation::Bridge, None, &mut RelayerHistory::default(), None).await
 }
 
-pub(crate) async fn submit_guardian_policy(rpc_config: &str, guardian_config: &str, provider: &RpcProvider, operation: crate::guardian::protocol::GuardianOperation, next_members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<u64> {
-    anyhow::ensure!(matches!(operation, crate::guardian::protocol::GuardianOperation::Bootstrap | crate::guardian::protocol::GuardianOperation::ReplacePolicy), "policy submission requires bootstrap or replacement");
-    submit_guardian_operation(rpc_config, guardian_config, provider, Vec::new(), &[], operation, Some(next_members), &mut RelayerHistory::default(), None).await
+pub(crate) async fn submit_guardian_policy(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, operation: guardian_common::protocol::GuardianOperation, next_members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<u64> {
+    anyhow::ensure!(matches!(operation, guardian_common::protocol::GuardianOperation::Bootstrap | guardian_common::protocol::GuardianOperation::ReplacePolicy), "policy submission requires bootstrap or replacement");
+    submit_guardian_operation(config, provider, Vec::new(), &[], operation, Some(next_members), &mut RelayerHistory::default(), None).await
 }
 
 pub(crate) async fn run_guardian_bootstrap(rpc_config: &str, guardian_config: &str) -> anyhow::Result<()> {
-    let config = super::guardian_client::GuardianClientConfig::load(Path::new(guardian_config))?;
+    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
     let members = config.authorization()?.account_json.decode()?.initial_policy.member_hashes;
-    let network = psy_config::PsyConfigGoldilocks::from_file(rpc_config)?;
-    let provider = RpcProvider::new_with_config(network.get_current_network()?)?;
-    let operation = submit_guardian_policy(rpc_config, guardian_config, &provider, crate::guardian::protocol::GuardianOperation::Bootstrap, [members[0], members[1], members[2]]);
+    let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
+    config.root.validate_rpc_network(external.get_current_network()?)?;
+    let provider = guardian_common::runtime::load_network(&config.root, config.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let operation = submit_guardian_policy(&config, &provider, guardian_common::protocol::GuardianOperation::Bootstrap, [members[0], members[1], members[2]]);
     let history = config.serve_history();
     tokio::select! { result = history => { result?; anyhow::bail!("guardian history listener stopped"); }, result = operation => { result?; Ok(()) } }
 }
 
 pub(crate) async fn run_guardian_replace_policy(rpc_config: &str, guardian_config: &str, next_members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<()> {
-    let config = super::guardian_client::GuardianClientConfig::load(Path::new(guardian_config))?;
-    let network = psy_config::PsyConfigGoldilocks::from_file(rpc_config)?;
-    let provider = RpcProvider::new_with_config(network.get_current_network()?)?;
-    let operation = submit_guardian_policy(rpc_config, guardian_config, &provider, crate::guardian::protocol::GuardianOperation::ReplacePolicy, next_members);
+    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
+    let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
+    config.root.validate_rpc_network(external.get_current_network()?)?;
+    let provider = guardian_common::runtime::load_network(&config.root, config.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let operation = submit_guardian_policy(&config, &provider, guardian_common::protocol::GuardianOperation::ReplacePolicy, next_members);
     let history = config.serve_history();
     tokio::select! { result = history => { result?; anyhow::bail!("guardian history listener stopped"); }, result = operation => { result?; Ok(()) } }
 }
 
 pub(crate) async fn run_guardian_register(rpc_config: &str, guardian_config: &str, exclusive_registration_intake: bool) -> anyhow::Result<()> {
-    let config = super::guardian_client::GuardianClientConfig::load(Path::new(guardian_config))?;
+    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
     let authorization = config.authorization()?;
-    let archive = super::guardian_client::RelayerArchive::open(&config.archive_path)?;
+    let archive = super::guardian_client::RelayerArchive::open(&config.config_dir.join(&config.client().archive_path))?;
     let _account_lock = archive.lock()?;
     ensure!(archive.pending_request()?.is_none(), "registration cannot replace pending account work");
-    let network = psy_config::PsyConfigGoldilocks::from_file(rpc_config)?;
-    let provider = RpcProvider::new_with_config(network.get_current_network()?)?;
-    let mut wallet = WalletSession::new(network.get_current_network()?).await?;
+    let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
+    config.root.validate_rpc_network(external.get_current_network()?)?;
+    let provider = guardian_common::runtime::load_network(&config.root, authorization)?;
+    let mut wallet = WalletSession::new_with_provider(&config.root.network, provider.clone(), Some(authorization.endcap_verifier_fingerprint)).await?;
     let public_key = wallet.register_bridge_multisig_user(authorization.account_json.decode()?, exclusive_registration_intake).await?;
     ensure!(public_key == authorization.account_public_key && provider.get_user_ids_for_public_key(public_key).await? == vec![BRIDGE_USER_ID_U64], "AccountIdentityConflict");
     Ok(())
 }
 
-fn pending_policy_matches(request: &crate::guardian::protocol::GuardianSignRequest, operation: crate::guardian::protocol::GuardianOperation, members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<bool> {
+fn pending_policy_matches(request: &guardian_common::protocol::GuardianSignRequest, operation: guardian_common::protocol::GuardianOperation, members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<bool> {
     if request.operation != operation { return Ok(false); }
     let calls: ContractCallData = serde_json::from_value(request.trace_json.decode()?.call_data)?;
     let expected: Vec<_> = members.iter().flat_map(|member| member.0.elements.map(|limb| limb.to_canonical_u64())).collect();
     Ok(calls.contract_calls.len() == 1 && calls.contract_calls[0].contract_id == 6 && calls.contract_calls[0].method_name == "set_policy" && calls.contract_calls[0].inputs.get(16..) == Some(expected.as_slice()))
 }
 
-async fn refresh_relayer_history(wallet: &WalletSession, provider: &RpcProvider, config: &super::guardian_client::GuardianClientConfig, archive: &super::guardian_client::RelayerArchive, head: u64, root: QHashOut<GoldilocksField>, retained: &mut RelayerHistory) -> anyhow::Result<()> {
-    use crate::guardian::{protocol::*, verify::{GuardianVerificationContext, verify_session}};
+async fn refresh_relayer_history(wallet: &WalletSession, provider: &RpcProvider, config: &super::guardian_client::LoadedGuardianConfig, archive: &super::guardian_client::RelayerArchive, head: u64, root: QHashOut<GoldilocksField>, retained: &mut RelayerHistory) -> anyhow::Result<()> {
+    use guardian_common::protocol::*;
+    use crate::guardian::verify::{GuardianVerificationContext, verify_session};
     let mut approved = Vec::new();
     for session in &retained.sessions {
         let version = session.record.request_json.decode()?.authorization_version;
         if !approved.iter().any(|authorization: &GuardianAuthorization| authorization.version == version) {
             let authorization = config.historical_authorization(version)?;
             ensure!(retained.approvals.get(&version) == Some(&sha256(&serde_json::to_vec(&authorization)?)), "approved historical authorization changed");
-            approved.push(authorization);
+            approved.push(authorization.clone());
         }
-        let saved = archive.sessions(session.nonce - 1, 1)?.sessions.into_iter().next().context("retained canonical record missing")?;
-        ensure!(serde_json::to_vec(&saved)? == serde_json::to_vec(&session.record)?, "immutable canonical record changed");
     }
-    let context = GuardianVerificationContext { wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.l1_endpoints, history: &retained.history };
+    let context = GuardianVerificationContext { wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.client().l1_endpoints, history: &retained.history };
     crate::guardian::verify::verify_guardian_saved_anchors(&context, &[], &approved, &retained.sessions).await.map_err(|error| anyhow::anyhow!("saved guardian history observation failed: {error:?}"))?;
+    for session in &retained.sessions {
+        let authorization = config.historical_authorization(session.record.request_json.decode()?.authorization_version)?;
+        match archive.sessions(session.nonce - 1, 1)?.sessions.into_iter().next() {
+            Some(saved) => ensure!(serde_json::to_vec(&saved)? == serde_json::to_vec(&session.record)?, "immutable canonical record changed"),
+            None => archive.save_record(&session.record, authorization)?,
+        }
+    }
     loop {
         let page = archive.sessions(retained.history.nonce(), 1)?;
         let Some(record) = page.sessions.into_iter().next() else { break; };
         let authorization = config.historical_authorization(record.request_json.decode()?.authorization_version)?;
         let digest = sha256(&serde_json::to_vec(&authorization)?);
         if let Some(previous) = retained.approvals.get(&authorization.version) { ensure!(*previous == digest, "approved historical authorization changed"); }
-        let context = GuardianVerificationContext { wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.l1_endpoints, history: &retained.history };
+        let context = GuardianVerificationContext { wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.client().l1_endpoints, history: &retained.history };
         let session = verify_session(&context, &authorization, record).await?;
         retained.history.apply(&session)?;
         retained.approvals.insert(authorization.version, digest);
@@ -3469,44 +3534,53 @@ fn select_guardian_withdrawals(withdrawals: &[propose_withdrawals::PendingWithdr
     Ok(selected)
 }
 
-async fn submit_guardian_operation(rpc_config: &str, guardian_config: &str, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal], operation: crate::guardian::protocol::GuardianOperation, next_members: Option<[QHashOut<GoldilocksField>; 3]>, retained: &mut RelayerHistory, mut pending_owner: Option<&mut dyn ProducingOwner>) -> anyhow::Result<u64> {
+async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal], operation: guardian_common::protocol::GuardianOperation, next_members: Option<[QHashOut<GoldilocksField>; 3]>, retained: &mut RelayerHistory, mut pending_owner: Option<&mut dyn ProducingOwner>) -> anyhow::Result<u64> {
     use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
-    use crate::guardian::{protocol::*, verify::{GuardianVerificationContext, verify_guardian_session, verify_session}};
-    use super::guardian_client::{GuardianClientConfig, GuardianClient, RelayerArchive, prove_pending_request};
+    use guardian_common::protocol::*;
+    use crate::guardian::verify::{GuardianVerificationContext, verify_guardian_session};
+    use super::guardian_client::{GuardianClient, RelayerArchive, prove_pending_request};
     use psy_prover::trace::GeneratedTxTraceJson;
-    let config = GuardianClientConfig::load(Path::new(guardian_config))?;
-    let authorization = config.authorization()?;
-    let archive = RelayerArchive::open(&config.archive_path)?;
+    let authorization = config.authorization()?.clone();
+    let archive = RelayerArchive::open(&config.config_dir.join(&config.client().archive_path))?;
     let _account_lock = archive.lock()?;
-    let network = psy_config::PsyConfigGoldilocks::from_file(rpc_config)?;
-    let mut wallet = WalletSession::new(network.get_current_network()?).await?;
+    let mut wallet = WalletSession::new_with_provider(&config.root.network, provider.clone(), Some(authorization.endcap_verifier_fingerprint)).await?;
     let public_key = wallet.add_multisig_user(authorization.account_json.decode()?).await?;
     ensure!(public_key == authorization.account_public_key && provider.get_user_ids_for_public_key(public_key).await? == vec![BRIDGE_USER_ID_U64], "AccountIdentityConflict");
     let coordinator_url = provider.get_coordinator_url()?;
     let committed = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
     let head = committed.checkpoint_id;
     let root = committed.checkpoint_tree_root;
-    refresh_relayer_history(&wallet, provider, &config, &archive, head, root, retained).await?;
-    let history = &mut retained.history;
+    // Capture before refreshing: receipt repair may remove the pending marker.
     let pending = archive.pending_request()?;
+    refresh_relayer_history(&wallet, provider, &config, &archive, head, root, retained).await?;
     let pending_nonce = pending.as_ref().map(|request| request.decode().map(|request| request.session_nonce)).transpose()?;
     let pending_included = retained.sessions.iter().find(|session| Some(session.nonce) == pending_nonce).cloned();
     let request_json = if let Some(pending) = pending {
         let pending_request = pending.decode()?;
-        if let Some(owner) = pending_owner.as_deref_mut() {
-            owner.ensure_owned_pending(&pending_request)?;
-        }
         if operation != GuardianOperation::Bridge {
             ensure!(pending_policy_matches(&pending_request, operation, next_members.context("policy command requires next members")?)?, "NonceConflict: pending operation or policy members differ from requested command");
         }
         if let Some(session) = pending_included {
             ensure!(session.record.request_json.as_str() == pending.as_str(), "NonceConflict: canonical inclusion differs from pending request");
-            let approved = config.historical_authorization(pending_request.authorization_version)?;
-            archive.save_record(&session.record, &approved)?;
+            archive.save_record(&session.record, config.historical_authorization(pending_request.authorization_version)?)?;
             return Ok(session.record.included_checkpoint_id);
         }
+        let approved = config.historical_authorization(pending_request.authorization_version)?;
+        if let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, approved, &retained.history, &pending).await? {
+            let landed = session.record.included_checkpoint_id;
+            retained.history.apply(&session)?;
+            retained.approvals.insert(approved.version, sha256(&serde_json::to_vec(approved)?));
+            retained.sessions.push(session);
+            // Fill any archived suffix before a subsequent fresh plan.
+            let committed = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
+            refresh_relayer_history(&wallet, provider, config, &archive, committed.checkpoint_id, committed.checkpoint_tree_root, retained).await?;
+            return Ok(landed);
+        }
+        if let Some(owner) = pending_owner.as_deref_mut() { owner.ensure_owned_pending(&pending_request)?; }
         pending
     } else {
+        if operation == GuardianOperation::Bridge && calls.is_empty() && withdrawals.is_empty() { return Ok(head); }
+        let history = &retained.history;
         let account_proof = provider.get_user_tree_merkle_proof(head, BRIDGE_USER_ID_U64).await?;
         let nonce = if account_proof.value == QHashOut::ZERO { 1 } else { provider.get_user_leaf_data(head, BRIDGE_USER_ID_U64).await?.nonce.to_canonical_u64().checked_add(1).context("account nonce overflow")? };
         ensure!(history.nonce().checked_add(1) == Some(nonce), "HistoryUnavailable: retained canonical account prefix is incomplete");
@@ -3522,7 +3596,7 @@ async fn submit_guardian_operation(rpc_config: &str, guardian_config: &str, prov
             ensure!(call.method_name == "set_chain_root" && call.inputs.len() == 10, "UnsupportedCall");
             let index = u8::try_from(call.inputs[0])?;
             let chain = authorization.chain(index)?;
-            let endpoint = config.l1_endpoints.iter().find(|endpoint| endpoint.chain_index == index).context("missing authorized L1 endpoint")?;
+            let endpoint = config.client().l1_endpoints.iter().find(|endpoint| endpoint.chain_index == index).context("missing authorized L1 endpoint")?;
             let old_count = u32::try_from(fetch_deposit_tree_next_index(provider, head, u64::from(index)).await?)?;
             let new_count = u32::try_from(call.inputs[1])?;
             if old_count == new_count { continue; }
@@ -3560,18 +3634,23 @@ async fn submit_guardian_operation(rpc_config: &str, guardian_config: &str, prov
         for call in &call_data.contract_calls { builder.trace_call(call.clone()).await?; }
         ensure!(builder.required_fee()? <= authorization.max_fee, "fee exceeds guardian authorization");
         let trace = builder.finalize_tx_trace(call_data.software_defined_call.clone()).await?;
-        let request = GuardianSignRequest { schema_version: 1, authorization_version: authorization.version, network_magic: authorization.network_magic, genesis_hash: authorization.genesis_hash, user_id: BRIDGE_USER_ID_U64, session_nonce: nonce, operation, trace_json: JsonText::from_value(&GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(&call_data)?)?)?, deposit_anchors: anchors, withdrawal_records: records };
-        let context = GuardianVerificationContext { wallet: &wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.l1_endpoints, history: &history };
-        verify_guardian_session(&context, &authorization, &request).await?;
+        let trace_envelope = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(&call_data).context("trace call_data json")?).context("guardian trace json build")?;
+        let envelope_bytes = serde_json::to_string(&trace_envelope).context("guardian trace envelope serialize")?;
+        tracing::info!(bytes = envelope_bytes.len(), "guardian request envelope built");
+        let request = GuardianSignRequest { schema_version: 1, authorization_version: authorization.version, network_magic: authorization.network_magic, genesis_hash: authorization.genesis_hash, user_id: BRIDGE_USER_ID_U64, session_nonce: nonce, operation, trace_json: JsonText::parse(envelope_bytes)?, deposit_anchors: anchors, withdrawal_records: records };
+        let context = GuardianVerificationContext { wallet: &wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.client().l1_endpoints, history: &history };
+        verify_guardian_session(&context, &authorization, &request).await.map_err(|error| anyhow::Error::from(error).context("fresh withdrawal request self-verification"))?;
         JsonText::from_value(&request)?
     };
-    let request = request_json.decode()?;
+    let history = &mut retained.history;
+    let request = request_json.decode().context("pending guardian request decode")?;
     if let Some(owner) = pending_owner.as_deref_mut() {
         owner.record_producing(&request, withdrawals)?;
+
     }
     let request_authorization = config.historical_authorization(request.authorization_version)?;
     let trace = request.decode_trace()?;
-    let client = GuardianClient::new(&config)?;
+    let client = GuardianClient::new(config.client())?;
     let proof = loop {
         match prove_pending_request(&mut wallet, &client, &archive, &request_authorization, &request_json).await {
             Ok(proof) => break proof,
@@ -3582,12 +3661,11 @@ async fn submit_guardian_operation(rpc_config: &str, guardian_config: &str, prov
             Err(error) => return Err(error),
         }
     };
-    let signatures = archive.signatures(request.session_nonce)?.context("missing threshold signatures")?;
-    let mut record = GuardianSessionRecord { request_json, signatures_json: JsonText::from_value(&signatures)?, endcap_input_json: JsonText::from_value(&trace.finalization.submit_end_cap_input)?, endcap_proof_hex: format!("0x{}", hex::encode(&proof)), included_checkpoint_id: u64::MAX, included_checkpoint_hash: root };
-    record.validate(&request_authorization)?;
+    // Inclusion classification reads only the frozen request until the nonce is
+    // consumed; unfinished sessions need neither threshold signatures nor proof.
     let committed_now = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
     ensure!(committed_now.checkpoint_id >= head && provider.get_checkpoint_tree_root(head).await? == root, "committed checkpoint contradiction; pending request retained");
-    if let Some(session) = recover_guardian_inclusion(&wallet, provider, &config, &archive, &request_authorization, history, &mut record).await? {
+    if let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, request_authorization, history, &request_json).await? {
         history.apply(&session)?;
         let landed = session.record.included_checkpoint_id;
         retained.approvals.insert(request_authorization.version, sha256(&serde_json::to_vec(&request_authorization)?));
@@ -3598,7 +3676,7 @@ async fn submit_guardian_operation(rpc_config: &str, guardian_config: &str, prov
     let leaf = match submission {
         Ok(leaf) => leaf,
         Err(error) => {
-            if let Some(session) = recover_guardian_inclusion(&wallet, provider, &config, &archive, &request_authorization, history, &mut record).await? {
+            if let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, request_authorization, history, &request_json).await? {
                 history.apply(&session)?;
                 let landed = session.record.included_checkpoint_id;
                 retained.approvals.insert(request_authorization.version, sha256(&serde_json::to_vec(&request_authorization)?));
@@ -3609,14 +3687,12 @@ async fn submit_guardian_operation(rpc_config: &str, guardian_config: &str, prov
         }
     };
     let start = trace.finalization.submit_end_cap_input.core.checkpoint_id.to_canonical_u64();
-    let landed = provider.wait_for_endcap_inclusion(BRIDGE_USER_ID_U64, leaf, start, Some(REALM_CHECKPOINT_POLL_TIMEOUT_SECS), REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
-    record.included_checkpoint_id = landed;
-    record.included_checkpoint_hash = provider.get_checkpoint_tree_merkle_proof(landed, landed).await?.value;
-    let included_root = provider.get_checkpoint_tree_root(landed).await?;
-    let context = GuardianVerificationContext { wallet: &wallet, provider, verified_checkpoint_id: landed, verified_checkpoint_tree_root: included_root, l1_endpoints: &config.l1_endpoints, history: &history };
-    let session = verify_session(&context, &request_authorization, record.clone()).await?;
-    archive.save_record(&record, &request_authorization)?;
+    provider.wait_for_endcap_inclusion(BRIDGE_USER_ID_U64, leaf, start, Some(REALM_CHECKPOINT_POLL_TIMEOUT_SECS), REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
+    let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, request_authorization, history, &request_json).await? else {
+        anyhow::bail!("submitted EndCap has no authenticated inclusion");
+    };
     history.apply(&session)?;
+    let landed = session.record.included_checkpoint_id;
     retained.approvals.insert(request_authorization.version, sha256(&serde_json::to_vec(&request_authorization)?));
     retained.sessions.push(session);
     Ok(landed)
@@ -3625,37 +3701,201 @@ async fn submit_guardian_operation(rpc_config: &str, guardian_config: &str, prov
 async fn recover_guardian_inclusion(
     wallet: &WalletSession,
     provider: &RpcProvider,
-    config: &super::guardian_client::GuardianClientConfig,
+    config: &super::guardian_client::LoadedGuardianConfig,
     archive: &super::guardian_client::RelayerArchive,
-    authorization: &crate::guardian::protocol::GuardianAuthorization,
+    authorization: &guardian_common::protocol::GuardianAuthorization,
     history: &crate::guardian::verify::GuardianHistory,
-    record: &mut crate::guardian::protocol::GuardianSessionRecord,
-) -> anyhow::Result<Option<crate::guardian::protocol::GuardianSession>> {
+    request_json: &guardian_common::protocol::JsonText<GuardianSignRequest>,
+) -> anyhow::Result<Option<guardian_common::protocol::GuardianSession>> {
+    use plonky2::field::types::PrimeField64;
     use psy_client_data::config::store_config::PsyHasher;
     use psy_crypto::hash::traits::qhashable::QFieldHashable;
+    use guardian_common::protocol::{GuardianSessionRecord, JsonText};
+    let request = request_json.decode()?;
+    let input = request.decode_trace()?.finalization.submit_end_cap_input;
+    let start = request.decode_trace()?.anchor.start_checkpoint_id;
+    let start_leaf = input.core.state_transition.start_user_leaf_hash;
     let head = crate::guardian::service::load_guardian_committed_head(provider, &provider.get_coordinator_url()?).await?;
-    let input = record.endcap_input_json.decode()?;
-    let proof = provider.get_user_tree_merkle_proof(head.checkpoint_id, BRIDGE_USER_ID_U64).await?;
-    if proof.value != input.core.new_user_leaf.qfhash::<PsyHasher>() { return Ok(None); }
-    record.included_checkpoint_id = head.checkpoint_id;
-    record.included_checkpoint_hash = provider.get_checkpoint_tree_merkle_proof(head.checkpoint_id, head.checkpoint_id).await?.value;
-    let context = crate::guardian::verify::GuardianVerificationContext {
-        wallet, provider, verified_checkpoint_id: head.checkpoint_id,
-        verified_checkpoint_tree_root: head.checkpoint_tree_root,
-        l1_endpoints: &config.l1_endpoints, history,
+    let predecessor = authenticated_account(provider, start, head.checkpoint_id, head.checkpoint_tree_root, authorization).await?;
+    let current = authenticated_account(provider, head.checkpoint_id, head.checkpoint_id, head.checkpoint_tree_root, authorization).await?;
+    if pending_transition_unfinished(request.session_nonce, start_leaf, predecessor, current)? { return Ok(None); }
+    ensure!(head.checkpoint_id > start, "consumed nonce has no historical interval");
+    let predecessor_nonce = predecessor.1;
+    let mut record = GuardianSessionRecord {
+        request_json: request_json.clone(),
+        signatures_json: JsonText::from_value(&archive.signatures(request.session_nonce)?.context("consumed nonce missing archived signatures")?)?,
+        endcap_input_json: JsonText::from_value(&input)?,
+        endcap_proof_hex: format!("0x{}", hex::encode(archive.proof(request.session_nonce)?.context("consumed nonce missing archived proof")?)),
+        included_checkpoint_id: u64::MAX,
+        included_checkpoint_hash: head.checkpoint_tree_root,
     };
-    let session = crate::guardian::verify::verify_session(&context, authorization, record.clone()).await?;
-    archive.save_record(record, authorization)?;
+    let archived = archive.sessions(request.session_nonce - 1, 1)?.sessions.into_iter().next();
+    let exact = match archived {
+        Some(record) => Some(record),
+        None => super::guardian_client::GuardianClient::new(config.client())?.session_record(request.session_nonce - 1).await?,
+    };
+    let adopted = if let Some(candidate) = exact {
+        ensure!(candidate.request_json.as_str() == record.request_json.as_str() && candidate.signatures_json.as_str() == record.signatures_json.as_str() && candidate.endcap_input_json.as_str() == record.endcap_input_json.as_str() && candidate.endcap_proof_hex == record.endcap_proof_hex, "authenticated guardian record differs from archived evidence");
+        ensure!(candidate.request_json.decode()?.session_nonce == request.session_nonce, "authenticated guardian record nonce mismatch");
+        candidate
+    } else {
+        let included = first_nonce_checkpoint(provider, start, head.checkpoint_id, head.checkpoint_tree_root, authorization, request.session_nonce).await?;
+        let predecessor = included.checked_sub(1).context("included checkpoint has no predecessor")?;
+        let (included_predecessor_leaf, included_predecessor_nonce) = authenticated_account(provider, predecessor, head.checkpoint_id, head.checkpoint_tree_root, authorization).await?;
+        ensure!(included_predecessor_nonce == predecessor_nonce && included_predecessor_leaf == start_leaf, "historical predecessor differs from archived start");
+        let (included_leaf, included_nonce) = authenticated_account(provider, included, head.checkpoint_id, head.checkpoint_tree_root, authorization).await?;
+        ensure!(included_nonce == request.session_nonce && included_leaf == input.core.new_user_leaf.qfhash::<PsyHasher>(), "historical inclusion differs from archived EndCap");
+        record.included_checkpoint_id = included;
+        record.included_checkpoint_hash = provider.get_checkpoint_tree_merkle_proof(head.checkpoint_id, included).await?.value;
+        record
+    };
+    let context = crate::guardian::verify::GuardianVerificationContext {
+        wallet, provider, verified_checkpoint_id: head.checkpoint_id, verified_checkpoint_tree_root: head.checkpoint_tree_root,
+        l1_endpoints: &config.client().l1_endpoints, history,
+    };
+    let session = crate::guardian::verify::verify_session(&context, authorization, adopted).await?;
+    archive.save_record(&session.record, authorization)?;
     Ok(Some(session))
 }
 
+/// Classify authenticated chain state before reading any signing/proof files.
+fn pending_transition_unfinished(nonce: u64, start_leaf: QHashOut<GoldilocksField>, predecessor: (QHashOut<GoldilocksField>, u64), current: (QHashOut<GoldilocksField>, u64)) -> anyhow::Result<bool> {
+    let previous = nonce.checked_sub(1).context("pending nonce starts at zero")?;
+    ensure!(predecessor == (start_leaf, previous), "archived predecessor differs from authenticated start");
+    if current == predecessor { return Ok(true); }
+    ensure!(current.1 >= nonce, "account history conflicts with archived predecessor");
+    Ok(false)
+}
+
+async fn authenticated_account(provider: &RpcProvider, checkpoint: u64, head: u64, root: QHashOut<GoldilocksField>, authorization: &guardian_common::protocol::GuardianAuthorization) -> anyhow::Result<(QHashOut<GoldilocksField>, u64)> {
+    use plonky2::field::types::PrimeField64;
+    use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
+    use psy_client_data::config::store_config::PsyHasher;
+    use psy_crypto::hash::traits::qhashable::QFieldHashable;
+    let leaf = provider.get_checkpoint_leaf_data(checkpoint).await?;
+    let roots = provider.get_checkpoint_global_state_roots(checkpoint).await?;
+    let path = provider.get_checkpoint_tree_merkle_proof(head, checkpoint).await?;
+    crate::guardian::verify::verify_checkpoint(checkpoint, &leaf, &roots, &path, root).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let user = provider.get_user_leaf_data(checkpoint, authorization.user_id).await?;
+    let user_path = provider.get_user_tree_merkle_proof(checkpoint, authorization.user_id).await?;
+    crate::guardian::verify::verify_path(&user_path, roots.user_tree_root, authorization.user_id, user_path.value, psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    if user_path.value == QHashOut::ZERO { return Ok((user_path.value, 0)); }
+    ensure!(user_path.value == user.qfhash::<PsyHasher>() && user.public_key == authorization.account_public_key && user.user_id.to_canonical_u64() == authorization.user_id, "authenticated account identity mismatch");
+    Ok((user_path.value, user.nonce.to_canonical_u64()))
+}
+
+async fn first_included_checkpoint<F, Fut>(mut probe: F, start: u64, head: u64, nonce: u64) -> anyhow::Result<u64>
+where F: FnMut(u64) -> Fut, Fut: Future<Output = anyhow::Result<u64>> {
+    ensure!(start < head && probe(start).await? < nonce, "historical start is not before the archived nonce");
+    let mut low = start;
+    let mut high = head;
+    let mut high_nonce = probe(head).await?;
+    ensure!(high_nonce >= nonce, "historical head has not consumed the archived nonce");
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        let observed = probe(middle).await?;
+        if observed >= nonce { high = middle; high_nonce = observed; } else { low = middle; }
+    }
+    ensure!(high_nonce == nonce, "historical account nonce skipped the archived session");
+    Ok(high)
+}
+
+async fn first_nonce_checkpoint(provider: &RpcProvider, start: u64, head: u64, root: QHashOut<GoldilocksField>, authorization: &guardian_common::protocol::GuardianAuthorization, nonce: u64) -> anyhow::Result<u64> {
+    first_included_checkpoint(|checkpoint| async move {
+        authenticated_account(provider, checkpoint, head, root, authorization).await.map(|(_, nonce)| nonce)
+    }, start, head, nonce).await
+}
+
 mod tests {
+
     use super::*;
     use crate::bridge::propose_withdrawals::PendingWithdrawal;
     use std::{
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+    #[tokio::test]
+    async fn historical_nonce_search_checks_predecessor_and_uses_each_probe_once() {
+        let mut probes = Vec::new();
+        let observations = |checkpoint| { probes.push(checkpoint); std::future::ready(Ok(if checkpoint < 80 { 4 } else if checkpoint < 100 { 5 } else { 9 })) };
+        assert_eq!(first_included_checkpoint(observations, 10, 10_000, 5).await.unwrap(), 80);
+        assert!(probes.len() <= 64 - (10_000u64 - 10).leading_zeros() as usize + 2);
+        let unique: HashSet<_> = probes.iter().collect();
+        assert_eq!(unique.len(), probes.len());
+        assert!(first_included_checkpoint(|_| std::future::ready(Ok(5)), 10, 20, 5).await.is_err());
+        assert!(first_included_checkpoint(|checkpoint| std::future::ready(Ok(if checkpoint < 80 { 4 } else { 9 })), 10, 10_000, 5).await.is_err());
+        assert!(first_included_checkpoint(|checkpoint| std::future::ready(if checkpoint == 15 { Err(anyhow::anyhow!("missing")) } else { Ok(if checkpoint < 16 { 4 } else { 5 }) }), 10, 20, 5).await.is_err());
+    }
+
+    #[test]
+    fn pending_chain_classification_preserves_unfinished_and_rejects_conflicts() {
+        let leaf = QHashOut::from_values(1, 2, 3, 4);
+        let other = QHashOut::ZERO;
+        assert!(pending_transition_unfinished(5, leaf, (leaf, 4), (leaf, 4)).unwrap());
+        assert!(!pending_transition_unfinished(5, leaf, (leaf, 4), (other, 5)).unwrap());
+        assert!(!pending_transition_unfinished(5, leaf, (leaf, 4), (other, 9)).unwrap());
+        assert!(pending_transition_unfinished(5, leaf, (leaf, 4), (other, 4)).is_err());
+        assert!(pending_transition_unfinished(5, leaf, (other, 4), (leaf, 5)).is_err());
+        assert!(pending_transition_unfinished(5, leaf, (leaf, 4), (leaf, 3)).is_err());
+    }
+
+    #[test]
+    fn pending_then_fresh_clear_only_each_exact_confirmed_owner() {
+        let mut request = crate::guardian::test_fixture::codec_request_fixture();
+        let mut owner = None;
+        let mut pending = HashMap::new();
+        let retired = HashMap::new();
+        record_producing_in_ledger(&mut owner, &mut pending, &retired, &request, &[]).unwrap();
+        assert!(clear_confirmed_producing(&mut owner, &request).unwrap());
+        advance_request_nonce(&mut request);
+        record_producing_in_ledger(&mut owner, &mut pending, &retired, &request, &[]).unwrap();
+        let mut wrong = request.clone();
+        wrong.authorization_version += 1;
+        assert!(!clear_confirmed_producing(&mut owner, &wrong).unwrap());
+        ensure_owned_producing(&owner, &request).unwrap();
+        assert!(clear_confirmed_producing(&mut owner, &request).unwrap());
+        assert!(owner.is_none());
+        advance_request_nonce(&mut request);
+        record_producing_in_ledger(&mut owner, &mut pending, &retired, &request, &[]).unwrap();
+    }
+
+    fn advance_request_nonce(request: &mut GuardianSignRequest) {
+        let mut trace = request.decode_trace().unwrap();
+        request.session_nonce += 1;
+        trace.finalization.nonce = GoldilocksField(request.session_nonce);
+        let call_data = request.trace_json.decode().unwrap().call_data;
+        request.trace_json = guardian_common::protocol::JsonText::from_value(&psy_prover::trace::GeneratedTxTraceJson::from_trace(&trace, call_data).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn request_only_and_signed_unproved_restart_keep_frozen_request() {
+        use super::super::guardian_client::RelayerArchive;
+        use guardian_common::protocol::JsonText;
+        use psy_client_common::data::base_types::hash256::Hash256;
+        use psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature;
+        use psy_vm::ups::multisig::MultisigSignatures;
+        let path = temp_state_path("unfinished-archive");
+        let archive = RelayerArchive::open(&path).unwrap();
+        let request = crate::guardian::test_fixture::codec_request_fixture();
+        let frozen = JsonText::from_value(&request).unwrap();
+        archive.save_request(&frozen).unwrap();
+        let start = request.decode_trace().unwrap().finalization.submit_end_cap_input.core.state_transition.start_user_leaf_hash;
+        assert!(pending_transition_unfinished(1, start, (start, 0), (start, 0)).unwrap());
+        assert!(archive.signatures(1).unwrap().is_none());
+        assert!(archive.proof(1).unwrap().is_none());
+        assert_eq!(archive.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
+        let signatures = MultisigSignatures { member_indices: vec![0, 2], signatures: vec![PsyCompressedSecp256K1Signature { public_key: [2; 33], signature: [1; 64], message: Hash256([0; 32]) }; 2] };
+        archive.save_signatures(1, &signatures).unwrap();
+        let saved = fs::read(path.join("1/signatures.json")).unwrap();
+        let reopened = RelayerArchive::open(&path).unwrap();
+        assert!(pending_transition_unfinished(1, start, (start, 0), (start, 0)).unwrap());
+        assert!(reopened.signatures(1).unwrap().is_some());
+        assert!(reopened.proof(1).unwrap().is_none());
+        assert_eq!(reopened.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
+        assert_eq!(fs::read(path.join("1/signatures.json")).unwrap(), saved);
+        fs::remove_dir_all(path).unwrap();
+    }
+
 
     fn temp_state_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -6877,23 +7117,23 @@ rpc_urls = ["http://127.0.0.1:4"]
     #[test]
     fn system_prove_proxy_url_is_required() {
         let path = write_temp_rpc_config("[]");
-        let err = resolve_system_prove_proxy_url(&daemon_config_with_rpc(&path)).unwrap_err();
+        let err = resolve_system_prove_proxy_url(psy_config::PsyConfigGoldilocks::builder().path(path.to_str().unwrap()).network(psy_config::CURRENT_NETWORK).build().unwrap().get_current_network().unwrap()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("system_prove_proxy_url"), "{msg}");
-        assert!(msg.contains("localhost"), "{msg}");
+        assert!(msg.contains("loaded network"), "{msg}");
     }
 
     #[test]
     fn system_prove_proxy_url_skips_blank_entries() {
         let path = write_temp_rpc_config(r#"["  ", "http://127.0.0.1:9997"]"#);
-        let url = resolve_system_prove_proxy_url(&daemon_config_with_rpc(&path)).unwrap();
+        let url = resolve_system_prove_proxy_url(psy_config::PsyConfigGoldilocks::builder().path(path.to_str().unwrap()).network(psy_config::CURRENT_NETWORK).build().unwrap().get_current_network().unwrap()).unwrap();
         assert_eq!(url, "http://127.0.0.1:9997");
     }
 
     #[test]
     fn user_pool_url_is_not_a_fallback() {
         let path = write_temp_rpc_config(r#"[""]"#);
-        assert!(resolve_system_prove_proxy_url(&daemon_config_with_rpc(&path)).is_err());
+        assert!(resolve_system_prove_proxy_url(psy_config::PsyConfigGoldilocks::builder().path(path.to_str().unwrap()).network(psy_config::CURRENT_NETWORK).build().unwrap().get_current_network().unwrap()).is_err());
     }
 
     /// Starts a minimal single-shot HTTP responder on `127.0.0.1:0` that reads

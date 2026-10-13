@@ -597,13 +597,30 @@ mod tests {
         assert_eq!(signed.signature, Some([3; 64]));
         assert!(matches!(db.save_guardian_signature(value.network_magic, value.user_id, value.nonce, &value.request_bytes, [4; 64]).await, Err(GuardianSignError::NonceConflict)));
         assert_eq!(db.lookup_signed(value.network_magic, value.user_id, value.nonce).await.expect("unchanged").expect("decision").signature, Some([3; 64]));
-        db.halt_account(value.network_magic, value.user_id, HaltReason::SigningAuthorizationInvalid).await.expect("halt");
+        db.halt_account(value.network_magic, value.user_id, HaltReason::AppendHistoryMismatch).await.expect("halt");
         assert!(matches!(db.authorize_response(value.network_magic, value.user_id, value.nonce, &value.request_bytes, |_| Ok(())).await, Err(GuardianSignError::AccountHalted)));
         assert!(matches!(db.save_account(&active(value.network_magic, u64::MAX)).await, Err(GuardianSignError::AccountHalted)));
         assert_eq!(db.load_account(value.network_magic, value.user_id).await.expect("load halted").state, GuardianAccountState::Halted);
         drop(db);
         let mut restored = GuardianDb::open(OpenOptions::new().read(true).write(true).open(&owned.path).expect("restored"), KEY).await.expect("halt reopened");
         assert_eq!(restored.load_account(value.network_magic, value.user_id).await.expect("retained halt").state, GuardianAccountState::Halted);
+    }
+
+    #[tokio::test]
+    async fn signed_reservation_survives_differing_request_and_reuse_returns_signature() {
+        let value = reserved();
+        let mut owned = TestDb::create(&active(value.network_magic, u64::MAX)).await;
+        owned.db().reserve_guardian_nonce(&value).await.expect("reserve");
+        owned.db().save_guardian_signature(value.network_magic, value.user_id, value.nonce, &value.request_bytes, [5; 64]).await.expect("sign");
+        let mut differing = value.clone();
+        differing.authorization_bytes.push(7);
+        assert!(matches!(owned.db().reserve_guardian_nonce(&differing).await, Err(GuardianSignError::NonceConflict)));
+        let retained = owned.db().lookup_signed(value.network_magic, value.user_id, value.nonce).await.expect("lookup").expect("signed reservation");
+        assert_eq!(retained.signature, Some([5; 64]));
+        assert!(same_reservation(&retained, &value));
+        let reused = owned.db().reserve_guardian_nonce(&value).await.expect("same-request reuse");
+        assert_eq!(reused.signature, Some([5; 64]));
+        assert_eq!(owned.db().lookup_signed(value.network_magic, value.user_id, value.nonce).await.expect("unchanged").expect("decision").signature, Some([5; 64]));
     }
 
     #[tokio::test]

@@ -51,6 +51,7 @@ psy_provider = { workspace = true }
 psy_client_data = { workspace = true }
 psy_client_common = { workspace = true }
 psy_cli_common = { path = "../psy_cli_common" }
+guardian_common = { path = "../guardian_common" }
 psy_config = { workspace = true }
 psy_prover = { workspace = true, features = ["gnark-wrap"] }
 psy_core = { workspace = true }
@@ -60,9 +61,7 @@ psy_common_circuit = { workspace = true }
 psy_ups_circuit = { workspace = true }
 bincode = { workspace = true }
 futures = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
-webpki-roots = { workspace = true }
+
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
@@ -75,3 +74,4 @@ psy_rpc_pool = { path = "../../psy_rpc_pool" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 k256 = { workspace = true }
+psy_user_cli = { path = "../../client_prover/psy_cli/psy_user_cli" }

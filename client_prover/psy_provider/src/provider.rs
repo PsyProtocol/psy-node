@@ -182,6 +182,8 @@ where
     Ok(None)
 }
 
+const RPC_RESPONSE_BYTE_LIMIT: usize = 128 * 1024 * 1024;
+
 pub(crate) async fn read_rpc_response(response: reqwest::Response, bounded: bool) -> anyhow::Result<String> {
     if !bounded {
         return Ok(response.text().await?);
@@ -192,7 +194,7 @@ pub(crate) async fn read_rpc_response(response: reqwest::Response, bounded: bool
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        anyhow::ensure!(chunk.len() <= 64 * 1024 * 1024 - body.len(), "RPC response exceeds 64 MiB");
+        anyhow::ensure!(chunk.len() <= RPC_RESPONSE_BYTE_LIMIT - body.len(), "RPC response exceeds 128 MiB");
         body.extend_from_slice(&chunk);
     }
     Ok(String::from_utf8(body)?)
