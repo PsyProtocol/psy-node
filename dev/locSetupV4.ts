@@ -3920,7 +3920,7 @@ class DevNetProcessManager {
                     const rpcUrl = resolveLocalL1RpcUrl(localChain.port);
                     const args = [
                         'anvil', '--host', '0.0.0.0', '--port', String(localChain.port),
-                        '--chain-id', String(chainMeta.l1ChainId), '--steps-tracing', '-vvvv',
+                        '--chain-id', String(chainMeta.l1ChainId), '--block-time', '1', '--steps-tracing', '-vvvv',
                     ];
                     await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                         args,
