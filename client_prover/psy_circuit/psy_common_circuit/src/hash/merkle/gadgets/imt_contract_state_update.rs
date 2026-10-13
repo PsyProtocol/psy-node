@@ -27,7 +27,7 @@ use super::{
     merkle_proof::MerkleProofGadget,
 };
 use crate::builder::{
-    comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers, math::core::CircuitBuilderCoreMathHelpers,
+    comparison::CircuitBuilderComparison, connect::CircuitBuilderConnectHelpers, math::core::CircuitBuilderCoreMathHelpers, select::CircuitBuilderSelectHelpers,
 };
 
 // ---------------------------------------------------------------------------
@@ -292,7 +292,8 @@ impl IMTInsertGadget {
         );
         let room = builder.is_less_than(32, starting_count, map_capacity);
         builder.connect(room.target, true_target.target);
-        let new_leaf_index = builder.add(builder.add(physical_base, starting_count), one);
+        let new_leaf_index = builder.add(physical_base, starting_count);
+        let new_leaf_index = builder.add(new_leaf_index, one);
         let new_leaf_delta_proof = DeltaMerkleProofGadget::add_virtual_to_with_options::<H, F, D>(
             builder,
             tree_height,
@@ -320,7 +321,8 @@ impl IMTInsertGadget {
 
         let predecessor_is_sentinel = builder.is_equal(predecessor_delta_proof.index, physical_base);
         let member_predecessor = builder.not(predecessor_is_sentinel);
-        let initialized_member = builder.and(builder.not(sentinel_virgin), member_predecessor);
+        let initialized = builder.not(sentinel_virgin);
+        let initialized_member = builder.and(initialized, member_predecessor);
         let authenticated_old_hash = builder.select_hash(sentinel_virgin, zero_hash, pred_old_hash);
         let old_hash = builder.select_hash(initialized_member, pred_old_hash, authenticated_old_hash);
         builder.connect_hashes(predecessor_delta_proof.old_value, old_hash);
@@ -354,7 +356,8 @@ impl IMTInsertGadget {
         let successor_absent = builder.is_zero_hash(predecessor_old_leaf.next_key);
         let before_successor = is_qhashout_lt::<F, D>(builder, new_leaf.key, predecessor_old_leaf.next_key);
         let gap = builder.or(successor_absent, before_successor);
-        builder.connect(builder.and(before_query, gap).target, true_target.target);
+        let valid = builder.and(before_query, gap);
+        builder.connect(valid.target, true_target.target);
 
         let transient_old_hash = builder.select_hash(sentinel_virgin, pred_new_hash, sentinel_old_hash);
         builder.connect_hashes(sentinel_delta_proof.old_value, transient_old_hash);
@@ -365,23 +368,25 @@ impl IMTInsertGadget {
             builder.connect(sentinel_new_leaf.value.elements[limb], sentinel_preimage.value.elements[limb]);
         }
         builder.connect(sentinel_old_leaf.value.elements[0], starting_count);
-        builder.connect(sentinel_new_leaf.value.elements[0], builder.add(starting_count, one));
+        let ending_count = builder.add(starting_count, one);
+        builder.connect(sentinel_new_leaf.value.elements[0], ending_count);
         builder.connect_hashes_if_true(member_predecessor, sentinel_old_leaf.next_key, sentinel_preimage.next_key);
         builder.connect_if_true(member_predecessor, sentinel_old_leaf.next_index, sentinel_preimage.next_index);
         builder.connect_hashes_if_true(sentinel_predecessor, sentinel_old_leaf.next_key, new_leaf.key);
         builder.connect_if_true(sentinel_predecessor, sentinel_old_leaf.next_index, new_leaf_index);
         builder.connect_hashes(sentinel_new_leaf.next_key, sentinel_old_leaf.next_key);
         builder.connect(sentinel_new_leaf.next_index, sentinel_old_leaf.next_index);
-        let final_successor_present = builder.and(
-            builder.not(builder.is_zero_hash(sentinel_new_leaf.next_key)),
-            builder.not(builder.is_zero(sentinel_new_leaf.next_index)),
-        );
+        let key_zero = builder.is_zero_hash(sentinel_new_leaf.next_key);
+        let key_present = builder.not(key_zero);
+        let index_zero = builder.is_zero(sentinel_new_leaf.next_index);
+        let index_present = builder.not(index_zero);
+        let final_successor_present = builder.and(key_present, index_present);
         Self::connect_index_in_open_interval(
             builder,
             final_successor_present,
             sentinel_new_leaf.next_index,
             physical_base,
-            builder.add(starting_count, one),
+            ending_count,
         );
 
         Self {
@@ -408,18 +413,23 @@ impl IMTInsertGadget {
         height_bits: Target,
     ) -> (Target, Target) {
         let (quotient, remainder) = builder.div_rem4(base_offset);
-        let physical_base = builder.add(quotient, builder.is_not_zero(remainder).target);
+        let remainder_nonzero = builder.is_not_zero(remainder);
+        let physical_base = builder.add(quotient, remainder_nonzero.target);
         builder.range_check(physical_base, 32);
         builder.range_check(capacity, 32);
-        let positive = builder.is_less_than(32, builder.zero(), capacity);
-        builder.connect(positive.target, builder.one());
+        let zero = builder.zero();
+        let one = builder.one();
+        let positive = builder.is_less_than(32, zero, capacity);
+        builder.connect(positive.target, one);
         let occupied = builder.add(physical_base, capacity);
         let mut tree_size = builder.one();
         for bits in 1..=32usize {
             tree_size = builder.add(tree_size, tree_size);
-            let is_height = builder.is_equal(height_bits, builder.constant(F::from_canonical_usize(bits)));
+            let height = builder.constant(F::from_canonical_usize(bits));
+            let is_height = builder.is_equal(height_bits, height);
             let within = builder.is_less_than(33, occupied, tree_size);
-            builder.connect(builder.select(is_height, within.target, builder.one()), builder.one());
+            let valid = builder.select(is_height, within.target, one);
+            builder.connect(valid, one);
         }
         (physical_base, capacity)
     }
@@ -431,28 +441,35 @@ impl IMTInsertGadget {
         sentinel: &IMTLeafTargets,
         proof: &MerkleProofGadget,
     ) -> (BoolTarget, Target) {
+        let zero = builder.zero();
+        let one = builder.one();
         let sentinel_hash = sentinel.hash::<H, F, D>(builder);
         let count = sentinel.value.elements[0];
         builder.connect(proof.index, physical_base);
         for limb in 0..4 {
-            builder.connect(sentinel.key.elements[limb], builder.zero());
+            builder.connect(sentinel.key.elements[limb], zero);
             if limb != 0 {
-                builder.connect(sentinel.value.elements[limb], builder.zero());
+                builder.connect(sentinel.value.elements[limb], zero);
             }
         }
         builder.range_check(count, 32);
         let within = builder.is_less_than_or_equal(32, count, capacity);
-        builder.connect(within.target, builder.one());
+        builder.connect(within.target, one);
         let virgin = builder.is_zero_hash(proof.value);
-        builder.connect_hashes_if_true(builder.not(virgin), sentinel_hash, proof.value);
+        let initialized = builder.not(virgin);
+        builder.connect_hashes_if_true(initialized, sentinel_hash, proof.value);
         Self::connect_leaf_zero_if_true(builder, virgin, sentinel);
-        let positive = builder.is_less_than(32, builder.zero(), count);
-        builder.connect_if_true(builder.not(virgin), positive.target, builder.one());
-        let linked = builder.and(builder.not(builder.is_zero_hash(sentinel.next_key)), builder.is_not_zero(sentinel.next_index));
-        builder.connect_if_true(builder.not(virgin), linked.target, builder.one());
-        Self::connect_index_in_open_interval(builder, builder.not(virgin), sentinel.next_index, physical_base, count);
-        let absent = builder.and(builder.is_zero_hash(sentinel.next_key), builder.is_zero(sentinel.next_index));
-        builder.connect_if_true(virgin, absent.target, builder.one());
+        let positive = builder.is_less_than(32, zero, count);
+        builder.connect_if_true(initialized, positive.target, one);
+        let key_zero = builder.is_zero_hash(sentinel.next_key);
+        let key_present = builder.not(key_zero);
+        let index_present = builder.is_not_zero(sentinel.next_index);
+        let linked = builder.and(key_present, index_present);
+        builder.connect_if_true(initialized, linked.target, one);
+        Self::connect_index_in_open_interval(builder, initialized, sentinel.next_index, physical_base, count);
+        let index_zero = builder.is_zero(sentinel.next_index);
+        let absent = builder.and(key_zero, index_zero);
+        builder.connect_if_true(virgin, absent.target, one);
         (virgin, count)
     }
 
@@ -476,15 +493,20 @@ impl IMTInsertGadget {
         physical_base: Target,
         count: Target,
     ) {
-        let first = builder.add(physical_base, builder.one());
+        let one = builder.one();
+        let first = builder.add(physical_base, one);
         let last = builder.add(physical_base, count);
         let low = builder.is_less_than_or_equal(33, first, index);
         let high = builder.is_less_than_or_equal(33, index, last);
-        builder.connect_if_true(active, builder.and(low, high).target, builder.one());
+        let within = builder.and(low, high);
+        builder.connect_if_true(active, within.target, one);
     }
 
     fn connect_query_nonzero<F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>, key: HashOutTarget) {
-        builder.connect(builder.not(builder.is_zero_hash(key)).target, builder.one());
+        let zero = builder.is_zero_hash(key);
+        let nonzero = builder.not(zero);
+        let one = builder.one();
+        builder.connect(nonzero.target, one);
     }
 
     fn connect_predecessor_role<F: RichField + Extendable<D>, const D: usize>(
@@ -499,12 +521,16 @@ impl IMTInsertGadget {
             builder.connect_zero_if_true(at_sentinel, predecessor.key.elements[limb]);
         }
         let member = builder.not(at_sentinel);
-        let first = builder.add(physical_base, builder.one());
+        let one = builder.one();
+        let first = builder.add(physical_base, one);
         let last = builder.add(physical_base, count);
         let low = builder.is_less_than_or_equal(33, first, index);
         let high = builder.is_less_than_or_equal(33, index, last);
-        builder.connect_if_true(member, builder.and(low, high).target, builder.one());
-        builder.connect_if_true(member, builder.not(builder.is_zero_hash(predecessor.key)).target, builder.one());
+        let within = builder.and(low, high);
+        builder.connect_if_true(member, within.target, one);
+        let key_zero = builder.is_zero_hash(predecessor.key);
+        let key_nonzero = builder.not(key_zero);
+        builder.connect_if_true(member, key_nonzero.target, one);
         Self::connect_successor_pair(builder, predecessor.next_key, predecessor.next_index, physical_base, count);
     }
 
@@ -515,14 +541,21 @@ impl IMTInsertGadget {
         physical_base: Target,
         count: Target,
     ) {
-        let absent = builder.and(builder.is_zero_hash(next_key), builder.is_zero(next_index));
-        let present = builder.and(builder.not(builder.is_zero_hash(next_key)), builder.not(builder.is_zero(next_index)));
-        builder.connect(builder.or(absent, present).target, builder.one());
-        let first = builder.add(physical_base, builder.one());
+        let key_zero = builder.is_zero_hash(next_key);
+        let index_zero = builder.is_zero(next_index);
+        let absent = builder.and(key_zero, index_zero);
+        let key_present = builder.not(key_zero);
+        let index_present = builder.not(index_zero);
+        let present = builder.and(key_present, index_present);
+        let valid = builder.or(absent, present);
+        let one = builder.one();
+        builder.connect(valid.target, one);
+        let first = builder.add(physical_base, one);
         let last = builder.add(physical_base, count);
         let low = builder.is_less_than_or_equal(33, first, next_index);
         let high = builder.is_less_than_or_equal(33, next_index, last);
-        builder.connect_if_true(present, builder.and(low, high).target, builder.one());
+        let within = builder.and(low, high);
+        builder.connect_if_true(present, within.target, one);
     }
 
     /// Set the authenticated insertion witness, including both sentinel versions.

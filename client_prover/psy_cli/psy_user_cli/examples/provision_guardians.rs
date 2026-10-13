@@ -72,14 +72,9 @@ fn protected_root() -> Result<PathBuf, &'static str> {
 }
 
 fn current_uid() -> Result<u32, &'static str> {
-    let status = fs::read_to_string("/proc/self/status").map_err(|_| "reading process status failed")?;
-    for line in status.lines() {
-        if let Some(value) = line.strip_prefix("Uid:") {
-            let uid = value.split_whitespace().next().ok_or("process uid missing")?.parse::<u32>().map_err(|_| "process uid invalid")?;
-            return Ok(uid);
-        }
-    }
-    Err("process uid missing")
+    // SAFETY: getuid takes no arguments, has no memory preconditions, and
+    // returns the real UID on both Linux and macOS.
+    Ok(unsafe { libc::getuid() })
 }
 
 struct OutputDirs {
@@ -183,7 +178,7 @@ fn save_public(
         public_key_param,
         provision_index: member.provision_index,
         sorted_slot,
-        compressed_public_key: hex::encode(member.compressed_public_key),
+        compressed_public_key: format!("0x{}", hex::encode(member.compressed_public_key)),
         member_commitment: member.commitment,
     }).collect::<Vec<_>>();
     let members_json = serde_json::to_vec(&rows).map_err(|_| "serializing guardian members failed")?;

@@ -24,6 +24,7 @@ use psy_plonky2_circuits::{
         circuits::{
             bridge_agg_final::{bridge_agg_final_pi_len, BridgeAggFinalCircuit, BridgeAggProveResult},
             bridge_aggregate::bridge_aggregate_pi_len,
+            bridge_wrap::DepositBatchWrapCircuit,
             bridge_claim::{
                 BridgeRewardClaimInput, BridgeRewardClaimWitness,
                 BridgeTokenPolicy, BridgeWithdrawalClaimCircuit, BridgeWithdrawalClaimInput,
@@ -202,14 +203,14 @@ pub(crate) fn withdrawal_burn_key(nonce: [u32; 8]) -> HashOut<F> {
     plonky2::hash::poseidon::PoseidonHash::hash_no_pad(&inputs)
 }
 
-fn be_u32_words(bytes: &[u8; 32]) -> [u32; 8] {
+pub(super) fn be_u32_words(bytes: &[u8; 32]) -> [u32; 8] {
     std::array::from_fn(|index| {
         let start = 4 * index;
         u32::from_be_bytes([bytes[start], bytes[start + 1], bytes[start + 2], bytes[start + 3]])
     })
 }
 
-fn recipient_words(address: &[u8; 20]) -> [u32; 8] {
+pub(super) fn recipient_words(address: &[u8; 20]) -> [u32; 8] {
     let mut words = [0u32; 8];
     for index in 0..5 {
         let start = 4 * index;
@@ -226,13 +227,13 @@ fn validate_withdrawal_words(recipient: [u32; 8], amount: [u32; 8]) -> anyhow::R
     Ok(())
 }
 
-fn amount_words(bytes: &[u8; 32]) -> anyhow::Result<[u32; 8]> {
+pub(super) fn amount_words(bytes: &[u8; 32]) -> anyhow::Result<[u32; 8]> {
     let words = be_u32_words(bytes);
     validate_withdrawal_words([0; 8], words)?;
     Ok(words)
 }
 
-fn withdrawal_policy_ordinals(policies: &[BridgeTokenPolicy], records: &[psy_client_data::bridge_aggregate::WithdrawalBurnRecord]) -> anyhow::Result<Vec<u8>> {
+pub(super) fn withdrawal_policy_ordinals(policies: &[BridgeTokenPolicy], records: &[psy_client_data::bridge_aggregate::WithdrawalBurnRecord]) -> anyhow::Result<Vec<u8>> {
     let mut installed = std::collections::HashMap::<(u8, u32), u8>::with_capacity(policies.len());
     for (position, policy) in policies.iter().enumerate() {
         let ordinal = u8::try_from(position).context("withdrawal policy ordinal exceeds u8")?;

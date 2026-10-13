@@ -89,5 +89,6 @@ psy_node_nats = { workspace = true }
 
 
 [dev-dependencies]
+libc = { workspace = true }
 k256 = { workspace = true }
 psy_crypto = { workspace = true }

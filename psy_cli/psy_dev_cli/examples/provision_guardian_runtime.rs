@@ -215,7 +215,7 @@ fn provision() -> Result<()> {
     for (slot, member) in members.iter().enumerate() {
         anyhow::ensure!(member.sorted_slot == slot, "member sorted_slot must be dense 0..2");
         anyhow::ensure!(
-            member.compressed_public_key.len() == 67 && member.compressed_public_key.starts_with("0x"),
+            member.compressed_public_key.len() == 68 && member.compressed_public_key.starts_with("0x"),
             "member compressed public key must be a 0x-prefixed 33-byte hex string"
         );
     }
@@ -1075,7 +1075,7 @@ fn check_protected_ancestors(root: &Path, uid: u32) -> Result<()> {
         }
         let metadata = fs::symlink_metadata(&ancestor).context("reading protected ancestor")?;
         anyhow::ensure!(
-            metadata.is_dir() && ![0, uid].contains(&metadata.uid()) && metadata.mode() & 0o022 == 0,
+            metadata.is_dir() && [0, uid].contains(&metadata.uid()) && metadata.mode() & 0o022 == 0,
             "protected ancestor {ancestor:?} owner or mode is unsuitable"
         );
     }
@@ -1083,18 +1083,8 @@ fn check_protected_ancestors(root: &Path, uid: u32) -> Result<()> {
 }
 
 fn current_uid() -> Result<u32> {
-    let status = fs::read_to_string("/proc/self/status").context("reading process status")?;
-    for line in status.lines() {
-        if let Some(value) = line.strip_prefix("Uid:") {
-            return value
-                .split_whitespace()
-                .next()
-                .context("uid missing")?
-                .parse()
-                .context("parsing uid");
-        }
-    }
-    bail!("uid missing")
+    // SAFETY: getuid takes no arguments and returns the real UID on Unix.
+    Ok(unsafe { libc::getuid() })
 }
 
 fn create_protected_dir(directory: &Path) -> Result<()> {

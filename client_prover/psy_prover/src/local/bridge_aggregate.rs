@@ -377,7 +377,7 @@ impl ClaimClient {
         for (input, new_root) in &segments {
             let proof = segment.prove(input)?;
             anyhow::ensure!(proof.public_inputs.len() == REWARD_SEGMENT_STATEMENT_LEN, "reward segment statement width mismatch");
-            let read = |offset| QHashOut::from_values(proof.public_inputs[offset].to_canonical_u64(), proof.public_inputs[offset + 1].to_canonical_u64(), proof.public_inputs[offset + 2].to_canonical_u64(), proof.public_inputs[offset + 3].to_canonical_u64()).0;
+            let read = |offset: usize| QHashOut::<F>::from_values(proof.public_inputs[offset].to_canonical_u64(), proof.public_inputs[offset + 1].to_canonical_u64(), proof.public_inputs[offset + 2].to_canonical_u64(), proof.public_inputs[offset + 3].to_canonical_u64()).0;
             anyhow::ensure!(read(SEGMENT_OLD_NULLIFIER) == input.old_nullifier_root, "reward segment initial root mismatch");
             anyhow::ensure!(read(SEGMENT_NEW_NULLIFIER) == *new_root, "reward segment computed root mismatch");
             proofs.push(merge.prove(&RewardMergeWitness::Leaf { segment: proof })?);

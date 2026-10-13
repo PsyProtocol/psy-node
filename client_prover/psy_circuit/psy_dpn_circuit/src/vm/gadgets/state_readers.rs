@@ -1370,7 +1370,8 @@ impl StateReaderGadget {
             selected = builder.select(is_candidate, candidate, selected);
             matched = builder.or(matched, is_candidate);
         }
-        builder.connect(matched.target, builder.one());
+        let one = builder.one();
+        builder.connect(matched.target, one);
         selected
     }
 
@@ -1388,13 +1389,15 @@ impl StateReaderGadget {
         builder.range_check(physical_base, 32);
         builder.range_check(capacity, 32);
         let one = builder.one();
-        let capacity_positive = builder.is_less_than(32, builder.zero(), capacity);
+        let zero = builder.zero();
+        let capacity_positive = builder.is_less_than(32, zero, capacity);
         builder.connect(capacity_positive.target, one);
         let occupied = builder.add(physical_base, capacity);
         let mut tree_size = builder.one();
         for bits in 1..=32usize {
             tree_size = builder.add(tree_size, tree_size);
-            let is_height = builder.is_equal(height_bits, builder.constant(F::from_canonical_usize(bits)));
+            let constant = builder.constant(F::from_canonical_usize(bits));
+            let is_height = builder.is_equal(height_bits, constant);
             let within_tree = builder.is_less_than(33, occupied, tree_size);
             let accepted = builder.select(is_height, within_tree.target, one);
             builder.connect(accepted, one);
@@ -1428,7 +1431,8 @@ impl StateReaderGadget {
         let at_or_above_first = builder.is_less_than_or_equal(33, first_member, index);
         let at_or_below_last = builder.is_less_than_or_equal(33, index, last_member);
         let in_interval = builder.and(at_or_above_first, at_or_below_last);
-        builder.connect_if_true(condition, in_interval.target, builder._true().target);
+        let true_target = builder._true();
+        builder.connect_if_true(condition, in_interval.target, true_target.target);
     }
 
     /// Authenticate the sentinel at `B` and expose its allocated count.
@@ -1461,16 +1465,20 @@ impl StateReaderGadget {
         }
         builder.range_check(count, 32);
         let count_within_capacity = builder.is_less_than_or_equal(32, count, capacity);
-        builder.connect_if_true(active, count_within_capacity.target, builder._true().target);
+        let true_target = builder._true();
+        builder.connect_if_true(active, count_within_capacity.target, true_target.target);
 
-        let initialized = builder.and(active, builder.not(slot_is_zero));
+        let not_condition = builder.not(slot_is_zero);
+        let initialized = builder.and(active, not_condition);
         let virgin = builder.and(active, slot_is_zero);
         builder.connect_hashes_if_true(initialized, sentinel_hash, proof_value);
         Self::connect_leaf_zero_if_true(builder, virgin, sentinel);
 
-        let count_positive = builder.is_less_than(32, builder.zero(), count);
+        let zero = builder.zero();
+        let count_positive = builder.is_less_than(32, zero, count);
         builder.connect_if_true(initialized, count_positive.target, one);
-        let successor_present = builder.not(builder.is_zero_hash(sentinel.next_key));
+        let key_zero = builder.is_zero_hash(sentinel.next_key);
+        let successor_present = builder.not(key_zero);
         let successor_index_present = builder.is_not_zero(sentinel.next_index);
         let successor_linked = builder.and(successor_present, successor_index_present);
         builder.connect_if_true(initialized, successor_linked.target, one);
@@ -1488,8 +1496,10 @@ impl StateReaderGadget {
         active: BoolTarget,
         query_key: HashOutTarget,
     ) {
-        let query_nonzero = builder.not(builder.is_zero_hash(query_key));
-        builder.connect_if_true(active, query_nonzero.target, builder._true().target);
+        let key_zero = builder.is_zero_hash(query_key);
+        let query_nonzero = builder.not(key_zero);
+        let true_target = builder._true();
+        builder.connect_if_true(active, query_nonzero.target, true_target.target);
     }
 
 
@@ -1507,9 +1517,11 @@ impl StateReaderGadget {
         for limb in 0..4 {
             builder.connect_zero_if_true(sentinel_role, predecessor.key.elements[limb]);
         }
-        let member_role = builder.and(active, builder.not(at_sentinel));
+        let not_condition = builder.not(at_sentinel);
+        let member_role = builder.and(active, not_condition);
         Self::connect_index_in_open_interval(builder, member_role, predecessor_index, physical_base, count);
-        let member_key_nonzero = builder.not(builder.is_zero_hash(predecessor.key));
+        let key_zero = builder.is_zero_hash(predecessor.key);
+        let member_key_nonzero = builder.not(key_zero);
         builder.connect_if_true(member_role, member_key_nonzero.target, one.target);
         Self::connect_successor_pair(builder, active, predecessor.next_key, predecessor.next_index, physical_base, count);
     }
@@ -1529,7 +1541,8 @@ impl StateReaderGadget {
         let index_present = builder.not(index_absent);
         let both_present = builder.and(key_present, index_present);
         let paired = builder.or(both_absent, both_present);
-        builder.connect_if_true(active, paired.target, builder._true().target);
+        let true_target = builder._true();
+        builder.connect_if_true(active, paired.target, true_target.target);
         let present = builder.and(active, both_present);
         Self::connect_index_in_open_interval(builder, present, next_index, physical_base, count);
     }
@@ -2045,7 +2058,8 @@ impl StateReaderGadget {
                 let inserted_hash = inserted_leaf.hash::<H, F, D>(builder);
                 let room_for_insert = builder.is_less_than(32, starting_count, map_capacity);
                 builder.connect_if_true(condition_and_insert, room_for_insert.target, true_target.target);
-                let allocated_index = builder.add(builder.add(physical_base, starting_count), one);
+                let sum = builder.add(physical_base, starting_count);
+                let allocated_index = builder.add(sum, one);
                 builder.connect_hashes_if_true(condition_and_insert, predecessor_delta.old_root, self.end_contract_state_root);
                 builder.connect_hashes_if_true(condition_and_insert, predecessor_delta.new_root, member_delta.old_root);
                 builder.connect_hashes_if_true(condition_and_insert, member_delta.new_root, sentinel_delta.old_root);
@@ -2063,8 +2077,10 @@ impl StateReaderGadget {
 
                 let predecessor_is_sentinel = builder.is_equal(predecessor_delta.index, physical_base);
                 let sentinel_predecessor = builder.and(condition_and_insert, predecessor_is_sentinel);
-                let member_predecessor = builder.and(condition_and_insert, builder.not(predecessor_is_sentinel));
-                let initialized_insert = builder.and(condition_and_insert, builder.not(sentinel_virgin));
+                let not_condition = builder.not(predecessor_is_sentinel);
+                let member_predecessor = builder.and(condition_and_insert, not_condition);
+                let not_condition = builder.not(sentinel_virgin);
+                let initialized_insert = builder.and(condition_and_insert, not_condition);
                 let initialized_member_predecessor = builder.and(initialized_insert, member_predecessor);
                 builder.connect_hashes_if_true(initialized_member_predecessor, predecessor_old_hash, predecessor_delta.old_value);
                 builder.connect_hashes_if_true(sentinel_predecessor, predecessor_old.key, sentinel.key);
@@ -2140,7 +2156,8 @@ impl StateReaderGadget {
                 Self::connect_leaf_zero_if_true(builder, not_condition, &sentinel);
                 Self::connect_leaf_zero_if_true(builder, not_condition, &sentinel_old);
                 Self::connect_leaf_zero_if_true(builder, not_condition, &sentinel_new);
-                builder.connect_if_true(not_condition, is_insert.target, builder.zero());
+                let zero = builder.zero();
+                builder.connect_if_true(not_condition, is_insert.target, zero);
                 Self::connect_leaf_zero_if_true(builder, condition_and_update, &predecessor_old);
                 Self::connect_leaf_zero_if_true(builder, condition_and_update, &predecessor_new);
                 Self::connect_leaf_zero_if_true(builder, condition_and_update, &inserted_leaf);
@@ -2196,11 +2213,12 @@ impl StateReaderGadget {
                             dpn.resolve_target(c.key[3]),
                         ],
                     };
+                    let state_height = builder.constant(F::from_canonical_usize(self.contract_state_tree_height));
                     let (physical_base, map_capacity) = Self::verify_imt_map_bounds(
                         builder,
                         dpn.resolve_target(c.base_offset),
                         dpn.resolve_target(c.capacity),
-                        builder.constant(F::from_canonical_usize(self.contract_state_tree_height)),
+                        state_height,
                     );
                     let active = builder._true();
                     let (_virgin, count) = Self::constrain_authenticated_sentinel::<H, F, D>(
@@ -2267,11 +2285,12 @@ impl StateReaderGadget {
                             dpn.resolve_target(c.key[3]),
                         ],
                     };
+                    let state_height = builder.constant(F::from_canonical_usize(self.contract_state_tree_height));
                     let (physical_base, map_capacity) = Self::verify_imt_map_bounds(
                         builder,
                         dpn.resolve_target(c.base_offset),
                         dpn.resolve_target(c.capacity),
-                        builder.constant(F::from_canonical_usize(self.contract_state_tree_height)),
+                        state_height,
                     );
                     let active = builder._true();
                     let (virgin, count) = Self::constrain_authenticated_sentinel::<H, F, D>(
@@ -2295,8 +2314,10 @@ impl StateReaderGadget {
                     builder.connect_hashes(mp.root, end_contract_state_root);
                     builder.connect_hashes_if_true(membership, leaf_hash, mp.value);
                     builder.connect_hashes_if_true(initialized_absence, leaf_hash, mp.value);
-                    builder.connect_hashes_if_true(virgin_absence, mp.value, builder.constant_hash(HashOut::ZERO));
-                    builder.connect_if_true(membership, key_eq.target, builder._true().target);
+                    let zero_hash = builder.constant_hash(HashOut::ZERO);
+                    builder.connect_hashes_if_true(virgin_absence, mp.value, zero_hash);
+                    let true_target = builder._true();
+                    builder.connect_if_true(membership, key_eq.target, true_target.target);
                     builder.connect_if_true(virgin_absence, mp.index, physical_base);
                     Self::connect_query_nonzero(builder, active, query_key);
                     Self::connect_index_in_open_interval(
@@ -2327,8 +2348,10 @@ impl StateReaderGadget {
                     let query_before_successor = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
                     let successor_gap = builder.or(successor_absent, query_before_successor);
                     let strict_absence = builder.and(predecessor_before_query, successor_gap);
-                    builder.connect_if_true(initialized_absence, strict_absence.target, builder._true().target);
-                    builder.connect_if_true(virgin, exists.target, builder.zero());
+                    let true_target = builder._true();
+                    builder.connect_if_true(initialized_absence, strict_absence.target, true_target.target);
+                    let zero = builder.zero();
+                    builder.connect_if_true(virgin, exists.target, zero);
                     self.insert_imt_contains_gadget(ck, mp, leaf, exists.target, sentinel, sentinel_proof);
                     let result = vec![exists.target];
                     self.result_map.insert(ck, result.clone());
@@ -2347,7 +2370,8 @@ impl StateReaderGadget {
                         builder.connect_hashes(mp_uct.root, uct_root);
                         let contract_id_target = dpn.resolve_target(c.contract_id);
                         builder.connect(mp_uct.index, contract_id_target);
-                        self.result_map.insert(read_root_ck, mp_uct.value.elements.to_vec());
+                        let result = mp_uct.value.elements.to_vec();
+                        self.result_map.insert(read_root_ck, result);
                     }
                     expected_contract_state_tree_root
                 };
@@ -2520,8 +2544,10 @@ impl StateReaderGadget {
                     builder.connect_hashes(state_slot_proof.root, expected_contract_state_tree_root);
                     builder.connect_hashes_if_true(exists, leaf_hash, state_slot_proof.value);
                     builder.connect_hashes_if_true(initialized_absence, leaf_hash, state_slot_proof.value);
-                    builder.connect_hashes_if_true(virgin_absence, state_slot_proof.value, builder.constant_hash(HashOut::ZERO));
-                    builder.connect_if_true(exists, key_eq.target, builder._true().target);
+                    let zero_hash = builder.constant_hash(HashOut::ZERO);
+                    builder.connect_hashes_if_true(virgin_absence, state_slot_proof.value, zero_hash);
+                    let true_target = builder._true();
+                    builder.connect_if_true(exists, key_eq.target, true_target.target);
                     builder.connect_if_true(virgin_absence, state_slot_proof.index, physical_base);
                     Self::connect_query_nonzero(builder, active, query_key);
                     Self::connect_index_in_open_interval(builder, exists, state_slot_proof.index, physical_base, count);
@@ -2539,8 +2565,10 @@ impl StateReaderGadget {
                     let query_before_successor = is_qhashout_lt::<F, D>(builder, query_key, leaf.next_key);
                     let successor_gap = builder.or(successor_absent, query_before_successor);
                     let strict_absence = builder.and(predecessor_before_query, successor_gap);
-                    builder.connect_if_true(initialized_absence, strict_absence.target, builder._true().target);
-                    builder.connect_if_true(virgin, exists.target, builder.zero());
+                    let true_target = builder._true();
+                    builder.connect_if_true(initialized_absence, strict_absence.target, true_target.target);
+                    let zero = builder.zero();
+                    builder.connect_if_true(virgin, exists.target, zero);
                     self.insert_imt_contains_other_user_gadget(
                         imt_ck,
                         IMTContainsOtherUserGadget {

@@ -164,7 +164,7 @@ fn recipient_limbs(recipient: &[u8; 20]) -> [u32; 8] {
 }
 
 fn reward_claim_identity(config_hash: &[u8; 32], record: &[u8], anchor: &[u8], proof: &[u8]) -> String {
-    digest(&[&domain_hash(Domain::LeafCommit), config_hash, &word(3), record, &alloy_primitives::keccak256([anchor, proof].concat())])
+    digest(&[&domain_hash(Domain::LeafCommit), config_hash, &word(3), record, alloy_primitives::keccak256([anchor, proof].concat()).as_slice()])
 }
 
 

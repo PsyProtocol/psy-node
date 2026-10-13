@@ -86,6 +86,7 @@ shadow-rs = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
+libc = { workspace = true }
 serde_cbor = { workspace = true }
 zstd = { workspace = true }
 

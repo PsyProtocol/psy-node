@@ -1252,10 +1252,10 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
     ensure!(proofs.iter().all(|proof| hash_out(&proof.public_inputs[4..8]).ok() == Some(end_user_root) && hash_out(&proof.public_inputs[8..12]).ok() == Some(end_gcon)), "selected finalizations disagree on global roots");
     let admitted = selected_withdrawal_records(&selected_claims, directory, circuits, a.end_checkpoint_id, end_checkpoint_root, end_user_root, end_gcon)?;
     let withdrawals = openable_withdrawal_records(provider, circuits, a.end_checkpoint_id, &admitted).await?;
-    let chains = a.starts.iter().zip(&a.deposits).map(|(start, transition)| psy_client_data::bridge_aggregate::BridgeChainRow {
+    let chains = a.starts.iter().zip(&a.deposits).map(|(start, transition)| Ok(psy_client_data::bridge_aggregate::BridgeChainRow {
         chain_index: start.chain_index, start_checkpoint_id: u32::try_from(start.start_checkpoint_id)?, start_checkpoint_root: start.start_checkpoint_root,
         old_deposit_root: transition.old_root, new_deposit_root: transition.new_root, old_count: transition.old_count, new_count: transition.new_count,
-    }).collect::<Vec<_>>();
+    })).collect::<anyhow::Result<Vec<_>>>()?;
     let opening = psy_client_data::bridge_aggregate::BridgeOpening {
         config_hash: a.config_hash, end_checkpoint_id: u32::try_from(a.end_checkpoint_id)?, end_checkpoint_root, end_user_root,
         chains, deposits: a.deposit_leaves.clone(), withdrawals, rewards,
@@ -1265,7 +1265,7 @@ async fn collect_aggregate_claims(config: &BridgeProposeDaemonConfig, chains: &[
     let predecessor = state.accepted_deposit_endpoints.get(&hex::encode(a.config_hash)).cloned();
     let (predecessor, successor_reference) = save_opening_deposit_prefixes(config, network, directory, predecessor.as_ref(), &a).await?;
     let frozen_claims = selected_claims.iter().filter(|claim| claim.kind == 2).chain(selected_claims.iter().filter(|claim| claim.kind == 3)).cloned().collect::<Vec<_>>();
-    let selected_ids = withdrawals.iter().map(|record| aggregate_claim_id(a.config_hash, 2, &record.encode().map_err(|error| anyhow::anyhow!("withdrawal record: {error:?}"))?)).chain(rewards.iter().map(|record| {
+    let selected_ids = opening.withdrawals.iter().map(|record| Ok(aggregate_claim_id(a.config_hash, 2, &record.encode().map_err(|error| anyhow::anyhow!("withdrawal record: {error:?}"))?))).chain(opening.rewards.iter().map(|record| {
         let claim = frozen_claims.iter().find(|claim| claim.kind == 3 && aggregate_bytes(&claim.record).ok().as_deref() == record.encode().ok().as_deref()).context("selected reward proof missing")?;
         Ok(reward_claim_id(a.config_hash, &aggregate_bytes(&claim.record)?, &load_aggregate_file(directory, claim.proof.as_ref().context("reward proof absent")?)?))
     })).collect::<anyhow::Result<Vec<_>>>()?;
