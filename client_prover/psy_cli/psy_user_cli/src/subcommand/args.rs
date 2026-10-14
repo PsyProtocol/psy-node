@@ -1,4 +1,4 @@
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use plonky2::field::goldilocks_field::GoldilocksField;
 pub use psy_client_common::args::WalletSourceArgs;
 use psy_client_common::{args::SignType, data::qhashout::QHashOut};
@@ -60,6 +60,81 @@ pub enum WalletCommands {
         #[arg(long)]
         definition: String,
     },
+    /// Generate a starter composed SD key policy file
+    SdKeyPolicyTemplate {
+        #[arg(long)]
+        kind: SdKeyPolicyTemplateKindArg,
+        #[arg(long)]
+        contract: u64,
+        /// Numeric method ids or on-chain function names.
+        #[arg(long, value_delimiter = ',')]
+        methods: Vec<String>,
+        /// Calldata word the spending-limit kind bounds.
+        #[arg(long)]
+        word: Option<u32>,
+        /// Per-transaction bound for the spending-limit kind.
+        #[arg(long)]
+        max_per_tx: Option<u64>,
+        /// Session-wide bound for the spending-limit kind.
+        #[arg(long)]
+        max_total: Option<u64>,
+        #[arg(long)]
+        min_tx_count: Option<u64>,
+        #[arg(long)]
+        max_tx_count: Option<u64>,
+        #[arg(long)]
+        output: Option<String>,
+        /// RPC config path, required to resolve method names in --methods.
+        #[arg(long)]
+        rpc_config: Option<String>,
+    },
+    /// Simulate transactions against a policy file before registering the key
+    SdKeyPolicyCheck {
+        #[arg(long)]
+        definition: String,
+        /// `CONTRACT:METHOD[:WORD0,WORD1,...]`; METHOD is a numeric id or an
+        /// on-chain function name.
+        #[arg(long, value_name = "CONTRACT:METHOD[:WORD0,WORD1,...]")]
+        call: Vec<String>,
+        /// RPC config path, required to resolve method names in --call.
+        #[arg(long)]
+        rpc_config: Option<String>,
+    },
+    /// Print what a policy file authorizes, in words
+    SdKeyPolicyDescribe {
+        #[arg(long)]
+        definition: String,
+        /// Contracts whose code definitions annotate method ids with names.
+        #[arg(long, value_delimiter = ',')]
+        contract: Vec<u64>,
+        /// RPC config path, required to annotate method names.
+        #[arg(long)]
+        rpc_config: Option<String>,
+    },
+    /// Resolve method names in a policy file to numeric ids, emitting the
+    /// canonical policy to register and prove with
+    SdKeyPolicyResolve {
+        #[arg(long)]
+        definition: String,
+        /// Contract context for method names not scoped by a Contract rule.
+        #[arg(long)]
+        contract: Option<u64>,
+        /// RPC config path, required when the policy contains method names.
+        #[arg(long)]
+        rpc_config: Option<String>,
+        #[arg(long)]
+        output: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum SdKeyPolicyTemplateKindArg {
+    /// Fixed allowlist of contract and method pairs
+    AllowMethod,
+    /// Allowlist plus per-call and session bounds on one calldata word
+    SpendingLimit,
+    /// The methods must appear in the given order
+    Sequence,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]

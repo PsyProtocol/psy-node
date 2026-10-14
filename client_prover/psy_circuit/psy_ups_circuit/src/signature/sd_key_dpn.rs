@@ -1952,6 +1952,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composed_policy_checks_input_on_every_matching_contract_method_call() {
+        use psy_vm::ups::sd_key::{build_composed_sd_key_policy, SDKeyCallRule as Rule, SDKeyComparison};
+
+        let rule = Rule::All(vec![
+            Rule::Contract(5),
+            Rule::Method(10),
+            Rule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 },
+        ]);
+        let (definition, config) = build_composed_sd_key_policy(&rule, &[], 1, 3).unwrap();
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap();
+        let prove = |calls: &[(u64, u32, Vec<u64>)]| {
+            let pairs = calls.iter().map(|(contract, method, inputs)| make_tx_info(*contract, *method, inputs)).collect::<Vec<_>>();
+            let infos = pairs.iter().map(|(info, _)| *info).collect();
+            let inputs = pairs.into_iter().map(|(_, input)| input).collect();
+            build_witness(infos, inputs, 3)
+        };
+
+        // Each matching call independently satisfies the input bound.
+        let valid = prove(&[(5, 10, vec![40]), (5, 10, vec![100]), (5, 10, vec![0])]);
+        gadget.prove(dummy_private_key(), &valid, witness_sighash(&valid)).await.unwrap();
+
+        // A later matching call cannot evade the rule after an earlier valid call.
+        let invalid_input = prove(&[(5, 10, vec![40]), (5, 10, vec![101])]);
+        assert!(gadget.prove(dummy_private_key(), &invalid_input, witness_sighash(&invalid_input)).await.is_err());
+
+        // Contract and method are part of the same per-transaction rule.
+        let wrong_contract = prove(&[(6, 10, vec![40])]);
+        assert!(gadget.prove(dummy_private_key(), &wrong_contract, witness_sighash(&wrong_contract)).await.is_err());
+        let wrong_method = prove(&[(5, 11, vec![40])]);
+        assert!(gadget.prove(dummy_private_key(), &wrong_method, witness_sighash(&wrong_method)).await.is_err());
+    }
+
+    #[tokio::test]
     async fn allow_caller_and_method_range_rejects_direct_transfer() {
         let (definition, config) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
             &[DEFAULT_CALLER_CONTRACT_ID_U64, 5, DEFAULT_CALLER_CONTRACT_ID_U64],

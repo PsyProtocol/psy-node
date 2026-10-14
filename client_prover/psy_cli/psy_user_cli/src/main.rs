@@ -166,6 +166,10 @@ fn command_paths(cli: &Cli) -> Vec<&str> {
             WalletCommands::Load { wallet } | WalletCommands::Info { wallet } => push_wallet_paths(&mut paths, wallet),
             WalletCommands::List { keystore_dir } => paths.extend(keystore_dir.as_deref()),
             WalletCommands::SdKeyPolicyFingerprint { definition } => paths.push(definition),
+            WalletCommands::SdKeyPolicyTemplate { output, rpc_config, .. } => { paths.extend(output.as_deref()); paths.extend(rpc_config.as_deref()); }
+            WalletCommands::SdKeyPolicyCheck { definition, rpc_config, .. } => { paths.push(definition); paths.extend(rpc_config.as_deref()); }
+            WalletCommands::SdKeyPolicyDescribe { definition, rpc_config, .. } => { paths.push(definition); paths.extend(rpc_config.as_deref()); }
+            WalletCommands::SdKeyPolicyResolve { definition, rpc_config, output, .. } => { paths.push(definition); paths.extend(rpc_config.as_deref()); paths.extend(output.as_deref()); }
             WalletCommands::Random { .. } | WalletCommands::SdKeyFingerprint { .. } => {}
         },
         Commands::RegisterUser(args) => push_wallet_paths(&mut paths, &args.wallet),
