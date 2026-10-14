@@ -1,0 +1,6 @@
+ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE}
+COPY --chown=10001:10001 app /app
+WORKDIR /app
+USER 10001:10001
+# ENTRYPOINT is generated per image as an exec-form array by build.py.

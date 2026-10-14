@@ -1,0 +1,7 @@
+ARG RUNTIME_BASE
+FROM ${RUNTIME_BASE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 libgcc-s1 libstdc++6 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+USER 10001:10001

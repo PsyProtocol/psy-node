@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "scope": "isolated-local-kubernetes-build-candidate",
+  "deployment_base": "1ba693d72bc2eba846e26c919d08c224c21ce4df",
+  "deployment_authorized": false,
+  "stage": "localhost",
+  "sources": {
+    "node": {
+      "repository": "PsyProtocol/psy-node",
+      "commit": "e46df92dfd7a5954a74f275651caafad1a6d5fc6",
+      "lock_sha256": "4e7dc8d056fc68a4a2428df920893e2241038d8719ef80773a0d39ef4bccf565",
+      "basis": "Published release/testnet-stable candidate for a NEW isolated lab; not the live component map"
+    },
+    "services": {
+      "repository": "PsyProtocol/psy-services",
+      "commit": "f4d6ee8a4f55a69586e4ed8d5a3f0a9bc4422ded",
+      "lock_sha256": "7ec7cbe043e88d198ee20ab711bfa4b01d1d3d5d5cbf155c61ea9919a7115bd8",
+      "basis": "Preserve the API response deadline fix; do not implicitly rebuild Indexer at this revision"
+    },
+    "indexer": {
+      "repository": "PsyProtocol/psy-services",
+      "commit": "7c1e1f61673949bb7343529d4dd51d66f631d236",
+      "lock_sha256": "da415d0138ad2a4da93aa1805b3d4dfcf5b4fe15b839309d94c27fe6a14c828e",
+      "basis": "Keep a separately pinned Indexer source"
+    },
+    "genesis": {
+      "repository": "PsyProtocol/psy-genesis",
+      "commit": "cb3ea4a1e743c3c01037ae968e10f27389788a7d",
+      "config_sha256": "4737cc8dfff772235fcb5575aa60dd57e3c7d7fcdf056fbed2ab2827fe9ff2c7",
+      "contracts_sha256": "66e9687c21b4317d549eabe6b78cbf8ab4016c26b9a9311ad5bb4816701dedc2"
+    }
+  },
+  "toolchain": {
+    "rust": "nightly-2025-09-20",
+    "rust_version_prefix": "rustc 1.92.0-nightly",
+    "go": "1.22.3",
+    "go_archive_sha256": "8920ea521bad8f6b7bc377b4824982e011c19af27df88a815e3586ea895f1b36",
+    "target": "x86_64-unknown-linux-gnu",
+    "rustflags": "-C target-cpu=x86-64",
+    "goamd64": "v1",
+    "max_glibc": "2.36",
+    "builder_base": "rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97",
+    "runtime_base": "debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
+  },
+  "build_limits": {"jobs": 4, "cpus": 6, "memory": "16g", "minimum_free_gib": 80},
+  "components": {
+    "node": {"source": "node", "binary": "psy_node_cli", "image": "psy-node"},
+    "worker": {"source": "node", "binary": "psy_worker_cli", "image": "psy-worker"},
+    "user-cli": {"source": "node", "binary": "psy_user_cli", "image": "psy-user-cli"},
+    "relayer": {"source": "node", "binary": "psy_relayer_cli", "image": "psy-relayer"},
+    "services": {"source": "services", "binary": "psy-services", "image": "psy-services"},
+    "indexer": {"source": "indexer", "binary": "psy-indexer", "image": "psy-indexer"}
+  },
+  "remaining_images": {
+    "psy-envio": {"status": "input-freeze-required", "reason": "Envio 2.32.10 subtree has no committed pnpm lock; generated code and deployed RPC/history patches require a reviewed source input"},
+    "psy-frontend": {"status": "lab-config-required", "reason": "Freeze the DApp/SDK cohort and the new lab endpoints/deployed-contract configuration before compiling static assets"},
+    "psy-admission": {"status": "source-attestation-required", "reason": "Existing Realm1 gateway source must be archived/pinned and Coordinator/Realm0 method policy verified"}
+  },
+  "platform_candidates": {
+    "verified_date_utc": "2026-10-14",
+    "k3s": "v1.35.9+k3s1",
+    "metallb_chart": "0.16.1",
+    "kube_vip": "v1.2.4",
+    "traefik": "v3.7.14",
+    "kube_prometheus_stack_chart": "92.3.1",
+    "prometheus_operator": "v0.94.1",
+    "status": "Published candidates; chart rendering, K3s endpoint configuration and interoperability are not yet verified"
+  },
+  "dependency_images": {
+    "postgres": "postgres@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5",
+    "scylla": "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc",
+    "valkey": "valkey/valkey@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d",
+    "nats": "nats@sha256:c991221cdddd53a24893cd18a90faf7a42396108496aed076bb982a349e76484",
+    "nostr": "scsibug/nostr-rs-relay@sha256:48d54c2d2781577cf3ed2951112f0953dc2c5e7c9d2ea20c64e8c0fa37d16e4d",
+    "hasura": "hasura/graphql-engine@sha256:13bb9088f5b011b15af117fd1b175360f5205946bee1a78d9e0c846e5a38551c"
+  }
+}
