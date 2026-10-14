@@ -6976,7 +6976,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "plonky2"
 version = "1.1.0"
-source = "git+https://github.com/PsyProtocol//plonky2-hwa?rev=736572e9dd3ca93566471cf5a2a1cb67a13fe01d#736572e9dd3ca93566471cf5a2a1cb67a13fe01d"
+source = "git+https://www.github.com/PsyProtocol/plonky2-hwa?rev=736572e9dd3ca93566471cf5a2a1cb67a13fe01d#736572e9dd3ca93566471cf5a2a1cb67a13fe01d"
 dependencies = [
  "ahash",
  "anyhow",
@@ -7004,7 +7004,7 @@ dependencies = [
 [[package]]
 name = "plonky2_field"
 version = "1.0.0"
-source = "git+https://github.com/PsyProtocol//plonky2-hwa?rev=736572e9dd3ca93566471cf5a2a1cb67a13fe01d#736572e9dd3ca93566471cf5a2a1cb67a13fe01d"
+source = "git+https://www.github.com/PsyProtocol/plonky2-hwa?rev=736572e9dd3ca93566471cf5a2a1cb67a13fe01d#736572e9dd3ca93566471cf5a2a1cb67a13fe01d"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -7023,7 +7023,7 @@ dependencies = [
 [[package]]
 name = "plonky2_maybe_rayon"
 version = "1.0.0"
-source = "git+https://github.com/PsyProtocol//plonky2-hwa?rev=736572e9dd3ca93566471cf5a2a1cb67a13fe01d#736572e9dd3ca93566471cf5a2a1cb67a13fe01d"
+source = "git+https://www.github.com/PsyProtocol/plonky2-hwa?rev=736572e9dd3ca93566471cf5a2a1cb67a13fe01d#736572e9dd3ca93566471cf5a2a1cb67a13fe01d"
 dependencies = [
  "rayon",
 ]
@@ -7031,7 +7031,7 @@ dependencies = [
 [[package]]
 name = "plonky2_util"
 version = "1.0.0"
-source = "git+https://github.com/PsyProtocol//plonky2-hwa?rev=736572e9dd3ca93566471cf5a2a1cb67a13fe01d#736572e9dd3ca93566471cf5a2a1cb67a13fe01d"
+source = "git+https://www.github.com/PsyProtocol/plonky2-hwa?rev=736572e9dd3ca93566471cf5a2a1cb67a13fe01d#736572e9dd3ca93566471cf5a2a1cb67a13fe01d"
 
 [[package]]
 name = "plonky2x"
