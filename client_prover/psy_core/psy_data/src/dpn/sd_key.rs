@@ -135,6 +135,7 @@ pub enum SDKeyCallRule {
     Method(u32),
     Caller(u64),
     Input { word: u32, comparison: SDKeyComparison, value: u64 },
+    Not(Box<SDKeyCallRule>),
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
@@ -173,6 +174,7 @@ impl SDKeyCallRule {
                     child.validate()?;
                 }
             }
+            Self::Not(child) => child.validate()?,
             Self::Input { word, value, .. } => {
                 anyhow::ensure!(*word < SDKEY_MAX_CALLDATA_WORDS, "SD key input word {} exceeds calldata capacity", word);
                 anyhow::ensure!(*value < GoldilocksField::ORDER, "SD key input comparison value must be a canonical field value");
@@ -282,6 +284,7 @@ impl SDKeyComposedPolicy {
         match rule {
             SDKeyCallRule::All(children) => children.iter().all(|child| Self::rule_matches(child, info, words)),
             SDKeyCallRule::Any(children) => children.iter().any(|child| Self::rule_matches(child, info, words)),
+            SDKeyCallRule::Not(child) => !Self::rule_matches(child, info, words),
             SDKeyCallRule::Contract(id) => info.contract_id.to_canonical_u64() == *id,
             SDKeyCallRule::Method(id) => info.method_id.to_canonical_u64() == *id as u64,
             SDKeyCallRule::Caller(id) => info.caller_contract_id.to_canonical_u64() == *id,
@@ -474,5 +477,38 @@ mod composed_policy_tests {
         };
         let trailing = pairs(&[(5, 10, &[0]), (5, 20, &[0]), (5, 30, &[0])]);
         policy.check_transaction_infos(&trailing.0, &trailing.1).unwrap();
+    }
+
+    #[test]
+    fn not_composes_with_any_to_express_conditional_input_rules() {
+        let conditional = |contract, method, word, value| {
+            SDKeyCallRule::Any(vec![
+                SDKeyCallRule::Not(Box::new(SDKeyCallRule::All(vec![
+                    SDKeyCallRule::Contract(contract),
+                    SDKeyCallRule::Method(method),
+                ]))),
+                SDKeyCallRule::Input { word, comparison: SDKeyComparison::Lte, value },
+            ])
+        };
+        let policy = SDKeyComposedPolicy {
+            per_transaction: SDKeyCallRule::All(vec![
+                conditional(5, 10, 0, 100),
+                conditional(8, 20, 1, 7),
+            ]),
+            ordered: vec![],
+            totals: vec![],
+        };
+
+        let valid = pairs(&[(5, 10, &[100]), (8, 20, &[0, 7]), (12, 30, &[999])]);
+        policy.check_transaction_infos(&valid.0, &valid.1).unwrap();
+
+        let bad_first = pairs(&[(5, 10, &[101])]);
+        assert!(policy.check_transaction_infos(&bad_first.0, &bad_first.1).is_err());
+        let bad_second = pairs(&[(8, 20, &[0, 8])]);
+        assert!(policy.check_transaction_infos(&bad_second.0, &bad_second.1).is_err());
+        // An absent input makes the Input leaf false, so its conditional is
+        // rejected when the contract and method match.
+        let missing = pairs(&[(5, 10, &[])]);
+        assert!(policy.check_transaction_infos(&missing.0, &missing.1).is_err());
     }
 }

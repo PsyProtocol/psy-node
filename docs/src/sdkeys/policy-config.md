@@ -22,7 +22,42 @@ Save a JSON file such as `sd-key-policy.json`:
 first transactions in order; it cannot contain more entries than
 `min_tx_count`. `All` and `Any` can contain nested rules. Available leaf rules
 are `Contract`, `Method`, `Caller`, and `Input`. `Input.comparison` accepts
-`Eq`, `Lt`, `Lte`, `Gt`, or `Gte`.
+`Eq`, `Lt`, `Lte`, `Gt`, or `Gte`. `Not` negates one nested rule. A missing
+calldata word makes an `Input` rule false, so `Not(Input(...))` is true when
+that word is absent.
+
+Use `Not` with `Any` to make a rule conditional. This example constrains input
+for calls to `(5, 10)` and `(8, 20)` while leaving other contract/method pairs
+unconstrained by these conditions:
+
+```json
+{
+  "per_transaction": {
+    "All": [
+      {
+        "Any": [
+          { "Not": { "All": [{ "Contract": 5 }, { "Method": 10 }] } },
+          { "Input": { "word": 0, "comparison": "Lte", "value": 100 } }
+        ]
+      },
+      {
+        "Any": [
+          { "Not": { "All": [{ "Contract": 8 }, { "Method": 20 }] } },
+          { "Input": { "word": 1, "comparison": "Eq", "value": 7 } }
+        ]
+      }
+    ]
+  },
+  "ordered": [],
+  "totals": [],
+  "min_tx_count": 1,
+  "max_tx_count": 10
+}
+```
+
+This expresses each implication as `Not(condition) or input_rule`. Matching
+the contract and method therefore requires the input rule to pass. A missing
+required input word fails that implication.
 
 `totals` sums the selected calldata word across the actual transactions. It
 does not read an ABI or know that a word is an amount. Confirm that every

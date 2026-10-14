@@ -144,6 +144,23 @@ mod policy_tests {
     }
 
     #[test]
+    fn composed_json_parses_not_for_conditional_input_rules() {
+        let json = r#"{
+            "per_transaction": {"Any": [
+                {"Not": {"All": [{"Contract": 5}, {"Method": 10}]}},
+                {"Input": {"word": 0, "comparison": "Lte", "value": 100}}
+            ]},
+            "ordered": [],
+            "totals": [],
+            "min_tx_count": 1,
+            "max_tx_count": 3
+        }"#;
+        let (_, config) = parse_sd_key_dpn_definition_json(json, "conditional.json").unwrap();
+        let rule = config.transaction_count_policy.unwrap().composed.unwrap().per_transaction;
+        assert!(matches!(rule, SDKeyCallRule::Any(children) if matches!(children.first(), Some(SDKeyCallRule::Not(_)))));
+    }
+
+    #[test]
     fn templates_round_trip_through_the_loader() {
         for (kind, ordered_len, totals_len) in [
             (SdKeyPolicyTemplateKind::AllowMethod, 0, 0),
@@ -264,6 +281,19 @@ mod policy_tests {
         super::visit_method_names(&mut numeric, None, &mut |_, _| visits += 1);
         assert_eq!(visits, 0);
         assert_eq!(numeric["All"][1]["Method"], serde_json::json!(10));
+
+        // Not forwards the inherited context, and an All group inside Not
+        // supplies its own contract context to nested method names.
+        let mut negated = json!({
+            "Not": {"All": [{"Contract": 9}, {"Method": "transfer"}]}
+        });
+        let mut resolved = Vec::new();
+        super::visit_method_names(&mut negated, None, &mut |context, method| {
+            resolved.push((context, method.as_str().unwrap_or_default().to_string()));
+            *method = serde_json::Value::from(77u32);
+        });
+        assert_eq!(resolved, vec![(Some(9), "transfer".to_string())]);
+        assert_eq!(negated["Not"]["All"][1]["Method"], serde_json::json!(77));
     }
 }
 
@@ -493,7 +523,8 @@ pub async fn method_name_map(rpc_config: Option<&str>, contracts: &[u64]) -> Res
 
 /// Walk a policy-file rule tree, invoking `visit` for every `Method` entry
 /// written as a string. A `Contract` leaf among the direct children of an
-/// `All` group scopes the names inside that group; `Any` groups do not scope.
+/// `All` group scopes the names inside that group; `Any` and `Not` forward the
+/// current context to their children.
 fn visit_method_names(rule: &mut serde_json::Value, context: Option<u64>, visit: &mut impl FnMut(Option<u64>, &mut serde_json::Value)) {
     let Some(map) = rule.as_object_mut() else { return };
     if map.len() != 1 {
@@ -510,6 +541,10 @@ fn visit_method_names(rule: &mut serde_json::Value, context: Option<u64>, visit:
         for child in children {
             visit_method_names(child, context, visit);
         }
+        return;
+    }
+    if let Some(child) = map.get_mut("Not") {
+        visit_method_names(child, context, visit);
         return;
     }
     if let Some(method) = map.get_mut("Method") {
@@ -667,6 +702,7 @@ fn describe_call_rule(rule: &SDKeyCallRule, names: Option<&std::collections::Has
     match rule {
         SDKeyCallRule::All(children) => children.iter().map(|child| wrap_call_rule(child, names)).collect::<Vec<_>>().join(" and "),
         SDKeyCallRule::Any(children) => children.iter().map(|child| wrap_call_rule(child, names)).collect::<Vec<_>>().join(" or "),
+        SDKeyCallRule::Not(child) => format!("not ({})", describe_call_rule(child, names)),
         SDKeyCallRule::Contract(id) => format!("call contract {id}"),
         SDKeyCallRule::Method(id) => format!("method {}", method_label(*id, names)),
         SDKeyCallRule::Caller(id) => format!("called by contract {id}"),
@@ -685,7 +721,7 @@ fn describe_call_rule(rule: &SDKeyCallRule, names: Option<&std::collections::Has
 
 fn wrap_call_rule(child: &SDKeyCallRule, names: Option<&std::collections::HashMap<u32, String>>) -> String {
     match child {
-        SDKeyCallRule::All(_) | SDKeyCallRule::Any(_) => format!("({})", describe_call_rule(child, names)),
+        SDKeyCallRule::All(_) | SDKeyCallRule::Any(_) | SDKeyCallRule::Not(_) => format!("({})", describe_call_rule(child, names)),
         _ => describe_call_rule(child, names),
     }
 }

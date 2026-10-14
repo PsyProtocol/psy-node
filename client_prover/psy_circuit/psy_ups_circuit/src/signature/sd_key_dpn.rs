@@ -454,6 +454,10 @@ impl SDKeyDpnCircuitGadget {
                 for child in children { let value = Self::constrain_call_rule(builder, slot, child); result = builder.or(result, value); }
                 result
             }
+            SDKeyCallRule::Not(child) => {
+                let value = Self::constrain_call_rule(builder, slot, child);
+                builder.not(value)
+            }
             SDKeyCallRule::Contract(id) => {
                 let id = builder.constant(GF::from_canonical_u64(*id));
                 builder.is_equal(slot.contract_id, id)
@@ -1982,6 +1986,37 @@ mod tests {
         assert!(gadget.prove(dummy_private_key(), &wrong_contract, witness_sighash(&wrong_contract)).await.is_err());
         let wrong_method = prove(&[(5, 11, vec![40])]);
         assert!(gadget.prove(dummy_private_key(), &wrong_method, witness_sighash(&wrong_method)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn composed_policy_not_allows_other_calls_but_conditions_matching_inputs() {
+        use psy_vm::ups::sd_key::{build_composed_sd_key_policy, SDKeyCallRule as Rule, SDKeyComparison};
+
+        let only_when = |contract, method, word, value| {
+            Rule::Any(vec![
+                Rule::Not(Box::new(Rule::All(vec![Rule::Contract(contract), Rule::Method(method)]))),
+                Rule::Input { word, comparison: SDKeyComparison::Lte, value },
+            ])
+        };
+        let per_transaction = Rule::All(vec![only_when(5, 10, 0, 100), only_when(8, 20, 1, 7)]);
+        let (definition, config) = build_composed_sd_key_policy(&per_transaction, &[], 1, 3).unwrap();
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap();
+        let prove = |calls: &[(u64, u32, Vec<u64>)]| {
+            let pairs = calls.iter().map(|(contract, method, inputs)| make_tx_info(*contract, *method, inputs)).collect::<Vec<_>>();
+            let infos = pairs.iter().map(|(info, _)| *info).collect();
+            let inputs = pairs.into_iter().map(|(_, input)| input).collect();
+            build_witness(infos, inputs, 3)
+        };
+
+        let allowed = prove(&[(5, 10, vec![100]), (8, 20, vec![0, 7]), (12, 30, vec![999])]);
+        gadget.prove(dummy_private_key(), &allowed, witness_sighash(&allowed)).await.unwrap();
+
+        let violates_first = prove(&[(5, 10, vec![101])]);
+        assert!(gadget.prove(dummy_private_key(), &violates_first, witness_sighash(&violates_first)).await.is_err());
+        let violates_second = prove(&[(8, 20, vec![0, 8])]);
+        assert!(gadget.prove(dummy_private_key(), &violates_second, witness_sighash(&violates_second)).await.is_err());
+        let missing_word = prove(&[(5, 10, vec![])]);
+        assert!(gadget.prove(dummy_private_key(), &missing_word, witness_sighash(&missing_word)).await.is_err());
     }
 
     #[tokio::test]
