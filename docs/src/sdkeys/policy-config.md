@@ -110,7 +110,9 @@ the prover performs before proving, plus the transaction count range.
 Method may be a numeric id or an on-chain function name; names require
 `--rpc-config` and are resolved from the contract's code definition,
 while numeric ids keep the check fully offline. The simulated caller is
-the default caller contract (0), matching user-initiated transactions.
+the default caller contract (`0x100000000`), matching user-initiated
+transactions; a `Caller` rule therefore tells direct calls apart from
+cross-contract calls in the check exactly as it does in the circuit.
 `--methods` on the template command accepts names the same way.
 
 Inspect what a key authorizes, in words:

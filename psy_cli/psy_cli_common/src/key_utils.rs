@@ -223,6 +223,25 @@ mod policy_tests {
     }
 
     #[test]
+    fn policy_check_simulates_the_default_caller_for_user_initiated_calls() {
+        let default_caller = psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64;
+        let json = format!(
+            r#"{{
+            "per_transaction": {{"All": [{{"Contract": 7}}, {{"Method": 10}}, {{"Caller": {default_caller}}}]}},
+            "ordered": [],
+            "totals": [],
+            "min_tx_count": 1,
+            "max_tx_count": 2
+        }}"#
+        );
+        let calls = vec![PolicySimCall { contract_id: 7, method_id: 10, inputs: vec![0] }];
+        check_sd_key_policy_json(&json, "t", &calls).unwrap();
+        let cross_contract_only = json.replace(&format!("{{\"Caller\": {default_caller}}}"), "{\"Caller\": 5}");
+        let error = check_sd_key_policy_json(&cross_contract_only, "t", &calls).unwrap_err();
+        assert!(error.to_string().contains("denies transaction 0"));
+    }
+
+    #[test]
     fn call_specs_parse_ids_names_and_inputs() {
         assert_eq!(
             parse_policy_call_spec("7:10:60,7").unwrap(),
@@ -632,8 +651,12 @@ fn sim_call_infos(calls: &[PolicySimCall]) -> (Vec<SDKeyTransactionInfo<Goldiloc
                 SDKeyTransactionInfo {
                     contract_id: GoldilocksField::from_canonical_u64(call.contract_id),
                     method_id: GoldilocksField::from_canonical_u32(call.method_id),
-                    // Simulated transactions are user-initiated: the default caller.
-                    caller_contract_id: GoldilocksField::from_canonical_u64(0),
+                    // Simulated transactions are user-initiated, so the caller
+                    // is the default caller contract, exactly like the prover
+                    // fills top-level session calls.
+                    caller_contract_id: GoldilocksField::from_canonical_u64(
+                        psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64,
+                    ),
                     inputs_length: GoldilocksField::from_canonical_u64(call.inputs.len() as u64),
                     inputs_hash: Default::default(),
                 },
@@ -681,7 +704,11 @@ pub fn check_sd_key_policy_json(contents: &str, path: &str, calls: &[PolicySimCa
             let allowed = policy.allowed_calls.iter().any(|pair| {
                 pair.contract_id == call.contract_id
                     && pair.method_id == call.method_id
-                    && pair.caller_contract_id.map(|caller| caller == 0).unwrap_or(true)
+                    // simulated calls are user-initiated: the default caller
+                    && pair
+                        .caller_contract_id
+                        .map(|caller| caller == psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64)
+                        .unwrap_or(true)
             });
             anyhow::ensure!(allowed, "tx {index}: contract {} method {} is not in the allowed call list", call.contract_id, call.method_id);
             lines.push(format!("tx {index}: contract {} method {} inputs {:?} - allowed", call.contract_id, call.method_id, call.inputs));

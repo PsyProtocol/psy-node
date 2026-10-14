@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 plonky2 = { workspace = true }
 psy_client_common = { workspace = true }
 psy_client_data = { workspace = true }
+psy_config = { workspace = true }
 psy_crypto = { workspace = true }
 psy_provider = { workspace = true }
 psy_prover = { workspace = true, default-features = false }
