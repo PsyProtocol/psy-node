@@ -458,6 +458,12 @@ impl SDKeyDpnCircuitGadget {
                 let value = Self::constrain_call_rule(builder, slot, child);
                 builder.not(value)
             }
+            SDKeyCallRule::IfThen { condition, then } => {
+                let condition = Self::constrain_call_rule(builder, slot, condition);
+                let then = Self::constrain_call_rule(builder, slot, then);
+                let not_condition = builder.not(condition);
+                builder.or(not_condition, then)
+            }
             SDKeyCallRule::Contract(id) => {
                 let id = builder.constant(GF::from_canonical_u64(*id));
                 builder.is_equal(slot.contract_id, id)
@@ -514,6 +520,25 @@ impl SDKeyDpnCircuitGadget {
             let maximum = builder.constant(GF::from_canonical_u64(total.max_total));
             let within_total = builder.is_less_than_or_equal(64, sum, maximum);
             builder.assert_one(within_total.target);
+        }
+        for relation in &policy.cross_transaction {
+            let left = &introspection.tx_info_slots[relation.left_slot as usize];
+            let right = &introspection.tx_info_slots[relation.right_slot as usize];
+            for (slot, word) in [(left, relation.left_word), (right, relation.right_word)] {
+                let minimum = builder.constant(GF::from_canonical_u64(word as u64 + 1));
+                let present = builder.is_greater_than_or_equal(64, slot.inputs_length, minimum);
+                builder.assert_one(present.target);
+            }
+            let left = left.inputs[relation.left_word as usize];
+            let right = right.inputs[relation.right_word as usize];
+            let satisfied = match relation.comparison {
+                SDKeyComparison::Eq => builder.is_equal(left, right),
+                SDKeyComparison::Lt => builder.is_less_than(64, left, right),
+                SDKeyComparison::Lte => builder.is_less_than_or_equal(64, left, right),
+                SDKeyComparison::Gt => builder.is_greater_than(64, left, right),
+                SDKeyComparison::Gte => builder.is_greater_than_or_equal(64, left, right),
+            };
+            builder.assert_one(satisfied.target);
         }
     }
 
@@ -2017,6 +2042,33 @@ mod tests {
         assert!(gadget.prove(dummy_private_key(), &violates_second, witness_sighash(&violates_second)).await.is_err());
         let missing_word = prove(&[(5, 10, vec![])]);
         assert!(gadget.prove(dummy_private_key(), &missing_word, witness_sighash(&missing_word)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn composed_policy_if_then_and_cross_transaction_comparison_are_proved() {
+        use psy_vm::ups::sd_key::{build_composed_sd_key_policy_with_relations, SDKeyCallRule as Rule, SDKeyComparison, SDKeyTransactionInputRelation};
+        let rule = Rule::IfThen {
+            condition: Box::new(Rule::All(vec![Rule::Contract(5), Rule::Method(10)])),
+            then: Box::new(Rule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 }),
+        };
+        let relation = SDKeyTransactionInputRelation { left_slot: 0, left_word: 1, comparison: SDKeyComparison::Lte, right_slot: 1, right_word: 1 };
+        let (definition, config) = build_composed_sd_key_policy_with_relations(&rule, &[], &[], &[relation], 2, 2).unwrap();
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap();
+        let prove = |a: u64, b: u64| {
+            let pairs = [(5, 10, vec![90, a]), (6, 11, vec![0, b])].map(|(c, m, inputs)| make_tx_info(c, m, &inputs));
+            let infos = pairs.iter().map(|(info, _)| *info).collect();
+            let inputs = pairs.into_iter().map(|(_, input)| input).collect();
+            build_witness(infos, inputs, 2)
+        };
+        let valid = prove(7, 8);
+        gadget.prove(dummy_private_key(), &valid, witness_sighash(&valid)).await.unwrap();
+        let violates_relation = prove(9, 8);
+        assert!(gadget.prove(dummy_private_key(), &violates_relation, witness_sighash(&violates_relation)).await.is_err());
+        let mut violates_if_then = prove(7, 8);
+        let (info, inputs) = make_tx_info(5, 10, &[101, 7]);
+        violates_if_then.transaction_infos[0] = info;
+        violates_if_then.transaction_inputs[0] = inputs;
+        assert!(gadget.prove(dummy_private_key(), &violates_if_then, witness_sighash(&violates_if_then)).await.is_err());
     }
 
     #[tokio::test]

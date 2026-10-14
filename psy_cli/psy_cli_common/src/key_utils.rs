@@ -19,7 +19,7 @@ use psy_prover::wallet::memory_wallet::{get_eth_personal_secp256k1_fingerprint, 
 use psy_provider::wallet::secp_wallet::Wallet;
 use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
 use psy_ups_circuit::signature::sd_key_dpn::SDKeyDpnCircuitGadget;
-use psy_vm::{dpn::vm::def::DPNFunctionCircuitDefinition, ups::sd_key::{SDKeyCallRule, SDKeyComparison, SDKeyInputTotalLimit}};
+use psy_vm::{dpn::vm::def::DPNFunctionCircuitDefinition, ups::sd_key::{SDKeyCallRule, SDKeyComparison, SDKeyInputTotalLimit, SDKeyTransactionInputRelation}};
 use psy_ups_circuit::signature::sd_key_plonky2::get_sdc_public_key_param;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,8 @@ struct ComposedSDKeyPolicyFile {
     ordered: Vec<SDKeyCallRule>,
     #[serde(default)]
     totals: Vec<SDKeyInputTotalLimit>,
+    #[serde(default)]
+    cross_transaction: Vec<SDKeyTransactionInputRelation>,
     min_tx_count: u64,
     max_tx_count: u64,
 }
@@ -89,10 +91,11 @@ fn parse_sd_key_dpn_definition_json(contents: &str, path: &str) -> Result<(DPNFu
     }
     let policy: ComposedSDKeyPolicyFile = serde_json::from_value(value)
         .with_context(|| format!("decode composed SD key policy {path}"))?;
-    psy_vm::ups::sd_key::build_composed_sd_key_policy_with_totals(
+    psy_vm::ups::sd_key::build_composed_sd_key_policy_with_relations(
         &policy.per_transaction,
         &policy.ordered,
         &policy.totals,
+        &policy.cross_transaction,
         policy.min_tx_count,
         policy.max_tx_count,
     )
@@ -158,6 +161,25 @@ mod policy_tests {
         let (_, config) = parse_sd_key_dpn_definition_json(json, "conditional.json").unwrap();
         let rule = config.transaction_count_policy.unwrap().composed.unwrap().per_transaction;
         assert!(matches!(rule, SDKeyCallRule::Any(children) if matches!(children.first(), Some(SDKeyCallRule::Not(_)))));
+    }
+
+    #[test]
+    fn composed_json_accepts_if_then_and_cross_transaction_relations() {
+        let json = r#"{
+            "per_transaction": {"IfThen": {
+                "condition": {"All": [{"Contract": 5}, {"Method": 10}]},
+                "then": {"Input": {"word": 0, "comparison": "Lte", "value": 100}}
+            }},
+            "ordered": [], "totals": [],
+            "cross_transaction": [{"left_slot": 0, "left_word": 1, "comparison": "Lte", "right_slot": 1, "right_word": 1}],
+            "min_tx_count": 2, "max_tx_count": 3
+        }"#;
+        let (_, config) = parse_sd_key_dpn_definition_json(json, "if-then.json").unwrap();
+        let composed = config.transaction_count_policy.unwrap().composed.unwrap();
+        assert!(matches!(composed.per_transaction, SDKeyCallRule::IfThen { .. }));
+        assert_eq!(composed.cross_transaction.len(), 1);
+        let invalid = json.replace("\"left_slot\": 0", "\"left_slot\": 2");
+        assert!(parse_sd_key_dpn_definition_json(&invalid, "invalid-slots.json").is_err());
     }
 
     #[test]
@@ -383,6 +405,7 @@ pub fn build_sd_key_policy_template(
         per_transaction,
         ordered,
         totals,
+        cross_transaction: vec![],
         min_tx_count: min,
         max_tx_count: max,
     })?;
@@ -566,6 +589,11 @@ fn visit_method_names(rule: &mut serde_json::Value, context: Option<u64>, visit:
         visit_method_names(child, context, visit);
         return;
     }
+    if let Some(conditional) = map.get_mut("IfThen").and_then(|value| value.as_object_mut()) {
+        if let Some(condition) = conditional.get_mut("condition") { visit_method_names(condition, context, visit); }
+        if let Some(then_rule) = conditional.get_mut("then") { visit_method_names(then_rule, context, visit); }
+        return;
+    }
     if let Some(method) = map.get_mut("Method") {
         if method.is_string() {
             visit(context, method);
@@ -730,6 +758,7 @@ fn describe_call_rule(rule: &SDKeyCallRule, names: Option<&std::collections::Has
         SDKeyCallRule::All(children) => children.iter().map(|child| wrap_call_rule(child, names)).collect::<Vec<_>>().join(" and "),
         SDKeyCallRule::Any(children) => children.iter().map(|child| wrap_call_rule(child, names)).collect::<Vec<_>>().join(" or "),
         SDKeyCallRule::Not(child) => format!("not ({})", describe_call_rule(child, names)),
+        SDKeyCallRule::IfThen { condition, then } => format!("if {} then {}", wrap_call_rule(condition, names), wrap_call_rule(then, names)),
         SDKeyCallRule::Contract(id) => format!("call contract {id}"),
         SDKeyCallRule::Method(id) => format!("method {}", method_label(*id, names)),
         SDKeyCallRule::Caller(id) => format!("called by contract {id}"),
@@ -748,7 +777,7 @@ fn describe_call_rule(rule: &SDKeyCallRule, names: Option<&std::collections::Has
 
 fn wrap_call_rule(child: &SDKeyCallRule, names: Option<&std::collections::HashMap<u32, String>>) -> String {
     match child {
-        SDKeyCallRule::All(_) | SDKeyCallRule::Any(_) | SDKeyCallRule::Not(_) => format!("({})", describe_call_rule(child, names)),
+        SDKeyCallRule::All(_) | SDKeyCallRule::Any(_) | SDKeyCallRule::Not(_) | SDKeyCallRule::IfThen { .. } => format!("({})", describe_call_rule(child, names)),
         _ => describe_call_rule(child, names),
     }
 }
@@ -793,6 +822,16 @@ pub fn describe_sd_key_policy_json(contents: &str, path: &str, names: Option<&st
                             "  - calldata word {}: at most {} per transaction, at most {} in total\n",
                             total.word, total.max_per_tx, total.max_total
                         );
+                    }
+                }
+                if !composed.cross_transaction.is_empty() {
+                    out += "cross-transaction calldata comparisons:\n";
+                    for relation in &composed.cross_transaction {
+                        let op = match relation.comparison {
+                            SDKeyComparison::Eq => "==", SDKeyComparison::Lt => "<", SDKeyComparison::Lte => "<=",
+                            SDKeyComparison::Gt => ">", SDKeyComparison::Gte => ">=",
+                        };
+                        out += &format!("  - tx {} word {} {op} tx {} word {}\n", relation.left_slot, relation.left_word, relation.right_slot, relation.right_word);
                     }
                 }
             }

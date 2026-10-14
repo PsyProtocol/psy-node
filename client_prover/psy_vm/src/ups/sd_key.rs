@@ -1,5 +1,5 @@
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::hash_types::RichField};
-pub use psy_client_data::dpn::sd_key::{SDKeyCallRule, SDKeyComparison, SDKeyInputTotalLimit};
+pub use psy_client_data::dpn::sd_key::{SDKeyCallRule, SDKeyComparison, SDKeyInputTotalLimit, SDKeyTransactionInputRelation};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{
     dpn::sd_key::{SDKeyConfig, SDKeySecp256k1WitnessSlot, SDKeyTransactionInfo, MAX_INTROSPECTABLE_TRANSACTIONS},
@@ -231,7 +231,7 @@ pub fn build_composed_sd_key_policy(
     min_tx_count: u64,
     max_tx_count: u64,
 ) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
-    build_composed_sd_key_policy_with_totals(per_transaction, ordered, &[], min_tx_count, max_tx_count)
+    build_composed_sd_key_policy_with_relations(per_transaction, ordered, &[], &[], min_tx_count, max_tx_count)
 }
 
 /// Like `build_composed_sd_key_policy`, with session-wide calldata limits.
@@ -242,12 +242,24 @@ pub fn build_composed_sd_key_policy_with_totals(
     min_tx_count: u64,
     max_tx_count: u64,
 ) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
+    build_composed_sd_key_policy_with_relations(per_transaction, ordered, totals, &[], min_tx_count, max_tx_count)
+}
+
+pub fn build_composed_sd_key_policy_with_relations(
+    per_transaction: &SDKeyCallRule,
+    ordered: &[SDKeyCallRule],
+    totals: &[SDKeyInputTotalLimit],
+    cross_transaction: &[SDKeyTransactionInputRelation],
+    min_tx_count: u64,
+    max_tx_count: u64,
+) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
     anyhow::ensure!(min_tx_count <= max_tx_count && max_tx_count > 0 && max_tx_count <= MAX_INTROSPECTABLE_TRANSACTIONS as u64,
         "SD key transaction count range must satisfy 0 <= min <= max <= {} and max > 0", MAX_INTROSPECTABLE_TRANSACTIONS);
     let composed = psy_client_data::dpn::sd_key::SDKeyComposedPolicy {
         per_transaction: per_transaction.clone(),
         ordered: ordered.to_vec(),
         totals: totals.to_vec(),
+        cross_transaction: cross_transaction.to_vec(),
     };
     composed.validate(min_tx_count as u32, max_tx_count as u32)?;
 

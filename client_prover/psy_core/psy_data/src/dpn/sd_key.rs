@@ -136,6 +136,7 @@ pub enum SDKeyCallRule {
     Caller(u64),
     Input { word: u32, comparison: SDKeyComparison, value: u64 },
     Not(Box<SDKeyCallRule>),
+    IfThen { condition: Box<SDKeyCallRule>, then: Box<SDKeyCallRule> },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
@@ -154,12 +155,25 @@ pub struct SDKeyInputTotalLimit {
     pub max_total: u64,
 }
 
+/// Compare calldata words across two fixed active transaction slots.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
+#[ts(export)]
+pub struct SDKeyTransactionInputRelation {
+    pub left_slot: u32,
+    pub left_word: u32,
+    pub comparison: SDKeyComparison,
+    pub right_slot: u32,
+    pub right_word: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
 #[ts(export)]
 pub struct SDKeyComposedPolicy {
     pub per_transaction: SDKeyCallRule,
     pub ordered: Vec<SDKeyCallRule>,
     pub totals: Vec<SDKeyInputTotalLimit>,
+    #[serde(default)]
+    pub cross_transaction: Vec<SDKeyTransactionInputRelation>,
 }
 
 impl SDKeyCallRule {
@@ -175,6 +189,7 @@ impl SDKeyCallRule {
                 }
             }
             Self::Not(child) => child.validate()?,
+            Self::IfThen { condition, then } => { condition.validate()?; then.validate()?; }
             Self::Input { word, value, .. } => {
                 anyhow::ensure!(*word < SDKEY_MAX_CALLDATA_WORDS, "SD key input word {} exceeds calldata capacity", word);
                 anyhow::ensure!(*value < GoldilocksField::ORDER, "SD key input comparison value must be a canonical field value");
@@ -212,6 +227,12 @@ impl SDKeyComposedPolicy {
         }
         for total in &self.totals {
             total.validate(max_tx_count)?;
+        }
+        for relation in &self.cross_transaction {
+            anyhow::ensure!(relation.left_slot < min_tx_count && relation.right_slot < min_tx_count,
+                "SD key cross-transaction slots must be below minimum transaction count");
+            anyhow::ensure!(relation.left_word < SDKEY_MAX_CALLDATA_WORDS && relation.right_word < SDKEY_MAX_CALLDATA_WORDS,
+                "SD key cross-transaction input word exceeds calldata capacity");
         }
         Ok(())
     }
@@ -273,6 +294,18 @@ impl SDKeyComposedPolicy {
                 total.max_total
             );
         }
+        for relation in &self.cross_transaction {
+            let left_info = infos.get(relation.left_slot as usize).ok_or_else(|| anyhow::anyhow!("SD key cross-transaction rule references missing transaction {}", relation.left_slot))?;
+            let right_info = infos.get(relation.right_slot as usize).ok_or_else(|| anyhow::anyhow!("SD key cross-transaction rule references missing transaction {}", relation.right_slot))?;
+            anyhow::ensure!(left_info.inputs_length.to_canonical_u64() > relation.left_word as u64,
+                "SD key cross-transaction rule requires word {} in transaction {}", relation.left_word, relation.left_slot);
+            anyhow::ensure!(right_info.inputs_length.to_canonical_u64() > relation.right_word as u64,
+                "SD key cross-transaction rule requires word {} in transaction {}", relation.right_word, relation.right_slot);
+            let left = inputs.get(relation.left_slot as usize).and_then(|words| words.get(relation.left_word as usize)).ok_or_else(|| anyhow::anyhow!("missing cross-transaction left word"))?.to_canonical_u64();
+            let right = inputs.get(relation.right_slot as usize).and_then(|words| words.get(relation.right_word as usize)).ok_or_else(|| anyhow::anyhow!("missing cross-transaction right word"))?.to_canonical_u64();
+            let ok = match relation.comparison { SDKeyComparison::Eq => left == right, SDKeyComparison::Lt => left < right, SDKeyComparison::Lte => left <= right, SDKeyComparison::Gt => left > right, SDKeyComparison::Gte => left >= right };
+            anyhow::ensure!(ok, "SD key cross-transaction comparison failed: tx {} word {} {:?} tx {} word {}", relation.left_slot, relation.left_word, relation.comparison, relation.right_slot, relation.right_word);
+        }
         Ok(())
     }
 
@@ -285,6 +318,7 @@ impl SDKeyComposedPolicy {
             SDKeyCallRule::All(children) => children.iter().all(|child| Self::rule_matches(child, info, words)),
             SDKeyCallRule::Any(children) => children.iter().any(|child| Self::rule_matches(child, info, words)),
             SDKeyCallRule::Not(child) => !Self::rule_matches(child, info, words),
+            SDKeyCallRule::IfThen { condition, then } => !Self::rule_matches(condition, info, words) || Self::rule_matches(then, info, words),
             SDKeyCallRule::Contract(id) => info.contract_id.to_canonical_u64() == *id,
             SDKeyCallRule::Method(id) => info.method_id.to_canonical_u64() == *id as u64,
             SDKeyCallRule::Caller(id) => info.caller_contract_id.to_canonical_u64() == *id,
@@ -421,6 +455,7 @@ mod composed_policy_tests {
             ]),
             ordered: vec![SDKeyCallRule::Method(10), SDKeyCallRule::Method(20)],
             totals: vec![SDKeyInputTotalLimit { word: 0, max_per_tx: 100, max_total: 150 }],
+            cross_transaction: vec![],
         }
     }
 
@@ -459,6 +494,7 @@ mod composed_policy_tests {
             per_transaction: SDKeyCallRule::Input { word: 1, comparison: SDKeyComparison::Eq, value: 7 },
             ordered: vec![],
             totals: vec![],
+            cross_transaction: vec![],
         };
         let present = pairs(&[(5, 10, &[0, 7])]);
         policy.check_transaction_infos(&present.0, &present.1).unwrap();
@@ -469,11 +505,35 @@ mod composed_policy_tests {
     }
 
     #[test]
+    fn if_then_and_cross_transaction_relation_are_checked_natively() {
+        let policy = SDKeyComposedPolicy {
+            per_transaction: SDKeyCallRule::IfThen {
+                condition: Box::new(SDKeyCallRule::All(vec![SDKeyCallRule::Contract(5), SDKeyCallRule::Method(10)])),
+                then: Box::new(SDKeyCallRule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 }),
+            },
+            ordered: vec![],
+            totals: vec![],
+            cross_transaction: vec![SDKeyTransactionInputRelation {
+                left_slot: 0, left_word: 1, comparison: SDKeyComparison::Lte, right_slot: 1, right_word: 1,
+            }],
+        };
+        policy.validate(2, 2).unwrap();
+        let valid = pairs(&[(5, 10, &[100, 7]), (6, 11, &[0, 8])]);
+        policy.check_transaction_infos(&valid.0, &valid.1).unwrap();
+        let conditional_failure = pairs(&[(5, 10, &[101, 7]), (6, 11, &[0, 8])]);
+        assert!(policy.check_transaction_infos(&conditional_failure.0, &conditional_failure.1).is_err());
+        let relation_failure = pairs(&[(5, 10, &[100, 9]), (6, 11, &[0, 8])]);
+        assert!(policy.check_transaction_infos(&relation_failure.0, &relation_failure.1).is_err());
+        assert!(policy.validate(1, 2).is_err(), "referenced slots must be active for every allowed count");
+    }
+
+    #[test]
     fn ordered_rules_only_bind_leading_slots() {
         let policy = SDKeyComposedPolicy {
             per_transaction: SDKeyCallRule::Contract(5),
             ordered: vec![SDKeyCallRule::Method(10)],
             totals: vec![],
+            cross_transaction: vec![],
         };
         let trailing = pairs(&[(5, 10, &[0]), (5, 20, &[0]), (5, 30, &[0])]);
         policy.check_transaction_infos(&trailing.0, &trailing.1).unwrap();
@@ -497,6 +557,7 @@ mod composed_policy_tests {
             ]),
             ordered: vec![],
             totals: vec![],
+            cross_transaction: vec![],
         };
 
         let valid = pairs(&[(5, 10, &[100]), (8, 20, &[0, 7]), (12, 30, &[999])]);

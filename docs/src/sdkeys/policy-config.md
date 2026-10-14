@@ -22,11 +22,12 @@ Save a JSON file such as `sd-key-policy.json`:
 first transactions in order; it cannot contain more entries than
 `min_tx_count`. `All` and `Any` can contain nested rules. Available leaf rules
 are `Contract`, `Method`, `Caller`, and `Input`. `Input.comparison` accepts
-`Eq`, `Lt`, `Lte`, `Gt`, or `Gte`. `Not` negates one nested rule. A missing
+`Eq`, `Lt`, `Lte`, `Gt`, or `Gte`. `Not` negates one nested rule. `IfThen`
+applies a rule when its condition matches. A missing
 calldata word makes an `Input` rule false, so `Not(Input(...))` is true when
 that word is absent.
 
-Use `Not` with `Any` to make a rule conditional. This example constrains input
+Use `IfThen` to make a rule conditional. This example constrains input
 for calls to `(5, 10)` and `(8, 20)` while leaving other contract/method pairs
 unconstrained by these conditions:
 
@@ -55,9 +56,21 @@ unconstrained by these conditions:
 }
 ```
 
-This expresses each implication as `Not(condition) or input_rule`. Matching
-the contract and method therefore requires the input rule to pass. A missing
+Matching the contract and method therefore requires the input rule to pass. A missing
 required input word fails that implication.
+
+`cross_transaction` compares calldata words in fixed transaction slots. Every
+referenced slot must be below `min_tx_count`, so it is guaranteed to exist:
+
+```json
+"cross_transaction": [
+  { "left_slot": 0, "left_word": 1, "comparison": "Lte", "right_slot": 1, "right_word": 1 }
+]
+```
+
+This requires word 1 in transaction 0 to be less than or equal to word 1 in
+transaction 1. Both words must be present. Supported comparisons are `Eq`,
+`Lt`, `Lte`, `Gt`, and `Gte`.
 
 `totals` sums the selected calldata word across the actual transactions. It
 does not read an ABI or know that a word is an amount. Confirm that every
