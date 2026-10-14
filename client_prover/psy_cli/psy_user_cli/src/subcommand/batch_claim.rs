@@ -181,13 +181,7 @@ pub(crate) async fn run_items(
             anyhow::ensure!(info.fingerprint == fingerprint, "software-defined-plonky2-sign key fingerprint mismatch");
         }
         SignType::SDKeyDpnSign => {
-            let (min_tx_count, max_tx_count) = wallet.sd_key_tx_count_range();
-            let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy_range(
-                &wallet.sd_key_allowed_contract_id,
-                &wallet.sd_key_allowed_method_id,
-                min_tx_count,
-                max_tx_count,
-            )?;
+            let (function, config) = psy_cli_common::key_utils::load_sd_key_dpn_definition(wallet)?;
             let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
             anyhow::ensure!(info.fingerprint == fingerprint, "sd-key fingerprint mismatch");
         }

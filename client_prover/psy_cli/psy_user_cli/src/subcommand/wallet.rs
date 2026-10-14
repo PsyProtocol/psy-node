@@ -113,5 +113,10 @@ pub fn run(args: WalletArgs) -> Result<CommandResult> {
             );
             Ok(CommandResult::generic("wallet-sd-key-fingerprint"))
         }
+        WalletCommands::SdKeyPolicyFingerprint { definition } => {
+            let fingerprint = psy_cli_common::key_utils::sd_key_dpn_fingerprint_from_file(&definition)?;
+            println!("{}", fingerprint);
+            Ok(CommandResult::generic("wallet-sd-key-policy-fingerprint"))
+        }
     }
 }

@@ -1,5 +1,5 @@
 use plonky2::field::goldilocks_field::GoldilocksField as F;
-use psy_cli_common::key_utils::load_wallet_key_info;
+use psy_cli_common::key_utils::{load_sd_key_dpn_definition, load_wallet_key_info};
 use psy_client_common::args::{ContractCallData, WalletSessionArgs};
 use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
 use psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT;
@@ -37,13 +37,7 @@ pub async fn run(args: GenerateTxTraceArgs) -> anyhow::Result<CommandResult> {
             );
         }
         psy_client_common::args::SignType::SDKeyDpnSign => {
-            let (min_tx_count, max_tx_count) = args.session.wallet.sd_key_tx_count_range();
-            let (function, config) = psy_vm::ups::sd_key::build_allow_method_policy_range(
-                &args.session.wallet.sd_key_allowed_contract_id,
-                &args.session.wallet.sd_key_allowed_method_id,
-                min_tx_count,
-                max_tx_count,
-            )?;
+            let (function, config) = load_sd_key_dpn_definition(&args.session.wallet)?;
             let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
             anyhow::ensure!(
                 info.fingerprint == fingerprint,

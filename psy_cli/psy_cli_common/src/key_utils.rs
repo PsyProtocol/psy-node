@@ -1,6 +1,6 @@
-use std::{path::Path, str::FromStr};
+use std::{fs, path::Path, str::FromStr};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::PoseidonPermutation};
 use psy_client_common::{
     args::SignType,
@@ -17,6 +17,8 @@ use psy_client_data::config::store_config::PsyHasher;
 use psy_prover::wallet::memory_wallet::{get_eth_personal_secp256k1_fingerprint, get_secp256k1_fingerprint, get_zk_fingerprint};
 use psy_provider::wallet::secp_wallet::Wallet;
 use psy_ups_circuit::signature::sd_key_dpn::get_sd_key_public_key_param;
+use psy_ups_circuit::signature::sd_key_dpn::SDKeyDpnCircuitGadget;
+use psy_vm::{dpn::vm::def::DPNFunctionCircuitDefinition, ups::sd_key::{SDKeyCallRule, SDKeyInputTotalLimit}};
 use psy_ups_circuit::signature::sd_key_plonky2::get_sdc_public_key_param;
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,101 @@ pub struct WalletKeyInfo {
     pub public_key_param: QHashOut<GoldilocksField>,
     pub public_key_hash: QHashOut<GoldilocksField>,
     pub generated: bool,
+}
+
+/// Human-readable policy accepted by `--sd-key-definition`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposedSDKeyPolicyFile {
+    per_transaction: SDKeyCallRule,
+    #[serde(default)]
+    ordered: Vec<SDKeyCallRule>,
+    #[serde(default)]
+    totals: Vec<SDKeyInputTotalLimit>,
+    min_tx_count: u64,
+    max_tx_count: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompiledSDKeyDefinitionFile {
+    function: DPNFunctionCircuitDefinition,
+    config: psy_client_data::dpn::sd_key::SDKeyConfig,
+}
+
+pub fn load_sd_key_dpn_definition(args: &WalletSourceArgs) -> Result<(DPNFunctionCircuitDefinition, psy_client_data::dpn::sd_key::SDKeyConfig)> {
+    if let Some(path) = &args.sd_key_definition {
+        anyhow::ensure!(
+            args.sd_key_allowed_contract_id.is_empty()
+                && args.sd_key_allowed_method_id.is_empty()
+                && args.sd_key_min_tx_count.is_none()
+                && args.sd_key_max_tx_count.is_none(),
+            "--sd-key-definition cannot be combined with allow-method or transaction-count flags"
+        );
+        return load_sd_key_dpn_definition_from_file(path);
+    }
+    let (min, max) = args.sd_key_tx_count_range();
+    psy_vm::ups::sd_key::build_allow_method_policy_range(
+        &args.sd_key_allowed_contract_id,
+        &args.sd_key_allowed_method_id,
+        min,
+        max,
+    )
+}
+
+pub fn load_sd_key_dpn_definition_from_file(path: &str) -> Result<(DPNFunctionCircuitDefinition, psy_client_data::dpn::sd_key::SDKeyConfig)> {
+    let contents = fs::read_to_string(path).with_context(|| format!("read SD key policy file {path}"))?;
+    parse_sd_key_dpn_definition_json(&contents, path)
+}
+
+fn parse_sd_key_dpn_definition_json(contents: &str, path: &str) -> Result<(DPNFunctionCircuitDefinition, psy_client_data::dpn::sd_key::SDKeyConfig)> {
+    let value: serde_json::Value = serde_json::from_str(&contents).with_context(|| format!("parse SD key policy file {path}"))?;
+    if value.get("function").is_some() || value.get("config").is_some() {
+        let definition: CompiledSDKeyDefinitionFile = serde_json::from_value(value)
+            .with_context(|| format!("decode compiled SD key definition {path}"))?;
+        return Ok((definition.function, definition.config));
+    }
+    let policy: ComposedSDKeyPolicyFile = serde_json::from_value(value)
+        .with_context(|| format!("decode composed SD key policy {path}"))?;
+    psy_vm::ups::sd_key::build_composed_sd_key_policy_with_totals(
+        &policy.per_transaction,
+        &policy.ordered,
+        &policy.totals,
+        policy.min_tx_count,
+        policy.max_tx_count,
+    )
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::parse_sd_key_dpn_definition_json;
+
+    #[test]
+    fn composed_json_builds_range_and_rejects_typos() {
+        let json = r#"{
+            "per_transaction": {"All": [{"Contract": 7}, {"Any": [{"Method": 10}, {"Method": 20}]}]},
+            "ordered": [{"Method": 10}, {"Method": 20}],
+            "totals": [{"word": 0, "max_per_tx": 100, "max_total": 250}],
+            "min_tx_count": 2,
+            "max_tx_count": 3
+        }"#;
+        let (_, config) = parse_sd_key_dpn_definition_json(json, "test.json").unwrap();
+        let policy = config.transaction_count_policy.unwrap();
+        assert_eq!((policy.min_tx_count, policy.max_tx_count), (2, 3));
+        assert_eq!(policy.composed.unwrap().totals.len(), 1);
+        let invalid = json.replace("max_total", "max_totla");
+        assert!(parse_sd_key_dpn_definition_json(&invalid, "test.json").is_err());
+    }
+}
+
+pub fn sd_key_dpn_fingerprint_from_file(path: &str) -> Result<QHashOut<GoldilocksField>> {
+    let (function, config) = load_sd_key_dpn_definition_from_file(path)?;
+    Ok(SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &config)?.get_fingerprint())
+}
+
+pub fn sd_key_dpn_fingerprint(args: &WalletSourceArgs) -> Result<QHashOut<GoldilocksField>> {
+    let (function, config) = load_sd_key_dpn_definition(args)?;
+    Ok(SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &config)?.get_fingerprint())
 }
 
 pub fn load_wallet_key_info(args: &WalletSourceArgs, allow_generate: bool) -> Result<WalletKeyInfo> {
@@ -91,13 +188,19 @@ pub fn load_wallet_key_info(args: &WalletSourceArgs, allow_generate: bool) -> Re
                 generated,
             })
         }
-        SignType::SDKeyDpnSign | SignType::SDKeyPlonky2Sign => {
+        SignType::SDKeyDpnSign => {
             let (private_key, generated) = load_or_create_key(args, allow_generate)?;
-            let fingerprint = QHashOut::<GoldilocksField>::from_str(
-                args.fingerprint
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("sd-key sign need fingerprint"))?,
-            )?;
+            let fingerprint = match (&args.fingerprint, &args.sd_key_definition) {
+                (Some(value), Some(_)) => {
+                    let supplied = QHashOut::<GoldilocksField>::from_str(value)?;
+                    let configured = sd_key_dpn_fingerprint(args)?;
+                    anyhow::ensure!(supplied == configured, "SD key fingerprint does not match policy file");
+                    supplied
+                }
+                (Some(value), None) => QHashOut::<GoldilocksField>::from_str(value)?,
+                (None, Some(_)) => sd_key_dpn_fingerprint(args)?,
+                (None, None) => bail!("sd-key sign needs --fingerprint or --sd-key-definition"),
+            };
             let public_key_param = get_sd_key_public_key_param(&private_key);
             let public_key_hash = ZKPublicKeyInfo {
                 fingerprint,
@@ -105,7 +208,23 @@ pub fn load_wallet_key_info(args: &WalletSourceArgs, allow_generate: bool) -> Re
             }
             .qfhash::<PsyHasher>();
             Ok(WalletKeyInfo {
-                sign_type: args.sign_type.clone(),
+                sign_type: SignType::SDKeyDpnSign,
+                private_key,
+                fingerprint,
+                public_key_param,
+                public_key_hash,
+                generated,
+            })
+        }
+        SignType::SDKeyPlonky2Sign => {
+            let (private_key, generated) = load_or_create_key(args, allow_generate)?;
+            let fingerprint = QHashOut::<GoldilocksField>::from_str(
+                args.fingerprint.as_ref().ok_or_else(|| anyhow!("sd-key sign need fingerprint"))?,
+            )?;
+            let public_key_param = get_sdc_public_key_param(&private_key);
+            let public_key_hash = ZKPublicKeyInfo { fingerprint, public_key_param }.qfhash::<PsyHasher>();
+            Ok(WalletKeyInfo {
+                sign_type: SignType::SDKeyPlonky2Sign,
                 private_key,
                 fingerprint,
                 public_key_param,

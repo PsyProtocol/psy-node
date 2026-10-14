@@ -33,6 +33,48 @@ SD keys that read `self` state must be compiled with the target contract ID
 using a contract-aware compiler entry point. Compilation fails if state is read
 without that binding; it never silently binds the state proof to contract zero.
 
+### Composable call policy builder
+
+Rust callers can build a read-only SD-key definition from nested `All` and
+`Any` rules. The common rule applies to every transaction. Optional ordered
+rules apply to transaction slots starting at zero, in addition to the common
+rule. Transaction count can vary in an inclusive range. Ordered rules must fit
+within the minimum count.
+
+```rust
+use psy_vm::ups::sd_key::{
+    build_composed_sd_key_policy_with_totals, SDKeyCallRule as Rule,
+    SDKeyComparison, SDKeyInputTotalLimit,
+};
+
+// This example assumes method 10 and method 20 both encode the quantity to
+// limit in calldata word 0, with the same units. Verify that against their ABIs.
+let common = Rule::All(vec![
+    Rule::Contract(7),
+    Rule::Any(vec![Rule::Method(10), Rule::Method(20)]),
+    Rule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 },
+]);
+let (function, config) = build_composed_sd_key_policy_with_totals(
+    &common,
+    &[Rule::Method(10), Rule::Method(20)], // first buy, then sell
+    &[SDKeyInputTotalLimit { word: 0, max_per_tx: 100, max_total: 300 }],
+    2, // minimum transaction count
+    3, // maximum transaction count
+)?;
+// Register (function, config) through register_sd_key_dpn_circuit.
+```
+
+`Rule::Caller(id)` restricts the calling contract. An input comparison requires
+that the selected calldata word exists; a missing word makes that rule false.
+A total limit sums the selected word across
+transactions. Every call must contain that word and remain within
+`max_per_tx`; the builder rejects a count whose worst-case sum could wrap the
+field. It does not know whether that word is an amount, price, recipient, or
+something else. For methods with different calldata layouts, this sum is not
+a meaningful amount limit; use an ABI-aware policy before calling it that.
+The builder checks at most 64 transactions
+and calldata word indices 0 through 127.
+
 ### Basic Extended Signature
 
 **Using Psy Language:**

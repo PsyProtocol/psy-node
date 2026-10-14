@@ -117,9 +117,8 @@ pub struct WalletSourceArgs {
     #[clap(long)]
     #[serde(default)]
     pub sd_key_max_tx_count: Option<u64>,
-    /// JSON file containing a programmable SDKey definition. The file must
-    /// contain `{ "function": <DPNFunctionCircuitDefinition>,
-    /// "config": <SDKeyConfig> }`.
+    /// JSON file containing a composed SD key policy, or a compiled
+    /// `{ "function": <DPNFunctionCircuitDefinition>, "config": <SDKeyConfig> }`.
     #[clap(long, env = "SD_KEY_DEFINITION")]
     pub sd_key_definition: Option<String>,
 }

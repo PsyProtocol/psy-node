@@ -3662,6 +3662,9 @@ impl WalletSession {
             transaction_infos.len(),
             transaction_inputs.len()
         );
+        if let Some(composed) = config.transaction_count_policy.as_ref().and_then(|policy| policy.composed.as_ref()) {
+            composed.check_transaction_infos(&transaction_infos, &transaction_inputs)?;
+        }
 
         let current_header = user_session_mgr.get_current_ups_header().clone();
         let checkpoint_id = current_header.session_start_context.checkpoint_id.to_canonical_u64();
@@ -3831,6 +3834,9 @@ impl WalletSession {
             transaction_infos.len(),
             transaction_inputs.len()
         );
+        if let Some(composed) = config.transaction_count_policy.as_ref().and_then(|policy| policy.composed.as_ref()) {
+            composed.check_transaction_infos(&transaction_infos, &transaction_inputs)?;
+        }
         anyhow::ensure!(
             current_header.current_state.tx_count.to_canonical_u64() as usize == transaction_infos.len(),
             "SD key trace tx_count {} does not match {} transactions",

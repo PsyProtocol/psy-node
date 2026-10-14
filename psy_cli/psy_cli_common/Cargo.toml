@@ -12,4 +12,6 @@ psy_crypto = { workspace = true }
 psy_provider = { workspace = true }
 psy_prover = { workspace = true, default-features = false }
 psy_ups_circuit = { workspace = true }
+psy_vm = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }

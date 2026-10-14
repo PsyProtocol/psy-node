@@ -1,4 +1,5 @@
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::hash_types::RichField};
+pub use psy_client_data::dpn::sd_key::{SDKeyCallRule, SDKeyComparison, SDKeyInputTotalLimit};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{
     dpn::sd_key::{SDKeyConfig, SDKeySecp256k1WitnessSlot, SDKeyTransactionInfo, MAX_INTROSPECTABLE_TRANSACTIONS},
@@ -221,6 +222,58 @@ impl DpnDefBuilder {
     }
 }
 
+
+/// Build a bounded policy. `per_transaction` applies to every active call;
+/// `ordered` additionally constrains the first slots in sequence.
+pub fn build_composed_sd_key_policy(
+    per_transaction: &SDKeyCallRule,
+    ordered: &[SDKeyCallRule],
+    min_tx_count: u64,
+    max_tx_count: u64,
+) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
+    build_composed_sd_key_policy_with_totals(per_transaction, ordered, &[], min_tx_count, max_tx_count)
+}
+
+/// Like `build_composed_sd_key_policy`, with session-wide calldata limits.
+pub fn build_composed_sd_key_policy_with_totals(
+    per_transaction: &SDKeyCallRule,
+    ordered: &[SDKeyCallRule],
+    totals: &[SDKeyInputTotalLimit],
+    min_tx_count: u64,
+    max_tx_count: u64,
+) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
+    anyhow::ensure!(min_tx_count <= max_tx_count && max_tx_count > 0 && max_tx_count <= MAX_INTROSPECTABLE_TRANSACTIONS as u64,
+        "SD key transaction count range must satisfy 0 <= min <= max <= {} and max > 0", MAX_INTROSPECTABLE_TRANSACTIONS);
+    let composed = psy_client_data::dpn::sd_key::SDKeyComposedPolicy {
+        per_transaction: per_transaction.clone(),
+        ordered: ordered.to_vec(),
+        totals: totals.to_vec(),
+    };
+    composed.validate(min_tx_count as u32, max_tx_count as u32)?;
+
+    let mut builder = DpnDefBuilder::new();
+    let authorized = builder.bool_op(DPNOpType::ConstantTrue, vec![]);
+    let function = DPNFunctionCircuitDefinition {
+        name: "composed_sd_key_policy".to_string(), method_id: 0,
+        circuit_inputs: vec![], circuit_outputs: vec![authorized],
+        state_commands: vec![], state_command_resolution_indices: vec![],
+        assertions: vec![], definitions: builder.definitions, events: vec![],
+    };
+    let config = SDKeyConfig {
+        num_introspectable_transactions: max_tx_count as u32,
+        transaction_count_policy: Some(psy_client_data::dpn::sd_key::SDKeyTransactionCountPolicy {
+            min_tx_count: min_tx_count as u32,
+            max_tx_count: max_tx_count as u32,
+            allowed_calls: vec![],
+            composed: Some(composed),
+        }), can_read_state: false,
+        contract_state_tree_height: psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT,
+        requires_secp256k1: false, num_secp256k1_slots: 0,
+        contract_id: psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64,
+    };
+    Ok((function, config))
+}
+
 /// Build the read-only DPN authorization function equivalent of the legacy
 /// fixed allow-method SD key policy: every introspectable transaction slot must
 /// call one of the allowed (contract_id, method_id) pairs, and the session
@@ -374,6 +427,7 @@ pub fn build_allow_method_policy_range(
                     caller_contract_id: None,
                 })
                 .collect(),
+            composed: None,
         }),
         can_read_state: false,
         contract_state_tree_height: psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT,
@@ -412,6 +466,7 @@ pub fn build_allow_caller_and_method_policy_range(
                 caller_contract_id: Some(caller_contract_id),
             })
             .collect(),
+        composed: None,
     });
     let mut builder = DpnDefBuilder::new();
     let authorized = builder.bool_op(DPNOpType::ConstantTrue, vec![]);
@@ -487,6 +542,52 @@ pub fn sd_key_config_for_dpn_function(definition: &DPNFunctionCircuitDefinition)
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use plonky2::field::types::Field64;
+
+    #[test]
+    fn composed_policy_builds_nested_and_ordered_constraints() {
+        let common = SDKeyCallRule::All(vec![
+            SDKeyCallRule::Contract(7),
+            SDKeyCallRule::Any(vec![SDKeyCallRule::Method(10), SDKeyCallRule::Method(20)]),
+            SDKeyCallRule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 },
+        ]);
+        let (definition, config) = build_composed_sd_key_policy(
+            &common, &[SDKeyCallRule::Method(10), SDKeyCallRule::Method(20)], 2, 3,
+        ).unwrap();
+        definition.validate_sd_key_read_only().unwrap();
+        assert_eq!(config.num_introspectable_transactions, 3);
+        let policy = config.transaction_count_policy.unwrap();
+        assert_eq!((policy.min_tx_count, policy.max_tx_count), (2, 3));
+        assert!(policy.composed.is_some());
+    }
+
+    #[test]
+    fn composed_policy_rejects_empty_groups_and_invalid_slots() {
+        assert!(build_composed_sd_key_policy(&SDKeyCallRule::Any(vec![]), &[], 1, 2).is_err());
+        assert!(build_composed_sd_key_policy(&SDKeyCallRule::Contract(1), &[SDKeyCallRule::Method(1), SDKeyCallRule::Method(1)], 1, 2).is_err());
+        assert!(build_composed_sd_key_policy(&SDKeyCallRule::Input {
+            word: psy_client_data::dpn::sd_key::SDKEY_MAX_CALLDATA_WORDS,
+            comparison: SDKeyComparison::Eq, value: 0,
+        }, &[], 1, 2).is_err());
+        assert!(build_composed_sd_key_policy(&SDKeyCallRule::Contract(GF::ORDER), &[], 1, 2).is_err());
+        assert!(build_composed_sd_key_policy(&SDKeyCallRule::Input {
+            word: 0, comparison: SDKeyComparison::Eq, value: GF::ORDER,
+        }, &[], 1, 2).is_err());
+    }
+
+    #[test]
+    fn composed_policy_total_is_bounded() {
+        let total = SDKeyInputTotalLimit { word: 0, max_per_tx: 100, max_total: 250 };
+        let (definition, config) = build_composed_sd_key_policy_with_totals(
+            &SDKeyCallRule::Contract(7), &[], &[total], 1, 3,
+        ).unwrap();
+        definition.validate_sd_key_read_only().unwrap();
+        assert_eq!(config.transaction_count_policy.unwrap().composed.unwrap().totals.len(), 1);
+        let overflow = SDKeyInputTotalLimit { word: 0, max_per_tx: GF::ORDER / 2, max_total: 1 };
+        assert!(build_composed_sd_key_policy_with_totals(
+            &SDKeyCallRule::Contract(7), &[], &[overflow], 1, 3,
+        ).is_err());
+    }
 
     #[test]
     fn allow_method_policy_function_validates_inputs() {

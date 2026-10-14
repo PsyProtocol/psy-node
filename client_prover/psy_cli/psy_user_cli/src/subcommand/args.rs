@@ -55,6 +55,11 @@ pub enum WalletCommands {
         #[arg(long)]
         max_tx_count: Option<u64>,
     },
+    /// Print the fingerprint for an SD key JSON policy file
+    SdKeyPolicyFingerprint {
+        #[arg(long)]
+        definition: String,
+    },
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]

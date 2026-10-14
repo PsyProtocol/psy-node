@@ -11,7 +11,7 @@ use plonky2::{
         poseidon::PoseidonHash,
     },
     iop::{
-        target::Target,
+        target::{BoolTarget, Target},
         witness::{PartialWitness, WitnessWrite},
     },
     plonk::{
@@ -23,7 +23,7 @@ use plonky2::{
 };
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{
-    dpn::sd_key::{SDKeyConfig, SDKeyTransactionCountPolicy, SDKeyTransactionInfo, MAX_INTROSPECTABLE_TRANSACTIONS, SDKEY_MAX_CALLDATA_WORDS, SDKEY_TX_COUNT_BITS},
+    dpn::sd_key::{SDKeyCallRule, SDKeyComparison, SDKeyComposedPolicy, SDKeyConfig, SDKeyTransactionCountPolicy, SDKeyTransactionInfo, MAX_INTROSPECTABLE_TRANSACTIONS, SDKEY_MAX_CALLDATA_WORDS, SDKEY_TX_COUNT_BITS},
     qdata::checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeafStats},
 };
 use psy_common_circuit::{
@@ -394,7 +394,7 @@ impl SDKeyDpnCircuitGadget {
     ) {
         assert!(policy.min_tx_count <= policy.max_tx_count, "SDKey min_tx_count exceeds max_tx_count");
         assert_eq!(policy.max_tx_count as usize, introspection.tx_info_slots.len());
-        assert!(!policy.allowed_calls.is_empty(), "SDKey transaction policy requires allowed calls");
+        assert!(!policy.allowed_calls.is_empty() || policy.composed.is_some(), "SDKey transaction policy requires allowed calls or composed rules");
 
         let min_count = builder.constant(GF::from_canonical_u64(policy.min_tx_count as u64));
         let at_least_min = builder.is_less_than_or_equal(SDKEY_TX_COUNT_BITS, min_count, introspection.tx_count);
@@ -418,8 +418,98 @@ impl SDKeyDpnCircuitGadget {
                 }
                 allowed = builder.or(allowed, pair_matches);
             }
-            let slot_allowed = builder.or(inactive, allowed);
-            builder.assert_one(slot_allowed.target);
+            if !policy.allowed_calls.is_empty() {
+                let slot_allowed = builder.or(inactive, allowed);
+                builder.assert_one(slot_allowed.target);
+            }
+            if let Some(composed) = &policy.composed {
+                let common = Self::constrain_call_rule(builder, slot, &composed.per_transaction);
+                let mut matches = common;
+                if let Some(ordered) = composed.ordered.get(index) {
+                    let sequence = Self::constrain_call_rule(builder, slot, ordered);
+                    matches = builder.and(matches, sequence);
+                }
+                let slot_allowed = builder.or(inactive, matches);
+                builder.assert_one(slot_allowed.target);
+            }
+        }
+        if let Some(composed) = &policy.composed {
+            Self::constrain_composed_totals(builder, introspection, composed);
+        }
+    }
+
+    fn constrain_call_rule(
+        builder: &mut CircuitBuilder<GF, D>,
+        slot: &SDKeyTransactionInfoTargets,
+        rule: &SDKeyCallRule,
+    ) -> BoolTarget {
+        match rule {
+            SDKeyCallRule::All(children) => {
+                let mut result = builder._true();
+                for child in children { let value = Self::constrain_call_rule(builder, slot, child); result = builder.and(result, value); }
+                result
+            }
+            SDKeyCallRule::Any(children) => {
+                let mut result = builder._false();
+                for child in children { let value = Self::constrain_call_rule(builder, slot, child); result = builder.or(result, value); }
+                result
+            }
+            SDKeyCallRule::Contract(id) => {
+                let id = builder.constant(GF::from_canonical_u64(*id));
+                builder.is_equal(slot.contract_id, id)
+            }
+            SDKeyCallRule::Method(id) => {
+                let id = builder.constant(GF::from_canonical_u32(*id));
+                builder.is_equal(slot.method_id, id)
+            }
+            SDKeyCallRule::Caller(id) => {
+                let id = builder.constant(GF::from_canonical_u64(*id));
+                builder.is_equal(slot.caller_contract_id, id)
+            }
+            SDKeyCallRule::Input { word, comparison, value } => {
+                let minimum = builder.constant(GF::from_canonical_u64(*word as u64 + 1));
+                let present = builder.is_greater_than_or_equal(64, slot.inputs_length, minimum);
+                let expected = builder.constant(GF::from_canonical_u64(*value));
+                let actual = slot.inputs[*word as usize];
+                let matches = match comparison {
+                    SDKeyComparison::Eq => builder.is_equal(actual, expected),
+                    SDKeyComparison::Lt => builder.is_less_than(64, actual, expected),
+                    SDKeyComparison::Lte => builder.is_less_than_or_equal(64, actual, expected),
+                    SDKeyComparison::Gt => builder.is_greater_than(64, actual, expected),
+                    SDKeyComparison::Gte => builder.is_greater_than_or_equal(64, actual, expected),
+                };
+                builder.and(present, matches)
+            }
+        }
+    }
+
+    fn constrain_composed_totals(
+        builder: &mut CircuitBuilder<GF, D>,
+        introspection: &SDKeyTransactionIntrospectionGadget,
+        policy: &SDKeyComposedPolicy,
+    ) {
+        for total in &policy.totals {
+            let mut sum = builder.zero();
+            for (index, slot) in introspection.tx_info_slots.iter().enumerate() {
+                let index = builder.constant(GF::from_canonical_u64(index as u64));
+                let active = builder.is_less_than(SDKEY_TX_COUNT_BITS, index, introspection.tx_count);
+                let inactive = builder.not(active);
+                let minimum = builder.constant(GF::from_canonical_u64(total.word as u64 + 1));
+                let present = builder.is_greater_than_or_equal(64, slot.inputs_length, minimum);
+                let valid_length = builder.or(inactive, present);
+                builder.assert_one(valid_length.target);
+                let value = slot.inputs[total.word as usize];
+                let maximum = builder.constant(GF::from_canonical_u64(total.max_per_tx));
+                let within_limit = builder.is_less_than_or_equal(64, value, maximum);
+                let valid_value = builder.or(inactive, within_limit);
+                builder.assert_one(valid_value.target);
+                let zero = builder.zero();
+                let active_value = builder.select(active, value, zero);
+                sum = builder.add(sum, active_value);
+            }
+            let maximum = builder.constant(GF::from_canonical_u64(total.max_total));
+            let within_total = builder.is_less_than_or_equal(64, sum, maximum);
+            builder.assert_one(within_total.target);
         }
     }
 
@@ -547,7 +637,10 @@ impl SDKeyDpnCircuitGadget {
                 policy.max_tx_count == sd_config.num_introspectable_transactions,
                 "SDKey max_tx_count must match circuit transaction capacity"
             );
-            anyhow::ensure!(!policy.allowed_calls.is_empty(), "SDKey transaction policy requires allowed calls");
+            anyhow::ensure!(!policy.allowed_calls.is_empty() || policy.composed.is_some(), "SDKey transaction policy requires allowed calls or composed rules");
+            if let Some(composed) = &policy.composed {
+                composed.validate(policy.min_tx_count, policy.max_tx_count)?;
+            }
         }
 
         let input_len = definition.circuit_inputs.iter().max().map(|idx| *idx as usize + 1).unwrap_or(0);
@@ -1809,6 +1902,53 @@ mod tests {
         let (disallowed, inputs) = make_tx_info(5, 43, &[]);
         let witness = build_witness(vec![disallowed], vec![inputs], 3);
         assert!(gadget.prove(dummy_private_key(), &witness, witness_sighash(&witness)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn composed_policy_proves_variable_count_order_and_total_limit() {
+        use psy_vm::ups::sd_key::{
+            build_composed_sd_key_policy_with_totals, SDKeyCallRule as Rule, SDKeyComparison,
+            SDKeyInputTotalLimit,
+        };
+        let common = Rule::All(vec![
+            Rule::Contract(5),
+            Rule::Any(vec![
+                Rule::All(vec![Rule::Method(10), Rule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 }]),
+                Rule::All(vec![Rule::Method(20), Rule::Input { word: 1, comparison: SDKeyComparison::Eq, value: 7 }]),
+            ]),
+        ]);
+        let (definition, config) = build_composed_sd_key_policy_with_totals(
+            &common,
+            &[Rule::Method(10), Rule::Method(20)],
+            &[SDKeyInputTotalLimit { word: 0, max_per_tx: 100, max_total: 150 }],
+            2,
+            3,
+        ).unwrap();
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap();
+        let prove = |calls: &[(u64, u32, Vec<u64>)]| {
+            let pairs = calls.iter().map(|(contract, method, inputs)| make_tx_info(*contract, *method, inputs)).collect::<Vec<_>>();
+            let infos = pairs.iter().map(|(info, _)| *info).collect();
+            let inputs = pairs.into_iter().map(|(_, input)| input).collect();
+            build_witness(infos, inputs, 3)
+        };
+        let valid = prove(&[(5, 10, vec![60]), (5, 20, vec![80, 7]), (5, 10, vec![0])]);
+        gadget.prove(dummy_private_key(), &valid, witness_sighash(&valid)).await.unwrap();
+        let valid_shorter = prove(&[(5, 10, vec![60]), (5, 20, vec![80, 7])]);
+        gadget.prove(dummy_private_key(), &valid_shorter, witness_sighash(&valid_shorter)).await.unwrap();
+        let too_few = prove(&[(5, 10, vec![60])]);
+        assert!(gadget.prove(dummy_private_key(), &too_few, witness_sighash(&too_few)).await.is_err());
+        let mut too_many = valid.clone();
+        let (extra_info, extra_inputs) = make_tx_info(5, 20, &[0, 7]);
+        too_many.transaction_infos.push(extra_info);
+        too_many.transaction_inputs.push(extra_inputs);
+        too_many.tx_count = GF::from_canonical_u64(4);
+        assert!(gadget.prove(dummy_private_key(), &too_many, witness_sighash(&too_many)).await.is_err());
+        let too_much = prove(&[(5, 10, vec![80]), (5, 20, vec![80, 7]), (5, 10, vec![0])]);
+        assert!(gadget.prove(dummy_private_key(), &too_much, witness_sighash(&too_much)).await.is_err());
+        let wrong_order = prove(&[(5, 20, vec![60, 7]), (5, 10, vec![80]), (5, 10, vec![0])]);
+        assert!(gadget.prove(dummy_private_key(), &wrong_order, witness_sighash(&wrong_order)).await.is_err());
+        let short = prove(&[(5, 10, vec![]), (5, 20, vec![80, 7]), (5, 10, vec![0])]);
+        assert!(gadget.prove(dummy_private_key(), &short, witness_sighash(&short)).await.is_err());
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use plonky2::field::goldilocks_field::GoldilocksField as F;
-use psy_cli_common::key_utils::load_wallet_key_info;
+use psy_cli_common::key_utils::{load_sd_key_dpn_definition, load_wallet_key_info};
 use psy_client_common::{
     args::{ContractCallArgs, ContractCallData, SignType, WalletSessionArgs, WalletSourceArgs},
     data::qhashout::QHashOut,
@@ -106,26 +106,18 @@ pub async fn configure_wallet_session_for_signer(
             );
         }
         SignType::SDKeyDpnSign => {
-            let allowed_contract_ids = &wallet.sd_key_allowed_contract_id;
-            if allowed_contract_ids.is_empty() {
-                anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-contract-id");
+            if wallet.sd_key_definition.is_none() {
+                let (min_tx_count, max_tx_count) = wallet.sd_key_tx_count_range();
+                validate_sd_key_allowed_calls(
+                    &wallet_session.st_provider,
+                    contract_calls,
+                    &wallet.sd_key_allowed_contract_id,
+                    &wallet.sd_key_allowed_method_id,
+                    min_tx_count,
+                    max_tx_count,
+                ).await?;
             }
-            let allowed_method_ids = &wallet.sd_key_allowed_method_id;
-            if allowed_method_ids.is_empty() {
-                anyhow::bail!("sd-key sign needs at least one --sd-key-allowed-method-id");
-            }
-            let (min_tx_count, max_tx_count) = wallet.sd_key_tx_count_range();
-            validate_sd_key_allowed_calls(
-                &wallet_session.st_provider,
-                contract_calls,
-                allowed_contract_ids,
-                allowed_method_ids,
-                min_tx_count,
-                max_tx_count,
-            )
-            .await?;
-            let (function, config) =
-                psy_vm::ups::sd_key::build_allow_method_policy_range(allowed_contract_ids, allowed_method_ids, min_tx_count, max_tx_count)?;
+            let (function, config) = load_sd_key_dpn_definition(wallet)?;
             let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, config).await?;
             anyhow::ensure!(
                 signer_fingerprint == fingerprint,
