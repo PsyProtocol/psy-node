@@ -234,9 +234,9 @@ make run-all
 
 `make run-all` does **not** rely on bare defaults. It expands an explicit component list with two Realms, two
 Coordinator workers, one Realm worker, one prove proxy, the database group, Coordinator/Realm nodes, faucet, Layer 1,
-relayer stack, and all four UI flags (`Makefile:61-67`). It also defaults `PSY_SKIP_BRANCH_CHECK`,
-`PSY_SKIP_KEYSTORE`, and `PSY_SKIP_BUILD` to `1`, whereas a direct launcher invocation has no intrinsic
-`PSY_SKIP_BUILD=1` default (`Makefile:13-15`; `Makefile:67`; `dev/locSetupV4.ts:1933-1968`).
+relayer stack, and all four UI flags (`Makefile:61-67`). Make defaults `PSY_SKIP_BRANCH_CHECK`,
+`PSY_SKIP_KEYSTORE`, and `PSY_SKIP_BUILD` to `1`. A direct launcher also skips branch sync, remote keystore
+refresh, and build unless that value is exact `0` (`Makefile:16-18`; `dev/locSetupPolicy.ts:316-318`).
 
 | Setting             | Bare launcher                                      | `make run-all`                         | Evidence                                        |
 | ------------------- | -------------------------------------------------: | -------------------------------------: | ----------------------------------------------- |
@@ -244,7 +244,7 @@ relayer stack, and all four UI flags (`Makefile:61-67`). It also defaults `PSY_S
 | Coordinator workers | 1                                                  | 2                                      | `dev/locSetupV4.ts:5484`; `Makefile:61`         |
 | Realm workers       | 2                                                  | 1                                      | `dev/locSetupV4.ts:5477-5481`; `Makefile:61`    |
 | Prove proxy         | Implicit 1                                         | Explicit 1                             | `dev/locSetupV4.ts:4362-4369`; `Makefile:61`    |
-| Build policy        | Build when required unless environment disables it | Existing artifacts required by default | `dev/locSetupV4.ts:1933-1968`; `Makefile:15,67` |
+| Build policy        | Existing artifacts unless exact `PSY_SKIP_BUILD=0` | Existing artifacts required by default | `dev/locSetupV4.ts:2101-2102`; `Makefile:18` |
 
 ### 4.3 Component Selection
 
@@ -280,10 +280,10 @@ Numeric strings are parsed with `parseInt(..., 10)`, so malformed suffixes can s
 | `--prove-proxy COUNT`            | String, `0`; full foreground implies 1 | Starts proxy listeners on `9999 + index`.                                                                                                                                                                                                                                                                                                                                                                                          | `dev/locSetupV4.ts:4362-4396`                                                                 |
 | `--faucet-server`                | Boolean selector                       | Starts faucet on 9998 after same-launch proxy readiness, when proxies exist.                                                                                                                                                                                                                                                                                                                                                       | `dev/locSetupV4.ts:4633-4662`                                                                 |
 | `--l1`                           | Boolean selector                       | Starts local/forked Anvil or probes external Layer 1, then deploys/reuses contracts.                                                                                                                                                                                                                                                                                                                                               | `dev/locSetupV4.ts:4404-4452`                                                                 |
-| `--relayer`                      | Boolean selector                       | Starts Envio backing services/indexer, psy-services, indexers, and relayer; external core/Layer 1 dependencies must exist in component mode.                                                                                                                                                                                                                                                                                       | `dev/locSetupV4.ts:4454-4704`                                                                 |
-| `--relayer-config PATH`          | String, local TOML path                | Supplies Envio/dependency configuration; the launcher generates a separate relayer daemon config.                                                                                                                                                                                                                                                                                                                                  | `dev/locSetupV4.ts:4454-4473`; `dev/locSetupV4.ts:4667-4699`                                  |
-| `--bridge-proposer-daemon`       | Boolean selector                       | Enables relayer application selection but has a current duplicated-mode defect described in section 17.                                                                                                                                                                                                                                                                                                                            | `dev/locSetupV4.ts:5477,5498`; `dev/locSetupV4.ts:3950-3954`                                  |
-| `--psy-privacy-bridge`           | Boolean selector                       | Waits for Nostr and starts the bridge UI on 5177.                                                                                                                                                                                                                                                                                                                                                                                  | `dev/locSetupV4.ts:4706-4739`                                                                 |
+| `--relayer`                      | Boolean selector                       | Starts Envio backing services/indexer, psy-services, indexers, and the bridge relayer. The relayer receives the unchanged operator file named by `PSY_BRIDGE_DAEMON_CONFIG`; no daemon config is generated. External core and Layer 1 dependencies must exist in component mode. Component selection does not skip DApp dependency setup: `ensureAllUiDeps` still runs for every non-teardown startup, including core-only selection. | `dev/locSetupV4.ts` |
+| `--relayer-config PATH`          | String, local TOML path                | Supplies the existing Envio/dependency configuration. It is not the bridge daemon config and is not rewritten into one. | `dev/locSetupV4.ts` |
+| `--bridge-proposer-daemon`       | Boolean selector                       | Same component selection, bridge dependency guard, and forwarded daemon config as `--relayer`. | `dev/locSetupV4.ts` |
+| `--psy-privacy-bridge`           | Boolean selector                       | Starts bridge dependencies (Envio, psy-services, and indexers) without selecting the relayer, then waits for Nostr and starts the bridge UI on 5177. Acceptance omits `--relayer` because the driver owns the relayer. | `dev/locSetupV4.ts:4926`; `dev/locSetupV4.ts:5176-5211`; `dev/locSetupV4.ts:5704-5705` |
 | `--ide`                          | Boolean selector                       | Starts the IDE on 5176.                                                                                                                                                                                                                                                                                                                                                                                                            | `dev/locSetupV4.ts:4742-4761`                                                                 |
 | `--explorer`                     | Boolean selector                       | Starts Explorer on 5178.                                                                                                                                                                                                                                                                                                                                                                                                           | `dev/locSetupV4.ts:4764-4788`                                                                 |
 | `--mode-a-web-wallet-bridge`     | Boolean selector                       | Starts the Mode A UI on 5179 only when every `link:` package resolves.                                                                                                                                                                                                                                                                                                                                                             | `dev/locSetupV4.ts:4790-4839`                                                                 |
@@ -321,7 +321,7 @@ values, then service-specific overrides (`dev/locSetupV4.ts:3921-3931`; `dev/loc
 | ----------------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
 | `PSY_PROJECTS_DIR`      | Parent of repository root                                                   | Locates sibling `psy-services`, `psy-wallet`, `psy-sdk`, and `psy-compiler` repositories.                  | `dev/locSetupV4.ts:1662-1686`                                                 |
 | `PSY_SKIP_BRANCH_CHECK` | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` fetches expected branches, stashes dirty/untracked changes, and checks out remote refs detached. | `dev/locSetupPolicy.ts:299-301`; `dev/locSetupV4.ts:1727-1752`; `Makefile:13` |
-| `PSY_SKIP_BUILD`        | Direct default off; Make default `1`                                        | Exact `1` requires existing release binaries and current generated artifacts instead of building.          | `dev/locSetupV4.ts:1933-1968`; `Makefile:15`                                  |
+| `PSY_SKIP_BUILD`        | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` builds; every other value requires existing release binaries and current generated artifacts. | `dev/locSetupPolicy.ts:316-318`; `dev/locSetupV4.ts:2101-2102`; `Makefile:18`                                  |
 | `PSY_CONFIG_PATH`       | Repository Genesis config                                                   | Supplies build configuration to Make and fallback Cargo builds.                                            | `Makefile:3,22-34`; `dev/locSetupV4.ts:2801-2824`                             |
 
 Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime configuration. Reuse requires its source-configuration SHA-256 stamp, epoch metadata, topology, and all requested key files to match (`dev/locSetupV4.ts:1149-1199,1237-1287,4053-4056`). Runtime rotation reads compiled `psy_config::CHECKPOINTS_PER_EPOCH`; a runtime JSON edit is not an epoch-length override (`psy_data/src/config/network_config.rs:61-81`). Sibling discovery is not gitlink checkout: `PSY_PROJECTS_DIR` locates `psy-services`, `psy-wallet`, `psy-sdk`, and `psy-compiler`, while node `psy-genesis`, `psy-contracts`, and `psy-dapp` are submodules. Because `psy-dapp` is `update = none`, a clean checkout first runs `git submodule update --init --checkout -- psy-dapp`, then initializes nested `psy-genesis` and `psy-contracts` from that checkout (`dev/locSetupV4.ts:1998-2034`). Initialize `psy-sdk/psy-genesis` from the SDK checkout before `prepare:wasm` (`dev/locSetupV4.ts:1942-1972`). Do not use `--remote`.
@@ -331,47 +331,24 @@ Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime co
 | Variable                   | Default                                                                   | Effect                                                                                                 | Evidence                                                                                    |
 | -------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
 | `HOME`                     | Required                                                                  | Locates trust setup and default relayer keystore.                                                      | `dev/locSetupV4.ts:2476-2481`; `dev/locSetupV4.ts:2968-2973`                                |
-| `KEYSTORE_PATH`            | `${HOME}/.psy/keystore/bridge-relayer`                                    | Encrypted UTC JSON used by both `[relayer_wallet]` (L2 ZKSign) and `[finalize]` / `[[chains]]` (L1 secp). | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`, `daemonConfig`)                    |
-| `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` | unset | Genesis registration 2 and locSetup: first-choice UTC JSON path. Same file the relayer decrypts. | `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`; `dev/locSetupV4.ts:298-310` |
-| `BRIDGE_RELAYER_KEYSTORE_PATH` | unset | Alias if `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` is unset. | same |
-| `WALLET_PASSWORD`          | Prompt/policy; generated development keystore can use development default | Decrypts the UTC JSON for locSetup, L1 deploy, genesis generation, and the relayer.                    | `dev/locSetupPolicy.ts:615-638`; `dev/locSetupV4.ts:313-330`; `dev/locSetupV4.ts:3084-3097` |
-| `PSY_SKIP_KEYSTORE`        | Direct default off; Make default `1`                                      | Exact `1` skips remote trust-setup refresh/hash verification but still requires mandatory local files. | `dev/locSetupV4.ts:2487-2521`; `Makefile:14`                                                |
-| `PSY_KEYSTORE_R2_PREFIX` | Required unless exact `PSY_SKIP_KEYSTORE=1`; no default | Public `psy-proving-keystores` R2 prefix, e.g. `localhost-<digest>`: one `[A-Za-z0-9._-]{1,128}` segment, without `..`, slash or whitespace. Anonymous HTTPS curl; no legacy alias. | `dev/locSetupPolicy.ts` (`r2CurlArgs`); `dev/locSetupV4.ts` (`downloadKeystoreObject`) |
+| `KEYSTORE_PATH` | `${HOME}/.psy/keystore/bridge-relayer` | Encrypted UTC JSON for L1 `[finalize]` / `[[chains]]` transaction signing only; not the L2 multisig identity. | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`, `daemonConfig`) |
+| `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` | unset | First-choice L1 relayer keystore path; not a Genesis enrollment input. | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`) |
+| `BRIDGE_RELAYER_KEYSTORE_PATH` | unset | L1 keystore alias when `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` is unset. | same |
+| `WALLET_PASSWORD` | Existing prompt/development policy | Decrypts L1 deployment and relayer keystores; not consumed for public Genesis enrollment. | `dev/locSetupV4.ts` (`resolveWalletPassword`, `planGenesisGeneration`) |
+| `PSY_RELAYER_MULTISIG_ACCOUNT` | Required only for actual Genesis generation | Public initial two-of-three account JSON path, forwarded as `--relayer-multisig-account`; relative paths resolve against the repository root. Verified Genesis reuse does not require it. | `dev/locSetupV4.ts` (`planGenesisGeneration`); `Makefile:139-144` |
+| `PSY_MULTISIG_POLICY_ARTIFACT` | Required only for actual Genesis generation | Approved policy compiler artifact JSON path including ABI, forwarded as `--multisig-policy-artifact`; no default or implicit generation. | same |
+| `PSY_SKIP_KEYSTORE`        | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` refreshes remote trust setup; every other value skips refresh but still requires mandatory local files. | `dev/locSetupPolicy.ts:316-318`; `dev/locSetupV4.ts:2670-2706`; `Makefile:17`                                                |
+| `PSY_KEYSTORE_R2_PREFIX` | Required only for exact `PSY_SKIP_KEYSTORE=0`; no default | Public `psy-proving-keystores` R2 prefix, e.g. `localhost-<digest>`: one `[A-Za-z0-9._-]{1,128}` segment, without `..`, slash or whitespace. Anonymous HTTPS curl; no legacy alias. | `dev/locSetupPolicy.ts` (`r2CurlArgs`); `dev/locSetupV4.ts` (`downloadKeystoreObject`) |
 
-Remote trust-setup mode fails closed on manifest fetch, parse, version or missing/invalid entries for any of the nine files. Local files are checked against manifest size and SHA-256 before reuse, and extracted files must verify after download. Only explicit `PSY_SKIP_KEYSTORE=1` selects local nonempty-file checks; remote failures never do. Consumers download from the fixed public base `https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev` without login, credentials or Wrangler. Curl ignores its configuration file, rejects HTTP errors and non-HTTPS redirects; the launcher suppresses raw subprocess output/spawn errors and reports object URL/exit diagnostics. Uploads still require authenticated Wrangler. Never publish wallet/UTC JSON or credentials.
+Remote trust-setup mode fails closed on manifest fetch, parse, version or missing/invalid entries for any of the nine files. Local files are checked against manifest size and SHA-256 before reuse, and extracted files must verify after download. Every value except exact `PSY_SKIP_KEYSTORE=0` selects local nonempty-file checks; remote failures never do. Consumers download from the fixed public base `https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev` without login, credentials or Wrangler. Curl ignores its configuration file, rejects HTTP errors and non-HTTPS redirects; the launcher suppresses raw subprocess output/spawn errors and reports object URL/exit diagnostics. Uploads still require authenticated Wrangler. Never publish wallet/UTC JSON or credentials.
 
-#### Using a Throwaway Bridge-Relayer Keystore
+#### Separate L1 transaction signing and L2 multisig identity
 
-`KEYSTORE_PATH` is the encrypted UTC JSON used by both `[relayer_wallet]` and `[finalize]` / `[[chains]]` in generated `daemon.toml`. The L2 identity is that file's 32-byte secret parsed as a Poseidon key (`Wallet::load` then `Hash256` then `QHashOut`), not a plaintext `private_key`. Genesis registration 2 (`user_id` `524288`) matches only when the same file was passed to `make generate-genesis-data` ([genesis-generation.md](genesis-generation.md) section 1.2.1: `PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, or `KEYSTORE_PATH`, plus `WALLET_PASSWORD`). The proving trust setup stays under `~/.psy/keystore` regardless of `KEYSTORE_PATH`.
+`KEYSTORE_PATH` and its higher-priority aliases configure the encrypted L1 transaction-signing keystore only. The proving trust setup stays under `~/.psy/keystore` regardless of that variable. L2 registration 2 (`user_id` 524288) is derived from the public `MultisigAccount` and actual multisig circuit fingerprint, not from a keystore secret. Genesis seeds the initial policy at contract 6 and exports `null` at registration index 2 in `private_keys.json`; other indexed validator/faucet secrets remain secret. See [public Genesis inputs](genesis-generation.md#121-public-bridge-multisig-account).
 
-```bash
-# Throwaway UTC JSON instead of ~/.psy/keystore/bridge-relayer
-export WALLET_PASSWORD=devnet
-mkdir -p /tmp/psy-devnet-relayer
-export KEYSTORE_PATH=/tmp/psy-devnet-relayer/bridge-relayer-keystore
-cast wallet new /tmp/psy-devnet-relayer bridge-relayer-keystore --unsafe-password "$WALLET_PASSWORD"
-PSY_BRIDGE_RELAYER_KEYSTORE_PATH="$KEYSTORE_PATH" make generate-genesis-data
-make run-all
-```
+When generation is triggered, provide both `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`; the launcher validates readable public JSON inputs and passes the exact required flags. Its generator child excludes legacy secret-bearing enrollment variables without changing the parent process's L1 transaction-signing environment. If an existing Genesis snapshot passes the reuse checks, these generation inputs are not required. No automatic account replacement or live-chain regeneration is authorized by supplying them.
 
-Behavior on the first and later launches:
-
-1. Path absent — the launcher auto-generates a development keystore from the Anvil development
-   private key `0xac0974…2ff80`, encrypted with `WALLET_PASSWORD` (default `"devnet"` when unset)
-   (`dev/locSetupV4.ts:2427-2588`). That file still has to be the genesis input or registration 2
-   is `deterministic_private_key(2)` and the relayer is `not_registered`.
-2. Path exists — the password must match that keystore. In a non-interactive session
-   (`WALLET_PASSWORD` unset, no TTY) startup fails with
-   `"WALLET_PASSWORD is required for an existing bridge-relayer keystore in a non-interactive
-   session"`; interactive sessions prompt instead (`dev/locSetupPolicy.ts:511-543`). An existing
-   keystore is never silently re-encrypted with the devnet default.
-3. A mismatched password is not detected at startup validation alone — it surfaces later as a
-   decrypt failure (`invalid password`) when the relayer or deployment first uses the wallet
-   (`dev/locSetupPolicy.ts:546-555`). Always pass the same `WALLET_PASSWORD` for a given
-   `KEYSTORE_PATH`.
-
-The developer's real `~/.psy/keystore/bridge-relayer` is never read or modified while
-`KEYSTORE_PATH` points elsewhere; trust-setup artifacts are not affected by this variable.
+L1 password behavior is unchanged: an existing keystore requires its correct password, non-interactive startup without the required password fails, and an existing keystore is not silently re-encrypted. A missing development L1 keystore can be generated from the named local-devnet fixture; that fixture is not an L2 enrollment key. Do not copy development secrets into deployment documentation. This launcher change does not register a guardian daemon.
 
 ### 6.4 Resources, Logging, and Supervision
 
@@ -397,11 +374,17 @@ The developer's real `~/.psy/keystore/bridge-relayer` is never read or modified 
 The supported faucet keys are `PSY_FAUCET_OPERATORS_JSON`, `PSY_FAUCET_OPERATORS_JSON_B64`,
 `PSY_FAUCET_TURNSTILE_SECRET`, `PSY_FAUCET_REQUIRE_TURNSTILE`, `PSY_FAUCET_TURNSTILE_ACTION`,
 `PSY_FAUCET_TURNSTILE_ALLOWED_HOSTNAMES`, and `PSY_FAUCET_WINDOW_CHECKPOINTS`
-(`dev/locSetupPolicy.ts:4-12`). If neither operator representation exists, the launcher best-effort loads the bridge
-faucet-operator JSON file before and after auto-setup (`dev/locSetupV4.ts:5523-5535`;
-`dev/locSetupV4.ts:5708-5720`). Foreground children inherit these values broadly; daemonized containers receive only
-nonempty faucet values plus the fixed runtime allowlist (`dev/locSetupV4.ts:3921-3924`;
-`dev/locSetupV4.ts:4910-4921`).
+(`dev/locSetupPolicy.ts`). If neither operator representation exists, the launcher best-effort loads the bridge
+faucet-operator JSON file before and after auto-setup. Foreground children inherit these values broadly.
+
+`PSY_BRIDGE_DAEMON_CONFIG` is required before startup whenever full mode, `--relayer`, or `--bridge-proposer-daemon`
+is selected. It names an existing public daemon TOML. The launcher validates metadata and forwards that file unchanged as
+`psy_relayer_cli --config <path>` with no subcommand. Required fields are `rpc_config`, `services_url`,
+`withdraw_method_id`, and `guardian_config`. `[[chains]].family` is optional and defaults to `evm` in the daemon.
+`PSY_GUARDIAN_CONFIG`, when set, must resolve to the same file as `guardian_config`. The launcher does not generate
+bridge identity or a `[relayer_wallet]` section. L1 sender `keystore_path` and `password_env` remain inside the
+forwarded file. Core-only and relayer-only selections still run the existing DApp dependency setup; they do not install
+a missing UI only when its dependencies are already present and SDK rebuild does not force a refresh.
 
 ## 7. Foreground Process Inventory and Readiness
 
@@ -420,13 +403,13 @@ nonempty faucet values plus the fixed runtime allowlist (`dev/locSetupV4.ts:3921
 | Realm workers          | `psy_worker_cli worker`                                                               | Worker-start marker; all selected worker promises are awaited.                              | `dev/locSetupV4.ts:4250-4342`                                  |
 | Dummy provers          | `dev/dummy_prover.sh`                                                                 | Dummy-prover marker; start in parallel after Realm workers.                                 | `dev/locSetupV4.ts:4343-4360`                                  |
 | Prove proxy            | `psy_user_cli prove-proxy`                                                            | Log marker starts background warm-up; TCP `9999 + index` has up to 600 one-second attempts. | `dev/locSetupV4.ts:4362-4402`                                  |
-| Anvil                  | `anvil ... --state db/anvil/state.json --state-interval <ANVIL_STATE_INTERVAL\|\|60>` | `Listening on`, then HTTP Layer 1 probe.                                                    | `dev/locSetupV4.ts:4448-4462`                                  |
+| Anvil                  | `anvil ... --state db/anvil/state.json --state-interval <ANVIL_STATE_INTERVAL\|\|60>` | `Listening on`, then HTTP Layer 1 probe, preserved genesis check, then `anvil_setIntervalMining([1])` on each launcher-managed chain. | `dev/locSetupV4.ts` (`l1StartedDetector`, `assertPreservedAnvilGenesis`, `setLocalAnvilIntervalMining`) |
 | Envio backing services | Generated Docker Compose                                                              | Postgres TCP 5433, SQL `select 1`, Hasura `/healthz`.                                       | `dev/locSetupV4.ts:3338-3364`                                  |
 | Envio indexer          | `pnpm start`                                                                          | Outer setup requires TCP 9898.                                                              | `dev/locSetupV4.ts:3363-3376`; `dev/locSetupV4.ts:4478-4492`   |
 | psy-services           | `psy-services --disable-auth`                                                         | Start marker, then `http://127.0.0.1:3000/health`.                                          | `dev/locSetupV4.ts:4545-4575`                                  |
 | psy-indexers           | `psy-indexer` Coordinator then Realm                                                  | `Starting PSY Indexer`; sequential ordering.                                                | `dev/locSetupV4.ts:4576-4630`                                  |
 | Faucet                 | `psy_user_cli faucet-server`                                                          | Waits for same-launch proxies; its TCP 9998 probe is nonblocking after spawn.               | `dev/locSetupV4.ts:4633-4662`                                  |
-| Relayer                | `psy_relayer_cli --config .../daemon.toml`                                            | Relayer marker after same-launch proxy readiness and bridge stack.                          | `dev/locSetupV4.ts:4663-4704`                                  |
+| Relayer                | `psy_relayer_cli --config <PSY_BRIDGE_DAEMON_CONFIG>`                              | `multichain bridge relayer started` or `bridge relayer started`, after same-launch proxy readiness and the bridge stack. | `dev/locSetupV4.ts` |
 | UIs                    | Vite/Bun development servers                                                          | `ready in`; ports 5177, 5176, 5178, 5179.                                                   | `dev/locSetupV4.ts:4706-4839`                                  |
 
 General initialization-hint startup retries after two seconds, with `maxRetries=3` meaning at most four attempts;
@@ -527,6 +510,18 @@ state absent + deployment absent   -> fresh local chain; reset Envio storage
 state present + deployment present -> load Anvil state; reuse deployment; retain Envio storage
 only one present                    -> fail and instruct PURGE=1 make shutdown then make run-all
 ```
+A preserved snapshot must contain exactly one serialized block 0. Anvil creates a fresh genesis before loading
+`--state`, then the last block 0 replaces it, so duplicate timestamps change the genesis hash. The launcher passes
+that unique header's timestamp as decimal `--timestamp` on every preserved start and, after RPC readiness and before
+deployment reuse, requires block 0 and `earliest` to retain every saved header field and, when block 1 exists, its
+`parentHash`. An ambiguous snapshot fails instead of dropping a header. One-time cleanup uses a trusted full RPC
+header, not timestamp alone. A fork keeps the paired state check but skips the local block 0 pin because its genesis is remote (`dev/locSetupV4.ts:3227-3363`; `dev/locSetupV4.ts:5389-5424`).
+
+`localAnvilLaunchArgs` does not pass `--block-time`. After the HTTP probe and preserved genesis check, and before deployment or persisted-deployment reuse, each launcher-managed chain (localhost, localhostBsc, localhostBase, including a local fork) receives `anvil_setIntervalMining([1])` through `setLocalAnvilIntervalMining()`. An external RPC is not called. `anvilRpc` throws on HTTP or JSON-RPC failure, so a refused interval does not continue into deployment. Fresh deployment's `009_set_anvil_interval_mining.ts` repeats the same call and only logs a warning; the launcher call is what covers persisted reuse, which returns before that script runs. `make restart` keeps the Anvil processes alive, so it does not repeat the call.
+
+Envio's ordered batch chooses the minimum chain timestamp. An empty chain buffer whose timestamp is still below a
+deposit stalls indexing; the fetch-limit threshold only caps the request and does not release it. Local empty blocks
+that advance the BSC and Base timestamps release the original deposit.
 
 This behavior is implemented by `resolveLocalAnvilStatePlan()` and the localhost reuse branch in
 `deployPsyContracts()` (`dev/locSetupV4.ts:2991-3007`). Foreground Anvil startup creates the parent directory before
@@ -739,9 +734,7 @@ These are limitations of the current source, not supported command examples.
    examples (`dev/locSetupV4.ts:5439-5471`; `dev/locSetupV4.ts:5561`; `dev/locSetupV4.ts:5602-5603`).
 3. Help says bare startup uses Realms 0-127, while the parser default is one Realm; section 4.1 is definitive
    (`dev/locSetupV4.ts:5448,5486`; `dev/locSetupV4.ts:5581-5582`).
-4. `--bridge-proposer-daemon` is counted as a top-level component selector but omitted from the manager's second
-   selector expression; alone, it gives component-mode worker defaults while manager `startAll` becomes true
-   (`dev/locSetupV4.ts:5477-5484`; `dev/locSetupV4.ts:3950-3954`).
+4. Core-only and relayer-only selectors suppress UI processes but still execute the unconditional DApp dependency setup. A missing `node_modules` or an SDK rebuild can install DApp dependencies and abort startup. This is a prerequisite, not a frontend-independent setup (`dev/locSetupV4.ts`).
 5. Numeric CLI strings use `parseInt`, which accepts malformed suffixes. Core mode rejects invalid parsed Realm topology, including nonpositive Realm/edge counts and port collisions; other counts still lack equivalent range validation and can suppress loops (`dev/locSetupV4.ts:1107-1121,5482-5495`).
 6. `--host` is not a complete topology relocation: Layer 1 uses `L1_RPC_HOST`, while bridge services contain literal
    loopback endpoints (`dev/locSetupV4.ts:490-493`; `dev/locSetupV4.ts:4482`;

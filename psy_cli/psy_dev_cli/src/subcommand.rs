@@ -44,6 +44,6 @@ pub enum Commands {
     ChainInfo(ChainInfoArgs),
     #[command(name = "rollback", about = "Generate or execute an offline role-local rollback plan")]
     Rollback(RollbackArgs),
-    #[command(name = "generate-genesis-data", about = "Write local-devnet genesis.json, private_keys.json, and faucetOperators.json")]
+    #[command(name = "generate-genesis-data", about = "Write local-devnet genesis.json, private_keys.json, and faucetOperators.json, or write guardian configuration from the existing genesis with --guardians-root")]
     GenerateGenesisData(GenerateGenesisDataArgs),
 }

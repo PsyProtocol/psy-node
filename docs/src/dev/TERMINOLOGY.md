@@ -234,3 +234,31 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 6. A `RealmTransition` is `transition`. Do not name it `pair`.
 7. Receiver identity for private notes and deposit claims is `shield_address`. Do not name it `note_owner`.
 8. `explicit` is not a domain name. A keystore path is `set` or `default`.
+9. `config.json` is the one public guardian ceremony file: `network`, `guardians`, and `client`. Keystore paths reference `~/.psy/keystore` and the file holds no key bytes.
+10. `guardian-id` is `1`, `2`, or `3`. It selects `guardians.<id>` and member-hash slot `id - 1`.
+11. `GuardianRuntimeConfig` is the in-memory view of one selected guardian, including the operator-supplied `--db-path`. It is not a file and has no TLS or signing-authorization field.
+12. `GuardianDb` is the exclusive redb owner of one signing key. `guardian-service` creates a missing `--db-path` once and opens an existing nonempty file. `guardian-create-db` is not a command.
+13. `HaltReason` has five values: `FinalityConflict`, `CheckpointConflict`, `NonceConsumedDifferently`, `IncludedTransitionMissing`, and `AppendHistoryMismatch`. No signing-authorization reason exists.
+14. `guardian_common` is the shared guardian protocol, runtime, database and EndCap-bound crate. The generator and relayer consume it; it depends on neither binary.
+15. `GuardianConfig` is the public ceremony root containing the typed network, three signer configurations and the client configuration. `GuardianConfig::load` is its sole Rust file decoder.
+   `guardian_user_operation` is the acceptance-only isolated worker for one existing deposit, claim, or withdrawal API call. Its public outcome contains operation, transaction hash and status; it is not a production command.
+16. `GuardianSignerConfig` contains one guardian's bind address and two absolute standard-keystore references. It has no database path.
+17. `GuardianClientConfig` contains the public client endpoints, archive path, history bind and L1 endpoint mapping nested in `GuardianConfig.client`; it is not a separate file.
+18. `load_authorization_archive` loads the fixed config-relative authorization index and version files and verifies their hashes and authorization bounds.
+19. `build_runtime_config` derives one `GuardianRuntimeConfig` from the public root, guardian id, operator database path and active authorization index.
+20. `validate_rpc_network` compares the external compiled-stage typed network with the embedded guardian network after clearing only external `prove_proxy_url` and materializing empty system-proxy arrays on both sides.
+
+### Naming governance — guardian ceremony
+
+The guardian domain owns the `Guardian` type head and `guardian_common` crate. `GuardianConfig`, `GuardianSignerConfig`, `GuardianClientConfig`, and `GuardianRuntimeConfig` have different contents, not equivalent-type aliases. Their three-instance signer collection uses one type. Existing cryptographic labels, request preimages and redb table/codec identifiers are unchanged by configuration consolidation.
+
+| Occurrence in guardian ceremony design | Disposition | Basis |
+|---|---|---|
+| `generate-genesis-data`, `get_populated_checkpoint_leaf` | Existing API spelling, unchanged | Existing CLI and node-builder entry points; this task changes their wiring, not their names. |
+| `parse_canonical_json` | Existing API spelling, unchanged | Existing shared protocol decoder and its wire-validation semantics; extraction keeps the spelling and behavior. |
+| `ApprovedContract.compiler_artifact_json` and `contract_leaf_json` | Protected serialized keys | Existing authorization JSON encoding at `psy_cli/guardian_common/src/protocol.rs:156-161`. |
+| `archive/relayer-journal` | Protected public path | User-approved single-file ceremony/archive layout. |
+| `canonical` in hash-limb description | Non-violation | Mathematical field encoding property, not a newly named code component. |
+| `old` inside `threshold` | Non-violation | Quantity threshold, not a lifecycle qualifier. |
+
+The scope of this disposition is the guardian ceremony sections of `genesis-generation.md` and the vocabulary rows above, not unrelated terminology entries or a future production-source naming sweep.

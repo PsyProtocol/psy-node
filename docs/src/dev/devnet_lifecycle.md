@@ -152,7 +152,7 @@ Repair only the stale output:
 - SDK compiler identity or generated WASM is stale: `CARGO_NET_GIT_FETCH_WITH_CLI=true PSY_NETWORK=localhost pnpm --dir ../psy-sdk/psy-ts-sdk/packages/psy-sdk build`. This generates both prover targets and the compiler stamp. Keep generated `bigint` exports; do not copy another package's bindings or cast them to `number`.
 - A required node, services, or indexer binary is missing or older than its sources: `make build` in the owning repository.
 
-Do not rebuild all three because one comparison failed. Regenerate root `genesis.json` only when a [§6.1](circuit-and-verifier-operations.md#61-genesis-trigger) construction input changed; a stamp or compiler-revision refresh alone does not. Do not weaken the provenance check. Do not add a Cargo `[patch]` or `[replace]` override for the pinned Psy node revision; the existing plonky2-hwa patch in each repository is not inherited across git pins. `dev/locSetupV4.ts:2796-2850` verifies the Genesis payload and full stamp before process startup.
+Do not rebuild all three because one comparison failed. Regenerate root `genesis.json` only when a [§6.1](circuit-and-verifier-operations.md#61-genesis-trigger) construction input changed; a stamp or compiler-revision refresh alone does not. Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions; the existing plonky2-hwa patch in each repository is not inherited across git pins. `dev/locSetupV4.ts` verifies the Genesis payload and full stamp before process startup. When a construction input requires root `genesis.json` regeneration, set `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT` for `make generate-genesis-data`; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
 
 ## 3. Fresh Start
 
@@ -287,7 +287,7 @@ The earlier checkpoint-289-to-0 run proved L2 rollback, convergence, and transac
 | Failure | Action |
 |---|---|
 | `compiler revision changed` | Regenerate compiler/Genesis contract artifacts, regenerate root `genesis.json`, rebuild affected release binaries, then run the artifact checks. |
-| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data`; stale embedded circuit definitions can fail prove-proxy circuit construction. |
+| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data` with both public inputs `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`; stale embedded circuit definitions can fail prove-proxy circuit construction. |
 | Cargo cannot authenticate to `git@github.com` | Set `CARGO_NET_GIT_FETCH_WITH_CLI=true`; repair empty cached submodules without deleting the whole Cargo git cache. |
 | Submodule fetch reports `early EOF` | Retry the same authenticated command. |
 | Scylla `raft operation add_entry timed out` during fresh schema creation | Run `PURGE=1 make shutdown` then `make run-all`; do not reuse the partial Scylla volume. |

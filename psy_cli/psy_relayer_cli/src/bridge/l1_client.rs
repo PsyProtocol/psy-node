@@ -124,6 +124,7 @@ impl L1Client {
         &self,
         config: &BridgeProposeDaemonConfig,
         provider: &RpcProvider,
+        guardian: &super::guardian_client::LoadedGuardianConfig,
         bridge: Address,
         from_checkpoint: u64,
         to_checkpoint: u64,
@@ -152,7 +153,7 @@ impl L1Client {
             }
         }).await?;
         run_l2_bridge_round_with_l1_snapshot(
-            config, provider, source_chain_index, proved, pending, from_checkpoint,
+            config, provider, guardian, source_chain_index, proved, pending, from_checkpoint,
             to_checkpoint, confirmation_lag_checkpoints, is_catchup_batch, state,
             propose_args, max_checkpoint_batch,
         ).await
@@ -162,8 +163,9 @@ impl L1Client {
         &self,
         config: &BridgeProposeDaemonConfig,
         target_deposit_count: u32,
+        network: &psy_config::NetworkConfigGoldilocks,
     ) -> anyhow::Result<()> {
-        let prove_proxy_url = resolve_system_prove_proxy_url(config)?;
+        let prove_proxy_url = resolve_system_prove_proxy_url(network)?;
         self.with_rpc_failover("deposit_batch_appends", |url| {
             let owned = url.to_string();
             let proxy = prove_proxy_url.clone();
@@ -185,6 +187,7 @@ impl L1Client {
         withdrawals: &[propose_withdrawals::PendingWithdrawal],
         config: &BridgeProposeDaemonConfig,
         to_checkpoint: u64,
+        network: &psy_config::NetworkConfigGoldilocks,
     ) -> anyhow::Result<claim_withdrawals::BatchWithdrawalsReport> {
         let bridge_addr = resolve_bridge_address(config)?;
         tracing::info!(
@@ -192,7 +195,7 @@ impl L1Client {
             to_checkpoint,
             "claiming current batch withdrawals on L1"
         );
-        let prove_proxy_url = resolve_system_prove_proxy_url(config)?;
+        let prove_proxy_url = resolve_system_prove_proxy_url(network)?;
         self.with_rpc_failover("claim_withdrawals", |url| {
             let owned = url.to_string();
             let bridge_addr = bridge_addr.clone();

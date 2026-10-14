@@ -1,5 +1,6 @@
-# Reference template — locSetupV4 generates the actual daemon.toml at runtime
-# with absolute paths resolved from the current machine.
+guardian_config = "guardian-client.json"
+# Operator-supplied reference template. The launcher forwards PSY_BRIDGE_DAEMON_CONFIG unchanged
+# and does not generate daemon.toml. Legacy Envio dependency paths remain distinct from that daemon config.
 rpc_config = "psy-genesis/config.json"
 services_url = "http://127.0.0.1:3000"
 withdraw_method_id = 3055054724
@@ -7,10 +8,6 @@ proof_dir = "local_checkpoints/bridge_proposer"
 poll_interval_secs = 15
 confirmation_lag_checkpoints = 3
 max_checkpoint_batch = 32
-
-[relayer_wallet]
-sign_type = "ZKSign"
-keystore_path = "<HOME>/.psy/keystore/bridge-relayer"
 
 [finalize]
 l1_rpc_url = "http://127.0.0.1:8545"

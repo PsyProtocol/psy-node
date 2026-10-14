@@ -47,7 +47,7 @@ impl PCoreQueueItemBase for TestJob {
 async fn pending_consumers_survive_idle_and_upgrade_without_losing_ack_state() -> anyhow::Result<()> {
     let url = std::env::var("NATS_INTEGRATION_URL")?;
     let id = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
-    let mut client = setup_nats_psy_queue_from_connection_str(&url, &format!("lifetime_{id}")).await?;
+    let mut client = setup_nats_psy_queue_from_connection_str(&url, &format!("lifetime_{id}"), NatsSetupMode::CreateIfMissing).await?;
     assert_eq!(client.standard_ephemeral_queue_pull_config.inactive_threshold, Duration::ZERO);
     assert_eq!(client.worker_queue_pull_config.inactive_threshold, Duration::ZERO);
     assert_eq!(client.worker_queue_pull_config.max_deliver, -1);
@@ -125,7 +125,7 @@ async fn ensure_handles_cold_cache_and_missing_cached_consumer() -> anyhow::Resu
     let url = std::env::var("NATS_INTEGRATION_URL")?;
     let id = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
     let namespace = format!("ensure_lifetime_{id}");
-    let mut old_client = setup_nats_psy_queue_from_connection_str(&url, &namespace).await?;
+    let mut old_client = setup_nats_psy_queue_from_connection_str(&url, &namespace, NatsSetupMode::CreateIfMissing).await?;
     old_client.standard_ephemeral_queue_pull_config.inactive_threshold = Duration::from_secs(2);
     old_client.ensure_stream().await?;
     let mut key = queue_key(id);
@@ -134,7 +134,7 @@ async fn ensure_handles_cold_cache_and_missing_cached_consumer() -> anyhow::Resu
     <NatsJetStreamClient as QStandardQueueBase>::ensure_consumer(&old_client, &key, 7, 11, id, 0).await?;
     let before = old_client.jetstream.get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
         &durable, &old_client.stream_name).await?.get_info().await?;
-    let client = setup_nats_psy_queue_from_connection_str(&url, &namespace).await?;
+    let client = setup_nats_psy_queue_from_connection_str(&url, &namespace, NatsSetupMode::CreateIfMissing).await?;
     <NatsJetStreamClient as QStandardQueueBase>::ensure_consumer(&client, &key, 7, 11, id, 0).await?;
     let after = client.jetstream.get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
         &durable, &client.stream_name).await?.get_info().await?;
@@ -170,7 +170,7 @@ async fn witness_repair_resumes_dependency_pipeline_without_republishing_jobs() 
     let redis_url = std::env::var("REDIS_INTEGRATION_URL")?;
     let id = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
     let namespace = format!("witness_repair_{id}");
-    let mut client = setup_nats_psy_queue_from_connection_str(&url, &namespace).await?;
+    let mut client = setup_nats_psy_queue_from_connection_str(&url, &namespace, NatsSetupMode::CreateIfMissing).await?;
     client.worker_queue_pull_config.ack_wait = Duration::from_millis(100);
     client.ensure_stream().await?;
     let store = StandardRedisStore::new(new_redis_async_pool(&redis_url, 2).await?, namespace, 7, 11);

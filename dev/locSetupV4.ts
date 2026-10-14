@@ -5,7 +5,7 @@ import path from "path";
 import net from "node:net";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { availableParallelism } from "node:os";
+import { availableParallelism, homedir } from "node:os";
 import allConfig from "../psy-genesis/config.json";
 import { protocolConfig } from "../psy-contracts/protocol-config";
 import {
@@ -504,6 +504,11 @@ async function anvilRpc(
     }
     return body.result;
 }
+/** One-second interval mining for a launcher-managed Anvil. Not for an external RPC. */
+export async function setLocalAnvilIntervalMining(rpcUrl: string): Promise<void> {
+    await anvilRpc(rpcUrl, "anvil_setIntervalMining", [1]);
+    console.log(`[DevNet] set anvil interval mining to 1 second on ${rpcUrl}`);
+}
 
 async function sendTokenTransfer(
     rpcUrl: string,
@@ -660,6 +665,7 @@ export class RunningProcess {
     /** Stable service name for supervisor logs (e.g. prove_proxy_0, bridge_relayer). */
     name: string = '';
     cmds: string[] = [];
+    guardianListener?: { host: string; port: number };
     spawnOptions: {
         cwd?: string;
         stdOutVisitor?: ProcessLineVisitor;
@@ -770,6 +776,13 @@ export class RunningProcess {
         appendLogs?: boolean,
         logBanner?: string,
     }): Promise<RunningProcess> {
+        if (cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli")) {
+            options = { ...options, cwd: path.resolve(options.cwd || process.cwd()), env: options.env ?? { ...process.env } as Record<string, string> };
+        }
+        await validateRelayerTemplate(cmds, options);
+        const guardianListener = cmds.includes("guardian-service")
+            ? await prepareGuardianService(cmds, options.cwd || process.cwd())
+            : undefined;
         const prepareLog = async (filePath: string | undefined) => {
             if (!filePath) return;
             if (options.appendLogs) {
@@ -788,12 +801,13 @@ export class RunningProcess {
             cwd: options.cwd || undefined,
             stdout: "pipe",
             stderr: "pipe",
-            env: options.env ? { ...process.env, ...options.env } : undefined,
+            env: cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli") ? options.env : options.env ? { ...process.env, ...options.env } : undefined,
             detached: true,
         });
 
         const runningProcess = new RunningProcess(proc, options.stdOutVisitor, options.stdErrVisitor, options.allOutputVisitor);
         runningProcess.cmds = cmds.slice();
+        runningProcess.guardianListener = guardianListener;
         runningProcess.startedAtMs = Date.now();
         runningProcess.healthySinceMs = runningProcess.startedAtMs;
         runningProcess.spawnOptions = {
@@ -882,6 +896,46 @@ export class RunningProcess {
             runningProcess.hasExited = true;
             runningProcess.onExit(code, exitSignal);
         })();
+        if (guardianListener) {
+            runningProcess.healthySinceMs = 0;
+            // Cold circuit build measured ~5min. Prove-proxy uses the same 600s listen budget
+            // (600 attempts × 1s). 120 × 500ms is only ~60s when each probe is connection-refused.
+            const readinessDeadlineMs = 600_000;
+            const readinessStartedMs = performance.now();
+            try {
+                for (;;) {
+                    if (proc.exitCode !== null) throw new Error("[DevNet] guardian-service exited before readiness");
+                    const remainingMs = readinessDeadlineMs - (performance.now() - readinessStartedMs);
+                    if (remainingMs <= 0) {
+                        throw new Error(`[DevNet] guardian-service port ${guardianListener.port} not ready within ${readinessDeadlineMs}ms`);
+                    }
+                    try {
+                        const host = guardianListener.host.includes(":") ? `[${guardianListener.host}]` : guardianListener.host;
+                        await waitForHttpUrl(`http://${host}:${guardianListener.port}/v1/sessions?after_nonce=0&limit=1`, {
+                            attempts: 1, timeoutMs: Math.min(1500, remainingMs), name: "guardian-service sessions",
+                            validateResponse: guardianSessionsReady,
+                        });
+                        if (performance.now() - readinessStartedMs >= readinessDeadlineMs) {
+                            throw new Error(`[DevNet] guardian-service port ${guardianListener.port} not ready within ${readinessDeadlineMs}ms`);
+                        }
+                        break;
+                    } catch (error) {
+                        const afterMs = readinessDeadlineMs - (performance.now() - readinessStartedMs);
+                        if (afterMs <= 0) {
+                            throw new Error(`[DevNet] guardian-service port ${guardianListener.port} not ready within ${readinessDeadlineMs}ms`);
+                        }
+                        await Bun.sleep(Math.min(500, afterMs));
+                    }
+                }
+                if (runningProcess.hasExited || proc.exitCode !== null) throw new Error("[DevNet] guardian-service exited before readiness");
+                runningProcess.initializationReady = true;
+                runningProcess.healthySinceMs = Date.now();
+            } catch (error) {
+                runningProcess.kill();
+                await waitForProcessExit(runningProcess);
+                throw error;
+            }
+        }
 
         return runningProcess;
     }
@@ -1094,7 +1148,7 @@ export const LOCAL_DEVNET_ZK_FINGERPRINT = "65e0169bfffd55f1c0ea9f76c111a5b15e65
 /** Local-devnet bridge relayer stays at registration 2 (Strategy5 user_id 524288). */
 export const LOCAL_DEVNET_RELAYER_REGISTRATION_ID = 2;
 export const LOCAL_DEVNET_RELAYER_USER_ID = 524288;
-/** Anvil account #0. Seeds an auto-generated encrypted bridge-relayer keystore; daemon.toml still uses keystore_path. */
+/** Anvil account #0. Seeds the auto-generated encrypted L1 sender keystore. Bridge identity is the preprovisioned multisig account, not a generated L2 key. */
 export const LOCAL_DEVNET_RELAYER_ZK_PRIVATE_KEY =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
@@ -1435,11 +1489,8 @@ export function realmP2pProcessorExtraArgs(host: string, realmId: number, subId:
 export function realmP2pEdgeExtraArgs(host: string, realmId: number, subId: number, edgeIndex: number, edgeCount: number): string[] {
     return ["--p2p-identity-key", realmP2pEdgeIdentityPath(realmId, subId, edgeIndex), "--p2p-listen", realmP2pListen(host, realmP2pEdgePort(realmId, subId, edgeIndex, edgeCount))];
 }
-function relayerStartedDetector(line: string): boolean {
-    return line.includes("connected to indexer postgres")
-        || line.includes("envio schema is ready")
-        || line.includes("indexer deposit sync window")
-        || line.includes("bridge relayer started");
+export function relayerStartedDetector(line: string): boolean {
+    return /(?:^|\s)(?<!aggregate )(?:multichain bridge relayer started|bridge relayer started)(?!\w)/.test(line);
 }
 function psyServicesStartedDetector(line: string): boolean {
     return line.includes('Starting API server on')
@@ -1684,25 +1735,35 @@ async function ensureEnvioHasuraPublicAccess(): Promise<void> {
     console.warn('[DevNet] Failed to set Envio Hasura public permissions for:', missingPermissions);
 }
 
+export async function guardianSessionsReady(response: Response): Promise<boolean> {
+    if (response.status !== 200) return false;
+    const page = await response.json();
+    return !!page && Array.isArray(page.sessions) && page.sessions.length <= 1
+        && typeof page.next_after_nonce === "number" && Number.isFinite(page.next_after_nonce)
+        && Number.isInteger(page.next_after_nonce) && page.next_after_nonce >= 0
+        && typeof page.has_more === "boolean";
+}
+
 async function waitForHttpUrl(
     url: string,
-    opts?: { attempts?: number; delayMs?: number; timeoutMs?: number; name?: string }
+    opts?: { attempts?: number; delayMs?: number; timeoutMs?: number; name?: string; validateResponse?: (response: Response) => Promise<boolean> }
 ): Promise<void> {
     const attempts = opts?.attempts ?? 20;
     const delayMs = opts?.delayMs ?? 1000;
     const timeoutMs = opts?.timeoutMs ?? 1500;
     const name = opts?.name ?? url;
     for (let i = 1; i <= attempts; i++) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
         try {
-            const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-            const res = await fetch(url, { method: "GET", signal: ctrl.signal });
-            clearTimeout(timer);
-            if (res.ok || res.status < 500) {
+            const res = await fetch(url, { method: "GET", signal: ctrl.signal, redirect: opts?.validateResponse ? "error" : "follow" });
+            if (opts?.validateResponse ? await opts.validateResponse(res) : res.ok || res.status < 500) {
                 return;
             }
         } catch {
             // retry
+        } finally {
+            clearTimeout(timer);
         }
         if (i < attempts) {
             await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -2057,7 +2118,7 @@ async function ensureBinaryBuilt(binaryPath: string, buildArgs: string[], cwd: s
 }
 
 function skipBuildEnabled(): boolean {
-    return process.env.PSY_SKIP_BUILD === "1";
+    return shouldSkipBranchSync(process.env.PSY_SKIP_BUILD);
 }
 
 async function requireReleaseBinaries(binaries: Array<{ name: string; path: string }>): Promise<void> {
@@ -2069,8 +2130,8 @@ async function requireReleaseBinaries(binaries: Array<{ name: string; path: stri
     }
     if (missing.length > 0) {
         throw new Error(
-            `[AutoSetup] PSY_SKIP_BUILD=1 requires existing release binaries. Missing: ${missing.join(", ")}. ` +
-            `Run once without PSY_SKIP_BUILD=1 to build them.`,
+            `[AutoSetup] Skipping build requires existing release binaries. Missing: ${missing.join(", ")}. ` +
+            `Set PSY_SKIP_BUILD=0 to build them.`,
         );
     }
 }
@@ -2091,7 +2152,7 @@ async function ensureAllBinariesBuilt(cwd: string): Promise<void> {
 
     if (skipBuildEnabled()) {
         await requireReleaseBinaries([...nodeBinaries, ...psyServicesBinaries]);
-        console.warn("[AutoSetup] PSY_SKIP_BUILD=1 — using existing release binaries without running Cargo");
+        console.warn("[AutoSetup] build skipped unless PSY_SKIP_BUILD=0 -- using existing release binaries without running Cargo");
         return;
     }
 
@@ -2375,7 +2436,7 @@ async function ensurePsySdkArtifacts(workspaceDir: string): Promise<{ rebuilt: b
     }
     if (skipBuildEnabled()) {
         throw new Error(
-            `[AutoSetup] PSY_SKIP_BUILD=1 requires current psy-sdk compiler artifacts. ` +
+            `[AutoSetup] Skipping build requires current psy-sdk compiler artifacts. ` +
             `Rebuild psy-sdk first (${staleReasons.join(", ")}).`,
         );
     }
@@ -2625,10 +2686,10 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
     await mkdir(path.dirname(bridgeRelayerPath), { recursive: true });
     let generated = false;
 
-    // Explicit local-only mode preserves the existing nonempty-file checks.
-    // No remote failure may implicitly select this mode.
-    if (process.env.PSY_SKIP_KEYSTORE === "1") {
-        console.warn("[AutoSetup] PSY_SKIP_KEYSTORE=1 — skipping trust-setup download/hash verification; keeping local ~/.psy/keystore as-is");
+    // Local mode is the default. Exact PSY_SKIP_KEYSTORE=0 selects remote refresh.
+    // A remote failure never selects local mode; this predicate is the only selector.
+    if (shouldSkipBranchSync(process.env.PSY_SKIP_KEYSTORE)) {
+        console.warn("[AutoSetup] keystore refresh skipped unless PSY_SKIP_KEYSTORE=0 -- keeping local ~/.psy/keystore as-is");
         const requiredTrustSetupEntries = [
             "circuit_groth16.bin",
             "pk_groth16.bin",
@@ -2646,12 +2707,12 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
         );
         if (invalidEntries.length > 0) {
             throw new Error(
-                `[AutoSetup] PSY_SKIP_KEYSTORE=1 requires a complete local trust setup. ` +
+                `[AutoSetup] Skipping keystore refresh requires a complete local trust setup. ` +
                 `Missing or empty files under ${keystoreDir}: ${invalidEntries.join(", ")}. ` +
-                `Generate them first or run without PSY_SKIP_KEYSTORE=1 to download the published setup.`,
+                `Generate them first or set PSY_SKIP_KEYSTORE=0 to download the published setup.`,
             );
         }
-        // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by [relayer_wallet] and [finalize]; trust setup remains under ~/.psy/keystore.
+        // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by L1 [finalize] and [[chains]]; trust setup remains under ~/.psy/keystore.
         if (!(await exists(bridgeRelayerPath))) {
             await ensurePsyContractsDependencies(contractsDir);
             await autoGenerateBridgeRelayerKeystore(bridgeRelayerPath, contractsDir);
@@ -2666,7 +2727,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
 
     // 1. bridge-relayer keystore: auto-generate only when missing.
     //    It is a dev key and never needs refreshing on its own; no interactive prompt.
-    // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by [relayer_wallet] and [finalize]; trust setup remains under ~/.psy/keystore.
+    // PSY_BRIDGE_RELAYER_KEYSTORE_PATH / BRIDGE_RELAYER_KEYSTORE_PATH / KEYSTORE_PATH override the encrypted UTC JSON used by L1 [finalize] and [[chains]]; trust setup remains under ~/.psy/keystore.
     if (!(await exists(bridgeRelayerPath))) {
         await ensurePsyContractsDependencies(contractsDir);
         await rm(bridgeRelayerPath).catch(() => undefined);
@@ -2792,7 +2853,59 @@ async function isUsableGenesisContracts(filePath: string): Promise<boolean> {
     }
 }
 
-async function ensureGenesisFiles(cwd: string): Promise<void> {
+export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv): Promise<{ args: string[]; env: NodeJS.ProcessEnv }> {
+    const configuredPath = env.PSY_RELAYER_MULTISIG_ACCOUNT;
+    if (!configuredPath?.trim()) throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT is required for Genesis generation");
+    const accountPath = path.resolve(cwd, configuredPath);
+    try {
+        if (!(await fs.promises.stat(accountPath)).isFile()) throw new Error("not a regular file");
+        const text = await fs.promises.readFile(accountPath, "utf-8");
+        const account = JSON.parse(text);
+        const fields = new Set<string>();
+        let previousToken = "";
+        for (const [token] of text.matchAll(/"(?:\\.|[^"\\])*"|:/g)) {
+            if (token === ":") {
+                const field = JSON.parse(previousToken);
+                if (fields.has(field)) throw new Error("duplicate field");
+                fields.add(field);
+            }
+            previousToken = token;
+        }
+        if (!account || Object.keys(account).sort().join(",") !== "contract_id,initial_policy" || account.contract_id !== 6) throw new Error("invalid account");
+        const policy = account.initial_policy;
+        if (!policy || Object.keys(policy).sort().join(",") !== "member_count,member_hashes,threshold,version"
+            || policy.version !== 1 || policy.threshold !== 2 || policy.member_count !== 3
+            || !Array.isArray(policy.member_hashes) || policy.member_hashes.length !== 8) throw new Error("invalid initial policy");
+        let previous = [0n, 0n, 0n, 0n];
+        for (const [index, hash] of policy.member_hashes.entries()) {
+            if (typeof hash !== "string" || !/^(?:[0-9a-fA-F]{2}){0,32}$/.test(hash)) throw new Error("invalid member hash");
+            const padded = hash.padStart(64, "0");
+            const limbs = [3, 2, 1, 0].map((limb) => BigInt(`0x${padded.slice(limb * 16, limb * 16 + 16)}`) % 0xffffffff00000001n);
+            const firstDifference = limbs.findIndex((limb, position) => limb !== previous[position]);
+            if (index < 3 ? firstDifference < 0 || limbs[firstDifference] < previous[firstDifference] : limbs.some((limb) => limb !== 0n)) throw new Error("invalid member order or padding");
+            previous = limbs;
+        }
+    } catch {
+        throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT must be a readable public MultisigAccount file with contract 6 and a valid initial two-of-three policy");
+    }
+    const configuredArtifact = env.PSY_MULTISIG_POLICY_ARTIFACT;
+    if (!configuredArtifact?.trim()) throw new Error("PSY_MULTISIG_POLICY_ARTIFACT is required for Genesis generation");
+    const artifactPath = path.resolve(cwd, configuredArtifact);
+    try {
+        if (!(await fs.promises.stat(artifactPath)).isFile()) throw new Error("not a regular file");
+        const artifact = JSON.parse(await fs.promises.readFile(artifactPath, "utf-8"));
+        if (artifact?.state_tree_height !== 4 || artifact?.abi?.contract?.state_tree_height !== 4
+            || !Array.isArray(artifact.circuit_definitions) || artifact.circuit_definitions.length !== 2
+            || artifact.circuit_definitions.map((definition: { name?: string }) => definition?.name).sort().join(",") !== "get_policy,set_policy") throw new Error("invalid policy artifact");
+    } catch {
+        throw new Error("PSY_MULTISIG_POLICY_ARTIFACT must be a readable policy artifact with height 4, ABI, get_policy and set_policy");
+    }
+    const childEnv: NodeJS.ProcessEnv = { ...env, PWD: cwd };
+    for (const key of ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"]) delete childEnv[key];
+    return { args: [path.join(cwd, "target", "release", "psy_dev_cli"), "generate-genesis-data", "--repo-root", cwd, "--relayer-multisig-account", accountPath, "--multisig-policy-artifact", artifactPath], env: childEnv };
+}
+
+export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
     const genesisPath = path.join(cwd, "genesis.json");
     const genesisContractsPath = path.join(cwd, "psy-genesis", "genesis_contracts.json");
     const genesisContractsStampPath = path.join(cwd, "psy-genesis", ".genesis_contracts.compiler-artifact.json");
@@ -2855,20 +2968,21 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
             console.log("[AutoSetup] genesis artifacts already exist");
             return;
         }
-        console.log("[AutoSetup] genesis.json present but not strict Unix-seconds genesis; regenerating");
+        throw new Error("[AutoSetup] Existing genesis.json is invalid; explicit authorized regeneration is required");
     }
 
     const cli = path.join(cwd, "target", "release", "psy_dev_cli");
     if (!(await exists(cli))) {
         throw new Error(
             `[AutoSetup] ${cli} is missing; build it with cargo build --release --bin psy_dev_cli ` +
-            `or run without PSY_SKIP_BUILD=1.`,
+            `or set PSY_SKIP_BUILD=0.`,
         );
     }
+    const generation = await planGenesisGeneration(cwd, env);
     console.log("[AutoSetup] Generating genesis.json via psy_dev_cli generate-genesis-data...");
-    const result = await runAndCapture([cli, "generate-genesis-data", "--repo-root", cwd], cwd);
-    if (result.code !== 0) {
-        throw new Error(`[AutoSetup] Failed to generate genesis.json: ${result.stderr || result.stdout}`);
+    const result = await runAndCapture(generation.args, cwd, generation.env);
+    if (result.code !== 0 || !(await isUsableGenesisData(genesisPath))) {
+        throw new Error(`[AutoSetup] Failed to generate genesis.json (exit ${result.code})`);
     }
     console.log("[AutoSetup] genesis.json generated");
 }
@@ -2879,6 +2993,7 @@ async function ensureDevEnvironment(
         requireDocker?: boolean;
         requireAnvil?: boolean;
         requireBun?: boolean;
+        env?: NodeJS.ProcessEnv;
     },
 ): Promise<void> {
     console.log("[AutoSetup] Checking dev environment...");
@@ -2915,15 +3030,14 @@ async function ensureDevEnvironment(
     const sdk = await ensurePsySdkArtifacts(cwd);
     await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
     const { generated } = await ensureKeystoreFiles(contractsDir);
-    // Only set default WALLET_PASSWORD when we generated the keystore this run.
-    // Must happen before generate-genesis-data decrypts that UTC JSON.
+    // Only set default WALLET_PASSWORD when we generated the L1 keystore this run.
     if (generated && !process.env.WALLET_PASSWORD) {
         process.env.WALLET_PASSWORD = "devnet";
         bridgeRelayerKeystoreGeneratedThisRun = true;
         console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
     }
     await ensureAllBinariesBuilt(cwd);
-    await ensureGenesisFiles(cwd);
+    await ensureGenesisFiles(cwd, { ...process.env, ...opts?.env });
     console.log("[AutoSetup] Dev environment ready.");
 }
 
@@ -3063,15 +3177,164 @@ async function ensurePsyContractsDependencies(contractsDir: string) {
 }
 
 export const ANVIL_STATE_PATH = path.join("db", "anvil", "state.json");
+export function localAnvilStatePath(repoCwd: string, network: L1DeploymentNetwork = "localhost"): string {
+    return path.join(repoCwd, network === "localhost" ? ANVIL_STATE_PATH : path.join("db", "anvil", network, "state.json"));
+}
+
+
+export interface PreservedAnvilGenesis {
+    timestamp: string;
+    header: Record<string, string>;
+    block1ParentHash?: string;
+}
 
 export interface LocalAnvilStatePlan {
     statePath: string;
     hasState: boolean;
     shouldResetEnvio: boolean;
+    genesis?: PreservedAnvilGenesis;
 }
 
-export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1DeploymentNetwork = "localhost"): Promise<LocalAnvilStatePlan> {
-    const statePath = path.join(repoCwd, network === "localhost" ? ANVIL_STATE_PATH : path.join("db", "anvil", network, "state.json"));
+function canonicalAnvilHeader(block: unknown, source: string): Record<string, string> {
+    if (typeof block !== "object" || block === null || !("header" in block)) {
+        throw new Error(`[DevNet] Anvil state ${source} has a block without a header object`);
+    }
+    const raw = block.header;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+        throw new Error(`[DevNet] Anvil state ${source} block header is not an object`);
+    }
+    const header: Record<string, string> = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (typeof value !== "string") {
+            throw new Error(`[DevNet] Anvil state ${source} header.${key} is not a string. Refusing a partial genesis identity.`);
+        }
+        header[key] = value;
+    }
+    if (header.number === undefined || header.timestamp === undefined) {
+        throw new Error(`[DevNet] Anvil state ${source} header is missing number or timestamp`);
+    }
+    return header;
+}
+
+function requireBlockHash(value: unknown, source: string): string {
+    if (typeof value !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(value)) {
+        throw new Error(`[DevNet] ${source} is ${JSON.stringify(value)}; expected a 32-byte hash`);
+    }
+    return value.toLowerCase();
+}
+
+/** Anvil mints a fresh genesis before loading --state, then the last serialized block 0 replaces it. */
+export function preservedAnvilGenesis(state: unknown, source: string): PreservedAnvilGenesis {
+    const blocks = typeof state === "object" && state !== null && "blocks" in state ? state.blocks : undefined;
+    if (!Array.isArray(blocks)) {
+        throw new Error(`[DevNet] Anvil state ${source} has no blocks array. Refusing to start a preserved chain without a genesis header to pin.`);
+    }
+    const genesisHeaders: Record<string, string>[] = [];
+    const block1Parents: string[] = [];
+    for (const block of blocks) {
+        const header = canonicalAnvilHeader(block, source);
+        const number = hexQuantityToBigInt(header.number, `Anvil state ${source} block number`);
+        if (number === 0n) genesisHeaders.push(header);
+        else if (number === 1n) block1Parents.push(requireBlockHash(header.parentHash, `Anvil state ${source} block 1 parentHash`));
+    }
+    if (genesisHeaders.length !== 1) {
+        const stamps = genesisHeaders.map((header) => header.timestamp).join(", ");
+        throw new Error(
+            `[DevNet] Anvil state ${source} has ${genesisHeaders.length} block 0 headers` +
+            `${stamps ? ` (timestamps ${stamps})` : ""}. Anvil keeps the last block 0 and that changes the genesis hash. ` +
+            "Refusing to select or drop one. Match block 1 parentHash to a trusted RPC block hash before replacing this snapshot.",
+        );
+    }
+    const header = genesisHeaders[0];
+    const timestamp = hexQuantityToBigInt(header.timestamp, `Anvil state ${source} genesis timestamp`);
+    if (timestamp > (1n << 64n) - 1n) {
+        throw new Error(`[DevNet] Anvil state ${source} genesis timestamp does not fit Anvil --timestamp`);
+    }
+    const parents = [...new Set(block1Parents)];
+    if (parents.length > 1) {
+        throw new Error(`[DevNet] Anvil state ${source} has conflicting block 1 parentHash values. Refusing to bind genesis.`);
+    }
+    return {
+        timestamp: timestamp.toString(),
+        header,
+        ...(parents.length === 1 ? { block1ParentHash: parents[0] } : {}),
+    };
+}
+
+export function localAnvilLaunchArgs(
+    port: number,
+    chainId: string,
+    statePath: string,
+    genesis?: PreservedAnvilGenesis,
+): string[] {
+    const args = [
+        "anvil", "--host", "0.0.0.0", "--port", String(port),
+        "--chain-id", chainId,
+        "--state", statePath, "--state-interval", process.env.ANVIL_STATE_INTERVAL || "60", "--preserve-historical-states", "-vvvv",
+    ];
+    if (genesis) args.push("--timestamp", genesis.timestamp);
+    return args;
+}
+
+function assertSavedGenesisFields(
+    actual: Record<string, unknown>,
+    expected: Record<string, string>,
+    source: string,
+): void {
+    const mismatches = Object.entries(expected).filter(([key, value]) => {
+        const got = actual[key];
+        return typeof got !== "string" || got.toLowerCase() !== value.toLowerCase();
+    }).map(([key]) => key);
+    if (mismatches.length > 0) {
+        throw new Error(`[DevNet] ${source} does not match the saved genesis header fields: ${mismatches.join(", ")}`);
+    }
+}
+
+async function anvilRpcHeader(
+    rpc: (rpcUrl: string, method: string, params: unknown[]) => Promise<unknown>,
+    rpcUrl: string,
+    tag: string,
+    source: string,
+): Promise<{ hash: string; parentHash: string; fields: Record<string, unknown> }> {
+    const block = await rpc(rpcUrl, "eth_getBlockByNumber", [tag, false]);
+    if (typeof block !== "object" || block === null) {
+        throw new Error(`[DevNet] ${source} returned ${JSON.stringify(block)}; expected a block header`);
+    }
+    const fields = block as Record<string, unknown>;
+    return {
+        hash: requireBlockHash(fields.hash, `${source} hash`),
+        parentHash: requireBlockHash(fields.parentHash, `${source} parentHash`),
+        fields,
+    };
+}
+
+/** Fail closed before deployment reuse. The hash is the RPC value, not a locally computed header hash. */
+export async function assertPreservedAnvilGenesis(
+    rpcUrl: string,
+    genesis: PreservedAnvilGenesis,
+    source: string,
+    rpc: (rpcUrl: string, method: string, params: unknown[]) => Promise<unknown> = anvilRpc,
+): Promise<void> {
+    const block0 = await anvilRpcHeader(rpc, rpcUrl, "0x0", `${source} block 0`);
+    const earliest = await anvilRpcHeader(rpc, rpcUrl, "earliest", `${source} earliest`);
+    if (block0.hash !== earliest.hash) {
+        throw new Error(`[DevNet] ${source} earliest hash ${earliest.hash} does not match block 0 hash ${block0.hash}`);
+    }
+    assertSavedGenesisFields(block0.fields, genesis.header, `${source} block 0`);
+    assertSavedGenesisFields(earliest.fields, genesis.header, `${source} earliest`);
+    if (genesis.block1ParentHash === undefined) return;
+    const expected = requireBlockHash(genesis.block1ParentHash, `${source} saved block 1 parentHash`);
+    if (block0.hash !== expected) {
+        throw new Error(`[DevNet] ${source} block 0 hash ${block0.hash} does not match saved block 1 parentHash ${expected}. Refusing the drifted genesis.`);
+    }
+    const block1 = await anvilRpcHeader(rpc, rpcUrl, "0x1", `${source} block 1`);
+    if (block1.parentHash !== expected) {
+        throw new Error(`[DevNet] ${source} block 1 parentHash ${block1.parentHash} does not match saved block 1 parentHash ${expected}`);
+    }
+}
+
+export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1DeploymentNetwork = "localhost", fork = false): Promise<LocalAnvilStatePlan> {
+    const statePath = localAnvilStatePath(repoCwd, network);
     const deploymentPath = path.join(repoCwd, "psy-contracts", "deployments", network, "deployed-contracts.json");
     const hasState = await exists(statePath);
     const hasDeployment = await exists(deploymentPath);
@@ -3081,10 +3344,20 @@ export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1Dep
             `${statePath}=${hasState}, ${deploymentPath}=${hasDeployment}. Run PURGE=1 make shutdown, then make run-all.`,
         );
     }
+    if (!hasState) {
+        return { statePath, hasState, shouldResetEnvio: true };
+    }
+    let snapshot: unknown;
+    try {
+        snapshot = JSON.parse(await fs.promises.readFile(statePath, "utf8"));
+    } catch (error) {
+        throw new Error(`[DevNet] Anvil state ${statePath} is not plain JSON: ${error}`);
+    }
     return {
         statePath,
         hasState,
-        shouldResetEnvio: !hasState,
+        shouldResetEnvio: false,
+        ...(fork ? {} : { genesis: preservedAnvilGenesis(snapshot, statePath) }),
     };
 }
 
@@ -3211,10 +3484,10 @@ async function readDeploymentChainId(repoCwd: string, network: L1DeploymentNetwo
     return chainId;
 }
 
-async function runAndCapture(cmd: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> {
+async function runAndCapture(cmd: string[], cwd?: string, env?: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string; stderr: string }> {
     const proc = Bun.spawn(cmd, {
         cwd,
-        env: cwd ? { ...process.env, PWD: cwd } : undefined,
+        env: env ?? (cwd ? { ...process.env, PWD: cwd } : undefined),
         stdout: "pipe",
         stderr: "pipe",
     });
@@ -3300,6 +3573,291 @@ async function waitForCommandSuccess(
 function parseTomlScalar(raw: string, key: string): string | undefined {
     const m = raw.match(new RegExp(`(?:^|\\n)\\s*${key}\\s*=\\s*"([^"]+)"`));
     return m?.[1];
+}
+const NETWORK_FIELDS = ["magic", "users_per_realm", "global_user_tree_height", "realm_user_tree_height", "group_realm_height", "realm_configs", "p2p", "coordinator_configs", "prove_proxy_url", "faucet_rpc_url", "nostr_relay_url", "native_currency", "native_currency_decimal", "native_currency_name", "fees"];
+
+function isConfigRelative(value: unknown): value is string {
+    return typeof value === "string" && !!value && !value.includes("\0") && !path.isAbsolute(value)
+        && !value.split(/[\\/]/).some((component) => !component || component === "." || component === "..");
+}
+
+function isLoopbackHost(hostname: string): boolean {
+    const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (host === "localhost" || host === "::1") return true;
+    const parts = host.split(".");
+    return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d+$/.test(part) && Number(part) <= 255);
+}
+
+function isHttpOrigin(value: unknown): value is string {
+    if (typeof value !== "string" || !value) return false;
+    try {
+        const url = new URL(value);
+        return url.protocol === "http:" && !!url.hostname && url.port !== "0"
+            && !url.username && !url.password && url.pathname === "/" && !url.search && !url.hash;
+    } catch { return false; }
+}
+
+function isSocketAddress(value: unknown, history: boolean): boolean {
+    if (typeof value !== "string" || !value.trim() || value.includes("\0")) return false;
+    const ipv6 = value.startsWith("[") ? value.match(/^\[([^\]]+)\]:(\d+)$/) : null;
+    const host = ipv6 ? ipv6[1] : value.slice(0, value.lastIndexOf(":"));
+    const portText = ipv6 ? ipv6[2] : value.slice(value.lastIndexOf(":") + 1);
+    const port = Number(portText);
+    if (!host || !ipv6 && host.includes(":") || !Number.isInteger(port) || port < 0 || port > 65535) return false;
+    if (net.isIP(host) === 0) return false;
+    return !history || port !== 0 && host !== "0.0.0.0" && host !== "::";
+}
+
+function isStandardSecret(value: unknown, id: string, password: boolean): boolean {
+    if (typeof value !== "string" || !path.isAbsolute(value)) return false;
+    const home = homedir();
+    const name = password ? `guardian-${id}.password` : `guardian-${id}.keystore.json`;
+    return value === path.join(home, ".psy", "keystore", name);
+}
+
+function isL1Endpoint(value: unknown): boolean {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const endpoint = value as Record<string, unknown>;
+    if (Object.keys(endpoint).length !== 2 || !Number.isInteger(endpoint.chain_index) || (endpoint.chain_index as number) < 0 || (endpoint.chain_index as number) > 255) return false;
+    if (typeof endpoint.rpc_url !== "string") return false;
+    try {
+        const url = new URL(endpoint.rpc_url);
+        const https = url.protocol === "https:";
+        const loopbackHttp = url.protocol === "http:" && isLoopbackHost(url.hostname);
+        return (https || loopbackHttp) && !!url.hostname && !url.username && !url.password && !url.hash;
+    } catch { return false; }
+}
+
+function isNetworkProjection(value: unknown): boolean {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const network = value as Record<string, unknown>;
+    return NETWORK_FIELDS.every((field) => Object.hasOwn(network, field))
+        && typeof network.magic === "string" && !!network.magic
+        && typeof network.nostr_relay_url === "string"
+        && typeof network.native_currency === "string"
+        && typeof network.native_currency_name === "string"
+        && Number.isInteger(network.users_per_realm)
+        && [network.global_user_tree_height, network.realm_user_tree_height, network.group_realm_height, network.native_currency_decimal].every((value) => Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 255)
+        // Trusted prove proxies must be 1..8 distinct HTTP origins.
+        && Array.isArray(network.prove_proxy_url) && network.prove_proxy_url.length >= 1 && network.prove_proxy_url.length <= 8
+        && network.prove_proxy_url.every(isHttpOrigin)
+        && new Set(network.prove_proxy_url.map((entry) => new URL(entry).origin)).size === network.prove_proxy_url.length
+        && Array.isArray(network.coordinator_configs) && network.coordinator_configs.length > 0
+        && network.coordinator_configs.every((entry) => !!entry && typeof entry === "object" && Number.isInteger((entry as Record<string, unknown>).id) && Array.isArray((entry as Record<string, unknown>).rpc_url))
+        && Array.isArray(network.realm_configs)
+        && !!network.p2p && typeof network.p2p === "object" && Number.isInteger((network.p2p as Record<string, unknown>).checkpoints_per_epoch)
+        && !!network.fees && typeof network.fees === "object" && ["register_user_fee", "deploy_contract_fee", "guta_fee", "da_fee"].every((field) => Number.isInteger((network.fees as Record<string, unknown>)[field]));
+}
+
+
+
+export async function resolveGuardianConfigPath(cwd: string, configuredPath: string | undefined): Promise<string> {
+    const context = "[DevNet] Bridge relayer requires PSY_GUARDIAN_CONFIG pointing to an existing public GuardianConfig JSON";
+    if (!configuredPath?.trim()) {
+        throw new Error(`${context}; supply it in the environment or --env. Guardian credentials, registration and bootstrap are operator prerequisites; no L2 wallet fallback is available.`);
+    }
+    const configPath = path.resolve(cwd, configuredPath);
+    let config: Record<string, unknown>;
+    try {
+        const stat = await fs.promises.lstat(configPath);
+        if (!stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error("not a regular bounded file");
+        config = JSON.parse(await fs.promises.readFile(configPath, "utf8"));
+    } catch {
+        throw new Error(`${context}; the selected path must be a readable, non-symlink regular file containing valid JSON (at most 64 MiB).`);
+    }
+    if (!config || typeof config !== "object" || Array.isArray(config)) {
+        throw new Error(`${context}; expected only GuardianConfig public fields: network, guardians 1..3 and client, with no TLS metadata, database path or embedded signing keys.`);
+    }
+    const network = config.network;
+    const guardians = config.guardians;
+    const client = config.client;
+    const signerFields = ["listen_address", "signing_key_secret_path", "signing_key_password_secret_path"];
+    const clientFields = ["endpoints", "archive_path", "listen_address", "l1_endpoints"];
+    const guardianKeys = guardians && typeof guardians === "object" && !Array.isArray(guardians) ? Object.keys(guardians) : [];
+    const home = homedir();
+    const signerValid = guardianKeys.length === 3 && ["1", "2", "3"].every((id) => guardianKeys.includes(id))
+        && ["1", "2", "3"].every((id) => {
+            const signer = (guardians as Record<string, unknown>)[id];
+            if (!signer || typeof signer !== "object" || Array.isArray(signer)) return false;
+            const fields = signer as Record<string, unknown>;
+            return Object.keys(fields).length === signerFields.length
+                && signerFields.every((field) => Object.hasOwn(fields, field))
+                && isSocketAddress(fields.listen_address, false)
+                && isStandardSecret(fields.signing_key_secret_path, id, false)
+                && isStandardSecret(fields.signing_key_password_secret_path, id, true);
+        });
+    const clientRecord = client && typeof client === "object" && !Array.isArray(client) ? client as Record<string, unknown> : null;
+    const endpoints = clientRecord?.endpoints;
+    const l1 = clientRecord?.l1_endpoints;
+    const chainIndexes = Array.isArray(l1) && l1.every(isL1Endpoint) ? l1.map((endpoint) => (endpoint as Record<string, unknown>).chain_index) : [];
+    const clientValid = !!clientRecord && Object.keys(clientRecord).length === clientFields.length
+        && clientFields.every((field) => Object.hasOwn(clientRecord, field))
+        && isConfigRelative(clientRecord.archive_path) && clientRecord.archive_path === "archive/relayer-journal"
+        && isSocketAddress(clientRecord.listen_address, true)
+        && Array.isArray(endpoints) && endpoints.length === 3 && endpoints.every(isHttpOrigin)
+        && new Set(endpoints.map((endpoint) => new URL(endpoint).origin)).size === 3
+        && chainIndexes.length === (Array.isArray(l1) ? l1.length : -1) && new Set(chainIndexes).size === chainIndexes.length;
+    if (Object.keys(config).some((field) => !["network", "guardians", "client"].includes(field))
+        || !["network", "guardians", "client"].every((field) => Object.hasOwn(config, field))
+        || !isNetworkProjection(network) || !signerValid || !clientValid || !home) {
+        throw new Error(`${context}; expected only GuardianConfig public fields: network, guardians 1..3 and client, with no TLS metadata, database path or embedded signing keys.`);
+    }
+    return configPath;
+}
+
+// Guardian journals live beside the public config, outside purgeable devnet state.
+// Existing journals and their permissions are never rewritten by the launcher.
+export async function prepareGuardianService(cmds: readonly string[], cwd: string): Promise<{ host: string; port: number }> {
+    const id = cmds[cmds.indexOf("--guardian-id") + 1];
+    const configIndex = cmds.indexOf("--config");
+    const dbIndex = cmds.indexOf("--db-path");
+    if (!["1", "2", "3"].includes(id) || configIndex < 0 || dbIndex < 0 || cmds[dbIndex + 1] !== `journal/${id}.redb`) {
+        throw new Error("[DevNet] Invalid guardian-service template");
+    }
+    const configPath = await resolveGuardianConfigPath(cwd, cmds[configIndex + 1]);
+    const config = JSON.parse(await fs.promises.readFile(configPath, "utf8"));
+    const address = config.guardians[id].listen_address as string;
+    const port = Number(address.slice(address.lastIndexOf(":") + 1));
+    const host = address.slice(0, address.lastIndexOf(":")).replace(/^\[|\]$/g, "");
+    if (port === 0) throw new Error("[DevNet] guardian-service requires a fixed listen port");
+    // Binding, rather than connecting, also rejects occupied wildcard listeners.
+    await new Promise<void>((resolve, reject) => {
+        const server = net.createServer();
+        server.once("error", reject);
+        server.listen({ host, port, exclusive: true }, () => server.close((error) => error ? reject(error) : resolve()));
+    });
+    const journal = path.join(path.dirname(configPath), "journal");
+    await validateDaemonPath(journal, "output-directory", DEVNET_PURGE_PATHS.map((target) => path.resolve(cwd, target)), "guardian journal metadata");
+    await fs.promises.mkdir(journal, { recursive: true, mode: 0o700 });
+    const stat = await fs.promises.lstat(journal);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) {
+        throw new Error("[DevNet] guardian journal must be an owner-only directory");
+    }
+    return { host: host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host, port };
+}
+
+const DEVNET_PURGE_PATHS = [
+    "local_checkpoints", "db/anvil", "logs",
+    ...["localhost", "localhostBsc", "localhostBase", "sepolia", "ethereum"].map((network) => `psy-contracts/deployments/${network}`),
+];
+
+function daemonConfigError(field: string): Error {
+    return new Error(`[DevNet] PSY_BRIDGE_DAEMON_CONFIG: invalid or unavailable ${field}; operator provisioning required`);
+}
+
+async function validateDaemonPath(file: string, kind: "file" | "directory" | "output" | "output-directory", purgeTargets: readonly string[], field: string): Promise<void> {
+    const contains = (parent: string, child: string) => {
+        const relative = path.relative(parent, child);
+        return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+    };
+    const realPath = async (target: string): Promise<string> => {
+        try { return await fs.promises.realpath(target); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            // A dangling symlink is not an absent output directory.
+            try { await fs.promises.lstat(target); throw daemonConfigError(field); }
+            catch (missing) { if ((missing as NodeJS.ErrnoException).code !== "ENOENT") throw missing; }
+            const parent = path.dirname(target);
+            if (parent === target) throw error;
+            return path.join(await realPath(parent), path.basename(target));
+        }
+    };
+    try {
+        const resolved = await realPath(file);
+        for (const target of purgeTargets) {
+            if (contains(target, file) || contains(await realPath(target), resolved)) throw daemonConfigError(field);
+        }
+        try {
+            const stat = await fs.promises.stat(file);
+            if ((kind === "directory" || kind === "output-directory") ? !stat.isDirectory() : !stat.isFile()) throw daemonConfigError(field);
+        } catch (error) {
+            if ((kind !== "output" && kind !== "output-directory") || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+    } catch { throw daemonConfigError(field); }
+}
+
+export async function resolveBridgeDaemonConfigPath(
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    purge: boolean = false,
+    parse: ((text: string) => unknown) | undefined = Bun.TOML?.parse,
+): Promise<string> {
+    if (typeof parse !== "function") throw daemonConfigError("Bun.TOML.parse capability");
+    const textField = (value: unknown, field: string): string => {
+        if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw daemonConfigError(field);
+        return value;
+    };
+    const table = (value: unknown, field: string): Record<string, unknown> => {
+        if (!value || typeof value !== "object" || Array.isArray(value) || value instanceof Date) throw daemonConfigError(field);
+        return value as Record<string, unknown>;
+    };
+    const integer = (value: unknown, bits: number, field: string): void => {
+        if (typeof value !== "bigint" && (typeof value !== "number" || !Number.isSafeInteger(value))) throw daemonConfigError(field);
+        const n = BigInt(value as number | bigint);
+        if (n < 0n || n >= (1n << BigInt(bits))) throw daemonConfigError(field);
+    };
+    const configPath = path.resolve(cwd, textField(env.PSY_BRIDGE_DAEMON_CONFIG, "config path"));
+    const purgeTargets = purge ? DEVNET_PURGE_PATHS.map((target) => path.resolve(cwd, target)) : [];
+    await validateDaemonPath(configPath, "file", purgeTargets, "config path metadata");
+    let config: Record<string, unknown>;
+    try {
+        if ((await fs.promises.stat(configPath)).size > 64 * 1024 * 1024) throw daemonConfigError("config size");
+        config = table(parse(await fs.promises.readFile(configPath, "utf8")), "config table");
+    } catch { throw daemonConfigError("TOML document (details withheld)"); }
+    const inspectCredentials = async (value: unknown): Promise<void> => {
+        if (!value || typeof value !== "object") return;
+        for (const [field, child] of Object.entries(value)) {
+            if (field === "private_key" && child !== "") throw daemonConfigError("inline private_key");
+            if (field === "keystore_path") {
+                await validateDaemonPath(path.resolve(cwd, textField(child, "keystore_path")), "file", purgeTargets, "keystore_path metadata");
+            } else if (child && typeof child === "object") await inspectCredentials(child);
+        }
+    };
+    await inspectCredentials(config);
+    for (const field of ["rpc_config", "guardian_config"]) {
+        await validateDaemonPath(path.resolve(cwd, textField(config[field], field)), "file", purgeTargets, `${field} metadata`);
+    }
+    textField(config.services_url, "services_url");
+    integer(config.withdraw_method_id, 64, "withdraw_method_id");
+    for (const field of ["proof_dir", "poll_interval_secs", "confirmation_lag_checkpoints", "max_checkpoint_batch", "max_concurrent_l2_batches"]) {
+        if (!Object.hasOwn(config, field) || config[field] == null) continue;
+        if (field === "proof_dir") textField(config[field], field);
+        else integer(config[field], 64, field);
+    }
+    if (Object.hasOwn(config, "finalize") && config.finalize != null) table(config.finalize, "finalize");
+    if (Object.hasOwn(config, "chains")) {
+        if (!Array.isArray(config.chains)) throw daemonConfigError("chains");
+        for (const value of config.chains) {
+            const chain = table(value, "chains");
+            integer(chain.chain_index, 8, "chains.chain_index");
+            for (const field of ["network_id", "deployments_network"]) textField(chain[field], `chains.${field}`);
+            if (Object.hasOwn(chain, "family") && chain.family != null) textField(chain.family, "chains.family");
+        }
+    }
+    const guardianPath = path.resolve(cwd, config.guardian_config as string);
+    if (env.PSY_GUARDIAN_CONFIG !== undefined && path.resolve(cwd, env.PSY_GUARDIAN_CONFIG) !== guardianPath) {
+        throw daemonConfigError("PSY_GUARDIAN_CONFIG coherence");
+    }
+    await resolveGuardianConfigPath(cwd, guardianPath);
+    let guardian: Record<string, unknown>;
+    try { guardian = JSON.parse(await fs.promises.readFile(guardianPath, "utf8")); }
+    catch { throw daemonConfigError("guardian_config public JSON"); }
+    const guardianRoot = path.dirname(guardianPath);
+    const authorization = path.resolve(guardianRoot, "authorization");
+    await validateDaemonPath(path.resolve(authorization, "index.json"), "file", purgeTargets, "guardian_config.authorization/index.json metadata");
+    await validateDaemonPath(path.resolve(authorization, "versions"), "directory", purgeTargets, "guardian_config.authorization/versions metadata");
+    const client = guardian.client as Record<string, unknown>;
+    await validateDaemonPath(path.resolve(guardianRoot, client.archive_path as string), "output-directory", purgeTargets, "guardian_config.client.archive_path metadata");
+    return configPath;
+}
+
+export async function validateRelayerTemplate(cmds: readonly string[], options: RunningProcess["spawnOptions"]): Promise<void> {
+    if (!cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli") || cmds.includes("guardian-service")) return;
+    const cwd = options.cwd || process.cwd();
+    const env = options.env ?? process.env;
+    const configPath = await resolveBridgeDaemonConfigPath(cwd, env);
+    const index = cmds.indexOf("--config");
+    if (index < 0 || !cmds[index + 1] || path.resolve(cwd, cmds[index + 1]) !== configPath) throw daemonConfigError("saved --config coherence");
 }
 
 const ENVIO_NPM_VERSION = "2.32.10";
@@ -3546,6 +4104,7 @@ async function killKnownProcesses(): Promise<void> {
         "bun run dev/locSetupV4.ts",
         "psy_node_cli",
         "psy_worker_cli",
+        "psy_relayer_cli",
         "psy_user_cli prove-proxy",
         "psy_user_cli faucet-server",
         "psy-services/target/release/psy-services",
@@ -3613,6 +4172,140 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
         await runIgnoreErrors(["docker", "volume", "rm", "-f", "psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data", "psy-devnet-nats"]);
     }
 }
+const LOCAL_ANVIL_RPCS: ReadonlyArray<{ network: L1DeploymentNetwork; port: number }> = [
+    { network: "localhost", port: 8545 },
+    { network: "localhostBsc", port: 9545 },
+    { network: "localhostBase", port: 10545 },
+];
+
+function hexQuantityToBigInt(value: unknown, source: string): bigint {
+    if (typeof value !== "string" || !/^0x[0-9a-fA-F]+$/.test(value)) {
+        throw new Error(`[DevNet] ${source} returned ${JSON.stringify(value)}; expected a hex quantity`);
+    }
+    return BigInt(value);
+}
+
+/** anvil_dumpState(true) is always a hex-encoded gzip of plain state JSON and retains historical states. */
+export function decodeAnvilDumpStateHex(dump: unknown, source: string): string {
+    if (typeof dump !== "string" || !/^0x(?:[0-9a-fA-F]{2})+$/.test(dump)) {
+        throw new Error(`[DevNet] anvil_dumpState for '${source}' returned ${typeof dump}; expected hex-encoded gzip`);
+    }
+    let plain: Uint8Array;
+    try {
+        plain = Bun.gunzipSync(Buffer.from(dump.slice(2), "hex"));
+    } catch (error) {
+        throw new Error(`[DevNet] anvil_dumpState for '${source}' is not decodable gzip: ${error}`);
+    }
+    return new TextDecoder().decode(plain);
+}
+
+/** Anvil's blocks array is not tip-ordered; the tip is top-level best_block_number. */
+export function anvilStateBestBlockNumber(state: unknown, source: string): bigint {
+    if (typeof state !== "object" || state === null || !("best_block_number" in state)) {
+        throw new Error(`[DevNet] Anvil state ${source} has no best_block_number`);
+    }
+    const best = state.best_block_number;
+    if (typeof best === "number") {
+        if (!Number.isSafeInteger(best) || best < 0) throw new Error(`[DevNet] Anvil state ${source} best_block_number is not a safe integer`);
+        return BigInt(best);
+    }
+    if (typeof best === "string" && /^\d+$/.test(best)) return BigInt(best);
+    throw new Error(`[DevNet] Anvil state ${source} best_block_number is not a safe integer`);
+}
+
+async function stageFsSyncedAnvilState(statePath: string, stateText: string): Promise<string> {
+    const stagedPath = `${statePath}.preserve-${process.pid}.tmp`;
+    await mkdir(path.dirname(stagedPath), { recursive: true });
+    const handle = await fs.promises.open(stagedPath, "w");
+    try {
+        await handle.writeFile(stateText, "utf8");
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+    return stagedPath;
+}
+
+async function publishAnvilStateSnapshot(stagedPath: string, statePath: string): Promise<void> {
+    await fs.promises.rename(stagedPath, statePath);
+    try {
+        const directory = await fs.promises.open(path.dirname(statePath), "r");
+        try { await directory.sync(); } finally { await directory.close(); }
+    } catch (error) {
+        console.warn(`[DevNet] Anvil state directory sync failed for ${statePath}: ${error}`);
+    }
+}
+
+export async function preserveLiveAnvilRpc(
+    rpcUrl: string,
+    statePath: string,
+    source: string,
+    rpc: (rpcUrl: string, method: string, params: unknown[]) => Promise<unknown> = anvilRpc,
+    stop?: () => Promise<void>,
+): Promise<void> {
+    const head = hexQuantityToBigInt(await rpc(rpcUrl, "eth_blockNumber", []), `eth_blockNumber for '${source}'`);
+    const stateText = decodeAnvilDumpStateHex(await rpc(rpcUrl, "anvil_dumpState", [true]), source);
+    let snapshot: unknown;
+    try { snapshot = JSON.parse(stateText); }
+    catch (error) { throw new Error(`[DevNet] anvil_dumpState for '${source}' is not plain JSON: ${error}`); }
+    const best = anvilStateBestBlockNumber(snapshot, source);
+    const stagedPath = await stageFsSyncedAnvilState(statePath, stateText);
+    if (best !== head) {
+        throw new Error(`[DevNet] Anvil '${source}' snapshot best block ${best} does not match head ${head}; staged snapshot kept at ${stagedPath}`);
+    }
+    if (stop) await stop();
+    await publishAnvilStateSnapshot(stagedPath, statePath);
+    console.log(`[DevNet] preserved Anvil '${source}' state at ${statePath} (best block ${best})`);
+}
+
+async function tcpPortOpen(port: number): Promise<boolean> {
+    return await new Promise((resolve) => {
+        const socket = net.createConnection({ host: "127.0.0.1", port });
+        const done = (open: boolean) => { socket.destroy(); resolve(open); };
+        socket.setTimeout(300);
+        socket.once("connect", () => done(true));
+        socket.once("timeout", () => done(false));
+        socket.once("error", () => done(false));
+    });
+}
+
+/** Absent-owner failsafe: a live Anvil has unknown producers, so preservation is refused. */
+export async function preserveUnownedLiveAnvils(
+    _repoCwd: string,
+    _rpc: (rpcUrl: string, method: string, params: unknown[]) => Promise<unknown> = anvilRpc,
+    portOpen: (port: number) => Promise<boolean> = tcpPortOpen,
+): Promise<void> {
+    const live = [];
+    for (const chain of LOCAL_ANVIL_RPCS) {
+        if (await portOpen(chain.port)) live.push(chain.port);
+    }
+    if (live.length > 0) {
+        throw new Error(`[DevNet] live Anvil on ports ${live.join(", ")} has no supervisor to quiesce its producers; refusing to snapshot or kill it`);
+    }
+}
+
+export async function requestOwnedAnvilShutdown(repoRoot: string, purge: boolean): Promise<"owned" | "absent"> {
+    const socketPath = devnetControlSocketPath(repoRoot);
+    let stat: fs.Stats;
+    try { stat = await fs.promises.stat(socketPath); }
+    catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+        throw error;
+    }
+    if (!stat.isSocket()) return "absent";
+    try {
+        await sendDevnetControlCommand(repoRoot, purge ? "shutdown-purge" : "shutdown-preserve");
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("ECONNREFUSED") || message.includes("ENOENT")) return "absent";
+        if (message.includes("unsupported command")) {
+            throw new Error(`[DevNet] running supervisor at ${socketPath} does not support shutdown-preserve; restart it before PURGE=0 shutdown. Refusing to kill a live owner that cannot save Anvil.`);
+        }
+        throw error;
+    }
+    return "owned";
+}
+
 
 interface ProcessOptions {
     purge?: boolean;
@@ -3671,8 +4364,9 @@ function applicationStartRank(process: RunningProcess): number {
     if (process.name === "psy_services") return 7;
     if (process.name.startsWith("psy_indexer")) return 8;
     if (command.includes("faucet-server")) return 9;
-    if (command.includes("psy_relayer_cli")) return 10;
-    return 11;
+    if (command.includes("guardian-service")) return 10;
+    if (command.includes("psy_relayer_cli")) return 11;
+    return 12;
 }
 
 function sortedApplicationProcesses(processes: RunningProcess[]): RunningProcess[] {
@@ -3689,6 +4383,7 @@ export function applicationListenerPorts(processes: RunningProcess[]): number[] 
     const ports = new Set<number>();
     for (const process of processes) {
         const command = process.cmds;
+        if (process.guardianListener) ports.add(process.guardianListener.port);
         for (let index = 0; index < command.length - 1; index += 1) {
             if (command[index] === "--port") {
                 const port = Number(command[index + 1]);
@@ -3759,7 +4454,7 @@ async function waitForProcessExit(process: RunningProcess, timeoutMs: number = 1
     process.killWithSignal("SIGKILL");
     await process.proc.exited;
 }
-class DevNetProcessManager {
+export class DevNetProcessManager {
     spawnedProcesses: RunningProcess[] = [];
     needsStartDb: boolean = false;
     /** When true, exited children must not be auto-restarted (teardown/Ctrl+C). */
@@ -4033,6 +4728,7 @@ class DevNetProcessManager {
         banner: string = `\n===== [DevNet supervisor] CONTROLLED START at ${new Date().toISOString()} =====\n`,
         track: boolean = true,
     ): Promise<RunningProcess> {
+        await validateRelayerTemplate(template.cmds, template.spawnOptions);
         const options = { ...template.spawnOptions, appendLogs: true, logBanner: banner };
         const process = template.useInitHint && template.hintDetector
             ? await RunningProcess.spawnWithInitializationHintWithRetry(
@@ -4092,6 +4788,11 @@ class DevNetProcessManager {
                 }
             }
             await waitForTcpPortsClosed(this.host, applicationListenerPorts(applications));
+            for (const process of applications) {
+                if (process.guardianListener && process.guardianListener.host !== this.host) {
+                    await waitForTcpPortsClosed(process.guardianListener.host, [process.guardianListener.port]);
+                }
+            }
             this.applicationLifecycleState = "stopped";
         } catch (error) {
             this.applicationLifecycleState = "stopping";
@@ -4108,6 +4809,7 @@ class DevNetProcessManager {
         if (this.applicationLifecycleState !== "stopped") {
             throw new Error(`[DevNet][control] cannot start applications while state=${this.applicationLifecycleState}`);
         }
+        for (const template of this.pausedApplicationProcesses) await validateRelayerTemplate(template.cmds, template.spawnOptions);
         this.applicationLifecycleState = "starting";
         const templates = sortedApplicationProcesses(this.pausedApplicationProcesses);
         const started: RunningProcess[] = [];
@@ -4137,6 +4839,7 @@ class DevNetProcessManager {
     }
 
     async restartApplications(cwd: string = "."): Promise<void> {
+        for (const template of splitDevnetProcesses(this.spawnedProcesses).applications) await validateRelayerTemplate(template.cmds, template.spawnOptions);
         await this.stopApplications(cwd, false);
         await this.startApplications(cwd);
     }
@@ -4151,6 +4854,39 @@ class DevNetProcessManager {
         const directives = current.split(",").map((value) => value.trim()).filter(Boolean);
         if (directives.some((value) => value === directive || value.startsWith(`${directive.split("=")[0]}=`) || value === directive.split("=")[0])) return env;
         return { ...env, RUST_LOG: `${current},${directive}` };
+    }
+
+
+    async startGuardianServices(cwd: string, daemonConfigPath: string): Promise<void> {
+        const config = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath, "utf8"));
+        const guardianPath = await resolveGuardianConfigPath(cwd, config.guardian_config as string);
+        // All three guardians launch concurrently; each spawn blocks on its own 600s
+        // HTTP readiness budget and kills its own child when readiness fails. Every
+        // successful child is tracked immediately so a failing sibling cannot orphan
+        // it; on any failure the still-running children are killed and awaited before
+        // startup fails. The relayer therefore starts only after all three are ready.
+        const started: RunningProcess[] = [];
+        const results = await Promise.allSettled([1, 2, 3].map((id) => (async () => {
+            const name = `guardian_${id}`;
+            const process = await RunningProcess.spawn([
+                './target/release/psy_relayer_cli', 'guardian-service',
+                '--config', guardianPath, '--guardian-id', String(id), '--db-path', `journal/${id}.redb`,
+            ], {
+                cwd,
+                stdoutLogFile: path.join(cwd, 'logs', `${name}_logs.txt`),
+                stderrLogFile: path.join(cwd, 'logs', `${name}_errs.txt`),
+                env: this.getEnvWithRustLogDirective('psy_relayer_cli=info'),
+            });
+            started.push(process);
+            return this.track(process, name);
+        })()));
+        const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failure) {
+            for (const process of started) process.killWithSignal("SIGTERM");
+            await Promise.all(started.map((process) => waitForProcessExit(process)));
+            this.spawnedProcesses = this.spawnedProcesses.filter((process) => !started.includes(process));
+            throw failure.reason;
+        }
     }
 
     async setupProcesses(options: ProcessOptions): Promise<void> {
@@ -4172,9 +4908,13 @@ class DevNetProcessManager {
 
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
         // Determine what components to start
-        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || !!options.relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
+        const relayer = !!options.relayer || !!options.bridgeProposerDaemon;
+        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
         const startAll = !hasOnlyOptions;
-        const startBridgeProposerDaemon = startAll || !!options.bridgeProposerDaemon || !!options.relayer || !!options.bridgeUi;
+        const startBridgeProposerDaemon = shouldRequireGuardianConfig(startAll, options);
+        const daemonConfigPath = startBridgeProposerDaemon
+            ? await resolveBridgeDaemonConfigPath(cwd, this.getEnv(), !!options.purge)
+            : undefined;
 
         const startCoordinatorProcessor = startAll || !!options.coordinator;
         const startCoordinatorWorkers = coordinatorWorkersCount > 0;
@@ -4633,7 +5373,7 @@ class DevNetProcessManager {
         if (options.l1 || startAll) {
             const local = l1Network === "localhost" || l1Fork;
             const statePlans = local
-                ? await Promise.all(relayerChains.map((chain) => resolveLocalAnvilStatePlan(cwd, chain.deploymentsNetwork)))
+                ? await Promise.all(relayerChains.map((chain) => resolveLocalAnvilStatePlan(cwd, chain.deploymentsNetwork, l1Fork)))
                 : [];
             if (statePlans.some((plan) => plan.hasState) && statePlans.some((plan) => !plan.hasState)) {
                 throw new Error("[DevNet] Partial persisted L1 cohort; refusing to reset retained chains. Run PURGE=1 make shutdown, then make run-all.");
@@ -4646,14 +5386,15 @@ class DevNetProcessManager {
                     await mkdir(path.dirname(statePlan.statePath), { recursive: true });
                     const rpc = new URL(chain.rpcUrl);
                     const port = Number(rpc.port || (rpc.protocol === "https:" ? 443 : 80));
-                    const args = [
-                        "anvil", "--host", "0.0.0.0", "--port", String(port),
-                        "--chain-id", String(chainMeta.l1ChainId),
-                        "--state", statePlan.statePath, "--state-interval", process.env.ANVIL_STATE_INTERVAL || "60", "-vvvv",
-                        // --steps-tracing is omitted: it records full execution traces
-                        // for every block into the state dump (~21MB/block, 20GB in
-                        // ~1000 blocks) until the periodic write starves the RPC loop.
-                    ];
+                    const args = localAnvilLaunchArgs(
+                        port,
+                        String(chainMeta.l1ChainId),
+                        statePlan.statePath,
+                        statePlan.genesis,
+                    );
+                    // --steps-tracing is omitted: it records full execution traces
+                    // for every block into the state dump (~21MB/block, 20GB in
+                    // ~1000 blocks) until the periodic write starves the RPC loop.
                     if (l1Fork) {
                         const forkEnvKey = resolveForkRpcEnvKey(l1Network, cfgEntry, stage);
                         const forkRpcUrl = process.env[forkEnvKey];
@@ -4674,6 +5415,12 @@ class DevNetProcessManager {
                 await waitForHttpUrl(chain.rpcUrl, {
                     attempts: 30, delayMs: local ? 500 : 1000, timeoutMs: local ? 1500 : 3000, name: `${chainMeta.name} RPC`,
                 });
+                if (statePlan?.genesis) {
+                    await assertPreservedAnvilGenesis(chain.rpcUrl, statePlan.genesis, chain.deploymentsNetwork);
+                }
+                if (statePlan) {
+                    await setLocalAnvilIntervalMining(chain.rpcUrl);
+                }
                 await deployPsyContracts(cwd, chain.rpcUrl, chain.deploymentsNetwork, {
                     fundDevAccounts: local && !statePlan?.hasState,
                     localAnvilRpcUrl: local ? chain.rpcUrl : undefined,
@@ -4682,7 +5429,7 @@ class DevNetProcessManager {
             }
         }
         // 11. Bridge dependencies (Envio + psy-services)
-        if (options.relayer || options.bridgeUi || startAll) {
+        if (relayer || options.bridgeUi || options.psyPrivacyBridge || startAll) {
             const relayerConfig = options.relayerConfig || './psy_cli/psy_relayer_cli/config/local.toml';
             const relayerCfgPath = path.isAbsolute(relayerConfig) ? relayerConfig : path.join(cwd, relayerConfig);
             const relayerRaw = await Bun.file(relayerCfgPath).text();
@@ -4728,7 +5475,7 @@ class DevNetProcessManager {
                     { name: "psy-services", path: psyServicesBin },
                     { name: "psy-indexer", path: psyIndexerBin },
                 ]);
-                console.log('[DevNet] PSY_SKIP_BUILD=1 — using existing psy-services release binaries');
+                console.log('[DevNet] build skipped unless PSY_SKIP_BUILD=0 -- using existing psy-services release binaries');
             } else if (await exists(psyServicesCargoToml)) {
                 console.log('[DevNet] Building psy-services release binaries...');
                 const buildPsyServices = await runStreaming([
@@ -4915,45 +5662,12 @@ class DevNetProcessManager {
         // Relayer immediately requests Groth16 proofs; wait for listen first.
         if (startBridgeProposerDaemon) {
             await waitForProveProxy("bridge relayer");
+            await this.startGuardianServices(cwd, daemonConfigPath!);
 
-            // 11.5 Unified bridge relayer
-            const proofDir = path.resolve(cwd, 'local_checkpoints', 'bridge_proposer');
-            await mkdir(proofDir, { recursive: true });
-            const daemonConfigPath = path.join(proofDir, 'daemon.toml');
-            const daemonConfig = [
-                `rpc_config = "psy-genesis/config.json"`,
-                `services_url = "http://127.0.0.1:3000"`,
-                `withdraw_method_id = 4159421846`,
-                `proof_dir = "${proofDir.replaceAll('\\', '\\\\')}"`,
-                `poll_interval_secs = 15`,
-                `confirmation_lag_checkpoints = 3`,
-                ``,
-                `[relayer_wallet]`,
-                `sign_type = "ZKSign"`,
-                `keystore_path = "${resolveBridgeRelayerKeystorePath().replaceAll('\\', '\\\\')}"`,
-                ``,
-                `[finalize]`,
-                `l1_rpc_url = "${l1RpcUrl}"`,
-                `deployments_network = "${deploymentsNetwork}"`,
-                `keystore_path = "${resolveBridgeRelayerKeystorePath().replaceAll('\\', '\\\\')}"`,
-                `password_env = "WALLET_PASSWORD"`,
-                ``,
-                ...relayerChains.flatMap((chain) => [
-                    `[[chains]]`,
-                    `family = "evm"`,
-                    `chain_index = ${chain.chainIndex}`,
-                    `network_id = "${chain.networkId}"`,
-                    `rpc_urls = ["${chain.rpcUrl}"]`,
-                    `deployments_network = "${chain.deploymentsNetwork}"`,
-                    `keystore_path = "${resolveBridgeRelayerKeystorePath().replaceAll('\\', '\\\\')}"`,
-                    `password_env = "WALLET_PASSWORD"`,
-                    ``,
-                ]),
-            ].join('\n');
-            await writeFile(daemonConfigPath, daemonConfig, 'utf8');
+            // Forward the whole operator config unchanged; the daemon owns protocol and credential validation.
 
             this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                ['./target/release/psy_relayer_cli', '--config', daemonConfigPath],
+                ['./target/release/psy_relayer_cli', '--config', daemonConfigPath!],
                 relayerStartedDetector,
                 {
                     cwd,
@@ -5116,7 +5830,8 @@ class DevNetProcessManager {
         const coordinatorWorkersCount = options.coordinatorWorkersCount;
         this.genesisDataPath = options.genesisDataPath || "genesis.json";
 
-        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || !!options.relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
+        const relayer = !!options.relayer || !!options.bridgeProposerDaemon;
+        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
         const startAll = !hasOnlyOptions;
 
         const startCoordinatorProcessor = startAll || !!options.coordinator;
@@ -5485,13 +6200,45 @@ class DevNetProcessManager {
     async teardown(cwd: string = ".", purge: boolean = false): Promise<void> {
         this.stopping = true;
         console.log("[DevNet][supervisor] teardown: auto-restart disabled, stopping all children");
-        for (const process of this.spawnedProcesses) {
-            if (process?.isRunning()) process.kill();
+        if (!purge) await this.preserveOwnedAnvilState(cwd);
+        for (const child of this.spawnedProcesses) {
+            if (!purge && child.name.startsWith("l1_anvil")) continue;
+            if (child?.isRunning()) child.kill();
         }
         await teardownDevnet(cwd, purge);
     }
 
+    /** Stop application producers when a lifecycle is active. Anvil stays up. */
+    async quiesceApplications(cwd: string): Promise<void> {
+        if (this.applicationLifecycleState === "running" || this.applicationLifecycleState === "stopping") {
+            await this.stopApplications(cwd, false);
+        }
+    }
+
+    /** Stop producers, then stage each live owned Anvil and await its real exit. No SIGKILL. */
+    async preserveOwnedAnvilState(
+        cwd: string,
+        rpc?: (rpcUrl: string, method: string, params: unknown[]) => Promise<unknown>,
+    ): Promise<void> {
+        await this.quiesceApplications(cwd);
+        const anvils = this.spawnedProcesses.filter((child) => child.name.startsWith("l1_anvil") && child.isRunning());
+        for (const anvil of anvils) {
+            const portIndex = anvil.cmds.indexOf("--port");
+            const port = Number(anvil.cmds[portIndex + 1]);
+            if (!Number.isInteger(port)) throw new Error(`[DevNet] Anvil '${anvil.name}' has no --port`);
+            const network = anvil.name === "l1_anvil_bsc" ? "localhostBsc" : anvil.name === "l1_anvil_base" ? "localhostBase" : "localhost";
+            const stop = async () => {
+                anvil.killWithSignal("SIGTERM");
+                await anvil.proc.exited;
+            };
+            await preserveLiveAnvilRpc(resolveLocalL1RpcUrl(port), localAnvilStatePath(cwd, network), anvil.name, rpc, stop);
+        }
+    }
+
     static create(host?: string, envVars?: { [key: string]: string }, provingBackend?: string): DevNetProcessManager { return new DevNetProcessManager(host, envVars, provingBackend); }
+}
+export function shouldRequireGuardianConfig(startAll: boolean, options: Pick<ProcessOptions, "relayer" | "bridgeProposerDaemon" | "bridgeUi">): boolean {
+    return startAll || !!options.relayer || !!options.bridgeProposerDaemon || !!options.bridgeUi;
 }
 
 // --- Race-safe per-repository devnet startup lock -----------------------------
@@ -5581,7 +6328,7 @@ async function acquireDevnetLock(repoRoot: string): Promise<DevnetLock> {
     }
     return new DevnetLock(holder);
 }
-export type DevnetControlCommand = "restart" | "rollback-stop" | "rollback-resume";
+export type DevnetControlCommand = "restart" | "rollback-stop" | "rollback-resume" | "shutdown-preserve" | "shutdown-purge";
 
 interface DevnetControlResponse {
     ok: boolean;
@@ -5597,7 +6344,7 @@ export function devnetControlSocketPath(repoRoot: string): string {
 }
 
 function parseDevnetControlCommand(value: string): DevnetControlCommand {
-    if (value === "restart" || value === "rollback-stop" || value === "rollback-resume") return value;
+    if (value === "restart" || value === "rollback-stop" || value === "rollback-resume" || value === "shutdown-preserve" || value === "shutdown-purge") return value;
     throw new Error(`[DevNet][control] unsupported command ${value}`);
 }
 
@@ -5638,7 +6385,7 @@ export async function sendDevnetControlCommand(repoRoot: string, command: Devnet
 
 export async function startDevnetControlServer(
     repoRoot: string,
-    handle: (command: DevnetControlCommand) => Promise<string>,
+    handle: (command: DevnetControlCommand) => Promise<string | { message: string; afterAck?: () => void }>,
 ): Promise<DevnetControlServer> {
     const socketPath = devnetControlSocketPath(repoRoot);
     try {
@@ -5670,13 +6417,21 @@ export async function startDevnetControlServer(
             socket.removeAllListeners("data");
             commandQueue = commandQueue.then(async () => {
                 let response: DevnetControlResponse;
+                let afterAck: (() => void) | undefined;
                 try {
                     const command = parseDevnetControlCommand(received.slice(0, newline).trim());
-                    response = { ok: true, message: await handle(command) };
+                    const result = await handle(command);
+                    if (typeof result === "string") response = { ok: true, message: result };
+                    else {
+                        response = { ok: true, message: result.message };
+                        afterAck = result.afterAck;
+                    }
                 } catch (error) {
                     response = { ok: false, message: error instanceof Error ? error.message : String(error) };
                 }
-                socket.end(`${JSON.stringify(response)}\n`);
+                socket.end(`${JSON.stringify(response)}\n`, () => afterAck?.());
+            }).catch((error) => {
+                console.error(`[DevNet][control] failed to ack ${received.trim()}: ${error}`);
             });
         });
     });
@@ -5760,9 +6515,9 @@ async function runMain() {
     const faucetServer = !!values["faucet-server"];
     const dummyProvers = values["dummy-provers"] ? parseInt(values["dummy-provers"], 10) : 0;
     const l1 = !!values["l1"];
-    const relayer = !!values["relayer"];
+    const relayer = !!values["relayer"] || !!values["bridge-proposer-daemon"];
+    const bridgeProposerDaemon = relayer;
     const relayerConfig = values["relayer-config"] as string;
-    const bridgeProposerDaemon = !!values["bridge-proposer-daemon"];
     const psyPrivacyBridge = !!values["psy-privacy-bridge"];
     const ide = !!values["ide"];
     const explorer = !!values["explorer"];
@@ -5810,7 +6565,7 @@ Psy Network DevNet Setup Tool
 Usage: bun run dev/locSetupV4.ts [options]
 
  Options:
-    --control <command>             Send restart, rollback-stop, or rollback-resume to the running supervisor
+    --control <command>             Send restart, rollback-stop, rollback-resume, shutdown-preserve, or shutdown-purge to the running supervisor
     --host <ip>                     Target host IP (default: 127.0.0.1)
     --genesis-data-path <path>      Path to genesis data JSON file for processor nodes (default: genesis.json)
     --proving-backend <backend>     Proving backend to use (default: plonky2-poseidon-goldilocks)
@@ -5833,9 +6588,9 @@ Usage: bun run dev/locSetupV4.ts [options]
    --l1-port <port>                Port for anvil L1 node (default: 8545)
    VITE_PSY_STAGE=localhost|testnet|mainnet   Select the Psy stage (default: localhost)
    VITE_NETWORK=localhost|sepolia|ethereum   Select L1 target network (default: the stage's default L1, see VITE_PSY_STAGE)
-   --relayer                       Start unified bridge relayer (psy_relayer_cli --config <daemon.toml>)
+   --relayer                       Start bridge relayer from PSY_BRIDGE_DAEMON_CONFIG (no subcommand: psy_relayer_cli --config <path>)
    --relayer-config <path>         Legacy relayer/envio config path (default: ./psy_cli/psy_relayer_cli/config/local.toml)
-   --bridge-proposer-daemon        Alias for --relayer
+   --bridge-proposer-daemon        Same component selection and bridge dependencies as --relayer
    --psy-privacy-bridge           Start integrated privacy+bridge shell (psy-dapp/apps/bridge, port 5177)
    --ide                          Start IDE dev server (psy-dapp/apps/ide, port 5176)
    --explorer                     Start blockchain explorer dev server (psy-dapp/apps/explorer, port 5178)
@@ -5888,9 +6643,9 @@ Usage: bun run dev/locSetupV4.ts [options]
    - Set VITE_NETWORK=<sepolia|ethereum> and VITE_FORK=true to run anvil in fork mode; this forks the L1 named by VITE_NETWORK regardless of VITE_PSY_STAGE (VITE_PSY_STAGE picks the Psy genesis block, VITE_NETWORK+VITE_FORK pick the L1 to fork — e.g. VITE_PSY_STAGE=localhost VITE_NETWORK=sepolia VITE_FORK=true runs a local Psy chain forking public Sepolia); requires SEPOLIA_RPC_URL or ETH_RPC_URL to be set
    - Optionally set VITE_FORK_BLOCK_NUMBER=<block> to pin the fork block
    - PSY_SKIP_BRANCH_CHECK=0  explicitly enable repo fetch/checkout (default: leave every HEAD untouched)
-   - PSY_SKIP_KEYSTORE=1      keep local ~/.psy/keystore (skip public R2 download/hash refresh)
-   - PSY_KEYSTORE_R2_PREFIX   required for downloads: single segment localhost-<digest> in psy-proving-keystores
-   - PSY_SKIP_BUILD=1         use existing Rust release binaries; fail if any are missing
+   - PSY_SKIP_KEYSTORE=0      explicitly download/hash-refresh trust setup (default: keep local ~/.psy/keystore)
+   - PSY_KEYSTORE_R2_PREFIX   required when PSY_SKIP_KEYSTORE=0: single segment localhost-<digest> in psy-proving-keystores
+   - PSY_SKIP_BUILD=0         explicitly build Rust release binaries (default: use existing; fail if any are missing)
    - PSY_NO_AUTO_RESTART=1    disable supervised child-process auto-restart
    - SCYLLA_SMP=<n>           Scylla shard count (default: auto from reserved CPUs)
    - SCYLLA_CPUSET=<cpus>      Linux override for dedicated Scylla physical cores
@@ -5904,6 +6659,10 @@ Usage: bun run dev/locSetupV4.ts [options]
    - Child auto-restart is ON by default; restart banners are appended to per-service logs
         `);
         process.exit(0);
+    }
+
+    if (!teardown && !daemonlize && shouldRequireGuardianConfig(!hasOnlyOptions, { relayer, bridgeProposerDaemon })) {
+        envVars.PSY_BRIDGE_DAEMON_CONFIG = await resolveBridgeDaemonConfigPath(process.cwd(), { ...process.env, ...envVars }, purge);
     }
 
 
@@ -5934,23 +6693,20 @@ Usage: bun run dev/locSetupV4.ts [options]
     };
 
 
-    // SIGINT/SIGTERM: await teardown, then release the lock before exit. A
-    // duplicate signal while already shutting down is ignored.
+    // Control shutdown acks first, then exits. A duplicate signal is ignored.
     let shuttingDown = false;
-    const shutdown = async () => {
-        if (shuttingDown) {
-            console.log('[DevNet] shutdown already in progress; ignoring duplicate signal');
-            return;
-        }
+    const shutdown = async (failed = false) => {
+        if (shuttingDown) return;
         shuttingDown = true;
         try {
             await closeControlServer();
             if (globalManager) await globalManager.teardown(".", false);
         } catch (e) {
+            failed = true;
             console.error('[DevNet] error during teardown:', e);
         } finally {
             releaseDevnetLock();
-            process.exit(0);
+            process.exit(failed ? 1 : 0);
         }
     };
 
@@ -5972,6 +6728,7 @@ Usage: bun run dev/locSetupV4.ts [options]
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
             requireBun: !hasOnlyOptions || psyPrivacyBridge || ide || modeAWebWalletBridge,
+            env: envVars,
         });
     }
 
@@ -5990,8 +6747,17 @@ Usage: bun run dev/locSetupV4.ts [options]
     }
 
     if (teardown) {
-        await teardownDevnet(".", purge);
-        process.exit(0);
+        try {
+            if (!purge) {
+                const owner = await requestOwnedAnvilShutdown(REPO_ROOT, false);
+                if (owner === "absent") await preserveUnownedLiveAnvils(".");
+            }
+            await teardownDevnet(".", purge);
+            process.exit(0);
+        } catch (error) {
+            console.error(`[DevNet] teardown failed without broad cleanup: ${error}`);
+            process.exit(1);
+        }
     }
 
         const options: ProcessOptions = {
@@ -6031,6 +6797,18 @@ Usage: bun run dev/locSetupV4.ts [options]
             await globalManager.setupProcesses(options);
             controlServer = await startDevnetControlServer(REPO_ROOT, async (command) => {
                 if (!globalManager) throw new Error("[DevNet][control] process manager unavailable");
+                if (command === "shutdown-preserve" || command === "shutdown-purge") {
+                    const purgeRequested = command === "shutdown-purge";
+                    if (!purgeRequested) await globalManager.preserveOwnedAnvilState(REPO_ROOT);
+                    else globalManager.stopping = true;
+                    return {
+                        message: purgeRequested ? "shutdown purge accepted" : "Anvil state preserved; supervisor exiting",
+                        afterAck: () => queueMicrotask(() => {
+                            releaseDevnetLock();
+                            void closeControlServer().finally(() => process.exit(0));
+                        }),
+                    };
+                }
                 if (command === "restart") {
                     await globalManager.restartApplications(REPO_ROOT);
                     return "Devnet application processes restarted; DB and Anvil retained";

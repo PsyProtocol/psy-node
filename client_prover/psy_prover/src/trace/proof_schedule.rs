@@ -991,9 +991,11 @@ impl TraceProofSchedule {
             let root = current_root(&meta);
             anyhow::ensure!(
                 root == first_root,
-                "derived UPS start proof-tree root mismatch: computed={:?} trace_first_start={:?}",
+                "derived UPS start proof-tree root mismatch: computed={:?} trace_first_start={:?} fingerprint={:?} inner_public_inputs_hash={:?}",
                 root,
-                first_root
+                first_root,
+                ups_start_fingerprint,
+                inner_public_inputs_hash
             );
         }
 

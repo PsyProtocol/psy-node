@@ -42,7 +42,7 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 hyper = { workspace = true }
 jsonrpsee = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 sodalite = { workspace = true }
 secp256k1 = { workspace = true }
 bincode = { workspace = true }
@@ -58,7 +58,7 @@ http = { workspace = true }
 
 # WASM-specific dependencies
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }

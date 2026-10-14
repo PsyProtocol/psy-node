@@ -332,3 +332,17 @@ psy_user_cli register-user --private-key <key> --sign-type zk
 2. **Hardware considerations**: Ensure adequate CPU and memory
 3. **Network latency**: Use reliable network connections
 4. **Batch operations**: Group multiple transactions when possible
+
+## 10. Software-Defined Multisig
+
+The prover's `register_multisig_user`, `add_multisig_user`, and `inject_multisig_signatures` methods provide the multisig account and signing path. The circuit checks two distinct authorized members against the same message and authenticates the policy transition. Trace finalization reconstructs the signature context before proving.
+
+This feature does not include a guardian service, guardian admission, or a withdrawal aggregation change.
+
+With the local network configuration selected, run:
+
+```bash
+cargo test --release --offline -p psy_vm --lib multisig
+cargo test --release --offline -p psy_ups_circuit multisig
+cargo test --release --offline -p psy_prover --lib multisig
+```

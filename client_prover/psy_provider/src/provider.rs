@@ -182,9 +182,29 @@ where
     Ok(None)
 }
 
+const RPC_RESPONSE_BYTE_LIMIT: usize = 128 * 1024 * 1024;
+
+pub(crate) async fn read_rpc_response(response: reqwest::Response, bounded: bool) -> anyhow::Result<String> {
+    if !bounded {
+        return Ok(response.text().await?);
+    }
+    let response = response.error_for_status()?;
+    use futures::StreamExt;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        anyhow::ensure!(chunk.len() <= RPC_RESPONSE_BYTE_LIMIT - body.len(), "RPC response exceeds 128 MiB");
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(body)?)
+}
+
+
 #[derive(Debug, Clone)]
 pub struct RpcProvider {
     pub client: Arc<Client>,
+    pub endpoint_clients: Option<HashMap<String, Arc<Client>>>,
     pub realm_configs: HashMap<u64, Vec<String>>,
     pub coordinator_configs: HashMap<u64, Vec<String>>,
     pub users_per_realm: u64,
@@ -192,6 +212,37 @@ pub struct RpcProvider {
 }
 
 impl RpcProvider {
+    pub fn new_with_endpoint_clients(
+        config: &psy_config::NetworkConfigGoldilocks,
+        endpoint_clients: HashMap<String, Arc<Client>>,
+    ) -> anyhow::Result<Self> {
+        let mut provider = Self::new_with_config(config)?;
+        provider.install_endpoint_clients(endpoint_clients)?;
+        Ok(provider)
+    }
+
+    pub fn install_endpoint_clients(&mut self, endpoint_clients: HashMap<String, Arc<Client>>) -> anyhow::Result<()> {
+        let urls: std::collections::HashSet<&str> = self.realm_configs.values()
+            .chain(self.coordinator_configs.values()).flatten().map(String::as_str).collect();
+        anyhow::ensure!(!urls.is_empty(), "Endpoint client routes are empty");
+        anyhow::ensure!(urls.len() == endpoint_clients.len() && urls.iter().all(|url| endpoint_clients.contains_key(*url)),
+            "Endpoint clients must exactly cover configured RPC URLs");
+        self.endpoint_clients = Some(endpoint_clients);
+        Ok(())
+    }
+
+    pub fn client_for_url(&self, rpc_url: &str) -> anyhow::Result<&Client> {
+        match &self.endpoint_clients {
+            Some(clients) => clients.get(rpc_url).map(Arc::as_ref)
+                .ok_or_else(|| anyhow::anyhow!("RPC URL has no approved endpoint client")),
+            None => Ok(self.client.as_ref()),
+        }
+    }
+
+    pub(crate) fn has_endpoint_clients(&self) -> bool {
+        self.endpoint_clients.is_some()
+    }
+
     pub fn new_with_config_path(config_path: &str) -> anyhow::Result<Self> {
         let psy_config = psy_config::PsyConfigGoldilocks::from_file(config_path)?;
         let network_config = psy_config.get_current_network()?;
@@ -235,6 +286,7 @@ impl RpcProvider {
 
         Ok(Self {
             client: Arc::new(client),
+            endpoint_clients: None,
             realm_configs,
             coordinator_configs,
             users_per_realm: config.users_per_realm,
@@ -251,8 +303,13 @@ macro_rules! psy_rpc_call {
                 request: $rpc_params,
                 id: Id::Number(1),
             };
-            let response = $instance.client.post($rpc_url).json(&request).send().await?;
-            let json_response: RpcResponse<String> = response.json().await?;
+            let rpc_url = $rpc_url;
+            let response = $instance.client_for_url(AsRef::<str>::as_ref(&rpc_url))?.post(rpc_url).json(&request).send().await?;
+            let json_response: RpcResponse<String> = if $instance.has_endpoint_clients() {
+                serde_json::from_str(&crate::provider::read_rpc_response(response, true).await?)?
+            } else {
+                response.json().await?
+            };
             match json_response.result {
                 ResponseResult::Success(s) => {
                     tracing::info!("{:?}", s);
@@ -283,13 +340,15 @@ macro_rules! psy_rpc_call_back {
                 Err(_) => "<serialize-request-failed>".to_string(),
             };
             tracing::info!("psy rpc call: {}", url_str);
+            let client = $instance.client_for_url(AsRef::<str>::as_ref(&url_str))?;
             #[cfg(not(target_arch = "wasm32"))]
-            let request_builder = $instance
-                .client
-                .post(url_str.clone())
-                .timeout(std::time::Duration::from_secs(360));
+            let request_builder = if $instance.has_endpoint_clients() {
+                client.post(url_str.clone())
+            } else {
+                client.post(url_str.clone()).timeout(std::time::Duration::from_secs(360))
+            };
             #[cfg(target_arch = "wasm32")]
-            let request_builder = $instance.client.post(url_str.clone());
+            let request_builder = client.post(url_str.clone());
 
             let result = request_builder
                 .json(&request_payload)
@@ -299,30 +358,48 @@ macro_rules! psy_rpc_call_back {
             match result {
                 Ok(response) => {
                     let status = response.status();
-                    let body = response
-                        .text()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?;
+                    let body = crate::provider::read_rpc_response(response, $instance.has_endpoint_clients()).await?;
 
                     match serde_json::from_str::<RpcResponse<$ret_ty>>(&body) {
                         Ok(parsed) => Ok(parsed),
                         Err(e) => {
-                            tracing::error!(
-                                url = %url_str,
-                                method = %method_name,
-                                status = %status,
-                                body_len = body.len(),
-                                body = %body,
-                                error = %e,
-                                "[RPC_DECODE_FAIL] failed to parse JSON-RPC response body"
-                            );
-                            Err(anyhow::anyhow!(
-                                "failed to parse JSON-RPC response: method={} status={} error={} body={}",
-                                method_name,
-                                status,
-                                e,
-                                body
-                            ))
+                            if $instance.has_endpoint_clients() {
+                                tracing::error!(
+                                    method = %method_name,
+                                    status = %status,
+                                    body_len = body.len(),
+                                    error_category = ?e.classify(),
+                                    line = e.line(),
+                                    column = e.column(),
+                                    "[RPC_DECODE_FAIL] failed to parse JSON-RPC response body"
+                                );
+                                Err(anyhow::anyhow!(
+                                    "failed to parse JSON-RPC response: method={} status={} body_len={} error_category={:?} line={} column={}",
+                                    method_name,
+                                    status,
+                                    body.len(),
+                                    e.classify(),
+                                    e.line(),
+                                    e.column()
+                                ))
+                            } else {
+                                tracing::error!(
+                                    url = %url_str,
+                                    method = %method_name,
+                                    status = %status,
+                                    body_len = body.len(),
+                                    body = %body,
+                                    error = %e,
+                                    "[RPC_DECODE_FAIL] failed to parse JSON-RPC response body"
+                                );
+                                Err(anyhow::anyhow!(
+                                    "failed to parse JSON-RPC response: method={} status={} error={} body={}",
+                                    method_name,
+                                    status,
+                                    e,
+                                    body
+                                ))
+                            }
                         }
                     }
                 }
@@ -518,6 +595,7 @@ impl RpcProvider {
     pub fn with_user_id_owned(&self, user_id: u64) -> Self {
         Self {
             client: self.client.clone(),
+            endpoint_clients: self.endpoint_clients.clone(),
             realm_configs: self.realm_configs.clone(),
             coordinator_configs: self.coordinator_configs.clone(),
             users_per_realm: self.users_per_realm,
@@ -1135,6 +1213,20 @@ pub type ProxyContractFunctionCache<C, const D: usize> = crate::contract_fn_cach
     (u64, DPNFunctionCircuitDefinition),
     (QHashOut<<C as GenericConfig<D>>::F>, VerifierOnlyCircuitData<C, D>),
 >;
+
+impl<C: GenericConfig<D> + 'static, const D: usize> ProveProxyRpcProvider<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    fn client_for_url(&self, rpc_url: &str) -> anyhow::Result<&Client> {
+        anyhow::ensure!(rpc_url == self.proof_proxy_url, "Unexpected proof proxy URL");
+        Ok(self.client.as_ref())
+    }
+
+    fn has_endpoint_clients(&self) -> bool {
+        false
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
@@ -2283,6 +2375,7 @@ mod tests {
         let realm_urls = vec!["http://edge-0".to_string(), "http://edge-1".to_string()];
         let provider = RpcProvider {
             client: Arc::new(Client::new()),
+            endpoint_clients: None,
             realm_configs: HashMap::from([(1, realm_urls.clone())]),
             coordinator_configs: HashMap::from([(0, vec!["http://coordinator".to_string()])]),
             users_per_realm: 1_048_576,

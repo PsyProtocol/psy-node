@@ -9,7 +9,7 @@ use psy_node_core::queue::{
     worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
 };
 use psy_node_nats::{
-    psy_queue::setup_nats_psy_queue_from_connection_str,
+    psy_queue::{setup_nats_psy_queue_from_connection_str, NatsSetupMode},
     queue::{JetStreamAckMode, NatsJetStreamClient, NatsWorkerQueuePublishBarrier},
 };
 
@@ -61,7 +61,7 @@ async fn connect() -> anyhow::Result<(NatsJetStreamClient, u128, EphKey)> {
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
     let namespace = format!("nats_live_surface_{suffix}");
-    let client = setup_nats_psy_queue_from_connection_str(&url, &namespace).await?;
+    let client = setup_nats_psy_queue_from_connection_str(&url, &namespace, NatsSetupMode::CreateIfMissing).await?;
     client.ensure_stream().await?;
     client.ensure_stream().await?;
     let key = eph_key(suffix);
@@ -77,7 +77,7 @@ async fn connect() -> anyhow::Result<(NatsJetStreamClient, u128, EphKey)> {
 async fn setup_rejects_unreachable_server() {
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        setup_nats_psy_queue_from_connection_str("nats://127.0.0.1:1", "ns_unreachable"),
+        setup_nats_psy_queue_from_connection_str("nats://127.0.0.1:1", "ns_unreachable", NatsSetupMode::CreateIfMissing),
     ).await.expect("a refused local connection must fail promptly");
     assert!(result.is_err(), "an unreachable server must not produce a usable client");
 }
