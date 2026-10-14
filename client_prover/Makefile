@@ -186,8 +186,24 @@ return-back:
 	@echo "USER0 transferring back to USER1..."
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name transfer --inputs "[$(USER1_ID), 250000000000]" --sign-type $(SIGN_TYPE)
 
+REWARD_USER_ID          ?= 0
+REWARD_RECIPIENT        ?= 0x0000000000000000000000000000000000000001
+REWARD_TOKEN            ?= 0x0000000000000000000000000000000000000001
+REWARD_L1_RPC_URL       ?= http://127.0.0.1:8545
+REWARD_L1_PRIVATE_KEY   ?=
+REWARD_PROVE_PROXY_URL  ?= http://127.0.0.1:9001
+
 claim-rewards:
-	@RUST_LOG=info $(USER_CLI) claim-rewards --private-key ${USER0_PRIVATE_KEY} --jobs-file $(ROOT_DIR)/local_checkpoints/realm_worker_0.backup
+	@RUST_LOG=info $(USER_CLI) claim-rewards \
+		-p ${USER0_PRIVATE_KEY} \
+		--recipient ${REWARD_RECIPIENT} \
+		--user-id ${REWARD_USER_ID} \
+		--reward-token ${REWARD_TOKEN} \
+		--proof-cache-dir $(ROOT_DIR)/local_checkpoints/reward-proof-cache \
+		--jobs-file $(ROOT_DIR)/local_checkpoints/realm_worker_0.backup \
+		--l1-rpc-url ${REWARD_L1_RPC_URL} \
+		--l1-private-key ${REWARD_L1_PRIVATE_KEY} \
+		--prove-proxy-url ${REWARD_PROVE_PROXY_URL}
 
 withdraw:
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) withdraw \

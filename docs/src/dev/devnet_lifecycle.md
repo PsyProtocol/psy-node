@@ -19,6 +19,7 @@ Use only this lifecycle for local devnet operations; it supersedes ad-hoc per-se
 
 - [1. Environment](#1-environment)
 - [2. Artifact Gate](#2-artifact-gate)
+- [Public-only generate-genesis-data inputs](#public-only-generate-genesis-data-inputs)
 - [3. Fresh Start](#3-fresh-start)
 - [4. Readiness](#4-readiness)
 - [5. State-Preserving Restart](#5-state-preserving-restart)
@@ -154,6 +155,14 @@ Repair only the stale output:
 
 Do not rebuild all three because one comparison failed. Regenerate root `genesis.json` only when a [§6.1](circuit-and-verifier-operations.md#61-genesis-trigger) construction input changed; a stamp or compiler-revision refresh alone does not. Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions; the existing plonky2-hwa patch in each repository is not inherited across git pins. `dev/locSetupV4.ts` verifies the Genesis payload and full stamp before process startup. When a construction input requires root `genesis.json` regeneration, set `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT` for `make generate-genesis-data`; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
 
+### Public-only `generate-genesis-data` inputs
+
+`make generate-genesis-data` takes only public inputs. It requires `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`, then runs `./target/release/psy_dev_cli generate-genesis-data` with `--repo-root`, `--relayer-multisig-account`, and `--multisig-policy-artifact` (`Makefile:139-144`). That child drops `PRIVATE_KEY`, `BRIDGE_RELAYER_L2_PRIVATE_KEY`, `KEYSTORE_PATH`, `PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, and `WALLET_PASSWORD`. The account `contract_id` must be 1 (`MULTISIG_POLICY_CONTRACT_ID`); `public_key_param` rejects any other id (`client_prover/psy_vm/src/ups/multisig.rs:20,75-76`), and the guardians-root branch repeats the check (`generate_genesis/guardians_root.rs:88`).
+
+Use that current release `psy_dev_cli`. A stale binary still checks contract ID 6 (`public multisig account must name contract 6`; `Genesis contract 6 must be multisig_policy`) and fails a contract-1 account.
+
+The Make target does not redirect writes. Isolated output flags are `--genesis-out`, `--private-keys-out`, and `--faucet-operators-out`; `--skip-faucet-operators` omits the faucet file. Defaults are `<repo-root>/genesis.json`, `<repo-root>/private_keys.json`, and `<repo-root>/psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:125-135,546-547,560-625`).
+
 ## 3. Fresh Start
 
 A fresh test chain requires a full purge because Scylla volumes, checkpoint ring buffer files, the persisted Anvil snapshot, and localhost deployments must start from the same genesis state. `make shutdown` purges by default (`PURGE ?= 1` in the Makefile); only `PURGE=0 make shutdown` preserves the paired state:
@@ -231,6 +240,7 @@ make run-all LOCSETUP_START_ARGS="... --purge"
 ```
 
 Purge and contract redeployment are paired by design: removing the persisted Anvil state and deployment summary makes the next startup deploy fresh contracts with `--reset`. There is no supported keep-data contract-swap path; a circuit or keystore change always requires a purge restart.
+
 
 ## 6. Offline Rollback Stop and Resume
 

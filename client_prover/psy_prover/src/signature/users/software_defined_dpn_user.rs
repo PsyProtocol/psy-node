@@ -101,7 +101,9 @@ mod tests {
     use std::str::FromStr;
 
     use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
-    use psy_client_data::qdata::{ups_signature::PsyUserProvingSessionSignatureDataCompact, user::PsyUserLeaf, user_contract_state::SignContext as SessionSignContext};
+    use psy_client_data::qdata::{
+        ups_signature::PsyUserProvingSessionSignatureDataCompact, user::PsyUserLeaf, user_contract_state::SignContext as SessionSignContext,
+    };
     use psy_crypto::hash::traits::qhashable::QFieldHashable;
 
     use super::*;

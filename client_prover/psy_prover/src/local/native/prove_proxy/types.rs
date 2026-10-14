@@ -58,6 +58,7 @@ pub struct BridgeDepositBatchGroth16Proof {
     pub public_inputs: Vec<u64>,
 }
 
+
 pub fn parse_hex_qhashout(hex: &str) -> anyhow::Result<ParthQHashOut<F>> {
     let hex = hex.trim_start_matches("0x");
     anyhow::ensure!(hex.len() == 64, "expected 64 hex chars, got {}", hex.len());

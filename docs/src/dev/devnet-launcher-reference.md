@@ -164,6 +164,9 @@ DB group: Redis/Valkey + NATS + Scylla + Nostr
 core-selected Realm P2P key generation + genesis validator injection
   |
   v
+Prove proxy processes; TCP 9999+index readiness (600 x 1s) completes before core
+  |
+  v
 Coordinator processor
   |
   v
@@ -180,9 +183,6 @@ Coordinator workers (after the complete Realm processor/edge phase)
   |
   v
 Realm workers (parallel) -> dummy provers (parallel)
-  |
-  v
-Prove proxy processes; TCP warm-up continues concurrently
   |
   v
 Anvil or external L1 -> contract deploy/reuse
@@ -210,8 +210,9 @@ control socket + steady-state supervisor
 The DB phase starts `dev/start_db.sh --persist` and then probes ports 6379, 4222, and 9042
 (`dev/locSetupV4.ts:4030-4045`). Coordinator startup precedes Realm batching
 (`dev/locSetupV4.ts:4060-4248`). Coordinator workers explicitly await the full Realm phase, not only the Coordinator
-phase (`dev/locSetupV4.ts:4150-4162`; `dev/locSetupV4.ts:4248`). Workers, dummy provers, proxy, Layer 1, bridge
-services, faucet, relayer, and UIs follow in source order (`dev/locSetupV4.ts:4250-4839`).
+phase (`dev/locSetupV4.ts`). Workers and dummy provers follow the core phase. Prove proxy is spawned after
+genesis preparation and its TCP listen gate completes before the Coordinator processor. Layer 1, bridge
+services, faucet, relayer, and UIs then follow in source order (`dev/locSetupV4.ts`).
 
 ## 4. Startup Mode Selection
 
@@ -344,7 +345,7 @@ Remote trust-setup mode fails closed on manifest fetch, parse, version or missin
 
 #### Separate L1 transaction signing and L2 multisig identity
 
-`KEYSTORE_PATH` and its higher-priority aliases configure the encrypted L1 transaction-signing keystore only. The proving trust setup stays under `~/.psy/keystore` regardless of that variable. L2 registration 2 (`user_id` 524288) is derived from the public `MultisigAccount` and actual multisig circuit fingerprint, not from a keystore secret. Genesis seeds the initial policy at contract 6 and exports `null` at registration index 2 in `private_keys.json`; other indexed validator/faucet secrets remain secret. See [public Genesis inputs](genesis-generation.md#121-public-bridge-multisig-account).
+`KEYSTORE_PATH` and its higher-priority aliases configure the encrypted L1 transaction-signing keystore only. The proving trust setup stays under `~/.psy/keystore` regardless of that variable. L2 registration 2 (`user_id` 524288) is derived from the public `MultisigAccount` and actual multisig circuit fingerprint, not from a keystore secret. Genesis seeds the initial policy at contract 1 and exports `null` at registration index 2 in `private_keys.json`; other indexed validator/faucet secrets remain secret. See [public Genesis inputs](genesis-generation.md#121-public-bridge-multisig-account).
 
 When generation is triggered, provide both `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`; the launcher validates readable public JSON inputs and passes the exact required flags. Its generator child excludes legacy secret-bearing enrollment variables without changing the parent process's L1 transaction-signing environment. If an existing Genesis snapshot passes the reuse checks, these generation inputs are not required. No automatic account replacement or live-chain regeneration is authorized by supplying them.
 
@@ -402,7 +403,7 @@ a missing UI only when its dependencies are already present and SDK rebuild does
 | Coordinator workers    | `psy_worker_cli worker`                                                               | Worker-start marker; start sequentially after complete Realm readiness.                     | `dev/locSetupV4.ts:4120-4162`; `dev/locSetupV4.ts:4248`        |
 | Realm workers          | `psy_worker_cli worker`                                                               | Worker-start marker; all selected worker promises are awaited.                              | `dev/locSetupV4.ts:4250-4342`                                  |
 | Dummy provers          | `dev/dummy_prover.sh`                                                                 | Dummy-prover marker; start in parallel after Realm workers.                                 | `dev/locSetupV4.ts:4343-4360`                                  |
-| Prove proxy            | `psy_user_cli prove-proxy`                                                            | Log marker starts background warm-up; TCP `9999 + index` has up to 600 one-second attempts. | `dev/locSetupV4.ts:4362-4402`                                  |
+| Prove proxy            | `psy_user_cli prove-proxy --role all`                                                 | Spawned after genesis prep; TCP `9999 + index` (600 x 1s, 1500ms connect) completes before Coordinator processor. Faucet and relayer still await the same gate. | `dev/locSetupV4.ts` (`waitForProveProxy`) |
 | Anvil                  | `anvil ... --state db/anvil/state.json --state-interval <ANVIL_STATE_INTERVAL\|\|60>` | `Listening on`, then HTTP Layer 1 probe, preserved genesis check, then `anvil_setIntervalMining([1])` on each launcher-managed chain. | `dev/locSetupV4.ts` (`l1StartedDetector`, `assertPreservedAnvilGenesis`, `setLocalAnvilIntervalMining`) |
 | Envio backing services | Generated Docker Compose                                                              | Postgres TCP 5433, SQL `select 1`, Hasura `/healthz`.                                       | `dev/locSetupV4.ts:3338-3364`                                  |
 | Envio indexer          | `pnpm start`                                                                          | Outer setup requires TCP 9898.                                                              | `dev/locSetupV4.ts:3363-3376`; `dev/locSetupV4.ts:4478-4492`   |
@@ -876,9 +877,9 @@ holds the repository startup lock (`dev/locSetupV4.ts:5639-5706`).
 **Postcondition:** every selected foreground phase has reached its source-defined readiness point; tracked children
 are supervisor-wired (`dev/locSetupV4.ts:3693-3734`; `dev/locSetupV4.ts:3950-4839`).
 
-**Internal flow:** derive selection/resources, prepare logs/binaries, start DB, inject P2P validators, start core,
-workers/proxy, Layer 1/deployment, bridge stack, faucet/relayer, then UIs
-(`dev/locSetupV4.ts:3950-4839`).
+**Internal flow:** derive selection/resources, prepare logs/binaries, start DB, inject P2P validators, await prove-proxy
+TCP readiness, start core, workers, Layer 1/deployment, bridge stack, faucet/relayer, then UIs
+(`dev/locSetupV4.ts`).
 
 ### `resolveRuntimeResourceSettings()`
 

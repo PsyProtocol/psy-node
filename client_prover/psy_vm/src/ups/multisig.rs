@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::state_reader::StateReaderResults;
 
-pub const MULTISIG_POLICY_CONTRACT_ID: u32 = 6;
+pub const MULTISIG_POLICY_CONTRACT_ID: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultisigPolicy {

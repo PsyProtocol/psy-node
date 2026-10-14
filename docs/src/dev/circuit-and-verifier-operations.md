@@ -118,16 +118,19 @@ UPS / EndCap circuit source or circuit-defining constant
 ├── circuit_groth16.bin, pk_groth16.bin, vk_groth16.bin
 ├── deposit_append/
 │   └── circuit_groth16.bin, pk_groth16.bin, vk_groth16.bin
-└── withdrawal_claim/
+├── withdrawal_claim/
+│   └── circuit_groth16.bin, pk_groth16.bin, vk_groth16.bin
+└── reward_claim/
     └── circuit_groth16.bin, pk_groth16.bin, vk_groth16.bin
 
 psy-contracts/src/
 ├── GnarkGroth16Verifier.sol
 ├── DepositBatchVerifier.sol
-└── WithdrawalClaimVerifier.sol
+├── WithdrawalClaimVerifier.sol
+└── RewardClaimVerifier.sol
 ```
 
-The CLI enables deposit append and withdrawal claim unless explicitly skipped, and enables Bridge aggregation only with `--include-bridge-agg` (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:84-113`). Each selected directory owns exactly `circuit_groth16.bin`, `pk_groth16.bin`, and `vk_groth16.bin` (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:82,567-586`).
+With no cohort flags, `regenerate-groth16-keystore` regenerates `bridge_agg`, `deposit_append`, `withdrawal_claim`, and `reward_claim`. `--skip-bridge-agg`, `--skip-deposit-append`, `--skip-withdrawal-claim`, and `--skip-reward-claim` omit one cohort each (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:105-139`). Each selected directory owns exactly `circuit_groth16.bin`, `pk_groth16.bin`, and `vk_groth16.bin` (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:95,777-783`). All four verifier exports write the nested `./psy-contracts/src` checkout used by the launcher.
 
 ## 3. Trigger Matrices
 
@@ -278,7 +281,7 @@ When triggered, the current target is:
 PSY_RELAYER_MULTISIG_ACCOUNT='<public-multisig-account-json>' PSY_MULTISIG_POLICY_ARTIFACT='<approved-policy-compiler-artifact-json>' make generate-genesis-data
 ```
 
-It runs `./target/release/psy_dev_cli generate-genesis-data` with required `--relayer-multisig-account` and `--multisig-policy-artifact` public file paths (`Makefile:139-144`). Registration 2 is derived from the initial two-of-three public account and actual multisig circuit fingerprint, with contract-6 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet entries retain their keys. Never package or publish `private_keys.json`.
+It runs `./target/release/psy_dev_cli generate-genesis-data` with required `--relayer-multisig-account` and `--multisig-policy-artifact` public file paths (`Makefile:139-144`). Registration 2 is derived from the initial two-of-three public account and actual multisig circuit fingerprint, with contract-1 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet entries retain their existing keys and positions. The generator does not write `faucet_operators.json` beside Genesis. See [devnet-launcher-reference.md](devnet-launcher-reference.md) for the launcher's public input and child-environment behavior.
 
 ### 6.2 Embedded wallet circuit trigger
 
@@ -460,21 +463,22 @@ export KEYSTORE_DIR=<home>/.psy/keystore
 ```
 
 4. Stop local consumers of selected cohorts and preserve the previous complete selected cohort plus matching Solidity verifier.
-5. Never recursively delete the keystore root. The CLI removes only the three named files in a selected directory (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:567-578`).
+5. Never recursively delete the keystore root. The CLI removes only the three named files in a selected directory (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:763-775`).
 
 ### 9.2 Exact commands
 
 | Triggered cohorts | Regeneration | Verifier export |
 |---|---|---|
-| All three | `make regen-groth16-keystore` | `make export-all-solidity-verifier` |
+| All four (`bridge_agg`, `deposit_append`, `withdrawal_claim`, `reward_claim`) | `make regen-groth16-keystore` | `make export-all-solidity-verifier` |
 | `bridge_agg` only | `make regen-bridge-agg-keystore` | `make export-solidity-verifier` |
-| `deposit_append` only | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-withdrawal-claim` | `make export-solidity-verifier-deposit` |
-| `withdrawal_claim` only | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-deposit-append` | `make export-solidity-verifier-withdrawal` |
-| Deposit and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore` | `make export-solidity-verifier-deposit && make export-solidity-verifier-withdrawal` |
-| Bridge aggregation and deposit | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-withdrawal-claim --include-bridge-agg` | `make export-solidity-verifier && make export-solidity-verifier-deposit` |
-| Bridge aggregation and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-deposit-append --include-bridge-agg` | `make export-solidity-verifier && make export-solidity-verifier-withdrawal` |
+| `deposit_append` only | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-bridge-agg --skip-withdrawal-claim --skip-reward-claim` | `make export-solidity-verifier-deposit` |
+| `withdrawal_claim` only | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-bridge-agg --skip-deposit-append --skip-reward-claim` | `make export-solidity-verifier-withdrawal` |
+| `reward_claim` only | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-bridge-agg --skip-deposit-append --skip-withdrawal-claim` | `make export-solidity-verifier-reward` |
+| Deposit and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-bridge-agg --skip-reward-claim` | `make export-solidity-verifier-deposit && make export-solidity-verifier-withdrawal` |
+| Bridge aggregation and deposit | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-withdrawal-claim --skip-reward-claim` | `make export-solidity-verifier && make export-solidity-verifier-deposit` |
+| Bridge aggregation and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-deposit-append --skip-reward-claim` | `make export-solidity-verifier && make export-solidity-verifier-withdrawal` |
 
-The Make targets and exact verifier destinations are at `Makefile:130-146`. After generation, require every selected file to exist and be nonempty. The generator itself requires existence (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:581-586`).
+`make regen-groth16-keystore` passes no cohort flags, so the CLI regenerates all four cohorts. `make regen-bridge-agg-keystore` remains bridge-only by passing `--skip-deposit-append --skip-withdrawal-claim --skip-reward-claim`. `make export-all-solidity-verifier` exports all four verifiers into the nested `./psy-contracts/src/` checkout. The Make targets and exact verifier destinations are at `Makefile:163-182`. After generation, require every selected file to exist and be nonempty. The generator itself requires existence (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:777-783`).
 
 ## 10. Offline Packaging and Manifest
 

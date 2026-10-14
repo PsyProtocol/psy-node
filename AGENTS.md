@@ -501,6 +501,14 @@ Violating any rule below requires an immediate fix before other work continues.
 18. **No stopping before the goal is fully met.** Work continues until every deliverable has current executable evidence. A phase boundary, sub-step, pending review, or infrastructure stall is never a reason to stop the turn or park the objective; unblocked reachable work continues in the same turn. Waiting on external input is allowed only when the information is unreachable by any tool, and the stop must state exactly what is missing and what was tried.
 19. **Decision ownership.** The user makes only the most important decisions and design rulings (approval boundaries, external-authority changes, irreversible operations such as push/deploy/publish, and explicit scope changes). Everything else — implementation choices, bug-fix approaches, internal API shapes, repair strategies, sequencing within an agreed milestone — is decided by the working agent with stated reasoning. Never bounce a decision back to the user that the agent can resolve from repository evidence; when a rule genuinely requires user agreement (this file says so explicitly), state the choice made and the alternative rejected rather than presenting an options list.
 
+### Real End-to-End Flow First
+
+1. The first implementation milestone MUST connect the smallest complete real user flow across all required components and produce an observable result. Compilation, isolated component tests, mocks, queue admission, and disconnected implementations do not satisfy this milestone.
+2. Before that milestone, prioritize required interfaces, missing integration, and demonstrated blockers. Do not delay it for speculative hardening, optional abstractions, performance tuning, cosmetic renaming, exhaustive edge-case suites, or repeated reviews of unchanged code.
+3. Keep proof verification, authorization, replay protection, correct balances and supply, secret handling, and existing fail-closed checks intact. Never use dummy proofs, permissive mocks, skipped validation, or false success to claim the real flow works.
+4. Preserve required design and pre-execution review gates, scoped to the changed contract and its necessary negative cases. Re-review changed or affected paths after repairs; do not restart unrelated reviews without new evidence. Parallelize independent implementation and verification preparation.
+5. After the first real-flow result, finish all user-requested acceptance cases, applicable security checks, documentation, and cleanup before delivery. Record adjacent improvements in ISSUES.md rather than expanding the active task. This changes execution order, not the final completeness requirement.
+
 ## Multi-Agent Ownership
 
 1. Before editing, each agent must declare the exact files or modules it owns. Two agents must never edit the same file or implement competing versions of the same feature concurrently.

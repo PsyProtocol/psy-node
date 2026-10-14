@@ -541,20 +541,28 @@ pub struct GenerateBatchProofMinerRewardProofsArgs {
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct ClaimRewardsArgs {
-    #[clap(env, long, default_value = "config.json", env)]
+    #[clap(long, default_value = "config.json", env)]
     pub rpc_config: String,
+    #[clap(long, env, help = "Ethereum reward token address; its addresses provider discovers the StateManager")]
+    pub reward_token: String,
+    #[clap(long, env, help = "Ethereum reward recipient address")]
+    pub recipient: String,
+    #[clap(long, env, help = "Reward owner user id on L2")]
+    pub user_id: u64,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
-    /// Path to JSON file containing job IDs
-    #[clap(long, default_value = "worker.backup")]
+    #[clap(long, default_value = "worker.backup", help = "Original binary worker job metadata; never consumed or deleted")]
     pub jobs_file: String,
-    /// Write a versioned, reusable JSON reward summary to this path.
-    #[clap(long)]
-    pub summary_output: Option<String>,
-    /// Generate the reward summary without loading a wallet or submitting a
-    /// transaction.
-    #[clap(long, requires = "summary_output")]
-    pub summary_only: bool,
+    #[clap(long, default_value = "reward-proof-cache", help = "Disposable aggregate proof cache directory, separate from original worker metadata")]
+    pub proof_cache_dir: String,
+    #[clap(long, env, help = "Ethereum JSON-RPC used to read recognized roots and token claimed pairs")]
+    pub l1_rpc_url: String,
+    #[clap(long, env = "L1_PRIVATE_KEY", help = "EVM private key signing the L1 claimReward transaction; distinct from the ZK wallet source")]
+    pub l1_private_key: String,
+    #[clap(long, env, help = "Prove-proxy JSON-RPC URL for the Groth16 reward claim wrap")]
+    pub prove_proxy_url: String,
+    #[clap(long, env, help = "Prove-proxy bearer token")]
+    pub prove_proxy_token: Option<String>,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]

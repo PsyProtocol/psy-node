@@ -269,11 +269,26 @@ psy_worker_cli worker \
   --user 3145728 \
   --completed-jobs-log-file worker.backup
 
-# Claim mining rewards
+# Claim mining rewards (prove, wrap to Groth16 at the prove-proxy, pay on L1)
 psy_user_cli claim-rewards \
+  --rpc-config ./config.json \
   --keystore-path <home>/.psy/keystore/miner0.json \
-  --jobs-file worker.backup
+  --jobs-file worker.backup \
+  --recipient 0xYOUR_REWARD_RECIPIENT \
+  --user-id YOUR_USER_ID \
+  --proof-cache-dir ./reward-proof-cache \
+  --l1-rpc-url http://127.0.0.1:8545 \
+  --l1-private-key "$L1_PRIVATE_KEY" \
+  --prove-proxy-url http://127.0.0.1:9001
 ```
+
+Eligible checkpoint mints are confirmed on L1 before remaining jobs are preaggregated.
+`--rpc-config` is the only configuration file: it supplies the reward token and the circuits.
+Keep `worker.backup` outside the disposable cache directory. The cache retains network magic,
+source fingerprints, common digests, verifier digests, and the proof. Removing it does not
+remove original selections or undo on-chain `claimed` pairs. Confirm rediscovers the token
+and `STATE_MANAGER` from the provider at the receipt block. Services admission is not
+required. Each claimed checkpoint/user pair is final, including any omitted jobs.
 
 ## 8. Security Practices
 

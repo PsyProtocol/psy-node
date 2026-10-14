@@ -2871,7 +2871,7 @@ export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv)
             }
             previousToken = token;
         }
-        if (!account || Object.keys(account).sort().join(",") !== "contract_id,initial_policy" || account.contract_id !== 6) throw new Error("invalid account");
+        if (!account || Object.keys(account).sort().join(",") !== "contract_id,initial_policy" || account.contract_id !== 1) throw new Error("invalid account");
         const policy = account.initial_policy;
         if (!policy || Object.keys(policy).sort().join(",") !== "member_count,member_hashes,threshold,version"
             || policy.version !== 1 || policy.threshold !== 2 || policy.member_count !== 3
@@ -2886,7 +2886,7 @@ export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv)
             previous = limbs;
         }
     } catch {
-        throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT must be a readable public MultisigAccount file with contract 6 and a valid initial two-of-three policy");
+        throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT must be a readable public MultisigAccount file with contract 1 and a valid initial two-of-three policy");
     }
     const configuredArtifact = env.PSY_MULTISIG_POLICY_ARTIFACT;
     if (!configuredArtifact?.trim()) throw new Error("PSY_MULTISIG_POLICY_ARTIFACT is required for Genesis generation");
@@ -4187,7 +4187,15 @@ function hexQuantityToBigInt(value: unknown, source: string): bigint {
 
 /** anvil_dumpState(true) is always a hex-encoded gzip of plain state JSON and retains historical states. */
 export function decodeAnvilDumpStateHex(dump: unknown, source: string): string {
-    if (typeof dump !== "string" || !/^0x(?:[0-9a-fA-F]{2})+$/.test(dump)) {
+    const hexChars = typeof dump === "string" ? dump.length - 2 : 0;
+    let hex = typeof dump === "string" && dump.startsWith("0x") && hexChars > 0 && hexChars % 2 === 0;
+    if (typeof dump === "string") {
+        for (let i = 2; hex && i < dump.length; i++) {
+            const code = dump.charCodeAt(i);
+            hex = (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+        }
+    }
+    if (!hex || typeof dump !== "string") {
         throw new Error(`[DevNet] anvil_dumpState for '${source}' returned ${typeof dump}; expected hex-encoded gzip`);
     }
     let plain: Uint8Array;
@@ -5020,6 +5028,51 @@ export class DevNetProcessManager {
             await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pConfig);
         }
 
+        // Prove proxy Groth16 preload is independent of Coordinator RPC.
+        // Spawn immediately after realm/genesis prep, then wait for :9999
+        // before core so processor startup is not concurrent with preload.
+        const proveProxyReady: Promise<void>[] = [];
+        const proveProxyCount = options.proveProxyCount || 0;
+        if (proveProxyCount > 0 || startAll) {
+            const count = proveProxyCount || 1;
+            for (let i = 0; i < count; i++) {
+                const port = 9999 + i;
+                const proveProxyProc = await RunningProcess.spawnWithInitializationHintWithRetry(
+                    [
+                        './target/release/psy_user_cli',
+                        'prove-proxy',
+                        '--listen-addr',
+                        `0.0.0.0:${port}`,
+                        '--rpc-config',
+                        'psy-genesis/config.json',
+                        '--role',
+                        'all',
+                    ],
+                    proveProxyStartedDetector,
+                    { cwd, ...getLogPaths(`prove_proxy_${i}`, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
+                );
+                this.track(proveProxyProc);
+                proveProxyReady.push(
+                    waitForTcpPort('127.0.0.1', port, {
+                        attempts: 600,
+                        delayMs: 1000,
+                        timeoutMs: 1500,
+                        name: `Prove proxy ${i}`,
+                    }).then(() => {
+                        console.log(`[DevNet] Prove proxy instance ${i} started on port ${port}`);
+                    }),
+                );
+                console.log(`[DevNet] Prove proxy instance ${i} process started; continuing while Groth16 warms on port ${port}`);
+            }
+        }
+        const waitForProveProxy = async (reason: string): Promise<void> => {
+            if (proveProxyReady.length === 0) return;
+            console.log(`[DevNet] Waiting for prove-proxy listen before ${reason}...`);
+            await Promise.all(proveProxyReady);
+        };
+        await waitForProveProxy("coordinator processor");
+
+
 
         // 3. Coordinator Processor
         if (startCoordinatorProcessor) {
@@ -5324,49 +5377,6 @@ export class DevNetProcessManager {
             console.log(`[DevNet] All ${dummyProvers} dummy provers started`);
         }
 
-        // 9. Prove Proxy
-        // Groth16 preload is 3–4 minutes and does not depend on Anvil/Envio.
-        // Spawn now, keep warming in the background, and only wait for :9999
-        // before the proof-consuming relayer (and before setupProcesses returns).
-        const proveProxyReady: Promise<void>[] = [];
-        const proveProxyCount = options.proveProxyCount || 0;
-        if (proveProxyCount > 0 || startAll) {
-            const count = proveProxyCount || 1;
-            for (let i = 0; i < count; i++) {
-                const port = 9999 + i;
-                const proveProxyProc = await RunningProcess.spawnWithInitializationHintWithRetry(
-                    [
-                        './target/release/psy_user_cli',
-                        'prove-proxy',
-                        '--listen-addr',
-                        `0.0.0.0:${port}`,
-                        '--rpc-config',
-                        'psy-genesis/config.json',
-                        '--role',
-                        'all',
-                    ],
-                    proveProxyStartedDetector,
-                    { cwd, ...getLogPaths(`prove_proxy_${i}`, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
-                );
-                this.track(proveProxyProc);
-                proveProxyReady.push(
-                    waitForTcpPort('127.0.0.1', port, {
-                        attempts: 600,
-                        delayMs: 1000,
-                        timeoutMs: 1500,
-                        name: `Prove proxy ${i}`,
-                    }).then(() => {
-                        console.log(`[DevNet] Prove proxy instance ${i} started on port ${port}`);
-                    }),
-                );
-                console.log(`[DevNet] Prove proxy instance ${i} process started; continuing while Groth16 warms on port ${port}`);
-            }
-        }
-        const waitForProveProxy = async (reason: string): Promise<void> => {
-            if (proveProxyReady.length === 0) return;
-            console.log(`[DevNet] Waiting for prove-proxy listen before ${reason}...`);
-            await Promise.all(proveProxyReady);
-        };
 
         // 10. L1 (Anvil)
         let resetEnvioStorage = false;

@@ -8,7 +8,7 @@ use psy_config::network_constants::{CHECKPOINT_TREE_HEIGHT, GLOBAL_CONTRACT_TREE
 use psy_crypto::hash::{merkle::core::MerkleProofCore, traits::{hasher::{FieldQHasher, MerkleZeroHasher}, qhashable::QFieldHashable}};
 use psy_provider::{provider::RpcProvider, request::QIMTMembershipProofRPCRequest};
 use psy_prover::{session::session::WalletSession, trace::{TxTrace, TraceStep}};
-use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatureWitness, StoredMultisigPolicy};
+use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatureWitness, StoredMultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
 
 use guardian_common::endcap::approved_endcap_max_proof_bytes;
 use guardian_common::protocol::*;
@@ -176,7 +176,7 @@ pub async fn validate_approved_contract(approved: &ApprovedContract, wallet: &Wa
     }
     let deployment=trusted_proxy_contract_root(wallet,u64::from(approved.contract_id),leaf.deployer.to_canonical_u64(),artifact.state_tree_height,&artifact.circuit_definitions).await?;
     if deployment.code_root!=leaf.code_root || deployment.function_tree_root!=leaf.function_tree_root { return Err(GuardianSignError::AuthorizationMismatch); }
-    if approved.contract_id==6 && artifact.state_tree_height!=4 { return Err(GuardianSignError::PolicyMismatch); }
+    if approved.contract_id==MULTISIG_POLICY_CONTRACT_ID && artifact.state_tree_height!=4 { return Err(GuardianSignError::PolicyMismatch); }
     if !matches!(approved.contract_id,0|4) { return Ok(None); }
     let state=artifact.abi.pointer("/contract/state").and_then(serde_json::Value::as_array).ok_or(GuardianSignError::AuthorizationMismatch)?;
     let mut fields=state.iter().filter(|field|field["name"]=="state_map");
@@ -342,7 +342,7 @@ fn policy_call(operation: GuardianOperation, witness: &MultisigSignatureWitness)
     if (operation == GuardianOperation::Bootstrap) != bootstrap || start == ending { return Err(GuardianSignError::PolicyMismatch); }
     let mut inputs = Vec::with_capacity(28);
     for hash in std::iter::once(start.header).chain(start.members).chain(ending.members) { inputs.extend(hash.0.elements.map(|field|field.to_canonical_u64())); }
-    Ok(ContractCallArgs { contract_id:6,method_name:"set_policy".into(),inputs })
+    Ok(ContractCallArgs { contract_id:u64::from(MULTISIG_POLICY_CONTRACT_ID),method_name:"set_policy".into(),inputs })
 }
 
 async fn verify_guardian_session_evidence(context: &GuardianVerificationContext<'_>, authorization: &GuardianAuthorization, request: &GuardianSignRequest) -> Result<(VerifiedGuardianSession, ContractCallData, Hash4),GuardianAccountError> {
@@ -666,21 +666,21 @@ mod tests {
     fn recovery_commitment_fixture() -> (GuardianAuthorization, GuardianSignRequest, TxTrace, ContractCallData, Hash4) {
         use psy_crypto::hash::merkle::utils::simple_merkle_tree::SimpleMerkleTree;
         use psy_client_data::{dpn::proving_session::DPNProvingSessionSimpleMethodCall, qdata::{user::PsyUserLeaf,user_contract_state::{UserContractState,SignContext},ups_signature::PsyUserProvingSessionSignatureDataCompact}};
-        use psy_vm::{ups::{multisig::MultisigAccount,state_reader::StateReaderResults},dpn::ops::state_cmd::data::{DPNStateCmd,DPNStateCmdGetSelfUserCurrentContractStateSlotHash}};
+        use psy_vm::{ups::{multisig::{MultisigAccount,MULTISIG_POLICY_CONTRACT_ID},state_reader::StateReaderResults},dpn::ops::state_cmd::data::{DPNStateCmd,DPNStateCmdGetSelfUserCurrentContractStateSlotHash}};
         let members = [Hash4::from_values(1,0,0,0),Hash4::from_values(2,0,0,0),Hash4::from_values(3,0,0,0)];
         let policy = StoredMultisigPolicy {header:Hash4::from_values(1,2,3,0),members}.policy().unwrap();
-        let account = MultisigAccount {contract_id:6,initial_policy:policy};
+        let account = MultisigAccount {contract_id:MULTISIG_POLICY_CONTRACT_ID,initial_policy:policy};
         let fingerprint = Hash4::from_values(9,8,7,6);
         let public_key = PsyHasher::q_two_to_one(fingerprint,account.public_key_param().unwrap());
         let mut policy_tree = SimpleMerkleTree::<PsyHasher,Hash4>::new(4);
         for (index,value) in std::iter::once(Hash4::from_values(1,2,3,0)).chain(members).enumerate() { policy_tree.set_leaf(index as u64,value); }
         let mut contracts = SimpleMerkleTree::<PsyHasher,Hash4>::new(GLOBAL_CONTRACT_TREE_HEIGHT);
-        contracts.set_leaf(6,policy_tree.get_root());
+        contracts.set_leaf(u64::from(MULTISIG_POLICY_CONTRACT_ID),policy_tree.get_root());
         let leaf = PsyUserLeaf {public_key,user_state_tree_root:contracts.get_root(),user_id:F::from_canonical_u64(BRIDGE_USER_ID),nonce:F::ONE,..Default::default()};
         let mut users = SimpleMerkleTree::<PsyHasher,Hash4>::new(GLOBAL_USER_TREE_HEIGHT);
         users.set_leaf(BRIDGE_USER_ID,leaf.qfhash::<PsyHasher>());
         let root = Hash4::from_values(5,6,7,8);
-        let state = StateReaderResults {state:UserContractState::new(root,leaf,policy_tree.get_root(),F::from_canonical_u64(6),F::from_canonical_u64(7)),user_tree_root:users.get_root(),checkpoint:None,aux_user_leaves:vec![],state_cmds:(0..4).map(|index|DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(DPNStateCmdGetSelfUserCurrentContractStateSlotHash {slot_index:F::from_canonical_u64(index)})).collect(),merkel_proofs:(0..4).flat_map(|index|[contracts.get_leaf(6),policy_tree.get_leaf(index)]).collect()};
+        let state = StateReaderResults {state:UserContractState::new(root,leaf,policy_tree.get_root(),F::from_canonical_u32(MULTISIG_POLICY_CONTRACT_ID),F::from_canonical_u64(7)),user_tree_root:users.get_root(),checkpoint:None,aux_user_leaves:vec![],state_cmds:(0..4).map(|index|DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(DPNStateCmdGetSelfUserCurrentContractStateSlotHash {slot_index:F::from_canonical_u64(index)})).collect(),merkel_proofs:(0..4).flat_map(|index|[contracts.get_leaf(u64::from(MULTISIG_POLICY_CONTRACT_ID)),policy_tree.get_leaf(index)]).collect()};
         let method = |name: &str,method_id| psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition {name:name.into(),method_id,circuit_inputs:vec![],circuit_outputs:vec![],assertions:vec![],events:vec![],definitions:vec![],state_commands:vec![],state_command_resolution_indices:vec![]};
         let artifact = CompilerArtifact {state_tree_height:4,circuit_definitions:vec![method("first",1),method("second",2)],abi:serde_json::json!({"schema_version":"2.0.0","contract":{"state_tree_height":4}})};
         let artifact_json = JsonText::from_value(&artifact).unwrap();
@@ -867,7 +867,7 @@ mod tests {
         let directory=std::path::PathBuf::from(std::env::var("GUARDIAN_COMPILER_ARTIFACTS")?);
         let network=psy_config::PsyConfigGoldilocks::builder().path("config.json").network(psy_config::CURRENT_NETWORK).build()?.get_current_network()?.clone();
         let wallet=WalletSession::new(&network).await?;
-        let names=["token","mining_rewards","deposit_tree","withdrawal_tree","usdt_token","faucet","multisig_policy"];
+        let names=["token","multisig_policy","deposit_tree","withdrawal_tree","usdt_token","faucet"];
         let history=GuardianHistory::new();
         for (contract_id,name) in names.iter().enumerate() {
             let text=std::fs::read_to_string(directory.join(name).join("target").join(format!("{name}.json")))?;
@@ -890,7 +890,7 @@ mod tests {
                 substituted.compiler_artifact_sha256=sha256(substituted.compiler_artifact_json.as_str().as_bytes());
                 assert!(validate_approved_contract(&substituted,&wallet).await.is_err(),"ABI offset substitution accepted for {name}");
             } else { assert!(map.is_none()); }
-            if contract_id==6 { assert_eq!(artifact.state_tree_height,4); }
+            if contract_id==MULTISIG_POLICY_CONTRACT_ID as usize { assert_eq!(artifact.state_tree_height,4); }
             let mut wrong_digest=approved.clone(); wrong_digest.compiler_artifact_sha256.0[0]^=1;
             assert!(history.approved_artifact(&wrong_digest,&wallet).await.is_err());
             let mut wrong_leaf=leaf; wrong_leaf.code_root.0.elements[0]+=F::ONE;

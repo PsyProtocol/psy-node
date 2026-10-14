@@ -332,6 +332,9 @@ pub enum RequestParams<F: RichField> {
 
     #[serde(rename = "psy_generate_batch_proof_miner_reward_proofs")]
     GenerateBatchProofMinerRewardProofs(QGenerateBatchProofMinerRewardProofsRPCRequest),
+
+    #[serde(rename = "psy_worker_get_realm_identifier_worker_api")]
+    GetRealmIdentifierWorkerApi,
 }
 
 #[serde_as]

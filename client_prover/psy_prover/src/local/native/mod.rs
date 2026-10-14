@@ -453,7 +453,7 @@ mod multisig_rpc_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn multisig_public_requests_validate_accounts_policies_and_signatures() {
         use plonky2::field::types::PrimeField64;
-        use psy_vm::ups::multisig::MultisigPolicy;
+        use psy_vm::ups::multisig::{MultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
         let mut members: Vec<_> = (1u8..=3).map(|byte| {
             let key = k256::ecdsa::SigningKey::from_slice(&[byte; 32]).unwrap();
             let signature = secp256k1_sign(key, QHashOut::<F>::from_values(1, 2, 3, 4)).unwrap();
@@ -464,7 +464,7 @@ mod multisig_rpc_tests {
         let mut member_hashes = [QHashOut::ZERO; 8];
         for (index, (hash, _)) in members.iter().enumerate() { member_hashes[index] = *hash; }
         let policy = MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes };
-        let account = MultisigAccount { contract_id: 6, initial_policy: policy.clone() };
+        let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: policy.clone() };
         let mut wallet = crate::wallet::memory_wallet::PsyMemoryWallet::new(Vec::new());
         let info = wallet.register_multisig_user(account.clone()).unwrap();
         let public_key = info.qfhash::<psy_client_data::config::store_config::PsyHasher>();

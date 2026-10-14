@@ -9,6 +9,7 @@ pub mod proof_store;
 pub mod protocol;
 pub mod qblock;
 pub mod qdata;
+pub mod reward_claim;
 pub mod qstore;
 pub mod qsync;
 pub mod traits;

@@ -103,7 +103,9 @@ impl SignContext {
 mod tests {
     use plonky2::field::goldilocks_field::GoldilocksField as GF;
     use plonky2::{field::types::Field, hash::hash_types::HashOut};
-    use psy_client_data::qdata::{ups_signature::PsyUserProvingSessionSignatureDataCompact, user::PsyUserLeaf, user_contract_state::SignContext as SessionSignContext};
+    use psy_client_data::qdata::{
+        ups_signature::PsyUserProvingSessionSignatureDataCompact, user::PsyUserLeaf, user_contract_state::SignContext as SessionSignContext,
+    };
 
     use super::*;
 

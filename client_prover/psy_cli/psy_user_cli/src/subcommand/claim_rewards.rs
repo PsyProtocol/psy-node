@@ -1,195 +1,292 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
+use std::collections::BTreeMap;
+use alloy_consensus::{SignableTransaction, TxEip1559};
+use alloy_eips::Encodable2718;
+use alloy_primitives::{Address, TxHash, TxKind, U256};
+use alloy_signer::Signer;
+use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use hashbrown::HashMap;
-use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
+use plonky2::{
+    field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}},
+};
 use psy_cli_common::key_utils::load_wallet_key_info;
 use psy_client_common::{
-    args::ContractCallArgs,
+    args::SignType,
     data::qhashout::QHashOut,
-    job::id::{QProvingJobDataID, QProvingJobDataIDWithRewardPreimage, GUTA_REWARDS_TREE_V2_MAX_HEIGHT},
+    job::id::{QProvingJobDataID, QProvingJobDataIDWithRewardPreimage},
 };
 use psy_client_data::{
-    api::reward::{PsyProoffMinerRewardProof, PsyProoffMinerRewardProofWithRewardPreimage, PsyProvingJobClaimMetadata},
-    config::store_config::PsyHasher,
-    traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync},
+    api::reward::PsyProvingJobClaimMetadata,
+    reward_claim::RewardClaim,
+    traits::qdatastore::qmetadata::QMetaDataStoreReaderSync,
 };
-use psy_config::network_constants::{MINING_REWARDS_CONTRACT_ID, TOKEN_CONTRACT_ID, TOKEN_CONTRACT_STATE_TREE_HEIGHT};
-use psy_crypto::hash::{merkle::tag_tree::TagTreeMerkleProofWithRewardPreimage, traits::hasher::FieldQHasher};
-use psy_prover::session::{build_claim_calls_for_multi_checkpoints_v2, ProofWithCheckpointV2, LAST_CLAIMED_CHECKPOINT_SLOT};
 use psy_provider::provider::RpcProvider;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use psy_prover::local::reward_client::{
+    bind_reward_checkpoint_statement, canonical_quantity, chain_id_word, decode_address, encode_reward_claim_calldata, encode_u64_word, recipient_limbs, reward_claim_chain,
+    RewardCheckpointStatement, RewardClaimWrapProofInput, RewardClient, RewardJobAggregate, RewardJobAggregateCache,
+    RewardJobOriginals, RewardPendingSelection, UserRewardCircuits,
+};
+use psy_plonky2_circuits::bridge::circuits::user_reward_checkpoint_aggregate::{UserRewardCheckpointAggregateCircuit, UserRewardCheckpointAggregateWitness, REWARD_CLAIM_MAX_CHECKPOINTS, USER_REWARD_CHECKPOINT_AGGREGATE_TOTAL_PUBLIC_INPUT_COUNT};
 
-use super::{args::ClaimRewardsArgs, submit_end_cap_proof};
-use crate::result::{write_json_atomically, CommandResult, TransactionResult, TransactionStatus};
-
-type ClaimMetadata = PsyProvingJobClaimMetadata<QHashOut<GoldilocksField>, QProvingJobDataID>;
-
-#[derive(Debug)]
-struct LoadedClaimJobs {
-    records: Vec<ClaimMetadata>,
-    source_format: String,
-    source_record_size: Option<usize>,
-    source_sha256: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RewardSummary {
-    schema_version: u32,
-    network: String,
-    generated_at_ms: u64,
-    source: RewardSummarySource,
-    summary: RewardSummaryTotals,
-    checkpoints: Vec<RewardSummaryCheckpoint>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RewardSummarySource {
-    path: String,
-    format: String,
-    record_size: Option<usize>,
-    record_count: usize,
-    sha256: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RewardSummaryTotals {
-    checkpoint_count: usize,
-    job_count: usize,
-    estimated_total_reward: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RewardSummaryCheckpoint {
-    checkpoint_id: u64,
-    unique_pending_id: u64,
-    node_type: String,
-    realm_id: u64,
-    realm_sub_id: u64,
-    fees_collected: u64,
-    gutas_completed: u64,
-    reward_per_job: u64,
-    job_count: usize,
-    estimated_total_reward: u64,
-    jobs: Vec<RewardSummaryJob>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RewardSummaryJob {
-    #[serde(flatten)]
-    metadata: ClaimMetadata,
-    circuit_name: String,
-    reward_path_info: u64,
-    estimated_reward: u64,
-    validation: RewardSummaryValidation,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RewardSummaryValidation {
-    preimage_matches_backup_tag: bool,
-    proof_leaf_tag_matches_backup_tag: bool,
-}
+use super::args::ClaimRewardsArgs;
+use super::claim_withdrawal::rpc_call;
+use crate::result::{CommandResult, L1TransactionResult, L1TransactionStatus};
+use psy_prover::signature::traits::SignatureUser;
+use psy_prover::signature::users::zk_user::ZKUser;
+use psy_crypto::signature::zk::wallet::SimplePsyPrivateKey;
+use psy_crypto::common::user_id::get_registration_id_from_user_id;
+use psy_client_data::config::store_config::PsyHasher;
+use psy_crypto::hash::traits::qhashable::QFieldHashable;
 
 pub async fn run(args: ClaimRewardsArgs) -> Result<CommandResult> {
-    let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
-    let rpc_config = psy_config.get_current_network()?.clone();
-    let provider = RpcProvider::new_with_config(&rpc_config)?;
-    let loaded = load_claim_jobs(&args.jobs_file)?;
-    tracing::info!("Loaded {} job records from {}", loaded.records.len(), args.jobs_file);
+    let user_id = u32::try_from(args.user_id)?;
+    let recipient = decode_address(&args.recipient)?;
+    anyhow::ensure!(recipient != [0; 20], "reward recipient must be nonzero");
 
-    if let Some(summary_output) = &args.summary_output {
-        let summary = build_reward_summary(&provider, psy_config.current_network_name(), &args.jobs_file, &loaded).await?;
-        write_json_atomically(Path::new(summary_output), &summary)?;
-        tracing::info!("Wrote reusable reward summary to {}", summary_output);
+    let wallet = Some(load_wallet_key_info(&args.wallet, false)?);
+    let (client, circuits) = RewardClient::load(&args.rpc_config)?;
+    let wallet = wallet.context("reward root requires the selected ZK private key")?;
+    anyhow::ensure!(wallet.sign_type == SignType::ZKSign, "reward root accepts only ZK authorization");
+    let signer = ZKUser::new(SimplePsyPrivateKey { private_key: wallet.private_key });
+    let chain_id_hex: String = serde_json::from_value(rpc_call(&args.l1_rpc_url, "eth_chainId", serde_json::json!([])).await?)?;
+    let chain_id = chain_id_word(canonical_quantity(&chain_id_hex)?)?;
+    anyhow::ensure!(reward_claim_chain(chain_id), "reward chain identity must be 1, 31337, or 11155111");
+    let block = client.read_l1_block(&args.l1_rpc_url).await?;
+    let deployment = client.discover_reward_deployment(&args.l1_rpc_url, &block, &args.reward_token).await?;
+    let token = format!("0x{}", hex::encode(deployment.token));
+    let state_manager_address = format!("0x{}", hex::encode(deployment.state_manager));
+    let loaded = validate_and_deduplicate_jobs(load_reward_jobs(&args.jobs_file)?, args.user_id, &args.jobs_file)?;
+    anyhow::ensure!(loaded.jobs_len() != 0, "no reward jobs selected");
+    let grouped = client.group_reward_jobs(loaded.into(), user_id, recipient).await?;
+    let unloaded_ids = grouped.unloaded.keys().copied().collect::<Vec<_>>();
+    let groups = grouped.groups;
+    let (anchor_id, root_word, recognized) = client.read_finalized_checkpoint(&args.l1_rpc_url, &block, &state_manager_address).await?;
+    let mut eligible = Vec::new();
+    let mut remaining = Vec::new();
+    for (checkpoint, originals) in groups {
+        if client.read_claimed_pair(&args.l1_rpc_url, &block, &token, user_id, checkpoint).await? { continue; }
+        if recognized && checkpoint <= anchor_id { eligible.push(originals); } else { remaining.push(originals); }
     }
-    if args.summary_only {
-        return Ok(CommandResult::generic("claim-rewards-summary"));
+    if eligible.is_empty() && !unloaded_ids.is_empty() {
+        let ids = unloaded_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        anyhow::bail!("reward source groups unavailable: {ids}; original jobs file unchanged");
     }
-
-    let info = load_wallet_key_info(&args.wallet, false)?;
-    let user_id = provider
-        .get_user_ids_for_public_key(info.public_key_hash)
-        .await?
-        .first()
-        .ok_or(anyhow::format_err!("no user id"))?
-        .clone();
-
-    let job_ids = claim_jobs_from_metadata(loaded.records)?;
-    tracing::info!("Loaded {} job IDs from file", job_ids.jobs_len());
-    let job_ids = validate_and_deduplicate_jobs(job_ids, user_id, &args.jobs_file)?;
-    tracing::info!(
-        "Loaded claim jobs from {}: realm_jobs={}, coordinator_jobs={}",
-        args.jobs_file,
-        job_ids.realm_jobs.len(),
-        job_ids.coordinator_jobs.len()
-    );
-    tracing::debug!("Total jobs: {}", serde_json::to_string_pretty(&job_ids)?);
-
-    let latest_checkpoint_id = provider.get_latest_block_state().await?.checkpoint_id;
-    let last_claimed_checkpoint_id = get_last_claimed_checkpoint_id(&provider, user_id, latest_checkpoint_id).await?;
-    tracing::info!(
-        "Claim reward checkpoint state: user_id={}, latest_checkpoint_id={}, last_claimed_checkpoint_id={}",
-        user_id,
-        latest_checkpoint_id,
-        last_claimed_checkpoint_id
-    );
-    let mut proofs_with_checkpoint_id = build_realm_proofs(&provider, last_claimed_checkpoint_id, job_ids.realm_jobs).await?;
-    for (k, v) in build_proofs(&provider, last_claimed_checkpoint_id, job_ids.coordinator_jobs, 2).await? {
-        proofs_with_checkpoint_id.entry(k).or_default().extend(v);
+    if eligible.is_empty() {
+        preaggregate_remaining(&client, &circuits, &args, &token, remaining, None).await?;
+        return Ok(CommandResult::L1Transaction(L1TransactionResult { transaction_hash: None, status: L1TransactionStatus::ProofOnly, chain_id: Some(chain_id) }));
     }
-    tracing::info!(
-        "Proofs after checkpoint filtering: checkpoints={}, proofs={}",
-        proofs_with_checkpoint_id.len(),
-        proofs_with_checkpoint_id.values().map(|proofs| proofs.len()).sum::<usize>()
-    );
-
-    // Build contract call args from proofs (pass job_ids to get reward_path_info)
-    let contract_call_args = build_claim_calls_from_proofs(&provider, &proofs_with_checkpoint_id).await?;
-
-    // Execute contract calls
-    if !contract_call_args.is_empty() {
-        let (tx_hash, _end_user_leaf_hash) = submit_end_cap_proof::prove_contract_call_data_once(
-            &args.rpc_config,
-            &args.wallet,
-            psy_client_common::args::ContractCallData::new(contract_call_args),
+    eligible.sort_by_key(|originals| originals.source_checkpoint_id);
+    let checkpoint_circuit = UserRewardCheckpointAggregateCircuit::new(&circuits.user_reward_root);
+    let mut confirmed_hashes: Vec<String> = Vec::new();
+    let mut submitted_hash: Option<String> = None;
+    for chunk in eligible.chunks(REWARD_CLAIM_MAX_CHECKPOINTS) {
+        let outcome = async {
+        let mut claims = Vec::with_capacity(chunk.len());
+        let mut proofs = Vec::with_capacity(chunk.len());
+        let mut deferred = Vec::new();
+        for originals in chunk {
+            let material = async {
+                let source = client.rpc_provider.get_checkpoint_leaf_data(u64::from(originals.source_checkpoint_id)).await?;
+                let anchor = client.load_finalized_reward_anchor(anchor_id, root_word, originals).await?;
+                Ok::<_, anyhow::Error>((source, anchor))
+            }.await;
+            let (source, anchor) = match material {
+                Ok(material) => material,
+                Err(error) => { tracing::warn!(checkpoint_id = originals.source_checkpoint_id, %error, "reward historical material unavailable; whole selection remains pending"); deferred.push(originals.clone()); continue; }
+            };
+            let aggregate = load_or_prove_aggregate(&client, &circuits, &args, originals, &source)?;
+            let root = client.prove_finalized_reward_root(&circuits.user_reward_root, &circuits.user_reward_leaf, &circuits.user_reward_aggregate, &aggregate, &anchor, recipient_limbs(&recipient))?;
+            let pi: [u64; 23] = root.public_inputs.iter().map(|value| value.to_canonical_u64()).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("reward root statement width mismatch"))?;
+            claims.push(RewardClaim::from_public_inputs(&pi)?);
+            proofs.push(checkpoint_circuit.prove(&UserRewardCheckpointAggregateWitness::Root { root })?);
+        }
+        remaining.extend(deferred);
+        if proofs.is_empty() { return Ok(()); }
+        while proofs.len() > 1 {
+            let mut round = proofs.into_iter();
+            let mut reduced = Vec::new();
+            while let Some(left) = round.next() {
+                reduced.push(match round.next() {
+                    Some(right) => checkpoint_circuit.prove(&UserRewardCheckpointAggregateWitness::Pair { left, right })?,
+                    None => left,
+                });
+            }
+            proofs = reduced;
+        }
+        let proof = proofs.pop().context("no eligible checkpoint proof")?;
+        let statement = bind_reward_checkpoint_statement(&proof.public_inputs, user_id, &recipient, &root_word, &claims)?;
+        let anchor = client.load_finalized_reward_anchor(anchor_id, root_word, chunk.first().context("reward claim has no payable group")?).await?;
+        let wrapped = signer.prove_reward_claim(&client, &checkpoint_circuit, &proof, &anchor, deployment.token, deployment.state_manager).await?;
+        let request_proof = RewardClaimWrapProofInput { reward_claim_wrap_proof_hex: hex::encode(bincode::serialize(&wrapped)?) };
+        let wrap = client.prove_reward_claim_groth16(&args.prove_proxy_url, args.prove_proxy_token.as_deref(), &request_proof).await?;
+        tracing::info!("Groth16 reward claim proof generated");
+        let data = encode_reward_claim_calldata(&wrap.solidity_proof, user_id, recipient, &statement)?;
+        let block = client.read_l1_block(&args.l1_rpc_url).await?;
+        anyhow::ensure!(client.read_reward_root_recognized(&args.l1_rpc_url, &block, &state_manager_address, statement.checkpoint_tree_root).await?, "reward checkpoint root is no longer recognized");
+        for id in &statement.checkpoint_ids {
+            anyhow::ensure!(!client.read_claimed_pair(&args.l1_rpc_url, &block, &token, user_id, *id).await?, "reward checkpoint {id} is already claimed; rebuild the selected unclaimed batch");
+        }
+        let token_address = Address::from(deployment.token);
+        let l1_signer: PrivateKeySigner = args.l1_private_key.parse()?;
+        let from = l1_signer.address();
+        let nonce_hex: String = serde_json::from_value(
+            rpc_call(&args.l1_rpc_url, "eth_getTransactionCount", serde_json::json!([format!("{:#x}", from), "latest"])).await?,
+        )?;
+        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).map_err(|error| anyhow::anyhow!("reward nonce parse: {error}"))?;
+        let gas_estimate = match rpc_call(
+            &args.l1_rpc_url,
+            "eth_estimateGas",
+            serde_json::json!([{
+                "from": format!("{:#x}", from),
+                "to": format!("{:#x}", token_address),
+                "data": format!("0x{}", hex::encode(&data)),
+            }]),
         )
-        .await?;
-        tracing::info!("Successfully claimed rewards with v2 proof structure");
-        Ok(CommandResult::Transaction(TransactionResult {
-            transaction_hash: tx_hash,
-            user_id: Some(user_id),
-            status: TransactionStatus::Submitted,
-            confirmed_checkpoint: None,
-            network: psy_config.current_network_name().to_string(),
-        }))
-    } else {
-        tracing::info!("No proofs to claim");
-        Ok(CommandResult::generic("claim-rewards"))
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => Err(err)?,
+        };
+        let gas_hex: String = serde_json::from_value(gas_estimate).context("reward gas estimate type")?;
+        let estimated_gas = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16).map_err(|error| anyhow::anyhow!("reward gas estimate parse: {error}"))?;
+        let gas_limit = estimated_gas.checked_mul(6).context("reward gas estimate overflow")? / 5;
+
+        let fee_history = rpc_call(&args.l1_rpc_url, "eth_feeHistory", serde_json::json!([1, "latest", [50.0]])).await?;
+        let base_fee_str = fee_history["baseFeePerGas"][0].as_str().context("reward fee history has no base fee")?;
+        let base_fee = u128::from_str_radix(base_fee_str.trim_start_matches("0x"), 16).map_err(|error| anyhow::anyhow!("reward base fee parse: {error}"))?;
+        let priority_str = fee_history["reward"][0][0].as_str().context("reward fee history has no priority fee")?;
+        let max_priority_fee = u128::from_str_radix(priority_str.trim_start_matches("0x"), 16).map_err(|error| anyhow::anyhow!("reward priority fee parse: {error}"))?;
+        let max_fee_per_gas = base_fee.checked_mul(2).context("reward base fee overflow")?.checked_add(max_priority_fee).context("reward max fee overflow")?;
+
+        let tx = TxEip1559 {
+            chain_id,
+            nonce,
+            max_fee_per_gas,
+            max_priority_fee_per_gas: max_priority_fee,
+            gas_limit,
+            to: TxKind::Call(token_address),
+            value: U256::ZERO,
+            input: alloy_primitives::Bytes::from(data),
+            access_list: Default::default(),
+        };
+        let sig = l1_signer.sign_hash(&tx.signature_hash()).await?;
+        let signed = tx.into_signed(sig);
+        let mut encoded = Vec::new();
+        signed.encode_2718(&mut encoded);
+        let tx_hash_raw: String = match rpc_call(&args.l1_rpc_url, "eth_sendRawTransaction", serde_json::json!([format!("0x{}", hex::encode(&encoded))])).await {
+            Ok(value) => serde_json::from_value(value)?,
+            Err(err) => Err(err)?,
+        };
+        let tx_hash: TxHash = tx_hash_raw.parse()?;
+        submitted_hash = Some(format!("{:#x}", tx_hash));
+        tracing::info!("claim_reward tx submitted: {:#x}", tx_hash);
+        println!("claim_reward tx: {:#x}", tx_hash);
+
+        let receipt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(RECEIPT_WAIT_SECS);
+        let receipt = loop {
+            anyhow::ensure!(std::time::Instant::now() < receipt_deadline, "reward claim receipt not observed within {}s: tx_hash={:#x}", RECEIPT_WAIT_SECS, tx_hash);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let result = rpc_call(&args.l1_rpc_url, "eth_getTransactionReceipt", serde_json::json!([format!("{:#x}", tx_hash)])).await;
+            match result {
+                Ok(value) if !value.is_null() => break value,
+                _ => continue,
+            }
+        };
+        let receipt = client.read_canonical_reward_receipt(&args.l1_rpc_url, &format!("{:#x}", tx_hash), &receipt).await?;
+        let status_str = receipt["status"].as_str().context("reward receipt has no status")?;
+        anyhow::ensure!(status_str == "0x0" || status_str == "0x1", "malformed reward receipt status: {status_str}");
+        let receipt_status = u64::from_str_radix(status_str.trim_start_matches("0x"), 16).map_err(|error| anyhow::anyhow!("reward receipt status parse: {error}"))?;
+        println!("status: {}", if receipt_status == 1 { "success" } else { "failed" });
+        if receipt_status != 1 {
+            let trace = rpc_call(&args.l1_rpc_url, "debug_traceTransaction", serde_json::json!([format!("{:#x}", tx_hash), {"tracer": "callTracer"}])).await;
+            let revert_reason = trace.ok().and_then(|value| value["revertReason"].as_str().map(str::to_owned));
+            Err(anyhow::anyhow!("reward claim transaction reverted: tx_hash={:#x}, reason={}", tx_hash, revert_reason.as_deref().unwrap_or("unknown")))?;
+        }
+        client.reward_claimed_event(&receipt, deployment.token, user_id, recipient, &statement)?;
+        client.mint_transfer_event(&receipt, deployment.token, recipient, statement.total_amount)?;
+        let receipt_block = receipt["blockHash"].as_str().context("reward receipt has no block hash")?;
+        for id in &statement.checkpoint_ids {
+            anyhow::ensure!(client.read_claimed_pair(&args.l1_rpc_url, receipt_block, &token, user_id, *id).await?, "reward token claimed pair differs for checkpoint {id}");
+        }
+        confirmed_hashes.push(submitted_hash.take().context("confirmed reward claim has no submitted hash")?);
+        Ok(())
+        }.await;
+        if let Err(error) = outcome {
+            return Err(attach_claim_hashes(error, &confirmed_hashes, submitted_hash.as_deref()));
+        }
     }
+    preaggregate_remaining(&client, &circuits, &args, &token, remaining, confirmed_hashes.last().map(String::as_str)).await.map_err(|error| attach_claim_hashes(error, &confirmed_hashes, None))?;
+    if !unloaded_ids.is_empty() {
+        let ids = unloaded_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        return Err(attach_claim_hashes(anyhow::anyhow!("reward source groups unavailable: {ids}; original jobs file unchanged"), &confirmed_hashes, None));
+    }
+    let status = if confirmed_hashes.is_empty() { L1TransactionStatus::ProofOnly } else { L1TransactionStatus::Confirmed };
+    Ok(CommandResult::L1Transaction(L1TransactionResult {
+        transaction_hash: confirmed_hashes.last().cloned(),
+        status,
+        chain_id: Some(chain_id),
+    }))
+}
+const RECEIPT_WAIT_SECS: u64 = 120;
+
+
+
+fn load_or_prove_aggregate(client: &RewardClient, circuits: &UserRewardCircuits, args: &ClaimRewardsArgs, originals: &RewardJobOriginals, source: &psy_client_data::qdata::checkpoint::PsyCheckpointLeaf<GoldilocksField>) -> Result<RewardJobAggregate> {
+    let directory = std::path::Path::new(&args.proof_cache_dir);
+    std::fs::create_dir_all(directory)?;
+    anyhow::ensure!(!std::fs::canonicalize(&args.jobs_file)?.starts_with(std::fs::canonicalize(directory)?), "original jobs must be outside the disposable cache directory");
+    let path = directory.join(format!("{:016x}-{}-{}.json", psy_config::network_constants::PSY_NETWORK_MAGIC, originals.user_id, originals.source_checkpoint_id));
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(cache) = serde_json::from_slice::<RewardJobAggregateCache>(&bytes) {
+            if let Ok(Some(aggregate)) = client.reuse_reward_job_aggregate(&circuits.user_reward_leaf, &circuits.user_reward_aggregate, &cache, originals, source) { return Ok(aggregate); }
+        }
+    }
+    let aggregate = client.prove_reward_job_aggregate(&circuits.user_reward_leaf, &circuits.user_reward_aggregate, originals.user_id, originals.source_checkpoint_id, source, &originals.jobs)?;
+    cache_proved_aggregate(circuits, &path, &aggregate)?;
+    Ok(aggregate)
 }
 
-#[derive(Debug, serde::Serialize)]
+async fn preaggregate_remaining(client: &RewardClient, circuits: &UserRewardCircuits, args: &ClaimRewardsArgs, token: &str, remaining: Vec<RewardJobOriginals>, confirmed_tx: Option<&str>) -> Result<()> {
+    let block = client.read_l1_block(&args.l1_rpc_url).await.map_err(|error| attach_confirmed_payout(error, confirmed_tx))?;
+    for originals in remaining {
+        if client.read_claimed_pair(&args.l1_rpc_url, &block, token, originals.user_id, originals.source_checkpoint_id).await.map_err(|error| attach_confirmed_payout(error, confirmed_tx))? { continue; }
+        match client.rpc_provider.get_checkpoint_leaf_data(u64::from(originals.source_checkpoint_id)).await {
+            Ok(source) => { let _aggregate = load_or_prove_aggregate(client, circuits, args, &originals, &source).map_err(|error| attach_confirmed_payout(error, confirmed_tx))?; }
+            Err(error) => tracing::warn!(checkpoint_id = originals.source_checkpoint_id, %error, "complete reward source unavailable; originals remain pending"),
+        };
+    }
+    Ok(())
+}
+
+fn attach_claim_hashes(error: anyhow::Error, confirmed: &[String], submitted: Option<&str>) -> anyhow::Error {
+    let mut parts = Vec::new();
+    if !confirmed.is_empty() { parts.push(format!("confirmed_tx={}", confirmed.join(","))); }
+    if let Some(hash) = submitted { parts.push(format!("submitted_tx={hash}")); }
+    if parts.is_empty() { error } else { error.context(parts.join("; ")) }
+}
+fn attach_confirmed_payout(error: anyhow::Error, confirmed_tx: Option<&str>) -> anyhow::Error {
+    attach_claim_hashes(error, confirmed_tx.map(|hash| vec![hash.to_owned()]).as_deref().unwrap_or(&[]), None)
+}
+
+fn cache_proved_aggregate(circuits: &UserRewardCircuits, path: &std::path::Path, aggregate: &RewardJobAggregate) -> Result<()> {
+    let (cache, _) = aggregate.build_reward_job_aggregate_cache(circuits)?;
+    crate::result::write_json_atomically(path, &cache)
+}
+
+
+#[derive(Debug)]
 struct ClaimRewardJobsWithRealm {
-    realm_jobs: Vec<(u64, u64, QProvingJobDataIDWithRewardPreimage)>,
+    realm_jobs: Vec<(u64, u64, u64, QProvingJobDataIDWithRewardPreimage)>,
     coordinator_jobs: Vec<(u64, QProvingJobDataIDWithRewardPreimage)>,
 }
 
 impl ClaimRewardJobsWithRealm {
-    fn new_empty() -> Self {
-        Self {
-            realm_jobs: vec![],
-            coordinator_jobs: vec![],
-        }
-    }
+    fn new_empty() -> Self { Self { realm_jobs: vec![], coordinator_jobs: vec![] } }
+    fn jobs_len(&self) -> usize { self.realm_jobs.len() + self.coordinator_jobs.len() }
+}
 
-    fn jobs_len(&self) -> usize {
-        self.realm_jobs.len() + self.coordinator_jobs.len()
-    }
+impl From<ClaimRewardJobsWithRealm> for RewardPendingSelection {
+    fn from(jobs: ClaimRewardJobsWithRealm) -> Self { Self { realm_jobs: jobs.realm_jobs, coordinator_jobs: jobs.coordinator_jobs } }
 }
 
 fn validate_and_deduplicate_jobs(
@@ -197,23 +294,23 @@ fn validate_and_deduplicate_jobs(
     expected_user_id: u64,
     jobs_file: &str,
 ) -> Result<ClaimRewardJobsWithRealm> {
-    let mut seen: HashMap<QProvingJobDataID, (Option<u64>, u64, u64, QHashOut<GoldilocksField>)> = HashMap::new();
+    let mut seen: HashMap<QProvingJobDataID, (Option<u64>, u64, u64, u64, QHashOut<GoldilocksField>)> = HashMap::new();
     let mut deduplicated = ClaimRewardJobsWithRealm::new_empty();
-    for (realm_id, unique_pending_id, job) in jobs.realm_jobs {
-        validate_reward_preimage_user(&job, expected_user_id, jobs_file, &format!("realm_id={realm_id}"))?;
-        let identity = (Some(realm_id), unique_pending_id, job.inner.reward_path_info, job.reward_tree_tag_preimage);
+    for (realm_id, realm_sub_id, unique_pending_id, job) in jobs.realm_jobs {
+        validate_reward_preimage_user(&job, expected_user_id, jobs_file, &format!("realm_id={realm_id} realm_sub_id={realm_sub_id}"))?;
+        let identity = (Some(realm_id), realm_sub_id, unique_pending_id, job.inner.reward_path_info, job.reward_tree_tag_preimage);
         match seen.get(&job.inner.job_data_id) {
             Some(existing) if existing == &identity => {}
             Some(_) => anyhow::bail!("jobs file {} contains conflicting duplicate job_id {:?}", jobs_file, job.inner.job_data_id),
             None => {
                 seen.insert(job.inner.job_data_id, identity);
-                deduplicated.realm_jobs.push((realm_id, unique_pending_id, job));
+                deduplicated.realm_jobs.push((realm_id, realm_sub_id, unique_pending_id, job));
             }
         }
     }
     for (unique_pending_id, job) in jobs.coordinator_jobs {
         validate_reward_preimage_user(&job, expected_user_id, jobs_file, "coordinator")?;
-        let identity = (None, unique_pending_id, job.inner.reward_path_info, job.reward_tree_tag_preimage);
+        let identity = (None, 0, unique_pending_id, job.inner.reward_path_info, job.reward_tree_tag_preimage);
         match seen.get(&job.inner.job_data_id) {
             Some(existing) if existing == &identity => {}
             Some(_) => anyhow::bail!("jobs file {} contains conflicting duplicate job_id {:?}", jobs_file, job.inner.job_data_id),
@@ -245,270 +342,17 @@ fn validate_reward_preimage_user(
     Ok(())
 }
 
-fn index_reward_preimages(
-    jobs: &[QProvingJobDataIDWithRewardPreimage],
-) -> Result<HashMap<QProvingJobDataID, QHashOut<GoldilocksField>>> {
-    let mut index = HashMap::new();
-    for job in jobs {
-        if let Some(existing) = index.insert(job.inner.job_data_id, job.reward_tree_tag_preimage) {
-            anyhow::ensure!(existing == job.reward_tree_tag_preimage, "conflicting reward preimages for duplicate job_id {:?}", job.inner.job_data_id);
-        }
-    }
-    Ok(index)
-}
 
-fn attach_reward_preimages(
-    proofs: Vec<PsyProoffMinerRewardProof<QHashOut<GoldilocksField>>>,
-    preimages: &HashMap<QProvingJobDataID, QHashOut<GoldilocksField>>,
-    source: &str,
-) -> Result<Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>> {
-    let mut matched = HashMap::new();
-    let mut attached = Vec::with_capacity(proofs.len());
-    for proof in proofs {
-        let reward_tree_tag_preimage = preimages
-            .get(&proof.job_id)
-            .copied()
-            .with_context(|| format!("missing reward preimage for {} proof job {:?}", source, proof.job_id))?;
-        anyhow::ensure!(
-            matched.insert(proof.job_id, ()).is_none(),
-            "duplicate {} proof for job {:?}",
-            source,
-            proof.job_id,
-        );
-        attached.push(PsyProoffMinerRewardProofWithRewardPreimage { inner: proof, reward_tree_tag_preimage });
-    }
-    if matched.len() != preimages.len() {
-        let missing = preimages
-            .keys()
-            .filter(|job_id| !matched.contains_key(*job_id))
-            .copied()
-            .collect::<Vec<_>>();
-        anyhow::bail!("{} proofs are missing requested job_ids {:?}", source, missing);
-    }
-    Ok(attached)
-}
-
-fn require_checkpoint_id(checkpoint_id: Option<u64>, source: &str) -> Result<u64> {
-    checkpoint_id.with_context(|| format!("{} has no checkpoint id", source))
-}
-
-fn reward_path_info(level: u8, index: u64) -> Result<u64> {
-    const INDEX_MASK: u64 = 0x00ff_ffff_ffff_ffff;
-    anyhow::ensure!(index <= INDEX_MASK, "reward tree node index {} exceeds 56 bits", index);
-    Ok(((level as u64) << 56) | index)
-}
-
-pub async fn build_realm_proofs(
-    provider: &RpcProvider,
-    last_claimed_checkpoint_id: u64,
-    job_ids: Vec<(u64, u64, QProvingJobDataIDWithRewardPreimage)>,
-) -> Result<HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>> {
-    let job_ids_with_realm_and_unique_pending_id: HashMap<(u64, u64), Vec<QProvingJobDataIDWithRewardPreimage>> =
-        job_ids.into_iter().fold(HashMap::new(), |mut map, (realm_id, unique_pending_id, job)| {
-            map.entry((realm_id, unique_pending_id)).or_default().push(job);
-            map
-        });
-
-    let mut total_proofs = 0;
-    let mut proofs_with_unique_pending_id: HashMap<
-        u64,
-        Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>,
-    > = HashMap::new();
-
-    for ((realm_id, unique_pending_id), job_id_with_preimages) in job_ids_with_realm_and_unique_pending_id.iter() {
-        let job_ids = job_id_with_preimages
-            .iter()
-            .map(|job_id_with_preimage| job_id_with_preimage.inner)
-            .collect::<Vec<_>>();
-        let preimages = index_reward_preimages(job_id_with_preimages)?;
-
-        let checkpoint_id = require_checkpoint_id(
-            provider
-                .get_realm_checkpoint_id_for_unique_pending_id_by_realm_id(*realm_id, *unique_pending_id)
-                .await?,
-            &format!("realm {} unique_pending_id {}", realm_id, unique_pending_id),
-        )?;
-        let proofs = provider
-            .generate_realm_batch_proof_miner_reward_proofs_by_realm_id(*realm_id, *unique_pending_id, job_ids)
-            .await?;
-
-        if checkpoint_id <= last_claimed_checkpoint_id {
-            tracing::info!(
-                "Skipping realm {} unique_pending_id {} checkpoint {} because last_claimed_checkpoint_id is {}",
-                realm_id,
-                unique_pending_id,
-                checkpoint_id,
-                last_claimed_checkpoint_id
-            );
-            continue;
-        }
-
-        total_proofs += proofs.len();
-        tracing::info!(
-            "Including realm {} unique_pending_id {} checkpoint {} jobs={} proofs={}",
-            realm_id,
-            unique_pending_id,
-            checkpoint_id,
-            job_id_with_preimages.len(),
-            proofs.len()
-        );
-
-        let proof_with_reward_preimages = attach_reward_preimages(proofs, &preimages, "realm")?;
-        proofs_with_unique_pending_id
-            .entry(checkpoint_id)
-            .or_default()
-            .extend(proof_with_reward_preimages);
-    }
-    tracing::info!("Total realm proofs: {}", total_proofs);
-
-    Ok(proofs_with_unique_pending_id)
-}
-
-pub async fn build_proofs(
-    provider: &RpcProvider,
-    last_claimed_checkpoint_id: u64,
-    job_ids: Vec<(u64, QProvingJobDataIDWithRewardPreimage)>,
-    node_type: u8,
-) -> Result<HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>> {
-    let job_ids_with_unique_pending_id: HashMap<u64, Vec<QProvingJobDataIDWithRewardPreimage>> =
-        job_ids.into_iter().fold(HashMap::new(), |mut map, (unique_pending_id, job)| {
-            map.entry(unique_pending_id).or_default().push(job);
-            map
-        });
-
-    let mut total_proofs = 0;
-    let mut proofs_with_unique_pending_id: HashMap<
-        u64,
-        Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>,
-    > = HashMap::new();
-
-    for (unique_pending_id, job_id_with_preimages) in job_ids_with_unique_pending_id.iter() {
-        let job_ids = job_id_with_preimages
-            .iter()
-            .map(|job_id_with_preimage| job_id_with_preimage.inner)
-            .collect::<Vec<_>>();
-        let preimages = index_reward_preimages(job_id_with_preimages)?;
-
-        let (checkpoint_id, proofs) = if node_type == 1 {
-            let checkpoint_id = require_checkpoint_id(
-                provider.get_realm_checkpoint_id_for_unique_pending_id(*unique_pending_id).await?,
-                &format!("realm unique_pending_id {}", unique_pending_id),
-            )?;
-            let proofs = provider
-                .generate_realm_batch_proof_miner_reward_proofs(*unique_pending_id, job_ids)
-                .await?;
-            (checkpoint_id, proofs)
-        } else {
-            let checkpoint_id = require_checkpoint_id(
-                provider
-                    .get_coordinator_checkpoint_id_for_unique_pending_id(*unique_pending_id)
-                    .await?,
-                &format!("coordinator unique_pending_id {}", unique_pending_id),
-            )?;
-            let proofs = provider
-                .generate_coordinator_batch_proof_miner_reward_proofs(*unique_pending_id, job_ids)
-                .await?;
-            (checkpoint_id, proofs)
-        };
-
-        if checkpoint_id <= last_claimed_checkpoint_id {
-            tracing::info!(
-                "Skipping coordinator unique_pending_id {} checkpoint {} because last_claimed_checkpoint_id is {}",
-                unique_pending_id,
-                checkpoint_id,
-                last_claimed_checkpoint_id
-            );
-            continue;
-        }
-
-        total_proofs += proofs.len();
-        tracing::info!(
-            "Including coordinator unique_pending_id {} checkpoint {} jobs={} proofs={}",
-            unique_pending_id,
-            checkpoint_id,
-            job_id_with_preimages.len(),
-            proofs.len()
-        );
-
-        let proof_with_reward_preimages = attach_reward_preimages(proofs, &preimages, "coordinator")?;
-        proofs_with_unique_pending_id
-            .entry(checkpoint_id)
-            .or_default()
-            .extend(proof_with_reward_preimages);
-    }
-    tracing::info!("Total proofs: {}", total_proofs);
-
-    Ok(proofs_with_unique_pending_id)
-}
-
-async fn get_last_claimed_checkpoint_id(provider: &RpcProvider, user_id: u64, latest_checkpoint_id: u64) -> Result<u64> {
-    let proof = provider
-        .get_user_contract_state_tree_merkle_proof(
-            latest_checkpoint_id,
-            user_id,
-            TOKEN_CONTRACT_ID,
-            TOKEN_CONTRACT_STATE_TREE_HEIGHT,
-            LAST_CLAIMED_CHECKPOINT_SLOT,
-        )
-        .await?;
-
-    Ok(proof.value.0.elements[1].0)
-}
-
-fn load_claim_jobs(path: &str) -> Result<LoadedClaimJobs> {
+fn load_reward_jobs(path: &str) -> Result<ClaimRewardJobsWithRealm> {
     let buffer = std::fs::read(path)?;
-    let source_sha256 = format!("{:x}", Sha256::digest(&buffer));
+    let mut claim_jobs = ClaimRewardJobsWithRealm::new_empty();
 
     if buffer.is_empty() {
         tracing::info!("Backup file is empty");
-        return Ok(LoadedClaimJobs {
-            records: Vec::new(),
-            source_format: "psy-worker-backup-v1".to_string(),
-            source_record_size: Some(ClaimMetadata::record_size()),
-            source_sha256,
-        });
+        return Ok(claim_jobs);
     }
 
-    if buffer.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{') {
-        let summary: RewardSummary = serde_json::from_slice(&buffer).context("failed to parse reward summary JSON")?;
-        anyhow::ensure!(
-            summary.schema_version == 1,
-            "unsupported reward summary schema_version {}",
-            summary.schema_version
-        );
-        let expected_job_count = summary.summary.job_count;
-        let mut records = Vec::new();
-        for checkpoint in summary.checkpoints {
-            for job in checkpoint.jobs {
-                let computed_path = reward_path_info(job.metadata.reward_tree_node_key.level, job.metadata.reward_tree_node_key.index)?;
-                anyhow::ensure!(
-                    computed_path == job.reward_path_info,
-                    "{} has inconsistent reward_path_info for job {:?}: stored={}, computed={}",
-                    path,
-                    job.metadata.job_id,
-                    job.reward_path_info,
-                    computed_path,
-                );
-                records.push(job.metadata);
-            }
-        }
-        anyhow::ensure!(
-            records.len() == expected_job_count,
-            "{} summary job_count is {}, but contains {} jobs",
-            path,
-            expected_job_count,
-            records.len(),
-        );
-        let records = validate_and_deduplicate_metadata(records, path)?;
-        return Ok(LoadedClaimJobs {
-            records,
-            source_format: "psy-reward-summary-v1".to_string(),
-            source_record_size: None,
-            source_sha256,
-        });
-    }
-
-    let record_size = ClaimMetadata::record_size();
+    let record_size = PsyProvingJobClaimMetadata::<QHashOut<GoldilocksField>, QProvingJobDataID>::record_size();
     anyhow::ensure!(
         buffer.len() % record_size == 0,
         "jobs backup length {} is not a multiple of record size {}",
@@ -516,63 +360,23 @@ fn load_claim_jobs(path: &str) -> Result<LoadedClaimJobs> {
         record_size
     );
 
-    let mut records = Vec::with_capacity(buffer.len() / record_size);
     for (record_index, record_data) in buffer.chunks_exact(record_size).enumerate() {
         let offset = record_index * record_size;
-        let metadata =
-            ClaimMetadata::psy_ser_from_slice(record_data).with_context(|| format!("failed to parse jobs backup record at offset {}", offset))?;
-        validate_claim_metadata(&metadata, path)?;
-        records.push(metadata);
-    }
-
-    Ok(LoadedClaimJobs {
-        records: validate_and_deduplicate_metadata(records, path)?,
-        source_format: "psy-worker-backup-v1".to_string(),
-        source_record_size: Some(record_size),
-        source_sha256,
-    })
-}
-
-fn validate_claim_metadata(metadata: &ClaimMetadata, source: &str) -> Result<()> {
-    let encoded = reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?;
-    let expected_tag = PsyHasher::q_two_to_one(metadata.reward_tree_tag_preimage, metadata.reward_tree_tag_preimage);
-    anyhow::ensure!(
-        expected_tag == metadata.reward_tree_tag,
-        "{} contains a reward_tree_tag that does not match its preimage: job_id={:?}, reward_path_info={}",
-        source,
-        metadata.job_id,
-        encoded,
-    );
-    Ok(())
-}
-
-fn validate_and_deduplicate_metadata(records: Vec<ClaimMetadata>, source: &str) -> Result<Vec<ClaimMetadata>> {
-    let mut seen: HashMap<QProvingJobDataID, ClaimMetadata> = HashMap::new();
-    let mut result = Vec::with_capacity(records.len());
-    for metadata in records {
-        validate_claim_metadata(&metadata, source)?;
-        match seen.get(&metadata.job_id) {
-            Some(existing) if existing == &metadata => continue,
-            Some(_) => anyhow::bail!("{} contains conflicting duplicate job_id {:?}", source, metadata.job_id),
-            None => {
-                seen.insert(metadata.job_id, metadata.clone());
-                result.push(metadata);
-            }
-        }
-    }
-    Ok(result)
-}
-
-fn claim_jobs_from_metadata(records: Vec<ClaimMetadata>) -> Result<ClaimRewardJobsWithRealm> {
-    let mut claim_jobs = ClaimRewardJobsWithRealm::new_empty();
-    for metadata in records {
+        let metadata = PsyProvingJobClaimMetadata::<QHashOut<GoldilocksField>, QProvingJobDataID>::psy_ser_from_slice(record_data)
+            .with_context(|| format!("failed to parse jobs backup record at offset {}", offset))?;
+        anyhow::ensure!(
+            metadata.reward_tree_node_key.index <= 0x00FF_FFFF_FFFF_FFFF,
+            "jobs backup record at offset {} has reward path index {} exceeding 56 bits",
+            offset,
+            metadata.reward_tree_node_key.index
+        );
         let job = QProvingJobDataIDWithRewardPreimage::new(
             metadata.job_id,
-            reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?,
+            (u64::from(metadata.reward_tree_node_key.level) << 56) | metadata.reward_tree_node_key.index,
             metadata.reward_tree_tag_preimage,
         );
         if metadata.node_type == 1 {
-            claim_jobs.realm_jobs.push((metadata.realm_id, metadata.unique_pending_id, job));
+            claim_jobs.realm_jobs.push((metadata.realm_id, metadata.realm_sub_id, metadata.unique_pending_id, job));
         } else {
             claim_jobs.coordinator_jobs.push((metadata.unique_pending_id, job));
         }
@@ -582,281 +386,335 @@ fn claim_jobs_from_metadata(records: Vec<ClaimMetadata>) -> Result<ClaimRewardJo
 }
 
 #[cfg(test)]
-fn load_job_ids_from_file(path: &str) -> Result<ClaimRewardJobsWithRealm> {
-    claim_jobs_from_metadata(load_claim_jobs(path)?.records)
-}
-
-async fn build_reward_summary(provider: &RpcProvider, network: &str, source_path: &str, loaded: &LoadedClaimJobs) -> Result<RewardSummary> {
-    let mut groups: BTreeMap<(u8, u64, u64, u64), Vec<&ClaimMetadata>> = BTreeMap::new();
-    for metadata in &loaded.records {
-        anyhow::ensure!(
-            matches!(metadata.node_type, 1 | 2),
-            "unsupported reward node_type {} for job {:?}",
-            metadata.node_type,
-            metadata.job_id,
-        );
-        groups
-            .entry((metadata.node_type, metadata.realm_id, metadata.realm_sub_id, metadata.unique_pending_id))
-            .or_default()
-            .push(metadata);
-    }
-
-    let mut checkpoint_stats = BTreeMap::<u64, (u64, u64, u64)>::new();
-    let mut checkpoints = Vec::with_capacity(groups.len());
-    let mut distinct_checkpoint_ids = BTreeSet::new();
-    let mut estimated_total_reward = 0u64;
-
-    for ((node_type, realm_id, realm_sub_id, unique_pending_id), records) in groups {
-        let request_jobs = records
-            .iter()
-            .map(|metadata| {
-                Ok(QProvingJobDataIDWithRewardPreimage::new(
-                    metadata.job_id,
-                    reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?,
-                    metadata.reward_tree_tag_preimage,
-                )
-                .inner)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let (checkpoint_id, proofs) = if node_type == 1 {
-            let checkpoint_id = require_checkpoint_id(
-                provider
-                    .get_realm_checkpoint_id_for_unique_pending_id_by_realm_id(realm_id, unique_pending_id)
-                    .await?,
-                &format!("realm {} unique_pending_id {}", realm_id, unique_pending_id),
-            )?;
-            let proofs = provider
-                .generate_realm_batch_proof_miner_reward_proofs_by_realm_id(realm_id, unique_pending_id, request_jobs)
-                .await?;
-            (checkpoint_id, proofs)
-        } else {
-            let checkpoint_id = require_checkpoint_id(
-                provider.get_coordinator_checkpoint_id_for_unique_pending_id(unique_pending_id).await?,
-                &format!("coordinator unique_pending_id {}", unique_pending_id),
-            )?;
-            let proofs = provider
-                .generate_coordinator_batch_proof_miner_reward_proofs(unique_pending_id, request_jobs)
-                .await?;
-            (checkpoint_id, proofs)
-        };
-
-        let (fees_collected, gutas_completed, reward_per_job) = match checkpoint_stats.get(&checkpoint_id) {
-            Some(stats) => *stats,
-            None => {
-                let leaf = provider.get_checkpoint_leaf_data(checkpoint_id).await?;
-                let fees = leaf.stats.guta_fees_collected.to_canonical_u64();
-                let gutas = leaf.stats.pm_jobs_completed.gutas_completed.to_canonical_u64();
-                let reward = if gutas == 0 { 0 } else { fees / gutas };
-                checkpoint_stats.insert(checkpoint_id, (fees, gutas, reward));
-                (fees, gutas, reward)
-            }
-        };
-
-        let mut proofs_by_job = HashMap::new();
-        for proof in proofs {
-            anyhow::ensure!(
-                proofs_by_job.insert(proof.job_id, proof).is_none(),
-                "duplicate reward proof for unique_pending_id {}",
-                unique_pending_id,
-            );
-        }
-
-        let mut jobs = Vec::with_capacity(records.len());
-        for metadata in records {
-            let proof = proofs_by_job
-                .remove(&metadata.job_id)
-                .with_context(|| format!("missing reward proof for job {:?}", metadata.job_id))?;
-            anyhow::ensure!(
-                proof.tag_tree_proof.leaf.tag == metadata.reward_tree_tag,
-                "reward proof leaf tag does not match backup tag for job {:?}",
-                metadata.job_id,
-            );
-            jobs.push(RewardSummaryJob {
-                metadata: metadata.clone(),
-                circuit_name: format!("{:?}", metadata.job_id.circuit_type),
-                reward_path_info: reward_path_info(metadata.reward_tree_node_key.level, metadata.reward_tree_node_key.index)?,
-                estimated_reward: reward_per_job,
-                validation: RewardSummaryValidation {
-                    preimage_matches_backup_tag: true,
-                    proof_leaf_tag_matches_backup_tag: true,
-                },
-            });
-        }
-        anyhow::ensure!(
-            proofs_by_job.is_empty(),
-            "RPC returned unrequested reward proofs for unique_pending_id {}",
-            unique_pending_id
-        );
-
-        let group_total = reward_per_job.checked_mul(jobs.len() as u64).context("estimated group reward overflow")?;
-        estimated_total_reward = estimated_total_reward
-            .checked_add(group_total)
-            .context("estimated total reward overflow")?;
-        distinct_checkpoint_ids.insert(checkpoint_id);
-        checkpoints.push(RewardSummaryCheckpoint {
-            checkpoint_id,
-            unique_pending_id,
-            node_type: if node_type == 1 { "realm" } else { "coordinator" }.to_string(),
-            realm_id,
-            realm_sub_id,
-            fees_collected,
-            gutas_completed,
-            reward_per_job,
-            job_count: jobs.len(),
-            estimated_total_reward: group_total,
-            jobs,
-        });
-    }
-
-    Ok(RewardSummary {
-        schema_version: 1,
-        network: network.to_string(),
-        generated_at_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
-        source: RewardSummarySource {
-            path: source_path.to_string(),
-            format: loaded.source_format.clone(),
-            record_size: loaded.source_record_size,
-            record_count: loaded.records.len(),
-            sha256: loaded.source_sha256.clone(),
-        },
-        summary: RewardSummaryTotals {
-            checkpoint_count: distinct_checkpoint_ids.len(),
-            job_count: loaded.records.len(),
-            estimated_total_reward,
-        },
-        checkpoints,
-    })
-}
-
-pub async fn build_claim_calls_from_proofs(
-    provider: &RpcProvider,
-    proofs_with_unique_pending_id: &HashMap<u64, Vec<PsyProoffMinerRewardProofWithRewardPreimage<QHashOut<GoldilocksField>>>>,
-) -> Result<Vec<ContractCallArgs>> {
-    if proofs_with_unique_pending_id.is_empty() {
-        tracing::info!("No valid checkpoints with rewards to claim");
-        return Ok(Vec::new());
-    }
-
-    tracing::debug!("Building claim calls from proofs: {:?}", proofs_with_unique_pending_id);
-
-    let mut sorted_checkpoints: Vec<_> = proofs_with_unique_pending_id.keys().copied().collect();
-    sorted_checkpoints.sort();
-    tracing::info!("Preparing claim calls for checkpoints: {:?}", sorted_checkpoints);
-
-    let mut all_proofs_with_checkpoints = Vec::new();
-
-    for &checkpoint_id in &sorted_checkpoints {
-        let proofs = proofs_with_unique_pending_id
-            .get(&checkpoint_id)
-            .with_context(|| format!("missing proofs for checkpoint {}", checkpoint_id))?;
-        tracing::debug!("Checkpoint {} - Proofs: {}", checkpoint_id, serde_json::to_string_pretty(&proofs)?);
-
-        let checkpoint_leaf = provider.get_checkpoint_leaf_data(checkpoint_id).await?;
-        let fees_collected = checkpoint_leaf.stats.guta_fees_collected.to_canonical_u64();
-        let gutas_completed = checkpoint_leaf.stats.pm_jobs_completed.gutas_completed.to_canonical_u64();
-        tracing::info!(
-            "Checkpoint {} - Fees collected: {}, Gutas completed: {}",
-            checkpoint_id,
-            fees_collected,
-            gutas_completed
-        );
-
-        let proposed_reward = if gutas_completed > 0 { fees_collected / gutas_completed } else { 0u64 };
-
-        if proposed_reward == 0 {
-            tracing::warn!(
-                "Skipping checkpoint {} due to zero reward (fees_collected={}, gutas_completed={})",
-                checkpoint_id,
-                fees_collected,
-                gutas_completed
-            );
-            continue;
-        }
-
-        tracing::info!("Checkpoint {} - Reward: {}, Proofs: {}", checkpoint_id, proposed_reward, proofs.len());
-        for proof in proofs {
-            all_proofs_with_checkpoints.push(ProofWithCheckpointV2 {
-                checkpoint_id,
-                proof: TagTreeMerkleProofWithRewardPreimage::new(proof.inner.tag_tree_proof.clone(), proof.reward_tree_tag_preimage)
-                    .pad_to_height(GUTA_REWARDS_TREE_V2_MAX_HEIGHT as usize),
-                proposed_reward,
-            });
-        }
-    }
-
-    if all_proofs_with_checkpoints.is_empty() {
-        tracing::info!("No checkpoints with valid rewards to claim");
-        return Ok(Vec::new());
-    }
-
-    tracing::info!(
-        "Building claim calls for {} proofs across {} checkpoints",
-        all_proofs_with_checkpoints.len(),
-        sorted_checkpoints.len()
-    );
-    tracing::debug!("Proofs with checkpoints: {}", serde_json::to_string_pretty(&all_proofs_with_checkpoints)?);
-
-    let mut all_contract_calls = Vec::new();
-    let mut group_start = 0;
-    while group_start < all_proofs_with_checkpoints.len() {
-        let checkpoint_id = all_proofs_with_checkpoints[group_start].checkpoint_id;
-        let mut group_end = group_start + 1;
-        while group_end < all_proofs_with_checkpoints.len() && all_proofs_with_checkpoints[group_end].checkpoint_id == checkpoint_id {
-            group_end += 1;
-        }
-
-        let mut checkpoint_calls = build_claim_calls_for_multi_checkpoints_v2(&all_proofs_with_checkpoints[group_start..group_end]).await;
-        tracing::info!(
-            "Prepared {} reward claim calls for checkpoint {} with {} proofs",
-            checkpoint_calls.len(),
-            checkpoint_id,
-            group_end - group_start
-        );
-        all_contract_calls.append(&mut checkpoint_calls);
-        group_start = group_end;
-    }
-    for (call_index, call) in all_contract_calls.iter().enumerate() {
-        tracing::info!(
-            "Prepared reward claim call {}: contract_id={}, method={}, input_count={}",
-            call_index,
-            call.contract_id,
-            call.method_name,
-            call.inputs.len()
-        );
-    }
-
-    let last_checkpoint = all_proofs_with_checkpoints
-        .last()
-        .with_context(|| "claim proof list became empty before checkpoint finalization")?
-        .checkpoint_id;
-
-    all_contract_calls.push(ContractCallArgs {
-        contract_id: MINING_REWARDS_CONTRACT_ID as u64,
-        method_name: "end_session".to_string(),
-        inputs: vec![last_checkpoint],
-    });
-
-    all_contract_calls.push(ContractCallArgs {
-        contract_id: TOKEN_CONTRACT_ID as u64,
-        method_name: "claim_pow_rewards".to_string(),
-        inputs: vec![last_checkpoint],
-    });
-
-    tracing::info!(
-        "Executing {} contract calls in single transaction, last_checkpoint={}",
-        all_contract_calls.len(),
-        last_checkpoint
-    );
-    Ok(all_contract_calls)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use psy_client_common::job::id::{
-        ProvingJobCircuitType, ProvingJobDataType, QJobTopic,
+    use std::{collections::BTreeMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+    use plonky2::{
+        field::types::{Field, PrimeField64},
+        hash::{hash_types::HashOut, poseidon::PoseidonHash},
+        plonk::config::{Hasher, PoseidonGoldilocksConfig},
     };
+    use psy_client_data::{
+        reward_claim::RewardClaim,
+        qdata::checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf},
+    };
+    use psy_crypto::hash::merkle::core::MerkleProofCore;
+    use psy_prover::local::reward_client::RewardClient as PortableRewardClient;
+    use psy_plonky2_circuits::bridge::circuits::user_reward_tree::{
+        UserRewardAggregateCircuit, UserRewardJobWitness, UserRewardLeafCircuit, UserRewardRootCircuit,
+    };
+    type F = GoldilocksField;
+
+    struct Server { url: String, stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>> }
+    impl Server {
+        fn new(reply: impl Fn(serde_json::Value) -> serde_json::Value + Send + 'static) -> Self {
+            use std::io::{BufRead, Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false)); let stopped = stop.clone();
+            let thread = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stopped.load(Ordering::SeqCst) { break; }
+                    let mut stream = stream.unwrap();
+                    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                    let mut reader = std::io::BufReader::new(&mut stream); let mut length = None;
+                    loop {
+                        let mut line = String::new(); assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" { break; }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") { length = Some(value.trim().parse::<usize>().unwrap()); }
+                        }
+                    }
+                    let mut body = vec![0; length.unwrap()]; reader.read_exact(&mut body).unwrap(); drop(reader);
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let response = serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":reply(request.clone())}).to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                }
+            });
+            Self { url, stop, thread: Some(thread) }
+        }
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.url.trim_start_matches("http://"));
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+    fn path(leaves: &BTreeMap<u64, HashOut<F>>, index: u64) -> MerkleProofCore<QHashOut<F>> {
+        let value = leaves[&index]; let mut nodes = leaves.clone(); let mut cursor = index;
+        let mut empty = HashOut::ZERO; let mut siblings = Vec::new();
+        for _ in 0..32 {
+            siblings.push(QHashOut(nodes.get(&(cursor ^ 1)).copied().unwrap_or(empty)));
+            let mut parents = BTreeMap::new();
+            for child in nodes.keys() { parents.insert(child >> 1, PoseidonHash::two_to_one(nodes.get(&(child & !1)).copied().unwrap_or(empty), nodes.get(&(child | 1)).copied().unwrap_or(empty))); }
+            nodes = parents; cursor >>= 1; empty = PoseidonHash::two_to_one(empty, empty);
+        }
+        MerkleProofCore { root: QHashOut(nodes[&0]), value: QHashOut(value), index, siblings }
+    }
+    struct Fixture {
+        server: Server, client: PortableRewardClient,
+        claimed: Arc<tokio::sync::Mutex<BTreeMap<(u32, u32), bool>>>,
+        private_key: HashOut<F>, jobs: Vec<UserRewardJobWitness>,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let private_key = QHashOut::from_values(17, 23, 31, 47);
+            let param = psy_ups_circuit::signature::software_defined::get_sdc_public_key_param(&private_key);
+            let identity = psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureCircuit::<PoseidonGoldilocksConfig, 2>::new().fingerprint.0;
+            let registration_leaf = PoseidonHash::two_to_one(identity, param.0);
+            let registration_index = get_registration_id_from_user_id(7);
+            let registration_path = path(&BTreeMap::from([(registration_index, registration_leaf)]), registration_index);
+            let mut roots = PsyCheckpointGlobalStateRoots::default(); roots.user_registration_tree_root = registration_path.root;
+            let mut anchor = PsyCheckpointLeaf::default(); anchor.global_chain_root = roots.qfhash::<PsyHasher>();
+            let preimage = parth_core::pgoldilocks::QHashOut::from_values(7, 1, 0, 0);
+            let tag = PoseidonHash::two_to_one(preimage.0, preimage.0);
+            let tagged = |left, right, tag| PoseidonHash::two_to_one(PoseidonHash::two_to_one(left, right), tag);
+            let mut levels = vec![(0..128).map(|index| tagged(QHashOut::from_values(index, 0, 0, 0).0, HashOut::ZERO, tag)).collect::<Vec<_>>()];
+            for level in 0..7 { levels.push(levels[level].chunks_exact(2).map(|pair| tagged(pair[0], pair[1], HashOut::ZERO)).collect()); }
+            let jobs = (0..18usize).map(|index| UserRewardJobWitness {
+                source_checkpoint_id: 10, height: 7, path_index: index as u32,
+                tag: psy_plonky2_circuits::bridge::circuits::user_reward_tree::UserRewardTagWitness {
+                    tag_preimage: preimage, leaf_left: parth_core::pgoldilocks::QHashOut::from_values(index as u64, 0, 0, 0),
+                    leaf_right: parth_core::pgoldilocks::QHashOut::ZERO, leaf_tag: parth_core::pgoldilocks::QHashOut(tag),
+                    siblings: std::array::from_fn(|level| if level < 7 { parth_core::pgoldilocks::QHashOut(levels[level][(index >> level) ^ 1]) } else { parth_core::pgoldilocks::QHashOut::ZERO }),
+                    parent_tags: [parth_core::pgoldilocks::QHashOut::ZERO; 21],
+                },
+            }).collect();
+            let mut source = PsyCheckpointLeaf::default(); source.stats.pm_rewards_commitment.gutas_root.0 = levels[7][0];
+            source.stats.pm_jobs_completed.gutas_completed = F::from_canonical_u32(32); source.stats.guta_fees_collected = F::from_canonical_u32(320);
+            let checkpoints = BTreeMap::from([(10, source.qfhash::<PsyHasher>().0), (11, anchor.qfhash::<PsyHasher>().0), (12, anchor.qfhash::<PsyHasher>().0)]);
+            let checkpoint_root = path(&checkpoints, 11).root;
+            let claimed = Arc::new(tokio::sync::Mutex::new(BTreeMap::new())); let claimed_read = claimed.clone();
+            let server = Server::new(move |request| {
+                let method = request["method"].as_str().unwrap();
+                match method {
+                    "eth_chainId" => serde_json::json!("0x1"),
+                    "eth_getBlockByNumber" => { let tag = request["params"][0].as_str().unwrap().to_owned(); assert!(tag == "0x2a" || tag == "latest"); serde_json::json!({"hash": format!("0x{}", "ab".repeat(32))}) },
+                    "eth_call" => {
+                        assert_eq!(request["params"][0]["to"], format!("0x{}", "05".repeat(20)));
+                        assert_eq!(request["params"][1], serde_json::json!({"blockHash":format!("0x{}", "ab".repeat(32)),"requireCanonical":true}));
+                        let data = hex::decode(request["params"][0]["data"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+                        assert_eq!(&data[..4], &alloy_primitives::keccak256(b"claimed(uint32,uint32)")[..4]);
+                        assert_eq!(data.len(), 68);
+                        let user = u32::from_be_bytes(data[32..36].try_into().unwrap());
+                        let checkpoint = u32::from_be_bytes(data[64..68].try_into().unwrap());
+                        let value = claimed_read.blocking_lock().get(&(user, checkpoint)).copied().unwrap_or(false);
+                        serde_json::json!(format!("0x{}{:02x}", "00".repeat(31), u8::from(value)))
+                    },
+                    "psy_get_checkpoint_leaf_data" => serde_json::to_value(if request["params"]["checkpoint_id"] == 10 { source } else { anchor }).unwrap(),
+                    "psy_get_checkpoint_tree_merkle_proof" => serde_json::to_value(path(&checkpoints, request["params"]["leaf_checkpoint_id"].as_u64().unwrap())).unwrap(),
+                    "psy_get_checkpoint_global_state_roots" => serde_json::to_value(roots).unwrap(),
+                    "psy_get_user_registration_tree_leaf_hash" => serde_json::to_value(QHashOut(registration_leaf)).unwrap(),
+                    "psy_get_user_registration_tree_merkle_proof" => serde_json::to_value(&registration_path).unwrap(),
+                    _ => panic!("unexpected RPC {method}"),
+                }
+            });
+            let rpc_provider = RpcProvider { client: Arc::new(reqwest::Client::new()), endpoint_clients: None, realm_configs: std::collections::HashMap::new(), coordinator_configs: std::collections::HashMap::from([(0, vec![server.url.clone()])]), users_per_realm: 1 << psy_config::network_constants::REALM_USER_TREE_HEIGHT, current_user_id: 0 };
+            let client = PortableRewardClient::new(rpc_provider);
+            Self { server, client, claimed, private_key: private_key.0, jobs }
+        }
+        fn recipient() -> [u8; 20] { decode_address("0x0102030405060708090a0b0c0d0e0f1011121314").unwrap() }
+    }
+
+    #[tokio::test]
+    async fn aggregate_cache_loss_rebuilds_exact_selection() {
+        let fixture = Fixture::new();
+        let leaf = UserRewardLeafCircuit::new();
+        let aggregate = UserRewardAggregateCircuit::new(&leaf);
+        let root = UserRewardRootCircuit::new(&aggregate);
+        let circuits = UserRewardCircuits { user_reward_leaf: leaf, user_reward_aggregate: aggregate, user_reward_root: root };
+        let source = fixture.client.rpc_provider.get_checkpoint_leaf_data(10).await.unwrap();
+        let prove = || fixture.client.prove_reward_job_aggregate(&circuits.user_reward_leaf, &circuits.user_reward_aggregate, 7, 10, &source, &fixture.jobs[..2]).unwrap();
+        let first = prove();
+        let (cache, originals) = first.build_reward_job_aggregate_cache(&circuits).unwrap();
+        assert!(fixture.client.reuse_reward_job_aggregate(&circuits.user_reward_leaf, &circuits.user_reward_aggregate, &cache, &originals, &source).unwrap().is_some());
+        drop(cache);
+        let rebuilt = prove();
+        assert_eq!(first.proof.public_inputs, rebuilt.proof.public_inputs);
+        let mut mixed = fixture.jobs[..2].to_vec(); mixed[1].source_checkpoint_id = 11;
+        assert!(fixture.client.prove_reward_job_aggregate(&circuits.user_reward_leaf, &circuits.user_reward_aggregate, 7, 10, &source, &mixed).is_err());
+    }
+
+    #[tokio::test]
+    async fn paid_preaggregation_failure_keeps_confirmed_hash_and_source_error() {
+        let fixture = Fixture::new();
+        let leaf = UserRewardLeafCircuit::new();
+        let aggregate_circuit = UserRewardAggregateCircuit::new(&leaf);
+        let root = UserRewardRootCircuit::new(&aggregate_circuit);
+        let circuits = UserRewardCircuits { user_reward_leaf: leaf, user_reward_aggregate: aggregate_circuit, user_reward_root: root };
+        let originals = RewardJobOriginals { user_id: 7, source_checkpoint_id: 10, jobs: fixture.jobs[..2].to_vec() };
+        let root_dir = std::env::temp_dir().join(format!("claim-paid-preaggregate-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let jobs_file = root_dir.join("jobs.bin");
+        let cache_dir = root_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(&jobs_file, []).unwrap();
+        let cache_name = format!("{:016x}-7-10.json", psy_config::network_constants::PSY_NETWORK_MAGIC);
+        std::fs::create_dir(cache_dir.join(&cache_name)).unwrap();
+        std::fs::write(cache_dir.join(&cache_name).join("occupied"), []).unwrap();
+        let token = format!("0x{}", "05".repeat(20));
+        let args = ClaimRewardsArgs {
+            rpc_config: String::new(), reward_token: String::new(), recipient: String::new(), user_id: 7,
+            wallet: crate::subcommand::args::WalletSourceArgs { sign_type: psy_client_common::args::SignType::ZKSign, private_key: None, keystore_path: None, wallet_password: None, fingerprint: None, sd_key_allowed_contract_id: vec![], sd_key_allowed_method_id: vec![], sd_key_expected_tx_count: 2 },
+            jobs_file: jobs_file.to_str().unwrap().to_owned(), proof_cache_dir: cache_dir.to_str().unwrap().to_owned(),
+            l1_rpc_url: fixture.server.url.clone(), l1_private_key: String::new(), prove_proxy_url: String::new(), prove_proxy_token: None,
+        };
+        let paid_hash = format!("0x{}", "cd".repeat(32));
+        let error = preaggregate_remaining(&fixture.client, &circuits, &args, &token, vec![originals], Some(&paid_hash)).await.unwrap_err();
+        assert!(error.chain().any(|cause| cause.is::<std::io::Error>()), "cache write error was replaced: {error:#}");
+        assert!(error.chain().any(|cause| cause.to_string().contains(&paid_hash)), "confirmed hash dropped: {error:#}");
+        assert!(jobs_file.is_file());
+        std::fs::remove_dir_all(root_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claimed_bool_decides_eligibility_without_cursor() {
+        let fixture = Fixture::new();
+        let token = format!("0x{}", "05".repeat(20));
+        let url = &fixture.server.url;
+        assert!(!fixture.client.read_claimed_pair(url, "0x2a", &token, 7, 10).await.unwrap());
+        assert!(!fixture.client.read_claimed_pair(url, "0x2a", &token, 7, 9).await.unwrap());
+        fixture.claimed.lock().await.insert((7, 10), true);
+        assert!(fixture.client.read_claimed_pair(url, "0x2a", &token, 7, 10).await.unwrap());
+        assert!(!fixture.client.read_claimed_pair(url, "0x2a", &token, 8, 10).await.unwrap());
+    }
+
+    #[test]
+    fn claim_reward_abi_decodes_complete_list_and_total() {
+        let mut proof_words = ["1".to_owned(), "1".to_owned(), "1".to_owned(), "1".to_owned(), "1".to_owned(), "1".to_owned(), "1".to_owned(), "1".to_owned()];
+        for count in [1usize, 64] {
+            let ids: Vec<u32> = (0..count as u32).collect();
+            let total = encode_u64_word(u64::try_from(count).unwrap() * 2);
+            let mut root = [0u8; 32]; root[0] = 0x11; root[31] = 1;
+            let statement = RewardCheckpointStatement { checkpoint_tree_root: root, checkpoint_ids: ids.clone(), total_amount: total };
+            let data = encode_reward_claim_calldata(&proof_words, 7, [1; 20], &statement).unwrap();
+            assert_eq!(&data[..4], &alloy_primitives::keccak256(b"claimReward(bytes,bytes32,uint32,address,uint32[],uint256)")[..4]);
+            assert_eq!(&data[4..4 + 32], &encode_u64_word(192));
+            assert_eq!(&data[4 + 32..4 + 64], &root);
+            assert_eq!(&data[4 + 64..4 + 96], &encode_u64_word(7));
+            assert_eq!(&data[4 + 108..4 + 128], &[1; 20]);
+            assert_eq!(&data[4 + 128..4 + 160], &encode_u64_word(480));
+            assert_eq!(&data[4 + 160..4 + 192], &total);
+            assert_eq!(&data[4 + 192..4 + 224], &encode_u64_word(256));
+            for index in 0..8 {
+                assert_eq!(&data[4 + 224 + index * 32..4 + 256 + index * 32], &encode_u64_word(1));
+            }
+            assert_eq!(&data[4 + 480..4 + 512], &encode_u64_word(u64::try_from(count).unwrap()));
+            for (index, id) in ids.iter().enumerate() {
+                assert_eq!(&data[4 + 512 + index * 32..4 + 544 + index * 32], &encode_u64_word(u64::from(*id)));
+            }
+            assert_eq!(data.len(), 4 + 512 + 32 * count);
+        }
+        let total = encode_u64_word(2);
+        let bad = RewardCheckpointStatement { checkpoint_tree_root: [2; 32], checkpoint_ids: vec![0, 0], total_amount: total };
+        assert!(encode_reward_claim_calldata(&proof_words, 7, [1; 20], &bad).is_err());
+        proof_words[0] = "0".to_owned();
+        assert!(encode_reward_claim_calldata(&proof_words, 7, [1; 20], &RewardCheckpointStatement { checkpoint_ids: (0..65).collect(), ..bad }).is_err());
+    }
+
+    #[tokio::test]
+    async fn claimed_read_errors_do_not_become_unclaimed() {
+        let server = Server::new(|request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => serde_json::json!("0x1"),
+            "eth_call" => serde_json::json!("0x"),
+            _ => panic!("unexpected method"),
+        });
+        let rpc_provider = RpcProvider { client: Arc::new(reqwest::Client::new()), endpoint_clients: None, realm_configs: std::collections::HashMap::new(), coordinator_configs: std::collections::HashMap::from([(0, vec![server.url.clone()])]), users_per_realm: 1, current_user_id: 0 };
+        let client = PortableRewardClient::new(rpc_provider);
+        let result = client.read_claimed_pair(&server.url, &format!("0x{}", "ab".repeat(32)), "0x1111111111111111111111111111111111111111", 7, 10).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirmation_requires_reward_claimed_and_mint_transfer() {
+        let token = [5u8; 20];
+        let recipient = [1u8; 20];
+        let root = [2u8; 32];
+        let total = encode_u64_word(20);
+        let statement = RewardCheckpointStatement { checkpoint_tree_root: root, checkpoint_ids: vec![10], total_amount: total };
+        let mut recipient_word = [0u8; 32]; recipient_word[12..].copy_from_slice(&recipient);
+        let mut claimed_data = encode_u64_word(64).to_vec();
+        claimed_data.extend_from_slice(&total);
+        claimed_data.extend_from_slice(&encode_u64_word(1));
+        claimed_data.extend_from_slice(&encode_u64_word(10));
+        let claimed_topic = alloy_primitives::keccak256(b"RewardClaimed(uint32,address,bytes32,uint32[],uint256)");
+        let transfer_topic = alloy_primitives::keccak256(b"Transfer(address,address,uint256)");
+        let claimed = serde_json::json!({"address":format!("0x{}", hex::encode(token)),"topics":[format!("0x{}",hex::encode(claimed_topic)),format!("0x{}",hex::encode(encode_u64_word(7))),format!("0x{}",hex::encode(recipient_word)),format!("0x{}",hex::encode(root))],"data":format!("0x{}",hex::encode(claimed_data))});
+        let transfer = serde_json::json!({"address":format!("0x{}", hex::encode(token)),"topics":[format!("0x{}",hex::encode(transfer_topic)),format!("0x{}",hex::encode([0u8; 32])),format!("0x{}",hex::encode(recipient_word))],"data":format!("0x{}",hex::encode(total))});
+        let receipt = serde_json::json!({"logs":[claimed, transfer]});
+        let client = PortableRewardClient { rpc_provider: RpcProvider { client: Arc::new(reqwest::Client::new()), endpoint_clients: None, realm_configs: Default::default(), coordinator_configs: Default::default(), users_per_realm: 1, current_user_id: 0 }, http: reqwest::Client::new() };
+        client.reward_claimed_event(&receipt, token, 7, recipient, &statement).unwrap();
+        client.mint_transfer_event(&receipt, token, recipient, total).unwrap();
+        assert!(client.reward_claimed_event(&receipt, token, 7, recipient, &RewardCheckpointStatement { checkpoint_ids: vec![11], ..statement }).is_err());
+        assert!(client.mint_transfer_event(&receipt, token, recipient, encode_u64_word(21)).is_err());
+    }
+
+
+
+    #[test]
+    fn aggregate_binding_accepts_nonzero_root_and_rejects_each_mutation() {
+        use plonky2::field::types::Field;
+        use plonky2::plonk::proof::ProofWithPublicInputs;
+        let recipient = [1u8; 20];
+        let limbs = recipient_limbs(&recipient);
+        let mut root = [0u8; 32]; root[0] = 0x11; root[31] = 1;
+        let root_limbs = [
+            u64::from_be_bytes(root[24..32].try_into().unwrap()),
+            u64::from_be_bytes(root[16..24].try_into().unwrap()),
+            u64::from_be_bytes(root[8..16].try_into().unwrap()),
+            u64::from_be_bytes(root[..8].try_into().unwrap()),
+        ];
+        let claims = vec![
+            RewardClaim { user_id: 7, contract_id: 7, checkpoint_id: 0, count: 1, recipient, amount: encode_u64_word(5) },
+            RewardClaim { user_id: 7, contract_id: 7, checkpoint_id: 9, count: 1, recipient, amount: encode_u64_word(7) },
+        ];
+        let mut inputs = vec![F::ZERO; USER_REWARD_CHECKPOINT_AGGREGATE_TOTAL_PUBLIC_INPUT_COUNT];
+        inputs[0] = F::from_canonical_u32(7);
+        for (index, limb) in limbs.iter().take(5).enumerate() { inputs[1 + index] = F::from_canonical_u32(*limb); }
+        for (index, limb) in root_limbs.iter().enumerate() { inputs[6 + index] = F::from_canonical_u64(*limb); }
+        inputs[10] = F::from_canonical_u32(2);
+        inputs[11] = F::from_canonical_u32(12);
+        inputs[15] = F::from_canonical_u32(0);
+        inputs[16] = F::from_canonical_u32(9);
+        let bound = bind_reward_checkpoint_statement(&inputs, 7, &recipient, &root, &claims).unwrap();
+        assert_eq!(bound.checkpoint_tree_root, root);
+        assert_eq!(bound.checkpoint_ids, vec![0, 9]);
+        assert_eq!(bound.total_amount, encode_u64_word(12));
+        let mut reject_at = |index: usize, value: F| {
+            let mut changed = inputs.clone();
+            changed[index] = value;
+            assert!(bind_reward_checkpoint_statement(&changed, 7, &recipient, &root, &claims).is_err());
+        };
+        reject_at(0, F::from_canonical_u32(8));
+        for index in 0..5 { reject_at(1 + index, inputs[1 + index] + F::ONE); }
+        for index in 0..4 { reject_at(6 + index, inputs[6 + index] + F::ONE); }
+        reject_at(10, F::from_canonical_u32(1));
+        reject_at(11, F::from_canonical_u32(11));
+        reject_at(15, F::from_canonical_u32(1));
+        reject_at(17, F::ONE);
+    }
+
+    #[test]
+    fn checkpoint_pairing_is_canonical_for_odd_and_large_selections() {
+        for count in [1usize, 3, 5, 7, 33, 65] {
+            let mut sizes = vec![1usize; count];
+            while sizes.len() > 1 {
+                let mut round = sizes.into_iter();
+                let mut reduced = Vec::new();
+                while let Some(left) = round.next() {
+                    reduced.push(match round.next() {
+                        Some(right) => { assert!(left.is_power_of_two()); assert!((1..=left).contains(&right)); left + right }
+                        None => left,
+                    });
+                }
+                sizes = reduced;
+            }
+            assert_eq!(sizes, vec![count]);
+        }
+    }
+
+
+    use psy_client_common::job::id::{ProvingJobCircuitType, ProvingJobDataType, QJobTopic};
 
     fn job(task_index: u32, user_id: u64, marker: u64) -> QProvingJobDataIDWithRewardPreimage {
         QProvingJobDataIDWithRewardPreimage::new(
@@ -905,96 +763,30 @@ mod tests {
             .contains("conflicting duplicate job_id"));
     }
 
-    #[test]
-    fn proofs_are_matched_to_preimages_by_job_id_not_position() {
-        let first = job(1, 7, 10);
-        let second = job(2, 7, 20);
-        let preimages = index_reward_preimages(&[first.clone(), second.clone()]).unwrap();
-        let proofs = vec![
-            PsyProoffMinerRewardProof {
-                job_id: second.inner.job_data_id,
-                tag_tree_proof: psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty(),
-            },
-            PsyProoffMinerRewardProof {
-                job_id: first.inner.job_data_id,
-                tag_tree_proof: psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty(),
-            },
-        ];
-        let attached = attach_reward_preimages(proofs, &preimages, "test").unwrap();
-        assert_eq!(attached[0].reward_tree_tag_preimage, second.reward_tree_tag_preimage);
-        assert_eq!(attached[1].reward_tree_tag_preimage, first.reward_tree_tag_preimage);
-    }
-
-    #[test]
-    fn proof_set_must_exactly_match_requested_jobs() {
-        let first = job(1, 7, 10);
-        let second = job(2, 7, 20);
-        let preimages = index_reward_preimages(&[first.clone(), second.clone()]).unwrap();
-        let missing = vec![PsyProoffMinerRewardProof {
-            job_id: first.inner.job_data_id,
-            tag_tree_proof: psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty(),
-        }];
-        assert!(attach_reward_preimages(missing, &preimages, "test")
-            .unwrap_err()
-            .to_string()
-            .contains("missing requested job_ids"));
-
-        let duplicate = vec![
-            PsyProoffMinerRewardProof {
-                job_id: first.inner.job_data_id,
-                tag_tree_proof: psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty(),
-            },
-            PsyProoffMinerRewardProof {
-                job_id: first.inner.job_data_id,
-                tag_tree_proof: psy_crypto::hash::merkle::tag_tree::TagTreeMerkleProof::new_empty(),
-            },
-        ];
-        assert!(attach_reward_preimages(duplicate, &preimages, "test")
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate test proof"));
-    }
-
-    #[test]
-    fn same_checkpoint_proofs_are_appended_not_overwritten() {
-        let mut by_checkpoint: HashMap<u64, Vec<u64>> = HashMap::new();
-        by_checkpoint.entry(9).or_default().extend([1, 2]);
-        by_checkpoint.entry(9).or_default().extend([3]);
-        assert_eq!(by_checkpoint.get(&9).unwrap(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn unavailable_checkpoint_is_fail_closed() {
-        assert!(require_checkpoint_id(None, "coordinator unique_pending_id 11")
-            .unwrap_err()
-            .to_string()
-            .contains("has no checkpoint id"));
-    }
 
     #[test]
     fn malformed_backup_length_is_rejected() {
         let path = std::env::temp_dir().join(format!("claim-rewards-truncated-{}", std::process::id()));
         std::fs::write(&path, [0u8]).unwrap();
-        let error = load_job_ids_from_file(path.to_str().unwrap()).unwrap_err();
+        let error = load_reward_jobs(path.to_str().unwrap()).unwrap_err();
         assert!(error.to_string().contains("not a multiple of record size"));
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn backup_preserves_unique_pending_id_and_reward_tree_node_key() {
+    fn backup_preserves_unique_pending_id() {
         use psy_crypto::hash::merkle::utils::common::SimpleMerkleNodeKey;
 
-        let reward_tree_tag_preimage = QHashOut::from_values(7, 0, 10, 11);
         let metadata = PsyProvingJobClaimMetadata {
             job_id: job(1, 7, 10).inner.job_data_id,
-            reward_tree_tag: PsyHasher::q_two_to_one(reward_tree_tag_preimage, reward_tree_tag_preimage),
-            reward_tree_tag_preimage,
+            reward_tree_tag: QHashOut::from_values(1, 2, 3, 4),
+            reward_tree_tag_preimage: QHashOut::from_values(7, 0, 10, 11),
             proving_duration_ms: 1,
             job_submitted_at: 2,
             unique_pending_id: 987,
             realm_id: 3,
             realm_sub_id: 0,
-            reward_tree_node_key: SimpleMerkleNodeKey { level: 3, index: 2 },
+            reward_tree_node_key: SimpleMerkleNodeKey { level: 1, index: 10 },
             reward_tree_hash_mode: 0,
             reward_tree_node_children: 0,
             node_type: 1,
@@ -1002,77 +794,114 @@ mod tests {
         };
         let path = std::env::temp_dir().join(format!("claim-rewards-metadata-{}", std::process::id()));
         std::fs::write(&path, metadata.psy_ser_to_bytes().unwrap()).unwrap();
-        let loaded = load_job_ids_from_file(path.to_str().unwrap()).unwrap();
+        let loaded = load_reward_jobs(path.to_str().unwrap()).unwrap();
         assert_eq!(loaded.realm_jobs[0].0, 3);
-        assert_eq!(loaded.realm_jobs[0].1, 987);
-        assert_eq!(loaded.realm_jobs[0].2.inner.reward_path_info, (3u64 << 56) | 2);
+        assert_eq!(loaded.realm_jobs[0].1, 0);
+        assert_eq!(loaded.realm_jobs[0].2, 987);
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn colliding_pending_ids_keep_distinct_realm_origins() {
+        use psy_crypto::hash::merkle::utils::common::SimpleMerkleNodeKey;
+        let mut bytes = Vec::new();
+        for (sub, task) in [(1u64, 1u32), (2, 2)] {
+            let metadata = PsyProvingJobClaimMetadata {
+                job_id: job(task, 7, 10 + sub).inner.job_data_id,
+                reward_tree_tag: QHashOut::from_values(1, 2, 3, 4),
+                reward_tree_tag_preimage: QHashOut::from_values(7, 0, 10, 11),
+                proving_duration_ms: 1,
+                job_submitted_at: 2,
+                unique_pending_id: 310,
+                realm_id: 0,
+                realm_sub_id: sub,
+                reward_tree_node_key: SimpleMerkleNodeKey { level: 1, index: sub },
+                reward_tree_hash_mode: 0,
+                reward_tree_node_children: 0,
+                node_type: 1,
+                api_url_hash: [0; 32],
+            };
+            bytes.extend(metadata.psy_ser_to_bytes().unwrap());
+        }
+        let path = std::env::temp_dir().join(format!("claim-rewards-collision-{}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let loaded = validate_and_deduplicate_jobs(load_reward_jobs(path.to_str().unwrap()).unwrap(), 7, "worker.backup").unwrap();
+        std::fs::remove_file(path).unwrap();
+        let origins: Vec<(u64, u64, u64)> = loaded.realm_jobs.iter().map(|(realm, sub, pending, _)| (*realm, *sub, *pending)).collect();
+        assert_eq!(origins, vec![(0, 1, 310), (0, 2, 310)]);
+    }
+
+
+    #[test]
+    fn backup_reward_path_roundtrips_through_rpc_job() {
+        use psy_crypto::hash::merkle::utils::common::SimpleMerkleNodeKey;
+        let cases = [(1u8, 0u64, 1u8), (3, 7, 1), (0, 0, 0)];
+        let mut bytes = Vec::new();
+        for (level, index, node_type) in cases {
+            let metadata = PsyProvingJobClaimMetadata {
+                job_id: job(1, 7, 10).inner.job_data_id,
+                reward_tree_tag: QHashOut::from_values(1, 2, 3, 4),
+                reward_tree_tag_preimage: QHashOut::from_values(7, 0, 10, 11),
+                proving_duration_ms: 1,
+                job_submitted_at: 2,
+                unique_pending_id: 64,
+                realm_id: 3,
+                realm_sub_id: 0,
+                reward_tree_node_key: SimpleMerkleNodeKey { level, index },
+                reward_tree_hash_mode: 0,
+                reward_tree_node_children: 0,
+                node_type,
+                api_url_hash: [0; 32],
+            };
+            bytes.extend(metadata.psy_ser_to_bytes().unwrap());
+        }
+        let path = std::env::temp_dir().join(format!("claim-rewards-path-{}", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = load_reward_jobs(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let jobs = loaded.realm_jobs.into_iter().map(|(_, _, _, job)| job).chain(loaded.coordinator_jobs.into_iter().map(|(_, job)| job)).collect::<Vec<_>>();
+        assert_eq!(jobs.len(), cases.len());
+        for ((expected_level, expected_index, _), loaded_job) in cases.into_iter().zip(jobs) {
+            let request = psy_provider::request::QGenerateBatchProofMinerRewardProofsRPCRequest { unique_pending_id: 64, job_ids: vec![loaded_job.inner] };
+            let packed = serde_json::to_value(&request).unwrap()["job_ids"][0]["reward_path_info"].as_u64().unwrap();
+            assert_eq!(packed, (u64::from(expected_level) << 56) | expected_index);
+            assert_eq!(((packed >> 56) as u8, packed & 0x00FF_FFFF_FFFF_FFFF), (expected_level, expected_index));
+        }
     }
 
     #[test]
-    fn reusable_json_recomputes_and_validates_reward_path() {
+    fn backup_reward_path_rejects_index_above_56_bits() {
         use psy_crypto::hash::merkle::utils::common::SimpleMerkleNodeKey;
-
-        let reward_tree_tag_preimage = QHashOut::from_values(7, 0, 10, 11);
         let metadata = PsyProvingJobClaimMetadata {
             job_id: job(1, 7, 10).inner.job_data_id,
-            reward_tree_tag: PsyHasher::q_two_to_one(reward_tree_tag_preimage, reward_tree_tag_preimage),
-            reward_tree_tag_preimage,
+            reward_tree_tag: QHashOut::from_values(1, 2, 3, 4),
+            reward_tree_tag_preimage: QHashOut::from_values(7, 0, 10, 11),
             proving_duration_ms: 1,
             job_submitted_at: 2,
-            unique_pending_id: 987,
+            unique_pending_id: 64,
             realm_id: 3,
-            realm_sub_id: 4,
-            reward_tree_node_key: SimpleMerkleNodeKey { level: 3, index: 2 },
+            realm_sub_id: 0,
+            reward_tree_node_key: SimpleMerkleNodeKey { level: 1, index: 0x00FF_FFFF_FFFF_FFFF + 1 },
             reward_tree_hash_mode: 0,
             reward_tree_node_children: 0,
             node_type: 1,
             api_url_hash: [0; 32],
         };
-        let summary = RewardSummary {
-            schema_version: 1,
-            network: "sepolia".to_string(),
-            generated_at_ms: 1,
-            source: RewardSummarySource {
-                path: "worker.backup".to_string(),
-                format: "psy-worker-backup-v1".to_string(),
-                record_size: Some(ClaimMetadata::record_size()),
-                record_count: 1,
-                sha256: "00".to_string(),
-            },
-            summary: RewardSummaryTotals {
-                checkpoint_count: 1,
-                job_count: 1,
-                estimated_total_reward: 42,
-            },
-            checkpoints: vec![RewardSummaryCheckpoint {
-                checkpoint_id: 999,
-                unique_pending_id: 987,
-                node_type: "realm".to_string(),
-                realm_id: 3,
-                realm_sub_id: 4,
-                fees_collected: 42,
-                gutas_completed: 1,
-                reward_per_job: 42,
-                job_count: 1,
-                estimated_total_reward: 42,
-                jobs: vec![RewardSummaryJob {
-                    metadata,
-                    circuit_name: "test".to_string(),
-                    reward_path_info: (3u64 << 56) | 2,
-                    estimated_reward: 42,
-                    validation: RewardSummaryValidation {
-                        preimage_matches_backup_tag: true,
-                        proof_leaf_tag_matches_backup_tag: true,
-                    },
-                }],
-            }],
-        };
-        let path = std::env::temp_dir().join(format!("claim-rewards-summary-{}.json", std::process::id()));
-        std::fs::write(&path, serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
-        let loaded = load_claim_jobs(path.to_str().unwrap()).unwrap();
-        let jobs = claim_jobs_from_metadata(loaded.records).unwrap();
-        assert_eq!(jobs.realm_jobs[0].2.inner.reward_path_info, (3u64 << 56) | 2);
+        let path = std::env::temp_dir().join(format!("claim-rewards-high-index-{}", std::process::id()));
+        std::fs::write(&path, metadata.psy_ser_to_bytes().unwrap()).unwrap();
+        let error = load_reward_jobs(path.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("exceeding 56 bits"), "{error}");
         std::fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn reward_claim_chain_accepts_only_the_token_set() {
+        for chain_id in [1u64, 31337, 11155111] {
+            assert!(reward_claim_chain(chain_id));
+            assert_eq!(chain_id_word(canonical_quantity(&format!("0x{chain_id:x}")).unwrap()).unwrap(), chain_id);
+        }
+        for chain_id in [0u64, 5, 31338, 11155110, 11155112] {
+            assert!(!reward_claim_chain(chain_id));
+        }
+    }
+
 }

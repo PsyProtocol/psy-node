@@ -1,6 +1,6 @@
 use std::fmt;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use plonky2::{field::goldilocks_field::GoldilocksField, plonk::circuit_data::VerifierOnlyCircuitData};
 use psy_client_common::data::qhashout::QHashOut;
@@ -70,6 +70,18 @@ pub trait SignatureUser: fmt::Debug + Send + Sync {
     ) -> Result<QHashOut<GoldilocksField>> {
         let info = self.public_key_info(wallet, circuit_manager).await?;
         Ok(info.qfhash::<PsyHasher>())
+    }
+
+    async fn prove_reward_claim(
+        &self,
+        _client: &crate::local::reward_client::RewardClient,
+        _checkpoint: &psy_plonky2_circuits::bridge::circuits::user_reward_checkpoint_aggregate::UserRewardCheckpointAggregateCircuit,
+        _aggregate: &psy_plonky2_circuits::bridge::circuits::user_reward_checkpoint_aggregate::UserRewardCheckpointAggregateProof,
+        _anchor: &crate::local::reward_client::FinalizedCheckpointAnchor,
+        _token: [u8; 20],
+        _state_manager: [u8; 20],
+    ) -> Result<plonky2::plonk::proof::ProofWithPublicInputs<GoldilocksField, psy_client_data::config::store_config::PsyPlonky2Config, 2>> {
+        bail!("reward claim proving requires a held ZK key; this signature user is unsupported")
     }
 }
 

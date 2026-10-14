@@ -1016,6 +1016,26 @@ impl RpcProvider {
 
         Ok(&realm_urls[(user_id % realm_urls.len() as u64) as usize])
     }
+    pub async fn discover_realm_edges(&self) -> anyhow::Result<HashMap<(u64, u64), String>> {
+        let urls: Vec<String> = self.realm_configs.values().flatten().cloned().collect();
+        let mut edges = HashMap::new();
+        for url in urls {
+            let rpc_url = url.as_str().to_owned();
+            let response = psy_rpc_call_back!(self, rpc_url, RequestParams::<F>::GetRealmIdentifierWorkerApi, serde_json::Value);
+            let identity = match response.result {
+                ResponseResult::Success(identity) => identity,
+                ResponseResult::Error(error) => anyhow::bail!("realm identifier query failed for {url}: {error:?}"),
+            };
+            let realm_id = identity["realm_id"].as_u64().ok_or_else(|| anyhow::format_err!("realm identifier from {url} has no realm_id"))?;
+            let realm_sub_id = identity["realm_sub_id"].as_u64().ok_or_else(|| anyhow::format_err!("realm identifier from {url} has no realm_sub_id"))?;
+            if edges.insert((realm_id, realm_sub_id), url.clone()).is_some() {
+                anyhow::bail!("realm {realm_id} sub {realm_sub_id} is served by more than one configured edge");
+            }
+        }
+        Ok(edges)
+    }
+
+
 
     pub fn get_realm_url_by_realm_id(&self, realm_id: u64) -> anyhow::Result<&String> {
         Ok(&self.get_realm_urls(realm_id)?[0])
@@ -1155,11 +1175,10 @@ impl RpcProvider {
 
     pub async fn get_realm_checkpoint_id_for_unique_pending_id_by_realm_id(
         &self,
-        realm_id: u64,
+        url: &str,
         unique_pending_id: u64,
     ) -> anyhow::Result<Option<u64>> {
-        self.get_checkpoint_id_for_unique_pending_id_inner(self.get_realm_url_by_realm_id(realm_id)?.to_string(), unique_pending_id)
-            .await
+        self.get_checkpoint_id_for_unique_pending_id_inner(url.to_string(), unique_pending_id).await
     }
 
     pub async fn generate_realm_batch_proof_miner_reward_proofs(
@@ -1167,19 +1186,19 @@ impl RpcProvider {
         unique_pending_id: u64,
         job_ids: Vec<QProvingJobDataIDWithRewardPath>,
     ) -> anyhow::Result<Vec<PsyProoffMinerRewardProof<QHashOut<GoldilocksField>>>> {
-        self.generate_batch_proof_miner_reward_proofs_inner(self.get_realm_url(self.current_user_id)?.to_string(), unique_pending_id, job_ids)
-            .await
+        self.generate_batch_proof_miner_reward_proofs_inner(self.get_realm_url(self.current_user_id)?.to_string(), unique_pending_id, job_ids).await
     }
 
     pub async fn generate_realm_batch_proof_miner_reward_proofs_by_realm_id(
         &self,
-        realm_id: u64,
+        url: &str,
         unique_pending_id: u64,
         job_ids: Vec<QProvingJobDataIDWithRewardPath>,
     ) -> anyhow::Result<Vec<PsyProoffMinerRewardProof<QHashOut<GoldilocksField>>>> {
-        self.generate_batch_proof_miner_reward_proofs_inner(self.get_realm_url_by_realm_id(realm_id)?.to_string(), unique_pending_id, job_ids)
-            .await
+        self.generate_batch_proof_miner_reward_proofs_inner(url.to_string(), unique_pending_id, job_ids).await
     }
+
+
 }
 
 // Re-export NetworkConfig from psy_config
@@ -2388,4 +2407,5 @@ mod tests {
             assert_eq!(provider.get_realm_url(user_id).unwrap(), expected);
         }
     }
+
 }

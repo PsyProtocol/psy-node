@@ -19,7 +19,7 @@ PSY_SKIP_BUILD ?= 1
 PURGE ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test check check-all psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal
+.PHONY: all build clean test check check-all psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward
 
 all: build
 
@@ -161,10 +161,10 @@ generate-groth16:
 													  ${data}/out_vk.json
 
 regen-groth16-keystore:
-	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR) --include-bridge-agg
+	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR)
 
 regen-bridge-agg-keystore:
-	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR) --skip-deposit-append --skip-withdrawal-claim --include-bridge-agg
+	${BIN_PREFIX}/psy_relayer_cli regenerate-groth16-keystore --keystore-dir $(KEYSTORE_DIR) --skip-deposit-append --skip-withdrawal-claim --skip-reward-claim
 
 keystore := $(KEYSTORE_DIR)
 export-solidity-verifier:
@@ -176,4 +176,7 @@ export-solidity-verifier-deposit:
 export-solidity-verifier-withdrawal:
 	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/withdrawal_claim ./psy-contracts/src/WithdrawalClaimVerifier.sol
 
-export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal
+export-solidity-verifier-reward:
+	${BIN_PREFIX}/psy_relayer_cli export-solidity-verifier ${keystore}/reward_claim ./psy-contracts/src/RewardClaimVerifier.sol
+
+export-all-solidity-verifier: export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward

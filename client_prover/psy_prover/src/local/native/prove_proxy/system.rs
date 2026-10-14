@@ -19,6 +19,9 @@ use psy_plonky2_circuits::{
         circuits::{
             bridge_agg_final::BridgeAggFinalCircuit,
             bridge_wrap::{BridgeWrapCircuit, DepositBatchWrapCircuit, SharedGroth16Wrapper, WithdrawalClaimWrapCircuit},
+            reward_claim_wrap::{RewardClaimWrapCircuit, REWARD_CLAIM_PUBLIC_INPUT_BITS},
+            user_reward_checkpoint_aggregate::UserRewardCheckpointAggregateCircuit,
+            user_reward_tree::{UserRewardAggregateCircuit, UserRewardLeafCircuit, UserRewardRootCircuit},
         },
         gadgets::tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
     },
@@ -41,6 +44,8 @@ use super::{
     types::*,
     C, D, F,
 };
+use crate::local::reward_client::{RewardClaimWrapGroth16Proof, RewardClaimWrapProofInput};
+
 
 #[rpc(server, client, namespace = "psy")]
 pub trait ProveProxySystemRpc {
@@ -60,22 +65,29 @@ pub trait ProveProxySystemRpc {
     /// Groth16
     #[method(name = "prove_bridge_agg_groth16")]
     async fn prove_bridge_agg_groth16(&self, deps_network: String, input: BridgeAggWitnessInput) -> Result<BridgeAggGroth16Output, ErrorObjectOwned>;
-}
 
+    /// Reward claim: completed portable RewardClaimWrapCircuit proof → local verifier
+    /// → existing SharedGroth16Wrapper. The 2304-byte message stays unchanged.
+    #[method(name = "prove_reward_claim_groth16")]
+    async fn prove_reward_claim_groth16(&self, input: RewardClaimWrapProofInput) -> Result<RewardClaimWrapGroth16Proof, ErrorObjectOwned>;
+}
 pub struct SystemProveProvider {
     pub deposit_batch_wrap_circuit: Arc<DepositBatchWrapCircuit>,
     pub withdrawal_claim_wrap_circuit: Arc<WithdrawalClaimWrapCircuit>,
     pub bridge_wrap_circuit: Arc<BridgeWrapCircuit>,
+    pub reward_claim_wrap_circuit: Arc<RewardClaimWrapCircuit>,
     pub deposit_batch_groth16_wrapper: Arc<SharedGroth16Wrapper>,
     pub withdrawal_claim_groth16_wrapper: Arc<SharedGroth16Wrapper>,
     pub bridge_groth16_wrapper: Arc<SharedGroth16Wrapper>,
+    pub reward_claim_groth16_wrapper: Arc<SharedGroth16Wrapper>,
     pub deposit_append_circuit: Arc<DepositBatchAppendCircuit<C, D>>,
     pub deposit_batch_minifier: Arc<QEDProofMinifierChain<D, F, C>>,
     pub withdrawal_claim_circuit: Arc<WithdrawalBatchClaimCircuit<C, D>>,
+    pub checkpoint_aggregate_circuit: Arc<UserRewardCheckpointAggregateCircuit>,
 }
 
 impl SystemProveProvider {
-    /// Builds the bridge wrap circuits and preloads the three Groth16 keystores.
+    /// Builds the bridge wrap circuits and preloads the four Groth16 keystores.
     /// Does not touch the coordinator RPC or the UPS circuit manager.
     pub fn new() -> anyhow::Result<Self> {
         let home = dirs::home_dir().context("cannot locate system prove-proxy keystore HOME")?;
@@ -88,7 +100,7 @@ impl SystemProveProvider {
         // Check every required file before expensive circuit construction. The
         // synchronous FFI initialization below also decodes each group before
         // this provider can be registered as system-capable.
-        for (label, directory) in [("bridge", ""), ("deposit_append", "deposit_append"), ("withdrawal_claim", "withdrawal_claim")] {
+        for (label, directory) in [("bridge", ""), ("deposit_append", "deposit_append"), ("withdrawal_claim", "withdrawal_claim"), ("reward_claim", "reward_claim")] {
             for name in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
                 let path = root.join(directory).join(name);
                 let file = std::fs::File::open(&path)
@@ -144,6 +156,26 @@ impl SystemProveProvider {
             )
             .into_shared_groth16_wrapper(format!("{}/withdrawal_claim/", root.display())),
         );
+
+        tracing::info!("Pre-building RewardClaimWrapCircuit...");
+        let reward_leaf = Arc::new(UserRewardLeafCircuit::new());
+        let reward_aggregate = Arc::new(UserRewardAggregateCircuit::new(&reward_leaf));
+        let reward_root = Arc::new(UserRewardRootCircuit::new(&reward_aggregate));
+        let checkpoint_aggregate = Arc::new(UserRewardCheckpointAggregateCircuit::new(&reward_root));
+        let reward_claim_wrap_circuit = Arc::new(RewardClaimWrapCircuit::new(
+            &checkpoint_aggregate.circuit_data.common,
+            checkpoint_aggregate.fingerprint,
+            checkpoint_aggregate.circuit_data.verifier_only.constants_sigmas_cap.height(),
+        ));
+        let reward_claim_groth16_circuit = RewardClaimWrapCircuit::new(
+            &checkpoint_aggregate.circuit_data.common,
+            checkpoint_aggregate.fingerprint,
+            checkpoint_aggregate.circuit_data.verifier_only.constants_sigmas_cap.height(),
+        );
+        let reward_claim_groth16_wrapper = Arc::new(SharedGroth16Wrapper::new(
+            reward_claim_groth16_circuit.circuit_data,
+            format!("{}/reward_claim/", root.display()),
+        ));
 
         tracing::info!("Pre-building BridgeWrapCircuit...");
         let coordinator_circuits = cached_bridge_coordinator_circuits()?;
@@ -203,6 +235,7 @@ impl SystemProveProvider {
             ("bridge", &bridge_groth16_wrapper.keystore_path),
             ("deposit_append", &deposit_batch_groth16_wrapper.keystore_path),
             ("withdrawal_claim", &withdrawal_claim_groth16_wrapper.keystore_path),
+            ("reward_claim", &reward_claim_groth16_wrapper.keystore_path),
         ] {
             tracing::info!(keystore = label, path = keystore_path, "preloading Groth16 setup");
             gnark_plonky2_verifier_ffi::initialize(keystore_path);
@@ -214,12 +247,15 @@ impl SystemProveProvider {
             deposit_batch_wrap_circuit,
             withdrawal_claim_wrap_circuit,
             bridge_wrap_circuit,
+            reward_claim_wrap_circuit,
             deposit_batch_groth16_wrapper,
             withdrawal_claim_groth16_wrapper,
             bridge_groth16_wrapper,
+            reward_claim_groth16_wrapper,
             deposit_append_circuit: deposit_template,
             deposit_batch_minifier: deposit_minifier,
             withdrawal_claim_circuit: withdrawal_template,
+            checkpoint_aggregate_circuit: checkpoint_aggregate,
         })
     }
 }
@@ -230,11 +266,11 @@ mod setup_tests {
 
     #[test]
     fn system_startup_rejects_missing_empty_or_non_file_setup_before_building_circuits() {
-        for directory in ["", "deposit_append", "withdrawal_claim"] {
+        for directory in ["", "deposit_append", "withdrawal_claim", "reward_claim"] {
             for name in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
                 for failure in ["missing", "empty", "directory"] {
                     let root = tempfile::tempdir().unwrap();
-                    for group in ["", "deposit_append", "withdrawal_claim"] {
+                    for group in ["", "deposit_append", "withdrawal_claim", "reward_claim"] {
                         std::fs::create_dir_all(root.path().join(group)).unwrap();
                         for file in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
                             std::fs::write(root.path().join(group).join(file), b"placeholder").unwrap();
@@ -678,7 +714,51 @@ impl ProveProxySystemRpcServer for SystemProveProvider {
             )
         })?
     }
+
+    async fn prove_reward_claim_groth16(
+        &self,
+        input: RewardClaimWrapProofInput,
+    ) -> Result<RewardClaimWrapGroth16Proof, ErrorObjectOwned> {
+        let wrap_circuit = self.reward_claim_wrap_circuit.clone();
+        let groth16_wrapper = self.reward_claim_groth16_wrapper.clone();
+        let checkpoint_aggregate = self.checkpoint_aggregate_circuit.clone();
+        tokio::task::spawn_blocking(move || {
+            let proof_bytes = hex::decode(input.reward_claim_wrap_proof_hex.trim_start_matches("0x"))
+                .map_err(|e| anyhow::anyhow!("hex decode reward claim wrap proof: {e}"))?;
+            let wrap_proof: ProofWithPublicInputs<F, C, D> = bincode::deserialize(&proof_bytes)
+                .map_err(|e| anyhow::anyhow!("bincode deserialize reward claim wrap proof: {e}"))?;
+            anyhow::ensure!(
+                wrap_proof.public_inputs.len() == REWARD_CLAIM_PUBLIC_INPUT_BITS,
+                "reward claim wrap proof has {} public inputs, expected {}",
+                wrap_proof.public_inputs.len(),
+                REWARD_CLAIM_PUBLIC_INPUT_BITS
+            );
+            wrap_circuit.circuit_data.verify(wrap_proof.clone())
+                .map_err(|e| anyhow::anyhow!("reward claim wrap proof failed local verifier: {e:?}"))?;
+            tracing::info!(
+                fingerprint = ?checkpoint_aggregate.fingerprint,
+                keystore = %groth16_wrapper.keystore_path,
+                "reward claim wrap proof verified against local circuit"
+            );
+            let groth16 = groth16_wrapper.prove_groth16(&wrap_proof, None)?;
+            anyhow::ensure!(groth16.public_inputs.len() == 2, "reward claim groth16 returned {} public inputs", groth16.public_inputs.len());
+            Ok::<_, anyhow::Error>(RewardClaimWrapGroth16Proof {
+                solidity_proof: g16_proof_to_solidity_words(&groth16),
+                solidity_public_inputs: [groth16.public_inputs[0].clone(), groth16.public_inputs[1].clone()],
+            })
+        })
+        .await
+        .map_err(|join_err| {
+            ErrorObjectOwned::owned(
+                1,
+                "prove_reward_claim_groth16: task schedule failed",
+                Some(format!("Thread pool task execution failed: {}", join_err)),
+            )
+        })?
+        .map_err(|err| ErrorObjectOwned::owned(1, "prove_reward_claim_groth16 proving error", Some(err.to_string())))
+    }
 }
+
 fn parse_bridge_global_state_roots(
     roots: &BridgeAggGlobalStateRoots,
 ) -> Result<PQEDCheckpointGlobalStateRoots<parth_core::pgoldilocks::QHashOut<F>>, ErrorObjectOwned> {

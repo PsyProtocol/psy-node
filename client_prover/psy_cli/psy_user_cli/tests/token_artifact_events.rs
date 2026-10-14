@@ -505,10 +505,10 @@ fn canonical_abi_manifest_matches_genesis_contracts() {
     assert_manifest_precompile(0, "token", "PsyTokenContract.json", "PsyTokenContract", "token");
     assert_manifest_precompile(
         1,
-        "mining_rewards",
-        "PsyPOWMiningRewardsClaimContract.json",
-        "PsyPOWMiningRewardsClaimContract",
-        "mining_rewards",
+        "multisig_policy",
+        "MultisigPolicyContract.json",
+        "MultisigPolicyContract",
+        "multisig_policy",
     );
     assert_manifest_precompile(2, "deposit_tree", "PsyDepositTreeContract.json", "PsyDepositTreeContract", "deposit_tree");
     assert_manifest_precompile(
