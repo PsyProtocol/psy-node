@@ -22,7 +22,7 @@ fn protected_file_at(directory: &Path, relative: &Path, file_flags: i32) -> Resu
         let name = CString::new(name.as_bytes()).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
         let final_file = index + 1 == parts.len();
         let flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | if final_file { file_flags } else { libc::O_RDONLY | libc::O_DIRECTORY };
-        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::mode_t) };
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::c_int) };
         if fd < 0 { return Err(GuardianSignError::KeyUnavailable); }
         let opened = unsafe { File::from_raw_fd(fd) };
         let metadata = opened.metadata().map_err(|_| GuardianSignError::KeyUnavailable)?;
