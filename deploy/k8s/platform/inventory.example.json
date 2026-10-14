@@ -1,0 +1,27 @@
+{
+  "lab": "psy-k8s-local",
+  "network_confirmed": false,
+  "storage_confirmed": false,
+  "lan_cidr": "192.168.5.0/24",
+  "gateway": "192.168.5.1",
+  "dns": ["192.168.5.1"],
+  "reserved_cidrs": ["10.250.0.0/24", "172.17.0.0/16", "10.148.0.0/16"],
+  "pod_cidr": "10.42.0.0/16",
+  "service_cidr": "10.43.0.0/16",
+  "api_vip": "192.168.5.216",
+  "ingress_vip": "192.168.5.217",
+  "ssh_public_key": "REPLACE_WITH_DEDICATED_LAB_SSH_PUBLIC_KEY",
+  "hosts": {
+    "x2": {"ssh": "arc99x2", "bridge": "br0", "os_pool": "/home/psy/k8s-lab/os", "minimum_available_memory_gib": 14},
+    "x3": {"ssh": "arc99x3", "bridge": "br0", "os_pool": "/home/psy/k8s-lab/os", "minimum_available_memory_gib": 18},
+    "x4": {"ssh": "arc99x4", "bridge": "br0", "os_pool": "/home/psy/k8s-lab/os", "data_pool": "/mnt/psy-k8s-lab", "minimum_available_memory_gib": 26}
+  },
+  "nodes": [
+    {"name": "psy-lab-cp-x2", "host": "x2", "role": "server", "ip": "192.168.5.210", "mac": "52:54:00:70:02:01", "cpus": 2, "memory_gib": 4, "os_gib": 40},
+    {"name": "psy-lab-work-x2", "host": "x2", "role": "agent", "ip": "192.168.5.211", "mac": "52:54:00:70:02:02", "cpus": 4, "memory_gib": 8, "os_gib": 40},
+    {"name": "psy-lab-cp-x3", "host": "x3", "role": "server", "ip": "192.168.5.212", "mac": "52:54:00:70:03:01", "cpus": 2, "memory_gib": 4, "os_gib": 40},
+    {"name": "psy-lab-work-x3", "host": "x3", "role": "agent", "ip": "192.168.5.213", "mac": "52:54:00:70:03:02", "cpus": 6, "memory_gib": 12, "os_gib": 40},
+    {"name": "psy-lab-cp-x4", "host": "x4", "role": "server", "ip": "192.168.5.214", "mac": "52:54:00:70:04:01", "cpus": 2, "memory_gib": 4, "os_gib": 40},
+    {"name": "psy-lab-work-x4", "host": "x4", "role": "agent", "ip": "192.168.5.215", "mac": "52:54:00:70:04:02", "cpus": 8, "memory_gib": 20, "os_gib": 40, "data_gib": 256}
+  ]
+}

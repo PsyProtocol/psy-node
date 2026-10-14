@@ -1,0 +1,12 @@
+{
+  "verified_date_utc": "2026-10-14",
+  "assets": {
+    "ubuntu.img": {"url": "https://cloud-images.ubuntu.com/noble/20260926/noble-server-cloudimg-amd64.img", "sha256": "6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2", "large_vm_image": true},
+    "k3s": {"url": "https://github.com/k3s-io/k3s/releases/download/v1.35.9%2Bk3s1/k3s", "sha256": "897acb21cca57d477a211102251a6591450ce767344a9faaa121a1007ca9fa9a"},
+    "helm.tgz": {"url": "https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz", "sha256": "a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496"},
+    "metallb.tgz": {"url": "https://github.com/metallb/metallb/releases/download/metallb-chart-0.16.1/metallb-0.16.1.tgz", "sha256": "fb06bb584fcb7856f15733b2a6a2aff5b61b5c350687e341c163ae24a5938adc"},
+    "traefik.tgz": {"url": "https://traefik.github.io/charts/traefik/traefik-41.7.1.tgz", "sha256": "f9edd5ca699ff0f5eab14df6e4feefa15f7597a9b56f0b1c01f6089b1eecbaf1"},
+    "prometheus.tgz": {"url": "https://github.com/prometheus-community/helm-charts/releases/download/kube-prometheus-stack-92.3.1/kube-prometheus-stack-92.3.1.tgz", "sha256": "5c976ae9562ec3b28b571f38e109e5d3f2ea3355573da416cd06be52dce6bd6a"},
+    "gateway-api.yaml": {"url": "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml", "sha256": "6a4029e661446d64add866a00ecdc40c14219b68777ab614c5cdaac0adb481f1"}
+  }
+}
