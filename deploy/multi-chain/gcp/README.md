@@ -86,6 +86,13 @@ them for the final production-like preflight.
 
 ## Deployment order
 
+Hasura logging is bounded by the shared Envio installer: 100 MiB per file,
+100 files including the active file, with rotated-file compression (about
+10 GiB before compression). Step 11 verifies the created container's actual
+logging policy. See [Hasura log retention](../../gcp/HASURA_LOG_RETENTION.md)
+for the separate existing-container rollout; do not rerun the fresh-deploy
+installer just to change logging on the live testnet.
+
 The entrypoint executes the shared step scripts in `steps.tsv` order. The
 plan displays every step ID, description, and script path:
 

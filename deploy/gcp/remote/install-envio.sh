@@ -311,6 +311,13 @@ services:
       - "${HASURA_EXTERNAL_PORT:-18080}:8080"
     user: 1001:1001
     restart: always
+    # Capacity retention, not time retention. Keep Docker in charge of rotation.
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "100"
+        compress: "true"
     environment:
       HASURA_GRAPHQL_DATABASE_URL: ${ENVIO_DATABASE_URL}
       HASURA_GRAPHQL_ENABLE_CONSOLE: ${HASURA_GRAPHQL_ENABLE_CONSOLE:-false}
@@ -343,6 +350,16 @@ fi
 compose -f generated/docker-compose.hasura.yaml down --remove-orphans >/dev/null 2>&1 || true
 docker rm -f generated-graphql-engine-1 generated-envio-postgres-1 >/dev/null 2>&1 || true
 compose -f generated/docker-compose.hasura.yaml up -d
+
+# Inspect the created container, not just the generated Compose configuration.
+hasura_container="$(compose -f generated/docker-compose.hasura.yaml ps -q graphql-engine)"
+[ -n "$hasura_container" ] || { echo "Hasura container missing" >&2; exit 1; }
+docker inspect --format '{{json .HostConfig.LogConfig}}' "$hasura_container" | jq -e '
+  .Type == "json-file" and
+  .Config["max-size"] == "100m" and
+  .Config["max-file"] == "100" and
+  .Config.compress == "true"
+' >/dev/null || { echo "Hasura log retention policy not applied" >&2; exit 1; }
 
 cat >/etc/systemd/system/parth-envio.service <<'EOF'
 [Unit]
