@@ -79,16 +79,17 @@
     },
     {
       "id": "services-api",
-      "host": "gcp-cp-ce",
+      "host": "gcp-psy-service",
       "units": [
         "parth-psy-services.service"
       ],
       "repository": "PsyProtocol/psy-services",
-      "source_commit": "31f7eb8dfbbb13652a028dd217db0d6b28273fba",
-      "source_ref": "release/testnet-stable",
-      "expected_binary_sha256": "5c6a375362ff4627a57b32c6b6fb1a22954c68a9c56b3c5dbf6ac801c8c02fe8",
+      "source_commit": "a43632d6d899c49cbeca3786dba42b337489bb3e",
+      "source_ref": "fix/private-claimable-cache-20261014",
+      "expected_binary_sha256": "a6a5abfaa76068c9bf59d4bbc51e5e2553c6f746a0bda0ff51237fe9ddb88179",
+      "observed_date_utc": "2026-10-14",
       "branch_mapping": "external_repo_pin_recorded",
-      "evidence": "../services-rpc/DEPLOYED-20261009.md and artifact.json; running /proc hash verified. Services-only L1 RPC update; MemoryHigh 8 GiB, MemoryMax 12 GiB and 95-nostr-scan-state.conf preserved."
+      "evidence": "../services-claimable-cache/DEPLOYED-20261014.md; running /proc hash verified, existing f4d6ee8 deadline fix retained. Relocated service configuration preserved; MemoryHigh 5 GiB / MemoryMax 6 GiB. No Indexer updated by the Services rollout."
     },
     {
       "id": "l2-indexers",
