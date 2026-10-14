@@ -92,19 +92,33 @@
       "evidence": "../services-claimable-cache/DEPLOYED-20261014.md; running /proc hash verified, existing f4d6ee8 deadline fix retained. Relocated service configuration preserved; MemoryHigh 5 GiB / MemoryMax 6 GiB. No Indexer updated by the Services rollout."
     },
     {
-      "id": "l2-indexers",
+      "id": "coordinator-indexer",
       "host": "gcp-cp-ce",
       "units": [
-        "parth-psy-indexer@coordinator.service",
-        "parth-psy-indexer@realm-0.service",
-        "parth-psy-indexer@realm-1.service"
+        "parth-psy-indexer@coordinator.service"
       ],
       "repository": "PsyProtocol/psy-services",
       "source_commit": "7c1e1f61673949bb7343529d4dd51d66f631d236",
       "source_ref": "fix/bridge-shared-http-client",
       "expected_binary_sha256": "611f5975dd9291c6e8253491689f018b3935a4e70ec5fd6d8a7044fdddf8e770",
       "branch_mapping": "external_repo_pin_recorded",
-      "evidence": "Live indexer release BUILD-MANIFEST.env and three /proc hashes. Indexers did NOT advance with API b6dd702 or 31f7eb8."
+      "observed_date_utc": "2026-10-14",
+      "evidence": "Coordinator Indexer PID 1829212 and /proc hash rechecked on 2026-10-14. Not replaced with the Services API or Realm Indexers."
+    },
+    {
+      "id": "realm-indexers",
+      "host": "gcp-realm-processor",
+      "units": [
+        "parth-psy-indexer@realm-0.service",
+        "parth-psy-indexer@realm-1.service"
+      ],
+      "repository": "PsyProtocol/psy-services",
+      "source_commit": "e00e203429c238d595893b3dbd6e21ed82864008",
+      "source_ref": "fix/realm-indexer-job-stats-20261014",
+      "expected_binary_sha256": "b224fbd838a018998076864d8e7d5b80bb78d1cfbb33fb1a2d03e806b406c53f",
+      "observed_date_utc": "2026-10-14",
+      "branch_mapping": "external_repo_pin_recorded",
+      "evidence": "../realm-indexer-job-stats/DEPLOYED-20261014.md; both /proc hashes verified, sequential restart, preserved cursors and backups. Coordinator historical RPC added through the private address. Processor PIDs unchanged."
     },
     {
       "id": "faucet",
