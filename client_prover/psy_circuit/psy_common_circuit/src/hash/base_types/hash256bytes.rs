@@ -10,9 +10,26 @@ use plonky2::{
 
 use super::hash256::Hash256Target;
 use crate::{
+    builder::comparison::assert_canonical_64,
     traits::{ConnectableTarget, CreatableTarget, SwappableTarget, ToTargets},
     u32::arithmetic_u32::U32Target,
 };
+
+fn range_check_bytes<F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>, bytes: &[Target]) {
+    for &byte in bytes {
+        builder.range_check(byte, 8);
+    }
+}
+
+fn pack_u32_be<F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>, bytes: &[Target]) -> Target {
+    debug_assert_eq!(bytes.len(), 4);
+    let c256 = builder.constant(F::from_canonical_u32(0x100));
+    let mut value = bytes[0];
+    for &byte in &bytes[1..] {
+        value = builder.mul_add(value, c256, byte);
+    }
+    value
+}
 
 pub type Hash256BytesTarget = [Target; 32];
 
@@ -56,8 +73,9 @@ pub trait CircuitBuilderHash256Bytes<F: RichField + Extendable<D>, const D: usiz
 
 impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHash256Bytes<F, D> for CircuitBuilder<F, D> {
     fn add_virtual_hash256_bytes_target(&mut self) -> Hash256BytesTarget {
-        // TODO: range check u8?
-        core::array::from_fn(|_| self.add_virtual_target())
+        let result = core::array::from_fn(|_| self.add_virtual_target());
+        range_check_bytes(self, &result);
+        result
     }
 
     fn connect_hash256_bytes(&mut self, x: Hash256BytesTarget, y: Hash256BytesTarget) {
@@ -71,6 +89,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHash256Bytes<F,
     }
 
     fn hash256_bytes_to_hash256(&mut self, x: Hash256BytesTarget) -> Hash256Target {
+        range_check_bytes(self, &x);
         let result = x
             .chunks_exact(4)
             .map(|chunk| {
@@ -85,6 +104,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHash256Bytes<F,
     }
 
     fn hash256_bytes_to_u32_bits(&mut self, x: Hash256BytesTarget) -> [[BoolTarget; 32]; 8] {
+        range_check_bytes(self, &x);
         let zero = self._false();
         let result = x
             .chunks_exact(4)
@@ -101,6 +121,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHash256Bytes<F,
     }
 
     fn hash256_bytes_to_hashout224(&mut self, x: Hash256BytesTarget) -> HashOutTarget {
+        range_check_bytes(self, &x);
         let result = x
             .chunks_exact(8)
             .map(|chunk| {
@@ -131,6 +152,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHash256Bytes<F,
     }
 
     fn hash256_bytes_to_hash256_be(&mut self, x: Hash256BytesTarget) -> Hash256Target {
+        range_check_bytes(self, &x);
         let result = x
             .chunks_exact(4)
             .map(|chunk| {
@@ -145,18 +167,15 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHash256Bytes<F,
     }
 
     fn hash256_bytes_to_hashout(&mut self, x: Hash256BytesTarget) -> HashOutTarget {
+        range_check_bytes(self, &x);
         let result = x
             .chunks_exact(8)
             .map(|chunk| {
-                let c256 = self.constant(F::from_canonical_u32(0x100));
-                let mut value = chunk[0];
-                value = self.mul_add(value, c256, chunk[1]);
-                value = self.mul_add(value, c256, chunk[2]);
-                value = self.mul_add(value, c256, chunk[3]);
-                value = self.mul_add(value, c256, chunk[4]);
-                value = self.mul_add(value, c256, chunk[5]);
-                value = self.mul_add(value, c256, chunk[6]);
-                self.mul_add(value, c256, chunk[7])
+                let high = pack_u32_be(self, &chunk[..4]);
+                let low = pack_u32_be(self, &chunk[4..]);
+                assert_canonical_64(self, low, high);
+                let two_to_32 = self.constant(F::from_canonical_u64(1u64 << 32));
+                self.mul_add(high, two_to_32, low)
             })
             .collect::<Vec<Target>>();
         HashOutTarget {
@@ -175,8 +194,11 @@ mod tests {
     use std::str::FromStr;
 
     use plonky2::{
-        field::goldilocks_field::GoldilocksField,
-        iop::witness::PartialWitness,
+        field::{
+            goldilocks_field::GoldilocksField,
+            types::{Field, Field64},
+        },
+        iop::witness::{PartialWitness, WitnessWrite},
         plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig},
     };
     use psy_client_common::data::{base_types::hash256::Hash256, qhashout::QHashOut};
@@ -186,6 +208,37 @@ mod tests {
     type F = GoldilocksField;
     type C = PoseidonGoldilocksConfig;
     const D: usize = 2;
+
+    #[test]
+    fn hash256_bytes_to_hashout_rejects_goldilocks_modulus_alias() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let bytes = builder.add_virtual_hash256_bytes_target();
+        builder.hash256_bytes_to_hashout(bytes);
+        let data = builder.build::<C>();
+
+        let mut encoded = [0u8; 32];
+        encoded[..8].copy_from_slice(&F::ORDER.to_be_bytes());
+        let mut pw = PartialWitness::new();
+        pw.set_hash256_bytes_target(&bytes, &encoded).unwrap();
+        assert!(data.prove(pw).is_err(), "a field-modulus chunk must not alias zero");
+    }
+
+    #[test]
+    fn hash256_bytes_targets_reject_non_byte_values() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let bytes = builder.add_virtual_hash256_bytes_target();
+        builder.hash256_bytes_to_hashout(bytes);
+        let data = builder.build::<C>();
+
+        let mut pw = PartialWitness::new();
+        for &target in &bytes[1..] {
+            pw.set_target(target, F::ZERO).unwrap();
+        }
+        pw.set_target(bytes[0], F::from_canonical_u64(256)).unwrap();
+        assert!(data.prove(pw).is_err(), "byte targets must be constrained to 0..=255");
+    }
 
     #[test]
     fn test_hash256_to_qhashout_consistency() -> anyhow::Result<()> {

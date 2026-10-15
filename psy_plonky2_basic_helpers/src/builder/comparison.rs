@@ -8,7 +8,7 @@ use plonky2::{
 use crate::u32::multiple_comparison::list_lte_circuit;
 
 /// Exclude the value-plus-modulus alias before comparing 64-bit limbs.
-fn assert_canonical_64<F: RichField + Extendable<D>, const D: usize>(
+pub fn assert_canonical_64<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     low: Target,
     high: Target,
