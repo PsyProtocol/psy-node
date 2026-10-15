@@ -11,21 +11,50 @@ Save a JSON file such as `sd-key-policy.json`:
       { "Input": { "word": 0, "comparison": "Lte", "value": 100 } }
     ]
   },
-  "ordered": [{ "Method": 10 }, { "Method": 20 }],
+  "transaction_rules": {
+    "0": { "Method": 10 },
+    "1": { "Method": 20 }
+  },
   "totals": [{ "word": 0, "max_per_tx": 100, "max_total": 250 }],
   "min_tx_count": 2,
   "max_tx_count": 3
 }
 ```
 
-`per_transaction` applies to every transaction. `ordered` constrains the
-first transactions in order; it cannot contain more entries than
-`min_tx_count`. `All` and `Any` can contain nested rules. Available leaf rules
+`per_transaction` applies to every transaction. `transaction_rules` constrains
+specific zero-based transaction indexes; use consecutive indexes for an
+ordered sequence or leave earlier indexes out to constrain one transaction.
+The legacy `ordered` array is still accepted and converted to indexes starting
+at zero. `All` and `Any` can contain nested rules. Available leaf rules
 are `Contract`, `Method`, `Caller`, and `Input`. `Input.comparison` accepts
 `Eq`, `Lt`, `Lte`, `Gt`, or `Gte`. `Not` negates one nested rule. `IfThen`
 applies a rule when its condition matches. A missing
 calldata word makes an `Input` rule false, so `Not(Input(...))` is true when
 that word is absent.
+
+Use `transaction_rules` to constrain only selected transaction positions. The
+object keys are zero-based transaction indexes. A rule is applied only when
+that transaction exists; unspecified positions are unaffected by this field
+but still must satisfy `per_transaction`:
+
+```json
+{
+  "per_transaction": { "Contract": 0 },
+  "transaction_rules": {
+    "2": {
+      "All": [
+        { "Method": 30 },
+        { "Input": { "word": 0, "comparison": "Lte", "value": 10 } }
+      ]
+    }
+  },
+  "min_tx_count": 1,
+  "max_tx_count": 3
+}
+```
+
+This constrains only transaction index 2 (the third transaction). Consecutive
+`transaction_rules` indexes express an ordered sequence directly.
 
 Use `IfThen` to make a rule conditional. This example constrains input
 for calls to `(5, 10)` and `(8, 20)` while leaving other contract/method pairs
@@ -49,7 +78,7 @@ unconstrained by these conditions:
       }
     ]
   },
-  "ordered": [],
+  "transaction_rules": {},
   "totals": [],
   "min_tx_count": 1,
   "max_tx_count": 10
@@ -76,7 +105,7 @@ expands the rule to contract, method, and calldata-word checks:
       "value": 100
     }
   },
-  "ordered": [],
+  "transaction_rules": {},
   "totals": [],
   "min_tx_count": 1,
   "max_tx_count": 3
@@ -168,7 +197,7 @@ psy_user_cli wallet sd-key-policy-describe --definition sd-key-policy.json
 ```
 
 It prints the transaction count range, the rule every transaction must
-satisfy, ordered slot constraints, session totals, and the fingerprint.
+satisfy, transaction-position constraints, session totals, and the fingerprint.
 With `--rpc-config --contract 7` it also annotates method ids with the
 on-chain function names from that contract.
 
@@ -177,7 +206,7 @@ on-chain function names from that contract.
 Policy files may write `Method` rules as on-chain function names instead
 of numeric ids. A name is resolved against the contract named by a
 `Contract` rule in the same `All` group; names outside such a group, like
-ordered-slot rules, use the `--contract` flag:
+position rules, use the `--contract` flag:
 
 ```json
 {
@@ -187,7 +216,7 @@ ordered-slot rules, use the `--contract` flag:
       { "Any": [{ "Method": "buy" }, { "Method": "sell" }] }
     ]
   },
-  "ordered": [{ "Method": "buy" }],
+  "transaction_rules": { "0": { "Method": "buy" } },
   "totals": [],
   "min_tx_count": 1,
   "max_tx_count": 2

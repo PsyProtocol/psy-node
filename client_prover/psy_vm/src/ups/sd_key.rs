@@ -224,7 +224,7 @@ impl DpnDefBuilder {
 
 
 /// Build a bounded policy. `per_transaction` applies to every active call;
-/// `ordered` additionally constrains the first slots in sequence.
+/// `ordered` is retained as a compatibility input for the first slots.
 pub fn build_composed_sd_key_policy(
     per_transaction: &SDKeyCallRule,
     ordered: &[SDKeyCallRule],
@@ -253,11 +253,28 @@ pub fn build_composed_sd_key_policy_with_relations(
     min_tx_count: u64,
     max_tx_count: u64,
 ) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
+    anyhow::ensure!(ordered.len() <= min_tx_count as usize,
+        "SD key ordered rules exceed minimum transaction count");
+    let transaction_rules = ordered.iter().enumerate().map(|(tx_index, rule)| {
+        psy_client_data::dpn::sd_key::SDKeyTransactionRule { tx_index: tx_index as u32, rule: rule.clone() }
+    }).collect::<Vec<_>>();
+    build_composed_sd_key_policy_with_transaction_rules(per_transaction, &transaction_rules, totals, cross_transaction, min_tx_count, max_tx_count)
+}
+
+pub fn build_composed_sd_key_policy_with_transaction_rules(
+    per_transaction: &SDKeyCallRule,
+    transaction_rules: &[psy_client_data::dpn::sd_key::SDKeyTransactionRule],
+    totals: &[SDKeyInputTotalLimit],
+    cross_transaction: &[SDKeyTransactionInputRelation],
+    min_tx_count: u64,
+    max_tx_count: u64,
+) -> anyhow::Result<(DPNFunctionCircuitDefinition, SDKeyConfig)> {
     anyhow::ensure!(min_tx_count <= max_tx_count && max_tx_count > 0 && max_tx_count <= MAX_INTROSPECTABLE_TRANSACTIONS as u64,
         "SD key transaction count range must satisfy 0 <= min <= max <= {} and max > 0", MAX_INTROSPECTABLE_TRANSACTIONS);
     let composed = psy_client_data::dpn::sd_key::SDKeyComposedPolicy {
         per_transaction: per_transaction.clone(),
-        ordered: ordered.to_vec(),
+        ordered: vec![],
+        transaction_rules: transaction_rules.to_vec(),
         totals: totals.to_vec(),
         cross_transaction: cross_transaction.to_vec(),
     };

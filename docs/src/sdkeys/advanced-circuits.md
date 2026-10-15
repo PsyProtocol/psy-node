@@ -37,15 +37,16 @@ without that binding; it never silently binds the state proof to contract zero.
 
 Rust callers can build a read-only SD-key definition from nested `All` and
 `Any` rules. The common rule applies to every transaction. Optional ordered
-rules apply to transaction slots starting at zero, in addition to the common
-rule. Transaction count can vary in an inclusive range. Ordered rules must fit
-within the minimum count.
+rules apply to explicitly selected transaction slots, in addition to the
+common rule. Transaction count can vary in an inclusive range. A selected rule
+is enforced only if that transaction exists.
 
 ```rust
 use psy_vm::ups::sd_key::{
-    build_composed_sd_key_policy_with_totals, SDKeyCallRule as Rule,
+    build_composed_sd_key_policy_with_transaction_rules, SDKeyCallRule as Rule,
     SDKeyComparison, SDKeyInputTotalLimit,
 };
+use psy_client_data::dpn::sd_key::SDKeyTransactionRule;
 
 // This example assumes method 10 and method 20 both encode the quantity to
 // limit in calldata word 0, with the same units. Verify that against their ABIs.
@@ -54,10 +55,15 @@ let common = Rule::All(vec![
     Rule::Any(vec![Rule::Method(10), Rule::Method(20)]),
     Rule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 },
 ]);
-let (function, config) = build_composed_sd_key_policy_with_totals(
+let transaction_rules = vec![
+    SDKeyTransactionRule { tx_index: 0, rule: Rule::Method(10) },
+    SDKeyTransactionRule { tx_index: 1, rule: Rule::Method(20) },
+];
+let (function, config) = build_composed_sd_key_policy_with_transaction_rules(
     &common,
-    &[Rule::Method(10), Rule::Method(20)], // first buy, then sell
+    &transaction_rules, // first buy, then sell
     &[SDKeyInputTotalLimit { word: 0, max_per_tx: 100, max_total: 300 }],
+    &[],
     2, // minimum transaction count
     3, // maximum transaction count
 )?;

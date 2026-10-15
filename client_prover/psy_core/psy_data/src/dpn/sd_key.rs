@@ -171,9 +171,19 @@ pub struct SDKeyTransactionInputRelation {
 pub struct SDKeyComposedPolicy {
     pub per_transaction: SDKeyCallRule,
     pub ordered: Vec<SDKeyCallRule>,
+    /// Additional rule for selected transaction positions (zero based).
+    #[serde(default)]
+    pub transaction_rules: Vec<SDKeyTransactionRule>,
     pub totals: Vec<SDKeyInputTotalLimit>,
     #[serde(default)]
     pub cross_transaction: Vec<SDKeyTransactionInputRelation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, TS)]
+#[ts(export)]
+pub struct SDKeyTransactionRule {
+    pub tx_index: u32,
+    pub rule: SDKeyCallRule,
 }
 
 impl SDKeyCallRule {
@@ -225,6 +235,15 @@ impl SDKeyComposedPolicy {
         for rule in &self.ordered {
             rule.validate()?;
         }
+        let mut transaction_slots = std::collections::HashSet::new();
+        for slot_rule in &self.transaction_rules {
+            anyhow::ensure!(slot_rule.tx_index < max_tx_count,
+                "SD key transaction rule index {} is outside maximum transaction count {}",
+                slot_rule.tx_index, max_tx_count);
+            anyhow::ensure!(transaction_slots.insert(slot_rule.tx_index),
+                "SD key transaction rule index {} is duplicated", slot_rule.tx_index);
+            slot_rule.rule.validate()?;
+        }
         for total in &self.totals {
             total.validate(max_tx_count)?;
         }
@@ -264,6 +283,11 @@ impl SDKeyComposedPolicy {
             if let Some(rule) = self.ordered.get(index) {
                 if !Self::rule_matches(rule, info, words) {
                     anyhow::bail!("SD key policy denies transaction {}: ordered slot rule {:?}", index, rule);
+                }
+            }
+            if let Some(slot_rule) = self.transaction_rules.iter().find(|rule| rule.tx_index as usize == index) {
+                if !Self::rule_matches(&slot_rule.rule, info, words) {
+                    anyhow::bail!("SD key policy denies transaction {}: transaction-specific rule {:?}", index, slot_rule.rule);
                 }
             }
         }
@@ -454,6 +478,7 @@ mod composed_policy_tests {
                 SDKeyCallRule::Any(vec![SDKeyCallRule::Method(10), SDKeyCallRule::Method(20)]),
             ]),
             ordered: vec![SDKeyCallRule::Method(10), SDKeyCallRule::Method(20)],
+            transaction_rules: vec![],
             totals: vec![SDKeyInputTotalLimit { word: 0, max_per_tx: 100, max_total: 150 }],
             cross_transaction: vec![],
         }
@@ -493,6 +518,7 @@ mod composed_policy_tests {
         let policy = SDKeyComposedPolicy {
             per_transaction: SDKeyCallRule::Input { word: 1, comparison: SDKeyComparison::Eq, value: 7 },
             ordered: vec![],
+            transaction_rules: vec![],
             totals: vec![],
             cross_transaction: vec![],
         };
@@ -512,6 +538,7 @@ mod composed_policy_tests {
                 then: Box::new(SDKeyCallRule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 }),
             },
             ordered: vec![],
+            transaction_rules: vec![],
             totals: vec![],
             cross_transaction: vec![SDKeyTransactionInputRelation {
                 left_slot: 0, left_word: 1, comparison: SDKeyComparison::Lte, right_slot: 1, right_word: 1,
@@ -532,6 +559,7 @@ mod composed_policy_tests {
         let policy = SDKeyComposedPolicy {
             per_transaction: SDKeyCallRule::Contract(5),
             ordered: vec![SDKeyCallRule::Method(10)],
+            transaction_rules: vec![],
             totals: vec![],
             cross_transaction: vec![],
         };
@@ -556,6 +584,7 @@ mod composed_policy_tests {
                 conditional(8, 20, 1, 7),
             ]),
             ordered: vec![],
+            transaction_rules: vec![],
             totals: vec![],
             cross_transaction: vec![],
         };

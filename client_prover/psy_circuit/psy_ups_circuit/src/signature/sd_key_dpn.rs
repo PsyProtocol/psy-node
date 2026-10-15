@@ -429,6 +429,10 @@ impl SDKeyDpnCircuitGadget {
                     let sequence = Self::constrain_call_rule(builder, slot, ordered);
                     matches = builder.and(matches, sequence);
                 }
+                if let Some(transaction_rule) = composed.transaction_rules.iter().find(|rule| rule.tx_index as usize == index) {
+                    let selected = Self::constrain_call_rule(builder, slot, &transaction_rule.rule);
+                    matches = builder.and(matches, selected);
+                }
                 let slot_allowed = builder.or(inactive, matches);
                 builder.assert_one(slot_allowed.target);
             }
@@ -2069,6 +2073,38 @@ mod tests {
         violates_if_then.transaction_infos[0] = info;
         violates_if_then.transaction_inputs[0] = inputs;
         assert!(gadget.prove(dummy_private_key(), &violates_if_then, witness_sighash(&violates_if_then)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn composed_policy_transaction_rules_bind_only_the_selected_slot() {
+        use psy_vm::ups::sd_key::{build_composed_sd_key_policy_with_transaction_rules, SDKeyCallRule as Rule, SDKeyComparison};
+        let common = Rule::Contract(0);
+        let selected = psy_client_data::dpn::sd_key::SDKeyTransactionRule {
+            tx_index: 2,
+            rule: Rule::All(vec![
+                Rule::Method(30),
+                Rule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 10 },
+            ]),
+        };
+        let (definition, config) = build_composed_sd_key_policy_with_transaction_rules(
+            &common, &[selected], &[], &[], 1, 3,
+        ).unwrap();
+        let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap();
+        let prove = |calls: &[(u64, u32, Vec<u64>)]| {
+            let pairs = calls.iter().map(|(contract, method, inputs)| make_tx_info(*contract, *method, inputs)).collect::<Vec<_>>();
+            let infos = pairs.iter().map(|(info, _)| *info).collect();
+            let inputs = pairs.into_iter().map(|(_, input)| input).collect();
+            build_witness(infos, inputs, 3)
+        };
+
+        let short = prove(&[(0, 11, vec![1])]);
+        gadget.prove(dummy_private_key(), &short, witness_sighash(&short)).await.unwrap();
+        let valid = prove(&[(0, 11, vec![1]), (0, 22, vec![2]), (0, 30, vec![10])]);
+        gadget.prove(dummy_private_key(), &valid, witness_sighash(&valid)).await.unwrap();
+        let wrong_slot = prove(&[(0, 11, vec![1]), (0, 30, vec![1]), (0, 22, vec![2])]);
+        assert!(gadget.prove(dummy_private_key(), &wrong_slot, witness_sighash(&wrong_slot)).await.is_err());
+        let over_limit = prove(&[(0, 11, vec![1]), (0, 22, vec![2]), (0, 30, vec![11])]);
+        assert!(gadget.prove(dummy_private_key(), &over_limit, witness_sighash(&over_limit)).await.is_err());
     }
 
     #[tokio::test]

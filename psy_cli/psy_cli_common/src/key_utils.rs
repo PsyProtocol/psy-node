@@ -40,8 +40,11 @@ pub struct WalletKeyInfo {
 #[serde(deny_unknown_fields)]
 struct ComposedSDKeyPolicyFile {
     per_transaction: SDKeyCallRule,
-    #[serde(default)]
+    /// Legacy contiguous-prefix syntax. New policies should use transaction_rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ordered: Vec<SDKeyCallRule>,
+    #[serde(default)]
+    transaction_rules: std::collections::BTreeMap<u32, SDKeyCallRule>,
     #[serde(default)]
     totals: Vec<SDKeyInputTotalLimit>,
     #[serde(default)]
@@ -92,9 +95,21 @@ fn parse_sd_key_dpn_definition_json(contents: &str, path: &str) -> Result<(DPNFu
     anyhow::ensure!(!contains_abi_input(&value), "policy contains AbiInput rules; resolve them online first with `wallet sd-key-policy-resolve --rpc-config <network-config>`");
     let policy: ComposedSDKeyPolicyFile = serde_json::from_value(value)
         .with_context(|| format!("decode composed SD key policy {path}"))?;
-    psy_vm::ups::sd_key::build_composed_sd_key_policy_with_relations(
+    anyhow::ensure!(policy.ordered.is_empty() || policy.transaction_rules.is_empty(),
+        "use either transaction_rules or legacy ordered, not both");
+    anyhow::ensure!(policy.ordered.len() <= policy.min_tx_count as usize,
+        "legacy ordered rules exceed minimum transaction count");
+    let mut transaction_rules = policy.transaction_rules.iter().map(|(tx_index, rule)| {
+        psy_client_data::dpn::sd_key::SDKeyTransactionRule { tx_index: *tx_index, rule: rule.clone() }
+    }).collect::<Vec<_>>();
+    if transaction_rules.is_empty() {
+        transaction_rules.extend(policy.ordered.iter().enumerate().map(|(tx_index, rule)| {
+            psy_client_data::dpn::sd_key::SDKeyTransactionRule { tx_index: tx_index as u32, rule: rule.clone() }
+        }));
+    }
+    psy_vm::ups::sd_key::build_composed_sd_key_policy_with_transaction_rules(
         &policy.per_transaction,
-        &policy.ordered,
+        &transaction_rules,
         &policy.totals,
         &policy.cross_transaction,
         policy.min_tx_count,
@@ -280,6 +295,9 @@ async fn resolve_abi_inputs_online(value: &mut serde_json::Value, rpc_config: Op
     if let Some(ordered) = value.get("ordered").and_then(serde_json::Value::as_array) {
         for rule in ordered { collect_abi_contract_ids(rule, &mut ids)?; }
     }
+    if let Some(rules) = value.get("transaction_rules").and_then(serde_json::Value::as_object) {
+        for rule in rules.values() { collect_abi_contract_ids(rule, &mut ids)?; }
+    }
     if ids.is_empty() { return Ok(()); }
     let config_path = rpc_config.ok_or_else(|| anyhow!("--rpc-config is required to fetch ABI rules from psy-services"))?;
     let config = psy_config::PsyConfigGoldilocks::from_file(config_path)
@@ -294,6 +312,9 @@ async fn resolve_abi_inputs_online(value: &mut serde_json::Value, rpc_config: Op
     if let Some(rule) = value.get_mut("per_transaction") { expand_abi_input_rules(rule, &abis)?; }
     if let Some(ordered) = value.get_mut("ordered").and_then(serde_json::Value::as_array_mut) {
         for rule in ordered { expand_abi_input_rules(rule, &abis)?; }
+    }
+    if let Some(rules) = value.get_mut("transaction_rules").and_then(serde_json::Value::as_object_mut) {
+        for rule in rules.values_mut() { expand_abi_input_rules(rule, &abis)?; }
     }
     Ok(())
 }
@@ -318,7 +339,12 @@ mod policy_tests {
         let (_, config) = parse_sd_key_dpn_definition_json(json, "test.json").unwrap();
         let policy = config.transaction_count_policy.unwrap();
         assert_eq!((policy.min_tx_count, policy.max_tx_count), (2, 3));
-        assert_eq!(policy.composed.unwrap().totals.len(), 1);
+        let composed = policy.composed.unwrap();
+        assert_eq!(composed.totals.len(), 1);
+        assert_eq!(composed.ordered.len(), 0);
+        assert_eq!(composed.transaction_rules.len(), 2);
+        assert_eq!(composed.transaction_rules[0].tx_index, 0);
+        assert_eq!(composed.transaction_rules[1].tx_index, 1);
         let invalid = json.replace("max_total", "max_totla");
         assert!(parse_sd_key_dpn_definition_json(&invalid, "test.json").is_err());
     }
@@ -377,6 +403,34 @@ mod policy_tests {
         assert_eq!(composed.cross_transaction.len(), 1);
         let invalid = json.replace("\"left_slot\": 0", "\"left_slot\": 2");
         assert!(parse_sd_key_dpn_definition_json(&invalid, "invalid-slots.json").is_err());
+    }
+
+    #[test]
+    fn transaction_rules_constrain_only_selected_slot() {
+        let definition = r#"{
+            "per_transaction": {"Contract": 0},
+            "transaction_rules": {"2": {"All": [{"Method": 30}, {"Input": {"word": 0, "comparison": "Lte", "value": 10}}]}},
+            "min_tx_count": 1,
+            "max_tx_count": 3
+        }"#;
+        check_sd_key_policy_json(definition, "test", &[
+            PolicySimCall { contract_id: 0, method_id: 11, inputs: vec![1] },
+            PolicySimCall { contract_id: 0, method_id: 22, inputs: vec![2] },
+            PolicySimCall { contract_id: 0, method_id: 30, inputs: vec![10] },
+        ]).unwrap();
+
+        let wrong_slot = [
+            PolicySimCall { contract_id: 0, method_id: 11, inputs: vec![1] },
+            PolicySimCall { contract_id: 0, method_id: 30, inputs: vec![1] },
+            PolicySimCall { contract_id: 0, method_id: 22, inputs: vec![2] },
+        ];
+        assert!(check_sd_key_policy_json(definition, "test", &wrong_slot).is_err());
+
+        let absent_optional_slot = [PolicySimCall { contract_id: 0, method_id: 11, inputs: vec![1] }];
+        check_sd_key_policy_json(definition, "test", &absent_optional_slot).unwrap();
+
+        let out_of_range = definition.replace("\"2\":", "\"3\":");
+        assert!(parse_sd_key_dpn_definition_json(&out_of_range, "test").is_err());
     }
 
     #[test]
@@ -463,7 +517,7 @@ mod policy_tests {
 
     #[test]
     fn templates_round_trip_through_the_loader() {
-        for (kind, ordered_len, totals_len) in [
+        for (kind, transaction_rule_count, totals_len) in [
             (SdKeyPolicyTemplateKind::AllowMethod, 0, 0),
             (SdKeyPolicyTemplateKind::SpendingLimit, 0, 1),
             (SdKeyPolicyTemplateKind::Sequence, 2, 0),
@@ -472,7 +526,8 @@ mod policy_tests {
             let (_, config) = parse_sd_key_dpn_definition_json(&json, "template").unwrap();
             let policy = config.transaction_count_policy.unwrap();
             let composed = policy.composed.unwrap();
-            assert_eq!(composed.ordered.len(), ordered_len);
+            assert_eq!(composed.ordered.len(), 0);
+            assert_eq!(composed.transaction_rules.len(), transaction_rule_count);
             assert_eq!(composed.totals.len(), totals_len);
             assert_eq!(policy.min_tx_count, policy.max_tx_count);
         }
@@ -561,7 +616,7 @@ mod policy_tests {
         use serde_json::json;
 
         // All's Contract leaf scopes the names inside it; Any does not scope;
-        // ordered rules have no contract context of their own.
+        // ordered and transaction-specific rules have no context of their own.
         let mut policy = json!({
             "per_transaction": {"All": [
                 {"Contract": 7},
@@ -569,6 +624,7 @@ mod policy_tests {
                 {"Method": "ping"}
             ]},
             "ordered": [{"Method": "ping"}],
+            "transaction_rules": {"2": {"All": [{"Contract": 8}, {"Method": "stake"}]}},
             "totals": [],
             "min_tx_count": 1,
             "max_tx_count": 3
@@ -585,9 +641,11 @@ mod policy_tests {
                 (Some(7), "sell".to_string()),
                 (Some(7), "ping".to_string()),
                 (None, "ping".to_string()),
+                (Some(8), "stake".to_string()),
             ]
         );
         assert_eq!(policy["per_transaction"]["All"][1]["Any"][0]["Method"], serde_json::json!(42));
+        assert_eq!(policy["transaction_rules"]["2"]["All"][1]["Method"], serde_json::json!(42));
 
         // a bare rule without an enclosing Contract reports no context
         let mut unscoped = json!({"Any": [{"Method": "buy"}]});
@@ -680,9 +738,13 @@ pub fn build_sd_key_policy_template(
     };
     let min = min_tx_count.unwrap_or(default_min);
     let max = max_tx_count.unwrap_or(min);
+    let transaction_rules = ordered.iter().enumerate().map(|(tx_index, rule)| {
+        (tx_index as u32, rule.clone())
+    }).collect();
     let json = serde_json::to_string_pretty(&ComposedSDKeyPolicyFile {
         per_transaction,
-        ordered,
+        ordered: vec![],
+        transaction_rules,
         totals,
         cross_transaction: vec![],
         min_tx_count: min,
@@ -890,6 +952,11 @@ fn visit_policy_file_method_names(file: &mut serde_json::Value, visit: &mut impl
             visit_method_names(rule, None, visit);
         }
     }
+    if let Some(rules) = file.get_mut("transaction_rules").and_then(|value| value.as_object_mut()) {
+        for rule in rules.values_mut() {
+            visit_method_names(rule, None, visit);
+        }
+    }
 }
 
 /// Resolve ABI-aware rules from psy-services and `Method` names against
@@ -1094,6 +1161,12 @@ pub fn describe_sd_key_policy_json(contents: &str, path: &str, names: Option<&st
                     out += "leading transactions are further constrained, in order:\n";
                     for (index, rule) in composed.ordered.iter().enumerate() {
                         out += &format!("  slot {index}: {}\n", describe(rule));
+                    }
+                }
+                if !composed.transaction_rules.is_empty() {
+                    out += "selected transaction positions are further constrained:\n";
+                    for slot_rule in &composed.transaction_rules {
+                        out += &format!("  tx {}: {}\n", slot_rule.tx_index, describe(&slot_rule.rule));
                     }
                 }
                 if !composed.totals.is_empty() {
