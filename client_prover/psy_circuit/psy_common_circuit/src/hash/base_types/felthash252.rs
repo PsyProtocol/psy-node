@@ -4,6 +4,7 @@ use plonky2::{
     iop::target::{BoolTarget, Target},
     plonk::circuit_builder::CircuitBuilder,
 };
+use crate::builder::comparison::split_canonical_low_high;
 
 use super::hash256bytes::Hash256BytesTarget;
 
@@ -37,10 +38,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderFelt252Hash<F, 
     }
 
     fn hashout_to_felt252_hashout(&mut self, value: HashOutTarget) -> HashOutTarget {
-        let a = self.split_low_high(value.elements[0], 63, 64).0;
-        let b = self.split_low_high(value.elements[1], 63, 64).0;
-        let c = self.split_low_high(value.elements[2], 63, 64).0;
-        let d = self.split_low_high(value.elements[3], 63, 64).0;
+        let a = split_canonical_low_high(self, value.elements[0], 63).0;
+        let b = split_canonical_low_high(self, value.elements[1], 63).0;
+        let c = split_canonical_low_high(self, value.elements[2], 63).0;
+        let d = split_canonical_low_high(self, value.elements[3], 63).0;
         HashOutTarget { elements: [a, b, c, d] }
     }
 

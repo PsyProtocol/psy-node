@@ -17,6 +17,7 @@ use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::privacy::shield_deposit_claim::ShieldDepositClaimInput;
 use psy_common_circuit::{
     builder::{
+        comparison::split_canonical_low_high_32bits,
         hash::core::CircuitBuilderHashCore,
         pad_circuit::{pad_circuit_degree, CircuitBuilderPsyCommonGates},
     },
@@ -79,12 +80,12 @@ impl ShieldDepositClaimGadget {
         // No element reversal needed — the bytes32 encoding preserves [f0,f1,f2,f3] order.
         let shield_address_words: [Target; 8] = std::array::from_fn(|i| {
             let elem_idx = i / 2;
-            let (low, high) = builder.split_low_high(shield_address.elements[elem_idx], 32, 64);
+            let (low, high) = split_canonical_low_high_32bits(builder, shield_address.elements[elem_idx]);
             if i % 2 == 0 { high } else { low }
         });
         let note_secret_hash_words: [Target; 8] = std::array::from_fn(|i| {
             let elem_idx = i / 2;
-            let (low, high) = builder.split_low_high(note_secret_hash[elem_idx], 32, 64);
+            let (low, high) = split_canonical_low_high_32bits(builder, note_secret_hash[elem_idx]);
             if i % 2 == 0 { high } else { low }
         });
         let mut deposit_commitment_preimage = Vec::with_capacity(41);

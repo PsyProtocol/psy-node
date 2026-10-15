@@ -8,7 +8,7 @@ use plonky2::{
 };
 use psy_client_data::{config::store_config::PsyHasher, dpn::sd_key::SDKEY_MAX_CALLDATA_WORDS};
 use psy_common_circuit::{
-    builder::{comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore},
+    builder::{comparison::{split_canonical_le_64, split_canonical_low_high, CircuitBuilderComparison}, hash::core::CircuitBuilderHashCore},
     crypto::secp256k1::{
         ecdsa::gadgets::{
             biguint::{BigUintTarget, CircuitBuilderBiguint},
@@ -772,7 +772,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleDPNBuilder<F, D> {
                 let base_value = builder
                     .target_as_constant(self.resolve_target(op.inputs[0]))
                     .expect("ExpConstantBase base must be constant");
-                let exponent_bits = builder.split_le(self.resolve_target(op.inputs[1]), 64);
+                let exponent_bits = split_canonical_le_64(builder, self.resolve_target(op.inputs[1]));
                 self.set_target_at(op.index as usize, builder.exp_from_bits_const_base(base_value, exponent_bits), "ExpConstantBase")
             }
             DPNOpType::Mod | DPNOpType::ModConstantDivisor | DPNOpType::ModConstantDividend => {
@@ -796,7 +796,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleDPNBuilder<F, D> {
             }
             DPNOpType::DivRem4 => {
                 let target = self.resolve_target(op.inputs[0]);
-                let (low, high) = builder.split_low_high(target, 2, 64);
+                let (low, high) = split_canonical_low_high(builder, target, 2);
                 self.set_target_array_at(op.index as usize, vec![high, low], "DivRem4");
             }
             DPNOpType::CastU32 => {
