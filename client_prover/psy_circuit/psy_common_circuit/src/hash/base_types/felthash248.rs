@@ -4,6 +4,7 @@ use plonky2::{
     iop::target::BoolTarget,
     plonk::circuit_builder::CircuitBuilder,
 };
+use crate::builder::comparison::{split_canonical_le_64, split_canonical_low_high};
 
 use super::hash256bytes::{CircuitBuilderHash256Bytes, Hash256BytesTarget};
 
@@ -24,7 +25,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderFelt248Hash<F, 
         let a = value.elements[0];
         let b = value.elements[1];
         let c = value.elements[2];
-        let d = self.split_low_high(value.elements[3], 56, 64).0;
+        let d = split_canonical_low_high(self, value.elements[3], 56).0;
         HashOutTarget { elements: [a, b, c, d] }
     }
 
@@ -32,7 +33,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderFelt248Hash<F, 
         let bytes = value
             .elements
             .iter()
-            .flat_map(|e| self.split_le(*e, 64))
+            .flat_map(|e| split_canonical_le_64(self, *e))
             .collect::<Vec<BoolTarget>>()
             .chunks(8)
             .map(|bits| self.le_sum(bits.iter()))

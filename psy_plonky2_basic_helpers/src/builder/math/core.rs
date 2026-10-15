@@ -23,10 +23,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderCoreMathHelpers
     }
 
     fn div_rem(&mut self, x: Target, n: usize) -> (Target, Target) {
-        // TODO/UNSURE: can we skip the 63 bit range check and just use self.split_low_high(x, n, 64)?
+        // Keep this 63-bit contract unless callers explicitly need full field
+        // width. A 64-bit split must use split_canonical_low_high; a raw
+        // split_low_high(_, _, 64) permits value-plus-modulus aliases.
         self.range_check(x, 63);
 
-        // TODO/UNSURE: can we make this num_bits = 64?:
         let (rem, div) = self.split_low_high(x, n, 63);
         (div, rem)
     }
