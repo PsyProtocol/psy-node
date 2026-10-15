@@ -204,9 +204,37 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderComparison<F, D
     }
 
     fn assert_non_zero_hash(&mut self, hash: HashOutTarget) {
-        self.assert_non_zero(hash.elements[0]);
-        self.assert_non_zero(hash.elements[1]);
-        self.assert_non_zero(hash.elements[2]);
-        self.assert_non_zero(hash.elements[3]);
+        let is_zero = self.is_zero_hash(hash);
+        self.assert_zero(is_zero.target);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2::{
+        field::{goldilocks_field::GoldilocksField, types::Field},
+        hash::hash_types::HashOut,
+        iop::witness::{PartialWitness, WitnessWrite},
+        plonk::{circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig},
+    };
+
+    use super::*;
+
+    #[test]
+    fn non_zero_hash_allows_zero_elements_but_rejects_zero_hash() {
+        let mut builder = CircuitBuilder::<GoldilocksField, 2>::new(CircuitConfig::standard_recursion_config());
+        let hash = builder.add_virtual_hash();
+        builder.assert_non_zero_hash(hash);
+        let circuit = builder.build::<PoseidonGoldilocksConfig>();
+
+        let mut one_zero_element = PartialWitness::new();
+        one_zero_element
+            .set_hash_target(hash, HashOut { elements: [GoldilocksField::ZERO, GoldilocksField::ONE, GoldilocksField::ONE, GoldilocksField::ONE] })
+            .unwrap();
+        assert!(circuit.prove(one_zero_element).is_ok());
+
+        let mut all_zero = PartialWitness::new();
+        all_zero.set_hash_target(hash, HashOut::ZERO).unwrap();
+        assert!(circuit.prove(all_zero).is_err());
     }
 }
