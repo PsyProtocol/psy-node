@@ -14,7 +14,7 @@ use plonky2::{
 };
 use plonky2::field::types::Field64;
 use psy_ups_circuit::signature::multisig::MultisigSignatureCircuit;
-use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy};
+use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
 use psy_client_common::data::qhashout::QHashOut as ClientHash;
 use psy_core::{
     constants::protocol::{DA_CHALLENGE_WINDOW, TOKEN_BURN_METHOD_ID},
@@ -289,7 +289,7 @@ fn validate_multisig_policy_artifact(
             "multisig policy ABI differs from compiled method");
     }
     validate_policy_abi_slots(&artifact.abi)?;
-    let contract = contracts.get(6).context("Genesis contracts must contain multisig policy contract 6")?;
+    let contract = contracts.get(MULTISIG_POLICY_CONTRACT_ID as usize).context("Genesis contracts must contain multisig policy contract 1")?;
     ensure!(contract.code_definition.state_tree_height == 4, "Genesis policy contract must declare height 4");
     let (_, expected) = psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<C, D>(
         contract.deployer, 4, &artifact.circuit_definitions,
@@ -372,7 +372,7 @@ fn load_contracts(path: &Path) -> anyhow::Result<Vec<PQBCDeployContract<Hash>>> 
     for entry in &named {
         ensure!(!entry.name.trim().is_empty() && names.insert(entry.name.as_str()), "Genesis contract names must be nonempty and unique");
     }
-    ensure!(named.get(6).map(|entry| entry.name.as_str()) == Some("multisig_policy"), "Genesis contract 6 must be multisig_policy");
+    ensure!(named.get(MULTISIG_POLICY_CONTRACT_ID as usize).map(|entry| entry.name.as_str()) == Some("multisig_policy"), "Genesis contract 1 must be multisig_policy");
     Ok(named.into_iter().map(|entry| entry.deployment).collect())
 }
 
@@ -672,7 +672,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("psy-genesis-flat-{}", rand::random::<u64>()));
         std::fs::create_dir(&root).unwrap();
         let entries: Vec<_> = (0..7).map(|index| serde_json::json!({
-            "name": if index == 6 { "multisig_policy".to_string() } else { format!("contract{index}") },
+            "name": if index == u64::from(MULTISIG_POLICY_CONTRACT_ID) { "multisig_policy".to_string() } else { format!("contract{index}") },
             "deployer": index,
             "code_definition": {"state_tree_height":4,"functions":[]},
             "function_whitelist":[],"code_root":Hash::get_zero_value()
@@ -794,10 +794,10 @@ mod tests {
         let artifact_bytes = std::fs::read(artifact_path).unwrap();
         validate_multisig_policy_artifact(&contracts, &artifact_bytes).unwrap();
         let mut wrong_height = contracts.clone();
-        wrong_height[6].code_definition.state_tree_height = 5;
+        wrong_height[MULTISIG_POLICY_CONTRACT_ID as usize].code_definition.state_tree_height = 5;
         assert!(validate_multisig_policy_artifact(&wrong_height, &artifact_bytes).is_err());
         let mut wrong_code = contracts.clone();
-        wrong_code[6].code_root = Hash::get_zero_value();
+        wrong_code[MULTISIG_POLICY_CONTRACT_ID as usize].code_root = Hash::get_zero_value();
         assert!(validate_multisig_policy_artifact(&wrong_code, &artifact_bytes).is_err());
         let stats = PQEDCheckpointLeafStats::<F, Hash>::new_empty();
         let genesis: PsyGenesisBlockSetupData<F, Hash> = serde_json::from_value(serde_json::json!({
@@ -820,7 +820,7 @@ mod tests {
             contract_tree.set_leaf_no_proof(id, parth_core::crypto::hash::traits::QFieldHashable::qfhash::<PoseidonHasher>(&leaf));
         }
         assert_eq!(contract_tree.get_root(), builder.global_contract_tree_root);
-        assert!(contract_tree.get_leaf(6).verify::<PoseidonHasher>());
+        assert!(contract_tree.get_leaf(u64::from(MULTISIG_POLICY_CONTRACT_ID)).verify::<PoseidonHasher>());
         builder.setup_users::<PoseidonHasher, N>(&genesis, None, true, true).unwrap();
         let mut global = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
         let mut relayer_state = None;
@@ -847,14 +847,14 @@ mod tests {
                 assert_eq!(ucon.get_leaf(0).value, fee.get_root());
                 assert!(fee.get_leaf(0).verify::<PoseidonHasher>());
                 assert_eq!(fee.get_leaf(0).value, Hash::from_values(100, 0, 0, 0));
-                let policy = &state_trees.iter().find(|(id, _)| *id == 6).unwrap().1;
+                let policy = &state_trees.iter().find(|(id, _)| *id == u64::from(MULTISIG_POLICY_CONTRACT_ID)).unwrap().1;
                 let mut proofs = Vec::new();
                 for slot in 0..4 {
-                    proofs.push(serde_json::from_value(serde_json::to_value(ucon.get_leaf(6)).unwrap()).unwrap());
+                    proofs.push(serde_json::from_value(serde_json::to_value(ucon.get_leaf(u64::from(MULTISIG_POLICY_CONTRACT_ID))).unwrap()).unwrap());
                     proofs.push(serde_json::from_value(serde_json::to_value(policy.get_leaf(slot)).unwrap()).unwrap());
                 }
                 relayer_state = Some(StateReaderResults {
-                    state: UserContractState { checkpoint_tree_root: ClientHash::ZERO, user_leaf: leaf, start_contract_state_root: ClientHash(policy.get_root().0), contract_id: F::from_canonical_u32(6), checkpoint_id: F::ZERO },
+                    state: UserContractState { checkpoint_tree_root: ClientHash::ZERO, user_leaf: leaf, start_contract_state_root: ClientHash(policy.get_root().0), contract_id: F::from_canonical_u32(MULTISIG_POLICY_CONTRACT_ID), checkpoint_id: F::ZERO },
                     user_tree_root: ClientHash::ZERO, checkpoint: None, aux_user_leaves: vec![],
                     state_cmds: (0..4).map(|slot| DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(DPNStateCmdGetSelfUserCurrentContractStateSlotHash { slot_index: F::from_canonical_u64(slot) })).collect(),
                     merkel_proofs: proofs,
@@ -899,7 +899,7 @@ mod tests {
         for (index, member) in member_hashes[..3].iter_mut().enumerate() {
             *member = ClientHash::from_values(index as u64 + 1, 0, 0, 0);
         }
-        MultisigAccount { contract_id: 6, initial_policy: MultisigPolicy {
+        MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: MultisigPolicy {
             version: 1, threshold: 2, member_count: 3, member_hashes,
         } }
     }
@@ -915,7 +915,7 @@ mod tests {
             assert!(decode_relayer_multisig_account(&serde_json::to_vec(&value).unwrap()).is_err());
         }
         let text = String::from_utf8(valid).unwrap();
-        let duplicate = text.replacen("\"contract_id\":6", "\"contract_id\":6,\"contract_id\":6", 1);
+        let duplicate = text.replacen("\"contract_id\":1", "\"contract_id\":1,\"contract_id\":1", 1);
         assert!(decode_relayer_multisig_account(duplicate.as_bytes()).is_err());
         let duplicate = text.replacen("\"version\":1", "\"version\":1,\"version\":1", 1);
         assert!(decode_relayer_multisig_account(duplicate.as_bytes()).is_err());

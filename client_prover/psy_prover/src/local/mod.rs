@@ -1,5 +1,6 @@
 pub mod common;
 pub mod store;
+pub mod reward_client;
 pub use store::UserProverWorkerStore;
 
 // #[cfg(feature = "is_sync")]

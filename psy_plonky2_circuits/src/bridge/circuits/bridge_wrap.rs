@@ -3,8 +3,8 @@ pub use std::fmt::Display;
 use hex::FromHexError;
 use parth_core::{crypto::hash::traits::HashTo4Felts, pgoldilocks::QHashOut};
 use plonky2::{
-    field::{goldilocks_field::GoldilocksField, types::PrimeField64},
-    iop::witness::{PartialWitness, WitnessWrite},
+    field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}},
+    iop::{target::{BoolTarget, Target}, witness::{PartialWitness, WitnessWrite}},
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData},
@@ -215,7 +215,10 @@ impl BridgeWrapCircuit {
 #[cfg(test)]
 mod tests {
     use super::bridge_wrap_public_inputs_keccak_bytes;
-    use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
+    use plonky2::{
+        field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}},
+        iop::{target::{BoolTarget, Target}, witness::WitnessWrite},
+    };
 
     #[test]
     fn bridge_wrap_keccak_bytes_pair_swap_tree_root_limbs() {
@@ -247,6 +250,7 @@ mod tests {
         assert_eq!(&bytes[136..144], &25u64.to_be_bytes());
     }
 }
+
 
 #[derive(Debug)]
 pub struct DepositBatchWrapCircuit {

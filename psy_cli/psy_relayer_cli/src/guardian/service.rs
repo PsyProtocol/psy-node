@@ -697,12 +697,12 @@ mod tests {
     #[test]
     fn startup_enrollment_makes_approved_multisig_identity_available_and_rejects_wrong_pins() {
         use psy_prover::wallet::memory_wallet::PsyMemoryWallet;
-        use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy};
+        use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
         let mut members = [Hash4::ZERO; 8];
         for (index, member) in members[..3].iter_mut().enumerate() {
             *member = Hash4::from_values(index as u64 + 1, 0, 0, 0);
         }
-        let account = MultisigAccount { contract_id: 6, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes: members } };
+        let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes: members } };
         let mut enrolled = PsyMemoryWallet::new(Vec::new());
         let identity = enrolled.register_multisig_user(account.clone()).unwrap();
         let public_key = identity.qfhash::<PsyHasher>();

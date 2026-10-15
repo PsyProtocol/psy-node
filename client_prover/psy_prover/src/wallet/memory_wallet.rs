@@ -1,15 +1,15 @@
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use anyhow::bail;
+use anyhow::{bail, Context as _};
 use base64::Engine;
 use dashmap::DashMap;
 use plonky2::{
-    field::{goldilocks_field::GoldilocksField, types::Field},
+    field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}},
     hash::{
         hash_types::{HashOut, RichField},
         poseidon::{PoseidonHash, PoseidonPermutation},
     },
-    plonk::{circuit_data::VerifierOnlyCircuitData, config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs},
+    plonk::{circuit_data::VerifierOnlyCircuitData, config::{Hasher, PoseidonGoldilocksConfig}, proof::ProofWithPublicInputs},
 };
 use psy_client_common::data::{
     alt::AltVerifierOnlyCircuitData, base_types::hash256::Hash256, qhashout::QHashOut, secp256k1::CompressedPublicKey,
@@ -1003,6 +1003,32 @@ impl PsyMemoryWallet {
             .get(pk_hash)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| anyhow::anyhow!("User with public key hash {} not found", pk_hash))
+    }
+
+    pub async fn prove_reward_claim(
+        &self,
+        pk_hash: &QHashOut<F>,
+        client: &crate::local::reward_client::RewardClient,
+        checkpoint: &psy_plonky2_circuits::bridge::circuits::user_reward_checkpoint_aggregate::UserRewardCheckpointAggregateCircuit,
+        aggregate: &psy_plonky2_circuits::bridge::circuits::user_reward_checkpoint_aggregate::UserRewardCheckpointAggregateProof,
+        anchor: &crate::local::reward_client::FinalizedCheckpointAnchor,
+        token: [u8; 20],
+        state_manager: [u8; 20],
+    ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+        let user = self.get_user_by_public_key_hash(pk_hash)?;
+        let user_id = u32::try_from(aggregate.public_inputs.first().context("reward aggregate has no user")?.to_canonical_u64())?;
+        let registration_index = psy_crypto::common::user_id::get_registration_id_from_user_id(u64::from(user_id));
+        anyhow::ensure!(anchor.registration_index == registration_index, "selected reward user does not match the authenticated registration");
+        let manager = self.random_circuit_manager();
+        let info = user.public_key_info(self, manager.as_ref()).await?;
+        anyhow::ensure!(info.qfhash::<PsyHasher>() == *pk_hash, "selected reward user does not match the authenticated registration");
+        let fingerprint = PsyBasicZKSignatureCircuit::<C, D>::new().fingerprint.0;
+        let registration_leaf = PoseidonHash::two_to_one(fingerprint, info.public_key_param.0);
+        anyhow::ensure!(
+            anchor.registration_leaf == registration_leaf && registration_leaf != HashOut::ZERO,
+            "selected reward user does not match the authenticated registration"
+        );
+        user.prove_reward_claim(client, checkpoint, aggregate, anchor, token, state_manager).await
     }
 
     pub async fn add_software_defined_dpn_private_key(

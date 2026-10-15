@@ -1,8 +1,6 @@
 pub mod compile_bridge;
 pub mod session;
 pub use session::*;
-pub mod utils;
-pub use utils::*;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn sleep(dur: std::time::Duration) {

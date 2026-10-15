@@ -103,7 +103,7 @@ fn resolve_current_deployments_network(rpc_config_path: &str) -> anyhow::Result<
     Ok(psy_config.current_network_name().to_string())
 }
 
-async fn rpc_call(url: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+pub(crate) async fn rpc_call(url: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
     });

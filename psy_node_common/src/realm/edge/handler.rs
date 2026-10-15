@@ -454,38 +454,122 @@ impl<
             .map(|job_id_with_path| SimpleMerkleNodeKey::from_reward_path_info(job_id_with_path.reward_path_info))
             .collect::<Vec<_>>();
 
-        let mut tag_proofs = self.tag_tree_rewards_store
-            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &merkle_node_keys).await?;
+        let tag_proofs = self
+            .tag_tree_rewards_store
+            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &merkle_node_keys)
+            .await?;
 
-        // Merge the realm-local reward proof with the coordinator-level proof so
-        // the final root matches the checkpoint's global rewards root. The realm
-        // processor persists this top proof keyed by unique_pending_id.
+        // Resolve pending -> checkpoint. The GUTA claim circuit binds the job tag
+        // root to checkpoint.stats.pm_rewards_commitment.gutas_root, not
+        // register_users_root (user_reward_tree.rs). The stored top leaf is an
+        // opaque commitment and is not hashed or rewritten.
+        let checkpoint_id = self
+            .db_reader
+            .get_checkpoint_id_for_unique_pending_id(unique_pending_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no checkpoint id found for unique pending id {}", unique_pending_id))?;
+        let checkpoint_leaf = self.db_reader.get_checkpoint_leaf_data(checkpoint_id).await?;
+        let checkpoint_rewards_root = checkpoint_leaf.stats.pm_rewards_commitment.gutas_root;
         let top_proof = self
             .db_reader
             .get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id)
             .await?;
-        for proof in &mut tag_proofs {
-            anyhow::ensure!(
-                proof.root == top_proof.leaf.get_node_hash::<N::HasherBase>(),
-                "Realm rewards local root does not match top proof leaf at unique_pending_id {}",
-                unique_pending_id
-            );
-            let local_proof_height = proof.siblings.len();
-            proof.siblings.extend(top_proof.siblings.clone());
-            proof.root = top_proof.root;
-            proof.index |= top_proof.index << local_proof_height;
-        }
+        anyhow::ensure!(
+            top_proof.root == checkpoint_rewards_root,
+            "Top rewards proof root does not match checkpoint {} gutas rewards root at unique_pending_id {}",
+            checkpoint_id,
+            unique_pending_id
+        );
 
-        // Wrap into PsyProoffMinerRewardProof
-        let miner_proofs = job_ids.into_iter().zip(tag_proofs.into_iter()).map(|(job_id_with_path, tag_proof)| {
-            PsyProoffMinerRewardProof {
-                job_id: job_id_with_path.job_data_id,
-                tag_tree_proof: tag_proof,
-            }
-        }).collect::<Vec<_>>();
+        let miner_proofs = job_ids
+            .into_iter()
+            .zip(tag_proofs.into_iter())
+            .map(|(job_id_with_path, local_proof)| {
+                let combined = compose_realm_reward_proof::<N>(&local_proof, &top_proof, checkpoint_rewards_root)?;
+                Ok(PsyProoffMinerRewardProof {
+                    job_id: job_id_with_path.job_data_id,
+                    tag_tree_proof: combined,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(miner_proofs)
     }
+}
+
+/// Depth of one tag-tree proof. `siblings.len()` is the number of parent steps,
+/// which is also the bit width of that proof's index.
+fn tag_tree_proof_depth(siblings_len: usize) -> anyhow::Result<u32> {
+    u32::try_from(siblings_len).map_err(|_| anyhow::anyhow!("tag tree proof depth {} exceeds u32", siblings_len))
+}
+
+/// `index` must fit in `depth` bits. Depth 0 only admits index 0. The full-width
+/// skip applies only at depth 64, after the caller has already rejected a deeper
+/// proof, so a shift by 64 is never used to test the width.
+fn ensure_index_fits_depth(index: u64, depth: u32, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(depth <= 64, "{label} proof depth {depth} exceeds 64");
+    if depth == 0 {
+        anyhow::ensure!(index == 0, "{label} depth 0 proof has non-zero index {index}");
+        return Ok(());
+    }
+    if depth == 64 {
+        return Ok(());
+    }
+    let width = 1u64 << depth;
+    anyhow::ensure!(index < width, "{label} index {index} does not fit in depth {depth}");
+    Ok(())
+}
+
+/// Build a new proof: unchanged local leaf, checkpoint gutas rewards root, and
+/// `index = local.index | (top.index << local_depth)` over `local.siblings + top.siblings`.
+/// Both inputs are only borrowed. The top proof is not verified on its own: its
+/// leaf is an opaque value, often the zero preimage, so hashing it would fail.
+/// A local depth of 64 admits only an empty upper proof (depth 0, index 0) so
+/// the upper index is never shifted by 64.
+fn compose_realm_reward_proof<N: QNetworkTypesConfig>(
+    local_proof: &TagTreeMerkleProof<N::QHash>,
+    top_proof: &TagTreeMerkleProof<N::QHash>,
+    checkpoint_rewards_root: N::QHash,
+) -> anyhow::Result<TagTreeMerkleProof<N::QHash>> {
+    anyhow::ensure!(
+        local_proof.verify::<N::HasherBase>(),
+        "Realm rewards local proof does not verify"
+    );
+
+    let local_depth = tag_tree_proof_depth(local_proof.siblings.len())?;
+    let top_depth = tag_tree_proof_depth(top_proof.siblings.len())?;
+    ensure_index_fits_depth(local_proof.index, local_depth, "local rewards")?;
+    ensure_index_fits_depth(top_proof.index, top_depth, "top rewards")?;
+
+    let total_depth = local_depth
+        .checked_add(top_depth)
+        .ok_or_else(|| anyhow::anyhow!("combined rewards proof depth overflow"))?;
+    anyhow::ensure!(total_depth <= 64, "combined rewards proof depth {total_depth} exceeds 64");
+
+    let combined_index = if local_depth == 64 {
+        anyhow::ensure!(
+            top_depth == 0 && top_proof.index == 0,
+            "local rewards depth 64 cannot be extended by a non-empty top proof"
+        );
+        local_proof.index
+    } else {
+        local_proof.index | (top_proof.index << local_depth)
+    };
+
+    let mut siblings = Vec::with_capacity(local_proof.siblings.len() + top_proof.siblings.len());
+    siblings.extend_from_slice(&local_proof.siblings);
+    siblings.extend_from_slice(&top_proof.siblings);
+    let combined = TagTreeMerkleProof {
+        root: checkpoint_rewards_root,
+        leaf: local_proof.leaf.clone(),
+        index: combined_index,
+        siblings,
+    };
+    anyhow::ensure!(
+        combined.verify::<N::HasherBase>(),
+        "Combined rewards proof does not verify against checkpoint gutas rewards root"
+    );
+    Ok(combined)
 }
 
 /// Pure validation for a forwarded EndCap header against the local Realm
@@ -2157,7 +2241,7 @@ pub(crate) mod tests {
     };
     use parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3;
     use parth_core::{
-        crypto::hash::tag_tree::{TagTreeMerkleProof, TagTreeNodePreimage, TagTreeProofNode},
+        crypto::hash::{tag_tree::{TagTreeMerkleProof, TagTreeNodePreimage, TagTreeProofNode, hash_tag_tree_node}, traits::MerkleHasher},
         data::queue::queue_key::PCoreQueueItemBase,
         felt::{FromPrimitiveValuesFelt, ZeroableFelt},
         pgoldilocks::PoseidonHasher,
@@ -2175,11 +2259,11 @@ pub(crate) mod tests {
             SubmitUserEndCapNonProofCoreInput,
         },
         queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
-        v1::qdata::user_end_cap_result::PUPSEndCapResultCompact,
+        v1::qdata::{checkpoint::PQEDCheckpointLeafStats, user_end_cap_result::PUPSEndCapResultCompact},
     };
     use psy_node_core::{
         psy_core_db::traits::full::{
-            PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointTreeDatabaseReader,
+            PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointRealmSpecificDatabaseReader, PsyNodeCheckpointTreeDatabaseReader,
             PsyNodeCoreDatabaseBasicContractInfoStoreWriter, PsyNodeCoreDatabaseUserStoreWriter,
         },
         psy_temp_db::{
@@ -2856,61 +2940,285 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    fn zero_leaf() -> TagTreeNodePreimage<PHash> {
+        TagTreeNodePreimage {
+            left: PHash::get_zero_value(),
+            right: PHash::get_zero_value(),
+            tag: PHash::get_zero_value(),
+        }
+    }
+
+    fn node_value(left: PHash, right: PHash, tag: PHash) -> PHash {
+        hash_tag_tree_node::<PHash, PoseidonHasher>(&left, &right, &tag)
+    }
+
+    /// Upper spine whose leaf is the opaque zero preimage. `verify` on this proof
+    /// alone fails because hashing that leaf does not reproduce `local_root`.
+    /// Concatenating it above a real local proof does verify.
+    fn opaque_zero_top(local_root: PHash, index: u64) -> TagTreeMerkleProof<PHash> {
+        let sibling = TagTreeProofNode { sibling: zh(54), parent_tag: zh(55) };
+        let step = if index & 1 == 0 {
+            PoseidonHasher::two_to_one(&local_root, &sibling.sibling)
+        } else {
+            PoseidonHasher::two_to_one(&sibling.sibling, &local_root)
+        };
+        TagTreeMerkleProof {
+            root: PoseidonHasher::two_to_one(&step, &sibling.parent_tag),
+            leaf: zero_leaf(),
+            index,
+            siblings: vec![sibling],
+        }
+    }
+
+    fn reward_job(key: SimpleMerkleNodeKey) -> Vec<QProvingJobDataIDWithRewardPath<QProvingJobDataID>> {
+        vec![QProvingJobDataIDWithRewardPath::new(
+            QProvingJobDataID::qp_rand_gen(),
+            key.to_reward_path_info(),
+        )]
+    }
+
+    /// Store one real root node: both children are the zero value, and the stored
+    /// value is `hash(zero, zero, tag)`, which is what the proof leaf hashes to.
+    async fn seed_local_root(env: &StandardEnv, pending_id: u64, tag: PHash) -> anyhow::Result<PHash> {
+        let value = node_value(PHash::get_zero_value(), PHash::get_zero_value(), tag);
+        env.db
+            .rewards_tag_tree_set_node_tag(pending_id, SimpleMerkleNodeKey::new_root(), tag, value)
+            .await?;
+        Ok(value)
+    }
+
+    /// Store a real left child and the parent that hashes that child with a zero
+    /// right sibling. The child's proof then has one authentic sibling.
+    async fn seed_local_child(env: &StandardEnv, pending_id: u64) -> anyhow::Result<SimpleMerkleNodeKey> {
+        let child = SimpleMerkleNodeKey::new(1, 0);
+        let child_tag = zh(40);
+        let child_value = node_value(PHash::get_zero_value(), PHash::get_zero_value(), child_tag);
+        let parent_tag = zh(42);
+        let parent_value = node_value(child_value, PHash::get_zero_value(), parent_tag);
+        env.db.rewards_tag_tree_set_node_tag(pending_id, child, child_tag, child_value).await?;
+        env.db
+            .rewards_tag_tree_set_node_tag(pending_id, SimpleMerkleNodeKey::new_root(), parent_tag, parent_value)
+            .await?;
+        Ok(child)
+    }
+
+    async fn seed_checkpoint_gutas_root(env: &StandardEnv, pending_id: u64, checkpoint_id: u64, gutas_root: PHash) -> anyhow::Result<()> {
+        env.db
+            .set_unique_pending_id_checkpoint_id_mapping(pending_id, checkpoint_id)
+            .await?;
+        let mut leaf = PQEDCheckpointLeaf {
+            global_chain_root: PHash::get_zero_value(),
+            stats: PQEDCheckpointLeafStats::get_empty_stats(),
+        };
+        leaf.stats.pm_rewards_commitment.register_users_root = zh(70);
+        leaf.stats.pm_rewards_commitment.deploy_contracts_root = zh(71);
+        leaf.stats.pm_rewards_commitment.gutas_root = gutas_root;
+        env.db.set_checkpoint_leaf_data(checkpoint_id, &leaf).await
+    }
+
+    async fn load_local(env: &StandardEnv, pending_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<TagTreeMerkleProof<PHash>> {
+        let mut proofs = env
+            .db
+            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(pending_id, &[key])
+            .await?;
+        proofs.pop().ok_or_else(|| anyhow::anyhow!("missing local rewards proof"))
+    }
+
     #[tokio::test]
-    async fn batch_reward_proofs_merge_top_proof_root() -> anyhow::Result<()> {
+    async fn batch_reward_proofs_compose_opaque_top_to_gutas_root() -> anyhow::Result<()> {
         let env = RealmEdgeTestEnv::<N>::create(Arc::new(TestZKVerifier {})).await?;
         let handler = &env.handler;
-
-        // the coordinator-level top proof must exist for the pending id
-        let err = handler
-            .generate_batch_proof_miner_reward_proofs_internal(0, vec![])
-            .await
-            .expect_err("missing top proof must fail");
-        assert!(err.to_string().contains("Rewards tree proof not found"), "unexpected error: {err}");
-
-        // seed one rewards tag tree node and a non-trivial top proof
+        let pending_id = 64u64;
+        let checkpoint_id = 32u64;
         let root_key = SimpleMerkleNodeKey::new_root();
-        env.db.rewards_tag_tree_set_node_tag(0, root_key, zh(40), zh(41)).await?;
-        let top_proof = TagTreeMerkleProof {
-            root: zh(50),
-            leaf: TagTreeNodePreimage {
-                left: zh(51),
-                right: zh(52),
-                tag: zh(53),
-            },
-            index: 1,
-            siblings: vec![TagTreeProofNode { sibling: zh(54), parent_tag: zh(55) }],
-        };
-        env.db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(0, &top_proof).await?;
+        let root_tag = zh(40);
 
-        // capture the realm-local proof before the merge
-        let local = env
-            .db
-            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(0, &[root_key])
+        let err = handler
+            .generate_batch_proof_miner_reward_proofs_internal(pending_id, vec![])
+            .await
+            .expect_err("unmapped pending id must fail");
+        assert!(
+            err.to_string().contains("no checkpoint id found for unique pending id"),
+            "unexpected error: {err}"
+        );
+
+        let stored_root = seed_local_root(&env, pending_id, root_tag).await?;
+        let local_before = load_local(&env, pending_id, root_key).await?;
+        assert_eq!(local_before.leaf.tag, root_tag);
+        assert_eq!(local_before.leaf.get_node_hash::<PoseidonHasher>(), stored_root);
+        assert_eq!(local_before.root, stored_root);
+        assert!(local_before.verify::<PoseidonHasher>(), "seeded local proof must verify");
+
+        let top_proof = opaque_zero_top(local_before.root, 1);
+        assert!(
+            !top_proof.verify::<PoseidonHasher>(),
+            "opaque zero top leaf must not verify on its own"
+        );
+        let top_before = top_proof.clone();
+        env.db
+            .set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(pending_id, &top_proof)
             .await?;
-        assert_eq!(local.len(), 1);
+        seed_checkpoint_gutas_root(&env, pending_id, checkpoint_id, top_proof.root).await?;
 
-        // empty request: no proofs
-        let empty = handler.generate_batch_proof_miner_reward_proofs_internal(0, vec![]).await?;
-        assert!(empty.is_empty());
+        let stored_leaf = env.db.get_checkpoint_leaf_data(checkpoint_id).await?;
+        assert_ne!(
+            stored_leaf.stats.pm_rewards_commitment.gutas_root,
+            stored_leaf.stats.pm_rewards_commitment.register_users_root
+        );
 
-        let job_ids = vec![QProvingJobDataIDWithRewardPath::new(
-            QProvingJobDataID::qp_rand_gen(),
-            root_key.to_reward_path_info(),
-        )];
-        let proofs = handler.generate_batch_proof_miner_reward_proofs_internal(0, job_ids).await?;
+        let proofs = handler
+            .generate_batch_proof_miner_reward_proofs_internal(pending_id, reward_job(root_key))
+            .await?;
         assert_eq!(proofs.len(), 1);
-        // the merged proof is re-rooted at the top proof with the merged index
-        assert_eq!(proofs[0].tag_tree_proof.root, top_proof.root);
-        assert_eq!(
-            proofs[0].tag_tree_proof.index,
-            local[0].index | (top_proof.index << local[0].siblings.len())
+        let combined = &proofs[0].tag_tree_proof;
+        assert_eq!(combined.leaf, local_before.leaf);
+        assert_eq!(combined.root, stored_leaf.stats.pm_rewards_commitment.gutas_root);
+        assert_ne!(combined.root, stored_leaf.stats.pm_rewards_commitment.register_users_root);
+        assert_eq!(combined.index, local_before.index | (top_before.index << local_before.siblings.len()));
+        assert_eq!(combined.siblings.len(), local_before.siblings.len() + top_before.siblings.len());
+        assert!(combined.verify::<PoseidonHasher>(), "combined proof must verify");
+
+        let local_after = load_local(&env, pending_id, root_key).await?;
+        let top_after = env
+            .db
+            .get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(pending_id)
+            .await?;
+        assert_eq!(local_after, local_before);
+        assert_eq!(top_after, top_before);
+        assert_eq!(top_after.leaf, zero_leaf());
+
+        // wrong checkpoint gutas root
+        seed_checkpoint_gutas_root(&env, pending_id, checkpoint_id, zh(90)).await?;
+        let err = handler
+            .generate_batch_proof_miner_reward_proofs_internal(pending_id, reward_job(root_key))
+            .await
+            .expect_err("wrong checkpoint gutas root must fail");
+        assert!(err.to_string().contains("gutas rewards root"), "unexpected error: {err}");
+        seed_checkpoint_gutas_root(&env, pending_id, checkpoint_id, top_before.root).await?;
+
+        // wrong local value: stored value is not hash(left, right, tag)
+        let bad_value_pending = 65u64;
+        seed_local_root(&env, bad_value_pending, root_tag).await?;
+        env.db
+            .rewards_tag_tree_set_node_tag(bad_value_pending, root_key, root_tag, zh(99))
+            .await?;
+        let bad_value = load_local(&env, bad_value_pending, root_key).await?;
+        assert!(!bad_value.verify::<PoseidonHasher>(), "mismatched stored value must not verify");
+        let err = compose_realm_reward_proof::<N>(&bad_value, &top_before, top_before.root)
+            .expect_err("wrong local value must fail");
+        assert!(err.to_string().contains("local proof does not verify"), "unexpected error: {err}");
+
+        // wrong local tag, with the value recomputed so the local proof still
+        // verifies but no longer matches the opaque upper spine
+        let bad_tag_pending = 66u64;
+        let bad_tag = zh(98);
+        let bad_tag_root = seed_local_root(&env, bad_tag_pending, bad_tag).await?;
+        let bad_tag_local = load_local(&env, bad_tag_pending, root_key).await?;
+        assert!(bad_tag_local.verify::<PoseidonHasher>());
+        assert_ne!(bad_tag_root, local_before.root);
+        let err = compose_realm_reward_proof::<N>(&bad_tag_local, &top_before, top_before.root)
+            .expect_err("wrong local tag must fail");
+        assert!(
+            err.to_string().contains("does not verify against checkpoint gutas rewards root"),
+            "unexpected error: {err}"
         );
-        assert_eq!(
-            proofs[0].tag_tree_proof.siblings.len(),
-            local[0].siblings.len() + top_proof.siblings.len()
+
+        // wrong local sibling: the parent records a sibling other than the real
+        // zero right child, so the child proof verifies locally and then fails
+        // when concatenated under the spine built from the honest parent.
+        let bad_sibling_pending = 67u64;
+        let child = seed_local_child(&env, bad_sibling_pending).await?;
+        let honest_child = load_local(&env, bad_sibling_pending, child).await?;
+        assert_eq!(honest_child.siblings.len(), 1);
+        assert!(honest_child.verify::<PoseidonHasher>(), "honest child proof must verify");
+        let honest_top = opaque_zero_top(honest_child.root, 0);
+        let mut bad_child = honest_child.clone();
+        bad_child.siblings[0].sibling = zh(97);
+        bad_child.root = TagTreeMerkleProof::new_from_params::<PoseidonHasher>(
+            bad_child.index,
+            bad_child.leaf.clone(),
+            bad_child.siblings.clone(),
+        )
+        .root;
+        assert!(bad_child.verify::<PoseidonHasher>(), "tampered sibling proof is locally valid");
+        let err = compose_realm_reward_proof::<N>(&bad_child, &honest_top, honest_top.root)
+            .expect_err("wrong local sibling must fail");
+        assert!(
+            err.to_string().contains("does not verify against checkpoint gutas rewards root"),
+            "unexpected error: {err}"
         );
+
+        // index that does not fit the one-sibling local depth
+        let mut bad_index = honest_child.clone();
+        bad_index.index = 2;
+        let err = compose_realm_reward_proof::<N>(&bad_index, &honest_top, honest_top.root)
+            .expect_err("local index above its depth must fail");
+        assert!(err.to_string().contains("does not fit in depth"), "unexpected error: {err}");
+
+        // upper sibling that does not continue the local root
+        let mut bad_upper = top_before.clone();
+        bad_upper.siblings[0].sibling = zh(96);
+        let err = compose_realm_reward_proof::<N>(&local_before, &bad_upper, bad_upper.root)
+            .expect_err("wrong upper sibling must fail");
+        assert!(
+            err.to_string().contains("does not verify against checkpoint gutas rewards root"),
+            "unexpected error: {err}"
+        );
+
+        // depth 64 local proof plus an empty upper proof must not shift by 64
+        let deep_siblings = vec![TagTreeProofNode { sibling: zh(3), parent_tag: zh(4) }; 64];
+        let deep_local = TagTreeMerkleProof::new_from_params::<PoseidonHasher>(u64::MAX, local_before.leaf.clone(), deep_siblings);
+        assert!(deep_local.verify::<PoseidonHasher>());
+        let empty_top = TagTreeMerkleProof {
+            root: deep_local.root,
+            leaf: zero_leaf(),
+            index: 0,
+            siblings: vec![],
+        };
+        let deep_combined = compose_realm_reward_proof::<N>(&deep_local, &empty_top, deep_local.root)?;
+        assert_eq!(deep_combined.index, u64::MAX);
+        assert_eq!(deep_combined.siblings.len(), 64);
+        assert!(deep_combined.verify::<PoseidonHasher>());
+
+        let shifted_top = TagTreeMerkleProof {
+            root: deep_local.root,
+            leaf: zero_leaf(),
+            index: 1,
+            siblings: vec![],
+        };
+        let err = compose_realm_reward_proof::<N>(&deep_local, &shifted_top, deep_local.root)
+            .expect_err("non-empty index above depth 64 must fail");
+        assert!(err.to_string().contains("depth 0 proof has non-zero index"), "unexpected error: {err}");
+
+        // 64 local siblings plus one upper sibling fails the total-depth guard.
+        let one_upper = TagTreeProofNode { sibling: zh(3), parent_tag: zh(4) };
+        let upper_step = PoseidonHasher::two_to_one(&deep_local.root, &one_upper.sibling);
+        let one_top = TagTreeMerkleProof {
+            root: PoseidonHasher::two_to_one(&upper_step, &one_upper.parent_tag),
+            leaf: zero_leaf(),
+            index: 0,
+            siblings: vec![one_upper],
+        };
+        let err = compose_realm_reward_proof::<N>(&deep_local, &one_top, one_top.root)
+            .expect_err("depth 64 plus one upper sibling must fail");
+        assert!(
+            err.to_string().contains("combined rewards proof depth 65 exceeds 64"),
+            "unexpected error: {err}"
+        );
+
+        let err = compose_realm_reward_proof::<N>(&local_before, &too_deep_top(), local_before.root)
+            .expect_err("upper depth above 64 must fail");
+        assert!(err.to_string().contains("exceeds 64"), "unexpected error: {err}");
         Ok(())
+    }
+
+    fn too_deep_top() -> TagTreeMerkleProof<PHash> {
+        TagTreeMerkleProof {
+            root: PHash::get_zero_value(),
+            leaf: zero_leaf(),
+            index: 0,
+            siblings: vec![TagTreeProofNode { sibling: zh(3), parent_tag: zh(4) }; 65],
+        }
     }
 
     #[tokio::test]

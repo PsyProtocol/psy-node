@@ -143,25 +143,47 @@ Claim rewards with the wallet source used by the worker:
 psy_user_cli claim-rewards \
   --rpc-config ./config.json \
   --keystore-path .wallets/miner0.json \
-  --jobs-file worker.backup
+  --recipient 0xYOUR_REWARD_RECIPIENT \
+  --user-id YOUR_USER_ID \
+  --proof-cache-dir ./reward-proof-cache \
+  --jobs-file worker.backup \
+  --l1-rpc-url http://127.0.0.1:8545 \
+  --l1-private-key "$L1_PRIVATE_KEY" \
+  --prove-proxy-url http://127.0.0.1:9001
 ```
 
-Or use a private key:
+Or use a ZK wallet private key instead of a keystore:
 
 ```bash
 psy_user_cli claim-rewards \
   --rpc-config ./config.json \
-  --private-key YOUR_PRIVATE_KEY \
-  --jobs-file worker.backup
+  --private-key YOUR_ZK_PRIVATE_KEY \
+  --recipient 0xYOUR_REWARD_RECIPIENT \
+  --user-id YOUR_USER_ID \
+  --proof-cache-dir ./reward-proof-cache \
+  --jobs-file worker.backup \
+  --l1-rpc-url http://127.0.0.1:8545 \
+  --l1-private-key "$L1_PRIVATE_KEY" \
+  --prove-proxy-url http://127.0.0.1:9001
 ```
 
 | Parameter | Meaning |
 |---|---|
-| `--rpc-config` | Network configuration path; defaults to `config.json` |
-| `--keystore-path` or `--private-key` | Wallet source matching the worker identity |
+| `--rpc-config` | Existing network RPC configuration; defaults to `config.json`. It supplies the reward token and the circuits. There is no second setup file. |
+| `--keystore-path` or `--private-key` | ZK wallet source matching the worker identity |
 | `--jobs-file` | Completed-job backup written by `--completed-jobs-log-file` |
+| `--recipient` | Ethereum address receiving the payout |
+| `--user-id` | L2 user id owning the selected reward jobs |
+| `--proof-cache-dir` | Disposable aggregate cache; defaults to `reward-proof-cache`, separate from originals |
+| `--services-url` | Optional services transport; not an eligibility or payout requirement |
+| `--l1-rpc-url` | Ethereum JSON-RPC endpoint for recognized-root reads, `claimed` queries, and the mint transaction |
+| `--l1-private-key` | EVM key signing the L1 `claimReward` transaction; distinct from the ZK wallet |
+| `--prove-proxy-url` | Prove-proxy JSON-RPC URL producing the Groth16 reward claim proof |
+| `--prove-proxy-token` | Optional prove-proxy bearer token |
 
-The claim inputs are defined in `client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:536-544`.
+The command loads `RewardClient` from `--rpc-config` only. It groups the original selection by checkpoint, reads a finite L1 snapshot, and mints eligible unclaimed checkpoints through `claimReward` on the configured reward token. More than 64 eligible checkpoints use the same artifact in successive transactions; each transaction carries its complete ID list and proved total. It verifies the receipt, the token `RewardClaimed` event, the mint `Transfer`, and each exact `claimed` pair before preaggregating remaining available jobs. Confirm rediscovers the token and `STATE_MANAGER` from the provider at the receipt block. There is no wait-for-finalization barrier, payer cursor, or 32-checkpoint direct-claim cap. Services admission is not required.
+
+Keep the original worker backup: proof-cache deletion rebuilds from those selections and available historical source/path material. A cache holds schema, network magic, the source fingerprints, common digests, verifier digests, the proof, and the exact selection. It holds neither an external config hash, a circuit-set hash, paid flags, nor private keys. A paid checkpoint cannot accept omitted jobs later; select all desired jobs for that checkpoint before claiming. Unknown checkpoint mappings fail closed rather than silently paying a smaller selection; independently identified unavailable later sources remain pending without blocking ready payouts. A receipt failure or timeout does not start remaining-job proving or report payment success.
 
 ## 6. Performance and Security
 

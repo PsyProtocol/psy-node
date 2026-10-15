@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -10,14 +10,14 @@ use parth_core::{
     crypto::hash::{
         merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore, MerkleProofCore},
         tag_tree::{hash_tag_tree_node_four, hash_tag_tree_node_single},
-        traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable},
+        traits::{FieldQHasher as ParthFieldQHasher, MerkleZeroHasher, QFieldHashable as ParthQFieldHashable},
     },
     pgoldilocks::QHashOut,
     protocol::core_types::QNetworkTreeConstants,
 };
 use plonky2::{
-    field::{goldilocks_field::GoldilocksField, types::Field},
-    hash::poseidon::PoseidonHash,
+    field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}},
+    hash::{hash_types::HashOut, poseidon::PoseidonHash},
     plonk::config::{Hasher, PoseidonGoldilocksConfig},
 };
 use psy_core::{
@@ -43,13 +43,26 @@ use psy_data::{
         user::PQEDUserLeaf,
     },
 };
+use psy_client_common::data::qhashout::QHashOut as ClientQHashOut;
+use psy_client_data::qdata::checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheckpointLeaf};
+use psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureCircuit;
+use psy_crypto::{common::user_id::get_registration_id_from_user_id, hash::traits::qhashable::QFieldHashable};
 use psy_plonky2_circuits::{
     bridge::{
         circuits::{
             bridge_agg_final::BridgeAggFinalCircuit,
-            bridge_wrap::{BridgeWrapCircuit, DepositBatchWrapCircuit, WithdrawalClaimWrapCircuit},
+            bridge_wrap::{BridgeWrapCircuit, DepositBatchWrapCircuit, SharedGroth16Wrapper, WithdrawalClaimWrapCircuit},
+            reward_claim_wrap::{RewardClaimWrapCircuit, RewardClaimWrapWitness, REWARD_CLAIM_PUBLIC_INPUT_BITS},
+            user_reward_checkpoint_aggregate::{UserRewardCheckpointAggregateCircuit, UserRewardCheckpointAggregateWitness},
+            user_reward_tree::{
+                UserRewardAggregateCircuit, UserRewardAggregateWitness, UserRewardJobWitness, UserRewardLeafCircuit, UserRewardLeafWitness,
+                UserRewardRootCircuit, UserRewardRootProof, UserRewardRootWitness, UserRewardTagWitness,
+            },
         },
-        gadgets::tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
+        gadgets::{
+            reward_nullifier::{nullifier_job_index, REWARD_NULLIFIER_HEIGHT},
+            tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
+        },
     },
     proof_minifier::pm_chain::QEDProofMinifierChain,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
@@ -80,21 +93,31 @@ const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
 const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
     psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const GROTH16_FILES: [&str; 3] = ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"];
+const REWARD_CLAIM_DIR: &str = "reward_claim";
+const REWARD_USER_ID: u32 = 7;
+const REWARD_SOURCE_CHECKPOINT_ID: u32 = 10;
+const REWARD_ANCHOR_CHECKPOINT_ID: u32 = 12;
+const REWARD_JOB_HEIGHT: u8 = 6;
+const REWARD_PRIVATE_KEY: [u64; 4] = [17, 23, 31, 47];
+const REWARD_RECIPIENT: [u32; 8] = [1, 2, 3, 4, 5, 0, 0, 0];
 
 #[derive(Debug, Clone, Args)]
 pub struct RegenerateGroth16KeystoreArgs {
     /// Keystore root directory. Defaults to ~/.psy/keystore.
     #[arg(long)]
     pub keystore_dir: Option<PathBuf>,
-    /// Also regenerate the bridge aggregation wrapper keystore.
-    #[arg(long, default_value_t = false)]
-    pub include_bridge_agg: bool,
     /// Do not regenerate deposit_append.
     #[arg(long, default_value_t = false)]
     pub skip_deposit_append: bool,
     /// Do not regenerate withdrawal_claim.
     #[arg(long, default_value_t = false)]
     pub skip_withdrawal_claim: bool,
+    /// Do not regenerate bridge_agg.
+    #[arg(long, default_value_t = false)]
+    pub skip_bridge_agg: bool,
+    /// Do not regenerate reward_claim.
+    #[arg(long, default_value_t = false)]
+    pub skip_reward_claim: bool,
 }
 
 pub fn run(args: RegenerateGroth16KeystoreArgs) -> anyhow::Result<()> {
@@ -108,8 +131,11 @@ pub fn run(args: RegenerateGroth16KeystoreArgs) -> anyhow::Result<()> {
     if !args.skip_withdrawal_claim {
         regenerate_withdrawal_claim(&keystore_dir)?;
     }
-    if args.include_bridge_agg {
+    if !args.skip_bridge_agg {
         regenerate_bridge_agg(&keystore_dir)?;
+    }
+    if !args.skip_reward_claim {
+        regenerate_reward_claim(&keystore_dir)?;
     }
 
     println!("regenerated local Groth16 keystore files under {}", keystore_dir.display());
@@ -557,6 +583,176 @@ fn regenerate_withdrawal_claim(keystore_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn regenerate_reward_claim(keystore_dir: &Path) -> anyhow::Result<()> {
+    let out_dir = keystore_dir.join(REWARD_CLAIM_DIR);
+    clear_groth16_files(&out_dir)?;
+
+    println!("building reward claim circuits...");
+    let leaf = UserRewardLeafCircuit::new();
+    let job_aggregate = UserRewardAggregateCircuit::new(&leaf);
+    let root = UserRewardRootCircuit::new(&job_aggregate);
+    let checkpoint_aggregate = UserRewardCheckpointAggregateCircuit::new(&root);
+    let generated = generated_reward_checkpoints()?;
+    let root_proof = prove_keyless_reward_root(&leaf, &job_aggregate, &root, &generated)?;
+    let checkpoint_proof = checkpoint_aggregate
+        .prove(&UserRewardCheckpointAggregateWitness::Root { root: root_proof.clone() })
+        .context("failed to prove reward checkpoint aggregate")?;
+    checkpoint_aggregate.circuit_data.verify(checkpoint_proof.clone())
+        .context("reward checkpoint aggregate proof failed verification")?;
+    let witness = reward_claim_wrap_witness(&root_proof, &generated)?;
+    let wrap = RewardClaimWrapCircuit::new(
+        &checkpoint_aggregate.circuit_data.common,
+        checkpoint_aggregate.fingerprint,
+        checkpoint_aggregate.circuit_data.verifier_only.constants_sigmas_cap.height(),
+    );
+    let wrapper_proof = wrap.prove(&checkpoint_aggregate.circuit_data.verifier_only, &checkpoint_proof, &witness)
+        .context("failed to prove local reward claim wrapper")?;
+    anyhow::ensure!(wrapper_proof.public_inputs.len() == REWARD_CLAIM_PUBLIC_INPUT_BITS, "reward wrapper public input width drifted");
+    wrap.circuit_data.verify(wrapper_proof.clone()).context("local reward wrapper proof failed verification")?;
+    println!(
+        "reward_claim aggregate fingerprint: {:?}, wrapper public inputs: {}, keystore: {}",
+        checkpoint_aggregate.fingerprint, wrapper_proof.public_inputs.len(), out_dir.display()
+    );
+    let shared_circuit = RewardClaimWrapCircuit::new(
+        &checkpoint_aggregate.circuit_data.common,
+        checkpoint_aggregate.fingerprint,
+        checkpoint_aggregate.circuit_data.verifier_only.constants_sigmas_cap.height(),
+    );
+    let shared_wrapper = SharedGroth16Wrapper::new(shared_circuit.circuit_data, format!("{}/", out_dir.display()));
+    println!("generating reward_claim Groth16 setup/proof...");
+    shared_wrapper.prove_groth16(&wrapper_proof, None).context("failed to generate reward_claim Groth16 setup/proof")?;
+    require_groth16_files(&out_dir)?;
+    println!("updated {}", out_dir.display());
+    Ok(())
+}
+
+struct GeneratedRewardCheckpoints {
+    source_leaf: PsyCheckpointLeaf<F>,
+    anchor_leaf: PsyCheckpointLeaf<F>,
+    global_roots: PsyCheckpointGlobalStateRoots<F>,
+    checkpoint_tree_root: HashOut<F>,
+    checkpoint_siblings: [HashOut<F>; 32],
+    anchor_siblings: [HashOut<F>; 32],
+    registration_leaf: HashOut<F>,
+    registration_index: u64,
+    registration_siblings: [HashOut<F>; psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize],
+    private_key: HashOut<F>,
+}
+
+fn generated_reward_checkpoints() -> anyhow::Result<GeneratedRewardCheckpoints> {
+    let private_key = HashOut { elements: REWARD_PRIVATE_KEY.map(F::from_canonical_u64) };
+    let (registration_leaf, registration_index, registration_siblings, registration_root) = registration_membership(REWARD_USER_ID, private_key);
+    let mut global_roots = PsyCheckpointGlobalStateRoots::default();
+    global_roots.user_registration_tree_root = ClientQHashOut(registration_root);
+    let mut source_leaf = PsyCheckpointLeaf::default();
+    source_leaf.stats.pm_rewards_commitment.gutas_root = ClientQHashOut::from(reward_job_root(REWARD_USER_ID).0);
+    source_leaf.stats.pm_jobs_completed.gutas_completed = F::from_canonical_u32(64);
+    source_leaf.stats.guta_fees_collected = F::from_canonical_u32(640);
+    let mut anchor_leaf = PsyCheckpointLeaf::default();
+    anchor_leaf.global_chain_root = global_roots.qfhash::<PoseidonHash>();
+    let mut checkpoints = BTreeMap::new();
+    checkpoints.insert(u64::from(REWARD_SOURCE_CHECKPOINT_ID), source_leaf.qfhash::<PoseidonHash>().0);
+    checkpoints.insert(u64::from(REWARD_ANCHOR_CHECKPOINT_ID), anchor_leaf.qfhash::<PoseidonHash>().0);
+    let (checkpoint_siblings, checkpoint_tree_root) = merkle_path::<32>(&checkpoints, u64::from(REWARD_SOURCE_CHECKPOINT_ID));
+    let (anchor_siblings, anchor_root) = merkle_path::<32>(&checkpoints, u64::from(REWARD_ANCHOR_CHECKPOINT_ID));
+    anyhow::ensure!(anchor_root == checkpoint_tree_root, "reward source and anchor roots differ");
+    Ok(GeneratedRewardCheckpoints { source_leaf, anchor_leaf, global_roots, checkpoint_tree_root, checkpoint_siblings, anchor_siblings, registration_leaf, registration_index, registration_siblings, private_key })
+}
+
+fn reward_claim_wrap_witness(root_proof: &UserRewardRootProof, generated: &GeneratedRewardCheckpoints) -> anyhow::Result<RewardClaimWrapWitness> {
+    let root_root = HashOut { elements: root_proof.public_inputs[19..23].try_into().map_err(|_| anyhow::anyhow!("reward root statement has no checkpoint root"))? };
+    anyhow::ensure!(root_root == generated.checkpoint_tree_root, "reward root proof is not bound to the generated checkpoint tree");
+    Ok(RewardClaimWrapWitness {
+        token: address_bytes(0x22), state_manager: address_bytes(0x11), anchor_checkpoint_id: REWARD_ANCHOR_CHECKPOINT_ID,
+        anchor_leaf: generated.anchor_leaf.clone(), anchor_siblings: generated.anchor_siblings, global_roots: generated.global_roots,
+        registration_leaf: generated.registration_leaf, registration_index: generated.registration_index,
+        registration_siblings: generated.registration_siblings, private_key: generated.private_key,
+    })
+}
+
+fn address_bytes(byte: u8) -> [u8; 20] { [byte; 20] }
+
+fn prove_keyless_reward_root(
+    leaf: &UserRewardLeafCircuit, job_aggregate: &UserRewardAggregateCircuit, root: &UserRewardRootCircuit, generated: &GeneratedRewardCheckpoints,
+) -> anyhow::Result<UserRewardRootProof> {
+    let leaf_proof = leaf.prove(&reward_leaf_witness(REWARD_USER_ID, REWARD_SOURCE_CHECKPOINT_ID, &generated.source_leaf)).context("failed to prove reward leaf")?;
+    leaf.circuit_data.verify(leaf_proof.clone()).context("reward leaf proof failed verification")?;
+    let job_proof = job_aggregate.prove(&UserRewardAggregateWitness::Leaf { leaf: leaf_proof }).context("failed to prove reward job aggregate")?;
+    job_aggregate.circuit_data.verify(job_proof.clone()).context("reward job aggregate proof failed verification")?;
+    let root_proof = root.prove(&UserRewardRootWitness {
+        recipient: REWARD_RECIPIENT, checkpoint_tree_root: generated.checkpoint_tree_root, checkpoint_leaf: generated.source_leaf.clone(),
+        checkpoint_siblings: generated.checkpoint_siblings, aggregate_proof: job_proof,
+    }).context("failed to prove keyless reward root")?;
+    root.circuit_data.verify(root_proof.clone()).context("reward root proof failed verification")?;
+    Ok(root_proof)
+}
+
+fn reward_leaf_witness(user_id: u32, source_checkpoint_id: u32, checkpoint_leaf: &PsyCheckpointLeaf<F>) -> UserRewardLeafWitness {
+    let path_index = 0;
+    let coordinate = u64::from(nullifier_job_index(REWARD_JOB_HEIGHT, path_index).expect("reward generation coordinate"));
+    let (nullifier_siblings, old_nullifier_root) = merkle_path::<REWARD_NULLIFIER_HEIGHT>(&BTreeMap::new(), coordinate);
+    UserRewardLeafWitness {
+        user_id, old_nullifier_root,
+        job: UserRewardJobWitness { source_checkpoint_id, height: REWARD_JOB_HEIGHT, path_index, tag: reward_job_tag(user_id, path_index) },
+        checkpoint_leaf: checkpoint_leaf.clone(), nullifier_siblings,
+    }
+}
+
+fn reward_job_root(user_id: u32) -> QHashOut<F> {
+    let preimage = QHashOut::from_values(u64::from(user_id), 0, 4, 8);
+    let owner = PoseidonHash::two_to_one(preimage.0, preimage.0);
+    let mut level = (0..64u64).map(|index| tagged_node(QHashOut::from_values(index, 0, 0, 0).0, HashOut::ZERO, owner)).collect::<Vec<_>>();
+    for _ in 0..6 { level = level.chunks_exact(2).map(|pair| tagged_node(pair[0], pair[1], HashOut::ZERO)).collect(); }
+    QHashOut(level[0])
+}
+
+fn reward_job_tag(user_id: u32, path_index: u32) -> UserRewardTagWitness {
+    let preimage = QHashOut::from_values(u64::from(user_id), 0, 4, 8);
+    let owner = PoseidonHash::two_to_one(preimage.0, preimage.0);
+    let mut levels = vec![(0..64u64).map(|index| tagged_node(QHashOut::from_values(index, 0, 0, 0).0, HashOut::ZERO, owner)).collect::<Vec<_>>()];
+    for level in 0..6 { levels.push(levels[level].chunks_exact(2).map(|pair| tagged_node(pair[0], pair[1], HashOut::ZERO)).collect()); }
+    UserRewardTagWitness {
+        tag_preimage: preimage, leaf_left: QHashOut::from_values(u64::from(path_index), 0, 0, 0), leaf_right: QHashOut::ZERO, leaf_tag: QHashOut(owner),
+        siblings: std::array::from_fn(|level| if level < 6 { QHashOut(levels[level][usize::try_from(path_index).expect("reward path") >> level ^ 1]) } else { QHashOut::ZERO }),
+        parent_tags: [QHashOut::ZERO; 21],
+    }
+}
+
+fn tagged_node(left: HashOut<F>, right: HashOut<F>, tag: HashOut<F>) -> HashOut<F> {
+    PoseidonHash::two_to_one(PoseidonHash::two_to_one(left, right), tag)
+}
+
+fn registration_membership(
+    user_id: u32, private_key: HashOut<F>,
+) -> (HashOut<F>, u64, [HashOut<F>; psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize], HashOut<F>) {
+    let public_key_param = psy_ups_circuit::signature::software_defined::get_sdc_public_key_param(&ClientQHashOut(private_key));
+    let fingerprint = PsyBasicZKSignatureCircuit::<C, D>::new().fingerprint.0;
+    let registration_leaf = PoseidonHash::two_to_one(fingerprint, public_key_param.0);
+    let registration_index = get_registration_id_from_user_id(u64::from(user_id));
+    let (registration_siblings, registration_root) = merkle_path::<{ psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize }>(
+        &BTreeMap::from([(registration_index, registration_leaf)]), registration_index,
+    );
+    (registration_leaf, registration_index, registration_siblings, registration_root)
+}
+
+fn merkle_path<const HEIGHT: usize>(leaves: &BTreeMap<u64, HashOut<F>>, index: u64) -> ([HashOut<F>; HEIGHT], HashOut<F>) {
+    let mut nodes = leaves.clone();
+    let mut position = index;
+    let mut empty = HashOut::ZERO;
+    let siblings = std::array::from_fn(|_| {
+        let sibling = nodes.get(&(position ^ 1)).copied().unwrap_or(empty);
+        let mut parents = BTreeMap::new();
+        for &child in nodes.keys() {
+            parents.insert(child >> 1, PoseidonHash::two_to_one(nodes.get(&(child & !1)).copied().unwrap_or(empty), nodes.get(&(child | 1)).copied().unwrap_or(empty)));
+        }
+        nodes = parents;
+        empty = PoseidonHash::two_to_one(empty, empty);
+        position >>= 1;
+        sibling
+    });
+    (siblings, nodes.get(&0).copied().unwrap_or(empty))
+}
+
 fn default_keystore_dir() -> PathBuf {
     home::home_dir()
         .expect("HOME is required to resolve default Groth16 keystore path")
@@ -809,4 +1005,48 @@ fn bridge_state_witnesses() -> anyhow::Result<(
         user_tree_proof,
     };
     Ok((deposit, withdrawal, global_roots))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RegenerateGroth16KeystoreArgs;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Selector {
+        #[command(flatten)]
+        args: RegenerateGroth16KeystoreArgs,
+    }
+
+    fn parsed(argv: &[&str]) -> RegenerateGroth16KeystoreArgs {
+        Selector::try_parse_from(std::iter::once("psy_relayer_cli").chain(argv.iter().copied()))
+            .unwrap_or_else(|error| panic!("{error}"))
+            .args
+    }
+
+    #[test]
+    fn no_flags_selects_all_four_cohorts() {
+        let args = parsed(&[]);
+        assert!(!args.skip_deposit_append);
+        assert!(!args.skip_withdrawal_claim);
+        assert!(!args.skip_bridge_agg);
+        assert!(!args.skip_reward_claim);
+        assert!(args.keystore_dir.is_none());
+    }
+
+    #[test]
+    fn skip_flags_select_one_cohort_and_keystore_dir() {
+        let reward_only = parsed(&["--skip-deposit-append", "--skip-withdrawal-claim", "--skip-bridge-agg", "--keystore-dir", "target/reward-keystore"]);
+        assert!(reward_only.skip_deposit_append);
+        assert!(reward_only.skip_withdrawal_claim);
+        assert!(reward_only.skip_bridge_agg);
+        assert!(!reward_only.skip_reward_claim);
+        assert_eq!(reward_only.keystore_dir.unwrap().as_os_str(), "target/reward-keystore");
+
+        let bridge_only = parsed(&["--skip-deposit-append", "--skip-withdrawal-claim", "--skip-reward-claim"]);
+        assert!(bridge_only.skip_deposit_append);
+        assert!(bridge_only.skip_withdrawal_claim);
+        assert!(!bridge_only.skip_bridge_agg);
+        assert!(bridge_only.skip_reward_claim);
+    }
 }

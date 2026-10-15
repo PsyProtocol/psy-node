@@ -50,6 +50,10 @@ psy_serialize = { workspace = true }
 pser = { workspace = true }
 psy_common_circuit = { workspace = true }
 psy_crypto = { workspace = true }
+psy_config = { workspace = true }
+psy_network_circuit = { workspace = true }
+psy_client_data = { workspace = true }
+psy_ups_circuit = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 jsonrpsee = { workspace = true }
@@ -63,3 +67,4 @@ zstd = { workspace = true }
 [dev-dependencies]
 psy_node_core = { workspace = true }
 psy_node_store_memory = { workspace = true }
+psy_client_common = { workspace = true }

@@ -585,7 +585,7 @@ describe("isUsableGenesisData", () => {
 });
 
 describe("public-only Genesis generation", () => {
-    const account = () => ({ contract_id: 6, initial_policy: { version: 1, threshold: 2, member_count: 3, member_hashes: ["01", "02", "03", "00", "00", "00", "00", "00"] } });
+    const account = () => ({ contract_id: 1, initial_policy: { version: 1, threshold: 2, member_count: 3, member_hashes: ["01", "02", "03", "00", "00", "00", "00", "00"] } });
     const artifact = () => ({ state_tree_height: 4, circuit_definitions: [{ name: "get_policy" }, { name: "set_policy" }], abi: { contract: { state_tree_height: 4 } } });
 
     it("forwards public paths as individual argv and strips only child secrets", async () => {
@@ -617,7 +617,7 @@ describe("public-only Genesis generation", () => {
             await expect(planGenesisGeneration(dir, { ...env, PSY_RELAYER_MULTISIG_ACCOUNT: "." })).rejects.toThrow();
             const invalid: unknown[] = [null, {}, { ...account(), contract_id: 5 }, { ...account(), extra: true }];
             for (const change of [{ version: 2 }, { threshold: 1 }, { member_count: 2 }, { member_hashes: ["01", "01", "03", "00", "00", "00", "00", "00"] }, { member_hashes: ["00", "02", "03", "00", "00", "00", "00", "00"] }, { member_hashes: ["01", "02", "03", "01", "00", "00", "00", "00"] }]) invalid.push({ ...account(), initial_policy: { ...account().initial_policy, ...change } });
-            for (const input of invalid.map((value) => JSON.stringify(value)).concat('{"contract_id":6,"contract_id":6,"initial_policy":' + JSON.stringify(account().initial_policy) + '}', "not JSON")) {
+            for (const input of invalid.map((value) => JSON.stringify(value)).concat('{"contract_id":1,"contract_id":1,"initial_policy":' + JSON.stringify(account().initial_policy) + '}', "not JSON")) {
                 await Bun.write(`${dir}/account.json`, input);
                 await expect(planGenesisGeneration(dir, env)).rejects.toThrow();
             }
@@ -1731,6 +1731,35 @@ describe("make shutdown Anvil preservation", () => {
         expect(anvilStateBestBlockNumber(JSON.parse(text), "fixture")).toBe(5n);
         expect(decodeAnvilDumpStateHex(dumpHex(text), "fixture")).toBe(text);
         expect(() => anvilStateBestBlockNumber({ blocks: [{ header: { number: "0x64" } }] }, "fixture")).toThrow("best_block_number");
+    });
+
+    it("decodes a large incompressible mixed-case JSON dump", () => {
+        let state = 0x9e3779b9;
+        const next = () => {
+            state ^= state << 13;
+            state ^= state >>> 17;
+            state ^= state << 5;
+            return state >>> 0;
+        };
+        const alphabet = "0123456789abcdef";
+        let padding = "";
+        while (padding.length < 4 * 1024 * 1024) padding += alphabet[next() & 15];
+        const text = JSON.stringify({ best_block_number: 5, padding });
+        const hex = Buffer.from(Bun.gzipSync(Buffer.from(text))).toString("hex");
+        const mixed = `0x${hex.replace(/[a-f]/g, (digit, index) => index % 2 === 0 ? digit.toUpperCase() : digit)}`;
+        expect(mixed.length).toBeGreaterThan(1024 * 1024);
+        expect(decodeAnvilDumpStateHex(mixed, "fixture")).toBe(text);
+        expect(JSON.parse(decodeAnvilDumpStateHex(mixed, "fixture")).best_block_number).toBe(5);
+    });
+
+    it("rejects malformed hex and non-gzip dumps", () => {
+        const expected = "expected hex-encoded gzip";
+        const valid = dumpHex(stateText(5));
+        for (const dump of ["0x", "abc", `${valid}a`, `${valid}\n`, `${valid}é`, 0, null]) {
+            expect(() => decodeAnvilDumpStateHex(dump, "fixture")).toThrow(expected);
+        }
+        expect(() => decodeAnvilDumpStateHex(`${valid.slice(0, -1)}g`, "fixture")).toThrow(expected);
+        expect(() => decodeAnvilDumpStateHex(`0x${Buffer.from("not gzip").toString("hex")}`, "fixture")).toThrow("not decodable gzip");
     });
 
     it("routes PURGE=0 teardown to the owner, publishes only after exit, and skips broad kill on failure", async () => {

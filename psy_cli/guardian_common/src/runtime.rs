@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn operator_db_paths_reject_traversal_and_resolve_absolute_or_config_relative() {
-        let config = Path::new("/ceremony/config.json");
+        let config = Path::new("/guardians-root/config.json");
         assert!(resolve_operator_db_path(config, Path::new("../escape.redb")).is_err());
         assert!(resolve_operator_db_path(config, Path::new("journal/")).is_err());
         assert!(resolve_operator_db_path(config, Path::new("journal/.")).is_err());
@@ -411,7 +411,7 @@ mod tests {
         assert!(resolve_operator_db_path(config, Path::new("/.")).is_err());
         assert!(resolve_operator_db_path(config, Path::new("")).is_err());
         assert_eq!(resolve_operator_db_path(config, Path::new("/var/guardian/journal.redb")).unwrap().1, Path::new("var/guardian/journal.redb"));
-        assert_eq!(resolve_operator_db_path(config, Path::new("journal.redb")).unwrap().1, Path::new("ceremony/journal.redb"));
+        assert_eq!(resolve_operator_db_path(config, Path::new("journal.redb")).unwrap().1, Path::new("guardians-root/journal.redb"));
     }
 
     fn configured(endpoints: [&str; 3], bind: &str) -> GuardianConfig {
@@ -443,7 +443,7 @@ mod tests {
         assert!(config.validate().is_ok());
         assert!(config.guardians.values().map(|signer| signer.listen_address).all(|address| address == config.guardians[&1].listen_address));
         let index = GuardianAuthorizationIndex { active_version: 1, versions: vec![GuardianAuthorizationVersion { version: 1, sha256: Hex([1; 32]) }] };
-        let runtime = config.build_runtime_config(Path::new("/ceremony/config.json"), 1, Path::new("journal.redb"), &index).unwrap();
+        let runtime = config.build_runtime_config(Path::new("/guardians-root/config.json"), 1, Path::new("journal.redb"), &index).unwrap();
         assert_eq!(runtime.history_urls, vec!["http://127.0.0.1:9/".to_owned(), "http://b/".to_owned(), "http://c/".to_owned()]);
     }
 

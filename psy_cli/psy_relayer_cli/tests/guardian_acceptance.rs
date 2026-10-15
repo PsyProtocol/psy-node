@@ -10,7 +10,7 @@
 //! never-used guardian keys. Databases are absent; first service start creates
 //! each one. There is no create-db command and no TLS.
 //!
-//! The public manifest.json stays outside ceremony outputs. See §4.5 for its
+//! The public manifest.json stays outside guardians-root outputs. See §4.5 for its
 //! exact field set. Secret-consuming user APIs run in the ignored
 //! `guardian_user_operation` child of this executable. The parent passes only
 //! the manifest directory and operation name; the child writes

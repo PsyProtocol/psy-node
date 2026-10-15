@@ -95,6 +95,15 @@ Client CLI for wallet, contract deploy/call, tree/metadata queries, proving help
 | Privacy | `private-transfer`, `private-claim`, `derive-shield` |
 | Misc | `tx`, `faucet-server`, `get-psy-sdc-fingerprint`, `get-user-event-data`, `get-user-leaf` |
 
+## Reward setup
+
+`claim-rewards` loads `RewardClient` from the existing `--rpc-config`. That file supplies the reward token and the circuits through `UserRewardCircuits::build`. There is no external setup document, source-identity field, or second configuration file.
+
+`claim-rewards` mints eligible unclaimed checkpoint groups first through L1 `claimReward(bytes,bytes32,uint32,address,uint32[],uint256)` on the configured reward token. It builds authenticated Roots and a checkpoint aggregate, sends the wrap witness to the prove-proxy, and confirms the receipt, the token `RewardClaimed` event, the mint `Transfer`, and exact `claimed(user,id)` pairs before refreshing state and preaggregating remaining jobs. Confirm rediscovers the token and `STATE_MANAGER` from the provider at the receipt block. Each transaction keeps the complete public ID list and proved total; more than 64 eligible checkpoints repeat the same artifact. Eligibility uses recognized finalized roots and token claimed pairs, never a payer cursor.
+
+Required flags beyond the ZK wallet source are `--recipient`, `--user-id`, `--l1-rpc-url`, `--l1-private-key`, and `--prove-proxy-url`. `--proof-cache-dir` defaults to `reward-proof-cache`; keep original `--jobs-file` binary metadata outside it. Cache loss rebuilds with original selections and available historical source/path material. A retained cache matches network magic, source fingerprints, common digests, verifier digests, and the proof; it is not paid state. `--services-url` is optional transport configuration. Unknown checkpoint mappings fail closed to prevent omitted-job forfeiture; independently identified later unavailable material stays pending. Failed or pending L1 claims do not enable remaining proving. New source and regression coverage require execution; no E2E pass is asserted.
+
+
 ## Source
 
 - `client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs`

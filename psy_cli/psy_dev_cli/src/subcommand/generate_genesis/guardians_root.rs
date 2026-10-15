@@ -51,7 +51,7 @@ use guardian_common::{
     },
 };
 use psy_ups_circuit::signature::multisig::MultisigSignatureCircuit;
-use psy_vm::ups::multisig::MultisigAccount;
+use psy_vm::ups::multisig::{MultisigAccount, MULTISIG_POLICY_CONTRACT_ID};
 
 use super::{
     decode_relayer_multisig_account, read_public_input, validate_multisig_policy_artifact,
@@ -72,7 +72,7 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
         .guardians_root
         .as_ref()
         .context("--guardians-root is required for the --guardians-root branch")?;
-    require_ceremony_inputs(args)?;
+    require_guardians_root_inputs(args)?;
     let repo_root = args.repo_root.canonicalize().with_context(|| {
         format!("repo-root {} does not exist", args.repo_root.display())
     })?;
@@ -85,7 +85,7 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
         &repo_root,
         &args.relayer_multisig_account,
     )?)?;
-    ensure!(account.contract_id == 6, "public multisig account must name contract 6");
+    ensure!(account.contract_id == MULTISIG_POLICY_CONTRACT_ID, "public multisig account must name contract 1");
     validate_multisig_policy_artifact(
         &genesis.contracts,
         &read_public_input(&repo_root, &args.multisig_policy_artifact)?,
@@ -163,7 +163,7 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Fails closed when ceremony-only flags leak into the unchanged publish branch.
+/// Fails closed when guardians-root-only flags leak into the unchanged publish branch.
 pub fn reject_publish_branch_flags(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
     for (present, flag) in [
         (args.chains.is_some(), "--chains"),
@@ -176,7 +176,7 @@ pub fn reject_publish_branch_flags(args: &GenerateGenesisDataArgs) -> anyhow::Re
     Ok(())
 }
 
-fn require_ceremony_inputs(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
+fn require_guardians_root_inputs(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
     for (present, flag) in [
         (args.chains.is_some(), "--chains"),
         (args.l1_endpoints.is_some(), "--l1-endpoints"),
@@ -209,13 +209,13 @@ fn locate_genesis_multisig_user<'a>(
 ) -> anyhow::Result<&'a PsyCompactUserDefinition<Hash>> {
     ensure!(
         args.relayer_registration_id == 2 && args.relayer_user_id == BRIDGE_USER_ID,
-        "guardian ceremony requires the fixed public registration 2 and user {BRIDGE_USER_ID}"
+        "guardians-root requires the fixed public registration 2 and user {BRIDGE_USER_ID}"
     );
     ensure!(
         args.coordinator_global_user_tree_height == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT
             && args.realm_global_user_tree_height == N::REALM_GLOBAL_USER_TREE_HEIGHT
             && args.group_realm_height == N::GROUP_REALM_HEIGHT,
-        "ceremony Strategy5 dimensions must equal the local-devnet builder dimensions"
+        "guardians-root Strategy5 dimensions must equal the local-devnet builder dimensions"
     );
     let (registration, user) = users
         .iter()
@@ -319,7 +319,7 @@ fn validate_compiled_dimensions(args: &GenerateGenesisDataArgs) -> anyhow::Resul
         args.coordinator_global_user_tree_height == N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT
             && args.realm_global_user_tree_height == N::REALM_GLOBAL_USER_TREE_HEIGHT
             && args.group_realm_height == N::GROUP_REALM_HEIGHT,
-        "ceremony Strategy5 dimensions must equal the local-devnet builder dimensions"
+        "guardians-root Strategy5 dimensions must equal the local-devnet builder dimensions"
     );
     Ok(())
 }
@@ -773,7 +773,7 @@ mod tests {
     use parth_core::crypto::hash::traits::ZeroableHash;
     use psy_data::v1::qdata::public_key::PZKPublicKeyInfo;
 
-    fn ceremony_args() -> GenerateGenesisDataArgs {
+    fn guardians_root_args() -> GenerateGenesisDataArgs {
         GenerateGenesisDataArgs::try_parse_from([
             "generate-genesis-data",
             "--relayer-multisig-account", "account.json",
@@ -783,7 +783,7 @@ mod tests {
             "--l1-endpoints", "l1.json",
             "--approved-contracts", "approved.json",
         ])
-        .expect("ceremony flags parse")
+        .expect("guardians-root flags parse")
     }
 
     fn compact_user(marker: u64) -> PsyCompactUserDefinition<Hash> {
@@ -810,16 +810,16 @@ mod tests {
     }
 
     #[test]
-    fn ceremony_flags_are_required_together_and_rejected_without_guardians_root() {
-        let args = ceremony_args();
-        require_ceremony_inputs(&args).expect("complete ceremony flags");
-        let mut partial = ceremony_args();
+    fn guardians_root_flags_are_required_together_and_rejected_without_guardians_root() {
+        let args = guardians_root_args();
+        require_guardians_root_inputs(&args).expect("complete guardians-root flags");
+        let mut partial = guardians_root_args();
         partial.chains = None;
-        assert!(require_ceremony_inputs(&partial).is_err());
-        let mut publish = ceremony_args();
+        assert!(require_guardians_root_inputs(&partial).is_err());
+        let mut publish = guardians_root_args();
         publish.guardians_root = None;
         assert!(reject_publish_branch_flags(&publish).is_err());
-        let mut fee_only = ceremony_args();
+        let mut fee_only = guardians_root_args();
         fee_only.guardians_root = None;
         fee_only.chains = None;
         fee_only.l1_endpoints = None;
@@ -831,12 +831,12 @@ mod tests {
 
     #[test]
     fn genesis_multisig_user_is_located_at_registration_two() {
-        let args = ceremony_args();
+        let args = guardians_root_args();
         assert_eq!(builder_user_id(2), BRIDGE_USER_ID);
         let mut users = vec![compact_user(1), compact_user(2), compact_user(3)];
         let located = locate_genesis_multisig_user(&args, &users).expect("registration 2");
         assert_eq!(located.public_key_info.fingerprint, users[2].public_key_info.fingerprint);
-        let mut wrong_dimensions = ceremony_args();
+        let mut wrong_dimensions = guardians_root_args();
         wrong_dimensions.group_realm_height = 2;
         assert!(locate_genesis_multisig_user(&wrong_dimensions, &users).is_err());
         users[2].public_key_info.fingerprint = Hash::from_values(9, 0, 0, 0);

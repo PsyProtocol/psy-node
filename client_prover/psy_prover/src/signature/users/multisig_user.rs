@@ -5,7 +5,7 @@ use psy_client_common::data::{base_types::hash256::Hash256, qhashout::QHashOut, 
 use psy_client_data::config::store_config::{PsyHasher, PsyPlonky2Config, PsyProof};
 use psy_config::network_constants::PSY_NETWORK_MAGIC;
 use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::{secp256k1::wallet::hash_no_pad_compressed_public_key, zk::data::ZKPublicKeyInfo}};
-use psy_vm::ups::{circuit_manager::UPSCircuitManager, multisig::{MultisigAccount, MultisigPolicy, MultisigSignatureInput, MultisigSignatureWitness, MultisigSignatures}};
+use psy_vm::ups::{circuit_manager::UPSCircuitManager, multisig::{MultisigAccount, MultisigPolicy, MultisigSignatureInput, MultisigSignatureWitness, MultisigSignatures, MULTISIG_POLICY_CONTRACT_ID}};
 
 use crate::{signature::{context::SignContext, traits::{SignatureCircuitInfo, SignatureUser}}, wallet::memory_wallet::PsyMemoryWallet};
 use super::external_secp256k1_user::{validate_compressed_public_key, validate_signature_prehash};
@@ -121,7 +121,7 @@ mod tests {
         members.sort_by_key(|(hash, _)| hash.0.elements.map(|limb| limb.to_canonical_u64()));
         let mut member_hashes = [QHashOut::ZERO; 8];
         for (index, (hash, _)) in members.iter().enumerate() { member_hashes[index] = *hash; }
-        let account = MultisigAccount { contract_id: 6, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes } };
+        let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes } };
         (account, MultisigSignatures { member_indices: vec![0, 2], signatures: vec![members[0].1, members[2].1] })
     }
 

@@ -1,12 +1,16 @@
+use std::fmt;
+
 use anyhow::Result;
 use async_trait::async_trait;
-use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::PoseidonHash};
+use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::PoseidonHash, plonk::config::PoseidonGoldilocksConfig};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::config::store_config::{PsyPlonky2Config, PsyProof};
 use psy_crypto::signature::zk::{data::ZKPublicKeyInfo, wallet::SimplePsyPrivateKey};
+use psy_plonky2_circuits::bridge::circuits::user_reward_checkpoint_aggregate::{UserRewardCheckpointAggregateCircuit, UserRewardCheckpointAggregateProof};
 use psy_vm::ups::circuit_manager::UPSCircuitManager;
 
 use crate::{
+    local::reward_client::{FinalizedCheckpointAnchor, RewardClient},
     signature::{
         context::SignContext,
         traits::{SignatureCircuitInfo, SignatureUser},
@@ -14,9 +18,15 @@ use crate::{
     wallet::memory_wallet::PsyMemoryWallet,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ZKUser {
     private_key: SimplePsyPrivateKey<GoldilocksField>,
+}
+
+impl fmt::Debug for ZKUser {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ZKUser").field("private_key", &"<redacted>").finish()
+    }
 }
 
 impl ZKUser {
@@ -61,6 +71,18 @@ impl SignatureUser for ZKUser {
             circuit_fingerprint: wallet.zk_circuit_fingerprint().await?,
             verifier_config: wallet.zk_circuit_verifier_config().await?,
         })
+    }
+
+    async fn prove_reward_claim(
+        &self,
+        client: &RewardClient,
+        checkpoint: &UserRewardCheckpointAggregateCircuit,
+        aggregate: &UserRewardCheckpointAggregateProof,
+        anchor: &FinalizedCheckpointAnchor,
+        token: [u8; 20],
+        state_manager: [u8; 20],
+    ) -> Result<plonky2::plonk::proof::ProofWithPublicInputs<GoldilocksField, PoseidonGoldilocksConfig, 2>> {
+        client.prove_reward_claim(checkpoint, aggregate, anchor, token, state_manager, self.private_key.private_key.0)
     }
 }
 

@@ -28,8 +28,8 @@ use psy_provider::{
     request::RealmEndCapSlotUpdates,
 };
 use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
+use psy_vm::ups::multisig::MULTISIG_POLICY_CONTRACT_ID;
 use serde::{Deserialize, Serialize};
-
 use guardian_common::protocol::GuardianSignRequest;
 use crate::bridge::{
     claim_attempts,
@@ -3485,7 +3485,7 @@ fn pending_policy_matches(request: &guardian_common::protocol::GuardianSignReque
     if request.operation != operation { return Ok(false); }
     let calls: ContractCallData = serde_json::from_value(request.trace_json.decode()?.call_data)?;
     let expected: Vec<_> = members.iter().flat_map(|member| member.0.elements.map(|limb| limb.to_canonical_u64())).collect();
-    Ok(calls.contract_calls.len() == 1 && calls.contract_calls[0].contract_id == 6 && calls.contract_calls[0].method_name == "set_policy" && calls.contract_calls[0].inputs.get(16..) == Some(expected.as_slice()))
+    Ok(calls.contract_calls.len() == 1 && calls.contract_calls[0].contract_id == u64::from(MULTISIG_POLICY_CONTRACT_ID) && calls.contract_calls[0].method_name == "set_policy" && calls.contract_calls[0].inputs.get(16..) == Some(expected.as_slice()))
 }
 
 async fn refresh_relayer_history(wallet: &WalletSession, provider: &RpcProvider, config: &super::guardian_client::LoadedGuardianConfig, archive: &super::guardian_client::RelayerArchive, head: u64, root: QHashOut<GoldilocksField>, retained: &mut RelayerHistory) -> anyhow::Result<()> {
@@ -3617,7 +3617,7 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
             let next_members = next_members.context("policy operation requires exactly three members")?;
             let mut expected = Vec::with_capacity(16);
             for slot in 0..4 {
-                let hash = provider.get_user_contract_state_tree_leaf_hash(head, BRIDGE_USER_ID_U64, 6, 4, slot).await?;
+                let hash = provider.get_user_contract_state_tree_leaf_hash(head, BRIDGE_USER_ID_U64, MULTISIG_POLICY_CONTRACT_ID, 4, slot).await?;
                 expected.extend(hash.0.elements.map(|limb| limb.to_canonical_u64()));
             }
             if operation == GuardianOperation::Bootstrap {
@@ -3626,7 +3626,7 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
                 ensure!(expected[0] != 0, "rotation requires initialized policy");
             }
             for member in next_members { expected.extend(member.0.elements.map(|limb| limb.to_canonical_u64())); }
-            approved_calls.push(ContractCallArgs { contract_id: 6, method_name: "set_policy".to_owned(), inputs: expected });
+            approved_calls.push(ContractCallArgs { contract_id: u64::from(MULTISIG_POLICY_CONTRACT_ID), method_name: "set_policy".to_owned(), inputs: expected });
         }
         if approved_calls.is_empty() { return Ok(head); }
         let call_data = ContractCallData::new(approved_calls);

@@ -1,5 +1,7 @@
 # Relayer L1 RPC provider pool
 
+> Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
+
 ## Scope
 
 This applies to relayer L1 JSON-RPC requests only, not Psy RPC, Envio,
