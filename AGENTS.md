@@ -18,6 +18,17 @@ It supplements higher-level agent rules. The stricter rule wins.
 
 Before naming a function, variable, field, type, module, file, or log marker, every AI agent MUST read `docs/src/dev/TERMINOLOGY.md`. That file owns the shared verbs and domain nouns. Do not create a second term for a concept it already names; reuse the existing word. If a needed term is absent, add it to `docs/src/dev/TERMINOLOGY.md` in the same change that introduces the symbol.
 
+## Document Routing
+
+Read the owning document before the matching operation; keep executable procedures in that document.
+
+| Operation | Required document |
+|---|---|
+| Create an eight-repository worktree cohort, switch to local dependencies, install dependencies, or build the cohort | `docs/src/dev/worktree-cohort.md` |
+| Change cross-repository Git revisions, npm versions, or release gitlinks | `docs/src/dev/circuit-and-verifier-operations.md` §8 |
+| Generate compiler contract artifacts or node Genesis | `docs/src/dev/genesis-generation.md` |
+| Start, stop, restart, or roll back the devnet | `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md` |
+
 ## Required Devnet Lifecycle Reading
 
 Before any devnet startup, shutdown, restart, rollback, or live E2E operation, every AI agent MUST read and follow `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md`. The lifecycle guide owns state-preserving operations; the launcher reference owns launcher flags, the startup DAG, ports, environment, Anvil persistence, and known current-source limitations. JTMB remains test-only and is not rollback-validation evidence. Rollback validation uses the Plonky2 path; all lifecycle stop/resume, artifact, and verification procedures remain authoritative.
