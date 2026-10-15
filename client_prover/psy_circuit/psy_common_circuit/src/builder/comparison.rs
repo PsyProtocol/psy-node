@@ -10,7 +10,7 @@ use crate::u32::multiple_comparison::list_lte_circuit;
 
 /// A field element can also be represented by its value plus the modulus when
 /// split into 64 bits. Exclude that alias before treating the limbs as an integer.
-fn assert_canonical_64<F: RichField + Extendable<D>, const D: usize>(
+pub fn assert_canonical_64<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     low: Target,
     high: Target,
