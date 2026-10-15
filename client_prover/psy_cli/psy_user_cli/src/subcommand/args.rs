@@ -111,15 +111,15 @@ pub enum WalletCommands {
         #[arg(long)]
         rpc_config: Option<String>,
     },
-    /// Resolve method names in a policy file to numeric ids, emitting the
-    /// canonical policy to register and prove with
+    /// Fetch ABI-aware rules from psy-services and resolve method names to
+    /// numeric ids, emitting the canonical policy to register and prove with
     SdKeyPolicyResolve {
         #[arg(long)]
         definition: String,
         /// Contract context for method names not scoped by a Contract rule.
         #[arg(long)]
         contract: Option<u64>,
-        /// RPC config path, required when the policy contains method names.
+        /// Network config path, used for psy-services ABI URLs and on-chain method names.
         #[arg(long)]
         rpc_config: Option<String>,
         #[arg(long)]

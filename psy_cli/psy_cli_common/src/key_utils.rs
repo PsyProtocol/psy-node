@@ -89,6 +89,7 @@ fn parse_sd_key_dpn_definition_json(contents: &str, path: &str) -> Result<(DPNFu
             .with_context(|| format!("decode compiled SD key definition {path}"))?;
         return Ok((definition.function, definition.config));
     }
+    anyhow::ensure!(!contains_abi_input(&value), "policy contains AbiInput rules; resolve them online first with `wallet sd-key-policy-resolve --rpc-config <network-config>`");
     let policy: ComposedSDKeyPolicyFile = serde_json::from_value(value)
         .with_context(|| format!("decode composed SD key policy {path}"))?;
     psy_vm::ups::sd_key::build_composed_sd_key_policy_with_relations(
@@ -99,6 +100,202 @@ fn parse_sd_key_dpn_definition_json(contents: &str, path: &str) -> Result<(DPNFu
         policy.min_tx_count,
         policy.max_tx_count,
     )
+}
+
+fn abi_input_to_rule(spec: &serde_json::Value, abi: &serde_json::Value) -> Result<serde_json::Value> {
+    if let Some(map) = spec.as_object() {
+        for key in map.keys() {
+            anyhow::ensure!(matches!(key.as_str(), "contract_id" | "method" | "parameter" | "comparison" | "value"),
+                "unknown AbiInput field `{key}`");
+        }
+    } else {
+        anyhow::bail!("AbiInput must be an object");
+    }
+    let contract_id = spec.get("contract_id").and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("AbiInput.contract_id must be an unsigned integer"))?;
+    let method_name = spec.get("method").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("AbiInput.method must be a method name"))?;
+    let parameter_path = spec.get("parameter").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("AbiInput.parameter must be a parameter or struct field path"))?;
+    let comparison = spec.get("comparison").cloned().ok_or_else(|| anyhow!("AbiInput.comparison is required"))?;
+    let value = spec.get("value").and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("AbiInput.value must be an unsigned integer"))?;
+
+    let contract = abi.get("contract").ok_or_else(|| anyhow!("ABI file is missing `contract`"))?;
+    let contract_name = contract.get("name").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("ABI contract is missing its name"))?;
+    let methods = contract.get("methods").and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("ABI contract is missing its methods list"))?;
+    let mut matching_methods = methods.iter().filter(|method| method.get("name").and_then(serde_json::Value::as_str) == Some(method_name));
+    let method = matching_methods.next().ok_or_else(|| anyhow!("method `{method_name}` is not found in ABI contract `{contract_name}`"))?;
+    anyhow::ensure!(matching_methods.next().is_none(), "method `{method_name}` is ambiguous in ABI contract `{contract_name}`");
+    let method_id = method.get("method_id").and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("ABI method `{method_name}` is missing a numeric method_id"))?;
+    let method_id = u32::try_from(method_id).context("ABI method_id exceeds u32")?;
+    let inputs = method.get("inputs").and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("ABI method `{method_name}` is missing inputs"))?;
+    let (parameter, field_path) = parameter_path.split_once('.').map(|(a, b)| (a, Some(b)))
+        .unwrap_or((parameter_path, None));
+    anyhow::ensure!(!parameter.is_empty() && field_path.map(|path| !path.is_empty()).unwrap_or(true), "invalid ABI parameter path `{parameter_path}`");
+    let mut offset = 0u64;
+    let mut target_size = 0u64;
+    let mut target_type = None;
+    for input in inputs {
+        let input_name = input.get("name").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let felt_size = input.get("felt_size").and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("ABI input `{input_name}` is missing felt_size"))?;
+        if input_name == parameter {
+            target_type = input.get("type");
+            target_size = felt_size;
+            break;
+        }
+        offset = offset.checked_add(felt_size).ok_or_else(|| anyhow!("ABI input offset overflow"))?;
+    }
+    let mut target_type = target_type.ok_or_else(|| anyhow!("parameter `{parameter}` is not found in ABI method `{method_name}`"))?;
+    if let Some(path) = field_path {
+        for segment in path.split('.') {
+            anyhow::ensure!(!segment.is_empty(), "invalid ABI field path `{parameter_path}`");
+            anyhow::ensure!(target_type.get("kind").and_then(serde_json::Value::as_str) == Some("struct"),
+                "ABI path `{parameter_path}` traverses a non-struct type at `{segment}`");
+            let type_name = target_type.get("name").and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("ABI struct type is missing its name"))?;
+            let types = abi.get("types").and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow!("ABI file is missing struct type definitions"))?;
+            let struct_type = types.iter().find(|ty| ty.get("kind").and_then(serde_json::Value::as_str) == Some("struct")
+                && ty.get("name").and_then(serde_json::Value::as_str) == Some(type_name))
+                .ok_or_else(|| anyhow!("struct type `{type_name}` is not defined in ABI"))?;
+            let fields = struct_type.get("fields").and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow!("ABI struct `{type_name}` is missing fields"))?;
+            let field = fields.iter().find(|field| field.get("name").and_then(serde_json::Value::as_str) == Some(segment))
+                .ok_or_else(|| anyhow!("field `{segment}` is not found in ABI struct `{type_name}`"))?;
+            let field_offset = field.get("offset_within_parent").and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow!("ABI field `{segment}` is missing offset_within_parent"))?;
+            let field_size = field.get("felt_size").and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow!("ABI field `{segment}` is missing felt_size"))?;
+            anyhow::ensure!(field_offset.checked_add(field_size).map(|end| end <= target_size).unwrap_or(false),
+                "ABI field `{segment}` exceeds its parent type size");
+            offset = offset.checked_add(field_offset).ok_or_else(|| anyhow!("ABI field offset overflow"))?;
+            target_size = field_size;
+            target_type = field.get("type").ok_or_else(|| anyhow!("ABI field `{segment}` is missing type"))?;
+        }
+    }
+    anyhow::ensure!(target_type.get("kind").and_then(serde_json::Value::as_str) == Some("primitive")
+        && target_type.get("name").and_then(serde_json::Value::as_str) == Some("Felt"),
+        "ABI parameter path `{parameter_path}` must resolve to one Felt");
+    anyhow::ensure!(target_size == 1, "ABI parameter path `{parameter_path}` must occupy exactly one Felt");
+    let word = u32::try_from(offset).context("ABI calldata word index exceeds u32")?;
+    Ok(serde_json::json!({"All": [
+        {"Contract": contract_id},
+        {"Method": method_id},
+        {"Input": {"word": word, "comparison": comparison, "value": value}}
+    ]}))
+}
+
+fn expand_abi_input_rules(value: &mut serde_json::Value, abis: &std::collections::HashMap<u64, serde_json::Value>) -> Result<()> {
+    if let Some(spec) = value.as_object().and_then(|map| (map.len() == 1).then(|| map.get("AbiInput")).flatten()) {
+        let contract_id = spec.get("contract_id").and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("AbiInput.contract_id must be an unsigned integer"))?;
+        let abi = abis.get(&contract_id).ok_or_else(|| anyhow!("ABI for contract {contract_id} was not fetched from psy-services"))?;
+        *value = abi_input_to_rule(spec, abi)?;
+        return Ok(());
+    }
+    match value {
+        serde_json::Value::Array(items) => for item in items { expand_abi_input_rules(item, abis)?; },
+        serde_json::Value::Object(map) => for item in map.values_mut() { expand_abi_input_rules(item, abis)?; },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn contains_abi_input(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(contains_abi_input),
+        serde_json::Value::Object(map) => map.contains_key("AbiInput") || map.values().any(contains_abi_input),
+        _ => false,
+    }
+}
+
+fn collect_abi_contract_ids(value: &serde_json::Value, ids: &mut std::collections::BTreeSet<u64>) -> Result<()> {
+    match value {
+        serde_json::Value::Array(items) => for item in items { collect_abi_contract_ids(item, ids)?; },
+        serde_json::Value::Object(map) => {
+            if map.len() == 1 {
+                if let Some(spec) = map.get("AbiInput") {
+                    let id = spec.get("contract_id").and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| anyhow!("AbiInput.contract_id must be an unsigned integer"))?;
+                    ids.insert(id);
+                    return Ok(());
+                }
+            }
+            for item in map.values() { collect_abi_contract_ids(item, ids)?; }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn fetch_contract_abi_from_services(
+    client: &reqwest::Client,
+    service_urls: &[String],
+    contract_id: u64,
+) -> Result<serde_json::Value> {
+    let contract_id_i64 = i64::try_from(contract_id).context("contract id exceeds psy-services ABI endpoint range")?;
+    let mut errors = Vec::new();
+    for base_url in service_urls {
+        let url = format!("{}/api/v1/get/contract/{contract_id_i64}/abi?format=raw", base_url.trim_end_matches('/'));
+        match client.get(&url).send().await.and_then(reqwest::Response::error_for_status) {
+            Ok(response) => {
+                let body: serde_json::Value = response.json().await.with_context(|| format!("decode ABI response from {url}"))?;
+                anyhow::ensure!(body.get("success").and_then(serde_json::Value::as_bool) == Some(true),
+                    "psy-services returned an unsuccessful ABI response for contract {contract_id}");
+                let abi = body.get("data").and_then(|data| data.get("abi")).filter(|abi| !abi.is_null())
+                    .ok_or_else(|| anyhow!("psy-services has no raw ABI for contract {contract_id}"))?;
+                return normalize_service_abi(abi);
+            }
+            Err(error) => errors.push(format!("{url}: {error}")),
+        }
+    }
+    anyhow::bail!("failed to fetch ABI for contract {contract_id} from configured psy-services URLs: {}", errors.join("; "))
+}
+
+fn normalize_service_abi(raw: &serde_json::Value) -> Result<serde_json::Value> {
+    if raw.get("contract").is_some() {
+        return Ok(raw.clone());
+    }
+    if let Some(files) = raw.as_array() {
+        let candidates: Vec<_> = files.iter().filter_map(|file| {
+            if file.get("contract").is_some() { Some(file) } else { file.get("abi") }
+        })
+            .filter(|abi| abi.get("contract").is_some()).collect();
+        anyhow::ensure!(candidates.len() == 1,
+            "psy-services ABI response has {} canonical ABI entries; expected exactly one", candidates.len());
+        return Ok(candidates[0].clone());
+    }
+    anyhow::bail!("psy-services returned an unsupported ABI shape (expected contract.methods ABI)")
+}
+
+async fn resolve_abi_inputs_online(value: &mut serde_json::Value, rpc_config: Option<&str>) -> Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
+    if let Some(rule) = value.get("per_transaction") { collect_abi_contract_ids(rule, &mut ids)?; }
+    if let Some(ordered) = value.get("ordered").and_then(serde_json::Value::as_array) {
+        for rule in ordered { collect_abi_contract_ids(rule, &mut ids)?; }
+    }
+    if ids.is_empty() { return Ok(()); }
+    let config_path = rpc_config.ok_or_else(|| anyhow!("--rpc-config is required to fetch ABI rules from psy-services"))?;
+    let config = psy_config::PsyConfigGoldilocks::from_file(config_path)
+        .with_context(|| format!("load network config {config_path}"))?;
+    let urls = config.get_current_network()?.api_services_url.as_ref()
+        .filter(|urls| !urls.is_empty()).ok_or_else(|| anyhow!("current network config has no api_services_url"))?;
+    let client = reqwest::Client::new();
+    let mut abis = std::collections::HashMap::new();
+    for contract_id in ids {
+        abis.insert(contract_id, fetch_contract_abi_from_services(&client, urls, contract_id).await?);
+    }
+    if let Some(rule) = value.get_mut("per_transaction") { expand_abi_input_rules(rule, &abis)?; }
+    if let Some(ordered) = value.get_mut("ordered").and_then(serde_json::Value::as_array_mut) {
+        for rule in ordered { expand_abi_input_rules(rule, &abis)?; }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -180,6 +377,88 @@ mod policy_tests {
         assert_eq!(composed.cross_transaction.len(), 1);
         let invalid = json.replace("\"left_slot\": 0", "\"left_slot\": 2");
         assert!(parse_sd_key_dpn_definition_json(&invalid, "invalid-slots.json").is_err());
+    }
+
+    #[test]
+    fn abi_input_resolves_nested_felt_field_to_calldata_word() {
+        let abi = serde_json::json!({
+            "schema_version": "2.0.0",
+            "contract": {"name": "Example", "methods": [{
+                "name": "submit", "method_id": 42,
+                "inputs": [
+                    {"name": "prefix", "type": {"kind": "primitive", "name": "Hash"}, "felt_size": 4},
+                    {"name": "order", "type": {"kind": "struct", "name": "Order"}, "felt_size": 2}
+                ]
+            }]},
+            "types": [{"kind": "struct", "name": "Order", "felt_size": 2, "fields": [
+                {"name": "recipient", "type": {"kind": "primitive", "name": "Felt"}, "offset_within_parent": 0, "felt_size": 1},
+                {"name": "amount", "type": {"kind": "primitive", "name": "Felt"}, "offset_within_parent": 1, "felt_size": 1}
+            ]}]
+        });
+        let rule = super::abi_input_to_rule(&serde_json::json!({
+            "contract_id": 7, "method": "submit", "parameter": "order.amount", "comparison": "Lte", "value": 100
+        }), &abi).unwrap();
+        assert_eq!(rule, serde_json::json!({"All": [
+            {"Contract": 7}, {"Method": 42},
+            {"Input": {"word": 5, "comparison": "Lte", "value": 100}}
+        ]}));
+        let non_felt = super::abi_input_to_rule(&serde_json::json!({
+            "contract_id": 7, "method": "submit", "parameter": "prefix", "comparison": "Eq", "value": 1
+        }), &abi);
+        assert!(non_felt.unwrap_err().to_string().contains("must resolve to one Felt"));
+    }
+
+    #[test]
+    fn genesis_token_abi_resolves_transfer_amount() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../psy-genesis/genesis_abi/PsyTokenContract.json");
+        let abi: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("read Genesis Token ABI"),
+        )
+        .expect("parse Genesis Token ABI");
+
+        let rule = super::abi_input_to_rule(
+            &serde_json::json!({
+                "contract_id": 7,
+                "method": "transfer",
+                "parameter": "amount",
+                "comparison": "Lte",
+                "value": 100
+            }),
+            &abi,
+        )
+        .expect("resolve transfer amount");
+
+        assert_eq!(rule["All"][0]["Contract"], 7);
+        assert_eq!(rule["All"][1]["Method"], 2789897329u64);
+        assert_eq!(rule["All"][2]["Input"]["word"], 1);
+        assert_eq!(rule["All"][2]["Input"]["value"], 100);
+    }
+
+    #[test]
+    fn abi_input_rule_expands_to_a_pinned_numeric_rule() {
+        let abi = serde_json::json!({"contract": {"name": "Example", "methods": [{
+            "name": "pay", "method_id": 77,
+            "inputs": [{"name": "amount", "type": {"kind": "primitive", "name": "Felt"}, "felt_size": 1}]
+        }]}, "types": []});
+        let mut abis = std::collections::HashMap::new();
+        abis.insert(9, abi);
+        let mut rule = serde_json::json!({"AbiInput": {
+            "contract_id": 9, "method": "pay", "parameter": "amount", "comparison": "Lte", "value": 50
+        }});
+        super::expand_abi_input_rules(&mut rule, &abis).unwrap();
+        assert_eq!(rule, serde_json::json!({"All": [
+            {"Contract": 9}, {"Method": 77}, {"Input": {"word": 0, "comparison": "Lte", "value": 50}}
+        ]}));
+    }
+
+    #[test]
+    fn services_abi_response_accepts_raw_and_uploaded_artifact_shapes() {
+        let abi = serde_json::json!({"contract": {"name": "Example", "methods": []}, "types": []});
+        assert_eq!(super::normalize_service_abi(&abi).unwrap(), abi);
+        let wrapped = serde_json::json!([{"path": "Example.abi", "abi": abi}]);
+        assert_eq!(super::normalize_service_abi(&wrapped).unwrap(), abi);
+        assert!(super::normalize_service_abi(&serde_json::json!([])).is_err());
     }
 
     #[test]
@@ -613,11 +892,9 @@ fn visit_policy_file_method_names(file: &mut serde_json::Value, visit: &mut impl
     }
 }
 
-/// Resolve `Method` names in a composed policy file against on-chain contract
-/// code definitions and return the canonical numeric policy JSON, plus a log
-/// line per resolved name. The result is what should be registered, proven,
-/// and fingerprinted: resolving once keeps the policy's meaning stable across
-/// contract updates.
+/// Resolve ABI-aware rules from psy-services and `Method` names against
+/// on-chain contract code definitions. The canonical numeric policy is what
+/// should be registered, proven, and fingerprinted.
 pub async fn resolve_sd_key_policy_names(
     contents: &str,
     rpc_config: Option<&str>,
@@ -628,6 +905,8 @@ pub async fn resolve_sd_key_policy_names(
         value.get("function").is_none() && value.get("config").is_none(),
         "sd-key-policy-resolve applies to composed policy files, not compiled definitions"
     );
+    let had_abi_rules = contains_abi_input(&value);
+    resolve_abi_inputs_online(&mut value, rpc_config).await?;
     let mut requests: Vec<(Option<u64>, String)> = Vec::new();
     visit_policy_file_method_names(&mut value, &mut |context, method| {
         let context = context.or(explicit_contract);
@@ -637,7 +916,9 @@ pub async fn resolve_sd_key_policy_names(
         }
     });
     if requests.is_empty() {
-        return Ok((contents.to_string(), Vec::new()));
+        parse_sd_key_dpn_definition_json(&serde_json::to_string(&value)?, "resolved policy")?;
+        let log = if had_abi_rules { vec!["ABI input rules resolved from psy-services".to_string()] } else { Vec::new() };
+        return Ok((serde_json::to_string_pretty(&value)?, log));
     }
     let path = rpc_config.ok_or_else(|| anyhow!("--rpc-config is required to resolve method names in the policy"))?;
     let provider = psy_provider::provider::RpcProvider::new_with_config_path(path)?;
@@ -653,7 +934,7 @@ pub async fn resolve_sd_key_policy_names(
             anyhow::bail!("method `{name}` is not found in contract {contract_id}");
         }
     }
-    let mut log = Vec::new();
+    let mut log = if had_abi_rules { vec!["ABI input rules resolved from psy-services".to_string()] } else { Vec::new() };
     visit_policy_file_method_names(&mut value, &mut |context, method| {
         let context = context.or(explicit_contract);
         let name = method.as_str().unwrap_or_default().to_string();

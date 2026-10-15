@@ -59,6 +59,39 @@ unconstrained by these conditions:
 Matching the contract and method therefore requires the input rule to pass. A missing
 required input word fails that implication.
 
+## Refer to ABI parameters by name
+
+For ABI-aware rules, use an `AbiInput` rule. `sd-key-policy-resolve` fetches
+the ABI from the current network's `api_services_url` in `--rpc-config` and
+expands the rule to contract, method, and calldata-word checks:
+
+```json
+{
+  "per_transaction": {
+    "AbiInput": {
+      "contract_id": 7,
+      "method": "submit_order",
+      "parameter": "order.amount",
+      "comparison": "Lte",
+      "value": 100
+    }
+  },
+  "ordered": [],
+  "totals": [],
+  "min_tx_count": 1,
+  "max_tx_count": 3
+}
+```
+
+`parameter` is either a top-level method parameter such as `amount` or a
+dot-separated static struct path such as `order.amount` or
+`order.asset.amount`. The final field must be exactly one `Felt`. The ABI from
+psy-services provides each method ID and the flattened field offsets. The
+generated rule also pins the contract ID and method ID, so other calls do not inherit the
+parameter constraint. Arrays, hashes, non-Felt values, and unknown or
+ambiguous methods are rejected. The resolved numeric policy is what you
+inspect, fingerprint, and use for proving; proving does not fetch an ABI.
+
 `cross_transaction` compares calldata words in fixed transaction slots. Every
 referenced slot must be below `min_tx_count`, so it is guaranteed to exist:
 
@@ -161,8 +194,8 @@ ordered-slot rules, use the `--contract` flag:
 }
 ```
 
-Resolve the names once, against the chain, and register the numeric
-result:
+Resolve ABI parameter paths from psy-services and method names against the
+chain once, then register the numeric result:
 
 ```bash
 psy_user_cli wallet sd-key-policy-resolve --definition names.json \

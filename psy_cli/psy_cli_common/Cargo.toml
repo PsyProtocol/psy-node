@@ -16,3 +16,4 @@ psy_ups_circuit = { workspace = true }
 psy_vm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
