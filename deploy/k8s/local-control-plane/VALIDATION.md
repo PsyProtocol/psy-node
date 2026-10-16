@@ -69,3 +69,22 @@ Pods on psy-lab-cp-local. CoreDNS/metrics Pending before workers join is expecte
   policy enforcement, storage recovery or Psy transactions.
 - Read-only host update: x2/x3 still lack br0; x4 SSH was unavailable during the
   operator's disk work. No host network/disk action was attempted by the agent.
+
+## Existing /data SSD adoption — 2026-10-17
+
+Read-only inspection found x4's 1 TB SanDisk SSD (serial 2113C4462901) already
+mounted as ext4 at /data with about 915 GiB free, psy ownership and a persistent
+UUID fstab entry. A separate 4 TB NTFS disk is outside this lab. All four br0
+bridges are still absent.
+
+The new ordinary-user adoption helper checks hardware/filesystem identity and
+capacity, then only creates a dedicated pool and ACLs on its new directories.
+Six new tests cover SSD identity/path binding, plan-only behavior, rejection of
+root/wrong UUID, scoped ACL mutations and existing/symlink preservation (52 total
+with prior suites). Real setfacl creation and idempotent receipt validation also
+passed as the ordinary local user in temporary directories outside the sandbox;
+the sandbox's unmapped QEMU UID had rejected the first ACL smoke check.
+
+The old mounted-pool layout remains supported. No physical formatting, mount,
+fstab or shared-parent permission changes are part of the new helper. Actual
+cluster creation remains conditional on ordinary-user and bridge preflight.

@@ -29,6 +29,10 @@
 x3 清理后 OS 池约 139 GiB 可用；四台 br0 和 x4 新盘尚未就绪。用户已确认路由器
 做了地址保留。x2/x3/x4 的旧服务不由本实验脚本自动停止。
 
+2026-10-17 更新：x4 已新增 1 TB SanDisk SSD，ext4 挂载 `/data`，约 915 GiB 可用，
+已配置开机挂载且 psy 可写。用 `adopt-data.py` 普通用户接入其独立实验目录，
+保留现有文件系统；inventory 和创建器核对 UUID/serial。四台 br0 仍待操作员配置。
+
 ## 独立运行目录
 
 本机准备目录：`/home/peter/git/bridge_zilong/k8s-local-control-plane/`。

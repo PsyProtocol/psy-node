@@ -90,7 +90,10 @@ def validate(config):
             require((spec.get("expected_hostname"), spec.get("operator"), spec["os_pool"]) == from_host, "host identity/operator/pool does not match operator setup")
             require(spec["ssh"] == ("local" if host == "local" else "arc99" + host) and spec["bridge"] == "br0", "unexpected host transport/bridge")
             if host == "x4":
-                require(spec.get("data_mount") == "/mnt/psy-k8s-lab" and spec.get("data_pool") == "/mnt/psy-k8s-lab/vm-data", "x4 needs the prepared mounted disk and pool leaf")
+                layouts = {"/mnt/psy-k8s-lab": "/mnt/psy-k8s-lab/vm-data", "/data": "/data/psy-k8s-lab/vm-data"}
+                require(spec.get("data_mount") in layouts and spec.get("data_pool") == layouts[spec["data_mount"]], "x4 needs the prepared mounted disk and pool leaf")
+                if spec["data_mount"] == "/data":
+                    require(spec.get("data_uuid") == "d6d4015e-098a-4d6d-842d-6304bc015132" and spec.get("data_serial") == "2113C4462901", "Observed /data SSD UUID/serial required")
         require(bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", spec["ssh"])), "invalid host SSH alias")
         require(bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", spec["bridge"])), "invalid bridge name")
         if "expected_hostname" in spec:
@@ -470,6 +473,9 @@ if role=='x4':
  disks=setup.backing_disks(mount) if mounted else set()
  report['checks']['new_data_disk']=bool(disks) and disks.isdisjoint(setup.backing_disks('/')) and disks.isdisjoint(setup.backing_disks('/home'))
  report['checks']['new_data_capacity']=mounted and shutil.disk_usage(mount).free>=288*2**30
+ if spec.get('data_uuid'):
+  report['checks']['new_data_uuid']=mounted and setup.run('findmnt','-n','-o','UUID','-T',str(mount))==spec['data_uuid']
+  report['checks']['new_data_serial']=len(disks)==1 and setup.run('lsblk','-dn','-o','SERIAL','/dev/'+next(iter(disks)))==spec['data_serial']
 print(json.dumps(report))
 '''
         command = [sys.executable, "-"] if role == "local" else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", spec["ssh"], "python3 -"]

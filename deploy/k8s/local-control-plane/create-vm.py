@@ -75,12 +75,17 @@ def preflight(role, cfg):
     mem = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
     require(int(mem["MemAvailable"].split()[0]) / 2**20 >= cfg["minimum_available_memory_gib"], "Insufficient available RAM")
     if role == "x4":
-        require(cfg.get("data_mount") == "/mnt/psy-k8s-lab" and cfg.get("data_pool") == "/mnt/psy-k8s-lab/vm-data", "Unexpected x4 data mount/pool")
+        layouts = {"/mnt/psy-k8s-lab": "/mnt/psy-k8s-lab/vm-data", "/data": "/data/psy-k8s-lab/vm-data"}
+        require(cfg.get("data_mount") in layouts and cfg.get("data_pool") == layouts[cfg["data_mount"]], "Unexpected x4 data mount/pool")
         mount, data = Path(cfg["data_mount"]), Path(cfg["data_pool"])
         require(mount.is_mount() and not mount.is_symlink() and data.is_dir() and not data.is_symlink(), "Prepared x4 mount and pool required")
         require(data.stat().st_uid == os.geteuid() and data.stat().st_dev == mount.stat().st_dev and os.access(data, os.W_OK | os.X_OK), "Data pool must be owned, writable and on the mounted new disk")
         disks = setup.backing_disks(data)
         require(disks and disks.isdisjoint(setup.backing_disks("/")) and disks.isdisjoint(setup.backing_disks("/home")), "Data disk must differ from root and home")
+        if cfg["data_mount"] == "/data":
+            require(cfg.get("data_uuid") == "d6d4015e-098a-4d6d-842d-6304bc015132" and cfg.get("data_serial") == "2113C4462901", "Observed /data SSD identity required")
+            require(run("findmnt", "-n", "-o", "UUID", "-T", str(mount)) == cfg["data_uuid"], "Mounted SSD UUID changed")
+            require(len(disks) == 1 and run("lsblk", "-dn", "-o", "SERIAL", "/dev/" + next(iter(disks))) == cfg["data_serial"], "Mounted SSD serial changed")
         require(type(node.get("data_gib")) is int and 256 <= node["data_gib"] <= 2048, "x4 needs its new data disk")
         require(shutil.disk_usage(data).free >= (node["data_gib"] + 32) * 2**30, "Insufficient new data disk capacity")
     else:

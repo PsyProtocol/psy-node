@@ -16,7 +16,7 @@
     "local": {"ssh": "local", "expected_hostname": "arch3900x", "operator": "peter", "bridge": "br0", "os_pool": "/home/peter/git/bridge_zilong/k8s-local-control-plane/vm", "minimum_available_memory_gib": 10},
     "x2": {"ssh": "arc99x2", "expected_hostname": "arc99x2", "operator": "psy", "bridge": "br0", "os_pool": "/home/psy/k8s-lab/os", "minimum_available_memory_gib": 10},
     "x3": {"ssh": "arc99x3", "expected_hostname": "arc99x3", "operator": "psy", "bridge": "br0", "os_pool": "/home/psy/k8s-lab/os", "minimum_available_memory_gib": 14},
-    "x4": {"ssh": "arc99x4", "expected_hostname": "arc99x4", "operator": "psy", "bridge": "br0", "os_pool": "/home/psy/k8s-lab/os", "data_mount": "/mnt/psy-k8s-lab", "data_pool": "/mnt/psy-k8s-lab/vm-data", "minimum_available_memory_gib": 22}
+    "x4": {"ssh": "arc99x4", "expected_hostname": "arc99x4", "operator": "psy", "bridge": "br0", "os_pool": "/home/psy/k8s-lab/os", "data_mount": "/data", "data_pool": "/data/psy-k8s-lab/vm-data", "data_uuid": "d6d4015e-098a-4d6d-842d-6304bc015132", "data_serial": "2113C4462901", "minimum_available_memory_gib": 22}
   },
   "nodes": [
     {"name": "psy-lab-cp-local", "host": "local", "role": "server", "ip": "192.168.5.210", "mac": "52:54:00:70:01:01", "cpus": 4, "memory_gib": 8, "os_gib": 60},

@@ -51,17 +51,26 @@ sudo python3 host_setup.py x4 bridge --apply --console-confirmed --ip-reservatio
 
 ## 下一步由人执行：x4 新数据盘
 
-现场仍只看到原系统盘，不能对它格式化。先扩容 SSD 并持久挂载到
-`/mnt/psy-k8s-lab`，至少 288 GiB 可用，与根盘和 /home 底盘均不同，再在 x4：
+2026-10-17：已发现新增 SanDisk SSD PLUS 1000GB，serial `2113C4462901`，
+ext4 分区 UUID `d6d4015e-098a-4d6d-842d-6304bc015132`，已挂载 `/data`，
+fstab 已配置开机挂载，约 915 GiB 可用。`/data` 由 psy 所有，允许普通用户准备
+独立目录。该盘不用重新格式化，不改挂载点，不使用另一块 4 TB NTFS 盘。
+
+当前改为普通用户执行 `adopt-data.py`（和 host_setup.py 一同交付），先不带参数
+只读核对，再加 --apply：
 
 ```bash
-cd /home/psy/k8s-host-setup-20261016
-sudo python3 host_setup.py x4 storage --apply
+python3 adopt-data.py
+python3 adopt-data.py --apply
 ```
 
-完全空白的新盘如需初始化，按 host-setup 文档核对 by-id 与 SERIAL 后使用其
-可选入口；本文件不猜测设备名。数据池叶目录为 `/mnt/psy-k8s-lab/vm-data`，
-它本身不是 mountpoint，创建器验证的是父级挂载和底层物理盘。
+入口核对 x4 物理身份、普通 psy、UUID、serial、ext4、与根盘和 /home 不同的底盘、
+可用空间和已有父目录访问权限。只在 `/data/psy-k8s-lab/vm-data` 创建新池，并对
+新建两层目录授予 QEMU 最小访问 ACL；不修改 `/data` 根目录或已有文件权限，
+不 chown、不递归授权、不运行 sudo/mount/mkfs/fstab 操作。相同 receipt 可重复检查，
+已有不同目录、软链接或不完整准备现场会拒绝覆盖。VM 创建时再次核对 SSD 身份。
+
+旧 `/mnt/psy-k8s-lab` 布局仅保留兼容；不要为迁就旧路径重挂或重格式化当前 SSD。
 
 ## 普通用户后续流程
 
@@ -71,7 +80,8 @@ sudo python3 host_setup.py x4 storage --apply
 1. 独立实验 SSH key、私有 inventory、固定下载资产放在本机
    `/home/peter/git/bridge_zilong/k8s-local-control-plane/`。不复用生产凭据。
 2. `lab.py preflight --inventory /absolute/inventory.json` 读取四机，所有 checks 为
-   true 才返回成功。`network_confirmed` 仅表示地址已确认，不能代替 br0 验收。
+   true 才返回成功。路由器地址保留不能代替 br0 验收；新包的 network_confirmed
+   保持 false，直到四台 br0 都已确认。
 3. 只有新盘验收通过才设 `storage_confirmed: true`，渲染到新的输出目录。
    旧的 storage=false 包保留为证据，所有安装入口仍会拒绝执行。
 4. 执行 `lab.py fetch --assets /absolute/assets --include-vm-image`，随后
