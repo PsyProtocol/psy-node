@@ -334,6 +334,9 @@ where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> + MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>,
 {
     async fn register_contract_method_circuit(&self, contract_id: u64, contract_code: &ContractCodeDefinition, fn_id: u32) -> anyhow::Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _register = psy_prove_observe::stage_key(psy_prove_observe::Stage::Register,
+            Some(psy_prove_observe::cache_key(contract_id, fn_id)));
         let func = contract_code
             .functions
             .get(fn_id as usize)
@@ -357,6 +360,8 @@ where
 
         let circuit = self.contract_prover_circuit(key, &dapen_fc, state_tree_height);
         let (cached_bytes, budget_bytes, cached_circuits) = self.contract_prover_cache_usage();
+        #[cfg(not(target_arch = "wasm32"))]
+        psy_prove_observe::cache_usage(cached_bytes, budget_bytes, cached_circuits);
         tracing::info!(
             "register contract {} function {} estimated prover bytes {}; prover cache {} of {} bytes in {} circuits",
             contract_id,
@@ -389,7 +394,11 @@ where
         fn_def: &DPNFunctionCircuitDefinition,
         state_tree_height: usize,
     ) -> Arc<DapenContractFunctionCircuit<C, D>> {
-        let compile = || {
+        #[cfg(not(target_arch = "wasm32"))]
+        let observation_key = psy_prove_observe::cache_key(key.0, key.1);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _lookup = psy_prove_observe::stage_key(psy_prove_observe::Stage::CacheLookup, Some(observation_key));
+        let compile_inner = || {
             Arc::new(DapenContractFunctionCircuit::<C, D>::new(
                 fn_def,
                 state_tree_height,
@@ -397,16 +406,32 @@ where
                 false,
             ))
         };
+        let compile = || {
+            #[cfg(not(target_arch = "wasm32"))]
+            { psy_prove_observe::build(observation_key, compile_inner) }
+            #[cfg(target_arch = "wasm32")]
+            { compile_inner() }
+        };
         let compiled_from_inputs = |circuit: &DapenContractFunctionCircuit<C, D>| {
             circuit.fn_def == *fn_def && circuit.fn_builder_gadget.state_reader.contract_state_tree_height == state_tree_height
         };
         for _ in 0..3 {
             if let Some(cached) = self.contract_circuits.get(&key) {
                 if compiled_from_inputs(&cached.circuit) {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    psy_prove_observe::cache_event("cache_hit", observation_key);
                     return cached.circuit;
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                psy_prove_observe::cache_event("cache_stale_remove", observation_key);
                 self.contract_circuits.remove(&key);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            psy_prove_observe::cache_event("cache_miss", observation_key);
+            // Encloses both the single-flight wait and the owner build; child build activity
+            // distinguishes the owner. This is NOT claimed to be an internal cache-lock hold.
+            #[cfg(not(target_arch = "wasm32"))]
+            let _wait = psy_prove_observe::stage_key(psy_prove_observe::Stage::CacheWait, Some(observation_key));
             let entry = match self.contract_circuits.get_or_insert_with(&key, || {
                 let circuit = compile();
                 let estimated_bytes = circuit.estimated_prover_bytes();

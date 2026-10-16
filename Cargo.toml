@@ -38,6 +38,7 @@ members = [
 
     # ---- Client/Prover crates ----
     "client_prover/psy_core/kvq",
+    "client_prover/psy_core/psy_prove_observe",
     "client_prover/psy_core/psy_common",
     "client_prover/psy_core/psy_crypto",
     "client_prover/psy_core/psy_data",
@@ -63,6 +64,7 @@ version = "0.1.0"
 [workspace.lints]
 
 [workspace.dependencies]
+psy_prove_observe = { path = "client_prover/psy_core/psy_prove_observe" }
 
 # ---- Macros & Proc-macros ----
 syn = { version = "2.0", features = ["full"] }
@@ -363,3 +365,10 @@ psy_ups_circuit = { path = "./client_prover/psy_circuit/psy_ups_circuit", defaul
 psy_dpn_circuit = { path = "./client_prover/psy_circuit/psy_dpn_circuit", default-features = false }
 
 [profile.release]
+
+# GPU lab: build against the local plonky2-hwa worktree (candidate B + GPU work).
+[patch."https://github.com/PsyProtocol/plonky2-hwa"]
+plonky2 = { path = "../plonky2-hwa/plonky2" }
+plonky2_field = { path = "../plonky2-hwa/field" }
+plonky2_maybe_rayon = { path = "../plonky2-hwa/maybe_rayon" }
+plonky2_util = { path = "../plonky2-hwa/util" }

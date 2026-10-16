@@ -5976,7 +5976,6 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "plonky2"
 version = "1.1.0"
-source = "git+https://github.com/PsyProtocol/plonky2-hwa?rev=1dfe6112c3eca3668c15820755371a8a3e75f934#1dfe6112c3eca3668c15820755371a8a3e75f934"
 dependencies = [
  "ahash",
  "anyhow",
@@ -6004,7 +6003,6 @@ dependencies = [
 [[package]]
 name = "plonky2_field"
 version = "1.0.0"
-source = "git+https://github.com/PsyProtocol/plonky2-hwa?rev=1dfe6112c3eca3668c15820755371a8a3e75f934#1dfe6112c3eca3668c15820755371a8a3e75f934"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -6023,7 +6021,6 @@ dependencies = [
 [[package]]
 name = "plonky2_maybe_rayon"
 version = "1.0.0"
-source = "git+https://github.com/PsyProtocol/plonky2-hwa?rev=1dfe6112c3eca3668c15820755371a8a3e75f934#1dfe6112c3eca3668c15820755371a8a3e75f934"
 dependencies = [
  "rayon",
 ]
@@ -6031,7 +6028,6 @@ dependencies = [
 [[package]]
 name = "plonky2_util"
 version = "1.0.0"
-source = "git+https://github.com/PsyProtocol/plonky2-hwa?rev=1dfe6112c3eca3668c15820755371a8a3e75f934#1dfe6112c3eca3668c15820755371a8a3e75f934"
 
 [[package]]
 name = "plonky2x"
@@ -7442,6 +7438,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_prove_observe"
+version = "0.1.0"
+dependencies = [
+ "http 1.4.0",
+ "jsonrpsee",
+ "quick_cache",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "psy_prover"
 version = "0.1.0"
 dependencies = [
@@ -7484,6 +7496,7 @@ dependencies = [
  "psy_plonky2_basic_helpers",
  "psy_plonky2_circuits",
  "psy_plonky2_common_circuits",
+ "psy_prove_observe",
  "psy_provider",
  "psy_ups_circuit",
  "psy_vm",
@@ -7685,6 +7698,7 @@ dependencies = [
  "psy_crypto",
  "psy_dpn_circuit",
  "psy_network_circuit",
+ "psy_prove_observe",
  "psy_vm",
  "quick_cache",
  "rand 0.8.5",

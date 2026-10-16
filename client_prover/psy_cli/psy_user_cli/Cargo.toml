@@ -91,4 +91,5 @@ zstd = { workspace = true }
 [features]
 default = ["gnark-wrap"]
 gnark-wrap = ["psy_prover/gnark-wrap"]
+cuda = ["psy_prover/cuda"]
 is_sync = ["psy_prover/is_sync"]

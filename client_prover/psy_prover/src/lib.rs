@@ -78,6 +78,12 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
     let rpc_config = psy_config.get_current_network()?;
 
     let role = args.role;
+    // Opt-in diagnostics only. No admission or executor policy changes.
+    let observe = match psy_prove_observe::Config::from_env().map_err(anyhow::Error::msg)? {
+        Some(config) => psy_prove_observe::Observer::start(config, role.as_str(),
+            option_env!("PSY_PROVE_BUILD_ID").unwrap_or("unrecorded-build"))?,
+        None => psy_prove_observe::Observer::disabled(),
+    };
     tracing::info!(role = role.as_str(), "prove proxy role");
 
     // User circuits are built before assembly because the constructor is
@@ -108,7 +114,12 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
         .allow_methods([Method::POST, Method::OPTIONS])
         .allow_origin(Any)
         .allow_headers(Any);
-    let cors = tower::ServiceBuilder::new().layer(HealthLayer).layer(cors_opts);
+    let cors = tower::ServiceBuilder::new()
+        .layer(psy_prove_observe::HttpLayer(observe.clone()))
+        .layer(HealthLayer).layer(cors_opts);
+    let rpc_observe = observe.clone();
+    let rpc_middleware = jsonrpsee::server::middleware::rpc::RpcServiceBuilder::new()
+        .layer_fn(move |service| psy_prove_observe::RpcObserver::new(service, rpc_observe.clone(), 512 * 1024 * 1024));
     let server_addr: SocketAddr = args.listen_addr.parse()?;
     tracing::info!("Starting prove proxy server at {}", server_addr);
     let server = ServerBuilder::default()
@@ -119,12 +130,14 @@ pub async fn run_prove_proxy_server(args: psy_client_common::args::ProveProxyArg
                 .build(),
         )
         .set_http_middleware(cors)
+        .set_rpc_middleware(rpc_middleware)
         .build(server_addr)
         .await?;
 
     let handle = server.start(module);
     println!("\n[CFLI:PSY_PROVE_PROXY_STARTED][{}][{}]\n", server_addr, role.as_str());
     handle.stopped().await;
+    observe.stop();
     Ok(())
 }
 

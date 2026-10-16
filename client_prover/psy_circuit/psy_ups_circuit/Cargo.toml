@@ -40,6 +40,7 @@ hex = {workspace = true}
 
 # Native-only dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+psy_prove_observe = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

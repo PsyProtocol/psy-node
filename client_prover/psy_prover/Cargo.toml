@@ -45,6 +45,7 @@ bincode = { workspace = true }
 
 # Native-only dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+psy_prove_observe = { workspace = true }
 kvq = { workspace = true }
 serde_cbor = { workspace = true }
 # psy_store = { workspace = true, default-features = false }
@@ -86,6 +87,8 @@ flate2 = { workspace = true }
 
 [features]
 gnark-wrap = ["dep:gnark-plonky2-verifier-ffi", "psy_plonky2_circuits/gnark-wrap"]
+# GPU lab: CUDA commitments in plonky2 (runtime switch PLONKY2_GPU=1).
+cuda = ["plonky2/cuda"]
 # default = ["is_sync"]
 is_sync = [
     "maybe-async/is_sync",

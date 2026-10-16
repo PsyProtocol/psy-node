@@ -374,10 +374,13 @@ impl UserProveProvider {
 
     async fn register_contract_circuits_inner(&self, contract_id: u64) -> anyhow::Result<()> {
         tracing::debug!("register_contract_circuits contract_id: {}", contract_id);
+        let _upstream = psy_prove_observe::stage(psy_prove_observe::Stage::Upstream);
         let contract_code = self
             .rpc_provider
             .resolve_get_contract_code(&QSRCmdGetContractCodeDefinition { contract_id })
             .await?;
+        drop(_upstream);
+        let _register = psy_prove_observe::stage(psy_prove_observe::Stage::Register);
         self.circuit_manager
             .register_contract_circuits(contract_id, &contract_code)
             .await
@@ -394,7 +397,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         let circuit_manager = self.circuit_manager.clone();
         let input = input.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || circuit_manager.ups_start.prove_base(&input));
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || circuit_manager.ups_start.prove_base(&input));
 
         let proof_result = proof_join_handle.await.map_err(|join_err| {
             ErrorObjectOwned::owned(
@@ -422,7 +425,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         let circuit_manager = self.circuit_manager.clone();
         let input = input.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || circuit_manager.ups_start_register_user.prove_base(&input));
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || circuit_manager.ups_start_register_user.prove_base(&input));
 
         let proof_result = proof_join_handle.await.map_err(|join_err| {
             ErrorObjectOwned::owned(
@@ -488,11 +491,14 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         method_name: String,
     ) -> Result<(u64, DPNFunctionCircuitDefinition), ErrorObjectOwned> {
         tracing::debug!("get_fn_id contract_id: {}, method_name: {}", contract_id, method_name);
+        let _upstream = psy_prove_observe::stage(psy_prove_observe::Stage::Upstream);
         let contract_code = self
             .rpc_provider
             .resolve_get_contract_code(&QSRCmdGetContractCodeDefinition { contract_id })
             .await
             .map_err(|err| ErrorObjectOwned::owned(1, "get contract code error", Some(err.to_string())))?;
+        drop(_upstream);
+        let _resolve = psy_prove_observe::stage(psy_prove_observe::Stage::Resolve);
         self.circuit_manager
             .resolve_contract_function_by_method_name(contract_id, &contract_code, method_name)
             .await
@@ -542,7 +548,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
             // The prover circuit may have been evicted; rebuilding it can take
             // seconds, so fetch it on the blocking pool together with proving.
-            tokio::task::spawn_blocking(move || {
+            psy_prove_observe::spawn_blocking(move || {
                 let fn_circuit = circuit_manager
                     .contract_function_circuit(contract_id, fn_id)
                     .map_err(|err| ErrorObjectOwned::owned(1, "fn_circuit build error", Some(err.to_string())))?;
@@ -576,7 +582,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         let circuit_manager = self.circuit_manager.clone();
         let input = input.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || circuit_manager.ups_cfc_standard_tx.prove_base(&input));
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || circuit_manager.ups_cfc_standard_tx.prove_base(&input));
 
         let proof_result = proof_join_handle.await.map_err(|join_err| {
             ErrorObjectOwned::owned(
@@ -604,7 +610,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         let circuit_manager = self.circuit_manager.clone();
         let input = input.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || circuit_manager.ups_cfc_deferred_tx.prove_base(&input));
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || circuit_manager.ups_cfc_deferred_tx.prove_base(&input));
 
         let proof_result = proof_join_handle.await.map_err(|join_err| {
             ErrorObjectOwned::owned(
@@ -635,7 +641,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         })?;
 
         let circuit_manager = self.circuit_manager.clone();
-        let proof_join_handle = tokio::task::spawn_blocking(move || {
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move { circuit_manager.prove_zk_sign_minifier(inner_proof).await })
         });
 
@@ -668,7 +674,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         })?;
 
         let proof_join_handle =
-            tokio::task::spawn_blocking(move || circuit_manager.private_note_inclusion_minifier_circuit().prove_minifier(base_proof));
+            psy_prove_observe::spawn_blocking(move || circuit_manager.private_note_inclusion_minifier_circuit().prove_minifier(base_proof));
         let proof_result = proof_join_handle.await.map_err(|join_err| {
             ErrorObjectOwned::owned(
                 1,
@@ -692,7 +698,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         })?;
 
         let proof_join_handle =
-            tokio::task::spawn_blocking(move || circuit_manager.shield_deposit_claim_minifier_circuit().prove_minifier(base_proof));
+            psy_prove_observe::spawn_blocking(move || circuit_manager.shield_deposit_claim_minifier_circuit().prove_minifier(base_proof));
         let proof_result = proof_join_handle.await.map_err(|join_err| {
             ErrorObjectOwned::owned(1, "prove_shield_deposit_claim_minifier: task schedule failed", Some(join_err.to_string()))
         })?;
@@ -704,7 +710,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
         let circuit_manager = self.circuit_manager.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || circuit_manager.secp_circuit().prove(&signature));
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || circuit_manager.secp_circuit().prove(&signature));
 
         let proof_result = proof_join_handle.await.map_err(|join_err| {
             ErrorObjectOwned::owned(
@@ -731,7 +737,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
         let circuit_manager = self.circuit_manager.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || circuit_manager.eth_personal_secp_circuit().prove(&signature));
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || circuit_manager.eth_personal_secp_circuit().prove(&signature));
 
         let proof_result = proof_join_handle.await.map_err(|join_err| {
             ErrorObjectOwned::owned(
@@ -815,7 +821,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
         let circuit_manager = self.circuit_manager.clone();
         let circuit_info = self.circuit_info.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || {
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || {
             let agg_whitelist_merkle_proof = circuit_manager
                 .proof_tree_agg_circuits
                 .circuit_inclusion_proofs
@@ -858,7 +864,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
         let circuit_manager = self.circuit_manager.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || {
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || {
             circuit_manager.proof_tree_agg_circuits.circuit_set.single_leaf_circuit.prove_base(
                 agg_circuit_whitelist_root,
                 &single_insert_leaf_proof,
@@ -898,7 +904,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
         let circuit_manager = self.circuit_manager.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || {
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || {
             circuit_manager.proof_tree_agg_circuits.circuit_set.two_leaf_circuit.prove_base(
                 agg_circuit_whitelist_root,
                 &left_insert_leaf_proof,
@@ -942,7 +948,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
         let circuit_manager = self.circuit_manager.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || {
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || {
             circuit_manager.proof_tree_agg_circuits.circuit_set.two_agg_circuit.prove_base(
                 &left_agg_whitelist_merkle_proof,
                 &left_agg_proof_header,
@@ -986,7 +992,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
         let circuit_manager = self.circuit_manager.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || {
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || {
             circuit_manager
                 .proof_tree_agg_circuits
                 .circuit_set
@@ -1033,7 +1039,7 @@ impl ProveProxyUserRpcServer for UserProveProvider {
 
         let circuit_manager = self.circuit_manager.clone();
 
-        let proof_join_handle = tokio::task::spawn_blocking(move || {
+        let proof_join_handle = psy_prove_observe::spawn_blocking(move || {
             circuit_manager
                 .proof_tree_agg_circuits
                 .circuit_set

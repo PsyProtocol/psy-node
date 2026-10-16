@@ -1,0 +1,19 @@
+[package]
+name = "psy_prove_observe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
+jsonrpsee = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+quick_cache = { workspace = true }
