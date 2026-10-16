@@ -124,6 +124,11 @@ DB Pod 经 PVC 使用 x4 本地 PV，Pod 重建可复用同一卷，x4 故障时
 保留三个 MetalLB speaker 与三个 Traefik 副本及可推进的滚动策略。
 完整集群与跨节点 DNS/网络/隔离、业务镜像和交易流程仍需现场验收。
 
+磁盘扩容期间可先运行 `prepare-delivery.py` 组装四台各自的完整输入包；未确认存储
+的包保持不可执行。新 platform/ 同时包含 `network-acceptance.py`，准备 DNS、
+跨 worker HTTP、NetworkPolicy 允许/拒绝路径及 LAN 入口的现场验收。生成脚本和
+离线测试通过不等于真实四机网络已经验收，具体步骤见 RUNBOOK。
+
 概念依据：[Service](https://kubernetes.io/docs/concepts/services-networking/service/)、
 [NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/)、
 [PV](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)、

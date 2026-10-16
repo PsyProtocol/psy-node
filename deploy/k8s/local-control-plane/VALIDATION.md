@@ -46,3 +46,26 @@ and [metrics-server](https://github.com/k3s-io/k3s/blob/v1.35.9%2Bk3s1/manifests
 tolerate the standard control-plane taint. A dedicated control-only taint is added,
 worker-only node-exporter is rendered, and verification requires zero scheduled
 Pods on psy-lab-cp-local. CoreDNS/metrics Pending before workers join is expected.
+
+## Additional preparation while x4 disk is being expanded
+
+- Added per-host delivery assembly and network acceptance, with 11 new regression
+  tests (46 including the previous suites). Coverage includes package role/hash
+  boundaries, bad-asset rejection before output, offline/unconfirmed execution
+  guards, worker-only restricted probes, positive and negative connectivity
+  controls, namespace AND Pod selectors, and fake-cluster orchestration.
+- Resolved official BusyBox 1.37.0 linux/amd64 digest via Docker Hub manifest.
+  Ran its httpd/wget as UID 1000, no external network, no capabilities, read-only
+  root filesystem and temporary /www; unique HTTP response matched. This tests
+  image commands, not Kubernetes networking or CNI enforcement.
+- Used pinned K3s in an isolated temporary Docker container, without agent, host
+  mounts or published ports. Actual API/server dry-run admitted all 16 workload,
+  Service, NetworkPolicy, ReferenceGrant and HTTPRoute objects, with restricted
+  Pod admission enforced on the two fixture namespaces; no warnings/errors.
+  The test caught a default ServiceAccount creation race. The runner now creates
+  dedicated tokenless probe identities before Pods. Container was stopped/removed.
+- Live four-host cluster/NetworkPolicy/Gateway acceptance still requires the
+  operator's br0 and x4 disk steps. API dry-run does not demonstrate DNS, routing,
+  policy enforcement, storage recovery or Psy transactions.
+- Read-only host update: x2/x3 still lack br0; x4 SSH was unavailable during the
+  operator's disk work. No host network/disk action was attempted by the agent.

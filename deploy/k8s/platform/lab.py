@@ -364,6 +364,9 @@ echo 'Installed; use systemctl status psy-lab-k3s and k3s kubectl get nodes'
     write(plat / "api-vip", api_address(config) + "\n")
     write(plat / "ingress-vip", config["ingress_vip"] + "\n")
     write(plat / "server-ips.json", [n["ip"] for n in config["nodes"] if n["role"] == "server"])
+    if local_control(config):
+        write(plat / "network-acceptance.py", (HERE.parent / "local-control-plane/network-acceptance.py").read_text(), True)
+        write(plat / "network-acceptance.json", {"topology": "local-control-plane", "execution_enabled": config["network_confirmed"] and config["storage_confirmed"], "workers": ["psy-lab-work-" + role for role in ("x2", "x3", "x4")], "ingress_vip": config["ingress_vip"]})
     print(json.dumps({"output": str(destination), "inventory_sha256": stamp, "execution_enabled": config["network_confirmed"] and config["storage_confirmed"]}))
 
 

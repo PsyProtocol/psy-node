@@ -105,3 +105,53 @@ sudo python3 host_setup.py x4 storage --apply
 
 保留本机控制 VM 的 etcd snapshot **和同一 server token**到另一台物理机；它们
 不替代 x4 数据备份。中断时保留域/磁盘/etcd，先查原因，不运行删除或自动重建。
+
+## 一次生成每台机器的完整输入包
+
+`prepare-delivery.py` 在本机生成 bundle，并为 local/x2/x3/x4 分别组装完整输入：
+对应的 host.json/XML/cloud-init、独立 Ubuntu 镜像副本、对应 guest/ 安装文件、
+固定 K3s 二进制、资产锁、源码提交与 SHA256SUMS。包内没有私钥、token 或 kubeconfig。
+输出本身约 3 GiB，提前检查本机空间；它只写本机的新目录，不连接或启动远端机器。
+
+从干净且已提交的源码根目录执行：
+
+```bash
+python3 deploy/k8s/local-control-plane/prepare-delivery.py \
+  --inventory /absolute/inventory.json \
+  --assets /absolute/assets \
+  --output /absolute/new-delivery
+```
+
+只向对应机器复制 `host-packages/<role>/`，进入该目录先执行
+`sha256sum --check SHA256SUMS`，再运行不带 --apply 的创建计划。
+storage_confirmed=false 的包可预先分发，但拒绝安装。磁盘/网络就绪后重新预检，
+生成新的、已确认的交付包；保留旧包，不在已分发包中手改确认状态。
+
+## 平台启动后的网络与隔离验收
+
+新的四节点 platform/ 包含 `network-acceptance.py` 和对应只含非敏感配置的 JSON。
+先 `python3 network-acceptance.py --plan` 离线检查清单；真实平台验证通过后，在
+同一 platform/ 目录和明确的实验 `KUBECONFIG` 下执行：
+
+```bash
+python3 network-acceptance.py --run --evidence /absolute/new-evidence-directory
+```
+
+入口会重新核对 API/四节点身份、控制面污点及平台就绪，再创建两个带随机后缀的
+专用实验 namespace，全部测试 Pod 固定在三个 worker，不调度到本机。
+它先验证五个客户端的基线 DNS/HTTP，再施加两个 namespace 的默认入站/出站拒绝、
+DNS 放行、namespace AND Pod label 限定的 HTTP 放行。三个合法客户端必须成功，
+错误 namespace、错误 Pod label 的两个对照客户端必须被阻断，且 DNS 仍正常。
+拒绝判定要求实际 wget 超时；exec/认证错误、DNS 失败或 HTTP 404 不算隔离成功。
+
+最后创建专属 HTTPRoute（psy-platform）和仅授权测试 Service 的 ReferenceGrant，
+从操作机经 LAN VIP/Traefik 访问后端并核对本轮唯一响应体。它不修改现有 Gateway
+或业务 NetworkPolicy，不部署 Psy 数据库、不验证交易与持久卷恢复。
+
+清单和结果以 mode 600 保存在新证据目录。成功/失败都保留现场，不自动清理；
+测试 Pod 最长运行 30 分钟，不自动重启。检查 result.json 中的随机 namespace、
+HTTPRoute 名字及它们的 `psy.local/acceptance-run` 标签，确认属于本轮后再删除
+这些测试资源。不要删除 psy-platform namespace 或其他实验/业务资源。
+
+协议依据：[NetworkPolicy 选择器组合](https://kubernetes.io/docs/concepts/services-networking/network-policies/)、
+[Gateway API ReferenceGrant](https://gateway-api.sigs.k8s.io/api-types/referencegrant/)。
