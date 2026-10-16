@@ -75,86 +75,91 @@ impl PsyCompileResult {
     }
 
     pub fn injest_sfr(&mut self, sym_store: &SymFeltStore, value: SymFeltRef) -> u64 {
-        if self.indexed_map.contains_key(&value) {
-            return *self.indexed_map.get(&value).unwrap();
-        }
+        let mut pending = vec![(value, false)];
+        while let Some((value, ready)) = pending.pop() {
+            if self.indexed_map.contains_key(&value) {
+                continue;
+            }
+            let children = sym_store.get_direct_children(value);
+            if !ready {
+                pending.push((value, true));
+                pending.extend(children.into_iter().rev().map(|child| (child, false)));
+                continue;
+            }
+            // Preserve recursive postorder, including register allocation order.
+            let mut children_inds = children.iter().map(|child| self.indexed_map[child]).collect::<Vec<_>>();
 
-        let mut children_inds = sym_store
-            .get_direct_children(value)
-            .into_iter()
-            .map(|c| self.injest_sfr(sym_store, c))
-            .collect::<Vec<_>>();
-
-        let new_base_index = match value.get_op_type().get_data_type() {
-            DPNBuiltInDataType::Target => {
-                let v = self.total_targets;
-                self.total_targets += 1;
-                v
-            }
-            DPNBuiltInDataType::Bool => {
-                let v = self.total_bools;
-                self.total_bools += 1;
-                v
-            }
-            DPNBuiltInDataType::U32Target => {
-                let v = self.total_u32s;
-                self.total_u32s += 1;
-                v
-            }
-            DPNBuiltInDataType::HashOut => {
-                let v = self.total_hashes;
-                self.total_hashes += 1;
-                v
-            }
-            DPNBuiltInDataType::HashOut160 => {
-                let v = self.total_hash160s;
-                self.total_hash160s += 1;
-                v
-            }
-            DPNBuiltInDataType::TargetArray => {
-                let v = self.total_target_arrays;
-                self.total_target_arrays += 1;
-                v
-            }
-            DPNBuiltInDataType::BoolArray => {
-                let v = self.total_bool_arrays;
-                self.total_bool_arrays += 1;
-                v
-            }
-            DPNBuiltInDataType::U32TargetArray => {
-                let v = self.total_u32_arrays;
-                self.total_u32_arrays += 1;
-                v
-            }
-            DPNBuiltInDataType::Unknown => panic!("unsupported data type"),
-        };
-        if !value.needs_store() {
-            let idef = value.get_inline_def();
-            self.definitions.push(DPNIndexedVarDef {
-                data_type: idef.op_type.get_data_type(),
-                index: new_base_index,
-                op_type: idef.op_type,
-                inputs: vec![idef.const_param],
-            });
-        } else {
-            let vdef = sym_store.get(value);
-            let mut inputs = if value.get_op_type().has_constant_param() {
-                vec![vdef.const_param]
-            } else {
-                vec![]
+            let new_base_index = match value.get_op_type().get_data_type() {
+                DPNBuiltInDataType::Target => {
+                    let v = self.total_targets;
+                    self.total_targets += 1;
+                    v
+                }
+                DPNBuiltInDataType::Bool => {
+                    let v = self.total_bools;
+                    self.total_bools += 1;
+                    v
+                }
+                DPNBuiltInDataType::U32Target => {
+                    let v = self.total_u32s;
+                    self.total_u32s += 1;
+                    v
+                }
+                DPNBuiltInDataType::HashOut => {
+                    let v = self.total_hashes;
+                    self.total_hashes += 1;
+                    v
+                }
+                DPNBuiltInDataType::HashOut160 => {
+                    let v = self.total_hash160s;
+                    self.total_hash160s += 1;
+                    v
+                }
+                DPNBuiltInDataType::TargetArray => {
+                    let v = self.total_target_arrays;
+                    self.total_target_arrays += 1;
+                    v
+                }
+                DPNBuiltInDataType::BoolArray => {
+                    let v = self.total_bool_arrays;
+                    self.total_bool_arrays += 1;
+                    v
+                }
+                DPNBuiltInDataType::U32TargetArray => {
+                    let v = self.total_u32_arrays;
+                    self.total_u32_arrays += 1;
+                    v
+                }
+                DPNBuiltInDataType::Unknown => panic!("unsupported data type"),
             };
-            inputs.append(&mut children_inds);
-            self.definitions.push(DPNIndexedVarDef {
-                data_type: vdef.op_type.get_data_type(),
-                index: new_base_index,
-                op_type: vdef.op_type,
-                inputs,
-            });
-        }
+            if !value.needs_store() {
+                let idef = value.get_inline_def();
+                self.definitions.push(DPNIndexedVarDef {
+                    data_type: idef.op_type.get_data_type(),
+                    index: new_base_index,
+                    op_type: idef.op_type,
+                    inputs: vec![idef.const_param],
+                });
+            } else {
+                let vdef = sym_store.get(value);
+                let mut inputs = if value.get_op_type().has_constant_param() {
+                    vec![vdef.const_param]
+                } else {
+                    vec![]
+                };
+                inputs.append(&mut children_inds);
+                self.definitions.push(DPNIndexedVarDef {
+                    data_type: vdef.op_type.get_data_type(),
+                    index: new_base_index,
+                    op_type: vdef.op_type,
+                    inputs,
+                });
+            }
 
-        let new_op_id = encode_indexed_op_id(value.get_op_type().get_data_type(), new_base_index);
-        self.indexed_map.insert(value, new_op_id);
-        new_op_id
+            let new_op_id = encode_indexed_op_id(value.get_op_type().get_data_type(), new_base_index);
+            self.indexed_map.insert(value, new_op_id);
+        }
+        self.indexed_map[&value]
     }
 
     pub fn injest_state_cmd(&mut self, sym_store: &SymFeltStore, cmd: DPNStateCmd<SymFeltRef>) {

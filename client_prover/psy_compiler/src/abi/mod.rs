@@ -219,6 +219,9 @@ pub enum PrimitiveTypeName {
     Bool,
     U32,
     Hash,
+    U64,
+    U128,
+    U256,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -614,7 +617,24 @@ impl AbiTypeProofPlan {
         visiting: &mut Vec<String>,
     ) -> anyhow::Result<u32> {
         let (type_key, circuit_kind, dependencies) = match ty {
-            TypeRef::Primitive { name } => (format!("primitive:{name:?}"), AbiTypeProofCircuitKind::Primitive, Vec::new()),
+            TypeRef::Primitive { name } => match name {
+                PrimitiveTypeName::U64 | PrimitiveTypeName::U128 | PrimitiveTypeName::U256 => {
+                    let length = match name {
+                        PrimitiveTypeName::U64 => 2,
+                        PrimitiveTypeName::U128 => 4,
+                        _ => 8,
+                    };
+                    return Self::intern_type(
+                        &TypeRef::Array {
+                            item: Box::new(TypeRef::Primitive { name: PrimitiveTypeName::U32 }),
+                            length,
+                            item_felt_size: 1,
+                        },
+                        definitions, by_key, nodes, visiting,
+                    );
+                }
+                _ => (format!("primitive:{name:?}"), AbiTypeProofCircuitKind::Primitive, Vec::new()),
+            },
             TypeRef::Array { item, length, .. } => {
                 let child = Self::intern_type(item, definitions, by_key, nodes, visiting)?;
                 let child_key = &nodes[child as usize].type_key;

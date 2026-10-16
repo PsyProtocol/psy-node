@@ -133,6 +133,9 @@ pub enum PrimitiveTypeName {
     Bool,
     U32,
     Hash,
+    U64,
+    U128,
+    U256,
 }
 
 /// Source-level map type family.

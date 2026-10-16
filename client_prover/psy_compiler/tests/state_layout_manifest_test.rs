@@ -1,6 +1,33 @@
 use psy_compiler::{abi::TypeRef, compile};
 
 #[test]
+fn uint_compiler_abi_round_trip_retains_limb_counts() {
+    for (name, limb_count) in [("U64", 2usize), ("U128", 4), ("U256", 8)] {
+        let json = format!(
+            r#"{{
+                "schema_version":"2.0.0",
+                "contract":{{
+                    "name":"UintContract","state_tree_height":4,
+                    "state":[{{"name":"value","type":{{"kind":"primitive","name":"{name}"}},"offset":0,"felt_size":{limb_count}}}],
+                    "methods":[{{"name":"set_value","method_id":1329233053,"state_mutability":"external",
+                        "inputs":[{{"name":"value","type":{{"kind":"primitive","name":"{name}"}},"felt_size":{limb_count}}}],
+                        "outputs":[],"input_felt_count":{limb_count},"output_felt_count":0}}]
+                }},"types":[]
+            }}"#
+        );
+        let abi: psy_compiler::abi::Abi = serde_json::from_str(&json).unwrap();
+        abi.contract.state_layout.validate().unwrap();
+        assert_eq!(abi.contract.state_layout.slot_count, limb_count as u64);
+        assert_eq!(abi.contract.state_layout.type_proof_plan.nodes[1].circuit_kind, psy_compiler::abi::AbiTypeProofCircuitKind::FixedArray);
+        let output = serde_json::to_value(&abi).unwrap();
+        assert_eq!(output["contract"]["state"][0]["type"]["name"], name);
+        assert_eq!(output["contract"]["methods"][0]["input_felt_count"], limb_count);
+        let client_abi: psy_client_data::abi::Abi = serde_json::from_str(&abi.to_json().unwrap()).unwrap();
+        assert_eq!(client_abi.contract.state[0].felt_size, limb_count);
+    }
+}
+
+#[test]
 #[ignore = "writes ABI fixtures for the update-contract end-to-end test"]
 fn generate_contract6_old_and_new_abi_fixtures() {
     let old_source = r#"
