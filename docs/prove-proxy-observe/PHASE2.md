@@ -1,5 +1,7 @@
 # 阶段二：证明内部阶段与资源等待
 
+开销来源、已有测量的适用范围和后续 release A/B 记录见 [OVERHEAD.md](OVERHEAD.md)。
+
 首版已提交 `psy-node 2f155713e39eff838adb945ede33f554c834b5c7`，未推送或部署。本阶段继续在同一个隔离工作区，`plonky2-hwa` 分支为 `obs/prove-proxy-stages-20261016`，基线 `3b79153477d234fc4c8d2b310c83f4d41f71255a`。
 
 两个仓库的本阶段改动需要配套使用：psy-node 的本地 `[patch]` 已指向旁边的 plonky2-hwa；不能只取 psy-node 的 hooks feature 而继续使用没有 hook API 的旧 plonky2。仍然是本地候选，不是新的远端依赖 pin 或生产 release。
