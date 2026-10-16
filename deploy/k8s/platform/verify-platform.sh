@@ -2,7 +2,9 @@
 python3 check-cluster.py
 kubectl -n kube-system rollout status deployment/coredns --timeout=5m
 kubectl -n kube-system rollout status deployment/metrics-server --timeout=5m
-kubectl -n kube-system rollout status daemonset/psy-lab-kube-vip --timeout=5m
+if [[ -f kube-vip.json ]]; then
+  kubectl -n kube-system rollout status daemonset/psy-lab-kube-vip --timeout=5m
+fi
 kubectl -n metallb-system rollout status deployment/psy-lab-metallb-controller --timeout=5m
 kubectl -n metallb-system rollout status daemonset/psy-lab-metallb-speaker --timeout=5m
 kubectl -n psy-platform rollout status deployment/psy-lab-traefik --timeout=5m
@@ -13,9 +15,16 @@ def get(ns,kind,name):
  return json.loads(subprocess.check_output(["kubectl","-n",ns,"get",kind,name,"-o","json"]))
 def check(ok,why):
  if not ok: raise SystemExit(why)
-for ns,name,count in [("kube-system","psy-lab-kube-vip",3),("metallb-system","psy-lab-metallb-speaker",3),("psy-observe","psy-lab-prometheus-prometheus-node-exporter",6)]:
+expected=json.loads(Path("expected-nodes.json").read_text())
+single="psy-lab-cp-local" in expected
+counts=[("metallb-system","psy-lab-metallb-speaker",3),("psy-observe","psy-lab-prometheus-prometheus-node-exporter",3 if single else len(expected))]
+if Path("kube-vip.json").exists(): counts.append(("kube-system","psy-lab-kube-vip",3))
+for ns,name,count in counts:
  ds=get(ns,"daemonset",name)
  check(ds["status"].get("desiredNumberScheduled")==count and ds["status"].get("numberReady")==count,"Wrong ready count: "+name)
+if single:
+ pods=json.loads(subprocess.check_output(["kubectl","get","pods","--all-namespaces","--field-selector","spec.nodeName=psy-lab-cp-local","-o","json"]))["items"]
+ check(not pods,"Control plane must have no scheduled Pods")
 service=get("psy-platform","service","psy-lab-traefik")
 check({x.get("ip") for x in service["status"].get("loadBalancer",{}).get("ingress",[])}=={Path("ingress-vip").read_text().strip()},"Application VIP not allocated")
 pods=json.loads(subprocess.check_output(["kubectl","-n","psy-platform","get","pods","-l","app.kubernetes.io/name=traefik","-o","json"]))["items"]

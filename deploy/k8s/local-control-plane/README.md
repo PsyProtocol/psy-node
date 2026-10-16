@@ -3,14 +3,15 @@
 这是根据用户 2026-10-16 决定新建的独立目录，取代原三机六 VM 方案作为下一轮
 本地实验的设计方向。用户已确认施工，并要求所有宿主机 sudo 步骤由本人执行。
 [host-setup](host-setup/README.md) 提供对应管理员安装、网络/回退与新盘准备脚本；
-`../platform/` 已发布脚本仍针对三机六 VM，尚不能直接执行来得到此新拓扑。
+共享 renderer 现已支持本目录的四节点 inventory，普通用户 VM 创建入口也已适配。
+执行顺序见 [RUNBOOK.md](RUNBOOK.md)，不再使用旧六 VM inventory/root 创建入口。
 本轮仍不迁移或停止线上业务、不改动 x1、不自动重启任何机器。
 
 ## 物理布局
 
 | 位置 | 新实验职责 | 起步 VM 候选资源 | 系统存储池可用空间门槛 |
 | --- | --- | --- | --- |
-| 本机 arch3900x | 单 K3s 控制 VM，taint 阻止普通业务调度 | 4 vCPU / 8 GiB / 60 GiB OS | 76 GiB |
+| 本机 arch3900x | 单 K3s 控制 VM，所有 Pod 留在远端工作节点 | 4 vCPU / 8 GiB / 60 GiB OS | 76 GiB |
 | x2 | 一个业务工作 VM | 4 vCPU / 8 GiB / 40 GiB OS | 56 GiB |
 | x3 | 一个业务工作 VM，后续重点承载证明 | 6 vCPU / 12 GiB / 40 GiB OS | 56 GiB |
 | x4 | 一个业务工作 VM，优先承载持久化数据 | 8 vCPU / 20 GiB / 40 GiB OS，另 256 GiB 数据盘 | OS 56 GiB，新盘池 288 GiB |
@@ -22,11 +23,11 @@
 
 本机只读观测：Ryzen 9 5900XT、约 125 GiB RAM、当前约 51 GiB MemAvailable、
 根盘约 250 GiB 可用；本机地址为 192.168.5.20，**不是为控制 VM 预留的新 IP**。
-本机当前无 /dev/kvm，CPU 暴露 flags 未见 svm，virsh/qemu-img/cloud-localds 未安装。
-VM 方案须先确认虚拟化支持和配置，不能据 CPU 型号宣称 KVM 已可用。本轮不更改
-BIOS、内核模块、软件包、宿主网桥或已有服务。重启后的只读预检已完成：三台有 KVM，
-但尚缺 libvirt/QEMU/cloud-localds，x3 仍约 40 GiB 可用，x4 尚未看到新增盘。
-x3 磁盘由用户处理。x2/x3/x4 仍有 Proxy 等旧服务在运行，脚本不自动停止它们。
+2026-10-16 更新：用户开启本机 SVM，并在四台宿主机执行了管理员安装脚本。
+四台 KVM、helpers、普通用户 libvirt、内存和 OS 池容量均通过只读验收；本机还
+用无网卡、临时快照启动了已校验 Ubuntu 镜像，内核和 init 启动成功后退出。
+x3 清理后 OS 池约 139 GiB 可用；四台 br0 和 x4 新盘尚未就绪。用户已确认路由器
+做了地址保留。x2/x3/x4 的旧服务不由本实验脚本自动停止。
 
 ## 独立运行目录
 
@@ -71,8 +72,15 @@ API 的控制器、服务发现更新和故障恢复受限，不能承诺业务�
 
 平台还需 CoreDNS、metrics-server、MetalLB、Traefik、Prometheus、Grafana、
 Alertmanager、Operator、kube-state-metrics、每节点 node-exporter。新拓扑的
-node-exporter 期望 4 份，不再使用旧 6 份验收；不部署旧 Collector/Controller。
+node-exporter 仅在三个工作节点运行，共 3 份；不部署旧 Collector/Controller。
 blackbox 与镜像仓库如加装要单独计数，准确 Pod 数以新模板与现场验收为准。
+
+“四节点”包含控制节点，不表示四台都承载工作负载。本机控制 VM 仅运行 K3s
+控制面进程与必需节点基础进程，数据库、业务、DNS、入口和监控 Pod 全部在
+x2/x3/x4。除标准控制面污点，再加 `psy.local/control-only=true:NoSchedule`，
+避免 K3s 默认 CoreDNS/metrics-server 对标准控制面污点的容忍使它们落到本机。
+第一个 server 启动后、workers 加入前，DNS/metrics Pod Pending 是预期行为。
+监控 node-exporter 也限定 worker；最终验收要求控制节点上 Pod 数为零。
 
 Services PostgreSQL 和 Envio PostgreSQL 初期保持两套，避免把 schema/迁移耦合
 合并。Processor 的实际 Scylla/Valkey/NATS 依赖按角色冻结；不能给每个程序全库权限。
@@ -109,15 +117,12 @@ DB Pod 经 PVC 使用 x4 本地 PV，Pod 重建可复用同一卷，x4 故障时
 一套数据副本。先接受并验证数据单点，备份必须到另一台机器；数据库复制、高可用、
 跨节点存储是后续独立工作。Kubernetes 重建 Pod 不能代替数据库复制或应用 fencing。
 
-## 施工前的具体变更
+## 施工状态
 
-1. 人执行 host-setup 的管理员步骤，解决本机 KVM 前提与地址/网桥，普通用户验收。
-2. 共享 renderer 加入新 topology，生成 local 一个 server 与 x2/x3/x4 各一 agent；
-   不再给三台工作机生成控制 VM，也不允许 x1 进入 inventory。
-3. API 地址直接指向本机控制 VM，调整 bootstrap、etcd 备份与安装顺序。
-4. 验收节点数量从 6 改为 4，node-exporter 从 6 改为 4，去掉 kube-vip 验收；
-   保留三个 MetalLB speaker 与三个 Traefik 副本及可推进的滚动策略。
-5. 重启后只读预检通过，再启动平台与跨节点 DNS/网络/隔离测试；业务分批迁入。
+已完成四节点渲染、普通用户 libvirt 创建入口、直接 API 引导及新拓扑验收。
+待人执行网桥/新盘准备后，重新验收和渲染为可执行包，再创建实际集群。
+保留三个 MetalLB speaker 与三个 Traefik 副本及可推进的滚动策略。
+完整集群与跨节点 DNS/网络/隔离、业务镜像和交易流程仍需现场验收。
 
 概念依据：[Service](https://kubernetes.io/docs/concepts/services-networking/service/)、
 [NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/)、

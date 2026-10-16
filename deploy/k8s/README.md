@@ -4,8 +4,9 @@
 machine and x2/x3/x4 as workers; x1 stays on live workloads. See the
 [local control-plane discussion](local-control-plane/README.md). Its dedicated
 directory includes [operator-run host prerequisites](local-control-plane/host-setup/README.md),
-but the executable platform runner below still targets
-the previous six-VM topology and must be adapted before installation.
+and [four-node construction instructions](local-control-plane/RUNBOOK.md).
+The shared renderer supports both inventories; use the local-control-plane
+inventory for the current lab. Only the three remote workers run Pods.
 
 The `deploy/k8s/` directory owns the local Kubernetes build and deployment
 preparation. The original target was an isolated lab on x2/x3/x4, with three
@@ -45,7 +46,7 @@ image paths have a tested build harness; real Psy compilation/proof/E2E and the
 remaining Envio/frontend/admission inputs are still pending. Published platform
 versions are candidates rather than a verified installation combination.
 
-Continue with [the platform construction runbook](platform/README.md). It covers
+The [previous platform runbook](platform/README.md) covers
 host checks, six VM bundles, K3s/embedded etcd, kube-vip, MetalLB, Traefik Gateway
 API and kube-prometheus-stack. Preparation and rendering are offline/read-only;
 the generated installation scripts require deliberate execution on confirmed lab
@@ -56,6 +57,7 @@ The monitoring target is Prometheus,
 Grafana and Alertmanager, with native Psy metrics or a small read-only exporter;
 the legacy Collector/Controller are not long-term deployment dependencies.
 
-No script has been executed to change x2/x3/x4 as part of this preparation.
-Construction scripts do not stop existing services, change host bridges, format
-physical disks, reset chain state, push images or publish packages.
+The operator has installed host prerequisites. Bridges and x4 expanded storage
+remain operator-run steps; the cluster has not been created. VM construction
+does not stop existing services, change host bridges, format physical disks,
+reset chain state, push images or publish packages.

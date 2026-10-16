@@ -32,12 +32,30 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def local_control(config):
+    return config.get("topology", "three-host-ha") == "local-control-plane"
+
+
+def first_server(config):
+    name = "psy-lab-cp-local" if local_control(config) else "psy-lab-cp-x2"
+    matches = [n for n in config["nodes"] if n["name"] == name and n["role"] == "server"]
+    require(len(matches) == 1, "missing/duplicate first control node")
+    return matches[0]
+
+
+def api_address(config):
+    return config["api_address"] if local_control(config) else config["api_vip"]
+
+
 def validate(config):
     require(config["lab"] == "psy-k8s-local", "only the isolated psy-k8s-local lab is supported")
     for key in ("network_confirmed", "storage_confirmed"):
         require(type(config[key]) is bool, f"{key} must be boolean")
-    require(set(config["hosts"]) == {"x2", "x3", "x4"}, "exactly x2/x3/x4 required")
-    require(len(config["nodes"]) == 6, "exactly six VMs required")
+    require(config.get("topology", "three-host-ha") in {"three-host-ha", "local-control-plane"}, "unknown topology")
+    single = local_control(config)
+    require(set(config["hosts"]) == ({"local", "x2", "x3", "x4"} if single else {"x2", "x3", "x4"}), "unexpected physical host set; x1 is excluded")
+    require(len(config["nodes"]) == (4 if single else 6), "unexpected VM count")
+    require(all(n["host"] in config["hosts"] and n["role"] in {"server", "agent"} for n in config["nodes"]), "invalid node host/role")
     lan = ipaddress.IPv4Network(config["lan_cidr"])
     networks = [lan] + [ipaddress.IPv4Network(config[k]) for k in ("pod_cidr", "service_cidr")]
     networks += [ipaddress.IPv4Network(c) for c in config["reserved_cidrs"]]
@@ -45,7 +63,9 @@ def validate(config):
         require(all(not net.overlaps(other) for other in networks[i+1:]), "overlapping LAN/Pod/Service/reserved CIDRs")
     svc = networks[2]
     require(svc.num_addresses >= 32, "service CIDR too small")
-    addresses = [n["ip"] for n in config["nodes"]] + [config["api_vip"], config["ingress_vip"], config["gateway"]]
+    if single:
+        require("api_vip" not in config and config["api_address"] == first_server(config)["ip"], "single control plane uses its own VM IP, without API VIP")
+    addresses = [n["ip"] for n in config["nodes"]] + ([] if single else [config["api_vip"]]) + [config["ingress_vip"], config["gateway"]]
     require(len(addresses) == len(set(addresses)), "duplicate node/VIP/gateway IP")
     for addr in addresses:
         addr = ipaddress.IPv4Address(addr)
@@ -61,9 +81,16 @@ def validate(config):
         require(blob[4:4+length].decode() == key.split()[0] and len(blob) > 4 + length + 16, "invalid SSH public key wire encoding")
     except (ValueError, struct.error, UnicodeError) as exc:
         raise ValueError("invalid SSH public key wire encoding") from exc
-    require(not set(addresses[:-1]) & {"192.168.5.35", "192.168.5.41", "192.168.5.43"}, "lab IP collides with existing physical host")
+    require(not set(addresses[:-1]) & {"192.168.5.20", "192.168.5.35", "192.168.5.41", "192.168.5.43"}, "lab IP collides with existing physical host")
     names, macs = set(), set()
     for host, spec in config["hosts"].items():
+        if single:
+            from_host = {"local": ("arch3900x", "peter", "/home/peter/git/bridge_zilong/k8s-local-control-plane/vm"),
+                         **{h: ("arc99" + h, "psy", "/home/psy/k8s-lab/os") for h in ("x2", "x3", "x4")}}[host]
+            require((spec.get("expected_hostname"), spec.get("operator"), spec["os_pool"]) == from_host, "host identity/operator/pool does not match operator setup")
+            require(spec["ssh"] == ("local" if host == "local" else "arc99" + host) and spec["bridge"] == "br0", "unexpected host transport/bridge")
+            if host == "x4":
+                require(spec.get("data_mount") == "/mnt/psy-k8s-lab" and spec.get("data_pool") == "/mnt/psy-k8s-lab/vm-data", "x4 needs the prepared mounted disk and pool leaf")
         require(bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", spec["ssh"])), "invalid host SSH alias")
         require(bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", spec["bridge"])), "invalid bridge name")
         if "expected_hostname" in spec:
@@ -80,9 +107,12 @@ def validate(config):
                 require("k8s" in p and not p.startswith(("/etc/", "/dev/", "/var/lib/parth")), "pool must be dedicated to k8s")
         require("data_pool" not in spec or host == "x4", "only x4 owns a data pool")
         nodes = [n for n in config["nodes"] if n["host"] == host]
-        require({n["role"] for n in nodes} == {"server", "agent"} and len(nodes) == 2, "each host needs one server and one agent")
+        if single:
+            require(len(nodes) == 1 and nodes[0]["role"] == ("server" if host == "local" else "agent"), "local needs one server; x2/x3/x4 each need one agent")
+        else:
+            require({n["role"] for n in nodes} == {"server", "agent"} and len(nodes) == 2, "each host needs one server and one agent")
         total = sum(n["memory_gib"] for n in nodes)
-        require(total <= {"x2": 24, "x3": 48, "x4": 48}[host], "VM memory exceeds host budget")
+        require(total <= {"local": 16, "x2": 24, "x3": 48, "x4": 48}[host], "VM memory exceeds host budget")
         require(spec["minimum_available_memory_gib"] >= total + 2, "host needs 2 GiB free beyond VM allocation")
     for n in config["nodes"]:
         expected = f"psy-lab-{'cp' if n['role'] == 'server' else 'work'}-{n['host']}"
@@ -192,7 +222,8 @@ def kube_vip(config):
 def platform_files(config, out):
     workers = {"psy.local/role": "worker"}
     spread = {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [{"labelSelector": {"matchLabels": {"app.kubernetes.io/name": "traefik"}}, "topologyKey": "kubernetes.io/hostname"}]}}
-    write(out / "kube-vip.json", {"apiVersion": "v1", "kind": "List", "items": kube_vip(config)})
+    if not local_control(config):
+        write(out / "kube-vip.json", {"apiVersion": "v1", "kind": "List", "items": kube_vip(config)})
     namespaces = [object_("Namespace", ns) for ns in ("psy-platform", "psy-data", "psy-chain", "psy-compute", "psy-app", "psy-observe", "metallb-system")]
     # MetalLB speaker/node-exporter need host network privileges; no global restricted PSA.
     for obj in namespaces:
@@ -225,6 +256,8 @@ def platform_files(config, out):
         "prometheus-node-exporter": {"tolerations": [{"operator": "Exists", "effect": "NoSchedule"}]},
         "prometheus": {"prometheusSpec": {"replicas": 1, "nodeSelector": {"kubernetes.io/hostname": "psy-lab-work-x4"}, "retention": "7d", "retentionSize": "35GB", "storageSpec": claim("50Gi"), "resources": {"requests": {"cpu": "500m", "memory": "2Gi"}, "limits": {"memory": "4Gi"}}}},
         "alertmanager": {"alertmanagerSpec": {"replicas": 1, "nodeSelector": {"kubernetes.io/hostname": "psy-lab-work-x4"}, "storage": claim("2Gi")}}})
+    if local_control(config):
+        monitoring["prometheus-node-exporter"]["nodeSelector"] = workers
     write(out / "prometheus-values.json", monitoring)
 
 
@@ -240,8 +273,11 @@ def render(config, destination):
     for host, spec in config["hosts"].items():
         host_dir = destination / "hosts" / host
         write(host_dir / "host.json", {**spec, "nodes": [n for n in config["nodes"] if n["host"] == host], "confirmed": config["network_confirmed"] and config["storage_confirmed"]})
-        write(host_dir / "create-vms.py", (HERE / "create-vms.py").read_text(), True)
-    first = next(n for n in config["nodes"] if n["name"] == "psy-lab-cp-x2")
+        creator = HERE.parent / "local-control-plane/create-vm.py" if local_control(config) else HERE / "create-vms.py"
+        write(host_dir / "create-vms.py", creator.read_text(), True)
+        if local_control(config):
+            write(host_dir / "host_setup.py", (HERE.parent / "local-control-plane/host-setup/host_setup.py").read_text())
+    first = first_server(config)
     for node in config["nodes"]:
         name = node["name"]
         path = destination / "nodes" / name
@@ -252,13 +288,17 @@ def render(config, destination):
         write(host_dir / (name + "-network.json"), {"version": 2, "ethernets": {"eth0": {"match": {"macaddress": node["mac"]}, "set-name": "eth0", "dhcp4": False, "addresses": [f"{node['ip']}/{ipaddress.IPv4Network(config['lan_cidr']).prefixlen}"], "routes": [{"to": "default", "via": config["gateway"]}], "nameservers": {"addresses": config["dns"]}}}})
         cfg = {"node-name": name, "node-ip": node["ip"], "flannel-iface": "eth0", "token-file": "/etc/rancher/k3s/lab-token", "node-label": ["psy.local/lab=" + config["lab"], "psy.local/host=" + node["host"], "psy.local/role=" + ("control-plane" if node["role"] == "server" else "worker")], "kubelet-arg": ["fail-swap-on=true"]}
         if node["role"] == "server":
-            cfg.update({"disable": ["traefik", "servicelb", "local-storage"], "secrets-encryption": True, "write-kubeconfig-mode": "0600", "cluster-cidr": config["pod_cidr"], "service-cidr": config["service_cidr"], "cluster-dns": str(ipaddress.IPv4Network(config["service_cidr"]).network_address + 10), "tls-san": [config["api_vip"]], "node-taint": ["node-role.kubernetes.io/control-plane=true:NoSchedule"], "etcd-snapshot-retention": 5, "etcd-snapshot-schedule-cron": "0 */6 * * *"})
+            cfg.update({"disable": ["traefik", "servicelb", "local-storage"], "secrets-encryption": True, "write-kubeconfig-mode": "0600", "cluster-cidr": config["pod_cidr"], "service-cidr": config["service_cidr"], "cluster-dns": str(ipaddress.IPv4Network(config["service_cidr"]).network_address + 10), "tls-san": [api_address(config)], "node-taint": ["node-role.kubernetes.io/control-plane=true:NoSchedule"], "etcd-snapshot-retention": 5, "etcd-snapshot-schedule-cron": "0 */6 * * *"})
         if node == first:
             cfg["cluster-init"] = True
         else:
-            cfg["server"] = "https://" + config["api_vip"] + ":6443"
+            cfg["server"] = "https://" + api_address(config) + ":6443"
         if node.get("data_gib"):
             cfg["data-dir"] = "/srv/psy-lab/k3s"
+        if local_control(config) and node["role"] == "server":
+            # K3s CoreDNS/metrics-server tolerate the standard control-plane taint.
+            # This dedicated taint keeps even those addons off the operator host.
+            cfg["node-taint"].append("psy.local/control-only=true:NoSchedule")
         write(path / "config.yaml", cfg)  # JSON is a YAML subset.
         unit = f'''[Unit]
 Description=Psy isolated lab K3s {node['role']}
@@ -313,12 +353,15 @@ echo 'Installed; use systemctl status psy-lab-k3s and k3s kubectl get nodes'
     plat = destination / "platform"
     platform_files(config, plat)
     for script in ("bootstrap-vip.sh", "install-platform.sh", "verify-platform.sh"):
+        if local_control(config) and script == "bootstrap-vip.sh":
+            write(plat / "check-bootstrap.sh", shell_prelude(config) + 'python3 check-cluster.py --bootstrap\nkubectl get --raw=/readyz\necho "Control plane Ready; join the three workers with the SAME lab token"\n', True)
+            continue
         write(plat / script, shell_prelude(config) + (HERE / script).read_text(), True)
     write(plat / "check-cluster.py", (HERE / "check-cluster.py").read_text(), True)
     write(plat / "verify-assets.py", (HERE / "verify-assets.py").read_text(), True)
     write(plat / "assets.lock.json", json.loads((HERE / "assets.lock.json").read_text()))
     write(plat / "expected-nodes.json", {n["name"]: {"ip": n["ip"], "role": n["role"]} for n in config["nodes"]})
-    write(plat / "api-vip", config["api_vip"] + "\n")
+    write(plat / "api-vip", api_address(config) + "\n")
     write(plat / "ingress-vip", config["ingress_vip"] + "\n")
     write(plat / "server-ips.json", [n["ip"] for n in config["nodes"] if n["role"] == "server"])
     print(json.dumps({"output": str(destination), "inventory_sha256": stamp, "execution_enabled": config["network_confirmed"] and config["storage_confirmed"]}))
@@ -365,6 +408,8 @@ def charts(output, assets):
 
 def preflight(config):
     validate(config)
+    if local_control(config):
+        return four_host_preflight(config)
     # Read-only, no credentials, process arguments, service logs or environment dumps.
     for host, spec in config["hosts"].items():
         probe = '''import json,os,pathlib,shutil,subprocess,pwd,grp
@@ -396,6 +441,41 @@ def parent(p):
             report["checks"] = checks
         print(json.dumps({"host": host, "ssh": spec["ssh"], "exit": result.returncode, "report": report, "stderr": result.stderr}, indent=2))
         require(result.returncode == 0, "SSH preflight failed")
+
+
+def four_host_preflight(config):
+    """Collect every host before returning failure; never install or modify hosts."""
+    source = (HERE.parent / "local-control-plane/host-setup/host_setup.py").read_text()
+    ready = True
+    for role, spec in config["hosts"].items():
+        probe = "import types,io,contextlib,json,shutil,pathlib\nsetup=types.ModuleType('host_setup_probe')\n"
+        probe += "exec(" + repr(source) + ",setup.__dict__)\n"
+        probe += "role=" + repr(role) + "\nspec=" + repr(spec) + "\n"
+        probe += '''cfg=setup.identity(role)
+output=io.StringIO()
+with contextlib.redirect_stdout(output): setup.check(cfg)
+report=json.loads(output.getvalue())
+mem=dict(line.split(':',1) for line in pathlib.Path('/proc/meminfo').read_text().splitlines())
+report['available_memory_gib']=int(mem['MemAvailable'].split()[0])/2**20
+report['checks']['memory_capacity']=report['available_memory_gib']>=spec['minimum_available_memory_gib']
+report['routes']=json.loads(setup.run('ip','-j','route'))
+if role=='x4':
+ mount=pathlib.Path(spec['data_mount']); pool=pathlib.Path(spec['data_pool'])
+ mounted=mount.is_mount() and not mount.is_symlink()
+ report['checks']['new_data_mount']=mounted
+ report['checks']['new_data_pool']=pool.is_dir() and not pool.is_symlink() and mounted and pool.stat().st_dev==mount.stat().st_dev
+ disks=setup.backing_disks(mount) if mounted else set()
+ report['checks']['new_data_disk']=bool(disks) and disks.isdisjoint(setup.backing_disks('/')) and disks.isdisjoint(setup.backing_disks('/home'))
+ report['checks']['new_data_capacity']=mounted and shutil.disk_usage(mount).free>=288*2**30
+print(json.dumps(report))
+'''
+        command = [sys.executable, "-"] if role == "local" else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", spec["ssh"], "python3 -"]
+        result = subprocess.run(command, input=probe, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        report = json.loads(result.stdout) if result.returncode == 0 else None
+        passed = report is not None and all(report["checks"].values())
+        ready = ready and passed
+        print(json.dumps({"host": role, "ready": passed, "report": report, "stderr": result.stderr}, indent=2))
+    require(ready, "Host preparation incomplete; inspect failed checks above. No host changes made")
 
 
 def main():

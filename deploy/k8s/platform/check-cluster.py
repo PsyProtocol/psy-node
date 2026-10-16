@@ -20,12 +20,13 @@ def check(bootstrap=False):
     server = view["clusters"][0]["cluster"]["server"]
     vip = Path("api-vip").read_text().strip()
     expected = json.loads(Path("expected-nodes.json").read_text())
-    wanted = {"psy-lab-cp-x2"} if bootstrap else set(expected)
-    endpoint = expected["psy-lab-cp-x2"]["ip"] if bootstrap else vip
+    first = "psy-lab-cp-local" if "psy-lab-cp-local" in expected else "psy-lab-cp-x2"
+    wanted = {first} if bootstrap else set(expected)
+    endpoint = expected[first]["ip"] if bootstrap else vip
     if server != "https://" + endpoint + ":6443":
         sys.exit("Wrong API endpoint; refusing to use this kubeconfig")
     nodes = kubectl("get", "nodes", "-o", "json")["items"]
-    if {n["metadata"]["name"] for n in nodes} != wanted:
+    if len(nodes) != len(wanted) or {n["metadata"]["name"] for n in nodes} != wanted:
         sys.exit("Unexpected cluster node set; expected the isolated lab only")
     for node in nodes:
         name = node["metadata"]["name"]
@@ -35,6 +36,11 @@ def check(bootstrap=False):
         ready = any(c["type"] == "Ready" and c["status"] == "True" for c in node["status"]["conditions"])
         if labels.get("psy.local/lab") != "psy-k8s-local" or labels.get("psy.local/role") != role or ips != {expected[name]["ip"]} or not ready:
             sys.exit("Node identity/readiness mismatch: " + name)
+        if name == "psy-lab-cp-local":
+            taints = {(t["key"], t.get("value"), t["effect"]) for t in node.get("spec", {}).get("taints", [])}
+            required = {("node-role.kubernetes.io/control-plane", "true", "NoSchedule"), ("psy.local/control-only", "true", "NoSchedule")}
+            if not required.issubset(taints):
+                sys.exit("Local control-plane scheduling taints missing")
     print("Confirmed isolated lab node identities and API endpoint")
 
 
