@@ -37,7 +37,9 @@ impl SubTreeNodeTopLineGadget {
             child_transition.new_node_value,
         );
 
-        let node_index = top_line_proof.bit_info.get_root_parent_index(builder);
+        // The opt bit info returns the subtree-root node index (low bit =
+        // direction), which is exactly the new node's index at node_level.
+        let node_index = top_line_proof.bit_info.get_root_index(builder);
 
         let node_level = builder.sub(child_transition.node_level, top_line_height);
         builder.range_check(node_level, log2_ceil(max_level));
