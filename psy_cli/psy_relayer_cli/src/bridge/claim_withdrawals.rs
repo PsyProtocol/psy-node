@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, str::FromStr};
+use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, str::FromStr};
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::Provider;
@@ -22,6 +22,7 @@ use serde::Deserialize;
 use tokio::time::{timeout, Duration};
 
 use crate::bridge::api_client::{ApiResponse, DeployedContracts, build_default_http_client, get_services_json, resolve_contract_address_from_deployments};
+use crate::bridge::claim_conflicts::find_nonce_conflicts;
 use crate::bridge::prove_proxy_client::{BridgeWithdrawalBatchWitnessInput, BridgeWithdrawalWitnessInput as ProxyWithdrawalWitnessInput, ProveProxyClient};
 use crate::bridge::constants::{
     BRIDGE_USER_ID_U32, DEFAULT_L1_RPC_URL, L1_GROTH16_CALL_GAS_FALLBACK,
@@ -73,9 +74,9 @@ pub struct BatchWithdrawalsReport {
     pub resolved_leaf_hashes: Vec<String>,
     #[serde(default)]
     pub failure_reasons: HashMap<String, String>,
-    /// Withdrawals held back for a reason that resolves on its own, and that
-    /// therefore must not spend one of the claim's limited attempts, such as
-    /// waiting for bridge liquidity or an acceptable pre-broadcast fee quote.
+    /// Claims held without spending attempts: transient liquidity/fee waits or
+    /// nonce conflicts that require manual reconciliation. Neither is proof
+    /// that a withdrawal was paid.
     #[serde(default)]
     pub deferrals: HashMap<String, String>,
 }
@@ -151,6 +152,29 @@ fn address_high_bits_are_zero(words: [u32; 8]) -> bool {
 
 const CLAIM_PROOF_FETCH_MAX_ATTEMPTS: usize = 12;
 const CLAIM_PROOF_FETCH_RETRY_DELAY_SECS: u64 = 5;
+
+/// Guard direct batch/CLI callers as well as daemon dispatch. Do this before
+/// claimedNullifiers reads: one occupied nonce cannot settle every colliding leaf.
+fn partition_claim_inputs(withdrawals: &[PendingWithdrawal]) -> (Vec<PendingWithdrawal>, HashMap<String, String>) {
+    let conflicts = find_nonce_conflicts(withdrawals.iter()
+        .map(|w| (w.destination_chain_index, w.nonce, w.leaf_hash.as_str())));
+    let reasons: HashMap<String, String> = conflicts.into_iter().flat_map(|conflict| {
+        let reason = conflict.reason();
+        conflict.leaf_hashes.into_iter().map(move |leaf| (leaf, reason.clone()))
+    }).collect();
+    let mut seen = HashSet::new();
+    let mut eligible = Vec::new();
+    let mut deferrals = HashMap::new();
+    for withdrawal in withdrawals {
+        let leaf = withdrawal.leaf_hash.to_ascii_lowercase();
+        if let Some(reason) = reasons.get(&leaf) {
+            deferrals.insert(withdrawal.leaf_hash.clone(), reason.clone());
+        } else if seen.insert(leaf) {
+            eligible.push(withdrawal.clone());
+        }
+    }
+    (eligible, deferrals)
+}
 
 async fn fetch_claim_proof(
     http: &reqwest::Client,
@@ -534,14 +558,16 @@ pub async fn submit_batch(
     fee_policy: Option<&super::l1_fees::BscFeePolicy>,
 ) -> Result<BatchWithdrawalsReport> {
     let _phantom_c: std::marker::PhantomData<C> = std::marker::PhantomData;
+    let requested = withdrawals.len();
+    let (withdrawals, mut deferrals) = partition_claim_inputs(withdrawals);
     if withdrawals.is_empty() {
         return Ok(BatchWithdrawalsReport {
-            requested: 0,
+            requested,
             submitted_count: 0,
             already_claimed_count: 0,
             resolved_leaf_hashes: Vec::new(),
             failure_reasons: HashMap::new(),
-            deferrals: HashMap::new(),
+            deferrals,
         });
     }
 
@@ -566,13 +592,14 @@ pub async fn submit_batch(
         &provider, &mut TransactionRequest::default(), fee_policy,
     ).await {
         tracing::warn!(%error, "withdrawal fees deferred before proof generation");
+        deferrals.extend(withdrawals.iter().map(|w| (w.leaf_hash.clone(), error.to_string())));
         return Ok(BatchWithdrawalsReport {
-            requested: withdrawals.len(),
+            requested,
             submitted_count: 0,
             already_claimed_count: 0,
             resolved_leaf_hashes: Vec::new(),
             failure_reasons: HashMap::new(),
-            deferrals: withdrawals.iter().map(|w| (w.leaf_hash.clone(), error.to_string())).collect(),
+            deferrals,
         });
     }
     let http = build_default_http_client()?;
@@ -581,7 +608,6 @@ pub async fn submit_batch(
     let mut already_claimed_count = 0usize;
     let mut resolved_leaf_hashes = Vec::new();
     let mut failure_reasons = HashMap::new();
-    let mut deferrals: HashMap<String, String> = HashMap::new();
     let mut bridge_erc20_liquidity_remaining: HashMap<Address, U256> = HashMap::new();
     if multicall3_address.is_some() || !deployments_network.is_empty() {
         let _ = (multicall3_address, deployments_network);
@@ -1040,7 +1066,7 @@ pub async fn submit_batch(
     }
 
     Ok(BatchWithdrawalsReport {
-        requested: withdrawals.len(),
+        requested,
         submitted_count,
         already_claimed_count,
         resolved_leaf_hashes,
@@ -1108,7 +1134,7 @@ pub async fn run(args: BatchWithdrawalsArgs) -> Result<()> {
         report.failure_reasons.len(),
         report.deferrals.len()
     );
-    anyhow::ensure!(args.l1_fee_policy.is_none() || report.deferrals.is_empty(),
+    anyhow::ensure!(report.deferrals.is_empty(),
         "withdrawal claims deferred; not all requested claims were submitted");
     Ok(())
 }
@@ -1116,6 +1142,61 @@ pub async fn run(args: BatchWithdrawalsArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conflict_withdrawal(leaf: &str, user: u64, nonce: u32) -> PendingWithdrawal {
+        PendingWithdrawal {
+            event_id: user as i64,
+            checkpoint_id: 1,
+            user_id: user,
+            sender_user_id: user,
+            contract_id: 4,
+            destination_chain_index: 0,
+            token_address: [0; 8],
+            amount: [0, 0, 0, 0, 0, 0, 0, 100_000_000],
+            recipient: [0, 0, 0, 0, 0, 0, 0, user as u32],
+            nonce: [0, 0, 0, 0, 0, 0, 0, nonce],
+            leaf_hash: leaf.to_string(),
+        }
+    }
+
+    #[test]
+    fn conflicting_users_are_removed_before_any_claimed_flag_check() {
+        let (eligible, deferred) = partition_claim_inputs(&[
+            conflict_withdrawal("a", 1, 77),
+            conflict_withdrawal("b", 2, 77),
+            conflict_withdrawal("healthy", 3, 78),
+        ]);
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].leaf_hash, "healthy");
+        assert_eq!(deferred.len(), 2);
+        assert!(deferred.contains_key("a") && deferred.contains_key("b"));
+    }
+
+    #[test]
+    fn repeated_observation_cannot_create_duplicate_slots_in_a_claim() {
+        let w = conflict_withdrawal("0xabc", 1, 77);
+        let mut alias = w.clone();
+        alias.leaf_hash = "0xABC".to_string();
+        alias.event_id = 999;
+        let (eligible, deferred) = partition_claim_inputs(&[w, alias]);
+        assert_eq!(eligible.len(), 1);
+        assert!(deferred.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_all_conflicting_batch_needs_no_signer_rpc_or_prover() {
+        let report = submit_batch(
+            &[conflict_withdrawal("a", 1, 77), conflict_withdrawal("b", 2, 77)],
+            "invalid-services-url", "invalid-rpc-url", "invalid-bridge", None,
+            "unused", None, None, "UNUSED_PASSWORD", Some("invalid-proxy-url"), None,
+        ).await.expect("collisions must return before signer or network setup");
+        assert_eq!(report.requested, 2);
+        assert_eq!(report.deferrals.len(), 2);
+        assert_eq!(report.submitted_count, 0);
+        assert_eq!(report.already_claimed_count, 0);
+        assert!(report.resolved_leaf_hashes.is_empty());
+        assert!(report.failure_reasons.is_empty());
+    }
 
     #[test]
     fn normalize_l1_root_for_services_reverses_u32_word_order() {

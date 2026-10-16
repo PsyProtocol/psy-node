@@ -41,7 +41,9 @@ pub struct ClaimAttempts {
     pub last_reason: String,
 }
 
-/// A withdrawal that has used up its attempts. Nothing retries these.
+/// A withdrawal removed from automatic processing. Nothing retries these.
+/// Besides exhausted claims, nonce-conflicting leaves are quarantined here
+/// without spending attempts; last_reason identifies that condition explicitly.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetiredClaim<W> {
     pub withdrawal: W,
