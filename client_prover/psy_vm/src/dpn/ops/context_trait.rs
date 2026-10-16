@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use super::{op_types::DPNOpType, sym_felt::SymFeltRef};
+use super::{op_types::DPNOpType, sym_felt::SymFeltRef, uint::UintValue};
 use crate::dpn::QContext;
 pub trait ContextFelt:
     Copy
@@ -302,6 +302,26 @@ pub trait DPNContext<F: ContextFelt>: Debug + Clone {
     fn op_u32_and(&mut self, a: F, b: F) -> F;
     fn op_u32_shl(&mut self, a: F, b: F) -> F;
     fn op_u32_shr(&mut self, a: F, b: F) -> F;
+
+    fn op_uint_add<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> [F; N] where Self: Sized { UintValue(a).add(self, UintValue(b)).0 }
+    fn op_uint_sub<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> [F; N] where Self: Sized { UintValue(a).sub(self, UintValue(b)).0 }
+    fn op_uint_mul<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> [F; N] where Self: Sized { UintValue(a).mul(self, UintValue(b)).0 }
+    fn op_uint_div_rem<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> ([F; N], [F; N]) where Self: Sized {
+        let (quotient, remainder) = UintValue(a).div_rem(self, UintValue(b));
+        (quotient.0, remainder.0)
+    }
+    fn op_uint_eq<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> F where Self: Sized { UintValue(a).eq(self, UintValue(b)) }
+    fn op_uint_lt<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> F where Self: Sized { UintValue(a).lt(self, UintValue(b)) }
+    fn op_uint_and<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> [F; N] where Self: Sized { UintValue(a).bitand(self, UintValue(b)).0 }
+    fn op_uint_or<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> [F; N] where Self: Sized { UintValue(a).bitor(self, UintValue(b)).0 }
+    fn op_uint_xor<const N: usize>(&mut self, a: [F; N], b: [F; N]) -> [F; N] where Self: Sized { UintValue(a).bitxor(self, UintValue(b)).0 }
+    fn op_uint_not<const N: usize>(&mut self, a: [F; N]) -> [F; N] where Self: Sized { UintValue(a).not(self).0 }
+    fn op_uint_shl<const N: usize>(&mut self, a: [F; N], distance: F) -> [F; N] where Self: Sized { UintValue(a).shl(self, distance).0 }
+    fn op_uint_shr<const N: usize>(&mut self, a: [F; N], distance: F) -> [F; N] where Self: Sized { UintValue(a).shr(self, distance).0 }
+    fn op_uint_from_felt<const N: usize>(&mut self, value: F) -> [F; N] where Self: Sized { UintValue::<F, N>::from_felt(self, value).0 }
+    fn op_uint_from_limbs<const N: usize>(&mut self, limbs: [F; N]) -> [F; N] where Self: Sized { UintValue::<F, N>::from_limbs(self, limbs).0 }
+    fn op_uint_to_felt<const N: usize>(&mut self, limbs: [F; N]) -> F where Self: Sized { UintValue(limbs).to_felt(self) }
+    fn op_uint_to_u32<const N: usize>(&mut self, limbs: [F; N]) -> F where Self: Sized { UintValue(limbs).to_u32(self) }
 
     // end u32 ops
     fn op_true(&mut self) -> F;

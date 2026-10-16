@@ -922,6 +922,7 @@ enum CompilerAbiPrimitive {
     Bool,
     U32,
     Hash,
+    U256,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1850,6 +1851,10 @@ where
                 CompilerAbiPrimitive::Hash => {
                     (StatePrimitiveTypeTag::Hash, 4)
                 }
+                CompilerAbiPrimitive::U256 => {
+                    let limb = primitive_type_layout::<Hasher, F, Hash>(StatePrimitiveTypeTag::U32, 1)?;
+                    return fixed_array_type_layout::<Hasher, F, Hash>(limb, 8);
+                }
             };
             primitive_type_layout::<Hasher, F, Hash>(tag, width)
         }
@@ -1988,6 +1993,14 @@ where
                 CompilerAbiPrimitive::Bool => StatePrimitiveTypeTag::Bool,
                 CompilerAbiPrimitive::U32 => StatePrimitiveTypeTag::U32,
                 CompilerAbiPrimitive::Hash => StatePrimitiveTypeTag::Hash,
+                CompilerAbiPrimitive::U256 => {
+                    let limb = primitive_type_layout::<Hasher, F, Hash>(StatePrimitiveTypeTag::U32, 1)?;
+                    return Ok(StateTypeLayoutWitness::FixedArray {
+                        element_type_hash: limb.type_layout_hash,
+                        element_slot_count: 1,
+                        array_length: 8,
+                    });
+                }
             };
             Ok(StateTypeLayoutWitness::Primitive { type_tag })
         }
@@ -2263,6 +2276,14 @@ fn append_compiler_abi_type_dag_node(
                 CompilerAbiPrimitive::Bool => StatePrimitiveTypeTag::Bool,
                 CompilerAbiPrimitive::U32 => StatePrimitiveTypeTag::U32,
                 CompilerAbiPrimitive::Hash => StatePrimitiveTypeTag::Hash,
+                CompilerAbiPrimitive::U256 => {
+                    // Uint values use little-endian u32 limbs, not packed u64 slots.
+                    let element = u16::try_from(nodes.len())?;
+                    nodes.push(CanonicalTypeLayoutNode::Primitive { type_tag: StatePrimitiveTypeTag::U32 });
+                    let root = u16::try_from(nodes.len())?;
+                    nodes.push(CanonicalTypeLayoutNode::FixedArray { element, length: 8 });
+                    return Ok(root);
+                }
             };
             CanonicalTypeLayoutNode::Primitive { type_tag }
         }
@@ -2919,6 +2940,38 @@ mod tests {
         let mut wrong_commitment = witness;
         wrong_commitment.public_inputs.appended_fields_commitment = QHashOut::rand();
         assert!(wrong_commitment.validate::<PoseidonHasher, PF>().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn u256_compiler_layout_matches_eight_u32_limbs() -> anyhow::Result<()> {
+        let abi = serde_json::json!({
+            "contract": {"state_tree_height": 4, "state_layout": {
+                "layout_version": 1, "encoding_version": 1,
+                "field_count": 1, "slot_count": 8,
+                "fields": [{"field_id": 1, "type": {"kind": "primitive", "name": "U256"},
+                    "start_slot": 0, "slot_count": 8}]
+            }}, "types": []
+        });
+        let json = serde_json::to_string(&abi)?;
+        let manifest = canonical_layout_manifest_from_compiler_abi_json::<PoseidonHasher, PF, QHashOut<PF>>(&json, 2, 2)?;
+        let mut array_abi = abi.clone();
+        array_abi["contract"]["state_layout"]["fields"][0]["type"] = serde_json::json!({
+            "kind": "array", "item": {"kind": "primitive", "name": "U32"},
+            "length": 8, "item_felt_size": 1
+        });
+        let array_manifest = canonical_layout_manifest_from_compiler_abi_json::<PoseidonHasher, PF, QHashOut<PF>>(
+            &serde_json::to_string(&array_abi)?, 2, 2,
+        )?;
+        assert_eq!(manifest, array_manifest);
+        let summary = manifest.field_type_dags[0].evaluate::<PoseidonHasher, PF, QHashOut<PF>>()?;
+        assert_eq!(summary.total_slot_count, 8);
+        assert_eq!(summary.type_layout_hash, manifest.layout.contract_layout.fields[0].type_layout_hash);
+        let mut invalid = abi;
+        invalid["contract"]["state_layout"]["fields"][0]["slot_count"] = serde_json::json!(4);
+        assert!(canonical_layout_manifest_from_compiler_abi_json::<PoseidonHasher, PF, QHashOut<PF>>(
+            &serde_json::to_string(&invalid)?, 2, 2,
+        ).is_err());
         Ok(())
     }
 

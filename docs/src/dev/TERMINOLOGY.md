@@ -279,6 +279,29 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 
 ## 10. Naming checklist
 
+### Unsigned integers
+
+`uint` names the checked unsigned integer family: language types `u32`, `u64`,
+`u128`, and `u256`. `Uint<N>` holds N little-endian `u32` limbs; a limb is one
+base-2^32 digit. `UintValue<F, N>` holds the corresponding DPN scalar values.
+`U64`, `U128`, `U256` and their `*Value` forms are width-specific aliases.
+The generic `DPNContext::op_uint_*` methods expose these operations to callers
+and delegate to `UintValue`; they add no serialized opcode. N=1 arithmetic,
+bitwise, and shift methods use existing native `op_u32_*` operations. Wider
+widths expand into existing
+range-checked scalar DPN operations. `mul` computes a full 2N-limb product and
+rejects overflow beyond N limbs. `div_rem` computes the unsigned quotient and
+remainder, rejecting a zero divisor. Shifts take a `u32` distance: bits moved
+past the 32N-bit width are dropped, and a distance of 32N or more yields zero.
+Carry and borrow name the digits propagated between adjacent limbs.
+The deployment ABI preserves `U256` as a primitive name; its state-layout
+proof uses the existing fixed array of eight `U32` limbs (eight slots), not
+packed `U64`, `U128`, or `Hash` storage. No new circuit or primitive tag is introduced.
+`get_value`, `set_value`, and `get_value_other` are lossless u256 map operations.
+`u256_map_key_hash` derives the two physical IMT keys from namespace, key hash,
+and half index under the ASCII `U256MAP` domain. Each logical value consumes two
+entries of the existing map capacity; generic map methods retain digest semantics.
+
 1. The name says the object (`proposal`, `guta_gatherer`, `checkpoint`, `shield_address`), not a
    category (`data`, `store`, `production`).
 2. State qualifiers precede the object: `last_committed_realm_end_root`,
@@ -325,3 +348,5 @@ Retain UserRewardLeaf, UserRewardAggregate, UserRewardRoot, UserRewardCheckpoint
 
 
 SDK prepare and confirm names are `PrepareRewardClaimRequest`, `RewardClaimPreparation`, `PreparedRewardClaim`, `DeferredRewardCheckpoint`, `RewardClaimConfirmation`, `RewardCheckpointStatement`, `prepare_reward_claim_json`, `prepareRewardClaim`, `confirm_reward_claim_json`, `confirmRewardClaim`, `prove_reward_root`, `bind_reward_checkpoint_statement`, and `encode_reward_claim_calldata`. `RewardClaimPreparation` is the status outcome, not a wrapper around an unspecified body. `RewardCheckpointStatement` is the bound checkpoint root, active checkpoint ids, and total. `prove_reward_root` has one `anyhow` failure for an unsupported signer and one `ZKUser` override. `getClaimRewardsCallArgs` and `claimRewards` are removed rather than aliased. The relation and encodings stay in checkpoint-claim-cutover.md section 6.
+
+`ensure_eval_cache` evaluates a symbolic expression graph in postorder using a heap stack. `resolve_felt_ref_ready` and `resolve_array_ref_ready` evaluate one node after its scalar and array dependencies are cached. Compilation preserves the same child postorder and register allocation order with a heap stack.
