@@ -64,7 +64,7 @@ Debug 模式、本机 loopback、真实 jsonrpsee/HTTP、8 并发，work 返回�
 5. GPU lane/buffer、large-proof-slot 等内部 admission 与 RPC job 的关联；当前证明内部显示整体 proof，不能区分这些等待。
 6. 更完整的固定标签计数/直方图导出。现有 JSON watchdog 是阶段直方图/活动快照，不是新的 Prometheus 服务；executor queue_ms、RPC 结果等仍需离线聚合。
 7. 原监控 inventory 修复、磁盘延迟派生、Caddy logging 版本核查、Nginx 模板验证和轮转集成。未改生产配置。
-8. 不同模型独立代码审阅及正式 staged delivery；本次未 stage/commit/push。
+8. 首版已完成不同模型逐行审阅并本地提交 `2f155713`，未推送或部署。阶段二验证见 [PHASE2.md](PHASE2.md)。
 
 ## 当前可支持的结论
 

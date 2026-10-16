@@ -420,3 +420,142 @@ async fn http_overhead_probe() {
         o.stop();
     }
 }
+
+#[cfg(feature = "plonky2-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prover_hook_exposes_wait_and_restores_stage_on_panic() {
+    use plonky2::util::observation::{enter, Phase};
+    let (o, _dir) = observer(16);
+    let rpc = o.activity("rpc", "gpu-fixture", "work", Stage::Rpc);
+    let captured = o.clone();
+    rpc.context()
+        .scope(async {
+            spawn_blocking(move || {
+                let _wait = enter(Phase::GpuLaneWait);
+                assert!(captured.snapshot()["active"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["kind"] == "job" && v["stage"] == "gpu_lane_wait" && v["request_id"] == "gpu-fixture"));
+                let caught = std::panic::catch_unwind(|| {
+                    let _device = enter(Phase::GpuDevice);
+                    panic!("local observation fixture");
+                });
+                assert!(caught.is_err());
+                assert!(captured.snapshot()["active"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["kind"] == "job" && v["stage"] == "gpu_lane_wait"));
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+    drop(rpc);
+    assert_eq!(o.snapshot()["inflight"], 0);
+    o.stop();
+}
+
+/// Real small-circuit proof compatibility gate, not a production fixture
+/// replay. Run in its own process with deterministic random/PoW switches, GPU
+/// disabled.
+#[cfg(feature = "plonky2-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn real_proof_observation_equivalence() {
+    use plonky2::{
+        field::{goldilocks_field::GoldilocksField, types::Field},
+        iop::witness::{PartialWitness, WitnessWrite},
+        plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig},
+    };
+    assert_eq!(std::env::var("PLONKY2_DETERMINISTIC_RANDOM").as_deref(), Ok("1"));
+    assert_eq!(std::env::var("PLONKY2_POW_DETERMINISTIC").as_deref(), Ok("1"));
+    assert_eq!(std::env::var("PLONKY2_GPU").as_deref(), Ok("0"));
+    let config = CircuitConfig::standard_recursion_config();
+    let mut builder = CircuitBuilder::<GoldilocksField, 2>::new(config);
+    let x = builder.add_virtual_target();
+    let square = builder.mul(x, x);
+    builder.register_public_input(square);
+    let data = Arc::new(builder.build::<PoseidonGoldilocksConfig>());
+    let mut witness = PartialWitness::new();
+    witness.set_target(x, GoldilocksField::from_canonical_u64(7)).unwrap();
+    let d = data.clone();
+    let w = witness.clone();
+    let reference = tokio::task::spawn_blocking(move || d.prove(w).unwrap()).await.unwrap();
+    data.verify(reference.clone()).unwrap();
+    let (o, dir) = observer(16);
+    let request = o.activity("rpc", "real-proof", "fixture", Stage::Rpc);
+    let d = data.clone();
+    let actual = request
+        .context()
+        .scope(async { spawn_blocking(move || d.prove(witness).unwrap()).await.unwrap() })
+        .await;
+    data.verify(actual.clone()).unwrap();
+    assert_eq!(reference.to_bytes(), actual.to_bytes());
+    drop(request);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let log = std::fs::read_to_string(dir.path().join("events.0.jsonl")).unwrap();
+    for phase in ["witness", "wires_commit", "quotient", "fri"] {
+        assert!(
+            log.lines().any(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                v["event"] == "stage_begin" && v["detail"]["stage"] == phase && v["request_id"] == "real-proof"
+            }),
+            "missing {phase}"
+        );
+    }
+    assert_eq!(o.snapshot()["inflight"], 0);
+    o.stop();
+}
+
+#[cfg(feature = "plonky2-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn real_large_proof_slot_wait_is_visible() {
+    assert_eq!(std::env::var("PLONKY2_LARGE_PROOF_SLOTS").as_deref(), Ok("1"));
+    let (o, _dir) = observer(16);
+    let owner = o.activity("rpc", "slot-owner", "fixture", Stage::Rpc);
+    let waiter = o.activity("rpc", "slot-waiter", "fixture", Stage::Rpc);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let first = owner
+        .context()
+        .scope(async {
+            spawn_blocking(move || {
+                let _slot = plonky2::util::proof_gate::acquire(20);
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        })
+        .await;
+    started_rx.await.unwrap();
+    let second = waiter
+        .context()
+        .scope(async {
+            spawn_blocking(|| {
+                let _slot = plonky2::util::proof_gate::acquire(20);
+            })
+        })
+        .await;
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let s = o.snapshot();
+            let a = s["active"].as_array().unwrap();
+            if a.iter().any(|v| v["request_id"] == "slot-waiter" && v["stage"] == "large_proof_wait") {
+                assert!(a.iter().any(|v| v["request_id"] == "slot-owner" && v["stage"] == "large_proof_held"));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    release_tx.send(()).unwrap();
+    first.await.unwrap();
+    second.await.unwrap();
+    observed.unwrap();
+    drop(owner);
+    drop(waiter);
+    assert_eq!(o.snapshot()["inflight"], 0);
+    o.stop();
+}

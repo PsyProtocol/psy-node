@@ -3,7 +3,11 @@ name = "psy_prove_observe"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+plonky2-hooks = ["dep:plonky2"]
+
 [dependencies]
+plonky2 = { workspace = true, optional = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

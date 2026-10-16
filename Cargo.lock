@@ -7443,6 +7443,7 @@ version = "0.1.0"
 dependencies = [
  "http 1.4.0",
  "jsonrpsee",
+ "plonky2",
  "quick_cache",
  "reqwest 0.12.28",
  "serde",

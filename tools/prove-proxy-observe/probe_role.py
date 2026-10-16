@@ -46,6 +46,10 @@ def probe(url):
         return out
 
 
+def healthy(result):
+    return result.get("curl_exit") == 0 and result.get("http_code") == 200 and result.get("rpc_success") is True
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", required=True)
@@ -70,7 +74,7 @@ def main():
             result = probe(a.url)
         except (OSError, subprocess.TimeoutExpired):
             result = {"probe_error": True, "rpc_success": False}
-        ok = result.get("http_code") == 200 and result.get("rpc_success")
+        ok = healthy(result)
         failures = 0 if ok else failures + 1
         result.update(label=a.label, epoch_s=time.time(), mono_s=start, consecutive_failures=failures,
                       alert=failures >= 3)

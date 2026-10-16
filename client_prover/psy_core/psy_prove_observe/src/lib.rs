@@ -40,6 +40,23 @@ pub enum Stage {
     CircuitBuild,
     ExecutorQueue,
     Proof,
+    Witness,
+    WiresCommit,
+    PartialProducts,
+    ZsCommit,
+    Quotient,
+    QuotientCommit,
+    Openings,
+    Fri,
+    LargeProofWait,
+    LargeProofHeld,
+    GpuBufferWait,
+    GpuLaneWait,
+    GpuLaneHeld,
+    GpuDevice,
+    GpuRebuild,
+    GpuQuotientWait,
+    GpuFriWait,
     ResponseReady,
 }
 const STAGES: usize = Stage::ResponseReady as usize + 1;
@@ -126,6 +143,23 @@ const STAGE_NAMES: [Stage; STAGES] = [
     Stage::CircuitBuild,
     Stage::ExecutorQueue,
     Stage::Proof,
+    Stage::Witness,
+    Stage::WiresCommit,
+    Stage::PartialProducts,
+    Stage::ZsCommit,
+    Stage::Quotient,
+    Stage::QuotientCommit,
+    Stage::Openings,
+    Stage::Fri,
+    Stage::LargeProofWait,
+    Stage::LargeProofHeld,
+    Stage::GpuBufferWait,
+    Stage::GpuLaneWait,
+    Stage::GpuLaneHeld,
+    Stage::GpuDevice,
+    Stage::GpuRebuild,
+    Stage::GpuQuotientWait,
+    Stage::GpuFriWait,
     Stage::ResponseReady,
 ];
 impl AtomicState {
@@ -474,7 +508,35 @@ fn with_context<R>(context: Context, f: impl FnOnce() -> R) -> R {
         }
     }
     let _restore = Restore(BLOCKING.with(|v| v.replace(Some(context))));
+    #[cfg(feature = "plonky2-hooks")]
+    if current().0.is_some() {
+        return plonky2::util::observation::with_hook(Arc::new(|phase| Box::new(stage(prover_phase(phase)))), f);
+    }
     f()
+}
+
+#[cfg(feature = "plonky2-hooks")]
+fn prover_phase(p: plonky2::util::observation::Phase) -> Stage {
+    use plonky2::util::observation::Phase;
+    match p {
+        Phase::Witness => Stage::Witness,
+        Phase::WiresCommit => Stage::WiresCommit,
+        Phase::PartialProducts => Stage::PartialProducts,
+        Phase::ZsCommit => Stage::ZsCommit,
+        Phase::Quotient => Stage::Quotient,
+        Phase::QuotientCommit => Stage::QuotientCommit,
+        Phase::Openings => Stage::Openings,
+        Phase::Fri => Stage::Fri,
+        Phase::LargeProofWait => Stage::LargeProofWait,
+        Phase::LargeProofHeld => Stage::LargeProofHeld,
+        Phase::GpuBufferWait => Stage::GpuBufferWait,
+        Phase::GpuLaneWait => Stage::GpuLaneWait,
+        Phase::GpuLaneHeld => Stage::GpuLaneHeld,
+        Phase::GpuDevice => Stage::GpuDevice,
+        Phase::GpuRebuild => Stage::GpuRebuild,
+        Phase::GpuQuotientWait => Stage::GpuQuotientWait,
+        Phase::GpuFriWait => Stage::GpuFriWait,
+    }
 }
 
 pub fn build<R>(key: u64, f: impl FnOnce() -> R) -> R {

@@ -13,6 +13,10 @@ import probe_role
 
 
 class Tests(unittest.TestCase):
+    def test_transport_failure_is_unhealthy_even_with_valid_rpc(self):
+        self.assertFalse(probe_role.healthy({"curl_exit":18,"http_code":200,"rpc_success":True}))
+        self.assertTrue(probe_role.healthy({"curl_exit":0,"http_code":200,"rpc_success":True}))
+
     def test_sampler_tracks_own_pid_and_bounds_disk(self):
         with tempfile.TemporaryDirectory() as d:
             output = Path(d)/"resources.jsonl"

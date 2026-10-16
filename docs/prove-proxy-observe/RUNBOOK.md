@@ -1,5 +1,7 @@
 # 运行与证据解读
 
+以下命令均从 psy-node 仓库根目录执行。阶段二覆盖和当前测试状态见 [PHASE2.md](PHASE2.md)。
+
 ## 开启候选（仅离线 / 已批准的灰度）
 
 在启动候选前设置 `PSY_PROVE_OBSERVE_DIR`，每进程使用独立目录。确保服务运行用户可写、目录 0700。默认不设置时没有诊断文件/后台线程。设置有误会使启动失败，不会悄悄把错误当成健康。
@@ -9,7 +11,7 @@
 ## 只读资源采样
 
 ```bash
-python3 tools/observe_resources.py --pid <PID> --samples 720 --interval 5 \
+python3 tools/prove-proxy-observe/observe_resources.py --pid <PID> --samples 720 --interval 5 \
   --gpu --diagnostic-dir <DIAG_DIR> --output <PRIVATE_DIR>/resources.jsonl
 ```
 
@@ -20,7 +22,7 @@ PID 身份由 `/proc/PID/stat` 的启动 tick 校验；退出或 PID 重用即�
 ## 轻量探针
 
 ```bash
-python3 tools/probe_role.py --url <APPROVED_ENDPOINT> --label backend-x1 \
+python3 tools/prove-proxy-observe/probe_role.py --url <APPROVED_ENDPOINT> --label backend-x1 \
   --samples 6 --interval 10 --output <PRIVATE_DIR>/probe.jsonl
 ```
 
@@ -34,7 +36,7 @@ python3 tools/probe_role.py --url <APPROVED_ENDPOINT> --label backend-x1 \
 2. 把目标进程 events 文件拷到私有分析目录：
 
 ```bash
-python3 tools/trace_request.py --request-id <ID> <DIR>/events.*.jsonl
+python3 tools/prove-proxy-observe/trace_request.py --request-id <ID> <DIR>/events.*.jsonl
 ```
 
 3. 用 `instance + id` 关联；batch 中 `request_id` 相同但 RPC activity id 不同，job/build 通过 parent_id 关联。

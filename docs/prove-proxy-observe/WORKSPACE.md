@@ -1,5 +1,7 @@
 # Prove Proxy 阻塞观测工作区 · 2026-10-16
 
+首版已本地提交为 `2f155713e39eff838adb945ede33f554c834b5c7`，通过不同模型逐行审阅，未推送。下文基线和实现范围保留首版快照；最新推进见 [PHASE2.md](PHASE2.md)。
+
 本工作区实现第一阶段观测候选：请求关联、USER 冷构建/缓存等待、blocking executor 生命周期、独立 watchdog 与外部采样。**未部署、未重启线上服务、未修改流量或计算策略。** 不是上次故障根因的最终结论。
 
 ## 基线与隔离
@@ -9,7 +11,7 @@
 | psy-node worktree | `psy-node/`，分支 `obs/prove-proxy-stall-20261016` |
 | psy-node 基线 | `16a4a4b9bf542f80c331d3eedc14f73a0b546090` |
 | plonky2-hwa worktree | `plonky2-hwa/`，detached `3b79153477d234fc4c8d2b310c83f4d41f71255a`，本次未修改 |
-| 继承的 GPU lab 配置 | `../../../../evidence/gpu-baseline.patch`；4 个 Cargo 文件的既有 local-path/CUDA 配置 |
+| 继承的 GPU lab 配置 | `evidence/gpu-baseline.patch`；4 个 Cargo 文件的既有 local-path/CUDA 配置 |
 | 本次新增代码 | `psy-node/client_prover/psy_core/psy_prove_observe/` 及 Prove Proxy / circuit manager 调用点 |
 | 原任务书 | `../psy-memory/issues/prove-proxy-stall-observability-20261015/AGENT-HANDOFF.md` |
 
@@ -46,7 +48,7 @@ HTTP `response_prepared` 只代表框架准备响应，未测量客户端收到�
 ## 本地验证
 
 ```bash
-cd psy-node
+# 从 psy-node 仓库根目录运行
 CARGO_BUILD_JOBS=2 cargo test --offline -p psy_prove_observe
 CARGO_BUILD_JOBS=2 PSY_NETWORK=testnet cargo check --offline -p psy_prover
 CARGO_BUILD_JOBS=2 PSY_NETWORK=testnet \
@@ -54,11 +56,11 @@ CARGO_BUILD_JOBS=2 PSY_NETWORK=testnet \
   cargo check --offline -p psy_prover --features cuda
 # 纯本地中间件压力测量，不是证明性能验收：
 CARGO_BUILD_JOBS=2 cargo test --offline -p psy_prove_observe http_overhead_probe -- --ignored --nocapture
-cd ../tools/prove-proxy-observe
+cd tools/prove-proxy-observe
 python3 -m unittest -v test_tools
 ```
 
-原始结果在 `../../../../evidence/`。最终状态与尚未完成的验收见 `docs/VALIDATION.md`，使用方法及上线边界见 `docs/RUNBOOK.md`。
+原始结果在 `evidence/`。最终状态与尚未完成的验收见 [VALIDATION.md](VALIDATION.md)，使用方法及上线边界见 [RUNBOOK.md](RUNBOOK.md)。
 
 ## 后续施工
 

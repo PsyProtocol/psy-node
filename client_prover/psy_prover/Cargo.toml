@@ -45,7 +45,7 @@ bincode = { workspace = true }
 
 # Native-only dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-psy_prove_observe = { workspace = true }
+psy_prove_observe = { workspace = true, features = ["plonky2-hooks"] }
 kvq = { workspace = true }
 serde_cbor = { workspace = true }
 # psy_store = { workspace = true, default-features = false }
