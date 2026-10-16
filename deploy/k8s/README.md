@@ -1,7 +1,14 @@
 # Psy local Kubernetes preparation
 
+**2026-10-16 topology change:** the next lab uses a control plane on the local
+machine and x2/x3/x4 as workers; x1 stays on live workloads. See the
+[local control-plane discussion](local-control-plane/README.md). Its dedicated
+directory includes [operator-run host prerequisites](local-control-plane/host-setup/README.md),
+but the executable platform runner below still targets
+the previous six-VM topology and must be adapted before installation.
+
 The `deploy/k8s/` directory owns the local Kubernetes build and deployment
-preparation. The initial target is an isolated lab on x2/x3/x4, with three
+preparation. The original target was an isolated lab on x2/x3/x4, with three
 control-plane VMs, three application VMs, and experimental data storage on x4.
 
 Current implementation:

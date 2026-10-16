@@ -1,5 +1,8 @@
 # x2/x3/x4 平台施工脚本
 
+2026-10-16：用户已调整为本机控制面 + x2/x3/x4 工作节点，x1 不动。当前脚本仍为
+旧六 VM 方案；请先看[新拓扑讨论稿](../local-control-plane/README.md)，适配后再施工。
+
 这一批交付是本地独立实验集群的平台施工工具。已提供六台 VM、K3s 三控制节点、
 kube-vip、MetalLB、Traefik Gateway API、Prometheus/Grafana/Alertmanager 和本地 PV。
 真实三机启动、LAN/VIP 故障切换、Psy 镜像与交易 E2E 是后续现场验收项目。
