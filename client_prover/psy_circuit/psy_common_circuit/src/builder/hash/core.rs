@@ -186,7 +186,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHashCore<F, D> 
         value: Target,
     ) -> HashOutTarget {
         let not_high_bit = self.not(index_high_bit);
-        let not_low_bit = self.not(index_high_bit);
+        let not_low_bit = self.not(index_low_bit);
 
         let index_is_0 = self.and(not_low_bit, not_high_bit);
         let index_is_1 = self.and(index_low_bit, not_high_bit);
