@@ -522,3 +522,42 @@ async fn withdrawal_policy_refusal_precedes_proof_and_does_not_fail_claims() {
     // Any proof, contract-state or broadcast call would panic in this fixture.
     assert_eq!(rpc.calls.lock().unwrap().len(), 4);
 }
+
+#[tokio::test]
+async fn live_fee_refusal_preserves_nonce_conflicts_and_healthy_claims() {
+    // The deployed recent_history policy must coexist with conflict isolation.
+    // Sparse history falls back to this over-budget quote before any proof.
+    let rpc = MockRpc::new(97, json!("0xffffffffffff"), json!([["0x0"]]));
+    let a = super::super::propose_withdrawals::PendingWithdrawal {
+        event_id: 1, checkpoint_id: 1, user_id: 1, sender_user_id: 1,
+        contract_id: 1, destination_chain_index: 1,
+        token_address: [0; 8], amount: [0; 8], recipient: [0; 8], nonce: [0; 8],
+        leaf_hash: "conflict-a".to_owned(),
+    };
+    let mut b = a.clone();
+    b.event_id = 2;
+    b.user_id = 2;
+    b.sender_user_id = 2;
+    b.leaf_hash = "conflict-b".to_owned();
+    let mut healthy = a.clone();
+    healthy.nonce[7] = 1;
+    healthy.leaf_hash = "healthy".to_owned();
+    let test_key = "11".repeat(32);
+    let report = super::super::claim_withdrawals::submit_batch(
+        &[a, b, healthy], "http://127.0.0.1:1", rpc.url.as_str(),
+        "0x0000000000000000000000000000000000000001", None, "bscTestnet",
+        Some(&test_key), None, "UNUSED_TEST_PASSWORD", None, Some(&economical_policy()),
+    ).await.unwrap();
+
+    assert_eq!(report.requested, 3);
+    assert_eq!(report.submitted_count, 0);
+    assert_eq!(report.already_claimed_count, 0);
+    assert!(report.resolved_leaf_hashes.is_empty());
+    assert!(report.failure_reasons.is_empty());
+    assert_eq!(report.deferrals.len(), 3);
+    assert!(report.deferrals["conflict-a"].contains("nonce conflict"));
+    assert!(report.deferrals["conflict-b"].contains("nonce conflict"));
+    assert!(report.deferrals["healthy"].contains("required priority fee exceeds configured cap"));
+    // The fixture rejects any proof, contract-state or broadcast method.
+    assert_eq!(rpc.calls.lock().unwrap().len(), 4);
+}

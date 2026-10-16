@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use psy_cli_common::key_utils::load_wallet_key_info;
 use crate::bridge::{
     claim_attempts,
+    claim_conflicts::find_nonce_conflicts,
     claim_withdrawals,
     constants::{
         BRIDGE_USER_ID_U64, DEFAULT_DEPLOYMENTS_NETWORK, DEFAULT_L1_RPC_URL, DEPOSIT_TREE_CONTRACT_ID, WITHDRAWAL_TREE_CONTRACT_ID,
@@ -292,8 +293,8 @@ pub(crate) struct DaemonState {
     /// Failure counts for the entries above, keyed by leaf_hash.
     #[serde(default)]
     claim_retry: HashMap<String, claim_attempts::ClaimAttempts>,
-    /// Withdrawals that ran out of attempts. Nothing retries these; they are
-    /// kept so the stuck funds stay traceable and can be re-armed by hand.
+    /// Exhausted or nonce-conflicting withdrawals. Nothing retries these;
+    /// original identities/reasons remain traceable for manual reconciliation.
     #[serde(default)]
     retired_claim_withdrawals:
         HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
@@ -1031,8 +1032,15 @@ async fn run_multichain(
             }
         }
         // Every round, and deliberately outside the finalization gate below: a
-        // round that never finishes finalizing still must not let unroutable
-        // withdrawals pile up unnoticed.
+        // round that never finishes finalizing still must not let conflicting
+        // or unroutable withdrawals pile up unnoticed. Quarantine first so an
+        // unserved chain cannot spend a retry or hide a nonce-conflict reason.
+        quarantine_conflicting_claims(
+            &mut state.pending_claim_withdrawals,
+            &mut state.claim_retry,
+            &mut state.retired_claim_withdrawals,
+            claim_attempts::now_unix(),
+        );
         record_unroutable_claims(
             &chains.iter().map(|chain| chain.chain_index).collect::<HashSet<u8>>(),
             &mut state.pending_claim_withdrawals,
@@ -2294,6 +2302,40 @@ fn claims_to_attempt(
         .collect()
 }
 
+/// Preserve collisions in the existing durable retired ledger, with an explicit
+/// reason and their ORIGINAL attempt count. This is quarantine, not exhaustion:
+/// it requests no proof, spends no attempt, and never claims a leaf was paid.
+/// The existing state schema and replay protection also work after rollback.
+fn quarantine_conflicting_claims(
+    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    retired: &mut HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
+    now_unix: u64,
+) -> bool {
+    let conflicts = find_nonce_conflicts(
+        pending.values().chain(retired.values().map(|entry| &entry.withdrawal))
+            .map(|w| (w.destination_chain_index, w.nonce, w.leaf_hash.as_str())),
+    );
+    let reasons: HashMap<String, String> = conflicts.into_iter().flat_map(|conflict| {
+        let reason = conflict.reason();
+        conflict.leaf_hashes.into_iter().map(move |leaf| (leaf, reason.clone()))
+    }).collect();
+    let to_quarantine = pending.iter().filter_map(|(key, w)| {
+        reasons.get(&w.leaf_hash.to_ascii_lowercase()).map(|reason| (key.clone(), reason.clone()))
+    }).collect::<Vec<_>>();
+    let changed = !to_quarantine.is_empty();
+    for (leaf, reason) in to_quarantine {
+        let withdrawal = pending.remove(&leaf).expect("selected pending withdrawal");
+        let attempts = retry.remove(&leaf).unwrap_or_default().attempts;
+        tracing::error!(leaf_hash = %leaf, attempts, reason = %reason,
+            "withdrawal nonce collision quarantined; no claim proof requested and no attempt spent");
+        retired.entry(leaf).or_insert(claim_attempts::RetiredClaim {
+            withdrawal, attempts, last_reason: reason, retired_at_unix: now_unix,
+        });
+    }
+    changed
+}
+
 /// Replayed events must not automatically re-arm claims retired by the operator policy.
 fn insert_pending_claims(
     withdrawals: &[propose_withdrawals::PendingWithdrawal],
@@ -2517,6 +2559,9 @@ async fn settle_pending_claim_withdrawals(
     max_checkpoint_batch: u64,
 ) -> bool {
     let now_unix = claim_attempts::now_unix();
+    quarantine_conflicting_claims(
+        pending_claim_withdrawals, claim_retry, retired_claim_withdrawals, now_unix,
+    );
     let to_claim = claims_to_attempt(pending_claim_withdrawals, claim_retry);
     if to_claim.is_empty() {
         // Not the same as "nothing pending": every remaining entry can have
@@ -4041,6 +4086,82 @@ mod tests {
     }
 
     #[test]
+    fn nonce_conflicts_preserve_every_obligation_and_spend_no_attempts() {
+        let mut a = backoff_withdrawal("a");
+        a.sender_user_id = 11;
+        let mut b = backoff_withdrawal("b");
+        b.sender_user_id = 22;
+        b.token_address[7] = 3; // Different token/user does not scope the L1 nonce.
+        let mut healthy = backoff_withdrawal("healthy");
+        healthy.nonce[0] = 1;
+        let mut pending = HashMap::from([("a".to_string(), a), ("b".to_string(), b), ("healthy".to_string(), healthy)]);
+        let mut retry = HashMap::from([("a".to_string(), claim_attempts::ClaimAttempts {
+            attempts: 2, last_reason: "previous transient failure".to_string(),
+        })]);
+        let mut retired = HashMap::new();
+        assert!(quarantine_conflicting_claims(&mut pending, &mut retry, &mut retired, 123));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending["healthy"].leaf_hash, "healthy");
+        assert_eq!(retired.len(), 2);
+        assert_eq!(retired["a"].withdrawal.sender_user_id, 11);
+        assert_eq!(retired["b"].withdrawal.sender_user_id, 22);
+        assert_eq!(retired["a"].attempts, 2);
+        assert_eq!(retired["b"].attempts, 0);
+        assert!(retry.is_empty());
+        assert!(retired.values().all(|r| r.last_reason.contains("nonce conflict")));
+        assert!(!quarantine_conflicting_claims(&mut pending, &mut retry, &mut retired, 124));
+        assert_eq!(retired["a"].retired_at_unix, 123);
+    }
+
+    #[test]
+    fn restart_and_later_scan_do_not_reactivate_a_nonce_conflict() {
+        let a = backoff_withdrawal("a");
+        let b = backoff_withdrawal("b");
+        let mut state = DaemonState {
+            pending_claim_withdrawals: HashMap::from([("a".to_string(), a.clone()), ("b".to_string(), b)]),
+            ..Default::default()
+        };
+        quarantine_conflicting_claims(&mut state.pending_claim_withdrawals, &mut state.claim_retry,
+            &mut state.retired_claim_withdrawals, 123);
+        let encoded = toml::to_string(&state).unwrap();
+        let mut restarted: DaemonState = toml::from_str(&encoded).unwrap();
+        assert!(!insert_pending_claims(&[a], &mut restarted.pending_claim_withdrawals, &restarted.retired_claim_withdrawals));
+        let later = backoff_withdrawal("later");
+        insert_pending_claims(&[later], &mut restarted.pending_claim_withdrawals, &restarted.retired_claim_withdrawals);
+        assert!(quarantine_conflicting_claims(&mut restarted.pending_claim_withdrawals,
+            &mut restarted.claim_retry, &mut restarted.retired_claim_withdrawals, 124));
+        assert!(restarted.pending_claim_withdrawals.is_empty());
+        assert_eq!(restarted.retired_claim_withdrawals.len(), 3);
+        assert_eq!(restarted.retired_claim_withdrawals["later"].attempts, 0);
+        assert_eq!(restarted.retired_claim_withdrawals["a"].retired_at_unix, 123);
+    }
+
+    #[test]
+    fn an_exhausted_retired_leaf_still_blocks_a_conflicting_new_leaf_only_on_its_chain() {
+        let old = backoff_withdrawal("old");
+        let mut same_chain = backoff_withdrawal("new");
+        same_chain.sender_user_id = 2;
+        let mut other_chain = backoff_withdrawal("other-chain");
+        other_chain.destination_chain_index = 1;
+        let mut pending = HashMap::from([
+            ("new".to_string(), same_chain),
+            ("other-chain".to_string(), other_chain),
+            ("old".to_string(), old.clone()), // Defensive overlap from a manually requeued ledger.
+        ]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::from([("old".to_string(), claim_attempts::RetiredClaim {
+            withdrawal: old, attempts: 3, last_reason: "original failure".to_string(), retired_at_unix: 1,
+        })]);
+        quarantine_conflicting_claims(&mut pending, &mut retry, &mut retired, 123);
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key("other-chain"));
+        assert_eq!(retired["old"].last_reason, "original failure");
+        assert_eq!(retired["old"].attempts, 3);
+        assert_eq!(retired["old"].retired_at_unix, 1);
+        assert!(retired.contains_key("new"));
+    }
+
+    #[test]
     fn a_withdrawal_that_has_never_been_tried_is_due() {
         let mut pending = HashMap::new();
         pending.insert("a".to_string(), backoff_withdrawal("a"));
@@ -4074,6 +4195,28 @@ mod tests {
 
     fn served(indices: &[u8]) -> HashSet<u8> {
         indices.iter().copied().collect()
+    }
+
+    #[test]
+    fn unserved_chain_conflicts_preserve_zero_and_near_exhausted_attempts() {
+        let mut pending = HashMap::from([
+            ("new".to_string(), withdrawal_for_chain("new", 7)),
+            ("retried".to_string(), withdrawal_for_chain("retried", 7)),
+        ]);
+        let mut retry = HashMap::from([("retried".to_string(), claim_attempts::ClaimAttempts {
+            attempts: 2, last_reason: "previous transient failure".to_string(),
+        })]);
+        let mut retired = HashMap::new();
+
+        quarantine_conflicting_claims(&mut pending, &mut retry, &mut retired, 123);
+        record_unroutable_claims(&served(&[0, 1, 2]), &mut pending, &mut retry, &mut retired, 123);
+
+        assert!(pending.is_empty());
+        assert!(retry.is_empty());
+        assert_eq!(retired.len(), 2);
+        assert_eq!(retired["new"].attempts, 0);
+        assert_eq!(retired["retried"].attempts, 2);
+        assert!(retired.values().all(|entry| entry.last_reason.contains("nonce conflict")));
     }
 
     #[test]
