@@ -38,6 +38,10 @@ impl VariableHeightBitInfo {
         }
         BoolTarget::new_unsafe(base)
     }
+    /// Returns the PARENT index of the subtree root, i.e. `index >> (height + 1)`
+    /// — the direction bit towards the parent is already dropped. (The opt
+    /// variant returns the node index `index >> height` instead; see its
+    /// `get_root_index`.)
     pub fn get_root_parent_index<F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> Target {
         let mut sub_root_bit = builder.zero();
         let mut sub_root_index = builder.zero();

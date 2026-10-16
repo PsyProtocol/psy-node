@@ -86,9 +86,9 @@ impl UpdateNearestCommonAncestorProofOptGadget {
         builder.connect(level_a_diff_sub_solo, height_a);
         builder.connect(level_b_diff_sub_solo, height_b);
 
-        let computed_child_index_a = child_a.bit_info.get_root_parent_index(builder);
+        let computed_child_index_a = child_a.bit_info.get_root_index(builder);
         let computed_root_index_a = builder.div_rem(computed_child_index_a, 1).0;
-        let computed_child_index_b = child_b.bit_info.get_root_parent_index(builder);
+        let computed_child_index_b = child_b.bit_info.get_root_index(builder);
         let computed_root_index_b = builder.div_rem(computed_child_index_b, 1).0;
 
         tracing::debug!(
