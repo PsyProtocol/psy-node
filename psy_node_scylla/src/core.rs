@@ -29,41 +29,59 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 execution_profile = execution_profile.consistency(scylla::statement::Consistency::One)
         };
         let execution_profile = execution_profile.build();
-        let session = SessionBuilder::new()
+        let credentials = crate::auth::from_env()?;
+        let schema_precreated = crate::auth::schema_precreated()?;
+        let mut builder = SessionBuilder::new()
             .known_nodes(known_nodes.iter())
             .default_execution_profile_handle(execution_profile.into_handle())
             .connection_timeout(Duration::from_secs(120))
             .keepalive_timeout(Duration::from_secs(60))
             .keepalive_interval(Duration::from_secs(30))
-            .pool_size(PoolSize::PerHost(NonZeroUsize::new(1).unwrap()))
-            .build()
-            .await?;
+            .pool_size(PoolSize::PerHost(NonZeroUsize::new(1).unwrap()));
+        if let Some(credentials) = credentials {
+            builder = builder.user(credentials.username, credentials.password);
+        }
+        let session = builder.build().await?;
         let session = Arc::new(session);
 
         let no_tablet_keyspace = format!("{}_no_tablet", keyspace);
 
-        println!("creating keyspaces: {} and {}", &keyspace, &no_tablet_keyspace);
+        if schema_precreated {
+            // Query only metadata: application roles need no global CREATE
+            // permission. Do not silently create or alter any missing keyspace.
+            for name in [&keyspace, &no_tablet_keyspace] {
+                let rows = session.query_unpaged(
+                    "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?",
+                    (name.as_str(),),
+                ).await?.into_rows_result()?;
+                if rows.maybe_first_row::<(String,)>()?.is_none() {
+                    anyhow::bail!("required Scylla keyspace is absent; provision schema before startup");
+                }
+            }
+        } else {
+            println!("creating keyspaces: {} and {}", &keyspace, &no_tablet_keyspace);
 
-        session
-            .query_unpaged(
-                format!(
-                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
-                    &keyspace
-                ),
-                &[],
-            )
-            .await?;
-        session.await_schema_agreement().await?;
-        session
-            .query_unpaged(
-                format!(
-                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
-                    &no_tablet_keyspace
-                ),
-                &[],
-            )
-            .await?;
-        session.await_schema_agreement().await?;
+            session
+                .query_unpaged(
+                    format!(
+                        "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
+                        &keyspace
+                    ),
+                    &[],
+                )
+                .await?;
+            session.await_schema_agreement().await?;
+            session
+                .query_unpaged(
+                    format!(
+                        "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
+                        &no_tablet_keyspace
+                    ),
+                    &[],
+                )
+                .await?;
+            session.await_schema_agreement().await?;
+        }
         Ok(Self {
             session,
             keyspace,
