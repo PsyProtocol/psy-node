@@ -88,3 +88,10 @@ namespace，数据库测试记录/stream 留作证据；失败保留客户端现
 Valkey AOF everysec；Scylla batch commitlog；NATS file store。PVC capacity 为调度声明，
 同一 ext4 上的目录没有磁盘硬配额。监控卷 54 GiB 加本轮 80 GiB 共声明 134 GiB，
 仍需留出 K3s 镜像、日志、WAL 和压缩空间。当前均为单数据节点，备份/异机恢复需单独验证。
+
+Scylla 2026.1.5 原生外层参数解析器转交 Seastar 参数时需 `--smp=2`、`--memory=4G`
+等单参数形式。旧包遇到该启动错误时，使用已审查新源码的
+`databases.py repair-scylla-args --bundle /absolute/original-bundle --evidence /absolute/new-repair.json`，
+只对原 bundle 所有且参数未被他人改变的 StatefulSet 做 UID/resourceVersion 条件 patch，
+不修改旧包、PVC 或凭据；再从原包继续 install。失败的旧 Pod 若阻止 StatefulSet 更新，
+核对 owner/旧 controller revision 后仅删除该实验 Pod，让控制器重建。

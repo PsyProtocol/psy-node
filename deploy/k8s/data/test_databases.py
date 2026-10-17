@@ -139,6 +139,13 @@ class DataTests(unittest.TestCase):
             self.assertTrue(any('ALTER ROLE cassandra WITH LOGIN = false' in kw['data'] for _,kw in calls))
             self.assertGreaterEqual(sum('SELECT cluster_name' in kw['data'] for _,kw in calls),3)
 
+    def test_scylla_seastar_options_are_single_arguments(self):
+        args=db.scylla_args()
+        for flag in ['--smp=2','--memory=4G','--overprovisioned','--lock-memory=0','--log-to-stdout=1','--log-to-syslog=0']:
+            self.assertIn(flag,args)
+        self.assertNotIn('--smp',args)
+        self.assertNotIn('--memory',args)
+
     def test_plan_is_offline_and_does_not_create_or_contact_cluster(self):
         p=subprocess.run([sys.executable,str(db.HERE/'databases.py'),'plan'],capture_output=True,text=True,check=True)
         value=json.loads(p.stdout)

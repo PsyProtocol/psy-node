@@ -92,6 +92,11 @@ def peer(namespace, labels):
     return {'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': namespace}}, 'podSelector': {'matchLabels': labels}}
 
 
+def scylla_args():
+    # Scylla's outer parser forwards Seastar flags only in --name=value form.
+    return ['--options-file', '/config/scylla.yaml', '--broadcast-rpc-address', '$(POD_IP)', '--smp=2', '--memory=4G', '--overprovisioned', '--lock-memory=0', '--developer-mode=1', '--log-to-stdout=1', '--log-to-syslog=0']
+
+
 def manifests(passwords, images):
     result = [obj('ServiceAccount', 'psy-lab-data', automountServiceAccountToken=False)]
     result.append(obj('NetworkPolicy', 'psy-lab-data-default-deny', {'podSelector': {}, 'policyTypes': ['Ingress', 'Egress'], 'ingress': [], 'egress': []}, api='networking.k8s.io/v1'))
@@ -120,7 +125,7 @@ def manifests(passwords, images):
             # expansion or writable ConfigMap is needed in the container.
             env = [{'name': 'POD_IP', 'valueFrom': {'fieldRef': {'fieldPath': 'status.podIP'}}}]
             command = ['/usr/bin/scylla']
-            args = ['--options-file', '/config/scylla.yaml', '--broadcast-rpc-address', '$(POD_IP)', '--smp', '2', '--memory', '4G', '--overprovisioned', '1', '--lock-memory', '0', '--developer-mode', '1', '--log-to-stdout', '1', '--log-to-syslog', '0']
+            args = scylla_args()
             mount = '/var/lib/scylla'
             for role, user, password in [('admin', 'lab_admin', values['admin-password']), ('app', 'psy_app', values['app-password']), ('bootstrap', 'cassandra', 'cassandra')]:
                 values['cqlshrc-' + role] = '[authentication]\nusername = '+user+'\npassword = '+password+'\n'
@@ -275,6 +280,22 @@ def install(bundle):
     print('Five database services ready; run acceptance before declaring completion')
 
 
+def repair_scylla(bundle, evidence):
+    require(evidence.is_absolute() and not evidence.exists(), 'Fresh absolute repair evidence required')
+    meta = guard(bundle)
+    original = next(x for x in json.loads((bundle / 'resources.json').read_text())['items'] if x['kind'] == 'StatefulSet' and x['metadata']['name'] == 'scylla')
+    current = json.loads(kubectl('-n', NS, 'get', 'statefulset', 'scylla', '-o', 'json').stdout)
+    require(current['metadata'].get('annotations', {}).get('psy.local/data-bundle') == meta['bundle_id'], 'Foreign Scylla StatefulSet')
+    before = current['spec']['template']['spec']['containers'][0]
+    require(before['image'] == meta['images']['scylla'], 'Scylla image changed; inspect before repair')
+    require(before['args'] in [original['spec']['template']['spec']['containers'][0]['args'], scylla_args()], 'Unexpected Scylla arguments; refusing to overwrite')
+    patch = [{'op': 'test', 'path': '/metadata/uid', 'value': current['metadata']['uid']}, {'op': 'test', 'path': '/metadata/resourceVersion', 'value': current['metadata']['resourceVersion']}, {'op': 'test', 'path': '/spec/template/spec/containers/0/args', 'value': before['args']}, {'op': 'replace', 'path': '/spec/template/spec/containers/0/args', 'value': scylla_args()}]
+    write(evidence, {'repair': 'Scylla Seastar CLI argument format only', 'bundle_id': meta['bundle_id'], 'statefulset_uid': current['metadata']['uid'], 'before_args': before['args'], 'after_args': scylla_args(), 'volumes_preserved': True})
+    if before['args'] != scylla_args():
+        kubectl('-n', NS, 'patch', 'statefulset', 'scylla', '--type=json', '-p', json.dumps(patch))
+    print('Patched only owned Scylla arguments; existing PVC and credentials retained')
+
+
 def main():
     os.umask(0o077)
     p = argparse.ArgumentParser(description=__doc__)
@@ -286,13 +307,18 @@ def main():
     r.add_argument('--virtual-fs-uuid', required=True)
     i = sub.add_parser('install')
     i.add_argument('--bundle', type=Path, required=True)
+    fix = sub.add_parser('repair-scylla-args')
+    fix.add_argument('--bundle', type=Path, required=True)
+    fix.add_argument('--evidence', type=Path, required=True)
     a = p.parse_args()
     if a.command == 'plan':
         print(json.dumps({'namespace': NS, 'databases': DATABASES, 'new_pvc_gib': sum(d['gib'] for d in DATABASES.values()), 'node': 'psy-lab-work-x4', 'external_services': 0, 'deployment': False}, indent=2))
     elif a.command == 'render':
         render(a.inventory, a.platform.resolve(), a.output, a.secrets_file, a.virtual_fs_uuid)
-    else:
+    elif a.command == 'install':
         install(a.bundle.resolve())
+    else:
+        repair_scylla(a.bundle.resolve(), a.evidence)
 
 
 if __name__ == '__main__':
