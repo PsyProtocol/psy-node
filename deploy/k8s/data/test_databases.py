@@ -39,7 +39,7 @@ class DataTests(unittest.TestCase):
     def test_storage_is_prebound_retained_separate_and_pods_cannot_use_control_plane(self):
         items=self.objects()
         self.assertEqual(len([p for p in items if p['kind']=='StatefulSet']),5)
-        self.assertEqual(sum(x['gib'] for x in db.DATABASES.values()),80)
+        self.assertEqual(sum(x['gib'] for x in db.DATABASES.values()),130)
         for p in items:
             if p['kind']=='PersistentVolume':
                 self.assertEqual(p['spec']['persistentVolumeReclaimPolicy'],'Retain')
@@ -146,12 +146,32 @@ class DataTests(unittest.TestCase):
         self.assertNotIn('--smp',args)
         self.assertNotIn('--memory',args)
 
+    def test_full_database_budget_and_scylla_heap_match_the_dedicated_node_plan(self):
+        items=self.objects()
+        for item in items:
+            if item['kind']=='StatefulSet':
+                c=item['spec']['template']['spec']['containers'][0]
+                self.assertEqual(c['resources'],{'requests':{'cpu':'4','memory':'8Gi'},'limits':{'cpu':'4','memory':'8Gi'}})
+                if item['metadata']['name']=='scylla':
+                    self.assertIn('--smp=4',c['args'])
+                    self.assertIn('--memory=6G',c['args'])
+                if item['metadata']['name'].startswith('postgres'):
+                    self.assertIn('shared_buffers=2GB',c['args'])
+            if item['kind']=='PersistentVolumeClaim':
+                self.assertGreaterEqual(int(item['spec']['resources']['requests']['storage'][:-2]),20)
+        valkey=next(x for x in items if x['kind']=='ConfigMap' and x['metadata']['name']=='psy-lab-valkey')
+        self.assertIn('maxmemory 3gb',valkey['data']['valkey.conf'])
+        nats=next(x for x in items if x['kind']=='Secret' and x['metadata']['name']=='psy-lab-nats')
+        limits=json.loads(base64.b64decode(nats['data']['nats.conf']))['jetstream']
+        self.assertEqual(limits['max_file_store'],18*2**30)
+        self.assertEqual(limits['max_memory_store'],2**30)
+
     def test_plan_is_offline_and_does_not_create_or_contact_cluster(self):
         p=subprocess.run([sys.executable,str(db.HERE/'databases.py'),'plan'],capture_output=True,text=True,check=True)
         value=json.loads(p.stdout)
         self.assertFalse(value['deployment'])
         self.assertEqual(value['external_services'],0)
-        self.assertEqual(value['new_pvc_gib'],80)
+        self.assertEqual(value['new_pvc_gib'],130)
 
 
 if __name__=='__main__':

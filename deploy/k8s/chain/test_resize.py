@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('resize', Path(__file__).with_name('resize-worker.py'))
 resize = importlib.util.module_from_spec(spec)
@@ -42,6 +46,45 @@ class ResizeSafety(unittest.TestCase):
     def test_domain_shape_ignores_only_the_two_memory_fields(self):
         self.assertEqual(resize.shape(XML), resize.shape(XML.replace('8388608', '16777216')))
         self.assertNotEqual(resize.shape(XML), resize.shape(XML.replace('<vcpu>4', '<vcpu>8')))
+        self.assertEqual(resize.shape(XML,allow_cpu=True),resize.shape(XML.replace('<vcpu>4','<vcpu>8'),allow_cpu=True))
+
+    def test_insufficient_capacity_after_shutdown_restores_the_unchanged_vm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            platform=root/'platform'; platform.mkdir()
+            node={**NODE,'role':'agent'}
+            inventory={'lab':'psy-k8s-local','topology':'local-control-plane','network_confirmed':True,'storage_confirmed':True,
+                       'nodes':[node],'hosts':{'x2':{**HOST,'ssh':'arc99x2','expected_hostname':'arc99x2'}}}
+            config=root/'inventory.json'; config.write_text(json.dumps(inventory))
+            (root/'inventory.sha256').write_text(hashlib.sha256(json.dumps(inventory,sort_keys=True).encode()).hexdigest())
+            calls=[]
+            def virsh(host,*args):
+                calls.append(args)
+                if args[0]=='dumpxml':return XML
+                if args[0]=='domstate':return 'shut off' if any(c[0]=='shutdown' for c in calls) else 'running'
+                return ''
+            def ssh(host,args):return '24' if args[0]=='getconf' else 'arc99x2'
+            state={'spec':{},'metadata':{'uid':'same-node'},'status':{'nodeInfo':{'bootID':'old-boot'}}}
+            def run(args,**kwargs):return json.dumps(state) if args[:3]==['kubectl','get','node'] else ''
+            argv=['resize-worker.py','--inventory',str(config),'--platform',str(platform),'--node','x2',
+                  '--domain-uuid',UUID,'--memory-gib','16','--cpus','6','--apply','--evidence',str(root/'evidence')]
+            with patch('sys.argv',argv),patch.object(resize,'virsh',side_effect=virsh),patch.object(resize,'ssh',side_effect=ssh),\
+                 patch.object(resize,'run',side_effect=run) as runner,patch.object(resize,'host_memory',return_value={'MemTotal':32*2**20,'MemAvailable':20*2**20}),\
+                 patch.object(resize,'wait_node',return_value=state) as wait:
+                with self.assertRaisesRegex(ValueError,'Insufficient physical memory'):
+                    resize.main()
+                wait.assert_called_once_with(NODE['name'],8,'old-boot')
+                self.assertIn(('start',UUID),calls)
+                self.assertFalse(any(c[0].startswith('set') for c in calls))
+                self.assertTrue(any(c.args[0]==['kubectl','uncordon',NODE['name']] for c in runner.call_args_list))
+            self.assertEqual((root/'evidence/domain-before.xml').read_text(),XML+'\n')
+
+    def test_wait_ignores_stale_ready_until_the_guest_boot_id_changes(self):
+        old={'status':{'conditions':[{'type':'Ready','status':'True'}],'capacity':{'memory':str(16*2**20)+'Ki'},'nodeInfo':{'bootID':'old'}}}
+        new=json.loads(json.dumps(old));new['status']['nodeInfo']['bootID']='new'
+        with patch.object(resize,'run',side_effect=[json.dumps(old),json.dumps(new)]) as runner,patch.object(resize.time,'sleep'):
+            self.assertEqual(resize.wait_node('psy-lab-work-x2',16,'old'),new)
+            self.assertEqual(runner.call_count,2)
 
 
 if __name__ == '__main__':

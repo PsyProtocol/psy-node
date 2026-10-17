@@ -19,11 +19,11 @@ HERE = Path(__file__).resolve().parent
 NS = 'psy-data'
 LABELS = {'psy.local/lab': 'psy-k8s-local', 'psy.local/component': 'data'}
 DATABASES = {
-    'postgres-services': {'image': 'postgres', 'port': 5432, 'gib': 10, 'uid': 999, 'gid': 999, 'memory': '1Gi', 'request': '256Mi', 'database': 'psy_services'},
-    'postgres-envio': {'image': 'postgres', 'port': 5432, 'gib': 10, 'uid': 999, 'gid': 999, 'memory': '1Gi', 'request': '256Mi', 'database': 'psy_envio'},
-    'scylla': {'image': 'scylla', 'port': 9042, 'gib': 50, 'uid': 999, 'gid': 1000, 'memory': '6Gi', 'request': '4Gi'},
-    'valkey': {'image': 'valkey', 'port': 6379, 'gib': 5, 'uid': 999, 'gid': 1000, 'memory': '1Gi', 'request': '256Mi'},
-    'nats': {'image': 'nats', 'port': 4222, 'gib': 5, 'uid': 1000, 'gid': 1000, 'memory': '512Mi', 'request': '128Mi'},
+    'postgres-services': {'image': 'postgres', 'port': 5432, 'gib': 20, 'uid': 999, 'gid': 999, 'memory': '8Gi', 'request': '8Gi', 'database': 'psy_services'},
+    'postgres-envio': {'image': 'postgres', 'port': 5432, 'gib': 20, 'uid': 999, 'gid': 999, 'memory': '8Gi', 'request': '8Gi', 'database': 'psy_envio'},
+    'scylla': {'image': 'scylla', 'port': 9042, 'gib': 50, 'uid': 999, 'gid': 1000, 'memory': '8Gi', 'request': '8Gi'},
+    'valkey': {'image': 'valkey', 'port': 6379, 'gib': 20, 'uid': 999, 'gid': 1000, 'memory': '8Gi', 'request': '8Gi'},
+    'nats': {'image': 'nats', 'port': 4222, 'gib': 20, 'uid': 1000, 'gid': 1000, 'memory': '8Gi', 'request': '8Gi'},
 }
 PYTHON_IMAGE = 'docker.io/library/python@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4'
 
@@ -92,9 +92,9 @@ def peer(namespace, labels):
     return {'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': namespace}}, 'podSelector': {'matchLabels': labels}}
 
 
-def scylla_args():
+def scylla_args(*, full_resources=False):
     # Scylla's outer parser forwards Seastar flags only in --name=value form.
-    return ['--options-file', '/config/scylla.yaml', '--broadcast-rpc-address', '$(POD_IP)', '--smp=2', '--memory=4G', '--overprovisioned', '--lock-memory=0', '--developer-mode=1', '--log-to-stdout=1', '--log-to-syslog=0']
+    return ['--options-file', '/config/scylla.yaml', '--broadcast-rpc-address', '$(POD_IP)', '--smp=4' if full_resources else '--smp=2', '--memory=6G' if full_resources else '--memory=4G', '--overprovisioned', '--lock-memory=0', '--developer-mode=1', '--log-to-stdout=1', '--log-to-syslog=0']
 
 
 def manifests(passwords, images):
@@ -118,25 +118,26 @@ def manifests(passwords, images):
             env = [{'name': 'POSTGRES_PASSWORD_FILE', 'value': '/credentials/admin-password'}, {'name': 'PGDATA', 'value': '/var/lib/postgresql/data/pgdata'}, {'name': 'POSTGRES_INITDB_ARGS', 'value': '--auth-host=scram-sha-256 --auth-local=trust'}]
             config = {'01-app.sh': pg_init(d['database'])}
             mount = '/var/lib/postgresql/data'
-            args = ['postgres', '-c', 'shared_buffers=128MB', '-c', 'max_connections=50', '-c', 'max_wal_size=1GB']
+            args = ['postgres', '-c', 'shared_buffers=2GB', '-c', 'effective_cache_size=5GB', '-c', 'work_mem=8MB', '-c', 'max_connections=100', '-c', 'max_wal_size=2GB']
         elif name == 'scylla':
             config = {'scylla.yaml': json.dumps({'cluster_name': 'psy-k8s-lab', 'workdir': '/var/lib/scylla', 'num_tokens': 16, 'listen_address': '127.0.0.1', 'rpc_address': '0.0.0.0', 'broadcast_rpc_address': '127.0.0.1', 'seed_provider': [{'class_name': 'org.apache.cassandra.locator.SimpleSeedProvider', 'parameters': [{'seeds': '127.0.0.1'}]}], 'endpoint_snitch': 'SimpleSnitch', 'authenticator': 'PasswordAuthenticator', 'authorizer': 'CassandraAuthorizer', 'commitlog_sync': 'batch', 'commitlog_sync_batch_window_in_ms': 2, 'commitlog_total_space_in_mb': 1024, 'api_address': '127.0.0.1', 'prometheus_address': '0.0.0.0', 'tablets_mode_for_new_keyspaces': 'disabled'})}
             # Override advertised RPC IP through a native CLI option. No shell
             # expansion or writable ConfigMap is needed in the container.
             env = [{'name': 'POD_IP', 'valueFrom': {'fieldRef': {'fieldPath': 'status.podIP'}}}]
             command = ['/usr/bin/scylla']
-            args = scylla_args()
+            # Keep room for allocator/driver/other overhead within the 8 GiB Pod.
+            args = scylla_args(full_resources=True)
             mount = '/var/lib/scylla'
             for role, user, password in [('admin', 'lab_admin', values['admin-password']), ('app', 'psy_app', values['app-password']), ('bootstrap', 'cassandra', 'cassandra')]:
                 values['cqlshrc-' + role] = '[authentication]\nusername = '+user+'\npassword = '+password+'\n'
         elif name == 'valkey':
             command = ['valkey-server']
             args = ['/config/valkey.conf']
-            config = {'valkey.conf': 'bind 0.0.0.0\nprotected-mode yes\nport 6379\ndir /data\nappendonly yes\nappendfsync everysec\nsave ""\nmaxmemory 512mb\nmaxmemory-policy noeviction\naclfile /credentials/users.acl\n'}
+            config = {'valkey.conf': 'bind 0.0.0.0\nprotected-mode yes\nport 6379\ndir /data\nappendonly yes\nappendfsync everysec\nsave ""\nmaxmemory 3gb\nmaxmemory-policy noeviction\naclfile /credentials/users.acl\n'}
             values['users.acl'] = 'user default off\nuser lab_admin on #'+hashlib.sha256(values['admin-password'].encode()).hexdigest()+' ~* &* +@all\nuser psy_app on #'+hashlib.sha256(values['app-password'].encode()).hexdigest()+' ~psy:* &psy:* +@all -@admin -@dangerous\n'
         else:
             args = ['--config', '/credentials/nats.conf']
-            values['nats.conf'] = json.dumps({'server_name': 'psy-k8s-lab-nats', 'listen': '0.0.0.0:4222', 'http': '127.0.0.1:8222', 'max_payload': 8388608, 'jetstream': {'store_dir': '/data/jetstream', 'max_memory_store': 134217728, 'max_file_store': 4294967296}, 'authorization': {'users': [{'user': 'psy_app', 'password': values['app-password'], 'permissions': {'publish': ['psy.>', '$JS.API.>', '$JS.ACK.>'], 'subscribe': ['psy.>', '_INBOX.>']}}]}})
+            values['nats.conf'] = json.dumps({'server_name': 'psy-k8s-lab-nats', 'listen': '0.0.0.0:4222', 'http': '127.0.0.1:8222', 'max_payload': 8388608, 'jetstream': {'store_dir': '/data/jetstream', 'max_memory_store': 2**30, 'max_file_store': 18 * 2**30}, 'authorization': {'users': [{'user': 'psy_app', 'password': values['app-password'], 'permissions': {'publish': ['psy.>', '$JS.API.>', '$JS.ACK.>'], 'subscribe': ['psy.>', '_INBOX.>']}}]}})
         result.append(obj('Secret', 'psy-lab-' + name, type='Opaque', data={k: base64.b64encode(v.encode()).decode() for k, v in values.items()}))
         if config:
             result.append(obj('ConfigMap', 'psy-lab-' + name, data=config))
@@ -145,7 +146,7 @@ def manifests(passwords, images):
         if config:
             volumes.append({'name': 'config', 'configMap': {'name': 'psy-lab-' + name, 'defaultMode': 0o444}})
             mounts.append({'name': 'config', 'mountPath': '/docker-entrypoint-initdb.d' if name.startswith('postgres') else '/config', 'readOnly': True})
-        container = {'name': name, 'image': images[d['image']], 'args': args, 'env': env, 'ports': [{'name': 'client', 'containerPort': d['port']}], 'volumeMounts': mounts, 'resources': {'requests': {'cpu': '1' if name == 'scylla' else '100m', 'memory': d['request']}, 'limits': {'cpu': '2' if name == 'scylla' else '1', 'memory': d['memory']}}, 'securityContext': {'allowPrivilegeEscalation': False, 'capabilities': {'drop': ['ALL']}}, 'startupProbe': {'tcpSocket': {'port': 'client'}, 'periodSeconds': 5, 'failureThreshold': 120}, 'readinessProbe': {'tcpSocket': {'port': 'client'}, 'periodSeconds': 5}, 'livenessProbe': {'tcpSocket': {'port': 'client'}, 'periodSeconds': 20, 'failureThreshold': 6}}
+        container = {'name': name, 'image': images[d['image']], 'args': args, 'env': env, 'ports': [{'name': 'client', 'containerPort': d['port']}], 'volumeMounts': mounts, 'resources': {'requests': {'cpu': '4', 'memory': d['request']}, 'limits': {'cpu': '4', 'memory': d['memory']}}, 'securityContext': {'allowPrivilegeEscalation': False, 'capabilities': {'drop': ['ALL']}}, 'startupProbe': {'tcpSocket': {'port': 'client'}, 'periodSeconds': 5, 'failureThreshold': 120}, 'readinessProbe': {'tcpSocket': {'port': 'client'}, 'periodSeconds': 5}, 'livenessProbe': {'tcpSocket': {'port': 'client'}, 'periodSeconds': 20, 'failureThreshold': 6}}
         if command:
             container['command'] = command
         result.append(obj('StatefulSet', name, {'replicas': 1, 'serviceName': name, 'selector': {'matchLabels': {'app.kubernetes.io/name': name}}, 'persistentVolumeClaimRetentionPolicy': {'whenDeleted': 'Retain', 'whenScaled': 'Retain'}, 'template': {'metadata': {'labels': labels}, 'spec': {'serviceAccountName': 'psy-lab-data', 'automountServiceAccountToken': False, 'terminationGracePeriodSeconds': 120, 'nodeSelector': {'psy.local/role': 'worker', 'kubernetes.io/hostname': 'psy-lab-work-x4'}, 'securityContext': {'runAsNonRoot': True, 'runAsUser': d['uid'], 'runAsGroup': d['gid'], 'fsGroup': d['gid'], 'fsGroupChangePolicy': 'OnRootMismatch', 'seccompProfile': {'type': 'RuntimeDefault'}}, 'containers': [container], 'volumes': volumes}}}, api='apps/v1'))

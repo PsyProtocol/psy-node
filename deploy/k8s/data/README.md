@@ -3,13 +3,22 @@
 只为 `psy-k8s-local` 新实验部署五个单实例数据服务，全部在 work-x4；不访问或迁移现网数据库。
 两个 PostgreSQL 分别服务 Services 和 Envio，数据库、账户密码及 PVC 分开。
 
-| Service（psy-data） | 端口 | 数据卷 | 内存 request / limit |
-| --- | ---: | ---: | --- |
-| postgres-services | 5432 | 10 GiB | 256 MiB / 1 GiB |
-| postgres-envio | 5432 | 10 GiB | 256 MiB / 1 GiB |
-| scylla | 9042 | 50 GiB | 4 GiB / 6 GiB |
-| valkey | 6379 | 5 GiB | 256 MiB / 1 GiB |
-| nats | 4222 | 5 GiB | 128 MiB / 512 MiB |
+| Service（psy-data） | 端口 | 数据卷 | CPU request / limit | 内存 request / limit |
+| --- | ---: | ---: | --- | --- |
+| postgres-services | 5432 | 20 GiB | 4 / 4 | 8 GiB / 8 GiB |
+| postgres-envio | 5432 | 20 GiB | 4 / 4 | 8 GiB / 8 GiB |
+| scylla | 9042 | 50 GiB | 4 / 4 | 8 GiB / 8 GiB |
+| valkey | 6379 | 20 GiB | 4 / 4 | 8 GiB / 8 GiB |
+| nats | 4222 | 20 GiB | 4 / 4 | 8 GiB / 8 GiB |
+
+上述为 2026-10-17 用户确认的专用节点预算。合计申请 20 vCPU、40 GiB 内存和
+130 GiB 数据卷，Worker VM 必须先具备足够 allocatable 容量，再应用配置。
+CPU 单位为 Kubernetes 的逻辑 CPU/vCPU，不表示独占物理核心。
+Scylla 使用 4 shard、6 GiB 内部 memory budget，为 Pod 的 8 GiB 上限留出开销。
+两个 PostgreSQL 的 shared_buffers 为 2 GiB；Valkey maxmemory 为 3 GiB，剩余预算
+为 AOF rewrite/COW 和其他开销留空间；NATS JetStream memory/file store 上限为
+1/18 GiB，磁盘上限低于其 20 GiB PVC，预留文件系统开销。
+旧输入包保持不可变；更新源码默认值本身不会修改已经部署的实例。
 
 业务入口如 `postgres-services.psy-data.svc.cluster.local:5432`，全部为 ClusterIP。
 数据库镜像复用 `../build/versions.json` 的四个固定 digest；已核实 PG 16.15、Scylla
@@ -86,7 +95,7 @@ worker 读取原记录与消息。此为正常重建持久性测试，不代表�
 namespace，数据库测试记录/stream 留作证据；失败保留客户端现场，result.json 如实失败。
 
 Valkey AOF everysec；Scylla batch commitlog；NATS file store。PVC capacity 为调度声明，
-同一 ext4 上的目录没有磁盘硬配额。监控卷 54 GiB 加本轮 80 GiB 共声明 134 GiB，
+同一 ext4 上的目录没有磁盘硬配额。监控卷 54 GiB 加本轮 130 GiB 共声明 184 GiB，
 仍需留出 K3s 镜像、日志、WAL 和压缩空间。当前均为单数据节点，备份/异机恢复需单独验证。
 
 Scylla 2026.1.5 原生外层参数解析器转交 Seastar 参数时需 `--smp=2`、`--memory=4G`
