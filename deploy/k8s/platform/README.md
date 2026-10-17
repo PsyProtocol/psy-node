@@ -89,7 +89,13 @@ python3 lab.py charts --output output/run-001 --assets assets
 覆盖上一次施工证据。输出目录 700，配置 600，脚本 700。`charts` 校验 Helm 原始包
 和可执行文件，生成真实 Helm 模板并复制固定 chart/CRD，安装时再次校验。
 K3s、MetalLB、Prometheus cohort 与 `../build/versions.json` 一致；额外冻结
-Helm 3.19.0、Traefik chart 41.7.1、Gateway API 1.4.0、Ubuntu noble 20260926。
+Helm 3.19.0、Traefik chart 41.7.1、Gateway API 1.5.1、Ubuntu noble 20260926。
+
+2026-10-17 四节点现场发现：Traefik 3.7.14 启动 Gateway provider 时会等待
+`TLSRoute` 的 v1 informer；1.4.0 Standard 没有该 API，导致 Pod Ready 但
+Gateway 一直等待 controller。固定改用官方 1.5.1 Standard，下载摘要与 GitHub
+release asset 的 SHA256 核对；安装等待所需 CRD Established，验收再等待 Gateway
+Programmed，不能用 Pod Ready 代替入口可用。
 Chart 内的运行时镜像及 kube-vip 当前按固定版本 tag；镜像 digest 锁定、镜像仓库、
 签名与镜像拉取凭据在业务镜像发布阶段落实，本实验安装尚未做到全离线镜像供应。
 

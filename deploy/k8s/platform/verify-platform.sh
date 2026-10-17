@@ -8,6 +8,7 @@ fi
 kubectl -n metallb-system rollout status deployment/psy-lab-metallb-controller --timeout=5m
 kubectl -n metallb-system rollout status daemonset/psy-lab-metallb-speaker --timeout=5m
 kubectl -n psy-platform rollout status deployment/psy-lab-traefik --timeout=5m
+kubectl -n psy-platform wait --for=condition=Programmed gateway/traefik-gateway --timeout=5m
 python3 - <<'PY'
 import json,subprocess
 from pathlib import Path

@@ -7,6 +7,6 @@
     "metallb.tgz": {"url": "https://github.com/metallb/metallb/releases/download/metallb-chart-0.16.1/metallb-0.16.1.tgz", "sha256": "fb06bb584fcb7856f15733b2a6a2aff5b61b5c350687e341c163ae24a5938adc"},
     "traefik.tgz": {"url": "https://traefik.github.io/charts/traefik/traefik-41.7.1.tgz", "sha256": "f9edd5ca699ff0f5eab14df6e4feefa15f7597a9b56f0b1c01f6089b1eecbaf1"},
     "prometheus.tgz": {"url": "https://github.com/prometheus-community/helm-charts/releases/download/kube-prometheus-stack-92.3.1/kube-prometheus-stack-92.3.1.tgz", "sha256": "5c976ae9562ec3b28b571f38e109e5d3f2ea3355573da416cd06be52dce6bd6a"},
-    "gateway-api.yaml": {"url": "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml", "sha256": "6a4029e661446d64add866a00ecdc40c14219b68777ab614c5cdaac0adb481f1"}
+    "gateway-api.yaml": {"url": "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml", "sha256": "751002b3b91a87f7ae3bd2517c79a47a8d7ed6702901808a1cf9bd97d284f9b8"}
   }
 }

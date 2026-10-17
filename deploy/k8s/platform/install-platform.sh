@@ -5,7 +5,7 @@ python3 verify-assets.py
 kubectl apply -f namespaces.json
 kubectl apply -f storage.json
 kubectl apply --server-side -f gateway-api.yaml
-kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io crd/httproutes.gateway.networking.k8s.io --timeout=120s
+kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io crd/httproutes.gateway.networking.k8s.io crd/grpcroutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io crd/tlsroutes.gateway.networking.k8s.io crd/listenersets.gateway.networking.k8s.io --timeout=120s
 ./helm upgrade --install psy-lab-metallb metallb.tgz --namespace metallb-system -f metallb-values.json --wait --timeout 10m
 kubectl wait --for=condition=Established crd/ipaddresspools.metallb.io crd/l2advertisements.metallb.io --timeout=120s
 kubectl apply -f metallb-pool.json
