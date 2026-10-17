@@ -61,3 +61,5 @@ The operator has installed host prerequisites. Bridges and x4 expanded storage
 remain operator-run steps; the cluster has not been created. VM construction
 does not stop existing services, change host bridges, format physical disks,
 reset chain state, push images or publish packages.
+
+数据库施工与真实读写/隔离/Pod 重建验收见 [data/README.md](data/README.md)。
