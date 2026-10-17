@@ -86,9 +86,10 @@ class PreparationTests(unittest.TestCase):
     def test_exec_auth_http_errors_do_not_prove_isolation(self):
         def response(code, stderr):
             return subprocess.CompletedProcess([], code, "", stderr)
-        self.assertTrue(network.network_timeout(response(1, "wget: download timed out")))
-        for p in [response(1, "error: unable to upgrade connection: timed out"), response(1, "wget: server returned error: HTTP/1.1 404 Not Found"), response(1, "wget: bad address 'http.test'"), response(0, "wget: download timed out")]:
-            self.assertFalse(network.network_timeout(p))
+        self.assertTrue(network.network_denied(response(1, "wget: download timed out"), "10.43.1.2"))
+        self.assertTrue(network.network_denied(response(1, "wget: can't connect to remote host (10.43.1.2): Connection refused\ncommand terminated with exit code 1\n"), "10.43.1.2"))
+        for p in [response(1, "error: unable to upgrade connection: timed out"), response(1, "wget: server returned error: HTTP/1.1 404 Not Found"), response(1, "wget: bad address 'http.test'"), response(0, "wget: download timed out"), response(1, "wget: can't connect to remote host (10.43.1.3): Connection refused"), response(137, "wget: download timed out")]:
+            self.assertFalse(network.network_denied(p, "10.43.1.2"))
 
     def test_live_orchestration_and_negative_controls_with_fake_cluster(self):
         plan = network.fixtures("c0ffee00")
@@ -101,7 +102,13 @@ class PreparationTests(unittest.TestCase):
                 self.assertTrue(state.get("accounts"))
             if items[0]["kind"] == "NetworkPolicy":
                 state["policies"] = True
+                if items[0]["metadata"]["name"].startswith("control-"):
+                    state["grant"] = items[0]["metadata"]["name"].removeprefix("control-")
         def kubectl(*args, **kwargs):
+            if "delete" in args:
+                self.assertEqual(args[3:5], ("networkpolicy", "control-" + state["grant"]))
+                state["grant"] = None
+                state["revocations"] = state.get("revocations", 0) + 1
             if "--ignore-not-found" in args:
                 return subprocess.CompletedProcess(args, 0, "", "")
             if "get" in args and "pod" in args:
@@ -111,8 +118,8 @@ class PreparationTests(unittest.TestCase):
             if "get" in args and "service" in args:
                 return subprocess.CompletedProcess(args, 0, '{"spec":{"clusterIP":"10.43.1.2"}}', "")
             if "wget" in args:
-                if state["policies"] and args[3].startswith("denied-"):
-                    return subprocess.CompletedProcess(args, 1, "", "wget: download timed out")
+                if state["policies"] and args[3].startswith("denied-") and (state.get("grant") != args[3] or state.get("broken_backend")):
+                    return subprocess.CompletedProcess(args, 1, "", "wget: can't connect to remote host (10.43.1.2): Connection refused\ncommand terminated with exit code 1\n")
                 return subprocess.CompletedProcess(args, 0, plan["body"], "")
             return subprocess.CompletedProcess(args, 0, "", "")
         response = types.SimpleNamespace(status=200, read=lambda _: plan["body"].encode())
@@ -125,8 +132,23 @@ class PreparationTests(unittest.TestCase):
             network.run_live(cfg, out)
             result = json.loads((out / "result.json").read_text())
             self.assertTrue(result["passed"])
-            self.assertEqual(len(result["checks"]), 3)
+            self.assertEqual(len(result["checks"]), 4)
+            self.assertEqual(state["revocations"], 2)
             self.assertEqual((out / "result.json").stat().st_mode & 0o777, 0o600)
+        # Persistent backend failure must not be accepted as network isolation,
+        # and the temporary grant must be revoked even on this failure path.
+        state.clear()
+        state.update(policies=False, broken_backend=True)
+        def immediate(action, why, seconds=60):
+            if not action():
+                raise ValueError(why)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(network.uuid, "uuid4", return_value=types.SimpleNamespace(hex="c0ffee001234")), patch.object(network, "kubectl", side_effect=kubectl), patch.object(network, "create", side_effect=create), patch.object(subprocess, "run"), patch.object(network, "wait_until", side_effect=immediate):
+            out = Path(tmp) / "evidence"
+            with self.assertRaisesRegex(ValueError, "Temporary ingress grant did not restore"):
+                network.run_live(cfg, out)
+            self.assertFalse(json.loads((out / "result.json").read_text())["passed"])
+            self.assertEqual(state["revocations"], 1)
+            self.assertIsNone(state["grant"])
 
     def test_offline_plan_requires_no_cluster_or_config(self):
         p = subprocess.run([sys.executable, str(HERE / "network-acceptance.py"), "--plan"], capture_output=True, text=True)

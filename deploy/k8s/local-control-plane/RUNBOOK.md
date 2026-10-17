@@ -152,7 +152,10 @@ python3 network-acceptance.py --run --evidence /absolute/new-evidence-directory
 它先验证五个客户端的基线 DNS/HTTP，再施加两个 namespace 的默认入站/出站拒绝、
 DNS 放行、namespace AND Pod label 限定的 HTTP 放行。三个合法客户端必须成功，
 错误 namespace、错误 Pod label 的两个对照客户端必须被阻断，且 DNS 仍正常。
-拒绝判定要求实际 wget 超时；exec/认证错误、DNS 失败或 HTTP 404 不算隔离成功。
+拒绝判定要求实际 wget 超时，或到预期 Service IP 的明确 Connection refused
+（K3s/kube-router 可用 REJECT）。两个对照客户端还必须在临时精确 ingress 放行
+后访问同一端点成功、撤销该测试白名单后再次被拒绝；临时策略在 finally 中删除。
+exec/认证错误、DNS 失败或 HTTP 404 不算隔离成功。
 
 最后创建专属 HTTPRoute（psy-platform）和仅授权测试 Service 的 ReferenceGrant，
 从操作机经 LAN VIP/Traefik 访问后端并核对本轮唯一响应体。它不修改现有 Gateway

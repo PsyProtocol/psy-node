@@ -74,7 +74,15 @@ def fixtures(run):
     route["metadata"]["labels"] = labels
     probes = [(client, "probe-" + role) for role in ("x2", "x3", "x4")]
     decoys = [(client, "denied-label"), (server, "denied-namespace")]
-    return {"run_id": run, "namespaces": [server, client], "body": body, "fixtures": namespaces + accounts + pods + [service], "policies": policies, "ingress": [grant, route], "allowed": probes, "denied": decoys}
+    controls = []
+    for namespace, name in decoys:
+        role = "other" if name == "denied-label" else "client"
+        source = peer(namespace, role)
+        source["podSelector"]["matchLabels"].update(labels)
+        control = policy("control-" + name, server, {**labels, "role": "http"}, ingress=[{"from": [source], "ports": port}])
+        control["metadata"]["labels"] = labels
+        controls.append(control)
+    return {"run_id": run, "namespaces": [server, client], "body": body, "fixtures": namespaces + accounts + pods + [service], "policies": policies, "ingress": [grant, route], "allowed": probes, "denied": decoys, "rejection_controls": controls}
 
 
 def kubectl(*args, data=None, check=True):
@@ -89,8 +97,14 @@ def fetch(namespace, pod, address):
     return kubectl("-n", namespace, "exec", pod, "--", "wget", "-q", "-T", "3", "-O", "-", address, check=False)
 
 
-def network_timeout(response):
-    return response.returncode == 1 and bool(re.search(r"wget:.*timed out", response.stderr, re.IGNORECASE))
+def network_denied(response, target_ip):
+    # K3s/kube-router can REJECT with ICMP port-unreachable rather than DROP.
+    # A refusal alone is insufficient: run_live also proves the SAME client can
+    # reach the SAME endpoint with a temporary, narrowly scoped ingress grant.
+    if response.returncode != 1 or response.stdout:
+        return False
+    refused = r"^wget: can't connect to remote host \(" + re.escape(target_ip) + r"\): Connection refused$"
+    return bool(re.search(r"^wget:.*timed out$", response.stderr, re.MULTILINE | re.IGNORECASE) or re.search(refused, response.stderr, re.MULTILINE))
 
 
 def wait_until(action, why, seconds=60):
@@ -141,15 +155,25 @@ def run_live(config, directory):
         # Wait for policy propagation; allowed paths must also remain healthy.
         for ns, pod in plan["allowed"]:
             wait_until(lambda ns=ns, pod=pod: (lambda p: p.returncode == 0 and p.stdout == plan["body"])(fetch(ns, pod, dns)), "Allowed path failed: " + pod)
-        for ns, pod in plan["denied"]:
+        for index, (ns, pod) in enumerate(plan["denied"]):
             kubectl("-n", ns, "exec", pod, "--", "nslookup", "http." + plan["namespaces"][0] + ".svc.cluster.local")
             def denied(ns=ns, pod=pod):
                 response = fetch(ns, pod, direct)
                 # exec/setup/auth failures are not evidence of network isolation.
-                return network_timeout(response)
+                return network_denied(response, service["spec"]["clusterIP"])
             wait_until(denied, "Forbidden path was not blocked: " + pod)
+            # Prove causality, including for connection-refused responses: an
+            # unrelated dead backend or broken Service cannot pass this control.
+            control = plan["rejection_controls"][index]
+            create([control])
+            try:
+                wait_until(lambda: (lambda p: p.returncode == 0 and p.stdout == plan["body"])(fetch(ns, pod, direct)), "Temporary ingress grant did not restore the same client: " + pod)
+            finally:
+                kubectl("-n", control["metadata"]["namespace"], "delete", "networkpolicy", control["metadata"]["name"], "--wait=true")
+            wait_until(denied, "Revoked ingress grant did not block the same client: " + pod)
             for _ in range(2):
                 require(denied(), "Forbidden path changed state: " + pod)
+        record("both denied clients recover under a temporary ingress grant and fail again after revocation")
         for ns, pod in plan["allowed"]:
             response = fetch(ns, pod, direct)
             require(response.returncode == 0 and response.stdout == plan["body"], "Positive control failed after denial tests")
