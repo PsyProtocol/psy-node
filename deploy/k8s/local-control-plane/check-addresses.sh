@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Operator-run, read-only duplicate address probe on the local physical machine.
 set -euo pipefail
-[[ $(hostname -s) == arch3900x ]] || { echo 'Run on arch3900x only' >&2; exit 1; }
+[[ $(< /proc/sys/kernel/hostname) == arch3900x ]] || { echo 'Run on arch3900x only' >&2; exit 1; }
 [[ $(cat /sys/class/net/enp5s0/address) == 14:d8:64:07:69:36 ]] || { echo 'Physical NIC identity changed' >&2; exit 1; }
 command -v arping >/dev/null
 interface=enp5s0
