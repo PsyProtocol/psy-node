@@ -173,6 +173,13 @@ class DataTests(unittest.TestCase):
         self.assertEqual(value['external_services'],0)
         self.assertEqual(value['new_pvc_gib'],130)
 
+    def test_prior_acceptance_id_is_validated_before_cluster_access(self):
+        with patch.object(db,'guard') as guard:
+            for value in ['bad-id', '1234567g', "';DELETE"]:
+                with self.assertRaisesRegex(ValueError,'eight hex'):
+                    acceptance.run(Path('/unused'),Path('/unused-evidence'),value)
+            guard.assert_not_called()
+
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

@@ -20,6 +20,21 @@ Scylla 使用 4 shard、6 GiB 内部 memory budget，为 Pod 的 8 GiB 上限留
 1/18 GiB，磁盘上限低于其 20 GiB PVC，预留文件系统开销。
 旧输入包保持不可变；更新源码默认值本身不会修改已经部署的实例。
 
+已有小配额实验库可用 `upgrade-resources.py` 升级。默认只检查，传入原 `--bundle`、
+新的绝对路径 `--evidence`、实验 guest 的 `--ssh-key` / `--known-hosts` 和数据盘
+`--virtual-fs-uuid`；确认 VM 容量后加 `--apply`。脚本逐库正常停机，在同一 guest
+文件系统新目录保存并验哈希的离线副本，然后调整资源和内部配置、恢复 Ready。
+每库复制前按目录实际 apparent size 再留 5% 复制开销和 32 GiB 文件系统余量，
+备份父目录必须由 root 持有且权限 700。PV 重绑定等控制器报告 Released；
+只对明确的 resourceVersion conflict 做有界重读重试，身份或 spec 漂移立即拒绝。
+静态 local PV 没有自动扩容控制器：增大声明时，会删除原 PVC 并把新 PVC 绑定回
+同一个 Retain PV/原数据目录；PV UID 不变，PVC UID 会改变。不会删 PV、目录或轮换密码。
+Scylla 已有 50 GiB 无须重新绑定。离线副本位于同一磁盘，仅用于本次回退，不是异机备份。
+失败后保留现场；若当前 PVC 仍安全 Bound，则请求恢复已停止的实例。
+必须随后再跑真实数据库验收，不能把完成配置变更当成验收通过。
+升级后的验收可传 `--prior-run <先前成功验收的八位run_id>`，在写入本轮数据前，
+从三个 worker 分别读回先前五服务的持久记录/消息，再做本轮完整读写/重建/隔离验证。
+
 业务入口如 `postgres-services.psy-data.svc.cluster.local:5432`，全部为 ClusterIP。
 数据库镜像复用 `../build/versions.json` 的四个固定 digest；已核实 PG 16.15、Scylla
 2026.1.5、Valkey 9.1.2。客户端 Python 3.12.15 也固定 digest。无 latest/tag 漂移。

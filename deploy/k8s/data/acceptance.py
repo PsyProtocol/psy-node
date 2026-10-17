@@ -63,7 +63,8 @@ def wait_until(action, why, seconds=90):
         time.sleep(2)
 
 
-def run(bundle, evidence):
+def run(bundle, evidence, prior_run=None):
+    db.require(prior_run is None or (len(prior_run) == 8 and all(c in '0123456789abcdef' for c in prior_run)), 'Prior acceptance run must be eight hex characters')
     db.require(evidence.is_absolute() and not evidence.exists(), 'Fresh absolute evidence directory required')
     meta = db.guard(bundle)
     evidence.mkdir(parents=True, mode=0o700)
@@ -130,6 +131,17 @@ def run(bundle, evidence):
             if x['kind'] == 'Pod':
                 actual = json.loads(db.kubectl('-n', x['metadata']['namespace'], 'get', 'pod', x['metadata']['name'], '-o', 'json').stdout)
                 db.require(actual['spec']['nodeName'] == x['spec']['nodeSelector']['kubernetes.io/hostname'], 'Unexpected probe scheduling')
+        if prior_run:
+            result['prior_run'] = prior_run
+            for worker in WORKERS:
+                pod = 'probe-' + worker.rsplit('-', 1)[1]
+                identity = hashlib.sha256((prior_run + worker).encode()).hexdigest()[:8]
+                for name in ['postgres-services', 'postgres-envio']:
+                    pg(pod, name, identity, 'read')
+                cql(pod, identity, 'read')
+                for operation in ['valkey', 'nats']:
+                    python_probe(allowed, pod, operation, identity, 'read')
+                record(worker + ' five services prior-run persistent read passed')
         for phase in ['write', 'read']:
             if phase == 'read':
                 old_pvcs = json.loads(db.kubectl('-n', db.NS, 'get', 'pvc', '-o', 'json').stdout)
@@ -199,8 +211,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--bundle', type=Path, required=True)
     p.add_argument('--evidence', type=Path, required=True)
+    p.add_argument('--prior-run', help='Also read the persistent records/messages of a previous successful acceptance run')
     args = p.parse_args()
-    run(args.bundle.resolve(), args.evidence)
+    run(args.bundle.resolve(), args.evidence, args.prior_run)
 
 
 if __name__ == '__main__':
