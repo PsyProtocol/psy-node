@@ -18,7 +18,7 @@ assertion that all live artifacts are built from the stable branch tip.
 
 | Input | Selected revision/version |
 | --- | --- |
-| Node/Worker/User CLI/Relayer | `e46df92dfd7a5954a74f275651caafad1a6d5fc6` |
+| Node/Worker/User CLI/Relayer | `ec215c6d9d7b26c985067c229090bad06f2cf550` |
 | Services API | `f4d6ee8a4f55a69586e4ed8d5a3f0a9bc4422ded` |
 | L2 Indexer | `7c1e1f61673949bb7343529d4dd51d66f631d236` |
 | Genesis source | `cb3ea4a1e743c3c01037ae968e10f27389788a7d` |
@@ -33,6 +33,12 @@ must be verified on the independent lab chain before release. Existing sources
 map localhost/testnet to the same historical magic; explicit network isolation,
 new state and independent lab signing keys are still required. This builder
 does not generate signing material or load a production Genesis state dump.
+
+The Node pin adds optional Scylla credentials from mounted files and a mode that
+requires precreated keyspaces. It preserves the frozen `e46df92d` protocol,
+Cargo.lock and Genesis inputs. See `psy_node_scylla/README.md` in that source.
+The source commit was published before this build pin; real compilation and
+CLI transaction acceptance are still required.
 
 Builder/runtime base images and dependency images have fixed registry digests.
 Rust and Go identities are checked inside the builder, not inferred from its

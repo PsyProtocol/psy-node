@@ -7,9 +7,9 @@
   "sources": {
     "node": {
       "repository": "PsyProtocol/psy-node",
-      "commit": "e46df92dfd7a5954a74f275651caafad1a6d5fc6",
+      "commit": "ec215c6d9d7b26c985067c229090bad06f2cf550",
       "lock_sha256": "4e7dc8d056fc68a4a2428df920893e2241038d8719ef80773a0d39ef4bccf565",
-      "basis": "Published release/testnet-stable candidate for a NEW isolated lab; not the live component map"
+      "basis": "Published lab/kubernetes-runtime-auth-20261017: optional Scylla file authentication and precreated schema support on frozen e46df92d; NEW isolated lab only"
     },
     "services": {
       "repository": "PsyProtocol/psy-services",
