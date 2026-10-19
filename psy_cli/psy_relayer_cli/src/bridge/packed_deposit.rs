@@ -16,6 +16,8 @@ const SAFE_CALLDATA_BYTES: usize = 120 * 1024;
 sol! {
     function appendPackedBatches(bytes batches);
     function BRIDGE() external view returns (address);
+    function getL1FeeUpperBound(uint256 unsignedTxSize) external view returns (uint256);
+    function getOperatorFee(uint256 gasUsed) external view returns (uint256);
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -27,6 +29,9 @@ pub(crate) struct PackedDepositConfig {
     pub max_gas_per_tx: u64,
     pub max_fee_per_gas_wei: u64,
     pub max_tx_fee_wei: u64,
+    /// Base total-budget accounting; canonical GasPriceOracle, no custom target.
+    #[serde(default)]
+    pub include_base_data_fee: bool,
 }
 
 impl PackedDepositConfig {
@@ -59,9 +64,11 @@ impl PackedDepositConfig {
         let actual = BRIDGECall::abi_decode_returns(&raw).context("decode packed deposit adapter Bridge failed")?;
         ensure!(actual == bridge, "packed deposit adapter points to a different Bridge");
         let chain_id = provider.get_chain_id().await.context("read packed deposit chain ID failed")?;
-        if matches!(chain_id, 1 | 11155111) {
-            ensure!(self.max_gas_per_tx <= 16_777_216, "packed deposit gas budget exceeds Ethereum transaction gas cap");
+        if matches!(chain_id, 1 | 11155111 | 56 | 97 | 8453 | 84532) {
+            ensure!(self.max_gas_per_tx <= 16_777_216, "packed deposit gas budget exceeds chain transaction gas cap");
         }
+        ensure!(self.include_base_data_fee == matches!(chain_id, 8453 | 84532),
+            "packed Base deposits require data-fee accounting; it cannot be enabled on other chains");
         Ok(())
     }
 }
@@ -123,6 +130,7 @@ fn estimate_hit_limit(error: &alloy_transport::TransportError) -> bool {
 async fn estimate_group(
     provider: &impl Provider, adapter: Address, records: &[Vec<u8>],
     fees: &TransactionRequest, gas_budget: u64,
+    base_data_fee: bool, total_fee_budget: u128,
 ) -> Result<(TransactionRequest, usize)> {
     let mut low = 1;
     let mut high = records.len();
@@ -136,7 +144,12 @@ async fn estimate_group(
         match provider.estimate_gas(tx.clone()).await {
             Ok(estimate) => {
                 let gas = gas_with_margin(estimate)?;
-                if gas <= gas_budget {
+                let extra = if base_data_fee {
+                    base_extra_fee(provider, tx.input.input.as_ref().context("missing packed input")?.len(), gas).await?
+                } else { 0 };
+                let affordable = !base_data_fee || total_fee(gas,
+                    tx.max_fee_per_gas.context("missing packed Base gas price")?, extra)? <= total_fee_budget;
+                if gas <= gas_budget && affordable {
                     tx.gas = Some(gas);
                     best = Some((tx, count));
                     low = count + 1;
@@ -153,6 +166,29 @@ async fn estimate_group(
         }
     }
     best.context("no packed deposit call fits the configured budget")
+}
+
+fn total_fee(gas: u64, price: u128, extra: u128) -> Result<u128> {
+    u128::from(gas).checked_mul(price).and_then(|fee| fee.checked_add(extra))
+        .context("packed deposit total fee overflow")
+}
+
+/// Oracle upper-bound estimate plus 20% headroom for changing fee attributes.
+/// 1024 bytes cover the EIP-1559 transaction envelope (empty access list),
+/// chain ID, nonce, gas/fee/value fields and RLP lengths beyond calldata.
+async fn base_extra_fee(provider: &impl Provider, calldata_bytes: usize, gas_limit: u64) -> Result<u128> {
+    let oracle: Address = "0x420000000000000000000000000000000000000F".parse()?;
+    let size = calldata_bytes.checked_add(1024).context("Base transaction size overflow")?;
+    let (l1, operator) = tokio::try_join!(
+        super::api_client::eth_call_u256(provider, oracle, getL1FeeUpperBoundCall { unsignedTxSize: U256::from(size) }),
+        super::api_client::eth_call_u256(provider, oracle, getOperatorFeeCall { gasUsed: U256::from(gas_limit) }),
+    ).map_err(|_| super::l1_fees::FeeSourceError("Base data/operator fee quote unavailable"))?;
+    let extra = u128::try_from(l1.checked_add(operator).context("Base extra fee overflow")?)
+        .context("Base extra fee exceeds u128")?;
+    let buffered = extra.checked_add(extra / 5).and_then(|v| v.checked_add(u128::from(extra % 5 != 0)))
+        .context("Base extra fee buffer overflow")?;
+    tracing::debug!(calldata_bytes, gas_limit, extra_fee_upper_bound_wei = buffered, "quoted packed Base extra fees");
+    Ok(buffered)
 }
 
 /// Wait for one ready call, then drain only what is already available. There
@@ -217,7 +253,13 @@ pub(crate) async fn submit(
         let fee_gas_budget = u64::try_from(u128::from(config.max_tx_fee_wei) / price).unwrap_or(u64::MAX);
         let gas_budget = config.max_gas_per_tx.min(fee_gas_budget);
         let end = (start + config.max_calls_per_tx).min(calls.len());
-        let (tx, count) = estimate_group(provider, config.adapter_address, &records[start..end], &fees, gas_budget).await?;
+        let (tx, count) = estimate_group(provider, config.adapter_address, &records[start..end], &fees, gas_budget,
+            config.include_base_data_fee, u128::from(config.max_tx_fee_wei)).await?;
+        if config.include_base_data_fee {
+            let extra = base_extra_fee(provider, tx.input.input.as_ref().context("missing packed input")?.len(), tx.gas.context("missing gas limit")?).await?;
+            ensure!(total_fee(tx.gas.unwrap(), price, extra)? <= u128::from(config.max_tx_fee_wei),
+                "Base total fee changed beyond budget before broadcast");
+        }
         provider.call(tx.clone()).await.context("packed deposit simulation failed")?;
         tracing::info!(start, count, gas_limit = ?tx.gas, "sending packed deposit transaction");
         let receipt = provider.send_transaction(tx).await.context("send packed deposit failed")?
@@ -293,7 +335,8 @@ mod tests {
         assert_eq!(gas_with_margin(14_388_825).unwrap(), 14_964_378);
         assert!(gas_with_margin(u64::MAX).is_err());
         let mut config = PackedDepositConfig { adapter_address: Address::repeat_byte(1), max_calls_per_tx: 12,
-            max_gas_per_tx: 8_000_000, max_fee_per_gas_wei: 5_000_000_000, max_tx_fee_wei: 40_000_000_000_000_000 };
+            max_gas_per_tx: 8_000_000, max_fee_per_gas_wei: 5_000_000_000, max_tx_fee_wei: 40_000_000_000_000_000,
+            include_base_data_fee: false };
         assert!(config.validate().is_ok());
         config.max_calls_per_tx = 15;
         assert!(config.validate().is_err());
@@ -320,6 +363,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let fail_oracle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_fail_oracle = fail_oracle.clone();
         let server = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -343,16 +388,27 @@ mod tests {
                     data.extend_from_slice(&bytes[..n]);
                 }
                 let request: serde_json::Value = serde_json::from_slice(&data[offset..offset + length]).unwrap();
-                assert_eq!(request["method"], "eth_estimateGas");
                 let tx = &request["params"][0];
                 let input = tx.get("input").or_else(|| tx.get("data")).unwrap().as_str().unwrap();
                 let input: Bytes = input.parse().unwrap();
-                let group = appendPackedBatchesCall::abi_decode(&input).unwrap();
-                let count = group.batches.len() / RECORD_BYTES;
-                let result = if count > 3 {
-                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":3,"message":"execution reverted"}})
+                let result = if request["method"] == "eth_call" {
+                    if server_fail_oracle.load(std::sync::atomic::Ordering::SeqCst) {
+                        serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32000,"message":"oracle unavailable"}})
+                    } else {
+                        let value = if input[..4] == getL1FeeUpperBoundCall::SELECTOR { 1_000_000_000u64 } else {
+                            assert_eq!(input[..4], getOperatorFeeCall::SELECTOR); 500_000_000u64
+                        };
+                        serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":format!("0x{value:064x}")})
+                    }
                 } else {
+                    assert_eq!(request["method"], "eth_estimateGas");
+                    let group = appendPackedBatchesCall::abi_decode(&input).unwrap();
+                    let count = group.batches.len() / RECORD_BYTES;
+                    if count > 3 {
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":3,"message":"execution reverted"}})
+                    } else {
                     serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":format!("0x{:x}", count * 3_500_000)})
+                    }
                 }.to_string();
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{result}", result.len());
                 socket.write_all(response.as_bytes()).await.unwrap();
@@ -361,13 +417,28 @@ mod tests {
         let provider = alloy_provider::ProviderBuilder::new().connect_http(url);
         let record = encode_record(&fixture(0)).unwrap();
         let records = vec![record; 12];
-        let (tx, count) = estimate_group(&provider, Address::repeat_byte(1), &records, &TransactionRequest::default(), 15_000_000).await.unwrap();
+        let (tx, count) = estimate_group(&provider, Address::repeat_byte(1), &records, &TransactionRequest::default(), 15_000_000, false, u128::MAX).await.unwrap();
         assert_eq!(count, 3);
         assert_eq!(tx.gas, Some(10_920_000));
-        let (_, count) = estimate_group(&provider, Address::repeat_byte(1), &records, &TransactionRequest::default(), 9_000_000).await.unwrap();
+        let (_, count) = estimate_group(&provider, Address::repeat_byte(1), &records, &TransactionRequest::default(), 9_000_000, false, u128::MAX).await.unwrap();
         assert_eq!(count, 2);
-        assert!(estimate_group(&provider, Address::repeat_byte(1), &records, &TransactionRequest::default(), 3_500_000).await.is_err());
+        assert!(estimate_group(&provider, Address::repeat_byte(1), &records, &TransactionRequest::default(), 3_500_000, false, u128::MAX).await.is_err());
+        let mut fees = TransactionRequest::default();
+        fees.max_fee_per_gas = Some(1);
+        let (_, count) = estimate_group(&provider, Address::repeat_byte(1), &records, &fees,
+            15_000_000, true, 1_808_000_000).await.unwrap();
+        assert_eq!(count, 2, "extra fees must shrink a group even when execution gas fits");
+        fail_oracle.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = estimate_group(&provider, Address::repeat_byte(1), &records, &fees,
+            15_000_000, true, u128::MAX).await.unwrap_err();
+        assert!(super::super::l1_fees::is_fee_preparation_error(&error));
         server.abort();
+    }
+
+    #[test]
+    fn base_total_fee_accounts_for_extra_fees_and_overflow() {
+        assert_eq!(total_fee(15_000_000, 6_000_000, 30_000).unwrap(), 90_000_000_030_000);
+        assert!(total_fee(u64::MAX, u128::MAX, 1).is_err());
     }
 
     #[test]
