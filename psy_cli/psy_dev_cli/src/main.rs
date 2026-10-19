@@ -12,6 +12,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::InspectAnvilState(args) => {
+            subcommand::inspect_anvil_state::run(args)?;
+        }
         Commands::ReadWorkerBackup(args) => {
             subcommand::read_worker_backup::run(args).await?;
         }

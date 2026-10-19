@@ -454,6 +454,7 @@ describe("local Anvil persistence", () => {
                 ],
             }));
             await Bun.write(`${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`, "{}");
+            const snapshotBefore = await Bun.file(`${dir}/db/anvil/state.json`).text();
             const plan = await resolveLocalAnvilStatePlan(dir);
             expect(plan.hasState).toBe(true);
             expect(plan.shouldResetEnvio).toBe(false);
@@ -465,6 +466,7 @@ describe("local Anvil persistence", () => {
                 "--timestamp", (0x6acdc5den).toString(),
             ]);
             expect(localAnvilLaunchArgs(8545, "31337", plan.statePath)).not.toContain("--timestamp");
+            expect(await Bun.file(`${dir}/db/anvil/state.json`).text()).toBe(snapshotBefore);
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
         }
@@ -511,6 +513,22 @@ describe("local Anvil persistence", () => {
             expect(localAnvilLaunchArgs(8545, "1", plan.statePath, plan.genesis)).not.toContain("--timestamp");
             await Bun.$`rm ${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`.quiet();
             await expect(resolveLocalAnvilStatePlan(dir, "localhost", true)).rejects.toThrow("must exist together");
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+
+    it("rejects malformed trailing JSON for local and fork restore without changing the snapshot", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            await Bun.$`mkdir -p ${dir}/db/anvil ${dir}/psy-contracts/deployments/localhost`.quiet();
+            await Bun.write(`${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`, "{}");
+            const invalid = JSON.stringify({ blocks: [{ header: genesisHeader }] }) + " trailing";
+            await Bun.write(`${dir}/db/anvil/state.json`, invalid);
+            for (const fork of [false, true]) {
+                await expect(resolveLocalAnvilStatePlan(dir, "localhost", fork)).rejects.toThrow("validation failed");
+                expect(await Bun.file(`${dir}/db/anvil/state.json`).text()).toBe(invalid);
+            }
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
         }

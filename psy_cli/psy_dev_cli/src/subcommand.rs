@@ -9,6 +9,7 @@ pub mod nats_inspect;
 pub mod chain_info;
 pub mod generate_genesis;
 pub mod rollback;
+pub mod inspect_anvil_state;
 
 use chain_info::ChainInfoArgs;
 use generate_genesis::GenerateGenesisDataArgs;
@@ -28,6 +29,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(about = "Validate a retained Anvil JSON snapshot and extract genesis metadata (internal)")]
+    InspectAnvilState(inspect_anvil_state::InspectAnvilStateArgs),
     #[command(about = "Read and parse worker completed jobs backup file")]
     ReadWorkerBackup(ReadWorkerBackupArgs),
     #[command(about = "Read and parse checkpoint tree backup file")]

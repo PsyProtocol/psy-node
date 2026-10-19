@@ -6,6 +6,7 @@ import net from "node:net";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { availableParallelism, homedir } from "node:os";
+import { execFile } from "node:child_process";
 import allConfig from "../psy-genesis/config.json";
 import { protocolConfig } from "../psy-contracts/protocol-config";
 import {
@@ -3345,6 +3346,25 @@ export async function assertPreservedAnvilGenesis(
     }
 }
 
+/** The release CLI streams the complete document; stdout contains only bounded header metadata. */
+export async function inspectLocalAnvilState(statePath: string, fork: boolean): Promise<PreservedAnvilGenesis | undefined> {
+    const cli = path.resolve(import.meta.dir, "../target/release/psy_dev_cli");
+    const args = ["inspect-anvil-state", "--state", statePath, ...(fork ? ["--fork"] : [])];
+    const stdout = await new Promise<string>((resolve, reject) => {
+        execFile(cli, args, { encoding: "utf8", maxBuffer: 512 * 1024 }, (error, stdout, stderr) => {
+            if (error) {
+                reject(new Error(`[DevNet] Anvil state ${statePath} validation failed: ${stderr.trim() || error.message}. ` +
+                    "If psy_dev_cli is missing or stale, rebuild with cargo build --release --bin psy_dev_cli."));
+            } else resolve(stdout);
+        });
+    });
+    const result = JSON.parse(stdout) as PreservedAnvilGenesis | null;
+    if (fork ? result !== null : result === null || typeof result !== "object" || typeof result.timestamp !== "string" || typeof result.header !== "object" || result.header === null) {
+        throw new Error(`[DevNet] Invalid inspect-anvil-state metadata for ${statePath}; rebuild psy_dev_cli`);
+    }
+    return result ?? undefined;
+}
+
 export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1DeploymentNetwork = "localhost", fork = false): Promise<LocalAnvilStatePlan> {
     const statePath = localAnvilStatePath(repoCwd, network);
     const deploymentPath = path.join(repoCwd, "psy-contracts", "deployments", network, "deployed-contracts.json");
@@ -3359,17 +3379,12 @@ export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1Dep
     if (!hasState) {
         return { statePath, hasState, shouldResetEnvio: true };
     }
-    let snapshot: unknown;
-    try {
-        snapshot = JSON.parse(await fs.promises.readFile(statePath, "utf8"));
-    } catch (error) {
-        throw new Error(`[DevNet] Anvil state ${statePath} is not plain JSON: ${error}`);
-    }
+    const genesis = await inspectLocalAnvilState(statePath, fork);
     return {
         statePath,
         hasState,
         shouldResetEnvio: false,
-        ...(fork ? {} : { genesis: preservedAnvilGenesis(snapshot, statePath) }),
+        ...(fork ? {} : { genesis }),
     };
 }
 

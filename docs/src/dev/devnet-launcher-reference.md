@@ -512,6 +512,16 @@ deployment reuse, requires block 0 and `earliest` to retain every saved header f
 `parentHash`. An ambiguous snapshot fails instead of dropping a header. One-time cleanup uses a trusted full RPC
 header, not timestamp alone. A fork keeps the paired state check but skips the local block 0 pin because its genesis is remote (`dev/locSetupV4.ts:3227-3363`; `dev/locSetupV4.ts:5389-5424`).
 
+Before restore, the launcher runs the required release `psy_dev_cli inspect-anvil-state --state <path>`
+(with `--fork` for a fork). Rebuild it with `cargo build --release --bin psy_dev_cli` after updating this code;
+there is no whole-file JavaScript parsing fallback. The read-only inspector streams the complete JSON, including
+ignored account/block payloads and the final end-of-document check, and emits only genesis header metadata.
+It retains at most one block header at a time, rejects duplicate `blocks`, `header`, and header-field keys,
+and bounds materialized metadata reads to 1 KiB per key and 64 KiB per header (including JSON encoding/whitespace).
+Ignored payload strings have no size cap. Snapshot bytes, dump cadence, and post-start RPC identity checks are unchanged.
+Launcher persistence tests require this current release binary; Rust inspector tests cover chunk boundaries,
+malformed/truncated tails, oversized ignored strings, ambiguous genesis, and metadata limits.
+
 `localAnvilLaunchArgs` does not pass `--block-time`. After the HTTP probe and preserved genesis check, and before deployment or persisted-deployment reuse, each launcher-managed chain (localhost, localhostBsc, localhostBase, including a local fork) receives `anvil_setIntervalMining([1])` through `setLocalAnvilIntervalMining()`. An external RPC is not called. `anvilRpc` throws on HTTP or JSON-RPC failure, so a refused interval does not continue into deployment. Fresh deployment's `009_set_anvil_interval_mining.ts` repeats the same call and only logs a warning; the launcher call is what covers persisted reuse, which returns before that script runs. `make restart` keeps the Anvil processes alive, so it does not repeat the call.
 
 Envio's ordered batch chooses the minimum chain timestamp. An empty chain buffer whose timestamp is still below a
