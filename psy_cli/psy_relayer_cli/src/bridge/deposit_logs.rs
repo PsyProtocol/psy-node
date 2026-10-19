@@ -18,7 +18,8 @@ use alloy_rpc_types_eth::{BlockNumberOrTag, Filter};
 use alloy_sol_types::{sol, SolEvent};
 use anyhow::Context;
 
-const MAX_LOG_BLOCKS_PER_QUERY: u64 = 50_000;
+// Keep both lookup and collection within the current RPC subscriptions' range limit.
+const MAX_LOG_BLOCKS_PER_QUERY: u64 = 5_000;
 
 sol! {
     /// Emitted by the bridge contract when a deposit is recorded.
@@ -50,7 +51,7 @@ pub fn indexed_u32_topic(value: u32) -> B256 {
 /// # Performance
 ///
 /// Recent deposits normally need two log requests. Long histories are split into
-/// requests spanning at most 50,000 blocks; collection stops when all requested
+/// requests spanning at most 5,000 blocks; collection stops when all requested
 /// indices have been found. Providers with stricter limits may still reject a request.
 pub async fn bulk_fetch_deposit_records(
     provider: &impl Provider,
