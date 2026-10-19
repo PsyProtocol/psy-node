@@ -14,6 +14,79 @@ A cohort worktree is an additional checkout of an existing local repository, not
 
 Release publication order stays [circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §8. Section 6 here is local mode only: path and `file:` edits inside the new worktrees. Sibling ownership is `AGENTS.md:27,87-102`.
 
+## Bun workspace workflow
+
+`scripts/workspace.ts` provides the automated Git-only workflow below. The later
+shell tutorial also describes optional local dependency edits and builds; the Bun
+commands do **not** perform those edits, install dependencies, or start services.
+Run from a workspace root containing the eight sibling repositories:
+
+```bash
+bun psy-node/scripts/workspace.ts --help
+bun psy-node/scripts/workspace.ts status
+bun psy-node/scripts/workspace.ts create --source . --destination ../feature-demo --branch feature/demo
+bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' -- psy-ts-sdk/src/client.ts
+# Alternatively, review the index yourself first, then commit only that index:
+bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' --staged
+# Explicit user-run publication of clean topic branches (optionally --repo NAME):
+bun psy-node/scripts/workspace.ts push --source ../feature-demo
+bun psy-node/scripts/workspace.ts merge --source ../feature-demo --target . --branch feature/demo --integration ../integration-demo
+# Explicit user-run publication; use a fresh integration directory:
+bun psy-node/scripts/workspace.ts merge --source ../feature-demo --target . --branch feature/demo --integration ../integration-publish --push
+```
+
+The default base is `mainnet-beta`; the default remote is `origin`. `status` is
+read-only and is the default command. All mutations require an explicit source.
+Creation checks all repositories first and creates real topic branches from
+committed base refs; it never copies dirty files, secrets, ledgers, or local
+configuration. Missing repositories use the documented official origin. Recorded
+submodules are initialized, including node's `update = none` DApp gitlink.
+
+`commit` requires exactly one repository, a message, and either literal paths
+after `--` or `--staged`. Explicit paths require an empty index and cannot name
+the repository root. There is no blanket staging. `push` refuses detached HEAD,
+base/main/master branches, dirty trees, and non-fast-forward remote topics. It
+preflights every selected repository before the first push; it never forces.
+
+`merge` requires clean topic worktrees but permits dirty target worktrees because
+it **never changes target files, indexes, or local base branches**. It freezes
+each target's local base commit and the actual remote base SHA using `ls-remote`.
+Required remote objects are fetched into immutable
+`refs/prefetch/workspace/<sha>` refs with an empty refmap; remote-tracking refs
+are not updated. Current remote base must be an ancestor of local base, so local
+unpublished base commits are retained and newer public commits cannot be dropped.
+The integration directory must be new and outside both workspaces, with an
+existing parent. Its basename identifies the new `workspace-integration/...`
+branch in each target repository.
+
+Ordering comes from the union of recorded gitlinks in topic and frozen base
+trees, with compiler/contracts/genesis/sdk/services/wallet/dapp/node as tie order.
+Cycles fail before worktree creation. Only `.gitmodules` URLs whose basename is
+one of those repositories form cohort edges; external submodules and historical
+Cargo/package pins do not. Unchanged historical gitlinks remain unchanged. A
+changed cohort gitlink must equal its sibling topic HEAD, and that child topic
+must descend from its frozen local base. The parent index then records the
+child's completed integration hash, never its stranded pre-squash topic hash.
+Nested target checkouts are never retargeted.
+
+All squash results are prepared on isolated integration branches before any
+publication. Conflicts stop immediately and retain every created worktree for
+inspection; only gitlink-only conflicts with a validated child mapping can be
+resolved automatically. No automatic removal, stash, reset, switch, or rollback
+occurs. Fix the topic/base explicitly, then rerun with a fresh integration path.
+Local refs and actual remote tips are checked again after integration. `--push`
+alone authorizes dependency-ordered base publication, checking the expected remote
+tip again before each ordinary non-force push. Cross-repository publication is
+not atomic: failure can leave earlier dependencies published; the command stops
+and retains all integration branches. No credential URLs are stored in metadata.
+
+After merge, **local `mainnet-beta` remains unchanged**, even after `--push`.
+The command prints an exact `git -C ... -c submodule.recurse=false merge --ff-only
+<integration-sha>` for each repository. Run it yourself only after confirming the
+target is clean and already on the intended base branch. Preserve or explicitly
+commit existing user work first; never reset or discard it to synchronize.
+
+
 ## Table of Contents
 
 - [1. Inputs](#1-inputs)
