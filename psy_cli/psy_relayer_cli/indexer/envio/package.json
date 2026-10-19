@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "test": "node --test tests/*.test.cjs",
     "dev": "envio dev --config ./config.yaml",
     "codegen": "envio codegen --config ./config.yaml",
     "start": "envio start --config ./config.yaml"
