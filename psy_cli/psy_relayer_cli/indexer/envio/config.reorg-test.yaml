@@ -1,6 +1,7 @@
 # Local reorg test fixture (tests/reorg/run-reorg-test.cjs). Never deploy it.
 # One Anvil chain; the Bridge address carries a log emitter, not the contract.
 # rollback_on_reorg stays at its default (true), as in config.template.yaml.
+# The test sets confirmed_block_threshold per scenario (Envio default 200, live release 8).
 name: psy-relayer-indexer-reorg-test
 field_selection:
   transaction_fields:
@@ -18,6 +19,7 @@ contracts:
 networks:
   - id: 31337
     start_block: 0
+    confirmed_block_threshold: ${REORG_TEST_CONFIRMED_BLOCK_THRESHOLD}
     rpc_config:
       url: ${REORG_TEST_RPC_URL}
     contracts:

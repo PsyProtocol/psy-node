@@ -12,23 +12,29 @@
 // (tests/lib/handler-harness.cjs); stale DepositLeaf or AccountDepositStats
 // rows would also make the handler's invariants stop Envio.
 // Scenario 2: the reorg happens while Envio runs, and the discarded deposit is
-// re-included in a later block. Envio 2.32.10's RPC source answers its
+// re-included in a later block. Upstream Envio 2.32.10's RPC source answers its
 // parent-hash check from a block cache keyed by number, so it misses this
-// reorg. The test then requires the handler invariant to stop Envio instead of
-// appending the deposit twice, and a restart to roll the fork back to a state
-// equal to the replay (or, if Envio detects the reorg live, a correct
-// rollback). Set REORG_TEST_REQUIRE_LIVE_DETECTION=1 to require detection.
+// reorg: the handler invariant must stop Envio instead of appending the deposit
+// twice, and a restart must roll the fork back. With the fresh-reorg-parent
+// patch enabled (patches/fresh-reorg-parent.py, PSY_ENVIO_FRESH_REORG_PARENT=1)
+// Envio must roll back live, without a restart.
+// Scenario 3 uses confirmed_block_threshold 8, the live release's value. It is
+// a reorg window, not a confirmation delay: a reorg is rolled back live while
+// the parent block is within 8 blocks of the head (3a) and missed for good,
+// even after a restart, once the head is further away (3c). The confirmation
+// delay is ENVIO_INDEXING_BLOCK_LAG: blocks within it never reach the handlers,
+// so a reorg within it needs no rollback (3b).
 //
 // Requirements: anvil and cast (Foundry), psql, a PostgreSQL server reachable
 // through ENVIO_PG_HOST / ENVIO_PG_PORT / ENVIO_PG_USER / ENVIO_PG_PASSWORD
 // (never point it at a shared server: the test creates and drops its own
-// database), and `pnpm install` done in this directory:
+// database), and `pnpm install` done in this directory (it applies the patch):
 //
 //   ENVIO_PG_HOST=127.0.0.1 ENVIO_PG_PORT=5544 ENVIO_PG_USER=postgres \
 //     ENVIO_PG_PASSWORD=... node tests/reorg/run-reorg-test.cjs
 //
-// Envio bakes the RPC URL into generated/ at codegen time, so the test runs
-// codegen for config.reorg-test.yaml after it has picked the Anvil port. Run
+// Envio bakes the RPC URL and the threshold into generated/ at codegen time, so
+// the test runs codegen for config.reorg-test.yaml once per threshold. Run
 // `pnpm codegen` again before using the regular config. Envio 2.32.10 runs on
 // Node <= 22 (on Node >= 23 its yargs dependency fails to load);
 // REORG_TEST_NODE_BIN_DIR, when set, is put first on PATH for the Envio
@@ -67,7 +73,13 @@ const PG = {
   user: env('ENVIO_PG_USER'),
   password: env('ENVIO_PG_PASSWORD'),
 };
-const DATABASE = `envio_reorg_test_${process.pid}`;
+const FRESH_PARENT_ENV = 'PSY_ENVIO_FRESH_REORG_PARENT';
+const DEFAULT_REORG_DEPTH = 200; // Envio's confirmed_block_threshold default
+const LIVE_RELEASE_REORG_DEPTH = 8;
+const INDEXING_BLOCK_LAG = 4;
+const createdDatabases = [];
+let database;
+let reorgDepth;
 
 const word = (value) => BigInt(value).toString(16).padStart(64, '0');
 const hex32 = (value) => '0x' + word(value);
@@ -79,8 +91,8 @@ const TOKEN = '0x2222222222222222222222222222222222222222';
 const RECIPIENT = '0x5555555555555555555555555555555555555555';
 const L2_TOKEN = hex32(4);
 
-function psql(sql, database = DATABASE) {
-  return execFileSync('psql', ['-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1', '-d', database, '-c', sql], {
+function psql(sql, target = database) {
+  return execFileSync('psql', ['-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1', '-d', target, '-c', sql], {
     encoding: 'utf8',
     env: { ...process.env, PGHOST: PG.host, PGPORT: PG.port, PGUSER: PG.user, PGPASSWORD: PG.password },
   }).trim();
@@ -135,7 +147,12 @@ async function emit(topics, dataWords, params, kind) {
   const padded = [...topics, ...Array(4 - topics.length).fill(0n)];
   const calldata = '0x' + word(topics.length) + padded.map(word).join('') + dataWords.map(word).join('');
   const txHash = await rpc('eth_sendTransaction', [{ from: SENDER, to: BRIDGE, data: calldata, gas: '0x100000' }]);
-  const receipt = await rpc('eth_getTransactionReceipt', [txHash]);
+  let receipt = await rpc('eth_getTransactionReceipt', [txHash]);
+  for (let attempt = 0; receipt == null && attempt < 50; attempt++) {
+    await sleep(100); // Anvil can answer the send before the automined block is visible
+    receipt = await rpc('eth_getTransactionReceipt', [txHash]);
+  }
+  assert.ok(receipt, `no receipt for ${txHash}`);
   assert.equal(receipt.status, '0x1');
   assert.equal(receipt.logs.length, 1);
   const block = await rpc('eth_getBlockByNumber', [receipt.blockNumber, false]);
@@ -229,19 +246,46 @@ function stop(child) {
   }
 }
 
-function startEnvio() {
+function signalEnvio(signal) {
+  process.kill(-envio.pid, signal); // own process group only
+}
+
+function codegen(depth) {
+  reorgDepth = depth;
+  execFileSync('pnpm', ['exec', 'envio', 'codegen', '--config', './config.reorg-test.yaml'], {
+    cwd: ENVIO_DIR,
+    env: {
+      ...process.env,
+      REORG_TEST_RPC_URL: rpcUrl,
+      REORG_TEST_CONFIRMED_BLOCK_THRESHOLD: String(reorgDepth),
+    },
+    stdio: ['ignore', 'ignore', 'inherit'],
+  });
+}
+
+function createDatabase() {
+  database = `envio_reorg_test_${process.pid}_depth_${reorgDepth}`;
+  psql(`CREATE DATABASE "${database}"`, 'postgres');
+  createdDatabases.push(database);
+}
+
+function startEnvio({ isFreshParent, indexingBlockLag }) {
+  const { [FRESH_PARENT_ENV]: _fresh, ENVIO_INDEXING_BLOCK_LAG: _lag, ...inheritedEnv } = process.env;
   const child = spawn('pnpm', ['exec', 'envio', 'start', '--config', './config.reorg-test.yaml'], {
     cwd: ENVIO_DIR,
     detached: true,
     env: {
-      ...process.env,
+      ...inheritedEnv,
       ...(process.env.REORG_TEST_NODE_BIN_DIR
         ? { PATH: `${process.env.REORG_TEST_NODE_BIN_DIR}${path.delimiter}${process.env.PATH}` }
         : {}),
-      ENVIO_PG_DATABASE: DATABASE,
+      ...(isFreshParent ? { [FRESH_PARENT_ENV]: '1' } : {}),
+      ...(indexingBlockLag ? { ENVIO_INDEXING_BLOCK_LAG: String(indexingBlockLag) } : {}),
+      ENVIO_PG_DATABASE: database,
       ENVIO_PG_PUBLIC_SCHEMA: 'public',
       ENVIO_HASURA: 'false',
       REORG_TEST_RPC_URL: rpcUrl,
+      REORG_TEST_CONFIRMED_BLOCK_THRESHOLD: String(reorgDepth),
       LOG_LEVEL: 'info',
       TUI_OFF: 'true',
     },
@@ -263,7 +307,67 @@ const progress = () => Number(psql(
   `SELECT coalesce(max(progress_block), -1) FROM envio_chains WHERE id = ${CHAIN_ID}`) || -1);
 const depositRow = (index) => JSON.parse(psql(
   `SELECT coalesce(json_agg(to_jsonb(t)), '[]') FROM "Deposit" t WHERE id = '${CHAIN_ID}-${index}'`))[0];
-const reorgLogCount = () => (envioLog.match(/Blockchain reorg detected/g) || []).length;
+const reorgLogCount = (fromOffset = 0) => (envioLog.slice(fromOffset).match(/Blockchain reorg detected/g) || []).length;
+const invariantMessage = (fromOffset) =>
+  (envioLog.slice(fromOffset).match(/deposit read model invariant violated: [^\n"]*/) || [])[0];
+
+// With Envio running and caught up, replaces the block holding a new deposit
+// with a fork that re-includes the same deposit `blocksBefore` blocks later and
+// ends `blocksAfter` blocks after it. Envio is paused while the fork is built,
+// so it first sees the finished fork.
+const waitForDepositIndexed = (index, orphaned) => waitFor(`deposit ${index} to be indexed`,
+  () => progress() >= orphaned.event.block.number && depositRow(index) != null);
+
+async function replaceDepositBlock({
+  index, shield, amount, blocksBefore = 2, blocksAfter, beforeReorg = waitForDepositIndexed,
+}) {
+  const point = await rpc('evm_snapshot');
+  const orphaned = await emitDeposit({ index, shield, amount });
+  await beforeReorg(index, orphaned);
+  const logOffset = envioLog.length;
+  signalEnvio('SIGSTOP');
+  try {
+    assert.equal(await rpc('evm_revert', [point]), true);
+    if (blocksBefore > 0) await rpc('anvil_mine', [`0x${blocksBefore.toString(16)}`]);
+    const reincluded = await emitDeposit({ index, shield, amount });
+    await rpc('anvil_mine', [`0x${blocksAfter.toString(16)}`]);
+    const head = Number(await rpc('eth_blockNumber'));
+    return { orphaned, reincluded, head, logOffset };
+  } finally {
+    signalEnvio('SIGCONT');
+  }
+}
+
+// Waits until Envio has either rolled the fork back and indexed the deposit at
+// its new block, or stopped.
+async function waitForReorgOutcome({ index, reincluded, head, logOffset }) {
+  const deadline = Date.now() + 30000;
+  const isRolledBack = () => reorgLogCount(logOffset) > 0 && progress() >= head
+    && depositRow(index)?.block_number === reincluded.event.block.number;
+  while (Date.now() < deadline && envio.exitCode == null && !isRolledBack()) await sleep(500);
+  await sleep(2000); // let the batch after the rollback commit, or the process exit
+  return {
+    isDetected: reorgLogCount(logOffset) > 0,
+    isHalted: envio.exitCode != null,
+    invariant: invariantMessage(logOffset),
+  };
+}
+
+// The re-included deposit must stop Envio instead of appending a second leaf.
+function assertMissedAndHalted(outcome, index) {
+  assert.ok(!outcome.isDetected && outcome.isHalted
+    && new RegExp(`Deposit ${CHAIN_ID}-${index} already exists`).test(outcome.invariant || ''),
+  `missed reorg was neither rolled back nor stopped by the invariant: ${JSON.stringify(outcome)}\n${tail(envioLog)}`);
+}
+
+async function assertRolledBackLive(outcome, canonical, label) {
+  assert.ok(outcome.isDetected && !outcome.isHalted,
+    `${label}: live reorg not rolled back: ${JSON.stringify(outcome)}\n${tail(envioLog)}`);
+  assert.deepEqual(dbState(), await expectedState(canonical), `${label}: state after the live rollback differs from a replay`);
+}
+
+const describeFork = ({ index, orphaned, reincluded, head }) => `deposit ${index} orphaned at block `
+  + `${orphaned.event.block.number}, re-included at block ${reincluded.event.block.number}, head ${head}`;
 
 async function main() {
   const port = await freePort();
@@ -275,22 +379,17 @@ async function main() {
   await waitFor('anvil', async () => (await rpc('eth_chainId')) === '0x7a69');
   await rpc('anvil_setCode', [BRIDGE, EMITTER_RUNTIME]);
 
-  execFileSync('pnpm', ['exec', 'envio', 'codegen', '--config', './config.reorg-test.yaml'], {
-    cwd: ENVIO_DIR,
-    env: { ...process.env, REORG_TEST_RPC_URL: rpcUrl },
-    stdio: ['ignore', 'ignore', 'inherit'],
-  });
-  psql(`CREATE DATABASE "${DATABASE}"`, 'postgres');
+  codegen(DEFAULT_REORG_DEPTH);
+  createDatabase();
 
   const S1 = hex32(0x51n);
   const S2 = hex32(0x52n);
   const S3 = hex32(0x53n);
 
   // ── Scenario 1 (gate): reorg rolled back by Envio ────────────────────────
-  // Envio 2.32.10's RPC source caches blocks by number, so its parent-hash
-  // guard only sees a reorg when the cache is fresh. Stopping Envio before the
-  // reorg and restarting it after makes Envio compare the stored checkpoint
-  // hashes with the new chain and run its real rollback path.
+  // Stopping Envio before the reorg and restarting it after makes Envio
+  // compare the stored checkpoint hashes with the new chain (its block cache
+  // starts empty) and run its real rollback path.
   const common = [
     await emitDeposit({ index: 0, shield: S1, amount: 100n }),
     await emitDeposit({ index: 1, shield: S1, amount: 101n }),
@@ -304,7 +403,7 @@ async function main() {
   ];
   const headA = Number(await rpc('eth_blockNumber'));
 
-  envio = startEnvio();
+  envio = startEnvio({ isFreshParent: false });
   await waitFor('fork A to be indexed', () => progress() >= headA);
   const stateA = dbState();
   assert.deepEqual(stateA, await expectedState([...common, ...forkA]), 'fork A state differs from replay');
@@ -324,15 +423,15 @@ async function main() {
   for (let i = 0; i < 3; i++) await rpc('evm_mine');
   const headB = Number(await rpc('eth_blockNumber'));
   assert.ok(headB > headA, 'fork B must be longer than fork A');
-  const canonicalB = [...common, ...forkB];
+  let canonical = [...common, ...forkB];
 
-  envio = startEnvio();
+  envio = startEnvio({ isFreshParent: false });
   await waitFor('fork B to replace fork A', () => progress() >= headB && depositRow(2)?.shield_address === S3);
   await sleep(2000); // let the batch after the rollback commit
   assert.equal(envio.exitCode, null, `Envio stopped after the reorg\n${tail(envioLog)}`);
   assert.ok(reorgLogCount() >= 1, `Envio did not log a reorg\n${tail(envioLog)}`);
   const stateB = dbState();
-  assert.deepEqual(stateB, await expectedState(canonicalB),
+  assert.deepEqual(stateB, await expectedState(canonical),
     'state after the rollback differs from a replay of the canonical chain');
   assert.equal(stateB.AccountDepositStats.find((row) => row.shield_address === S2), undefined,
     'stats of an account that only deposited on the discarded fork must be gone');
@@ -341,53 +440,103 @@ async function main() {
     + `${stateB.AccountDepositStats.length} stats rows, ${stateB.WithdrawalClaim.length} claims; `
     + `all ${ENTITIES.length} entity tables equal the replay`);
 
-  // ── Scenario 2: reorg while Envio keeps running ──────────────────────────
-  const reorgsBefore = reorgLogCount();
-  const livePoint = await rpc('evm_snapshot');
-  const forkC = [await emitDeposit({ index: 3, shield: S1, amount: 103n })];
-  const headC = Number(await rpc('eth_blockNumber'));
-  await waitFor('fork C to be indexed', () => progress() >= headC && depositRow(3) != null);
-  assert.equal(await rpc('evm_revert', [livePoint]), true);
-  for (let i = 0; i < 2; i++) await rpc('evm_mine');
-  // The same deposit, re-included in a later block of the new chain.
-  const forkD = [await emitDeposit({ index: 3, shield: S1, amount: 103n })];
-  for (let i = 0; i < 2; i++) await rpc('evm_mine');
-  const headD = Number(await rpc('eth_blockNumber'));
-  const deadline = Date.now() + 30000;
-  while (Date.now() < deadline && envio.exitCode == null) {
-    if (reorgLogCount() > reorgsBefore && progress() >= headD) break;
-    await sleep(500);
-  }
+  // ── Scenario 2a: live reorg, upstream RPC source (patch not enabled) ─────
+  const unpatched = await replaceDepositBlock({ index: 3, shield: S1, amount: 103n, blocksAfter: 2 });
+  const unpatchedOutcome = await waitForReorgOutcome({ index: 3, ...unpatched });
+  console.log(`scenario 2a (${FRESH_PARENT_ENV} unset, threshold ${DEFAULT_REORG_DEPTH}): `
+    + `${describeFork({ index: 3, ...unpatched })}; ${JSON.stringify(unpatchedOutcome)}`);
+  assertMissedAndHalted(unpatchedOutcome, 3);
+  canonical = [...canonical, unpatched.reincluded];
+  // Recovery: a restart starts with an empty block cache, so Envio compares
+  // the stored checkpoint hashes with the chain and rolls the fork back.
+  envio = startEnvio({ isFreshParent: false });
+  await waitFor('restart to roll back the missed reorg', () => reorgLogCount(unpatched.logOffset) > 0
+    && progress() >= unpatched.head && depositRow(3)?.block_number === unpatched.reincluded.event.block.number);
   await sleep(2000);
-  const detected = reorgLogCount() > reorgsBefore;
-  const halted = envio.exitCode != null;
-  const invariant = (envioLog.match(/deposit read model invariant violated: [^\n"]*/) || [])[0];
-  if (detected && !halted) {
-    assert.deepEqual(dbState(), await expectedState([...canonicalB, ...forkD]),
-      'state after the live rollback differs from a replay');
-    console.log('scenario 2: Envio detected the live reorg and rolled back');
-  } else {
-    console.log(`scenario 2: live reorg detected=${detected}; Envio halted=${halted}`
-      + `${invariant ? `; ${invariant}` : ''}; DB Deposit 3 block=${depositRow(3)?.block_number}, `
-      + `canonical block=${forkD[0].event.block.number} (orphaned fork C block ${forkC[0].event.block.number})`);
-    // Without a rollback, the re-included deposit must stop Envio instead of
-    // appending a second leaf for it.
-    assert.ok(!detected && halted && /Deposit 31337-3 already exists/.test(invariant || ''),
-      `missed reorg was neither rolled back nor stopped by the invariant\n${tail(envioLog)}`);
-    // Recovery: a restart starts with an empty block cache, so Envio compares
-    // the stored checkpoint hashes with the chain and rolls the fork back.
-    envio = startEnvio();
-    await waitFor('restart to roll back the missed reorg',
-      () => reorgLogCount() > reorgsBefore && progress() >= headD && depositRow(3)?.block_number === forkD[0].event.block.number);
-    await sleep(2000);
-    assert.equal(envio.exitCode, null, `Envio stopped after the restart\n${tail(envioLog)}`);
-    assert.deepEqual(dbState(), await expectedState([...canonicalB, ...forkD]),
-      'state after the restart differs from a replay of the canonical chain');
-    console.log('scenario 2: a restart detected the missed reorg, rolled back and matches the replay');
-    if (process.env.REORG_TEST_REQUIRE_LIVE_DETECTION === '1') {
-      throw new Error('live reorg was not rolled back');
-    }
-  }
+  assert.equal(envio.exitCode, null, `Envio stopped after the restart\n${tail(envioLog)}`);
+  assert.deepEqual(dbState(), await expectedState(canonical),
+    'state after the restart differs from a replay of the canonical chain');
+  console.log('scenario 2a passed: upstream Envio missed the live reorg, the invariant stopped it, '
+    + 'and a restart rolled back to a state equal to the replay');
+  await stopAndWait(envio);
+
+  // ── Scenario 2b: live reorg with the fresh reorg parent enabled ─────────
+  envio = startEnvio({ isFreshParent: true });
+  const patched = await replaceDepositBlock({ index: 4, shield: S2, amount: 104n, blocksAfter: 2 });
+  const patchedOutcome = await waitForReorgOutcome({ index: 4, ...patched });
+  console.log(`scenario 2b (${FRESH_PARENT_ENV}=1, threshold ${DEFAULT_REORG_DEPTH}): `
+    + `${describeFork({ index: 4, ...patched })}; ${JSON.stringify(patchedOutcome)}`);
+  canonical = [...canonical, patched.reincluded];
+  await assertRolledBackLive(patchedOutcome, canonical, 'scenario 2b');
+  console.log('scenario 2b passed: Envio rolled the live reorg back without a restart; '
+    + `all ${ENTITIES.length} entity tables equal the replay`);
+  await stopAndWait(envio);
+
+  // ── Scenario 3: the live release's confirmed_block_threshold ────────────
+  // Envio checks the parent hash only while the parent is within the threshold
+  // of the head the fetch saw; an older parent is skipped.
+  codegen(LIVE_RELEASE_REORG_DEPTH);
+  createDatabase();
+  envio = startEnvio({ isFreshParent: true });
+  const headBefore = Number(await rpc('eth_blockNumber'));
+  await waitFor('the chain to be indexed again', () => progress() >= headBefore);
+  assert.deepEqual(dbState(), await expectedState(canonical), 'threshold 8: initial sync differs from a replay');
+
+  const within = await replaceDepositBlock({ index: 5, shield: S3, amount: 105n, blocksAfter: 2 });
+  const withinOutcome = await waitForReorgOutcome({ index: 5, ...within });
+  console.log(`scenario 3a (${FRESH_PARENT_ENV}=1, threshold ${LIVE_RELEASE_REORG_DEPTH}): `
+    + `${describeFork({ index: 5, ...within })}; ${JSON.stringify(withinOutcome)}`);
+  canonical = [...canonical, within.reincluded];
+  await assertRolledBackLive(withinOutcome, canonical, 'scenario 3a');
+  console.log('scenario 3a passed: parent within the threshold, rolled back live');
+
+  await stopAndWait(envio);
+  envio = startEnvio({ isFreshParent: false, indexingBlockLag: INDEXING_BLOCK_LAG });
+  await rpc('anvil_mine', [`0x${(INDEXING_BLOCK_LAG + 2).toString(16)}`]);
+  const laggedHead = Number(await rpc('eth_blockNumber'));
+  await waitFor('Envio to index up to the lagged head', () => progress() >= laggedHead - INDEXING_BLOCK_LAG);
+  const lagged = await replaceDepositBlock({
+    index: 6,
+    shield: S2,
+    amount: 106n,
+    blocksAfter: INDEXING_BLOCK_LAG + 1,
+    beforeReorg: async (index, orphaned) => {
+      await sleep(3000); // several polls with the deposit block at the head
+      assert.ok(progress() < orphaned.event.block.number && depositRow(index) == null,
+        `ENVIO_INDEXING_BLOCK_LAG=${INDEXING_BLOCK_LAG} let the head block reach the handlers`);
+    },
+  });
+  await waitFor('the re-included deposit to be indexed',
+    () => depositRow(6)?.block_number === lagged.reincluded.event.block.number);
+  await sleep(2000);
+  const laggedOutcome = { isDetected: reorgLogCount(lagged.logOffset) > 0, isHalted: envio.exitCode != null };
+  console.log(`scenario 3b (${FRESH_PARENT_ENV} unset, ENVIO_INDEXING_BLOCK_LAG=${INDEXING_BLOCK_LAG}): `
+    + `${describeFork({ index: 6, ...lagged })}; ${JSON.stringify(laggedOutcome)}`);
+  assert.ok(!laggedOutcome.isDetected && !laggedOutcome.isHalted, `${JSON.stringify(laggedOutcome)}\n${tail(envioLog)}`);
+  canonical = [...canonical, lagged.reincluded];
+  assert.deepEqual(dbState(), await expectedState(canonical), 'scenario 3b: state differs from a replay');
+  console.log('scenario 3b passed: the orphaned head block never reached the handlers; no rollback was needed');
+  await stopAndWait(envio);
+
+  envio = startEnvio({ isFreshParent: true });
+  const beyond = await replaceDepositBlock({
+    index: 7, shield: S1, amount: 107n, blocksAfter: LIVE_RELEASE_REORG_DEPTH + 4,
+  });
+  const beyondOutcome = await waitForReorgOutcome({ index: 7, ...beyond });
+  console.log(`scenario 3c (${FRESH_PARENT_ENV}=1, threshold ${LIVE_RELEASE_REORG_DEPTH}): `
+    + `${describeFork({ index: 7, ...beyond })}; ${JSON.stringify(beyondOutcome)}`);
+  assertMissedAndHalted(beyondOutcome, 7);
+  const restartOffset = envioLog.length;
+  envio = startEnvio({ isFreshParent: true });
+  await waitFor('the restart to stop again', () => envio.exitCode != null || reorgLogCount(restartOffset) > 0);
+  assertMissedAndHalted({
+    isDetected: reorgLogCount(restartOffset) > 0,
+    isHalted: envio.exitCode != null,
+    invariant: invariantMessage(restartOffset),
+  }, 7);
+  console.log('scenario 3c passed (documents a limit): with the parent more than '
+    + `${LIVE_RELEASE_REORG_DEPTH} blocks below the head, neither the patched live guard nor a restart `
+    + 'detects the reorg; the invariant stops Envio on every start');
   console.log('reorg rollback test passed');
 }
 
@@ -400,9 +549,11 @@ main()
     stop(envio);
     stop(anvil);
     await sleep(1500);
-    try {
-      psql(`DROP DATABASE IF EXISTS "${DATABASE}" WITH (FORCE)`, 'postgres');
-    } catch (error) {
-      console.error(`could not drop ${DATABASE}: ${error.message}`);
+    for (const name of createdDatabases) {
+      try {
+        psql(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`, 'postgres');
+      } catch (error) {
+        console.error(`could not drop ${name}: ${error.message}`);
+      }
     }
   });
