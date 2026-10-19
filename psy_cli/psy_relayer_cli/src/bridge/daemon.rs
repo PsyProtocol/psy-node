@@ -120,6 +120,8 @@ pub(crate) struct BridgeProposeDaemonConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct L1Config {
     #[serde(default)]
+    pub packed_deposit: Option<super::packed_deposit::PackedDepositConfig>,
+    #[serde(default)]
     pub fee_policy: Option<super::l1_fees::BscFeePolicy>,
     #[serde(default = "default_evm_family")]
     pub family: String,
@@ -168,6 +170,7 @@ impl L1Config {
         config.finalize.l1_rpc_fallback_url = None;
         config.finalize.l1_rpc_providers = providers;
         config.finalize.fee_policy = self.fee_policy.clone();
+        config.finalize.packed_deposit = self.packed_deposit.clone();
         config.finalize.deployments_network = Some(self.deployments_network.clone());
         config.finalize.state_manager = self.state_manager.clone();
         config.finalize.bridge_address = self.bridge_address.clone();
@@ -197,6 +200,8 @@ fn legacy_rpc_urls(finalize: &DaemonFinalizeConfig) -> Vec<String> {
 }
 
 fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L1Config>> {
+    ensure!(config.chains.is_empty() || config.finalize.packed_deposit.is_none(),
+        "with [[chains]], configure packed deposits in [chains.packed_deposit]");
     ensure!(config.chains.is_empty() || config.finalize.fee_policy.is_none(),
         "with [[chains]], configure fees in [chains.fee_policy], not [finalize.fee_policy]");
     let mut chains = if config.chains.is_empty() {
@@ -212,6 +217,7 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
             .or_else(|| (deployments_network == "localhost").then_some(0))
             .context("deployment is missing protocol.chain.l1ChainIndex")?;
         vec![L1Config {
+            packed_deposit: config.finalize.packed_deposit.clone(),
             fee_policy: config.finalize.fee_policy.clone(),
             family: default_evm_family(),
             chain_index,
@@ -231,6 +237,7 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
     ensure!(!chains.is_empty(), "bridge relayer requires at least one chain");
     let mut seen = HashSet::with_capacity(chains.len());
     for chain in &chains {
+        if let Some(packed) = &chain.packed_deposit { packed.validate()?; }
         if let Some(policy) = &chain.fee_policy {
             policy.validate()?;
             ensure!(chain.network_id == "bscTestnet" && chain.deployments_network == "bscTestnet",
@@ -264,6 +271,8 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct DaemonFinalizeConfig {
+    #[serde(default)]
+    pub packed_deposit: Option<super::packed_deposit::PackedDepositConfig>,
     #[serde(default)]
     pub fee_policy: Option<super::l1_fees::BscFeePolicy>,
     pub l1_rpc_url: Option<String>,
@@ -858,6 +867,9 @@ async fn materialize_chain_proof(
 }
 
 pub async fn run(args: RunDaemonArgs) -> anyhow::Result<()> {
+    let proof_concurrency = super::constants::configured_proxy_proof_concurrency()
+        .map_err(anyhow::Error::msg)?;
+    tracing::info!(proof_concurrency, "configured remote deposit proof concurrency");
     let loaded = load_config(&args.config)?;
     let chain_configs = configured_chains(&loaded)?;
     if chain_configs.len() == 1 {
@@ -1560,6 +1572,7 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
     let rpc_url = l1_rpc
         .parse()
         .with_context(|| format!("invalid L1 rpc url: {}", l1_rpc))?;
+    let packed_sender = wallet.default_signer().address();
     let provider = crate::bridge::l1_provider::connect_l1_with_wallet(rpc_url, wallet)?;
     let proved_before = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
     let expected_proved_after = U256::from(target_deposit_count);
@@ -1581,6 +1594,29 @@ pub(crate) async fn submit_deposit_batch_appends_with_l1_rpc(
     super::l1_fees::prepare_l1_fees(
         &provider, &mut TransactionRequest::default(), config.finalize.fee_policy.as_ref(),
     ).await?;
+
+    if let Some(packed) = &config.finalize.packed_deposit {
+        packed.validate_bridge(&provider, bridge).await?;
+        packed.prepare_fees(&provider, &mut TransactionRequest::default(), config.finalize.fee_policy.as_ref()).await?;
+        if let Some(proxy_url) = prove_proxy_url {
+            let (sender, receiver) = tokio::sync::mpsc::channel(packed.max_calls_per_tx * 2);
+            // Let an already-broadcast transaction finish even if a later proof
+            // fails. try_join! would cancel receipt tracking on producer error.
+            let (produced, sent) = tokio::join!(
+                prove_bridge::stream_deposit_batch_append_calls_remote(
+                    l1_rpc, deployments_network, target_deposit_count, proxy_url, sender,
+                ),
+                super::packed_deposit::submit_ready(
+                    &provider, packed, bridge, packed_sender, receiver, target_deposit_count, config.finalize.fee_policy.as_ref(),
+                ),
+            );
+            super::packed_deposit::finish_pipeline(produced, sent)?;
+        } else {
+            let calls = prove_bridge::build_deposit_batch_append_calls(l1_rpc, deployments_network, target_deposit_count).await?;
+            super::packed_deposit::submit(&provider, packed, bridge, packed_sender, &calls, target_deposit_count, config.finalize.fee_policy.as_ref()).await?;
+        }
+        return Ok(());
+    }
 
     let calls = if let Some(proxy_url) = prove_proxy_url {
         prove_bridge::build_deposit_batch_append_calls_remote(
@@ -2749,7 +2785,7 @@ async fn build_l2_call_plan(
             &http,
             services_url,
             source_chain_index,
-            global_target_deposit_count,
+            crate::bridge::api_client::DepositTreeRootCount::GlobalTarget(global_target_deposit_count),
         )
         .await?;
         let per_chain_snapshot_deposit_count = source_chain_tree_state
@@ -2917,7 +2953,7 @@ async fn build_multichain_l2_plan(
                 &http,
                 &base.services_url,
                 u64::from(chain.chain_index),
-                u64::from(pending),
+                crate::bridge::api_client::DepositTreeRootCount::ChainSnapshot(u64::from(pending)),
             ).await?;
             ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}", chain.chain_index, pending);
             let snapshot_count = snapshot.snapshot_deposit_count().context("deposit snapshot missing count")?;
@@ -3365,6 +3401,39 @@ async fn fetch_deposit_tree_next_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_deposit_budgets_are_opt_in_and_do_not_leak_between_chains() {
+        let raw = r#"
+rpc_config = "config.json"
+services_url = "http://127.0.0.1:3000"
+withdraw_method_id = 1
+[[chains]]
+chain_index = 0
+network_id = "sepolia"
+deployments_network = "sepolia"
+rpc_urls = ["http://127.0.0.1:8545"]
+[chains.packed_deposit]
+adapter_address = "0x1111111111111111111111111111111111111111"
+max_calls_per_tx = 12
+max_gas_per_tx = 15000000
+max_fee_per_gas_wei = 5000000000
+max_tx_fee_wei = 75000000000000000
+[[chains]]
+chain_index = 1
+network_id = "bscTestnet"
+deployments_network = "bscTestnet"
+rpc_urls = ["http://127.0.0.1:8546"]
+"#;
+        let config: BridgeProposeDaemonConfig = toml::from_str(raw).unwrap();
+        assert!(config.finalize.packed_deposit.is_none());
+        let sepolia = config.chains[0].effective_config(&config).unwrap();
+        let packed = sepolia.finalize.packed_deposit.as_ref().unwrap();
+        packed.validate().unwrap();
+        assert_eq!(packed.max_calls_per_tx, 12);
+        assert_eq!(packed.max_tx_fee_wei, 75_000_000_000_000_000);
+        assert!(config.chains[1].effective_config(&sepolia).unwrap().finalize.packed_deposit.is_none());
+    }
     use crate::bridge::propose_withdrawals::PendingWithdrawal;
     use std::{
         path::PathBuf,

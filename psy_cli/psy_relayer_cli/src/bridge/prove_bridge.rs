@@ -51,7 +51,7 @@ use serde::Serialize;
 
 use crate::bridge::constants::{
     BRIDGE_USER_ID_U64, DEPOSIT_TREE_AGG_SLOT_BASE, DEPOSIT_TREE_CHAIN_ROOT_SLOT_BASE,
-    DEPOSIT_TREE_CONTRACT_ID, MAX_CONCURRENT_PROXY_PROOFS, TOP_TREE_HEIGHT,
+    configured_proxy_proof_concurrency, DEPOSIT_TREE_CONTRACT_ID, TOP_TREE_HEIGHT,
     WITHDRAWAL_TREE_AGG_SLOT_BASE, WITHDRAWAL_TREE_CHAIN_ROOT_SLOT_BASE,
     WITHDRAWAL_TREE_CONTRACT_ID,
 };
@@ -368,6 +368,16 @@ pub struct DepositBatchAppendCall {
     pub slot_data: Vec<U256>,
     pub call_data: Bytes,
 }
+
+#[derive(Debug)]
+pub(crate) struct DepositStreamConsumerStopped;
+
+impl std::fmt::Display for DepositStreamConsumerStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("packed deposit consumer stopped")
+    }
+}
+impl std::error::Error for DepositStreamConsumerStopped {}
 
 #[derive(Clone, Debug)]
 pub struct BridgeProveResult {
@@ -1053,6 +1063,34 @@ pub async fn build_deposit_batch_append_calls_remote(
     target_deposit_count: u32,
     prove_proxy_url: &str,
 ) -> anyhow::Result<Vec<DepositBatchAppendCall>> {
+    build_deposit_batch_append_calls_remote_inner(
+        l1_rpc_url, deployments_network, target_deposit_count, prove_proxy_url, None,
+    ).await
+}
+
+/// Emit the ready consecutive prefix while later proofs are still running.
+/// Bounded delivery allows sending without waiting for a full proving round.
+pub(crate) async fn stream_deposit_batch_append_calls_remote(
+    l1_rpc_url: &str,
+    deployments_network: &str,
+    target_deposit_count: u32,
+    prove_proxy_url: &str,
+    sender: tokio::sync::mpsc::Sender<DepositBatchAppendCall>,
+) -> anyhow::Result<()> {
+    build_deposit_batch_append_calls_remote_inner(
+        l1_rpc_url, deployments_network, target_deposit_count, prove_proxy_url, Some(sender),
+    ).await?;
+    Ok(())
+}
+
+async fn build_deposit_batch_append_calls_remote_inner(
+    l1_rpc_url: &str,
+    deployments_network: &str,
+    target_deposit_count: u32,
+    prove_proxy_url: &str,
+    sender: Option<tokio::sync::mpsc::Sender<DepositBatchAppendCall>>,
+) -> anyhow::Result<Vec<DepositBatchAppendCall>> {
+    let max_concurrent_proxy_proofs = configured_proxy_proof_concurrency().map_err(anyhow::Error::msg)?;
     let l1_config = load_l1_deployment_config(deployments_network)?;
     let inputs = fetch_deposit_batch_inputs(
         target_deposit_count,
@@ -1083,6 +1121,41 @@ pub async fn build_deposit_batch_append_calls_remote(
         circuit_deposits: Vec<DepositLeafData>,
         proxy_deposits: Vec<ProxyDepositLeafInput>,
         old_frontier_str: Vec<String>,
+    }
+
+    impl ChunkPrep {
+        fn assemble(&self, proxy_output: BridgeDepositBatchGroth16Proof) -> anyhow::Result<DepositBatchAppendCall> {
+            let mut proof = [U256::ZERO; 8];
+            for (i, value) in proxy_output.solidity_proof.iter().enumerate() {
+                proof[i] = U256::from_str_radix(value.trim_start_matches("0x"), 16)?;
+            }
+
+            let slot_data_u32 = compute_batch_slot_data_words(
+                &self.circuit_deposits.iter().map(deposit_leaf_to_circuit).collect::<Vec<_>>(),
+            );
+            let slot_data: [U256; 1312] = {
+                let mut arr = [U256::ZERO; 1312];
+                for (i, &v) in slot_data_u32.iter().enumerate() {
+                    arr[i] = U256::from(v);
+                }
+                arr
+            };
+
+            let call = batchAppendCall {
+                proof,
+                publicInputs: proxy_output.public_inputs.iter().map(|v| U256::from(*v)).collect(),
+                slotData: slot_data,
+            };
+            let call_data = Bytes::from(call.abi_encode());
+            let slot_data_u256: Vec<U256> = slot_data_u32.iter().map(|v| U256::from(*v)).collect();
+            Ok(DepositBatchAppendCall {
+                from_index: self.from_index,
+                to_index: self.to_index,
+                batch_commit: self.batch_commit,
+                slot_data: slot_data_u256,
+                call_data,
+            })
+        }
     }
 
     let mut frontier = inputs.old_frontier.clone();
@@ -1147,7 +1220,7 @@ pub async fn build_deposit_batch_append_calls_remote(
 
     // ── Phase 2 + 3: fire all proxy requests concurrently via FuturesUnordered ──
     // Each chunk is independent (preimages already computed locally), so we can
-    // send up to 4 concurrent proxy requests using FuturesUnordered.
+    // Bound concurrency to the configured pool; collect results in chunk order.
     let proxy_client = Arc::new(ProveProxyClient::new(prove_proxy_url));
     use futures::stream::FuturesUnordered;
     use futures::StreamExt;
@@ -1155,17 +1228,18 @@ pub async fn build_deposit_batch_append_calls_remote(
     let mut pending = FuturesUnordered::new();
     let mut outstanding: usize = 0;
     let mut prep_idx: usize = 0;
+    let mut next_emit = 0;
     let mut proxy_outputs: Vec<Option<BridgeDepositBatchGroth16Proof>> = vec![None; prep_list.len()];
     tracing::info!(
         "[remote] Sending {} deposit chunk(s) to Prove Proxy at {} (max {} concurrent)",
         prep_list.len(),
         prove_proxy_url,
-        MAX_CONCURRENT_PROXY_PROOFS
+        max_concurrent_proxy_proofs
     );
 
     loop {
         // Spawn new requests while we have chunks and haven't hit concurrency limit
-        while outstanding < MAX_CONCURRENT_PROXY_PROOFS && prep_idx < prep_list.len() {
+        while outstanding < max_concurrent_proxy_proofs && prep_idx < prep_list.len() {
             let prep = &prep_list[prep_idx];
             let client = Arc::clone(&proxy_client);
             let witness = BridgeDepositBatchWitnessInput {
@@ -1191,6 +1265,14 @@ pub async fn build_deposit_batch_append_calls_remote(
             outstanding -= 1;
             let proof = result?;
             proxy_outputs[idx] = Some(proof);
+            if let Some(sender) = &sender {
+                while next_emit < proxy_outputs.len() && proxy_outputs[next_emit].is_some() {
+                    let output = proxy_outputs[next_emit].take().unwrap();
+                    let call = prep_list[next_emit].assemble(output)?;
+                    sender.send(call).await.map_err(|_| DepositStreamConsumerStopped)?;
+                    next_emit += 1;
+                }
+            }
             tracing::debug!(
                 "[remote] Deposit chunk {} received from Prove Proxy (from_index {})",
                 idx,
@@ -1199,46 +1281,20 @@ pub async fn build_deposit_batch_append_calls_remote(
         }
     }
 
+    if sender.is_some() {
+        anyhow::ensure!(next_emit == prep_list.len(), "streamed deposit prefix is incomplete");
+        return Ok(Vec::new());
+    }
+
     // Collect in order
     let proxy_outputs: Vec<BridgeDepositBatchGroth16Proof> = proxy_outputs
         .into_iter()
         .map(|opt| opt.ok_or_else(|| anyhow::anyhow!("missing proxy output for chunk")))
         .collect::<anyhow::Result<_>>()?;
 
-    // ── Phase 4: assemble calldata from proxy outputs + preimages ──
-    let mut calls = Vec::with_capacity(proxy_outputs.len());
-    for (prep, proxy_output) in prep_list.into_iter().zip(proxy_outputs.into_iter()) {
-        let mut proof = [U256::ZERO; 8];
-        for (i, value) in proxy_output.solidity_proof.iter().enumerate() {
-            proof[i] = U256::from_str_radix(value.trim_start_matches("0x"), 16)?;
-        }
-
-        let slot_data_u32 = compute_batch_slot_data_words(
-            &prep.circuit_deposits.iter().map(deposit_leaf_to_circuit).collect::<Vec<_>>(),
-        );
-        let slot_data: [U256; 1312] = {
-            let mut arr = [U256::ZERO; 1312];
-            for (i, &v) in slot_data_u32.iter().enumerate() {
-                arr[i] = U256::from(v);
-            }
-            arr
-        };
-
-        let call = batchAppendCall {
-            proof,
-            publicInputs: proxy_output.public_inputs.iter().map(|v| U256::from(*v)).collect(),
-            slotData: slot_data,
-        };
-        let call_data = Bytes::from(call.abi_encode());
-        let slot_data_u256: Vec<U256> = slot_data_u32.iter().map(|v| U256::from(*v)).collect();
-        calls.push(DepositBatchAppendCall {
-            from_index: prep.from_index,
-            to_index: prep.to_index,
-            batch_commit: prep.batch_commit,
-            slot_data: slot_data_u256,
-            call_data,
-        });
-    }
+    let calls = prep_list.iter().zip(proxy_outputs)
+        .map(|(prep, output)| prep.assemble(output))
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(calls)
 }

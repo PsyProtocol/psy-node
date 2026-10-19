@@ -7,6 +7,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use std::{fs, path::PathBuf, str::FromStr};
 
+#[cfg(test)]
+#[path = "api_client_tests.rs"]
+mod tests;
+
 sol! {
     function l1ChainIndex() external view returns (uint8);
 }
@@ -76,11 +80,19 @@ impl DepositTreeRootState {
     }
 }
 
+/// Services distinguishes a prefix of global deposit indexes from an exact
+/// count in one source chain's tree. They are not interchangeable.
+#[derive(Debug, Clone, Copy)]
+pub enum DepositTreeRootCount {
+    GlobalTarget(u64),
+    ChainSnapshot(u64),
+}
+
 pub async fn fetch_services_deposit_tree_root(
     http: &reqwest::Client,
     services_url: &str,
     source_chain_index: u64,
-    target_deposit_count: u64,
+    count: DepositTreeRootCount,
 ) -> anyhow::Result<DepositTreeRootState> {
     let mut url = reqwest::Url::parse(&format!(
         "{}/api/v1/bridge/deposit-tree-root",
@@ -89,8 +101,11 @@ pub async fn fetch_services_deposit_tree_root(
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("source_chain_index", &source_chain_index.to_string());
-        let target_deposit_count = target_deposit_count.to_string();
-        query.append_pair("target_deposit_count", &target_deposit_count);
+        let (parameter, value) = match count {
+            DepositTreeRootCount::GlobalTarget(value) => ("target_deposit_count", value),
+            DepositTreeRootCount::ChainSnapshot(value) => ("snapshot_deposit_count", value),
+        };
+        query.append_pair(parameter, &value.to_string());
     }
     let resp: ApiResponse<DepositTreeRootState> =
         get_services_json(http, url.as_str(), "deposit_tree_root").await?;
@@ -100,7 +115,21 @@ pub async fn fetch_services_deposit_tree_root(
             resp.error.unwrap_or_else(|| "unknown".into())
         );
     }
-    resp.data.ok_or_else(|| anyhow::anyhow!("deposit_tree_root response missing data"))
+    let snapshot = resp.data.ok_or_else(|| anyhow::anyhow!("deposit_tree_root response missing data"))?;
+    if let DepositTreeRootCount::ChainSnapshot(expected_count) = count {
+        anyhow::ensure!(snapshot.found, "missing exact deposit snapshot for chain {} count {}: {}",
+            source_chain_index, expected_count, snapshot.reason.as_deref().unwrap_or("no reason given"));
+        anyhow::ensure!(snapshot.source_chain_index == Some(source_chain_index),
+            "deposit snapshot chain mismatch: requested {} returned {:?}",
+            source_chain_index, snapshot.source_chain_index);
+        // An echoed legacy target is not evidence of an exact per-chain count.
+        let actual_count = snapshot.snapshot_deposit_count.or(snapshot.tree_count)
+            .context("deposit snapshot missing per-chain count")?;
+        anyhow::ensure!(actual_count == expected_count,
+            "deposit snapshot count mismatch for chain {}: requested {} returned {}",
+            source_chain_index, expected_count, actual_count);
+    }
+    Ok(snapshot)
 }
 
 pub async fn get_services_json<T: serde::de::DeserializeOwned>(
