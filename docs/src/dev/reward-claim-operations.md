@@ -115,6 +115,7 @@ For each selected coordinate require:
 - `0 < selected_job_count <= checkpoint.stats.pm_jobs_completed.gutas_completed`, with `gutas_completed > 0`. For each checkpoint independently, `amount = floor(selected_job_count * guta_fees_collected / gutas_completed)`; the remainder is strictly less than the denominator (`psy_plonky2_circuits/src/bridge/circuits/user_reward_tree.rs:543-565,583-588,619-628`).
 - A positive amount. A zero result is rejected by `RewardClaim::from_public_inputs`, even though the payout arithmetic can produce zero (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:98-100`; `client_prover/psy_core/psy_data/src/reward_claim.rs:75-105`).
 - An unclaimed `(user_id, checkpoint_id)` under a recognized finalized root. Claiming consumes the checkpoint pair, not just the selected jobs: select all intended owned jobs for that checkpoint before paying it (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:63-68,125-128,208-209`).
+- Recognition requires `checkpointTreeRootsClean()` and a nonzero `checkpointTreeRootCheckpointId(bytes32)` no greater than the finalized tip. After a real force-set, administrators revoke named abandoned roots with `revokeCheckpointTreeRoots(bytes32[])` and explicitly call `setCheckpointTreeRootsClean(true)` only after cleanup verification. Revocation preserves unnamed historical roots and never resets claimed pairs; there is no root count or automatic clean transition.
 
 ## 3. Query Before Claiming
 

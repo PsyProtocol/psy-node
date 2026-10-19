@@ -977,9 +977,9 @@ impl RewardClient {
     }
 
     pub async fn read_reward_root_recognized(&self, l1_rpc_url: &str, block: &str, state_manager: &str, root: [u8; 32]) -> Result<bool> {
-        let clean = self.l1_call(l1_rpc_url, block, state_manager, keccak256(b"rewardRootsClean()")[..4].to_vec()).await?;
+        let clean = self.l1_call(l1_rpc_url, block, state_manager, keccak256(b"checkpointTreeRootsClean()")[..4].to_vec()).await?;
         if !decode_claimed_bool(&clean)? { return Ok(false); }
-        let mut data = keccak256(b"rewardRootCheckpointId(bytes32)")[..4].to_vec();
+        let mut data = keccak256(b"checkpointTreeRootCheckpointId(bytes32)")[..4].to_vec();
         data.extend_from_slice(&root);
         let registered = self.l1_call(l1_rpc_url, block, state_manager, data).await?;
         let tip = self.l1_call(l1_rpc_url, block, state_manager, keccak256(b"lastFinalizedCheckpointId()")[..4].to_vec()).await?;

@@ -343,19 +343,30 @@ Use this narrowly scoped repair only when the finalized ID and deposit/withdrawa
      --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
    ```
 
-3. Revoke **all** registered reward roots after the state change. A changed state with existing roots sets `rewardRootsClean=false`; only then is `revokeAbandonedRewardRoots` allowed. Passing the entire count removes every entry. A partial batch leaves the contract dirty until the last entry is removed; `finalize` rejects dirty state. If there are no entries, skip revocation; calling it with zero or an already-clean registry reverts (`psy-contracts/src/StateManager.sol:140-155,168-181,207-208`).
+3. Revoke the **named abandoned checkpoint tree roots**, preserving unaffected historical roots. Every real state change sets `checkpointTreeRootsClean=false`, even when the registry is empty. The mapping `checkpointTreeRootCheckpointId(bytes32)` is the single source of truth: there is no array or count. Build the approved abandoned-root list from retained settlement events and rollback lineage evidence, not just the replaced tip. `revokeCheckpointTreeRoots(bytes32[])` zeroes each named nonzero root and is idempotent; it never re-enables finalization or claims. Use batches within the network gas limit. If the full recovery plan also abandons bridge subtree memberships, call `revokeKnownSubtreeRoots(bytes32[],bytes32[])` with the approved deposit and withdrawal subtree lists; it sets only those memberships false and does not change current roots or the clean flag. This narrow lineage-only repair must not invent bridge revocations.
 
    ```bash
-   COUNT=$(cast call "$STATE_MANAGER" 'finalizedRewardRootCount()(uint256)' \
-     --rpc-url "$L1_RPC_URL" --json | jq -er '.[0]')
-   if test "$COUNT" != 0; then
-     cast send "$STATE_MANAGER" 'revokeAbandonedRewardRoots(uint256)' "$COUNT" \
-       --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
-   fi
-   cast call "$STATE_MANAGER" 'rewardRootsClean()(bool)' \
-     --rpc-url "$L1_RPC_URL" --json | jq -e '.[0] == true or .[0] == "true"'
+   read -r -p 'Approved abandoned checkpoint roots JSON file: ' ABANDONED_ROOTS_FILE
+   ABANDONED_ROOTS=$(jq -cer 'select(type == "array") | select(all(.[]; type == "string" and test("^0x[0-9a-fA-F]{64}$") and . != "0x0000000000000000000000000000000000000000000000000000000000000000"))' "$ABANDONED_ROOTS_FILE")
+   cast send "$STATE_MANAGER" 'revokeCheckpointTreeRoots(bytes32[])' "$ABANDONED_ROOTS" \
+     --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
+   while IFS= read -r root; do
+     cast call "$STATE_MANAGER" 'checkpointTreeRootCheckpointId(bytes32)(uint64)' "$root" \
+       --rpc-url "$L1_RPC_URL" --json | jq -e '.[0] == 0 or .[0] == "0"'
+   done < <(jq -r '.[]' "$ABANDONED_ROOTS_FILE")
    cast call "$STATE_MANAGER" 'lastVerifiedCheckpointRoot()(bytes32)' \
      --rpc-url "$L1_RPC_URL" --json | jq -e --arg root "$NEW_ROOT" '.[0] == $root'
+   ```
+
+   Verify retained historical registrations and any revoked subtree memberships against the approved recovery plan. Only after **all** cleanup is complete, explicitly attest that the registry is clean. The flag does not validate the completeness of your list; re-enabling prematurely can admit stale roots. Empty registries also require this explicit acknowledgement. A no-op force-set leaves the flag unchanged. For governed deployments, encode and execute both revocation and acknowledgement through the timelock/Safe instead of sending directly from a non-admin signer.
+
+   The clean flag attests only to the operator's named list, not its completeness or ancestry. **Current withdrawal root warning:** Bridge accepts a proof matching `StateManager.withdrawalSubtreeRoot()` even when its `knownWithdrawalSubtreeRoots` membership is false (`psy-contracts/src/Bridge.sol:719-724`). Abandoning that current root requires an authorized repair of the state field as well as membership revocation; a mapping-only revocation is insufficient. `knownDepositSubtreeRoots` has no production reader and is audit state, not a deposit-acceptance gate. The governed subtree operation is `state-manager:revoke-known-subtree-roots --deposit-roots-json ... --withdrawal-roots-json ...`; both inputs accept JSON files or inline arrays.
+
+   ```bash
+   cast send "$STATE_MANAGER" 'setCheckpointTreeRootsClean(bool)' true \
+     --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
+   cast call "$STATE_MANAGER" 'checkpointTreeRootsClean()(bool)' \
+     --rpc-url "$L1_RPC_URL" --json | jq -e '.[0] == true or .[0] == "true"'
    ```
 
 4. Require the next **real settlement finalize** and a new `Finalized` event. `forceSetState` repairs continuity but **does not register the replacement root**; `finalize` registers its newly proved end root and advances the anchor (`psy-contracts/src/StateManager.sol:150-166,242-255`). A clean registry alone is not a recognized reward root (`client_prover/psy_prover/src/local/reward_client.rs:979-995`).
