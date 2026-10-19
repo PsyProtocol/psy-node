@@ -21,7 +21,7 @@
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
        l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, tx_hash
+       block_number, block_timestamp, tx_hash
 FROM "Deposit"
 WHERE shield_address = $1 AND chain_index = $2 AND chain_id = $3
 ORDER BY chain_local_deposit_index
@@ -35,7 +35,7 @@ LIMIT 100;
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
        l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, tx_hash
+       block_number, block_timestamp, tx_hash
 FROM "Deposit"
 WHERE shield_address = $1 AND chain_index = $2 AND chain_id = $3
   AND chain_local_deposit_index > $4
@@ -51,7 +51,7 @@ LIMIT 100;
 -- gate: report
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
        l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, tx_hash
+       block_number, block_timestamp, tx_hash
 FROM "Deposit"
 WHERE shield_address = $1 AND chain_index = $2 AND chain_id = $3
 ORDER BY chain_local_deposit_index
@@ -75,7 +75,7 @@ WHERE id = $1;
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
        l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number
+       block_number, block_timestamp
 FROM "Deposit"
 WHERE chain_index = $1 AND chain_id = $2 AND deposit_index = $3;
 
@@ -118,7 +118,7 @@ SELECT EXISTS (
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
        l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, tx_hash
+       block_number, block_timestamp, tx_hash
 FROM "Deposit"
 WHERE tx_hash = $1 AND chain_index = $2
 ORDER BY deposit_index DESC

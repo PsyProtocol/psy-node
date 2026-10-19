@@ -19,7 +19,7 @@ async function assertRejectedWithoutWrites(context, run, pattern) {
 
 test('a deposit writes its leaf and account stats next to Deposit and the tree', async () => {
   const context = makeContext();
-  await deposit(context, { ...SEPOLIA, index: 0, blockNumber: 42, shieldAddress: shield(1) });
+  await deposit(context, { ...SEPOLIA, index: 0, blockNumber: 42, blockTimestamp: 1716601728, shieldAddress: shield(1) });
 
   assert.deepEqual(context.DepositLeaf.rows.get('0-0'), {
     id: '0-0',
@@ -39,7 +39,9 @@ test('a deposit writes its leaf and account stats next to Deposit and the tree',
     last_chain_local_deposit_index: 0,
     last_block_number: 42,
   });
-  assert.equal(context.Deposit.rows.get('11155111-0').chain_local_deposit_index, 0);
+  const row = context.Deposit.rows.get('11155111-0');
+  assert.equal(row.chain_local_deposit_index, 0);
+  assert.equal(row.block_timestamp, 1716601728n);
   assert.equal(context.DepositTreeMeta.rows.get('0').last_count, 1);
 });
 
@@ -70,6 +72,7 @@ test('the tree, its root and Deposit rows are unchanged by the read model', asyn
     chain_index: 0,
     leaf_hash: '0x' + '44'.repeat(32),
     block_number: 104,
+    block_timestamp: 1716601728n,
     tx_hash: '0x' + 'ab'.repeat(32),
   });
 });

@@ -24,6 +24,7 @@ type Deposit @entity
   chain_index: Int!
   leaf_hash: String!
   block_number: Int!
+  block_timestamp: BigInt!          # L1 block time, Unix seconds
   tx_hash: String! @index
 }
 
