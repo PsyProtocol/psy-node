@@ -103,6 +103,31 @@ pub struct RollbackTempValueSnapshot {
     pub value: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackImtKeyIndexEntry {
+    pub tree_id: i64,
+    pub tree_sub_id: i64,
+    pub key_bucket: i16,
+    pub encoded_key: String,
+    #[serde(deserialize_with = "deserialize_imt_key_index_target")]
+    pub target: Option<RollbackImtKeyIndexRow>,
+}
+
+fn deserialize_imt_key_index_target<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<RollbackImtKeyIndexRow>, D::Error> {
+    Option::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackImtKeyIndexRow {
+    pub leaf_key: String,
+    pub birth_checkpoint: i64,
+    pub leaf_index: i64,
+}
+
 
 // Empty keys is a proved no-op; the phase is still required and the executor still calls the API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

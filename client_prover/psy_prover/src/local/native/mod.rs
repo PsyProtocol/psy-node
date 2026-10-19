@@ -452,14 +452,12 @@ mod multisig_rpc_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn multisig_public_requests_validate_accounts_policies_and_signatures() {
-        use plonky2::field::types::PrimeField64;
         use psy_vm::ups::multisig::{MultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
-        let mut members: Vec<_> = (1u8..=3).map(|byte| {
+        let members: Vec<_> = (1u8..=3).map(|byte| {
             let key = k256::ecdsa::SigningKey::from_slice(&[byte; 32]).unwrap();
             let signature = secp256k1_sign(key, QHashOut::<F>::from_values(1, 2, 3, 4)).unwrap();
             (hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(CompressedPublicKey(signature.public_key)), signature)
         }).collect();
-        members.sort_by_key(|(hash, _)| hash.0.elements.map(|limb| limb.to_canonical_u64()));
         let signatures = MultisigSignatures { member_indices: vec![0, 2], signatures: vec![members[0].1, members[2].1] };
         let mut member_hashes = [QHashOut::ZERO; 8];
         for (index, (hash, _)) in members.iter().enumerate() { member_hashes[index] = *hash; }

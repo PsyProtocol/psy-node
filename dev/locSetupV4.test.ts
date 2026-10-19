@@ -22,6 +22,10 @@ import {
     assertPreservedAnvilGenesis,
     anvilStateBestBlockNumber,
     localAnvilLaunchArgs,
+    isRepoAnvilProcess,
+    runTeardownCommand,
+    stopRepoAnvilsForPurge,
+    exactSnapshotNames,
     preservedAnvilGenesis,
     ROLLBACK_STOP_SENTINEL_CONTENT,
     ROLLBACK_STOP_SENTINEL_PATH,
@@ -457,7 +461,7 @@ describe("local Anvil persistence", () => {
             expect(plan.genesis?.block1ParentHash).toBe(ORIGINAL_GENESIS_HASH);
             expect(localAnvilLaunchArgs(8545, "31337", plan.statePath, plan.genesis)).toEqual([
                 "anvil", "--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337",
-                "--state", plan.statePath, "--state-interval", process.env.ANVIL_STATE_INTERVAL || "60", "--preserve-historical-states", "-vvvv",
+                "--state", plan.statePath, "--state-interval", (process.env.ANVIL_STATE_INTERVAL && /^\d+$/.test(process.env.ANVIL_STATE_INTERVAL) ? process.env.ANVIL_STATE_INTERVAL : "900"), "--preserve-historical-states", "-vvvv",
                 "--timestamp", (0x6acdc5den).toString(),
             ]);
             expect(localAnvilLaunchArgs(8545, "31337", plan.statePath)).not.toContain("--timestamp");
@@ -1822,3 +1826,205 @@ describe("make shutdown Anvil preservation", () => {
         }
     });
 });
+
+describe("purge Anvil ownership", () => {
+    const withExe = async (run: (exe: string, repo: string) => Promise<void>) => {
+        const dir = await mkdtemp(`${tmpdir()}/anvil-exe-`);
+        const repo = `${dir}/repo`;
+        await mkdir(repo);
+        const exe = `${dir}/anvil`;
+        await writeFile(exe, "");
+        await chmod(exe, 0o755);
+        try { await run(exe, repo); }
+        finally { await rm(dir, { recursive: true, force: true }); }
+    };
+    const identity = (cmdline: string, exe: string, cwd = path.join(path.dirname(exe), "repo")) => ({ exe, cwd, cmdline, starttime: "10" });
+
+    it("accepts host-before-port and equals flags for an expected state", async () => {
+        await withExe(async (exe, repo) => {
+            const state = `${repo}/db/anvil/state.json`;
+            expect(await isRepoAnvilProcess(identity(["anvil", "--host", "0.0.0.0", "--port", "8545", "--state", state].join("\0"), exe), repo)).toBe(true);
+            expect(await isRepoAnvilProcess(identity(["anvil", `--state=${state}`, "--port=8545"].join("\0"), exe), repo)).toBe(true);
+        });
+    });
+
+    it("defaults the state interval to 900 and rejects non-positive values", () => {
+        const previous = process.env.ANVIL_STATE_INTERVAL;
+        try {
+            delete process.env.ANVIL_STATE_INTERVAL;
+            expect(localAnvilLaunchArgs(8545, "31337", "db/anvil/state.json")).toContain("900");
+            for (const invalid of ["0", "-1", "1.5", "abc", " 900"]) {
+                process.env.ANVIL_STATE_INTERVAL = invalid;
+                expect(() => localAnvilLaunchArgs(8545, "31337", "db/anvil/state.json")).toThrow("positive integer");
+            }
+        } finally {
+            if (previous === undefined) delete process.env.ANVIL_STATE_INTERVAL;
+            else process.env.ANVIL_STATE_INTERVAL = previous;
+        }
+    });
+
+    it("rejects foreign cwd, foreign state, duplicate flags, and a symlink that leaves the checkout", async () => {
+        const dir = await mkdtemp(`${tmpdir()}/purge-anvil-`);
+        const checkout = `${dir}/repo`;
+        const repo = checkout;
+        const exe = `${dir}/anvil`;
+        const outside = `${dir}/outside.json`;
+        const link = `${checkout}/db/anvil/state.json`;
+        await mkdir(`${checkout}/db/anvil`, { recursive: true });
+        await writeFile(exe, "");
+        await chmod(exe, 0o755);
+        await writeFile(outside, "{}");
+        await symlink(outside, link);
+        try {
+            expect(await isRepoAnvilProcess(identity(["anvil", "--port", "8545", "--state", `${repo}/db/anvil/state.json`].join("\0"), exe, "/tmp/other-repo"), repo)).toBe(false);
+            expect(await isRepoAnvilProcess(identity(["anvil", "--port", "8545", "--state", "/tmp/other/state.json"].join("\0"), exe), repo)).toBe(false);
+            expect(await isRepoAnvilProcess(identity(["anvil", "--port", "8545", "--port", "9545", "--state", `${repo}/db/anvil/state.json`].join("\0"), exe), repo)).toBe(false);
+            expect(await isRepoAnvilProcess(identity(["anvil", "--port", "8545", "--state", `${repo}/db/anvil/state.json`, "--state", `${repo}/db/anvil/localhostBsc/state.json`].join("\0"), exe), repo)).toBe(false);
+            expect(await isRepoAnvilProcess(identity(["anvil", "--port", "8545", "--state", link].join("\0"), exe, checkout), checkout)).toBe(false);
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("accepts an absent snapshot whose canonical ancestor stays inside the checkout", async () => {
+        await withExe(async (exe, repo) => {
+            const missing = `${repo}/db/anvil/not-yet-written-state.json`;
+            expect(await isRepoAnvilProcess(identity(["anvil", "--port", "8545", "--state", `${repo}/db/anvil/state.json`].join("\0"), exe), repo)).toBe(true);
+            expect(await isRepoAnvilProcess(identity(["anvil", "--port", "8545", "--state", missing].join("\0"), exe), repo)).toBe(false);
+        });
+    });
+
+    it("signals only the owned pid and refuses a reused starttime", async () => {
+        await withExe(async (exe, repo) => {
+            const state = `${repo}/db/anvil/state.json`;
+            const owned = identity(["anvil", "--port", "8545", "--state", state].join("\0"), exe);
+            const foreign = identity(["anvil", "--port", "8545", "--state", "/tmp/other/state.json"].join("\0"), exe, "/tmp/other");
+            const signals: Array<[number, string]> = [];
+            const alive = new Set([11, 22]);
+            await expect(stopRepoAnvilsForPurge(repo, {
+                listPids: async () => [11, 22, process.pid],
+                readIdentity: async (pid) => pid === 11 ? owned : pid === 22 ? foreign : null,
+                signal: (pid, sig) => { signals.push([pid, sig]); alive.delete(pid); },
+                alive: (pid) => alive.has(pid),
+                portOpen: async () => false,
+            })).resolves.toBeUndefined();
+            expect(signals).toEqual([[11, "SIGTERM"]]);
+
+            let reads = 0;
+            await expect(stopRepoAnvilsForPurge(repo, {
+                listPids: async () => [11],
+                readIdentity: async () => {
+                    reads += 1;
+                    return { ...owned, starttime: reads < 3 ? "10" : "99" };
+                },
+                signal: () => { throw new Error("must not signal a reused pid"); },
+                alive: () => false,
+                portOpen: async () => false,
+            })).rejects.toThrow("reused before SIGTERM");
+        });
+    });
+
+    it("fails while a foreign Anvil port stays open and does not signal it", async () => {
+        await withExe(async (_exe, repo) => {
+            const signals: number[] = [];
+            await expect(stopRepoAnvilsForPurge(repo, {
+                listPids: async () => [],
+                readIdentity: async () => null,
+                signal: (pid) => { signals.push(pid); },
+                alive: () => true,
+                portOpen: async (port) => port === 8545,
+            })).rejects.toThrow("still live port 8545");
+            expect(signals).toEqual([]);
+        });
+    });
+
+    it("kills and reaps a harmless timeout child and returns failure", async () => {
+        const result = await runTeardownCommand(["sleep", "30"], undefined, 200);
+        expect(result.timedOut).toBe(true);
+        expect(result.code).toBeNull();
+        expect(result.argv0).toBe("sleep");
+    });
+
+    it("times out and kills a descendant retaining stdout after its leader exits", async () => {
+        // Real kernel pipe EOF and orphan reaping cannot be driven by fake timers.
+        const started = Date.now();
+        const result = await runTeardownCommand(["sh", "-c", "sleep 30 & echo $!"], undefined, 200);
+        expect(result.timedOut).toBe(true);
+        expect(result.stdoutComplete).toBe(false);
+        expect(Date.now() - started).toBeLessThan(2_000);
+        const pid = Number(result.stdout);
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+        // Orphans may briefly remain as zombies until the host's init reaps them.
+        const deadline = Date.now() + 1_000;
+        let running = true;
+        while (running && Date.now() < deadline) {
+            try {
+                const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+                running = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] !== "Z";
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                running = false;
+            }
+            if (running) await Bun.sleep(10);
+        }
+        expect(running).toBe(false);
+    });
+
+    it("never treats truncated stdout as a complete listing", async () => {
+        const result = await runTeardownCommand([process.execPath, "-e", "process.stdout.write('x'.repeat(70000))"], undefined, 2_000);
+        expect(result.code).toBe(0);
+        expect(result.timedOut).toBe(false);
+        expect(result.stdout.length).toBe(65_536);
+        expect(result.stdoutComplete).toBe(false);
+    });
+
+    it("stops an owned fixture child before a hanging docker command and keeps the aggregate failing", async () => {
+        await withExe(async (exe, repo) => {
+            const child = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+            let exited = false;
+            const reaped = child.exited.then(() => { exited = true; });
+            const signals: number[] = [];
+            const order: string[] = [];
+            try {
+                await stopRepoAnvilsForPurge(repo, {
+                    listPids: async () => [child.pid],
+                    readIdentity: async () => identity(["anvil", "--port", "8545", "--state", `${repo}/db/anvil/state.json`].join("\0"), exe),
+                    signal: (pid, sig) => {
+                        order.push(sig);
+                        signals.push(pid);
+                        if (sig === "SIGTERM") child.kill("SIGTERM");
+                    },
+                    alive: () => !exited,
+                    portOpen: async () => false,
+                });
+                expect(exited).toBe(true);
+                await reaped;
+                order.push("anvil-gone");
+                const hung = await runTeardownCommand(["sleep", "30"], undefined, 200);
+                order.push("docker");
+                const failures = [hung.timedOut ? "docker timed out" : ""].filter((entry) => entry.length > 0);
+                expect(failures).toEqual(["docker timed out"]);
+                expect(order[0]).toBe("SIGTERM");
+                expect(order.indexOf("anvil-gone")).toBeLessThan(order.indexOf("docker"));
+                expect(signals).toEqual([child.pid]);
+            } finally {
+                try { child.kill("SIGKILL"); } catch { /* already reaped */ }
+                await child.exited;
+            }
+        });
+    });
+
+    it("treats a missing docker object as absent and a daemon error or leftover as failure", () => {
+        const names = exactSnapshotNames("valkey-server\n\npsy-devnet-redis\n");
+        expect(names.has("scylla-server")).toBe(false);
+        expect(names.has("psy-devnet-redis")).toBe(true);
+        const missing = { code: 0, timedOut: false };
+        const daemon = { code: 1, timedOut: false };
+        const timed = { code: null, timedOut: true };
+        expect(missing.code === 0 && !names.has("scylla-server")).toBe(true);
+        expect(daemon.code !== 0 || daemon.timedOut).toBe(true);
+        expect(timed.code !== 0 || timed.timedOut).toBe(true);
+        expect(names.has("valkey-server")).toBe(true);
+    });
+});
+

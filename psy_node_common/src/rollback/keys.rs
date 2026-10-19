@@ -247,16 +247,6 @@ pub fn public_key_hash_user_pairs(
     Ok(pairs)
 }
 
-pub fn imt_key_index_keys(
-    backups: &BackupKeySource,
-    role: RollbackRole,
-) -> anyhow::Result<Vec<ImtKeyIndexKey>> {
-    if role != RollbackRole::Realm {
-        return Ok(Vec::new());
-    }
-    Ok(backups.realm_end_cap.values().flat_map(|backup| backup.imt_key_index_keys.clone()).collect())
-}
-
 pub fn global_user_tree_keys(
     backups: &BackupKeySource,
     role: RollbackRole,
@@ -529,6 +519,7 @@ mod tests {
         async fn proc_id_for_pending(&self, id: u64) -> anyhow::Result<Option<u128>> { Ok(self.pending_to_proc.get(&id).copied()) }
         async fn root_for_checkpoint(&self, _id: u64) -> anyhow::Result<Option<[u8; 32]>> { Ok(None) }
         async fn imt_leaf_at_target(&self, _tree_id: i64, _tree_sub_id: i64, _leaf_index: i64, _target_checkpoint_id: i64) -> anyhow::Result<bool> { Ok(false) }
+        async fn imt_leaf_birth(&self, _tree: i64, _sub: i64, _index: i64, _target: i64) -> anyhow::Result<Option<(i64, Vec<u8>)>> { Ok(None) }
         async fn imt_next_append_index(&self, _tree_id: i64, _tree_sub_id: i64) -> anyhow::Result<Option<i64>> { Ok(None) }
         async fn global_checkpoint_tree_delete_path_keys(&self, _checkpoint_id: u64) -> anyhow::Result<Vec<MerkleNodeKey>> { Ok(Vec::new()) }
     }

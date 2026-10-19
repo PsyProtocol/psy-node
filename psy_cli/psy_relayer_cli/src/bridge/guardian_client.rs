@@ -458,16 +458,15 @@ mod tests {
 
     #[test]
     fn collector_requires_two_distinct_authorized_signatures_on_same_message() {
-        use plonky2::{field::types::PrimeField64, hash::poseidon::PoseidonPermutation};
+        use plonky2::hash::poseidon::PoseidonPermutation;
         use psy_client_common::data::secp256k1::CompressedPublicKey;
         use psy_crypto::signature::secp256k1::wallet::{hash_no_pad_compressed_public_key, secp256k1_sign};
         let sighash = QHashOut::from_values(1, 2, 3, 4);
-        let mut members: Vec<_> = (1u8..=3).map(|byte| {
+        let members: Vec<_> = (1u8..=3).map(|byte| {
             let signature = secp256k1_sign(k256::ecdsa::SigningKey::from_slice(&[byte; 32]).unwrap(), sighash).unwrap();
             let hash = hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(CompressedPublicKey(signature.public_key));
             (hash, signature)
         }).collect();
-        members.sort_by_key(|member| member.0.0.elements.map(|field| field.to_canonical_u64()));
         let mut policy = MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes: [QHashOut::ZERO; 8] };
         for (index, member) in members.iter().enumerate() { policy.member_hashes[index] = member.0; }
         assert!(select_signatures(&mut [(0, members[0].1)], &policy, sighash).is_none());

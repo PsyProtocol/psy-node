@@ -176,7 +176,7 @@ PSY_SKIP_BUILD=1 \
 make run-all
 ```
 
-`PURGE=1 make shutdown` removes checkpoints, `db/anvil/state.json`, logs, local deployments, and devnet Docker volumes; bare `make shutdown` is identical because purge is the Make default. A fresh chain is `PURGE=1 make shutdown` followed by `make run-all`. Never delete only Scylla, the Anvil state, deployments, or `local_checkpoints/`; retained components would describe different chains.
+`PURGE=1 make shutdown` removes checkpoints, Anvil state under `db/anvil`, logs, and deployments only after the Anvil, Docker, and known-application cleanup gates succeed. Docker cleanup is attempted after Anvil shutdown, even if that shutdown fails; failure blocks file deletion and startup. Docker commands and listings are bounded, and failed or incomplete listings cannot prove absence. Any timeout or targeted leftover is a nonzero failure. The application gate covers known command patterns and a fixed port subset, not all sockets: Realm 13380–14679, proxy 9999–10008, guardians 15441–15443, and history 15450 are not individually probed (see [launcher teardown guarantees](devnet-launcher-reference.md#13-teardown-and-purge)). Bare `make shutdown` is identical because purge is the Make default. A fresh chain is `PURGE=1 make shutdown` followed by `make run-all`. Never delete only Scylla, Anvil state, deployments, or `local_checkpoints/`; retained components would describe different chains. `PURGE=0 make shutdown` does not fall through into purge when preservation fails.
 
 `make run-all` stays in the foreground. Run it in a dedicated terminal or tmux pane. Do not background it with `&`.
 
@@ -224,7 +224,7 @@ make restart
 
 `make restart` sends a command to the existing supervisor. It stops and recreates processors, edges, workers, proof services, APIs, indexers, relayer, and UIs from their recorded commands. The original Anvil process, database launcher, Scylla, Redis, NATS, Nostr, Envio containers, checkpoints, and logs remain active. Contract deployment and Envio storage initialization are not rerun.
 
-Anvil continuously saves the local L1 chain to `db/anvil/state.json`. A non-purge shutdown (`PURGE=0 make shutdown`) followed by `make run-all` loads that exact L1 state and reuses `psy-contracts/deployments/localhost/deployed-contracts.json`. The state and deployment must exist together; mismatch fails with an instruction to run `PURGE=1 make shutdown` then `make run-all`.
+Anvil periodically saves each local L1 chain (`db/anvil/state.json`, plus `db/anvil/localhostBsc/state.json` and `db/anvil/localhostBase/state.json`). `ANVIL_STATE_INTERVAL` sets that period in seconds and must be a positive integer; the launcher default is 900. A non-purge shutdown (`PURGE=0 make shutdown`) followed by `make run-all` loads that exact L1 state and reuses the matching deployment summary. The state and deployment must exist together; mismatch fails with an instruction to run `PURGE=1 make shutdown` then `make run-all`.
 
 `PURGE=0 make shutdown` is a full process teardown that preserves the paired Anvil state, L2 databases, checkpoints, and deployments. A later `make run-all` restores the same chain. Bare `make shutdown` purges by default and deletes that state; use it only when a fresh chain is intended. For a complete fresh restart use:
 

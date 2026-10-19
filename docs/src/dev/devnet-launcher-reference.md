@@ -404,7 +404,7 @@ a missing UI only when its dependencies are already present and SDK rebuild does
 | Realm workers          | `psy_worker_cli worker`                                                               | Worker-start marker; all selected worker promises are awaited.                              | `dev/locSetupV4.ts:4250-4342`                                  |
 | Dummy provers          | `dev/dummy_prover.sh`                                                                 | Dummy-prover marker; start in parallel after Realm workers.                                 | `dev/locSetupV4.ts:4343-4360`                                  |
 | Prove proxy            | `psy_user_cli prove-proxy --role all`                                                 | Spawned after genesis prep; TCP `9999 + index` (600 x 1s, 1500ms connect) completes before Coordinator processor. Faucet and relayer still await the same gate. | `dev/locSetupV4.ts` (`waitForProveProxy`) |
-| Anvil                  | `anvil ... --state db/anvil/state.json --state-interval <ANVIL_STATE_INTERVAL\|\|60>` | `Listening on`, then HTTP Layer 1 probe, preserved genesis check, then `anvil_setIntervalMining([1])` on each launcher-managed chain. | `dev/locSetupV4.ts` (`l1StartedDetector`, `assertPreservedAnvilGenesis`, `setLocalAnvilIntervalMining`) |
+| Anvil                  | `anvil ... --state db/anvil/state.json --state-interval <ANVIL_STATE_INTERVAL\|\|900>` | `Listening on`, then HTTP Layer 1 probe, preserved genesis check, then `anvil_setIntervalMining([1])` on each launcher-managed chain. | `dev/locSetupV4.ts` (`l1StartedDetector`, `assertPreservedAnvilGenesis`, `setLocalAnvilIntervalMining`) |
 | Envio backing services | Generated Docker Compose                                                              | Postgres TCP 5433, SQL `select 1`, Hasura `/healthz`.                                       | `dev/locSetupV4.ts:3338-3364`                                  |
 | Envio indexer          | `pnpm start`                                                                          | Outer setup requires TCP 9898.                                                              | `dev/locSetupV4.ts:3363-3376`; `dev/locSetupV4.ts:4478-4492`   |
 | psy-services           | `psy-services --disable-auth`                                                         | Start marker, then `http://127.0.0.1:3000/health`.                                          | `dev/locSetupV4.ts:4545-4575`                                  |
@@ -486,13 +486,7 @@ Redis/Valkey, NATS, and Nostr and the Scylla set to Scylla (`dev/locSetupV4.ts:6
 
 ## 10. Anvil Persistence and Restart Recovery
 
-Anvil state is exactly `db/anvil/state.json`; Anvil receives `--state` with that path and
-`--state-interval ${ANVIL_STATE_INTERVAL:-60}`, so it loads an existing snapshot and writes
-updates every `ANVIL_STATE_INTERVAL` seconds, default 60 (anvil's own default;
-`dev/locSetupV4.ts:2954`; `dev/locSetupV4.ts:4448-4460`). Earlier launches hardcoded 1s; with a
-multi-GB accumulated state each dump outruns the interval, the write loop saturates the disk,
-and the RPC event loop starves (observed: 10.7GB state at ~4500 blocks). Raise
-`ANVIL_STATE_INTERVAL` on long-lived devnets if RPC latency grows.
+Anvil state is exactly `db/anvil/state.json` (BSC and Base use `db/anvil/localhostBsc/state.json` and `db/anvil/localhostBase/state.json`). Anvil receives `--state` with that path and `--state-interval` from `ANVIL_STATE_INTERVAL`. Unset or empty selects the launcher default of 900 seconds; a supplied nonempty value must be a positive integer. Zero, negative, fractional, or non-numeric values fail startup. This only slows future periodic dumps. It does not shrink an existing snapshot or proof memory.
 
 Do NOT pass `--steps-tracing`: it records full execution traces per block into the state dump
 (~21MB/block; 20GB within ~1000 blocks on a fresh chain) until the periodic write starves the
@@ -578,23 +572,21 @@ for supervised restart so they rebuild infrastructure connections (`dev/locSetup
 `make shutdown` invokes `--teardown --purge` by default: the Makefile sets `PURGE ?= 1` and the target adds `--purge`
 unless an explicit `PURGE=0` limits it to bare `--teardown`; `PURGE=1 make shutdown` remains valid and is identical to
 the default. Bare launcher `--teardown` stays non-purge regardless of the Make default. A fresh chain is
-`PURGE=1 make shutdown` then `make run-all` (`Makefile:16`; `Makefile:99-103`). Direct teardown executes
-this sequence (`dev/locSetupV4.ts:3402-3468`):
+`PURGE=1 make shutdown` then `make run-all` (`Makefile:16`; `Makefile:99-103`). Direct teardown executes this sequence (`dev/locSetupV4.ts` `teardownDevnet`):
 
 ```text
-1. Kill known command patterns.
-2. Stop/remove known Redis/Valkey, NATS, Scylla, and Nostr containers.
-3. Bring generated Envio Compose down; add volume deletion only for purge.
-4. Kill listeners on the fixed known port set.
-5. For purge only, delete checkpoints, db/anvil, logs, deployment directories,
-   Envio volumes, and named Redis/Scylla/NATS volumes.
+1. Kill known command patterns, excluding Anvil argv. The teardown process and its ancestors are not Anvil targets.
+2. Non-purge only: stop/remove known Redis/Valkey, NATS, Scylla, and Nostr containers,
+   bring generated Envio Compose down without deleting volumes, then kill listeners on the fixed port set.
+   Anvil ports 8545, 9545, and 10545 are not in that generic kill list.
+3. Purge only: stop Anvil processes whose /proc exe basename, canonical cwd, --state, and --port match this checkout, re-reading starttime before SIGTERM and SIGKILL. A foreign listener on an Anvil port fails the purge and is not killed. Attempt this before Docker cleanup; independent cleanup continues after failure, but file deletion stays blocked.
+4. Docker commands and process listings have a 15-second deadline covering exit and pipe EOF, followed by at most one second for reap after process-group cancellation. Infrastructure containers/volumes are removed directly before Compose removes its own stack. Failed, timed-out, truncated, or unreadable listings never prove absence. Failures remain aggregated.
+5. Path deletion requires successful Anvil, Docker, and known-application gates. Success additionally requires absent purge paths. Failure exits nonzero and does not start the stack.
 ```
 
-Non-purge teardown preserves `local_checkpoints`, `db/anvil/state.json`, deployment summaries, logs, Envio volumes, and
-named infrastructure volumes, although it stops the running processes and containers
-(`dev/locSetupV4.ts:3450-3468`). Purge deletes `local_checkpoints`, the complete `db/anvil` directory, logs, localhost,
-Sepolia, and Ethereum deployment directories, generated Envio volumes, and named Redis/Scylla/NATS volumes
-(`dev/locSetupV4.ts:3394-3399`; `dev/locSetupV4.ts:3458-3466`).
+The application gate checks known command patterns plus loopback TCP ports 1337–1346, 3000, 5433, 8080, 8081, 9898, 9998, and 5174–5179. It is not an exhaustive socket census: Realm ports 13380–14679, proxy ports 9999–10008, guardian ports 15441–15443, and history port 15450 are not individually probed by purge. Their normal launcher processes are covered only where they match the known command patterns. Custom listeners or renamed writers are outside this postcondition; success does not certify that every application port is closed.
+
+Non-purge teardown still preserves `local_checkpoints`, Anvil snapshots, deployment summaries, logs, Envio volumes, and named infrastructure volumes. It does not fall through into purge after a preservation failure. Purge deletes `local_checkpoints`, the complete `db/anvil` directory, logs, localhost, localhostBsc, localhostBase, Sepolia, and Ethereum deployment directories, generated Envio volumes, and named Redis/Scylla/NATS volumes.
 
 ## 14. Daemonized Path Differences
 
@@ -745,7 +737,7 @@ These are limitations of the current source, not supported command examples.
    `dev/locSetupV4.ts:4923-5160`).
 8. Daemonized Realm P2P uses a separate public-only runtime config: processor and edge public multiaddresses name the
    corresponding Compose DNS services, while each container listens on `/ip4/0.0.0.0/tcp/...`.
-9. Teardown uses fixed process patterns and port ranges rather than the actual launch plan; a hypothetical custom Anvil port is absent from the fixed listener list (`dev/locSetupV4.ts:3422-3470`). Mode A port 5179 is included in `killKnownPorts` and matched by `psy-dapp/mode-a-web-wallet-bridge` plus `vite.js --host 0.0.0.0 --port 5179`.
+9. Non-purge teardown uses fixed process patterns and port ranges rather than the actual launch plan. Anvil ports are not in `killKnownPorts`; purge matches only this checkout's Anvil processes. Mode A port 5179 is included in `killKnownPorts` and matched by `psy-dapp/mode-a-web-wallet-bridge` plus `vite.js --host 0.0.0.0 --port 5179`.
 10. Startup purge with `--purge` performs the full paired teardown (processes, containers, checkpoints, Anvil state,
     deployments, volumes) before auto-setup; it is equivalent to `PURGE=1 make shutdown` followed by `make run-all`
     (`dev/locSetupV4.ts:5693-5698`; `dev/locSetupV4.ts:3472-3492`).

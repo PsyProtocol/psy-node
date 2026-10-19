@@ -1052,6 +1052,17 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
     ) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>> {
         table.select_leaf(&self.session, tree_id, tree_sub_id, leaf_index, max_checkpoint_id).await
     }
+
+    async fn db_select_imt_leaf_birth(
+        &self,
+        table: &ScyllaIMTLeafPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        max_checkpoint_id: i64,
+    ) -> anyhow::Result<Option<(i64, Vec<u8>)>> {
+        table.select_leaf_birth(&self.session, tree_id, tree_sub_id, leaf_index, max_checkpoint_id).await
+    }
 }
 
 #[async_trait]

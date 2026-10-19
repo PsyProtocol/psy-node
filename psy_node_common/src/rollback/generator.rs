@@ -21,7 +21,7 @@ use crate::{
     realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_end_cap_gatherer_backup_file},
     rollback::{
         keys::{self, MerkleNodeKey, TempFieldKey, UserTransformParams},
-        plan::{RollbackIds, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackSnapshot, RollbackTempValueSnapshot, TargetContractState},
+        plan::{RollbackIds, RollbackImtKeyIndexEntry, RollbackImtKeyIndexRow, RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackSnapshot, RollbackTempValueSnapshot, TargetContractState},
     },
 };
 
@@ -38,6 +38,13 @@ pub trait RollbackStateReader: Send + Sync {
         leaf_index: i64,
         target_checkpoint_id: i64,
     ) -> anyhow::Result<bool>;
+    async fn imt_leaf_birth(
+        &self,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        target_checkpoint_id: i64,
+    ) -> anyhow::Result<Option<(i64, Vec<u8>)>>;
     async fn imt_next_append_index(
         &self,
         tree_id: i64,
@@ -333,7 +340,7 @@ pub fn api_for_table(table: &str) -> &'static str {
         "pending_id_to_pending_proc_id_table" => "db_delete_many_u64_u128_pairs",
         "public_key_hash_to_user_ids_table" => "db_delete_many_hash_user_pairs",
         "guta_reward_tag_tree_table" => "db_delete_many_pending_id_partitions",
-        "imt_key_index_table" => "db_delete_many_imt_keys",
+        "imt_key_index_table" => "set_imt_key_index",
         "global_user_tree_table" | "global_checkpoint_tree_table" | "user_registration_tree_table" | "global_contract_tree_table" => "db_delete_many_merkle_nodes",
         "user_contract_tree_table" | "contract_function_tree_table" => "db_delete_many_tree_merkle_nodes",
         "contract_state_tree_table" => "db_delete_many_tree_subtree_merkle_nodes",
@@ -522,13 +529,8 @@ pub async fn build_phases(
         serde_json::Value::Array(partition_keys),
     ));
 
-    // Match the unversioned key-index writer: new keys and zero-key/zero-value sentinels.
-    let imt_key_keys = keys::imt_key_index_keys(backups, role)?;
-    let ik: Vec<_> = imt_key_keys
-        .iter()
-        .map(|k| json!([k.tree_id, k.tree_sub_id, k.key_bucket, hex::encode(&k.encoded_key)]))
-        .collect();
-    phases.push(pending_phase("imt_key_index_table", serde_json::Value::Array(ik)));
+    let imt_keys = derive_imt_key_index_entries(backups, role, plan.target_checkpoint_id, state_reader).await?;
+    phases.push(pending_phase("imt_key_index_table", serde_json::to_value(imt_keys)?));
 
     phases.push(pending_phase(
         "checkpoint_leaf_to_checkpoint_id_table",
@@ -899,13 +901,66 @@ fn materialize_imt_key_index_keys<N: QNetworkTypesConfig>(ffs: &[u8]) -> anyhow:
         let encoded_key = encode_imt_key_for_sorting::<N::F, N::QHash>(&hash);
         let key_bucket = imt_key_bucket_to_i16(u16::from_be_bytes([encoded_key[0], encoded_key[1]]));
         keys.push(keys::ImtKeyIndexKey {
-            tree_id: tree_id as i64,
-            tree_sub_id: tree_sub_id as i64,
+            tree_id: i64::try_from(tree_id)?,
+            tree_sub_id: i64::try_from(tree_sub_id)?,
             key_bucket,
             encoded_key: encoded_key.to_vec(),
         });
     }
     Ok(keys)
+}
+
+async fn derive_imt_key_index_entries(
+    backups: &BackupKeySource,
+    role: RollbackRole,
+    target_checkpoint_id: u64,
+    reader: &dyn RollbackStateReader,
+) -> anyhow::Result<Vec<RollbackImtKeyIndexEntry>> {
+    if role != RollbackRole::Realm {
+        return Ok(Vec::new());
+    }
+    let target = i64::try_from(target_checkpoint_id)?;
+    // Collect identities first so repeated sentinel writes issue only one history query.
+    let mut writes = BTreeMap::new();
+    for backup in backups.realm_end_cap.values() {
+        let ffs = &backup.update_contract_state_imt_leaves_ffs;
+        anyhow::ensure!(ffs.len() % IMT_LEAF_FFS_ENTRY_SIZE_V2 == 0, "invalid IMT leaf FFS length");
+        let mut keys = backup.imt_key_index_keys.iter();
+        for bytes in ffs.chunks_exact(IMT_LEAF_FFS_ENTRY_SIZE_V2) {
+            let (tree, sub, index, _, leaf_key, leaf_value, _, _, is_new) = deserialize_imt_leaf_ffs_entry_v2(bytes)?;
+            if !has_imt_key_index_row(is_new, &leaf_key, &leaf_value) {
+                continue;
+            }
+            let key = keys.next().context("missing materialized IMT key-index key")?;
+            let tree = i64::try_from(tree)?;
+            let sub = i64::try_from(sub)?;
+            let index = i64::try_from(index)?;
+            anyhow::ensure!((key.tree_id, key.tree_sub_id) == (tree, sub), "IMT key-index coordinates differ from FFS");
+            let physical = (tree, sub, key.key_bucket, hex::encode(&key.encoded_key));
+            let write = (index, leaf_key, is_new, !is_new);
+            let previous = writes.entry(physical).or_insert(write);
+            anyhow::ensure!(previous.0 == index && previous.1 == leaf_key, "conflicting IMT key-index writes for physical key");
+            previous.2 |= is_new;
+            previous.3 |= !is_new;
+        }
+        anyhow::ensure!(keys.next().is_none(), "extra materialized IMT key-index key");
+    }
+    let mut entries = Vec::with_capacity(writes.len());
+    for ((tree_id, tree_sub_id, key_bucket, encoded_key), (leaf_index, leaf_key, is_new, has_sentinel)) in writes {
+        let row = if !has_sentinel {
+            None
+        } else {
+            reader.imt_leaf_birth(tree_id, tree_sub_id, leaf_index, target).await?
+                .map(|(birth_checkpoint, historical_key)| {
+                    anyhow::ensure!(!is_new, "new IMT key overlaps retained sentinel history");
+                    anyhow::ensure!(historical_key == leaf_key, "IMT sentinel birth history has a different leaf key");
+                    anyhow::ensure!((0..=target).contains(&birth_checkpoint), "IMT sentinel birth is outside target history");
+                    Ok::<_, anyhow::Error>(RollbackImtKeyIndexRow { leaf_key: hex::encode(leaf_key), birth_checkpoint, leaf_index })
+                }).transpose()?
+        };
+        entries.push(RollbackImtKeyIndexEntry { tree_id, tree_sub_id, key_bucket, encoded_key, target: row });
+    }
+    Ok(entries)
 }
 
 async fn collect_global_checkpoint_tree_delete_path_keys(
@@ -1195,6 +1250,10 @@ mod tests {
         async fn imt_leaf_at_target(&self, tree_id: i64, tree_sub_id: i64, leaf_index: i64, target_checkpoint_id: i64) -> anyhow::Result<bool> {
             Ok(self.leaves.contains(&(tree_id, tree_sub_id, leaf_index, target_checkpoint_id)))
         }
+        async fn imt_leaf_birth(&self, tree: i64, sub: i64, index: i64, target: i64) -> anyhow::Result<Option<(i64, Vec<u8>)>> {
+            Ok(self.leaves.iter().filter(|&&(t, s, i, cp)| (t, s, i) == (tree, sub, index) && cp <= target)
+                .map(|&(_, _, _, cp)| cp).min().map(|cp| (cp, vec![0; 32])))
+        }
         async fn imt_next_append_index(&self, tree_id: i64, tree_sub_id: i64) -> anyhow::Result<Option<i64>> {
             Ok(((tree_id, tree_sub_id) == (7, 9)).then_some(11))
         }
@@ -1473,6 +1532,63 @@ mod tests {
         entry[88..120].copy_from_slice(&leaf_value);
         entry[160] = u8::from(is_new_key);
         entry
+    }
+
+    struct BirthReader {
+        history: Option<(i64, Vec<u8>)>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RollbackStateReader for BirthReader {
+        async fn pending_id_for_checkpoint(&self, _: u64) -> anyhow::Result<Option<u64>> { unreachable!() }
+        async fn checkpoint_id_for_pending(&self, _: u64) -> anyhow::Result<Option<u64>> { unreachable!() }
+        async fn proc_id_for_pending(&self, _: u64) -> anyhow::Result<Option<u128>> { unreachable!() }
+        async fn root_for_checkpoint(&self, _: u64) -> anyhow::Result<Option<[u8;32]>> { unreachable!() }
+        async fn imt_leaf_at_target(&self, _: i64, _: i64, _: i64, _: i64) -> anyhow::Result<bool> { unreachable!() }
+        async fn imt_next_append_index(&self, _: i64, _: i64) -> anyhow::Result<Option<i64>> { unreachable!() }
+        async fn global_checkpoint_tree_delete_path_keys(&self, _: u64) -> anyhow::Result<Vec<MerkleNodeKey>> { unreachable!() }
+        async fn imt_leaf_birth(&self, tree: i64, sub: i64, index: i64, target: i64) -> anyhow::Result<Option<(i64, Vec<u8>)>> {
+            assert_eq!((tree, sub, index, target), (7, 9, 10, 10));
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.history.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn sentinel_restores_original_birth_once_per_physical_key() {
+        let sentinel = imt_entry(7, 9, 10, [0;32], [0;32], false);
+        let mut ffs = sentinel.clone();
+        ffs.extend(sentinel.clone());
+        ffs.extend(imt_entry(7, 9, 12, [1;32], [1;32], true));
+        let mut backups = imt_backups(&[(11, ffs), (12, sentinel)]);
+        for backup in backups.realm_end_cap.values_mut() {
+            backup.imt_key_index_keys = backup.update_contract_state_imt_leaves_ffs.chunks_exact(IMT_LEAF_FFS_ENTRY_SIZE_V2).map(|bytes| {
+                let (_, _, _, _, mut key, _, _, _, _) = deserialize_imt_leaf_ffs_entry_v2(bytes).unwrap();
+                key.reverse();
+                keys::ImtKeyIndexKey { tree_id: 7, tree_sub_id: 9, key_bucket: imt_key_bucket_to_i16(u16::from_be_bytes([key[0], key[1]])), encoded_key: key.to_vec() }
+            }).collect();
+        }
+        let reader = BirthReader { history: Some((3, vec![0;32])), calls: 0.into() };
+        let entries = derive_imt_key_index_entries(&backups, RollbackRole::Realm, 10, &reader).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].target, Some(RollbackImtKeyIndexRow { leaf_key: "00".repeat(32), birth_checkpoint: 3, leaf_index: 10 }));
+        assert_eq!(entries[1].target, None);
+        assert_eq!(reader.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let absent = BirthReader { history: None, calls: 0.into() };
+        assert!(derive_imt_key_index_entries(&backups, RollbackRole::Realm, 10, &absent).await.unwrap().iter().all(|entry| entry.target.is_none()));
+        assert_eq!(absent.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for history in [(3, vec![1;32]), (11, vec![0;32]), (-1, vec![0;32])] {
+            let invalid = BirthReader { history: Some(history), calls: 0.into() };
+            assert!(derive_imt_key_index_entries(&backups, RollbackRole::Realm, 10, &invalid).await.is_err());
+        }
+        backups.realm_end_cap.get_mut(&12).unwrap().update_contract_state_imt_leaves_ffs[160] = 1;
+        assert!(derive_imt_key_index_entries(&backups, RollbackRole::Realm, 10, &reader).await.is_err(), "a new key cannot overlap retained sentinel history");
+        assert!(derive_imt_key_index_entries(&backups, RollbackRole::Realm, 10, &absent).await.unwrap().iter().all(|entry| entry.target.is_none()));
+        backups.realm_end_cap.get_mut(&12).unwrap().update_contract_state_imt_leaves_ffs[160] = 0;
+        let backup = backups.realm_end_cap.get_mut(&12).unwrap();
+        backup.update_contract_state_imt_leaves_ffs[16..24].copy_from_slice(&11u64.to_le_bytes());
+        assert!(derive_imt_key_index_entries(&backups, RollbackRole::Realm, 10, &reader).await.is_err());
     }
 
     fn realm_backup_with_imt(ffs: Vec<u8>) -> RealmEndCapBackup {

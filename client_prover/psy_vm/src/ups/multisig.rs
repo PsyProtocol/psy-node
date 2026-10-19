@@ -34,16 +34,17 @@ impl MultisigPolicy {
             self.threshold == 2 && self.member_count == 3,
             "multisig policy must be exactly two of three"
         );
-        let mut previous = [0u64; 4];
-        for (index, member_hash) in self.member_hashes.iter().enumerate() {
-            let limbs = member_hash.0.elements.map(|limb| limb.to_canonical_u64());
+        // Member positions are caller-owned and are committed without sorting.
+        let members = self.member_hashes.map(|hash| hash.0.elements.map(|limb| limb.to_canonical_u64()));
+        for (index, limbs) in members.into_iter().enumerate() {
             if index < usize::from(self.member_count) {
                 anyhow::ensure!(limbs != [0; 4], "multisig active member {index} must be nonzero");
-                anyhow::ensure!(limbs > previous, "multisig members must be strictly increasing by canonical hash limbs");
-                previous = limbs;
             } else {
                 anyhow::ensure!(limbs == [0; 4], "multisig unused member {index} must be zero");
             }
+        }
+        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+            anyhow::ensure!(members[a] != members[b], "multisig members must be distinct");
         }
         Ok(())
     }
@@ -191,15 +192,16 @@ mod tests {
             let invalid = StoredMultisigPolicy { header: QHashOut::from_values(header[0], header[1], header[2], header[3]), ..valid.clone() };
             assert!(invalid.policy().is_err());
         }
-        let mut invalid = valid.clone();
-        invalid.members[1] = invalid.members[0];
-        assert!(invalid.policy().is_err());
-        invalid = valid.clone();
-        invalid.members.swap(0, 1);
-        assert!(invalid.policy().is_err());
-        invalid = valid;
-        invalid.members[0] = QHashOut::ZERO;
-        assert!(invalid.policy().is_err());
+        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+            let mut invalid = valid.clone();
+            invalid.members[b] = invalid.members[a];
+            assert!(invalid.policy().is_err());
+        }
+        for index in 0..3 {
+            let mut invalid = valid.clone();
+            invalid.members[index] = QHashOut::ZERO;
+            assert!(invalid.policy().is_err());
+        }
     }
 
     #[test]
@@ -221,15 +223,31 @@ mod tests {
     }
 
     #[test]
-    fn commitment_retains_eight_entry_encoding_without_extra_members() {
-        let policy = stored().policy().unwrap();
-        let mut fields = vec![0x4d534750, 1, 2, 3, 8];
-        fields.extend([1, 9, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
-        fields.extend([0; 20]);
-        let fields: Vec<_> = fields.into_iter().map(GoldilocksField::from_canonical_u64).collect();
-        assert_eq!(policy.commitment().unwrap(), QHashOut(PoseidonHash::hash_no_pad(&fields)));
-        let mut padded = policy;
-        padded.member_hashes[3] = QHashOut::from_values(4, 0, 0, 0);
-        assert!(padded.validate().is_err());
+    fn commitment_retains_caller_order_and_eight_entry_encoding() {
+        let members = stored().members;
+        let mut commitments = Vec::new();
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let stored = StoredMultisigPolicy { header: stored().header, members: order.map(|i| members[i]) };
+            let policy = stored.policy().unwrap();
+            assert_eq!(&policy.member_hashes[..3], &stored.members);
+            let mut fields = vec![0x4d534750, 1, 2, 3, 8];
+            fields.extend(stored.members.iter().flat_map(|hash| hash.0.elements.map(|limb| limb.to_canonical_u64())));
+            fields.extend([0; 20]);
+            let fields: Vec<_> = fields.into_iter().map(GoldilocksField::from_canonical_u64).collect();
+            let commitment = policy.commitment().unwrap();
+            assert_eq!(commitment, QHashOut(PoseidonHash::hash_no_pad(&fields)));
+            assert!(!commitments.contains(&commitment));
+            commitments.push(commitment);
+            for index in 3..8 {
+                let mut padded = policy.clone();
+                padded.member_hashes[index] = members[0];
+                assert!(padded.validate().is_err());
+            }
+            for threshold in [0, 1, 3] {
+                let mut invalid = policy.clone();
+                invalid.threshold = threshold;
+                assert!(invalid.validate().is_err());
+            }
+        }
     }
 }

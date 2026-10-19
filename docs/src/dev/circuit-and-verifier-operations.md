@@ -132,6 +132,8 @@ psy-contracts/src/
 
 With no cohort flags, `regenerate-groth16-keystore` regenerates `bridge_agg`, `deposit_append`, `withdrawal_claim`, and `reward_claim`. `--skip-bridge-agg`, `--skip-deposit-append`, `--skip-withdrawal-claim`, and `--skip-reward-claim` omit one cohort each (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:105-139`). Each selected directory owns exactly `circuit_groth16.bin`, `pk_groth16.bin`, and `vk_groth16.bin` (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:95,777-783`). All four verifier exports write the nested `./psy-contracts/src` checkout used by the launcher.
 
+The reward cohort changes when `RewardClaimWrapCircuit` changes its public commitment. The wrapper exports 256 bits of the full token-domain message's Keccak commitment, and the generic gnark path keccak-hashes those bits exactly as it does for deposit and withdrawal, binding the result as two 128-bit halves. `PsyToken.claimReward` computes the identical double hash, matching the deposit/withdrawal cohorts (`psy_plonky2_circuits/src/bridge/circuits/reward_claim_wrap.rs:207-221`; `psy-contracts/src/PsyToken.sol:104-121`). The checkpoint aggregate remains 147 fields at capacity 64. This invalidates only the reward setup and `RewardClaimVerifier.sol`, not the other three cohorts.
+
 ## 3. Trigger Matrices
 
 ### 3.1 EndCap, cache, Genesis, and embedded wallet bundle
@@ -464,6 +466,8 @@ export KEYSTORE_DIR=<home>/.psy/keystore
 
 4. Stop local consumers of selected cohorts and preserve the previous complete selected cohort plus matching Solidity verifier.
 5. Never recursively delete the keystore root. The CLI removes only the three named files in a selected directory (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:763-775`).
+6. For a reward commitment cutover, generate in an isolated keystore root while an existing end-to-end run continues. Never overwrite its active `reward_claim` directory. Freeze the reward wrapper/common/verifier identity, pinned Gnark revision, all three setup binaries and exported `RewardClaimVerifier.sol` as one artifact set, recording immutable source revisions and exact file hashes/sizes. The old terminal wrap/Groth16 proofs cannot be reused with the new verifier; unchanged inner aggregate proofs and job caches do not acquire new semantics.
+7. Cut over only after independent review, real Groth16 verification and a real token claim with exact mint/replay checks pass. Stop affected consumers before installing the matching code, complete reward setup and deployed verifier together. Preserve the previous complete set for rollback. The wrapper exports 256 Boolean bits of `C = keccak256(M)`; the unchanged generic Gnark path binds the two 128-bit halves of `keccak256(C)`, matching PsyToken's double hash.
 
 ### 9.2 Exact commands
 
@@ -479,6 +483,10 @@ export KEYSTORE_DIR=<home>/.psy/keystore
 | Bridge aggregation and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-deposit-append --skip-reward-claim` | `make export-solidity-verifier && make export-solidity-verifier-withdrawal` |
 
 `make regen-groth16-keystore` passes no cohort flags, so the CLI regenerates all four cohorts. `make regen-bridge-agg-keystore` remains bridge-only by passing `--skip-deposit-append --skip-withdrawal-claim --skip-reward-claim`. `make export-all-solidity-verifier` exports all four verifiers into the nested `./psy-contracts/src/` checkout. The Make targets and exact verifier destinations are at `Makefile:163-182`. After generation, require every selected file to exist and be nonempty. The generator itself requires existence (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:777-783`).
+
+For isolated reward generation, use the reward-only command above with `--keystore-dir <isolated-keystore-root>`, then run `<repo-root>/target/release/psy_relayer_cli export-solidity-verifier <isolated-keystore-root>/reward_claim <isolated-contracts-checkout>/src/RewardClaimVerifier.sol`. Do not use a Make target pointing at the active keystore during that run. Before freezing, record measured circuit/proving-key/verifying-key sizes, portable wrapper and Groth16 proving time/peak memory, and cold preload time/peak memory. A smaller public commitment is not evidence of a particular setup size or completed verification.
+
+The ignored Rust test `two_and_three_real_roots_aggregate_canonical_ids_and_wrap_public_bits` in `psy_plonky2_circuits/src/bridge/circuits/user_reward_checkpoint_aggregate.rs` produces real recursive proofs and checks the compact digest against independently encoded message bytes. Run it with `cargo test --release -p psy_plonky2_circuits two_and_three_real_roots_aggregate_canonical_ids_and_wrap_public_bits -- --ignored --nocapture` only after review. It does not export a Groth16 fixture or execute Groth16 verification or a token claim; both remain required before freeze.
 
 ## 10. Offline Packaging and Manifest
 

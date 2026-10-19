@@ -108,17 +108,15 @@ impl SignatureUser for MultisigUser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plonky2::field::types::PrimeField64;
     use psy_crypto::signature::secp256k1::wallet::secp256k1_sign;
 
     fn fixture(sighash: QHashOut<GoldilocksField>) -> (MultisigAccount, MultisigSignatures) {
-        let mut members: Vec<_> = (1u8..=3).map(|byte| {
+        let members: Vec<_> = (1u8..=3).map(|byte| {
             let key = k256::ecdsa::SigningKey::from_slice(&[byte; 32]).unwrap();
             let signature = secp256k1_sign(key, sighash).unwrap();
             let hash = hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(CompressedPublicKey(signature.public_key));
             (hash, signature)
         }).collect();
-        members.sort_by_key(|(hash, _)| hash.0.elements.map(|limb| limb.to_canonical_u64()));
         let mut member_hashes = [QHashOut::ZERO; 8];
         for (index, (hash, _)) in members.iter().enumerate() { member_hashes[index] = *hash; }
         let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes } };

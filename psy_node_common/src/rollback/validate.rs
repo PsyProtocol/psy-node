@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 
 use serde_json::Value;
+use psy_data::v1::qdata::contract::imt_key_bucket_to_i16;
+use crate::rollback::plan::RollbackImtKeyIndexEntry;
 use psy_node_core::{
     psy_temp_db::{TEMP_TABLE_ID_WORKER_REPUTATION_BYTES, TEMP_TABLE_WORKER_REPUTATION_KEY_SIZE},
     store::traits::temp_db::PENDING_KEYED_TEMP_TABLE_ID_BYTES,
@@ -148,7 +150,7 @@ fn validate_semantic_keys(plan: &RollbackPlan) -> anyhow::Result<()> {
                 validate_reward_keys(plan, &phase.keys, &pending_set)?;
             }
             "public_key_hash_to_user_ids_table" => validate_hash_user_pairs(&phase.keys)?,
-            "imt_key_index_table" => validate_imt_key_index(&phase.keys)?,
+            "imt_key_index_table" => { decode_imt_key_index_entries(&phase.keys, plan.target_checkpoint_id)?; }
             "global_user_tree_table"
             | "global_checkpoint_tree_table"
             | "user_registration_tree_table"
@@ -353,21 +355,25 @@ fn validate_hash_user_pairs(keys: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_imt_key_index(keys: &Value) -> anyhow::Result<()> {
-    for (index, value) in require_array("imt_key_index_table", keys)?.iter().enumerate() {
-        let tuple = require_tuple("imt_key_index_table", index, value, 4)?;
-        as_i64("imt_key_index_table", index, &tuple[0])?;
-        as_i64("imt_key_index_table", index, &tuple[1])?;
-        let bucket = as_i64("imt_key_index_table", index, &tuple[2])?;
-        if bucket < i16::MIN as i64 || bucket > i16::MAX as i64 {
-            anyhow::bail!("imt_key_index_table key {index} key_bucket is outside i16");
-        }
-        let encoded = hex_value("imt_key_index_table", index, &tuple[3])?;
-        if encoded.is_empty() {
-            anyhow::bail!("imt_key_index_table key {index} has an empty encoded_key");
+pub(crate) fn decode_imt_key_index_entries(keys: &Value, target_checkpoint_id: u64) -> anyhow::Result<Vec<RollbackImtKeyIndexEntry>> {
+    let entries: Vec<RollbackImtKeyIndexEntry> = serde_json::from_value(keys.clone())?;
+    let mut seen = HashSet::new();
+    for entry in &entries {
+        anyhow::ensure!(entry.tree_id >= 0 && entry.tree_sub_id >= 0, "negative IMT key-index coordinate");
+        let encoded = hex::decode(&entry.encoded_key)?;
+        anyhow::ensure!(encoded.len() == 32, "IMT encoded key must contain exactly 32 bytes");
+        anyhow::ensure!(entry.key_bucket == imt_key_bucket_to_i16(u16::from_be_bytes([encoded[0], encoded[1]])), "IMT key bucket differs from encoded key");
+        anyhow::ensure!(seen.insert((entry.tree_id, entry.tree_sub_id, entry.key_bucket, encoded.clone())), "duplicate IMT physical key");
+        if let Some(row) = &entry.target {
+            let leaf_key = hex::decode(&row.leaf_key)?;
+            anyhow::ensure!(leaf_key.len() == 32, "IMT leaf key must contain exactly 32 bytes");
+            // Only the zero-key/zero-value sentinel writer rewrites an existing mapping.
+            // Its canonical sort encoding is also zero, independent of field representation.
+            anyhow::ensure!(leaf_key.iter().all(|&byte| byte == 0) && encoded.iter().all(|&byte| byte == 0), "IMT restoration must bind the zero sentinel to its canonical encoded key");
+            anyhow::ensure!(row.leaf_index >= 0 && row.birth_checkpoint >= 0 && row.birth_checkpoint as u64 <= target_checkpoint_id, "IMT restoration tuple is outside target history");
         }
     }
-    Ok(())
+    Ok(entries)
 }
 
 fn validate_merkle_checkpoints(
@@ -704,6 +710,32 @@ mod tests {
         let root = format!("0x{}", hex::encode([checkpoint_id as u8; 32]));
         let checkpoint = format!("0x{}", hex::encode(checkpoint_id.to_le_bytes()));
         serde_json::json!([root, checkpoint])
+    }
+
+    #[test]
+    fn mixed_imt_entries_require_exact_shape_and_canonical_target() {
+        let entry = serde_json::json!({"tree_id":7,"tree_sub_id":9,"key_bucket":imt_key_bucket_to_i16(0),"encoded_key":"00".repeat(32),"target":{"leaf_key":"00".repeat(32),"birth_checkpoint":3,"leaf_index":10}});
+        assert!(decode_imt_key_index_entries(&serde_json::json!([entry.clone()]), 10).is_ok());
+        assert!(decode_imt_key_index_entries(&serde_json::json!([entry.clone(), entry.clone()]), 10).is_err());
+        for (field, value) in [("tree_id", serde_json::json!(-1)), ("key_bucket", serde_json::json!(0)), ("encoded_key", serde_json::json!("00")), ("unexpected", serde_json::json!(true))] {
+            let mut invalid = entry.clone();
+            invalid[field] = value;
+            assert!(decode_imt_key_index_entries(&serde_json::json!([invalid]), 10).is_err(), "{field}");
+        }
+        for (field, value) in [("leaf_index", serde_json::json!(-1)), ("birth_checkpoint", serde_json::json!(11)), ("leaf_key", serde_json::json!("01".repeat(32))), ("unexpected", serde_json::json!(true))] {
+            let mut invalid = entry.clone();
+            invalid["target"][field] = value;
+            assert!(decode_imt_key_index_entries(&serde_json::json!([invalid]), 10).is_err(), "{field}");
+        }
+        let mut deletion = entry.clone();
+        deletion["target"] = Value::Null;
+        assert!(decode_imt_key_index_entries(&serde_json::json!([deletion.clone()]), 10).is_ok());
+        deletion.as_object_mut().unwrap().remove("target");
+        assert!(decode_imt_key_index_entries(&serde_json::json!([deletion]), 10).is_err());
+        assert!(decode_imt_key_index_entries(&serde_json::json!([[7,9,-32768,"00".repeat(32)]]), 10).is_err());
+        let mut plan = valid_plan();
+        plan.phases.iter_mut().find(|phase| phase.table == "imt_key_index_table").unwrap().api = "db_delete_many_imt_keys".into();
+        assert!(validate_rollback_plan(&plan).is_err());
     }
 
     fn valid_plan() -> RollbackPlan {

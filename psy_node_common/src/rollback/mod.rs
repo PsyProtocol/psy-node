@@ -26,6 +26,7 @@ pub use keys::{
 };
 pub use plan::{
     read_rollback_plan, write_rollback_plan_atomic, RollbackIds,
+    RollbackImtKeyIndexEntry, RollbackImtKeyIndexRow,
     RollbackNatsConsumerKind, RollbackNatsConsumerTarget, RollbackPhase,
     RollbackPhaseStatus, RollbackPlan, RollbackRole, RollbackSnapshot,
     RollbackTempValueSnapshot, TargetContractState,

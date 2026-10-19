@@ -572,11 +572,7 @@ mod tests {
         };
         let wrapped = wrapper.prove(aggregate.get_verifier_config_ref(), &triple, &auth).unwrap();
         wrapper.circuit_data.verify(wrapped.clone()).unwrap();
-        assert_eq!(wrapped.public_inputs.len(), 256 * (8 + REWARD_CLAIM_MAX_CHECKPOINTS));
-        let recovered = wrapped.public_inputs.chunks(64).flat_map(|group| {
-            (0..8).map(move |byte| group[(7 - byte) * 8..(8 - byte) * 8].iter().enumerate()
-                .fold(0u8, |accumulator, (index, bit)| accumulator + ((bit.to_canonical_u64() as u8) << index)))
-        }).collect::<Vec<_>>();
+        assert_eq!(wrapped.public_inputs.len(), 256);
         let word = |value: u64| { let mut bytes = [0u8; 32]; bytes[24..].copy_from_slice(&value.to_be_bytes()); bytes };
         let address = |value: [u8; 20]| { let mut bytes = [0u8; 32]; bytes[12..].copy_from_slice(&value); bytes };
         let mut hasher = tiny_keccak::Keccak::v256();
@@ -597,6 +593,15 @@ mod tests {
         for index in 0..REWARD_CLAIM_MAX_CHECKPOINTS {
             expected.extend(word(if index < 3 { u64::from(sources[index]) } else { 0 }));
         }
-        assert_eq!(recovered, expected);
+        let mut hasher = tiny_keccak::Keccak::v256();
+        let mut digest = [0u8; 32];
+        tiny_keccak::Hasher::update(&mut hasher, &expected);
+        tiny_keccak::Hasher::finalize(hasher, &mut digest);
+        let recovered = wrapped.public_inputs.chunks(64).flat_map(|group| {
+            (0..8).map(move |byte| group[(7 - byte) * 8..(8 - byte) * 8].iter().enumerate()
+                .fold(0u8, |accumulator, (index, bit)| accumulator + ((bit.to_canonical_u64() as u8) << index)))
+        }).collect::<Vec<_>>();
+        assert_eq!(recovered.len(), 32);
+        assert_eq!(recovered, digest);
     }
 }

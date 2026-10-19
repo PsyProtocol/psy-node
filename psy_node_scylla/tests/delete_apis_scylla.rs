@@ -10,7 +10,7 @@ use psy_node_core::store::traits::core_db::{
     CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter,
     CoreDatabaseBlobPairDeleter, CoreDatabaseBlobPairVerifier, CoreDatabaseDoubleIdMerkleWriter,
     CoreDatabaseHashToManyIdsWriter, CoreDatabaseHashUserPairDeleter, CoreDatabaseHashUserPairVerifier,
-    CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTLeafWriter, CoreDatabaseIMTNextAppendIndexWriter,
+    CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseIMTNextAppendIndexWriter,
     CoreDatabaseImtKeyDeleter, CoreDatabaseImtKeyVerifier, CoreDatabaseImtLeafDeleter,
     CoreDatabaseImtLeafVerifier, CoreDatabaseImtNextAppendIndexDeleter, CoreDatabaseImtNextAppendIndexVerifier,
     CoreDatabaseKivWriter, CoreDatabaseMerkleDeleter, CoreDatabaseMerkleVerifier,
@@ -341,6 +341,33 @@ async fn imt_leaf_key_index_next_index_delete_removes_exact_scope() -> anyhow::R
     assert_eq!(
         backend.db_get_existing_imt_next_append_indexes(db.imt_next_append_index_table.as_ref(), &[(1, 2), (1, 3)]).await?,
         vec![(1, 3)]
+    );
+
+    cleanup_store(&db).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "database slow"]
+async fn imt_leaf_birth_returns_oldest_version_inside_bound() -> anyhow::Result<()> {
+    let db = setup_store("psy_imt_leaf_birth").await?;
+    let backend = db.store.as_ref();
+    let sentinel_key = [0u8; 32];
+    let other_key = [9u8; 32];
+
+    backend.db_insert_imt_leaf(db.imt_leaf_table.as_ref(), 7, 9, 10, 3, &[1; 32], &sentinel_key, &[0; 32], &[4; 32], 11).await?;
+    backend.db_insert_imt_leaf(db.imt_leaf_table.as_ref(), 7, 9, 10, 8, &[2; 32], &sentinel_key, &[0; 32], &[5; 32], 12).await?;
+    backend.db_insert_imt_leaf(db.imt_leaf_table.as_ref(), 7, 9, 10, 12, &[3; 32], &sentinel_key, &[0; 32], &[6; 32], 13).await?;
+    backend.db_insert_imt_leaf(db.imt_leaf_table.as_ref(), 7, 9, 11, 1, &[7; 32], &other_key, &[8; 32], &[0; 32], 0).await?;
+
+    assert_eq!(
+        backend.db_select_imt_leaf_birth(db.imt_leaf_table.as_ref(), 7, 9, 10, 10).await?,
+        Some((3, sentinel_key.to_vec()))
+    );
+    assert_eq!(backend.db_select_imt_leaf_birth(db.imt_leaf_table.as_ref(), 7, 9, 10, 2).await?, None);
+    assert_eq!(
+        backend.db_select_imt_leaf_birth(db.imt_leaf_table.as_ref(), 7, 9, 11, 10).await?,
+        Some((1, other_key.to_vec()))
     );
 
     cleanup_store(&db).await?;

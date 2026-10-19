@@ -32,18 +32,6 @@ fn canonical_bits(builder: &mut CircuitBuilder<F, 2>, value: Target) -> Vec<Bool
     bits
 }
 
-fn bits_less_than(builder: &mut CircuitBuilder<F, 2>, a: &[BoolTarget], b: &[BoolTarget]) -> BoolTarget {
-    let mut less = builder._false();
-    for (&a, &b) in a.iter().zip(b) {
-        let equal = builder.is_equal(a.target, b.target);
-        let not_a = builder.not(a);
-        let bit_less = builder.and(not_a, b);
-        let lower_less = builder.and(equal, less);
-        less = builder.or(bit_less, lower_less);
-    }
-    less
-}
-
 #[derive(Debug)]
 struct MultisigPolicyTarget {
     version: Target,
@@ -66,24 +54,17 @@ impl MultisigPolicyTarget {
         builder.assert_non_zero(version);
         let capacity = builder.constant(F::from_canonical_u8(8));
         let member_hashes = core::array::from_fn(|_| builder.add_virtual_hash());
-        let mut previous_bits: Option<Vec<BoolTarget>> = None;
-        let one = builder.one();
         for (i, member) in member_hashes.iter().enumerate() {
             let index = builder.constant(F::from_canonical_usize(i));
             let active = builder.is_less_than(8, index, member_count);
             let inactive = builder.not(active);
             let is_zero = builder.is_zero_hash(*member);
             builder.connect(is_zero.target, inactive.target);
-            let mut bits = Vec::with_capacity(256);
-            // Limb zero is most significant in the policy's lexical ordering.
-            for limb in member.elements.iter().rev() {
-                bits.extend(canonical_bits(builder, *limb));
-            }
-            if let Some(previous) = previous_bits.as_ref() {
-                let increasing = bits_less_than(builder, previous, &bits);
-                builder.connect_if_true(active, increasing.target, one);
-            }
-            previous_bits = Some(bits);
+        }
+        // Only active members must differ; unused entries remain zero padding.
+        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+            let equal = builder.is_equal_hash(member_hashes[a], member_hashes[b]);
+            builder.assert_zero(equal.target);
         }
         let domain = builder.constant(F::from_canonical_u32(0x4d534750));
         let mut fields = vec![domain, version, threshold, member_count, capacity];
@@ -359,7 +340,7 @@ impl MultisigSignatureCircuit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plonky2::field::types::{Field64, PrimeField64};
+    use plonky2::field::types::Field64;
     use psy_client_data::config::store_config::PsyHasher;
 
     fn policy(version: u32) -> MultisigPolicy {
@@ -388,19 +369,42 @@ mod tests {
     #[test]
     fn policy_constraints_reject_duplicates_padding_and_threshold() {
         let valid = policy(1);
-        policy_proof(&valid).unwrap();
-        let mut duplicate = valid.clone();
-        duplicate.member_hashes[1] = duplicate.member_hashes[0];
-        assert!(policy_proof(&duplicate).is_err());
-        let mut padding = valid.clone();
-        padding.member_hashes[7] = padding.member_hashes[0];
-        assert!(policy_proof(&padding).is_err());
-        let mut threshold = valid.clone();
-        threshold.threshold = 3;
-        assert!(policy_proof(&threshold).is_err());
-        let mut reversed = valid;
-        reversed.member_hashes.swap(0, 1);
-        assert!(policy_proof(&reversed).is_err());
+        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+            let mut duplicate = valid.clone();
+            duplicate.member_hashes[b] = duplicate.member_hashes[a];
+            assert!(policy_proof(&duplicate).is_err());
+        }
+        for index in 0..3 {
+            let mut zero = valid.clone();
+            zero.member_hashes[index] = QHashOut::ZERO;
+            assert!(policy_proof(&zero).is_err());
+        }
+        for index in 3..8 {
+            let mut padding = valid.clone();
+            padding.member_hashes[index] = padding.member_hashes[0];
+            assert!(policy_proof(&padding).is_err());
+        }
+        for threshold in [0, 1, 3] {
+            let mut invalid = valid.clone();
+            invalid.threshold = threshold;
+            assert!(policy_proof(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_commitment_preserves_all_member_permutations() {
+        let mut valid = policy(1);
+        valid.member_hashes[0] = QHashOut::from_values(1, 0, 0, 0);
+        valid.member_hashes[1] = QHashOut::from_values(1, 0, 0, 1);
+        valid.member_hashes[2] = QHashOut::from_values(0xffff_ffff_0000_0000, 0, 0, 0);
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let mut permuted = valid.clone();
+            for (index, member) in order.into_iter().enumerate() {
+                permuted.member_hashes[index] = valid.member_hashes[member];
+            }
+            policy_proof(&permuted).unwrap();
+            transition_proof(&permuted, &permuted, false, false, 1).unwrap();
+        }
     }
 
     #[test]
@@ -525,13 +529,12 @@ mod tests {
         use psy_client_data::qdata::{user::PsyUserLeaf, user_contract_state::{SignContext, UserContractState}, ups_signature::PsyUserProvingSessionSignatureDataCompact};
         use psy_crypto::{hash::{merkle::core::MerkleProofCore, traits::{hasher::MerkleZeroHasher, qhashable::QFieldHashable}}, signature::secp256k1::core::PsyCompressedSecp256K1Signature};
         use psy_vm::ups::{multisig::{MultisigAccount, MultisigSignatures, MultisigSignatureWitness}, state_reader::StateReaderResults};
-        let mut keys: Vec<_> = (1u8..=4).map(|byte| {
+        let keys: Vec<_> = (1u8..=4).map(|byte| {
             let key = SigningKey::from_slice(&[byte; 32]).unwrap();
             let compressed: [u8; 33] = key.verifying_key().to_encoded_point(true).as_bytes().try_into().unwrap();
             let member = hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(CompressedPublicKey(compressed));
             (member, key, compressed)
         }).collect();
-        keys.sort_by_key(|(member, _, _)| member.0.elements.map(|limb| limb.to_canonical_u64()));
         let mut initial = policy(1);
         for (i, (member, _, _)) in keys.iter().take(3).enumerate() {
             initial.member_hashes[i] = *member;
@@ -614,6 +617,14 @@ mod tests {
             duplicate.signatures.member_indices[1] = duplicate.signatures.member_indices[0];
             duplicate.signatures.signatures[1] = duplicate.signatures.signatures[0];
             assert!(circuit.set_witness(&duplicate).and_then(|pw| circuit.circuit_data.prove(pw)).is_err());
+            for indices in [[2, 0], [0, 3]] {
+                let mut invalid = input.clone();
+                invalid.signatures.member_indices = indices.to_vec();
+                assert!(circuit.set_witness(&invalid).and_then(|pw| circuit.circuit_data.prove(pw)).is_err());
+            }
+            let mut wrong_member = input.clone();
+            wrong_member.signatures.member_indices = vec![0, 1];
+            assert!(circuit.set_witness(&wrong_member).and_then(|pw| circuit.circuit_data.prove(pw)).is_err());
             let mut forged_slot = input.clone();
             forged_slot.witness.start_state.merkel_proofs[3].value = QHashOut::from_values(9, 9, 9, 9);
             assert!(forged_slot.witness.policies().is_err());

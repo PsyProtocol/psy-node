@@ -58,7 +58,7 @@ use psy_node_core::{
             CoreDatabaseBlobPairDeleter, CoreDatabaseBlobPairVerifier,
             CoreDatabaseHashUserPairDeleter, CoreDatabaseHashUserPairVerifier,
             CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter,
-            CoreDatabaseImtKeyDeleter, CoreDatabaseImtKeyVerifier,
+            CoreDatabaseImtKeyDeleter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter,
             CoreDatabaseImtLeafDeleter, CoreDatabaseImtLeafVerifier,
             CoreDatabaseImtNextAppendIndexDeleter, CoreDatabaseKivReader,
             CoreDatabaseKivWriter, CoreDatabaseMerkleDeleter, CoreDatabaseMerkleVerifier,
@@ -371,9 +371,22 @@ impl RollbackExecutionStore for ExecutionStore {
                 ensure!(phase.table == "imt_leaf_table", "unknown IMT leaf rollback table {}", phase.table);
                 backend.db_delete_many_imt_leaves(self.database.imt_leaf_table.as_ref(), keys).await?;
             }
-            RollbackOperation::ImtKeys(keys) => {
+            RollbackOperation::SetImtKeyIndex(entries) => {
                 ensure!(phase.table == "imt_key_index_table", "unknown IMT key rollback table {}", phase.table);
-                backend.db_delete_many_imt_keys(self.database.imt_key_index_table.as_ref(), keys).await?;
+                for entry in entries {
+                    let encoded_key = hex::decode(&entry.encoded_key)?;
+                    match &entry.target {
+                        Some(row) => backend.db_insert_imt_key_index(
+                            self.database.imt_key_index_table.as_ref(), entry.tree_id, entry.tree_sub_id,
+                            entry.key_bucket, &encoded_key, &hex::decode(&row.leaf_key)?,
+                            row.birth_checkpoint, row.leaf_index,
+                        ).await?,
+                        None => backend.db_delete_many_imt_keys(
+                            self.database.imt_key_index_table.as_ref(),
+                            &[(entry.tree_id, entry.tree_sub_id, entry.key_bucket, encoded_key)],
+                        ).await?,
+                    }
+                }
             }
             RollbackOperation::HashUserPairs(keys) => {
                 let keys = decode_hash_user_pairs(keys)?;
@@ -535,9 +548,15 @@ impl RollbackExecutionStore for ExecutionStore {
                 let residual = backend.db_get_existing_imt_leaves(self.database.imt_leaf_table.as_ref(), keys).await?;
                 ensure!(residual.is_empty(), "imt_leaf_table retains keys {:?}", residual);
             }
-            RollbackOperation::ImtKeys(keys) => {
-                let residual = backend.db_get_existing_imt_keys(self.database.imt_key_index_table.as_ref(), keys).await?;
-                ensure!(residual.is_empty(), "imt_key_index_table retains keys {:?}", residual);
+            RollbackOperation::SetImtKeyIndex(entries) => {
+                for entry in entries {
+                    let actual = backend.db_select_imt_key_index_exact(
+                        self.database.imt_key_index_table.as_ref(), entry.tree_id, entry.tree_sub_id,
+                        entry.key_bucket, &hex::decode(&entry.encoded_key)?,
+                    ).await?;
+                    let expected = entry.target.as_ref().map(|row| (row.leaf_index, row.birth_checkpoint));
+                    ensure!(actual == expected, "imt_key_index_table tuple mismatch for ({}, {}, {}, {}): expected {:?}, got {:?}", entry.tree_id, entry.tree_sub_id, entry.key_bucket, entry.encoded_key, expected, actual);
+                }
             }
             RollbackOperation::HashUserPairs(keys) => {
                 let keys = decode_hash_user_pairs(keys)?;

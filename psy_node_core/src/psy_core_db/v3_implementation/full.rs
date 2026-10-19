@@ -48,8 +48,8 @@ use crate::{
     },
     store::traits::{
         core_db::{
-            CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseIMTKeyIndexWriter,
-            CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader,
+            CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseIMTKeyIndexReader,
+            CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader,
             CoreDatabaseStore, CoreDatabaseU64Reader, CoreDatabaseZeroIdMerkleReader,
         },
         helpers::*,
@@ -3829,6 +3829,53 @@ impl<
                 // Compute as u16 first, then convert to i16 for ScyllaDB
                 let key_bucket_u16 = u16::from_be_bytes([encoded_key[0], encoded_key[1]]);
                 let key_bucket = imt_key_bucket_to_i16(key_bucket_u16);
+                let birth_checkpoint = if is_new_key {
+                    checkpoint_id as i64
+                } else {
+                    match self
+                        .store
+                        .db_select_imt_key_index_exact(
+                            &self.imt_key_index_table,
+                            tree_id as i64,
+                            tree_sub_id as i64,
+                            key_bucket,
+                            &encoded_key,
+                        )
+                        .await?
+                    {
+                        Some((stored_leaf_index, stored_birth_checkpoint)) => {
+                            if stored_leaf_index != leaf_index as i64 {
+                                anyhow::bail!(
+                                    "sentinel key index leaf_index {stored_leaf_index} conflicts with serialized leaf_index {leaf_index} for tree_id={tree_id}, tree_sub_id={tree_sub_id}"
+                                );
+                            }
+                            stored_birth_checkpoint
+                        }
+                        None => {
+                            let Some((birth_checkpoint, historical_leaf_key)) = self
+                                .store
+                                .db_select_imt_leaf_birth(
+                                    &self.imt_leaf_table,
+                                    tree_id as i64,
+                                    tree_sub_id as i64,
+                                    leaf_index as i64,
+                                    checkpoint_id as i64,
+                                )
+                                .await?
+                            else {
+                                anyhow::bail!(
+                                    "missing sentinel key index has no leaf birth at or before checkpoint {checkpoint_id} for tree_id={tree_id}, tree_sub_id={tree_sub_id}, leaf_index={leaf_index}"
+                                );
+                            };
+                            if historical_leaf_key != leaf_key {
+                                anyhow::bail!(
+                                    "recovered leaf birth key does not match sentinel key for tree_id={tree_id}, tree_sub_id={tree_sub_id}, leaf_index={leaf_index}"
+                                );
+                            }
+                            birth_checkpoint
+                        }
+                    }
+                };
 
                 self.store
                     .db_insert_imt_key_index(
@@ -3838,7 +3885,7 @@ impl<
                         key_bucket,
                         &encoded_key,
                         &leaf_key,
-                        checkpoint_id as i64,
+                        birth_checkpoint,
                         leaf_index as i64,
                     )
                     .await?;

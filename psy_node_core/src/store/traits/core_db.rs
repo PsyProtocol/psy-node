@@ -824,6 +824,17 @@ pub trait CoreDatabaseIMTLeafReader<TableIdentifier: Clone + Send + Sync> {
         leaf_index: i64,
         max_checkpoint_id: i64,
     ) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>>;
+
+    /// Select the earliest retained IMT leaf version at or before the checkpoint bound.
+    /// Returns (birth_checkpoint, leaf_key). None means no version in that partition is within the bound.
+    async fn db_select_imt_leaf_birth(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        max_checkpoint_id: i64,
+    ) -> anyhow::Result<Option<(i64, Vec<u8>)>>;
 }
 
 #[async_trait]

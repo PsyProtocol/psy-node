@@ -84,6 +84,8 @@ preventing unauthorized claims.
 
 The depositor calls `Router.deposit(token, amount, shieldAddress, noteCommitment)` on L1.
 
+`psy_user_cli deposit` and `claim-withdrawal` accept the L1 signer through `L1_PRIVATE_KEY` or the existing `--private-key` argument. `L1_PRIVATE_KEY` is distinct from the L2 `PRIVATE_KEY`, and command help does not display its value.
+
 - The Router delegates to the appropriate Gateway (ERC20 or ETH).
 - The Gateway calls `Bridge.recordDepositFromGateway()` which computes the deposit leaf hash and stores it.
 - The Bridge emits a `DepositRecorded` event with the deposit index and leaf hash.

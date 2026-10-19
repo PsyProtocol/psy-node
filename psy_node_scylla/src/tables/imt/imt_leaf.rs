@@ -33,6 +33,7 @@ pub struct ScyllaIMTLeafPreparedStatements {
     pub delete_prepared: Arc<PreparedStatement>,
     pub select_prepared: Arc<PreparedStatement>,
     pub select_exact_prepared: Arc<PreparedStatement>,
+    pub select_birth_prepared: Arc<PreparedStatement>,
 }
 
 impl ScyllaIMTLeafPreparedStatements {
@@ -92,11 +93,19 @@ impl ScyllaIMTLeafPreparedStatements {
         let select_exact_stmt = format!(
             "SELECT checkpoint_id FROM {keyspace}.{table_name} WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ? LIMIT 1"
         );
+        let select_birth_stmt = format!(
+            "SELECT checkpoint_id, leaf_key \
+             FROM {keyspace}.{table_name} \
+             WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id <= ? \
+             ORDER BY checkpoint_id ASC \
+             LIMIT 1"
+        );
 
         tracing::info!("Preparing IMT leaf statements: {}.{}", keyspace, table_name);
         let insert_prepared = session.prepare(insert_stmt).await?;
         let select_prepared = session.prepare(select_stmt).await?;
         let select_exact_prepared = session.prepare(select_exact_stmt).await?;
+        let select_birth_prepared = session.prepare(select_birth_stmt).await?;
         let delete_prepared = session.prepare(format!(
             "DELETE FROM {keyspace}.{table_name} WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?"
         )).await?;
@@ -110,6 +119,7 @@ impl ScyllaIMTLeafPreparedStatements {
             delete_prepared: Arc::new(delete_prepared),
             select_prepared: Arc::new(select_prepared),
             select_exact_prepared: Arc::new(select_exact_prepared),
+            select_birth_prepared: Arc::new(select_birth_prepared),
         })
     }
 
@@ -173,6 +183,27 @@ impl ScyllaIMTLeafPreparedStatements {
 
         let rows = result.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>()? {
+            Some(row) => Ok(Some(row)),
+            None => Ok(None),
+        }
+    }
+
+    /// Select the earliest retained leaf version at or before the checkpoint bound.
+    /// Returns (birth_checkpoint, leaf_key).
+    pub async fn select_leaf_birth(
+        &self,
+        session: &Session,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        max_checkpoint_id: i64,
+    ) -> anyhow::Result<Option<(i64, Vec<u8>)>> {
+        let result = session
+            .execute_unpaged(&self.select_birth_prepared, (tree_id, tree_sub_id, leaf_index, max_checkpoint_id))
+            .await?;
+
+        let rows = result.into_rows_result()?;
+        match rows.maybe_first_row::<(i64, Vec<u8>)>()? {
             Some(row) => Ok(Some(row)),
             None => Ok(None),
         }

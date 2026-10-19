@@ -12,6 +12,7 @@ use super::{
     plan::{
         write_rollback_plan_atomic, RollbackNatsConsumerKind, RollbackNatsConsumerTarget,
         RollbackPhase, RollbackPhaseStatus, RollbackPlan, RollbackTempValueSnapshot,
+        RollbackImtKeyIndexEntry,
     },
     validate::validate_rollback_plan,
 };
@@ -34,7 +35,7 @@ pub enum RollbackOperation {
     TreeMerkleNodes(Vec<(u64, u8, u64, u64)>),
     TreeSubtreeMerkleNodes(Vec<(u64, u64, u8, u64, u64)>),
     ImtLeaves(Vec<(i64, i64, i64, i64)>),
-    ImtKeys(Vec<(i64, i64, i16, Vec<u8>)>),
+    SetImtKeyIndex(Vec<RollbackImtKeyIndexEntry>),
     HashUserPairs(Vec<(Vec<u8>, u64)>),
     BlobPairs(Vec<(Vec<u8>, Vec<u8>)>),
     U64U128Pairs(Vec<(u64, u128)>),
@@ -150,7 +151,10 @@ where
     }
     require_counter_not_regressed(store, plan).await?;
 
-    if marker == plan.target_checkpoint_id {
+    if marker == plan.target_checkpoint_id
+        && (plan.latest_checkpoint_id != plan.target_checkpoint_id
+            || plan.phases.iter().all(|phase| phase.status == RollbackPhaseStatus::Completed))
+    {
         reconcile_target(store, progress, plan, &phases).await?;
         return Ok(RollbackOutcome::Reconciled);
     }
@@ -170,10 +174,12 @@ where
                 .context("failed to delete post-target gatherer backups")?;
             // Persisted verify does not authorize this write; re-check postconditions before the only commit mutation.
             verify_complete(store, plan, &phases, plan.latest_checkpoint_id).await?;
-            store
-                .write_latest_checkpoint_marker(plan.target_checkpoint_id)
-                .await
-                .context("failed to write rollback commit marker")?;
+            if plan.latest_checkpoint_id != plan.target_checkpoint_id {
+                store
+                    .write_latest_checkpoint_marker(plan.target_checkpoint_id)
+                    .await
+                    .context("failed to write rollback commit marker")?;
+            }
             require_marker(store, plan.target_checkpoint_id, "after marker phase").await?;
         } else if phase.is_verify() {
             verify_complete(store, plan, &phases, plan.latest_checkpoint_id).await?;
@@ -363,19 +369,8 @@ pub fn decode_rollback_phase(phase: &RollbackPhase) -> anyhow::Result<Executable
             }
             RollbackOperation::ImtLeaves(out)
         }
-        "db_delete_many_imt_keys" if table == "imt_key_index_table" => {
-            let values = array(&phase.keys, table)?;
-            let mut out = Vec::with_capacity(values.len());
-            for (i, value) in values.iter().enumerate() {
-                let t = fixed_array(value, 4, table, i)?;
-                out.push((
-                    as_i64(&t[0], table, i)?,
-                    as_i64(&t[1], table, i)?,
-                    as_i16(&t[2], table, i)?,
-                    decode_hex_value(&t[3], table, i)?,
-                ));
-            }
-            RollbackOperation::ImtKeys(out)
+        "set_imt_key_index" if table == "imt_key_index_table" => {
+            RollbackOperation::SetImtKeyIndex(super::validate::decode_imt_key_index_entries(&phase.keys, u64::MAX)?)
         }
         "db_delete_many_hash_user_pairs" if table == "public_key_hash_to_user_ids_table" => {
             let values = array(&phase.keys, table)?;
@@ -494,10 +489,6 @@ fn as_i64(value: &Value, table: &str, index: usize) -> anyhow::Result<i64> {
     value.as_i64().ok_or_else(|| anyhow::anyhow!("{table} key {index} contains a non-i64 value"))
 }
 
-fn as_i16(value: &Value, table: &str, index: usize) -> anyhow::Result<i16> {
-    i16::try_from(as_i64(value, table, index)?)
-        .map_err(|_| anyhow::anyhow!("{table} key {index} contains a value outside i16 range"))
-}
 
 fn as_u8(value: &Value, table: &str, index: usize) -> anyhow::Result<u8> {
     u8::try_from(as_u64(value, table, index)?).map_err(Into::into)
@@ -590,6 +581,9 @@ mod tests {
 
     struct FakeStore {
         state: Mutex<FakeState>,
+        imt_rows: parking_lot::Mutex<std::collections::BTreeMap<(i64, i64, i16, String), super::super::plan::RollbackImtKeyIndexRow>>,
+        fail_after_imt_entry: std::sync::atomic::AtomicBool,
+        cleanup_seeded_residuals: std::sync::atomic::AtomicBool,
         fail_execute: Mutex<Option<String>>,
         fail_verify: Mutex<Option<String>>,
         fail_marker_write: Mutex<bool>,
@@ -613,6 +607,9 @@ mod tests {
                 fail_verify: Mutex::new(None),
                 fail_marker_write: Mutex::new(false),
                 fail_delete_backups: Mutex::new(false),
+                imt_rows: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+                fail_after_imt_entry: false.into(),
+                cleanup_seeded_residuals: false.into(),
             }
         }
 
@@ -690,6 +687,7 @@ mod tests {
                 bail!("injected execute failure at table {phase}");
             }
             let mut state = self.state.lock().unwrap();
+            if self.cleanup_seeded_residuals.load(std::sync::atomic::Ordering::SeqCst) { state.residual.remove(&phase); }
             state.applied.push(phase.clone());
             state.events.push(StoreEvent::Execute(phase));
             Ok(())
@@ -734,6 +732,20 @@ mod tests {
                 }
             }
             let mut state = self.state.lock().unwrap();
+            if let RollbackOperation::SetImtKeyIndex(entries) = &phase.operation {
+                let mut rows = self.imt_rows.lock();
+                for entry in entries {
+                    let key = (entry.tree_id, entry.tree_sub_id, entry.key_bucket, entry.encoded_key.clone());
+                    match &entry.target {
+                        Some(row) => { rows.insert(key, row.clone()); }
+                        None => { rows.remove(&key); }
+                    }
+                    if self.fail_after_imt_entry.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        bail!("injected failure after IMT entry mutation");
+                    }
+                }
+            }
+            if self.cleanup_seeded_residuals.load(std::sync::atomic::Ordering::SeqCst) { state.residual.remove(&phase.table); }
             state.applied.push(phase.table.clone());
             state.events.push(StoreEvent::Execute(phase.table.clone()));
             Ok(())
@@ -752,6 +764,13 @@ mod tests {
                 }
             }
             let mut state = self.state.lock().unwrap();
+            if let RollbackOperation::SetImtKeyIndex(entries) = &phase.operation {
+                let rows = self.imt_rows.lock();
+                for entry in entries {
+                    let key = (entry.tree_id, entry.tree_sub_id, entry.key_bucket, entry.encoded_key.clone());
+                    anyhow::ensure!(rows.get(&key) == entry.target.as_ref(), "IMT frozen tuple mismatch");
+                }
+            }
             if state.residual.contains(phase.table.as_str()) {
                 bail!("residual keys remain at table {}", phase.table);
             }
@@ -1023,7 +1042,7 @@ mod tests {
                 "realm_rewards_tree_node_key_table" => rewards.clone(),
                 "public_key_hash_to_user_ids_table" => serde_json::json!([["0102", 1]]),
                 "pending_id_to_pending_proc_id_table" => proc_json.clone(),
-                "imt_key_index_table" => serde_json::json!([[1, 0, 1, "0102"]]),
+                "imt_key_index_table" => serde_json::json!([{ "tree_id": 1, "tree_sub_id": 0, "key_bucket": -32768, "encoded_key": "00".repeat(32), "target": null }]),
                 "global_user_tree_table"
                 | "global_checkpoint_tree_table"
                 | "user_registration_tree_table"
@@ -1140,34 +1159,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_equals_latest_reconciles_without_mutation() {
-        let mut plan = build_plan(
-            RollbackRole::Coordinator,
-            0,
-            0,
-            210,
-            210,
-            104,
-            Vec::new(),
-        );
-        let store = FakeStore::new(plan.latest_checkpoint_id, plan.latest_pending_id);
+    async fn target_equals_latest_cleans_pending_state_then_reconciles() {
+        for ids in [Vec::new(), vec![
+            RollbackIds { checkpoint_id: None, pending_id: 41, proc_id: 4100 },
+            RollbackIds { checkpoint_id: None, pending_id: 43, proc_id: 4300 },
+        ]] {
+            let mut plan = build_plan(RollbackRole::Realm, 0, 2, 10, 10, 43, ids);
+            let store = FakeStore::new(10, 43);
+            store.cleanup_seeded_residuals.store(true, std::sync::atomic::Ordering::SeqCst);
+            for table in data_phase_tables() { store.add_residual(table); }
+            let progress = FakeProgressStore::new();
+            assert_eq!(execute_rollback_plan(&store, &progress, &mut plan).await.unwrap(), RollbackOutcome::Completed);
+            assert_eq!(store.applied(), data_phase_tables());
+            assert_eq!(store.marker(), 10);
+            assert_eq!(store.counter(), 43);
+            assert_eq!(store.marker_writes(), 0);
+            assert!(plan.phases.iter().all(|phase| phase.status == RollbackPhaseStatus::Completed));
+            assert_eq!(execute_rollback_plan(&store, &progress, &mut plan).await.unwrap(), RollbackOutcome::Reconciled);
+            assert_eq!(store.applied(), data_phase_tables());
+            assert_eq!(store.marker_writes(), 0);
+            store.add_residual("TKVSV1-singletons".into());
+            assert!(execute_rollback_plan(&store, &progress, &mut plan).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn equal_head_resumes_every_phase_from_saved_progress() {
+        for table in data_phase_tables() {
+            let mut plan = build_plan(RollbackRole::Realm, 0, 2, 10, 10, 43, vec![RollbackIds { checkpoint_id: None, pending_id: 43, proc_id: 4300 }]);
+            let original = plan.clone();
+            let store = FakeStore::new(10, 43);
+            let progress = FakeProgressStore::new();
+            store.fail_execute(Some(table));
+            assert!(execute_rollback_plan(&store, &progress, &mut plan).await.is_err());
+            let mut loaded = progress.snapshots().last().cloned().unwrap_or(original);
+            assert_eq!(execute_rollback_plan(&store, &progress, &mut loaded).await.unwrap(), RollbackOutcome::Completed);
+            assert_eq!(store.applied(), data_phase_tables());
+            assert_eq!(store.marker_writes(), 0);
+            assert_eq!(store.counter(), 43);
+        }
+    }
+
+    #[tokio::test]
+    async fn equal_head_reloads_pending_final_phase_after_journal_failure() {
+        let mut plan = build_plan(RollbackRole::Realm, 0, 2, 10, 10, 43, Vec::new());
+        let store = FakeStore::new(10, 43);
         let progress = FakeProgressStore::new();
+        progress.fail_after_marker_status(true);
+        assert!(execute_rollback_plan(&store, &progress, &mut plan).await.is_err());
+        let snapshots = progress.snapshots();
+        let mut loaded = snapshots[snapshots.len() - 2].clone();
+        assert_eq!(loaded.phases.last().unwrap().status, RollbackPhaseStatus::Pending);
+        assert_eq!(execute_rollback_plan(&store, &progress, &mut loaded).await.unwrap(), RollbackOutcome::Completed);
+        assert_eq!(store.applied(), data_phase_tables());
+        assert_eq!(store.marker_writes(), 0);
+        assert_eq!(store.counter(), 43);
+    }
 
-        let outcome = execute_rollback_plan(&store, &progress, &mut plan).await.unwrap();
-
-        assert_eq!(outcome, RollbackOutcome::Reconciled);
-        assert!(store.applied().is_empty(), "§12 target==latest must not execute destructive phases");
-        assert_eq!(store.marker_writes(), 0, "reconciliation must not rewrite the current marker");
-        assert_eq!(store.backup_deletes(), 1, "reconciliation must still delete leftover post-target backups");
-        let events = store.events();
-        assert!(
-            events.iter().all(|event| matches!(event, StoreEvent::Verify(_) | StoreEvent::DeleteBackups)),
-            "reconciliation may only delete leftover backups and verify postconditions"
-        );
-        let delete_pos = events.iter().position(|event| matches!(event, StoreEvent::DeleteBackups)).expect("reconciliation must delete leftovers");
-        let first_verify_pos = events.iter().position(|event| matches!(event, StoreEvent::Verify(_))).expect("reconciliation must verify postconditions");
-        assert!(delete_pos < first_verify_pos, "reconciliation must delete leftover backups before verifying postconditions");
-        assert!(plan.phases.iter().all(|phase| phase.status == RollbackPhaseStatus::Completed));
+    #[tokio::test]
+    async fn mixed_imt_phase_replays_partial_mutation_from_saved_plan() {
+        for equal_head in [false, true] {
+            let mut plan = build_plan(RollbackRole::Realm, 0, 2, 10, if equal_head {10} else {11}, 43, Vec::new());
+            let phase = plan.phases.iter_mut().find(|phase| phase.table == "imt_key_index_table").unwrap();
+            phase.keys = serde_json::json!([
+                {"tree_id":7,"tree_sub_id":9,"key_bucket":-32768,"encoded_key":"00".repeat(32),"target":{"leaf_key":"00".repeat(32),"birth_checkpoint":3,"leaf_index":10}},
+                {"tree_id":7,"tree_sub_id":9,"key_bucket":-32511,"encoded_key":"01".repeat(32),"target":null}
+            ]);
+            let store = FakeStore::new(plan.latest_checkpoint_id, 43);
+            store.imt_rows.lock().insert((7,9,-32511,"01".repeat(32)), super::super::plan::RollbackImtKeyIndexRow { leaf_key: "01".repeat(32), birth_checkpoint: 11, leaf_index: 12 });
+            store.fail_after_imt_entry.store(true, std::sync::atomic::Ordering::SeqCst);
+            let progress = FakeProgressStore::new();
+            assert!(execute_rollback_plan(&store, &progress, &mut plan).await.is_err());
+            assert_eq!(store.imt_rows.lock().len(), 2);
+            let saved = progress.snapshots().last().unwrap().clone();
+            let mut loaded: RollbackPlan = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+            assert_eq!(execute_rollback_plan(&store, &progress, &mut loaded).await.unwrap(), RollbackOutcome::Completed);
+            assert_eq!(store.imt_rows.lock().len(), 1);
+            assert_eq!(store.counter(), 43);
+            assert_eq!(store.marker_writes(), usize::from(!equal_head));
+            assert_eq!(execute_rollback_plan(&store, &progress, &mut loaded).await.unwrap(), RollbackOutcome::Reconciled);
+        }
     }
 
     #[tokio::test]

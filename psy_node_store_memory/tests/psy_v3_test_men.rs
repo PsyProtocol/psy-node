@@ -2,10 +2,15 @@ use std::sync::Arc;
 
 use parth_core::{
     data::hash::hash256::Hash256,
-    protocol::core_types::{QNetworkHashTypes, QNetworkTreeConstants},
+    protocol::core_types::{Q256BitHash, QNetworkHashTypes, QNetworkTreeConstants},
 };
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_node_core::psy_core_db::v3_implementation::{full::PsyUnifiedCoreDatabaseStore, test_helper::ExPsyUnifiedStoreTestHelper};
+use psy_node_core::{
+    psy_core_db::traits::full::PsyNodeContractStateIMTDatabaseWriter,
+    store::traits::core_db::{CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTLeafWriter},
+};
+use psy_data::v1::qdata::contract::{encode_imt_key_for_sorting, imt_key_bucket_to_i16, serialize_imt_leaf_ffs_entry_v2};
 use psy_node_store_memory::cbs_store::{InMemoryCoreStore, InMemoryTableIdentifier};
 // ================================================================================================
 // REPLACEMENT FOR TEST HARNESS SETUP
@@ -234,5 +239,114 @@ async fn exact_vintage_rewards_and_completeness_regressions() -> anyhow::Result<
     let simple_store = SimpleStoreEx::setup(db).await?;
     simple_store.store.test_realm_specific_proofs().await?;
     simple_store.store.test_exact_global_user_proof_completeness().await?;
+    Ok(())
+}
+
+fn imt_entry(tree_id: u64, tree_sub_id: u64, leaf_index: u64, leaf_key: [u8; 32], leaf_value: [u8; 32], is_new_key: bool) -> [u8; 161] {
+    serialize_imt_leaf_ffs_entry_v2::<Hash256>(
+        tree_id,
+        tree_sub_id,
+        leaf_index,
+        &Hash256::from_owned_32bytes([1; 32]),
+        &Hash256::from_owned_32bytes(leaf_key),
+        &Hash256::from_owned_32bytes(leaf_value),
+        &Hash256::from_owned_32bytes([2; 32]),
+        0,
+        is_new_key,
+    )
+}
+
+fn sentinel_index_key(leaf_key: &[u8; 32]) -> (i16, [u8; 32]) {
+    let encoded_key = encode_imt_key_for_sorting::<u64, Hash256>(&Hash256::from_owned_32bytes(*leaf_key));
+    let key_bucket = imt_key_bucket_to_i16(u16::from_be_bytes([encoded_key[0], encoded_key[1]]));
+    (key_bucket, encoded_key)
+}
+
+#[tokio::test]
+async fn sentinel_key_index_preserves_birth_and_recovers_missing_row() -> anyhow::Result<()> {
+    let db = Arc::new(InMemoryTestStore::new());
+    let simple_store = SimpleStoreEx::setup(db).await?;
+    let unified = &simple_store.store.db;
+    let tree_id = 7_i64;
+    let tree_sub_id = 9_i64;
+    let sentinel_key = [0u8; 32];
+    let (key_bucket, encoded_key) = sentinel_index_key(&sentinel_key);
+
+    unified
+        .contract_state_imt_set_leaves_ffs(3, &imt_entry(7, 9, 10, sentinel_key, [0; 32], false))
+        .await?;
+    unified
+        .contract_state_imt_set_leaves_ffs(11, &imt_entry(7, 9, 10, sentinel_key, [0; 32], false))
+        .await?;
+    assert_eq!(
+        unified
+            .store
+            .db_select_imt_key_index_exact(unified.imt_key_index_table.as_ref(), tree_id, tree_sub_id, key_bucket, &encoded_key)
+            .await?,
+        Some((10, 3))
+    );
+
+    let new_key = [5u8; 32];
+    unified
+        .contract_state_imt_set_leaves_ffs(11, &imt_entry(7, 9, 12, new_key, [6; 32], true))
+        .await?;
+    let (new_bucket, new_encoded_key) = sentinel_index_key(&new_key);
+    assert_eq!(
+        unified
+            .store
+            .db_select_imt_key_index_exact(unified.imt_key_index_table.as_ref(), tree_id, tree_sub_id, new_bucket, &new_encoded_key)
+            .await?,
+        Some((12, 11))
+    );
+
+    let recovered_tree_id = 8_i64;
+    let recovered_tree_sub_id = 10_i64;
+    let (recovered_bucket, recovered_encoded_key) = sentinel_index_key(&sentinel_key);
+    assert_eq!(
+        unified
+            .store
+            .db_select_imt_key_index_exact(
+                unified.imt_key_index_table.as_ref(),
+                recovered_tree_id,
+                recovered_tree_sub_id,
+                recovered_bucket,
+                &recovered_encoded_key,
+            )
+            .await?,
+        None
+    );
+    unified
+        .store
+        .db_insert_imt_leaf(unified.imt_leaf_table.as_ref(), recovered_tree_id, recovered_tree_sub_id, 14, 4, &[1; 32], &sentinel_key, &[0; 32], &[2; 32], 0)
+        .await?;
+    unified
+        .store
+        .db_insert_imt_leaf(unified.imt_leaf_table.as_ref(), recovered_tree_id, recovered_tree_sub_id, 14, 9, &[3; 32], &sentinel_key, &[0; 32], &[2; 32], 0)
+        .await?;
+    unified
+        .contract_state_imt_set_leaves_ffs(9, &imt_entry(8, 10, 14, sentinel_key, [0; 32], false))
+        .await?;
+    assert_eq!(
+        unified
+            .store
+            .db_select_imt_key_index_exact(
+                unified.imt_key_index_table.as_ref(),
+                recovered_tree_id,
+                recovered_tree_sub_id,
+                recovered_bucket,
+                &recovered_encoded_key,
+            )
+            .await?,
+        Some((14, 4))
+    );
+
+    unified
+        .store
+        .db_insert_imt_key_index(unified.imt_key_index_table.as_ref(), tree_id, tree_sub_id, key_bucket, &encoded_key, &sentinel_key, 4, 99)
+        .await?;
+    let conflict = unified
+        .contract_state_imt_set_leaves_ffs(11, &imt_entry(7, 9, 10, sentinel_key, [0; 32], false))
+        .await;
+    assert!(conflict.is_err());
     Ok(())
 }

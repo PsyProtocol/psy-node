@@ -840,7 +840,7 @@ pub struct DepositArgs {
     #[clap(long, env, default_value = "http://127.0.0.1:8545")]
     pub l1_rpc_url: String,
     /// L1 private key for signing the deposit tx
-    #[clap(long, short = 'p', required_unless_present = "resume_deposit_index")]
+    #[clap(long, short = 'p', env = "L1_PRIVATE_KEY", hide_env_values = true, required_unless_present = "resume_deposit_index")]
     pub private_key: Option<String>,
     /// Router contract address (0x-prefixed hex)
     #[clap(long, env)]
@@ -928,7 +928,7 @@ pub struct ClaimWithdrawalArgs {
     #[clap(long, env, default_value = "http://127.0.0.1:8545")]
     pub l1_rpc_url: String,
     /// L1 private key (required to submit the claim tx)
-    #[clap(long, short = 'p')]
+    #[clap(long, short = 'p', env = "L1_PRIVATE_KEY", hide_env_values = true)]
     pub private_key: String,
     /// L1 recipient address (20-byte EVM address or 32-byte hex; 20-byte
     /// inputs are auto-left-padded to bytes32)

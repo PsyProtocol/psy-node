@@ -1898,6 +1898,45 @@ where
         }
         Ok(None)
     }
+
+    async fn db_select_imt_leaf_birth(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        max_checkpoint_id: i64,
+    ) -> anyhow::Result<Option<(i64, Vec<u8>)>> {
+        let db = self.get_or_create_table(&format!("{}_imt_leaf_{}", table.to_string(), "leaf"));
+        let mut partition = Vec::with_capacity(24);
+        partition.extend_from_slice(&tree_id.to_be_bytes());
+        partition.extend_from_slice(&tree_sub_id.to_be_bytes());
+        partition.extend_from_slice(&leaf_index.to_be_bytes());
+
+        if max_checkpoint_id < 0 {
+            return Ok(None);
+        }
+        let mut start = partition.clone();
+        start.extend_from_slice(&0_i64.to_be_bytes());
+        let Some(entry) = db.range(start..).next() else {
+            return Ok(None);
+        };
+        let key = entry.key();
+        if key.len() != 32 || key[..24] != partition {
+            return Ok(None);
+        }
+        let checkpoint_id = i64::from_be_bytes(key[24..32].try_into()?);
+        if checkpoint_id < 0 || checkpoint_id > max_checkpoint_id {
+            return Ok(None);
+        }
+        let value = entry.value();
+        if value.len() < 64 {
+            anyhow::bail!(
+                "IMT leaf value for tree_id={tree_id}, tree_sub_id={tree_sub_id}, leaf_index={leaf_index}, checkpoint_id={checkpoint_id} is shorter than 64 bytes"
+            );
+        }
+        Ok(Some((checkpoint_id, value[32..64].to_vec())))
+    }
 }
 
 #[async_trait]

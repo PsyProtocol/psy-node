@@ -23,6 +23,7 @@ use psy_network_circuit::gadgets::qdata::{
     checkpoint_state_roots::PsyCheckpointGlobalStateRootsGadget,
 };
 use psy_plonky2_basic_helpers::builder::{comparison::CircuitBuilderComparison, core::CircuitBuilderHelpersCore, verify::CircuitBuilderVerifyProofHelpers};
+use psy_plonky2_common_circuits::hash::keccak::keccak256_bytes_targets;
 use psy_plonky2_common_circuits::hash::merkle::gadgets::merkle_proof::MerkleProofGadget;
 use psy_ups_circuit::signature::software_defined::get_zk_public_key_param;
 
@@ -40,7 +41,7 @@ type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 
 pub const REWARD_CLAIM_MESSAGE_BYTES: usize = 32 * (8 + REWARD_CLAIM_MAX_CHECKPOINTS);
-pub const REWARD_CLAIM_PUBLIC_INPUT_BITS: usize = 256 * (8 + REWARD_CLAIM_MAX_CHECKPOINTS);
+pub const REWARD_CLAIM_PUBLIC_INPUT_BITS: usize = 256;
 /// `keccak256(bytes("PsyReward/TokenCheckpointClaim/1"))`, legacy Keccak-256.
 /// The expression is the authority; this compiled constant must match it.
 const CLAIM_DOMAIN: [u8; 32] = [
@@ -203,6 +204,24 @@ fn chunk_bits(builder: &mut CircuitBuilder<F, D>, bytes: &[Target]) -> Vec<Targe
     bits
 }
 
+fn register_reward_claim_commitment(builder: &mut CircuitBuilder<F, D>, message: &[Target]) -> usize {
+    let commitment = keccak256_bytes_targets(builder, message);
+    let mut bytes = Vec::with_capacity(32);
+    for word in commitment {
+        let bits = builder.split_le(word.0, 32);
+        for byte in bits.chunks_exact(8) {
+            bytes.push(builder.le_sum(byte.iter()));
+        }
+    }
+    let mut commitment_bit_count = 0;
+    for chunk in bytes.chunks_exact(8) {
+        let bits = chunk_bits(builder, chunk);
+        commitment_bit_count += bits.len();
+        builder.register_public_inputs(&bits);
+    }
+    commitment_bit_count
+}
+
 impl RewardClaimWrapCircuit {
     pub fn new(
         common_data: &CommonCircuitData<F, D>,
@@ -225,8 +244,7 @@ impl RewardClaimWrapCircuit {
         );
         assert_eq!(USER_REWARD_CHECKPOINT_AGGREGATE_PUBLIC_INPUT_COUNT, 15 + REWARD_CLAIM_MAX_CHECKPOINTS);
         assert_eq!(USER_REWARD_CHECKPOINT_AGGREGATE_RECURSIVE_PUBLIC_INPUT_COUNT, 68);
-        assert_eq!(REWARD_CLAIM_PUBLIC_INPUT_BITS, REWARD_CLAIM_MESSAGE_BYTES * 8);
-        assert_eq!(REWARD_CLAIM_PUBLIC_INPUT_BITS, 18432);
+        assert_eq!(REWARD_CLAIM_PUBLIC_INPUT_BITS, 256);
         assert_eq!(verifier_data_target.constants_sigmas_cap.0.len(), 16);
         let suffix = USER_REWARD_CHECKPOINT_AGGREGATE_PUBLIC_INPUT_COUNT;
         for index in 0..4 {
@@ -303,12 +321,8 @@ impl RewardClaimWrapCircuit {
         let message = register_reward_claim_message(
             &mut builder, &statement[..USER_REWARD_CHECKPOINT_AGGREGATE_PUBLIC_INPUT_COUNT], &root_bits, &state_manager, &token,
         );
-        let mut bits = Vec::<Target>::with_capacity(REWARD_CLAIM_PUBLIC_INPUT_BITS);
-        for chunk in message.chunks_exact(8) {
-            bits.extend(chunk_bits(&mut builder, chunk));
-        }
-        assert_eq!(bits.len(), REWARD_CLAIM_PUBLIC_INPUT_BITS);
-        builder.register_public_inputs(&bits);
+        let commitment_bit_count = register_reward_claim_commitment(&mut builder, &message);
+        assert_eq!(commitment_bit_count, REWARD_CLAIM_PUBLIC_INPUT_BITS);
         let circuit_data = builder.build::<C>();
         assert_eq!(circuit_data.common.num_public_inputs, REWARD_CLAIM_PUBLIC_INPUT_BITS);
         Self {
@@ -357,20 +371,16 @@ mod tests {
     use plonky2::{iop::witness::PartialWitness, plonk::circuit_builder::CircuitBuilder};
 
     #[test]
-    fn reward_claim_public_bits_recover_frozen_message() {
+    fn reward_claim_commitment_matches_full_message_keccak() {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let statement: Vec<_> = (0..USER_REWARD_CHECKPOINT_AGGREGATE_PUBLIC_INPUT_COUNT).map(|_| builder.add_virtual_target()).collect();
         let root_bits: Vec<_> = (6..10).map(|index| builder.split_le(statement[index], 64)).collect();
         let state_manager: [Target; 20] = std::array::from_fn(|_| builder.add_virtual_target());
         let token: [Target; 20] = std::array::from_fn(|_| builder.add_virtual_target());
         let message = register_reward_claim_message(&mut builder, &statement, &root_bits, &state_manager, &token);
-        let mut bits = Vec::with_capacity(REWARD_CLAIM_PUBLIC_INPUT_BITS);
-        for chunk in message.chunks_exact(8) {
-            bits.extend(chunk_bits(&mut builder, chunk));
-        }
-        builder.register_public_inputs(&bits);
+        register_reward_claim_commitment(&mut builder, &message);
         let circuit_data = builder.build::<C>();
-
+        for count in [1usize, 3, REWARD_CLAIM_MAX_CHECKPOINTS] {
         let mut values = vec![0u64; USER_REWARD_CHECKPOINT_AGGREGATE_PUBLIC_INPUT_COUNT];
         values[0] = 7;
         values[1] = 0x0102_0304;
@@ -382,13 +392,13 @@ mod tests {
         values[7] = 0x2222_2222_0000_001a;
         values[8] = 0x3333_3333_0000_001b;
         values[9] = 0x4444_4444_0000_001c;
-        values[10] = 3;
+        values[10] = count as u64;
         values[11] = 0x4444_4444;
         values[12] = 0x5555_5555;
         values[13] = 0x6666_6666;
         values[14] = 0x7777_7777;
         for index in 0..REWARD_CLAIM_MAX_CHECKPOINTS {
-            values[15 + index] = if index < 3 { 0xa0 + index as u64 } else { 0 };
+            values[15 + index] = if index < count { index as u64 } else { 0 };
         }
         let state_manager_value = [0x43u8; 20];
         let token_value = [0x45u8; 20];
@@ -440,17 +450,24 @@ mod tests {
             expected.extend(word(values[15 + index]));
         }
         assert_eq!(expected.len(), REWARD_CLAIM_MESSAGE_BYTES);
-        assert_eq!(REWARD_CLAIM_PUBLIC_INPUT_BITS, 256 * (8 + REWARD_CLAIM_MAX_CHECKPOINTS));
-        assert_eq!(REWARD_CLAIM_PUBLIC_INPUT_BITS, 18432);
-
+        assert_eq!(REWARD_CLAIM_PUBLIC_INPUT_BITS, 256);
+        let mut hasher = tiny_keccak::Keccak::v256();
+        let mut digest = [0u8; 32];
+        tiny_keccak::Hasher::update(&mut hasher, &expected);
+        tiny_keccak::Hasher::finalize(hasher, &mut digest);
         let recovered = proved.public_inputs.chunks(64).flat_map(|group| {
             (0..8).map(move |byte| {
                 group[(7 - byte) * 8..(8 - byte) * 8].iter().enumerate()
                     .fold(0u8, |accumulator, (index, bit)| accumulator + ((bit.to_canonical_u64() as u8) << index))
             })
         }).collect::<Vec<_>>();
-        assert_eq!(recovered.len(), REWARD_CLAIM_MESSAGE_BYTES);
-        assert_eq!(recovered, expected);
+        assert_eq!(recovered.len(), 32);
+        assert_eq!(recovered, digest);
+        circuit_data.verify(proved.clone()).unwrap();
+        let mut tampered = proved;
+        tampered.public_inputs[0] = F::ONE - tampered.public_inputs[0];
+        assert!(circuit_data.verify(tampered).is_err());
+        }
     }
 
     fn prove_canonical_goldilocks(value: u64) -> bool {

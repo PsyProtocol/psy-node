@@ -1,5 +1,5 @@
 import { parseArgs } from "util";
-import { rmdir, rm, exists, mkdir, writeFile } from "fs/promises";
+import { rm, exists, mkdir, writeFile } from "fs/promises";
 import fs from "fs";
 import path from "path";
 import net from "node:net";
@@ -118,15 +118,15 @@ export async function retryProcessorStartup<T>(
 type ProcessLineVisitor = (line: string, process: RunningProcess) => void;
 // this is an insecure, obviously fake private key for local devnet use only
 const FAKE_MINER_PRIVATE_KEY = "691337BADFACE067320cb499a730fa6c81a756ed912f181f0f20a6b1fa5c1337";
-async function killDocker() {
+async function killDocker(): Promise<void> {
+    await runIgnoreErrors(["docker", "stop", "valkey-server", "scylla-server", "nats-server"]);
+}
+
+async function runIgnoreErrors(cmd: string[], cwd?: string): Promise<void> {
     try {
-        const proc = Bun.spawn(['docker', 'stop', 'valkey-server', 'scylla-server', 'nats-server'], {
-            stderr: "ignore",
-            stdout: "ignore"
-        });
-        await proc.exited;
-    } catch (e) {
-        console.log("[DevNet] Failed to kill docker", e);
+        await runAndCapture(cmd, cwd);
+    } catch {
+        // best-effort teardown helper
     }
 }
 
@@ -498,7 +498,15 @@ async function anvilRpc(
     if (!response.ok) {
         throw new Error(`[DevNet] ${method} failed with HTTP ${response.status}`);
     }
-    const body = await response.json() as { error?: { message?: string }; result?: unknown };
+    let body: { error?: { message?: string }; result?: unknown };
+    try {
+        body = await response.json() as { error?: { message?: string }; result?: unknown };
+    } catch (error) {
+        const endpoint = new URL(rpcUrl);
+        const contentLength = response.headers.get("content-length");
+        const category = error instanceof SyntaxError ? "invalid JSON" : "response parse failed";
+        throw new Error(`[DevNet] ${method} response from ${endpoint.origin} HTTP ${response.status}${contentLength === null ? "" : ` content-length ${contentLength}`} ${category}`);
+    }
     if (body.error) {
         throw new Error(`[DevNet] ${method} failed: ${body.error.message || "unknown error"}`);
     }
@@ -3267,10 +3275,14 @@ export function localAnvilLaunchArgs(
     statePath: string,
     genesis?: PreservedAnvilGenesis,
 ): string[] {
+    const intervalEnv = process.env.ANVIL_STATE_INTERVAL;
+    const interval = intervalEnv === undefined || intervalEnv.length === 0
+        ? 900
+        : resolvePositiveIntegerSetting(/^\d+$/.test(intervalEnv) ? intervalEnv : "0", 900, "ANVIL_STATE_INTERVAL");
     const args = [
         "anvil", "--host", "0.0.0.0", "--port", String(port),
         "--chain-id", chainId,
-        "--state", statePath, "--state-interval", process.env.ANVIL_STATE_INTERVAL || "60", "--preserve-historical-states", "-vvvv",
+        "--state", statePath, "--state-interval", String(interval), "--preserve-historical-states", "-vvvv",
     ];
     if (genesis) args.push("--timestamp", genesis.timestamp);
     return args;
@@ -4075,19 +4087,399 @@ async function startEnvioIndexerForRelayer(
     return envioProcess;
 }
 
-async function cleanCheckpoint(checkpointPath: string, cwd: string = '.') {
-    const fullPath = path.resolve(cwd, checkpointPath);
-    if (await exists(fullPath)) {
-        await rmdir(fullPath, { recursive: true });
+const PURGE_DOCKER_TIMEOUT_MS = 15_000;
+const PURGE_ANVIL_SIGNAL_WAIT_MS = 5_000;
+const PURGE_DOCKER_NAMES = ["valkey-server", "nats-server", "scylla-server", "nostr-relay"] as const;
+const PURGE_DOCKER_VOLUMES = ["psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data", "psy-devnet-nats"] as const;
+
+export interface TeardownCommandResult {
+    argv0: string;
+    code: number | null;
+    timedOut: boolean;
+    stderrCategory: "empty" | "present";
+    stdout: string;
+    stdoutComplete: boolean;
+}
+
+async function readPipeBounded(stream: ReadableStream<Uint8Array> | null | undefined, limit: number, cancel: { run?: () => void }): Promise<{ text: string; complete: boolean }> {
+    if (!stream) return { text: "", complete: false };
+    const reader = stream.getReader();
+    let complete = true;
+    cancel.run = () => { complete = false; void reader.cancel().catch(() => {}); };
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            if (value.byteLength > limit - size) complete = false;
+            const slice = value.subarray(0, Math.min(value.byteLength, limit - size));
+            if (slice.byteLength > 0) chunks.push(slice);
+            size += slice.byteLength;
+        }
+    } catch {
+        complete = false;
+    } finally {
+        reader.releaseLock();
+    }
+    return { text: Buffer.concat(chunks).toString("utf8"), complete };
+}
+
+export async function runTeardownCommand(argv: string[], cwd: string | undefined, timeoutMs: number): Promise<TeardownCommandResult> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error(`[DevNet] teardown command timeout must be positive, received ${timeoutMs}`);
+    const proc = Bun.spawn(["setsid", "--wait", ...argv], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const stdoutCancel: { run?: () => void } = {};
+    const stderrCancel: { run?: () => void } = {};
+    const stdoutTask = readPipeBounded(proc.stdout, 65_536, stdoutCancel);
+    const stderrTask = readPipeBounded(proc.stderr, 65_536, stderrCancel);
+    const completed = Promise.all([proc.exited, stdoutTask, stderrTask]);
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    const timer = setTimeout(() => resolve(true), timeoutMs);
+    completed.then(() => resolve(false), () => resolve(true));
+    const timedOut = await promise;
+    clearTimeout(timer);
+    if (timedOut && proc.pid > 0 && proc.pid !== process.pid) {
+        // The leader may already have exited while descendants still hold its pipes.
+        try { process.kill(-proc.pid, "SIGKILL"); } catch { /* group already gone */ }
+        try { proc.kill("SIGKILL"); } catch { /* leader already reaped */ }
+        stdoutCancel.run?.();
+        stderrCancel.run?.();
+    }
+    const reap = Promise.withResolvers<Awaited<typeof completed> | null>();
+    const reapTimer = setTimeout(() => reap.resolve(null), 1_000);
+    completed.then(reap.resolve, () => reap.resolve(null));
+    const result = await reap.promise;
+    clearTimeout(reapTimer);
+    return {
+        argv0: argv[0] ?? "",
+        code: timedOut || !result ? null : result[0],
+        timedOut: timedOut || !result,
+        stderrCategory: !result || result[2].text.trim() ? "present" : "empty",
+        stdout: result?.[1].text.trim() ?? "",
+        stdoutComplete: !timedOut && !!result?.[1].complete,
+    };
+}
+
+function formatTeardownFailure(phase: string, result: TeardownCommandResult): string {
+    const status = result.timedOut ? "timed out after bounded wait" : `exit ${result.code}`;
+    return `${phase} ${result.argv0} ${status} stdout=${result.stdoutComplete ? "complete" : "incomplete"} stderr=${result.stderrCategory}`;
+}
+
+export interface AnvilProcessIdentity {
+    exe: string;
+    cwd: string;
+    cmdline: string;
+    starttime: string;
+}
+
+const LOCAL_ANVIL_RPCS: ReadonlyArray<{ network: L1DeploymentNetwork; relative: string; port: number }> = [
+    { network: "localhost", relative: "db/anvil/state.json", port: 8545 },
+    { network: "localhostBsc", relative: "db/anvil/localhostBsc/state.json", port: 9545 },
+    { network: "localhostBase", relative: "db/anvil/localhostBase/state.json", port: 10545 },
+];
+
+async function tcpPortOpen(port: number): Promise<boolean> {
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    const done = (open: boolean) => { socket.destroy(); resolve(open); };
+    socket.setTimeout(300);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+    return promise;
+}
+
+function anvilFlagValues(args: readonly string[], name: string): string[] | null {
+    const values: string[] = [];
+    const prefix = `${name}=`;
+    for (let index = 0; index < args.length; index += 1) {
+        const token = args[index];
+        if (token === name) {
+            const value = args[index + 1];
+            if (value === undefined || value.startsWith("--")) return null;
+            values.push(value);
+            index += 1;
+        } else if (token.startsWith(prefix)) {
+            values.push(token.slice(prefix.length));
+        }
+    }
+    return values;
+}
+
+async function canonicalExistingAncestor(target: string): Promise<string | null> {
+    const missing: string[] = [];
+    let cursor = path.resolve(target);
+    while (!(await exists(cursor))) {
+        const parent = path.dirname(cursor);
+        if (parent === cursor) return null;
+        missing.push(cursor);
+        cursor = parent;
+    }
+    let canonical: string;
+    try { canonical = await fs.promises.realpath(cursor); }
+    catch { return null; }
+    for (const segment of missing.reverse()) canonical = path.join(canonical, path.basename(segment));
+    return canonical;
+}
+
+/** Pure identity predicate: basename anvil, this checkout, one expected state, matching port. */
+export async function isRepoAnvilProcess(processInfo: AnvilProcessIdentity, canonicalRepoRoot: string): Promise<boolean> {
+    if (path.basename(processInfo.exe) !== "anvil") return false;
+    let cwdReal: string;
+    let exeReal: string;
+    try {
+        cwdReal = await fs.promises.realpath(processInfo.cwd);
+        exeReal = await fs.promises.realpath(processInfo.exe);
+    } catch {
+        return false;
+    }
+    if (path.basename(exeReal) !== "anvil" || cwdReal !== canonicalRepoRoot) return false;
+    const args = processInfo.cmdline.split("\0").filter((token) => token.length > 0);
+    if (args.length === 0 || path.basename(args[0]) !== "anvil") return false;
+    const states = anvilFlagValues(args, "--state");
+    const ports = anvilFlagValues(args, "--port");
+    if (!states || states.length !== 1 || !ports || ports.length !== 1) return false;
+    const port = Number(ports[0]);
+    const expected = LOCAL_ANVIL_RPCS.find((entry) => entry.port === port);
+    if (!expected || !Number.isInteger(port)) return false;
+    const stateReal = await canonicalExistingAncestor(path.resolve(canonicalRepoRoot, states[0]));
+    const allowed = await canonicalExistingAncestor(path.resolve(canonicalRepoRoot, expected.relative));
+    if (!stateReal || !allowed || stateReal !== allowed) return false;
+    let cursor = path.resolve(canonicalRepoRoot, states[0]);
+    while (true) {
+        let link: fs.Stats;
+        try { link = await fs.promises.lstat(cursor); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                const parent = path.dirname(cursor);
+                if (parent === cursor) break;
+                cursor = parent;
+                continue;
+            }
+            return false;
+        }
+        if (link.isSymbolicLink()) {
+            let followed: string;
+            try { followed = await fs.promises.realpath(cursor); }
+            catch { return false; }
+            const inside = followed === canonicalRepoRoot || followed.startsWith(`${canonicalRepoRoot}${path.sep}`);
+            if (!inside) return false;
+        }
+        const parent = path.dirname(cursor);
+        if (parent === cursor) break;
+        cursor = parent;
+    }
+    return true;
+}
+
+async function readAnvilProcessIdentity(pid: number): Promise<AnvilProcessIdentity | null> {
+    const base = `/proc/${pid}`;
+    try {
+        const [exe, cwd, cmdline, stat] = await Promise.all([
+            fs.promises.readlink(`${base}/exe`),
+            fs.promises.readlink(`${base}/cwd`),
+            fs.promises.readFile(`${base}/cmdline`),
+            fs.promises.readFile(`${base}/stat`, "utf8"),
+        ]);
+        const close = stat.lastIndexOf(")");
+        const starttime = close >= 0 ? stat.slice(close + 2).split(" ")[19] : "";
+        if (!starttime) return null;
+        return { exe, cwd, cmdline: cmdline.toString("utf8"), starttime };
+    } catch {
+        return null;
     }
 }
 
-async function runIgnoreErrors(cmd: string[], cwd?: string): Promise<void> {
-    try {
-        await runAndCapture(cmd, cwd);
-    } catch {
-        // best-effort teardown helper
+function processAncestors(pid: number): Set<number> {
+    const ancestors = new Set<number>([pid]);
+    let cursor = pid;
+    for (let depth = 0; depth < 64; depth += 1) {
+        let status = "";
+        try { status = fs.readFileSync(`/proc/${cursor}/status`, "utf8"); }
+        catch { break; }
+        const match = /^PPid:\s+(\d+)$/m.exec(status);
+        const parent = match ? Number(match[1]) : 0;
+        if (!parent || ancestors.has(parent)) break;
+        ancestors.add(parent);
+        cursor = parent;
     }
+    return ancestors;
+}
+
+async function listPids(): Promise<number[]> {
+    const entries = await fs.promises.readdir("/proc");
+    return entries.filter((entry) => /^\d+$/.test(entry)).map((entry) => Number(entry));
+}
+
+export interface PurgeAnvilControl {
+    listPids?: () => Promise<number[]>;
+    readIdentity?: (pid: number) => Promise<AnvilProcessIdentity | null>;
+    signal?: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
+    alive?: (pid: number) => boolean;
+    portOpen?: (port: number) => Promise<boolean>;
+}
+
+export async function stopRepoAnvilsForPurge(repoRoot: string, control: PurgeAnvilControl = {}): Promise<void> {
+    const canonicalRepoRoot = await fs.promises.realpath(repoRoot);
+    const list = control.listPids ?? listPids;
+    const readIdentity = control.readIdentity ?? readAnvilProcessIdentity;
+    const signal = control.signal ?? ((pid, sig) => process.kill(pid, sig));
+    const alive = control.alive ?? ((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+    const portOpen = control.portOpen ?? tcpPortOpen;
+    const protectedPids = processAncestors(process.pid);
+    const owned: Array<{ pid: number; starttime: string }> = [];
+    const failures: string[] = [];
+    for (const pid of await list()) {
+        if (protectedPids.has(pid)) continue;
+        const identity = await readIdentity(pid);
+        if (!identity || !(await isRepoAnvilProcess(identity, canonicalRepoRoot))) continue;
+        const again = await readIdentity(pid);
+        if (!again || again.starttime !== identity.starttime || again.exe !== identity.exe || again.cwd !== identity.cwd || again.cmdline !== identity.cmdline) {
+            failures.push(`pid ${pid} identity changed before signal`);
+            continue;
+        }
+        owned.push({ pid, starttime: again.starttime });
+    }
+    const stopOwned = async (sig: "SIGTERM" | "SIGKILL") => {
+        for (const entry of owned) {
+            const current = await readIdentity(entry.pid);
+            if (!current) continue;
+            if (current.starttime !== entry.starttime || !(await isRepoAnvilProcess(current, canonicalRepoRoot))) {
+                failures.push(`pid ${entry.pid} reused before ${sig}`);
+                continue;
+            }
+            try { signal(entry.pid, sig); }
+            catch (error) {
+                if (alive(entry.pid)) failures.push(`pid ${entry.pid} ${sig} failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+    };
+    await stopOwned("SIGTERM");
+    const deadline = Date.now() + PURGE_ANVIL_SIGNAL_WAIT_MS;
+    while (owned.some((entry) => alive(entry.pid)) && Date.now() < deadline) await Bun.sleep(50);
+    if (owned.some((entry) => alive(entry.pid))) await stopOwned("SIGKILL");
+    const killDeadline = Date.now() + PURGE_ANVIL_SIGNAL_WAIT_MS;
+    while (owned.some((entry) => alive(entry.pid)) && Date.now() < killDeadline) await Bun.sleep(50);
+    const residual: string[] = [];
+    for (const entry of owned) {
+        const current = await readIdentity(entry.pid);
+        if (alive(entry.pid) && current?.starttime === entry.starttime) residual.push(String(entry.pid));
+    }
+    for (const chain of LOCAL_ANVIL_RPCS) {
+        if (await portOpen(chain.port)) residual.push(`port ${chain.port}`);
+    }
+    if (failures.length > 0 || residual.length > 0) {
+        throw new Error(`[DevNet] purge Anvil cleanup failed: ${[...failures, ...residual.map((item) => `still live ${item}`)].join("; ")}`);
+    }
+}
+
+async function runBoundedTeardown(phase: string, argv: string[], cwd: string | undefined, failures: string[]): Promise<TeardownCommandResult> {
+    try {
+        const result = await runTeardownCommand(argv, cwd, PURGE_DOCKER_TIMEOUT_MS);
+        if (result.timedOut || result.code !== 0 || !result.stdoutComplete) failures.push(formatTeardownFailure(phase, result));
+        return result;
+    } catch (error) {
+        failures.push(`${phase} ${argv[0] ?? ""} spawn failed: ${error instanceof Error ? error.message : String(error)}`);
+        return { argv0: argv[0] ?? "", code: null, timedOut: false, stderrCategory: "present", stdout: "", stdoutComplete: false };
+    }
+}
+
+export function exactSnapshotNames(stdout: string): Set<string> {
+    return new Set(stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0));
+}
+async function purgeDockerCleanup(cwd: string, failures: string[]): Promise<boolean> {
+    const containers = await runBoundedTeardown("docker-ps", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
+    const volumes = await runBoundedTeardown("volume-ls", ["docker", "volume", "ls", "--format", "{{.Name}}"], undefined, failures);
+    if (containers.timedOut || containers.code !== 0 || !containers.stdoutComplete || volumes.timedOut || volumes.code !== 0 || !volumes.stdoutComplete) {
+        return false;
+    }
+    const containerNames = exactSnapshotNames(containers.stdout);
+    const volumeNames = exactSnapshotNames(volumes.stdout);
+    const composeFile = path.join(cwd, "psy_cli", "psy_relayer_cli", "indexer", "envio", "generated", "docker-compose.yaml");
+    const expected = new Set<string>(PURGE_DOCKER_NAMES);
+    if (await exists(composeFile)) {
+        const compose = await fs.promises.readFile(composeFile, "utf8");
+        for (const match of compose.matchAll(/^\s*container_name:\s*["']?([^"'\s#]+)["']?\s*$/gm)) expected.add(match[1]);
+        for (const match of compose.matchAll(/^\s{2}([A-Za-z0-9_.-]+):\s*$/gm)) expected.add(`generated-${match[1]}-1`);
+        // Direct cleanup owns infrastructure names; Compose owns its stack.
+    }
+    const liveContainers = PURGE_DOCKER_NAMES.filter((name) => containerNames.has(name));
+    const liveVolumes = PURGE_DOCKER_VOLUMES.filter((name) => volumeNames.has(name));
+    if (liveContainers.length > 0) {
+        await runBoundedTeardown("docker-stop", ["docker", "stop", ...liveContainers], undefined, failures);
+        await runBoundedTeardown("docker-rm", ["docker", "rm", "-f", ...liveContainers], undefined, failures);
+    }
+    if (liveVolumes.length > 0) await runBoundedTeardown("volume-rm", ["docker", "volume", "rm", "-f", ...liveVolumes], undefined, failures);
+    if (await exists(composeFile)) {
+        await runBoundedTeardown("compose-down", ["docker", "compose", "-f", composeFile, "down", "--remove-orphans", "-v"], cwd, failures);
+    }
+    const containersAfter = await runBoundedTeardown("docker-ps-after", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
+    const volumesAfter = await runBoundedTeardown("volume-ls-after", ["docker", "volume", "ls", "--format", "{{.Name}}"], undefined, failures);
+    if (containersAfter.timedOut || containersAfter.code !== 0 || !containersAfter.stdoutComplete || volumesAfter.timedOut || volumesAfter.code !== 0 || !volumesAfter.stdoutComplete) {
+        return false;
+    }
+    const leftContainers = exactSnapshotNames(containersAfter.stdout);
+    const leftVolumes = exactSnapshotNames(volumesAfter.stdout);
+    for (const name of expected) if (leftContainers.has(name)) failures.push(`container ${name} still present`);
+    for (const name of PURGE_DOCKER_VOLUMES) if (leftVolumes.has(name)) failures.push(`volume ${name} still present`);
+    return failures.length === 0;
+}
+
+async function knownApplicationsGone(failures: string[]): Promise<boolean> {
+    const patterns = ["psy_node_cli", "psy_worker_cli", "psy_relayer_cli", "psy_user_cli prove-proxy", "psy_user_cli faucet-server", "psy-services", "psy-indexer", "hardhat node", "vite.js --host 0.0.0.0 --port 5179", "envio/bin.js"];
+    const listed = await runBoundedTeardown("application-ps", ["ps", "-eo", "args="], undefined, failures);
+    if (listed.timedOut || listed.code !== 0 || !listed.stdoutComplete) {
+        return false;
+    }
+    const lines = listed.stdout.split("\n");
+    const residual = patterns.filter((pattern) => lines.some((line) => line.includes(pattern)));
+    const ports = [3000, 5433, 8080, 8081, 9898, 9998, 5174, 5175, 5176, 5177, 5178, 5179];
+    for (let port = 1337; port <= 1346; port += 1) ports.push(port);
+    for (const port of ports) if (await tcpPortOpen(port)) residual.push(`port ${port}`);
+    if (residual.length > 0) failures.push(`applications still present: ${residual.join(", ")}`);
+    return residual.length === 0;
+}
+
+async function purgeDevnet(cwd: string): Promise<void> {
+    const failures: string[] = [];
+    let anvilStopped = true;
+    try { await stopRepoAnvilsForPurge(cwd); }
+    catch (error) {
+        anvilStopped = false;
+        failures.push(error instanceof Error ? error.message : String(error));
+    }
+    const dockerClean = await purgeDockerCleanup(cwd, failures);
+    const applicationsGone = await knownApplicationsGone(failures);
+    console.log("[DevNet] Purging local checkpoints, Anvil state, logs, deployments, and Docker volumes...");
+    const purgePaths = ["./local_checkpoints", "./db/anvil", "./logs", ...DEVNET_PURGE_PATHS.filter((entry) => entry.startsWith("psy-contracts/"))];
+    if (anvilStopped && dockerClean && applicationsGone) {
+        const root = await fs.promises.realpath(cwd);
+        for (const relative of purgePaths) {
+            const target = path.resolve(root, relative);
+            try {
+                const parent = await canonicalExistingAncestor(path.dirname(target));
+                if (!parent || (parent !== root && !parent.startsWith(`${root}${path.sep}`))) {
+                    throw new Error("parent resolves outside checkout");
+                }
+                await rm(target, { recursive: true, force: true });
+            } catch (error) {
+                failures.push(`delete ${relative}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+    } else failures.push("skipped deleting purge paths: cleanup was not proven");
+    for (const chain of LOCAL_ANVIL_RPCS) {
+        if (await tcpPortOpen(chain.port)) failures.push(`residual port ${chain.port}`);
+    }
+    for (const relative of purgePaths) {
+        try {
+            await fs.promises.lstat(path.resolve(cwd, relative));
+            failures.push(`residual path ${relative}`);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") failures.push(`cannot inspect residual path ${relative}`);
+        }
+    }
+    if (failures.length > 0) throw new Error(`[DevNet] purge failed without startup: ${failures.join(" | ")}`);
 }
 
 async function killGeneratedEnvioStack(cwd: string, purge: boolean): Promise<void> {
@@ -4111,9 +4503,7 @@ async function killKnownProcesses(): Promise<void> {
         "psy-services/target/release/psy-indexer",
         "cargo run --release --bin psy-services",
         "cargo run --release --bin psy-indexer",
-        "anvil --port 8545",
-        "anvil --port 9545",
-        "anvil --port 10545",
+
         "hardhat node",
         "dummy_prover.sh prove_random",
         "client_prover/psy_bridge",
@@ -4138,7 +4528,7 @@ async function killKnownProcesses(): Promise<void> {
 }
 
 async function killKnownPorts(): Promise<void> {
-    const ports: number[] = [3000, 5433, 8080, 8081, 8545, 9545, 10545, 9898, 9998, 5174, 5175, 5176, 5177, 5178, 5179];
+    const ports: number[] = [3000, 5433, 8080, 8081, 9898, 9998, 5174, 5175, 5176, 5177, 5178, 5179];
     for (let p = 1337; p <= 1346; p++) ports.push(p);
     for (let p = 9999; p <= 10008; p++) ports.push(p);
     for (let p = 13380; p <= 14679; p++) ports.push(p);
@@ -4155,28 +4545,16 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
     console.log(`
 [DevNet] Tearing down...${purge ? " (purge)" : ""}`);
     await killKnownProcesses();
+    if (purge) {
+        await purgeDevnet(cwd);
+        return;
+    }
     await killDocker();
     await runIgnoreErrors(["docker", "rm", "-f", "valkey-server", "nats-server", "scylla-server", "nostr-relay"]);
     await killGeneratedEnvioStack(cwd, purge);
     await killKnownPorts();
-    if (purge) {
-        console.log("[DevNet] Purging local checkpoints, Anvil state, logs, deployments, and Docker volumes...");
-        await cleanCheckpoint("./local_checkpoints", cwd);
-        await cleanCheckpoint("./db/anvil", cwd);
-        await cleanCheckpoint("./logs", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/localhost", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/localhostBsc", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/localhostBase", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/sepolia", cwd);
-        await cleanCheckpoint("./psy-contracts/deployments/ethereum", cwd);
-        await runIgnoreErrors(["docker", "volume", "rm", "-f", "psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data", "psy-devnet-nats"]);
-    }
 }
-const LOCAL_ANVIL_RPCS: ReadonlyArray<{ network: L1DeploymentNetwork; port: number }> = [
-    { network: "localhost", port: 8545 },
-    { network: "localhostBsc", port: 9545 },
-    { network: "localhostBase", port: 10545 },
-];
+
 
 function hexQuantityToBigInt(value: unknown, source: string): bigint {
     if (typeof value !== "string" || !/^0x[0-9a-fA-F]+$/.test(value)) {
@@ -4264,17 +4642,6 @@ export async function preserveLiveAnvilRpc(
     if (stop) await stop();
     await publishAnvilStateSnapshot(stagedPath, statePath);
     console.log(`[DevNet] preserved Anvil '${source}' state at ${statePath} (best block ${best})`);
-}
-
-async function tcpPortOpen(port: number): Promise<boolean> {
-    return await new Promise((resolve) => {
-        const socket = net.createConnection({ host: "127.0.0.1", port });
-        const done = (open: boolean) => { socket.destroy(); resolve(open); };
-        socket.setTimeout(300);
-        socket.once("connect", () => done(true));
-        socket.once("timeout", () => done(false));
-        socket.once("error", () => done(false));
-    });
 }
 
 /** Absent-owner failsafe: a live Anvil has unknown producers, so preservation is refused. */
@@ -6727,11 +7094,12 @@ Usage: bun run dev/locSetupV4.ts [options]
     // Auto-setup: clone repos, install deps, download keystore, build binaries
     // Skip for teardown so it works even on a partially configured machine
     if (purge && !teardown) {
-        // Purge at startup is the single data-destroying switch: it wipes the
-        // same paired set as `PURGE=1 make shutdown` (checkpoints, Anvil state,
-        // logs, deployments, Docker volumes) before any process starts, so L1
-        // and L2 are purged together and contracts are redeployed fresh.
-        await teardownDevnet(".", purge);
+        try {
+            await teardownDevnet(".", true);
+        } catch (error) {
+            console.error(`[DevNet] startup purge failed; not starting: ${error}`);
+            process.exit(1);
+        }
     }
     if (!teardown) {
         await ensureDevEnvironment(REPO_ROOT, {

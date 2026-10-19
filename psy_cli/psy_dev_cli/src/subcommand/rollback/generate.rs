@@ -140,6 +140,11 @@ impl RollbackStateReader for ScyllaRollbackStateReader {
             .await?
             .is_some())
     }
+    async fn imt_leaf_birth(&self, tree_id: i64, tree_sub_id: i64, leaf_index: i64, target_checkpoint_id: i64) -> anyhow::Result<Option<(i64, Vec<u8>)>> {
+        self.db.store.db_select_imt_leaf_birth(
+            &self.db.imt_leaf_table, tree_id, tree_sub_id, leaf_index, target_checkpoint_id,
+        ).await
+    }
     async fn imt_next_append_index(
         &self,
         tree_id: i64,

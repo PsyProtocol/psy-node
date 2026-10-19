@@ -72,7 +72,7 @@ const GOLDILOCKS_ORDER: u64 = 0xffff_ffff_0000_0001;
 /// the request carries no key, address, or aggregate witness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewardClaimWrapProofInput {
-    /// Hex of the bincode-serialized wrapper `ProofWithPublicInputs` (18432 public inputs).
+    /// Hex of the bincode-serialized wrapper `ProofWithPublicInputs` (256 digest bits).
     pub reward_claim_wrap_proof_hex: String,
 }
 
@@ -80,8 +80,9 @@ pub struct RewardClaimWrapProofInput {
 pub struct RewardClaimWrapGroth16Proof {
     /// Groth16 proof as eight Solidity words (uint256[8]).
     pub solidity_proof: [String; 8],
-    /// High and low 128-bit digest halves of the 2304-byte checkpoint-list
-    /// message, returned as the token verifier's uint256[2] public inputs.
+    /// High and low 128-bit halves of keccak256 of the wrapper's in-circuit
+    /// message commitment, bound by the generic gnark path (deposit/withdrawal
+    /// double-hash semantics; PsyToken computes the identical hash).
     pub solidity_public_inputs: [String; 2],
 }
 
@@ -976,12 +977,14 @@ impl RewardClient {
     }
 
     pub async fn read_reward_root_recognized(&self, l1_rpc_url: &str, block: &str, state_manager: &str, root: [u8; 32]) -> Result<bool> {
-        let epoch = self.l1_call(l1_rpc_url, block, state_manager, keccak256(b"rewardRootEpoch()")[..4].to_vec()).await?;
-        let mut data = keccak256(b"rewardRootEpochs(bytes32)")[..4].to_vec();
+        let clean = self.l1_call(l1_rpc_url, block, state_manager, keccak256(b"rewardRootsClean()")[..4].to_vec()).await?;
+        if !decode_claimed_bool(&clean)? { return Ok(false); }
+        let mut data = keccak256(b"rewardRootCheckpointId(bytes32)")[..4].to_vec();
         data.extend_from_slice(&root);
-        let recognized = self.l1_call(l1_rpc_url, block, state_manager, data).await?;
-        anyhow::ensure!(epoch.len() == 32 && recognized.len() == 32 && epoch[..24] == [0; 24] && recognized[..24] == [0; 24], "reward root epoch width");
-        Ok(epoch != [0; 32] && epoch == recognized)
+        let registered = self.l1_call(l1_rpc_url, block, state_manager, data).await?;
+        let tip = self.l1_call(l1_rpc_url, block, state_manager, keccak256(b"lastFinalizedCheckpointId()")[..4].to_vec()).await?;
+        anyhow::ensure!(registered.len() == 32 && tip.len() == 32 && registered[..24] == [0; 24] && tip[..24] == [0; 24], "reward root checkpoint id width");
+        Ok(registered != [0; 32] && registered <= tip)
     }
 
     pub async fn read_finalized_checkpoint(&self, l1_rpc_url: &str, block: &str, state_manager: &str) -> Result<(u32, [u8; 32], bool)> {
@@ -1020,7 +1023,8 @@ impl RewardClient {
         })
     }
 
-    /// One portable 18432-bit wrapper proof after the 147-input checkpoint aggregate.
+    /// One portable wrapper proof carrying the 256-bit message commitment after
+    /// the 147-input checkpoint aggregate.
     /// The held key and registration path are witness-only and are not returned.
     pub fn prove_reward_claim(
         &self,

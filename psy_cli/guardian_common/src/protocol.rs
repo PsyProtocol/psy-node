@@ -6,7 +6,7 @@ use psy_client_common::{args::ContractCallData, data::qhashout::QHashOut};
 use psy_client_data::{guta::end_cap_input::SubmitUserEndCapNonProofInput, qdata::contract::PsyContractLeaf};
 use psy_crypto::{hash::core::sha256::CoreSha256Hasher, signature::secp256k1::core::PsyCompressedSecp256K1Signature};
 use psy_prover::trace::{GeneratedTxTraceJson, TxTrace, TraceStep};
-use psy_vm::ups::multisig::{MultisigAccount, MultisigSignatures};
+use psy_vm::ups::multisig::{MultisigAccount, MultisigSignatures, MULTISIG_POLICY_CONTRACT_ID};
 use serde::{de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor}, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -442,14 +442,14 @@ impl GuardianAuthorization {
         validate_hash(self.account_public_key)?; validate_hash(self.multisig_fingerprint)?; validate_hash(self.endcap_verifier_fingerprint)?;
         if self.endcap_verifier_fingerprint == Hash4::ZERO { return Err(mismatch); }
         let account = self.account_json.decode()?;
-        if account.contract_id != 6 || account.initial_policy.threshold != 2 || account.initial_policy.member_count != 3 { return Err(GuardianSignError::PolicyMismatch); }
+        if account.contract_id != MULTISIG_POLICY_CONTRACT_ID || account.initial_policy.threshold != 2 || account.initial_policy.member_count != 3 { return Err(GuardianSignError::PolicyMismatch); }
         for member in account.initial_policy.member_hashes { validate_hash(member)?; }
         let param = account.public_key_param().map_err(|_| GuardianSignError::PolicyMismatch)?;
         let key = QHashOut(PoseidonHash::two_to_one(self.multisig_fingerprint.0, param.0));
         if key != self.account_public_key || self.multisig_fingerprint == Hash4::ZERO { return Err(GuardianSignError::AccountIdentityConflict); }
         if self.approved_contracts.windows(2).any(|w| w[0].contract_id >= w[1].contract_id) || self.chains.windows(2).any(|w| w[0].chain_index >= w[1].chain_index) { return Err(mismatch); }
         let approved: BTreeSet<_> = self.approved_contracts.iter().map(|c| c.contract_id).collect();
-        if [0, 2, 3, 6].iter().any(|id| !approved.contains(id)) { return Err(mismatch); }
+        if [0, MULTISIG_POLICY_CONTRACT_ID, 2, 3].iter().any(|id| !approved.contains(id)) { return Err(mismatch); }
         let mut chain_ids = BTreeSet::new();
         for chain in &self.chains {
             if chain.chain_id == U256::ZERO || !chain_ids.insert(chain.chain_id) || chain.genesis_hash.0 == [0; 32]
@@ -948,7 +948,7 @@ mod compiler_artifact_tests {
         };
         let compiler_artifact_json = JsonText::from_value(&artifact).unwrap();
         let compiler_artifact_sha256 = sha256(compiler_artifact_json.as_str().as_bytes());
-        ApprovedContract { contract_id: 6, contract_leaf_json: JsonText::from_value(&PsyContractLeaf::default()).unwrap(), compiler_artifact_json, compiler_artifact_sha256 }
+        ApprovedContract { contract_id: MULTISIG_POLICY_CONTRACT_ID, contract_leaf_json: JsonText::from_value(&PsyContractLeaf::default()).unwrap(), compiler_artifact_json, compiler_artifact_sha256 }
     }
 
     #[test]
@@ -997,5 +997,39 @@ mod compiler_artifact_tests {
         approved.compiler_artifact_json = JsonText::from_value(&artifact).unwrap();
         approved.compiler_artifact_sha256 = sha256(approved.compiler_artifact_json.as_str().as_bytes());
         assert_eq!(approved.compiler_artifact().unwrap().abi["contract"]["state"][0]["type"]["length"].as_u64(), Some(4294967296));
+    }
+
+    #[test]
+    fn contract1_authorization_is_accepted_and_contract6_is_rejected() {
+        use psy_vm::ups::multisig::{MultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
+        let mut members = [Hash4::ZERO; 8];
+        members[0] = Hash4::from_values(1, 0, 0, 0);
+        members[1] = Hash4::from_values(2, 0, 0, 0);
+        members[2] = Hash4::from_values(3, 0, 0, 0);
+        let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes: members } };
+        let fingerprint = Hash4::from_values(9, 8, 7, 6);
+        let param = account.public_key_param().unwrap();
+        let approved_contracts = [0, MULTISIG_POLICY_CONTRACT_ID, 2, 3].into_iter().map(|contract_id| { let mut contract = approval(); contract.contract_id = contract_id; contract }).collect();
+        let mut auth = GuardianAuthorization {
+            version: 1, network_magic: 90101, genesis_hash: Hex([1; 32]), user_id: BRIDGE_USER_ID,
+            account_json: JsonText::from_value(&account).unwrap(),
+            account_public_key: QHashOut(PoseidonHash::two_to_one(fingerprint.0, param.0)), multisig_fingerprint: fingerprint,
+            deposit_contract_id: 2, withdrawal_contract_id: 3, fee_contract_id: 0, guta_fee: 1, da_fee: 1, max_fee: 2, max_endcap_proof_bytes: 1024,
+            endcap_verifier_fingerprint: Hash4::from_values(1, 1, 1, 1), approved_contracts,
+            chains: vec![ChainAuthorization {
+                chain_index: 0, chain_id: U256::from(1u64), genesis_hash: Hex([2; 32]), bridge: Hex([3; 20]), state_manager: Hex([4; 20]),
+                bridge_code_hash: Hex([5; 32]), bridge_implementation: Hex([6; 20]), bridge_implementation_code_hash: Hex([7; 32]),
+                state_manager_code_hash: Hex([8; 32]), state_manager_implementation: Hex([9; 20]), state_manager_implementation_code_hash: Hex([10; 32]),
+                deployment_block: 1, token_mappings: vec![TokenMapping { token: Hex([11; 20]), l2_contract_id: 0 }],
+            }],
+        };
+        assert!(auth.validate(1, 1, 1024).is_ok());
+        auth.approved_contracts.retain(|contract| contract.contract_id != MULTISIG_POLICY_CONTRACT_ID);
+        assert_eq!(auth.validate(1, 1, 1024).unwrap_err(), GuardianSignError::AuthorizationMismatch);
+        auth.approved_contracts = [0, 2, 3, 6].into_iter().map(|contract_id| { let mut contract = approval(); contract.contract_id = contract_id; contract }).collect();
+        let mut wrong = account; wrong.contract_id = 6;
+        auth.account_json = JsonText::from_value(&wrong).unwrap();
+        auth.account_public_key = QHashOut(PoseidonHash::two_to_one(fingerprint.0, Hash4::from_values(4, 5, 6, 7).0));
+        assert_eq!(auth.validate(1, 1, 1024).unwrap_err(), GuardianSignError::PolicyMismatch);
     }
 }

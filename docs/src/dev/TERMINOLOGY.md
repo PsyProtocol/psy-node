@@ -160,6 +160,8 @@ PARTH is a forest. Do not invent a second name for a tree that already has one.
 | GWT | Global withdrawal tree. |
 | IMT-indexed tree | Previous `next_append_index != 0` for that `(user_id, contract_id)` contract-state tree. |
 | Positional tree | Previous `next_append_index == 0`. Changed leaves on this tree do not require IMT records. |
+| Rollback IMT key-index entry (`RollbackImtKeyIndexEntry`) | Frozen physical key `(tree_id, tree_sub_id, key_bucket, encoded_key)` and explicit nullable target for `set_imt_key_index`; null deletes, a row restores. |
+| Rollback IMT key-index row (`RollbackImtKeyIndexRow`) | Canonical sentinel target `(leaf_key, birth_checkpoint, leaf_index)` derived from the earliest retained leaf version at or before the rollback target, not the latest update. |
 
 ## 6. Privacy and bridge
 
@@ -178,7 +180,13 @@ PARTH is a forest. Do not invent a second name for a tree that already has one.
 | UserRewardLeafCircuit | Authenticates one selected job and one empty-to-occupied transition in the claim-local nullifier tree. |
 | UserRewardAggregateCircuit | Verifies two consecutive child transitions or lifts one UserRewardLeaf proof; binds common user, source checkpoint and complete source checkpoint leaf hash. |
 | UserRewardRootCircuit | Authorizes the chosen recipient through a pinned key-ownership relation and authenticated registration membership; requires empty initial nullifier root, historical source-leaf inclusion and exact checkpoint fee payout. |
-| RewardClaimWrapCircuit | Plonky2 wrapper for one pinned complete-list UserRewardCheckpointAggregate proof and its cyclic suffix; emits the full-list message bits for SharedGroth16Wrapper. Singleton uses the same protocol. Keystore directory: `reward_claim`. |
+| RewardClaimWrapCircuit | Plonky2 wrapper for one pinned complete-list UserRewardCheckpointAggregate proof and its cyclic suffix; computes the full token-domain message Keccak commitment and emits its 256 bits for SharedGroth16Wrapper. Singleton uses the same protocol. Keystore directory: `reward_claim`. |
+| register_reward_claim_commitment | Circuit operation hashing the complete reward claim message with legacy Keccak-256 and registering only its 256 digest bits, grouped as little-endian bits of successive big-endian 64-bit digest chunks. |
+| rewardRootCheckpointId | StateManager mapping from checkpoint tree root to verified finalize checkpoint id; recognition requires `rewardRootsClean` and a nonzero id within `lastFinalizedCheckpointId`. Sole checkpoint-id source for the enumerated roots. |
+| finalizedRewardRoots / finalizedRewardRootCount | StateManager's unique `bytes32[]` enumeration of registered proof-tip roots and its length getter. No mirrored checkpoint IDs or cleanup cursor. |
+| rewardRootsClean | StateManager flag initialized true on fresh deployment, false atomically on a real force-set with registered roots, true again only when bounded cleanup empties the enumeration. Finalization and reward recognition require true. |
+| revokeAbandonedRewardRoots | Admin-only bounded deletion of at most `maxEntries` roots from the enumeration and mapping after a real force-set; governance command `state-manager:revoke-abandoned-reward-roots --max-entries`. |
+| RewardRootCleanupRequired / InvalidRewardRootCleanup / RewardRootAlreadyRegistered | StateManager errors for paused finalize, zero-bound or inactive/uninitialized cleanup, and duplicate root registration, respectively. |
 | Claim-local nullifier tree | Temporary positional tree initialized empty for each claim; its index is `(2^(height - 2) - 1) + path_index` for the authenticated GUTA coordinate. |
 | old_nullifier_root / new_nullifier_root | Paired endpoints of a claim-local nullifier-tree transition; not durable user consumption history. |
 | nullifier_siblings | Authentication path for one insertion into the claim-local nullifier tree. |

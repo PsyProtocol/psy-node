@@ -776,13 +776,12 @@ mod tests {
         use psy_crypto::{hash::traits::qhashable::QFieldHashable, signature::secp256k1::{core::PsyCompressedSecp256K1Signature, wallet::hash_no_pad_compressed_public_key}};
         use psy_vm::{dpn::ops::state_cmd::data::{DPNStateCmd, DPNStateCmdGetSelfUserCurrentContractStateSlotHash}, ups::{state_reader::StateReaderResults, multisig::{MultisigSignatureInput, MultisigSignatureWitness, MultisigSignatures}}};
         let circuit = MultisigSignatureCircuit::new().unwrap();
-        let mut keys: Vec<_> = (1u8..=3).map(|byte| {
+        let keys: Vec<_> = (1u8..=3).map(|byte| {
             let key = SigningKey::from_slice(&[byte; 32]).unwrap();
             let compressed: [u8; 33] = key.verifying_key().to_encoded_point(true).as_bytes().try_into().unwrap();
             let member = hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(CompressedPublicKey(compressed));
             (member, key, compressed)
         }).collect();
-        keys.sort_by_key(|(member, _, _)| member.0.elements.map(|limb| limb.to_canonical_u64()));
         let mut account = account_fixture();
         for (member, key) in account.initial_policy.member_hashes[..3].iter_mut().zip(&keys) { *member = key.0; }
         let user = initialized_multisig_user(&account, &circuit, 100).unwrap();
