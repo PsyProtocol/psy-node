@@ -59,15 +59,18 @@ The integration directory must be new and outside both workspaces, with an
 existing parent. Its basename identifies the new `workspace-integration/...`
 branch in each target repository.
 
-Ordering comes from the union of recorded gitlinks in topic and frozen base
-trees, with compiler/contracts/genesis/sdk/services/wallet/dapp/node as tie order.
+Ordering comes from the union of recorded gitlinks in the topic tree and the
+merge ancestor of the topic and frozen target base trees, with
+compiler/contracts/genesis/sdk/services/wallet/dapp/node as tie order.
 Cycles fail before worktree creation. Only `.gitmodules` URLs whose basename is
 one of those repositories form cohort edges; external submodules and historical
-Cargo/package pins do not. Unchanged historical gitlinks remain unchanged. A
-changed cohort gitlink must equal its sibling topic HEAD, and that child topic
-must descend from its frozen local base. The parent index then records the
-child's completed integration hash, never its stranded pre-squash topic hash.
-Nested target checkouts are never retargeted.
+Cargo/package pins do not. A gitlink counts as changed only against that merge
+ancestor: a pin the topic kept while the target base advanced is not a topic
+change, and the target pin survives the squash. Unchanged historical gitlinks
+remain unchanged. A changed cohort gitlink must equal its sibling topic HEAD,
+and that child topic must descend from its frozen local base. The parent index
+then records the child's completed integration hash, never its stranded
+pre-squash topic hash. Nested target checkouts are never retargeted.
 
 All squash results are prepared on isolated integration branches before any
 publication. Conflicts stop immediately and retain every created worktree for
