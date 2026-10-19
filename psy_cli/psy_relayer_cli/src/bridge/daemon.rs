@@ -49,6 +49,10 @@ use crate::bridge::{
     prove_bridge::{self},
 };
 
+#[cfg(test)]
+#[path = "packed_deposit_live_canary.rs"]
+mod packed_deposit_live_canary;
+
 const DEFAULT_PROOF_DIR: &str = "/tmp/psy_bridge_proofs";
 const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 const DEFAULT_MAX_CHECKPOINT_BATCH: u64 = 64;
