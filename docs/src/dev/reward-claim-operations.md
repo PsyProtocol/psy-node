@@ -9,6 +9,7 @@ Run a proof-mining worker with durable job metadata, select owned reward-tree jo
 ## Table of Contents
 
 - [Terminology](#terminology)
+- [0. End-to-End Path](#0-end-to-end-path)
 - [1. Mine and Preserve Job Metadata](#1-mine-and-preserve-job-metadata)
 - [2. Select Eligible Work](#2-select-eligible-work)
 - [3. Query Before Claiming](#3-query-before-claiming)
@@ -25,13 +26,25 @@ Run a proof-mining worker with durable job metadata, select owned reward-tree jo
 - **ZK**: zero-knowledge authorization; **EVM**: Ethereum Virtual Machine.
 - **PSY**: Psy token; **JSON**: JavaScript Object Notation.
 
+## 0. End-to-End Path
+
+1. Create a ZK wallet and register it; wait for its assigned user ID using [Common Operations §2–3](common-operations.md#3-register-an-account) (`client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:25-46`).
+2. **Start the worker before user operations**, with `--user <registered-id>` and a writable backup, following [Section 1](#1-mine-and-preserve-job-metadata). Attribution is attached to the worker's work request, not retroactively to the transaction sender; starting after the transition's GUTA jobs are taken cannot reattribute them (`psy_worker_core/src/api/basic_job_fetcher.rs:45-55,218-224`).
+3. Fund the operating wallet through [Common Operations §5.1](common-operations.md#51-fund-psy-through-the-faucet), then execute contract 0 method `claim` with the returned faucet operator ID. Wait for confirmation before further calls (`docs/src/dev/common-operations.md:110-134`).
+4. Submit real state-changing `call` operations and wait for committed confirmation; a query or idle checkpoint is not payable work. The faucet `claim` above is itself a state-changing call (`docs/src/dev/common-operations.md:123-134`; `psy_plonky2_circuits/src/guta/gadgets/guta_no_change_gadget.rs:50-65`). Any registered key can operate its own account and transact; it need not be the reward owner. **The claim keystore must hold the key registered at `--user-id`**, regardless of who submitted the proved transactions (`psy_worker_core/src/api/basic_job_fetcher.rs:45-55,218-224`; `client_prover/psy_prover/src/local/reward_client.rs:1040-1051`).
+5. Preserve the full backup and select complete records for eligible circuits **and matching preimage user**, following [Section 2](#2-select-eligible-work); circuit IDs alone are insufficient (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:326-341,346-382`).
+6. Run the `get-claim-amount` precheck in [Section 3](#3-query-before-claiming) for the relevant L2 source/claiming users. It checks L2 user-to-user claims, **not** an Ethereum mining-reward quote; separately check Section 2's selected-job arithmetic (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_amount.rs:7-25`).
+7. Run `claim-rewards` with the selected jobs and registered owner's keystore using [Section 4](#4-submit-the-claim); require `confirmed`, not merely `proof_only`, under [Section 5](#5-interpret-results-and-cache-state) (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:195-255`).
+
 ## 1. Mine and Preserve Job Metadata
 
 Use a worker configuration for the selected network and worker signing identity, then explicitly set reward attribution and a writable backup destination:
 
+> **Worker environment requirement:** unset `PSY_CONFIG_PATH` and `PSY_NETWORK` in the worker's launch environment. A bad inherited configuration can produce `Started N worker threads` followed within milliseconds by `Worker exit.` without an error line: the outer task checks only join failures and discards an inner `Result::Err` (`psy_cli/psy_worker_cli/src/subcommand/worker.rs:54-59,114-121,156-175`). These variables are build-time inputs to `psy_config`, not worker CLI options (`client_prover/psy_core/psy_config/build.rs:6,43-56`; `psy_cli/psy_worker_cli/src/subcommand.rs:30-73`), **but they also affect runtime circuit initialization**: `PSY_NETWORK` must match the selected network, and `PSY_CONFIG_PATH` restricts validator lookup to that one file, suppressing the generated-runtime-config fallback. A file without injected validators therefore fails initialization (`psy_data/src/config/network_config.rs:28-57`; `psy_plonky2_circuits/src/circuit_library/core.rs:27-28`). Pass `--network` explicitly to the worker and `--rpc-config` explicitly to user CLI commands; the worker has no `--rpc-config` option (`psy_cli/psy_worker_cli/src/subcommand.rs:30-73`; `client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:542-566`).
+
 ```bash
-./target/release/psy_worker_cli worker \
-  --config '<worker-config.json>' \
+env -u PSY_CONFIG_PATH -u PSY_NETWORK ./target/release/psy_worker_cli worker \
+  --config '<worker-config.json>' --network local-devnet \
   --user '<reward-owner-user-id>' \
   --coordinator-api-url '<coordinator-edge-url>' \
   --realm-api-url '<realm-edge-url>' \
@@ -134,6 +147,8 @@ This returns `claim_amount` for those two L2 users; omitting `--checkpoint-id` s
 
 Set up the registered ZK wallet using [Common Operations](common-operations.md). Supply its keystore through `--keystore-path` and password securely through `WALLET_PASSWORD`. Supply the **separate Ethereum signing key** through `L1_PRIVATE_KEY`; it signs the EVM transaction, while the held ZK key proves registration ownership (`client_prover/psy_core/psy_common/src/args.rs:91-100`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:46-50,130-175`; `client_prover/psy_prover/src/local/reward_client.rs:1029-1051`).
 
+> **Address casing:** supply both `--reward-token` and `--recipient` as `0x` plus exactly 40 **lowercase** hexadecimal characters. `lowercase_address` validates; it does not convert checksummed input. Deployment discovery validates the token through this same helper, so an uppercase token fails with `recipient must be 0x plus 40 lowercase hex characters` even when the recipient is valid. The error names `recipient` regardless of which address failed (`client_prover/psy_prover/src/local/reward_client.rs:749-753,1156-1158,1177-1178`).
+
 ```bash
 ./target/release/psy_user_cli claim-rewards \
   --rpc-config '<rpc-config.json>' \
@@ -172,7 +187,7 @@ Recipient decoding accepts 20 bytes or zero-padded 32 bytes, rejects high bits a
 Read the result file only after a successful process exit. The JSON object has `transaction_hash`, `status`, and `chain_id`; it is not wrapped in a command enum (`client_prover/psy_cli/psy_user_cli/src/result.rs:105-119,270-279`).
 
 - `status: "confirmed"`: at least one payout is confirmed; `transaction_hash` is the **last** confirmed transaction. Receipt success, reward event, mint transfer and every claimed pair are checked (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:195-228`).
-- `status: "proof_only"`, `transaction_hash: null`: no payout was confirmed. Already-claimed pairs are skipped; unfinalized selections can be preaggregated. This status does **not** assert a mint or that every pending source was available (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:63-76,93-104,223-255`).
+- `status: "proof_only"`, `transaction_hash: null`: no payout was confirmed. Already-claimed pairs are skipped; unfinalized selections can be preaggregated. This status does **not** assert a mint or that every pending source was available (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:63-76,93-104,223-255`). If every checkpoint is deferred with `historical checkpoint root differs from finalized L1 root`, follow [L1 reward-root recovery after rollback](rollback-operations.md#9-l1-reward-root-recovery-after-rollback) rather than replacing the jobs file (`client_prover/psy_prover/src/local/reward_client.rs:998-1002`).
 - After execution begins, errors remove the result file rather than publishing stale success. Results are written atomically. Use a dedicated output path, never an input file (`client_prover/psy_cli/psy_user_cli/src/result.rs:301-374`; `client_prover/psy_cli/psy_user_cli/src/main.rs:270-312`).
 - An error can follow an actual payout. Preserve `confirmed_tx=...` and `submitted_tx=...` from the error chain and inspect those receipts before retrying; absent output does not prove no transaction was sent (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:214-221,261-268`).
 
@@ -184,6 +199,9 @@ Braces below denote values interpolated by the source. Do not replace these resp
 
 | Response | Meaning and required action | Source |
 |---|---|---|
+| `recipient must be 0x plus 40 lowercase hex characters` | Token **or** recipient address has invalid casing/format. Supply both as `0x` plus 40 lowercase hex characters; the error always names recipient. | `client_prover/psy_prover/src/local/reward_client.rs:749-753,1156-1158,1177-1178` |
+| `reward source is newer than the recognized anchor` | Source checkpoint exceeds the L1 anchor. Wait for settlement to advance the recognized anchor, then retry with unchanged jobs. | `client_prover/psy_prover/src/local/reward_client.rs:541-544` |
+| `Failed to open backup file: {error}` | Backup cannot be opened for append (for example, unwritable destination). Mining continues **without durable claim metadata**. Fix the destination before mining more work. | `psy_worker_core/src/api/basic_job_fetcher.rs:59-70` |
 | `reward registration leaf does not match the private key` | Unregistered or different held ZK key at the anchor. Confirm registration and use the matching wallet; the Ethereum signer cannot substitute. | `client_prover/psy_prover/src/local/reward_client.rs:1043-1045` |
 | `reward root accepts only ZK authorization` | Unsupported wallet signing type. Select the registered ZK wallet. | `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:49` |
 | `jobs file {file} contains a reward for user_id {record_user}, but current wallet user_id is {expected_user}: {source}, job_id={job:?}` | Wrong tag-preimage first limb. Select the correct owner's records; do not edit their preimages. | `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:326-341` |

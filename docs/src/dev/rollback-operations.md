@@ -30,7 +30,8 @@ This procedure requires the default foreground stack on loopback, realms 0 and 1
 - [6. Execute and require completion](#6-execute-and-require-completion)
 - [7. Failure and resume procedure](#7-failure-and-resume-procedure)
 - [8. Resume and post-E2E acceptance](#8-resume-and-post-e2e-acceptance)
-- [9. Security](#9-security)
+- [9. L1 reward-root recovery after rollback](#9-l1-reward-root-recovery-after-rollback)
+- [10. Security](#10-security)
 
 ## 1. Flow
 
@@ -296,7 +297,71 @@ Apply the complete [post-rollback acceptance checklist](devnet_lifecycle.md#7-po
 
 Keep the five completed RPs and before/after evidence together. A completed local RP is not proof of L1 recovery, and transaction admission alone is not E2E success (`docs/src/dev/devnet_lifecycle.md:203-212`).
 
-## 9. Security
+## 9. L1 reward-root recovery after rollback
+
+**Diagnose lineage mismatch, not missing reward work.** If `claim-rewards` defers every checkpoint with `historical checkpoint root differs from finalized L1 root`, compare the Coordinator's checkpoint-tree root at `lastFinalizedCheckpointId` with StateManager's `lastVerifiedCheckpointRoot`. A retained pre-rollback L1 root does not authenticate the current L2 lineage (`client_prover/psy_prover/src/local/reward_client.rs:990-1002`; deferral: `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:88-104`). Repeated bridge-aggregation proof generation is not settlement progress. The daemon builds that proof at `psy_cli/psy_relayer_cli/src/bridge/daemon.rs:1504-1524`, then submits `finalize` and, on failure, logs the error and continues the loop (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:1570-1633`). A mismatched starting root makes `finalize` revert `InvalidCheckpointContinuity` (`psy-contracts/src/StateManager.sol:214-220`).
+
+Use this narrowly scoped repair only when the finalized ID and deposit/withdrawal roots remain correct and **only the checkpoint lineage root needs replacement**. Otherwise use the separately authorized full L1 recovery plan; do not invent bridge roots. The signer must be this deployment's **StateManagerAdmin**, checked through its addresses provider's `IPsyACLManagerSM`, not merely an owner or proposer (`psy-contracts/src/StateManager.sol:95-102,126-155`).
+
+1. Read all five current fields at one L1 block, and query the Coordinator root at that exact finalized checkpoint. Run from the repository root; supply public deployment values and the admin's encrypted keystore path, never a private-key literal. `get-checkpoint-tree-root` takes `--checkpoint-id` and returns a `root` field (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:399-405`; `client_prover/psy_cli/psy_user_cli/src/main.rs:592-598`; `client_prover/psy_cli/psy_user_cli/src/result.rs:121-124`). The root is serialized as reversed bytes in hexadecimal, matching the low-u64-first checkpoint word; prefix it with `0x`, without reversing it again (`client_prover/psy_core/psy_common/src/data/qhashout.rs:29-42`; `client_prover/psy_prover/src/local/reward_client.rs:691-698`).
+
+   ```bash
+   set -euo pipefail
+   test -d "$WORKSPACE"
+   read -r -p 'L1 RPC URL: ' L1_RPC_URL
+   read -r -p 'StateManager proxy address: ' STATE_MANAGER
+   read -r -p 'Psy RPC config path: ' RPC_CONFIG
+   read -r -p 'StateManagerAdmin keystore path: ' ADMIN_KEYSTORE
+   L1_BLOCK=$(cast block-number --rpc-url "$L1_RPC_URL")
+   state_field() {
+     cast call "$STATE_MANAGER" "$1" --rpc-url "$L1_RPC_URL" \
+       --block "$L1_BLOCK" --json | jq -er '.[0]'
+   }
+   ANCHOR=$(state_field 'lastFinalizedCheckpointId()(uint64)')
+   OLD_ROOT=$(state_field 'lastVerifiedCheckpointRoot()(bytes32)')
+   DEPOSIT_ROOT=$(state_field 'lastVerifiedDepositTreeRoot()(bytes32)')
+   WITHDRAWAL_ROOT=$(state_field 'lastVerifiedWithdrawalTreeRoot()(bytes32)')
+   WITHDRAWAL_SUBTREE=$(state_field 'withdrawalSubtreeRoot()(bytes32)')
+   ./target/release/psy_user_cli get-checkpoint-tree-root \
+     --rpc-config "$RPC_CONFIG" --checkpoint-id "$ANCHOR" \
+     --result-file "$WORKSPACE/reward-anchor-root.json"
+   NEW_ROOT=$(jq -er '.root | select(test("^[0-9a-f]{64}$")) | "0x" + .' \
+     "$WORKSPACE/reward-anchor-root.json")
+   test "$OLD_ROOT" != "$NEW_ROOT"
+   EXPECTED="($ANCHOR,$OLD_ROOT,$DEPOSIT_ROOT,$WITHDRAWAL_ROOT,$WITHDRAWAL_SUBTREE)"
+   TARGET_STATE="($ANCHOR,$NEW_ROOT,$DEPOSIT_ROOT,$WITHDRAWAL_ROOT,$WITHDRAWAL_SUBTREE)"
+   ```
+
+2. Simulate, then send the compare-and-swap. Tuple order is `(uint64,bytes32,bytes32,bytes32,bytes32)`: finalized ID, checkpoint root, deposit root, withdrawal root, withdrawal subtree root. Keep the ID and all bridge roots unchanged. A target ID greater than the expected ID is forbidden; concurrent state changes fail `UnexpectedCurrentState` rather than being overwritten. If that happens, reread and reassess instead of forcing stale values (`psy-contracts/src/StateManager.sol:27-33,126-166`). `cast send --keystore` prompts for its password; keep it out of argv and logs.
+
+   ```bash
+   read -r -p 'StateManagerAdmin public address: ' ADMIN_ADDRESS
+   FORCE_SIG='forceSetState((uint64,bytes32,bytes32,bytes32,bytes32),(uint64,bytes32,bytes32,bytes32,bytes32))'
+   cast call "$STATE_MANAGER" "$FORCE_SIG" "$EXPECTED" "$TARGET_STATE" \
+     --from "$ADMIN_ADDRESS" --rpc-url "$L1_RPC_URL"
+   cast send "$STATE_MANAGER" "$FORCE_SIG" "$EXPECTED" "$TARGET_STATE" \
+     --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
+   ```
+
+3. Revoke **all** registered reward roots after the state change. A changed state with existing roots sets `rewardRootsClean=false`; only then is `revokeAbandonedRewardRoots` allowed. Passing the entire count removes every entry. A partial batch leaves the contract dirty until the last entry is removed; `finalize` rejects dirty state. If there are no entries, skip revocation; calling it with zero or an already-clean registry reverts (`psy-contracts/src/StateManager.sol:140-155,168-181,207-208`).
+
+   ```bash
+   COUNT=$(cast call "$STATE_MANAGER" 'finalizedRewardRootCount()(uint256)' \
+     --rpc-url "$L1_RPC_URL" --json | jq -er '.[0]')
+   if test "$COUNT" != 0; then
+     cast send "$STATE_MANAGER" 'revokeAbandonedRewardRoots(uint256)' "$COUNT" \
+       --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
+   fi
+   cast call "$STATE_MANAGER" 'rewardRootsClean()(bool)' \
+     --rpc-url "$L1_RPC_URL" --json | jq -e '.[0] == true or .[0] == "true"'
+   cast call "$STATE_MANAGER" 'lastVerifiedCheckpointRoot()(bytes32)' \
+     --rpc-url "$L1_RPC_URL" --json | jq -e --arg root "$NEW_ROOT" '.[0] == $root'
+   ```
+
+4. Require the next **real settlement finalize** and a new `Finalized` event. `forceSetState` repairs continuity but **does not register the replacement root**; `finalize` registers its newly proved end root and advances the anchor (`psy-contracts/src/StateManager.sol:150-166,242-255`). A clean registry alone is not a recognized reward root (`client_prover/psy_prover/src/local/reward_client.rs:979-995`).
+5. Once the recognized anchor advances past the selected checkpoints, rerun [reward claims §4](reward-claim-operations.md#4-submit-the-claim) with the **unchanged jobs file**. Check confirmed receipts and minted rewards; do not rewrite preimages or source IDs to fit an abandoned lineage (`client_prover/psy_prover/src/local/reward_client.rs:541-548,998-1007`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:195-209,346-347`).
+
+## 10. Security
 
 - Treat rollback as destructive privileged maintenance. Restrict workspace access (`umask 077` above), retain original evidence, and do not expose private keys or credentials in tickets, logs, or version control.
 - Use key **paths**, never inline key contents. Keep the runtime public validator registry and the original identity keys unchanged; identity matching is a safety check, not an obstacle to bypass (`psy_cli/psy_node_cli/src/node/realm_p2p.rs:359-382`).
