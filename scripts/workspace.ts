@@ -49,7 +49,8 @@ function git(repo: string, args: string[], allowed = [0]): string {
 }
 function ancestor(repo: string, older: string, newer: string): boolean {
   const result = Bun.spawnSync(["git", "-C", repo, "merge-base", "--is-ancestor", older, newer], { stdout: "pipe", stderr: "pipe", env: gitEnvironment });
-  if (result.exitCode > 1) fail(`${repo}: cannot compare ancestry: ${result.stderr}`);
+  const stderr = result.stderr.toString().trim();
+  if (stderr || result.exitCode > 1) fail(`${repo}: cannot compare ancestry: ${stderr}`);
   return result.exitCode === 0;
 }
 function required(options: Options, name: string): string { return options.get(name) || fail(`--${name} is required`); }
@@ -133,7 +134,7 @@ function push(root: string, options: Options): void {
   }
   for (const plan of plans) {
     if (remoteTip(plan.repo, remote, plan.ref) !== plan.expected) fail(`${plan.repo}: remote topic changed; publication stopped (earlier repositories may be published)`);
-    git(plan.repo, ["push", "--recurse-submodules=no", remote, `${plan.tip}:refs/heads/${plan.ref}`]);
+    git(plan.repo, ["push", "--no-follow-tags", "--recurse-submodules=no", remote, `${plan.tip}:refs/heads/${plan.ref}`]);
     console.log(`${basename(plan.repo)}: pushed ${plan.ref} ${plan.tip}`);
   }
 }
@@ -203,11 +204,22 @@ function merge(root: string, options: Options): void {
     const base = head(target, `refs/heads/${baseBranch}`);
     const expected = remoteTip(target, remote, baseBranch);
     if (!expected) fail(`${target}: remote base branch is missing`);
-    return { name, source, target, tip, base, remote: expected, links: links(source, tip), baseLinks: links(target, base), worktree: join(integration, name), integrationBranch, merged: "" };
+    return { name, source, target, tip, base, remote: expected, links: links(source, tip), baseLinks: [] as Link[], worktree: join(integration, name), integrationBranch, merged: "" };
   });
-  const order = ordered(plans);
   const byName = new Map(plans.map(plan => [plan.name, plan]));
-  // Validate every intended gitlink transition before fetching or creating worktrees.
+  for (const plan of plans) {
+    fetchTip(plan.target, remote, baseBranch, plan.remote);
+    if (!ancestor(plan.target, plan.remote, plan.base)) fail(`${plan.name}: local base lacks current remote commits; reconcile explicitly before merge`);
+    // Local transport imports objects only: no topic/base/tracking refs are moved.
+    git(plan.target, ["fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", plan.source, `${plan.tip}:refs/prefetch/workspace/${plan.tip}`]);
+    const mergeBase = git(plan.target, ["merge-base", plan.base, plan.tip]);
+    // Gitlink edits are classified against the merge ancestor of the topic and
+    // the frozen target base, not the current base tree: a pin the topic kept
+    // while the target advanced is not a topic change.
+    plan.baseLinks = links(plan.target, mergeBase);
+  }
+  const order = ordered(plans);
+  // Validate every intended gitlink transition before creating worktrees.
   for (const plan of plans) {
     for (const link of plan.links) {
       const previous = plan.baseLinks.find(entry => entry.path === link.path);
@@ -217,17 +229,12 @@ function merge(root: string, options: Options): void {
     }
   }
   for (const plan of plans) {
-    fetchTip(plan.target, remote, baseBranch, plan.remote);
-    if (!ancestor(plan.target, plan.remote, plan.base)) fail(`${plan.name}: local base lacks current remote commits; reconcile explicitly before merge`);
-    // Local transport imports objects only: no topic/base/tracking refs are moved.
-    git(plan.target, ["fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", plan.source, `${plan.tip}:refs/prefetch/workspace/${plan.tip}`]);
-    git(plan.target, ["merge-base", plan.base, plan.tip]);
-  }
-  for (const plan of plans) {
     for (const link of plan.links) {
       const previous = plan.baseLinks.find(entry => entry.path === link.path);
       if (!link.child || (previous?.sha === link.sha && previous.child === link.child)) continue;
       const child = byName.get(link.child)!;
+      // child.target holds both compared commits: its own frozen base ref and
+      // the child tip imported above; child.source may lack the target base.
       if (!ancestor(child.target, child.base, child.tip)) fail(`${plan.name}/${link.path}: changed child topic must descend from frozen child base`);
     }
   }
@@ -263,7 +270,7 @@ function merge(root: string, options: Options): void {
   if (options.has("push")) {
     for (const plan of order) {
       if (remoteTip(plan.target, remote, baseBranch) !== plan.remote) fail(`${plan.name}: remote base changed; stopped (earlier repositories may be published)`);
-      git(plan.target, ["push", "--recurse-submodules=no", remote, `${plan.merged}:refs/heads/${baseBranch}`]);
+      git(plan.target, ["push", "--no-follow-tags", "--recurse-submodules=no", remote, `${plan.merged}:refs/heads/${baseBranch}`]);
       console.log(`${plan.name}: published ${plan.merged} to ${baseBranch}`);
     }
   }

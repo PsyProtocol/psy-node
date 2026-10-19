@@ -19,11 +19,15 @@ struct Genesis {
     block1_parent_hash: Option<String>,
 }
 
-// Budgets apply BEFORE serde can grow its string scratch buffer. Ignored payloads
-// have no byte limit; serde owns syntax and nesting behavior.
+// Guards apply before serde can grow its scratch buffers. Ignored payloads
+// have no byte limit, but all JSON containers share a structural depth limit.
+const MAX_JSON_DEPTH: usize = 128;
 struct GuardedRead<'a, R> {
     inner: R,
     budget: &'a Cell<Option<usize>>,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
 }
 impl<R: Read> Read for GuardedRead<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
@@ -34,6 +38,25 @@ impl<R: Read> Read for GuardedRead<'_, R> {
         let limit = self.budget.get().unwrap_or(out.len()).min(out.len());
         let n = self.inner.read(&mut out[..limit])?;
         if let Some(left) = self.budget.get() { self.budget.set(Some(left - n)); }
+        for &byte in &out[..n] {
+            if self.in_string {
+                if self.escaped { self.escaped = false; }
+                else if byte == b'\\' { self.escaped = true; }
+                else if byte == b'"' { self.in_string = false; }
+            } else {
+                match byte {
+                    b'"' => self.in_string = true,
+                    b'[' | b'{' => {
+                        if self.depth == MAX_JSON_DEPTH {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, "Anvil JSON exceeds structural depth limit"));
+                        }
+                        self.depth += 1;
+                    }
+                    b']' | b'}' => self.depth = self.depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
         Ok(n)
     }
 }
@@ -78,19 +101,44 @@ impl<'de> DeserializeSeed<'de> for Header<'_> {
     }
 }
 
-struct Block<'a>(&'a Cell<Option<usize>>);
+struct BlockMetadata {
+    number: String,
+    timestamp: String,
+    parent_hash: Option<String>,
+}
+struct Block<'a> {
+    budget: &'a Cell<Option<usize>>,
+    genesis: &'a mut Option<BTreeMap<String, String>>,
+}
 impl<'de> DeserializeSeed<'de> for Block<'_> {
-    type Value = BTreeMap<String, String>;
+    type Value = BlockMetadata;
     fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
         impl<'de> Visitor<'de> for Block<'_> {
-            type Value = BTreeMap<String, String>;
+            type Value = BlockMetadata;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("an Anvil block object") }
             fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
                 let mut header = None;
-                while let Some(key) = next_key(&mut map, self.0)? {
+                while let Some(key) = next_key(&mut map, self.budget)? {
                     if key == "header" {
                         if header.is_some() { return Err(de::Error::custom("duplicate block header")); }
-                        header = Some(map.next_value_seed(Header(self.0))?);
+                        let mut fields = map.next_value_seed(Header(self.budget))?;
+                        let number = quantity(&fields["number"]).ok_or_else(|| de::Error::custom("block number must be a hex quantity"))?.trim_start_matches('0');
+                        header = Some(if number.is_empty() {
+                            if self.genesis.is_some() { return Err(de::Error::custom("2 block 0 headers; refusing to select or drop one")); }
+                            let metadata = BlockMetadata {
+                                number: fields["number"].clone(),
+                                timestamp: fields["timestamp"].clone(),
+                                parent_hash: fields.get("parentHash").cloned(),
+                            };
+                            *self.genesis = Some(fields);
+                            metadata
+                        } else {
+                            BlockMetadata {
+                                number: fields.remove("number").unwrap(),
+                                timestamp: fields.remove("timestamp").unwrap(),
+                                parent_hash: fields.remove("parentHash"),
+                            }
+                        });
                     } else { map.next_value::<IgnoredAny>()?; }
                 }
                 header.ok_or_else(|| de::Error::custom("block without a header object"))
@@ -113,20 +161,21 @@ impl<'de> DeserializeSeed<'de> for Blocks<'_> {
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Genesis, S::Error> {
                 let mut genesis = None;
                 let mut parent: Option<String> = None;
-                while let Some(header) = seq.next_element_seed(Block(self.0))? {
-                    let number = quantity(&header["number"]).ok_or_else(|| de::Error::custom("block number must be a hex quantity"))?.trim_start_matches('0');
+                let mut genesis_timestamp = None;
+                while let Some(block) = seq.next_element_seed(Block { budget: self.0, genesis: &mut genesis })? {
+                    let number = quantity(&block.number).unwrap().trim_start_matches('0');
                     if number.is_empty() {
-                        if genesis.is_some() { return Err(de::Error::custom("2 block 0 headers; refusing to select or drop one")); }
-                        genesis = Some(header);
+                        genesis_timestamp = Some(block.timestamp);
                     } else if number == "1" {
-                        let hash = header.get("parentHash").filter(|h| h.len() == 66 && quantity(h).is_some())
+                        let hash = block.parent_hash.as_ref().filter(|h| h.len() == 66 && quantity(h).is_some())
                             .ok_or_else(|| de::Error::custom("block 1 parentHash must be a 32-byte hash"))?.to_ascii_lowercase();
                         if parent.as_ref().is_some_and(|p| p != &hash) { return Err(de::Error::custom("conflicting block 1 parentHash values")); }
                         parent = Some(hash);
                     }
                 }
                 let header = genesis.ok_or_else(|| de::Error::custom("0 block 0 headers; refusing to bind genesis"))?;
-                let digits = quantity(&header["timestamp"]).ok_or_else(|| de::Error::custom("genesis timestamp must be a hex quantity"))?.trim_start_matches('0');
+                let genesis_timestamp = genesis_timestamp.unwrap();
+                let digits = quantity(&genesis_timestamp).ok_or_else(|| de::Error::custom("genesis timestamp must be a hex quantity"))?.trim_start_matches('0');
                 let timestamp = if digits.is_empty() { 0 } else {
                     u64::from_str_radix(digits, 16).map_err(|_| de::Error::custom("genesis timestamp does not fit Anvil --timestamp"))?
                 };
@@ -163,7 +212,7 @@ fn inspect(reader: impl Read, fork: bool) -> serde_json::Result<Option<Genesis>>
     let budget = Cell::new(None);
     // Guard must be OUTSIDE BufReader: serde reads one byte at a time and must
     // not prefetch metadata bytes while the budget is disabled.
-    let reader = GuardedRead { inner: reader, budget: &budget };
+    let reader = GuardedRead { inner: reader, budget: &budget, depth: 0, in_string: false, escaped: false };
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
     let result = if fork { IgnoredAny::deserialize(&mut deserializer)?; None }
         else { Some(Snapshot(&budget).deserialize(&mut deserializer)?) };
@@ -249,6 +298,27 @@ mod tests {
         let conflict = good.replacen(&parent, &"cd".repeat(32), 1);
         assert!(parse(&conflict, false, 3).is_err());
         assert!(parse(&good.replace(&parent, "00"), false, 3).is_err());
+    }
+
+    #[test]
+    fn bounds_ignored_structural_depth_in_both_modes() {
+        let nested = format!("{}null{}", "[".repeat(MAX_JSON_DEPTH + 1), "]".repeat(MAX_JSON_DEPTH + 1));
+        let objects = format!("{}null{}", "{\"x\":".repeat(MAX_JSON_DEPTH + 1), "}".repeat(MAX_JSON_DEPTH + 1));
+        for value in [nested, objects] {
+            for text in [
+                format!(r#"{{"ignored":{value},"blocks":[{{"header":{HEADER}}}]}}"#),
+                format!(r#"{{"blocks":[{{"header":{HEADER},"ignored":{value}}}]}}"#),
+            ] {
+                for fork in [false, true] {
+                    for size in [1, 7, 1024] {
+                        let error = parse(&text, fork, size).unwrap_err().to_string();
+                        assert!(error.contains("structural depth limit"), "{error}");
+                    }
+                }
+            }
+        }
+        let flat = format!(r#"{{"ignored":"{}","blocks":[{{"header":{HEADER}}}]}}"#, r#"[{\"\\\"}]"#.repeat(256 * 1024));
+        for fork in [false, true] { assert!(parse(&flat, fork, 7).is_ok()); }
     }
 
     #[test]
