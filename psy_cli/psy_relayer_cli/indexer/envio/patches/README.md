@@ -53,6 +53,17 @@ resolve to different packages.
    compares the parent only while it is within the threshold of the head that
    the fetch saw; an older parent is skipped, patched or not, and a restart
    does not detect it either (test scenario 3c).
+5. On an existing database, changing `confirmed_block_threshold` in
+   `config.yaml` is not enough. Envio 2.32.10 writes the value to
+   `envio_chains.max_reorg_depth` only when it initializes an empty schema;
+   a resumed indexer builds its reorg detection and history pruning from that
+   column (`ChainFetcher.makeFromDbState`, `PgStorage.resumeInitialState`)
+   and uses the config value only for the historical-sync lag and the rollback
+   fallback target. Update the column for each changed chain while Envio is
+   stopped, guarded by its old value, for example
+   `UPDATE envio.envio_chains SET max_reorg_depth = 200 WHERE id = 97 AND max_reorg_depth = 8`.
+   No reset or re-index is needed. A fresh install (empty schema) takes the
+   config value directly.
 
 ### Cost
 
