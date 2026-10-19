@@ -352,3 +352,155 @@ src/main.rs     rmcp server + tool surface
 src/wallet.rs   thin wrapper over WalletSession (the real engine)
 src/policy.rs   spending-policy gate (caps, allowlist, sessions) — below the model
 ```
+
+## Unified private FT (ordinary wallets)
+
+The same `get_private_ft_balance` and `private_ft_transfer` / `private_ft_accept`
+/ `private_ft_claim` / `private_ft_recover` / `private_ft_public_claim` tools now
+accept registered single-Felt and two-Felt contracts. Callers supply a contract
+ID, decimal amount string, and numeric recipient ID; they never choose an
+encoding. The immutable owner registry selects a versioned adapter, then the
+client checks that its code root, layout root and state dimensions match the
+chain before using it. Unknown contracts fail closed. Amount size and decimals
+never determine the adapter; there is no fallback to another format on failure.
+Fetched method definitions are rehashed to the pinned code root; private
+transfer, private claim and public claim input counts are checked as well.
+
+| Owner `profile` | Contract support | Amount range | Private transfer / claim inputs |
+| --- | --- | --- | --- |
+| `single_felt_native_v1` | Native PSY 0 / pUSDT 4 with individually pinned code | 1..18446744069414584320 | 9 / 82 |
+| `single_felt_psy20_v1` | Private PSY20 v3 layout (22 fields, 2149832488 slots) | 1..18446744069414584320 | 9 / 82 |
+| `u124_private_v1` | Private U124 layout (24 fields, 2178599700 slots) | 1..2^124-1 | 14 / 151 |
+
+Omitting `profile` preserves the prior U124 configuration behavior. Each
+registered deployment needs its own reviewed code/layout pins; declaring a
+profile does not make arbitrary contract code trustworthy. Public-only FT
+contracts without private methods and other ABI/layout versions need separate
+adapters. This supports both known formats, not arbitrary ABI inference.
+
+For example, add a second `assets` entry for current staging PSY:
+
+```json
+{
+  "network": "sepolia", "contract_id": 0,
+  "profile": "single_felt_native_v1",
+  "code_root": "53735dc64de34c4a84281e22a3d1606d983ad6d617ab717480421883fc88d4ba",
+  "layout_root": "0000000000000000000000000000000000000000000000000000000000000000",
+  "decimals": 9, "policy_nano_per_token": 1000000000
+}
+```
+
+Single-Felt amounts are checked before policy charging/proving, and received
+notes are checked against the selected contract's amount range and proof
+domain. Single-Felt and U124 encrypted packets have different authenticated
+format tags; relabeling or cross-format claims are rejected. Existing U124
+packets, accepted note IDs and recovery records stay compatible. New recovery
+records bind the adapter; no recovery operation chooses another encoding or
+submits another transfer. Native PSY sends reserve headroom for principal plus
+fee; private claims check balance overflow and an unchanged caller leaf before
+broadcast. Native public credits use `simple_claim`; template credits use
+`claim`. Single-Felt public claims check the sender's unclaimed delta against
+balance capacity and require unchanged sender/caller leaves before broadcasting.
+The current Native adapter uses count/path/root offsets 8589934595/8589934600/
+2147483649 (root is a four-Felt leaf index); PSY20 v3 uses 33554435/33554440/
+8388609. Width alone therefore does not select a storage layout version.
+Original legacy `private_transfer` / `private_claim` tools stay intact.
+Native PSY contract 0 requires decimals 9 and weight 1,000,000,000: its policy
+charge always equals the exact NanoPSY principal, never a discounted FT weight.
+
+This is an MCP client change only. No Node runtime/circuit, deployed contract,
+services API, Genesis regeneration or SDK package update is required for the
+explicit encrypted handoff flow. Automatic services/Nostr discovery and
+services-side amount displays would require their own dual-format adaptation.
+
+### U124-specific encoding
+
+The dedicated `private_ft_*` tools support the new two-Felt FT profile. Amounts
+are **canonical decimal strings in token base units**, with two 62-bit limbs.
+The U124 adapter is separate from the legacy one-Felt `private_transfer`/`private_claim`.
+
+The owner supplies an immutable process configuration file through
+`PSY_MCP_PRIVATE_FT_CONFIG`; agents cannot register assets, change pins, choose
+budget weights, or replace recipient contacts through these tools:
+
+```json
+{
+  "assets": [{
+    "network": "sepolia", "contract_id": 2457,
+    "code_root": "fc19619943370196243a67e0947342d05cd430a6fb076b4cb3ca8c7a827b284f",
+    "layout_root": "35e546bb64ad8405e725377eae4cedd54032ca6980cda5520cc3cb18d81c0a03",
+    "profile": "u124_private_v1",
+    "decimals": 18, "policy_nano_per_token": 100000000
+  }],
+  "contacts": [{
+    "network": "sepolia", "user_id": 1234,
+    "shielded_address": "ELEMENTS_ORDER_HEX_FROM_GET_RECEIVE_ADDRESS",
+    "npub": "RECIPIENT_NPUB_FROM_GET_RECEIVE_ADDRESS"
+  }]
+}
+```
+
+The example weight means one whole test token counts as 0.1 PSY toward the
+existing policy budget. **It is an owner-selected accounting weight, not a
+market price.** The gate rounds up in integer arithmetic, checks the numeric
+recipient allowlist and `private_transfer` permission, and rejects overflow.
+Native transaction fees are paid in PSY; the principal budget weight does not
+represent a Native PSY transfer. Token ID, code/layout roots, 32-level tree,
+24 fields, and 2178599700 slots must match the pinned profile.
+
+1. Owner retrieves and registers the recipient's public receive address/npub.
+2. `get_private_ft_balance` reads the exact spendable decimal amount.
+3. `prepare_private_ft_transfer` / `execute_private_ft_transfer` authorize and
+   send `amount: "20000000000000000017"` to the registered `to_user_id`.
+4. Hand the opaque encrypted `delivery` string to the recipient. It contains
+   bounded NIP44 chunks with encrypted package/index/count/digest bindings.
+   It is a new MCP format; do not submit it to an old one-Felt wallet or the
+   legacy services drain. This entry provides explicit ciphertext handoff,
+   not an automatic Nostr relay subscription.
+5. Recipient calls `prepare_private_ft_accept` / `execute_private_ft_accept`
+   with that delivery and `contract_id`. The server decrypts, checks the
+   recipient, and independently verifies both native inclusion proofs. The
+   decrypted packet and receive blinding factors never enter a tool result.
+6. Recipient calls `prepare_private_ft_claim` / `execute_private_ft_claim`
+   with the returned `note_id`. Both proofs enter the session before final
+   paths are read; CFC and full UPS are proved and independently verified.
+
+`private_ft_public_claim` folds a public U124 FT credit addressed to this wallet
+into its spendable balance, under the existing `simple_claim` permission.
+`private_ft_recover` reconstructs an **already submitted** outgoing delivery,
+without another payment or amount charge. `private_ft_status` reconciles an
+opaque outgoing/incoming/public record ID through historical checkpoints.
+These preserve the exact authorized wallet identity across selection changes.
+
+The server persists a mode-0600 recovery record before proving, then the exact
+signed leaf hash, nonce and pre-submit checkpoint before its one submit RPC.
+Later delivery/journal failures cannot refund a possibly submitted amount.
+A network error is not proof of rejection: reconcile the recorded hash, then
+recover the delivery. Pending/consumed claims cannot be resubmitted. Sender
+operations have cross-process file locks and verify that the note-index
+baseline did not change. State/proof failures before submission do not spend
+the principal budget. No ordinary wallet keys or note secrets are exported.
+
+This profile hides note linkage through inclusion proofs; it does **not** claim
+all amounts, balances, events or calldata are confidential. Independent audit
+and broader release acceptance remain separate requirements.
+
+### Verification
+
+```sh
+cargo +nightly-2025-09-20 test --offline --locked --release -p psy_mcp_server
+# Explicitly exercise chunking with a local two-native-proof fixture:
+PSY_MCP_U124_TEST_PACKET=/owner/local/native-two-proof-fixture.json \
+  cargo +nightly-2025-09-20 test --offline --locked --release -p psy_mcp_server \
+  wide_private::tests::real_two_native_proofs_roundtrip_without_exceeding_nip44 \
+  -- --ignored --nocapture
+```
+
+The external fixture is read inside the test process, never printed; the test
+reports only packet byte size/chunk count. The test is ignored by default
+because the fixture is intentionally not committed. All other U124 tests run
+normally, including decimal/policy bounds, recipient-bound encryption,
+missing/reordered/spliced chunks, exclusive durable creation and route gates.
+
+Owner `select_wallet` can also lazily restore a saved wallet by its public user ID or pk hash when the bounded startup restore did not load it. The server resolves the saved key/fingerprint internally and validates its network and public identity against the chain; no key-file path or key enters tool arguments.
+Older backups without public identity caches are resolved inside the MCP process; only a key whose on-chain user ID or public hash matches the owner selection is activated.

@@ -420,14 +420,16 @@ pub fn discover_key_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_KEYSTORE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn with_temp_keystore<T>(f: impl FnOnce() -> T) -> T {
-        // Serialize env mutation across tests in this module.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        // A panicking sibling test must not cascade poison-failures here.
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Async inbox tests also span multiple directory lookups. Share this
+        // lock so their root cannot change while this helper mutates env.
+        let _guard = TEST_KEYSTORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("psy-mcp-keystore-test-{}", rand_suffix()));
         std::env::set_var(KEYSTORE_DIR_ENV, &dir);
         let out = f();

@@ -21,6 +21,8 @@ psy_client_data = { path = "../psy_core/psy_data" }
 psy_config = { path = "../psy_core/psy_config" }
 psy_crypto = { path = "../psy_core/psy_crypto" }
 psy_dpn_circuit = { path = "../psy_circuit/psy_dpn_circuit" }
+psy_ups_circuit = { path = "../psy_circuit/psy_ups_circuit" }
+psy_vm = { path = "../psy_vm" }
 psy_common_circuit = { path = "../psy_circuit/psy_common_circuit" }
 
 # ── Field / proof types ──

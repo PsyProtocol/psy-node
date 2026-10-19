@@ -12,6 +12,8 @@
 //!     → add_user(private_key, fingerprint)
 //!     → exec_contract_call(pk_hash, ContractCallData) / claim_batch(...)
 
+mod wide_private;
+
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -1260,10 +1262,39 @@ impl WalletManager {
     /// decimal user id or the public pk hash; private material is never needed.
     pub async fn select_user(&self, network: &NetworkId, selector: &str) -> Result<LoadedUser> {
         let selector = selector.trim();
-        self.state(network)
-            .await?
-            .select_user(selector)
-            .ok_or_else(|| anyhow!("user `{selector}` is not loaded on network `{network}`"))
+        if let Some(loaded)=self.state(network).await?.select_user(selector){return Ok(loaded)}
+        // Startup is deliberately bounded. An owner selection can lazily restore
+        // its cached public identity without putting a key/path into tool arguments.
+        let backups=crate::keystore::discover_key_files()?.into_iter().filter_map(|path|crate::keystore::load_key_file(&path.to_string_lossy()).ok()).collect::<Vec<_>>();
+        // Try exact cached public identities before resolving older uncached
+        // backups. Otherwise one unrelated legacy RPC can delay a known wallet.
+        for indexed_pass in [true,false] {
+        for backup in &backups {
+            let indexed=backup.user_id.is_some()||backup.public_key.is_some()||backup.mandate.is_some();
+            if indexed!=indexed_pass {continue}
+            let recorded_network=backup.network.as_deref().unwrap_or(self.default_network.as_str());
+            if recorded_network!=network.as_str(){continue;}
+            if backup.user_id.is_none()&&backup.public_key.is_none()&&backup.mandate.is_none(){
+                // Older installed MCP backups have no public-ID caches. Resolve
+                // inside the wallet process, and activate ONLY the requested ID.
+                let Some((private_key,fingerprint))=legacy_key_material(&backup.private_key,&backup.fingerprint) else {continue;};
+                let pk_hash=match self.state(network).await?.session.add_user(private_key,fingerprint).await {Ok(v)=>v,Err(_)=>continue};
+                let user_id=match self.resolve_user_id(network,pk_hash).await{Ok(v)=>v,Err(_)=>continue};
+                if selector.parse::<u64>().ok()!=Some(user_id)&&selector!=pk_hash.to_string(){continue;}
+                validate_cached_identity(&backup,pk_hash,user_id)?;
+                let sign_type=match backup.sign_type.as_ref(){Some(v)=>v.clone(),None=>self.infer_sign_type(network,private_key,fingerprint).await?};
+                let loaded=LoadedUser{name:backup.name.clone(),pk_hash,user_id,fingerprint,sign_type,mandate:None,private_key};
+                self.activate_user(network,loaded.clone()).await?;return Ok(loaded);
+            }
+            if !cached_selector_matches(network.as_str(),selector,recorded_network,backup.user_id,backup.public_key.as_deref()){continue;}
+            // Resolves key+fingerprint on-chain and validates BOTH public caches
+            // before activation. A stale or forged cache cannot select another user.
+            let loaded=self.load_from_backup(network,&backup).await?;
+            anyhow::ensure!(selector.parse::<u64>().ok()==Some(loaded.user_id)||selector==loaded.pk_hash.to_string(),"restored public identity differs from selector");
+            return Ok(loaded);
+        }
+        }
+        anyhow::bail!("user `{selector}` has no loaded or publicly indexed saved identity on network `{network}`")
     }
 
     /// Clear the implicit activation performed while restoring keys. Startup
@@ -1775,6 +1806,27 @@ impl WalletManager {
     /// touching the chain — the owner then registers it under a policy.
     pub async fn generate_keypair(&self, network: &NetworkId, sign_type: Option<&str>, fingerprint: Option<&str>) -> Result<(String, String)> {
         self.state(network).await?.generate_keypair(sign_type, fingerprint).await
+    }
+}
+
+fn legacy_key_material(key:&str,fingerprint:&str)->Option<(QHashOut<F>,QHashOut<F>)>{
+    Some((key.trim().parse().ok()?,fingerprint.trim().parse().ok()?))
+}
+fn cached_selector_matches(network:&str,selector:&str,recorded_network:&str,user_id:Option<u64>,pk:Option<&str>)->bool{
+    network==recorded_network&&(selector.parse::<u64>().ok().zip(user_id).map(|(a,b)|a==b).unwrap_or(false)||pk==Some(selector))
+}
+#[cfg(test)]
+mod saved_selector_tests {
+    use super::{cached_selector_matches,legacy_key_material};
+    #[test]
+    fn malformed_legacy_candidates_are_skipped(){let valid="0".repeat(64);assert!(legacy_key_material("bad",&valid).is_none());assert!(legacy_key_material(&valid,"bad").is_none());assert!(legacy_key_material(&format!(" {valid} "),&format!(" {valid} ")).is_some());}
+    #[test]
+    fn lazy_restore_uses_only_exact_network_and_public_identity(){
+        assert!(cached_selector_matches("n","1951296","n",Some(1951296),Some("public-hash")));
+        assert!(cached_selector_matches("n","public-hash","n",Some(1951296),Some("public-hash")));
+        assert!(!cached_selector_matches("other","1951296","n",Some(1951296),Some("public-hash")));
+        assert!(!cached_selector_matches("n","999","n",Some(1951296),Some("public-hash")));
+        assert!(!cached_selector_matches("n","../keys","n",None,None));
     }
 }
 

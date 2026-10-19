@@ -218,6 +218,7 @@ pub fn build_deposit_backup_events(recipient_npub: &str, note: &crate::wallet::D
         .or_else(|| deposit_proof.get("nullifier").cloned());
     let proof_content = serde_json::json!({
         "type": "psy_deposit_proof",
+        "version": 2,
         "backup_id": backup_id,
         "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
         "deposit_proof": deposit_proof,

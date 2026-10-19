@@ -15,6 +15,7 @@ mod token_units;
 mod agent_account;
 mod keystore;
 mod nostr_delivery;
+mod private_ft_delivery;
 mod l1;
 mod x402;
 mod policy;
@@ -29,6 +30,8 @@ mod x402_tools;
 mod network;
 mod claims_tools;
 mod private_tools;
+mod wide_private;
+mod wide_private_tools;
 
 use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 
@@ -180,6 +183,7 @@ pub struct PsyWalletServer {
     /// recipient/amount payload.
     pending_transactions: Arc<std::sync::Mutex<HashMap<String, PendingTransaction>>>,
     tool_router: ToolRouter<PsyWalletServer>,
+    wide_assets: Arc<wide_private::Config>,
 }
 
 impl PsyWalletServer {
@@ -538,6 +542,12 @@ fn is_transaction_tool(name: &str) -> bool {
             | "claim_batch"
             | "withdraw"
             | "claim_faucet"
+            | "private_ft_transfer"
+            | "private_ft_accept"
+            | "private_ft_sync"
+            | "private_ft_claim"
+            | "private_ft_recover"
+            | "private_ft_public_claim"
             | "private_transfer"
             | "x402_fetch"
     )
@@ -770,10 +780,12 @@ impl PsyWalletServer {
             // loop.
             policy: Arc::new(std::sync::Mutex::new(engine)),
             pending_transactions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            wide_assets: Arc::new(wide_private::Config::load().expect("invalid owner private FT configuration")),
             tool_router: Self::tool_router()
                 + Self::wallet_tools_router()
                 + Self::claims_tools_router()
                 + Self::private_tools_router()
+                + Self::wide_private_tools_router()
                 + Self::x402_tools_router(),
         }
     }
@@ -1625,7 +1637,7 @@ impl ServerHandler for PsyWalletServer {
                  Every state-changing operation requires prepare_* followed by execute_*; \
                  execute_* requires the human owner's PSY_MCP_OWNER_TOKEN. Create/load a \
                  wallet, issue a session, then spend under policy caps. \
-                 Amounts are in Nano (1 PSY = 1e9 Nano)."
+                 Legacy PSY amounts are Nano (1 PSY = 1e9 Nano); private_ft_* accepts single-Felt and U124 registered contract profiles; amounts are decimal strings in token base units."
                     .into(),
             ),
             ..Default::default()
@@ -1822,14 +1834,15 @@ mod router_tests {
             + PsyWalletServer::wallet_tools_router()
             + PsyWalletServer::claims_tools_router()
             + PsyWalletServer::private_tools_router()
+            + PsyWalletServer::wide_private_tools_router()
             + PsyWalletServer::x402_tools_router();
         let names = router
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(names.len(), 41);
-        for required in ["create_wallet", "get_balance", "private_transfer", "x402_fetch", "x402_verify"] {
+        assert_eq!(names.len(), 49);
+        for required in ["create_wallet", "get_balance", "private_transfer", "private_ft_transfer", "private_ft_claim", "private_ft_sync", "private_ft_status", "x402_fetch", "x402_verify"] {
             assert!(names.contains(required), "missing tool route {required}");
         }
     }
@@ -1840,6 +1853,7 @@ mod router_tests {
             + PsyWalletServer::wallet_tools_router()
             + PsyWalletServer::claims_tools_router()
             + PsyWalletServer::private_tools_router()
+            + PsyWalletServer::wide_private_tools_router()
             + PsyWalletServer::x402_tools_router();
         let raw_transaction_names = router
             .list_all()
@@ -1847,7 +1861,7 @@ mod router_tests {
             .map(|tool| tool.name.to_string())
             .filter(|name| is_transaction_tool(name))
             .collect::<Vec<_>>();
-        assert_eq!(raw_transaction_names.len(), 16, "update the confirmation classification when transaction tools change");
+        assert_eq!(raw_transaction_names.len(), 22, "update the confirmation classification when transaction tools change");
 
         let exposed = confirmation_wrapped_tools(&router)
             .into_iter()

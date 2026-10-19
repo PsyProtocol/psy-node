@@ -6884,6 +6884,8 @@ dependencies = [
  "psy_dpn_circuit",
  "psy_prover",
  "psy_provider",
+ "psy_ups_circuit",
+ "psy_vm",
  "rand 0.8.5",
  "reqwest 0.12.28",
  "rmcp",
