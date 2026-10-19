@@ -178,6 +178,99 @@ async function appendCurrentDepositLeaf(
   return curHash;
 }
 
+// ── Deposit read model: DepositLeaf and AccountDepositStats ─────────────────
+// Both are derived from DepositRecorded in the same handler call that writes
+// Deposit and advances DepositTreeMeta, so Envio's reorg rollback (entity
+// history restored to one checkpoint for every entity) keeps them consistent.
+// A violated invariant throws: Envio logs the error and exits without
+// committing the batch. That is deliberate; a gap or an overwrite would corrupt
+// the deposit tree silently. Operators: restart Envio once (a restart re-checks
+// recent block hashes and rolls back a reorg the running process missed); if
+// it stops again at the same event, the indexed data or configuration is wrong
+// and the indexer needs inspection and a resync, not more restarts.
+
+function invariant(condition: boolean, message: string) {
+  if (!condition) {
+    throw new Error(`deposit read model invariant violated: ${message}`);
+  }
+}
+
+export function depositLeafId(chainIndex: number, chainLocalDepositIndex: number): string {
+  return `${chainIndex}-${chainLocalDepositIndex}`;
+}
+
+export function accountDepositStatsId(chainIndex: number, shieldAddress: string): string {
+  return `${chainIndex}-${shieldAddress}`;
+}
+
+// Appending leaf `nextTreeIndex` of `chainIndex` must extend a dense sequence:
+// no existing Deposit or leaf is overwritten, the previous leaf exists, the
+// chain_index keeps one chain_id, and the global deposit_index advances by
+// exactly one (a skipped L1 event would otherwise shift every later leaf).
+// The first leaf must be deposit_index 0: the Bridge counts from 0, so anything
+// else means the indexer started after the Bridge's first deposit and this
+// tree could never match the chain's.
+export function assertDepositAppend({
+  chainId,
+  chainIndex,
+  depositIndex,
+  nextTreeIndex,
+  existingDeposit,
+  existingLeaf,
+  previousLeaf,
+}: any) {
+  const at = `chain_index=${chainIndex} chain_id=${chainId} deposit_index=${depositIndex} `
+    + `chain_local_deposit_index=${nextTreeIndex}`;
+  invariant(Number.isSafeInteger(nextTreeIndex) && nextTreeIndex >= 0,
+    `invalid DepositTreeMeta.last_count (${at})`);
+  invariant(existingDeposit == null, `Deposit ${chainId}-${depositIndex} already exists (${at})`);
+  invariant(existingLeaf == null,
+    `DepositLeaf ${depositLeafId(chainIndex, nextTreeIndex)} already exists (${at})`);
+  if (nextTreeIndex === 0) {
+    invariant(depositIndex === 0, `first deposit of chain_index ${chainIndex} is not deposit_index 0 (${at})`);
+    return;
+  }
+  invariant(previousLeaf != null,
+    `DepositLeaf ${depositLeafId(chainIndex, nextTreeIndex - 1)} is missing (${at})`);
+  invariant(Number(previousLeaf.chain_id) === chainId,
+    `chain_index ${chainIndex} already belongs to chain_id ${previousLeaf.chain_id} (${at})`);
+  invariant(depositIndex === Number(previousLeaf.deposit_index) + 1,
+    `deposit_index does not follow previous deposit_index ${previousLeaf.deposit_index} (${at})`);
+}
+
+export function nextAccountDepositStats(existing: any, {
+  shieldAddress,
+  chainIndex,
+  chainId,
+  chainLocalDepositIndex,
+  blockNumber,
+}: any) {
+  const id = accountDepositStatsId(chainIndex, shieldAddress);
+  let depositCount = 1;
+  if (existing != null) {
+    const count = Number(existing.deposit_count);
+    const last = Number(existing.last_chain_local_deposit_index);
+    invariant(Number(existing.chain_id) === chainId,
+      `AccountDepositStats ${id} belongs to chain_id ${existing.chain_id}, not ${chainId}`);
+    invariant(Number.isSafeInteger(count) && count >= 1 && count <= last + 1,
+      `AccountDepositStats ${id} count ${count} is inconsistent with last index ${last}`);
+    invariant(last < chainLocalDepositIndex,
+      `AccountDepositStats ${id} last index ${last} is not below ${chainLocalDepositIndex}`);
+    invariant(Number(existing.last_block_number) <= blockNumber,
+      `AccountDepositStats ${id} last block ${existing.last_block_number} is after ${blockNumber}`);
+    depositCount = count + 1;
+  }
+  return {
+    id,
+    shield_address: shieldAddress,
+    chain_index: chainIndex,
+    chain_id: chainId,
+    deposit_count: depositCount,
+    last_chain_local_deposit_index: chainLocalDepositIndex,
+    last_block_number: blockNumber,
+  };
+}
+
 // ── DepositRecorded handler ─────────────────────────────────────────────────────
 // Writes the raw deposit event and incrementally advances the CURRENT per-chain
 // Poseidon helper tree. Historical roots / proofs for older counts are derived
@@ -198,8 +291,32 @@ Bridge.DepositRecorded.handler(async ({ event, context }) => {
   const metaId = `${chainIndex}`;
   const existingMeta = await context.DepositTreeMeta.get(metaId);
   const nextTreeIndex = existingMeta != null ? Number(existingMeta.last_count || 0) : 0;
+  const depositId = `${chainId}-${depositIndex}`;
+  const [existingDeposit, existingLeaf, previousLeaf, existingStats] = await Promise.all([
+    context.Deposit.get(depositId),
+    context.DepositLeaf.get(depositLeafId(chainIndex, nextTreeIndex)),
+    nextTreeIndex > 0 ? context.DepositLeaf.get(depositLeafId(chainIndex, nextTreeIndex - 1)) : undefined,
+    context.AccountDepositStats.get(accountDepositStatsId(chainIndex, shieldAddress)),
+  ]);
+  assertDepositAppend({
+    chainId,
+    chainIndex,
+    depositIndex,
+    nextTreeIndex,
+    existingDeposit,
+    existingLeaf,
+    previousLeaf,
+  });
+  const accountStats = nextAccountDepositStats(existingStats, {
+    shieldAddress,
+    chainIndex,
+    chainId,
+    chainLocalDepositIndex: nextTreeIndex,
+    blockNumber,
+  });
+
   context.Deposit.set({
-    id: `${chainId}-${depositIndex}`,
+    id: depositId,
     chain_id: chainId,
     deposit_index: depositIndex,
     chain_local_deposit_index: nextTreeIndex,
@@ -230,6 +347,17 @@ Bridge.DepositRecorded.handler(async ({ event, context }) => {
     txHash,
   );
   const poseidonRootHex = qhashToDisplayHex(poseidonRoot);
+
+  context.DepositLeaf.set({
+    id: depositLeafId(chainIndex, nextTreeIndex),
+    chain_index: chainIndex,
+    chain_local_deposit_index: nextTreeIndex,
+    deposit_index: depositIndex,
+    chain_id: chainId,
+    poseidon_leaf_hash: qhashToDisplayHex(poseidonLeaf),
+    block_number: blockNumber,
+  });
+  context.AccountDepositStats.set(accountStats);
 
   context.DepositTreeMeta.set({
     id: metaId,
