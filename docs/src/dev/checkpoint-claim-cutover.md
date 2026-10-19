@@ -2,6 +2,7 @@
 
 > Draft: 2026-10-14. Status: **Draft — awaiting independent review; implementation stopped**.
 > Author: TokenRewardSpecGpt. Independent review: not yet completed.
+> The claim-rewards CLI is implemented and wired (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:41-53`) and the token-side claim entry point is implemented (`psy-contracts/src/PsyToken.sol:67-104`). The operational procedure is `docs/src/dev/reward-claim-operations.md`. This document remains the design specification, not the runbook.
 
 ## Abstract
 

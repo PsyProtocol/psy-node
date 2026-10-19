@@ -4,7 +4,7 @@
 
 ## Abstract
 
-Executable local-devnet procedures for wallet creation, account registration (zk and secp256k1), identity and state queries, contract deployment and update, and per-user contract-state reads. Run every command from `<repo-root>` with the release binary `./target/release/psy_user_cli`. Replace only angle-bracket values. Never place a real private key in this document, a result file, or a shared shell history.
+Executable local-devnet procedures for wallet creation, account registration (zk and secp256k1), identity and state queries, contract deployment and update, and per-user contract-state reads. The user-leaf `balance` is the native fee balance — DA fees credit the user leaf at finalize (`psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs:633-637`) and transactions burn fee through the token contract (`client_prover/psy_prover/src/session/session.rs:1597-1612`); token balances live in per-contract state trees, read with the Section 9 queries. Run every command from `<repo-root>` with the release binary `./target/release/psy_user_cli`. Replace only angle-bracket values. Never place a real private key in this document, a result file, or a shared shell history.
 
 Related: `docs/src/dev/devnet_lifecycle.md` for startup and shutdown; `docs/src/dev/private-transfer.md` for private transfers.
 
@@ -103,7 +103,7 @@ For a historical read, replace `999999` with the exact checkpoint ID.
 
 ### 5.1. Fund PSY Through the Faucet
 
-Do not call `simple_mint` on genesis contract 0: its deployer is the compiler's `DEFAULT_DEPLOYER`, not a local devnet wallet (`psy-compiler/psy-dargo-cli/examples/gen_deploy_json.rs:29-30`). Use the faucet operator's transfer and then claim it into the registered user's contract-0 balance.
+Do not call `mint` on genesis contract 0: its deployer is the compiler's `DEFAULT_DEPLOYER`, not a local devnet wallet (`psy-compiler/psy-dargo-cli/examples/gen_deploy_json.rs:29-30`), and `mint` asserts the caller is that deployer (`psy-compiler/psy-precompiles/token/src/main.psy:413-415`). Use the faucet operator's transfer and then claim it into the registered user's contract-0 balance.
 
 The local faucet listens on port `9998` (`dev/locSetupV4.ts:4676-4678`). Its public configuration returns the amount, checkpoint window, and operator user IDs; the local genesis configuration uses `1000000000000` per claim and a 120-checkpoint window. Operators are genesis `sd-key` users, not keys to copy into this runbook. Request and response fields, operator validation, and remote method names are defined in `client_prover/psy_prover/src/local/native/faucet.rs:19-49,196-197,212-241,482-488`.
 
@@ -124,14 +124,14 @@ OPERATOR_USER_ID="$(jq -r '.result.operator_user_id' <result-dir>/faucet.json)"
   --result-file <result-dir>/claim-psy.json \
   call --sign-type zk -p '<private-key>' \
   --rpc-config psy-genesis/config.json \
-  --contract-id 0 --method-name simple_claim \
+  --contract-id 0 --method-name claim \
   --inputs "[$OPERATOR_USER_ID]" --wait-until-confirmation
 jq -e '.status == "confirmed" and (.confirmed_checkpoint != null)' <result-dir>/claim-psy.json
 ```
 
-The faucet response identifies the submitting operator; use that `operator_user_id`, not the recipient user ID, as the `simple_claim` input. Wait for the operator transfer to be included before claiming. If the claim finds no transfer yet, inspect the returned `tx_hash` and wait for inclusion rather than requesting another transfer. Confirm the PSY token balance using the contract-0, leaf-0 query in Section 9 before starting a bridge or private-transfer operation. Keep all recipient calls serial: funding must return `confirmed` before the next call starts.
+The faucet response identifies the submitting operator; use that `operator_user_id`, not the recipient user ID, as the `claim` input. Wait for the operator transfer to be included before claiming. If the claim finds no transfer yet, inspect the returned `tx_hash` and wait for inclusion rather than requesting another transfer. Confirm the PSY token balance using the contract-0, leaf-0 query in Section 9 before starting a bridge or private-transfer operation. Keep all recipient calls serial: funding must return `confirmed` before the next call starts.
 
-The recipient claim reads the operator's cumulative transfer amount and credits the unclaimed difference (`psy-compiler/psy-precompiles/token/src/main.psy:444-465`).
+The faucet operator's deferred call is token `transfer(recipient, amount)` on contract 0 (`psy-compiler/psy-precompiles/faucet/src/main.psy:45-46`, method id `2789897329` in `psy-genesis/genesis_abi/PsyTokenContract.json:1`). The recipient `claim` reads the operator's cumulative transfer amount and credits the unclaimed difference (`psy-compiler/psy-precompiles/token/src/main.psy:461-481`). The USDT token contract exposes the same method set (`psy-compiler/psy-precompiles/usdt_token/src/main.psy:413,430,461`).
 
 ## 6. Deploy a Contract
 
@@ -144,7 +144,7 @@ The recipient claim reads the operator's cumulative transfer amount and credits 
   --rpc-config psy-genesis/config.json
 ```
 
-`compile-and-deploy` compiles a `.psy.rs` source and deploys in one step. The deployer identity stored on-chain is the caller's public-key hash; `only deployer can mint`-style guards compare against it (token precompile guard: `psy-compiler/psy-precompiles/token/src/main.psy:397-399`). Genesis contracts 0-5 are owned by the compiler's `DEFAULT_DEPLOYER` constant, which no local devnet key holds — genesis-owned methods such as `simple_mint` cannot be called by a normal devnet wallet (`psy-compiler/psy-dargo-cli/examples/gen_deploy_json.rs:24-30`).
+`compile-and-deploy` compiles a `.psy.rs` source and deploys in one step. The deployer identity stored on-chain is the caller's public-key hash; `only deployer can mint`-style guards compare against it (token precompile guard: `psy-compiler/psy-precompiles/token/src/main.psy:413-415`). Genesis contracts 0-5 are owned by the compiler's `DEFAULT_DEPLOYER` constant, which no local devnet key holds — genesis-owned methods such as `mint` cannot be called by a normal devnet wallet (`psy-compiler/psy-dargo-cli/examples/gen_deploy_json.rs:24-30`).
 
 ## 7. Update a Contract
 
@@ -233,7 +233,7 @@ Unlike `call`, `simulate` accepts repeated integer `--inputs` arguments, not a J
 |---|---|---|
 | result file absent after nonzero exit | Command failed; stale success was removed fail-closed | Read stderr, correct the cause, rerun |
 | `no user ids found` / `status: "not_registered"` | Registration not yet included or key never registered | Keep polling `get-user-id`; do not submit L2 calls |
-| `only deployer can mint` | Caller is not the contract deployer | Use the faucet procedure in Section 5.1 for genesis PSY funding; do not retry `simple_mint` |
+| `only deployer can mint` | Caller is not the contract deployer | Use the faucet procedure in Section 5.1 for genesis PSY funding; do not retry `mint` |
 | `Leaf preimage not found at index <n>` | No storage record at that index for (user, contract) | Treat as empty state; verify contract id and leaf index |
 | EndCap inclusion timeout after 180 seconds | Call submitted but inclusion not observed | Check the transaction hash and realm state; never run another same-user call concurrently |
 
@@ -242,5 +242,5 @@ Unlike `call`, `simulate` accepts repeated integer `--inputs` arguments, not a J
 - Command registry: `client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:47-159`.
 - Result-file contract: `client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:47-54`, `client_prover/psy_cli/psy_user_cli/src/result.rs:299-372`.
 - Registration/ID semantics: `client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:15-46`, `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_id.rs:9-30`.
-- Deployer guard example: `psy-compiler/psy-precompiles/token/src/main.psy:397-402`; update authorization: `psy_node_common/src/coordinator/edge/handler.rs:532-553`.
+- Deployer guard example: `psy-compiler/psy-precompiles/token/src/main.psy:413-415`; update authorization: `psy_node_common/src/coordinator/edge/handler.rs:532-553`.
 - Genesis deployment generation: `psy-compiler/Makefile:216-236`, `psy-compiler/psy-dargo-cli/examples/gen_deploy_json.rs:24-30`.
