@@ -375,7 +375,10 @@ Bridge.DepositRecorded.handler(async ({ event, context }) => {
 
 // ── WithdrawalClaimed handler ───────────────────────────────────────────────────
 // Records raw on-chain withdrawal claims so the API can list claimable state
-// without re-scanning the chain. ID = "{chainId}-{nullifier}".
+// without re-scanning the chain. ID = "{chainId}-{nullifier}", so the primary
+// key makes (chain_id, nullifier) unique. Bridge rejects a second claim of a
+// nullifier, so an existing row means two contracts share the id space or an
+// event was delivered twice; fail instead of overwriting the first claim.
 Bridge.WithdrawalClaimed.handler(async ({ event, context }) => {
   const chainId = Number(event.chainId);
   const blockNumber = Number(event.block.number);
@@ -385,8 +388,18 @@ Bridge.WithdrawalClaimed.handler(async ({ event, context }) => {
   const token = event.params.token.toString();
   const amount = event.params.amount;
 
+  const claimId = `${chainId}-${nullifier}`;
+  const existingClaim = await context.WithdrawalClaim.get(claimId);
+  if (existingClaim != null) {
+    throw new Error(
+      `withdrawal claim invariant violated: WithdrawalClaim ${claimId} already exists `
+      + `(tx ${existingClaim.tx_hash} at block ${existingClaim.block_number}; `
+      + `new tx ${txHash} at block ${blockNumber})`,
+    );
+  }
+
   context.WithdrawalClaim.set({
-    id: `${chainId}-${nullifier}`,
+    id: claimId,
     chain_id: chainId,
     nullifier,
     recipient,

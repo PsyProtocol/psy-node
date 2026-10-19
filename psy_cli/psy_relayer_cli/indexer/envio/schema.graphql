@@ -104,8 +104,13 @@ type DepositTreeNode @entity {
   tx_hash: String!
 }
 
-type WithdrawalClaim @entity {
-  id: ID!
+# id "{chain_id}-{nullifier}" is the primary key, so (chain_id, nullifier) is
+# unique by construction; Envio has no UNIQUE directive. The handler fails
+# instead of silently overwriting an existing claim. The composite index serves
+# lookups by nullifier list on one chain.
+type WithdrawalClaim @entity
+  @index(fields: ["chain_id", "nullifier"]) {
+  id: ID!                         # "{chain_id}-{nullifier}"
   chain_id: Int!
   nullifier: String!
   recipient: String!
