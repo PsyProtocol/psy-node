@@ -1,0 +1,27 @@
+# Local reorg test fixture (tests/reorg/run-reorg-test.cjs). Never deploy it.
+# One Anvil chain; the Bridge address carries a log emitter, not the contract.
+# rollback_on_reorg stays at its default (true), as in config.template.yaml.
+name: psy-relayer-indexer-reorg-test
+field_selection:
+  transaction_fields:
+    - hash
+contracts:
+  - name: Bridge
+    handler: ./handlers.ts
+    events:
+      - event: WithdrawalClaimed(bytes32 indexed nullifier, address indexed recipient, address indexed token, uint256 amount)
+      - event: DepositRecorded(uint32 indexed index, bytes32 shieldAddress, address indexed token, bytes32 l2TokenContractId, uint256 amount, uint8 chainIndex, bytes32 noteCommitment, bytes32 leafHash)
+  - name: StateManager
+    handler: ./handlers.ts
+    events:
+      - event: Finalized(uint64 indexed newLastFinalizedCheckpointId, bytes32 indexed newLastVerifiedCheckpointRoot, bytes32 depositTreeRoot, bytes32 withdrawalTreeRoot)
+networks:
+  - id: 31337
+    start_block: 0
+    rpc_config:
+      url: ${REORG_TEST_RPC_URL}
+    contracts:
+      - name: Bridge
+        address: ["0x00000000000000000000000000000000000b1d9e"]
+      - name: StateManager
+        address: ["0x0000000000000000000000000000000000005a7e"]
