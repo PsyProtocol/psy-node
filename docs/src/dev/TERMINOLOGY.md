@@ -44,6 +44,7 @@ Use one verb for one act. Do not invent a synonym.
 | `install` | Verify staged bytes, atomically rename them into their destination, then fsync the parent directory | `ProposalBackup::install` |
 | `stage` | Write a candidate that is not yet retained | `create_staged`, `stage_transition_blocks` |
 | `derive` | Compute a deterministic hash or identity from known inputs | `derive_shield_address`, `derive-shield` |
+| `prepare` | Create missing operator inputs and validate reusable inputs before generation or startup | `prepare-guardian-account`, `prepare-realm-p2p` |
 
 `persist` is banned. Do not add `store_*` as a verb synonym for `save`/`write`.
 
@@ -350,3 +351,23 @@ Retain UserRewardLeaf, UserRewardAggregate, UserRewardRoot, UserRewardCheckpoint
 SDK prepare and confirm names are `PrepareRewardClaimRequest`, `RewardClaimPreparation`, `PreparedRewardClaim`, `DeferredRewardCheckpoint`, `RewardClaimConfirmation`, `RewardCheckpointStatement`, `prepare_reward_claim_json`, `prepareRewardClaim`, `confirm_reward_claim_json`, `confirmRewardClaim`, `prove_reward_root`, `bind_reward_checkpoint_statement`, and `encode_reward_claim_calldata`. `RewardClaimPreparation` is the status outcome, not a wrapper around an unspecified body. `RewardCheckpointStatement` is the bound checkpoint root, active checkpoint ids, and total. `prove_reward_root` has one `anyhow` failure for an unsupported signer and one `ZKUser` override. `getClaimRewardsCallArgs` and `claimRewards` are removed rather than aliased. The relation and encodings stay in checkpoint-claim-cutover.md section 6.
 
 `ensure_eval_cache` evaluates a symbolic expression graph in postorder using a heap stack. `resolve_felt_ref_ready` and `resolve_array_ref_ready` evaluate one node after its scalar and array dependencies are cached. Compilation preserves the same child postorder and register allocation order with a heap stack.
+
+`PSY_GUARDIANS_ROOT` selects the existing `--guardians-root` CLI branch through Make. `PSY_GUARDIAN_CHAINS`, `PSY_GUARDIAN_L1_ENDPOINTS`, and `PSY_GUARDIAN_APPROVED_CONTRACTS` name its three public authorization input paths. `GUARDIANS_ROOT_ARGS` assembles those existing CLI flags; `check-guardians-root-inputs` checks the required Make inputs and `generate-guardians-root` invokes that branch against the existing Genesis.
+
+`prepare-realm-p2p` finalizes the existing Realm P2P identities and injects their public validators into the existing Genesis before guardian authorization is generated. `check-guardian-genesis` recomputes the complete checkpoint-0 identity, including validators, and compares it with the guardian authorization without starting services. `contract_method_common_data` retains method fingerprints and verifier data; metadata requests release temporary proving circuits after deriving that data.
+
+`guardian-prepare-account` prepares the three standard encrypted Guardian signing keys and their public two-of-three `MultisigAccount`. Existing custody is reused and an existing account must match its signer slots; the command never rotates a chain account. `prepare-guardian-account` is its Make entry point.
+
+`PSY_DEVNET_DIR` owns the stable local operator configuration directory. `prepare-guardian-config` creates the localhost bridge daemon configuration from the generated public Guardian root. `check-guardians` checks checkpoint-0 identity and local signing inputs; `check-guardians-live` adds live L2 validation.
+
+`prepare-multisig-policy-artifact` copies the matching sibling compiler's policy artifact into local operator inputs. `prepare-guardian-inputs` discovers the intended localhost L1 deployment and exports its pinned approvals, endpoints, and matching Genesis contract artifacts. `guardian-prepare-approved-contracts` is the operator CLI for deriving those contract approvals from Genesis and compiler artifacts. `checkGenesisContracts` checks that the adopted `psy-genesis/genesis_contracts.json` deployments exactly equal `genesis.json.contracts`; `--check-genesis-contracts-only` runs that startup preflight without reading sibling compiler outputs. `PSY_COMPILER_ARTIFACTS_DIR` selects the compiler's release artifact directory for explicit Guardian input preparation.
+
+`Account UI` is the DApp application in `psy-dapp/apps/account`. The existing `--mode-a-web-wallet-bridge` launcher selector starts this application on port 5179 and accepts the standalone Mode A package only on older DApp pins where that package still has a manifest.
+
+`GuardianStartup` is the localhost-only missing-configuration preparation plan owned by `guardianStartup.ts`. `planGuardianStartup` classifies retained versus missing operator configuration; `prepareGuardianStartup` creates missing public authorization/configuration after actual L1 deployment. `PSY_GUARDIAN_AUTO_PREPARE=1` enables this path for `make run-all`; it never authorizes Genesis regeneration, custody rotation, authorization replacement, or journal deletion.
+
+`clean-guardian` purges the paired local L1/L2 devnet, then moves `PSY_DEVNET_DIR` to a timestamped backup so the next `make run-all` prepares new public Guardian authorization. Guardian signing keys under `~/.psy/keystore` are outside that directory and remain unchanged. `clean-db` aliases this complete fresh-chain cleanup because retained Guardian L1 authorization cannot follow a purged Anvil chain.
+
+`verify_chain_identity` reuses Guardian L1 identity verification against a canonical pinned live block. `guardian-service-check --live-l1` checks retained L1 authorization after deployment/reuse and before signer startup; `--live` remains the L2/prove-proxy check.
+
+`purgeDockerCleanup` verifies owned Docker containers and volumes are absent. It refreshes container names after stopping because `--rm` containers remove themselves; a failed or incomplete listing never authorizes file deletion.

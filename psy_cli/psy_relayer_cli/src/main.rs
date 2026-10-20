@@ -33,6 +33,35 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Prepare three local Guardian keystores and their public two-of-three account.
+    GuardianPrepareAccount {
+        #[arg(long)] output: PathBuf,
+    },
+    /// Prepare the five local Genesis contract approvals from matching compiler artifacts.
+    GuardianPrepareApprovedContracts {
+        #[arg(long, default_value = "genesis.json")] genesis_data: PathBuf,
+        #[arg(long, required = true)] artifact: Vec<PathBuf>,
+        #[arg(long)] output: PathBuf,
+    },
+    /// Check guardian authorization, network, account, and signing keys without starting services.
+    GuardianServiceCheck {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value = "genesis.json")]
+        genesis_data: PathBuf,
+        #[arg(long)]
+        live: bool,
+        /// Verify retained L1 chain and contract identities against running RPCs.
+        #[arg(long)]
+        live_l1: bool,
+    },
+    /// Rebuild approved contract inputs for the exact contract IDs in the active authorization.
+    GuardianRefreshApprovedContracts {
+        #[arg(long)] config: PathBuf,
+        #[arg(long, default_value = "genesis.json")] genesis_data: PathBuf,
+        #[arg(long, required = true)] artifact: Vec<PathBuf>,
+        #[arg(long)] output: PathBuf,
+    },
     /// Run one independently verifying guardian signer from the public root config.
     GuardianService {
         #[arg(long)]
@@ -188,6 +217,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => run_bridge_daemon(cli.config).await,
+        Some(Commands::GuardianPrepareAccount { output }) => guardian::account::run(&output),
+        Some(Commands::GuardianPrepareApprovedContracts { genesis_data, artifact, output }) => guardian::service::prepare_approved_contracts(&genesis_data, &artifact, &output),
+        Some(Commands::GuardianServiceCheck { config, genesis_data, live, live_l1 }) => guardian::service::check(&config, &genesis_data, live, live_l1).await,
+        Some(Commands::GuardianRefreshApprovedContracts { config, genesis_data, artifact, output }) => guardian::service::refresh_approved_contracts(&config, &genesis_data, &artifact, &output),
         Some(Commands::GuardianService { config, guardian_id, db_path }) => guardian::service::run(&config, guardian_id, &db_path).await.map_err(Into::into),
         Some(Commands::GuardianPolicy { rpc_config, guardian_config, intent, exclusive_registration_intake, next_members_json }) => match intent {
             GuardianPolicyIntent::Register => {

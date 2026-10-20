@@ -163,19 +163,19 @@ pub struct ApprovedTokenMap {
 pub async fn validate_approved_contract(approved: &ApprovedContract, wallet: &WalletSession) -> Result<Option<ApprovedTokenMap>> {
     let artifact=approved.compiler_artifact()?;
     let leaf=approved.contract_leaf_json.decode()?;
-    if artifact.state_tree_height>32 || artifact.state_tree_height<4 || u64::from(artifact.state_tree_height)!=leaf.state_tree_height.to_canonical_u64() || artifact.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64)!=Some(u64::from(artifact.state_tree_height)) || artifact.abi["schema_version"]!="2.0.0" || artifact.circuit_definitions.is_empty() { return Err(GuardianSignError::AuthorizationMismatch); }
+    if artifact.state_tree_height>32 || artifact.state_tree_height<4 || u64::from(artifact.state_tree_height)!=leaf.state_tree_height.to_canonical_u64() || artifact.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64)!=Some(u64::from(artifact.state_tree_height)) || artifact.abi["schema_version"]!="2.0.0" || artifact.circuit_definitions.is_empty() { tracing::error!(contract_id = approved.contract_id, "approved contract artifact metadata does not match its contract leaf"); return Err(GuardianSignError::AuthorizationMismatch); }
     let mut ids=BTreeSet::new(); let mut names=BTreeSet::new();
     let methods=artifact.abi.pointer("/contract/methods").and_then(serde_json::Value::as_array).ok_or(GuardianSignError::AuthorizationMismatch)?;
-    if methods.len()!=artifact.circuit_definitions.len() { return Err(GuardianSignError::AuthorizationMismatch); }
+    if methods.len()!=artifact.circuit_definitions.len() { tracing::error!(contract_id = approved.contract_id, abi_methods = methods.len(), circuit_definitions = artifact.circuit_definitions.len(), "approved contract ABI method count does not match circuit definitions"); return Err(GuardianSignError::AuthorizationMismatch); }
     for definition in &artifact.circuit_definitions {
-        if !ids.insert(definition.method_id) || !names.insert(&definition.name) { return Err(GuardianSignError::AuthorizationMismatch); }
+        if !ids.insert(definition.method_id) || !names.insert(&definition.name) { tracing::error!(contract_id = approved.contract_id, method = %definition.name, method_id = definition.method_id, "approved contract contains duplicate method identity"); return Err(GuardianSignError::AuthorizationMismatch); }
         let mut matches=methods.iter().filter(|method|method["method_id"].as_u64()==Some(u64::from(definition.method_id)));
         let method=matches.next().ok_or(GuardianSignError::AuthorizationMismatch)?;
         let mutability=if definition.is_view_function() {"view"} else {"external"};
-        if matches.next().is_some() || method["name"].as_str()!=Some(definition.name.as_str()) || method["input_felt_count"].as_u64()!=Some(definition.circuit_inputs.len() as u64) || method["output_felt_count"].as_u64()!=Some(definition.circuit_outputs.len() as u64) || method["state_mutability"].as_str()!=Some(mutability) { return Err(GuardianSignError::AuthorizationMismatch); }
+        if matches.next().is_some() || method["name"].as_str()!=Some(definition.name.as_str()) || method["input_felt_count"].as_u64()!=Some(definition.circuit_inputs.len() as u64) || method["output_felt_count"].as_u64()!=Some(definition.circuit_outputs.len() as u64) || method["state_mutability"].as_str()!=Some(mutability) { tracing::error!(contract_id = approved.contract_id, method = %definition.name, method_id = definition.method_id, "approved contract ABI method does not match circuit definition"); return Err(GuardianSignError::AuthorizationMismatch); }
     }
     let deployment=trusted_proxy_contract_root(wallet,u64::from(approved.contract_id),leaf.deployer.to_canonical_u64(),artifact.state_tree_height,&artifact.circuit_definitions).await?;
-    if deployment.code_root!=leaf.code_root || deployment.function_tree_root!=leaf.function_tree_root { return Err(GuardianSignError::AuthorizationMismatch); }
+    if deployment.code_root!=leaf.code_root || deployment.function_tree_root!=leaf.function_tree_root { tracing::error!(contract_id = approved.contract_id, expected_code_root = ?leaf.code_root, actual_code_root = ?deployment.code_root, expected_function_tree_root = ?leaf.function_tree_root, actual_function_tree_root = ?deployment.function_tree_root, "approved contract artifact roots do not match the local circuit manager"); return Err(GuardianSignError::AuthorizationMismatch); }
     if approved.contract_id==MULTISIG_POLICY_CONTRACT_ID && artifact.state_tree_height!=4 { return Err(GuardianSignError::PolicyMismatch); }
     if !matches!(approved.contract_id,0|4) { return Ok(None); }
     let state=artifact.abi.pointer("/contract/state").and_then(serde_json::Value::as_array).ok_or(GuardianSignError::AuthorizationMismatch)?;
@@ -202,7 +202,7 @@ async fn trusted_proxy_contract_root(wallet: &WalletSession, contract_id: u64, d
     let mut hashes=Vec::with_capacity(definitions.len());
     for (position, definition) in definitions.iter().enumerate() {
         let (fn_id, resolved)=manager.resolve_contract_function_by_method_name(contract_id, &code, definition.name.clone()).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-        if fn_id!=position as u64 || resolved!=*definition { return Err(GuardianSignError::AuthorizationMismatch); }
+        if fn_id!=position as u64 || resolved!=*definition { tracing::error!(contract_id, method = %definition.name, expected_function_id = position, actual_function_id = fn_id, "approved contract function does not match the local circuit manager"); return Err(GuardianSignError::AuthorizationMismatch); }
         let (fingerprint, _)=manager.get_contract_method_common_data(contract_id, fn_id as u32).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
         leaves.push(fingerprint);
         let inputs_outputs=((definition.circuit_outputs.len() as u64)<<32) | (definition.circuit_inputs.len() as u64);

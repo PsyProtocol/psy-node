@@ -1,10 +1,12 @@
 import { parseArgs } from "util";
+import { planGuardianStartup, prepareGuardianStartup, type GuardianStartup } from "./guardianStartup";
 import { rm, exists, mkdir, writeFile } from "fs/promises";
 import fs from "fs";
 import path from "path";
 import net from "node:net";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
+import { createRequire } from "node:module";
 import { availableParallelism, homedir } from "node:os";
 import allConfig from "../psy-genesis/config.json";
 import { protocolConfig } from "../psy-contracts/protocol-config";
@@ -1415,16 +1417,31 @@ export function daemonRealmP2pConfig(config: FullNetworkConfig, realmIds: readon
     return copy;
 }
 
-export async function injectGenesisValidators(genesisPath: string, config: FullNetworkConfig): Promise<void> {
+export async function injectGenesisValidators(genesisPath: string, config: FullNetworkConfig, requireMatch = false): Promise<void> {
     const genesis = JSON.parse(await fs.promises.readFile(genesisPath, "utf-8")) as { validators?: Array<{ realm_id: number; validator_user_id: number; node_id: string; bls_public_key: string }> };
     const network = config.networks[config.defaultNetwork];
-    genesis.validators = network.realm_configs.flatMap((realm) => realm.validators.map((validator) => ({
+    const validators = network.realm_configs.flatMap((realm) => realm.validators.map((validator) => ({
         realm_id: realm.id,
         validator_user_id: validator.validator_user_id,
         node_id: validator.processor_node_id,
         bls_public_key: validator.bls_public_key,
     })));
+    if (JSON.stringify(genesis.validators) === JSON.stringify(validators)) return;
+    if (requireMatch) throw new Error("[DevNet] Realm P2P validators differ from the authorized Genesis; run make prepare-realm-p2p and generate a new guardians root before startup");
+    genesis.validators = validators;
     await fs.promises.writeFile(genesisPath, JSON.stringify(genesis, null, 2), "utf-8");
+}
+
+async function validateGuardianRealmP2pConfig(cwd: string, realmIds: number[], edgeCount: number, host: string, genesisPath: string): Promise<void> {
+    const configPath = path.join(cwd, REALM_P2P_OUT_DIR, "config.json");
+    for (const file of [configPath, ...realmP2pSecretPaths(realmIds, edgeCount).map((file) => path.join(cwd, file))]) {
+        if (!(await exists(file))) throw new Error(`[DevNet] Missing prepared Realm P2P input ${file}; run make prepare-realm-p2p before generating guardian authorization`);
+    }
+    const config = JSON.parse(await fs.promises.readFile(configPath, "utf8")) as FullNetworkConfig;
+    const genesisConfigHash = createHash("sha256").update(await fs.promises.readFile(path.join(cwd, "psy-genesis/config.json"))).digest("hex");
+    const plan = planRealmP2pConfig(config, realmIds, edgeCount, host, await genesisValidatorUserIds(cwd, realmIds), genesisConfigHash);
+    if (!plan.reuse) throw new Error("[DevNet] Prepared Realm P2P configuration does not match this startup; run make prepare-realm-p2p and generate a new guardians root");
+    await injectGenesisValidators(path.resolve(cwd, genesisPath), config, true);
 }
 
 async function ensureRealmP2pConfig(
@@ -3001,6 +3018,7 @@ async function ensureDevEnvironment(
         requireDocker?: boolean;
         requireAnvil?: boolean;
         requireBun?: boolean;
+        l1Only?: boolean;
         env?: NodeJS.ProcessEnv;
     },
 ): Promise<void> {
@@ -3027,16 +3045,23 @@ async function ensureDevEnvironment(
     }
 
     await ensureRequiredSubmodules(cwd);
+    const contractsDir = path.join(cwd, "psy-contracts");
+    if (opts?.l1Only) {
+        const { generated } = await ensureKeystoreFiles(contractsDir);
+        if (generated && !process.env.WALLET_PASSWORD) {
+            process.env.WALLET_PASSWORD = "devnet";
+            bridgeRelayerKeystoreGeneratedThisRun = true;
+            console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
+        }
+        console.log("[AutoSetup] L1-only environment ready.");
+        return;
+    }
     // psy-dapp ships nested psy-genesis/psy-contracts gitlinks that the UI
     // apps alias into (config.json, protocol-config, deployments); initialize
     // them before any UI dependency install or dev-server startup.
     await ensurePsyDappNestedSubmodules(path.join(cwd, "psy-dapp"));
-    // Proven order from parth-generic-v1: clone/find siblings (and init
-    // psy-sdk's psy-genesis) before ensurePsySdkArtifacts reads config.json.
     await ensureAllReposCloned();
-    const contractsDir = path.join(cwd, "psy-contracts");
-    const sdk = await ensurePsySdkArtifacts(cwd);
-    await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
+    await ensureAllUiDeps(cwd);
     const { generated } = await ensureKeystoreFiles(contractsDir);
     // Only set default WALLET_PASSWORD when we generated the L1 keystore this run.
     if (generated && !process.env.WALLET_PASSWORD) {
@@ -3078,24 +3103,58 @@ async function buildProject(cwd?: string) {
     if (await proc.exited !== 0) throw new Error(`Build failed`);
 }
 
-async function ensureUiDependencies(uiDir: string) {
+export async function resolveModeAWebWalletBridgeDir(cwd: string): Promise<string> {
+    for (const relative of ["psy-dapp/apps/account", "psy-dapp/mode-a-web-wallet-bridge"]) {
+        const dir = path.resolve(cwd, relative);
+        if (await exists(path.join(dir, "package.json"))) return dir;
+    }
+    throw new Error("[DevNet] Account UI package.json is missing in psy-dapp/apps/account and mode-a-web-wallet-bridge; check the DApp checkout before startup");
+}
+
+export async function resolveUiViteCommand(uiDir: string): Promise<string[]> {
+    const manifest = path.resolve(uiDir, "package.json");
+    if (!(await exists(manifest))) throw new Error(`[DevNet] UI package.json is missing at ${manifest}; refusing to install dependencies in a parent workspace`);
+    try {
+        const vitePackage = createRequire(manifest).resolve("vite/package.json");
+        const entry = path.join(path.dirname(vitePackage), "bin", "vite.js");
+        if (!(await exists(entry))) throw new Error(`missing ${entry}`);
+        return ["node", entry];
+    } catch (error) {
+        throw new Error(`[DevNet] Vite is unavailable for ${uiDir}; install the DApp's frozen dependencies before startup: ${error}`);
+    }
+}
+
+export async function resolveUiWorkspaceDir(uiDir: string): Promise<string> {
+    const workspaceDir = path.resolve(uiDir, "..", "..");
+    const lockPath = path.join(workspaceDir, "pnpm-lock.yaml");
+    if (await exists(path.join(workspaceDir, "pnpm-workspace.yaml")) && await exists(lockPath)) {
+        const lock = Bun.YAML.parse(await fs.promises.readFile(lockPath, "utf8")) as { importers?: Record<string, unknown> };
+        const importer = path.relative(workspaceDir, path.resolve(uiDir)).split(path.sep).join("/");
+        if (lock.importers && Object.hasOwn(lock.importers, importer)) return workspaceDir;
+    }
+    return path.resolve(uiDir);
+}
+
+export async function ensureUiDependencies(uiDir: string) {
+    if (!(await exists(path.join(uiDir, "package.json")))) throw new Error(`[DevNet] Missing UI package.json in ${uiDir}; refusing to install dependencies in a parent workspace`);
+    // Current apps/account belongs to the root lockfile even though it retains
+    // a standalone workspace marker/lockfile from before the directory move.
+    const workspaceDir = await resolveUiWorkspaceDir(uiDir);
+    if (workspaceDir !== path.resolve(uiDir)) {
+        await ensureNpmDeps(workspaceDir, "psy-dapp");
+        return;
+    }
     // Some apps ship their own pnpm-workspace.yaml (e.g. mode-a-web-wallet-bridge)
     // even though they live under a parent workspace. Install them in-place so
     // pnpm can resolve their `link:` deps correctly.
     if (await exists(path.join(uiDir, "pnpm-workspace.yaml"))) {
         console.log(`[DevNet] Installing UI deps in standalone pnpm workspace ${uiDir}...`);
         await ensurePnpmBuildScriptsApproved(uiDir, ["esbuild"]);
-        const result = await runAndCapture(["pnpm", "install"], uiDir);
+        const result = await runAndCapture(["pnpm", "install", "--frozen-lockfile"], uiDir);
         if (result.code !== 0) {
             throw new Error(`pnpm install failed in ${uiDir}: ${result.stderr || result.stdout}`);
         }
         console.log(`[DevNet] UI deps installed in ${uiDir}`);
-        return;
-    }
-
-    const workspaceDir = path.resolve(uiDir, "..", "..");
-    if (await exists(path.join(workspaceDir, "pnpm-workspace.yaml"))) {
-        await ensureNpmDeps(workspaceDir, "psy-dapp");
         return;
     }
 
@@ -3872,6 +3931,28 @@ export async function validateRelayerTemplate(cmds: readonly string[], options: 
     if (index < 0 || !cmds[index + 1] || path.resolve(cwd, cmds[index + 1]) !== configPath) throw daemonConfigError("saved --config coherence");
 }
 
+async function checkGuardianServices(cwd: string, daemonConfigPath: string, genesisDataPath: string, live = false, liveL1 = false): Promise<void> {
+    const daemonConfig = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath, "utf8"));
+    const guardianPath = await resolveGuardianConfigPath(cwd, daemonConfig.guardian_config as string);
+    const cli = path.join(cwd, "target", "release", "psy_relayer_cli");
+    if (!(await exists(cli))) {
+        throw new Error(`[DevNet] Guardian preflight requires the release binary ${cli}; build psy_relayer_cli first`);
+    }
+    console.log("[DevNet] Checking guardian configuration, Genesis artifacts and signing keys...");
+    if (!live) {
+        const genesisCheck = await runAndCapture([path.join(cwd, "target", "release", "psy_dev_cli"), "check-guardian-genesis", "--config", guardianPath, "--genesis-data", path.resolve(cwd, genesisDataPath)], cwd);
+        if (genesisCheck.code !== 0) throw new Error(`[DevNet] Guardian Genesis preflight failed: ${genesisCheck.stderr || genesisCheck.stdout}`);
+    }
+    const args = [cli, "guardian-service-check", "--config", guardianPath, "--genesis-data", path.resolve(cwd, genesisDataPath)];
+    if (live) args.push("--live");
+    if (liveL1) args.push("--live-l1");
+    const result = await runAndCapture(args, cwd);
+    if (result.code !== 0) {
+        throw new Error(`[DevNet] Guardian ${live ? "live " : ""}startup check failed: ${result.stderr || result.stdout}`);
+    }
+    console.log(`[DevNet] Guardian ${live ? "live " : ""}startup check passed.`);
+}
+
 const ENVIO_NPM_VERSION = "2.32.10";
 const ENVIO_HASURA_IMAGE = "hasura/graphql-engine:v2.43.0";
 const ENVIO_POSTGRES_IMAGE = "postgres:17.5";
@@ -4291,6 +4372,20 @@ async function readAnvilProcessIdentity(pid: number): Promise<AnvilProcessIdenti
     }
 }
 
+export async function cleanCheckpoint(checkpointPath: string, cwd: string = '.', retained: readonly string[] = []) {
+    const fullPath = path.resolve(cwd, checkpointPath);
+    if (!(await exists(fullPath))) return;
+    if (retained.length > 0) {
+        const checkpoint = await fs.promises.lstat(fullPath);
+        if (!checkpoint.isDirectory() || checkpoint.isSymbolicLink()) throw new Error(`[DevNet] checkpoint path is not a directory: ${fullPath}`);
+        for (const entry of await fs.promises.readdir(fullPath)) {
+            if (!retained.includes(entry)) await rm(path.join(fullPath, entry), { recursive: true, force: true });
+        }
+        return;
+    }
+    await rm(fullPath, { recursive: true, force: true });
+}
+
 function processAncestors(pid: number): Set<number> {
     const ancestors = new Set<number>([pid]);
     let cursor = pid;
@@ -4388,9 +4483,9 @@ async function runBoundedTeardown(phase: string, argv: string[], cwd: string | u
 export function exactSnapshotNames(stdout: string): Set<string> {
     return new Set(stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0));
 }
-async function purgeDockerCleanup(cwd: string, failures: string[]): Promise<boolean> {
-    const containers = await runBoundedTeardown("docker-ps", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
-    const volumes = await runBoundedTeardown("volume-ls", ["docker", "volume", "ls", "--format", "{{.Name}}"], undefined, failures);
+export async function purgeDockerCleanup(cwd: string, failures: string[], run = runBoundedTeardown): Promise<boolean> {
+    const containers = await run("docker-ps", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
+    const volumes = await run("volume-ls", ["docker", "volume", "ls", "--format", "{{.Name}}"], undefined, failures);
     if (containers.timedOut || containers.code !== 0 || !containers.stdoutComplete || volumes.timedOut || volumes.code !== 0 || !volumes.stdoutComplete) {
         return false;
     }
@@ -4407,15 +4502,20 @@ async function purgeDockerCleanup(cwd: string, failures: string[]): Promise<bool
     const liveContainers = PURGE_DOCKER_NAMES.filter((name) => containerNames.has(name));
     const liveVolumes = PURGE_DOCKER_VOLUMES.filter((name) => volumeNames.has(name));
     if (liveContainers.length > 0) {
-        await runBoundedTeardown("docker-stop", ["docker", "stop", ...liveContainers], undefined, failures);
-        await runBoundedTeardown("docker-rm", ["docker", "rm", "-f", ...liveContainers], undefined, failures);
+        await run("docker-stop", ["docker", "stop", ...liveContainers], undefined, failures);
+        // --rm containers disappear when stopped. Do not remove a stale snapshot.
+        const stopped = await run("docker-ps-stopped", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
+        if (stopped.timedOut || stopped.code !== 0 || !stopped.stdoutComplete) return false;
+        const remaining = exactSnapshotNames(stopped.stdout);
+        const retainedContainers = liveContainers.filter((name) => remaining.has(name));
+        if (retainedContainers.length > 0) await run("docker-rm", ["docker", "rm", "-f", ...retainedContainers], undefined, failures);
     }
-    if (liveVolumes.length > 0) await runBoundedTeardown("volume-rm", ["docker", "volume", "rm", "-f", ...liveVolumes], undefined, failures);
+    if (liveVolumes.length > 0) await run("volume-rm", ["docker", "volume", "rm", "-f", ...liveVolumes], undefined, failures);
     if (await exists(composeFile)) {
-        await runBoundedTeardown("compose-down", ["docker", "compose", "-f", composeFile, "down", "--remove-orphans", "-v"], cwd, failures);
+        await run("compose-down", ["docker", "compose", "-f", composeFile, "down", "--remove-orphans", "-v"], cwd, failures);
     }
-    const containersAfter = await runBoundedTeardown("docker-ps-after", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
-    const volumesAfter = await runBoundedTeardown("volume-ls-after", ["docker", "volume", "ls", "--format", "{{.Name}}"], undefined, failures);
+    const containersAfter = await run("docker-ps-after", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
+    const volumesAfter = await run("volume-ls-after", ["docker", "volume", "ls", "--format", "{{.Name}}"], undefined, failures);
     if (containersAfter.timedOut || containersAfter.code !== 0 || !containersAfter.stdoutComplete || volumesAfter.timedOut || volumesAfter.code !== 0 || !volumesAfter.stdoutComplete) {
         return false;
     }
@@ -4462,7 +4562,11 @@ async function purgeDevnet(cwd: string): Promise<void> {
                 if (!parent || (parent !== root && !parent.startsWith(`${root}${path.sep}`))) {
                     throw new Error("parent resolves outside checkout");
                 }
-                await rm(target, { recursive: true, force: true });
+                if (relative === "./local_checkpoints") {
+                    await cleanCheckpoint(relative, root, ["realm_p2p"]);
+                } else {
+                    await rm(target, { recursive: true, force: true });
+                }
             } catch (error) {
                 failures.push(`delete ${relative}: ${error instanceof Error ? error.message : String(error)}`);
             }
@@ -4473,6 +4577,10 @@ async function purgeDevnet(cwd: string): Promise<void> {
     }
     for (const relative of purgePaths) {
         try {
+            if (relative === "./local_checkpoints") {
+                const entries = await fs.promises.readdir(path.resolve(cwd, relative));
+                if (entries.every((entry) => entry === "realm_p2p")) continue;
+            }
             await fs.promises.lstat(path.resolve(cwd, relative));
             failures.push(`residual path ${relative}`);
         } catch (error) {
@@ -4512,6 +4620,7 @@ async function killKnownProcesses(): Promise<void> {
         "psy-dapp/apps/ide",
         "psy-dapp/apps/explorer",
         "psy-dapp/mode-a-web-wallet-bridge",
+        "psy-dapp/apps/account",
         "vite.js --host 0.0.0.0 --port 5179",
         "pnpm dev",
         "envio/bin.js",
@@ -4683,6 +4792,7 @@ export async function requestOwnedAnvilShutdown(repoRoot: string, purge: boolean
 
 
 interface ProcessOptions {
+    guardianStartup?: GuardianStartup;
     purge?: boolean;
     cwd?: string;
     jtmb?: boolean;
@@ -5287,7 +5397,7 @@ export class DevNetProcessManager {
         const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
         const startAll = !hasOnlyOptions;
         const startBridgeProposerDaemon = shouldRequireGuardianConfig(startAll, options);
-        const daemonConfigPath = startBridgeProposerDaemon
+        let daemonConfigPath = startBridgeProposerDaemon && !options.guardianStartup
             ? await resolveBridgeDaemonConfigPath(cwd, this.getEnv(), !!options.purge)
             : undefined;
 
@@ -5392,7 +5502,7 @@ export class DevNetProcessManager {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
             realmP2pConfig = await ensureRealmP2pConfig(nodeCli, cwd, allRealmIds, realmEdgeCount, this.host);
             this.envVars = { ...this.envVars, PSY_CONFIG_PATH: `${REALM_P2P_OUT_DIR}/config.json`, PSY_NETWORK: realmP2pConfig.defaultNetwork };
-            await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pConfig);
+            await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pConfig, !!daemonConfigPath);
         }
 
         // Prove proxy Groth16 preload is independent of Coordinator RPC.
@@ -5530,8 +5640,6 @@ export class DevNetProcessManager {
                 ));
             }
         };
-        await startCoordinatorWorkerProcesses();
-
         let processorReadiness: Promise<void> = Promise.resolve();
 
         if (startRealmProcessor) {
@@ -5631,6 +5739,16 @@ export class DevNetProcessManager {
         }
 
         await processorReadiness;
+
+        // The guardian's contract/circuit check needs the local prove proxy and
+        // a readable Coordinator checkpoint, but not workers, L1 deployment,
+        // indexers, or faucet. Run it at the earliest point those inputs exist.
+        if (startBridgeProposerDaemon && daemonConfigPath) {
+            await waitForProveProxy("guardian L2 validation");
+            await checkGuardianServices(cwd, daemonConfigPath!, this.genesisDataPath, true);
+        }
+
+        await startCoordinatorWorkerProcesses();
 
         if (startRealmWorkers) {
             const workerPromises: Promise<RunningProcess>[] = [];
@@ -5805,6 +5923,22 @@ export class DevNetProcessManager {
                 });
             }
         }
+        if (startBridgeProposerDaemon && options.guardianStartup) {
+            console.log("[DevNet] Preparing missing localhost Guardian configuration from the current Genesis and L1 deployments...");
+            await prepareGuardianStartup(path.resolve(cwd), options.guardianStartup, async (args) => {
+                const result = await runAndCapture(args, cwd, this.getEnv());
+                if (result.code !== 0) throw new Error(`[DevNet] Guardian preparation failed: ${result.stderr || result.stdout}`);
+            });
+            daemonConfigPath = await resolveBridgeDaemonConfigPath(cwd, this.getEnv());
+            await checkGuardianServices(cwd, daemonConfigPath, this.genesisDataPath);
+            await waitForProveProxy("guardian L2 validation");
+            await checkGuardianServices(cwd, daemonConfigPath, this.genesisDataPath, true);
+        }
+
+        if (startBridgeProposerDaemon) {
+            await checkGuardianServices(cwd, daemonConfigPath!, this.genesisDataPath, false, true);
+        }
+
         // 11. Bridge dependencies (Envio + psy-services)
         if (relayer || options.bridgeUi || options.psyPrivacyBridge || startAll) {
             const relayerConfig = options.relayerConfig || './psy_cli/psy_relayer_cli/config/local.toml';
@@ -6146,10 +6280,9 @@ export class DevNetProcessManager {
 
         // 18. Mode A Web Wallet Bridge
         if (options.modeAWebWalletBridge || startAll) {
-            const modeAWebWalletBridgeDir = path.join(cwd, 'psy-dapp', 'mode-a-web-wallet-bridge');
-            // The app uses `link:` deps to `@psy-protocol/psy-sdk` and `@psy-protocol/evm-wallet`.
-            // Those packages are not part of this repo (client_prover/psy_sdk only has generated
-            // types), so we can only start the dev server if the linked workspace is present.
+            const modeAWebWalletBridgeDir = await resolveModeAWebWalletBridgeDir(cwd);
+            // apps/account replaced the standalone Mode A app. Retain the CLI
+            // selector/port and support a real standalone package on older pins.
             const modeAPackageJson = await (async (): Promise<Record<string, unknown> | null> => {
                 try {
                     return await Bun.file(path.join(modeAWebWalletBridgeDir, 'package.json')).json();
@@ -6166,7 +6299,7 @@ export class DevNetProcessManager {
                         if (!(await exists(path.join(resolved, 'package.json')))) {
                             console.warn(
                                 `[DevNet] Skipping Mode A Web Wallet Bridge: linked dependency ${name}@${spec} does not resolve to a valid package (${resolved}).\n`
-                                + `[DevNet] Make sure the psy-sdk workspace is checked out at the path expected by psy-dapp/mode-a-web-wallet-bridge/package.json.`,
+                                + `[DevNet] Make sure the psy-sdk workspace is checked out at the path expected by ${modeAWebWalletBridgeDir}/package.json.`,
                             );
                             return;
                         }
@@ -6178,7 +6311,7 @@ export class DevNetProcessManager {
             }
             await ensureUiDependencies(modeAWebWalletBridgeDir);
             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                ['node', 'node_modules/vite/bin/vite.js', '--host', '0.0.0.0', '--port', '5179', '--strictPort'],
+                [...await resolveUiViteCommand(modeAWebWalletBridgeDir), '--host', '0.0.0.0', '--port', '5179', '--strictPort'],
                 uiStartedDetector,
                 {
                     cwd: modeAWebWalletBridgeDir,
@@ -6641,6 +6774,7 @@ class DevnetLock {
         if (this.released) return;
         this.released = true;
         try {
+            this.holder.stdin?.end();
             this.holder.kill();
         } catch {
             // Already exited: the kernel lock is already released.
@@ -6848,6 +6982,7 @@ async function runMain() {
             "host": { type: "string", default: "127.0.0.1" },
 
             "genesis-data-path": { type: "string", default: "genesis.json" },
+            "prepare-realm-p2p": { type: "boolean" },
             "coordinator": { type: "boolean" },
             "db": { type: "boolean" },
             "dummy-provers": { type: "string" },
@@ -6974,7 +7109,8 @@ Usage: bun run dev/locSetupV4.ts [options]
    --mode-a-web-wallet-bridge     Start Mode A web wallet bridge dev server (psy-dapp/mode-a-web-wallet-bridge, port 5179)
    --daemonlize                    Generate docker-compose.yml and start in background
    --teardown                      Stop local devnet processes/containers and exit
-   --purge                         With --teardown (or startup), also remove local_checkpoints, logs, deployments, and devnet Docker volumes
+   --purge                         Also remove checkpoint state (retain realm_p2p identities), logs, deployments, and devnet Docker volumes
+   --prepare-realm-p2p              Prepare validator identities in existing Genesis, then exit before service startup
    --help, -h                      Show this help message
 
   Examples:
@@ -7038,10 +7174,17 @@ Usage: bun run dev/locSetupV4.ts [options]
         process.exit(0);
     }
 
-    if (!teardown && !daemonlize && shouldRequireGuardianConfig(!hasOnlyOptions, { relayer, bridgeProposerDaemon })) {
-        envVars.PSY_BRIDGE_DAEMON_CONFIG = await resolveBridgeDaemonConfigPath(process.cwd(), { ...process.env, ...envVars }, purge);
+    if (values["prepare-realm-p2p"]) {
+        if (teardown || purge || hasOnlyOptions || daemonlize) throw new Error("--prepare-realm-p2p cannot be combined with startup, teardown, purge, or daemon modes");
+        const lock = await acquireDevnetLock(REPO_ROOT);
+        try {
+            const realmIds = Array.from({ length: realmsCount }, (_, index) => startRealmId + index);
+            const config = await ensureRealmP2pConfig(path.join(REPO_ROOT, "target/release/psy_node_cli"), REPO_ROOT, realmIds, realmEdgeCount, host);
+            await injectGenesisValidators(path.resolve(REPO_ROOT, genesisDataPath), config);
+            console.log("[DevNet] Realm P2P validators prepared in existing Genesis; generate guardian authorization next.");
+        } finally { lock.release(); }
+        return;
     }
-
 
     // Acquire a race-safe per-repository kernel lock BEFORE auto-setup or any
     // Docker/process destruction. A live holder blocks this startup; an
@@ -7091,6 +7234,31 @@ Usage: bun run dev/locSetupV4.ts [options]
     process.on('SIGTERM', () => void shutdown());
 
     try {
+    let guardianStartup: GuardianStartup | undefined;
+    if (!teardown && !daemonlize && shouldRequireGuardianConfig(!hasOnlyOptions, { relayer, bridgeProposerDaemon })) {
+        const selection = resolveL1Selection();
+        guardianStartup = await planGuardianStartup(REPO_ROOT, { ...process.env, ...envVars },
+            (!hasOnlyOptions || (coordinator && l1 && Number(values["prove-proxy"] || 0) > 0))
+            && startRealmId === 0 && realmsCount === 2
+            && selection.l1Network === "localhost" && !selection.l1Fork);
+        if (!guardianStartup) envVars.PSY_BRIDGE_DAEMON_CONFIG = await resolveBridgeDaemonConfigPath(REPO_ROOT, { ...process.env, ...envVars }, purge);
+        else {
+            if (purge) throw new Error("Automatic Guardian preparation cannot be combined with startup purge; use an explicit reviewed shutdown first");
+            if (path.resolve(REPO_ROOT, genesisDataPath) !== path.join(REPO_ROOT, "genesis.json")) throw new Error("Automatic Guardian preparation requires the standard genesis.json path");
+            envVars.PSY_BRIDGE_DAEMON_CONFIG = guardianStartup.daemonPath;
+            envVars.PSY_GUARDIAN_CONFIG = guardianStartup.guardianPath;
+        }
+    }
+    // Validate public guardian configuration before purge, auto-setup, or any
+    // service startup. The L2-dependent artifact/circuit check runs as soon as
+    // the core and prove proxy are ready, before workers and L1 deployment.
+    const guardianDaemonConfigPath = envVars.PSY_BRIDGE_DAEMON_CONFIG;
+    if (!teardown && !daemonlize && (!hasOnlyOptions || modeAWebWalletBridge)) await resolveModeAWebWalletBridgeDir(REPO_ROOT);
+    if (!teardown && guardianDaemonConfigPath && !guardianStartup) {
+        if (!hasOnlyOptions || coordinator) await validateGuardianRealmP2pConfig(REPO_ROOT, Array.from({ length: realmsCount }, (_, index) => startRealmId + index), realmEdgeCount, host, genesisDataPath);
+        await checkGuardianServices(REPO_ROOT, guardianDaemonConfigPath, values["genesis-data-path"] || "genesis.json");
+    }
+
     // Auto-setup: clone repos, install deps, download keystore, build binaries
     // Skip for teardown so it works even on a partially configured machine
     if (purge && !teardown) {
@@ -7106,8 +7274,22 @@ Usage: bun run dev/locSetupV4.ts [options]
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
             requireBun: !hasOnlyOptions || psyPrivacyBridge || ide || modeAWebWalletBridge,
+            l1Only: l1 && !db && !values["coordinator"] && !values["prove-proxy"] && !values["faucet-server"]
+                && !values["dummy-provers"] && workerRealmCount === 0 && coordinatorWorkersCount === 0
+                && !relayer && !psyPrivacyBridge && !ide && !explorer && !modeAWebWalletBridge,
             env: envVars,
         });
+        if (guardianStartup) {
+            console.log("[DevNet] Checking genesis.json contracts against psy-genesis/genesis_contracts.json before starting nodes or deploying contracts...");
+            const args = ["bun", "run", path.join(REPO_ROOT, "dev/guardianInputs.ts"), "--check-genesis-contracts-only"];
+            const result = await runAndCapture(args, REPO_ROOT, { ...process.env, ...envVars });
+            if (result.code !== 0) throw new Error(`[DevNet] Genesis contract preflight failed: ${result.stderr || result.stdout}`);
+        }
+        if (guardianStartup && !fs.existsSync(guardianStartup.guardianPath)) {
+            const result = await runAndCapture([path.join(REPO_ROOT, "target/release/psy_relayer_cli"), "guardian-prepare-account",
+                "--output", path.join(guardianStartup.directory, "relayer-multisig-account.json")], REPO_ROOT, { ...process.env, ...envVars });
+            if (result.code !== 0) throw new Error(`[DevNet] Guardian account preparation failed: ${result.stderr || result.stdout}`);
+        }
     }
 
     // (Re)load faucet operators AFTER auto-setup so genesis-generated files exist.
@@ -7138,7 +7320,14 @@ Usage: bun run dev/locSetupV4.ts [options]
         }
     }
 
+        if (!daemonlize && (!hasOnlyOptions || modeAWebWalletBridge)) {
+            const uiDir = await resolveModeAWebWalletBridgeDir(REPO_ROOT);
+            await ensureUiDependencies(uiDir);
+            await resolveUiViteCommand(uiDir);
+        }
+
         const options: ProcessOptions = {
+            guardianStartup,
             purge,
             jtmb: !!values.jtmb,
             l1Port,

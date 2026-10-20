@@ -8560,6 +8560,7 @@ dependencies = [
  "psy_ups_circuit",
  "psy_user_cli",
  "psy_vm",
+ "rand 0.8.5",
  "redb",
  "reqwest 0.12.28",
  "serde",

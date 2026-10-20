@@ -155,6 +155,10 @@ Repair only the stale output:
 
 Do not rebuild all three because one comparison failed. Regenerate root `genesis.json` only when a [§6.1](circuit-and-verifier-operations.md#61-genesis-trigger) construction input changed; a stamp or compiler-revision refresh alone does not. Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions; the existing plonky2-hwa patch in each repository is not inherited across git pins. `dev/locSetupV4.ts` verifies the Genesis payload and full stamp before process startup. When a construction input requires root `genesis.json` regeneration, set `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT` for `make generate-genesis-data`; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
 
+When `make run-all` selects the bridge proposer/relayer, its public guardian configuration, authorization archive, and signing-key slots are checked before purge or auto-setup. For automatic localhost Guardian preparation, `genesis.json.contracts` is compared with the adopted `psy-genesis/genesis_contracts.json` immediately after environment preparation and before starting nodes or deploying L1 contracts; this preflight does not read sibling compiler outputs. After the prove proxy and Coordinator/Realm processors are ready, the launcher performs the L2-dependent guardian Genesis and contract/circuit check before starting workers or deploying/reusing L1 contracts. A failure at any gate stops startup; do not retry by restarting the full stack until the reported input mismatch is corrected.
+
+Run `make prepare-realm-p2p` before generating guardian authorization. The early gate requires reusable P2P keys/configuration, verifies that their validators match the existing Genesis without rewriting it, and recomputes the complete authorized checkpoint-0 hash with `psy_dev_cli check-guardian-genesis`. Purge retains `local_checkpoints/realm_p2p`; other checkpoint state is removed. To intentionally replace validator identities, prepare and authorize that membership separately before startup.
+
 ### Public-only `generate-genesis-data` inputs
 
 `make generate-genesis-data` takes only public inputs. It requires `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`, then runs `./target/release/psy_dev_cli generate-genesis-data` with `--repo-root`, `--relayer-multisig-account`, and `--multisig-policy-artifact` (`Makefile:139-144`). That child drops `PRIVATE_KEY`, `BRIDGE_RELAYER_L2_PRIVATE_KEY`, `KEYSTORE_PATH`, `PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, and `WALLET_PASSWORD`. The account `contract_id` must be 1 (`MULTISIG_POLICY_CONTRACT_ID`); `public_key_param` rejects any other id (`client_prover/psy_vm/src/ups/multisig.rs:20,75-76`), and the guardians-root branch repeats the check (`generate_genesis/guardians_root.rs:88`).
@@ -178,7 +182,42 @@ make run-all
 
 `PURGE=1 make shutdown` removes checkpoints, Anvil state under `db/anvil`, logs, and deployments only after the Anvil, Docker, and known-application cleanup gates succeed. Docker cleanup is attempted after Anvil shutdown, even if that shutdown fails; failure blocks file deletion and startup. Docker commands and listings are bounded, and failed or incomplete listings cannot prove absence. Any timeout or targeted leftover is a nonzero failure. The application gate covers known command patterns and a fixed port subset, not all sockets: Realm 13380–14679, proxy 9999–10008, guardians 15441–15443, and history 15450 are not individually probed (see [launcher teardown guarantees](devnet-launcher-reference.md#13-teardown-and-purge)). Bare `make shutdown` is identical because purge is the Make default. A fresh chain is `PURGE=1 make shutdown` followed by `make run-all`. Never delete only Scylla, Anvil state, deployments, or `local_checkpoints/`; retained components would describe different chains. `PURGE=0 make shutdown` does not fall through into purge when preservation fails.
 
+Use `make clean-guardian` when the next startup must create a fresh local chain and new Guardian authorization. It first completes the same full purge, then moves the complete `PSY_DEVNET_DIR` to a timestamped backup. It preserves the signing keys under `~/.psy/keystore`; the next `make run-all` recreates the public account, inputs, authorization, journal, and daemon from those same keys and the new L1 deployments. `make clean-db` uses this complete operation so it cannot leave authorization bound to a deleted Anvil genesis. There is intentionally no environment variable that rewrites retained authorization in place: select a new operator directory or run this fresh-chain operation. Do not use it to migrate a live chain or discard journal history while retaining L1/L2 state.
+
 `make run-all` stays in the foreground. Run it in a dedicated terminal or tmux pane. Do not background it with `&`.
+
+### 3.1 Fresh localhost without existing Guardian configuration
+
+For a matching artifact cohort with an existing verified `genesis.json`, the
+normal entry point now prepares missing localhost Guardian configuration:
+
+```bash
+make run-all
+```
+
+Make enables
+`PSY_GUARDIAN_AUTO_PREPARE=1`. Under the foreground supervisor lock, startup
+classifies configuration, prepares missing public multisig account/custody
+after the release build gate, finalizes P2P membership, and starts L1/L2 through
+the normal launcher. After actual L1 deployment it discovers the local public
+authorization inputs, creates the missing Guardian root and daemon, then runs
+offline and live checks before starting Guardian/Relayer. Existing daemon/root
+configuration is reused and checked; it never refreshes retained authorization
+or deletes journal history. A root with only its daemon missing gets that daemon
+prepared before the existing-root Genesis/P2P checks, not after validator injection.
+
+Automatic preparation supports only foreground, non-fork localhost with the
+standard two-Realm core, L1 and prove proxy selected. Missing custom-path configs,
+partial roots, stale overrides, conflicting inputs, missing Genesis, and identity
+mismatches stop startup. After L1 deployment/reuse, every Guardian-selected
+startup (including retained configs) runs `guardian-service-check --live-l1`
+before starting Guardian/Relayer. This verifies chain ID, L1 genesis, Bridge/
+StateManager registry, proxy implementations and code hashes at a pinned canonical
+block; an old root is not accepted just because its files exist.
+Complete the normal artifact/dependency gates first;
+this does not rebuild compiler/SDK artifacts or make an incompatible existing
+Genesis usable. Explicit Genesis generation remains subject to its boundary.
+Startup purge cannot be combined with missing-configuration preparation.
 
 ## 4. Readiness
 

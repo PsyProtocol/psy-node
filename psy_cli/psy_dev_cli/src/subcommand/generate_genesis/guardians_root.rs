@@ -326,7 +326,7 @@ fn validate_compiled_dimensions(args: &GenerateGenesisDataArgs) -> anyhow::Resul
 
 /// Recomputes checkpoint 0 exactly as the node coordinator does, with the
 /// node-side hasher, and converts it to the client 32-byte genesis identity.
-fn checkpoint0_genesis_hash(genesis: &PsyGenesisBlockSetupData<F, Hash>) -> anyhow::Result<Hash256> {
+pub(super) fn checkpoint0_genesis_hash(genesis: &PsyGenesisBlockSetupData<F, Hash>) -> anyhow::Result<Hash256> {
     let mut builder = GenesisDatabaseDataBuilder::new(
         genesis.deposit_tree_root,
         genesis.withdrawal_tree_root,

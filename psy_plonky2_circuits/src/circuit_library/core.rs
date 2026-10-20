@@ -10,6 +10,21 @@ use crate::{circuit_library::end_cap_verifier_data::get_end_cap_alt_verifier_dat
 pub fn get_plonky2_circuit_library_and_prover_for_network<C: QGenericConfig<D> + 'static, const D: usize>(
     network: PsyChainNetworkType,
 ) -> anyhow::Result<(GenericCircuitVerifier<C, D>, QEDCoordinatorCircuitManager<C, D>)> 
+where C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
+{
+    let rotation = psy_data::config::network_config::load_realm_rotation_config(network)?;
+    get_plonky2_circuit_library_and_prover_for_network_with_rotation::<C, D>(
+        network,
+        rotation.checkpoints_per_epoch,
+        rotation.validator_sub_ids,
+    )
+}
+
+pub fn get_plonky2_circuit_library_and_prover_for_network_with_rotation<C: QGenericConfig<D> + 'static, const D: usize>(
+    network: PsyChainNetworkType,
+    checkpoints_per_epoch: u64,
+    validator_sub_ids: Vec<u16>,
+) -> anyhow::Result<(GenericCircuitVerifier<C, D>, QEDCoordinatorCircuitManager<C, D>)>
 where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
 {
 
@@ -25,8 +40,6 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
 
 
     let circuit_config = get_circuit_config_for_network(network);
-    let rotation = psy_data::config::network_config::load_realm_rotation_config(network)?;
-
     let default_user_state_tree_root = QHashOut::<C::F>::from_u64x4(circuit_config.default_user_state_tree_root_hash_u64_x4);
 
     //let end_cap_common_circuit_data =
@@ -61,8 +74,8 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         default_user_state_tree_root,
         get_default_worker_rewards_tree_tag::<QHashOut<C::F>>(),
         psy_data::guta::realm_finalize::realm_finalize_guta_chain_domain::<C::F, QHashOut<C::F>, C::Hasher>(network.get_chain_id()),
-        rotation.checkpoints_per_epoch,
-        rotation.validator_sub_ids,
+        checkpoints_per_epoch,
+        validator_sub_ids,
     );
 
     gcv.register_circuit_triplet(

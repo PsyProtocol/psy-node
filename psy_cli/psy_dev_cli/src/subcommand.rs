@@ -28,6 +28,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(about = "Verify the complete existing Genesis identity against guardian authorization without starting services")]
+    CheckGuardianGenesis {
+        #[arg(long)] config: std::path::PathBuf,
+        #[arg(long, default_value = "genesis.json")] genesis_data: std::path::PathBuf,
+    },
     #[command(about = "Read and parse worker completed jobs backup file")]
     ReadWorkerBackup(ReadWorkerBackupArgs),
     #[command(about = "Read and parse checkpoint tree backup file")]

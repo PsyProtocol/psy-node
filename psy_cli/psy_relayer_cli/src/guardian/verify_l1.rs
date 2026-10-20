@@ -103,6 +103,17 @@ async fn verify_identity(rpc: &CustodyRpc<'_>, chain: &ChainAuthorization, block
     Ok(())
 }
 
+pub(crate) async fn verify_chain_identity(endpoint: &ChainEndpoint, chain: &ChainAuthorization) -> Result<()> {
+    let rpc = CustodyRpc::new(endpoint)?;
+    let head = rpc.block(json!("latest")).await?;
+    let number = quantity(&head["number"])?;
+    let hash = block_hash(&head)?;
+    let block = json!({ "blockHash": format!("0x{}", hex::encode(hash)), "requireCanonical": true });
+    verify_identity(&rpc, chain, &block).await?;
+    if block_hash(&rpc.block(block_id(number)).await?)? != hash { return Err(GuardianSignError::EvidenceMismatch); }
+    Ok(())
+}
+
 async fn verify_ancestor(rpc: &CustodyRpc<'_>, number: u64, hash: [u8;32], finalized: &Value) -> Result<()> {
     if number > quantity(&finalized["number"])? { return Err(GuardianSignError::EvidenceUnavailable); }
     let canonical=rpc.block(block_id(number)).await?;
@@ -281,6 +292,77 @@ fn address_words(address: &[u8]) -> [u32; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_checks_live_chain_identity_without_replacing_authorization() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for conflict in ["none", "genesis", "code", "implementation", "reorg"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = ChainEndpoint { chain_index: 0, rpc_url: format!("http://{}", listener.local_addr().unwrap()) };
+            let chain = ChainAuthorization {
+                chain_index: 0, chain_id: U256::from(31337), genesis_hash: Hex([1;32]),
+                bridge: Hex([2;20]), state_manager: Hex([3;20]),
+                bridge_code_hash: Hex(keccak256([0x60,0x00]).into()),
+                bridge_implementation: Hex([4;20]), bridge_implementation_code_hash: Hex(keccak256([0x60,0x00]).into()),
+                state_manager_code_hash: Hex(keccak256([0x60,0x00]).into()),
+                state_manager_implementation: Hex([5;20]), state_manager_implementation_code_hash: Hex(keccak256([0x60,0x00]).into()),
+                deployment_block: 1, token_mappings: vec![],
+            };
+            let retained = serde_json::to_vec(&chain).unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let request: Value = loop {
+                        let mut chunk = [0;4096];
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                            if bytes.len() >= end + 4 + length { break serde_json::from_slice(&bytes[end+4..end+4+length]).unwrap(); }
+                        }
+                    };
+                    let word = |byte: u8| json!(format!("0x{}{}", "00".repeat(12), hex::encode([byte;20])));
+                    let method = request["method"].as_str().unwrap();
+                    let params = &request["params"];
+                    let result = match method {
+                        "eth_getBlockByNumber" => {
+                            let genesis = params[0] == "0x0";
+                            let hash = if genesis { if conflict == "genesis" { 9 } else { 1 } }
+                                else if conflict == "reorg" && params[0] == "0xa" { 9 } else { 6 };
+                            json!({ "number": if genesis { "0x0" } else { "0xa" }, "hash": format!("0x{}", hex::encode([hash;32])) })
+                        },
+                        "eth_chainId" => json!("0x7a69"),
+                        "eth_call" => {
+                            assert_eq!(params[1]["requireCanonical"], true);
+                            let data = params[0]["data"].as_str().unwrap();
+                            if data.starts_with("0xc72c4d10") { word(7) }
+                            else if data.starts_with("0x21f8a721") { word(3) }
+                            else { json!(format!("0x{}", "00".repeat(32))) }
+                        },
+                        "eth_getCode" => {
+                            assert_eq!(params[1]["requireCanonical"], true);
+                            json!(if conflict == "code" { "0x6001" } else { "0x6000" })
+                        },
+                        "eth_getStorageAt" => {
+                            assert_eq!(params[2]["requireCanonical"], true);
+                            word(if conflict == "implementation" { 9 } else if params[0] == format!("0x{}", hex::encode([2;20])) { 4 } else { 5 })
+                        },
+                        _ => panic!("unexpected RPC {method}"),
+                    };
+                    let body = json!({ "jsonrpc":"2.0", "id":1, "result":result }).to_string();
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let result = verify_chain_identity(&endpoint, &chain).await;
+            server.abort();
+            assert_eq!(result.is_ok(), conflict == "none", "{conflict}: {result:?}");
+            assert_eq!(serde_json::to_vec(&chain).unwrap(), retained);
+        }
+    }
 
     #[test]
     fn custody_frontier_only_reuses_contiguous_forward_interval() {

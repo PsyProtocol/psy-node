@@ -3,7 +3,7 @@ import path from "node:path";
 import net from "node:net";
 import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { mkdtemp, mkdir, writeFile, rm, symlink, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, symlink, chmod, realpath } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
 import allConfig from "../psy-genesis/config.json";
 import {
@@ -26,6 +26,7 @@ import {
     runTeardownCommand,
     stopRepoAnvilsForPurge,
     exactSnapshotNames,
+    purgeDockerCleanup,
     preservedAnvilGenesis,
     ROLLBACK_STOP_SENTINEL_CONTENT,
     ROLLBACK_STOP_SENTINEL_PATH,
@@ -36,6 +37,7 @@ import {
     sendDevnetControlCommand,
     evaluateCompilerArtifactStamp,
     injectGenesisValidators,
+    cleanCheckpoint,
     isUsableGenesisData,
     ensureGenesisFiles,
     planGenesisGeneration,
@@ -45,6 +47,10 @@ import {
     resolveLocalAnvilStatePlan,
     resolveForkRpcEnvKey,
     resolveProjectsDir,
+    resolveModeAWebWalletBridgeDir,
+    resolveUiViteCommand,
+    resolveUiWorkspaceDir,
+    ensureUiDependencies,
     RunningProcess,
     runStreamingCaptureStderr,
     retryProcessorStartup,
@@ -997,7 +1003,90 @@ describe("realm P2P launch planning", () => {
     });
 });
 
+describe("Account UI startup", () => {
+    it("uses the root importer despite a retained standalone marker and outdated app lockfile", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "account-ui-workspace-"));
+        const spawn = spyOn(Bun, "spawn");
+        try {
+            const app = path.join(dir, "apps/account");
+            await Bun.write(path.join(app, "package.json"), '{"name":"account","dependencies":{"sdk":"2.0.8"}}');
+            await Bun.write(path.join(app, "pnpm-workspace.yaml"), "allowBuilds:\n  esbuild: true\n");
+            await Bun.write(path.join(app, "pnpm-lock.yaml"), "importers:\n  .:\n    dependencies:\n      sdk:\n        specifier: file:old-location\n");
+            await Bun.write(path.join(dir, "pnpm-workspace.yaml"), "packages:\n  - apps/*\n");
+            await Bun.write(path.join(dir, "pnpm-lock.yaml"), "importers:\n  apps/account:\n    dependencies:\n      sdk:\n        specifier: 2.0.8\n");
+            await mkdir(path.join(dir, "node_modules"));
+            expect(await resolveUiWorkspaceDir(app)).toBe(dir);
+            await ensureUiDependencies(app);
+            expect(spawn).not.toHaveBeenCalled();
+        } finally { spawn.mockRestore(); await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("prefers apps/account over a leftover Mode A directory", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "account-ui-startup-"));
+        try {
+            await mkdir(path.join(dir, "psy-dapp/mode-a-web-wallet-bridge/dist"), { recursive: true });
+            await Bun.write(path.join(dir, "psy-dapp/apps/account/package.json"), '{"name":"psy-zkanykey-wallet"}');
+            expect(await resolveModeAWebWalletBridgeDir(dir)).toBe(path.join(dir, "psy-dapp/apps/account"));
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("supports a valid Mode A package but rejects build-only leftovers", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "mode-a-ui-startup-"));
+        try {
+            const legacy = path.join(dir, "psy-dapp/mode-a-web-wallet-bridge");
+            await mkdir(path.join(legacy, "dist"), { recursive: true });
+            await expect(resolveModeAWebWalletBridgeDir(dir)).rejects.toThrow("package.json is missing");
+            await Bun.write(path.join(legacy, "package.json"), '{"name":"mode-a-web-wallet-bridge"}');
+            expect(await resolveModeAWebWalletBridgeDir(dir)).toBe(legacy);
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("resolves hoisted Vite and rejects a missing executable before service startup", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "account-ui-vite-"));
+        try {
+            const app = path.join(dir, "apps/account");
+            await expect(resolveUiViteCommand(app)).rejects.toThrow("UI package.json is missing");
+            await Bun.write(path.join(app, "package.json"), '{"name":"account"}');
+            await Bun.write(path.join(dir, "node_modules/vite/package.json"), '{"name":"vite","exports":{"./package.json":"./package.json"}}');
+            await expect(resolveUiViteCommand(app)).rejects.toThrow("Vite is unavailable");
+            const entry = path.join(dir, "node_modules/vite/bin/vite.js");
+            await Bun.write(entry, "// fixture");
+            expect(await resolveUiViteCommand(app)).toEqual(["node", await realpath(entry)]);
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+});
+
 describe("injectGenesisValidators", () => {
+    it("rejects validator changes during authorized startup without modifying Genesis", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "guardian-genesis-validators-"));
+        try {
+            const genesisPath = path.join(dir, "genesis.json");
+            const config = { defaultNetwork: "localhost", networks: { localhost: { realm_configs: [{ id: 0, validators: [{ validator_user_id: 0, processor_node_id: "aa", bls_public_key: "bb" }] }] } } } as any;
+            await Bun.write(genesisPath, JSON.stringify({ validators: [], checkpoint_stats: { block_time: 42 } }));
+            await injectGenesisValidators(genesisPath, config);
+            const authorized = await Bun.file(genesisPath).text();
+            await injectGenesisValidators(genesisPath, config, true);
+            expect(await Bun.file(genesisPath).text()).toBe(authorized);
+            config.networks.localhost.realm_configs[0].validators[0].bls_public_key = "cc";
+            await expect(injectGenesisValidators(genesisPath, config, true)).rejects.toThrow("differ from the authorized Genesis");
+            expect(await Bun.file(genesisPath).text()).toBe(authorized);
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("purges checkpoint state while retaining Realm P2P identity files", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "guardian-purge-validators-"));
+        try {
+            const root = path.join(dir, "local_checkpoints");
+            await mkdir(path.join(root, "realm_p2p"), { recursive: true });
+            await mkdir(path.join(root, "coordinator"), { recursive: true });
+            await Bun.write(path.join(root, "realm_p2p", "identity.key"), "retained identity");
+            await Bun.write(path.join(root, "coordinator", "checkpoint"), "discarded state");
+            await cleanCheckpoint("local_checkpoints", dir, ["realm_p2p"]);
+            expect(await Bun.file(path.join(root, "realm_p2p", "identity.key")).text()).toBe("retained identity");
+            expect(await Bun.file(path.join(root, "coordinator", "checkpoint")).exists()).toBe(false);
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
     it("writes ordered network validators without storing sub ids", async () => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         try {
@@ -2014,6 +2103,26 @@ describe("purge Anvil ownership", () => {
         });
     });
 
+    it("does not remove auto-removed containers twice and fails closed on an unreadable stop snapshot", async () => {
+        for (const mode of ["auto-removed", "retained", "unreadable"] as const) {
+            const phases: string[] = [];
+            const failures: string[] = [];
+            const ok = await purgeDockerCleanup("/tmp/psy-no-compose-fixture", failures, async (phase, argv, _cwd, errors) => {
+                phases.push(phase);
+                if (phase === "docker-rm") expect(argv).toEqual(["docker", "rm", "-f", "scylla-server"]);
+                const stdout = phase === "docker-ps" || (phase === "docker-ps-stopped" && mode === "retained")
+                    ? "scylla-server\n" : phase === "volume-ls" ? "psy-devnet-scylla\n" : "";
+                const failed = phase === "docker-ps-stopped" && mode === "unreadable";
+                if (failed) errors.push("snapshot failed");
+                return { argv0: "docker", code: failed ? 1 : 0, timedOut: false, stderrCategory: failed ? "present" : "empty", stdout, stdoutComplete: !failed };
+            });
+            expect(ok).toBe(mode !== "unreadable");
+            expect(phases.includes("docker-rm")).toBe(mode === "retained");
+            expect(phases.includes("volume-rm")).toBe(mode !== "unreadable");
+            if (mode !== "unreadable") expect(phases).toContain("docker-ps-after");
+        }
+    });
+
     it("treats a missing docker object as absent and a daemon error or leftover as failure", () => {
         const names = exactSnapshotNames("valkey-server\n\npsy-devnet-redis\n");
         expect(names.has("scylla-server")).toBe(false);
@@ -2027,4 +2136,3 @@ describe("purge Anvil ownership", () => {
         expect(names.has("valkey-server")).toBe(true);
     });
 });
-
