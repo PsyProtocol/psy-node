@@ -1871,6 +1871,8 @@ mod gatherer_builder_tests {
             coordinator_guta_updates_circuit_whitelist: chain_state.guta_circuit_whitelist,
             checkpoint_tree: Arc::new(chain_state.checkpoint_tree.clone()),
             future_pending_end_cap_jobs: Arc::new(RwLock::new(Vec::new())),
+            current_validator_user_leaf: Arc::new(std::sync::Mutex::new(chain_state.finalizer_user.user_leaf.clone())),
+            tree_store: chain_state.db.clone(),
             _phantom_n: std::marker::PhantomData,
         };
 

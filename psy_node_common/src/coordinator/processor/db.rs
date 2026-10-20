@@ -1943,6 +1943,7 @@ mod integration_tests {
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: PHash::from_values(4, 0, 0, 0),
             withdrawal_tree_root: PHash::from_values(5, 0, 0, 0),
+            validators: vec![],
         }
     }
 
@@ -1974,7 +1975,7 @@ mod integration_tests {
             let (genesis_transition, _genesis_block_update) = GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_coordinator::<
                 parth_core::pgoldilocks::PoseidonHasher,
                 N,
-            >(&genesis_data, fp_config.checkpoint_state_transition_circuit_fingerprint)?;
+            >(&genesis_data, psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(), fp_config.checkpoint_state_transition_circuit_fingerprint)?;
 
             let processor = TestProcessor::new_init(
                 Arc::clone(&db),
@@ -2008,7 +2009,7 @@ mod integration_tests {
 
         async fn create_with_genesis_committed() -> anyhow::Result<Self> {
             let mut env = Self::create().await?;
-            env.processor.ensure_genesis_applied_from_setup_data(&env.genesis_data).await?;
+            env.processor.ensure_genesis_applied_from_setup_data(psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(), &env.genesis_data).await?;
             Ok(env)
         }
     }
@@ -2057,7 +2058,7 @@ mod integration_tests {
     #[tokio::test]
     async fn genesis_commit_flips_state_to_ready_and_persists_everything() -> anyhow::Result<()> {
         let mut env = CoordinatorDbTestEnv::create().await?;
-        env.processor.ensure_genesis_applied_from_setup_data(&env.genesis_data).await?;
+        env.processor.ensure_genesis_applied_from_setup_data(psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(), &env.genesis_data).await?;
 
         let processor = &env.processor;
         assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::Ready);
@@ -2108,7 +2109,7 @@ mod integration_tests {
         processor.ensure_db_matches_verifiable_transition(&env.genesis_transition).await?;
 
         // a second ensure call must be a no-op (state is already Ready)
-        env.processor.ensure_genesis_applied_from_setup_data(&env.genesis_data).await?;
+        env.processor.ensure_genesis_applied_from_setup_data(psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(), &env.genesis_data).await?;
         assert_eq!(env.processor.get_latest_checkpoint_id_internal().await?, 0);
         Ok(())
     }
@@ -2118,6 +2119,7 @@ mod integration_tests {
         let mut env = CoordinatorDbTestEnv::create().await?;
         let (_, genesis_block_update) = GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_coordinator::<parth_core::pgoldilocks::PoseidonHasher, N>(
             &env.genesis_data,
+            psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(),
             env.processor.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
         )?;
 

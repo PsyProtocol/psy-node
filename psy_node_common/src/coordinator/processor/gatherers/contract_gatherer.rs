@@ -624,6 +624,7 @@ mod gatherer_tests {
                 user_tree_root: zh(3),
                 withdrawal_tree_root: zh(2),
                 user_registration_tree_root: zh(3),
+                validator_tree_root: zh(2),
             },
             should_revert_last_changes: false,
             block_state: block_state(1),

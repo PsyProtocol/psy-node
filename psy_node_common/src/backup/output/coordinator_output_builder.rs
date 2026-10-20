@@ -1244,6 +1244,7 @@ mod output_builder_tests {
             user_tree_root: zh(1),
             withdrawal_tree_root: PoseidonHasher::get_zero_hash(TODO_WITHDRAWAL_TREE_HEIGHT as usize),
             user_registration_tree_root: zh(3),
+            validator_tree_root: zh(2),
         };
         let old_leaf = PQEDCheckpointLeaf::<PF, PHash> {
             global_chain_root: old_state_roots.qfhash::<PoseidonHasher>(),
