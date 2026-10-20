@@ -85,6 +85,7 @@ mod tests {
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: QHashOut::<PF>::from_values(4, 0, 0, 0),
             withdrawal_tree_root: QHashOut::<PF>::from_values(5, 0, 0, 0),
+            validators: vec![],
         }
     }
 

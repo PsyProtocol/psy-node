@@ -1545,6 +1545,7 @@ pub(crate) mod realm_db_test_env {
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: PHash::from_values(4, 0, 0, 0),
             withdrawal_tree_root: PHash::from_values(5, 0, 0, 0),
+            validators: vec![],
         }
     }
 
@@ -1553,6 +1554,7 @@ pub(crate) mod realm_db_test_env {
     ) -> anyhow::Result<PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<PF, PHash>> {
         GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_realm::<PoseidonHasher, N>(
             genesis_data,
+            u64::from(TEST_CHAIN_ID),
             TEST_REALM_ID,
             TEST_REALM_SUB_ID,
         )
@@ -1699,6 +1701,8 @@ pub(crate) mod realm_db_test_env {
             input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>,
             proof: Vec<u8>,
             realm_id: u64,
+            _proposal_bytes: Option<Vec<u8>>,
+            _certificate_bytes: Option<Vec<u8>>,
         ) -> anyhow::Result<()> {
             *self.guta_submit_attempts.lock().unwrap() += 1;
             let committed_meanwhile = *self.checkpoints_committed_during_guta_submit.lock().unwrap();
@@ -1727,6 +1731,8 @@ pub(crate) mod realm_db_test_env {
         pub coordinator: Arc<FakeRealmCoordinatorClient>,
         pub genesis_data: PsyGenesisBlockSetupData<PF, PHash>,
         pub genesis: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<PF, PHash>,
+        pub proposal_backup: Arc<crate::realm::processor::proposal_backup::ProposalBackup>,
+        _proposal_backup_dir: tempfile::TempDir,
     }
 
     impl RealmDbTestEnv {
@@ -1740,6 +1746,8 @@ pub(crate) mod realm_db_test_env {
             let file_system = Arc::new(SimpleMockMemoryFileSystem::new());
             let genesis_data = genesis_setup_data(1, 4);
             let genesis = build_realm_genesis(&genesis_data)?;
+            let proposal_backup_dir = tempfile::tempdir()?;
+            let proposal_backup = Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?);
 
             let coordinator = Arc::new(FakeRealmCoordinatorClient::new());
             // the coordinator is sitting at genesis (checkpoint 0)
@@ -1754,13 +1762,13 @@ pub(crate) mod realm_db_test_env {
                 Arc::clone(&guta_queue),
                 Arc::clone(&proof_queue),
                 Arc::clone(&coordinator),
-                TEST_CHAIN_ID,
+                u64::from(TEST_CHAIN_ID),
                 test_realm_identifier(),
                 fingerprint_config(),
+                Arc::new(crate::test_common::TestZKVerifier {}),
                 Arc::clone(&file_system),
                 TEST_BACKUP_PATH.to_string(),
-                genesis.prepared_updates.new_realm_root,
-                genesis.coordinator_update.checkpoint_sync_info.checkpoint_tree_root,
+                &genesis,
             )
             .await?;
 
@@ -1774,6 +1782,8 @@ pub(crate) mod realm_db_test_env {
                 coordinator,
                 genesis_data,
                 genesis,
+                proposal_backup,
+                _proposal_backup_dir: proposal_backup_dir,
             })
         }
 
@@ -1930,7 +1940,7 @@ mod init_tests {
             processor.state.last_committed_realm_end_root,
             env.genesis.prepared_updates.new_realm_root
         );
-        assert_eq!(processor.state.chain_id, TEST_CHAIN_ID);
+        assert_eq!(processor.state.chain_id, u64::from(TEST_CHAIN_ID));
         assert_eq!(processor.state.realm_id_u64, TEST_REALM_ID);
         assert_eq!(processor.state.realm_sub_id_u64, TEST_REALM_SUB_ID);
         assert!(!processor.needs_revert);
@@ -1975,13 +1985,13 @@ mod init_tests {
             Arc::clone(&env.guta_queue),
             Arc::clone(&env.proof_queue),
             Arc::clone(&env.coordinator),
-            TEST_CHAIN_ID,
+            u64::from(TEST_CHAIN_ID),
             test_realm_identifier(),
             fingerprint_config(),
+            Arc::new(crate::test_common::TestZKVerifier {}),
             Arc::clone(&env.file_system),
             format!("rollback_{}", std::process::id()),
-            env.genesis.prepared_updates.new_realm_root,
-            env.genesis.coordinator_update.checkpoint_sync_info.checkpoint_tree_root,
+            &env.genesis,
         )
         .await?;
 
@@ -2138,7 +2148,7 @@ mod init_tests {
 
         let mut tree = load_global_user_tree(&env).await?;
         env.processor
-            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree)
+            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree, &env.proposal_backup, None)
             .await?;
 
         // the unchanged checkpoint was skipped: nothing was committed locally
@@ -2163,7 +2173,7 @@ mod init_tests {
         let mut tree = load_global_user_tree(&env).await?;
         let err = match env
             .processor
-            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree)
+            .ensure_backup_restored_if_necessary(&env.file_system, TEST_GUTA_BACKUP_DIR, &mut tree, &env.proposal_backup, None)
             .await
         {
             Err(err) => err,
@@ -2188,7 +2198,7 @@ mod init_tests {
 
         let mut tree = load_global_user_tree(&env).await?;
         env.processor
-            .init_with_setup_and_genesis(&env.file_system, TEST_GUTA_BACKUP_DIR, env.genesis.clone(), &mut tree)
+            .init_with_setup_and_genesis(&env.file_system, TEST_GUTA_BACKUP_DIR, env.genesis.clone(), &mut tree, &env.proposal_backup, None)
             .await?;
 
         let state = &env.processor.state;

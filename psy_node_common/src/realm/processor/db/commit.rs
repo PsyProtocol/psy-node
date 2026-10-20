@@ -417,9 +417,9 @@ mod commit_tests {
         assert_eq!(env.proof_queue.ensured_consumers.lock().unwrap().len(), 2);
 
         // temp db mirrors the rotated ids
-        let gathering = env.temp_db.get_gathering_unique_pending_ids(&rid).await?;
-        assert_eq!(gathering.0, 1);
-        assert_eq!(gathering.1, env.processor.state.gathering_proc_checkpoint_unique_id);
+        let gathering = env.temp_db.get_gathering_generation(&rid).await?;
+        assert_eq!(gathering.unique_pending_id, 1);
+        assert_eq!(gathering.proc_checkpoint_unique_id, env.processor.state.gathering_proc_checkpoint_unique_id);
         let processing = env.temp_db.get_unique_pending_ids(&rid).await?;
         assert_eq!(processing, (0, 0u128));
 
@@ -449,7 +449,7 @@ mod commit_tests {
 
         let err = match env
             .processor
-            .commit_state(&tampered, &env.genesis.prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![], false)
+            .commit_state(&tampered, &env.genesis.prepared_updates, ProvingJobCircuitType::GUTANoChange, vec![])
             .await
         {
             Err(err) => err,
@@ -525,7 +525,7 @@ mod commit_tests {
             update_contract_state_imt_leaves_ffs: vec![],
         };
         env.processor
-            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![], true)
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
             .await?;
 
         assert_eq!(env.db.get_latest_checkpoint_id().await?, 1);
@@ -573,7 +573,7 @@ mod commit_tests {
             update_contract_state_imt_leaves_ffs: vec![],
         };
         env.processor
-            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![], true)
+            .commit_state(&update, &prepared, ProvingJobCircuitType::GUTANoChange, vec![])
             .await?;
         // the previous checkpoint's proofs (pending id 0) were dropped; the
         // commit itself still reports checkpoint 1 fully persisted
