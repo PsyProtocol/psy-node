@@ -10372,9 +10372,10 @@ mod async_split_tests {
             .await?;
         let mint_tx_hash = wallet_session.prove_tx_trace(user0, &mint_trace).await?;
         tracing::info!("step-claim test: mint submitted tx_hash={}", mint_tx_hash);
+        let mint_end_user_leaf_hash = mint_trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
         wallet_session
             .st_provider
-            .wait_for_endcap_inclusion(user0_id, mint_tx_hash, mint_before, Some(240), 1)
+            .wait_for_endcap_inclusion(user0_id, mint_end_user_leaf_hash, mint_before, Some(240), 1)
             .await?;
         tracing::info!("step-claim test: mint included");
 
@@ -10392,9 +10393,10 @@ mod async_split_tests {
             .await?;
         let transfer_tx_hash = wallet_session.prove_tx_trace(user0, &transfer_trace).await?;
         tracing::info!("step-claim test: transfer submitted tx_hash={}", transfer_tx_hash);
+        let transfer_end_user_leaf_hash = transfer_trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
         wallet_session
             .st_provider
-            .wait_for_endcap_inclusion(user0_id, transfer_tx_hash, transfer_before, Some(240), 1)
+            .wait_for_endcap_inclusion(user0_id, transfer_end_user_leaf_hash, transfer_before, Some(240), 1)
             .await?;
         tracing::info!("step-claim test: transfer included");
 
