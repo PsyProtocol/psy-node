@@ -67,6 +67,7 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 zeroize = { workspace = true }
+rand = { workspace = true }
 libc = { workspace = true }
 tower = { workspace = true }
 psy_rpc_pool = { path = "../../psy_rpc_pool" }

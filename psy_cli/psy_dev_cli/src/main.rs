@@ -12,6 +12,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::CheckGuardianGenesis { config, genesis_data } => {
+            subcommand::generate_genesis::check_guardian_genesis(&config, &genesis_data)?;
+        }
         Commands::ReadWorkerBackup(args) => {
             subcommand::read_worker_backup::run(args).await?;
         }

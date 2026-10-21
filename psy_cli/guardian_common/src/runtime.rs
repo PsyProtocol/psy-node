@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, BTreeSet}, ffi::CString, fs::File, io::Read, os::{fd::{AsRawFd, FromRawFd}, unix::fs::MetadataExt}, path::{Component, Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{BTreeMap, BTreeSet}, ffi::CString, fs::File, io::{Read, Seek, SeekFrom}, os::{fd::{AsRawFd, FromRawFd}, unix::fs::MetadataExt}, path::{Component, Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use zeroize::Zeroizing;
 use super::protocol::*;
@@ -22,7 +22,7 @@ fn protected_file_at(directory: &Path, relative: &Path, file_flags: i32) -> Resu
         let name = CString::new(name.as_bytes()).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
         let final_file = index + 1 == parts.len();
         let flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | if final_file { file_flags } else { libc::O_RDONLY | libc::O_DIRECTORY };
-        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::mode_t) };
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::c_int) };
         if fd < 0 { return Err(GuardianSignError::KeyUnavailable); }
         let opened = unsafe { File::from_raw_fd(fd) };
         let metadata = opened.metadata().map_err(|_| GuardianSignError::KeyUnavailable)?;
@@ -293,7 +293,8 @@ pub fn load_signing_key(config: &GuardianRuntimeConfig) -> Result<psy_provider::
     let mut file = protected_file(&key_directory, &key_relative)?;
     let before = file.metadata().map_err(|_| GuardianSignError::KeyUnavailable)?;
     let _encrypted = read_file(&mut file, 1024 * 1024)?;
-    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    file.seek(SeekFrom::Start(0)).map_err(|_| GuardianSignError::KeyUnavailable)?;
+    let fd_path = PathBuf::from(format!("{}/{}", if cfg!(target_os = "macos") { "/dev/fd" } else { "/proc/self/fd" }, file.as_raw_fd()));
     let key = psy_provider::wallet::secp_wallet::Wallet::load_encrypted_keystore(&fd_path, secret_text(&password, true)?).map_err(|_| GuardianSignError::KeyUnavailable)?;
     let after = file.metadata().map_err(|_| GuardianSignError::KeyUnavailable)?;
     if before.len() != after.len() || before.mtime() != after.mtime() || before.mtime_nsec() != after.mtime_nsec()

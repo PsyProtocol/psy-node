@@ -44,6 +44,7 @@ Use one verb for one act. Do not invent a synonym.
 | `install` | Verify staged bytes, atomically rename them into their destination, then fsync the parent directory | `ProposalBackup::install` |
 | `stage` | Write a candidate that is not yet retained | `create_staged`, `stage_transition_blocks` |
 | `derive` | Compute a deterministic hash or identity from known inputs | `derive_shield_address`, `derive-shield` |
+| `prepare` | Create missing operator inputs and validate reusable inputs before generation or startup | `prepare-guardian-account`, `prepare-realm-p2p` |
 
 `persist` is banned. Do not add `store_*` as a verb synonym for `save`/`write`.
 
@@ -279,6 +280,29 @@ On-disk directory: `local_checkpoints/realm_{R}_{S}/proposal_backups/`.
 
 ## 10. Naming checklist
 
+### Unsigned integers
+
+`uint` names the checked unsigned integer family: language types `u32`, `u64`,
+`u128`, and `u256`. `Uint<N>` holds N little-endian `u32` limbs; a limb is one
+base-2^32 digit. `UintValue<F, N>` holds the corresponding DPN scalar values.
+`U64`, `U128`, `U256` and their `*Value` forms are width-specific aliases.
+The generic `DPNContext::op_uint_*` methods expose these operations to callers
+and delegate to `UintValue`; they add no serialized opcode. N=1 arithmetic,
+bitwise, and shift methods use existing native `op_u32_*` operations. Wider
+widths expand into existing
+range-checked scalar DPN operations. `mul` computes a full 2N-limb product and
+rejects overflow beyond N limbs. `div_rem` computes the unsigned quotient and
+remainder, rejecting a zero divisor. Shifts take a `u32` distance: bits moved
+past the 32N-bit width are dropped, and a distance of 32N or more yields zero.
+Carry and borrow name the digits propagated between adjacent limbs.
+The deployment ABI preserves `U256` as a primitive name; its state-layout
+proof uses the existing fixed array of eight `U32` limbs (eight slots), not
+packed `U64`, `U128`, or `Hash` storage. No new circuit or primitive tag is introduced.
+`get_value`, `set_value`, and `get_value_other` are lossless u256 map operations.
+`u256_map_key_hash` derives the two physical IMT keys from namespace, key hash,
+and half index under the ASCII `U256MAP` domain. Each logical value consumes two
+entries of the existing map capacity; generic map methods retain digest semantics.
+
 1. The name says the object (`proposal`, `guta_gatherer`, `checkpoint`, `shield_address`), not a
    category (`data`, `store`, `production`).
 2. State qualifiers precede the object: `last_committed_realm_end_root`,
@@ -325,3 +349,25 @@ Retain UserRewardLeaf, UserRewardAggregate, UserRewardRoot, UserRewardCheckpoint
 
 
 SDK prepare and confirm names are `PrepareRewardClaimRequest`, `RewardClaimPreparation`, `PreparedRewardClaim`, `DeferredRewardCheckpoint`, `RewardClaimConfirmation`, `RewardCheckpointStatement`, `prepare_reward_claim_json`, `prepareRewardClaim`, `confirm_reward_claim_json`, `confirmRewardClaim`, `prove_reward_root`, `bind_reward_checkpoint_statement`, and `encode_reward_claim_calldata`. `RewardClaimPreparation` is the status outcome, not a wrapper around an unspecified body. `RewardCheckpointStatement` is the bound checkpoint root, active checkpoint ids, and total. `prove_reward_root` has one `anyhow` failure for an unsupported signer and one `ZKUser` override. `getClaimRewardsCallArgs` and `claimRewards` are removed rather than aliased. The relation and encodings stay in checkpoint-claim-cutover.md section 6.
+
+`ensure_eval_cache` evaluates a symbolic expression graph in postorder using a heap stack. `resolve_felt_ref_ready` and `resolve_array_ref_ready` evaluate one node after its scalar and array dependencies are cached. Compilation preserves the same child postorder and register allocation order with a heap stack.
+
+`PSY_GUARDIANS_ROOT` selects the existing `--guardians-root` CLI branch through Make. `PSY_GUARDIAN_CHAINS`, `PSY_GUARDIAN_L1_ENDPOINTS`, and `PSY_GUARDIAN_APPROVED_CONTRACTS` name its three public authorization input paths. `GUARDIANS_ROOT_ARGS` assembles those existing CLI flags; `check-guardians-root-inputs` checks the required Make inputs and `generate-guardians-root` invokes that branch against the existing Genesis.
+
+`prepare-realm-p2p` finalizes the existing Realm P2P identities and injects their public validators into the existing Genesis before guardian authorization is generated. `check-guardian-genesis` recomputes the complete checkpoint-0 identity, including validators, and compares it with the guardian authorization without starting services. `contract_method_common_data` retains method fingerprints and verifier data; metadata requests release temporary proving circuits after deriving that data.
+
+`guardian-prepare-account` prepares the three standard encrypted Guardian signing keys and their public two-of-three `MultisigAccount`. Existing custody is reused and an existing account must match its signer slots; the command never rotates a chain account. `prepare-guardian-account` is its Make entry point.
+
+`PSY_DEVNET_DIR` owns the stable local operator configuration directory. `prepare-guardian-config` creates the localhost bridge daemon configuration from the generated public Guardian root. `check-guardians` checks checkpoint-0 identity and local signing inputs; `check-guardians-live` adds live L2 validation.
+
+`prepare-multisig-policy-artifact` copies the matching sibling compiler's policy artifact into local operator inputs. `prepare-guardian-inputs` discovers the intended localhost L1 deployment and exports its pinned approvals, endpoints, and matching Genesis contract artifacts. `guardian-prepare-approved-contracts` is the operator CLI for deriving those contract approvals from Genesis and compiler artifacts. `checkGenesisContracts` checks that the adopted `psy-genesis/genesis_contracts.json` deployments exactly equal `genesis.json.contracts`; `--check-genesis-contracts-only` runs that startup preflight without reading sibling compiler outputs. `PSY_COMPILER_ARTIFACTS_DIR` selects the compiler's release artifact directory for explicit Guardian input preparation.
+
+`Account UI` is the DApp application in `psy-dapp/apps/account`. The existing `--mode-a-web-wallet-bridge` launcher selector starts this application on port 5179 and accepts the standalone Mode A package only on older DApp pins where that package still has a manifest.
+
+`GuardianStartup` is the localhost-only missing-configuration preparation plan owned by `guardianStartup.ts`. `planGuardianStartup` classifies retained versus missing operator configuration; `prepareGuardianStartup` creates missing public authorization/configuration after actual L1 deployment. `PSY_GUARDIAN_AUTO_PREPARE=1` enables this path for `make run-all`; it never authorizes Genesis regeneration, custody rotation, authorization replacement, or journal deletion.
+
+`clean-guardian` purges the paired local L1/L2 devnet, then moves `PSY_DEVNET_DIR` to a timestamped backup so the next `make run-all` prepares new public Guardian authorization. Guardian signing keys under `~/.psy/keystore` are outside that directory and remain unchanged. `clean-db` aliases this complete fresh-chain cleanup because retained Guardian L1 authorization cannot follow a purged Anvil chain.
+
+`verify_chain_identity` reuses Guardian L1 identity verification against a canonical pinned live block. `guardian-service-check --live-l1` checks retained L1 authorization after deployment/reuse and before signer startup; `--live` remains the L2/prove-proxy check.
+
+`purgeDockerCleanup` verifies owned Docker containers and volumes are absent. It refreshes container names after stopping because `--rm` containers remove themselves; a failed or incomplete listing never authorizes file deletion.

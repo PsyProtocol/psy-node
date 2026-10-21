@@ -40,9 +40,21 @@ mod guardians_root;
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
-const DEFAULT_SD_KEY_FINGERPRINT: &str = "38755910c4dfb3c9bef528a4af697edced7e2607a6b769d054c4985a7000f0eb";
+const DEFAULT_SD_KEY_FINGERPRINT: &str = "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
 const GUARDIANS_ROOT_MAX_FEE_DEFAULT: u64 = 2_000_000_000;
+
+pub fn check_guardian_genesis(config: &Path, genesis_data: &Path) -> anyhow::Result<()> {
+    let archive = guardian_common::runtime::load_authorization_archive(config, guardian_common::endcap::approved_endcap_max_proof_bytes()?)?;
+    let genesis: PsyGenesisBlockSetupData<F, Hash> = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(genesis_data)?))?;
+    let actual = guardians_root::checkpoint0_genesis_hash(&genesis)?;
+    let expected = &archive.active().0.genesis_hash;
+    ensure!(actual.0 == expected.0,
+        "guardian Genesis identity mismatch (including validators): current=0x{}, authorized=0x{}; finalize Realm P2P membership with make prepare-realm-p2p before generating a new guardians root; do not regenerate Genesis or change the existing authorization in place",
+        hex::encode(actual.0), hex::encode(expected.0));
+    println!("Guardian Genesis identity verified: 0x{}", hex::encode(actual.0));
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 struct ValidatorSlot {

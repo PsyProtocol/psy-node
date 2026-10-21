@@ -319,6 +319,7 @@ pub(crate) mod startup_tests {
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: zh(psy_core::constants::protocol::TODO_DEPOSIT_TREE_HEIGHT as usize),
             withdrawal_tree_root: zh(psy_core::constants::protocol::TODO_WITHDRAWAL_TREE_HEIGHT as usize),
+            validators: vec![],
         }
     }
 
@@ -364,6 +365,7 @@ pub(crate) mod startup_tests {
             let proof_work_queue = Arc::new(FakeWorkerQueue::new());
             let (processor, guta_gatherer_handle, register_gatherer_handle, deploy_gatherer_handle) =
                 create_coordinator_processor::<N, _, _, _, _, _, _, _, _, _>(
+                    psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(),
                     genesis_data,
                     Arc::clone(&file_system),
                     "coord_test_deploy_backups".to_string(),

@@ -1,4 +1,4 @@
-use std::{convert::Infallible, future::Future, io::ErrorKind, path::{Component, Path, PathBuf}, sync::Arc, time::Duration};
+use std::{convert::Infallible, future::Future, io::{BufReader, ErrorKind}, path::{Component, Path, PathBuf}, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -11,11 +11,15 @@ use guardian_common::endcap::approved_endcap_max_proof_bytes;
 use guardian_common::protocol::{parse_canonical_json, sha256, validate_hash, GuardianAccount, GuardianAccountState, GuardianAuthorization, GuardianRuntimeConfig, GuardianSessionRecord, GuardianSignError, GuardianSignErrorResponse, GuardianSignRequest, GuardianSessionsResponse, HaltReason, Hash4, Hex, Hex32, GOLDILOCKS_MODULUS, MAX_BODY_BYTES};
 use guardian_common::runtime::{create_db_file, load_authorization_archive, load_network, load_signing_key, open_db_file, resolve_operator_db_path, AuthorizationArchive};
 use super::verify::{GuardianVerificationContext, GuardianAccountError};
+use anyhow::{ensure, Context};
+use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::QNetworkTreeConstants};
+use psy_core::network_config::PsyNetworkLocalDevnetConstants as N;
 use psy_client_common::data::base_types::hash256::Hash256;
-use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
+use psy_client_data::{config::store_config::PsyHasher, qdata::contract::{ContractCodeDefinition, PsyContractLeaf}, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
+use psy_data::v1::qdata::contract::PQBCDeployContract;
 use psy_crypto::hash::traits::qhashable::QFieldHashable;
 use psy_provider::{provider::RpcProvider, request::{RequestParams, RpcRequest, RpcResponse, ResponseResult, Version, Id, QCheckpointTreeRootRPCRequest}};
-use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
+use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}};
 
 #[derive(Clone, Copy)]
 pub(crate) struct GuardianCommittedHead { pub checkpoint_id: u64, pub checkpoint_tree_root: Hash4 }
@@ -50,7 +54,11 @@ async fn verify_genesis(provider: &RpcProvider, head: GuardianCommittedHead, aut
     let roots = provider.get_checkpoint_global_state_roots(0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
     let path = provider.get_checkpoint_tree_merkle_proof(head.checkpoint_id, 0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
     super::verify::verify_checkpoint(0, &leaf, &roots, &path, head.checkpoint_tree_root)?;
-    if Hash256::from(leaf.qfhash::<PsyHasher>()).0 != authorization.genesis_hash.0 { return Err(GuardianSignError::AccountIdentityConflict); }
+    let actual = Hash256::from(leaf.qfhash::<PsyHasher>()).0;
+    if actual != authorization.genesis_hash.0 {
+        tracing::error!(actual = %hex::encode(actual), authorized = %hex::encode(authorization.genesis_hash.0), "guardian L2 checkpoint-0 identity differs from authorization");
+        return Err(GuardianSignError::AccountIdentityConflict);
+    }
     let root = provider.get_checkpoint_tree_root(0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
     let path = provider.get_checkpoint_tree_merkle_proof(0, 0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
     super::verify::verify_checkpoint(0, &leaf, &roots, &path, root)
@@ -253,6 +261,178 @@ fn authenticate_key_slot(account: &psy_vm::ups::multisig::MultisigAccount, guard
     let expected = account.initial_policy.member_hashes.get(usize::from(guardian_id.checked_sub(1).ok_or(GuardianSignError::AuthorizationMismatch)?))
         .ok_or(GuardianSignError::AuthorizationMismatch)?;
     if member != *expected { return Err(GuardianSignError::AccountIdentityConflict); }
+    Ok(())
+}
+
+pub async fn check(config_path: &Path, genesis_data_path: &Path, live: bool, live_l1: bool) -> anyhow::Result<()> {
+    let proof_bound = approved_endcap_max_proof_bytes().context("guardian EndCap proof bound")?;
+    let loaded = guardian_common::protocol::GuardianConfig::load(config_path).context("guardian config")?;
+    let archive = load_authorization_archive(config_path, proof_bound).context("guardian authorization archive")?;
+    let active = &archive.active().0;
+    validate_authorized_contracts_against_genesis(genesis_data_path, active)?;
+    let provider = load_network(&loaded, active).context("guardian network")?;
+    let account = active.account_json.decode().context("guardian multisig account")?;
+    let mut wallet = psy_prover::wallet::memory_wallet::PsyMemoryWallet::new(Vec::new());
+    enroll_guardian_account(&mut wallet, account.clone(), active.multisig_fingerprint, active.account_public_key)
+        .context("guardian multisig account identity")?;
+    for guardian_id in 1..=3 {
+        let db_path = PathBuf::from(format!("journal/{guardian_id}.redb"));
+        let runtime = loaded.build_runtime_config(config_path, guardian_id, &db_path, &archive.index)
+            .with_context(|| format!("guardian {guardian_id} runtime config"))?;
+        runtime.validate(active, &archive.index)
+            .with_context(|| format!("guardian {guardian_id} runtime authorization"))?;
+        let key = load_signing_key(&runtime)
+            .with_context(|| format!("guardian {guardian_id} signing key"))?;
+        authenticate_key_slot(&account, guardian_id, key.compressed_public_key())
+            .with_context(|| format!("guardian {guardian_id} signing key slot"))?;
+    }
+    if live_l1 {
+        for chain in &active.chains {
+            let endpoint = loaded.client.l1_endpoints.iter().find(|endpoint| endpoint.chain_index == chain.chain_index)
+                .context("guardian authorized L1 endpoint missing")?;
+            super::verify_l1::verify_chain_identity(endpoint, chain).await
+                .with_context(|| format!("guardian authorized L1 chain {} differs from running deployment or is unavailable; retained authorization was not changed", chain.chain_index))?;
+        }
+    }
+    if live {
+        let mut wallet = psy_prover::session::session::WalletSession::new_with_provider(
+            &loaded.network,
+            provider,
+            Some(active.endcap_verifier_fingerprint),
+        ).await.context("guardian L2 wallet initialization")?;
+        enroll_guardian_account(&mut wallet.wallet, account, active.multisig_fingerprint, active.account_public_key)
+            .context("guardian L2 account identity")?;
+        let head = load_guardian_committed_head(&wallet.st_provider, &loaded.network.coordinator_configs[0].rpc_url[0]).await
+            .context("guardian L2 committed checkpoint")?;
+        verify_genesis(&wallet.st_provider, head, active).await.context("guardian L2 Genesis identity")?;
+        for approved in &active.approved_contracts {
+            super::verify::validate_approved_contract(approved, &wallet).await
+                .with_context(|| format!("guardian authorized contract {} failed artifact/circuit validation against this node build", approved.contract_id))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn refresh_approved_contracts(config_path: &Path, genesis_data_path: &Path, artifact_paths: &[PathBuf], output: &Path) -> anyhow::Result<()> {
+    let proof_bound = approved_endcap_max_proof_bytes().context("guardian EndCap proof bound")?;
+    let archive = load_authorization_archive(config_path, proof_bound).context("guardian authorization archive")?;
+    let ids: Vec<_> = archive.active().0.approved_contracts.iter().map(|contract| contract.contract_id).collect();
+    build_approved_contracts(genesis_data_path, artifact_paths, &ids, output)
+}
+
+pub fn prepare_approved_contracts(genesis_data_path: &Path, artifact_paths: &[PathBuf], output: &Path) -> anyhow::Result<()> {
+    build_approved_contracts(genesis_data_path, artifact_paths, &[0, 1, 2, 3, 4], output)
+}
+
+fn build_approved_contracts(genesis_data_path: &Path, artifact_paths: &[PathBuf], ids: &[u32], output: &Path) -> anyhow::Result<()> {
+    use guardian_common::protocol::{ApprovedContract, CompilerArtifact, JsonText};
+    use psy_vm::dpn::contract::dapen_fc_to_cfc_code_definition;
+
+    ensure!(!output.exists(), "refusing to overwrite {}", output.display());
+    let genesis_file = std::fs::File::open(genesis_data_path).with_context(|| format!("opening Genesis data {}", genesis_data_path.display()))?;
+    let genesis: GenesisContractsData = serde_json::from_reader(BufReader::new(genesis_file)).context("parsing Genesis contracts")?;
+    let paths: std::collections::BTreeMap<u32, &PathBuf> = artifact_paths.iter().map(|path| {
+        let id = path.file_stem().and_then(|stem| stem.to_str()).and_then(|name| match name {
+            "token" => Some(0), "multisig_policy" => Some(1), "deposit_tree" => Some(2), "withdrawal_tree" => Some(3), "usdt_token" => Some(4), _ => None,
+        }).context("artifact filename must be token, multisig_policy, deposit_tree, withdrawal_tree, or usdt_token")?;
+        Ok((id, path))
+    }).collect::<anyhow::Result<_>>()?;
+    let mut refreshed = Vec::new();
+    for &id in ids {
+        let contract = genesis.contracts.get(id as usize).with_context(|| format!("Genesis has no contract {id}"))?;
+        let artifact_path = paths.get(&id).with_context(|| format!("missing compiler artifact for approved contract {id}"))?;
+        let bytes = std::fs::read(artifact_path).with_context(|| format!("reading {}", artifact_path.display()))?;
+        let artifact_text = String::from_utf8(bytes).context("compiler artifact is not UTF-8")?;
+        let compiler_artifact = JsonText::<CompilerArtifact>::parse(artifact_text).context("compiler artifact is not canonical")?;
+        let artifact = compiler_artifact.decode().context("decoding compiler artifact")?;
+        let artifact_code = ContractCodeDefinition { state_tree_height: artifact.state_tree_height, functions: artifact.circuit_definitions.iter().map(dapen_fc_to_cfc_code_definition).collect() };
+        ensure!(serde_json::to_value(&artifact_code)? == serde_json::to_value(&contract.code_definition)?, "contract {id} compiler artifact does not match current Genesis");
+        let rooted = contract.clone().into_with_whitelist_root::<PoseidonHasher>(N::CONTRACT_FUNCTION_TREE_HEIGHT).with_context(|| format!("computing function root for contract {id}"))?;
+        let to_hash4 = |hash: QHashOut<GoldilocksField>| { let v = hash.0.elements; Hash4::from_values(v[0].to_canonical_u64(), v[1].to_canonical_u64(), v[2].to_canonical_u64(), v[3].to_canonical_u64()) };
+        let leaf = PsyContractLeaf { deployer: GoldilocksField::from_canonical_u64(rooted.deployer), function_tree_root: to_hash4(rooted.function_whitelist_root), code_root: to_hash4(rooted.code_root), state_tree_height: GoldilocksField::from_canonical_u16(rooted.code_definition.state_tree_height), state_layout_root: Hash4::ZERO, state_layout_field_count: GoldilocksField::ZERO, state_layout_slot_count: GoldilocksField::ZERO };
+        refreshed.push(ApprovedContract { contract_id: id, contract_leaf_json: JsonText::from_value(&leaf)?, compiler_artifact_sha256: sha256(compiler_artifact.as_str().as_bytes()), compiler_artifact_json: compiler_artifact });
+    }
+    let bytes = serde_json::to_vec(&refreshed)?;
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(output).with_context(|| format!("creating {}", output.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct GenesisContractsData {
+    contracts: Vec<PQBCDeployContract<QHashOut<GoldilocksField>>>,
+    #[serde(rename = "users")]
+    _users: serde::de::IgnoredAny,
+    #[serde(rename = "checkpoint_stats")]
+    _checkpoint_stats: serde::de::IgnoredAny,
+    #[serde(rename = "deposit_tree_root")]
+    _deposit_tree_root: serde::de::IgnoredAny,
+    #[serde(rename = "withdrawal_tree_root")]
+    _withdrawal_tree_root: serde::de::IgnoredAny,
+    #[serde(default)]
+    _validators: Option<serde::de::IgnoredAny>,
+}
+
+fn validate_authorized_contracts_against_genesis(
+    genesis_data_path: &Path,
+    authorization: &GuardianAuthorization,
+) -> anyhow::Result<()> {
+    use psy_vm::dpn::contract::dapen_fc_to_cfc_code_definition;
+
+    let file = std::fs::File::open(genesis_data_path)
+        .with_context(|| format!("opening Genesis data {}", genesis_data_path.display()))?;
+    let genesis: GenesisContractsData = serde_json::from_reader(BufReader::new(file))
+        .with_context(|| format!("parsing Genesis contracts from {}", genesis_data_path.display()))?;
+    let to_hash4 = |hash: QHashOut<GoldilocksField>| {
+        let values = hash.0.elements;
+        Hash4::from_values(
+            values[0].to_canonical_u64(),
+            values[1].to_canonical_u64(),
+            values[2].to_canonical_u64(),
+            values[3].to_canonical_u64(),
+        )
+    };
+
+    let mut mismatches = Vec::new();
+    for approved in &authorization.approved_contracts {
+        let Some(genesis_contract) = genesis.contracts.get(approved.contract_id as usize) else {
+            mismatches.push(format!("contract {} is absent", approved.contract_id));
+            continue;
+        };
+        let artifact = approved.compiler_artifact()
+            .map_err(|error| anyhow::anyhow!("guardian authorized contract {} compiler artifact: {error}", approved.contract_id))?;
+        let artifact_code = ContractCodeDefinition {
+            state_tree_height: artifact.state_tree_height,
+            functions: artifact.circuit_definitions.iter().map(dapen_fc_to_cfc_code_definition).collect(),
+        };
+        if serde_json::to_value(&artifact_code)? != serde_json::to_value(&genesis_contract.code_definition)? {
+            mismatches.push(format!("contract {} compiler artifact definitions differ", approved.contract_id));
+        }
+
+        let rooted = genesis_contract.clone()
+            .into_with_whitelist_root::<PoseidonHasher>(N::CONTRACT_FUNCTION_TREE_HEIGHT)
+            .with_context(|| format!("computing Genesis function root for contract {}", approved.contract_id))?;
+        let genesis_leaf = PsyContractLeaf {
+            deployer: GoldilocksField::from_canonical_u64(rooted.deployer),
+            function_tree_root: to_hash4(rooted.function_whitelist_root),
+            code_root: to_hash4(rooted.code_root),
+            state_tree_height: GoldilocksField::from_canonical_u16(rooted.code_definition.state_tree_height),
+            state_layout_root: Hash4::ZERO,
+            state_layout_field_count: GoldilocksField::ZERO,
+            state_layout_slot_count: GoldilocksField::ZERO,
+        };
+        let authorized_leaf = approved.contract_leaf_json.decode()
+            .map_err(|error| anyhow::anyhow!("guardian authorized contract {} leaf: {error}", approved.contract_id))?;
+        if genesis_leaf != authorized_leaf {
+            mismatches.push(format!("contract {} authorized leaf differs", approved.contract_id));
+        }
+    }
+    ensure!(mismatches.is_empty(), "guardian authorization does not match current Genesis: {}", mismatches.join("; "));
     Ok(())
 }
 

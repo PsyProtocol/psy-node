@@ -37,7 +37,7 @@ pub struct StagedProposal {
     path: String,
     transition: RealmTransition,
     proposal_id: [u8; 32],
-    cleanup: Option<Box<dyn FnOnce() + Send>>,
+    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl Drop for StagedProposal {

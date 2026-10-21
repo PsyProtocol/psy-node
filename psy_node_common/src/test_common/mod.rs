@@ -189,6 +189,7 @@ pub async fn setup_test_unified_db(store: Arc<TestInMemoryCoreStore>) -> anyhow:
         tree_table("global_checkpoint_tree_table", TestNetworkConfig::CHECKPOINT_TREE_HEIGHT),
         table("guta_reward_tag_tree_table"),
         tree_table("user_registration_tree_table", TestNetworkConfig::GLOBAL_USER_TREE_HEIGHT),
+        tree_table("validator_tree_table", psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8),
         tree_table("global_contract_tree_table", TestNetworkConfig::GLOBAL_CONTRACT_TREE_HEIGHT),
         table("contract_function_tree_table"),
         table("contract_leaf_table"),

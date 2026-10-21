@@ -123,6 +123,8 @@ indexer is an application even though its Docker backing services are persistent
 
 ## 2. Startup Sequence
 
+`make prepare-realm-p2p` prepares the default two-Realm validator identities and updates only the existing Genesis validator membership, then exits without starting services. Generate a guardians root after this step. Guardian-selected startup checks that P2P inputs are reusable and membership matches, then verifies the full offline checkpoint-0 identity with `psy_dev_cli check-guardian-genesis` before infrastructure startup. Purge retains the `local_checkpoints/realm_p2p` identity directory. Prove-proxy method-resolution RPCs decode definitions without compiling circuits; common-data RPCs serialize temporary circuit construction and retain only fingerprints/verifier metadata keyed by method definition and state-tree height, releasing proving data after each build.
+
 ```mermaid
 sequenceDiagram
     participant Operator
@@ -134,18 +136,21 @@ sequenceDiagram
 
     Operator->>Launcher: 1. Make target or direct CLI
     Launcher->>Launcher: 2. Parse flags, environment, and acquire lock
-    Launcher->>Launcher: 3. Auto-setup repositories, artifacts, and tools
-    Launcher->>Infra: 4. Start DB group and wait for TCP readiness
-    Launcher->>Core: 5. Start processors, edges, and workers in dependency order
-    Launcher->>Infra: 6. Start or connect to L1; deploy or reuse contracts
-    Launcher->>Apps: 7. Start Envio, services, indexers, relayer, faucet, and UIs
-    Launcher->>Control: 8. Open repository-keyed Unix socket
-    Control-->>Operator: 9. Supervisor ready
+    Launcher->>Launcher: 3. Guardian config/archive/key preflight (when selected)
+    Launcher->>Launcher: 4. Purge if explicitly requested; auto-setup repositories and tools
+    Launcher->>Infra: 5. Start DB group and wait for TCP readiness
+    Launcher->>Core: 6. Start prove proxy, processors, and edges
+    Launcher->>Launcher: 7. Live guardian Genesis and contract/circuit check
+    Launcher->>Core: 8. Start workers
+    Launcher->>Infra: 9. Start or connect to L1; deploy or reuse contracts
+    Launcher->>Apps: 10. Start Envio, services, indexers, relayer, faucet, and UIs
+    Launcher->>Control: 11. Open repository-keyed Unix socket
+    Control-->>Operator: 12. Supervisor ready
 ```
 
-Steps 1-3 are implemented by CLI parsing, lock acquisition, and `ensureDevEnvironment()`
-(`dev/locSetupV4.ts:5435-5521`; `dev/locSetupV4.ts:5639-5706`). Steps 4-7 are the foreground
-`setupProcesses()` phases (`dev/locSetupV4.ts:4030-4839`). The control socket opens only after
+Steps 1-4 are implemented by CLI parsing, lock acquisition, guardian preflight, optional purge, and `ensureDevEnvironment()`
+(`dev/locSetupV4.ts:5435-5521`; `dev/locSetupV4.ts:5639-5706`). Steps 5-10 are the foreground
+`setupProcesses()` phases (`dev/locSetupV4.ts:4030-4839`). The live guardian check runs after processor readiness, when its prove-proxy and Coordinator inputs exist, and before workers or L1 contract deployment. The control socket opens only after
 `setupProcesses()` resolves, so startup-time failures cannot be repaired through `make restart`
 (`dev/locSetupV4.ts:5759-5774`).
 
@@ -156,6 +161,9 @@ mode logic in section 4 (`dev/locSetupV4.ts:3950-3969`).
 
 ```text
 resource derivation + logs + release-binary gate
+  |
+  v
+guardian config/archive/signing-key preflight (when bridge proposer/relayer selected)
   |
   v
 DB group: Redis/Valkey + NATS + Scylla + Nostr
@@ -179,10 +187,13 @@ Realm processors in batches of at most four
 Realm edges for that batch (parallel), then two-second spacing
   |
   v
-Coordinator workers (after the complete Realm processor/edge phase)
+Live guardian Genesis and contract/circuit validation (when selected)
   |
   v
-Realm workers (parallel) -> dummy provers (parallel)
+Coordinator workers -> Realm workers (after the complete Realm processor/edge phase)
+  |
+  v
+dummy provers (parallel)
   |
   v
 Anvil or external L1 -> contract deploy/reuse
@@ -215,6 +226,10 @@ genesis preparation and its TCP listen gate completes before the Coordinator pro
 services, faucet, relayer, and UIs then follow in source order (`dev/locSetupV4.ts`).
 
 ## 4. Startup Mode Selection
+
+The retained `--mode-a-web-wallet-bridge` selector prefers `psy-dapp/apps/account/package.json` on current DApp revisions; it falls back to the standalone directory only when that directory still contains a package manifest. Its port remains 5179. The launcher resolves Vite through the selected package's Node resolution path (including hoisted dependencies) and validates the entry before starting infrastructure. A directory containing only old build artifacts is not an application and cannot trigger an install in the parent workspace.
+
+An application's importer in the DApp root `pnpm-lock.yaml` determines workspace ownership before a retained app-local `pnpm-workspace.yaml` is considered. Account therefore uses the root workspace rather than its pre-migration standalone lockfile. Its dependency preparation and Vite-entry check run before service startup; standalone installs retain `--frozen-lockfile`.
 
 ### 4.1 Bare Launcher Defaults
 
@@ -581,12 +596,12 @@ the default. Bare launcher `--teardown` stays non-purge regardless of the Make d
    Anvil ports 8545, 9545, and 10545 are not in that generic kill list.
 3. Purge only: stop Anvil processes whose /proc exe basename, canonical cwd, --state, and --port match this checkout, re-reading starttime before SIGTERM and SIGKILL. A foreign listener on an Anvil port fails the purge and is not killed. Attempt this before Docker cleanup; independent cleanup continues after failure, but file deletion stays blocked.
 4. Docker commands and process listings have a 15-second deadline covering exit and pipe EOF, followed by at most one second for reap after process-group cancellation. Infrastructure containers/volumes are removed directly before Compose removes its own stack. Failed, timed-out, truncated, or unreadable listings never prove absence. Failures remain aggregated.
-5. Path deletion requires successful Anvil, Docker, and known-application gates. Success additionally requires absent purge paths. Failure exits nonzero and does not start the stack.
+5. Path deletion requires successful Anvil, Docker, and known-application gates. Success additionally requires absent purge paths, except retained `local_checkpoints/realm_p2p`. Failure exits nonzero and does not start the stack.
 ```
 
 The application gate checks known command patterns plus loopback TCP ports 1337–1346, 3000, 5433, 8080, 8081, 9898, 9998, and 5174–5179. It is not an exhaustive socket census: Realm ports 13380–14679, proxy ports 9999–10008, guardian ports 15441–15443, and history port 15450 are not individually probed by purge. Their normal launcher processes are covered only where they match the known command patterns. Custom listeners or renamed writers are outside this postcondition; success does not certify that every application port is closed.
 
-Non-purge teardown still preserves `local_checkpoints`, Anvil snapshots, deployment summaries, logs, Envio volumes, and named infrastructure volumes. It does not fall through into purge after a preservation failure. Purge deletes `local_checkpoints`, the complete `db/anvil` directory, logs, localhost, localhostBsc, localhostBase, Sepolia, and Ethereum deployment directories, generated Envio volumes, and named Redis/Scylla/NATS volumes.
+Non-purge teardown preserves `local_checkpoints`, Anvil snapshots, deployment summaries, logs, Envio volumes, and named infrastructure volumes. It does not fall through into purge after a preservation failure. Purge deletes checkpoint state under `local_checkpoints` except retained `realm_p2p` identities, the complete `db/anvil` directory, logs, localhost, localhostBsc, localhostBase, Sepolia, and Ethereum deployment directories, generated Envio volumes, and named Redis/Scylla/NATS volumes.
 
 ## 14. Daemonized Path Differences
 
@@ -1011,6 +1026,13 @@ Commands execute serially and the loop remains available until the server is clo
    not rewrite it (`dev/locSetupV4.ts:1225-1234`; `dev/locSetupV4.ts:4072-4079`).
 
 ## Related Documents
+
+`make run-all` enables `PSY_GUARDIAN_AUTO_PREPARE=1` for missing standard localhost
+Guardian configuration. The foreground launcher prepares authorization only after
+actual L1 deployment and validates it against live L2 before starting signers.
+Retained configurations still receive startup preflight; this is not an automatic
+reset or Genesis-regeneration option. Restrictions and the executable procedure
+are owned by [devnet lifecycle §3.1](devnet_lifecycle.md#31-fresh-localhost-without-existing-guardian-configuration).
 
 - [Circuit and verifier operations](circuit-and-verifier-operations.md)
 - [Devnet lifecycle](devnet_lifecycle.md)

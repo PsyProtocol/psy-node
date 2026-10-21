@@ -9,6 +9,12 @@ include .env
 export
 endif
 
+PSY_DEVNET_DIR ?= $(HOME)/.psy/devnet/local
+PSY_RELAYER_MULTISIG_ACCOUNT ?= $(PSY_DEVNET_DIR)/relayer-multisig-account.json
+PSY_MULTISIG_POLICY_ARTIFACT ?= $(PSY_DEVNET_DIR)/inputs/multisig_policy.json
+PSY_BRIDGE_DAEMON_CONFIG ?= $(PSY_DEVNET_DIR)/daemon.toml
+PSY_GUARDIAN_CONFIG ?= $(if $(strip $(PSY_GUARDIANS_ROOT)),$(PSY_GUARDIANS_ROOT),$(PSY_DEVNET_DIR)/guardians)/config.json
+
 LOG_LEVEL    := psy_node_common=debug,psy_node_cli=info,psy_worker_core=debug,psy_node_core=debug
 VITE_NETWORK  ?= localhost
 VITE_FORK    ?= false
@@ -19,7 +25,7 @@ PSY_SKIP_BUILD ?= 1
 PURGE ?= 1
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test check check-all psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart shutdown clean-db run-dummy-prover config_gen_v2 generate-genesis-data generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward
+.PHONY: all build clean test check check-all psy-data-coverage psy-vm-coverage psy-node-common-coverage psy-prover-coverage psy-prover-coverage-offline psy-prover-coverage-online deploy-contracts register-users query-chain-info run-all rollback-db rollback-stop rollback-resume staging-server restart shutdown clean-db clean-guardian run-dummy-prover config_gen_v2 generate-genesis-data generate-guardians-root check-guardians-root-inputs prepare-realm-p2p build-guardian-tools prepare-guardian-account prepare-multisig-policy-artifact prepare-guardian-inputs prepare-guardian-config check-guardian-genesis check-guardians check-guardians-live generate-groth16 regen-groth16-keystore regen-bridge-agg-keystore export-solidity-verifier export-solidity-verifier-deposit export-solidity-verifier-withdrawal export-solidity-verifier-reward
 
 all: build
 
@@ -96,7 +102,7 @@ LOCSETUP_START_ARGS = --proving-backend ${PROVING_BACKEND} --db --coordinator --
 run-all:
 	@if [ "$(VITE_NETWORK)" = "ethereum" ] && [ -z "$$ETH_RPC_URL" ]; then echo "ETH_RPC_URL is required when VITE_NETWORK=ethereum" >&2; exit 1; fi
 	@if [ "$(VITE_NETWORK)" = "sepolia" ] && [ -z "$(SEPOLIA_RPC_URL)" ]; then echo "SEPOLIA_RPC_URL is required when VITE_NETWORK=sepolia. Use a private RPC endpoint." >&2; exit 1; fi
-	VITE_NETWORK=$(VITE_NETWORK) VITE_FORK=$(VITE_FORK) SEPOLIA_RPC_URL=$(SEPOLIA_RPC_URL) ETH_RPC_URL=$(ETH_RPC_URL) REDEPLOY_L1=$(REDEPLOY_L1) PSY_SKIP_BRANCH_CHECK=$(PSY_SKIP_BRANCH_CHECK) PSY_SKIP_KEYSTORE=$(PSY_SKIP_KEYSTORE) PSY_SKIP_BUILD=$(PSY_SKIP_BUILD) bun run dev/locSetupV4.ts $(LOCSETUP_START_ARGS)
+	PSY_DEVNET_DIR="$(PSY_DEVNET_DIR)" PSY_BRIDGE_DAEMON_CONFIG="$(PSY_BRIDGE_DAEMON_CONFIG)" PSY_GUARDIAN_AUTO_PREPARE=1 VITE_NETWORK=$(VITE_NETWORK) VITE_FORK=$(VITE_FORK) SEPOLIA_RPC_URL=$(SEPOLIA_RPC_URL) ETH_RPC_URL=$(ETH_RPC_URL) REDEPLOY_L1=$(REDEPLOY_L1) PSY_SKIP_BRANCH_CHECK=$(PSY_SKIP_BRANCH_CHECK) PSY_SKIP_KEYSTORE=$(PSY_SKIP_KEYSTORE) PSY_SKIP_BUILD=$(PSY_SKIP_BUILD) bun run dev/locSetupV4.ts $(LOCSETUP_START_ARGS)
 
 restart:
 	bun run dev/locSetupV4.ts --control restart
@@ -132,16 +138,79 @@ shutdown:
 	bun run dev/locSetupV4.ts --teardown $(if $(filter 1,$(PURGE)),--purge)
 
 clean-db:
+	$(MAKE) clean-guardian
+
+clean-guardian:
+	@test -z "$(strip $(PSY_GUARDIANS_ROOT) $(PSY_GUARDIAN_CHAINS) $(PSY_GUARDIAN_L1_ENDPOINTS) $(PSY_GUARDIAN_APPROVED_CONTRACTS))" || { echo "Refusing explicit Guardian path overrides; unset them or clean that operator configuration explicitly" >&2; exit 1; }
+	@test "$(abspath $(PSY_GUARDIAN_CONFIG))" = "$(abspath $(PSY_DEVNET_DIR)/guardians/config.json)" || { echo "PSY_GUARDIAN_CONFIG is outside PSY_DEVNET_DIR; unset the stale override" >&2; exit 1; }
+	@test "$(abspath $(PSY_BRIDGE_DAEMON_CONFIG))" = "$(abspath $(PSY_DEVNET_DIR)/daemon.toml)" || { echo "PSY_BRIDGE_DAEMON_CONFIG is outside PSY_DEVNET_DIR; unset the stale override" >&2; exit 1; }
 	$(MAKE) shutdown PURGE=1
+	@root="$(abspath $(PSY_DEVNET_DIR))"; \
+	case "$$root" in /|"$(abspath $(HOME))"|"$(abspath $(CURDIR))") echo "Refusing unsafe PSY_DEVNET_DIR: $$root" >&2; exit 1;; esac; \
+	if [ ! -e "$$root" ]; then echo "Guardian state already absent: $$root"; exit 0; fi; \
+	backup="$$root.before-guardian-regeneration-$$(date +%Y%m%d-%H%M%S)"; \
+	test ! -e "$$backup" || { echo "Guardian backup already exists: $$backup" >&2; exit 1; }; \
+	mv -- "$$root" "$$backup"; \
+	echo "Guardian public state moved to $$backup"; \
+	echo "Guardian signing keys under $(HOME)/.psy/keystore were preserved"
 config_gen_v2:
 	cargo run --release --package psy_plonky2_circuits --example config_gen_v2
 
 # Public-only registration 2 (user_id 524288), independent of L1 signer custody.
 # Supply PSY_RELAYER_MULTISIG_ACCOUNT and PSY_MULTISIG_POLICY_ARTIFACT public JSON paths.
+# With PSY_GUARDIANS_ROOT, read existing genesis.json and generate Guardian configuration.
+GUARDIANS_ROOT_ARGS = $(if $(strip $(PSY_GUARDIANS_ROOT)),--guardians-root "$(PSY_GUARDIANS_ROOT)" --chains "$(PSY_GUARDIAN_CHAINS)" --l1-endpoints "$(PSY_GUARDIAN_L1_ENDPOINTS)" --approved-contracts "$(PSY_GUARDIAN_APPROVED_CONTRACTS)")
+ifneq ($(strip $(PSY_GUARDIANS_ROOT) $(PSY_GUARDIAN_CHAINS) $(PSY_GUARDIAN_L1_ENDPOINTS) $(PSY_GUARDIAN_APPROVED_CONTRACTS)),)
+generate-genesis-data: check-guardians-root-inputs
+endif
 generate-genesis-data:
 	@test -n "$(PSY_RELAYER_MULTISIG_ACCOUNT)" || { echo "PSY_RELAYER_MULTISIG_ACCOUNT is required" >&2; exit 1; }
 	@test -n "$(PSY_MULTISIG_POLICY_ARTIFACT)" || { echo "PSY_MULTISIG_POLICY_ARTIFACT is required" >&2; exit 1; }
-	@env -u PRIVATE_KEY -u BRIDGE_RELAYER_L2_PRIVATE_KEY -u KEYSTORE_PATH -u PSY_BRIDGE_RELAYER_KEYSTORE_PATH -u BRIDGE_RELAYER_KEYSTORE_PATH -u WALLET_PASSWORD ${BIN_PREFIX}psy_dev_cli generate-genesis-data --repo-root "$(CURDIR)" --relayer-multisig-account "$(PSY_RELAYER_MULTISIG_ACCOUNT)" --multisig-policy-artifact "$(PSY_MULTISIG_POLICY_ARTIFACT)"
+	@env -u PRIVATE_KEY -u BRIDGE_RELAYER_L2_PRIVATE_KEY -u KEYSTORE_PATH -u PSY_BRIDGE_RELAYER_KEYSTORE_PATH -u BRIDGE_RELAYER_KEYSTORE_PATH -u WALLET_PASSWORD ${BIN_PREFIX}psy_dev_cli generate-genesis-data --repo-root "$(CURDIR)" --relayer-multisig-account "$(PSY_RELAYER_MULTISIG_ACCOUNT)" --multisig-policy-artifact "$(PSY_MULTISIG_POLICY_ARTIFACT)" $(GUARDIANS_ROOT_ARGS)
+
+check-guardians-root-inputs:
+	@test -n "$(strip $(PSY_GUARDIANS_ROOT))" || { echo "PSY_GUARDIANS_ROOT is required" >&2; exit 1; }
+	@test -n "$(strip $(PSY_GUARDIAN_CHAINS))" || { echo "PSY_GUARDIAN_CHAINS is required" >&2; exit 1; }
+	@test -n "$(strip $(PSY_GUARDIAN_L1_ENDPOINTS))" || { echo "PSY_GUARDIAN_L1_ENDPOINTS is required" >&2; exit 1; }
+	@test -n "$(strip $(PSY_GUARDIAN_APPROVED_CONTRACTS))" || { echo "PSY_GUARDIAN_APPROVED_CONTRACTS is required" >&2; exit 1; }
+	@test -r "$(PSY_GUARDIAN_CHAINS)" || { echo "Missing reviewed chains input: $(PSY_GUARDIAN_CHAINS)" >&2; exit 1; }
+	@test -r "$(PSY_GUARDIAN_L1_ENDPOINTS)" || { echo "Missing reviewed L1 endpoints input: $(PSY_GUARDIAN_L1_ENDPOINTS)" >&2; exit 1; }
+	@test -r "$(PSY_GUARDIAN_APPROVED_CONTRACTS)" || { echo "Missing approved contracts input: $(PSY_GUARDIAN_APPROVED_CONTRACTS)" >&2; exit 1; }
+	@test ! -e "$(PSY_GUARDIANS_ROOT)" || { echo "Guardian root already exists; preserve it and select a new PSY_DEVNET_DIR or PSY_GUARDIANS_ROOT" >&2; exit 1; }
+
+prepare-realm-p2p:
+	bun run dev/locSetupV4.ts --prepare-realm-p2p --realms-count 2
+
+build-guardian-tools:
+	cargo build --release --bin psy_relayer_cli --bin psy_dev_cli
+
+prepare-guardian-account: build-guardian-tools
+	@${BIN_PREFIX}psy_relayer_cli guardian-prepare-account --output "$(PSY_RELAYER_MULTISIG_ACCOUNT)"
+
+prepare-multisig-policy-artifact:
+	@bun run dev/guardianInputs.ts --output "$(PSY_DEVNET_DIR)/inputs" --policy-only $(if $(strip $(PSY_COMPILER_ARTIFACTS_DIR)),--compiler-artifacts "$(PSY_COMPILER_ARTIFACTS_DIR)")
+
+prepare-guardian-inputs: build-guardian-tools
+	@bun run dev/guardianInputs.ts --output "$(PSY_DEVNET_DIR)/inputs" $(if $(strip $(PSY_COMPILER_ARTIFACTS_DIR)),--compiler-artifacts "$(PSY_COMPILER_ARTIFACTS_DIR)")
+
+prepare-guardian-config:
+	@bun run dev/guardianConfig.ts "$(PSY_GUARDIAN_CONFIG)" "$(PSY_BRIDGE_DAEMON_CONFIG)"
+
+generate-guardians-root:
+	@$(MAKE) generate-genesis-data \
+		PSY_GUARDIANS_ROOT="$(or $(PSY_GUARDIANS_ROOT),$(PSY_DEVNET_DIR)/guardians)" \
+		PSY_GUARDIAN_CHAINS="$(or $(PSY_GUARDIAN_CHAINS),$(PSY_DEVNET_DIR)/inputs/chains.json)" \
+		PSY_GUARDIAN_L1_ENDPOINTS="$(or $(PSY_GUARDIAN_L1_ENDPOINTS),$(PSY_DEVNET_DIR)/inputs/l1-endpoints.json)" \
+		PSY_GUARDIAN_APPROVED_CONTRACTS="$(or $(PSY_GUARDIAN_APPROVED_CONTRACTS),$(PSY_DEVNET_DIR)/inputs/approved-contracts.json)"
+
+check-guardian-genesis:
+	@${BIN_PREFIX}psy_dev_cli check-guardian-genesis --config "$(PSY_GUARDIAN_CONFIG)" --genesis-data "$(CURDIR)/genesis.json"
+
+check-guardians: check-guardian-genesis
+	@${BIN_PREFIX}psy_relayer_cli guardian-service-check --config "$(PSY_GUARDIAN_CONFIG)" --genesis-data "$(CURDIR)/genesis.json"
+
+check-guardians-live: check-guardian-genesis
+	@${BIN_PREFIX}psy_relayer_cli guardian-service-check --config "$(PSY_GUARDIAN_CONFIG)" --genesis-data "$(CURDIR)/genesis.json" --live
 
 # Regenerates client_prover/psy_prover/src/wallet/local_circuits.json (embedded
 # zk-sign + privacy base circuits). Needed whenever the circuit-defining

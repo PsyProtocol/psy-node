@@ -48,6 +48,7 @@ use psy_client_data::qdata::checkpoint::{PsyCheckpointGlobalStateRoots, PsyCheck
 use psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureCircuit;
 use psy_crypto::{common::user_id::get_registration_id_from_user_id, hash::traits::qhashable::QFieldHashable};
 use psy_plonky2_circuits::{
+    circuit_library::get_plonky2_circuit_library_and_prover_for_network_with_rotation,
     bridge::{
         circuits::{
             bridge_agg_final::BridgeAggFinalCircuit,
@@ -106,6 +107,9 @@ pub struct RegenerateGroth16KeystoreArgs {
     /// Keystore root directory. Defaults to ~/.psy/keystore.
     #[arg(long)]
     pub keystore_dir: Option<PathBuf>,
+    /// Offline bridge-agg validator sub IDs when no injected network config is available.
+    #[arg(long, value_delimiter = ',')]
+    pub validator_sub_ids: Option<Vec<u16>>,
     /// Do not regenerate deposit_append.
     #[arg(long, default_value_t = false)]
     pub skip_deposit_append: bool,
@@ -132,7 +136,7 @@ pub fn run(args: RegenerateGroth16KeystoreArgs) -> anyhow::Result<()> {
         regenerate_withdrawal_claim(&keystore_dir)?;
     }
     if !args.skip_bridge_agg {
-        regenerate_bridge_agg(&keystore_dir)?;
+        regenerate_bridge_agg(&keystore_dir, args.validator_sub_ids)?;
     }
     if !args.skip_reward_claim {
         regenerate_reward_claim(&keystore_dir)?;
@@ -142,11 +146,22 @@ pub fn run(args: RegenerateGroth16KeystoreArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
-    clear_groth16_files(keystore_dir)?;
-
+fn regenerate_bridge_agg(keystore_dir: &Path, validator_sub_ids: Option<Vec<u16>>) -> anyhow::Result<()> {
     println!("building bridge agg final circuit...");
-    let coordinator_circuits = cached_bridge_coordinator_circuits()?;
+    let offline_circuits;
+    let coordinator_circuits = if let Some(ids) = validator_sub_ids {
+        anyhow::ensure!((psy_data::p2p::MIN_VALIDATORS_PER_REALM..=psy_data::p2p::MAX_VALIDATORS_PER_REALM).contains(&ids.len())
+            && ids.iter().copied().eq(1..=ids.len() as u16), "validator sub IDs must be the active contiguous 1..N set");
+        offline_circuits = get_plonky2_circuit_library_and_prover_for_network_with_rotation::<C, D>(
+            psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet,
+            psy_config::CHECKPOINTS_PER_EPOCH,
+            ids,
+        )?.1;
+        &offline_circuits
+    } else {
+        cached_bridge_coordinator_circuits()?
+    };
+    clear_groth16_files(keystore_dir)?;
     let worker_rewards_tree_tag = get_default_worker_rewards_tree_tag::<QHashOut<F>>();
     let checkpoint_common_data = coordinator_circuits
         .checkpoint_root_transition

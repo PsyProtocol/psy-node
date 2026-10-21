@@ -2440,7 +2440,8 @@ pub(crate) mod tests {
                 Arc::clone(&user_update_queue),
                 Arc::clone(&work_queue),
                 test_realm_identifier(),
-                TEST_CHAIN_ID,
+                crate::worker_whitelist::WhiteListCache::new("psy-genesis/config.json", psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet)?,
+                u64::from(TEST_CHAIN_ID),
                 TEST_NODE_ID,
                 proof_verifier,
             );
@@ -2448,7 +2449,7 @@ pub(crate) mod tests {
             // counters so handler reads behave like production (ids at 0).
             let rid = test_realm_identifier();
             temp_db.set_unique_pending_ids(&rid, 0, 0).await?;
-            temp_db.set_gathering_unique_pending_ids(&rid, 0, 0).await?;
+            temp_db.set_gathering_generation(&rid, psy_node_core::psy_temp_db::GatheringGeneration { unique_pending_id: 0, proc_checkpoint_unique_id: 0, checkpoint_id: 0 }).await?;
             Ok(Self { handler, db, temp_db, user_update_queue, work_queue })
         }
     }
@@ -2711,6 +2712,7 @@ pub(crate) mod tests {
                 contract_id: 1,
                 slot_updates: vec![RealmSlotUpdate { slot: 5, old_value: 0, new_value: 7 }],
             }],
+            accepted_user_leaf_hash: None,
         };
         env.temp_db
             .set_user_end_cap_slot_updates(
@@ -2745,7 +2747,7 @@ pub(crate) mod tests {
         let mut mismatch = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         mismatch.core.new_user_leaf.last_checkpoint_id = PF::from_u64_value(1);
         let err = handler
-            .handle_user_end_cap_proof_submission(mismatch, vec![])
+            .handle_user_end_cap_proof_submission(mismatch, vec![], None)
             .await
             .expect_err("checkpoint mismatch must fail");
         assert!(
@@ -2756,7 +2758,7 @@ pub(crate) mod tests {
         // user from another realm
         let foreign = gen_end_cap_input(OTHER_REALM_USER_ID, checkpoint_root);
         let err = handler
-            .handle_user_end_cap_proof_submission(foreign, vec![])
+            .handle_user_end_cap_proof_submission(foreign, vec![], None)
             .await
             .expect_err("user outside the realm must fail");
         assert!(err.to_string().contains("does not belong to this realm"), "unexpected error: {err}");
@@ -2765,7 +2767,7 @@ pub(crate) mod tests {
         let mut empty = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         empty.contract_state_updates = vec![];
         let err = handler
-            .handle_user_end_cap_proof_submission(empty, vec![])
+            .handle_user_end_cap_proof_submission(empty, vec![], None)
             .await
             .expect_err("empty updates must fail");
         assert!(err.to_string().contains("contract_state_updates cannot be empty"), "unexpected error: {err}");
@@ -2775,7 +2777,7 @@ pub(crate) mod tests {
         future.core.checkpoint_id = PF::from_u64_value(1);
         future.core.new_user_leaf.last_checkpoint_id = PF::from_u64_value(1);
         let err = handler
-            .handle_user_end_cap_proof_submission(future, vec![])
+            .handle_user_end_cap_proof_submission(future, vec![], None)
             .await
             .expect_err("future checkpoint must fail");
         assert!(err.to_string().contains("but current checkpoint is"), "unexpected error: {err}");
@@ -2784,7 +2786,7 @@ pub(crate) mod tests {
         let mut bad_start = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         bad_start.core.state_transition.start_user_leaf_hash = PHash::from_values(4242, 0, 0, 0);
         let err = handler
-            .handle_user_end_cap_proof_submission(bad_start, vec![])
+            .handle_user_end_cap_proof_submission(bad_start, vec![], None)
             .await
             .expect_err("wrong start hash must fail");
         assert!(err.to_string().contains("Invalid start_user_leaf_hash"), "unexpected error: {err}");
@@ -2797,7 +2799,7 @@ pub(crate) mod tests {
             .into_owned_32bytes()
             .to_vec();
         let err = handler
-            .handle_user_end_cap_proof_submission(bad_root, proof_bytes)
+            .handle_user_end_cap_proof_submission(bad_root, proof_bytes, None)
             .await
             .expect_err("wrong checkpoint tree root must fail");
         assert!(
@@ -2808,7 +2810,7 @@ pub(crate) mod tests {
         // proof bytes that decode to a different public-inputs hash
         let (input, _) = valid_end_cap_submission(&env).await?;
         let err = handler
-            .handle_user_end_cap_proof_submission(input, PHash::get_zero_value().into_owned_32bytes().to_vec())
+            .handle_user_end_cap_proof_submission(input, PHash::get_zero_value().into_owned_32bytes().to_vec(), None)
             .await
             .expect_err("mismatched public inputs hash must fail");
         assert!(err.to_string().contains("Public inputs hash mismatch"), "unexpected error: {err}");
@@ -2822,7 +2824,7 @@ pub(crate) mod tests {
             .into_owned_32bytes()
             .to_vec();
         let err = handler
-            .handle_user_end_cap_proof_submission(bad_leaf, proof_bytes)
+            .handle_user_end_cap_proof_submission(bad_leaf, proof_bytes, None)
             .await
             .expect_err("inconsistent new user leaf must fail");
         assert!(err.to_string().contains("invalid new_user_leaf"), "unexpected error: {err}");
@@ -2844,7 +2846,7 @@ pub(crate) mod tests {
             .await?;
         let stale = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
         let err = handler
-            .handle_user_end_cap_proof_submission(stale, vec![])
+            .handle_user_end_cap_proof_submission(stale, vec![], None)
             .await
             .expect_err("stale user checkpoint must fail");
         assert!(err.to_string().contains("but user's last checkpoint is 5"), "unexpected error: {err}");
@@ -2859,7 +2861,7 @@ pub(crate) mod tests {
         let (input, proof_bytes) = valid_end_cap_submission(&env).await?;
         let new_user_leaf = input.core.new_user_leaf.clone();
 
-        handler.handle_user_end_cap_proof_submission(input, proof_bytes.clone()).await?;
+        handler.handle_user_end_cap_proof_submission(input, proof_bytes.clone(), None).await?;
 
         // the end-cap queue item was published under the live proc id
         assert_eq!(env.user_update_queue.published_count(), 1);
@@ -2899,7 +2901,7 @@ pub(crate) mod tests {
         // a second submission for the same user is rejected by the status guard
         let (second, second_proof) = valid_end_cap_submission(&env).await?;
         let err = handler
-            .handle_user_end_cap_proof_submission(second, second_proof)
+            .handle_user_end_cap_proof_submission(second, second_proof, None)
             .await
             .expect_err("double submission must fail");
         assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");

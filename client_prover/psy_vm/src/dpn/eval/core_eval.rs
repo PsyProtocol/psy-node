@@ -60,6 +60,45 @@ impl EvalHelpers for SymFeltStore {
 }
 impl ContextEval for SymFeltStore {
     fn resolve_felt_ref_cached<I: ContextInput, C: EvalCache>(&self, felt_ref: SymFeltRef, input: &I, cache: &mut C) -> u64 {
+        if felt_ref.is_constant_type() { return felt_ref.get_constant_value(); }
+        if cache.contains(felt_ref) { return cache.get(felt_ref); }
+        self.ensure_eval_cache(felt_ref, false, input, cache);
+        cache.get(felt_ref)
+    }
+
+    fn resolve_array_ref_cached<I: ContextInput, C: EvalCache>(&self, felt_ref: SymFeltRef, input: &I, cache: &mut C) -> Box<Vec<u64>> {
+        if cache.contains_arr(felt_ref) { return cache.get_arr_ref(felt_ref); }
+        self.ensure_eval_cache(felt_ref, true, input, cache);
+        cache.get_arr_ref(felt_ref)
+    }
+}
+
+impl SymFeltStore {
+    fn ensure_eval_cache<I: ContextInput, C: EvalCache>(&self, felt_ref: SymFeltRef, array: bool, input: &I, cache: &mut C) {
+        let mut pending = vec![(felt_ref, array, false)];
+        while let Some((value, array, ready)) = pending.pop() {
+            if if array { cache.contains_arr(value) } else { value.is_constant_type() || cache.contains(value) } {
+                continue;
+            }
+            if ready {
+                // All dependencies are cached, so operand resolution cannot recurse down the graph.
+                if array { self.resolve_array_ref_ready(value, input, cache); }
+                else { self.resolve_felt_ref_ready(value, input, cache); }
+                continue;
+            }
+            pending.push((value, array, true));
+            if !array && value.get_op_type() == DPNOpType::TargetAt {
+                let children = &self.get(value).inputs;
+                // TargetAt resolves its index before its array.
+                pending.push((children[0], true, false));
+                pending.push((children[1], false, false));
+            } else {
+                pending.extend(self.get_direct_children(value).into_iter().rev().map(|child| (child, false, false)));
+            }
+        }
+    }
+
+    fn resolve_felt_ref_ready<I: ContextInput, C: EvalCache>(&self, felt_ref: SymFeltRef, input: &I, cache: &mut C) -> u64 {
         if felt_ref.is_constant_type() {
             felt_ref.get_constant_value()
         } else if cache.contains(felt_ref) {
@@ -336,7 +375,7 @@ impl ContextEval for SymFeltStore {
         }
     }
 
-    fn resolve_array_ref_cached<I: ContextInput, C: EvalCache>(&self, felt_ref: SymFeltRef, input: &I, cache: &mut C) -> Box<Vec<u64>> {
+    fn resolve_array_ref_ready<I: ContextInput, C: EvalCache>(&self, felt_ref: SymFeltRef, input: &I, cache: &mut C) -> Box<Vec<u64>> {
         if cache.contains_arr(felt_ref) {
             cache.get_arr_ref(felt_ref)
         } else {

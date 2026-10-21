@@ -6,4 +6,5 @@ pub mod state_cmd;
 pub mod state_phase;
 pub mod sym_felt;
 pub mod sym_felt_store;
+pub mod uint;
 pub mod utils;
