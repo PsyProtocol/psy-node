@@ -8,9 +8,19 @@ use crate::subcommand::{Cli, Commands};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
-    setup_logging()?;
 
     let cli = Cli::parse();
+    if matches!(cli.command, Commands::FreshDevnetState(_)) {
+        // This command's stdout is a JSON handshake. Its logs go to stderr, and
+        // the shared logger is skipped because it claims the process subscriber.
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+            .init();
+    } else {
+        setup_logging()?;
+    }
     match cli.command {
         Commands::InspectAnvilState(args) => {
             subcommand::inspect_anvil_state::run(args)?;
@@ -41,6 +51,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::GenerateGenesisData(args) => {
             subcommand::generate_genesis::run(args).await?;
+        }
+        Commands::FreshDevnetState(args) => {
+            subcommand::fresh_devnet_state::run(args.repo_root, args.guardians_root).await?;
         }
     }
     Ok(())

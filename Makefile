@@ -90,7 +90,7 @@ query-chain-info:
 staging-server:
 	VITE_NETWORK=sepolia VITE_FORK=false bun run dev/locSetupV4.ts --psy-privacy-bridge --ide --explorer
 
-LOCSETUP_START_ARGS = --proving-backend ${PROVING_BACKEND} --db --coordinator --realms-count 2 --coordinator-workers 2 --realm-workers 1 --prove-proxy 1 --faucet-server --l1 --relayer --psy-privacy-bridge --ide --explorer --mode-a-web-wallet-bridge --env RUST_LOG=${LOG_LEVEL}
+LOCSETUP_START_ARGS = --all --proving-backend ${PROVING_BACKEND} --db --coordinator --realms-count 2 --coordinator-workers 2 --realm-workers 1 --prove-proxy 1 --faucet-server --l1 --relayer --psy-privacy-bridge --ide --explorer --mode-a-web-wallet-bridge --env RUST_LOG=${LOG_LEVEL}
 
 
 run-all:
@@ -137,11 +137,9 @@ config_gen_v2:
 	cargo run --release --package psy_plonky2_circuits --example config_gen_v2
 
 # Public-only registration 2 (user_id 524288), independent of L1 signer custody.
-# Supply PSY_RELAYER_MULTISIG_ACCOUNT and PSY_MULTISIG_POLICY_ARTIFACT public JSON paths.
+# Public signing policy comes only from the selected psy-genesis/config.json network.
 generate-genesis-data:
-	@test -n "$(PSY_RELAYER_MULTISIG_ACCOUNT)" || { echo "PSY_RELAYER_MULTISIG_ACCOUNT is required" >&2; exit 1; }
-	@test -n "$(PSY_MULTISIG_POLICY_ARTIFACT)" || { echo "PSY_MULTISIG_POLICY_ARTIFACT is required" >&2; exit 1; }
-	@env -u PRIVATE_KEY -u BRIDGE_RELAYER_L2_PRIVATE_KEY -u KEYSTORE_PATH -u PSY_BRIDGE_RELAYER_KEYSTORE_PATH -u BRIDGE_RELAYER_KEYSTORE_PATH -u WALLET_PASSWORD ${BIN_PREFIX}psy_dev_cli generate-genesis-data --repo-root "$(CURDIR)" --relayer-multisig-account "$(PSY_RELAYER_MULTISIG_ACCOUNT)" --multisig-policy-artifact "$(PSY_MULTISIG_POLICY_ARTIFACT)"
+	@env -u PRIVATE_KEY -u BRIDGE_RELAYER_L2_PRIVATE_KEY -u KEYSTORE_PATH -u PSY_BRIDGE_RELAYER_KEYSTORE_PATH -u BRIDGE_RELAYER_KEYSTORE_PATH -u WALLET_PASSWORD ${BIN_PREFIX}psy_dev_cli generate-genesis-data --repo-root "$(CURDIR)"
 
 # Regenerates client_prover/psy_prover/src/wallet/local_circuits.json (embedded
 # zk-sign + privacy base circuits). Needed whenever the circuit-defining

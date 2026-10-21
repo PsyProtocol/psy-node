@@ -94,7 +94,7 @@ assert equal to get_session_proof_tree_root()
 
 The leaf formula is `hash_two_to_one` of the burned fingerprint and the contract-side `public_inputs_hash` (`<workspace>/psy-compiler/psy-precompiles/token/src/main.psy:358-365,625-631`). The walk is `for i in 0u32..16u32` (`<workspace>/psy-compiler/psy-precompiles/token/src/main.psy:366-376,633-643`). `UPS_SESSION_PROOF_TREE_HEIGHT` is 16 (`client_prover/psy_core/psy_config/src/network_constants.rs:39`).
 
-`PrivateNoteInclusionCircuit::get_fingerprint` returns the minifier fingerprint (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/private_note_inclusion.rs:367-373`). `DepositInclusionCircuit::get_fingerprint` does the same (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs:315-316`). UPS imports the alias: `privacy::{..., shield_deposit_claim::ShieldDepositClaimCircuit}` (`client_prover/psy_circuit/psy_ups_circuit/src/circuit_manager/core.rs:44-46,196-198`). The wallet proves a base/inner circuit; the UPS manager minifies it. The contract constant is the **minifier** fingerprint, which is what the session proof-tree leaf uses.
+`PrivateNoteInclusionCircuit::get_fingerprint` returns the minifier fingerprint (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/private_note_inclusion.rs:371-372`). `DepositInclusionCircuit::get_fingerprint` does the same (`client_prover/psy_circuit/psy_dpn_circuit/src/circuits/privacy/deposit_inclusion.rs:315-316`). UPS imports the alias: `privacy::{..., shield_deposit_claim::ShieldDepositClaimCircuit}` (`client_prover/psy_circuit/psy_ups_circuit/src/circuit_manager/core.rs:44-46,196-198`). The wallet proves a base/inner circuit; the UPS manager minifies it. The contract constant is the **minifier** fingerprint, which is what the session proof-tree leaf uses.
 
 These circuits are not coordinator library types. Regenerating `cached_circuit_library.rs` does not change either constant.
 
@@ -223,7 +223,7 @@ From `<workspace>/psy-compiler`, after the compiler Cargo pins use pushed `R_nod
 make gen-deploy-json
 ```
 
-That target compiles both token variants, copies `token.json` and `token.update.json` into `psy-genesis`, regenerates `genesis_contracts.json` and `genesis_abi/`, and writes compiler provenance (`<workspace>/psy-compiler/Makefile:213-255`). Require the generated `token.json` / `token.update.json` / `usdt_token.json` bytecode to contain the new limbs.
+The workspace recipe is `<workspace>/psy-compiler/Makefile:270-309`. It compiles the precompiles, copies `token.json` and `token.update.json` into `psy-genesis`, regenerates `genesis_contracts.json` and `genesis_abi/`, writes the compiler provenance stamp at `:308`, and does not write the node's root `genesis.json`. Require the generated token bytecode to contain the new limbs.
 
 Then:
 

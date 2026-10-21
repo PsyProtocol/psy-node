@@ -10,6 +10,7 @@ pub mod chain_info;
 pub mod generate_genesis;
 pub mod rollback;
 pub mod inspect_anvil_state;
+pub mod fresh_devnet_state;
 
 use chain_info::ChainInfoArgs;
 use generate_genesis::GenerateGenesisDataArgs;
@@ -47,6 +48,18 @@ pub enum Commands {
     ChainInfo(ChainInfoArgs),
     #[command(name = "rollback", about = "Generate or execute an offline role-local rollback plan")]
     Rollback(RollbackArgs),
-    #[command(name = "generate-genesis-data", about = "Write local-devnet genesis.json, private_keys.json, and faucetOperators.json, or write guardian configuration from the existing genesis with --guardians-root")]
+    #[command(name = "generate-genesis-data", about = "Write local-devnet genesis.json, private_keys.json, and faucetOperators.json, or write guardian authorization and runtime directories from the existing genesis with --guardians-root")]
     GenerateGenesisData(GenerateGenesisDataArgs),
+    #[command(name = "fresh-devnet-state", about = "Reset owned devnet state and publish guardian authorization to the selected network configuration")]
+    FreshDevnetState(FreshDevnetStateArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct FreshDevnetStateArgs {
+    /// Repository root the fresh devnet is reset inside.
+    #[arg(long)]
+    pub repo_root: std::path::PathBuf,
+    /// Checkout-owned guardian runtime root whose databases are seeded.
+    #[arg(long)]
+    pub guardians_root: std::path::PathBuf,
 }

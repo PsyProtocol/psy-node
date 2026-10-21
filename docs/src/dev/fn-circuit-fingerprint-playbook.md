@@ -85,10 +85,10 @@ connect_hashes_switch(is_first, storage_start_root, default_root, contract_leaf)
 
 | Constraint site | Current source |
 |---|---|
-| Function-circuit contract start root | `client_prover/psy_circuit/psy_dpn_circuit/src/vm/compile.rs:60-83` |
-| UPS current-contract slot reader | `client_prover/psy_circuit/psy_ups_circuit/src/signature/state_reader.rs:98-125` |
-| UPS external-contract slot reader | `client_prover/psy_circuit/psy_ups_circuit/src/signature/state_reader.rs:224-256` |
-| UPS other-user contract slot reader | `client_prover/psy_circuit/psy_ups_circuit/src/signature/state_reader.rs:366-421` |
+| Function-circuit contract start root | `client_prover/psy_circuit/psy_dpn_circuit/src/vm/compile.rs:74-81` |
+| UPS current-contract slot reader | `client_prover/psy_circuit/psy_ups_circuit/src/signature/state_reader.rs:106-123` |
+| UPS external-contract slot reader | `client_prover/psy_circuit/psy_ups_circuit/src/signature/state_reader.rs:192-210` |
+| UPS other-user contract slot reader | `client_prover/psy_circuit/psy_ups_circuit/src/signature/state_reader.rs:312-330` |
 
 For an authorized code investigation, map the reported target index to the actual construction's `connect_hashes` and `connect` calls. The former `vt626_index_map` print-only diagnostic was removed in `348ff052`; it is not a runnable current test. Target indices are construction-specific, not protocol constants. The `ucon_leaf_prove_tests` in the function-circuit crate cover uninitialized proving, unchanged initialized behavior, and a negative control. The recorded verification command was `cargo test --release -p psy_dpn_circuit`.
 
@@ -114,15 +114,15 @@ An EndCap-only change does not independently authorize Genesis, token privacy fi
 
 **Symptom:** repeated `Checkpoint leaf not found for id N` while the processor waits for a Finalize reply.
 
-**Cause:** publishing a gathering checkpoint before its full metadata exists lets the serial processor wait on a gatherer that needs metadata the same processor has not yet persisted. The fix in `0b7c23c0` persists the canonical range, including empty checkpoints, before advancing state. `sync_with_coordinator` calls `persist_checkpoint_metadata_range` before publishing the synchronized base (`psy_node_common/src/realm/processor/db/sync.rs:80-84,315-362`). `set_new_unique_ids` owns generation publication (`psy_node_common/src/realm/processor/db/commit.rs:52-117`). `finalizer_identity` reads the checkpoint leaf and authenticated roots (`psy_node_common/src/realm/processor/gatherers/realm_end_cap_gatherer.rs:466-490`).
+**Cause:** publishing a gathering checkpoint before its full metadata exists lets the serial processor wait on a gatherer that needs metadata the same processor has not yet persisted. The fix in `0b7c23c0` persists the canonical range, including empty checkpoints, before advancing in-memory base ids. `sync_with_coordinator` syncs the checkpoint tree, then calls `persist_checkpoint_metadata_range` (`psy_node_common/src/realm/processor/db/sync.rs:225-248`; function at `:463`). `set_new_unique_ids` only rotates ids and accepts `Option<N::QHash>` (`psy_node_common/src/realm/processor/db/commit.rs:154`); it does not publish a gathering generation. There is no `finalizer_identity`. Checkpoint leaf and authenticated roots are loaded by `load_realm_guta_validator_proofs` (`psy_node_common/src/realm/processor/gatherers/realm_end_cap_gatherer.rs:526-586`).
 
 Debug persistence ordering and metadata completeness before attributing this error to ordinary Realm lag. Do not restore the redundant header-only startup fetch.
 
 ### 2.5 Peer rejects the finalizer root job
 
-**Symptom:** no peer votes and a fatal `wait_votes` timeout despite proposal publication.
+**Symptom:** no peer votes and the proposer returns `timed out waiting for valid Realm votes` despite proposal publication (`psy_node_common/src/realm/processor/core/process_block.rs:808-814`).
 
-**Cause:** mandatory finalization makes `RealmFinalizeGUTA` (circuit 63) the proposal root. The previous inference whitelist accepted only the 13 ordinary GUTA types. `infer_root_job_type` now accepts the finalizer through its registered runtime verifier and preserves fail-closed rejection (`psy_cli/psy_node_cli/src/node/realm_p2p.rs:673-712`). This correction was delivered in `f3e0ee3c`.
+**Cause:** mandatory finalization makes `RealmFinalizeGUTA` (circuit 63) the proposal root. There is no `infer_root_job_type`. Peer verification is `verify_proposal_submission` (`psy_node_common/src/realm/processor/consensus.rs:140-198`), called from `psy_cli/psy_node_cli/src/node/realm_p2p.rs:610-615`. It verifies the registered circuit-63 proof and fails closed. The historical whitelist correction was delivered in `f3e0ee3c`.
 
 The investigation recorded a received peer vote, formed certificate, and matching proposer/non-proposer FFS end roots at checkpoint 431. That historical observation does not substitute for acceptance on a new artifact cohort.
 
@@ -132,7 +132,7 @@ The investigation recorded a received peer vote, formed certificate, and matchin
 
 **Cause:** sparse global-user-tree nodes can retain older upper-tree versions after metadata catch-up or other-Realm advancement. A maximum-at-or-before query is not an exact checkpoint top proof. The fix in `aaed92d6` composes the local Realm subtree with the stored authenticated top spine at the exact checkpoint. `f401cbab` extends exact-vintage handling to Realm edge roots/proofs, rewards-top lookups, and metadata completeness.
 
-`finalizer_user_tree_proofs` reads the exact top proof, checks the Realm index and user membership, bounds the local subtree at the Coordinator/Realm boundary, requires local root equal to the top value, validates sibling counts, and verifies the composed proof (`psy_node_common/src/realm/processor/gatherers/realm_end_cap_gatherer.rs:536-567`). Missing or stale top metadata fails closed. Realm edge root reads use checkpoint metadata rather than a sparse global-tree maximum (`psy_node_common/src/realm/edge/handler.rs:1328-1345`).
+`validator_user_tree_proofs` reads the exact top proof, checks the Realm index and user membership, bounds the local subtree at the Coordinator/Realm boundary, requires the local root to equal the top value, and verifies the composed proof (`psy_node_common/src/realm/processor/gatherers/realm_end_cap_gatherer.rs:589-620`). There is no `finalizer_user_tree_proofs`. Missing or stale top metadata fails closed. Realm edge root reads use the exact checkpoint spine rather than a sparse global-tree maximum (`psy_node_common/src/realm/edge/handler.rs:1421-1430`).
 
 Rewards rows are keyed by pending identifiers; resolve checkpoint-to-pending mapping before selecting the exact rewards top. Do not treat checkpoint numbers and pending identifiers as interchangeable namespaces. Retained Finalize commands also have a total-retention deadline; expiry drops the reply sender instead of waiting indefinitely. These recovery rules do not permit omitting mandatory finalization.
 
@@ -140,7 +140,7 @@ Rewards rows are keyed by pending identifiers; resolve checkpoint-to-pending map
 
 **Symptom:** an accepted EndCap never reaches planning: its queue item is acknowledged, but the planner cannot find its contract updates.
 
-**Cause:** the edge previously captured generation G before asynchronous verification, stored payload under G, then delivered on a refreshed G+1 process subject. `e45de68b` makes the post-verification `(unique_pending_id, proc_checkpoint_id)` pair the single owner for storage and delivery (`psy_node_common/src/realm/edge/handler.rs:68-95,917-925,1067-1084`). The temporary payload-source-generation workaround was reverted in `cf9c3e37`; do not reintroduce a second generation selector.
+**Cause:** the edge previously captured generation G before asynchronous verification, stored payload under G, then delivered on a refreshed G+1 process subject. `e45de68b` makes the post-verification generation the single owner for storage and delivery. `with_end_cap_gathering_generation` is `psy_node_common/src/realm/edge/handler.rs:88-103`; the call site is `:951`. The temporary payload-source-generation workaround was reverted in `cf9c3e37`; do not reintroduce a second generation selector.
 
 ```text
 1. Verify the EndCap proof and retain the verified proof bytes.
@@ -153,7 +153,7 @@ Rewards rows are keyed by pending identifiers; resolve checkpoint-to-pending map
 8. Return success only when all steps succeeded; otherwise return an explicit error.
 ```
 
-`with_end_cap_gathering_generation<Read, ReadFuture, Submit, SubmitFuture>(read_generation, submit) -> anyhow::Result<()>` reads the pair, awaits submission, and calls `ensure_end_cap_generation_unchanged` afterward. The pre-publication check lives inside submission. Consumer-creation and publish failures propagate. An observed rotation returns `delivery is not confirmed`, not silent success. Fault-injected regression cases cover rotation after verification, rotation during delivery, failed submission, and half-pair refresh (`psy_node_common/src/realm/edge/handler.rs:1600-1695`).
+`with_end_cap_gathering_generation` takes the admitted generation, a generation reader, and a submit closure (`psy_node_common/src/realm/edge/handler.rs:88-103`). It checks the generation before submission and calls `ensure_end_cap_generation_unchanged` afterward. Consumer-creation and publish failures propagate. An observed rotation returns `delivery is not confirmed` (`:81`), not silent success. Current regression cases cover rotation after verification, rotation during publish, and failed submission (`:1713-1752`). There is no separate half-pair refresh test.
 
 ## 3. Regeneration Procedures
 
@@ -169,8 +169,8 @@ These are reference procedures, not permission to stop the running stack, commit
      get-user-end-cap-common-data
    ```
 
-2. Require all four output records from that invocation. Compare network magic numerically with `psy-genesis/config.json:3-10`; stop on mismatch.
-3. Copy `alt_verify_data` verbatim to `psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:27` and the printed four fingerprint limbs, in order, to `psy_core/src/network_config/local_devnet.rs:17`. The verifier JSON is shared across network selectors; localhost evidence does not validate non-local operation.
+2. Require the EndCap promotion records from that invocation: network, magic, `endcap_fingerprint_u64x4`, and `alt_verify_data`. The same invocation also prints `endcap_fingerprint`, `zk_fingerprint`, and `secp_fingerprint`; do not treat those three as EndCap metadata. Compare network magic numerically with `networks.localhost.magic` at `psy-genesis/config.json:3-5`; stop on mismatch.
+3. Copy `alt_verify_data` verbatim to `psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:27` and the printed four fingerprint limbs, in order, to `END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4` at `psy_core/src/network_config/local_devnet.rs:17`. The verifier JSON is shared across network selectors; localhost evidence does not validate non-local operation.
 4. Run the exact cache-only command twice:
 
    ```bash
@@ -186,9 +186,9 @@ These are reference procedures, not permission to stop the running stack, commit
 
 1. Freeze the intended node source revision and apply the release applicability gate. The historical local compiler experiment used local path dependencies; release consumers must use the exact authorized node revision under `AGENTS.md`, not an undocumented pin override.
 2. Update the compiler's node dependencies consistently and let Cargo regenerate its lockfile. Build/check the compiler under the authorized delivery procedure.
-3. Run `make gen-deploy-json` in `<workspace>/psy-compiler`. This writes the compressed `psy-genesis/genesis_contracts.json`, token artifacts, contract interfaces, and provenance stamp; it does **not** write the node's root `genesis.json` (`<workspace>/psy-compiler/Makefile:208-255`).
-4. Because the contract artifact changed, run `make generate-genesis-data` in `psy-node` with `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT` to regenerate root `genesis.json`. Rebuild the SDK compiler artifacts when their own input changed and verify both compiler provenance stamps.
-5. Use an authorized full purge/restart to install the new chain cohort. Core launcher startup injects the ordered public validators before processors start (`dev/locSetupV4.ts:4048-4056`); require the intended nonempty validator list. Do not hand-edit Genesis fingerprints.
+3. Run `make gen-deploy-json` in `<workspace>/psy-compiler`. The workspace recipe is `<workspace>/psy-compiler/Makefile:270-309`: it compiles the precompiles, copies `token.json` and `token.update.json`, writes `psy-genesis/genesis_contracts.json` and `genesis_abi/`, and writes the compiler provenance stamp at `:308`. It does **not** write the node's root `genesis.json`.
+4. Because the contract artifact changed, preconfigure `networks.<selected-network>.guardian_authorization.bridge_relayer_signing_policy` in `psy-genesis/config.json`, then run `make generate-genesis-data` in `psy-node` with no account environment variable and no account flag. There is no `PSY_RELAYER_MULTISIG_ACCOUNT` or `PSY_MULTISIG_POLICY_ARTIFACT`. Rebuild the SDK compiler artifacts when their own input changed and verify both compiler provenance stamps.
+5. Use an authorized full purge/restart to install the new chain cohort. Core launcher startup injects the ordered public validators before processors start (`injectGenesisValidators`, `dev/locSetupV4.ts:1524,5939`); require the intended nonempty validator list. Do not hand-edit Genesis fingerprints.
 6. Re-register users, claim faucet funds, transfer, and complete the real EndCap acceptance procedure. Do not add Cargo `[patch]` or `[replace]` overrides for pinned node revisions.
 
 ## 4. Triage Order

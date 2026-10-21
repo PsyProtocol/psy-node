@@ -1,6 +1,6 @@
 # Getting Started
 
-> For supervised start/stop/restart/rollback, follow the internal guides `docs/src/../dev/devnet_lifecycle.md` and `docs/src/../dev/devnet-launcher-reference.md` (not published in SUMMARY). Prefer `make run-all` / `make shutdown` over manual per-service starts. Note that `make shutdown` purges persisted chain state by default; use `PURGE=0 make shutdown` to stop the stack while preserving it.
+> For supervised start/stop/restart/rollback, follow the internal guides `docs/src/../dev/devnet_lifecycle.md` and `docs/src/../dev/devnet-launcher-reference.md` (not published in SUMMARY). Prefer `make run-all` / `make shutdown` over manual per-service starts. Note that `make shutdown` purges persisted chain state by default; `PURGE=0 make shutdown` stops without purging, but its database stop is `docker stop -t -1` and waits indefinitely; the supervisor's Docker stop subprocess has no deadline (its control client normally times out at 900 seconds). In the recorded observation the invoker was cut off at 180 seconds while the supervisor kept waiting. `PURGE=1 make shutdown` is the supported complete teardown (11.44 s).
 
 
 > Updated: 2026-09-03.
@@ -249,7 +249,7 @@ Stop the supervised stack without deleting state:
 PURGE=0 make shutdown
 ```
 
-`make shutdown` purges by default (`PURGE ?= 1` in the Makefile): it deletes checkpoints, `db/anvil/state.json`, logs, localhost deployments, and devnet Docker volumes; `PURGE=1 make shutdown` is the explicit equivalent. The shutdown target invokes the launcher teardown path (`Makefile:99-100`). Do not remove data directories manually.
+`make shutdown` purges by default (`PURGE ?= 1` in the Makefile): it deletes checkpoints, `db/anvil/state.json`, logs, localhost deployments, and devnet Docker volumes; `PURGE=1 make shutdown` is the explicit equivalent and the supported complete teardown. The `PURGE=0` path above requests supervisor shutdown and stops the exact Anvil processes, but its database stop is `docker stop -t -1`, which waits indefinitely; the supervisor's Docker stop subprocess has no deadline, while its control client normally times out at 900 seconds. In the recorded observation the invoker was cut off at 180 seconds while the supervisor kept waiting, and the supported purge teardown then completed in 11.44 seconds. The shutdown target invokes the launcher teardown path (`Makefile:99-100`). Do not remove data directories manually.
 
 ## 9. Implemented Network Capabilities
 

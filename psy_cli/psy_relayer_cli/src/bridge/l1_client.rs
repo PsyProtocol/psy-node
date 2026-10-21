@@ -4,6 +4,9 @@ use alloy_primitives::Address;
 use anyhow::Context;
 use psy_provider::provider::RpcProvider;
 use serde::Deserialize;
+use plonky2::field::{goldilocks_field::GoldilocksField, types::PrimeField64};
+use psy_client_common::data::qhashout::QHashOut;
+use psy_client_data::traits::qdatastore::qtreedata::QTreeDataStoreReaderSync;
 
 use crate::bridge::{
     claim_withdrawals,
@@ -32,7 +35,23 @@ struct ProofMetadata {
     #[serde(default)]
     deposit_tree_root: String,
     withdrawal_tree_root: String,
+    /// BridgeAgg public inputs: predecessor checkpoint-tree root, then end root.
+    #[serde(default)]
+    checkpoint_roots: Vec<String>,
 }
+
+/// L2 root read failed. Callers must keep the cached proof; deleting it would
+/// turn an unread lineage into a blind rebuild.
+#[derive(Debug)]
+pub(crate) struct CachedProofLineageUnread;
+
+impl std::fmt::Display for CachedProofLineageUnread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("L2 checkpoint lineage unread; cached proof retained")
+    }
+}
+
+impl std::error::Error for CachedProofLineageUnread {}
 
 #[derive(Clone)]
 pub struct L1Client {
@@ -234,34 +253,38 @@ impl L1Client {
     ) -> anyhow::Result<BridgeProveResult> {
         if proof_path.exists() {
             let meta = load_proof_metadata(proof_path)?;
-            if meta.to_checkpoint == to_checkpoint
-                && meta.from_checkpoint.unwrap_or(from_checkpoint) == from_checkpoint
-                && meta
-                    .num_checkpoints_aggregated
-                    .unwrap_or_else(|| to_checkpoint.saturating_sub(from_checkpoint) + 1)
-                    == to_checkpoint.saturating_sub(from_checkpoint) + 1
-            {
-                // Validate deposit_tree_root is present and well-formed.
-                // Old cached proofs without this field will be rejected
-                // and re-proved.
-                if !meta.deposit_tree_root.starts_with("0x") || meta.deposit_tree_root.len() != 66
-                    || !meta.deposit_tree_root[2..].chars().all(|c| c.is_ascii_hexdigit())
-                {
-                    tracing::warn!(
-                        deposit_tree_root = %meta.deposit_tree_root,
-                        "cached proof has missing or invalid deposit_tree_root; re-proving"
-                    );
-                    fs::remove_file(proof_path)?;
-                } else {
-                    return Ok(BridgeProveResult {
-                        from_checkpoint,
-                        to_checkpoint,
-                        num_checkpoints_aggregated: to_checkpoint - from_checkpoint + 1,
-                        proof_path: proof_path.to_path_buf(),
-                        deposit_tree_root: meta.deposit_tree_root.clone(),
-                        withdrawal_tree_root: meta.withdrawal_tree_root.clone(),
-                    });
+            let same_range = meta.to_checkpoint == to_checkpoint
+                && meta.from_checkpoint == Some(from_checkpoint)
+                && meta.num_checkpoints_aggregated
+                    == Some(to_checkpoint.saturating_sub(from_checkpoint) + 1);
+            if same_range && bytes32_hex(&meta.deposit_tree_root) {
+                // Same checkpoint ids can name a pre-rollback chain. Reuse only
+                // when both cached roots still are the current L2 roots.
+                match cached_lineage_matches(config, &meta, from_checkpoint, to_checkpoint).await {
+                    Ok(true) => {
+                        return Ok(BridgeProveResult {
+                            from_checkpoint,
+                            to_checkpoint,
+                            num_checkpoints_aggregated: to_checkpoint - from_checkpoint + 1,
+                            proof_path: proof_path.to_path_buf(),
+                            deposit_tree_root: meta.deposit_tree_root.clone(),
+                            withdrawal_tree_root: meta.withdrawal_tree_root.clone(),
+                        });
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            from_checkpoint,
+                            to_checkpoint,
+                            "cached bridge proof does not match current L2 checkpoint roots; re-proving"
+                        );
+                    }
+                    Err(error) => return Err(error),
                 }
+            } else if same_range {
+                tracing::warn!(
+                    deposit_tree_root = %meta.deposit_tree_root,
+                    "cached proof has missing or invalid deposit_tree_root; re-proving"
+                );
             }
             fs::remove_file(proof_path)
                 .with_context(|| format!("failed to remove stale proof {}", proof_path.display()))?;
@@ -293,6 +316,54 @@ impl L1Client {
 fn load_proof_metadata(path: &Path) -> anyhow::Result<ProofMetadata> {
     let raw = fs::read_to_string(path).with_context(|| format!("failed to read proof {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("failed to parse proof {}", path.display()))
+}
+
+fn lineage_unread(from_checkpoint: u64, to_checkpoint: u64, err: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(CachedProofLineageUnread).context(format!(
+        "failed to read L2 checkpoint roots for {from_checkpoint}..={to_checkpoint}: {err}"
+    ))
+}
+
+fn bytes32_hex(value: &str) -> bool {
+    value.starts_with("0x") && value.len() == 66 && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn checkpoint_root_hex(root: &QHashOut<GoldilocksField>) -> String {
+    let mut out = [0u8; 32];
+    for i in 0..4 {
+        let value = root.0.elements[3 - i].to_canonical_u64();
+        out[i * 8..(i + 1) * 8].copy_from_slice(&value.to_be_bytes());
+    }
+    format!("0x{}", hex::encode(out))
+}
+
+async fn cached_lineage_matches(
+    config: &BridgeProposeDaemonConfig,
+    meta: &ProofMetadata,
+    from_checkpoint: u64,
+    to_checkpoint: u64,
+) -> anyhow::Result<bool> {
+    let (Some(cached_predecessor), Some(cached_end)) = (meta.checkpoint_roots.first(), meta.checkpoint_roots.get(1)) else {
+        return Ok(false);
+    };
+    if !bytes32_hex(cached_predecessor) || !bytes32_hex(cached_end) {
+        return Ok(false);
+    }
+    let Some(predecessor_id) = from_checkpoint.checked_sub(1) else {
+        return Err(lineage_unread(from_checkpoint, to_checkpoint, "range has no predecessor checkpoint"));
+    };
+    let provider = RpcProvider::new_with_config_path(&config.rpc_config)
+        .map_err(|err| lineage_unread(from_checkpoint, to_checkpoint, err))?;
+    let predecessor = provider
+        .get_checkpoint_tree_root(predecessor_id)
+        .await
+        .map_err(|err| lineage_unread(from_checkpoint, to_checkpoint, err))?;
+    let end = provider
+        .get_checkpoint_tree_root(to_checkpoint)
+        .await
+        .map_err(|err| lineage_unread(from_checkpoint, to_checkpoint, err))?;
+    Ok(cached_predecessor.eq_ignore_ascii_case(&checkpoint_root_hex(&predecessor))
+        && cached_end.eq_ignore_ascii_case(&checkpoint_root_hex(&end)))
 }
 
 async fn load_or_build_proof_impl(
@@ -419,6 +490,126 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("psy-relayer-l1-client-test-{name}-{}", std::process::id()));
         path
+    }
+
+    #[tokio::test]
+    async fn cached_proof_reuse_requires_current_l2_lineage() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        // Distinct limbs catch root-order and bytes32 encoding mistakes.
+        const PREDECESSOR: &str = "0000000000000004000000000000000300000000000000020000000000000001";
+        const END: &str = "0000000000000008000000000000000700000000000000060000000000000005";
+        const OTHER: &str = "000000000000000c000000000000000b000000000000000a0000000000000009";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_mode = mode.clone();
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" { break; }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], "psy_get_checkpoint_tree_root");
+                let id = request["params"]["checkpoint_id"].as_u64().unwrap();
+                assert!(id == 9 || id == 20);
+                server_requests.lock().unwrap().push(id);
+                let mode = server_mode.load(Ordering::SeqCst);
+                let response = if mode == 3 || (mode == 4 && id == 20) {
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"],
+                        "error": {"code": -32000, "message": "checkpoint root unavailable"}})
+                } else {
+                    let root = match (mode, id) {
+                        (1, 9) | (2, 20) => OTHER,
+                        (_, 9) => PREDECESSOR,
+                        _ => END,
+                    };
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": root})
+                }.to_string();
+                reader.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(), response,
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let dir = temp_path("cache-lineage");
+        fs::create_dir_all(&dir).unwrap();
+        let rpc_path = dir.join("rpc.json");
+        // Use the canonical schema and compiled network identity, overriding
+        // only RPC endpoints so every request stays on the local stub.
+        let genesis: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../psy-genesis/config.json"
+        ))).unwrap();
+        let mut network = genesis["networks"][psy_config::CURRENT_NETWORK].clone();
+        assert!(network.is_object());
+        network["realm_configs"] = serde_json::json!([{"id": 0, "rpc_url": [&url]}]);
+        network["coordinator_configs"] = serde_json::json!([{"id": 0, "rpc_url": [&url]}]);
+        for key in ["prove_proxy_url", "system_prove_proxy_url", "faucet_rpc_url", "api_services_url"] {
+            network[key] = serde_json::json!([&url]);
+        }
+        let rpc_config = serde_json::json!({
+            "networks": {(psy_config::CURRENT_NETWORK): network},
+            "defaultNetwork": psy_config::CURRENT_NETWORK,
+        });
+        fs::write(&rpc_path, rpc_config.to_string()).unwrap();
+        let mut config: BridgeProposeDaemonConfig = toml::from_str(&format!(
+            "rpc_config = {:?}\nguardian_root = \"guardians-root\"\nservices_url = \"http://127.0.0.1:1\"\nwithdraw_method_id = 0\n",
+            rpc_path.display(),
+        )).unwrap();
+        // A rejected cache enters the real rebuild path, failing before proving
+        // or writing because this deployment deliberately does not exist.
+        config.finalize.deployments_network = Some(format!("cache-lineage-no-deployment-{}", std::process::id()));
+        config.finalize.l1_rpc_url = Some(url.clone());
+        let client = L1Client::from_finalize_config(&config.finalize, "cache-lineage").unwrap();
+        let proof_path = dir.join("bridge_proof_20.json");
+        let original = serde_json::json!({
+            "from_checkpoint": 10, "to_checkpoint": 20, "num_checkpoints_aggregated": 11,
+            "checkpoint_roots": [format!("0x{PREDECESSOR}"), format!("0x{END}")],
+            "deposit_tree_root": format!("0x{}", "11".repeat(32)),
+            "withdrawal_tree_root": format!("0x{}", "22".repeat(32)),
+            "proof": "cached-proof-must-not-be-rewritten"
+        }).to_string();
+        for scenario in 0..5 {
+            mode.store(scenario, Ordering::SeqCst);
+            requests.lock().unwrap().clear();
+            fs::write(&proof_path, &original).unwrap();
+            let result = client.load_or_build_proof(&config, &proof_path, 10, 20, Some(&url)).await;
+            if scenario == 0 {
+                let reused = result.unwrap();
+                assert_eq!((reused.from_checkpoint, reused.to_checkpoint, reused.num_checkpoints_aggregated), (10, 20, 11));
+                assert_eq!(reused.proof_path, proof_path);
+                assert_eq!(fs::read_to_string(&proof_path).unwrap(), original);
+            } else if scenario <= 2 {
+                let error = result.unwrap_err();
+                assert!(error.downcast_ref::<CachedProofLineageUnread>().is_none());
+                assert!(format!("{error:#}").contains("failed to load deployed-contracts.json"), "{error:#}");
+                assert!(!proof_path.exists(), "stale proof must not survive failed rebuild");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.downcast_ref::<CachedProofLineageUnread>().is_some(), "{error:#}");
+                assert!(format!("{error:#}").contains("10..=20"));
+                assert_eq!(fs::read_to_string(&proof_path).unwrap(), original);
+            }
+            let expected = if scenario == 3 { vec![9] } else { vec![9, 20] };
+            assert_eq!(*requests.lock().unwrap(), expected);
+        }
+        server.abort();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

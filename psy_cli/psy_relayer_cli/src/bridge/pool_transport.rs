@@ -6,6 +6,11 @@ use psy_rpc_pool::{CallOutcome, PoolError, ProviderPool, RetryPolicy};
 use serde::de::Error as _;
 use tower::Service;
 
+/// Pool-generated transport faults. Shared by the error constructor and the
+/// log-side classifier so both agree on the category without new error types.
+const POOL_TIMEOUT_MESSAGE: &str = "L1 RPC attempt timed out";
+const POOL_UNAVAILABLE_MESSAGE: &str = "L1 RPC providers cooling down or recovery probe in flight";
+
 /// alloy transport over a scored provider pool. Shared by all providers for
 /// one chain, including receipt polling and signing fillers.
 #[derive(Clone)]
@@ -33,8 +38,8 @@ impl PoolTransport {
             .await
             .map_err(|error| match error {
                 PoolError::Provider(error) => redact(error),
-                PoolError::Unavailable => TransportErrorKind::custom_str("L1 RPC providers cooling down or recovery probe in flight"),
-                PoolError::Timeout => TransportErrorKind::custom_str("L1 RPC attempt timed out"),
+                PoolError::Unavailable => TransportErrorKind::custom_str(POOL_UNAVAILABLE_MESSAGE),
+                PoolError::Timeout => TransportErrorKind::custom_str(POOL_TIMEOUT_MESSAGE),
             })
     }
 }
@@ -128,6 +133,37 @@ fn redact(error: TransportError) -> TransportError {
         }
         TransportError::DeserError { err, .. } => TransportError::DeserError { err, text: String::new() },
         other => other,
+    }
+}
+
+/// Coarse, log-safe root-cause class for a transport error: `timeout`
+/// (deadline exceeded), `unavailable` (endpoint unreachable, rejecting, or
+/// in pool cooldown/quarantine), `provider` (JSON-RPC error response),
+/// `revert` (JSON-RPC code 3, the EVM execution-revert code), `decode`
+/// (response unusable), `other` (residual variants). Reads only typed
+/// variants, status codes and the pool's own fault strings — never URLs,
+/// query strings, auth material or server response bodies.
+pub(super) fn error_category(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::ErrorResp(payload) if payload.code == 3 => "revert",
+        TransportError::ErrorResp(_) => "provider",
+        TransportError::NullResp | TransportError::DeserError { .. } | TransportError::SerError(_) => "decode",
+        TransportError::Transport(kind) => match kind {
+            TransportErrorKind::HttpError(http) => {
+                if http.status == 429 || http.status >= 500 { "unavailable" } else { "provider" }
+            }
+            TransportErrorKind::Custom(err) => {
+                if let Some(reqwest_error) = err.downcast_ref::<reqwest::Error>() {
+                    if reqwest_error.is_timeout() { "timeout" } else { "unavailable" }
+                } else if err.to_string() == POOL_TIMEOUT_MESSAGE {
+                    "timeout"
+                } else {
+                    "unavailable"
+                }
+            }
+            _ => "other",
+        },
+        _ => "other",
     }
 }
 
@@ -662,5 +698,23 @@ mod tests {
             }
             other => panic!("expected ErrorResp, got {other:?}"),
         }
+    }
+    #[test]
+    fn error_category_matches_typed_transport_error_variants() {
+        let error_payload = |code: i64| -> alloy_json_rpc::ErrorPayload {
+            serde_json::from_value(serde_json::json!({"code": code, "message": "provider message"})).unwrap()
+        };
+        // JSON-RPC code 3 is the EVM execution-revert code; no message sniffing.
+        assert_eq!(error_category(&TransportError::ErrorResp(error_payload(3))), "revert");
+        assert_eq!(error_category(&TransportError::ErrorResp(error_payload(-32601))), "provider");
+        assert_eq!(error_category(&TransportError::NullResp), "decode");
+        let parse_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert_eq!(error_category(&TransportError::DeserError { err: parse_err, text: String::new() }), "decode");
+        assert_eq!(error_category(&TransportError::SerError(serde_json::from_str::<serde_json::Value>("no").unwrap_err())), "decode");
+        assert_eq!(error_category(&TransportErrorKind::http_error(429, String::new())), "unavailable");
+        assert_eq!(error_category(&TransportErrorKind::http_error(503, String::new())), "unavailable");
+        assert_eq!(error_category(&TransportErrorKind::custom_str(POOL_TIMEOUT_MESSAGE)), "timeout");
+        assert_eq!(error_category(&TransportErrorKind::custom_str(POOL_UNAVAILABLE_MESSAGE)), "unavailable");
+        assert_eq!(error_category(&TransportError::UnsupportedFeature("ws")), "other");
     }
 }

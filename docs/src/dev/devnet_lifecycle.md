@@ -2,18 +2,15 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-07. Status: Review.
+> Updated: 2026-10-21. Status: Review.
 
 ## Overview
 
-`devnet_lifecycle.md` is the required operating procedure for local Psy devnet work: startup, shutdown,
-restart, and offline rollback keep the persisted Anvil chain, Scylla state, checkpoint files, and
-supervised processes aligned. Supported entry points are `make run-all`, `make restart`, `make
-rollback-stop`, `make rollback-resume`, and `make shutdown`.
+`devnet_lifecycle.md` is the required operating procedure for local Psy devnet work. `make run-all` always starts a fresh chain. `make restart` and `make rollback-resume` keep the database and the three running Anvil processes and restart applications only. `make shutdown` is teardown; `PURGE=1` is its default. Supported entry points are `make run-all`, `make restart`, `make rollback-stop`, `make rollback-resume`, and `make shutdown`.
 
 ## Background
 
-Use only this lifecycle for local devnet operations; it supersedes ad-hoc per-service startup and manual state repair. The supervisor distinguishes persistent infrastructure from application processes, allowing offline rollback without replacing the L1 chain. A purge instead removes the paired L1/L2 state. These are distinct operations, not interchangeable restart shortcuts (`dev/locSetupV4.ts:3450-3468,3505-3512,3851-3919`).
+Use only this lifecycle for local devnet operations; it supersedes ad-hoc per-service startup and manual state repair. The supervisor distinguishes persistent infrastructure from application processes. `make restart` and `make rollback-resume` leave the running database and the three Anvil processes in place. A purge removes the paired L1/L2 state. These are distinct operations, not interchangeable restart shortcuts (`dev/locSetupV4.ts:5221-5225,5740-5746,7715-7724`).
 
 ## Table of Contents
 
@@ -22,7 +19,7 @@ Use only this lifecycle for local devnet operations; it supersedes ad-hoc per-se
 - [Public-only generate-genesis-data inputs](#public-only-generate-genesis-data-inputs)
 - [3. Fresh Start](#3-fresh-start)
 - [4. Readiness](#4-readiness)
-- [5. State-Preserving Restart](#5-state-preserving-restart)
+- [5. Application Restart](#5-application-restart)
 - [6. Offline Rollback Stop and Resume](#6-offline-rollback-stop-and-resume)
 - [7. Post-Restart and Post-Rollback Verification](#7-post-restart-and-post-rollback-verification)
 - [8. Failure Rules](#8-failure-rules)
@@ -59,7 +56,7 @@ PSY_SKIP_BRANCH_CHECK=1
 PSY_SKIP_KEYSTORE=1
 ```
 
-Do not set `PSY_NO_AUTO_RESTART=1` when `make restart`, `make rollback-stop`, or `make rollback-resume` will be used. Those targets require the foreground supervisor to remain active. `PSY_SKIP_BUILD=1` is valid only after the release binaries and compiler-generated artifacts have been verified against the current source. `Makefile:13-15` defines the defaults; `dev/locSetupV4.ts` rejects stale Psy SDK compiler artifacts.
+Do not set `PSY_NO_AUTO_RESTART=1` when `make restart`, `make rollback-stop`, or `make rollback-resume` will be used. Those targets require the foreground supervisor to remain active. `PSY_SKIP_BUILD=1` is valid only after the release binaries and compiler-generated artifacts have been verified against the current source. `Makefile:16-18` defines the skip and purge defaults; `dev/locSetupV4.ts` rejects stale Psy SDK compiler artifacts.
 
 Before startup, from a clean `<repo-root>`, check out the recorded DApp pin despite `update = none`, then initialize every nested link at its recorded SHA:
 
@@ -153,32 +150,40 @@ Repair only the stale output:
 - SDK compiler identity or generated WASM is stale: `CARGO_NET_GIT_FETCH_WITH_CLI=true PSY_NETWORK=localhost pnpm --dir ../psy-sdk/psy-ts-sdk/packages/psy-sdk build`. This generates both prover targets and the compiler stamp. Keep generated `bigint` exports; do not copy another package's bindings or cast them to `number`.
 - A required node, services, or indexer binary is missing or older than its sources: `make build` in the owning repository.
 
-Do not rebuild all three because one comparison failed. Regenerate root `genesis.json` only when a [§6.1](circuit-and-verifier-operations.md#61-genesis-trigger) construction input changed; a stamp or compiler-revision refresh alone does not. Do not weaken the provenance check. Do not add Cargo `[patch]` or `[replace]` overrides for pinned Psy node revisions; the existing plonky2-hwa patch in each repository is not inherited across git pins. `dev/locSetupV4.ts` verifies the Genesis payload and full stamp before process startup. When a construction input requires root `genesis.json` regeneration, set `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT` for `make generate-genesis-data`; the root file embeds the contract circuit definitions consumed by processors and the prove proxy.
+Repair only stale compiler outputs and rebuild affected binaries; do not weaken provenance checks or add Cargo patch overrides. `make run-all` explicitly authorizes a fresh local Genesis after complete startup preflight. Standalone generation reads the public signing policy from the selected network in `psy-genesis/config.json`; it takes no account-file path.
 
 ### Public-only `generate-genesis-data` inputs
 
-`make generate-genesis-data` takes only public inputs. It requires `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`, then runs `./target/release/psy_dev_cli generate-genesis-data` with `--repo-root`, `--relayer-multisig-account`, and `--multisig-policy-artifact` (`Makefile:139-144`). That child drops `PRIVATE_KEY`, `BRIDGE_RELAYER_L2_PRIVATE_KEY`, `KEYSTORE_PATH`, `PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, and `WALLET_PASSWORD`. The account `contract_id` must be 1 (`MULTISIG_POLICY_CONTRACT_ID`); `public_key_param` rejects any other id (`client_prover/psy_vm/src/ups/multisig.rs:20,75-76`), and the guardians-root branch repeats the check (`generate_genesis/guardians_root.rs:88`).
+`make generate-genesis-data` passes only `--repo-root` to the release CLI (`Makefile:141-142`). It removes legacy secret-bearing enrollment variables from that child. It does not accept `PSY_RELAYER_MULTISIG_ACCOUNT` or `--relayer-multisig-account`. The public two-of-three policy is the existing JSON string at `networks[CURRENT_NETWORK].guardian_authorization.bridge_relayer_signing_policy`. An operator configures that public member policy once in the canonical JSON; it is not a secret and is not a separate file. A missing checked-in policy fails before destruction. The generator resolves compiler artifacts from `PSY_PROJECTS_DIR/psy-compiler`, or the sibling `psy-compiler` checkout when unset.
 
 Use that current release `psy_dev_cli`. A stale binary still checks contract ID 6 (`public multisig account must name contract 6`; `Genesis contract 6 must be multisig_policy`) and fails a contract-1 account.
 
-The Make target does not redirect writes. Isolated output flags are `--genesis-out`, `--private-keys-out`, and `--faucet-operators-out`; `--skip-faucet-operators` omits the faucet file. Defaults are `<repo-root>/genesis.json`, `<repo-root>/private_keys.json`, and `<repo-root>/psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:125-135,546-547,560-625`).
+The Make target does not redirect writes. Isolated output flags are `--genesis-out`, `--private-keys-out`, and `--faucet-operators-out`; `--skip-faucet-operators` omits the faucet file. Defaults are `<repo-root>/genesis.json`, `<repo-root>/private_keys.json`, and `<repo-root>/psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:122-132,668-671`).
 
 ## 3. Fresh Start
 
-A fresh test chain requires a full purge because Scylla volumes, checkpoint ring buffer files, the persisted Anvil snapshot, and localhost deployments must start from the same genesis state. `make shutdown` purges by default (`PURGE ?= 1` in the Makefile); only `PURGE=0 make shutdown` preserves the paired state:
+`make run-all` passes `--all` and always starts a fresh local chain, independently of `PURGE`. Explicit worker and proxy counts still apply, including `--prove-proxy 0`. Partial component commands never perform the full reset; `--db` refuses existing containers or volumes rather than adopting them. Full startup validates daemon and public configuration, generation inputs, resource settings, namespace ownership, and complete Docker listings before stopping anything. An unbound checkout cannot adopt matching resources, including legacy names. The existing owner-only guardian `db/` directory is a provisioning prerequisite. The foreground `fresh-devnet-state` helper validates protected fixed paths and acquires all four real redb exclusive guards before acknowledging `prepared`. Any live database owner blocks startup. It retains those guards across stdin `reset`, fresh Genesis generation, and the three local deployments. After deployment the launcher sends stdin `authorize` and waits for `authorized`. That phase writes `guardian_authorization` onto the selected `CURRENT_NETWORK` object in `psy-genesis/config.json` and writes no separate authorization file. Database tables are cleared in place and the files are never unlinked. The helper exits before guardian services start. The first fresh preflight does not require `guardian_authorization`; guardian-service startup and application restart do. Namespace binding, guardian keys, and the rest of the public network configuration are not reset (`dev/locSetupV4.ts:3163-3223,4013-4017,4069-4104,5904-5913,6334-6336`; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:57-95`; `psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs:229-236`).
+
+The new Anvil writes `--state` to the now-absent snapshot path and does not load it. Local contracts deploy with `--reset`. If a configured local port already has a listener, startup fails and does not kill that process.
+
+After the four in-place database clears, in order `guardian-1.redb`, `guardian-2.redb`, `guardian-3.redb`, then `relayer.redb`, the helper removes fixed paths in this order: `db/anvil`; contents of `local_checkpoints` except the retained `devnet-namespace` file; `genesis.json`; then `psy-contracts/deployments/localhost`, `localhostBsc`, and `localhostBase`. Each database commit is separate. A failure stops immediately: earlier commits and removals remain, later cleanup does not start, and nothing is rolled back (`psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:5-6,23-31,81-85`). TypeScript does not recursively remove these paths or inspect redb contents. Ancestor symlink checks alone are not a race-safety guarantee. The launcher does not request Anvil historical-state preservation. `make restart` only restarts applications: it does not run the helper, recreate databases, generate Genesis, deploy contracts, or rewrite `guardian_authorization`.
+
+The protected helper requires trusted root/current-user-owned ancestry without group/world write access, and current-user-owned cleanup descendants; symlinks and hardlinked files are rejected. Opening and closing real redb databases can update engine housekeeping headers even when preflight rejects another input. The no-side-effects guarantee for failed preflight is therefore no business-table reset and no cleanup deletion, not byte-for-byte equality of redb files.
 
 ```bash
-PURGE=1 make shutdown
 make build
-PSY_SKIP_KEYSTORE=1 \
-PSY_SKIP_BRANCH_CHECK=1 \
-PSY_SKIP_BUILD=1 \
+export PSY_SKIP_KEYSTORE=1
+export PSY_SKIP_BRANCH_CHECK=1
+export PSY_SKIP_BUILD=1
 make run-all
 ```
 
-`PURGE=1 make shutdown` removes checkpoints, Anvil state under `db/anvil`, logs, and deployments only after the Anvil, Docker, and known-application cleanup gates succeed. Docker cleanup is attempted after Anvil shutdown, even if that shutdown fails; failure blocks file deletion and startup. Docker commands and listings are bounded, and failed or incomplete listings cannot prove absence. Any timeout or targeted leftover is a nonzero failure. The application gate covers known command patterns and a fixed port subset, not all sockets: Realm 13380–14679, proxy 9999–10008, guardians 15441–15443, and history 15450 are not individually probed (see [launcher teardown guarantees](devnet-launcher-reference.md#13-teardown-and-purge)). Bare `make shutdown` is identical because purge is the Make default. A fresh chain is `PURGE=1 make shutdown` followed by `make run-all`. Never delete only Scylla, Anvil state, deployments, or `local_checkpoints/`; retained components would describe different chains. `PURGE=0 make shutdown` does not fall through into purge when preservation fails.
+`make shutdown` remains the explicit teardown. `PURGE=1` is still its default and performs the broader purge documented in the launcher reference; it is the supported complete teardown. `PURGE=0` stops without purging, but its database stop is `docker stop -t -1`, which waits indefinitely; that supervisor-side Docker stop subprocess has no deadline, while the control client normally times out at 900 seconds (`dev/locSetupV4.ts:7355-7362`). In the recorded observation the invoker was cut off at 180 seconds while the supervisor kept waiting, and the supported purge teardown then completed in 11.44 seconds. It is not required before `make run-all`.
 
 `make run-all` stays in the foreground. Run it in a dedicated terminal or tmux pane. Do not background it with `&`.
+
+A second `make run-all` is another fresh chain, not a resume. Run it only after the first supervisor has exited, its control socket is gone, configured local ports are free, and no process still holds the four redb files. It repeats the same clear-then-cleanup order, then generates a new Genesis and deployments. `make restart` cannot replace that second fresh start: restart requires the original supervisor and its recorded `db`, `l1_anvil`, `l1_anvil_bsc`, and `l1_anvil_base` processes to still be running. If any of those processes is absent, restart fails and starts nothing.
+
 
 ## 4. Readiness
 
@@ -214,7 +219,7 @@ curl -s -X POST http://127.0.0.1:1337 \
 
 With the default `make run-all` topology (`--realms-count 2`, `--realm-edge-nodes 1`, two validators per Realm), Realm edge HTTP ports are `13380`/`13381` for Realm 0 subs `1`/`2` and `13390`/`13391` for Realm 1. Each Realm starts processors for both sub-IDs. `start-realm-processor` does not take a sub-id flag; the process derives sub-id from its Ed25519 identity match in `PSY_CONFIG_PATH`. Rollback plans still require explicit `--realm-id` / `--realm-sub-id` and must match that derived identity.
 
-## 5. State-Preserving Restart
+## 5. Application Restart
 
 Keep the terminal running `make run-all` alive. Restart only its supervised application children:
 
@@ -222,24 +227,10 @@ Keep the terminal running `make run-all` alive. Restart only its supervised appl
 make restart
 ```
 
-`make restart` sends a command to the existing supervisor. It stops and recreates processors, edges, workers, proof services, APIs, indexers, relayer, and UIs from their recorded commands. The original Anvil process, database launcher, Scylla, Redis, NATS, Nostr, Envio containers, checkpoints, and logs remain active. Contract deployment and Envio storage initialization are not rerun.
+`make restart` sends `restart` to the existing supervisor. It requires the recorded `db`, `l1_anvil`, `l1_anvil_bsc`, and `l1_anvil_base` processes to still be running. A healthy primary Anvil is not sufficient. If any required process is absent, the command fails and starts nothing. On success it stops and recreates processors, edges, workers, proof services, APIs, indexers, relayer, and UIs from their recorded commands. Restart also requires the selected network's `guardian_authorization` object to already exist. It does not delete files, remove volumes, deploy contracts, publish authorization, or start a replacement database or Anvil (`dev/locSetupV4.ts:4013-4017,4240-4248,5743-5746`).
 
-Anvil periodically saves each local L1 chain (`db/anvil/state.json`, plus `db/anvil/localhostBsc/state.json` and `db/anvil/localhostBase/state.json`). `ANVIL_STATE_INTERVAL` sets that period in seconds and must be a positive integer; the launcher default is 900. A non-purge shutdown (`PURGE=0 make shutdown`) followed by `make run-all` loads that exact L1 state and reuses the matching deployment summary. The state and deployment must exist together; mismatch fails with an instruction to run `PURGE=1 make shutdown` then `make run-all`.
+Anvil continues writing its current chain to `db/anvil/state.json` (and the localhostBsc and localhostBase paths). Those files are outputs of the running process. The next `make run-all` removes them before starting a new chain.
 
-`PURGE=0 make shutdown` is a full process teardown that preserves the paired Anvil state, L2 databases, checkpoints, and deployments. A later `make run-all` restores the same chain. Bare `make shutdown` purges by default and deletes that state; use it only when a fresh chain is intended. For a complete fresh restart use:
-
-```bash
-PURGE=1 make shutdown
-make run-all
-```
-
-That sequence purges L1 and L2 together before starting a new chain. The equivalent single-command form passes `--purge` to the launcher, which runs the same paired purge (checkpoints, `db/anvil/state.json`, logs, localhost deployments, devnet Docker volumes) before any process starts and then deploys contracts fresh:
-
-```bash
-make run-all LOCSETUP_START_ARGS="... --purge"
-```
-
-Purge and contract redeployment are paired by design: removing the persisted Anvil state and deployment summary makes the next startup deploy fresh contracts with `--reset`. There is no supported keep-data contract-swap path; a circuit or keystore change always requires a purge restart.
 
 
 ## 6. Offline Rollback Stop and Resume
@@ -265,7 +256,7 @@ Pass that path to rollback generation and execution with `--stop-sentinel local_
 
 ```bash
 for p in 1337 13380 13381 13390 13391 3000 9999; do ! nc -z 127.0.0.1 "$p"; done
-for p in 8545 9042 6379 4222 8081 5433 8080; do nc -z 127.0.0.1 "$p"; done
+for p in 8545 9545 10545 9042 6379 4222 8081 5433 8080; do nc -z 127.0.0.1 "$p"; done
 ```
 
 4. Generate and execute one rollback plan for the Coordinator and one for every Realm processor identity `(realm_id, realm_sub_id)` (default `make run-all`: four Realm plans for realms `0`/`1` × subs `1`/`2`). Realm plans require `--realm-id` and `--realm-sub-id` matching the processor derived from its identity key. Rollback validation uses only `plonky2-poseidon-goldilocks`; JTMB is test-only. `--target-contract-state <json>` is optional: generation retains it only when `last_finalized_checkpoint_id` exactly equals the rollback target, and absence or mismatch never blocks local rollback. Generate every RP before executing any RP, then require every phase in every RP to be `completed` before resume. Any L1 force-state action is a separate operator task.
@@ -275,9 +266,9 @@ for p in 8545 9042 6379 4222 8081 5433 8080; do nc -z 127.0.0.1 "$p"; done
 make rollback-resume
 ```
 
-The supervisor removes the stop sentinel only after every saved application process reaches its startup condition. Never purge or tear down the stack — neither the default purging `make shutdown` nor the state-preserving `PURGE=0 make shutdown` — between rollback plan generation, execution, recovery, and resume.
+The supervisor removes the stop sentinel only after every saved application process reaches its startup condition. `make rollback-resume` starts those saved templates against the infrastructure left running by `make rollback-stop`. It is not `make run-all`: it does not deploy L1, reset Envio, or create a fresh chain. Do not run `make shutdown`, including `PURGE=0 make shutdown`, between rollback plan generation, execution, recovery, and resume.
 
-`make rollback-resume` restarts the saved application templates. It can take several minutes because release Plonky2 workers and the prove proxy rebuild circuit state. A long-running command is not stuck while new `CONTROLLED START` markers appear and readiness ports progressively open. The current supervisor starts templates serially; the prove proxy warm-up is usually the critical path.
+`make rollback-resume` can take several minutes because release Plonky2 workers and the prove proxy rebuild circuit state. A long-running command is not stuck while new `CONTROLLED START` markers appear and readiness ports progressively open. The current supervisor starts templates serially; the prove proxy warm-up is usually the critical path.
 
 ## 7. Post-Restart and Post-Rollback Verification
 
@@ -290,35 +281,35 @@ The supervisor removes the stop sentinel only after every saved application proc
 7. Require checkpoint ring buffers to be contiguous through the current head and new gatherer backups to begin above the retained monotonic pending high-water.
 8. If an end cap anchors to a historical checkpoint after rollback, bound the checkpoint-tree proof query by the current logical head; an unbounded per-node max query can mix physical post-rollback residual versions.
 
-The earlier checkpoint-289-to-0 run proved L2 rollback, convergence, and transaction acceptance. It did not prove localhost L1 continuity because the old restart path recreated Anvil. Treat it only as L2 rollback evidence.
+The earlier checkpoint-289-to-0 run is historical L2 evidence from the old restart path: it showed L2 rollback, convergence, and transaction acceptance, and it did not prove localhost L1 continuity because that path recreated Anvil. It is not verification of the current three-Anvil restart.
 
 ## 8. Failure Rules
 
 | Failure | Action |
 |---|---|
-| `compiler revision changed` | Regenerate compiler/Genesis contract artifacts, regenerate root `genesis.json`, rebuild affected release binaries, then run the artifact checks. |
-| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data` with both public inputs `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`; stale embedded circuit definitions can fail prove-proxy circuit construction. |
+| `compiler revision changed` | Regenerate compiler and Genesis contract artifacts, regenerate root `genesis.json`, rebuild affected release binaries, then run the artifact checks. |
+| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data` with the matching sibling compiler artifacts and the canonical signing policy already present; stale embedded definitions can fail prove-proxy circuit construction. |
 | Cargo cannot authenticate to `git@github.com` | Set `CARGO_NET_GIT_FETCH_WITH_CLI=true`; repair empty cached submodules without deleting the whole Cargo git cache. |
 | Submodule fetch reports `early EOF` | Retry the same authenticated command. |
-| Scylla `raft operation add_entry timed out` during fresh schema creation | Run `PURGE=1 make shutdown` then `make run-all`; do not reuse the partial Scylla volume. |
-| Anvil state and localhost deployment do not both exist | Run `PURGE=1 make shutdown` then `make run-all`; do not regenerate or delete only one artifact. |
-| `db/anvil/state.json` is truncated or invalid JSON | The L1 snapshot is unusable. Do not repair it manually or claim L1 continuity. Use `PURGE=1 make shutdown` then `make run-all` for full-stack work; an explicitly authorized L2-only test may omit L1 and must record that limitation. |
+| Scylla `raft operation add_entry timed out` during fresh schema creation | Stop the partial stack with `PURGE=1 make shutdown`, then run `make run-all`. Do not reuse the partial Scylla volume. |
+| Anvil state or a localhost deployment is missing or inconsistent | Run `PURGE=1 make shutdown`, then `make run-all`. `make run-all` creates a fresh chain; it does not reuse one side of a partial pair. |
+| `db/anvil/state.json` is truncated or invalid JSON | The L1 snapshot is unusable. Do not repair it manually or claim L1 continuity. Use `PURGE=1 make shutdown`, then `make run-all`. |
 | Database proof differs from checkpoint ring buffer proof | Keep the stack stopped and identify whether the DB history or ring buffer is stale; do not delete only one side. |
 | `rollback-stop` reports an application port still open | Keep the supervisor in `stopping`, terminate the tracked application process group, and retry `make rollback-stop`. Do not write the sentinel manually. |
-| `make restart` cannot reach the control socket | The foreground `make run-all` supervisor is absent. Start `make run-all` only when the preserved Anvil/deployment pair and retained databases are valid. |
+| `make restart` cannot reach the control socket | The foreground supervisor is absent. `make run-all` creates a fresh chain; it does not preserve the previous chain. |
 | Processor exits before the exact readiness marker | Read that processor's error log; do not treat an open RPC port as processor readiness. |
 | Realm resume has no positive pending/proc mapping below the retained counter | Resolve the committed pair from the latest checkpoint mapping at or before the marker; the `(0,0)` sentinel is valid for an unchanged Realm. Never lower or reuse the counter. |
 | Rollback CLI says an endpoint is reachable | Run `make rollback-stop`; do not bypass the offline guard. |
 | Rollback plan phase fails | Keep applications stopped and rerun the same RP. The phase model is idempotent. |
-| `make rollback-resume` fails | Keep the sentinel and retained infrastructure; fix the failing application, then rerun `make rollback-resume`. |
+| `make rollback-resume` fails | Keep the sentinel and the infrastructure that is still running; fix the failing application, then rerun `make rollback-resume`. Do not replace it with `make run-all`. |
 
 ## 9. Forbidden Operations
 
-- Do not use `PURGE=0 make shutdown && make run-all` unless `db/anvil/state.json` and the localhost deployment both remain present. Bare `make shutdown` purges by default and deletes both.
+- Do not follow `make shutdown` with `make run-all` in order to reuse Anvil state or deployments. `PURGE=0` does not turn `make run-all` into a state-preserving restart. `make run-all` always starts a fresh chain.
 - Do not run `docker compose` or manually restart one devnet service.
 - Do not run individual process binaries to substitute for the supervisor control targets.
 - Do not use `PSY_NO_AUTO_RESTART=1` when process-only restart or rollback stop/resume is required.
-- Do not use non-purge restart after deleting Scylla, Redis, NATS, Anvil state, deployments, or checkpoint files.
+- Do not use `make restart` after the supervisor has exited, or after deleting Scylla, Redis, NATS, Anvil state, deployments, or checkpoint files. `make restart` requires the recorded database and all three Anvil processes to still be running.
 - Do not use `PSY_SKIP_BUILD=1` after source, compiler, Genesis, or SDK artifact changes without rebuilding.
 - Do not regenerate a rollback plan after destructive phases have started; resume the frozen RP.
 - Do not restart processors until all Coordinator and Realm rollback plans and external recovery have completed.

@@ -20,7 +20,7 @@ use std::{fs, io::Write, net::SocketAddr, os::unix::fs::{MetadataExt, OpenOption
 
 use anyhow::{ensure, Context};
 use bincode::Options;
-use guardian_common::{endcap::approved_endcap_max_proof_bytes, protocol::{parse_canonical_json, ChainEndpoint, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, TokenMapping, BRIDGE_USER_ID, MAX_BODY_BYTES}, runtime::{load_authorization_archive, AuthorizationArchive}};
+use guardian_common::{protocol::{parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianAuthorization, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, TokenMapping, BRIDGE_USER_ID, MAX_BODY_BYTES}};
 use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
@@ -44,6 +44,34 @@ const SIGNER: TableDefinition<'_, (), [u8; 33]> = TableDefinition::new("guardian
 const ACCOUNT: TableDefinition<'_, (u64, u64), &[u8]> = TableDefinition::new("guardian_account");
 const SIGNED: TableDefinition<'_, (u64, u64, u64), &[u8]> = TableDefinition::new("guardian_signed");
 const SESSION: TableDefinition<'_, (u64, u64, u64), &[u8]> = TableDefinition::new("guardian_session");
+const GUARDIAN_DEPOSIT_TREE_STATES: TableDefinition<'_, GuardianDepositTreeKey, &[u8]> = TableDefinition::new("deposit_tree_states");
+const GUARDIAN_INCLUDED_WITHDRAWAL_BURNS: TableDefinition<'_, GuardianWithdrawalBurnKey, u64> = TableDefinition::new("included_withdrawal_burns");
+const GUARDIAN_NONCE: TableDefinition<'_, GuardianNonce, u64> = TableDefinition::new("guardian_withdrawal_nonce");
+// Role-specific runtime-key mirrors of the writers' schemas: redb compares type_name
+// and fixed_width on open, so guardian-N.redb needs guardian_common::* names and
+// relayer.redb needs psy_relayer_cli::* names; byte payloads pass through unchanged.
+#[derive(Debug)]
+struct GuardianDepositTreeKey([u8; 17]);
+#[derive(Debug)]
+struct GuardianWithdrawalBurnKey([u8; 56]);
+#[derive(Debug)]
+struct GuardianNonce([u8; 49]);
+#[derive(Debug)]
+struct RelayerDepositTreeKey([u8; 17]);
+#[derive(Debug)]
+struct RelayerWithdrawalBurnKey([u8; 56]);
+#[derive(Debug)]
+struct RelayerNonce([u8; 49]);
+macro_rules! runtime_key { ($ty:ident, $width:expr, $name:literal) => {
+    impl redb::Value for $ty { type SelfType<'a> = Self; type AsBytes<'a> = [u8; $width]; fn fixed_width() -> Option<usize> { Some($width) } fn from_bytes<'a>(data: &'a [u8]) -> Self where Self: 'a { Self(data.try_into().unwrap()) } fn as_bytes<'a, 'b: 'a>(value: &'a Self) -> [u8; $width] where Self: 'a, Self: 'b { value.0 } fn type_name() -> redb::TypeName { redb::TypeName::new($name) } }
+    impl redb::Key for $ty { fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering { a.cmp(b) } }
+}; }
+runtime_key!(GuardianDepositTreeKey, 17, "guardian_common::DepositTreeKey");
+runtime_key!(GuardianWithdrawalBurnKey, 56, "guardian_common::WithdrawalBurnKey");
+runtime_key!(GuardianNonce, 49, "guardian_common::NonceKey");
+runtime_key!(RelayerDepositTreeKey, 17, "psy_relayer_cli::DepositTreeKey");
+runtime_key!(RelayerWithdrawalBurnKey, 56, "psy_relayer_cli::WithdrawalBurnKey");
+runtime_key!(RelayerNonce, 49, "psy_relayer_cli::NonceKey");
 
 fn read(path: &Path) -> anyhow::Result<Vec<u8>> {
     fs::read(path).map_err(|_| anyhow::anyhow!("fixture/archive read failed (details redacted)"))
@@ -101,13 +129,16 @@ impl Journal {
         let txn = db.begin_read().map_err(|_| anyhow::anyhow!("database read failed (details redacted)"))?;
         let mut names = txn.list_tables().map_err(|_| anyhow::anyhow!("database tables unavailable"))?.map(|table| table.name().to_owned()).collect::<Vec<_>>();
         names.sort();
-        ensure!(names == ["guardian_account", "guardian_session", "guardian_signed", "guardian_signer"], "database table set mismatch");
+        ensure!(names == ["deposit_tree_states", "guardian_account", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"], "database table set mismatch");
         ensure!(txn.list_multimap_tables().map_err(|_| anyhow::anyhow!("database tables unavailable"))?.next().is_none(), "database contains a multimap table");
         let (account, signed, retained_sessions) = {
             let signer = txn.open_table(SIGNER).map_err(|_| anyhow::anyhow!("signer table unavailable"))?;
             let accounts = txn.open_table(ACCOUNT).map_err(|_| anyhow::anyhow!("account table unavailable"))?;
             let signed_table = txn.open_table(SIGNED).map_err(|_| anyhow::anyhow!("decision table unavailable"))?;
             let sessions = txn.open_table(SESSION).map_err(|_| anyhow::anyhow!("session table unavailable"))?;
+            drop(txn.open_table(GUARDIAN_DEPOSIT_TREE_STATES).map_err(|_| anyhow::anyhow!("deposit tree states table unavailable"))?);
+            drop(txn.open_table(GUARDIAN_INCLUDED_WITHDRAWAL_BURNS).map_err(|_| anyhow::anyhow!("withdrawal burn index unavailable"))?);
+            drop(txn.open_table(GUARDIAN_NONCE).map_err(|_| anyhow::anyhow!("nonce index unavailable"))?);
             ensure!(signer.len().map_err(|_| anyhow::anyhow!("signer count unavailable"))? == 1, "immutable signer missing");
             ensure!(signer.get(()).map_err(|_| anyhow::anyhow!("signer row unavailable"))?.is_some_and(|row| matches!(row.value()[0], 2 | 3)), "immutable signer missing");
             let account_bytes = accounts.get((network, USER)).map_err(|_| anyhow::anyhow!("account row unavailable"))?.map(|row| row.value().to_vec());
@@ -145,7 +176,7 @@ impl Journal {
 
 struct Flow {
     mapping: TokenMapping,
-    l1: ChainEndpoint,
+    l1: psy_config::ChainEndpoint,
     services_url: String,
     prove_proxy_url: String,
     router: String,
@@ -154,10 +185,11 @@ struct Flow {
 struct Fixture {
     root: PathBuf,
     manifest: Value,
-    config_path: PathBuf,
+    rpc_config: PathBuf,
+    guardian_root: PathBuf,
     config: GuardianConfig,
-    archive: AuthorizationArchive,
-    archive_dir: PathBuf,
+    authorization: std::sync::Arc<GuardianAuthorization>,
+    relayer_db: PathBuf,
     ready: Duration,
     session: Duration,
     flow: Flow,
@@ -178,13 +210,13 @@ impl Fixture {
         for removed in ["journal_database_files", "guardians", "guardian_listen_addresses", "relayer_history_listen_address", "relayer_guardian_config", "relayer_archive"] {
             ensure!(manifest.get(removed).is_none(), "obsolete manifest field present");
         }
-        let config_path = root.join(normal_relative(manifest["guardian_config"].as_str().context("guardian config missing")?)?);
-        protected(&config_path, false)?;
-        let bound = approved_endcap_max_proof_bytes().map_err(|_| anyhow::anyhow!("endcap proof bound unavailable"))?;
-        let config = GuardianConfig::load(&config_path).map_err(|_| anyhow::anyhow!("guardian config rejected"))?;
-        config.validate().map_err(|_| anyhow::anyhow!("guardian config rejected"))?;
-        let archive = load_authorization_archive(&config_path, bound).map_err(|_| anyhow::anyhow!("authorization archive rejected"))?;
-        let archive_dir = config_path.parent().context("config parent missing")?.join(&config.client.archive_path);
+        let rpc_config = root.join(normal_relative(manifest["relayer_rpc_config"].as_str().context("rpc config missing")?)?);
+        let guardian_root = root.join(normal_relative(manifest["guardian_root"].as_str().context("guardian root missing")?)?);
+        protected(&rpc_config, false)?;
+        protected(&guardian_root, true)?;
+        let config = GuardianConfig::load(&rpc_config, &guardian_root).map_err(|_| anyhow::anyhow!("guardian config rejected"))?;
+        let authorization = config.authorization.clone();
+        let relayer_db = config.guardian_root.join("db/relayer.redb");
         let mut ready = Duration::from_secs(120);
         let mut session = Duration::from_secs(600);
         for (key, limit) in [("service_ready_secs", &mut ready), ("session_secs", &mut session)] {
@@ -193,15 +225,14 @@ impl Fixture {
                 *limit = Duration::from_secs(seconds);
             }
         }
-        let mut fixture = Self { root, manifest, config_path, config, archive, archive_dir, ready, session, flow: Flow { mapping: TokenMapping { token: guardian_common::protocol::Hex([0; 20]), l2_contract_id: 0 }, l1: ChainEndpoint { chain_index: 0, rpc_url: String::new() }, services_url: String::new(), prove_proxy_url: String::new(), router: String::new() } };
-        protected(&fixture.archive_dir, true)?;
-        ensure!(fixture.manifest["network_magic"].as_u64() == Some(fixture.archive.active().0.network_magic), "manifest/archive network mismatch");
+        let mut fixture = Self { root, manifest, rpc_config, guardian_root, config, authorization, relayer_db, ready, session, flow: Flow { mapping: TokenMapping { token: guardian_common::protocol::Hex([0; 20]), l2_contract_id: 0 }, l1: psy_config::ChainEndpoint { chain_index: 0, rpc_url: String::new() }, services_url: String::new(), prove_proxy_url: String::new(), router: String::new() } };
+        ensure!(fixture.manifest["network_magic"].as_u64() == Some(fixture.config.network_magic()?), "manifest/network magic mismatch");
         ensure!(fixture.manifest["db_files"].as_array().is_some_and(|values| values.len() == 3), "fixture requires exactly three databases");
         let mut databases = Vec::new();
         for index in 0..3 {
             let path = fixture.database(index)?;
             if require_absent_journals {
-                ensure!(fs::symlink_metadata(&path).is_err(), "database path already exists; never replace retained evidence");
+                ensure!(fs::symlink_metadata(&path).is_err(), "database path already exists; never replace retained journal");
                 protected(path.parent().context("database parent missing")?, true)?;
             } else {
                 protected(&path, false)?;
@@ -220,12 +251,11 @@ impl Fixture {
             protected(&proof_output, false)?;
         }
         protected(proof_output.parent().context("deposit proof parent missing")?, true)?;
-        let external = PsyConfig::load(&fixture.path("relayer_rpc_config")?)?;
-        fixture.config.validate_rpc_network(&external).map_err(|_| anyhow::anyhow!("RPC projection mismatch"))?;
+        ensure!(fixture.rpc_config == fixture.path("relayer_rpc_config")?, "manifest rpc config mismatch");
         let daemon_bytes = read(&fixture.path("relayer_daemon_config")?)?;
         let daemon: toml::Value = toml::from_str(std::str::from_utf8(&daemon_bytes).map_err(|_| anyhow::anyhow!("daemon config not UTF-8"))?).map_err(|_| anyhow::anyhow!("invalid daemon TOML"))?;
-        ensure!(fixture.manifest_path(daemon["guardian_config"].as_str().context("daemon guardian config missing")?)? == fixture.config_path, "daemon/manifest guardian config mismatch");
-        ensure!(fixture.manifest_path(daemon["rpc_config"].as_str().context("daemon rpc config missing")?)? == fixture.path("relayer_rpc_config")?, "daemon/manifest rpc config mismatch");
+        ensure!(fixture.manifest_path(daemon["guardian_root"].as_str().context("daemon guardian root missing")?)? == fixture.guardian_root, "daemon/manifest guardian root mismatch");
+        ensure!(fixture.manifest_path(daemon["rpc_config"].as_str().context("daemon rpc config missing")?)? == fixture.rpc_config, "daemon/manifest rpc config mismatch");
         fixture.flow = fixture.select_flow()?;
         ensure!(fixture.claimant()? != USER, "claimant must not be the bridge user");
         ensure!(fixture.amount()? > 0, "amount must be positive");
@@ -239,13 +269,13 @@ impl Fixture {
     fn select_flow(&self) -> anyhow::Result<Flow> {
         let chain_index = u8::try_from(self.manifest["chain_index"].as_u64().context("chain index missing")?).map_err(|_| anyhow::anyhow!("chain index out of range"))?;
         let token = hex20(self.manifest["token"].as_str().context("token missing")?)?;
-        let authorization = &self.archive.active().0;
+        let authorization = self.authorization.as_ref();
         let chain = authorization.chain(chain_index).map_err(|_| anyhow::anyhow!("authorized chain missing"))?;
         let matches = chain.token_mappings.iter().filter(|mapping| mapping.token == token).collect::<Vec<_>>();
         ensure!(matches.len() == 1, "authorized token mapping is not unique");
         let services = self.config.network.api_services_url.as_ref().and_then(|urls| urls.iter().find(|url| !url.is_empty())).context("services URL missing")?;
         let prove = self.config.network.system_prove_proxy_url.iter().find(|url| !url.is_empty()).context("system prove proxy missing")?;
-        let l1 = self.config.client.l1_endpoints.iter().find(|endpoint| endpoint.chain_index == chain_index).context("L1 endpoint missing")?;
+        let l1 = self.config.network.l1_endpoints.iter().find(|endpoint| endpoint.chain_index == chain_index).context("L1 endpoint missing")?;
         ensure!(self.manifest["router_address"].as_str().is_some_and(|value| !value.is_empty()), "router missing");
         Ok(Flow { mapping: matches[0].clone(), l1: l1.clone(), services_url: services.clone(), prove_proxy_url: prove.clone(), router: self.manifest["router_address"].as_str().unwrap().to_string() })
     }
@@ -259,11 +289,27 @@ impl Fixture {
     }
     fn path(&self, key: &str) -> anyhow::Result<PathBuf> { self.located(&self.manifest[key]) }
     fn database(&self, index: usize) -> anyhow::Result<PathBuf> {
-        let (_, relative) = guardian_common::runtime::resolve_operator_db_path(&self.config_path, Path::new(self.manifest["db_files"][index].as_str().context("database path missing")?)).map_err(|_| anyhow::anyhow!("database path rejected"))?;
-        Ok(PathBuf::from("/").join(relative))
+        ensure!((0..3).contains(&index), "guardian database index must be 0..3");
+        Ok(self.guardian_root.join("db").join(format!("guardian-{}.redb", index + 1)))
     }
-    fn nonce(&self, nonce: u64, file: &str) -> PathBuf { self.archive_dir.join(nonce.to_string()).join(file) }
-    fn network(&self) -> u64 { self.archive.active().0.network_magic }
+    fn stage(&self, nonce: u64) -> anyhow::Result<Option<Value>> {
+        protected(&self.relayer_db, false)?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(&self.relayer_db).map_err(|_| anyhow::anyhow!("relayer database open failed"))?;
+        let db = Database::builder().create_file(file).map_err(|_| anyhow::anyhow!("relayer database open failed"))?;
+        let tx = db.begin_read().map_err(|_| anyhow::anyhow!("relayer database read failed"))?;
+        let mut names = tx.list_tables().map_err(|_| anyhow::anyhow!("relayer tables unavailable"))?.map(|table| table.name().to_owned()).collect::<Vec<_>>();
+        names.sort();
+        ensure!(names == ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "relayer_request"], "relayer database table set mismatch");
+        drop(tx.open_table(TableDefinition::<(u64, u64), &[u8]>::new("guardian_account")).map_err(|_| anyhow::anyhow!("relayer account unavailable"))?);
+        drop(tx.open_table(TableDefinition::<u8, &[u8]>::new("chain_claims")).map_err(|_| anyhow::anyhow!("chain claims table unavailable"))?);
+        drop(tx.open_table(TableDefinition::<(), &[u8]>::new("finalization_batch")).map_err(|_| anyhow::anyhow!("finalization batch table unavailable"))?);
+        drop(tx.open_table(TableDefinition::<RelayerDepositTreeKey, &[u8]>::new("deposit_tree_states")).map_err(|_| anyhow::anyhow!("relayer deposit tree states unavailable"))?);
+        drop(tx.open_table(TableDefinition::<RelayerWithdrawalBurnKey, u64>::new("included_withdrawal_burns")).map_err(|_| anyhow::anyhow!("relayer withdrawal burn index unavailable"))?);
+        drop(tx.open_table(TableDefinition::<RelayerNonce, u64>::new("guardian_withdrawal_nonce")).map_err(|_| anyhow::anyhow!("relayer nonce unavailable"))?);
+        let table = tx.open_table(TableDefinition::<u64, &[u8]>::new("relayer_request")).map_err(|_| anyhow::anyhow!("relayer request table unavailable"))?;
+        Ok(table.get(nonce).map_err(|_| anyhow::anyhow!("relayer request row unavailable"))?.map(|row| serde_json::from_slice(row.value())).transpose().map_err(|_| anyhow::anyhow!("relayer request row rejected"))?)
+    }
+    fn network(&self) -> u64 { self.config.network_magic().unwrap_or(0) }
     fn text(&self, key: &str) -> anyhow::Result<String> { self.manifest[key].as_str().context("missing manifest text").map(str::to_string) }
     fn claimant(&self) -> anyhow::Result<u64> { self.manifest["claimant_user_id"].as_u64().context("claimant missing") }
     fn amount(&self) -> anyhow::Result<u64> { self.manifest["amount"].as_u64().context("amount missing") }
@@ -281,7 +327,7 @@ impl Fixture {
 
     fn guardian(&self, index: usize) -> anyhow::Result<Command> {
         let mut command = self.command();
-        command.arg("guardian-service").arg("--config").arg(&self.config_path).arg("--guardian-id").arg((index + 1).to_string()).arg("--db-path").arg(self.database(index)?);
+        command.arg("guardian-service").arg("--rpc-config").arg(&self.rpc_config).arg("--guardian-root").arg(&self.guardian_root).arg("--guardian-id").arg((index + 1).to_string());
         Ok(command)
     }
 
@@ -300,26 +346,22 @@ impl Fixture {
         ensure!(members.iter().all(|member| guardian_common::protocol::validate_hash(*member).is_ok()), "replacement member is not canonical");
         let serialized = serde_json::to_string(&members).map_err(|_| anyhow::anyhow!("replacement members rejected"))?;
         let mut command = self.command();
-        command.arg("guardian-policy").arg("--rpc-config").arg(self.path("relayer_rpc_config")?).arg("--guardian-config").arg(&self.config_path).arg("--intent").arg("replace").arg("--next-members-json").arg(serialized);
+        command.arg("guardian-policy").arg("--rpc-config").arg(&self.rpc_config).arg("--guardian-root").arg(&self.guardian_root).arg("--intent").arg("replace").arg("--next-members-json").arg(serialized);
         Ok(command)
     }
 
     fn listeners(&self) -> anyhow::Result<Vec<SocketAddr>> {
-        let mut addresses = self.config.guardians.values().map(|signer| signer.listen_address).collect::<Vec<_>>();
-        addresses.push(self.config.client.listen_address);
-        ensure!(addresses.iter().all(|address| address.ip().is_loopback() && address.port() != 0), "listener must be numeric loopback");
+        let mut signers = self.config.network.guardian_configs.clone();
+        signers.sort_by_key(|signer| signer.id);
+        let mut addresses = signers.into_iter().map(|signer| signer.listen_address).collect::<Vec<_>>();
+        addresses.push(self.config.network.guardian_history.as_ref().context("guardian history missing")?.listen_address);
+        ensure!(addresses.len() == 4 && addresses.iter().all(|address| address.ip().is_loopback() && address.port() != 0), "listener must be numeric loopback");
         ensure!(addresses.windows(2).all(|pair| pair[0] != pair[1]) && addresses[0] != addresses[2], "listeners must be distinct");
         Ok(addresses)
     }
 }
 
-struct PsyConfig;
-impl PsyConfig {
-    fn load(path: &Path) -> anyhow::Result<psy_config::NetworkConfigGoldilocks> {
-        let settings = psy_config::PsyConfigGoldilocks::builder().path(path.to_str().context("RPC path not UTF-8")?).network(psy_config::CURRENT_NETWORK).build().map_err(|_| anyhow::anyhow!("external RPC config rejected"))?;
-        Ok(settings.get_current_network().map_err(|_| anyhow::anyhow!("external RPC stage rejected"))?.clone())
-    }
-}
+
 
 
 fn hex20(value: &str) -> anyhow::Result<guardian_common::protocol::Hex<20>> {
@@ -386,20 +428,22 @@ impl Children {
     }
 }
 
-struct PendingLink(PathBuf);
-impl Drop for PendingLink { fn drop(&mut self) { let _ = fs::remove_file(&self.0); } }
 
-struct Sessions { http: reqwest::Client, origins: [url::Url; 3] }
+struct Sessions { http: reqwest::Client, origins: [url::Url; 3], history: url::Url }
 impl Sessions {
     fn load(fixture: &Fixture) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(30)).build().map_err(|_| anyhow::anyhow!("session client unavailable"))?;
         let mut origins = Vec::new();
-        for value in &fixture.config.client.endpoints {
+        for value in &fixture.config.endpoints {
             let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("client endpoint invalid"))?;
             ensure!(url.scheme() == "http" && url.host().is_some() && url.username().is_empty() && url.password().is_none() && (url.path() == "/" || url.path().is_empty()) && url.query().is_none() && url.fragment().is_none(), "guardian endpoint must be a fixed HTTP origin");
             origins.push(url);
         }
-        Ok(Self { http, origins: origins.try_into().map_err(|_| anyhow::anyhow!("three guardian endpoints required"))? })
+        let origins: [url::Url; 3] = origins.try_into().map_err(|_| anyhow::anyhow!("three guardian endpoints required"))?;
+        let history = url::Url::parse(&fixture.config.history_url).map_err(|_| anyhow::anyhow!("history endpoint invalid"))?;
+        ensure!(history.scheme() == "http" && history.host().is_some() && history.username().is_empty() && history.password().is_none() && (history.path() == "/" || history.path().is_empty()) && history.query().is_none() && history.fragment().is_none(), "relayer history must be a fixed HTTP origin");
+        ensure!(origins.iter().all(|origin| origin != &history), "relayer history must not reuse a guardian origin");
+        Ok(Self { http, origins, history })
     }
 
     async fn body(&self, response: Result<reqwest::Response, reqwest::Error>) -> anyhow::Result<Option<Vec<u8>>> {
@@ -418,30 +462,40 @@ impl Sessions {
         Ok(self.body(response).await?.and_then(|bytes| parse_canonical_json(&bytes).ok()))
     }
 
-    async fn durable_signature(&self, children: &mut Children, daemon: usize, index: usize, fixture: &Fixture, nonce: u64) -> anyhow::Result<GuardianSignResponse> {
+    async fn durable_signature(&self, children: &mut Children, mut daemon: usize, index: usize, fixture: &Fixture, nonce: u64) -> anyhow::Result<(usize, GuardianSignResponse)> {
         let deadline = Instant::now() + fixture.session;
-        let request_path = fixture.nonce(nonce, "request.json");
+        let history = fixture.listeners()?[3];
         loop {
             children.alive(daemon)?;
-            if request_path.is_file() { break; }
-            ensure!(Instant::now() < deadline, "durable signature timed out");
-            sleep(Duration::from_secs(1)).await;
-        }
-        loop {
-            children.alive(daemon)?;
-            let request = read(&request_path)?;
-            ensure!(request.len() <= MAX_BODY_BYTES, "archived request exceeds transport bound");
+            children.stop(daemon).await?;
+            let Some(stage) = fixture.stage(nonce)? else {
+                daemon = children.start(fixture.daemon()?)?;
+                children.ready(daemon, history, fixture.ready).await?;
+                ensure!(Instant::now() < deadline, "durable signature timed out");
+                continue;
+            };
+            let request = stage.get("Request").or_else(|| stage.get("Signed")).or_else(|| stage.get("Proved")).context("archived request missing")?["request"].as_str().context("archived request missing")?.as_bytes().to_vec();
+            daemon = children.start(fixture.daemon()?)?;
+            children.ready(daemon, history, fixture.ready).await?;
             if let Some(response) = self.post_signature(index, &request).await? {
                 let parsed = GuardianSignRequest::parse(&request).map_err(|_| anyhow::anyhow!("archived request rejected"))?;
-                if response.validate_context(&parsed).is_ok() && response.session_nonce == nonce && response.signature.0.iter().any(|byte| *byte != 0) { return Ok(response); }
+                if response.validate_context(&parsed).is_ok() && response.session_nonce == nonce && response.signature.0.iter().any(|byte| *byte != 0) && self.included(nonce).await?.is_none() { return Ok((daemon, response)); }
             }
             ensure!(Instant::now() < deadline, "durable signature timed out");
             sleep(Duration::from_secs(1)).await;
         }
     }
 
+    async fn included(&self, nonce: u64) -> anyhow::Result<Option<guardian_common::protocol::GuardianSessionRecord>> {
+        self.page(&self.history, nonce).await
+    }
+
     async fn session(&self, index: usize, nonce: u64) -> anyhow::Result<Option<guardian_common::protocol::GuardianSessionRecord>> {
-        let mut url = self.origins[index].clone();
+        self.page(&self.origins[index], nonce).await
+    }
+
+    async fn page(&self, origin: &url::Url, nonce: u64) -> anyhow::Result<Option<guardian_common::protocol::GuardianSessionRecord>> {
+        let mut url = origin.clone();
         url.set_path("/v1/sessions");
         url.query_pairs_mut().append_pair("after_nonce", &(nonce - 1).to_string()).append_pair("limit", "1");
         let Some(body) = self.body(self.http.get(url).send().await).await? else { return Ok(None); };
@@ -461,31 +515,28 @@ impl Sessions {
     }
 }
 
-async fn wait_receipt(children: &mut Children, child: usize, fixture: &Fixture, nonce: u64) -> anyhow::Result<()> {
-    let deadline = Instant::now() + fixture.session;
+async fn wait_receipt(children: &mut Children, child: usize, sessions: &Sessions, bound: Duration, nonce: u64) -> anyhow::Result<guardian_common::protocol::GuardianSessionRecord> {
+    let deadline = Instant::now() + bound;
     loop {
         children.alive(child)?;
-        if fixture.nonce(nonce, "included.json").is_file() && !fixture.archive_dir.join("pending.json").exists() { return Ok(()); }
+        if let Some(record) = sessions.included(nonce).await? { return Ok(record); }
         ensure!(Instant::now() < deadline, "canonical relayer inclusion timed out");
         sleep(Duration::from_millis(100)).await;
     }
 }
 
-async fn verify_inclusion(provider: &RpcProvider, fixture: &Fixture, nonce: u64, operation: GuardianOperation) -> anyhow::Result<Value> {
-    let envelope = json_value(&read(&fixture.nonce(nonce, "included.json"))?)?;
-    let request_bytes = read(&fixture.nonce(nonce, "request.json"))?;
-    let signature_bytes = read(&fixture.nonce(nonce, "signatures.json"))?;
-    ensure!(envelope["request_json"].as_str().map(str::as_bytes) == Some(request_bytes.as_slice()), "receipt changed exact archived request");
-    ensure!(envelope["signatures_json"].as_str().map(str::as_bytes) == Some(signature_bytes.as_slice()), "receipt changed exact archived signatures");
-    let proof = read(&fixture.nonce(nonce, "endcap.bin"))?;
-    ensure!(!proof.is_empty() && envelope["endcap_proof_hex"] == format!("0x{}", hex::encode(&proof)), "receipt proof mismatch");
-    let request = GuardianSignRequest::parse(&request_bytes).map_err(|_| anyhow::anyhow!("included request rejected"))?;
+async fn verify_inclusion(provider: &RpcProvider, record: &guardian_common::protocol::GuardianSessionRecord, fixture: &Fixture, nonce: u64, operation: GuardianOperation) -> anyhow::Result<Value> {
+    let request_bytes = record.request_json.as_str().as_bytes();
+    let signature_bytes = record.signatures_json.as_str().as_bytes();
+    let proof = hex::decode(record.endcap_proof_hex.trim_start_matches("0x")).map_err(|_| anyhow::anyhow!("included proof rejected"))?;
+    ensure!(!proof.is_empty(), "receipt proof is empty");
+    let request = record.request_json.decode().map_err(|_| anyhow::anyhow!("included request rejected"))?;
     ensure!(request.session_nonce == nonce && request.user_id == USER && request.network_magic == fixture.network() && request.operation == operation, "included request context mismatch");
-    let signatures = json_value(&signature_bytes)?;
+    let signatures = json_value(signature_bytes)?;
     let indices = signatures["member_indices"].as_array().context("missing signature indices")?;
     ensure!(indices.len() == 2 && indices[0].as_u64() < indices[1].as_u64() && indices[1].as_u64().is_some_and(|value| value < 3), "not a distinct two-member quorum");
-    let checkpoint = envelope["included_checkpoint_id"].as_u64().context("missing included checkpoint")?;
-    let input = json_value(envelope["endcap_input_json"].as_str().context("missing EndCap input")?.as_bytes())?;
+    let checkpoint = record.included_checkpoint_id;
+    let input = json_value(record.endcap_input_json.as_str().as_bytes())?;
     let expected_leaf: psy_client_data::qdata::user::PsyUserLeaf<GoldilocksField> = serde_json::from_value(input["core"]["new_user_leaf"].clone()).map_err(|_| anyhow::anyhow!("invalid included user leaf"))?;
     let leaf = provider.get_user_leaf_data(checkpoint, USER).await.map_err(|_| anyhow::anyhow!("included user leaf unavailable"))?;
     ensure!(leaf.nonce.to_canonical_u64() == nonce && leaf.qfhash::<PsyHasher>() == expected_leaf.qfhash::<PsyHasher>(), "canonical account transition differs from EndCap");
@@ -496,9 +547,8 @@ async fn verify_inclusion(provider: &RpcProvider, fixture: &Fixture, nonce: u64,
     let checkpoint_path = provider.get_checkpoint_tree_merkle_proof(checkpoint, checkpoint).await.map_err(|_| anyhow::anyhow!("checkpoint path unavailable"))?;
     let root = provider.get_checkpoint_tree_root(checkpoint).await.map_err(|_| anyhow::anyhow!("checkpoint root unavailable"))?;
     ensure!(path.root == roots.user_tree_root && roots.qfhash::<PsyHasher>() == checkpoint_leaf.global_chain_root && checkpoint_path.index == checkpoint && checkpoint_path.value == checkpoint_leaf.qfhash::<PsyHasher>() && checkpoint_path.root == root && checkpoint_path.verify::<PsyHasher>(), "account inclusion not bound to canonical checkpoint");
-    let receipt_hash: QHashOut<GoldilocksField> = serde_json::from_value(envelope["included_checkpoint_hash"].clone()).map_err(|_| anyhow::anyhow!("invalid receipt checkpoint hash"))?;
-    ensure!(receipt_hash == checkpoint_path.value, "receipt names another checkpoint");
-    Ok(json_value(&request_bytes)?)
+    ensure!(record.included_checkpoint_hash == checkpoint_path.value, "receipt names another checkpoint");
+    Ok(json_value(request_bytes)?)
 }
 
 async fn contract_root(provider: &RpcProvider, fixture: &Fixture, checkpoint: u64, user: u64, contract: u32) -> anyhow::Result<(guardian_common::protocol::Hash4, u8)> {
@@ -512,7 +562,7 @@ async fn contract_root(provider: &RpcProvider, fixture: &Fixture, checkpoint: u6
     ensure!(user_path.root == roots.user_tree_root && roots.qfhash::<PsyHasher>() == checkpoint_leaf.global_chain_root && checkpoint_path.index == checkpoint && checkpoint_path.value == checkpoint_leaf.qfhash::<PsyHasher>() && checkpoint_path.root == root && checkpoint_path.verify::<PsyHasher>(), "token account not bound to canonical checkpoint");
     let contract_path = provider.get_user_contract_tree_merkle_proof(checkpoint, user, contract).await.map_err(|_| anyhow::anyhow!("token contract path unavailable"))?;
     ensure!(contract_path.index == u64::from(contract) && contract_path.root == account.user_state_tree_root && contract_path.verify::<PsyHasher>(), "token contract not bound to account");
-    let approved = fixture.archive.active().0.approved_contracts.iter().find(|item| item.contract_id == contract).context("approved token contract missing")?;
+    let approved = fixture.authorization.approved_contracts.iter().find(|item| item.contract_id == contract).context("approved token contract missing")?;
     let leaf = approved.contract_leaf_json.decode().map_err(|_| anyhow::anyhow!("approved token leaf rejected"))?;
     let height = u8::try_from(leaf.state_tree_height.to_canonical_u64()).map_err(|_| anyhow::anyhow!("token contract height invalid"))?;
     let global_contract = provider.get_contract_tree_merkle_proof(checkpoint, contract).await.map_err(|_| anyhow::anyhow!("global contract path unavailable"))?;
@@ -591,7 +641,7 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     let provider = RpcProvider::new_with_config_path(fixture.path("relayer_rpc_config")?.to_str().context("RPC path not UTF-8")?).map_err(|_| anyhow::anyhow!("fixture RPC configuration invalid"))?;
     let latest = provider.get_coordinator_latest_block_state().await.map_err(|_| anyhow::anyhow!("latest checkpoint unavailable"))?.checkpoint_id;
     let bridge_leaf = provider.get_user_leaf_data(latest, USER).await.map_err(|_| anyhow::anyhow!("initial bridge account unavailable"))?;
-    ensure!(bridge_leaf.nonce.to_canonical_u64() == 0 && !fixture.archive_dir.join("pending.json").exists() && !fixture.archive_dir.join("1").exists(), "acceptance requires a pristine bridge account/session archive");
+    ensure!(bridge_leaf.nonce.to_canonical_u64() == 0 && fixture.stage(1)?.is_none(), "acceptance requires a pristine bridge account/session database");
     let baseline_chain_count = state_subslots(&provider, fixture, latest, USER, 3, 65544 + u64::from(fixture.flow.l1.chain_index), 1).await?[0];
     let baseline_global_count = state_subslots(&provider, fixture, latest, USER, 3, 65800, 1).await?[0];
     let expected = expected_burn(fixture)?;
@@ -616,41 +666,38 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     let deposit = start_user_operation(fixture, children, "deposit")?;
     let daemon = children.start(fixture.daemon()?)?;
     children.ready(daemon, addresses[3], fixture.ready).await?;
-    let response = sessions.durable_signature(children, daemon, 0, fixture, 1).await?;
+    let (daemon, response) = sessions.durable_signature(children, daemon, 0, fixture, 1).await?;
     children.stop(daemon).await?;
     children.stop(guardians[0]).await?;
-    ensure!(!fixture.nonce(1, "signatures.json").exists() && !fixture.nonce(1, "included.json").exists(), "one guardian unexpectedly obtained quorum");
-    let request = read(&fixture.nonce(1, "request.json"))?;
-    ensure!(read(&fixture.archive_dir.join("pending.json"))? == request, "pending differs from original request");
+    let stage = fixture.stage(1)?.context("archived request missing")?;
+    ensure!(stage.get("Included").is_none(), "one guardian unexpectedly included the request");
+    let request = stage.get("Request").or_else(|| stage.get("Signed")).or_else(|| stage.get("Proved")).context("archived request missing")?["request"].as_str().context("archived request missing")?.as_bytes().to_vec();
     let original = Journal::read(&databases[0], fixture.network(), &[1])?;
     let decisions = original.signed(1)?;
     ensure!(decisions.len() == 1 && decisions[0].request_bytes == GuardianSignRequest::parse(&request).map_err(|_| anyhow::anyhow!("archived request rejected"))?.canonical_bytes().map_err(|_| anyhow::anyhow!("archived request rejected"))? && decisions[0].signature == Some(response.signature.0), "durable decision differs from archived request and signing response");
     let original_decision = (decisions[0].request_bytes.clone(), decisions[0].signature);
     drop(original);
-    let link_path = fixture.archive_dir.join("acceptance-original-pending.json");
-    fs::hard_link(fixture.archive_dir.join("pending.json"), &link_path).map_err(|_| anyhow::anyhow!("cannot retain original pending inode"))?;
-    let pending = PendingLink(link_path);
+    let retained = request.clone();
     guardians[0] = children.start(fixture.guardian(0)?)?;
     children.ready(guardians[0], addresses[0], fixture.ready).await?;
     guardians[1] = children.start(fixture.guardian(1)?)?;
     children.ready(guardians[1], addresses[1], fixture.ready).await?;
     let daemon = children.start(fixture.daemon()?)?;
     children.ready(daemon, addresses[3], fixture.ready).await?;
-    wait_receipt(children, daemon, fixture, 1).await?;
+    let receipt = wait_receipt(children, daemon, &sessions, fixture.session, 1).await?;
     children.stop(daemon).await?;
-    let bridge = verify_inclusion(&provider, fixture, 1, GuardianOperation::Bridge).await?;
+    let bridge = verify_inclusion(&provider, &receipt, fixture, 1, GuardianOperation::Bridge).await?;
     ensure!(bridge["deposit_anchors"].as_array().is_some_and(|anchors| !anchors.is_empty()), "nonce 1 has no deposit anchor");
     let session1_records: Vec<guardian_common::protocol::WithdrawalBurnRecord> = serde_json::from_value(bridge["withdrawal_records"].clone()).map_err(|_| anyhow::anyhow!("first-session burn records rejected"))?;
     ensure!(!session1_records.contains(&expected), "manifest withdrawal predates the claimant withdraw step");
-    let signatures = read(&fixture.nonce(1, "signatures.json"))?;
-    let proof = read(&fixture.nonce(1, "endcap.bin"))?;
-    fs::hard_link(&pending.0, fixture.archive_dir.join("pending.json")).map_err(|_| anyhow::anyhow!("cannot restore original pending marker"))?;
-    fs::remove_file(fixture.nonce(1, "included.json")).map_err(|_| anyhow::anyhow!("cannot remove own inclusion receipt"))?;
+    let signatures = receipt.signatures_json.as_str().as_bytes().to_vec();
+    let proof = receipt.endcap_proof_hex.as_bytes().to_vec();
     let daemon = children.start(fixture.daemon()?)?;
     children.ready(daemon, addresses[3], fixture.ready).await?;
-    wait_receipt(children, daemon, fixture, 1).await?;
-    ensure!(read(&fixture.nonce(1, "request.json"))? == request && read(&fixture.nonce(1, "signatures.json"))? == signatures && read(&fixture.nonce(1, "endcap.bin"))? == proof, "crash recovery changed archived request/signatures/proof");
-    verify_inclusion(&provider, fixture, 1, GuardianOperation::Bridge).await?;
+    let recovered_receipt = wait_receipt(children, daemon, &sessions, fixture.session, 1).await?;
+    children.stop(daemon).await?;
+    ensure!(recovered_receipt.request_json.as_str().as_bytes() == retained.as_slice() && recovered_receipt.signatures_json.as_str().as_bytes() == signatures.as_slice() && recovered_receipt.endcap_proof_hex.as_bytes() == proof.as_slice(), "crash recovery changed archived request/signatures/proof");
+    verify_inclusion(&provider, &recovered_receipt, fixture, 1, GuardianOperation::Bridge).await?;
     sessions.wait_session(children, guardians[0], 0, fixture, 1).await?;
     sessions.wait_session(children, guardians[1], 1, fixture, 1).await?;
     children.stop(guardians[0]).await?;
@@ -704,9 +751,9 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     children.ready(guardians[2], addresses[2], fixture.ready).await?;
     let burn_daemon = children.start(fixture.daemon()?)?;
     children.ready(burn_daemon, addresses[3], fixture.ready).await?;
-    let burn_nonce = next_archive_nonce(fixture, 1).await?;
-    wait_receipt(children, burn_daemon, fixture, burn_nonce).await?;
-    let burn = verify_inclusion(&provider, fixture, burn_nonce, GuardianOperation::Bridge).await?;
+    let burn_receipt = wait_receipt(children, burn_daemon, &sessions, fixture.session, 2).await?;
+    let burn_nonce = burn_receipt.request_json.decode().map_err(|_| anyhow::anyhow!("burn request rejected"))?.session_nonce;
+    let burn = verify_inclusion(&provider, &burn_receipt, fixture, burn_nonce, GuardianOperation::Bridge).await?;
     let records = burn["withdrawal_records"].as_array().context("burn records missing")?;
     ensure!(records.len() == 1 && burn_matches(&records[0], &expected)?, "burn session does not contain the exact manifest withdrawal");
     verify_token_burn(&provider, fixture, withdrawn_checkpoint, &expected).await?;
@@ -715,7 +762,7 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
         sessions.wait_session(children, guardians[index], index, fixture, burn_nonce).await?;
         children.stop(guardians[index]).await?;
         let journal = Journal::read(&databases[index], fixture.network(), &[burn_nonce])?;
-        let session = require_imported(&journal, burn_nonce, &read(&fixture.nonce(burn_nonce, "request.json"))?, &read(&fixture.nonce(burn_nonce, "signatures.json"))?)?;
+        let session = require_imported(&journal, burn_nonce, burn_receipt.request_json.as_str().as_bytes(), burn_receipt.signatures_json.as_str().as_bytes())?;
         ensure!(session.withdrawal_appends.len() == 1 && session.withdrawal_appends[0].burn == expected, "authenticated burn append differs");
         verify_withdrawal_append(&provider, fixture, &session).await?;
         observed.push(session.withdrawal_appends);
@@ -730,7 +777,7 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     children.stop(guardians[1]).await?;
     let imported_burn = Journal::read(&databases[1], fixture.network(), &[burn_nonce])?;
     ensure!(imported_burn.signed(burn_nonce)?.is_empty(), "offline burn import fabricated a decision");
-    let imported_session = require_imported(&imported_burn, burn_nonce, &read(&fixture.nonce(burn_nonce, "request.json"))?, &read(&fixture.nonce(burn_nonce, "signatures.json"))?)?;
+    let imported_session = require_imported(&imported_burn, burn_nonce, burn_receipt.request_json.as_str().as_bytes(), burn_receipt.signatures_json.as_str().as_bytes())?;
     ensure!(imported_session.withdrawal_appends == observed[0], "offline burn import changed the append");
     drop(imported_burn);
     guardians[0] = children.start(fixture.guardian(0)?)?;
@@ -749,17 +796,18 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     let members = replacement_members(fixture)?;
     let rotation = children.start(fixture.policy()?)?;
     children.success(rotation, fixture.session).await?;
-    let policy_nonce = next_archive_nonce(fixture, burn_nonce).await?;
-    verify_inclusion(&provider, fixture, policy_nonce, GuardianOperation::ReplacePolicy).await?;
-    let policy_receipt = json_value(&read(&fixture.nonce(policy_nonce, "included.json"))?)?;
-    let policy_checkpoint = policy_receipt["included_checkpoint_id"].as_u64().context("policy checkpoint missing")?;
-    let slots = state_subslots(&provider, fixture, policy_checkpoint, USER, 6, 0, 16).await?;
+    let policy_stage = fixture.stage(burn_nonce + 1)?.context("included policy row missing")?;
+    let policy_receipt: guardian_common::protocol::GuardianSessionRecord = serde_json::from_value(policy_stage.get("Included").context("policy row is not Included")?["record"].clone()).map_err(|_| anyhow::anyhow!("included policy record rejected"))?;
+    let policy_nonce = policy_receipt.request_json.decode().map_err(|_| anyhow::anyhow!("policy request rejected"))?.session_nonce;
+    verify_inclusion(&provider, &policy_receipt, fixture, policy_nonce, GuardianOperation::ReplacePolicy).await?;
+    let policy_checkpoint = policy_receipt.included_checkpoint_id;
+    let slots = state_subslots(&provider, fixture, policy_checkpoint, USER, psy_vm::ups::multisig::MULTISIG_POLICY_CONTRACT_ID, 0, 16).await?;
     let hashes: Vec<guardian_common::protocol::Hash4> = slots.chunks_exact(4).map(|fields| {
         let fields: [u64; 4] = fields.try_into().unwrap();
         guardian_common::protocol::Hash4::try_from(&fields).map_err(|_| anyhow::anyhow!("policy slot rejected"))
     }).collect::<anyhow::Result<_>>()?;
     let ending = psy_vm::ups::multisig::StoredMultisigPolicy { header: hashes[0], members: [hashes[1], hashes[2], hashes[3]] }.policy()?;
-    let initial = fixture.archive.active().0.account_json.decode().map_err(|_| anyhow::anyhow!("account rejected"))?.initial_policy;
+    let initial = fixture.authorization.bridge_relayer_signing_policy.decode().map_err(|_| anyhow::anyhow!("account rejected"))?.initial_policy;
     ensure!(ending == members && ending.member_hashes != initial.member_hashes, "committed replacement policy differs or is unchanged");
     let stopped_b = Journal::read(&databases[1], fixture.network(), &[policy_nonce])?;
     ensure!(stopped_b.signed(policy_nonce)?.is_empty(), "offline B signed rotation");
@@ -790,16 +838,7 @@ async fn claimant_checkpoint(provider: &RpcProvider, fixture: &Fixture, operatio
     }
 }
 
-async fn next_archive_nonce(fixture: &Fixture, previous: u64) -> anyhow::Result<u64> {
-    let deadline = Instant::now() + fixture.session;
-    loop {
-        let mut nonce = previous + 1;
-        while fixture.nonce(nonce, "included.json").is_file() { nonce += 1; }
-        if nonce > previous + 1 { return Ok(nonce - 1); }
-        ensure!(Instant::now() < deadline, "next archive nonce unavailable");
-        sleep(Duration::from_millis(200)).await;
-    }
-}
+
 
 fn expected_burn(fixture: &Fixture) -> anyhow::Result<guardian_common::protocol::WithdrawalBurnRecord> {
     Ok(guardian_common::protocol::WithdrawalBurnRecord {
@@ -823,7 +862,7 @@ async fn verify_deposit_event(fixture: &Fixture, tx_hash: &str) -> anyhow::Resul
     let response = reqwest::Client::new().post(&fixture.flow.l1.rpc_url).json(&body).send().await.map_err(|_| anyhow::anyhow!("deposit receipt unavailable"))?;
     let receipt: Value = response.json().await.map_err(|_| anyhow::anyhow!("deposit receipt rejected"))?;
     ensure!(receipt["result"]["status"] == "0x1" && receipt["result"]["transactionHash"].as_str().is_some_and(|hash| hash.eq_ignore_ascii_case(tx_hash)), "deposit receipt identity/status differs");
-    let chain = fixture.archive.active().0.chain(fixture.flow.l1.chain_index).map_err(|_| anyhow::anyhow!("authorized chain missing"))?;
+    let chain = fixture.authorization.chain(fixture.flow.l1.chain_index).map_err(|_| anyhow::anyhow!("authorized chain missing"))?;
     let logs: Vec<alloy_rpc_types_eth::Log> = serde_json::from_value(receipt["result"]["logs"].clone()).map_err(|_| anyhow::anyhow!("deposit logs rejected"))?;
     let mut found = None;
     for log in logs {
@@ -858,15 +897,10 @@ fn withdrawal_leaf(record: &guardian_common::protocol::WithdrawalBurnRecord) -> 
 }
 
 async fn verify_token_burn(provider: &RpcProvider, fixture: &Fixture, checkpoint: u64, record: &guardian_common::protocol::WithdrawalBurnRecord) -> anyhow::Result<()> {
-    let approved = fixture.archive.active().0.approved_contracts.iter().find(|item| item.contract_id == record.token_contract_id).context("approved burn contract missing")?;
-    let artifact = approved.compiler_artifact().map_err(|_| anyhow::anyhow!("approved token ABI rejected"))?;
-    let fields = artifact.abi.pointer("/contract/state").and_then(Value::as_array).context("token state ABI missing")?;
-    let maps = fields.iter().filter(|field| field["name"] == "state_map").collect::<Vec<_>>();
-    ensure!(maps.len() == 1, "token state_map is not unique");
-    let base = maps[0]["offset"].as_u64().context("token map offset missing")?;
-    let capacity = maps[0]["type"]["capacity"].as_u64().context("token map capacity missing")?;
-    ensure!(base % 4 == 0 && capacity > 0 && maps[0]["type"]["map_kind"] == "map" && maps[0]["type"]["value_felt_size"] == 4, "token map layout differs");
-    let input = psy_provider::request::QIMTMembershipProofRPCRequest { checkpoint_id: checkpoint, user_id: u64::from(record.sender_user_id), contract_id: record.token_contract_id, key: withdrawal_key(record), state_slot_base: base / 4, capacity };
+    let approved = fixture.authorization.approved_contracts.iter().find(|item| item.contract_id == record.token_contract_id).context("approved burn contract missing")?;
+    let layout = approved.withdrawal_layout.context("approved withdrawal layout missing")?;
+    ensure!(layout.capacity > 0 && layout.subslot_base % 4 == 0, "token map layout differs");
+    let input = psy_provider::request::QIMTMembershipProofRPCRequest { checkpoint_id: checkpoint, user_id: u64::from(record.sender_user_id), contract_id: record.token_contract_id, key: withdrawal_key(record), state_slot_base: layout.subslot_base / 4, capacity: layout.capacity };
     let proof = provider.get_withdrawal_burn_proof(input.clone()).await.map_err(|_| anyhow::anyhow!("withdrawal burn proof unavailable"))?;
     let (root, height) = contract_root(provider, fixture, checkpoint, u64::from(record.sender_user_id), record.token_contract_id).await?;
     let membership = &proof.record_membership;
@@ -970,7 +1004,7 @@ async fn wait_indexed_claim(fixture: &Fixture, provider: &RpcProvider) -> anyhow
 }
 
 async fn l1_view<Call: SolCall>(fixture: &Fixture, call: Call) -> anyhow::Result<Call::Return> {
-    let chain = fixture.archive.active().0.chain(fixture.flow.l1.chain_index).map_err(|_| anyhow::anyhow!("authorized chain missing"))?;
+    let chain = fixture.authorization.chain(fixture.flow.l1.chain_index).map_err(|_| anyhow::anyhow!("authorized chain missing"))?;
     let body = json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to": format!("0x{}", hex::encode(chain.state_manager.0)), "data": format!("0x{}", hex::encode(call.abi_encode()))}, "latest"]});
     let value: Value = reqwest::Client::new().post(&fixture.flow.l1.rpc_url).json(&body).send().await?.json().await?;
     ensure!(value.get("error").is_none(), "StateManager call failed");
@@ -1009,7 +1043,7 @@ async fn guardian_user_operation() {
         Err(_) => ("failed".to_string(), None),
     };
     let path = fixture.root.join("operations").join(format!("{operation}.json"));
-    write_exclusive(&path, serde_json::to_vec(&json!({"operation": operation, "transaction_hash": hash, "status": status})).unwrap_or_default().as_slice()).unwrap_or_else(|error| panic!("operation evidence rejected: {error}"));
+    write_exclusive(&path, serde_json::to_vec(&json!({"operation": operation, "transaction_hash": hash, "status": status})).unwrap_or_default().as_slice()).unwrap_or_else(|error| panic!("operation receipt rejected: {error}"));
     result.unwrap_or_else(|error| panic!("user operation failed: {error}"));
 }
 

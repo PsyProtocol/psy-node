@@ -1,7 +1,9 @@
 #!/bin/bash
 set -o pipefail
 
-# Configuration
+# Container and volume identities match resolveDevnetDbNames in
+# dev/locSetupPolicy.ts. Unset or empty PSY_DEVNET_NAMESPACE keeps these
+# legacy names; a namespace prefixes them and must never select the legacy set.
 VALKEY_NAME="valkey-server"
 NATS_NAME="nats-server"
 SCYLLA_NAME="scylla-server"
@@ -12,34 +14,113 @@ SCYLLA_VOLUME="psy-devnet-scylla"
 SCYLLA_DATA_VOLUME="psy-devnet-scylla-data"
 NATS_VOLUME="psy-devnet-nats"
 
-# Parse --persist flag
-PERSIST=false
-for arg in "$@"; do
-    if [ "$arg" = "--persist" ]; then
-        PERSIST=true
+PSY_DEVNET_NAMESPACE="${PSY_DEVNET_NAMESPACE-}"
+if [ -n "${PSY_DEVNET_NAMESPACE}" ]; then
+    if ! [[ "${PSY_DEVNET_NAMESPACE}" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; then
+        echo "[SYSTEM] PSY_DEVNET_NAMESPACE is invalid." >&2
+        exit 2
     fi
+    VALKEY_NAME="${PSY_DEVNET_NAMESPACE}-valkey-server"
+    NATS_NAME="${PSY_DEVNET_NAMESPACE}-nats-server"
+    SCYLLA_NAME="${PSY_DEVNET_NAMESPACE}-scylla-server"
+    NOSTR_NAME="${PSY_DEVNET_NAMESPACE}-nostr-relay"
+    VALKEY_VOLUME="${PSY_DEVNET_NAMESPACE}-psy-devnet-redis"
+    SCYLLA_VOLUME="${PSY_DEVNET_NAMESPACE}-psy-devnet-scylla"
+    SCYLLA_DATA_VOLUME="${PSY_DEVNET_NAMESPACE}-psy-devnet-scylla-data"
+    NATS_VOLUME="${PSY_DEVNET_NAMESPACE}-psy-devnet-nats"
+fi
+
+# Fresh starts never adopt existing containers or volumes. --persist is reserved
+# for the explicit offline rollback database command, not launcher startup.
+PERSIST=false
+FRESH=false
+for arg in "$@"; do
+    case "$arg" in
+        --fresh) FRESH=true; PERSIST=true ;;
+        --persist) PERSIST=true ;;
+        *) echo "[SYSTEM] Unknown database startup option." >&2; exit 2 ;;
+    esac
 done
+if [ "$FRESH" = "true" ]; then
+    containers=$(docker ps -a --format '{{.Names}}') || exit 1
+    volumes=$(docker volume ls --format '{{.Name}}') || exit 1
+    for name in "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" "$VALKEY_VOLUME" "$SCYLLA_VOLUME" "$SCYLLA_DATA_VOLUME" "$NATS_VOLUME"; do
+        while IFS= read -r existing; do
+            if [ "$existing" = "$name" ]; then
+                echo "[SYSTEM] Fresh database startup refuses an existing resource: $name" >&2
+                exit 1
+            fi
+        done <<< "$containers
+$volumes"
+    done
+fi
 
 # Get absolute path for repo-local logs
 PARENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
 
 # Ensure logs directory exists
-mkdir -p "$PARENT_DIR/logs" || true
-chmod -R 777 "$PARENT_DIR/logs" "$PARENT_DIR/local_checkpoints" 2>/dev/null || true
+mkdir -p "$PARENT_DIR/logs" || exit 1
 
 VALKEY_LOGS="$PARENT_DIR/logs/valkey_logs.txt"
 NATS_LOGS="$PARENT_DIR/logs/nats_logs.txt"
 SCYLLA_LOGS="$PARENT_DIR/logs/scylla_logs.txt"
 NOSTR_LOGS="$PARENT_DIR/logs/nostr_logs.txt"
+# Previous runs of this identity only. Never signal by port or by another
+# namespace. Stop waits for the stop signal with no SIGKILL fallback; remove
+# a name only after Docker reports that it is no longer running.
+stop_owned_containers() {
+    docker stop -t -1 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null || true
+}
 
-# Clean up any previous runs
-docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null
-docker rm -f "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null || true
+remove_stopped_owned_containers() {
+    local name=""
+    local running=""
+    for name in "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME"; do
+        if ! docker container inspect "$name" >/dev/null 2>&1; then
+            continue
+        fi
+        running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)"
+        if [ "$running" != "false" ]; then
+            echo "[SYSTEM] Refusing to remove live container ${name}." >&2
+            exit 1
+        fi
+        docker rm "$name" >/dev/null 2>&1 || true
+    done
+}
+
+if [ "$FRESH" != "true" ]; then
+    stop_owned_containers
+    remove_stopped_owned_containers
+fi
+
+# Host ports stay fixed. After our own containers are gone, an occupied port
+# is a hard failure: do not kill or remap the unknown listener.
+host_port_listening() {
+    local port="$1"
+    local listeners=""
+    if command -v ss >/dev/null 2>&1; then
+        listeners="$(ss -H -ltn "sport = :${port}" 2>/dev/null || true)"
+    elif command -v lsof >/dev/null 2>&1; then
+        listeners="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)"
+    else
+        echo "[SYSTEM] Cannot check host port ${port}: neither ss nor lsof is available." >&2
+        exit 2
+    fi
+    [ -n "${listeners}" ]
+}
+
+for host_port in 6379 4222 9042 8081; do
+    if host_port_listening "$host_port"; then
+        echo "[SYSTEM] Host port ${host_port} is already in use. Refusing to start; not killing the listener." >&2
+        exit 1
+    fi
+done
 
 # Reentrancy-guarded cleanup for intentional SIGINT/SIGTERM. Does NOT exit on
 # its own: it stops all containers once and sets INTENTIONAL_EXIT so the
 # supervision loop below can exit 0. A second signal while already cleaning up
 # is ignored (no recursive cleanup). Persistent volumes are never removed here.
+# A negative timeout waits for the stop signal and does not fall back to SIGKILL.
 CLEANUP_DONE=0
 INTENTIONAL_EXIT=0
 cleanup() {
@@ -53,7 +134,7 @@ cleanup() {
     echo "Stopping containers (Graceful Shutdown)..."
     echo "-----------------------------------------------------"
 
-    docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null
+    stop_owned_containers
 
     echo "All services stopped."
     if [ "$PERSIST" = "true" ]; then
@@ -240,7 +321,7 @@ while true; do
             echo "[SYSTEM] Stopping containers and exiting non-zero for supervisor restart."
             echo "-----------------------------------------------------"
             trap - SIGINT SIGTERM
-            docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null
+            stop_owned_containers
             exit 1
         fi
     done
@@ -289,6 +370,7 @@ echo "-----------------------------------------------------"
 echo "[SYSTEM] DB service '${EXITED_LABEL}' pipeline exited unexpectedly (code=${EXIT_CODE})."
 echo "[SYSTEM] Stopping remaining containers and exiting non-zero for supervisor restart."
 echo "-----------------------------------------------------"
-docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" "$NOSTR_NAME" 2>/dev/null
+# Graceful path: wait for the stop signal. Do not fall back to SIGKILL.
+stop_owned_containers
 echo "[SYSTEM] Remaining containers stopped. Persistent volumes preserved."
 exit 1

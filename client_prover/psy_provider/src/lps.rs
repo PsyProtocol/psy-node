@@ -23,6 +23,33 @@ use super::{provider::RpcProvider, request::*};
 
 type F = GoldilocksField;
 
+/// Realm `psy_get_user_tree_merkle_proof` reports this when that checkpoint's user-tree
+/// proof is not stored yet. Returned inside `anyhow::Error` only for this exact RPC shape.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("User tree proof not found for checkpoint_id {checkpoint_id}")]
+pub struct MissingCheckpointProof {
+    pub checkpoint_id: u64,
+}
+
+const MISSING_CHECKPOINT_PROOF_ERROR_CODE: i64 = -32001;
+
+fn parse_missing_checkpoint_proof(error: &RpcError, checkpoint_id: u64) -> Option<MissingCheckpointProof> {
+    if error.code != ErrorCode::ServerError(MISSING_CHECKPOINT_PROOF_ERROR_CODE) || error.data.is_some() {
+        return None;
+    }
+    let checkpoint = error.message.strip_prefix("User tree proof not found for checkpoint_id ")?;
+    if checkpoint.is_empty()
+        || (checkpoint.len() > 1 && checkpoint.as_bytes()[0] == b'0')
+        || !checkpoint.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    if checkpoint.parse::<u64>().ok()? != checkpoint_id {
+        return None;
+    }
+    Some(MissingCheckpointProof { checkpoint_id })
+}
+
 /// Checkpoint-pinned evidence; the consumer must authenticate it to its verified checkpoint root.
 #[derive(Debug, Clone)]
 pub struct WithdrawalBurnProof {
@@ -546,6 +573,9 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
             }
             ResponseResult::Error(e) => {
                 error!("RPC call failed: {:?}", e);
+                if let Some(missing) = parse_missing_checkpoint_proof(&e, checkpoint_id) {
+                    return Err(missing.into());
+                }
                 Err(anyhow::format_err!("get_user_tree_merkle_proof rpc call failed `{:?}`", e))
             }
         }
@@ -1438,5 +1468,59 @@ impl RpcProvider {
                 Err(anyhow::format_err!("get_checkpoint_state_transition_proof rpc call failed `{:?}`", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::*;
+
+    fn rpc_error(code: ErrorCode, message: &'static str) -> RpcError {
+        RpcError {
+            code,
+            message: Cow::Borrowed(message),
+            data: None,
+        }
+    }
+
+    #[test]
+    fn parses_exact_missing_checkpoint_proof() {
+        let error = rpc_error(ErrorCode::ServerError(MISSING_CHECKPOINT_PROOF_ERROR_CODE), "User tree proof not found for checkpoint_id 17");
+        let missing = parse_missing_checkpoint_proof(&error, 17).expect("exact missing checkpoint");
+        assert_eq!(missing, MissingCheckpointProof { checkpoint_id: 17 });
+        let classified: anyhow::Error = missing.into();
+        assert_eq!(classified.downcast_ref::<MissingCheckpointProof>().map(|proof| proof.checkpoint_id), Some(17));
+    }
+
+    #[test]
+    fn rejects_wrong_rpc_code_checkpoint_and_nonmatching_error() {
+        let exact = "User tree proof not found for checkpoint_id 17";
+        assert_eq!(parse_missing_checkpoint_proof(&rpc_error(ErrorCode::ServerError(-32002), exact), 17), None);
+        assert_eq!(parse_missing_checkpoint_proof(&rpc_error(ErrorCode::InternalError, exact), 17), None);
+        assert_eq!(
+            parse_missing_checkpoint_proof(
+                &rpc_error(ErrorCode::ServerError(MISSING_CHECKPOINT_PROOF_ERROR_CODE), "User tree proof not found for checkpoint_id 18"),
+                17,
+            ),
+            None
+        );
+        for message in [
+            "connection refused",
+            "User tree proof not found for checkpoint_id",
+            "User tree proof not found for checkpoint_id 17 ",
+            "User tree proof not found for checkpoint_id 017",
+            "user tree proof not found for checkpoint_id 17",
+        ] {
+            let error = rpc_error(ErrorCode::ServerError(MISSING_CHECKPOINT_PROOF_ERROR_CODE), message);
+            assert_eq!(parse_missing_checkpoint_proof(&error, 17), None, "{message}");
+        }
+        let with_data = RpcError {
+            code: ErrorCode::ServerError(MISSING_CHECKPOINT_PROOF_ERROR_CODE),
+            message: Cow::Borrowed(exact),
+            data: Some(serde_json::Value::Null),
+        };
+        assert_eq!(parse_missing_checkpoint_proof(&with_data, 17), None);
     }
 }

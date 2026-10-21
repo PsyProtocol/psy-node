@@ -1,10 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import {
     applyEnvioCpuSetToCompose,
+    applyEnvioNetworkName,
     classifySupervisedExit,
     DEFAULT_PROVING_RAYON_THREADS,
     DEFAULT_WORKER_BATCH_SIZE,
+    DEVNET_NAMESPACE_ENV,
     emptyRestartStreak,
+    envioComposeCommand,
+    envioPostgresReadinessCommand,
+    envioServicesDatabaseProbeCommand,
     FAUCET_ENV_KEYS,
     failureSignature,
     findCpuSetOverlap,
@@ -18,6 +23,8 @@ import {
     isExactProcessorReadyLine,
     isLikelyWrongKeystorePassword,
     isTransientScyllaSchemaFailure,
+    LEGACY_DEVNET_DB_NAMES,
+    LEGACY_ENVIO_NETWORK,
     MAX_IDENTICAL_FAILURE_RESTARTS,
     nextRestartDelayMs,
     nextSpawnRetryDelayMs,
@@ -32,11 +39,17 @@ import {
     PSY_DAPP_NESTED_SUBMODULES,
     PSY_SDK_GENESIS_CONFIG_REL,
     PSY_SDK_GENESIS_SUBMODULE,
+    psyServicesDatabaseCommands,
     formatPsyDappNestedSubmoduleRemedy,
     psySdkGenesisSubmoduleNeedsInit,
     planPsyDappNestedSubmoduleInit,
     resolveCpuPartition,
     resolveCpuPartitionForAffinity,
+    resolveDevnetDbNames,
+    resolveDevnetDbNamesFromEnv,
+    devnetDbContainerNames,
+    devnetDbVolumeNames,
+    devnetIsolationResources,
     resolvePositiveIntegerSetting,
     resolveRayonThreadCount,
     resolveScyllaMemory,
@@ -209,6 +222,124 @@ describe("runtime infrastructure settings", () => {
         }, FAUCET_ENV_KEYS);
         expect(Object.keys(selected).sort()).toEqual([...FAUCET_ENV_KEYS].sort());
         expect(selected.UNRELATED).toBeUndefined();
+    });
+});
+
+describe("devnet namespace identities", () => {
+    const legacyValues = [
+        ...devnetDbContainerNames(LEGACY_DEVNET_DB_NAMES),
+        ...devnetDbVolumeNames(LEGACY_DEVNET_DB_NAMES),
+        LEGACY_DEVNET_DB_NAMES.envioComposeProject,
+        LEGACY_DEVNET_DB_NAMES.envioNetwork,
+        LEGACY_DEVNET_DB_NAMES.envioPostgresContainer,
+        LEGACY_DEVNET_DB_NAMES.envioDataVolume,
+    ];
+
+    it("preserves legacy names when the namespace is unset or empty", () => {
+        expect(DEVNET_NAMESPACE_ENV).toBe("PSY_DEVNET_NAMESPACE");
+        for (const unset of [undefined, null, ""]) {
+            expect(resolveDevnetDbNames(unset)).toEqual(LEGACY_DEVNET_DB_NAMES);
+        }
+        expect(resolveDevnetDbNamesFromEnv({})).toEqual(LEGACY_DEVNET_DB_NAMES);
+        expect(LEGACY_DEVNET_DB_NAMES).toEqual({
+            namespace: null,
+            containers: {
+                valkey: "valkey-server",
+                nats: "nats-server",
+                scylla: "scylla-server",
+                nostr: "nostr-relay",
+            },
+            volumes: {
+                valkey: "psy-devnet-redis",
+                scylla: "psy-devnet-scylla",
+                scyllaData: "psy-devnet-scylla-data",
+                nats: "psy-devnet-nats",
+            },
+            envioComposeProject: "generated",
+            envioNetwork: "local_test_network",
+            envioPostgresContainer: "generated-envio-postgres-1",
+            envioDataVolume: "generated_db_data",
+        });
+    });
+
+    it("prefixes a valid namespace without reusing any legacy identity", () => {
+        const names = resolveDevnetDbNames("e2e");
+        expect(names).toEqual({
+            namespace: "e2e",
+            containers: {
+                valkey: "e2e-valkey-server",
+                nats: "e2e-nats-server",
+                scylla: "e2e-scylla-server",
+                nostr: "e2e-nostr-relay",
+            },
+            volumes: {
+                valkey: "e2e-psy-devnet-redis",
+                scylla: "e2e-psy-devnet-scylla",
+                scyllaData: "e2e-psy-devnet-scylla-data",
+                nats: "e2e-psy-devnet-nats",
+            },
+            envioComposeProject: "e2e-generated",
+            envioNetwork: "e2e-local_test_network",
+            envioPostgresContainer: "e2e-generated-envio-postgres-1",
+            envioDataVolume: "e2e-generated_db_data",
+        });
+        const namespacedValues = [
+            ...devnetDbContainerNames(names),
+            ...devnetDbVolumeNames(names),
+            names.envioComposeProject,
+            names.envioNetwork,
+            names.envioPostgresContainer,
+            names.envioDataVolume,
+        ];
+        expect(new Set(namespacedValues).size).toBe(namespacedValues.length);
+        expect(namespacedValues.some((name) => legacyValues.includes(name))).toBe(false);
+        expect(devnetIsolationResources(names)).toEqual({
+            containers: [...devnetDbContainerNames(names), names.envioPostgresContainer],
+            volumes: [...devnetDbVolumeNames(names), names.envioDataVolume],
+            networks: [names.envioNetwork],
+        });
+    });
+
+    it("rejects invalid namespaces without treating them as legacy", () => {
+        for (const invalid of ["E2E", "e2e_x", "-e2e", "e2e-", "e2e.1", "a b", "a".repeat(33), " e2e", "e2e "]) {
+            expect(() => resolveDevnetDbNames(invalid)).toThrow(DEVNET_NAMESPACE_ENV);
+        }
+        expect(() => resolveDevnetDbNamesFromEnv({ PSY_DEVNET_NAMESPACE: "Bad" })).toThrow(DEVNET_NAMESPACE_ENV);
+    });
+
+    it("routes Postgres and Compose commands through the resolved identity", () => {
+        const legacyPostgres = LEGACY_DEVNET_DB_NAMES.envioPostgresContainer;
+        const namespacedPostgres = resolveDevnetDbNames("e2e").envioPostgresContainer;
+        expect(psyServicesDatabaseCommands(false, false)).toEqual([
+            ["docker", "exec", legacyPostgres, "createdb", "-U", "postgres", "psy_services"],
+        ]);
+        expect(psyServicesDatabaseCommands(true, true, namespacedPostgres)[0][2]).toBe(namespacedPostgres);
+        expect(envioPostgresReadinessCommand(namespacedPostgres)).toEqual([
+            "docker", "exec", namespacedPostgres, "psql", "-U", "postgres", "-d", "postgres", "-c", "select 1",
+        ]);
+        expect(envioServicesDatabaseProbeCommand(namespacedPostgres)[2]).toBe(namespacedPostgres);
+        expect(envioComposeCommand("generated/docker-compose.yaml", "e2e-generated", ["up", "-d"])).toEqual([
+            "docker", "compose", "-p", "e2e-generated", "-f", "generated/docker-compose.yaml", "up", "-d",
+        ]);
+        const compose = [
+            "name: psy-relayer-envio",
+            "networks:",
+            "  envio-network:",
+            `    name: ${LEGACY_ENVIO_NETWORK}`,
+            "volumes:",
+            "  db_data:",
+            "",
+        ].join("\n");
+        const rewritten = applyEnvioNetworkName(compose, "e2e-local_test_network");
+        const nameValues = rewritten.split("\n").flatMap((line) => {
+            const match = line.match(/^\s*name:\s*["']?([A-Za-z0-9][A-Za-z0-9_.-]*)["']?\s*$/);
+            return match ? [match[1]] : [];
+        });
+        expect(nameValues).toEqual(["psy-relayer-envio", "e2e-local_test_network"]);
+        expect(nameValues.includes(LEGACY_ENVIO_NETWORK)).toBe(false);
+        expect(applyEnvioNetworkName(rewritten, "e2e-local_test_network")).toBe(rewritten);
+        expect(applyEnvioNetworkName(compose, LEGACY_ENVIO_NETWORK)).toBe(compose);
+        expect(() => applyEnvioNetworkName("services:\n  envio-postgres:\n", "e2e-local_test_network")).toThrow();
     });
 });
 

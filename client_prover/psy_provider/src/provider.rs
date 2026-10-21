@@ -439,7 +439,9 @@ macro_rules! psy_rpc_call_back {
                         e.is_body(),
                         e.is_decode()
                     );
-                    Err(anyhow::anyhow!("{}", error_msg))
+                    // Preserve the typed reqwest::Error as the chain root (Display text unchanged)
+                    // so downstream classifiers can downcast it instead of matching strings.
+                    Err(anyhow::Error::new(e).context(error_msg))
                 }
             }
         }
@@ -2406,6 +2408,54 @@ mod tests {
         for _ in 0..128 {
             assert_eq!(provider.get_realm_url(user_id).unwrap(), expected);
         }
+    }
+    // Transport-error boundary: psy_rpc_call_back must keep the typed
+    // reqwest::Error at the root of the anyhow chain (same Display text as
+    // before) so downstream classifiers can downcast is_timeout/is_connect.
+    // JSON-RPC ResponseResult::Error stays a separate, permanent path.
+    #[tokio::test]
+    async fn transport_error_arm_keeps_typed_reqwest_error_downcastable() {
+        // Deterministically closed port: bind a probe listener, record the port,
+        // drop it — connects to it are refused.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind probe listener");
+        let closed_port = listener.local_addr().expect("probe port").port();
+        drop(listener);
+
+        let url = format!("http://127.0.0.1:{closed_port}");
+        let url_label = url.clone();
+        let provider = RpcProvider {
+            client: Arc::new(Client::new()),
+            endpoint_clients: None,
+            realm_configs: HashMap::from([(1, vec![url.clone()])]),
+            coordinator_configs: HashMap::from([(0, vec![url.clone()])]),
+            users_per_realm: 1_048_576,
+            current_user_id: 0,
+        };
+
+        let error = (async {
+            let _response = psy_rpc_call_back!(
+                provider,
+                url,
+                RequestParams::<F>::GetLatestBlockState(QLatestBlockStateRPCRequest {}),
+                PsyBlockState
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .expect_err("closed port must produce a transport error");
+
+        let transport = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .expect("reqwest::Error must remain downcastable in the anyhow chain");
+        assert!(
+            transport.is_connect(),
+            "refused connection must be a typed connect error, got {transport:?}"
+        );
+        assert!(
+            error.to_string().starts_with(&format!("Connection error to {url_label}: ")),
+            "existing error boundary text must be preserved, got: {error}"
+        );
     }
 
 }

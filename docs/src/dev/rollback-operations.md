@@ -14,9 +14,9 @@ Status: Review. Updated: 2026-09-16. Internal operator runbook.
 
 ## Scope and authority
 
-Use five independent RPs to roll back the default local stack: one Coordinator and four Realm processors. This runbook supplies executable generation, inspection, and execution commands; [devnet lifecycle, sections 6–9](devnet_lifecycle.md#6-offline-rollback-stop-and-resume) owns stopping, retained infrastructure, resuming, and acceptance. [Launcher control lifecycle](devnet-launcher-reference.md#11-control-socket-and-application-lifecycle) explains the supervisor. Do not substitute a new launcher invocation for the saved supervisor commands (`docs/src/dev/devnet_lifecycle.md:164-243`; `Makefile:61-76`).
+Use five independent RPs to roll back the default local stack: one Coordinator and four Realm processors. This runbook supplies executable generation, inspection, and execution commands; [devnet lifecycle, sections 6–9](devnet_lifecycle.md#6-offline-rollback-stop-and-resume) owns stopping, retained infrastructure, resuming, and acceptance. [Launcher control lifecycle](devnet-launcher-reference.md#11-control-socket-and-application-lifecycle) explains the supervisor. Do not substitute a new launcher invocation for the saved supervisor commands (`docs/src/dev/devnet_lifecycle.md:164-243`; `Makefile:96-108,131-132`).
 
-This procedure requires the default foreground stack on loopback, realms 0 and 1, two validators per Realm, one edge per validator, and one Coordinator edge. It does not cover a custom topology, daemonized stack, or remote network (`Makefile:61`; `dev/locSetupV4.ts:1004-1007,1125-1135,4195-4206,4224-4239,4293-4317`).
+This procedure requires the default foreground stack on loopback, realms 0 and 1, two validators per Realm, one edge per validator, and one Coordinator edge. It does not cover a custom topology, daemonized stack, or remote network (`Makefile:96-99`; `dev/locSetupV4.ts:1004-1007,1125-1135,4195-4206,4224-4239,4293-4317`).
 
 **Never follow the current rollback CLI success text that suggests `make run-all`. Use only `make rollback-resume` after every RP and external recovery are complete.** The text is stale relative to the canonical lifecycle (`psy_cli/psy_dev_cli/src/subcommand/rollback.rs:139-156`; `docs/src/dev/devnet_lifecycle.md:190-199`).
 
@@ -299,9 +299,11 @@ Keep the five completed RPs and before/after evidence together. A completed loca
 
 ## 9. L1 reward-root recovery after rollback
 
-**Diagnose lineage mismatch, not missing reward work.** If `claim-rewards` defers every checkpoint with `historical checkpoint root differs from finalized L1 root`, compare the Coordinator's checkpoint-tree root at `lastFinalizedCheckpointId` with StateManager's `lastVerifiedCheckpointRoot`. A retained pre-rollback L1 root does not authenticate the current L2 lineage (`client_prover/psy_prover/src/local/reward_client.rs:990-1002`; deferral: `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:88-104`). Repeated bridge-aggregation proof generation is not settlement progress. The daemon builds that proof at `psy_cli/psy_relayer_cli/src/bridge/daemon.rs:1504-1524`, then submits `finalize` and, on failure, logs the error and continues the loop (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:1570-1633`). A mismatched starting root makes `finalize` revert `InvalidCheckpointContinuity` (`psy-contracts/src/StateManager.sol:214-220`).
+**Diagnose lineage mismatch, not missing reward work.** If `claim-rewards` defers every checkpoint with `historical checkpoint root differs from finalized L1 root`, compare the Coordinator's checkpoint-tree root at `lastFinalizedCheckpointId` with StateManager's `lastVerifiedCheckpointRoot`. A retained pre-rollback L1 root does not authenticate the current L2 lineage (`client_prover/psy_prover/src/local/reward_client.rs:998-1002`; deferral: `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:88-104`). The automated claim path reads L1 recognition through the current `rewardRootsClean()` and `rewardRootCheckpointId(bytes32)` selectors (`client_prover/psy_prover/src/local/reward_client.rs:979-987`; `psy-contracts/src/StateManager.sol:46-49`) and works against this revision. Verified on the recorded current-source run: all three L1 chains performed the CAS 694→680 and drained 70 abandoned roots; after resume finalize at 697 with matching roots, replaying the exact claim eth_call was rejected. Earlier recorded E2E runs used the pre-cutover contract revision and remain historical evidence only. Repeated bridge-aggregation proof generation is not settlement progress. The daemon builds that proof at `psy_cli/psy_relayer_cli/src/bridge/daemon.rs:1516-1530`, then submits `finalize` and, on failure, logs the error and continues the loop (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:1584-1648`). A mismatched starting root makes `finalize` revert `InvalidCheckpointContinuity` (`psy-contracts/src/StateManager.sol:216-218`).
 
-Use this narrowly scoped repair only when the finalized ID and deposit/withdrawal roots remain correct and **only the checkpoint lineage root needs replacement**. Otherwise use the separately authorized full L1 recovery plan; do not invent bridge roots. The signer must be this deployment's **StateManagerAdmin**, checked through its addresses provider's `IPsyACLManagerSM`, not merely an owner or proposer (`psy-contracts/src/StateManager.sol:95-102,126-155`).
+**Bridge proof cache after rollback.** Single- and multichain relayers reuse a cached proof only when its `from_checkpoint`, `to_checkpoint`, and aggregation count match the requested range and its predecessor (`from_checkpoint - 1`) and end (`to_checkpoint`) checkpoint-tree roots match current L2 historical roots. An unavailable root fails closed and preserves the cached file; a mismatch discards the stale cache and invokes the existing proof-generation path, never rewriting proof values to fit the new lineage (`psy_cli/psy_relayer_cli/src/bridge/l1_client.rs`, `L1Client::load_or_build_proof`). EndCap inclusion waits use the authenticated end-user-leaf hash, not the submission's content hash (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs`).
+
+Use this narrowly scoped repair only when the finalized ID and deposit/withdrawal roots remain correct and **only the checkpoint lineage root needs replacement**. Otherwise use the separately authorized full L1 recovery plan; do not invent bridge roots. The signer must be this deployment's **StateManagerAdmin**, checked through its addresses provider's `IPsyACLManagerSM`, not merely an owner or proposer (`psy-contracts/src/StateManager.sol:95-102,126-148`).
 
 1. Read all five current fields at one L1 block, and query the Coordinator root at that exact finalized checkpoint. Run from the repository root; supply public deployment values and the admin's encrypted keystore path, never a private-key literal. `get-checkpoint-tree-root` takes `--checkpoint-id` and returns a `root` field (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:399-405`; `client_prover/psy_cli/psy_user_cli/src/main.rs:592-598`; `client_prover/psy_cli/psy_user_cli/src/result.rs:121-124`). The root is serialized as reversed bytes in hexadecimal, matching the low-u64-first checkpoint word; prefix it with `0x`, without reversing it again (`client_prover/psy_core/psy_common/src/data/qhashout.rs:29-42`; `client_prover/psy_prover/src/local/reward_client.rs:691-698`).
 
@@ -343,35 +345,40 @@ Use this narrowly scoped repair only when the finalized ID and deposit/withdrawa
      --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
    ```
 
-3. Revoke the **named abandoned checkpoint tree roots**, preserving unaffected historical roots. Every real state change sets `checkpointTreeRootsClean=false`, even when the registry is empty. The mapping `checkpointTreeRootCheckpointId(bytes32)` is the single source of truth: there is no array or count. Build the approved abandoned-root list from retained settlement events and rollback lineage evidence, not just the replaced tip. `revokeCheckpointTreeRoots(bytes32[])` zeroes each named nonzero root and is idempotent; it never re-enables finalization or claims. Use batches within the network gas limit. If the full recovery plan also abandons bridge subtree memberships, call `revokeKnownSubtreeRoots(bytes32[],bytes32[])` with the approved deposit and withdrawal subtree lists; it sets only those memberships false and does not change current roots or the clean flag. This narrow lineage-only repair must not invent bridge revocations.
+3. Revoke the abandoned finalized reward roots with the bounded governed operation. The registry is an internal array: `finalizedRewardRootCount()` is its only count and there is no named-root revoke (`psy-contracts/src/StateManager.sol:46-49,168-182`). A real force-set sets `rewardRootsClean=false` only when that array is non-empty (`psy-contracts/src/StateManager.sol:155`); an empty registry needs no cleanup call. `revokeAbandonedRewardRoots(uint256 maxEntries)` pops entries from the end, zeroes their `rewardRootCheckpointId` registrations, and sets `rewardRootsClean=true` only once the array is empty; it reverts when the flag is already clean, the registry is empty, or the bound is zero (`psy-contracts/src/StateManager.sol:172-174`). Cleanup does not itself register a replacement root and never touches claimed pairs. It deletes the newest entries first, so a bound below the full count leaves the oldest abandoned roots registered and `rewardRootsClean` false. Governed deployments encode and execute the call through the timelock/Safe; a no-op force-set leaves the flag unchanged.
 
    ```bash
-   read -r -p 'Approved abandoned checkpoint roots JSON file: ' ABANDONED_ROOTS_FILE
-   ABANDONED_ROOTS=$(jq -cer 'select(type == "array") | select(all(.[]; type == "string" and test("^0x[0-9a-fA-F]{64}$") and . != "0x0000000000000000000000000000000000000000000000000000000000000000"))' "$ABANDONED_ROOTS_FILE")
-   cast send "$STATE_MANAGER" 'revokeCheckpointTreeRoots(bytes32[])' "$ABANDONED_ROOTS" \
-     --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
-   while IFS= read -r root; do
-     cast call "$STATE_MANAGER" 'checkpointTreeRootCheckpointId(bytes32)(uint64)' "$root" \
-       --rpc-url "$L1_RPC_URL" --json | jq -e '.[0] == 0 or .[0] == "0"'
-   done < <(jq -r '.[]' "$ABANDONED_ROOTS_FILE")
    cast call "$STATE_MANAGER" 'lastVerifiedCheckpointRoot()(bytes32)' \
      --rpc-url "$L1_RPC_URL" --json | jq -e --arg root "$NEW_ROOT" '.[0] == $root'
+   cast call "$STATE_MANAGER" 'finalizedRewardRootCount()(uint256)' \
+     --rpc-url "$L1_RPC_URL"
+   cast call "$STATE_MANAGER" 'rewardRootsClean()(bool)' \
+     --rpc-url "$L1_RPC_URL"
    ```
 
-   Verify retained historical registrations and any revoked subtree memberships against the approved recovery plan. Only after **all** cleanup is complete, explicitly attest that the registry is clean. The flag does not validate the completeness of your list; re-enabling prematurely can admit stale roots. Empty registries also require this explicit acknowledgement. A no-op force-set leaves the flag unchanged. For governed deployments, encode and execute both revocation and acknowledgement through the timelock/Safe instead of sending directly from a non-admin signer.
-
-   The clean flag attests only to the operator's named list, not its completeness or ancestry. **Current withdrawal root warning:** Bridge accepts a proof matching `StateManager.withdrawalSubtreeRoot()` even when its `knownWithdrawalSubtreeRoots` membership is false (`psy-contracts/src/Bridge.sol:719-724`). Abandoning that current root requires an authorized repair of the state field as well as membership revocation; a mapping-only revocation is insufficient. `knownDepositSubtreeRoots` has no production reader and is audit state, not a deposit-acceptance gate. The governed subtree operation is `state-manager:revoke-known-subtree-roots --deposit-roots-json ... --withdrawal-roots-json ...`; both inputs accept JSON files or inline arrays.
+   The first command verifies the repaired checkpoint root. A zero count with `rewardRootsClean() == true` means the registry was empty at force-set time and needs no cleanup call; skip to step 4. A nonzero count after a real force-set is expected: the registry holds the abandoned roots and `rewardRootsClean()` is false. Verify retained historical registrations against the approved recovery plan. Run the governed task with a bound that fits the network gas limit; `DRY_RUN=TimeLock` only encodes, so queue and execute each printed batch through the timelock/Safe workflow, then re-read the count. Repeat until the count is zero, then require `rewardRootsClean() == true`; use a distinct `--execution-time` for repeated identical timelock operations:
 
    ```bash
-   cast send "$STATE_MANAGER" 'setCheckpointTreeRootsClean(bool)' true \
-     --keystore "$ADMIN_KEYSTORE" --rpc-url "$L1_RPC_URL"
-   cast call "$STATE_MANAGER" 'checkpointTreeRootsClean()(bool)' \
+   BATCHES_LEFT=5
+   COUNT=$(cast call "$STATE_MANAGER" 'finalizedRewardRootCount()(uint256)' \
+     --rpc-url "$L1_RPC_URL")
+   while [ "$COUNT" -gt 0 ]; do
+     test "$BATCHES_LEFT" -gt 0 || { echo 'finalizedRewardRootCount is still nonzero after the last bounded batch' >&2; exit 1; }
+     BATCHES_LEFT=$((BATCHES_LEFT - 1))
+     DRY_RUN=TimeLock npx hardhat state-manager:revoke-abandoned-reward-roots \
+       --max-entries 100 --network localhost
+     read -r -p 'Queue and execute the printed batch through the timelock/Safe, then press Enter to re-read the count: '
+     COUNT=$(cast call "$STATE_MANAGER" 'finalizedRewardRootCount()(uint256)' \
+       --rpc-url "$L1_RPC_URL")
+   done
+   cast call "$STATE_MANAGER" 'rewardRootsClean()(bool)' \
      --rpc-url "$L1_RPC_URL" --json | jq -e '.[0] == true or .[0] == "true"'
    ```
 
-4. Require the next **real settlement finalize** and a new `Finalized` event. `forceSetState` repairs continuity but **does not register the replacement root**; `finalize` registers its newly proved end root and advances the anchor (`psy-contracts/src/StateManager.sol:150-166,242-255`). A clean registry alone is not a recognized reward root (`client_prover/psy_prover/src/local/reward_client.rs:979-995`).
-5. Once the recognized anchor advances past the selected checkpoints, rerun [reward claims §4](reward-claim-operations.md#4-submit-the-claim) with the **unchanged jobs file**. Check confirmed receipts and minted rewards; do not rewrite preimages or source IDs to fit an abandoned lineage (`client_prover/psy_prover/src/local/reward_client.rs:541-548,998-1007`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:195-209,346-347`).
+   `rewardRootsClean()` true plus a zero count is the only completion signal. **Current withdrawal root warning:** Bridge accepts a proof matching `StateManager.withdrawalSubtreeRoot()` even when its `knownWithdrawalSubtreeRoots` membership is false (`psy-contracts/src/Bridge.sol:719-724`). Abandoning that current root requires an authorized repair of the state field; a membership-only change is insufficient. `knownDepositSubtreeRoots` has no production reader and is audit state, not a deposit-acceptance gate.
 
+4. Require the next **real settlement finalize** and a new `Finalized` event. `forceSetState` repairs continuity but **does not register the replacement root**; `finalize` requires `rewardRootsClean`, registers its newly proved end root in `rewardRootCheckpointId`, and advances the anchor (`psy-contracts/src/StateManager.sol:207,240-244`). A clean registry alone is not a recognized reward root (`psy-contracts/src/PsyToken.sol:90-94`).
+5. Once the recognized anchor advances past the selected checkpoints, rerun [reward claims §4](reward-claim-operations.md#4-submit-the-claim) with the **unchanged jobs file**. Check confirmed receipts and minted rewards; do not rewrite preimages or source IDs to fit an abandoned lineage (`client_prover/psy_prover/src/local/reward_client.rs:541-551,998-1007`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:195-209,346-347`). Verified on the recorded current-source run: the claim minted 666666666 for user 0 before the rollback; after the recovery and resume finalize, replaying its exact eth_call was rejected.
 ## 10. Security
 
 - Treat rollback as destructive privileged maintenance. Restrict workspace access (`umask 077` above), retain original evidence, and do not expose private keys or credentials in tickets, logs, or version control.

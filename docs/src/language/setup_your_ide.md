@@ -18,7 +18,7 @@ This document introduces how to use the Psy language server `psy-lsp-server` for
   cd psy-compiler
 ```
 
-2. Compile `psy-lsp-server`：
+2. Compile `psy-lsp-server`:
 
 ```bash
   cd psy-lsp-server

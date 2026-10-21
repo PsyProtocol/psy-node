@@ -71,6 +71,15 @@ pub struct NetworkConfig<F: RichField> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_prove_proxy_url: Vec<String>,
     pub faucet_rpc_url: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardian_configs: Vec<GuardianPublicConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_history: Option<GuardianHistoryConfig>,
+    /// Parsed into the guardian protocol type by guardian consumers, avoiding a crate cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_authorization: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub l1_endpoints: Vec<ChainEndpoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_services_url: Option<Vec<String>>,
     /// Nostr relay for private-note delivery. This is required per network;
@@ -121,6 +130,27 @@ pub struct CoordinatorConfig {
     pub id: u64,
     pub rpc_url: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianPublicConfig {
+    pub id: u8,
+    pub listen_address: std::net::SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianHistoryConfig {
+    pub listen_address: std::net::SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainEndpoint { pub chain_index: u8, pub rpc_url: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeConfig {
@@ -1179,5 +1209,37 @@ mod tests {
             count, 1,
             "the build-identity log must fire exactly once per process, got {count}"
         );
+    }
+
+    #[test]
+    fn public_guardian_schema_defaults_and_round_trips_without_operator_paths() {
+        let json = config_json("testnet", &[("testnet", network_json(TESTNET_MAGIC_HEX, 1048576, "0"))]);
+        let mut config: Config<GoldilocksField> = serde_json::from_str(&json).unwrap();
+        let network = config.networks.get_mut("testnet").unwrap();
+        assert!(network.guardian_configs.is_empty());
+        assert!(network.guardian_history.is_none());
+        assert!(network.guardian_authorization.is_none());
+        assert!(network.l1_endpoints.is_empty());
+        network.guardian_configs = vec![GuardianPublicConfig {
+            id: 1, listen_address: "0.0.0.0:15441".parse().unwrap(), rpc_url: Some("http://guardian.example:15441/".into()),
+        }];
+        network.guardian_history = Some(GuardianHistoryConfig {
+            listen_address: "127.0.0.1:15450".parse().unwrap(), rpc_url: None,
+        });
+        network.l1_endpoints = vec![ChainEndpoint { chain_index: 42, rpc_url: "https://chain.example/rpc".into() }];
+        let encoded = serde_json::to_value(&*network).unwrap();
+        assert_eq!(encoded["guardian_configs"][0], serde_json::json!({
+            "id": 1, "listen_address": "0.0.0.0:15441", "rpc_url": "http://guardian.example:15441/"
+        }));
+        assert_eq!(encoded["guardian_history"], serde_json::json!({"listen_address": "127.0.0.1:15450"}));
+        let decoded: NetworkConfigGoldilocks = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.l1_endpoints[0].chain_index, 42);
+        for field in ["signing_key_secret_path", "signing_key_password_secret_path", "db_path", "archive_path"] {
+            let mut endpoint = serde_json::json!({"id": 1, "listen_address": "127.0.0.1:15441"});
+            endpoint[field] = serde_json::json!("operator-local");
+            assert!(serde_json::from_value::<GuardianPublicConfig>(endpoint).is_err());
+        }
+        assert!(serde_json::from_str::<GuardianPublicConfig>(r#"{"id":"01","listen_address":"127.0.0.1:15441"}"#).is_err());
+        assert!(serde_json::from_str::<GuardianPublicConfig>(r#"{"id":1,"id":2,"listen_address":"127.0.0.1:15441"}"#).is_err());
     }
 }

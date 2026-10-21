@@ -1,29 +1,29 @@
-//! `--guardians-root` branch of `generate-genesis-data` (frozen design §4).
+//! `--guardians-root` branch of `generate-genesis-data`.
 //!
-//! `--guardians-root` verifies the supplied public account, compiler artifact and
-//! approved contract inputs against the EXISTING `genesis.json`, recomputes the
-//! offline checkpoint-0 identity through the populated node-side builder, and
-//! writes exactly one public config plus the version-1 authorization
-//! archive/index. It never calls `generate_local_devnet_genesis`, never writes
-//! `genesis.json`, `private_keys.json`, or `faucetOperators.json`, and never
-//! reads or copies keystore contents — only their file metadata.
+//! `--guardians-root` verifies the canonical signing policy and the sibling compiler
+//! artifacts against the EXISTING `genesis.json`, derives the approved
+//! contracts and the chain authorization from the deployment output and the
+//! canonical network, recomputes the offline checkpoint-0 identity through the
+//! populated node-side builder, and publishes the authorization into the
+//! selected network of `psy-genesis/config.json`. It never
+//! calls `generate_local_devnet_genesis`, never writes `genesis.json`,
+//! `private_keys.json`, `faucetOperators.json`, or any public `config.json`,
+//! and never reads keystore contents — only their file metadata, at the
+//! `guardian_secret_paths` locations derived from `$HOME`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     ffi::CString,
-    fs::OpenOptions,
     io::Write,
-    net::SocketAddr,
     os::unix::{
         ffi::OsStrExt,
-        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        fs::MetadataExt,
         io::{AsRawFd, FromRawFd},
     },
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{anyhow, ensure, Context};
-use clap::Parser as _;
 use parth_core::{
     crypto::hash::traits::QFieldHashable,
     felt::FromPrimitiveValuesFelt,
@@ -37,32 +37,29 @@ use plonky2::{
     plonk::config::Hasher,
 };
 use psy_client_common::data::{base_types::hash256::Hash256, qhashout::QHashOut as ClientHash};
-use psy_config::{NetworkConfigGoldilocks, PsyConfigGoldilocks, GUTA_FEE, DA_FEE};
+use psy_config::{ChainEndpoint, NetworkConfigGoldilocks, PsyConfigGoldilocks, GUTA_FEE, DA_FEE};
 use psy_core::network_config::PsyNetworkLocalDevnetConstants as N;
 use psy_data::genesis::genesis_block_setup::PsyGenesisBlockSetupData;
 use psy_node_core::genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder;
 use plonky2::field::types::PrimeField64;
 use guardian_common::{
-    endcap::approved_endcap_max_proof_bytes,
     protocol::{
-        self, ApprovedContract, ChainAuthorization, ChainEndpoint, GuardianAuthorization,
-        GuardianAuthorizationIndex, GuardianAuthorizationVersion, GuardianClientConfig,
-        GuardianConfig, GuardianSignerConfig, Hex, JsonText, BRIDGE_USER_ID,
+        self, ApprovedContract, ChainAuthorization, GuardianAuthorization,
+        Hex, JsonText, BRIDGE_USER_ID,
     },
+    runtime::guardian_secret_paths,
 };
 use psy_ups_circuit::signature::multisig::MultisigSignatureCircuit;
 use psy_vm::ups::multisig::{MultisigAccount, MULTISIG_POLICY_CONTRACT_ID};
 
 use super::{
-    decode_relayer_multisig_account, read_public_input, validate_multisig_policy_artifact,
-    GUARDIANS_ROOT_MAX_FEE_DEFAULT, GenerateGenesisDataArgs, Hash, PsyCompactUserDefinition,
+    compiler_checkout, decode_relayer_multisig_account, derive_withdrawal_layout, read_compiler_contract,
+    require_abi_method_agreement, require_deployment_roots, require_policy_contract, validate_multisig_policy_artifact,
+    CompiledContract, GUARDIANS_ROOT_MAX_FEE_DEFAULT, GenerateGenesisDataArgs, Hash, PsyCompactUserDefinition,
 };
 
-const GUARDIAN_FIRST_LISTEN_PORT: u16 = 15441;
-const CLIENT_HISTORY_LISTEN_PORT: u16 = 15450;
-const GUARDIANS_ROOT_CONFIG_FILE: &str = "config.json";
-const GUARDIANS_ROOT_AUTHORIZATION_DIR: &str = "authorization";
-const GUARDIANS_ROOT_ARCHIVE_JOURNAL_DIR: &str = "archive/relayer-journal";
+const GUARDIANS_ROOT_DB_DIR: &str = "db";
+
 
 type F = GoldilocksField;
 
@@ -72,7 +69,6 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
         .guardians_root
         .as_ref()
         .context("--guardians-root is required for the --guardians-root branch")?;
-    require_guardians_root_inputs(args)?;
     let repo_root = args.repo_root.canonicalize().with_context(|| {
         format!("repo-root {} does not exist", args.repo_root.display())
     })?;
@@ -80,16 +76,18 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
     // 1. The existing genesis is only read; it is never rewritten or re-derived.
     let genesis = load_existing_genesis(args, &repo_root)?;
 
-    // 2. Public inputs and their identity against the existing genesis.
-    let account = decode_relayer_multisig_account(&read_public_input(
-        &repo_root,
-        &args.relayer_multisig_account,
-    )?)?;
-    ensure!(account.contract_id == MULTISIG_POLICY_CONTRACT_ID, "public multisig account must name contract 1");
-    validate_multisig_policy_artifact(
-        &genesis.contracts,
-        &read_public_input(&repo_root, &args.multisig_policy_artifact)?,
-    )?;
+    // 2. Canonical signing policy and the sibling compiler artifacts, read once.
+    let (account, policy) = checked_canonical_policy(&repo_root)?;
+    let compiler_root = compiler_checkout(&repo_root)?;
+    let compiled = [
+        read_compiler_contract(&compiler_root, "token")?,
+        read_compiler_contract(&compiler_root, "multisig_policy")?,
+        read_compiler_contract(&compiler_root, "deposit_tree")?,
+        read_compiler_contract(&compiler_root, "withdrawal_tree")?,
+        read_compiler_contract(&compiler_root, "usdt_token")?,
+        read_compiler_contract(&compiler_root, "faucet")?,
+    ];
+    validate_multisig_policy_artifact(&genesis.contracts, &compiled[1])?;
     let circuit = MultisigSignatureCircuit::new()?;
     let user = locate_genesis_multisig_user(args, &genesis.users)?;
     verify_genesis_user_identity(&account, &circuit, user)?;
@@ -98,92 +96,308 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
     validate_compiled_dimensions(args)?;
     let genesis_hash = checkpoint0_genesis_hash(&genesis)?;
 
-    // 4. Authorization inputs, fee cap, and the complete shared validator.
-    let chains: Vec<ChainAuthorization> = decode_canonical(
-        &read_public_input(&repo_root, args.chains.as_ref().context("--chains")?)?,
-        "--chains",
-    )?;
-    let l1_endpoints: Vec<ChainEndpoint> = decode_canonical(
-        &read_public_input(&repo_root, args.l1_endpoints.as_ref().context("--l1-endpoints")?)?,
-        "--l1-endpoints",
-    )?;
-    let approved_contracts: Vec<ApprovedContract> = decode_canonical(
-        &read_public_input(
-            &repo_root,
-            args.approved_contracts.as_ref().context("--approved-contracts")?,
-        )?,
-        "--approved-contracts",
-    )?;
-    require_exact_l1_endpoint_coverage(&chains, &l1_endpoints)?;
+    // 4. Derived authorization, fee cap, and the complete shared validator.
+    // The selected canonical network's public L1 endpoints are the only L1
+    // source; a network without them is rejected without fallback.
+    let network = load_network_projection(&repo_root)?;
+    let l1_endpoints = canonical_l1_endpoints(&network)?;
     for endpoint in &l1_endpoints {
         validate_l1_endpoint(&endpoint.rpc_url)
             .with_context(|| format!("L1 endpoint for chain {}", endpoint.chain_index))?;
     }
-    let max_fee = args.max_fee.unwrap_or(GUARDIANS_ROOT_MAX_FEE_DEFAULT);
-    validate_fee_cap(max_fee)?;
-    let proof_bound = approved_endcap_max_proof_bytes()?;
-    let authorization = build_authorization(
-        &account,
-        &circuit,
-        &genesis_hash,
-        max_fee,
-        chains,
-        approved_contracts,
-        proof_bound,
-    )?;
-    authorization
-        .validate(GUTA_FEE, DA_FEE, proof_bound)
-        .map_err(|error| anyhow!("guardian authorization validation: {error}"))?;
+    let chains = derive_chain_authorizations(&repo_root, &l1_endpoints)?;
+    let authorization = prepare_authorization(&policy, &circuit, &genesis_hash, &genesis.contracts, &compiled, chains, args.max_fee)?;
 
-    // 5. One public config: typed network projection plus fixed listeners.
-    let network = load_network_projection(&repo_root)?;
-    let client = GuardianClientConfig {
-        endpoints: std::array::from_fn(|index| guardian_endpoint(index as u8 + 1)),
-        archive_path: PathBuf::from(GUARDIANS_ROOT_ARCHIVE_JOURNAL_DIR),
-        listen_address: SocketAddr::from(([127, 0, 0, 1], CLIENT_HISTORY_LISTEN_PORT)),
-        l1_endpoints,
-    };
-    for endpoint in &client.endpoints {
-        validate_http_origin(endpoint).context("generated guardian client endpoint")?;
-    }
-    let config = GuardianConfig {
-        network,
-        guardians: guardian_signers()?,
-        client,
-    };
-    config
-        .validate()
-        .map_err(|error| anyhow!("generated guardian config validation: {error}"))?;
-
-    // 6. Secret metadata walk only; keystore contents are never opened.
+    // 5. Secret metadata walk only; keystore contents are never opened.
     verify_secret_metadata()?;
 
-    // 7. Exclusive outputs, modes, and parent-directory syncs.
-    write_outputs(guardians_root, &config, &authorization)?;
+    // 6. Exclusive outputs. Every input above is settled before the first write.
+    publish_guardian_authorization(&repo_root, &authorization)?;
+    ensure_runtime_db(guardians_root)?;
     Ok(())
 }
 
-/// Fails closed when guardians-root-only flags leak into the unchanged publish branch.
+/// Builds the authorization from inputs already read. No chain call and no write.
+fn prepare_authorization(
+    policy: &JsonText<MultisigAccount>,
+    circuit: &MultisigSignatureCircuit,
+    genesis_hash: &Hash256,
+    deployments: &[super::PQBCDeployContract<Hash>],
+    compiled: &[CompiledContract],
+    chains: Vec<ChainAuthorization>,
+    max_fee: Option<u64>,
+) -> anyhow::Result<GuardianAuthorization> {
+    let approved_contracts = derive_approved_contracts(deployments, compiled)?;
+    let max_fee = max_fee.unwrap_or(GUARDIANS_ROOT_MAX_FEE_DEFAULT);
+    validate_fee_cap(max_fee)?;
+    build_authorization(policy, circuit, genesis_hash, max_fee, chains, approved_contracts)
+}
+
+/// Creates `<guardians-root>/db` mode 0700 when absent and keeps it when the
+/// runtime already owns databases there. The runtime creates the `.redb` files.
+fn ensure_runtime_db(root: &Path) -> anyhow::Result<()> {
+    let components = normal_absolute_components(root, "--guardians-root")?;
+    let effective_uid = current_uid()?;
+    let mut parent = open_directory(Path::new("/"))?;
+    for name in &components[..components.len() - 1] {
+        let c_name = CString::new(name.as_bytes()).context("guardians root contains NUL")?;
+        parent = open_protected_child(parent, &c_name, effective_uid, true)?;
+    }
+    let root_name = CString::new(components.last().context("guardians root missing")?.as_bytes()).context("guardians root contains NUL")?;
+    let root_dir = open_or_create_directory(parent, &root_name, effective_uid, true)?;
+    drop(open_or_create_directory(root_dir, &CString::new(GUARDIANS_ROOT_DB_DIR).unwrap(), effective_uid, true)?);
+    Ok(())
+}
+
+/// Checks default secret-output metadata, the canonical signing policy, and
+/// the sibling compiler artifacts before any reset. `private_keys.json` and
+/// `faucetOperators.json` are metadata only: an existing path must be one
+/// regular file owned by this user in mode 0600 and is opened without following
+/// symlinks. A missing file is a first generation. A missing parent is allowed
+/// because publication creates it with `create_dir_all`; an existing parent
+/// component must already be a real directory. `genesis.json` is not checked
+/// here — reset removes it under the separate cleanup mode rule. This does not
+/// read genesis, those secret files, deployment output, or a chain. The
+/// selected network's `guardian_authorization` may be incomplete before deploy;
+/// only its `bridge_relayer_signing_policy` is decoded here, strictly.
+pub fn preflight_fresh_devnet_inputs(repo_root: &Path) -> anyhow::Result<()> {
+    for path in super::fresh_devnet_secret_outputs(repo_root) {
+        super::preflight_owned_regular_destination(&path)
+            .with_context(|| format!("fresh output {}", path.display()))?;
+    }
+    checked_canonical_policy(repo_root)?;
+    let compiler_root = compiler_checkout(repo_root)?;
+    for stem in ["token", "multisig_policy", "deposit_tree", "withdrawal_tree", "usdt_token", "faucet"] {
+        let compiled = read_compiler_contract(&compiler_root, stem)?;
+        require_abi_method_agreement(&compiled)?;
+        if stem == "multisig_policy" { require_policy_contract(&compiled)?; }
+        if compiled.circuit_definitions.iter().any(|definition| definition.name == "withdraw") { derive_withdrawal_layout(&compiled)?; }
+    }
+    Ok(())
+}
+
+fn checked_policy(policy_bytes: &[u8]) -> anyhow::Result<MultisigAccount> {
+    let account = decode_relayer_multisig_account(policy_bytes)?;
+    ensure!(account.contract_id == MULTISIG_POLICY_CONTRACT_ID, "public multisig account must name contract 1");
+    account.initial_policy.validate().context("supplied multisig initial policy failed the existing policy validator")?;
+    Ok(account)
+}
+
+/// The strict canonical policy: the existing public account decoder for the
+/// typed account plus the exact retained string for byte-preserving publish.
+fn checked_policy_text(policy_bytes: &[u8]) -> anyhow::Result<(MultisigAccount, JsonText<MultisigAccount>)> {
+    let account = checked_policy(policy_bytes)?;
+    let text = std::str::from_utf8(policy_bytes).context("canonical signing policy must be UTF-8")?;
+    let policy = JsonText::<MultisigAccount>::parse(text.to_owned())
+        .map_err(|error| anyhow!("canonical signing policy is not canonical MultisigAccount JSON: {error}"))?;
+    Ok((account, policy))
+}
+
+/// The exact string value of the selected network's
+/// `guardian_authorization.bridge_relayer_signing_policy`, decode-only: the
+/// remaining authorization fields may be absent before the deploy.
+fn extract_policy_string(config: &serde_json::Value) -> anyhow::Result<String> {
+    let field = format!("networks.{}.guardian_authorization.bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK);
+    let pointer = format!("/networks/{}/guardian_authorization/bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK);
+    let value = config.pointer(&pointer).with_context(|| format!(
+        "canonical config psy-genesis/config.json is missing {field}: the checked-in public MultisigAccount signing policy is a required prerequisite before generation or publish"
+    ))?;
+    value.as_str().map(str::to_owned)
+        .with_context(|| format!("{field} must be the public MultisigAccount JSON string"))
+}
+
+/// Reads the canonical config and returns the strict signing-policy bytes; the
+/// single policy input for both generator branches.
+pub fn canonical_policy_bytes(repo_root: &Path) -> anyhow::Result<Vec<u8>> {
+    extract_policy_string(&require_canonical_config(repo_root)?).map(String::into_bytes)
+}
+
+/// Reads and strictly validates the canonical policy exactly as the postdeploy
+/// builder does — before any reset or output — so an accepted policy can never
+/// be rejected at the authorize phase. The retained string stays publishable
+/// byte-for-byte, and noncanonical JSON (unpadded hashes, unknown or duplicate
+/// fields) is rejected here with the field path.
+pub fn checked_canonical_policy(repo_root: &Path) -> anyhow::Result<(MultisigAccount, JsonText<MultisigAccount>)> {
+    checked_policy_text(&canonical_policy_bytes(repo_root)?).map_err(|error| {
+        anyhow!("{error}; networks.{}.guardian_authorization.bridge_relayer_signing_policy must be the canonical public MultisigAccount JSON string", psy_config::CURRENT_NETWORK)
+    })
+}
+
+/// Pins the canonical config file identity (device and inode) and its full
+/// bytes, including the selected-network signing-policy string, before any
+/// reset. Revalidation fails closed before publish; the helper's own
+/// `publish_guardian_authorization_unchanged` is the only authorized writer of
+/// the postdeploy authorization update.
+pub struct CanonicalPolicyPin {
+    device: u64,
+    inode: u64,
+    config_bytes: Vec<u8>,
+    policy_bytes: Vec<u8>,
+}
+
+impl CanonicalPolicyPin {
+    /// No-follow read of the canonical config with strict policy validation.
+    pub fn pin(repo_root: &Path) -> anyhow::Result<Self> {
+        let path = canonical_config_path(repo_root);
+        let file = open_canonical_config(&path)?;
+        let metadata = file.metadata().with_context(|| format!("reading {}", path.display()))?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut &file, &mut bytes).with_context(|| format!("reading {}", path.display()))?;
+        let config = duplicate_free_config(&bytes)?;
+        let policy = extract_policy_string(&config)?;
+        checked_policy(policy.as_bytes())?;
+        Ok(Self { device: metadata.dev(), inode: metadata.ino(), config_bytes: bytes, policy_bytes: policy.into_bytes() })
+    }
+
+    /// The pinned signing-policy bytes for `build_fresh_devnet_authorization`.
+    pub fn policy_bytes(&self) -> &[u8] { &self.policy_bytes }
+
+    /// Fails closed when the canonical config was replaced or any pinned byte,
+    /// including the signing-policy string, changed in place.
+    pub fn validate(&self, repo_root: &Path) -> anyhow::Result<()> {
+        let path = canonical_config_path(repo_root);
+        let file = open_canonical_config(&path)?;
+        let metadata = file.metadata().with_context(|| format!("reading {}", path.display()))?;
+        ensure!(metadata.dev() == self.device && metadata.ino() == self.inode, "canonical config {} was replaced during fresh startup", path.display());
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut &file, &mut bytes).with_context(|| format!("reading {}", path.display()))?;
+        ensure!(bytes == self.config_bytes.as_slice(),
+            "canonical config {} changed during fresh startup; only this helper's publish may update networks.{}.guardian_authorization.bridge_relayer_signing_policy",
+            path.display(), psy_config::CURRENT_NETWORK);
+        Ok(())
+    }
+}
+
+/// The typed authorization for the selected network, built after the L1 deploy.
+/// `policy_bytes` are the caller's already-read policy. This writes nothing.
+fn authorization_envelope(args: &GenerateGenesisDataArgs, policy_bytes: &[u8]) -> anyhow::Result<GuardianAuthorization> {
+    let repo_root = args.repo_root.canonicalize().context("repo-root does not exist")?;
+    let genesis = load_existing_genesis(args, &repo_root)?;
+    let (account, policy) = checked_policy_text(policy_bytes)?;
+    let compiler_root = compiler_checkout(&repo_root)?;
+    let compiled = [
+        read_compiler_contract(&compiler_root, "token")?, read_compiler_contract(&compiler_root, "multisig_policy")?,
+        read_compiler_contract(&compiler_root, "deposit_tree")?, read_compiler_contract(&compiler_root, "withdrawal_tree")?,
+        read_compiler_contract(&compiler_root, "usdt_token")?, read_compiler_contract(&compiler_root, "faucet")?,
+    ];
+    validate_multisig_policy_artifact(&genesis.contracts, &compiled[1])?;
+    let circuit = MultisigSignatureCircuit::new()?;
+    verify_genesis_user_identity(&account, &circuit, locate_genesis_multisig_user(args, &genesis.users)?)?;
+    validate_compiled_dimensions(args)?;
+    let genesis_hash = checkpoint0_genesis_hash(&genesis)?;
+    let network = load_network_projection(&repo_root)?;
+    let endpoints = canonical_l1_endpoints(&network)?;
+    for endpoint in &endpoints { validate_l1_endpoint(&endpoint.rpc_url)?; }
+    let chains = derive_chain_authorizations(&repo_root, &endpoints)?;
+    prepare_authorization(&policy, &circuit, &genesis_hash, &genesis.contracts, &compiled, chains, args.max_fee)
+}
+
+/// The typed authorization from the pinned policy bytes read before the reset;
+/// the policy string is preserved byte-for-byte in the published authorization.
+pub fn build_fresh_devnet_authorization(repo_root: &Path, policy_bytes: &[u8]) -> anyhow::Result<GuardianAuthorization> {
+    let args = clap::Parser::try_parse_from([
+        "generate-genesis-data", "--repo-root", repo_root.to_str().context("repo-root must be UTF-8")?,
+    ])?;
+    authorization_envelope(&args, policy_bytes)
+}
+
+fn canonical_config_path(repo_root: &Path) -> PathBuf { repo_root.join("psy-genesis/config.json") }
+
+/// The runtime's strict duplicate-free decoder: every public config read goes
+/// through it, so duplicate keys fail closed instead of last-wins.
+fn duplicate_free_config(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    guardian_common::protocol::parse_duplicate_free_json(bytes)
+        .map_err(|error| anyhow!("canonical config is not duplicate-free JSON: {error}"))
+}
+fn require_canonical_config(repo_root: &Path) -> anyhow::Result<serde_json::Value> {
+    let path = canonical_config_path(repo_root);
+    let file = open_canonical_config(&path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut &file, &mut bytes).with_context(|| format!("reading {}", path.display()))?;
+    let config = duplicate_free_config(&bytes)?;
+    Ok(config)
+}
+
+/// Sets `networks[CURRENT_NETWORK].guardian_authorization` and republishes the
+/// canonical config. Every other field and network is kept.
+pub fn publish_guardian_authorization(repo_root: &Path, authorization: &GuardianAuthorization) -> anyhow::Result<()> {
+    let path = canonical_config_path(repo_root);
+    let parent = open_directory(path.parent().context("canonical config has no parent")?)?;
+    let mut config = require_canonical_config(repo_root)?;
+    config.pointer_mut(&format!("/networks/{}", psy_config::CURRENT_NETWORK)).context("selected network missing")?["guardian_authorization"] =
+        serde_json::to_value(authorization).context("serializing the guardian authorization")?;
+    publish_replaced(&parent, &path, &serde_json::to_vec_pretty(&config).context("serializing the canonical config")?, 0o644)
+}
+
+/// Publishes only when the canonical config still holds the pinned bytes. The
+/// final identity+bytes compare runs through the held parent descriptor
+/// immediately before the `renameat`, leaving a one-syscall window that is
+/// trusted to the same-uid mutator: this is a changed-content rejection, not an
+/// atomic compare-and-swap promise.
+pub fn publish_guardian_authorization_unchanged(
+    repo_root: &Path,
+    pin: &CanonicalPolicyPin,
+    authorization: &GuardianAuthorization,
+) -> anyhow::Result<()> {
+    let path = canonical_config_path(repo_root);
+    let parent = open_directory(path.parent().context("canonical config has no parent")?)?;
+    let name = CString::new(path.file_name().context("canonical config has no name")?.as_bytes()).context("canonical config contains NUL")?;
+    let read_current = |parent: &std::fs::File| -> anyhow::Result<(std::fs::Metadata, Vec<u8>)> {
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDONLY, 0) };
+        ensure!(fd >= 0, "reading {} failed: {}", path.display(), std::io::Error::last_os_error());
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = file.metadata().with_context(|| format!("reading {}", path.display()))?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut &file, &mut bytes).with_context(|| format!("reading {}", path.display()))?;
+        Ok((metadata, bytes))
+    };
+    let unchanged = |current: &(std::fs::Metadata, Vec<u8>)| -> bool {
+        current.0.dev() == pin.device && current.0.ino() == pin.inode && current.1.as_slice() == pin.config_bytes.as_slice()
+    };
+    let current = read_current(&parent)?;
+    ensure!(unchanged(&current),
+        "canonical config {} changed during fresh startup; only this helper's publish may update networks.{}.guardian_authorization.bridge_relayer_signing_policy",
+        path.display(), psy_config::CURRENT_NETWORK);
+    let mut config = duplicate_free_config(&current.1)?;
+    config.pointer_mut(&format!("/networks/{}", psy_config::CURRENT_NETWORK)).context("selected network missing")?["guardian_authorization"] =
+        serde_json::to_value(authorization).context("serializing the guardian authorization")?;
+    let body = serde_json::to_vec_pretty(&config).context("serializing the canonical config")?;
+    // The last compare through the held parent descriptor precedes the rename by
+    // the one trusted same-uid window documented above.
+    let current = read_current(&parent)?;
+    ensure!(unchanged(&current),
+        "canonical config {} changed during fresh startup; only this helper's publish may update networks.{}.guardian_authorization.bridge_relayer_signing_policy",
+        path.display(), psy_config::CURRENT_NETWORK);
+    publish_replaced(&parent, &path, &body, 0o644)
+}
+/// No-follow open of the canonical config; the returned descriptor backs every
+/// read and metadata check so a symlink swap cannot redirect them.
+fn open_canonical_config(path: &Path) -> anyhow::Result<std::fs::File> {
+    let directory = open_directory(path.parent().context("canonical config has no parent")?)?;
+    let name = CString::new(path.file_name().context("canonical config has no name")?.as_bytes()).context("canonical config contains NUL")?;
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDONLY, 0) };
+    ensure!(fd >= 0, "reading {} failed: {}", path.display(), std::io::Error::last_os_error());
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn publish_replaced(parent: &std::fs::File, path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    let name = CString::new(path.file_name().context("output has no name")?.as_bytes()).context("output contains NUL")?;
+    let temporary = CString::new(format!(".{}.tmp", path.file_name().unwrap().to_string_lossy())).unwrap();
+    reject_existing_output(&parent, &temporary.to_string_lossy())?;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), temporary.as_ptr(), libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode) };
+    ensure!(fd >= 0, "reserving {} failed: {}", path.display(), std::io::Error::last_os_error());
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let publish = (|| { file.write_all(bytes)?; file.sync_all()?;
+        ensure!(unsafe { libc::renameat(parent.as_raw_fd(), temporary.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } == 0, "publishing {} failed: {}", path.display(), std::io::Error::last_os_error());
+        Ok(parent.sync_all()?) })();
+    if publish.is_err() { unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) }; }
+    publish.with_context(|| format!("publishing {}", path.display()))
+}
+
+
+/// Fails closed when the guardians-root fee cap leaks into the unchanged publish branch.
 pub fn reject_publish_branch_flags(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
-    for (present, flag) in [
-        (args.chains.is_some(), "--chains"),
-        (args.l1_endpoints.is_some(), "--l1-endpoints"),
-        (args.approved_contracts.is_some(), "--approved-contracts"),
-        (args.max_fee.is_some(), "--max-fee"),
-    ] {
-        ensure!(!present, "{flag} is only valid together with --guardians-root");
-    }
-    Ok(())
-}
-
-fn require_guardians_root_inputs(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
-    for (present, flag) in [
-        (args.chains.is_some(), "--chains"),
-        (args.l1_endpoints.is_some(), "--l1-endpoints"),
-        (args.approved_contracts.is_some(), "--approved-contracts"),
-    ] {
-        ensure!(present, "{flag} is required together with --guardians-root");
-    }
+    ensure!(args.max_fee.is_none(), "--max-fee is only valid together with --guardians-root");
     Ok(())
 }
 
@@ -375,43 +589,190 @@ fn require_exact_l1_endpoint_coverage(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The calls the relayer and guardian actually make, by contract id. A contract
+/// with no entry is approved with an empty method list.
+const CALLED_METHODS: [(u32, &[&str]); 3] = [
+    (1, &["set_policy"]),
+    (2, &["set_chain_root"]),
+    (3, &["append_withdrawal", "batch_append_withdrawals_2", "batch_append_withdrawals_5"]),
+];
+
+/// Method bindings for the calls this contract serves, taken from the compiled
+/// definitions. The name is the generator's expected name; the method id and the
+/// input count come from the compiler, and the ABI must report the same count.
+fn approved_methods(contract_id: u32, artifact: &CompiledContract) -> anyhow::Result<Vec<protocol::ApprovedMethod>> {
+    let expected = CALLED_METHODS.iter().find(|(id, _)| *id == contract_id).map(|(_, names)| *names).unwrap_or(&[]);
+    let abi_methods = artifact.abi.pointer("/contract/methods").and_then(serde_json::Value::as_array).context("compiler ABI methods missing")?;
+    expected.iter().map(|name| {
+        let definition = artifact.circuit_definitions.iter().find(|definition| definition.name == *name)
+            .with_context(|| format!("contract {contract_id} compiler artifact has no {name} definition"))?;
+        let abi = abi_methods.iter().find(|method| method["name"].as_str() == Some(*name))
+            .with_context(|| format!("contract {contract_id} ABI has no {name} method"))?;
+        let input_felt_count = u32::try_from(definition.circuit_inputs.len()).context("input count exceeds u32")?;
+        ensure!(abi["input_felt_count"].as_u64() == Some(u64::from(input_felt_count)), "ABI input count for {name} differs from the compiled definition");
+        Ok(protocol::ApprovedMethod { name: (*name).to_owned(), method_id: definition.method_id, input_felt_count })
+    }).collect()
+}
+
+/// One approved contract per genesis deployment. The record keeps the leaf, the
+/// called method bindings, and the raw compiler bytes' SHA-256; the compiler
+/// JSON stays in its own directory.
+fn derive_approved_contracts(
+    deployments: &[super::PQBCDeployContract<Hash>],
+    compiled: &[CompiledContract],
+) -> anyhow::Result<Vec<ApprovedContract>> {
+    ensure!(deployments.len() == compiled.len(), "Genesis deployments and compiler artifacts differ in count");
+    ensure!(deployments.len() == compiled.len(), "Genesis deployments and compiler artifacts differ in count");
+    let mut approved = Vec::with_capacity(compiled.len());
+    for (contract_id, (deployment, artifact)) in deployments.iter().zip(compiled).enumerate() {
+        let contract_id = u32::try_from(contract_id).context("contract id exceeds u32")?;
+        require_abi_method_agreement(artifact)?;
+        require_deployment_roots(artifact, deployment)?;
+        let withdrawal_layout = if artifact.circuit_definitions.iter().any(|definition| definition.name == "withdraw") {
+            Some(derive_withdrawal_layout(artifact)?)
+        } else {
+            None
+        };
+        approved.push(ApprovedContract {
+            contract_id,
+            contract_leaf_json: JsonText::from_value(&contract_leaf(deployment)).map_err(|error| anyhow!("contract leaf JSON: {error}"))?,
+            methods: approved_methods(contract_id, artifact)?,
+            withdrawal_layout,
+        });
+    }
+    Ok(approved)
+}
+
+/// Deployment directory for one canonical chain index, in the order the
+/// launcher deploys the local cohort.
+const DEPLOYMENT_NETWORKS: [&str; 3] = ["localhost", "localhostBsc", "localhostBase"];
+
+/// Chain authorization from the already built deployment output. The L1 genesis
+/// hash is the one field no file carries, so it comes from block 0 of the
+/// canonical endpoint for that chain index.
+fn derive_chain_authorizations(repo_root: &Path, endpoints: &[ChainEndpoint]) -> anyhow::Result<Vec<ChainAuthorization>> {
+    let mut chains = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let network = DEPLOYMENT_NETWORKS.get(usize::from(endpoint.chain_index)).with_context(|| {
+            format!("canonical chain index {} has no deployment directory", endpoint.chain_index)
+        })?;
+        let directory = repo_root.join(format!("psy-contracts/deployments/{network}"));
+        let summary = read_json(&directory.join("deployed-contracts.json"))?;
+        let chain_index = summary.pointer("/protocol/chain/l1ChainIndex").and_then(serde_json::Value::as_u64)
+            .context("deployment summary omits l1ChainIndex")?;
+        ensure!(chain_index == u64::from(endpoint.chain_index), "deployment {network} chain index {chain_index} differs from the canonical endpoint");
+        let chain_id = summary["chainId"].as_str().context("deployment summary omits chainId")?.parse::<u64>()
+            .context("deployment chainId is not a number")?;
+        let reported = rpc_quantity(&endpoint.rpc_url, "eth_chainId", serde_json::json!([]))?;
+        ensure!(reported == chain_id, "canonical endpoint for chain {chain_index} reports chain id {reported}, not the deployed {chain_id}");
+        let genesis_hash = rpc_block_hash(&endpoint.rpc_url, "0x0")?;
+        let deployment_block = ["Bridge_Proxy", "StateManager_Proxy"].into_iter().map(|name| {
+            let receipt = read_json(&directory.join(format!("{name}.json")))?;
+            receipt.pointer("/receipt/blockNumber").and_then(serde_json::Value::as_u64)
+                .with_context(|| format!("{name} receipt omits its block number"))
+        }).collect::<anyhow::Result<Vec<_>>>()?.into_iter().max().context("deployment receipts missing")?;
+        let bridge = address_field(&summary, "/proxies/Bridge_Proxy")?;
+        let state_manager = address_field(&summary, "/proxies/StateManager_Proxy")?;
+        let mut token_mappings = summary.pointer("/protocol/tokens").and_then(serde_json::Value::as_object)
+            .context("deployment summary omits tokens")?.values().map(|token| {
+            let token_address = address_field(token, "/l1Address")?;
+            let contract_id = token["l2TokenContractId"].as_str().context("token omits l2TokenContractId")?;
+            let words = hex::decode(contract_id.trim_start_matches("0x")).context("token contract id is not hex")?;
+            let l2_contract_id = words.last().copied().context("token contract id is empty")? as u32;
+            ensure!(words[..words.len() - 1].iter().all(|word| *word == 0), "token contract id uses more than one byte");
+            Ok(protocol::TokenMapping { token: token_address, l2_contract_id })
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        token_mappings.sort_by_key(|mapping| mapping.token);
+        chains.push(ChainAuthorization {
+            chain_index: endpoint.chain_index, chain_id: alloy_primitives::U256::from(chain_id), genesis_hash: Hex(genesis_hash),
+            bridge, state_manager, deployment_block, token_mappings,
+        });
+    }
+    Ok(chains)
+}
+
+fn read_json(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn address_field(value: &serde_json::Value, pointer: &str) -> anyhow::Result<Hex<20>> {
+    let text = value.pointer(pointer).and_then(serde_json::Value::as_str).with_context(|| format!("{pointer} is missing"))?;
+    let bytes = hex::decode(text.trim_start_matches("0x")).with_context(|| format!("{pointer} is not hex"))?;
+    let bytes: [u8; 20] = bytes.try_into().map_err(|_| anyhow!("{pointer} is not a 20 byte address"))?;
+    ensure!(bytes != [0; 20], "{pointer} is the zero address");
+    Ok(Hex(bytes))
+}
+
+fn rpc_quantity(url: &str, method: &str, params: serde_json::Value) -> anyhow::Result<u64> {
+    let result = rpc_result(url, method, params)?;
+    let text = result.as_str().with_context(|| format!("{method} returned no quantity"))?;
+    u64::from_str_radix(text.trim_start_matches("0x"), 16).with_context(|| format!("{method} quantity is not hex"))
+}
+
+fn rpc_block_hash(url: &str, block: &str) -> anyhow::Result<[u8; 32]> {
+    let result = rpc_result(url, "eth_getBlockByNumber", serde_json::json!([block, false]))?;
+    let text = result["hash"].as_str().context("block 0 has no hash")?;
+    let bytes = hex::decode(text.trim_start_matches("0x")).context("block 0 hash is not hex")?;
+    bytes.try_into().map_err(|_| anyhow!("block 0 hash is not 32 bytes"))
+}
+
+fn rpc_result(url: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let response = reqwest::blocking::Client::new()
+        .post(url)
+        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
+        .send()
+        .with_context(|| format!("calling {method} on {url}"))?;
+    let body: serde_json::Value = response.json().with_context(|| format!("reading {method} response from {url}"))?;
+    body.get("result").filter(|result| !result.is_null()).cloned().with_context(|| format!("{method} on {url} returned no result: {body}"))
+}
+
+fn contract_leaf(deployment: &super::PQBCDeployContract<Hash>) -> psy_client_data::qdata::contract::PsyContractLeaf<F> {
+    use plonky2::field::types::Field;
+    let mut function_tree = parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3::<PoseidonHasher, Hash>::new(
+        psy_config::network_constants::CONTRACT_FUNCTION_TREE_HEIGHT,
+    );
+    for (index, leaf) in deployment.function_whitelist.iter().enumerate() {
+        function_tree.set_leaf_no_proof(index as u64, *leaf);
+    }
+    psy_client_data::qdata::contract::PsyContractLeaf {
+        deployer: F::from_canonical_u64(deployment.deployer),
+        function_tree_root: ClientHash(function_tree.get_root().0),
+        code_root: ClientHash(deployment.code_root.0),
+        state_tree_height: F::from_canonical_u64(u64::from(deployment.code_definition.state_tree_height)),
+        // Genesis deployments carry no compiler layout metadata, so the leaf
+        // uses the same empty layout the node builder records.
+        state_layout_root: ClientHash::default(),
+        state_layout_field_count: F::ZERO,
+        state_layout_slot_count: F::ZERO,
+    }
+}
+
 fn build_authorization(
-    account: &MultisigAccount,
+    policy: &JsonText<MultisigAccount>,
     circuit: &MultisigSignatureCircuit,
     genesis_hash: &Hash256,
     max_fee: u64,
     chains: Vec<ChainAuthorization>,
     approved_contracts: Vec<ApprovedContract>,
-    proof_bound: u32,
 ) -> anyhow::Result<GuardianAuthorization> {
     let fingerprint = circuit.get_fingerprint();
-    let param = account.public_key_param().context("multisig account key parameter")?;
     let manager = psy_ups_circuit::circuit_manager::core::PsyUPSStepCircuitManager::<plonky2::plonk::config::PoseidonGoldilocksConfig, 2>::new_with_config(psy_config::PSY_NETWORK_MAGIC);
     let verifier = manager.ups_end_cap.minifier_chain.as_ref().context("endcap verifier unavailable")?.get_verifier_data();
     let endcap_verifier_fingerprint = ClientHash(psy_plonky2_circuits::proof_minifier::pm_core::get_circuit_fingerprint_generic::<2, F, plonky2::plonk::config::PoseidonGoldilocksConfig>(verifier));
     Ok(GuardianAuthorization {
-        version: 1,
-        network_magic: psy_config::PSY_NETWORK_MAGIC,
         genesis_hash: Hex(genesis_hash.0),
-        user_id: BRIDGE_USER_ID,
-        account_json: JsonText::from_value(account).map_err(|error| anyhow!("account JSON: {error}"))?,
-        account_public_key: ClientHash(PoseidonHash::two_to_one(fingerprint.0, param.0)),
+        bridge_relayer_signing_policy: policy.clone(),
         multisig_fingerprint: ClientHash(fingerprint.0),
-        deposit_contract_id: 2,
-        withdrawal_contract_id: 3,
-        fee_contract_id: 0,
-        guta_fee: GUTA_FEE,
-        da_fee: DA_FEE,
-        max_fee,
-        max_endcap_proof_bytes: proof_bound,
         endcap_verifier_fingerprint,
+        max_fee,
         approved_contracts,
         chains,
     })
 }
 /// Loads `<repo-root>/psy-genesis/config.json` at the compiled stage, not the
-/// file's default stage, and keeps the configured `prove_proxy_url`.
+/// file's default stage, keeping the configured `prove_proxy_url` and the
+/// canonical network's public guardian endpoints.
 fn load_network_projection(repo_root: &Path) -> anyhow::Result<NetworkConfigGoldilocks> {
     let config_path = repo_root.join("psy-genesis/config.json");
     let config = PsyConfigGoldilocks::builder()
@@ -419,81 +780,25 @@ fn load_network_projection(repo_root: &Path) -> anyhow::Result<NetworkConfigGold
         .network(psy_config::CURRENT_NETWORK)
         .build()
         .map_err(|error| anyhow!("loading {}: {error}", config_path.display()))?;
-    let mut network = config
+    let network = config
         .get_network(psy_config::CURRENT_NETWORK)
         .map_err(|error| anyhow!("selecting {} from {}: {error}", psy_config::CURRENT_NETWORK, config_path.display()))?
         .clone();
     Ok(network)
 }
 
-/// Serializes the public config and re-inserts `system_prove_proxy_url` so the
-/// field is present even when the pool is empty.
-fn config_bytes(config: &GuardianConfig) -> anyhow::Result<Vec<u8>> {
-    let mut value = serde_json::to_value(config).context("serializing guardian config")?;
-    let system_prove_proxy_url = serde_json::to_value(&config.network.system_prove_proxy_url)
-        .context("serializing system prove proxy URLs")?;
-    let object = value
-        .as_object_mut()
-        .context("guardian config must serialize to a JSON object")?;
-    let network = object
-        .get_mut("network")
-        .context("guardian config must serialize a network object")?
-        .as_object_mut()
-        .context("guardian config network must be a JSON object")?;
-    network.insert("system_prove_proxy_url".to_owned(), system_prove_proxy_url);
-    let mut bytes = serde_json::to_vec_pretty(&value).context("serializing guardian config JSON")?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
-fn guardian_listen_address(id: u8) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], GUARDIAN_FIRST_LISTEN_PORT + u16::from(id) - 1))
-}
-
-fn guardian_endpoint(id: u8) -> String {
-    format!("http://127.0.0.1:{}/", GUARDIAN_FIRST_LISTEN_PORT + u16::from(id) - 1)
-}
-
-fn guardian_signers() -> anyhow::Result<BTreeMap<u8, GuardianSignerConfig>> {
-    let mut guardians = BTreeMap::new();
-    for id in 1..=3u8 {
-        let (signing_key_secret_path, signing_key_password_secret_path) = keystore_secret_paths(id)?;
-        guardians.insert(
-            id,
-            GuardianSignerConfig {
-                listen_address: guardian_listen_address(id),
-                signing_key_secret_path,
-                signing_key_password_secret_path,
-            },
-        );
-    }
-    Ok(guardians)
-}
-
-fn keystore_secret_paths(id: u8) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let home = home::home_dir().context("home directory is required for guardian keystore metadata")?;
-    let keystore = home.join(".psy").join("keystore");
-    Ok((
-        keystore.join(format!("guardian-{id}.keystore.json")),
-        keystore.join(format!("guardian-{id}.password")),
-    ))
-}
-
-fn validate_http_origin(value: &str) -> anyhow::Result<()> {
-    let url = url::Url::parse(value).context("parsing guardian HTTP origin")?;
-    ensure!(url.scheme() == "http", "guardian endpoints must be HTTP origins");
-    ensure!(url.host().is_some(), "guardian endpoints require a host");
+/// Canonical selected network `l1_endpoints` replace the former --l1-endpoints
+/// input; a network without guardian L1 endpoints is rejected without fallback.
+fn canonical_l1_endpoints(network: &NetworkConfigGoldilocks) -> anyhow::Result<Vec<ChainEndpoint>> {
     ensure!(
-        url.username().is_empty() && url.password().is_none(),
-        "guardian endpoints must be credential-free"
+        !network.l1_endpoints.is_empty(),
+        "canonical network {} must declare nonempty l1_endpoints for the --guardians-root branch",
+        psy_config::CURRENT_NETWORK
     );
-    ensure!(
-        url.query().is_none() && url.fragment().is_none(),
-        "guardian endpoints must not carry a query or fragment"
-    );
-    ensure!(matches!(url.path(), "" | "/"), "guardian endpoints must not carry a path");
-    Ok(())
+    Ok(network.l1_endpoints.clone())
 }
+
+
 
 fn validate_l1_endpoint(value: &str) -> anyhow::Result<()> {
     let url = url::Url::parse(value).context("parsing L1 endpoint")?;
@@ -518,7 +823,7 @@ fn validate_l1_endpoint(value: &str) -> anyhow::Result<()> {
 /// ever opening the final file.
 fn verify_secret_metadata() -> anyhow::Result<()> {
     for id in 1..=3u8 {
-        let (key, password) = keystore_secret_paths(id)?;
+        let (key, password) = guardian_secret_paths(id).map_err(|error| anyhow!("guardian {id} keystore metadata: {error}"))?;
         verify_protected_file(&key)
             .with_context(|| format!("guardian {id} keystore metadata {}", key.display()))?;
         verify_protected_file(&password)
@@ -567,62 +872,8 @@ fn current_uid() -> anyhow::Result<u32> {
     Ok(unsafe { libc::geteuid() })
 }
 
-fn write_outputs(
-    root: &Path,
-    config: &GuardianConfig,
-    authorization: &GuardianAuthorization,
-) -> anyhow::Result<()> {
-    let components = normal_absolute_components(root, "--guardians-root")?;
-    let effective_uid = current_uid()?;
-    let mut parent = open_directory(Path::new("/"))?;
-    for name in &components[..components.len() - 1] {
-        let c_name = CString::new(name.as_bytes()).context("guardians root contains NUL")?;
-        parent = open_protected_child(parent, &c_name, effective_uid, true)?;
-    }
-    let root_name = CString::new(components.last().context("guardians root missing")?.as_bytes())
-        .context("guardians root contains NUL")?;
-    let root_exists = nofollow_exists(parent.as_raw_fd(), &root_name)?;
-    if root_exists {
-        let root_dir = open_nofollow_directory(&parent, &root_name)?;
-        verify_directory_descriptor(&root_dir, effective_uid, false)?;
-        reject_existing_output(&root_dir, GUARDIANS_ROOT_CONFIG_FILE)?;
-        reject_existing_output(&root_dir, GUARDIANS_ROOT_AUTHORIZATION_DIR)?;
-        reject_existing_output(&root_dir, "archive")?;
-    }
 
-    let config_body = config_bytes(config)?;
-    let authorization_body = authorization_bytes(authorization)?;
-    let index = GuardianAuthorizationIndex {
-        active_version: 1,
-        versions: vec![GuardianAuthorizationVersion {
-            version: 1,
-            sha256: protocol::sha256(&authorization_body),
-        }],
-    };
-    let mut index_bytes = serde_json::to_vec_pretty(&index).context("serializing authorization index")?;
-    index_bytes.push(b'\n');
 
-    let root_dir = open_or_create_directory(parent, &root_name, effective_uid, true)?;
-    let authorization_dir = exclusive_child_directory(&root_dir, GUARDIANS_ROOT_AUTHORIZATION_DIR, effective_uid)?;
-    let versions_dir = exclusive_child_directory(&authorization_dir, "versions", effective_uid)?;
-    let archive_dir = exclusive_child_directory(&root_dir, "archive", effective_uid)?;
-    let journal_dir = exclusive_child_directory(&archive_dir, "relayer-journal", effective_uid)?;
-    drop(journal_dir);
-    write_new_at(&root_dir, GUARDIANS_ROOT_CONFIG_FILE, &config_body)?;
-    write_new_at(&versions_dir, "1.json", &authorization_body)?;
-    write_new_at(&authorization_dir, "index.json", &index_bytes)?;
-    Ok(())
-}
-
-fn authorization_bytes(authorization: &GuardianAuthorization) -> anyhow::Result<Vec<u8>> {
-    let text = JsonText::<GuardianAuthorization>::from_value(authorization)
-        .map_err(|error| anyhow!("serializing guardian authorization: {error}"))?
-        .as_str()
-        .to_owned();
-    let mut bytes = text.into_bytes();
-    bytes.push(b'\n');
-    Ok(bytes)
-}
 
 fn exclusive_child_directory(
     parent: &std::fs::File,
@@ -776,12 +1027,7 @@ mod tests {
     fn guardians_root_args() -> GenerateGenesisDataArgs {
         GenerateGenesisDataArgs::try_parse_from([
             "generate-genesis-data",
-            "--relayer-multisig-account", "account.json",
-            "--multisig-policy-artifact", "policy.json",
             "--guardians-root", "/tmp/guardians",
-            "--chains", "chains.json",
-            "--l1-endpoints", "l1.json",
-            "--approved-contracts", "approved.json",
         ])
         .expect("guardians-root flags parse")
     }
@@ -810,23 +1056,20 @@ mod tests {
     }
 
     #[test]
-    fn guardians_root_flags_are_required_together_and_rejected_without_guardians_root() {
-        let args = guardians_root_args();
-        require_guardians_root_inputs(&args).expect("complete guardians-root flags");
-        let mut partial = guardians_root_args();
-        partial.chains = None;
-        assert!(require_guardians_root_inputs(&partial).is_err());
-        let mut publish = guardians_root_args();
+    fn guardians_root_fee_cap_is_rejected_on_the_publish_branch() {
+        let mut publish = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--guardians-root", "/tmp/guardians", "--max-fee", "2000000000",
+        ])
+        .expect("publish-branch args carrying the guardians-root fee cap parse");
         publish.guardians_root = None;
         assert!(reject_publish_branch_flags(&publish).is_err());
-        let mut fee_only = guardians_root_args();
-        fee_only.guardians_root = None;
-        fee_only.chains = None;
-        fee_only.l1_endpoints = None;
-        fee_only.approved_contracts = None;
-        fee_only.max_fee = Some(GUARDIANS_ROOT_MAX_FEE_DEFAULT);
-        assert!(reject_publish_branch_flags(&fee_only).is_err());
-        fee_only.max_fee = None;
+        publish.max_fee = None;
+        assert!(reject_publish_branch_flags(&publish).is_ok());
+        for flag in ["--chains", "--approved-contracts", "--multisig-policy-artifact"] {
+            let mut args = vec!["generate-genesis-data", "--guardians-root", "/tmp/guardians"];
+            args.extend([flag, "removed.json"]);
+            assert!(GenerateGenesisDataArgs::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
@@ -852,12 +1095,6 @@ mod tests {
             genesis_hash: Hex([1; 32]),
             bridge: Hex([2; 20]),
             state_manager: Hex([3; 20]),
-            bridge_code_hash: Hex([4; 32]),
-            bridge_implementation: Hex([5; 20]),
-            bridge_implementation_code_hash: Hex([6; 32]),
-            state_manager_code_hash: Hex([7; 32]),
-            state_manager_implementation: Hex([8; 20]),
-            state_manager_implementation_code_hash: Hex([9; 32]),
             deployment_block: 1,
             token_mappings: vec![],
         };
@@ -871,67 +1108,50 @@ mod tests {
     }
 
     #[test]
-    fn system_prove_proxy_url_is_materialized_by_config_serializer() {
-        let fixture = serde_json::json!({
-            "network": {
-                "magic": "0", "users_per_realm": 1, "global_user_tree_height": 1,
-                "realm_user_tree_height": 1, "group_realm_height": 1, "realm_configs": [],
-                "p2p": {"checkpoints_per_epoch": 1}, "coordinator_configs": [],
-                "prove_proxy_url": [], "faucet_rpc_url": [], "nostr_relay_url": "",
-                "native_currency": "", "native_currency_decimal": 0, "native_currency_name": "",
-                "fees": {"register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0}
-            },
-            "guardians": {},
-            "client": {
-                "endpoints": ["", "", ""], "archive_path": "",
-                "listen_address": "127.0.0.1:1", "l1_endpoints": []
-            }
-        });
-        let config: GuardianConfig = serde_json::from_value(fixture).expect("public JSON fixture");
-        let bytes = config_bytes(&config).expect("production serializer");
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("serialized config");
-        assert!(value["network"]["system_prove_proxy_url"].as_array().expect("field").is_empty());
-    }
-    #[test]
-    fn guardian_listeners_and_endpoints_are_fixed_and_distinct() {
-        let endpoints: Vec<String> = (1..=3u8).map(guardian_endpoint).collect();
-        assert_eq!(endpoints, vec!["http://127.0.0.1:15441/", "http://127.0.0.1:15442/", "http://127.0.0.1:15443/"]);
-        for id in 1..=3u8 {
-            let address = guardian_listen_address(id);
-            assert_eq!(address.to_string(), format!("127.0.0.1:{}", GUARDIAN_FIRST_LISTEN_PORT + u16::from(id) - 1));
-        }
-        let client = SocketAddr::from(([127, 0, 0, 1], CLIENT_HISTORY_LISTEN_PORT));
-        assert_eq!(client.to_string(), "127.0.0.1:15450");
-    }
-
-    #[test]
-    fn http_origins_are_validated_and_l1_endpoints_keep_the_existing_policy() {
-        validate_http_origin("http://127.0.0.1:15441/").expect("plain http origin");
-        for invalid in [
-            "https://127.0.0.1:15441/",
-            "http://user:pass@127.0.0.1:15441/",
-            "http://127.0.0.1:15441/history",
-            "http://127.0.0.1:15441/?a=b",
-            "http://127.0.0.1:15441/#x",
-            "not a url",
-        ] {
-            assert!(validate_http_origin(invalid).is_err(), "{invalid} must be rejected");
-        }
+    fn l1_endpoints_keep_the_existing_policy() {
         validate_l1_endpoint("https://example.invalid/rpc").expect("https l1 endpoint");
         validate_l1_endpoint("http://localhost:8545").expect("loopback http l1 endpoint");
         assert!(validate_l1_endpoint("http://example.invalid/rpc").is_err());
         assert!(validate_l1_endpoint("https://user:pass@example.invalid").is_err());
     }
 
+    fn canonical_network(l1_endpoints: serde_json::Value) -> anyhow::Result<NetworkConfigGoldilocks> {
+        let mut value = serde_json::json!({
+            "magic": "0", "users_per_realm": 1, "global_user_tree_height": 1,
+            "realm_user_tree_height": 1, "group_realm_height": 1, "realm_configs": [],
+            "p2p": {"checkpoints_per_epoch": 1}, "coordinator_configs": [],
+            "prove_proxy_url": [], "faucet_rpc_url": [], "nostr_relay_url": "",
+            "native_currency": "", "native_currency_decimal": 0, "native_currency_name": "",
+            "fees": {"register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0}
+        });
+        value["l1_endpoints"] = l1_endpoints;
+        serde_json::from_value(value).map_err(|error| anyhow!(error))
+    }
+
+    #[test]
+    fn canonical_network_l1_endpoints_replace_the_former_flag_input() {
+        let endpoints = canonical_network(serde_json::json!([
+            {"chain_index": 0, "rpc_url": "http://127.0.0.1:8545"},
+            {"chain_index": 1, "rpc_url": "http://127.0.0.1:9545"},
+            {"chain_index": 2, "rpc_url": "http://127.0.0.1:10545"},
+        ])).expect("canonical network");
+        let decoded = canonical_l1_endpoints(&endpoints).expect("canonical l1 endpoints");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].chain_index, 0);
+        assert_eq!(decoded[0].rpc_url, "http://127.0.0.1:8545");
+        let missing = canonical_network(serde_json::json!([])).expect("canonical network");
+        assert!(canonical_l1_endpoints(&missing).is_err());
+    }
+
     #[test]
     fn duplicate_or_unknown_keys_fail_canonical_array_inputs() {
-        let valid = r#"[{"chain_index":1,"rpc_url":"http://localhost:8545"}]"#;
+        let valid = "[{\"chain_index\":1,\"rpc_url\":\"http://localhost:8545\"}]";
         let decoded: Vec<ChainEndpoint> =
             decode_canonical(valid.as_bytes(), "--l1-endpoints").expect("valid array");
         assert_eq!(decoded[0].chain_index, 1);
-        let duplicate = r#"[{"chain_index":1,"chain_index":1,"rpc_url":"http://localhost:8545"}]"#;
+        let duplicate = "[{\"chain_index\":1,\"chain_index\":1,\"rpc_url\":\"http://localhost:8545\"}]";
         assert!(decode_canonical::<Vec<ChainEndpoint>>(duplicate.as_bytes(), "--l1-endpoints").is_err());
-        let unknown = r#"[{"chain_index":1,"rpc_url":"http://localhost:8545","extra":true}]"#;
+        let unknown = "[{\"chain_index\":1,\"rpc_url\":\"http://localhost:8545\",\"extra\":true}]";
         assert!(decode_canonical::<Vec<ChainEndpoint>>(unknown.as_bytes(), "--l1-endpoints").is_err());
     }
 
@@ -941,4 +1161,180 @@ mod tests {
         assert!(verify_protected_file(Path::new("/home/u/../u/guardian-1.keystore.json")).is_err());
         assert!(verify_protected_file(Path::new("/home/u/./../u/guardian-1.keystore.json")).is_err());
     }
+
+    fn deployment_fixture(root: &Path, chain_id: u64, block: u64) {
+        let directory = root.join("psy-contracts/deployments/localhost");
+        std::fs::create_dir_all(&directory).unwrap();
+        let summary = serde_json::json!({
+            "chainId": chain_id.to_string(),
+            "protocol": {"chain": {"l1ChainIndex": 0}, "tokens": {"PSY": {"l1Address": "0x1111111111111111111111111111111111111111", "l2TokenContractId": "0x0000000000000000000000000000000000000000000000000000000000000000"}}},
+            "proxies": {"Bridge_Proxy": "0x2222222222222222222222222222222222222222", "StateManager_Proxy": "0x3333333333333333333333333333333333333333"}
+        });
+        std::fs::write(directory.join("deployed-contracts.json"), serde_json::to_vec(&summary).unwrap()).unwrap();
+        for name in ["Bridge_Proxy", "StateManager_Proxy"] {
+            std::fs::write(directory.join(format!("{name}.json")), serde_json::to_vec(&serde_json::json!({"receipt": {"blockNumber": block}})).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn chain_authorization_requires_the_deployment_output() {
+        let root = std::env::temp_dir().join(format!("psy-deploy-missing-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let endpoints = vec![ChainEndpoint { chain_index: 0, rpc_url: "http://127.0.0.1:1".into() }];
+        assert!(derive_chain_authorizations(&root, &endpoints).is_err());
+        deployment_fixture(&root, 31337, 55);
+        // The endpoint is closed, so the chain id cross-check fails before any database exists.
+        assert!(derive_chain_authorizations(&root, &endpoints).is_err());
+        assert!(!root.join("db").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn canonical_policy_config() -> serde_json::Value {
+        let mut member_hashes = [ClientHash::ZERO; 8];
+        for (index, member) in member_hashes[..3].iter_mut().enumerate() {
+            *member = ClientHash::from_values(index as u64 + 1, 0, 0, 0);
+        }
+        let policy = serde_json::to_string(&MultisigAccount {
+            contract_id: MULTISIG_POLICY_CONTRACT_ID,
+            initial_policy: psy_vm::ups::multisig::MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes },
+        })
+        .unwrap();
+        let mut config = serde_json::json!({ "networks": {} });
+        config["networks"][psy_config::CURRENT_NETWORK]["guardian_authorization"]["bridge_relayer_signing_policy"] = serde_json::json!(policy);
+        config
+    }
+
+    #[test]
+    fn canonical_policy_pin_detects_replacement_and_in_place_change() {
+        let root = std::env::temp_dir().join(format!("psy-policy-pin-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
+        let write_config = |config: &serde_json::Value| {
+            std::fs::write(root.join("psy-genesis/config.json"), serde_json::to_vec_pretty(config).unwrap()).unwrap();
+        };
+        write_config(&canonical_policy_config());
+        let pin = CanonicalPolicyPin::pin(&root).expect("pin canonical policy");
+        pin.validate(&root).expect("unchanged config validates");
+        let mut changed = canonical_policy_config();
+        changed["networks"][psy_config::CURRENT_NETWORK]["guardian_authorization"]["bridge_relayer_signing_policy"] = serde_json::json!("{}");
+        write_config(&changed);
+        assert!(pin.validate(&root).is_err());
+        std::fs::remove_file(root.join("psy-genesis/config.json")).unwrap();
+        write_config(&canonical_policy_config());
+        assert!(pin.validate(&root).is_err());
+        let mut missing = canonical_policy_config();
+        missing["networks"][psy_config::CURRENT_NETWORK].as_object_mut().unwrap().remove("guardian_authorization");
+        write_config(&missing);
+        let Err(error) = CanonicalPolicyPin::pin(&root) else { panic!("pin must reject a config without the signing policy") };
+        let error = format!("{error:?}");
+        assert!(error.contains(&format!("networks.{}.guardian_authorization.bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preflight_reports_the_missing_policy_field_path_before_any_reset() {
+        let root = std::env::temp_dir().join(format!("psy-policy-preflight-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
+        std::fs::write(root.join("psy-genesis/config.json"), serde_json::to_vec_pretty(&serde_json::json!({ "networks": {} })).unwrap()).unwrap();
+        let error = format!("{:?}", preflight_fresh_devnet_inputs(&root).unwrap_err());
+        assert!(error.contains(&format!("networks.{}.guardian_authorization.bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn secret_preflight_root() -> std::path::PathBuf {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("psy-secret-preflight-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("genesis.json"), b"retained genesis").unwrap();
+        std::fs::set_permissions(root.join("genesis.json"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let marker = root.join("guardians-root/db/guardian-1.redb");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&marker).unwrap();
+        std::io::Write::write_all(&mut file, b"retained business rows").unwrap();
+        root
+    }
+
+    fn assert_business_untouched(root: &std::path::Path) {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::read(root.join("genesis.json")).unwrap(), b"retained genesis");
+        assert_eq!(std::fs::metadata(root.join("genesis.json")).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(std::fs::read(root.join("guardians-root/db/guardian-1.redb")).unwrap(), b"retained business rows");
+        assert!(!root.join(".private_keys.json.tmp").exists());
+        assert!(!root.join("psy-dapp/apps/bridge/src/config/.faucetOperators.json.tmp").exists());
+    }
+
+    #[test]
+    fn invalid_secret_outputs_fail_before_prepared_without_business_mutations() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../psy-dapp/apps/account/src/config/faucetOperators.example.json")).expect("real public faucetOperators example");
+        let policy = format!("networks.{}.guardian_authorization.bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK);
+        let faucet = |root: &std::path::Path| root.join("psy-dapp/apps/bridge/src/config/faucetOperators.json");
+
+        let allowed = secret_preflight_root();
+        let keys = allowed.join("private_keys.json");
+        std::fs::write(&keys, &fixture).unwrap();
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(super::super::preflight_owned_regular_destination(&keys).is_ok());
+        assert!(super::super::preflight_owned_regular_destination(&faucet(&allowed)).is_ok());
+        let error = format!("{:?}", preflight_fresh_devnet_inputs(&allowed).unwrap_err());
+        assert!(error.contains(&policy), "{error}");
+        assert_eq!(std::fs::read(&keys).unwrap(), fixture);
+        assert!(!allowed.join("psy-dapp").exists());
+        assert_business_untouched(&allowed);
+        std::fs::remove_dir_all(&allowed).unwrap();
+
+        let bad_mode = secret_preflight_root();
+        std::fs::create_dir_all(faucet(&bad_mode).parent().unwrap()).unwrap();
+        std::fs::write(faucet(&bad_mode), &fixture).unwrap();
+        std::fs::set_permissions(faucet(&bad_mode), std::fs::Permissions::from_mode(0o664)).unwrap();
+        let error = format!("{:?}", preflight_fresh_devnet_inputs(&bad_mode).unwrap_err());
+        assert!(error.contains("faucetOperators.json") && error.contains("mode 0600") && !error.contains(&policy), "{error}");
+        assert_eq!(std::fs::read(faucet(&bad_mode)).unwrap(), fixture);
+        assert_eq!(std::fs::metadata(faucet(&bad_mode)).unwrap().mode() & 0o777, 0o664);
+        assert_business_untouched(&bad_mode);
+        std::fs::remove_dir_all(&bad_mode).unwrap();
+
+        let linked = secret_preflight_root();
+        let source = linked.join("public-fixture.json");
+        std::fs::write(&source, &fixture).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&source, linked.join("private_keys.json")).unwrap();
+        let error = format!("{:?}", preflight_fresh_devnet_inputs(&linked).unwrap_err());
+        assert!(error.contains("symlink") && error.contains("private_keys.json") && !error.contains(&policy), "{error}");
+        assert!(std::fs::symlink_metadata(linked.join("private_keys.json")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&source).unwrap(), fixture);
+        assert_business_untouched(&linked);
+        std::fs::remove_dir_all(&linked).unwrap();
+
+        let hard = secret_preflight_root();
+        std::fs::create_dir_all(faucet(&hard).parent().unwrap()).unwrap();
+        let hard_source = hard.join("public-fixture.json");
+        std::fs::write(&hard_source, &fixture).unwrap();
+        std::fs::set_permissions(&hard_source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&hard_source, faucet(&hard)).unwrap();
+        let error = format!("{:?}", preflight_fresh_devnet_inputs(&hard).unwrap_err());
+        assert!(error.contains("faucetOperators.json") && error.contains("single regular file") && !error.contains(&policy), "{error}");
+        assert_eq!(std::fs::metadata(faucet(&hard)).unwrap().nlink(), 2);
+        assert_eq!(std::fs::metadata(faucet(&hard)).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&hard_source).unwrap(), fixture);
+        assert_business_untouched(&hard);
+        std::fs::remove_dir_all(&hard).unwrap();
+
+        let parent_link = secret_preflight_root();
+        let real = parent_link.join("real-config");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("faucetOperators.json"), &fixture).unwrap();
+        std::fs::set_permissions(real.join("faucetOperators.json"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let src = parent_link.join("psy-dapp/apps/bridge/src");
+        std::fs::create_dir_all(&src).unwrap();
+        symlink(&real, src.join("config")).unwrap();
+        let error = format!("{:?}", preflight_fresh_devnet_inputs(&parent_link).unwrap_err());
+        assert!(error.contains("usable directory") && !error.contains(&policy), "{error}");
+        assert!(std::fs::symlink_metadata(src.join("config")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(real.join("faucetOperators.json")).unwrap(), fixture);
+        assert_business_untouched(&parent_link);
+        std::fs::remove_dir_all(&parent_link).unwrap();
+    }
+
 }

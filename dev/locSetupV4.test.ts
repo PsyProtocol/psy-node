@@ -1,10 +1,12 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it, spyOn, mock } from "bun:test";
 import path from "node:path";
+import fs from "node:fs";
+import { type ChildProcessWithoutNullStreams } from "node:child_process";
 import net from "node:net";
 import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, rm, symlink, chmod } from "node:fs/promises";
-import { tmpdir, homedir } from "node:os";
+import { tmpdir } from "node:os";
 import allConfig from "../psy-genesis/config.json";
 import {
     COORDINATOR_PROCESSOR_READY_MARKER,
@@ -16,11 +18,15 @@ import {
 } from "./locSetupPolicy";
 import {
     downloadKeystoreObject,
+    downloadTrustSetupObject,
     fetchKeystoreManifest,
     groupVerifies,
+    trustSetupPartKeys,
+    trustSetupGroups,
+    TRUST_SETUP_PART_BYTES,
     ANVIL_STATE_PATH,
     assertPreservedAnvilGenesis,
-    anvilStateBestBlockNumber,
+
     localAnvilLaunchArgs,
     isRepoAnvilProcess,
     runTeardownCommand,
@@ -31,11 +37,12 @@ import {
     ROLLBACK_STOP_SENTINEL_PATH,
     applicationListenerPorts,
     applicationStartOrder,
-    decodeAnvilDumpStateHex,
     devnetControlSocketPath,
     sendDevnetControlCommand,
     evaluateCompilerArtifactStamp,
     injectGenesisValidators,
+    ensureRealmP2pConfig,
+    LOCAL_DEVNET_ZK_FINGERPRINT,
     isUsableGenesisData,
     ensureGenesisFiles,
     planGenesisGeneration,
@@ -50,7 +57,15 @@ import {
     retryProcessorStartup,
     splitDevnetProcesses,
     startAfterPrerequisite,
-    preserveUnownedLiveAnvils,
+    discoverRepoAnvils,
+    gracefulDevnetStop,
+    isGracefulShutdownControlClient,
+    resolveBoundDevnetNames,
+    commitDevnetNamespaceBinding,
+    selectedUiDependencies,
+    ensurePsyContractsDependencies,
+    runFrozenEnvioCodegen,
+    frozenEnvioStartCommand,
     startDevnetControlServer,
     startRealmProcessorBatchSequentially,
     writeCompilerArtifactStamp,
@@ -76,14 +91,17 @@ import {
     validateRealmP2pPorts,
     selectedRuntimeConfigKey,
     REALM_P2P_SUB_IDS,
-    resolveGuardianConfigPath,
+    validateGuardianRpcConfig,
+    resolveGuardianRoot,
+    validateGuardianAuthorization,
     resolveBridgeDaemonConfigPath,
     prepareGuardianService,
     guardianSessionsReady,
     validateRelayerTemplate,
     relayerStartedDetector,
     DevNetProcessManager,
-    shouldRequireGuardianConfig,
+    shouldRequireGuardianRoot,
+    prepareFreshDevnetState,
 } from "./locSetupV4";
 import type { GenesisContractsArtifactFingerprint } from "./locSetupV4";
 
@@ -151,7 +169,7 @@ describe("public R2 keystore", () => {
                 process.execPath, "-e", `console.log('${sentinel}'); console.error('${sentinel}'); process.exit(22)`,
             ], options)) as typeof Bun.spawn);
             const manifest = { version: 1, files: {} as Record<string, { size: number; sha256: string }> };
-            for (const prefix of ["", "deposit_append/", "withdrawal_claim/"]) {
+            for (const prefix of ["", "deposit_append/", "withdrawal_claim/", "reward_claim/"]) {
                 for (const name of ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"]) {
                     manifest.files[prefix + name] = { size: 3, sha256: createHash("sha256").update("abc").digest("hex") };
                 }
@@ -182,6 +200,117 @@ describe("public R2 keystore", () => {
         } finally {
             spawn.mockRestore();
             log.mockRestore(); warn.mockRestore(); error.mockRestore();
+            if (previous === undefined) delete process.env.PSY_KEYSTORE_R2_PREFIX;
+            else process.env.PSY_KEYSTORE_R2_PREFIX = previous;
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    const CHUNKED_KEYS = ["pk_groth16.bin.zst", "deposit_append.tar.zst", "withdrawal_claim.tar.zst", "reward_claim.tar.zst"];
+
+    it("derives zero-based part keys from the manifest size", () => {
+        expect(TRUST_SETUP_PART_BYTES).toBe(268435456);
+        expect(trustSetupPartKeys("pk_groth16.bin.zst", 1)).toEqual(["pk_groth16.bin.zst.part-00"]);
+        expect(trustSetupPartKeys("pk_groth16.bin.zst", 268435456)).toEqual(["pk_groth16.bin.zst.part-00"]);
+        expect(trustSetupPartKeys("pk_groth16.bin.zst", 21, 10)).toEqual([
+            "pk_groth16.bin.zst.part-00", "pk_groth16.bin.zst.part-01", "pk_groth16.bin.zst.part-02",
+        ]);
+        expect(trustSetupGroups.filter((group) => group.chunked).map((group) => group.key)).toEqual(CHUNKED_KEYS);
+        expect(trustSetupGroups.filter((group) => !group.chunked).map((group) => group.key)).toEqual([
+            "circuit_groth16.bin.zst", "vk_groth16.bin.zst",
+        ]);
+    });
+
+    it("assembles chunked objects from resumed parts and leaves single objects whole", async () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "psy-r2-parts-"));
+        const previous = process.env.PSY_KEYSTORE_R2_PREFIX;
+        process.env.PSY_KEYSTORE_R2_PREFIX = "localhost-test";
+        const spawn = spyOn(Bun, "spawn");
+        const partBytes = 5;
+        const object = "pk_groth16.bin.zst";
+        const parts = ["aaaaa", "bbbbb", "cc"];
+        const whole = parts.join("");
+        const manifest = { version: 1, files: { [object]: { size: whole.length, sha256: createHash("sha256").update(whole).digest("hex") } } };
+        try {
+            spawn.mockImplementation(((args: string[]) => {
+                const dest = args[args.indexOf("-o") + 1];
+                const part = parts[Number(args.at(-1)!.slice(-2))];
+                writeFileSync(dest, part);
+                expect(args).toContain("-C");
+                return { exited: Promise.resolve(0) };
+            }) as typeof Bun.spawn);
+            const dest = path.join(dir, object);
+            await downloadTrustSetupObject({ type: "zst", key: object, entries: ["pk_groth16.bin"], chunked: true }, dest, manifest, partBytes);
+            expect(readFileSync(dest, "utf8")).toBe(whole);
+            expect(readdirSync(dir)).toEqual([object]);
+            const single = path.join(dir, "circuit_groth16.bin.zst");
+            spawn.mockImplementation(((args: string[]) => {
+                expect(args).not.toContain("-C");
+                expect(args.at(-1)).toContain("/circuit_groth16.bin.zst");
+                writeFileSync(args[args.indexOf("-o") + 1], "whole-object");
+                return { exited: Promise.resolve(0) };
+            }) as typeof Bun.spawn);
+            await downloadTrustSetupObject({ type: "zst", key: "circuit_groth16.bin.zst", entries: ["circuit_groth16.bin"], chunked: false }, single, manifest);
+            expect(readFileSync(single, "utf8")).toBe("whole-object");
+            expect(spawn.mock.calls).toHaveLength(4);
+        } finally {
+            spawn.mockRestore();
+            if (previous === undefined) delete process.env.PSY_KEYSTORE_R2_PREFIX;
+            else process.env.PSY_KEYSTORE_R2_PREFIX = previous;
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("fails closed naming the object when a part is missing or empty", async () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "psy-r2-parts-"));
+        const previous = process.env.PSY_KEYSTORE_R2_PREFIX;
+        process.env.PSY_KEYSTORE_R2_PREFIX = "localhost-test";
+        const spawn = spyOn(Bun, "spawn");
+        const object = "deposit_append.tar.zst";
+        const manifest = { version: 1, files: { [object]: { size: 12, sha256: "a".repeat(64) } } };
+        const group = { type: "tar" as const, key: object, entries: ["deposit_append/pk_groth16.bin"], chunked: true };
+        try {
+            spawn.mockImplementation(((args: string[]) => {
+                const dest = args[args.indexOf("-o") + 1];
+                writeFileSync(dest, args.at(-1)!.endsWith("part-01") ? "" : "12345");
+                return { exited: Promise.resolve(0) };
+            }) as typeof Bun.spawn);
+            await expect(downloadTrustSetupObject(group, path.join(dir, object), manifest, 5)).rejects.toThrow(`${object}: missing or empty part ${object}.part-01`);
+            spawn.mockImplementation(((args: string[]) => {
+                if (args.at(-1)!.endsWith("part-02")) return { exited: Promise.resolve(22) };
+                writeFileSync(args[args.indexOf("-o") + 1], "12345");
+                return { exited: Promise.resolve(0) };
+            }) as typeof Bun.spawn);
+            await expect(downloadTrustSetupObject(group, path.join(dir, object), manifest, 5)).rejects.toThrow(`${object}: missing part ${object}.part-02`);
+            delete manifest.files[object];
+            await expect(downloadTrustSetupObject(group, path.join(dir, object), manifest, 5)).rejects.toThrow(`${object}: sha256sums.json has no size/sha256`);
+        } finally {
+            spawn.mockRestore();
+            if (previous === undefined) delete process.env.PSY_KEYSTORE_R2_PREFIX;
+            else process.env.PSY_KEYSTORE_R2_PREFIX = previous;
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("fails closed naming the object when the assembled sha256 mismatches", async () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "psy-r2-parts-"));
+        const previous = process.env.PSY_KEYSTORE_R2_PREFIX;
+        process.env.PSY_KEYSTORE_R2_PREFIX = "localhost-test";
+        const spawn = spyOn(Bun, "spawn");
+        const object = "withdrawal_claim.tar.zst";
+        const manifest = { version: 1, files: { [object]: { size: 6, sha256: "f".repeat(64) } } };
+        try {
+            spawn.mockImplementation(((args: string[]) => {
+                writeFileSync(args[args.indexOf("-o") + 1], "123");
+                return { exited: Promise.resolve(0) };
+            }) as typeof Bun.spawn);
+            await expect(downloadTrustSetupObject(
+                { type: "tar", key: object, entries: ["withdrawal_claim/pk_groth16.bin"], chunked: true },
+                path.join(dir, object), manifest, 3,
+            )).rejects.toThrow(`${object}: sha256/size mismatch vs sha256sums.json`);
+            expect(readdirSync(dir)).toEqual([]);
+        } finally {
+            spawn.mockRestore();
             if (previous === undefined) delete process.env.PSY_KEYSTORE_R2_PREFIX;
             else process.env.PSY_KEYSTORE_R2_PREFIX = previous;
             rmSync(dir, { recursive: true, force: true });
@@ -427,135 +556,50 @@ const block1: Record<string, string> = {
 };
 const rpcBlock = (header: Record<string, string>, hash: string) => ({ ...header, hash });
 
-describe("local Anvil persistence", () => {
-    it("uses the ignored db/anvil state path for a new chain", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
+describe("local Anvil fresh startup", () => {
+    it("rejects an occupied listener without reading identity or RPC", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "fresh-anvil-plan-"));
         try {
-            const plan = await resolveLocalAnvilStatePlan(dir);
-            expect(plan.statePath).toBe(path.join(dir, ANVIL_STATE_PATH));
-            expect(plan.hasState).toBe(false);
-            expect(plan.shouldResetEnvio).toBe(true);
+            const readIdentity = mock(async () => { throw new Error("identity must not be read"); });
+            await expect(resolveLocalAnvilStatePlan(dir, "localhost", false, { listenerOwner: async () => 12345, readIdentity }))
+                .rejects.toThrow("refusing to reuse or kill a foreign owner");
+            expect(readIdentity).not.toHaveBeenCalled();
         } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
+            await rm(dir, { recursive: true, force: true });
         }
     });
 
-    it("reuses Anvil and localhost deployments only when both exist and genesis is unique", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
+    it("rejects a stale snapshot and deployment even when PURGE is unset", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "stale-anvil-plan-"));
+        const previous = process.env.PURGE;
+        process.env.PURGE = "0";
         try {
-            await Bun.$`mkdir -p ${dir}/db/anvil ${dir}/psy-contracts/deployments/localhost`.quiet();
-            const header = { ...genesisHeader, timestamp: "0x6acdc5de" };
-            await Bun.write(`${dir}/db/anvil/state.json`, JSON.stringify({
-                best_block_number: 2,
-                blocks: [
-                    { header: { ...header, number: "0x2", parentHash: ZERO_HASH } },
-                    { header: block1 },
-                    { header },
-                ],
-            }));
-            await Bun.write(`${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`, "{}");
-            const snapshotBefore = await Bun.file(`${dir}/db/anvil/state.json`).text();
-            const plan = await resolveLocalAnvilStatePlan(dir);
-            expect(plan.hasState).toBe(true);
-            expect(plan.shouldResetEnvio).toBe(false);
-            expect(plan.genesis?.timestamp).toBe((0x6acdc5den).toString());
-            expect(plan.genesis?.block1ParentHash).toBe(ORIGINAL_GENESIS_HASH);
-            expect(localAnvilLaunchArgs(8545, "31337", plan.statePath, plan.genesis)).toEqual([
-                "anvil", "--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337",
-                "--state", plan.statePath, "--state-interval", (process.env.ANVIL_STATE_INTERVAL && /^\d+$/.test(process.env.ANVIL_STATE_INTERVAL) ? process.env.ANVIL_STATE_INTERVAL : "900"), "--preserve-historical-states", "-vvvv",
-                "--timestamp", (0x6acdc5den).toString(),
-            ]);
+            await mkdir(path.join(dir, "db/anvil"), { recursive: true });
+            await writeFile(path.join(dir, ANVIL_STATE_PATH), "{\"blocks\":[]}");
+            await expect(resolveLocalAnvilStatePlan(dir, "localhost", false, { listenerOwner: async () => null }))
+                .rejects.toThrow("refusing to load an existing Anvil snapshot");
+            expect(await Bun.file(path.join(dir, ANVIL_STATE_PATH)).text()).toBe("{\"blocks\":[]}");
+        } finally {
+            if (previous === undefined) delete process.env.PURGE;
+            else process.env.PURGE = previous;
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("returns an absent output path and no timestamp for a new chain", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "new-anvil-plan-"));
+        try {
+            const plan = await resolveLocalAnvilStatePlan(dir, "localhost", false, { listenerOwner: async () => null });
+            expect(plan).toEqual({ statePath: path.join(dir, ANVIL_STATE_PATH), hasState: false, shouldResetEnvio: true });
             expect(localAnvilLaunchArgs(8545, "31337", plan.statePath)).not.toContain("--timestamp");
-            expect(await Bun.file(`${dir}/db/anvil/state.json`).text()).toBe(snapshotBefore);
+            expect(localAnvilLaunchArgs(8545, "31337", plan.statePath)).toContain("--state");
+            expect(localAnvilLaunchArgs(8545, "31337", plan.statePath)).not.toContain("--preserve-historical-states");
         } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
-        }
-    });
-
-    it("rejects duplicate block 0 even when a later nonzero block is unsorted", () => {
-        const drifted = { ...genesisHeader, timestamp: "0x6acdd96f" };
-        expect(() => preservedAnvilGenesis({
-            blocks: [
-                { header: { ...genesisHeader, number: "0x5" } },
-                { header: genesisHeader },
-                { header: drifted },
-            ],
-        }, "fixture")).toThrow("2 block 0");
-    });
-
-    it("fails closed when the ready RPC genesis does not retain the saved header and block 1 parent", async () => {
-        const genesis = preservedAnvilGenesis({
-            blocks: [{ header: genesisHeader }, { header: block1 }],
-        }, "fixture");
-        const wrong = rpcBlock({ ...genesisHeader, timestamp: "0x6acdd96f" }, "0x" + "ab".repeat(32));
-        const calls: string[] = [];
-        const rpc = async (_url: string, method: string, params: unknown[]) => {
-            calls.push(`${method}:${String(params[0])}`);
-            return params[0] === "0x1"
-                ? rpcBlock({ ...block1, parentHash: ORIGINAL_GENESIS_HASH }, "0x" + "11".repeat(32))
-                : wrong;
-        };
-        await expect(assertPreservedAnvilGenesis("http://127.0.0.1:8545", genesis, "localhost", rpc))
-            .rejects.toThrow("block 0");
-        expect(calls).toEqual(["eth_getBlockByNumber:0x0", "eth_getBlockByNumber:earliest"]);
-    });
-
-    it("keeps a paired fork snapshot without requiring a local block 0", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
-        try {
-            await Bun.$`mkdir -p ${dir}/db/anvil ${dir}/psy-contracts/deployments/localhost`.quiet();
-            await Bun.write(`${dir}/db/anvil/state.json`, JSON.stringify({ best_block_number: 19_000_000, blocks: [] }));
-            await Bun.write(`${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`, "{}");
-            const plan = await resolveLocalAnvilStatePlan(dir, "localhost", true);
-            expect(plan.hasState).toBe(true);
-            expect(plan.shouldResetEnvio).toBe(false);
-            expect(plan.genesis).toBeUndefined();
-            expect(localAnvilLaunchArgs(8545, "1", plan.statePath, plan.genesis)).not.toContain("--timestamp");
-            await Bun.$`rm ${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`.quiet();
-            await expect(resolveLocalAnvilStatePlan(dir, "localhost", true)).rejects.toThrow("must exist together");
-        } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
-        }
-    });
-
-    it("rejects malformed trailing JSON for local and fork restore without changing the snapshot", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
-        try {
-            await Bun.$`mkdir -p ${dir}/db/anvil ${dir}/psy-contracts/deployments/localhost`.quiet();
-            await Bun.write(`${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`, "{}");
-            const invalid = JSON.stringify({ blocks: [{ header: genesisHeader }] }) + " trailing";
-            await Bun.write(`${dir}/db/anvil/state.json`, invalid);
-            for (const fork of [false, true]) {
-                await expect(resolveLocalAnvilStatePlan(dir, "localhost", fork)).rejects.toThrow("validation failed");
-                expect(await Bun.file(`${dir}/db/anvil/state.json`).text()).toBe(invalid);
-            }
-        } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
-        }
-    });
-
-    it("rejects state and deployment drift", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
-        try {
-            await Bun.$`mkdir -p ${dir}/db/anvil`.quiet();
-            await Bun.write(`${dir}/db/anvil/state.json`, "{}");
-            await expect(resolveLocalAnvilStatePlan(dir)).rejects.toThrow("must exist together");
-        } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
-        }
-    });
-
-    it("rejects deployment without Anvil state", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
-        try {
-            await Bun.$`mkdir -p ${dir}/psy-contracts/deployments/localhost`.quiet();
-            await Bun.write(`${dir}/psy-contracts/deployments/localhost/deployed-contracts.json`, "{}");
-            await expect(resolveLocalAnvilStatePlan(dir)).rejects.toThrow("must exist together");
-        } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
+            await rm(dir, { recursive: true, force: true });
         }
     });
 });
+
 
 describe("startAfterPrerequisite", () => {
     it("does not start workers until every processor reaches readiness", async () => {
@@ -609,16 +653,17 @@ describe("isUsableGenesisData", () => {
 describe("public-only Genesis generation", () => {
     const account = () => ({ contract_id: 1, initial_policy: { version: 1, threshold: 2, member_count: 3, member_hashes: ["01", "02", "03", "00", "00", "00", "00", "00"] } });
     const artifact = () => ({ state_tree_height: 4, circuit_definitions: [{ name: "get_policy" }, { name: "set_policy" }], abi: { contract: { state_tree_height: 4 } } });
+    const writePolicy = (dir: string, policy: unknown = JSON.stringify(account())) => Bun.write(`${dir}/psy-genesis/config.json`, JSON.stringify({ networks: { localhost: { guardian_authorization: { bridge_relayer_signing_policy: policy } } } }));
 
-    it("forwards public paths as individual argv and strips only child secrets", async () => {
+    it("uses only the canonical public config and strips child secrets", async () => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         try {
-            await Bun.write(`${dir}/public account.json`, JSON.stringify(account()));
-            await Bun.write(`${dir}/policy artifact.json`, JSON.stringify(artifact()));
+            await writePolicy(dir);
+            await Bun.write(`${dir}/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`, JSON.stringify(artifact()));
             const aliases = ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"];
-            const env: NodeJS.ProcessEnv = { PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json", KEEP: "present", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
+            const env: NodeJS.ProcessEnv = { PSY_NETWORK: "localhost", PSY_PROJECTS_DIR: dir, KEEP: "present", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
             const plan = await planGenesisGeneration(dir, env);
-            expect(plan.args).toEqual([`${dir}/target/release/psy_dev_cli`, "generate-genesis-data", "--repo-root", dir, "--relayer-multisig-account", `${dir}/public account.json`, "--multisig-policy-artifact", `${dir}/policy artifact.json`]);
+            expect(plan.args).toEqual([`${dir}/target/release/psy_dev_cli`, "generate-genesis-data", "--repo-root", dir]);
             for (const alias of aliases) {
                 expect(plan.env[alias]).toBeUndefined();
                 expect(env[alias]).toBe("test-only");
@@ -629,68 +674,64 @@ describe("public-only Genesis generation", () => {
         }
     });
 
-    it("rejects missing paths, unknown and duplicate fields, and invalid fixed policies", async () => {
+    it("rejects missing canonical policy, unknown and duplicate account fields, and invalid fixed policies", async () => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         try {
-            const env = { PSY_RELAYER_MULTISIG_ACCOUNT: "account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy.json" };
-            await Bun.write(`${dir}/policy.json`, JSON.stringify(artifact()));
+            const env = { PSY_NETWORK: "localhost", PSY_PROJECTS_DIR: dir };
+            const artifactPath = `${dir}/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`;
+            await Bun.write(artifactPath, JSON.stringify(artifact()));
             await expect(planGenesisGeneration(dir, {})).rejects.toThrow();
             await expect(planGenesisGeneration(dir, env)).rejects.toThrow();
-            await expect(planGenesisGeneration(dir, { ...env, PSY_RELAYER_MULTISIG_ACCOUNT: "." })).rejects.toThrow();
+            await writePolicy(dir, account());
+            await expect(planGenesisGeneration(dir, env)).rejects.toThrow("bridge_relayer_signing_policy");
             const invalid: unknown[] = [null, {}, { ...account(), contract_id: 5 }, { ...account(), extra: true }];
             for (const change of [{ version: 2 }, { threshold: 1 }, { member_count: 2 }, { member_hashes: ["01", "01", "03", "00", "00", "00", "00", "00"] }, { member_hashes: ["00", "02", "03", "00", "00", "00", "00", "00"] }, { member_hashes: ["01", "02", "03", "01", "00", "00", "00", "00"] }]) invalid.push({ ...account(), initial_policy: { ...account().initial_policy, ...change } });
             for (const input of invalid.map((value) => JSON.stringify(value)).concat('{"contract_id":1,"contract_id":1,"initial_policy":' + JSON.stringify(account().initial_policy) + '}', "not JSON")) {
-                await Bun.write(`${dir}/account.json`, input);
+                await writePolicy(dir, input);
                 await expect(planGenesisGeneration(dir, env)).rejects.toThrow();
             }
-            await Bun.write(`${dir}/account.json`, JSON.stringify(account()));
-            await expect(planGenesisGeneration(dir, { PSY_RELAYER_MULTISIG_ACCOUNT: "account.json" })).rejects.toThrow();
-            await Bun.write(`${dir}/policy.json`, JSON.stringify({ ...artifact(), state_tree_height: 3 }));
+            await writePolicy(dir);
+            await expect(planGenesisGeneration(dir, { ...env, PSY_NETWORK: "absent" })).rejects.toThrow("networks.absent.guardian_authorization.bridge_relayer_signing_policy");
+            const positioned = account();
+            positioned.initial_policy.member_hashes = ["03", "01", "02", "00", "00", "00", "00", "00"];
+            await writePolicy(dir, JSON.stringify(positioned));
+            const canonicalBefore = await Bun.file(`${dir}/psy-genesis/config.json`).text();
+            await planGenesisGeneration(dir, env);
+            expect(await Bun.file(`${dir}/psy-genesis/config.json`).text()).toBe(canonicalBefore);
+            await Bun.write(artifactPath, JSON.stringify({ ...artifact(), state_tree_height: 3 }));
             await expect(planGenesisGeneration(dir, env)).rejects.toThrow();
         } finally {
             await Bun.$`rm -rf ${dir}`.quiet();
         }
     });
 
-    it("launches generation with public argv and a secret-free child environment", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
+    it("rejects stale compiler policy without deleting an existing Genesis", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "policy-preflight-"));
         try {
-            await Bun.write(`${dir}/psy-genesis/genesis_contracts.json`, new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]));
-            await Bun.write(`${dir}/public account.json`, JSON.stringify(account()));
-            await Bun.write(`${dir}/policy artifact.json`, JSON.stringify(artifact()));
-            const cli = `${dir}/target/release/psy_dev_cli`;
-            await Bun.write(cli, '#!/usr/bin/env bun\nawait Bun.write("child.json", JSON.stringify({ args: process.argv.slice(2), env: process.env }));\nawait Bun.write("genesis.json", \'{"checkpoint_stats":{"block_time":1764248609}}\');\n');
-            await Bun.$`chmod +x ${cli}`.quiet();
-            const aliases = ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"];
-            const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
-            await ensureGenesisFiles(dir, env);
-            const child = await Bun.file(`${dir}/child.json`).json();
-            expect(child.args).toEqual(["generate-genesis-data", "--repo-root", dir, "--relayer-multisig-account", `${dir}/public account.json`, "--multisig-policy-artifact", `${dir}/policy artifact.json`]);
-            for (const alias of aliases) {
-                expect(child.env[alias]).toBeUndefined();
-                expect(env[alias]).toBe("test-only");
-            }
+            await writePolicy(dir);
+            await Bun.write(`${dir}/genesis.json`, "existing genesis");
+            await Bun.write(`${dir}/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`, JSON.stringify({ ...artifact(), state_tree_height: 3 }));
+            await expect(planGenesisGeneration(dir, { PSY_PROJECTS_DIR: dir, PSY_NETWORK: "localhost" })).rejects.toThrow("Sibling compiler");
+            expect(await Bun.file(`${dir}/genesis.json`).text()).toBe("existing genesis");
         } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
+            await rm(dir, { recursive: true, force: true });
         }
     });
 
-    it("rejects exit zero without usable genesis.json and a nonzero generator exit", async () => {
-        const dir = (await Bun.$`mktemp -d`.text()).trim();
+    it("rejects preflight prerequisites without touching existing state or launching a generator", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "genesis-preflight-"));
         try {
-            await Bun.write(`${dir}/psy-genesis/genesis_contracts.json`, new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]));
-            await Bun.write(`${dir}/public account.json`, JSON.stringify(account()));
-            await Bun.write(`${dir}/policy artifact.json`, JSON.stringify(artifact()));
-            const cli = `${dir}/target/release/psy_dev_cli`;
-            const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json" };
-            await Bun.write(cli, "#!/usr/bin/env bun\n");
-            await Bun.$`chmod +x ${cli}`.quiet();
-            await expect(ensureGenesisFiles(dir, env)).rejects.toThrow("exit 0");
-            expect(await Bun.file(`${dir}/genesis.json`).exists()).toBe(false);
-            await Bun.write(cli, "#!/usr/bin/env bun\nprocess.exit(7);\n");
-            await expect(ensureGenesisFiles(dir, env)).rejects.toThrow("exit 7");
+            await mkdir(path.join(dir, "psy-genesis"));
+            await writeFile(path.join(dir, "genesis.json"), "existing genesis");
+            await writeFile(path.join(dir, "private_keys.json"), "retained fixture");
+            await expect(ensureGenesisFiles(dir, {}, true)).rejects.toThrow("genesis_contracts.json");
+            await writeFile(path.join(dir, "psy-genesis/genesis_contracts.json"), new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]));
+            await expect(ensureGenesisFiles(dir, {}, true)).rejects.toThrow();
+            expect(await Bun.file(path.join(dir, "genesis.json")).text()).toBe("existing genesis");
+            expect(await Bun.file(path.join(dir, "private_keys.json")).text()).toBe("retained fixture");
+            expect(await Bun.file(path.join(dir, "db")).exists()).toBe(false);
         } finally {
-            await Bun.$`rm -rf ${dir}`.quiet();
+            await rm(dir, { recursive: true, force: true });
         }
     });
 
@@ -895,8 +936,9 @@ describe("realm P2P launch planning", () => {
         genesisConfigHash,
         networks: {
             localhost: {
+                ...structuredClone(allConfig.networks.localhost),
                 realm_user_tree_height: 20,
-                p2p: { checkpoints_per_epoch: allConfig.networks.localhost.p2p.checkpoints_per_epoch },
+                p2p: structuredClone(allConfig.networks.localhost.p2p),
                 realm_configs: [{
                     id: 0,
                     rpc_url: [],
@@ -909,33 +951,201 @@ describe("realm P2P launch planning", () => {
         },
     });
 
+    async function fixture(existing: boolean = true) {
+        const cwd = await mkdtemp(path.join(tmpdir(), "realm-p2p-preserve-"));
+        const runtimeDir = path.join(cwd, "local_checkpoints/realm_p2p");
+        await mkdir(path.join(cwd, "psy-genesis"), { recursive: true });
+        await mkdir(runtimeDir, { recursive: true });
+        const runtime = config(2);
+        const source = structuredClone(runtime);
+        const genesis = {
+            users: Array.from({ length: 5 }, () => ({ public_key_info: { fingerprint: LOCAL_DEVNET_ZK_FINGERPRINT } })),
+            validators: existing ? runtime.networks.localhost.realm_configs.flatMap((realm) => realm.validators.map((validator) => ({
+                realm_id: realm.id, validator_user_id: validator.validator_user_id,
+                node_id: validator.processor_node_id, bls_public_key: validator.bls_public_key,
+            }))) : [],
+        };
+        await writeFile(path.join(cwd, "genesis.json"), JSON.stringify(genesis));
+        await writeFile(path.join(cwd, "psy-genesis/config.json"), JSON.stringify(source));
+        if (existing) {
+            await writeFile(path.join(runtimeDir, "config.json"), JSON.stringify(runtime));
+            for (const key of realmP2pSecretPaths([0], 2)) await writeFile(path.join(cwd, key), `fixture-${path.basename(key)}`);
+        }
+        return { cwd, runtimeDir, runtime, source, genesis };
+    }
+
+    function snapshot(cwd: string) {
+        return Object.fromEntries((readdirSync(cwd, { recursive: true }) as string[]).sort().map((name) => {
+            const file = path.join(cwd, name);
+            return [name, statSync(file).isFile() ? readFileSync(file).toString("hex") : "directory"];
+        }));
+    }
+
+    for (const change of ["both endpoints", "normal endpoint", "system endpoint", "whitespace", "missing hash"] as const) {
+        it(`preserves all keys and membership for ${change}`, async () => {
+            const f = await fixture();
+            const sourceNetwork = f.source.networks.localhost as Record<string, unknown>;
+            if (change === "both endpoints" || change === "normal endpoint") sourceNetwork.prove_proxy_url = ["http://normal.example:9999"];
+            if (change === "both endpoints" || change === "system endpoint") sourceNetwork.system_prove_proxy_url = ["http://system.example:9998"];
+            sourceNetwork.faucet_rpc_url = ["http://not-refreshed.example"];
+            await writeFile(path.join(f.cwd, "psy-genesis/config.json"), JSON.stringify(f.source, null, 4) + "\n");
+            if (change === "missing hash") {
+                const { genesisConfigHash: _, ...unstamped } = f.runtime;
+                await writeFile(path.join(f.runtimeDir, "config.json"), JSON.stringify(unstamped));
+            }
+            const before = snapshot(f.cwd);
+            const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("Generator must not run"); });
+            const writes = spyOn(fs.promises, "writeFile");
+            try {
+                const result = await ensureRealmP2pConfig("unused", f.cwd, [0], 2, "192.0.2.8");
+                await injectGenesisValidators(path.join(f.cwd, "genesis.json"), result);
+                expect(spawn).not.toHaveBeenCalled();
+                expect(writes.mock.calls.every(([file]) => String(file) === path.join(f.runtimeDir, "config.json"))).toBe(true);
+                const expected = JSON.parse(Buffer.from(before["local_checkpoints/realm_p2p/config.json"], "hex").toString());
+                for (const field of ["prove_proxy_url", "system_prove_proxy_url"]) {
+                    if (sourceNetwork[field] === undefined) delete expected.networks.localhost[field];
+                    else expected.networks.localhost[field] = sourceNetwork[field];
+                }
+                expect(result).toEqual(expected);
+                expect(JSON.parse(readFileSync(path.join(f.runtimeDir, "config.json"), "utf8"))).toEqual(expected);
+                const after = snapshot(f.cwd);
+                delete before["local_checkpoints/realm_p2p/config.json"];
+                delete after["local_checkpoints/realm_p2p/config.json"];
+                expect(after).toEqual(before);
+                const daemon = daemonRealmP2pConfig(result, [0], 2);
+                expect(daemon.networks.localhost.prove_proxy_url).toEqual(sourceNetwork.prove_proxy_url);
+                expect(daemon.networks.localhost.system_prove_proxy_url).toEqual(sourceNetwork.system_prove_proxy_url);
+            } finally {
+                writes.mockRestore();
+                spawn.mockRestore();
+                await rm(f.cwd, { recursive: true, force: true });
+            }
+        });
+    }
+
+    for (const failure of ["missing key", "missing config", "malformed config", "null config", "unexpected realm", "nested artifact", "edge count", "host", "realm count", "consensus", "genesis conflict", "fresh with membership", "config only", "daemon only"] as const) {
+        it(`rejects ${failure} before writes or generation`, async () => {
+            const f = await fixture();
+            const configPath = path.join(f.runtimeDir, "config.json");
+            if (failure === "missing key") await rm(path.join(f.cwd, realmP2pSecretPaths([0], 2)[0]));
+            if (failure === "missing config") await rm(configPath);
+            if (failure === "malformed config") await writeFile(configPath, "{");
+            if (failure === "null config") await writeFile(configPath, "null");
+            if (failure === "unexpected realm") await writeFile(path.join(f.runtimeDir, "realm_9_sub_1_bls.key"), "fixture");
+            if (failure === "nested artifact") await mkdir(path.join(f.runtimeDir, "old-keys"));
+            if (failure === "config only" || failure === "daemon only") {
+                for (const key of realmP2pSecretPaths([0], 2)) await rm(path.join(f.cwd, key));
+            }
+            if (failure === "daemon only") {
+                await rm(configPath);
+                await writeFile(path.join(f.runtimeDir, "daemon-config.json"), JSON.stringify(f.runtime));
+            }
+            if (failure === "consensus") {
+                f.source.networks.localhost.p2p.checkpoints_per_epoch++;
+                await writeFile(path.join(f.cwd, "psy-genesis/config.json"), JSON.stringify(f.source));
+            }
+            if (failure === "genesis conflict") {
+                f.source.networks.localhost.prove_proxy_url = ["http://must-not-refresh.example:9999"];
+                await writeFile(path.join(f.cwd, "psy-genesis/config.json"), JSON.stringify(f.source));
+                f.genesis.validators[0].node_id = "conflicting-identity";
+                await writeFile(path.join(f.cwd, "genesis.json"), JSON.stringify(f.genesis));
+            }
+            if (failure === "fresh with membership") await rm(f.runtimeDir, { recursive: true });
+            const before = snapshot(f.cwd);
+            const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("Generator must not run"); });
+            const writes = spyOn(fs.promises, "writeFile");
+            try {
+                await expect(ensureRealmP2pConfig("unused", f.cwd, failure === "realm count" ? [0, 1] : [0], failure === "edge count" ? 1 : 2, failure === "host" ? "192.0.2.9" : "192.0.2.8")).rejects.toThrow();
+                expect(spawn).not.toHaveBeenCalled();
+                expect(writes).not.toHaveBeenCalled();
+                expect(snapshot(f.cwd)).toEqual(before);
+            } finally {
+                writes.mockRestore();
+                spawn.mockRestore();
+                await rm(f.cwd, { recursive: true, force: true });
+            }
+        });
+    }
+
+    for (const directory of ["empty", "absent"] as const) {
+    it(`generates only fresh ${directory} state and binds reserved ZK keys once`, async () => {
+        const f = await fixture(false);
+        if (directory === "absent") await rm(f.runtimeDir, { recursive: true });
+        const privateKeys = Array.from({ length: 5 }, (_, index) => (index + 1).toString(16).repeat(64));
+        await writeFile(path.join(f.cwd, "private_keys.json"), JSON.stringify(privateKeys));
+        const spawn = spyOn(Bun, "spawn").mockImplementation((..._args: unknown[]) => {
+            mkdirSync(f.runtimeDir, { recursive: true });
+            writeFileSync(path.join(f.runtimeDir, "config.json"), JSON.stringify(f.runtime));
+            for (const key of realmP2pSecretPaths([0], 2)) writeFileSync(path.join(f.cwd, key), "generated-fixture");
+            return { exited: Promise.resolve(0) } as Bun.Subprocess;
+        });
+        try {
+            const result = await ensureRealmP2pConfig("fixture-cli", f.cwd, [0], 2, "192.0.2.8");
+            expect(spawn).toHaveBeenCalledTimes(1);
+            expect(spawn.mock.calls[0][0]).toContain("init-realm-p2p-keys");
+            await injectGenesisValidators(path.join(f.cwd, "genesis.json"), result);
+            expect(JSON.parse(readFileSync(path.join(f.cwd, "genesis.json"), "utf8")).validators).toHaveLength(2);
+            for (const subId of REALM_P2P_SUB_IDS) {
+                expect(readFileSync(path.join(f.runtimeDir, `realm_0_sub_${subId}_zk.key`), "utf8")).toBe(privateKeys[reservedValidatorRegistrationId(0, subId)]);
+            }
+            const before = snapshot(f.cwd);
+            await ensureRealmP2pConfig("fixture-cli", f.cwd, [0], 2, "192.0.2.8");
+            expect(spawn).toHaveBeenCalledTimes(1);
+            expect(snapshot(f.cwd)).toEqual(before);
+        } finally {
+            spawn.mockRestore();
+            await rm(f.cwd, { recursive: true, force: true });
+        }
+    });
+    }
+
+    it("keeps canonical nonempty Genesis bytes unchanged and rejects conflicts", async () => {
+        const f = await fixture();
+        const genesisPath = path.join(f.cwd, "genesis.json");
+        f.genesis.validators.reverse();
+        await writeFile(genesisPath, JSON.stringify(f.genesis, null, 4) + "\n");
+        const before = snapshot(f.cwd);
+        const writes = spyOn(fs.promises, "writeFile");
+        try {
+            await injectGenesisValidators(genesisPath, f.runtime);
+            expect(writes).not.toHaveBeenCalled();
+            f.runtime.networks.localhost.realm_configs[0].validators[0].bls_public_key = "conflicting-bls";
+            await expect(injectGenesisValidators(genesisPath, f.runtime)).rejects.toThrow(/membership conflicts/);
+            expect(writes).not.toHaveBeenCalled();
+            expect(snapshot(f.cwd)).toEqual(before);
+        } finally {
+            writes.mockRestore();
+            await rm(f.cwd, { recursive: true, force: true });
+        }
+    });
+
     it("reuses only a complete config for the selected host and edge count", () => {
         expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(true);
-        expect(planRealmP2pConfig(config(1), [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
-        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.9", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
+        expect(() => planRealmP2pConfig(config(1), [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash)).toThrow(/topology/);
+        expect(() => planRealmP2pConfig(config(2), [0], 2, "192.0.2.9", realm0ValidatorIds, genesisConfigHash)).toThrow(/topology/);
     });
 
     it("reuses a runtime config stamped with the current genesis hash", () => {
         expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(true);
     });
 
-    it("regenerates when genesis bytes change even if parsed settings match", () => {
+    it("reuses identities when source bytes or hash metadata change", () => {
         const changedHash = createHash("sha256").update(genesisConfigBytes).update("\n").digest("hex");
-        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds, changedHash).reuse).toBe(false);
+        expect(planRealmP2pConfig(config(2), [0], 2, "192.0.2.8", realm0ValidatorIds, changedHash).reuse).toBe(true);
     });
 
-    it("regenerates legacy runtime configs without a genesis hash", () => {
+    it("reuses legacy runtime configs without a genesis hash", () => {
         const { genesisConfigHash: _, ...unstamped } = config(2);
-        expect(planRealmP2pConfig(unstamped, [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
+        expect(planRealmP2pConfig(unstamped, [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(true);
     });
 
-    it("regenerates when the cached checkpoint period differs from genesis", () => {
+    it("rejects a cached checkpoint period differing from genesis", () => {
         const stale = config(2);
         stale.networks.localhost.p2p.checkpoints_per_epoch += 1;
-        expect(planRealmP2pConfig(stale, [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
+        expect(() => planRealmP2pConfig(stale, [0], 2, "192.0.2.8", realm0ValidatorIds, genesisConfigHash)).toThrow(/consensus/);
     });
 
-    it("regenerates when an unselected Realm still has validators", () => {
+    it("rejects an unselected Realm with validators", () => {
         const stale = config(1);
         stale.networks.localhost.realm_configs.push({
             id: 1,
@@ -945,7 +1155,7 @@ describe("realm P2P launch planning", () => {
                 validator(reservedValidatorUserId(1, 2), 2, 1),
             ],
         });
-        expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(false);
+        expect(() => planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds, genesisConfigHash)).toThrow(/topology/);
         stale.networks.localhost.realm_configs[1].validators = [];
         expect(planRealmP2pConfig(stale, [0], 1, "192.0.2.8", realm0ValidatorIds, genesisConfigHash).reuse).toBe(true);
     });
@@ -1054,24 +1264,25 @@ describe("injectGenesisValidators", () => {
 });
 
 describe("guardian launcher config preflight", () => {
-    const configLimitBytes = 64 * 1024 * 1024;
-    const signer = (id: number) => ({
+    const env = { PSY_NETWORK: "localhost" };
+    const guardian = (id: number, overrides: Record<string, unknown> = {}) => ({
+        id,
         listen_address: `127.0.0.1:${15440 + id}`,
-        signing_key_secret_path: path.join(homedir(), ".psy", "keystore", `guardian-${id}.keystore.json`),
-        signing_key_password_secret_path: path.join(homedir(), ".psy", "keystore", `guardian-${id}.password`),
-    });
-    const publicNetwork = () => ({ magic: "0x1", users_per_realm: 1, global_user_tree_height: 32, realm_user_tree_height: 20, group_realm_height: 1, realm_configs: [{ id: 0, rpc_url: ["http://127.0.0.1:18081"] }], p2p: { checkpoints_per_epoch: 1 }, coordinator_configs: [{ id: 0, rpc_url: ["http://127.0.0.1:18080"] }], prove_proxy_url: ["http://127.0.0.1:9999"], faucet_rpc_url: [], nostr_relay_url: "wss://relay.example", native_currency: "PSY", native_currency_decimal: 18, native_currency_name: "Psy", fees: { register_user_fee: 0, deploy_contract_fee: 0, guta_fee: 1000000000, da_fee: 1000 } });
-    const publicGuardianConfig = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
-        network: publicNetwork(),
-        guardians: { "1": signer(1), "2": signer(2), "3": signer(3) },
-        client: {
-            endpoints: ["http://127.0.0.1:15441/", "http://127.0.0.1:15442/", "http://127.0.0.1:15443/"],
-            archive_path: "archive/relayer-journal",
-            listen_address: "127.0.0.1:15450",
-            l1_endpoints: [{ chain_index: 0, rpc_url: "http://127.0.0.1:8545" }],
-        },
         ...overrides,
     });
+    const canonicalNetwork = (overrides: Record<string, unknown> = {}) => ({
+        magic: "0x1", users_per_realm: 1, global_user_tree_height: 32, realm_user_tree_height: 20, group_realm_height: 1,
+        realm_configs: [{ id: 0, rpc_url: ["http://127.0.0.1:18081"] }],
+        p2p: { checkpoints_per_epoch: 1 }, coordinator_configs: [{ id: 0, rpc_url: ["http://127.0.0.1:18080"] }],
+        prove_proxy_url: ["http://127.0.0.1:9999"], faucet_rpc_url: [], nostr_relay_url: "wss://relay.example",
+        native_currency: "PSY", native_currency_decimal: 18, native_currency_name: "Psy",
+        fees: { register_user_fee: 0, deploy_contract_fee: 0, guta_fee: 1000000000, da_fee: 1000 },
+        guardian_configs: [guardian(1), guardian(2), guardian(3)],
+        guardian_history: { listen_address: "127.0.0.1:15450" },
+        l1_endpoints: [{ chain_index: 0, rpc_url: "http://127.0.0.1:8545" }],
+        ...overrides,
+    });
+    const canonicalConfig = (network: Record<string, unknown> = canonicalNetwork()) => ({ defaultNetwork: "localhost", networks: { localhost: network } });
     const inTempDir = async (run: (dir: string) => Promise<void>): Promise<void> => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         try {
@@ -1084,45 +1295,55 @@ describe("guardian launcher config preflight", () => {
         await Bun.write(path.join(dir, file), typeof contents === "string" ? contents : JSON.stringify(contents));
     };
     const expectRejection = (dir: string, file: string, message: string): Promise<void> =>
-        expect(resolveGuardianConfigPath(dir, file)).rejects.toThrow(message);
+        expect(validateGuardianRpcConfig(dir, file, env)).rejects.toThrow(message);
 
-    it("accepts a bounded public GuardianConfig and returns the resolved config path", async () => {
+    it("accepts a canonical network with guardian public endpoints and returns that network", async () => {
         await inTempDir(async (dir) => {
-            await writeConfig(dir, "config.json", publicGuardianConfig());
+            await writeConfig(dir, "config.json", canonicalConfig());
             await Bun.$`mkdir -p ${path.join(dir, "nested")}`.quiet();
-            await writeConfig(dir, "nested/config.json", publicGuardianConfig());
-            await writeConfig(dir, "origin-variants.json", publicGuardianConfig({
-                client: {
-                    endpoints: ["http://guardian-a.example", "http://guardian-a.example:8443", "http://guardian-b.example"],
-                    archive_path: "archive/relayer-journal",
-                    listen_address: "127.0.0.1:15450",
-                    l1_endpoints: [],
-                },
-            }));
-            expect(await resolveGuardianConfigPath(dir, "config.json")).toBe(path.resolve(dir, "config.json"));
-            expect(await resolveGuardianConfigPath(dir, "nested/config.json")).toBe(path.resolve(dir, "nested", "config.json"));
-            expect(await resolveGuardianConfigPath(dir, path.join(dir, "config.json"))).toBe(path.join(dir, "config.json"));
-            expect(await resolveGuardianConfigPath("/", path.join(dir, "origin-variants.json"))).toBe(path.join(dir, "origin-variants.json"));
+            await writeConfig(dir, "nested/config.json", canonicalConfig());
+            await writeConfig(dir, "origin-variants.json", canonicalConfig(canonicalNetwork({
+                guardian_configs: [
+                    guardian(1, { rpc_url: "http://guardian-a.example/" }),
+                    guardian(2, { rpc_url: "http://guardian-a.example:8443/" }),
+                    guardian(3, { rpc_url: "http://guardian-b.example/" }),
+                ],
+            })));
+            const selected = await validateGuardianRpcConfig(dir, "config.json", env);
+            expect(selected.guardian_configs).toEqual([guardian(1), guardian(2), guardian(3)]);
+            expect(selected.guardian_history).toEqual({ listen_address: "127.0.0.1:15450" });
+            expect(selected.l1_endpoints).toEqual([{ chain_index: 0, rpc_url: "http://127.0.0.1:8545" }]);
+            expect((await validateGuardianRpcConfig(dir, "nested/config.json", env)).guardian_configs).toHaveLength(3);
+            expect((await validateGuardianRpcConfig("/", path.join(dir, "origin-variants.json"), env)).guardian_configs).toHaveLength(3);
         });
     });
-
-    it("rejects a missing or blank PSY_GUARDIAN_CONFIG instead of falling back to a wallet", async () => {
+    it("rejects a missing or blank PSY_GUARDIAN_ROOT instead of falling back to a wallet", async () => {
         await inTempDir(async (dir) => {
             for (const missing of [undefined, "", "   "]) {
-                await expect(resolveGuardianConfigPath(dir, missing)).rejects.toThrow("supply it in the environment or --env");
+                await expect(resolveGuardianRoot(dir, missing)).rejects.toThrow("supply it in the environment or --env");
             }
         });
     });
 
-    it("rejects a per-guardian service config, TLS metadata, or schema drift from GuardianConfig", async () => {
-        const missingClient = publicGuardianConfig();
-        delete missingClient.client;
+    it("rejects symlink ancestors without changing the real guardian directory", async () => {
+        await inTempDir(async (dir) => {
+            await mkdir(path.join(dir, "owned/guardians"), { recursive: true });
+            await writeFile(path.join(dir, "owned/guardians/retained"), "unchanged");
+            await symlink(path.join(dir, "owned"), path.join(dir, "alias"));
+            await expect(resolveGuardianRoot(dir, "alias/guardians")).rejects.toThrow("symlink ancestors");
+            expect(await Bun.file(path.join(dir, "owned/guardians/retained")).text()).toBe("unchanged");
+        });
+    });
+
+    it("rejects endpoint keys, runtime root paths and malformed canonical network structures", async () => {
+        const missingHistory = canonicalNetwork();
+        delete missingHistory.guardian_history;
         const cases: Array<[string, unknown]> = [
-            ["database path", { ...publicGuardianConfig(), db_path: "guardian.redb" }],
-            ["TLS metadata", { ...publicGuardianConfig(), tls_identity_path: "tls/relayer.pem" }],
-            ["missing client", missingClient],
-            ["leading zero guardian key", publicGuardianConfig({ guardians: { "01": signer(1), "2": signer(2), "3": signer(3) } })],
-            ["top level array", [publicGuardianConfig()]],
+            ["keystore path", canonicalConfig(canonicalNetwork({ guardian_configs: [guardian(1, { signing_key_secret_path: "/keys/1.json" }), guardian(2), guardian(3)] }))],
+            ["root path", canonicalConfig(canonicalNetwork({ guardian_root: "/tmp/guardians" }))],
+            ["missing guardian history", canonicalConfig(missingHistory)],
+            ["leading zero guardian id", canonicalConfig(canonicalNetwork({ guardian_configs: [{ id: "01", listen_address: "127.0.0.1:15441" }, guardian(2), guardian(3)] }))],
+            ["top level array", [canonicalConfig()]],
             ["top level string", '"config"'],
             ["top level null", "null"],
         ];
@@ -1130,51 +1351,32 @@ describe("guardian launcher config preflight", () => {
             for (const [label, contents] of cases) {
                 const file = `schema-${label.replaceAll(" ", "-")}.json`;
                 await writeConfig(dir, file, contents);
-                await expectRejection(dir, file, "expected only GuardianConfig public fields");
+                await expect(validateGuardianRpcConfig(dir, file, env)).rejects.toThrow();
             }
         });
     });
 
-    it("rejects a client archive path that escapes the config directory or is not the fixed archive", async () => {
-        const violations: Array<[string, unknown]> = [
-            ["parent traversal", "../escaped/relayer-journal"],
-            ["absolute path", "/tmp/relayer-journal"],
-            ["wrong archive", "archive/other"],
-            ["empty string", ""],
-            ["nul byte", "archive/relayer-journal\0"],
-        ];
+    it("rejects a symlinked, directory, missing or non-JSON rpc config file", async () => {
         await inTempDir(async (dir) => {
-            for (const [label, archivePath] of violations) {
-                const file = `archive-${label.replaceAll(" ", "-")}.json`;
-                const config = publicGuardianConfig();
-                (config.client as Record<string, unknown>).archive_path = archivePath;
-                await writeConfig(dir, file, config);
-                await expectRejection(dir, file, "expected only GuardianConfig public fields");
-            }
-        });
-    });
-
-    it("rejects a symlinked, directory, missing or non-JSON guardian config file", async () => {
-        await inTempDir(async (dir) => {
-            await writeConfig(dir, "real.json", publicGuardianConfig());
+            await writeConfig(dir, "real.json", canonicalConfig());
             await Bun.$`ln -s ${path.join(dir, "real.json")} ${path.join(dir, "link.json")}`.quiet();
             await Bun.$`mkdir -p ${path.join(dir, "directory.json")}`.quiet();
-            await writeConfig(dir, "truncated.json", '{"network":');
+            await writeConfig(dir, "truncated.json", '{"networks":');
             await writeConfig(dir, "empty.json", "");
             for (const file of ["link.json", "directory.json", "missing.json", "truncated.json", "empty.json"]) {
-                await expectRejection(dir, file, "the selected path must be a readable, non-symlink regular file containing valid JSON (at most 64 MiB).");
+                await expectRejection(dir, file, "the selected rpc_config must be a readable, non-symlink regular file containing valid JSON (at most 64 MiB).");
             }
-            expect(await resolveGuardianConfigPath(dir, "real.json")).toBe(path.resolve(dir, "real.json"));
+            expect(await validateGuardianRpcConfig(dir, "real.json", env)).toMatchObject({ guardian_configs: [guardian(1), guardian(2), guardian(3)] });
         });
     });
 
-    it("rejects a guardian config above the 64 MiB read limit and accepts one exactly at the limit", async () => {
+    it("rejects an rpc config above the 64 MiB read limit and accepts one exactly at the limit", async () => {
+        const configLimitBytes = 64 * 1024 * 1024;
         await inTempDir(async (dir) => {
             const file = "oversized.json";
             const target = path.join(dir, file);
-            const network = publicNetwork();
-            (network as Record<string, unknown>).padding = "";
-            const encoded = JSON.stringify(publicGuardianConfig({ network }));
+            const network = canonicalNetwork({ padding: "" });
+            const encoded = JSON.stringify(canonicalConfig(network));
             const insertion = encoded.indexOf('"padding":"');
             const head = encoded.slice(0, insertion + '"padding":"'.length);
             const tail = encoded.slice(insertion + '"padding":"'.length);
@@ -1189,48 +1391,47 @@ describe("guardian launcher config preflight", () => {
             writer.write(tail);
             await writer.end();
             expect(statSync(target).size).toBe(configLimitBytes);
-            expect(await resolveGuardianConfigPath(dir, file)).toBe(target);
+            expect(await validateGuardianRpcConfig(dir, file, env)).toMatchObject({ guardian_history: { listen_address: "127.0.0.1:15450" } });
             appendFileSync(target, " ");
             expect(statSync(target).size).toBe(configLimitBytes + 1);
             await expectRejection(dir, file, "at most 64 MiB");
         });
     });
 
-    it("rejects guardian endpoints that are not three distinct fixed HTTP origins", async () => {
+    it("rejects guardian endpoints that are not three distinct advertised origins", async () => {
         const cases: Array<[string, unknown]> = [
-            ["duplicate origin", ["http://127.0.0.1:15441", "http://127.0.0.1:15442", "http://127.0.0.1:15442"]],
-            ["host case only difference", ["http://guardian-a.example/", "http://Guardian-A.example/", "http://guardian-b.example/"]],
-            ["https origin", ["https://127.0.0.1:15441", "http://127.0.0.1:15442", "http://127.0.0.1:15443"]],
-            ["embedded credentials", ["http://user:pass@127.0.0.1:15441", "http://127.0.0.1:15442", "http://127.0.0.1:15443"]],
-            ["non root path", ["http://127.0.0.1:15441/admin", "http://127.0.0.1:15442", "http://127.0.0.1:15443"]],
-            ["query string", ["http://127.0.0.1:15441/?x=1", "http://127.0.0.1:15442", "http://127.0.0.1:15443"]],
-            ["fragment", ["http://127.0.0.1:15441/#frag", "http://127.0.0.1:15442", "http://127.0.0.1:15443"]],
-            ["zero port", ["http://127.0.0.1:0", "http://127.0.0.1:15442", "http://127.0.0.1:15443"]],
-            ["missing host", ["http:///", "http://127.0.0.1:15442", "http://127.0.0.1:15443"]],
-            ["unparseable entry", ["not a url", "http://127.0.0.1:15442", "http://127.0.0.1:15443"]],
-            ["non string entry", ["http://127.0.0.1:15441", 7, "http://127.0.0.1:15443"]],
-            ["two entries", ["http://127.0.0.1:15441", "http://127.0.0.1:15442"]],
-            ["four entries", ["http://127.0.0.1:15441", "http://127.0.0.1:15442", "http://127.0.0.1:15443", "http://127.0.0.1:15444"]],
+            ["duplicate id", [guardian(1), guardian(1), guardian(3)]],
+            ["duplicate advertised origin", [guardian(1, { rpc_url: "http://guardian.example/" }), guardian(2, { rpc_url: "http://guardian.example:80/" }), guardian(3)]],
+            ["advertised wildcard", [guardian(1, { rpc_url: "http://0.0.0.0:15441" }), guardian(2), guardian(3)]],
+            ["https origin", [guardian(1, { rpc_url: "https://127.0.0.1:15441/" }), guardian(2), guardian(3)]],
+            ["embedded credentials", [guardian(1, { rpc_url: "http://user:pass@127.0.0.1:15441/" }), guardian(2), guardian(3)]],
+            ["non root path", [guardian(1, { rpc_url: "http://127.0.0.1:15441/admin" }), guardian(2), guardian(3)]],
+            ["query string", [guardian(1, { rpc_url: "http://127.0.0.1:15441/?x=1" }), guardian(2), guardian(3)]],
+            ["fragment", [guardian(1, { rpc_url: "http://127.0.0.1:15441/#frag" }), guardian(2), guardian(3)]],
+            ["zero port", [guardian(1, { listen_address: "127.0.0.1:0" }), guardian(2), guardian(3)]],
+            ["wildcard without advertisement", [guardian(1, { listen_address: "0.0.0.0:15441" }), guardian(2), guardian(3)]],
+            ["unparseable entry", [guardian(1, { rpc_url: "not a url" }), guardian(2), guardian(3)]],
+            ["two entries", [guardian(1), guardian(2)]],
+            ["four entries", [guardian(1), guardian(2), guardian(3), guardian(4)]],
             ["not an array", "http://127.0.0.1:15441"],
         ];
         await inTempDir(async (dir) => {
-            for (const [label, endpoints] of cases) {
+            for (const [label, guardianConfigs] of cases) {
                 const file = `endpoints-${label.replaceAll(" ", "-")}.json`;
-                const config = publicGuardianConfig();
-                (config.client as Record<string, unknown>).endpoints = endpoints;
-                await writeConfig(dir, file, config);
-                await expectRejection(dir, file, "expected only GuardianConfig public fields");
+                await writeConfig(dir, file, canonicalConfig(canonicalNetwork({ guardian_configs: guardianConfigs })));
+                await expectRejection(dir, file, "guardian public fields");
             }
         });
     });
 
     it("rejects an unusable history listener or invalid L1 endpoint", async () => {
         const cases: Array<[string, Record<string, unknown>]> = [
-            ["blank listener", { listen_address: "   " }],
-            ["non string listener", { listen_address: 15450 }],
-            ["unspecified listener", { listen_address: "0.0.0.0:15450" }],
-            ["zero port", { listen_address: "127.0.0.1:0" }],
+            ["blank listener", { guardian_history: { listen_address: "   " } }],
+            ["non string listener", { guardian_history: { listen_address: 15450 } }],
+            ["unspecified listener", { guardian_history: { listen_address: "0.0.0.0:15450" } }],
+            ["zero port", { guardian_history: { listen_address: "127.0.0.1:0" } }],
             ["l1 endpoints not an array", { l1_endpoints: {} }],
+            ["missing l1 endpoints", { l1_endpoints: [] }],
             ["null l1 endpoint", { l1_endpoints: [null] }],
             ["unknown l1 field", { l1_endpoints: [{ chain_index: 0, rpc_url: "http://127.0.0.1:8545", chain_id: 1 }] }],
             ["chain index above u8", { l1_endpoints: [{ chain_index: 256, rpc_url: "http://127.0.0.1:8545" }] }],
@@ -1239,58 +1440,46 @@ describe("guardian launcher config preflight", () => {
             ["string chain index", { l1_endpoints: [{ chain_index: "0", rpc_url: "http://127.0.0.1:8545" }] }],
             ["non string rpc url", { l1_endpoints: [{ chain_index: 0, rpc_url: 7 }] }],
             ["blank rpc url", { l1_endpoints: [{ chain_index: 0, rpc_url: "   " }] }],
+            ["zero l1 port", { l1_endpoints: [{ chain_index: 0, rpc_url: "http://127.0.0.1:0" }] }],
         ];
         await inTempDir(async (dir) => {
-            for (const [label, clientOverrides] of cases) {
-                const file = `client-${label.replaceAll(" ", "-")}.json`;
-                const config = publicGuardianConfig();
-                config.client = { ...(config.client as Record<string, unknown>), ...clientOverrides };
-                await writeConfig(dir, file, config);
-                await expectRejection(dir, file, "expected only GuardianConfig public fields");
+            for (const [label, overrides] of cases) {
+                const file = `network-${label.replaceAll(" ", "-")}.json`;
+                await writeConfig(dir, file, canonicalConfig(canonicalNetwork(overrides)));
+                await expectRejection(dir, file, "guardian public fields");
             }
         });
     });
-    it("requires a nonempty trusted prove-proxy pool and rejects empty or malformed pools", async () => {
-        const cases: Array<[string, unknown]> = [
-            ["empty pool", []],
-            ["not an array", "http://127.0.0.1:9999"],
-            ["non string entry", ["http://127.0.0.1:9999", 7]],
-            ["blank entry", ["http://127.0.0.1:9999", "   "]],
-        ];
+
+    it("selects the compiled network and rejects one without guardian endpoints", async () => {
         await inTempDir(async (dir) => {
-            for (const [label, proveProxyUrl] of cases) {
-                const file = `proxy-${label.replaceAll(" ", "-")}.json`;
-                const config = publicGuardianConfig();
-                (config.network as Record<string, unknown>).prove_proxy_url = proveProxyUrl;
-                await writeConfig(dir, file, config);
-                await expectRejection(dir, file, "expected only GuardianConfig public fields");
-            }
-            await writeConfig(dir, "trusted-proxy.json", publicGuardianConfig());
-            expect(await resolveGuardianConfigPath(dir, "trusted-proxy.json")).toBe(path.resolve(dir, "trusted-proxy.json"));
+            await writeConfig(dir, "config.json", canonicalConfig());
+            await expect(validateGuardianRpcConfig(dir, "config.json", { PSY_NETWORK: "mainnet" })).rejects.toThrow("mainnet network must exist");
+            await expect(validateGuardianRpcConfig(dir, "config.json", {})).rejects.toThrow("PSY_NETWORK must name the compiled canonical network");
         });
     });
 });
 
 describe("guardian config selection precedence", () => {
-    it("requires PSY_GUARDIAN_CONFIG whenever a relayer, bridge proposer or bridge UI launches", () => {
+    it("requires PSY_GUARDIAN_ROOT whenever a relayer, bridge proposer or bridge UI launches", () => {
         // ProcessOptions.bridgeUi is set by the process-manager path, not by a CLI flag.
-        expect(shouldRequireGuardianConfig(true, {})).toBe(true);
-        expect(shouldRequireGuardianConfig(false, { relayer: true })).toBe(true);
-        expect(shouldRequireGuardianConfig(false, { bridgeProposerDaemon: true })).toBe(true);
-        expect(shouldRequireGuardianConfig(false, { bridgeUi: true })).toBe(true);
+        expect(shouldRequireGuardianRoot(true, {})).toBe(true);
+        expect(shouldRequireGuardianRoot(false, { relayer: true })).toBe(true);
+        expect(shouldRequireGuardianRoot(false, { bridgeProposerDaemon: true })).toBe(true);
+        expect(shouldRequireGuardianRoot(false, { bridgeUi: true })).toBe(true);
     });
 
-    it("does not require PSY_GUARDIAN_CONFIG for memory, db or explicit-only runs", () => {
-        expect(shouldRequireGuardianConfig(false, {})).toBe(false);
-        expect(shouldRequireGuardianConfig(false, { relayer: false, bridgeProposerDaemon: false, bridgeUi: false })).toBe(false);
-        expect(shouldRequireGuardianConfig(false, { psyPrivacyBridge: true })).toBe(false);
+    it("does not require PSY_GUARDIAN_ROOT for memory, db or explicit-only runs", () => {
+        expect(shouldRequireGuardianRoot(false, {})).toBe(false);
+        expect(shouldRequireGuardianRoot(false, { relayer: false, bridgeProposerDaemon: false, bridgeUi: false })).toBe(false);
+        expect(shouldRequireGuardianRoot(false, { psyPrivacyBridge: true })).toBe(false);
     });
 });
 
 describe("whole bridge daemon config forwarding", () => {
-    const daemonToml = `rpc_config = "rpc.json"
+    const daemonToml = `guardian_root = "guardians"
+rpc_config = "rpc.json"
 services_url = "http://127.0.0.1:3000"
-guardian_config = "guardian.json"
 withdraw_method_id = 4159421846
 poll_interval_secs = 15
 confirmation_lag_checkpoints = 3
@@ -1319,18 +1508,30 @@ password_env = "SYNTHETIC_PASSWORD"
     const fixture = async (run: (cwd: string, env: NodeJS.ProcessEnv, ports: number[]) => Promise<void>) => {
         const cwd = await mkdtemp(path.join(tmpdir(), "daemon-public-preflight-"));
         try {
-            await mkdir(path.join(cwd, "authorization", "versions"), { recursive: true });
-            for (const file of ["rpc.json", "signer", "authorization/index.json", "authorization/versions/1.json"]) await writeFile(path.join(cwd, file), "synthetic metadata fixture, not credentials");
+            await mkdir(path.join(cwd, "guardians", "db"), { recursive: true, mode: 0o700 });
+            await writeFile(path.join(cwd, "signer"), "synthetic metadata fixture, not credentials");
             const ports = [await reserveLoopbackPort(), await reserveLoopbackPort(), await reserveLoopbackPort()];
-            const signer = (id: number) => ({ listen_address: `127.0.0.1:${ports[id - 1]}`, signing_key_secret_path: path.join(homedir(), ".psy", "keystore", `guardian-${id}.keystore.json`), signing_key_password_secret_path: path.join(homedir(), ".psy", "keystore", `guardian-${id}.password`) });
-            const network = { magic: "0x1", users_per_realm: 1, global_user_tree_height: 32, realm_user_tree_height: 20, group_realm_height: 1, realm_configs: [{ id: 0, rpc_url: ["http://127.0.0.1:18081"] }], p2p: { checkpoints_per_epoch: 1 }, coordinator_configs: [{ id: 0, rpc_url: ["http://127.0.0.1:18080"] }], prove_proxy_url: ["http://127.0.0.1:9999"], faucet_rpc_url: [], nostr_relay_url: "wss://relay.example", native_currency: "PSY", native_currency_decimal: 18, native_currency_name: "Psy", fees: { register_user_fee: 0, deploy_contract_fee: 0, guta_fee: 1000000000, da_fee: 1000 } };
-            await writeFile(path.join(cwd, "guardian.json"), JSON.stringify({
-                network,
-                guardians: { "1": signer(1), "2": signer(2), "3": signer(3) },
-                client: { endpoints: ["http://a.example/", "http://b.example/", "http://c.example/"], archive_path: "archive/relayer-journal", listen_address: "127.0.0.1:15450", l1_endpoints: [] },
-            }));
+            const network = {
+                magic: "0x1", users_per_realm: 1, global_user_tree_height: 32, realm_user_tree_height: 20, group_realm_height: 1,
+                realm_configs: [{ id: 0, rpc_url: ["http://127.0.0.1:18081"] }], p2p: { checkpoints_per_epoch: 1 },
+                coordinator_configs: [{ id: 0, rpc_url: ["http://127.0.0.1:18080"] }], prove_proxy_url: ["http://127.0.0.1:9999"],
+                faucet_rpc_url: [], nostr_relay_url: "wss://relay.example", native_currency: "PSY", native_currency_decimal: 18,
+                native_currency_name: "Psy", fees: { register_user_fee: 0, deploy_contract_fee: 0, guta_fee: 1000000000, da_fee: 1000 },
+                guardian_configs: [1, 2, 3].map((id) => ({ id, listen_address: `127.0.0.1:${ports[id - 1]}` })),
+                guardian_history: { listen_address: "127.0.0.1:15450" },
+                guardian_authorization: {}, // Presence only; Rust owns typed validation.
+                l1_endpoints: [{ chain_index: 0, rpc_url: "http://127.0.0.1:8545" }],
+            };
+            await writeFile(path.join(cwd, "rpc.json"), JSON.stringify({ defaultNetwork: "localhost", networks: { localhost: network } }));
             await writeFile(path.join(cwd, "daemon.toml"), daemonToml);
-            await run(cwd, { PSY_BRIDGE_DAEMON_CONFIG: "daemon.toml" }, ports);
+            const previousNetwork = process.env.PSY_NETWORK;
+            process.env.PSY_NETWORK = "localhost";
+            try {
+                await run(cwd, { PSY_BRIDGE_DAEMON_CONFIG: "daemon.toml", PSY_GUARDIAN_ROOT: "guardians", PSY_NETWORK: "localhost" }, ports);
+            } finally {
+                if (previousNetwork === undefined) delete process.env.PSY_NETWORK;
+                else process.env.PSY_NETWORK = previousNetwork;
+            }
         } finally { await rm(cwd, { recursive: true, force: true }); }
     };
 
@@ -1369,17 +1570,17 @@ password_env = "SYNTHETIC_PASSWORD"
                 await allEntered.promise;
                 expect(commands).toHaveLength(3);
                 expect(manager.spawnedProcesses).toHaveLength(0);
+                expect(commands).toEqual([1, 2, 3].map((id) => [
+                    './target/release/psy_relayer_cli', 'guardian-service', '--rpc-config', path.join(cwd, 'rpc.json'),
+                    '--guardian-root', path.join(cwd, 'guardians'), '--guardian-id', String(id),
+                ]));
                 for (const gate of gates) gate.resolve();
                 await starting;
-                expect(commands).toEqual([1, 2, 3].map((id) => [
-                    './target/release/psy_relayer_cli', 'guardian-service', '--config', path.join(cwd, 'guardian.json'),
-                    '--guardian-id', String(id), '--db-path', `journal/${id}.redb`,
-                ]));
                 expect(manager.spawnedProcesses.map((process) => process.name)).toEqual(["guardian_1", "guardian_2", "guardian_3"]);
                 const relayer = processTemplate("bridge_relayer", ["psy_relayer_cli", "--config", "daemon.toml"]);
                 expect(applicationStartOrder([relayer, ...manager.spawnedProcesses])).toEqual(["guardian_1", "guardian_2", "guardian_3", "bridge_relayer"]);
                 expect(applicationListenerPorts(manager.spawnedProcesses)).toEqual([...ports].sort((left, right) => left - right));
-                await validateRelayerTemplate(commands[0], { cwd, env: {} });
+                await validateRelayerTemplate(commands[0], { cwd, env: { PSY_NETWORK: "localhost" } });
             } finally { for (const gate of gates) gate.resolve(); spawn.mockRestore(); }
         });
     });
@@ -1403,10 +1604,10 @@ password_env = "SYNTHETIC_PASSWORD"
             try {
                 await expect(RunningProcess.spawn([
                     process.execPath, "-e", "setInterval(() => {}, 1 << 30)",
-                    "guardian-service", "--config", "guardian.json", "--guardian-id", "1", "--db-path", "journal/1.redb",
+                    "guardian-service", "--rpc-config", "rpc.json", "--guardian-root", "guardians", "--guardian-id", "1",
                 ], {
                     cwd,
-                    env: {} as Record<string, string>,
+                    env: { PSY_NETWORK: "localhost" } as Record<string, string>,
                     stdoutLogFile: path.join(cwd, "guardian-late.log"),
                     stderrLogFile: path.join(cwd, "guardian-late.err"),
                 })).rejects.toThrow(`guardian-service port ${ports[0]} not ready within 600000ms`);
@@ -1429,10 +1630,10 @@ password_env = "SYNTHETIC_PASSWORD"
             try {
                 await expect(RunningProcess.spawn([
                     process.execPath, "-e", "setInterval(() => {}, 1 << 30)",
-                    "guardian-service", "--config", "guardian.json", "--guardian-id", "1", "--db-path", "journal/1.redb",
+                    "guardian-service", "--rpc-config", "rpc.json", "--guardian-root", "guardians", "--guardian-id", "1",
                 ], {
                     cwd,
-                    env: {} as Record<string, string>,
+                    env: { PSY_NETWORK: "localhost" } as Record<string, string>,
                     stdoutLogFile: path.join(cwd, "guardian-timeout.log"),
                     stderrLogFile: path.join(cwd, "guardian-timeout.err"),
                 })).rejects.toThrow(`guardian-service port ${ports[0]} not ready within 600000ms`);
@@ -1468,48 +1669,71 @@ password_env = "SYNTHETIC_PASSWORD"
         });
     });
 
-    it("rejects occupied guardian ports and preserves protected journal bytes", async () => {
-        await fixture(async (cwd) => {
+    it("rejects occupied guardian ports and preserves an existing guardian database file", async () => {
+        await fixture(async (cwd, env) => {
             const listener = net.createServer();
             await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
             const port = (listener.address() as net.AddressInfo).port;
-            const configPath = path.join(cwd, "guardian.json");
+            const configPath = path.join(cwd, "rpc.json");
             const config = JSON.parse(await Bun.file(configPath).text());
-            config.guardians["1"].listen_address = `127.0.0.1:${port}`;
+            config.networks.localhost.guardian_configs[0].listen_address = `127.0.0.1:${port}`;
             await writeFile(configPath, JSON.stringify(config));
-            const cmds = ["psy_relayer_cli", "guardian-service", "--config", configPath, "--guardian-id", "1", "--db-path", "journal/1.redb"];
+            const cmds = ["psy_relayer_cli", "guardian-service", "--rpc-config", "rpc.json", "--guardian-root", "guardians", "--guardian-id", "1"];
             try {
-                await expect(prepareGuardianService(cmds, cwd)).rejects.toThrow();
+                await expect(prepareGuardianService(cmds, cwd, env)).rejects.toThrow();
             } finally { await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve())); }
-            expect(await prepareGuardianService(cmds, cwd)).toEqual({ host: "127.0.0.1", port });
-            const journal = path.join(cwd, "journal");
-            expect(statSync(journal).mode & 0o777).toBe(0o700);
-            await writeFile(path.join(journal, "1.redb"), "retained journal", { mode: 0o600 });
-            await prepareGuardianService(cmds, cwd);
-            expect(readFileSync(path.join(journal, "1.redb"), "utf8")).toBe("retained journal");
-            expect(statSync(path.join(journal, "1.redb")).mode & 0o777).toBe(0o600);
-            await chmod(journal, 0o755);
-            await expect(prepareGuardianService(cmds, cwd)).rejects.toThrow("owner-only");
-            expect(statSync(journal).mode & 0o777).toBe(0o755);
+            expect(await prepareGuardianService(cmds, cwd, env)).toEqual({ host: "127.0.0.1", port });
+            const databaseDir = path.join(cwd, "guardians", "db");
+            expect(statSync(databaseDir).mode & 0o777).toBe(0o700);
+            await writeFile(path.join(databaseDir, "guardian-1.redb"), "retained database", { mode: 0o600 });
+            await prepareGuardianService(cmds, cwd, env);
+            expect(readFileSync(path.join(databaseDir, "guardian-1.redb"), "utf8")).toBe("retained database");
+            expect(statSync(path.join(databaseDir, "guardian-1.redb")).mode & 0o777).toBe(0o600);
+            await chmod(databaseDir, 0o755);
+            await expect(prepareGuardianService(cmds, cwd, env)).rejects.toThrow("owner-only");
+            expect(statSync(databaseDir).mode & 0o777).toBe(0o755);
         });
     });
 
-    it("rejects journal paths redirected into purgeable state", async () => {
-        await fixture(async (cwd) => {
+    it("rejects a database directory redirected into purgeable state", async () => {
+        await fixture(async (cwd, env) => {
+            await rm(path.join(cwd, "guardians", "db"), { recursive: true, force: true });
             await mkdir(path.join(cwd, "logs"));
-            await symlink(path.join(cwd, "logs"), path.join(cwd, "journal"));
-            const cmds = ["psy_relayer_cli", "guardian-service", "--config", "guardian.json", "--guardian-id", "1", "--db-path", "journal/1.redb"];
-            await expect(prepareGuardianService(cmds, cwd)).rejects.toThrow("guardian journal metadata");
-            await expect(prepareGuardianService([...cmds.slice(0, -1), "journal/2.redb"], cwd)).rejects.toThrow("Invalid guardian-service template");
+            await symlink(path.join(cwd, "logs"), path.join(cwd, "guardians", "db"));
+            const cmds = ["psy_relayer_cli", "guardian-service", "--rpc-config", "rpc.json", "--guardian-root", "guardians", "--guardian-id", "1"];
+            await expect(prepareGuardianService(cmds, cwd, env)).rejects.toThrow("guardian db metadata");
         });
     });
 
     it("forwards nested TOML unchanged, resolving from launch cwd without reading protected contents", async () => {
         await fixture(async (cwd, env) => {
-            for (const file of ["signer", "authorization/index.json"]) await chmod(path.join(cwd, file), 0);
+            await chmod(path.join(cwd, "signer"), 0);
             expect(await resolveBridgeDaemonConfigPath(cwd, env, true)).toBe(path.join(cwd, "daemon.toml"));
             expect(await Bun.file(path.join(cwd, "daemon.toml")).text()).toBe(daemonToml);
             await validateRelayerTemplate(["./target/release/psy_relayer_cli", "--config", "daemon.toml"], { cwd, env: env as Record<string, string> });
+        });
+    });
+
+    it("allows first fresh preflight without authorization but rejects runtime until canonical publication", async () => {
+        await fixture(async (cwd, env) => {
+            const file = path.join(cwd, "rpc.json");
+            const config = await Bun.file(file).json();
+            delete config.networks.localhost.guardian_authorization;
+            await writeFile(file, JSON.stringify(config));
+            expect(await resolveBridgeDaemonConfigPath(cwd, env, true)).toBe(path.join(cwd, "daemon.toml"));
+            const commands = ["./target/release/psy_relayer_cli", "--config", "daemon.toml"];
+            const guardian = ["psy_relayer_cli", "guardian-service", "--rpc-config", "rpc.json", "--guardian-root", "guardians"];
+            await expect(validateRelayerTemplate(commands, { cwd, env: env as Record<string, string> })).rejects.toThrow("guardian_authorization");
+            await expect(validateRelayerTemplate(guardian, { cwd, env: env as Record<string, string> })).rejects.toThrow("guardian_authorization");
+            config.networks.localhost.guardian_authorization = {};
+            const published = JSON.stringify(config);
+            await writeFile(file, published);
+            await validateRelayerTemplate(commands, { cwd, env: env as Record<string, string> });
+            await validateRelayerTemplate(guardian, { cwd, env: env as Record<string, string> });
+            expect(await Bun.file(file).text()).toBe(published);
+            for (const invalid of [undefined, null, [], "separate-file.json"]) {
+                expect(() => validateGuardianAuthorization({ guardian_authorization: invalid })).toThrow("guardian_authorization");
+            }
         });
     });
 
@@ -1578,7 +1802,7 @@ password_env = "SYNTHETIC_PASSWORD"
     it("rejects lexical and realpath purge containment including absent history outputs", async () => {
         await fixture(async (cwd, env) => {
             await mkdir(path.join(cwd, "logs"));
-            await writeFile(path.join(cwd, "logs", "rpc.json"), "synthetic");
+            await writeFile(path.join(cwd, "logs", "rpc.json"), await Bun.file(path.join(cwd, "rpc.json")).text());
             await symlink(path.join(cwd, "logs"), path.join(cwd, "alias"));
             for (const rpc of ["logs/rpc.json", "alias/rpc.json"]) {
                 await writeFile(path.join(cwd, "daemon.toml"), daemonToml.replace('rpc_config = "rpc.json"', `rpc_config = "${rpc}"`));
@@ -1586,45 +1810,45 @@ password_env = "SYNTHETIC_PASSWORD"
                 expect(await resolveBridgeDaemonConfigPath(cwd, env)).toBe(path.join(cwd, "daemon.toml"));
             }
             await writeFile(path.join(cwd, "daemon.toml"), daemonToml);
-            const guardian = JSON.parse(await Bun.file(path.join(cwd, "guardian.json")).text());
-            await symlink(path.join(cwd, "logs"), path.join(cwd, "archive"));
-            await writeFile(path.join(cwd, "guardian.json"), JSON.stringify(guardian));
-            await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("archive_path metadata");
+            await rm(path.join(cwd, "guardians", "db"), { recursive: true, force: true });
+            await symlink(path.join(cwd, "logs"), path.join(cwd, "guardians", "db"));
+            await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("guardian root db metadata");
         });
     });
 
-    it("accepts a real or absent relayer archive directory and rejects a regular file through restart and resume", async () => {
+    it("requires the generator-owned db directory and preserves an existing database file through restart", async () => {
         await fixture(async (cwd, env) => {
-            const guardianPath = path.join(cwd, "guardian.json");
-            const guardian = JSON.parse(await Bun.file(guardianPath).text());
-            const archive = path.join(cwd, "archive", "relayer-journal");
+            const databaseDir = path.join(cwd, "guardians", "db");
+            const databaseFile = path.join(databaseDir, "relayer.redb");
             const spawnOptions = { cwd, env: env as Record<string, string> };
-            await rm(archive, { recursive: true, force: true });
+            await writeFile(databaseFile, "retained relayer database", { mode: 0o600 });
             expect(await resolveBridgeDaemonConfigPath(cwd, env, true)).toBe(path.join(cwd, "daemon.toml"));
             await validateRelayerTemplate(["psy_relayer_cli", "--config", "daemon.toml"], spawnOptions);
-            expect(await Bun.file(archive).exists()).toBe(false);
-
-            await mkdir(path.join(archive, "7"), { recursive: true });
-            await writeFile(path.join(archive, "7", "request.json"), "retained signing history");
+            expect(await Bun.file(databaseFile).text()).toBe("retained relayer database");
             expect(await resolveBridgeDaemonConfigPath(cwd, env, true)).toBe(path.join(cwd, "daemon.toml"));
             await validateRelayerTemplate(["psy_relayer_cli", "--config", "daemon.toml"], spawnOptions);
             const manager = new DevNetProcessManager();
             const relayer = processTemplate("bridge_relayer", ["psy_relayer_cli", "--config", "daemon.toml"]);
             relayer.spawnOptions = spawnOptions;
+            const infrastructure = ["db", "l1_anvil", "l1_anvil_bsc", "l1_anvil_base"].map((name) => {
+                const process = processTemplate(name, [name]);
+                process.isRunning = () => true;
+                return process;
+            });
             const lifecycle = manager as unknown as {
                 applicationLifecycleState: string;
                 pausedApplicationProcesses: RunningProcess[];
                 spawnedProcesses: RunningProcess[];
             };
             lifecycle.applicationLifecycleState = "running";
-            lifecycle.spawnedProcesses = [relayer];
+            lifecycle.spawnedProcesses = [...infrastructure, relayer];
             lifecycle.pausedApplicationProcesses = [];
             const stop = spyOn(manager, "stopApplications").mockImplementation(async () => {
                 lifecycle.applicationLifecycleState = "stopped";
                 lifecycle.spawnedProcesses = [];
                 lifecycle.pausedApplicationProcesses = [relayer];
             });
-            const spawnSentinel = new Error("archive preflight reached spawn sentinel");
+            const spawnSentinel = new Error("db preflight reached spawn sentinel");
             const spawn = spyOn(RunningProcess, "spawn").mockRejectedValue(spawnSentinel);
             try {
                 // The saved config matches, so this proves preflight reaches spawn rather than a config mismatch.
@@ -1641,13 +1865,15 @@ password_env = "SYNTHETIC_PASSWORD"
             expect(lifecycle.applicationLifecycleState).toBe("stopped");
             expect(lifecycle.pausedApplicationProcesses).toEqual([relayer]);
             expect(lifecycle.spawnedProcesses).toEqual([]);
-            expect(await Bun.file(path.join(archive, "7", "request.json")).text()).toBe("retained signing history");
+            expect(await Bun.file(databaseFile).text()).toBe("retained relayer database");
+            lifecycle.spawnedProcesses = [relayer];
+            lifecycle.applicationLifecycleState = "running";
+            await expect(manager.restartApplications(cwd)).rejects.toThrow("requires running infrastructure");
+            expect(await Bun.file(databaseFile).text()).toBe("retained relayer database");
 
-            const invalidArchive = path.join(cwd, "archive-file");
-            await writeFile(invalidArchive, "not a directory");
-            guardian.client.archive_path = "archive-file";
-            await writeFile(path.join(cwd, "guardian.json"), JSON.stringify(guardian));
-            await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("expected only GuardianConfig public fields");
+            await rm(databaseDir, { recursive: true, force: true });
+            await writeFile(databaseDir, "not a directory");
+            await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("guardian root db metadata");
         });
     });
 
@@ -1657,7 +1883,8 @@ password_env = "SYNTHETIC_PASSWORD"
             await writeFile(path.join(cwd, "daemon.toml"), daemonToml.replace('rpc_config = "rpc.json"', 'rpc_config = "logs"'));
             await expect(resolveBridgeDaemonConfigPath(cwd, env, true)).rejects.toThrow("rpc_config metadata");
             await writeFile(path.join(cwd, "daemon.toml"), daemonToml);
-            await expect(resolveBridgeDaemonConfigPath(cwd, { ...env, PSY_GUARDIAN_CONFIG: "other.json" })).rejects.toThrow("coherence");
+            await expect(resolveBridgeDaemonConfigPath(cwd, { ...env, PSY_GUARDIAN_ROOT: "other-root" })).rejects.toThrow();
+            expect(await Bun.file(path.join(cwd, "daemon.toml")).text()).toBe(daemonToml);
             await expect(validateRelayerTemplate(["psy_relayer_cli", "--config", "other.toml"], { cwd, env: env as Record<string, string> })).rejects.toThrow("saved --config coherence");
         });
     });
@@ -1667,14 +1894,19 @@ password_env = "SYNTHETIC_PASSWORD"
             const manager = new DevNetProcessManager();
             const relayer = processTemplate("bridge_relayer", ["psy_relayer_cli", "--config", "daemon.toml"]);
             relayer.spawnOptions = { cwd, env: env as Record<string, string> };
-            manager.spawnedProcesses = [relayer];
+            const infrastructure = ["db", "l1_anvil", "l1_anvil_bsc", "l1_anvil_base"].map((name) => {
+                const process = processTemplate(name, [name]);
+                process.isRunning = () => true;
+                return process;
+            });
+            manager.spawnedProcesses = [...infrastructure, relayer];
             const stop = spyOn(manager, "stopApplications").mockResolvedValue(undefined);
             const spawn = spyOn(RunningProcess, "spawn");
             try {
                 await rm(path.join(cwd, "rpc.json"));
                 await expect(manager.restartApplications("/not-the-launch-cwd")).rejects.toThrow("rpc_config");
                 expect(stop).not.toHaveBeenCalled();
-                expect(manager.spawnedProcesses).toEqual([relayer]);
+                expect(manager.spawnedProcesses).toEqual([...infrastructure, relayer]);
                 // Exercise saved supervisor state without starting any child processes.
                 const lifecycle = manager as unknown as {
                     applicationLifecycleState: string;
@@ -1741,107 +1973,279 @@ describe("resolveForkRpcEnvKey", () => {
     });
 });
 
-describe("make shutdown Anvil preservation", () => {
-    const stateText = (best: number) => JSON.stringify({
-        best_block_number: best,
-        blocks: [{ header: { number: "0x1" } }, { header: { number: "0x64" } }],
-    });
-    const dumpHex = (text: string) => `0x${Buffer.from(Bun.gzipSync(Buffer.from(text))).toString("hex")}`;
-
-    it("reads top-level best_block_number instead of the last unsorted block", () => {
-        const text = stateText(5);
-        expect(anvilStateBestBlockNumber(JSON.parse(text), "fixture")).toBe(5n);
-        expect(decodeAnvilDumpStateHex(dumpHex(text), "fixture")).toBe(text);
-        expect(() => anvilStateBestBlockNumber({ blocks: [{ header: { number: "0x64" } }] }, "fixture")).toThrow("best_block_number");
-    });
-
-    it("decodes a large incompressible mixed-case JSON dump", () => {
-        let state = 0x9e3779b9;
-        const next = () => {
-            state ^= state << 13;
-            state ^= state >>> 17;
-            state ^= state << 5;
-            return state >>> 0;
-        };
-        const alphabet = "0123456789abcdef";
-        let padding = "";
-        while (padding.length < 4 * 1024 * 1024) padding += alphabet[next() & 15];
-        const text = JSON.stringify({ best_block_number: 5, padding });
-        const hex = Buffer.from(Bun.gzipSync(Buffer.from(text))).toString("hex");
-        const mixed = `0x${hex.replace(/[a-f]/g, (digit, index) => index % 2 === 0 ? digit.toUpperCase() : digit)}`;
-        expect(mixed.length).toBeGreaterThan(1024 * 1024);
-        expect(decodeAnvilDumpStateHex(mixed, "fixture")).toBe(text);
-        expect(JSON.parse(decodeAnvilDumpStateHex(mixed, "fixture")).best_block_number).toBe(5);
-    });
-
-    it("rejects malformed hex and non-gzip dumps", () => {
-        const expected = "expected hex-encoded gzip";
-        const valid = dumpHex(stateText(5));
-        for (const dump of ["0x", "abc", `${valid}a`, `${valid}\n`, `${valid}é`, 0, null]) {
-            expect(() => decodeAnvilDumpStateHex(dump, "fixture")).toThrow(expected);
-        }
-        expect(() => decodeAnvilDumpStateHex(`${valid.slice(0, -1)}g`, "fixture")).toThrow(expected);
-        expect(() => decodeAnvilDumpStateHex(`0x${Buffer.from("not gzip").toString("hex")}`, "fixture")).toThrow("not decodable gzip");
-    });
-
-    it("routes PURGE=0 teardown to the owner, publishes only after exit, and skips broad kill on failure", async () => {
+describe("PURGE=0 shutdown control", () => {
+    it("acks shutdown only through the supervisor and refuses an unsupported owner", async () => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         const repo = `${dir}/repo`;
         await Bun.$`mkdir -p ${repo}`.quiet();
         const previousTmp = process.env.TMPDIR;
         process.env.TMPDIR = dir;
-        const order: string[] = [];
-        const published: string[] = [];
-        const killed: string[] = [];
-        const manager = new DevNetProcessManager();
-        const anvil = Object.create(RunningProcess.prototype) as RunningProcess;
-        anvil.name = "l1_anvil";
-        anvil.cmds = ["anvil", "--port", "8545"];
-        anvil.hasExited = false;
-        const exited = Promise.withResolvers<number>();
-        anvil.proc = { killed: false, exited: exited.promise } as unknown as RunningProcess["proc"];
-        anvil.isRunning = () => !anvil.hasExited;
-        anvil.killWithSignal = () => {
-            killed.push("SIGTERM");
-            anvil.hasExited = true;
-            exited.resolve(0);
-        };
-        manager.spawnedProcesses = [anvil];
-        manager.quiesceApplications = async () => { order.push("quiesce"); };
-        const rpc = async (_rpcUrl: string, method: string) => {
-            order.push(method);
-            return method === "eth_blockNumber" ? "0x5" : dumpHex(stateText(5));
-        };
         try {
             const server = await startDevnetControlServer(repo, async (command) => {
-                if (command !== "shutdown-preserve") throw new Error(`unexpected ${command}`);
-                await manager.preserveOwnedAnvilState(repo, rpc);
-                published.push(await Bun.file(localAnvilStatePath(repo)).text());
-                return { message: "preserved", afterAck: () => undefined };
+                if (command !== "shutdown") throw new Error(`unexpected ${command}`);
+                return { message: "shutdown completed", afterAck: () => undefined };
             });
             expect(await requestOwnedAnvilShutdown(repo, false)).toBe("owned");
-            expect(JSON.parse(published[0]).best_block_number).toBe(5);
-            expect(order).toEqual(["quiesce", "eth_blockNumber", "anvil_dumpState"]);
-            expect(killed).toEqual(["SIGTERM"]);
             await server.close();
-
             const stale = await startDevnetControlServer(repo, async () => {
-                throw new Error("[DevNet][control] unsupported command shutdown-preserve");
+                throw new Error("[DevNet][control] unsupported command shutdown");
             });
-            await expect(requestOwnedAnvilShutdown(repo, false)).rejects.toThrow("does not support shutdown-preserve");
+            await expect(requestOwnedAnvilShutdown(repo, false)).rejects.toThrow("does not support shutdown");
             await stale.close();
-
-            const before = await Bun.file(localAnvilStatePath(repo)).text();
-            await expect(preserveUnownedLiveAnvils(repo, async () => {
-                throw new Error("RPC must not run");
-            }, async (port) => port === 8545)).rejects.toThrow("refusing to snapshot or kill");
-            expect(await Bun.file(localAnvilStatePath(repo)).text()).toBe(before);
-            expect(readdirSync(path.dirname(localAnvilStatePath(repo))).some((entry) => entry.includes(".preserve-"))).toBe(false);
         } finally {
             if (previousTmp === undefined) delete process.env.TMPDIR;
             else process.env.TMPDIR = previousTmp;
             await Bun.$`rm -rf ${dir}`.quiet();
         }
+    });
+});
+
+describe("frozen dependency startup selection", () => {
+    it("does not prepare SDK/UI sidecars for core-only selection", () => {
+        expect(selectedUiDependencies(false, {})).toBe(false);
+        expect(selectedUiDependencies(true, {})).toBe(true);
+        for (const ui of ["psyPrivacyBridge", "ide", "explorer", "modeAWebWalletBridge"] as const) {
+            expect(selectedUiDependencies(false, { [ui]: true })).toBe(true);
+        }
+    });
+
+    it("refuses missing contracts dependencies instead of installing in frozen mode", async () => {
+        const root = await mkdtemp(path.join(tmpdir(), "frozen-contracts-"));
+        const previous = process.env.PSY_FROZEN_DEPS;
+        process.env.PSY_FROZEN_DEPS = "1";
+        const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("must not install"); });
+        try {
+            await expect(ensurePsyContractsDependencies(root)).rejects.toThrow("refusing install");
+            expect(spawn).not.toHaveBeenCalled();
+            await mkdir(path.join(root, "node_modules/.bin"), { recursive: true });
+            await writeFile(path.join(root, "node_modules/.bin/hardhat"), "fixture");
+            await ensurePsyContractsDependencies(root);
+            expect(spawn).not.toHaveBeenCalled();
+        } finally {
+            spawn.mockRestore();
+            if (previous === undefined) delete process.env.PSY_FROZEN_DEPS;
+            else process.env.PSY_FROZEN_DEPS = previous;
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it("requires explicit cached pnpm/store and real Envio before guarded codegen", async () => {
+        const root = await mkdtemp(path.join(tmpdir(), "frozen-envio-"));
+        try {
+            await expect(runFrozenEnvioCodegen(root, {})).rejects.toThrow("PSY_FROZEN_DEPS_PNPM");
+            await expect(runFrozenEnvioCodegen(root, { PSY_FROZEN_DEPS_PNPM: "/unused/pnpm.cjs", PSY_FROZEN_DEPS_STORE: "/unused/store" }))
+                .rejects.toThrow("preinstalled Envio executable");
+        } finally { await rm(root, { recursive: true, force: true }); }
+    });
+});
+
+describe("frozen Envio runtime command", () => {
+    it("accepts the reviewed start script and refuses a different one", async () => {
+        const root = await mkdtemp(path.join(tmpdir(), "frozen-envio-start-"));
+        const generated = path.join(root, "generated");
+        const executable = path.join(generated, "node_modules/.bin/ts-node");
+        const writeManifest = (start: string) => writeFile(
+            path.join(generated, "package.json"),
+            JSON.stringify({ scripts: { start } }),
+        );
+        await mkdir(path.dirname(executable), { recursive: true });
+        await mkdir(path.join(generated, "src"), { recursive: true });
+        await writeFile(executable, "#!/usr/bin/env node\n");
+        await writeFile(path.join(generated, "src/Index.res.js"), "export {};\n");
+        try {
+            await writeManifest("ts-node src/Index.res.js");
+            await expect(frozenEnvioStartCommand(root)).resolves.toEqual({
+                command: [executable, "src/Index.res.js"],
+                cwd: generated,
+            });
+            await writeManifest("node src/Index.res.js");
+            await expect(frozenEnvioStartCommand(root)).rejects.toThrow("reviewed generated start script");
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("graceful Anvil stop", () => {
+    const identity = (exe: string, repo: string, port: number) => ({
+        exe, cwd: repo, cmdline: ["anvil", "--port", String(port), "--state", `${repo}/db/anvil/state.json`].join("\0"), starttime: "10",
+    });
+
+    it("SIGTERMs only the discovered repo Anvil and leaves its state file untouched", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "graceful-anvil-"));
+        const repo = path.join(dir, "repo");
+        const exe = path.join(dir, "anvil");
+        const state = path.join(repo, "db/anvil/state.json");
+        await mkdir(path.dirname(state), { recursive: true });
+        await writeFile(state, "native-exit-dump");
+        await writeFile(exe, "");
+        await chmod(exe, 0o755);
+        const processIdentity = identity(exe, repo, 8545);
+        const signals: number[] = [];
+        let alive = true;
+        const stopped: string[][] = [];
+        try {
+            await gracefulDevnetStop(repo, {
+                listPids: async () => [41],
+                readIdentity: async (pid) => pid === 41 && alive ? processIdentity : null,
+                listenerOwner: async (port) => port === 8545 && alive ? 41 : null,
+                alive: (pid) => pid === 41 && alive,
+                signal: (pid) => { signals.push(pid); alive = false; },
+                listCheckoutProcesses: async () => [],
+                stopDocker: async (names) => { stopped.push([...names]); },
+            });
+            expect(signals).toEqual([41]);
+            expect(await Bun.file(state).text()).toBe("native-exit-dump");
+            expect(stopped[0]).toEqual(["valkey-server", "nats-server", "scylla-server", "nostr-relay", "generated-envio-postgres-1", "generated-graphql-engine-1"]);
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("refuses SIGTERM when the listener identity changes and does not stop databases", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "graceful-anvil-reuse-"));
+        const repo = path.join(dir, "repo");
+        const exe = path.join(dir, "anvil");
+        const state = path.join(repo, "db/anvil/state.json");
+        await mkdir(path.dirname(state), { recursive: true });
+        await writeFile(state, "native-exit-dump");
+        await writeFile(exe, "");
+        await chmod(exe, 0o755);
+        const processIdentity = identity(exe, repo, 8545);
+        const stopped: string[][] = [];
+        let reads = 0;
+        try {
+            await expect(gracefulDevnetStop(repo, {
+                listPids: async () => [41],
+                readIdentity: async () => {
+                    reads += 1;
+                    return reads === 1 ? processIdentity : { ...processIdentity, starttime: "99" };
+                },
+                listenerOwner: async (port) => port === 8545 ? 41 : null,
+                signal: () => { throw new Error("must not signal a changed identity"); },
+                listCheckoutProcesses: async () => [],
+                stopDocker: async (names) => { stopped.push([...names]); },
+            })).rejects.toThrow("identity changed before SIGTERM");
+            expect(stopped).toEqual([]);
+            expect(reads).toBe(2);
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("rejects an occupied listener that is not the matching repo Anvil", async () => {
+        const dir = await mkdtemp(`${tmpdir()}/graceful-anvil-`);
+        const exe = `${dir}/anvil`;
+        await writeFile(exe, "");
+        await chmod(exe, 0o755);
+        try {
+            await expect(discoverRepoAnvils(`${dir}/repo`, {
+                listPids: async () => [],
+                listenerOwner: async (port) => port === 8545 ? 77 : null,
+            })).rejects.toThrow("not the matching repo Anvil");
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("stops only the resolved namespace containers", async () => {
+        const dir = await mkdtemp(`${tmpdir()}/graceful-stop-`);
+        await mkdir(path.join(dir, "local_checkpoints"));
+        await writeFile(path.join(dir, "local_checkpoints", "devnet-namespace"), "\n");
+        const stopped: string[][] = [];
+        try {
+            await gracefulDevnetStop(dir, {
+                listPids: async () => [],
+                listenerOwner: async () => null,
+                listCheckoutProcesses: async () => [],
+                stopDocker: async (names) => { stopped.push([...names]); },
+            });
+            expect(stopped[0]).toEqual(["valkey-server", "nats-server", "scylla-server", "nostr-relay", "generated-envio-postgres-1", "generated-graphql-engine-1"]);
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("devnet resource admission", () => {
+    it("inherits a committed namespace and rejects explicit conflicts", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "namespace-binding-"));
+        try {
+            await mkdir(path.join(dir, "local_checkpoints"));
+            await writeFile(path.join(dir, "local_checkpoints/devnet-namespace"), "isolated\n");
+            expect((await resolveBoundDevnetNames(dir, {})).namespace).toBe("isolated");
+            await expect(resolveBoundDevnetNames(dir, { PSY_DEVNET_NAMESPACE: "other" })).rejects.toThrow("does not match");
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("allows unbound legacy reads but never maps an explicit namespace to legacy", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "namespace-unbound-"));
+        try {
+            const legacy = await resolveBoundDevnetNames(dir, {});
+            expect(legacy.namespace).toBeNull();
+            await expect(resolveBoundDevnetNames(dir, { PSY_DEVNET_NAMESPACE: "isolated" })).rejects.toThrow("no committed");
+            expect(await Bun.file(path.join(dir, "local_checkpoints/devnet-namespace")).exists()).toBe(false);
+            await commitDevnetNamespaceBinding(dir, legacy);
+            await expect(commitDevnetNamespaceBinding(dir, legacy)).rejects.toThrow();
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("creates an owner-only binding tree and rejects a loose pre-existing one", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "namespace-binding-modes-"));
+        try {
+            await commitDevnetNamespaceBinding(dir, await resolveBoundDevnetNames(dir, {}));
+            const bindingDir = path.join(dir, "local_checkpoints");
+            expect(statSync(bindingDir).mode & 0o777).toBe(0o700);
+            expect(statSync(path.join(bindingDir, "devnet-namespace")).mode & 0o7777).toBe(0o600);
+            expect(readdirSync(bindingDir)).toEqual(["devnet-namespace"]);
+
+            const loose = await mkdtemp(path.join(tmpdir(), "namespace-binding-loose-"));
+            try {
+                const looseDir = path.join(loose, "local_checkpoints");
+                await mkdir(looseDir);
+                await chmod(looseDir, 0o775);
+                await expect(commitDevnetNamespaceBinding(loose, await resolveBoundDevnetNames(loose, {})))
+                    .rejects.toThrow("must not be group/other-writable");
+                expect(statSync(looseDir).mode & 0o777).toBe(0o775);
+                expect(readdirSync(looseDir)).toEqual([]);
+            } finally { await rm(loose, { recursive: true, force: true }); }
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+
+    it("does not discover or stop infrastructure after failed admission", async () => {
+        const manager = new DevNetProcessManager();
+        const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("must not spawn cleanup"); });
+        try {
+            await manager.cleanupFailedSetup("unused");
+            await manager.teardown("unused", false);
+            expect(spawn).not.toHaveBeenCalled();
+        } finally { spawn.mockRestore(); }
+    });
+
+    it("checks untracked producers before discovery or infrastructure stop", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "namespace-producer-"));
+        try {
+            await expect(gracefulDevnetStop(dir, {
+                listCheckoutProcesses: async () => ["orphan"],
+                listPids: async () => { throw new Error("must not discover"); },
+                stopDocker: async () => { throw new Error("must not stop"); },
+            })).rejects.toThrow("producers remain");
+        } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+});
+
+describe("non-purge shutdown control client attribution", () => {
+    it("ignores only the exact same-user checkout teardown CLI, not Bun producers", () => {
+        const root = "/checkout/psy-node";
+        const uid = process.getuid!();
+        const client = [process.execPath, "run", "dev/locSetupV4.ts", "--teardown", ""];
+        const matches = (argv: string[], exe = process.execPath, cwd = root, owner = uid) =>
+            isGracefulShutdownControlClient(root, exe, cwd, argv, owner);
+        expect(matches(client)).toBe(true);
+        expect(matches([process.execPath, `${root}/dev/locSetupV4.ts`, "--teardown"])).toBe(true);
+        expect(matches([process.execPath, "run", "dev/locSetupV4.ts", "--db", "--l1"])).toBe(false);
+        expect(matches([process.execPath, "run", "producer.ts", "--teardown"])).toBe(false);
+        expect(matches([...client.slice(0, -1), "--db"])).toBe(false);
+        expect(matches([...client.slice(0, -1), "--purge"])).toBe(false);
+        expect(matches(client, "/other/bun")).toBe(false);
+        expect(matches(client, process.execPath, "/other/checkout")).toBe(false);
+        expect(matches(client, process.execPath, root, uid + 1)).toBe(false);
     });
 });
 
@@ -2044,5 +2448,70 @@ describe("purge Anvil ownership", () => {
         expect(timed.code !== 0 || timed.timedOut).toBe(true);
         expect(names.has("valkey-server")).toBe(true);
     });
+});
+
+/** Owned helper exit when stdin closes. The abort ladder stays in production. */
+describe("fresh helper ownership release", () => {
+    it("releases ownership with exit code 1 and a null signal", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "fresh-helper-exit-"));
+        const guardianRoot = path.join(dir, "guardians");
+        const helperPath = path.join(dir, "target", "release", "psy_dev_cli");
+        // ESM live binding: locSetupV4's spawn is this namespace export, so the spy
+        // observes the helper the abort actually owns. A static import is a copy.
+        const childProcess = await import("node:child_process");
+        const spawnSpy = spyOn(childProcess, "spawn");
+        let child: ChildProcessWithoutNullStreams | undefined;
+        try {
+            const account = {
+                contract_id: 1,
+                initial_policy: { version: 1, threshold: 2, member_count: 3, member_hashes: ["01", "02", "03", "00", "00", "00", "00", "00"] },
+            };
+            await mkdir(path.join(dir, "psy-genesis"), { recursive: true });
+            await mkdir(path.join(dir, "psy-compiler/psy-precompiles/multisig_policy/target"), { recursive: true });
+            await mkdir(path.dirname(helperPath), { recursive: true });
+            await writeFile(path.join(dir, "psy-genesis/config.json"), JSON.stringify({
+                networks: { localhost: { guardian_authorization: { bridge_relayer_signing_policy: JSON.stringify(account) } } },
+            }));
+            await writeFile(path.join(dir, "psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json"), JSON.stringify({
+                state_tree_height: 4,
+                circuit_definitions: [{ name: "get_policy" }, { name: "set_policy" }],
+                abi: { contract: { state_tree_height: 4 } },
+            }));
+            // One process: re-exec line-buffered, then block in `read`. EOF makes `read`
+            // return 1, and that status is the exit. `exit 0` would fake a clean publish.
+            await writeFile(helperPath, [
+                "#!/bin/bash",
+                "if [[ -z ${FRESH_HELPER_FIXTURE_READY:-} ]]; then",
+                "  export FRESH_HELPER_FIXTURE_READY=1",
+                "  exec stdbuf -oL /bin/bash \"$0\" \"$@\"",
+                "fi",
+                "printf '%s\\n' '{\"phase\":\"prepared\"}'",
+                "read -r line",
+                "",
+            ].join("\n"));
+            await chmod(helperPath, 0o755);
+            const state = await prepareFreshDevnetState(dir, guardianRoot, { PSY_NETWORK: "localhost", PSY_PROJECTS_DIR: dir });
+            const spawned = spawnSpy.mock.results[0];
+            expect(spawned?.type).toBe("return");
+            child = spawned.value as ChildProcessWithoutNullStreams;
+            const exitEvent = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+                child!.once("exit", (code, signal) => resolve({ code, signal }));
+            });
+            await state.abort();
+            expect(await exitEvent).toEqual({ code: 1, signal: null });
+        } finally {
+            const owned = child ?? (spawnSpy.mock.results[0]?.type === "return"
+                ? spawnSpy.mock.results[0].value as ChildProcessWithoutNullStreams
+                : undefined);
+            spawnSpy.mockRestore();
+            if (owned && owned.exitCode === null && owned.signalCode === null) {
+                await new Promise<void>((resolve) => {
+                    owned.once("exit", () => resolve());
+                    try { owned.kill("SIGKILL"); } catch { resolve(); }
+                });
+            }
+            await rm(dir, { recursive: true, force: true });
+        }
+    }, 15_000);
 });
 

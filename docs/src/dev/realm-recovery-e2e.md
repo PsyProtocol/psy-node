@@ -8,15 +8,14 @@ user-reported prior acceptance; source references describe checks, not test pass
 
 ## Environment
 
-Use the repository's configured devnet environment and launch `make run-all`
-in the foreground under tmux, never with `&`. Do not copy credentials or
-machine-specific environment paths into this runbook. Runtime operations are
-owned by the session operator; the verification snippets below are read-only.
+Use the repository's configured devnet environment. `make run-all` is a fresh local startup (`Makefile:96-99`): it resets local chain state regardless of `PURGE`. It is not a state-preserving restart. State-preserving resume is `make rollback-resume` (`Makefile:107-108`). Launch a fresh stack with `make run-all` in the foreground under tmux, never with `&`. Do not copy credentials or machine-specific environment paths into this runbook. Runtime operations are owned by the session operator; the verification snippets below are read-only.
 
 Logs land in `logs/<service>_<logs,errs>.txt`. RPC surfaces:
 coordinator edge `:1337`, realm edges `:13380/:13381` (realm 0) and
 `:13390/:13391` (realm 1), faucet `:9998`, psy-services `:3000`,
-prove proxy `:9999`, L1 anvil `:8545`.
+foreground prove proxy `prove_proxy_0` with `--role all` on `:9999`
+(daemon Compose omits `--role` and is user-only), L1 anvil `:8545`.
+Do not call that process `local0`.
 
 Snapshot logs before destructive reruns:
 
@@ -70,44 +69,53 @@ done
 
 3. Scenario F uses a **fresh registered user**, not genesis user 0. The
    public faucet RPC still grants only 100 raw units and does not take an
-   amount. Fee-reserved funding used genesis user 0 calling contract 5
-   `faucet(user_id, amount)` once, which deferred token `simple_transfer`
-   (`../psy-compiler/psy-precompiles/faucet/src/main.psy:17-45`). Amount was
-   `100 + 3 * 1_000_002_000` raw so the recipient's later `simple_claim` and
-   two successful `simple_transfer` EndCaps could pay
-   `GUTA_FEE + DA_FEE * slots` (`psy-genesis/config.json:65-66`;
+   amount. Current fee-reserved funding is genesis user 0 calling contract 5
+   `faucet(user_id, amount)` once. That defers contract 0 `transfer`, method
+   id `2789897329` (`../psy-compiler/psy-precompiles/faucet/src/main.psy:45-46`).
+   The current token methods are `claim(sender)` at
+   `../psy-compiler/psy-precompiles/token/src/main.psy:461` and
+   `transfer(recipient, amount)` at `:430`. Historical PASS rows below keep
+   the old `simple_claim` / `simple_transfer` names as observations of those
+   runs. They are not the current method names.
+   Protocol fees were not changed (`psy-genesis/config.json:65-66`;
    `client_prover/psy_circuit/psy_ups_circuit/src/session.rs:1311-1338`).
-   Protocol fees were not changed.
 
-4. Recipient spendable balance requires `simple_claim(sender)` against the
-   faucet caller (`../psy-compiler/psy-precompiles/token/src/main.psy:445-465`).
-   Scenario F then used `psy_user_cli call ... --method-name simple_transfer`
-   for 50, 49, and rejected 10. `private-transfer` still exists, but that CLI
-   requires `--private-key` on argv (`args.rs:679-683`) and was not used.
+4. Recipient spendable balance requires `claim` with input
+   `[0]` when genesis user 0 was the faucet caller
+   (`../psy-compiler/psy-precompiles/token/src/main.psy:461-474`).
+   After that claim is included, Scenario F uses `psy_user_cli call` on
+   contract 0 `--method-name transfer` with inputs `[0,1]` for the funded
+   user-0 sample. Export `PRIVATE_KEY` for the CLI; do not pass
+   `--private-key` on argv (`client_prover/psy_core/psy_common/src/args.rs:95-96`).
+   `private-transfer` still exists and was not used.
 
 Judgment criteria (grep the proposer's and follower's processor logs):
 
 | Criterion | Greppable string | Source |
 | --- | --- | --- |
-| Proposal published | `realm P2P proposal published proposal=` | `process_block.rs:786` |
-| Follower saved the body | body file appears under `local_checkpoints/realm_{R}_{S}/proposal_backups/bodies/` | `realm_p2p.rs:616` |
-| Follower voted | `realm P2P vote published proposal= signer_sub_id=` (peer's sub id) | `drive.rs:221` |
-| Proposer collected the vote | `realm P2P vote received proposal= signer_sub_id=` | `drive.rs:336` |
-| Certificate formed | `realm P2P certificate formed proposal=` | `process_block.rs:853` |
-| Submitted to coordinator | `Submitting GUTA proof to Coordinator proposal=` | `process_block.rs:606` |
-| Coordinator admitted | `realm P2P certificate admitted realm=` | coordinator `handler.rs:889` |
-| Inclusion applied | `Committed Realm proposal FFS checkpoint_id=` | `process_block.rs:397` |
+| Proposal published | `realm P2P proposal published proposal=` | `process_block.rs:796` |
+| Follower saved the body | body file appears under `local_checkpoints/realm_{R}_{S}/proposal_backups/bodies/` | `realm_p2p.rs:616`; path helper `node_start_config.rs:49-52` |
+| Follower voted | `realm P2P vote published proposal= signer_sub_id=` (peer's sub id) | `drive.rs:222` |
+| Proposer collected the vote | `realm P2P vote received proposal= signer_sub_id=` | `drive.rs:338` |
+| Certificate formed | `realm P2P certificate formed proposal=` | `process_block.rs:861` |
+| Submitted to coordinator | `Submitting GUTA proof to Coordinator proposal=` | `process_block.rs:608` |
+| Coordinator admitted | `realm P2P certificate admitted realm=` | coordinator `handler.rs:1094` |
+| Proposer commit | `Committed new realm block with checkpoint_id` | `process_block.rs:673-675` |
+| Follower inclusion applied | `Applied proposal FFS checkpoint_id=` | `process_block.rs:397-401` |
 | GUTA root changed | proposal `new_root != old_root` (body file name halves differ) | `replay_state_updates_into_tree` |
-| 4th transfer rejected | `assertion failed: insufficient balance` from `simple_transfer`, not an RPC crash | `token/src/main.psy:423` |
+| 4th transfer rejected | `assertion failed: insufficient balance` from `transfer`, not an RPC crash | `../psy-compiler/psy-precompiles/token/src/main.psy:439` |
+
+There is no current log `Committed Realm proposal FFS`. `Applied Realm gatherer FastForward` is the gatherer path, not proposal FFS.
 
 Failure signatures and what they mean:
 
 | String | Meaning | Where to look |
 | --- | --- | --- |
-| `dropped unauthenticated Realm vote` | a vote arrived for a proposal whose vote-auth context is not registered locally | `drive.rs:328`; expected on the follower for the proposer's self-vote, abnormal if the follower never votes |
-| `follower baseline replay rejected proposal=` | the follower's baseline replay rejected the proposal (coverage or root binding) | `realm_p2p.rs:633`; reason comes from `recovery.rs` |
-| `timed out: wait_votes` | proposer never reached the replication threshold; 120 s deadline | `runner.rs:122` |
-| `InvalidStateUpdates: ... has no IMT record` | nonzero changed leaf on an IMT-indexed tree lacks its required IMT record; see limitations below, not a universal positional-write rejection | `psy_node_common/src/realm/processor/recovery.rs:389-393,570-603` |
+| `dropped unauthenticated Realm vote` | a vote arrived for a proposal whose vote-auth context is not registered locally | `drive.rs:333`; expected on the follower for the proposer's self-vote, abnormal if the follower never votes |
+| `follower baseline replay rejected proposal=` | the follower's baseline replay rejected the proposal (coverage or root binding) | `realm_p2p.rs:634`; reason comes from FFS verification, not `recovery.rs` |
+| `timed out waiting for valid Realm votes` | proposer never reached the replication threshold; 120 s deadline | `process_block.rs:808-814`. `runner.rs:122` is unrelated |
+| `no peer offered transition=` | current debug text when no peer offers a transition | `process_block.rs:345`. The older `no peer offered pair` string is gone |
+| `InvalidStateUpdates: ... has no IMT record` | nonzero changed leaf on an IMT-indexed tree lacks its required IMT record; see limitations below, not a universal positional-write rejection | `psy_node_common/src/realm/processor/db/records.rs:73-74` |
 
 ## H — lagging follower body catch-up
 
@@ -152,8 +160,7 @@ Fix and same-state resume:
    through the retained tip; `[REALM_STARTUP] reloaded gatherer tree after catch-up`
    at `14:58:08.248172Z`.
 5. The exact C765 body file appeared on `realm_0_2` at `14:58:06` with the
-   same 144231 bytes as `realm_0_1`. That is `proposal_store.install` of a
-   staged catch-up candidate (`init.rs:667-668`), not gossip
+   same 144231 bytes as `realm_0_1`. The historical note called this `proposal_store.install` of a staged catch-up candidate (`init.rs:667-668`). Current owner is `ProposalBackup::install` (`proposal_backup.rs:260`); there is no `proposal_store.rs`. That observation is not gossip
    `Realm P2P proposal body complete` (that string is absent after resume).
    Pre-resume `no verified candidate for pair=(3927e571...,0e4e642f...)`
    is gone after the metadata persist.
@@ -180,8 +187,7 @@ Status: **closed on the H-resumed stack.** Two windows:
 1. Pause. Realm-0 `sub_1` PID 2472240 was `SIGSTOP`'d at coordinator
    tip **962** (epoch 96) and `SIGCONT`'d at tip **995** (epoch 99).
    While frozen, `:1337` advanced 962 → 995 without that processor.
-   After continue, five edges agreed at 998 then 1047;
-   `no peer offered pair` stayed 0 on both realm-0 processors.
+   After continue, five edges agreed at 998 then 1047. The recorded `no peer offered pair` count stayed 0; that string is historical. The current debug text is `no peer offered transition=`.
 2. Other sub_id. After recovery, a realm-0 faucet (`psy_claim_faucet`
    on `:9998`, recipient 47, tx `5251c931…`, operator 393216, request
    checkpoint 1147) produced the first realm-0 `sub_2` transaction
@@ -236,7 +242,7 @@ and edge.
 |---|---|
 | W0 | Five edges **1276**. Epoch 127 (anchor 1269) computed r0 `sub_1`, r1 `sub_2`. `logs/worker_0_logs.txt` size 35285; last live proving was RealmFinalizeGUTA goal 1148 submit ok. |
 | W1 | SIGSTOP 2477876 at 16:04:11Z; `/proc` state `T`. Log size stayed 35285 for 8s (mtime 15:42:47Z). Coordinator workers remained `S`; tip 1279→1283. |
-| W2 | Faucet recipient 48, tx `3673b143…`, operator 1441792, request C1284. Realm-1 `sub_1` logged `Realm worker publication acknowledged` at 16:05:09Z (`process_block.rs:118`) checkpoint 1286 unique_pending_id 4058, then no `waited for jobs` / `Persisted worker artifact ready`. Timeout is `u64::MAX` (`startup.rs:126`); `persisted_artifact.rs:16-17` skips the deadline. Classified unbounded silent await. Proofs not weakened. Second faucet recipient 49, tx `58f7ca64…`, operator 917504, request C1288. |
+| W2 | Faucet recipient 48, tx `3673b143…`, operator 1441792, request C1284. Realm-1 `sub_1` logged `Realm worker publication acknowledged` at 16:05:09Z (`process_block.rs:118`) checkpoint 1286 unique_pending_id 4058, then no `waited for jobs` / `Persisted worker artifact ready`. Timeout is `u64::MAX` (`psy_node_common/src/realm/processor/core/startup.rs:128`); `persisted_artifact.rs:16-17` skips the deadline. Classified unbounded silent await. Proofs not weakened. Second faucet recipient 49, tx `58f7ca64…`, operator 917504, request C1288. |
 | W3 | Five `psy_get_checkpoint_global_state_roots[1286]` identical (`user_tree_root=cc23dad2…`). No post-16:04 Fatal / RESTART / channel-closed / preimage-mismatch. Live tips diverged only because r1s1 sat in the wait (`:13390` stayed 1286). |
 | W4 | While 2477876 remained `T`, coordinator tip reached **1300** epoch **130**. Computed r0 `sub_2` / r1 `sub_2` from committed anchor 1299. W0 identity was r0 `sub_1` at epoch 127. Not wall-clock. |
 | W5 | SIGCONT 2477876 at 16:07:41Z; state `T`→`S`; cmdline unchanged. `worker_0_logs.txt` grew past 35285. Post-CONT proving start/done/submit ok for GUTASingleEndCap goal **4058** and RealmFinalizeGUTA 1285/1290. r1s1 persisted the root proof at 16:07:45Z. |
@@ -284,27 +290,40 @@ No `Local database is stale.` (`init.rs:491`) and no
 
 ### 4b. Crash restart (kill -9)
 
+Kill only the realm processor already running for this isolated test. Do not search by command name and do not take the first match. At the prompt, enter the known PID of that one process:
+
 ```bash
-kill -9 <realm_processor_pid>
+read -r -p 'PID of the realm processor in this isolated test: ' pid
+case "$pid" in
+  ''|*[!0-9]*) echo "PID must be digits only" >&2; exit 1 ;;
+esac
+cwd=$(readlink -f "/proc/$pid/cwd") || exit 1
+repo=$(readlink -f "<repo-root>")
+case "$cwd" in
+  "$repo"|"$repo"/*) ;;
+  *) echo "PID cwd is not this repository" >&2; exit 1 ;;
+esac
+kill -9 "$pid"
 ```
+
+`<repo-root>` is the checkout under test. The check reads `/proc/$pid/cwd` only. Do not read `/proc/$pid/environ`.
 
 Judgment:
 
 - startup sweep removes unparseable residue from the ACTIVE bodies dir:
   `remove_staged_files` deletes files whose name fails
-  `parse_transition_file_name` (`proposal_store.rs:374-385`) — plant
+  `parse_transition_file_name` (`proposal_backup.rs:374-384`) — plant
   `.tmp-<n>-junk` and a garbage name before the kill; both must vanish.
 - valid bodies survive: `<hex>_<hex>` files created before the crash are still
   on disk after restart.
 - damaged bodies (valid name, corrupt bytes) are deleted on hydrate — flip the
   last byte of a body, restart, and the file disappears (damage path
-  `remove_transition`, `proposal_store.rs:242-256`).
+  `remove_transition`, `proposal_backup.rs:243`). There is no `proposal_store.rs`.
 - DB opens clean; no `Local database is stale.` / `ahead of coordinator`.
 
-### 4c. Full-network restart preserving state
+### 4c. Historical full-network restart observation
 
-Executed: `PURGE=0 make shutdown` then `make run-all` with rebuilt
-`psy_node_cli` at `5cc40680`. Relayer used a temporary `KEYSTORE_PATH`; HOME
+Historical observation at `psy_node_cli` `5cc40680`, not a current state-preserving procedure: `PURGE=0 make shutdown` then `make run-all`. Current `make run-all` resets local chain state regardless of `PURGE`. State-preserving resume is `make rollback-resume`. Relayer used a temporary `KEYSTORE_PATH`; HOME
 relayer keystore was not overwritten.
 
 After restart, five surfaces returned identical
@@ -482,7 +501,7 @@ proposers without a harness change.
 - Per-tree pairing classifies a tree using a **positive LIVE next-append
   pointer**, then requires IMT records for its nonzero changed leaves,
   including new indices on an IMT-indexed tree
-  (`psy_node_common/src/realm/processor/recovery.rs:570-603,389-393`).
+  (`psy_node_common/src/realm/processor/db/records.rs:73-74`; the former `recovery.rs:389-393,570-603` path is not current).
   Zero-valued changed leaves remain exempt. The pointer read is not
   checkpoint-versioned
   (`psy_node_core/src/psy_core_db/v3_implementation/full.rs:4142-4151`).
@@ -552,13 +571,13 @@ takeover.** Nonempty sub_2 proposal during the pause was not obtained.
 |---|---|
 | W0 | Five edges **1746**. Epoch 174 (anchor 1739) computed r0 `sub_2`, r1 `sub_2`. Realm worker PID **2477876** `S`; `logs/worker_0_logs.txt` size 68357. Coordinator workers 2476236/2477056 `S`. `e2e-evidence/round1-w/w0.json`. |
 | W1 | SIGSTOP 2477876 at 17:17:42Z; `/proc` `T`. Size stayed 68357 for 8s. Coordinator workers `S`; tip 1746→1747 (`w1.json`). |
-| W2 | Faucet recipient 55, tx `b68c038e…`, operator 655360, request C1749 (`w2-faucet.json`). r0s1 `Realm worker publication acknowledged` 17:18:30Z checkpoint 1751 unique_pending_id **5206** (`w2-ack.txt`); no `waited for jobs` before SIGCONT. Timeout `u64::MAX` (`startup.rs:126`). Unbounded silent await. Proofs not weakened. |
+| W2 | Faucet recipient 55, tx `b68c038e…`, operator 655360, request C1749 (`w2-faucet.json`). r0s1 `Realm worker publication acknowledged` 17:18:30Z checkpoint 1751 unique_pending_id **5206** (`w2-ack.txt`); no `waited for jobs` before SIGCONT. Timeout `u64::MAX` (`psy_node_common/src/realm/processor/core/startup.rs:128`). Unbounded silent await. Proofs not weakened. |
 | W3 | Five `psy_get_checkpoint_global_state_roots[1746]` identical (`user_tree_root=daa3bc6a…`). Live tips during wait: `:13380`=1751 others 1753 (r0s1 blocked). No 17:17–17:19 Fatal/RESTART/channel-closed/preimage-mismatch (`w3-rpc.json`, `w3-fatals.txt`). |
 | W4 | W0 identity r0 `sub_2` epoch 174. While worker `T`, tip 1753 epoch **175** computed r0 `sub_1` from committed anchor 1749 (`w4-scan.json`). Not wall-clock. |
 | W5 | SIGCONT 17:19:14Z; `T`→`S`; `size_before=68357` (`w5-cont.json`). `logs/worker_0_logs.txt` then contains `proving start` goal **5206** GUTASingleEndCap (`w5-proving.txt`). |
 | W6 | New proposer r0 `sub_1` epoch 175. 17:19:16Z `scheduled proposer realm=0 sub_id=1 epoch=175 target=1751`; certificate `signers=[1]`; follower r0s2 `proposal start accepted` + `proposal body complete` proposal=`0c2868a7…` body_len=**143789**; `Committed new realm block with checkpoint_id = 1757`. Operator 655360 leaf on `:13380` first equals tx `b68c038e…` at C1757 (C1756 still `8ce29ee7…`). Five-edge roots at 1757 identical (`w6-rpc.json`). |
 
-### 4c — PURGE=0 full-network restart — PASS
+### 4c — historical PURGE=0 full-network restart observation — PASS on that old revision
 
 Frozen checkpoint **1915** before teardown (`e2e-evidence/round2-4c/pre-summary.json`).
 Five tips **1938**. `user_tree_root=367179a0bcebb17b…`,
@@ -652,8 +671,7 @@ logged `Realm P2P proposal body complete` proposal=`95d8835f…` then
 file `9f3156d0…_74269643…` (142020 bytes) appeared on r0s1 (mtime
 23:21:14Z) and r0s2 (mtime 23:24:55Z); `cmp` identical
 (`body-cmp.json`). Gossip `body_len=141806`; docs cite disk `cmp`.
-Five-edge roots at 144 identical (`catchup-rpc.json`);
-`no peer offered pair` count 0 (`ghost.txt`).
+Five-edge roots at 144 identical (`catchup-rpc.json`). The recorded `no peer offered pair` count was 0 (`ghost.txt`); that string is historical. The current debug text is `no peer offered transition=`.
 
 
 ### Case 2 — missed epoch nonempty takeover — FAIL

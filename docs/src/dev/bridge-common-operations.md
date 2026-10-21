@@ -89,7 +89,7 @@ PURGE=1 make shutdown
 make run-all
 ```
 
-Keep `make run-all` in the foreground; it intentionally remains alive as the service supervisor (`Makefile:64-67`, `dev/locSetupV4.ts:5630-5635`). Run readiness checks and every later command from a second terminal whose current directory is `<repo-root>`. Do not background or abandon the supervisor. The supervisor truncates the relayer logs for this initial launch (`dev/locSetupV4.ts:649-658,4542-4549`), so the marker below belongs to the current process. Do not continue until all checks below succeed:
+Keep `make run-all` in the foreground; it intentionally remains alive as the service supervisor (`Makefile:96-99`, `dev/locSetupV4.ts:7723-7729`). Run readiness checks and every later command from a second terminal whose current directory is `<repo-root>`. Do not background or abandon the supervisor. The supervisor replaces the relayer logs for this initial launch (`dev/locSetupV4.ts:874-883,6567-6577`), so the marker below belongs to the current process. Do not continue until all checks below succeed:
 
 ```bash
 curl -fsS http://127.0.0.1:3000/health
@@ -105,16 +105,16 @@ curl -fsS -X POST http://127.0.0.1:13380 \
 grep -a 'bridge relayer started' logs/bridge_relayer_errs.txt
 ```
 
-The setup waits for services health and recognizes the stable relayer marker `bridge relayer started` (`dev/locSetupV4.ts:1141-1144,3676-3677,4418-4424`). Coordinator and realm RPC methods use the `psy_` prefix (`client_prover/psy_provider/src/request.rs:68-100`).
+The setup waits for services health and recognizes the stable relayer marker `bridge relayer started` (`dev/locSetupV4.ts:1634-1635,6567-6577`). Coordinator and realm RPC methods use the `psy_` prefix (`client_prover/psy_provider/src/request.rs:68-100`).
 
-`make run-all` generates `local_checkpoints/bridge_proposer/daemon.toml` and starts the current relayer daemon through this CLI surface (`dev/locSetupV4.ts:4519-4551`):
+`make run-all` does not generate a daemon configuration. It starts the current relayer from the operator-supplied `PSY_BRIDGE_DAEMON_CONFIG`; the checked-in reference template is `psy_cli/psy_relayer_cli/config/local.toml` (`dev/locSetupV4.ts:6565-6578`, `psy_cli/psy_relayer_cli/config/local.toml:1-4`):
 
 ```bash
 ./target/release/psy_relayer_cli \
-  --config local_checkpoints/bridge_proposer/daemon.toml
+  --config "$PSY_BRIDGE_DAEMON_CONFIG"
 ```
 
-The lifecycle target owns that process. The command is shown to identify the active `psy_relayer_cli` surface; do not launch a second copy. The relayer does not support `--result-file`; its durable operational state is `local_checkpoints/bridge_proposer/daemon_state.toml`, its stdout log is `logs/bridge_relayer_logs.txt`, and tracing markers are in `logs/bridge_relayer_errs.txt` (`dev/locSetupV4.ts:3832-3837`, `psy_cli/psy_relayer_cli/src/main.rs:24-32`, `psy_cli/psy_relayer_cli/src/bridge/daemon.rs:1205`). The daemon config also requires `guardian_config`, pointing at the public guardian root `config.json`; the daemon loads it and validates the external RPC projection at startup (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:100,892-897`). Guardian signer setup and the guardians-root branch that produces that root are owned by [genesis-generation.md §4](genesis-generation.md#4-guardians-root); no TLS, certificate, or separate guardian database provisioning step exists in this runbook.
+The lifecycle target owns that process. The command identifies the active `psy_relayer_cli` surface; do not launch a second copy. The relayer does not support `--result-file`. Durable daemon progress is `<guardian_root>/db/relayer.redb`, not `<proof_dir>/daemon_state.toml` or `<proof_dir>/daemon_state_multichain.toml`. `proof_dir` still comes from the daemon TOML, defaults to `/tmp/psy_bridge_proofs`, and holds proof files only. Its stdout log is `logs/bridge_relayer_logs.txt`, and tracing markers are in `logs/bridge_relayer_errs.txt` (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:852-876,1112-1118`). `run_multichain` loads `RelayerDb::finalization_batch` and `RelayerDb::chain_claims` through `load_multichain_state`. `run_single_chain` reads `L1Client::last_finalized_checkpoint`, then loads that chain's `chain_claims` row through `load_chain_state`. That L1 value is the only cursor and is not stored. `chain_claims` is keyed by `u8` `chain_index` and holds `pending_claim_withdrawals`, `claim_retry`, and `retired_claim_withdrawals`. `finalization_batch` is the singleton key `()` and holds `pending_finalization_range` (`from_checkpoint`, `to_checkpoint`) and `finalized_chains`. `deposit_tree_states` stores per-chain `count`, `root`, `frontier`, and `anchor`; its `event_block` is the log cursor and is not a string prefix. `included_withdrawal_burns` is keyed by sender, token contract, and burn nonce, not by an identity. `guardian_withdrawal_nonce` stays unchanged. Both reads happen after the current authorization digest. The in-flight guardian request is the sole non-`Included` `relayer_request` row from `RelayerDb::pending_request`: `session_nonce` is the key and `request_id` comes from `GuardianSignRequest::request_id`. Resume does not read or clear a stored `producing_session`. `save_request` commits that pending row and selected `chain_claims` inserts together. `import_verified` commits the `Included` row and new `chain_claims` inserts together. `save_finalization_and_claims` commits the `finalization_batch` singleton and new claims together, and only when a range is persisted. Later claim results commit `chain_claims` only. There is no `identity_namespace` row and no `last_finalized_checkpoint` row (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:891-896,1141-1154,1866-1922,1943-1962`; `psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:216-244,446-537,676`). The daemon TOML keeps `rpc_config`, pointing at the canonical `psy-genesis/config.json`; it has no `guardian_config` and no second JSON. The launcher requires `PSY_GUARDIAN_ROOT`, checks the selected network's public guardian endpoints and its `guardian_authorization` object, and checks the guardians-root `db/` directory metadata. That object is the only authorization record. The runtime databases `db/guardian-{1,2,3}.redb` and `db/relayer.redb` hold mutable nonce, signed-request, included-session, per-chain deposit-tree state, included withdrawal burns, per-chain claim, and shared finalization-batch state; they do not store an authorization body (`dev/locSetupV4.ts` `resolveGuardianRoot` + `validateGuardianRuntimeRoot` + `validateGuardianAuthorization`, and the relayer/guardian template validation that calls them; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:24-28`). Guardian signer setup and publication into the selected network are owned by [genesis-generation.md §4](genesis-generation.md#4-guardians-root). This runbook has no separate authorization document and no TLS or certificate step.
 
 ## 3. Discover This Startup's Addresses
 
@@ -146,11 +146,14 @@ Stop if any value is empty or `null`.
 
 ## 4. Set One User and Small Amounts
 
-Use a normal devnet user, not the relayer identity. Keep L2 operations for this user strictly serial. Choose fresh `R0`, `R1`, note-secret limbs, nullifier-secret limbs, and withdrawal nonce for every run.
+Use a normal devnet user, not the relayer identity. Keep L2 operations for this user strictly serial. Choose fresh `R0`, `R1`, note-secret limbs, nullifier-secret limbs, and withdrawal nonce for every run. L2 wallet commands read the existing `PRIVATE_KEY`. The deposit command reads `L1_PRIVATE_KEY`. `cast` has no environment binding for a raw key: scripted sends use `ETH_KEYSTORE` and `ETH_PASSWORD`, and the installed `cast send --help` binds `ETH_PASSWORD` to `--password-file` (a path, not the password text). Do not export a private key in this runbook, and do not pass `--private-key` or `--password`.
 
 ```bash
-export USER_PRIVATE_KEY='<user-l1-private-key>'
-export USER_L1_ADDRESS="$(cast wallet address "$USER_PRIVATE_KEY")"
+test -n "${PRIVATE_KEY:-}"
+test -n "${L1_PRIVATE_KEY:-}"
+test -n "${ETH_KEYSTORE:-}"
+test -f "${ETH_PASSWORD:-}"
+export USER_L1_ADDRESS="$(cast wallet address --keystore "$ETH_KEYSTORE" --password-file "$ETH_PASSWORD")"
 export DEPOSIT_AMOUNT='2000'
 export WITHDRAW_AMOUNT='1000'
 export SOURCE_CHAIN_INDEX='0'
@@ -172,22 +175,23 @@ For local USDT, `2000` is `0.002` USDT and `1000` is `0.001` USDT. Small values 
 
 ## 5. Register the User and Derive the Shield Address
 
-Follow [`docs/src/dev/common-operations.md`](common-operations.md) Sections 2–4 with this run's `USER_PRIVATE_KEY`, `RPC_CONFIG`, and `RESULT_DIR`. Continue only when registration is indexed. Export `USER_PUBLIC_KEY` from `register-user.json.public_key_hash` and `USER_ID` from `get-user-id.json.user_id`; reject an empty or null user ID. Registration and identity semantics are defined in `client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:15-46` and `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_id.rs:9-30`.
+Follow [`docs/src/dev/common-operations.md`](common-operations.md) Sections 2–4 with `PRIVATE_KEY` already exported, plus this run's `RPC_CONFIG` and `RESULT_DIR`. Do not pass `-p` or `--private-key`. Continue only when registration is indexed. Export `USER_PUBLIC_KEY` from `register-user.json.public_key_hash` and `USER_ID` from `get-user-id.json.user_id`; reject an empty or null user ID. Registration and identity semantics are defined in `client_prover/psy_cli/psy_user_cli/src/subcommand/register_user.rs:15-46` and `client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_id.rs:9-30`.
 
 Derive the bridge-specific shield address using the same user and this run's fresh randomness:
 
 ```bash
+test -n "${USER_ID:-}"
 ./target/release/psy_user_cli \
   --result-file "$RESULT_DIR/shield-address.json" \
   derive-shield \
-  --private-key "$USER_PRIVATE_KEY" \
+  --user-id "$USER_ID" \
   --rpc-config "$RPC_CONFIG" \
   --random0 "$R0" \
   --random1 "$R1"
 export SHIELD_ADDRESS="$(jq -r '.shield_address' "$RESULT_DIR/shield-address.json")"
 ```
 
-`derive-shield` takes exactly one of `--private-key` or `--user-id`. The private-key path resolves the registered user over RPC and also prints the Nostr npub. The user-id path is offline. Structured `shield_address` is the services query key (`client_prover/psy_cli/psy_user_cli/src/subcommand/shield_address.rs:66-112`).
+`derive-shield` takes exactly one of `--private-key` or `--user-id`. The private-key flag is argv-only (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:827-828`) and also prints the Nostr npub. This runbook does not execute that form. The `--user-id` path is offline and is the executable command. Structured `shield_address` is the services query key (`client_prover/psy_cli/psy_user_cli/src/subcommand/shield_address.rs:66-112`).
 
 The global `--result-file` is atomically published only on success and contains secret-free command results (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:47-54`, `client_prover/psy_cli/psy_user_cli/src/result.rs:299-372`).
 
@@ -197,21 +201,23 @@ Follow [`docs/src/dev/common-operations.md`](common-operations.md) Section 5.1 u
 
 ## 7. Approve the Gateway and Submit the L1 Deposit — Not an EndCap
 
-Approve only the resolved ERC20Gateway, then submit exactly one deposit. Router dispatches the request, but ERC20Gateway is the token spender and calls `safeTransferFrom(depositor, bridge, amount)` (`psy-contracts/src/Router.sol:64-87`, `psy-contracts/src/ERC20Gateway.sol:62-82`). The CLI derives the shield address and note commitment from the user ID and fresh material (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:64-180`).
+Approve only the resolved ERC20Gateway, then submit exactly one deposit. Router dispatches the request, but ERC20Gateway is the token spender and calls `safeTransferFrom(depositor, bridge, amount)` (`psy-contracts/src/Router.sol:64-87`, `psy-contracts/src/ERC20Gateway.sol:62-82`). The CLI derives the shield address and note commitment from the user ID and fresh material (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:64-180`). The `deposit` and `claim-deposit` commands below read `NOTE_SECRET` and `NULLIFIER_SECRET` from the process environment (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:879-882`); omit those flags and never pass the secret values as command-line arguments, where they would leak into shell history and process listings.
 
 ```bash
 export FINALIZED_BEFORE_DEPOSIT="$(cast call "$STATE_MANAGER" 'lastFinalizedCheckpointId()(uint64)' --rpc-url "$L1_RPC_URL" | awk '{print $1}')"
 
+test -n "${ETH_KEYSTORE:-}"
+test -f "${ETH_PASSWORD:-}"
 cast send "$USDT" 'approve(address,uint256)' "$ERC20_GATEWAY" "$DEPOSIT_AMOUNT" \
-  --rpc-url "$L1_RPC_URL" --private-key "$USER_PRIVATE_KEY"
+  --rpc-url "$L1_RPC_URL" --keystore "$ETH_KEYSTORE" --password-file "$ETH_PASSWORD"
 
 export RECIPIENT_NPUB="<receiver-npub>"    # npub1... of the receiver; same wallet or the claimer
 export NOSTR_RELAY_URL="ws://127.0.0.1:8081"   # devnet relay; use a public relay only on shared networks
+test -n "${L1_PRIVATE_KEY:-}"
 ./target/release/psy_user_cli \
   --result-file "$RESULT_DIR/deposit.json" \
   deposit \
   --l1-rpc-url "$L1_RPC_URL" \
-  --private-key "$USER_PRIVATE_KEY" \
   --router-address "$ROUTER" \
   --token "$USDT" \
   --amount "$DEPOSIT_AMOUNT" \
@@ -221,8 +227,6 @@ export NOSTR_RELAY_URL="ws://127.0.0.1:8081"   # devnet relay; use a public rela
   --user-id "$USER_ID" \
   --r0 "$R0" \
   --r1 "$R1" \
-  --note-secret "$NOTE_SECRET" \
-  --nullifier-secret "$NULLIFIER_SECRET" \
   --deposit-proof-output "$RESULT_DIR/deposit-proof.json" \
   --recipient-npub "$RECIPIENT_NPUB" \
   --nostr-relay "$NOSTR_RELAY_URL"
@@ -232,28 +236,57 @@ export DEPOSIT_INDEX="$(jq -r '.deposit_index' "$RESULT_DIR/deposit-proof.json")
 test "$DEPOSIT_INDEX" != 'null'
 ```
 
-`--deposit-proof-output` is optional at the deposit interface, but it is required for the file-based `claim-deposit` command used below. With this flag, the deposit command waits up to 600 seconds for relayer proof readiness and then writes the sender-generated inclusion proof (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:636-676`, `client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1072-1107`). Never rerun `deposit` to retry proof generation: that records a new L1 deposit. `--nostr-relay` defaults to a public relay; on local devnet always pass `ws://127.0.0.1:8081` (the devnet nostr-relay container) or the events never reach the receiver.
+`--deposit-proof-output` is optional at the deposit interface, but it is required for the file-based `claim-deposit` command used below. With this flag, the deposit command waits up to 600 seconds for relayer proof readiness and then writes the sender-generated inclusion proof (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:773-804`). Never submit another `deposit` to retry proof generation: that records a new L1 deposit. If the original transaction is already confirmed, regenerate only its proof. Before running recovery, export `NOTE_SECRET` and `NULLIFIER_SECRET` from the retained mode-0600 deposit note into the process environment. Do not print those values or pass them as command arguments. The command reads those existing environment values, does not take `--private-key` or `--recipient-npub`, does not broadcast a transaction, and does not publish Nostr events (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:843,879-916`, `client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1164-1229`):
+
+```bash
+./target/release/psy_user_cli \
+  --result-file "$RESULT_DIR/deposit-recovery.json" \
+  deposit \
+  --l1-rpc-url "$L1_RPC_URL" \
+  --router-address "$ROUTER" \
+  --token "$USDT" \
+  --amount "$DEPOSIT_AMOUNT" \
+  --rpc-config "$RPC_CONFIG" \
+  --source-chain-index "$SOURCE_CHAIN_INDEX" \
+  --l2-token-contract-id "$USDT_L2_CONTRACT_ID" \
+  --user-id "$USER_ID" \
+  --r0 "$R0" \
+  --r1 "$R1" \
+  --deposit-proof-output "$RESULT_DIR/deposit-proof.json" \
+  --resume-deposit-index "$DEPOSIT_INDEX" \
+  --resume-tx-hash "$(jq -r '.transaction_hash' "$RESULT_DIR/deposit.json")" \
+  --resume-chain-id "$(cast chain-id --rpc-url "$L1_RPC_URL")"
+
+jq -e '.status == "proof_only" and .transaction_hash == null' "$RESULT_DIR/deposit-recovery.json"
+```
+
+`--nostr-relay` defaults to a public relay; on local devnet always pass `ws://127.0.0.1:8081` (the devnet nostr-relay container) or the events never reach the receiver.
 
 ### Persist Deposit Claim Material — Mandatory
 
 Write the secret-bearing note BEFORE the approve/deposit step (the deposit
 CLI may spend minutes waiting for proof readiness and Nostr delivery after
 broadcasting the L1 transaction; a crash in that window otherwise leaves the
-funds locked with the secrets lost — ISSUE-OPS-2). Build the JSON with
-python/jq so shell expansion cannot corrupt it:
+funds locked with the secrets lost — ISSUE-OPS-2). Build the file with python
+reading `os.environ`, so the secret limbs never enter argv, shell history, or
+stdout, and create it atomically with mode 0600:
 
 ```bash
-cat > "$RESULT_DIR/deposit-note.json" <<EOF
-{
-  "user_id": "$USER_ID",
-  "r0": "$R0",
-  "r1": "$R1",
-  "note_secret": "$NOTE_SECRET",
-  "nullifier_secret": "$NULLIFIER_SECRET",
-  "recipient_npub": "$RECIPIENT_NPUB"
+python3 - <<'PY'
+import json, os
+note = {
+    "user_id": os.environ["USER_ID"],
+    "r0": os.environ["R0"],
+    "r1": os.environ["R1"],
+    "note_secret": os.environ["NOTE_SECRET"],
+    "nullifier_secret": os.environ["NULLIFIER_SECRET"],
+    "recipient_npub": os.environ["RECIPIENT_NPUB"],
 }
-EOF
-chmod 600 "$RESULT_DIR/deposit-note.json"
+path = os.path.join(os.environ["RESULT_DIR"], "deposit-note.json")
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as handle:
+    json.dump(note, handle)
+PY
 test -s "$RESULT_DIR/deposit-note.json"
 ```
 
@@ -282,13 +315,13 @@ The deposit command above already carries `--recipient-npub`; this section
 describes the two-event backup protocol only. Both events are linked by
 `backup_id = note_commitment`: plaintext `psy_deposit_proof` metadata and
 proof, and encrypted `psy_deposit_secrets` claim material
-(`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:802-904`).
+(`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:959-1024`).
 
-Omitting `--recipient-npub` for a Nostr receiver breaks claim retrieval: the L1 deposit can succeed without publishing either recovery event. The local proof file does not replace Nostr delivery to that receiver. Require both events for the same backup identifier before treating Nostr recovery as ready. If delivery is missing, preserve the existing deposit proof and secrets and restore delivery for that deposit; do not submit a second L1 deposit.
+Omitting `--recipient-npub` for a Nostr receiver breaks claim retrieval: the L1 deposit can succeed without publishing either recovery event. The local proof file does not replace Nostr delivery to that receiver. Require both events for the same backup identifier before treating Nostr recovery as ready. If delivery is missing, preserve the existing deposit proof and secrets and restore delivery for that deposit; do not submit a second L1 deposit. `--resume-deposit-index` cannot restore Nostr delivery because recovery refuses `--recipient-npub`.
 
 ## 8. Observe Relayer Deposit Append and Finalize
 
-The relayer first appends the deposit state on L2, advances L1 `provedDepositCount` through `batchAppend`, then finalizes a checkpoint range. The Bridge exposes the deposit counters and root (`psy-contracts/src/Bridge.sol:148-152`). Section 7 captured the finalized cursor before the deposit:
+The relayer first appends the deposit state on L2, advances L1 `provedDepositCount` through `batchAppend`, then finalizes a checkpoint range. The Bridge exposes the deposit counters and root as public fields (`psy-contracts/src/Bridge.sol:112-114`). Section 7 captured the finalized cursor before the deposit:
 
 ```bash
 export PROVED_TARGET="$((DEPOSIT_INDEX + 1))"
@@ -314,11 +347,11 @@ The proof file, `provedDepositCount >= deposit_index + 1`, and a measured finali
 Run only after the recipient's PSY funding call has confirmed and the proof file exists. Raw secrets are optional validation inputs, but when supplied they must be supplied together. Do not pass a checkpoint ID; the command resolves current context.
 
 ```bash
+test -n "${PRIVATE_KEY:-}"
 ./target/release/psy_user_cli \
   --result-file "$RESULT_DIR/claim-deposit.json" \
   claim-deposit \
   --sign-type zk \
-  --private-key "$USER_PRIVATE_KEY" \
   --rpc-config "$RPC_CONFIG" \
   --l1-rpc-url "$L1_RPC_URL" \
   --token-l1-address "$USDT" \
@@ -328,9 +361,7 @@ Run only after the recipient's PSY funding call has confirmed and the proof file
   --deposit-index "$DEPOSIT_INDEX" \
   --deposit-proof "$RESULT_DIR/deposit-proof.json" \
   --r0 "$R0" \
-  --r1 "$R1" \
-  --note-secret "$NOTE_SECRET" \
-  --nullifier-secret "$NULLIFIER_SECRET"
+  --r1 "$R1"
 
 jq -e '.status == "confirmed" and (.confirmed_checkpoint != null)' "$RESULT_DIR/claim-deposit.json"
 ```
@@ -355,22 +386,22 @@ jq -e --argjson index "$DEPOSIT_INDEX" --arg note "${NOTE_COMMITMENT#0x}" --arg 
 ' "$RESULT_DIR/deposits.json"
 ```
 
-This query requires the exact deposit identity—chain-local index, note commitment, L2 token contract, and shield address—to report `claimed: true`; counts alone are not sufficient (`../psy-services/src/api/handlers/bridge.rs:1331-1359,1431-1451`).
+This query requires the exact deposit identity—chain-local index, note commitment, L2 token contract, and shield address—to report `claimed: true`; counts alone are not sufficient (`../psy-services/src/api/handlers/bridge.rs:1473-1546`).
 
 The command checks shield address, token, amount, chain index, deposit index, proof fingerprint, and public inputs before proving and submitting the EndCap (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_deposit.rs:401-527`).
 
 ## 10. Withdraw on L2 — Real EndCap
 
-Start only after claim-deposit returns confirmed. The command flag is `--destination-chain-index`; it is a Bridge chain index, not the EVM chain ID. Normal 20-byte token and recipient addresses are accepted and left-padded automatically. Omit `--contract-id`: the command queries `Router.l1ToL2Token(token)` and converts the bytes32 mapping to the required decimal `u64` contract ID (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:762-794`, `client_prover/psy_cli/psy_user_cli/src/subcommand/withdraw.rs:213-221,278-281`).
+Start only after claim-deposit returns confirmed. The command flag is `--destination-chain-index`; it is a Bridge chain index, not the EVM chain ID. Normal 20-byte token and recipient addresses are accepted and left-padded automatically. Omit `--contract-id`: the command queries `Router.l1ToL2Token(token)` and converts the bytes32 mapping to the required decimal `u64` contract ID (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:789-820`, `client_prover/psy_cli/psy_user_cli/src/subcommand/withdraw.rs:80-108`).
 
 ```bash
 export FINALIZED_BEFORE_WITHDRAW="$(cast call "$STATE_MANAGER" 'lastFinalizedCheckpointId()(uint64)' --rpc-url "$L1_RPC_URL" | awk '{print $1}')"
 export L1_BALANCE_BEFORE="$(cast call "$USDT" 'balanceOf(address)(uint256)' "$USER_L1_ADDRESS" --rpc-url "$L1_RPC_URL" | awk '{print $1}')"
+test -n "${PRIVATE_KEY:-}"
 ./target/release/psy_user_cli \
   --result-file "$RESULT_DIR/withdraw.json" \
   withdraw \
   --sign-type zk \
-  --private-key "$USER_PRIVATE_KEY" \
   --rpc-config "$RPC_CONFIG" \
   --l1-rpc-url "$L1_RPC_URL" \
   --destination-chain-index 0 \
@@ -388,7 +419,7 @@ The withdrawal amount must be positive and no greater than the user's withdrawn-
 
 Section 10 captured the finalization cursor and recipient balance before the L2 withdrawal.
 
-After the withdrawal EndCap, the relayer scans the event, submits an L2 `append_withdrawal` EndCap, proves and finalizes the checkpoint range on L1, then calls `Bridge.batchClaimWithdrawal`. That call registers `pendingWithdrawals[nonce]` and sets `claimedNullifiers[nonce]`; it does not transfer tokens (`psy-contracts/src/Bridge.sol:807-830`, `psy_cli/psy_relayer_cli/src/bridge/claim_withdrawals.rs:588-604`).
+After the withdrawal EndCap, the relayer scans the event, submits an L2 `append_withdrawal` EndCap, proves and finalizes the checkpoint range on L1, then calls `Bridge.batchClaimWithdrawal`. That call registers `pendingWithdrawals[nonce]` and sets `claimedNullifiers[nonce]`; it does not transfer tokens (`psy-contracts/src/Bridge.sol:762-764,810-838`, `psy_cli/psy_relayer_cli/src/bridge/claim_withdrawals.rs:584-589,978-995`).
 
 ```bash
 for attempt in $(seq 1 360); do
@@ -406,7 +437,9 @@ CLAIMABLE_AT="$(jq -r '.[3]' <<<"$PENDING_JSON")"
 test "$PENDING_AMOUNT" -eq "$WITHDRAW_AMOUNT"
 
 while test "$(cast block latest --field timestamp --rpc-url "$L1_RPC_URL" | awk '{print $1}')" -lt "$CLAIMABLE_AT"; do sleep 1; done
-cast send "$BRIDGE" 'claimPendingWithdrawal(bytes32)' "$WITHDRAWAL_NONCE" --rpc-url "$L1_RPC_URL" --private-key "$USER_PRIVATE_KEY"
+test -n "${ETH_KEYSTORE:-}"
+test -f "${ETH_PASSWORD:-}"
+cast send "$BRIDGE" 'claimPendingWithdrawal(bytes32)' "$WITHDRAWAL_NONCE" --rpc-url "$L1_RPC_URL" --keystore "$ETH_KEYSTORE" --password-file "$ETH_PASSWORD"
 
 export L1_BALANCE_AFTER="$(cast call "$USDT" 'balanceOf(address)(uint256)' "$USER_L1_ADDRESS" --rpc-url "$L1_RPC_URL" | awk '{print $1}')"
 test "$L1_BALANCE_AFTER" -ge "$((L1_BALANCE_BEFORE + WITHDRAW_AMOUNT))"
@@ -414,7 +447,7 @@ CLEARED_JSON="$(cast call "$BRIDGE" 'pendingWithdrawals(bytes32)(address,address
 test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 ```
 
-`claimedNullifiers(nonce) == true` proves registration/idempotency. Recipient balance increase plus cleared `pendingWithdrawals[nonce]` prove settlement. `claimPendingWithdrawal` enforces `claimableAt`, deletes the pending entry, and then transfers tokens (`psy-contracts/src/Bridge.sol:825-859`).
+`claimedNullifiers(nonce) == true` proves registration/idempotency. Recipient balance increase plus cleared `pendingWithdrawals[nonce]` prove settlement. `claimPendingWithdrawal` enforces `claimableAt`, deletes the pending entry, and then transfers tokens (`psy-contracts/src/Bridge.sol:770-776,795-805`).
 
 ## 12. Observable-State Matrix
 
@@ -433,7 +466,7 @@ test "$(jq -r '.[2]' <<<"$CLEARED_JSON")" -eq 0
 | Relayer withdrawal registration     | relayer L2 EndCap and L1 transaction            | finalization cursor increases; `claimedNullifiers(nonce) == true`; pending amount is nonzero | StateManager and Bridge views                              |
 | User L1 settlement                  | user L1 transaction                             | recipient balance rises; pending amount becomes zero                                         | `claimPendingWithdrawal`, Bridge and token views           |
 
-Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-proof routes (`../psy-services/src/api/server.rs:135-153`, `../psy-services/src/api/server.rs:318-345`). Deposit `claimed` is matched per deposit identity, not inferred from counts (`../psy-services/src/api/handlers/bridge.rs:1331-1359`, `../psy-services/src/api/handlers/bridge.rs:1431-1451`). For direct RPC probes, use `psy_get_latest_checkpoint_id` and `psy_get_imt_leaf_index_for_key`; query the realm tip only, never a coordinator-derived stale checkpoint (`client_prover/psy_provider/src/request.rs:82-87`, `client_prover/psy_provider/src/request.rs:257-265`).
+Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-proof routes (`../psy-services/src/api/server.rs:135-153`, `../psy-services/src/api/server.rs:318-345`). Deposit `claimed` is matched per deposit identity, not inferred from counts (`../psy-services/src/api/handlers/bridge.rs:1473-1546`). For direct RPC probes, use `psy_get_latest_checkpoint_id` and `psy_get_imt_leaf_index_for_key`; query the realm tip only, never a coordinator-derived stale checkpoint (`client_prover/psy_provider/src/request.rs:82-87`, `client_prover/psy_provider/src/request.rs:257-265`).
 
 ## 13. Exact Failure Responses
 
@@ -442,15 +475,15 @@ Services exposes the stable deposit, withdrawal, deposit-proof, and withdrawal-p
 | result file absent after nonzero exit                                                                                                                                       | Command failed; stale success was removed fail-closed                             | Read stderr, correct the cause, rerun that command only                                                                              |
 | `status: "not_registered"` and `user_id: null`                                                                                                                              | Registration has not been indexed                                                 | Continue the bounded user-ID poll; do not submit L2 calls                                                                            |
 | `ERC20InsufficientAllowance`                                                                                                                                                | ERC20Gateway allowance is insufficient                                            | Approve the resolved gateway for at least `DEPOSIT_AMOUNT`, then submit one deposit                                                  |
-| Nostr receiver cannot retrieve the deposit claim                                                                                                                            | `--recipient-npub` omitted or one recovery event missing                          | Restore both events for the existing deposit using the retained proof and secrets; do not rerun deposit                              |
-| `timeout waiting for deposit claim proof … (elapsed=600s)`                                                                                                                  | Deposit exists but the relayer/services proof did not become ready in ten minutes | Inspect `provedDepositCount`, services health, and relayer log; do **not** rerun deposit                                             |
+| Nostr receiver cannot retrieve the deposit claim                                                                                                                            | `--recipient-npub` omitted or one recovery event missing                          | Restore both events for the existing deposit using the retained proof and secrets; do not submit a second deposit. Recovery mode cannot publish the events |
+| `timeout waiting for deposit claim proof … (elapsed=600s)`                                                                                                                  | Deposit exists but the relayer/services proof did not become ready in ten minutes | Inspect `provedDepositCount`, services health, and the relayer log. Regenerate the existing proof with `--resume-deposit-index`; do **not** submit another deposit |
 | proof response `found:false, reason:"no_proved_deposits"`                                                                                                                   | No deposit snapshot has been proved                                               | Wait for relayer deposit append                                                                                                      |
 | `deposit_not_indexed`                                                                                                                                                       | Envio has not indexed this deposit                                                | Wait for indexer; keep the same deposit index                                                                                        |
 | `deposit_not_in_snapshot`                                                                                                                                                   | Requested snapshot does not include this deposit                                  | Wait for a later proved count                                                                                                        |
 | `indexer_not_ready`                                                                                                                                                         | Indexed tree count trails the requested snapshot                                  | Wait for indexer catch-up                                                                                                            |
 | `indexer_node_missing`                                                                                                                                                      | Snapshot data is incomplete                                                       | Stop this claim attempt and inspect services/indexer consistency                                                                     |
 | `deposit_leaf_mismatch`                                                                                                                                                     | Indexed payload and computed leaf disagree                                        | Stop; do not claim or create another deposit                                                                                         |
-| `multi_source_snapshot_not_supported`                                                                                                                                       | A global prefix spans multiple source chains                                      | Query with the chain-local snapshot count                                                                                            |
+| `multi_source_snapshot_not_supported`                                                                                                                                       | A global deposit-tree snapshot spans multiple source chains                       | Query with the chain-local snapshot count                                                                                            |
 | `shield address mismatch vs deposit proof`                                                                                                                                  | User ID, `R0`, or `R1` differs from the deposit                                   | Restore the original values; never alter the proof                                                                                   |
 | `token address mismatch vs deposit proof`, `amount mismatch vs deposit proof`, `source_chain_index mismatch vs deposit proof`, or `deposit_index mismatch vs deposit proof` | Claim arguments differ from the proof                                             | Use the exact deposit values                                                                                                         |
 | `--note-secret and --nullifier-secret must be passed together`                                                                                                              | Only one raw secret was supplied                                                  | Supply both or omit both from claim-deposit                                                                                          |
@@ -484,7 +517,7 @@ rm -rf "$RESULT_DIR"
 make shutdown
 ```
 
-Do not manually kill individual services. A non-purge restart can separate L1 and L2 state; the walkthrough sections “33.10 locSetupV4 auto-restart timing” and “33.11 Non-purge devnet restart tears L1/L2 state apart” explain why. Routine cleanup uses `make shutdown`, which purges the paired L1/L2 state by default (`PURGE ?= 1` in the Makefile), before the next `make run-all`; use `PURGE=0 make shutdown` only when the paired chain state must survive the cleanup.
+Do not manually kill individual services. `make shutdown` is teardown and purges paired L1/L2 state by default (`PURGE ?= 1`). It is not required before the next `make run-all`: that target always starts a fresh chain, and `PURGE=0` does not turn it into a state-preserving restart. Use `make restart` only while the original supervisor and all three Anvil processes are still running. See [devnet lifecycle](devnet_lifecycle.md#3-fresh-start).
 
 ## 16. Source and Walkthrough References
 

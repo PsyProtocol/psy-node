@@ -8,6 +8,8 @@ This document describes the private transfer and private claim flow on the Psy p
 
 Related: `docs/src/dev/devnet_lifecycle.md` for startup and shutdown; `docs/src/dev/common-operations.md` for wallet, registration, and PSY funding.
 
+**Substitutions:** the values below are operator-supplied public parameters for a single run: paths, contract IDs, amounts, addresses, npubs, and the note's `r0`/`r1`. Replace them before use. This document shows no executable command that carries a signing key: the current private-transfer and private-claim CLIs cannot accept a key without placing it in the process argument list, which the credential rules of this repository forbid (see Steps 2 and 5).
+
 ## Table of Contents
 
 - [1. Overview](#1-overview)
@@ -64,23 +66,23 @@ The receiver derives a shield address using two random values (`r0`, `r1`) and e
 shield_address = PoseidonHash(user_id, 1337, r0, r1)
 ```
 
-The receiver must remember `r0` and `r1` — they are required to claim the note. `psy_user_cli derive-shield` prints `shield_address`; the private-key path also prints the Nostr npub (`client_prover/psy_cli/psy_user_cli/src/subcommand/shield_address.rs:66-112`, `args.rs:798-808`).
+The receiver must remember `r0` and `r1` — they are required to claim the note. `psy_user_cli derive-shield` prints `shield_address`; the private-key path also prints the Nostr npub (`client_prover/psy_cli/psy_user_cli/src/subcommand/shield_address.rs:66-112`, `args.rs:823-835`).
 
 ### Step 2: Execute Private Transfer
 
-The sender calls `private-transfer` with the receiver's shield address:
+The sender calls `private-transfer` with the receiver's shield address. Its public parameters (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:704-728`):
 
-```bash
-./target/release/psy_user_cli private-transfer \
-  --rpc-config <config> \
-  -p <sender_private_key> \
-  --contract-id <token_contract_id> \
-  --amount <amount> \
-  --receiver <receiver_shield_address> \
-  --note-root-slot 2147483649 \
-  --nostr-recipient-pubkey '<receiver-npub>' \
-  --output <output_file>
-```
+| Flag | Operator-supplied value | Notes |
+|------|--------------------------|-------|
+| `--rpc-config` | RPC config path | Defaults to `config.json`; also reads from the environment |
+| `--contract-id` | token contract ID | Defaults to `0` |
+| `--amount` | transfer amount | Positive integer |
+| `--receiver` | receiver's shield address | Alias `--owner` |
+| `--note-root-slot` | `2147483649` | Default value, shown explicitly |
+| `--nostr-recipient-pubkey` | receiver's npub | Routes the backup delivery |
+| `--output` | output file path | Defaults to `note_proof.json` |
+
+**Signing-key constraint — blocked:** the current `private-transfer` and `private-claim` CLIs accept the signing key only through `-p/--private-key` (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:686-687,708-709`); they have no environment or keystore alternative. Every invocation therefore places the key in the process argument list, where other processes and argv logging can read it, and no shell technique — quoted variables, `read -rs`, or history tricks — removes that exposure. This violates the credential-handling rule this runbook applies everywhere else, so no executable example is shown. The concrete missing prerequisite is secure key input on these two commands: an environment-sourced key read without echo, or a keystore-path alternative, defined in `args.rs`. Until that lands, this step cannot be run compliantly; the parameter rows above are unaffected.
 
 **Internal execution path:**
 
@@ -148,17 +150,17 @@ Items already flagged as `claimed` by the indexer are excluded.
 
 ### Step 5: Execute Private Claim
 
-The receiver claims the note by submitting a `private_claim` contract call:
+The receiver claims the note by submitting a `private_claim` contract call. Its public parameters (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:682-702`):
 
-```bash
-./target/release/psy_user_cli private-claim \
-  --rpc-config <config> \
-  -p <receiver_private_key> \
-  --contract-id <token_contract_id> \
-  --note-proof <note_proof_file> \
-  --random0 <r0> \
-  --random1 <r1>
-```
+| Flag | Operator-supplied value | Notes |
+|------|--------------------------|-------|
+| `--rpc-config` | RPC config path | Defaults to `config.json`; also reads from the environment |
+| `--contract-id` | token contract ID | Defaults to `0` |
+| `--note-proof` | note proof file path | The Step 2 output, or Nostr-delivered material saved to a file |
+| `--nostr-secret-key` | optional Nostr signing key | Secret; argv-only like the signing key, so the same constraint applies |
+| `--random0` / `--random1` | receiver's retained `r0` / `r1` | Claim material from Step 1 |
+
+The Step 2 signing-key constraint applies unchanged to the receiver's key: the CLI still accepts it only as `-p` or `--private-key`, and the step stays blocked until the same secure key input prerequisite lands. No executable example is shown.
 
 **Internal execution path:**
 

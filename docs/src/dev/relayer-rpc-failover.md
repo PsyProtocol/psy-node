@@ -182,6 +182,11 @@ These are tunable v1 guesses. Adjust from observed production logs.
   normal traffic for `minutes` (30 by default).
 - `RPC provider restored` (INFO) — a post-quarantine trial returned a
   non-provider-fault result and its quarantine was lifted.
+- `failed to read finalization cursor` (ERROR, multichain daemon round) —
+  fields: `chain_index`, `error` (outer context only), and `error_category`,
+  a static root-cause class (`timeout`/`unavailable`/`provider`/`revert`/
+  `decode`, fallback `other`) resolved from the typed transport error via
+  `pool_transport::error_category`. No URLs or bodies are added.
 
 **Operator note:** all endpoints unavailable produces a bounded error, not
 forced traffic through a quarantined endpoint. Every failed attempt logs

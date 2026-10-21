@@ -1,11 +1,11 @@
-use std::{collections::{BTreeMap, BTreeSet}, ffi::CString, fs::File, io::Read, os::{fd::{AsRawFd, FromRawFd}, unix::fs::MetadataExt}, path::{Component, Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::BTreeSet, ffi::CString, fs::File, io::Read, os::{fd::{AsRawFd, FromRawFd}, unix::fs::MetadataExt}, path::{Component, Path, PathBuf}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use zeroize::Zeroizing;
 use super::protocol::*;
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 
-fn protected_file_at(directory: &Path, relative: &Path, file_flags: i32) -> Result<(File, File)> {
+fn protected_file_at(directory: &Path, relative: &Path, file_flags: i32, allowed_modes: &[u32]) -> Result<(File, File)> {
     if relative.as_os_str().is_empty() || relative.components().any(|part| !matches!(part, Component::Normal(_))) {
         return Err(GuardianSignError::AuthorizationMismatch);
     }
@@ -27,7 +27,7 @@ fn protected_file_at(directory: &Path, relative: &Path, file_flags: i32) -> Resu
         let opened = unsafe { File::from_raw_fd(fd) };
         let metadata = opened.metadata().map_err(|_| GuardianSignError::KeyUnavailable)?;
         if final_file {
-            if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o7777 != 0o600 {
+            if !metadata.is_file() || metadata.uid() != uid || !allowed_modes.contains(&(metadata.mode() & 0o7777)) {
                 return Err(GuardianSignError::KeyUnavailable);
             }
             return Ok((opened, current));
@@ -40,15 +40,15 @@ fn protected_file_at(directory: &Path, relative: &Path, file_flags: i32) -> Resu
 }
 
 fn protected_file(directory: &Path, relative: &Path) -> Result<File> {
-    protected_file_at(directory, relative, libc::O_RDONLY).map(|(file, _)| file)
+    protected_file_at(directory, relative, libc::O_RDONLY, &[0o600]).map(|(file, _)| file)
 }
 
 pub fn open_db_file(directory: &Path, relative: &Path) -> Result<File> {
-    protected_file_at(directory, relative, libc::O_RDWR).map(|(file, _)| file)
+    protected_file_at(directory, relative, libc::O_RDWR, &[0o600]).map(|(file, _)| file)
 }
 
 pub fn create_db_file(directory: &Path, relative: &Path) -> Result<(File, File)> {
-    protected_file_at(directory, relative, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
+    protected_file_at(directory, relative, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, &[0o600])
 }
 
 fn read_file(file: &mut File, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
@@ -77,39 +77,15 @@ fn secret_text(bytes: &[u8], password: bool) -> Result<&str> {
     Ok(text)
 }
 
-pub struct AuthorizationArchive {
-    pub index: GuardianAuthorizationIndex,
-    entries: BTreeMap<u32, (GuardianAuthorization, Vec<u8>)>,
-}
-impl AuthorizationArchive {
-    pub fn load(directory: &Path, proof_bound: u32) -> Result<Self> {
-        let bytes = read_protected_file(directory, Path::new("authorization/index.json"), MAX_BODY_BYTES)?;
-        let index = GuardianAuthorizationIndex::parse(&bytes)?;
-        let mut entries = BTreeMap::new();
-        for version in &index.versions {
-            let path = index.archive_file(Path::new("authorization/versions"), version.version)?;
-            let bytes = read_protected_file(directory, &path, MAX_BODY_BYTES)?;
-            let authorization = index.resolve(version.version, &bytes)?;
-            authorization.validate(psy_config::GUTA_FEE, psy_config::DA_FEE, proof_bound)?;
-            entries.insert(version.version, (authorization, bytes.to_vec()));
-        }
-        Ok(Self { index, entries })
-    }
-    pub fn active(&self) -> &(GuardianAuthorization, Vec<u8>) { &self.entries[&self.index.active_version] }
-    pub fn resolve(&self, version: u32) -> Result<&(GuardianAuthorization, Vec<u8>)> {
-        self.entries.get(&version).ok_or(GuardianSignError::HistoryUnavailable)
-    }
-    pub fn authorizations(&self) -> Vec<GuardianAuthorization> { self.entries.values().map(|entry| entry.0.clone()).collect() }
-}
 
-pub const AUTHORIZATION_INDEX_PATH: &str = "authorization/index.json";
-pub const AUTHORIZATION_ARCHIVE_PATH: &str = "authorization/versions";
 
-fn config_directory(config_path: &Path) -> Result<PathBuf> {
-    let path = if config_path.is_absolute() { config_path.to_path_buf() } else {
-        std::env::current_dir().map_err(|_| GuardianSignError::KeyUnavailable)?.join(config_path)
-    };
-    path.parent().filter(|parent| !parent.as_os_str().is_empty()).map(Path::to_path_buf).ok_or(GuardianSignError::AuthorizationMismatch)
+fn guardian_root_path(root: &Path) -> Result<PathBuf> {
+    if root.as_os_str().is_empty() || root.components().any(|part| matches!(part, Component::ParentDir | Component::Prefix(_))) {
+        return Err(GuardianSignError::AuthorizationMismatch);
+    }
+    if root.is_absolute() { Ok(root.to_path_buf()) } else {
+        Ok(std::env::current_dir().map_err(|_| GuardianSignError::KeyUnavailable)?.join(root))
+    }
 }
 
 fn split_protected(path: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -121,127 +97,94 @@ fn split_protected(path: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((PathBuf::from("/"), relative))
 }
 
-pub fn resolve_operator_db_path(config_path: &Path, db_path: &Path) -> Result<(PathBuf, PathBuf)> {
-    let directory = config_directory(config_path)?;
-    let raw = std::os::unix::ffi::OsStrExt::as_bytes(db_path.as_os_str());
-    if raw.is_empty() || raw.ends_with(b"/") || raw.ends_with(b"/.") || db_path.components().next_back().is_none_or(|part| !matches!(part, Component::Normal(_))) {
-        return Err(GuardianSignError::AuthorizationMismatch);
-    }
-    if db_path.is_absolute() { return split_protected(db_path); }
-    if db_path.components().any(|part| !matches!(part, Component::Normal(_) | Component::CurDir)) {
-        return Err(GuardianSignError::AuthorizationMismatch);
-    }
-    let relative = directory.components().filter(|part| !matches!(part, Component::RootDir | Component::CurDir))
-        .chain(db_path.components().filter(|part| !matches!(part, Component::CurDir))).collect::<PathBuf>();
-    if relative.as_os_str().is_empty() { return Err(GuardianSignError::AuthorizationMismatch); }
-    Ok((PathBuf::from("/"), relative))
-}
-
-fn standard_secret_path(guardian_id: u8, password: bool) -> Result<PathBuf> {
+pub fn guardian_secret_paths(guardian_id: u8) -> Result<(PathBuf, PathBuf)> {
     if !(1..=3).contains(&guardian_id) { return Err(GuardianSignError::AuthorizationMismatch); }
-    let home = home::home_dir().ok_or(GuardianSignError::KeyUnavailable)?;
-    let name = if password { format!("guardian-{guardian_id}.password") } else { format!("guardian-{guardian_id}.keystore.json") };
-    Ok(home.join(".psy").join("keystore").join(name))
+    let directory = home::home_dir().ok_or(GuardianSignError::KeyUnavailable)?.join(".psy/keystore");
+    let key = directory.join(format!("guardian-{guardian_id}.keystore.json"));
+    let password = directory.join(format!("guardian-{guardian_id}.password"));
+    split_protected(&key)?;
+    split_protected(&password)?;
+    Ok((key, password))
 }
 
-pub(crate) fn decode_guardian_config(bytes: &[u8]) -> Result<GuardianConfig> {
-    let parsed = parse_duplicate_free_json(bytes)?;
-    if guardian_ids(&parsed)? != [1, 2, 3] { return Err(GuardianSignError::MalformedRequest); }
-    serde_json::from_value(parsed).map_err(|_| GuardianSignError::MalformedRequest)
-}
-
-fn guardian_ids(value: &serde_json::Value) -> Result<Vec<u8>, GuardianSignError> {
-    let keys = value.get("guardians").and_then(serde_json::Value::as_object).ok_or(GuardianSignError::MalformedRequest)?;
-    let mut ids = Vec::new();
-    for key in keys.keys() {
-        if key.as_bytes().first() == Some(&b'0') || !key.bytes().all(|byte| byte.is_ascii_digit()) { return Err(GuardianSignError::MalformedRequest); }
-        let id = key.parse::<u8>().map_err(|_| GuardianSignError::MalformedRequest)?;
-        ids.push(id);
+fn advertised_origin(listen_address: std::net::SocketAddr, rpc_url: Option<&str>) -> Result<String> {
+    if listen_address.port() == 0 { return Err(GuardianSignError::AuthorizationMismatch); }
+    match rpc_url {
+        Some(url) => { http_origin(url)?; Ok(url.to_owned()) }
+        None => history_origin(listen_address),
     }
-    ids.sort_unstable();
-    Ok(ids)
 }
 
 impl GuardianConfig {
-    pub fn load(path: &Path) -> Result<Self> {
-        let absolute = if path.is_absolute() { path.to_path_buf() } else {
-            std::env::current_dir().map_err(|_| GuardianSignError::KeyUnavailable)?.join(path)
-        };
-        let (directory, relative) = split_protected(&absolute)?;
-        let bytes = read_protected_file(&directory, &relative, MAX_BODY_BYTES)?;
-        let config = decode_guardian_config(&bytes)?;
-        config.validate()?;
-        Ok(config)
+    pub fn load(rpc_config: &Path, guardian_root: &Path) -> Result<Self> {
+        let mut file = File::open(rpc_config).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|_| GuardianSignError::MalformedRequest)?;
+        let parsed = parse_duplicate_free_json(&bytes)?;
+        let mut config: psy_config::Config<plonky2::field::goldilocks_field::GoldilocksField> =
+            serde_json::from_value(parsed).map_err(|_| GuardianSignError::MalformedRequest)?;
+        let network = config.networks.remove(psy_config::CURRENT_NETWORK).ok_or(GuardianSignError::AuthorizationMismatch)?;
+        Self::from_network(network, guardian_root)
     }
-    pub fn validate(&self) -> Result<()> {
-        if self.guardians.keys().copied().collect::<Vec<_>>() != vec![1, 2, 3] { return Err(GuardianSignError::AuthorizationMismatch); }
-        for (id, signer) in &self.guardians {
-            let key = standard_secret_path(*id, false)?;
-            let password = standard_secret_path(*id, true)?;
-            if signer.signing_key_secret_path != key || signer.signing_key_password_secret_path != password {
-                return Err(GuardianSignError::AuthorizationMismatch);
-            }
-            let _ = split_protected(&key)?;
-            let _ = split_protected(&password)?;
+
+    fn from_network(mut network: psy_config::NetworkConfigGoldilocks, guardian_root: &Path) -> Result<Self> {
+        let value = network.guardian_authorization.take().ok_or(GuardianSignError::AuthorizationMismatch)?;
+        let authorization: GuardianAuthorization = serde_json::from_value(value).map_err(|_| GuardianSignError::MalformedRequest)?;
+        authorization.validate(network.fees.guta_fee, network.fees.da_fee)?;
+        let authorization = Arc::new(authorization);
+        let mut endpoints = [String::new(), String::new(), String::new()];
+        if network.guardian_configs.len() != 3 { return Err(GuardianSignError::AuthorizationMismatch); }
+        let mut origins = BTreeSet::new();
+        for guardian in &network.guardian_configs {
+            if !(1..=3).contains(&guardian.id) { return Err(GuardianSignError::AuthorizationMismatch); }
+            let endpoint = &mut endpoints[usize::from(guardian.id - 1)];
+            if !endpoint.is_empty() { return Err(GuardianSignError::AuthorizationMismatch); }
+            *endpoint = advertised_origin(guardian.listen_address, guardian.rpc_url.as_deref())?;
+            if !origins.insert(http_origin(endpoint)?) { return Err(GuardianSignError::AuthorizationMismatch); }
         }
-        if self.client.archive_path != Path::new("archive/relayer-journal") { return Err(GuardianSignError::AuthorizationMismatch); }
-        if self.client.endpoints.len() != 3 { return Err(GuardianSignError::AuthorizationMismatch); }
-        let mut endpoints = BTreeSet::new();
-        for endpoint in &self.client.endpoints {
-            if !endpoints.insert(http_origin(endpoint)?) { return Err(GuardianSignError::AuthorizationMismatch); }
-        }
-        history_origin(self.client.listen_address)?;
+        let history = network.guardian_history.as_ref().ok_or(GuardianSignError::AuthorizationMismatch)?;
+        let history_url = advertised_origin(history.listen_address, history.rpc_url.as_deref())?;
+        if network.l1_endpoints.is_empty() { return Err(GuardianSignError::AuthorizationMismatch); }
         let mut chains = BTreeSet::new();
-        for endpoint in &self.client.l1_endpoints {
+        for endpoint in &network.l1_endpoints {
             if !chains.insert(endpoint.chain_index) { return Err(GuardianSignError::AuthorizationMismatch); }
             validate_endpoint(&endpoint.rpc_url, false, false)?;
         }
-        Ok(())
+        Ok(Self { network, authorization, guardian_root: guardian_root_path(guardian_root)?, endpoints, history_url })
     }
-    pub fn build_runtime_config(&self, config_path: &Path, guardian_id: u8, db_path: &Path, index: &GuardianAuthorizationIndex) -> Result<GuardianRuntimeConfig> {
-        let signer = self.guardians.get(&guardian_id).ok_or(GuardianSignError::AuthorizationMismatch)?;
-        let (db_directory, db_relative) = resolve_operator_db_path(config_path, db_path)?;
-        let db = db_directory.join(&db_relative);
-        let authorization_path = index.archive_file(Path::new(AUTHORIZATION_ARCHIVE_PATH), index.active_version)?;
+
+    pub fn network_magic(&self) -> Result<u64> {
+        let magic = psy_config::parse_magic_hex(&self.network.magic).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
+        if magic == 0 || magic >= GOLDILOCKS_MODULUS { return Err(GuardianSignError::AuthorizationMismatch); }
+        Ok(magic)
+    }
+
+    pub fn build_runtime_config(&self, guardian_id: u8) -> Result<GuardianRuntimeConfig> {
+        let signer = self.network.guardian_configs.iter().find(|entry| entry.id == guardian_id).ok_or(GuardianSignError::AuthorizationMismatch)?;
+        let (key, password) = guardian_secret_paths(guardian_id)?;
+        let db = self.guardian_root.join("db").join(format!("guardian-{guardian_id}.redb"));
         let l2 = self.network.coordinator_configs.first().and_then(|entry| entry.rpc_url.first()).ok_or(GuardianSignError::AuthorizationMismatch)?;
-        let listener = history_origin(self.client.listen_address)?;
-        let mut seen = BTreeSet::from([http_origin(&listener)?]);
-        let mut history = vec![listener];
-        for endpoint in &self.client.endpoints {
+        let mut seen = BTreeSet::from([http_origin(&self.history_url)?]);
+        let mut history = vec![self.history_url.clone()];
+        for endpoint in &self.endpoints {
             if seen.insert(http_origin(endpoint)?) { history.push(endpoint.clone()); }
         }
-        let runtime = GuardianRuntimeConfig {
-            authorization_path: authorization_path.to_string_lossy().into_owned(),
-            authorization_archive_path: AUTHORIZATION_ARCHIVE_PATH.into(),
-            authorization_index_path: AUTHORIZATION_INDEX_PATH.into(),
+        Ok(GuardianRuntimeConfig {
             listen_address: signer.listen_address.to_string(),
             db_path: db.to_string_lossy().into_owned(),
-            signing_key_secret_path: signer.signing_key_secret_path.to_string_lossy().into_owned(),
-            signing_key_password_secret_path: signer.signing_key_password_secret_path.to_string_lossy().into_owned(),
+            signing_key_secret_path: key.to_string_lossy().into_owned(),
+            signing_key_password_secret_path: password.to_string_lossy().into_owned(),
             l2_rpc_url: l2.clone(),
-            l1_rpc_urls: self.client.l1_endpoints.clone(),
+            l1_rpc_urls: self.network.l1_endpoints.clone(),
             history_urls: history,
-        };
-        Ok(runtime)
-    }
-    pub fn validate_rpc_network(&self, network: &psy_config::NetworkConfigGoldilocks) -> Result<()> {
-        let mut embedded = serde_json::to_value(&self.network).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
-        let mut external = serde_json::to_value(network).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
-        for value in [&mut embedded, &mut external] {
-            value.as_object_mut().ok_or(GuardianSignError::AuthorizationMismatch)?
-                .entry("system_prove_proxy_url").or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        }
-        if embedded != external { return Err(GuardianSignError::AuthorizationMismatch); }
-        Ok(())
+        })
     }
 }
 
 pub fn load_network(config: &GuardianConfig, authorization: &GuardianAuthorization) -> Result<psy_provider::provider::RpcProvider> {
     let network = &config.network;
-    let magic = match network.magic.strip_prefix("0x").or_else(|| network.magic.strip_prefix("0X")) {
-        Some(hex) => u64::from_str_radix(hex, 16).ok(), None => network.magic.parse::<u64>().ok(),
-    };
-    if magic != Some(authorization.network_magic) || authorization.network_magic != psy_config::PSY_NETWORK_MAGIC
+    validate_l1_coverage(&network.l1_endpoints, &authorization.chains)?;
+    if config.network_magic()? != psy_config::PSY_NETWORK_MAGIC
         || network.users_per_realm != psy_config::USERS_PER_REALM || network.global_user_tree_height != psy_config::GLOBAL_USER_TREE_HEIGHT
         || network.realm_user_tree_height != psy_config::REALM_USER_TREE_HEIGHT || network.group_realm_height != psy_config::GROUP_REALM_HEIGHT
         || network.fees.guta_fee != psy_config::GUTA_FEE || network.fees.da_fee != psy_config::DA_FEE
@@ -271,14 +214,20 @@ pub fn load_network(config: &GuardianConfig, authorization: &GuardianAuthorizati
         for url in &entry.rpc_url { install(url, &mut clients)?; }
     }
     let realm_count = 1u64.checked_shl(u32::from(psy_config::COORDINATOR_USER_TREE_HEIGHT)).ok_or(GuardianSignError::AuthorizationMismatch)?;
-    if realm_ids.is_empty() || realm_ids.iter().any(|id| *id >= realm_count) || !realm_ids.contains(&(authorization.user_id / network.users_per_realm)) {
+    if realm_ids.is_empty() || realm_ids.iter().any(|id| *id >= realm_count) || !realm_ids.contains(&(authorization.user_id() / network.users_per_realm)) {
         return Err(GuardianSignError::AuthorizationMismatch);
     }
     psy_provider::provider::RpcProvider::new_with_endpoint_clients(network, clients).map_err(|_| GuardianSignError::AuthorizationMismatch)
 }
 
-pub fn load_authorization_archive(config_path: &Path, proof_bound: u32) -> Result<AuthorizationArchive> {
-    AuthorizationArchive::load(&config_directory(config_path)?, proof_bound)
+
+fn validate_l1_coverage(endpoints: &[psy_config::ChainEndpoint], chains: &[ChainAuthorization]) -> Result<()> {
+    let configured = endpoints.iter().map(|endpoint| endpoint.chain_index).collect::<BTreeSet<_>>();
+    let authorized = chains.iter().map(|chain| chain.chain_index).collect::<BTreeSet<_>>();
+    if configured.is_empty() || configured.len() != endpoints.len() || authorized.len() != chains.len() || configured != authorized {
+        return Err(GuardianSignError::AuthorizationMismatch);
+    }
+    Ok(())
 }
 
 fn http_client() -> Result<reqwest::Client> {
@@ -305,11 +254,42 @@ pub fn load_signing_key(config: &GuardianRuntimeConfig) -> Result<psy_provider::
 mod tests {
     use super::*;
 
+    fn private_test_directory(label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = unsafe { libc::geteuid() };
+        let runtime = PathBuf::from("/run/user").join(uid.to_string());
+        let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|path| path.is_dir())
+            .or_else(|| runtime.is_dir().then_some(runtime))
+            .unwrap_or_else(|| std::env::current_dir().expect("workspace test working directory"));
+        let directory = base.join(format!("guardian-runtime-test-{label}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&directory).expect("private test directory under XDG_RUNTIME_DIR, /run/user/$UID, or the workspace");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for ancestor in directory.ancestors().skip(1) {
+            let metadata = ancestor.metadata().expect("ancestor metadata for the protected-path walk");
+            assert!([0, uid].contains(&metadata.uid()) && metadata.mode() & 0o022 == 0,
+                "ancestor {} must be root/euid-owned and not group/other-writable for the protected-path walk", ancestor.display());
+        }
+        directory
+    }
+
     #[test]
-    #[ignore = "requires operator-owned 0700 GUARDIAN_RUNTIME_TEST_DIRECTORY and QA approval"]
+    fn selected_network_requires_one_typed_authorization_without_version_envelopes() {
+        let mut missing = network();
+        missing.guardian_authorization = None;
+        assert!(GuardianConfig::from_network(missing, Path::new("/guardians-root")).is_err());
+        let mut old = network();
+        old.guardian_authorization.as_mut().unwrap()["version"] = serde_json::json!(1);
+        assert!(GuardianConfig::from_network(old, Path::new("/guardians-root")).is_err());
+        let config = GuardianConfig::from_network(network(), Path::new("/guardians-root")).unwrap();
+        assert!(config.network.guardian_authorization.is_none());
+        assert_eq!(config.authorization.user_id(), BRIDGE_USER_ID);
+        assert_eq!(config.network_magic().unwrap(), 1);
+    }
+
+    #[test]
     fn protected_reader_rejects_symlinks_modes_traversal_and_keeps_open_inode() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let directory = PathBuf::from(std::env::var_os("GUARDIAN_RUNTIME_TEST_DIRECTORY").expect("explicit disposable test directory"));
+        let directory = private_test_directory("protected-reader");
         let file = directory.join("protected-reader-input");
         let moved = directory.join("protected-reader-retained");
         let link = directory.join("protected-reader-link");
@@ -318,6 +298,9 @@ mod tests {
         assert_eq!(&**read_protected_file(&directory, Path::new("protected-reader-input"), 8).unwrap(), b"approved");
         assert!(read_protected_file(&directory, Path::new("protected-reader-input"), 7).is_err());
         assert!(read_protected_file(&directory, Path::new("../protected-reader-input"), 8).is_err());
+        std::fs::write(directory.join("protected-reader-empty"), b"").unwrap();
+        std::fs::set_permissions(directory.join("protected-reader-empty"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_protected_file(&directory, Path::new("protected-reader-empty"), 8).is_err());
         symlink(&file, &link).unwrap();
         assert!(read_protected_file(&directory, Path::new("protected-reader-link"), 8).is_err());
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -329,14 +312,14 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(&**read_file(&mut held, 8).unwrap(), b"approved");
         for path in [file, moved, link] { std::fs::remove_file(path).unwrap(); }
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
-    #[ignore = "requires operator-owned 0700 GUARDIAN_RUNTIME_TEST_DIRECTORY and QA approval"]
     fn db_files_are_created_exclusively_and_reopened_without_replacement() {
         use std::io::Write;
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let directory = PathBuf::from(std::env::var_os("GUARDIAN_RUNTIME_TEST_DIRECTORY").expect("explicit disposable test directory"));
+        let directory = private_test_directory("db-files");
         let name = format!("guardian-db-{}-{}.redb", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
         let relative = Path::new(&name);
         assert!(open_db_file(&directory, relative).is_err());
@@ -355,134 +338,141 @@ mod tests {
         assert!(create_db_file(&directory, Path::new(&link)).is_err());
         drop(reopened); drop(file);
         std::fs::remove_file(directory.join(link)).unwrap(); std::fs::remove_file(directory.join(relative)).unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
     }
-    fn minimal_guardian_config() -> serde_json::Value {
-        serde_json::json!({
-            "network": {
-                "magic": "0x1", "users_per_realm": 1, "global_user_tree_height": 1, "realm_user_tree_height": 1, "group_realm_height": 1,
-                "realm_configs": [], "p2p": {"checkpoints_per_epoch": 1}, "coordinator_configs": [], "prove_proxy_url": [],
-                "faucet_rpc_url": [], "nostr_relay_url": "", "native_currency": "", "native_currency_decimal": 0, "native_currency_name": "",
-                "fees": {"register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0}
-            },
-            "guardians": {
-                "1": {"listen_address": "127.0.0.1:1", "signing_key_secret_path": "/keys/1.json", "signing_key_password_secret_path": "/keys/1.password"},
-                "2": {"listen_address": "127.0.0.1:2", "signing_key_secret_path": "/keys/2.json", "signing_key_password_secret_path": "/keys/2.password"},
-                "3": {"listen_address": "127.0.0.1:3", "signing_key_secret_path": "/keys/3.json", "signing_key_password_secret_path": "/keys/3.password"}
-            },
-            "client": {"endpoints": ["http://a/", "http://b/", "http://c/"], "archive_path": "archive/relayer-journal", "listen_address": "127.0.0.1:9", "l1_endpoints": []}
-        })
-    }
-
-    #[test]
-    fn guardian_config_keeps_empty_system_proxy_and_nested_network_fields() {
-        let mut value = minimal_guardian_config();
-        value["network"]["system_prove_proxy_url"] = serde_json::json!([]);
-        value["network"]["unknown_nested"] = serde_json::json!({"kept": false});
-        let config = decode_guardian_config(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(config.network.system_prove_proxy_url.is_empty());
-        assert!(config.network.prove_proxy_url.is_empty());
-        let mut outer = value;
-        outer["db_path"] = serde_json::json!("guardian.redb");
-        assert!(decode_guardian_config(&serde_json::to_vec(&outer).unwrap()).is_err());
-        let mut duplicate = serde_json::to_vec(&minimal_guardian_config()).unwrap();
-        let brace = duplicate.iter().position(|byte| *byte == b'{').unwrap();
-        let member = br#""client":{"endpoints":["http://a/","http://b/","http://c/"],"archive_path":"archive/relayer-journal","listen_address":"127.0.0.1:9","l1_endpoints":[]},"#;
-        duplicate.splice(brace + 1..brace + 1, member.iter().copied());
-        assert!(decode_guardian_config(&duplicate).is_err());
-        let mut repeated = serde_json::to_vec(&minimal_guardian_config()).unwrap();
-        let marker = br#","3":"#;
-        let at = repeated.windows(marker.len()).rposition(|window| window == marker).unwrap();
-        let repeated_member = br#""2":{"listen_address":"127.0.0.1:2","signing_key_secret_path":"/keys/2.json","signing_key_password_secret_path":"/keys/2.password"},"#;
-        repeated.splice(at + 1..at + 1, repeated_member.iter().copied());
-        serde_json::from_slice::<serde_json::Value>(&repeated).expect("syntactically valid duplicate-key JSON");
-        assert!(decode_guardian_config(&repeated).is_err());
-        let mut nonempty = minimal_guardian_config();
-        nonempty["network"]["system_prove_proxy_url"] = serde_json::json!(["http://system/"]);
-        assert_eq!(decode_guardian_config(&serde_json::to_vec(&nonempty).unwrap()).unwrap().network.system_prove_proxy_url, vec!["http://system/"]);
-    }
-
-    #[test]
-    fn operator_db_paths_reject_traversal_and_resolve_absolute_or_config_relative() {
-        let config = Path::new("/guardians-root/config.json");
-        assert!(resolve_operator_db_path(config, Path::new("../escape.redb")).is_err());
-        assert!(resolve_operator_db_path(config, Path::new("journal/")).is_err());
-        assert!(resolve_operator_db_path(config, Path::new("journal/.")).is_err());
-        assert!(resolve_operator_db_path(config, Path::new("/var/guardian/journal/")).is_err());
-        assert!(resolve_operator_db_path(config, Path::new("/.")).is_err());
-        assert!(resolve_operator_db_path(config, Path::new("")).is_err());
-        assert_eq!(resolve_operator_db_path(config, Path::new("/var/guardian/journal.redb")).unwrap().1, Path::new("var/guardian/journal.redb"));
-        assert_eq!(resolve_operator_db_path(config, Path::new("journal.redb")).unwrap().1, Path::new("guardians-root/journal.redb"));
-    }
-
-    fn configured(endpoints: [&str; 3], bind: &str) -> GuardianConfig {
-        let home = home::home_dir().unwrap();
-        let mut guardians = BTreeMap::new();
-        for id in 1..=3 {
-            guardians.insert(id, GuardianSignerConfig {
-                listen_address: bind.parse().unwrap(),
-                signing_key_secret_path: home.join(format!(".psy/keystore/guardian-{id}.keystore.json")),
-                signing_key_password_secret_path: home.join(format!(".psy/keystore/guardian-{id}.password")),
-            });
-        }
-        let network = serde_json::from_value(serde_json::json!({
+    fn network() -> psy_config::NetworkConfigGoldilocks {
+        serde_json::from_value(serde_json::json!({
             "magic": "0x1", "users_per_realm": 1, "global_user_tree_height": 1, "realm_user_tree_height": 1, "group_realm_height": 1,
+            "guardian_authorization": super::super::protocol::approval_tests::authorization_fixture(),
             "realm_configs": [], "p2p": {"checkpoints_per_epoch": 1}, "coordinator_configs": [{"id": 0, "rpc_url": ["http://coordinator/"]}],
             "prove_proxy_url": [], "faucet_rpc_url": [], "nostr_relay_url": "", "native_currency": "", "native_currency_decimal": 0,
-            "native_currency_name": "", "fees": {"register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0}
-        })).unwrap();
-        GuardianConfig { network, guardians, client: GuardianClientConfig {
-            endpoints: endpoints.map(str::to_owned), archive_path: PathBuf::from("archive/relayer-journal"),
-            listen_address: "127.0.0.1:9".parse().unwrap(), l1_endpoints: vec![],
-        } }
+            "native_currency_name": "", "fees": {"register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0},
+            "guardian_configs": [
+                {"id": 3, "listen_address": "127.0.0.1:15443"},
+                {"id": 1, "listen_address": "127.0.0.1:15441"},
+                {"id": 2, "listen_address": "127.0.0.1:15442"}
+            ],
+            "guardian_history": {"listen_address": "127.0.0.1:15450"},
+            "l1_endpoints": [{"chain_index": 7, "rpc_url": "https://chain.example/rpc"}]
+        })).unwrap()
     }
 
     #[test]
-    fn advertised_origins_normalize_while_equal_binds_and_duplicate_history_origins_are_distinct_rules() {
-        assert!(configured(["http://example/", "http://EXAMPLE:80/", "http://other/"], "0.0.0.0:15441").validate().is_err());
-        let config = configured(["http://127.0.0.1:9", "http://b/", "http://c/"], "0.0.0.0:15441");
-        assert!(config.validate().is_ok());
-        assert!(config.guardians.values().map(|signer| signer.listen_address).all(|address| address == config.guardians[&1].listen_address));
-        let index = GuardianAuthorizationIndex { active_version: 1, versions: vec![GuardianAuthorizationVersion { version: 1, sha256: Hex([1; 32]) }] };
-        let runtime = config.build_runtime_config(Path::new("/guardians-root/config.json"), 1, Path::new("journal.redb"), &index).unwrap();
-        assert_eq!(runtime.history_urls, vec!["http://127.0.0.1:9/".to_owned(), "http://b/".to_owned(), "http://c/".to_owned()]);
-    }
-
-    #[test]
-    fn guardian_json_keys_reject_alternate_numeric_spellings() {
-        for text in [r#"{"guardians":{"01":{},"2":{},"3":{}}}"#, r#"{"guardians":{"1":{},"2":{},"2":{}}}"#, r#"{"guardians":{"1":{},"2":{},"4":{}}}"#] {
-            let value: serde_json::Value = serde_json::from_str(text).unwrap_or(serde_json::json!({"guardians":{}}));
-            assert!(guardian_ids(&value).map(|ids| ids == [1, 2, 3]).unwrap_or(false) == false);
+    fn guardian_ids_are_exact_unique_and_order_independent() {
+        let config = GuardianConfig::from_network(network(), Path::new("/guardians-root")).unwrap();
+        assert_eq!(config.endpoints, ["http://127.0.0.1:15441/", "http://127.0.0.1:15442/", "http://127.0.0.1:15443/"]);
+        for id in [0, 1, 2, 4, 255] {
+            let mut changed = network();
+            changed.guardian_configs[0].id = id;
+            assert!(GuardianConfig::from_network(changed, Path::new("/guardians-root")).is_err());
         }
-        let value = serde_json::json!({"guardians":{"3":{},"1":{},"2":{}}});
-        assert_eq!(guardian_ids(&value).unwrap(), [1, 2, 3]);
+        let mut missing = network();
+        missing.guardian_configs.pop();
+        assert!(GuardianConfig::from_network(missing, Path::new("/guardians-root")).is_err());
     }
 
     #[test]
-    fn rpc_projection_requires_matching_user_proxy() {
-        let embedded = serde_json::json!({
-            "magic": "0x1", "users_per_realm": 1, "global_user_tree_height": 1, "realm_user_tree_height": 1, "group_realm_height": 1,
-            "realm_configs": [], "p2p": {"checkpoints_per_epoch": 1}, "coordinator_configs": [], "prove_proxy_url": ["http://127.0.0.1:9999/"],
-            "faucet_rpc_url": [], "nostr_relay_url": "", "native_currency": "", "native_currency_decimal": 0, "native_currency_name": "",
-            "fees": {"register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0}
-        });
-        let network: psy_config::NetworkConfigGoldilocks = serde_json::from_value(embedded.clone()).unwrap();
-        let config = GuardianConfig { network: network.clone(), guardians: BTreeMap::new(), client: GuardianClientConfig {
-            endpoints: ["http://a/".into(), "http://b/".into(), "http://c/".into()], archive_path: PathBuf::from("archive/relayer-journal"),
-            listen_address: "127.0.0.1:1".parse().unwrap(), l1_endpoints: vec![],
-        } };
-        assert!(config.validate_rpc_network(&network).is_ok());
-        let mut embedded_proxy = embedded.clone();
-        embedded_proxy["prove_proxy_url"] = serde_json::json!(["http://embedded-user/"]);
-        let embedded_config = GuardianConfig { network: serde_json::from_value(embedded_proxy).unwrap(), guardians: BTreeMap::new(), client: config.client.clone() };
-        assert!(embedded_config.validate_rpc_network(&network).is_err());
-        let mut external = embedded.clone();
-        external["prove_proxy_url"] = serde_json::json!([]);
-        assert!(config.validate_rpc_network(&serde_json::from_value(external.clone()).unwrap()).is_err());
-        external["system_prove_proxy_url"] = serde_json::json!(["http://system/"]);
-        assert!(config.validate_rpc_network(&serde_json::from_value(external).unwrap()).is_err());
-        external = embedded;
-        external["coordinator_configs"] = serde_json::json!([{"id": 0, "rpc_url": ["http://changed/"]}]);
-        assert!(config.validate_rpc_network(&serde_json::from_value(external).unwrap()).is_err());
+    fn missing_public_configuration_never_falls_back() {
+        let mut missing = network();
+        missing.guardian_configs.clear();
+        assert!(GuardianConfig::from_network(missing, Path::new("/guardians-root")).is_err());
+        let mut missing = network();
+        missing.guardian_history = None;
+        assert!(GuardianConfig::from_network(missing, Path::new("/guardians-root")).is_err());
+        let mut missing = network();
+        missing.l1_endpoints.clear();
+        assert!(GuardianConfig::from_network(missing, Path::new("/guardians-root")).is_err());
+        let mut duplicate = network();
+        duplicate.l1_endpoints.push(duplicate.l1_endpoints[0].clone());
+        assert!(GuardianConfig::from_network(duplicate, Path::new("/guardians-root")).is_err());
+    }
+
+    #[test]
+    fn wildcard_binds_require_explicit_valid_dial_origins() {
+        for bind in ["0.0.0.0:15441", "[::]:15441"] {
+            assert!(advertised_origin(bind.parse().unwrap(), None).is_err());
+            assert_eq!(advertised_origin(bind.parse().unwrap(), Some("http://remote.example/")).unwrap(), "http://remote.example/");
+        }
+        for url in ["http://user:password@remote/", "http://remote/path", "http://remote/?query", "https://remote/", "http://remote:0/", "http://0.0.0.0:15441/", "http://[::]:15441/"] {
+            assert!(advertised_origin("0.0.0.0:15441".parse().unwrap(), Some(url)).is_err());
+        }
+        assert!(advertised_origin("127.0.0.1:0".parse().unwrap(), Some("http://remote/")).is_err());
+        assert_eq!(advertised_origin("[::1]:15441".parse().unwrap(), None).unwrap(), "http://[::1]:15441/");
+        let mut duplicate = network();
+        duplicate.guardian_configs[0].rpc_url = Some("http://example/".into());
+        duplicate.guardian_configs[1].rpc_url = Some("http://EXAMPLE:80/".into());
+        assert!(GuardianConfig::from_network(duplicate, Path::new("/guardians-root")).is_err());
+    }
+
+    #[test]
+    fn runtime_paths_derive_only_from_root_and_guardian_id() {
+        let mut public = network();
+        public.guardian_history.as_mut().unwrap().rpc_url = Some("http://127.0.0.1:15441/".into());
+        let config = GuardianConfig::from_network(public, Path::new("/guardians-root")).unwrap();
+        for id in 1..=3 {
+            let runtime = config.build_runtime_config(id).unwrap();
+            assert_eq!(runtime.db_path, format!("/guardians-root/db/guardian-{id}.redb"));
+            let (key, password) = guardian_secret_paths(id).unwrap();
+            assert_eq!(key.file_name().unwrap(), format!("guardian-{id}.keystore.json").as_str());
+            assert_eq!(password.file_name().unwrap(), format!("guardian-{id}.password").as_str());
+            assert_eq!(key.parent().unwrap(), home::home_dir().unwrap().join(".psy/keystore"));
+            assert_eq!(Path::new(&runtime.signing_key_secret_path), key);
+            assert_eq!(Path::new(&runtime.signing_key_password_secret_path), password);
+            assert_eq!(runtime.history_urls.len(), 3);
+        }
+        for id in [0, 4, 255] {
+            assert!(guardian_secret_paths(id).is_err());
+            assert!(config.build_runtime_config(id).is_err());
+        }
+        for root in ["", "../root", "/root/../other"] { assert!(guardian_root_path(Path::new(root)).is_err()); }
+        assert_eq!(guardian_root_path(Path::new("relative-root")).unwrap(), std::env::current_dir().unwrap().join("relative-root"));
+    }
+
+    #[test]
+    fn public_loader_selects_compiled_network_without_secret_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("guardian-public-config-{}-{}.json", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let mut networks = serde_json::Map::new();
+        networks.insert(psy_config::CURRENT_NETWORK.into(), serde_json::to_value(network()).unwrap());
+        let mut other = network();
+        other.guardian_configs.clear();
+        networks.insert("not-the-compiled-network".into(), serde_json::to_value(other).unwrap());
+        let mut document = serde_json::json!({"defaultNetwork": "not-the-compiled-network", "networks": networks});
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(GuardianConfig::load(&path, Path::new("/guardians-root")).is_ok());
+        let selected_name = serde_json::to_string(psy_config::CURRENT_NETWORK).unwrap();
+        let selected = serde_json::to_string(&network()).unwrap();
+        let duplicate = format!("{{\n  \"defaultNetwork\": {selected_name},\n  \"networks\": {{ {selected_name}: {selected}, {selected_name}: {selected} }}\n}}");
+        std::fs::write(&path, duplicate).unwrap();
+        assert!(matches!(GuardianConfig::load(&path, Path::new("/guardians-root")), Err(GuardianSignError::MalformedRequest)));
+        std::fs::write(&path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+        assert!(GuardianConfig::load(&path, Path::new("/guardians-root")).is_ok());
+        document["networks"].as_object_mut().unwrap().remove(psy_config::CURRENT_NETWORK);
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(GuardianConfig::load(&path, Path::new("/guardians-root")).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn l1_coverage_rejects_empty_missing_extra_and_duplicate_chains() {
+        let chain = ChainAuthorization {
+            chain_index: 7, chain_id: alloy_primitives::U256::from(7), genesis_hash: Hex([1; 32]),
+            bridge: Hex([1; 20]), state_manager: Hex([2; 20]), deployment_block: 1, token_mappings: vec![],
+        };
+        let endpoints = network().l1_endpoints;
+        assert!(validate_l1_coverage(&endpoints, &[chain.clone()]).is_ok());
+        assert!(validate_l1_coverage(&[], &[]).is_err());
+        assert!(validate_l1_coverage(&[], &[chain.clone()]).is_err());
+        assert!(validate_l1_coverage(&endpoints, &[]).is_err());
+        assert!(validate_l1_coverage(&[endpoints[0].clone(), endpoints[0].clone()], &[chain.clone()]).is_err());
+        assert!(validate_l1_coverage(&endpoints, &[chain.clone(), chain.clone()]).is_err());
+        let mut other = chain.clone();
+        other.chain_index = 42;
+        assert!(validate_l1_coverage(&endpoints, &[other.clone()]).is_err());
+        let mut both = endpoints;
+        both.push(psy_config::ChainEndpoint { chain_index: 42, rpc_url: "https://other.example/rpc".into() });
+        assert!(validate_l1_coverage(&both, &[chain, other]).is_ok());
     }
 
     #[test]
@@ -491,5 +481,18 @@ mod tests {
             assert!(secret_text(bytes, true).is_err());
         }
         assert_eq!(secret_text(b" secret ", true).unwrap(), " secret ");
+    }
+
+    #[test]
+    fn network_magic_requires_nonzero_hex_below_goldilocks_modulus() {
+        let mut config = GuardianConfig::from_network(network(), Path::new("/guardians-root")).unwrap();
+        for magic in ["", "0x0", "0X0", "garbage", "0xg", "-1", "0x1_0", "0xffffffff00000001", "0xffffffff00000002"] {
+            config.network.magic = magic.into();
+            assert!(config.network_magic().is_err(), "{magic}");
+        }
+        for (magic, expected) in [("0x1", 1u64), ("0X10", 16), ("90101", 0x90101), ("0xffffffff00000000", GOLDILOCKS_MODULUS - 1)] {
+            config.network.magic = magic.into();
+            assert_eq!(config.network_magic().unwrap(), expected, "{magic}");
+        }
     }
 }

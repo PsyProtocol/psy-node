@@ -3955,7 +3955,7 @@ dependencies = [
 [[package]]
 name = "gnark-plonky2-verifier-ffi"
 version = "0.1.0"
-source = "git+https://github.com/PsyProtocol/gnark-plonky2-verifier.git?rev=aeda6bebc02fed0d43bd572ff45f50ab6c03f2db#aeda6bebc02fed0d43bd572ff45f50ab6c03f2db"
+source = "git+https://github.com/PsyProtocol/gnark-plonky2-verifier.git?rev=7831c5216f7bc94619af7ee56b22243c08696976#7831c5216f7bc94619af7ee56b22243c08696976"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -3966,7 +3966,7 @@ dependencies = [
 [[package]]
 name = "gnark-plonky2-wrapper"
 version = "0.1.0"
-source = "git+https://github.com/PsyProtocol/gnark-plonky2-verifier.git?rev=aeda6bebc02fed0d43bd572ff45f50ab6c03f2db#aeda6bebc02fed0d43bd572ff45f50ab6c03f2db"
+source = "git+https://github.com/PsyProtocol/gnark-plonky2-verifier.git?rev=7831c5216f7bc94619af7ee56b22243c08696976#7831c5216f7bc94619af7ee56b22243c08696976"
 dependencies = [
  "anyhow",
  "ff",
@@ -7729,7 +7729,9 @@ dependencies = [
  "psy_ups_circuit",
  "psy_vm",
  "rand 0.8.5",
+ "redb",
  "redis 0.30.0",
+ "reqwest 0.12.28",
  "rkyv",
  "rustyline",
  "rustyline-derive",
@@ -7746,6 +7748,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "url",
  "zstd 0.13.3",
 ]

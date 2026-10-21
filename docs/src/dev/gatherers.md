@@ -45,8 +45,8 @@ Five gatherer roles exist. **Four** run on the coordinator (register user, deplo
 |---|---|---|---|---|
 | RegisterUserGatherer | Coordinator | register-user | inline | `coordinator/processor/gatherers/register_user_gatherer.rs` |
 | DeployContractGatherer | Coordinator | deploy-contract | inline | `coordinator/processor/gatherers/deploy_contract_gatherer.rs` |
+| UpdateContractGatherer | Coordinator | update-contract | inline | `coordinator/processor/gatherers/update_contract_gatherer.rs` |
 | CoordinatorGUTAUpdateGatherer | Coordinator | realm GUTA update | `CoordinatorGUTAPlanner` | `coordinator/processor/gatherers/coordinator_guta_update_gatherer.rs` |
-| RealmGUTAEndCapGatherer | Realm | user EndCap | `RealmGUTAPlanner` | `realm/processor/gatherers/realm_end_cap_gatherer.rs` |
 
 ```text
 process_block
@@ -65,7 +65,7 @@ Every gatherer follows the same cycle.
 
 **Create.** `create_new_with_tree` reads shared status, opens a backup file for the current `unique_pending_id`, writes magic and a header, and constructs the planner on the current checkpoint root.
 
-**Consume.** `finalize_gathering_and_update_queue_key` (`queue/gatherer.rs:130`, `:249`) rotates the queue key to the new gathering id and triggers the runner. The runner drains the ephemeral queue into `process_queue_item`, which updates the owned tree and appends the item to the backup.
+**Consume.** `finalize_gathering_and_update_queue_key` (`queue/gatherer.rs:134`, `:253`) rotates the queue key to the new gathering id and triggers the runner. The runner drains the ephemeral queue into `process_queue_item`, which updates the owned tree and appends the item to the backup.
 
 **Finalize.** After the drain, the gatherer asks the planner for jobs, writes the backup footer, and returns FFS node updates plus the job tree.
 
@@ -117,7 +117,7 @@ Coordinator trees are owned by these **four** gatherers after startup hydrates t
 
 ## 5. Unique-id rotation
 
-`set_new_unique_ids` runs once per block **before** finalize (coordinator `coordinator/processor/db.rs:780`; realm `realm/processor/db/commit.rs:52`).
+`set_new_unique_ids` runs once per block **before** finalize. The coordinator rotation is `coordinator/processor/db.rs:780`. The realm rotation is `realm/processor/db/commit.rs:154` and takes `Option<N::QHash>`; it rotates ids and does not publish a gathering generation.
 
 ```text
 Before:  processing = P, gathering = G
@@ -139,7 +139,7 @@ Realm extra fields: `gathering_realm_start_root` (checkpoint-authenticated), `pr
 | `RealmGUTAPlanner` | Fixed-level arrays plus EndCap / job stragglers | 7 / 11 EndCap | 8 / 13 / 57 and checkpoint-upgrade twins; root 63 |
 | `CoordinatorGUTAPlanner` | MMR-style `waiting_nodes` with right-fold finalize | incoming realm GUTA | lift (mode 3) then binary fold |
 
-Realm two-EndCap jobs are mode 1 (`realm_guta_planner.rs:590`). The finalizer job is mode 0 with the root GUTA as its only dependency (`realm_guta_planner.rs:1028-1038`). Coordinator wrap-one-child jobs are mode 3 (`coordinator_guta_planner.rs:475-484`). Reward-node keys are assigned from the offsets in [Reward Tree Circuit Layouts](reward-tree-circuits.md#5-global-reward-tree-offsets).
+Realm two-EndCap jobs write mode 1, `PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN` (`realm_guta_planner.rs:521,717`). The finalizer job is mode 0, `HASH_CHILDREN_STANDARD`, with `children: 2` and the root GUTA as its only dependency (`realm_guta_planner.rs:1056-1064`). Coordinator wrap-one-child jobs are mode 3 (`coordinator_guta_planner.rs:481-490`). Reward-node keys are assigned from the offsets in [Reward Tree Circuit Layouts](reward-tree-circuits.md#5-global-reward-tree-offsets).
 
 ## 7. Security Considerations
 
@@ -165,7 +165,7 @@ A parked processor (`ProcessorState::Error`) stops every bound gatherer. That is
 | Realm EndCap gatherer | `psy_node_common/src/realm/processor/gatherers/realm_end_cap_gatherer.rs` |
 | Register user | `psy_node_common/src/coordinator/processor/gatherers/register_user_gatherer.rs` |
 | Deploy contract | `psy_node_common/src/coordinator/processor/gatherers/deploy_contract_gatherer.rs` |
-| Coordinator GUTA | `psy_node_common/src/coordinator/processor/gatherers/coordinator_guta_update_gatherer.rs` |
+| Update contract | `psy_node_common/src/coordinator/processor/gatherers/update_contract_gatherer.rs` |
 | Realm planner | `psy_node_common/src/guta_planner/realm_guta_planner.rs` |
 | Coordinator planner | `psy_node_common/src/guta_planner/coordinator_guta_planner.rs` |
 | EndCap edge validation | `psy_node_common/src/realm/edge/utils/end_cap.rs` |

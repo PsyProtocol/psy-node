@@ -1,10 +1,12 @@
 // Creates a new multi-repo workspace mirroring an existing one: per repo, a
 // NEW topic branch of the same name based on the base tip frozen to a SHA at
-// preflight, via `git worktree add` from local source repos, or a
-// documented-origin clone when the source repo directory is missing;
-// submodules initialized recursively at recorded gitlink SHAs. No fetch,
-// push, prune, force, or branch deletion; no staging of dirty content; no
-// config/secret copies; no builds. Failures never delete what was created.
+// preflight, via `git worktree add` from local source repos. A missing source
+// repo may be cloned from its documented origin; that clone is the only
+// network read. A present local base is frozen from refs/heads or the
+// existing origin tracking ref and is never fetched. Recorded submodules are
+// initialized at their gitlink SHAs. No push, prune, force, or branch
+// deletion; no staging of dirty content; no config/secret copies; no builds.
+// Failures never delete what was created.
 
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import * as path from "node:path";

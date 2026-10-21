@@ -3,7 +3,7 @@
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
 > Draft: 2026-09-07. Status: Draft (design).
-> **Currency (2026-09-08, local circuit):** Circuit 63 source already removed wallet-signature fingerprint derivation (`realm_finalize_guta.rs` fee/public-key section). Type 64 is absent from `cached_circuit_library` in this worktree. Treat narrative below that says “currently requires WrappedSignatureProof” as **pre-cutover**; prefer live `realm_finalize_guta.rs` + [ProvingJobs.md](../protocol/ProvingJobs.md) §2 for what ships today. Remaining draft items (PI commitment / AlreadyClaimed) still need independent verification against processors.
+> **Currency (2026-09-08, local circuit):** Circuit 63 source already removed wallet-signature fingerprint derivation. Type 64 is absent from `cached_circuit_library` in this worktree. Sections 1 and 5 that describe wallet proving, `WrappedSignatureProof`, synthetic `checkpoint_id = 0`, type 64, or an extra `finalize_binding` RPC argument are historical design text, not the current implementation. Live construction is `build_p2p_finalize_output` (`process_block.rs:936`) and live peer verification is `verify_proposal_submission` (`consensus.rs:140-198`). `submit_guta_internal` takes header, proof, optional proposal, and optional certificate only (`handler.rs:805-810`); it does not take `finalize_binding`. Remaining draft items (PI commitment / AlreadyClaimed) still need independent verification against processors.
 
 > Author: GPT-6 Astra. Reviewed-by: orchestrator, approved with conditions incorporated below.
 
@@ -83,7 +83,7 @@ sequenceDiagram
     Coordinator-->>Processor: 8. AlreadyClaimed exclusion, admission, then inclusion
 ```
 
-The diagram shows the target interaction; the authoritative current ASCII flow is:
+The diagram shows the target interaction. The ASCII flow and source table below are a **pre-cutover historical record**, not the current implementation:
 
 ```text
 checkpoint identity + validator wallet private key
@@ -97,7 +97,7 @@ root GUTA proof -------------------------+-> circuit 63 -> final header + reward
   -> pending-generation AlreadyClaimed -> proof store -> Coordinator queue
 ```
 
-| Concern | Read-only source verification |
+| Concern | Historical pre-cutover source note; not a current implementation claim |
 |---|---|
 | Actual circuit path | `psy_plonky2_circuits/src/guta_v2/circuits/realm_finalize_guta.rs:205-238,637-683,979-1018`. The ticket's `guta/circuits/realm_finalize_guta.rs` path does not exist. Circuit 63 verifies WrappedSignatureProof, its fingerprint, action/key-parameter public inputs and wallet public-key derivation. |
 | Chain domain | `psy_data/src/guta/realm_finalize.rs:78-85`: `H_many([F::from_u64_value(chain_id)])`. Retain the migrated full `u64` chain identity. |
@@ -236,7 +236,7 @@ processor/core/process_block.rs:548 rc_submit_guta_proof
   -> existing proof store / Coordinator queue
 ```
 
-Append required `finalize_binding: Vec<u8>` to that RPC and all implementations. It contains actual O plus finalizer worker tag, defined below; it contains no new signature. Keep existing proposal/certificate wire encodings. For external Realm admission, require job type 63, proposal, certificate and binding. Internal ordinary GUTA aggregation remains unchanged. No new endpoint or optional legacy finalizer path is permitted.
+**Design only; not current.** Do not append `finalize_binding: Vec<u8>` to the live RPC. `submit_guta_internal` currently takes the header, proof bytes, optional proposal bytes, and optional certificate bytes (`handler.rs:805-810`). Any binding required by this design must already be inside the proposal body before this cutover is implemented. Keep existing proposal/certificate wire encodings. For external Realm admission, the design requires job type 63, proposal, and certificate. Internal ordinary GUTA aggregation remains unchanged. No new endpoint or optional legacy finalizer path is permitted.
 
 Reuse `verify_optional_guta_certificate`'s tree lookup, scheduled proposer calculation and BLS FastAggregateVerify. Its current no-validator return at `handler.rs:791-796` must fail closed for the finalizer endpoint. Rename the helper to reflect mandatory validation when migrating its callers.
 
@@ -316,7 +316,7 @@ impl BlsSignature {
 
 Source: `messages.rs:435-450`, `bls.rs:156-175,232-239`. Preconditions: canonical proposal and checkpoint-authenticated keys; strict subgroup/non-infinity parsing stays in the existing BLS types. Postcondition: verified certificate message equals D. Invalid keys, signatures or mismatched D fail with the existing protocol error; no storage side effects occur.
 
-Proposed handler signature, preserving the actual existing generic types:
+Proposed handler signature, **not the current signature**. The live function stops at `certificate_bytes` (`handler.rs:805-810`):
 
 ```rust
 pub async fn submit_guta_internal(

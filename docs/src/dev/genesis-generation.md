@@ -2,7 +2,7 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-10-13. Status: Review.
+> Updated: 2026-10-21. Status: Review.
 
 ## Overview
 
@@ -16,7 +16,7 @@
 
 ## Background
 
-The compiler produces contract definitions, while the node generator embeds those definitions into a network bootstrap snapshot. The launcher then adds public validator membership. `psy-genesis/config.json` is a separate network configuration input; `make gen-deploy-json` does not generate it (`<workspace>/psy-compiler/Makefile:208-255`). Keep these ownership boundaries explicit when debugging stale artifacts.
+The compiler produces contract definitions, while the node generator embeds those definitions into a network bootstrap snapshot. The launcher then adds public validator membership. `psy-genesis/config.json` is the one public configuration, including authorization; `make gen-deploy-json` does not generate it (`<workspace>/psy-compiler/Makefile:270-309`). Keep these ownership boundaries explicit when debugging stale artifacts.
 
 ```mermaid
 sequenceDiagram
@@ -71,11 +71,9 @@ EndCap metadata, GUTA, cache, verifier JSON, fingerprint, and ordinary witness c
 
 ### 1.2 Command
 
-When generation is authorized, supply both required public input files:
+When generation is authorized, the public signing policy must already be the JSON string at `networks[CURRENT_NETWORK].guardian_authorization.bridge_relayer_signing_policy` in `psy-genesis/config.json`. The policy compiler artifact is read from the sibling checkout, not from a flag:
 
 ```bash
-PSY_RELAYER_MULTISIG_ACCOUNT='<public-multisig-account-json>' \
-PSY_MULTISIG_POLICY_ARTIFACT='<approved-policy-compiler-artifact-json>' \
 make generate-genesis-data
 ```
 
@@ -83,18 +81,15 @@ The equivalent command from the repository root is:
 
 ```bash
 ./target/release/psy_dev_cli generate-genesis-data \
-  --repo-root . \
-  --relayer-multisig-account '<public-multisig-account-json>' \
-  --multisig-policy-artifact '<approved-policy-compiler-artifact-json>'
+  --repo-root .
 ```
-
-Both flags are required and have no default. Relative input paths resolve against `--repo-root`. The Make target passes the public paths and strips secret-bearing legacy enrollment variables from the generator child environment; it does not change L1 custody in the parent process. The launcher requires these inputs only when it actually generates Genesis, not when reusing a verified existing snapshot. Sources: `Makefile:139-144`; `dev/locSetupV4.ts` (`planGenesisGeneration`); `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`. The `--guardians-root` branch of the same command is documented in §4.
+There is no `--relayer-multisig-account` flag and no `PSY_RELAYER_MULTISIG_ACCOUNT` variable (`Makefile:141-142`). The compiler artifact is `<projects>/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`, where `<projects>` is `$PSY_PROJECTS_DIR` or the parent of `--repo-root`. There is no `--multisig-policy-artifact` flag and no `PSY_MULTISIG_POLICY_ARTIFACT` variable. The Make target strips secret-bearing legacy enrollment variables from the generator child environment; it does not change L1 custody in the parent process. Full startup always generates a fresh Genesis after its preflight. A missing checked-in policy fails before any destruction. Application restart does not generate Genesis. Sources: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:72-76`; `Makefile:141-142`; `dev/locSetupV4.ts:3113-3167`. The `--guardians-root` branch of the same command is documented in §4.
 
 ### 1.2.1 Public bridge multisig account
 
-Registration 2 (`user_id` 524288) is a public-only two-of-three multisig account. The input is a JSON object containing exactly `contract_id` and `initial_policy`; unknown or duplicate fields are rejected. `contract_id` must be 1. `initial_policy` contains exactly `version: 1`, `threshold: 2`, `member_count: 3`, and `member_hashes`, an array of eight strings using the existing `QHashOut` JSON encoding. The first three commitments must be nonzero, pairwise unequal as whole hashes, and retained in the supplied order; the remaining five must be zero padding. Supply commitments for the approved external signers, not addresses or private keys. Source: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:198-225`; `client_prover/psy_vm/src/ups/multisig.rs`.
+Registration 2 (`user_id` 524288) is a public-only two-of-three multisig account. Its only input is the existing JSON string `bridge_relayer_signing_policy` on the selected network. That string decodes as a `MultisigAccount` containing exactly `contract_id` and `initial_policy`; unknown or duplicate fields are rejected. `contract_id` must be 1. `initial_policy` contains exactly `version` 1, `threshold` 2, `member_count` 3, and `member_hashes`, an array of eight commitments. The first three commitments must be nonzero and pairwise unequal; the remaining five must be zero. This document does not invent member values. The commitments identify the approved public signers; they are not addresses or private keys. Before deploy, only this policy field is required. After deploy, the published authorization contains the full seven-field object and preserves this same policy string. Source: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:185-212`; `psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs:186-203`; `dev/locSetupV4.ts:3135-3153`.
 
-The separate compiler artifact contains the approved policy contract's current ABI 2.0.0 and exactly `get_policy` and `set_policy` circuit definitions, with declared state-tree height 4. The generator checks method identifiers, input/output counts, mutability, and the visible `header`/three-`members` ABI offsets, then derives the complete deployment and requires equality with Genesis contract 1 (`generate_genesis.rs:259-262`). This uses the existing ABI, not a new canonical layout root or nested Genesis metadata schema. The required supplied artifact is not compiled or regenerated by these commands.
+The sibling compiler artifact contains the approved policy contract's ABI 2.0.0 and exactly `get_policy` and `set_policy` circuit definitions, with declared state-tree height 4. The generator checks the ABI schema, method identifiers, input and output felt counts, view or external mutability, and the visible `header` and three-`members` offsets, then derives the deployment and requires its code root and function roots to equal Genesis contract 1. The same read covers every genesis deployment: a `state_map` must be a Hash-keyed map of capacity 1,048,576 with value size 4 starting on its alignment boundary, and a `withdraw` method's withdrawal map operands must be unique typed literals with exactly one write preceded by at least one read of the same base and capacity. The compiler JSON stays in the compiler's `target` directory; these commands never copy or regenerate it.
 
 The generator derives the account identity from the actual `MultisigSignatureCircuit` fingerprint and the initial public policy. It initializes contract 1 with header `[1, 2, 3, 0]` in slot 0 and the three member commitments in slots 1 through 3. Contract 0 slot 0 holds the configured nonzero canonical initial fee balance. The user nonce is zero, but the policy is already initialized: the first signed session uses the current initial policy, not pristine-account bootstrap. No relayer master secret is generated, decrypted, or exported.
 
@@ -125,7 +120,7 @@ cd <workspace>/psy-compiler
 make gen-deploy-json
 ```
 
-The compiler tree must be clean and exactly at the selected `R_compiler`. The user publishes that commit by SSH; if its reachability is already proven, do not publish it again. `make gen-deploy-json` reads `git rev-parse HEAD` and `git ls-tree` at that revision, so a dirty compiler or a later uncommitted lockfile change is not the stamp. Finalize the node pin and `Cargo.lock`, then generate. The target defaults `PSY_GENESIS` to `../psy-node/psy-genesis`, writes `genesis_contracts.json`, refreshes `genesis_abi/`, writes `.genesis_contracts.compiler-artifact.json`, and copies `token.json` and `token.update.json` there. The stamp must contain `compilerRevision`, `compilerSourcesHash`, and SHA-256/size for `genesis_contracts.json`, `token.json`, and `token.update.json`.
+The compiler tree must be clean and exactly at the selected `R_compiler`. The user publishes that commit by SSH; if its reachability is already proven, do not publish it again. Finalize the node pin and `Cargo.lock`, then generate. `make gen-deploy-json` compiles the six genesis contracts, writes `genesis_contracts.json`, refreshes `genesis_abi/`, and copies `token.json` and `token.update.json` into the default `PSY_GENESIS` directory `../psy-node/psy-genesis`. Its final recipe also writes `.genesis_contracts.compiler-artifact.json`. That sidecar records `compilerRevision`, `compilerSourcesHash`, and SHA-256 plus byte size for `genesis_contracts.json`, `token.json`, and `token.update.json` (`<workspace>/psy-compiler/Makefile:270-309`).
 
 The node generator consumes the existing flat array of named deployments from `genesis_contracts.json`, not a nested layout wrapper. Names must be nonempty and unique; entry 1 must be `multisig_policy`. Its sibling `.genesis_contracts.compiler-artifact.json` is mandatory: the generator accepts the existing eight-field stamp, checks fixed-width lowercase identity strings, and verifies the raw bundle byte size and SHA-256 before decoding. The stamp must be a regular file of at most 65,536 bytes. This does not introduce a private-storage ABI export or a new bundle schema.
 
@@ -145,8 +140,7 @@ The key generator writes P2P identity/BLS secrets and creates one distinct edge 
 Genesis construction fails closed when a Realm exceeds the P2P validator cap (`MAX_VALIDATORS_PER_REALM = 64` in `psy_data/src/p2p/limits.rs`), a NodeId, BLS key, or validator user ID is duplicated, a public identity is invalid, or `validator_user_id` is outside the owning Realm's half-open user range. Processor startup also requires its local Ed25519 NodeId and BLS secret to match the configured public values exactly.
 
 ## 4. Guardians root
-
-`generate-genesis-data --guardians-root PATH` is the only guardians-root entry. It verifies the supplied public inputs against the **existing** `genesis.json` named by `--genesis-out`, or `<repo-root>/genesis.json` when absent; relative paths resolve against `--repo-root`. It never calls `generate_local_devnet_genesis` and never writes `genesis.json`, `private_keys.json`, or `faucetOperators.json`. Without `--guardians-root`, the publish branch is unchanged and any guardians-root-only flag fails closed; with `--guardians-root`, the three guardians-root input flags are required (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:181-187`; `psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs:69-188`).
+`generate-genesis-data --guardians-root PATH` is the only guardians-root entry. It reads the **existing** `genesis.json` named by `--genesis-out`, or `<repo-root>/genesis.json` when absent, and never regenerates it. Relative paths resolve against `--repo-root`. It never calls `generate_local_devnet_genesis` and never writes `genesis.json`, `private_keys.json`, or `faucetOperators.json`. Without `--guardians-root`, the publish branch is unchanged and `--max-fee` fails closed. There is no `--chains`, `--approved-contracts`, `--multisig-policy-artifact`, or `--relayer-multisig-account` flag.
 
 Shared guardians-root code lives in the `psy_cli/guardian_common` crate (`lib.rs` declares `db`, `endcap`, `protocol`, `runtime`). The generator and `psy_relayer_cli` both consume it; it depends on neither binary.
 
@@ -156,76 +150,60 @@ File inputs are resolved by the existing `read_public_input(repo_root, path)` co
 
 | Input | Required | Exact decoded rule |
 |---|---|---|
-| `--relayer-multisig-account` | yes (publish branch too) | Strict public account decoder (`generate_genesis.rs:198-225`): exactly `contract_id` and `initial_policy`; `contract_id` 1; policy `version` 1, `threshold` 2, `member_count` 3, eight `member_hashes` with the first three nonzero and pairwise unequal in caller-supplied order and the remaining five zero; unknown or duplicate fields rejected. |
-| `--multisig-policy-artifact` | yes (publish branch too) | Existing compiler artifact checked against Genesis contract 1 by `validate_multisig_policy_artifact` (`guardians_root.rs:89-92`). |
-| `--chains` | with `--guardians-root` | Canonical JSON array of `ChainAuthorization` (`psy_cli/guardian_common/src/protocol.rs:195-203`): `chain_index`, `chain_id`, `genesis_hash`, Bridge/StateManager proxies with code hashes, `deployment_block`, `token_mappings`. |
-| `--l1-endpoints` | with `--guardians-root` | Canonical JSON array of `ChainEndpoint` (`protocol.rs:245`): `chain_index: u8`, `rpc_url: String`; exactly one endpoint per authorized chain index, no duplicates (`guardians_root.rs:357-376`); credential-free `https` or loopback `http` (`guardians_root.rs:497-514`). |
-| `--approved-contracts` | with `--guardians-root` | Canonical JSON array of `ApprovedContract` (`protocol.rs:156-161`): `contract_id`, `contract_leaf_json`, `compiler_artifact_json`, `compiler_artifact_sha256`. The two JSON fields are JSON strings, not paths or nested objects. |
-| `--max-fee` | optional | `u64` fee cap, default `2000000000` (`generate_genesis.rs:45`); must be at least the compiled `GUTA_FEE + DA_FEE` floor (`guardians_root.rs:349-355`). `guta_fee` and `da_fee` are compiled constants recorded in the authorization, not guardians-root overrides. |
+| `bridge_relayer_signing_policy` | yes | Existing JSON string at `networks[CURRENT_NETWORK].guardian_authorization.bridge_relayer_signing_policy` in `psy-genesis/config.json`. It is the public `MultisigAccount`: `contract_id` 1 and `initial_policy` version 1, threshold 2, member count 3. No path flag and no secret. A missing policy fails before generation or destruction (`guardians_root.rs:186-203`). |
+| sibling compiler artifacts | derived | `<projects>/psy-compiler/psy-precompiles/<stem>/target/<stem>.json` for the six genesis stems, where `<projects>` is `$PSY_PROJECTS_DIR` or the parent of `--repo-root`. Read once; the raw bytes stay in that directory. |
+| deployment output | derived, with `--guardians-root` | `psy-contracts/deployments/<network>/deployed-contracts.json` plus the Bridge and StateManager proxy receipts, for `localhost`, `localhostBsc`, and `localhostBase` in chain index order. |
+| canonical `l1_endpoints` | with `--guardians-root` | The selected compiled network of `<repo-root>/psy-genesis/config.json` supplies the endpoints; nonempty, no duplicate chain index, no port `0`, no wildcard host, credential-free `https` or loopback `http`. `eth_chainId` must equal the deployed `chainId`, and block 0 supplies the L1 genesis hash. No `--l1-endpoints` flag and no fallback (`dev/locSetupV4.ts:3896-3906,3978-3991`). |
+| `--max-fee` | optional | `u64` fee cap, default `2000000000` (`generate_genesis.rs`); must be at least the compiled `GUTA_FEE + DA_FEE` floor (`guardians_root.rs`). `guta_fee` and `da_fee` stay on the canonical network and are not copied into authorization. |
 
-Canonical decoding rejects duplicate and unknown keys through the shared `JsonText`/`parse_canonical_json` decoder (`guardians_root.rs:756-766`; `guardian_common/src/protocol.rs:115-122`).
+Canonical decoding rejects duplicate and unknown keys through the shared `JsonText`/`parse_canonical_json` decoder (`guardians_root.rs`; `guardian_common/src/protocol.rs`).
 
-Identity is checked end to end before any output exists. Construct `MultisigSignatureCircuit`, derive its fingerprint, locate user `524288` through the Strategy5 registration mapping, and require it to sit at registration 2; require the genesis user's fingerprint, public-key parameter, contract-1 header `[1, 2, 3, 0]` and three member slots to match the supplied account (`guardians_root.rs:206-294`). Compiled network dimensions must equal the local-devnet builder's (`guardians_root.rs:297-325`). Checkpoint 0 is recomputed offline with the node-side `parth_core::pgoldilocks::PoseidonHasher` through `GenesisDatabaseDataBuilder` (`setup_contracts`, `setup_users`, `setup_validators` with `psy_config::PSY_NETWORK_MAGIC`, populated leaf `qfhash`), then converted to the client 32-byte genesis identity (`guardians_root.rs:329-347`).
+Identity is checked end to end before any output exists. Construct `MultisigSignatureCircuit`, derive its fingerprint, locate user `524288` through the Strategy5 registration mapping, and require it to sit at registration 2; require the genesis user's fingerprint, public-key parameter, contract-1 header `[1, 2, 3, 0]` and three member slots to match the supplied account (`guardians_root.rs`). Compiled network dimensions must equal the local-devnet builder's (`guardians_root.rs`). Checkpoint 0 is recomputed offline with the node-side `parth_core::pgoldilocks::PoseidonHasher` through `GenesisDatabaseDataBuilder` (`setup_contracts`, `setup_users`, `setup_validators` with `psy_config::PSY_NETWORK_MAGIC`, populated leaf `qfhash`), then converted to the client 32-byte genesis identity (`guardians_root.rs`).
 
 ### 4.2 Outputs
 
-The guardians-root branch writes exactly four paths under `--guardians-root` and replaces nothing:
+The guardians-root branch does not create authorization databases. Public authorization is the `guardian_authorization` object on `networks[CURRENT_NETWORK]` inside `psy-genesis/config.json`. The fresh helper publishes that object after the three local deployments by rewriting the authorization while preserving the pinned `bridge_relayer_signing_policy` string and keeping every other network. The helper command is `fresh-devnet-state --repo-root <repo-root> --guardians-root <root>`; it takes no policy path. Preflight pins the canonical config device and inode and the exact policy bytes, then revalidates both before reset and before publish (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs:205-247`; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:39-95`; `dev/locSetupV4.ts:4079-4082`).
+
+First fresh startup is policy-only: before the deploy, the checked-in config must contain only the `bridge_relayer_signing_policy` string on the selected network; the remaining six authorization fields may be absent (`guardians_root.rs:186-197`). After the three local deployments, the fresh helper builds the complete seven-field `GuardianAuthorization` from those pinned policy bytes and publishes it once. Runtime is full-authorization: `GuardianDb` opens only against the complete `GuardianAuthorization`, and every sign request binds its `authorization_sha256`, so a partial object or a digest mismatch fails closed (`psy_cli/guardian_common/src/protocol.rs:241-246`; `psy_cli/guardian_common/src/db.rs:111-121`).
 
 ```text
-config.json                      public guardian root (schema below)
-authorization/versions/1.json    canonical GuardianAuthorization, version 1
-authorization/index.json         index { active_version: 1, versions: [{ version: 1, sha256 }] }
-archive/relayer-journal/         empty directory reserved for the relayer journal
+<guardian_root>/db/guardian-1.redb
+<guardian_root>/db/guardian-2.redb
+<guardian_root>/db/guardian-3.redb
+<guardian_root>/db/relayer.redb
 ```
 
-The index hashes the exact written authorization bytes. Files are effective-uid-owned `0600`, directories `0700`, protected ancestors are walked `openat`/`O_NOFOLLOW`, and every file's parent directory is synced. A collision with existing output — including a retained partial output from a failed run — fails closed; a rerun never overwrites it (`guardians_root.rs:569-614,725-746`).
+Those four files are runtime databases, not authorization stores. Guardian files hold `deposit_tree_states`, `guardian_account`, `guardian_session`, `guardian_signed`, `guardian_signer`, `guardian_withdrawal_nonce`, and `included_withdrawal_burns`. The relayer file holds `chain_claims`, `deposit_tree_states`, `finalization_batch`, `guardian_account`, `guardian_withdrawal_nonce`, `included_withdrawal_burns`, and `relayer_request`. They store mutable nonce, signed-request, included-session, per-chain deposit-tree state (`count`, `root`, `frontier`, `anchor`; its `event_block` is the log cursor, not a string prefix), included withdrawal burns, per-chain claim, and shared finalization-batch state and no authorization body. `deposit_tree_states` is keyed by `DepositTreeKey` (`network_magic`, `user_id`, `chain_index`). `included_withdrawal_burns` is keyed by `WithdrawalBurnKey` (`network_magic`, `user_id`, sender, token contract, burn nonce); that key is not an identity. `guardian_withdrawal_nonce` stays the second index. `chain_claims` is keyed by `u8` `chain_index` and holds `pending_claim_withdrawals`, `claim_retry`, and `retired_claim_withdrawals`. `finalization_batch` is the singleton key `()` and holds `pending_finalization_range` (`from_checkpoint`, `to_checkpoint`) and `finalized_chains`. The relayer file does not store `producing_session`, `last_finalized_checkpoint`, or `identity_namespace`. The fresh helper accepts an empty file or exactly that runtime table set, clears tables in place, and never unlinks the files. Directories are mode `0700`. A signed request binds the digest of the current `guardian_authorization`; a digest mismatch fails closed, and an old request is not re-signed under a replacement object (`psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:24-28,340-355`; `psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:211-244,435-492`; `psy_cli/guardian_common/src/db.rs:20-27`).
 
-The embedded network is the typed `NetworkConfigGoldilocks` projection of `<repo-root>/psy-genesis/config.json`, loaded at the compiled stage (not the file's default stage), keeping the configured `prove_proxy_url` and re-materializing `system_prove_proxy_url` even when empty (`guardians_root.rs:413-446`). Proxy bounds and fingerprint checks are in [§4.3](#43-trusted-proxy-config-anchors-and-availability).
+`guardian_authorization` contains only `genesis_hash`, `bridge_relayer_signing_policy`, `multisig_fingerprint`, `endcap_verifier_fingerprint`, `max_fee`, `approved_contracts`, and `chains`. `bridge_relayer_signing_policy` is the guardian two-of-three signing policy for bridge-relayer L2 operations: a `MultisigAccount` with `contract_id` and `initial_policy`. `account_json` and `multisig_account` are not this field and have no serde alias. `ApprovedContract` contains only `contract_id`, `contract_leaf_json`, `methods`, and `withdrawal_layout`. It does not store `artifact_sha256`. Network magic, user id, contract ids, `guta_fee`, `da_fee`, and the account public key are derived from the canonical network and account, not duplicated in authorization. Proof-byte limits stay at `MAX_BODY_BYTES`; the retained EndCap verifier fingerprint is still checked. The compiler JSON stays in the compiler `target` directory and is not loaded by hash at runtime. The approved methods are `set_policy` on contract 1, `set_chain_root` on contract 2, and `append_withdrawal`, `batch_append_withdrawals_2`, `batch_append_withdrawals_5` on contract 3. Contracts 0, 4, and 5 carry an empty method list. The method id and input count come from the compiled definition and must match the ABI.
 
-The serialized schema (`psy_cli/guardian_common/src/protocol.rs:205-226`) is all-required, holds no secret bytes and no database path:
+This field list is the frozen contract, and current source declares exactly this seven-field `GuardianAuthorization` (`psy_cli/guardian_common/src/protocol.rs:195-202`). Runtime acceptance for this cutover is still pending the paused unified test round; source agreement is not a recorded pass.
 
-```rust
-pub struct GuardianConfig {
-    pub network: psy_config::NetworkConfigGoldilocks,
-    pub guardians: BTreeMap<u8, GuardianSignerConfig>,
-    pub client: GuardianClientConfig,
-}
-pub struct GuardianSignerConfig {
-    pub listen_address: SocketAddr,
-    pub signing_key_secret_path: PathBuf,
-    pub signing_key_password_secret_path: PathBuf,
-}
-pub struct GuardianClientConfig {
-    pub endpoints: [String; 3],
-    pub archive_path: PathBuf,
-    pub listen_address: SocketAddr,
-    pub l1_endpoints: Vec<ChainEndpoint>,
-}
-```
+Chain authorization is derived the same way. The deployment chain index must equal the canonical endpoint's chain index, `eth_chainId` must equal the deployed `chainId`, and the deployment block is the greater `receipt.blockNumber` of the Bridge and StateManager proxies. The record carries no code hash and no implementation address. The L1 genesis hash is block 0 from that endpoint.
 
-`guardians` has exactly JSON keys `"1"`, `"2"`, `"3"`; alternate numeric spellings and duplicates fail (`guardian_common/src/runtime.rs:153-162`). The guardians-root branch fixes guardian listeners `127.0.0.1:15441` through `15443`, matching `client.endpoints` HTTP origins in id order, `client.listen_address` `127.0.0.1:15450`, and `archive_path` `archive/relayer-journal` (`guardians_root.rs:61-65,141-145,448-454`). Guardian endpoint validation requires scheme `http`, a host, no credentials, query, fragment, or path; there is no loopback restriction (`guardians_root.rs:481-495`). The L1 endpoint policy is independent: credential-free `https` or loopback `http` (`guardians_root.rs:497-514`).
+`GuardianConfig` is an in-memory value loaded by `GuardianConfig::load(rpc_config, guardian_root)`. It is not a separate serialized file. `build_runtime_config(guardian_id)` derives `<guardian_root>/db/guardian-{id}.redb`; the relayer reads `<guardian_root>/db/relayer.redb` (`psy_cli/guardian_common/src/runtime.rs:160-213`).
 
-The two secret paths per guardian are absolute `<home>/.psy/keystore/guardian-<id>.keystore.json` and `<home>/.psy/keystore/guardian-<id>.password`. The guardians-root branch walks their metadata without following symlinks and never opens the files: each must already exist as an effective-uid regular file in mode `0600` (`guardians_root.rs:472-548`). Guardian-service alone reads their contents.
+The two secret paths per guardian are absolute `<home>/.psy/keystore/guardian-<id>.keystore.json` and `<home>/.psy/keystore/guardian-<id>.password`, returned by the shared `guardian_secret_paths(id)` helper (`guardian_common/src/runtime.rs`) and never serialized. The guardians-root branch walks their metadata without following symlinks and never opens the files: each must already exist as an effective-uid regular file in mode `0600` (`guardians_root.rs`). Guardian-service alone reads their contents.
 
 ### 4.3 Trusted proxy config, anchors, and availability
 
 Provenance: user rulings `trusted_guardian_proxy`, `trusted_guardian_proxy_config`, `trusted_guardian_proxy_anchors`, and `trusted_guardian_proxy_availability` (2026-10-13). Implemented. The earlier design-only and no-separate-pinning statements are withdrawn.
 
-`prove_proxy_url` remains `Vec<String>` on `NetworkConfigGoldilocks` (`client_prover/psy_core/psy_config/src/lib.rs:69`). `load_network_projection` keeps the compiled-stage projection, including that vector (`guardians_root.rs:413-426`). `load_network` accepts 1 to 8 URLs and rejects an empty, blank, or invalid URL (`runtime.rs:239-257`). With a recorded EndCap fingerprint, `WalletSession::new_with_provider` applies the same bound, builds one `ProveProxyRpcProvider` per URL, and refuses the local `PsyUPSStepCircuitManager` fallback (`session.rs:2527-2559`). A construction error fails that startup closed.
+`prove_proxy_url` remains `Vec<String>` on `NetworkConfigGoldilocks` (`client_prover/psy_core/psy_config/src/lib.rs`). `load_network_projection` keeps the compiled-stage projection, including that vector (`guardians_root.rs`). `load_network` accepts 1 to 8 URLs and rejects an empty, blank, or invalid URL (`runtime.rs`). With a recorded EndCap fingerprint, `WalletSession::new_with_provider` applies the same bound, builds one `ProveProxyRpcProvider` per URL, and refuses the local `PsyUPSStepCircuitManager` fallback (`session.rs`). A construction error fails that startup closed.
 
-`GuardianAuthorization.endcap_verifier_fingerprint` is a nonzero `Hash4` (`protocol.rs:184-188`). `validate` rejects zero and checks the recorded `multisig_fingerprint` against the account key (`protocol.rs:434-449`). The account and its required approval use `MULTISIG_POLICY_CONTRACT_ID` (1), the same identity Genesis writes; the former literal 6 is not accepted. `build_authorization` writes both fingerprints (`guardians_root.rs:379-411`). `AuthorizationArchive` and `validate_update` are unchanged: a fingerprint change is a new version, and old versions cannot be replaced (`protocol.rs:472-500`).
+`GuardianAuthorization.endcap_verifier_fingerprint` is a nonzero `Hash4`. `validate` rejects zero and checks the recorded `multisig_fingerprint` against the account. The account and its required approval use `MULTISIG_POLICY_CONTRACT_ID` (1), the same identity Genesis writes; the former literal 6 is not accepted. `build_authorization` writes the retained fingerprints. A fingerprint change replaces the current `guardian_authorization` object; an old signed request is not re-signed under the replacement object.
 
 Enrollment uses the recorded fingerprint. `enroll_guardian_account` calls `register_recorded_multisig_user` and requires the returned fingerprint and account key to match (`service.rs:220-225,272-283`; `memory_wallet.rs:628-640`). It does not construct `MultisigSignatureCircuit`. The unchanged `register_multisig_user` path still builds that circuit (`memory_wallet.rs:612-626`).
 
 The proxy supplies method definitions, fingerprints, and verifier metadata only. It returns neither a guardian signature nor a proof verdict. For every configured manager, startup and `verify_session` call `ups_end_cap_circuit_verifier_config`, fingerprint the returned `VerifierOnly` data with `get_circuit_fingerprint_generic`, and require `endcap_verifier_fingerprint` (`session.rs:2560-2566`; `verify.rs:464-490`). A mismatch fails closed. EndCap proof verification and checkpoint, state, policy, nonce, trace, signing, and journal checks stay local.
 
-Negative checks: there is no pin file, proxy-signature approval, or guardian local-proving fallback. The guardians-root branch does not clear `prove_proxy_url`. Guardian enrollment does not construct `MultisigSignatureCircuit`. Old authorization versions are not rewritten.
+Negative checks: there is no pin file, proxy-signature approval, or guardian local-proving fallback. The guardians-root branch does not clear `prove_proxy_url`. Guardian enrollment does not construct `MultisigSignatureCircuit`.
 
 Implemented in `psy_cli/guardian_common/src/protocol.rs`, `psy_cli/guardian_common/src/runtime.rs`, `psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs`, `psy_cli/psy_relayer_cli/src/guardian/service.rs`, `psy_cli/psy_relayer_cli/src/guardian/verify.rs`, `client_prover/psy_prover/src/session/session.rs`, and `client_prover/psy_prover/src/wallet/memory_wallet.rs`.
 
 ### 4.4 Validation status
 
-Release build of `psy_relayer_cli` and `psy_dev_cli` completed. Recorded release results:
+The counts below are historical results for the old proxy revision and the old authorization shape. They are not acceptance of `bridge_relayer_signing_policy` and do not verify the current authorization contract at runtime:
 
 ```text
 cargo test -p guardian_common --release --lib
@@ -236,7 +214,7 @@ cd dev && bun test locSetupV4.test.ts
 97 passed
 ```
 
-The running release stack enabled the new proxy path. All four HTTP checks returned 200: guardians 1, 2, and 3, then the relayer. Guardians started together at 10:32:23 UTC and were ready before the relayer's first log at 10:35:39 UTC, about 195 seconds. That interval is not a one-minute result, and the contradictory 95 ms bound is rejected. After ready, guardian RSS was 1,428,784 / 1,400,296 / 1,400,032 KiB, with peaks 1,832,112 / 1,855,628 / 1,851,436 KiB and swap 0. The prior local-construction baseline was 15,688,444 / 16,442,988 / 16,084,444 KiB.
+The recorded release stack enabled the old proxy path. All four HTTP checks returned 200: guardians 1, 2, and 3, then the relayer. Guardians started together at 10:32:23 UTC and were ready before the relayer's first log at 10:35:39 UTC, about 195 seconds. That interval is not a one-minute result, and the contradictory 95 ms bound is rejected. After ready, guardian RSS was 1,428,784 / 1,400,296 / 1,400,032 KiB, with peaks 1,832,112 / 1,855,628 / 1,851,436 KiB and swap 0. The prior local-construction baseline was 15,688,444 / 16,442,988 / 16,084,444 KiB. These measurements belong to that old revision.
 
 First-signature timing, quorum, and whole-flow E2E are NOT VERIFIED. `psy_cli/psy_relayer_cli/tests/guardian_acceptance.rs` remains ignored. Separately, Envio discovery of the existing deposit failed, so the funds flow has not reached guardian signing. Envio schema reset remains unapproved and was not run. Rotation approval remains an unresolved finding, not a guardians-root requirement.
 
@@ -255,14 +233,14 @@ First-signature timing, quorum, and whole-flow E2E are NOT VERIFIED. `psy_cli/ps
 | Failure | Response |
 |---|---|
 | `make generate-genesis-data` fails | Do not ship the partial `genesis.json`; fix the generator input and rerun |
-| Missing `PSY_RELAYER_MULTISIG_ACCOUNT` or `PSY_MULTISIG_POLICY_ARTIFACT`, or an invalid public account/artifact | Fail closed. Supply both readable public files; do not fall back to a keystore, plaintext key, or `deterministic_private_key(2)`. |
-| Relayer cannot authorize user `524288` | Registration 2 was not initialized from the approved public account and policy artifact. Regenerate Genesis from those inputs on a new chain; do not paste a plaintext key into daemon config. |
+| Missing canonical `bridge_relayer_signing_policy`, a missing sibling compiler artifact, or an invalid public account | Fail closed before destruction. Put the public policy in the selected network of `psy-genesis/config.json` and supply the compiler checkout; do not fall back to a keystore, a plaintext key, or `deterministic_private_key(2)`. There is no `PSY_RELAYER_MULTISIG_ACCOUNT` or `PSY_MULTISIG_POLICY_ARTIFACT`. |
+| Relayer cannot authorize user `524288` | Registration 2 was not initialized from the selected `bridge_relayer_signing_policy` and the sibling compiler artifact. There is no policy-file flag. Regenerate Genesis from those inputs on a new chain; do not paste a plaintext key into daemon config. |
 | `validators` entries differ from the selected runtime membership | Core startup injects the selected ordered validators; component-only startup does not rewrite them. Diagnose configuration drift before the next authorized core startup. |
 | Provenance mismatch in `psy-genesis` stamp | Rebuild `make gen-deploy-json` from the committed clean compiler revision after its node pin and lockfile are final; never hand-edit provenance JSON |
 | `private_keys.json` leaked | Treat as secret compromise; rotate and remove from every distribution channel |
 | Guardians-root flag without `--guardians-root`, or a missing guardians-root flag with it | Fail closed (`guardians_root.rs:167-188`). Run the flag sets as disjoint branches. |
 | Guardians-root output collision or retained partial output | The rerun refuses to overwrite; resolve the retained output manually after review (`guardians_root.rs:725-732`). |
-| `guardian-service` meets an empty journal file | `JournalUnavailable`; the operator handles the file manually — the service never deletes or reinitializes it (`service.rs:245-261`). |
+| `guardian-service` meets an empty database file | `DatabaseUnavailable`. Opening the raw empty file fails closed. The service does not delete or reinitialize it, and this is not a journal error (`psy_cli/guardian_common/src/db.rs:164`; `psy_cli/psy_relayer_cli/src/guardian/service.rs:310-315`). |
 
 ## Security Considerations
 

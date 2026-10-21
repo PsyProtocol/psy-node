@@ -54,7 +54,7 @@ The coordinator is the authority. Realms sync the checkpoint tree down and submi
 
 ## 2. ProcessorState
 
-`psy_node_common/src/utils/processor_status.rs:8-77`:
+`psy_node_common/src/utils/processor_status.rs:8-76`:
 
 ```text
 Starting = 0, Running = 1, Error = 2, Stopping = 3, Stopped = 4
@@ -104,10 +104,10 @@ Part-1 and CST reward layouts are in [Reward Tree Circuit Layouts](reward-tree-c
 
 ## 4. Realm `process_block`
 
-Entry: `realm/processor/core/process_block.rs:348`.
+Entry: `realm/processor/core/process_block.rs:422`.
 
-1. Sanity check, then `get_results_from_gatherers` (`:169`): `set_new_unique_ids`, finalize the EndCap gatherer.
-2. If there is no root job, synchronize metadata only through `last_committed_checkpoint_id` and return without mutating `processing_realm_end_root`.
+1. Sanity check, then `get_results_from_gatherers` (`:175`): `set_new_unique_ids(Option<N::QHash>)` at `realm/processor/db/commit.rs:154` rotates ids; it does not publish a gathering generation. Then finalize the EndCap gatherer.
+2. If there is no root job, synchronize metadata only through `last_committed_checkpoint_id` and return without mutating `processing_realm_end_root` (`:447-467`). This is not an early return before gatherer results.
 3. If P2P rotation is enabled and the finalized proof base does not schedule this sub-ID for `T = base + 1`, fail closed without syncing after the gatherer tree commit.
 4. Record `processing_realm_end_root`, publish GUTA jobs, and retrieve the root proof.
 5. Submit circuit 63, the finalizer binding, Proposal, and Certificate through `rc_submit_guta_proof`.
@@ -136,7 +136,7 @@ A crash after the mapping and before the marker is `NeedsRecovery`. Recovery reb
 
 ### Realm
 
-`realm/processor/db/commit.rs:218`.
+`realm/processor/db/commit.rs:227`.
 
 1. Bidirectional pending-id mappings first. `commit_state` is the sole writer of the commit mapping.
 2. Global-user and reward top proofs.
@@ -155,7 +155,7 @@ Realm sync entry points (`realm/processor/db/sync.rs`):
 
 | Function | Writes DB? | When |
 |---|---|---|
-| `sync_with_coordinator` | no (memory checkpoint tree only) | top of each `process_block` via `sync_and_verify` |
+| `sync_with_coordinator` | yes: after the memory checkpoint-tree sync it calls `persist_checkpoint_metadata_range` (`sync.rs:242-248`, function at `:463`); it does not advance the committed marker | top of each `process_block` via `sync_and_verify` |
 | `commit_state` | yes, one checkpoint | after coordinator inclusion |
 | `sync_to_coordinator_checkpoint_id` | metadata through the supplied checkpoint | only when its Realm root is already locally applied; no newer-tip marker advance |
 | `sync_to_coordinator_set_checkpoint_id` | same guarded metadata path, bounded to a fetched tip | startup and retryable-rejection synchronization |

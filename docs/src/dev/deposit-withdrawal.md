@@ -84,7 +84,7 @@ preventing unauthorized claims.
 
 The depositor calls `Router.deposit(token, amount, shieldAddress, noteCommitment)` on L1.
 
-`psy_user_cli deposit` and `claim-withdrawal` accept the L1 signer through `L1_PRIVATE_KEY` or the existing `--private-key` argument. `L1_PRIVATE_KEY` is distinct from the L2 `PRIVATE_KEY`, and command help does not display its value.
+`psy_user_cli deposit` and `claim-withdrawal` accept the L1 signer through `L1_PRIVATE_KEY` or the argv `--private-key` flag. The executable runbook uses only `L1_PRIVATE_KEY` and does not pass `--private-key`. `L1_PRIVATE_KEY` is distinct from the L2 `PRIVATE_KEY`, and command help does not display its value.
 
 - The Router delegates to the appropriate Gateway (ERC20 or ETH).
 - The Gateway calls `Bridge.recordDepositFromGateway()` which computes the deposit leaf hash and stores it.
@@ -122,7 +122,7 @@ GET /api/v1/bridge/deposit-claim-proof
     ?deposit_index=<index>
     &source_chain_index=<chain_index>
     &proved_deposit_count=<provedDepositCount>
-    [&tree_count=<snapshotCount>]
+    [&snapshot_deposit_count=<snapshotCount>]
 ```
 
 The response contains:
@@ -132,7 +132,7 @@ The response contains:
 - `siblings`: Merkle path
 - `deposit`: deposit payload (shield_address, token, amount, etc.)
 - `chain_local_deposit_index` / `deposit_index`
-- `proved_deposit_count` / `tree_count`: the snapshot count this proof was built against
+- `proved_deposit_count`: the L1 proved count reported with the proof; `snapshot_deposit_count` (legacy alias `tree_count`): the snapshot count this proof was built against
 
 ### Step 5: Generate Deposit Inclusion ZK Proof
 
@@ -173,7 +173,7 @@ isClaimed = query L2 IMT for claimKey in token contract
 | `ERC20InsufficientAllowance` | ERC20Gateway not approved | Approve the Gateway, not just the Router |
 | `proof not ready` | Relayer has not yet proven the deposit | Wait for `provedDepositCount` to advance |
 | `shield_address mismatch` | r0/r1 or user_id inconsistent with deposit | Ensure the same user_id and r0/r1 are used |
-| `nullifier already claimed` | Deposit was already claimed | Check `isDepositClaimed()` before attempting |
+| `nullifier already claimed` | Deposit was already claimed | Query `GET /api/v1/get/bridge/deposits` for the deposit identity and require `claimed: true` before retrying |
 | `stale trace anchor` | Checkpoint advanced during proving | Regenerate trace with fresh anchor |
 
 ## 4. Withdrawal Flow (L2→L1)
@@ -213,7 +213,16 @@ Once the withdrawal is finalized, psy-services provides a claim proof:
 
 ```text
 GET /api/v1/bridge/withdrawal-claim-proof
+    ?recipient=<l1_recipient_address>
+    &token_address=<l1_token_address>
+    &amount=<amount>
+    &nonce=<withdrawal_nonce>
+    &destination_chain_index=<bridge_chain_index>
+    [&sender_user_id=<user_id>]
+    [&scan_limit=<limit>]
 ```
+
+`recipient`, `token_address`, `amount`, `nonce`, and `destination_chain_index` are all required; omitting any returns 400. `destination_chain_index` is the Bridge chain index, not the EVM chain ID.
 
 The response contains:
 - `found`: boolean

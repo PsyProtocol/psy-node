@@ -33,21 +33,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run one independently verifying guardian signer from the public root config.
+    /// Run one independently verifying guardian signer from the canonical network config.
     GuardianService {
         #[arg(long)]
-        config: PathBuf,
+        rpc_config: PathBuf,
+        #[arg(long)]
+        guardian_root: PathBuf,
         #[arg(long)]
         guardian_id: u8,
-        #[arg(long)]
-        db_path: PathBuf,
     },
     /// Register, bootstrap, or replace the bridge multisig policy.
     GuardianPolicy {
         #[arg(long)]
         rpc_config: String,
         #[arg(long)]
-        guardian_config: String,
+        guardian_root: String,
         /// Distinguishes register, bootstrap, and replace; circuit bootstrap remains a separate path.
         #[arg(long)]
         intent: GuardianPolicyIntent,
@@ -188,19 +188,19 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => run_bridge_daemon(cli.config).await,
-        Some(Commands::GuardianService { config, guardian_id, db_path }) => guardian::service::run(&config, guardian_id, &db_path).await.map_err(Into::into),
-        Some(Commands::GuardianPolicy { rpc_config, guardian_config, intent, exclusive_registration_intake, next_members_json }) => match intent {
+        Some(Commands::GuardianService { rpc_config, guardian_root, guardian_id }) => guardian::service::run(&rpc_config, &guardian_root, guardian_id).await.map_err(Into::into),
+        Some(Commands::GuardianPolicy { rpc_config, guardian_root, intent, exclusive_registration_intake, next_members_json }) => match intent {
             GuardianPolicyIntent::Register => {
                 if next_members_json.is_some() {
                     anyhow::bail!("guardian-policy register does not accept --next-members-json");
                 }
-                bridge::daemon::run_guardian_register(&rpc_config, &guardian_config, exclusive_registration_intake).await
+                bridge::daemon::run_guardian_register(&rpc_config, &guardian_root, exclusive_registration_intake).await
             }
             GuardianPolicyIntent::Bootstrap => {
                 if !exclusive_registration_intake || next_members_json.is_some() {
                     anyhow::bail!("guardian-policy bootstrap requires exclusive intake and derives members from authorization");
                 }
-                bridge::daemon::run_guardian_bootstrap(&rpc_config, &guardian_config).await
+                bridge::daemon::run_guardian_bootstrap(&rpc_config, &guardian_root).await
             }
             GuardianPolicyIntent::Replace => {
                 if exclusive_registration_intake {
@@ -208,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let members_json = next_members_json.ok_or_else(|| anyhow::anyhow!("guardian-policy replace requires --next-members-json"))?;
                 let members = guardian_common::protocol::parse_canonical_json::<[guardian_common::protocol::Hash4; 3]>(members_json.as_bytes())?;
-                bridge::daemon::run_guardian_replace_policy(&rpc_config, &guardian_config, members).await
+                bridge::daemon::run_guardian_replace_policy(&rpc_config, &guardian_root, members).await
             }
         },
         Some(Commands::Initialize { keystore_dir }) => {

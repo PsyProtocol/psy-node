@@ -6,11 +6,11 @@
 
 ## Overview
 
-This runbook is the release procedure for EndCap verifier metadata generated and completely validated only with `PSY_NETWORK=localhost`, Plonky2 caches, real peer-to-peer transaction acceptance, cross-repository delivery, and the three independent Bridge Groth16 cohorts. `config_gen_v2` is hardcoded to local-devnet constants, while every network enum arm currently reads one shared verifier JSON. Replacing that JSON is therefore a global runtime verifier mutation generated and validated only against localhost; non-local operation must fail closed until source implements and validates distinct per-network verifier metadata selection. Bridge publication is a separate, explicitly authorized operation: package offline, hash the nine uncompressed files in a version-1 manifest, upload objects first, read them back and validate them, then upload the manifest last.
+This runbook is the release procedure for EndCap verifier metadata generated and completely validated only with `PSY_NETWORK=localhost`, Plonky2 caches, real peer-to-peer transaction acceptance, cross-repository delivery, and the four independent Bridge Groth16 cohorts. `config_gen_v2` is hardcoded to local-devnet constants, while every network enum arm currently reads one shared verifier JSON. Replacing that JSON is therefore a global runtime verifier mutation generated and validated only against localhost; non-local operation must fail closed until source implements and validates distinct per-network verifier metadata selection. Bridge publication is a separate, explicitly authorized operation: package offline, hash the twelve uncompressed files and four full compressed objects in a sixteen-entry version-1 manifest, upload the two single objects and required parts first, read them back and validate them, then upload the manifest last.
 
 ## Background
 
-Circuit metadata forms a dependency cascade, but not every circuit-related change triggers every generator. EndCap verifier JSON and its four-limb fingerprint must come from one real circuit construction. Cache generation must not enter the Groth16 path. Genesis data and the embedded wallet circuit bundle have narrower independent triggers. Bridge aggregation, deposit append, and withdrawal claim each own a separate trusted-setup cohort. Finally, compilation success or HTTP admission alone does not prove the real peer-to-peer path: acceptance requires one real `psy_user_cli call`, a forwarded EndCap through one pinned edge, proposal voting and certification, Coordinator admission, proposer commit, non-proposer fast-forward synchronization, and equal roots.
+Circuit metadata forms a dependency cascade, but not every circuit-related change triggers every generator. EndCap verifier JSON and its four-limb fingerprint must come from one real circuit construction. Cache generation must not enter the Groth16 path. Genesis data and the embedded wallet circuit bundle have narrower independent triggers. Bridge aggregation, deposit append, withdrawal claim, and reward claim each own a separate trusted-setup cohort. Finally, compilation success or HTTP admission alone does not prove the real peer-to-peer path: acceptance requires one real `psy_user_cli call`, a forwarded EndCap through one pinned edge, proposal voting and certification, Coordinator admission, proposer commit, non-proposer fast-forward synchronization, and equal roots.
 
 ## Table of Contents
 
@@ -57,7 +57,7 @@ Circuit metadata forms a dependency cascade, but not every circuit-related chang
 
 1. Run node commands from `<repo-root>`, sibling commands from `<workspace>/<repo>`, local keystore commands against `<home>/.psy/keystore`, and disposable operations under `<tmp>`. Repository documentation must not contain workstation paths.
 2. Current Audit source is the governing reference. Relevant release policy and repository topology are at `AGENTS.md:75-93,95-137`.
-3. The complete metadata generation and validation procedure exists only for `PSY_NETWORK=localhost`. The metadata CLI prints the compiled `CURRENT_NETWORK`, `PSY_NETWORK_MAGIC`, fingerprint, exact `[u64; 4]`, and verifier JSON (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:12-30`). The fingerprint constant is localhost-specific, but the checked-in real verifier JSON is shared by every network selector arm.
+3. The complete metadata generation and validation procedure exists only for `PSY_NETWORK=localhost`. The metadata CLI prints the compiled `CURRENT_NETWORK`, `PSY_NETWORK_MAGIC`, display fingerprint, exact `[u64; 4]`, verifier JSON, and the separate `zk_fingerprint` and `secp_fingerprint` lines (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:26-35`). The EndCap fingerprint constant is localhost-specific, but the checked-in real verifier JSON is shared by every network selector arm.
 4. Replacing `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` changes runtime verifier input for all eight networks, even though current generation and cache validation cover only LocalDevnet. `config_gen_v2` explicitly loads `PsyChainNetworkType::LocalDevnet` and instantiates `PsyNetworkLocalDevnetConstants` (`psy_plonky2_circuits/examples/config_gen_v2.rs:93-102,448-449`), while the verifier selector maps every network enum arm to the same JSON constant (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-40`). Block all non-local use of the changed blob until a reviewed implementation selects and validates distinct per-network verifier metadata throughout the CLI, cache generator, checked-in verifier data, and network constants.
 5. Generation, repository delivery, artifact upload, package publication, contract deployment, and Git push are separate actions. Authorization for one does not authorize another (`AGENTS.md:59-70`).
 
@@ -197,22 +197,25 @@ cargo run --release -p psy_user_cli --no-default-features -- \
   get-user-end-cap-common-data
 ```
 
-Require these four output records from the same successful invocation:
+Require these records from the same successful invocation. The EndCap promotion set is network, magic, `endcap_fingerprint_u64x4`, and `alt_verify_data`. The same invocation also prints `endcap_fingerprint`, `zk_fingerprint`, and `secp_fingerprint`; those three are not EndCap verifier metadata:
 
 ```text
 psy_network: localhost
 psy_network_magic: 0x...
+endcap_fingerprint: <display fingerprint>
 endcap_fingerprint_u64x4: [limb0, limb1, limb2, limb3]
 alt_verify_data: {complete JSON object}
+zk_fingerprint: <display fingerprint>
+secp_fingerprint: <display fingerprint>
 ```
 
-The command constructs `PsyUPSStepCircuitManager` with the compiled network magic and converts its real verifier-only data (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:12-24`).
+The command constructs `PsyUPSStepCircuitManager` with the compiled network magic and converts its real verifier-only data (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:16-35`). Copy only `alt_verify_data` and `endcap_fingerprint_u64x4` into the EndCap artifacts. Do not promote `zk_fingerprint` or `secp_fingerprint` as EndCap metadata.
 
 ### 4.3 Promote atomically
 
 1. Require `psy_network: localhost`. Parse the printed magic and `networks.localhost.magic` in `<repo-root>/psy-genesis/config.json` as hexadecimal integers and require equality (`psy-genesis/config.json:3-5`). The CLI prints lowercase hex while the configuration may use uppercase; case-sensitive string comparison is invalid. A numeric mismatch is a hard failure.
 2. Copy the complete value after `alt_verify_data:` verbatim into `END_CAP_ALT_VERIFIER_DATA_SERIALIZED` at `psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:27`. This single blob is returned for all network selector arms, so the edit has global runtime scope even though its generation and validation evidence is localhost-only.
-3. Copy the printed `endcap_fingerprint_u64x4` limbs verbatim, in printed order, into the localhost `END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4`. Do not convert from the display fingerprint and do not reorder, reinterpret, or recalculate limbs. The CLI obtains the four canonical limbs directly from the fingerprint elements (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:19-24`).
+3. Copy the printed `endcap_fingerprint_u64x4` limbs verbatim, in printed order, into the localhost `END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4`. Do not convert from the display fingerprint and do not reorder, reinterpret, or recalculate limbs. The CLI obtains the four canonical limbs directly from the fingerprint elements (`client_prover/psy_cli/psy_user_cli/src/subcommand/get_user_endcap_common_data.rs:19-29`).
 4. Do not copy the dummy verifier constant at `psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:5-25`.
 5. Do not update a non-local network fingerprint constant from localhost output. Current one-JSON-for-all-networks source is not evidence that the new shared verifier is valid for another network (`psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs:29-40`).
 6. Treat the shared verifier JSON, localhost `[u64; 4]`, and both generated caches as one atomic rollback unit. A partial update is invalid.
@@ -280,10 +283,10 @@ EndCap metadata, GUTA, cache, verifier JSON, network fingerprint, ordinary circu
 When triggered, the current target is:
 
 ```bash
-PSY_RELAYER_MULTISIG_ACCOUNT='<public-multisig-account-json>' PSY_MULTISIG_POLICY_ARTIFACT='<approved-policy-compiler-artifact-json>' make generate-genesis-data
+make generate-genesis-data
 ```
 
-It runs `./target/release/psy_dev_cli generate-genesis-data` with required `--relayer-multisig-account` and `--multisig-policy-artifact` public file paths (`Makefile:139-144`). Registration 2 is derived from the initial two-of-three public account and actual multisig circuit fingerprint, with contract-1 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet entries retain their existing keys and positions. The generator does not write `faucet_operators.json` beside Genesis. See [devnet-launcher-reference.md](devnet-launcher-reference.md) for the launcher's public input and child-environment behavior.
+Preconfigure `networks.<selected-network>.guardian_authorization.bridge_relayer_signing_policy` in `psy-genesis/config.json`, then run the command with no account environment variable and no account flag. The target runs `psy_dev_cli generate-genesis-data --repo-root` (`Makefile:141-142`). There is no `PSY_RELAYER_MULTISIG_ACCOUNT` variable, no `PSY_MULTISIG_POLICY_ARTIFACT` variable, and no `--multisig-policy-artifact` flag. Registration 2 is derived from that selected signing policy and the actual multisig circuit fingerprint, with contract-1 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet entries retain their existing keys and positions. The generator does not write `faucet_operators.json` beside Genesis. See [devnet-launcher-reference.md](devnet-launcher-reference.md) for the launcher's public input and child-environment behavior.
 
 ### 6.2 Embedded wallet circuit trigger
 
@@ -306,7 +309,7 @@ sequenceDiagram
     participant Proposer
     participant NonProposer
     participant Coordinator
-    UserCLI->>PinnedEdge: 1. Real simple_mint call and EndCap
+    UserCLI->>PinnedEdge: 1. Real contract call and EndCap
     PinnedEdge->>Proposer: 2. Forward EndCap over P2P
     Proposer->>Proposer: 3. Accept and publish Proposal
     NonProposer->>Proposer: 4. Publish verified Vote
@@ -334,21 +337,26 @@ The resulting fragment must be exactly one of:
 
 ### 7.3 Real transaction command
 
-Run one serial transaction through that config:
+Preconditions, in order, before this acceptance call:
+
+1. Genesis user 0 has called contract 5 `faucet(1, 1)`. The faucet defers contract 0 `transfer` as method id `2789897329` with inputs `[1, 1]` (`../psy-compiler/psy-precompiles/faucet/src/main.psy:45-46`).
+2. User 1 has included contract 0 `claim` with input `[0]`, so the deferred amount `1` is on user 1's spendable balance (`../psy-compiler/psy-precompiles/token/src/main.psy:461`).
+3. User 1 still holds at least amount `1` after fees. Do not invent a larger balance.
+
+Then run one serial acceptance transaction through the pinned config. The method is the current contract-0 `transfer(recipient, amount)` (`../psy-compiler/psy-precompiles/token/src/main.psy:430`). Recipient `0` and amount `1` are the funded sample. Do not pass a private key on argv. Export `PRIVATE_KEY` in the operator environment; `WalletSessionArgs.private_key` reads that variable (`client_prover/psy_core/psy_common/src/args.rs:95-96`):
 
 ```bash
 <repo-root>/target/release/psy_user_cli call \
   --rpc-config <tmp>/p2p-e2e.json \
-  --private-key "$USER_PRIVATE_KEY" \
   --contract-id 0 \
-  --method-name simple_mint \
-  --inputs '[1000000000000]' \
+  --method-name transfer \
+  --inputs '[0,1]' \
   --wait-until-confirmation
 ```
 
 `WalletSessionArgs` defines repeated contract, method, and JSON input arguments plus `--wait-until-confirmation` (`client_prover/psy_core/psy_common/src/args.rs:114-171`). The command waits for EndCap inclusion and logs `endcap submitted` followed by `endcap included` (`client_prover/psy_cli/psy_user_cli/src/subcommand/submit_end_cap_proof.rs:150-181`).
 
-Plain `psy_user_cli deposit` is excluded: it calls the layer-one Router and is not an L2 EndCap producer (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1-15,183-184`). Real EndCap-producing paths include `call`, `withdraw`, and `claim-deposit`; `withdraw` builds an L2 contract call and waits for EndCap inclusion (`client_prover/psy_cli/psy_user_cli/src/subcommand/withdraw.rs:115-161`), while `claim-deposit` builds the L2 `claim_deposit` call (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_deposit.rs:493-556`).
+Do not use `mint` as the canonical acceptance transaction: bridge operations state that mint is not a funding path. Plain `psy_user_cli deposit` is also excluded: it calls the layer-one Router and is not an L2 EndCap producer (`client_prover/psy_cli/psy_user_cli/src/subcommand/deposit.rs:1-15,183-184`). Real EndCap-producing paths include `call`, `withdraw`, and `claim-deposit`; `withdraw` builds an L2 contract call and waits for EndCap inclusion (`client_prover/psy_cli/psy_user_cli/src/subcommand/withdraw.rs:115-161`), while `claim-deposit` builds the L2 `claim_deposit` call (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_deposit.rs:493-556`).
 
 ### 7.4 Required log and RPC assertions
 
@@ -364,9 +372,9 @@ Capture one coherent transaction chain. Require:
 | HTTP submit | Proposer processor | `Submitting GUTA proof to Coordinator proposal=` |
 | Coordinator admission | Coordinator edge | `realm P2P certificate admitted realm=0` |
 | Proposer commit | Proposer processor | `Committed new realm block with checkpoint_id` |
-| Non-proposer FFS | Non-proposer processor | `Applied Realm proposal FFS` |
+| Non-proposer FFS | Non-proposer processor | `Applied proposal FFS checkpoint_id=` |
 
-Require the same 64-hex `end_cap_id` in forward and accept. Require the same 64-hex `proposal` identifier in proposal, vote, certificate, submit, and admission. Then correlate proposer commit and non-proposer FFS by the admitted inclusion checkpoint and resulting realm root; those two logs do not contain the proposal identifier. Require the certificate to show both validator signers or equivalent evidence with at least two verified votes. Source ownership for these needles includes `psy_node_common/src/realm/network/drive.rs` (`realm P2P vote published proposal=`), `psy_node_common/src/realm/edge/handler.rs` (EndCap forward/accept), `psy_node_common/src/realm/processor/core/process_block.rs` (proposal/certificate/commit), `psy_cli/psy_node_cli/src/node/realm_p2p.rs`, and `psy_node_common/src/coordinator/edge/handler.rs` (certificate admission).
+Require the same 64-hex `end_cap_id` in forward and accept. Require the same 64-hex `proposal` identifier in proposal, vote, certificate, submit, and admission. Then correlate proposer commit and non-proposer FFS by the admitted inclusion checkpoint and resulting realm root; those two logs do not contain the proposal identifier. Do not accept `Applied Realm gatherer FastForward`: that string is the gatherer path, not proposal FFS. Require the certificate to show both validator signers or equivalent evidence with at least two verified votes. Source ownership for these needles includes `psy_node_common/src/realm/network/drive.rs` (`realm P2P vote published proposal=`), `psy_node_common/src/realm/edge/handler.rs` (EndCap forward/accept), `psy_node_common/src/realm/processor/core/process_block.rs:397-401,673-675` (FFS and commit), `psy_cli/psy_node_cli/src/node/realm_p2p.rs`, and `psy_node_common/src/coordinator/edge/handler.rs` (certificate admission).
 
 After inclusion, query `psy_get_checkpoint_global_state_roots` for the included checkpoint from Coordinator RPC and both realm-0 edge RPC endpoints. Require identical complete results across all three endpoints. Also require equal latest checkpoint identifiers on both realm edges. The RPC surfaces are defined in `psy_api_core/src/coordinator/standard_edge_rpc.rs:46-50,78-79` and `psy_api_core/src/realm/standard_edge_rpc.rs:78-82,128-133`.
 
@@ -430,14 +438,15 @@ SDK WASM bindings are generated, not copied. From `../psy-sdk/psy-ts-sdk/package
 
 npm publication is separate from source publication and from consumer lockfile updates. A new package needs an unused version and its own authorization. DApp or Wallet may move to an existing compatible registry version without that new publication. `publish:psy-sdk`, `publish:utils`, `publish:contract-sdk`, and `publish:all` bump before publishing, so do not use them after `version:patch:*`.
 
-R2 publication has two paths. A prefix whose manifest and all nine files already passed validation is reused; do not upload it again. A separately authorized new cohort needs a fresh `localhost-<digest>` prefix. Before its first upload, require HTTP 404 for all six object names:
+R2 publication has two paths. A prefix whose sixteen-entry manifest, four compressed assemblies and twelve uncompressed files already passed validation is reused; do not upload it again. A separately authorized new cohort needs a fresh `localhost-<digest>` prefix. After Sections 10.2-10.4, before its first upload, require HTTP 404 for every actual data object key plus the manifest. The current cohort has fourteen data objects: two single objects and twelve parts (`.part-00` through `.part-02` for each of four large objects). Do not probe the nonexistent whole large-object keys instead of their parts:
 
 ```bash
 set -euo pipefail
 export PSY_KEYSTORE_R2_PREFIX='localhost-<digest>'
 export ARTIFACT_URL="https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev/$PSY_KEYSTORE_R2_PREFIX"
-for object in circuit_groth16.bin.zst pk_groth16.bin.zst vk_groth16.bin.zst \
-  deposit_append.tar.zst withdrawal_claim.tar.zst sha256sums.json; do
+for file in "$PACKAGE_DIR/circuit_groth16.bin.zst" "$PACKAGE_DIR/vk_groth16.bin.zst" \
+  "$PACKAGE_DIR/"*.part-* "$PACKAGE_DIR/sha256sums.json"; do
+  object=${file##*/}
   code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$ARTIFACT_URL/$object")
   test "$code" = 404
 done
@@ -482,7 +491,7 @@ export KEYSTORE_DIR=<home>/.psy/keystore
 | Bridge aggregation and deposit | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-withdrawal-claim --skip-reward-claim` | `make export-solidity-verifier && make export-solidity-verifier-deposit` |
 | Bridge aggregation and withdrawal | `<repo-root>/target/release/psy_relayer_cli regenerate-groth16-keystore --keystore-dir <home>/.psy/keystore --skip-deposit-append --skip-reward-claim` | `make export-solidity-verifier && make export-solidity-verifier-withdrawal` |
 
-`make regen-groth16-keystore` passes no cohort flags, so the CLI regenerates all four cohorts. `make regen-bridge-agg-keystore` remains bridge-only by passing `--skip-deposit-append --skip-withdrawal-claim --skip-reward-claim`. `make export-all-solidity-verifier` exports all four verifiers into the nested `./psy-contracts/src/` checkout. The Make targets and exact verifier destinations are at `Makefile:163-182`. After generation, require every selected file to exist and be nonempty. The generator itself requires existence (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:777-783`).
+`make regen-groth16-keystore` passes no cohort flags, so the CLI regenerates all four cohorts. `make regen-bridge-agg-keystore` remains bridge-only by passing `--skip-deposit-append --skip-withdrawal-claim --skip-reward-claim`. `make export-all-solidity-verifier` exports all four verifiers into the nested `./psy-contracts/src/` checkout. The Make targets and exact verifier destinations are at `Makefile:162-181`. After generation, require every selected file to exist and be nonempty. The generator itself requires existence (`psy_cli/psy_relayer_cli/src/bridge/regen_groth16_keystore.rs:777-783`).
 
 For isolated reward generation, use the reward-only command above with `--keystore-dir <isolated-keystore-root>`, then run `<repo-root>/target/release/psy_relayer_cli export-solidity-verifier <isolated-keystore-root>/reward_claim <isolated-contracts-checkout>/src/RewardClaimVerifier.sol`. Do not use a Make target pointing at the active keystore during that run. Before freezing, record measured circuit/proving-key/verifying-key sizes, portable wrapper and Groth16 proving time/peak memory, and cold preload time/peak memory. A smaller public commitment is not evidence of a particular setup size or completed verification.
 
@@ -492,200 +501,85 @@ The ignored Rust test `two_and_three_real_roots_aggregate_canonical_ids_and_wrap
 
 ### 10.1 Package layout
 
-The publication cohort is exactly five compressed objects plus one manifest:
+`scripts/trust-setup.py` is the official packager, validator and publisher. Run from the repository root with Python 3.9+ and installed `zstd` and `tar`; publication additionally needs `curl` and the official installed `wrangler`. No dependencies are installed.
 
-```text
-circuit_groth16.bin.zst
-pk_groth16.bin.zst
-vk_groth16.bin.zst
-deposit_append.tar.zst
-withdrawal_claim.tar.zst
-sha256sums.json
-```
+The source has three files (`circuit_groth16.bin`, `pk_groth16.bin`, `vk_groth16.bin`) in each of four cohorts: the keystore root, `deposit_append/`, `withdrawal_claim/`, and `reward_claim/`. Other keystore files, wallet JSON and credentials are not packaged.
 
-The three root files are compressed separately. Each child archive contains its top-level directory and exactly three files. This matches the current downloader groups (`dev/locSetupV4.ts:2555-2579`).
+The local package retains six full compressed objects: the three root files with `.zst` appended and `deposit_append.tar.zst`, `withdrawal_claim.tar.zst`, `reward_claim.tar.zst`. Each archive contains exactly its three regular files under the cohort directory, without a separate directory entry. The package also contains `sha256sums.json` and publication parts. Only root circuit/vk objects are published whole. Root pk and all three archives are split into 268435456-byte parts, named `<object>.part-NN` from `00`; the last part contains the remainder. Counts are computed from compressed sizes, never hard-coded. The current published cohort has fourteen data objects (two singles and twelve parts), plus the manifest.
 
 ### 10.2 Offline packaging command
 
-Run without network access:
+Set `KEYSTORE_DIR` to the existing source keystore and `PACKAGE_DIR` to a new, disjoint output directory whose parent exists:
 
 ```bash
-export KEYSTORE_DIR=<home>/.psy/keystore
-export PACKAGE_DIR=<tmp>/psy-groth16-package
-rm -rf "$PACKAGE_DIR"
-mkdir -p "$PACKAGE_DIR"
-
-zstd -f "$KEYSTORE_DIR/circuit_groth16.bin" -o "$PACKAGE_DIR/circuit_groth16.bin.zst"
-zstd -f "$KEYSTORE_DIR/pk_groth16.bin" -o "$PACKAGE_DIR/pk_groth16.bin.zst"
-zstd -f "$KEYSTORE_DIR/vk_groth16.bin" -o "$PACKAGE_DIR/vk_groth16.bin.zst"
-
-tar -C "$KEYSTORE_DIR" -cf - \
-  deposit_append/circuit_groth16.bin \
-  deposit_append/pk_groth16.bin \
-  deposit_append/vk_groth16.bin \
-  | zstd -f -o "$PACKAGE_DIR/deposit_append.tar.zst"
-
-tar -C "$KEYSTORE_DIR" -cf - \
-  withdrawal_claim/circuit_groth16.bin \
-  withdrawal_claim/pk_groth16.bin \
-  withdrawal_claim/vk_groth16.bin \
-  | zstd -f -o "$PACKAGE_DIR/withdrawal_claim.tar.zst"
+scripts/trust-setup.py pack --source "$KEYSTORE_DIR" --package "$PACKAGE_DIR"
 ```
+
+This compresses, splits, writes the manifest and performs full offline verification. Existing output directories (even empty ones), symlink output paths, and output paths overlapping the source are rejected. Source and existing output are never deleted. A failed pack can leave its newly created incomplete package for inspection; use a different fresh directory on retry. Allow temporary disk space for a compressed assembly and decompressed archive in addition to the retained package. Do not mutate the source during packing.
 
 ### 10.3 Version-1 manifest
 
-The manifest hashes the nine uncompressed files, not the five compressed objects. Each entry contains lowercase hexadecimal SHA-256 and byte size. Generate it exactly:
+The exact schema is `{ "version": 1, "files": { "<fixed path>": { "sha256": "<64 lowercase hex characters>", "size": <positive safe integer> } } }`. Extra keys and duplicate JSON keys are rejected. `files` contains exactly sixteen entries:
 
-```bash
-KEYSTORE_DIR="$KEYSTORE_DIR" PACKAGE_DIR="$PACKAGE_DIR" python3 - <<'PY'
-import hashlib, json, os
-from pathlib import Path
+- The twelve uncompressed paths defined in Section 10.1.
+- Full compressed entries for `pk_groth16.bin.zst`, `deposit_append.tar.zst`, `withdrawal_claim.tar.zst`, and `reward_claim.tar.zst`.
 
-root = Path(os.environ["KEYSTORE_DIR"])
-out = Path(os.environ["PACKAGE_DIR"]) / "sha256sums.json"
-paths = [
-    "circuit_groth16.bin",
-    "pk_groth16.bin",
-    "vk_groth16.bin",
-    "deposit_append/circuit_groth16.bin",
-    "deposit_append/pk_groth16.bin",
-    "deposit_append/vk_groth16.bin",
-    "withdrawal_claim/circuit_groth16.bin",
-    "withdrawal_claim/pk_groth16.bin",
-    "withdrawal_claim/vk_groth16.bin",
-]
-files = {}
-for rel in paths:
-    path = root / rel
-    if not path.is_file() or path.stat().st_size == 0:
-        raise SystemExit(f"missing or empty: {path}")
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    files[rel] = {"sha256": digest.hexdigest(), "size": path.stat().st_size}
-out.write_text(json.dumps({"version": 1, "files": files}, indent=2) + "\n")
-PY
-```
-
-The consumer schema is `{version, files[path] = {sha256, size}}`; version must equal `1` (`dev/locSetupV4.ts:2390-2434,2545-2550`).
+Sizes are bytes in `1..2^53-1`. Compressed hashes cover the complete ordered concatenation, not individual parts. The two single compressed objects have no compressed manifest entries; their decompressed files are verified. This matches the consumer's `trustSetupGroups` and `downloadTrustSetupObject` in `dev/locSetupV4.ts`.
 
 ### 10.4 Offline validation
 
-Validate the package into a clean directory before any upload:
-
 ```bash
-export VERIFY_DIR=<tmp>/psy-groth16-package-verify
-rm -rf "$VERIFY_DIR"
-mkdir -p "$VERIFY_DIR/deposit_append" "$VERIFY_DIR/withdrawal_claim"
-
-zstd -d -f "$PACKAGE_DIR/circuit_groth16.bin.zst" -o "$VERIFY_DIR/circuit_groth16.bin"
-zstd -d -f "$PACKAGE_DIR/pk_groth16.bin.zst" -o "$VERIFY_DIR/pk_groth16.bin"
-zstd -d -f "$PACKAGE_DIR/vk_groth16.bin.zst" -o "$VERIFY_DIR/vk_groth16.bin"
-zstd -d -c "$PACKAGE_DIR/deposit_append.tar.zst" | tar -xf - -C "$VERIFY_DIR"
-zstd -d -c "$PACKAGE_DIR/withdrawal_claim.tar.zst" | tar -xf - -C "$VERIFY_DIR"
-
-VERIFY_DIR="$VERIFY_DIR" MANIFEST="$PACKAGE_DIR/sha256sums.json" python3 - <<'PY'
-import hashlib, json, os
-from pathlib import Path
-
-root = Path(os.environ["VERIFY_DIR"])
-manifest = json.loads(Path(os.environ["MANIFEST"]).read_text())
-assert manifest["version"] == 1
-assert len(manifest["files"]) == 9
-for rel, expected in manifest["files"].items():
-    path = root / rel
-    data_hash = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            data_hash.update(chunk)
-    assert path.stat().st_size == expected["size"], rel
-    assert data_hash.hexdigest() == expected["sha256"], rel
-print("validated 9 uncompressed Groth16 files")
-PY
+scripts/trust-setup.py verify --package "$PACKAGE_DIR"
 ```
+
+Verification checks exact manifest keys and fixed paths, package filenames, regular non-symlink files, computed part names and sizes, ordered compressed size/SHA-256, optional retained full compressed objects, and all twelve decompressed size/SHA-256 values. It accepts either a local package or a public readback package containing only publication objects and manifest; it never modifies that package. All archive member names, types and sizes must match the expected three files before any member is opened. Links, extra members, traversal paths and sparse files are rejected. Archive paths are never extracted into the filesystem. Private temporary verification files are automatically removed.
 
 ## 11. Publication Boundary
 
 ### 11.1 Authorization and storage class
 
-Artifact upload requires separate exact authorization naming the target storage location and object prefix. Generation, packaging, source push, or contract deployment does not authorize upload. Public trust-setup objects live in Cloudflare R2 bucket `psy-proving-keystores`. Uploads require authenticated Wrangler with `--remote`; anyone can download via `https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev` without login or Wrangler. Wallet/UTC JSON and credentials are never publication objects.
-
-Do not put credential values, access keys, secret keys, session tokens, or profile names in commands, documentation, logs, or release records.
+Artifact upload requires separate exact authorization naming storage location and prefix. Generation, packaging, source push, or deployment does not authorize upload. The fixed destination is Cloudflare R2 bucket `psy-proving-keystores`, publicly readable at `https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev`. The publisher invokes installed official `wrangler r2 object put ... --remote` with inherited trusted CLI authentication. There are no credential arguments; raw Wrangler output is suppressed. Never inspect credential files or include credentials, profile names or wallet JSON in publication evidence.
 
 ### 11.2 Objects first, manifest last
 
-For a new authorized cohort, select a fresh immutable prefix `localhost-<digest>` and pass the Section 8.2 vacancy test before the first upload. A fully verified existing prefix is reused without upload. `PSY_KEYSTORE_R2_PREFIX` must be one segment matching `[A-Za-z0-9._-]{1,128}`, with no `..`, slash, or whitespace. It is not a URL and has no default or legacy alias; the consumer uses the fixed public HTTPS base above. Upload authentication is inherited by Wrangler; never inspect or copy credential files into release evidence. Keep raw Wrangler output out of shared logs. Large-object upload/multipart support must be resolved by the publisher before publication; do not split objects or change the manifest schema to bypass an upload limit.
+Reserve exclusive writer ownership of a fresh authorized `localhost-<digest>` prefix. The prefix must match `[A-Za-z0-9._-]{1,128}` and must not contain `..`. Reuse an already verified published cohort without uploading again; the vacancy gate rejects any occupied publication key, including the manifest. Set `PSY_KEYSTORE_R2_PREFIX` to the authorized segment:
 
 ```bash
-set -e
-export PSY_KEYSTORE_R2_PREFIX='localhost-<digest>' # substitute the authorized digest
-export ARTIFACT_PREFIX="psy-proving-keystores/$PSY_KEYSTORE_R2_PREFIX"
-export ARTIFACT_URL="https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev/$PSY_KEYSTORE_R2_PREFIX"
-
-wrangler r2 object put "$ARTIFACT_PREFIX/circuit_groth16.bin.zst" --file "$PACKAGE_DIR/circuit_groth16.bin.zst" --remote
-wrangler r2 object put "$ARTIFACT_PREFIX/pk_groth16.bin.zst" --file "$PACKAGE_DIR/pk_groth16.bin.zst" --remote
-wrangler r2 object put "$ARTIFACT_PREFIX/vk_groth16.bin.zst" --file "$PACKAGE_DIR/vk_groth16.bin.zst" --remote
-wrangler r2 object put "$ARTIFACT_PREFIX/deposit_append.tar.zst" --file "$PACKAGE_DIR/deposit_append.tar.zst" --remote
-wrangler r2 object put "$ARTIFACT_PREFIX/withdrawal_claim.tar.zst" --file "$PACKAGE_DIR/withdrawal_claim.tar.zst" --remote
+scripts/trust-setup.py publish --package "$PACKAGE_DIR" --prefix "$PSY_KEYSTORE_R2_PREFIX"
 ```
 
-Do not upload `sha256sums.json` yet.
+The publisher takes a private snapshot and fully verifies it before any upload. It requires HTTP 404 for **every** actual data object and the manifest before the first write; any other status or transport failure aborts. Each key is checked again immediately before upload. Only the two singles and computed parts are uploaded, then the manifest last. No custom bucket or public base URL is accepted.
+
+Wrangler object-put does not provide atomic conditional creation: vacancy checks cannot prevent an independent concurrent writer racing the upload. Exclusive prefix ownership is mandatory. A partial upload, occupied key or readback mismatch blocks further writes; abandon that prefix and use a separately authorized fresh prefix, never overwrite or resume a partial prefix.
+
+Safe, network-read-only publication behavior smoke:
+
+```bash
+scripts/trust-setup.py publish --package "$PACKAGE_DIR" --prefix "$PSY_KEYSTORE_R2_PREFIX" --check-only
+```
+
+`--check-only` performs snapshot verification and the complete HTTP vacancy gate, then prints planned data/readback ordering and the final manifest step. It performs **no uploads** and is **not upload or readback proof**. Use a fresh prefix, not the already published prefix.
 
 ### 11.3 Read back and validate every object
 
-```bash
-export READBACK_DIR=<tmp>/psy-groth16-readback
-rm -rf "$READBACK_DIR"
-mkdir -p "$READBACK_DIR"
-
-curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/circuit_groth16.bin.zst" "$ARTIFACT_URL/circuit_groth16.bin.zst"
-curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/pk_groth16.bin.zst" "$ARTIFACT_URL/pk_groth16.bin.zst"
-curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/vk_groth16.bin.zst" "$ARTIFACT_URL/vk_groth16.bin.zst"
-curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/deposit_append.tar.zst" "$ARTIFACT_URL/deposit_append.tar.zst"
-curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/withdrawal_claim.tar.zst" "$ARTIFACT_URL/withdrawal_claim.tar.zst"
-
-cmp "$PACKAGE_DIR/circuit_groth16.bin.zst" "$READBACK_DIR/circuit_groth16.bin.zst"
-cmp "$PACKAGE_DIR/pk_groth16.bin.zst" "$READBACK_DIR/pk_groth16.bin.zst"
-cmp "$PACKAGE_DIR/vk_groth16.bin.zst" "$READBACK_DIR/vk_groth16.bin.zst"
-cmp "$PACKAGE_DIR/deposit_append.tar.zst" "$READBACK_DIR/deposit_append.tar.zst"
-cmp "$PACKAGE_DIR/withdrawal_claim.tar.zst" "$READBACK_DIR/withdrawal_claim.tar.zst"
-cp "$PACKAGE_DIR/sha256sums.json" "$READBACK_DIR/sha256sums.json"
-```
-
-In a subshell, set `PACKAGE_DIR="$READBACK_DIR"` and repeat Section 10.4 to validate all nine uncompressed files (circuit, proving key and verifying key for root, deposit append and withdrawal claim); exit the subshell before Section 11.4 so the original package directory remains selected. Any byte, decompression, path, size, or hash mismatch blocks manifest publication.
+After each data upload, the publisher anonymously reads the public object through HTTPS and verifies size and SHA-256 against the immutable, fully verified snapshot before proceeding. Equality to those bytes preserves the verified four compressed assemblies and twelve uncompressed files. Any failed or differing readback prevents manifest publication. Redirects are not followed; only HTTP 200 is accepted. Curl configuration loading is disabled with `-q`.
 
 ### 11.4 Publish manifest last and confirm
 
-```bash
-wrangler r2 object put "$ARTIFACT_PREFIX/sha256sums.json" --file "$PACKAGE_DIR/sha256sums.json" --remote
-curl -q -f -S -L --proto '=https' --proto-redir '=https' -o "$READBACK_DIR/sha256sums.json" "$ARTIFACT_URL/sha256sums.json"
-cmp "$PACKAGE_DIR/sha256sums.json" "$READBACK_DIR/sha256sums.json"
-```
-
-The manifest is the publication commit point. Never replace it before all five objects pass readback validation.
+Only after every data object passes public readback does the script upload `sha256sums.json`, then require HTTP 200 and exact byte equality to the snapshot manifest. The manifest is the publication commit point. No success is reported before its readback passes. Failures do not roll back remote objects or authorize replacement.
 
 ### 11.5 Clean consumer download proof
 
-Consumer verification must use an empty `<home>/.psy/keystore`, must run without `PSY_SKIP_KEYSTORE`, and must successfully fetch and parse the version-1 manifest with valid sizes and SHA-256 hashes for all nine files before accepting downloaded files. Manifest fetch/parse/version/coverage failures are fatal; size/hash mismatches require replacement and successful post-download verification. There is no automatic existence-only fallback. Exact `PSY_SKIP_KEYSTORE=1` preserves the explicit local mode requiring nine nonempty files, but that mode is not publication proof. The launcher uses anonymous HTTPS curl, disables curl configuration loading, rejects HTTP errors and non-HTTPS redirects, and suppresses raw subprocess output/spawn errors; download failures report only the object URL and exit status.
-
-For release evidence:
-
-1. Use a clean disposable home directory.
-2. Ensure `PSY_SKIP_KEYSTORE` is unset.
-3. Set `PSY_KEYSTORE_R2_PREFIX` to the published `localhost-<digest>` segment. Consumers need curl, not Wrangler, cloud credentials, or a login.
-4. Launch the normal consumer startup path.
-5. Require a successful `sha256sums.json` fetch and `verified OK` for every downloaded group.
-6. Reject retained local files or `PSY_SKIP_KEYSTORE=1` as clean-download proof; repeat Section 10.4 against the read-back manifest for all nine files.
+Consumer verification is separate from publisher verification. Use an empty disposable `<home>/.psy/keystore`, exact `PSY_SKIP_KEYSTORE=0`, and the published `PSY_KEYSTORE_R2_PREFIX`, then launch the normal consumer startup path. Require a successful version-1 manifest fetch and `verified OK` for every group. The downloader derives part counts from the four compressed entries, verifies ordered assemblies, and validates all twelve uncompressed files. Manifest errors are fatal; there is no existence-only fallback. Consumers need curl, not Wrangler or credentials. Retained files or local skip mode are not clean-download proof. Run Section 10.4 against a separate public readback package for the exact sixteen-entry publication contract.
 
 ## 12. Verification and Failure Handling
 
 ### 12.1 Release checks
 
-1. Rerun Section 4.2 with identical environment. Require identical network, magic, `fingerprint_u64x4`, and verifier JSON.
+1. Rerun Section 4.2 with identical environment. Require identical network, magic, display fingerprint, `endcap_fingerprint_u64x4`, and verifier JSON. `zk_fingerprint` and `secp_fingerprint` are printed but are not part of the EndCap promotion set.
 2. Rerun Section 5.1. Require both cache files to report up to date.
 3. Complete Section 7 through dual-sub root equality.
-4. For each triggered Bridge cohort, require three nonempty files, export the matching Solidity verifier, generate a proof through the matching wrapper, and verify it with that newly exported verifier before deployment. Runtime constructs separate withdrawal, deposit, and Bridge aggregation wrappers (`client_prover/psy_prover/src/local/native/prove_proxy.rs:660-748`).
+4. For each triggered Bridge cohort, require three nonempty files, export the matching Solidity verifier, generate a proof through the matching wrapper, and verify it with that newly exported verifier before deployment. The system prove provider constructs separate withdrawal, deposit, Bridge aggregation, and reward-claim wrappers (`client_prover/psy_prover/src/local/native/prove_proxy/system.rs:119-222`).
 5. Complete Section 10.4 before upload and Sections 11.3-11.5 after authorized upload.
 6. Require the final change scope to contain only triggered metadata, both caches, selected Solidity verifiers, applicable downstream pins or generated outputs, and the source changes that caused them. Genesis, embedded wallet circuits, unrelated Bridge cohorts, gitlinks, and packages remain unchanged unless their matrix row triggers.
 
@@ -706,7 +600,7 @@ For release evidence:
 | Selected cohort generation leaves a missing or empty file | Keep consumers stopped; restore or regenerate the entire selected cohort |
 | New proof fails against new verifier | Roll back the entire cohort and matching Solidity verifier |
 | Offline package validation fails | Do not upload |
-| Any object readback differs or fails uncompressed manifest validation | Replace the object and repeat readback; do not publish the manifest |
+| Any object readback differs or fails uncompressed manifest validation | Stop publication; abandon the partial prefix and use a separately authorized fresh prefix, never replace its objects |
 | Manifest fetch falls back to existence checks | Fail publication verification |
 | Upload lacks exact authorization | Do not upload |
 
@@ -727,7 +621,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 | Manual replace (separate procedure) | `../psy-compiler/psy-precompiles/token/src/main.psy` and `usdt_token/src/main.psy` | Token privacy circuit fingerprints; see [token-privacy-circuit-fingerprints.md](token-privacy-circuit-fingerprints.md) |
 | Selected verifier replace | `psy-contracts/src/GnarkGroth16Verifier.sol` | `bridge_agg` trigger |
 | Selected verifier replace | `psy-contracts/src/DepositBatchVerifier.sol` | `deposit_append` trigger |
-| Selected verifier replace | `psy-contracts/src/WithdrawalClaimVerifier.sol` | `withdrawal_claim` trigger |
+| Selected verifier replace | `psy-contracts/src/RewardClaimVerifier.sol` | `reward_claim` trigger |
 
 ```diff
 --- a/psy_plonky2_circuits/src/circuit_library/end_cap_verifier_data.rs
@@ -771,6 +665,12 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 @@ withdrawal_claim verification key when selected @@
 -previous withdrawal_claim verifier
 +export from matching newly generated withdrawal_claim cohort
+
+--- a/psy-contracts/src/RewardClaimVerifier.sol
++++ b/psy-contracts/src/RewardClaimVerifier.sol
+@@ reward_claim verification key when selected @@
+-previous reward_claim verifier
++export from matching newly generated reward_claim cohort
 ```
 
 ## 14. Rationale
@@ -788,7 +688,7 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 
 1. **Fail-closed network boundary:** never use localhost validation as evidence for another network. The current verifier JSON is globally shared, so a localhost-generated replacement requires every non-local consumer to remain blocked until distinct per-network verifier metadata is implemented and validated.
 2. **Private-key exclusion:** root `private_keys.json` and faucet operator private keys are secrets. Never package, upload, commit, paste, or publish them.
-3. **Public proving artifacts:** the authorized R2 bucket `psy-proving-keystores` serves this localhost proving-artifact release publicly. Publish only the nine circuit/proving/verifying files through the package in Section 10; exclude signing keys, passwords, validator secrets, and setup randomness. Public availability does not authorize use on an unvalidated network.
+3. **Public proving artifacts:** the authorized R2 bucket `psy-proving-keystores` serves this localhost proving-artifact release publicly. Publish only the two single compressed objects, the required parts of the four large compressed objects, and the sixteen-entry manifest defined in Section 10: fourteen data object keys plus the manifest for the current cohort, representing twelve uncompressed circuit/proving/verifying files. Exclude signing keys, passwords, validator secrets, and setup randomness. Public availability does not authorize use on an unvalidated network.
 4. **Separate authorization:** source delivery, package publication, artifact upload, and deployment each require their own authorization. Upload commands must not embed credentials or profile names.
 5. **Atomic verifier deployment:** deploy a Solidity verifier only with its matching complete cohort and runtime configuration.
 6. **No dummy substitution:** dummy EndCap provers, dummy verifier JSON, lookalike circuits, and fabricated submissions are never release evidence.

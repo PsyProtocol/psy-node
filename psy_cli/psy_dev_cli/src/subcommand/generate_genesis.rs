@@ -36,11 +36,12 @@ use psy_plonky2_circuits::node::config::networks::local_devnet::{
 };
 
 mod guardians_root;
+pub use guardians_root::{build_fresh_devnet_authorization, preflight_fresh_devnet_inputs, publish_guardian_authorization, publish_guardian_authorization_unchanged, CanonicalPolicyPin};
 
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
-const DEFAULT_SD_KEY_FINGERPRINT: &str = "38755910c4dfb3c9bef528a4af697edced7e2607a6b769d054c4985a7000f0eb";
+const DEFAULT_SD_KEY_FINGERPRINT: &str = "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
 const GUARDIANS_ROOT_MAX_FEE_DEFAULT: u64 = 2_000_000_000;
 
@@ -78,13 +79,6 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "genesis-contracts")]
     pub genesis_contracts: Option<PathBuf>,
 
-    /// Public initial two-of-three account JSON; never a signer secret.
-    #[arg(long = "relayer-multisig-account")]
-    pub relayer_multisig_account: PathBuf,
-
-    /// Approved local compiler multisig_policy artifact, including its ABI.
-    #[arg(long = "multisig-policy-artifact")]
-    pub multisig_policy_artifact: PathBuf,
     /// Dense registration index of the bridge relayer.
     #[arg(long = "relayer-registration-id", default_value_t = 2)]
     pub relayer_registration_id: u64,
@@ -156,22 +150,12 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "sd-key-allowed-method-id", default_values_t = vec![3375543263u32, 2789897329, TOKEN_BURN_METHOD_ID])]
     pub sd_key_allowed_method_ids: Vec<u32>,
 
-    /// --guardians-root output directory. Reads the existing genesis and writes guardian
-    /// configuration instead of genesis.json, private_keys.json, or faucetOperators.json.
+    /// --guardians-root runtime directory. Reads the existing genesis, derives the
+    /// compact guardian authorization, publishes it to the selected network in
+    /// psy-genesis/config.json, and creates the runtime db directory.
     #[arg(long = "guardians-root")]
     pub guardians_root: Option<PathBuf>,
 
-    /// --guardians-root input: authorized chains JSON array. Required with --guardians-root.
-    #[arg(long = "chains")]
-    pub chains: Option<PathBuf>,
-
-    /// --guardians-root input: authorized L1 endpoint JSON array. Required with --guardians-root.
-    #[arg(long = "l1-endpoints")]
-    pub l1_endpoints: Option<PathBuf>,
-
-    /// --guardians-root input: approved contract JSON array. Required with --guardians-root.
-    #[arg(long = "approved-contracts")]
-    pub approved_contracts: Option<PathBuf>,
 
     /// --guardians-root authorization fee cap. Must be at least the compiled GUTA_FEE + DA_FEE floor.
     #[arg(long = "max-fee")]
@@ -224,12 +208,6 @@ fn decode_relayer_multisig_account(bytes: &[u8]) -> anyhow::Result<MultisigAccou
     Ok(account)
 }
 
-fn read_public_input(repo_root: &Path, path: &Path) -> anyhow::Result<Vec<u8>> {
-    ensure!(!path.as_os_str().is_empty(), "public input path must not be empty");
-    let path = repo_root.join(path);
-    ensure!(path.is_file(), "public input {} must be an existing regular file", path.display());
-    std::fs::read(&path).with_context(|| format!("reading public input {}", path.display()))
-}
 
 fn initialized_multisig_user(
     account: &MultisigAccount,
@@ -258,45 +236,12 @@ fn initialized_multisig_user(
 
 fn validate_multisig_policy_artifact(
     contracts: &[PQBCDeployContract<Hash>],
-    bytes: &[u8],
+    compiled: &CompiledContract,
 ) -> anyhow::Result<()> {
-    use psy_client_data::config::store_config::{C, D};
-    use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
-    #[derive(serde::Deserialize)]
-    struct PolicyArtifact {
-        state_tree_height: u16,
-        circuit_definitions: Vec<DPNFunctionCircuitDefinition>,
-        abi: serde_json::Value,
-    }
-    let artifact: PolicyArtifact = serde_json::from_slice(bytes).context("invalid multisig policy compiler artifact")?;
-    ensure!(artifact.state_tree_height == 4, "multisig policy artifact must declare height 4");
-    ensure!(artifact.circuit_definitions.len() == 2
-        && ["get_policy", "set_policy"].iter().all(|name| artifact.circuit_definitions.iter().filter(|definition| definition.name == *name).count() == 1),
-        "multisig policy artifact requires exactly get_policy and set_policy");
-    ensure!(artifact.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64) == Some(4),
-        "multisig policy ABI must declare height 4");
-    let methods = artifact.abi.pointer("/contract/methods").and_then(serde_json::Value::as_array)
-        .context("multisig policy ABI methods are missing")?;
-    ensure!(methods.len() == 2, "multisig policy ABI must declare two methods");
-    for definition in &artifact.circuit_definitions {
-        let mut matches = methods.iter().filter(|method| method["name"].as_str() == Some(definition.name.as_str()));
-        let method = matches.next().context("multisig policy ABI method is missing")?;
-        ensure!(matches.next().is_none(), "multisig policy ABI method is duplicated");
-        ensure!(method["method_id"].as_u64() == Some(u64::from(definition.method_id))
-            && method["input_felt_count"].as_u64() == Some(definition.circuit_inputs.len() as u64)
-            && method["output_felt_count"].as_u64() == Some(definition.circuit_outputs.len() as u64)
-            && method["state_mutability"].as_str() == Some(if definition.is_view_function() { "view" } else { "external" }),
-            "multisig policy ABI differs from compiled method");
-    }
-    validate_policy_abi_slots(&artifact.abi)?;
+    require_abi_method_agreement(compiled)?;
+    require_policy_contract(compiled)?;
     let contract = contracts.get(MULTISIG_POLICY_CONTRACT_ID as usize).context("Genesis contracts must contain multisig policy contract 1")?;
-    ensure!(contract.code_definition.state_tree_height == 4, "Genesis policy contract must declare height 4");
-    let (_, expected) = psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<C, D>(
-        contract.deployer, 4, &artifact.circuit_definitions,
-    )?;
-    let expected: PQBCDeployContract<Hash> = serde_json::from_value(serde_json::to_value(expected)?)?;
-    ensure!(contract == &expected, "Genesis policy code/functions differ from approved compiler artifact");
-    Ok(())
+    require_deployment_roots(compiled, contract)
 }
 
 fn validate_policy_abi_slots(abi: &serde_json::Value) -> anyhow::Result<()> {
@@ -312,6 +257,167 @@ fn validate_policy_abi_slots(abi: &serde_json::Value) -> anyhow::Result<()> {
         && fields[1]["felt_size"].as_u64() == Some(12) && fields[1]["type"] == members_type,
         "multisig policy ABI must expose header and three members at slots 0 through 3");
     Ok(())
+}
+/// One compiled precompile, read once from the sibling compiler checkout.
+struct CompiledContract {
+    /// Raw compiler JSON bytes; the approval records their SHA-256, never a copy.
+    raw: Vec<u8>,
+    state_tree_height: u16,
+    circuit_definitions: Vec<psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition>,
+    abi: serde_json::Value,
+}
+
+fn compiler_checkout(repo_root: &Path) -> anyhow::Result<PathBuf> {
+    let root = match std::env::var_os("PSY_PROJECTS_DIR") {
+        Some(dir) => PathBuf::from(dir).join("psy-compiler"),
+        None => repo_root.join("../psy-compiler"),
+    };
+    root.canonicalize().with_context(|| format!("sibling psy-compiler checkout {} is missing", root.display()))
+}
+
+fn read_compiler_contract(compiler_root: &Path, stem: &str) -> anyhow::Result<CompiledContract> {
+    let path = compiler_root.join(format!("psy-precompiles/{stem}/target/{stem}.json"));
+    let raw = std::fs::read(&path).with_context(|| format!("reading compiler artifact {}", path.display()))?;
+    #[derive(serde::Deserialize)]
+    struct Artifact {
+        state_tree_height: u16,
+        circuit_definitions: Vec<psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition>,
+        abi: serde_json::Value,
+    }
+    let artifact: Artifact = serde_json::from_slice(&raw).with_context(|| format!("parsing compiler artifact {}", path.display()))?;
+    Ok(CompiledContract { raw, state_tree_height: artifact.state_tree_height, circuit_definitions: artifact.circuit_definitions, abi: artifact.abi })
+}
+
+fn abi_methods(abi: &serde_json::Value) -> anyhow::Result<&Vec<serde_json::Value>> {
+    abi.pointer("/contract/methods").and_then(serde_json::Value::as_array).context("compiler ABI methods are missing")
+}
+
+/// ABI schema 2.0.0, one ABI method per compiled definition, matching method id,
+/// input and output felt counts, and view/external mutability.
+fn require_abi_method_agreement(compiled: &CompiledContract) -> anyhow::Result<()> {
+    ensure!(compiled.abi["schema_version"].as_str() == Some("2.0.0"), "compiler artifact requires ABI 2.0.0");
+    ensure!(compiled.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64) == Some(u64::from(compiled.state_tree_height)),
+        "compiler ABI height differs from the artifact height");
+    let methods = abi_methods(&compiled.abi)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for definition in &compiled.circuit_definitions {
+        ensure!(seen.insert(definition.name.as_str()), "compiled method {} is duplicated", definition.name);
+        let mut matches = methods.iter().filter(|method| method["name"].as_str() == Some(definition.name.as_str()));
+        let method = matches.next().with_context(|| format!("compiler ABI omits method {}", definition.name))?;
+        ensure!(matches.next().is_none(), "compiler ABI method {} is duplicated", definition.name);
+        ensure!(method["method_id"].as_u64() == Some(u64::from(definition.method_id))
+            && method["input_felt_count"].as_u64() == Some(definition.circuit_inputs.len() as u64)
+            && method["output_felt_count"].as_u64() == Some(definition.circuit_outputs.len() as u64)
+            && method["state_mutability"].as_str() == Some(if definition.is_view_function() { "view" } else { "external" }),
+            "compiler ABI method {} differs from its compiled definition", definition.name);
+    }
+    Ok(())
+}
+
+/// Deployment code root and function roots must equal the compiled definitions.
+fn require_deployment_roots(compiled: &CompiledContract, deployment: &PQBCDeployContract<Hash>) -> anyhow::Result<()> {
+    use psy_client_data::config::store_config::{C, D};
+    ensure!(u64::from(deployment.code_definition.state_tree_height) == u64::from(compiled.state_tree_height),
+        "Genesis deployment height differs from the compiler artifact");
+    let (_, expected) = psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<C, D>(
+        deployment.deployer, u8::try_from(compiled.state_tree_height).context("compiler state tree height exceeds u8")?, &compiled.circuit_definitions,
+    )?;
+    let expected: PQBCDeployContract<Hash> = serde_json::from_value(serde_json::to_value(expected)?)?;
+    ensure!(deployment == &expected, "Genesis deployment code and function roots differ from the compiler artifact");
+    Ok(())
+}
+
+fn require_policy_contract(compiled: &CompiledContract) -> anyhow::Result<()> {
+    ensure!(compiled.state_tree_height == 4, "multisig policy artifact must declare height 4");
+    ensure!(["get_policy", "set_policy"].iter().all(|name| compiled.circuit_definitions.iter().filter(|definition| definition.name == *name).count() == 1)
+        && compiled.circuit_definitions.len() == 2, "multisig policy artifact requires exactly get_policy and set_policy");
+    validate_policy_abi_slots(&compiled.abi)
+}
+
+/// The `state_map` field is a Hash-keyed map of capacity 1,048,576 whose felt
+/// span is capacity times the value size and starts on the alignment boundary.
+fn require_hash_state_map(abi: &serde_json::Value) -> anyhow::Result<(u64, u64)> {
+    let fields = abi.pointer("/contract/state").and_then(serde_json::Value::as_array).context("compiler ABI state is missing")?;
+    let mut maps = fields.iter().filter(|field| field["name"].as_str() == Some("state_map"));
+    let map = maps.next().context("compiler ABI has no state_map")?;
+    ensure!(maps.next().is_none(), "compiler ABI state_map is duplicated");
+    let hash = serde_json::json!({"kind": "primitive", "name": "Hash"});
+    let (offset, felt_size, capacity, value_felt_size, alignment) = (
+        map["offset"].as_u64().context("state_map offset missing")?,
+        map["felt_size"].as_u64().context("state_map felt size missing")?,
+        map.pointer("/type/capacity").and_then(serde_json::Value::as_u64).context("state_map capacity missing")?,
+        map.pointer("/type/value_felt_size").and_then(serde_json::Value::as_u64).context("state_map value felt size missing")?,
+        map.pointer("/type/alignment_felts").and_then(serde_json::Value::as_u64).context("state_map alignment missing")?,
+    );
+    ensure!(map.pointer("/type/kind").and_then(serde_json::Value::as_str) == Some("map")
+        && map.pointer("/type/map_kind").and_then(serde_json::Value::as_str) == Some("map")
+        && map.pointer("/type/key") == Some(&hash) && map.pointer("/type/value") == Some(&hash)
+        && capacity == 1_048_576 && value_felt_size == 4 && alignment == 4
+        && offset.is_multiple_of(alignment) && felt_size == capacity.checked_mul(value_felt_size).context("state_map felt span overflow")?,
+        "state_map must be a Hash map of capacity 1048576, value size 4, aligned on 4");
+    Ok((offset, capacity))
+}
+
+/// A state-command operand names the `index` of the one `data_type` 0
+/// definition whose single input is the literal value.
+fn literal_operand(definitions: &[psy_vm::dpn::ops::op_types::DPNIndexedVarDef], operand: u64) -> anyhow::Result<u64> {
+    let mut matches = definitions.iter().filter(|definition| {
+        definition.data_type == psy_vm::dpn::ops::op_types::DPNBuiltInDataType::Target && definition.index as u64 == operand
+    });
+    let definition = matches.next().context("IMT operand has no typed literal")?;
+    ensure!(matches.next().is_none(), "IMT operand names more than one typed literal");
+    ensure!(definition.op_type == psy_vm::dpn::ops::op_types::DPNOpType::Constant, "IMT operand is not a constant literal");
+    let mut inputs = definition.inputs.iter();
+    let value = inputs.next().copied().context("typed literal value missing")?;
+    ensure!(inputs.next().is_none(), "typed literal carries more than its value");
+    Ok(value)
+}
+
+/// Every IMT operand resolves to a unique typed literal, no operand serves both
+/// the base and capacity roles, every read names the same base and capacity as
+/// the single write, and at least one read precedes that write.
+fn require_withdrawal_imt(compiled: &CompiledContract) -> anyhow::Result<(u64, u64)> {
+    let withdraw = compiled.circuit_definitions.iter().find(|definition| definition.name == "withdraw").context("token artifact has no withdraw method")?;
+    let definitions = &withdraw.definitions;
+    let commands = serde_json::to_value(&withdraw.state_commands)?;
+    let commands = commands.as_array().context("withdraw state commands missing")?;
+    let mut reads = Vec::new();
+    let mut write = None;
+    let mut bases = std::collections::BTreeSet::new();
+    let mut capacities = std::collections::BTreeSet::new();
+    for (position, command) in commands.iter().enumerate() {
+        let kind = command["type"].as_str().unwrap_or_default();
+        if !kind.contains("IMT") { continue; }
+        let base = command["base_offset"].as_u64().context("IMT command base missing")?;
+        let capacity = command["capacity"].as_u64().context("IMT command capacity missing")?;
+        bases.insert(base);
+        capacities.insert(capacity);
+        let (base, capacity) = (literal_operand(definitions, base)?, literal_operand(definitions, capacity)?);
+        if kind == "SetIMTContractStateValue" {
+            ensure!(write.replace((position, base, capacity)).is_none(), "withdraw writes the withdrawal map more than once");
+        } else {
+            reads.push((position, base, capacity));
+        }
+    }
+    ensure!(bases.is_disjoint(&capacities), "withdrawal IMT reuses a typed literal operand between the base and capacity roles");
+    let (written_at, base, capacity) = write.context("withdraw never writes the withdrawal map")?;
+    ensure!(reads.iter().any(|(position, _, _)| *position < written_at), "withdraw writes the withdrawal map before reading it");
+    ensure!(reads.iter().all(|(_, read_base, read_capacity)| *read_base == base && *read_capacity == capacity),
+        "withdrawal IMT reads name a different map than the write");
+    Ok((base, capacity))
+}
+
+/// The withdrawal map the compiled `withdraw` writes. `subslot_base` is the IMT
+/// sentinel felt, one before the first record, so records start at
+/// `subslot_base + 4` and the inclusive end `subslot_base + capacity` must sit
+/// inside the state tree.
+fn derive_withdrawal_layout(compiled: &CompiledContract) -> anyhow::Result<guardian_common::protocol::WithdrawalLayout> {
+    let (abi_base, abi_capacity) = require_hash_state_map(&compiled.abi)?;
+    let (base, capacity) = require_withdrawal_imt(compiled)?;
+    ensure!(base == abi_base && capacity == abi_capacity, "compiled withdrawal map differs from the ABI state_map");
+    let tree_felts = 1u64.checked_shl(u32::from(compiled.state_tree_height)).and_then(|slots| slots.checked_mul(4)).context("state tree felt count overflow")?;
+    ensure!(base.checked_add(capacity).is_some_and(|end| end < tree_felts), "withdrawal map exceeds the state tree");
+    Ok(guardian_common::protocol::WithdrawalLayout { subslot_base: base, capacity })
 }
 
 #[derive(serde::Deserialize)]
@@ -503,13 +609,13 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     let repo_root = args.repo_root.canonicalize().with_context(|| {
         format!("repo-root {} does not exist", args.repo_root.display())
     })?;
-    let account = decode_relayer_multisig_account(&read_public_input(&repo_root, &args.relayer_multisig_account)?)?;
+    let account = guardians_root::checked_canonical_policy(&repo_root)?.0;
     let contracts_path = args.genesis_contracts.clone().unwrap_or_else(|| {
         repo_root.join("psy-genesis/genesis_contracts.json")
     });
     let contracts = load_contracts(&contracts_path)?;
     let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
-    validate_multisig_policy_artifact(&contracts, &read_public_input(&repo_root, &args.multisig_policy_artifact)?)?;
+    validate_multisig_policy_artifact(&contracts, &read_compiler_contract(&compiler_checkout(&repo_root)?, "multisig_policy")?)?;
     let multisig_circuit = MultisigSignatureCircuit::new()?;
     let relayer = initialized_multisig_user(&account, &multisig_circuit, args.initial_fee_balance)?;
     let (users, private_keys) = genesis_users(args, relayer)?;
@@ -544,96 +650,20 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     };
 
     let genesis_path = args.genesis_out.clone().unwrap_or_else(|| repo_root.join("genesis.json"));
-    let private_keys_path = args.private_keys_out.clone().unwrap_or_else(|| repo_root.join("private_keys.json"));
-    if let Some(parent) = genesis_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = private_keys_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&genesis_path, serde_json::to_string_pretty(&genesis_data)?)
-        .with_context(|| format!("writing {}", genesis_path.display()))?;
-    std::fs::write(&private_keys_path, serde_json::to_string_pretty(&private_keys)?)
-        .with_context(|| format!("writing {}", private_keys_path.display()))?;
+    let private_keys_path = args.private_keys_out.clone().unwrap_or_else(|| default_private_keys_path(&repo_root));
+    let faucet_operators_path = (!args.skip_faucet_operators).then(|| args.faucet_operators_out.clone().unwrap_or_else(|| {
+        default_faucet_operators_path(&repo_root)
+    }));
+    // Every body is serialized before the first output is opened, so a later
+    // failure cannot leave an earlier output truncated.
+    let genesis_body = serde_json::to_vec_pretty(&genesis_data)?;
+    let private_keys_body = serde_json::to_vec_pretty(&private_keys)?;
+    let faucet_body = faucet_operators_path.as_ref().map(|_| faucet_operators_body(args, &private_keys, special_zk_user_count, sd_key_fingerprint)).transpose()?;
 
-    let mut faucet_operators_written = None;
-    if !args.skip_faucet_operators {
-        #[derive(serde::Serialize)]
-        struct FaucetOperatorJson {
-            #[serde(rename = "userId")]
-            user_id: String,
-            address: String,
-            #[serde(rename = "privateKey")]
-            private_key: String,
-            fingerprint: String,
-            #[serde(rename = "signType")]
-            sign_type: String,
-        }
-
-        #[derive(serde::Serialize)]
-        struct FaucetOperatorsJson {
-            #[serde(rename = "faucetContractId")]
-            faucet_contract_id: u64,
-            #[serde(rename = "faucetMethodName")]
-            faucet_method_name: String,
-            #[serde(rename = "faucetMethodId")]
-            faucet_method_id: u64,
-            #[serde(rename = "faucetPerClaimAmount")]
-            faucet_per_claim_amount: String,
-            #[serde(rename = "sdKeyExpectedTxCount")]
-            sd_key_expected_tx_count: u64,
-            #[serde(rename = "sdKeyAllowedContractIds")]
-            sd_key_allowed_contract_ids: Vec<u64>,
-            #[serde(rename = "sdKeyAllowedMethodIds")]
-            sd_key_allowed_method_ids: Vec<u32>,
-            operators: Vec<FaucetOperatorJson>,
-        }
-
-        let operators: Vec<FaucetOperatorJson> = (0..args.faucet_operator_count)
-            .map(|i| {
-                let slot = special_zk_user_count + i;
-                let pk = private_keys.get(slot).copied().flatten()
-                    .with_context(|| format!("faucet registration {slot} requires a private key"))?;
-                let user_id = user_id_for(args, slot as u64);
-                let public_key_param = get_public_key_param::<F, PoseidonHash>(pk);
-                let pk_info = PZKPublicKeyInfo {
-                    fingerprint: sd_key_fingerprint,
-                    public_key_param,
-                };
-                let address = pk_info.to_hash::<PoseidonHasher>();
-                Ok(FaucetOperatorJson {
-                    user_id: user_id.to_string(),
-                    address: format!("{}", address),
-                    private_key: format!("{}", pk),
-                    fingerprint: format!("{}", sd_key_fingerprint),
-                    sign_type: "sd-key".to_string(),
-                })
-            })
-            .collect::<anyhow::Result<_>>()?;
-
-        let faucet_operators = FaucetOperatorsJson {
-            faucet_contract_id: args.faucet_contract_id,
-            faucet_method_name: args.faucet_method_name.clone(),
-            faucet_method_id: args.faucet_method_id,
-            faucet_per_claim_amount: args.faucet_per_claim_amount.clone(),
-            sd_key_expected_tx_count: args.sd_key_expected_tx_count,
-            sd_key_allowed_contract_ids: args.sd_key_allowed_contract_ids.clone(),
-            sd_key_allowed_method_ids: args.sd_key_allowed_method_ids.clone(),
-            operators,
-        };
-        let faucet_operators_path = args.faucet_operators_out.clone().unwrap_or_else(|| {
-            repo_root.join("psy-dapp/apps/bridge/src/config/faucetOperators.json")
-        });
-        if let Some(parent) = faucet_operators_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(
-            &faucet_operators_path,
-            serde_json::to_string_pretty(&faucet_operators)?,
-        )
-        .with_context(|| format!("writing {}", faucet_operators_path.display()))?;
-        faucet_operators_written = Some(faucet_operators_path);
-    }
+    write_exclusive(&genesis_path, &genesis_body)?;
+    write_owned_regular(&private_keys_path, &private_keys_body)?;
+    if let (Some(path), Some(body)) = (faucet_operators_path.as_ref(), faucet_body.as_ref()) { write_owned_regular(path, body)?; }
+    let faucet_operators_written = faucet_operators_path;
 
     tracing::info!(
         genesis = %genesis_path.display(),
@@ -644,8 +674,156 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     Ok(())
 }
 
+fn faucet_operators_body(args: &GenerateGenesisDataArgs, private_keys: &[Option<Hash>], special_zk_user_count: usize, sd_key_fingerprint: Hash) -> anyhow::Result<Vec<u8>> {
+    #[derive(serde::Serialize)]
+    struct FaucetOperatorJson { #[serde(rename = "userId")] user_id: String, address: String, #[serde(rename = "privateKey")] private_key: String, fingerprint: String, #[serde(rename = "signType")] sign_type: String }
+    #[derive(serde::Serialize)]
+    struct FaucetOperatorsJson { #[serde(rename = "faucetContractId")] faucet_contract_id: u64, #[serde(rename = "faucetMethodName")] faucet_method_name: String, #[serde(rename = "faucetMethodId")] faucet_method_id: u64, #[serde(rename = "faucetPerClaimAmount")] faucet_per_claim_amount: String, #[serde(rename = "sdKeyExpectedTxCount")] sd_key_expected_tx_count: u64, #[serde(rename = "sdKeyAllowedContractIds")] sd_key_allowed_contract_ids: Vec<u64>, #[serde(rename = "sdKeyAllowedMethodIds")] sd_key_allowed_method_ids: Vec<u32>, operators: Vec<FaucetOperatorJson> }
+    let operators = (0..args.faucet_operator_count).map(|i| {
+        let slot = special_zk_user_count + i;
+        let pk = private_keys.get(slot).copied().flatten().with_context(|| format!("faucet registration {slot} requires a private key"))?;
+        let public_key_param = get_public_key_param::<F, PoseidonHash>(pk);
+        let address = PZKPublicKeyInfo { fingerprint: sd_key_fingerprint, public_key_param }.to_hash::<PoseidonHasher>();
+        Ok(FaucetOperatorJson { user_id: user_id_for(args, slot as u64).to_string(), address: format!("{address}"), private_key: format!("{pk}"), fingerprint: format!("{sd_key_fingerprint}"), sign_type: "sd-key".to_string() })
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    serde_json::to_vec_pretty(&FaucetOperatorsJson { faucet_contract_id: args.faucet_contract_id, faucet_method_name: args.faucet_method_name.clone(), faucet_method_id: args.faucet_method_id, faucet_per_claim_amount: args.faucet_per_claim_amount.clone(), sd_key_expected_tx_count: args.sd_key_expected_tx_count, sd_key_allowed_contract_ids: args.sd_key_allowed_contract_ids.clone(), sd_key_allowed_method_ids: args.sd_key_allowed_method_ids.clone(), operators }).context("serializing faucet operators")
+}
+
+/// Creates `path` and writes it. An existing path, including a symlink, is refused.
+fn write_exclusive(path: &Path, body: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, io::{AsRawFd, FromRawFd}};
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().context("output path has no file name")?;
+    std::fs::create_dir_all(parent)?;
+    let directory = std::fs::File::open(parent).with_context(|| format!("opening {}", parent.display()))?;
+    let c_name = std::ffi::CString::new(name.as_bytes()).context("output name contains NUL")?;
+    let flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), c_name.as_ptr(), flags, 0o600) };
+    ensure!(fd >= 0, "creating {} failed: {}", path.display(), std::io::Error::last_os_error());
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().with_context(|| format!("reading {}", path.display()))?;
+    ensure!(metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o600,
+        "{} must be a single regular file owned by this user in mode 0600", path.display());
+    std::io::Write::write_all(&mut file, body).with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all().with_context(|| format!("syncing {}", path.display()))
+}
+
+fn default_private_keys_path(repo_root: &Path) -> PathBuf {
+    repo_root.join("private_keys.json")
+}
+
+fn default_faucet_operators_path(repo_root: &Path) -> PathBuf {
+    repo_root.join("psy-dapp/apps/bridge/src/config/faucetOperators.json")
+}
+
+/// Default secret outputs of an unflagged `generate_local_devnet_genesis`.
+/// `genesis.json` is omitted: fresh reset deletes it through cleanup.
+fn fresh_devnet_secret_outputs(repo_root: &Path) -> [PathBuf; 2] {
+    [default_private_keys_path(repo_root), default_faucet_operators_path(repo_root)]
+}
+
+fn output_parent(path: &Path) -> &Path {
+    path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."))
+}
+
+/// Metadata-only acceptance of one secret output. A missing file is a first
+/// generation. A missing parent is allowed because `write_owned_regular`
+/// creates just that parent with `create_dir_all`; an existing component must
+/// already be a real directory opened with `O_NOFOLLOW`. An existing file must
+/// be one regular link owned by this user in mode 0600. File bytes are not read.
+fn preflight_owned_regular_destination(path: &Path) -> anyhow::Result<()> {
+    let name = path.file_name().context("output path has no file name")?;
+    let Some(directory) = open_usable_parent(output_parent(path))? else { return Ok(()) };
+    require_owned_regular_at(&directory, name, path)
+}
+
+fn open_nofollow_directory_at(parent: &std::fs::File, name: &std::ffi::OsStr) -> anyhow::Result<Option<std::fs::File>> {
+    use std::os::unix::{ffi::OsStrExt, io::{AsRawFd, FromRawFd}};
+    ensure!(!name.is_empty() && !name.as_bytes().contains(&b'/') && name != "." && name != "..", "invalid output parent component");
+    let c_name = std::ffi::CString::new(name.as_bytes()).context("output parent contains NUL")?;
+    let flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_RDONLY;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags, 0) };
+    if fd >= 0 { return Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) })); }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) { return Ok(None); }
+    Err(error).context("output parent is not a usable directory")
+}
+
+fn open_usable_parent(parent: &Path) -> anyhow::Result<Option<std::fs::File>> {
+    use std::path::Component;
+    let mut directory = if parent.is_absolute() {
+        std::fs::File::open("/").context("opening /")?
+    } else {
+        std::fs::File::open(".").context("opening .")?
+    };
+    let mut missing = false;
+    for component in parent.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            _ => anyhow::bail!("output parent {} must not contain parent components", parent.display()),
+        };
+        if missing { continue; }
+        match open_nofollow_directory_at(&directory, name)? {
+            Some(child) => directory = child,
+            None => missing = true,
+        }
+    }
+    Ok(if missing { None } else { Some(directory) })
+}
+
+fn require_owned_regular_at(directory: &std::fs::File, name: &std::ffi::OsStr, path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, io::{AsRawFd, FromRawFd}};
+    let destination = std::ffi::CString::new(name.as_bytes()).context("output name contains NUL")?;
+    let flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_RDONLY;
+    let existing = unsafe { libc::openat(directory.as_raw_fd(), destination.as_ptr(), flags, 0) };
+    if existing >= 0 {
+        let existing = unsafe { std::fs::File::from_raw_fd(existing) };
+        let metadata = existing.metadata().with_context(|| format!("reading {}", path.display()))?;
+        ensure!(metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o777 == 0o600,
+            "{} must be a single regular file owned by this user in mode 0600", path.display());
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        anyhow::bail!("{} must be a single regular file owned by this user in mode 0600, not a symlink", path.display());
+    }
+    ensure!(error.raw_os_error() == Some(libc::ENOENT), "opening {} failed: {}", path.display(), error);
+    Ok(())
+}
+
+/// Publishes `path` atomically through a no-follow parent descriptor. Calls
+/// `preflight_owned_regular_destination` before `create_dir_all`, then checks
+/// the same metadata again once that parent exists. A missing destination is
+/// created by the exclusive temp-and-renameat publish. A failed write leaves
+/// the existing file intact and no temporary survives.
+fn write_owned_regular(path: &Path, body: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::{ffi::OsStrExt, io::{AsRawFd, FromRawFd}};
+    preflight_owned_regular_destination(path)?;
+    let parent = output_parent(path);
+    let name = path.file_name().context("output path has no file name")?;
+    std::fs::create_dir_all(parent)?;
+    let directory = open_usable_parent(parent)?.with_context(|| format!("opening {}", parent.display()))?;
+    require_owned_regular_at(&directory, name, path)?;
+    let destination = std::ffi::CString::new(name.as_bytes()).context("output name contains NUL")?;
+    let temporary = std::ffi::CString::new(format!(".{}.tmp", name.to_string_lossy())).context("temporary name contains NUL")?;
+    let created = unsafe { libc::openat(directory.as_raw_fd(), temporary.as_ptr(), libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600) };
+    ensure!(created >= 0, "reserving a temporary for {} failed: {}", path.display(), std::io::Error::last_os_error());
+    let mut file = unsafe { std::fs::File::from_raw_fd(created) };
+    let publish = (|| {
+        std::io::Write::write_all(&mut file, body)?;
+        file.sync_all()?;
+        ensure!(unsafe { libc::renameat(directory.as_raw_fd(), temporary.as_ptr(), directory.as_raw_fd(), destination.as_ptr()) } == 0,
+            "publishing {} failed: {}", path.display(), std::io::Error::last_os_error());
+        Ok(directory.sync_all()?)
+    })();
+    if publish.is_err() { unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) }; }
+    publish.with_context(|| format!("writing {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt;
     #[test]
     fn policy_abi_requires_exact_visible_four_slot_storage() {
         let abi = serde_json::json!({"schema_version":"2.0.0","contract":{"state":[
@@ -743,7 +921,7 @@ mod tests {
 
     #[test]
     fn dense_export_keeps_validator_and_faucet_indices_without_relayer_secret() {
-        let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "policy.json"]).unwrap();
+        let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
         let account = account_fixture();
         let relayer = PsyCompactUserDefinition {
             public_key_info: PZKPublicKeyInfo { fingerprint: Hash::get_zero_value(), public_key_param: QHashOut(account.public_key_param().unwrap().0) },
@@ -763,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires approved PSY_GENESIS_CONTRACTS and PSY_MULTISIG_POLICY_ARTIFACT; run explicitly in QA"]
+    #[ignore = "requires approved PSY_GENESIS_CONTRACTS and the sibling compiler checkout; run explicitly in QA"]
     fn initialized_genesis_roots_authorize_first_ordinary_nonce_one() {
         use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
         use plonky2::{field::types::{Field, PrimeField64}, hash::poseidon::PoseidonPermutation};
@@ -788,16 +966,15 @@ mod tests {
         assert!(initialized_multisig_user(&account, &circuit, 0).is_err());
         assert!(initialized_multisig_user(&account, &circuit, F::ORDER).is_err());
         let contracts_path = std::env::var_os("PSY_GENESIS_CONTRACTS").expect("QA must supply approved Genesis contracts");
-        let artifact_path = std::env::var_os("PSY_MULTISIG_POLICY_ARTIFACT").expect("QA must supply approved multisig compiler artifact");
         let contracts = load_contracts(Path::new(&contracts_path)).unwrap();
-        let artifact_bytes = std::fs::read(artifact_path).unwrap();
-        validate_multisig_policy_artifact(&contracts, &artifact_bytes).unwrap();
+        let compiled = read_compiler_contract(&compiler_checkout(Path::new("..")).expect("sibling psy-compiler checkout"), "multisig_policy").unwrap();
+        validate_multisig_policy_artifact(&contracts, &compiled).unwrap();
         let mut wrong_height = contracts.clone();
         wrong_height[MULTISIG_POLICY_CONTRACT_ID as usize].code_definition.state_tree_height = 5;
-        assert!(validate_multisig_policy_artifact(&wrong_height, &artifact_bytes).is_err());
+        assert!(validate_multisig_policy_artifact(&wrong_height, &compiled).is_err());
         let mut wrong_code = contracts.clone();
         wrong_code[MULTISIG_POLICY_CONTRACT_ID as usize].code_root = Hash::get_zero_value();
-        assert!(validate_multisig_policy_artifact(&wrong_code, &artifact_bytes).is_err());
+        assert!(validate_multisig_policy_artifact(&wrong_code, &compiled).is_err());
         let stats = PQEDCheckpointLeafStats::<F, Hash>::new_empty();
         let genesis: PsyGenesisBlockSetupData<F, Hash> = serde_json::from_value(serde_json::json!({
             "contracts": contracts,
@@ -937,44 +1114,74 @@ mod tests {
     }
 
     #[test]
-    fn cli_requires_both_public_inputs_and_rejects_secret_flags() {
-        assert!(GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).is_err());
-        let public_args = ["generate-genesis-data", "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "policy.json"];
-        assert!(GenerateGenesisDataArgs::try_parse_from(public_args).is_ok());
-        for flag in ["--private-key", "--bridge-relayer-l2-private-key", "--keystore-path", "--psy-bridge-relayer-keystore-path", "--bridge-relayer-keystore-path", "--wallet-password"] {
+    fn cli_defaults_and_rejects_secret_flags() {
+        assert!(GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).is_ok());
+        let public_args = ["generate-genesis-data"];
+        for flag in ["--private-key", "--bridge-relayer-l2-private-key", "--keystore-path", "--psy-bridge-relayer-keystore-path", "--bridge-relayer-keystore-path", "--wallet-password", "--multisig-policy-artifact"] {
             let mut args = public_args.to_vec();
             args.extend([flag, "must-not-be-consumed"]);
             assert!(GenerateGenesisDataArgs::try_parse_from(args).is_err());
         }
-        assert!(GenerateGenesisDataArgs::try_parse_from(&public_args[..3]).is_err());
     }
 
     #[test]
-    fn missing_or_directory_public_inputs_fail_closed() {
-        assert!(read_public_input(Path::new("."), Path::new("")).is_err());
-        assert!(read_public_input(Path::new("."), Path::new(".")).is_err());
-        assert!(read_public_input(Path::new("."), Path::new("/definitely-missing-public-multisig-account")).is_err());
-        assert!(validate_multisig_policy_artifact(&[], br#"{"state_tree_height":4,"circuit_definitions":[]}"#).is_err());
+    fn missing_compiler_checkout_fails_closed() {
+        assert!(compiler_checkout(Path::new("/definitely-missing-compiler-parent")).is_err());
     }
 
     #[test]
-    fn malformed_public_account_does_not_create_outputs() {
+    fn missing_canonical_policy_fails_before_outputs() {
         let root = std::env::temp_dir().join(format!("psy-public-genesis-reject-{}", rand::random::<u64>()));
         std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("account.json"), b"{}").unwrap();
-        std::fs::write(root.join("contracts.json"), b"[]").unwrap();
+        std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
+        let mut config = serde_json::json!({ "networks": {} });
+        config["networks"][psy_config::CURRENT_NETWORK] = serde_json::json!({});
+        std::fs::write(root.join("psy-genesis/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         let args = GenerateGenesisDataArgs::try_parse_from([
             "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
-            "--genesis-contracts", root.join("contracts.json").to_str().unwrap(),
-            "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "absent.json",
         ]).unwrap();
-        assert!(generate_local_devnet_genesis(&args).is_err());
+        let error = format!("{:?}", generate_local_devnet_genesis(&args).unwrap_err());
+        assert!(error.contains(&format!("networks.{}.guardian_authorization.bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK)));
         assert!(!root.join("genesis.json").exists());
         assert!(!root.join("private_keys.json").exists());
         assert!(!root.join("psy-dapp").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
+
+    #[test]
+    fn duplicate_selected_network_fails_before_outputs() {
+        let root = std::env::temp_dir().join(format!("psy-duplicate-network-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
+        std::fs::write(root.join("psy-genesis/config.json"),
+            r#"{"networks":{"localhost":{},"localhost":{"guardian_authorization":{}}}}"#).unwrap();
+        let args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
+        ]).unwrap();
+        let error = format!("{:?}", generate_local_devnet_genesis(&args).unwrap_err());
+        assert!(error.contains("not duplicate-free JSON"));
+        assert!(!root.join("genesis.json").exists());
+        assert!(!root.join("private_keys.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_l1_endpoint_keys_fail_before_outputs() {
+        let root = std::env::temp_dir().join(format!("psy-duplicate-endpoint-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
+        std::fs::write(root.join("psy-genesis/config.json"),
+            r#"{"networks":{"localhost":{"guardian_authorization":{"bridge_relayer_signing_policy":"{}"},"l1_endpoints":[{"chain_index":0,"chain_index":0,"rpc_url":"http://127.0.0.1:8545"}]}}}"#).unwrap();
+        let args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
+        ]).unwrap();
+        let error = format!("{:?}", generate_local_devnet_genesis(&args).unwrap_err());
+        assert!(error.contains("not duplicate-free JSON"));
+        assert!(!root.join("genesis.json").exists());
+        assert!(!root.join("private_keys.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn default_relayer_registration_maps_to_default_user_id() {
         let user_id = UserIdBitsStrategy5::get_user_id_from_user_registration_id(2, 12, 20, 1);
@@ -985,5 +1192,120 @@ mod tests {
     fn validator_slot_parses_realm_sub_registration() {
         let slot: ValidatorSlot = "1,2,3".parse().unwrap();
         assert_eq!((slot.realm_id, slot.sub_id, slot.registration_id), (1, 2, 3));
+    }
+
+    fn compiled_fixture(stem: &str, height: u16, methods: serde_json::Value, state: serde_json::Value, definitions: Vec<psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition>) -> CompiledContract {
+        let abi = serde_json::json!({"schema_version": "2.0.0", "contract": {"name": stem, "state_tree_height": height, "state": state, "methods": methods}});
+        CompiledContract { raw: vec![], state_tree_height: height, circuit_definitions: definitions, abi }
+    }
+
+    fn method(name: &str, method_id: u32, inputs: usize, outputs: usize, view: bool, commands: Vec<psy_vm::dpn::ops::state_cmd::data::DPNStateCmd<u64>>, definitions: Vec<psy_vm::dpn::ops::op_types::DPNIndexedVarDef>) -> psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition {
+        psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition { name: name.into(), method_id, circuit_inputs: vec![0; inputs], circuit_outputs: vec![0; outputs], assertions: vec![], events: vec![], definitions, state_commands: commands, state_command_resolution_indices: vec![] }
+    }
+
+    fn literal(index: u64, value: u64) -> psy_vm::dpn::ops::op_types::DPNIndexedVarDef {
+        psy_vm::dpn::ops::op_types::DPNIndexedVarDef { data_type: psy_vm::dpn::ops::op_types::DPNBuiltInDataType::Target, index: index as usize, op_type: psy_vm::dpn::ops::op_types::DPNOpType::Constant, inputs: vec![value] }
+    }
+
+    fn token_fixture() -> CompiledContract {
+        use psy_vm::dpn::ops::state_cmd::data::{DPNStateCmd, DPNStateCmdContainsSelfUserCurrentIMTContractStateValue, DPNStateCmdSetIMTContractStateValue};
+        let read = DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(DPNStateCmdContainsSelfUserCurrentIMTContractStateValue { base_offset: 10, capacity: 11, key: [0; 4] });
+        let write = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue { condition: 0, base_offset: 10, capacity: 11, key: [0; 4], value: [0; 4] });
+        let definitions = vec![literal(10, 8_589_934_680), literal(11, 1_048_576)];
+        let state = serde_json::json!([{"name": "state_map", "offset": 8589934680u64, "felt_size": 4194304u64, "type": {"kind": "map", "map_kind": "map", "key": {"kind": "primitive", "name": "Hash"}, "value": {"kind": "primitive", "name": "Hash"}, "capacity": 1048576, "value_felt_size": 4, "alignment_felts": 4}}]);
+        compiled_fixture("token", 32, serde_json::json!([{"name": "withdraw", "method_id": 7, "input_felt_count": 0, "output_felt_count": 0, "state_mutability": "external"}]), state, vec![method("withdraw", 7, 0, 0, false, vec![read, write], definitions)])
+    }
+
+    #[test]
+    fn compiler_checkout_requires_the_sibling_repository() {
+        assert!(compiler_checkout(Path::new("/definitely-missing-compiler-parent")).is_err());
+        let parent = std::env::temp_dir().join(format!("psy-compiler-parent-{}", rand::random::<u64>()));
+        std::fs::create_dir(&parent).unwrap();
+        assert!(read_compiler_contract(&parent, "token").is_err());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn descriptor_rejects_a_stamp_disagreement_and_a_changed_hash() {
+        let bundle = b"[]";
+        let mut stamp = stamp_fixture(bundle);
+        stamp["artifactSha256"] = serde_json::json!("e".repeat(64));
+        assert!(validate_contracts_stamp(&serde_json::to_vec(&stamp).unwrap(), bundle).is_err());
+        stamp["artifactByteSize"] = serde_json::json!(bundle.len() + 1);
+        stamp["artifactSha256"] = stamp_fixture(bundle)["artifactSha256"].clone();
+        assert!(validate_contracts_stamp(&serde_json::to_vec(&stamp).unwrap(), bundle).is_err());
+    }
+
+    #[test]
+    fn withdrawal_layout_comes_from_the_compiled_map() {
+        let compiled = token_fixture();
+        let layout = derive_withdrawal_layout(&compiled).unwrap();
+        assert_eq!((layout.subslot_base, layout.capacity), (8_589_934_680, 1_048_576));
+        let mut unaligned = compiled.abi.clone();
+        unaligned["contract"]["state"][0]["offset"] = serde_json::json!(1);
+        let mut moved = token_fixture();
+        moved.abi = unaligned;
+        assert!(derive_withdrawal_layout(&moved).is_err());
+        let mut duplicated = token_fixture();
+        let field = duplicated.abi["contract"]["state"][0].clone();
+        duplicated.abi["contract"]["state"].as_array_mut().unwrap().push(field);
+        assert!(derive_withdrawal_layout(&duplicated).is_err());
+    }
+
+    #[test]
+    fn withdrawal_imt_requires_one_write_preceded_by_a_matching_read() {
+        use psy_vm::dpn::ops::state_cmd::data::{DPNStateCmd, DPNStateCmdContainsSelfUserCurrentIMTContractStateValue, DPNStateCmdSetIMTContractStateValue};
+        let write = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue { condition: 0, base_offset: 10, capacity: 10, key: [0; 4], value: [0; 4] });
+        let mut write_first = token_fixture();
+        write_first.circuit_definitions[0].state_commands = vec![write.clone()];
+        assert!(require_withdrawal_imt(&write_first).is_err());
+        let foreign = DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(DPNStateCmdContainsSelfUserCurrentIMTContractStateValue { base_offset: 12, capacity: 13, key: [0; 4] });
+        let mut disagreeing = token_fixture();
+        disagreeing.circuit_definitions[0].definitions.extend([literal(12, 7), literal(13, 7)]);
+        disagreeing.circuit_definitions[0].state_commands.insert(0, foreign);
+        assert!(require_withdrawal_imt(&disagreeing).is_err());
+        let mut reused = token_fixture();
+        reused.circuit_definitions[0].state_commands.push(write);
+        assert!(require_withdrawal_imt(&reused).is_err());
+    }
+
+    #[test]
+    fn first_publish_creates_missing_outputs_and_failed_replace_preserves() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("psy-owned-regular-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let private_keys = root.join("private_keys.json");
+        write_owned_regular(&private_keys, b"first body").expect("first fresh publish needs no pre-created destination");
+        let metadata = std::fs::metadata(&private_keys).unwrap();
+        assert!(metadata.is_file() && metadata.nlink() == 1 && metadata.mode() & 0o777 == 0o600);
+        assert_eq!(std::fs::read(&private_keys).unwrap(), b"first body");
+        write_owned_regular(&private_keys, b"second body").expect("existing owned destination is replaced");
+        assert_eq!(std::fs::read(&private_keys).unwrap(), b"second body");
+        let faucet = root.join("faucetOperators.json");
+        std::fs::write(&faucet, b"retained").unwrap();
+        std::fs::set_permissions(&faucet, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(write_owned_regular(&faucet, b"replacement").is_err());
+        assert_eq!(std::fs::read(&faucet).unwrap(), b"retained");
+        assert!(!root.join(".faucetOperators.json.tmp").exists());
+        let owned = root.join("owned.json");
+        write_owned_regular(&owned, b"public").unwrap();
+        let link = root.join("linked.json");
+        std::os::unix::fs::symlink(&owned, &link).unwrap();
+        assert!(write_owned_regular(&link, b"replacement").is_err());
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&owned).unwrap(), b"public");
+        let hard_source = root.join("hard-source.json");
+        let hard_dest = root.join("hard-dest.json");
+        std::fs::write(&hard_source, b"public").unwrap();
+        std::fs::set_permissions(&hard_source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&hard_source, &hard_dest).unwrap();
+        assert!(write_owned_regular(&hard_dest, b"replacement").is_err());
+        assert_eq!(std::fs::metadata(&hard_dest).unwrap().nlink(), 2);
+        assert_eq!(std::fs::read(&hard_dest).unwrap(), b"public");
+        let nested = root.join("psy-dapp/apps/bridge/src/config/faucetOperators.json");
+        write_owned_regular(&nested, b"created").expect("missing faucet parent is created at publication");
+        assert_eq!(std::fs::metadata(&nested).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&nested).unwrap(), b"created");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

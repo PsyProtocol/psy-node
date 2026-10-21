@@ -2,7 +2,7 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-09-07. Status: Review.
+> Updated: 2026-10-19. Status: Review.
 
 ## Terminology
 
@@ -14,7 +14,7 @@ Realm P2P is the standard Realm launcher path. Validator membership and public r
 
 ## Background
 
-Public membership must agree with local secrets, Genesis, and the compiled network. Startup rejects ambiguity rather than selecting the first identity match. The selected-network loader is `psy_cli/psy_node_cli/src/node/realm_p2p.rs:148-190`; processor/Genesis identity checks are at `psy_cli/psy_node_cli/src/node/realm_p2p.rs:462-535`.
+Public membership must agree with local secrets, Genesis, and the compiled network. Startup rejects ambiguity rather than selecting the first identity match. The selected-network loader is `load_selected_network` (`psy_cli/psy_node_cli/src/node/realm_p2p.rs:150-173`); processor/Genesis identity checks are `validate_processor_identity` (`psy_cli/psy_node_cli/src/node/realm_p2p.rs:412-497`).
 
 ## Table of Contents
 
@@ -80,9 +80,9 @@ Local-devnet example above uses reserved Strategy5 user ids for Realm 0 subs `1`
 
 The validator sub-id is not stored. It is the validator's one-based array position. This preserves existing port and database namespaces (`realm_{id}_{sub}`). `validator_user_id` must lie in the owning Realm's half-open user range. Local-devnet genesis pre-places dedicated ZK validator accounts at registrations `0`, `1`, `3`, `4` for realms `0..1` (Strategy5 GROUP=1), keeps registration `2` as the bridge relayer (`user_id` `524288`), and has the launcher bind `(realm_id, sub_id)` to those reserved validator accounts rather than picking ordinary faucet users. Realm 0 sub 1 is intentionally registration `0` / `user_id` `0`.
 
-The exact reserved mapping is `(realm 0, sub 1) -> registration 0 -> user 0`, `(realm 0, sub 2) -> registration 4 -> user 262144`, `(realm 1, sub 1) -> registration 1 -> user 1048576`, and `(realm 1, sub 2) -> registration 3 -> user 1572864` (`dev/locSetupV4.ts:978-1013`). The structural example above intentionally uses descriptive placeholders for public keys and PeerIds; obtain real values from key generation, not by copying the example.
+The exact reserved mapping is `(realm 0, sub 1) -> registration 0 -> user 0`, `(realm 0, sub 2) -> registration 4 -> user 262144`, `(realm 1, sub 1) -> registration 1 -> user 1048576`, and `(realm 1, sub 2) -> registration 3 -> user 1572864` (`dev/locSetupV4.ts`, `reservedValidatorRegistrationId` and `reservedValidatorUserId`). The structural example above intentionally uses descriptive placeholders for public keys and PeerIds; obtain real values from key generation, not by copying the example.
 
-`checkpoints_per_epoch` is build-time circuit input. Runtime rotation uses `psy_config::CHECKPOINTS_PER_EPOCH`, not a mutable runtime JSON override (`psy_data/src/config/network_config.rs:61-81`; `psy_cli/psy_node_cli/src/node/realm_p2p.rs:345,373,402`). Localhost currently configures 10 (`psy-genesis/config.json:9-10`). Active Realms must have identical validator counts. Changing the source configuration requires the matching compiled artifacts; editing only the injected runtime configuration cannot change the rotation constant.
+`checkpoints_per_epoch` is build-time circuit input. Runtime rotation uses `psy_config::CHECKPOINTS_PER_EPOCH`, not a mutable runtime JSON override (`psy_data/src/config/network_config.rs:61-81`; `psy_cli/psy_node_cli/src/node/realm_p2p.rs:325,354`). Localhost currently configures 10 (`psy-genesis/config.json:9-10`). Active Realms must have identical validator counts. Changing the source configuration requires the matching compiled artifacts; editing only the injected runtime configuration cannot change the rotation constant.
 
 ## Fail-Closed Startup
 
@@ -96,9 +96,23 @@ Realm rollback loads the same processor config and resolves the one-based sub-id
 
 ## Launcher Behavior
 
-Core startup creates or loads two ordered validators per Realm, injects their public identities into `genesis.json`, exports `PSY_CONFIG_PATH`, and starts processor/edge listeners (`dev/locSetupV4.ts:4048-4056,4152-4243`). Component-only modes without core processors do not mutate Genesis or generate validator secrets. Controlled process-only resume replays saved commands without rerunning this setup phase.
+Core startup creates or loads two ordered validators per Realm, exports `PSY_CONFIG_PATH`, and starts processor/edge listeners. Both foreground and daemon startup call the same `ensureRealmP2pConfig` preflight before injecting membership with `injectGenesisValidators` (`dev/locSetupV4.ts`). Component-only modes without core processors do not mutate Genesis or generate validator secrets. Controlled process-only resume replays saved commands without rerunning this setup phase.
 
-Runtime config reuse requires all requested secret files, matching identities/topology, matching epoch metadata, and `genesisConfigHash` equal to the SHA-256 digest of the source `psy-genesis/config.json` (`dev/locSetupV4.ts:1149-1199,1237-1287`). A changed source config invalidates reuse. Daemon core startup derives a separate public config using Compose service names while listeners bind wildcard addresses (`dev/locSetupV4.ts:1202-1223,4870-4875`).
+Runtime reuse is identity-preserving. `planRealmP2pConfig` requires compatible requested Realm IDs, ordered validator user IDs, public host/ports, edge counts, and consensus fields (P2P settings, magic, user counts and tree heights). Incompatible existing state raises an error rather than regenerating identities. The whole-source SHA-256 `genesisConfigHash` is generation provenance, not an invalidation trigger: endpoint edits, whitespace changes, and missing or stale hash metadata do not authorize key generation.
+
+`ensureRealmP2pConfig` inventories every entry in `local_checkpoints/realm_p2p`. Existing state requires `config.json` and every requested processor Ed25519, BLS, ZK, and edge identity file. The optional `daemon-config.json` is recognized; unexpected artifacts, directories, symlinks, missing files, and malformed runtime configuration fail closed before writes. Only an absent or empty runtime directory together with empty Genesis validator membership permits `init-realm-p2p-keys`. Initial generation binds the reserved Genesis ZK keys; ordinary reuse never rewrites ZK or other secret files. File presence is an inventory check, **not cryptographic validation**; the node still derives and checks public identities from local secrets.
+
+Before refreshing existing configuration, the launcher compares canonical Genesis membership (Realm ID, validator user ID, processor NodeId, BLS public key). Identical nonempty membership is a byte-preserving no-op in `injectGenesisValidators`; conflicting membership rejects, and empty initial membership can be populated. Membership comparison ignores array ordering, not identity differences. These checks do not bypass database Genesis/CST guards and do not repair previously overwritten identities or Genesis.
+
+The only source fields refreshed on reuse are `prove_proxy_url` and `system_prove_proxy_url`, independently, from the selected source network in `psy-genesis/config.json`. Distinct normal and system endpoints remain distinct; neither falls back to the other. An absent source field is removed from the runtime config. All other runtime fields, validator identities, peer addresses, and generation hash metadata remain unchanged. No file is rewritten when neither endpoint field changes. Daemon core startup derives a separate public config using Compose service names via `daemonRealmP2pConfig`; it retains the same membership and both endpoint fields while listeners bind wildcard addresses.
+
+Foreground `make run-all` starts prove-proxy index 0 as service `prove_proxy_0` on port 9999 with `psy_user_cli prove-proxy --role all` (`dev/locSetupV4.ts:5935-5945`). That role serves both user and system proofs. Daemon Compose starts `prove-proxy-0` without `--role` (`dev/locSetupV4.ts:7006-7009`), so `ProveProxyArgs.role` stays the user-only default (`client_prover/psy_core/psy_common/src/args.rs:232-233`). Do not describe every proxy process as serving system proofs, and do not call the process `local0`. The checked-in `prove_proxy_url` is the selected public config value; do not copy a workstation LAN address into this runbook.
+
+Fixture regression coverage lives in `dev/locSetupV4.test.ts` under `realm P2P launch planning` and `injectGenesisValidators`. Run from the repository root:
+
+```sh
+bun test dev/locSetupV4.test.ts --test-name-pattern 'realm P2P launch planning|injectGenesisValidators'
+```
 
 ## Security Considerations
 

@@ -21,8 +21,8 @@ use crate::bridge::constants::{BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID};
 pub struct ProposeWithdrawalsArgs {
     #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
-    #[clap(long, env = "PSY_GUARDIAN_CONFIG")]
-    pub guardian_config: String,
+    #[clap(long, env = "PSY_GUARDIAN_ROOT")]
+    pub guardian_root: String,
     #[clap(long, env = "PSY_SERVICES_URL")]
     pub services_url: Option<String>,
     #[clap(long, env = "PSY_WITHDRAW_METHOD_ID")]
@@ -429,7 +429,7 @@ pub(crate) fn compute_withdrawal_leaf_words(
     ])
 }
 
-fn compute_withdrawal_leaf_hash(
+pub(crate) fn compute_withdrawal_leaf_hash(
     sender_user_id: u64,
     recipient: [u32; 8],
     token_address: [u32; 8],
@@ -462,11 +462,11 @@ pub async fn fetch_pending_bridge_withdrawals(
     _from_checkpoint: u64,
     _to_checkpoint_exclusive: u64,
     chain_offsets: &[(u64, u64)],
-    guardian: &super::guardian_client::LoadedGuardianConfig,
+    network: &psy_config::NetworkConfigGoldilocks,
 ) -> anyhow::Result<Vec<PendingWithdrawal>> {
 
     let http = build_default_http_client()?;
-    let services_url = resolve_services_url(&args.services_url, &guardian.root.network)?;
+    let services_url = resolve_services_url(&args.services_url, network)?;
 
     let requested: Vec<(u64, u64)> = if chain_offsets.is_empty() {
         args.destination_chain_indices
@@ -600,9 +600,9 @@ pub async fn build_withdrawal_round_plan(
     args: &ProposeWithdrawalsArgs,
     from_checkpoint: u64,
     to_checkpoint_exclusive: u64,
-    guardian: &super::guardian_client::LoadedGuardianConfig,
+    network: &psy_config::NetworkConfigGoldilocks,
 ) -> anyhow::Result<WithdrawalRoundPlan> {
-    let discovered = fetch_pending_bridge_withdrawals(args, from_checkpoint, to_checkpoint_exclusive, &[], guardian).await?;
+    let discovered = fetch_pending_bridge_withdrawals(args, from_checkpoint, to_checkpoint_exclusive, &[], network).await?;
     let mut plan = WithdrawalRoundPlan::default();
     for withdrawal in discovered {
         plan.append_withdrawals.push(withdrawal.clone());
@@ -615,9 +615,9 @@ pub async fn discover_withdrawals(
     args: &ProposeWithdrawalsArgs,
     from_checkpoint: u64,
     to_checkpoint_exclusive: u64,
-    guardian: &super::guardian_client::LoadedGuardianConfig,
+    network: &psy_config::NetworkConfigGoldilocks,
 ) -> anyhow::Result<Vec<PendingWithdrawal>> {
-    Ok(build_withdrawal_round_plan(args, from_checkpoint, to_checkpoint_exclusive, guardian)
+    Ok(build_withdrawal_round_plan(args, from_checkpoint, to_checkpoint_exclusive, network)
         .await?
         .append_withdrawals)
 }
@@ -690,7 +690,7 @@ pub async fn run_and_get_withdrawal_root(
         );
     }
 
-    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, &[], guardian).await?;
+    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, &[], &guardian.root.network).await?;
 
     if discovered.is_empty() {
         tracing::info!(from_checkpoint, to_checkpoint_exclusive, "no withdrawal events found in range");
@@ -729,10 +729,8 @@ pub async fn run_and_get_withdrawal_root(
 }
 
 pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
-    let history = super::guardian_client::LoadedGuardianConfig::load(std::path::Path::new(&args.guardian_config))?;
-    let external = psy_config::PsyConfigGoldilocks::builder().path(&args.rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
-    history.root.validate_rpc_network(external.get_current_network()?)?;
-    let provider = guardian_common::runtime::load_network(&history.root, history.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let history = super::guardian_client::LoadedGuardianConfig::load(std::path::Path::new(&args.rpc_config), std::path::Path::new(&args.guardian_root))?;
+    let provider = guardian_common::runtime::load_network(&history.root, history.authorization()).map_err(|error| anyhow::anyhow!("{error}"))?;
     let (from_checkpoint, requested_to_checkpoint_exclusive) = resolve_scan_range(&args)?;
     let latest_checkpoint = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
     let to_checkpoint_exclusive = requested_to_checkpoint_exclusive.min(latest_checkpoint);

@@ -11,15 +11,196 @@ export const FAUCET_ENV_KEYS = [
     "PSY_FAUCET_WINDOW_CHECKPOINTS",
 ] as const;
 
-export function psyServicesDatabaseCommands(purge: boolean, databaseExists: boolean): string[][] {
-    const prefix = ['docker', 'exec', 'generated-envio-postgres-1'];
-    if (purge) {
-        return [
-            [...prefix, 'dropdb', '-U', 'postgres', '--if-exists', 'psy_services'],
-            [...prefix, 'createdb', '-U', 'postgres', 'psy_services'],
-        ];
+/** Unset or empty keeps the checkout's existing Docker identities. */
+export const DEVNET_NAMESPACE_ENV = "PSY_DEVNET_NAMESPACE";
+
+const DEVNET_NAMESPACE_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
+const DOCKER_OBJECT_NAME_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,62}$/;
+
+export const LEGACY_ENVIO_COMPOSE_PROJECT = "generated";
+export const LEGACY_ENVIO_NETWORK = "local_test_network";
+export const ENVIO_POSTGRES_SERVICE = "envio-postgres";
+export const ENVIO_DATA_VOLUME = "db_data";
+
+const DB_CONTAINER_SUFFIX = {
+    valkey: "valkey-server",
+    nats: "nats-server",
+    scylla: "scylla-server",
+    nostr: "nostr-relay",
+} as const;
+
+const DB_VOLUME_SUFFIX = {
+    valkey: "psy-devnet-redis",
+    scylla: "psy-devnet-scylla",
+    scyllaData: "psy-devnet-scylla-data",
+    nats: "psy-devnet-nats",
+} as const;
+
+export type DevnetDbContainers = { [Key in keyof typeof DB_CONTAINER_SUFFIX]: string };
+export type DevnetDbVolumes = { [Key in keyof typeof DB_VOLUME_SUFFIX]: string };
+
+export type DevnetDbNames = {
+    namespace: string | null;
+    containers: DevnetDbContainers;
+    volumes: DevnetDbVolumes;
+    envioComposeProject: string;
+    envioNetwork: string;
+    envioPostgresContainer: string;
+    envioDataVolume: string;
+};
+
+export type DevnetIsolationResources = {
+    containers: string[];
+    volumes: string[];
+    networks: string[];
+};
+
+function assertDockerObjectName(value: string, label: string): void {
+    if (!DOCKER_OBJECT_NAME_PATTERN.test(value)) {
+        throw new Error(`${label} is not a usable Docker object name`);
     }
-    return databaseExists ? [] : [[...prefix, 'createdb', '-U', 'postgres', 'psy_services']];
+}
+
+function prefixDevnetName(namespace: string | null, legacyName: string): string {
+    return namespace == null ? legacyName : `${namespace}-${legacyName}`;
+}
+
+function devnetDbNames(namespace: string | null): DevnetDbNames {
+    const containers = {
+        valkey: prefixDevnetName(namespace, DB_CONTAINER_SUFFIX.valkey),
+        nats: prefixDevnetName(namespace, DB_CONTAINER_SUFFIX.nats),
+        scylla: prefixDevnetName(namespace, DB_CONTAINER_SUFFIX.scylla),
+        nostr: prefixDevnetName(namespace, DB_CONTAINER_SUFFIX.nostr),
+    };
+    const volumes = {
+        valkey: prefixDevnetName(namespace, DB_VOLUME_SUFFIX.valkey),
+        scylla: prefixDevnetName(namespace, DB_VOLUME_SUFFIX.scylla),
+        scyllaData: prefixDevnetName(namespace, DB_VOLUME_SUFFIX.scyllaData),
+        nats: prefixDevnetName(namespace, DB_VOLUME_SUFFIX.nats),
+    };
+    const envioComposeProject = prefixDevnetName(namespace, LEGACY_ENVIO_COMPOSE_PROJECT);
+    const envioNetwork = namespace == null ? LEGACY_ENVIO_NETWORK : `${namespace}-${LEGACY_ENVIO_NETWORK}`;
+    const names = {
+        namespace,
+        containers,
+        volumes,
+        envioComposeProject,
+        envioNetwork,
+        envioPostgresContainer: `${envioComposeProject}-${ENVIO_POSTGRES_SERVICE}-1`,
+        envioDataVolume: `${envioComposeProject}_${ENVIO_DATA_VOLUME}`,
+    };
+    for (const name of [...Object.values(containers), ...Object.values(volumes), envioComposeProject, envioNetwork, names.envioPostgresContainer, names.envioDataVolume]) {
+        assertDockerObjectName(name, "Resolved devnet resource");
+    }
+    return names;
+}
+
+export const LEGACY_DEVNET_DB_NAMES: DevnetDbNames = devnetDbNames(null);
+
+/**
+ * One resolved identity for the four DB containers and volumes, the Envio
+ * Compose project, its explicit network, and the Postgres service container.
+ * Null, undefined, and "" keep legacy names. Any other value must match
+ * `^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$`; namespaced results never equal a
+ * legacy identity. `dev/start_db.sh` applies the same container and volume rule.
+ */
+export function resolveDevnetDbNames(namespace: string | null | undefined): DevnetDbNames {
+    if (namespace == null || namespace === "") return LEGACY_DEVNET_DB_NAMES;
+    if (!DEVNET_NAMESPACE_PATTERN.test(namespace)) {
+        throw new Error(`${DEVNET_NAMESPACE_ENV} is invalid`);
+    }
+    return devnetDbNames(namespace);
+}
+
+export function resolveDevnetDbNamesFromEnv(
+    env: Readonly<Record<string, string | undefined>>,
+): DevnetDbNames {
+    return resolveDevnetDbNames(env[DEVNET_NAMESPACE_ENV]);
+}
+
+export function devnetDbContainerNames(names: DevnetDbNames): string[] {
+    return [names.containers.valkey, names.containers.nats, names.containers.scylla, names.containers.nostr];
+}
+
+export function devnetDbVolumeNames(names: DevnetDbNames): string[] {
+    return [names.volumes.valkey, names.volumes.scylla, names.volumes.scyllaData, names.volumes.nats];
+}
+
+/** Containers, volumes, and network a selected namespace must not already own. */
+export function devnetIsolationResources(names: DevnetDbNames): DevnetIsolationResources {
+    return {
+        containers: [...devnetDbContainerNames(names), names.envioPostgresContainer],
+        volumes: [...devnetDbVolumeNames(names), names.envioDataVolume],
+        networks: [names.envioNetwork],
+    };
+}
+
+function envioPostgresExec(postgresContainer: string, command: readonly string[]): string[] {
+    assertDockerObjectName(postgresContainer, "Envio Postgres container");
+    return ["docker", "exec", postgresContainer, ...command];
+}
+
+export function psyServicesDatabaseCommands(
+    purge: boolean,
+    databaseExists: boolean,
+    postgresContainer: string = LEGACY_DEVNET_DB_NAMES.envioPostgresContainer,
+): string[][] {
+    const drop = envioPostgresExec(postgresContainer, ["dropdb", "-U", "postgres", "--if-exists", "psy_services"]);
+    const create = envioPostgresExec(postgresContainer, ["createdb", "-U", "postgres", "psy_services"]);
+    if (purge) return [drop, create];
+    return databaseExists ? [] : [create];
+}
+
+export function envioPostgresReadinessCommand(
+    postgresContainer: string = LEGACY_DEVNET_DB_NAMES.envioPostgresContainer,
+): string[] {
+    return envioPostgresExec(postgresContainer, ["psql", "-U", "postgres", "-d", "postgres", "-c", "select 1"]);
+}
+
+export function envioServicesDatabaseProbeCommand(
+    postgresContainer: string = LEGACY_DEVNET_DB_NAMES.envioPostgresContainer,
+): string[] {
+    return envioPostgresExec(postgresContainer, [
+        "psql", "-U", "postgres", "-d", "postgres", "-tAc",
+        "SELECT 1 FROM pg_database WHERE datname = 'psy_services'",
+    ]);
+}
+
+export function envioComposeCommand(
+    composeFile: string,
+    project: string,
+    args: readonly string[],
+): string[] {
+    assertDockerObjectName(project, "Envio Compose project");
+    if (composeFile.trim() === "" || args.length === 0 || args.some((arg) => arg === "")) {
+        throw new Error("Envio Compose command is incomplete");
+    }
+    return ["docker", "compose", "-p", project, "-f", composeFile, ...args];
+}
+
+const ENVIO_NETWORK_NAME_LINE = /^([ \t]*)name:[ \t]*["']?([A-Za-z0-9][A-Za-z0-9_.-]*)["']?[ \t]*$/;
+
+/**
+ * Rewrites the generated Compose network's explicit `local_test_network` name.
+ * Other `name:` entries are left alone. A namespaced run must find that line;
+ * repeating the rewrite is a no-op.
+ */
+export function applyEnvioNetworkName(composeYaml: string, networkName: string): string {
+    assertDockerObjectName(networkName, "Envio network");
+    const lines = composeYaml.split("\n");
+    let matches = 0;
+    for (let index = 0; index < lines.length; index += 1) {
+        const match = lines[index].match(ENVIO_NETWORK_NAME_LINE);
+        if (!match) continue;
+        const current = match[2];
+        if (current !== LEGACY_ENVIO_NETWORK && current !== networkName) continue;
+        matches += 1;
+        if (current !== networkName) lines[index] = `${match[1]}name: ${networkName}`;
+    }
+    if (matches !== 1) {
+        throw new Error(`Envio compose must contain exactly one explicit ${LEGACY_ENVIO_NETWORK} network name`);
+    }
+    return lines.join("\n");
 }
 
 export function pinFaucetPerClaimAmount(json: string): string {

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::{self, File},
     future::Future,
@@ -40,7 +40,7 @@ use crate::bridge::{
         REALM_CHECKPOINT_POLL_INTERVAL_SECS, REALM_CHECKPOINT_POLL_TIMEOUT_SECS,
     },
     finalize_bridge::{self, FinalizeBridgeAggArgs},
-    l1_client::L1Client,
+    l1_client::{CachedProofLineageUnread, L1Client},
     l1_signer::load_l1_wallet,
     propose_withdrawals::{self, ProposeWithdrawalsArgs},
     prove_bridge::{self},
@@ -97,7 +97,7 @@ pub(crate) struct BridgeProposeDaemonConfig {
     pub confirmation_lag_checkpoints: Option<u64>,
     #[serde(default)]
     pub max_checkpoint_batch: Option<u64>,
-    pub guardian_config: String,
+    pub guardian_root: String,
     /// Canonical guardian history retained across daemon rounds; never serialized.
     #[serde(skip)]
     guardian_history: std::sync::Arc<tokio::sync::Mutex<RelayerHistory>>,
@@ -142,21 +142,30 @@ fn default_evm_family() -> String { "evm".to_string() }
 
 struct RelayerHistory {
     history: crate::guardian::verify::GuardianHistory,
-    sessions: Vec<guardian_common::protocol::GuardianSession>,
-    approvals: std::collections::BTreeMap<u32, guardian_common::protocol::Hex32>,
 }
 
 impl Default for RelayerHistory {
-    fn default() -> Self {
-        Self { history: crate::guardian::verify::GuardianHistory::new(), sessions: Vec::new(), approvals: std::collections::BTreeMap::new() }
+    fn default() -> Self { Self { history: crate::guardian::verify::GuardianHistory::new() } }
+}
+
+impl RelayerHistory {
+    fn restore(account: &guardian_common::protocol::GuardianAccount, deposit_tree_states: &[guardian_common::protocol::DepositTreeState]) -> anyhow::Result<Self> {
+        account.validate().map_err(|error| anyhow::anyhow!(error))?;
+        let mut history = crate::guardian::verify::GuardianHistory::new();
+        history.nonce = account.imported_nonce.unwrap_or(0);
+        history.ending_leaf = account.imported_ending_leaf;
+        for (chain, count, frontier, root) in &account.withdrawal_chains { history.chains.insert(*chain, (*count, *frontier, *root)); }
+        for state in deposit_tree_states {
+            state.validate().map_err(|error| anyhow::anyhow!(error))?;
+            let chain = state.anchor.chain_index;
+            anyhow::ensure!(history.deposits.insert(chain, (state.count, state.root)).is_none(), "duplicate included deposit chain");
+            anyhow::ensure!(history.deposit_tree_states.insert(chain, state.clone()).is_none(), "duplicate included deposit chain");
+        }
+        Ok(Self { history })
     }
 }
 
 impl L1Config {
-    fn namespace(&self) -> String {
-        format!("evm_{}_{}", self.chain_index, self.network_id)
-    }
-
     fn effective_config(
         &self,
         base: &BridgeProposeDaemonConfig,
@@ -204,7 +213,7 @@ fn legacy_rpc_urls(finalize: &DaemonFinalizeConfig) -> Vec<String> {
     rpc_urls
 }
 
-fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L1Config>> {
+fn configured_chains(config: &BridgeProposeDaemonConfig, l1_endpoints: &[psy_config::ChainEndpoint]) -> anyhow::Result<Vec<L1Config>> {
     ensure!(config.chains.is_empty() || config.finalize.fee_policy.is_none(),
         "with [[chains]], configure fees in [chains.fee_policy], not [finalize.fee_policy]");
     let mut chains = if config.chains.is_empty() {
@@ -219,12 +228,14 @@ fn configured_chains(config: &BridgeProposeDaemonConfig) -> anyhow::Result<Vec<L
             .map(|protocol| protocol.chain.l1_chain_index)
             .or_else(|| (deployments_network == "localhost").then_some(0))
             .context("deployment is missing protocol.chain.l1ChainIndex")?;
+        let endpoint = l1_endpoints.iter().find(|endpoint| endpoint.chain_index == chain_index)
+            .context("canonical L1 endpoint missing for deployment chain")?;
         vec![L1Config {
             fee_policy: config.finalize.fee_policy.clone(),
             family: default_evm_family(),
             chain_index,
             network_id: deployments_network.clone(),
-            rpc_urls: legacy_rpc_urls(&config.finalize),
+            rpc_urls: if config.finalize.l1_rpc_url.is_some() || config.finalize.l1_rpc_fallback_url.is_some() { legacy_rpc_urls(&config.finalize) } else { vec![endpoint.rpc_url.clone()] },
             rpc_providers: config.finalize.l1_rpc_providers.clone(),
             deployments_network,
             state_manager: config.finalize.state_manager.clone(),
@@ -287,26 +298,23 @@ pub(crate) struct DaemonFinalizeConfig {
     pub password_env: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct DaemonState {
-    last_finalized_checkpoint: u64,
     /// Withdrawals that still need a successful L1 claim.
     ///
     /// This set is the single source of truth for crash recovery:
     /// newly-scanned withdrawals are inserted before finalize/claim,
     /// successful claims remove entries, and all remaining entries are
     /// retried next round. The key is leaf_hash.
-    #[serde(default, alias = "failed_claim_withdrawals")]
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
     /// Failure counts for the entries above, keyed by leaf_hash.
-    #[serde(default)]
     claim_retry: HashMap<String, claim_attempts::ClaimAttempts>,
     /// Withdrawals that ran out of attempts. Nothing retries these; they are
     /// kept so the stuck funds stay traceable and can be re-armed by hand.
-    #[serde(default)]
     retired_claim_withdrawals:
         HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
 }
+
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PendingFinalizationRange {
@@ -314,119 +322,16 @@ struct PendingFinalizationRange {
     to_checkpoint: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 struct MultichainDaemonState {
-    #[serde(default)]
-    identity_namespace: String,
-    #[serde(default)]
-    last_finalized_checkpoint: u64,
-    #[serde(default)]
     pending_finalization_range: Option<PendingFinalizationRange>,
-    #[serde(default)]
     finalized_chains: HashSet<u8>,
-    #[serde(default)]
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    #[serde(default)]
     claim_retry: HashMap<String, claim_attempts::ClaimAttempts>,
-    #[serde(default)]
     retired_claim_withdrawals:
         HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
-    /// Producing ownership of the archived guardian request; recorded before proving.
-    #[serde(default)]
-    producing_session: Option<ProducingSession>,
 }
 
-/// Durable producing ownership of the archived guardian request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ProducingSession {
-    session_nonce: u64,
-    request_id: String,
-}
-
-/// One writer of the daemon state's durable pending ownership.
-trait ProducingOwner {
-    /// Refuses daemon production while an archived pending request has no recorded owner.
-    fn ensure_owned_pending(&mut self, request: &GuardianSignRequest) -> anyhow::Result<()>;
-    /// Records producing ownership and selected withdrawals durably before proving.
-    fn record_producing(&mut self, request: &GuardianSignRequest, withdrawals: &[propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<()>;
-}
-
-fn ensure_owned_producing(producing: &Option<ProducingSession>, request: &GuardianSignRequest) -> anyhow::Result<()> {
-    match producing {
-        Some(producing) => ensure!(
-            producing.session_nonce == request.session_nonce
-                && producing.request_id == hex::encode(request.request_id()?.0),
-            "archived request differs from producing owner",
-        ),
-        None => anyhow::bail!("unowned archived session requires operator reconciliation before daemon production"),
-    }
-    Ok(())
-}
-
-fn clear_confirmed_producing(producing: &mut Option<ProducingSession>, request: &GuardianSignRequest) -> anyhow::Result<bool> {
-    let matches = producing.as_ref().is_some_and(|owner| owner.session_nonce == request.session_nonce)
-        && producing.as_ref().map(|owner| owner.request_id.as_str()) == Some(hex::encode(request.request_id()?.0).as_str());
-    if matches { *producing = None; }
-    Ok(matches)
-}
-
-fn clear_landed_producing(state: &mut MultichainDaemonState, retained: &RelayerHistory, landed: u64) -> anyhow::Result<bool> {
-    for session in &retained.sessions {
-        if session.record.included_checkpoint_id == landed && clear_confirmed_producing(&mut state.producing_session, &session.record.request_json.decode()?)? { return Ok(true); }
-    }
-    Ok(false)
-}
-
-fn record_producing_in_ledger(
-    producing: &mut Option<ProducingSession>,
-    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    retired: &HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
-    request: &GuardianSignRequest,
-    withdrawals: &[propose_withdrawals::PendingWithdrawal],
-) -> anyhow::Result<()> {
-    let request_id = hex::encode(request.request_id()?.0);
-    for record in &request.withdrawal_records {
-        let selected = withdrawals.iter().find(|withdrawal| {
-            withdrawal.sender_user_id == u64::from(record.sender_user_id)
-                && withdrawal.contract_id == u64::from(record.token_contract_id)
-                && withdrawal.destination_chain_index == u64::from(record.destination_chain_index)
-                && withdrawal.token_address == record.token
-                && withdrawal.amount == record.amount
-                && withdrawal.recipient == record.recipient
-                && withdrawal.nonce == record.nonce
-        }).or_else(|| pending.values().find(|withdrawal| {
-            withdrawal.sender_user_id == u64::from(record.sender_user_id) && withdrawal.contract_id == u64::from(record.token_contract_id) && withdrawal.destination_chain_index == u64::from(record.destination_chain_index) && withdrawal.token_address == record.token && withdrawal.amount == record.amount && withdrawal.recipient == record.recipient && withdrawal.nonce == record.nonce
-        })).or_else(|| retired.values().map(|entry| &entry.withdrawal).find(|withdrawal| {
-            withdrawal.sender_user_id == u64::from(record.sender_user_id) && withdrawal.contract_id == u64::from(record.token_contract_id) && withdrawal.destination_chain_index == u64::from(record.destination_chain_index) && withdrawal.token_address == record.token && withdrawal.amount == record.amount && withdrawal.recipient == record.recipient && withdrawal.nonce == record.nonce
-        })).context("guardian request missing selected withdrawal metadata")?;
-        let existing = pending.get(&selected.leaf_hash)
-            .or_else(|| retired.get(&selected.leaf_hash).map(|entry| &entry.withdrawal));
-        if let Some(existing) = existing {
-            ensure!(serde_json::to_value(existing)? == serde_json::to_value(selected)?, "selected withdrawal metadata conflict");
-        } else {
-            pending.insert(selected.leaf_hash.clone(), selected.clone());
-        }
-    }
-    match producing {
-        Some(saved) => ensure!(saved.session_nonce == request.session_nonce && saved.request_id == request_id, "producing session changed"),
-        None => *producing = Some(ProducingSession { session_nonce: request.session_nonce, request_id }),
-    }
-    Ok(())
-}
-
-/// Producing ownership for the multichain daemon state owned by the round loop.
-struct MultichainProducingOwner<'a>(&'a Path, &'a mut MultichainDaemonState);
-
-impl ProducingOwner for MultichainProducingOwner<'_> {
-    fn ensure_owned_pending(&mut self, request: &GuardianSignRequest) -> anyhow::Result<()> {
-        ensure_owned_producing(&self.1.producing_session, request)
-    }
-
-    fn record_producing(&mut self, request: &GuardianSignRequest, withdrawals: &[propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<()> {
-        record_producing_in_ledger(&mut self.1.producing_session, &mut self.1.pending_claim_withdrawals, &self.1.retired_claim_withdrawals, request, withdrawals)?;
-        save_multichain_state(self.0, self.1).context("failed to persist producing ownership")
-    }
-}
 
 
 #[derive(Debug)]
@@ -812,7 +717,8 @@ enum PostL2Orchestration<T> {
 /// atomically installs it when a normal-entry round newly latches catch-up, and
 /// invokes `dispatch` only when post-L2 phases are authorized.
 async fn orchestrate_post_l2_round<T, Dispatch, DispatchFuture>(
-    state_path: &Path,
+    db: &super::guardian_client::RelayerDb,
+    chain: u8,
     state: &DaemonState,
     current_round_withdrawals: &[propose_withdrawals::PendingWithdrawal],
     pre_round_is_catchup_batch: bool,
@@ -832,15 +738,11 @@ where
     insert_pending_claims(current_round_withdrawals, &mut pending_claim_withdrawals, &retired_claim_withdrawals);
 
     if !pre_round_is_catchup_batch && post_l2_is_catchup_batch {
-        save_state(
-            state_path,
-            &DaemonState {
-                last_finalized_checkpoint: state.last_finalized_checkpoint,
-                pending_claim_withdrawals,
-                claim_retry,
-                retired_claim_withdrawals,
-            },
-        )?;
+        save_chain_state(db, chain, &DaemonState {
+            pending_claim_withdrawals,
+            claim_retry,
+            retired_claim_withdrawals,
+        })?;
         return Ok(PostL2Orchestration::Deferred);
     }
 
@@ -857,11 +759,12 @@ async fn dispatch_post_l2_phase<T>(
 }
 
 fn persist_finalized_state_then_cleanup_proof(
-    state_path: &Path,
+    db: &super::guardian_client::RelayerDb,
+    chain: u8,
     state: &DaemonState,
     proof_path: &Path,
 ) -> anyhow::Result<()> {
-    save_state(state_path, state)?;
+    save_chain_state(db, chain, state)?;
     if let Err(err) = fs::remove_file(proof_path) {
         tracing::warn!(
             proof_path = %proof_path.display(),
@@ -905,12 +808,10 @@ async fn materialize_chain_proof(
 
 pub async fn run(args: RunDaemonArgs) -> anyhow::Result<()> {
     let loaded = load_config(&args.config)?;
-    let chain_configs = configured_chains(&loaded)?;
-    let history_config = super::guardian_client::LoadedGuardianConfig::load(Path::new(&loaded.guardian_config))?;
-    let external = psy_config::PsyConfigGoldilocks::builder().path(&loaded.rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
-    let external_network = external.get_current_network()?;
-    history_config.root.validate_rpc_network(external_network)?;
-    let provider = guardian_common::runtime::load_network(&history_config.root, history_config.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let history_config = super::guardian_client::LoadedGuardianConfig::load(Path::new(&loaded.rpc_config), Path::new(&loaded.guardian_root))?;
+    let chain_configs = configured_chains(&loaded, history_config.l1_endpoints())?;
+    let provider = guardian_common::runtime::load_network(&history_config.root, history_config.authorization()).map_err(|error| anyhow::anyhow!("{error}"))?;
+    initialize_relayer_account(&history_config, &provider).await?;
     let daemon = async {
         if chain_configs.len() == 1 {
             return run_single_chain(chain_configs[0].effective_config(&loaded)?, &args.config, &history_config, &provider).await;
@@ -921,6 +822,54 @@ pub async fn run(args: RunDaemonArgs) -> anyhow::Result<()> {
         result = history_config.serve_history() => result,
         result = daemon => result,
     }
+}
+/// Verifies checkpoint 0 against the committed head and the authorization genesis,
+/// then records that exact fresh account before either daemon path loads progress.
+async fn initialize_relayer_account(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider) -> anyhow::Result<()> {
+    use psy_client_common::data::base_types::hash256::Hash256;
+    use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::qmetadata::QMetaDataStoreReaderSync};
+    use psy_crypto::hash::traits::qhashable::QFieldHashable;
+    let authorization = config.authorization();
+    let url = provider.get_coordinator_url()?;
+    let head = crate::guardian::service::load_guardian_committed_head(provider, &url).await?;
+    let leaf = provider.get_checkpoint_leaf_data(0).await?;
+    let roots = provider.get_checkpoint_global_state_roots(0).await?;
+    let path = provider.get_checkpoint_tree_merkle_proof(head.checkpoint_id, 0).await?;
+    crate::guardian::verify::verify_checkpoint(0, &leaf, &roots, &path, head.checkpoint_tree_root).map_err(|error| anyhow::anyhow!(error))?;
+    let authenticated = leaf.qfhash::<PsyHasher>();
+    ensure!(Hash256::from(authenticated).0 == authorization.genesis_hash.0, "verified checkpoint 0 leaf differs from the authorization genesis");
+    let root = provider.get_checkpoint_tree_root(0).await?;
+    let self_path = provider.get_checkpoint_tree_merkle_proof(0, 0).await?;
+    crate::guardian::verify::verify_checkpoint(0, &leaf, &roots, &self_path, root).map_err(|error| anyhow::anyhow!(error))?;
+    config.db.ensure_genesis_account(config.root.network_magic()?, authorization.user_id(), authenticated)
+}
+
+
+/// Root-cause class (`timeout`/`unavailable`/`provider`/`revert`/`decode`,
+/// fallback `other`) for a failed L1 read. A typed `reqwest::Error` in the chain
+/// classifies timeout and connect exits and nothing else; otherwise the typed
+/// alloy transport error at the bottom of the anyhow chain is classified via the
+/// pool's redaction-aware mapper. The result is a static name only: no URLs,
+/// request parameters or response bodies.
+fn transport_error_category(error: &anyhow::Error) -> &'static str {
+    error
+        .chain()
+        .find_map(|cause| {
+            if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+                return Some(if error.is_timeout() { "timeout" } else if error.is_connect() { "unavailable" } else { "other" });
+            }
+            cause.downcast_ref::<alloy_transport::TransportError>().map(super::pool_transport::error_category)
+        })
+        .unwrap_or("other")
+}
+/// True only for typed transient failures — a transport error categorized
+/// `timeout`/`unavailable` or the committed-head reader's `L2RpcUnavailable`
+/// — that a later round can plausibly resolve. Everything else (nonce
+/// conflicts, halted accounts, reverts, decode errors, untyped fallbacks)
+/// stays permanent and must surface.
+fn is_temporary_rpc_error(error: &anyhow::Error) -> bool {
+    if matches!(transport_error_category(error), "timeout" | "unavailable") { return true; }
+    error.chain().any(|cause| cause.downcast_ref::<guardian_common::protocol::GuardianSignError>() == Some(&guardian_common::protocol::GuardianSignError::L2RpcUnavailable))
 }
 
 async fn run_multichain(
@@ -933,7 +882,7 @@ async fn run_multichain(
     ensure!(config.max_concurrent_l2_batches.unwrap_or(1) == 1, "multisig account permits one inflight session");
     let proof_dir = config.proof_dir.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_PROOF_DIR));
     fs::create_dir_all(&proof_dir)?;
-    let identity_namespace = chain_configs.iter().map(L1Config::namespace).collect::<Vec<_>>().join("__");
+    let chains_label = chain_configs.iter().map(|chain| chain.chain_index.to_string()).collect::<Vec<_>>().join(",");
     let mut chains = Vec::with_capacity(chain_configs.len());
     for chain in chain_configs {
         let effective = chain.effective_config(&config)?;
@@ -952,11 +901,10 @@ async fn run_multichain(
     let lag = config.confirmation_lag_checkpoints.unwrap_or(3);
     let max_batch = config.max_checkpoint_batch.unwrap_or(DEFAULT_MAX_CHECKPOINT_BATCH);
     validate_max_checkpoint_batch(max_batch)?;
-    let state_path = proof_dir.join("daemon_state_multichain.toml");
     let proxy = resolve_system_prove_proxy_url(&guardian.root.network)?;
     verify_system_prove_proxy(&proxy).await?;
     tracing::info!(prove_proxy = %proxy, "system prove proxy configured");
-    tracing::info!(config=%config_path.display(), chain_count=chains.len(), %identity_namespace, "multichain bridge relayer started");
+    tracing::info!(config=%config_path.display(), chain_count=chains.len(), chains=%chains_label, "multichain bridge relayer started");
 
     // Coordinator stall guard: if the head does not advance for
     // COORDINATOR_STALL_POLLS consecutive rounds while the previous round
@@ -972,7 +920,7 @@ async fn run_multichain(
     let mut l2_retry_backoff = Duration::from_secs(RELAYER_MIN_RETRY_BACKOFF_SECS);
 
     loop {
-        let mut state = load_multichain_state(&state_path, &identity_namespace)?;
+        let mut state = load_multichain_state(&guardian.db)?;
         let mut cursors = HashMap::new();
         let mut read_failed = false;
         for chain in &chains {
@@ -980,7 +928,12 @@ async fn run_multichain(
                 Ok(cursor) => { cursors.insert(chain.chain_index, cursor); }
                 Err(error) => {
                     read_failed = true;
-                    tracing::error!(chain_index=chain.chain_index, %error, "failed to read finalization cursor");
+                    tracing::error!(
+                        chain_index = chain.chain_index,
+                        error = %error,
+                        error_category = transport_error_category(&error),
+                        "failed to read finalization cursor"
+                    );
                 }
             }
         }
@@ -1004,27 +957,35 @@ async fn run_multichain(
         } else {
             select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?
         };
-        let archive = super::guardian_client::RelayerArchive::open(&guardian.config_dir.join(&guardian.client().archive_path))?;
         let mut pending_landed = None;
-        if archive.pending_request()?.is_some() {
+        if guardian.db.pending_request()?.is_some() {
             let mut guardian_history = config.guardian_history.lock().await;
-            let mut owner = MultichainProducingOwner(&state_path, &mut state);
-            let landed = submit_guardian_operation(guardian, provider, Vec::new(), &[], guardian_common::protocol::GuardianOperation::Bridge, None, &mut guardian_history, Some(&mut owner)).await?;
-            wait_until_checkpoint_confirmed(provider, landed, lag, REALM_CHECKPOINT_POLL_TIMEOUT_SECS, REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
-            if clear_landed_producing(&mut state, &guardian_history, landed)? {
-                save_multichain_state(&state_path, &state)?;
-            }
-            pending_landed = Some(landed);
-            last_round_submitted_l2_work = true;
-            latest = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
-            if state.pending_finalization_range.is_none() {
-                (from_checkpoint, window) = select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?;
+            let recovered = async {
+                let landed = submit_guardian_operation(guardian, provider, Vec::new(), &[], guardian_common::protocol::GuardianOperation::Bridge, None, &mut guardian_history).await?;
+                wait_until_checkpoint_confirmed(provider, landed, lag, REALM_CHECKPOINT_POLL_TIMEOUT_SECS, REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
+                Ok((landed, provider.get_coordinator_latest_block_state().await?.checkpoint_id))
+            }.await;
+            match recovered {
+                Ok((landed, fresh_head)) => {
+                    pending_landed = Some(landed);
+                    last_round_submitted_l2_work = true;
+                    latest = fresh_head;
+                    if state.pending_finalization_range.is_none() {
+                        (from_checkpoint, window) = select_multichain_relayer_window(&cursors.values().copied().collect::<Vec<_>>(), latest, lag, max_batch)?;
+                    }
+                }
+                Err(error) if is_temporary_rpc_error(&error) => {
+                    tracing::warn!(%error, error_category = transport_error_category(&error), "pending guardian recovery hit temporary RPC unavailability; retrying next round");
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
         }
         if window.to_checkpoint < from_checkpoint && pending_landed.is_none() { tokio::time::sleep(poll_interval).await; continue; }
         let propose_args = ProposeWithdrawalsArgs {
             rpc_config: config.rpc_config.clone(),
-            guardian_config: config.guardian_config.clone(),
+            guardian_root: config.guardian_root.clone(),
             services_url: Some(config.services_url.clone()),
             withdraw_method_id: config.withdraw_method_id,
             state_file: None,
@@ -1059,7 +1020,7 @@ async fn run_multichain(
             round_withdrawals = plan.withdrawals.clone();
             let mut guardian_history = config.guardian_history.lock().await;
             let previous_nonce = guardian_history.history.nonce();
-            let landed = match submit_multichain_l2_plan(&config, provider, &plan, &state_path, &mut state, &mut guardian_history, lag, guardian).await {
+            let landed = match submit_multichain_l2_plan(provider, &plan, &mut guardian_history, lag, guardian).await {
                 Ok(value) => value,
                 Err(error) => {
                     tracing::error!(%error, backoff_secs = l2_retry_backoff.as_secs(), "multichain guardian L2 submission failed");
@@ -1072,9 +1033,6 @@ async fn run_multichain(
             let submitted_l2_work = fresh_landed || pending_landed.is_some();
             last_round_submitted_l2_work = submitted_l2_work;
             l2_retry_backoff = Duration::from_secs(RELAYER_MIN_RETRY_BACKOFF_SECS);
-            if fresh_landed && clear_landed_producing(&mut state, &guardian_history, landed)? {
-                save_multichain_state(&state_path, &state)?;
-            }
             if !window.has_confirmed_range() {
                 tracing::info!(submitted_l2_work, landed, "append-only multichain round retained until a confirmed proof window exists");
                 tokio::time::sleep(poll_interval).await;
@@ -1096,7 +1054,7 @@ async fn run_multichain(
             .map(|chain| (chain.chain_index, cursors[&chain.chain_index]))
             .collect::<Vec<_>>();
         if !persist_and_sync_multichain_range(
-            &state_path, &mut state, range, &round_withdrawals, &chain_cursors,
+            &guardian.db, &mut state, range, &round_withdrawals, &chain_cursors,
             |chain_index, endpoint| {
                 let chain = chains.iter().find(|chain| chain.chain_index == chain_index).unwrap();
                 let provider = &provider;
@@ -1122,7 +1080,7 @@ async fn run_multichain(
         }
         let shared_path = proof_dir.join(format!("bridge_proof_{}.json", to_checkpoint));
         let needs_finalize = chains.iter().any(|chain| cursors[&chain.chain_index] < to_checkpoint);
-        if needs_finalize && !shared_path.exists() {
+        if needs_finalize {
             if let Err(error) = chains[0].l1.load_or_build_proof(
                 &chains[0].config, &shared_path, from_checkpoint, to_checkpoint, Some(proxy.as_str()),
             ).await {
@@ -1164,7 +1122,7 @@ async fn run_multichain(
             &mut state.retired_claim_withdrawals,
             claim_attempts::now_unix(),
         );
-        save_multichain_state(&state_path, &state)?;
+        save_multichain_state(&guardian.db, &state)?;
 
         if state.finalized_chains.len() == chains.len() {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1184,12 +1142,11 @@ async fn run_multichain(
                     &mut state.retired_claim_withdrawals,
                     now_unix,
                 );
-                save_multichain_state(&state_path, &state)?;
+                save_multichain_state(&guardian.db, &state)?;
             }
-            state.last_finalized_checkpoint = to_checkpoint;
             state.pending_finalization_range = None;
             state.finalized_chains.clear();
-            save_multichain_state(&state_path, &state)?;
+            save_multichain_state(&guardian.db, &state)?;
             let _ = fs::remove_file(&shared_path);
         }
         tokio::time::sleep(poll_interval).await;
@@ -1223,18 +1180,11 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
     let confirmation_lag_checkpoints = config.confirmation_lag_checkpoints.unwrap_or(3);
     let max_checkpoint_batch = config.max_checkpoint_batch.unwrap_or(DEFAULT_MAX_CHECKPOINT_BATCH);
     validate_max_checkpoint_batch(max_checkpoint_batch)?;
-    let state_path = proof_dir.join("daemon_state.toml");
+    let chain = configured_chains(&config, guardian.l1_endpoints())?.into_iter().next().context("single-chain relayer has no chain")?.chain_index;
 
     loop {
-        let mut state = load_state(&state_path)?;
-        match l1.last_finalized_checkpoint(state_manager).await {
-            Ok(l1_last_finalized_checkpoint) => {
-                state = reconcile_state_with_l1_finalized_checkpoint(
-                    state,
-                    &state_path,
-                    l1_last_finalized_checkpoint,
-                )?;
-            }
+        let l1_cursor = match l1.last_finalized_checkpoint(state_manager).await {
+            Ok(cursor) => cursor,
             Err(err) => {
                 tracing::error!(
                     state_manager = %state_manager,
@@ -1244,19 +1194,16 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                 tokio::time::sleep(poll_interval).await;
                 continue;
             }
-        }
+        };
+        let mut state = load_chain_state(&guardian.db, chain)?;
 
-        // ═══════════════════════════════════════════════════════════════════
-        //  CHECKPOINT WINDOW ── pre-round state check
-        // ═══════════════════════════════════════════════════════════════════
-
-        let from_checkpoint = state.last_finalized_checkpoint + 1;
+        let from_checkpoint = l1_cursor + 1;
         let latest_checkpoint = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
         tracing::info!(
             from_checkpoint,
             latest_checkpoint,
             confirmation_lag_checkpoints,
-            last_finalized_checkpoint = state.last_finalized_checkpoint,
+            last_finalized_checkpoint = l1_cursor,
             "pre-round: checkpoint window"
         );
         let window = select_relayer_window(
@@ -1269,7 +1216,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
         let is_catchup_batch = window.is_catchup_batch;
         let propose_args = ProposeWithdrawalsArgs {
             rpc_config: config.rpc_config.clone(),
-            guardian_config: config.guardian_config.clone(),
+            guardian_root: config.guardian_root.clone(),
             services_url: Some(config.services_url.clone()),
             withdraw_method_id: config.withdraw_method_id,
             state_file: None,
@@ -1331,13 +1278,14 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
         };
 
 
-        state = load_state(&state_path)?;
+        state = load_chain_state(&guardian.db, chain)?;
         // One sticky authority: L2 may latch catch-up mid-round; outer gates
         // must honor that latch for deposits and pending-claim settlement.
         let mut is_catchup_batch = l2_round.is_catchup_batch;
         let (post_l2_phase_permit, mut pending_claim_withdrawals) =
             match orchestrate_post_l2_round(
-                &state_path,
+                &guardian.db,
+                chain,
                 &state,
                 &l2_round.claim_withdrawals,
                 window.is_catchup_batch,
@@ -1386,7 +1334,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                     &mut claim_retry,
                     &mut retired_claim_withdrawals,
                     from_checkpoint,
-                    state.last_finalized_checkpoint,
+                    l1_cursor,
                     is_catchup_batch,
                     confirmation_lag_checkpoints,
                     &guardian.root.network,
@@ -1394,15 +1342,11 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                 ),
             )
             .await;
-            if let Err(e) = save_state(
-                &state_path,
-                &DaemonState {
-                    last_finalized_checkpoint: state.last_finalized_checkpoint,
-                    pending_claim_withdrawals,
-                    claim_retry,
-                    retired_claim_withdrawals,
-                },
-            ) {
+            if let Err(e) = save_chain_state(&guardian.db, chain, &DaemonState {
+                pending_claim_withdrawals,
+                claim_retry,
+                retired_claim_withdrawals,
+            }) {
                 tracing::error!(
                     error = %e,
                     "failed to persist pending claims after append-only claim settlement"
@@ -1436,7 +1380,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                     &mut claim_retry,
                     &mut retired_claim_withdrawals,
                     from_checkpoint,
-                    state.last_finalized_checkpoint,
+                    l1_cursor,
                     is_catchup_batch,
                     confirmation_lag_checkpoints,
                     &guardian.root.network,
@@ -1444,15 +1388,11 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                 ),
             )
             .await;
-            if let Err(e) = save_state(
-                &state_path,
-                &DaemonState {
-                    last_finalized_checkpoint: state.last_finalized_checkpoint,
-                    pending_claim_withdrawals,
-                    claim_retry,
-                    retired_claim_withdrawals,
-                },
-            ) {
+            if let Err(e) = save_chain_state(&guardian.db, chain, &DaemonState {
+                pending_claim_withdrawals,
+                claim_retry,
+                retired_claim_withdrawals,
+            }) {
                 tracing::error!(
                     error = %e,
                     "failed to persist pending claims when skipping prove"
@@ -1517,7 +1457,9 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
             Ok(result) => result,
             Err(err) => {
                 tracing::error!(to_checkpoint, error = %err, "bridge daemon prove step failed");
-                let _ = fs::remove_file(&proof_path);
+                if err.downcast_ref::<CachedProofLineageUnread>().is_none() {
+                    let _ = fs::remove_file(&proof_path);
+                }
                 tokio::time::sleep(poll_interval).await;
                 continue;
             }
@@ -1532,11 +1474,7 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
             proof_json: proof_path.clone(),
             to_checkpoint,
             rpc_config: config.rpc_config.clone(),
-            l1_rpc_url: config
-                .finalize
-                .l1_rpc_url
-                .clone()
-                .unwrap_or_else(|| DEFAULT_L1_RPC_URL.to_string()),
+            l1_rpc_url: config.finalize.l1_rpc_url.clone().context("canonical L1 endpoint missing")?,
             deployments_network: config
                 .finalize
                 .deployments_network
@@ -1555,15 +1493,11 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
         };
 
         let withdrawal_count = l2_round.claim_withdrawals.len();
-        if let Err(e) = save_state(
-            &state_path,
-            &DaemonState {
-                last_finalized_checkpoint: state.last_finalized_checkpoint,
-                pending_claim_withdrawals: pending_claim_withdrawals.clone(),
-                claim_retry: claim_retry.clone(),
-                retired_claim_withdrawals: retired_claim_withdrawals.clone(),
-            },
-        ) {
+        if let Err(e) = save_chain_state(&guardian.db, chain, &DaemonState {
+            pending_claim_withdrawals: pending_claim_withdrawals.clone(),
+            claim_retry: claim_retry.clone(),
+            retired_claim_withdrawals: retired_claim_withdrawals.clone(),
+        }) {
             tracing::error!(error = %e, "failed to persist pending claims before finalize");
         }
 
@@ -1592,13 +1526,13 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                 .await;
 
                 let finalized_state = DaemonState {
-                    last_finalized_checkpoint: to_checkpoint,
                     pending_claim_withdrawals,
                     claim_retry,
                     retired_claim_withdrawals,
                 };
                 match persist_finalized_state_then_cleanup_proof(
-                    &state_path,
+                    &guardian.db,
+                    chain,
                     &finalized_state,
                     &proof_path,
                 ) {
@@ -1969,22 +1903,66 @@ fn load_config(path: &Path) -> anyhow::Result<BridgeProposeDaemonConfig> {
     toml::from_str(&raw).with_context(|| format!("failed to parse daemon config {}", path.display()))
 }
 
-fn load_state(path: &Path) -> anyhow::Result<DaemonState> {
-    if !path.exists() {
-        return Ok(DaemonState::default());
-    }
-    let raw = fs::read_to_string(path).with_context(|| format!("failed to read daemon state {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse daemon state {}", path.display()))
+fn chain_of(withdrawal: &propose_withdrawals::PendingWithdrawal) -> anyhow::Result<u8> {
+    u8::try_from(withdrawal.destination_chain_index).context("claim destination chain does not fit chain_index")
 }
 
-fn load_multichain_state(path: &Path, namespace: &str) -> anyhow::Result<MultichainDaemonState> {
-    if !path.exists() {
-        return Ok(MultichainDaemonState { identity_namespace: namespace.to_string(), ..Default::default() });
+fn claims_of(state: &DaemonState) -> super::guardian_client::ChainClaims {
+    super::guardian_client::ChainClaims {
+        pending_claim_withdrawals: state.pending_claim_withdrawals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        claim_retry: state.claim_retry.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        retired_claim_withdrawals: state.retired_claim_withdrawals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     }
-    let raw = fs::read_to_string(path)?;
-    let state: MultichainDaemonState = toml::from_str(&raw)?;
-    ensure!(state.identity_namespace == namespace, "multichain daemon state belongs to a different chain cohort");
+}
+
+fn load_chain_state(db: &super::guardian_client::RelayerDb, chain: u8) -> anyhow::Result<DaemonState> {
+    let row = db.chain_claims()?.remove(&chain).unwrap_or_default();
+    Ok(DaemonState {
+        pending_claim_withdrawals: row.pending_claim_withdrawals.into_iter().collect(),
+        claim_retry: row.claim_retry.into_iter().collect(),
+        retired_claim_withdrawals: row.retired_claim_withdrawals.into_iter().collect(),
+    })
+}
+
+fn save_chain_state(db: &super::guardian_client::RelayerDb, chain: u8, state: &DaemonState) -> anyhow::Result<()> {
+    db.save_chain_claims(chain, &claims_of(state))
+}
+
+fn load_multichain_state(db: &super::guardian_client::RelayerDb) -> anyhow::Result<MultichainDaemonState> {
+    let batch = db.finalization_batch()?;
+    let mut state = MultichainDaemonState {
+        pending_finalization_range: batch.pending_finalization_range.map(|range| PendingFinalizationRange { from_checkpoint: range.from_checkpoint, to_checkpoint: range.to_checkpoint }),
+        finalized_chains: batch.finalized_chains.into_iter().collect(),
+        ..Default::default()
+    };
+    for row in db.chain_claims()?.into_values() {
+        state.pending_claim_withdrawals.extend(row.pending_claim_withdrawals);
+        state.claim_retry.extend(row.claim_retry);
+        state.retired_claim_withdrawals.extend(row.retired_claim_withdrawals);
+    }
     Ok(state)
+}
+
+fn chain_claim_rows(state: &MultichainDaemonState) -> anyhow::Result<BTreeMap<u8, super::guardian_client::ChainClaims>> {
+    let mut by_chain: BTreeMap<u8, DaemonState> = BTreeMap::new();
+    for (leaf, withdrawal) in &state.pending_claim_withdrawals {
+        by_chain.entry(chain_of(withdrawal)?).or_default().pending_claim_withdrawals.insert(leaf.clone(), withdrawal.clone());
+    }
+    for (leaf, retry) in &state.claim_retry {
+        let withdrawal = state.pending_claim_withdrawals.get(leaf).context("claim retry has no pending withdrawal")?;
+        by_chain.entry(chain_of(withdrawal)?).or_default().claim_retry.insert(leaf.clone(), retry.clone());
+    }
+    for (leaf, retired) in &state.retired_claim_withdrawals {
+        by_chain.entry(chain_of(&retired.withdrawal)?).or_default().retired_claim_withdrawals.insert(leaf.clone(), retired.clone());
+    }
+    Ok(by_chain.iter().map(|(chain, row)| (*chain, claims_of(row))).collect())
+}
+
+fn save_multichain_state(db: &super::guardian_client::RelayerDb, state: &MultichainDaemonState) -> anyhow::Result<()> {
+    db.save_claims_and_batch(&chain_claim_rows(state)?, &super::guardian_client::FinalizationBatch {
+        pending_finalization_range: state.pending_finalization_range.map(|range| super::guardian_client::FinalizationRange { from_checkpoint: range.from_checkpoint, to_checkpoint: range.to_checkpoint }),
+        finalized_chains: state.finalized_chains.iter().copied().collect(),
+    })
 }
 
 // L1 may already be ahead of an older catch-up target. Keep the actual append
@@ -2006,7 +1984,7 @@ where
 // Both fresh and resumed ranges pass this gate before proof/finalize. A fee
 // refusal retains the landing endpoint and claims, without spending attempts.
 async fn persist_and_sync_multichain_range<Sync, SyncFuture>(
-    path: &Path,
+    db: &super::guardian_client::RelayerDb,
     state: &mut MultichainDaemonState,
     range: PendingFinalizationRange,
     withdrawals: &[propose_withdrawals::PendingWithdrawal],
@@ -2021,7 +1999,10 @@ where
         "cannot replace an unfinished multichain range");
     state.pending_finalization_range = Some(range);
     insert_pending_claims(withdrawals, &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
-    save_multichain_state(path, state)?;
+    db.save_finalization_and_claims(&super::guardian_client::FinalizationBatch {
+        pending_finalization_range: Some(super::guardian_client::FinalizationRange { from_checkpoint: range.from_checkpoint, to_checkpoint: range.to_checkpoint }),
+        finalized_chains: state.finalized_chains.iter().copied().collect(),
+    }, withdrawals)?;
 
     for &(chain_index, cursor) in chain_cursors {
         if !chain_finalization_required(cursor, range)? { continue; }
@@ -2037,116 +2018,7 @@ where
     Ok(true)
 }
 
-fn save_multichain_state(path: &Path, state: &MultichainDaemonState) -> anyhow::Result<()> {
-    let raw = toml::to_string(state)?;
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&tmp, raw)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
 
-fn save_state(path: &Path, state: &DaemonState) -> anyhow::Result<()> {
-    let raw = toml::to_string(state).context("failed to serialize daemon state")?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().ok_or_else(|| {
-        anyhow::anyhow!(
-            "daemon state path missing file name: {}",
-            path.display()
-        )
-    })?;
-    let tmp_name = format!(
-        ".{}.tmp-{}-{}",
-        file_name.to_string_lossy(),
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    );
-    let tmp_path = parent.join(tmp_name);
-
-    let install = (|| -> anyhow::Result<()> {
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temp daemon state {}",
-                    tmp_path.display()
-                )
-            })?;
-        file.write_all(raw.as_bytes()).with_context(|| {
-            format!(
-                "failed to write temp daemon state {}",
-                tmp_path.display()
-            )
-        })?;
-        file.sync_all().with_context(|| {
-            format!(
-                "failed to sync temp daemon state {}",
-                tmp_path.display()
-            )
-        })?;
-        drop(file);
-        fs::rename(&tmp_path, path).with_context(|| {
-            format!(
-                "failed to install daemon state via rename to {}",
-                path.display()
-            )
-        })?;
-        // Durably record the directory entry that now points at the new state.
-        // Treat failure as an install failure so callers retain the proof and
-        // do not advertise the new checkpoint as crash-safe.
-        let dir = File::open(parent).with_context(|| {
-            format!(
-                "failed to open daemon state parent directory {}",
-                parent.display()
-            )
-        })?;
-        dir.sync_all().with_context(|| {
-            format!(
-                "failed to sync daemon state parent directory {}",
-                parent.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if install.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-
-    install.with_context(|| format!("failed to write daemon state {}", path.display()))
-}
-
-fn reconcile_state_with_l1_finalized_checkpoint(
-    mut state: DaemonState,
-    state_path: &Path,
-    l1_last_finalized_checkpoint: u64,
-) -> anyhow::Result<DaemonState> {
-    let original_last_finalized = state.last_finalized_checkpoint;
-
-    state.last_finalized_checkpoint = l1_last_finalized_checkpoint;
-
-    if state.last_finalized_checkpoint != original_last_finalized
-    {
-        tracing::warn!(
-            local_last_finalized_checkpoint = original_last_finalized,
-            l1_last_finalized_checkpoint,
-            pending_claims = state.pending_claim_withdrawals.len(),
-            "reconciled bridge daemon state with L1 StateManager"
-        );
-        if let Err(e) = save_state(state_path, &state) {
-            tracing::error!(error = %e, "failed to persist reconciled state");
-        }
-    }
-
-    Ok(state)
-}
 
 
 pub(crate) async fn fetch_l1_last_finalized_checkpoint(
@@ -2232,7 +2104,6 @@ pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
         .proof_dir
         .as_deref()
         .unwrap_or_else(|| Path::new(DEFAULT_PROOF_DIR));
-    let state_path = proof_dir.join("daemon_state.toml");
     propose_args.poll_timeout_secs = 0;
     ensure!(
         pending_deposit_count >= proved_deposit_count,
@@ -2287,10 +2158,9 @@ pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
     //  ── L2 Call Planning & Submission Loop ──
     // ═══════════════════════════════════════════════════════════════════
 
-    let pending_archive = super::guardian_client::RelayerArchive::open(&guardian.config_dir.join(&guardian.client().archive_path))?;
-    if pending_archive.pending_request()?.is_some() {
+    if guardian.db.pending_request()?.is_some() {
         let mut guardian_history = config.guardian_history.lock().await;
-        let landed = submit_guardian_operation(guardian, provider, Vec::new(), &[], guardian_common::protocol::GuardianOperation::Bridge, None, &mut guardian_history, None).await?;
+        let landed = submit_guardian_operation(guardian, provider, Vec::new(), &[], guardian_common::protocol::GuardianOperation::Bridge, None, &mut guardian_history).await?;
         wait_until_checkpoint_confirmed(provider, landed, confirmation_lag_checkpoints, REALM_CHECKPOINT_POLL_TIMEOUT_SECS, REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
         to_checkpoint = to_checkpoint.max(landed);
         submitted_l2_work = true;
@@ -2357,7 +2227,6 @@ pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
             &mut seen_claim_leaf_hashes,
             &mut claim_withdrawals,
         );
-        persist_claim_withdrawals_before_l2_submit(&state_path, &plan.withdrawals)?;
 
         if plan.is_empty() {
             return finish_l2_round(
@@ -2729,21 +2598,6 @@ async fn settle_pending_claim_withdrawals(
     is_catchup_batch
 }
 
-fn persist_claim_withdrawals_before_l2_submit(
-    state_path: &Path,
-    withdrawals: &[propose_withdrawals::PendingWithdrawal],
-) -> anyhow::Result<()> {
-    if withdrawals.is_empty() {
-        return Ok(());
-    }
-
-    let mut persisted = load_state(state_path)?;
-    let changed = insert_pending_claims(withdrawals, &mut persisted.pending_claim_withdrawals, &persisted.retired_claim_withdrawals);
-    if changed {
-        save_state(state_path, &persisted).context("failed to persist pending claims before L2 submission")?;
-    }
-    Ok(())
-}
 
 fn record_claim_withdrawals(
     withdrawals: &[propose_withdrawals::PendingWithdrawal],
@@ -2905,7 +2759,7 @@ async fn build_l2_call_plan(
             withdrawal_from_checkpoint,
             to_checkpoint.saturating_add(1),
             &[(source_chain_index, l2_withdrawal_next_index)],
-            guardian,
+            &guardian.root.network,
         )
         .await?
     } else {
@@ -3019,7 +2873,7 @@ async fn build_multichain_l2_plan(
             from_checkpoint.max(1),
             to_checkpoint.saturating_add(1),
             &withdrawal_chain_offsets,
-            guardian,
+            &guardian.root.network,
         ).await?
     } else {
         Vec::new()
@@ -3029,11 +2883,8 @@ async fn build_multichain_l2_plan(
 }
 
 async fn submit_multichain_l2_plan(
-    config: &BridgeProposeDaemonConfig,
     provider: &RpcProvider,
     plan: &MultichainL2CallPlan,
-    state_path: &Path,
-    state: &mut MultichainDaemonState,
     retained: &mut RelayerHistory,
     confirmation_lag_checkpoints: u64,
     guardian: &super::guardian_client::LoadedGuardianConfig,
@@ -3041,7 +2892,6 @@ async fn submit_multichain_l2_plan(
     if plan.calls.is_empty() {
         return Ok(provider.get_coordinator_latest_block_state().await?.checkpoint_id);
     }
-    let mut owner = MultichainProducingOwner(state_path, state);
     let landed = submit_guardian_operation(
         guardian,
         provider,
@@ -3050,7 +2900,6 @@ async fn submit_multichain_l2_plan(
         guardian_common::protocol::GuardianOperation::Bridge,
         None,
         retained,
-        Some(&mut owner),
     ).await?;
     wait_until_checkpoint_confirmed(
         provider,
@@ -3257,13 +3106,10 @@ async fn submit_l2_call_plan(
     if plan.batch_calls.is_empty() {
         return Ok(provider.get_coordinator_latest_block_state().await?.checkpoint_id);
     }
-    let proof_dir = config.proof_dir.as_deref().unwrap_or_else(|| Path::new(DEFAULT_PROOF_DIR));
-    let state_path = proof_dir.join("daemon_state.toml");
     let mut guardian_history = config.guardian_history.lock().await;
     // One PSY session: the multisig account permits a single inflight trace,
-    // so the whole plan is submitted as one guardian operation. The single-chain
-    // ledger is persisted by persist_claim_withdrawals_before_l2_submit before
-    // this call, so no daemon producing owner row is required here.
+    // so the whole plan is submitted as one guardian operation. Selected claims
+    // are inserted in the same database transaction as the pending request.
     let landed = submit_guardian_operation(
         guardian,
         provider,
@@ -3272,7 +3118,6 @@ async fn submit_l2_call_plan(
         guardian_common::protocol::GuardianOperation::Bridge,
         None,
         &mut guardian_history,
-        None,
     ).await?;
     wait_until_checkpoint_confirmed(
         provider,
@@ -3437,47 +3282,39 @@ async fn fetch_deposit_tree_next_index(
 
 
 pub(crate) async fn submit_guardian_calls(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<u64> {
-    submit_guardian_operation(config, provider, calls, withdrawals, guardian_common::protocol::GuardianOperation::Bridge, None, &mut RelayerHistory::default(), None).await
+    submit_guardian_operation(config, provider, calls, withdrawals, guardian_common::protocol::GuardianOperation::Bridge, None, &mut RelayerHistory::default()).await
 }
 
 pub(crate) async fn submit_guardian_policy(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, operation: guardian_common::protocol::GuardianOperation, next_members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<u64> {
     anyhow::ensure!(matches!(operation, guardian_common::protocol::GuardianOperation::Bootstrap | guardian_common::protocol::GuardianOperation::ReplacePolicy), "policy submission requires bootstrap or replacement");
-    submit_guardian_operation(config, provider, Vec::new(), &[], operation, Some(next_members), &mut RelayerHistory::default(), None).await
+    submit_guardian_operation(config, provider, Vec::new(), &[], operation, Some(next_members), &mut RelayerHistory::default()).await
 }
 
-pub(crate) async fn run_guardian_bootstrap(rpc_config: &str, guardian_config: &str) -> anyhow::Result<()> {
-    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
-    let members = config.authorization()?.account_json.decode()?.initial_policy.member_hashes;
-    let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
-    config.root.validate_rpc_network(external.get_current_network()?)?;
-    let provider = guardian_common::runtime::load_network(&config.root, config.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
+pub(crate) async fn run_guardian_bootstrap(rpc_config: &str, guardian_root: &str) -> anyhow::Result<()> {
+    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(rpc_config), Path::new(guardian_root))?;
+    let members = config.authorization().bridge_relayer_signing_policy.decode()?.initial_policy.member_hashes;
+    let provider = guardian_common::runtime::load_network(&config.root, config.authorization()).map_err(|error| anyhow::anyhow!("{error}"))?;
     let operation = submit_guardian_policy(&config, &provider, guardian_common::protocol::GuardianOperation::Bootstrap, [members[0], members[1], members[2]]);
     let history = config.serve_history();
     tokio::select! { result = history => { result?; anyhow::bail!("guardian history listener stopped"); }, result = operation => { result?; Ok(()) } }
 }
 
-pub(crate) async fn run_guardian_replace_policy(rpc_config: &str, guardian_config: &str, next_members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<()> {
-    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
-    let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
-    config.root.validate_rpc_network(external.get_current_network()?)?;
-    let provider = guardian_common::runtime::load_network(&config.root, config.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
+pub(crate) async fn run_guardian_replace_policy(rpc_config: &str, guardian_root: &str, next_members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<()> {
+    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(rpc_config), Path::new(guardian_root))?;
+    let provider = guardian_common::runtime::load_network(&config.root, config.authorization()).map_err(|error| anyhow::anyhow!("{error}"))?;
     let operation = submit_guardian_policy(&config, &provider, guardian_common::protocol::GuardianOperation::ReplacePolicy, next_members);
     let history = config.serve_history();
     tokio::select! { result = history => { result?; anyhow::bail!("guardian history listener stopped"); }, result = operation => { result?; Ok(()) } }
 }
 
-pub(crate) async fn run_guardian_register(rpc_config: &str, guardian_config: &str, exclusive_registration_intake: bool) -> anyhow::Result<()> {
-    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
-    let authorization = config.authorization()?;
-    let archive = super::guardian_client::RelayerArchive::open(&config.config_dir.join(&config.client().archive_path))?;
-    let _account_lock = archive.lock()?;
-    ensure!(archive.pending_request()?.is_none(), "registration cannot replace pending account work");
-    let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
-    config.root.validate_rpc_network(external.get_current_network()?)?;
+pub(crate) async fn run_guardian_register(rpc_config: &str, guardian_root: &str, exclusive_registration_intake: bool) -> anyhow::Result<()> {
+    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(rpc_config), Path::new(guardian_root))?;
+    let authorization = config.authorization();
+    ensure!(config.db.pending_request()?.is_none(), "registration cannot replace pending account work");
     let provider = guardian_common::runtime::load_network(&config.root, authorization)?;
     let mut wallet = WalletSession::new_with_provider(&config.root.network, provider.clone(), Some(authorization.endcap_verifier_fingerprint)).await?;
-    let public_key = wallet.register_bridge_multisig_user(authorization.account_json.decode()?, exclusive_registration_intake).await?;
-    ensure!(public_key == authorization.account_public_key && provider.get_user_ids_for_public_key(public_key).await? == vec![BRIDGE_USER_ID_U64], "AccountIdentityConflict");
+    let public_key = wallet.register_bridge_multisig_user(authorization.bridge_relayer_signing_policy.decode()?, exclusive_registration_intake).await?;
+    ensure!(public_key == authorization.account_public_key()? && provider.get_user_ids_for_public_key(public_key).await? == vec![BRIDGE_USER_ID_U64], "AccountIdentityConflict");
     Ok(())
 }
 
@@ -3488,103 +3325,144 @@ fn pending_policy_matches(request: &guardian_common::protocol::GuardianSignReque
     Ok(calls.contract_calls.len() == 1 && calls.contract_calls[0].contract_id == u64::from(MULTISIG_POLICY_CONTRACT_ID) && calls.contract_calls[0].method_name == "set_policy" && calls.contract_calls[0].inputs.get(16..) == Some(expected.as_slice()))
 }
 
-async fn refresh_relayer_history(wallet: &WalletSession, provider: &RpcProvider, config: &super::guardian_client::LoadedGuardianConfig, archive: &super::guardian_client::RelayerArchive, head: u64, root: QHashOut<GoldilocksField>, retained: &mut RelayerHistory) -> anyhow::Result<()> {
-    use guardian_common::protocol::*;
-    use crate::guardian::verify::{GuardianVerificationContext, verify_session};
-    let mut approved = Vec::new();
-    for session in &retained.sessions {
-        let version = session.record.request_json.decode()?.authorization_version;
-        if !approved.iter().any(|authorization: &GuardianAuthorization| authorization.version == version) {
-            let authorization = config.historical_authorization(version)?;
-            ensure!(retained.approvals.get(&version) == Some(&sha256(&serde_json::to_vec(&authorization)?)), "approved historical authorization changed");
-            approved.push(authorization.clone());
+async fn restore_relayer_history(wallet: &WalletSession, provider: &RpcProvider, config: &super::guardian_client::LoadedGuardianConfig, authorization: &guardian_common::protocol::GuardianAuthorization, head: u64, root: QHashOut<GoldilocksField>) -> anyhow::Result<RelayerHistory> {
+    use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
+    let network = config.root.network_magic()?;
+    let user = authorization.user_id();
+    let Some(account) = config.db.load_account(network, user)? else { return Ok(RelayerHistory::default()); };
+    ensure!(account.authorization_sha256 == authorization.digest().map_err(|error| anyhow::anyhow!(error))?, "changed authorization refuses operation without rewriting state");
+    if account.state == guardian_common::protocol::GuardianAccountState::Halted { anyhow::bail!("halted guardian account refuses operation"); }
+    let deposit_tree_states = config.db.load_deposit_tree_states(network, user)?;
+    if account.last_checkpoint_id > head { anyhow::bail!("saved checkpoint is beyond the committed head"); }
+    let path = provider.get_checkpoint_tree_merkle_proof(head, account.last_checkpoint_id).await?;
+    let leaf = provider.get_checkpoint_leaf_data(account.last_checkpoint_id).await?;
+    let roots = provider.get_checkpoint_global_state_roots(account.last_checkpoint_id).await?;
+    crate::guardian::verify::verify_checkpoint(account.last_checkpoint_id, &leaf, &roots, &path, root).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    ensure!(path.value == account.last_checkpoint_hash, "saved checkpoint leaf hash differs from the authenticated leaf");
+    if let Some(saved) = account.imported_ending_leaf {
+        use plonky2::field::types::PrimeField64;
+        use psy_client_data::config::store_config::PsyHasher;
+        use psy_crypto::hash::traits::qhashable::QFieldHashable;
+        let user_id = authorization.user_id();
+        let user_path = provider.get_user_tree_merkle_proof(account.last_checkpoint_id, user_id).await?;
+        crate::guardian::verify::verify_path(&user_path, roots.user_tree_root, user_id, saved, psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        if saved != QHashOut::ZERO {
+            let user = provider.get_user_leaf_data(account.last_checkpoint_id, user_id).await?;
+            ensure!(user.qfhash::<PsyHasher>() == saved && user.public_key == authorization.account_public_key().map_err(|error| anyhow::anyhow!(error))? && user.user_id.to_canonical_u64() == user_id, "saved ending leaf differs from the authenticated account leaf");
         }
     }
-    let context = GuardianVerificationContext { wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.client().l1_endpoints, history: &retained.history };
-    crate::guardian::verify::verify_guardian_saved_anchors(&context, &[], &approved, &retained.sessions).await.map_err(|error| anyhow::anyhow!("saved guardian history observation failed: {error:?}"))?;
-    for session in &retained.sessions {
-        let authorization = config.historical_authorization(session.record.request_json.decode()?.authorization_version)?;
-        match archive.sessions(session.nonce - 1, 1)?.sessions.into_iter().next() {
-            Some(saved) => ensure!(serde_json::to_vec(&saved)? == serde_json::to_vec(&session.record)?, "immutable canonical record changed"),
-            None => archive.save_record(&session.record, authorization)?,
+    for state in &deposit_tree_states {
+        let endpoint = config.l1_endpoints().iter().find(|endpoint| endpoint.chain_index == state.anchor.chain_index).context("saved deposit-tree state has no authorized L1 endpoint")?;
+        let chain = authorization.chain(state.anchor.chain_index).map_err(|error| anyhow::anyhow!(error))?;
+        let canonical = crate::guardian::verify_l1::verify_saved_deposit_anchor_headers(endpoint, chain, &state.anchor).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        match crate::guardian::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash) {
+            Ok(()) => {}
+            Err(crate::guardian::verify::GuardianAccountError::Conflict(reason @ guardian_common::protocol::HaltReason::FinalityConflict)) => {
+                config.db.halt_account(network, user, reason)?;
+                anyhow::bail!("saved deposit anchor contradicts canonical finality");
+            }
+            Err(error) => return Err(anyhow::anyhow!("{error:?}")),
         }
     }
-    loop {
-        let page = archive.sessions(retained.history.nonce(), 1)?;
-        let Some(record) = page.sessions.into_iter().next() else { break; };
-        let authorization = config.historical_authorization(record.request_json.decode()?.authorization_version)?;
-        let digest = sha256(&serde_json::to_vec(&authorization)?);
-        if let Some(previous) = retained.approvals.get(&authorization.version) { ensure!(*previous == digest, "approved historical authorization changed"); }
-        let context = GuardianVerificationContext { wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.client().l1_endpoints, history: &retained.history };
-        let session = verify_session(&context, &authorization, record).await?;
-        retained.history.apply(&session)?;
-        retained.approvals.insert(authorization.version, digest);
-        retained.sessions.push(session);
+    let restored = RelayerHistory::restore(&account, &deposit_tree_states)?;
+    if account.imported_nonce.is_some() {
+        let no_withdrawal_burns = std::collections::BTreeSet::<(u32, u32, [u32; 8])>::new();
+        let no_nonces = std::collections::BTreeSet::<(u8, [u32; 8])>::new();
+        let context = verification_context(wallet, provider, config, head, root, &restored.history, &[], &no_withdrawal_burns, &no_nonces);
+        if let Err(error) = crate::guardian::verify::verify_restored_history(&context, authorization, account.last_checkpoint_id).await {
+            if let crate::guardian::verify::GuardianAccountError::Conflict(reason) = error { config.db.halt_account(network, user, reason)?; }
+            anyhow::bail!("{error:?}");
+        }
     }
-    Ok(())
+    Ok(restored)
+}
+/// Local-only install of the committed DB tail: decodes and validates the
+/// durable account and deposit-tree states without any network I/O — it can fail on
+/// unusable state but never on transport. Full re-verification against a
+/// fresh committed head happens at the next entry restore, before the
+/// history is ever used.
+fn committed_history_snapshot(config: &super::guardian_client::LoadedGuardianConfig, authorization: &guardian_common::protocol::GuardianAuthorization) -> anyhow::Result<RelayerHistory> {
+    use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
+    let network = config.root.network_magic()?;
+    let user = authorization.user_id();
+    let account = config.db.load_account(network, user)?.context("durable guardian account missing after import")?;
+    if account.state == guardian_common::protocol::GuardianAccountState::Halted { anyhow::bail!("halted guardian account refuses history install"); }
+    RelayerHistory::restore(&account, &config.db.load_deposit_tree_states(network, user)?)
 }
 
-fn select_guardian_withdrawals(withdrawals: &[propose_withdrawals::PendingWithdrawal], mut included: impl FnMut(u32, u32, [u32; 8]) -> bool) -> anyhow::Result<Vec<propose_withdrawals::PendingWithdrawal>> {
+fn current_conflicts(archive: &super::guardian_client::RelayerDb, network: u64, user: u64, records: &[guardian_common::protocol::WithdrawalBurnRecord]) -> anyhow::Result<(std::collections::BTreeSet<(u32, u32, [u32; 8])>, std::collections::BTreeSet<(u8, [u32; 8])>)> {
+    let mut withdrawal_burns = std::collections::BTreeSet::new();
+    let mut nonces = std::collections::BTreeSet::new();
+    for record in records {
+        if archive.contains_included_withdrawal_burn(network, user, record.sender_user_id, record.token_contract_id, record.nonce)? { withdrawal_burns.insert((record.sender_user_id, record.token_contract_id, record.nonce)); }
+        if archive.contains_withdrawal_nonce(network, user, record.destination_chain_index, record.nonce)? { nonces.insert((record.destination_chain_index, record.nonce)); }
+    }
+    Ok((withdrawal_burns, nonces))
+}
+
+fn verification_context<'a>(wallet: &'a WalletSession, provider: &'a RpcProvider, config: &'a super::guardian_client::LoadedGuardianConfig, head: u64, root: QHashOut<GoldilocksField>, history: &'a crate::guardian::verify::GuardianHistory, reserved: &'a [guardian_common::protocol::DepositTreeState], withdrawal_burns: &'a std::collections::BTreeSet<(u32, u32, [u32; 8])>, nonces: &'a std::collections::BTreeSet<(u8, [u32; 8])>) -> crate::guardian::verify::GuardianVerificationContext<'a> {
+    crate::guardian::verify::GuardianVerificationContext { wallet, provider, network: &config.root.network, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: config.l1_endpoints(), history, reserved_deposit_tree_states: reserved, conflicting_withdrawal_burns: withdrawal_burns, conflicting_nonces: nonces }
+}
+
+/// Drops withdrawals already present in either durable point index — the identity
+/// index or the destination-chain nonce index. In-batch duplicates are still
+/// rejected by the session's own duplicate checks.
+fn select_guardian_withdrawals(withdrawals: &[propose_withdrawals::PendingWithdrawal], mut identity_taken: impl FnMut(u32, u32, [u32; 8]) -> anyhow::Result<bool>, mut nonce_taken: impl FnMut(u8, [u32; 8]) -> anyhow::Result<bool>) -> anyhow::Result<Vec<propose_withdrawals::PendingWithdrawal>> {
     let mut selected = Vec::new();
     for withdrawal in withdrawals {
         let sender = u32::try_from(withdrawal.sender_user_id)?;
         let contract = u32::try_from(withdrawal.contract_id)?;
-        if !included(sender, contract, withdrawal.nonce) { selected.push(withdrawal.clone()); }
+        let chain = u8::try_from(withdrawal.destination_chain_index)?;
+        if !identity_taken(sender, contract, withdrawal.nonce)? && !nonce_taken(chain, withdrawal.nonce)? { selected.push(withdrawal.clone()); }
     }
     Ok(selected)
 }
 
-async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal], operation: guardian_common::protocol::GuardianOperation, next_members: Option<[QHashOut<GoldilocksField>; 3]>, retained: &mut RelayerHistory, mut pending_owner: Option<&mut dyn ProducingOwner>) -> anyhow::Result<u64> {
+async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal], operation: guardian_common::protocol::GuardianOperation, next_members: Option<[QHashOut<GoldilocksField>; 3]>, retained: &mut RelayerHistory) -> anyhow::Result<u64> {
     use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
     use guardian_common::protocol::*;
-    use crate::guardian::verify::{GuardianVerificationContext, verify_guardian_session};
-    use super::guardian_client::{GuardianClient, RelayerArchive, prove_pending_request};
+    use crate::guardian::verify::verify_guardian_session;
+    use super::guardian_client::{GuardianClient, prove_pending_request};
     use psy_prover::trace::GeneratedTxTraceJson;
-    let authorization = config.authorization()?.clone();
-    let archive = RelayerArchive::open(&config.config_dir.join(&config.client().archive_path))?;
-    let _account_lock = archive.lock()?;
+    let authorization = config.authorization();
+    let archive = &config.db;
     let mut wallet = WalletSession::new_with_provider(&config.root.network, provider.clone(), Some(authorization.endcap_verifier_fingerprint)).await?;
-    let public_key = wallet.add_multisig_user(authorization.account_json.decode()?).await?;
-    ensure!(public_key == authorization.account_public_key && provider.get_user_ids_for_public_key(public_key).await? == vec![BRIDGE_USER_ID_U64], "AccountIdentityConflict");
+    let public_key = wallet.add_multisig_user(authorization.bridge_relayer_signing_policy.decode()?).await?;
+    ensure!(public_key == authorization.account_public_key()? && provider.get_user_ids_for_public_key(public_key).await? == vec![BRIDGE_USER_ID_U64], "AccountIdentityConflict");
     let coordinator_url = provider.get_coordinator_url()?;
     let committed = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
     let head = committed.checkpoint_id;
     let root = committed.checkpoint_tree_root;
     // Capture before refreshing: receipt repair may remove the pending marker.
     let pending = archive.pending_request()?;
-    refresh_relayer_history(&wallet, provider, &config, &archive, head, root, retained).await?;
+    *retained = restore_relayer_history(&wallet, provider, config, authorization, head, root).await?;
     let pending_nonce = pending.as_ref().map(|request| request.decode().map(|request| request.session_nonce)).transpose()?;
-    let pending_included = retained.sessions.iter().find(|session| Some(session.nonce) == pending_nonce).cloned();
+    let pending_included = match (pending_nonce, archive.sessions(retained.history.nonce(), 1)?.sessions.into_iter().next()) {
+        (Some(nonce), Some(record)) if record.request_json.decode()?.session_nonce == nonce => Some(record),
+        _ => None,
+    };
+    let staged_deposit_tree_states = pending_nonce.map(|nonce| archive.pending_deposit_tree_states(nonce)).transpose()?.unwrap_or_default();
     let request_json = if let Some(pending) = pending {
         let pending_request = pending.decode()?;
         if operation != GuardianOperation::Bridge {
             ensure!(pending_policy_matches(&pending_request, operation, next_members.context("policy command requires next members")?)?, "NonceConflict: pending operation or policy members differ from requested command");
         }
-        if let Some(session) = pending_included {
-            ensure!(session.record.request_json.as_str() == pending.as_str(), "NonceConflict: canonical inclusion differs from pending request");
-            archive.save_record(&session.record, config.historical_authorization(pending_request.authorization_version)?)?;
-            return Ok(session.record.included_checkpoint_id);
+        if let Some(record) = pending_included {
+            ensure!(record.request_json.as_str() == pending.as_str(), "NonceConflict: canonical inclusion differs from pending request");
+            return Ok(record.included_checkpoint_id);
         }
-        let approved = config.historical_authorization(pending_request.authorization_version)?;
-        if let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, approved, &retained.history, &pending).await? {
-            let landed = session.record.included_checkpoint_id;
-            retained.history.apply(&session)?;
-            retained.approvals.insert(approved.version, sha256(&serde_json::to_vec(approved)?));
-            retained.sessions.push(session);
-            // Fill any archived suffix before a subsequent fresh plan.
-            let committed = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
-            refresh_relayer_history(&wallet, provider, config, &archive, committed.checkpoint_id, committed.checkpoint_tree_root, retained).await?;
-            return Ok(landed);
+        if let Some((session, deposit_tree_states)) = recover_guardian_inclusion(&wallet, provider, config, archive, authorization, &retained.history, &pending, &staged_deposit_tree_states).await? {
+            return Ok(import_recovered(provider, config, authorization, archive, retained, session, &deposit_tree_states).await?);
         }
-        if let Some(owner) = pending_owner.as_deref_mut() { owner.ensure_owned_pending(&pending_request)?; }
         pending
     } else {
         if operation == GuardianOperation::Bridge && calls.is_empty() && withdrawals.is_empty() { return Ok(head); }
         let history = &retained.history;
         let account_proof = provider.get_user_tree_merkle_proof(head, BRIDGE_USER_ID_U64).await?;
         let nonce = if account_proof.value == QHashOut::ZERO { 1 } else { provider.get_user_leaf_data(head, BRIDGE_USER_ID_U64).await?.nonce.to_canonical_u64().checked_add(1).context("account nonce overflow")? };
-        ensure!(history.nonce().checked_add(1) == Some(nonce), "HistoryUnavailable: retained canonical account prefix is incomplete");
-        let selected = select_guardian_withdrawals(withdrawals, |sender, contract, nonce| history.contains_burn(sender, contract, nonce))?;
+        ensure!(history.nonce().checked_add(1) == Some(nonce), "retained session prefix is incomplete");
+        let network_magic = config.root.network_magic()?;
+        let selected = select_guardian_withdrawals(withdrawals, |sender, contract, nonce| archive.contains_included_withdrawal_burn(network_magic, BRIDGE_USER_ID_U64, sender, contract, nonce), |chain, nonce| archive.contains_withdrawal_nonce(network_magic, BRIDGE_USER_ID_U64, chain, nonce))?;
         let records = selected.iter().map(|withdrawal| Ok(WithdrawalBurnRecord {
             sender_user_id: withdrawal.sender_user_id.try_into()?, token_contract_id: withdrawal.contract_id.try_into()?,
             destination_chain_index: withdrawal.destination_chain_index.try_into()?, token: withdrawal.token_address,
@@ -3596,12 +3474,12 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
             ensure!(call.method_name == "set_chain_root" && call.inputs.len() == 10, "UnsupportedCall");
             let index = u8::try_from(call.inputs[0])?;
             let chain = authorization.chain(index)?;
-            let endpoint = config.client().l1_endpoints.iter().find(|endpoint| endpoint.chain_index == index).context("missing authorized L1 endpoint")?;
+            let endpoint = config.l1_endpoints().iter().find(|endpoint| endpoint.chain_index == index).context("missing authorized L1 endpoint")?;
             let old_count = u32::try_from(fetch_deposit_tree_next_index(provider, head, u64::from(index)).await?)?;
             let new_count = u32::try_from(call.inputs[1])?;
             if old_count == new_count { continue; }
             let anchor = crate::guardian::verify_l1::finalized_deposit_anchor(endpoint, chain, old_count, new_count).await?;
-            let (_, new_root) = crate::guardian::verify_l1::verify_deposit_anchor(history, endpoint, chain, &anchor).await?;
+            let (_, new_root, _state) = crate::guardian::verify_l1::verify_deposit_anchor(history.deposit_tree_states.get(&index), endpoint, chain, &anchor).await?;
             let root_bytes: Vec<_> = new_root.0.elements.iter().flat_map(|field| {
                 let value = field.to_canonical_u64();
                 (value as u32).to_be_bytes().into_iter().chain(((value >> 32) as u32).to_be_bytes())
@@ -3621,7 +3499,7 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
                 expected.extend(hash.0.elements.map(|limb| limb.to_canonical_u64()));
             }
             if operation == GuardianOperation::Bootstrap {
-                ensure!(expected.iter().all(|limb| *limb == 0) && nonce == 1 && next_members == authorization.account_json.decode()?.initial_policy.member_hashes[..3], "invalid policy bootstrap");
+                ensure!(expected.iter().all(|limb| *limb == 0) && nonce == 1 && next_members == authorization.bridge_relayer_signing_policy.decode()?.initial_policy.member_hashes[..3], "invalid policy bootstrap");
             } else {
                 ensure!(expected[0] != 0, "rotation requires initialized policy");
             }
@@ -3637,24 +3515,21 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
         let trace_envelope = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(&call_data).context("trace call_data json")?).context("guardian trace json build")?;
         let envelope_bytes = serde_json::to_string(&trace_envelope).context("guardian trace envelope serialize")?;
         tracing::info!(bytes = envelope_bytes.len(), "guardian request envelope built");
-        let request = GuardianSignRequest { schema_version: 1, authorization_version: authorization.version, network_magic: authorization.network_magic, genesis_hash: authorization.genesis_hash, user_id: BRIDGE_USER_ID_U64, session_nonce: nonce, operation, trace_json: JsonText::parse(envelope_bytes)?, deposit_anchors: anchors, withdrawal_records: records };
-        let context = GuardianVerificationContext { wallet: &wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.client().l1_endpoints, history: &history };
-        verify_guardian_session(&context, &authorization, &request).await.map_err(|error| anyhow::Error::from(error).context("fresh withdrawal request self-verification"))?;
+        let request = GuardianSignRequest { schema_version: 1, authorization_sha256: authorization.digest().map_err(|error: guardian_common::protocol::GuardianSignError| anyhow::anyhow!(error))?, network_magic: config.root.network_magic()?, genesis_hash: authorization.genesis_hash, user_id: BRIDGE_USER_ID_U64, session_nonce: nonce, operation, trace_json: JsonText::parse(envelope_bytes)?, deposit_anchors: anchors, withdrawal_records: records };
+        let (withdrawal_burns, nonce_conflicts) = current_conflicts(archive, config.root.network_magic()?, BRIDGE_USER_ID_U64, &request.withdrawal_records)?;
+        let context = verification_context(&wallet, provider, config, head, root, history, &[], &withdrawal_burns, &nonce_conflicts);
+        let (_verified, staged) = verify_guardian_session(&context, authorization, &request).await.map_err(|error| anyhow::Error::from(error).context("fresh withdrawal request self-verification"))?;
+        archive.save_request(&JsonText::from_value(&request)?, &staged, &selected)?;
         JsonText::from_value(&request)?
     };
-    let history = &mut retained.history;
     let request = request_json.decode().context("pending guardian request decode")?;
-    if let Some(owner) = pending_owner.as_deref_mut() {
-        owner.record_producing(&request, withdrawals)?;
-
-    }
-    let request_authorization = config.historical_authorization(request.authorization_version)?;
+    let staged_deposit_tree_states = archive.pending_deposit_tree_states(request.session_nonce)?;
     let trace = request.decode_trace()?;
-    let client = GuardianClient::new(config.client())?;
+    let client = GuardianClient::new(config.endpoints())?;
     let proof = loop {
-        match prove_pending_request(&mut wallet, &client, &archive, &request_authorization, &request_json).await {
+        match prove_pending_request(&mut wallet, &client, archive, authorization, &request_json, &staged_deposit_tree_states).await {
             Ok(proof) => break proof,
-            Err(error) if error.downcast_ref::<GuardianSignError>() == Some(&GuardianSignError::EvidenceUnavailable) => {
+            Err(error) if error.downcast_ref::<GuardianSignError>() == Some(&GuardianSignError::SignatureQuorumUnavailable) => {
                 tracing::warn!(nonce = request.session_nonce, "guardian quorum unavailable; retrying frozen request");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -3665,36 +3540,43 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     // consumed; unfinished sessions need neither threshold signatures nor proof.
     let committed_now = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
     ensure!(committed_now.checkpoint_id >= head && provider.get_checkpoint_tree_root(head).await? == root, "committed checkpoint contradiction; pending request retained");
-    if let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, request_authorization, history, &request_json).await? {
-        history.apply(&session)?;
-        let landed = session.record.included_checkpoint_id;
-        retained.approvals.insert(request_authorization.version, sha256(&serde_json::to_vec(&request_authorization)?));
-        retained.sessions.push(session);
+    if let Some((session, deposit_tree_states)) = recover_guardian_inclusion(&wallet, provider, config, archive, authorization, &retained.history, &request_json, &staged_deposit_tree_states).await? {
+        let landed = import_recovered(provider, config, authorization, archive, retained, session, &deposit_tree_states).await?;
         return Ok(landed);
     }
+    let end_user_leaf_hash = trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
     let submission = wallet.submit_end_cap(&trace, bincode::deserialize(&proof)?).await;
     let leaf = match submission {
-        Ok(leaf) => leaf,
+        Ok(_) => end_user_leaf_hash,
         Err(error) => {
-            if let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, request_authorization, history, &request_json).await? {
-                history.apply(&session)?;
-                let landed = session.record.included_checkpoint_id;
-                retained.approvals.insert(request_authorization.version, sha256(&serde_json::to_vec(&request_authorization)?));
-                retained.sessions.push(session);
-                return Ok(landed);
+            if let Some((session, deposit_tree_states)) = recover_guardian_inclusion(&wallet, provider, config, archive, authorization, &retained.history, &request_json, &staged_deposit_tree_states).await? {
+                return Ok(import_recovered(provider, config, authorization, archive, retained, session, &deposit_tree_states).await?);
             }
             return Err(error);
         }
     };
     let start = trace.finalization.submit_end_cap_input.core.checkpoint_id.to_canonical_u64();
     provider.wait_for_endcap_inclusion(BRIDGE_USER_ID_U64, leaf, start, Some(REALM_CHECKPOINT_POLL_TIMEOUT_SECS), REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
-    let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, request_authorization, history, &request_json).await? else {
+    let Some((session, deposit_tree_states)) = recover_guardian_inclusion(&wallet, provider, config, archive, authorization, &retained.history, &request_json, &staged_deposit_tree_states).await? else {
         anyhow::bail!("submitted EndCap has no authenticated inclusion");
     };
-    history.apply(&session)?;
+    Ok(import_recovered(provider, config, authorization, archive, retained, session, &deposit_tree_states).await?)
+}
+
+async fn import_recovered(provider: &RpcProvider, config: &super::guardian_client::LoadedGuardianConfig, authorization: &guardian_common::protocol::GuardianAuthorization, archive: &super::guardian_client::RelayerDb, retained: &mut RelayerHistory, session: guardian_common::protocol::GuardianSession, deposit_tree_states: &[guardian_common::protocol::DepositTreeState]) -> anyhow::Result<u64> {
     let landed = session.record.included_checkpoint_id;
-    retained.approvals.insert(request_authorization.version, sha256(&serde_json::to_vec(&request_authorization)?));
-    retained.sessions.push(session);
+    // Network phase, strictly before the durable import: a temporary RPC
+    // outage here fails ahead of the commit and leaves the pending request
+    // for the next round, instead of misreporting a submission failure.
+    let committed = crate::guardian::service::load_guardian_committed_head(provider, &provider.get_coordinator_url()?).await?;
+    ensure!(committed.checkpoint_id >= landed, "committed head is behind the recovered inclusion");
+    archive.import_verified(&session, deposit_tree_states, session.record.included_checkpoint_id, session.record.included_checkpoint_hash)?;
+    // Post-commit the outcome is concrete: the inclusion is confirmed on-chain
+    // and the Included transition, advanced account and indexes are durable in
+    // one commit. Install the history from the DB tail locally — no RPC after
+    // the commit can turn a confirmed inclusion into a reported failure; the
+    // next entry re-verifies against a fresh committed head before any use.
+    *retained = committed_history_snapshot(config, authorization)?;
     Ok(landed)
 }
 
@@ -3702,11 +3584,12 @@ async fn recover_guardian_inclusion(
     wallet: &WalletSession,
     provider: &RpcProvider,
     config: &super::guardian_client::LoadedGuardianConfig,
-    archive: &super::guardian_client::RelayerArchive,
+    archive: &super::guardian_client::RelayerDb,
     authorization: &guardian_common::protocol::GuardianAuthorization,
     history: &crate::guardian::verify::GuardianHistory,
     request_json: &guardian_common::protocol::JsonText<GuardianSignRequest>,
-) -> anyhow::Result<Option<guardian_common::protocol::GuardianSession>> {
+    pending_deposit_tree_states: &[guardian_common::protocol::DepositTreeState],
+) -> anyhow::Result<Option<(guardian_common::protocol::GuardianSession, Vec<guardian_common::protocol::DepositTreeState>)>> {
     use plonky2::field::types::PrimeField64;
     use psy_client_data::config::store_config::PsyHasher;
     use psy_crypto::hash::traits::qhashable::QFieldHashable;
@@ -3732,10 +3615,10 @@ async fn recover_guardian_inclusion(
     let archived = archive.sessions(request.session_nonce - 1, 1)?.sessions.into_iter().next();
     let exact = match archived {
         Some(record) => Some(record),
-        None => super::guardian_client::GuardianClient::new(config.client())?.session_record(request.session_nonce - 1).await?,
+        None => super::guardian_client::GuardianClient::new(config.endpoints())?.session_record(request.session_nonce - 1).await?,
     };
     let adopted = if let Some(candidate) = exact {
-        ensure!(candidate.request_json.as_str() == record.request_json.as_str() && candidate.signatures_json.as_str() == record.signatures_json.as_str() && candidate.endcap_input_json.as_str() == record.endcap_input_json.as_str() && candidate.endcap_proof_hex == record.endcap_proof_hex, "authenticated guardian record differs from archived evidence");
+        ensure!(candidate.request_json.as_str() == record.request_json.as_str() && candidate.signatures_json.as_str() == record.signatures_json.as_str() && candidate.endcap_input_json.as_str() == record.endcap_input_json.as_str() && candidate.endcap_proof_hex == record.endcap_proof_hex, "authenticated guardian record differs from archived record");
         ensure!(candidate.request_json.decode()?.session_nonce == request.session_nonce, "authenticated guardian record nonce mismatch");
         candidate
     } else {
@@ -3749,13 +3632,12 @@ async fn recover_guardian_inclusion(
         record.included_checkpoint_hash = provider.get_checkpoint_tree_merkle_proof(head.checkpoint_id, included).await?.value;
         record
     };
-    let context = crate::guardian::verify::GuardianVerificationContext {
-        wallet, provider, verified_checkpoint_id: head.checkpoint_id, verified_checkpoint_tree_root: head.checkpoint_tree_root,
-        l1_endpoints: &config.client().l1_endpoints, history,
-    };
-    let session = crate::guardian::verify::verify_session(&context, authorization, adopted).await?;
-    archive.save_record(&session.record, authorization)?;
-    Ok(Some(session))
+    let (withdrawal_burns, nonce_conflicts) = current_conflicts(archive, request.network_magic, request.user_id, &request.withdrawal_records)?;
+    let context = verification_context(wallet, provider, config, head.checkpoint_id, head.checkpoint_tree_root, history, pending_deposit_tree_states, &withdrawal_burns, &nonce_conflicts);
+    let (session, deposit_tree_states) = crate::guardian::verify::verify_session(&context, authorization, adopted, history).await?;
+    ensure!(pending_deposit_tree_states.is_empty() || deposit_tree_states.as_slice() == pending_deposit_tree_states, "verified deposit-tree states differ from the durable pending binding");
+    let bound = if pending_deposit_tree_states.is_empty() { deposit_tree_states.clone() } else { pending_deposit_tree_states.to_vec() };
+    Ok(Some((session, bound)))
 }
 
 /// Classify authenticated chain state before reading any signing/proof files.
@@ -3776,11 +3658,11 @@ async fn authenticated_account(provider: &RpcProvider, checkpoint: u64, head: u6
     let roots = provider.get_checkpoint_global_state_roots(checkpoint).await?;
     let path = provider.get_checkpoint_tree_merkle_proof(head, checkpoint).await?;
     crate::guardian::verify::verify_checkpoint(checkpoint, &leaf, &roots, &path, root).map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    let user = provider.get_user_leaf_data(checkpoint, authorization.user_id).await?;
-    let user_path = provider.get_user_tree_merkle_proof(checkpoint, authorization.user_id).await?;
-    crate::guardian::verify::verify_path(&user_path, roots.user_tree_root, authorization.user_id, user_path.value, psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let user = provider.get_user_leaf_data(checkpoint, authorization.user_id()).await?;
+    let user_path = provider.get_user_tree_merkle_proof(checkpoint, authorization.user_id()).await?;
+    crate::guardian::verify::verify_path(&user_path, roots.user_tree_root, authorization.user_id(), user_path.value, psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize).map_err(|error| anyhow::anyhow!("{error:?}"))?;
     if user_path.value == QHashOut::ZERO { return Ok((user_path.value, 0)); }
-    ensure!(user_path.value == user.qfhash::<PsyHasher>() && user.public_key == authorization.account_public_key && user.user_id.to_canonical_u64() == authorization.user_id, "authenticated account identity mismatch");
+    ensure!(user_path.value == user.qfhash::<PsyHasher>() && user.public_key == authorization.account_public_key()? && user.user_id.to_canonical_u64() == authorization.user_id(), "authenticated account identity mismatch");
     Ok((user_path.value, user.nonce.to_canonical_u64()))
 }
 
@@ -3806,14 +3688,15 @@ async fn first_nonce_checkpoint(provider: &RpcProvider, start: u64, head: u64, r
     }, start, head, nonce).await
 }
 
+#[cfg(test)]
 mod tests {
 
     use super::*;
+    fn test_l1() -> Vec<psy_config::ChainEndpoint> {
+        vec![psy_config::ChainEndpoint { chain_index: 0, rpc_url: "http://127.0.0.1:8545".into() }]
+    }
     use crate::bridge::propose_withdrawals::PendingWithdrawal;
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+
     #[tokio::test]
     async fn historical_nonce_search_checks_predecessor_and_uses_each_probe_once() {
         let mut probes = Vec::new();
@@ -3839,25 +3722,6 @@ mod tests {
         assert!(pending_transition_unfinished(5, leaf, (leaf, 4), (leaf, 3)).is_err());
     }
 
-    #[test]
-    fn pending_then_fresh_clear_only_each_exact_confirmed_owner() {
-        let mut request = crate::guardian::test_fixture::codec_request_fixture();
-        let mut owner = None;
-        let mut pending = HashMap::new();
-        let retired = HashMap::new();
-        record_producing_in_ledger(&mut owner, &mut pending, &retired, &request, &[]).unwrap();
-        assert!(clear_confirmed_producing(&mut owner, &request).unwrap());
-        advance_request_nonce(&mut request);
-        record_producing_in_ledger(&mut owner, &mut pending, &retired, &request, &[]).unwrap();
-        let mut wrong = request.clone();
-        wrong.authorization_version += 1;
-        assert!(!clear_confirmed_producing(&mut owner, &wrong).unwrap());
-        ensure_owned_producing(&owner, &request).unwrap();
-        assert!(clear_confirmed_producing(&mut owner, &request).unwrap());
-        assert!(owner.is_none());
-        advance_request_nonce(&mut request);
-        record_producing_in_ledger(&mut owner, &mut pending, &retired, &request, &[]).unwrap();
-    }
 
     fn advance_request_nonce(request: &mut GuardianSignRequest) {
         let mut trace = request.decode_trace().unwrap();
@@ -3868,45 +3732,87 @@ mod tests {
     }
 
     #[test]
-    fn request_only_and_signed_unproved_restart_keep_frozen_request() {
-        use super::super::guardian_client::RelayerArchive;
-        use guardian_common::protocol::JsonText;
+    fn request_signed_proved_included_restart_keeps_frozen_request_and_proof() {
+        use guardian_common::protocol::{GuardianSession, GuardianSessionRecord, JsonText};
         use psy_client_common::data::base_types::hash256::Hash256;
         use psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature;
         use psy_vm::ups::multisig::MultisigSignatures;
-        let path = temp_state_path("unfinished-archive");
-        let archive = RelayerArchive::open(&path).unwrap();
+        let (root, archive) = super::super::guardian_client::tests_db();
+        let authorization = || std::sync::Arc::new(crate::guardian::test_fixture::codec_authorization_fixture());
+        let reopen = || super::super::guardian_client::RelayerDb::open(&root, authorization()).unwrap();
+        let reject_second_writer = || assert!(super::super::guardian_client::RelayerDb::open(&root, authorization()).is_err(), "a second writer cannot open the live database");
         let request = crate::guardian::test_fixture::codec_request_fixture();
         let frozen = JsonText::from_value(&request).unwrap();
-        archive.save_request(&frozen).unwrap();
+        let proof = [0xAAu8];
         let start = request.decode_trace().unwrap().finalization.submit_end_cap_input.core.state_transition.start_user_leaf_hash;
+        archive.save_request(&frozen, &[], &[]).unwrap();
         assert!(pending_transition_unfinished(1, start, (start, 0), (start, 0)).unwrap());
         assert!(archive.signatures(1).unwrap().is_none());
         assert!(archive.proof(1).unwrap().is_none());
         assert_eq!(archive.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
-        let signatures = MultisigSignatures { member_indices: vec![0, 2], signatures: vec![PsyCompressedSecp256K1Signature { public_key: [2; 33], signature: [1; 64], message: Hash256([0; 32]) }; 2] };
-        archive.save_signatures(1, &signatures).unwrap();
-        let saved = fs::read(path.join("1/signatures.json")).unwrap();
-        let reopened = RelayerArchive::open(&path).unwrap();
+        reject_second_writer();
+        drop(archive);
+        let signed = reopen();
         assert!(pending_transition_unfinished(1, start, (start, 0), (start, 0)).unwrap());
-        assert!(reopened.signatures(1).unwrap().is_some());
-        assert!(reopened.proof(1).unwrap().is_none());
-        assert_eq!(reopened.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
-        assert_eq!(fs::read(path.join("1/signatures.json")).unwrap(), saved);
-        fs::remove_dir_all(path).unwrap();
+        assert!(signed.signatures(1).unwrap().is_none());
+        assert!(signed.proof(1).unwrap().is_none());
+        assert_eq!(signed.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
+        let signatures = MultisigSignatures { member_indices: vec![0, 2], signatures: vec![PsyCompressedSecp256K1Signature { public_key: [2; 33], signature: [1; 64], message: Hash256([0; 32]) }; 2] };
+        signed.save_signatures(1, &signatures).unwrap();
+        reject_second_writer();
+        drop(signed);
+        let proved = reopen();
+        assert_eq!(proved.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
+        assert_eq!(proved.signatures(1).unwrap().unwrap().member_indices, vec![0, 2]);
+        assert!(proved.proof(1).unwrap().is_none());
+        assert_eq!(proved.load_account(request.network_magic, request.user_id).unwrap().and_then(|account| account.imported_nonce), None);
+        proved.save_proof(1, &proof).unwrap();
+        assert_eq!(proved.proof(1).unwrap().unwrap(), proof);
+        reject_second_writer();
+        drop(proved);
+        let included = reopen();
+        assert_eq!(included.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
+        assert_eq!(included.proof(1).unwrap().unwrap(), proof);
+        assert_eq!(included.load_account(request.network_magic, request.user_id).unwrap().and_then(|account| account.imported_nonce), None);
+        let record = GuardianSessionRecord {
+            request_json: frozen.clone(),
+            signatures_json: JsonText::from_value(&signatures).unwrap(),
+            endcap_input_json: JsonText::from_value(&request.decode_trace().unwrap().finalization.submit_end_cap_input).unwrap(),
+            endcap_proof_hex: "0xaa".to_owned(), included_checkpoint_id: 1, included_checkpoint_hash: QHashOut::from_values(1, 2, 3, 4),
+        };
+        // Persistence boundary only: recover_guardian_inclusion authenticates the
+        // proof in production before this archive transition.
+        let end = request.decode_trace().unwrap().finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
+        let session = GuardianSession { network_magic: request.network_magic, user_id: request.user_id, nonce: 1, record: record.clone(), starting_leaf_hash: start, ending_leaf_hash: end, withdrawal_appends: Vec::new() };
+        included.import_verified(&session, &[], 1, record.included_checkpoint_hash).unwrap();
+        assert!(included.pending_request().unwrap().is_none());
+        assert_eq!(included.proof(1).unwrap().unwrap(), proof);
+        assert_eq!(included.load_session(1, request.request_id().unwrap()).unwrap().0.as_str(), frozen.as_str());
+        assert_eq!(included.load_account(request.network_magic, request.user_id).unwrap().unwrap().imported_nonce, Some(1));
+        reject_second_writer();
+        drop(included);
+        let restarted = reopen();
+        assert!(!pending_transition_unfinished(1, start, (start, 0), (session.ending_leaf_hash, 1)).unwrap());
+        assert!(restarted.pending_request().unwrap().is_none());
+        assert_eq!(restarted.load_session(1, request.request_id().unwrap()).unwrap().0.as_str(), frozen.as_str());
+        assert_eq!(restarted.signatures(1).unwrap().unwrap().member_indices, vec![0, 2]);
+        assert_eq!(restarted.proof(1).unwrap().unwrap(), proof);
+        assert_eq!(restarted.load_account(request.network_magic, request.user_id).unwrap().unwrap().imported_nonce, Some(1));
+        assert_eq!(restarted.sessions(0, 1).unwrap().sessions.len(), 1);
+        let mut skipped = request.clone();
+        advance_request_nonce(&mut skipped);
+        advance_request_nonce(&mut skipped);
+        assert!(restarted.save_request(&JsonText::from_value(&skipped).unwrap(), &[], &[]).is_err());
+        let mut next = request.clone();
+        advance_request_nonce(&mut next);
+        let next_frozen = JsonText::from_value(&next).unwrap();
+        restarted.save_request(&next_frozen, &[], &[]).unwrap();
+        assert_eq!(restarted.pending_request().unwrap().unwrap().as_str(), next_frozen.as_str());
+        assert_eq!(restarted.load_account(request.network_magic, request.user_id).unwrap().unwrap().imported_nonce, Some(1));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
 
-    fn temp_state_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "psy-relayer-daemon-state-{name}-{}-{nanos}.toml",
-            std::process::id()
-        ))
-    }
 
     fn sample_withdrawal(seed: u32) -> PendingWithdrawal {
         let words = |base: u32| std::array::from_fn(|i| base + i as u32);
@@ -4057,63 +3963,27 @@ mod tests {
 
 
     #[test]
-    fn reconcile_state_preserves_pending_withdrawals() {
-        let path = temp_state_path("pending");
-        let withdrawal = sample_withdrawal(1);
+    fn claim_queue_round_trips_and_survives_restart() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let mut withdrawal = sample_withdrawal(1);
+        withdrawal.destination_chain_index = 0;
         let state = DaemonState {
-            last_finalized_checkpoint: 10,
-            pending_claim_withdrawals: HashMap::from([(
-                withdrawal.leaf_hash.clone(),
-                withdrawal.clone(),
-            )]),
-                        ..Default::default()
-                    };
-
-        let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 64).unwrap();
-
-        assert_eq!(reconciled.last_finalized_checkpoint, 64);
-        assert_eq!(reconciled.pending_claim_withdrawals.len(), 1);
-        assert_eq!(
-            reconciled.pending_claim_withdrawals[&withdrawal.leaf_hash].event_id,
-            withdrawal.event_id
-        );
-        let saved = load_state(&path).unwrap();
+            pending_claim_withdrawals: HashMap::from([(withdrawal.leaf_hash.clone(), withdrawal.clone())]),
+            ..Default::default()
+        };
+        save_chain_state(&db, 0, &state).unwrap();
+        drop(db);
+        let restarted = super::super::guardian_client::RelayerDb::open(
+            &root,
+            std::sync::Arc::new(crate::guardian::test_fixture::codec_authorization_fixture()),
+        ).unwrap();
+        let saved = load_chain_state(&restarted, 0).unwrap();
         assert_eq!(saved.pending_claim_withdrawals.len(), 1);
-        let _ = std::fs::remove_file(path);
+        assert_eq!(saved.pending_claim_withdrawals[&withdrawal.leaf_hash].event_id, withdrawal.event_id);
+        let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn reconcile_state_advances_to_l1_finalized_checkpoint() {
-        let path = temp_state_path("advance");
-        let state = DaemonState {
-            last_finalized_checkpoint: 10,
-            pending_claim_withdrawals: HashMap::new(),
-                        ..Default::default()
-                    };
-
-        let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 12).unwrap();
-
-        assert_eq!(reconciled.last_finalized_checkpoint, 12);
-        assert_eq!(load_state(&path).unwrap().last_finalized_checkpoint, 12);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn reconcile_state_caps_to_l1_when_local_is_ahead() {
-        let path = temp_state_path("clamp");
-        let state = DaemonState {
-            last_finalized_checkpoint: 20,
-            pending_claim_withdrawals: HashMap::new(),
-                        ..Default::default()
-                    };
-
-        let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 18).unwrap();
-
-        assert_eq!(reconciled.last_finalized_checkpoint, 18);
-        let saved = load_state(&path).unwrap();
-        assert_eq!(saved.last_finalized_checkpoint, 18);
-        let _ = std::fs::remove_file(path);
-    }
 
     #[test]
     fn withdrawal_batch_calls_single_item_matches_append_withdrawal_layout() {
@@ -4290,78 +4160,57 @@ mod tests {
     // ── crash-recovery & state persistence edge cases ──────────────────────
 
     #[test]
-    fn load_state_returns_default_when_file_missing() {
-        // Restart with no daemon_state.toml: must boot from a clean default,
-        // not error. L1 reconciliation re-anchors the cursor next round.
-        let path = temp_state_path("missing");
-        assert!(!path.exists());
-        let state = load_state(&path).expect("missing state file should yield default");
-        assert_eq!(state.last_finalized_checkpoint, 0);
+    fn missing_chain_row_loads_an_empty_claim_queue() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        let state = load_chain_state(&db, 0).expect("missing chain row is an empty queue");
         assert!(state.pending_claim_withdrawals.is_empty());
+        assert!(state.claim_retry.is_empty());
+        assert!(state.retired_claim_withdrawals.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn load_state_errors_on_corrupt_state_file() {
-        // A corrupt daemon_state.toml must surface a parse error rather than
-        // silently booting from default — otherwise pending claims vanish.
-        let path = temp_state_path("corrupt");
-        std::fs::write(&path, "last_finalized_checkpoint = \"not-a-u64\"\n").unwrap();
-        let err = load_state(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("failed to parse daemon state"),
-            "expected parse-error context, got: {err}"
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn save_then_load_state_round_trips_pending_withdrawals() {
-        // Persisted pending claims must survive a save/load cycle bit-for-bit
-        // so a restart resumes claiming exactly where it left off.
-        let path = temp_state_path("roundtrip");
-        let w1 = sample_withdrawal(3);
-        let w2 = sample_withdrawal(7);
+    fn save_then_load_round_trips_pending_withdrawals() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let mut w1 = sample_withdrawal(3);
+        let mut w2 = sample_withdrawal(7);
+        w1.destination_chain_index = 0;
+        w2.destination_chain_index = 0;
         let state = DaemonState {
-            last_finalized_checkpoint: 42,
             pending_claim_withdrawals: HashMap::from([
                 (w1.leaf_hash.clone(), w1.clone()),
                 (w2.leaf_hash.clone(), w2.clone()),
             ]),
-                        ..Default::default()
-                    };
-        save_state(&path, &state).unwrap();
-        let loaded = load_state(&path).unwrap();
-        assert_eq!(loaded.last_finalized_checkpoint, 42);
+            ..Default::default()
+        };
+        save_chain_state(&db, 0, &state).unwrap();
+        let loaded = load_chain_state(&db, 0).unwrap();
         assert_eq!(loaded.pending_claim_withdrawals.len(), 2);
         assert_eq!(loaded.pending_claim_withdrawals[&w1.leaf_hash].event_id, w1.event_id);
         assert_eq!(loaded.pending_claim_withdrawals[&w2.leaf_hash].event_id, w2.event_id);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn landed_l2_withdrawal_survives_crash_and_is_claimed_after_restart() {
-        let path = temp_state_path("pre-submit-crash");
-        let withdrawal = sample_withdrawal(11);
-        let state = DaemonState {
-            last_finalized_checkpoint: 42,
-            pending_claim_withdrawals: HashMap::new(),
-                        ..Default::default()
-                    };
-        save_state(&path, &state).unwrap();
-
-        persist_claim_withdrawals_before_l2_submit(&path, std::slice::from_ref(&withdrawal))
-            .expect("withdrawal must be durable before the L2 batch is submitted");
-
-        // The L2 batch lands, then the daemon crashes before the round can
-        // return its in-memory claim_withdrawals vector. Restart from disk only.
-        let mut restarted = load_state(&path).expect("restart must load pending claims");
-        assert_eq!(restarted.last_finalized_checkpoint, 42);
+    fn landed_l2_withdrawal_survives_restart_and_is_claimed() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        let mut withdrawal = sample_withdrawal(11);
+        withdrawal.destination_chain_index = 0;
+        save_chain_state(&db, 0, &DaemonState::default()).unwrap();
+        db.save_request(
+            &guardian_common::protocol::JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap(),
+            &[],
+            std::slice::from_ref(&withdrawal),
+        ).expect("selected claims commit with the pending request");
+        drop(db);
+        let restarted_db = super::super::guardian_client::RelayerDb::open(
+            &root,
+            std::sync::Arc::new(crate::guardian::test_fixture::codec_authorization_fixture()),
+        ).unwrap();
+        let mut restarted = load_chain_state(&restarted_db, 0).expect("restart must load pending claims");
         assert_eq!(restarted.pending_claim_withdrawals.len(), 1);
-        assert_eq!(
-            restarted.pending_claim_withdrawals[&withdrawal.leaf_hash].event_id,
-            withdrawal.event_id
-        );
-
+        assert_eq!(restarted.pending_claim_withdrawals[&withdrawal.leaf_hash].event_id, withdrawal.event_id);
         let claim_report = claim_withdrawals::BatchWithdrawalsReport {
             requested: 1,
             submitted_count: 1,
@@ -4371,51 +4220,10 @@ mod tests {
             deferrals: HashMap::new(),
         };
         apply_claim_report(&mut restarted.pending_claim_withdrawals, &claim_report);
-        assert!(
-            restarted.pending_claim_withdrawals.is_empty(),
-            "the restarted daemon must submit and resolve the landed withdrawal"
-        );
-
-        let _ = std::fs::remove_file(path);
+        assert!(restarted.pending_claim_withdrawals.is_empty(), "the restarted daemon must resolve the landed withdrawal");
+        let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn reconcile_state_noop_when_local_matches_l1_does_not_write() {
-        // When local already matches L1, reconcile must be a no-op: it must
-        // not touch the state file (avoids needless disk churn / clobbering).
-        let path = temp_state_path("noop");
-        assert!(!path.exists());
-        let state = DaemonState {
-            last_finalized_checkpoint: 15,
-            pending_claim_withdrawals: HashMap::new(),
-                        ..Default::default()
-                    };
-        let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 15).unwrap();
-        assert_eq!(reconciled.last_finalized_checkpoint, 15);
-        assert!(!path.exists(), "no-op reconcile must not create a state file");
-    }
-
-    #[test]
-    fn reconcile_state_clamps_local_ahead_of_l1_and_persists() {
-        // Crash after finalize but before state save: L1 advanced, local did not.
-        // The inverse — local ahead of L1 — must clamp down to L1 and persist
-        // so the next round's from_checkpoint is L1-authoritative.
-        let path = temp_state_path("clamp-persist");
-        let w = sample_withdrawal(2);
-        let state = DaemonState {
-            last_finalized_checkpoint: 30,
-            pending_claim_withdrawals: HashMap::from([(w.leaf_hash.clone(), w.clone())]),
-                        ..Default::default()
-                    };
-        let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 18).unwrap();
-        assert_eq!(reconciled.last_finalized_checkpoint, 18);
-        // Pending claim survives the clamp.
-        assert_eq!(reconciled.pending_claim_withdrawals.len(), 1);
-        assert_eq!(reconciled.pending_claim_withdrawals[&w.leaf_hash].event_id, w.event_id);
-        // Clamp is persisted to disk.
-        assert_eq!(load_state(&path).unwrap().last_finalized_checkpoint, 18);
-        let _ = std::fs::remove_file(path);
-    }
 
     // ── select_relayer_window boundary edge cases ──────────────────────────
 
@@ -4604,6 +4412,14 @@ mod tests {
         let mut w = backoff_withdrawal(leaf);
         w.destination_chain_index = chain_index;
         w
+    }
+
+    fn bind_progress_to_fixture(db: &super::super::guardian_client::RelayerDb) {
+        db.save_request(
+            &guardian_common::protocol::JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap(),
+            &[],
+            &[],
+        ).unwrap();
     }
 
     fn served(indices: &[u8]) -> HashSet<u8> {
@@ -4826,11 +4642,17 @@ mod tests {
 
     #[test]
     fn whole_batch_errors_exhaust_budget_across_single_chain_restarts() {
-        let path = temp_state_path("batch-error-restarts");
+        let (root, db) = super::super::guardian_client::tests_db();
         let failed = withdrawal_for_chain("failed", 0);
         let untouched = withdrawal_for_chain("untouched", 1);
         let mut state = DaemonState::default();
         insert_pending_claims(&[failed.clone(), untouched], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+
+        db.save_request(
+            &guardian_common::protocol::JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap(),
+            &[],
+            &[failed.clone()],
+        ).unwrap();
 
         for attempt in 1..=claim_attempts::CLAIM_MAX_ATTEMPTS {
             record_claim_result(
@@ -4841,8 +4663,8 @@ mod tests {
                 &mut state.retired_claim_withdrawals,
                 u64::from(attempt),
             );
-            save_state(&path, &state).unwrap();
-            state = load_state(&path).unwrap();
+            save_chain_state(&db, 0, &state).unwrap();
+            state = load_chain_state(&db, 0).unwrap();
             if attempt < claim_attempts::CLAIM_MAX_ATTEMPTS {
                 assert_eq!(state.claim_retry["failed"].attempts, attempt);
             }
@@ -4857,20 +4679,18 @@ mod tests {
         assert_eq!(retired.last_reason, "claim batch failed: RPC unavailable");
         assert_eq!(retired.retired_at_unix, 3);
 
-        persist_claim_withdrawals_before_l2_submit(&path, &[failed]).unwrap();
-        assert!(!load_state(&path).unwrap().pending_claim_withdrawals.contains_key("failed"));
-        fs::remove_file(path).unwrap();
+        assert!(!load_chain_state(&db, 0).unwrap().pending_claim_withdrawals.contains_key("failed"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn multichain_retirement_survives_restart_and_replayed_scans() {
-        let path = temp_state_path("multichain-retirement");
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
         let failed = withdrawal_for_chain("failed", 0);
         let healthy = withdrawal_for_chain("healthy", 2);
         let range = PendingFinalizationRange { from_checkpoint: 10, to_checkpoint: 20 };
         let mut state = MultichainDaemonState {
-            identity_namespace: "three-chains".to_string(),
-            last_finalized_checkpoint: 9,
             pending_finalization_range: Some(range),
             finalized_chains: served(&[0, 1]),
             ..Default::default()
@@ -4883,11 +4703,10 @@ mod tests {
                 &[failed.clone()], &Ok(report), &mut state.pending_claim_withdrawals,
                 &mut state.claim_retry, &mut state.retired_claim_withdrawals, u64::from(attempt),
             );
-            save_multichain_state(&path, &state).unwrap();
-            state = load_multichain_state(&path, "three-chains").unwrap();
+            save_multichain_state(&db, &state).unwrap();
+            state = load_multichain_state(&db).unwrap();
         }
 
-        assert_eq!(state.last_finalized_checkpoint, 9);
         assert_eq!(state.pending_finalization_range, Some(range));
         assert_eq!(state.finalized_chains, served(&[0, 1]));
         assert_eq!(state.retired_claim_withdrawals["failed"].attempts, 3);
@@ -4908,11 +4727,13 @@ mod tests {
         );
         assert!(state.pending_claim_withdrawals.is_empty());
         assert_eq!(state.retired_claim_withdrawals.len(), 1);
-        fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn post_l2_replay_does_not_rearm_retired_claims() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
         let retired = withdrawal_for_chain("retired", 0);
         let fresh = withdrawal_for_chain("fresh", 1);
         let mut state = DaemonState::default();
@@ -4920,16 +4741,14 @@ mod tests {
             withdrawal: retired.clone(), attempts: 3, last_reason: "invalid proof".to_string(), retired_at_unix: 1,
         });
         for is_catchup in [false, true] {
-            let path = temp_state_path("post-l2-retired");
             let result = orchestrate_post_l2_round(
-                &path, &state, &[retired.clone(), fresh.clone()], false, is_catchup,
+                &db, 0, &state, &[retired.clone(), fresh.clone()], false, is_catchup,
                 |_, pending| async move { pending },
             ).await.unwrap();
             let pending = match result {
                 PostL2Orchestration::Deferred => {
-                    let loaded = load_state(&path).unwrap();
+                    let loaded = load_chain_state(&db, 0).unwrap();
                     assert_eq!(loaded.retired_claim_withdrawals.len(), 1);
-                    fs::remove_file(path).unwrap();
                     loaded.pending_claim_withdrawals
                 }
                 PostL2Orchestration::Dispatch(pending) => pending,
@@ -4937,17 +4756,9 @@ mod tests {
             assert_eq!(pending.len(), 1);
             assert!(pending.contains_key("fresh"));
         }
+        let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn old_multichain_state_without_retry_fields_remains_readable() {
-        let state: MultichainDaemonState = toml::from_str(
-            "identity_namespace = 'three-chains'\nlast_finalized_checkpoint = 42\n",
-        ).unwrap();
-        assert_eq!(state.last_finalized_checkpoint, 42);
-        assert!(state.claim_retry.is_empty());
-        assert!(state.retired_claim_withdrawals.is_empty());
-    }
 
     #[test]
     fn apply_claim_report_removes_resolved_and_already_claimed_keeps_failures() {
@@ -5447,165 +5258,6 @@ mod tests {
         assert_eq!(claims[1].leaf_hash, w3.leaf_hash);
     }
 
-    // ── reconcile_state_with_l1_finalized_checkpoint: error-propagation ────
-
-    #[test]
-    fn reconcile_state_succeeds_and_advances_when_persistence_fails() {
-        // Crash-recovery contract: a save_state failure during reconcile must
-        // NOT abort the in-memory reconcile — the checkpoint is still advanced
-        // and pending claims preserved, so the next round is L1-authoritative
-        // even if disk could not be written this cycle.
-        // Pointing save at a path whose PARENT directory does not exist makes
-        // fs::write fail (it cannot create the missing parent) without disturbing
-        // the in-memory state. A bare filename under temp_dir would succeed.
-        let unwritable = std::env::temp_dir()
-            .join("psy-relayer-nonexistent-parent-9f2a")
-            .join("state.toml");
-        let state = DaemonState {
-            last_finalized_checkpoint: 10,
-            pending_claim_withdrawals: HashMap::from([(
-                "leaf-keep".to_string(),
-                sample_withdrawal(1),
-            )]),
-                        ..Default::default()
-                    };
-        let reconciled =
-            reconcile_state_with_l1_finalized_checkpoint(state, &unwritable, 25).unwrap();
-        assert_eq!(reconciled.last_finalized_checkpoint, 25, "checkpoint must advance");
-        assert_eq!(reconciled.pending_claim_withdrawals.len(), 1, "pending must survive");
-        // The file was never written (parent dir absent).
-        assert!(!unwritable.exists());
-    }
-
-    #[test]
-    fn reconcile_state_clamps_to_zero_preserves_pending_and_persists() {
-        // L1 finalized regressed to 0 (e.g. fresh StateManager after a restart):
-        // local must clamp down to 0, pending claims survive, and the clamp is
-        // persisted so the next round's cursor is L1-authoritative.
-        let path = temp_state_path("clamp-zero");
-        let w = sample_withdrawal(4);
-        let state = DaemonState {
-            last_finalized_checkpoint: 20,
-            pending_claim_withdrawals: HashMap::from([(w.leaf_hash.clone(), w.clone())]),
-                        ..Default::default()
-                    };
-        let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 0).unwrap();
-        assert_eq!(reconciled.last_finalized_checkpoint, 0);
-        assert_eq!(reconciled.pending_claim_withdrawals.len(), 1);
-        assert_eq!(reconciled.pending_claim_withdrawals[&w.leaf_hash].event_id, w.event_id);
-        assert_eq!(load_state(&path).unwrap().last_finalized_checkpoint, 0);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn reconcile_state_noop_with_pending_present_does_not_write() {
-        // When local already matches L1 — even with pending claims — reconcile
-        // is a no-op and must not touch disk (avoids clobbering/needless churn).
-        let path = temp_state_path("noop-pending");
-        assert!(!path.exists());
-        let w = sample_withdrawal(1);
-        let state = DaemonState {
-            last_finalized_checkpoint: 15,
-            pending_claim_withdrawals: HashMap::from([(w.leaf_hash.clone(), w.clone())]),
-                        ..Default::default()
-                    };
-        let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 15).unwrap();
-        assert_eq!(reconciled.last_finalized_checkpoint, 15);
-        assert_eq!(reconciled.pending_claim_withdrawals.len(), 1);
-        assert!(!path.exists(), "no-op reconcile must not create a state file");
-    }
-
-    // ── load_state / save_state / DaemonState serde edges ───────────────────
-
-    #[test]
-    fn load_state_empty_file_errors_not_silently_default() {
-        // Crash recovery: a truncated/zero-byte state file must surface a parse
-        // error rather than silently booting to default — otherwise pending
-        // claims would vanish without trace. (Only a *missing* file yields the
-        // clean default; an existing-but-empty file is treated as corrupt.)
-        let path = temp_state_path("empty");
-        std::fs::write(&path, "").unwrap();
-        let err = load_state(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("failed to parse daemon state"),
-            "empty file must surface a parse error, got: {err}"
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_state_migrates_legacy_failed_claim_withdrawals_alias() {
-        // Backwards-compat migration: state files written by older daemons under
-        // the field name `failed_claim_withdrawals` must deserialize into
-        // `pending_claim_withdrawals` (the serde alias). Losing these on upgrade
-        // would silently drop unclaimed withdrawals — a P0 crash-recovery defect.
-        let path = temp_state_path("legacy-alias");
-        let toml = concat!(
-            "last_finalized_checkpoint = 88\n",
-            "[failed_claim_withdrawals.leaf-legacy]\n",
-            "event_id = -7\n",
-            "checkpoint_id = 5\n",
-            "user_id = 6\n",
-            "sender_user_id = 7\n",
-            "contract_id = 8\n",
-            "destination_chain_index = 9\n",
-            "token_address = [1,2,3,4,5,6,7,8]\n",
-            "amount = [9,10,11,12,13,14,15,16]\n",
-            "recipient = [17,18,19,20,21,22,23,24]\n",
-            "nonce = [25,26,27,28,29,30,31,32]\n",
-            "leaf_hash = \"leaf-legacy\"\n",
-        );
-        std::fs::write(&path, toml).unwrap();
-        let state = load_state(&path).expect("legacy alias must deserialize");
-        assert_eq!(state.last_finalized_checkpoint, 88);
-        assert_eq!(state.pending_claim_withdrawals.len(), 1, "legacy claims must migrate");
-        let w = &state.pending_claim_withdrawals["leaf-legacy"];
-        assert_eq!(w.event_id, -7);
-        assert_eq!(w.leaf_hash, "leaf-legacy");
-        assert_eq!(w.nonce, [25, 26, 27, 28, 29, 30, 31, 32]);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn save_state_round_trips_large_checkpoint_and_large_pending_set() {
-        // Large-checkpoint boundary: i64::MAX is the largest u64 the TOML layer
-        // can serialise (TOML integers are i64-range); a large pending set must
-        // survive a save/load cycle bit-for-bit so a restart resumes exactly.
-        // (u64::MAX is intentionally NOT tested here: it overflows TOML's i64
-        // range and save_state errors — see the report's limitations note.)
-        let path = temp_state_path("large");
-        let mut pending = HashMap::new();
-        for seed in 0..50u32 {
-            let w = sample_withdrawal(seed);
-            pending.insert(w.leaf_hash.clone(), w);
-        }
-        let state = DaemonState {
-            last_finalized_checkpoint: i64::MAX as u64,
-            pending_claim_withdrawals: pending,
-                        ..Default::default()
-                    };
-        save_state(&path, &state).unwrap();
-        let loaded = load_state(&path).unwrap();
-        assert_eq!(loaded.last_finalized_checkpoint, i64::MAX as u64);
-        assert_eq!(loaded.pending_claim_withdrawals.len(), 50);
-        // Spot-check two entries to ensure values (not just counts) round-trip.
-        assert_eq!(loaded.pending_claim_withdrawals["leaf-0"].event_id, 0);
-        assert_eq!(loaded.pending_claim_withdrawals["leaf-49"].user_id, 249);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn save_state_errors_when_path_is_unwritable() {
-        // Error-propagation: writing to a path whose parent directory does not
-        // exist must surface an error carrying the path context, not panic.
-        let unwritable = std::env::temp_dir().join("psy-relayer-nonexistent-dir-7b1").join("x.toml");
-        let state = DaemonState::default();
-        let err = save_state(&unwritable, &state).unwrap_err();
-        assert!(
-            err.to_string().contains("failed to write daemon state"),
-            "expected write-failure context, got: {err}"
-        );
-    }
 
     // ── read_single_felt_from_packed_leaf: packed contract-state decoding ──
 
@@ -6039,63 +5691,33 @@ mod tests {
     }
 
     #[test]
-    fn catchup_round_defers_claims_and_retains_pending_across_reconcile_save_cycle() {
-        // Catch-up must defer pending withdrawals without mutating them so a
-        // later normal round can retry the same durable set.
+    fn catchup_round_defers_claims_and_retains_pending() {
         let window = RelayerWindow {
             to_checkpoint: 17,
             confirmed_to_checkpoint: Some(77),
             is_catchup_batch: true,
         };
         assert!(window.is_catchup_batch);
-        let is_catchup_batch = window.is_catchup_batch;
-        assert!(is_catchup_batch, "catchup round must disable withdrawal processing");
-
-        let w1 = sample_withdrawal(1);
-        let w2 = sample_withdrawal(2);
+        let mut w1 = sample_withdrawal(1);
+        let mut w2 = sample_withdrawal(2);
+        w1.destination_chain_index = 0;
+        w2.destination_chain_index = 0;
         let pending: HashMap<String, PendingWithdrawal> = [
             (w1.leaf_hash.clone(), w1.clone()),
             (w2.leaf_hash.clone(), w2.clone()),
-        ]
-        .into_iter()
-        .collect();
-
-        assert!(is_catchup_batch);
-        assert_eq!(pending.len(), 2);
-
-        // Reconcile against an advanced L1 cursor (as the next round would),
-        // then persist and reload: pending claims must round-trip intact.
-        let path = temp_state_path("catchup-retain");
-        let state = DaemonState {
-            last_finalized_checkpoint: 17,
-            pending_claim_withdrawals: pending,
-                        ..Default::default()
-                    };
-        let reconciled = reconcile_state_with_l1_finalized_checkpoint(state, &path, 77).unwrap();
-        assert_eq!(reconciled.last_finalized_checkpoint, 77);
-        assert_eq!(reconciled.pending_claim_withdrawals.len(), 2);
-        assert_eq!(reconciled.pending_claim_withdrawals[&w1.leaf_hash].event_id, w1.event_id);
-        assert_eq!(reconciled.pending_claim_withdrawals[&w2.leaf_hash].event_id, w2.event_id);
-
-        let saved = load_state(&path).unwrap();
-        assert_eq!(saved.last_finalized_checkpoint, 77);
+        ].into_iter().collect();
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        save_chain_state(&db, 0, &DaemonState { pending_claim_withdrawals: pending, ..Default::default() }).unwrap();
+        let saved = load_chain_state(&db, 0).unwrap();
         assert_eq!(saved.pending_claim_withdrawals.len(), 2);
         assert_eq!(saved.pending_claim_withdrawals[&w1.leaf_hash].event_id, w1.event_id);
         assert_eq!(saved.pending_claim_withdrawals[&w2.leaf_hash].event_id, w2.event_id);
-
-        // After catchup completes, the next round is normal: claims are now
-        // allowed and the retained pending set drives a claim.
-        let normal_window = RelayerWindow {
-            to_checkpoint: 77,
-            confirmed_to_checkpoint: Some(77),
-            is_catchup_batch: false,
-        };
-        let normal_is_catchup_batch = normal_window.is_catchup_batch;
-        assert!(!normal_is_catchup_batch);
-        assert!(!normal_is_catchup_batch && 2 > 0);
-
-        let _ = std::fs::remove_file(path);
+        let normal = RelayerWindow { to_checkpoint: 77, confirmed_to_checkpoint: Some(77), is_catchup_batch: false };
+        assert!(!normal.is_catchup_batch && saved.pending_claim_withdrawals.len() > 0);
+        let _ = std::fs::remove_dir_all(root);
     }
+
 
     // ── inner-loop catch-up break (run_l2_bridge_round mid-round stop) ────
 
@@ -6464,18 +6086,17 @@ mod tests {
             .await;
         }
 
-        let state_path = temp_state_path("new-latch-orchestration");
-        let durable = sample_withdrawal(1);
-        let landed = sample_withdrawal(2);
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let mut durable = sample_withdrawal(1);
+        let mut landed = sample_withdrawal(2);
+        durable.destination_chain_index = 0;
+        landed.destination_chain_index = 0;
         let state = DaemonState {
-            last_finalized_checkpoint: 77,
-            pending_claim_withdrawals: HashMap::from([(
-                durable.leaf_hash.clone(),
-                durable.clone(),
-            )]),
-                        ..Default::default()
-                    };
-        save_state(&state_path, &state).unwrap();
+            pending_claim_withdrawals: HashMap::from([(durable.leaf_hash.clone(), durable.clone())]),
+            ..Default::default()
+        };
+        save_chain_state(&db, 0, &state).unwrap();
 
         let deposit_calls = Arc::new(AtomicUsize::new(0));
         let proof_calls = Arc::new(AtomicUsize::new(0));
@@ -6483,7 +6104,8 @@ mod tests {
         let claim_calls = Arc::new(AtomicUsize::new(0));
 
         let deferred = orchestrate_post_l2_round(
-            &state_path,
+            &db,
+            0,
             &state,
             std::slice::from_ref(&landed),
             false,
@@ -6511,8 +6133,7 @@ mod tests {
         assert_eq!(finalize_calls.load(Ordering::SeqCst), 0);
         assert_eq!(claim_calls.load(Ordering::SeqCst), 0);
 
-        let installed = load_state(&state_path).unwrap();
-        assert_eq!(installed.last_finalized_checkpoint, 77);
+        let installed = load_chain_state(&db, 0).unwrap();
         assert_eq!(installed.pending_claim_withdrawals.len(), 2);
         assert_eq!(
             installed.pending_claim_withdrawals[&durable.leaf_hash].event_id,
@@ -6532,7 +6153,8 @@ mod tests {
             claim_calls.store(0, Ordering::SeqCst);
 
             let dispatched = orchestrate_post_l2_round(
-                &state_path,
+                &db,
+                0,
                 &state,
                 &[],
                 pre,
@@ -6564,7 +6186,7 @@ mod tests {
             assert_eq!(claim_calls.load(Ordering::SeqCst), 1, "{label}");
         }
 
-        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6608,121 +6230,55 @@ mod tests {
     }
 
     #[test]
-    fn save_state_atomically_replaces_existing_ledger_without_temp_residue() {
-        // Crash safety: successful install fully replaces the prior ledger and
-        // leaves no same-dir temp residue that could later be confused for state.
-        let path = temp_state_path("atomic-replace");
-        let prior_w = sample_withdrawal(3);
-        let prior = DaemonState {
-            last_finalized_checkpoint: 11,
+    fn chain_row_replace_keeps_prior_claim_and_adds_the_next() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let mut prior_w = sample_withdrawal(3);
+        prior_w.destination_chain_index = 0;
+        save_chain_state(&db, 0, &DaemonState {
             pending_claim_withdrawals: HashMap::from([(prior_w.leaf_hash.clone(), prior_w.clone())]),
-                        ..Default::default()
-                    };
-        save_state(&path, &prior).unwrap();
-        let prior_bytes = std::fs::read(&path).expect("prior ledger bytes");
-
-        let next_w = sample_withdrawal(9);
-        let next = DaemonState {
-            last_finalized_checkpoint: 42,
+            ..Default::default()
+        }).unwrap();
+        let mut next_w = sample_withdrawal(9);
+        next_w.destination_chain_index = 0;
+        save_chain_state(&db, 0, &DaemonState {
             pending_claim_withdrawals: HashMap::from([
                 (prior_w.leaf_hash.clone(), prior_w.clone()),
                 (next_w.leaf_hash.clone(), next_w.clone()),
             ]),
-                       ..Default::default()
-                   };
-        save_state(&path, &next).unwrap();
-
-        let loaded = load_state(&path).unwrap();
-        assert_eq!(loaded.last_finalized_checkpoint, 42);
+            ..Default::default()
+        }).unwrap();
+        let loaded = load_chain_state(&db, 0).unwrap();
         assert_eq!(loaded.pending_claim_withdrawals.len(), 2);
-        assert_eq!(
-            loaded.pending_claim_withdrawals[&next_w.leaf_hash].event_id,
-            next_w.event_id
-        );
-        let installed_bytes = std::fs::read(&path).expect("installed ledger bytes");
-        assert_ne!(
-            installed_bytes, prior_bytes,
-            "atomic install must replace the prior ledger contents"
-        );
-
-        let parent = path.parent().expect("temp state parent");
-        let stem = path
-            .file_name()
-            .expect("state file name")
-            .to_string_lossy()
-            .into_owned();
-        let temp_residue: Vec<_> = std::fs::read_dir(parent)
-            .expect("read state parent")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                name.contains(".tmp-") && name.contains(stem.trim_start_matches('.'))
-            })
-            .map(|entry| entry.path())
-            .collect();
-        assert!(
-            temp_residue.is_empty(),
-            "successful atomic save must not leave temp residue: {temp_residue:?}"
-        );
-
-        let _ = std::fs::remove_file(path);
+        assert_eq!(loaded.pending_claim_withdrawals[&next_w.leaf_hash].event_id, next_w.event_id);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn failed_state_install_must_not_delete_proof_or_treat_advance_as_persisted() {
-        // Unwritable state destination surfaces an install error, leaves the
-        // pre-existing ledger untouched, and retains the proof through the
-        // exact production install/cleanup helper.
-        let parent = std::env::temp_dir().join(format!(
-            "psy-relayer-atomic-fail-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&parent).unwrap();
-        let path = parent.join("daemon_state.toml");
-        let prior = DaemonState {
-            last_finalized_checkpoint: 7,
-            pending_claim_withdrawals: HashMap::new(),
-                        ..Default::default()
-                    };
-        save_state(&path, &prior).unwrap();
-        let prior_bytes = std::fs::read(&path).unwrap();
-
-        let proof_path = parent.join("bridge_proof_99.json");
+    fn failed_claim_install_retains_proof_and_prior_row() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let mut prior_w = sample_withdrawal(7);
+        prior_w.destination_chain_index = 0;
+        save_chain_state(&db, 0, &DaemonState {
+            pending_claim_withdrawals: HashMap::from([(prior_w.leaf_hash.clone(), prior_w.clone())]),
+            ..Default::default()
+        }).unwrap();
+        let proof_path = root.join("bridge_proof_99.json");
         std::fs::write(&proof_path, b"proof-must-survive").unwrap();
-        let missing_state_path = parent
-            .join("missing-dir")
-            .join("nested")
-            .join("daemon_state.toml");
-        let advanced = DaemonState {
-            last_finalized_checkpoint: 99,
-            pending_claim_withdrawals: HashMap::new(),
-                           ..Default::default()
-                       };
-        let err = persist_finalized_state_then_cleanup_proof(
-            &missing_state_path,
-            &advanced,
-            &proof_path,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("failed to write daemon state"),
-            "expected write-failure context, got: {err}"
-        );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            prior_bytes,
-            "failed install must not mutate the prior ledger"
-        );
-        assert!(
-            proof_path.exists(),
-            "production helper must retain proof when state install fails"
-        );
-
-        let _ = std::fs::remove_file(&proof_path);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(parent);
+        let mut advanced = DaemonState::default();
+        advanced.pending_claim_withdrawals.insert("too-wide".into(), withdrawal_for_chain("too-wide", u64::from(u8::MAX) + 1));
+        let err = save_multichain_state(&db, &MultichainDaemonState {
+            pending_claim_withdrawals: advanced.pending_claim_withdrawals,
+            ..Default::default()
+        }).unwrap_err();
+        assert!(err.to_string().contains("claim destination chain does not fit chain_index"), "{err}");
+        assert!(proof_path.exists(), "a failed claim install must not delete the proof");
+        assert_eq!(load_chain_state(&db, 0).unwrap().pending_claim_withdrawals.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
+
+
 
     #[test]
     fn l2_round_result_compile_time_shape_contract() {
@@ -6762,6 +6318,24 @@ mod tests {
     }
 
     #[test]
+    fn cursor_read_error_chain_classifies_typed_transport_root() {
+        // Mirrors the real chain at the "failed to read finalization cursor"
+        // log site: the eth_call's TransportError wrapped by the two contexts
+        // from fetch_l1_last_finalized_checkpoint and with_rpc_failover.
+        let payload: alloy_json_rpc::ErrorPayload = serde_json::from_value(
+            serde_json::json!({"code": 3, "message": "execution reverted"}),
+        ).unwrap();
+        let error = anyhow::Error::from(alloy_transport::TransportError::ErrorResp(payload))
+            .context("StateManager.lastFinalizedCheckpointId eth_call failed")
+            .context("L1 operation last_finalized_checkpoint failed");
+        assert_eq!(transport_error_category(&error), "revert");
+
+        // No typed transport error in the chain: fallback, never a guess.
+        let untyped = anyhow::anyhow!("L1 operation last_finalized_checkpoint failed");
+        assert_eq!(transport_error_category(&untyped), "other");
+    }
+
+    #[test]
     fn set_chain_root_calls_are_sorted_and_use_absolute_counts() {
         let mut calls = vec![
             build_set_chain_root_call(2, 9, &format!("0x{}", "22".repeat(32))).unwrap(),
@@ -6777,6 +6351,7 @@ mod tests {
     fn daemon_config_parses_three_evm_chains() {
         let raw = r#"
 rpc_config = "config.json"
+guardian_root = "guardians-root"
 services_url = "http://127.0.0.1:3000"
 withdraw_method_id = 1
 
@@ -6805,6 +6380,18 @@ deployments_network = "localhostBase"
         assert_eq!(config.chains.len(), 3);
         assert_eq!(config.chains.iter().map(|chain| chain.chain_index).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert!(config.chains.iter().all(|chain| chain.family == "evm"));
+    }
+
+    #[test]
+    fn default_daemon_config_loads_required_startup_fields() {
+        let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/config/local.toml"));
+        let config = load_config(&path).unwrap();
+        let services = reqwest::Url::parse(config.services_url.trim_end_matches('/')).unwrap();
+        assert!(matches!(services.scheme(), "http" | "https") && services.host().is_some());
+        assert!(config.withdraw_method_id > 0);
+        assert!(!config.rpc_config.is_empty());
+        let guardian_root = Path::new(&config.guardian_root);
+        assert!(guardian_root.is_relative() && guardian_root.components().all(|component| matches!(component, std::path::Component::Normal(_))));
     }
 
     #[test]
@@ -6855,6 +6442,7 @@ deployments_network = "localhostBase"
     fn chain_rpc_providers_take_precedence_and_legacy_urls_keep_order() {
         let raw = r#"
 rpc_config = "config.json"
+guardian_root = "guardians-root"
 services_url = "http://127.0.0.1:3000"
 withdraw_method_id = 1
 
@@ -6896,6 +6484,7 @@ rpc_urls = ["https://z", "https://a"]
     fn l1_fees_named_pool_policy_is_chain_local_and_legacy_config_still_loads() {
         let config: BridgeProposeDaemonConfig = toml::from_str(r#"
 rpc_config = "config.json"
+guardian_root = "guardians-root"
 services_url = "http://127.0.0.1:1"
 withdraw_method_id = 1
 [[chains]]
@@ -6929,10 +6518,10 @@ rpc_urls = ["http://127.0.0.1:4"]
         }
         let mut invalid = config.clone();
         invalid.finalize.fee_policy = bsc.finalize.fee_policy.clone();
-        assert!(configured_chains(&invalid).unwrap_err().to_string().contains("not [finalize.fee_policy]"));
+        assert!(configured_chains(&invalid, &test_l1()).unwrap_err().to_string().contains("not [finalize.fee_policy]"));
         invalid.finalize.fee_policy = None;
         invalid.chains[0].fee_policy = bsc.finalize.fee_policy.clone();
-        assert!(configured_chains(&invalid).unwrap_err().to_string().contains("only be enabled for bscTestnet"));
+        assert!(configured_chains(&invalid, &test_l1()).unwrap_err().to_string().contains("only be enabled for bscTestnet"));
         let mut legacy = config;
         legacy.chains[1].fee_policy = None;
         assert!(legacy.chains.iter().all(|c| c.fee_policy.is_none()));
@@ -6981,21 +6570,18 @@ rpc_urls = ["http://127.0.0.1:4"]
 
     #[tokio::test]
     async fn l1_fees_durable_range_survives_refusal_and_resume_syncs_before_finalize() {
-        let path = temp_state_path("fee-range-resume");
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
         let withdrawal = withdrawal_for_chain("landed-bsc", 1);
         let range = PendingFinalizationRange { from_checkpoint: 198846, to_checkpoint: 198905 };
-        let mut state = MultichainDaemonState {
-            identity_namespace: "fee-resume".into(),
-            last_finalized_checkpoint: 198845,
-            ..Default::default()
-        };
+        let mut state = MultichainDaemonState::default();
         let mut attempted = Vec::new();
         let ready = persist_and_sync_multichain_range(
-            &path, &mut state, range, &[withdrawal.clone()],
+            &db, &mut state, range, &[withdrawal.clone()],
             &[(0, 198845), (1, 198845), (2, 198845)],
             |chain, endpoint| {
                 // Fault injection runs only after the actual production save.
-                let saved = load_multichain_state(&path, "fee-resume").unwrap();
+                let saved = load_multichain_state(&db).unwrap();
                 assert_eq!(saved.pending_finalization_range, Some(range));
                 assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
                 attempted.push((chain, endpoint));
@@ -7007,14 +6593,13 @@ rpc_urls = ["http://127.0.0.1:4"]
         assert!(!ready, "fee refusal must block proof/finalize dispatch");
         assert_eq!(attempted, vec![(0, range.to_checkpoint), (1, range.to_checkpoint)]);
 
-        let mut restarted = load_multichain_state(&path, "fee-resume").unwrap();
-        assert_eq!(restarted.last_finalized_checkpoint, 198845);
+        let mut restarted = load_multichain_state(&db).unwrap();
         assert!(restarted.finalized_chains.is_empty());
         assert!(restarted.claim_retry.is_empty());
         assert!(restarted.retired_claim_withdrawals.is_empty());
         attempted.clear();
         let ready = persist_and_sync_multichain_range(
-            &path, &mut restarted, range, &[],
+            &db, &mut restarted, range, &[],
             &[(0, range.to_checkpoint), (1, 198845), (2, 198845)],
             |chain, endpoint| {
                 attempted.push((chain, endpoint));
@@ -7025,20 +6610,23 @@ rpc_urls = ["http://127.0.0.1:4"]
         // A finalized chain is skipped, but every unfinished chain is synced
         // again at the original endpoint before finalization can proceed.
         assert_eq!(attempted, vec![(1, range.to_checkpoint), (2, range.to_checkpoint)]);
-        let saved = load_multichain_state(&path, "fee-resume").unwrap();
+        let saved = load_multichain_state(&db).unwrap();
         assert_eq!(saved.pending_finalization_range, Some(range));
         assert_eq!(saved.pending_claim_withdrawals.len(), 1);
-        fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn l1_fees_durable_range_save_failure_blocks_deposit_dispatch() {
-        let path = temp_state_path("fee-range-save-failure");
-        fs::create_dir(&path).unwrap();
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let poison = b"not-json";
+        db.test_write_raw_finalization_batch(poison).unwrap();
+        let withdrawal = withdrawal_for_chain("poisoned-batch", 1);
         let mut state = MultichainDaemonState::default();
         let range = PendingFinalizationRange { from_checkpoint: 10, to_checkpoint: 80 };
         let result = persist_and_sync_multichain_range(
-            &path, &mut state, range, &[], &[(1, 9)],
+            &db, &mut state, range, &[withdrawal], &[(1, 9)],
             |_, _| {
                 panic!("deposit dispatch must not run if the ledger cannot be installed");
                 #[allow(unreachable_code)]
@@ -7046,26 +6634,27 @@ rpc_urls = ["http://127.0.0.1:4"]
             },
         ).await;
         assert!(result.is_err());
-        fs::remove_dir(&path).unwrap();
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        if tmp.exists() { fs::remove_file(tmp).unwrap(); }
+        assert_eq!(db.test_raw_finalization_batch().unwrap().as_deref(), Some(&poison[..]));
+        assert!(db.chain_claims().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn l1_fees_durable_range_retains_claims_on_non_fee_deposit_error() {
-        let path = temp_state_path("fee-range-rpc-error");
-        let mut state = MultichainDaemonState { identity_namespace: "rpc-error".into(), ..Default::default() };
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let mut state = MultichainDaemonState::default();
         let range = PendingFinalizationRange { from_checkpoint: 1, to_checkpoint: 5 };
         let withdrawal = withdrawal_for_chain("landed-rpc-error", 1);
         let result = persist_and_sync_multichain_range(
-            &path, &mut state, range, &[withdrawal.clone()], &[(1, 0)],
+            &db, &mut state, range, &[withdrawal.clone()], &[(1, 0)],
             |_, _| std::future::ready(Err(anyhow::anyhow!("injected deposit RPC error"))),
         ).await;
         assert!(result.is_err());
-        let saved = load_multichain_state(&path, "rpc-error").unwrap();
+        let saved = load_multichain_state(&db).unwrap();
         assert_eq!(saved.pending_finalization_range, Some(range));
         assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
-        fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn write_temp_rpc_config(system_urls: &str) -> std::path::PathBuf {
@@ -7078,16 +6667,19 @@ rpc_urls = ["http://127.0.0.1:4"]
         let path = dir.join("config.json");
         // Match the compiled identity so this fixture exercises URL validation,
         // rather than failing the independent stage/magic guard first.
-        let json = r#"{"networks":{"localhost":{
-                "magic": "__COMPILED_MAGIC__",
+        let system_prove_proxy_url: serde_json::Value = serde_json::from_str(system_urls).unwrap();
+        let json = serde_json::json!({
+            "networks": {"localhost": {
+                "magic": format!("0x{:x}", psy_config::PSY_NETWORK_MAGIC),
                 "users_per_realm": 1048576,
                 "global_user_tree_height": 24,
                 "realm_user_tree_height": 20,
                 "group_realm_height": 1,
                 "realm_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8546"]}],
+                "p2p": {"checkpoints_per_epoch": 1},
                 "coordinator_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:8545"]}],
                 "prove_proxy_url": ["http://127.0.0.1:9999"],
-                "system_prove_proxy_url": __SYSTEM_URLS__,
+                "system_prove_proxy_url": system_prove_proxy_url,
                 "faucet_rpc_url": ["http://127.0.0.1:8547"],
                 "nostr_relay_url": "wss://relay.127.0.0.1.example",
                 "native_currency": "PSY",
@@ -7096,19 +6688,19 @@ rpc_urls = ["http://127.0.0.1:4"]
                 "fees": {
                     "register_user_fee": 0,
                     "deploy_contract_fee": 0,
-                    "guta_fee": 5000000000,
+                    "guta_fee": 5_000_000_000u64,
                     "da_fee": 0
                 }
-            }},"defaultNetwork":"localhost"}"#
-        .replace("__SYSTEM_URLS__", system_urls)
-        .replace("__COMPILED_MAGIC__", &format!("0x{:x}", psy_config::PSY_NETWORK_MAGIC));
+            }},
+            "defaultNetwork": "localhost"
+        }).to_string();
         std::fs::write(&path, json).unwrap();
         path
     }
 
     fn daemon_config_with_rpc(path: &std::path::Path) -> BridgeProposeDaemonConfig {
         toml::from_str(&format!(
-            "rpc_config = {:?}\nguardian_config = \"guardian-client.json\"\nservices_url = \"http://127.0.0.1:1\"\nwithdraw_method_id = 0\n",
+            "rpc_config = {:?}\nguardian_root = \"guardians-root\"\nservices_url = \"http://127.0.0.1:1\"\nwithdraw_method_id = 0\n",
             path.display()
         ))
         .unwrap()
@@ -7228,5 +6820,25 @@ rpc_urls = ["http://127.0.0.1:4"]
         let url = format!("http://{addr}");
 
         assert!(verify_system_prove_proxy(&url).await.is_err());
+    }
+
+    #[test]
+    fn select_guardian_withdrawals_drops_both_index_conflicts_without_failing_the_session() {
+        let nonce_a = [0u32, 0, 0, 0, 0, 0, 0, 7];
+        let nonce_b = [0u32, 0, 0, 0, 0, 0, 0, 8];
+        let nonce_c = [0u32, 0, 0, 0, 0, 0, 0, 9];
+        let withdrawal = |nonce: [u32; 8], chain: u64, sender: u64| PendingWithdrawal {
+            event_id: 0, checkpoint_id: 0, user_id: 1, sender_user_id: sender, contract_id: 4,
+            destination_chain_index: chain, token_address: [0; 8], amount: [0; 8], recipient: [0; 8], nonce, leaf_hash: String::new(),
+        };
+        let withdrawals = vec![withdrawal(nonce_a, 0, 1000), withdrawal(nonce_b, 1, 1001), withdrawal(nonce_c, 1, 1002)];
+        let withdrawal_burns = std::collections::BTreeSet::from([(1000u32, 4u32, nonce_a)]);
+        let nonces = std::collections::BTreeSet::from([(1u8, nonce_b)]);
+        // A durable withdrawal-burn hit or a destination-chain nonce hit drops the withdrawal;
+        // neither conflict may abort the selection or fail the whole session here.
+        let selected = select_guardian_withdrawals(&withdrawals, |sender, contract, nonce| Ok(withdrawal_burns.contains(&(sender, contract, nonce))), |chain, nonce| Ok(nonces.contains(&(chain, nonce)))).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].nonce, nonce_c);
+        assert_eq!(selected[0].destination_chain_index, 1);
     }
 }

@@ -1,12 +1,14 @@
-import { parseArgs } from "util";
+import { parseArgs, isDeepStrictEqual } from "util";
 import { rm, exists, mkdir, writeFile } from "fs/promises";
 import fs from "fs";
 import path from "path";
 import net from "node:net";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { availableParallelism, homedir } from "node:os";
-import { execFile } from "node:child_process";
+import { availableParallelism } from "node:os";
+import { execFile, spawn } from "node:child_process";
+import { createInterface } from "node:readline";
+import { frozenDepsEnabled, frozenDepsCommandRunner, guardedEnvioCodegen } from "./frozenDeps";
 import allConfig from "../psy-genesis/config.json";
 import { protocolConfig } from "../psy-contracts/protocol-config";
 import {
@@ -20,6 +22,7 @@ import {
     REALM_PROCESSOR_READY_MARKER,
     SUPERVISOR_RESTART_LIMIT_TAG,
     applyEnvioCpuSetToCompose,
+    applyEnvioNetworkName,
     classifySupervisedExit,
     emptyRestartStreak,
     failureSignature,
@@ -52,8 +55,18 @@ import {
     r2CurlArgs,
     psyServicesDatabaseCommands,
     pinFaucetPerClaimAmount,
+    DEVNET_NAMESPACE_ENV,
+    resolveDevnetDbNamesFromEnv,
+    resolveDevnetDbNames,
+    devnetDbContainerNames,
+    devnetDbVolumeNames,
+    devnetIsolationResources,
+    envioPostgresReadinessCommand,
+    envioServicesDatabaseProbeCommand,
+    envioComposeCommand,
 } from "./locSetupPolicy";
 import type {
+    DevnetDbNames,
     FatalProcessorErrorMarker,
     PsyDappNestedInitPlan,
     PsyDappNestedSubmodule,
@@ -119,8 +132,82 @@ export async function retryProcessorStartup<T>(
 type ProcessLineVisitor = (line: string, process: RunningProcess) => void;
 // this is an insecure, obviously fake private key for local devnet use only
 const FAKE_MINER_PRIVATE_KEY = "691337BADFACE067320cb499a730fa6c81a756ed912f181f0f20a6b1fa5c1337";
-async function killDocker(): Promise<void> {
-    await runIgnoreErrors(["docker", "stop", "valkey-server", "scylla-server", "nats-server"]);
+export const DEVNET_NAMESPACE_BINDING = path.join("local_checkpoints", "devnet-namespace");
+
+export async function resolveBoundDevnetNames(repoRoot: string, env: NodeJS.ProcessEnv = process.env): Promise<DevnetDbNames> {
+    const bindingPath = path.join(repoRoot, DEVNET_NAMESPACE_BINDING);
+    let stored: string | null = null;
+    try { stored = (await fs.promises.readFile(bindingPath, "utf8")).trim(); }
+    catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const explicit = env[DEVNET_NAMESPACE_ENV];
+    const explicitSet = explicit != null && explicit !== "";
+    if (stored !== null) {
+        const bound = resolveDevnetDbNames(stored === "" ? null : stored);
+        if (explicitSet && bound.namespace !== resolveDevnetDbNames(explicit).namespace) {
+            throw new Error(`[DevNet] ${DEVNET_NAMESPACE_ENV} does not match the worktree binding`);
+        }
+        return bound;
+    }
+    if (explicitSet) throw new Error(`[DevNet] ${DEVNET_NAMESPACE_ENV} has no committed worktree binding`);
+    return resolveDevnetDbNames(null);
+}
+
+export async function commitDevnetNamespaceBinding(repoRoot: string, names: DevnetDbNames): Promise<void> {
+    const bindingPath = path.join(repoRoot, DEVNET_NAMESPACE_BINDING);
+    const bindingDir = path.dirname(bindingPath);
+    // New trees get an owner-only directory; a pre-existing directory is only
+    // validated, never chmod'ed (it may hold operator-managed checkpoints).
+    await mkdir(bindingDir, { recursive: true, mode: 0o700 });
+    if ((await fs.promises.stat(bindingDir)).mode & 0o22) {
+        throw new Error(`[DevNet] binding directory ${bindingDir} must not be group/other-writable`);
+    }
+    const pendingPath = `${bindingPath}.pending-${process.pid}`;
+    // Explicit 0600: bare "wx" inherits the umask (0664 under umask 002), which
+    // the fresh-state helper rejects for owner-controlled files.
+    const handle = await fs.promises.open(pendingPath, "wx", 0o600);
+    try {
+        await handle.writeFile(`${names.namespace ?? ""}\n`);
+        await handle.sync();
+    } finally { await handle.close(); }
+    try {
+        // link is exclusive: never replace a binding published by another owner.
+        await fs.promises.link(pendingPath, bindingPath);
+    } finally { await fs.promises.unlink(pendingPath); }
+    const directory = await fs.promises.open(path.dirname(bindingPath), "r");
+    try { await directory.sync(); } finally { await directory.close(); }
+}
+
+export async function reserveDevnetNamespace(repoRoot: string, env: NodeJS.ProcessEnv = process.env): Promise<DevnetDbNames> {
+    const bindingPath = path.join(repoRoot, DEVNET_NAMESPACE_BINDING);
+    if (await exists(bindingPath)) return resolveBoundDevnetNames(repoRoot, env);
+    const names = resolveDevnetDbNamesFromEnv(env);
+    await assertFreshDevnetNamespace(names);
+    await commitDevnetNamespaceBinding(repoRoot, names);
+    return names;
+}
+async function assertFreshDevnetNamespace(names: DevnetDbNames): Promise<void> {
+    const wanted = devnetIsolationResources(names);
+    wanted.containers.push(`${names.envioComposeProject}-graphql-engine-1`);
+    wanted.networks.push(names.namespace === null ? "psy-devnet" : `${names.namespace}-psy-devnet`);
+    const checks: Array<[string, string[], string[]]> = [
+        ["container", ["docker", "ps", "-a", "--format", "{{.Names}}"], wanted.containers],
+        ["volume", ["docker", "volume", "ls", "--format", "{{.Name}}"], wanted.volumes],
+        ["network", ["docker", "network", "ls", "--format", "{{.Name}}"], wanted.networks],
+    ];
+    for (const [kind, argv, expected] of checks) {
+        const listed = await runTeardownCommand(argv, undefined, PURGE_DOCKER_TIMEOUT_MS);
+        if (listed.timedOut || listed.code !== 0 || !listed.stdoutComplete) {
+            throw new Error(`[DevNet] cannot prove ${kind} absence for namespace ${names.namespace}`);
+        }
+        const present = exactSnapshotNames(listed.stdout);
+        const collision = expected.filter((name) => present.has(name));
+        if (collision.length > 0) throw new Error(`[DevNet] namespace ${names.namespace} already owns ${kind}: ${collision.join(", ")}`);
+    }
+    for (const port of [6379, 4222, 9042, 8081, 5433, 8080, 8545, 9545, 10545]) {
+        if (await tcpPortOpen(port)) throw new Error(`[DevNet] namespace ${names.namespace} requires free port ${port}`);
+    }
 }
 
 async function runIgnoreErrors(cmd: string[], cwd?: string): Promise<void> {
@@ -790,7 +877,7 @@ export class RunningProcess {
         }
         await validateRelayerTemplate(cmds, options);
         const guardianListener = cmds.includes("guardian-service")
-            ? await prepareGuardianService(cmds, options.cwd || process.cwd())
+            ? await prepareGuardianService(cmds, options.cwd || process.cwd(), options.env ?? process.env)
             : undefined;
         const prepareLog = async (filePath: string | undefined) => {
             if (!filePath) return;
@@ -1346,8 +1433,9 @@ export function planRealmP2pConfig(
     edgeCount: number,
     publicHost: string,
     validatorUserIds: readonly number[],
-    genesisConfigHash: string,
+    _genesisConfigHash: string,
     nodeNetwork: string = "local-devnet",
+    sourceConfig: FullNetworkConfig = allConfig as FullNetworkConfig,
 ): RealmP2pConfigPlan {
     if (validatorUserIds.length !== realmIds.length * REALM_P2P_SUB_IDS.length) throw new Error("Expected one genesis user id per validator");
     validatorUserIds.forEach((userId, index) => {
@@ -1357,12 +1445,15 @@ export function planRealmP2pConfig(
         }
     });
     const configKey = selectedRuntimeConfigKey(nodeNetwork);
-    const sourceNetwork = (allConfig as FullNetworkConfig).networks[configKey];
+    const sourceNetwork = sourceConfig.networks[configKey];
     if (!sourceNetwork) throw new Error(`Genesis config has no network ${configKey}`);
-    const networkConfig = config?.networks[configKey];
+    const networkConfig = config?.networks?.[configKey];
     const activeRealmIds = new Set(realmIds);
-    const reusable = config?.genesisConfigHash === genesisConfigHash
-        && networkConfig?.p2p?.checkpoints_per_epoch === sourceNetwork.p2p.checkpoints_per_epoch
+    const consensusFields = ["p2p", "magic", "users_per_realm", "global_user_tree_height", "realm_user_tree_height", "group_realm_height"] as const;
+    if (config && (!networkConfig || consensusFields.some((field) => !isDeepStrictEqual(networkConfig[field], sourceNetwork[field])))) {
+        throw new Error("Existing Realm P2P consensus configuration differs from source; refusing identity regeneration");
+    }
+    const reusable = !!networkConfig
         && Array.isArray(networkConfig.realm_configs)
         && realmIds.every((realmId, realmIndex) => {
             const matches = networkConfig.realm_configs.filter((value) => value.id === realmId);
@@ -1386,6 +1477,7 @@ export function planRealmP2pConfig(
         })
         && networkConfig.realm_configs.every((realm) => activeRealmIds.has(realm.id)
             || Array.isArray(realm.validators) && realm.validators.length === 0);
+    if (config && !reusable) throw new Error("Existing Realm P2P topology is incompatible; refusing identity regeneration");
     return {
         reuse: reusable,
         args: ["--out-dir", REALM_P2P_OUT_DIR, "--realm-ids", realmIds.join(","), "--validators-per-realm", REALM_P2P_SUB_IDS.length.toString(), "--validator-user-ids", validatorUserIds.join(","), "--edges-per-validator", edgeCount.toString()],
@@ -1416,35 +1508,86 @@ export function daemonRealmP2pConfig(config: FullNetworkConfig, realmIds: readon
     return copy;
 }
 
-export async function injectGenesisValidators(genesisPath: string, config: FullNetworkConfig): Promise<void> {
-    const genesis = JSON.parse(await fs.promises.readFile(genesisPath, "utf-8")) as { validators?: Array<{ realm_id: number; validator_user_id: number; node_id: string; bls_public_key: string }> };
-    const network = config.networks[config.defaultNetwork];
-    genesis.validators = network.realm_configs.flatMap((realm) => realm.validators.map((validator) => ({
+type GenesisMembership = Array<{ realm_id: number; validator_user_id: number; node_id: string; bls_public_key: string }>;
+
+function realmGenesisValidators(config: FullNetworkConfig): GenesisMembership {
+    return config.networks[config.defaultNetwork].realm_configs.flatMap((realm) => realm.validators.map((validator) => ({
         realm_id: realm.id,
         validator_user_id: validator.validator_user_id,
         node_id: validator.processor_node_id,
         bls_public_key: validator.bls_public_key,
     })));
+}
+
+function validateGenesisValidators(validators: unknown, expected: GenesisMembership): void {
+    if (validators === undefined) return;
+    if (!Array.isArray(validators)) throw new Error("Malformed Genesis validator membership");
+    if (validators.length === 0) return;
+    const canonical = (members: GenesisMembership) => [...members].sort((a, b) => a.realm_id - b.realm_id || a.validator_user_id - b.validator_user_id);
+    if (!isDeepStrictEqual(canonical(validators), canonical(expected))) {
+        throw new Error("Existing Genesis validator membership conflicts with Realm P2P config; refusing overwrite");
+    }
+}
+
+export async function injectGenesisValidators(genesisPath: string, config: FullNetworkConfig): Promise<void> {
+    const genesis = JSON.parse(await fs.promises.readFile(genesisPath, "utf-8")) as { validators?: GenesisMembership };
+    const validators = realmGenesisValidators(config);
+    validateGenesisValidators(genesis.validators, validators);
+    if (genesis.validators?.length) return;
+    genesis.validators = validators;
     await fs.promises.writeFile(genesisPath, JSON.stringify(genesis, null, 2), "utf-8");
 }
 
-async function ensureRealmP2pConfig(
+export async function ensureRealmP2pConfig(
     nodeCli: string,
     cwd: string,
     realmIds: number[],
     edgeCount: number,
     publicHost: string,
+    genesisPath: string = path.join(cwd, "genesis.json"),
 ): Promise<FullNetworkConfig> {
-    const configPath = path.join(cwd, REALM_P2P_OUT_DIR, "config.json");
-    const genesisConfigHash = createHash("sha256").update(await fs.promises.readFile(path.join(cwd, "psy-genesis/config.json"))).digest("hex");
-    let config: FullNetworkConfig | null = null;
-    if (await exists(configPath)) {
-        config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
+    const runtimeDir = path.join(cwd, REALM_P2P_OUT_DIR);
+    const configPath = path.join(runtimeDir, "config.json");
+    const sourceBytes = await fs.promises.readFile(path.join(cwd, "psy-genesis/config.json"));
+    const sourceConfig = JSON.parse(sourceBytes.toString()) as FullNetworkConfig;
+    const genesisConfigHash = createHash("sha256").update(sourceBytes).digest("hex");
+    const entries = await fs.promises.readdir(runtimeDir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [];
+        throw error;
+    });
+    const secretNames = realmP2pSecretPaths(realmIds, edgeCount).map((secretPath) => path.basename(secretPath));
+    const allowedNames = new Set(["config.json", "daemon-config.json", ...secretNames]);
+    if (entries.some((entry) => !entry.isFile() || !allowedNames.has(entry.name))) {
+        throw new Error("Unexpected Realm P2P runtime artifacts; refusing identity regeneration");
     }
-    const secretsExist = (await Promise.all(realmP2pSecretPaths(realmIds, edgeCount)
-        .map((secretPath) => exists(path.join(cwd, secretPath))))).every(Boolean);
+    const names = new Set(entries.map((entry) => entry.name));
+    if (entries.length && (!names.has("config.json") || secretNames.some((name) => !names.has(name)))) {
+        throw new Error("Incomplete Realm P2P config or keys; refusing identity regeneration");
+    }
+    let config: FullNetworkConfig | null = null;
+    if (names.has("config.json")) {
+        config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
+        if (!config || !config.networks) throw new Error("Malformed Realm P2P config; refusing identity regeneration");
+    }
+    const genesis = JSON.parse(await fs.promises.readFile(genesisPath, "utf-8")) as { validators?: GenesisMembership };
     const validatorUserIds = await genesisValidatorUserIds(cwd, realmIds);
-    const plan = planRealmP2pConfig(secretsExist ? config : null, realmIds, edgeCount, publicHost, validatorUserIds, genesisConfigHash);
+    const plan = planRealmP2pConfig(config, realmIds, edgeCount, publicHost, validatorUserIds, genesisConfigHash, "local-devnet", sourceConfig);
+    const configKey = selectedRuntimeConfigKey("local-devnet");
+    if (config && plan.reuse) {
+        validateGenesisValidators(genesis.validators, realmGenesisValidators({ ...config, defaultNetwork: configKey }));
+        let changed = false;
+        for (const field of ["prove_proxy_url", "system_prove_proxy_url"] as const) {
+            const source = sourceConfig.networks[configKey][field];
+            if (isDeepStrictEqual(config.networks[configKey][field], source)) continue;
+            if (source === undefined) delete config.networks[configKey][field];
+            else config.networks[configKey][field] = structuredClone(source);
+            changed = true;
+        }
+        if (changed) await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
+        config.defaultNetwork = configKey;
+        return config;
+    }
+    validateGenesisValidators(genesis.validators, []);
     const privateKeys = JSON.parse(await fs.promises.readFile(path.join(cwd, "private_keys.json"), "utf-8")) as string[];
     const validatorKeys = validatorUserIds.map((userId, index) => {
         const realmId = realmIds[Math.floor(index / REALM_P2P_SUB_IDS.length)];
@@ -1458,20 +1601,18 @@ async function ensureRealmP2pConfig(
         if (typeof key !== "string" || !/^[0-9a-fA-F]{64}$/.test(key)) throw new Error(`Missing or invalid genesis private key for validator user ${userId}`);
         return key;
     });
-    if (!plan.reuse) {
-        const proc = Bun.spawn([nodeCli, "init-realm-p2p-keys", ...plan.args], {
-            cwd,
-            stdout: "pipe",
-            stderr: "pipe",
-            env: { ...process.env, ...plan.env },
-        });
-        const exit = await proc.exited;
-        if (exit !== 0) throw new Error(`init-realm-p2p-keys failed (${exit}): ${await new Response(proc.stderr).text()}`);
-        config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
-        config.genesisConfigHash = genesisConfigHash;
-        await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
-    }
-    if (!config) throw new Error("Realm P2P config generation did not produce a config");
+    const proc = Bun.spawn([nodeCli, "init-realm-p2p-keys", ...plan.args], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, ...plan.env },
+    });
+    const exit = await proc.exited;
+    if (exit !== 0) throw new Error(`init-realm-p2p-keys failed (${exit}): ${await new Response(proc.stderr).text()}`);
+    config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
+    planRealmP2pConfig(config, realmIds, edgeCount, publicHost, validatorUserIds, genesisConfigHash, "local-devnet", sourceConfig);
+    config.genesisConfigHash = genesisConfigHash;
+    await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
     for (let index = 0; index < validatorKeys.length; index++) {
         const realmId = realmIds[Math.floor(index / REALM_P2P_SUB_IDS.length)];
         const subId = index % REALM_P2P_SUB_IDS.length + 1;
@@ -2207,6 +2348,10 @@ async function shouldUseFrozenPnpmLock(dir: string): Promise<boolean> {
 
 async function ensureNpmDeps(dir: string, name: string, opts?: { force?: boolean }): Promise<void> {
     const nodeModules = path.join(dir, "node_modules");
+    if (frozenDepsEnabled()) {
+        if (!(await exists(nodeModules))) throw new Error(`[DevNet] PSY_FROZEN_DEPS requires preinstalled ${name} dependencies`);
+        return;
+    }
     if (!opts?.force && await exists(nodeModules)) {
         console.log(`[AutoSetup] ${name} deps already installed`);
         return;
@@ -2443,7 +2588,7 @@ async function ensurePsySdkArtifacts(workspaceDir: string): Promise<{ rebuilt: b
         await assemblePsySdkCompilerSidecar(sdkDir, workspaceDir);
         return { rebuilt: false };
     }
-    if (skipBuildEnabled()) {
+    if (skipBuildEnabled() || frozenDepsEnabled()) {
         throw new Error(
             `[AutoSetup] Skipping build requires current psy-sdk compiler artifacts. ` +
             `Rebuild psy-sdk first (${staleReasons.join(", ")}).`,
@@ -2480,8 +2625,10 @@ async function ensurePsySdkArtifacts(workspaceDir: string): Promise<{ rebuilt: b
     return { rebuilt: true };
 }
 
-export async function downloadKeystoreObject(key: string, destPath: string): Promise<void> {
+export async function downloadKeystoreObject(key: string, destPath: string, resume = false): Promise<void> {
     const args = r2CurlArgs(process.env.PSY_KEYSTORE_R2_PREFIX, key, destPath);
+    // Part downloads resume; a finished part is skipped by the caller, a short one continues.
+    if (resume) args.splice(args.length - 1, 0, "-C", "-");
     const object = args[args.length - 1];
     console.log(`[AutoSetup] Downloading ${object}...`);
     let code: number;
@@ -2498,14 +2645,106 @@ export async function downloadKeystoreObject(key: string, destPath: string): Pro
     }
 }
 
-async function downloadAndExtractTar(key: string, destDir: string): Promise<void> {
-    const tmpFile = path.join(destDir, path.basename(key) + ".tmp");
-    await downloadKeystoreObject(key, tmpFile);
-    console.log(`[AutoSetup] Extracting ${key}...`);
+// The four large official objects ship as <object>.part-NN: 256MiB each, zero-based,
+// last part holding the remainder. Count is ceil(manifest size / part bytes).
+export const TRUST_SETUP_PART_BYTES = 268435456;
+
+export function trustSetupPartKeys(key: string, size: number, partBytes = TRUST_SETUP_PART_BYTES): string[] {
+    if (!Number.isSafeInteger(size) || size <= 0 || !Number.isSafeInteger(partBytes) || partBytes <= 0) {
+        throw new Error(`[AutoSetup] ${key}: invalid compressed object size`);
+    }
+    const count = Math.ceil(size / partBytes);
+    return Array.from({ length: count }, (_, index) => `${key}.part-${String(index).padStart(2, "0")}`);
+}
+
+async function assembleChunkedObject(
+    key: string,
+    destPath: string,
+    expected: { sha256: string; size: number },
+    partBytes: number,
+): Promise<void> {
+    const partKeys = trustSetupPartKeys(key, expected.size, partBytes);
+    const partDir = path.dirname(destPath);
+    const partPaths: string[] = [];
+    for (let index = 0; index < partKeys.length; index++) {
+        const partKey = partKeys[index];
+        const partPath = path.join(partDir, partKey);
+        const partSize = index === partKeys.length - 1
+            ? expected.size - partBytes * (partKeys.length - 1)
+            : partBytes;
+        let stat: { size: number } | null = await fs.promises.stat(partPath).catch(() => null);
+        if (stat && stat.size > partSize) {
+            await rm(partPath).catch(() => undefined);
+            stat = null;
+        }
+        if (!stat || stat.size !== partSize) {
+            try {
+                await downloadKeystoreObject(partKey, partPath, true);
+            } catch (err) {
+                throw new Error(`[AutoSetup] ${key}: missing part ${partKey} (${(err as Error).message})`);
+            }
+            stat = await fs.promises.stat(partPath).catch(() => null);
+            if (!stat || stat.size !== partSize) {
+                throw new Error(`[AutoSetup] ${key}: missing or empty part ${partKey}`);
+            }
+        }
+        partPaths.push(partPath);
+    }
+    const out = await fs.promises.open(destPath, "w");
+    try {
+        const buf = Buffer.alloc(1024 * 1024);
+        for (const partPath of partPaths) {
+            const input = await fs.promises.open(partPath, "r");
+            try {
+                let position = 0;
+                for (;;) {
+                    const { bytesRead } = await input.read(buf, 0, buf.length, position);
+                    if (bytesRead <= 0) break;
+                    await out.write(buf.subarray(0, bytesRead));
+                    position += bytesRead;
+                }
+            } finally {
+                await input.close();
+            }
+        }
+    } finally {
+        await out.close();
+    }
+    const actual = await digestFile(destPath);
+    if (actual.size !== expected.size || actual.sha256 !== expected.sha256) {
+        await rm(destPath).catch(() => undefined);
+        await Promise.all(partPaths.map((partPath) => rm(partPath).catch(() => undefined)));
+        throw new Error(`[AutoSetup] ${key}: sha256/size mismatch vs sha256sums.json`);
+    }
+    await Promise.all(partPaths.map((partPath) => rm(partPath).catch(() => undefined)));
+}
+
+export async function downloadTrustSetupObject(
+    group: KeystoreGroup,
+    destPath: string,
+    manifest: KeystoreManifest,
+    partBytes = TRUST_SETUP_PART_BYTES,
+): Promise<void> {
+    if (!group.chunked) {
+        await downloadKeystoreObject(group.key, destPath);
+        return;
+    }
+    const expected = manifest.files[group.key];
+    if (!expected || typeof expected.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(expected.sha256)
+        || !Number.isSafeInteger(expected.size) || expected.size <= 0) {
+        throw new Error(`[AutoSetup] ${group.key}: sha256sums.json has no size/sha256 entry for the compressed object`);
+    }
+    await assembleChunkedObject(group.key, destPath, expected, partBytes);
+}
+
+async function downloadAndExtractTar(group: KeystoreGroup, destDir: string, manifest: KeystoreManifest): Promise<void> {
+    const tmpFile = path.join(destDir, path.basename(group.key) + ".tmp");
+    await downloadTrustSetupObject(group, tmpFile, manifest);
+    console.log(`[AutoSetup] Extracting ${group.key}...`);
     // Use zstd + tar pipe for cross-platform compat (macOS BSD tar doesn't support --zstd)
     const result = await runAndCapture(["bash", "-c", `zstd -d < "${tmpFile}" | tar xf - -C "${destDir}"`]);
     if (result.code !== 0) {
-        throw new Error(`[AutoSetup] Failed to extract ${key}: ${result.stderr}`);
+        throw new Error(`[AutoSetup] Failed to extract ${group.key}: ${result.stderr}`);
     }
     await rm(tmpFile).catch(() => undefined);
 }
@@ -2591,7 +2830,43 @@ const { Wallet } = require("ethers");
 
 type KeystoreManifestFile = { sha256: string; size: number };
 type KeystoreManifest = { version: number; files: Record<string, KeystoreManifestFile> };
-type KeystoreGroup = { type: "zst" | "tar"; key: string; entries: string[] };
+type KeystoreGroup = { type: "zst" | "tar"; key: string; entries: string[]; chunked: boolean };
+
+export const trustSetupGroups: readonly KeystoreGroup[] = [
+    { type: "zst", key: "circuit_groth16.bin.zst", entries: ["circuit_groth16.bin"], chunked: false },
+    { type: "zst", key: "pk_groth16.bin.zst", entries: ["pk_groth16.bin"], chunked: true },
+    { type: "zst", key: "vk_groth16.bin.zst", entries: ["vk_groth16.bin"], chunked: false },
+    {
+        type: "tar",
+        key: "deposit_append.tar.zst",
+        entries: [
+            "deposit_append/circuit_groth16.bin",
+            "deposit_append/pk_groth16.bin",
+            "deposit_append/vk_groth16.bin",
+        ],
+        chunked: true,
+    },
+    {
+        type: "tar",
+        key: "withdrawal_claim.tar.zst",
+        entries: [
+            "withdrawal_claim/circuit_groth16.bin",
+            "withdrawal_claim/pk_groth16.bin",
+            "withdrawal_claim/vk_groth16.bin",
+        ],
+        chunked: true,
+    },
+    {
+        type: "tar",
+        key: "reward_claim.tar.zst",
+        entries: [
+            "reward_claim/circuit_groth16.bin",
+            "reward_claim/pk_groth16.bin",
+            "reward_claim/vk_groth16.bin",
+        ],
+        chunked: true,
+    },
+];
 
 export async function fetchKeystoreManifest(manifestPath: string): Promise<KeystoreManifest> {
     await downloadKeystoreObject("sha256sums.json", manifestPath);
@@ -2600,7 +2875,7 @@ export async function fetchKeystoreManifest(manifestPath: string): Promise<Keyst
         if (parsed?.version !== 1 || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) {
             throw new Error("invalid manifest");
         }
-        for (const dir of ["", "deposit_append/", "withdrawal_claim/"]) {
+        for (const dir of ["", "deposit_append/", "withdrawal_claim/", "reward_claim/"]) {
             for (const name of ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"]) {
                 const entry = parsed.files[dir + name];
                 if (!entry || typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(entry.sha256)
@@ -2611,7 +2886,7 @@ export async function fetchKeystoreManifest(manifestPath: string): Promise<Keyst
         }
         return parsed;
     } catch {
-        throw new Error("[AutoSetup] Invalid sha256sums.json: require version 1 and size/sha256 entries for all nine trust-setup files");
+        throw new Error("[AutoSetup] Invalid sha256sums.json: require version 1 and size/sha256 entries for all twelve trust-setup files");
     }
 }
 
@@ -2709,6 +2984,9 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
             "withdrawal_claim/circuit_groth16.bin",
             "withdrawal_claim/pk_groth16.bin",
             "withdrawal_claim/vk_groth16.bin",
+            "reward_claim/circuit_groth16.bin",
+            "reward_claim/pk_groth16.bin",
+            "reward_claim/vk_groth16.bin",
         ];
         const invalidEntries = await missingOrEmptyKeystoreEntries(
             keystoreDir,
@@ -2754,29 +3032,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
 
     // 3. Trust-setup groups. Each group is fetched from one public R2 object;
     //    every member file is hash-verified against the manifest before and after.
-    const groups: KeystoreGroup[] = [
-        { type: "zst", key: "circuit_groth16.bin.zst", entries: ["circuit_groth16.bin"] },
-        { type: "zst", key: "pk_groth16.bin.zst", entries: ["pk_groth16.bin"] },
-        { type: "zst", key: "vk_groth16.bin.zst", entries: ["vk_groth16.bin"] },
-        {
-            type: "tar",
-            key: "deposit_append.tar.zst",
-            entries: [
-                "deposit_append/circuit_groth16.bin",
-                "deposit_append/pk_groth16.bin",
-                "deposit_append/vk_groth16.bin",
-            ],
-        },
-        {
-            type: "tar",
-            key: "withdrawal_claim.tar.zst",
-            entries: [
-                "withdrawal_claim/circuit_groth16.bin",
-                "withdrawal_claim/pk_groth16.bin",
-                "withdrawal_claim/vk_groth16.bin",
-            ],
-        },
-    ];
+    const groups = trustSetupGroups;
 
     for (const group of groups) {
         if (await groupVerifies(manifest, keystoreDir, group.entries)) {
@@ -2788,7 +3044,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
             const destPath = path.join(keystoreDir, group.entries[0]);
             const tmpPath = path.join(keystoreDir, group.key + ".downloading");
             await rm(destPath).catch(() => undefined);
-            await downloadKeystoreObject(group.key, tmpPath);
+            await downloadTrustSetupObject(group, tmpPath, manifest);
             console.log(`[AutoSetup] Decompressing ${group.key}...`);
             const decompressedTmp = destPath + ".decompressing";
             const result = await runAndCapture(["zstd", "-d", tmpPath, "-o", decompressedTmp, "--force"]);
@@ -2803,7 +3059,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
 
             const dirPath = path.join(keystoreDir, path.dirname(group.entries[0]));
             await rm(dirPath, { recursive: true }).catch(() => undefined);
-            await downloadAndExtractTar(group.key, keystoreDir);
+            await downloadAndExtractTar(group, keystoreDir, manifest);
         }
 
         if (!(await groupVerifies(manifest, keystoreDir, group.entries))) {
@@ -2863,12 +3119,16 @@ async function isUsableGenesisContracts(filePath: string): Promise<boolean> {
 }
 
 export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv): Promise<{ args: string[]; env: NodeJS.ProcessEnv }> {
-    const configuredPath = env.PSY_RELAYER_MULTISIG_ACCOUNT;
-    if (!configuredPath?.trim()) throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT is required for Genesis generation");
-    const accountPath = path.resolve(cwd, configuredPath);
+    const networkKey = env.PSY_NETWORK?.trim();
+    const policyField = `networks.${networkKey || "CURRENT_NETWORK"}.guardian_authorization.bridge_relayer_signing_policy`;
     try {
-        if (!(await fs.promises.stat(accountPath)).isFile()) throw new Error("not a regular file");
-        const text = await fs.promises.readFile(accountPath, "utf-8");
+        if (!networkKey) throw new Error("missing selected network");
+        const configPath = path.resolve(cwd, "psy-genesis/config.json");
+        const stat = await fs.promises.lstat(configPath);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024 * 1024) throw new Error("invalid canonical config");
+        const config = JSON.parse(await fs.promises.readFile(configPath, "utf8"));
+        const text = config?.networks?.[networkKey]?.guardian_authorization?.bridge_relayer_signing_policy;
+        if (typeof text !== "string") throw new Error("missing policy JSON string");
         const account = JSON.parse(text);
         const fields = new Set<string>();
         let previousToken = "";
@@ -2885,21 +3145,22 @@ export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv)
         if (!policy || Object.keys(policy).sort().join(",") !== "member_count,member_hashes,threshold,version"
             || policy.version !== 1 || policy.threshold !== 2 || policy.member_count !== 3
             || !Array.isArray(policy.member_hashes) || policy.member_hashes.length !== 8) throw new Error("invalid initial policy");
-        let previous = [0n, 0n, 0n, 0n];
+        const members = new Set<string>();
         for (const [index, hash] of policy.member_hashes.entries()) {
             if (typeof hash !== "string" || !/^(?:[0-9a-fA-F]{2}){0,32}$/.test(hash)) throw new Error("invalid member hash");
             const padded = hash.padStart(64, "0");
             const limbs = [3, 2, 1, 0].map((limb) => BigInt(`0x${padded.slice(limb * 16, limb * 16 + 16)}`) % 0xffffffff00000001n);
-            const firstDifference = limbs.findIndex((limb, position) => limb !== previous[position]);
-            if (index < 3 ? firstDifference < 0 || limbs[firstDifference] < previous[firstDifference] : limbs.some((limb) => limb !== 0n)) throw new Error("invalid member order or padding");
-            previous = limbs;
+            const member = limbs.join(",");
+            const zero = limbs.every((limb) => limb === 0n);
+            if (index < 3) {
+                if (zero || members.has(member)) throw new Error("invalid active member");
+                members.add(member);
+            } else if (!zero) throw new Error("invalid unused member");
         }
     } catch {
-        throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT must be a readable public MultisigAccount file with contract 1 and a valid initial two-of-three policy");
+        throw new Error(`psy-genesis/config.json ${policyField} must contain a public MultisigAccount JSON string with contract 1 and a valid initial two-of-three policy`);
     }
-    const configuredArtifact = env.PSY_MULTISIG_POLICY_ARTIFACT;
-    if (!configuredArtifact?.trim()) throw new Error("PSY_MULTISIG_POLICY_ARTIFACT is required for Genesis generation");
-    const artifactPath = path.resolve(cwd, configuredArtifact);
+    const artifactPath = path.resolve(env.PSY_PROJECTS_DIR || path.join(cwd, ".."), "psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json");
     try {
         if (!(await fs.promises.stat(artifactPath)).isFile()) throw new Error("not a regular file");
         const artifact = JSON.parse(await fs.promises.readFile(artifactPath, "utf-8"));
@@ -2907,14 +3168,14 @@ export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv)
             || !Array.isArray(artifact.circuit_definitions) || artifact.circuit_definitions.length !== 2
             || artifact.circuit_definitions.map((definition: { name?: string }) => definition?.name).sort().join(",") !== "get_policy,set_policy") throw new Error("invalid policy artifact");
     } catch {
-        throw new Error("PSY_MULTISIG_POLICY_ARTIFACT must be a readable policy artifact with height 4, ABI, get_policy and set_policy");
+        throw new Error("Sibling compiler multisig_policy artifact must have height 4, ABI, get_policy and set_policy");
     }
     const childEnv: NodeJS.ProcessEnv = { ...env, PWD: cwd };
     for (const key of ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"]) delete childEnv[key];
-    return { args: [path.join(cwd, "target", "release", "psy_dev_cli"), "generate-genesis-data", "--repo-root", cwd, "--relayer-multisig-account", accountPath, "--multisig-policy-artifact", artifactPath], env: childEnv };
+    return { args: [path.resolve(cwd, "target", "release", "psy_dev_cli"), "generate-genesis-data", "--repo-root", path.resolve(cwd)], env: childEnv };
 }
 
-export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = process.env, preflight = false): Promise<void> {
     const genesisPath = path.join(cwd, "genesis.json");
     const genesisContractsPath = path.join(cwd, "psy-genesis", "genesis_contracts.json");
     const genesisContractsStampPath = path.join(cwd, "psy-genesis", ".genesis_contracts.compiler-artifact.json");
@@ -2971,6 +3232,11 @@ export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = p
             );
         }
     }
+    if (preflight) {
+        await fs.promises.access(path.join(cwd, "target/release/psy_dev_cli"), fs.constants.X_OK);
+        await planGenesisGeneration(cwd, env);
+        return;
+    }
 
     if (await exists(genesisPath)) {
         if (await isUsableGenesisData(genesisPath)) {
@@ -2996,15 +3262,22 @@ export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = p
     console.log("[AutoSetup] genesis.json generated");
 }
 
+/** Component selection contract: core-only launchers have no SDK sidecar consumer. */
+export function selectedUiDependencies(startAll: boolean, options: { psyPrivacyBridge?: boolean; ide?: boolean; explorer?: boolean; modeAWebWalletBridge?: boolean }): boolean {
+    return startAll || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
+}
+
 async function ensureDevEnvironment(
     cwd: string,
     opts?: {
         requireDocker?: boolean;
         requireAnvil?: boolean;
         requireBun?: boolean;
+        selectedUi?: boolean;
         env?: NodeJS.ProcessEnv;
     },
 ): Promise<void> {
+    if (opts?.env?.PSY_FROZEN_DEPS !== undefined) process.env.PSY_FROZEN_DEPS = opts.env.PSY_FROZEN_DEPS;
     console.log("[AutoSetup] Checking dev environment...");
     // Preflight: check required tools with actionable install hints
     await checkToolAvailable("git", "https://git-scm.com/");
@@ -3028,16 +3301,21 @@ async function ensureDevEnvironment(
     }
 
     await ensureRequiredSubmodules(cwd);
+    if (opts?.selectedUi && !(await exists(path.join(cwd, "psy-dapp", "apps", "account", "package.json")))) {
+        throw new Error("[DevNet] Mode A web wallet bridge package is missing at psy-dapp/apps/account/package.json");
+    }
     // psy-dapp ships nested psy-genesis/psy-contracts gitlinks that the UI
     // apps alias into (config.json, protocol-config, deployments); initialize
     // them before any UI dependency install or dev-server startup.
-    await ensurePsyDappNestedSubmodules(path.join(cwd, "psy-dapp"));
+    if (opts?.selectedUi) await ensurePsyDappNestedSubmodules(path.join(cwd, "psy-dapp"));
     // Proven order from parth-generic-v1: clone/find siblings (and init
     // psy-sdk's psy-genesis) before ensurePsySdkArtifacts reads config.json.
     await ensureAllReposCloned();
     const contractsDir = path.join(cwd, "psy-contracts");
-    const sdk = await ensurePsySdkArtifacts(cwd);
-    await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
+    if (opts?.selectedUi) {
+        const sdk = await ensurePsySdkArtifacts(cwd);
+        await ensureAllUiDeps(cwd, { force: sdk.rebuilt });
+    }
     const { generated } = await ensureKeystoreFiles(contractsDir);
     // Only set default WALLET_PASSWORD when we generated the L1 keystore this run.
     if (generated && !process.env.WALLET_PASSWORD) {
@@ -3046,7 +3324,6 @@ async function ensureDevEnvironment(
         console.warn("[AutoSetup] WALLET_PASSWORD not set, using default 'devnet' for auto-generated keystore.");
     }
     await ensureAllBinariesBuilt(cwd);
-    await ensureGenesisFiles(cwd, { ...process.env, ...opts?.env });
     console.log("[AutoSetup] Dev environment ready.");
 }
 
@@ -3080,7 +3357,14 @@ async function buildProject(cwd?: string) {
 }
 
 async function ensureUiDependencies(uiDir: string) {
-    // Some apps ship their own pnpm-workspace.yaml (e.g. mode-a-web-wallet-bridge)
+    if (frozenDepsEnabled()) {
+        const workspaceDir = path.resolve(uiDir, "..", "..");
+        if (!(await exists(path.join(uiDir, "node_modules"))) && !(await exists(path.join(workspaceDir, "node_modules")))) {
+            throw new Error("[DevNet] PSY_FROZEN_DEPS requires preinstalled UI dependencies");
+        }
+        return;
+    }
+    // Some apps ship their own pnpm-workspace.yaml (e.g. apps/account)
     // even though they live under a parent workspace. Install them in-place so
     // pnpm can resolve their `link:` deps correctly.
     if (await exists(path.join(uiDir, "pnpm-workspace.yaml"))) {
@@ -3166,7 +3450,10 @@ async function pnpmInstallWithAutoApprove(cwd: string, extraArgs: string[] = [])
     throw new Error(`${installCmd.join(" ")} failed in ${cwd}: exceeded auto-approve retries`);
 }
 
-async function ensurePsyContractsDependencies(contractsDir: string) {
+export async function ensurePsyContractsDependencies(contractsDir: string) {
+    if (frozenDepsEnabled() && !(await exists(path.join(contractsDir, "node_modules/.bin/hardhat")))) {
+        throw new Error("[DevNet] PSY_FROZEN_DEPS requires preinstalled psy-contracts dependencies; refusing install");
+    }
     const hardhatBin = path.join(contractsDir, "node_modules/.bin/hardhat");
     if (await exists(hardhatBin)) return;
 
@@ -3199,9 +3486,8 @@ export interface PreservedAnvilGenesis {
 
 export interface LocalAnvilStatePlan {
     statePath: string;
-    hasState: boolean;
-    shouldResetEnvio: boolean;
-    genesis?: PreservedAnvilGenesis;
+    hasState: false;
+    shouldResetEnvio: true;
 }
 
 function canonicalAnvilHeader(block: unknown, source: string): Record<string, string> {
@@ -3283,7 +3569,7 @@ export function localAnvilLaunchArgs(
     const args = [
         "anvil", "--host", "0.0.0.0", "--port", String(port),
         "--chain-id", chainId,
-        "--state", statePath, "--state-interval", String(interval), "--preserve-historical-states", "-vvvv",
+        "--state", statePath, "--state-interval", String(interval), "-vvvv",
     ];
     if (genesis) args.push("--timestamp", genesis.timestamp);
     return args;
@@ -3365,34 +3651,35 @@ export async function inspectLocalAnvilState(statePath: string, fork: boolean): 
     return result ?? undefined;
 }
 
-export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1DeploymentNetwork = "localhost", fork = false): Promise<LocalAnvilStatePlan> {
+/** Local startup never loads a snapshot. The state path is where the new Anvil will write. */
+export async function resolveLocalAnvilStatePlan(
+    repoCwd: string, network: L1DeploymentNetwork = "localhost", _fork = false,
+    control: Pick<GracefulStopControl, "listenerOwner"> & { rpcUrl?: string } = {},
+): Promise<LocalAnvilStatePlan> {
     const statePath = localAnvilStatePath(repoCwd, network);
-    const deploymentPath = path.join(repoCwd, "psy-contracts", "deployments", network, "deployed-contracts.json");
-    const hasState = await exists(statePath);
-    const hasDeployment = await exists(deploymentPath);
-    if (hasState !== hasDeployment) {
-        throw new Error(
-            `[DevNet] Local Anvil state and ${network} deployment must exist together: ` +
-            `${statePath}=${hasState}, ${deploymentPath}=${hasDeployment}. Run PURGE=1 make shutdown, then make run-all.`,
-        );
+    const chain = LOCAL_ANVIL_RPCS.find((entry) => entry.network === network);
+    if (chain) {
+        const rpcUrl = control.rpcUrl ?? `http://127.0.0.1:${chain.port}`;
+        const endpoint = new URL(rpcUrl);
+        if (!["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname) || Number(endpoint.port) !== chain.port) {
+            throw new Error(`[DevNet] ${network} RPC must use the configured local Anvil port ${chain.port}`);
+        }
+        const pid = await (control.listenerOwner ?? tcpListenerOwner)(chain.port);
+        if (pid !== null) {
+            throw new Error(`[DevNet] occupied ${network} listener is not available for a fresh Anvil; refusing to reuse or kill a foreign owner`);
+        }
     }
-    if (!hasState) {
-        return { statePath, hasState, shouldResetEnvio: true };
+    if (await exists(statePath)) {
+        throw new Error(`[DevNet] fresh startup left ${statePath}; refusing to load an existing Anvil snapshot`);
     }
-    const genesis = await inspectLocalAnvilState(statePath, fork);
-    return {
-        statePath,
-        hasState,
-        shouldResetEnvio: false,
-        ...(fork ? {} : { genesis }),
-    };
+    return { statePath, hasState: false, shouldResetEnvio: true };
 }
 
 async function deployPsyContracts(
     repoCwd: string,
     l1RpcUrl: string,
     deploymentsNetwork: L1DeploymentNetwork,
-    opts?: { fundDevAccounts?: boolean; localAnvilRpcUrl?: string; reuseLocalDeployment?: boolean },
+    opts?: { fundDevAccounts?: boolean; localAnvilRpcUrl?: string },
 ) {
     const contractsDir = path.join(repoCwd, "psy-contracts");
     if (!(await exists(contractsDir))) {
@@ -3411,18 +3698,11 @@ async function deployPsyContracts(
     );
     const forceRedeploy = shouldRedeployL1();
     const hasExistingDeployment = await exists(deploymentSummaryPath);
-    if (deploymentsNetwork.startsWith("localhost") && opts?.reuseLocalDeployment) {
-        if (!hasExistingDeployment) {
-            throw new Error(`[DevNet] Missing ${deploymentsNetwork} deployment at ${deploymentSummaryPath} for persisted Anvil state`);
+    if (deploymentsNetwork.startsWith("localhost")) {
+        if (hasExistingDeployment) {
+            throw new Error(`[DevNet] fresh startup left ${deploymentSummaryPath}; refusing to reuse a localhost deployment`);
         }
-        const missingTokens = await readRequiredDeploymentTokenGaps(deploymentSummaryPath);
-        if (missingTokens.length > 0) {
-            throw new Error(`[DevNet] Persisted ${deploymentsNetwork} deployment is incomplete: missing tokens ${missingTokens.join(", ")}`);
-        }
-        console.log(`[DevNet] Reusing persisted ${deploymentsNetwork} deployment at ${deploymentSummaryPath}`);
-        return;
-    }
-    if (!deploymentsNetwork.startsWith("localhost") && !forceRedeploy) {
+    } else if (!forceRedeploy) {
         if (!hasExistingDeployment) {
             throw new Error(
                 `[DevNet] Missing ${deploymentsNetwork} deployment at ${deploymentSummaryPath}. ` +
@@ -3601,12 +3881,7 @@ function parseTomlScalar(raw: string, key: string): string | undefined {
     const m = raw.match(new RegExp(`(?:^|\\n)\\s*${key}\\s*=\\s*"([^"]+)"`));
     return m?.[1];
 }
-const NETWORK_FIELDS = ["magic", "users_per_realm", "global_user_tree_height", "realm_user_tree_height", "group_realm_height", "realm_configs", "p2p", "coordinator_configs", "prove_proxy_url", "faucet_rpc_url", "nostr_relay_url", "native_currency", "native_currency_decimal", "native_currency_name", "fees"];
 
-function isConfigRelative(value: unknown): value is string {
-    return typeof value === "string" && !!value && !value.includes("\0") && !path.isAbsolute(value)
-        && !value.split(/[\\/]/).some((component) => !component || component === "." || component === "..");
-}
 
 function isLoopbackHost(hostname: string): boolean {
     const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -3619,7 +3894,7 @@ function isHttpOrigin(value: unknown): value is string {
     if (typeof value !== "string" || !value) return false;
     try {
         const url = new URL(value);
-        return url.protocol === "http:" && !!url.hostname && url.port !== "0"
+        return url.protocol === "http:" && !!url.hostname && !isWildcardHost(url.hostname.replace(/^\[|\]$/g, "")) && url.port !== "0"
             && !url.username && !url.password && url.pathname === "/" && !url.search && !url.hash;
     } catch { return false; }
 }
@@ -3630,17 +3905,11 @@ function isSocketAddress(value: unknown, history: boolean): boolean {
     const host = ipv6 ? ipv6[1] : value.slice(0, value.lastIndexOf(":"));
     const portText = ipv6 ? ipv6[2] : value.slice(value.lastIndexOf(":") + 1);
     const port = Number(portText);
-    if (!host || !ipv6 && host.includes(":") || !Number.isInteger(port) || port < 0 || port > 65535) return false;
+    if (!host || !ipv6 && host.includes(":") || !/^\d+$/.test(portText) || !Number.isInteger(port) || port <= 0 || port > 65535) return false;
     if (net.isIP(host) === 0) return false;
     return !history || port !== 0 && host !== "0.0.0.0" && host !== "::";
 }
 
-function isStandardSecret(value: unknown, id: string, password: boolean): boolean {
-    if (typeof value !== "string" || !path.isAbsolute(value)) return false;
-    const home = homedir();
-    const name = password ? `guardian-${id}.password` : `guardian-${id}.keystore.json`;
-    return value === path.join(home, ".psy", "keystore", name);
-}
 
 function isL1Endpoint(value: unknown): boolean {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -3651,115 +3920,153 @@ function isL1Endpoint(value: unknown): boolean {
         const url = new URL(endpoint.rpc_url);
         const https = url.protocol === "https:";
         const loopbackHttp = url.protocol === "http:" && isLoopbackHost(url.hostname);
-        return (https || loopbackHttp) && !!url.hostname && !url.username && !url.password && !url.hash;
+        return (https || loopbackHttp) && !!url.hostname && !isWildcardHost(url.hostname.replace(/^\[|\]$/g, "")) && url.port !== "0" && !url.username && !url.password && !url.hash;
     } catch { return false; }
 }
 
-function isNetworkProjection(value: unknown): boolean {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-    const network = value as Record<string, unknown>;
-    return NETWORK_FIELDS.every((field) => Object.hasOwn(network, field))
-        && typeof network.magic === "string" && !!network.magic
-        && typeof network.nostr_relay_url === "string"
-        && typeof network.native_currency === "string"
-        && typeof network.native_currency_name === "string"
-        && Number.isInteger(network.users_per_realm)
-        && [network.global_user_tree_height, network.realm_user_tree_height, network.group_realm_height, network.native_currency_decimal].every((value) => Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 255)
-        // Trusted prove proxies must be 1..8 distinct HTTP origins.
-        && Array.isArray(network.prove_proxy_url) && network.prove_proxy_url.length >= 1 && network.prove_proxy_url.length <= 8
-        && network.prove_proxy_url.every(isHttpOrigin)
-        && new Set(network.prove_proxy_url.map((entry) => new URL(entry).origin)).size === network.prove_proxy_url.length
-        && Array.isArray(network.coordinator_configs) && network.coordinator_configs.length > 0
-        && network.coordinator_configs.every((entry) => !!entry && typeof entry === "object" && Number.isInteger((entry as Record<string, unknown>).id) && Array.isArray((entry as Record<string, unknown>).rpc_url))
-        && Array.isArray(network.realm_configs)
-        && !!network.p2p && typeof network.p2p === "object" && Number.isInteger((network.p2p as Record<string, unknown>).checkpoints_per_epoch)
-        && !!network.fees && typeof network.fees === "object" && ["register_user_fee", "deploy_contract_fee", "guta_fee", "da_fee"].every((field) => Number.isInteger((network.fees as Record<string, unknown>)[field]));
+
+const GUARDIAN_RPC_CONTEXT = "[DevNet] Bridge relayer requires the daemon rpc_config psy-genesis network to carry guardian public endpoints";
+const GUARDIAN_RPC_FIELDS = "expected canonical guardian public fields: distinct guardian_configs ids 1..3 and advertised origins, guardian_history and nonempty l1_endpoints; endpoint entries cannot contain keys or root paths";
+
+function guardianRpcError(detail: string): Error {
+    return new Error(`${GUARDIAN_RPC_CONTEXT}; ${detail}`);
 }
 
+function exactFields(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+    const keys = Object.keys(value);
+    return required.every((field) => keys.includes(field))
+        && keys.every((field) => required.includes(field) || optional.includes(field));
+}
 
+function isWildcardHost(host: string): boolean {
+    return host === "0.0.0.0" || host === "::";
+}
 
-export async function resolveGuardianConfigPath(cwd: string, configuredPath: string | undefined): Promise<string> {
-    const context = "[DevNet] Bridge relayer requires PSY_GUARDIAN_CONFIG pointing to an existing public GuardianConfig JSON";
-    if (!configuredPath?.trim()) {
-        throw new Error(`${context}; supply it in the environment or --env. Guardian credentials, registration and bootstrap are operator prerequisites; no L2 wallet fallback is available.`);
+function socketHost(value: string): string | null {
+    const ipv6 = value.startsWith("[") ? value.match(/^\[([^\]]+)\]:\d+$/) : null;
+    const host = ipv6 ? ipv6[1] : value.slice(0, value.lastIndexOf(":"));
+    return host || null;
+}
+
+function advertisedOrigin(listenAddress: string, rpcUrl: unknown): boolean {
+    if (rpcUrl === undefined) {
+        const host = socketHost(listenAddress);
+        return !!host && !isWildcardHost(host);
     }
+    return isHttpOrigin(rpcUrl);
+}
+
+function isGuardianPublicConfig(value: unknown): value is { id: number; listen_address: string; rpc_url?: string } {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const entry = value as Record<string, unknown>;
+    return exactFields(entry, ["id", "listen_address"], ["rpc_url"])
+        && Number.isInteger(entry.id) && (entry.id as number) >= 1 && (entry.id as number) <= 3
+        && isSocketAddress(entry.listen_address, false)
+        && advertisedOrigin(entry.listen_address as string, entry.rpc_url);
+}
+
+function isGuardianHistoryConfig(value: unknown): boolean {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const entry = value as Record<string, unknown>;
+    return exactFields(entry, ["listen_address"], ["rpc_url"])
+        && isSocketAddress(entry.listen_address, true)
+        && advertisedOrigin(entry.listen_address as string, entry.rpc_url);
+}
+
+export async function validateGuardianRpcConfig(cwd: string, configuredPath: string, env: NodeJS.ProcessEnv = process.env): Promise<Record<string, unknown>> {
+    const networkKey = env.PSY_NETWORK?.trim();
+    if (!networkKey) throw guardianRpcError("PSY_NETWORK must name the compiled canonical network");
     const configPath = path.resolve(cwd, configuredPath);
     let config: Record<string, unknown>;
     try {
         const stat = await fs.promises.lstat(configPath);
-        if (!stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error("not a regular bounded file");
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024 * 1024) throw new Error("not a regular bounded file");
         config = JSON.parse(await fs.promises.readFile(configPath, "utf8"));
     } catch {
-        throw new Error(`${context}; the selected path must be a readable, non-symlink regular file containing valid JSON (at most 64 MiB).`);
+        throw guardianRpcError("the selected rpc_config must be a readable, non-symlink regular file containing valid JSON (at most 64 MiB).");
     }
-    if (!config || typeof config !== "object" || Array.isArray(config)) {
-        throw new Error(`${context}; expected only GuardianConfig public fields: network, guardians 1..3 and client, with no TLS metadata, database path or embedded signing keys.`);
+    const networks = config.networks;
+    const network = networks && typeof networks === "object" && !Array.isArray(networks)
+        ? (networks as Record<string, unknown>)[networkKey]
+        : undefined;
+    if (!network || typeof network !== "object" || Array.isArray(network)) {
+        throw guardianRpcError(`the ${networkKey} network must exist`);
     }
-    const network = config.network;
-    const guardians = config.guardians;
-    const client = config.client;
-    const signerFields = ["listen_address", "signing_key_secret_path", "signing_key_password_secret_path"];
-    const clientFields = ["endpoints", "archive_path", "listen_address", "l1_endpoints"];
-    const guardianKeys = guardians && typeof guardians === "object" && !Array.isArray(guardians) ? Object.keys(guardians) : [];
-    const home = homedir();
-    const signerValid = guardianKeys.length === 3 && ["1", "2", "3"].every((id) => guardianKeys.includes(id))
-        && ["1", "2", "3"].every((id) => {
-            const signer = (guardians as Record<string, unknown>)[id];
-            if (!signer || typeof signer !== "object" || Array.isArray(signer)) return false;
-            const fields = signer as Record<string, unknown>;
-            return Object.keys(fields).length === signerFields.length
-                && signerFields.every((field) => Object.hasOwn(fields, field))
-                && isSocketAddress(fields.listen_address, false)
-                && isStandardSecret(fields.signing_key_secret_path, id, false)
-                && isStandardSecret(fields.signing_key_password_secret_path, id, true);
-        });
-    const clientRecord = client && typeof client === "object" && !Array.isArray(client) ? client as Record<string, unknown> : null;
-    const endpoints = clientRecord?.endpoints;
-    const l1 = clientRecord?.l1_endpoints;
-    const chainIndexes = Array.isArray(l1) && l1.every(isL1Endpoint) ? l1.map((endpoint) => (endpoint as Record<string, unknown>).chain_index) : [];
-    const clientValid = !!clientRecord && Object.keys(clientRecord).length === clientFields.length
-        && clientFields.every((field) => Object.hasOwn(clientRecord, field))
-        && isConfigRelative(clientRecord.archive_path) && clientRecord.archive_path === "archive/relayer-journal"
-        && isSocketAddress(clientRecord.listen_address, true)
-        && Array.isArray(endpoints) && endpoints.length === 3 && endpoints.every(isHttpOrigin)
-        && new Set(endpoints.map((endpoint) => new URL(endpoint).origin)).size === 3
-        && chainIndexes.length === (Array.isArray(l1) ? l1.length : -1) && new Set(chainIndexes).size === chainIndexes.length;
-    if (Object.keys(config).some((field) => !["network", "guardians", "client"].includes(field))
-        || !["network", "guardians", "client"].every((field) => Object.hasOwn(config, field))
-        || !isNetworkProjection(network) || !signerValid || !clientValid || !home) {
-        throw new Error(`${context}; expected only GuardianConfig public fields: network, guardians 1..3 and client, with no TLS metadata, database path or embedded signing keys.`);
+    const selected = network as Record<string, unknown>;
+    const guardians = selected.guardian_configs;
+    const l1Endpoints = selected.l1_endpoints;
+    const chainIndexes = Array.isArray(l1Endpoints) && l1Endpoints.length > 0 && l1Endpoints.every(isL1Endpoint)
+        ? l1Endpoints.map((endpoint) => (endpoint as Record<string, unknown>).chain_index)
+        : [];
+    const guardianValid = Array.isArray(guardians) && guardians.length === 3 && guardians.every(isGuardianPublicConfig)
+        && [1, 2, 3].every((id) => guardians.filter((entry) => (entry as { id: number }).id === id).length === 1);
+    const guardianOrigins = guardianValid
+        ? guardians.map((entry) => new URL(entry.rpc_url ?? `http://${entry.listen_address}`).origin)
+        : [];
+    if (Object.hasOwn(selected, "guardian_root") || !guardianValid || new Set(guardianOrigins).size !== 3 || !isGuardianHistoryConfig(selected.guardian_history)
+        || chainIndexes.length === 0 || chainIndexes.length !== (Array.isArray(l1Endpoints) ? l1Endpoints.length : -1)
+        || new Set(chainIndexes).size !== chainIndexes.length) {
+        throw guardianRpcError(GUARDIAN_RPC_FIELDS);
     }
-    return configPath;
+    return selected;
 }
 
-// Guardian journals live beside the public config, outside purgeable devnet state.
-// Existing journals and their permissions are never rewritten by the launcher.
-export async function prepareGuardianService(cmds: readonly string[], cwd: string): Promise<{ host: string; port: number }> {
-    const id = cmds[cmds.indexOf("--guardian-id") + 1];
-    const configIndex = cmds.indexOf("--config");
-    const dbIndex = cmds.indexOf("--db-path");
-    if (!["1", "2", "3"].includes(id) || configIndex < 0 || dbIndex < 0 || cmds[dbIndex + 1] !== `journal/${id}.redb`) {
+export async function resolveGuardianRoot(cwd: string, configuredRoot: string | undefined): Promise<string> {
+    const context = "[DevNet] Bridge relayer requires PSY_GUARDIAN_ROOT pointing at the guardians-root runtime directory";
+    if (!configuredRoot?.trim()) {
+        throw new Error(`${context}; supply it in the environment or --env. Guardian credentials, registration and bootstrap are operator prerequisites; no L2 wallet fallback is available.`);
+    }
+    const root = path.resolve(cwd, configuredRoot);
+    let stat: fs.Stats;
+    try { stat = await fs.promises.lstat(root); }
+    catch { throw new Error(`${context}; the selected path must be an existing non-symlink directory.`); }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`${context}; the selected path must be an existing non-symlink directory.`);
+    if (await fs.promises.realpath(root) !== root) throw new Error(`${context}; symlink ancestors are not allowed.`);
+    return root;
+}
+
+async function validateGuardianRuntimeRoot(root: string, purgeTargets: readonly string[], generated: boolean): Promise<void> {
+    await validateDaemonPath(path.resolve(root, "db"), generated ? "directory" : "output-directory", purgeTargets, "guardian root db metadata");
+}
+
+// Rust validates the typed authorization and binds retained request digests.
+// Startup only checks presence in the selected canonical network configuration.
+export function validateGuardianAuthorization(network: Record<string, unknown>): void {
+    const authorization = network.guardian_authorization;
+    if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) {
+        throw new Error("[DevNet] selected network requires guardian_authorization; fresh startup publishes it after deployment");
+    }
+}
+
+// Databases contain mutable runtime state only; authorization lives in network config.
+export async function prepareGuardianService(cmds: readonly string[], cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<{ host: string; port: number }> {
+    const idIndex = cmds.indexOf("--guardian-id");
+    const rpcIndex = cmds.indexOf("--rpc-config");
+    const rootIndex = cmds.indexOf("--guardian-root");
+    const id = cmds[idIndex + 1];
+    if (!["1", "2", "3"].includes(id) || rpcIndex < 0 || rootIndex < 0 || idIndex !== cmds.length - 2) {
         throw new Error("[DevNet] Invalid guardian-service template");
     }
-    const configPath = await resolveGuardianConfigPath(cwd, cmds[configIndex + 1]);
-    const config = JSON.parse(await fs.promises.readFile(configPath, "utf8"));
-    const address = config.guardians[id].listen_address as string;
+    const network = await validateGuardianRpcConfig(cwd, cmds[rpcIndex + 1], env);
+    const entry = (network.guardian_configs as Array<{ id: number; listen_address: string }>).find((guardian) => guardian.id === Number(id));
+    if (!entry) throw new Error("[DevNet] Invalid guardian-service template");
+    const address = entry.listen_address;
     const port = Number(address.slice(address.lastIndexOf(":") + 1));
     const host = address.slice(0, address.lastIndexOf(":")).replace(/^\[|\]$/g, "");
     if (port === 0) throw new Error("[DevNet] guardian-service requires a fixed listen port");
-    // Binding, rather than connecting, also rejects occupied wildcard listeners.
     await new Promise<void>((resolve, reject) => {
         const server = net.createServer();
         server.once("error", reject);
         server.listen({ host, port, exclusive: true }, () => server.close((error) => error ? reject(error) : resolve()));
     });
-    const journal = path.join(path.dirname(configPath), "journal");
-    await validateDaemonPath(journal, "output-directory", DEVNET_PURGE_PATHS.map((target) => path.resolve(cwd, target)), "guardian journal metadata");
-    await fs.promises.mkdir(journal, { recursive: true, mode: 0o700 });
-    const stat = await fs.promises.lstat(journal);
+    const root = path.resolve(cwd, cmds[rootIndex + 1]);
+    const databaseDir = path.join(root, "db");
+    await validateDaemonPath(databaseDir, "directory", DEVNET_PURGE_PATHS.map((target) => path.resolve(cwd, target)), "guardian db metadata");
+    const stat = await fs.promises.lstat(databaseDir);
     if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) {
-        throw new Error("[DevNet] guardian journal must be an owner-only directory");
+        throw new Error("[DevNet] guardian db directory must be an existing owner-only directory");
     }
+    validateGuardianAuthorization(network);
     return { host: host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host, port };
 }
 
@@ -3767,6 +4074,154 @@ const DEVNET_PURGE_PATHS = [
     "local_checkpoints", "db/anvil", "logs",
     ...["localhost", "localhostBsc", "localhostBase", "sepolia", "ethereum"].map((network) => `psy-contracts/deployments/${network}`),
 ];
+
+export interface FreshDevnetState {
+    abort(): Promise<void>;
+    reset(): Promise<void>;
+    authorize(): Promise<void>;
+}
+
+export interface ScopedDevnetReset {
+    volumes: string[];
+    containers: string[];
+}
+
+/** EOF grace before SIGTERM: enough for a clean helper exit that drops its dirty-DB mark. */
+const FRESH_HELPER_ABORT_GRACE_MS = 5_000;
+/** Bounded waits between SIGTERM and SIGKILL in the abort ladder. */
+const FRESH_HELPER_TERM_GRACE_MS = 2_000;
+const FRESH_HELPER_KILL_GRACE_MS = 2_000;
+
+/** ANSI CSI/escape sequences stripped before any stderr line becomes a diagnostic. */
+const ANSI_ESCAPE_PATTERN = /\u001b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
+/** Words that disqualify a stderr line from display, whatever their case. */
+const FRESH_HELPER_SECRET_PATTERN = /password|private[\s_-]*key|mnemonic|secret|token/i;
+const FRESH_HELPER_STDERR_TAIL_BYTES = 2048;
+const FRESH_HELPER_DIAGNOSTIC_MAX_CHARS = 200;
+
+/** Last `Error:` line of the helper's stderr, made safe for display; null when absent or unsafe. */
+function freshHelperSafeError(stderrTail: Buffer): string | null {
+    const last = stderrTail.toString("utf8").replace(ANSI_ESCAPE_PATTERN, "")
+        .split("\n").filter((line) => /^Error:/.test(line)).at(-1);
+    if (last === undefined) return null;
+    const clipped = last.slice(0, FRESH_HELPER_DIAGNOSTIC_MAX_CHARS);
+    if (clipped.includes("=") || FRESH_HELPER_SECRET_PATTERN.test(clipped)) return null;
+    return clipped;
+}
+
+/** Suffixes the failure's message with the helper's safe stderr line; never replaces the error. */
+function appendFreshHelperDiagnostic(error: unknown, stderrTail: Buffer): unknown {
+    const diagnostic = freshHelperSafeError(stderrTail);
+    if (diagnostic === null || !(error instanceof Error)) return error;
+    error.message += `\n[DevNet] fresh helper stderr: ${diagnostic}`;
+    return error;
+}
+
+/** One helper owns every database inode through public authorization publication. */
+export async function prepareFreshDevnetState(cwd: string, guardianRoot: string, env: NodeJS.ProcessEnv): Promise<FreshDevnetState> {
+    const generation = await planGenesisGeneration(cwd, env);
+    const child = spawn(generation.args[0], ["fresh-devnet-state", "--repo-root", path.resolve(cwd),
+        "--guardians-root", guardianRoot],
+        { cwd, env: generation.env, stdio: ["pipe", "pipe", "pipe"] });
+    const lines = createInterface({ input: child.stdout });
+    const iterator = lines[Symbol.asyncIterator]();
+    // Exit fact vs error event: a spawn failure has no pid and is done; an
+    // error on a live process (e.g. a failed kill) must never fake an exit.
+    const exited = new Promise<number | null>((resolve) => {
+        child.once("exit", (code) => resolve(code));
+        child.once("error", () => { if (child.pid === undefined) resolve(null); });
+    });
+    const waitExited = (ms: number) => {
+        let timer: NodeJS.Timeout | undefined;
+        const deadline = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); });
+        return Promise.race([exited.then(() => true), deadline]).finally(() => clearTimeout(timer!));
+    };
+    // Bounded stderr tail: the pipe must never fill while the handshake runs,
+    // and only the exit-time anyhow line is needed for diagnostics.
+    let stderrTail = Buffer.alloc(0);
+    child.stderr?.on("data", (chunk: Buffer) => {
+        stderrTail = Buffer.concat([stderrTail, chunk]);
+        if (stderrTail.length > FRESH_HELPER_STDERR_TAIL_BYTES) {
+            stderrTail = stderrTail.subarray(stderrTail.length - FRESH_HELPER_STDERR_TAIL_BYTES);
+        }
+    });
+    const receive = async (phase: string) => {
+        try {
+            const line = await iterator.next();
+            if (line.done || line.value !== JSON.stringify({ phase })) {
+                throw new Error(`[DevNet] fresh state helper failed before ${phase}; state was not authorized for the next stage`);
+            }
+        } catch (error) {
+            // Abort first so the exit-time anyhow line is fully written, then
+            // surface it as display-only context; the original error is kept.
+            try { await abort(); }
+            catch (abortError) {
+                // A final abort error (helper refusing to die) must not swallow
+                // the phase failure that triggered it.
+                throw new Error((abortError as Error).message, { cause: error });
+            }
+            throw appendFreshHelperDiagnostic(error, stderrTail);
+        }
+    };
+    // Singleflight: concurrent aborts share one ladder. It ends only on a real
+    // exit (or a spawn failure, which has no process to wait for) and throws
+    // a final error when the helper survives every stage, never claiming stop.
+    let abortPromise: Promise<void> | null = null;
+    const abort = (): Promise<void> => abortPromise ??= (async () => {
+        try {
+            child.stdin.end();
+            // Graceful EOF first: a clean helper exit after stdin close drops
+            // its dirty-DB mark, so the next fresh run finds a clean redb.
+            if (!await waitExited(FRESH_HELPER_ABORT_GRACE_MS)) {
+                child.kill("SIGTERM");
+                if (!await waitExited(FRESH_HELPER_TERM_GRACE_MS)) {
+                    child.kill("SIGKILL");
+                    if (!await waitExited(FRESH_HELPER_KILL_GRACE_MS)) {
+                        throw new Error("[DevNet] fresh state helper survived EOF, SIGTERM, and SIGKILL; it may still hold its redb lock");
+                    }
+                }
+            }
+        } finally { lines.close(); }
+    })();
+    // receive aborts and annotates its own failures; after it the helper
+    // reached "prepared" and remains alive for reset/authorize phases.
+    await receive("prepared");
+    return {
+        abort,
+        async reset() { child.stdin.write("reset\n"); await receive("reset"); },
+        async authorize() {
+            child.stdin.end("authorize\n");
+            await receive("authorized");
+            if (await exited !== 0) throw appendFreshHelperDiagnostic(
+                new Error("[DevNet] fresh state helper failed to publish authorization"), stderrTail);
+            validateGuardianAuthorization(await validateGuardianRpcConfig(cwd, path.resolve(cwd, "psy-genesis/config.json"), env));
+            lines.close();
+        },
+    };
+}
+
+export async function planScopedDevnetReset(names: DevnetDbNames): Promise<ScopedDevnetReset> {
+    const failures: string[] = [];
+    const listed = await runBoundedTeardown("fresh-volume-ls", ["docker", "volume", "ls", "--format", "{{.Name}}"], undefined, failures);
+    const containers = await runBoundedTeardown("fresh-docker-ps", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
+    if (failures.length > 0) throw new Error(`[DevNet] fresh startup cannot prove namespace resources: ${failures.join(" | ")}`);
+    return {
+        volumes: [...devnetDbVolumeNames(names), names.envioDataVolume].filter((name) => exactSnapshotNames(listed.stdout).has(name)),
+        containers: [...devnetDbContainerNames(names), names.envioPostgresContainer, `${names.envioComposeProject}-graphql-engine-1`].filter((name) => exactSnapshotNames(containers.stdout).has(name)),
+    };
+}
+
+async function resetScopedDevnetState(cwd: string, targets: ScopedDevnetReset): Promise<void> {
+    await stopRepoAnvilsForPurge(cwd);
+    const failures: string[] = [];
+    if (targets.containers.length > 0) {
+        await runBoundedTeardown("fresh-docker-stop", ["docker", "stop", ...targets.containers], undefined, failures);
+        if (failures.length > 0) throw new Error("[DevNet] could not stop owned containers");
+        await runBoundedTeardown("fresh-docker-rm", ["docker", "rm", ...targets.containers], undefined, failures);
+    }
+    if (targets.volumes.length > 0) await runBoundedTeardown("fresh-volume-rm", ["docker", "volume", "rm", ...targets.volumes], undefined, failures);
+    if (failures.length > 0) throw new Error(`[DevNet] fresh startup namespace cleanup failed: ${failures.join(" | ")}`);
+}
 
 function daemonConfigError(field: string): Error {
     return new Error(`[DevNet] PSY_BRIDGE_DAEMON_CONFIG: invalid or unavailable ${field}; operator provisioning required`);
@@ -3841,9 +4296,7 @@ export async function resolveBridgeDaemonConfigPath(
         }
     };
     await inspectCredentials(config);
-    for (const field of ["rpc_config", "guardian_config"]) {
-        await validateDaemonPath(path.resolve(cwd, textField(config[field], field)), "file", purgeTargets, `${field} metadata`);
-    }
+    await validateDaemonPath(path.resolve(cwd, textField(config.rpc_config, "rpc_config")), "file", purgeTargets, "rpc_config metadata");
     textField(config.services_url, "services_url");
     integer(config.withdraw_method_id, 64, "withdraw_method_id");
     for (const field of ["proof_dir", "poll_interval_secs", "confirmation_lag_checkpoints", "max_checkpoint_batch", "max_concurrent_l2_batches"]) {
@@ -3861,37 +4314,41 @@ export async function resolveBridgeDaemonConfigPath(
             if (Object.hasOwn(chain, "family") && chain.family != null) textField(chain.family, "chains.family");
         }
     }
-    const guardianPath = path.resolve(cwd, config.guardian_config as string);
-    if (env.PSY_GUARDIAN_CONFIG !== undefined && path.resolve(cwd, env.PSY_GUARDIAN_CONFIG) !== guardianPath) {
-        throw daemonConfigError("PSY_GUARDIAN_CONFIG coherence");
+    const configuredRoot = textField(config.guardian_root, "guardian_root");
+    const envRoot = env.PSY_GUARDIAN_ROOT?.trim();
+    if (envRoot && path.resolve(cwd, envRoot) !== path.resolve(cwd, configuredRoot)) {
+        throw daemonConfigError("PSY_GUARDIAN_ROOT disagrees with guardian_root");
     }
-    await resolveGuardianConfigPath(cwd, guardianPath);
-    let guardian: Record<string, unknown>;
-    try { guardian = JSON.parse(await fs.promises.readFile(guardianPath, "utf8")); }
-    catch { throw daemonConfigError("guardian_config public JSON"); }
-    const guardianRoot = path.dirname(guardianPath);
-    const authorization = path.resolve(guardianRoot, "authorization");
-    await validateDaemonPath(path.resolve(authorization, "index.json"), "file", purgeTargets, "guardian_config.authorization/index.json metadata");
-    await validateDaemonPath(path.resolve(authorization, "versions"), "directory", purgeTargets, "guardian_config.authorization/versions metadata");
-    const client = guardian.client as Record<string, unknown>;
-    await validateDaemonPath(path.resolve(guardianRoot, client.archive_path as string), "output-directory", purgeTargets, "guardian_config.client.archive_path metadata");
+    const guardianRoot = await resolveGuardianRoot(cwd, configuredRoot);
+    await validateGuardianRuntimeRoot(guardianRoot, purgeTargets, false);
+    try { await validateGuardianRpcConfig(cwd, config.rpc_config as string, env); }
+    catch (error) { throw daemonConfigError(error instanceof Error ? error.message : "rpc_config guardian public endpoints"); }
     return configPath;
 }
 
-export async function validateRelayerTemplate(cmds: readonly string[], options: RunningProcess["spawnOptions"]): Promise<void> {
-    if (!cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli") || cmds.includes("guardian-service")) return;
+export async function validateRelayerTemplate(cmds: readonly string[], options: RunningProcess["spawnOptions"] = {}): Promise<void> {
+    if (!cmds.includes("guardian-service") && !cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli")) return;
     const cwd = options.cwd || process.cwd();
     const env = options.env ?? process.env;
+    if (cmds.includes("guardian-service")) {
+        const rpcIndex = cmds.indexOf("--rpc-config");
+        if (rpcIndex < 0 || !cmds[rpcIndex + 1]) throw guardianRpcError("missing --rpc-config");
+        validateGuardianAuthorization(await validateGuardianRpcConfig(cwd, cmds[rpcIndex + 1], env));
+        return;
+    }
+    if (!cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli")) return;
     const configPath = await resolveBridgeDaemonConfigPath(cwd, env);
     const index = cmds.indexOf("--config");
     if (index < 0 || !cmds[index + 1] || path.resolve(cwd, cmds[index + 1]) !== configPath) throw daemonConfigError("saved --config coherence");
+    const config = Bun.TOML.parse(await fs.promises.readFile(configPath, "utf8"));
+    validateGuardianAuthorization(await validateGuardianRpcConfig(cwd, config.rpc_config as string, env));
 }
 
 const ENVIO_NPM_VERSION = "2.32.10";
 const ENVIO_HASURA_IMAGE = "hasura/graphql-engine:v2.43.0";
 const ENVIO_POSTGRES_IMAGE = "postgres:17.5";
 
-async function configureEnvioDockerCompose(composePath: string, runtimeCpuSet: string | undefined): Promise<void> {
+async function configureEnvioDockerCompose(composePath: string, runtimeCpuSet: string | undefined, networkName: string): Promise<void> {
     if (!(await exists(composePath))) {
         throw new Error(`Envio codegen did not create ${composePath}`);
     }
@@ -3899,7 +4356,7 @@ async function configureEnvioDockerCompose(composePath: string, runtimeCpuSet: s
     const pinnedImages = original
         .replace(/image:\s*hasura\/graphql-engine:[^\s]+/g, `image: ${ENVIO_HASURA_IMAGE}`)
         .replace(/image:\s*postgres:[^\s]+/g, `image: ${ENVIO_POSTGRES_IMAGE}`);
-    const configured = applyEnvioCpuSetToCompose(pinnedImages, runtimeCpuSet);
+    const configured = applyEnvioNetworkName(applyEnvioCpuSetToCompose(pinnedImages, runtimeCpuSet), networkName);
     if (configured !== original) {
         await Bun.write(composePath, configured);
     }
@@ -3910,6 +4367,36 @@ function stringRecord(value: unknown): Record<string, string> {
     return Object.fromEntries(
         Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     );
+}
+
+export async function runFrozenEnvioCodegen(envioDir: string, environment: NodeJS.ProcessEnv): Promise<void> {
+    const root = path.resolve(envioDir);
+    const cachedPnpm = environment.PSY_FROZEN_DEPS_PNPM;
+    const store = environment.PSY_FROZEN_DEPS_STORE;
+    if (!cachedPnpm || !store) throw new Error("[DevNet] PSY_FROZEN_DEPS requires PSY_FROZEN_DEPS_PNPM and PSY_FROZEN_DEPS_STORE");
+    const executable = path.join(root, "node_modules/.bin/envio");
+    if (!(await exists(executable))) throw new Error("[DevNet] PSY_FROZEN_DEPS requires preinstalled Envio executable");
+    await guardedEnvioCodegen({
+        root, cachedPnpm, store, environment, runner: frozenDepsCommandRunner,
+        codegen: ({ environment: guardedEnvironment }) => frozenDepsCommandRunner(executable, ["codegen", "--directory", root, "--config", "./config.yaml"], { cwd: root, env: guardedEnvironment }),
+    });
+}
+
+export async function frozenEnvioStartCommand(envioDir: string): Promise<{ command: string[]; cwd: string }> {
+    const generated = path.resolve(envioDir, "generated");
+    const manifest: unknown = JSON.parse(await fs.promises.readFile(path.join(generated, "package.json"), "utf8"));
+    if (!manifest || typeof manifest !== "object" || !("scripts" in manifest)
+        || !manifest.scripts || typeof manifest.scripts !== "object"
+        || !("start" in manifest.scripts) || manifest.scripts.start !== "ts-node src/Index.res.js") {
+        throw new Error("[DevNet] frozen Envio runtime requires the reviewed generated start script");
+    }
+    const executable = path.join(generated, "node_modules/.bin/ts-node");
+    if (!(await exists(executable)) || !(await exists(path.join(generated, "src/Index.res.js")))) {
+        throw new Error("[DevNet] frozen Envio runtime requires compiled indexer and preinstalled ts-node");
+    }
+    // Envio 2.32.10 start without --restart/--bench only runs this script in
+    // generated/. Mandatory guarded codegen already parsed the configuration.
+    return { command: [executable, "src/Index.res.js"], cwd: generated };
 }
 
 async function startEnvioIndexerForRelayer(
@@ -4001,52 +4488,58 @@ async function startEnvioIndexerForRelayer(
             `LOG_LEVEL=info`,
         ].join("\n") + "\n",
     );
-    const pkgPath = path.join(envioDir, "package.json");
-    let existingPackage: Record<string, unknown> = {};
-    if (await exists(pkgPath)) {
-        try {
-            const parsedPackage: unknown = JSON.parse(await Bun.file(pkgPath).text());
-            if (parsedPackage && typeof parsedPackage === "object" && !Array.isArray(parsedPackage)) {
-                existingPackage = parsedPackage as Record<string, unknown>;
+    const frozen = frozenDepsEnabled((env ?? process.env).PSY_FROZEN_DEPS);
+    if (frozen) {
+        // Always run real codegen; its guarded children install/build from the
+        // reviewed lock. Do not rewrite manifests or trust a config hash.
+        await runFrozenEnvioCodegen(envioDir, env ?? process.env);
+    } else {
+        const pkgPath = path.join(envioDir, "package.json");
+        let existingPackage: Record<string, unknown> = {};
+        if (await exists(pkgPath)) {
+            try {
+                const parsedPackage: unknown = JSON.parse(await Bun.file(pkgPath).text());
+                if (parsedPackage && typeof parsedPackage === "object" && !Array.isArray(parsedPackage)) {
+                    existingPackage = parsedPackage as Record<string, unknown>;
+                }
+            } catch {
+                // fall back to defaults below
             }
-        } catch {
-            // fall back to defaults below
         }
-    }
-    const envioPkg = {
-        ...existingPackage,
-        name: typeof existingPackage.name === "string" ? existingPackage.name : "psy-relayer-envio",
-        private: true,
-        version: typeof existingPackage.version === "string" ? existingPackage.version : "0.1.0",
-        scripts: {
-            ...stringRecord(existingPackage.scripts),
-            codegen: "envio codegen --config ./config.yaml",
-            start: "envio start --config ./config.yaml",
-        },
-        devDependencies: {
-            ...stringRecord(existingPackage.devDependencies),
-            envio: ENVIO_NPM_VERSION,
-        },
-    };
-    await Bun.write(pkgPath, JSON.stringify(envioPkg, null, 2) + "\n");
-
-    console.log("[DevNet] Installing Envio indexer dependencies...");
-    await ensurePnpmBuildScriptsApproved(envioDir, ["esbuild"]);
-    await pnpmInstallWithAutoApprove(envioDir);
-
-    console.log("[DevNet] Generating Envio indexer...");
-    const codegen = await runAndCapture(["pnpm", "codegen"], envioDir);
-    if (codegen.code !== 0) {
-        throw new Error(`envio codegen failed: ${codegen.stderr || codegen.stdout}`);
+        const envioPkg = {
+            ...existingPackage,
+            name: typeof existingPackage.name === "string" ? existingPackage.name : "psy-relayer-envio",
+            private: true,
+            version: typeof existingPackage.version === "string" ? existingPackage.version : "0.1.0",
+            scripts: {
+                ...stringRecord(existingPackage.scripts),
+                codegen: "envio codegen --config ./config.yaml",
+                start: "envio start --config ./config.yaml",
+            },
+            devDependencies: {
+                ...stringRecord(existingPackage.devDependencies),
+                envio: ENVIO_NPM_VERSION,
+            },
+        };
+        await Bun.write(pkgPath, JSON.stringify(envioPkg, null, 2) + "\n");
+        console.log("[DevNet] Installing Envio indexer dependencies...");
+        await ensurePnpmBuildScriptsApproved(envioDir, ["esbuild"]);
+        await pnpmInstallWithAutoApprove(envioDir);
+        console.log("[DevNet] Generating Envio indexer...");
+        const codegen = await runAndCapture(["pnpm", "codegen"], envioDir);
+        if (codegen.code !== 0) {
+            throw new Error(`envio codegen failed: ${codegen.stderr || codegen.stdout}`);
+        }
     }
     const envioGeneratedDir = path.join(envioDir, "generated");
     const envioComposeFile = path.join(envioGeneratedDir, "docker-compose.yaml");
-    await configureEnvioDockerCompose(envioComposeFile, runtimeCpuSet);
+    const names = resolveDevnetDbNamesFromEnv(env ?? process.env);
+    await configureEnvioDockerCompose(envioComposeFile, runtimeCpuSet, names.envioNetwork);
 
     if (resetStorage) {
         console.log("[DevNet] Resetting Envio storage for ephemeral Anvil chain...");
         const reset = await runAndCapture(
-            ["docker", "compose", "-f", envioComposeFile, "down", "--remove-orphans", "-v"],
+            envioComposeCommand(envioComposeFile, names.envioComposeProject, ["down", "--remove-orphans", "-v"]),
             repoCwd,
         );
         if (reset.code !== 0) {
@@ -4056,7 +4549,7 @@ async function startEnvioIndexerForRelayer(
 
     console.log("[DevNet] Starting Envio docker services...");
     const composeStart = await runAndCapture(
-        ["docker", "compose", "-f", envioComposeFile, "up", "-d"],
+        envioComposeCommand(envioComposeFile, names.envioComposeProject, ["up", "-d"]),
         repoCwd,
     );
     if (composeStart.code !== 0) {
@@ -4069,7 +4562,7 @@ async function startEnvioIndexerForRelayer(
         name: "Envio Postgres",
     });
     await waitForCommandSuccess(
-        ["docker", "exec", "generated-envio-postgres-1", "psql", "-U", "postgres", "-d", "postgres", "-c", "select 1"],
+        envioPostgresReadinessCommand(names.envioPostgresContainer),
         { attempts: 600, delayMs: 1000, name: "Envio Postgres SQL readiness" },
     );
     await waitForHttpUrl("http://127.0.0.1:8080/healthz", {
@@ -4079,16 +4572,19 @@ async function startEnvioIndexerForRelayer(
         name: "Envio GraphQL",
     });
 
-    await ensurePnpmBuildScriptsApproved(envioGeneratedDir, ["rescript"]);
-    await pnpmInstallWithAutoApprove(envioGeneratedDir);
-    const buildGenerated = await runAndCapture(["pnpm", "build"], envioGeneratedDir);
-    if (buildGenerated.code !== 0) {
-        throw new Error(`envio generated build failed: ${buildGenerated.stderr || buildGenerated.stdout}`);
+    if (!frozen) {
+        await ensurePnpmBuildScriptsApproved(envioGeneratedDir, ["rescript"]);
+        await pnpmInstallWithAutoApprove(envioGeneratedDir);
+        const buildGenerated = await runAndCapture(["pnpm", "build"], envioGeneratedDir);
+        if (buildGenerated.code !== 0) {
+            throw new Error(`envio generated build failed: ${buildGenerated.stderr || buildGenerated.stdout}`);
+        }
     }
 
-    console.log("[DevNet] Starting Envio indexer (pnpm start)...");
-    const envioProcess = await RunningProcess.spawn(["pnpm", "start"], {
-        cwd: envioDir,
+    console.log("[DevNet] Starting Envio indexer...");
+    const start = frozen ? await frozenEnvioStartCommand(envioDir) : { command: ["pnpm", "start"], cwd: envioDir };
+    const envioProcess = await RunningProcess.spawn(start.command, {
+        cwd: start.cwd,
         stdoutLogFile: path.join(repoCwd, "logs", "envio_logs.txt"),
         stderrLogFile: path.join(repoCwd, "logs", "envio_errs.txt"),
         env: {
@@ -4104,8 +4600,6 @@ async function startEnvioIndexerForRelayer(
 
 const PURGE_DOCKER_TIMEOUT_MS = 15_000;
 const PURGE_ANVIL_SIGNAL_WAIT_MS = 5_000;
-const PURGE_DOCKER_NAMES = ["valkey-server", "nats-server", "scylla-server", "nostr-relay"] as const;
-const PURGE_DOCKER_VOLUMES = ["psy-devnet-redis", "psy-devnet-scylla", "psy-devnet-scylla-data", "psy-devnet-nats"] as const;
 
 export interface TeardownCommandResult {
     argv0: string;
@@ -4356,6 +4850,8 @@ export async function stopRepoAnvilsForPurge(repoRoot: string, control: PurgeAnv
         }
         owned.push({ pid, starttime: again.starttime });
     }
+    if (failures.length > 0) throw new Error(`[DevNet] Anvil identity preflight failed: ${failures.join("; ")}`);
+    if (!control.portOpen) await discoverRepoAnvils(repoRoot);
     const stopOwned = async (sig: "SIGTERM" | "SIGKILL") => {
         for (const entry of owned) {
             const current = await readIdentity(entry.pid);
@@ -4409,25 +4905,22 @@ async function purgeDockerCleanup(cwd: string, failures: string[]): Promise<bool
     if (containers.timedOut || containers.code !== 0 || !containers.stdoutComplete || volumes.timedOut || volumes.code !== 0 || !volumes.stdoutComplete) {
         return false;
     }
+    const names = await resolveBoundDevnetNames(cwd);
+    const containerTargets = [...devnetDbContainerNames(names), names.envioPostgresContainer, `${names.envioComposeProject}-graphql-engine-1`];
+    const volumeTargets = [...devnetDbVolumeNames(names), names.envioDataVolume];
     const containerNames = exactSnapshotNames(containers.stdout);
     const volumeNames = exactSnapshotNames(volumes.stdout);
     const composeFile = path.join(cwd, "psy_cli", "psy_relayer_cli", "indexer", "envio", "generated", "docker-compose.yaml");
-    const expected = new Set<string>(PURGE_DOCKER_NAMES);
-    if (await exists(composeFile)) {
-        const compose = await fs.promises.readFile(composeFile, "utf8");
-        for (const match of compose.matchAll(/^\s*container_name:\s*["']?([^"'\s#]+)["']?\s*$/gm)) expected.add(match[1]);
-        for (const match of compose.matchAll(/^\s{2}([A-Za-z0-9_.-]+):\s*$/gm)) expected.add(`generated-${match[1]}-1`);
-        // Direct cleanup owns infrastructure names; Compose owns its stack.
-    }
-    const liveContainers = PURGE_DOCKER_NAMES.filter((name) => containerNames.has(name));
-    const liveVolumes = PURGE_DOCKER_VOLUMES.filter((name) => volumeNames.has(name));
+    const expected = new Set<string>(containerTargets);
+    const liveContainers = containerTargets.filter((name) => containerNames.has(name));
+    const liveVolumes = volumeTargets.filter((name) => volumeNames.has(name));
     if (liveContainers.length > 0) {
         await runBoundedTeardown("docker-stop", ["docker", "stop", ...liveContainers], undefined, failures);
         await runBoundedTeardown("docker-rm", ["docker", "rm", "-f", ...liveContainers], undefined, failures);
     }
     if (liveVolumes.length > 0) await runBoundedTeardown("volume-rm", ["docker", "volume", "rm", "-f", ...liveVolumes], undefined, failures);
     if (await exists(composeFile)) {
-        await runBoundedTeardown("compose-down", ["docker", "compose", "-f", composeFile, "down", "--remove-orphans", "-v"], cwd, failures);
+        await runBoundedTeardown("compose-down", envioComposeCommand(composeFile, names.envioComposeProject, ["down", "--remove-orphans", "-v"]), cwd, failures);
     }
     const containersAfter = await runBoundedTeardown("docker-ps-after", ["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, failures);
     const volumesAfter = await runBoundedTeardown("volume-ls-after", ["docker", "volume", "ls", "--format", "{{.Name}}"], undefined, failures);
@@ -4437,7 +4930,7 @@ async function purgeDockerCleanup(cwd: string, failures: string[]): Promise<bool
     const leftContainers = exactSnapshotNames(containersAfter.stdout);
     const leftVolumes = exactSnapshotNames(volumesAfter.stdout);
     for (const name of expected) if (leftContainers.has(name)) failures.push(`container ${name} still present`);
-    for (const name of PURGE_DOCKER_VOLUMES) if (leftVolumes.has(name)) failures.push(`volume ${name} still present`);
+    for (const name of volumeTargets) if (leftVolumes.has(name)) failures.push(`volume ${name} still present`);
     return failures.length === 0;
 }
 
@@ -4497,13 +4990,6 @@ async function purgeDevnet(cwd: string): Promise<void> {
     if (failures.length > 0) throw new Error(`[DevNet] purge failed without startup: ${failures.join(" | ")}`);
 }
 
-async function killGeneratedEnvioStack(cwd: string, purge: boolean): Promise<void> {
-    const composeFile = path.join(cwd, "psy_cli", "psy_relayer_cli", "indexer", "envio", "generated", "docker-compose.yaml");
-    if (!(await exists(composeFile))) return;
-    const args = ["docker", "compose", "-f", composeFile, "down", "--remove-orphans"];
-    if (purge) args.push("-v");
-    await runIgnoreErrors(args, cwd);
-}
 
 async function killKnownProcesses(): Promise<void> {
     const patterns = [
@@ -4526,7 +5012,7 @@ async function killKnownProcesses(): Promise<void> {
         "psy-dapp/apps/bridge",
         "psy-dapp/apps/ide",
         "psy-dapp/apps/explorer",
-        "psy-dapp/mode-a-web-wallet-bridge",
+        "psy-dapp/apps/account",
         "vite.js --host 0.0.0.0 --port 5179",
         "pnpm dev",
         "envio/bin.js",
@@ -4542,32 +5028,16 @@ async function killKnownProcesses(): Promise<void> {
     }
 }
 
-async function killKnownPorts(): Promise<void> {
-    const ports: number[] = [3000, 5433, 8080, 8081, 9898, 9998, 5174, 5175, 5176, 5177, 5178, 5179];
-    for (let p = 1337; p <= 1346; p++) ports.push(p);
-    for (let p = 9999; p <= 10008; p++) ports.push(p);
-    for (let p = 13380; p <= 14679; p++) ports.push(p);
-    for (const port of ports) {
-        await runIgnoreErrors([
-            "bash",
-            "-lc",
-            `if command -v lsof >/dev/null 2>&1; then lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null | xargs -r kill -9 2>/dev/null || true; elif command -v fuser >/dev/null 2>&1; then fuser -k ${port}/tcp >/dev/null 2>&1 || true; fi`,
-        ]);
-    }
-}
 
 async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promise<void> {
-    console.log(`
-[DevNet] Tearing down...${purge ? " (purge)" : ""}`);
-    await killKnownProcesses();
-    if (purge) {
-        await purgeDevnet(cwd);
+    if (!purge) {
+        await gracefulDevnetStop(cwd);
         return;
     }
-    await killDocker();
-    await runIgnoreErrors(["docker", "rm", "-f", "valkey-server", "nats-server", "scylla-server", "nostr-relay"]);
-    await killGeneratedEnvioStack(cwd, purge);
-    await killKnownPorts();
+    console.log(`
+[DevNet] Tearing down... (purge)`);
+    await killKnownProcesses();
+    await purgeDevnet(cwd);
 }
 
 
@@ -4578,100 +5048,206 @@ function hexQuantityToBigInt(value: unknown, source: string): bigint {
     return BigInt(value);
 }
 
-/** anvil_dumpState(true) is always a hex-encoded gzip of plain state JSON and retains historical states. */
-export function decodeAnvilDumpStateHex(dump: unknown, source: string): string {
-    const hexChars = typeof dump === "string" ? dump.length - 2 : 0;
-    let hex = typeof dump === "string" && dump.startsWith("0x") && hexChars > 0 && hexChars % 2 === 0;
-    if (typeof dump === "string") {
-        for (let i = 2; hex && i < dump.length; i++) {
-            const code = dump.charCodeAt(i);
-            hex = (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+interface GracefulStopControl {
+    listPids?: () => Promise<number[]>;
+    readIdentity?: (pid: number) => Promise<AnvilProcessIdentity | null>;
+    signal?: (pid: number, signal: "SIGTERM") => void;
+    alive?: (pid: number) => boolean;
+    listenerOwner?: (port: number) => Promise<number | null>;
+    listCheckoutProcesses?: (repoRoot: string) => Promise<string[]>;
+    stopDocker?: (names: readonly string[]) => Promise<void>;
+}
+
+function anvilChainOf(identity: AnvilProcessIdentity): (typeof LOCAL_ANVIL_RPCS)[number] {
+    const port = Number(anvilFlagValues(identity.cmdline.split("\0"), "--port")?.[0]);
+    const chain = LOCAL_ANVIL_RPCS.find((entry) => entry.port === port);
+    if (!chain) throw new Error(`[DevNet] discovered Anvil has no configured chain for port ${port}`);
+    return chain;
+}
+
+function anvilIdentityMatches(current: AnvilProcessIdentity | null, expected: AnvilProcessIdentity): boolean {
+    return current !== null && current.exe === expected.exe && current.cwd === expected.cwd
+        && current.cmdline === expected.cmdline && current.starttime === expected.starttime;
+}
+
+async function tcpListenerOwner(port: number): Promise<number | null> {
+    const hex = port.toString(16).padStart(4, "0").toUpperCase();
+    const sockets = new Map<string, number>();
+    for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+        let text = "";
+        try { text = await fs.promises.readFile(table, "utf8"); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            continue;
+        }
+        for (const line of text.split("\n").slice(1)) {
+            const fields = line.trim().split(/\s+/);
+            if (fields.length < 10 || fields[3] !== "0A") continue;
+            const local = fields[1].split(":");
+            if (local[1] !== hex) continue;
+            sockets.set(fields[9], Number.parseInt(fields[7], 16));
         }
     }
-    if (!hex || typeof dump !== "string") {
-        throw new Error(`[DevNet] anvil_dumpState for '${source}' returned ${typeof dump}; expected hex-encoded gzip`);
+    if (sockets.size === 0) return null;
+    const owners = new Set<number>();
+    for (const pid of await listPids()) {
+        let fds: string[] = [];
+        try { fds = await fs.promises.readdir(`/proc/${pid}/fd`); }
+        catch { continue; }
+        for (const fd of fds) {
+            let link = "";
+            try { link = await fs.promises.readlink(`/proc/${pid}/fd/${fd}`); }
+            catch { continue; }
+            const match = /^socket:\[(\d+)\]$/.exec(link);
+            if (match && sockets.has(match[1])) owners.add(pid);
+        }
     }
-    let plain: Uint8Array;
-    try {
-        plain = Bun.gunzipSync(Buffer.from(dump.slice(2), "hex"));
-    } catch (error) {
-        throw new Error(`[DevNet] anvil_dumpState for '${source}' is not decodable gzip: ${error}`);
+    if (owners.size !== 1) {
+        throw new Error(`[DevNet] listener on port ${port} has ${owners.size === 0 ? "no attributable" : "ambiguous"} owner`);
     }
-    return new TextDecoder().decode(plain);
+    return [...owners][0];
 }
 
-/** Anvil's blocks array is not tip-ordered; the tip is top-level best_block_number. */
-export function anvilStateBestBlockNumber(state: unknown, source: string): bigint {
-    if (typeof state !== "object" || state === null || !("best_block_number" in state)) {
-        throw new Error(`[DevNet] Anvil state ${source} has no best_block_number`);
-    }
-    const best = state.best_block_number;
-    if (typeof best === "number") {
-        if (!Number.isSafeInteger(best) || best < 0) throw new Error(`[DevNet] Anvil state ${source} best_block_number is not a safe integer`);
-        return BigInt(best);
-    }
-    if (typeof best === "string" && /^\d+$/.test(best)) return BigInt(best);
-    throw new Error(`[DevNet] Anvil state ${source} best_block_number is not a safe integer`);
+const CHECKOUT_PRODUCER_BASENAMES: Record<string, true> = {
+    psy_node_cli: true, psy_worker_cli: true, psy_relayer_cli: true, psy_user_cli: true,
+    "psy-services": true, "psy-indexer": true, node: true, bun: true, envio: true, "envio-linux": true,
+};
+
+/** Only the same-user, same-runtime CLI waiting for non-purge shutdown is not a producer. */
+export function isGracefulShutdownControlClient(repoRoot: string, exe: string, cwd: string, argv: readonly string[], uid: number): boolean {
+    if (exe !== process.execPath || cwd !== repoRoot || uid !== process.getuid?.()) return false;
+    const args = argv.at(-1) === "" ? argv.slice(0, -1) : argv;
+    const scriptIndex = args[1] === "run" ? 2 : 1;
+    return args.length === scriptIndex + 2
+        && path.resolve(cwd, args[scriptIndex] ?? "") === path.join(repoRoot, "dev/locSetupV4.ts")
+        && args[scriptIndex + 1] === "--teardown";
 }
 
-async function stageFsSyncedAnvilState(statePath: string, stateText: string): Promise<string> {
-    const stagedPath = `${statePath}.preserve-${process.pid}.tmp`;
-    await mkdir(path.dirname(stagedPath), { recursive: true });
-    const handle = await fs.promises.open(stagedPath, "w");
-    try {
-        await handle.writeFile(stateText, "utf8");
-        await handle.sync();
-    } finally {
-        await handle.close();
+async function listCheckoutProducerLines(repoRoot: string): Promise<string[]> {
+    const found: string[] = [];
+    const protectedPids = processAncestors(process.pid);
+    const servicesRoot = await fs.promises.realpath(path.resolve(repoRoot, "../psy-services")).catch(() => null);
+    for (const pid of await listPids()) {
+        if (protectedPids.has(pid)) continue;
+        let exe: string;
+        let cwd: string;
+        let argv: string[];
+        let uid: number;
+        try {
+            const status = await fs.promises.readFile(`/proc/${pid}/status`, "utf8");
+            uid = Number(/^Uid:\s+(\d+)/m.exec(status)?.[1] ?? NaN);
+            const command = /^Name:\s+(.+)$/m.exec(status)?.[1] ?? "";
+            // Linux comm is truncated; known runtime/interpreter candidates
+            // must be attributable, unrelated system processes need not be.
+            if (!Object.keys(CHECKOUT_PRODUCER_BASENAMES).some((name) => name.slice(0, 15) === command)
+                && !["MainThread", "nodejs"].includes(command)) continue;
+            [exe, cwd] = await Promise.all([
+                fs.promises.readlink(`/proc/${pid}/exe`),
+                fs.promises.readlink(`/proc/${pid}/cwd`),
+            ]);
+            argv = (await fs.promises.readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0");
+            if (isGracefulShutdownControlClient(repoRoot, exe, cwd, argv, uid)) continue;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") continue;
+            throw new Error(`[DevNet] cannot attribute candidate process ${pid}; refusing non-purge shutdown`);
+        }
+        const basename = path.basename(exe).replace(/ \(deleted\)$/, "");
+        const inside = cwd === repoRoot || cwd.startsWith(`${repoRoot}${path.sep}`);
+        const sibling = servicesRoot !== null && (cwd === servicesRoot || cwd.startsWith(`${servicesRoot}${path.sep}`));
+        const referencesCheckout = argv.some((arg) => arg === repoRoot || arg.startsWith(`${repoRoot}${path.sep}`));
+        let mountedCheckout = false;
+        if (CHECKOUT_PRODUCER_BASENAMES[basename] && cwd.startsWith("/app/")) {
+            try {
+                const [host, mounted] = await Promise.all([
+                    fs.promises.stat(repoRoot), fs.promises.stat(`/proc/${pid}/root/app/workspace`),
+                ]);
+                mountedCheckout = host.dev === mounted.dev && host.ino === mounted.ino;
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            }
+        }
+        if (((inside || mountedCheckout) && CHECKOUT_PRODUCER_BASENAMES[basename])
+            || (sibling && ["psy-services", "psy-indexer"].includes(basename)
+                && (referencesCheckout || await tcpListenerOwner(3000) === pid))) {
+            found.push(`${pid} ${basename}`);
+        }
     }
-    return stagedPath;
+    return found;
 }
 
-async function publishAnvilStateSnapshot(stagedPath: string, statePath: string): Promise<void> {
-    await fs.promises.rename(stagedPath, statePath);
-    try {
-        const directory = await fs.promises.open(path.dirname(statePath), "r");
-        try { await directory.sync(); } finally { await directory.close(); }
-    } catch (error) {
-        console.warn(`[DevNet] Anvil state directory sync failed for ${statePath}: ${error}`);
-    }
+async function assertCheckoutProducersStopped(repoRoot: string, control: GracefulStopControl): Promise<void> {
+    const canonical = await fs.promises.realpath(repoRoot);
+    const producers = await (control.listCheckoutProcesses ?? listCheckoutProducerLines)(canonical);
+    if (producers.length > 0) throw new Error("[DevNet] checkout producers remain or cannot be safely attributed; refusing non-purge shutdown");
 }
 
-export async function preserveLiveAnvilRpc(
-    rpcUrl: string,
-    statePath: string,
-    source: string,
-    rpc: (rpcUrl: string, method: string, params: unknown[]) => Promise<unknown> = anvilRpc,
-    stop?: () => Promise<void>,
-): Promise<void> {
-    const head = hexQuantityToBigInt(await rpc(rpcUrl, "eth_blockNumber", []), `eth_blockNumber for '${source}'`);
-    const stateText = decodeAnvilDumpStateHex(await rpc(rpcUrl, "anvil_dumpState", [true]), source);
-    let snapshot: unknown;
-    try { snapshot = JSON.parse(stateText); }
-    catch (error) { throw new Error(`[DevNet] anvil_dumpState for '${source}' is not plain JSON: ${error}`); }
-    const best = anvilStateBestBlockNumber(snapshot, source);
-    const stagedPath = await stageFsSyncedAnvilState(statePath, stateText);
-    if (best !== head) {
-        throw new Error(`[DevNet] Anvil '${source}' snapshot best block ${best} does not match head ${head}; staged snapshot kept at ${stagedPath}`);
+export async function discoverRepoAnvils(repoRoot: string, control: GracefulStopControl = {}): Promise<Array<{ pid: number; identity: AnvilProcessIdentity; chain: (typeof LOCAL_ANVIL_RPCS)[number] }>> {
+    const canonicalRepoRoot = await fs.promises.realpath(repoRoot).catch(() => path.resolve(repoRoot));
+    const list = control.listPids ?? listPids;
+    const readIdentity = control.readIdentity ?? readAnvilProcessIdentity;
+    const listenerOwner = control.listenerOwner ?? tcpListenerOwner;
+    const found: Array<{ pid: number; identity: AnvilProcessIdentity; chain: (typeof LOCAL_ANVIL_RPCS)[number] }> = [];
+    for (const pid of await list()) {
+        if (processAncestors(process.pid).has(pid)) continue;
+        const identity = await readIdentity(pid);
+        if (!identity || !(await isRepoAnvilProcess(identity, canonicalRepoRoot))) continue;
+        const chain = anvilChainOf(identity);
+        if (found.some((entry) => entry.chain.port === chain.port)) {
+            throw new Error(`[DevNet] more than one repo Anvil matches ${chain.network}`);
+        }
+        const owner = await listenerOwner(chain.port);
+        if (owner !== pid) throw new Error(`[DevNet] ${chain.network} listener is not owned by discovered Anvil ${pid}`);
+        found.push({ pid, identity, chain });
     }
-    if (stop) await stop();
-    await publishAnvilStateSnapshot(stagedPath, statePath);
-    console.log(`[DevNet] preserved Anvil '${source}' state at ${statePath} (best block ${best})`);
-}
-
-/** Absent-owner failsafe: a live Anvil has unknown producers, so preservation is refused. */
-export async function preserveUnownedLiveAnvils(
-    _repoCwd: string,
-    _rpc: (rpcUrl: string, method: string, params: unknown[]) => Promise<unknown> = anvilRpc,
-    portOpen: (port: number) => Promise<boolean> = tcpPortOpen,
-): Promise<void> {
-    const live = [];
     for (const chain of LOCAL_ANVIL_RPCS) {
-        if (await portOpen(chain.port)) live.push(chain.port);
+        const owner = await listenerOwner(chain.port);
+        if (owner === null) continue;
+        if (!found.some((entry) => entry.pid === owner && entry.chain.port === chain.port)) {
+            throw new Error(`[DevNet] occupied ${chain.network} listener is not the matching repo Anvil`);
+        }
     }
-    if (live.length > 0) {
-        throw new Error(`[DevNet] live Anvil on ports ${live.join(", ")} has no supervisor to quiesce its producers; refusing to snapshot or kill it`);
+    return found;
+}
+
+async function stopNamedDocker(names: readonly string[]): Promise<void> {
+    const listed = await runTeardownCommand(["docker", "ps", "-a", "--format", "{{.Names}}"], undefined, PURGE_DOCKER_TIMEOUT_MS);
+    if (listed.timedOut || listed.code !== 0 || !listed.stdoutComplete) throw new Error("[DevNet] cannot list containers before graceful stop");
+    const present = exactSnapshotNames(listed.stdout);
+    const live = names.filter((name) => present.has(name));
+    if (live.length === 0) return;
+    const proc = Bun.spawn(["docker", "stop", "-t", "-1", ...live], { stdin: "ignore", stdout: "ignore", stderr: "inherit" });
+    const code = await proc.exited;
+    if (code !== 0) throw new Error(`[DevNet] graceful docker stop failed with exit ${code}`);
+}
+
+/** Stop checkout producers, SIGTERM each exact repo Anvil, then stop namespace databases.
+ * Anvil's own --state exit dump is the only retained L1 evidence. */
+export async function gracefulDevnetStop(cwd: string, control: GracefulStopControl = {}): Promise<void> {
+    const names = await resolveBoundDevnetNames(cwd);
+    await assertCheckoutProducersStopped(cwd, control);
+    const discovered = await discoverRepoAnvils(cwd, control);
+    const readIdentity = control.readIdentity ?? readAnvilProcessIdentity;
+    const listenerOwner = control.listenerOwner ?? tcpListenerOwner;
+    const signal = control.signal ?? ((pid: number) => process.kill(pid, "SIGTERM"));
+    const alive = control.alive ?? ((pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+    for (const entry of discovered) {
+        const current = await readIdentity(entry.pid);
+        if (!anvilIdentityMatches(current, entry.identity) || await listenerOwner(entry.chain.port) !== entry.pid) {
+            throw new Error(`[DevNet] ${entry.chain.network} identity changed before SIGTERM`);
+        }
+        signal(entry.pid, "SIGTERM");
+        while (alive(entry.pid)) {
+            const again = await readIdentity(entry.pid);
+            if (again && !anvilIdentityMatches(again, entry.identity)) {
+                throw new Error(`[DevNet] ${entry.chain.network} pid was reused during shutdown`);
+            }
+            await Bun.sleep(50);
+        }
+        if (await listenerOwner(entry.chain.port) !== null) {
+            throw new Error(`[DevNet] ${entry.chain.network} listener remained open after exit`);
+        }
     }
+    await (control.stopDocker ?? stopNamedDocker)([...devnetDbContainerNames(names), names.envioPostgresContainer, `${names.envioComposeProject}-graphql-engine-1`]);
 }
 
 export async function requestOwnedAnvilShutdown(repoRoot: string, purge: boolean): Promise<"owned" | "absent"> {
@@ -4684,12 +5260,12 @@ export async function requestOwnedAnvilShutdown(repoRoot: string, purge: boolean
     }
     if (!stat.isSocket()) return "absent";
     try {
-        await sendDevnetControlCommand(repoRoot, purge ? "shutdown-purge" : "shutdown-preserve");
+        await sendDevnetControlCommand(repoRoot, purge ? "shutdown-purge" : "shutdown");
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (message.includes("ECONNREFUSED") || message.includes("ENOENT")) return "absent";
         if (message.includes("unsupported command")) {
-            throw new Error(`[DevNet] running supervisor at ${socketPath} does not support shutdown-preserve; restart it before PURGE=0 shutdown. Refusing to kill a live owner that cannot save Anvil.`);
+            throw new Error(`[DevNet] running supervisor at ${socketPath} does not support shutdown; restart it before PURGE=0 shutdown. Refusing to kill a live owner that cannot stop Anvil.`);
         }
         throw error;
     }
@@ -4698,6 +5274,7 @@ export async function requestOwnedAnvilShutdown(repoRoot: string, purge: boolean
 
 
 interface ProcessOptions {
+    all?: boolean;
     purge?: boolean;
     cwd?: string;
     jtmb?: boolean;
@@ -4834,23 +5411,53 @@ async function stopEnvioIndexerProcess(): Promise<void> {
     ]);
 }
 
-async function waitForProcessExit(process: RunningProcess, timeoutMs: number = 15_000): Promise<void> {
+async function waitForProcessExit(process: RunningProcess): Promise<void> {
     if (process.hasExited) return;
-    const timeoutGate = Promise.withResolvers<boolean>();
-    const timeout = setTimeout(() => timeoutGate.resolve(false), timeoutMs);
-    const exited = await Promise.race([process.proc.exited.then(() => true), timeoutGate.promise]);
-    clearTimeout(timeout);
-    if (exited || process.hasExited) return;
-    process.killWithSignal("SIGKILL");
     await process.proc.exited;
 }
 export class DevNetProcessManager {
     spawnedProcesses: RunningProcess[] = [];
     needsStartDb: boolean = false;
+    private admittedNames: DevnetDbNames | null = null;
+    private namespaceLock: DevnetLock | null = null;
     /** When true, exited children must not be auto-restarted (teardown/Ctrl+C). */
     private stopping: boolean = false;
     private applicationLifecycleState: ApplicationLifecycleState = "running";
     private pausedApplicationProcesses: RunningProcess[] = [];
+    private freshState: FreshDevnetState | undefined;
+
+    private async admitNamespace(cwd: string): Promise<DevnetDbNames> {
+        // All local deployments share host ports. Hold this host-wide lock
+        // through startup and supervision, not just the absence check.
+        this.namespaceLock = await acquireDevnetLock("psy-devnet-host-resources");
+        try {
+            const names = await reserveDevnetNamespace(cwd, this.getEnv());
+            this.envVars = { ...(this.envVars || {}), [DEVNET_NAMESPACE_ENV]: names.namespace ?? "" };
+            this.admittedNames = names;
+            return names;
+        } catch (error) {
+            this.namespaceLock.release();
+            this.namespaceLock = null;
+            throw error;
+        }
+    }
+
+    async cleanupFailedSetup(cwd: string): Promise<void> {
+        this.stopping = true;
+        if (this.freshState) {
+            await this.freshState.abort();
+            this.freshState = undefined;
+        }
+        // Preflight/auto-setup failures confer no authority over any resources.
+        // Leave artifacts for explicit recovery rather than discovering/killing
+        // processes or containers that this invocation never started.
+        if (!this.admittedNames) return;
+        if (this.applicationLifecycleState === "running" || this.applicationLifecycleState === "stopping") {
+            await this.stopApplications(cwd, false);
+        }
+        this.namespaceLock?.release();
+        this.namespaceLock = null;
+    }
 
     // Shared Config Constants
     private readonly NETWORK = "local-devnet";
@@ -5170,12 +5777,6 @@ export class DevNetProcessManager {
                     process.killWithSignal("SIGTERM");
                 }
                 await Promise.all(applications.map((process) => waitForProcessExit(process)));
-                for (const process of applications) {
-                    try {
-                        process.killWithSignal("SIGKILL");
-                    } catch {
-                    }
-                }
             }
             await waitForTcpPortsClosed(this.host, applicationListenerPorts(applications));
             for (const process of applications) {
@@ -5229,13 +5830,20 @@ export class DevNetProcessManager {
     }
 
     async restartApplications(cwd: string = "."): Promise<void> {
-        for (const template of splitDevnetProcesses(this.spawnedProcesses).applications) await validateRelayerTemplate(template.cmds, template.spawnOptions);
+        const { persistent, applications } = splitDevnetProcesses(this.spawnedProcesses);
+        const required = ["db", "l1_anvil", "l1_anvil_bsc", "l1_anvil_base"];
+        const missing = required.filter((name) => !persistent.some((process) => process.name === name && process.isRunning()));
+        if (missing.length > 0) {
+            throw new Error(`[DevNet][control] restart requires running infrastructure; missing ${missing.join(", ")}`);
+        }
+        for (const template of applications) await validateRelayerTemplate(template.cmds, template.spawnOptions);
         await this.stopApplications(cwd, false);
         await this.startApplications(cwd);
     }
 
     private getEnv(): { [key: string]: string } {
-        return { ...process.env, ...this.envVars, PSY_NETWORK: selectedRuntimeConfigKey(this.NETWORK) } as { [key: string]: string };
+        const namespace = process.env[DEVNET_NAMESPACE_ENV];
+        return { ...process.env, ...this.envVars, PSY_NETWORK: selectedRuntimeConfigKey(this.NETWORK), ...(namespace ? { [DEVNET_NAMESPACE_ENV]: namespace } : {}) } as { [key: string]: string };
     }
     private getEnvWithRustLogDirective(directive: string): { [key: string]: string } {
         const env = this.getEnv() || { ...process.env } as { [key: string]: string };
@@ -5249,7 +5857,8 @@ export class DevNetProcessManager {
 
     async startGuardianServices(cwd: string, daemonConfigPath: string): Promise<void> {
         const config = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath, "utf8"));
-        const guardianPath = await resolveGuardianConfigPath(cwd, config.guardian_config as string);
+        const rpcConfig = path.resolve(cwd, config.rpc_config as string);
+        const guardianRoot = await resolveGuardianRoot(cwd, String(config.guardian_root ?? ""));
         // All three guardians launch concurrently; each spawn blocks on its own 600s
         // HTTP readiness budget and kills its own child when readiness fails. Every
         // successful child is tracked immediately so a failing sibling cannot orphan
@@ -5260,7 +5869,7 @@ export class DevNetProcessManager {
             const name = `guardian_${id}`;
             const process = await RunningProcess.spawn([
                 './target/release/psy_relayer_cli', 'guardian-service',
-                '--config', guardianPath, '--guardian-id', String(id), '--db-path', `journal/${id}.redb`,
+                '--rpc-config', rpcConfig, '--guardian-root', guardianRoot, '--guardian-id', String(id),
             ], {
                 cwd,
                 stdoutLogFile: path.join(cwd, 'logs', `${name}_logs.txt`),
@@ -5280,7 +5889,11 @@ export class DevNetProcessManager {
     }
 
     async setupProcesses(options: ProcessOptions): Promise<void> {
+
         const cwd = options?.cwd || ".";
+        const relayer = !!options.relayer || !!options.bridgeProposerDaemon;
+        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
+        const startAll = options.all ?? !hasOnlyOptions;
         const jtmb = !!options?.jtmb;
         const l1Port = options.l1Port ?? 8545;
         const { stage, l1Network, l1Fork, cfgEntry } = resolveL1Selection();
@@ -5294,16 +5907,10 @@ export class DevNetProcessManager {
         const coordinatorWorkersCount = options.coordinatorWorkersCount;
         this.genesisDataPath = options.genesisDataPath || "genesis.json";
         const skipBuild = skipBuildEnabled();
-
-
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
-        // Determine what components to start
-        const relayer = !!options.relayer || !!options.bridgeProposerDaemon;
-        const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
-        const startAll = !hasOnlyOptions;
-        const startBridgeProposerDaemon = shouldRequireGuardianConfig(startAll, options);
+        const startBridgeProposerDaemon = shouldRequireGuardianRoot(startAll, options);
         const daemonConfigPath = startBridgeProposerDaemon
-            ? await resolveBridgeDaemonConfigPath(cwd, this.getEnv(), !!options.purge)
+            ? await resolveBridgeDaemonConfigPath(cwd, this.getEnv(), startAll || !!options.purge)
             : undefined;
 
         const startCoordinatorProcessor = startAll || !!options.coordinator;
@@ -5311,7 +5918,7 @@ export class DevNetProcessManager {
         const startRealmProcessor = startAll || !!options.coordinator;
         const startRealmWorkers = workerRealmCount > 0;
 
-        const needsStartDb = !hasOnlyOptions || !!options.db;
+        const needsStartDb = startAll || !!options.db;
         const startRealmId = options.startRealmId || 0;
         const realmsCount = options.realmsCount !== undefined ? options.realmsCount : (startAll ? 1 : 1);
         const prepareRealmP2p = shouldPrepareRealmP2p(startCoordinatorProcessor, startRealmProcessor);
@@ -5320,7 +5927,7 @@ export class DevNetProcessManager {
         const provingProcessCount = coordinatorWorkersCount
             + workerRealmCount
             + (options.dummyProvers || 0)
-            + ((options.proveProxyCount || 0) > 0 ? options.proveProxyCount || 0 : (startAll ? 1 : 0));
+            + (options.proveProxyCount ?? (startAll ? 1 : 0));
         const runtimeResources = await resolveRuntimeResourceSettings(
             this.getEnv() || { ...process.env } as { [key: string]: string },
             provingProcessCount,
@@ -5380,12 +5987,30 @@ export class DevNetProcessManager {
         } else {
             console.log("Binaries already exist, skipping build...");
         }
+        if (startAll) {
+            if (stage !== "localhost" || l1Network !== "localhost" || l1Fork || options.daemonlize
+                || path.resolve(cwd, this.genesisDataPath) !== path.resolve(cwd, "genesis.json")) {
+                throw new Error("[DevNet] full fresh startup requires foreground localhost, no fork, and the canonical genesis.json");
+            }
+            await ensureGenesisFiles(cwd, this.getEnv(), true);
+            await ensurePsyContractsDependencies(path.join(cwd, "psy-contracts"));
+            await assertCheckoutProducersStopped(cwd, {});
+            await discoverRepoAnvils(cwd);
+            await loadBridgeRelayerSigner(cwd);
+        }
+        const names = await this.admitNamespace(cwd);
+        if (startAll && daemonConfigPath) {
+            const daemon = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath, "utf8"));
+            const guardianRoot = await resolveGuardianRoot(cwd, daemon.guardian_root as string);
+            const reset = await planScopedDevnetReset(names);
+            this.freshState = await prepareFreshDevnetState(cwd, guardianRoot, this.getEnv());
+            await resetScopedDevnetState(cwd, reset);
+            await this.freshState.reset();
+            await ensureGenesisFiles(cwd, this.getEnv());
+        }
 
-        // 2. Start Database
         if (this.needsStartDb) {
-            console.log("[DevNet] Killing existing docker containers...");
-            await killDocker();
-            const startDbCmd = ['./dev/start_db.sh', '--persist'];
+            const startDbCmd = ['./dev/start_db.sh', '--fresh'];
             await this.track(
                 await RunningProcess.spawnWithInitializationHint(
                     startDbCmd, dbStartedDetector, { cwd, ...getLogPaths("db", false), env: this.getEnv() }
@@ -5405,7 +6030,7 @@ export class DevNetProcessManager {
         let realmP2pConfig: FullNetworkConfig | null = null;
         if (prepareRealmP2p) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            realmP2pConfig = await ensureRealmP2pConfig(nodeCli, cwd, allRealmIds, realmEdgeCount, this.host);
+            realmP2pConfig = await ensureRealmP2pConfig(nodeCli, cwd, allRealmIds, realmEdgeCount, this.host, path.join(cwd, this.genesisDataPath));
             this.envVars = { ...this.envVars, PSY_CONFIG_PATH: `${REALM_P2P_OUT_DIR}/config.json`, PSY_NETWORK: realmP2pConfig.defaultNetwork };
             await injectGenesisValidators(path.join(cwd, this.genesisDataPath), realmP2pConfig);
         }
@@ -5414,9 +6039,9 @@ export class DevNetProcessManager {
         // Spawn immediately after realm/genesis prep, then wait for :9999
         // before core so processor startup is not concurrent with preload.
         const proveProxyReady: Promise<void>[] = [];
-        const proveProxyCount = options.proveProxyCount || 0;
-        if (proveProxyCount > 0 || startAll) {
-            const count = proveProxyCount || 1;
+        const proveProxyCount = options.proveProxyCount ?? (startAll ? 1 : 0);
+        if (proveProxyCount > 0) {
+            const count = proveProxyCount;
             for (let i = 0; i < count; i++) {
                 const port = 9999 + i;
                 const proveProxyProc = await RunningProcess.spawnWithInitializationHintWithRetry(
@@ -5760,33 +6385,31 @@ export class DevNetProcessManager {
         }
 
 
-        // 10. L1 (Anvil)
+        // 10. L1 (Anvil). Local chains always start empty and deploy fresh.
         let resetEnvioStorage = false;
         if (options.l1 || startAll) {
             const local = l1Network === "localhost" || l1Fork;
             const statePlans = local
-                ? await Promise.all(relayerChains.map((chain) => resolveLocalAnvilStatePlan(cwd, chain.deploymentsNetwork, l1Fork)))
+                ? await Promise.all(relayerChains.map((chain) => resolveLocalAnvilStatePlan(cwd, chain.deploymentsNetwork, l1Fork, { rpcUrl: chain.rpcUrl })))
                 : [];
-            if (statePlans.some((plan) => plan.hasState) && statePlans.some((plan) => !plan.hasState)) {
-                throw new Error("[DevNet] Partial persisted L1 cohort; refusing to reset retained chains. Run PURGE=1 make shutdown, then make run-all.");
+            resetEnvioStorage = statePlans.length > 0;
+            const contractsDir = path.join(cwd, "psy-contracts");
+            const deploys = relayerChains.some((chain) => chain.deploymentsNetwork.startsWith("localhost") || shouldRedeployL1());
+            if (deploys) {
+                await ensurePsyContractsDependencies(contractsDir);
+                const compile = Bun.spawn(["npx", "hardhat", "compile"], { cwd: contractsDir, stdout: "inherit", stderr: "inherit" });
+                const compileCode = await compile.exited;
+                if (compileCode !== 0) throw new Error(`[DevNet] psy-contracts compile failed (exit=${compileCode})`);
             }
-            resetEnvioStorage = statePlans.length > 0 && statePlans.every((plan) => plan.shouldResetEnvio);
-            for (const [index, chain] of relayerChains.entries()) {
+            const l1Deployments = await Promise.allSettled(relayerChains.map(async (chain, index) => {
                 const chainMeta = protocolConfig.chains[chain.deploymentsNetwork];
                 const statePlan = statePlans[index];
+                const logName = chain.chainIndex === 0 ? "l1_anvil" : `l1_anvil_${chain.prefix.toLowerCase()}`;
                 if (statePlan) {
                     await mkdir(path.dirname(statePlan.statePath), { recursive: true });
                     const rpc = new URL(chain.rpcUrl);
                     const port = Number(rpc.port || (rpc.protocol === "https:" ? 443 : 80));
-                    const args = localAnvilLaunchArgs(
-                        port,
-                        String(chainMeta.l1ChainId),
-                        statePlan.statePath,
-                        statePlan.genesis,
-                    );
-                    // --steps-tracing is omitted: it records full execution traces
-                    // for every block into the state dump (~21MB/block, 20GB in
-                    // ~1000 blocks) until the periodic write starves the RPC loop.
+                    const args = localAnvilLaunchArgs(port, String(chainMeta.l1ChainId), statePlan.statePath);
                     if (l1Fork) {
                         const forkEnvKey = resolveForkRpcEnvKey(l1Network, cfgEntry, stage);
                         const forkRpcUrl = process.env[forkEnvKey];
@@ -5795,30 +6418,28 @@ export class DevNetProcessManager {
                         const forkBlock = process.env.VITE_FORK_BLOCK_NUMBER;
                         if (forkBlock?.trim()) args.push("--fork-block-number", forkBlock.trim());
                     }
-                    const logName = chain.chainIndex === 0 ? "l1_anvil" : `l1_anvil_${chain.prefix.toLowerCase()}`;
                     this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                        args,
-                        l1StartedDetector,
+                        args, l1StartedDetector,
                         { cwd, ...getLogPaths(logName, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() },
-                    ));
+                    ), logName);
                 } else {
                     console.log(`[DevNet] Using external L1 network ${chain.networkId} via ${chain.rpcUrl}`);
                 }
                 await waitForHttpUrl(chain.rpcUrl, {
                     attempts: 30, delayMs: local ? 500 : 1000, timeoutMs: local ? 1500 : 3000, name: `${chainMeta.name} RPC`,
                 });
-                if (statePlan?.genesis) {
-                    await assertPreservedAnvilGenesis(chain.rpcUrl, statePlan.genesis, chain.deploymentsNetwork);
-                }
-                if (statePlan) {
-                    await setLocalAnvilIntervalMining(chain.rpcUrl);
-                }
+                if (statePlan) await setLocalAnvilIntervalMining(chain.rpcUrl);
                 await deployPsyContracts(cwd, chain.rpcUrl, chain.deploymentsNetwork, {
-                    fundDevAccounts: local && !statePlan?.hasState,
+                    fundDevAccounts: local,
                     localAnvilRpcUrl: local ? chain.rpcUrl : undefined,
-                    reuseLocalDeployment: statePlan?.hasState,
                 });
-            }
+            }));
+            const l1Failure = l1Deployments.find((result): result is PromiseRejectedResult => result.status === "rejected");
+            if (l1Failure) throw l1Failure.reason;
+        }
+        if (this.freshState) {
+            await this.freshState.authorize();
+            this.freshState = undefined;
         }
         // 11. Bridge dependencies (Envio + psy-services)
         if (relayer || options.bridgeUi || options.psyPrivacyBridge || startAll) {
@@ -5918,17 +6539,8 @@ export class DevNetProcessManager {
                 };
             }));
 
-            let servicesDatabaseExists = false;
-            if (!options.purge) {
-                const probe = Bun.spawn([
-                    'docker', 'exec', 'generated-envio-postgres-1', 'psql', '-U', 'postgres',
-                    '-d', 'postgres', '-tAc', "SELECT 1 FROM pg_database WHERE datname = 'psy_services'",
-                ], { stdio: ['ignore', 'pipe', 'inherit'] });
-                const result = await new Response(probe.stdout).text();
-                if (await probe.exited !== 0) throw new Error('[DevNet] Failed to check psy_services database');
-                servicesDatabaseExists = result.trim() === '1';
-            }
-            for (const command of psyServicesDatabaseCommands(!!options.purge, servicesDatabaseExists)) {
+            const names = resolveDevnetDbNamesFromEnv(this.getEnv());
+            for (const command of psyServicesDatabaseCommands(true, false, names.envioPostgresContainer)) {
                 const code = await Bun.spawn(command, { stdio: ['ignore', 'ignore', 'inherit'] }).exited;
                 if (code !== 0) throw new Error(`[DevNet] psy_services database setup failed: ${command[3]}`);
             }
@@ -6161,7 +6773,7 @@ export class DevNetProcessManager {
 
         // 18. Mode A Web Wallet Bridge
         if (options.modeAWebWalletBridge || startAll) {
-            const modeAWebWalletBridgeDir = path.join(cwd, 'psy-dapp', 'mode-a-web-wallet-bridge');
+            const modeAWebWalletBridgeDir = path.join(cwd, 'psy-dapp', 'apps', 'account');
             // The app uses `link:` deps to `@psy-protocol/psy-sdk` and `@psy-protocol/evm-wallet`.
             // Those packages are not part of this repo (client_prover/psy_sdk only has generated
             // types), so we can only start the dev server if the linked workspace is present.
@@ -6181,7 +6793,7 @@ export class DevNetProcessManager {
                         if (!(await exists(path.join(resolved, 'package.json')))) {
                             console.warn(
                                 `[DevNet] Skipping Mode A Web Wallet Bridge: linked dependency ${name}@${spec} does not resolve to a valid package (${resolved}).\n`
-                                + `[DevNet] Make sure the psy-sdk workspace is checked out at the path expected by psy-dapp/mode-a-web-wallet-bridge/package.json.`,
+                                + `[DevNet] Make sure the psy-sdk workspace is checked out at the path expected by psy-dapp/apps/account/package.json.`,
                             );
                             return;
                         }
@@ -6224,7 +6836,7 @@ export class DevNetProcessManager {
 
         const relayer = !!options.relayer || !!options.bridgeProposerDaemon;
         const hasOnlyOptions = !!options.db || !!options.coordinator || (options.proveProxyCount || 0) > 0 || !!options.faucetServer || (options.dummyProvers || 0) > 0 || !!options.l1 || relayer || !!options.bridgeUi || !!options.privacyUi || !!options.psyPrivacyBridge || !!options.ide || !!options.explorer || !!options.modeAWebWalletBridge;
-        const startAll = !hasOnlyOptions;
+        const startAll = options.all ?? !hasOnlyOptions;
 
         const startCoordinatorProcessor = startAll || !!options.coordinator;
         const startCoordinatorWorkers = coordinatorWorkersCount > 0;
@@ -6242,7 +6854,7 @@ export class DevNetProcessManager {
         let realmP2pConfig: FullNetworkConfig | null = null;
         if (prepareRealmP2p) {
             const allRealmIds = Array.from({ length: realmsCount }, (_, i) => startRealmId + i);
-            const foregroundP2pConfig = await ensureRealmP2pConfig("./target/release/psy_node_cli", cwd, allRealmIds, realmEdgeCount, this.host);
+            const foregroundP2pConfig = await ensureRealmP2pConfig("./target/release/psy_node_cli", cwd, allRealmIds, realmEdgeCount, this.host, path.join(cwd, this.genesisDataPath));
             realmP2pConfig = daemonRealmP2pConfig(foregroundP2pConfig, allRealmIds, realmEdgeCount);
             const daemonConfigPath = path.join(cwd, REALM_P2P_OUT_DIR, "daemon-config.json");
             await fs.promises.writeFile(daemonConfigPath, JSON.stringify(realmP2pConfig, null, 2), "utf-8");
@@ -6251,7 +6863,9 @@ export class DevNetProcessManager {
 
 
         const services: any = {};
-        const networkName = "psy-devnet";
+        const names = await this.admitNamespace(cwd);
+        const daemonName = names.namespace === null ? "psy-devnet" : `${names.namespace}-psy-devnet`;
+        const networkName = daemonName;
 
         const runtimeResources = await resolveRuntimeResourceSettings(
             this.getEnv() || { ...process.env } as { [key: string]: string },
@@ -6296,11 +6910,17 @@ export class DevNetProcessManager {
 
         // Infrastructure
         if (needsStartDb) {
+            const occupied = await planScopedDevnetReset(names);
+            const owned = [...devnetDbContainerNames(names), ...devnetDbVolumeNames(names)];
+            const collision = [...occupied.containers, ...occupied.volumes].filter((name) => owned.includes(name));
+            if (collision.length > 0) {
+                throw new Error(`[DevNet] database startup refuses existing resources: ${collision.join(", ")}`);
+            }
             services["valkey-server"] = {
                 image: "valkey/valkey",
-                container_name: "valkey-server",
+                container_name: names.containers.valkey,
                 ports: ["6379:6379"],
-                volumes: ["psy-devnet-redis:/data"],
+                volumes: [`${names.volumes.valkey}:/data`],
                 command: [
                     "valkey-server",
                     "--dir", "/data",
@@ -6313,22 +6933,22 @@ export class DevNetProcessManager {
 
             services["nats-server"] = {
                 image: "nats",
-                container_name: "nats-server",
+                container_name: names.containers.nats,
                 ports: ["4222:4222"],
-                volumes: ["psy-devnet-nats:/data"],
+                volumes: [`${names.volumes.nats}:/data`],
                 ...(runtimeResources.runtimeCpuSet ? { cpuset: runtimeResources.runtimeCpuSet } : {}),
                 command: ["-js", "-sd", "/data"]
             };
 
             services["scylla-server"] = {
                 image: "scylladb/scylla:latest",
-                container_name: "scylla-server",
+                container_name: names.containers.scylla,
                 ports: ["9042:9042"],
                 cap_add: ["PERFMON"],
                 ...(runtimeResources.scyllaCpuSet ? { cpuset: runtimeResources.scyllaCpuSet } : {}),
                 volumes: [
-                    "psy-devnet-scylla:/var/lib/scylla",
-                    "psy-devnet-scylla-data:/run/udev/data"
+                    `${names.volumes.scylla}:/var/lib/scylla`,
+                    `${names.volumes.scyllaData}:/run/udev/data`
                 ],
                 command: scyllaCommand,
                 healthcheck: {
@@ -6360,7 +6980,7 @@ export class DevNetProcessManager {
 
         const getServiceEntry = (name: string, cmd: string[], useHostUser: boolean = true) => ({
             image: nodeImage,
-            container_name: name,
+            container_name: names.namespace === null ? name : `${names.namespace}-${name}`,
             ...(useHostUser ? { user: `${uid}:${gid}` } : {}),
             working_dir: "/app/workspace",
             environment: envList,
@@ -6543,10 +7163,10 @@ export class DevNetProcessManager {
         };
 
         compose.volumes = {
-            "psy-devnet-redis": { name: "psy-devnet-redis" },
-            "psy-devnet-scylla": { name: "psy-devnet-scylla" },
-            "psy-devnet-scylla-data": { name: "psy-devnet-scylla-data" },
-            "psy-devnet-nats": { name: "psy-devnet-nats" }
+            [names.volumes.valkey]: { name: names.volumes.valkey },
+            [names.volumes.scylla]: { name: names.volumes.scylla },
+            [names.volumes.scyllaData]: { name: names.volumes.scyllaData },
+            [names.volumes.nats]: { name: names.volumes.nats },
         };
 
         // Helper to stringify Docker Compose YAML with explicit quoting for all string values
@@ -6575,13 +7195,13 @@ export class DevNetProcessManager {
         };
 
         const yamlString = stringifyYaml({ services, networks: { default: { name: networkName } } });
-        let fullYaml = yamlString + "\nvolumes:\n  psy-devnet-redis: {}\n  psy-devnet-scylla: {}\n  psy-devnet-scylla-data: {}\n  psy-devnet-nats: {}\n";
+        let fullYaml = yamlString + `\nvolumes:\n  ${names.volumes.valkey}:\n    name: ${names.volumes.valkey}\n  ${names.volumes.scylla}:\n    name: ${names.volumes.scylla}\n  ${names.volumes.scyllaData}:\n    name: ${names.volumes.scyllaData}\n  ${names.volumes.nats}:\n    name: ${names.volumes.nats}\n`;
         
         await writeFile("docker-compose.yml", fullYaml);
         console.log("[DevNet] Generated docker-compose.yml (Clean YAML)");
         
         console.log("[DevNet] Starting via docker-compose...");
-        const proc = Bun.spawn(["docker", "compose", "up", "-d", "--remove-orphans"], {
+        const proc = Bun.spawn(["docker", "compose", "-p", daemonName, "up", "-d", "--remove-orphans"], {
             stdout: "inherit",
             stderr: "inherit"
         });
@@ -6591,45 +7211,39 @@ export class DevNetProcessManager {
 
     async teardown(cwd: string = ".", purge: boolean = false): Promise<void> {
         this.stopping = true;
+        if (this.freshState) {
+            await this.freshState.abort();
+            this.freshState = undefined;
+        }
+        if (!this.admittedNames) return;
         console.log("[DevNet][supervisor] teardown: auto-restart disabled, stopping all children");
-        if (!purge) await this.preserveOwnedAnvilState(cwd);
+        if (!purge) {
+            await this.stopOwnedAnvilState(cwd);
+            await gracefulDevnetStop(cwd);
+            return;
+        }
         for (const child of this.spawnedProcesses) {
-            if (!purge && child.name.startsWith("l1_anvil")) continue;
             if (child?.isRunning()) child.kill();
         }
-        await teardownDevnet(cwd, purge);
+        await teardownDevnet(cwd, true);
     }
 
-    /** Stop application producers when a lifecycle is active. Anvil stays up. */
-    async quiesceApplications(cwd: string): Promise<void> {
+    /** Stop tracked producers. Anvil stays up until gracefulDevnetStop signals it. */
+    async stopOwnedAnvilState(cwd: string): Promise<void> {
+        await resolveBoundDevnetNames(cwd, this.getEnv());
+        if (!this.admittedNames) throw new Error("[DevNet] supervisor has not admitted resource ownership");
+        this.stopping = true;
         if (this.applicationLifecycleState === "running" || this.applicationLifecycleState === "stopping") {
             await this.stopApplications(cwd, false);
         }
-    }
-
-    /** Stop producers, then stage each live owned Anvil and await its real exit. No SIGKILL. */
-    async preserveOwnedAnvilState(
-        cwd: string,
-        rpc?: (rpcUrl: string, method: string, params: unknown[]) => Promise<unknown>,
-    ): Promise<void> {
-        await this.quiesceApplications(cwd);
-        const anvils = this.spawnedProcesses.filter((child) => child.name.startsWith("l1_anvil") && child.isRunning());
-        for (const anvil of anvils) {
-            const portIndex = anvil.cmds.indexOf("--port");
-            const port = Number(anvil.cmds[portIndex + 1]);
-            if (!Number.isInteger(port)) throw new Error(`[DevNet] Anvil '${anvil.name}' has no --port`);
-            const network = anvil.name === "l1_anvil_bsc" ? "localhostBsc" : anvil.name === "l1_anvil_base" ? "localhostBase" : "localhost";
-            const stop = async () => {
-                anvil.killWithSignal("SIGTERM");
-                await anvil.proc.exited;
-            };
-            await preserveLiveAnvilRpc(resolveLocalL1RpcUrl(port), localAnvilStatePath(cwd, network), anvil.name, rpc, stop);
-        }
+        const tracked = splitDevnetProcesses(this.spawnedProcesses).applications.filter((process) => process.isRunning());
+        for (const process of tracked) process.killWithSignal("SIGTERM");
+        for (const process of tracked) await process.proc.exited;
     }
 
     static create(host?: string, envVars?: { [key: string]: string }, provingBackend?: string): DevNetProcessManager { return new DevNetProcessManager(host, envVars, provingBackend); }
 }
-export function shouldRequireGuardianConfig(startAll: boolean, options: Pick<ProcessOptions, "relayer" | "bridgeProposerDaemon" | "bridgeUi">): boolean {
+export function shouldRequireGuardianRoot(startAll: boolean, options: Pick<ProcessOptions, "relayer" | "bridgeProposerDaemon" | "bridgeUi">): boolean {
     return startAll || !!options.relayer || !!options.bridgeProposerDaemon || !!options.bridgeUi;
 }
 
@@ -6642,7 +7256,7 @@ export function shouldRequireGuardianConfig(startAll: boolean, options: Pick<Pro
 // (possibly stale) lock is present.
 
 function devnetLockPath(repoRoot: string): string {
-    const tmpBase = process.env.TMPDIR || "/tmp";
+    const tmpBase = repoRoot === "psy-devnet-host-resources" ? "/tmp" : process.env.TMPDIR || "/tmp";
     const key = createHash("sha256").update(repoRoot).digest("hex").slice(0, 32);
     return path.join(tmpBase, `psy-devnet-${key}.lock`);
 }
@@ -6720,7 +7334,7 @@ async function acquireDevnetLock(repoRoot: string): Promise<DevnetLock> {
     }
     return new DevnetLock(holder);
 }
-export type DevnetControlCommand = "restart" | "rollback-stop" | "rollback-resume" | "shutdown-preserve" | "shutdown-purge";
+export type DevnetControlCommand = "restart" | "rollback-stop" | "rollback-resume" | "shutdown" | "shutdown-purge";
 
 interface DevnetControlResponse {
     ok: boolean;
@@ -6736,7 +7350,7 @@ export function devnetControlSocketPath(repoRoot: string): string {
 }
 
 function parseDevnetControlCommand(value: string): DevnetControlCommand {
-    if (value === "restart" || value === "rollback-stop" || value === "rollback-resume" || value === "shutdown-preserve" || value === "shutdown-purge") return value;
+    if (value === "restart" || value === "rollback-stop" || value === "rollback-resume" || value === "shutdown" || value === "shutdown-purge") return value;
     throw new Error(`[DevNet][control] unsupported command ${value}`);
 }
 
@@ -6767,6 +7381,9 @@ export async function sendDevnetControlCommand(repoRoot: string, command: Devnet
     socket.once("error", (error) => response.reject(
         new Error(`[DevNet][control] cannot reach the running supervisor at ${socketPath}: ${error.message}`),
     ));
+    socket.once("close", () => {
+        if (!received.includes("\n")) response.reject(new Error("[DevNet][control] supervisor disconnected without a completion acknowledgment"));
+    });
     try {
         return await response.promise;
     } finally {
@@ -6851,6 +7468,7 @@ async function runMain() {
     const { values } = parseArgs({
         args: Bun.argv,
         options: {
+            all: { type: "boolean" },
             jtmb: { type: "boolean" },
             "proving-backend": { type: "string" },
             "disable-worker-edge-logs": { type: "boolean" },
@@ -6888,7 +7506,8 @@ async function runMain() {
 
 
 
-    const hasOnlyOptions = !!values["db"] || !!values["coordinator"] || !!values["prove-proxy"] || !!values["faucet-server"] || !!values["dummy-provers"] || !!values["l1"] || !!values["relayer"] || !!values["bridge-proposer-daemon"] || !!values["psy-privacy-bridge"] || !!values["ide"] || !!values["explorer"] || !!values["mode-a-web-wallet-bridge"];
+    const proveProxyCount = values["prove-proxy"] !== undefined ? parseInt(values["prove-proxy"], 10) : undefined;
+    const hasOnlyOptions = !values.all && (!!values["db"] || !!values["coordinator"] || (proveProxyCount !== undefined && proveProxyCount !== 0) || !!values["faucet-server"] || !!values["dummy-provers"] || !!values["l1"] || !!values["relayer"] || !!values["bridge-proposer-daemon"] || !!values["psy-privacy-bridge"] || !!values["ide"] || !!values["explorer"] || !!values["mode-a-web-wallet-bridge"]);
     const workerRealmCount = resolveRealmWorkerCount(
         values["realm-workers"],
         hasOnlyOptions,
@@ -6903,7 +7522,6 @@ async function runMain() {
     const genesisDataPath = values["genesis-data-path"] || "genesis.json";
     const coordinator = !!values["coordinator"];
     const db = !!values["db"];
-    const proveProxyCount = values["prove-proxy"] ? parseInt(values["prove-proxy"], 10) : 0;
     const faucetServer = !!values["faucet-server"];
     const dummyProvers = values["dummy-provers"] ? parseInt(values["dummy-provers"], 10) : 0;
     const l1 = !!values["l1"];
@@ -6957,7 +7575,8 @@ Psy Network DevNet Setup Tool
 Usage: bun run dev/locSetupV4.ts [options]
 
  Options:
-    --control <command>             Send restart, rollback-stop, rollback-resume, shutdown-preserve, or shutdown-purge to the running supervisor
+    --all                          Full fresh local startup (component counts remain configurable)
+    --control <command>             Send restart, rollback-stop, rollback-resume, shutdown, or shutdown-purge to the running supervisor
     --host <ip>                     Target host IP (default: 127.0.0.1)
     --genesis-data-path <path>      Path to genesis data JSON file for processor nodes (default: genesis.json)
     --proving-backend <backend>     Proving backend to use (default: plonky2-poseidon-goldilocks)
@@ -6986,7 +7605,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --psy-privacy-bridge           Start integrated privacy+bridge shell (psy-dapp/apps/bridge, port 5177)
    --ide                          Start IDE dev server (psy-dapp/apps/ide, port 5176)
    --explorer                     Start blockchain explorer dev server (psy-dapp/apps/explorer, port 5178)
-   --mode-a-web-wallet-bridge     Start Mode A web wallet bridge dev server (psy-dapp/mode-a-web-wallet-bridge, port 5179)
+   --mode-a-web-wallet-bridge     Start Mode A web wallet bridge dev server (psy-dapp/apps/account, port 5179)
    --daemonlize                    Generate docker-compose.yml and start in background
    --teardown                      Stop local devnet processes/containers and exit
    --purge                         With --teardown (or startup), also remove local_checkpoints, logs, deployments, and devnet Docker volumes
@@ -7022,7 +7641,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    bun run dev/locSetupV4.ts --bridge-proposer-daemon  # alias for unified bridge relayer
    bun run dev/locSetupV4.ts --psy-privacy-bridge  # start integrated privacy+bridge shell on port 5177
    bun run dev/locSetupV4.ts --explorer            # start blockchain explorer on port 5178
-   bun run dev/locSetupV4.ts --mode-a-web-wallet-bridge  # start Mode A web wallet bridge on port 5179
+   bun run dev/locSetupV4.ts --mode-a-web-wallet-bridge  # start Mode A web wallet bridge (psy-dapp/apps/account, port 5179)
    bun run dev/locSetupV4.ts --l1 --relayer --psy-privacy-bridge  # full bridge stack
 
  Notes:
@@ -7052,8 +7671,9 @@ Usage: bun run dev/locSetupV4.ts [options]
         `);
         process.exit(0);
     }
+    if (!teardown && daemonlize && (values.all || !hasOnlyOptions)) throw new Error("[DevNet] full fresh startup requires the foreground launcher");
 
-    if (!teardown && !daemonlize && shouldRequireGuardianConfig(!hasOnlyOptions, { relayer, bridgeProposerDaemon })) {
+    if (!teardown && !daemonlize && shouldRequireGuardianRoot(!hasOnlyOptions, { relayer, bridgeProposerDaemon })) {
         envVars.PSY_BRIDGE_DAEMON_CONFIG = await resolveBridgeDaemonConfigPath(process.cwd(), { ...process.env, ...envVars }, purge);
     }
 
@@ -7104,23 +7724,13 @@ Usage: bun run dev/locSetupV4.ts [options]
 
     process.on('SIGINT', () => void shutdown());
     process.on('SIGTERM', () => void shutdown());
-
     try {
-    // Auto-setup: clone repos, install deps, download keystore, build binaries
-    // Skip for teardown so it works even on a partially configured machine
-    if (purge && !teardown) {
-        try {
-            await teardownDevnet(".", true);
-        } catch (error) {
-            console.error(`[DevNet] startup purge failed; not starting: ${error}`);
-            process.exit(1);
-        }
-    }
     if (!teardown) {
         await ensureDevEnvironment(REPO_ROOT, {
             requireDocker: !hasOnlyOptions || db || relayer || bridgeProposerDaemon,
             requireAnvil: !hasOnlyOptions || l1,
             requireBun: !hasOnlyOptions || psyPrivacyBridge || ide || modeAWebWalletBridge,
+            selectedUi: selectedUiDependencies(!hasOnlyOptions, { psyPrivacyBridge, ide, explorer, modeAWebWalletBridge }),
             env: envVars,
         });
     }
@@ -7143,9 +7753,11 @@ Usage: bun run dev/locSetupV4.ts [options]
         try {
             if (!purge) {
                 const owner = await requestOwnedAnvilShutdown(REPO_ROOT, false);
-                if (owner === "absent") await preserveUnownedLiveAnvils(".");
+                if (owner === "owned") process.exit(0);
+                await gracefulDevnetStop(".");
+            } else {
+                await teardownDevnet(".", true);
             }
-            await teardownDevnet(".", purge);
             process.exit(0);
         } catch (error) {
             console.error(`[DevNet] teardown failed without broad cleanup: ${error}`);
@@ -7154,6 +7766,7 @@ Usage: bun run dev/locSetupV4.ts [options]
     }
 
         const options: ProcessOptions = {
+            all: !hasOnlyOptions,
             purge,
             jtmb: !!values.jtmb,
             l1Port,
@@ -7190,12 +7803,17 @@ Usage: bun run dev/locSetupV4.ts [options]
             await globalManager.setupProcesses(options);
             controlServer = await startDevnetControlServer(REPO_ROOT, async (command) => {
                 if (!globalManager) throw new Error("[DevNet][control] process manager unavailable");
-                if (command === "shutdown-preserve" || command === "shutdown-purge") {
+                if (command === "shutdown" || command === "shutdown-purge") {
                     const purgeRequested = command === "shutdown-purge";
-                    if (!purgeRequested) await globalManager.preserveOwnedAnvilState(REPO_ROOT);
-                    else globalManager.stopping = true;
+                    if (!purgeRequested) {
+                        await globalManager.stopOwnedAnvilState(REPO_ROOT);
+                        await gracefulDevnetStop(REPO_ROOT);
+                    } else {
+                        globalManager.stopping = true;
+                        await teardownDevnet(REPO_ROOT, true);
+                    }
                     return {
-                        message: purgeRequested ? "shutdown purge accepted" : "Anvil state preserved; supervisor exiting",
+                        message: purgeRequested ? "shutdown purge completed" : "shutdown completed",
                         afterAck: () => queueMicrotask(() => {
                             releaseDevnetLock();
                             void closeControlServer().finally(() => process.exit(0));
@@ -7226,7 +7844,7 @@ Usage: bun run dev/locSetupV4.ts [options]
         console.error("Setup failed:", e);
         try {
             await closeControlServer();
-            if (globalManager) await globalManager.teardown(".", false);
+            if (globalManager) await globalManager.cleanupFailedSetup(".");
         } catch (te) {
             console.error("[DevNet] error during teardown after setup failure:", te);
         }

@@ -2,7 +2,7 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 >
-> Updated: 2026-10-15. Status: Review.
+> Updated: 2026-10-20. Status: Review.
 
 ## Overview
 
@@ -16,31 +16,38 @@ Release publication order stays [circuit-and-verifier-operations.md](circuit-and
 
 ## Bun workspace workflow
 
-`scripts/workspace.ts` provides the automated Git-only workflow below. The later
-shell tutorial also describes optional local dependency edits and builds; the Bun
-commands do **not** perform those edits, install dependencies, or start services.
+`scripts/workspace.ts` is the only workspace command. Cohort gitlink staging is
+`gitlinks sync`. Integration preparation is `prepare-merge`. Dependency reads
+and switches are `deps` subcommands, and SDK version, pack, and publish steps
+are `packages` subcommands. None of these commands build packages or start
+services. `psy-node` in these commands is the cohort repository, not Node.js.
 Run from a workspace root containing the eight sibling repositories:
 
 ```bash
 bun psy-node/scripts/workspace.ts --help
 bun psy-node/scripts/workspace.ts status
 bun psy-node/scripts/workspace.ts create --source . --destination ../feature-demo --branch feature/demo
+bun psy-node/scripts/workspace.ts gitlinks sync --source ../feature-demo
 bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' -- psy-ts-sdk/src/client.ts
 # Alternatively, review the index yourself first, then commit only that index:
 bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' --staged
 # Explicit user-run publication of clean topic branches (optionally --repo NAME):
 bun psy-node/scripts/workspace.ts push --source ../feature-demo
-bun psy-node/scripts/workspace.ts merge --source ../feature-demo --target . --branch feature/demo --integration ../integration-demo
+bun psy-node/scripts/workspace.ts prepare-merge --source ../feature-demo --target . --branch feature/demo --integration ../integration-demo
 # Explicit user-run publication; use a fresh integration directory:
-bun psy-node/scripts/workspace.ts merge --source ../feature-demo --target . --branch feature/demo --integration ../integration-publish --push
+bun psy-node/scripts/workspace.ts prepare-merge --source ../feature-demo --target . --branch feature/demo --integration ../integration-publish --push
 ```
 
-The default base is `mainnet-beta`; the default remote is `origin`. `status` is
-read-only and is the default command. All mutations require an explicit source.
-Creation checks all repositories first and creates real topic branches from
-committed base refs; it never copies dirty files, secrets, ledgers, or local
+The default base is `mainnet-beta`; the default remote is `origin`. `status`,
+`gitlinks sync`, and `deps show` default to the workspace containing this script;
+every other command requires an explicit source. `gitlinks sync` is Git-only and local:
+it does not fetch
+from a remote, does not edit Cargo or npm pins, and does not commit. Creation
+checks all repositories first and creates real topic branches from committed
+base refs; it never copies dirty files, secrets, ledgers, or local
 configuration. Missing repositories use the documented official origin. Recorded
-submodules are initialized, including node's `update = none` DApp gitlink.
+submodules are initialized, including node's `update = none` DApp gitlink. A
+create failure exits nonzero and keeps every directory already created.
 
 `commit` requires exactly one repository, a message, and either literal paths
 after `--` or `--staged`. Explicit paths require an empty index and cannot name
@@ -48,7 +55,7 @@ the repository root. There is no blanket staging. `push` refuses detached HEAD,
 base/main/master branches, dirty trees, and non-fast-forward remote topics. It
 preflights every selected repository before the first push; it never forces.
 
-`merge` requires clean topic worktrees but permits dirty target worktrees because
+`prepare-merge` requires clean topic worktrees but permits dirty target worktrees because
 it **never changes target files, indexes, or local base branches**. It freezes
 each target's local base commit and the actual remote base SHA using `ls-remote`.
 Required remote objects are fetched into immutable
@@ -67,10 +74,13 @@ one of those repositories form cohort edges; external submodules and historical
 Cargo/package pins do not. A gitlink counts as changed only against that merge
 ancestor: a pin the topic kept while the target base advanced is not a topic
 change, and the target pin survives the squash. Unchanged historical gitlinks
-remain unchanged. A changed cohort gitlink must equal its sibling topic HEAD,
-and that child topic must descend from its frozen local base. The parent index
-then records the child's completed integration hash, never its stranded
-pre-squash topic hash. Nested target checkouts are never retargeted.
+remain unchanged, except a pin that still equals the child topic HEAD: the
+squash commit is a new SHA even when the child tree matches the merge ancestor,
+so the parent index records that integration hash instead of the stranded topic
+tip. A changed cohort gitlink must equal its sibling topic HEAD, and that child
+topic must descend from its frozen local base. The parent index then records
+the child's completed integration hash, never its stranded pre-squash topic
+hash. Nested target checkouts are never retargeted.
 
 All squash results are prepared on isolated integration branches before any
 publication. Conflicts stop immediately and retain every created worktree for
@@ -83,12 +93,147 @@ tip again before each ordinary non-force push. Cross-repository publication is
 not atomic: failure can leave earlier dependencies published; the command stops
 and retains all integration branches. No credential URLs are stored in metadata.
 
-After merge, **local `mainnet-beta` remains unchanged**, even after `--push`.
+After prepare-merge, **local `mainnet-beta` remains unchanged**, even after `--push`.
 The command prints an exact `git -C ... -c submodule.recurse=false merge --ff-only
 <integration-sha>` for each repository. Run it yourself only after confirming the
 target is clean and already on the intended base branch. Preserve or explicitly
 commit existing user work first; never reset or discard it to synchronize.
 
+`prepare-merge` also reads `Cargo.toml` from the source tip and the merge ancestor of
+`psy-compiler`, `psy-sdk`, and `psy-services` before it creates the integration
+directory. It uses the node remote base already frozen by that preflight. A
+psy-node `rev` the topic introduces must be that frozen remote base or its
+ancestor. Commits reachable from the source node tip but not from that remote
+base are the commits this squash drops; a retained pin that names one of them
+fails. Unchanged historical pins are printed and left alone, including pins
+whose objects are not in this checkout. A repository with no `Cargo.toml`
+(fixture trees) contributes no pins. A present but malformed manifest fails.
+This check does not edit Cargo files and does not contact the network again.
+
+Cargo and npm publication is a separate two-pass flow through the same
+`scripts/workspace.ts` entrypoint, not something `prepare-merge` performs and not
+something this document claims has been published. `deps use-node-commit` changes
+Cargo pins only. `deps use-npm-version` changes the wallet and dapp SDK and EVM dependency versions only. There is no
+combined pin command.
+
+1. Freeze the node code revision that consumers will name, and get that exact
+   SHA onto the published base history (`deps use-node-commit` only after that SHA exists
+   on the remote base). Do not point Cargo `rev` values at a pre-squash topic
+   tip or an unpublished integration commit. A published integration SHA is valid.
+2. On a separate dependency topic, set explicit SDK versions (`packages set-version`),
+   pack and validate the four tarballs (`packages pack`), then publish those
+   tarballs (`packages publish`). Registry confirmation is required before
+   consumers move. Publish uploads already packed tarballs only. It does not
+   build, commit, stage, or reset.
+3. Switch wallet and dapp SDK and EVM dependencies together (`deps use-npm-version`), then `gitlinks sync`
+   cohort gitlinks and `prepare-merge` them. Nested dapp links must already be inside
+   the dapp commit that node records.
+
+`packages set-version` and `packages pack` require the selected SDK version to
+satisfy EVM wallet's declared SDK peer range. `deps use-npm-version` checks that range
+from published registry metadata before changing manifests or locks; matching
+package versions alone do not establish compatibility. Missing peer metadata
+also stops the switch. The peer gate supports exact `major.minor.patch` and
+caret `^major.minor.patch` ranges, including the current `^2.0.0`; malformed or
+other range syntax is rejected explicitly rather than interpreted permissively.
+
+### Local dependency cutover and return to published dependencies
+
+```bash
+# Read-only dependency report. show may omit --source; check requires it:
+bun psy-node/scripts/workspace.ts deps show --source ../feature-demo
+bun psy-node/scripts/workspace.ts deps check --source ../feature-demo
+# Read-only plan; requires eight siblings on the same topic branch:
+bun psy-node/scripts/workspace.ts deps use-local --source ../feature-demo
+# Rewrite manifests and resolve locks only (network/cache access is possible):
+bun psy-node/scripts/workspace.ts deps use-local --source ../feature-demo --apply
+# --install is rejected unless --apply is also present. It activates consumer
+# node_modules with lifecycle scripts disabled:
+bun psy-node/scripts/workspace.ts deps use-local --source ../feature-demo --apply --install
+# Return Cargo to an explicit revision already reachable from the remote base.
+# This does not change npm consumers:
+bun psy-node/scripts/workspace.ts deps use-node-commit --source ../feature-demo --rev FULL_PUBLISHED_SHA --apply
+# Return npm to an explicit, published, peer-compatible version.
+# This does not change Cargo pins:
+bun psy-node/scripts/workspace.ts deps use-npm-version --source ../feature-demo --version 2.0.8 --apply --install
+# Set four explicit SDK versions, then pack and publish those tarballs only:
+bun psy-node/scripts/workspace.ts packages set-version --source ../feature-demo --version 2.0.8 --apply
+bun psy-node/scripts/workspace.ts packages pack --source ../feature-demo --out ../sdk-packs --version 2.0.8
+bun psy-node/scripts/workspace.ts packages publish --source ../feature-demo --out ../sdk-packs --version 2.0.8 --tag latest
+```
+
+Choose the lock-only or install form, not both sequentially against dirty owned
+files. These operations permit unrelated source dirt, but require their own
+manifests and locks to be tracked and clean before any writes. Review and commit
+each completed switch explicitly before another switch. All eight sibling HEADs,
+branches, and owned-file bytes are rechecked immediately before mutation.
+Nothing is staged, committed, reset, restored, built, or published automatically.
+Failure retains all partial edits and installs for inspection; there is no
+automatic retry over dirty output.
+
+Local Cargo mode rewrites 36 direct declarations in compiler, SDK, and services,
+using `package` rather than dependency alias to locate each concrete node crate.
+It preserves aliases, features and existing patch tables. The virtual node root
+is never used as a crate. Cargo itself updates each lock through `metadata`, then
+`metadata --locked` checks the graph. Remaining remote node packages or wrong
+sibling crate paths fail. `deps use-node-commit` reverses local paths to explicit Git pins
+and rejects mixed local/published graphs; divergent published revisions still
+require `--allow-history-switch`.
+
+Local npm mode changes five consumer manifests: wallet plus DApp account,
+bridge, explorer and IDE. Account changes SDK and EVM wallet together. Source
+package names, declared prebuilt entrypoints and the EVM SDK peer range must be
+valid before any write; the helper never builds missing output. Real pnpm
+updates wallet's lock, DApp's root lock, and account's standalone lock (using
+`--ignore-workspace`). Real Bun updates account's compatibility `bun.lock` with
+`--lockfile-only --ignore-scripts`; parsing uses the available `Bun.JSON5.parse`
+API (Bun 1.3.14 or newer), not text stripping. Bridge's inactive legacy pnpm lock
+is left unchanged with a warning. Published mode checks actual registry
+integrities in all active locks, not just manifest versions.
+
+Only `--apply --install` changes `node_modules`. It invokes scripts-disabled
+pnpm `install --force --frozen-lockfile` at wallet and DApp root, not account's
+standalone compatibility root. Force explicitly requests refresh after an SDK
+build atomically replaces output files. The helper compares installed declared
+entrypoint/provenance bytes and package identity to the sibling, failing if stale.
+An isolated authored-package fixture with pnpm 10.34.5 demonstrated offline
+forced frozen installation refreshing a rename-replaced `dist` directory and a
+new export in all five consumers. Real Cargo, pnpm, and Bun resolvers completed
+the local-to-published round trip; this is not a full SDK/consumer build verification.
+Workspace `link:` records are accepted only when their importer-relative target
+matches the expected sibling. Unknown Bun tuple shapes fail closed.
+After a later SDK rebuild, rerun the explicit install form with clean owned files.
+Pack, publish, push and prepare-merge reject local dependency declarations/locks; return
+to published dependencies and review the resulting commits before publication.
+Cargo publication inspection covers tracked member manifests and locks, not only
+root manifests. A source-less lock package is rejected only when its name belongs
+to a concrete node crate and is not a package declared by that consumer itself;
+ordinary consumer workspace packages and node's own internal paths remain valid.
+
+
+
+`gitlinks sync` is the cohort gitlink command. It reads every sibling, then refuses to
+write until the whole graph is valid. All eight repositories must be on the same
+checked-out topic branch (not the base, not detached, not
+`workspace-integration/...`). A cohort gitlink whose recorded SHA is not an
+ancestor of that sibling's HEAD fails closed, including a pin that has commits
+the sibling does not. External gitlinks such as `lib/forge-std` are not cohort
+edges and are left alone. A pin that already equals the sibling HEAD must also
+match the on-disk nested checkout; an index-only match is not enough. The parent
+repository does not store child commits, so ancestry is compared in the sibling
+repository after a local import of the recorded pin from the nested checkout
+when that object is missing there. Superproject dirt other than the gitlinks
+about to be staged fails the command. A dirty or missing nested checkout fails
+it too: gitlinks sync never discards nested files and never initializes a new checkout.
+Those checks finish before any index write. The recorded-pin import is local
+and does not stage. After that preflight, each sibling HEAD is imported from
+the sibling repository directly into that nested checkout's object database
+(`refs/prefetch/workspace/<sha>`, empty refmap, no fetch head, no remote), the
+superproject index is staged with `update-index --cacheinfo 160000`, then the
+path is checked out with `git submodule update --checkout --no-fetch`.
+`--no-fetch` blocks falling back to the nested origin. `update = none` (node's
+DApp gitlink) is overridden for that one invocation. The index stays staged.
+Commit it yourself with `commit --staged` after review.
 
 ## Table of Contents
 
@@ -271,25 +416,18 @@ Services keys at `psy-services/Cargo.toml:12-25`, plus dev-dependency `psy_clien
 
 SDK keys at `psy-sdk/Cargo.toml:24-33` use the same directories. `package` equals the key except `psy_data` = `psy_client_data` and `psy_common` = `psy_client_common`. `psy_vm`, `psy_data`, `psy_prover`, `psy_common_circuit`, `psy_dpn_circuit`, and `psy_ups_circuit` keep `default-features = false`. SDK has no `psy_network_circuit` pin.
 
-Wallet `package.json:43` is `file:../psy-sdk/psy-ts-sdk/packages/psy-sdk`, one level above `psy-wallet`, so it is `$DESTINATION_ROOT/psy-sdk`. DApp app manifests keep `file:../../../psy-sdk/psy-ts-sdk/packages/psy-sdk` (account also has `evm-wallet` at line 26, bridge line 38, explorer line 21, ide line 17). From `apps/<app>/package.json`, `../../..` is the parent of `psy-dapp`, which is `$DESTINATION_ROOT`, not `psy-dapp/psy-sdk` and not four levels up. The lockfile records that same target as `file:../psy-sdk/...` from the `psy-dapp` workspace root (`psy-dapp/pnpm-lock.yaml:20-24,1284-1285`). Do not rewrite those specifiers. `apps/site` and `apps/wallet` have no `@psy-protocol/*` dependency.
+Local mode computes relative `file:` paths from each consumer manifest to the
+sibling SDK package. Wallet uses `file:../psy-sdk/psy-ts-sdk/packages/psy-sdk`;
+DApp apps use `file:../../../psy-sdk/psy-ts-sdk/packages/psy-sdk`, and account
+also uses the adjacent `evm-wallet` package. These are local-mode values, not
+the published defaults. `apps/site` and `apps/wallet` have no SDK dependency.
 
-Refresh each edited Cargo lock without rewriting unrelated versions. Discard the metadata document:
+Use `workspace.ts deps use-local` above instead of manually updating
+only a subset of locks. `--apply` updates all three Cargo locks and all four
+active npm locks without installing `node_modules`. `--install` requires `--apply`
+and additionally activates the two consumer roots with lifecycle scripts disabled.
 
-```bash
-set -euo pipefail
-for name in psy-compiler psy-services psy-sdk; do
-  cargo metadata --format-version 1 --manifest-path "$DESTINATION_ROOT/$name/Cargo.toml" >/dev/null
-done
-```
-
-For an edited pnpm manifest, refresh only its lockfile:
-
-```bash
-pnpm install --lockfile-only --ignore-scripts --dir "$DESTINATION_ROOT/psy-dapp"
-pnpm install --lockfile-only --ignore-scripts --dir "$DESTINATION_ROOT/psy-wallet"
-```
-
-Commit those manifest and lockfile edits in the owning worktree before Section 7. `psy-compiler/Makefile:270-309` stamps `compilerRevision` from `git rev-parse HEAD`. An uncommitted local-mode edit stamps the wrong source. Do not run `make gen-deploy-json` or `make generate-genesis-data` from this tutorial. Absence of root `genesis.json` is not permission to generate it.
+Commit those manifest and lockfile edits in the owning worktree before Section 7. `make gen-deploy-json` reads the compiler `HEAD` while it writes `.genesis_contracts.compiler-artifact.json`, so an uncommitted compiler edit would not be the recorded revision (`<workspace>/psy-compiler/Makefile:270-309`). Do not run `make gen-deploy-json` or `make generate-genesis-data` from this tutorial. Absence of root `genesis.json` is not permission to generate it.
 
 ## 7. Build
 
@@ -322,7 +460,7 @@ test -f "$DARGO_STD_PATH"
 ( cd "$DESTINATION_ROOT/psy-wallet" && pnpm build:dev )
 ```
 
-`dev/locSetupV4.ts:2190-2213` omits `--frozen-lockfile` unless `.npmrc` contains `lockfile=true`, and lines 3128-3154 retry `pnpm approve-builds --all`. Do not use that path. `psy-wallet/pnpm-workspace.yaml:1-3` does not authorize a registry SDK version in place of the `file:` dependency. Forge uses the Section 4 `lib/forge-std` checkout. `foundry.toml:4-5` sets its lib and test dirs. Do not run `forge install`.
+`dev/locSetupV4.ts:2338` tests whether `.npmrc` contains `lockfile=true`. `dev/locSetupV4.ts:2358` then chooses `--frozen-lockfile` or `--no-frozen-lockfile`. Lines `3403` and `3427` run `pnpm approve-builds`. Do not use that path. `psy-wallet/pnpm-workspace.yaml:1-3` does not authorize a registry SDK version in place of the `file:` dependency. Forge uses the Section 4 `lib/forge-std` checkout. `foundry.toml:4-5` sets its lib and test dirs. Do not run `forge install`.
 
 ## 8. Cleanup
 

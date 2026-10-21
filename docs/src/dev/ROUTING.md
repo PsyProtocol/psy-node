@@ -2,11 +2,11 @@
 
 > Repository-only routing index for `docs/src/dev`. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-10-19. Status: Review.
+> Updated: 2026-10-21. Status: Review.
 
 ## Abstract
 
-Each task below names the document that owns it and the document to read next. Every filename listed here exists under `docs/src/dev`; `AGENTS.md` is the sole exception and sits at the repository root as repository-root policy. `docs/src/dev/reward-claim-operations.md` is the operational reward-claim runbook for the implemented CLI (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:41-53`).
+Each task below names the document that owns it and the document to read next. Every filename listed here exists under `docs/src/dev`; `AGENTS.md` is the sole exception and sits at the repository root as repository-root policy. `docs/src/dev/reward-claim-operations.md` is the operational reward-claim runbook for the implemented CLI (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:50`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:41`).
 
 ## Table of Contents
 
@@ -21,11 +21,11 @@ Each task below names the document that owns it and the document to read next. E
 | Create a wallet, register an account, fund PSY, query state, deploy or call a contract | `common-operations.md` | `devnet_lifecycle.md` |
 | Deposit, claim a deposit, withdraw, or settle through the relayer | `bridge-common-operations.md` | `deposit-withdrawal.md` |
 | Understand the checkpoint reward claim design | `checkpoint-claim-cutover.md` (draft design spec, not a runbook) | `reward-claim-operations.md` |
-| Run the implemented claim-rewards CLI against the deployed contracts (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:41-53`; `psy-contracts/src/PsyToken.sol:67-104`) | `reward-claim-operations.md` | `checkpoint-claim-cutover.md` |
+| Run the implemented claim-rewards CLI against the deployed contracts (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:50`; `client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:41`; `psy-contracts/src/PsyToken.sol:67-104`) | `reward-claim-operations.md` | `checkpoint-claim-cutover.md` |
 | Read reward tree circuit layouts, modes, or offsets | `reward-tree-circuits.md` | `gatherers.md` |
 | Understand gatherer job modes or publication | `gatherers.md` | `processors.md` |
 | Understand coordinator or realm processor pipelines | `processors.md` | `gatherers.md` |
-| Generate or validate EndCap verifier metadata, Plonky2 caches, or the Bridge Groth16 cohorts | `circuit-and-verifier-operations.md` | `AGENTS.md` (repository root; governing release policy, `AGENTS.md:78-101`) |
+| Generate or validate EndCap verifier metadata, Plonky2 caches, or the Bridge Groth16 cohorts | `circuit-and-verifier-operations.md` | `AGENTS.md` (repository root; governing release policy, `AGENTS.md:92-102`) |
 | Start, stop, restart, or purge the local devnet | `devnet_lifecycle.md` | `devnet-launcher-reference.md` |
 | Look up launcher flags, ports, supervision, or Anvil persistence | `devnet-launcher-reference.md` | `devnet_lifecycle.md` |
 | Roll back the local stack | `rollback-operations.md` (five independent RPs) | `devnet_lifecycle.md` |
@@ -48,7 +48,7 @@ Each task below names the document that owns it and the document to read next. E
 | `common-operations.md` | Wallet, registration, funding, queries, contract deployment, calls |
 | `bridge-common-operations.md` | Bridge deposit, claim, withdrawal, settlement procedures |
 | `checkpoint-claim-cutover.md` | Checkpoint reward claim design specification (draft; not the operations runbook) |
-| `reward-claim-operations.md` | Claim-rewards CLI (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:41-53`) and deployed-contract operations (`psy-contracts/src/PsyToken.sol:67-104`) |
+| `reward-claim-operations.md` | Claim-rewards CLI (`client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:50`) and deployed-contract operations (`psy-contracts/src/PsyToken.sol:67-104`) |
 | `reward-tree-circuits.md` | Reward tree circuit layouts, modes, offsets |
 | `gatherers.md` | Gatherer job modes and publication |
 | `processors.md` | Coordinator and realm processor pipelines |
@@ -70,5 +70,5 @@ Each task below names the document that owns it and the document to read next. E
 
 ## Related Documents
 
-- `AGENTS.md` (repository root) governs release policy, repository topology, and when generation is authorized (`AGENTS.md:78-101`); `circuit-and-verifier-operations.md` cites it as the governing reference.
+- `AGENTS.md` (repository root) governs release policy at `AGENTS.md:92-102`; `circuit-and-verifier-operations.md` cites it as the governing reference. Its guardian storage block at `AGENTS.md:74-86` is the current authorization contract: selected-network `guardian_authorization` has the seven fields in `psy_cli/guardian_common/src/protocol.rs:195-209` and carries no L1 code hash (`AGENTS.md:80,84`).
 - `docs/src/dev/reward-claim-operations.md` is referenced here.

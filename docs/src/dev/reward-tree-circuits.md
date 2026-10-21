@@ -138,7 +138,7 @@ child R values ──► tagged node R ──► PI = H(header, R)
 | Two EndCap | 7 `GUTATwoEndCap` | `verify_two_end_cap.rs:119` | `(0, 0)` |
 | Single EndCap | 11 `GUTASingleEndCap` | `verify_single_end_cap.rs:105` | `(0, 0)` |
 
-`R = H(H(0, 0), tag)`. The planner writes `PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN` (`realm_guta_planner.rs:590`).
+`R = H(H(0, 0), tag)`. The planner writes `PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN` at the two-EndCap and single-EndCap job sites (`realm_guta_planner.rs:521,717`).
 
 ### 4.2 Binary GUTA aggregators (mode 0)
 
@@ -161,13 +161,13 @@ R63 = H(H(root_guta.rewards_tree_value, A), worker_tag)
 PI  = H(final_guta_header_hash, R63)
 ```
 
-The planner marks that job `HASH_CHILDREN_STANDARD` with two children and one dependency: the root GUTA job (`realm_guta_planner.rs:1136-1145`). The worker supplies `root_guta.rewards_tree_value` as `c0`; the circuit supplies `A` as `c1`.
+The planner marks that job `HASH_CHILDREN_STANDARD` with two children and one dependency: the root GUTA job (`realm_guta_planner.rs:1056-1064`). The executable reward binding is `finalize_reward_root63`: `H(H(root_guta_reward_tag, A), worker_tag)` (`psy_data/src/guta/realm_finalize.rs:330-348`). Cite that function, not the reversed comments at `consensus.rs:136-137` and `process_block.rs:934`. The worker supplies `root_guta.rewards_tree_value` as `c0`; the circuit supplies `A` as `c1`.
 
 See [RealmFinalizeGUTA BLS Authentication](realm-finalize-bls-auth.md) for the authorization gate around this node.
 
 ### 4.4 Coordinator lift (mode 3)
 
-A coordinator GUTA that wraps one realm job uses `LIFT_CHILD` (`coordinator_guta_planner.rs:475-484`):
+A coordinator GUTA that wraps one realm job uses `LIFT_CHILD` (`coordinator_guta_planner.rs:481-490`):
 
 ```text
 R = H(H(child_R, 0), tag)
@@ -196,7 +196,7 @@ The four children occupy the offsets in section 5.
 
 ### 4.6 Checkpoint state transition (circuit 32, mode 3)
 
-CST does not re-hash the four part-1 children. It lifts the part-1 reward value (`checkpoint_state_transition.rs:515-517`, gadget `checkpoint_state_transition_proofs.rs:90`):
+CST does not re-hash the four part-1 children. It lifts the part-1 reward value (`checkpoint_state_transition.rs:497-499`, gadget `checkpoint_state_transition_proofs.rs:90`):
 
 ```text
 R32 = H(H(R40, 0), tag)
