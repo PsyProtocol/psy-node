@@ -1042,7 +1042,7 @@ async fn run_user_operation(fixture: &Fixture, operation: &str) -> anyhow::Resul
         }
         "withdraw" => {
             let result = psy_user_cli::subcommand::withdraw::run(psy_user_cli::subcommand::args::WithdrawArgs {
-                rpc_config: rpc.display().to_string(), wallet, destination_chain_index: u64::from(fixture.flow.l1.chain_index), token_address: fixture.text("token")?, amount, recipient: fixture.text("recipient")?, nonce: fixture.text("withdrawal_nonce")?, l1_rpc_url: fixture.flow.l1.rpc_url.clone(), contract_id: Some(u64::from(fixture.flow.mapping.l2_contract_id)),
+                rpc_config: rpc.display().to_string(), wallet, destination_chain_index: u64::from(fixture.flow.l1.chain_index), token: if fixture.flow.mapping.l2_contract_id == 4 { "usdt" } else { "psy" }.to_string(), token_address: fixture.text("token")?, amount, recipient: fixture.text("recipient")?, nonce: fixture.text("withdrawal_nonce")?, contract_id: Some(u64::from(fixture.flow.mapping.l2_contract_id)),
             }).await?;
             included_status(result)
         }

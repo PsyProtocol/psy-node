@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::state_reader::StateReaderResults;
 
-pub const MULTISIG_POLICY_CONTRACT_ID: u32 = 1;
+pub use psy_config::MULTISIG_POLICY_CONTRACT_ID;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultisigPolicy {
@@ -80,7 +80,7 @@ impl MultisigAccount {
         let mut fields = [GoldilocksField::ZERO; 8];
         fields[0] = GoldilocksField::from_canonical_u32(0x4d534741);
         fields[1] = GoldilocksField::from_canonical_u32(self.contract_id);
-        fields[3] = GoldilocksField::from_canonical_u8(4);
+        fields[3] = GoldilocksField::from_canonical_u8(psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT);
         fields[4..].copy_from_slice(&initial_commitment.0.elements);
         Ok(QHashOut(PoseidonHash::hash_no_pad(&fields)))
     }
@@ -142,8 +142,8 @@ impl StoredMultisigPolicy {
             anyhow::ensure!(contract == &state.merkel_proofs[0], "multisig UCON proofs disagree");
             anyhow::ensure!(contract.index == MULTISIG_POLICY_CONTRACT_ID as u64 && contract.root == state.state.user_leaf.user_state_tree_root, "multisig UCON anchor mismatch");
             anyhow::ensure!(contract.siblings.len() == psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize, "multisig UCON height mismatch");
-            anyhow::ensure!(slot.index == index as u64 && slot.siblings.len() == 4, "multisig CSTATE location mismatch");
-            let root = if contract.value == QHashOut::ZERO { <PsyHasher as MerkleZeroHasher<QHashOut<GoldilocksField>>>::get_zero_hash(4) } else { contract.value };
+            anyhow::ensure!(slot.index == index as u64 && slot.siblings.len() == psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT as usize, "multisig CSTATE location mismatch");
+            let root = if contract.value == QHashOut::ZERO { <PsyHasher as MerkleZeroHasher<QHashOut<GoldilocksField>>>::get_zero_hash(psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT as usize) } else { contract.value };
             anyhow::ensure!(slot.root == root && state.state.start_contract_state_root == root, "multisig CSTATE anchor mismatch");
             anyhow::ensure!(contract.verify::<PsyHasher>() && slot.verify::<PsyHasher>(), "invalid multisig state proof");
             slots[index] = slot.value;

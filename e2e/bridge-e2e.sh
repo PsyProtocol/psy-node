@@ -377,9 +377,8 @@ l2_withdraw() {
       withdraw \
       --sign-type zk -p "$USER_PK" \
       --rpc-config "$RPC_CONFIG" \
-      --l1-rpc-url "$RPC_URL" \
       --destination-chain-index 0 \
-      --token-address "$USDT" \
+      --token usdt \
       --amount "$WITHDRAW_AMOUNT" \
       --recipient "$USER_ADDR" \
       --nonce "$WITHDRAW_NONCE" 2>&1); then w_ok=1 && break; fi

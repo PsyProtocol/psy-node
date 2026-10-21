@@ -797,8 +797,12 @@ pub struct WithdrawArgs {
     /// chainId)
     #[arg(long = "destination-chain-index", alias = "destination-chain-id", env = "DESTINATION_CHAIN_INDEX")]
     pub destination_chain_index: u64,
-    /// L1 token contract address (20-byte EVM address or 32-byte hex; 20-byte
-    /// inputs are auto-left-padded to bytes32)
+    /// Which bridgeable token to withdraw: psy (contract 0) or usdt
+    /// (contract 4).
+    #[arg(long, env, default_value = "psy")]
+    pub token: String,
+    /// L1 token address (20-byte EVM address or 32-byte hex); the contract
+    /// checks it against the governance mapping for the destination chain.
     #[arg(long, env)]
     pub token_address: String,
     /// Amount to withdraw
@@ -811,11 +815,7 @@ pub struct WithdrawArgs {
     /// User-chosen nonce (bytes32 hex, 256-bit, unique per destination chain)
     #[arg(long, env)]
     pub nonce: String,
-    /// L1 RPC URL (e.g. http://localhost:8545)
-    #[arg(long, env, default_value = "http://127.0.0.1:8545")]
-    pub l1_rpc_url: String,
-    /// Override L2 contract ID to call withdraw on (default: auto-detect from
-    /// Router)
+    /// Override L2 contract ID to call withdraw on (default: from --token)
     #[arg(long, env)]
     pub contract_id: Option<u64>,
 }

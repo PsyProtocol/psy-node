@@ -352,6 +352,7 @@ Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime co
 | `BRIDGE_RELAYER_KEYSTORE_PATH` | unset | L1 keystore alias when `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` is unset. | same |
 | `WALLET_PASSWORD` | Existing prompt/development policy | Decrypts L1 deployment and relayer keystores; not consumed for public Genesis enrollment. | `dev/locSetupV4.ts` (`resolveWalletPassword`, `planGenesisGeneration`) |
 | `PSY_RELAYER_MULTISIG_ACCOUNT` | Required only for actual Genesis generation | Public initial two-of-three account JSON path, forwarded as `--relayer-multisig-account`; relative paths resolve against the repository root. Verified Genesis reuse does not require it. | `dev/locSetupV4.ts` (`planGenesisGeneration`); `Makefile:139-144` |
+| `PSY_GOVERNANCE_MULTISIG_ACCOUNT` | Required only for actual Genesis generation | Public governance two-of-three account JSON path, forwarded as `--governance-multisig-account`; Make defaults it to `$(PSY_DEVNET_DIR)/governance-multisig-account.json`. | `dev/locSetupV4.ts` (`planGenesisGeneration`); `Makefile` |
 | `PSY_MULTISIG_POLICY_ARTIFACT` | Required only for actual Genesis generation | Approved policy compiler artifact JSON path including ABI, forwarded as `--multisig-policy-artifact`; no default or implicit generation. | same |
 | `PSY_SKIP_KEYSTORE`        | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` refreshes remote trust setup; every other value skips refresh but still requires mandatory local files. | `dev/locSetupPolicy.ts:316-318`; `dev/locSetupV4.ts:2670-2706`; `Makefile:17`                                                |
 | `PSY_KEYSTORE_R2_PREFIX` | Required only for exact `PSY_SKIP_KEYSTORE=0`; no default | Public `psy-proving-keystores` R2 prefix, e.g. `localhost-<digest>`: one `[A-Za-z0-9._-]{1,128}` segment, without `..`, slash or whitespace. Anonymous HTTPS curl; no legacy alias. | `dev/locSetupPolicy.ts` (`r2CurlArgs`); `dev/locSetupV4.ts` (`downloadKeystoreObject`) |
@@ -599,7 +600,7 @@ the default. Bare launcher `--teardown` stays non-purge regardless of the Make d
 5. Path deletion requires successful Anvil, Docker, and known-application gates. Success additionally requires absent purge paths, except retained `local_checkpoints/realm_p2p`. Failure exits nonzero and does not start the stack.
 ```
 
-The application gate checks known command patterns plus loopback TCP ports 1337–1346, 3000, 5433, 8080, 8081, 9898, 9998, and 5174–5179. It is not an exhaustive socket census: Realm ports 13380–14679, proxy ports 9999–10008, guardian ports 15441–15443, and history port 15450 are not individually probed by purge. Their normal launcher processes are covered only where they match the known command patterns. Custom listeners or renamed writers are outside this postcondition; success does not certify that every application port is closed.
+The application gate checks known command patterns plus loopback TCP ports 1337–1346, 3000, 5433, 8080, 8081, 9898, 9998, and 5174–5179. It is not an exhaustive socket census: Realm ports 13380–14679, proxy ports 9999–10008, Bridge Guardian ports 15441–15443 and history port 15450, and governance Guardian ports 15541–15543 and history port 15550 are not individually probed by purge. Their normal launcher processes are covered only where they match the known command patterns. Custom listeners or renamed writers are outside this postcondition; success does not certify that every application port is closed.
 
 Non-purge teardown preserves `local_checkpoints`, Anvil snapshots, deployment summaries, logs, Envio volumes, and named infrastructure volumes. It does not fall through into purge after a preservation failure. Purge deletes checkpoint state under `local_checkpoints` except retained `realm_p2p` identities, the complete `db/anvil` directory, logs, localhost, localhostBsc, localhostBase, Sepolia, and Ethereum deployment directories, generated Envio volumes, and named Redis/Scylla/NATS volumes.
 
@@ -1030,6 +1031,10 @@ Commands execute serially and the loop remains available until the server is clo
 `make run-all` enables `PSY_GUARDIAN_AUTO_PREPARE=1` for missing standard localhost
 Guardian configuration. The foreground launcher prepares authorization only after
 actual L1 deployment and validates it against live L2 before starting signers.
+After the Guardian services are ready on a localhost L1/L2 launch, the launcher
+submits missing authorized chain/token mappings through the governance account
+in one UPS before starting the bridge relayer. Retained matching mappings are
+left in place; a conflicting nonzero mapping stops startup.
 Retained configurations still receive startup preflight; this is not an automatic
 reset or Genesis-regeneration option. Restrictions and the executable procedure
 are owned by [devnet lifecycle §3.1](devnet_lifecycle.md#31-fresh-localhost-without-existing-guardian-configuration).

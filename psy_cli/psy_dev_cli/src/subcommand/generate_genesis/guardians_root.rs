@@ -85,6 +85,11 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
         &repo_root,
         &args.relayer_multisig_account,
     )?)?;
+    let governance_account = decode_relayer_multisig_account(&read_public_input(
+        &repo_root,
+        &args.governance_multisig_account,
+    )?)?;
+    ensure!(account.public_key_param()? != governance_account.public_key_param()?, "governance account must differ from bridge account");
     ensure!(account.contract_id == MULTISIG_POLICY_CONTRACT_ID, "public multisig account must name contract 1");
     validate_multisig_policy_artifact(
         &genesis.contracts,
@@ -92,7 +97,12 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
     )?;
     let circuit = MultisigSignatureCircuit::new()?;
     let user = locate_genesis_multisig_user(args, &genesis.users)?;
-    verify_genesis_user_identity(&account, &circuit, user)?;
+    verify_genesis_user_identity(&account, &circuit, user, false)?;
+    let governance_user = genesis.users.get(super::GOVERNANCE_REGISTRATION_ID as usize)
+        .context("governance multisig registration 15 is missing from Genesis")?;
+    ensure!(builder_user_id(super::GOVERNANCE_REGISTRATION_ID) == super::GOVERNANCE_USER_ID,
+        "governance registration does not map to the fixed Strategy5 user ID");
+    verify_genesis_user_identity(&governance_account, &circuit, governance_user, true)?;
 
     // 3. Offline checkpoint 0 through the node-side populated builder.
     validate_compiled_dimensions(args)?;
@@ -122,14 +132,26 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
     let max_fee = args.max_fee.unwrap_or(GUARDIANS_ROOT_MAX_FEE_DEFAULT);
     validate_fee_cap(max_fee)?;
     let proof_bound = approved_endcap_max_proof_bytes()?;
+    ensure!(args.governance_authorization || (args.governance_params.is_none() && args.governance_next_members.is_none()), "governance approvals require --governance-authorization");
+    let approved_withdrawal_params = match &args.governance_params {
+        Some(path) => Some(serde_json::from_slice::<guardian_common::protocol::ApprovedWithdrawalParams>(&read_public_input(&repo_root, path)?)?),
+        None => None,
+    };
+    let approved_next_members = match &args.governance_next_members {
+        Some(path) => Some(serde_json::from_slice::<[guardian_common::protocol::Hash4; 3]>(&read_public_input(&repo_root, path)?)?),
+        None => None,
+    };
     let authorization = build_authorization(
-        &account,
+        if args.governance_authorization { &governance_account } else { &account },
         &circuit,
         &genesis_hash,
+        if args.governance_authorization { super::GOVERNANCE_USER_ID } else { BRIDGE_USER_ID },
         max_fee,
         chains,
         approved_contracts,
         proof_bound,
+        approved_withdrawal_params,
+        approved_next_members,
     )?;
     authorization
         .validate(GUTA_FEE, DA_FEE, proof_bound)
@@ -138,9 +160,9 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
     // 5. One public config: typed network projection plus fixed listeners.
     let network = load_network_projection(&repo_root)?;
     let client = GuardianClientConfig {
-        endpoints: std::array::from_fn(|index| guardian_endpoint(index as u8 + 1)),
+        endpoints: std::array::from_fn(|index| guardian_endpoint_for(index as u8 + 1, args.governance_authorization)),
         archive_path: PathBuf::from(GUARDIANS_ROOT_ARCHIVE_JOURNAL_DIR),
-        listen_address: SocketAddr::from(([127, 0, 0, 1], CLIENT_HISTORY_LISTEN_PORT)),
+        listen_address: SocketAddr::from(([127, 0, 0, 1], CLIENT_HISTORY_LISTEN_PORT + if args.governance_authorization { 100 } else { 0 })),
         l1_endpoints,
     };
     for endpoint in &client.endpoints {
@@ -148,7 +170,7 @@ pub fn run_guardians_root(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> 
     }
     let config = GuardianConfig {
         network,
-        guardians: guardian_signers()?,
+        guardians: guardian_signers_for(args.governance_authorization)?,
         client,
     };
     config
@@ -170,6 +192,9 @@ pub fn reject_publish_branch_flags(args: &GenerateGenesisDataArgs) -> anyhow::Re
         (args.l1_endpoints.is_some(), "--l1-endpoints"),
         (args.approved_contracts.is_some(), "--approved-contracts"),
         (args.max_fee.is_some(), "--max-fee"),
+        (args.governance_authorization, "--governance-authorization"),
+        (args.governance_params.is_some(), "--governance-params"),
+        (args.governance_next_members.is_some(), "--governance-next-members"),
     ] {
         ensure!(!present, "{flag} is only valid together with --guardians-root");
     }
@@ -246,6 +271,7 @@ fn verify_genesis_user_identity(
     account: &MultisigAccount,
     circuit: &MultisigSignatureCircuit,
     user: &PsyCompactUserDefinition<Hash>,
+    governance: bool,
 ) -> anyhow::Result<()> {
     let policy = &account.initial_policy;
     policy
@@ -275,7 +301,7 @@ fn verify_genesis_user_identity(
         .iter()
         .find(|record| record.parent_index == u64::from(account.contract_id))
         .context("genesis user lacks the multisig policy contract record")?;
-    ensure!(record.children.len() == 4, "genesis policy record must hold header plus three members");
+    ensure!(record.children.len() == if governance { 6 } else { 4 }, "genesis policy record has the wrong number of slots");
     for (slot, child) in record.children.iter().enumerate() {
         ensure!(child.index == slot as u64, "genesis policy slot {} is misplaced", slot);
     }
@@ -289,6 +315,12 @@ fn verify_genesis_user_identity(
             "genesis policy member slot {} differs from the supplied account",
             slot + 1
         );
+    }
+    if governance {
+        ensure!(record.children[4].value == Hash::from_values(1, 0, 10_000_000_000_000, 10_000_000_000_000),
+            "genesis governance withdrawal limits differ from the initial policy");
+        ensure!(record.children[5].value == Hash::from_values(10, 10, 0, 0),
+            "genesis governance withdrawal timing differs from the initial policy");
     }
     Ok(())
 }
@@ -380,10 +412,13 @@ fn build_authorization(
     account: &MultisigAccount,
     circuit: &MultisigSignatureCircuit,
     genesis_hash: &Hash256,
+    user_id: u64,
     max_fee: u64,
     chains: Vec<ChainAuthorization>,
     approved_contracts: Vec<ApprovedContract>,
     proof_bound: u32,
+    approved_withdrawal_params: Option<guardian_common::protocol::ApprovedWithdrawalParams>,
+    approved_next_members: Option<[guardian_common::protocol::Hash4; 3]>,
 ) -> anyhow::Result<GuardianAuthorization> {
     let fingerprint = circuit.get_fingerprint();
     let param = account.public_key_param().context("multisig account key parameter")?;
@@ -394,7 +429,7 @@ fn build_authorization(
         version: 1,
         network_magic: psy_config::PSY_NETWORK_MAGIC,
         genesis_hash: Hex(genesis_hash.0),
-        user_id: BRIDGE_USER_ID,
+        user_id,
         account_json: JsonText::from_value(account).map_err(|error| anyhow!("account JSON: {error}"))?,
         account_public_key: ClientHash(PoseidonHash::two_to_one(fingerprint.0, param.0)),
         multisig_fingerprint: ClientHash(fingerprint.0),
@@ -408,6 +443,8 @@ fn build_authorization(
         endcap_verifier_fingerprint,
         approved_contracts,
         chains,
+        approved_withdrawal_params,
+        approved_next_members,
     })
 }
 /// Loads `<repo-root>/psy-genesis/config.json` at the compiled stage, not the
@@ -454,14 +491,24 @@ fn guardian_endpoint(id: u8) -> String {
     format!("http://127.0.0.1:{}/", GUARDIAN_FIRST_LISTEN_PORT + u16::from(id) - 1)
 }
 
+fn guardian_endpoint_for(id: u8, governance: bool) -> String {
+    if governance { format!("http://127.0.0.1:{}/", GUARDIAN_FIRST_LISTEN_PORT + 100 + u16::from(id) - 1) }
+    else { guardian_endpoint(id) }
+}
+
 fn guardian_signers() -> anyhow::Result<BTreeMap<u8, GuardianSignerConfig>> {
+    guardian_signers_for(false)
+}
+
+fn guardian_signers_for(governance: bool) -> anyhow::Result<BTreeMap<u8, GuardianSignerConfig>> {
     let mut guardians = BTreeMap::new();
     for id in 1..=3u8 {
-        let (signing_key_secret_path, signing_key_password_secret_path) = keystore_secret_paths(id)?;
+        let key_id = if governance { id % 3 + 1 } else { id };
+        let (signing_key_secret_path, signing_key_password_secret_path) = keystore_secret_paths(key_id)?;
         guardians.insert(
             id,
             GuardianSignerConfig {
-                listen_address: guardian_listen_address(id),
+                listen_address: SocketAddr::from(([127, 0, 0, 1], guardian_listen_address(id).port() + if governance { 100 } else { 0 })),
                 signing_key_secret_path,
                 signing_key_password_secret_path,
             },
@@ -772,11 +819,13 @@ mod tests {
     use clap::Parser;
     use parth_core::crypto::hash::traits::ZeroableHash;
     use psy_data::v1::qdata::public_key::PZKPublicKeyInfo;
+    use psy_vm::ups::multisig::MultisigPolicy;
 
     fn guardians_root_args() -> GenerateGenesisDataArgs {
         GenerateGenesisDataArgs::try_parse_from([
             "generate-genesis-data",
             "--relayer-multisig-account", "account.json",
+            "--governance-multisig-account", "governance.json",
             "--multisig-policy-artifact", "policy.json",
             "--guardians-root", "/tmp/guardians",
             "--chains", "chains.json",
@@ -798,6 +847,26 @@ mod tests {
             event_index: 0,
             constract_state_tree_records: vec![],
         }
+    }
+
+    #[test]
+    fn genesis_multisig_policy_slots_match_account_role() {
+        let mut member_hashes = [ClientHash::ZERO; 8];
+        for (index, member) in member_hashes[..3].iter_mut().enumerate() {
+            *member = ClientHash::from_values(index as u64 + 1, 0, 0, 0);
+        }
+        let account = MultisigAccount {
+            contract_id: MULTISIG_POLICY_CONTRACT_ID,
+            initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes },
+        };
+        let circuit = MultisigSignatureCircuit::new().expect("multisig circuit");
+        let bridge = super::super::initialized_multisig_user(&account, &circuit, 100, false).expect("bridge user");
+        let mut governance = super::super::initialized_multisig_user(&account, &circuit, 100, true).expect("governance user");
+        verify_genesis_user_identity(&account, &circuit, &bridge, false).expect("bridge slots");
+        verify_genesis_user_identity(&account, &circuit, &governance, true).expect("governance slots");
+        assert!(verify_genesis_user_identity(&account, &circuit, &governance, false).is_err());
+        governance.constract_state_tree_records[1].children[4].value = Hash::from_values(0, 0, 0, 0);
+        assert!(verify_genesis_user_identity(&account, &circuit, &governance, true).is_err());
     }
 
     #[test]

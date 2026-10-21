@@ -2,6 +2,7 @@ use std::{path::{Path, PathBuf}, str::FromStr};
 
 use anyhow::{Context, ensure};
 use clap::Parser;
+use guardian_common::protocol::GOVERNANCE_USER_ID;
 use parth_core::{
     crypto::hash::traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash},
     data::hash::merkle_node_nest::{MerkleLeafNode, MerkleNodeNest},
@@ -43,6 +44,7 @@ type Hash = QHashOut<F>;
 const DEFAULT_SD_KEY_FINGERPRINT: &str = "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
 const GUARDIANS_ROOT_MAX_FEE_DEFAULT: u64 = 2_000_000_000;
+const GOVERNANCE_REGISTRATION_ID: u64 = 15;
 
 pub fn check_guardian_genesis(config: &Path, genesis_data: &Path) -> anyhow::Result<()> {
     let archive = guardian_common::runtime::load_authorization_archive(config, guardian_common::endcap::approved_endcap_max_proof_bytes()?)?;
@@ -93,6 +95,10 @@ pub struct GenerateGenesisDataArgs {
     /// Public initial two-of-three account JSON; never a signer secret.
     #[arg(long = "relayer-multisig-account")]
     pub relayer_multisig_account: PathBuf,
+
+    /// Public two-of-three governance account JSON with a distinct account public key.
+    #[arg(long = "governance-multisig-account")]
+    pub governance_multisig_account: PathBuf,
 
     /// Approved local compiler multisig_policy artifact, including its ABI.
     #[arg(long = "multisig-policy-artifact")]
@@ -173,6 +179,18 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "guardians-root")]
     pub guardians_root: Option<PathBuf>,
 
+    /// Generate a separate Guardian authorization and listener set for the governance account.
+    #[arg(long = "governance-authorization", default_value_t = false)]
+    pub governance_authorization: bool,
+
+    /// Exact withdrawal parameters that this governance authorization may sign.
+    #[arg(long = "governance-params")]
+    pub governance_params: Option<PathBuf>,
+
+    /// Exact three new member hashes that this governance authorization may rotate to.
+    #[arg(long = "governance-next-members")]
+    pub governance_next_members: Option<PathBuf>,
+
     /// --guardians-root input: authorized chains JSON array. Required with --guardians-root.
     #[arg(long = "chains")]
     pub chains: Option<PathBuf>,
@@ -247,6 +265,7 @@ fn initialized_multisig_user(
     account: &MultisigAccount,
     circuit: &MultisigSignatureCircuit,
     initial_fee_balance: u64,
+    governance: bool,
 ) -> anyhow::Result<PsyCompactUserDefinition<Hash>> {
     ensure!(initial_fee_balance > 0 && initial_fee_balance < F::ORDER, "initial fee balance must be nonzero and canonical");
     let public_key_info = PZKPublicKeyInfo {
@@ -257,6 +276,15 @@ fn initialized_multisig_user(
     policy_slots.extend(account.initial_policy.member_hashes[..3].iter().enumerate().map(|(index, member)| {
         MerkleLeafNode { index: index as u64 + 1, value: QHashOut(member.0) }
     }));
+    // The first four leaves remain dedicated to multisig signing. Governance
+    // fields begin at felt 16; L1 token mappings remain empty until an
+    // authorized multisig call enables the deployed chain/token pairs.
+    if governance {
+        policy_slots.extend([
+            MerkleLeafNode { index: 4, value: QHashOut::from_values(1, 0, 10_000_000_000_000, 10_000_000_000_000) },
+            MerkleLeafNode { index: 5, value: QHashOut::from_values(10, 10, 0, 0) },
+        ]);
+    }
     Ok(PsyCompactUserDefinition {
         public_key_info, balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0,
         constract_state_tree_records: vec![
@@ -281,15 +309,16 @@ fn validate_multisig_policy_artifact(
         abi: serde_json::Value,
     }
     let artifact: PolicyArtifact = serde_json::from_slice(bytes).context("invalid multisig policy compiler artifact")?;
-    ensure!(artifact.state_tree_height == 4, "multisig policy artifact must declare height 4");
-    ensure!(artifact.circuit_definitions.len() == 2
-        && ["get_policy", "set_policy"].iter().all(|name| artifact.circuit_definitions.iter().filter(|definition| definition.name == *name).count() == 1),
-        "multisig policy artifact requires exactly get_policy and set_policy");
-    ensure!(artifact.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64) == Some(4),
-        "multisig policy ABI must declare height 4");
+    ensure!(artifact.state_tree_height == u16::from(psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT), "multisig policy artifact tree height mismatch");
+    const METHODS: [&str; 6] = ["get_policy", "set_policy", "get_params", "set_params", "get_chain_mapping", "set_chain_mapping"];
+    ensure!(artifact.circuit_definitions.len() == METHODS.len()
+        && METHODS.iter().all(|name| artifact.circuit_definitions.iter().filter(|definition| definition.name == *name).count() == 1),
+        "multisig policy artifact methods differ from the approved governance interface");
+    ensure!(artifact.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64) == Some(u64::from(psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT)),
+        "multisig policy ABI tree height mismatch");
     let methods = artifact.abi.pointer("/contract/methods").and_then(serde_json::Value::as_array)
         .context("multisig policy ABI methods are missing")?;
-    ensure!(methods.len() == 2, "multisig policy ABI must declare two methods");
+    ensure!(methods.len() == METHODS.len(), "multisig policy ABI method count mismatch");
     for definition in &artifact.circuit_definitions {
         let mut matches = methods.iter().filter(|method| method["name"].as_str() == Some(definition.name.as_str()));
         let method = matches.next().context("multisig policy ABI method is missing")?;
@@ -302,9 +331,9 @@ fn validate_multisig_policy_artifact(
     }
     validate_policy_abi_slots(&artifact.abi)?;
     let contract = contracts.get(MULTISIG_POLICY_CONTRACT_ID as usize).context("Genesis contracts must contain multisig policy contract 1")?;
-    ensure!(contract.code_definition.state_tree_height == 4, "Genesis policy contract must declare height 4");
+    ensure!(contract.code_definition.state_tree_height == u16::from(psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT), "Genesis policy contract tree height mismatch");
     let (_, expected) = psy_prover::session::gen_contract_deploy_and_circuits_for_functions::<C, D>(
-        contract.deployer, 4, &artifact.circuit_definitions,
+        contract.deployer, psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT, &artifact.circuit_definitions,
     )?;
     let expected: PQBCDeployContract<Hash> = serde_json::from_value(serde_json::to_value(expected)?)?;
     ensure!(contract == &expected, "Genesis policy code/functions differ from approved compiler artifact");
@@ -317,12 +346,29 @@ fn validate_policy_abi_slots(abi: &serde_json::Value) -> anyhow::Result<()> {
         .context("multisig policy ABI state is missing")?;
     let hash_type = serde_json::json!({"kind":"primitive","name":"Hash"});
     let members_type = serde_json::json!({"kind":"array","item":hash_type,"length":3,"item_felt_size":4});
-    ensure!(fields.len() == 2 && fields[0]["name"].as_str() == Some("header")
+    ensure!(fields.len() == 15 && fields[0]["name"].as_str() == Some("header")
         && fields[0]["offset"].as_u64() == Some(0) && fields[0]["felt_size"].as_u64() == Some(4)
         && fields[0]["type"] == hash_type
         && fields[1]["name"].as_str() == Some("members") && fields[1]["offset"].as_u64() == Some(4)
         && fields[1]["felt_size"].as_u64() == Some(12) && fields[1]["type"] == members_type,
         "multisig policy ABI must expose header and three members at slots 0 through 3");
+    let names = ["version", "paused", "psy_per_tx_limit", "usdt_per_tx_limit", "cooldown_checkpoints", "loosen_delay_checkpoints", "pending_paused", "pending_psy_limit", "pending_usdt_limit", "pending_cooldown", "effective_checkpoint"];
+    let felt_type = serde_json::json!({"kind":"primitive","name":"Felt"});
+    for (index, name) in names.iter().enumerate() {
+        let field = &fields[index + 2];
+        ensure!(field["name"].as_str() == Some(*name)
+            && field["offset"].as_u64() == Some(index as u64 + 16)
+            && field["felt_size"].as_u64() == Some(1)
+            && field["type"] == felt_type, "multisig governance ABI field {name} is misplaced");
+    }
+    let address_type = serde_json::json!({"kind":"array","item":{"kind":"array","item":{"kind":"primitive","name":"U32"},"length":8,"item_felt_size":1},"length":256,"item_felt_size":8});
+    for (index, name, offset) in [(13, "psy_l1_addresses", 27), (14, "usdt_l1_addresses", 2075)] {
+        let field = &fields[index];
+        ensure!(field["name"].as_str() == Some(name)
+            && field["offset"].as_u64() == Some(offset)
+            && field["felt_size"].as_u64() == Some(2048)
+            && field["type"] == address_type, "multisig governance ABI mapping {name} is misplaced");
+    }
     Ok(())
 }
 
@@ -446,6 +492,7 @@ fn compact_user(
 fn genesis_users(
     args: &GenerateGenesisDataArgs,
     relayer: PsyCompactUserDefinition<Hash>,
+    governance: PsyCompactUserDefinition<Hash>,
 ) -> anyhow::Result<(Vec<PsyCompactUserDefinition<Hash>>, Vec<Option<Hash>>)> {
     let validator_slots = parse_validator_slots(&args.validator_slots)?;
     let zk_fingerprint = zk_fingerprint(args)?;
@@ -454,6 +501,8 @@ fn genesis_users(
         "public multisig Genesis requires registration 2 and user 524288");
     ensure!(args.coordinator_global_user_tree_height == 12 && args.realm_global_user_tree_height == 20 && args.group_realm_height == 1,
         "public multisig Genesis requires local-devnet Strategy5 tree heights");
+    ensure!(args.faucet_operator_count == 10 && user_id_for(args, GOVERNANCE_REGISTRATION_ID) == GOVERNANCE_USER_ID,
+        "governance registration 15 requires ten faucet operators and Strategy5 user 1966080");
     ensure!(validator_slots.len() >= 2, "dense registration 2 requires preceding validator registrations");
     let mut relayer = Some(relayer);
     let special_zk_user_count = validator_slots.len() + 1;
@@ -508,6 +557,9 @@ fn genesis_users(
         private_keys.push(Some(private_key));
         users.push(compact_user(sd_key_fingerprint, private_key, args.initial_fee_balance));
     }
+    ensure!(users.len() as u64 == GOVERNANCE_REGISTRATION_ID, "governance registration must follow faucet accounts");
+    users.push(governance);
+    private_keys.push(None);
     Ok((users, private_keys))
 }
 
@@ -516,6 +568,8 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
         format!("repo-root {} does not exist", args.repo_root.display())
     })?;
     let account = decode_relayer_multisig_account(&read_public_input(&repo_root, &args.relayer_multisig_account)?)?;
+    let governance_account = decode_relayer_multisig_account(&read_public_input(&repo_root, &args.governance_multisig_account)?)?;
+    ensure!(account.public_key_param()? != governance_account.public_key_param()?, "governance and relayer multisig accounts must have distinct public keys");
     let contracts_path = args.genesis_contracts.clone().unwrap_or_else(|| {
         repo_root.join("psy-genesis/genesis_contracts.json")
     });
@@ -523,9 +577,10 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
     validate_multisig_policy_artifact(&contracts, &read_public_input(&repo_root, &args.multisig_policy_artifact)?)?;
     let multisig_circuit = MultisigSignatureCircuit::new()?;
-    let relayer = initialized_multisig_user(&account, &multisig_circuit, args.initial_fee_balance)?;
-    let (users, private_keys) = genesis_users(args, relayer)?;
-    let special_zk_user_count = users.len() - args.faucet_operator_count;
+    let relayer = initialized_multisig_user(&account, &multisig_circuit, args.initial_fee_balance, false)?;
+    let governance = initialized_multisig_user(&governance_account, &multisig_circuit, args.initial_fee_balance, true)?;
+    let (users, private_keys) = genesis_users(args, relayer, governance)?;
+    let special_zk_user_count = parse_validator_slots(&args.validator_slots)?.len() + 1;
 
     let genesis_data = PsyGenesisBlockSetupData {
         contracts,
@@ -755,19 +810,22 @@ mod tests {
 
     #[test]
     fn dense_export_keeps_validator_and_faucet_indices_without_relayer_secret() {
-        let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "policy.json"]).unwrap();
+        let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--relayer-multisig-account", "account.json", "--governance-multisig-account", "governance.json", "--multisig-policy-artifact", "policy.json"]).unwrap();
+        assert_eq!(user_id_for(&args, GOVERNANCE_REGISTRATION_ID), GOVERNANCE_USER_ID);
         let account = account_fixture();
         let relayer = PsyCompactUserDefinition {
             public_key_info: PZKPublicKeyInfo { fingerprint: Hash::get_zero_value(), public_key_param: QHashOut(account.public_key_param().unwrap().0) },
             balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0, constract_state_tree_records: vec![],
         };
-        let (users, keys) = genesis_users(&args, relayer).unwrap();
+        let governance = relayer.clone();
+        let (users, keys) = genesis_users(&args, relayer, governance).unwrap();
         assert_eq!(keys.len(), users.len());
-        assert_eq!(keys.len(), 15);
+        assert_eq!(keys.len(), 16);
         assert!(keys[2].is_none());
+        assert!(keys[15].is_none());
         let exported = serde_json::to_value(&keys).unwrap();
         assert!(exported[2].is_null());
-        for registration in (0..keys.len()).filter(|index| *index != 2) {
+        for registration in (0..keys.len()).filter(|index| *index != 2 && *index != 15) {
             let key = keys[registration].expect("validator/faucet key must remain at its registration");
             assert_eq!(key, deterministic_private_key(registration as u64));
             assert_eq!(users[registration].public_key_info.public_key_param, get_public_key_param::<F, PoseidonHash>(key));
@@ -796,9 +854,9 @@ mod tests {
         }).collect();
         let mut account = account_fixture();
         for (member, key) in account.initial_policy.member_hashes[..3].iter_mut().zip(&keys) { *member = key.0; }
-        let user = initialized_multisig_user(&account, &circuit, 100).unwrap();
-        assert!(initialized_multisig_user(&account, &circuit, 0).is_err());
-        assert!(initialized_multisig_user(&account, &circuit, F::ORDER).is_err());
+        let user = initialized_multisig_user(&account, &circuit, 100, true).unwrap();
+        assert!(initialized_multisig_user(&account, &circuit, 0, true).is_err());
+        assert!(initialized_multisig_user(&account, &circuit, F::ORDER, true).is_err());
         let contracts_path = std::env::var_os("PSY_GENESIS_CONTRACTS").expect("QA must supply approved Genesis contracts");
         let artifact_path = std::env::var_os("PSY_MULTISIG_POLICY_ARTIFACT").expect("QA must supply approved multisig compiler artifact");
         let contracts = load_contracts(Path::new(&contracts_path)).unwrap();
@@ -951,7 +1009,7 @@ mod tests {
     #[test]
     fn cli_requires_both_public_inputs_and_rejects_secret_flags() {
         assert!(GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).is_err());
-        let public_args = ["generate-genesis-data", "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "policy.json"];
+        let public_args = ["generate-genesis-data", "--relayer-multisig-account", "account.json", "--governance-multisig-account", "governance.json", "--multisig-policy-artifact", "policy.json"];
         assert!(GenerateGenesisDataArgs::try_parse_from(public_args).is_ok());
         for flag in ["--private-key", "--bridge-relayer-l2-private-key", "--keystore-path", "--psy-bridge-relayer-keystore-path", "--bridge-relayer-keystore-path", "--wallet-password"] {
             let mut args = public_args.to_vec();
@@ -978,7 +1036,7 @@ mod tests {
         let args = GenerateGenesisDataArgs::try_parse_from([
             "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
             "--genesis-contracts", root.join("contracts.json").to_str().unwrap(),
-            "--relayer-multisig-account", "account.json", "--multisig-policy-artifact", "absent.json",
+            "--relayer-multisig-account", "account.json", "--governance-multisig-account", "governance.json", "--multisig-policy-artifact", "absent.json",
         ]).unwrap();
         assert!(generate_local_devnet_genesis(&args).is_err());
         assert!(!root.join("genesis.json").exists());

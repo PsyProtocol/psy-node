@@ -520,4 +520,28 @@ fn canonical_abi_manifest_matches_genesis_contracts() {
     );
     assert_manifest_precompile(4, "usdt", "USDTTokenContract.json", "USDTTokenContract", "usdt_token");
     assert_manifest_precompile(5, "faucet", "PsyFaucetContract.json", "PsyFaucetContract", "faucet");
+    assert_eq!(read_json(&abi_manifest_path())["precompiles"].as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn token_withdraw_requires_token_address_input() {
+    for name in ["PsyTokenContract", "USDTTokenContract"] {
+        let abi_path = genesis_root().join("genesis_abi").join(format!("{name}.json"));
+        let abi = read_json(&abi_path);
+        let withdraw = abi["contract"]["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|method| method["name"].as_str() == Some("withdraw"))
+            .unwrap();
+        // The contract checks the supplied L1 token against its governance mapping.
+        assert_eq!(withdraw["input_felt_count"].as_u64(), Some(33), "{name} withdraw must take 33 felts");
+        let input_names: Vec<&str> = withdraw["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|input| input["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(input_names, ["destination_chain_index", "token_address", "amount", "recipient", "nonce"]);
+    }
 }

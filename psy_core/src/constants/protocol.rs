@@ -79,7 +79,6 @@ pub const DEFAULT_USER_STATE_TREE_ROOT_U64: [u64; 4] = [
     7329967984378645716,
     6310665049578686403,
 ];
-pub const TOKEN_CONTRACT_ID: u32 = 0;
 // Burn method_id after the legacy prefix removal (name-derived id of "burn").
 pub const TOKEN_BURN_METHOD_ID: u32 = 3998182541;
 

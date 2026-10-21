@@ -19,7 +19,7 @@ export function buildGuardianDaemonConfig(guardianPath: string, config: { client
     return `guardian_config = ${quote(path.resolve(guardianPath))}
 rpc_config = ${quote(path.join(repoRoot, "psy-genesis", "config.json"))}
 services_url = "http://127.0.0.1:3000"
-withdraw_method_id = 4159421846
+withdraw_method_id = 3055054724
 proof_dir = ${quote(path.join(repoRoot, "local_checkpoints", "bridge_proposer"))}
 poll_interval_secs = 15
 confirmation_lag_checkpoints = 3

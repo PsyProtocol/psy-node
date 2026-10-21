@@ -58,7 +58,7 @@ use super::{args::DepositArgs, note_proof_common::qhash_to_u64x4};
 use crate::result::{CommandResult, L1TransactionResult, L1TransactionStatus};
 
 const BRIDGE_USER_ID_U64: u64 = 524288;
-const DEPOSIT_TREE_CONTRACT_ID: u32 = 2;
+use psy_config::DEPOSIT_TREE_CONTRACT_ID;
 const DEPOSIT_TREE_CHAIN_COUNTS_SUBSLOT_BASE: u64 = 8 + (8192 * 8);
 
 fn resolve_shield_address(args: &DepositArgs) -> anyhow::Result<String> {

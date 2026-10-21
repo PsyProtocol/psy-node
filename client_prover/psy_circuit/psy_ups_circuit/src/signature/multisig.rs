@@ -186,8 +186,8 @@ impl MultisigSignatureCircuit {
         let nonce = builder.add_virtual_target();
         let sighash = compute_sig_hash(&mut builder, &sig_data, &sign_context, &start_user_leaf, nonce);
         let contract_id = builder.constant(F::from_canonical_u32(MULTISIG_POLICY_CONTRACT_ID));
-        let mut start_reader = StateReaderGadget::new(&mut builder, 4);
-        let mut end_reader = StateReaderGadget::new(&mut builder, 4);
+        let mut start_reader = StateReaderGadget::new(&mut builder, psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT);
+        let mut end_reader = StateReaderGadget::new(&mut builder, psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT);
         for (reader, leaf) in [(&mut start_reader, start_user_leaf), (&mut end_reader, sign_context.user_leaf)] {
             reader.state.user_leaf.connect_to_other(&mut builder, leaf);
             builder.connect(reader.state.contract_id, contract_id);
@@ -218,7 +218,7 @@ impl MultisigSignatureCircuit {
         constrain_policy_transition(&mut builder, &initial, &current, &ending, start_slots, end_slots, &start_user_leaf);
         let domain = builder.constant(F::from_canonical_u32(0x4d534741));
         let zero = builder.zero();
-        let height = builder.constant(F::from_canonical_u8(4));
+        let height = builder.constant(F::from_canonical_u8(psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT));
         let param = builder.hash_n_to_hash_no_pad::<PoseidonHash>([vec![domain, contract_id, zero, height], initial.commitment.elements.to_vec()].concat());
         let pi = builder.hash_two_to_one::<PoseidonHash>(sighash, param);
         builder.register_public_inputs(&pi.elements);
@@ -556,14 +556,14 @@ mod tests {
             event_index: F::ZERO, user_id: F::from_canonical_u64(9),
         };
         let state = |slots: [QHashOut<F>; 4], uninitialized: bool| {
-            let mut leaves = vec![QHashOut::ZERO; 16];
+            let mut leaves = vec![QHashOut::ZERO; 1 << psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT];
             leaves[..4].copy_from_slice(&slots);
             let mut levels = vec![leaves];
-            for height in 0..4 {
+            for height in 0..psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT as usize {
                 let parents = levels[height].chunks_exact(2).map(|pair| QHashOut(PoseidonHash::two_to_one(pair[0].0, pair[1].0))).collect();
                 levels.push(parents);
             }
-            let slot_root = levels[4][0];
+            let slot_root = levels[psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT as usize][0];
             let contract_siblings: Vec<_> = (0..psy_config::network_constants::GLOBAL_CONTRACT_TREE_HEIGHT as usize).map(|height| QHashOut(<PoseidonHash as MerkleZeroHasher<HashOut<F>>>::get_zero_hash(height))).collect();
             let contract_value = if uninitialized { QHashOut::ZERO } else { slot_root };
             let contract_proof = MerkleProofCore::new_from_params::<PsyHasher>(MULTISIG_POLICY_CONTRACT_ID as u64, contract_value, contract_siblings);
@@ -572,7 +572,7 @@ mod tests {
             user_leaf.user_state_tree_root = user_root;
             let mut proofs = Vec::new();
             for i in 0..4 {
-                let siblings = (0..4).map(|height| levels[height][(i >> height) ^ 1]).collect();
+                let siblings = (0..psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT as usize).map(|height| levels[height][(i >> height) ^ 1]).collect();
                 proofs.push(contract_proof.clone());
                 proofs.push(MerkleProofCore::new_from_params::<PsyHasher>(i as u64, slots[i], siblings));
             }

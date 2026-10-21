@@ -43,7 +43,8 @@ network config -------------> build-time constants and runtime membership valida
 - [1. Root `genesis.json`](#1-root-genesisjson)
   - [1.1 Trigger](#11-trigger)
   - [1.2 Command](#12-command)
-  - [1.2.1 Public bridge multisig account](#121-public-bridge-multisig-account)
+  - [1.2.1 Governance multisig account (registration 15)](#121-governance-multisig-account-registration-15)
+  - [1.2.2 Public multisig accounts](#122-public-multisig-accounts)
   - [1.3 Outputs](#13-outputs)
   - [1.4 Verification](#14-verification)
 - [2. `psy-genesis/` Repository Artifacts](#2-psy-genesis-repository-artifacts)
@@ -71,10 +72,11 @@ EndCap metadata, GUTA, cache, verifier JSON, fingerprint, and ordinary witness c
 
 ### 1.2 Command
 
-When generation is authorized, supply both required public input files:
+When generation is authorized, supply both public multisig accounts and the approved policy artifact:
 
 ```bash
 PSY_RELAYER_MULTISIG_ACCOUNT='<public-multisig-account-json>' \
+PSY_GOVERNANCE_MULTISIG_ACCOUNT='<public-governance-account-json>' \
 PSY_MULTISIG_POLICY_ARTIFACT='<approved-policy-compiler-artifact-json>' \
 make generate-genesis-data
 ```
@@ -85,43 +87,49 @@ The equivalent command from the repository root is:
 ./target/release/psy_dev_cli generate-genesis-data \
   --repo-root . \
   --relayer-multisig-account '<public-multisig-account-json>' \
+  --governance-multisig-account '<public-governance-account-json>' \
   --multisig-policy-artifact '<approved-policy-compiler-artifact-json>'
 ```
 
-Both flags are required and have no default. Relative input paths resolve against `--repo-root`. The Make target passes the public paths and strips secret-bearing legacy enrollment variables from the generator child environment; it does not change L1 custody in the parent process. The launcher requires these inputs only when it actually generates Genesis, not when reusing a verified existing snapshot. Sources: `Makefile:139-144`; `dev/locSetupV4.ts` (`planGenesisGeneration`); `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`. The `--guardians-root` branch of the same command is documented in §4.
+The CLI requires all three input paths; Make defaults the governance account path to `$(PSY_DEVNET_DIR)/governance-multisig-account.json`. Relative input paths resolve against `--repo-root`. The Make target passes the public paths and strips secret-bearing legacy enrollment variables from the generator child environment; it does not change L1 custody in the parent process. The launcher requires these inputs only when it actually generates Genesis, not when reusing a verified existing snapshot. Sources: `Makefile`; `dev/locSetupV4.ts` (`planGenesisGeneration`); `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`. The `--guardians-root` branch of the same command is documented in §4.
 
-### 1.2.1 Public bridge multisig account
+### 1.2.1 Governance multisig account (registration 15)
+
+Genesis initializes a separate two-of-three governance multisig account at dense registration 15 (Strategy5 user ID `1966080`). Its public account must differ from the bridge relayer account. Contract 1 (`multisig_policy`) contains the initial member policy in state leaves 0–3. Leaf 4 contains `[version, paused, psy_per_tx_limit, usdt_per_tx_limit] = [1, 0, 10_000_000_000_000, 10_000_000_000_000]`; leaf 5 contains `[cooldown_checkpoints, loosen_delay_checkpoints, pending_paused, pending_psy_limit] = [10, 10, 0, 0]`. Remaining pending fields and the effective checkpoint start at zero. These are Genesis state values, not a `set_params` transaction. Sources: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs` and `generate_genesis/guardians_root.rs`.
+
+Per-chain L1 token mappings start empty because L1 deployments do not yet exist when Genesis is generated. On localhost startup, after L1 deployment and Guardian readiness, `psy_relayer_cli guardian-set-chain-mappings` submits all missing authorized chain/token mappings in one governance UPS. It checks existing mappings before submission and rejects a conflicting nonzero mapping. If an earlier mapping request is pending, it resumes that request before batching the remaining mappings. Later parameter changes use `psy_relayer_cli guardian-set-params`, which submits a governance multisig call to `multisig_policy.set_params`; the Guardian authorization must approve the exact values. Tightening changes apply immediately, while loosening changes become effective after the stored `loosen_delay_checkpoints` period. Do not regenerate an existing chain merely to change its live parameters.
+
+### 1.2.2 Public multisig accounts
 
 For local development, prepare missing signing keys and the public account with:
 
 ```bash
 make prepare-guardian-account
-# Copy the matching compiler's policy artifact into the stable input directory:
+# Reconstruct the policy artifact from the current Genesis and psy-genesis ABI:
 make prepare-multisig-policy-artifact
 ```
 
 This builds the release operator binaries, creates missing encrypted
 `~/.psy/keystore/guardian-{1,2,3}.keystore.json` files and random password files,
-then derives a contract-1 two-of-three public account from the three compressed
+then derives two distinct contract-1 two-of-three public accounts from the three compressed
 public keys. Key and password files have mode `0600`; secret bytes are not
 printed. Repeated execution decrypts and validates existing custody and reuses
-the account without rewriting it. A key without its password or an existing
+the accounts without rewriting them. A key without its password or an existing
 account whose members differ fails closed. Restore missing custody rather than
 using this command to rotate an existing chain account.
 
-The account defaults to `$(PSY_DEVNET_DIR)/relayer-multisig-account.json`, where
+The bridge and governance accounts default to `$(PSY_DEVNET_DIR)/relayer-multisig-account.json` and `$(PSY_DEVNET_DIR)/governance-multisig-account.json`, respectively, where
 `PSY_DEVNET_DIR` defaults to `~/.psy/devnet/local`. An absent `.env` is supported;
-Make owns these defaults. `PSY_RELAYER_MULTISIG_ACCOUNT` overrides only the
-public output path. Guardian key paths remain the standard custody paths.
+Make owns these defaults. `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_GOVERNANCE_MULTISIG_ACCOUNT` override their respective public paths. Guardian key paths remain the standard custody paths.
 This command does not register an account on an existing chain or regenerate
-Genesis. A fresh chain must explicitly use the resulting public account as
+Genesis. A fresh chain must explicitly use both resulting public accounts as
 its `make generate-genesis-data` input under the Genesis trigger boundary.
 
-Registration 2 (`user_id` 524288) is a public-only two-of-three multisig account. The input is a JSON object containing exactly `contract_id` and `initial_policy`; unknown or duplicate fields are rejected. `contract_id` must be 1. `initial_policy` contains exactly `version: 1`, `threshold: 2`, `member_count: 3`, and `member_hashes`, an array of eight strings using the existing `QHashOut` JSON encoding. The first three commitments must be nonzero, pairwise unequal as whole hashes, and retained in the supplied order; the remaining five must be zero padding. Supply commitments for the approved external signers, not addresses or private keys. Source: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:198-225`; `client_prover/psy_vm/src/ups/multisig.rs`.
+Registrations 2 (`user_id` 524288) and 15 (`user_id` 1966080) are distinct public-only two-of-three multisig accounts. Each input is a JSON object containing exactly `contract_id` and `initial_policy`; unknown or duplicate fields are rejected. `contract_id` must be 1. `initial_policy` contains exactly `version: 1`, `threshold: 2`, `member_count: 3`, and `member_hashes`, an array of eight strings using the existing `QHashOut` JSON encoding. The first three commitments must be nonzero, pairwise unequal as whole hashes, and retained in the supplied order; the remaining five must be zero padding. Supply commitments for the approved external signers, not addresses or private keys. Source: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:198-225`; `client_prover/psy_vm/src/ups/multisig.rs`.
 
-The separate compiler artifact contains the approved policy contract's current ABI 2.0.0 and exactly `get_policy` and `set_policy` circuit definitions, with declared state-tree height 4. The generator checks method identifiers, input/output counts, mutability, and the visible `header`/three-`members` ABI offsets, then derives the complete deployment and requires equality with Genesis contract 1 (`generate_genesis.rs:259-262`). This uses the existing ABI, not a new canonical layout root or nested Genesis metadata schema. The required supplied artifact is not compiled or regenerated by these commands.
+The separate compiler artifact contains the approved policy contract's current ABI 2.0.0 and exactly `get_policy`, `set_policy`, `get_params`, `set_params`, `get_chain_mapping`, and `set_chain_mapping` circuit definitions, with the state-tree height from `MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT`. The generator checks method identifiers, input/output counts, mutability, and the visible `header`/three-`members` ABI offsets, then derives the complete deployment and requires equality with Genesis contract 1 (`generate_genesis.rs:259-262`). This uses the existing ABI, not a new canonical layout root or nested Genesis metadata schema. The required supplied artifact is not compiled or regenerated by these commands.
 
-The generator derives the account identity from the actual `MultisigSignatureCircuit` fingerprint and the initial public policy. It initializes contract 1 with header `[1, 2, 3, 0]` in slot 0 and the three member commitments in slots 1 through 3. Contract 0 slot 0 holds the configured nonzero canonical initial fee balance. The user nonce is zero, but the policy is already initialized: the first signed session uses the current initial policy, not pristine-account bootstrap. No relayer master secret is generated, decrypted, or exported.
+The generator derives each account identity from the actual `MultisigSignatureCircuit` fingerprint and the initial public policy. It initializes contract 1 with header `[1, 2, 3, 0]` in slot 0 and the three member commitments in slots 1 through 3. Contract 0 slot 0 holds the configured nonzero canonical initial fee balance. The user nonce is zero, but the policy is already initialized: the first signed session uses the current initial policy, not pristine-account bootstrap. No relayer master secret is generated, decrypted, or exported.
 
 L1 transaction keystores and passwords remain separate operator custody inputs; they do not select this L2 identity. Do not regenerate an existing chain to rotate members. Use a current-quorum-authorized policy replacement instead. Current quality assurance for public Genesis construction, initialized-state proofs, and startup is pending; the input contract does not establish that generated artifacts are ready for use.
 
@@ -130,7 +138,7 @@ L1 transaction keystores and passwords remain separate operator custody inputs; 
 | Output | Handling |
 |---|---|
 | Root `genesis.json` | Network bootstrap state containing contract registrations, worker whitelist, validator list, and checkpoint stats. |
-| Root `private_keys.json` | Dense registration-indexed array: entry 2 is JSON `null`; other validator/faucet entries retain their existing keys and positions. The file remains **secret**. Never package, upload, commit, paste, or publish it ([circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §13 and Security Considerations). |
+| Root `private_keys.json` | Dense registration-indexed array: entries 2 and 15 are JSON `null`; other validator/faucet entries retain their existing keys and positions. The file remains **secret**. Never package, upload, commit, paste, or publish it ([circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §13 and Security Considerations). |
 | `psy-dapp/apps/bridge/src/config/faucetOperators.json` | Faucet operator config (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Skip with `--skip-faucet-operators`. |
 
 ### 1.4 Verification
@@ -163,7 +171,7 @@ If `genesis_contracts.json` content changed, regenerate root `genesis.json` (§1
 
 Local-devnet Genesis pre-places dedicated ZK validator accounts at registrations `0`, `1`, `3`, `4` for realms `0..1` (Strategy5 GROUP=1), and the initialized public multisig account at registration `2` with fixed Strategy5 `user_id` `524288`. Faucet sd-key operators occupy registrations `5..14`. The launcher binds each `(realm_id, sub_id)` to the reserved validator registrations and does not scan ordinary faucet or relayer users. Dense local-devnet Genesis currently covers validator realms `0..1` only.
 
-`[finalize]` and `[[chains]]` retain their separate encrypted L1 keystore configuration. That keystore does not determine registration 2. See the public inputs in [§1.2.1](#121-public-bridge-multisig-account). This lane does not register a guardian daemon in the launcher.
+`[finalize]` and `[[chains]]` retain their separate encrypted L1 keystore configuration. That keystore does not determine registration 2. See the public inputs in [§1.2.2](#122-public-multisig-accounts). This lane does not register a guardian daemon in the launcher.
 
 The key generator writes P2P identity/BLS secrets and creates one distinct edge identity and public address for every requested edge index. Foreground public addresses use the requested host. Daemon startup writes a separate runtime config whose public addresses use Compose DNS service names; container listeners remain wildcard addresses. All of these addresses use the standard Realm P2P transport.
 
@@ -185,6 +193,7 @@ PSY_GUARDIAN_CHAINS='<chain-authorizations-json>' \
 PSY_GUARDIAN_L1_ENDPOINTS='<l1-endpoints-json>' \
 PSY_GUARDIAN_APPROVED_CONTRACTS='<approved-contracts-json>' \
 PSY_RELAYER_MULTISIG_ACCOUNT='<public-multisig-account-json>' \
+PSY_GOVERNANCE_MULTISIG_ACCOUNT='<public-governance-account-json>' \
 PSY_MULTISIG_POLICY_ARTIFACT='<approved-policy-compiler-artifact-json>' \
 make generate-guardians-root
 ```
@@ -212,8 +221,10 @@ deployment summaries and canonical deployment receipts, checks chain IDs,
 Bridge/StateManager registry and proxy implementation addresses, and pins code
 hash reads to a canonical L1 block. It exports chain approvals and endpoint
 lists without sending transactions. The command is restricted to localhost
-RPC endpoints. It also exports approvals for contracts 0 through 4 from the
-compiler artifacts, requiring their definitions to match the existing Genesis.
+RPC endpoints. It also exports approvals for contracts 0 through 4 by decoding
+the function definitions in the current `genesis.json` and pairing them with
+the matching `psy-genesis/genesis_abi/` files. The compiler `target/` directory
+is not required for the default preparation path.
 It requires `cast` for Keccak hashing, which is supplied by the Foundry tools
 already used for local Anvil. Different existing input files are not replaced.
 
@@ -222,13 +233,11 @@ The existing `PSY_GUARDIAN_CHAINS`, `PSY_GUARDIAN_L1_ENDPOINTS`,
 variables override those paths. These authorization inputs must describe the
 intended deployment. `PSY_MULTISIG_POLICY_ARTIFACT` defaults to
 `$(PSY_DEVNET_DIR)/inputs/multisig_policy.json`.
-`make prepare-multisig-policy-artifact` copies that public artifact from the
-newest release `psy-precompiles-*/out` directory of sibling `psy-compiler`.
-`PSY_COMPILER_ARTIFACTS_DIR` selects an explicit build-output directory when
-needed. The matching clean compiler/artifact cohort remains a prerequisite;
-these commands do not build the compiler or refresh its provenance. A missing
-or mismatched artifact fails the generator rather than adopting unrelated
-contract definitions.
+`make prepare-multisig-policy-artifact` reconstructs that public artifact from
+the current Genesis and `psy-genesis/genesis_abi/`. `PSY_COMPILER_ARTIFACTS_DIR`
+selects explicit compiler artifacts for manual comparison when needed. The
+default path does not build or read sibling compiler `target/` files. A
+mismatched ABI or malformed Genesis function definition fails preparation.
 
 `prepare-guardian-config` reads the generated public root and creates
 `$(PSY_DEVNET_DIR)/daemon.toml` for its localhost L1 endpoints. An existing

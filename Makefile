@@ -11,6 +11,7 @@ endif
 
 PSY_DEVNET_DIR ?= $(HOME)/.psy/devnet/local
 PSY_RELAYER_MULTISIG_ACCOUNT ?= $(PSY_DEVNET_DIR)/relayer-multisig-account.json
+PSY_GOVERNANCE_MULTISIG_ACCOUNT ?= $(PSY_DEVNET_DIR)/governance-multisig-account.json
 PSY_MULTISIG_POLICY_ARTIFACT ?= $(PSY_DEVNET_DIR)/inputs/multisig_policy.json
 PSY_BRIDGE_DAEMON_CONFIG ?= $(PSY_DEVNET_DIR)/daemon.toml
 PSY_GUARDIAN_CONFIG ?= $(if $(strip $(PSY_GUARDIANS_ROOT)),$(PSY_GUARDIANS_ROOT),$(PSY_DEVNET_DIR)/guardians)/config.json
@@ -159,14 +160,14 @@ config_gen_v2:
 # Public-only registration 2 (user_id 524288), independent of L1 signer custody.
 # Supply PSY_RELAYER_MULTISIG_ACCOUNT and PSY_MULTISIG_POLICY_ARTIFACT public JSON paths.
 # With PSY_GUARDIANS_ROOT, read existing genesis.json and generate Guardian configuration.
-GUARDIANS_ROOT_ARGS = $(if $(strip $(PSY_GUARDIANS_ROOT)),--guardians-root "$(PSY_GUARDIANS_ROOT)" --chains "$(PSY_GUARDIAN_CHAINS)" --l1-endpoints "$(PSY_GUARDIAN_L1_ENDPOINTS)" --approved-contracts "$(PSY_GUARDIAN_APPROVED_CONTRACTS)")
+GUARDIANS_ROOT_ARGS = $(if $(strip $(PSY_GUARDIANS_ROOT)),--guardians-root "$(PSY_GUARDIANS_ROOT)" --chains "$(PSY_GUARDIAN_CHAINS)" --l1-endpoints "$(PSY_GUARDIAN_L1_ENDPOINTS)" --approved-contracts "$(PSY_GUARDIAN_APPROVED_CONTRACTS)" $(if $(strip $(PSY_GOVERNANCE_AUTHORIZATION)),--governance-authorization))
 ifneq ($(strip $(PSY_GUARDIANS_ROOT) $(PSY_GUARDIAN_CHAINS) $(PSY_GUARDIAN_L1_ENDPOINTS) $(PSY_GUARDIAN_APPROVED_CONTRACTS)),)
 generate-genesis-data: check-guardians-root-inputs
 endif
 generate-genesis-data:
 	@test -n "$(PSY_RELAYER_MULTISIG_ACCOUNT)" || { echo "PSY_RELAYER_MULTISIG_ACCOUNT is required" >&2; exit 1; }
 	@test -n "$(PSY_MULTISIG_POLICY_ARTIFACT)" || { echo "PSY_MULTISIG_POLICY_ARTIFACT is required" >&2; exit 1; }
-	@env -u PRIVATE_KEY -u BRIDGE_RELAYER_L2_PRIVATE_KEY -u KEYSTORE_PATH -u PSY_BRIDGE_RELAYER_KEYSTORE_PATH -u BRIDGE_RELAYER_KEYSTORE_PATH -u WALLET_PASSWORD ${BIN_PREFIX}psy_dev_cli generate-genesis-data --repo-root "$(CURDIR)" --relayer-multisig-account "$(PSY_RELAYER_MULTISIG_ACCOUNT)" --multisig-policy-artifact "$(PSY_MULTISIG_POLICY_ARTIFACT)" $(GUARDIANS_ROOT_ARGS)
+	@env -u PRIVATE_KEY -u BRIDGE_RELAYER_L2_PRIVATE_KEY -u KEYSTORE_PATH -u PSY_BRIDGE_RELAYER_KEYSTORE_PATH -u BRIDGE_RELAYER_KEYSTORE_PATH -u WALLET_PASSWORD ${BIN_PREFIX}psy_dev_cli generate-genesis-data --repo-root "$(CURDIR)" --relayer-multisig-account "$(PSY_RELAYER_MULTISIG_ACCOUNT)" --governance-multisig-account "$(PSY_GOVERNANCE_MULTISIG_ACCOUNT)" --multisig-policy-artifact "$(PSY_MULTISIG_POLICY_ARTIFACT)" $(GUARDIANS_ROOT_ARGS)
 
 check-guardians-root-inputs:
 	@test -n "$(strip $(PSY_GUARDIANS_ROOT))" || { echo "PSY_GUARDIANS_ROOT is required" >&2; exit 1; }
@@ -185,7 +186,7 @@ build-guardian-tools:
 	cargo build --release --bin psy_relayer_cli --bin psy_dev_cli
 
 prepare-guardian-account: build-guardian-tools
-	@${BIN_PREFIX}psy_relayer_cli guardian-prepare-account --output "$(PSY_RELAYER_MULTISIG_ACCOUNT)"
+	@${BIN_PREFIX}psy_relayer_cli guardian-prepare-account --output "$(PSY_RELAYER_MULTISIG_ACCOUNT)" --governance-output "$(PSY_GOVERNANCE_MULTISIG_ACCOUNT)"
 
 prepare-multisig-policy-artifact:
 	@bun run dev/guardianInputs.ts --output "$(PSY_DEVNET_DIR)/inputs" --policy-only $(if $(strip $(PSY_COMPILER_ARTIFACTS_DIR)),--compiler-artifacts "$(PSY_COMPILER_ARTIFACTS_DIR)")

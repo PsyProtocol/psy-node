@@ -13,9 +13,21 @@ describe("Guardian daemon config", () => {
         const config = Bun.TOML.parse(text);
         expect(config.guardian_config).toBe("/operator/guardians/config.json");
         expect(config.rpc_config).toBe("/repo/psy-genesis/config.json");
+        expect(config.withdraw_method_id).toBe(3055054724);
         expect(config.chains.map((chain: any) => [chain.chain_index, chain.network_id, chain.rpc_urls])).toEqual([
             [0, "localhost", ["http://127.0.0.1:8545"]], [1, "localhostBsc", ["http://127.0.0.1:9545"]],
         ]);
+    });
+
+    it("uses the withdraw method ID from the current token ABI", async () => {
+        const abi = JSON.parse(await fs.readFile(path.join(import.meta.dir, "../psy-genesis/genesis_abi/PsyTokenContract.json"), "utf8"));
+        const withdraw = abi.contract.methods.find((method: { name: string }) => method.name === "withdraw");
+        const text = buildGuardianDaemonConfig("/operator/guardians/config.json", { client: { l1_endpoints: [
+            { chain_index: 0, rpc_url: "http://127.0.0.1:8545" },
+        ] } }, "/repo", "/operator");
+        expect(Bun.TOML.parse(text).withdraw_method_id).toBe(withdraw.method_id);
+        const template = await fs.readFile(path.join(import.meta.dir, "../psy_cli/psy_relayer_cli/config/local.toml"), "utf8");
+        expect(Bun.TOML.parse(template).withdraw_method_id).toBe(withdraw.method_id);
     });
 
     it("rejects missing indices and non-local endpoints", () => {

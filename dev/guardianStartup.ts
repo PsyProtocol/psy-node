@@ -21,6 +21,7 @@ export async function planGuardianStartup(cwd: string, env: NodeJS.ProcessEnv, l
     for (const [name, expected] of Object.entries({
         PSY_GUARDIAN_CONFIG: guardianPath, PSY_BRIDGE_DAEMON_CONFIG: daemonPath,
         PSY_RELAYER_MULTISIG_ACCOUNT: path.join(directory, "relayer-multisig-account.json"),
+        PSY_GOVERNANCE_MULTISIG_ACCOUNT: path.join(directory, "governance-multisig-account.json"),
         PSY_MULTISIG_POLICY_ARTIFACT: path.join(directory, "inputs/multisig_policy.json"),
     })) {
         if (env[name] && path.resolve(cwd, env[name]!) !== expected) throw new Error(`${name} overrides the local Guardian preparation paths; remove stale overrides or provision explicitly`);
@@ -48,8 +49,19 @@ export async function prepareGuardianStartup(
         "-u", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "-u", "BRIDGE_RELAYER_KEYSTORE_PATH", "-u", "WALLET_PASSWORD",
         path.join(cwd, "target/release/psy_dev_cli"), "generate-genesis-data", "--repo-root", cwd,
         "--relayer-multisig-account", path.join(startup.directory, "relayer-multisig-account.json"),
+        "--governance-multisig-account", path.join(startup.directory, "governance-multisig-account.json"),
         "--multisig-policy-artifact", path.join(startup.directory, "inputs/multisig_policy.json"),
         "--guardians-root", path.dirname(startup.guardianPath),
+        "--chains", path.join(startup.directory, "inputs/chains.json"),
+        "--l1-endpoints", path.join(startup.directory, "inputs/l1-endpoints.json"),
+        "--approved-contracts", path.join(startup.directory, "inputs/approved-contracts.json")]);
+    await run(["env", "-u", "PRIVATE_KEY", "-u", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "-u", "KEYSTORE_PATH",
+        "-u", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "-u", "BRIDGE_RELAYER_KEYSTORE_PATH", "-u", "WALLET_PASSWORD",
+        path.join(cwd, "target/release/psy_dev_cli"), "generate-genesis-data", "--repo-root", cwd,
+        "--relayer-multisig-account", path.join(startup.directory, "relayer-multisig-account.json"),
+        "--governance-multisig-account", path.join(startup.directory, "governance-multisig-account.json"),
+        "--multisig-policy-artifact", path.join(startup.directory, "inputs/multisig_policy.json"),
+        "--guardians-root", path.join(startup.directory, "governance"), "--governance-authorization",
         "--chains", path.join(startup.directory, "inputs/chains.json"),
         "--l1-endpoints", path.join(startup.directory, "inputs/l1-endpoints.json"),
         "--approved-contracts", path.join(startup.directory, "inputs/approved-contracts.json")]);

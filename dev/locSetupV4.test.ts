@@ -596,17 +596,18 @@ describe("isUsableGenesisData", () => {
 
 describe("public-only Genesis generation", () => {
     const account = () => ({ contract_id: 1, initial_policy: { version: 1, threshold: 2, member_count: 3, member_hashes: ["01", "02", "03", "00", "00", "00", "00", "00"] } });
-    const artifact = () => ({ state_tree_height: 4, circuit_definitions: [{ name: "get_policy" }, { name: "set_policy" }], abi: { contract: { state_tree_height: 4 } } });
+    const artifact = () => ({ state_tree_height: 11, circuit_definitions: ["get_policy", "set_policy", "get_params", "set_params", "get_chain_mapping", "set_chain_mapping"].map((name) => ({ name })), abi: { contract: { state_tree_height: 11 } } });
 
     it("forwards public paths as individual argv and strips only child secrets", async () => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         try {
             await Bun.write(`${dir}/public account.json`, JSON.stringify(account()));
+            await Bun.write(`${dir}/governance account.json`, JSON.stringify(account()));
             await Bun.write(`${dir}/policy artifact.json`, JSON.stringify(artifact()));
             const aliases = ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"];
-            const env: NodeJS.ProcessEnv = { PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json", KEEP: "present", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
+            const env: NodeJS.ProcessEnv = { PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_GOVERNANCE_MULTISIG_ACCOUNT: "governance account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json", KEEP: "present", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
             const plan = await planGenesisGeneration(dir, env);
-            expect(plan.args).toEqual([`${dir}/target/release/psy_dev_cli`, "generate-genesis-data", "--repo-root", dir, "--relayer-multisig-account", `${dir}/public account.json`, "--multisig-policy-artifact", `${dir}/policy artifact.json`]);
+            expect(plan.args).toEqual([`${dir}/target/release/psy_dev_cli`, "generate-genesis-data", "--repo-root", dir, "--relayer-multisig-account", `${dir}/public account.json`, "--governance-multisig-account", `${dir}/governance account.json`, "--multisig-policy-artifact", `${dir}/policy artifact.json`]);
             for (const alias of aliases) {
                 expect(plan.env[alias]).toBeUndefined();
                 expect(env[alias]).toBe("test-only");
@@ -620,7 +621,8 @@ describe("public-only Genesis generation", () => {
     it("rejects missing paths, unknown and duplicate fields, and invalid fixed policies", async () => {
         const dir = (await Bun.$`mktemp -d`.text()).trim();
         try {
-            const env = { PSY_RELAYER_MULTISIG_ACCOUNT: "account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy.json" };
+            const env = { PSY_RELAYER_MULTISIG_ACCOUNT: "account.json", PSY_GOVERNANCE_MULTISIG_ACCOUNT: "governance.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy.json" };
+            await Bun.write(`${dir}/governance.json`, JSON.stringify(account()));
             await Bun.write(`${dir}/policy.json`, JSON.stringify(artifact()));
             await expect(planGenesisGeneration(dir, {})).rejects.toThrow();
             await expect(planGenesisGeneration(dir, env)).rejects.toThrow();
@@ -645,15 +647,16 @@ describe("public-only Genesis generation", () => {
         try {
             await Bun.write(`${dir}/psy-genesis/genesis_contracts.json`, new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]));
             await Bun.write(`${dir}/public account.json`, JSON.stringify(account()));
+            await Bun.write(`${dir}/governance account.json`, JSON.stringify(account()));
             await Bun.write(`${dir}/policy artifact.json`, JSON.stringify(artifact()));
             const cli = `${dir}/target/release/psy_dev_cli`;
             await Bun.write(cli, '#!/usr/bin/env bun\nawait Bun.write("child.json", JSON.stringify({ args: process.argv.slice(2), env: process.env }));\nawait Bun.write("genesis.json", \'{"checkpoint_stats":{"block_time":1764248609}}\');\n');
             await Bun.$`chmod +x ${cli}`.quiet();
             const aliases = ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"];
-            const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
+            const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, PSY_RELAYER_MULTISIG_ACCOUNT: "public account.json", PSY_GOVERNANCE_MULTISIG_ACCOUNT: "governance account.json", PSY_MULTISIG_POLICY_ARTIFACT: "policy artifact.json", ...Object.fromEntries(aliases.map((key) => [key, "test-only"])) };
             await ensureGenesisFiles(dir, env);
             const child = await Bun.file(`${dir}/child.json`).json();
-            expect(child.args).toEqual(["generate-genesis-data", "--repo-root", dir, "--relayer-multisig-account", `${dir}/public account.json`, "--multisig-policy-artifact", `${dir}/policy artifact.json`]);
+            expect(child.args).toEqual(["generate-genesis-data", "--repo-root", dir, "--relayer-multisig-account", `${dir}/public account.json`, "--governance-multisig-account", `${dir}/governance account.json`, "--multisig-policy-artifact", `${dir}/policy artifact.json`]);
             for (const alias of aliases) {
                 expect(child.env[alias]).toBeUndefined();
                 expect(env[alias]).toBe("test-only");
@@ -1177,6 +1180,18 @@ describe("guardian launcher config preflight", () => {
         });
     });
 
+    it("accepts the complete governance key rotation and rejects mixed key assignments", async () => {
+        await inTempDir(async (dir) => {
+            const config = publicGuardianConfig();
+            config.guardians = { "1": signer(2), "2": signer(3), "3": signer(1) };
+            await writeConfig(dir, "governance.json", config);
+            expect(await resolveGuardianConfigPath(dir, "governance.json")).toBe(path.resolve(dir, "governance.json"));
+            (config.guardians as Record<string, unknown>)[2] = signer(2);
+            await writeConfig(dir, "mixed.json", config);
+            await expectRejection(dir, "mixed.json", "expected only GuardianConfig public fields");
+        });
+    });
+
     it("rejects a missing or blank PSY_GUARDIAN_CONFIG instead of falling back to a wallet", async () => {
         await inTempDir(async (dir) => {
             for (const missing of [undefined, "", "   "]) {
@@ -1362,7 +1377,7 @@ describe("whole bridge daemon config forwarding", () => {
     const daemonToml = `rpc_config = "rpc.json"
 services_url = "http://127.0.0.1:3000"
 guardian_config = "guardian.json"
-withdraw_method_id = 4159421846
+withdraw_method_id = 3055054724
 poll_interval_secs = 15
 confirmation_lag_checkpoints = 3
 max_checkpoint_batch = 32
@@ -1623,7 +1638,7 @@ password_env = "SYNTHETIC_PASSWORD"
         await fixture(async (cwd, env) => {
             for (const [before, after, message] of [
                 ["chain_index = 0", "chain_index = 256", "chains.chain_index"],
-                ["withdraw_method_id = 4159421846", "withdraw_method_id = -1", "withdraw_method_id"],
+                ["withdraw_method_id = 3055054724", "withdraw_method_id = -1", "withdraw_method_id"],
                 ["poll_interval_secs = 15", "poll_interval_secs = 1.5", "poll_interval_secs"],
                 ["max_checkpoint_batch = 32", "max_checkpoint_batch = 9007199254740993.0", "max_checkpoint_batch"],
                 ["family = \"evm\"", "family = 7", "chains.family"],

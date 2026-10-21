@@ -13,6 +13,7 @@ use serde_json::Value;
 pub const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 pub const GOLDILOCKS_MODULUS: u64 = 0xffff_ffff_0000_0001;
 pub const BRIDGE_USER_ID: u64 = 524288;
+pub const GOVERNANCE_USER_ID: u64 = 1966080;
 pub type Hash4 = QHashOut<GoldilocksField>;
 pub type Hex20 = Hex<20>;
 pub type Hex32 = Hex<32>;
@@ -187,6 +188,18 @@ pub struct GuardianAuthorization {
     pub deposit_contract_id: u32, pub withdrawal_contract_id: u32, pub fee_contract_id: u32,
     pub guta_fee: u64, pub da_fee: u64, pub max_fee: u64, pub max_endcap_proof_bytes: u32, pub endcap_verifier_fingerprint: Hash4,
     pub approved_contracts: Vec<ApprovedContract>, pub chains: Vec<ChainAuthorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_withdrawal_params: Option<ApprovedWithdrawalParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_next_members: Option<[Hash4; 3]>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedWithdrawalParams {
+    pub paused: bool,
+    pub psy_per_tx_limit: u64,
+    pub usdt_per_tx_limit: u64,
+    pub cooldown_checkpoints: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,7 +264,7 @@ pub struct GuardianAuthorizationVersion { pub version: u32, pub sha256: Hex32 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
-pub enum GuardianOperation { Bridge = 0, Bootstrap = 1, ReplacePolicy = 2 }
+pub enum GuardianOperation { Bridge = 0, Bootstrap = 1, ReplacePolicy = 2, SetChainMapping = 3, SetParams = 4 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardianSignRequest {
@@ -363,8 +376,10 @@ impl WithdrawalBurnRecord {
 impl GuardianSignRequest {
     pub fn parse(bytes: &[u8]) -> Result<Self, GuardianSignError> { let request: Self = parse_canonical_json(bytes)?; request.validate()?; Ok(request) }
     pub fn validate(&self) -> Result<(), GuardianSignError> {
-        if self.schema_version != 1 || self.authorization_version == 0 || !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID || !canonical_field(self.session_nonce)
+        if self.schema_version != 1 || self.authorization_version == 0 || !canonical_field(self.network_magic) || !matches!(self.user_id, BRIDGE_USER_ID | GOVERNANCE_USER_ID) || !canonical_field(self.session_nonce)
             || self.deposit_anchors.len() > 256 || self.withdrawal_records.len() > 1024 { return Err(GuardianSignError::MalformedRequest); }
+        if matches!(self.operation, GuardianOperation::SetChainMapping | GuardianOperation::SetParams) && self.user_id != GOVERNANCE_USER_ID { return Err(GuardianSignError::UnsupportedCall); }
+        if matches!(self.operation, GuardianOperation::Bridge | GuardianOperation::Bootstrap) && self.user_id != BRIDGE_USER_ID { return Err(GuardianSignError::UnsupportedCall); }
         if self.operation != GuardianOperation::Bridge && (!self.deposit_anchors.is_empty() || !self.withdrawal_records.is_empty()) { return Err(GuardianSignError::UnsupportedCall); }
         if self.operation == GuardianOperation::Bridge && self.deposit_anchors.is_empty() && self.withdrawal_records.is_empty() { return Err(GuardianSignError::UnsupportedCall); }
         if self.deposit_anchors.windows(2).any(|w| w[0].chain_index >= w[1].chain_index)
@@ -434,11 +449,19 @@ impl GuardianAuthorization {
     pub fn validate(&self, guta_fee: u64, da_fee: u64, max_endcap_proof_bytes: u32) -> Result<(), GuardianSignError> {
         let mismatch = GuardianSignError::AuthorizationMismatch;
         let floor = guta_fee.checked_add(da_fee).ok_or(mismatch)?;
-        if self.version == 0 || !canonical_field(self.network_magic) || self.genesis_hash.0 == [0; 32] || self.user_id != BRIDGE_USER_ID
+        if self.version == 0 || !canonical_field(self.network_magic) || self.genesis_hash.0 == [0; 32] || !matches!(self.user_id, BRIDGE_USER_ID | GOVERNANCE_USER_ID)
             || self.deposit_contract_id != 2 || self.withdrawal_contract_id != 3 || self.fee_contract_id != 0
             || self.guta_fee != guta_fee || self.da_fee != da_fee || self.max_fee < floor
             || self.max_endcap_proof_bytes == 0 || self.max_endcap_proof_bytes != max_endcap_proof_bytes
             || self.chains.is_empty() || self.chains.len() > 256 { return Err(mismatch); }
+        if let Some(params) = self.approved_withdrawal_params {
+            if self.user_id != GOVERNANCE_USER_ID || params.psy_per_tx_limit == 0 || params.usdt_per_tx_limit == 0
+                || !canonical_field(params.psy_per_tx_limit) || !canonical_field(params.usdt_per_tx_limit) { return Err(mismatch); }
+        }
+        if let Some(members) = self.approved_next_members {
+            if self.user_id != GOVERNANCE_USER_ID || members.iter().any(|member| *member == Hash4::ZERO)
+                || members[0] == members[1] || members[0] == members[2] || members[1] == members[2] { return Err(mismatch); }
+        }
         validate_hash(self.account_public_key)?; validate_hash(self.multisig_fingerprint)?; validate_hash(self.endcap_verifier_fingerprint)?;
         if self.endcap_verifier_fingerprint == Hash4::ZERO { return Err(mismatch); }
         let account = self.account_json.decode()?;
@@ -558,7 +581,7 @@ impl GuardianRuntimeConfig {
 
 impl GuardianSigned {
     pub fn validate(&self) -> Result<(), GuardianSignError> {
-        if !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID || !canonical_field(self.nonce)
+        if !canonical_field(self.network_magic) || !matches!(self.user_id, BRIDGE_USER_ID | GOVERNANCE_USER_ID) || !canonical_field(self.nonce)
             || self.request_bytes.len() > MAX_BODY_BYTES || self.authorization_bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::JournalUnavailable); }
         let request = GuardianSignRequest::from_canonical_bytes(&self.request_bytes).map_err(|_| GuardianSignError::JournalUnavailable)?;
         if request.network_magic != self.network_magic || request.user_id != self.user_id || request.session_nonce != self.nonce {
@@ -570,7 +593,7 @@ impl GuardianSigned {
 }
 impl GuardianAccount {
     pub fn validate(&self) -> Result<(), GuardianSignError> {
-        if !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID || self.authorization_version == 0
+        if !canonical_field(self.network_magic) || !matches!(self.user_id, BRIDGE_USER_ID | GOVERNANCE_USER_ID) || self.authorization_version == 0
             || self.imported_nonce.is_some_and(|n| !canonical_field(n))
             || (self.state == GuardianAccountState::Halted) != self.halt_reason.is_some() { return Err(GuardianSignError::JournalUnavailable); }
         validate_hash(self.last_checkpoint_hash)
@@ -656,7 +679,7 @@ impl GuardianSignRequest {
         let schema_version = input.u32()?; let authorization_version = input.u32()?;
         let network_magic = input.u64()?; let genesis_hash = Hex(input.take()?);
         let user_id = input.u64()?; let session_nonce = input.u64()?;
-        let operation = match input.u8()? { 0 => GuardianOperation::Bridge, 1 => GuardianOperation::Bootstrap, 2 => GuardianOperation::ReplacePolicy, _ => return Err(GuardianSignError::MalformedRequest) };
+        let operation = match input.u8()? { 0 => GuardianOperation::Bridge, 1 => GuardianOperation::Bootstrap, 2 => GuardianOperation::ReplacePolicy, 3 => GuardianOperation::SetChainMapping, 4 => GuardianOperation::SetParams, _ => return Err(GuardianSignError::MalformedRequest) };
         let length = input.count(input.remaining.len())?;
         if length > input.remaining.len() { return Err(GuardianSignError::MalformedRequest); }
         let (text, rest) = input.remaining.split_at(length); input.remaining = rest;
@@ -741,7 +764,7 @@ mod tests {
         assert_eq!(encoded.len(), 137);
         assert_eq!(&encoded[..9], &[0xe8, 3, 0, 0, 4, 0, 0, 0, 0]);
         assert_eq!(&encoded[9 + 32 + 28..9 + 64], &[1, 0, 0, 0]);
-        assert_eq!([GuardianOperation::Bridge as u8, GuardianOperation::Bootstrap as u8, GuardianOperation::ReplacePolicy as u8], [0, 1, 2]);
+        assert_eq!([GuardianOperation::Bridge as u8, GuardianOperation::Bootstrap as u8, GuardianOperation::ReplacePolicy as u8, GuardianOperation::SetChainMapping as u8, GuardianOperation::SetParams as u8], [0, 1, 2, 3, 4]);
     }
 
     fn burn(amount: u64) -> WithdrawalBurnRecord {
@@ -903,6 +926,24 @@ mod bounds_tests {
     use super::*;
 
     #[test]
+    fn governance_operations_require_governance_account() {
+        let mut request = codec_request_fixture();
+        request.operation = GuardianOperation::SetParams;
+        assert_eq!(request.validate().unwrap_err(), GuardianSignError::UnsupportedCall);
+        let mut trace = request.decode_trace().unwrap();
+        trace.meta.user_id = GOVERNANCE_USER_ID;
+        request.trace_json = JsonText::from_value(&GeneratedTxTraceJson::from_trace(
+            &trace, serde_json::to_value(ContractCallData::new(vec![])).unwrap(),
+        ).unwrap()).unwrap();
+        request.user_id = GOVERNANCE_USER_ID;
+        assert!(request.validate().is_ok());
+        request.operation = GuardianOperation::ReplacePolicy;
+        assert!(request.validate().is_ok());
+        request.operation = GuardianOperation::Bridge;
+        assert_eq!(request.validate().unwrap_err(), GuardianSignError::UnsupportedCall);
+    }
+
+    #[test]
     fn request_vector_bounds_and_destination_nonce_uniqueness_are_enforced() {
         let mut request = codec_request_fixture(); request.operation = GuardianOperation::Bridge;
         request.deposit_anchors = (0..=256).map(|i| DepositAnchor { chain_index: i as u8, block_number: 1, block_hash: Hex([1; 32]), old_count: 0, new_count: 1 }).collect();
@@ -1015,7 +1056,7 @@ mod compiler_artifact_tests {
             account_json: JsonText::from_value(&account).unwrap(),
             account_public_key: QHashOut(PoseidonHash::two_to_one(fingerprint.0, param.0)), multisig_fingerprint: fingerprint,
             deposit_contract_id: 2, withdrawal_contract_id: 3, fee_contract_id: 0, guta_fee: 1, da_fee: 1, max_fee: 2, max_endcap_proof_bytes: 1024,
-            endcap_verifier_fingerprint: Hash4::from_values(1, 1, 1, 1), approved_contracts,
+            endcap_verifier_fingerprint: Hash4::from_values(1, 1, 1, 1), approved_contracts, approved_withdrawal_params: None, approved_next_members: None,
             chains: vec![ChainAuthorization {
                 chain_index: 0, chain_id: U256::from(1u64), genesis_hash: Hex([2; 32]), bridge: Hex([3; 20]), state_manager: Hex([4; 20]),
                 bridge_code_hash: Hex([5; 32]), bridge_implementation: Hex([6; 20]), bridge_implementation_code_hash: Hex([7; 32]),

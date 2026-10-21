@@ -57,8 +57,8 @@ use crate::{
 };
 
 const BRIDGE_USER_ID: u64 = 524_288;
-const DEPOSIT_TREE_CONTRACT_ID: u64 = 2;
-const WITHDRAWAL_TREE_CONTRACT_ID: u64 = 3;
+const DEPOSIT_TREE_CONTRACT_ID: u64 = psy_config::DEPOSIT_TREE_CONTRACT_ID as u64;
+const WITHDRAWAL_TREE_CONTRACT_ID: u64 = psy_config::WITHDRAWAL_TREE_CONTRACT_ID as u64;
 /// BridgeAgg Final public-input width:
 /// [0..4) start root, [4..12) deposit root, [12..20) withdrawal root,
 /// [20..24) end root, [24] end checkpoint index, [25] num checkpoints.

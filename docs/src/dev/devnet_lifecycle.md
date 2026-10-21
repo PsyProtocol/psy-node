@@ -161,7 +161,7 @@ Run `make prepare-realm-p2p` before generating guardian authorization. The early
 
 ### Public-only `generate-genesis-data` inputs
 
-`make generate-genesis-data` takes only public inputs. It requires `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`, then runs `./target/release/psy_dev_cli generate-genesis-data` with `--repo-root`, `--relayer-multisig-account`, and `--multisig-policy-artifact` (`Makefile:139-144`). That child drops `PRIVATE_KEY`, `BRIDGE_RELAYER_L2_PRIVATE_KEY`, `KEYSTORE_PATH`, `PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, and `WALLET_PASSWORD`. The account `contract_id` must be 1 (`MULTISIG_POLICY_CONTRACT_ID`); `public_key_param` rejects any other id (`client_prover/psy_vm/src/ups/multisig.rs:20,75-76`), and the guardians-root branch repeats the check (`generate_genesis/guardians_root.rs:88`).
+`make generate-genesis-data` takes only public inputs. It requires `PSY_RELAYER_MULTISIG_ACCOUNT`, `PSY_GOVERNANCE_MULTISIG_ACCOUNT`, and `PSY_MULTISIG_POLICY_ARTIFACT`, then runs `./target/release/psy_dev_cli generate-genesis-data` with `--repo-root`, `--relayer-multisig-account`, `--governance-multisig-account`, and `--multisig-policy-artifact` (`Makefile`). That child drops `PRIVATE_KEY`, `BRIDGE_RELAYER_L2_PRIVATE_KEY`, `KEYSTORE_PATH`, `PSY_BRIDGE_RELAYER_KEYSTORE_PATH`, `BRIDGE_RELAYER_KEYSTORE_PATH`, and `WALLET_PASSWORD`. The account `contract_id` must be 1 (`MULTISIG_POLICY_CONTRACT_ID`); `public_key_param` rejects any other id (`client_prover/psy_vm/src/ups/multisig.rs:20,75-76`), and the guardians-root branch repeats the check (`generate_genesis/guardians_root.rs:88`).
 
 Use that current release `psy_dev_cli`. A stale binary still checks contract ID 6 (`public multisig account must name contract 6`; `Genesis contract 6 must be multisig_policy`) and fails a contract-1 account.
 
@@ -336,7 +336,7 @@ The earlier checkpoint-289-to-0 run proved L2 rollback, convergence, and transac
 | Failure | Action |
 |---|---|
 | `compiler revision changed` | Regenerate compiler/Genesis contract artifacts, regenerate root `genesis.json`, rebuild affected release binaries, then run the artifact checks. |
-| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data` with both public inputs `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_MULTISIG_POLICY_ARTIFACT`; stale embedded circuit definitions can fail prove-proxy circuit construction. |
+| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data` with both public accounts `PSY_RELAYER_MULTISIG_ACCOUNT` and `PSY_GOVERNANCE_MULTISIG_ACCOUNT` plus `PSY_MULTISIG_POLICY_ARTIFACT`; stale embedded circuit definitions can fail prove-proxy circuit construction. |
 | Cargo cannot authenticate to `git@github.com` | Set `CARGO_NET_GIT_FETCH_WITH_CLI=true`; repair empty cached submodules without deleting the whole Cargo git cache. |
 | Submodule fetch reports `early EOF` | Retry the same authenticated command. |
 | Scylla `raft operation add_entry timed out` during fresh schema creation | Run `PURGE=1 make shutdown` then `make run-all`; do not reuse the partial Scylla volume. |

@@ -36,11 +36,14 @@ enum Commands {
     /// Prepare three local Guardian keystores and their public two-of-three account.
     GuardianPrepareAccount {
         #[arg(long)] output: PathBuf,
+        #[arg(long)] governance_output: PathBuf,
     },
-    /// Prepare the five local Genesis contract approvals from matching compiler artifacts.
+    /// Prepare the five local Genesis contract approvals from Genesis and its ABIs.
     GuardianPrepareApprovedContracts {
         #[arg(long, default_value = "genesis.json")] genesis_data: PathBuf,
-        #[arg(long, required = true)] artifact: Vec<PathBuf>,
+        #[arg(long)] genesis_abi_dir: Option<PathBuf>,
+        #[arg(long)] artifact: Vec<PathBuf>,
+        #[arg(long)] policy_artifact_output: Option<PathBuf>,
         #[arg(long)] output: PathBuf,
     },
     /// Check guardian authorization, network, account, and signing keys without starting services.
@@ -84,6 +87,28 @@ enum Commands {
         exclusive_registration_intake: bool,
         #[arg(long)]
         next_members_json: Option<String>,
+    },
+    /// Submit an authorized L1 token mapping from the governance multisig account.
+    GuardianSetChainMapping {
+        #[arg(long)] rpc_config: String,
+        #[arg(long)] guardian_config: String,
+        #[arg(long)] chain_index: u8,
+        #[arg(long)] l2_contract_id: u32,
+        #[arg(long)] l1_address: String,
+    },
+    /// Submit missing authorized L1 token mappings in one governance UPS.
+    GuardianSetChainMappings {
+        #[arg(long)] rpc_config: String,
+        #[arg(long)] guardian_config: String,
+    },
+    /// Update withdrawal parameters through the governance Guardian account.
+    GuardianSetParams {
+        #[arg(long)] rpc_config: String,
+        #[arg(long)] guardian_config: String,
+        #[arg(long)] paused: bool,
+        #[arg(long)] psy_per_tx_limit: u64,
+        #[arg(long)] usdt_per_tx_limit: u64,
+        #[arg(long)] cooldown_checkpoints: u32,
     },
     /// Initialize keystore (generate or load Groth16 proving/verification keys)
     Initialize { keystore_dir: String },
@@ -217,11 +242,20 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => run_bridge_daemon(cli.config).await,
-        Some(Commands::GuardianPrepareAccount { output }) => guardian::account::run(&output),
-        Some(Commands::GuardianPrepareApprovedContracts { genesis_data, artifact, output }) => guardian::service::prepare_approved_contracts(&genesis_data, &artifact, &output),
+        Some(Commands::GuardianPrepareAccount { output, governance_output }) => guardian::account::run(&output, &governance_output),
+        Some(Commands::GuardianPrepareApprovedContracts { genesis_data, genesis_abi_dir, artifact, policy_artifact_output, output }) => guardian::service::prepare_approved_contracts(&genesis_data, genesis_abi_dir.as_deref(), &artifact, policy_artifact_output.as_deref(), &output),
         Some(Commands::GuardianServiceCheck { config, genesis_data, live, live_l1 }) => guardian::service::check(&config, &genesis_data, live, live_l1).await,
         Some(Commands::GuardianRefreshApprovedContracts { config, genesis_data, artifact, output }) => guardian::service::refresh_approved_contracts(&config, &genesis_data, &artifact, &output),
         Some(Commands::GuardianService { config, guardian_id, db_path }) => guardian::service::run(&config, guardian_id, &db_path).await.map_err(Into::into),
+        Some(Commands::GuardianSetChainMapping { rpc_config, guardian_config, chain_index, l2_contract_id, l1_address }) => {
+            bridge::daemon::run_guardian_set_chain_mapping(&rpc_config, &guardian_config, chain_index, l2_contract_id, &l1_address).await
+        }
+        Some(Commands::GuardianSetChainMappings { rpc_config, guardian_config }) => {
+            bridge::daemon::run_guardian_set_chain_mappings(&rpc_config, &guardian_config).await
+        }
+        Some(Commands::GuardianSetParams { rpc_config, guardian_config, paused, psy_per_tx_limit, usdt_per_tx_limit, cooldown_checkpoints }) => {
+            bridge::daemon::run_guardian_set_params(&rpc_config, &guardian_config, paused, psy_per_tx_limit, usdt_per_tx_limit, cooldown_checkpoints).await
+        }
         Some(Commands::GuardianPolicy { rpc_config, guardian_config, intent, exclusive_registration_intake, next_members_json }) => match intent {
             GuardianPolicyIntent::Register => {
                 if next_members_json.is_some() {

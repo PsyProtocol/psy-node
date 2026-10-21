@@ -12,7 +12,7 @@ async function command(args: string[]): Promise<string> {
     return output.trim();
 }
 
-async function readGenesisContracts(file: string): Promise<unknown[]> {
+export async function readGenesisContracts(file: string): Promise<unknown[]> {
     const bytes = await fs.readFile(file);
     const text = bytes.subarray(0, 4).equals(Buffer.from([0x28, 0xb5, 0x2f, 0xfd]))
         ? await command(["zstd", "-dc", file])
@@ -156,17 +156,15 @@ async function existingPublicMatches(output: string, expected: string | Uint8Arr
     catch { return current.equals(next); }
 }
 
-async function findArtifacts(repoRoot: string, selected: string | undefined): Promise<Record<string, string>> {
+async function findArtifacts(selected: string): Promise<Record<string, string>> {
     const names = ["token", "multisig_policy", "deposit_tree", "withdrawal_tree", "usdt_token"];
-    const root = selected ? path.resolve(selected) : path.resolve(repoRoot, "../psy-compiler/psy-precompiles");
-    const artifacts = Object.fromEntries(names.map((name) => [name, selected
-        ? path.join(root, `${name}.json`)
-        : path.join(root, name, "target", `${name}.json`)]));
+    const root = path.resolve(selected);
+    const artifacts = Object.fromEntries(names.map((name) => [name, path.join(root, `${name}.json`)]));
     for (const [name, artifact] of Object.entries(artifacts)) {
         try {
             if (!(await fs.stat(artifact)).isFile()) throw new Error();
         } catch {
-            throw new Error(`Missing canonical ${name} compiler artifact at ${artifact}; build the matching sibling psy-compiler first`);
+            throw new Error(`Missing selected ${name} compiler artifact at ${artifact}`);
         }
     }
     return artifacts;
@@ -184,11 +182,25 @@ if (import.meta.main) {
         console.log("genesis.json contracts match psy-genesis/genesis_contracts.json.");
         process.exit(0);
     }
-    const artifacts = await findArtifacts(repoRoot, values["compiler-artifacts"]);
-    console.log(`Compiler artifacts selected: ${Object.values(artifacts).join(", ")}`);
+    const artifacts = values["compiler-artifacts"] ? await findArtifacts(values["compiler-artifacts"]) : undefined;
     const output = path.resolve(values.output!);
-    await writePublic(path.join(output, "multisig_policy.json"), await fs.readFile(artifacts.multisig_policy));
-    if (!values["policy-only"]) {
+    await fs.mkdir(output, { recursive: true, mode: 0o700 });
+    const stage = await fs.mkdtemp(path.join(output, ".approved-contracts-"));
+    try {
+        const policy = path.join(stage, "multisig_policy.json");
+        const approved = path.join(stage, "approved-contracts.json");
+        if (artifacts) {
+            console.log(`Compiler artifacts selected: ${Object.values(artifacts).join(", ")}`);
+            await fs.copyFile(artifacts.multisig_policy, policy);
+            if (!values["policy-only"]) await command([path.join(repoRoot, "target/release/psy_relayer_cli"), "guardian-prepare-approved-contracts",
+                "--genesis-data", path.join(repoRoot, "genesis.json"), ...Object.values(artifacts).flatMap((artifact) => ["--artifact", artifact]), "--output", approved]);
+        } else {
+            await command([path.join(repoRoot, "target/release/psy_relayer_cli"), "guardian-prepare-approved-contracts",
+                "--genesis-data", path.join(repoRoot, "genesis.json"), "--genesis-abi-dir", path.join(repoRoot, "psy-genesis/genesis_abi"),
+                "--policy-artifact-output", policy, "--output", approved]);
+        }
+        await writePublic(path.join(output, "multisig_policy.json"), await fs.readFile(policy));
+        if (!values["policy-only"]) {
         const chains = [];
         const endpoints = [];
         for (const [chainIndex, network] of ["localhost", "localhostBsc", "localhostBase"].entries()) {
@@ -209,16 +221,10 @@ if (import.meta.main) {
             chains.push(await buildChainAuthorization(summary, deployment, rpc, (code) => command(["cast", "keccak", code])));
             endpoints.push({ chain_index: chainIndex, rpc_url: endpoint });
         }
-        await fs.mkdir(output, { recursive: true, mode: 0o700 });
-        const stage = await fs.mkdtemp(path.join(output, ".approved-contracts-"));
-        try {
-            const approved = path.join(stage, "approved-contracts.json");
-            await command([path.join(repoRoot, "target/release/psy_relayer_cli"), "guardian-prepare-approved-contracts", "--genesis-data", path.join(repoRoot, "genesis.json"),
-                ...Object.values(artifacts).flatMap((artifact) => ["--artifact", artifact]), "--output", approved]);
-            await writePublic(path.join(output, "approved-contracts.json"), await fs.readFile(approved));
-        } finally { await fs.rm(stage, { recursive: true, force: true }); }
+        await writePublic(path.join(output, "approved-contracts.json"), await fs.readFile(approved));
         await writePublic(path.join(output, "chains.json"), JSON.stringify(chains));
         await writePublic(path.join(output, "l1-endpoints.json"), JSON.stringify(endpoints));
-    }
+        }
+    } finally { await fs.rm(stage, { recursive: true, force: true }); }
     console.log(`Guardian public inputs ready: ${output}`);
 }

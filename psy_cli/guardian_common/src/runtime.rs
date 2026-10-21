@@ -175,15 +175,19 @@ impl GuardianConfig {
     }
     pub fn validate(&self) -> Result<()> {
         if self.guardians.keys().copied().collect::<Vec<_>>() != vec![1, 2, 3] { return Err(GuardianSignError::AuthorizationMismatch); }
+        let mut standard = true;
+        let mut rotated = true;
         for (id, signer) in &self.guardians {
-            let key = standard_secret_path(*id, false)?;
-            let password = standard_secret_path(*id, true)?;
-            if signer.signing_key_secret_path != key || signer.signing_key_password_secret_path != password {
-                return Err(GuardianSignError::AuthorizationMismatch);
-            }
-            let _ = split_protected(&key)?;
-            let _ = split_protected(&password)?;
+            let standard_key = standard_secret_path(*id, false)?;
+            let standard_password = standard_secret_path(*id, true)?;
+            let rotated_key = standard_secret_path(id % 3 + 1, false)?;
+            let rotated_password = standard_secret_path(id % 3 + 1, true)?;
+            standard &= signer.signing_key_secret_path == standard_key && signer.signing_key_password_secret_path == standard_password;
+            rotated &= signer.signing_key_secret_path == rotated_key && signer.signing_key_password_secret_path == rotated_password;
+            let _ = split_protected(&signer.signing_key_secret_path)?;
+            let _ = split_protected(&signer.signing_key_password_secret_path)?;
         }
+        if !standard && !rotated { return Err(GuardianSignError::AuthorizationMismatch); }
         if self.client.archive_path != Path::new("archive/relayer-journal") { return Err(GuardianSignError::AuthorizationMismatch); }
         if self.client.endpoints.len() != 3 { return Err(GuardianSignError::AuthorizationMismatch); }
         let mut endpoints = BTreeSet::new();
@@ -446,6 +450,18 @@ mod tests {
         let index = GuardianAuthorizationIndex { active_version: 1, versions: vec![GuardianAuthorizationVersion { version: 1, sha256: Hex([1; 32]) }] };
         let runtime = config.build_runtime_config(Path::new("/guardians-root/config.json"), 1, Path::new("journal.redb"), &index).unwrap();
         assert_eq!(runtime.history_urls, vec!["http://127.0.0.1:9/".to_owned(), "http://b/".to_owned(), "http://c/".to_owned()]);
+    }
+
+    #[test]
+    fn governance_guardian_config_uses_rotated_member_keys() {
+        let mut config = configured(["http://a/", "http://b/", "http://c/"], "127.0.0.1:15541");
+        for (id, signer) in &mut config.guardians {
+            signer.signing_key_secret_path = standard_secret_path(id % 3 + 1, false).unwrap();
+            signer.signing_key_password_secret_path = standard_secret_path(id % 3 + 1, true).unwrap();
+        }
+        config.validate().expect("governance key rotation");
+        config.guardians.get_mut(&1).unwrap().signing_key_password_secret_path = standard_secret_path(1, true).unwrap();
+        assert_eq!(config.validate().unwrap_err(), GuardianSignError::AuthorizationMismatch);
     }
 
     #[test]

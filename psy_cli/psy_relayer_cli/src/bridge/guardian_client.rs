@@ -553,7 +553,7 @@ mod tests {
         let authorization = GuardianAuthorization {
             version: request.authorization_version, network_magic: request.network_magic, genesis_hash: request.genesis_hash, user_id: request.user_id,
             account_json: JsonText::from_value(&psy_vm::ups::multisig::MultisigAccount { contract_id: psy_vm::ups::multisig::MULTISIG_POLICY_CONTRACT_ID, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes: [QHashOut::from_values(1, 2, 3, 4); 8] } }).unwrap(), account_public_key: QHashOut::ZERO, multisig_fingerprint: QHashOut::ZERO,
-            deposit_contract_id: 2, withdrawal_contract_id: 3, fee_contract_id: 0, guta_fee: 0, da_fee: 0, max_fee: 0, max_endcap_proof_bytes: 1, endcap_verifier_fingerprint: QHashOut::from_values(1, 2, 3, 4), chains: vec![], approved_contracts: vec![],
+            deposit_contract_id: 2, withdrawal_contract_id: 3, fee_contract_id: 0, guta_fee: 0, da_fee: 0, max_fee: 0, max_endcap_proof_bytes: 1, endcap_verifier_fingerprint: QHashOut::from_values(1, 2, 3, 4), chains: vec![], approved_contracts: vec![], approved_withdrawal_params: None, approved_next_members: None,
         };
         archive.save_record(&record, &authorization).unwrap();
         let saved = fs::read(path.join("1/included.json")).unwrap();

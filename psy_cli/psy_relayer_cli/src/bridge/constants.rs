@@ -29,9 +29,9 @@ pub const BRIDGE_CLAIM_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_SDC_PATH: &str = "sdc.json";
 
 /// Contract ID of the deposit tree precompile on L2.
-pub const DEPOSIT_TREE_CONTRACT_ID: u32 = 2;
+pub use psy_config::DEPOSIT_TREE_CONTRACT_ID;
 /// Contract ID of the withdrawal tree precompile on L2.
-pub const WITHDRAWAL_TREE_CONTRACT_ID: u32 = 3;
+pub use psy_config::WITHDRAWAL_TREE_CONTRACT_ID;
 
 // ── L1 / contract layout constants ───────────────────────────────────────────
 

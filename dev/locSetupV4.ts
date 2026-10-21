@@ -2913,21 +2913,25 @@ export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv)
     } catch {
         throw new Error("PSY_RELAYER_MULTISIG_ACCOUNT must be a readable public MultisigAccount file with contract 1 and a valid initial two-of-three policy");
     }
+    const governancePath = env.PSY_GOVERNANCE_MULTISIG_ACCOUNT;
+    if (!governancePath?.trim() || !(await fs.promises.stat(path.resolve(cwd, governancePath)).catch(() => null))?.isFile()) {
+        throw new Error("PSY_GOVERNANCE_MULTISIG_ACCOUNT must be a readable public governance account file");
+    }
     const configuredArtifact = env.PSY_MULTISIG_POLICY_ARTIFACT;
     if (!configuredArtifact?.trim()) throw new Error("PSY_MULTISIG_POLICY_ARTIFACT is required for Genesis generation");
     const artifactPath = path.resolve(cwd, configuredArtifact);
     try {
         if (!(await fs.promises.stat(artifactPath)).isFile()) throw new Error("not a regular file");
         const artifact = JSON.parse(await fs.promises.readFile(artifactPath, "utf-8"));
-        if (artifact?.state_tree_height !== 4 || artifact?.abi?.contract?.state_tree_height !== 4
-            || !Array.isArray(artifact.circuit_definitions) || artifact.circuit_definitions.length !== 2
-            || artifact.circuit_definitions.map((definition: { name?: string }) => definition?.name).sort().join(",") !== "get_policy,set_policy") throw new Error("invalid policy artifact");
+        if (artifact?.state_tree_height !== 11 || artifact?.abi?.contract?.state_tree_height !== 11
+            || !Array.isArray(artifact.circuit_definitions) || artifact.circuit_definitions.length !== 6
+            || artifact.circuit_definitions.map((definition: { name?: string }) => definition?.name).sort().join(",") !== "get_chain_mapping,get_params,get_policy,set_chain_mapping,set_params,set_policy") throw new Error("invalid policy artifact");
     } catch {
-        throw new Error("PSY_MULTISIG_POLICY_ARTIFACT must be a readable policy artifact with height 4, ABI, get_policy and set_policy");
+        throw new Error("PSY_MULTISIG_POLICY_ARTIFACT must be a readable policy artifact with height 11 and the six governance methods");
     }
     const childEnv: NodeJS.ProcessEnv = { ...env, PWD: cwd };
     for (const key of ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"]) delete childEnv[key];
-    return { args: [path.join(cwd, "target", "release", "psy_dev_cli"), "generate-genesis-data", "--repo-root", cwd, "--relayer-multisig-account", accountPath, "--multisig-policy-artifact", artifactPath], env: childEnv };
+    return { args: [path.join(cwd, "target", "release", "psy_dev_cli"), "generate-genesis-data", "--repo-root", cwd, "--relayer-multisig-account", accountPath, "--governance-multisig-account", path.resolve(cwd, governancePath), "--multisig-policy-artifact", artifactPath], env: childEnv };
 }
 
 export async function ensureGenesisFiles(cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
@@ -3747,16 +3751,17 @@ export async function resolveGuardianConfigPath(cwd: string, configuredPath: str
     const guardianKeys = guardians && typeof guardians === "object" && !Array.isArray(guardians) ? Object.keys(guardians) : [];
     const home = homedir();
     const signerValid = guardianKeys.length === 3 && ["1", "2", "3"].every((id) => guardianKeys.includes(id))
-        && ["1", "2", "3"].every((id) => {
+        && [false, true].some((rotated) => ["1", "2", "3"].every((id) => {
             const signer = (guardians as Record<string, unknown>)[id];
             if (!signer || typeof signer !== "object" || Array.isArray(signer)) return false;
             const fields = signer as Record<string, unknown>;
+            const keyId = rotated ? String(Number(id) % 3 + 1) : id;
             return Object.keys(fields).length === signerFields.length
                 && signerFields.every((field) => Object.hasOwn(fields, field))
                 && isSocketAddress(fields.listen_address, false)
-                && isStandardSecret(fields.signing_key_secret_path, id, false)
-                && isStandardSecret(fields.signing_key_password_secret_path, id, true);
-        });
+                && isStandardSecret(fields.signing_key_secret_path, keyId, false)
+                && isStandardSecret(fields.signing_key_password_secret_path, keyId, true);
+        }));
     const clientRecord = client && typeof client === "object" && !Array.isArray(client) ? client as Record<string, unknown> : null;
     const endpoints = clientRecord?.endpoints;
     const l1 = clientRecord?.l1_endpoints;
@@ -5345,17 +5350,20 @@ export class DevNetProcessManager {
     async startGuardianServices(cwd: string, daemonConfigPath: string): Promise<void> {
         const config = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath, "utf8"));
         const guardianPath = await resolveGuardianConfigPath(cwd, config.guardian_config as string);
+        const governancePath = path.join(path.dirname(path.dirname(guardianPath)), "governance", "config.json");
+        const roots = [{ label: "guardian", configPath: guardianPath }];
+        if (fs.existsSync(governancePath)) roots.push({ label: "governance_guardian", configPath: governancePath });
         // All three guardians launch concurrently; each spawn blocks on its own 600s
         // HTTP readiness budget and kills its own child when readiness fails. Every
         // successful child is tracked immediately so a failing sibling cannot orphan
         // it; on any failure the still-running children are killed and awaited before
         // startup fails. The relayer therefore starts only after all three are ready.
         const started: RunningProcess[] = [];
-        const results = await Promise.allSettled([1, 2, 3].map((id) => (async () => {
-            const name = `guardian_${id}`;
+        const results = await Promise.allSettled(roots.flatMap((root) => [1, 2, 3].map((id) => (async () => {
+            const name = `${root.label}_${id}`;
             const process = await RunningProcess.spawn([
                 './target/release/psy_relayer_cli', 'guardian-service',
-                '--config', guardianPath, '--guardian-id', String(id), '--db-path', `journal/${id}.redb`,
+                '--config', root.configPath, '--guardian-id', String(id), '--db-path', `journal/${id}.redb`,
             ], {
                 cwd,
                 stdoutLogFile: path.join(cwd, 'logs', `${name}_logs.txt`),
@@ -5364,7 +5372,7 @@ export class DevNetProcessManager {
             });
             started.push(process);
             return this.track(process, name);
-        })()));
+        })())));
         const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
         if (failure) {
             for (const process of started) process.killWithSignal("SIGTERM");
@@ -6174,6 +6182,21 @@ export class DevNetProcessManager {
         if (startBridgeProposerDaemon) {
             await waitForProveProxy("bridge relayer");
             await this.startGuardianServices(cwd, daemonConfigPath!);
+
+            if ((options.l1 || startAll) && l1Network === "localhost" && !l1Fork) {
+                const governanceConfigPath = path.join(path.dirname(daemonConfigPath!), "governance", "config.json");
+                const daemonConfig = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath!, "utf8"));
+                const rpcConfigPath = daemonConfig.rpc_config;
+                if (typeof rpcConfigPath !== "string" || !fs.existsSync(governanceConfigPath)) {
+                    throw new Error("[DevNet] Governance Guardian configuration is required to set localhost chain mappings");
+                }
+                const result = await runAndCapture([
+                    path.join(cwd, "target/release/psy_relayer_cli"), "guardian-set-chain-mappings",
+                    "--rpc-config", path.resolve(cwd, rpcConfigPath), "--guardian-config", governanceConfigPath,
+                ], cwd, { ...this.getEnv(), RUST_LOG: "error" });
+                if (result.code !== 0) throw new Error(`[DevNet] Governance chain mapping setup failed: ${result.stderr || result.stdout}`);
+                console.log(`[DevNet] ${result.stdout.trim()}`);
+            }
 
             // Forward the whole operator config unchanged; the daemon owns protocol and credential validation.
 
@@ -7287,7 +7310,8 @@ Usage: bun run dev/locSetupV4.ts [options]
         }
         if (guardianStartup && !fs.existsSync(guardianStartup.guardianPath)) {
             const result = await runAndCapture([path.join(REPO_ROOT, "target/release/psy_relayer_cli"), "guardian-prepare-account",
-                "--output", path.join(guardianStartup.directory, "relayer-multisig-account.json")], REPO_ROOT, { ...process.env, ...envVars });
+                "--output", path.join(guardianStartup.directory, "relayer-multisig-account.json"),
+                "--governance-output", path.join(guardianStartup.directory, "governance-multisig-account.json")], REPO_ROOT, { ...process.env, ...envVars });
             if (result.code !== 0) throw new Error(`[DevNet] Guardian account preparation failed: ${result.stderr || result.stdout}`);
         }
     }

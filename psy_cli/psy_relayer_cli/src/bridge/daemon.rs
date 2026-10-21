@@ -3445,6 +3445,102 @@ pub(crate) async fn submit_guardian_policy(config: &super::guardian_client::Load
     submit_guardian_operation(config, provider, Vec::new(), &[], operation, Some(next_members), &mut RelayerHistory::default(), None).await
 }
 
+pub(crate) async fn run_guardian_set_chain_mapping(rpc_config: &str, guardian_config: &str, chain_index: u8, l2_contract_id: u32, l1_address: &str) -> anyhow::Result<()> {
+    let address = hex::decode(l1_address.strip_prefix("0x").context("L1 address must start with 0x")?)?;
+    ensure!(address.len() == 20, "L1 address must contain exactly 20 bytes");
+    let address: [u8; 20] = address.try_into().expect("checked L1 address length");
+    run_guardian_chain_mappings(rpc_config, guardian_config, Some((chain_index, l2_contract_id, address))).await
+}
+
+pub(crate) async fn run_guardian_set_chain_mappings(rpc_config: &str, guardian_config: &str) -> anyhow::Result<()> {
+    run_guardian_chain_mappings(rpc_config, guardian_config, None).await
+}
+
+async fn run_guardian_chain_mappings(rpc_config: &str, guardian_config: &str, selected: Option<(u8, u32, [u8; 20])>) -> anyhow::Result<()> {
+    use guardian_common::protocol::{GuardianOperation, GOVERNANCE_USER_ID};
+    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
+    ensure!(config.authorization()?.user_id == GOVERNANCE_USER_ID, "chain mapping requires governance Guardian authorization");
+    let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
+    config.root.validate_rpc_network(external.get_current_network()?)?;
+    let provider = guardian_common::runtime::load_network(&config.root, config.authorization()?)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let archive = super::guardian_client::RelayerArchive::open(&config.config_dir.join(&config.client().archive_path))?;
+    if let Some(pending) = archive.pending_request()? {
+        let request = pending.decode()?;
+        ensure!(request.operation == GuardianOperation::SetChainMapping, "NonceConflict: pending governance operation differs");
+        let call_data: ContractCallData = serde_json::from_value(request.trace_json.decode()?.call_data)?;
+        ensure!(!call_data.contract_calls.is_empty() && call_data.contract_calls.len() <= 16
+            && call_data.contract_calls.iter().all(|call| call.contract_id == u64::from(MULTISIG_POLICY_CONTRACT_ID) && call.method_name == "set_chain_mapping"),
+            "pending governance mapping request contains unsupported calls");
+        println!("resuming pending chain mapping UPS");
+        submit_guardian_mapping_calls(&config, &provider, call_data.contract_calls).await?;
+    }
+    let mut mappings: Vec<(u8, u32, [u8; 20])> = if let Some((chain_index, l2_contract_id, address)) = selected {
+        ensure!(config.authorization()?.chain(chain_index)?.token_mappings.iter().any(|mapping| mapping.l2_contract_id == l2_contract_id && mapping.token.0 == address), "chain/token mapping is absent from Guardian authorization");
+        vec![(chain_index, l2_contract_id, address)]
+    } else {
+        config.authorization()?.chains.iter().flat_map(|chain| chain.token_mappings.iter().map(move |mapping| (chain.chain_index, mapping.l2_contract_id, mapping.token.0))).collect()
+    };
+    mappings.sort_by_key(|(chain_index, l2_contract_id, _)| (*chain_index, *l2_contract_id));
+    ensure!(!mappings.is_empty() && mappings.len() <= 16, "governance UPS requires 1..16 chain mappings");
+    ensure!(mappings.windows(2).all(|pair| (pair[0].0, pair[0].1) != (pair[1].0, pair[1].1)), "multiple L1 tokens target one chain/L2 contract pair");
+    let head = crate::guardian::service::load_guardian_committed_head(&provider, &provider.get_coordinator_url()?).await?.checkpoint_id;
+    let version_slot = provider.get_user_contract_state_tree_leaf_hash(head, GOVERNANCE_USER_ID, MULTISIG_POLICY_CONTRACT_ID, psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT, 4).await?;
+    let mut version = version_slot.0.elements[0].to_canonical_u64();
+    let mut calls = Vec::new();
+    for (chain_index, l2_contract_id, address) in mappings {
+        let mut inputs = vec![version, u64::from(chain_index), u64::from(l2_contract_id), 0, 0, 0];
+        inputs.extend(address.chunks_exact(4).map(|part| u64::from(u32::from_be_bytes(part.try_into().expect("four address bytes")))));
+        let base = if l2_contract_id == 0 { 27u64 } else if l2_contract_id == 4 { 2075u64 } else { anyhow::bail!("unsupported L2 token contract"); };
+        let offset = base + u64::from(chain_index) * 8;
+        let mut stored = Vec::with_capacity(12);
+        for slot in offset / 4..=(offset + 7) / 4 {
+            let leaf = provider.get_user_contract_state_tree_leaf_hash(head, GOVERNANCE_USER_ID, MULTISIG_POLICY_CONTRACT_ID, psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT, slot).await?;
+            stored.extend(leaf.0.elements.map(|felt| felt.to_canonical_u64()));
+        }
+        let start = (offset % 4) as usize;
+        if stored[start..start + 8] == inputs[3..] { continue; }
+        if selected.is_none() { ensure!(stored[start..start + 8].iter().all(|value| *value == 0), "existing chain {chain_index} token {l2_contract_id} mapping differs from Guardian authorization"); }
+        calls.push(ContractCallArgs { contract_id: u64::from(MULTISIG_POLICY_CONTRACT_ID), method_name: "set_chain_mapping".to_owned(), inputs });
+        version = version.checked_add(1).context("policy version overflow")?;
+    }
+    if calls.is_empty() { println!("authorized chain mappings already match contract state"); return Ok(()); }
+    println!("submitting {} chain mappings in one governance UPS", calls.len());
+    submit_guardian_mapping_calls(&config, &provider, calls).await?;
+    Ok(())
+}
+
+async fn submit_guardian_mapping_calls(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, calls: Vec<ContractCallArgs>) -> anyhow::Result<u64> {
+    use guardian_common::protocol::GuardianOperation;
+    let mut relayer_history = RelayerHistory::default();
+    let operation = submit_guardian_operation(config, provider, calls, &[], GuardianOperation::SetChainMapping, None, &mut relayer_history, None);
+    let history = config.serve_history();
+    tokio::select! { result = history => { result?; anyhow::bail!("guardian history listener stopped"); }, result = operation => { let checkpoint = result?; println!("chain mappings included at checkpoint {checkpoint}"); Ok(checkpoint) } }
+}
+
+pub(crate) async fn run_guardian_set_params(rpc_config: &str, guardian_config: &str, paused: bool, psy_per_tx_limit: u64, usdt_per_tx_limit: u64, cooldown_checkpoints: u32) -> anyhow::Result<()> {
+    use guardian_common::protocol::{GuardianOperation, GOVERNANCE_USER_ID};
+    ensure!(psy_per_tx_limit > 0 && usdt_per_tx_limit > 0, "withdrawal limits must be positive");
+    let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
+    ensure!(config.authorization()?.user_id == GOVERNANCE_USER_ID, "withdrawal parameters require governance Guardian authorization");
+    let approved = config.authorization()?.approved_withdrawal_params.context("governance authorization does not approve withdrawal parameter updates")?;
+    ensure!(approved.paused == paused && approved.psy_per_tx_limit == psy_per_tx_limit
+        && approved.usdt_per_tx_limit == usdt_per_tx_limit && approved.cooldown_checkpoints == cooldown_checkpoints,
+        "requested withdrawal parameters differ from governance authorization");
+    let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
+    config.root.validate_rpc_network(external.get_current_network()?)?;
+    let provider = guardian_common::runtime::load_network(&config.root, config.authorization()?)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let head = crate::guardian::service::load_guardian_committed_head(&provider, &provider.get_coordinator_url()?).await?.checkpoint_id;
+    let version_slot = provider.get_user_contract_state_tree_leaf_hash(head, GOVERNANCE_USER_ID, MULTISIG_POLICY_CONTRACT_ID, psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT, 4).await?;
+    let inputs = vec![version_slot.0.elements[0].to_canonical_u64(), u64::from(paused), psy_per_tx_limit, usdt_per_tx_limit, u64::from(cooldown_checkpoints)];
+    let call = ContractCallArgs { contract_id: u64::from(MULTISIG_POLICY_CONTRACT_ID), method_name: "set_params".to_owned(), inputs };
+    let mut relayer_history = RelayerHistory::default();
+    let operation = submit_guardian_operation(&config, &provider, vec![call], &[], GuardianOperation::SetParams, None, &mut relayer_history, None);
+    let history = config.serve_history();
+    tokio::select! { result = history => { result?; anyhow::bail!("guardian history listener stopped"); }, result = operation => { result?; Ok(()) } }
+}
+
 pub(crate) async fn run_guardian_bootstrap(rpc_config: &str, guardian_config: &str) -> anyhow::Result<()> {
     let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
     let members = config.authorization()?.account_json.decode()?.initial_policy.member_hashes;
@@ -3458,6 +3554,9 @@ pub(crate) async fn run_guardian_bootstrap(rpc_config: &str, guardian_config: &s
 
 pub(crate) async fn run_guardian_replace_policy(rpc_config: &str, guardian_config: &str, next_members: [QHashOut<GoldilocksField>; 3]) -> anyhow::Result<()> {
     let config = super::guardian_client::LoadedGuardianConfig::load(Path::new(guardian_config))?;
+    if config.authorization()?.user_id == guardian_common::protocol::GOVERNANCE_USER_ID {
+        ensure!(config.authorization()?.approved_next_members == Some(next_members), "governance member rotation differs from authorization");
+    }
     let external = psy_config::PsyConfigGoldilocks::builder().path(rpc_config).network(psy_config::CURRENT_NETWORK).build()?;
     config.root.validate_rpc_network(external.get_current_network()?)?;
     let provider = guardian_common::runtime::load_network(&config.root, config.authorization()?).map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -3541,11 +3640,17 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     use super::guardian_client::{GuardianClient, RelayerArchive, prove_pending_request};
     use psy_prover::trace::GeneratedTxTraceJson;
     let authorization = config.authorization()?.clone();
+    let user_id = authorization.user_id;
+    ensure!(match operation {
+        GuardianOperation::Bridge | GuardianOperation::Bootstrap => user_id == BRIDGE_USER_ID,
+        GuardianOperation::SetChainMapping | GuardianOperation::SetParams => user_id == GOVERNANCE_USER_ID,
+        GuardianOperation::ReplacePolicy => matches!(user_id, BRIDGE_USER_ID | GOVERNANCE_USER_ID),
+    }, "operation/account mismatch");
     let archive = RelayerArchive::open(&config.config_dir.join(&config.client().archive_path))?;
     let _account_lock = archive.lock()?;
     let mut wallet = WalletSession::new_with_provider(&config.root.network, provider.clone(), Some(authorization.endcap_verifier_fingerprint)).await?;
     let public_key = wallet.add_multisig_user(authorization.account_json.decode()?).await?;
-    ensure!(public_key == authorization.account_public_key && provider.get_user_ids_for_public_key(public_key).await? == vec![BRIDGE_USER_ID_U64], "AccountIdentityConflict");
+    ensure!(public_key == authorization.account_public_key && provider.get_user_ids_for_public_key(public_key).await? == vec![user_id], "AccountIdentityConflict");
     let coordinator_url = provider.get_coordinator_url()?;
     let committed = crate::guardian::service::load_guardian_committed_head(provider, &coordinator_url).await?;
     let head = committed.checkpoint_id;
@@ -3557,7 +3662,11 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     let pending_included = retained.sessions.iter().find(|session| Some(session.nonce) == pending_nonce).cloned();
     let request_json = if let Some(pending) = pending {
         let pending_request = pending.decode()?;
-        if operation != GuardianOperation::Bridge {
+        if matches!(operation, GuardianOperation::SetChainMapping | GuardianOperation::SetParams) {
+            ensure!(pending_request.operation == operation, "NonceConflict: pending governance operation differs");
+            let pending_calls: ContractCallData = serde_json::from_value(pending_request.trace_json.decode()?.call_data)?;
+            ensure!(serde_json::to_value(&pending_calls.contract_calls)? == serde_json::to_value(&calls)?, "NonceConflict: pending governance call differs from requested command");
+        } else if operation != GuardianOperation::Bridge {
             ensure!(pending_policy_matches(&pending_request, operation, next_members.context("policy command requires next members")?)?, "NonceConflict: pending operation or policy members differ from requested command");
         }
         if let Some(session) = pending_included {
@@ -3581,8 +3690,8 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     } else {
         if operation == GuardianOperation::Bridge && calls.is_empty() && withdrawals.is_empty() { return Ok(head); }
         let history = &retained.history;
-        let account_proof = provider.get_user_tree_merkle_proof(head, BRIDGE_USER_ID_U64).await?;
-        let nonce = if account_proof.value == QHashOut::ZERO { 1 } else { provider.get_user_leaf_data(head, BRIDGE_USER_ID_U64).await?.nonce.to_canonical_u64().checked_add(1).context("account nonce overflow")? };
+        let account_proof = provider.get_user_tree_merkle_proof(head, user_id).await?;
+        let nonce = if account_proof.value == QHashOut::ZERO { 1 } else { provider.get_user_leaf_data(head, user_id).await?.nonce.to_canonical_u64().checked_add(1).context("account nonce overflow")? };
         ensure!(history.nonce().checked_add(1) == Some(nonce), "HistoryUnavailable: retained canonical account prefix is incomplete");
         let selected = select_guardian_withdrawals(withdrawals, |sender, contract, nonce| history.contains_burn(sender, contract, nonce))?;
         let records = selected.iter().map(|withdrawal| Ok(WithdrawalBurnRecord {
@@ -3612,12 +3721,17 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
         anchors.sort_by_key(|anchor| anchor.chain_index);
         approved_calls.sort_by_key(|call| call.inputs[0]);
         approved_calls.extend(build_withdrawal_batch_calls(&selected));
-        if operation != GuardianOperation::Bridge {
+        if matches!(operation, GuardianOperation::SetChainMapping | GuardianOperation::SetParams) {
+            ensure!(selected.is_empty() && anchors.is_empty() && approved_calls.is_empty()
+                && if operation == GuardianOperation::SetChainMapping { (1..=16).contains(&calls.len()) } else { calls.len() == 1 },
+                "governance calls cannot mix bridge calls or exceed the mapping batch limit");
+            approved_calls.extend(calls.clone());
+        } else if operation != GuardianOperation::Bridge {
             ensure!(approved_calls.is_empty() && records.is_empty() && anchors.is_empty(), "policy operation cannot mix bridge calls");
             let next_members = next_members.context("policy operation requires exactly three members")?;
             let mut expected = Vec::with_capacity(16);
             for slot in 0..4 {
-                let hash = provider.get_user_contract_state_tree_leaf_hash(head, BRIDGE_USER_ID_U64, MULTISIG_POLICY_CONTRACT_ID, 4, slot).await?;
+                let hash = provider.get_user_contract_state_tree_leaf_hash(head, user_id, MULTISIG_POLICY_CONTRACT_ID, psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT, slot).await?;
                 expected.extend(hash.0.elements.map(|limb| limb.to_canonical_u64()));
             }
             if operation == GuardianOperation::Bootstrap {
@@ -3630,14 +3744,14 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
         }
         if approved_calls.is_empty() { return Ok(head); }
         let call_data = ContractCallData::new(approved_calls);
-        let mut builder = wallet.begin_trace_build_at_checkpoint(public_key, BRIDGE_USER_ID_U64, head, nonce, root).await?;
+        let mut builder = wallet.begin_trace_build_at_checkpoint(public_key, user_id, head, nonce, root).await?;
         for call in &call_data.contract_calls { builder.trace_call(call.clone()).await?; }
         ensure!(builder.required_fee()? <= authorization.max_fee, "fee exceeds guardian authorization");
         let trace = builder.finalize_tx_trace(call_data.software_defined_call.clone()).await?;
         let trace_envelope = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(&call_data).context("trace call_data json")?).context("guardian trace json build")?;
         let envelope_bytes = serde_json::to_string(&trace_envelope).context("guardian trace envelope serialize")?;
         tracing::info!(bytes = envelope_bytes.len(), "guardian request envelope built");
-        let request = GuardianSignRequest { schema_version: 1, authorization_version: authorization.version, network_magic: authorization.network_magic, genesis_hash: authorization.genesis_hash, user_id: BRIDGE_USER_ID_U64, session_nonce: nonce, operation, trace_json: JsonText::parse(envelope_bytes)?, deposit_anchors: anchors, withdrawal_records: records };
+        let request = GuardianSignRequest { schema_version: 1, authorization_version: authorization.version, network_magic: authorization.network_magic, genesis_hash: authorization.genesis_hash, user_id, session_nonce: nonce, operation, trace_json: JsonText::parse(envelope_bytes)?, deposit_anchors: anchors, withdrawal_records: records };
         let context = GuardianVerificationContext { wallet: &wallet, provider, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_endpoints: &config.client().l1_endpoints, history: &history };
         verify_guardian_session(&context, &authorization, &request).await.map_err(|error| anyhow::Error::from(error).context("fresh withdrawal request self-verification"))?;
         JsonText::from_value(&request)?
@@ -3689,7 +3803,7 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
     let start = trace.finalization.submit_end_cap_input.core.checkpoint_id.to_canonical_u64();
     let end_user_leaf_hash = trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
     tracing::debug!(%tx_hash, %end_user_leaf_hash, "waiting for submitted EndCap inclusion");
-    provider.wait_for_endcap_inclusion(BRIDGE_USER_ID_U64, end_user_leaf_hash, start, Some(REALM_CHECKPOINT_POLL_TIMEOUT_SECS), REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
+    provider.wait_for_endcap_inclusion(user_id, end_user_leaf_hash, start, Some(REALM_CHECKPOINT_POLL_TIMEOUT_SECS), REALM_CHECKPOINT_POLL_INTERVAL_SECS).await?;
     let Some(session) = recover_guardian_inclusion(&wallet, provider, config, &archive, request_authorization, history, &request_json).await? else {
         anyhow::bail!("submitted EndCap has no authenticated inclusion");
     };

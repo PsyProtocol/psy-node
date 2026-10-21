@@ -25,10 +25,21 @@ use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeFiel
 pub(crate) struct GuardianCommittedHead { pub checkpoint_id: u64, pub checkpoint_tree_root: Hash4 }
 
 async fn committed_rpc<T: serde::de::DeserializeOwned>(provider: &RpcProvider, url: &str, request: RequestParams<GoldilocksField>) -> Result<T, GuardianSignError> {
+    let stage = match &request {
+        RequestParams::GetLatestCheckpointId => "latest_checkpoint_id",
+        RequestParams::GetCheckpointTreeRoot(_) => "checkpoint_tree_root",
+        _ => "other_committed_rpc",
+    };
     let request = RpcRequest { jsonrpc: Version::V2, request, id: Id::Number(1) };
     let response = provider.client_for_url(url).map_err(|_| GuardianSignError::AuthorizationMismatch)?
-        .post(url).json(&request).send().await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-    if !response.status().is_success() { return Err(GuardianSignError::EvidenceUnavailable); }
+        .post(url).json(&request).send().await.map_err(|error| {
+            tracing::error!(stage, %error, "guardian committed RPC transport failed");
+            GuardianSignError::EvidenceUnavailable
+        })?;
+    if !response.status().is_success() {
+        tracing::error!(stage, status = %response.status(), "guardian committed RPC HTTP failure");
+        return Err(GuardianSignError::EvidenceUnavailable);
+    }
     let mut response = response;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| GuardianSignError::EvidenceUnavailable)? {
@@ -37,7 +48,10 @@ async fn committed_rpc<T: serde::de::DeserializeOwned>(provider: &RpcProvider, u
     }
     match serde_json::from_slice::<RpcResponse<T>>(&bytes).map_err(|_| GuardianSignError::EvidenceUnavailable)?.result {
         ResponseResult::Success(value) => Ok(value),
-        ResponseResult::Error(_) => Err(GuardianSignError::EvidenceUnavailable),
+        ResponseResult::Error(error) => {
+            tracing::error!(stage, ?error, "guardian committed RPC returned an error");
+            Err(GuardianSignError::EvidenceUnavailable)
+        }
     }
 }
 
@@ -50,17 +64,32 @@ pub(crate) async fn load_guardian_committed_head(provider: &RpcProvider, url: &s
 }
 
 async fn verify_genesis(provider: &RpcProvider, head: GuardianCommittedHead, authorization: &GuardianAuthorization) -> Result<(), GuardianSignError> {
-    let leaf = provider.get_checkpoint_leaf_data(0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-    let roots = provider.get_checkpoint_global_state_roots(0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-    let path = provider.get_checkpoint_tree_merkle_proof(head.checkpoint_id, 0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+    let leaf = provider.get_checkpoint_leaf_data(0).await.map_err(|error| {
+        tracing::error!(%error, "guardian checkpoint-0 leaf unavailable");
+        GuardianSignError::EvidenceUnavailable
+    })?;
+    let roots = provider.get_checkpoint_global_state_roots(0).await.map_err(|error| {
+        tracing::error!(%error, "guardian checkpoint-0 state roots unavailable");
+        GuardianSignError::EvidenceUnavailable
+    })?;
+    let path = provider.get_checkpoint_tree_merkle_proof(head.checkpoint_id, 0).await.map_err(|error| {
+        tracing::error!(%error, "guardian checkpoint-0 path from committed head unavailable");
+        GuardianSignError::EvidenceUnavailable
+    })?;
     super::verify::verify_checkpoint(0, &leaf, &roots, &path, head.checkpoint_tree_root)?;
     let actual = Hash256::from(leaf.qfhash::<PsyHasher>()).0;
     if actual != authorization.genesis_hash.0 {
         tracing::error!(actual = %hex::encode(actual), authorized = %hex::encode(authorization.genesis_hash.0), "guardian L2 checkpoint-0 identity differs from authorization");
         return Err(GuardianSignError::AccountIdentityConflict);
     }
-    let root = provider.get_checkpoint_tree_root(0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
-    let path = provider.get_checkpoint_tree_merkle_proof(0, 0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+    let root = provider.get_checkpoint_tree_root(0).await.map_err(|error| {
+        tracing::error!(%error, "guardian checkpoint-0 tree root unavailable");
+        GuardianSignError::EvidenceUnavailable
+    })?;
+    let path = provider.get_checkpoint_tree_merkle_proof(0, 0).await.map_err(|error| {
+        tracing::error!(%error, "guardian checkpoint-0 path unavailable");
+        GuardianSignError::EvidenceUnavailable
+    })?;
     super::verify::verify_checkpoint(0, &leaf, &roots, &path, root)
 }
 
@@ -317,18 +346,20 @@ pub fn refresh_approved_contracts(config_path: &Path, genesis_data_path: &Path, 
     let proof_bound = approved_endcap_max_proof_bytes().context("guardian EndCap proof bound")?;
     let archive = load_authorization_archive(config_path, proof_bound).context("guardian authorization archive")?;
     let ids: Vec<_> = archive.active().0.approved_contracts.iter().map(|contract| contract.contract_id).collect();
-    build_approved_contracts(genesis_data_path, artifact_paths, &ids, output)
+    build_approved_contracts(genesis_data_path, None, artifact_paths, &ids, None, output)
 }
 
-pub fn prepare_approved_contracts(genesis_data_path: &Path, artifact_paths: &[PathBuf], output: &Path) -> anyhow::Result<()> {
-    build_approved_contracts(genesis_data_path, artifact_paths, &[0, 1, 2, 3, 4], output)
+pub fn prepare_approved_contracts(genesis_data_path: &Path, genesis_abi_dir: Option<&Path>, artifact_paths: &[PathBuf], policy_artifact_output: Option<&Path>, output: &Path) -> anyhow::Result<()> {
+    ensure!(genesis_abi_dir.is_some() != !artifact_paths.is_empty(), "provide either --genesis-abi-dir or --artifact paths");
+    build_approved_contracts(genesis_data_path, genesis_abi_dir, artifact_paths, &[0, 1, 2, 3, 4], policy_artifact_output, output)
 }
 
-fn build_approved_contracts(genesis_data_path: &Path, artifact_paths: &[PathBuf], ids: &[u32], output: &Path) -> anyhow::Result<()> {
+fn build_approved_contracts(genesis_data_path: &Path, genesis_abi_dir: Option<&Path>, artifact_paths: &[PathBuf], ids: &[u32], policy_artifact_output: Option<&Path>, output: &Path) -> anyhow::Result<()> {
     use guardian_common::protocol::{ApprovedContract, CompilerArtifact, JsonText};
-    use psy_vm::dpn::contract::dapen_fc_to_cfc_code_definition;
+    use psy_vm::dpn::contract::{cfc_code_definition_to_dapen_fc, dapen_fc_to_cfc_code_definition};
 
     ensure!(!output.exists(), "refusing to overwrite {}", output.display());
+    if let Some(path) = policy_artifact_output { ensure!(!path.exists() && path != output, "refusing to overwrite {}", path.display()); }
     let genesis_file = std::fs::File::open(genesis_data_path).with_context(|| format!("opening Genesis data {}", genesis_data_path.display()))?;
     let genesis: GenesisContractsData = serde_json::from_reader(BufReader::new(genesis_file)).context("parsing Genesis contracts")?;
     let paths: std::collections::BTreeMap<u32, &PathBuf> = artifact_paths.iter().map(|path| {
@@ -338,21 +369,60 @@ fn build_approved_contracts(genesis_data_path: &Path, artifact_paths: &[PathBuf]
         Ok((id, path))
     }).collect::<anyhow::Result<_>>()?;
     let mut refreshed = Vec::new();
+    let mut policy_artifact_json = None;
     for &id in ids {
         let contract = genesis.contracts.get(id as usize).with_context(|| format!("Genesis has no contract {id}"))?;
-        let artifact_path = paths.get(&id).with_context(|| format!("missing compiler artifact for approved contract {id}"))?;
-        let bytes = std::fs::read(artifact_path).with_context(|| format!("reading {}", artifact_path.display()))?;
-        let artifact_text = String::from_utf8(bytes).context("compiler artifact is not UTF-8")?;
-        let compiler_artifact = JsonText::<CompilerArtifact>::parse(artifact_text).context("compiler artifact is not canonical")?;
+        let compiler_artifact = if let Some(abi_dir) = genesis_abi_dir {
+            let abi_name = match id {
+                0 => "PsyTokenContract.json", 1 => "MultisigPolicyContract.json",
+                2 => "PsyDepositTreeContract.json", 3 => "PsyWithdrawalTreeContract.json",
+                4 => "USDTTokenContract.json", _ => anyhow::bail!("no Genesis ABI for approved contract {id}"),
+            };
+            let abi_path = abi_dir.join(abi_name);
+            let abi = serde_json::from_reader(std::fs::File::open(&abi_path).with_context(|| format!("opening {}", abi_path.display()))?)
+                .with_context(|| format!("parsing {}", abi_path.display()))?;
+            let definitions = contract.code_definition.functions.iter().map(|function| cfc_code_definition_to_dapen_fc(&psy_client_data::qdata::contract::ContractFunctionCodeDefinition {
+                method_id: function.method_id, num_inputs: function.num_inputs, num_outputs: function.num_outputs,
+                vm_type: function.vm_type, code: function.code.clone(),
+            }))
+                .collect::<anyhow::Result<Vec<_>>>().with_context(|| format!("decoding Genesis contract {id} functions"))?;
+            JsonText::from_value(&CompilerArtifact { state_tree_height: contract.code_definition.state_tree_height, circuit_definitions: definitions, abi })?
+        } else {
+            let artifact_path = paths.get(&id).with_context(|| format!("missing compiler artifact for approved contract {id}"))?;
+            let bytes = std::fs::read(artifact_path).with_context(|| format!("reading {}", artifact_path.display()))?;
+            let artifact_text = String::from_utf8(bytes).context("compiler artifact is not UTF-8")?;
+            JsonText::<CompilerArtifact>::parse(artifact_text).context("compiler artifact is not canonical")?
+        };
         let artifact = compiler_artifact.decode().context("decoding compiler artifact")?;
         let artifact_code = ContractCodeDefinition { state_tree_height: artifact.state_tree_height, functions: artifact.circuit_definitions.iter().map(dapen_fc_to_cfc_code_definition).collect() };
         ensure!(serde_json::to_value(&artifact_code)? == serde_json::to_value(&contract.code_definition)?, "contract {id} compiler artifact does not match current Genesis");
+        let methods = artifact.abi.pointer("/contract/methods").and_then(serde_json::Value::as_array)
+            .with_context(|| format!("contract {id} ABI has no methods"))?;
+        ensure!(artifact.abi["schema_version"] == "2.0.0"
+            && artifact.abi.pointer("/contract/state_tree_height").and_then(serde_json::Value::as_u64) == Some(u64::from(artifact.state_tree_height))
+            && methods.len() == artifact.circuit_definitions.len(), "contract {id} ABI does not match current Genesis");
+        for definition in &artifact.circuit_definitions {
+            let mut matches = methods.iter().filter(|method| method["method_id"].as_u64() == Some(u64::from(definition.method_id)));
+            let method = matches.next().with_context(|| format!("contract {id} ABI is missing method {}", definition.name))?;
+            ensure!(matches.next().is_none() && method["name"].as_str() == Some(definition.name.as_str())
+                && method["input_felt_count"].as_u64() == Some(definition.circuit_inputs.len() as u64)
+                && method["output_felt_count"].as_u64() == Some(definition.circuit_outputs.len() as u64)
+                && method["state_mutability"].as_str() == Some(if definition.is_view_function() { "view" } else { "external" }),
+                "contract {id} ABI method {} does not match current Genesis", definition.name);
+        }
         let rooted = contract.clone().into_with_whitelist_root::<PoseidonHasher>(N::CONTRACT_FUNCTION_TREE_HEIGHT).with_context(|| format!("computing function root for contract {id}"))?;
         let to_hash4 = |hash: QHashOut<GoldilocksField>| { let v = hash.0.elements; Hash4::from_values(v[0].to_canonical_u64(), v[1].to_canonical_u64(), v[2].to_canonical_u64(), v[3].to_canonical_u64()) };
         let leaf = PsyContractLeaf { deployer: GoldilocksField::from_canonical_u64(rooted.deployer), function_tree_root: to_hash4(rooted.function_whitelist_root), code_root: to_hash4(rooted.code_root), state_tree_height: GoldilocksField::from_canonical_u16(rooted.code_definition.state_tree_height), state_layout_root: Hash4::ZERO, state_layout_field_count: GoldilocksField::ZERO, state_layout_slot_count: GoldilocksField::ZERO };
+        if id == 1 {
+            policy_artifact_json = Some(compiler_artifact.as_str().to_owned());
+        }
         refreshed.push(ApprovedContract { contract_id: id, contract_leaf_json: JsonText::from_value(&leaf)?, compiler_artifact_sha256: sha256(compiler_artifact.as_str().as_bytes()), compiler_artifact_json: compiler_artifact });
     }
     let bytes = serde_json::to_vec(&refreshed)?;
+    if let Some(path) = policy_artifact_output {
+        let policy = policy_artifact_json.context("Genesis has no multisig policy contract")?;
+        std::fs::write(path, policy).with_context(|| format!("writing {}", path.display()))?;
+    }
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(output).with_context(|| format!("creating {}", output.display()))?;
     file.write_all(&bytes)?;
@@ -481,7 +551,10 @@ pub async fn run(config_path: &Path, guardian_id: u8, db_path: &Path) -> Result<
     let head = tokio::time::timeout(Duration::from_secs(30), load_guardian_committed_head(&wallet.st_provider, &runtime.l2_rpc_url)).await
         .map_err(|_| GuardianSignError::EvidenceUnavailable)??;
     verify_genesis(&wallet.st_provider, head, &active).await?;
-    let genesis = wallet.st_provider.get_checkpoint_leaf_data(0).await.map_err(|_| GuardianSignError::EvidenceUnavailable)?;
+    let genesis = wallet.st_provider.get_checkpoint_leaf_data(0).await.map_err(|error| {
+        tracing::error!(%error, "guardian account checkpoint-0 leaf unavailable");
+        GuardianSignError::EvidenceUnavailable
+    })?;
     let created = GuardianAccount { network_magic: active.network_magic, user_id: active.user_id,
         state: GuardianAccountState::Active, last_checkpoint_id: 0, last_checkpoint_hash: genesis.qfhash::<PsyHasher>(), imported_nonce: None,
         authorization_version: active.version, halt_reason: None };

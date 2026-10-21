@@ -54,7 +54,7 @@ fn resolve_bridge_address(deployments_network: &str) -> anyhow::Result<String> {
     super::deployments::resolve_proxy_or_core_address(deployments_network, "Bridge_Proxy", "Bridge", "Bridge_Proxy.json")
 }
 const BRIDGE_USER_ID_U64: u64 = 524288;
-const DEPOSIT_TREE_CONTRACT_ID: u32 = 2;
+use psy_config::DEPOSIT_TREE_CONTRACT_ID;
 const DEPOSIT_TREE_CHAIN_COUNTS_SUBSLOT_BASE: u64 = 8 + (8192 * 8);
 
 fn read_single_felt_from_packed_leaf(leaf: QHashOut<GoldilocksField>, sub_slot_index: u64) -> anyhow::Result<u64> {

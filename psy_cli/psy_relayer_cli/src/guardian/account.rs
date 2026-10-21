@@ -10,24 +10,28 @@ use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MULTISIG_POLICY_CON
 use rand::RngCore;
 use zeroize::Zeroizing;
 
-pub fn run(output: &Path) -> anyhow::Result<()> {
+pub fn run(output: &Path, governance_output: &Path) -> anyhow::Result<()> {
     let directory = home::home_dir().context("home directory unavailable")?.join(".psy/keystore");
-    prepare(&directory, output)?;
-    println!("Guardian public account ready: {} (three signers, threshold two)", output.display());
+    prepare(&directory, output, governance_output)?;
+    println!("Guardian public accounts ready: {} and {} (three signers, threshold two)", output.display(), governance_output.display());
     Ok(())
 }
 
-fn prepare(directory: &Path, output: &Path) -> anyhow::Result<()> {
+fn prepare(directory: &Path, output: &Path, governance_output: &Path) -> anyhow::Result<()> {
     let output = if output.is_absolute() { output.to_path_buf() } else { std::env::current_dir()?.join(output) };
+    let governance_output = if governance_output.is_absolute() { governance_output.to_path_buf() } else { std::env::current_dir()?.join(governance_output) };
+    ensure!(output != governance_output, "governance account output must differ from bridge account output");
     let parent = output.parent().context("account output must have a parent directory")?;
+    let governance_parent = governance_output.parent().context("governance account output must have a parent directory")?;
     fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)?;
     fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(governance_parent)?;
     // Refuse partial custody before creating any additional signing keys.
     for id in 1..=3 {
         let key = directory.join(format!("guardian-{id}.keystore.json"));
         let password = directory.join(format!("guardian-{id}.password"));
         ensure!(!key.try_exists()? || password.try_exists()?, "guardian {id} key exists without its password; recover custody before continuing");
-        ensure!(!output.try_exists()? || (key.try_exists()? && password.try_exists()?), "existing account requires all three existing signing keys; refusing to create replacement identities");
+        ensure!(!(output.try_exists()? || governance_output.try_exists()?) || (key.try_exists()? && password.try_exists()?), "existing account requires all three existing signing keys; refusing to create replacement identities");
     }
     let mut member_hashes = [QHashOut::<GoldilocksField>::ZERO; 8];
     for id in 1..=3 {
@@ -71,15 +75,24 @@ fn prepare(directory: &Path, output: &Path) -> anyhow::Result<()> {
         version: 1, threshold: 2, member_count: 3, member_hashes,
     }};
     account.public_key_param()?;
-    let bytes = serde_json::to_vec(&account)?;
+    let mut governance_account = account.clone();
+    governance_account.initial_policy.member_hashes[..3].rotate_left(1);
+    ensure!(account.public_key_param()? != governance_account.public_key_param()?, "governance account public key must differ");
+    write_public_account(&output, &account)?;
+    write_public_account(&governance_output, &governance_account)?;
+    Ok(())
+}
+
+fn write_public_account(output: &Path, account: &MultisigAccount) -> anyhow::Result<()> {
+    let parent = output.parent().context("account output must have a parent directory")?;
     let name = Path::new(output.file_name().context("account output filename")?);
     if output.try_exists()? {
         let existing = read_protected_file(parent, name, 65536)?;
         let existing: serde_json::Value = serde_json::from_slice(&existing)?;
-        ensure!(existing == serde_json::to_value(&account)?, "existing public account differs from the signing keys; refusing to replace it");
+        ensure!(existing == serde_json::to_value(account)?, "existing public account differs from the signing keys; refusing to replace it");
     } else {
         let (mut file, parent) = create_db_file(parent, name)?;
-        file.write_all(&bytes)?;
+        file.write_all(&serde_json::to_vec(account)?)?;
         file.sync_all()?;
         parent.sync_all()?;
     }
@@ -98,25 +111,28 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let directory = root.join("keystore");
         let output = root.join("account.json");
-        prepare(&directory, &output).unwrap();
-        let files: Vec<_> = (1..=3).flat_map(|id| [directory.join(format!("guardian-{id}.password")), directory.join(format!("guardian-{id}.keystore.json"))]).chain([output.clone()]).collect();
+        let governance_output = root.join("governance.json");
+        prepare(&directory, &output, &governance_output).unwrap();
+        let files: Vec<_> = (1..=3).flat_map(|id| [directory.join(format!("guardian-{id}.password")), directory.join(format!("guardian-{id}.keystore.json"))]).chain([output.clone(), governance_output.clone()]).collect();
         let before: Vec<_> = files.iter().map(|path| fs::read(path).unwrap()).collect();
         for path in &files {
             assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         let account: MultisigAccount = serde_json::from_slice(&before[6]).unwrap();
+        let governance_account: MultisigAccount = serde_json::from_slice(&before[7]).unwrap();
         account.public_key_param().unwrap();
+        assert_ne!(account.public_key_param().unwrap(), governance_account.public_key_param().unwrap());
         assert_eq!(account.initial_policy.member_count, 3);
         assert_eq!(account.initial_policy.threshold, 2);
-        prepare(&directory, &output).unwrap();
+        prepare(&directory, &output, &governance_output).unwrap();
         let after: Vec<_> = files.iter().map(|path| fs::read(path).unwrap()).collect();
         assert_eq!(before, after);
         fs::write(&output, b"{}").unwrap();
-        assert!(prepare(&directory, &output).unwrap_err().to_string().contains("refusing to replace"));
+        assert!(prepare(&directory, &output, &governance_output).unwrap_err().to_string().contains("refusing to replace"));
         assert_eq!(fs::read(&output).unwrap(), b"{}");
         fs::remove_file(&output).unwrap();
         fs::remove_file(directory.join("guardian-1.password")).unwrap();
-        assert!(prepare(&directory, &output).unwrap_err().to_string().contains("recover custody"));
+        assert!(prepare(&directory, &output, &governance_output).unwrap_err().to_string().contains("recover custody"));
         assert!(!output.exists());
         fs::remove_dir_all(root).unwrap();
     }

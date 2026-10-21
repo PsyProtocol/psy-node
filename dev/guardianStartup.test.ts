@@ -37,23 +37,23 @@ describe("Guardian startup preparation", () => {
             const startup = (await planGuardianStartup(cwd, env, true))!;
             const calls: string[][] = [];
             await prepareGuardianStartup(cwd, startup, async (args) => { calls.push(args); });
-            expect(calls).toHaveLength(3);
+            expect(calls).toHaveLength(4);
             expect(calls[0]).toContain(path.join(cwd, "dev/guardianInputs.ts"));
             expect(calls[1]).toContain("--guardians-root");
             expect(calls[1]).toContain("WALLET_PASSWORD");
-            expect(calls[2]).toContain(path.join(cwd, "dev/guardianConfig.ts"));
+            expect(calls[2]).toContain("--governance-authorization");
+            expect(calls[3]).toContain(path.join(cwd, "dev/guardianConfig.ts"));
             expect(await fs.readFile(path.join(cwd, "genesis.json"), "utf8")).toBe("verified fixture");
         });
     });
-    test("reuses a retained root without discovering or regenerating approvals", async () => {
+    test("preserves a retained root and refuses to regenerate approvals", async () => {
         await fixture(async (cwd, env) => {
             const startup = (await planGuardianStartup(cwd, env, true))!;
             await fs.mkdir(path.dirname(startup.guardianPath), { recursive: true });
             await fs.writeFile(startup.guardianPath, "retained config");
             const calls: string[][] = [];
-            await prepareGuardianStartup(cwd, startup, async (args) => { calls.push(args); });
-            expect(calls).toHaveLength(1);
-            expect(calls[0]).toContain(path.join(cwd, "dev/guardianConfig.ts"));
+            await expect(prepareGuardianStartup(cwd, startup, async (args) => { calls.push(args); })).rejects.toThrow("Guardian configuration appeared during startup");
+            expect(calls).toHaveLength(0);
             expect(await fs.readFile(startup.guardianPath, "utf8")).toBe("retained config");
         });
     });

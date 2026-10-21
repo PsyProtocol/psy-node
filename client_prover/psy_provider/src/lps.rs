@@ -96,7 +96,15 @@ impl RpcProvider {
 }
 
 fn is_imt_key_not_found_rpc_error(error: &RpcError) -> bool {
-    error.code.code() == i64::from(IMT_KEY_NOT_FOUND_CODE) && error.message == "Key not found in IMT"
+    // Older Realm edges wrapped the missing key with UNKNOWN_ERROR_CODE (-32001).
+    let code = error.code.code();
+    (code == i64::from(IMT_KEY_NOT_FOUND_CODE) || code == -32001) && error.message == "Key not found in IMT"
+}
+
+fn is_imt_predecessor_not_found_rpc_error(error: &RpcError) -> bool {
+    let code = error.code.code();
+    (code == i64::from(IMT_PREDECESSOR_NOT_FOUND_CODE) && error.message == "No predecessor found")
+        || (code == -32001 && error.message == "No predecessor found for key")
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
@@ -1309,7 +1317,7 @@ impl QMetaDataStoreReaderSync<F> for RpcProvider {
             }
             ResponseResult::Error(e) => {
                 error!("RPC call failed: {:?}", e);
-                if e.code.code() == i64::from(IMT_PREDECESSOR_NOT_FOUND_CODE) {
+                if is_imt_predecessor_not_found_rpc_error(&e) {
                     return Err(ImtLookupError::PredecessorNotFound.into());
                 }
                 Err(anyhow::format_err!("contract_state_imt_find_predecessor rpc call failed `{:?}`", e))
@@ -1342,9 +1350,21 @@ mod imt_error_tests {
     #[test]
     fn generic_server_error_is_not_an_imt_key_miss() {
         let missing = RpcError { code: ErrorCode::ServerError(IMT_KEY_NOT_FOUND_CODE.into()), message: "Key not found in IMT".into(), data: None };
+        let legacy_missing = RpcError { code: ErrorCode::ServerError((-32001).into()), message: "Key not found in IMT".into(), data: None };
         let failure = RpcError { code: missing.code, message: "handler failed".into(), data: None };
         assert!(is_imt_key_not_found_rpc_error(&missing));
+        assert!(is_imt_key_not_found_rpc_error(&legacy_missing));
         assert!(!is_imt_key_not_found_rpc_error(&failure));
+    }
+
+    #[test]
+    fn predecessor_miss_accepts_legacy_rpc_error() {
+        let missing = RpcError { code: ErrorCode::ServerError(IMT_PREDECESSOR_NOT_FOUND_CODE.into()), message: "No predecessor found".into(), data: None };
+        let legacy_missing = RpcError { code: ErrorCode::ServerError((-32001).into()), message: "No predecessor found for key".into(), data: None };
+        let failure = RpcError { code: legacy_missing.code, message: "handler failed".into(), data: None };
+        assert!(is_imt_predecessor_not_found_rpc_error(&missing));
+        assert!(is_imt_predecessor_not_found_rpc_error(&legacy_missing));
+        assert!(!is_imt_predecessor_not_found_rpc_error(&failure));
     }
 }
 

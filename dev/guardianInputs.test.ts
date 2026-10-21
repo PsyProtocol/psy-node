@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { promises as fs } from "node:fs";
-import { buildChainAuthorization, checkGenesisContracts, validateLocalEndpoint } from "./guardianInputs";
+import path from "node:path";
+import { buildChainAuthorization, checkGenesisContracts, readGenesisContracts, validateLocalEndpoint } from "./guardianInputs";
 
 describe("Local Guardian input discovery", () => {
     const address = (byte: string) => `0x${byte.repeat(40)}`;
@@ -74,6 +75,17 @@ describe("Local Guardian input discovery", () => {
             await expect(checkGenesisContracts(genesis, bundle)).rejects.toThrow("contracts differ");
         } finally {
             await fs.rm(directory, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps every Guardian ABI method aligned with the Genesis contract code", async () => {
+        const root = path.resolve(import.meta.dir, "../psy-genesis");
+        const contracts = await readGenesisContracts(path.join(root, "genesis_contracts.json")) as any[];
+        for (const [id, name] of ["PsyTokenContract", "MultisigPolicyContract", "PsyDepositTreeContract", "PsyWithdrawalTreeContract", "USDTTokenContract"].entries()) {
+            const abi = JSON.parse(await fs.readFile(path.join(root, "genesis_abi", `${name}.json`), "utf8"));
+            const codeMethods = contracts[id].code_definition.functions.map((method: any) => method.method_id).sort((a: number, b: number) => a - b);
+            const abiMethods = abi.contract.methods.map((method: any) => method.method_id).sort((a: number, b: number) => a - b);
+            expect(abiMethods).toEqual(codeMethods);
         }
     });
 });

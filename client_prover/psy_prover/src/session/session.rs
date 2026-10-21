@@ -3996,7 +3996,7 @@ impl WalletSession {
         let mut results = reader.to_results();
         let slot_proof = results.merkel_proofs.get(1)
             .ok_or_else(|| anyhow::anyhow!("multisig slot proof missing"))?;
-        anyhow::ensure!(slot_proof.siblings.len() == 4, "multisig contract requires CSTATE height 4");
+        anyhow::ensure!(slot_proof.siblings.len() == psy_config::network_constants::MULTISIG_POLICY_CONTRACT_STATE_TREE_HEIGHT as usize, "multisig contract CSTATE height mismatch");
         results.state.start_contract_state_root = slot_proof.root;
         psy_vm::ups::multisig::StoredMultisigPolicy::load(&results)?;
         Ok(results)
