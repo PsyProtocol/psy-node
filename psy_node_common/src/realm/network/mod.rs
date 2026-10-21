@@ -431,7 +431,7 @@ impl RealmNetwork {
         for address in &config.listen_addresses {
             swarm
                 .listen_on(address.clone())
-                .map_err(|error| NetworkError::Transport(format!("listen {address}: {error}")))?;
+                .map_err(|error| NetworkError::Transport(format!("listen {address}: {error}; details: {error:?}")))?;
         }
         for address in &config.external_addresses {
             swarm.add_external_address(address.clone());
