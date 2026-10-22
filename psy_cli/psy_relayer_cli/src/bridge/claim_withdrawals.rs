@@ -2,7 +2,7 @@ use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, str::FromS
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::Provider;
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
 use alloy_sol_types::{sol, SolCall};
 use anyhow::{Context, Result};
 use clap::Args;
@@ -43,6 +43,11 @@ sol! {
     );
 
     function claimedNullifiers(bytes32 nullifier) view returns (bool);
+    function getRevision() view returns (uint256);
+    function pendingWithdrawals(bytes32 nonce) view returns (
+        address token, address recipient, uint256 amount, uint64 claimableAt
+    );
+    function claimPendingWithdrawal(bytes32 nonce);
 
     function balanceOf(address account) view returns (uint256);
 }
@@ -255,6 +260,77 @@ fn withdrawal_nullifier_from_nonce(nonce: [u32; 8]) -> B256 {
         nonce_bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
     }
     B256::from(nonce_bytes)
+}
+
+fn validate_pending_payment(
+    token: Address, recipient: Address, amount: U256, withdrawal: &PendingWithdrawal,
+) -> Result<()> {
+    anyhow::ensure!(token == u32x8_to_address(withdrawal.token_address)
+        && recipient == u32x8_to_address(withdrawal.recipient)
+        && amount == u32x8_to_u256(withdrawal.amount),
+        "registered withdrawal does not match requested token/recipient/amount; manual reconciliation required");
+    Ok(())
+}
+
+/// Called only for an occupied nonce or a successful registration receipt.
+/// V2 pays during registration. V3 consumes the nonce before paying, so keep
+/// the daemon claim pending until its second, idempotently recoverable step.
+async fn finish_registered_payment<P: Provider>(
+    provider: &P, bridge: Address, withdrawal: &PendingWithdrawal, sender: Address,
+    minimum_block: Option<u64>, fee_policy: Option<&super::l1_fees::BscFeePolicy>,
+) -> Result<()> {
+    let block = provider.get_block_by_number(BlockNumberOrTag::Latest).await?
+        .context("latest L1 block unavailable")?;
+    anyhow::ensure!(block.header.number >= minimum_block.unwrap_or(0),
+        "RPC snapshot predates registration receipt; defer reconciliation");
+    let snapshot_hash = block.header.hash;
+    let nonce = withdrawal_nullifier_from_nonce(withdrawal.nonce);
+    let occupied = TransactionRequest::default().to(bridge)
+        .input(claimedNullifiersCall { nullifier: nonce }.abi_encode().into());
+    let raw = provider.call(occupied.clone()).hash_canonical(snapshot_hash).await?;
+    anyhow::ensure!(claimedNullifiersCall::abi_decode_returns(&raw)?,
+        "registration not visible at pinned canonical snapshot; defer payment");
+    let revision_tx = TransactionRequest::default().to(bridge)
+        .input(getRevisionCall {}.abi_encode().into());
+    let raw = provider.call(revision_tx).hash_canonical(snapshot_hash).await.context("Bridge revision read failed")?;
+    let revision = getRevisionCall::abi_decode_returns(&raw)?;
+    if revision == U256::from(2) { return Ok(()); }
+    anyhow::ensure!(revision == U256::from(3), "unsupported Bridge revision {revision}; payment not marked complete");
+    let read_pending = || TransactionRequest::default().to(bridge)
+        .input(pendingWithdrawalsCall { nonce }.abi_encode().into());
+    let raw = provider.call(read_pending()).hash_canonical(snapshot_hash).await.context("pending withdrawal read failed")?;
+    let pending = pendingWithdrawalsCall::abi_decode_returns(&raw)?;
+    // Old V2 payments have occupied nonces and no V3 pending record; V3
+    // deletes its pending record atomically with the actual asset transfer.
+    if pending.amount == U256::ZERO { return Ok(()); }
+    validate_pending_payment(pending.token, pending.recipient, pending.amount, withdrawal)?;
+    anyhow::ensure!(block.header.timestamp >= pending.claimableAt,
+        "withdrawal registered; awaiting claimableAt={}", pending.claimableAt);
+    let confirmed_nonce = provider.get_transaction_count(sender).await?;
+    let pending_nonce = provider.get_transaction_count(sender).pending().await?;
+    anyhow::ensure!(confirmed_nonce == pending_nonce,
+        "signer has an outstanding L1 transaction; reconcile before pending payment");
+    let mut tx = TransactionRequest::default().to(bridge)
+        .input(claimPendingWithdrawalCall { nonce }.abi_encode().into());
+    super::l1_fees::prepare_l1_fees(provider, &mut tx, fee_policy).await?;
+    let gas = provider.estimate_gas(tx.clone()).await.context("pending payment gas estimate failed")?;
+    anyhow::ensure!(gas <= 500_000, "pending payment exceeds 500000 gas budget");
+    tx.gas = Some(gas.saturating_mul(6).saturating_add(4) / 5);
+    anyhow::ensure!(tx.gas.unwrap() <= 500_000, "pending payment gas with margin exceeds budget");
+    let sent = timeout(Duration::from_secs(L1_TX_SEND_TIMEOUT_SECS), provider.send_transaction(tx))
+        .await.context("pending payment send timed out; reconcile on next round")??;
+    tracing::info!(nonce = %nonce, tx_hash = %sent.tx_hash(), "pending withdrawal payment submitted");
+    let receipt = timeout(Duration::from_secs(L1_TX_RECEIPT_TIMEOUT_SECS), sent.get_receipt())
+        .await.context("pending payment receipt timed out; reconcile on next round")??;
+    anyhow::ensure!(receipt.status(), "pending payment reverted; retain claim for reconciliation");
+    let paid_hash = receipt.block_hash.context("payment receipt missing block hash")?;
+    let raw = provider.call(occupied).hash_canonical(paid_hash).await?;
+    anyhow::ensure!(claimedNullifiersCall::abi_decode_returns(&raw)?, "payment receipt has no occupied nonce");
+    let raw = provider.call(read_pending()).hash_canonical(paid_hash).await.context("pending payment postcheck failed")?;
+    anyhow::ensure!(pendingWithdrawalsCall::abi_decode_returns(&raw)?.amount == U256::ZERO,
+        "pending payment receipt did not clear pending record");
+    tracing::info!(nonce = %nonce, tx_hash = %receipt.transaction_hash, "withdrawal payment confirmed");
+    Ok(())
 }
 
 async fn erc20_balance_of<P: Provider>(provider: &P, token: Address, owner: Address) -> Result<U256> {
@@ -585,6 +661,7 @@ pub async fn submit_batch(
     let rpc_url = l1_rpc_url
         .parse()
         .with_context(|| format!("invalid L1 rpc url: {}", l1_rpc_url))?;
+    let payment_sender = wallet.default_signer().address();
     let provider = connect_l1_with_wallet(rpc_url, wallet)?;
     // All fee preparation failures occur before broadcast, so preserve claims
     // without spending their limited attempts, even during an RPC outage.
@@ -642,6 +719,10 @@ pub async fn submit_batch(
 
         match withdrawal_already_claimed(&provider, bridge, w).await {
             Ok(true) => {
+                if let Err(error) = finish_registered_payment(&provider, bridge, w, payment_sender, None, fee_policy).await {
+                    deferrals.insert(w.leaf_hash.clone(), format!("registered withdrawal payment deferred: {error:#}"));
+                    continue;
+                }
                 tracing::info!(
                     index = i,
                     recipient = %recipient_addr,
@@ -1010,8 +1091,18 @@ pub async fn submit_batch(
                 {
                     Ok(Ok(receipt)) => {
                         if receipt.status() {
-                            submitted_count += meta.chunk.len();
-                            resolved_leaf_hashes.extend(leaf_hashes.iter().cloned());
+                            for claim in &meta.chunk {
+                                match finish_registered_payment(&provider, bridge, &claim.withdrawal, payment_sender, Some(receipt.block_number.unwrap_or(u64::MAX)), fee_policy).await {
+                                    Ok(()) => {
+                                        submitted_count += 1;
+                                        resolved_leaf_hashes.push(claim.withdrawal.leaf_hash.clone());
+                                    }
+                                    Err(error) => {
+                                        deferrals.insert(claim.withdrawal.leaf_hash.clone(),
+                                            format!("withdrawal registered; payment deferred: {error:#}"));
+                                    }
+                                }
+                            }
                             tracing::info!(
                                 tx_hash = %receipt.transaction_hash,
                                 root = %root_hex,
@@ -1157,6 +1248,22 @@ mod tests {
             nonce: [0, 0, 0, 0, 0, 0, 0, nonce],
             leaf_hash: leaf.to_string(),
         }
+    }
+
+    #[test]
+    fn pending_payment_requires_exact_request_identity() {
+        let w = conflict_withdrawal("payment", 42, 77);
+        let token = u32x8_to_address(w.token_address);
+        let recipient = u32x8_to_address(w.recipient);
+        let amount = u32x8_to_u256(w.amount);
+        assert!(validate_pending_payment(token, recipient, amount, &w).is_ok());
+        assert!(validate_pending_payment(Address::repeat_byte(1), recipient, amount, &w).is_err());
+        assert!(validate_pending_payment(token, Address::repeat_byte(1), amount, &w).is_err());
+        assert!(validate_pending_payment(token, recipient, amount + U256::from(1), &w).is_err());
+        // A consumed nonce belonging to another user's request must not be
+        // treated as evidence that this request has been paid.
+        let other = conflict_withdrawal("other", 43, 77);
+        assert!(validate_pending_payment(token, recipient, amount, &other).is_err());
     }
 
     #[test]
