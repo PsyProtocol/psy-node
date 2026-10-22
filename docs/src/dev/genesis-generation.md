@@ -44,6 +44,7 @@ network config -------------> build-time constants and runtime membership valida
   - [1.1 Trigger](#11-trigger)
   - [1.2 Command](#12-command)
   - [1.2.1 Public bridge multisig account](#121-public-bridge-multisig-account)
+  - [1.2.2 First-workspace guardian provisioning](#122-first-workspace-guardian-provisioning)
   - [1.3 Outputs](#13-outputs)
   - [1.4 Verification](#14-verification)
 - [2. `psy-genesis/` Repository Artifacts](#2-psy-genesis-repository-artifacts)
@@ -83,7 +84,7 @@ The equivalent command from the repository root is:
 ./target/release/psy_dev_cli generate-genesis-data \
   --repo-root .
 ```
-There is no `--relayer-multisig-account` flag and no `PSY_RELAYER_MULTISIG_ACCOUNT` variable (`Makefile:141-142`). The compiler artifact is `<projects>/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`, where `<projects>` is `$PSY_PROJECTS_DIR` or the parent of `--repo-root`. There is no `--multisig-policy-artifact` flag and no `PSY_MULTISIG_POLICY_ARTIFACT` variable. The Make target strips secret-bearing legacy enrollment variables from the generator child environment; it does not change L1 custody in the parent process. Full startup always generates a fresh Genesis after its preflight. A missing checked-in policy fails before any destruction. Application restart does not generate Genesis. Sources: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:72-76`; `Makefile:141-142`; `dev/locSetupV4.ts:3113-3167`. The `--guardians-root` branch of the same command is documented in §4.
+There is no `--relayer-multisig-account` flag and no `PSY_RELAYER_MULTISIG_ACCOUNT` variable (`Makefile:141-142`). The compiler artifact is `<projects>/psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json`, where `<projects>` is `$PSY_PROJECTS_DIR` or the parent of `--repo-root`. There is no `--multisig-policy-artifact` flag and no `PSY_MULTISIG_POLICY_ARTIFACT` variable. The Make target strips secret-bearing legacy enrollment variables from the generator child environment; it does not change L1 custody in the parent process. Full startup always generates a fresh Genesis after its preflight. A missing operator-provisioned policy fails before any destruction. Application restart does not generate Genesis. Sources: `psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs:72-76`; `Makefile:141-142`; `dev/locSetupV4.ts:3113-3167`. The `--guardians-root` branch of the same command is documented in §4. The first-workspace procedure that produces the policy string is [§1.2.2](#122-first-workspace-guardian-provisioning).
 
 ### 1.2.1 Public bridge multisig account
 
@@ -94,6 +95,68 @@ The sibling compiler artifact contains the approved policy contract's ABI 2.0.0 
 The generator derives the account identity from the actual `MultisigSignatureCircuit` fingerprint and the initial public policy. It initializes contract 1 with header `[1, 2, 3, 0]` in slot 0 and the three member commitments in slots 1 through 3. Contract 0 slot 0 holds the configured nonzero canonical initial fee balance. The user nonce is zero, but the policy is already initialized: the first signed session uses the current initial policy, not pristine-account bootstrap. No relayer master secret is generated, decrypted, or exported.
 
 L1 transaction keystores and passwords remain separate operator custody inputs; they do not select this L2 identity. Do not regenerate an existing chain to rotate members. Use a current-quorum-authorized policy replacement instead. Current quality assurance for public Genesis construction, initialized-state proofs, and startup is pending; the input contract does not establish that generated artifacts are ready for use.
+
+#### 1.2.2 First-workspace guardian provisioning
+
+A clean checkout has no portable guardian development keys and no checked-in `bridge_relayer_signing_policy`. Copying another workspace's policy does not provision this workspace: guardian `id` authenticates `member_hashes[id - 1]`, and a mismatch returns `AccountIdentityConflict` (`psy_cli/psy_relayer_cli/src/guardian/service.rs:278-285`). There is no environment-policy alias, authorization sidecar, or universal development policy. The only supported input is the operator-provisioned canonical public string on the selected network of the existing `psy-genesis/config.json`.
+
+If both `guardian-<id>.keystore.json` and `guardian-<id>.password` already exist as this user's regular files, use the reuse command below and do not create either file again. Creation is only for a guardian whose two final names are both absent. If either name exists, including a symlink or a dangling symlink, stop: do not overwrite, truncate, or recreate it.
+
+The six secret paths are fixed by `guardian_secret_paths` (`psy_cli/guardian_common/src/runtime.rs:100-107`):
+
+```text
+$HOME/.psy/keystore/guardian-1.keystore.json
+$HOME/.psy/keystore/guardian-1.password
+$HOME/.psy/keystore/guardian-2.keystore.json
+$HOME/.psy/keystore/guardian-2.password
+$HOME/.psy/keystore/guardian-3.keystore.json
+$HOME/.psy/keystore/guardian-3.password
+```
+
+Before the creation block, verify the directory the block will use. `$HOME/.psy/keystore` must already exist. It must be mode `0700`, owned by this user, and every ancestor from `/` through `.psy` must be a real directory with no symlink component. This user is the only one trusted to mutate it, and no other same-uid process may mutate it during creation. Do not run `mkdir` or `chmod` here: both follow a directory symlink. Inspect the existing path with `namei`, which displays symlink components as `l` and then follows them in the listing:
+
+```bash
+namei -l "$HOME/.psy/keystore"
+```
+
+Stop if any component is `l`, or if the listing continues past that component into the symlink target. The final line must be this user's `drwx------` directory. Each final secret path must already be an effective-uid regular file in mode `0600` before generation; the checker walks metadata with `AT_SYMLINK_NOFOLLOW` and never opens the files (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs:822-848`). A symlink or an extra hard link at the final path fails closed.
+
+`wallet create --output <path>` writes that exact file. `Wallet::save` passes the `--output` file name to `PrivateKeySigner::encrypt_keystore`, which forwards it to `eth-keystore` 0.5.0 `encrypt_key`; with a name, that function writes `directory/name` (`client_prover/psy_provider/src/wallet/secp_wallet.rs:209-225`; `eth-keystore-0.5.0/src/lib.rs:223-255`). Create it inside a private staging directory, then publish with `ln -T`. `wallet info` and `wallet random` print secret-bearing output and are not part of this procedure (`client_prover/psy_cli/psy_user_cli/src/subcommand/wallet.rs:65-90`).
+
+Run the binary from `<repo-root>` as the keystore owner, only after the `namei` check above passes. Do not pass `--password`, `--wallet-password`, or `--private-key`: those flags put the secret in argv. Omit `--password` so creation reads it with `rpassword::read_password()`, which opens `/dev/tty` (`rpassword` 7.4.0). A pipe does not answer that prompt. Repeat for guardians 2 and 3 only when that guardian's two final names are both absent. The three `Public Key:` lines are the only values copied forward.
+
+```bash
+set +x
+set -euo pipefail
+umask 077
+keystore=$HOME/.psy/keystore
+stage=$(mktemp -d "$keystore/.guardian-1.XXXXXXXX")
+(umask 077; : > "$stage/password")
+IFS= read -r -s GUARDIAN_PASSWORD < /dev/tty
+test -n "$GUARDIAN_PASSWORD"
+printf '%s' "$GUARDIAN_PASSWORD" > "$stage/password"
+unset GUARDIAN_PASSWORD
+printf '\n'
+./target/release/psy_user_cli wallet create --output "$stage/keystore.json"
+ln -T "$stage/keystore.json" "$keystore/guardian-1.keystore.json"
+ln -T "$stage/password" "$keystore/guardian-1.password"
+rm -rf -- "$stage"
+```
+
+Type the same password at `Enter password for wallet:`. The password file must be one nonempty UTF-8 line with no CR, LF, NUL, or leading U+FEFF; surrounding spaces are significant and are not trimmed (`psy_cli/guardian_common/src/runtime.rs:73-76,238-246`). `set +x` keeps the password out of an xtrace. `IFS= read -r -s ... < /dev/tty` reads it from the terminal without echo, trimming, or a shell-history entry, and `test -n` rejects an empty password. Do not `echo` it, export it, or redirect the CLI transcript into a log. `umask 077` makes the staging directory, password file, and keystore mode `0700` or `0600`.
+
+`ln -T` adds one hard link and fails with `File exists` when the destination is any existing file, symlink, or dangling symlink. It does not follow or replace that destination. Publish the keystore first and the password second. If either `ln` fails, stop and keep `$stage`: it holds the only copies. Do not delete it and do not retry creation over the surviving final name. After both links succeed, `rm -rf -- "$stage"` drops the extra links; the two final names remain one regular file each.
+
+When both final files for a guardian already exist, skip creation. Load that exact keystore with its existing password file. `wallet load` without `--wallet-password` prompts `Enter password for keystore:` on `/dev/tty` and prints `ETH Address:` and `Public Key:` only (`wallet.rs:42-50`; `secp_wallet.rs:228-244`). The printed public key is `hash_no_pad_compressed_public_key` of the compressed secp256k1 key (`secp_wallet.rs:79-85,396-397`), the same value `authenticate_key_slot` compares. Copy the `Public Key:` hex into the matching slot: guardian 1 is slot 0, guardian 2 is slot 1, and guardian 3 is slot 2. Do not sort the three hashes.
+
+```bash
+./target/release/psy_user_cli wallet load \
+  --keystore-path "$HOME/.psy/keystore/guardian-1.keystore.json"
+```
+
+Build one JSON string from those three printed hashes. `JsonText::parse` decodes it as `MultisigAccount` and accepts it when the decoded value reserializes to the same value (`psy_cli/guardian_common/src/protocol.rs:57-65,116-122`). Canonical here means the JSON value, not one exact text layout: whitespace and object key order are not significant. The value has exactly two fields, `contract_id` and `initial_policy`. `initial_policy` has exactly `version`, `threshold`, `member_count`, and `member_hashes`. `contract_id` is `1`, `version` is `1`, `threshold` is `2`, and `member_count` is `3`. `member_hashes` has eight lowercase hex strings. Slots 0 through 2 are the three distinct nonzero `Public Key:` values. Slots 3 through 7 are each `0000000000000000000000000000000000000000000000000000000000000000`. No unknown or duplicate field is accepted.
+
+Put that one JSON **string** at `networks.<selected>.guardian_authorization.bridge_relayer_signing_policy` in `psy-genesis/config.json`. On a new chain the object may contain only that field. Do not write `genesis_hash`, `multisig_fingerprint`, `endcap_verifier_fingerprint`, `max_fee`, `approved_contracts`, or `chains` by hand; publish adds those six fields later and preserves this string. Do not commit the password files, keystores, post-deployment authorization, or another operator's policy as a development default. Editing the policy of an already deployed chain is not provisioning: replace it only through the current two-of-three quorum.
 
 ### 1.3 Outputs
 
@@ -164,7 +227,7 @@ Identity is checked end to end before any output exists. Construct `MultisigSign
 
 The guardians-root branch does not create authorization databases. Public authorization is the `guardian_authorization` object on `networks[CURRENT_NETWORK]` inside `psy-genesis/config.json`. The fresh helper publishes that object after the three local deployments by rewriting the authorization while preserving the pinned `bridge_relayer_signing_policy` string and keeping every other network. The helper command is `fresh-devnet-state --repo-root <repo-root> --guardians-root <root>`; it takes no policy path. Preflight pins the canonical config device and inode and the exact policy bytes, then revalidates both before reset and before publish (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs:205-247`; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:39-95`; `dev/locSetupV4.ts:4079-4082`).
 
-First fresh startup is policy-only: before the deploy, the checked-in config must contain only the `bridge_relayer_signing_policy` string on the selected network; the remaining six authorization fields may be absent (`guardians_root.rs:186-197`). After the three local deployments, the fresh helper builds the complete seven-field `GuardianAuthorization` from those pinned policy bytes and publishes it once. Runtime is full-authorization: `GuardianDb` opens only against the complete `GuardianAuthorization`, and every sign request binds its `authorization_sha256`, so a partial object or a digest mismatch fails closed (`psy_cli/guardian_common/src/protocol.rs:241-246`; `psy_cli/guardian_common/src/db.rs:111-121`).
+First fresh startup is policy-only: before the deploy, the operator-provisioned canonical config must contain the `bridge_relayer_signing_policy` string on the selected network; the remaining six authorization fields may be absent (`guardians_root.rs:186-224`). That string is produced by [§1.2.2](#122-first-workspace-guardian-provisioning), not by a portable checked-in development policy. After the three local deployments, the fresh helper builds the complete seven-field `GuardianAuthorization` from those pinned policy bytes and publishes it once. Runtime is full-authorization: `GuardianDb` opens only against the complete `GuardianAuthorization`, and every sign request binds its `authorization_sha256`, so a partial object or a digest mismatch fails closed (`psy_cli/guardian_common/src/protocol.rs:241-246`; `psy_cli/guardian_common/src/db.rs:111-121`).
 
 ```text
 <guardian_root>/db/guardian-1.redb
@@ -233,7 +296,7 @@ First-signature timing, quorum, and whole-flow E2E are NOT VERIFIED. `psy_cli/ps
 | Failure | Response |
 |---|---|
 | `make generate-genesis-data` fails | Do not ship the partial `genesis.json`; fix the generator input and rerun |
-| Missing canonical `bridge_relayer_signing_policy`, a missing sibling compiler artifact, or an invalid public account | Fail closed before destruction. Put the public policy in the selected network of `psy-genesis/config.json` and supply the compiler checkout; do not fall back to a keystore, a plaintext key, or `deterministic_private_key(2)`. There is no `PSY_RELAYER_MULTISIG_ACCOUNT` or `PSY_MULTISIG_POLICY_ARTIFACT`. |
+| Missing canonical `bridge_relayer_signing_policy`, a missing sibling compiler artifact, or an invalid public account | Fail closed before destruction. Provision this workspace's public policy in the selected network of `psy-genesis/config.json` ([§1.2.2](#122-first-workspace-guardian-provisioning)) and supply the compiler checkout; do not fall back to a keystore, a plaintext key, `deterministic_private_key(2)`, or another operator's policy. There is no `PSY_RELAYER_MULTISIG_ACCOUNT` or `PSY_MULTISIG_POLICY_ARTIFACT`. |
 | Relayer cannot authorize user `524288` | Registration 2 was not initialized from the selected `bridge_relayer_signing_policy` and the sibling compiler artifact. There is no policy-file flag. Regenerate Genesis from those inputs on a new chain; do not paste a plaintext key into daemon config. |
 | `validators` entries differ from the selected runtime membership | Core startup injects the selected ordered validators; component-only startup does not rewrite them. Diagnose configuration drift before the next authorized core startup. |
 | Provenance mismatch in `psy-genesis` stamp | Rebuild `make gen-deploy-json` from the committed clean compiler revision after its node pin and lockfile are final; never hand-edit provenance JSON |

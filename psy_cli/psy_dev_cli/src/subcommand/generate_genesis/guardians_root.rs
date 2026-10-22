@@ -200,7 +200,7 @@ fn extract_policy_string(config: &serde_json::Value) -> anyhow::Result<String> {
     let field = format!("networks.{}.guardian_authorization.bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK);
     let pointer = format!("/networks/{}/guardian_authorization/bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK);
     let value = config.pointer(&pointer).with_context(|| format!(
-        "canonical config psy-genesis/config.json is missing {field}: the checked-in public MultisigAccount signing policy is a required prerequisite before generation or publish"
+        "canonical config psy-genesis/config.json is missing {field}: the operator-provisioned canonical public MultisigAccount signing policy is a required prerequisite before generation or publish (docs/src/dev/genesis-generation.md)"
     ))?;
     value.as_str().map(str::to_owned)
         .with_context(|| format!("{field} must be the public MultisigAccount JSON string"))
@@ -223,14 +223,14 @@ pub fn checked_canonical_policy(repo_root: &Path) -> anyhow::Result<(MultisigAcc
     })
 }
 
-/// Pins the canonical config file identity (device and inode) and its full
-/// bytes, including the selected-network signing-policy string, before any
-/// reset. Revalidation fails closed before publish; the helper's own
-/// `publish_guardian_authorization_unchanged` is the only authorized writer of
-/// the postdeploy authorization update.
+/// Pins the open canonical-config descriptor and its full bytes, including the
+/// selected-network signing-policy string, before any reset. The descriptor stays
+/// open so its inode cannot be recycled. Revalidation fails closed before publish
+/// when that path no longer names the held file or any pinned byte changed. The
+/// helper's own `publish_guardian_authorization_unchanged` is the only authorized
+/// writer of the postdeploy authorization update.
 pub struct CanonicalPolicyPin {
-    device: u64,
-    inode: u64,
+    file: std::fs::File,
     config_bytes: Vec<u8>,
     policy_bytes: Vec<u8>,
 }
@@ -240,25 +240,27 @@ impl CanonicalPolicyPin {
     pub fn pin(repo_root: &Path) -> anyhow::Result<Self> {
         let path = canonical_config_path(repo_root);
         let file = open_canonical_config(&path)?;
-        let metadata = file.metadata().with_context(|| format!("reading {}", path.display()))?;
+        ensure!(file.metadata().with_context(|| format!("reading {}", path.display()))?.is_file(), "{} must be a regular file", path.display());
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut &file, &mut bytes).with_context(|| format!("reading {}", path.display()))?;
         let config = duplicate_free_config(&bytes)?;
         let policy = extract_policy_string(&config)?;
         checked_policy(policy.as_bytes())?;
-        Ok(Self { device: metadata.dev(), inode: metadata.ino(), config_bytes: bytes, policy_bytes: policy.into_bytes() })
+        Ok(Self { file, config_bytes: bytes, policy_bytes: policy.into_bytes() })
     }
 
     /// The pinned signing-policy bytes for `build_fresh_devnet_authorization`.
     pub fn policy_bytes(&self) -> &[u8] { &self.policy_bytes }
 
     /// Fails closed when the canonical config was replaced or any pinned byte,
-    /// including the signing-policy string, changed in place.
+    /// including the signing-policy string, changed in place. Device and inode
+    /// come from the descriptor kept open since `pin`, compared with a fresh open.
     pub fn validate(&self, repo_root: &Path) -> anyhow::Result<()> {
         let path = canonical_config_path(repo_root);
         let file = open_canonical_config(&path)?;
-        let metadata = file.metadata().with_context(|| format!("reading {}", path.display()))?;
-        ensure!(metadata.dev() == self.device && metadata.ino() == self.inode, "canonical config {} was replaced during fresh startup", path.display());
+        let current = file.metadata().with_context(|| format!("reading {}", path.display()))?;
+        let pinned = self.file.metadata().with_context(|| format!("reading {}", path.display()))?;
+        ensure!(current.is_file() && current.dev() == pinned.dev() && current.ino() == pinned.ino(), "canonical config {} was replaced during fresh startup", path.display());
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut &file, &mut bytes).with_context(|| format!("reading {}", path.display()))?;
         ensure!(bytes == self.config_bytes.as_slice(),
@@ -347,12 +349,14 @@ pub fn publish_guardian_authorization_unchanged(
         ensure!(fd >= 0, "reading {} failed: {}", path.display(), std::io::Error::last_os_error());
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let metadata = file.metadata().with_context(|| format!("reading {}", path.display()))?;
+        ensure!(metadata.is_file(), "{} must be a regular file", path.display());
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut &file, &mut bytes).with_context(|| format!("reading {}", path.display()))?;
         Ok((metadata, bytes))
     };
+    let pinned = pin.file.metadata().with_context(|| format!("reading {}", path.display()))?;
     let unchanged = |current: &(std::fs::Metadata, Vec<u8>)| -> bool {
-        current.0.dev() == pin.device && current.0.ino() == pin.inode && current.1.as_slice() == pin.config_bytes.as_slice()
+        current.0.is_file() && current.0.dev() == pinned.dev() && current.0.ino() == pinned.ino() && current.1.as_slice() == pin.config_bytes.as_slice()
     };
     let current = read_current(&parent)?;
     ensure!(unchanged(&current),
@@ -370,6 +374,7 @@ pub fn publish_guardian_authorization_unchanged(
         path.display(), psy_config::CURRENT_NETWORK);
     publish_replaced(&parent, &path, &body, 0o644)
 }
+
 /// No-follow open of the canonical config; the returned descriptor backs every
 /// read and metadata check so a symlink swap cannot redirect them.
 fn open_canonical_config(path: &Path) -> anyhow::Result<std::fs::File> {
@@ -1209,17 +1214,21 @@ mod tests {
         let root = std::env::temp_dir().join(format!("psy-policy-pin-{}", rand::random::<u64>()));
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
+        let path = root.join("psy-genesis/config.json");
         let write_config = |config: &serde_json::Value| {
-            std::fs::write(root.join("psy-genesis/config.json"), serde_json::to_vec_pretty(config).unwrap()).unwrap();
+            std::fs::write(&path, serde_json::to_vec_pretty(config).unwrap()).unwrap();
         };
         write_config(&canonical_policy_config());
         let pin = CanonicalPolicyPin::pin(&root).expect("pin canonical policy");
         pin.validate(&root).expect("unchanged config validates");
         let mut changed = canonical_policy_config();
         changed["networks"][psy_config::CURRENT_NETWORK]["guardian_authorization"]["bridge_relayer_signing_policy"] = serde_json::json!("{}");
-        write_config(&changed);
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+            std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        }
         assert!(pin.validate(&root).is_err());
-        std::fs::remove_file(root.join("psy-genesis/config.json")).unwrap();
+        std::fs::remove_file(&path).unwrap();
         write_config(&canonical_policy_config());
         assert!(pin.validate(&root).is_err());
         let mut missing = canonical_policy_config();
