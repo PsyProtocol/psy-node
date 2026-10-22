@@ -31,8 +31,9 @@ bun psy-node/scripts/workspace.ts gitlinks sync --source ../feature-demo
 bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' -- psy-ts-sdk/src/client.ts
 # Alternatively, review the index yourself first, then commit only that index:
 bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' --staged
-# Explicit user-run publication of clean topic branches (optionally --repo NAME):
+# Preview freezes each selected HEAD against the live origin tip. Publication needs --push:
 bun psy-node/scripts/workspace.ts push --source ../feature-demo
+bun psy-node/scripts/workspace.ts push --source ../feature-demo --repo psy-contracts,psy-node --push
 bun psy-node/scripts/workspace.ts prepare-merge --source ../feature-demo --target . --branch feature/demo --integration ../integration-demo
 # Explicit user-run publication; use a fresh integration directory:
 bun psy-node/scripts/workspace.ts prepare-merge --source ../feature-demo --target . --branch feature/demo --integration ../integration-publish --push
@@ -51,9 +52,11 @@ create failure exits nonzero and keeps every directory already created.
 
 `commit` requires exactly one repository, a message, and either literal paths
 after `--` or `--staged`. Explicit paths require an empty index and cannot name
-the repository root. There is no blanket staging. `push` refuses detached HEAD,
-base/main/master branches, dirty trees, and non-fast-forward remote topics. It
-preflights every selected repository before the first push; it never forces.
+the repository root. There is no blanket staging. `push` freezes every selected
+HEAD (or an optional explicit reviewed SHA) and the live origin tip of its
+checked-out `mainnet-beta` or topic branch. That tip must be an ancestor of the
+frozen commit. Dirty files are printed and excluded. Nothing is fetched, merged,
+squashed, or published unless `--push` is present, and publication never forces.
 
 `prepare-merge` requires clean topic worktrees but permits dirty target worktrees because
 it **never changes target files, indexes, or local base branches**. It freezes

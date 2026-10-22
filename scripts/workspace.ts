@@ -32,7 +32,8 @@ Commands (default: status; no implicit mutations):
   create --source DIR --destination DIR --branch TOPIC [--base mainnet-beta]
   gitlinks sync [--source DIR] [--base mainnet-beta]
   commit --source DIR --repo NAME --message TEXT [--staged | -- PATH...]
-  push --source DIR [--repo NAME] [--base mainnet-beta] [--remote origin]
+  push --source DIR [--repo NAME] [--base mainnet-beta] [--remote origin] [--push]
+        [--reviewed NAME=FULL_SHA --expected NAME=FULL_SHA ...]
   prepare-merge --source DIR --target DIR --branch TOPIC --integration NEW_DIR
         [--base mainnet-beta] [--remote origin] [--message TEXT] [--push]
 
@@ -63,7 +64,27 @@ External gitlinks (forge-std) are left unchanged. A direct or nested target pin
 that would leave an external checkout at a different SHA fails before staging.
 Commit requires a topic branch: named paths require an empty index and are
 staged literally; --staged commits only the existing index.
-Push publishes clean topic branches only, never the base branch and never force.
+Push freezes each selected repository's current HEAD and the live tip of its
+checked-out branch, then uses that pair as the reviewed commit and expected ancestor.
+The default comparison base is mainnet-beta; --base changes that comparison name, not
+the branch that is published. The published ref is the branch currently checked out.
+Checked-out branches may be mainnet-beta or a topic branch. Explicit --reviewed and
+--expected pairs are optional and name those commits instead of HEAD and the live tip;
+both mappings must be nonempty and cover exactly the selected repositories. A comma-only
+or otherwise empty value is rejected before any remote read. One pair still requires
+--repo. The expected SHA must be that repository's live remote tip and an ancestor of
+its reviewed commit; a reviewed commit behind or divergent from that tip is rejected.
+There is no implicit merge, squash, stage, or pin rewrite. Workspace gitlinks must
+resolve to siblings. Unmapped external gitlinks are allowed only when their path, SHA,
+and .gitmodules URL match the expected parent commit exactly. Selected child pins must be
+ancestors of that child's reviewed commit; unselected child pins must already be
+published on the parent's branch. All preflight checks finish before publication,
+children precede parents, and each parent's pins are rechecked against live child tips
+immediately before publication. Selected child tips must still equal their reviewed
+commits. A remote that already has the reviewed commit is left untouched. Any
+publication requires --push. Without it this command only checks local objects and live
+tips: it does not fetch or push. Dirty files are allowed, printed, and never staged,
+switched, or included. Push never forces.
 prepare-merge prepares dependency-ordered squash commits on retained integration branches.
 It never moves local base branches or changes target working files, even if dirty.
 A cohort pin that still names the child topic HEAD is rewritten to that child's
@@ -108,8 +129,9 @@ Examples:
   bun psy-node/scripts/workspace.ts create --source ../mainnet-beta --destination ../feature --branch feature/demo
   bun psy-node/scripts/workspace.ts gitlinks sync --source ../feature
   bun psy-node/scripts/workspace.ts commit --source ../feature --repo psy-sdk --message 'Fix SDK' -- psy-ts-sdk/src/client.ts
-  bun psy-node/scripts/workspace.ts commit --source ../feature --repo psy-sdk --message 'Fix SDK' --staged
   bun psy-node/scripts/workspace.ts push --source ../feature
+  bun psy-node/scripts/workspace.ts push --source ../mainnet-beta --repo psy-contracts,psy-node --push
+  bun psy-node/scripts/workspace.ts push --source ../mainnet-beta --repo psy-node --reviewed psy-node=FULL_SHA --expected psy-node=FULL_SHA --push
   bun psy-node/scripts/workspace.ts prepare-merge --source ../feature --target ../mainnet-beta --branch feature/demo --integration ../integration-demo
   # User-executed publication (choose a fresh integration directory):
   bun psy-node/scripts/workspace.ts prepare-merge --source ../feature --target ../mainnet-beta --branch feature/demo --integration ../integration-publish --push
@@ -161,9 +183,9 @@ function topic(repo: string, base: string): string {
   return current;
 }
 function selected(options: Options): readonly string[] {
-  const name = options.get("repo");
-  if (name && !names.includes(name)) fail(`Unknown repository: ${name}`);
-  return name ? [name] : names;
+  const listed = (options.get("repo") || "").split(",").filter(Boolean);
+  if (listed.some((name, index) => !names.includes(name) || listed.indexOf(name) !== index)) fail(`Unknown repository: ${options.get("repo")}`);
+  return listed.length ? listed : names;
 }
 function remoteTip(repo: string, remote: string, ref: string): string {
   const lines = git(repo, ["ls-remote", "--refs", remote, `refs/heads/${ref}`]);
@@ -180,6 +202,13 @@ function remoteName(repo: string, name: string): void {
   const fetchUrls = git(repo, ["remote", "get-url", "--all", name]).split("\n");
   const pushUrls = git(repo, ["remote", "get-url", "--push", "--all", name]).split("\n");
   if (fetchUrls.length !== 1 || pushUrls.length !== 1 || fetchUrls[0] !== pushUrls[0]) fail(`${repo}: require one identical fetch/push URL for ancestry validation`);
+}
+function documentedRemote(repo: string, remote: string): void {
+  remoteName(repo, remote);
+  const fetchUrl = git(repo, ["remote", "get-url", "--all", remote]);
+  const pushUrl = git(repo, ["remote", "get-url", "--push", "--all", remote]);
+  const documented = `git@github.com:PsyProtocol/${basename(repo)}.git`;
+  if (fetchUrl !== documented || pushUrl !== documented) fail(`${repo}: remote is not the documented origin`);
 }
 function commit(root: string, options: Options, paths: string[]): void {
   const name = required(options, "repo");
@@ -200,32 +229,115 @@ function commit(root: string, options: Options, paths: string[]): void {
   git(repo, ["commit", "-m", message]);
   console.log(`${name}: committed ${head(repo)}`);
 }
+function fullSha(repo: string, label: string, value: string): string {
+  if (!/^[0-9a-f]{40}$/.test(value)) fail(`${repo}: ${label} must be a full lowercase commit SHA`);
+  return head(repo, value);
+}
+function reviewedPairs(options: Options, selectedNames: readonly string[]): Map<string, { reviewed: string; expected: string }> {
+  const present = options.has("reviewed") || options.has("expected");
+  const reviewed = new Map<string, string>();
+  const expected = new Map<string, string>();
+  for (const entry of (options.get("reviewed") || "").split(",").filter(Boolean)) {
+    const split = entry.indexOf("=");
+    const name = entry.slice(0, split);
+    const sha = entry.slice(split + 1);
+    if (!names.includes(name) || reviewed.has(name)) fail(`Invalid reviewed repository mapping: ${entry}`);
+    reviewed.set(name, sha);
+  }
+  for (const entry of (options.get("expected") || "").split(",").filter(Boolean)) {
+    const split = entry.indexOf("=");
+    const name = entry.slice(0, split);
+    const sha = entry.slice(split + 1);
+    if (!names.includes(name) || expected.has(name)) fail(`Invalid expected repository mapping: ${entry}`);
+    expected.set(name, sha);
+  }
+  if (present && (!reviewed.size || !expected.size)) fail("--reviewed and --expected must both be nonempty mappings");
+  if (reviewed.size !== expected.size || [...reviewed.keys()].some(name => !expected.has(name))) fail("--reviewed and --expected must name the same repositories");
+  if (!reviewed.size) return new Map();
+  if (reviewed.size === 1 && !options.has("repo")) fail("A single reviewed pair requires --repo");
+  if ([...reviewed.keys()].some(name => !selectedNames.includes(name)) || [...selectedNames].some(name => !reviewed.has(name))) fail("Reviewed publication requires one mapping for every selected repository");
+  return new Map([...reviewed].map(([name, sha]) => [name, { reviewed: sha, expected: expected.get(name)! }]));
+}
+function publishedPins(repo: string, name: string, reviewed: string, remote: string, ref: string, plans: ReadonlyMap<string, { tip: string; ref: string; expected: string }>, publication = false): void {
+  let expectedLinks: Map<string, Link> | undefined;
+  for (const link of links(repo, reviewed)) {
+    if (!link.child) {
+      if (!expectedLinks) {
+        const expected = plans.get(name)!.expected;
+        documentedRemote(repo, remote);
+        const live = remoteTip(repo, remote, ref);
+        if (live !== expected && live !== reviewed) fail(`${repo}: live remote head is neither the expected nor the reviewed commit`);
+        expectedLinks = new Map(links(repo, expected).map(pin => [pin.path, pin]));
+      }
+      const published = expectedLinks.get(link.path);
+      if (!link.url || !published || published.sha !== link.sha || published.url !== link.url) fail(`${name}: gitlink ${link.path} has no workspace mapping and is not an unchanged published external pin`);
+      continue;
+    }
+    const child = join(resolve(repo, ".."), link.child);
+    if (!existsSync(child) || realpathSync(git(child, ["rev-parse", "--show-toplevel"])) !== realpathSync(child)) fail(`${name}: gitlink ${link.path}: sibling repository missing`);
+    documentedRemote(child, remote);
+    if (Bun.spawnSync(["git", "-C", child, "cat-file", "-e", `${link.sha}^{commit}`], { stdout: "pipe", stderr: "pipe", env: gitEnvironment }).exitCode !== 0) fail(`${name}: gitlink ${link.path}: pinned commit ${link.sha} not present locally`);
+    const plan = plans.get(link.child);
+    const tip = plan && !publication ? plan.tip : remoteTip(child, remote, plan?.ref || ref);
+    if (!tip) fail(`${name}: gitlink ${link.path}: remote branch ${plan?.ref || ref} not found`);
+    if (publication && plan && tip !== plan.tip) fail(`${name}: gitlink ${link.path}: child remote changed; publication stopped (earlier repositories may be published)`);
+    if (Bun.spawnSync(["git", "-C", child, "cat-file", "-e", `${tip}^{commit}`], { stdout: "pipe", stderr: "pipe", env: gitEnvironment }).exitCode !== 0) fail(`${name}: gitlink ${link.path}: ${plan && !publication ? "reviewed" : "live head"} object missing locally`);
+    if (!ancestor(child, link.sha, tip)) fail(`${name}: gitlink ${link.path}: pin ${link.sha} not reachable from ${plan && !publication ? "reviewed child commit" : "published head"}`);
+  }
+}
 function push(root: string, options: Options): void {
   const base = options.get("base") || "mainnet-beta";
   const remote = options.get("remote") || "origin";
-  const plans = ordered(selected(options).map(name => {
+  const selection = selected(options);
+  const pairs = reviewedPairs(options, selection);
+  const plans = ordered(selection.map(name => {
     const repo = repository(root, name);
-    const ref = topic(repo, base);
-    clean(repo);
-    remoteName(repo, remote);
+    const ref = branch(repo) || fail(`${repo}: detached HEAD`);
+    validateBranch(repo, ref);
+    if (ref !== base && ref !== "mainnet-beta" && (["main", "master"].includes(ref) || ref.startsWith("workspace-integration/"))) fail(`${repo}: refusing branch ${ref}`);
+    documentedRemote(repo, remote);
     const tip = head(repo);
-    return { name, repo, ref, tip, expected: "", links: links(repo, tip), baseLinks: [] as Link[] };
+    const reviewed = pairs.size ? fullSha(repo, "reviewed", pairs.get(name)!.reviewed) : tip;
+    const expected = pairs.size ? fullSha(repo, "expected", pairs.get(name)!.expected) : "";
+    const changes = dirty(repo);
+    if (changes) console.log(`${name}: dirty files are not included:\n${changes}`);
+    return { name, repo, ref, tip: reviewed, frozen: tip, expected, links: links(repo, reviewed), baseLinks: [] as Link[] };
   }));
-  for (const plan of plans) assertPublishedDependencies(plan.repo, plan.name, plan.tip);
-  for (const plan of plans) plan.expected = remoteTip(plan.repo, remote, plan.ref);
+  const planByName = new Map(plans.map(plan => [plan.name, plan]));
   for (const plan of plans) {
-    if (!plan.expected) continue;
-    fetchTip(plan.repo, remote, plan.ref, plan.expected);
-    if (!ancestor(plan.repo, plan.expected, plan.tip)) fail(`${plan.repo}: topic push would not fast-forward`);
+    if (!pairs.size && head(plan.repo) !== plan.frozen) fail(`${plan.repo}: HEAD changed since it was frozen`);
+    const live = remoteTip(plan.repo, remote, plan.ref);
+    if (!pairs.size) {
+      if (!/^[0-9a-f]{40}$/.test(live)) fail(`${plan.repo}: remote ${plan.ref} tip is not a full commit SHA`);
+      plan.expected = fullSha(plan.repo, "expected", live);
+    }
+    if (!ancestor(plan.repo, plan.expected, plan.tip)) fail(`${plan.repo}: expected remote commit is not an ancestor of the reviewed commit`);
+    assertPublishedDependencies(plan.repo, plan.name, plan.tip);
+    publishedPins(plan.repo, plan.name, plan.tip, remote, plan.ref, planByName);
   }
   for (const plan of plans) {
-    clean(plan.repo);
-    if (head(plan.repo) !== plan.tip || branch(plan.repo) !== plan.ref || remoteTip(plan.repo, remote, plan.ref) !== plan.expected) fail(`${plan.repo}: state changed since preflight`);
+    const live = remoteTip(plan.repo, remote, plan.ref);
+    if (live !== plan.expected && live !== plan.tip) fail(`${plan.repo}: live remote head is neither the expected nor the reviewed commit`);
   }
   for (const plan of plans) {
-    if (remoteTip(plan.repo, remote, plan.ref) !== plan.expected) fail(`${plan.repo}: remote topic changed; publication stopped (earlier repositories may be published)`);
-    git(plan.repo, ["push", "--no-follow-tags", "--recurse-submodules=no", remote, `${plan.tip}:refs/heads/${plan.ref}`]);
-    console.log(`${basename(plan.repo)}: pushed ${plan.ref} ${plan.tip}`);
+    const current = remoteTip(plan.repo, remote, plan.ref);
+    const headMatches = pairs.size ? branch(plan.repo) === plan.ref : head(plan.repo) === plan.frozen && branch(plan.repo) === plan.ref;
+    if (!headMatches || (current !== plan.expected && current !== plan.tip)) fail(`${plan.repo}: state changed since preflight`);
+  }
+  if (!options.has("push")) {
+    for (const plan of plans) {
+      const live = remoteTip(plan.repo, remote, plan.ref);
+      console.log(live === plan.tip ? `${plan.name}: target already on remote; nothing to push` : `READY[${plan.name}] ${plan.tip} can be pushed to ${plan.ref} (re-run with --push to publish)`);
+    }
+    return;
+  }
+  for (const plan of plans) {
+    publishedPins(plan.repo, plan.name, plan.tip, remote, plan.ref, planByName, true);
+    const live = remoteTip(plan.repo, remote, plan.ref);
+    if (live === plan.tip) { console.log(`${plan.name}: target already on remote; nothing to push`); continue; }
+    if (live !== plan.expected) fail(`${plan.repo}: remote topic changed; publication stopped (earlier repositories may be published)`);
+    git(plan.repo, ["-c", "push.followTags=false", "push", "--no-follow-tags", "--recurse-submodules=no", remote, `${plan.tip}:refs/heads/${plan.ref}`]);
+    console.log(`PUSHED[${plan.name}] ${plan.tip} -> refs/heads/${plan.ref}`);
   }
 }
 
@@ -390,12 +502,12 @@ function sync(root: string, options: Options): void {
 
 }
 
-type Link = { path: string; sha: string; child: string };
+type Link = { path: string; sha: string; child: string; url: string };
 type Plan = { name: string; source: string; target: string; tip: string; base: string; remote: string; links: Link[]; baseLinks: Link[]; worktree: string; integrationBranch: string; merged: string };
 
 function links(repo: string, ref: string): Link[] {
   const entries = git(repo, ["ls-tree", "-r", "-z", ref]).split("\0").filter(Boolean);
-  const modules = new Map<string, string>();
+  const modules = new Map<string, { child: string; url: string }>();
   if (entries.some(entry => entry.endsWith("\t.gitmodules"))) {
     const config = git(repo, ["config", "--blob", `${ref}:.gitmodules`, "--get-regexp", "^submodule\\..*\\.path$"], [0, 1]);
     for (const line of config.split("\n").filter(Boolean)) {
@@ -404,12 +516,13 @@ function links(repo: string, ref: string): Link[] {
       const path = line.slice(split + 1);
       const url = git(repo, ["config", "--blob", `${ref}:.gitmodules`, "--get", key.replace(/\.path$/, ".url")]);
       const child = url.replace(/\/$/, "").split(/[/:]/).pop()!.replace(/\.git$/, "");
-      if (names.includes(child)) modules.set(path, child);
+      modules.set(path, { child: names.includes(child) ? child : "", url });
     }
   }
   return entries.filter(entry => entry.startsWith("160000 ")).map(entry => {
     const [metadata, path] = entry.split("\t");
-    return { path, sha: metadata.split(" ")[2], child: modules.get(path) || "" };
+    const module = modules.get(path);
+    return { path, sha: metadata.split(" ")[2], child: module?.child || "", url: module?.url || "" };
   });
 }
 
@@ -566,7 +679,7 @@ const commandSpecs: Record<string, CommandSpec> = {
   create: { valued: ["source", "destination", "branch", "base"], flags: [], paths: false, sourceDefault: false, required: ["source", "destination", "branch"] },
   "gitlinks sync": { valued: ["source", "base"], flags: [], paths: false, sourceDefault: true, required: [] },
   commit: { valued: ["source", "repo", "message", "base"], flags: ["staged"], paths: true, sourceDefault: false, required: ["source", "repo", "message"] },
-  push: { valued: ["source", "repo", "base", "remote"], flags: [], paths: false, sourceDefault: false, required: ["source"] },
+  push: { valued: ["source", "repo", "base", "remote", "reviewed", "expected"], flags: ["push"], paths: false, sourceDefault: false, required: ["source"] },
   "prepare-merge": { valued: ["source", "target", "branch", "integration", "base", "remote", "message"], flags: ["push"], paths: false, sourceDefault: false, required: ["source", "target", "branch", "integration"] },
   "deps show": { valued: ["source"], flags: [], paths: false, sourceDefault: true, required: [] },
   "deps check": { valued: ["source"], flags: [], paths: false, sourceDefault: false, required: ["source"] },
@@ -599,11 +712,14 @@ function parseInvocation(argv: string[]): { command: string; options: Options; p
     const arg = args.shift()!;
     if (arg === "--" && spec.paths) { paths = args.splice(0); break; }
     const key = arg.slice(2);
-    if (!arg.startsWith("--") || !allowed.includes(key) || options.has(key)) fail(`Unexpected or duplicate option: ${arg}`);
+    if (!arg.startsWith("--") || !allowed.includes(key) || (options.has(key) && !["reviewed", "expected", "repo"].includes(key))) fail(`Unexpected or duplicate option: ${arg}`);
     if (spec.flags.includes(key)) { options.set(key, "true"); continue; }
     const value = args.shift();
     if (!value || value.startsWith("--")) fail(`Missing value for ${arg}`);
-    options.set(key, value);
+    if (key === "reviewed" || key === "expected") options.set(key, [options.get(key), value].filter(Boolean).join(","));
+    else if (key === "repo") options.set(key, [options.get(key), value].filter(Boolean).join(","));
+    else if (options.has(key)) fail(`Unexpected or duplicate option: ${arg}`);
+    else options.set(key, value);
   }
   return { command, options, paths };
 }
