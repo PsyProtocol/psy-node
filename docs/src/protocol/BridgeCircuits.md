@@ -213,4 +213,4 @@ L2 withdrawals appended
   → WithdrawalBatchClaimCircuit (+ WithdrawalClaimWrap) → Bridge.batchClaimWithdrawal
 ```
 
-Leaf hash asymmetry: deposit leaf preimage on L1 uses keccak for the Solidity leaf; Plonky2 deposit batch uses Poseidon over the deposit word layout for the frontier tree. Withdrawal leaf preimage is Poseidon end-to-end. See [`docs/src/dev/deposit-withdrawal.md`](../dev/deposit-withdrawal.md) and `encoding` notes in memory architecture docs.
+Leaf hash asymmetry: deposit leaf preimage on L1 uses keccak for the Solidity leaf; Plonky2 deposit batch uses Poseidon over the deposit word layout for the frontier tree. Withdrawal leaf preimage is Poseidon end-to-end. See [`docs/src/dev/bridge-common-operations.md`](../dev/bridge-common-operations.md#architecture) and `encoding` notes in memory architecture docs.

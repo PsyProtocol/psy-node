@@ -2,28 +2,61 @@
 
 > Internal developer documentation — repository-only. Not part of the published mdBook (SUMMARY.md).
 
-> Updated: 2026-10-21. Status: Review.
+> Updated: 2026-10-22. Status: Review.
 
 ## Overview
 
-`devnet_lifecycle.md` is the required operating procedure for local Psy devnet work. `make run-all` always starts a fresh chain. `make restart` and `make rollback-resume` keep the database and the three running Anvil processes and restart applications only. `make shutdown` is teardown; `PURGE=1` is its default. Supported entry points are `make run-all`, `make restart`, `make rollback-stop`, `make rollback-resume`, and `make shutdown`.
+`devnet_lifecycle.md` is the required operating procedure for local Psy devnet work and the single owner of the launcher internals documented in sections 10-24. `make run-all` always starts a fresh chain. `make restart` and `make rollback-resume` keep the database and the three running Anvil processes and restart applications only. `make shutdown` is teardown; `PURGE=1` is its default. Supported entry points are `make run-all`, `make restart`, `make rollback-stop`, `make rollback-resume`, and `make shutdown`.
+
+This document owns `dev/locSetupV4.ts` internals: parser behavior, startup selection, environment flow, process construction, readiness, supervision, control commands, ports, persistent Anvil recovery, daemonized behavior, and current-source limitations (`dev/locSetupV4.ts:342-344,3541-3557,4013-4104,7230-7725`). Use the Make targets for the repository-supported operating lifecycle, and use direct launcher commands only when selecting a documented component set or diagnosing launcher behavior. When a section describes a direct launcher command, it describes source behavior, not a replacement lifecycle procedure.
+
+Persistent infrastructure means **Anvil, Scylla, Redis/Valkey, NATS, Nostr, and Envio backing services**. Applications means **processors, edges, workers, proxy, faucet, services, indexers, relayer, and UIs**. The control classifier keeps tracked processes named `db` and `l1_anvil`; the `db` process supervises Scylla, Redis/Valkey, NATS, and Nostr, while Envio Postgres and Hasura are Docker backing services outside the tracked process list (`dev/locSetupV4.ts:5202-5205`; `dev/start_db.sh:83-227`; `dev/locSetupV4.ts:4462-4477`). The tracked Envio indexer is an application even though its Docker backing services are persistent infrastructure. Outside frozen mode its command is `pnpm start`; frozen mode uses `frozenEnvioStartCommand` (`dev/locSetupV4.ts:4289-4303,4488-4489,5202-5205`).
 
 ## Background
 
 Use only this lifecycle for local devnet operations; it supersedes ad-hoc per-service startup and manual state repair. The supervisor distinguishes persistent infrastructure from application processes. `make restart` and `make rollback-resume` leave the running database and the three Anvil processes in place. A purge removes the paired L1/L2 state. These are distinct operations, not interchangeable restart shortcuts (`dev/locSetupV4.ts:5221-5225,5740-5746,7715-7724`).
 
+The launcher combines repository setup, resource allocation, persistent infrastructure, application startup, readiness gates, process supervision, local Layer 1 persistence, and destructive cleanup in one entry point (`dev/locSetupV4.ts:3541-3557,4013-4104,5202-5205`). Operators therefore need one source-grounded map that distinguishes supported Make commands from direct launcher mechanics, especially because a bare launcher invocation and `make run-all` select different counts, and because the embedded help contains current-source defects that must not be copied into commands (`Makefile:96-99`; `dev/locSetupV4.ts:7245-7247,7471-7472,7699-7725`).
+
 ## Table of Contents
 
 - [1. Environment](#1-environment)
 - [2. Artifact Gate](#2-artifact-gate)
-- [Public-only generate-genesis-data inputs](#public-only-generate-genesis-data-inputs)
+  - [Public-only generate-genesis-data inputs](#public-only-generate-genesis-data-inputs)
 - [3. Fresh Start](#3-fresh-start)
+  - [Startup sequence](#startup-sequence)
+  - [Process DAG](#process-dag)
 - [4. Readiness](#4-readiness)
+  - [Foreground process inventory](#foreground-process-inventory)
 - [5. Application Restart](#5-application-restart)
 - [6. Offline Rollback Stop and Resume](#6-offline-rollback-stop-and-resume)
 - [7. Post-Restart and Post-Rollback Verification](#7-post-restart-and-post-rollback-verification)
 - [8. Failure Rules](#8-failure-rules)
 - [9. Forbidden Operations](#9-forbidden-operations)
+- [Terminology and Abbreviations](#terminology-and-abbreviations)
+- [10. Startup Mode Selection](#10-startup-mode-selection)
+  - [10.1 Bare launcher defaults](#101-bare-launcher-defaults)
+  - [10.2 make run-all](#102-make-run-all)
+  - [10.3 Component selection](#103-component-selection)
+- [11. CLI Option Reference](#11-cli-option-reference)
+- [12. Environment Variable Reference](#12-environment-variable-reference)
+  - [12.1 Network and Anvil](#121-network-and-anvil)
+  - [12.2 Repository setup and build](#122-repository-setup-and-build)
+  - [12.3 Keystore and credentials](#123-keystore-and-credentials)
+  - [12.4 Resources, logging, and supervision](#124-resources-logging-and-supervision)
+  - [12.5 Faucet and service forwarding](#125-faucet-and-service-forwarding)
+- [13. Ports and P2P Formulas](#13-ports-and-p2p-formulas)
+- [14. CPU Partition and Rayon Derivation](#14-cpu-partition-and-rayon-derivation)
+- [15. Anvil State Flags and Fresh Persistence](#15-anvil-state-flags-and-fresh-persistence)
+- [16. Control Socket and Application Lifecycle](#16-control-socket-and-application-lifecycle)
+- [17. Auto-Restart](#17-auto-restart)
+- [18. Shutdown, Teardown, and Purge](#18-shutdown-teardown-and-purge)
+- [19. Daemonized Path Differences](#19-daemonized-path-differences)
+- [20. Direct Launcher Command Recipes](#20-direct-launcher-command-recipes)
+- [21. Current-Source Limitations](#21-current-source-limitations)
+- [22. Launcher Data Structures, Functions, and Loops](#22-launcher-data-structures-functions-and-loops)
+- [23. Rationale](#23-rationale)
+- [24. Security Considerations](#24-security-considerations)
 - [Related Documents](#related-documents)
 
 ```mermaid
@@ -46,6 +79,26 @@ sequenceDiagram
 artifact gate -> infrastructure -> validator injection -> processors/edges -> workers
   -> proxy -> L1 deployment/reuse -> services/indexers -> faucet/relayer -> interfaces -> supervisor
 ```
+
+## Terminology and Abbreviations
+
+| Term  | Meaning in this document                                                                                      | Evidence                                                     |
+| ----- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| CLI   | Command-line interface parsed by `runMain()`.                                                                 | `dev/locSetupV4.ts:7359-7440`                                |
+| CPU   | Central processing unit; the launcher partitions complete physical-core sibling groups on Linux.              | `dev/locSetupV4.ts:161-195`; `dev/locSetupPolicy.ts:82-180`  |
+| DAG   | Directed acyclic graph; the ordered startup dependencies in section 3.                                        | `dev/locSetupV4.ts:4069-4104,5859-6336`                      |
+| HTTP  | Hypertext Transfer Protocol, used for coordinator, Realm, Layer 1, Envio, and service readiness.              | `dev/locSetupV4.ts:4404-4452`; `dev/locSetupV4.ts:4456-4575` |
+| JSON  | JavaScript Object Notation, used by genesis, deployment summaries, control replies, and faucet configuration. | `dev/locSetupV4.ts:1149-1199`; `dev/locSetupV4.ts:5348-5358` |
+| L1    | Layer 1: local Anvil, a forked Anvil, Sepolia, or Ethereum.                                                   | `dev/locSetupV4.ts:342-344`; `dev/locSetupV4.ts:6292-6332`   |
+| L2    | Layer 2: Coordinator and Realm processors, edges, workers, checkpoints, services, and indexers.               | `dev/locSetupV4.ts:4060-4630`                                |
+| LWT   | Lightweight transaction; the launcher configures Scylla contention and write timeouts.                        | `dev/locSetupV4.ts:4889-4905`; `dev/start_db.sh:123-171`     |
+| NATS  | The NATS JetStream messaging service in persistent infrastructure.                                            | `dev/start_db.sh:109-120`                                    |
+| Nostr | The local Nostr relay in persistent infrastructure.                                                           | `dev/start_db.sh:184-227`                                    |
+| P2P   | Peer-to-peer Realm transport started by default for every Realm validator.                                    | `dev/locSetupV4.ts`                                          |
+| RPC   | Remote procedure call endpoint exposed by Layer 1, Coordinator edges, and Realm edges.                        | `dev/locSetupV4.ts:3541-3557`; `dev/locSetupV4.ts:6292-6326` |
+| SMP   | Symmetric multiprocessing shard count supplied to Scylla.                                                     | `dev/locSetupV4.ts:203-221`; `dev/start_db.sh:132-171`       |
+| TCP   | Transmission Control Protocol, used by launcher port readiness gates.                                         | `dev/locSetupV4.ts:4030-4045`; `dev/locSetupV4.ts:4384-4396` |
+| UI    | User interface: Privacy Bridge, IDE, Explorer, or Mode A Web Wallet Bridge.                                   | `dev/locSetupV4.ts:4706-4839`                                |
 
 ## 1. Environment
 
@@ -150,11 +203,11 @@ Repair only the stale output:
 - SDK compiler identity or generated WASM is stale: `CARGO_NET_GIT_FETCH_WITH_CLI=true PSY_NETWORK=localhost pnpm --dir ../psy-sdk/psy-ts-sdk/packages/psy-sdk build`. This generates both prover targets and the compiler stamp. Keep generated `bigint` exports; do not copy another package's bindings or cast them to `number`.
 - A required node, services, or indexer binary is missing or older than its sources: `make build` in the owning repository.
 
-Repair only stale compiler outputs and rebuild affected binaries; do not weaken provenance checks or add Cargo patch overrides. `make run-all` explicitly authorizes a fresh local Genesis after complete startup preflight. Standalone generation reads the public signing policy from the selected network in `psy-genesis/config.json`; it takes no account-file path.
+Repair only stale compiler outputs and rebuild affected binaries; do not weaken provenance checks or add Cargo patch overrides. `make run-all` explicitly authorizes a fresh local Genesis after complete startup preflight. Standalone generation reads the three public `guardian_initial_member_hashes` commitments from the selected network in `psy-genesis/config.json`; it takes no account-file path.
 
 ### Public-only `generate-genesis-data` inputs
 
-`make generate-genesis-data` passes only `--repo-root` to the release CLI (`Makefile:141-142`). It removes legacy secret-bearing enrollment variables from that child. It does not accept `PSY_RELAYER_MULTISIG_ACCOUNT` or `--relayer-multisig-account`. The public two-of-three policy is the existing JSON string at `networks[CURRENT_NETWORK].guardian_authorization.bridge_relayer_signing_policy`. An operator provisions that public member policy once in the canonical JSON for this workspace's guardian keys ([genesis-generation.md §1.2.2](genesis-generation.md#122-first-workspace-guardian-provisioning)); it is not a secret, not a separate file, and not a universal development default. A missing operator-provisioned policy fails before destruction. The generator resolves compiler artifacts from `PSY_PROJECTS_DIR/psy-compiler`, or the sibling `psy-compiler` checkout when unset.
+`make generate-genesis-data` passes only `--repo-root` to the release CLI (`Makefile:141-142`). It removes legacy secret-bearing enrollment variables from that child. It does not accept `PSY_RELAYER_MULTISIG_ACCOUNT`, `--relayer-multisig-account`, `--guardians-root`, or `--max-fee`. The public two-of-three policy is the three existing `guardian_initial_member_hashes` commitments on the selected network in `psy-genesis/config.json`. An operator provisions those public commitments once for this workspace's guardian keys ([genesis-generation.md §1.2.2](genesis-generation.md#122-first-workspace-guardian-provisioning)); they are not a secret, not a separate file, and not a universal development default. A missing or invalid value fails before destruction. There is no operator fee ceiling to configure. Protocol fees remain computed and verified, with no operator limit. The generator resolves the `multisig_policy` compiler artifact from `PSY_PROJECTS_DIR/psy-compiler`, or the sibling `psy-compiler` checkout when unset.
 
 Use that current release `psy_dev_cli`. A stale binary still checks contract ID 6 (`public multisig account must name contract 6`; `Genesis contract 6 must be multisig_policy`) and fails a contract-1 account.
 
@@ -162,17 +215,43 @@ The Make target does not redirect writes. Isolated output flags are `--genesis-o
 
 ## 3. Fresh Start
 
-`make run-all` passes `--all` and always starts a fresh local chain, independently of `PURGE`. Explicit worker and proxy counts still apply, including `--prove-proxy 0`. Partial component commands never perform the full reset; `--db` refuses existing containers or volumes rather than adopting them. Full startup validates daemon and public configuration, generation inputs, resource settings, namespace ownership, and complete Docker listings before stopping anything. An unbound checkout cannot adopt matching resources, including legacy names. The existing owner-only guardian `db/` directory is a provisioning prerequisite. The foreground `fresh-devnet-state` helper validates protected fixed paths and acquires all four real redb exclusive guards before acknowledging `prepared`. Any live database owner blocks startup. It retains those guards across stdin `reset`, fresh Genesis generation, and the three local deployments. After deployment the launcher sends stdin `authorize` and waits for `authorized`. That phase writes the complete `guardian_authorization` object onto the selected `CURRENT_NETWORK` object in `psy-genesis/config.json` and writes no separate authorization file. Database tables are cleared in place and the files are never unlinked. The helper exits before guardian services start. The first fresh preflight does not require the complete seven-field `guardian_authorization` object; it does require the selected network's `bridge_relayer_signing_policy` string. `guardian-service` startup and application restart require the complete object. Namespace binding, guardian keys, and the rest of the public network configuration are not reset (`dev/locSetupV4.ts:3163-3223,4013-4017,4069-4104,5904-5913,6334-6336`; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:57-95`; `psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs:161-168,186-224`).
+`make run-all` passes `--all` and always starts a fresh local chain, independently of `PURGE`. Explicit worker and proxy counts still apply, including `--prove-proxy 0`. Partial component commands never perform the full reset; `--db` refuses existing containers or volumes rather than adopting them. Full startup validates daemon and public configuration, generation inputs, resource settings, namespace ownership, and complete Docker listings before stopping anything. An unbound checkout cannot adopt matching resources, including legacy names. The existing owner-only guardian `db/` directory is a provisioning prerequisite. The foreground `fresh-devnet-state` helper validates protected fixed paths and acquires all four real redb exclusive guards before printing `{"phase":"prepared"}`. Any live database owner blocks startup. The launcher then writes `reset\n`; the helper retains those guards across the reset, fresh Genesis generation, and the three local deployments. After deployment the launcher writes `finish\n`, waits for `{"phase":"finished"}`, and requires exit 0. Finish rechecks the held database bindings and the guardian-root identity; it writes nothing and does not pin `psy-genesis/config.json`. The launcher does not snapshot or byte-compare that file. Database tables are cleared in place and the files are never unlinked. The helper exits before guardian services start. Fresh preflight requires the selected network's three `guardian_initial_member_hashes`. It does not configure or read an operator fee ceiling, and it does not require or create an authorization object. Protocol fees stay computed and verified. `guardian-service` startup and application restart consume the same read-only canonical fields plus the selected deployment documents. Namespace binding, guardian keys, and the rest of the public network configuration are not reset (`dev/locSetupV4.ts:358-375,3129-3189,4170-4249,6056-6060,6491-6494`; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:1-12,57-113`; `psy_cli/psy_dev_cli/src/subcommand/generate_genesis/guardians_root.rs:84-104`).
 
-Before that preflight, the selected network of `psy-genesis/config.json` must already carry the public guardian endpoints. `guardian_configs` is exactly three entries, ids `1`, `2`, and `3`, each with `listen_address` and an optional `rpc_url`. The reusable localhost listeners are `127.0.0.1:15441`, `127.0.0.1:15442`, and `127.0.0.1:15443`. `guardian_history` has `listen_address` `127.0.0.1:15450` and an optional `rpc_url`. `l1_endpoints` is nonempty, with unique `chain_index` values and credential-free `https` or loopback `http` URLs; the reusable localhost endpoints are chain `0` at `http://127.0.0.1:8545`, chain `1` at `http://127.0.0.1:9545`, and chain `2` at `http://127.0.0.1:10545`. No listener uses port `0` or a wildcard host, and the three advertised guardian origins stay unique. These entries contain no keystore path and no guardian root (`dev/locSetupV4.ts:3928-4011`). Reusing these endpoint defaults does not make another operator's policy commitments portable.
+Before that preflight, the selected network of `psy-genesis/config.json` must already carry the public guardian endpoints. `guardian_configs` is exactly three entries, ids `1`, `2`, and `3`, each with `listen_address` and an optional `rpc_url`. The reusable localhost listeners are `127.0.0.1:15441`, `127.0.0.1:15442`, and `127.0.0.1:15443`. `guardian_history` has `listen_address` `127.0.0.1:15450` and an optional `rpc_url`. No listener uses port `0` or a wildcard host, and the three advertised guardian origins stay unique. These entries contain no keystore path and no guardian root. Chain id and bridge are not written into this file and there is no `l1_endpoints` list. After the selected chains deploy, the launcher passes each existing `psy-contracts/deployments/<network>/deployed-contracts.json` as a repeatable `--l1-config` path. Those documents stay where deployment wrote them: nothing is copied and no config is written. A missing document fails startup (`dev/locSetupV4.ts:358-375,6450-6452`; `psy_cli/guardian_common/src/runtime.rs:188-229`). Reusing these endpoint defaults does not make another operator's member commitments portable.
 
-`PSY_GUARDIAN_ROOT` must already name an existing non-symlink directory whose `db/` child is an existing owner-only directory: current-uid owned, not group- or world-accessible (`dev/locSetupV4.ts:4014-4026,4063-4068`). The helper creates a missing `db/` at mode `0700` (`guardians_root.rs:136-137,906-944`). It does not create the four redb files until stdin `reset`; an existing empty `guardian-*.redb` later fails `guardian-service` with `DatabaseUnavailable` rather than being reinitialized. The six `$HOME/.psy/keystore/guardian-<id>.*` files are the separate operator key prerequisite in [genesis-generation.md §1.2.2](genesis-generation.md#122-first-workspace-guardian-provisioning). A new chain initializes registration 2 from the policy string already in Genesis. An existing chain replaces that policy only through the current two-of-three quorum; startup does not submit a pristine-account bootstrap.
+`PSY_GUARDIAN_ROOT` must already name an existing non-symlink directory whose `db/` child is an existing owner-only directory: current-uid owned, not group- or world-accessible (`dev/locSetupV4.ts:4070-4071`). The helper does not create `db/`; that directory must already exist (`psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:57-61`). It does not create the four redb files until stdin `reset`. A populated database must already be the exact schema-2 table set (`guardian_schema` `u32` 2, or `journal_schema` `u64` 2). A partial set, a wrong marker, or the previous 7-table journal fails closed before reset and is not wiped or migrated; explicit operator-controlled migration is deferred, not automatic. An existing empty `guardian-*.redb` later fails `guardian-service` with `DatabaseUnavailable` rather than being reinitialized. The three `$HOME/.psy/keystore/guardian-<id>.keystore.json` keystore files and their `GUARDIAN_<id>_KEYSTORE_PASSWORD` password environment variables (section 12.3) are the separate operator key prerequisite in [genesis-generation.md §1.2.2](genesis-generation.md#122-first-workspace-guardian-provisioning). There is no password file. A new chain initializes registration 2 from the member commitments already in the canonical config and embedded in Genesis. An existing chain replaces that policy only through the current two-of-three quorum; startup does not submit a pristine-account bootstrap.
 
-The new Anvil writes `--state` to the now-absent snapshot path and does not load it. Local contracts deploy with `--reset`. If a configured local port already has a listener, startup fails and does not kill that process.
-
-After the four in-place database clears, in order `guardian-1.redb`, `guardian-2.redb`, `guardian-3.redb`, then `relayer.redb`, the helper removes fixed paths in this order: `db/anvil`; contents of `local_checkpoints` except the retained `devnet-namespace` file; `genesis.json`; then `psy-contracts/deployments/localhost`, `localhostBsc`, and `localhostBase`. Each database commit is separate. A failure stops immediately: earlier commits and removals remain, later cleanup does not start, and nothing is rolled back (`psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:5-6,23-31,81-85`). TypeScript does not recursively remove these paths or inspect redb contents. Ancestor symlink checks alone are not a race-safety guarantee. The launcher does not request Anvil historical-state preservation. `make restart` only restarts applications: it does not run the helper, recreate databases, generate Genesis, deploy contracts, or rewrite `guardian_authorization`.
+The new Anvil writes `--state` to the now-absent snapshot path and does not load it, and local contracts deploy with `--reset` (section 15). After the four in-place database clears, in order `guardian-1.redb`, `guardian-2.redb`, `guardian-3.redb`, then `relayer.redb`, the helper removes fixed paths in this order: `db/anvil`; contents of `local_checkpoints` except the retained `devnet-namespace` file; `genesis.json`; then `psy-contracts/deployments/localhost`, `localhostBsc`, and `localhostBase`. Each database commit is separate. A failure stops immediately: earlier commits and removals remain, later cleanup does not start, and nothing is rolled back (`psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:5-12,57-103`). TypeScript does not recursively remove these paths or inspect redb contents. Ancestor symlink checks alone are not a race-safety guarantee. The launcher does not request Anvil historical-state preservation. `make restart` only restarts applications: it does not run the helper, recreate databases, generate Genesis, deploy contracts, or write configuration.
 
 The protected helper requires trusted root/current-user-owned ancestry without group/world write access, and current-user-owned cleanup descendants; symlinks and hardlinked files are rejected. Opening and closing real redb databases can update engine housekeeping headers even when preflight rejects another input. The no-side-effects guarantee for failed preflight is therefore no business-table reset and no cleanup deletion, not byte-for-byte equality of redb files.
+
+The launcher does not generate bridge identity or a `[relayer_wallet]` section; L1 sender `keystore_path` and `password_env` remain inside the forwarded daemon file (section 12.5).
+
+### Startup sequence
+
+```mermaid
+sequenceDiagram
+    participant Operator
+    participant Launcher
+    participant Infra as Persistent infrastructure
+    participant Core as Processors and edges
+    participant Apps as Applications
+    participant Control as Control socket
+
+    Operator->>Launcher: 1. Make target or direct CLI
+    Launcher->>Launcher: 2. Parse flags, environment, and acquire lock
+    Launcher->>Launcher: 3. Auto-setup repositories, artifacts, and tools
+    Launcher->>Infra: 4. Start DB group and wait for TCP readiness
+    Launcher->>Core: 5. Start processors, edges, and workers in dependency order
+    Launcher->>Infra: 6. Start or connect to L1; deploy or reuse contracts
+    Launcher->>Apps: 7. Start Envio, services, indexers, relayer, faucet, and UIs
+    Launcher->>Control: 8. Open repository-keyed Unix socket
+    Control-->>Operator: 9. Supervisor ready
+```
+
+Steps 1-3 are implemented by CLI parsing, lock acquisition, and `ensureDevEnvironment()` (`dev/locSetupV4.ts:7359-7440`; `dev/locSetupV4.ts:5859-5914`). Steps 4-7 are the foreground `setupProcesses()` phases (`dev/locSetupV4.ts:5916-6336`). The control socket opens only after `setupProcesses()` resolves, so startup-time failures cannot be repaired through `make restart` (`dev/locSetupV4.ts:7696-7727`).
+
+Fresh database startup uses `start_db.sh --fresh`, which refuses existing resources. Filesystem cleanup is descriptor-relative in the `fresh-devnet-state` helper, not a TypeScript recursive delete; end of input aborts the protocol, and a live guardian or relayer database owner must exit before a fresh launch is admitted. The namespace binding survives checkpoint cleanup; unbound legacy names receive the same collision checks as explicit namespaces. The helper writes no configuration and does not seed authorization tables. The four `db/*.redb` files hold mutable runtime rows only (`dev/locSetupV4.ts:4170-4249`; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:1-12,57-103`).
 
 ```bash
 make build
@@ -182,12 +261,70 @@ export PSY_SKIP_BUILD=1
 make run-all
 ```
 
-`make shutdown` remains the explicit teardown. `PURGE=1` is still its default and performs the broader purge documented in the launcher reference; it is the supported complete teardown. `PURGE=0` stops without purging, but its database stop is `docker stop -t -1`, which waits indefinitely; that supervisor-side Docker stop subprocess has no deadline, while the control client normally times out at 900 seconds (`dev/locSetupV4.ts:7355-7362`). In the recorded observation the invoker was cut off at 180 seconds while the supervisor kept waiting, and the supported purge teardown then completed in 11.44 seconds. It is not required before `make run-all`.
+`make shutdown` remains the explicit teardown; `PURGE=1` is its default and the supported complete teardown (section 18). It is not required before `make run-all`.
 
 `make run-all` stays in the foreground. Run it in a dedicated terminal or tmux pane. Do not background it with `&`.
 
 A second `make run-all` is another fresh chain, not a resume. Run it only after the first supervisor has exited, its control socket is gone, configured local ports are free, and no process still holds the four redb files. It repeats the same clear-then-cleanup order, then generates a new Genesis and deployments. `make restart` cannot replace that second fresh start: restart requires the original supervisor and its recorded `db`, `l1_anvil`, `l1_anvil_bsc`, and `l1_anvil_base` processes to still be running. If any of those processes is absent, restart fails and starts nothing.
 
+### Process DAG
+
+The following ASCII graph is definitive for the foreground path; conditional nodes run only when selected by the mode logic in section 10 (`dev/locSetupV4.ts:3950-3969`).
+
+```text
+resource derivation + logs + release-binary gate
+  |
+  v
+DB group: Redis/Valkey + NATS + Scylla + Nostr
+  |  readiness: group marker, then TCP 6379, 4222, 9042
+  v
+core-selected Realm P2P key generation + genesis validator injection
+  |
+  v
+Prove proxy processes; TCP 9999+index readiness (600 x 1s) completes before core
+  |
+  v
+Coordinator processor
+  |
+  v
+Coordinator edges (parallel)
+  |
+  v
+Realm processors in batches of at most four
+  |  processors sequential inside a batch
+  v
+Realm edges for that batch (parallel), then two-second spacing
+  |
+  v
+Coordinator workers (after the complete Realm processor/edge phase)
+  |
+  v
+Realm workers (parallel) -> dummy provers (parallel)
+  |
+  v
+Anvil or external L1 -> contract deploy/reuse
+  |
+  v
+Envio Postgres + Hasura -> Envio indexer API
+  |
+  v
+psy-services -> Coordinator indexer -> Realm indexers
+  |
+  +--------------------+
+  |                    |
+  v                    v
+faucet              relayer
+  |                    |
+  +----------+---------+
+             |
+             v
+Nostr readiness -> Privacy Bridge -> IDE -> Explorer -> Mode A UI
+             |
+             v
+control socket + steady-state supervisor
+```
+
+The DB phase starts `dev/start_db.sh --fresh` and then probes ports 6379, 4222, and 9042 (`dev/locSetupV4.ts:4030-4045`). Coordinator startup precedes Realm batching (`dev/locSetupV4.ts:4060-4248`). Coordinator workers explicitly await the full Realm phase, not only the Coordinator phase (`dev/locSetupV4.ts`). Workers and dummy provers follow the core phase. Prove proxy is spawned after genesis preparation and its TCP listen gate completes before the Coordinator processor. Layer 1, bridge services, faucet, relayer, and UIs then follow in source order (`dev/locSetupV4.ts`).
 
 ## 4. Readiness
 
@@ -223,6 +360,34 @@ curl -s -X POST http://127.0.0.1:1337 \
 
 With the default `make run-all` topology (`--realms-count 2`, `--realm-edge-nodes 1`, two validators per Realm), Realm edge HTTP ports are `13380`/`13381` for Realm 0 subs `1`/`2` and `13390`/`13391` for Realm 1. Each Realm starts processors for both sub-IDs. `start-realm-processor` does not take a sub-id flag; the process derives sub-id from its Ed25519 identity match in `PSY_CONFIG_PATH`. Rollback plans still require explicit `--realm-id` / `--realm-sub-id` and must match that derived identity.
 
+### Foreground process inventory
+
+| Process                | Command/log identity                                                                  | Readiness and prerequisite                                                                  | Evidence                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| DB group | `dev/start_db.sh --fresh`, `logs/db_*` | `All services are running.`, then TCP 6379/4222/9042. | `setupProcesses`, `dev/start_db.sh` |
+| Redis/Valkey           | Docker `valkey-server`                                                                | Group marker plus TCP 6379.                                                                 | `dev/start_db.sh:83-107`; `dev/locSetupV4.ts:4041-4045`        |
+| NATS                   | Docker NATS JetStream                                                                 | Group marker plus TCP 4222.                                                                 | `dev/start_db.sh:109-121`; `dev/locSetupV4.ts:4041-4045`       |
+| Scylla                 | Docker Scylla                                                                         | `nodetool status` contains `UN`, then TCP 9042.                                             | `dev/start_db.sh:232-255`; `dev/locSetupV4.ts:4041-4045`       |
+| Nostr                  | Docker Nostr relay                                                                    | Must remain alive for DB group; direct TCP 8081 gate precedes Privacy Bridge.               | `dev/start_db.sh:184-245`; `dev/locSetupV4.ts:4706-4714`       |
+| Coordinator processor  | `psy_node_cli start-coordinator-processor`                                            | Exact marker `[COORD_CREATE] processor new done`; 120-second attempt, narrow Scylla retry.  | `dev/locSetupV4.ts:4060-4090`; `dev/locSetupPolicy.ts:319-333` |
+| Coordinator edges      | `start-coordinator-edge`                                                              | Edge RPC marker; all edges start in parallel after processor.                               | `dev/locSetupV4.ts:4095-4118`                                  |
+| Realm processors       | `start-realm-processor`                                                               | Exact marker `[REALM_CREATE] processor new done`; 180-second attempt, narrow Scylla retry.  | `dev/locSetupV4.ts:4163-4208`; `dev/locSetupPolicy.ts:319-333` |
+| Realm edges            | `start-realm-edge`                                                                    | Edge RPC marker; parallel after every processor in the batch.                               | `dev/locSetupV4.ts:4208-4244`                                  |
+| Coordinator workers    | `psy_worker_cli worker`                                                               | Worker-start marker; start sequentially after complete Realm readiness.                     | `dev/locSetupV4.ts:4120-4162`; `dev/locSetupV4.ts:4248`        |
+| Realm workers          | `psy_worker_cli worker`                                                               | Worker-start marker; all selected worker promises are awaited.                              | `dev/locSetupV4.ts:4250-4342`                                  |
+| Dummy provers          | `dev/dummy_prover.sh`                                                                 | Dummy-prover marker; start in parallel after Realm workers.                                 | `dev/locSetupV4.ts:4343-4360`                                  |
+| Prove proxy            | `psy_user_cli prove-proxy --role all`                                                 | Spawned after genesis prep; TCP `9999 + index` (600 x 1s, 1500ms connect) completes before Coordinator processor. Faucet and relayer still await the same gate. | `dev/locSetupV4.ts` (`waitForProveProxy`) |
+| Anvil                  | `anvil ... --state db/anvil/state.json --state-interval <ANVIL_STATE_INTERVAL\|\|900>` | `Listening on`, then HTTP Layer 1 probe, preserved genesis check, then `anvil_setIntervalMining([1])` on each launcher-managed chain. | `dev/locSetupV4.ts` (`l1StartedDetector`, `assertPreservedAnvilGenesis`, `setLocalAnvilIntervalMining`) |
+| Envio backing services | Generated Docker Compose                                                              | Postgres TCP 5433, SQL `select 1`, Hasura `/healthz`.                                       | `dev/locSetupV4.ts:3338-3364`                                  |
+| Envio indexer          | `pnpm start`, or the frozen generated command                             | Outer setup requires TCP 9898. Frozen mode does not run `pnpm start`.                          | `dev/locSetupV4.ts:4289-4303,4488-4501`                    |
+| psy-services           | `psy-services --disable-auth`                                                         | Start marker, then `http://127.0.0.1:3000/health`.                                          | `dev/locSetupV4.ts:4545-4575`                                  |
+| psy-indexers           | `psy-indexer` Coordinator then Realm                                                  | `Starting PSY Indexer`; sequential ordering.                                                | `dev/locSetupV4.ts:4576-4630`                                  |
+| Faucet                 | `psy_user_cli faucet-server`                                                          | Waits for same-launch proxies; its TCP 9998 probe is nonblocking after spawn.               | `dev/locSetupV4.ts:4633-4662`                                  |
+| Relayer                | `psy_relayer_cli --config <PSY_BRIDGE_DAEMON_CONFIG>`                              | `multichain bridge relayer started` or `bridge relayer started`, after same-launch proxy readiness and the bridge stack. | `dev/locSetupV4.ts` |
+| UIs                    | Vite/Bun development servers                                                          | `ready in`; ports 5177, 5176, 5178, 5179.                                                   | `dev/locSetupV4.ts:4706-4839`                                  |
+
+General initialization-hint startup retries after two seconds, with `maxRetries=3` meaning at most four attempts; without an explicit initialization timeout, a live child that never prints its marker has no helper-level deadline (`dev/locSetupV4.ts:764-904`). Processor startup is narrower: only recognized transient Scylla schema failures and a follow-on timeout after such a failure are retried (`dev/locSetupV4.ts:47-96`).
+
 ## 5. Application Restart
 
 Keep the terminal running `make run-all` alive. Restart only its supervised application children:
@@ -231,11 +396,9 @@ Keep the terminal running `make run-all` alive. Restart only its supervised appl
 make restart
 ```
 
-`make restart` sends `restart` to the existing supervisor. It requires the recorded `db`, `l1_anvil`, `l1_anvil_bsc`, and `l1_anvil_base` processes to still be running. A healthy primary Anvil is not sufficient. If any required process is absent, the command fails and starts nothing. On success it stops and recreates processors, edges, workers, proof services, APIs, indexers, relayer, and UIs from their recorded commands. Restart also requires the selected network's `guardian_authorization` object to already exist. It does not delete files, remove volumes, deploy contracts, publish authorization, or start a replacement database or Anvil (`dev/locSetupV4.ts:4013-4017,4240-4248,5743-5746`).
+`make restart` sends `restart` to the existing supervisor. It requires the recorded `db`, `l1_anvil`, `l1_anvil_bsc`, and `l1_anvil_base` processes to still be running. A healthy primary Anvil is not sufficient. If any required process is absent, the command fails and starts nothing. On success it stops and recreates processors, edges, workers, proof services, APIs, indexers, relayer, and UIs from their recorded commands. Restart consumes the selected network's existing `guardian_initial_member_hashes`, guardian endpoints, and the already selected deployment documents; it does not create them and it does not write `l1_endpoints`. It does not delete files, remove volumes, deploy contracts, write configuration, or start a replacement database or Anvil (`dev/locSetupV4.ts:358-375,5743-5746`).
 
 Anvil continues writing its current chain to `db/anvil/state.json` (and the localhostBsc and localhostBase paths). Those files are outputs of the running process. The next `make run-all` removes them before starting a new chain.
-
-
 
 ## 6. Offline Rollback Stop and Resume
 
@@ -285,14 +448,14 @@ The supervisor removes the stop sentinel only after every saved application proc
 7. Require checkpoint ring buffers to be contiguous through the current head and new gatherer backups to begin above the retained monotonic pending high-water.
 8. If an end cap anchors to a historical checkpoint after rollback, bound the checkpoint-tree proof query by the current logical head; an unbounded per-node max query can mix physical post-rollback residual versions.
 
-The earlier checkpoint-289-to-0 run is historical L2 evidence from the old restart path: it showed L2 rollback, convergence, and transaction acceptance, and it did not prove localhost L1 continuity because that path recreated Anvil. It is not verification of the current three-Anvil restart.
-
 ## 8. Failure Rules
+
+Lifecycle failure rules:
 
 | Failure | Action |
 |---|---|
 | `compiler revision changed` | Regenerate compiler and Genesis contract artifacts, regenerate root `genesis.json`, rebuild affected release binaries, then run the artifact checks. |
-| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data` with the matching sibling compiler artifacts and the canonical signing policy already present; stale embedded definitions can fail prove-proxy circuit construction. |
+| Root `genesis.json` contract circuit differs from canonical compiler output | Run `make generate-genesis-data` with the matching sibling compiler artifact and the selected network's `guardian_initial_member_hashes` already present; stale embedded definitions can fail prove-proxy circuit construction. |
 | Cargo cannot authenticate to `git@github.com` | Set `CARGO_NET_GIT_FETCH_WITH_CLI=true`; repair empty cached submodules without deleting the whole Cargo git cache. |
 | Submodule fetch reports `early EOF` | Retry the same authenticated command. |
 | Scylla `raft operation add_entry timed out` during fresh schema creation | Stop the partial stack with `PURGE=1 make shutdown`, then run `make run-all`. Do not reuse the partial Scylla volume. |
@@ -300,12 +463,27 @@ The earlier checkpoint-289-to-0 run is historical L2 evidence from the old resta
 | `db/anvil/state.json` is truncated or invalid JSON | The L1 snapshot is unusable. Do not repair it manually or claim L1 continuity. Use `PURGE=1 make shutdown`, then `make run-all`. |
 | Database proof differs from checkpoint ring buffer proof | Keep the stack stopped and identify whether the DB history or ring buffer is stale; do not delete only one side. |
 | `rollback-stop` reports an application port still open | Keep the supervisor in `stopping`, terminate the tracked application process group, and retry `make rollback-stop`. Do not write the sentinel manually. |
-| `make restart` cannot reach the control socket | The foreground supervisor is absent. `make run-all` creates a fresh chain; it does not preserve the previous chain. |
+| `make restart` cannot reach the control socket | The foreground supervisor/socket is absent; daemon mode and completed teardown have no control server. `make run-all` creates a fresh chain; it does not preserve the previous chain. |
 | Processor exits before the exact readiness marker | Read that processor's error log; do not treat an open RPC port as processor readiness. |
 | Realm resume has no positive pending/proc mapping below the retained counter | Resolve the committed pair from the latest checkpoint mapping at or before the marker; the `(0,0)` sentinel is valid for an unchanged Realm. Never lower or reuse the counter. |
 | Rollback CLI says an endpoint is reachable | Run `make rollback-stop`; do not bypass the offline guard. |
 | Rollback plan phase fails | Keep applications stopped and rerun the same RP. The phase model is idempotent. |
 | `make rollback-resume` fails | Keep the sentinel and the infrastructure that is still running; fix the failing application, then rerun `make rollback-resume`. Do not replace it with `make run-all`. |
+
+Launcher diagnosis (source-grounded checks for the same operations):
+
+| Symptom                                            | Diagnosis and action                                                                                                     | Evidence                                                     |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| Another devnet is running                          | A repository-keyed kernel `flock` is held; use supported teardown or control rather than starting a second foreground launcher.          | `dev/locSetupV4.ts:5260-5309`                                |
+| Help or teardown fails before its branch           | Network resolution and `--env` parsing occur before help/teardown; correct invalid network, missing external RPC, or invalid assignment. | `dev/locSetupV4.ts:5511-5539`; `dev/locSetupV4.ts:5722-5725` |
+| Processor exits before ready                       | Read its error log; only recognized transient Scylla schema failures receive processor retry.                                            | `dev/locSetupV4.ts:47-96`; `dev/locSetupV4.ts:4060-4090`     |
+| Leftover local Anvil snapshot or deployment       | `make run-all` removes this checkout's scoped state first. A file that remains, or an occupied local port, fails the start.              | `dev/locSetupV4.ts` (`resetScopedDevnetState`, `resolveLocalAnvilStatePlan`) |
+| Rollback stop reports open ports                   | The manager remains in `stopping`; identify the retained application listener and retry the supported stop after resolving it.           | `dev/locSetupV4.ts:3560-3587`; `dev/locSetupV4.ts:3877-3879` |
+| Controlled resume fails                            | Newly started applications are stopped and lifecycle returns to `stopped`; fix the failing application and rerun resume.                 | `dev/locSetupV4.ts:3905-3913`                                |
+| Prove proxy appears slow                           | Log readiness can precede TCP readiness; the TCP gate permits up to 600 one-second attempts.                                             | `dev/locSetupV4.ts:4362-4402`                                |
+| Faucet port is not open when setup continues       | Its post-spawn TCP wait is detached and warning-only.                                                                                    | `dev/locSetupV4.ts:4649-4662`                                |
+| DB group restarts repeatedly                       | One Redis/Valkey, NATS, Scylla, or Nostr pipeline exited; the DB script stops the group and exits nonzero for supervisor restart.        | `dev/start_db.sh:232-294`                                    |
+| `PSY_SKIP_BUILD=1` reports missing/stale artifacts | Rebuild/regenerate required artifacts; skip-build intentionally fails instead of repairing them.                                         | `dev/locSetupV4.ts:1933-1968`; `dev/locSetupV4.ts:2247-2252` |
 
 ## 9. Forbidden Operations
 
@@ -319,10 +497,723 @@ The earlier checkpoint-289-to-0 run is historical L2 evidence from the old resta
 - Do not restart processors until all Coordinator and Realm rollback plans and external recovery have completed.
 - Do not run formatters.
 
+## 10. Startup Mode Selection
+
+### 10.1 Bare launcher defaults
+
+```bash
+bun run dev/locSetupV4.ts
+```
+
+A bare invocation has no component selector, so `startAll` is true. Its defaults are one Realm beginning at Realm 0,
+one Coordinator edge, one Realm edge, one Coordinator worker, two Realm workers, one implicit prove proxy, and the
+full foreground infrastructure/application set (`dev/locSetupV4.ts:5443-5449,5477-5486,3950-3969,4362-4369`).
+
+### 10.2 make run-all
+
+```bash
+make run-all
+```
+
+`make run-all` does **not** rely on bare defaults. It expands an explicit component list with two Realms, two
+Coordinator workers, one Realm worker, one prove proxy, the database group, Coordinator/Realm nodes, faucet, Layer 1,
+relayer stack, and all four UI flags (`Makefile:93`). Make defaults `PSY_SKIP_BRANCH_CHECK`,
+`PSY_SKIP_KEYSTORE`, and `PSY_SKIP_BUILD` to `1`. A direct launcher also skips branch sync, remote keystore
+refresh, and build unless that value is exact `0` (`Makefile:16-18`; `dev/locSetupPolicy.ts:316-318`).
+
+| Setting             | Bare launcher                                      | `make run-all`                         | Evidence                                        |
+| ------------------- | -------------------------------------------------: | -------------------------------------: | ----------------------------------------------- |
+| Realm count         | 1                                                  | 2                                      | `Makefile:93`    |
+| Coordinator workers | 1                                                  | 2                                      | `Makefile:93`    |
+| Realm workers       | 2                                                  | 1                                      | `Makefile:93`    |
+| Prove proxy         | Implicit 1                                         | Explicit 1                             | `Makefile:93`    |
+| Build policy        | Existing artifacts unless exact `PSY_SKIP_BUILD=0` | Existing artifacts required by default | `Makefile:18,99` |
+
+### 10.3 Component selection
+
+The component selectors are `--db`, `--coordinator`, `--prove-proxy`, `--faucet-server`, `--dummy-provers`, `--l1`,
+`--relayer`, `--bridge-proposer-daemon`, `--psy-privacy-bridge`, `--ide`, `--explorer`, and
+`--mode-a-web-wallet-bridge`. Without `--all`, selectors choose component mode and disable full-mode worker defaults. `make run-all` explicitly supplies `--all`, preserving its component/count overrides while requiring the protected fresh-local-start sequence. Explicit worker and proxy counts control startup, including a zero proxy count. Realm P2P is not a selector or modifier: every Realm launch uses it.
+Component selectors do not automatically select runtime dependencies: for example, `--coordinator` does not select `--db`, `--relayer` does not select Layer 1 or the
+core, and `--psy-privacy-bridge` does not select Nostr (`dev/locSetupV4.ts:3950-3969,4454-4704,4706-4718`).
+
+## 11. CLI Option Reference
+
+Numeric strings are parsed with `parseInt(..., 10)`, so malformed suffixes can still be accepted. Core startup additionally validates the parsed Realm start identifier, Realm count, edge count, and every requested Realm port before setup (`dev/locSetupV4.ts:1107-1121,5482-5487`). Worker and Coordinator counts do not receive that Realm-topology validation.
+
+| Option                           | Type and effective default             | Source-accurate effect                                                                                                                                                                                                                                                                                                                                                                                                             | Evidence                                                                                      |
+| -------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `--all` | Boolean, false | Explicit full fresh foreground localhost startup, even with component selectors; no fork or alternate Genesis path. Counts still apply. | `setupProcesses`, `Makefile` |
+| `--jtmb`                         | Boolean, false                         | Chooses `jtmb-poseidon-goldilocks` only when `--proving-backend` is absent.                                                                                                                                                                                                                                                                                                                                                        | `dev/locSetupV4.ts:5440-5441,4004`                                       |
+| `--proving-backend VALUE`        | String, Plonky2 fallback               | Supplies processor, worker, dummy-prover, and daemonized backend arguments.                                                                                                                                                                                                                                                                                                                                                        | `dev/locSetupV4.ts:3627-3641,4004-4354`                                  |
+| `--disable-worker-edge-logs`     | Boolean, false                         | Omits launcher log files for workers and edges in foreground mode.                                                                                                                                                                                                                                                                                                                                                                 | `dev/locSetupV4.ts:3993-4001`                                                                 |
+| `--realm-workers COUNT`          | 2 full / 0 component                   | Starts shared Realm workers; a positive value also counts toward Rayon sizing.                                                                                                                                                                                                                                                                                                                                                     | `dev/locSetupPolicy.ts:303-315`; `dev/locSetupV4.ts:3966-3975,4250-4341` |
+| `--realm-edge-nodes COUNT`       | String, `1`                            | Sets the number of distinct standard-P2P edge identities per Realm validator. Each edge receives its own secret key, public address, P2P listen port, and HTTP port.                                                                                                                                                                                                                                                               | `dev/locSetupV4.ts:5444,5482,4207-4237`                                                       |
+| `--coordinator-edge-nodes COUNT` | String, `1`                            | Starts Coordinator edges on `1337 + index`.                                                                                                                                                                                                                                                                                                                                                                                        | `dev/locSetupV4.ts:5445,5483,4094-4118`                                                       |
+| `--coordinator-workers COUNT`    | 1 full / 0 component                   | Starts Coordinator workers after Realm readiness.                                                                                                                                                                                                                                                                                                                                                                                  | `dev/locSetupV4.ts:5446,5484,4120-4128,4248`                                                  |
+| `--start-realm-id ID`            | String, `0`                            | Sets the inclusive first Realm ID.                                                                                                                                                                                                                                                                                                                                                                                                 | `dev/locSetupV4.ts:5447,5485`                                                                 |
+| `--realms-count COUNT`           | String, `1`                            | Sets the number of consecutive Realm IDs.                                                                                                                                                                                                                                                                                                                                                                                          | `dev/locSetupV4.ts:5448,5486`                                                                 |
+| `--host HOST`                    | String, `127.0.0.1`                    | Builds foreground DB, NATS, Redis, Coordinator, worker, and routable Realm P2P public addresses; it is not the Anvil host setting.                                                                                                                                                                                                                                                                                                 | `dev/locSetupV4.ts:5449,5488,4054,4126`                                                       |
+| Realm P2P                        | Core-only runtime setup                | Coordinator/Realm core startup uses the standard Realm P2P protocol, generates or reuses two ordered validators per Realm, injects public validator identities into Genesis, and exports a public-only runtime config. DB-, worker-, service-, and UI-only selections do not create secrets/config or rewrite Genesis. Daemon core mode writes a separate config using Compose DNS public addresses and wildcard listen addresses. | `dev/locSetupV4.ts:4048-4056,4870-4875`                                                       |
+| `--genesis-data-path PATH`       | String, `genesis.json`                 | Supplies processor Genesis and receives public validator identities only when Coordinator/Realm core is selected.                                                                                                                                                                                                                                                                                                                  | `dev/locSetupV4.ts:5451,5489,4056`                                                            |
+| `--coordinator`                  | Boolean selector                       | Starts Coordinator processor/edges and Realm processors/edges; it does not select DB.                                                                                                                                                                                                                                                                                                                                              | `dev/locSetupV4.ts:3950-3965,4060-4248`                                  |
+| `--db` | Boolean selector | Starts fresh Redis/Valkey, NATS, Scylla and Nostr; refuses existing containers or volumes without stopping or deleting them. | `dev/start_db.sh --fresh` |
+| `--dummy-provers COUNT`          | String, `0`                            | Starts dummy prover scripts for the selected Realm range; daemon mode emits none.                                                                                                                                                                                                                                                                                                                                                  | `dev/locSetupV4.ts:4343-4360,4843-5215`                                  |
+| `--prove-proxy COUNT`            | String, `0`; full foreground implies 1 | Starts proxy listeners on `9999 + index`.                                                                                                                                                                                                                                                                                                                                                                                          | `dev/locSetupV4.ts:4362-4396`                                                                 |
+| `--faucet-server`                | Boolean selector                       | Starts faucet on 9998 after same-launch proxy readiness, when proxies exist.                                                                                                                                                                                                                                                                                                                                                       | `dev/locSetupV4.ts:6537-6539`                                                                 |
+| `--l1`                           | Boolean selector                       | Starts local/forked Anvil or probes external Layer 1, then deploys/reuses contracts.                                                                                                                                                                                                                                                                                                                                               | `dev/locSetupV4.ts:4404-4452`                                                                 |
+| `--relayer` | Boolean selector | Starts Envio backing services/indexer, psy-services, indexers, and bridge relayer using the unchanged operator configuration. External core and Layer 1 dependencies must exist. Core-only and relayer-only selection skip SDK sidecar preparation and UI dependency setup unless a UI is also selected. | `dev/locSetupV4.ts` |
+| `--relayer-config PATH`          | String, local TOML path                | Supplies the existing Envio/dependency configuration. It is not the bridge daemon config and is not rewritten into one. | `dev/locSetupV4.ts` |
+| `--bridge-proposer-daemon`       | Boolean selector                       | Same component selection, bridge dependency guard, and forwarded daemon config as `--relayer`. | `dev/locSetupV4.ts` |
+| `--psy-privacy-bridge`           | Boolean selector                       | Starts bridge dependencies (Envio, psy-services, and indexers) without selecting the relayer, then waits for Nostr and starts the bridge UI on 5177. Acceptance omits `--relayer` because the driver owns the relayer. | `dev/locSetupV4.ts:4926,5176-5211,5704-5705` |
+| `--ide`                          | Boolean selector                       | Starts the IDE on 5176.                                                                                                                                                                                                                                                                                                                                                                                                            | `dev/locSetupV4.ts:4742-4761`                                                                 |
+| `--explorer`                     | Boolean selector                       | Starts Explorer on 5178.                                                                                                                                                                                                                                                                                                                                                                                                           | `dev/locSetupV4.ts:4764-4788`                                                                 |
+| `--mode-a-web-wallet-bridge`     | Boolean selector                       | Starts the Mode A UI on 5179 only when every `link:` package resolves.                                                                                                                                                                                                                                                                                                                                                             | `dev/locSetupV4.ts:4790-4839`                                                                 |
+| `--daemonlize`                   | Boolean modifier                       | Generates root `docker-compose.yml`, starts its limited service set, releases the lock, and exits.                                                                                                                                                                                                                                                                                                                                 | `dev/locSetupV4.ts:5755-5758`                                                                 |
+| `--teardown`                     | Boolean                                | Skips auto-setup and startup lock, stops known processes/containers/ports, and exits.                                                                                                                                                                                                                                                                                                                                              | `dev/locSetupV4.ts:5722-5725`                                                                 |
+| `--purge`                        | Boolean                                | The purge switch of the explicit teardown path, not the only data-destroying operation. With `--teardown`, purges and exits; at startup, runs the same paired purge (checkpoints, `db/anvil/state.json`, logs, localhost deployments, devnet Docker volumes) before any process starts, then deploys contracts fresh. Full startup with `--all` is a separate fresh reset that destroys prior state without this flag.                                                                                                                                                                   | `dev/locSetupV4.ts:5693-5698,3450-3468`                                  |
+| `--control COMMAND`              | String                                 | Sends exactly `restart`, `rollback-stop`, `rollback-resume`, `shutdown`, or `shutdown-purge` to a live foreground supervisor. Only `shutdown-purge` deletes state among the control commands; a full `--all` startup is the separate fresh reset.                                                                                                                                                                                                                                                                | `dev/locSetupV4.ts:7230,7245-7247,7472,7699-7725`                                             |
+| `--env ASSIGNMENTS`              | String                                 | Parses nonempty shell-style `KEY=VALUE` assignments; CLI values override inherited values for foreground children.                                                                                                                                                                                                                                                                                                                 | `dev/locSetupPolicy.ts:42-56`; `dev/locSetupV4.ts:3921-3931`                                  |
+| `--help`, `-h`                   | Boolean                                | Prints embedded help after network and environment resolution, then exits.                                                                                                                                                                                                                                                                                                                                                         | `dev/locSetupV4.ts:5516-5539,5539-5636`                                  |
+
+## 12. Environment Variable Reference
+
+Foreground managed children receive inherited launcher environment, then `--env` overrides, then normalized resource
+values, then service-specific overrides (`dev/locSetupV4.ts:3921-3931,3970-3975,4550-4566`). Daemonized containers receive only the filtered set described in section 19
+(`dev/locSetupV4.ts:4910-4921`).
+
+### 12.1 Network and Anvil
+
+| Variable                   | Default and validation                                  | Effect                                                                                                  | Evidence                                                                                |
+| -------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `VITE_NETWORK`             | `localhost`; accepts `localhost`, `sepolia`, `ethereum` | Selects network metadata, deployment namespace, external RPC, and UI network.                           | `dev/locSetupV4.ts:482-487,3943-3948`                              |
+| `VITE_FORK`                | False; truthy: `1`, `true`, `yes`, `on`                 | Requires non-local network and starts local Anvil from the selected external RPC.                       | `dev/locSetupV4.ts:118-121,246-257,4417-4425` |
+| `VITE_FORK_BLOCK_NUMBER`   | Unset                                                   | Adds Anvil `--fork-block-number`; launcher only trims, not numerically validates, it.                   | `dev/locSetupV4.ts:4423-4424`                                                           |
+| `SEPOLIA_RPC_URL`          | Required by configured Sepolia entry                    | Supplies direct Sepolia RPC or fork source.                                                             | `psy-genesis/config.json:135-138`; `dev/locSetupV4.ts:495-505`                          |
+| `ETH_RPC_URL`              | Required by configured Ethereum entry                   | Supplies direct Ethereum RPC or fork source.                                                            | `psy-genesis/config.json:208-211`; `dev/locSetupV4.ts:495-505`                          |
+| `L1_RPC_HOST`              | `127.0.0.1`                                             | Changes the URL used to reach local Anvil; Anvil still binds `0.0.0.0`.                                 | `dev/locSetupV4.ts:490-493,4413-4415`                              |
+| `REDEPLOY_L1` | Redeploy unless `0`, `false`, `no`, or `off` | Controls external deployment reuse only; full local startup always deploys fresh. | `deployPsyContracts` |
+| `DEV_PSY_SOURCE_ADDRESS`   | Deployment constructor source, then deployer            | Selects the impersonated PSY funding source for local/fork accounts.                                    | `dev/locSetupV4.ts:443-447`                                                             |
+| `DEV_FUND_EXTRA_ADDRESSES` | Empty comma-separated list                              | Adds addresses to local/fork development funding.                                                       | `dev/locSetupV4.ts:451-477`                                                             |
+
+### 12.2 Repository setup and build
+
+| Variable                | Default                                                                     | Effect                                                                                                     | Evidence                                                                      |
+| ----------------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `PSY_PROJECTS_DIR`      | Parent of repository root                                                   | Locates sibling `psy-services`, `psy-wallet`, `psy-sdk`, and `psy-compiler` repositories.                  | `dev/locSetupV4.ts:1662-1686`                                                 |
+| `PSY_SKIP_BRANCH_CHECK` | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` fetches expected branches, stashes dirty/untracked changes, and checks out remote refs detached. | `dev/locSetupPolicy.ts:299-301`; `dev/locSetupV4.ts:1727-1752`; `Makefile:13` |
+| `PSY_SKIP_BUILD`        | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` builds; every other value requires existing release binaries and current generated artifacts. | `dev/locSetupPolicy.ts:316-318`; `dev/locSetupV4.ts:2101-2102`; `Makefile:18`                                  |
+| `PSY_CONFIG_PATH`       | Repository Genesis config                                                   | Supplies build configuration to Make and fallback Cargo builds.                                            | `Makefile:3,22-34`; `dev/locSetupV4.ts:2801-2824`                             |
+
+Core setup replaces child `PSY_CONFIG_PATH` with the generated public runtime configuration. Reuse requires its source-configuration SHA-256 stamp, epoch metadata, topology, and all requested key files to match (`dev/locSetupV4.ts:1149-1199,1237-1287,4053-4056`). Runtime rotation reads compiled `psy_config::CHECKPOINTS_PER_EPOCH`; a runtime JSON edit is not an epoch-length override (`psy_data/src/config/network_config.rs:61-81`). Sibling discovery is not gitlink checkout: `PSY_PROJECTS_DIR` locates `psy-services`, `psy-wallet`, `psy-sdk`, and `psy-compiler`, while node `psy-genesis`, `psy-contracts`, and `psy-dapp` are submodules; section 1 defines the required checkout order (`dev/locSetupV4.ts:1942-1972,1998-2034`). Do not use `--remote`.
+
+### 12.3 Keystore and credentials
+
+| Variable                   | Default                                                                   | Effect                                                                                                 | Evidence                                                                                    |
+| -------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `HOME`                     | Required                                                                  | Locates trust setup and default relayer keystore.                                                      | `dev/locSetupV4.ts:2476-2481,2968-2973`                                |
+| `KEYSTORE_PATH` | `${HOME}/.psy/keystore/bridge-relayer` | Encrypted UTC JSON for L1 `[finalize]` / `[[chains]]` transaction signing only; not the L2 multisig identity. | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`, `daemonConfig`) |
+| `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` | unset | First-choice L1 relayer keystore path; not a Genesis enrollment input. | `dev/locSetupV4.ts` (`resolveBridgeRelayerKeystorePath`) |
+| `BRIDGE_RELAYER_KEYSTORE_PATH` | unset | L1 keystore alias when `PSY_BRIDGE_RELAYER_KEYSTORE_PATH` is unset. | same |
+| `WALLET_PASSWORD` | Existing prompt/development policy | Decrypts L1 deployment and relayer keystores; not consumed for public Genesis enrollment. | `dev/locSetupV4.ts` (`resolveWalletPassword`, `planGenesisGeneration`) |
+| `GUARDIAN_<id>_KEYSTORE_PASSWORD` | Required at guardian-service runtime | Names `GUARDIAN_1_KEYSTORE_PASSWORD`, `GUARDIAN_2_KEYSTORE_PASSWORD`, or `GUARDIAN_3_KEYSTORE_PASSWORD` by guardian id; supplies the keystore password for `$HOME/.psy/keystore/guardian-<id>.keystore.json`. No password file exists or is read. | `psy_cli/guardian_common/src/runtime.rs:102-108,250-254` |
+| Canonical guardian policy | Required before generation | Three distinct nonzero public `guardian_initial_member_hashes` commitments on the selected network in `psy-genesis/config.json`. No operator fee ceiling, account path, environment variable, or file flag. Protocol fees stay computed and verified. | `dev/locSetupV4.ts:3129-3189`; `client_prover/psy_core/psy_config/src/lib.rs:79-83` |
+| `PSY_SKIP_KEYSTORE`        | Direct source treats every value except exact `0` as skip; Make default `1` | Exact `0` refreshes remote trust setup; every other value skips refresh but still requires mandatory local files. | `dev/locSetupPolicy.ts:316-318`; `dev/locSetupV4.ts:2670-2706`; `Makefile:17`                                                |
+| `PSY_KEYSTORE_R2_PREFIX` | Required only for exact `PSY_SKIP_KEYSTORE=0`; no default | Public `psy-proving-keystores` R2 prefix, e.g. `localhost-<digest>`: one `[A-Za-z0-9._-]{1,128}` segment, without `..`, slash or whitespace. Anonymous HTTPS curl; no legacy alias. | `dev/locSetupPolicy.ts` (`r2CurlArgs`); `dev/locSetupV4.ts` (`downloadKeystoreObject`) |
+| `PSY_FROZEN_DEPS` | Off; exact `1` enables | Require preinstalled contracts/UI dependencies and current selected-UI SDK artifacts. Always run real Envio codegen through the guarded offline/frozen-lock adapter; do not rewrite the indexer manifest or run ordinary installs/approve-builds. | `dev/frozenDeps.ts`; `runFrozenEnvioCodegen` |
+| `PSY_FROZEN_DEPS_PNPM` | Required in frozen mode | Absolute reviewed cached pnpm 10.33.0 `bin/pnpm.cjs`; no package-manager download. | `dev/frozenDeps.ts` |
+| `PSY_FROZEN_DEPS_STORE` | Required in frozen mode | Absolute existing offline pnpm store, checked by the adapter. | `dev/frozenDeps.ts` |
+
+Frozen Envio codegen validates the approved lock/manifests and rejects project configuration files before
+dispatching guarded package-manager children. It never skips codegen based on a config hash. Generated
+ReScript compilation runs inside the guarded codegen path; startup invokes the real Envio executable
+directly instead of `pnpm start`. Missing prerequisites fail rather than triggering an unguarded install.
+
+Remote trust-setup mode fails closed on manifest fetch, parse, version or missing/invalid entries for any of the twelve uncompressed files (`dev/locSetupV4.ts:2780-2799`). The publication manifest has sixteen entries: those twelve plus full compressed size/SHA-256 entries for `pk_groth16.bin.zst`, `deposit_append.tar.zst`, `withdrawal_claim.tar.zst` and `reward_claim.tar.zst`. Each chunked download requires its compressed entry, derives the part count from its size, downloads zero-based `.part-NN` keys in 268435456-byte parts (last part the remainder), and verifies the ordered concatenation before decompression (`dev/locSetupV4.ts:2557-2646`). The current cohort has three parts per large object; circuit and verifying-key compressed root files remain single objects, for fourteen data object keys plus the manifest. Local files are checked against manifest size and SHA-256 before reuse, and extracted files must verify after download. Every value except exact `PSY_SKIP_KEYSTORE=0` selects local nonempty-file checks; remote failures never do. Consumers download from the fixed public base `https://pub-23b7764b3820454094ce80557ab38d0b.r2.dev` without login, credentials or Wrangler. Curl ignores its configuration file, rejects HTTP errors and non-HTTPS redirects; the launcher suppresses raw subprocess output/spawn errors and reports object URL/exit diagnostics. Uploads still require authenticated Wrangler. Never publish wallet/UTC JSON or credentials.
+
+Official producer commands are `scripts/trust-setup.py pack`, `verify`, and `publish`; see [offline packaging and manifest](circuit-and-verifier-operations.md#10-offline-packaging-and-manifest) and [publication boundary](circuit-and-verifier-operations.md#11-publication-boundary). Publication validates the complete package, requires all public keys absent, verifies uploaded bytes through public readback, and publishes the manifest last. `publish --check-only` validates and preflights without writes; it is not publication proof. Reserve exclusive ownership of a fresh prefix because Wrangler cannot atomically enforce conditional creation.
+
+#### Wallet provisioning
+
+- `wallet create --output <wallet-path>` without `--password` reads the password from the controlling terminal (`/dev/tty`), not standard input: piping a password does not answer the prompt. The source also accepts an explicit `--password` value (`client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:19-20`), but that form places the secret in argv, where it leaks into shell history and process listings; this document does not execute that form, and no lifecycle step requires it. The CLI chooses the explicit password or `rpassword::read_password()` at `client_prover/psy_cli/psy_user_cli/src/subcommand/wallet.rs:17-29`; flag: `client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:15-22`. The locked dependency is `rpassword` 7.4.0 (`Cargo.lock:9601-9604`); its Unix terminal path is `rpassword-7.4.0/src/lib.rs:115-121` (dependency source).
+- Guardian L2 custody is not this L1 wallet flow. The three guardian keystores are operator prerequisites at `$HOME/.psy/keystore/guardian-<id>.keystore.json`; create or reuse each keystore, then place only its public hash in the selected network, by [genesis-generation.md §1.2.2](genesis-generation.md#122-first-workspace-guardian-provisioning). Guardian signing reads each keystore password from the environment variable `GUARDIAN_<id>_KEYSTORE_PASSWORD` (`GUARDIAN_1_KEYSTORE_PASSWORD`, `GUARDIAN_2_KEYSTORE_PASSWORD`, `GUARDIAN_3_KEYSTORE_PASSWORD`) and accepts no other name (`psy_cli/guardian_common/src/runtime.rs:102-108,250-254`). There is no `guardian-<id>.password` file. `wallet create --output` writes a keystore at the exact path given (`client_prover/psy_provider/src/wallet/secp_wallet.rs:209-225`; `eth-keystore-0.5.0/src/lib.rs:223-255`). Do not use `wallet info` or `wallet random` for guardian provisioning: both print secret-bearing output. Automatic setup generates only the L1 bridge-relayer keystore and proving trust setup; it does not create guardian keys or a universal development policy.
+- To derive an existing key's ZK identity without creating a keystore, export `PRIVATE_KEY` and run `./target/release/psy_user_cli wallet info --sign-type zk`, as in [Common Operations §2](common-operations.md#2-wallet-lifecycle). Do not pass `-p` or `--private-key`: either form places the key in argv. The command prints `fingerprint`, `public_key_param`, and `public_key` **and the private key**. Run it only in a private terminal, not captured or shared logs (`client_prover/psy_cli/psy_user_cli/src/subcommand/wallet.rs:84-94`; `client_prover/psy_core/psy_common/src/args.rs:95`; `client_prover/psy_provider/src/wallet/secp_wallet.rs:228-230`).
+- An existing keystore needs the password used to create **that file**, not another wallet's password or a newly selected launcher password. Encryption/decryption use the supplied password (`client_prover/psy_provider/src/wallet/secp_wallet.rs:209-220,233-244`). `Mac Mismatch` means keystore authentication failed: first correct the file/password pairing; it is **not evidence by itself of corruption**, and it is not a reason to overwrite the file. The worker wraps the underlying error at `psy_worker_core/src/config/worker_cli_config.rs:47-49`; the literal is defined by the locked `eth-keystore` 0.5.0 dependency (`Cargo.lock:3044-3047`; `eth-keystore-0.5.0/src/error.rs:6-9`, dependency source), not by that wrapper.
+
+#### Separate L1 transaction signing and L2 multisig identity
+
+`KEYSTORE_PATH` and its higher-priority aliases configure the encrypted L1 transaction-signing keystore only. The proving trust setup stays under `~/.psy/keystore` regardless of that variable. L2 registration 2 (`user_id` 524288) is derived from the public `MultisigAccount` and actual multisig circuit fingerprint, not from a keystore secret. Genesis seeds the initial policy at contract 1 and exports `null` at registration index 2 in `private_keys.json`; other indexed validator/faucet secrets remain secret. See [public Genesis inputs](genesis-generation.md#121-public-bridge-multisig-account).
+
+Generation reads `networks[PSY_NETWORK].guardian_initial_member_hashes` from `psy-genesis/config.json` and the `multisig_policy` compiler artifact in the existing sibling checkout (`PSY_PROJECTS_DIR` may select the projects parent). There is no `PSY_RELAYER_MULTISIG_ACCOUNT`, `--relayer-multisig-account`, `--guardians-root`, `--max-fee`, or separate policy-artifact flag, and no operator fee ceiling to configure. The generation child excludes legacy secret-bearing enrollment variables without changing the parent's L1 signing environment. Full startup preflights the three commitments before any reset and always produces a fresh Genesis; the canonical config is read-only throughout, so nothing is published after deploy. Application restart never regenerates Genesis (`dev/locSetupV4.ts:3129-3197,4170-4249`).
+
+L1 password behavior is unchanged: an existing keystore requires its correct password, non-interactive startup without the required password fails, and an existing keystore is not silently re-encrypted. A missing development L1 keystore can be generated from the named local-devnet fixture; that fixture is not an L2 enrollment key and is not a guardian signing key. Do not copy development secrets into deployment documentation. Launcher startup does not register a guardian daemon. Guardian key provisioning and its three public member commitments are [genesis-generation.md §1.2.2](genesis-generation.md#122-first-workspace-guardian-provisioning).
+
+### 12.4 Resources, logging, and supervision
+
+| Variable                           | Default                               | Effect                                                                                | Evidence                                                       |
+| ---------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `PSY_WORKER_BATCH_SIZE`            | Positive integer `2`                  | Supplies worker `--batch-size` and is normalized into child environment.              | `dev/locSetupPolicy.ts:1`; `dev/locSetupV4.ts:136-140,208-221` |
+| `RAYON_NUM_THREADS`                | Derived, maximum `4`                  | Sets Rayon threads per proving process.                                               | `dev/locSetupPolicy.ts:2,218-220`; `dev/locSetupV4.ts:198-221` |
+| `PSY_RUNTIME_CPUSET`               | Automatic or unset                    | Linux-only complete-core runtime partition; wraps foreground children with `taskset`. | `dev/locSetupV4.ts:146-195,656-660`       |
+| `SCYLLA_CPUSET`                    | Automatic or unset                    | Linux-only complete-core Scylla partition.                                            | `dev/locSetupPolicy.ts:128-180`; `dev/start_db.sh:165-171`     |
+| `SCYLLA_SMP`                       | Reserved logical-core count, else 1-2 | Sets Scylla shard count.                                                              | `dev/locSetupV4.ts:203-221`; `dev/start_db.sh:132-171`         |
+| `SCYLLA_MEMORY`                    | `8G`                                  | Sets Scylla memory budget.                                                            | `dev/locSetupPolicy.ts:3,14-16`; `dev/start_db.sh:134,171`     |
+| `SCYLLA_CAS_CONTENTION_TIMEOUT_MS` | Positive integer `10000`              | Sets Scylla LWT contention timeout.                                                   | `dev/start_db.sh:135-160`; `dev/locSetupV4.ts:4889-4905`       |
+| `SCYLLA_WRITE_REQUEST_TIMEOUT_MS`  | Positive integer `10000`              | Sets Scylla write timeout.                                                           | `dev/start_db.sh:136-160`; `dev/locSetupV4.ts:4894-4905`       |
+| `SCYLLA_COMMITLOG_SYNC`            | `batch` in foreground DB script       | Sets foreground Scylla commitlog mode; daemon generation has no equivalent input.     | `dev/start_db.sh:125-163`; `dev/locSetupV4.ts:4899-4908`       |
+| `SCYLLA_COMMITLOG_BATCH_WINDOW`    | `2` milliseconds                      | Sets foreground batch sync window.                                                    | `dev/start_db.sh:129-163`                                      |
+| `SCYLLA_COMMITLOG_PERIOD`          | `10` milliseconds                     | Sets foreground periodic sync interval.                                               | `dev/start_db.sh:129-163`                                      |
+| `RUST_LOG`                         | No direct global default              | Controls Rust tracing; Make maps `LOG_LEVEL` to `--env RUST_LOG=...`.                 | `Makefile:9,61`; `dev/locSetupV4.ts:3923-3930` |
+| `PSY_NO_AUTO_RESTART`              | Restart enabled                       | Exact `1` disables foreground child auto-restart.                                     | `dev/locSetupV4.ts:3643-3645,5775-5780`   |
+| `TMPDIR`                           | `/tmp`                                | Bases the repository-keyed lock and control socket paths.                             | `dev/locSetupV4.ts:5238-5241,5328-5330`   |
+
+### 12.5 Faucet and service forwarding
+
+The supported faucet keys are `PSY_FAUCET_OPERATORS_JSON`, `PSY_FAUCET_OPERATORS_JSON_B64`,
+`PSY_FAUCET_TURNSTILE_SECRET`, `PSY_FAUCET_REQUIRE_TURNSTILE`, `PSY_FAUCET_TURNSTILE_ACTION`,
+`PSY_FAUCET_TURNSTILE_ALLOWED_HOSTNAMES`, and `PSY_FAUCET_WINDOW_CHECKPOINTS`
+(`dev/locSetupPolicy.ts`). If neither operator representation exists, the launcher best-effort loads the bridge
+faucet-operator JSON file before and after auto-setup. Foreground children inherit these values broadly.
+
+`PSY_BRIDGE_DAEMON_CONFIG` is required before startup whenever full mode, `--relayer`, or `--bridge-proposer-daemon`
+is selected. It names an existing public daemon TOML. The launcher validates metadata and forwards that file unchanged as
+`psy_relayer_cli --config <path>` with no subcommand. Required fields are `rpc_config`, `services_url`, and
+`withdraw_method_id`. `[[chains]].family` is optional and defaults to `evm` in the daemon. The daemon TOML has no
+`guardian_config`. `PSY_GUARDIAN_ROOT` names the guardians-root runtime directory; the launcher preflights its
+owner-only `db` directory against the selected canonical network's public guardian endpoints and launches each guardian as
+`psy_relayer_cli guardian-service --rpc-config <rpc_config> --guardian-root <root> --guardian-id <id>`. Database files are
+derived as `<root>/db/guardian-<id>.redb` and `<root>/db/relayer.redb`. They hold mutable runtime rows only. The launcher requires the owner-only `db` directory and, for guardian-service startup, the selected network's three `guardian_initial_member_hashes` and guardian endpoints, plus one repeatable `--l1-config` path per selected deployment document. Those paths replace `l1_config_url`; the selected network has no `l1_endpoints` list. It configures no operator fee ceiling and writes no password file. A selected network carrying `guardian_authorization` or `guardian_root` is rejected. Fresh preflight requires the same member commitments (section 3). Guardian listeners use nonzero ports. Their advertised origins are unique after URL normalization, and wildcard advertisements are rejected. The launcher never creates or opens the database files, and it never creates the guardian keystores (`dev/locSetupV4.ts:358-375,5861-5878,6450-6678`; `psy_cli/guardian_common/src/runtime.rs:126-229`).
+The launcher does not generate bridge identity or a `[relayer_wallet]` section. L1 sender `keystore_path` and `password_env` remain inside the
+forwarded file. Core-only and relayer-only selections skip the DApp dependency setup: `selectedUiDependencies`
+is false unless full mode or a UI option (`--psy-privacy-bridge`, `--ide`, `--explorer`,
+`--mode-a-web-wallet-bridge`) is selected, so nested psy-dapp submodule init, SDK artifacts, and UI dependency
+installs do not run (`dev/locSetupV4.ts:3266-3268,7731`). Selections that do run the setup force a UI
+dependency refresh when the SDK artifacts are rebuilt (`dev/locSetupV4.ts:3315-3318`).
+
+## 13. Ports and P2P Formulas
+
+For Realm ID `R`, one-based validator position `S`, zero-based edge index `E`, configured Realm edge count `C`,
+P2P Realm stride `P = max(20, 2C)`, and HTTP Realm stride `H = max(10, 2C)`:
+
+```text
+Coordinator edge HTTP/RPC = 1337 + edgeIndex
+Realm edge HTTP/RPC       = 13380 + RH + (S - 1)C + E
+Realm processor P2P TCP   = 41000 + 20R + S
+Realm edge P2P TCP        = 41100 + RP + (S - 1)C + E + 1
+Coordinator P2P bootnode  = N/A
+Prove proxy               = 9999 + proxyIndex
+```
+
+Local-devnet `validator_user_id` values are **not** `R * 2^20 + S`. The launcher binds each `(realm_id, sub_id)` to
+dedicated Strategy5 registrations (`0`, `1`, `3`, `4` for realms `0..1`), keeping registration `2` as the bridge
+relayer (`user_id` `524288`). See [realm-p2p-validators.md](realm-p2p-validators.md) and `dev/locSetupV4.ts`
+(`reservedValidatorRegistrationId` / `reservedValidatorUserId`).
+
+Every requested processor P2P, edge P2P, and Realm HTTP port is enumerated before startup. A topology is rejected
+before secret/config/Genesis mutation or process startup if any port exceeds 65535 or if any two requested endpoints,
+including endpoints from different port families, resolve to the same number. Multiple edges for one validator use
+their edge index and therefore receive unique P2P and HTTP ports.
+
+| Surface           | Port                          | Evidence                                                |
+| ----------------- | ----------------------------: | ------------------------------------------------------- |
+| Redis/Valkey      | 6379                          | `dev/start_db.sh:91-105`                                |
+| NATS              | 4222                          | `dev/start_db.sh:109-120`                               |
+| Scylla            | 9042                          | `dev/start_db.sh:173-181`                               |
+| Nostr             | 8081                          | `dev/start_db.sh:184-225`                               |
+| Anvil             | 8545 in valid current CLI use | `dev/locSetupV4.ts:5516,4408-4416` |
+| Envio Postgres    | 5433                          | `dev/locSetupV4.ts:3338-3347`                           |
+| Hasura            | 8080                          | `dev/locSetupV4.ts:3349-3356`                           |
+| Envio indexer API | 9898                          | `dev/locSetupV4.ts:4478-4492`                           |
+| psy-services      | 3000                          | `dev/locSetupV4.ts:4550-4575`                           |
+| Faucet            | 9998                          | `dev/locSetupV4.ts:6537-6539,7467`                  |
+| Privacy Bridge    | 5177                          | `dev/locSetupV4.ts:4717-4739`                           |
+| IDE               | 5176                          | `dev/locSetupV4.ts:4742-4761`                           |
+| Explorer          | 5178                          | `dev/locSetupV4.ts:4764-4788`                           |
+| Mode A UI         | 5179                          | `dev/locSetupV4.ts:4790-4839`                           |
+
+## 14. CPU Partition and Rayon Derivation
+
+The proving-process count is Coordinator workers plus Realm workers plus dummy provers plus prove proxies; a full
+foreground launch counts one proxy when no explicit proxy count is positive (`dev/locSetupV4.ts:3966-3975`). The
+launcher then performs this deterministic derivation (`dev/locSetupV4.ts:131-221`):
+
+```text
+1. Validate PSY_WORKER_BATCH_SIZE; use 2 when absent.
+2. Determine available physical cores.
+3. On macOS, prefer sysctl hw.physicalcpu.
+4. On Linux, parse lscpu topology and intersect launcher affinity.
+5. When managing Scylla, partition complete sibling groups between Scylla and runtime.
+6. Derive Rayon = max(1, min(4, floor(runtime physical cores / max(1, proving processes)))).
+7. Derive Scylla SMP from reserved logical cores, else clamp availableParallelism to 1..2.
+8. Export normalized resource values to managed children.
+```
+
+The exact Rayon formula is `resolveRayonThreadCount()` (`dev/locSetupPolicy.ts:218-220`). With no overrides, Scylla
+receives four physical cores when at least sixteen are available, two when eight to fifteen are available, and one when two to seven are available; runtime receives the complement
+(`dev/locSetupPolicy.ts:128-180`). Overrides must select available complete sibling groups, be disjoint, cover all
+available CPUs, and leave both partitions nonempty (`dev/locSetupPolicy.ts:139-180`). Every foreground child is
+wrapped with `taskset --cpu-list` when a runtime set exists; the DB script separately applies the runtime set to
+Redis/Valkey, NATS, and Nostr and the Scylla set to Scylla (`dev/locSetupV4.ts:656-660`;
+`dev/start_db.sh:77-80,154-180,219-223`).
+
+## 15. Anvil State Flags and Fresh Persistence
+
+Fresh start, application restart, and the supported stop/resume order are sections 3, 5, and 6; this section keeps only launcher flags and resource behavior.
+
+`make run-all` points Anvil `--state` at the absent output path and passes `--state-interval` from `ANVIL_STATE_INTERVAL`. Unset or empty selects 900 seconds; any supplied value must be a positive integer. The fresh launch does not pass `--timestamp` and does not read an old snapshot. `localAnvilLaunchArgs` appends `--timestamp` only when a caller supplies a preserved genesis. A file still present at the state path fails startup. An occupied configured port also fails startup; the launcher does not kill a listener it did not prove to be this checkout's Anvil (`dev/locSetupV4.ts:3541-3557,6307`).
+
+Local deployment summaries are deleted with the snapshots, so localhost, localhostBsc, and localhostBase deploy with `--reset`. `REDEPLOY_L1=false` still governs non-local networks only. Envio storage for the bound namespace is reset with the new chain.
+
+Do not pass `--steps-tracing`. It records full execution traces into the state dump until the periodic write starves the RPC loop.
+
+## 16. Control Socket and Application Lifecycle
+
+The foreground launcher derives a repository-keyed Unix socket beside its lock under `TMPDIR` or `/tmp`; the server
+sets permissions to `0600` (`dev/locSetupV4.ts:5238-5241,5328-5330,5416-5424`). Clients send one newline-terminated command and receive one JSON response; the client
+timeout is 900,000 milliseconds (`dev/locSetupV4.ts:5337-5369`). Server commands are serialized through one promise
+queue, so lifecycle mutations do not overlap (`dev/locSetupV4.ts:5395-5413`).
+
+| Command           | Supported Make target  | Effect                                                               | Evidence                                                                       |
+| ----------------- | ---------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `restart`         | `make restart`         | Stop then start applications; keep DB and all three Anvils alive. | `Makefile:101-102`; `dev/locSetupV4.ts:5740-5746,7715-7717` |
+| `rollback-stop`   | `make rollback-stop`   | Stop applications, verify ports closed, write rollback sentinel.     | `Makefile:104-105`; `dev/locSetupV4.ts:7719-7721`              |
+| `rollback-resume` | `make rollback-resume` | Start saved application templates against the infrastructure still running. It is not a fresh `make run-all`. | `Makefile:107-108`; `dev/locSetupV4.ts:7723-7724`              |
+
+Application stop sends process groups `SIGTERM`, waits for exit without SIGKILL escalation, and verifies derived
+application ports are closed. Resume order is Coordinator processor, Coordinator edges, Realm processors, Realm
+edges, workers/dummy provers, proxies, tracked Envio indexer, psy-services, psy-indexers, faucet, relayer, then UIs and
+other applications (`dev/locSetupV4.ts:3514-3534`). Controlled resume adds explicit post-start gates for proxy TCP,
+Envio 9898, and psy-services health (`dev/locSetupV4.ts:3835-3847`). A failed resume stops the newly started subset and
+returns lifecycle state to `stopped` (`dev/locSetupV4.ts:3905-3913`).
+
+## 17. Auto-Restart
+
+All tracked foreground children are wired for restart unless `PSY_NO_AUTO_RESTART=1`; intentional application stop
+and full teardown suppress restart (`dev/locSetupV4.ts:3643-3645,3693-3714,3737-3766`). The delay sequence is 1, 2, 4, 8, 16, then 30 seconds for subsequent exits
+(`dev/locSetupV4.ts:3751-3755`). Restarts reuse the saved command, working directory, environment, logs, readiness
+detector, and retry settings, and append restart banners rather than truncating logs
+(`dev/locSetupV4.ts:3768-3793,3814-3833`). Failed reconstruction retries after twice the prior
+delay, capped at 60 seconds (`dev/locSetupV4.ts:3797-3810`).
+
+Recognized fatal processor output terminates the processor for supervised recreation
+(`dev/locSetupV4.ts:3717-3734`). When the DB group recovers, running Coordinator and Realm processors are terminated
+for supervised restart so they rebuild infrastructure connections (`dev/locSetupV4.ts:3647-3669,3794-3796`).
+
+## 18. Shutdown, Teardown, and Purge
+
+`make shutdown` invokes `--teardown --purge` by default. `PURGE=0 make shutdown` is the non-purge path and
+does not enter broad process or port killing. That path discovers zero to three repo Anvil processes, requires
+the listener owner to match, sends SIGTERM to that exact process, and stops the resolved database namespace
+without escalating to SIGKILL. Its database stop is `docker stop -t -1` (`dev/locSetupV4.ts` `stopNamedDocker`),
+which waits indefinitely for the containers' own graceful exit and never escalates. That supervisor-side
+Docker stop subprocess has no deadline; the control client normally times out at 900 seconds
+(`dev/locSetupV4.ts:7355-7362`).
+It does not change mining, watch native state files, call `anvil_dumpState`, or
+promote a staged snapshot. Anvil's own `--state` exit dump is the only retained L1 evidence. Purge remains the
+destructive path (`Makefile`; `dev/locSetupV4.ts` `gracefulDevnetStop` and `teardownDevnet`).
+
+```text
+1. Purge only: kill known command patterns, excluding Anvil argv.
+2. Purge only: stop Anvil processes whose identity matches this checkout, then remove the resolved namespace's containers and volumes.
+3. Non-purge: exact SIGTERM only, no SIGKILL, no fuser, and no global port kill. Failure leaves Anvil and database state in place.
+4. Purge commands and discovery listings are bounded. Non-purge Docker stop is `docker stop -t -1` and waits indefinitely; it never escalates.
+5. Path deletion requires successful Anvil, Docker, and known-application gates.
+```
+
+`PSY_DEVNET_NAMESPACE` is bound to `local_checkpoints/devnet-namespace` only after initial resource absence
+checks succeed. Later launches inherit the binding when the environment is unset; explicit conflicts fail.
+An unbound checkout with no namespace retains legacy identities. An explicit unbound namespace cannot be
+used for shutdown. Foreground and daemon startup share admission and a host-resource lock because ports
+are fixed. Failed admission never authorizes resource cleanup. Setup failures stop tracked applications
+only and retain infrastructure for explicit recovery; they do not discover and stop unrelated resources.
+Non-purge shutdown includes both Envio Postgres and GraphQL. Orphan producers are a hard failure before
+Anvil is signaled, including sibling services attributable through checkout paths or the local services listener.
+The waiting shutdown CLI is excluded only when its runtime executable and user match the supervisor,
+its cwd is the checkout root, and its complete command is `bun [run] dev/locSetupV4.ts --teardown`
+(the equivalent absolute script path is accepted). Extra selectors, purge flags, and other Bun scripts
+remain producer candidates; this exception does not disable the orphan-producer guard.
+
+Control commands, including `shutdown` and `shutdown-purge`, use the generic 900-second client timeout.
+
+The application gate checks known command patterns plus loopback TCP ports 1337-1346, 3000, 5433, 8080, 8081, 9898, 9998, and 5174-5179. It is not an exhaustive socket census: Realm ports 13380-14679, proxy ports 9999-10008, guardian ports 15441-15443, and history port 15450 are not individually probed by purge. Their normal launcher processes are covered only where they match the known command patterns. Custom listeners or renamed writers are outside this postcondition; success does not certify that every application port is closed.
+
+Non-purge teardown still keeps `local_checkpoints`, Anvil `--state` files, deployment summaries, logs, Envio volumes, and named infrastructure volumes. It does not fall through into purge after a stop failure. Purge deletes `local_checkpoints`, the complete `db/anvil` directory, logs, localhost, localhostBsc, localhostBase, Sepolia, and Ethereum deployment directories, generated Envio volumes, and named Redis/Scylla/NATS volumes.
+
+## 19. Daemonized Path Differences
+
+The flag spelling is exactly `--daemonlize`. It generates root `docker-compose.yml`, runs
+`docker compose up -d --remove-orphans`, releases the launcher lock, and exits without a control socket
+(`dev/locSetupV4.ts:5465,5203-5215,5755-5758`).
+
+The daemonized service map contains Redis/Valkey, NATS, Scylla, Coordinator/Realm processors and edges, workers,
+explicit prove proxies, and faucet (`dev/locSetupV4.ts:4923-5160`). It omits Nostr, Anvil/deployment, Envio,
+psy-services, psy-indexers, relayer, dummy provers, and UIs (`dev/locSetupV4.ts:4843-5215`). It creates no
+`RunningProcess` objects, per-process launcher readiness detectors, launcher log supervision, control socket, or
+launcher auto-restart; generated services also have no Compose `restart` field
+(`dev/locSetupV4.ts:4987-5000,5162-5215`).
+
+Daemonized containers receive only `RUST_LOG`, forced `RUST_BACKTRACE=1`, `RAYON_NUM_THREADS`,
+`PSY_WORKER_BATCH_SIZE`, and nonempty faucet keys; arbitrary `--env` entries are not generally forwarded
+(`dev/locSetupV4.ts:4910-4921`). CPU sets become Compose `cpuset` fields, and every daemonized Realm worker connects to
+every generated Realm edge instead of using the foreground count-sensitive distribution
+(`dev/locSetupV4.ts:4923-4959,5108-5133`).
+
+## 20. Direct Launcher Command Recipes
+
+Operating procedures for fresh start, application restart, rollback stop, rollback resume, and shutdown are sections 3 and 5-9 (`Makefile:93,96-108,131-132`). Do not substitute these recipes for them. The remaining recipes in this section are direct launcher invocations, not the supported lifecycle.
+
+### Bare foreground full mode
+
+```bash
+bun run dev/locSetupV4.ts
+```
+
+This uses the bare defaults in section 10.1 and differs from `make run-all` (`dev/locSetupV4.ts:5443-5486`;
+`Makefile:93,96-99`).
+
+### Self-contained two-Realm core without Layer 1, bridge, or UIs
+
+```bash
+bun run dev/locSetupV4.ts \
+  --db \
+  --coordinator \
+  --realms-count 2 \
+  --coordinator-workers 2 \
+  --realm-workers 1
+```
+
+`--db` and `--coordinator` make this component mode, so worker counts are explicit
+(`dev/locSetupV4.ts:5477-5484,4030-4342`).
+
+### Realm P2P core
+
+```bash
+bun run dev/locSetupV4.ts \
+  --db \
+  --coordinator \
+  --start-realm-id 0 \
+  --realms-count 2 \
+  --realm-edge-nodes 2 \
+  --coordinator-workers 1 \
+  --realm-workers 2
+```
+
+This selects validator positions 1 and 2, creates four Realm processors and eight distinct Realm edges, and injects
+their public standard-P2P identities and routable addresses into the selected genesis/runtime configuration. Every
+edge has a unique secret filename, P2P listen port, and HTTP port; the launcher rejects any requested cross-family or
+same-family port collision before mutation or startup.
+
+### Proxy-only component
+
+```bash
+bun run dev/locSetupV4.ts --prove-proxy 2
+```
+
+This starts proxy listeners 9999 and 10000 without selecting DB, core, Layer 1, or services
+(`dev/locSetupV4.ts:5477,4362-4396`).
+
+### Dummy provers against an existing core
+
+```bash
+bun run dev/locSetupV4.ts \
+  --dummy-provers 4 \
+  --start-realm-id 1 \
+  --realms-count 2
+```
+
+This starts four dummy-prover processes targeting Realms 1 and 2 and does not select their dependencies
+(`dev/locSetupV4.ts:4343-4360,5477`).
+
+### Direct non-purge and purge teardown
+
+```bash
+bun run dev/locSetupV4.ts --teardown
+bun run dev/locSetupV4.ts --teardown --purge
+```
+
+Only the second command deletes persisted state in this teardown pair; a full `--all` startup is the separate fresh reset that also destroys prior state (`dev/locSetupV4.ts:5722-5725,3450-3468`).
+
+## 21. Current-Source Limitations
+
+These are limitations of the current source, not supported command examples.
+
+1. `--l1-port` is read and documented but not declared in `parseArgs`; strict parsing therefore makes the intended
+   custom port unreachable through a valid current command (`dev/locSetupV4.ts:5439-5471,5516,5565-5566`).
+2. Embedded help advertises `--workers` and examples use `--realm`, but neither option is declared; do not use those
+   examples (`dev/locSetupV4.ts:5439-5471,5561,5602-5603`).
+3. Help says bare startup uses Realms 0-127, while the parser default is one Realm; section 10.1 is definitive
+   (`dev/locSetupV4.ts:5448,5486,5581-5582`).
+4. Core-only and relayer-only selection skip both SDK sidecar preparation and UI dependency setup. Full-system startup or an explicitly selected privacy bridge, IDE, explorer, or Mode A wallet UI retains those prerequisites (`selectedUiDependencies`).
+5. Numeric CLI strings use `parseInt`, which accepts malformed suffixes. Core mode rejects invalid parsed Realm topology, including nonpositive Realm/edge counts and port collisions; other counts still lack equivalent range validation and can suppress loops (`dev/locSetupV4.ts:1107-1121,5482-5495`).
+6. `--host` is not a complete topology relocation: Layer 1 uses `L1_RPC_HOST`, while bridge services contain literal
+   loopback endpoints (`dev/locSetupV4.ts:490-493,4482,4550-4566`).
+7. Daemonized selectors for Layer 1, relayer, dummy provers, and UIs can suppress daemon full mode without generating
+   the requested service because those implementations are absent (`dev/locSetupV4.ts:4852-4860,4923-5160`).
+8. Daemonized Realm P2P uses a separate public-only runtime config: processor and edge public multiaddresses name the
+   corresponding Compose DNS services, while each container listens on `/ip4/0.0.0.0/tcp/...`.
+9. Non-purge teardown uses fixed process patterns and port ranges rather than the actual launch plan. Anvil ports are not in `killKnownPorts`; purge matches only this checkout's Anvil processes. Mode A port 5179 is included in `killKnownPorts` and matched by `psy-dapp/mode-a-web-wallet-bridge` plus `vite.js --host 0.0.0.0 --port 5179`.
+10. Startup purge with `--purge` performs the full paired teardown (processes, containers, checkpoints, Anvil state,
+    deployments, volumes) before auto-setup; it is equivalent to `PURGE=1 make shutdown` followed by `make run-all`
+    (`dev/locSetupV4.ts:5693-5698,3472-3492`).
+
+## 22. Launcher Data Structures, Functions, and Loops
+
+### `ProcessOptions`
+
+```ts
+interface ProcessOptions {
+    cwd?: string;
+    jtmb?: boolean;
+    l1Port?: number;
+    workerRealmCount: number;
+    realmEdgeCount: number;
+    coordinatorEdgeCount: number;
+    coordinatorWorkersCount: number;
+    disableWorkerEdgeLogs?: boolean;
+    startRealmId?: number;
+    realmsCount?: number;
+    coordinator?: boolean;
+    db?: boolean;
+    dummyProvers?: number;
+    genesisDataPath?: string;
+    proveProxyCount?: number;
+    faucetServer?: boolean;
+    l1?: boolean;
+    relayer?: boolean;
+    relayerConfig?: string;
+    bridgeProposerDaemon?: boolean;
+    bridgeUi?: boolean;
+    privacyUi?: boolean;
+    psyPrivacyBridge?: boolean;
+    ide?: boolean;
+    explorer?: boolean;
+    modeAWebWalletBridge?: boolean;
+    daemonlize?: boolean;
+}
+```
+
+`runMain()` creates this object after CLI/network/environment processing, and `DevNetProcessManager` reads it to
+construct either foreground processes or Compose services (`dev/locSetupV4.ts:3470-3498,5727-5760`). Required count fields always receive parsed/default values; optional booleans are false
+when omitted (`dev/locSetupV4.ts:5477-5506`). Example: `make run-all` materializes counts `workerRealmCount=1`,
+`realmEdgeCount=1`, `coordinatorEdgeCount=1`, `coordinatorWorkersCount=2`, `realmsCount=2`, plus its explicit component
+booleans (`Makefile:60`; `dev/locSetupV4.ts:5727-5753`).
+
+### `RuntimeResourceSettings`
+
+```ts
+type RuntimeResourceSettings = {
+    workerBatchSize: string;
+    runtimeCpuSet?: string;
+    scyllaCpuSet?: string;
+    scyllaSmp: string;
+    env: { [key: string]: string };
+};
+```
+
+`resolveRuntimeResourceSettings()` owns creation; foreground and daemonized setup read it, while callers do not mutate
+it (`dev/locSetupV4.ts:123-135,216-221,3970-3975,4882-4921`). Worker batch size, Rayon override, and Scylla shard count are validated as positive integers before construction, and CPU sets are
+present only when partitioning succeeds (`dev/locSetupV4.ts:136-214`). A four-core runtime with two proving processes
+and no override yields `RAYON_NUM_THREADS=2` by the documented formula (`dev/locSetupPolicy.ts:218-220`).
+
+### `LocalAnvilStatePlan`
+
+```ts
+export interface LocalAnvilStatePlan {
+    statePath: string;
+    hasState: boolean;
+    shouldResetEnvio: boolean;
+}
+```
+
+`resolveLocalAnvilStatePlan()` creates this immutable decision record for a fresh local chain;
+foreground Layer 1 and Envio startup consume it (`dev/locSetupV4.ts:3667-3689,4404-4475`). Local startup never loads a snapshot: an existing state file fails the start, and the returned value is always
+`{ statePath: "db/anvil/state.json", hasState: false, shouldResetEnvio: true }` relative to the repository
+(`dev/locSetupV4.ts:3667-3689`).
+
+### `DevnetControlResponse`
+
+```ts
+interface DevnetControlResponse {
+    ok: boolean;
+    message: string;
+}
+```
+
+The control server serializes one instance as one JSON line; the client accepts `message` only when `ok` is true
+(`dev/locSetupV4.ts:5319-5322,5348-5358,5404-5413`). Example success messages are returned by the command handler after restart, stop, or
+resume (`dev/locSetupV4.ts:5761-5772`).
+
+### `runMain()`
+
+**Signature:** `async function runMain()` (inferred return type `Promise<void>`) (`dev/locSetupV4.ts:5435`).
+
+**Internal flow:**
+
+```text
+parseArgs(Bun.argv)
+  -> derive selector mode, counts, flags, network, RPC, and child environment
+  -> control client OR help OR startup/teardown
+  -> acquireDevnetLock()
+  -> ensureDevEnvironment()
+  -> teardownDevnet() OR construct ProcessOptions
+  -> setupDaemonized() OR setupProcesses()
+  -> startDevnetControlServer()
+  -> steady-state interval
+```
+
+The exact dispatch and cleanup are at `dev/locSetupV4.ts:5437-5794`. CLI/network/environment/lock errors before the
+main `try` do not enter the `Setup failed` cleanup branch, while errors inside auto-setup, teardown, manager setup, or
+control-server creation invoke non-purge manager teardown and exit 1 (`dev/locSetupV4.ts:5511-5690,5783-5792`).
+
+### `DevNetProcessManager.setupProcesses()`
+
+**Signature:** `async setupProcesses(options: ProcessOptions): Promise<void>`
+(`dev/locSetupV4.ts:3933`).
+
+**Preconditions:** required tools/artifacts have passed auto-setup, selected external RPC values exist, and the caller
+holds the repository startup lock (`dev/locSetupV4.ts:5639-5706`).
+
+**Postcondition:** every selected foreground phase has reached its source-defined readiness point; tracked children
+are supervisor-wired (`dev/locSetupV4.ts:3693-3734,3950-4839`).
+
+**Internal flow:** derive selection/resources, prepare logs/binaries, start DB, inject P2P validators, await prove-proxy
+TCP readiness, start core, workers, Layer 1/deployment, bridge stack, faucet/relayer, then UIs
+(`dev/locSetupV4.ts`).
+
+### `resolveRuntimeResourceSettings()`
+
+**Signature:**
+
+```ts
+async function resolveRuntimeResourceSettings(
+    env: { [key: string]: string },
+    provingProcessCount: number,
+    shouldPartitionCpus: boolean,
+): Promise<RuntimeResourceSettings>
+```
+
+The function validates worker size, inspects platform topology, resolves optional CPU partitioning, derives Rayon and
+Scylla concurrency, and returns normalized child environment (`dev/locSetupV4.ts:131-221`). It calls
+`parseLscpuTopology()`, `resolveCpuPartitionForAffinity()`, `resolveRayonThreadCount()`, and
+`resolvePositiveIntegerSetting()` (`dev/locSetupV4.ts:161-206`).
+
+### `resolveLocalAnvilStatePlan()`
+
+**Signature:** `export async function resolveLocalAnvilStatePlan(repoCwd: string, network: L1DeploymentNetwork = "localhost"): Promise<LocalAnvilStatePlan>`
+(`dev/locSetupV4.ts:3668`). It requires the configured local Anvil port to be free and the state path to be absent, throwing on either violation; it never reuses state and always resets
+Envio storage (`dev/locSetupV4.ts:3667-3689`).
+
+### `stopApplications()`, `startApplications()`, and `restartApplications()`
+
+**Signatures:**
+
+```ts
+async stopApplications(cwd: string = ".", writeRollbackSentinel: boolean = false): Promise<void>
+async startApplications(cwd: string = "."): Promise<void>
+async restartApplications(cwd: string = "."): Promise<void>
+```
+
+Stop separates persistent processes, terminates applications, waits for exits/closed ports, and optionally writes the
+sentinel (`dev/locSetupV4.ts:3851-3886`). Start replays sorted templates, applies selected readiness gates, removes the
+sentinel only after success, and rolls back a partial start on failure (`dev/locSetupV4.ts:3888-3913`). Restart is
+exactly stop without sentinel followed by start (`dev/locSetupV4.ts:3916-3919`).
+
+### Foreground Realm startup loop
+
+**Entry:** after DB and Coordinator readiness (`dev/locSetupV4.ts:4030-4150`).
+
+```text
+for each Realm batch of at most four:
+  1. Build the batch's Realm IDs.
+  2. For each active sub-ID, start processors sequentially by Realm ID.
+  3. Require every processor's exact readiness marker.
+  4. Start all batch Realm edges in parallel.
+  5. Require every edge initialization detector.
+  6. Sleep two seconds.
+repeat until every Realm is ready.
+```
+
+This loop terminates on completion or the first unhandled process-start failure
+(`dev/locSetupV4.ts:4150-4248`). Coordinator workers wait on the entire loop's promise
+(`dev/locSetupV4.ts:4150-4162,4248`).
+
+### Supervisor restart loop
+
+**Trigger:** unexpected tracked-child exit (`dev/locSetupV4.ts:3704-3714`).
+
+```text
+1. Stop if manager teardown or intentional stop is active.
+2. Stop if PSY_NO_AUTO_RESTART=1.
+3. Increment restart count and derive capped exponential delay.
+4. Wait; recheck stop state.
+5. Recreate the child from its saved template and readiness detector.
+6. Replace the old tracked entry and append log banners.
+7. If DB recovered, request processor reconnection restarts.
+8. On reconstruction failure, wait up to 60 seconds and retry.
+```
+
+The implementation is `dev/locSetupV4.ts:3737-3811`. State retained between iterations includes command, spawn
+options, readiness detector, retry policy, name, and restart count (`dev/locSetupV4.ts:3768-3793,3814-3833`).
+
+### Control command queue
+
+**Entry:** one newline-terminated socket command (`dev/locSetupV4.ts:5396-5404`).
+
+```text
+1. Append handler work to commandQueue.
+2. Parse one of restart, rollback-stop, rollback-resume.
+3. Await the complete lifecycle mutation.
+4. Return one JSON line with ok=true and message.
+5. Convert handler failure to ok=false without stopping the supervisor.
+```
+
+Commands execute serially and the loop remains available until the server is closed during shutdown
+(`dev/locSetupV4.ts:5395-5430,5667-5688`).
+
+## 23. Rationale
+
+- **Make for lifecycle, direct CLI for mechanics:** Make fixes the repository-supported full-stack counts and control
+  entry points, while direct CLI exposes lower-level component selection (`Makefile:60-79`; section 10).
+- **Paired Anvil state and deployment:** restoring chain storage without matching addresses, or addresses without the
+  chain, would describe different Layer 1 histories; the launcher therefore fails closed on mismatch
+  (`dev/locSetupV4.ts:2999-3007`).
+- **Persistent/application split:** restart and offline rollback need application processes to stop without recreating
+  Anvil or the DB group (`dev/locSetupV4.ts:3505-3512,3851-3919`).
+- **Exact readiness before dependents:** processors require exact completion markers, bridge services require network
+  health, and proof consumers wait for proxy TCP to avoid treating process creation as service readiness
+  (`dev/locSetupPolicy.ts:319-333`; `dev/locSetupV4.ts:4362-4402,4456-4575`).
+- **Complete-core CPU partitioning:** assigning sibling threads from one physical core to competing Scylla/runtime
+  partitions would violate the partition model, so overrides require complete sibling groups
+  (`dev/locSetupPolicy.ts:143-180`).
+
+## 24. Security Considerations
+
+1. Never put `WALLET_PASSWORD`, `GUARDIAN_<id>_KEYSTORE_PASSWORD`, or another secret in `--env`; CLI arguments are visible in shell history and process
+   inspection, while the launcher already supports parent-environment transport
+   (`dev/locSetupV4.ts:5468-5470,5521,3921-3924`).
+2. Treat external RPC URLs as credential-bearing. `make run-all` expands them into a recipe command, and fork mode
+   passes the selected URL to Anvil as `--fork-url` (`Makefile:63-66`; `dev/locSetupV4.ts:4417-4424`).
+3. Treat `PSY_FAUCET_TURNSTILE_SECRET` and operator configuration as sensitive. Daemon mode writes nonempty faucet
+   values into generated Compose environment data (`dev/locSetupPolicy.ts:4-12`;
+   `dev/locSetupV4.ts:4910-4921,5203-5207`).
+4. Foreground environment inheritance is broad: after resolution, `WALLET_PASSWORD` and other parent values are
+   available to managed children, not only the process that semantically consumes them
+   (`dev/locSetupV4.ts:275-315,3921-3924`).
+5. `PSY_SKIP_KEYSTORE=1` replaces remote manifest/hash refresh with local existence checks, and `PSY_SKIP_BUILD=1`
+   trusts current artifacts instead of rebuilding them; use both only under the artifact gate in section 2
+   (`dev/locSetupV4.ts:2487-2521,1933-1968`).
+6. The control socket is local and permissioned `0600`, but any process running as the same account can attempt its
+   three lifecycle commands (`dev/locSetupV4.ts:5317-5335,5416-5424`).
+7. Purge is intentionally destructive across both Layer 1 and Layer 2 state, and it is the `make shutdown` default.
+   Review the deletion set before running either command. Use `PURGE=0 make shutdown` to preserve state;
+   `make run-all` is itself the fresh-chain sequence and does not depend on that purge (`Makefile`).
+8. With Coordinator/Realm core selected, `--genesis-data-path` is input and output: startup rewrites validators. Use a
+   disposable copy when preserving an existing validator list matters. Component-only modes without core processors do
+   not rewrite it (`dev/locSetupV4.ts:1225-1234,4072-4079`).
+
 ## Related Documents
 
 - [Circuit and verifier operations](circuit-and-verifier-operations.md)
-- [Devnet launcher reference](devnet-launcher-reference.md)
 - [Common account and contract operations](common-operations.md)
 - [Bridge common operations](bridge-common-operations.md)
 - [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)

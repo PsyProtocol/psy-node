@@ -121,7 +121,6 @@ Keep Ed25519, BLS, and validator ZK keys private. Public routing configuration i
 ## Related Documents
 
 - [Circuit and verifier operations](circuit-and-verifier-operations.md)
-- [Devnet launcher reference](devnet-launcher-reference.md)
 - [Devnet lifecycle](devnet_lifecycle.md)
 - [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
 - [Gatherers](gatherers.md)

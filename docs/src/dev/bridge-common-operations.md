@@ -1,18 +1,19 @@
 # Bridge Common Operations
 
-This repository-only developer runbook covers local-devnet deposit, claim, withdrawal, and relayer settlement alongside [common operations](common-operations.md).
+This repository-only developer document covers bridge architecture and the local-devnet procedure for one L1 deposit, one L2 claim-deposit, one L2 withdrawal, and relayer settlement, alongside [common operations](common-operations.md).
 
-> Repository-only bridge runbook. Generic wallet, registration, and PSY funding procedures are owned by [`docs/src/dev/common-operations.md`](common-operations.md).
+> Repository-only bridge document. Generic wallet, registration, and PSY funding procedures are owned by [`docs/src/dev/common-operations.md`](common-operations.md).
 
 ## Abstract
 
-This guide is the executable local-devnet procedure for one L1 deposit, one L2 claim-deposit, one L2 withdrawal, and relayer settlement. Run every command from `<repo-root>`. Replace only angle-bracket values. Never place a real private key or wallet password in this document, a result file, or a shell history shared with other users.
+The bridge connects an EVM L1 to the Psy L2. A deposit locks ERC-20 tokens on L1; the relayer proves that deposit, and the receiver claims it on L2. A withdrawal burns L2 tokens; the relayer registers a pending L1 claim, and the recipient settles it after `claimableAt`. The executable procedure below is one local-devnet pass through that lifecycle. Run every command from `<repo-root>`. Replace only angle-bracket values. Never place a real private key or wallet password in this document, a result file, or a shell history shared with other users.
 
-Related: [`docs/src/dev/devnet_lifecycle.md`](devnet_lifecycle.md) for startup and shutdown; [`docs/src/dev/deposit-withdrawal.md`](deposit-withdrawal.md) for bridge architecture.
+Related: [`docs/src/dev/devnet_lifecycle.md`](devnet_lifecycle.md) for startup and shutdown.
 
 ## Table of Contents
 
 - [Terminology](#terminology)
+- [Architecture](#architecture)
 - [1. State Flow](#1-state-flow)
 - [2. Start and Prove Readiness](#2-start-and-prove-readiness)
 - [3. Discover This Startup's Addresses](#3-discover-this-startups-addresses)
@@ -30,7 +31,7 @@ Related: [`docs/src/dev/devnet_lifecycle.md`](devnet_lifecycle.md) for startup a
 - [13. Exact Failure Responses](#13-exact-failure-responses)
 - [14. Serial Ordering Rule](#14-serial-ordering-rule)
 - [15. Cleanup](#15-cleanup)
-- [16. Source and Walkthrough References](#16-source-and-walkthrough-references)
+- [16. Source References](#16-source-references)
 
 ## Terminology
 
@@ -39,6 +40,95 @@ Related: [`docs/src/dev/devnet_lifecycle.md`](devnet_lifecycle.md) for startup a
 - **EndCap**: a proven L2 user-state transition submitted to a realm.
 - **PSY**: the L2 fee token.
 - **RPC**: JSON remote procedure call.
+
+## Architecture
+
+### Roles
+
+| Role | Component | Responsibility |
+|------|-----------|----------------|
+| Depositor | L1 wallet / CLI | Calls `Router.deposit()` and generates the deposit inclusion proof |
+| Bridge relayer | `psy_relayer_cli` daemon | Proves deposits on L2, calls L1 `Bridge.batchAppend()`, finalizes, and registers withdrawals on L1 |
+| Prove proxy | `psy_user_cli prove-proxy` | Generates Groth16 proofs for withdrawal claims |
+| Psy services | `psy-services` | Indexes deposits and withdrawals and serves claim-proof and claimed-identity queries |
+| L2 user | CLI / wallet | Claims deposits on L2 and initiates withdrawals |
+
+### L1 contracts
+
+| Contract | Purpose |
+|----------|---------|
+| `Router` | Deposit entry point; delegates to the token gateway |
+| `ERC20Gateway` | Transfers ERC-20 deposits and calls `Bridge.recordDepositFromGateway()` |
+| `Bridge` | Records deposit leaves, proves them with `batchAppend()`, registers withdrawals with `batchClaimWithdrawal()`, and settles them with `claimPendingWithdrawal()` |
+
+### L2 components
+
+| Component | Purpose |
+|-----------|---------|
+| `deposit_tree` | Stores L1 deposit roots per chain index |
+| `withdrawal_tree` | Stores L2 withdrawal leaves |
+| Token contracts | User balances and deposit-claim nullifier tracking. Localhost examples are PSY contract 0 and USDT contract 4 |
+
+L2 `claim_deposit` binds the UPS session proof tree to `shield_claim_fingerprint`, the minifier fingerprint of `DepositInclusionCircuit` (protocol alias `ShieldDepositClaimCircuit`). Updating that constant follows [`token-privacy-circuit-fingerprints.md`](token-privacy-circuit-fingerprints.md).
+
+### Deposit material and nullifier verification
+
+The receiver already owns a shield address. The depositor supplies claim material for this specific deposit:
+
+- `shield_address`: the receiver's existing shield receive address.
+- `nullifier_secret`: four fresh `u64` values, generated per deposit.
+- `note_secret`: four fresh `u64` values, generated per deposit.
+- `note_commitment = PoseidonHash(nullifier_secret || note_secret)`.
+
+Receiver-side `r0` and `r1` are not inputs to the sender-side `DepositInclusionCircuit`. `claim_deposit` checks receiver ownership later. The note commitment binds the nullifier to the note, so a different secret pair cannot claim the same leaf.
+
+The depositor generates the `DepositInclusionCircuit` inclusion proof and the receiver consumes it. The receiver does not re-prove deposit inclusion. Once the relayer has proved the deposit, the sender-side backup generator fetches the Merkle inclusion proof from psy-services:
+
+```text
+GET /api/v1/bridge/deposit-claim-proof
+    ?deposit_index=<index>
+    &source_chain_index=<chain_index>
+    &proved_deposit_count=<provedDepositCount>
+    [&snapshot_deposit_count=<snapshotCount>]
+```
+
+`proved_deposit_count` is the L1 proved count reported with the proof. `snapshot_deposit_count` (legacy alias `tree_count`) is the snapshot count the proof was built against. Either a proved count or a snapshot count is required. A found response carries the chain-local index, deposit root, leaf hash, siblings, and deposit payload. Stable not-found reasons are `no_proved_deposits`, `deposit_not_indexed`, `deposit_not_in_snapshot`, `indexer_not_ready`, `indexer_node_missing`, `deposit_leaf_mismatch`, and `multi_source_snapshot_not_supported`.
+
+Direct L2 claim verification is:
+
+```text
+nullifier_hash = PoseidonHash(nullifier_secret)
+claimKey = PoseidonHash(SHIELD_CLAIM_NAMESPACE, nullifier_hash)
+isClaimed = query the L2 IMT for claimKey in the token contract
+```
+
+Services do not infer `claimed` from a shield address, an amount, or equal deposit and claim counts. The same shield may repeat an amount, and the same deposit index on another chain must not alias. `GET /api/v1/get/bridge/deposits` sets `BridgeDepositItem.claimed` only when the indexed row's `(source_chain_index, chain_local_deposit_index, note_commitment, l2_token_contract_id)` is present in `nullifier_claims` for that shield with `claim_type = 'deposit'`. A missing identity, a missing claim, or any coordinate mismatch is not claimed. Conflicting nullifier-claim identities are rejected rather than overwritten. Wallet clients probe the IMT at the realm tip and merge claimed state monotonically: a cached or chain-observed true is never replaced by a stale service false, and an unknown IMT result does not authorize a claim.
+
+### Withdrawal claim proof and nullifier
+
+After the withdrawal is finalized, psy-services serves the claim proof. Optional query fields are `sender_user_id` and `scan_limit`:
+
+```text
+GET /api/v1/bridge/withdrawal-claim-proof
+    ?recipient=<l1_recipient_address>
+    &token_address=<l1_token_address>
+    &amount=<amount>
+    &nonce=<withdrawal_nonce>
+    &destination_chain_index=<bridge_chain_index>
+    [&sender_user_id=<user_id>]
+    [&scan_limit=<limit>]
+```
+
+`recipient`, `token_address`, `amount`, `nonce`, and `destination_chain_index` are required; omitting any returns HTTP 400. `destination_chain_index` is the Bridge chain index (0 through 255), not the EVM chain ID. L1 `claimedNullifiers` is keyed by the raw withdrawal nonce. The relayer may register that nonce before a manual caller: `NullifierAlreadyClaimed()` is an idempotent rejection, not evidence that settlement failed. Each deposit and withdrawal nullifier is unique. L2 rejects a repeated deposit claim; L1 rejects a repeated withdrawal nonce.
+
+### Round-trip invariants
+
+1. **Deposit leaf binding.** `note_commitment = PoseidonHash(nullifier_secret || note_secret)`.
+2. **Nullifier uniqueness.** Double-claims fail closed on the exact identity above, not on counts.
+3. **Proof split.** The depositor proves inclusion; the receiver proves ownership and consumes that proof.
+4. **Two-step withdrawal.** `batchClaimWithdrawal` creates the pending claim and sets `claimedNullifiers`. Only `claimPendingWithdrawal` transfers tokens, and only after `claimableAt`.
+5. **Balance identity.** After one deposit and one withdrawal, L1 token balance is `initial - deposit_amount + withdrawal_amount`, L2 token balance is `deposit_amount - withdrawal_amount`, `Bridge.claimedNullifiers(withdrawal_nonce)` is true, and the L2 IMT shows the deposit nullifier as claimed.
+6. **Chain index.** Withdrawals use the bridge chain index. An EVM chain ID is rejected as `destination chain index out of range`.
 
 ## 1. State Flow
 
@@ -114,7 +204,7 @@ The setup waits for services health and recognizes the stable relayer marker `br
   --config "$PSY_BRIDGE_DAEMON_CONFIG"
 ```
 
-The lifecycle target owns that process. The command identifies the active `psy_relayer_cli` surface; do not launch a second copy. The relayer does not support `--result-file`. Durable daemon progress is `<guardian_root>/db/relayer.redb`, not `<proof_dir>/daemon_state.toml` or `<proof_dir>/daemon_state_multichain.toml`. `proof_dir` still comes from the daemon TOML, defaults to `/tmp/psy_bridge_proofs`, and holds proof files only. Its stdout log is `logs/bridge_relayer_logs.txt`, and tracing markers are in `logs/bridge_relayer_errs.txt` (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:852-876,1112-1118`). `run_multichain` loads `RelayerDb::finalization_batch` and `RelayerDb::chain_claims` through `load_multichain_state`. `run_single_chain` reads `L1Client::last_finalized_checkpoint`, then loads that chain's `chain_claims` row through `load_chain_state`. That L1 value is the only cursor and is not stored. `chain_claims` is keyed by `u8` `chain_index` and holds `pending_claim_withdrawals`, `claim_retry`, and `retired_claim_withdrawals`. `finalization_batch` is the singleton key `()` and holds `pending_finalization_range` (`from_checkpoint`, `to_checkpoint`) and `finalized_chains`. `deposit_tree_states` stores per-chain `count`, `root`, `frontier`, and `anchor`; its `event_block` is the log cursor and is not a string prefix. `included_withdrawal_burns` is keyed by sender, token contract, and burn nonce, not by an identity. `guardian_withdrawal_nonce` stays unchanged. Both reads happen after the current authorization digest. The in-flight guardian request is the sole non-`Included` `relayer_request` row from `RelayerDb::pending_request`: `session_nonce` is the key and `request_id` comes from `GuardianSignRequest::request_id`. Resume does not read or clear a stored `producing_session`. `save_request` commits that pending row and selected `chain_claims` inserts together. `import_verified` commits the `Included` row and new `chain_claims` inserts together. `save_finalization_and_claims` commits the `finalization_batch` singleton and new claims together, and only when a range is persisted. Later claim results commit `chain_claims` only. There is no `identity_namespace` row and no `last_finalized_checkpoint` row (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:891-896,1141-1154,1866-1922,1943-1962`; `psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:216-244,446-537,676`). The daemon TOML keeps `rpc_config`, pointing at the canonical `psy-genesis/config.json`; it has no `guardian_config` and no second JSON. The launcher requires `PSY_GUARDIAN_ROOT`, checks the selected network's public guardian endpoints and its `guardian_authorization` object, and checks the guardians-root `db/` directory metadata. That object is the only authorization record. The runtime databases `db/guardian-{1,2,3}.redb` and `db/relayer.redb` hold mutable nonce, signed-request, included-session, per-chain deposit-tree state, included withdrawal burns, per-chain claim, and shared finalization-batch state; they do not store an authorization body (`dev/locSetupV4.ts` `resolveGuardianRoot` + `validateGuardianRuntimeRoot` + `validateGuardianAuthorization`, and the relayer/guardian template validation that calls them; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:24-28`). Guardian signer setup and publication into the selected network are owned by [genesis-generation.md §4](genesis-generation.md#4-guardians-root). This runbook has no separate authorization document and no TLS or certificate step.
+The lifecycle target owns that process. The command identifies the active `psy_relayer_cli` surface; do not launch a second copy. The relayer does not support `--result-file`. Durable daemon progress is `<guardian_root>/db/relayer.redb`, not `<proof_dir>/daemon_state.toml` or `<proof_dir>/daemon_state_multichain.toml`. `proof_dir` still comes from the daemon TOML, defaults to `/tmp/psy_bridge_proofs`, and holds proof files only. Its stdout log is `logs/bridge_relayer_logs.txt`, and tracing markers are in `logs/bridge_relayer_errs.txt` (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:852-876,1112-1118`). `run_multichain` loads `RelayerDb::finalization_batch` and `RelayerDb::chain_claims` through `load_multichain_state`. `run_single_chain` reads `L1Client::last_finalized_checkpoint`, then loads that chain's `chain_claims` row through `load_chain_state`. That L1 value is the only cursor and is not stored. `chain_claims` is keyed by `u8` `chain_index` and holds `pending_claim_withdrawals`, `claim_retry`, and `retired_claim_withdrawals`. `finalization_batch` is the singleton key `()` and holds `pending_finalization_range` (`from_checkpoint`, `to_checkpoint`) and `finalized_chains`. `deposit_tree_states` stores per-chain `count`, `root`, `frontier`, and `anchor`; its `event_block` is the log cursor and is not a string prefix. `included_withdrawal_burns` is keyed by sender, token contract, and burn nonce, not by an identity. `guardian_withdrawal_nonce` stays unchanged. Both reads happen after the current account-identity check derived from the configured member hashes. The in-flight guardian request is the sole non-`Included` `relayer_request` row from `RelayerDb::pending_request`: `session_nonce` is the key and `request_id` comes from `GuardianSignRequest::request_id`. Resume does not read or clear a stored `producing_session`. `save_request` commits that pending row and selected `chain_claims` inserts together. `import_verified` commits the `Included` row and new `chain_claims` inserts together. `save_finalization_and_claims` commits the `finalization_batch` singleton and new claims together, and only when a range is persisted. Later claim results commit `chain_claims` only. There is no `identity_namespace` row and no `last_finalized_checkpoint` row (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:891-896,1141-1154,1866-1922,1943-1962`; `psy_cli/psy_relayer_cli/src/bridge/guardian_client.rs:216-244,446-537,676`). The daemon TOML keeps `rpc_config`, pointing at the canonical `psy-genesis/config.json`; it has no `guardian_config` and no second JSON. The launcher requires `PSY_GUARDIAN_ROOT`, validates the selected network's `guardian_initial_member_hashes` and guardian endpoints, and takes chain identity from the deployment documents the deployer wrote, passed as repeatable `--l1-config` paths that replace the network `l1_config_url`; the relayer and guardians only read those documents, and no step writes the canonical config. It also checks the guardians-root `db/` directory metadata. That stable public field is the whole policy record. The runtime databases `db/guardian-{1,2,3}.redb` and `db/relayer.redb` hold mutable nonce, signed-request, included-session, per-chain deposit-tree state, included withdrawal burns, per-chain claim, and shared finalization-batch state; they do not store a policy record (`dev/locSetupV4.ts` `validateGuardianRpcConfig` + `resolveGuardianRoot` + `validateGuardianRuntimeRoot` + `assertGuardianKeystoresPresent`; `psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:24-28`). Guardian keystore setup and the selected network's stable guardian fields are owned by [genesis-generation.md §4](genesis-generation.md#4-guardians-root). This runbook has no separate authorization document and no TLS or certificate step.
 
 ## 3. Discover This Startup's Addresses
 
@@ -171,7 +261,7 @@ PY
 )"
 ```
 
-For local USDT, `2000` is `0.002` USDT and `1000` is `0.001` USDT. Small values reduce proof and liquidity surprises. `claim-deposit` and `withdraw` both consume L2 PSY fees; L1 token ownership does not pay L2 gas. The referenced Bridge campaign is [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md), especially its amount, L2 gas, and same-user serial-operation rules.
+For local USDT, `2000` is `0.002` USDT and `1000` is `0.001` USDT. Small values reduce proof and liquidity surprises. `claim-deposit` and `withdraw` both consume L2 PSY fees; L1 token ownership does not pay L2 gas. Keep amounts small and keep this user's L2 operations serial.
 
 ## 5. Register the User and Derive the Shield Address
 
@@ -506,7 +596,7 @@ For one user, execute these L2 EndCaps in this exact order, with each command re
 simple_claim (faucet funding) -> claim-deposit -> withdraw
 ```
 
-Do not background these commands. Do not submit two withdrawals for the same user concurrently. The relayer defaults to one sequential L2 batch (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:103-112`). The same serial rule is part of the referenced [PsyProtocol/psy-memory Bridge E2E](https://github.com/PsyProtocol/psy-memory/blob/main/src/repositories/parth-generic-v1/e2e/bridge.md).
+Do not background these commands. Do not submit two withdrawals for the same user concurrently. The relayer defaults to one sequential L2 batch (`psy_cli/psy_relayer_cli/src/bridge/daemon.rs:103-112`).
 
 ## 15. Cleanup
 
@@ -519,10 +609,9 @@ make shutdown
 
 Do not manually kill individual services. `make shutdown` is teardown and purges paired L1/L2 state by default (`PURGE ?= 1`). It is not required before the next `make run-all`: that target always starts a fresh chain, and `PURGE=0` does not turn it into a state-preserving restart. Use `make restart` only while the original supervisor and all three Anvil processes are still running. See [devnet lifecycle](devnet_lifecycle.md#3-fresh-start).
 
-## 16. Source and Walkthrough References
+## 16. Source References
 
 - Current command registry and flags: `client_prover/psy_cli/psy_user_cli/src/subcommand/mod.rs:47-159`, `client_prover/psy_cli/psy_user_cli/src/subcommand/args.rs:705-877`.
-- Current executable reference flow: `e2e/bridge-e2e.sh:88-289`.
 - Current relayer command surface: `psy_cli/psy_relayer_cli/src/main.rs:34-86,189-213`.
-- Referenced memory walkthrough: *Bridge E2E Walkthrough — Deposit → Claim → Withdraw → Claim* in the external Psy memory repository, especially the service-health-check section, the operational-discipline (Gotchas) section, sections 4.0-4.6, the Bridge Relayer main-loop section, and lessons 33.3-33.11.
-- Current source overrides any stale command or behavior in the walkthrough.
+- Deposit list and claim-proof handlers: `psy-services/src/api/handlers/bridge.rs:1412-1546,1639-1853`.
+- Claimed deposit identities: `psy-services/src/repositories/nullifier_claim.rs:128-151`.

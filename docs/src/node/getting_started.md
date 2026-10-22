@@ -1,6 +1,6 @@
 # Getting Started
 
-> For supervised start/stop/restart/rollback, follow the internal guides `docs/src/../dev/devnet_lifecycle.md` and `docs/src/../dev/devnet-launcher-reference.md` (not published in SUMMARY). Prefer `make run-all` / `make shutdown` over manual per-service starts. Note that `make shutdown` purges persisted chain state by default; `PURGE=0 make shutdown` stops without purging, but its database stop is `docker stop -t -1` and waits indefinitely; the supervisor's Docker stop subprocess has no deadline (its control client normally times out at 900 seconds). In the recorded observation the invoker was cut off at 180 seconds while the supervisor kept waiting. `PURGE=1 make shutdown` is the supported complete teardown (11.44 s).
+> For supervised start, stop, restart, rollback, launcher flags, ports, and supervision, follow [Devnet Startup, Shutdown, Restart, and Rollback](../dev/devnet_lifecycle.md). It is not published in SUMMARY. Prefer `make run-all` and `make shutdown` over manual per-service starts. `make shutdown` purges persisted chain state by default (`PURGE=1`); `PURGE=0 make shutdown` stops without purging, but its database stop is `docker stop -t -1` and waits indefinitely. The supervisor's Docker stop subprocess has no deadline, while the control client normally times out at 900 seconds.
 
 
 > Updated: 2026-09-03.
@@ -9,7 +9,7 @@
 
 This guide starts a complete Psy network for local development. Use the automated lifecycle for normal operation; the manual commands describe the node components and their required runtime flags.
 
-Before running any startup, shutdown, restart, or rollback command, read [Devnet Startup, Shutdown, Restart, and Rollback](../dev/devnet_lifecycle.md) and [Devnet Launcher Reference](../dev/devnet-launcher-reference.md).
+Before running any startup, shutdown, restart, or rollback command, read [Devnet Startup, Shutdown, Restart, and Rollback](../dev/devnet_lifecycle.md).
 
 ## Table of Contents
 
@@ -249,7 +249,7 @@ Stop the supervised stack without deleting state:
 PURGE=0 make shutdown
 ```
 
-`make shutdown` purges by default (`PURGE ?= 1` in the Makefile): it deletes checkpoints, `db/anvil/state.json`, logs, localhost deployments, and devnet Docker volumes; `PURGE=1 make shutdown` is the explicit equivalent and the supported complete teardown. The `PURGE=0` path above requests supervisor shutdown and stops the exact Anvil processes, but its database stop is `docker stop -t -1`, which waits indefinitely; the supervisor's Docker stop subprocess has no deadline, while its control client normally times out at 900 seconds. In the recorded observation the invoker was cut off at 180 seconds while the supervisor kept waiting, and the supported purge teardown then completed in 11.44 seconds. The shutdown target invokes the launcher teardown path (`Makefile:99-100`). Do not remove data directories manually.
+`make shutdown` purges by default (`PURGE ?= 1` in the Makefile): it deletes checkpoints, `db/anvil/state.json`, logs, localhost deployments, and devnet Docker volumes; `PURGE=1 make shutdown` is the explicit equivalent and the supported complete teardown. The `PURGE=0` path above requests supervisor shutdown and stops the exact Anvil processes, but its database stop is `docker stop -t -1`, which waits indefinitely; the supervisor's Docker stop subprocess has no deadline, while its control client normally times out at 900 seconds. The shutdown target invokes the launcher teardown path (`Makefile:99-100`). Do not remove data directories manually. Fresh start, application restart, and rollback stop/resume procedures are [devnet lifecycle](../dev/devnet_lifecycle.md) sections 3, 5, and 6.
 
 ## 9. Implemented Network Capabilities
 
@@ -257,7 +257,7 @@ PURGE=0 make shutdown
 - Realm proposal voting and certification are implemented; see [Realm Peer-to-Peer Validators](../dev/realm-p2p-validators.md).
 - Cross-chain bridge processing is implemented by the relayer and bridge components.
 - Runtime node storage uses ScyllaDB with Redis and NATS JetStream; the accepted flags are `--scylla-db-url`, `--redis-url`, and `--nats-jetstream-url` (`psy_cli/psy_node_cli/src/subcommand.rs:24-34,95-105,163-173,201-211`).
-- Devnet lifecycle procedures are internal: `docs/src/../dev/devnet_lifecycle.md` and `docs/src/../dev/devnet-launcher-reference.md` (not published in SUMMARY).
+- Devnet lifecycle and launcher procedures are internal: `docs/src/dev/devnet_lifecycle.md` (not published in SUMMARY).
 
 ## 10. Operating Tasks
 

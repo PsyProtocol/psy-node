@@ -27,17 +27,17 @@ Read the owning document before the matching operation; keep executable procedur
 | Create an eight-repository worktree cohort, switch to local dependencies, install dependencies, or build the cohort | `docs/src/dev/worktree-cohort.md` |
 | Change cross-repository Git revisions, npm versions, or release gitlinks | `docs/src/dev/circuit-and-verifier-operations.md` §8 |
 | Generate compiler contract artifacts or node Genesis | `docs/src/dev/genesis-generation.md` |
-| Start, stop, restart, or roll back the devnet | `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md` |
+| Start, stop, restart, or roll back the devnet | `docs/src/dev/devnet_lifecycle.md` |
 
 ## Required Devnet Lifecycle Reading
 
-Before any devnet startup, shutdown, restart, rollback, or live E2E operation, every AI agent MUST read and follow `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md`. The lifecycle guide owns state-preserving operations; the launcher reference owns launcher flags, the startup DAG, ports, environment, Anvil persistence, and known current-source limitations. JTMB remains test-only and is not rollback-validation evidence. Rollback validation uses the Plonky2 path; all lifecycle stop/resume, artifact, and verification procedures remain authoritative.
+Before any devnet startup, shutdown, restart, rollback, or live E2E operation, every AI agent MUST read and follow `docs/src/dev/devnet_lifecycle.md`. The lifecycle guide owns state-preserving operations; its launcher sections (§10-24) own launcher flags, the startup DAG, ports, environment, Anvil persistence, and known current-source limitations. JTMB remains test-only and is not rollback-validation evidence. Rollback validation uses the Plonky2 path; all lifecycle stop/resume, artifact, and verification procedures remain authoritative.
 
 ## Local Devnet Startup Preflight
 
 Keep the cohort repositories as sibling directories under one parent whenever possible: `psy-node`, `psy-compiler`, `psy-sdk`, `psy-genesis`, `psy-services`, `psy-contracts`, `psy-dapp`, and `psy-wallet`. The build and generation scripts use these sibling paths; a different layout requires explicit path configuration rather than copied repositories or ad-hoc symlinks.
 
-Before `make run-all`, restart, rollback validation, or a live E2E, read and follow both `docs/src/dev/devnet_lifecycle.md` and `docs/src/dev/devnet-launcher-reference.md`:
+Before `make run-all`, restart, rollback validation, or a live E2E, read and follow `docs/src/dev/devnet_lifecycle.md` (launcher internals §10-24):
 
 1. Initialize all required submodules recursively and confirm no required submodule status begins with `-`, `+`, or `U`. The node parent, nested DApp, SDK, and wallet gitlinks must resolve to their recorded SHAs.
 2. Confirm `genesis.json` already exists. Generate it only under the Genesis Regeneration Boundary; absence is a blocker, not permission to regenerate after unrelated changes.
@@ -73,17 +73,17 @@ Changes to the bridge aggregation circuit, checkpoint recursive transition circu
 
 ## Guardian And Relayer Storage Boundary
 
-Guardian and bridge-relayer state has exactly three homes. Do not add a directory, sidecar file, lock file, or second copy of the same request, session, or authorization.
+Guardian and bridge-relayer state has exactly three homes. Do not add a directory, sidecar file, lock file, or second copy of the same request, session, or policy.
 
 | Home | Holds |
 |---|---|
-| `psy-genesis/config.json` selected network | Network endpoints (`l1_endpoints`), guardian endpoints (`guardian_configs`, `guardian_history`), and `guardian_authorization` with exactly seven fields: `genesis_hash`, `bridge_relayer_signing_policy`, `multisig_fingerprint`, `endcap_verifier_fingerprint`, `max_fee`, `approved_contracts`, and `chains`. No keystore path, database path, authorization file, version, or hash artifact. |
-| `$HOME/.psy/keystore/` | `guardian-<id>.keystore.json` and `guardian-<id>.password` for ids 1, 2, and 3, plus the existing bridge-relayer keystore. Paths are derived from the id. Never write them into config. |
-| `<guardian_root>/db/guardian-{id}.redb` and `<guardian_root>/db/relayer.redb` | Runtime only: nonce, signed, Included, prefix, and indexes. Derived operational state. No authorization body. Exclusive ownership is the database handle lock, not a transaction alone. |
+| `psy-genesis/config.json` selected network | Guardian endpoints (`guardian_configs`, `guardian_history`), optional `l1_config_url`, and the stable public guardian field `guardian_initial_member_hashes` (exactly three distinct nonzero hashes). Chain id and bridge come from the deployment documents the deployer writes, passed as repeatable `--l1-config` paths that replace `l1_config_url`. There is no `l1_endpoints` list. No keystore path, database path, policy JSON, authorization object, digest, compiler artifact hash, fee ceiling, or password file. Guardian and relayer only read the deployment documents; no step writes this config. |
+| `$HOME/.psy/keystore/` | `guardian-<id>.keystore.json` for ids 1, 2, and 3, plus the existing bridge-relayer keystore. Paths are derived from the id. The password is read only from `GUARDIAN_<id>_KEYSTORE_PASSWORD`; there is no password file. Never write any of this into config. |
+| `<guardian_root>/db/guardian-{id}.redb` and `<guardian_root>/db/relayer.redb` | Runtime only: nonce, signed, Included, prefix, and indexes. Derived operational state. No policy record. Exclusive ownership is the database handle lock, not a transaction alone. |
 
-`guardian_authorization` on the selected network is the only authorization record. There is no `authorization/` directory, `authorization/index.json`, `authorization/versions/<version>.json`, authorization version, or historical version store, and no `compiler_artifact_sha256` or other hash artifact. Compiler artifacts stay in the compiler output directory and are not loaded by hash. Do not copy authorization bytes into a runtime row. A signed request binds that object's digest and fails closed when the digest differs.
+The stable public field is the whole guardian policy record. `guardian_initial_member_hashes` derives the `MultisigAccount` at the fixed Rust constant `MULTISIG_POLICY_CONTRACT_ID` (1) with version 1, threshold 2, member count 3, and the three hashes in slots 0-2. There is no `guardian_authorization` object, `bridge_relayer_signing_policy` JSON, `approved_contracts`/`contract_leaf_json` allowlist, policy digest, or historical version store. `multisig_fingerprint()` is compiled Rust, not config. The EndCap verifier fingerprint is the existing compiled `END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4` constant, not config; runtime proxy verifier data is compared against it. Contract IDs and state-tree heights are fixed Rust constants. Guardian calls are accepted from checkpoint, contract, and function Merkle proofs against the authenticated state roots, not from a configured code allowlist. Protocol required-fee, overflow, and burn accounting are unchanged. Compiler artifacts stay in the compiler output directory and are not loaded by hash. A signed request binds the network magic, bridge user id, and derived account public key and fails closed when any of them differs.
 
-Forbidden for this flow: a second guardian `config.json`, `validate_rpc_network`, `journal/<id>.redb`, `authorization/index.json`, `authorization/versions/<version>.json`, `archive/relayer-journal`, `pending.json`, `request.json`, `signatures.json`, `endcap.bin`, `included.json`, `account.lock`, and any new directory that records the same lifecycle. `make run-all` always creates a new database and a new L1 deployment. `make restart` keeps the running database and Anvil and restarts application processes. Do not infer reuse from `state.json` or `deployed-contracts.json`.
+Forbidden for this flow: a second guardian `config.json`, `journal/<id>.redb`, `authorization/index.json`, `authorization/versions/<version>.json`, `archive/relayer-journal`, `pending.json`, `request.json`, `signatures.json`, `endcap.bin`, `included.json`, `account.lock`, and any new directory that records the same lifecycle. `make run-all` always creates a new database and a new L1 deployment. `make restart` keeps the running database and Anvil and restarts application processes. Do not infer reuse from `state.json` or `deployed-contracts.json`.
 
 ## Token Privacy Circuit Fingerprint Boundary
 

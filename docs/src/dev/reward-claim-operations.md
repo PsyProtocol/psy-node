@@ -1,6 +1,6 @@
 # Reward Claim Operations
 
-> Repository-only reward runbook. Status: Review. Owning design: [Checkpoint Reward Claim Cutover](checkpoint-claim-cutover.md). Commands and eligibility below describe the source implementation, not deployment readiness.
+> Repository-only reward document. Commands below are the executable claim path. The protocol, checkpoint-tree authority, and security rules in this file describe the current source.
 
 ## Abstract
 
@@ -9,6 +9,7 @@ Run a proof-mining worker with durable job metadata, select owned reward-tree jo
 ## Table of Contents
 
 - [Terminology](#terminology)
+- [Reward Claim Protocol](#reward-claim-protocol)
 - [0. End-to-End Path](#0-end-to-end-path)
 - [1. Mine and Preserve Job Metadata](#1-mine-and-preserve-job-metadata)
 - [2. Select Eligible Work](#2-select-eligible-work)
@@ -25,6 +26,126 @@ Run a proof-mining worker with durable job metadata, select owned reward-tree jo
 - **CLI**: command-line interface; **RPC**: remote procedure call; **API**: application programming interface.
 - **ZK**: zero-knowledge authorization; **EVM**: Ethereum Virtual Machine.
 - **PSY**: Psy token; **JSON**: JavaScript Object Notation.
+
+## Reward Claim Protocol
+
+One user proves selected owned jobs inside each checkpoint, combines those independently calculated checkpoint rewards in a second binary recursive layer, and calls Ethereum `PsyToken.claimReward` to mint the proved sum. Every checkpoint ID is public, including the fixed-capacity zero padding. There is no per-node Keccak and no opaque payout-list commitment. StateManager authenticates finalized checkpoint-tree roots. The token verifies the proof and owns `claimed[userId][checkpointId]`.
+
+The compiled list capacity is `K = REWARD_CLAIM_MAX_CHECKPOINTS = 64` (`psy-contracts/src/PsyToken.sol:25`). It is a per-transaction resource bound, not a lifetime eligibility cap and not a caller-selected verifier capacity. More than 64 eligible checkpoints use another transaction of the same artifact. One checkpoint's selected jobs stay in one successful transaction. Checkpoint ID zero is a valid active ID; activity is `i < count`, never `id != 0`.
+
+```text
+owned jobs -> Leaf -> binary job Aggregate -> Root (one checkpoint)
+                          |
+        binary checkpoint Aggregate: padded IDs + sum
+                          |
+        RewardClaimWrapCircuit -> SharedGroth16Wrapper
+                          |
+        PsyToken.claimReward -> claimed[userId][id] + one _mint
+                          |
+        StateManager checkpointTreeRootCheckpointId
+```
+
+`recipient` is the 160-bit EVM address the authenticated user chooses as the mint destination. It is not derived from the registration key, fingerprint, or public-key hash, and `msg.sender` need not equal it. Anyone may forward an unchanged proof; forwarding cannot redirect the mint.
+
+### First layer
+
+One Leaf proves one selected GUTA job's tag ownership and reward-tree coordinates. Accepted height is `2 <= h <= 21` and `0 <= p < 2^(h-2)` (`psy_plonky2_circuits/src/bridge/circuits/user_reward_tree.rs:35,63-88`). The claim-local index is `(1 << (h-2)) - 1 + p`, computed inside the circuit over the whole index. Each selected coordinate is one empty-to-occupied transition. A sequential insertion counter is not the uniqueness proof.
+
+A job Aggregate lifts one pinned Leaf or verifies exactly two cyclic children. User, source checkpoint, and complete source-leaf hash must agree, and the left end nullifier root must equal the right start root. The outer statement exposes the endpoints and the checked `u32` job-count sum. A singleton lift and an odd host carry add no jobs.
+
+Root verifies that Aggregate, requires the empty starting nullifier root, and authenticates the complete source checkpoint leaf through its historical Merkle proof under the common finalized checkpoint-tree root. The source checkpoint is at or below the authorization anchor, and both source and anchor have inclusion paths. Fees and completed-job counts come from the source leaf, not free witnesses:
+
+`job_count * checkpoint_fees = amount * checkpoint_jobs_completed + remainder`
+
+with `0 <= remainder < checkpoint_jobs_completed`. Thus `amount = floor(job_count * checkpoint_fees / checkpoint_jobs_completed)`. Checkpoints are never combined before division (`psy_plonky2_circuits/src/bridge/circuits/user_reward_tree.rs:543-566`). A zero amount is rejected and consumes nothing.
+
+Registration membership is pinned in `RewardClaimWrapCircuit` (`psy_plonky2_circuits/src/bridge/circuits/reward_claim_wrap.rs:301-311`). The registration leaf is `Poseidon(fingerprint, public_key_param)`. The registration index is not `userId`: the Strategy5 bit mapping in `psy_crypto::common::user_id` converts between them (`client_prover/psy_core/psy_crypto/src/common/user_id.rs:220-348`). The proved user ID is bound to the job Aggregate user ID. The held ZK key is the only Root authorization; the Ethereum transaction signer is a different key.
+
+### Second layer and message
+
+`UserRewardCheckpointAggregateCircuit` has `Root` and `Pair` witnesses. Business width is `15+K`, the cyclic suffix is 68 fields, and total width is `83+K`. The active ID prefix is strictly increasing and the inactive suffix is zero. The Root branch copies one registration-aware Root. The Pair branch checks equal user, recipient, and root, adds counts and `u128` amounts with carry checks, and concatenates the active lists. Inactive business public inputs are masked to zero before range checks and arithmetic. Pair concatenation is a zero-filling barrel shift of the right list by the left count, then a slot-wise add; it is not a rotation and not a hash of the list.
+
+The token message is the static ABI encoding of:
+
+| Word | Value |
+|---|---|
+| 0 | `CLAIM_DOMAIN = keccak256("PsyReward/TokenCheckpointClaim/1")` |
+| 1 | token address, on chain `address(this)` |
+| 2 | StateManager address resolved from the provider |
+| 3 | `userId` zero-extended |
+| 4 | recipient |
+| 5 | checkpoint root |
+| 6 | count zero-extended |
+| 7 | `totalAmount` zero-extended |
+| 8+i | checkpoint ID zero-extended; inactive slots zero |
+
+`paddedIds` is a static `uint32[K]` array: 64 words, with no dynamic offset or length word. The wrapper hashes that message once. The generic Groth16 path hashes that commitment again. `PsyToken` computes the same double hash and passes the high and low 128-bit halves to `verifyProof(uint256[8], uint256[2])` (`psy-contracts/src/PsyToken.sol:106-127`). Callers cannot supply those halves. The verifier has no Boolean return: revert rejects, and a normal return accepts.
+
+### Token entry and checkpoint-tree API
+
+Current entry point (`psy-contracts/src/PsyToken.sol:50-134`):
+
+```solidity
+constructor(address initialHolder, uint256 initialSupply, address addressesProvider_);
+function claimReward(bytes calldata proof, bytes32 checkpointRoot,
+    uint32 userId, address recipient, uint32[] calldata checkpointIds,
+    uint256 totalAmount) external;
+function claimed(uint32 userId, uint32 checkpointId) external view returns (bool);
+function addressesProvider() external view returns (address);
+```
+
+The constructor keeps `Ownable(initialHolder)`, the initial mint, and 9 decimals. It stores only the immutable provider and requires that provider to have code. StateManager and `REWARD_CLAIM_VERIFIER_ID` are resolved at claim time. Owner `mint` stays owner-only and is distinct from proof-authorized issuance. There is no reserve transfer and no per-checkpoint amount in calldata.
+
+`claimReward` order is fixed:
+
+1. Reject `block.chainid` outside `1`, `31337`, and `11155111` before any provider read, claimed-state access, verification, or mint. Ordinary ERC-20 transfers and owner mint are unaffected.
+2. Reject a zero recipient, a zero total, a total above `u128`, or a count outside `1..=64`. Require deployed StateManager and reward-verifier code, and require the StateManager provider to equal this token's provider.
+3. Require `checkpointTreeRootsClean()`. Read `checkpointTreeRootCheckpointId(checkpointRoot)` and `lastFinalizedCheckpointId()`. The registered ID must be nonzero and no greater than the finalized tip. Recognition is verified finalize, not services admission.
+4. Require strictly increasing `checkpointIds` and `claimed[userId][id] == false`. Earlier unpaid holes stay claimable. There is no last-success cursor. Pad the list with zeros and build the message above.
+5. Require exactly 256 proof bytes, decode `uint256[8]`, and verify once.
+6. Set every listed pair true, call `_mint(recipient, totalAmount)` once, and emit one `RewardClaimed`. Any failure reverts the flags, balance, and supply. The supplied sum must match the verified statement.
+
+StateManager keeps `checkpointTreeRootCheckpointId(bytes32)` as the only root index. There is no root array, count, or enumeration (`psy-contracts/src/StateManager.sol:46-47`). Ordinary finalize preserves historical roots and rejects a duplicate registration.
+
+`forceSetState(expected, target)` compares the hash of the live state with the hash of `target` (`psy-contracts/src/StateManager.sol:124-164`):
+
+- An exact no-op, where those hashes are equal, returns before any write. `checkpointTreeRootsClean` stays unchanged.
+- A real change, including a same-height replacement whose root differs and including an empty registry, checks `expected`, rejects a target finalized ID above the expected ID, writes the target fields, and sets `checkpointTreeRootsClean` false. The supplied target is an administrative state, not a newly proved checkpoint-tree root.
+
+While the flag is false, both finalize and reward recognition stay blocked. Recovery is explicit and named:
+
+1. `revokeCheckpointTreeRoots(bytes32[])` deletes exactly the named nonzero `checkpointTreeRootCheckpointId` entries. It does not change the clean flag and does not reset `claimed` pairs (`psy-contracts/src/StateManager.sol:166-171`). The governed task is `state-manager:revoke-checkpoint-tree-roots --roots-json <file-or-json-array>`.
+2. `setCheckpointTreeRootsClean(true)` then re-enables recognition (`psy-contracts/src/StateManager.sol:173-175`). The governed task is `state-manager:set-checkpoint-tree-roots-clean --clean true`.
+
+Identify abandoned roots from settlement evidence. They cannot be discovered by scanning, because no enumeration exists. A revoked root stays unrecognized after the alternate branch advances unless that root is proved and registered again. Claimed pairs never reset.
+
+Removing the former root enumeration changed the clean flag's storage slot. Do not upgrade a populated StateManager in place: the old array length can be read as the clean flag, and that upgrade stays blocked until a reviewed storage migration exists. Fresh initialization sets `checkpointTreeRootsClean` true. Replacement deployment must rebuild StateManager and PsyToken with the same provider wiring and must select the matching new deployment documents through repeatable `--l1-config` paths at relayer and guardian startup; those paths replace the network `l1_config_url`, the relayer and guardians only read those documents, and neither the operator nor the launcher writes the canonical config or any authorization object. The former `ChainAuthorization` flow is deleted (`psy_cli/guardian_common/src/runtime.rs:126-229`).
+
+### SDK prepare and confirm
+
+The browser prepares one unsigned token transaction of at most 64 eligible checkpoint groups. An external Ethereum signer submits it. `prepareRewardClaim` and `confirmRewardClaim` are the provider methods (`psy-sdk/psy-ts-sdk/packages/psy-sdk/src/local-web-prover/provider.ts:179-193`). The TypeScript boundary uses `PsyJSON`, not `JSON.stringify`, so a `u64` above `2^53-1` stays exact.
+
+`PrepareRewardClaimRequest` carries `rewardToken`, `userId`, `recipient`, `jobs`, `l1RpcUrl`, `proveProxyUrl`, and optional `proveProxyToken` and `aggregateCaches`. Addresses are `0x` plus 40 lowercase hex characters. `proveProxyToken` is a bearer credential for `psy_prove_reward_claim_groth16` and is not copied into the prepared claim or a page message.
+
+`RewardClaimPreparation` is one of three statuses:
+
+- `ready`: one unsigned `PreparedRewardClaim`, plus remaining jobs, caches, already-claimed IDs, and deferred checkpoints. `checkpointIds` is strictly increasing, length 1 through 64, and `totalAmount` is a decimal `u128` string. `chainId` is the observed `eth_chainId`, exactly `1`, `31337`, or `11155111`.
+- `proof_only`: at least one validated job Aggregate exists and no payable transaction was produced. Remaining jobs keep every unpaid original. Deferred work with no completed aggregate is an error, not this status.
+- `nothing_to_claim`: no unclaimed original remains, including an empty input. A mapping, proof, or network failure is an error. A temporarily unrecognized source is a deferred record, not this status.
+
+The caller keeps the original jobs until `confirmed`. On `ready`, `remainingJobs` excludes only the jobs inside the prepared claim. Confirm returns `pending` only while the receipt is null. It returns `confirmed` only when the receipt and `eth_getTransactionByHash` match the submitted hash, the receipt block hash matches that block number, the prepared token emitted both `RewardClaimed` and the zero-address mint `Transfer`, and `claimed` is true for every ID at that block. The SDK does not sign, retry, or keep a paid cursor.
+
+Held-key proving resolves `pkHash` to the wallet's `SignatureUser`. Only `ZKUser` implements `prove_reward_root`; every other signer fails with `reward root proving requires a held ZK key`. The raw key stays inside that call. `request.userId` must equal the selected wallet's authenticated registration.
+
+### Security
+
+- Ownership is the first tag-preimage limb plus the held ZK registration key. Do not edit preimages to retarget a backup.
+- Duplicate coordinates and overlapping lists are rejected. Replay or partial overlap reverts the whole transaction; no flag or mint survives an invalid proof, an unrecognized root, or a mint failure.
+- Cache is disposable acceleration. It is safe to delete the cache and unsafe to delete the original backup. A changed source leaf or selection rebuilds from the originals. On-chain claimed bits cannot reconstruct jobs.
+- Payouts of the current eligible snapshot finish before advance aggregation of remaining jobs. A pending or failed receipt is not local paid state.
+- Services admission cannot grant or deny the token claim, and no user L2 reward claim is required.
+
+The executable sections below are the CLI path through this protocol.
 
 ## 0. End-to-End Path
 
@@ -115,7 +236,7 @@ For each selected coordinate require:
 - `0 < selected_job_count <= checkpoint.stats.pm_jobs_completed.gutas_completed`, with `gutas_completed > 0`. For each checkpoint independently, `amount = floor(selected_job_count * guta_fees_collected / gutas_completed)`; the remainder is strictly less than the denominator (`psy_plonky2_circuits/src/bridge/circuits/user_reward_tree.rs:543-565,583-588,619-628`).
 - A positive amount. A zero result is rejected by `RewardClaim::from_public_inputs`, even though the payout arithmetic can produce zero (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:98-100`; `client_prover/psy_core/psy_data/src/reward_claim.rs:75-105`).
 - An unclaimed `(user_id, checkpoint_id)` under a recognized finalized root. Claiming consumes the checkpoint pair, not just the selected jobs: select all intended owned jobs for that checkpoint before paying it (`client_prover/psy_cli/psy_user_cli/src/subcommand/claim_rewards.rs:63-68,125-128,208-209`).
-- Recognition requires `rewardRootsClean()` and a nonzero `rewardRootCheckpointId(bytes32)` registration no greater than the finalized tip (`psy-contracts/src/StateManager.sol:46-49`; recognition check: `psy-contracts/src/PsyToken.sol:90-94`). After a real force-set, administrators drain the registered roots with the bounded `revokeAbandonedRewardRoots(uint256 maxEntries)` governed task `state-manager:revoke-abandoned-reward-roots --max-entries N` (`psy-contracts/src/StateManager.sol:168-182`; `psy-contracts/tasks/upgrade.ts:82-89`); there is no named-root revoke and no explicit clean-flag setter. Cleanup sets `rewardRootsClean` true only once the internal registry is empty and never resets claimed pairs. The automated claim path reads recognition through those same `rewardRootsClean()` / `rewardRootCheckpointId(bytes32)` selectors (`client_prover/psy_prover/src/local/reward_client.rs:979-987`); a real current-source E2E run completed claims this way (user 0, mint 666666666).
+- Recognition requires `checkpointTreeRootsClean()` and a nonzero `checkpointTreeRootCheckpointId(bytes32)` registration no greater than the finalized tip (`psy-contracts/src/StateManager.sol:46-47`; recognition check: `psy-contracts/src/PsyToken.sol:90-94`). After a real force-set, the administrator revokes the approved abandoned roots by name with `revokeCheckpointTreeRoots(bytes32[])` (governed task `state-manager:revoke-checkpoint-tree-roots --roots-json <file-or-json-array>`; `psy-contracts/src/StateManager.sol:166-171`; `psy-contracts/tasks/upgrade.ts:82-89`) and then explicitly re-enables with `state-manager:set-checkpoint-tree-roots-clean --clean true` (`psy-contracts/src/StateManager.sol:173-175`). There is no root count or enumeration: identify abandoned roots from settlement evidence, never by on-chain scanning. Revocation never resets claimed pairs. The automated claim path reads recognition through those same `checkpointTreeRootsClean()` / `checkpointTreeRootCheckpointId(bytes32)` selectors (`client_prover/psy_prover/src/local/reward_client.rs:979-987`).
 
 ## 3. Query Before Claiming
 
@@ -223,8 +344,8 @@ Braces below denote values interpolated by the source. Do not replace these resp
 
 ## Related Documents
 
-- [Checkpoint Reward Claim Cutover](checkpoint-claim-cutover.md) — owning design document; this runbook documents executable source behavior only.
 - [Common Operations](common-operations.md) — wallet, registration and L2 state queries; [§9](common-operations.md#9-query-user-state-inside-a-contract) owns balance-read commands.
+
 - [Bridge Common Operations](bridge-common-operations.md) — deposit, withdrawal and relayer settlement procedures.
 - [Reward Tree Circuits](reward-tree-circuits.md) — reward-tree circuit reference.
 - [Devnet Lifecycle](devnet_lifecycle.md) — startup and shutdown.

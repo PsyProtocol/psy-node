@@ -286,7 +286,7 @@ When triggered, the current target is:
 make generate-genesis-data
 ```
 
-Preconfigure `networks.<selected-network>.guardian_authorization.bridge_relayer_signing_policy` in `psy-genesis/config.json`, then run the command with no account environment variable and no account flag. The target runs `psy_dev_cli generate-genesis-data --repo-root` (`Makefile:141-142`). There is no `PSY_RELAYER_MULTISIG_ACCOUNT` variable, no `PSY_MULTISIG_POLICY_ARTIFACT` variable, and no `--multisig-policy-artifact` flag. Registration 2 is derived from that selected signing policy and the actual multisig circuit fingerprint, with contract-1 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet entries retain their existing keys and positions. The generator does not write `faucet_operators.json` beside Genesis. See [devnet-launcher-reference.md](devnet-launcher-reference.md) for the launcher's public input and child-environment behavior.
+The selected `psy-genesis/config.json` network must already carry the three public `guardian_initial_member_hashes`, then run the command with no account environment variable and no account flag. The target runs `psy_dev_cli generate-genesis-data --repo-root` (`Makefile:141-142`). There is no `guardian_authorization` or policy JSON input, no `PSY_RELAYER_MULTISIG_ACCOUNT` variable, no `PSY_MULTISIG_POLICY_ARTIFACT` variable, and no `--multisig-policy-artifact` flag. Registration 2 is derived from those three member hashes and the actual multisig circuit fingerprint, with the fixed contract-1 policy fields initialized in Genesis; it is not derived from an L1 keystore or password. See [genesis-generation.md](genesis-generation.md) section 1.2.1 for the exact input contract. The generator writes root `genesis.json`, root `private_keys.json`, and, unless disabled, `psy-dapp/apps/bridge/src/config/faucetOperators.json` (`psy_cli/psy_dev_cli/src/subcommand/generate_genesis.rs`). Entry 2 of the dense private-key export is `null`; other validator/faucet entries retain their existing keys and positions. The generator does not write `faucet_operators.json` beside Genesis. See [devnet lifecycle, environment variable reference](devnet_lifecycle.md#12-environment-variable-reference) for the launcher's public input and child-environment behavior.
 
 ### 6.2 Embedded wallet circuit trigger
 
@@ -699,7 +699,6 @@ Rollback units are: the globally shared verifier JSON plus localhost fingerprint
 
 ## Related Documents
 
-- [Devnet launcher reference](devnet-launcher-reference.md)
 - [Devnet lifecycle](devnet_lifecycle.md)
 - [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
 - [Genesis generation](genesis-generation.md)

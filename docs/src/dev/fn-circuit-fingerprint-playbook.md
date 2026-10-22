@@ -187,7 +187,7 @@ These are reference procedures, not permission to stop the running stack, commit
 1. Freeze the intended node source revision and apply the release applicability gate. The historical local compiler experiment used local path dependencies; release consumers must use the exact authorized node revision under `AGENTS.md`, not an undocumented pin override.
 2. Update the compiler's node dependencies consistently and let Cargo regenerate its lockfile. Build/check the compiler under the authorized delivery procedure.
 3. Run `make gen-deploy-json` in `<workspace>/psy-compiler`. The workspace recipe is `<workspace>/psy-compiler/Makefile:270-309`: it compiles the precompiles, copies `token.json` and `token.update.json`, writes `psy-genesis/genesis_contracts.json` and `genesis_abi/`, and writes the compiler provenance stamp at `:308`. It does **not** write the node's root `genesis.json`.
-4. Because the contract artifact changed, preconfigure `networks.<selected-network>.guardian_authorization.bridge_relayer_signing_policy` in `psy-genesis/config.json`, then run `make generate-genesis-data` in `psy-node` with no account environment variable and no account flag. There is no `PSY_RELAYER_MULTISIG_ACCOUNT` or `PSY_MULTISIG_POLICY_ARTIFACT`. Rebuild the SDK compiler artifacts when their own input changed and verify both compiler provenance stamps.
+4. Because the contract artifact changed, ensure `<selected-network>` in `psy-genesis/config.json` carries the three public `guardian_initial_member_hashes`, then run `make generate-genesis-data` in `psy-node` with no account environment variable and no account flag. There is no `guardian_authorization` or policy JSON input, no `PSY_RELAYER_MULTISIG_ACCOUNT`, and no `PSY_MULTISIG_POLICY_ARTIFACT`. Rebuild the SDK compiler artifacts when their own input changed and verify both compiler provenance stamps.
 5. Use an authorized full purge/restart to install the new chain cohort. Core launcher startup injects the ordered public validators before processors start (`injectGenesisValidators`, `dev/locSetupV4.ts:1524,5939`); require the intended nonempty validator list. Do not hand-edit Genesis fingerprints.
 6. Re-register users, claim faucet funds, transfer, and complete the real EndCap acceptance procedure. Do not add Cargo `[patch]` or `[replace]` overrides for pinned node revisions.
 
@@ -224,7 +224,6 @@ Never weaken fingerprint inclusion, verifier equality, checkpoint-vintage checks
 
 - [Circuit and Verifier Operations](circuit-and-verifier-operations.md)
 - [Devnet Lifecycle](devnet_lifecycle.md)
-- [Devnet Launcher Reference](devnet-launcher-reference.md)
 - [Genesis Generation](genesis-generation.md)
 - [Realm P2P Validators](realm-p2p-validators.md)
 - [Token Privacy Circuit Fingerprints](token-privacy-circuit-fingerprints.md)

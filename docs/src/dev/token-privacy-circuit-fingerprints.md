@@ -278,7 +278,6 @@ Preserve matching source revisions, configuration, and generated artifact cohort
 ## Related Documents
 
 - [Circuit and verifier operations](circuit-and-verifier-operations.md)
-- [Devnet launcher reference](devnet-launcher-reference.md)
 - [Devnet lifecycle](devnet_lifecycle.md)
 - [Fn circuit fingerprint playbook](fn-circuit-fingerprint-playbook.md)
 - [Genesis generation](genesis-generation.md)
