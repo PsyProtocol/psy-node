@@ -44,6 +44,9 @@ pub struct ProposeWithdrawalsArgs {
     /// which only single-chain services deployments accept.
     #[clap(long, env = "PSY_DESTINATION_CHAIN_INDICES", value_delimiter = ',')]
     pub destination_chain_indices: Vec<u64>,
+    /// Local deployment documents. Repeated flags replace the network `l1_config_url`.
+    #[clap(long = "l1-config")]
+    pub l1_config: Vec<std::path::PathBuf>,
 }
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -729,10 +732,13 @@ pub async fn run_and_get_withdrawal_root(
 }
 
 pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
-    let history = super::guardian_client::LoadedGuardianConfig::load(std::path::Path::new(&args.rpc_config), std::path::Path::new(&args.guardian_root))?;
-    let provider = guardian_common::runtime::load_network(&history.root, history.authorization()).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let history = super::guardian_client::LoadedGuardianConfig::load(std::path::Path::new(&args.rpc_config), std::path::Path::new(&args.guardian_root), &args.l1_config).await?;
+    let provider = guardian_common::runtime::load_network(&history.root).map_err(|error| anyhow::anyhow!("{error}"))?;
     let (from_checkpoint, requested_to_checkpoint_exclusive) = resolve_scan_range(&args)?;
     let latest_checkpoint = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
+    let active = history.root.l1_chains.iter().map(|chain| u64::from(chain.chain_index)).collect::<std::collections::BTreeSet<_>>();
+    let requested = args.destination_chain_indices.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    anyhow::ensure!(requested == active, "destination chain indices must equal the active configured chains");
     let to_checkpoint_exclusive = requested_to_checkpoint_exclusive.min(latest_checkpoint);
 
     tracing::info!(

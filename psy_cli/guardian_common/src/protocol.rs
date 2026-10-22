@@ -3,11 +3,11 @@ use std::{collections::BTreeSet, fmt, marker::PhantomData, net::SocketAddr, path
 use alloy_primitives::U256;
 use plonky2::{field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}}, hash::poseidon::PoseidonHash};
 use psy_client_common::{args::ContractCallData, data::qhashout::QHashOut};
-use psy_client_data::{config::store_config::PsyHasher, guta::end_cap_input::SubmitUserEndCapNonProofInput, qdata::contract::PsyContractLeaf};
-use psy_config::ChainEndpoint;
+use psy_client_data::{config::store_config::PsyHasher, guta::end_cap_input::SubmitUserEndCapNonProofInput};
+
 use psy_crypto::hash::{core::sha256::CoreSha256Hasher, traits::hasher::{FieldQHasher, MerkleZeroHasher}};
 use psy_prover::trace::{GeneratedTxTraceJson, TxTrace, TraceStep};
-use psy_vm::ups::multisig::{MultisigAccount, MultisigSignatures, MULTISIG_POLICY_CONTRACT_ID};
+use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MultisigSignatures, MULTISIG_POLICY_CONTRACT_ID};
 use serde::{de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor}, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -131,9 +131,13 @@ pub enum GuardianSignError {
     ProofMismatch, TraceMismatch, DepositMismatch, WithdrawalMismatch, L1ResponseMismatch,
     StateMismatch, UnsupportedCall, PolicyMismatch,
     NonceConflict, WithdrawalNonceConflict, KeyUnavailable, AccountHalted,
+    LegacyJournalSchema,
 }
 impl fmt::Display for GuardianSignError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Self::LegacyJournalSchema { return f.write_str("incompatible legacy journal schema; explicit operator-controlled migration is required"); }
+        write!(f, "{self:?}")
+    }
 }
 impl std::error::Error for GuardianSignError {}
 impl GuardianSignError {
@@ -145,7 +149,7 @@ impl GuardianSignError {
             Self::AuthorizationMismatch | Self::StateMismatch | Self::NonceConflict | Self::WithdrawalNonceConflict => 409,
             Self::L1RpcUnavailable | Self::L2RpcUnavailable | Self::DepositLogsUnavailable | Self::SignatureQuorumUnavailable | Self::FinalityPending | Self::CheckpointProofUnavailable
                 | Self::DatabaseUnavailable | Self::SessionHistoryUnavailable | Self::ObserverTimeout | Self::SigningPreparationTimeout | Self::SigningBusy
-                | Self::IndexCheckpointTimeout | Self::KeyUnavailable | Self::AccountHalted | Self::ListenerUnavailable | Self::SignalHandlerUnavailable => 503,
+                | Self::IndexCheckpointTimeout | Self::KeyUnavailable | Self::AccountHalted | Self::ListenerUnavailable | Self::SignalHandlerUnavailable | Self::LegacyJournalSchema => 503,
         }
     }
     pub fn retry_after_ms(self) -> u32 {
@@ -156,7 +160,7 @@ impl GuardianSignError {
             Self::MalformedRequest | Self::UnauthorizedCaller | Self::AccountIdentityConflict | Self::AuthorizationMismatch
                 | Self::ProofMismatch | Self::TraceMismatch | Self::DepositMismatch | Self::WithdrawalMismatch | Self::L1ResponseMismatch
                 | Self::StateMismatch | Self::UnsupportedCall | Self::PolicyMismatch | Self::NonceConflict | Self::WithdrawalNonceConflict
-                | Self::AccountHalted | Self::ListenerUnavailable | Self::SignalHandlerUnavailable => 0,
+                | Self::AccountHalted | Self::ListenerUnavailable | Self::SignalHandlerUnavailable | Self::LegacyJournalSchema => 0,
         }
     }
 }
@@ -167,58 +171,25 @@ impl GuardianSignErrorResponse {
     pub fn new(request_id: Option<Hex32>, code: GuardianSignError) -> Self { Self { request_id, code, retry_after_ms: code.retry_after_ms() } }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApprovedContract {
-    pub contract_id: u32,
-    pub contract_leaf_json: JsonText<PsyContractLeaf<GoldilocksField>>,
-    /// Compiler method bindings authenticated by the retained authorization digest.
-    pub methods: Vec<ApprovedMethod>,
-    pub withdrawal_layout: Option<WithdrawalLayout>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApprovedMethod {
-    pub name: String,
-    pub method_id: u32,
-    pub input_felt_count: u32,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WithdrawalLayout {
-    /// Felt offset of the first withdrawal record in user state.
-    pub subslot_base: u64,
-    pub capacity: u64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GuardianAuthorization {
-    pub genesis_hash: Hex32,
-    pub bridge_relayer_signing_policy: JsonText<MultisigAccount>,
-    pub multisig_fingerprint: Hash4,
-    pub endcap_verifier_fingerprint: Hash4,
-    pub max_fee: u64,
-    pub approved_contracts: Vec<ApprovedContract>, pub chains: Vec<ChainAuthorization>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChainAuthorization {
-    pub chain_index: u8, pub chain_id: U256, pub genesis_hash: Hex32,
-    pub bridge: Hex20, pub state_manager: Hex20, pub deployment_block: u64,
-    pub token_mappings: Vec<TokenMapping>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TokenMapping { pub token: Hex20, pub l2_contract_id: u32 }
-
 /// Selected canonical network and derived operator-local startup values. Not serialized.
 #[derive(Debug, Clone)]
 pub struct GuardianConfig {
     pub network: psy_config::NetworkConfigGoldilocks,
-    pub authorization: std::sync::Arc<GuardianAuthorization>,
     pub guardian_root: PathBuf,
     pub endpoints: [String; 3],
     pub history_url: String,
+    /// Chains parsed from the selected deployment documents. Not a config field.
+    pub l1_chains: Vec<ChainEndpoint>,
+}
+/// One L1 the guardian dials. Built from a deployment document, never serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainEndpoint {
+    pub chain_index: u8,
+    pub chain_id: U256,
+    pub bridge: Hex20,
+    /// Inclusive cold-scan bound from the selected Bridge deployment metadata, never configuration.
+    pub deployment_block: u64,
+    pub rpc_url: String,
 }
 /// Derived startup fields for one selected guardian. Not serialized.
 #[derive(Debug, Clone)]
@@ -226,7 +197,7 @@ pub struct GuardianRuntimeConfig {
     pub listen_address: String,
     pub db_path: String,
     pub signing_key_secret_path: String,
-    pub signing_key_password_secret_path: String,
+    pub signing_key_password_env: String,
     pub l2_rpc_url: String,
     pub l1_rpc_urls: Vec<ChainEndpoint>,
     pub history_urls: Vec<String>,
@@ -239,8 +210,8 @@ pub enum GuardianOperation { Bridge = 0, Bootstrap = 1, ReplacePolicy = 2 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardianSignRequest {
-    pub schema_version: u32, pub authorization_sha256: Hex32, pub network_magic: u64,
-    pub genesis_hash: Hex32, pub user_id: u64, pub session_nonce: u64, pub operation: GuardianOperation,
+    pub schema_version: u32, pub network_magic: u64,
+    pub user_id: u64, pub session_nonce: u64, pub operation: GuardianOperation,
     pub trace_json: JsonText<GeneratedTxTraceJson>, pub deposit_anchors: Vec<DepositAnchor>,
     pub withdrawal_records: Vec<WithdrawalBurnRecord>,
 }
@@ -260,6 +231,7 @@ pub struct GuardianSignResponse {
     pub policy_commitment: Hash4, pub member_index: u8, pub message: Hex32, pub public_key: Hex33, pub signature: Hex64,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuardianSigned {
     pub network_magic: u64, pub user_id: u64, pub nonce: u64,
     pub request_bytes: Vec<u8>, pub starting_leaf_hash: Hash4,
@@ -309,7 +281,7 @@ pub enum HaltReason { FinalityConflict, CheckpointConflict, NonceConsumedDiffere
 pub struct GuardianAccount {
     pub network_magic: u64, pub user_id: u64, pub state: GuardianAccountState,
     pub last_checkpoint_id: u64, pub last_checkpoint_hash: Hash4, pub imported_nonce: Option<u64>,
-    pub authorization_sha256: Hex32, pub imported_ending_leaf: Option<Hash4>,
+    pub account_public_key: Hash4, pub imported_ending_leaf: Option<Hash4>,
     /// One included withdrawal frontier per destination chain: (chain, count, frontier, root).
     pub withdrawal_chains: Vec<(u8, u32, [Hash4; 32], Hash4)>,
     pub halt_reason: Option<HaltReason>,
@@ -388,7 +360,7 @@ impl WithdrawalBurnRecord {
 impl GuardianSignRequest {
     pub fn parse(bytes: &[u8]) -> Result<Self, GuardianSignError> { let request: Self = parse_canonical_json(bytes)?; request.validate()?; Ok(request) }
     pub fn validate(&self) -> Result<(), GuardianSignError> {
-        if self.schema_version != 1 || self.authorization_sha256.0 == [0; 32] || !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID || !canonical_field(self.session_nonce)
+        if self.schema_version != 2 || !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID || !canonical_field(self.session_nonce)
             || self.deposit_anchors.len() > 256 || self.withdrawal_records.len() > 1024 { return Err(GuardianSignError::MalformedRequest); }
         if self.operation != GuardianOperation::Bridge && (!self.deposit_anchors.is_empty() || !self.withdrawal_records.is_empty()) { return Err(GuardianSignError::UnsupportedCall); }
         if self.operation == GuardianOperation::Bridge && self.deposit_anchors.is_empty() && self.withdrawal_records.is_empty() { return Err(GuardianSignError::UnsupportedCall); }
@@ -421,9 +393,9 @@ impl GuardianSignRequest {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, GuardianSignError> {
         self.validate()?;
         let mut bytes = Vec::with_capacity(self.trace_json.as_str().len() + 128 + self.withdrawal_records.len() * 137);
-        bytes.extend_from_slice(b"PSYGS001");
-        bytes.extend_from_slice(&self.schema_version.to_le_bytes()); bytes.extend_from_slice(&self.authorization_sha256.0);
-        bytes.extend_from_slice(&self.network_magic.to_le_bytes()); bytes.extend_from_slice(&self.genesis_hash.0);
+        bytes.extend_from_slice(b"PSYGS002");
+        bytes.extend_from_slice(&self.schema_version.to_le_bytes());
+        bytes.extend_from_slice(&self.network_magic.to_le_bytes());
         bytes.extend_from_slice(&self.user_id.to_le_bytes()); bytes.extend_from_slice(&self.session_nonce.to_le_bytes()); bytes.push(self.operation as u8);
         put_text(&mut bytes, self.trace_json.as_str());
         bytes.extend_from_slice(&(self.deposit_anchors.len() as u64).to_le_bytes());
@@ -434,15 +406,12 @@ impl GuardianSignRequest {
         Ok(bytes)
     }
     pub fn request_id(&self) -> Result<Hex32, GuardianSignError> { Ok(sha256(&self.canonical_bytes()?)) }
-    pub fn validate_authorization(&self, authorization: &GuardianAuthorization) -> Result<(), GuardianSignError> {
+    pub fn validate_authorization(&self, config: &GuardianConfig) -> Result<(), GuardianSignError> {
         self.validate()?;
-        if self.authorization_sha256 != authorization.digest()? || self.genesis_hash != authorization.genesis_hash || self.user_id != authorization.user_id() { return Err(GuardianSignError::AuthorizationMismatch); }
-        if self.decode_trace()?.meta.public_key != authorization.account_public_key()? { return Err(GuardianSignError::AccountIdentityConflict); }
-        for anchor in &self.deposit_anchors { authorization.chain(anchor.chain_index)?; }
-        for record in &self.withdrawal_records {
-            let token = record.token_address()?;
-            if !authorization.chain(record.destination_chain_index)?.token_mappings.iter().any(|m| m.token == token && m.l2_contract_id == record.token_contract_id) { return Err(GuardianSignError::WithdrawalMismatch); }
-        }
+        if self.network_magic != config.network_magic()? || self.user_id != BRIDGE_USER_ID { return Err(GuardianSignError::AccountIdentityConflict); }
+        if self.decode_trace()?.meta.public_key != config.account_public_key()? { return Err(GuardianSignError::AccountIdentityConflict); }
+        for anchor in &self.deposit_anchors { config.chain(anchor.chain_index)?; }
+        for record in &self.withdrawal_records { config.chain(record.destination_chain_index)?; }
         Ok(())
     }
 }
@@ -451,65 +420,35 @@ pub fn traces_equal(supplied: &TxTrace, replayed: &TxTrace) -> Result<bool, Guar
     Ok(serde_json::to_value(supplied).map_err(|_| GuardianSignError::MalformedRequest)? == serde_json::to_value(replayed).map_err(|_| GuardianSignError::MalformedRequest)?)
 }
 
-impl GuardianAuthorization {
-    pub fn parse(bytes: &[u8]) -> Result<Self, GuardianSignError> { parse_canonical_json(bytes) }
+/// Derives the existing multisig account without retaining a second config representation.
+pub fn initial_account(network: &psy_config::NetworkConfigGoldilocks) -> Result<MultisigAccount, GuardianSignError> {
+    let members = network.guardian_initial_member_hashes.ok_or(GuardianSignError::PolicyMismatch)?;
+    for member in members { validate_hash(member)?; }
+    let mut member_hashes = [Hash4::ZERO; 8];
+    member_hashes[..3].copy_from_slice(&members);
+    let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes } };
+    account.initial_policy.validate().map_err(|_| GuardianSignError::PolicyMismatch)?;
+    account.public_key_param().map_err(|_| GuardianSignError::PolicyMismatch)?;
+    Ok(account)
+}
+
+pub fn multisig_fingerprint() -> Result<Hash4, GuardianSignError> {
+    psy_prover::wallet::memory_wallet::get_multisig_fingerprint::<GoldilocksField>().map_err(|_| GuardianSignError::PolicyMismatch)
+}
+
+impl GuardianConfig {
+    pub fn initial_account(&self) -> Result<MultisigAccount, GuardianSignError> { initial_account(&self.network) }
     pub fn user_id(&self) -> u64 { BRIDGE_USER_ID }
     pub fn account_public_key(&self) -> Result<Hash4, GuardianSignError> {
-        let account = self.bridge_relayer_signing_policy.decode()?;
-        let param = account.public_key_param().map_err(|_| GuardianSignError::PolicyMismatch)?;
-        Ok(QHashOut(PoseidonHash::two_to_one(self.multisig_fingerprint.0, param.0)))
+        let param = self.initial_account()?.public_key_param().map_err(|_| GuardianSignError::PolicyMismatch)?;
+        Ok(QHashOut(PoseidonHash::two_to_one(multisig_fingerprint()?.0, param.0)))
     }
-    pub fn digest(&self) -> Result<Hex32, GuardianSignError> {
-        serde_json::to_vec(self).map(|bytes| sha256(&bytes)).map_err(|_| GuardianSignError::AuthorizationMismatch)
+    pub fn chain(&self, index: u8) -> Result<&ChainEndpoint, GuardianSignError> {
+        self.l1_chains.iter().find(|chain| chain.chain_index == index).ok_or(GuardianSignError::AuthorizationMismatch)
     }
-
-    pub fn resolve_signed_authorization(&self, signed: &GuardianSigned) -> Result<&Self, GuardianSignError> {
+    pub fn validate_signed(&self, signed: &GuardianSigned) -> Result<(), GuardianSignError> {
         signed.validate()?;
-        let request = GuardianSignRequest::from_canonical_bytes(&signed.request_bytes)?;
-        if request.authorization_sha256 != self.digest()? || request.user_id != self.user_id() || request.genesis_hash != self.genesis_hash {
-            return Err(GuardianSignError::AuthorizationMismatch);
-        }
-        Ok(self)
-    }
-    pub fn chain(&self, index: u8) -> Result<&ChainAuthorization, GuardianSignError> {
-        self.chains.binary_search_by_key(&index, |c| c.chain_index).ok().map(|i| &self.chains[i]).ok_or(GuardianSignError::AuthorizationMismatch)
-    }
-    pub fn validate(&self, guta_fee: u64, da_fee: u64) -> Result<(), GuardianSignError> {
-        let mismatch = GuardianSignError::AuthorizationMismatch;
-        let floor = guta_fee.checked_add(da_fee).ok_or(mismatch)?;
-        if self.genesis_hash.0 == [0; 32] || self.max_fee < floor
-            || self.chains.is_empty() || self.chains.len() > 256 { return Err(mismatch); }
-        validate_hash(self.account_public_key()?)?; validate_hash(self.multisig_fingerprint)?; validate_hash(self.endcap_verifier_fingerprint)?;
-        if self.endcap_verifier_fingerprint == Hash4::ZERO { return Err(mismatch); }
-        let account = self.bridge_relayer_signing_policy.decode()?;
-        if account.contract_id != MULTISIG_POLICY_CONTRACT_ID || account.initial_policy.threshold != 2 || account.initial_policy.member_count != 3 { return Err(GuardianSignError::PolicyMismatch); }
-        for member in account.initial_policy.member_hashes { validate_hash(member)?; }
-        if self.multisig_fingerprint == Hash4::ZERO { return Err(GuardianSignError::AccountIdentityConflict); }
-        if self.approved_contracts.windows(2).any(|w| w[0].contract_id >= w[1].contract_id) || self.chains.windows(2).any(|w| w[0].chain_index >= w[1].chain_index) { return Err(mismatch); }
-        let approved: BTreeSet<_> = self.approved_contracts.iter().map(|c| c.contract_id).collect();
-        if [0, MULTISIG_POLICY_CONTRACT_ID, 2, 3].iter().any(|id| !approved.contains(id)) { return Err(mismatch); }
-        let mut chain_ids = BTreeSet::new();
-        for chain in &self.chains {
-            if chain.chain_id == U256::ZERO || !chain_ids.insert(chain.chain_id) || chain.genesis_hash.0 == [0; 32]
-                || [chain.bridge, chain.state_manager].iter().any(|a| a.0 == [0; 20])
-                || chain.token_mappings.is_empty() || chain.token_mappings.len() > 65536
-                || chain.token_mappings.windows(2).any(|w| w[0].token >= w[1].token) { return Err(mismatch); }
-            for mapping in &chain.token_mappings {
-                if !approved.contains(&mapping.l2_contract_id) { return Err(mismatch); }
-            }
-        }
-        for contract in &self.approved_contracts {
-            contract.contract_leaf_json.decode()?;
-            let mut method_names = BTreeSet::new();
-            let mut method_ids = BTreeSet::new();
-            for method in &contract.methods {
-                if !method_names.insert(&method.name) || !method_ids.insert(method.method_id) { return Err(mismatch); }
-            }
-            if let Some(layout) = contract.withdrawal_layout {
-                if layout.capacity == 0 || layout.subslot_base % 4 != 0 || layout.subslot_base.checked_add(layout.capacity.checked_mul(4).ok_or(mismatch)?).is_none() { return Err(mismatch); }
-            }
-        }
-        Ok(())
+        GuardianSignRequest::from_canonical_bytes(&signed.request_bytes)?.validate_authorization(self)
     }
 }
 
@@ -548,9 +487,9 @@ pub(crate) fn history_origin(address: SocketAddr) -> Result<String, GuardianSign
     Ok(origin)
 }
 impl GuardianRuntimeConfig {
-    pub fn validate(&self, authorization: &GuardianAuthorization) -> Result<(), GuardianSignError> {
+    pub fn validate(&self, config: &GuardianConfig) -> Result<(), GuardianSignError> {
         if self.listen_address.parse::<SocketAddr>().is_err()
-            || self.history_urls.is_empty() || self.l1_rpc_urls.len() != authorization.chains.len() { return Err(GuardianSignError::AuthorizationMismatch); }
+            || self.history_urls.is_empty() || self.l1_rpc_urls.len() != config.l1_chains.len() { return Err(GuardianSignError::AuthorizationMismatch); }
         let mut history = BTreeSet::new();
         for endpoint in &self.history_urls {
             validate_endpoint(endpoint, true, true)?;
@@ -558,7 +497,7 @@ impl GuardianRuntimeConfig {
         }
         let mut chains = BTreeSet::new();
         for endpoint in &self.l1_rpc_urls {
-            authorization.chain(endpoint.chain_index)?;
+            config.chain(endpoint.chain_index)?;
             if !chains.insert(endpoint.chain_index) { return Err(GuardianSignError::AuthorizationMismatch); }
             validate_endpoint(&endpoint.rpc_url, false, false)?;
         }
@@ -583,12 +522,13 @@ impl GuardianAccount {
     pub fn validate(&self) -> Result<(), GuardianSignError> {
         if !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID
             || self.imported_nonce.is_some_and(|n| !canonical_field(n))
-            || self.authorization_sha256.0 == [0; 32]
+            || self.account_public_key == Hash4::ZERO
             || (self.imported_nonce.is_none()) != self.imported_ending_leaf.is_none()
             || self.withdrawal_chains.len() > 256
             || self.withdrawal_chains.windows(2).any(|pair| pair[0].0 >= pair[1].0)
             || (self.state == GuardianAccountState::Halted) != self.halt_reason.is_some() { return Err(GuardianSignError::DatabaseUnavailable); }
         validate_hash(self.last_checkpoint_hash)?;
+        validate_hash(self.account_public_key)?;
         if let Some(leaf) = self.imported_ending_leaf { validate_hash(leaf)?; }
         for (_, count, frontier, root) in &self.withdrawal_chains {
             validate_hash(*root)?;
@@ -614,7 +554,7 @@ pub fn validate_changed_deposit_tree_states(request: &GuardianSignRequest, depos
 /// `included_deposit_tree_states` is the full included map. The caller proved `checkpoint_hash` is the bound checkpoint leaf. This does not halt or touch indexes.
 pub fn advance_included_account(account: &GuardianAccount, included_deposit_tree_states: &[DepositTreeState], session: &GuardianSession, deposit_tree_states: &[DepositTreeState], checkpoint_id: u64, checkpoint_hash: Hash4) -> Result<(GuardianAccount, Vec<DepositTreeState>), GuardianSignError> {
     let request = session.record.request_json.decode()?;
-    if request.authorization_sha256 != account.authorization_sha256 { return Err(GuardianSignError::AuthorizationMismatch); }
+    if request.network_magic != account.network_magic || request.user_id != account.user_id || request.decode_trace()?.meta.public_key != account.account_public_key { return Err(GuardianSignError::AccountIdentityConflict); }
     let next = account.imported_nonce.unwrap_or(0).checked_add(1).ok_or(GuardianSignError::SessionHistoryUnavailable)?;
     if session.nonce != next { return Err(GuardianSignError::SessionHistoryUnavailable); }
     if session.record.included_checkpoint_id != checkpoint_id || session.record.included_checkpoint_hash != checkpoint_hash {
@@ -693,9 +633,9 @@ pub fn withdrawal_tree_leaf(record: &WithdrawalBurnRecord) -> Hash4 {
 
 
 impl GuardianSessionRecord {
-    pub fn validate(&self, authorization: &GuardianAuthorization) -> Result<GuardianSignRequest, GuardianSignError> {
+    pub fn validate(&self, config: &GuardianConfig) -> Result<GuardianSignRequest, GuardianSignError> {
         let request = self.request_json.decode()?;
-        request.validate_authorization(authorization)?;
+        request.validate_authorization(config)?;
         validate_hash(self.included_checkpoint_hash)?;
         let signatures = self.signatures_json.decode()?;
         if signatures.member_indices.len() != 2 || signatures.signatures.len() != 2
@@ -754,9 +694,9 @@ impl GuardianSignRequest {
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GuardianSignError> {
         if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::MalformedRequest); }
         let mut input = RequestBytes { remaining: bytes };
-        if input.take::<8>()? != *b"PSYGS001" { return Err(GuardianSignError::MalformedRequest); }
-        let schema_version = input.u32()?; let authorization_sha256 = Hex(input.take()?);
-        let network_magic = input.u64()?; let genesis_hash = Hex(input.take()?);
+        if input.take::<8>()? != *b"PSYGS002" { return Err(GuardianSignError::MalformedRequest); }
+        let schema_version = input.u32()?;
+        let network_magic = input.u64()?;
         let user_id = input.u64()?; let session_nonce = input.u64()?;
         let operation = match input.u8()? { 0 => GuardianOperation::Bridge, 1 => GuardianOperation::Bootstrap, 2 => GuardianOperation::ReplacePolicy, _ => return Err(GuardianSignError::MalformedRequest) };
         let length = input.count(input.remaining.len())?;
@@ -774,7 +714,7 @@ impl GuardianSignRequest {
             withdrawal_records.push(WithdrawalBurnRecord { sender_user_id: input.u32()?, token_contract_id: input.u32()?, destination_chain_index: input.u8()?, token: input.words()?, amount: input.words()?, recipient: input.words()?, nonce: input.words()? });
         }
         if !input.remaining.is_empty() { return Err(GuardianSignError::MalformedRequest); }
-        let request = Self { schema_version, authorization_sha256, network_magic, genesis_hash, user_id, session_nonce, operation, trace_json, deposit_anchors, withdrawal_records };
+        let request = Self { schema_version, network_magic, user_id, session_nonce, operation, trace_json, deposit_anchors, withdrawal_records };
         request.validate()?;
         Ok(request)
     }
@@ -898,14 +838,14 @@ mod tests {
 pub(crate) fn codec_request_fixture() -> GuardianSignRequest {
     use psy_prover::trace::{TraceMeta, SessionAnchor, UpsStartWitness, TxFinalization};
     let trace = TxTrace {
-        meta: TraceMeta { network_magic: 90101, user_id: BRIDGE_USER_ID, public_key: Hash4::ZERO },
+        meta: TraceMeta { network_magic: 90101, user_id: BRIDGE_USER_ID, public_key: codec_config_fixture(90101).account_public_key().unwrap() },
         anchor: SessionAnchor { start_checkpoint_id: 0, checkpoint_leaf: Default::default(), global_state_roots: Default::default(), ups_step_circuit_whitelist_root: Hash4::ZERO },
         ups_start_witness: UpsStartWitness { ups_header: Default::default(), state_roots: Default::default(), checkpoint_tree_proof: Default::default(), user_tree_proof: Default::default(), user_registration_tree_proof: None, proof: None },
         contract_codes: vec![], steps: vec![],
         finalization: TxFinalization { submit_end_cap_input: Default::default(), nonce: GoldilocksField(1), tx_hash: Hash4::ZERO, software_defined_call: Default::default(), sig_hash: Hash4::ZERO },
     };
     let generated = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(ContractCallData::new(vec![])).unwrap()).unwrap();
-    GuardianSignRequest { schema_version: 1, authorization_sha256: approval_tests::authorization_fixture().digest().unwrap(), network_magic: 90101, genesis_hash: Hex([1; 32]), user_id: BRIDGE_USER_ID, session_nonce: 1, operation: GuardianOperation::Bootstrap, trace_json: JsonText::from_value(&generated).unwrap(), deposit_anchors: vec![], withdrawal_records: vec![] }
+    GuardianSignRequest { schema_version: 2, network_magic: 90101, user_id: BRIDGE_USER_ID, session_nonce: 1, operation: GuardianOperation::Bootstrap, trace_json: JsonText::from_value(&generated).unwrap(), deposit_anchors: vec![], withdrawal_records: vec![] }
 }
 
 #[cfg(test)]
@@ -916,21 +856,19 @@ mod request_tests {
     fn request_roundtrip_has_exact_header_widths_and_rejects_noncanonical_bytes() {
         let request = codec_request_fixture();
         let bytes = request.canonical_bytes().unwrap();
-        assert_eq!(&bytes[..8], b"PSYGS001");
-        assert_eq!(&bytes[8..12], &1u32.to_le_bytes());
-        assert_eq!(&bytes[12..44], &request.authorization_sha256.0);
-        assert_eq!(&bytes[44..52], &90101u64.to_le_bytes());
-        assert_eq!(&bytes[52..84], &[1; 32]);
-        assert_eq!(&bytes[84..92], &524288u64.to_le_bytes());
-        assert_eq!(&bytes[92..100], &1u64.to_le_bytes());
-        assert_eq!(bytes[100], 1);
-        assert_eq!(&bytes[101..109], &(request.trace_json.as_str().len() as u64).to_le_bytes());
+        assert_eq!(&bytes[..8], b"PSYGS002");
+        assert_eq!(&bytes[8..12], &2u32.to_le_bytes());
+        assert_eq!(&bytes[12..20], &90101u64.to_le_bytes());
+        assert_eq!(&bytes[20..28], &524288u64.to_le_bytes());
+        assert_eq!(&bytes[28..36], &1u64.to_le_bytes());
+        assert_eq!(bytes[36], 1);
+        assert_eq!(&bytes[37..45], &(request.trace_json.as_str().len() as u64).to_le_bytes());
         assert_eq!(&bytes[bytes.len() - 16..], &[0; 16]);
         assert_eq!(GuardianSignRequest::from_canonical_bytes(&bytes).unwrap().canonical_bytes().unwrap(), bytes);
-        for length in [0, 7, 100, 108, bytes.len() - 1] { assert!(GuardianSignRequest::from_canonical_bytes(&bytes[..length]).is_err()); }
+        for length in [0, 7, 36, 44, bytes.len() - 1] { assert!(GuardianSignRequest::from_canonical_bytes(&bytes[..length]).is_err()); }
         let mut invalid = bytes.clone(); invalid.push(0); assert!(GuardianSignRequest::from_canonical_bytes(&invalid).is_err());
-        let mut invalid = bytes.clone(); invalid[100] = 3; assert!(GuardianSignRequest::from_canonical_bytes(&invalid).is_err());
-        let mut invalid = bytes; invalid[101..109].copy_from_slice(&u64::MAX.to_le_bytes()); assert!(GuardianSignRequest::from_canonical_bytes(&invalid).is_err());
+        let mut invalid = bytes.clone(); invalid[36] = 3; assert!(GuardianSignRequest::from_canonical_bytes(&invalid).is_err());
+        let mut invalid = bytes; invalid[37..45].copy_from_slice(&u64::MAX.to_le_bytes()); assert!(GuardianSignRequest::from_canonical_bytes(&invalid).is_err());
     }
 
     #[test]
@@ -974,8 +912,8 @@ impl GuardianSignResponse {
     }
 }
 impl GuardianSession {
-    pub fn validate(&self, authorization: &GuardianAuthorization) -> Result<(), GuardianSignError> {
-        let request = self.record.validate(authorization)?;
+    pub fn validate(&self, config: &GuardianConfig) -> Result<(), GuardianSignError> {
+        let request = self.record.validate(config)?;
         if self.network_magic != request.network_magic || self.user_id != request.user_id || self.nonce != request.session_nonce
             || self.withdrawal_appends.len() != request.withdrawal_records.len() { return Err(GuardianSignError::StateMismatch); }
         validate_hash(self.starting_leaf_hash)?; validate_hash(self.ending_leaf_hash)?;
@@ -1027,105 +965,53 @@ mod bounds_tests {
 }
 
 #[cfg(test)]
-pub(crate) mod approval_tests {
+pub(crate) fn codec_config_fixture(magic: u64) -> GuardianConfig {
+    let network = serde_json::from_value(serde_json::json!({
+        "magic": format!("0x{magic:x}"), "users_per_realm": 1, "global_user_tree_height": 1, "realm_user_tree_height": 1, "group_realm_height": 1,
+        "guardian_initial_member_hashes": [Hash4::from_values(1, 0, 0, 0), Hash4::from_values(2, 0, 0, 0), Hash4::from_values(3, 0, 0, 0)],
+        "realm_configs": [], "p2p": {"checkpoints_per_epoch": 1}, "coordinator_configs": [{"id": 0, "rpc_url": ["http://coordinator/"]}],
+        "prove_proxy_url": [], "faucet_rpc_url": [], "nostr_relay_url": "", "native_currency": "", "native_currency_decimal": 0,
+        "native_currency_name": "", "fees": {"register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0},
+        "guardian_configs": [], "guardian_history": {"listen_address": "127.0.0.1:15450"}
+    })).unwrap();
+    let chain = |index: u8, id: u64, bridge: u8| ChainEndpoint {
+        chain_index: index, chain_id: U256::from(id), bridge: Hex([bridge; 20]), deployment_block: 0, rpc_url: format!("https://chain{index}.example/rpc"),
+    };
+    GuardianConfig { network, guardian_root: PathBuf::new(), endpoints: std::array::from_fn(|_| "http://127.0.0.1/".into()), history_url: "http://127.0.0.1/".into(), l1_chains: vec![chain(0, 7, 0x11), chain(1, 8, 0x22)] }
+}
+
+#[cfg(test)]
+mod cutover_tests {
     use super::*;
 
-    fn approval() -> ApprovedContract {
-        ApprovedContract {
-            contract_id: MULTISIG_POLICY_CONTRACT_ID,
-            contract_leaf_json: JsonText::from_value(&PsyContractLeaf::default()).unwrap(),
-            methods: vec![], withdrawal_layout: None,
+    #[test]
+    fn old_request_schema_and_removed_fields_are_rejected() {
+        let request = codec_request_fixture();
+        let mut bytes = request.canonical_bytes().unwrap();
+        bytes[..8].copy_from_slice(b"PSYGS001");
+        assert!(GuardianSignRequest::from_canonical_bytes(&bytes).is_err());
+        let mut old = request.clone(); old.schema_version = 1;
+        assert!(old.validate().is_err());
+        for field in ["authorization_sha256", "genesis_hash"] {
+            let mut json = serde_json::to_value(&request).unwrap();
+            json[field] = serde_json::to_value(Hex([1; 32])).unwrap();
+            assert!(GuardianSignRequest::parse(&serde_json::to_vec(&json).unwrap()).is_err());
         }
     }
 
     #[test]
-    fn authorization_is_one_minimal_object_with_deterministic_digest() {
-        let authorization = authorization_fixture();
-        let value = serde_json::to_value(&authorization).unwrap();
-        let fields = value.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>();
-        assert_eq!(fields, BTreeSet::from(["genesis_hash", "bridge_relayer_signing_policy", "multisig_fingerprint", "endcap_verifier_fingerprint", "max_fee", "approved_contracts", "chains"]));
-        let pretty = serde_json::to_vec_pretty(&authorization).unwrap();
-        assert_eq!(GuardianAuthorization::parse(&pretty).unwrap().digest().unwrap(), authorization.digest().unwrap());
-        let mut changed = authorization.clone(); changed.max_fee += 1;
-        assert_ne!(changed.digest().unwrap(), authorization.digest().unwrap());
-        for field in ["version", "account_json", "network_magic", "max_endcap_proof_bytes"] {
-            let mut old = value.clone(); old[field] = serde_json::json!(1);
-            assert!(GuardianAuthorization::parse(&serde_json::to_vec(&old).unwrap()).is_err());
-        }
-    }
-
-    #[test]
-    fn compact_approval_rejects_compiler_payload_and_unknown_fields() {
-        let mut value = serde_json::to_value(approval()).unwrap();
-        value["compiler_artifact_json"] = Value::String("{}".into());
-        assert!(parse_canonical_json::<ApprovedContract>(&serde_json::to_vec(&value).unwrap()).is_err());
-        value.as_object_mut().unwrap().remove("compiler_artifact_json");
-        value["withdrawal_layout"] = serde_json::json!({"subslot_base": 12, "capacity": 4294967296u64});
-        let approved: ApprovedContract = parse_canonical_json(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert_eq!(approved.withdrawal_layout.unwrap().capacity, 4294967296);
-    }
-
-    #[test]
-    fn approved_methods_require_unique_names_and_ids_without_guessed_input_bounds() {
-        let mut auth = authorization_fixture();
-        let first = ApprovedMethod { name: "withdraw".into(), method_id: 7, input_felt_count: u32::MAX };
-        let second = ApprovedMethod { name: "deposit".into(), method_id: 8, input_felt_count: 0 };
-        auth.approved_contracts[0].methods = vec![first.clone(), second.clone()];
-        assert!(auth.validate(1, 1).is_ok());
-        auth.approved_contracts[0].methods[1].name = first.name;
-        assert_eq!(auth.validate(1, 1).unwrap_err(), GuardianSignError::AuthorizationMismatch);
-        auth.approved_contracts[0].methods[1] = second;
-        auth.approved_contracts[0].methods[1].method_id = first.method_id;
-        assert_eq!(auth.validate(1, 1).unwrap_err(), GuardianSignError::AuthorizationMismatch);
-    }
-
-    #[test]
-    fn approved_method_fields_are_required_and_unknown_fields_are_rejected() {
-        let method = ApprovedMethod { name: "withdraw".into(), method_id: 7, input_felt_count: 4 };
-        let value = serde_json::to_value(&method).unwrap();
-        for field in ["name", "method_id", "input_felt_count"] {
-            let mut missing = value.clone();
-            missing.as_object_mut().unwrap().remove(field);
-            assert!(parse_canonical_json::<ApprovedMethod>(&serde_json::to_vec(&missing).unwrap()).is_err());
-        }
-        let mut unknown = value;
-        unknown["unapproved"] = Value::Bool(true);
-        assert!(parse_canonical_json::<ApprovedMethod>(&serde_json::to_vec(&unknown).unwrap()).is_err());
-        let mut contract = serde_json::to_value(approval()).unwrap();
-        contract.as_object_mut().unwrap().remove("methods");
-        assert!(parse_canonical_json::<ApprovedContract>(&serde_json::to_vec(&contract).unwrap()).is_err());
-    }
-    pub(crate) fn authorization_fixture() -> GuardianAuthorization {
-        use psy_vm::ups::multisig::{MultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
-        let mut members = [Hash4::ZERO; 8];
-        members[0] = Hash4::from_values(1, 0, 0, 0);
-        members[1] = Hash4::from_values(2, 0, 0, 0);
-        members[2] = Hash4::from_values(3, 0, 0, 0);
-        let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: MultisigPolicy { version: 1, threshold: 2, member_count: 3, member_hashes: members } };
-        let fingerprint = Hash4::from_values(9, 8, 7, 6);
-        let approved_contracts = [0, MULTISIG_POLICY_CONTRACT_ID, 2, 3].into_iter().map(|contract_id| { let mut contract = approval(); contract.contract_id = contract_id; contract }).collect();
-        GuardianAuthorization {
-            genesis_hash: Hex([1; 32]),
-            bridge_relayer_signing_policy: JsonText::from_value(&account).unwrap(),
-            multisig_fingerprint: fingerprint, max_fee: 2,
-            endcap_verifier_fingerprint: Hash4::from_values(1, 1, 1, 1), approved_contracts,
-            chains: vec![ChainAuthorization {
-                chain_index: 0, chain_id: U256::from(1u64), genesis_hash: Hex([2; 32]), bridge: Hex([3; 20]), state_manager: Hex([4; 20]),
-                deployment_block: 1, token_mappings: vec![TokenMapping { token: Hex([11; 20]), l2_contract_id: 0 }],
-            }],
-        }
-    }
-
-    #[test]
-    fn contract1_authorization_is_accepted_and_contract6_is_rejected() {
-        let mut auth = authorization_fixture();
-        let account = auth.bridge_relayer_signing_policy.decode().unwrap();
-        assert!(auth.validate(1, 1).is_ok());
-        auth.approved_contracts.retain(|contract| contract.contract_id != MULTISIG_POLICY_CONTRACT_ID);
-        assert_eq!(auth.validate(1, 1).unwrap_err(), GuardianSignError::AuthorizationMismatch);
-        auth.approved_contracts = [0, 2, 3, 6].into_iter().map(|contract_id| { let mut contract = approval(); contract.contract_id = contract_id; contract }).collect();
-        let mut wrong = account; wrong.contract_id = 6;
-        auth.bridge_relayer_signing_policy = JsonText::from_value(&wrong).unwrap();
-        assert_eq!(auth.validate(1, 1).unwrap_err(), GuardianSignError::PolicyMismatch);
+    fn initial_account_preserves_order_and_rejects_invalid_members() {
+        let mut config = codec_config_fixture(90101);
+        let account = config.initial_account().unwrap();
+        assert_eq!(account.contract_id, MULTISIG_POLICY_CONTRACT_ID);
+        assert_eq!(account.initial_policy.member_hashes[..3], config.network.guardian_initial_member_hashes.unwrap());
+        assert_eq!(account.initial_policy.member_hashes[3..], [Hash4::ZERO; 5]);
+        let key = config.account_public_key().unwrap();
+        config.network.guardian_initial_member_hashes.as_mut().unwrap().swap(0, 1);
+        assert_ne!(config.account_public_key().unwrap(), key);
+        config.network.guardian_initial_member_hashes.as_mut().unwrap()[0] = Hash4::ZERO;
+        assert!(config.initial_account().is_err());
+        config.network.guardian_initial_member_hashes = Some([Hash4::from_values(1, 0, 0, 0); 3]);
+        assert!(config.initial_account().is_err());
     }
 }

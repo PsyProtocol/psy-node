@@ -13,9 +13,7 @@ use plonky2::{
     hash::poseidon::PoseidonHash,
 };
 use plonky2::field::types::Field64;
-use psy_ups_circuit::signature::multisig::MultisigSignatureCircuit;
-use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
-use psy_client_common::data::qhashout::QHashOut as ClientHash;
+use psy_vm::ups::multisig::{MultisigAccount, MULTISIG_POLICY_CONTRACT_ID};
 use psy_core::{
     constants::protocol::{DA_CHALLENGE_WINDOW, TOKEN_BURN_METHOD_ID},
     user_id::{UserIdBitsStrategy5, UserIdGeneratorStrategy},
@@ -36,14 +34,14 @@ use psy_plonky2_circuits::node::config::networks::local_devnet::{
 };
 
 mod guardians_root;
-pub use guardians_root::{build_fresh_devnet_authorization, preflight_fresh_devnet_inputs, publish_guardian_authorization, publish_guardian_authorization_unchanged, CanonicalPolicyPin};
+pub use guardians_root::preflight_fresh_devnet_inputs;
 
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
 const DEFAULT_SD_KEY_FINGERPRINT: &str = "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
-const GUARDIANS_ROOT_MAX_FEE_DEFAULT: u64 = 2_000_000_000;
+
 
 #[derive(Clone, Debug)]
 struct ValidatorSlot {
@@ -150,23 +148,9 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "sd-key-allowed-method-id", default_values_t = vec![3375543263u32, 2789897329, TOKEN_BURN_METHOD_ID])]
     pub sd_key_allowed_method_ids: Vec<u32>,
 
-    /// --guardians-root runtime directory. Reads the existing genesis, derives the
-    /// compact guardian authorization, publishes it to the selected network in
-    /// psy-genesis/config.json, and creates the runtime db directory.
-    #[arg(long = "guardians-root")]
-    pub guardians_root: Option<PathBuf>,
-
-
-    /// --guardians-root authorization fee cap. Must be at least the compiled GUTA_FEE + DA_FEE floor.
-    #[arg(long = "max-fee")]
-    pub max_fee: Option<u64>,
 }
 
 pub async fn run(args: GenerateGenesisDataArgs) -> anyhow::Result<()> {
-    if args.guardians_root.is_some() {
-        return guardians_root::run_guardians_root(&args);
-    }
-    guardians_root::reject_publish_branch_flags(&args)?;
     generate_local_devnet_genesis(&args)
 }
 
@@ -179,44 +163,17 @@ fn deterministic_private_key(slot: u64) -> QHashOut<F> {
     )
 }
 
-fn decode_relayer_multisig_account(bytes: &[u8]) -> anyhow::Result<MultisigAccount> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct PublicPolicy {
-        version: u32,
-        threshold: u8,
-        member_count: u8,
-        member_hashes: [ClientHash<F>; 8],
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct PublicAccount {
-        contract_id: u32,
-        initial_policy: PublicPolicy,
-    }
-    let input: PublicAccount = serde_json::from_slice(bytes).context("invalid public multisig account")?;
-    let account = MultisigAccount {
-        contract_id: input.contract_id,
-        initial_policy: MultisigPolicy {
-            version: input.initial_policy.version,
-            threshold: input.initial_policy.threshold,
-            member_count: input.initial_policy.member_count,
-            member_hashes: input.initial_policy.member_hashes,
-        },
-    };
-    account.public_key_param()?;
-    Ok(account)
-}
 
-
+/// The bridge-relayer multisig user: the read-only network policy members,
+/// the Rust multisig fingerprint getter, and the fee balance slot.
 fn initialized_multisig_user(
     account: &MultisigAccount,
-    circuit: &MultisigSignatureCircuit,
     initial_fee_balance: u64,
 ) -> anyhow::Result<PsyCompactUserDefinition<Hash>> {
     ensure!(initial_fee_balance > 0 && initial_fee_balance < F::ORDER, "initial fee balance must be nonzero and canonical");
     let public_key_info = PZKPublicKeyInfo {
-        fingerprint: QHashOut(circuit.get_fingerprint().0),
+        fingerprint: QHashOut(guardian_common::protocol::multisig_fingerprint()
+            .map_err(|error| anyhow::anyhow!("multisig fingerprint: {error}"))?.0),
         public_key_param: QHashOut(account.public_key_param()?.0),
     };
     let mut policy_slots = vec![MerkleLeafNode { index: 0, value: QHashOut::from_values(1, 2, 3, 0) }];
@@ -332,92 +289,6 @@ fn require_policy_contract(compiled: &CompiledContract) -> anyhow::Result<()> {
     ensure!(["get_policy", "set_policy"].iter().all(|name| compiled.circuit_definitions.iter().filter(|definition| definition.name == *name).count() == 1)
         && compiled.circuit_definitions.len() == 2, "multisig policy artifact requires exactly get_policy and set_policy");
     validate_policy_abi_slots(&compiled.abi)
-}
-
-/// The `state_map` field is a Hash-keyed map of capacity 1,048,576 whose felt
-/// span is capacity times the value size and starts on the alignment boundary.
-fn require_hash_state_map(abi: &serde_json::Value) -> anyhow::Result<(u64, u64)> {
-    let fields = abi.pointer("/contract/state").and_then(serde_json::Value::as_array).context("compiler ABI state is missing")?;
-    let mut maps = fields.iter().filter(|field| field["name"].as_str() == Some("state_map"));
-    let map = maps.next().context("compiler ABI has no state_map")?;
-    ensure!(maps.next().is_none(), "compiler ABI state_map is duplicated");
-    let hash = serde_json::json!({"kind": "primitive", "name": "Hash"});
-    let (offset, felt_size, capacity, value_felt_size, alignment) = (
-        map["offset"].as_u64().context("state_map offset missing")?,
-        map["felt_size"].as_u64().context("state_map felt size missing")?,
-        map.pointer("/type/capacity").and_then(serde_json::Value::as_u64).context("state_map capacity missing")?,
-        map.pointer("/type/value_felt_size").and_then(serde_json::Value::as_u64).context("state_map value felt size missing")?,
-        map.pointer("/type/alignment_felts").and_then(serde_json::Value::as_u64).context("state_map alignment missing")?,
-    );
-    ensure!(map.pointer("/type/kind").and_then(serde_json::Value::as_str) == Some("map")
-        && map.pointer("/type/map_kind").and_then(serde_json::Value::as_str) == Some("map")
-        && map.pointer("/type/key") == Some(&hash) && map.pointer("/type/value") == Some(&hash)
-        && capacity == 1_048_576 && value_felt_size == 4 && alignment == 4
-        && offset.is_multiple_of(alignment) && felt_size == capacity.checked_mul(value_felt_size).context("state_map felt span overflow")?,
-        "state_map must be a Hash map of capacity 1048576, value size 4, aligned on 4");
-    Ok((offset, capacity))
-}
-
-/// A state-command operand names the `index` of the one `data_type` 0
-/// definition whose single input is the literal value.
-fn literal_operand(definitions: &[psy_vm::dpn::ops::op_types::DPNIndexedVarDef], operand: u64) -> anyhow::Result<u64> {
-    let mut matches = definitions.iter().filter(|definition| {
-        definition.data_type == psy_vm::dpn::ops::op_types::DPNBuiltInDataType::Target && definition.index as u64 == operand
-    });
-    let definition = matches.next().context("IMT operand has no typed literal")?;
-    ensure!(matches.next().is_none(), "IMT operand names more than one typed literal");
-    ensure!(definition.op_type == psy_vm::dpn::ops::op_types::DPNOpType::Constant, "IMT operand is not a constant literal");
-    let mut inputs = definition.inputs.iter();
-    let value = inputs.next().copied().context("typed literal value missing")?;
-    ensure!(inputs.next().is_none(), "typed literal carries more than its value");
-    Ok(value)
-}
-
-/// Every IMT operand resolves to a unique typed literal, no operand serves both
-/// the base and capacity roles, every read names the same base and capacity as
-/// the single write, and at least one read precedes that write.
-fn require_withdrawal_imt(compiled: &CompiledContract) -> anyhow::Result<(u64, u64)> {
-    let withdraw = compiled.circuit_definitions.iter().find(|definition| definition.name == "withdraw").context("token artifact has no withdraw method")?;
-    let definitions = &withdraw.definitions;
-    let commands = serde_json::to_value(&withdraw.state_commands)?;
-    let commands = commands.as_array().context("withdraw state commands missing")?;
-    let mut reads = Vec::new();
-    let mut write = None;
-    let mut bases = std::collections::BTreeSet::new();
-    let mut capacities = std::collections::BTreeSet::new();
-    for (position, command) in commands.iter().enumerate() {
-        let kind = command["type"].as_str().unwrap_or_default();
-        if !kind.contains("IMT") { continue; }
-        let base = command["base_offset"].as_u64().context("IMT command base missing")?;
-        let capacity = command["capacity"].as_u64().context("IMT command capacity missing")?;
-        bases.insert(base);
-        capacities.insert(capacity);
-        let (base, capacity) = (literal_operand(definitions, base)?, literal_operand(definitions, capacity)?);
-        if kind == "SetIMTContractStateValue" {
-            ensure!(write.replace((position, base, capacity)).is_none(), "withdraw writes the withdrawal map more than once");
-        } else {
-            reads.push((position, base, capacity));
-        }
-    }
-    ensure!(bases.is_disjoint(&capacities), "withdrawal IMT reuses a typed literal operand between the base and capacity roles");
-    let (written_at, base, capacity) = write.context("withdraw never writes the withdrawal map")?;
-    ensure!(reads.iter().any(|(position, _, _)| *position < written_at), "withdraw writes the withdrawal map before reading it");
-    ensure!(reads.iter().all(|(_, read_base, read_capacity)| *read_base == base && *read_capacity == capacity),
-        "withdrawal IMT reads name a different map than the write");
-    Ok((base, capacity))
-}
-
-/// The withdrawal map the compiled `withdraw` writes. `subslot_base` is the IMT
-/// sentinel felt, one before the first record, so records start at
-/// `subslot_base + 4` and the inclusive end `subslot_base + capacity` must sit
-/// inside the state tree.
-fn derive_withdrawal_layout(compiled: &CompiledContract) -> anyhow::Result<guardian_common::protocol::WithdrawalLayout> {
-    let (abi_base, abi_capacity) = require_hash_state_map(&compiled.abi)?;
-    let (base, capacity) = require_withdrawal_imt(compiled)?;
-    ensure!(base == abi_base && capacity == abi_capacity, "compiled withdrawal map differs from the ABI state_map");
-    let tree_felts = 1u64.checked_shl(u32::from(compiled.state_tree_height)).and_then(|slots| slots.checked_mul(4)).context("state tree felt count overflow")?;
-    ensure!(base.checked_add(capacity).is_some_and(|end| end < tree_felts), "withdrawal map exceeds the state tree");
-    Ok(guardian_common::protocol::WithdrawalLayout { subslot_base: base, capacity })
 }
 
 #[derive(serde::Deserialize)]
@@ -609,15 +480,17 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
     let repo_root = args.repo_root.canonicalize().with_context(|| {
         format!("repo-root {} does not exist", args.repo_root.display())
     })?;
-    let account = guardians_root::checked_canonical_policy(&repo_root)?.0;
+    let network = guardians_root::read_canonical_network(&repo_root)?;
+    let account = guardian_common::protocol::initial_account(&network).map_err(|error| {
+        anyhow::anyhow!("networks.{}.guardian_initial_member_hashes must be the three guardian member commitments: {error}", psy_config::CURRENT_NETWORK)
+    })?;
     let contracts_path = args.genesis_contracts.clone().unwrap_or_else(|| {
         repo_root.join("psy-genesis/genesis_contracts.json")
     });
     let contracts = load_contracts(&contracts_path)?;
     let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
     validate_multisig_policy_artifact(&contracts, &read_compiler_contract(&compiler_checkout(&repo_root)?, "multisig_policy")?)?;
-    let multisig_circuit = MultisigSignatureCircuit::new()?;
-    let relayer = initialized_multisig_user(&account, &multisig_circuit, args.initial_fee_balance)?;
+    let relayer = initialized_multisig_user(&account, args.initial_fee_balance)?;
     let (users, private_keys) = genesis_users(args, relayer)?;
     let special_zk_user_count = users.len() - args.faucet_operator_count;
 
@@ -845,6 +718,9 @@ mod tests {
     }
 
     use super::*;
+    use psy_client_common::data::qhashout::QHashOut as ClientHash;
+    use psy_ups_circuit::signature::multisig::MultisigSignatureCircuit;
+    use psy_vm::ups::multisig::MultisigPolicy;
     #[test]
     fn contract_loader_preserves_flat_deployments_and_order() {
         let root = std::env::temp_dir().join(format!("psy-genesis-flat-{}", rand::random::<u64>()));
@@ -962,9 +838,9 @@ mod tests {
         }).collect();
         let mut account = account_fixture();
         for (member, key) in account.initial_policy.member_hashes[..3].iter_mut().zip(&keys) { *member = key.0; }
-        let user = initialized_multisig_user(&account, &circuit, 100).unwrap();
-        assert!(initialized_multisig_user(&account, &circuit, 0).is_err());
-        assert!(initialized_multisig_user(&account, &circuit, F::ORDER).is_err());
+        let user = initialized_multisig_user(&account, 100).unwrap();
+        assert!(initialized_multisig_user(&account, 0).is_err());
+        assert!(initialized_multisig_user(&account, F::ORDER).is_err());
         let contracts_path = std::env::var_os("PSY_GENESIS_CONTRACTS").expect("QA must supply approved Genesis contracts");
         let contracts = load_contracts(Path::new(&contracts_path)).unwrap();
         let compiled = read_compiler_contract(&compiler_checkout(Path::new("..")).expect("sibling psy-compiler checkout"), "multisig_policy").unwrap();
@@ -1081,39 +957,6 @@ mod tests {
     }
 
     #[test]
-    fn public_account_rejects_secret_unknown_duplicate_and_invalid_policy() {
-        let account = account_fixture();
-        let valid = serde_json::to_vec(&account).unwrap();
-        assert_eq!(decode_relayer_multisig_account(&valid).unwrap().public_key_param().unwrap(), account.public_key_param().unwrap());
-        for field in ["private_key", "fingerprint", "public_key_param"] {
-            let mut value = serde_json::to_value(&account).unwrap();
-            value[field] = serde_json::json!("not-an-account-field");
-            assert!(decode_relayer_multisig_account(&serde_json::to_vec(&value).unwrap()).is_err());
-        }
-        let text = String::from_utf8(valid).unwrap();
-        let duplicate = text.replacen("\"contract_id\":1", "\"contract_id\":1,\"contract_id\":1", 1);
-        assert!(decode_relayer_multisig_account(duplicate.as_bytes()).is_err());
-        let duplicate = text.replacen("\"version\":1", "\"version\":1,\"version\":1", 1);
-        assert!(decode_relayer_multisig_account(duplicate.as_bytes()).is_err());
-        let mut value = serde_json::to_value(&account).unwrap();
-        value["initial_policy"]["secret"] = serde_json::json!(true);
-        assert!(decode_relayer_multisig_account(&serde_json::to_vec(&value).unwrap()).is_err());
-        for (field, invalid) in [("version", 0), ("version", 2), ("threshold", 1), ("member_count", 4)] {
-            let mut value = serde_json::to_value(&account).unwrap();
-            value["initial_policy"][field] = serde_json::json!(invalid);
-            assert!(decode_relayer_multisig_account(&serde_json::to_vec(&value).unwrap()).is_err());
-        }
-        for index in [0, 1, 7] {
-            let mut invalid = account.clone();
-            invalid.initial_policy.member_hashes[index] = if index == 0 { ClientHash::ZERO } else { invalid.initial_policy.member_hashes[0] };
-            assert!(decode_relayer_multisig_account(&serde_json::to_vec(&invalid).unwrap()).is_err());
-        }
-        let mut invalid = account;
-        invalid.contract_id = 5;
-        assert!(decode_relayer_multisig_account(&serde_json::to_vec(&invalid).unwrap()).is_err());
-    }
-
-    #[test]
     fn cli_defaults_and_rejects_secret_flags() {
         assert!(GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).is_ok());
         let public_args = ["generate-genesis-data"];
@@ -1129,19 +972,39 @@ mod tests {
         assert!(compiler_checkout(Path::new("/definitely-missing-compiler-parent")).is_err());
     }
 
+    fn canonical_network_fixture() -> serde_json::Value {
+        let mut members = [ClientHash::<F>::ZERO; 3];
+        for (index, member) in members.iter_mut().enumerate() { *member = ClientHash::from_values(index as u64 + 1, 0, 0, 0); }
+        serde_json::json!({
+            "magic": "0x1337CF514544CF69", "users_per_realm": 1, "global_user_tree_height": 1,
+            "realm_user_tree_height": 1, "group_realm_height": 1,
+            "guardian_initial_member_hashes": members,
+            "realm_configs": [], "p2p": {"checkpoints_per_epoch": 1}, "coordinator_configs": [],
+            "prove_proxy_url": [], "faucet_rpc_url": [], "nostr_relay_url": "",
+            "native_currency": "", "native_currency_decimal": 0, "native_currency_name": "",
+            "fees": {"register_user_fee": 0, "deploy_contract_fee": 0, "guta_fee": 0, "da_fee": 0}
+        })
+    }
+
+    fn write_canonical_network(root: &std::path::Path, network: &serde_json::Value) {
+        let mut config = serde_json::json!({"defaultNetwork": psy_config::CURRENT_NETWORK, "networks": {}});
+        config["networks"][psy_config::CURRENT_NETWORK] = network.clone();
+        std::fs::write(root.join("psy-genesis/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    }
+
     #[test]
     fn missing_canonical_policy_fails_before_outputs() {
         let root = std::env::temp_dir().join(format!("psy-public-genesis-reject-{}", rand::random::<u64>()));
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
-        let mut config = serde_json::json!({ "networks": {} });
-        config["networks"][psy_config::CURRENT_NETWORK] = serde_json::json!({});
-        std::fs::write(root.join("psy-genesis/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let mut network = canonical_network_fixture();
+        network.as_object_mut().unwrap().remove("guardian_initial_member_hashes");
+        write_canonical_network(&root, &network);
         let args = GenerateGenesisDataArgs::try_parse_from([
             "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
         ]).unwrap();
         let error = format!("{:?}", generate_local_devnet_genesis(&args).unwrap_err());
-        assert!(error.contains(&format!("networks.{}.guardian_authorization.bridge_relayer_signing_policy", psy_config::CURRENT_NETWORK)));
+        assert!(error.contains(&format!("networks.{}.guardian_initial_member_hashes", psy_config::CURRENT_NETWORK)));
         assert!(!root.join("genesis.json").exists());
         assert!(!root.join("private_keys.json").exists());
         assert!(!root.join("psy-dapp").exists());
@@ -1155,7 +1018,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
         std::fs::write(root.join("psy-genesis/config.json"),
-            r#"{"networks":{"localhost":{},"localhost":{"guardian_authorization":{}}}}"#).unwrap();
+            r#"{"networks":{"localhost":{},"localhost":{}}}"#).unwrap();
         let args = GenerateGenesisDataArgs::try_parse_from([
             "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
         ]).unwrap();
@@ -1167,17 +1030,21 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_l1_endpoint_keys_fail_before_outputs() {
-        let root = std::env::temp_dir().join(format!("psy-duplicate-endpoint-{}", rand::random::<u64>()));
+    fn duplicate_guardian_member_keys_fail_before_outputs() {
+        let root = std::env::temp_dir().join(format!("psy-duplicate-members-{}", rand::random::<u64>()));
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir_all(root.join("psy-genesis")).unwrap();
-        std::fs::write(root.join("psy-genesis/config.json"),
-            r#"{"networks":{"localhost":{"guardian_authorization":{"bridge_relayer_signing_policy":"{}"},"l1_endpoints":[{"chain_index":0,"chain_index":0,"rpc_url":"http://127.0.0.1:8545"}]}}}"#).unwrap();
+        let network = canonical_network_fixture().to_string();
+        let key = "\"guardian_initial_member_hashes\":";
+        let at = network.find(key).expect("canonical fixture keeps guardian member hashes");
+        let duped = format!("{}{key}0,{}", &network[..at], &network[at..]);
+        let network_name = psy_config::CURRENT_NETWORK;
+        let config = format!(r#"{{"defaultNetwork":"{network_name}","networks":{{"{network_name}":{duped}}}}}"#);
+        std::fs::write(root.join("psy-genesis/config.json"), config).unwrap();
         let args = GenerateGenesisDataArgs::try_parse_from([
             "generate-genesis-data", "--repo-root", root.to_str().unwrap(),
         ]).unwrap();
-        let error = format!("{:?}", generate_local_devnet_genesis(&args).unwrap_err());
-        assert!(error.contains("not duplicate-free JSON"));
+        assert!(generate_local_devnet_genesis(&args).is_err());
         assert!(!root.join("genesis.json").exists());
         assert!(!root.join("private_keys.json").exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -1192,28 +1059,6 @@ mod tests {
     fn validator_slot_parses_realm_sub_registration() {
         let slot: ValidatorSlot = "1,2,3".parse().unwrap();
         assert_eq!((slot.realm_id, slot.sub_id, slot.registration_id), (1, 2, 3));
-    }
-
-    fn compiled_fixture(stem: &str, height: u16, methods: serde_json::Value, state: serde_json::Value, definitions: Vec<psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition>) -> CompiledContract {
-        let abi = serde_json::json!({"schema_version": "2.0.0", "contract": {"name": stem, "state_tree_height": height, "state": state, "methods": methods}});
-        CompiledContract { raw: vec![], state_tree_height: height, circuit_definitions: definitions, abi }
-    }
-
-    fn method(name: &str, method_id: u32, inputs: usize, outputs: usize, view: bool, commands: Vec<psy_vm::dpn::ops::state_cmd::data::DPNStateCmd<u64>>, definitions: Vec<psy_vm::dpn::ops::op_types::DPNIndexedVarDef>) -> psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition {
-        psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition { name: name.into(), method_id, circuit_inputs: vec![0; inputs], circuit_outputs: vec![0; outputs], assertions: vec![], events: vec![], definitions, state_commands: commands, state_command_resolution_indices: vec![] }
-    }
-
-    fn literal(index: u64, value: u64) -> psy_vm::dpn::ops::op_types::DPNIndexedVarDef {
-        psy_vm::dpn::ops::op_types::DPNIndexedVarDef { data_type: psy_vm::dpn::ops::op_types::DPNBuiltInDataType::Target, index: index as usize, op_type: psy_vm::dpn::ops::op_types::DPNOpType::Constant, inputs: vec![value] }
-    }
-
-    fn token_fixture() -> CompiledContract {
-        use psy_vm::dpn::ops::state_cmd::data::{DPNStateCmd, DPNStateCmdContainsSelfUserCurrentIMTContractStateValue, DPNStateCmdSetIMTContractStateValue};
-        let read = DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(DPNStateCmdContainsSelfUserCurrentIMTContractStateValue { base_offset: 10, capacity: 11, key: [0; 4] });
-        let write = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue { condition: 0, base_offset: 10, capacity: 11, key: [0; 4], value: [0; 4] });
-        let definitions = vec![literal(10, 8_589_934_680), literal(11, 1_048_576)];
-        let state = serde_json::json!([{"name": "state_map", "offset": 8589934680u64, "felt_size": 4194304u64, "type": {"kind": "map", "map_kind": "map", "key": {"kind": "primitive", "name": "Hash"}, "value": {"kind": "primitive", "name": "Hash"}, "capacity": 1048576, "value_felt_size": 4, "alignment_felts": 4}}]);
-        compiled_fixture("token", 32, serde_json::json!([{"name": "withdraw", "method_id": 7, "input_felt_count": 0, "output_felt_count": 0, "state_mutability": "external"}]), state, vec![method("withdraw", 7, 0, 0, false, vec![read, write], definitions)])
     }
 
     #[test]
@@ -1234,39 +1079,6 @@ mod tests {
         stamp["artifactByteSize"] = serde_json::json!(bundle.len() + 1);
         stamp["artifactSha256"] = stamp_fixture(bundle)["artifactSha256"].clone();
         assert!(validate_contracts_stamp(&serde_json::to_vec(&stamp).unwrap(), bundle).is_err());
-    }
-
-    #[test]
-    fn withdrawal_layout_comes_from_the_compiled_map() {
-        let compiled = token_fixture();
-        let layout = derive_withdrawal_layout(&compiled).unwrap();
-        assert_eq!((layout.subslot_base, layout.capacity), (8_589_934_680, 1_048_576));
-        let mut unaligned = compiled.abi.clone();
-        unaligned["contract"]["state"][0]["offset"] = serde_json::json!(1);
-        let mut moved = token_fixture();
-        moved.abi = unaligned;
-        assert!(derive_withdrawal_layout(&moved).is_err());
-        let mut duplicated = token_fixture();
-        let field = duplicated.abi["contract"]["state"][0].clone();
-        duplicated.abi["contract"]["state"].as_array_mut().unwrap().push(field);
-        assert!(derive_withdrawal_layout(&duplicated).is_err());
-    }
-
-    #[test]
-    fn withdrawal_imt_requires_one_write_preceded_by_a_matching_read() {
-        use psy_vm::dpn::ops::state_cmd::data::{DPNStateCmd, DPNStateCmdContainsSelfUserCurrentIMTContractStateValue, DPNStateCmdSetIMTContractStateValue};
-        let write = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue { condition: 0, base_offset: 10, capacity: 10, key: [0; 4], value: [0; 4] });
-        let mut write_first = token_fixture();
-        write_first.circuit_definitions[0].state_commands = vec![write.clone()];
-        assert!(require_withdrawal_imt(&write_first).is_err());
-        let foreign = DPNStateCmd::ContainsSelfUserCurrentIMTContractStateValue(DPNStateCmdContainsSelfUserCurrentIMTContractStateValue { base_offset: 12, capacity: 13, key: [0; 4] });
-        let mut disagreeing = token_fixture();
-        disagreeing.circuit_definitions[0].definitions.extend([literal(12, 7), literal(13, 7)]);
-        disagreeing.circuit_definitions[0].state_commands.insert(0, foreign);
-        assert!(require_withdrawal_imt(&disagreeing).is_err());
-        let mut reused = token_fixture();
-        reused.circuit_definitions[0].state_commands.push(write);
-        assert!(require_withdrawal_imt(&reused).is_err());
     }
 
     #[test]

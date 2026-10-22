@@ -10,8 +10,7 @@
 //! never-used guardian keys. Databases are absent; first service start creates
 //! each one. There is no create-db command and no TLS.
 //!
-//! The public manifest.json stays outside guardians-root outputs. See §4.5 for its
-//! exact field set. Secret-consuming user APIs run in the ignored
+//! The public manifest.json stays outside guardians-root outputs. Its `l1_configs` lists the existing local deployment documents; the runner passes each unchanged and aggregates nothing. See §4.5 for the remaining field set. Secret-consuming user APIs run in the ignored
 //! `guardian_user_operation` child of this executable. The parent passes only
 //! the manifest directory and operation name; the child writes
 //! `operations/<operation>.json` at mode 0600.
@@ -20,7 +19,7 @@ use std::{fs, io::Write, net::SocketAddr, os::unix::fs::{MetadataExt, OpenOption
 
 use anyhow::{ensure, Context};
 use bincode::Options;
-use guardian_common::{protocol::{parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianAuthorization, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, TokenMapping, BRIDGE_USER_ID, MAX_BODY_BYTES}};
+use guardian_common::{protocol::{parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, BRIDGE_USER_ID, MAX_BODY_BYTES}};
 use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
@@ -34,12 +33,21 @@ use tokio::{net::TcpStream, process::{Child, Command}, time::{sleep, timeout, In
 
 const CLI: &str = env!("CARGO_BIN_EXE_psy_relayer_cli");
 const USER: u64 = BRIDGE_USER_ID;
-// Test-only ABI, matching psy-contracts/src/{StateManager,Bridge}.sol.
+// Test-only ABI, matching psy-contracts/src/{StateManager,Bridge,Router}.sol.
 sol! {
     function lastFinalizedCheckpointId() external view returns (uint64);
     function knownWithdrawalSubtreeRoots(bytes32 root) external view returns (bool);
+    function addressesProvider() external view returns (address);
+    function STATE_MANAGER_ID() external view returns (bytes32);
+    function getAddress(bytes32 id) external view returns (address);
+    function l1ToL2Token(address l1Token) external view returns (bytes32);
     event DepositRecorded(uint32 indexed index, bytes32 shieldAddress, address indexed token, bytes32 l2TokenContractId, uint256 amount, uint8 chainIndex, bytes32 noteCommitment, bytes32 leafHash);
 }
+/// Token `state_map` from the compiled ABI, the same map `guardian/verify.rs` checks.
+const WITHDRAWAL_MAP_BASE: u64 = 8_589_934_680;
+const WITHDRAWAL_MAP_CAPACITY: u64 = 1_048_576;
+const GUARDIAN_SCHEMA: TableDefinition<'_, (), u32> = TableDefinition::new("guardian_schema");
+const GUARDIAN_SCHEMA_VERSION: u32 = 2;
 const SIGNER: TableDefinition<'_, (), [u8; 33]> = TableDefinition::new("guardian_signer");
 const ACCOUNT: TableDefinition<'_, (u64, u64), &[u8]> = TableDefinition::new("guardian_account");
 const SIGNED: TableDefinition<'_, (u64, u64, u64), &[u8]> = TableDefinition::new("guardian_signed");
@@ -129,13 +137,15 @@ impl Journal {
         let txn = db.begin_read().map_err(|_| anyhow::anyhow!("database read failed (details redacted)"))?;
         let mut names = txn.list_tables().map_err(|_| anyhow::anyhow!("database tables unavailable"))?.map(|table| table.name().to_owned()).collect::<Vec<_>>();
         names.sort();
-        ensure!(names == ["deposit_tree_states", "guardian_account", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"], "database table set mismatch");
+        ensure!(names == ["deposit_tree_states", "guardian_account", "guardian_schema", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"], "database table set mismatch");
         ensure!(txn.list_multimap_tables().map_err(|_| anyhow::anyhow!("database tables unavailable"))?.next().is_none(), "database contains a multimap table");
         let (account, signed, retained_sessions) = {
             let signer = txn.open_table(SIGNER).map_err(|_| anyhow::anyhow!("signer table unavailable"))?;
             let accounts = txn.open_table(ACCOUNT).map_err(|_| anyhow::anyhow!("account table unavailable"))?;
             let signed_table = txn.open_table(SIGNED).map_err(|_| anyhow::anyhow!("decision table unavailable"))?;
             let sessions = txn.open_table(SESSION).map_err(|_| anyhow::anyhow!("session table unavailable"))?;
+            let schema = txn.open_table(GUARDIAN_SCHEMA).map_err(|_| anyhow::anyhow!("guardian schema unavailable"))?;
+            ensure!(schema.len().map_err(|_| anyhow::anyhow!("guardian schema unavailable"))? == 1 && schema.get(()).map_err(|_| anyhow::anyhow!("guardian schema unavailable"))?.is_some_and(|row| row.value() == GUARDIAN_SCHEMA_VERSION), "incompatible legacy journal schema; explicit operator-controlled migration is required");
             drop(txn.open_table(GUARDIAN_DEPOSIT_TREE_STATES).map_err(|_| anyhow::anyhow!("deposit tree states table unavailable"))?);
             drop(txn.open_table(GUARDIAN_INCLUDED_WITHDRAWAL_BURNS).map_err(|_| anyhow::anyhow!("withdrawal burn index unavailable"))?);
             drop(txn.open_table(GUARDIAN_NONCE).map_err(|_| anyhow::anyhow!("nonce index unavailable"))?);
@@ -175,8 +185,9 @@ impl Journal {
 }
 
 struct Flow {
-    mapping: TokenMapping,
-    l1: psy_config::ChainEndpoint,
+    l2_contract_id: u32,
+    state_manager: alloy_primitives::Address,
+    l1: guardian_common::protocol::ChainEndpoint,
     services_url: String,
     prove_proxy_url: String,
     router: String,
@@ -187,8 +198,8 @@ struct Fixture {
     manifest: Value,
     rpc_config: PathBuf,
     guardian_root: PathBuf,
+    l1_configs: Vec<PathBuf>,
     config: GuardianConfig,
-    authorization: std::sync::Arc<GuardianAuthorization>,
     relayer_db: PathBuf,
     ready: Duration,
     session: Duration,
@@ -196,10 +207,10 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn load() -> anyhow::Result<Self> { Self::load_config(true, true) }
+    fn load() -> anyhow::Result<Self> { futures::executor::block_on(Self::load_config(true, true)) }
 
 
-    fn load_config(require_absent_journals: bool, require_absent_proof: bool) -> anyhow::Result<Self> {
+    async fn load_config(require_absent_journals: bool, require_absent_proof: bool) -> anyhow::Result<Self> {
         let root = PathBuf::from(std::env::var_os("GUARDIAN_ACCEPTANCE_FIXTURE").context("GUARDIAN_ACCEPTANCE_FIXTURE is required; provision the disposable fixture documented in this test")?);
         ensure!(root.is_absolute(), "fixture must be absolute");
         protected(&root, true)?;
@@ -212,10 +223,17 @@ impl Fixture {
         }
         let rpc_config = root.join(normal_relative(manifest["relayer_rpc_config"].as_str().context("rpc config missing")?)?);
         let guardian_root = root.join(normal_relative(manifest["guardian_root"].as_str().context("guardian root missing")?)?);
+        let l1_entries = manifest["l1_configs"].as_array().context("l1 configs missing")?;
+        ensure!(!l1_entries.is_empty(), "fixture requires the local deployment documents");
+        let mut l1_configs = Vec::with_capacity(l1_entries.len());
+        for entry in l1_entries {
+            let path = root.join(normal_relative(entry.as_str().context("l1 config path missing")?)?);
+            protected(&path, false)?;
+            l1_configs.push(path);
+        }
         protected(&rpc_config, false)?;
         protected(&guardian_root, true)?;
-        let config = GuardianConfig::load(&rpc_config, &guardian_root).map_err(|_| anyhow::anyhow!("guardian config rejected"))?;
-        let authorization = config.authorization.clone();
+        let config = GuardianConfig::load(&rpc_config, &guardian_root, &l1_configs).await.map_err(|_| anyhow::anyhow!("guardian config rejected"))?;
         let relayer_db = config.guardian_root.join("db/relayer.redb");
         let mut ready = Duration::from_secs(120);
         let mut session = Duration::from_secs(600);
@@ -225,7 +243,7 @@ impl Fixture {
                 *limit = Duration::from_secs(seconds);
             }
         }
-        let mut fixture = Self { root, manifest, rpc_config, guardian_root, config, authorization, relayer_db, ready, session, flow: Flow { mapping: TokenMapping { token: guardian_common::protocol::Hex([0; 20]), l2_contract_id: 0 }, l1: psy_config::ChainEndpoint { chain_index: 0, rpc_url: String::new() }, services_url: String::new(), prove_proxy_url: String::new(), router: String::new() } };
+        let mut fixture = Self { root, manifest, rpc_config, guardian_root, l1_configs, config, relayer_db, ready, session, flow: Flow { l2_contract_id: 0, state_manager: alloy_primitives::Address::ZERO, l1: guardian_common::protocol::ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::ZERO, bridge: guardian_common::protocol::Hex([0; 20]), deployment_block: 0, rpc_url: String::new() }, services_url: String::new(), prove_proxy_url: String::new(), router: String::new() } };
         ensure!(fixture.manifest["network_magic"].as_u64() == Some(fixture.config.network_magic()?), "manifest/network magic mismatch");
         ensure!(fixture.manifest["db_files"].as_array().is_some_and(|values| values.len() == 3), "fixture requires exactly three databases");
         let mut databases = Vec::new();
@@ -256,28 +274,36 @@ impl Fixture {
         let daemon: toml::Value = toml::from_str(std::str::from_utf8(&daemon_bytes).map_err(|_| anyhow::anyhow!("daemon config not UTF-8"))?).map_err(|_| anyhow::anyhow!("invalid daemon TOML"))?;
         ensure!(fixture.manifest_path(daemon["guardian_root"].as_str().context("daemon guardian root missing")?)? == fixture.guardian_root, "daemon/manifest guardian root mismatch");
         ensure!(fixture.manifest_path(daemon["rpc_config"].as_str().context("daemon rpc config missing")?)? == fixture.rpc_config, "daemon/manifest rpc config mismatch");
-        fixture.flow = fixture.select_flow()?;
+        fixture.flow = fixture.select_flow().await?;
         ensure!(fixture.claimant()? != USER, "claimant must not be the bridge user");
         ensure!(fixture.amount()? > 0, "amount must be positive");
         ensure!(fixture.manifest["chain_index"].as_u64() == Some(u64::from(fixture.flow.l1.chain_index)), "manifest/mapping chain mismatch");
         hex20(&fixture.text("token")?)?;
         hex20(&fixture.text("recipient")?)?;
         hex32(&fixture.text("withdrawal_nonce")?)?;
+        let members = fixture.config.initial_account().map_err(|_| anyhow::anyhow!("configured initial account rejected"))?.initial_policy.member_hashes;
+        ensure!(members[..3].iter().all(|member| guardian_common::protocol::validate_hash(*member).is_ok()) && members[3..] == [guardian_common::protocol::Hash4::ZERO; 5], "configured members are not the canonical three");
+        for id in 1..=3 { let _ = std::env::var(guardian_common::runtime::guardian_password_env(id).map_err(|_| anyhow::anyhow!("guardian password env missing"))?).map_err(|_| anyhow::anyhow!("guardian password env missing"))?; }
         Ok(fixture)
     }
 
-    fn select_flow(&self) -> anyhow::Result<Flow> {
+    async fn select_flow(&self) -> anyhow::Result<Flow> {
         let chain_index = u8::try_from(self.manifest["chain_index"].as_u64().context("chain index missing")?).map_err(|_| anyhow::anyhow!("chain index out of range"))?;
         let token = hex20(self.manifest["token"].as_str().context("token missing")?)?;
-        let authorization = self.authorization.as_ref();
-        let chain = authorization.chain(chain_index).map_err(|_| anyhow::anyhow!("authorized chain missing"))?;
-        let matches = chain.token_mappings.iter().filter(|mapping| mapping.token == token).collect::<Vec<_>>();
-        ensure!(matches.len() == 1, "authorized token mapping is not unique");
+        let endpoint = self.config.chain(chain_index).map_err(|_| anyhow::anyhow!("configured chain missing"))?.clone();
+        let bridge = format!("{:?}", endpoint.bridge);
+        let provider = l1_call(&endpoint.rpc_url, &bridge, addressesProviderCall {}).await?;
+        let manager_id = l1_call(&endpoint.rpc_url, &provider.to_string(), STATE_MANAGER_IDCall {}).await?;
+        let state_manager = l1_call(&endpoint.rpc_url, &provider.to_string(), getAddressCall { id: manager_id }).await?;
+        ensure!(state_manager != alloy_primitives::Address::ZERO, "configured bridge resolved no StateManager");
+        let router = self.manifest["router_address"].as_str().filter(|value| !value.is_empty()).context("router missing")?;
+        let mapped = l1_call(&endpoint.rpc_url, router, l1ToL2TokenCall { l1Token: alloy_primitives::Address::from(token.0) }).await?;
+        ensure!(mapped.0[..28] == [0; 28], "router token mapping is not a contract id");
+        let l2_contract_id = u32::from_be_bytes(mapped.0[28..].try_into().unwrap());
+        ensure!(l2_contract_id == psy_config::TOKEN_CONTRACT_ID, "router token mapping is not the compiled token contract");
         let services = self.config.network.api_services_url.as_ref().and_then(|urls| urls.iter().find(|url| !url.is_empty())).context("services URL missing")?;
         let prove = self.config.network.system_prove_proxy_url.iter().find(|url| !url.is_empty()).context("system prove proxy missing")?;
-        let l1 = self.config.network.l1_endpoints.iter().find(|endpoint| endpoint.chain_index == chain_index).context("L1 endpoint missing")?;
-        ensure!(self.manifest["router_address"].as_str().is_some_and(|value| !value.is_empty()), "router missing");
-        Ok(Flow { mapping: matches[0].clone(), l1: l1.clone(), services_url: services.clone(), prove_proxy_url: prove.clone(), router: self.manifest["router_address"].as_str().unwrap().to_string() })
+        Ok(Flow { l2_contract_id, state_manager, l1: endpoint, services_url: services.clone(), prove_proxy_url: prove.clone(), router: router.to_string() })
     }
 
     fn manifest_path(&self, value: &str) -> anyhow::Result<PathBuf> {
@@ -299,7 +325,9 @@ impl Fixture {
         let tx = db.begin_read().map_err(|_| anyhow::anyhow!("relayer database read failed"))?;
         let mut names = tx.list_tables().map_err(|_| anyhow::anyhow!("relayer tables unavailable"))?.map(|table| table.name().to_owned()).collect::<Vec<_>>();
         names.sort();
-        ensure!(names == ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "relayer_request"], "relayer database table set mismatch");
+        ensure!(names == ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "journal_schema", "relayer_request"], "relayer database table set mismatch");
+        let schema = tx.open_table(TableDefinition::<(), u64>::new("journal_schema")).map_err(|_| anyhow::anyhow!("relayer schema unavailable"))?;
+        ensure!(schema.len().map_err(|_| anyhow::anyhow!("relayer schema unavailable"))? == 1 && schema.get(()).map_err(|_| anyhow::anyhow!("relayer schema unavailable"))?.is_some_and(|row| row.value() == 2), "incompatible legacy journal schema; explicit operator-controlled migration is required");
         drop(tx.open_table(TableDefinition::<(u64, u64), &[u8]>::new("guardian_account")).map_err(|_| anyhow::anyhow!("relayer account unavailable"))?);
         drop(tx.open_table(TableDefinition::<u8, &[u8]>::new("chain_claims")).map_err(|_| anyhow::anyhow!("chain claims table unavailable"))?);
         drop(tx.open_table(TableDefinition::<(), &[u8]>::new("finalization_batch")).map_err(|_| anyhow::anyhow!("finalization batch table unavailable"))?);
@@ -322,18 +350,28 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut command = Command::new(CLI);
         command.current_dir(&self.root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+        for id in 1..=3 {
+            let name = guardian_common::runtime::guardian_password_env(id).expect("guardian id");
+            command.env(name, std::env::var(name).expect("guardian password env"));
+        }
         command
+    }
+
+    fn with_l1_configs(&self, command: &mut Command) {
+        for path in &self.l1_configs { command.arg("--l1-config").arg(path); }
     }
 
     fn guardian(&self, index: usize) -> anyhow::Result<Command> {
         let mut command = self.command();
         command.arg("guardian-service").arg("--rpc-config").arg(&self.rpc_config).arg("--guardian-root").arg(&self.guardian_root).arg("--guardian-id").arg((index + 1).to_string());
+        self.with_l1_configs(&mut command);
         Ok(command)
     }
 
     fn daemon(&self) -> anyhow::Result<Command> {
         let mut command = self.command();
         command.arg("--config").arg(self.path("relayer_daemon_config")?);
+        self.with_l1_configs(&mut command);
         Ok(command)
     }
 
@@ -347,6 +385,7 @@ impl Fixture {
         let serialized = serde_json::to_string(&members).map_err(|_| anyhow::anyhow!("replacement members rejected"))?;
         let mut command = self.command();
         command.arg("guardian-policy").arg("--rpc-config").arg(&self.rpc_config).arg("--guardian-root").arg(&self.guardian_root).arg("--intent").arg("replace").arg("--next-members-json").arg(serialized);
+        self.with_l1_configs(&mut command);
         Ok(command)
     }
 
@@ -360,6 +399,29 @@ impl Fixture {
         Ok(addresses)
     }
 }
+fn compiled_contract_height(contract: u32) -> anyhow::Result<u8> {
+    match contract {
+        psy_config::TOKEN_CONTRACT_ID => Ok(psy_config::TOKEN_CONTRACT_STATE_TREE_HEIGHT),
+        2 => Ok(psy_config::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT),
+        3 => Ok(psy_config::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT),
+        id if id == u32::from(psy_vm::ups::multisig::MULTISIG_POLICY_CONTRACT_ID) => Ok(4),
+        _ => anyhow::bail!("contract has no compiled height"),
+    }
+}
+
+fn configured_bridge(fixture: &Fixture) -> anyhow::Result<alloy_primitives::Address> {
+    let endpoint = fixture.config.chain(fixture.flow.l1.chain_index).map_err(|_| anyhow::anyhow!("configured chain missing"))?;
+    Ok(alloy_primitives::Address::from(endpoint.bridge.0))
+}
+
+async fn l1_call<Call: SolCall>(rpc_url: &str, to: &str, call: Call) -> anyhow::Result<Call::Return> {
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to": to, "data": format!("0x{}", hex::encode(call.abi_encode()))}, "latest"]});
+    let value: Value = reqwest::Client::new().post(rpc_url).json(&body).send().await?.json().await?;
+    ensure!(value.get("error").is_none(), "configured endpoint call failed");
+    let bytes = hex::decode(value["result"].as_str().context("configured endpoint result missing")?.trim_start_matches("0x")).map_err(|_| anyhow::anyhow!("configured endpoint result rejected"))?;
+    Call::abi_decode_returns(&bytes).map_err(|_| anyhow::anyhow!("configured endpoint ABI return rejected"))
+}
+
 
 
 
@@ -562,9 +624,9 @@ async fn contract_root(provider: &RpcProvider, fixture: &Fixture, checkpoint: u6
     ensure!(user_path.root == roots.user_tree_root && roots.qfhash::<PsyHasher>() == checkpoint_leaf.global_chain_root && checkpoint_path.index == checkpoint && checkpoint_path.value == checkpoint_leaf.qfhash::<PsyHasher>() && checkpoint_path.root == root && checkpoint_path.verify::<PsyHasher>(), "token account not bound to canonical checkpoint");
     let contract_path = provider.get_user_contract_tree_merkle_proof(checkpoint, user, contract).await.map_err(|_| anyhow::anyhow!("token contract path unavailable"))?;
     ensure!(contract_path.index == u64::from(contract) && contract_path.root == account.user_state_tree_root && contract_path.verify::<PsyHasher>(), "token contract not bound to account");
-    let approved = fixture.authorization.approved_contracts.iter().find(|item| item.contract_id == contract).context("approved token contract missing")?;
-    let leaf = approved.contract_leaf_json.decode().map_err(|_| anyhow::anyhow!("approved token leaf rejected"))?;
-    let height = u8::try_from(leaf.state_tree_height.to_canonical_u64()).map_err(|_| anyhow::anyhow!("token contract height invalid"))?;
+    let height = compiled_contract_height(contract)?;
+    let leaf = provider.get_contract_leaf_data(u64::from(contract)).await.map_err(|_| anyhow::anyhow!("compiled contract leaf unavailable"))?;
+    ensure!(leaf.state_tree_height.to_canonical_u64() == u64::from(height), "compiled contract height differs from checkpoint leaf");
     let global_contract = provider.get_contract_tree_merkle_proof(checkpoint, contract).await.map_err(|_| anyhow::anyhow!("global contract path unavailable"))?;
     ensure!(global_contract.index == u64::from(contract) && global_contract.value == leaf.qfhash::<PsyHasher>() && global_contract.root == roots.contract_tree_root && global_contract.verify::<PsyHasher>(), "contract code/layout not bound to checkpoint");
     let state_root = if contract_path.value == guardian_common::protocol::Hash4::ZERO { <PsyHasher as MerkleZeroHasher<guardian_common::protocol::Hash4>>::get_zero_hash(height as usize) } else { contract_path.value };
@@ -645,7 +707,7 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     let baseline_chain_count = state_subslots(&provider, fixture, latest, USER, 3, 65544 + u64::from(fixture.flow.l1.chain_index), 1).await?[0];
     let baseline_global_count = state_subslots(&provider, fixture, latest, USER, 3, 65800, 1).await?[0];
     let expected = expected_burn(fixture)?;
-    let before_claimant = token_balance(&provider, fixture, latest, fixture.claimant()?, fixture.flow.mapping.l2_contract_id).await?;
+    let before_claimant = token_balance(&provider, fixture, latest, fixture.claimant()?, fixture.flow.l2_contract_id).await?;
     let claimant_nonce = provider.get_user_leaf_data(latest, fixture.claimant()?).await.map_err(|_| anyhow::anyhow!("initial claimant unavailable"))?.nonce.to_canonical_u64();
     let before_erc20 = erc20_balance(&fixture.flow.l1.rpc_url, fixture.manifest["token"].as_str().unwrap(), fixture.manifest["recipient"].as_str().context("recipient missing")?).await?;
     let sessions = Sessions::load(fixture)?;
@@ -739,13 +801,13 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
     let claimant = fixture.claimant()?;
     let amount = fixture.amount()?;
     let claimed_checkpoint = claimant_checkpoint(&provider, fixture, &claim, claimant, claimant_nonce + 1).await?;
-    let after_claim = token_balance(&provider, fixture, claimed_checkpoint, claimant, fixture.flow.mapping.l2_contract_id).await?;
+    let after_claim = token_balance(&provider, fixture, claimed_checkpoint, claimant, fixture.flow.l2_contract_id).await?;
     ensure!(after_claim == before_claimant + amount, "claimant token delta is not +amount");
     children.stop(daemon).await?;
     let withdrawal = user_operation(fixture, children, "withdraw").await?;
     ensure!(withdrawal["status"] == "included" && withdrawal["transaction_hash"].as_str().is_some(), "withdraw was not included");
     let withdrawn_checkpoint = claimant_checkpoint(&provider, fixture, &withdrawal, claimant, claimant_nonce + 2).await?;
-    let after_withdraw = token_balance(&provider, fixture, withdrawn_checkpoint, claimant, fixture.flow.mapping.l2_contract_id).await?;
+    let after_withdraw = token_balance(&provider, fixture, withdrawn_checkpoint, claimant, fixture.flow.l2_contract_id).await?;
     ensure!(after_withdraw + amount == after_claim, "claimant token delta is not -amount");
     guardians[2] = children.start(fixture.guardian(2)?)?;
     children.ready(guardians[2], addresses[2], fixture.ready).await?;
@@ -807,7 +869,7 @@ async fn scenario(fixture: &Fixture, children: &mut Children) -> anyhow::Result<
         guardian_common::protocol::Hash4::try_from(&fields).map_err(|_| anyhow::anyhow!("policy slot rejected"))
     }).collect::<anyhow::Result<_>>()?;
     let ending = psy_vm::ups::multisig::StoredMultisigPolicy { header: hashes[0], members: [hashes[1], hashes[2], hashes[3]] }.policy()?;
-    let initial = fixture.authorization.bridge_relayer_signing_policy.decode().map_err(|_| anyhow::anyhow!("account rejected"))?.initial_policy;
+    let initial = fixture.config.initial_account().map_err(|_| anyhow::anyhow!("configured initial account rejected"))?.initial_policy;
     ensure!(ending == members && ending.member_hashes != initial.member_hashes, "committed replacement policy differs or is unchanged");
     let stopped_b = Journal::read(&databases[1], fixture.network(), &[policy_nonce])?;
     ensure!(stopped_b.signed(policy_nonce)?.is_empty(), "offline B signed rotation");
@@ -843,7 +905,7 @@ async fn claimant_checkpoint(provider: &RpcProvider, fixture: &Fixture, operatio
 fn expected_burn(fixture: &Fixture) -> anyhow::Result<guardian_common::protocol::WithdrawalBurnRecord> {
     Ok(guardian_common::protocol::WithdrawalBurnRecord {
         sender_user_id: u32::try_from(fixture.claimant()?).map_err(|_| anyhow::anyhow!("claimant exceeds burn word"))?,
-        token_contract_id: fixture.flow.mapping.l2_contract_id,
+        token_contract_id: fixture.flow.l2_contract_id,
         destination_chain_index: fixture.flow.l1.chain_index,
         token: words8(left_pad20(&fixture.text("token")?)?),
         amount: words8({ let mut bytes = [0; 32]; bytes[24..].copy_from_slice(&fixture.amount()?.to_be_bytes()); bytes }),
@@ -862,14 +924,15 @@ async fn verify_deposit_event(fixture: &Fixture, tx_hash: &str) -> anyhow::Resul
     let response = reqwest::Client::new().post(&fixture.flow.l1.rpc_url).json(&body).send().await.map_err(|_| anyhow::anyhow!("deposit receipt unavailable"))?;
     let receipt: Value = response.json().await.map_err(|_| anyhow::anyhow!("deposit receipt rejected"))?;
     ensure!(receipt["result"]["status"] == "0x1" && receipt["result"]["transactionHash"].as_str().is_some_and(|hash| hash.eq_ignore_ascii_case(tx_hash)), "deposit receipt identity/status differs");
-    let chain = fixture.authorization.chain(fixture.flow.l1.chain_index).map_err(|_| anyhow::anyhow!("authorized chain missing"))?;
+    let bridge = configured_bridge(fixture)?;
+    let token = hex20(&fixture.text("token")?)?;
     let logs: Vec<alloy_rpc_types_eth::Log> = serde_json::from_value(receipt["result"]["logs"].clone()).map_err(|_| anyhow::anyhow!("deposit logs rejected"))?;
     let mut found = None;
     for log in logs {
-        if log.address().as_slice() != chain.bridge.0 || log.topics().first() != Some(&DepositRecorded::SIGNATURE_HASH) { continue; }
+        if log.address().as_slice() != bridge.as_slice() || log.topics().first() != Some(&DepositRecorded::SIGNATURE_HASH) { continue; }
         let decoded = log.log_decode::<DepositRecorded>().map_err(|_| anyhow::anyhow!("deposit event rejected"))?;
         let event = decoded.data();
-        ensure!(!log.removed && event.token.as_slice() == fixture.flow.mapping.token.0 && event.chainIndex == fixture.flow.l1.chain_index && event.amount == alloy_primitives::U256::from(fixture.amount()?) && event.l2TokenContractId.0[..28] == [0; 28] && u32::from_be_bytes(event.l2TokenContractId.0[28..].try_into().unwrap()) == fixture.flow.mapping.l2_contract_id, "deposit event differs from manifest mapping/amount");
+        ensure!(!log.removed && event.token.as_slice() == token.0 && event.chainIndex == fixture.flow.l1.chain_index && event.amount == alloy_primitives::U256::from(fixture.amount()?) && event.l2TokenContractId.0[..28] == [0; 28] && u32::from_be_bytes(event.l2TokenContractId.0[28..].try_into().unwrap()) == fixture.flow.l2_contract_id, "deposit event differs from configured bridge mapping/amount");
         ensure!(found.replace(event.index).is_none(), "deposit receipt has ambiguous matching events");
     }
     if let Some(index) = found { return Ok(index); }
@@ -897,10 +960,9 @@ fn withdrawal_leaf(record: &guardian_common::protocol::WithdrawalBurnRecord) -> 
 }
 
 async fn verify_token_burn(provider: &RpcProvider, fixture: &Fixture, checkpoint: u64, record: &guardian_common::protocol::WithdrawalBurnRecord) -> anyhow::Result<()> {
-    let approved = fixture.authorization.approved_contracts.iter().find(|item| item.contract_id == record.token_contract_id).context("approved burn contract missing")?;
-    let layout = approved.withdrawal_layout.context("approved withdrawal layout missing")?;
-    ensure!(layout.capacity > 0 && layout.subslot_base % 4 == 0, "token map layout differs");
-    let input = psy_provider::request::QIMTMembershipProofRPCRequest { checkpoint_id: checkpoint, user_id: u64::from(record.sender_user_id), contract_id: record.token_contract_id, key: withdrawal_key(record), state_slot_base: layout.subslot_base / 4, capacity: layout.capacity };
+    ensure!(record.token_contract_id == psy_config::TOKEN_CONTRACT_ID, "burn contract is not the compiled token contract");
+    ensure!(WITHDRAWAL_MAP_CAPACITY > 0 && WITHDRAWAL_MAP_BASE % 4 == 0, "token map layout differs");
+    let input = psy_provider::request::QIMTMembershipProofRPCRequest { checkpoint_id: checkpoint, user_id: u64::from(record.sender_user_id), contract_id: record.token_contract_id, key: withdrawal_key(record), state_slot_base: WITHDRAWAL_MAP_BASE / 4, capacity: WITHDRAWAL_MAP_CAPACITY };
     let proof = provider.get_withdrawal_burn_proof(input.clone()).await.map_err(|_| anyhow::anyhow!("withdrawal burn proof unavailable"))?;
     let (root, height) = contract_root(provider, fixture, checkpoint, u64::from(record.sender_user_id), record.token_contract_id).await?;
     let membership = &proof.record_membership;
@@ -1004,8 +1066,7 @@ async fn wait_indexed_claim(fixture: &Fixture, provider: &RpcProvider) -> anyhow
 }
 
 async fn l1_view<Call: SolCall>(fixture: &Fixture, call: Call) -> anyhow::Result<Call::Return> {
-    let chain = fixture.authorization.chain(fixture.flow.l1.chain_index).map_err(|_| anyhow::anyhow!("authorized chain missing"))?;
-    let body = json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to": format!("0x{}", hex::encode(chain.state_manager.0)), "data": format!("0x{}", hex::encode(call.abi_encode()))}, "latest"]});
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to": fixture.flow.state_manager.to_string(), "data": format!("0x{}", hex::encode(call.abi_encode()))}, "latest"]});
     let value: Value = reqwest::Client::new().post(&fixture.flow.l1.rpc_url).json(&body).send().await?.json().await?;
     ensure!(value.get("error").is_none(), "StateManager call failed");
     let bytes = hex::decode(value["result"].as_str().context("StateManager result missing")?.trim_start_matches("0x"))?;
@@ -1036,7 +1097,7 @@ async fn guardian_acceptance() {
 #[ignore = "typed secret-consuming child of guardian acceptance; parent supplies only manifest path and operation name"]
 async fn guardian_user_operation() {
     let operation = std::env::var("GUARDIAN_ACCEPTANCE_OPERATION").unwrap_or_else(|_| panic!("operation name missing"));
-    let fixture = Fixture::load_config(false, operation == "deposit").unwrap_or_else(|error| panic!("guardian fixture rejected: {error}"));
+    let fixture = Fixture::load_config(false, operation == "deposit").await.unwrap_or_else(|error| panic!("guardian fixture rejected: {error}"));
     let result = run_user_operation(&fixture, &operation).await;
     let (status, hash) = match &result {
         Ok(value) => (value.status.clone(), value.transaction_hash.clone()),
@@ -1062,7 +1123,7 @@ async fn run_user_operation(fixture: &Fixture, operation: &str) -> anyhow::Resul
     match operation {
         "deposit" => {
             let result = psy_user_cli::subcommand::deposit::run(psy_user_cli::subcommand::args::DepositArgs {
-                l1_rpc_url: fixture.flow.l1.rpc_url.clone(), private_key: Some(l1.private_key_hex()), router_address: fixture.flow.router.clone(), token: fixture.text("token")?, amount: amount.to_string(), shield_address: String::new(), r0: fixture.manifest["r0"].as_u64(), r1: fixture.manifest["r1"].as_u64(), user_id: Some(claimant), note_commitment: None, note_secret: Some(note), nullifier_secret: Some(nullifier), recipient_npub: None, nostr_relay: "wss://relay.nostr.band".to_string(), l2_token_contract_id: fixture.flow.mapping.l2_contract_id.to_string(), source_chain_index: u32::from(fixture.flow.l1.chain_index), rpc_config: rpc.display().to_string(), deposit_proof_output: Some(fixture.path("deposit_proof_path")?.display().to_string()), resume_deposit_index: None, resume_tx_hash: None, resume_chain_id: None,
+                l1_rpc_url: fixture.flow.l1.rpc_url.clone(), private_key: Some(l1.private_key_hex()), router_address: fixture.flow.router.clone(), token: fixture.text("token")?, amount: amount.to_string(), shield_address: String::new(), r0: fixture.manifest["r0"].as_u64(), r1: fixture.manifest["r1"].as_u64(), user_id: Some(claimant), note_commitment: None, note_secret: Some(note), nullifier_secret: Some(nullifier), recipient_npub: None, nostr_relay: "wss://relay.nostr.band".to_string(), l2_token_contract_id: fixture.flow.l2_contract_id.to_string(), source_chain_index: u32::from(fixture.flow.l1.chain_index), rpc_config: rpc.display().to_string(), deposit_proof_output: Some(fixture.path("deposit_proof_path")?.display().to_string()), resume_deposit_index: None, resume_tx_hash: None, resume_chain_id: None,
             }).await?;
             l1_status(result)
         }
@@ -1076,7 +1137,7 @@ async fn run_user_operation(fixture: &Fixture, operation: &str) -> anyhow::Resul
         }
         "withdraw" => {
             let result = psy_user_cli::subcommand::withdraw::run(psy_user_cli::subcommand::args::WithdrawArgs {
-                rpc_config: rpc.display().to_string(), wallet, destination_chain_index: u64::from(fixture.flow.l1.chain_index), token_address: fixture.text("token")?, amount, recipient: fixture.text("recipient")?, nonce: fixture.text("withdrawal_nonce")?, l1_rpc_url: fixture.flow.l1.rpc_url.clone(), contract_id: Some(u64::from(fixture.flow.mapping.l2_contract_id)),
+                rpc_config: rpc.display().to_string(), wallet, destination_chain_index: u64::from(fixture.flow.l1.chain_index), token_address: fixture.text("token")?, amount, recipient: fixture.text("recipient")?, nonce: fixture.text("withdrawal_nonce")?, l1_rpc_url: fixture.flow.l1.rpc_url.clone(), contract_id: Some(u64::from(fixture.flow.l2_contract_id)),
             }).await?;
             included_status(result)
         }

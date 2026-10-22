@@ -1,41 +1,45 @@
+use guardian_common::protocol::{ChainEndpoint, GuardianConfig, GuardianOperation, GuardianSignRequest, Hash4, Hex, JsonText, BRIDGE_USER_ID};
 use plonky2::field::goldilocks_field::GoldilocksField;
 use psy_client_common::args::ContractCallData;
-use psy_client_data::qdata::contract::PsyContractLeaf;
 use psy_prover::trace::{GeneratedTxTraceJson, SessionAnchor, TraceMeta, TxFinalization, TxTrace, UpsStartWitness};
-use psy_vm::ups::multisig::{MultisigAccount, StoredMultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
 
-use guardian_common::protocol::{ApprovedContract, ApprovedMethod, GuardianAuthorization, GuardianOperation, GuardianSignRequest, Hash4, Hex, JsonText, BRIDGE_USER_ID};
+/// Network the verifier tests share. Members are the three distinct nonzero
+/// commitments the protocol account derives. Chain id and bridge are the
+/// configured L1 identity.
+pub(crate) fn codec_network() -> psy_config::NetworkConfigGoldilocks {
+    serde_json::from_value(serde_json::json!({
+        "magic": "0x1337CF514544CF69",
+        "users_per_realm": 1,
+        "global_user_tree_height": 1,
+        "realm_user_tree_height": 1,
+        "group_realm_height": 1,
+        "realm_configs": [],
+        "p2p": { "checkpoints_per_epoch": 1 },
+        "coordinator_configs": [],
+        "prove_proxy_url": [],
+        "faucet_rpc_url": [],
+        "nostr_relay_url": "ws://127.0.0.1:1",
+        "native_currency": "PSY",
+        "native_currency_decimal": 6,
+        "native_currency_name": "Psy",
+        "fees": { "register_user_fee": 1, "deploy_contract_fee": 1, "guta_fee": 1, "da_fee": 1 },
+        "guardian_initial_member_hashes": [Hash4::from_values(1, 0, 0, 0), Hash4::from_values(2, 0, 0, 0), Hash4::from_values(3, 0, 0, 0)],
+    })).expect("codec network")
+}
 
-/// Canonical minimal seven-field authorization; the request fixture below embeds its digest and
-/// derived account public key so every consumer (relayer db, daemon, verifier) shares one identity.
-pub(crate) fn codec_authorization_fixture() -> GuardianAuthorization {
-    let members = [Hash4::from_values(1, 0, 0, 0), Hash4::from_values(2, 0, 0, 0), Hash4::from_values(3, 0, 0, 0)];
-    let account = MultisigAccount { contract_id: MULTISIG_POLICY_CONTRACT_ID, initial_policy: StoredMultisigPolicy { header: Hash4::from_values(1, 2, 3, 0), members }.policy().unwrap() };
-    GuardianAuthorization {
-        genesis_hash: Hex([1; 32]),
-        bridge_relayer_signing_policy: JsonText::from_value(&account).unwrap(),
-        multisig_fingerprint: Hash4::from_values(9, 8, 7, 6),
-        endcap_verifier_fingerprint: Hash4::from_values(1, 1, 1, 1),
-        max_fee: 100,
-        approved_contracts: vec![ApprovedContract {
-            contract_id: 3,
-            contract_leaf_json: JsonText::from_value(&PsyContractLeaf::<GoldilocksField>::default()).unwrap(),
-            withdrawal_layout: None,
-            methods: vec![ApprovedMethod { name: "first".into(), method_id: 1, input_felt_count: 0 }, ApprovedMethod { name: "second".into(), method_id: 2, input_felt_count: 0 }],
-        }],
-        chains: vec![],
-    }
+pub(crate) fn codec_guardian_config() -> GuardianConfig {
+    GuardianConfig { network: codec_network(), guardian_root: "guardians-root".into(), endpoints: [String::new(), String::new(), String::new()], history_url: String::new(), l1_chains: vec![ChainEndpoint { chain_index: 0, chain_id: alloy_primitives::U256::from(1u8), bridge: Hex([0x11; 20]), deployment_block: 0, rpc_url: "http://127.0.0.1:8545".into() }] }
 }
 
 pub(crate) fn codec_request_fixture() -> GuardianSignRequest {
-    let authorization = codec_authorization_fixture();
+    let config = codec_guardian_config();
     let trace = TxTrace {
-        meta: TraceMeta { network_magic: 90101, user_id: BRIDGE_USER_ID, public_key: authorization.account_public_key().unwrap() },
+        meta: TraceMeta { network_magic: config.network_magic().unwrap(), user_id: BRIDGE_USER_ID, public_key: config.account_public_key().unwrap() },
         anchor: SessionAnchor { start_checkpoint_id: 0, checkpoint_leaf: Default::default(), global_state_roots: Default::default(), ups_step_circuit_whitelist_root: Hash4::ZERO },
         ups_start_witness: UpsStartWitness { ups_header: Default::default(), state_roots: Default::default(), checkpoint_tree_proof: Default::default(), user_tree_proof: Default::default(), user_registration_tree_proof: None, proof: None },
         contract_codes: vec![], steps: vec![],
         finalization: TxFinalization { submit_end_cap_input: Default::default(), nonce: GoldilocksField(1), tx_hash: Hash4::ZERO, software_defined_call: Default::default(), sig_hash: Hash4::ZERO },
     };
     let generated = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(ContractCallData::new(vec![])).unwrap()).unwrap();
-    GuardianSignRequest { schema_version: 1, authorization_sha256: authorization.digest().unwrap(), network_magic: 90101, genesis_hash: Hex([1; 32]), user_id: BRIDGE_USER_ID, session_nonce: 1, operation: GuardianOperation::Bootstrap, trace_json: JsonText::from_value(&generated).unwrap(), deposit_anchors: vec![], withdrawal_records: vec![] }
+    GuardianSignRequest { schema_version: 2, network_magic: trace.meta.network_magic, user_id: BRIDGE_USER_ID, session_nonce: 1, operation: GuardianOperation::Bootstrap, trace_json: JsonText::from_value(&generated).unwrap(), deposit_anchors: vec![], withdrawal_records: vec![] }
 }

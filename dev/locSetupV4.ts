@@ -354,6 +354,25 @@ export function resolveActiveL1Chains(l1Network: L1NetworkName, l1Fork: boolean,
     }
     return chains;
 }
+
+/**
+ * Post-deploy deployment document of each selected chain, as repeatable
+ * `--l1-config PATH` pairs. Exactly the selected chains, one existing document
+ * each; the documents stay where deployment wrote them — nothing is copied and
+ * no config is written.
+ */
+export async function resolveL1ConfigArgs(cwd: string, chains: readonly ActiveL1Chain[]): Promise<string[]> {
+    const args: string[] = [];
+    for (const chain of chains) {
+        const documentPath = path.join(cwd, "psy-contracts", "deployments", chain.deploymentsNetwork, "deployed-contracts.json");
+        const stat = await fs.promises.lstat(documentPath).catch(() => null);
+        if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+            throw new Error(`[DevNet] selected L1 chain ${chain.networkId} has no deployment document at ${documentPath}`);
+        }
+        args.push("--l1-config", documentPath);
+    }
+    return args;
+}
 type ConfigNetworkEntry = {
     l1_rpc_urls?: string[];
     anvilForkSourceUrlEnv?: string;
@@ -1020,7 +1039,7 @@ export class RunningProcess {
                         if (afterMs <= 0) {
                             throw new Error(`[DevNet] guardian-service port ${guardianListener.port} not ready within ${readinessDeadlineMs}ms`);
                         }
-                        await Bun.sleep(Math.min(500, afterMs));
+                        await Bun.sleep(Math.min(500, Math.max(0, afterMs)));
                     }
                 }
                 if (runningProcess.hasExited || proc.exitCode !== null) throw new Error("[DevNet] guardian-service exited before readiness");
@@ -1575,17 +1594,17 @@ export async function ensureRealmP2pConfig(
     const configKey = selectedRuntimeConfigKey("local-devnet");
     if (config && plan.reuse) {
         validateGenesisValidators(genesis.validators, realmGenesisValidators({ ...config, defaultNetwork: configKey }));
-        let changed = false;
-        for (const field of ["prove_proxy_url", "system_prove_proxy_url"] as const) {
+        const projected = structuredClone(config);
+        const network = projected.networks[configKey];
+        for (const field of ["prove_proxy_url", "system_prove_proxy_url", "guardian_initial_member_hashes", "fees"] as const) {
             const source = sourceConfig.networks[configKey][field];
-            if (isDeepStrictEqual(config.networks[configKey][field], source)) continue;
-            if (source === undefined) delete config.networks[configKey][field];
-            else config.networks[configKey][field] = structuredClone(source);
-            changed = true;
+            if (source === undefined) delete network[field];
+            else network[field] = structuredClone(source);
         }
-        if (changed) await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
-        config.defaultNetwork = configKey;
-        return config;
+        delete network.guardian_authorization;
+        delete network.guardian_max_fee;
+        projected.defaultNetwork = configKey;
+        return projected;
     }
     validateGenesisValidators(genesis.validators, []);
     const privateKeys = JSON.parse(await fs.promises.readFile(path.join(cwd, "private_keys.json"), "utf-8")) as string[];
@@ -1611,6 +1630,13 @@ export async function ensureRealmP2pConfig(
     if (exit !== 0) throw new Error(`init-realm-p2p-keys failed (${exit}): ${await new Response(proc.stderr).text()}`);
     config = JSON.parse(await fs.promises.readFile(configPath, "utf-8")) as FullNetworkConfig;
     planRealmP2pConfig(config, realmIds, edgeCount, publicHost, validatorUserIds, genesisConfigHash, "local-devnet", sourceConfig);
+    const generated = config.networks[configKey];
+    for (const field of ["guardian_initial_member_hashes", "fees"] as const) {
+        const source = sourceConfig.networks[configKey][field];
+        if (source === undefined) delete generated[field];
+        else generated[field] = structuredClone(source);
+    }
+    delete generated.guardian_authorization;
     config.genesisConfigHash = genesisConfigHash;
     await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
     for (let index = 0; index < validatorKeys.length; index++) {
@@ -3118,57 +3144,44 @@ async function isUsableGenesisContracts(filePath: string): Promise<boolean> {
     }
 }
 
+const GOLDILOCKS_MODULUS = 0xffffffff00000001n;
+const GUARDIAN_MEMBER_FIELD = "guardian_initial_member_hashes";
+
+/** QHashOut JSON is up to 64 hex digits, big-endian, reversed into four little-endian Goldilocks limbs. */
+function guardianMemberLimbs(hash: unknown): bigint[] | null {
+    if (typeof hash !== "string" || !/^(?:[0-9a-fA-F]{2}){0,32}$/.test(hash)) return null;
+    const padded = hash.padStart(64, "0");
+    return [3, 2, 1, 0].map((limb) => BigInt(`0x${padded.slice(limb * 16, limb * 16 + 16)}`) % GOLDILOCKS_MODULUS);
+}
+
+
+
+/**
+ * Read-only membership preflight. The selected network already carries three member
+ * hashes; genesis consumes them and never writes config.
+ */
 export async function planGenesisGeneration(cwd: string, env: NodeJS.ProcessEnv): Promise<{ args: string[]; env: NodeJS.ProcessEnv }> {
     const networkKey = env.PSY_NETWORK?.trim();
-    const policyField = `networks.${networkKey || "CURRENT_NETWORK"}.guardian_authorization.bridge_relayer_signing_policy`;
+    const memberField = `networks.${networkKey || "CURRENT_NETWORK"}.${GUARDIAN_MEMBER_FIELD}`;
     try {
         if (!networkKey) throw new Error("missing selected network");
         const configPath = path.resolve(cwd, "psy-genesis/config.json");
         const stat = await fs.promises.lstat(configPath);
         if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024 * 1024) throw new Error("invalid canonical config");
         const config = JSON.parse(await fs.promises.readFile(configPath, "utf8"));
-        const text = config?.networks?.[networkKey]?.guardian_authorization?.bridge_relayer_signing_policy;
-        if (typeof text !== "string") throw new Error("missing policy JSON string");
-        const account = JSON.parse(text);
-        const fields = new Set<string>();
-        let previousToken = "";
-        for (const [token] of text.matchAll(/"(?:\\.|[^"\\])*"|:/g)) {
-            if (token === ":") {
-                const field = JSON.parse(previousToken);
-                if (fields.has(field)) throw new Error("duplicate field");
-                fields.add(field);
-            }
-            previousToken = token;
-        }
-        if (!account || Object.keys(account).sort().join(",") !== "contract_id,initial_policy" || account.contract_id !== 1) throw new Error("invalid account");
-        const policy = account.initial_policy;
-        if (!policy || Object.keys(policy).sort().join(",") !== "member_count,member_hashes,threshold,version"
-            || policy.version !== 1 || policy.threshold !== 2 || policy.member_count !== 3
-            || !Array.isArray(policy.member_hashes) || policy.member_hashes.length !== 8) throw new Error("invalid initial policy");
+        const network = config?.networks?.[networkKey];
+        const hashes = network?.[GUARDIAN_MEMBER_FIELD];
+        if (!Array.isArray(hashes) || hashes.length !== 3) throw new Error("expected three member hashes");
         const members = new Set<string>();
-        for (const [index, hash] of policy.member_hashes.entries()) {
-            if (typeof hash !== "string" || !/^(?:[0-9a-fA-F]{2}){0,32}$/.test(hash)) throw new Error("invalid member hash");
-            const padded = hash.padStart(64, "0");
-            const limbs = [3, 2, 1, 0].map((limb) => BigInt(`0x${padded.slice(limb * 16, limb * 16 + 16)}`) % 0xffffffff00000001n);
+        for (const hash of hashes) {
+            const limbs = guardianMemberLimbs(hash);
+            if (!limbs || limbs.every((limb) => limb === 0n)) throw new Error("invalid member hash");
             const member = limbs.join(",");
-            const zero = limbs.every((limb) => limb === 0n);
-            if (index < 3) {
-                if (zero || members.has(member)) throw new Error("invalid active member");
-                members.add(member);
-            } else if (!zero) throw new Error("invalid unused member");
+            if (members.has(member)) throw new Error("duplicate member");
+            members.add(member);
         }
     } catch {
-        throw new Error(`psy-genesis/config.json ${policyField} must contain a public MultisigAccount JSON string with contract 1 and a valid initial two-of-three policy`);
-    }
-    const artifactPath = path.resolve(env.PSY_PROJECTS_DIR || path.join(cwd, ".."), "psy-compiler/psy-precompiles/multisig_policy/target/multisig_policy.json");
-    try {
-        if (!(await fs.promises.stat(artifactPath)).isFile()) throw new Error("not a regular file");
-        const artifact = JSON.parse(await fs.promises.readFile(artifactPath, "utf-8"));
-        if (artifact?.state_tree_height !== 4 || artifact?.abi?.contract?.state_tree_height !== 4
-            || !Array.isArray(artifact.circuit_definitions) || artifact.circuit_definitions.length !== 2
-            || artifact.circuit_definitions.map((definition: { name?: string }) => definition?.name).sort().join(",") !== "get_policy,set_policy") throw new Error("invalid policy artifact");
-    } catch {
-        throw new Error("Sibling compiler multisig_policy artifact must have height 4, ABI, get_policy and set_policy");
+        throw new Error(`psy-genesis/config.json ${memberField} must contain three distinct nonzero public member hashes`);
     }
     const childEnv: NodeJS.ProcessEnv = { ...env, PWD: cwd };
     for (const key of ["PRIVATE_KEY", "BRIDGE_RELAYER_L2_PRIVATE_KEY", "KEYSTORE_PATH", "PSY_BRIDGE_RELAYER_KEYSTORE_PATH", "BRIDGE_RELAYER_KEYSTORE_PATH", "WALLET_PASSWORD"]) delete childEnv[key];
@@ -3883,12 +3896,7 @@ function parseTomlScalar(raw: string, key: string): string | undefined {
 }
 
 
-function isLoopbackHost(hostname: string): boolean {
-    const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    if (host === "localhost" || host === "::1") return true;
-    const parts = host.split(".");
-    return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d+$/.test(part) && Number(part) <= 255);
-}
+
 
 function isHttpOrigin(value: unknown): value is string {
     if (typeof value !== "string" || !value) return false;
@@ -3911,22 +3919,11 @@ function isSocketAddress(value: unknown, history: boolean): boolean {
 }
 
 
-function isL1Endpoint(value: unknown): boolean {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-    const endpoint = value as Record<string, unknown>;
-    if (Object.keys(endpoint).length !== 2 || !Number.isInteger(endpoint.chain_index) || (endpoint.chain_index as number) < 0 || (endpoint.chain_index as number) > 255) return false;
-    if (typeof endpoint.rpc_url !== "string") return false;
-    try {
-        const url = new URL(endpoint.rpc_url);
-        const https = url.protocol === "https:";
-        const loopbackHttp = url.protocol === "http:" && isLoopbackHost(url.hostname);
-        return (https || loopbackHttp) && !!url.hostname && !isWildcardHost(url.hostname.replace(/^\[|\]$/g, "")) && url.port !== "0" && !url.username && !url.password && !url.hash;
-    } catch { return false; }
-}
+
 
 
 const GUARDIAN_RPC_CONTEXT = "[DevNet] Bridge relayer requires the daemon rpc_config psy-genesis network to carry guardian public endpoints";
-const GUARDIAN_RPC_FIELDS = "expected canonical guardian public fields: distinct guardian_configs ids 1..3 and advertised origins, guardian_history and nonempty l1_endpoints; endpoint entries cannot contain keys or root paths";
+const GUARDIAN_RPC_FIELDS = "expected canonical guardian public fields: three distinct nonzero guardian_initial_member_hashes, distinct guardian_configs ids 1..3 and advertised origins, and guardian_history";
 
 function guardianRpcError(detail: string): Error {
     return new Error(`${GUARDIAN_RPC_CONTEXT}; ${detail}`);
@@ -3994,18 +3991,17 @@ export async function validateGuardianRpcConfig(cwd: string, configuredPath: str
     }
     const selected = network as Record<string, unknown>;
     const guardians = selected.guardian_configs;
-    const l1Endpoints = selected.l1_endpoints;
-    const chainIndexes = Array.isArray(l1Endpoints) && l1Endpoints.length > 0 && l1Endpoints.every(isL1Endpoint)
-        ? l1Endpoints.map((endpoint) => (endpoint as Record<string, unknown>).chain_index)
+    const members = Array.isArray(selected.guardian_initial_member_hashes)
+        ? selected.guardian_initial_member_hashes.map((hash) => guardianMemberLimbs(hash)?.join(",") ?? "")
         : [];
     const guardianValid = Array.isArray(guardians) && guardians.length === 3 && guardians.every(isGuardianPublicConfig)
         && [1, 2, 3].every((id) => guardians.filter((entry) => (entry as { id: number }).id === id).length === 1);
     const guardianOrigins = guardianValid
         ? guardians.map((entry) => new URL(entry.rpc_url ?? `http://${entry.listen_address}`).origin)
         : [];
-    if (Object.hasOwn(selected, "guardian_root") || !guardianValid || new Set(guardianOrigins).size !== 3 || !isGuardianHistoryConfig(selected.guardian_history)
-        || chainIndexes.length === 0 || chainIndexes.length !== (Array.isArray(l1Endpoints) ? l1Endpoints.length : -1)
-        || new Set(chainIndexes).size !== chainIndexes.length) {
+    if (Object.hasOwn(selected, "guardian_authorization") || Object.hasOwn(selected, "guardian_max_fee") || Object.hasOwn(selected, "guardian_root") || !guardianValid
+        || members.length !== 3 || members.some((member) => !member || member === "0,0,0,0") || new Set(members).size !== 3
+        || new Set(guardianOrigins).size !== 3 || !isGuardianHistoryConfig(selected.guardian_history)) {
         throw guardianRpcError(GUARDIAN_RPC_FIELDS);
     }
     return selected;
@@ -4028,17 +4024,25 @@ export async function resolveGuardianRoot(cwd: string, configuredRoot: string | 
 async function validateGuardianRuntimeRoot(root: string, purgeTargets: readonly string[], generated: boolean): Promise<void> {
     await validateDaemonPath(path.resolve(root, "db"), generated ? "directory" : "output-directory", purgeTargets, "guardian root db metadata");
 }
+const GUARDIAN_PASSWORD_ENV = ["GUARDIAN_1_KEYSTORE_PASSWORD", "GUARDIAN_2_KEYSTORE_PASSWORD", "GUARDIAN_3_KEYSTORE_PASSWORD"] as const;
 
-// Rust validates the typed authorization and binds retained request digests.
-// Startup only checks presence in the selected canonical network configuration.
-export function validateGuardianAuthorization(network: Record<string, unknown>): void {
-    const authorization = network.guardian_authorization;
-    if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) {
-        throw new Error("[DevNet] selected network requires guardian_authorization; fresh startup publishes it after deployment");
-    }
+/** Metadata only: three existing owner-only keystores. Passwords stay in the inherited env and are never written or logged. */
+export async function assertGuardianKeystoresPresent(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+    const homeDir = env.HOME;
+    if (!homeDir) throw new Error("[DevNet] HOME is required to locate guardian keystores");
+    const checks = await Promise.allSettled(GUARDIAN_PASSWORD_ENV.map(async (name, index) => {
+        if (!env[name]) throw new Error(`[DevNet] ${name} is required; passwords are not read from files`);
+        const keystore = path.join(homeDir, ".psy", "keystore", `guardian-${index + 1}.keystore.json`);
+        const stat = await fs.promises.lstat(keystore);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 || (process.getuid && stat.uid !== process.getuid())) {
+            throw new Error(`[DevNet] guardian-${index + 1} keystore must be an existing owner-only regular file`);
+        }
+    }));
+    const failure = checks.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
 }
 
-// Databases contain mutable runtime state only; authorization lives in network config.
+// Member hashes and Guardian endpoints come from the selected network; chain identity comes from the selected deployment documents.
 export async function prepareGuardianService(cmds: readonly string[], cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<{ host: string; port: number }> {
     const idIndex = cmds.indexOf("--guardian-id");
     const rpcIndex = cmds.indexOf("--rpc-config");
@@ -4066,7 +4070,7 @@ export async function prepareGuardianService(cmds: readonly string[], cwd: strin
     if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) {
         throw new Error("[DevNet] guardian db directory must be an existing owner-only directory");
     }
-    validateGuardianAuthorization(network);
+    await assertGuardianKeystoresPresent(env);
     return { host: host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host, port };
 }
 
@@ -4078,7 +4082,7 @@ const DEVNET_PURGE_PATHS = [
 export interface FreshDevnetState {
     abort(): Promise<void>;
     reset(): Promise<void>;
-    authorize(): Promise<void>;
+    finish(): Promise<void>;
 }
 
 export interface ScopedDevnetReset {
@@ -4117,7 +4121,7 @@ function appendFreshHelperDiagnostic(error: unknown, stderrTail: Buffer): unknow
     return error;
 }
 
-/** One helper owns every database inode through public authorization publication. */
+/** One helper owns every database inode from prepare through finish. Config is read-only and is not snapshotted. */
 export async function prepareFreshDevnetState(cwd: string, guardianRoot: string, env: NodeJS.ProcessEnv): Promise<FreshDevnetState> {
     const generation = await planGenesisGeneration(cwd, env);
     const child = spawn(generation.args[0], ["fresh-devnet-state", "--repo-root", path.resolve(cwd),
@@ -4149,7 +4153,7 @@ export async function prepareFreshDevnetState(cwd: string, guardianRoot: string,
         try {
             const line = await iterator.next();
             if (line.done || line.value !== JSON.stringify({ phase })) {
-                throw new Error(`[DevNet] fresh state helper failed before ${phase}; state was not authorized for the next stage`);
+                throw new Error(`[DevNet] fresh state helper failed before ${phase}; database locks were not released for the next stage`);
             }
         } catch (error) {
             // Abort first so the exit-time anyhow line is fully written, then
@@ -4184,17 +4188,16 @@ export async function prepareFreshDevnetState(cwd: string, guardianRoot: string,
         } finally { lines.close(); }
     })();
     // receive aborts and annotates its own failures; after it the helper
-    // reached "prepared" and remains alive for reset/authorize phases.
+    // reached "prepared" and remains alive for reset/finish phases.
     await receive("prepared");
     return {
         abort,
         async reset() { child.stdin.write("reset\n"); await receive("reset"); },
-        async authorize() {
-            child.stdin.end("authorize\n");
-            await receive("authorized");
+        async finish() {
+            child.stdin.end("finish\n");
+            await receive("finished");
             if (await exited !== 0) throw appendFreshHelperDiagnostic(
-                new Error("[DevNet] fresh state helper failed to publish authorization"), stderrTail);
-            validateGuardianAuthorization(await validateGuardianRpcConfig(cwd, path.resolve(cwd, "psy-genesis/config.json"), env));
+                new Error("[DevNet] fresh state helper failed to finish"), stderrTail);
             lines.close();
         },
     };
@@ -4333,7 +4336,7 @@ export async function validateRelayerTemplate(cmds: readonly string[], options: 
     if (cmds.includes("guardian-service")) {
         const rpcIndex = cmds.indexOf("--rpc-config");
         if (rpcIndex < 0 || !cmds[rpcIndex + 1]) throw guardianRpcError("missing --rpc-config");
-        validateGuardianAuthorization(await validateGuardianRpcConfig(cwd, cmds[rpcIndex + 1], env));
+        await validateGuardianRpcConfig(cwd, cmds[rpcIndex + 1], env);
         return;
     }
     if (!cmds.some((cmd) => path.basename(cmd) === "psy_relayer_cli")) return;
@@ -4341,7 +4344,7 @@ export async function validateRelayerTemplate(cmds: readonly string[], options: 
     const index = cmds.indexOf("--config");
     if (index < 0 || !cmds[index + 1] || path.resolve(cwd, cmds[index + 1]) !== configPath) throw daemonConfigError("saved --config coherence");
     const config = Bun.TOML.parse(await fs.promises.readFile(configPath, "utf8"));
-    validateGuardianAuthorization(await validateGuardianRpcConfig(cwd, config.rpc_config as string, env));
+    await validateGuardianRpcConfig(cwd, config.rpc_config as string, env);
 }
 
 const ENVIO_NPM_VERSION = "2.32.10";
@@ -5027,6 +5030,110 @@ async function killKnownProcesses(): Promise<void> {
         ]);
     }
 }
+const DEVNET_UI_LISTENER_APPS: Record<number, string> = { 5176: "ide", 5177: "bridge", 5178: "explorer", 5179: "account" };
+
+export interface DevnetUiListenerControl {
+    portOpen?: (port: number) => Promise<boolean>;
+    listenerOwner?: (port: number) => Promise<number | null>;
+    readIdentity?: (pid: number) => Promise<AnvilProcessIdentity | null>;
+    readUid?: (pid: number) => Promise<number | null>;
+    readPgrp?: (pid: number) => Promise<number | null>;
+    signalGroup?: (pgrp: number, signal: "SIGTERM" | "SIGKILL") => void;
+    leaderAlive?: (pgrp: number) => boolean;
+    sleep?: (ms: number) => Promise<void>;
+}
+
+/** SIGTERM then SIGKILL only a node group whose listener and leader share this checkout app cwd, exe, and uid. */
+export async function stopOwnedDevnetUiListeners(repoRoot: string, control: DevnetUiListenerControl = {}): Promise<void> {
+    const canonical = await fs.promises.realpath(repoRoot);
+    const appsRoot = `${canonical}${path.sep}psy-dapp${path.sep}apps${path.sep}`;
+    const self = process.getuid?.() ?? null;
+    const portOpen = control.portOpen ?? tcpPortOpen;
+    const ownerOf = control.listenerOwner ?? tcpListenerOwner;
+    const readIdentity = control.readIdentity ?? readAnvilProcessIdentity;
+    const readUid = control.readUid ?? (async (pid: number) => {
+        try {
+            const status = await fs.promises.readFile(`/proc/${pid}/status`, "utf8");
+            const uid = Number(/^Uid:\s+(\d+)/m.exec(status)?.[1]);
+            return Number.isInteger(uid) ? uid : null;
+        } catch { return null; }
+    });
+    const readPgrp = control.readPgrp ?? (async (pid: number) => {
+        try {
+            const stat = await fs.promises.readFile(`/proc/${pid}/stat`, "utf8");
+            const close = stat.lastIndexOf(")");
+            const pgrp = Number(close >= 0 ? stat.slice(close + 2).split(" ")[2] : "");
+            return Number.isInteger(pgrp) && pgrp > 1 ? pgrp : null;
+        } catch { return null; }
+    });
+    const signalGroup = control.signalGroup ?? ((pgrp: number, signal: "SIGTERM" | "SIGKILL") => process.kill(-pgrp, signal));
+    const leaderAlive = control.leaderAlive ?? ((pgrp: number) => { try { process.kill(pgrp, 0); return true; } catch { return false; } });
+    const sleep = control.sleep ?? ((ms: number) => Bun.sleep(ms));
+    const protectedPids = processAncestors(process.pid);
+    const groups = new Map<number, { starttime: string; exe: string; cwd: string; uid: number }>();
+    for (const [portText, app] of Object.entries(DEVNET_UI_LISTENER_APPS)) {
+        const port = Number(portText);
+        const appCwd = `${appsRoot}${app}`;
+        if (!(await portOpen(port))) continue;
+        let owner: number | null = null;
+        try { owner = await ownerOf(port); }
+        catch { throw new Error(`[DevNet] port ${port} listener owner is not attributable`); }
+        if (owner === null || protectedPids.has(owner)) {
+            throw new Error(`[DevNet] port ${port} listener is not an owned devnet UI process`);
+        }
+        const identity = await readIdentity(owner);
+        const uid = await readUid(owner);
+        const cwd = identity?.cwd ?? "";
+        const owned = identity !== null && uid !== null && uid === self
+            && path.basename(identity.exe) === "node"
+            && (cwd === appCwd || cwd.startsWith(`${appCwd}${path.sep}`));
+        if (!owned || identity === null) throw new Error(`[DevNet] port ${port} listener is not an owned devnet UI process`);
+        const again = await readIdentity(owner);
+        const uidAgain = await readUid(owner);
+        if (!again || uidAgain !== uid || again.starttime !== identity.starttime || again.exe !== identity.exe || again.cwd !== identity.cwd) {
+            throw new Error(`[DevNet] port ${port} owner changed before signal`);
+        }
+        const pgrp = await readPgrp(owner);
+        if (pgrp === null || protectedPids.has(pgrp)) throw new Error(`[DevNet] port ${port} process group is not an owned devnet UI process`);
+        const leader = await readIdentity(pgrp);
+        const leaderUid = await readUid(pgrp);
+        if (!leader || leaderUid !== uid || leader.exe !== identity.exe || path.basename(identity.exe) !== "node" || leader.cwd !== cwd) {
+            throw new Error(`[DevNet] port ${port} process group leader is not the owned listener context`);
+        }
+        const leaderAgain = await readIdentity(pgrp);
+        if (!leaderAgain || leaderAgain.starttime !== leader.starttime || leaderAgain.exe !== leader.exe || leaderAgain.cwd !== leader.cwd) {
+            throw new Error(`[DevNet] port ${port} process group leader changed before signal`);
+        }
+        const recorded = groups.get(pgrp);
+        if (recorded && (recorded.starttime !== leader.starttime || recorded.exe !== leader.exe || recorded.cwd !== leader.cwd || recorded.uid !== uid)) {
+            throw new Error(`[DevNet] devnet UI process group ${pgrp} has conflicting listeners`);
+        }
+        groups.set(pgrp, { starttime: leader.starttime, exe: leader.exe, cwd: leader.cwd, uid });
+    }
+    for (const [pgrp, expected] of groups) {
+        const leader = await readIdentity(pgrp);
+        const leaderUid = await readUid(pgrp);
+        if (!leader || leaderUid !== expected.uid || leader.starttime !== expected.starttime || leader.exe !== expected.exe || leader.cwd !== expected.cwd) {
+            throw new Error(`[DevNet] devnet UI process group ${pgrp} was reused before SIGTERM`);
+        }
+        try { signalGroup(pgrp, "SIGTERM"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    }
+    const deadline = Date.now() + PURGE_ANVIL_SIGNAL_WAIT_MS;
+    while (Date.now() < deadline && [...groups.keys()].some(leaderAlive)) await sleep(50);
+    for (const [pgrp, expected] of groups) {
+        if (!leaderAlive(pgrp)) continue;
+        const leader = await readIdentity(pgrp);
+        const leaderUid = await readUid(pgrp);
+        if (!leader || leaderUid !== expected.uid || leader.starttime !== expected.starttime || leader.exe !== expected.exe || leader.cwd !== expected.cwd) {
+            throw new Error(`[DevNet] devnet UI process group ${pgrp} was reused before SIGKILL`);
+        }
+        try { signalGroup(pgrp, "SIGKILL"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    }
+}
+
+
 
 
 async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promise<void> {
@@ -5036,6 +5143,7 @@ async function teardownDevnet(cwd: string = ".", purge: boolean = false): Promis
     }
     console.log(`
 [DevNet] Tearing down... (purge)`);
+    await stopOwnedDevnetUiListeners(cwd);
     await killKnownProcesses();
     await purgeDevnet(cwd);
 }
@@ -5855,10 +5963,12 @@ export class DevNetProcessManager {
     }
 
 
-    async startGuardianServices(cwd: string, daemonConfigPath: string): Promise<void> {
+    async startGuardianServices(cwd: string, daemonConfigPath: string, l1ConfigArgs: readonly string[]): Promise<void> {
         const config = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath, "utf8"));
         const rpcConfig = path.resolve(cwd, config.rpc_config as string);
         const guardianRoot = await resolveGuardianRoot(cwd, String(config.guardian_root ?? ""));
+        const guardianEnv = this.getEnvWithRustLogDirective('psy_relayer_cli=info');
+        await assertGuardianKeystoresPresent(guardianEnv);
         // All three guardians launch concurrently; each spawn blocks on its own 600s
         // HTTP readiness budget and kills its own child when readiness fails. Every
         // successful child is tracked immediately so a failing sibling cannot orphan
@@ -5869,12 +5979,13 @@ export class DevNetProcessManager {
             const name = `guardian_${id}`;
             const process = await RunningProcess.spawn([
                 './target/release/psy_relayer_cli', 'guardian-service',
-                '--rpc-config', rpcConfig, '--guardian-root', guardianRoot, '--guardian-id', String(id),
+                '--rpc-config', rpcConfig, '--guardian-root', guardianRoot,
+                ...l1ConfigArgs, '--guardian-id', String(id),
             ], {
                 cwd,
                 stdoutLogFile: path.join(cwd, 'logs', `${name}_logs.txt`),
                 stderrLogFile: path.join(cwd, 'logs', `${name}_errs.txt`),
-                env: this.getEnvWithRustLogDirective('psy_relayer_cli=info'),
+                env: guardianEnv,
             });
             started.push(process);
             return this.track(process, name);
@@ -6438,9 +6549,12 @@ export class DevNetProcessManager {
             if (l1Failure) throw l1Failure.reason;
         }
         if (this.freshState) {
-            await this.freshState.authorize();
+            await this.freshState.finish();
             this.freshState = undefined;
         }
+        // Deployment documents of exactly the selected chains, passed as repeatable
+        // --l1-config paths. The documents stay where deployment wrote them.
+        const l1ConfigArgs = startBridgeProposerDaemon ? await resolveL1ConfigArgs(cwd, relayerChains) : [];
         // 11. Bridge dependencies (Envio + psy-services)
         if (relayer || options.bridgeUi || options.psyPrivacyBridge || startAll) {
             const relayerConfig = options.relayerConfig || './psy_cli/psy_relayer_cli/config/local.toml';
@@ -6666,12 +6780,12 @@ export class DevNetProcessManager {
         // Relayer immediately requests Groth16 proofs; wait for listen first.
         if (startBridgeProposerDaemon) {
             await waitForProveProxy("bridge relayer");
-            await this.startGuardianServices(cwd, daemonConfigPath!);
+            await this.startGuardianServices(cwd, daemonConfigPath!, l1ConfigArgs);
 
             // Forward the whole operator config unchanged; the daemon owns protocol and credential validation.
 
             this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                ['./target/release/psy_relayer_cli', '--config', daemonConfigPath!],
+                ['./target/release/psy_relayer_cli', '--config', daemonConfigPath!, ...l1ConfigArgs],
                 relayerStartedDetector,
                 {
                     cwd,

@@ -1,7 +1,7 @@
 use bincode::Options;
 use redb::{Key, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle, TypeName, Value};
 
-use std::{collections::{BTreeMap, BTreeSet}, fs::File, path::Path, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, fs::File, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use anyhow::{Context, ensure};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -11,7 +11,7 @@ use psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature;
 use psy_prover::signature::users::multisig_user::validate_policy_signatures;
 use psy_vm::ups::multisig::{MultisigPolicy, MultisigSignatures};
 
-use guardian_common::protocol::{self, advance_included_account, validate_changed_deposit_tree_states, DepositTreeState, GuardianAccount, GuardianAuthorization, GuardianSession, GuardianSignError, GuardianSignRequest, GuardianSignResponse, GuardianSignErrorResponse, GuardianSessionRecord, GuardianSessionsResponse, HaltReason, JsonText, MAX_BODY_BYTES};
+use guardian_common::protocol::{self, advance_included_account, validate_changed_deposit_tree_states, DepositTreeState, GuardianAccount, GuardianSession, GuardianSignError, GuardianSignRequest, GuardianSignResponse, GuardianSignErrorResponse, GuardianSessionRecord, GuardianSessionsResponse, HaltReason, JsonText, BRIDGE_USER_ID, MAX_BODY_BYTES};
 use guardian_common::runtime::{create_db_file, open_db_file};
 
 pub(crate) struct LoadedGuardianConfig {
@@ -20,21 +20,20 @@ pub(crate) struct LoadedGuardianConfig {
 }
 
 impl LoadedGuardianConfig {
-    pub fn load_network(rpc_config: &Path, guardian_root: &Path) -> anyhow::Result<guardian_common::protocol::GuardianConfig> {
-        guardian_common::protocol::GuardianConfig::load(rpc_config, guardian_root).map_err(Into::into)
+    pub async fn load_network(rpc_config: &Path, guardian_root: &Path, local_documents: &[PathBuf]) -> anyhow::Result<guardian_common::protocol::GuardianConfig> {
+        guardian_common::protocol::GuardianConfig::load(rpc_config, guardian_root, local_documents).await.map_err(Into::into)
     }
 
-    pub fn load(rpc_config: &Path, guardian_root: &Path) -> anyhow::Result<Self> {
-        let root = Self::load_network(rpc_config, guardian_root)?;
-        let db = Arc::new(RelayerDb::open(&root.guardian_root, root.authorization.clone())?);
+    pub async fn load(rpc_config: &Path, guardian_root: &Path, local_documents: &[PathBuf]) -> anyhow::Result<Self> {
+        let root = Self::load_network(rpc_config, guardian_root, local_documents).await?;
+        let db = Arc::new(RelayerDb::open(&root.guardian_root)?);
         Ok(Self { root, db })
     }
 
     pub fn endpoints(&self) -> &[String; 3] { &self.root.endpoints }
 
-    pub fn l1_endpoints(&self) -> &[psy_config::ChainEndpoint] { &self.root.network.l1_endpoints }
 
-    pub fn authorization(&self) -> &GuardianAuthorization { &self.root.authorization }
+    pub fn config(&self) -> &guardian_common::protocol::GuardianConfig { &self.root }
 
     pub async fn serve_history(&self) -> anyhow::Result<()> {
         let listen = self.root.network.guardian_history.as_ref().context("guardian history missing")?.listen_address.to_string();
@@ -264,7 +263,10 @@ pub(crate) struct FinalizationRange {
     pub to_checkpoint: u64,
 }
 
-const RELAYER_TABLES: [&str; 7] = ["chain_claims", "finalization_batch", "guardian_account", "deposit_tree_states", "included_withdrawal_burns", "guardian_withdrawal_nonce", "relayer_request"];
+const JOURNAL_SCHEMA: TableDefinition<(), u64> = TableDefinition::new("journal_schema");
+const JOURNAL_SCHEMA_VERSION: u64 = 2;
+const RELAYER_TABLES: [&str; 8] = ["journal_schema", "chain_claims", "finalization_batch", "guardian_account", "deposit_tree_states", "included_withdrawal_burns", "guardian_withdrawal_nonce", "relayer_request"];
+const LEGACY_JOURNAL: &str = "incompatible legacy journal schema; explicit operator-controlled migration is required";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DepositTreeKey(u64, u64, u8);
@@ -324,10 +326,10 @@ fn decode_progress<T: serde::de::DeserializeOwned + serde::Serialize>(bytes: &[u
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum Request {
-    Request { request: String, authorization_sha256: protocol::Hex32, deposit_tree_states: Vec<DepositTreeState> },
-    Signed { request: String, authorization_sha256: protocol::Hex32, deposit_tree_states: Vec<DepositTreeState>, signatures: String },
-    Proved { request: String, authorization_sha256: protocol::Hex32, deposit_tree_states: Vec<DepositTreeState>, signatures: String, endcap: Vec<u8> },
-    Included { authorization_sha256: protocol::Hex32, record: GuardianSessionRecord },
+    Request { request: String, deposit_tree_states: Vec<DepositTreeState> },
+    Signed { request: String, deposit_tree_states: Vec<DepositTreeState>, signatures: String },
+    Proved { request: String, deposit_tree_states: Vec<DepositTreeState>, signatures: String, endcap: Vec<u8> },
+    Included { record: GuardianSessionRecord },
 }
 
 impl Request {
@@ -337,10 +339,12 @@ impl Request {
             Self::Included { record, .. } => record.request_json.as_str(),
         }
     }
-    fn authorization_sha256(&self) -> protocol::Hex32 {
-        match self {
-            Self::Request { authorization_sha256, .. } | Self::Signed { authorization_sha256, .. } | Self::Proved { authorization_sha256, .. } | Self::Included { authorization_sha256, .. } => *authorization_sha256,
-        }
+    fn account_key(&self) -> anyhow::Result<protocol::Hash4> {
+        let request = GuardianSignRequest::parse(self.request_text().as_bytes()).map_err(|error| anyhow::anyhow!(error))?;
+        Ok(request.decode_trace()?.meta.public_key)
+    }
+    fn request(&self) -> anyhow::Result<JsonText<GuardianSignRequest>> {
+        JsonText::parse(self.request_text().to_owned()).map_err(|error| anyhow::anyhow!(error))
     }
     fn deposit_tree_states(&self) -> &[DepositTreeState] {
         match self {
@@ -357,12 +361,12 @@ impl Request {
     }
 }
 
-pub(crate) struct RelayerDb { db: Arc<redb::Database>, authorization: Arc<GuardianAuthorization> }
+pub(crate) struct RelayerDb { db: Arc<redb::Database> }
 
 impl RelayerDb {
     /// Opens one request database. A missing file is created once; a pre-existing zero-length file is rejected.
     /// The held database is the process lock. The root is walked with `O_NOFOLLOW` and owner/mode checks.
-    pub fn open(guardian_root: &Path, authorization: Arc<GuardianAuthorization>) -> anyhow::Result<Self> {
+    pub fn open(guardian_root: &Path) -> anyhow::Result<Self> {
         let relative = Path::new("db/relayer.redb");
         let (file, parent, created) = match open_db_file(guardian_root, relative) {
             Ok(file) => (file, None, false),
@@ -372,13 +376,13 @@ impl RelayerDb {
             }
         };
         if !created && file.metadata()?.len() == 0 { anyhow::bail!("relayer database is empty"); }
-        let db = Self::open_file(file, authorization)?;
+        let db = Self::open_file(file)?;
         if let Some(parent) = parent { parent.sync_all()?; }
         Ok(db)
     }
 
     /// Validates one already-open database handle. Callers that did not use `open` must have applied the same protections.
-    fn open_file(file: File, authorization: Arc<GuardianAuthorization>) -> anyhow::Result<Self> {
+    fn open_file(file: File) -> anyhow::Result<Self> {
         let db = redb::Database::builder().create_file(file).context("relayer database open failed")?;
         let names = {
             let tx = db.begin_read()?;
@@ -386,9 +390,9 @@ impl RelayerDb {
             let names = tx.list_tables()?.map(|table| table.name().to_owned()).collect::<std::collections::BTreeSet<_>>();
             names
         };
-        ensure!(names.is_empty() || names == RELAYER_TABLES.into_iter().map(str::to_owned).collect::<std::collections::BTreeSet<String>>(), "relayer database table set rejected");
-        {
+        if names.is_empty() {
             let tx = db.begin_write()?;
+            tx.open_table(JOURNAL_SCHEMA)?.insert((), JOURNAL_SCHEMA_VERSION)?;
             tx.open_table(RELAYER_REQUEST)?;
             tx.open_table(GUARDIAN_ACCOUNT)?;
             tx.open_table(DEPOSIT_TREE_STATES)?;
@@ -397,14 +401,20 @@ impl RelayerDb {
             tx.open_table(CHAIN_CLAIMS)?;
             tx.open_table(FINALIZATION_BATCH)?;
             tx.commit()?;
+        } else {
+            ensure!(names == RELAYER_TABLES.into_iter().map(str::to_owned).collect::<std::collections::BTreeSet<String>>(), "{LEGACY_JOURNAL}");
+            let tx = db.begin_read()?;
+            let schema = tx.open_table(JOURNAL_SCHEMA)?;
+            ensure!(schema.get(())?.map(|row| row.value()) == Some(JOURNAL_SCHEMA_VERSION) && schema.len()? == 1, "{LEGACY_JOURNAL}");
         }
-        Ok(Self { db: Arc::new(db), authorization })
+        Ok(Self { db: Arc::new(db) })
     }
 
-    fn authorization_digest(&self, request: &GuardianSignRequest) -> anyhow::Result<protocol::Hex32> {
-        let current = self.authorization.digest().map_err(|error| anyhow::anyhow!(error))?;
-        ensure!(request.authorization_sha256 == current, "relayer request is not bound to the current authorization");
-        Ok(current)
+    fn current_identity(&self, config: &protocol::GuardianConfig, request: &GuardianSignRequest) -> anyhow::Result<protocol::Hash4> {
+        let identity = config.account_public_key().map_err(|error| anyhow::anyhow!(error))?;
+        request.validate_authorization(config).map_err(|error| anyhow::anyhow!(error))?;
+        ensure!(request.decode_trace()?.meta.public_key == identity, "relayer request account identity differs from the configured account");
+        Ok(identity)
     }
 
     fn row(&self, nonce: u64) -> anyhow::Result<Option<Request>> {
@@ -415,10 +425,10 @@ impl RelayerDb {
 
     fn same_stage(saved: &Request, next: &Request) -> anyhow::Result<bool> {
         Ok(match (saved, next) {
-            (Request::Request { request, authorization_sha256, deposit_tree_states }, Request::Request { request: next_request, authorization_sha256: next_digest, deposit_tree_states: next_deposit_tree_states }) => request == next_request && authorization_sha256 == next_digest && deposit_tree_states == next_deposit_tree_states,
-            (Request::Signed { request, authorization_sha256, deposit_tree_states, signatures }, Request::Signed { request: next_request, authorization_sha256: next_digest, deposit_tree_states: next_deposit_tree_states, signatures: next_signatures }) => request == next_request && authorization_sha256 == next_digest && deposit_tree_states == next_deposit_tree_states && signatures == next_signatures,
-            (Request::Proved { request, authorization_sha256, deposit_tree_states, signatures, endcap }, Request::Proved { request: next_request, authorization_sha256: next_digest, deposit_tree_states: next_deposit_tree_states, signatures: next_signatures, endcap: next_endcap }) => request == next_request && authorization_sha256 == next_digest && deposit_tree_states == next_deposit_tree_states && signatures == next_signatures && endcap == next_endcap,
-            (Request::Included { authorization_sha256, record }, Request::Included { authorization_sha256: next_digest, record: next_record }) => authorization_sha256 == next_digest && serde_json::to_vec(record)? == serde_json::to_vec(next_record)?,
+            (Request::Request { request, deposit_tree_states }, Request::Request { request: next_request, deposit_tree_states: next_deposit_tree_states }) => request == next_request && deposit_tree_states == next_deposit_tree_states,
+            (Request::Signed { request, deposit_tree_states, signatures }, Request::Signed { request: next_request, deposit_tree_states: next_deposit_tree_states, signatures: next_signatures }) => request == next_request && deposit_tree_states == next_deposit_tree_states && signatures == next_signatures,
+            (Request::Proved { request, deposit_tree_states, signatures, endcap }, Request::Proved { request: next_request, deposit_tree_states: next_deposit_tree_states, signatures: next_signatures, endcap: next_endcap }) => request == next_request && deposit_tree_states == next_deposit_tree_states && signatures == next_signatures && endcap == next_endcap,
+            (Request::Included { record }, Request::Included { record: next_record }) => serde_json::to_vec(record)? == serde_json::to_vec(next_record)?,
             _ => false,
         })
     }
@@ -434,7 +444,7 @@ impl RelayerDb {
                     | (Request::Signed { .. }, Request::Proved { .. }));
                 ensure!(advances
                     && saved.request_text() == next.request_text()
-                    && saved.authorization_sha256() == next.authorization_sha256()
+                    && saved.account_key()? == next.account_key()?
                     && saved.deposit_tree_states() == next.deposit_tree_states()
                     && saved.signatures_text().is_none_or(|signatures| Some(signatures) == next.signatures_text()),
                     "relayer request row conflict");
@@ -476,22 +486,22 @@ impl RelayerDb {
         Ok(())
     }
 
-    /// Binds daemon progress rows to the authorization digest stored in the latest archived request (account fallback), never a mirror row; returns whether a durable binding exists and fails closed on any mismatch.
-    fn progress_binding(&self) -> anyhow::Result<bool> {
-        let current = self.authorization.digest().map_err(|error| anyhow::anyhow!(error))?;
+    /// Progress is usable once a request or the sole account row carries the configured account identity.
+    fn progress_binding(&self, config: &protocol::GuardianConfig) -> anyhow::Result<bool> {
+        let identity = config.account_public_key().map_err(|error| anyhow::anyhow!(error))?;
         let tx = self.db.begin_read()?;
         let requests = tx.open_table(RELAYER_REQUEST)?;
         if let Some(row) = requests.range::<u64>(..)?.next_back() {
             let (_, row) = row?;
-            ensure!(decode(row.value())?.authorization_sha256() == current, "stored daemon progress is bound to a different authorization");
+            ensure!(decode(row.value())?.account_key()? == identity, "stored daemon progress is bound to a different account");
             return Ok(true);
         }
         let accounts = tx.open_table(GUARDIAN_ACCOUNT)?;
         let mut account_rows = accounts.iter()?;
         if let Some((_, row)) = account_rows.next().transpose()? {
             let account = decode_canonical::<GuardianAccount>(row.value())?;
-            ensure!(account_rows.next().transpose()?.is_none(), "stored progress binds two different authorizations");
-            ensure!(account.authorization_sha256 == current, "stored daemon progress is bound to a different authorization");
+            ensure!(account_rows.next().transpose()?.is_none(), "stored progress binds two different accounts");
+            ensure!(account.account_public_key == identity, "stored daemon progress is bound to a different account");
             return Ok(true);
         }
         Ok(false)
@@ -503,10 +513,10 @@ impl RelayerDb {
         let claims = tx.open_table(CHAIN_CLAIMS)?;
         for item in claims.iter()? {
             let (_, row) = item?;
-            ensure!(decode_progress::<ChainClaims>(row.value())? == ChainClaims::default(), "stored daemon progress has no durable authorization binding");
+            ensure!(decode_progress::<ChainClaims>(row.value())? == ChainClaims::default(), "stored daemon progress has no durable account binding");
         }
         if let Some(row) = tx.open_table(FINALIZATION_BATCH)?.get(())? {
-            ensure!(decode_progress::<FinalizationBatch>(row.value())? == FinalizationBatch::default(), "stored daemon progress has no durable authorization binding");
+            ensure!(decode_progress::<FinalizationBatch>(row.value())? == FinalizationBatch::default(), "stored daemon progress has no durable account binding");
         }
         Ok(())
     }
@@ -535,8 +545,8 @@ impl RelayerDb {
         Ok(tx.open_table(FINALIZATION_BATCH)?.get(())?.map(|row| row.value().to_vec()))
     }
 
-    pub(crate) fn chain_claims(&self) -> anyhow::Result<BTreeMap<u8, ChainClaims>> {
-        if !self.progress_binding()? { self.ensure_fresh_progress_default()?; }
+    pub(crate) fn chain_claims(&self, config: &protocol::GuardianConfig) -> anyhow::Result<BTreeMap<u8, ChainClaims>> {
+        if !self.progress_binding(config)? { self.ensure_fresh_progress_default()?; }
         let tx = self.db.begin_read()?;
         let table = tx.open_table(CHAIN_CLAIMS)?;
         let mut rows = BTreeMap::new();
@@ -547,9 +557,9 @@ impl RelayerDb {
         Ok(rows)
     }
 
-    pub(crate) fn save_chain_claims(&self, chain: u8, claims: &ChainClaims) -> anyhow::Result<()> {
-        let bound = self.progress_binding()?;
-        ensure!(bound || *claims == ChainClaims::default(), "non-default daemon progress requires a durable authorization binding");
+    pub(crate) fn save_chain_claims(&self, config: &protocol::GuardianConfig, chain: u8, claims: &ChainClaims) -> anyhow::Result<()> {
+        let bound = self.progress_binding(config)?;
+        ensure!(bound || *claims == ChainClaims::default(), "non-default daemon progress requires a durable account binding");
         let tx = self.db.begin_write()?;
         {
             let mut table = tx.open_table(CHAIN_CLAIMS)?;
@@ -560,8 +570,8 @@ impl RelayerDb {
         Ok(())
     }
 
-    pub(crate) fn finalization_batch(&self) -> anyhow::Result<FinalizationBatch> {
-        if !self.progress_binding()? { self.ensure_fresh_progress_default()?; }
+    pub(crate) fn finalization_batch(&self, config: &protocol::GuardianConfig) -> anyhow::Result<FinalizationBatch> {
+        if !self.progress_binding(config)? { self.ensure_fresh_progress_default()?; }
         let tx = self.db.begin_read()?;
         let table = tx.open_table(FINALIZATION_BATCH)?;
         Ok(match table.get(())? {
@@ -570,9 +580,9 @@ impl RelayerDb {
         })
     }
 
-    pub(crate) fn save_finalization_batch(&self, batch: &FinalizationBatch) -> anyhow::Result<()> {
-        let bound = self.progress_binding()?;
-        ensure!(bound || *batch == FinalizationBatch::default(), "non-default daemon progress requires a durable authorization binding");
+    pub(crate) fn save_finalization_batch(&self, config: &protocol::GuardianConfig, batch: &FinalizationBatch) -> anyhow::Result<()> {
+        let bound = self.progress_binding(config)?;
+        ensure!(bound || *batch == FinalizationBatch::default(), "non-default daemon progress requires a durable account binding");
         let tx = self.db.begin_write()?;
         self.write_finalization_batch(&tx, batch)?;
         tx.commit()?;
@@ -580,9 +590,9 @@ impl RelayerDb {
     }
     /// The shared batch and every chain-claims row are one recovery image.
     /// A crash between them would resume a range against a different claim set.
-    pub(crate) fn save_claims_and_batch(&self, claims: &BTreeMap<u8, ChainClaims>, batch: &FinalizationBatch) -> anyhow::Result<()> {
-        let bound = self.progress_binding()?;
-        ensure!(bound || (batch == &FinalizationBatch::default() && claims.values().all(|row| row == &ChainClaims::default())), "non-default daemon progress requires a durable authorization binding");
+    pub(crate) fn save_claims_and_batch(&self, config: &protocol::GuardianConfig, claims: &BTreeMap<u8, ChainClaims>, batch: &FinalizationBatch) -> anyhow::Result<()> {
+        let bound = self.progress_binding(config)?;
+        ensure!(bound || (batch == &FinalizationBatch::default() && claims.values().all(|row| row == &ChainClaims::default())), "non-default daemon progress requires a durable account binding");
         let tx = self.db.begin_write()?;
         {
             let mut table = tx.open_table(CHAIN_CLAIMS)?;
@@ -606,9 +616,9 @@ impl RelayerDb {
     }
 
 
-    pub(crate) fn save_finalization_and_claims(&self, batch: &FinalizationBatch, claims: &[crate::bridge::propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<()> {
-        let bound = self.progress_binding()?;
-        ensure!(bound || (batch == &FinalizationBatch::default() && claims.is_empty()), "non-default daemon progress requires a durable authorization binding");
+    pub(crate) fn save_finalization_and_claims(&self, config: &protocol::GuardianConfig, batch: &FinalizationBatch, claims: &[crate::bridge::propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<()> {
+        let bound = self.progress_binding(config)?;
+        ensure!(bound || (batch == &FinalizationBatch::default() && claims.is_empty()), "non-default daemon progress requires a durable account binding");
         let tx = self.db.begin_write()?;
         {
             self.write_finalization_batch(&tx, batch)?;
@@ -620,9 +630,9 @@ impl RelayerDb {
 
 
 
-    pub(crate) fn save_request(&self, request: &JsonText<GuardianSignRequest>, deposit_tree_states: &[DepositTreeState], claims: &[crate::bridge::propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<()> {
+    pub(crate) fn save_request(&self, config: &protocol::GuardianConfig, request: &JsonText<GuardianSignRequest>, deposit_tree_states: &[DepositTreeState], claims: &[crate::bridge::propose_withdrawals::PendingWithdrawal]) -> anyhow::Result<()> {
         let decoded = request.decode()?;
-        let digest = self.authorization_digest(&decoded)?;
+        let identity = self.current_identity(config, &decoded)?;
         validate_changed_deposit_tree_states(&decoded, deposit_tree_states).map_err(|error| anyhow::anyhow!(error))?;
         let tx = self.db.begin_write()?;
         {
@@ -636,12 +646,12 @@ impl RelayerDb {
                 let nonce = nonce.value();
                 let saved = decode(row.value())?;
                 if !matches!(saved, Request::Included { .. }) {
-                    ensure!(nonce == decoded.session_nonce && saved.request_text() == request.as_str() && saved.authorization_sha256() == digest && saved.deposit_tree_states() == deposit_tree_states, "multiple unresolved account requests");
+                    ensure!(nonce == decoded.session_nonce && saved.request_text() == request.as_str() && saved.account_key()? == identity && saved.deposit_tree_states() == deposit_tree_states, "multiple unresolved account requests");
                 }
             }
             if requests.get(decoded.session_nonce)?.is_none() {
                 self.insert_chain_claims(&tx, claims)?;
-                let next = Request::Request { request: request.as_str().to_owned(), authorization_sha256: digest, deposit_tree_states: deposit_tree_states.to_vec() };
+                let next = Request::Request { request: request.as_str().to_owned(), deposit_tree_states: deposit_tree_states.to_vec() };
                 let bytes = serde_json::to_vec(&next)?;
                 requests.insert(decoded.session_nonce, bytes.as_slice())?;
             }
@@ -679,7 +689,7 @@ impl RelayerDb {
         let saved = self.row(nonce)?.context("guardian request not yet archived")?;
         let text = serde_json::to_string(signatures)?;
         let next = match saved {
-            Request::Request { request, authorization_sha256, deposit_tree_states } => Request::Signed { request, authorization_sha256, deposit_tree_states, signatures: text },
+            Request::Request { request, deposit_tree_states } => Request::Signed { request, deposit_tree_states, signatures: text },
             Request::Signed { signatures, .. } | Request::Proved { signatures, .. } => {
                 ensure!(signatures == text, "relayer signature row conflict");
                 return Ok(());
@@ -703,7 +713,7 @@ impl RelayerDb {
         ensure!(!proof.is_empty(), "archived proof is empty");
         let saved = self.row(nonce)?.context("guardian request not yet archived")?;
         let next = match saved {
-            Request::Signed { request, authorization_sha256, deposit_tree_states, signatures } => Request::Proved { request, authorization_sha256, deposit_tree_states, signatures, endcap: proof.to_vec() },
+            Request::Signed { request, deposit_tree_states, signatures } => Request::Proved { request, deposit_tree_states, signatures, endcap: proof.to_vec() },
             Request::Proved { endcap, .. } => {
                 ensure!(endcap == proof, "relayer proof row conflict");
                 return Ok(());
@@ -742,12 +752,13 @@ impl RelayerDb {
     /// Records the verified genesis account, the sole authorization binding a fresh
     /// daemon has before any request exists. Inserts it only when absent; an existing
     /// row is retained unchanged, including its nonce, checkpoint, frontiers, and halt.
-    pub(crate) fn ensure_genesis_account(&self, network: u64, user: u64, genesis_leaf: protocol::Hash4) -> anyhow::Result<()> {
-        let digest = self.authorization.digest().map_err(|error| anyhow::anyhow!(error))?;
+    pub(crate) fn ensure_genesis_account(&self, config: &protocol::GuardianConfig, genesis_leaf: protocol::Hash4) -> anyhow::Result<()> {
+        let network = config.network_magic().map_err(|error| anyhow::anyhow!(error))?;
+        let identity = config.account_public_key().map_err(|error| anyhow::anyhow!(error))?;
         let created = GuardianAccount {
-            network_magic: network, user_id: user, state: protocol::GuardianAccountState::Active,
+            network_magic: network, user_id: BRIDGE_USER_ID, state: protocol::GuardianAccountState::Active,
             last_checkpoint_id: 0, last_checkpoint_hash: genesis_leaf, imported_nonce: None,
-            authorization_sha256: digest, imported_ending_leaf: None, withdrawal_chains: Vec::new(), halt_reason: None,
+            account_public_key: identity, imported_ending_leaf: None, withdrawal_chains: Vec::new(), halt_reason: None,
         };
         created.validate().map_err(|error| anyhow::anyhow!(error))?;
         let created_bytes = encode_canonical(&created)?;
@@ -761,7 +772,7 @@ impl RelayerDb {
                     let saved: GuardianAccount = decode_canonical(row.value())?;
                     ensure!(stored.next().transpose()?.is_none(), "initialized guardian account binds a different identity");
                     ensure!(key.value() == (saved.network_magic, saved.user_id), "account key differs from encoded identity");
-                    ensure!((saved.network_magic, saved.user_id, saved.authorization_sha256) == (network, user, digest), "initialized guardian account differs from the verified authorization");
+                    ensure!((saved.network_magic, saved.user_id, saved.account_public_key) == (network, BRIDGE_USER_ID, identity), "initialized guardian account differs from the configured account");
                     saved.validate().map_err(|error| anyhow::anyhow!(error))?;
                     true
                 } else {
@@ -769,7 +780,7 @@ impl RelayerDb {
                 }
             };
             if !has_account {
-                accounts.insert((network, user), created_bytes.as_slice())?;
+                accounts.insert((network, BRIDGE_USER_ID), created_bytes.as_slice())?;
             }
         }
         tx.commit()?;
@@ -827,9 +838,9 @@ impl RelayerDb {
 
     /// Included transition, changed deposit-tree states, both point indexes, and the sole account checkpoint in one commit.
     /// `checkpoint_hash` is the authenticated checkpoint leaf hash. A conflicting replay of an included nonce halts and never rewinds.
-    pub(crate) fn import_verified(&self, session: &GuardianSession, deposit_tree_states: &[DepositTreeState], checkpoint_id: u64, checkpoint_hash: protocol::Hash4) -> anyhow::Result<()> {
-        let request = session.record.validate(&self.authorization).map_err(|error| anyhow::anyhow!(error))?;
-        let digest = self.authorization_digest(&request)?;
+    pub(crate) fn import_verified(&self, config: &protocol::GuardianConfig, session: &GuardianSession, deposit_tree_states: &[DepositTreeState], checkpoint_id: u64, checkpoint_hash: protocol::Hash4) -> anyhow::Result<()> {
+        let request = session.record.validate(config).map_err(|error| anyhow::anyhow!(error))?;
+        let identity = self.current_identity(config, &request)?;
         ensure!((request.network_magic, request.user_id, request.session_nonce) == (session.network_magic, session.user_id, session.nonce), "imported session identity mismatch");
         ensure!(session.record.included_checkpoint_id == checkpoint_id && session.record.included_checkpoint_hash == checkpoint_hash, "imported checkpoint is not the bound leaf");
         validate_changed_deposit_tree_states(&request, deposit_tree_states).map_err(|error| anyhow::anyhow!(error))?;
@@ -857,10 +868,10 @@ impl RelayerDb {
                     ensure!((account.network_magic, account.user_id) == key, "account key differs from encoded identity");
                     account
                 }
-                None => fresh_account(session, digest, checkpoint_id, checkpoint_hash),
+                None => fresh_account(session, identity, checkpoint_id, checkpoint_hash),
             };
             if account.state == guardian_common::protocol::GuardianAccountState::Halted { anyhow::bail!("halted account refuses import"); }
-            let included_row = Request::Included { authorization_sha256: digest, record: session.record.clone() };
+            let included_row = Request::Included { record: session.record.clone() };
             let same_included = current.as_ref().is_some_and(|row| matches!(row, Request::Included { .. }) && Self::same_stage(row, &included_row).unwrap_or(false));
             // An exact replay of the archived Included bytes is idempotent on the immutable
             // per-nonce row and must return Ok before any cursor halt. At the current nonce
@@ -1030,11 +1041,11 @@ fn halt_account(accounts: &mut redb::Table<(u64, u64), &[u8]>, account: &Guardia
     accounts.insert((halted.network_magic, halted.user_id), bytes.as_slice())?;
     Ok(())
 }
-fn fresh_account(session: &GuardianSession, digest: protocol::Hex32, checkpoint_id: u64, checkpoint_hash: protocol::Hash4) -> GuardianAccount {
+fn fresh_account(session: &GuardianSession, identity: protocol::Hash4, checkpoint_id: u64, checkpoint_hash: protocol::Hash4) -> GuardianAccount {
     GuardianAccount {
         network_magic: session.network_magic, user_id: session.user_id, state: guardian_common::protocol::GuardianAccountState::Active,
         last_checkpoint_id: checkpoint_id, last_checkpoint_hash: checkpoint_hash, imported_nonce: None,
-        authorization_sha256: digest, imported_ending_leaf: None, withdrawal_chains: Vec::new(), halt_reason: None,
+        account_public_key: identity, imported_ending_leaf: None, withdrawal_chains: Vec::new(), halt_reason: None,
     }
 }
 
@@ -1042,21 +1053,21 @@ pub(crate) async fn prove_pending_request(
     wallet: &mut psy_prover::session::WalletSession,
     client: &GuardianClient,
     archive: &RelayerDb,
-    authorization: &GuardianAuthorization,
+    config: &protocol::GuardianConfig,
     request_json: &JsonText<GuardianSignRequest>,
     deposit_tree_states: &[DepositTreeState],
 ) -> anyhow::Result<Vec<u8>> {
     use psy_prover::trace::{TraceStep, TraceSignCircuitSource};
     use psy_vm::ups::multisig::MultisigSignatureWitness;
     let request = request_json.decode()?;
-    request.validate_authorization(authorization)?;
+    request.validate_authorization(config)?;
     let trace = request.decode_trace()?;
     let witness = match trace.steps.last() {
         Some(TraceStep::ZkSign(step)) if matches!(step.sign_circuit_source, TraceSignCircuitSource::Multisig) => serde_json::from_slice::<MultisigSignatureWitness>(&step.sign_witness)?,
         _ => anyhow::bail!("guardian request is not a multisig trace"),
     };
     let (policy, _) = witness.policies()?;
-    archive.save_request(request_json, deposit_tree_states, &[])?;
+    archive.save_request(config, request_json, deposit_tree_states, &[])?;
     let signatures = match archive.signatures(request.session_nonce)? {
         Some(signatures) => signatures,
         None => {
@@ -1068,6 +1079,7 @@ pub(crate) async fn prove_pending_request(
     validate_policy_signatures(&signatures, &policy, trace.finalization.sig_hash)?;
     wallet.inject_multisig_signatures(trace.meta.public_key, signatures).await?;
     if let Some(proof) = archive.proof(request.session_nonce)? {
+        crate::guardian::verify::verify_cached_endcap_proof(wallet, &proof, &trace.finalization.submit_end_cap_input).await?;
         return Ok(proof);
     }
     let schedule = wallet.prepare_trace_proof_schedule(&trace).await?;
@@ -1092,24 +1104,33 @@ mod tests {
     use std::future::Future;
     use super::*;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn fixture_authorization() -> std::sync::Arc<GuardianAuthorization> {
-        std::sync::Arc::new(crate::guardian::test_fixture::codec_authorization_fixture())
-    }
+    fn fixture_config() -> protocol::GuardianConfig { crate::guardian::test_fixture::codec_guardian_config() }
 
     /// Owner-only root whose every ancestor satisfies `protected_file_at`:
     /// directory, uid 0 or the effective uid, and no group/other write.
     /// `/tmp` is `01777`, so a fixture there is rejected as `KeyUnavailable`.
     fn protected_root(label: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let base = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| home::home_dir().expect("home directory"));
-        let root = base.join(format!("relayer-db-{label}-{}-{}.dir", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::DirBuilder::new().mode(0o700).recursive(true).create(root.join("db")).unwrap();
-        root
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let root = base.join(format!("relayer-db-{label}-{}-{n}.dir", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+                Ok(()) => {
+                    std::fs::DirBuilder::new().mode(0o700).create(root.join("db")).unwrap();
+                    return root;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("protected fixture root: {error}"),
+            }
+        }
     }
 
     pub(super) fn fresh() -> (std::path::PathBuf, RelayerDb) {
         let root = protected_root("fresh");
-        let db = RelayerDb::open(&root, fixture_authorization()).unwrap();
+        let db = RelayerDb::open(&root).unwrap();
         (root, db)
     }
 
@@ -1129,7 +1150,7 @@ mod tests {
         trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash = end;
         let call_data = request.trace_json.decode().unwrap().call_data;
         request.trace_json = JsonText::from_value(&psy_prover::trace::GeneratedTxTraceJson::from_trace(&trace, call_data).unwrap()).unwrap();
-        request.validate_authorization(&fixture_authorization()).unwrap();
+        request.validate_authorization(&fixture_config()).unwrap();
         request
     }
 
@@ -1137,7 +1158,7 @@ mod tests {
     fn retained_stages_only_advance_with_immutable_payloads() {
         let (path, db) = fresh();
         let frozen = JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         let request = db.row(1).unwrap().unwrap();
         db.save_signatures(1, &signatures()).unwrap();
         let signed = db.row(1).unwrap().unwrap();
@@ -1153,7 +1174,7 @@ mod tests {
         let mut changed = proved.clone();
         if let Request::Proved { endcap, .. } = &mut changed { endcap[0] ^= 1; }
         assert!(db.retain(1, &changed).is_err());
-        db.save_request(&frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         db.save_signatures(1, &signatures()).unwrap();
         db.save_proof(1, &[0xAA]).unwrap();
         assert!(matches!(db.row(1).unwrap(), Some(Request::Proved { .. })));
@@ -1176,7 +1197,7 @@ mod tests {
         drop(db);
         let empty = protected_root("empty");
         std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(empty.join("db").join("relayer.redb")).unwrap();
-        assert!(RelayerDb::open(&empty, fixture_authorization()).is_err());
+        assert!(RelayerDb::open(&empty).is_err());
         let partial = protected_root("partial");
         let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(partial.join("db").join("relayer.redb")).unwrap();
 
@@ -1185,40 +1206,44 @@ mod tests {
         tx.open_table(redb::TableDefinition::<(), &[u8]>::new("guardian_authorization_index")).unwrap();
         tx.commit().unwrap();
         drop(raw);
-        assert!(RelayerDb::open(&partial, fixture_authorization()).is_err());
+        assert!(RelayerDb::open(&partial).is_err());
         let inspect = redb::Database::builder().create_file(std::fs::OpenOptions::new().read(true).write(true).open(partial.join("db").join("relayer.redb")).unwrap()).unwrap();
         assert!(inspect.begin_read().unwrap().open_table(RELAYER_REQUEST).is_err());
         for path in [root, empty, partial] { let _ = std::fs::remove_dir_all(path); }
     }
     #[test]
-    fn changed_authorization_refuses_stored_progress_and_leaves_rows_untouched() {
+    fn changed_account_refuses_stored_progress_and_leaves_rows_untouched() {
         let (root, db) = fresh();
         let request = crate::guardian::test_fixture::codec_request_fixture();
-        db.save_request(&JsonText::from_value(&request).unwrap(), &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &JsonText::from_value(&request).unwrap(), &[], &[]).unwrap();
         let prior_batch = FinalizationBatch { pending_finalization_range: Some(FinalizationRange { from_checkpoint: 1, to_checkpoint: 2 }), finalized_chains: BTreeSet::from([1]) };
-        db.save_finalization_batch(&prior_batch).unwrap();
+        db.save_finalization_batch(&fixture_config(), &prior_batch).unwrap();
         drop(db);
-        let mut changed = crate::guardian::test_fixture::codec_authorization_fixture();
-        changed.genesis_hash.0[0] ^= 1;
-        let changed_db = RelayerDb::open(&root, std::sync::Arc::new(changed)).unwrap();
-        assert!(changed_db.finalization_batch().is_err());
-        assert!(changed_db.chain_claims().is_err());
+        let mut changed = fixture_config();
+        changed.network.guardian_initial_member_hashes.as_mut().unwrap().swap(0, 1);
+        let changed_db = RelayerDb::open(&root).unwrap();
+        assert!(changed_db.finalization_batch(&changed).is_err());
+        assert!(changed_db.chain_claims(&changed).is_err());
         let next_batch = FinalizationBatch { pending_finalization_range: None, finalized_chains: BTreeSet::new() };
-        assert!(changed_db.save_finalization_batch(&next_batch).is_err());
-        assert!(changed_db.save_chain_claims(1, &ChainClaims::default()).is_err());
-        assert!(changed_db.save_finalization_and_claims(&next_batch, &[]).is_err());
-        assert!(changed_db.save_claims_and_batch(&BTreeMap::new(), &next_batch).is_err());
+        assert!(changed_db.save_finalization_batch(&changed, &next_batch).is_err());
+        assert!(changed_db.save_chain_claims(&changed, 1, &ChainClaims::default()).is_err());
+        assert!(changed_db.save_finalization_and_claims(&changed, &next_batch, &[]).is_err());
+        assert!(changed_db.save_claims_and_batch(&changed, &BTreeMap::new(), &next_batch).is_err());
         drop(changed_db);
-        let original = RelayerDb::open(&root, fixture_authorization()).unwrap();
-        assert_eq!(original.finalization_batch().unwrap(), prior_batch);
-        assert!(original.chain_claims().unwrap().is_empty());
+        let original = RelayerDb::open(&root).unwrap();
+        assert_eq!(original.finalization_batch(&fixture_config()).unwrap(), prior_batch);
+        assert!(original.chain_claims(&fixture_config()).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn open_rejects_missing_table_and_never_recreates_it() {
         let (root, db) = fresh();
+        let tx = db.db.begin_read().unwrap();
+        let before = tx.list_tables().unwrap().map(|table| table.name().to_owned()).collect::<std::collections::BTreeSet<_>>();
+        drop(tx);
         drop(db);
+        assert_eq!(before, RELAYER_TABLES.into_iter().map(str::to_owned).collect());
         {
             let file = std::fs::OpenOptions::new().read(true).write(true).open(root.join("db").join("relayer.redb")).unwrap();
             let raw = redb::Database::builder().create_file(file).unwrap();
@@ -1226,12 +1251,15 @@ mod tests {
             tx.delete_table(CHAIN_CLAIMS).unwrap();
             tx.commit().unwrap();
         }
-        assert!(RelayerDb::open(&root, fixture_authorization()).is_err());
+        let error = RelayerDb::open(&root).err().expect("incomplete schema must be rejected");
+        assert_eq!(error.to_string(), LEGACY_JOURNAL);
         let file = std::fs::OpenOptions::new().read(true).write(true).open(root.join("db").join("relayer.redb")).unwrap();
         let inspect = redb::Database::builder().create_file(file).unwrap();
         let names = inspect.begin_read().unwrap().list_tables().unwrap().map(|table| table.name().to_owned()).collect::<std::collections::BTreeSet<_>>();
-        assert!(!names.contains("chain_claims"));
-        assert_eq!(names.len(), 6);
+        assert!(!names.contains(CHAIN_CLAIMS.name()));
+        let mut expected = before;
+        expected.remove(CHAIN_CLAIMS.name());
+        assert_eq!(names, expected);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1243,17 +1271,17 @@ mod tests {
         let frozen = JsonText::from_value(&request).unwrap();
         let mut second = request.clone();
         second.session_nonce = 2;
-        assert!(db.save_request(&JsonText::from_value(&second).unwrap(), &[], &[]).is_err());
-        db.save_request(&frozen, &[], &[]).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
+        assert!(db.save_request(&fixture_config(), &JsonText::from_value(&second).unwrap(), &[], &[]).is_err());
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         let mut changed = request.clone();
-        changed.authorization_sha256.0[0] ^= 1;
-        assert!(db.save_request(&JsonText::from_value(&changed).unwrap(), &[], &[]).is_err());
-        assert!(db.save_request(&JsonText::from_value(&second).unwrap(), &[], &[]).is_err());
+        changed.session_nonce = 9;
+        assert!(db.save_request(&fixture_config(), &JsonText::from_value(&changed).unwrap(), &[], &[]).is_err());
+        assert!(db.save_request(&fixture_config(), &JsonText::from_value(&second).unwrap(), &[], &[]).is_err());
         assert_eq!(db.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
         assert_eq!(db.load_session(1, request.request_id().unwrap()).unwrap().0.as_str(), frozen.as_str());
         drop(db);
-        let reopened = RelayerDb::open(&path, fixture_authorization()).unwrap();
+        let reopened = RelayerDb::open(&path).unwrap();
         assert_eq!(reopened.load_session(1, request.request_id().unwrap()).unwrap().0.as_str(), frozen.as_str());
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -1263,7 +1291,7 @@ mod tests {
         let (path, db) = fresh();
         let request = crate::guardian::test_fixture::codec_request_fixture();
         let frozen = JsonText::from_value(&request).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         assert!(db.signatures(1).unwrap().is_none());
         let saved = signatures();
         db.save_signatures(1, &saved).unwrap();
@@ -1274,7 +1302,7 @@ mod tests {
         assert_eq!(db.signatures(1).unwrap().unwrap().member_indices, vec![0, 2]);
         assert_eq!(db.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
         drop(db);
-        let reopened = RelayerDb::open(&path, fixture_authorization()).unwrap();
+        let reopened = RelayerDb::open(&path).unwrap();
         assert_eq!(reopened.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
         assert!(reopened.proof(1).unwrap().is_none());
         std::fs::remove_dir_all(path).unwrap();
@@ -1285,7 +1313,7 @@ mod tests {
         let (path, db) = fresh();
         let request = import_request(1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8));
         let frozen = JsonText::from_value(&request).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         let saved = signatures();
         db.save_signatures(1, &saved).unwrap();
         db.save_proof(1, &[0xAA]).unwrap();
@@ -1297,8 +1325,8 @@ mod tests {
             endcap_proof_hex: "0xaa".to_owned(), included_checkpoint_id: 1, included_checkpoint_hash: QHashOut::from_values(1, 2, 3, 4),
         };
         let session = GuardianSession { network_magic: request.network_magic, user_id: request.user_id, nonce: 1, record: record.clone(), starting_leaf_hash: protocol::Hash4::ZERO, ending_leaf_hash: QHashOut::from_values(5, 6, 7, 8), withdrawal_appends: Vec::new() };
-        db.import_verified(&session, &[], 1, record.included_checkpoint_hash).unwrap();
-        db.import_verified(&session, &[], 1, record.included_checkpoint_hash).unwrap();
+        db.import_verified(&fixture_config(), &session, &[], 1, record.included_checkpoint_hash).unwrap();
+        db.import_verified(&fixture_config(), &session, &[], 1, record.included_checkpoint_hash).unwrap();
         assert_eq!(db.load_account(request.network_magic, request.user_id).unwrap().unwrap().imported_nonce, Some(1));
         assert!(db.pending_request().unwrap().is_none());
         assert_eq!(db.signatures(1).unwrap().unwrap().member_indices, vec![0, 2]);
@@ -1307,19 +1335,19 @@ mod tests {
         assert_eq!(page.sessions.len(), 1);
         assert!(!page.has_more);
         let next = import_request(3, session.ending_leaf_hash, QHashOut::from_values(9, 9, 9, 9));
-        assert!(db.save_request(&JsonText::from_value(&next).unwrap(), &[], &[]).is_err());
+        assert!(db.save_request(&fixture_config(), &JsonText::from_value(&next).unwrap(), &[], &[]).is_err());
         assert!(db.sessions(1, 1).unwrap().sessions.is_empty());
         drop(db);
-        let reopened = RelayerDb::open(&path, fixture_authorization()).unwrap();
+        let reopened = RelayerDb::open(&path).unwrap();
         assert!(reopened.pending_request().unwrap().is_none());
         assert_eq!(reopened.sessions(0, 64).unwrap().sessions.len(), 1);
         let mut conflict = session.clone();
         conflict.ending_leaf_hash = QHashOut::from_values(9, 9, 9, 9);
-        assert!(reopened.import_verified(&conflict, &[], 1, record.included_checkpoint_hash).is_err());
+        assert!(reopened.import_verified(&fixture_config(), &conflict, &[], 1, record.included_checkpoint_hash).is_err());
         let halted = reopened.load_account(request.network_magic, request.user_id).unwrap().unwrap();
         assert_eq!(halted.state, guardian_common::protocol::GuardianAccountState::Halted);
         assert_eq!(halted.imported_nonce, Some(1));
-        assert!(reopened.import_verified(&session, &[], 1, record.included_checkpoint_hash).is_err());
+        assert!(reopened.import_verified(&fixture_config(), &session, &[], 1, record.included_checkpoint_hash).is_err());
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
@@ -1327,7 +1355,7 @@ mod tests {
         let (path, db) = fresh();
         let request = import_request(1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8));
         let frozen = JsonText::from_value(&request).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         let saved = signatures();
         db.save_signatures(1, &saved).unwrap();
         db.save_proof(1, &[0xAA]).unwrap();
@@ -1338,16 +1366,16 @@ mod tests {
             endcap_proof_hex: "0xaa".to_owned(), included_checkpoint_id: 1, included_checkpoint_hash: QHashOut::from_values(1, 2, 3, 4),
         };
         let session = GuardianSession { network_magic: request.network_magic, user_id: request.user_id, nonce: 1, record: record.clone(), starting_leaf_hash: protocol::Hash4::ZERO, ending_leaf_hash: QHashOut::from_values(5, 6, 7, 8), withdrawal_appends: Vec::new() };
-        db.import_verified(&session, &[], 1, record.included_checkpoint_hash).unwrap();
+        db.import_verified(&fixture_config(), &session, &[], 1, record.included_checkpoint_hash).unwrap();
         assert!(db.pending_request().unwrap().is_none());
         let next = import_request(2, session.ending_leaf_hash, QHashOut::from_values(9, 9, 9, 9));
         let next_frozen = JsonText::from_value(&next).unwrap();
-        db.save_request(&next_frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &next_frozen, &[], &[]).unwrap();
         assert_eq!(db.pending_request().unwrap().unwrap().as_str(), next_frozen.as_str());
         let skipped = import_request(3, session.ending_leaf_hash, QHashOut::from_values(9, 9, 9, 9));
-        assert!(db.save_request(&JsonText::from_value(&skipped).unwrap(), &[], &[]).is_err());
+        assert!(db.save_request(&fixture_config(), &JsonText::from_value(&skipped).unwrap(), &[], &[]).is_err());
         drop(db);
-        let reopened = RelayerDb::open(&path, fixture_authorization()).unwrap();
+        let reopened = RelayerDb::open(&path).unwrap();
         assert_eq!(reopened.pending_request().unwrap().unwrap().as_str(), next_frozen.as_str());
         assert_eq!(reopened.load_account(request.network_magic, request.user_id).unwrap().unwrap().imported_nonce, Some(1));
         std::fs::remove_dir_all(path).unwrap();
@@ -1358,43 +1386,35 @@ mod tests {
         let (path, db) = fresh();
         let request = crate::guardian::test_fixture::codec_request_fixture();
         let frozen = JsonText::from_value(&request).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
-        assert!(RelayerDb::open(&path, fixture_authorization()).is_err());
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
+        assert!(RelayerDb::open(&path).is_err());
         assert_eq!(db.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
         assert!(db.load_account(request.network_magic, request.user_id).unwrap().is_none());
-        assert!(db.chain_claims().unwrap().is_empty());
-        assert_eq!(db.finalization_batch().unwrap(), FinalizationBatch::default());
+        assert!(db.chain_claims(&fixture_config()).unwrap().is_empty());
+        assert_eq!(db.finalization_batch(&fixture_config()).unwrap(), FinalizationBatch::default());
         drop(db);
-        let reopened = RelayerDb::open(&path, fixture_authorization()).unwrap();
+        let reopened = RelayerDb::open(&path).unwrap();
         assert_eq!(reopened.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
         let (saved_request, included) = reopened.load_session(1, request.request_id().unwrap()).unwrap();
         assert_eq!(saved_request.as_str(), frozen.as_str());
         assert!(included.is_none());
         assert!(reopened.load_account(request.network_magic, request.user_id).unwrap().is_none());
-        assert!(reopened.chain_claims().unwrap().is_empty());
-        assert_eq!(reopened.finalization_batch().unwrap(), FinalizationBatch::default());
+        assert!(reopened.chain_claims(&fixture_config()).unwrap().is_empty());
+        assert_eq!(reopened.finalization_batch(&fixture_config()).unwrap(), FinalizationBatch::default());
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn included_and_claim_insert_failure_does_not_half_write() {
-        use guardian_common::protocol::{ChainAuthorization, GuardianOperation, Hex, TokenMapping, WithdrawalAppendRecord, WithdrawalBurnRecord};
-        let mut authorization = crate::guardian::test_fixture::codec_authorization_fixture();
-        authorization.chains.push(ChainAuthorization {
-            chain_index: 0, chain_id: alloy_primitives::U256::from(1u64), genesis_hash: Hex([2; 32]),
-            bridge: Hex([3; 20]), state_manager: Hex([4; 20]), deployment_block: 1,
-            token_mappings: vec![TokenMapping { token: Hex([11; 20]), l2_contract_id: 3 }],
-        });
-        let authorization = std::sync::Arc::new(authorization);
+        use guardian_common::protocol::{GuardianOperation, WithdrawalAppendRecord, WithdrawalBurnRecord};
         let path = protected_root("poison-claims");
-        let db = RelayerDb::open(&path, authorization.clone()).unwrap();
+        let db = RelayerDb::open(&path).unwrap();
         let burn = WithdrawalBurnRecord { sender_user_id: 1, token_contract_id: 3, destination_chain_index: 0, token: [0, 0, 0, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b], amount: [0, 0, 0, 0, 0, 0, 0, 1], recipient: [0, 0, 0, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c], nonce: [0; 8] };
         let mut request = import_request(1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8));
         request.operation = GuardianOperation::Bridge;
-        request.authorization_sha256 = authorization.digest().unwrap();
         request.withdrawal_records = vec![burn.clone()];
-        request.validate_authorization(&authorization).unwrap();
+        request.validate_authorization(&fixture_config()).unwrap();
         let frozen = JsonText::from_value(&request).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         {
             let tx = db.db.begin_write().unwrap();
             tx.open_table(CHAIN_CLAIMS).unwrap().insert(0u8, b"not-json".as_slice()).unwrap();
@@ -1407,21 +1427,21 @@ mod tests {
             endcap_proof_hex: "0xaa".to_owned(), included_checkpoint_id: 1, included_checkpoint_hash: QHashOut::from_values(1, 2, 3, 4),
         };
         let session = GuardianSession { network_magic: request.network_magic, user_id: request.user_id, nonce: 1, record, starting_leaf_hash: protocol::Hash4::ZERO, ending_leaf_hash: QHashOut::from_values(5, 6, 7, 8), withdrawal_appends: vec![WithdrawalAppendRecord { chain_index: 0, append_index: 0, burn: burn.clone() }] };
-        assert!(db.import_verified(&session, &[], 1, session.record.included_checkpoint_hash).is_err());
+        assert!(db.import_verified(&fixture_config(), &session, &[], 1, session.record.included_checkpoint_hash).is_err());
         let inspect = |db: &RelayerDb| {
             assert_eq!(db.pending_request().unwrap().unwrap().as_str(), frozen.as_str());
             assert!(db.load_account(request.network_magic, request.user_id).unwrap().and_then(|account| account.imported_nonce).is_none());
             assert!(!db.contains_included_withdrawal_burn(request.network_magic, request.user_id, 1, 3, burn.nonce).unwrap());
             assert!(!db.contains_withdrawal_nonce(request.network_magic, request.user_id, 0, burn.nonce).unwrap());
             assert!(db.sessions(0, 1).unwrap().sessions.is_empty());
-            assert_eq!(db.finalization_batch().unwrap(), FinalizationBatch::default());
-            assert!(db.chain_claims().is_err());
+            assert_eq!(db.finalization_batch(&fixture_config()).unwrap(), FinalizationBatch::default());
+            assert!(db.chain_claims(&fixture_config()).is_err());
             let tx = db.db.begin_read().unwrap();
             assert_eq!(tx.open_table(CHAIN_CLAIMS).unwrap().get(0u8).unwrap().unwrap().value(), b"not-json");
         };
         inspect(&db);
         drop(db);
-        inspect(&RelayerDb::open(&path, authorization).unwrap());
+        inspect(&RelayerDb::open(&path).unwrap());
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -1432,7 +1452,7 @@ mod tests {
         let (path, db) = fresh();
         let request = import_request(1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8));
         let frozen = JsonText::from_value(&request).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         let saved = signatures();
         let record = GuardianSessionRecord {
             request_json: frozen.clone(),
@@ -1441,11 +1461,11 @@ mod tests {
             endcap_proof_hex: "0xaa".to_owned(), included_checkpoint_id: 1, included_checkpoint_hash: QHashOut::from_values(1, 2, 3, 4),
         };
         let session = GuardianSession { network_magic: request.network_magic, user_id: request.user_id, nonce: 1, record: record.clone(), starting_leaf_hash: protocol::Hash4::ZERO, ending_leaf_hash: QHashOut::from_values(5, 6, 7, 8), withdrawal_appends: Vec::new() };
-        db.import_verified(&session, &[], 1, record.included_checkpoint_hash).unwrap();
+        db.import_verified(&fixture_config(), &session, &[], 1, record.included_checkpoint_hash).unwrap();
         // Nonce 2 advances the account checkpoint past nonce 1.
         let next = import_request(2, session.ending_leaf_hash, QHashOut::from_values(9, 9, 9, 9));
         let next_frozen = JsonText::from_value(&next).unwrap();
-        db.save_request(&next_frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &next_frozen, &[], &[]).unwrap();
         let next_record = GuardianSessionRecord {
             request_json: next_frozen,
             signatures_json: JsonText::from_value(&saved).unwrap(),
@@ -1453,9 +1473,9 @@ mod tests {
             endcap_proof_hex: "0xbb".to_owned(), included_checkpoint_id: 2, included_checkpoint_hash: QHashOut::from_values(2, 2, 2, 2),
         };
         let next_session = GuardianSession { network_magic: request.network_magic, user_id: request.user_id, nonce: 2, record: next_record, starting_leaf_hash: QHashOut::from_values(5, 6, 7, 8), ending_leaf_hash: QHashOut::from_values(9, 9, 9, 9), withdrawal_appends: Vec::new() };
-        db.import_verified(&next_session, &[], 2, QHashOut::from_values(2, 2, 2, 2)).unwrap();
+        db.import_verified(&fixture_config(), &next_session, &[], 2, QHashOut::from_values(2, 2, 2, 2)).unwrap();
         // The exact historical Included bytes replay idempotently and never halt.
-        db.import_verified(&session, &[], 1, record.included_checkpoint_hash).unwrap();
+        db.import_verified(&fixture_config(), &session, &[], 1, record.included_checkpoint_hash).unwrap();
         let account = db.load_account(request.network_magic, request.user_id).unwrap().unwrap();
         assert_eq!(account.state, guardian_common::protocol::GuardianAccountState::Active);
         assert_eq!(account.imported_nonce, Some(2));
@@ -1468,7 +1488,7 @@ mod tests {
         let (path, db) = fresh();
         let request = import_request(1, protocol::Hash4::ZERO, QHashOut::from_values(5, 6, 7, 8));
         let frozen = JsonText::from_value(&request).unwrap();
-        db.save_request(&frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &frozen, &[], &[]).unwrap();
         let saved = signatures();
         let record = GuardianSessionRecord {
             request_json: frozen.clone(),
@@ -1477,11 +1497,11 @@ mod tests {
             endcap_proof_hex: "0xaa".to_owned(), included_checkpoint_id: 1, included_checkpoint_hash: QHashOut::from_values(1, 2, 3, 4),
         };
         let session = GuardianSession { network_magic: request.network_magic, user_id: request.user_id, nonce: 1, record, starting_leaf_hash: protocol::Hash4::ZERO, ending_leaf_hash: QHashOut::from_values(5, 6, 7, 8), withdrawal_appends: Vec::new() };
-        db.import_verified(&session, &[], 1, QHashOut::from_values(1, 2, 3, 4)).unwrap();
+        db.import_verified(&fixture_config(), &session, &[], 1, QHashOut::from_values(1, 2, 3, 4)).unwrap();
         // The next nonce binds the SAME checkpoint id to a different leaf.
         let next = import_request(2, session.ending_leaf_hash, QHashOut::from_values(6, 6, 6, 6));
         let next_frozen = JsonText::from_value(&next).unwrap();
-        db.save_request(&next_frozen, &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &next_frozen, &[], &[]).unwrap();
         let next_record = GuardianSessionRecord {
             request_json: next_frozen,
             signatures_json: JsonText::from_value(&saved).unwrap(),
@@ -1489,7 +1509,7 @@ mod tests {
             endcap_proof_hex: "0xbb".to_owned(), included_checkpoint_id: 1, included_checkpoint_hash: QHashOut::from_values(9, 9, 9, 9),
         };
         let next_session = GuardianSession { network_magic: request.network_magic, user_id: request.user_id, nonce: 2, record: next_record, starting_leaf_hash: QHashOut::from_values(5, 6, 7, 8), ending_leaf_hash: QHashOut::from_values(6, 6, 6, 6), withdrawal_appends: Vec::new() };
-        assert!(db.import_verified(&next_session, &[], 1, QHashOut::from_values(9, 9, 9, 9)).is_err());
+        assert!(db.import_verified(&fixture_config(), &next_session, &[], 1, QHashOut::from_values(9, 9, 9, 9)).is_err());
         let halted = db.load_account(request.network_magic, request.user_id).unwrap().unwrap();
         assert_eq!(halted.state, guardian_common::protocol::GuardianAccountState::Halted);
         assert_eq!(halted.halt_reason, Some(HaltReason::CheckpointConflict));
@@ -1723,7 +1743,7 @@ mod tests {
     #[test]
     fn progress_rows_round_trip_in_leaf_order_not_insertion_order() {
         let (path, db) = fresh();
-        db.save_request(&JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap(), &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap(), &[], &[]).unwrap();
         let first = claim_words(2, 1);
         let second = claim_words(2, 2);
         let (smaller, larger) = if first.leaf_hash < second.leaf_hash { (first, second) } else { (second, first) };
@@ -1737,7 +1757,7 @@ mod tests {
             claim_retry: BTreeMap::from([(smaller.leaf_hash.clone(), crate::bridge::claim_attempts::ClaimAttempts { attempts: 2, last_reason: "proof late".into() })]),
             retired_claim_withdrawals: retired,
         };
-        db.save_chain_claims(2, &claims).unwrap();
+        db.save_chain_claims(&fixture_config(), 2, &claims).unwrap();
         let raw = {
             let tx = db.db.begin_read().unwrap();
             tx.open_table(CHAIN_CLAIMS).unwrap().get(2u8).unwrap().unwrap().value().to_vec()
@@ -1746,7 +1766,7 @@ mod tests {
         assert_eq!(raw, again);
         assert!(raw.windows(smaller.leaf_hash.len()).position(|window| window == smaller.leaf_hash.as_bytes()).unwrap()
             < raw.windows(larger.leaf_hash.len()).position(|window| window == larger.leaf_hash.as_bytes()).unwrap());
-        assert_eq!(db.chain_claims().unwrap(), BTreeMap::from([(2, claims)]));
+        assert_eq!(db.chain_claims(&fixture_config()).unwrap(), BTreeMap::from([(2, claims)]));
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -1760,9 +1780,9 @@ mod tests {
             tx.open_table(CHAIN_CLAIMS).unwrap().insert(2u8, b"not-json".as_slice()).unwrap();
             tx.commit().unwrap();
         }
-        assert!(db.save_request(&frozen, &[], &[claim_words(2, 1)]).is_err());
+        assert!(db.save_request(&fixture_config(), &frozen, &[], &[claim_words(2, 1)]).is_err());
         assert!(db.pending_request().unwrap().is_none());
-        assert!(db.chain_claims().is_err());
+        assert!(db.chain_claims(&fixture_config()).is_err());
         let tx = db.db.begin_read().unwrap();
         assert_eq!(tx.open_table(CHAIN_CLAIMS).unwrap().get(2u8).unwrap().unwrap().value(), b"not-json");
         drop(tx);
@@ -1772,14 +1792,14 @@ mod tests {
     #[test]
     fn shared_batch_and_every_chain_row_commit_or_stay_put() {
         let (path, db) = fresh();
-        db.save_request(&JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap(), &[], &[]).unwrap();
+        db.save_request(&fixture_config(), &JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap(), &[], &[]).unwrap();
         let kept = claim_words(1, 7);
         let mut prior = ChainClaims::default();
         prior.pending_claim_withdrawals.insert(kept.leaf_hash.clone(), kept.clone());
-        db.save_chain_claims(1, &prior).unwrap();
-        db.save_chain_claims(4, &ChainClaims::default()).unwrap();
+        db.save_chain_claims(&fixture_config(), 1, &prior).unwrap();
+        db.save_chain_claims(&fixture_config(), 4, &ChainClaims::default()).unwrap();
         let prior_batch = FinalizationBatch { pending_finalization_range: Some(FinalizationRange { from_checkpoint: 1, to_checkpoint: 2 }), finalized_chains: BTreeSet::from([1]) };
-        db.save_finalization_batch(&prior_batch).unwrap();
+        db.save_finalization_batch(&fixture_config(), &prior_batch).unwrap();
         let mut poisoned = BTreeMap::new();
         poisoned.insert(1, prior.clone());
         {
@@ -1787,8 +1807,8 @@ mod tests {
             tx.open_table(CHAIN_CLAIMS).unwrap().insert(9u8, b"not-json".as_slice()).unwrap();
             tx.commit().unwrap();
         }
-        assert!(db.save_claims_and_batch(&poisoned, &FinalizationBatch { pending_finalization_range: Some(FinalizationRange { from_checkpoint: 8, to_checkpoint: 9 }), finalized_chains: BTreeSet::from([1, 4]) }).is_err());
-        assert_eq!(db.finalization_batch().unwrap(), prior_batch);
+        assert!(db.save_claims_and_batch(&fixture_config(), &poisoned, &FinalizationBatch { pending_finalization_range: Some(FinalizationRange { from_checkpoint: 8, to_checkpoint: 9 }), finalized_chains: BTreeSet::from([1, 4]) }).is_err());
+        assert_eq!(db.finalization_batch(&fixture_config()).unwrap(), prior_batch);
         let tx = db.db.begin_read().unwrap();
         let table = tx.open_table(CHAIN_CLAIMS).unwrap();
         assert_eq!(table.get(1u8).unwrap().unwrap().value(), serde_json::to_vec(&prior).unwrap());
@@ -1804,12 +1824,12 @@ mod tests {
         let mut next = ChainClaims::default();
         next.pending_claim_withdrawals.insert(replacement.leaf_hash.clone(), replacement);
         let next_batch = FinalizationBatch { pending_finalization_range: None, finalized_chains: BTreeSet::new() };
-        db.save_claims_and_batch(&BTreeMap::from([(1, next.clone()), (9, ChainClaims::default())]), &next_batch).unwrap();
-        let saved = db.chain_claims().unwrap();
+        db.save_claims_and_batch(&fixture_config(), &BTreeMap::from([(1, next.clone()), (9, ChainClaims::default())]), &next_batch).unwrap();
+        let saved = db.chain_claims(&fixture_config()).unwrap();
         assert_eq!(saved[&1], next);
         assert_eq!(saved[&4], ChainClaims::default());
         assert!(saved[&9].pending_claim_withdrawals.is_empty());
-        assert_eq!(db.finalization_batch().unwrap(), next_batch);
+        assert_eq!(db.finalization_batch(&fixture_config()).unwrap(), next_batch);
         std::fs::remove_dir_all(path).unwrap();
     }
 

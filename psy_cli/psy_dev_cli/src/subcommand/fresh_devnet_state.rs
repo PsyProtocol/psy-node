@@ -5,8 +5,11 @@
 //! Missing databases are created only after `reset`; namespace binding stays put.
 //! Reset commits each database separately. Any failure stops immediately;
 //! earlier commits/removals remain, with no rollback or subsequent cleanup.
-//! Authorization is published only in the selected network's canonical config;
-//! runtime databases hold no authorization body or historical version store.
+//! The canonical config is read-only for the whole helper: no configuration is
+//! written or patched, and keystore passwords are environment-only. The stdin
+//! handshake is `prepared` (preflight + exclusive database locks), `reset`
+//! (database clears and cleanup targets), then `finish` (revalidate database
+//! bindings and the guardian-root identity, release, exit 0).
 use std::{
     collections::BTreeSet,
     ffi::{CStr, CString, OsStr, OsString},
@@ -17,15 +20,24 @@ use std::{
 };
 
 use anyhow::{ensure, Context};
-use redb::{backends::FileBackend, Database, Key, TableDefinition, TableHandle, TypeName, Value};
+use redb::{backends::FileBackend, Database, Key, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle, TypeName, Value};
 
-use super::generate_genesis::{build_fresh_devnet_authorization, preflight_fresh_devnet_inputs, publish_guardian_authorization_unchanged, CanonicalPolicyPin};
+use super::generate_genesis::preflight_fresh_devnet_inputs;
 
 const DATABASES: [&str; 4] = ["guardian-1.redb", "guardian-2.redb", "guardian-3.redb", "relayer.redb"];
-/// Frozen runtime table sets: a populated database must match exactly; partial
-/// or old sets fail closed and are never migrated by engine crash recovery.
-const GUARDIAN_TABLES: [&str; 7] = ["deposit_tree_states", "guardian_account", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"];
-const RELAYER_TABLES: [&str; 7] = ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "relayer_request"];
+/// Frozen runtime table sets: a populated database must match exactly, including
+/// the schema-2 marker (`guardian_schema` as `u32`, `journal_schema` as `u64`).
+/// Partial sets, a wrong marker version, and the previous 7-table journals fail
+/// closed before reset and are never wiped or migrated here.
+const GUARDIAN_TABLES: [&str; 8] = ["deposit_tree_states", "guardian_account", "guardian_schema", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"];
+const RELAYER_TABLES: [&str; 8] = ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "journal_schema", "relayer_request"];
+const LEGACY_GUARDIAN_TABLES: [&str; 7] = ["deposit_tree_states", "guardian_account", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"];
+const LEGACY_RELAYER_TABLES: [&str; 7] = ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "relayer_request"];
+const GUARDIAN_SCHEMA: TableDefinition<(), u32> = TableDefinition::new("guardian_schema");
+const JOURNAL_SCHEMA: TableDefinition<(), u64> = TableDefinition::new("journal_schema");
+const GUARDIAN_SCHEMA_VERSION: u32 = 2;
+const JOURNAL_SCHEMA_VERSION: u64 = 2;
+const LEGACY_JOURNAL: &str = "incompatible legacy journal schema; explicit operator-controlled migration is required";
 const TARGETS: [&str; 6] = [
     "db/anvil", "local_checkpoints", "genesis.json",
     "psy-contracts/deployments/localhost", "psy-contracts/deployments/localhostBsc",
@@ -57,11 +69,12 @@ pub async fn run(repo_root: PathBuf, guardians_root: PathBuf) -> anyhow::Result<
         .context("guardian db directory must already exist")?;
     validate_directory(&db_directory, true)?;
     validate_targets(&repo)?;
-    // Secret-output metadata lives in this preflight. Keep it before database
-    // open and `prepared`: mode 0664, a symlink, or a hardlink must fail with
-    // no business-table change and no cleanup.
+    // Secret-output metadata, guardian keystore metadata, the read-only
+    // canonical network policy, and the multisig policy compiler artifact live
+    // in this preflight. Keep it before database open and `prepared`: a bad
+    // mode, a symlink, or a hardlink must fail with no business-table change
+    // and no cleanup.
     preflight_fresh_devnet_inputs(&repo_root)?;
-    let policy_pin = CanonicalPolicyPin::pin(&repo_root)?;
     let mut databases = open_databases(&db_directory)?;
     phase("prepared")?;
     let stdin = io::stdin();
@@ -69,7 +82,6 @@ pub async fn run(repo_root: PathBuf, guardians_root: PathBuf) -> anyhow::Result<
     command(&mut input, "reset")?;
     // Revalidate the entire cleanup set and database bindings before the first reset write.
     validate_targets(&repo)?;
-    policy_pin.validate(&repo_root)?;
     check_database_bindings(&db_directory, &databases, false)?;
     for held in &mut databases {
         if held.database.is_none() {
@@ -88,19 +100,14 @@ pub async fn run(repo_root: PathBuf, guardians_root: PathBuf) -> anyhow::Result<
     }
     for target in TARGETS { remove_target(&repo, Path::new(target))?; }
     phase("reset")?;
-    command(&mut input, "authorize")?;
+    command(&mut input, "finish")?;
+    // Nothing is published: the canonical config is read-only. Finish only
+    // rechecks the held database bindings and the guardian-root identity,
+    // then releases the locks and exits 0.
     check_database_bindings(&db_directory, &databases, true)?;
-    policy_pin.validate(&repo_root)?;
-    let (authorization, policy_pin, repo_root) = tokio::task::spawn_blocking(move || {
-        let authorization = build_fresh_devnet_authorization(&repo_root, policy_pin.policy_bytes())?;
-        Ok::<_, anyhow::Error>((authorization, policy_pin, repo_root))
-    }).await.context("authorization builder worker failed")??;
-    policy_pin.validate(&repo_root)?;
     let current_guardian = open_absolute_directory(&guardians_root)?;
-    ensure!(same_file(&guardian, &current_guardian)?, "guardian root changed during authorization");
-    check_database_bindings(&db_directory, &databases, true)?;
-    publish_guardian_authorization_unchanged(&repo_root, &policy_pin, &authorization)?;
-    phase("authorized")?;
+    ensure!(same_file(&guardian, &current_guardian)?, "guardian root changed during finish");
+    phase("finished")?;
     drop(databases);
     Ok(())
 }
@@ -346,9 +353,15 @@ fn validate_database(database: &Database, relayer: bool) -> anyhow::Result<()> {
     let names: BTreeSet<_> = transaction.list_tables()?.map(|table| table.name().to_owned()).collect();
     let runtime_names: &[&str] = if relayer { &RELAYER_TABLES } else { &GUARDIAN_TABLES };
     let runtime: BTreeSet<_> = runtime_names.iter().map(|name| (*name).to_owned()).collect();
+    let legacy_names: &[&str] = if relayer { &LEGACY_RELAYER_TABLES } else { &LEGACY_GUARDIAN_TABLES };
+    let legacy: BTreeSet<_> = legacy_names.iter().map(|name| (*name).to_owned()).collect();
+    ensure!(names != legacy, "{LEGACY_JOURNAL}");
     ensure!(names.is_empty() || names == runtime, "unexpected database table shape");
     if names == runtime {
         if relayer {
+            let schema = transaction.open_table(JOURNAL_SCHEMA)?;
+            ensure!(schema.len()? == 1 && schema.get(())?.is_some_and(|row| row.value() == JOURNAL_SCHEMA_VERSION), "{LEGACY_JOURNAL}");
+            drop(schema);
             drop(transaction.open_table(TableDefinition::<u64, &[u8]>::new("relayer_request"))?);
             drop(transaction.open_table(TableDefinition::<u8, &[u8]>::new("chain_claims"))?);
             drop(transaction.open_table(TableDefinition::<(), &[u8]>::new("finalization_batch"))?);
@@ -357,6 +370,9 @@ fn validate_database(database: &Database, relayer: bool) -> anyhow::Result<()> {
             drop(transaction.open_table(TableDefinition::<RelayerWithdrawalBurnKey, u64>::new("included_withdrawal_burns"))?);
             drop(transaction.open_table(TableDefinition::<RelayerNonce, u64>::new("guardian_withdrawal_nonce"))?);
         } else {
+            let schema = transaction.open_table(GUARDIAN_SCHEMA)?;
+            ensure!(schema.len()? == 1 && schema.get(())?.is_some_and(|row| row.value() == GUARDIAN_SCHEMA_VERSION), "{LEGACY_JOURNAL}");
+            drop(schema);
             drop(transaction.open_table(TableDefinition::<(), [u8; 33]>::new("guardian_signer"))?);
             drop(transaction.open_table(TableDefinition::<(u64, u64), &[u8]>::new("guardian_account"))?);
             drop(transaction.open_table(TableDefinition::<(u64, u64, u64), &[u8]>::new("guardian_signed"))?);
@@ -434,9 +450,9 @@ mod tests {
         assert!(command(&mut io::Cursor::new(b""), "reset").is_err());
         assert!(command(&mut io::Cursor::new(b"reset"), "reset").is_err());
         assert!(command(&mut io::Cursor::new(b"other\n"), "reset").is_err());
-        let mut input = io::Cursor::new(b"reset\nauthorize\n");
+        let mut input = io::Cursor::new(b"reset\nfinish\n");
         command(&mut input, "reset").unwrap();
-        command(&mut input, "authorize").unwrap();
+        command(&mut input, "finish").unwrap();
     }
 
     #[test]
@@ -545,6 +561,7 @@ mod tests {
     fn open_complete(database: &Database, relayer: bool) {
         let transaction = database.begin_write().unwrap();
         if relayer {
+            transaction.open_table(JOURNAL_SCHEMA).unwrap().insert((), JOURNAL_SCHEMA_VERSION).unwrap();
             transaction.open_table(TableDefinition::<u64, &[u8]>::new("relayer_request")).unwrap();
             transaction.open_table(TableDefinition::<u8, &[u8]>::new("chain_claims")).unwrap().insert(9, br#"{"claim_retry":{},"pending_claim_withdrawals":{},"retired_claim_withdrawals":{}}"#.as_slice()).unwrap();
             transaction.open_table(TableDefinition::<(), &[u8]>::new("finalization_batch")).unwrap().insert((), br#"{"finalized_chains":[],"pending_finalization_range":null}"#.as_slice()).unwrap();
@@ -553,6 +570,7 @@ mod tests {
             transaction.open_table(TableDefinition::<RelayerWithdrawalBurnKey, u64>::new("included_withdrawal_burns")).unwrap();
             transaction.open_table(TableDefinition::<RelayerNonce, u64>::new("guardian_withdrawal_nonce")).unwrap();
         } else {
+            transaction.open_table(GUARDIAN_SCHEMA).unwrap().insert((), GUARDIAN_SCHEMA_VERSION).unwrap();
             transaction.open_table(TableDefinition::<(), [u8; 33]>::new("guardian_signer")).unwrap().insert((), &[2u8; 33]).unwrap();
             transaction.open_table(TableDefinition::<(u64, u64), &[u8]>::new("guardian_account")).unwrap();
             transaction.open_table(TableDefinition::<(u64, u64, u64), &[u8]>::new("guardian_signed")).unwrap();
@@ -590,6 +608,10 @@ mod tests {
         open_complete(&relayer, true);
         validate_database(&guardian, false).unwrap();
         validate_database(&relayer, true).unwrap();
+        assert_eq!(guardian.begin_read().unwrap().open_table(GUARDIAN_SCHEMA).unwrap().get(()).unwrap().unwrap().value(), GUARDIAN_SCHEMA_VERSION);
+        assert_eq!(relayer.begin_read().unwrap().open_table(JOURNAL_SCHEMA).unwrap().get(()).unwrap().unwrap().value(), JOURNAL_SCHEMA_VERSION);
+        assert_eq!(guardian.begin_read().unwrap().list_tables().unwrap().count(), GUARDIAN_TABLES.len());
+        assert_eq!(relayer.begin_read().unwrap().list_tables().unwrap().count(), RELAYER_TABLES.len());
         assert!(validate_database(&guardian, true).is_err());
         let old = Database::builder().create_file(directory.database_file("old.redb")).unwrap();
         let transaction = old.begin_write().unwrap();
@@ -609,7 +631,38 @@ mod tests {
         transaction.open_table(TableDefinition::<[u8; 56], u64>::new("included_withdrawal_burns")).unwrap();
         transaction.open_table(TableDefinition::<[u8; 49], u64>::new("guardian_withdrawal_nonce")).unwrap();
         transaction.commit().unwrap();
-        assert!(validate_database(&old, false).is_err());
+        assert!(validate_database(&old, false).unwrap_err().to_string().contains(LEGACY_JOURNAL));
+        let transaction = old.begin_write().unwrap();
+        for table in transaction.list_tables().unwrap() { transaction.delete_table(table).unwrap(); }
+        transaction.open_table(GUARDIAN_SCHEMA).unwrap().insert((), GUARDIAN_SCHEMA_VERSION.wrapping_sub(1)).unwrap();
+        transaction.open_table(TableDefinition::<(), [u8; 33]>::new("guardian_signer")).unwrap().insert((), &[4u8; 33]).unwrap();
+        transaction.open_table(TableDefinition::<(u64, u64), &[u8]>::new("guardian_account")).unwrap();
+        transaction.open_table(TableDefinition::<(u64, u64, u64), &[u8]>::new("guardian_signed")).unwrap();
+        transaction.open_table(TableDefinition::<(u64, u64, u64), &[u8]>::new("guardian_session")).unwrap();
+        transaction.open_table(TableDefinition::<GuardianDepositTreeKey, &[u8]>::new("deposit_tree_states")).unwrap();
+        transaction.open_table(TableDefinition::<GuardianWithdrawalBurnKey, u64>::new("included_withdrawal_burns")).unwrap();
+        transaction.open_table(TableDefinition::<GuardianNonce, u64>::new("guardian_withdrawal_nonce")).unwrap();
+        transaction.commit().unwrap();
+        assert!(validate_database(&old, false).unwrap_err().to_string().contains(LEGACY_JOURNAL));
+        assert_eq!(old.begin_read().unwrap().open_table(TableDefinition::<(), [u8; 33]>::new("guardian_signer")).unwrap().get(()).unwrap().unwrap().value(), [4u8; 33]);
+        let transaction = old.begin_write().unwrap();
+        for table in transaction.list_tables().unwrap() { transaction.delete_table(table).unwrap(); }
+        transaction.open_table(JOURNAL_SCHEMA).unwrap().insert((), JOURNAL_SCHEMA_VERSION + 1).unwrap();
+        transaction.open_table(TableDefinition::<u64, &[u8]>::new("relayer_request")).unwrap().insert(1, &[6u8][..]).unwrap();
+        transaction.open_table(TableDefinition::<u8, &[u8]>::new("chain_claims")).unwrap();
+        transaction.open_table(TableDefinition::<(), &[u8]>::new("finalization_batch")).unwrap();
+        transaction.open_table(TableDefinition::<(u64, u64), &[u8]>::new("guardian_account")).unwrap();
+        transaction.open_table(TableDefinition::<RelayerDepositTreeKey, &[u8]>::new("deposit_tree_states")).unwrap();
+        transaction.open_table(TableDefinition::<RelayerWithdrawalBurnKey, u64>::new("included_withdrawal_burns")).unwrap();
+        transaction.open_table(TableDefinition::<RelayerNonce, u64>::new("guardian_withdrawal_nonce")).unwrap();
+        transaction.commit().unwrap();
+        assert!(validate_database(&old, true).unwrap_err().to_string().contains(LEGACY_JOURNAL));
+        assert_eq!(old.begin_read().unwrap().open_table(TableDefinition::<u64, &[u8]>::new("relayer_request")).unwrap().get(1).unwrap().unwrap().value(), &[6u8][..]);
+        let transaction = old.begin_write().unwrap();
+        transaction.delete_table(transaction.open_table(JOURNAL_SCHEMA).unwrap()).unwrap();
+        transaction.commit().unwrap();
+        assert!(validate_database(&old, true).unwrap_err().to_string().contains(LEGACY_JOURNAL));
+        assert_eq!(old.begin_read().unwrap().list_tables().unwrap().count(), LEGACY_RELAYER_TABLES.len());
         let transaction = old.begin_write().unwrap();
         transaction.delete_table(transaction.list_tables().unwrap().next().unwrap()).unwrap();
         transaction.commit().unwrap();
@@ -673,7 +726,7 @@ mod tests {
                 databases.push(database);
             }
             // Exit with live engines: no Database::drop, just as with a helper
-            // terminated before its reset/authorize handshake finishes. The OS
+            // terminated before its reset/finish handshake finishes. The OS
             // releases locks; the parent owns fixture cleanup. No header spoofing.
             std::process::exit(UNCLEAN_EXIT);
         }
@@ -694,9 +747,14 @@ mod tests {
         let held = open_databases(&directory.open()).unwrap();
         for (index, item) in held.iter().enumerate() {
             let database = item.database.as_ref().unwrap();
-            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), match index { 0 => 0, _ => 7 });
+            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), match index { 0 => 0, _ => 8 });
             if index != 0 {
                 assert_eq!(runtime_row(database, index == 3), if index == 3 { vec![4] } else { vec![index as u8 + 1; 33] });
+                if index == 3 {
+                    assert_eq!(database.begin_read().unwrap().open_table(JOURNAL_SCHEMA).unwrap().get(()).unwrap().unwrap().value(), JOURNAL_SCHEMA_VERSION);
+                } else {
+                    assert_eq!(database.begin_read().unwrap().open_table(GUARDIAN_SCHEMA).unwrap().get(()).unwrap().unwrap().value(), GUARDIAN_SCHEMA_VERSION);
+                }
             }
             assert_eq!(fs::metadata(directory.0.join(item.name)).unwrap().ino(), inodes[index]);
             assert!(Database::open(directory.0.join(item.name)).is_err());
@@ -772,7 +830,7 @@ mod tests {
         for (index, name) in DATABASES.iter().enumerate() {
             let database = held.iter().find(|item| item.name == *name).unwrap().database.as_ref().unwrap();
             assert_eq!(runtime_row(database, index == 3), if index == 3 { vec![4] } else { vec![index as u8 + 1; 33] });
-            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), 7);
+            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), 8);
         }
         drop(held);
 
@@ -782,7 +840,7 @@ mod tests {
         for index in [0, 1, 3] {
             let database = Database::open(directory.0.join(DATABASES[index])).unwrap();
             assert_eq!(runtime_row(&database, index == 3), if index == 3 { vec![4] } else { vec![index as u8 + 1; 33] });
-            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), 7);
+            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), 8);
         }
         let old = Database::open(directory.0.join(DATABASES[2])).unwrap();
         assert_eq!(runtime_row(&old, false), vec![9; 33]);
@@ -800,7 +858,7 @@ mod tests {
         for index in 0..3 {
             let database = Database::open(directory.0.join(DATABASES[index])).unwrap();
             assert_eq!(runtime_row(&database, false), vec![index as u8 + 1; 33]);
-            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), 7);
+            assert_eq!(database.begin_read().unwrap().list_tables().unwrap().count(), 8);
         }
         let relayer = Database::open(directory.0.join(DATABASES[3])).unwrap();
         assert_eq!(runtime_row(&relayer, true), vec![9]);

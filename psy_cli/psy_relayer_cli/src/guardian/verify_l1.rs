@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 
 use crate::bridge::deposit_logs::DepositRecorded;
 use guardian_common::protocol::*;
-use psy_config::ChainEndpoint;
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 
@@ -44,7 +43,6 @@ impl<'a> CustodyRpc<'a> {
         bytes32(&value)
     }
 }
-/// CustodyRpc::new admits exactly what the config gate
 /// `guardian_common::protocol::validate_endpoint(.., false, false)` admits:
 /// HTTPS anywhere, plaintext HTTP only to std loopback (127.0.0.0/8, `[::1]`,
 /// exact domain `localhost`), no userinfo credentials, no fragment, no redirects.
@@ -53,7 +51,7 @@ mod custody_url_parity {
     use super::*;
 
     fn admits(rpc_url: &str) -> bool {
-        CustodyRpc::new(&ChainEndpoint { chain_index: 0, rpc_url: rpc_url.to_owned() }).is_ok()
+        CustodyRpc::new(&ChainEndpoint { chain_index: 0, chain_id: U256::from(1u8), bridge: Hex([0x11; 20]), deployment_block: 0, rpc_url: rpc_url.to_owned() }).is_ok()
     }
 
     /// Config admits the whole 127.0.0.0/8 range; the custody guard must not narrow it.
@@ -113,19 +111,59 @@ fn bytes32(value: &Value) -> Result<[u8;32]> {
 fn block_hash(block: &Value) -> Result<[u8;32]> { bytes32(&block["hash"]) }
 fn block_id(number: u64) -> Value { json!(format!("0x{number:x}")) }
 
-async fn verify_l1_chain(rpc: &CustodyRpc<'_>, chain: &ChainAuthorization, block: &Value) -> Result<()> {
+fn configured_chain_id(chain: &ChainEndpoint) -> Result<U256> {
+    if chain.chain_id.is_zero() { return Err(GuardianSignError::AuthorizationMismatch); }
+    Ok(chain.chain_id)
+}
+fn configured_bridge(chain: &ChainEndpoint) -> Hex20 { chain.bridge }
+struct DerivedChain { router: Hex20 }
+fn provider_address(provider: Hex20, name: &[u8]) -> Vec<u8> {
+    let mut data = keccak256(b"getAddress(bytes32)")[..4].to_vec();
+    data.extend_from_slice(keccak256(name).as_slice());
+    data
+}
+/// Chain id and bridge come from the endpoint. Manager and router are whatever
+/// the bridge provider returns at the pinned block. The manager must report
+/// this chain index. No configured genesis.
+async fn verify_l1_chain(rpc: &CustodyRpc<'_>, chain: &ChainEndpoint, block: &Value) -> Result<DerivedChain> {
     if rpc.endpoint.chain_index != chain.chain_index { return Err(GuardianSignError::AuthorizationMismatch); }
     let chain_id: U256 = serde_json::from_value(rpc.call("eth_chainId", json!([])).await?).map_err(|_| GuardianSignError::L1ResponseMismatch)?;
-    if chain_id != chain.chain_id || block_hash(&rpc.block(block_id(0)).await?)? != chain.genesis_hash.0 { return Err(GuardianSignError::AuthorizationMismatch); }
-    let provider_word = rpc.eth_call(chain.bridge,"addressesProvider()",None,block).await?;
-    if provider_word[..12] != [0;12] { return Err(GuardianSignError::L1ResponseMismatch)?; }
-    let provider = Hex::<20>(provider_word[12..].try_into().map_err(|_|GuardianSignError::L1ResponseMismatch)?);
-    let mut data = keccak256(b"getAddress(bytes32)")[..4].to_vec(); data.extend_from_slice(keccak256(b"STATE_MANAGER").as_slice());
-    let manager = bytes32(&rpc.call("eth_call",json!([{"to":provider,"data":format!("0x{}",hex::encode(data))},block])).await?)?;
-    if manager[..12] != [0;12] || manager[12..] != chain.state_manager.0 || U256::from_be_bytes(rpc.eth_call(chain.state_manager,"l1ChainIndex()",None,block).await?) != U256::from(chain.chain_index) { return Err(GuardianSignError::AuthorizationMismatch); }
+    if chain_id != configured_chain_id(chain)? { return Err(GuardianSignError::AuthorizationMismatch); }
+    let bridge = configured_bridge(chain);
+    let provider_word = rpc.eth_call(bridge, "addressesProvider()", None, block).await?;
+    if provider_word[..12] != [0; 12] { return Err(GuardianSignError::L1ResponseMismatch)?; }
+    let provider = Hex::<20>(provider_word[12..].try_into().map_err(|_| GuardianSignError::L1ResponseMismatch)?);
+    let manager = bytes32(&rpc.call("eth_call", json!([{"to": provider, "data": format!("0x{}", hex::encode(provider_address(provider, b"STATE_MANAGER")))}, block])).await?)?;
+    if manager[..12] != [0; 12] { return Err(GuardianSignError::L1ResponseMismatch)?; }
+    let manager = Hex::<20>(manager[12..].try_into().map_err(|_| GuardianSignError::L1ResponseMismatch)?);
+    if U256::from_be_bytes(rpc.eth_call(manager, "l1ChainIndex()", None, block).await?) != U256::from(chain.chain_index) { return Err(GuardianSignError::AuthorizationMismatch); }
+    let router = bytes32(&rpc.call("eth_call", json!([{"to": provider, "data": format!("0x{}", hex::encode(provider_address(provider, b"ROUTER")))}, block])).await?)?;
+    if router[..12] != [0; 12] || router[12..] == [0; 20] { return Err(GuardianSignError::L1ResponseMismatch)?; }
+    Ok(DerivedChain { router: Hex::<20>(router[12..].try_into().map_err(|_| GuardianSignError::L1ResponseMismatch)?) })
+}
+fn address_argument(address: Hex20) -> [u8; 32] { let mut word = [0; 32]; word[12..].copy_from_slice(&address.0); word }
+fn contract_id_word(id: u32) -> [u8; 32] { let mut word = [0; 32]; word[28..].copy_from_slice(&id.to_be_bytes()); word }
+async fn router_word(rpc: &CustodyRpc<'_>, router: Hex20, signature: &str, argument: [u8; 32], block: &Value) -> Result<[u8; 32]> {
+    let mut data = keccak256(signature.as_bytes())[..4].to_vec();
+    data.extend_from_slice(&argument);
+    bytes32(&rpc.call("eth_call", json!([{"to": router, "data": format!("0x{}", hex::encode(data))}, block])).await?)
+}
+/// Both router directions at one pinned block. Contract 0 remains the PSY
+/// bridge token and contract 4 remains USDT; the router mapping is the check,
+/// not an allowlist. A pair that does not name this token and contract fails.
+async fn verify_token_mapping(rpc: &CustodyRpc<'_>, router: Hex20, token: Hex20, contract_id: u32, block: &Value) -> Result<()> {
+    let forward = router_word(rpc, router, "l1ToL2Token(address)", address_argument(token), block).await?;
+    let reverse = router_word(rpc, router, "l2ToL1Token(bytes32)", contract_id_word(contract_id), block).await?;
+    if forward != contract_id_word(contract_id) || reverse != address_argument(token) { return Err(GuardianSignError::DepositMismatch); }
     Ok(())
 }
-
+pub(crate) async fn verify_withdrawal_token(chain: &ChainEndpoint, burn: &WithdrawalBurnRecord) -> Result<()> {
+    let rpc = CustodyRpc::new(chain)?;
+    let finalized = rpc.block(json!("finalized")).await?;
+    let block = block_id(quantity(&finalized["number"])?);
+    let derived = verify_l1_chain(&rpc, chain, &block).await?;
+    verify_token_mapping(&rpc, derived.router, burn.token_address()?, burn.token_contract_id, &block).await
+}
 async fn verify_ancestor(rpc: &CustodyRpc<'_>, number: u64, hash: [u8;32], finalized: &Value) -> Result<()> {
     if canonical_ancestor_header(rpc, number, finalized).await? != hash { return Err(GuardianSignError::DepositMismatch); }
     Ok(())
@@ -138,45 +176,43 @@ async fn canonical_ancestor_header(rpc: &CustodyRpc<'_>, number: u64, finalized:
     block_hash(&canonical)
 }
 
-pub async fn finalized_deposit_anchor(endpoint: &ChainEndpoint, chain: &ChainAuthorization, old_count: u32, new_count: u32) -> Result<DepositAnchor> {
-    let rpc = CustodyRpc::new(endpoint)?;
+pub async fn finalized_deposit_anchor(chain: &ChainEndpoint, old_count: u32, new_count: u32) -> Result<DepositAnchor> {
+    let rpc = CustodyRpc::new(chain)?;
     let finalized = rpc.block(json!("finalized")).await?;
     let number = quantity(&finalized["number"])?;
+    if number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     verify_l1_chain(&rpc, chain, &block_id(number)).await?;
     if old_count >= new_count { return Err(GuardianSignError::DepositMismatch); }
     Ok(DepositAnchor { chain_index: chain.chain_index, block_number: number, block_hash: Hex(block_hash(&finalized)?), old_count, new_count })
 }
 
-pub async fn verify_finalized_anchor(endpoint: &ChainEndpoint, chain: &ChainAuthorization, anchor: &DepositAnchor) -> Result<()> {
-    let rpc = CustodyRpc::new(endpoint)?;
+pub async fn verify_finalized_anchor(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<()> {
+    if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
+    let rpc = CustodyRpc::new(chain)?;
     let finalized = rpc.block(json!("finalized")).await?;
-    verify_l1_chain(&rpc,chain,&block_id(anchor.block_number)).await?;
-    verify_ancestor(&rpc,anchor.block_number,anchor.block_hash.0,&finalized).await
+    verify_l1_chain(&rpc, chain, &block_id(anchor.block_number)).await?;
+    verify_ancestor(&rpc, anchor.block_number, anchor.block_hash.0, &finalized).await
 }
 
-/// Header-only saved-anchor evidence: bounded chain identity (current chain id plus
-/// genesis header) plus the canonical finalized ancestry at the anchor height — the
-/// same `verify_ancestor` bound: the saved anchor must sit at or below the finalized
-/// height or this fails closed with `FinalityPending`. Approved addresses are
-/// config-immutable under the current digest, so no historical eth_call/logs run.
-/// Returns the canonical hash; the caller MUST compare it with the saved hash via
-/// `verify_cached_anchor_hash` (typed `FinalityConflict` halt) before use — this
-/// comparison is mandatory, not optional.
-pub(crate) async fn verify_saved_deposit_anchor_headers(endpoint: &ChainEndpoint, chain: &ChainAuthorization, anchor: &DepositAnchor) -> Result<Hex32> {
-    let rpc = CustodyRpc::new(endpoint)?;
+/// Header-only saved-anchor evidence: the configured chain id plus canonical
+/// finalized ancestry at the anchor height. The saved anchor must sit at or
+/// below the finalized height or this fails closed with `FinalityPending`.
+/// Returns the canonical hash; the caller MUST compare it with the saved hash
+/// via `verify_cached_anchor_hash` before use.
+pub(crate) async fn verify_saved_deposit_anchor_headers(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<Hex32> {
+    if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
+    let rpc = CustodyRpc::new(chain)?;
     let finalized = rpc.block(json!("finalized")).await?;
     saved_anchor_canonical_hash(&rpc, chain, anchor, &finalized).await
 }
 
-/// Bounded header-only canonical evidence for an anchor against an already fetched
-/// `finalized` block: current chain id, genesis header, and canonical finalized
-/// ancestry at the anchor height (fail-closed `FinalityPending` when the anchor sits
-/// above finalized). No historical eth_call or eth_getLogs. Shared by the standalone
-/// check above and the saved deposit-tree-state reuse gate in `verify_deposit_interval`, which
-/// already holds `finalized` and must not refetch it.
-async fn saved_anchor_canonical_hash(rpc: &CustodyRpc<'_>, chain: &ChainAuthorization, anchor: &DepositAnchor, finalized: &Value) -> Result<Hex32> {
+/// Configured chain id and canonical finalized ancestry at the anchor height.
+/// Fail-closed `FinalityPending` when the anchor sits above finalized. No
+/// historical eth_call or eth_getLogs, and no configured genesis header.
+async fn saved_anchor_canonical_hash(rpc: &CustodyRpc<'_>, chain: &ChainEndpoint, anchor: &DepositAnchor, finalized: &Value) -> Result<Hex32> {
+    if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     let chain_id: U256 = serde_json::from_value(rpc.call("eth_chainId", json!([])).await?).map_err(|_| GuardianSignError::L1ResponseMismatch)?;
-    if chain_id != chain.chain_id || block_hash(&rpc.block(block_id(0)).await?)? != chain.genesis_hash.0 { return Err(GuardianSignError::AuthorizationMismatch); }
+    if chain_id != configured_chain_id(chain)? { return Err(GuardianSignError::AuthorizationMismatch); }
     Ok(Hex(canonical_ancestor_header(rpc, anchor.block_number, finalized).await?))
 }
 
@@ -214,14 +250,19 @@ fn saved_deposit_tree_state_candidate(state: &DepositTreeState, anchor: &Deposit
 /// `matches_opening` compares the tip `(chain_index, count, root)` and, with
 /// `count == anchor.new_count` on an exact replay, can never certify the opening
 /// at `old_count`.
-pub async fn verify_deposit_anchor(reserved: Option<&DepositTreeState>, endpoint: &ChainEndpoint, chain: &ChainAuthorization, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState),super::verify::GuardianAccountError> {
-    tokio::time::timeout(std::time::Duration::from_secs(120),verify_deposit_interval(reserved,endpoint,chain,anchor)).await.map_err(|_|GuardianSignError::L1RpcUnavailable)?
+pub async fn verify_deposit_anchor(reserved: Option<&DepositTreeState>, chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState),super::verify::GuardianAccountError> {
+    tokio::time::timeout(std::time::Duration::from_secs(120),verify_deposit_interval(reserved,chain,anchor)).await.map_err(|_|GuardianSignError::L1RpcUnavailable)?
 }
 
-async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, endpoint: &ChainEndpoint, chain: &ChainAuthorization, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState),super::verify::GuardianAccountError> {
+async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState),super::verify::GuardianAccountError> {
     if anchor.chain_index != chain.chain_index { return Err(GuardianSignError::AuthorizationMismatch.into()); }
-    if anchor.old_count >= anchor.new_count || anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch.into()); }
-    let rpc = CustodyRpc::new(endpoint)?;
+    if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch.into()); }
+    if anchor.old_count >= anchor.new_count { return Err(GuardianSignError::DepositMismatch.into()); }
+    if reserved.is_some_and(|state| saved_deposit_tree_state_candidate(state, anchor)
+        && (state.anchor.block_number < chain.deployment_block || state.event_block < chain.deployment_block)) {
+        return Err(GuardianSignError::DepositMismatch.into());
+    }
+    let rpc = CustodyRpc::new(chain)?;
     let finalized = rpc.block(json!("finalized")).await?;
     // ANY saved deposit-tree-state reuse — exact replay or warm forward extend — is gated here so
     // a caller cannot skip it: the stored body must pass core
@@ -230,7 +271,7 @@ async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, endpoint: 
     // fetch, and the SAVED anchor — not the request anchor — must still sit on the
     // canonical chain: an L1 reorg that rewrote the saved anchor's block invalidates
     // the carried frontier/root even when this anchor is a fresh forward extension
-    // of it. Both checks are bounded header-only evidence (chain id, genesis header,
+    // of it. Both checks are bounded header-only evidence (configured chain id and
     // finalized ancestry): no historical eth_call or eth_getLogs runs against the
     // old state, and the new-batch checks below are unchanged.
     let reusable = match reserved {
@@ -252,16 +293,17 @@ async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, endpoint: 
     }
     verify_ancestor(&rpc,anchor.block_number,anchor.block_hash.0,&finalized).await?;
     let pinned = json!({"blockHash":anchor.block_hash,"requireCanonical":true});
-    verify_l1_chain(&rpc,chain,&pinned).await?;
-    let pending = U256::from_be_bytes(rpc.eth_call(chain.bridge,"pendingDepositCount()",None,&pinned).await?);
+    let bridge = configured_bridge(chain);
+    let derived = verify_l1_chain(&rpc, chain, &pinned).await?;
+    let pending = U256::from_be_bytes(rpc.eth_call(bridge, "pendingDepositCount()", None, &pinned).await?);
     if pending < U256::from(anchor.new_count) { return Err(GuardianSignError::DepositMismatch.into()); }
     let from_count=reusable.map_or(0,|state|state.count);
     let mut frontier=reusable.map_or([Hash4::ZERO;32],|state|state.frontier);
     let mut root=reusable.map_or_else(||<PsyHasher as MerkleZeroHasher<Hash4>>::get_zero_hash(32),|state|state.root);
     let mut old_root=root;
-    let mut event_block=reusable.map_or(chain.deployment_block,|state|state.event_block);
+    let mut event_block = reusable.map_or(chain.deployment_block, |state| state.event_block);
     let mut occupied_partial_page_hashes=reusable.map_or_else(Vec::new,|state|state.occupied_partial_page_hashes.clone());
-    let (mut events, latest_event_block) = fetch_deposit_events(&rpc,chain,anchor,from_count,event_block,&pinned).await?;
+    let (mut events, latest_event_block) = fetch_deposit_events(&rpc, chain, derived.router, anchor, from_count, event_block, &pinned).await?;
     event_block = latest_event_block;
     for index in from_count..anchor.new_count {
         let leaf = events.remove(&index).map(|(leaf, _)| leaf).ok_or(GuardianSignError::DepositMismatch)?;
@@ -280,24 +322,26 @@ fn append_verified_deposit_leaf(frontier: &mut [Hash4;32], occupied_partial_page
 }
 
 
-async fn fetch_deposit_events(rpc: &CustodyRpc<'_>, chain: &ChainAuthorization, anchor: &DepositAnchor, from_count: u32, mut event_block: u64, pinned: &Value) -> Result<(BTreeMap<u32,(Hash4,DepositLeafData)>,u64)> {
+async fn fetch_deposit_events(rpc: &CustodyRpc<'_>, chain: &ChainEndpoint, router: Hex20, anchor: &DepositAnchor, from_count: u32, mut event_block: u64, pinned: &Value) -> Result<(BTreeMap<u32,(Hash4,DepositLeafData)>,u64)> {
+    if anchor.block_number < chain.deployment_block || event_block < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     let mut events = BTreeMap::new();
     let mut start=event_block;
     while start <= anchor.block_number {
         let end = start.saturating_add(4999).min(anchor.block_number);
-        let logs = rpc.call("eth_getLogs",json!([{"address":chain.bridge,"fromBlock":block_id(start),"toBlock":block_id(end),"topics":[format!("{:#x}",DepositRecorded::SIGNATURE_HASH)]}])).await?;
+        let bridge = configured_bridge(chain);
+        let logs = rpc.call("eth_getLogs", json!([{"address": bridge, "fromBlock": block_id(start), "toBlock": block_id(end), "topics": [format!("{:#x}", DepositRecorded::SIGNATURE_HASH)]}])).await?;
         let logs: Vec<Log> = serde_json::from_value(logs).map_err(|_|GuardianSignError::L1ResponseMismatch)?;
         for log in logs {
             let decoded = log.log_decode::<DepositRecorded>().map_err(|_|GuardianSignError::L1ResponseMismatch)?;
             let event = decoded.data();
             if event.index < from_count || event.index >= anchor.new_count { continue; }
-            if log.address().as_slice() != chain.bridge.0 || log.removed || events.contains_key(&event.index) || log.log_index.is_none() { return Err(GuardianSignError::DepositMismatch.into()); }
+            if log.address().as_slice() != bridge.0 || log.removed || events.contains_key(&event.index) || log.log_index.is_none() { return Err(GuardianSignError::DepositMismatch.into()); }
             let number = log.block_number.ok_or(GuardianSignError::DepositMismatch)?;
             event_block=event_block.max(number);
             let hash = log.block_hash.ok_or(GuardianSignError::DepositMismatch)?;
             let transaction = log.transaction_hash.ok_or(GuardianSignError::DepositMismatch)?;
             let canonical = rpc.block(block_id(number)).await?;
-            if number > anchor.block_number || block_hash(&canonical)?.as_slice() != hash.as_slice() { return Err(GuardianSignError::DepositMismatch.into()); }
+            if number < start || number > end || block_hash(&canonical)?.as_slice() != hash.as_slice() { return Err(GuardianSignError::DepositMismatch.into()); }
             let receipt = rpc.call("eth_getTransactionReceipt",json!([transaction])).await?;
             if quantity(&receipt["status"])? != 1 || quantity(&receipt["blockNumber"])? != number || bytes32(&receipt["blockHash"])?.as_slice() != hash.as_slice() || bytes32(&receipt["transactionHash"])?.as_slice() != transaction.as_slice() { return Err(GuardianSignError::DepositMismatch.into()); }
             let receipt_logs: Vec<Log> = serde_json::from_value(receipt["logs"].clone()).map_err(|_|GuardianSignError::L1ResponseMismatch)?;
@@ -305,16 +349,16 @@ async fn fetch_deposit_events(rpc: &CustodyRpc<'_>, chain: &ChainAuthorization, 
             if receipt_logs.iter().filter(|candidate| serde_json::to_value(candidate).ok().as_ref() == Some(&original)).count() != 1 { return Err(GuardianSignError::DepositMismatch.into()); }
             if event.chainIndex != chain.chain_index || event.l2TokenContractId.as_slice()[..28] != [0;28] { return Err(GuardianSignError::DepositMismatch.into()); }
             let id = u32::from_be_bytes(event.l2TokenContractId.as_slice()[28..].try_into().map_err(|_|GuardianSignError::DepositMismatch)?);
-            if chain.token_mappings.iter().filter(|mapping| mapping.token.0.as_slice() == event.token.as_slice() && mapping.l2_contract_id == id).count() != 1 { return Err(GuardianSignError::DepositMismatch.into()); }
+            verify_token_mapping(rpc, router, Hex(event.token.as_slice().try_into().map_err(|_| GuardianSignError::DepositMismatch)?), id, pinned).await?;
             let mut words = Vec::with_capacity(41);
-            for bytes in [event.shieldAddress.0, U256::from_be_slice(event.token.as_slice()).to_be_bytes::<32>(),event.l2TokenContractId.0,event.amount.to_be_bytes::<32>()] {
+            for bytes in [event.shieldAddress.0, U256::from_be_slice(event.token.as_slice()).to_be_bytes::<32>(), event.l2TokenContractId.0, event.amount.to_be_bytes::<32>()] {
                 words.extend(bytes.chunks_exact(4).map(|word|u32::from_be_bytes(word.try_into().unwrap())));
             }
             words.push(u32::from(event.chainIndex));
             words.extend(event.noteCommitment.as_slice().chunks_exact(4).map(|word|u32::from_be_bytes(word.try_into().unwrap())));
             let bytes: Vec<u8> = words.iter().flat_map(|word|word.to_be_bytes()).collect();
             let hash = keccak256(&bytes);
-            if hash != event.leafHash || rpc.eth_call(chain.bridge,"depositLeafHashes(uint256)",Some(u64::from(event.index)),pinned).await?.as_slice() != hash.as_slice() { return Err(GuardianSignError::DepositMismatch.into()); }
+            if hash != event.leafHash || rpc.eth_call(bridge, "depositLeafHashes(uint256)", Some(u64::from(event.index)), pinned).await?.as_slice() != hash.as_slice() { return Err(GuardianSignError::DepositMismatch.into()); }
             let leaf = PsyHasher::q_hash_many(&words.into_iter().map(F::from_canonical_u32).collect::<Vec<_>>());
             events.insert(event.index,(leaf,DepositLeafData {
                 shield_address: bytes32_words(&event.shieldAddress.0),
@@ -331,18 +375,19 @@ async fn fetch_deposit_events(rpc: &CustodyRpc<'_>, chain: &ChainAuthorization, 
     Ok((events,event_block))
 }
 
-pub(crate) async fn fetch_deposit_records(endpoint: &ChainEndpoint, chain: &ChainAuthorization, anchor: &DepositAnchor) -> Result<Vec<DepositLeafData>> {
+pub(crate) async fn fetch_deposit_records(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<Vec<DepositLeafData>> {
     if anchor.chain_index != chain.chain_index { return Err(GuardianSignError::AuthorizationMismatch); }
-    if anchor.old_count >= anchor.new_count || anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
-    let rpc = CustodyRpc::new(endpoint)?;
+    if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
+    if anchor.old_count >= anchor.new_count { return Err(GuardianSignError::DepositMismatch); }
+    let rpc = CustodyRpc::new(chain)?;
     let finalized = rpc.block(json!("finalized")).await?;
-    verify_ancestor(&rpc,anchor.block_number,anchor.block_hash.0,&finalized).await?;
-    let pinned = json!({"blockHash":anchor.block_hash,"requireCanonical":true});
-    verify_l1_chain(&rpc,chain,&pinned).await?;
-    if U256::from_be_bytes(rpc.eth_call(chain.bridge,"pendingDepositCount()",None,&pinned).await?) < U256::from(anchor.new_count) { return Err(GuardianSignError::DepositMismatch); }
-    let (mut events, _) = fetch_deposit_events(&rpc,chain,anchor,0,chain.deployment_block,&pinned).await?;
+    verify_ancestor(&rpc, anchor.block_number, anchor.block_hash.0, &finalized).await?;
+    let pinned = json!({"blockHash": anchor.block_hash, "requireCanonical": true});
+    let derived = verify_l1_chain(&rpc, chain, &pinned).await?;
+    if U256::from_be_bytes(rpc.eth_call(configured_bridge(chain), "pendingDepositCount()", None, &pinned).await?) < U256::from(anchor.new_count) { return Err(GuardianSignError::DepositMismatch); }
+    let (mut events, _) = fetch_deposit_events(&rpc, chain, derived.router, anchor, 0, chain.deployment_block, &pinned).await?;
     let records = (0..anchor.new_count).map(|index| events.remove(&index).map(|(_, record)| record).ok_or(GuardianSignError::DepositMismatch)).collect::<Result<Vec<_>>>()?;
-    verify_ancestor(&rpc,anchor.block_number,anchor.block_hash.0,&rpc.block(json!("finalized")).await?).await?;
+    verify_ancestor(&rpc, anchor.block_number, anchor.block_hash.0, &rpc.block(json!("finalized")).await?).await?;
     Ok(records)
 }
 
@@ -370,6 +415,7 @@ fn address_words(address: &[u8]) -> [u32; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guardian::verify::GuardianAccountError;
     use alloy_primitives::{Address, B256};
     use alloy_sol_types::SolEvent;
     use plonky2::field::types::Field;
@@ -472,13 +518,11 @@ mod tests {
 
     const CHAIN_INDEX: u8 = 1;
     const CHAIN_ID: u64 = 97;
-    const DEPLOYMENT_BLOCK: u64 = 50;
     const HEIGHT_A: u64 = 1_000;
     const HEIGHT_B: u64 = 1_005;
     const SAVED_COUNT: u32 = 100;
     const NEW_COUNT: u32 = 105;
-    const TOKEN_ID: u32 = 7;
-    const GENESIS: [u8; 32] = [0x01; 32];
+    const TOKEN_ID: u32 = 0;
     const HASH_A: [u8; 32] = [0x0a; 32];
     const HASH_B: [u8; 32] = [0x0b; 32];
     const HASH_A_REORG: [u8; 32] = [0x0c; 32];
@@ -504,9 +548,9 @@ mod tests {
         match height { HEIGHT_A => u64::from(SAVED_COUNT), HEIGHT_B => u64::from(NEW_COUNT), _ => panic!("pending count is keyed only by L1 height") }
     }
     fn selector(signature: &str) -> String { format!("0x{}", hex::encode(&keccak256(signature.as_bytes())[..4])) }
-    fn get_address_data() -> String {
+    fn provider_data(name: &[u8]) -> String {
         let mut data = keccak256(b"getAddress(bytes32)")[..4].to_vec();
-        data.extend_from_slice(keccak256(b"STATE_MANAGER").as_slice());
+        data.extend_from_slice(keccak256(name).as_slice());
         format!("0x{}", hex::encode(data))
     }
     fn u32_arg(data: &str) -> Option<u32> {
@@ -550,12 +594,45 @@ mod tests {
     fn next_anchor(saved: &DepositAnchor) -> DepositAnchor {
         DepositAnchor { block_number: HEIGHT_B, block_hash: Hex(HASH_B), old_count: SAVED_COUNT, new_count: NEW_COUNT, ..saved.clone() }
     }
-    fn chain() -> ChainAuthorization {
-        ChainAuthorization {
-            chain_index: CHAIN_INDEX, chain_id: U256::from(CHAIN_ID), genesis_hash: Hex(GENESIS),
-            bridge: Hex(BRIDGE), state_manager: Hex(STATE_MANAGER), deployment_block: DEPLOYMENT_BLOCK,
-            token_mappings: vec![TokenMapping { token: Hex(TOKEN), l2_contract_id: TOKEN_ID }],
-        }
+    fn chain() -> ChainEndpoint {
+        ChainEndpoint { chain_index: CHAIN_INDEX, chain_id: U256::from(CHAIN_ID), bridge: Hex(BRIDGE), deployment_block: 0, rpc_url: "http://127.0.0.1:1".into() }
+    }
+
+    #[tokio::test]
+    async fn anchors_before_deployment_fail_before_rpc() {
+        let mut state = saved_deposit_tree_state();
+        let anchor = state.anchor.clone();
+        let mut endpoint = chain();
+        endpoint.deployment_block = anchor.block_number + 1;
+        assert!(matches!(verify_finalized_anchor(&endpoint, &anchor).await, Err(GuardianSignError::DepositMismatch)));
+        assert!(matches!(verify_saved_deposit_anchor_headers(&endpoint, &anchor).await, Err(GuardianSignError::DepositMismatch)));
+        assert!(matches!(verify_deposit_interval(None, &endpoint, &anchor).await, Err(GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch))));
+        assert!(matches!(fetch_deposit_records(&endpoint, &anchor).await, Err(GuardianSignError::DepositMismatch)));
+        let next = next_anchor(&anchor);
+        assert!(saved_deposit_tree_state_candidate(&state, &next));
+        assert!(next.block_number >= endpoint.deployment_block);
+        assert!(matches!(verify_deposit_interval(Some(&state), &endpoint, &next).await, Err(GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch))));
+
+        endpoint.deployment_block = anchor.block_number;
+        state.event_block = endpoint.deployment_block - 1;
+        assert!(matches!(verify_deposit_interval(Some(&state), &endpoint, &next).await, Err(GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch))));
+        assert!(matches!(verify_deposit_interval(Some(&state), &endpoint, &anchor).await, Err(GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch))));
+    }
+
+    #[tokio::test]
+    async fn deployment_block_is_an_inclusive_log_boundary() {
+        let batch = prepare_batch(0);
+        let fixture = serve_l1(batch.server).await;
+        let mut endpoint = fixture.endpoint();
+        endpoint.deployment_block = HEIGHT_B;
+        let anchor = next_anchor(&saved_deposit_tree_state().anchor);
+        let (_, _, staged) = verify_deposit_interval(None, &endpoint, &anchor).await.unwrap();
+        assert_eq!(staged.count, NEW_COUNT);
+        assert_eq!(staged.event_block, HEIGHT_B);
+        let calls = fixture.calls();
+        let logs = calls.iter().find(|call| call["method"] == "eth_getLogs").unwrap();
+        assert_eq!(logs["params"][0]["fromBlock"], block_id(HEIGHT_B));
+        assert_eq!(logs["params"][0]["toBlock"], block_id(HEIGHT_B));
     }
 
     fn deposit_event(index: u32) -> (DepositRecorded, Hash4) {
@@ -590,11 +667,15 @@ mod tests {
     }
 
     fn prepare_new_batch() -> PreparedBatch {
+        prepare_batch(SAVED_COUNT)
+    }
+
+    fn prepare_batch(from_count: u32) -> PreparedBatch {
         let mut logs = Vec::new();
         let mut receipts = std::collections::BTreeMap::new();
         let mut leaf_hashes = std::collections::BTreeMap::new();
         let mut poseidon = Vec::new();
-        for index in SAVED_COUNT..NEW_COUNT {
+        for index in from_count..NEW_COUNT {
             let (event, leaf) = deposit_event(index);
             assert_ne!(event.leafHash, B256::ZERO, "new-batch leaf hash is a real commitment");
             let mut transaction = [0u8; 32];
@@ -643,7 +724,7 @@ mod tests {
     impl L1Fixture {
         fn calls(&self) -> Vec<serde_json::Value> { self.calls.lock().unwrap().clone() }
         fn clear(&self) { self.calls.lock().unwrap().clear(); }
-        fn endpoint(&self) -> ChainEndpoint { ChainEndpoint { chain_index: CHAIN_INDEX, rpc_url: self.url.clone() } }
+        fn endpoint(&self) -> ChainEndpoint { ChainEndpoint { chain_index: CHAIN_INDEX, chain_id: U256::from(CHAIN_ID), bridge: Hex(BRIDGE), deployment_block: 0, rpc_url: self.url.clone() } }
     }
 
     fn dispatch(request: &serde_json::Value, batch: &ServerBatch, reorg: bool, tamper: bool) -> Result<serde_json::Value, &'static str> {
@@ -656,7 +737,6 @@ mod tests {
                 if tag == "finalized" { return Ok(header(HEIGHT_B, HASH_B)); }
                 let number = parse_qty(&params[0]).ok_or("block number")?;
                 let hash = match number {
-                    0 => GENESIS,
                     HEIGHT_A => if reorg { HASH_A_REORG } else { HASH_A },
                     HEIGHT_B => HASH_B,
                     _ => return Err("unexpected block height"),
@@ -669,8 +749,11 @@ mod tests {
                 let height = call_height(&params[1]).ok_or("call block")?;
                 if height != HEIGHT_B { return Err("historical eth_call is refused"); }
                 if to == hex_addr(&BRIDGE) && data == selector("addressesProvider()") { return Ok(serde_json::json!(word_addr(&PROVIDER))); }
-                if to == hex_addr(&PROVIDER) && data == get_address_data() { return Ok(serde_json::json!(word_addr(&STATE_MANAGER))); }
+                if to == hex_addr(&PROVIDER) && data == provider_data(b"STATE_MANAGER") { return Ok(serde_json::json!(word_addr(&STATE_MANAGER))); }
+                if to == hex_addr(&PROVIDER) && data == provider_data(b"ROUTER") { return Ok(serde_json::json!(word_addr(&STATE_MANAGER))); }
                 if to == hex_addr(&STATE_MANAGER) && data == selector("l1ChainIndex()") { return Ok(serde_json::json!(hex_word(u64::from(CHAIN_INDEX)))); }
+                if to == hex_addr(&STATE_MANAGER) && data.starts_with(&selector("l1ToL2Token(address)")) { return Ok(serde_json::json!(hex_word(u64::from(TOKEN_ID)))); }
+                if to == hex_addr(&STATE_MANAGER) && data.starts_with(&selector("l2ToL1Token(bytes32)")) { return Ok(serde_json::json!(word_addr(&TOKEN))); }
                 if to == hex_addr(&BRIDGE) && data == selector("pendingDepositCount()") { return Ok(serde_json::json!(hex_word(pending_count_at_height(height)))); }
                 if to == hex_addr(&BRIDGE) && data.starts_with(&selector("depositLeafHashes(uint256)")) {
                     let index = u32_arg(data).ok_or("leaf index")?;
@@ -739,7 +822,8 @@ mod tests {
     async fn saved_deposit_tree_state_reuses_headers_and_new_batch_checks_real_l1_evidence() {
         let prepared = prepare_new_batch();
         let fixture = serve_l1(prepared.server).await;
-        let endpoint = fixture.endpoint();
+        let mut endpoint = fixture.endpoint();
+        endpoint.deployment_block = HEIGHT_A - 1;
         let authorized = chain();
         let state = saved_deposit_tree_state();
         let next = next_anchor(&state.anchor);
@@ -747,14 +831,14 @@ mod tests {
         assert_eq!(pending_count_at_height(HEIGHT_A), u64::from(SAVED_COUNT));
         assert_eq!(pending_count_at_height(HEIGHT_B), u64::from(NEW_COUNT));
 
-        let canonical = verify_saved_deposit_anchor_headers(&endpoint, &authorized, &state.anchor).await.unwrap();
+        let canonical = verify_saved_deposit_anchor_headers(&endpoint, &state.anchor).await.unwrap();
         assert_eq!(canonical, Hex(HASH_A));
         assert!(verify_cached_anchor_hash(canonical, state.anchor.block_hash).is_ok());
         let headers = fixture.calls();
         assert!(headers.iter().all(is_header) && saw_block(&headers, HEIGHT_A) && !headers.iter().any(is_body));
         fixture.clear();
 
-        let (old_root, new_root, staged) = verify_deposit_anchor(Some(&state), &endpoint, &authorized, &state.anchor).await.unwrap();
+        let (old_root, new_root, staged) = verify_deposit_anchor(Some(&state), &endpoint, &state.anchor).await.unwrap();
         assert_eq!((old_root, new_root), (state.previous_root, state.root));
         assert_eq!(&staged, &state);
         let restart = fixture.calls();
@@ -762,7 +846,7 @@ mod tests {
         assert!(saw_block(&restart, HEIGHT_A) && !saw_block(&restart, HEIGHT_B) && !restart.iter().any(is_body));
         fixture.clear();
 
-        let (old_root, new_root, staged) = verify_deposit_anchor(Some(&state), &endpoint, &authorized, &next).await.unwrap();
+        let (old_root, new_root, staged) = verify_deposit_anchor(Some(&state), &endpoint, &next).await.unwrap();
         let (expected_root, expected_occupied) = fold_new(&state, &prepared.poseidon);
         assert_eq!(old_root, state.root);
         assert_eq!(new_root, expected_root);
@@ -798,7 +882,7 @@ mod tests {
         fixture.reorg.store(true, Ordering::Relaxed);
         let endpoint = fixture.endpoint();
         let state = saved_deposit_tree_state();
-        let error = verify_deposit_anchor(Some(&state), &endpoint, &chain(), &next_anchor(&state.anchor)).await.unwrap_err();
+        let error = verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap_err();
         assert!(matches!(error, GuardianAccountError::Conflict(HaltReason::FinalityConflict)), "{error:?}");
         let calls = fixture.calls();
         assert!(calls.iter().all(is_header) && saw_block(&calls, HEIGHT_A) && !saw_block(&calls, HEIGHT_B) && !calls.iter().any(is_body), "{calls:?}");
@@ -816,7 +900,7 @@ mod tests {
         // Count 100 = 0b1100100 folds frontier levels 2, 5, 6; an unused level-0 slot leaves the fold valid, so corrupt an occupied level-2 node.
         state.frontier[2] = state.root;
         assert!(state.validate().is_err());
-        let error = verify_deposit_anchor(Some(&state), &endpoint, &chain(), &next).await.unwrap_err();
+        let error = verify_deposit_anchor(Some(&state), &endpoint, &next).await.unwrap_err();
         assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch)), "{error:?}");
         let calls = fixture.calls();
         assert!(calls.iter().all(|call| !is_body(call)), "no L1 new-batch fetch before frontier validation: {calls:?}");
@@ -833,7 +917,7 @@ mod tests {
         fixture.tamper_leaf.store(true, Ordering::Relaxed);
         let endpoint = fixture.endpoint();
         let state = saved_deposit_tree_state();
-        let error = verify_deposit_anchor(Some(&state), &endpoint, &chain(), &next_anchor(&state.anchor)).await.unwrap_err();
+        let error = verify_deposit_anchor(Some(&state), &endpoint, &next_anchor(&state.anchor)).await.unwrap_err();
         assert!(matches!(error, GuardianAccountError::Unavailable(GuardianSignError::DepositMismatch)), "{error:?}");
         let calls = fixture.calls();
         assert!(calls.iter().any(|call| method(call) == "eth_call" && call["params"][0]["data"].as_str().unwrap_or("").starts_with(&selector("depositLeafHashes(uint256)"))));

@@ -1,6 +1,6 @@
 //! One redb file belongs to exactly one guardian signing key.
 //! The caller supplies the exclusive file descriptor; dropping this value releases it.
-//! Public approvals are shared immutably; only runtime state is stored in this database.
+//! Schema 2 stores runtime identity only. Legacy journals require explicit operator-controlled migration.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -13,18 +13,20 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 
-use super::protocol::{advance_included_account, DepositTreeState, GuardianAccount, GuardianAccountState, GuardianAuthorization, GuardianSession, GuardianSignError, GuardianSigned, HaltReason};
+use super::protocol::{advance_included_account, DepositTreeState, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianSession, GuardianSignError, GuardianSigned, HaltReason};
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 
 const GUARDIAN_SIGNER: TableDefinition<(), [u8; 33]> = TableDefinition::new("guardian_signer");
+const GUARDIAN_SCHEMA: TableDefinition<(), u32> = TableDefinition::new("guardian_schema");
+const SCHEMA_VERSION: u32 = 2;
 const GUARDIAN_ACCOUNT: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("guardian_account");
 const GUARDIAN_SIGNED: TableDefinition<(u64, u64, u64), &[u8]> = TableDefinition::new("guardian_signed");
 const GUARDIAN_SESSION: TableDefinition<(u64, u64, u64), &[u8]> = TableDefinition::new("guardian_session");
 const DEPOSIT_TREE_STATES: TableDefinition<DepositTreeKey, &[u8]> = TableDefinition::new("deposit_tree_states");
 const INCLUDED_WITHDRAWAL_BURNS: TableDefinition<WithdrawalBurnKey, u64> = TableDefinition::new("included_withdrawal_burns");
 const WITHDRAWAL_NONCE: TableDefinition<NonceKey, u64> = TableDefinition::new("guardian_withdrawal_nonce");
-const TABLE_NAMES: [&str; 7] = ["deposit_tree_states", "guardian_account", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"];
+const TABLE_NAMES: [&str; 8] = ["deposit_tree_states", "guardian_account", "guardian_schema", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DepositTreeKey(u64, u64, u8);
@@ -108,32 +110,33 @@ fn nonce_bounds(network: u64, user: u64, after: u64) -> (Bound<(u64, u64, u64)>,
     (Bound::Excluded((network, user, after)), Bound::Included((network, user, u64::MAX)))
 }
 
-pub struct GuardianDb { db: Database, public_key: [u8; 33], authorization: Arc<GuardianAuthorization> }
+pub struct GuardianDb { db: Database, public_key: [u8; 33], config: Arc<GuardianConfig> }
 
 impl GuardianDb {
     /// Creates an uninitialized database from an exclusively created protected empty file.
-    pub async fn create(file: File, public_key: [u8; 33], authorization: Arc<GuardianAuthorization>) -> Result<Self> {
+    pub async fn create(file: File, public_key: [u8; 33], config: Arc<GuardianConfig>) -> Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let metadata = file.metadata().map_err(unavailable)?;
         if metadata.len() != 0 || !metadata.is_file() || metadata.mode() & 0o7777 != 0o600
             || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 { return Err(GuardianSignError::DatabaseUnavailable); }
-        Ok(Self { db: open_database(file)?, public_key, authorization })
+        Ok(Self { db: open_database(file)?, public_key, config })
     }
 
     /// Commits signer, initial account, and the empty deposit-tree and nonce-index tables atomically.
-    /// The caller must first validate its key slot and genesis against the shared public approval.
+    /// The caller must first validate its key slot and checkpoint against the selected network.
     /// Existing or partial runtime tables are never repaired or reinitialized.
     pub async fn initialize_runtime(&mut self, account: &GuardianAccount) -> Result<()> {
         account.validate()?;
         if account.state != GuardianAccountState::Active || account.halt_reason.is_some() || account.imported_nonce.is_some()
             || account.imported_ending_leaf.is_some() || !account.withdrawal_chains.is_empty()
-            || account.authorization_sha256 != self.authorization.digest()? { return Err(GuardianSignError::StateMismatch); }
+            || account.account_public_key != self.config.account_public_key()? || account.network_magic != self.config.network_magic()? { return Err(GuardianSignError::StateMismatch); }
         if self.runtime_initialized()? { return Err(GuardianSignError::StateMismatch); }
         let tx = self.db.begin_write().map_err(unavailable)?;
         {
-            if account.user_id != self.authorization.user_id() {
+            if account.user_id != self.config.user_id() {
                 return Err(GuardianSignError::AccountIdentityConflict);
             }
+            tx.open_table(GUARDIAN_SCHEMA).map_err(unavailable)?.insert((), SCHEMA_VERSION).map_err(unavailable)?;
             let mut signer = tx.open_table(GUARDIAN_SIGNER).map_err(unavailable)?;
             signer.insert((), &self.public_key).map_err(unavailable)?;
             let mut accounts = tx.open_table(GUARDIAN_ACCOUNT).map_err(unavailable)?;
@@ -149,8 +152,8 @@ impl GuardianDb {
     }
 
 
-    pub fn resolve_signed_authorization(&self, signed: &GuardianSigned) -> Result<&GuardianAuthorization> {
-        self.authorization.resolve_signed_authorization(signed)
+    pub fn validate_signed(&self, signed: &GuardianSigned) -> Result<()> {
+        self.config.validate_signed(signed)
     }
 
     pub fn runtime_initialized(&self) -> Result<bool> {
@@ -158,13 +161,13 @@ impl GuardianDb {
         runtime_tables_present(&tx)
     }
 
-    /// Opens an existing valid redb with zero or exactly seven runtime tables.
-    /// Zero tables permit explicit fresh reset; raw empty files and partial tables are rejected.
-    pub async fn open(file: File, public_key: [u8; 33], authorization: Arc<GuardianAuthorization>) -> Result<Self> {
+    /// Opens an existing valid redb with zero or exactly eight schema-2 runtime tables.
+    /// Legacy, partial, and unknown schemas are rejected without migration or writes.
+    pub async fn open(file: File, public_key: [u8; 33], config: Arc<GuardianConfig>) -> Result<Self> {
         if file.metadata().map_err(unavailable)?.len() == 0 { return Err(GuardianSignError::DatabaseUnavailable); }
         let db = open_database(file)?;
         let tx = db.begin_read().map_err(unavailable)?;
-        if !runtime_tables_present(&tx)? { return Ok(Self { db, public_key, authorization }); }
+        if !runtime_tables_present(&tx)? { return Ok(Self { db, public_key, config }); }
         {
             let signer = tx.open_table(GUARDIAN_SIGNER).map_err(unavailable)?;
             if signer.len().map_err(unavailable)? != 1 { return Err(GuardianSignError::DatabaseUnavailable); }
@@ -180,13 +183,26 @@ impl GuardianDb {
             }
         }
         if rows.len() != 1 { return Err(GuardianSignError::DatabaseUnavailable); }
-        decode_account(rows[0].0, &rows[0].1)?;
-        drop(tx.open_table(GUARDIAN_SIGNED).map_err(unavailable)?);
-        drop(tx.open_table(GUARDIAN_SESSION).map_err(unavailable)?);
+        let account = decode_account(rows[0].0, &rows[0].1).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
+        if account.account_public_key != config.account_public_key()? || account.network_magic != config.network_magic()? { return Err(GuardianSignError::AccountIdentityConflict); }
+        {
+            let signed = tx.open_table(GUARDIAN_SIGNED).map_err(unavailable)?;
+            for row in signed.iter().map_err(unavailable)? {
+                let (key, bytes) = row.map_err(unavailable)?;
+                let value = decode_signed(key.value(), bytes.value()).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
+                config.validate_signed(&value)?;
+            }
+            let sessions = tx.open_table(GUARDIAN_SESSION).map_err(unavailable)?;
+            for row in sessions.iter().map_err(unavailable)? {
+                let (key, bytes) = row.map_err(unavailable)?;
+                let value = decode_session(key.value(), bytes.value()).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
+                value.record.request_json.decode().map_err(|_| GuardianSignError::LegacyJournalSchema)?.validate_authorization(&config)?;
+            }
+        }
         drop(tx.open_table(DEPOSIT_TREE_STATES).map_err(unavailable)?);
         drop(tx.open_table(INCLUDED_WITHDRAWAL_BURNS).map_err(unavailable)?);
         drop(tx.open_table(WITHDRAWAL_NONCE).map_err(unavailable)?);
-        Ok(Self { db, public_key, authorization })
+        Ok(Self { db, public_key, config })
     }
 
     pub async fn load_account(&mut self, network: u64, user: u64) -> Result<GuardianAccount> {
@@ -212,10 +228,9 @@ impl GuardianDb {
             }
             rows
         };
-        let digest = self.authorization.digest()?;
         rows.into_iter().map(|(key, bytes)| {
             let session = decode_session(key, &bytes)?;
-            if session.record.request_json.decode()?.authorization_sha256 != digest { return Err(GuardianSignError::AuthorizationMismatch); }
+            session.record.request_json.decode()?.validate_authorization(&self.config)?;
             Ok(session)
         }).collect()
     }
@@ -234,11 +249,9 @@ impl GuardianDb {
             }
             rows
         };
-        let digest = self.authorization.digest()?;
         rows.into_iter().map(|(key, bytes)| {
             let signed = decode_signed(key, &bytes)?;
-            let request = super::protocol::GuardianSignRequest::from_canonical_bytes(&signed.request_bytes)?;
-            if request.authorization_sha256 != digest || request.genesis_hash != self.authorization.genesis_hash { return Err(GuardianSignError::AuthorizationMismatch); }
+            self.config.validate_signed(&signed)?;
             Ok(signed)
         }).collect()
     }
@@ -250,7 +263,7 @@ impl GuardianDb {
         ensure_signer(&tx, self.public_key)?;
         let account = account_in(&tx, value.network_magic, value.user_id)?;
         ensure_active(&account)?;
-        if let Some(existing) = signed_in(&tx, &self.authorization, value.network_magic, value.user_id, value.nonce)? {
+        if let Some(existing) = signed_in(&tx, &self.config, value.network_magic, value.user_id, value.nonce)? {
             if !same_reservation(&existing, value) { return Err(GuardianSignError::NonceConflict); }
             if existing.signature.is_none() && account.imported_nonce.is_some_and(|nonce| nonce >= value.nonce) {
                 return Err(GuardianSignError::NonceConflict);
@@ -259,12 +272,12 @@ impl GuardianDb {
             return Ok(existing);
         }
         let request = super::protocol::GuardianSignRequest::from_canonical_bytes(&value.request_bytes)?;
-        if request.authorization_sha256 != account.authorization_sha256 { return Err(GuardianSignError::AuthorizationMismatch); }
+        if request.decode_trace()?.meta.public_key != account.account_public_key { return Err(GuardianSignError::AccountIdentityConflict); }
         if account.imported_ending_leaf.is_some_and(|leaf| leaf != value.starting_leaf_hash) { return Err(GuardianSignError::StateMismatch); }
         if value.nonce != account.imported_nonce.unwrap_or(0).checked_add(1).ok_or(GuardianSignError::NonceConflict)? {
             return Err(GuardianSignError::SessionHistoryUnavailable);
         }
-        self.authorization.resolve_signed_authorization(value)?;
+        self.config.validate_signed(value)?;
         insert_signed(&tx, value)?;
         tx.commit().map_err(unavailable)?;
         Ok(value.clone())
@@ -275,7 +288,7 @@ impl GuardianDb {
         ensure_signer(&tx, self.public_key)?;
         let account = account_in(&tx, network, user)?;
         ensure_active(&account)?;
-        let mut value = signed_in(&tx, &self.authorization, network, user, nonce)?.ok_or(GuardianSignError::NonceConflict)?;
+        let mut value = signed_in(&tx, &self.config, network, user, nonce)?.ok_or(GuardianSignError::NonceConflict)?;
         if value.request_bytes != request_bytes { return Err(GuardianSignError::NonceConflict); }
         if let Some(saved) = value.signature {
             if saved != signature { return Err(GuardianSignError::NonceConflict); }
@@ -291,7 +304,7 @@ impl GuardianDb {
 
     /// The closure must not perform I/O; its result is withheld until commit succeeds.
     pub async fn authorize_response<T, F>(&mut self, network: u64, user: u64, nonce: u64, request_bytes: &[u8], serialize: F) -> Result<T>
-    where F: FnOnce(&GuardianSigned, &GuardianAuthorization) -> Result<T> {
+    where F: FnOnce(&GuardianSigned, &GuardianConfig) -> Result<T> {
         let tx = self.db.begin_write().map_err(unavailable)?;
         ensure_signer(&tx, self.public_key)?;
         ensure_active(&account_in(&tx, network, user)?)?;
@@ -301,8 +314,8 @@ impl GuardianDb {
             decode_signed((network, user, nonce), bytes.value())?
         };
         if value.request_bytes != request_bytes || value.signature.is_none() { return Err(GuardianSignError::NonceConflict); }
-        let authorization = self.authorization.resolve_signed_authorization(&value)?;
-        let response = serialize(&value, authorization)?;
+        self.config.validate_signed(&value)?;
+        let response = serialize(&value, &self.config)?;
         tx.commit().map_err(unavailable)?;
         Ok(response)
     }
@@ -322,7 +335,7 @@ impl GuardianDb {
         let old = account_in(&tx, value.network_magic, value.user_id)?;
         ensure_active(&old)?;
         if value.state != GuardianAccountState::Active || value.halt_reason.is_some() || value.imported_nonce != old.imported_nonce
-            || value.imported_ending_leaf != old.imported_ending_leaf || value.authorization_sha256 != old.authorization_sha256
+            || value.imported_ending_leaf != old.imported_ending_leaf || value.account_public_key != old.account_public_key
             || value.withdrawal_chains != old.withdrawal_chains || value.last_checkpoint_id < old.last_checkpoint_id {
             return Err(GuardianSignError::StateMismatch);
         }
@@ -341,8 +354,7 @@ impl GuardianDb {
     /// One write commits the session, included deposit tree states, both nonce indexes, and the sole account checkpoint.
     pub async fn import_session(&mut self, value: &GuardianSession, deposit_tree_states: &[DepositTreeState], checkpoint_id: u64, checkpoint_hash: super::protocol::Hash4) -> Result<GuardianSession> {
         let request = value.record.request_json.decode()?;
-        let digest = self.authorization.digest()?;
-        if request.authorization_sha256 != digest || request.genesis_hash != self.authorization.genesis_hash { return Err(GuardianSignError::AuthorizationMismatch); }
+        request.validate_authorization(&self.config)?;
         if (request.network_magic, request.user_id, request.session_nonce) != (value.network_magic, value.user_id, value.nonce) {
             return Err(GuardianSignError::StateMismatch);
         }
@@ -356,14 +368,14 @@ impl GuardianDb {
         ensure_signer(&tx, self.public_key)?;
         let account = account_in(&tx, value.network_magic, value.user_id)?;
         ensure_active(&account)?;
-        if request.authorization_sha256 != account.authorization_sha256 { return Err(GuardianSignError::AuthorizationMismatch); }
+        if request.decode_trace()?.meta.public_key != account.account_public_key { return Err(GuardianSignError::AccountIdentityConflict); }
         if let Some(existing) = session_in(&tx, value.network_magic, value.user_id, value.nonce)? {
             if serde_json::to_string(&existing).map_err(unavailable)? != serde_json::to_string(value).map_err(unavailable)? {
                 write_halt(&tx, &account, HaltReason::NonceConsumedDifferently)?;
                 tx.commit().map_err(unavailable)?;
                 return Err(GuardianSignError::AccountHalted);
             }
-            if let Some(own) = signed_in(&tx, &self.authorization, value.network_magic, value.user_id, value.nonce)? {
+            if let Some(own) = signed_in(&tx, &self.config, value.network_magic, value.user_id, value.nonce)? {
                 if own.request_bytes != request_bytes || own.deposit_tree_states != deposit_tree_states { return Err(GuardianSignError::NonceConflict); }
             }
             return Ok(existing);
@@ -380,7 +392,7 @@ impl GuardianDb {
             tx.commit().map_err(unavailable)?;
             return Err(GuardianSignError::AccountHalted);
         }
-        if let Some(own) = signed_in(&tx, &self.authorization, value.network_magic, value.user_id, value.nonce)? {
+        if let Some(own) = signed_in(&tx, &self.config, value.network_magic, value.user_id, value.nonce)? {
             if own.request_bytes != request_bytes || own.deposit_tree_states != deposit_tree_states
                 || own.starting_leaf_hash != value.starting_leaf_hash || own.ending_leaf_hash != value.ending_leaf_hash {
                 write_halt(&tx, &account, HaltReason::NonceConsumedDifferently)?;
@@ -440,7 +452,7 @@ impl GuardianDb {
         };
         bytes.as_deref().map(|bytes| {
             let signed = decode_signed((network, user, nonce), bytes)?;
-            self.authorization.resolve_signed_authorization(&signed)?;
+            self.config.validate_signed(&signed)?;
             Ok(signed)
         }).transpose()
     }
@@ -449,9 +461,11 @@ impl GuardianDb {
 
 fn runtime_tables_present(tx: &redb::ReadTransaction) -> Result<bool> {
     let names = tx.list_tables().map_err(unavailable)?.map(|table| table.name().to_owned()).collect::<BTreeSet<_>>();
-    if tx.list_multimap_tables().map_err(unavailable)?.next().is_some() { return Err(GuardianSignError::DatabaseUnavailable); }
+    if tx.list_multimap_tables().map_err(unavailable)?.next().is_some() { return Err(GuardianSignError::LegacyJournalSchema); }
     if names.is_empty() { return Ok(false); }
-    if names != TABLE_NAMES.into_iter().map(str::to_owned).collect() { return Err(GuardianSignError::DatabaseUnavailable); }
+    if names != TABLE_NAMES.into_iter().map(str::to_owned).collect() { return Err(GuardianSignError::LegacyJournalSchema); }
+    let schema = tx.open_table(GUARDIAN_SCHEMA).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
+    if schema.len().map_err(unavailable)? != 1 || schema.get(()).map_err(unavailable)?.map(|row| row.value()) != Some(SCHEMA_VERSION) { return Err(GuardianSignError::LegacyJournalSchema); }
     drop(tx.open_table(GUARDIAN_SIGNER).map_err(unavailable)?);
     drop(tx.open_table(GUARDIAN_ACCOUNT).map_err(unavailable)?);
     drop(tx.open_table(GUARDIAN_SIGNED).map_err(unavailable)?);
@@ -481,7 +495,7 @@ fn account_in(tx: &redb::WriteTransaction, network: u64, user: u64) -> Result<Gu
     decode_account((network, user), &bytes)
 }
 
-fn signed_in(tx: &redb::WriteTransaction, authorization: &GuardianAuthorization, network: u64, user: u64, nonce: u64) -> Result<Option<GuardianSigned>> {
+fn signed_in(tx: &redb::WriteTransaction, config: &GuardianConfig, network: u64, user: u64, nonce: u64) -> Result<Option<GuardianSigned>> {
     let bytes = {
         let signed = tx.open_table(GUARDIAN_SIGNED).map_err(unavailable)?;
         let row = signed.get((network, user, nonce)).map_err(unavailable)?;
@@ -489,7 +503,7 @@ fn signed_in(tx: &redb::WriteTransaction, authorization: &GuardianAuthorization,
     };
     bytes.as_deref().map(|bytes| {
         let signed = decode_signed((network, user, nonce), bytes)?;
-        authorization.resolve_signed_authorization(&signed)?;
+        config.validate_signed(&signed)?;
         Ok(signed)
     }).transpose()
 }
@@ -633,7 +647,7 @@ mod tests {
         async fn create(account: &GuardianAccount) -> Self {
             let path = std::env::temp_dir().join(format!("guardian-db-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
             let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path).expect("disposable database");
-            let mut db = GuardianDb::create(file, KEY, approval()).await.unwrap();
+            let mut db = GuardianDb::create(file, KEY, Arc::new(super::super::protocol::codec_config_fixture(account.network_magic))).await.unwrap();
             db.initialize_runtime(account).await.expect("initialize runtime");
             Self { db: Some(db), path }
         }
@@ -655,13 +669,16 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
-    fn approval() -> Arc<GuardianAuthorization> {
-        Arc::new(super::super::protocol::approval_tests::authorization_fixture())
-    }
+    fn approval() -> Arc<GuardianConfig> { Arc::new(super::super::protocol::codec_config_fixture(90101)) }
 
-    fn change_approval_digest(signed: &mut GuardianSigned) {
+    fn change_request_identity(signed: &mut GuardianSigned) {
         let mut request = super::super::protocol::GuardianSignRequest::from_canonical_bytes(&signed.request_bytes).unwrap();
-        request.authorization_sha256.0[0] ^= 1;
+        let mut trace = request.decode_trace().unwrap();
+        trace.meta.public_key = Hash4::from_values(99, 0, 0, 0);
+        let mut generated = request.trace_json.decode().unwrap();
+        generated.pk_hash = trace.meta.public_key.to_string();
+        generated.trace.payload = serde_json::to_string(&trace).unwrap();
+        request.trace_json = JsonText::from_value(&generated).unwrap();
         signed.request_bytes = request.canonical_bytes().unwrap();
     }
 
@@ -680,7 +697,7 @@ mod tests {
         assert!(owned.db().load_sessions(90101, 524288, None, 1).await.unwrap().is_empty());
         assert!(owned.db().load_signed(90101, 524288, None, 1).await.unwrap().is_empty());
         assert_eq!(owned.db().db.begin_read().unwrap().list_tables().unwrap().count(), 0);
-        let original = owned.db().authorization.digest().unwrap();
+        let original = owned.db().config.account_public_key().unwrap();
         {
             let tx = owned.db().db.begin_write().unwrap();
             tx.open_table(GUARDIAN_SIGNER).unwrap().insert((), &KEY).unwrap();
@@ -698,7 +715,7 @@ mod tests {
         let names = owned.db().db.begin_read().unwrap().list_tables().unwrap().map(|table| table.name().to_owned()).collect::<BTreeSet<_>>();
         assert_eq!(names, TABLE_NAMES.into_iter().map(str::to_owned).collect());
         assert!(owned.db().initialize_runtime(&active(90101, 0)).await.is_err());
-        assert_eq!(owned.db().authorization.digest().unwrap(), original);
+        assert_eq!(owned.db().config.account_public_key().unwrap(), original);
         let file = owned.reopen();
         owned.db = Some(GuardianDb::open(file, KEY, approval()).await.unwrap());
         assert!(owned.db().runtime_initialized().unwrap());
@@ -736,7 +753,7 @@ mod tests {
         GuardianAccount {
             network_magic: network, user_id: 524288, state: GuardianAccountState::Active,
             last_checkpoint_id: checkpoint, last_checkpoint_hash: Hash4::default(), imported_nonce: None,
-            authorization_sha256: approval().digest().expect("approval digest"), imported_ending_leaf: None,
+            account_public_key: approval().account_public_key().expect("account public key"), imported_ending_leaf: None,
             withdrawal_chains: Vec::new(), halt_reason: None,
         }
     }
@@ -789,25 +806,23 @@ mod tests {
 
 
     #[tokio::test]
-    async fn changed_current_authorization_rejects_retained_signatures_after_reopen() {
+    async fn changed_initial_members_reject_retained_identity_after_reopen() {
         let signed = reserved();
         let mut owned = TestDb::create(&active(signed.network_magic, 0)).await;
         owned.db().reserve_guardian_nonce(&signed).await.unwrap();
         owned.db().save_guardian_signature(signed.network_magic, signed.user_id, signed.nonce, &signed.request_bytes, [5; 64]).await.unwrap();
-        let mut changed = (*approval()).clone(); changed.max_fee += 1;
+        let mut changed = (*approval()).clone();
+        changed.network.guardian_initial_member_hashes.as_mut().unwrap()[0] = Hash4::from_values(7, 0, 0, 0);
         let file = owned.reopen();
-        owned.db = Some(GuardianDb::open(file, KEY, Arc::new(changed)).await.unwrap());
-        assert!(matches!(owned.db().lookup_signed(signed.network_magic, signed.user_id, signed.nonce).await, Err(GuardianSignError::AuthorizationMismatch)));
-        assert!(matches!(owned.db().authorize_response(signed.network_magic, signed.user_id, signed.nonce, &signed.request_bytes, |_, _| Ok(())).await, Err(GuardianSignError::AuthorizationMismatch)));
-        assert!(matches!(owned.db().reserve_guardian_nonce(&signed).await, Err(GuardianSignError::AuthorizationMismatch)));
+        assert!(matches!(GuardianDb::open(file, KEY, Arc::new(changed)).await, Err(GuardianSignError::AccountIdentityConflict)));
     }
 
     #[tokio::test]
-    async fn invalid_approval_reference_cannot_reserve_a_nonce() {
+    async fn invalid_account_identity_cannot_reserve_a_nonce() {
         let mut signed = reserved();
         let mut owned = TestDb::create(&active(signed.network_magic, 0)).await;
-        change_approval_digest(&mut signed);
-        assert!(matches!(owned.db().reserve_guardian_nonce(&signed).await, Err(GuardianSignError::AuthorizationMismatch)));
+        change_request_identity(&mut signed);
+        assert!(matches!(owned.db().reserve_guardian_nonce(&signed).await, Err(GuardianSignError::AccountIdentityConflict)));
         assert!(owned.db().lookup_signed(signed.network_magic, signed.user_id, signed.nonce).await.unwrap().is_none());
     }
 
@@ -825,7 +840,7 @@ mod tests {
         retry.request_bytes.push(9);
         assert!(!same_reservation(&original, &retry));
         retry = original.clone();
-        change_approval_digest(&mut retry);
+        change_request_identity(&mut retry);
         assert!(!same_reservation(&original, &retry));
         retry = original.clone();
         retry.signature = Some([8; 64]);
@@ -840,7 +855,7 @@ mod tests {
         assert!(matches!(GuardianDb::open(contender, KEY, approval()).await, Err(GuardianSignError::KeyUnavailable)));
         owned.db().reserve_guardian_nonce(&value).await.expect("reserve");
         let mut different = value.clone();
-        change_approval_digest(&mut different);
+        change_request_identity(&mut different);
         assert!(matches!(owned.db().reserve_guardian_nonce(&different).await, Err(GuardianSignError::NonceConflict)));
         let file = owned.reopen();
         assert!(matches!(GuardianDb::open(file, [3; 33], approval()).await, Err(GuardianSignError::AccountIdentityConflict)));
@@ -868,7 +883,7 @@ mod tests {
         owned.db().reserve_guardian_nonce(&value).await.expect("reserve");
         owned.db().save_guardian_signature(value.network_magic, value.user_id, value.nonce, &value.request_bytes, [5; 64]).await.expect("sign");
         let mut differing = value.clone();
-        change_approval_digest(&mut differing);
+        change_request_identity(&mut differing);
         assert!(matches!(owned.db().reserve_guardian_nonce(&differing).await, Err(GuardianSignError::NonceConflict)));
         let retained = owned.db().lookup_signed(value.network_magic, value.user_id, value.nonce).await.expect("lookup").expect("signed reservation");
         assert_eq!(retained.signature, Some([5; 64]));
@@ -1041,7 +1056,7 @@ mod tests {
 
         assert_eq!(owned.db().load_deposit_tree_states(90109, 524288).await.expect("unchanged deposit tree state"), vec![changed]);
         let file = owned.reopen();
-        let mut restored = GuardianDb::open(file, KEY, approval()).await.expect("reopen");
+        let mut restored = GuardianDb::open(file, KEY, Arc::new(super::super::protocol::codec_config_fixture(90109))).await.expect("reopen");
         assert_eq!(restored.load_account(90109, 524288).await.expect("halted").state, GuardianAccountState::Halted);
         assert_halted_cursor(&mut restored, 90109, 1).await;
         assert_eq!(restored.load_deposit_tree_states(90109, 524288).await.expect("retained deposit tree state after reopen"), signed.deposit_tree_states);
@@ -1066,6 +1081,7 @@ mod tests {
             let db = open_database(file).unwrap();
             let tx = db.begin_write().expect("raw write");
             {
+                tx.open_table(GUARDIAN_SCHEMA).unwrap().insert((), SCHEMA_VERSION).unwrap();
                 let mut signer = tx.open_table(GUARDIAN_SIGNER).expect("signer");
                 signer.insert((), &KEY).expect("key");
                 let mut table = tx.open_table(GUARDIAN_ACCOUNT).expect("accounts");
@@ -1093,6 +1109,28 @@ mod tests {
             drop(tx);
             drop(db);
             let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_or_unknown_schema_is_rejected_without_rewriting_journal() {
+        for version in [None, Some(1), Some(3)] {
+            let mut owned = TestDb::create(&active(90101, 0)).await;
+            let tx = owned.db().db.begin_write().unwrap();
+            match version {
+                None => { tx.delete_table(GUARDIAN_SCHEMA).unwrap(); }
+                Some(version) => { tx.open_table(GUARDIAN_SCHEMA).unwrap().insert((), version).unwrap(); }
+            }
+            tx.commit().unwrap();
+            let file = owned.reopen();
+            let before = std::fs::read(&owned.path).unwrap();
+            let error = match GuardianDb::open(file, KEY, approval()).await {
+                Err(error) => error,
+                Ok(_) => panic!("legacy journal must require explicit migration"),
+            };
+            assert_eq!(error, GuardianSignError::LegacyJournalSchema);
+            assert!(error.to_string().contains("explicit operator-controlled migration is required"));
+            assert_eq!(std::fs::read(&owned.path).unwrap(), before);
         }
     }
 }

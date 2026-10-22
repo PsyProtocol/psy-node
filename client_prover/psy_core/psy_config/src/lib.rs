@@ -75,11 +75,13 @@ pub struct NetworkConfig<F: RichField> {
     pub guardian_configs: Vec<GuardianPublicConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian_history: Option<GuardianHistoryConfig>,
-    /// Parsed into the guardian protocol type by guardian consumers, avoiding a crate cycle.
+    /// Ordered public member hashes of the initial 2-of-3 multisig. Absent on networks that do not run a guardian.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guardian_authorization: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub l1_endpoints: Vec<ChainEndpoint>,
+    pub guardian_initial_member_hashes: Option<[QHashOut<F>; 3]>,
+
+    /// Trusted operator endpoint for the published L1 document. Absent when chains come from local deployment files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_config_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_services_url: Option<Vec<String>>,
     /// Nostr relay for private-note delivery. This is required per network;
@@ -148,9 +150,7 @@ pub struct GuardianHistoryConfig {
     pub rpc_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChainEndpoint { pub chain_index: u8, pub rpc_url: String }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeConfig {
@@ -906,6 +906,82 @@ impl<F: RichField> GenesisConfig<F> {
     }
 }
 
+/// Chain id text: optional `0x`/`0X`, then hex, or a decimal integer. No underscores, signs, or empty body.
+pub fn parse_chain_id(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("chain id must not be empty".to_string());
+    }
+    let (body, radix): (&str, u32) = if let Some(hex_body) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        (hex_body, 16)
+    } else if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        (trimmed, 10)
+    } else {
+        return Err(format!("invalid chain id {raw}"));
+    };
+    if body.is_empty() || (radix == 16 && !body.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        return Err(format!("invalid chain id {raw}"));
+    }
+    let mut value = [0u8; 32];
+    let mut started = false;
+    for byte in body.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return Err(format!("invalid chain id {raw}")),
+        };
+        if radix == 10 && digit >= 10 {
+            return Err(format!("invalid chain id {raw}"));
+        }
+        if !started && digit == 0 {
+            continue;
+        }
+        started = true;
+        let mut carry = u32::from(digit);
+        for limb in value.iter_mut().rev() {
+            let product = u32::from(*limb) * u32::from(radix) + carry;
+            *limb = product as u8;
+            carry = product >> 8;
+        }
+        if carry != 0 {
+            return Err(format!("chain id {raw} exceeds 256 bits"));
+        }
+    }
+    if !started {
+        return Err("chain id must be nonzero".to_string());
+    }
+    Ok(format!("0x{}", hex_encode(&value)))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Bridge address text: `0x` plus exactly 40 hex digits (any case), not the zero address.
+///
+/// Case is not a checksum. Hardhat and alloy emit EIP-55 mixed case; equality is the 20 bytes.
+pub fn parse_bridge_address(raw: &str) -> Result<[u8; 20], String> {
+    let body = raw.strip_prefix("0x").ok_or_else(|| format!("invalid bridge address {raw}"))?;
+    if body.len() != 40 || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("invalid bridge address {raw}"));
+    }
+    let mut address = [0u8; 20];
+    for (index, byte) in address.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&body[index * 2..index * 2 + 2], 16).map_err(|error| format!("invalid bridge address {raw}: {error}"))?;
+    }
+    if address == [0; 20] {
+        return Err("bridge address must be nonzero".to_string());
+    }
+    Ok(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,6 +1010,7 @@ mod tests {
                 "realm_user_tree_height": 20,
                 "group_realm_height": 1,
                 "realm_configs": [{{"id": 0, "rpc_url": ["http://127.0.0.1:13380"]}}],
+                "p2p": {{"checkpoints_per_epoch": 1}},
                 "coordinator_configs": [{{"id": 0, "rpc_url": ["http://127.0.0.1:1337"]}}],
                 "prove_proxy_url": ["http://127.0.0.1:9999"],
                 "faucet_rpc_url": ["http://127.0.0.1:9998"],
@@ -1218,22 +1295,28 @@ mod tests {
         let network = config.networks.get_mut("testnet").unwrap();
         assert!(network.guardian_configs.is_empty());
         assert!(network.guardian_history.is_none());
-        assert!(network.guardian_authorization.is_none());
-        assert!(network.l1_endpoints.is_empty());
+        assert!(network.guardian_initial_member_hashes.is_none());
+
         network.guardian_configs = vec![GuardianPublicConfig {
             id: 1, listen_address: "0.0.0.0:15441".parse().unwrap(), rpc_url: Some("http://guardian.example:15441/".into()),
         }];
         network.guardian_history = Some(GuardianHistoryConfig {
             listen_address: "127.0.0.1:15450".parse().unwrap(), rpc_url: None,
         });
-        network.l1_endpoints = vec![ChainEndpoint { chain_index: 42, rpc_url: "https://chain.example/rpc".into() }];
+        network.l1_config_url = Some("https://config.example/config.json".into());
         let encoded = serde_json::to_value(&*network).unwrap();
+        assert!(encoded.get("guardian_authorization").is_none());
+        assert!(encoded.get("guardian_initial_member_hashes").is_none());
+        assert!(encoded.get("l1_endpoints").is_none());
+
         assert_eq!(encoded["guardian_configs"][0], serde_json::json!({
             "id": 1, "listen_address": "0.0.0.0:15441", "rpc_url": "http://guardian.example:15441/"
         }));
         assert_eq!(encoded["guardian_history"], serde_json::json!({"listen_address": "127.0.0.1:15450"}));
+        assert_eq!(encoded["l1_config_url"], "https://config.example/config.json");
         let decoded: NetworkConfigGoldilocks = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded.l1_endpoints[0].chain_index, 42);
+        assert_eq!(decoded.l1_config_url.as_deref(), Some("https://config.example/config.json"));
+
         for field in ["signing_key_secret_path", "signing_key_password_secret_path", "db_path", "archive_path"] {
             let mut endpoint = serde_json::json!({"id": 1, "listen_address": "127.0.0.1:15441"});
             endpoint[field] = serde_json::json!("operator-local");
@@ -1241,5 +1324,41 @@ mod tests {
         }
         assert!(serde_json::from_str::<GuardianPublicConfig>(r#"{"id":"01","listen_address":"127.0.0.1:15441"}"#).is_err());
         assert!(serde_json::from_str::<GuardianPublicConfig>(r#"{"id":1,"id":2,"listen_address":"127.0.0.1:15441"}"#).is_err());
+    }
+
+    #[test]
+    fn guardian_identity_and_chain_text_round_trip_and_reject_bad_input() {
+        let members = [
+            QHashOut::<GoldilocksField>::from_values(1, 0, 0, 0),
+            QHashOut::<GoldilocksField>::from_values(2, 0, 0, 0),
+            QHashOut::<GoldilocksField>::from_values(3, 0, 0, 0),
+        ];
+
+        assert_eq!(parse_chain_id("31337").unwrap(), parse_chain_id("0x7A69").unwrap());
+        assert_eq!(parse_chain_id("0x7a69").unwrap(), "0x0000000000000000000000000000000000000000000000000000000000007a69");
+        let max = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        assert_eq!(parse_chain_id(max).unwrap(), max);
+        assert_eq!(parse_chain_id(&format!("0x{}", "f".repeat(64))).unwrap(), max);
+        assert!(parse_chain_id(&format!("0x1{}", "0".repeat(64))).is_err());
+        assert!(parse_chain_id(&format!("1{}", "0".repeat(78))).is_err());
+        assert!(parse_chain_id("7a69").is_err());
+        assert_ne!(parse_chain_id("10").unwrap(), parse_chain_id("0x10").unwrap());
+        for raw in ["", "0x", "0x0", "0", "-1", "0x1_0", "1_0", "not-a-chain"] {
+            assert!(parse_chain_id(raw).is_err(), "{raw}");
+        }
+        let address = parse_bridge_address("0x1111111111111111111111111111111111111111").unwrap();
+        assert_eq!(address, [0x11; 20]);
+        // Public Hardhat deployment Bridge (deployments/localhost/deployed-contracts.json).
+        const PUBLIC_BRIDGE: &str = "0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD82";
+        let deployed = parse_bridge_address(PUBLIC_BRIDGE).unwrap();
+        assert_eq!(deployed, parse_bridge_address(&PUBLIC_BRIDGE.to_ascii_lowercase()).unwrap());
+        assert_eq!(deployed, parse_bridge_address("0x0DCD1BF9A1B36CE34237EEAFEF220932846BCD82").unwrap());
+        assert_ne!(deployed, parse_bridge_address("0x1111111111111111111111111111111111111111").unwrap());
+        for raw in ["1111111111111111111111111111111111111111", "0x111111111111111111111111111111111111111", "0x11111111111111111111111111111111111111111", "0xGG11111111111111111111111111111111111111", "0X1111111111111111111111111111111111111111", "0x0000000000000000000000000000000000000000", "0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD8", "0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD82zz"] {
+            assert!(parse_bridge_address(raw).is_err(), "{raw}");
+        }
+        let hashes = serde_json::to_value(members).unwrap();
+        assert_eq!(serde_json::from_value::<[QHashOut<GoldilocksField>; 3]>(hashes).unwrap(), members);
+
     }
 }

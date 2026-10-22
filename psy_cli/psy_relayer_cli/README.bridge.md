@@ -29,9 +29,10 @@ cargo run -p psy_relayer_cli -- export-solidity-verifier \
 ## Guardian request archive
 
 The relayer archive advances each frozen request through `Request → Signed → Proved → Included`.
-Signing and proving preserve the request bytes, authorization digest, and deposit prefixes;
+Signing and proving preserve the request bytes, account identity derived from the configured member hashes, and deposit prefixes;
 proving also preserves the collected signatures. Exact retries keep the current stage and
 proof, while conflicting payloads and backward transitions are rejected. Authenticated
 inclusion commits the account checkpoint, deposit prefixes, and withdrawal indexes together.
-Database startup accepts only a tableless redb database or the complete seven-table schema (`chain_claims`, `deposit_tree_states`, `finalization_batch`, `guardian_account`, `guardian_withdrawal_nonce`, `included_withdrawal_burns`, `relayer_request`);
-pre-existing zero-length files and partial or unknown table sets are rejected.
+Database startup accepts only a tableless redb database or the complete eight-table schema (`chain_claims`, `deposit_tree_states`, `finalization_batch`, `guardian_account`, `guardian_withdrawal_nonce`, `included_withdrawal_burns`, `relayer_request`, `journal_schema`) with schema marker version `2`;
+pre-existing zero-length files, legacy schemas, and partial or unknown table sets are rejected without automatic migration.
+Deposit cold scans use the in-memory `ChainEndpoint.deployment_block` as an inclusive lower bound. A local `--l1-config` summary takes that bound from its sibling `Bridge_Proxy.json`: `address` must match the summary bridge, and the value is `receipt.blockNumber`. A remote `l1_config_url` registry requires `deployment_block` on every `l1_chains` entry. A missing value fails startup. There is no block-zero fallback and no automatic remote migration (`psy_cli/guardian_common/src/runtime.rs:188-315`).

@@ -27,6 +27,9 @@ mod guardian;
 struct Cli {
     #[arg(long, default_value = "./psy_cli/psy_relayer_cli/config/local.toml")]
     config: PathBuf,
+    /// Local deployment document. Repeated flags replace the network `l1_config_url`.
+    #[arg(long = "l1-config")]
+    l1_config: Vec<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -41,6 +44,9 @@ enum Commands {
         guardian_root: PathBuf,
         #[arg(long)]
         guardian_id: u8,
+        /// Local deployment document. Repeated flags replace the network `l1_config_url`.
+        #[arg(long = "l1-config")]
+        l1_config: Vec<PathBuf>,
     },
     /// Register, bootstrap, or replace the bridge multisig policy.
     GuardianPolicy {
@@ -55,6 +61,9 @@ enum Commands {
         exclusive_registration_intake: bool,
         #[arg(long)]
         next_members_json: Option<String>,
+        /// Local deployment document. Repeated flags replace the network `l1_config_url`.
+        #[arg(long = "l1-config")]
+        l1_config: Vec<PathBuf>,
     },
     /// Initialize keystore (generate or load Groth16 proving/verification keys)
     Initialize { keystore_dir: String },
@@ -187,20 +196,20 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        None => run_bridge_daemon(cli.config).await,
-        Some(Commands::GuardianService { rpc_config, guardian_root, guardian_id }) => guardian::service::run(&rpc_config, &guardian_root, guardian_id).await.map_err(Into::into),
-        Some(Commands::GuardianPolicy { rpc_config, guardian_root, intent, exclusive_registration_intake, next_members_json }) => match intent {
+        None => run_bridge_daemon(cli.config, cli.l1_config).await,
+        Some(Commands::GuardianService { rpc_config, guardian_root, guardian_id, l1_config }) => guardian::service::run(&rpc_config, &guardian_root, &l1_config, guardian_id).await.map_err(Into::into),
+        Some(Commands::GuardianPolicy { rpc_config, guardian_root, intent, exclusive_registration_intake, next_members_json, l1_config }) => match intent {
             GuardianPolicyIntent::Register => {
                 if next_members_json.is_some() {
                     anyhow::bail!("guardian-policy register does not accept --next-members-json");
                 }
-                bridge::daemon::run_guardian_register(&rpc_config, &guardian_root, exclusive_registration_intake).await
+                bridge::daemon::run_guardian_register(&rpc_config, &guardian_root, &l1_config, exclusive_registration_intake).await
             }
             GuardianPolicyIntent::Bootstrap => {
                 if !exclusive_registration_intake || next_members_json.is_some() {
-                    anyhow::bail!("guardian-policy bootstrap requires exclusive intake and derives members from authorization");
+                    anyhow::bail!("guardian-policy bootstrap requires exclusive intake and derives members from the configured initial account");
                 }
-                bridge::daemon::run_guardian_bootstrap(&rpc_config, &guardian_root).await
+                bridge::daemon::run_guardian_bootstrap(&rpc_config, &guardian_root, &l1_config).await
             }
             GuardianPolicyIntent::Replace => {
                 if exclusive_registration_intake {
@@ -208,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let members_json = next_members_json.ok_or_else(|| anyhow::anyhow!("guardian-policy replace requires --next-members-json"))?;
                 let members = guardian_common::protocol::parse_canonical_json::<[guardian_common::protocol::Hash4; 3]>(members_json.as_bytes())?;
-                bridge::daemon::run_guardian_replace_policy(&rpc_config, &guardian_root, members).await
+                bridge::daemon::run_guardian_replace_policy(&rpc_config, &guardian_root, &l1_config, members).await
             }
         },
         Some(Commands::Initialize { keystore_dir }) => {
@@ -261,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_bridge_daemon(config: PathBuf) -> anyhow::Result<()> {
+async fn run_bridge_daemon(config: PathBuf, l1_config: Vec<PathBuf>) -> anyhow::Result<()> {
     if !config.exists() {
         anyhow::bail!(
             "bridge-daemon config not found: {}",
@@ -273,7 +282,7 @@ async fn run_bridge_daemon(config: PathBuf) -> anyhow::Result<()> {
         config = %config.display(),
         "starting bridge-daemon in-process"
     );
-    bridge::daemon::run(bridge::daemon::RunDaemonArgs { config }).await
+    bridge::daemon::run(bridge::daemon::RunDaemonArgs { config, l1_config }).await
 }
 
 async fn run_indexer(cfg: Cfg) -> anyhow::Result<()> {

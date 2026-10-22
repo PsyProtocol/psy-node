@@ -48,9 +48,9 @@ pub enum Commands {
     ChainInfo(ChainInfoArgs),
     #[command(name = "rollback", about = "Generate or execute an offline role-local rollback plan")]
     Rollback(RollbackArgs),
-    #[command(name = "generate-genesis-data", about = "Write local-devnet genesis.json, private_keys.json, and faucetOperators.json, or write guardian authorization and runtime directories from the existing genesis with --guardians-root")]
+    #[command(name = "generate-genesis-data", about = "Write local-devnet genesis.json, private_keys.json, and faucetOperators.json from the read-only canonical network policy")]
     GenerateGenesisData(GenerateGenesisDataArgs),
-    #[command(name = "fresh-devnet-state", about = "Reset owned devnet state and publish guardian authorization to the selected network configuration")]
+    #[command(name = "fresh-devnet-state", about = "Reset owned devnet state under exclusive database locks; the canonical configuration is read-only")]
     FreshDevnetState(FreshDevnetStateArgs),
 }
 

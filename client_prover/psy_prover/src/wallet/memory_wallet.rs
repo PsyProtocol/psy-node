@@ -83,6 +83,31 @@ pub const SECP256K1_FINGERPRINT_U64: [u64; 4] = [14403954685883114299, 154031326
 pub const ETH_PERSONAL_SECP256K1_FINGERPRINT_U64: [u64; 4] =
     [9963234757308381150, 7229650793434273151, 17904933874181536995, 15676210893640687609];
 
+/// Measured `MultisigSignatureCircuit` fingerprint for the stage magic
+/// `0x1337CF514544CF69` (localhost and testnet). The circuit bakes
+/// `PSY_NETWORK_MAGIC` into its sighash constraints, so the mainnet magic
+/// `0x1337CF514544C069` is a different circuit and is not recorded here.
+/// 084655fe935380d64be6ca7257f1a042038d52201007d309439c7b4a2b4a25ea
+pub const STAGE_CF69_MULTISIG_FINGERPRINT_U64: [u64; 4] =
+    [4871904455392110058, 255951051491365641, 5469281389938581570, 596258552554946774];
+
+/// Multisig signature-circuit fingerprint for the magic this binary was built
+/// with. Unlike the ZK and secp getters this is fallible: only the measured
+/// stage magic has a constant, and there is no config value to fall back to.
+pub fn get_multisig_fingerprint<F: RichField>() -> anyhow::Result<QHashOut<F>> {
+    const STAGE_MAGIC: u64 = 0x1337CF514544CF69;
+    if psy_config::PSY_NETWORK_MAGIC != STAGE_MAGIC {
+        bail!(
+            "multisig fingerprint for network magic {:#018X} is not measured; only stage magic {:#018X} is supported",
+            psy_config::PSY_NETWORK_MAGIC,
+            STAGE_MAGIC
+        );
+    }
+    Ok(QHashOut(HashOut {
+        elements: STAGE_CF69_MULTISIG_FINGERPRINT_U64.map(F::from_canonical_u64),
+    }))
+}
+
 pub fn get_zk_fingerprint<F: RichField>() -> QHashOut<F> {
     QHashOut(HashOut {
         elements: [
@@ -1330,6 +1355,22 @@ mod tests {
         assert_eq!(zk.0.elements, ZK_FINGERPRINT_U64.map(F::from_canonical_u64));
         assert_eq!(secp.0.elements, SECP256K1_FINGERPRINT_U64.map(F::from_canonical_u64));
         assert_eq!(personal.0.elements, ETH_PERSONAL_SECP256K1_FINGERPRINT_U64.map(F::from_canonical_u64));
+    }
+
+    #[test]
+    fn multisig_fingerprint_matches_signature_circuit_or_rejects_unmeasured_magic() {
+        const STAGE_MAGIC: u64 = 0x1337CF514544CF69;
+        let measured = get_multisig_fingerprint::<F>();
+        if psy_config::PSY_NETWORK_MAGIC == STAGE_MAGIC {
+            let circuit = MultisigSignatureCircuit::new().expect("multisig circuit");
+            let fingerprint = measured.expect("measured stage");
+            assert_eq!(fingerprint.0.elements, circuit.get_fingerprint().0.elements);
+            assert_ne!(fingerprint, get_zk_fingerprint::<F>());
+            assert_ne!(fingerprint, get_secp256k1_fingerprint::<F>());
+        } else {
+            let error = measured.expect_err("unmeasured magic").to_string();
+            assert!(error.contains("not measured"), "{error}");
+        }
     }
 
     #[test]
