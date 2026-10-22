@@ -111,17 +111,18 @@ describe("portable CPU partitioning", () => {
         return rows.join("\n");
     };
 
-    it("reserves two complete cores on a 16-core SMT host", () => {
+    it("reserves four complete cores on a 16-core SMT host and leaves the rest to runtime", () => {
         const partition = resolveCpuPartition(parseLscpuTopology(topology(16, 2)));
         expect(partition).toEqual({
-            scyllaCpuSet: "0-1,16-17",
-            runtimeCpuSet: "2-15,18-31",
-            scyllaLogicalCpuCount: 2,
-            runtimePhysicalCoreCount: 14,
+            scyllaCpuSet: "0-3,16-19",
+            runtimeCpuSet: "4-15,20-31",
+            scyllaLogicalCpuCount: 4,
+            runtimePhysicalCoreCount: 12,
         });
+        expect(resolveCpuPartition(parseLscpuTopology(topology(16, 1)))?.scyllaLogicalCpuCount).toBe(4);
     });
 
-    it("adapts to 8-core hosts with and without SMT", () => {
+    it("keeps two complete cores on 8-core hosts with and without SMT", () => {
         expect(resolveCpuPartition(parseLscpuTopology(topology(8, 2)))?.scyllaLogicalCpuCount).toBe(2);
         expect(resolveCpuPartition(parseLscpuTopology(topology(8, 1)))?.scyllaLogicalCpuCount).toBe(2);
     });
@@ -143,14 +144,14 @@ describe("portable CPU partitioning", () => {
 
     it("treats an outer launcher affinity as the existing runtime partition", () => {
         const groups = parseLscpuTopology(topology(16, 2));
-        const allowed = parseCpuSet("2-15,18-31");
+        const allowed = parseCpuSet("4-15,20-31");
         expect(resolveCpuPartitionForAffinity(groups, allowed)).toEqual({
-            scyllaCpuSet: "0-1,16-17",
-            runtimeCpuSet: "2-15,18-31",
-            scyllaLogicalCpuCount: 2,
-            runtimePhysicalCoreCount: 14,
+            scyllaCpuSet: "0-3,16-19",
+            runtimeCpuSet: "4-15,20-31",
+            scyllaLogicalCpuCount: 4,
+            runtimePhysicalCoreCount: 12,
         });
-        expect(resolveCpuPartitionForAffinity(groups, allowed, "0-1,16-17", "2-15,18-31")).not.toBeNull();
+        expect(resolveCpuPartitionForAffinity(groups, allowed, "0-3,16-19", "4-15,20-31")).not.toBeNull();
     });
 
     it("rejects partial-core or conflicting launcher affinity overrides", () => {

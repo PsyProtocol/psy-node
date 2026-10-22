@@ -351,7 +351,7 @@ export function resolveCpuPartition(
         }
     }
 
-    const defaultScyllaCoreCount = physicalCoreGroups.length >= 8 ? 2 : 1;
+    const defaultScyllaCoreCount = physicalCoreGroups.length >= 16 ? 4 : physicalCoreGroups.length >= 8 ? 2 : 1;
     const resolvedScylla = scyllaCpus ?? new Set(
         runtimeCpus
             ? [...allCpus].filter((cpu) => !runtimeCpus.has(cpu))
