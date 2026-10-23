@@ -7509,7 +7509,9 @@ name = "psy_bridge_reader_cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "parking_lot",
  "psy_bridge_reader_api",
  "psy_bridge_reader_core",
  "tokio",

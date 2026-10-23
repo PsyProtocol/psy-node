@@ -7,8 +7,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use psy_bridge_reader_core::admission::{Budgets, LaneBudget};
+use psy_bridge_reader_core::follow::FollowConfig;
+use psy_bridge_reader_core::source::PgConfig;
 
 const MAX_TOKEN_BYTES: u64 = 4096;
+const APPLICATION_NAME: &str = "psy-bridge-reader";
 
 #[derive(Clone, Parser)]
 #[command(name = "psy-bridge-reader")]
@@ -29,7 +32,7 @@ pub struct Config {
     #[arg(long, env = "PSY_BRIDGE_READER_MEMORY_BUDGET_BYTES", default_value_t = 10_737_418_240)]
     pub memory_budget_bytes: u64,
     #[arg(long, env = "PSY_BRIDGE_READER_STATEMENT_TIMEOUT_MS", default_value_t = 5000)]
-    pub statement_timeout_ms: u64,
+    pub statement_timeout_ms: u32,
     #[arg(long, env = "PSY_BRIDGE_READER_BRIDGE_PROGRESS_CONCURRENCY")]
     pub bridge_progress_concurrency: Option<usize>,
     #[arg(long, env = "PSY_BRIDGE_READER_BRIDGE_PROGRESS_MAX_QUEUE")]
@@ -79,31 +82,58 @@ fn redact_database_url(url: &str) -> String {
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No `..`: a new field does not compile until it is listed here.
+        let Config {
+            listen,
+            token_file,
+            database_url,
+            db_schema,
+            tick_ms,
+            max_rows_per_tick,
+            memory_budget_bytes,
+            statement_timeout_ms,
+            bridge_progress_concurrency,
+            bridge_progress_max_queue,
+            bridge_progress_queue_wait_ms,
+            bridge_progress_deadline_ms,
+            claim_proof_concurrency,
+            claim_proof_max_queue,
+            claim_proof_queue_wait_ms,
+            claim_proof_deadline_ms,
+            interactive_concurrency,
+            interactive_max_queue,
+            interactive_queue_wait_ms,
+            interactive_deadline_ms,
+            background_concurrency,
+            background_max_queue,
+            background_queue_wait_ms,
+            background_deadline_ms,
+        } = self;
         f.debug_struct("Config")
-            .field("listen", &self.listen)
-            .field("token_file", &self.token_file)
-            .field("db_schema", &self.db_schema)
-            .field("tick_ms", &self.tick_ms)
-            .field("max_rows_per_tick", &self.max_rows_per_tick)
-            .field("memory_budget_bytes", &self.memory_budget_bytes)
-            .field("statement_timeout_ms", &self.statement_timeout_ms)
-            .field("bridge_progress_concurrency", &self.bridge_progress_concurrency)
-            .field("bridge_progress_max_queue", &self.bridge_progress_max_queue)
-            .field("bridge_progress_queue_wait_ms", &self.bridge_progress_queue_wait_ms)
-            .field("bridge_progress_deadline_ms", &self.bridge_progress_deadline_ms)
-            .field("claim_proof_concurrency", &self.claim_proof_concurrency)
-            .field("claim_proof_max_queue", &self.claim_proof_max_queue)
-            .field("claim_proof_queue_wait_ms", &self.claim_proof_queue_wait_ms)
-            .field("claim_proof_deadline_ms", &self.claim_proof_deadline_ms)
-            .field("interactive_concurrency", &self.interactive_concurrency)
-            .field("interactive_max_queue", &self.interactive_max_queue)
-            .field("interactive_queue_wait_ms", &self.interactive_queue_wait_ms)
-            .field("interactive_deadline_ms", &self.interactive_deadline_ms)
-            .field("background_concurrency", &self.background_concurrency)
-            .field("background_max_queue", &self.background_max_queue)
-            .field("background_queue_wait_ms", &self.background_queue_wait_ms)
-            .field("background_deadline_ms", &self.background_deadline_ms)
-            .field("database_url", &redact_database_url(&self.database_url))
+            .field("listen", listen)
+            .field("token_file", token_file)
+            .field("db_schema", db_schema)
+            .field("tick_ms", tick_ms)
+            .field("max_rows_per_tick", max_rows_per_tick)
+            .field("memory_budget_bytes", memory_budget_bytes)
+            .field("statement_timeout_ms", statement_timeout_ms)
+            .field("bridge_progress_concurrency", bridge_progress_concurrency)
+            .field("bridge_progress_max_queue", bridge_progress_max_queue)
+            .field("bridge_progress_queue_wait_ms", bridge_progress_queue_wait_ms)
+            .field("bridge_progress_deadline_ms", bridge_progress_deadline_ms)
+            .field("claim_proof_concurrency", claim_proof_concurrency)
+            .field("claim_proof_max_queue", claim_proof_max_queue)
+            .field("claim_proof_queue_wait_ms", claim_proof_queue_wait_ms)
+            .field("claim_proof_deadline_ms", claim_proof_deadline_ms)
+            .field("interactive_concurrency", interactive_concurrency)
+            .field("interactive_max_queue", interactive_max_queue)
+            .field("interactive_queue_wait_ms", interactive_queue_wait_ms)
+            .field("interactive_deadline_ms", interactive_deadline_ms)
+            .field("background_concurrency", background_concurrency)
+            .field("background_max_queue", background_max_queue)
+            .field("background_queue_wait_ms", background_queue_wait_ms)
+            .field("background_deadline_ms", background_deadline_ms)
+            .field("database_url", &redact_database_url(database_url))
             .finish()
     }
 }
@@ -188,8 +218,28 @@ impl Config {
                 self.max_rows_per_tick
             ));
         }
+        if self.statement_timeout_ms == 0 {
+            return Err("statement_timeout_ms must be > 0: 0 disables the server-side statement timeout".to_string());
+        }
         self.budgets()?;
+        self.follow_config()?.validate().map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// The follow loop's tick and page size; the timeouts keep their defaults.
+    pub fn follow_config(&self) -> Result<FollowConfig, String> {
+        let max_rows = usize::try_from(self.max_rows_per_tick)
+            .map_err(|_| format!("max_rows_per_tick {} does not fit usize", self.max_rows_per_tick))?;
+        Ok(FollowConfig { tick: Duration::from_millis(self.tick_ms), max_rows, ..FollowConfig::default() })
+    }
+
+    pub fn pg_config(&self) -> PgConfig {
+        PgConfig {
+            url: self.database_url.clone(),
+            schema: self.db_schema.clone(),
+            statement_timeout_ms: self.statement_timeout_ms,
+            application_name: APPLICATION_NAME.to_string(),
+        }
     }
 
     /// Reads the bearer token: non-empty, at most 4 KiB, mode 0600 or stricter.
@@ -264,6 +314,18 @@ mod tests {
         assert!(c.validate().is_err());
         let ok = parse(&["--claim-proof-concurrency", "2"]);
         assert_eq!(ok.budgets().unwrap().claim_proof.concurrency, 2);
+    }
+
+    #[test]
+    fn zero_statement_timeout_is_refused() {
+        assert!(parse(&["--statement-timeout-ms", "0"]).validate().is_err());
+        let c = parse(&["--statement-timeout-ms", "1", "--tick-ms", "250", "--max-rows-per-tick", "7"]);
+        assert!(c.validate().is_ok());
+        assert_eq!(c.pg_config().statement_timeout_ms, 1);
+        assert_eq!(c.pg_config().application_name, "psy-bridge-reader");
+        let follow = c.follow_config().unwrap();
+        assert_eq!((follow.tick, follow.max_rows), (Duration::from_millis(250), 7));
+        assert_eq!(follow.read_timeout, FollowConfig::default().read_timeout);
     }
 
     #[test]
