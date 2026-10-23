@@ -21,5 +21,6 @@ GRANT SELECT ON
     :"envio_schema"."WithdrawalClaim",
     :"envio_schema"."FinalizedBatch",
     :"envio_schema"."envio_chains",
-    :"envio_schema"."AccountDepositStats"
+    :"envio_schema"."AccountDepositStats",
+    :"envio_schema"."DepositTreeNode"
 TO :"reader_role";

@@ -24,8 +24,9 @@ pub const READER_TABLES: &[&str] = &[
 ];
 
 /// Tables read only by the psy-services direct-PostgreSQL fallback (design
-/// C13); the Reader never reads them (plan P11).
-pub const LEGACY_TABLES: &[&str] = &["AccountDepositStats"];
+/// C13); the Reader never reads them (plan P11). `DepositTreeNode` is read
+/// only by the fallback's tree walks (`tree_nodes`).
+pub const LEGACY_TABLES: &[&str] = &["AccountDepositStats", "DepositTreeNode"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryClass {
@@ -250,6 +251,20 @@ mod tests {
     }
 
     #[test]
+    fn the_fallback_shapes_are_registered_with_their_params() {
+        assert_eq!(query("tree_nodes").params, vec!["text[]"]);
+        assert_eq!(query("tree_nodes").index, vec!["DepositTreeNode_pkey"]);
+        assert_eq!(query("chain_indexes_on_chain").params, vec!["int4"]);
+        assert_eq!(query("deposit_list_page").params, vec!["text", "int4", "int4", "int8"]);
+        assert_eq!(query("deposit_list_next_page").params.len(), 5);
+        assert_eq!(query("deposit_list_offset_page").params.len(), 5);
+        assert_eq!(query("explorer_latest_deposits").params, vec!["int4", "int8"]);
+        assert!(required_indexes()
+            .iter()
+            .any(|i| i.table == "DepositTreeNode" && i.name == "DepositTreeNode_pkey"));
+    }
+
+    #[test]
     fn required_indexes_name_their_table() {
         let all = required_indexes();
         assert!(all.iter().any(|i| i.table == "WithdrawalClaim"
@@ -291,6 +306,8 @@ mod tests {
         for t in READER_TABLES.iter().chain(LEGACY_TABLES) {
             assert!(FALLBACK_ROLE_SQL.contains(&format!("\"{t}\"")), "{t}");
         }
+        assert!(LEGACY_TABLES.contains(&"DepositTreeNode"));
+        assert!(!READER_ROLE_SQL.contains("DepositTreeNode"));
         assert!(FALLBACK_ROLE_SQL.contains("GRANT SELECT ON"));
         for word in ["INSERT", "UPDATE", "DELETE", "TRUNCATE"] {
             assert!(!FALLBACK_ROLE_SQL.contains(word), "{word}");

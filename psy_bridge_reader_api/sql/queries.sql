@@ -15,50 +15,50 @@
 
 -- name: deposit_list_page
 -- class: interactive
--- params: text, int4, int4
+-- params: text, int4, int4, int8
 -- index: Deposit_shield_address_chain_index_chain_local_deposit_index
 -- max_buffers: 200
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
-       l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, block_timestamp, tx_hash
+       l2_token_contract_id, amount::text AS amount, note_commitment, chain_index, leaf_hash,
+       block_number, block_timestamp::text AS block_timestamp, tx_hash
 FROM "Deposit"
 WHERE shield_address = $1 AND chain_index = $2 AND chain_id = $3
 ORDER BY chain_local_deposit_index
-LIMIT 100;
+LIMIT $4;
 
 -- Measured 205 buffers at 100,000 rows (custom plan) and 106 at 1,000,000, so the
 -- old bound of 200 failed the 100,000-row run on an unchanged tree; 400 still
 -- catches a scan.
 -- name: deposit_list_next_page
 -- class: interactive
--- params: text, int4, int4, int4
+-- params: text, int4, int4, int4, int8
 -- index: Deposit_shield_address_chain_index_chain_local_deposit_index
 -- max_buffers: 400
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
-       l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, block_timestamp, tx_hash
+       l2_token_contract_id, amount::text AS amount, note_commitment, chain_index, leaf_hash,
+       block_number, block_timestamp::text AS block_timestamp, tx_hash
 FROM "Deposit"
 WHERE shield_address = $1 AND chain_index = $2 AND chain_id = $3
   AND chain_local_deposit_index > $4
 ORDER BY chain_local_deposit_index
-LIMIT 100;
+LIMIT $5;
 
 -- Today's wallet API pages with limit/offset; an offset costs O(offset).
 -- name: deposit_list_offset_page
 -- class: interactive
--- params: text, int4, int4, int8
+-- params: text, int4, int4, int8, int8
 -- index: Deposit_shield_address_chain_index_chain_local_deposit_index
 -- max_buffers: 0
 -- gate: report
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
-       l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, block_timestamp, tx_hash
+       l2_token_contract_id, amount::text AS amount, note_commitment, chain_index, leaf_hash,
+       block_number, block_timestamp::text AS block_timestamp, tx_hash
 FROM "Deposit"
 WHERE shield_address = $1 AND chain_index = $2 AND chain_id = $3
 ORDER BY chain_local_deposit_index
-LIMIT 100 OFFSET $4;
+LIMIT $5 OFFSET $4;
 
 -- name: account_deposit_stats
 -- class: interactive
@@ -77,8 +77,8 @@ WHERE id = $1;
 -- max_buffers: 10
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
-       l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, block_timestamp
+       l2_token_contract_id, amount::text AS amount, note_commitment, chain_index, leaf_hash,
+       block_number, block_timestamp::text AS block_timestamp
 FROM "Deposit"
 WHERE chain_index = $1 AND chain_id = $2 AND deposit_index = $3;
 
@@ -120,8 +120,8 @@ SELECT EXISTS (
 -- max_buffers: 20
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
-       l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
-       block_number, block_timestamp, tx_hash
+       l2_token_contract_id, amount::text AS amount, note_commitment, chain_index, leaf_hash,
+       block_number, block_timestamp::text AS block_timestamp, tx_hash
 FROM "Deposit"
 WHERE tx_hash = $1 AND chain_index = $2
 ORDER BY deposit_index DESC
@@ -177,15 +177,16 @@ WHERE chain_index = $1;
 -- chain_index, deposit_index follows block order).
 -- name: explorer_latest_deposits
 -- class: background
--- params: int4
+-- params: int4, int8
 -- index: Deposit_chain_index_deposit_index
 -- max_buffers: 200
 -- gate: yes
-SELECT chain_id, deposit_index, shield_address, token, amount, block_number, tx_hash
+SELECT chain_id, deposit_index, token, l2_token_contract_id, amount::text AS amount,
+       block_number, tx_hash
 FROM "Deposit"
 WHERE chain_index = $1
 ORDER BY deposit_index DESC
-LIMIT 100;
+LIMIT $2;
 
 -- Today's explorer feed (explorer_bridge.rs). No index orders it; reported to
 -- show the cost phase 2 must remove.
@@ -262,6 +263,33 @@ ORDER BY block_number, id
 LIMIT $4;
 
 -- One row per chain, like the watermark but for every chain at once.
+-- Chain indexes whose first leaf is on a chain_id (the fallback's index lookup).
+-- name: chain_indexes_on_chain
+-- class: interactive
+-- params: int4
+-- index: DepositLeaf_pkey
+-- max_buffers: 20
+-- gate: yes
+SELECT m.chain_index
+FROM "DepositTreeMeta" m
+JOIN "DepositLeaf" l ON l.id = m.chain_index || '-0'
+WHERE l.chain_id = $1
+ORDER BY m.chain_index;
+
+-- Tree nodes by id for a root or a proof (the fallback's tree walks); one
+-- primary-key lookup per id.
+-- Measured 154 buffers at 100,000 rows and 153 at 1,000,000 (48 existing ids
+-- plus 2 missing); max_buffers is twice that.
+-- name: tree_nodes
+-- class: bridge
+-- params: text[]
+-- index: DepositTreeNode_pkey
+-- max_buffers: 308
+-- gate: yes
+SELECT id, hash
+FROM "DepositTreeNode"
+WHERE id = ANY ($1);
+
 -- name: tree_meta_all
 -- class: background
 -- params:

@@ -55,7 +55,7 @@ TOKENS = [
 ]
 HASH_MULTIPLIER = 2654435761
 LOADED = ["Deposit", "DepositLeaf", "AccountDepositStats", "WithdrawalClaim", "DepositTreeMeta",
-          "FinalizedBatch"]
+          "FinalizedBatch", "DepositTreeNode"]
 SEQ_SCAN_ALLOWED = {"DepositTreeMeta"}
 AT_LEAST_ONE = -1   # expected row count: any non-empty result
 REPEATS = 5
@@ -138,6 +138,17 @@ LEAF_COLUMNS = {
     "poseidon_leaf_hash": h64("pleaf", "g"),
     "block_number": "1000000 + loc / 2",
 }
+# Tree nodes: every leaf's level-0 node and, for even leaves, a level-1 node.
+NODE_COLUMNS = {
+    "id": "ci || ':0:' || loc",
+    "chain_index": "ci",
+    "level": "0",
+    "node_index": "loc",
+    "hash": h64("node", "g"),
+    "block_number": "1000000 + loc / 2",
+    "tx_hash": h64("ntx", "g"),
+}
+NODE1_COLUMNS = dict(NODE_COLUMNS, id="ci || ':1:' || (loc / 2)", level="1", node_index="loc / 2")
 CLAIM_COLUMNS = {
     "id": "cid || '-' || nullifier",
     "chain_id": "cid",
@@ -324,6 +335,8 @@ def load(pg, rows, jobs, index_jobs):
     chunk = 1_000_000
     deposit = insert_sql(pg, "Deposit", DEPOSIT_COLUMNS, ROW_SQL)
     leaf = insert_sql(pg, "DepositLeaf", LEAF_COLUMNS, ROW_SQL)
+    node = insert_sql(pg, "DepositTreeNode", NODE_COLUMNS, ROW_SQL)
+    node1 = insert_sql(pg, "DepositTreeNode", NODE1_COLUMNS, ROW_SQL + " WHERE loc % 2 = 0")
     claim = insert_sql(pg, "WithdrawalClaim", CLAIM_COLUMNS, CLAIM_ROW_SQL)
     batch = insert_sql(pg, "FinalizedBatch", BATCH_COLUMNS, BATCH_ROW_SQL)
 
@@ -335,7 +348,7 @@ def load(pg, rows, jobs, index_jobs):
             out.append(lambda sql=sql: pg.run(sql))
         return out
 
-    parallel(jobs, chunks(rows, deposit) + chunks(rows, leaf) + chunks(claims, claim)
+    parallel(jobs, chunks(rows, deposit) + chunks(rows, leaf) + chunks(rows, node) + chunks(rows, node1) + chunks(claims, claim)
              + chunks(batches, batch),
              f"insert {rows:,} deposits, {rows:,} leaves, {claims:,} claims, {batches:,} batches")
 
@@ -418,16 +431,19 @@ def cases(rows, claims, accounts):
     claim_cursor = [CHAIN_ID[0], 2000000 + claim_g // 3, f"{CHAIN_ID[0]}-{hex64('null', claim_g)}", follow_limit]
     batch_g = next(g for g in range(batch_count(rows) // 3, batch_count(rows)) if g % 10 < 7)
     batch_cursor = [CHAIN_ID[0], 3000000 + batch_g // 3, f"{CHAIN_ID[0]}-{batch_g}", follow_limit]
+    # Existing level-0 and level-1 ids of chain 0 plus two that do not exist.
+    tree_ids = ([f"0:0:{n}" for n in range(count0 // 2, count0 // 2 + 32)]
+                + [f"0:1:{n}" for n in range(count0 // 4, count0 // 4 + 16)] + ["0:9:0", "0:9:1"])
     out = {
         "deposit_list_page": [
-            ("light", [light, 0, CHAIN_ID[0]], (AT_LEAST_ONE, "11155111")),
-            ("whale", [whale, 0, CHAIN_ID[0]], (min(100, whale_count), "11155111")),
+            ("light", [light, 0, CHAIN_ID[0], 100], (AT_LEAST_ONE, "11155111")),
+            ("whale", [whale, 0, CHAIN_ID[0], 100], (min(100, whale_count), "11155111")),
         ],
         "deposit_list_next_page": [
-            ("whale_mid", [whale, 0, CHAIN_ID[0], 175 * (whale_count // 2)], (min(100, whale_count // 2 - 1), None)),
+            ("whale_mid", [whale, 0, CHAIN_ID[0], 175 * (whale_count // 2), 100], (min(100, whale_count // 2 - 1), None)),
         ],
         "deposit_list_offset_page": [
-            ("whale_offset", [whale, 0, CHAIN_ID[0], max(0, min(5000, whale_count - 100))], (100, None)),
+            ("whale_offset", [whale, 0, CHAIN_ID[0], max(0, min(5000, whale_count - 100)), 100], (100, None)),
         ],
         "account_deposit_stats": [
             ("light", [f"0-{light}"], (1, None)),
@@ -447,12 +463,14 @@ def cases(rows, claims, accounts):
         "leaf_stream_page": [("from_third", [0, count0 // 3], (10000, str(count0 // 3)))],
         "withdrawal_claims_by_nullifier": [("page_100", [CHAIN_ID[0], nullifiers + missing], (len(nullifiers), None))],
         "watermark": [("chain0", [0], (1, str(count0)))],
-        "explorer_latest_deposits": [("chain0", [0], (100, "11155111"))],
+        "explorer_latest_deposits": [("chain0", [0, 100], (100, "11155111"))],
         "explorer_feed_current": [("chain0", [CHAIN_ID[0]], (100, "11155111"))],
         "follow_deposits": [("from_third", [0, count0 // 3, follow_limit], (follow_limit, None))],
         "follow_leaves": [("from_third", [0, count0 // 3, follow_limit], (follow_limit, str(count0 // 3)))],
         "follow_claims": [("from_third", claim_cursor, (follow_limit, None))],
         "follow_batches": [("from_third", batch_cursor, (AT_LEAST_ONE, None))],
+        "chain_indexes_on_chain": [("sepolia", [CHAIN_ID[0]], (1, "0")), ("bsc", [CHAIN_ID[1]], (1, "1"))],
+        "tree_nodes": [("proof_path", [tree_ids], (len(tree_ids) - 2, None))],
         "tree_meta_all": [("all_chains", [], (len(CHAINS), "0"))],
         "chain_progress": [("all_chains", [], None)],
         "envio_identity": [("one_row", [], (1, None))],
