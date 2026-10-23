@@ -59,7 +59,7 @@ class Reader {
     const logFd = fs.openSync(this.logFile, 'a');
     const url = `postgres://${encodeURIComponent(pg.user)}:${encodeURIComponent(pg.password)}@${pg.host}:${pg.port}/${database}`;
     this.child = spawn(bin, [], {
-      stdio: ['ignore', 'ignore', logFd],
+      stdio: ['ignore', logFd, logFd], // tracing writes to stdout, a start-up error to stderr
       env: {
         ...process.env,
         PSY_BRIDGE_READER_LISTEN: `127.0.0.1:${port}`,

@@ -40,7 +40,7 @@ A path that is missing or not executable fails at once with
 The Reader runs as a child process against the test's database with
 `PSY_BRIDGE_READER_LISTEN=127.0.0.1:<free port>`, a token file (mode 0600) in a
 temp directory, `PSY_BRIDGE_READER_DATABASE_URL`, `PSY_BRIDGE_READER_DB_SCHEMA=public`
-and `PSY_BRIDGE_READER_TICK_MS=200`. Its stderr goes to
+and `PSY_BRIDGE_READER_TICK_MS=200`. Its stdout (the tracing log) and stderr go to
 `reorg-reader-*/reader-<database>.log` in the OS temp directory; failures print
 the log tail. The test kills exactly that child at the end (and when it moves to
 the next database).
