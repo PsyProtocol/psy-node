@@ -962,7 +962,10 @@ async fn run_multichain(
             };
             round_withdrawals = plan.withdrawals.clone();
             let submitted_l2_work = !plan.calls.is_empty();
-            let landed = match submit_multichain_l2_plan(&config, &provider, &plan, lag).await {
+            let landed = match persist_and_dispatch_multichain_l2(
+                &state_path, &mut state, &plan.withdrawals,
+                || submit_multichain_l2_plan(&config, &provider, &plan, lag),
+            ).await {
                 Ok(value) => value,
                 Err(error) => { tracing::error!(%error, "multichain L2 multicall failed"); tokio::time::sleep(poll_interval).await; continue; }
             };
@@ -1965,16 +1968,38 @@ where
     Ok(true)
 }
 
+/// Retain claim debt before any broadcast, including append-only rounds and
+/// submissions whose response is lost. Keep the same in-memory ledger so later
+/// range saves cannot overwrite these entries. Existing retired debt stays retired.
+async fn persist_and_dispatch_multichain_l2<T, Dispatch, DispatchFuture>(
+    path: &Path,
+    state: &mut MultichainDaemonState,
+    withdrawals: &[propose_withdrawals::PendingWithdrawal],
+    dispatch: Dispatch,
+) -> anyhow::Result<T>
+where
+    Dispatch: FnOnce() -> DispatchFuture,
+    DispatchFuture: Future<Output = anyhow::Result<T>>,
+{
+    if !withdrawals.is_empty() {
+        insert_pending_claims(withdrawals, &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+        // Always save: an earlier failed write may have updated memory only.
+        save_multichain_state(path, state).context("failed to retain multichain claims before L2 dispatch")?;
+    }
+    dispatch().await
+}
+
 fn save_multichain_state(path: &Path, state: &MultichainDaemonState) -> anyhow::Result<()> {
-    let raw = toml::to_string(state)?;
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&tmp, raw)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    let raw = toml::to_string(state).context("failed to serialize multichain daemon state")?;
+    install_daemon_state(path, &raw)
 }
 
 fn save_state(path: &Path, state: &DaemonState) -> anyhow::Result<()> {
     let raw = toml::to_string(state).context("failed to serialize daemon state")?;
+    install_daemon_state(path, &raw)
+}
+
+fn install_daemon_state(path: &Path, raw: &str) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -6591,6 +6616,99 @@ rpc_urls = ["http://127.0.0.1:4"]
         assert_eq!(pending.len(), 1);
         assert!(retry.is_empty());
         assert!(retired.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multichain_claim_intent_survives_append_only_and_unknown_submission() {
+        for unknown_response in [false, true] {
+            let path = temp_state_path(if unknown_response { "multi-unknown" } else { "multi-append-only" });
+            let withdrawal = withdrawal_for_chain("new-bsc", 1);
+            let mut state = MultichainDaemonState {
+                identity_namespace: "intent-gate".into(), last_finalized_checkpoint: 42,
+                ..Default::default()
+            };
+            let result = persist_and_dispatch_multichain_l2(
+                &path, &mut state, std::slice::from_ref(&withdrawal), || {
+                    let saved = load_multichain_state(&path, "intent-gate").unwrap();
+                    assert!(saved.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
+                    assert!(saved.pending_finalization_range.is_none());
+                    std::future::ready(if unknown_response {
+                        Err(anyhow::anyhow!("broadcast accepted but response lost"))
+                    } else { Ok(50_u64) })
+                },
+            ).await;
+            assert_eq!(result.is_err(), unknown_response);
+            // Both the append-only continue and an unknown response must be
+            // recoverable using disk alone, with no confirmed range yet.
+            drop(state);
+            let restarted = load_multichain_state(&path, "intent-gate").unwrap();
+            assert_eq!(restarted.last_finalized_checkpoint, 42);
+            assert_eq!(restarted.pending_claim_withdrawals[&withdrawal.leaf_hash].event_id, withdrawal.event_id);
+            assert!(restarted.claim_retry.is_empty());
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn multichain_claim_intent_save_failure_blocks_dispatch_and_retry_saves_again() {
+        let path = temp_state_path("multi-intent-save-failure");
+        fs::create_dir(&path).unwrap();
+        let withdrawal = withdrawal_for_chain("new-bsc", 1);
+        let mut state = MultichainDaemonState { identity_namespace: "intent-retry".into(), ..Default::default() };
+        let result = persist_and_dispatch_multichain_l2(
+            &path, &mut state, std::slice::from_ref(&withdrawal), || {
+                panic!("cannot broadcast without installing the claim intent");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(()))
+            },
+        ).await;
+        assert!(result.is_err());
+        assert!(state.pending_claim_withdrawals.contains_key(&withdrawal.leaf_hash));
+        fs::remove_dir(&path).unwrap();
+        // Memory already contains the new entry. The retry must still save it
+        // before dispatch, rather than skipping the failed write as a duplicate.
+        persist_and_dispatch_multichain_l2(
+            &path, &mut state, &[withdrawal], || {
+                assert_eq!(load_multichain_state(&path, "intent-retry").unwrap().pending_claim_withdrawals.len(), 1);
+                std::future::ready(Ok(()))
+            },
+        ).await.unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn multichain_cancelled_dispatch_keeps_claim_intent() {
+        let path = temp_state_path("multi-cancelled-dispatch");
+        let withdrawal = withdrawal_for_chain("cancelled", 2);
+        let mut state = MultichainDaemonState { identity_namespace: "intent-cancel".into(), ..Default::default() };
+        let result = tokio::time::timeout(Duration::from_millis(10), persist_and_dispatch_multichain_l2(
+            &path, &mut state, &[withdrawal], || std::future::pending::<anyhow::Result<()>>(),
+        )).await;
+        assert!(result.is_err());
+        assert_eq!(load_multichain_state(&path, "intent-cancel").unwrap().pending_claim_withdrawals.len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn multichain_claim_intent_preserves_retired_and_later_range_save_keeps_new_debt() {
+        let path = temp_state_path("multi-intent-later-save");
+        let retired = withdrawal_for_chain("retired", 0);
+        let fresh = withdrawal_for_chain("fresh", 1);
+        let mut state = MultichainDaemonState { identity_namespace: "intent-later".into(), last_finalized_checkpoint: 42, ..Default::default() };
+        state.retired_claim_withdrawals.insert(retired.leaf_hash.clone(), claim_attempts::RetiredClaim {
+            withdrawal: retired.clone(), attempts: 3, last_reason: "invalid proof".into(), retired_at_unix: 1,
+        });
+        persist_and_dispatch_multichain_l2(&path, &mut state, &[retired, fresh.clone()], || std::future::ready(Ok(()))).await.unwrap();
+        assert!(!state.pending_claim_withdrawals.contains_key("retired"));
+        let range = PendingFinalizationRange { from_checkpoint: 43, to_checkpoint: 50 };
+        persist_and_sync_multichain_range(&path, &mut state, range, &[], &[], |_, _| std::future::ready(Ok(()))).await.unwrap();
+        let saved = load_multichain_state(&path, "intent-later").unwrap();
+        assert_eq!(saved.pending_finalization_range, Some(range));
+        assert!(saved.pending_claim_withdrawals.contains_key(&fresh.leaf_hash));
+        assert_eq!(saved.retired_claim_withdrawals["retired"].attempts, 3);
+        assert_eq!(saved.retired_claim_withdrawals["retired"].last_reason, "invalid proof");
+        assert!(saved.claim_retry.is_empty());
+        fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
