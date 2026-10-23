@@ -26,6 +26,13 @@ serde = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "net", "time", "macros", "fs"] }
+serde_json = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
+# For `examples/reader_bench.rs` only.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
