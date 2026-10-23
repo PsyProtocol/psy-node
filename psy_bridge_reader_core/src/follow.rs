@@ -1,6 +1,8 @@
 //! The follow loop: start-up, catch-up and steady ticks from the model's cursors, reloads and reconnects.
 
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::mem::Discriminant;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,12 +11,14 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::metrics::Metrics;
-use crate::model::{ApplyOutcome, ChainProgress, Model, ReloadReason, TickData, View};
+use crate::model::{ApplyOutcome, ChainProgress, Cursors, Model, ReloadReason, TickData, View};
 use crate::source::{EnvioSource, SourceError};
 
 const MAX_TICK: Duration = Duration::from_millis(1000);
 const MAX_FOLLOW_ROWS: usize = 50_000;
 const FIRST_BACKOFF: Duration = Duration::from_millis(100);
+const FIRST_CHAIN_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_CHAIN_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FollowConfig {
@@ -90,7 +94,14 @@ pub async fn run_follow<S, F, Fut>(
         tracing::error!(error = %e, "bridge reader follow config refused");
         return;
     }
-    let mut follow = FollowState { model, metrics, started_at: Instant::now(), is_startup_recorded: false, is_schema_missing: false };
+    let mut follow = FollowState {
+        model,
+        metrics,
+        started_at: Instant::now(),
+        is_startup_recorded: false,
+        is_schema_missing: false,
+        backoffs: BTreeMap::new(),
+    };
     let mut source: Option<S> = None;
     let mut backoff = FIRST_BACKOFF;
     loop {
@@ -101,15 +112,18 @@ pub async fn run_follow<S, F, Fut>(
                 Some(Err(e)) => Step::Failed(e),
             },
             Some(src) => {
-                let cursors = follow.model.lock().cursors();
+                let cursors = follow.cursors(Instant::now());
                 let tick_started_at = Instant::now();
                 let read = with_timeout(cfg.read_timeout, "read", src.read_tick(&cursors, cfg.max_rows));
                 match until_shutdown(&mut shutdown, read).await {
                     None => Step::Stop,
-                    Some(Ok(tick)) => {
-                        let is_catching_up = follow.apply(tick, tick_started_at) == ApplyOutcome::CatchingUp;
-                        Step::Ticked { next_read_at: (!is_catching_up).then(|| tick_started_at + cfg.tick) }
-                    }
+                    Some(Ok(tick)) => match follow.apply(tick, tick_started_at).await {
+                        None => Step::Stop,
+                        Some(outcome) => {
+                            let is_catching_up = outcome == ApplyOutcome::CatchingUp;
+                            Step::Ticked { next_read_at: (!is_catching_up).then(|| tick_started_at + cfg.tick) }
+                        }
+                    },
                     Some(Err(e)) => Step::Failed(e),
                 }
             }
@@ -169,21 +183,62 @@ struct FollowState {
     started_at: Instant,
     is_startup_recorded: bool,
     is_schema_missing: bool,
+    /// Keyed by chain_index: the chains reset by a reload and not verified since.
+    backoffs: BTreeMap<u64, ChainBackoff>,
+}
+
+/// A chain index reloaded again for the same reason is left out of the reads
+/// until `until`: at once the first time, then 1 s doubling to 5 min.
+struct ChainBackoff {
+    reason: Discriminant<ReloadReason>,
+    delay: Duration,
+    until: Instant,
 }
 
 impl FollowState {
-    fn apply(&mut self, tick: TickData, tick_started_at: Instant) -> ApplyOutcome {
+    /// The model's cursors, skipping every chain index still backing off.
+    fn cursors(&self, now: Instant) -> Cursors {
+        let mut cursors = self.model.lock().cursors();
+        cursors.skip = self.backoffs.iter().filter(|(_, b)| b.until > now).map(|(&chain_index, _)| chain_index).collect();
+        cursors
+    }
+
+    fn note_reload(&mut self, chain_index: u64, reason: &ReloadReason, now: Instant) {
+        let reason = std::mem::discriminant(reason);
+        let delay = match self.backoffs.get(&chain_index) {
+            Some(b) if b.reason == reason && b.delay.is_zero() => FIRST_CHAIN_BACKOFF,
+            Some(b) if b.reason == reason => (b.delay * 2).min(MAX_CHAIN_BACKOFF),
+            _ => Duration::ZERO,
+        };
+        self.backoffs.insert(chain_index, ChainBackoff { reason, delay, until: now + delay });
+    }
+
+    /// Runs `Model::apply` on the blocking pool, so a large tick never holds
+    /// an async worker. `None` when the runtime is shutting down.
+    async fn apply(&mut self, tick: TickData, tick_started_at: Instant) -> Option<ApplyOutcome> {
         self.is_schema_missing = false;
         let progress = tick.progress.clone();
-        let (outcome, view) = {
-            let mut model = self.model.lock();
+        let (model, metrics) = (self.model.clone(), self.metrics.clone());
+        let applied = tokio::task::spawn_blocking(move || {
+            let mut model = model.lock();
             let outcome = model.apply(tick);
-            if let ApplyOutcome::Reload(reason) = &outcome {
-                self.reset_for(&mut model, reason);
-            }
-            self.metrics.set_resident_bytes(model.resident_bytes_estimate());
-            (outcome, model.view())
+            let reset_chain = match &outcome {
+                ApplyOutcome::Reload(reason) => reset_for(&mut model, &metrics, reason),
+                _ => None,
+            };
+            metrics.set_resident_bytes(model.resident_bytes_estimate());
+            (outcome, model.view(), reset_chain)
+        })
+        .await;
+        let (outcome, view, reset_chain) = match applied {
+            Ok(applied) => applied,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => return None,
         };
+        if let (Some(chain_index), ApplyOutcome::Reload(reason)) = (reset_chain, &outcome) {
+            self.note_reload(chain_index, reason, Instant::now());
+        }
+        self.backoffs.retain(|chain_index, _| view.chains.get(chain_index).is_some_and(|c| c.ready.is_err()));
         match &outcome {
             ApplyOutcome::Published { reorged } => reorged.iter().for_each(|_| self.metrics.inc_reorgs()),
             ApplyOutcome::Reload(reason) => {
@@ -201,7 +256,7 @@ impl FollowState {
             self.is_startup_recorded = true;
             self.metrics.set_startup_seconds(self.started_at.elapsed().as_secs_f64());
         }
-        outcome
+        Some(outcome)
     }
 
     fn handle_source_error(&mut self, e: SourceError, backoff: Duration) {
@@ -211,6 +266,7 @@ impl FollowState {
             let mut model = self.model.lock();
             if is_new_schema_missing {
                 self.is_schema_missing = true;
+                self.backoffs.clear();
                 model.reset_all();
                 self.metrics.clear_chain_gauges();
                 self.metrics.inc_reload("schema_missing");
@@ -220,33 +276,35 @@ impl FollowState {
         self.set_view_metrics(&view, &[]);
     }
 
-    fn reset_for(&self, model: &mut Model, reason: &ReloadReason) {
-        match reason {
-            ReloadReason::InvariantViolated { chain_index, .. } | ReloadReason::TreeMismatch { chain_index } => {
-                model.reset_chain(*chain_index)
-            }
-            // reset_chain keeps the chain_id's committed safe block and claims, so only reset_all lowers them.
-            ReloadReason::IdentityChanged | ReloadReason::ProgressBelowCommitted { .. } => {
-                model.reset_all();
-                self.metrics.clear_chain_gauges();
-            }
-            ReloadReason::WindowOverLimit => {}
-        }
-    }
-
     /// `follow_lag_blocks` is the tick's Envio progress block minus the
     /// progress block the published view serves (-1 when it serves none).
     fn set_view_metrics(&self, view: &View, progress: &[ChainProgress]) {
         let now_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         self.metrics.set_view_age_seconds(now_unix_ms.saturating_sub(view.revision.as_of_unix_ms) as f64 / 1000.0);
-        for (&chain_index, chain) in &view.chains {
-            self.metrics.set_window_rows(chain_index, i64::try_from(chain.window.len()).unwrap_or(i64::MAX));
-        }
+        let window_rows = view.chains.iter().map(|(&chain_index, chain)| (chain_index, i64::try_from(chain.window.len()).unwrap_or(i64::MAX)));
+        self.metrics.set_window_rows(&window_rows.collect::<Vec<_>>());
         for p in progress {
             let served = view.envio_chains.get(&p.chain_id).map_or(-1, |e| i64::try_from(e.progress_block).unwrap_or(i64::MAX));
             self.metrics.set_follow_lag_blocks(p.chain_id, p.progress_block.saturating_sub(served).max(0));
         }
         self.metrics.refresh_process_rss();
+    }
+}
+
+/// Resets what `reason` needs; returns the chain index when only that one was reset.
+fn reset_for(model: &mut Model, metrics: &Metrics, reason: &ReloadReason) -> Option<u64> {
+    match reason {
+        ReloadReason::InvariantViolated { chain_index, .. } | ReloadReason::TreeMismatch { chain_index } => {
+            model.reset_chain(*chain_index);
+            Some(*chain_index)
+        }
+        // reset_chain keeps the chain_id's committed safe block and claims, so only reset_all lowers them.
+        ReloadReason::IdentityChanged | ReloadReason::ProgressBelowCommitted { .. } | ReloadReason::MetaMissing { .. } => {
+            model.reset_all();
+            metrics.clear_chain_gauges();
+            None
+        }
+        ReloadReason::WindowOverLimit => None,
     }
 }
 
@@ -256,6 +314,7 @@ fn reload_label(reason: &ReloadReason) -> &'static str {
         ReloadReason::ProgressBelowCommitted { .. } => "progress_below_committed",
         ReloadReason::InvariantViolated { .. } => "invariant_violated",
         ReloadReason::TreeMismatch { .. } => "tree_mismatch",
+        ReloadReason::MetaMissing { .. } => "meta_missing",
         ReloadReason::WindowOverLimit => "window_over_limit",
     }
 }
@@ -268,7 +327,7 @@ mod tests {
     use psy_bridge_reader_api::{DepositsByAddressQuery, WithdrawalClaimsRequest};
 
     use super::*;
-    use crate::model::{Cursors, DepositCursor, ReadError};
+    use crate::model::{DepositCursor, ReadError};
     use crate::test_support::TickBuilder;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -778,6 +837,133 @@ mod tests {
         assert_eq!(by_address(after, 1, 0, "A").unwrap(), a.rows(0));
         assert_eq!(claims(after), 0);
         assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"progress_below_committed\"} "), Some(1.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_meta_row_under_committed_deposits_resets_everything() {
+        let mut a = TickBuilder::new();
+        a.progress(1, 100, 8).progress(2, 100, 8);
+        a.deposit(0, 1, 10, "A");
+        a.deposit(1, 2, 10, "A");
+        let mut expected = Model::new();
+        let first = a.tick(&expected.cursors());
+        expected.apply(first.clone());
+        let rows = a.deposits.remove(&0).unwrap();
+        let missing = a.tick(&expected.cursors());
+        a.deposits.insert(0, rows);
+        let reloaded = a.tick(&Cursors::default());
+        let r = run(FollowConfig::default(), vec![], vec![Ok(first), Ok(missing), Ok(reloaded)], Duration::ZERO).await;
+        use Call::{Connect, Read};
+        assert_eq!(r.calls(), [(Connect, 0), (Read, 0), (Read, 500), (Read, 1000), (Read, 1500)]);
+        assert!(r.events[2].view.status().ready);
+        let reset = &r.events[3];
+        assert_eq!(reset.cursors, Some(Cursors::default()));
+        assert!(!reset.view.status().ready && reset.view.status().chains.is_empty());
+        assert!(reset.view.revision().epoch > r.events[2].view.revision().epoch);
+        let after = &r.events[4].view;
+        assert!(after.status().ready);
+        assert_eq!(by_address(after, 1, 0, "A").unwrap(), a.rows(0));
+        assert_eq!(by_address(after, 2, 1, "A").unwrap(), a.rows(1));
+        assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"meta_missing\"} "), Some(1.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_chain_index_loses_its_window_rows_series() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit(0, 1, 95, "A");
+        b.deposit(1, 1, 96, "B");
+        let first = b.tick(&Cursors::default());
+        b.deposits.remove(&1);
+        let rolled_back = b.tick(&Cursors::default());
+        let r = run(FollowConfig::default(), vec![], vec![Ok(first), Ok(rolled_back)], Duration::ZERO).await;
+        assert!(r.events[2].view.status().ready);
+        assert_eq!(r.metric("psy_bridge_reader_window_rows{chain_index=\"0\"} "), Some(1.0));
+        assert_eq!(r.metric("psy_bridge_reader_window_rows{chain_index=\"1\"} "), None);
+        assert_eq!(r.metric("psy_bridge_reader_reorgs_total "), Some(1.0));
+    }
+
+    type BuildTick = Box<dyn FnMut(u128, &Cursors) -> TickData + Send>;
+
+    /// A source that builds each tick from the cursors it is given, and records
+    /// when it was read with which cursors.
+    struct BuiltSource {
+        started_at: Instant,
+        until_ms: u128,
+        build: Arc<Mutex<BuildTick>>,
+        reads: Arc<Mutex<Vec<(u128, Cursors)>>>,
+        stop: Arc<watch::Sender<bool>>,
+    }
+
+    impl EnvioSource for BuiltSource {
+        fn read_tick(&mut self, cursors: &Cursors, _max_rows: usize) -> impl Future<Output = Result<TickData, SourceError>> + Send {
+            let at_ms = self.started_at.elapsed().as_millis();
+            let tick = (at_ms < self.until_ms).then(|| {
+                self.reads.lock().push((at_ms, cursors.clone()));
+                (self.build.lock())(at_ms, cursors)
+            });
+            if tick.is_none() {
+                self.stop.send_replace(true);
+            }
+            async move {
+                match tick {
+                    Some(tick) => Ok(tick),
+                    None => std::future::pending().await,
+                }
+            }
+        }
+    }
+
+    /// Runs the loop on built ticks until `until_ms`; returns the reads and
+    /// the last view.
+    async fn run_built(until_ms: u128, build: BuildTick) -> (Vec<(u128, Cursors)>, Arc<View>) {
+        let model = Arc::new(Mutex::new(Model::new()));
+        let view = model.lock().view_handle();
+        let (stop, shutdown) = watch::channel(false);
+        let stop = Arc::new(stop);
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let build = Arc::new(Mutex::new(build));
+        let started_at = Instant::now();
+        let connect = {
+            let reads = reads.clone();
+            move || {
+                let source = BuiltSource { started_at, until_ms, build: build.clone(), reads: reads.clone(), stop: stop.clone() };
+                async move { Ok(source) }
+            }
+        };
+        run_follow(connect, model, FollowConfig::default(), Metrics::new(1 << 30), shutdown).await;
+        let reads = std::mem::take(&mut *reads.lock());
+        (reads, view.load_full())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_persistent_fault_backs_off_and_does_not_reload_every_tick() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8).progress(2, 100, 8);
+        b.deposit(0, 1, 10, "A");
+        b.deposit(1, 2, 10, "A");
+        // Chain index 1's tree does not match Envio's meta until 40 s.
+        let build = move |at_ms: u128, cursors: &Cursors| {
+            if at_ms < 40_000 {
+                b.meta_root.insert(1, crate::tree::hash::zero(5));
+            } else {
+                b.meta_root.remove(&1);
+            }
+            b.tick(cursors)
+        };
+        let (reads, view) = run_built(70_000, Box::new(build)).await;
+        let read_at = |chain_index: u64| reads.iter().filter(|(_, c)| !c.skip.contains(&chain_index)).map(|(at, _)| *at).collect::<Vec<_>>();
+        let every_tick = (0..140).map(|k| k * 500).collect::<Vec<u128>>();
+        assert_eq!(reads.iter().map(|(at, _)| *at).collect::<Vec<_>>(), every_tick);
+        assert_eq!(read_at(0), every_tick);
+        // The first reload is at once, then 1 s doubling: 7 reads of the
+        // faulty chain in the first minute instead of 120.
+        let faulty = read_at(1);
+        let first_minute = faulty.iter().copied().filter(|at| *at < 60_000).collect::<Vec<_>>();
+        assert_eq!(first_minute, [0, 500, 1_500, 3_500, 7_500, 15_500, 31_500]);
+        // The first read after the repair verifies it; from then on every tick reads it.
+        assert_eq!(faulty[7..], every_tick[127..]);
+        assert!(view.status().ready);
     }
 
     #[tokio::test(start_paused = true)]

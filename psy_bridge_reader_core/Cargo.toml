@@ -7,13 +7,13 @@ rust-version = { workspace = true }
 [features]
 # Reference tree functions and the Envio fixture loader, for tests in this
 # crate and in crates that depend on it.
-test-support = ["dep:serde_json"]
+test-support = []
 
 [dependencies]
 parth_core = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true }
 psy_bridge_reader_api = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }

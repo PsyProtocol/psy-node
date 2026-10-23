@@ -200,7 +200,7 @@ where
     let start = Instant::now();
     let mut lane = default_lane;
     let response = match admit_and_read(state, headers, &mut lane, input, blocking, read, start).await {
-        Ok(body) => Json(body).into_response(),
+        Ok(body) => ([(CONTENT_TYPE, HeaderValue::from_static("application/json"))], body).into_response(),
         Err(e) => e.into_response(),
     };
     state.metrics.observe_request(endpoint, lane, response.status().as_u16(), start.elapsed().as_secs_f64());
@@ -215,10 +215,10 @@ async fn admit_and_read<Q, R>(
     blocking: fn(&Q) -> bool,
     read: fn(&View, &Q) -> Result<R, ReadError>,
     start: Instant,
-) -> Result<R, ApiError>
+) -> Result<Vec<u8>, ApiError>
 where
     Q: Send + 'static,
-    R: Send + 'static,
+    R: Serialize + Send + 'static,
 {
     authenticate(&state.token, headers)?;
     if let Some(chosen) = lane_header(headers)? {
@@ -252,24 +252,31 @@ where
             let admission = state.admission.clone();
             let metrics = state.metrics.clone();
             // The permit moves with the work: a read that outlives its
-            // deadline still holds its slot until it finishes.
+            // deadline still holds its slot until it is encoded.
             let task = tokio::task::spawn_blocking(move || {
-                let result = read(&view, &q);
+                let result = read_and_encode(&view, &q, read);
                 drop(permit);
                 refresh_lane(&admission, &metrics, lane);
                 result
             });
-            task.await.map_err(|e| ApiError::new(ErrorCode::Internal, format!("read task failed: {e}")))?.map_err(ApiError::from)
+            task.await.map_err(|e| ApiError::new(ErrorCode::Internal, format!("read task failed: {e}")))?
         } else {
-            let result = read(&view, &q);
+            let result = read_and_encode(&view, &q, read);
             drop(permit);
-            result.map_err(ApiError::from)
+            result
         }
     };
     match tokio::time::timeout_at(deadline, work).await {
         Ok(result) => result,
         Err(_) => Err(ApiError::new(ErrorCode::Timeout, format!("lane {} deadline passed", lane.as_str()))),
     }
+}
+
+/// Encoding a large list costs more than reading it, so it runs where the
+/// read runs, under the lane slot and the deadline.
+fn read_and_encode<Q, R: Serialize>(view: &View, q: &Q, read: fn(&View, &Q) -> Result<R, ReadError>) -> Result<Vec<u8>, ApiError> {
+    let body = read(view, q)?;
+    serde_json::to_vec(&body).map_err(|e| ApiError::new(ErrorCode::Internal, format!("encode the response: {e}")))
 }
 
 fn query<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, String> {
@@ -739,6 +746,44 @@ mod tests {
             // offset + limit = 101 goes to the held blocking pool and times out.
             assert_error(&send(&s, req(&page(100))).await, 503, "timeout", Some("1"));
         });
+    }
+
+    static PROBE_ADMISSION: std::sync::Mutex<Option<Arc<Admission>>> = std::sync::Mutex::new(None);
+    static PROBE_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    /// A response body that records the interactive lane's in-flight count
+    /// at the moment it is encoded.
+    struct EncodeProbe;
+
+    impl Serialize for EncodeProbe {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let admission = PROBE_ADMISSION.lock().unwrap().clone().expect("probe admission set");
+            PROBE_IN_FLIGHT.store(admission.in_flight(Lane::Interactive), std::sync::atomic::Ordering::SeqCst);
+            serializer.serialize_unit()
+        }
+    }
+
+    #[tokio::test]
+    async fn large_lists_are_encoded_under_the_permit() {
+        let (m, _) = ready_model();
+        let s = state_of(&m, &small_budgets());
+        *PROBE_ADMISSION.lock().unwrap() = Some(s.admission.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap());
+        let modes: [fn(&()) -> bool; 2] = [|_| true, |_| false];
+        for blocking in modes {
+            let response = run(&s, &headers, "probe", Lane::Interactive, Ok(()), blocking, |_, _: &()| Ok(EncodeProbe)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "application/json");
+            assert_eq!(PROBE_IN_FLIGHT.swap(usize::MAX, std::sync::atomic::Ordering::SeqCst), 1, "encoded outside the lane slot");
+            assert_eq!(s.admission.in_flight(Lane::Interactive), 0);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&bytes[..], b"null");
+        }
+        // A real 1000-row page answers with the same encoding.
+        let full = send(&s, req("/v1/deposits/by-address?shield_address=A&chain_id=1&limit=1000&offset=0")).await;
+        assert_eq!((full.0, full.2["total"].clone()), (StatusCode::OK, Value::from(5)));
+        assert_eq!(full.1.get(CONTENT_TYPE).unwrap(), "application/json");
     }
 
     #[tokio::test]

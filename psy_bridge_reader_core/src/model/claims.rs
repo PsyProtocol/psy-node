@@ -2,13 +2,63 @@
 //! committed part in `(block_number, id)` order plus a per-tick window, the
 //! same shape as a chain index's deposits.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use psy_bridge_reader_api::{FinalizedBatchRow, WithdrawalClaimRow};
 
-use crate::model::chain::RowIndex;
+#[cfg(test)]
+use crate::model::chain::index_walk_bytes;
+use crate::model::chain::{index_push, strings_bytes, table_bytes, vec_bytes, RowIndex};
+
+fn claim_heap_bytes(c: &WithdrawalClaimRow) -> u64 {
+    strings_bytes(&[&c.id, &c.nullifier, &c.recipient, &c.token, &c.amount, &c.tx_hash])
+}
+
+fn batch_heap_bytes(b: &FinalizedBatchRow) -> u64 {
+    strings_bytes(&[&b.id, &b.finalized_checkpoint_id, &b.deposit_tree_root, &b.withdrawal_tree_root, &b.tx_hash])
+}
+
+/// Appends clones of `claims` and `batches`, indexing each claim by nullifier
+/// at its position; returns the capacity of the new strings, keys and
+/// position lists.
+fn push_rows(
+    out_claims: &mut Vec<WithdrawalClaimRow>,
+    by_nullifier: &mut RowIndex,
+    out_batches: &mut Vec<FinalizedBatchRow>,
+    claims: &[WithdrawalClaimRow],
+    batches: &[FinalizedBatchRow],
+) -> u64 {
+    let mut heap_bytes = 0;
+    out_claims.reserve(claims.len());
+    out_batches.reserve(batches.len());
+    for c in claims {
+        let seq = u32::try_from(out_claims.len()).expect("at most 2^32 claims per chain_id");
+        let row = c.clone();
+        heap_bytes += claim_heap_bytes(&row) + index_push(by_nullifier, &row.nullifier, seq);
+        out_claims.push(row);
+    }
+    for b in batches {
+        let row = b.clone();
+        heap_bytes += batch_heap_bytes(&row);
+        out_batches.push(row);
+    }
+    heap_bytes
+}
+
+/// The vectors and the table at their allocated capacity.
+fn rows_bytes(claims: &Vec<WithdrawalClaimRow>, by_nullifier: &RowIndex, batches: &Vec<FinalizedBatchRow>) -> u64 {
+    vec_bytes(claims) + vec_bytes(batches) + table_bytes::<String, Vec<u32>>(by_nullifier.capacity())
+}
+
+#[cfg(test)]
+fn rows_walk_bytes(claims: &Vec<WithdrawalClaimRow>, by_nullifier: &RowIndex, batches: &Vec<FinalizedBatchRow>) -> u64 {
+    vec_bytes(claims)
+        + claims.iter().map(claim_heap_bytes).sum::<u64>()
+        + vec_bytes(batches)
+        + batches.iter().map(batch_heap_bytes).sum::<u64>()
+        + index_walk_bytes(by_nullifier)
+}
 
 /// Claims and batches at or below the committed safe block. A claim's
 /// sequence number is its position in `claims`.
@@ -17,16 +67,22 @@ pub(crate) struct CommittedClaims {
     pub(crate) claims: Vec<WithdrawalClaimRow>,
     pub(crate) by_nullifier: RowIndex,
     pub(crate) batches: Vec<FinalizedBatchRow>,
+    /// Kept as rows are appended, like `CommittedChain`'s.
+    heap_bytes: u64,
 }
 
 impl CommittedClaims {
     pub(crate) fn append(&mut self, claims: &[WithdrawalClaimRow], batches: &[FinalizedBatchRow]) {
-        for c in claims {
-            let seq = u32::try_from(self.claims.len()).expect("at most 2^32 claims per chain_id");
-            self.by_nullifier.entry(c.nullifier.clone()).or_default().push(seq);
-            self.claims.push(c.clone());
-        }
-        self.batches.extend_from_slice(batches);
+        self.heap_bytes += push_rows(&mut self.claims, &mut self.by_nullifier, &mut self.batches, claims, batches);
+    }
+
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.heap_bytes + rows_bytes(&self.claims, &self.by_nullifier, &self.batches)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn walk_bytes(&self) -> u64 {
+        rows_walk_bytes(&self.claims, &self.by_nullifier, &self.batches)
     }
 }
 
@@ -42,19 +98,25 @@ pub(crate) struct ClaimWindow {
     pub(crate) claims: Vec<WithdrawalClaimRow>,
     pub(crate) by_nullifier: RowIndex,
     pub(crate) batches: Vec<FinalizedBatchRow>,
+    /// Bytes of everything above, computed once by `build`.
+    pub(crate) resident_bytes: u64,
 }
 
 impl ClaimWindow {
     pub(crate) fn build(claims: &[WithdrawalClaimRow], batches: &[FinalizedBatchRow]) -> ClaimWindow {
-        let mut by_nullifier: RowIndex = HashMap::new();
-        for (k, c) in claims.iter().enumerate() {
-            by_nullifier.entry(c.nullifier.clone()).or_default().push(k as u32);
-        }
-        ClaimWindow { claims: claims.to_vec(), by_nullifier, batches: batches.to_vec() }
+        let mut w = ClaimWindow::default();
+        let heap_bytes = push_rows(&mut w.claims, &mut w.by_nullifier, &mut w.batches, claims, batches);
+        w.resident_bytes = heap_bytes + rows_bytes(&w.claims, &w.by_nullifier, &w.batches);
+        w
     }
 
     pub(crate) fn holds(&self, claims: &[WithdrawalClaimRow], batches: &[FinalizedBatchRow]) -> bool {
         self.claims == claims && self.batches == batches
+    }
+
+    #[cfg(test)]
+    pub(crate) fn walk_bytes(&self) -> u64 {
+        rows_walk_bytes(&self.claims, &self.by_nullifier, &self.batches)
     }
 }
 

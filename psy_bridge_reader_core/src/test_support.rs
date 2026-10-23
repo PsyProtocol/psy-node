@@ -240,11 +240,14 @@ impl TickBuilder {
         let mut deposits = BTreeMap::new();
         let mut metas = Vec::new();
         for (&chain_index, rows) in &self.deposits {
-            let from = cursors.deposits.get(&chain_index).map_or(0, |c| c.local_count) as usize;
-            deposits.insert(chain_index, limit(rows.get(from..).unwrap_or(&[]).to_vec(), max_rows, &mut truncated));
             let leaves = self.leaves(chain_index);
             let root = self.meta_root.get(&chain_index).copied().unwrap_or_else(|| naive_root(&leaves, leaves.len() as u64));
             metas.push(TreeMetaRow { chain_index, last_count: leaves.len() as u64, root });
+            if cursors.skip.contains(&chain_index) {
+                continue;
+            }
+            let from = cursors.deposits.get(&chain_index).map_or(0, |c| c.local_count) as usize;
+            deposits.insert(chain_index, limit(rows.get(from..).unwrap_or(&[]).to_vec(), max_rows, &mut truncated));
         }
         let after = |cursor: Option<&(u64, String)>, block: u64, id: &str| cursor.is_none_or(|(b, i)| (block, id) > (*b, i.as_str()));
         let mut claims = BTreeMap::new();
@@ -266,6 +269,7 @@ impl TickBuilder {
             claims,
             batches,
             truncated,
+            skipped: cursors.skip.clone(),
         }
     }
 

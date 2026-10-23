@@ -7,7 +7,7 @@
 //! `postgres` maintenance database) and works on its clone only, so the tests
 //! can run in parallel and the given database stays pristine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -226,6 +226,7 @@ async fn reads_a_tick_from_envio_ddl() {
         deposits: BTreeMap::from([(0, DepositCursor { local_count: 2, next_deposit_index: 9 })]),
         claims: BTreeMap::from([(CHAIN_ID, (100, claim().id))]),
         batches: BTreeMap::from([(CHAIN_ID, (109, "zzz".to_owned()))]),
+        ..Cursors::default()
     };
     let tick = source.read_tick(&cursors, 10).await.expect("second tick");
     assert_eq!(tick.deposits, BTreeMap::from([(0, vec![deposit(2)])]));
@@ -240,6 +241,13 @@ async fn reads_a_tick_from_envio_ddl() {
     let tick = source.read_tick(&Cursors::default(), 3).await.expect("exact tick");
     assert_eq!(tick.deposits[&0].len(), 3);
     assert!(!tick.truncated);
+
+    // A skipped chain index keeps its meta row but has no deposit read.
+    let skip = Cursors { skip: BTreeSet::from([0]), ..Cursors::default() };
+    let tick = source.read_tick(&skip, 10).await.expect("skipping tick");
+    assert_eq!(tick.metas, vec![TreeMetaRow { chain_index: 0, last_count: 3, root: tree_root() }]);
+    assert!(tick.deposits.is_empty());
+    assert_eq!(tick.skipped, BTreeSet::from([0]));
 
     // A claim beyond max_rows truncates too.
     seed.batch_execute(&format!(

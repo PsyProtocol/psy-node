@@ -275,6 +275,10 @@ mod tests {
         for t in READER_TABLES {
             assert!(READER_ROLE_SQL.contains(&format!("\"{t}\"")), "{t}");
         }
+        // The psy-services fallback role needs these; the Reader's role does not grant them.
+        for t in LEGACY_TABLES {
+            assert!(!READER_ROLE_SQL.contains(&format!("\"{t}\"")), "{t}");
+        }
         assert!(!READER_ROLE_SQL.contains("INSERT"));
     }
 }

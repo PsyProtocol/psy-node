@@ -206,6 +206,9 @@ pub struct WithdrawalClaimsResponse {
 
 /// Takes exactly one of `count` (chain-local) or `target_deposit_count` +
 /// `chain_id` (global, resolved through the prefix probe in the same view).
+/// A `target_deposit_count` above the highest indexed `deposit_index` + 1 over
+/// every chain index of `chain_id` is `count_not_indexed`, never a root of
+/// fewer leaves; a chain_id with no deposits resolves to count 0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TreeRootQuery {
@@ -226,6 +229,7 @@ pub struct TreeRootResponse {
 /// Takes exactly one of `count` (chain-local) or `target_deposit_count` +
 /// `chain_id` (global, resolved through the prefix probe in the same view),
 /// and exactly one of `leaf` (chain-local) or `deposit_index` + `chain_id`.
+/// `target_deposit_count` follows the `TreeRootQuery` rule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimProofQuery {

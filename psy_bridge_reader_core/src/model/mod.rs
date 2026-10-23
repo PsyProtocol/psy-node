@@ -21,9 +21,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use psy_bridge_reader_api::{DepositRow, EnvioChainStatus, FinalizedBatchRow, Revision, WithdrawalClaimRow};
+use psy_bridge_reader_api::{EnvioChainStatus, Revision};
 
-use self::chain::{ChainData, RowIndex};
+use self::chain::ChainData;
 use self::claims::ClaimData;
 
 pub use chain::ChainView;
@@ -80,6 +80,8 @@ pub enum ReloadReason {
     ProgressBelowCommitted { chain_id: u64 },
     InvariantViolated { chain_index: u64, what: String },
     TreeMismatch { chain_index: u64 },
+    /// A chain index with committed deposits has no `DepositTreeMeta` row.
+    MetaMissing { chain_index: u64 },
     WindowOverLimit,
 }
 
@@ -95,6 +97,9 @@ impl fmt::Display for ReloadReason {
             }
             ReloadReason::TreeMismatch { chain_index } => {
                 write!(f, "chain_index {chain_index} tree does not match Envio's DepositTreeMeta")
+            }
+            ReloadReason::MetaMissing { chain_index } => {
+                write!(f, "chain_index {chain_index} has committed deposits but no DepositTreeMeta row")
             }
             ReloadReason::WindowOverLimit => write!(f, "the unsafe window is above the follow row limit"),
         }
@@ -170,63 +175,20 @@ impl Model {
         }
     }
 
-    /// An estimate of the model's own structures, in bytes: the capacity of
-    /// every row string, 32 bytes per leaf hash and per stored upper node, and
-    /// 16 bytes per index entry, over the committed parts and the current
-    /// window. Process RSS is exported separately. Nothing is cached; call it
-    /// once per tick.
+    /// An estimate of the model's own structures, in bytes, over the committed
+    /// parts and the current window: every row and leaf vector at its
+    /// allocated capacity (the row struct size per slot), every row string,
+    /// index key and position list, the stored upper nodes, and every hash
+    /// table at `table_bytes`. The committed parts keep their sum as rows are
+    /// appended and a window computes its own when built, so this is O(chains).
+    /// Allocator overhead is not counted; process RSS is exported separately.
     pub fn resident_bytes_estimate(&self) -> u64 {
-        const HASH: u64 = 32;
-        const INDEX_ENTRY: u64 = 16;
-        fn deposits(rows: &[DepositRow]) -> u64 {
-            rows.iter()
-                .map(|r| {
-                    [&r.id, &r.shield_address, &r.token, &r.l2_token_contract_id, &r.amount, &r.note_commitment, &r.leaf_hash, &r.tx_hash]
-                        .iter()
-                        .map(|s| s.capacity() as u64)
-                        .sum::<u64>()
-                })
-                .sum()
-        }
-        fn claims(rows: &[WithdrawalClaimRow]) -> u64 {
-            rows.iter()
-                .map(|r| [&r.id, &r.nullifier, &r.recipient, &r.token, &r.amount, &r.tx_hash].iter().map(|s| s.capacity() as u64).sum::<u64>())
-                .sum()
-        }
-        fn batches(rows: &[FinalizedBatchRow]) -> u64 {
-            rows.iter()
-                .map(|r| {
-                    [&r.id, &r.finalized_checkpoint_id, &r.deposit_tree_root, &r.withdrawal_tree_root, &r.tx_hash]
-                        .iter()
-                        .map(|s| s.capacity() as u64)
-                        .sum::<u64>()
-                })
-                .sum()
-        }
-        fn entries(index: &RowIndex) -> u64 {
-            index.values().map(|v| v.len() as u64).sum::<u64>() * INDEX_ENTRY
-        }
-        let mut total = 0u64;
-        for state in self.chains.values() {
-            let c = state.data.committed.read();
-            total += deposits(&c.deposits) + c.leaves.len() as u64 * HASH + c.upper.node_count() as u64 * HASH;
-            total += entries(&c.by_address) + entries(&c.by_tx);
-        }
-        for data in self.claim_chains.values() {
-            let c = data.committed.read();
-            total += claims(&c.claims) + batches(&c.batches) + entries(&c.by_nullifier);
-        }
+        let committed = self.chains.values().map(|s| s.data.committed.read().resident_bytes()).sum::<u64>()
+            + self.claim_chains.values().map(|d| d.committed.read().resident_bytes()).sum::<u64>();
         let view = self.view.load();
-        for chain in view.chains.values() {
-            let w = &chain.window;
-            total += deposits(&w.deposits) + w.leaves.len() as u64 * HASH + w.nodes.len() as u64 * HASH;
-            total += entries(&w.by_address) + entries(&w.by_tx);
-        }
-        for chain in view.claim_chains.values() {
-            let w = &chain.window;
-            total += claims(&w.claims) + batches(&w.batches) + entries(&w.by_nullifier);
-        }
-        total
+        let windows = view.chains.values().map(|c| c.window.resident_bytes).sum::<u64>()
+            + view.claim_chains.values().map(|c| c.window.resident_bytes).sum::<u64>();
+        committed + windows
     }
 
     /// The committed boundaries the next read starts from.
@@ -243,7 +205,7 @@ impl Model {
                 batches.insert(*chain_id, (b.block_number, b.id.clone()));
             }
         }
-        Cursors { deposits, claims, batches }
+        Cursors { deposits, claims, batches, skip: Default::default() }
     }
 
     pub fn view(&self) -> Arc<View> {
@@ -297,6 +259,19 @@ impl Model {
 
     fn publish(&self, view: View) {
         self.view.store(Arc::new(view));
+    }
+}
+
+#[cfg(test)]
+impl Model {
+    /// `resident_bytes_estimate` recomputed by walking every row.
+    pub(crate) fn resident_bytes_walk(&self) -> u64 {
+        let committed = self.chains.values().map(|s| s.data.committed.read().walk_bytes()).sum::<u64>()
+            + self.claim_chains.values().map(|d| d.committed.read().walk_bytes()).sum::<u64>();
+        let view = self.view.load();
+        let windows = view.chains.values().map(|c| c.window.walk_bytes()).sum::<u64>()
+            + view.claim_chains.values().map(|c| c.window.walk_bytes()).sum::<u64>();
+        committed + windows
     }
 }
 

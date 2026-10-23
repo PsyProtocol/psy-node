@@ -164,7 +164,8 @@ impl View {
     }
 
     /// The chain-local count of a tree query: `count`, or `target` resolved
-    /// through the prefix probe in this view.
+    /// through the prefix probe in this view. A target above the deposits
+    /// indexed for the chain_id is `CountNotIndexed`, never fewer leaves.
     fn resolve_count(
         &self,
         chain_index: u64,
@@ -176,7 +177,15 @@ impl View {
             (Some(n), None) => Ok((n, false)),
             (None, Some(target)) => {
                 let chain_id = chain_id.ok_or_else(|| ReadError::BadRequest("target_deposit_count needs chain_id".to_owned()))?;
-                self.resolve_prefix(chain_index, chain_id, target)
+                let resolved = self.resolve_prefix(chain_index, chain_id, target)?;
+                let indexed = self.chains_of(chain_id)?.iter().filter_map(|(_, c)| {
+                    let r = c.read();
+                    r.len().checked_sub(1).map(|last| r.row(last).deposit_index + 1)
+                }).max();
+                match indexed {
+                    Some(indexed) if target > indexed => Err(ReadError::CountNotIndexed { count: target, indexed }),
+                    _ => Ok(resolved),
+                }
             }
             _ => Err(ReadError::BadRequest("give exactly one of count or target_deposit_count".to_owned())),
         }
@@ -489,6 +498,50 @@ mod tests {
         assert_eq!(proof.siblings, naive_siblings(&leaves, 1099, 1100).iter().map(to_display_hex).collect::<Vec<_>>());
     }
 
+    /// chain_id 1: chain index 0 holds deposit indexes 0, 1 and 3, chain
+    /// index 1 holds 2; chain_id 2 has deposit index 7 on chain index 2.
+    fn two_chain_ids() -> TickBuilder {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8).progress(2, 100, 8);
+        for (chain_index, deposit_index) in [(0, 0), (0, 1), (1, 2), (0, 3)] {
+            b.deposit_at(chain_index, 1, deposit_index, 50 + deposit_index, "A");
+        }
+        b.deposit_at(2, 2, 7, 50, "A");
+        b
+    }
+
+    fn proof_at_target(chain_index: u64, leaf: u64, target: u64) -> ClaimProofQuery {
+        ClaimProofQuery { chain_index, leaf: Some(leaf), deposit_index: None, chain_id: Some(1), count: None, target_deposit_count: Some(target) }
+    }
+
+    #[test]
+    fn global_target_above_indexed_is_count_not_indexed() {
+        let v = ready_model(&two_chain_ids()).view();
+        // Four deposits of chain_id 1 are indexed; chain_id 2's deposit 7 does not count.
+        let not_indexed = ReadError::CountNotIndexed { count: 5, indexed: 4 };
+        for chain_index in [0, 1, 2, 9] {
+            assert_eq!(v.tree_root(&tree_root(chain_index, None, Some(5), Some(1))).map(|r| r.root), Err(not_indexed.clone()), "{chain_index}");
+            assert_eq!(v.claim_proof(&proof_at_target(chain_index, 0, 5)).map(|r| r.proof), Err(not_indexed.clone()), "{chain_index}");
+        }
+        // A chain_id with no deposits keeps count 0.
+        let r = v.tree_root(&tree_root(9, None, Some(5), Some(3))).unwrap();
+        assert_eq!((r.chain_local_count, r.root), (0, to_display_hex(&zero(32))));
+    }
+
+    #[test]
+    fn global_target_at_indexed_is_served() {
+        let b = two_chain_ids();
+        let v = ready_model(&b).view();
+        let r = v.tree_root(&tree_root(0, None, Some(4), Some(1))).unwrap();
+        assert_eq!((r.chain_local_count, r.has_foreign_deposits), (3, true));
+        assert_eq!(r.root, to_display_hex(&naive_root(&b.leaves(0), 3)));
+        let r = v.tree_root(&tree_root(1, None, Some(4), Some(1))).unwrap();
+        assert_eq!((r.chain_local_count, r.root), (1, to_display_hex(&naive_root(&b.leaves(1), 1))));
+        let proof = v.claim_proof(&proof_at_target(0, 2, 4)).unwrap().proof.unwrap();
+        assert_eq!(proof.root, to_display_hex(&naive_root(&b.leaves(0), 3)));
+        assert_eq!(proof.siblings, naive_siblings(&b.leaves(0), 2, 3).iter().map(to_display_hex).collect::<Vec<_>>());
+    }
+
     #[test]
     fn explorer_orders_by_block_desc_then_id_desc_and_caps_at_100() {
         let mut b = TickBuilder::new();
@@ -545,7 +598,7 @@ mod tests {
         let r = v.tree_root(&tree_root(7, Some(0), None, None)).unwrap();
         assert_eq!((r.chain_local_count, r.root), (0, to_display_hex(&zero(32))));
         assert_eq!(v.tree_root(&tree_root(7, Some(1), None, None)), Err(ReadError::CountNotIndexed { count: 1, indexed: 0 }));
-        assert_eq!(v.tree_root(&tree_root(7, None, Some(10), Some(1))).unwrap().chain_local_count, 0);
+        assert_eq!(v.tree_root(&tree_root(7, None, Some(1), Some(1))).unwrap().chain_local_count, 0);
         assert_eq!(v.deposits_by_address(&address("A", Some(7), 10, 0)).unwrap().total, 0);
         assert_eq!(v.deposit_by_index(&DepositByIndexQuery { chain_index: 7, chain_id: 1, deposit_index: 0 }).unwrap().deposit, None);
         let claims = v.withdrawal_claims(&WithdrawalClaimsRequest { chain_id: 9, nullifiers: vec!["n".to_owned()] }).unwrap();
