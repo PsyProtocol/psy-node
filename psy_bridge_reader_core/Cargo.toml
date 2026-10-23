@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 serde_json = { workspace = true, optional = true }
 psy_bridge_reader_api = { workspace = true }
 tokio = { workspace = true }
+arc-swap = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

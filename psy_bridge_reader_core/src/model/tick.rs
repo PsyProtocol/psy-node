@@ -53,6 +53,10 @@ pub struct TreeMetaRow {
 pub struct DepositWithLeaf {
     pub row: DepositRow,
     pub leaf: Hash,
+    /// The `DepositLeaf` row's own `deposit_index` and `chain_id`. The source
+    /// pairs deposits and leaves by position; `Model::apply` checks these.
+    pub leaf_deposit_index: u64,
+    pub leaf_chain_id: u64,
     pub leaf_block_number: u64,
 }
 

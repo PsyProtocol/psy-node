@@ -7436,7 +7436,9 @@ dependencies = [
 name = "psy_bridge_reader_core"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "hex",
+ "parking_lot",
  "parth_core",
  "psy_bridge_reader_api",
  "serde_json",
