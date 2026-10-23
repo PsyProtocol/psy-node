@@ -27,9 +27,10 @@ impl UpperLevels {
         nodes.get(usize::try_from(index).ok()?).copied()
     }
 
-    /// Number of stored nodes over all levels.
-    pub fn node_count(&self) -> usize {
-        self.levels.iter().map(Vec::len).sum()
+    /// Bytes of the level vectors at their allocated capacity.
+    pub fn resident_bytes(&self) -> u64 {
+        let nodes = self.levels.iter().map(|l| l.capacity() * std::mem::size_of::<Hash>()).sum::<usize>();
+        (self.levels.capacity() * std::mem::size_of::<Vec<Hash>>() + nodes) as u64
     }
 
     /// Appends each node to its level. Panics unless every index equals that

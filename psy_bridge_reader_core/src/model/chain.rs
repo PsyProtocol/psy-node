@@ -6,6 +6,7 @@
 //! length, so a view taken before a promotion stays valid without a copy.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockReadGuard};
@@ -19,6 +20,43 @@ use crate::tree::upper::UpperLevels;
 /// Positions of one key's rows, in row order.
 pub(crate) type RowIndex = HashMap<String, Vec<u32>>;
 
+/// Bytes of a hash table's own allocation at `capacity`: hashbrown keeps one
+/// control byte per bucket and fills at most 7/8 of its buckets.
+pub(crate) fn table_bytes<K, V>(capacity: usize) -> u64 {
+    (capacity * (size_of::<(K, V)>() + 1) * 8 / 7) as u64
+}
+
+pub(crate) fn vec_bytes<T>(v: &Vec<T>) -> u64 {
+    (v.capacity() * size_of::<T>()) as u64
+}
+
+pub(crate) fn strings_bytes(strings: &[&String]) -> u64 {
+    strings.iter().map(|s| s.capacity() as u64).sum()
+}
+
+fn deposit_heap_bytes(r: &DepositRow) -> u64 {
+    strings_bytes(&[&r.id, &r.shield_address, &r.token, &r.l2_token_contract_id, &r.amount, &r.note_commitment, &r.leaf_hash, &r.tx_hash])
+}
+
+/// Adds `pos` under `key`; returns the bytes it added outside the table itself.
+pub(crate) fn index_push(index: &mut RowIndex, key: &str, pos: u32) -> u64 {
+    if let Some(positions) = index.get_mut(key) {
+        let before = vec_bytes(positions);
+        positions.push(pos);
+        return vec_bytes(positions) - before;
+    }
+    let key = key.to_owned();
+    let positions = vec![pos];
+    let added = key.capacity() as u64 + vec_bytes(&positions);
+    index.insert(key, positions);
+    added
+}
+
+#[cfg(test)]
+pub(crate) fn index_walk_bytes(index: &RowIndex) -> u64 {
+    table_bytes::<String, Vec<u32>>(index.capacity()) + index.iter().map(|(k, v)| k.capacity() as u64 + vec_bytes(v)).sum::<u64>()
+}
+
 /// Rows at or below the committed safe block, in chain-local order.
 #[derive(Default)]
 pub(crate) struct CommittedChain {
@@ -27,6 +65,9 @@ pub(crate) struct CommittedChain {
     pub(crate) by_address: RowIndex,
     pub(crate) by_tx: RowIndex,
     pub(crate) upper: UpperLevels,
+    /// Capacity of every row string, index key and position list, kept as
+    /// rows are appended.
+    heap_bytes: u64,
 }
 
 impl CommittedChain {
@@ -39,23 +80,41 @@ impl CommittedChain {
     pub(crate) fn append(&mut self, rows: &[DepositWithLeaf]) {
         let from_len = self.len();
         for (k, r) in rows.iter().enumerate() {
-            self.deposits.push(r.row.clone());
-            index_row(&mut self.by_address, &mut self.by_tx, &r.row, position(from_len + k as u64));
+            let row = r.row.clone();
+            let pos = position(from_len + k as u64);
+            self.heap_bytes += deposit_heap_bytes(&row)
+                + index_push(&mut self.by_address, &row.shield_address, pos)
+                + index_push(&mut self.by_tx, &row.tx_hash, pos);
+            self.deposits.push(row);
         }
         self.leaves.extend(rows.iter().map(|r| r.leaf));
         let to_len = self.len();
         let nodes = completed_nodes(&Tree::committed(self, to_len), from_len, to_len);
         self.upper.append(&nodes);
     }
+
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.heap_bytes
+            + vec_bytes(&self.deposits)
+            + vec_bytes(&self.leaves)
+            + self.upper.resident_bytes()
+            + table_bytes::<String, Vec<u32>>(self.by_address.capacity())
+            + table_bytes::<String, Vec<u32>>(self.by_tx.capacity())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn walk_bytes(&self) -> u64 {
+        vec_bytes(&self.deposits)
+            + self.deposits.iter().map(deposit_heap_bytes).sum::<u64>()
+            + vec_bytes(&self.leaves)
+            + self.upper.resident_bytes()
+            + index_walk_bytes(&self.by_address)
+            + index_walk_bytes(&self.by_tx)
+    }
 }
 
 fn position(i: u64) -> u32 {
     u32::try_from(i).expect("a chain index holds at most 2^32 deposits")
-}
-
-fn index_row(by_address: &mut RowIndex, by_tx: &mut RowIndex, row: &DepositRow, pos: u32) {
-    by_address.entry(row.shield_address.clone()).or_default().push(pos);
-    by_tx.entry(row.tx_hash.clone()).or_default().push(pos);
 }
 
 /// The committed part of one chain index, shared by every view of it.
@@ -75,22 +134,45 @@ pub(crate) struct WindowChain {
     /// `completed_nodes(committed_len, committed_len + len)`: every complete
     /// subtree at the block level or above that ends inside the window.
     pub(crate) nodes: HashMap<(u8, u64), Hash>,
+    /// Bytes of everything above, computed once by `build`.
+    pub(crate) resident_bytes: u64,
 }
 
 impl WindowChain {
     /// The window of `rows` above the first `committed.len()` committed rows.
     pub(crate) fn build(committed: &CommittedChain, rows: &[DepositWithLeaf]) -> WindowChain {
         let mut w = WindowChain::default();
+        let mut heap_bytes = 0;
         for (k, r) in rows.iter().enumerate() {
-            w.deposits.push(r.row.clone());
-            index_row(&mut w.by_address, &mut w.by_tx, &r.row, position(k as u64));
+            let row = r.row.clone();
+            let pos = position(k as u64);
+            heap_bytes += deposit_heap_bytes(&row)
+                + index_push(&mut w.by_address, &row.shield_address, pos)
+                + index_push(&mut w.by_tx, &row.tx_hash, pos);
+            w.deposits.push(row);
         }
         w.leaves.extend(rows.iter().map(|r| r.leaf));
         let committed_len = committed.len();
         let src = Tree { committed, committed_len, window_leaves: &w.leaves, window_nodes: None };
         let nodes = completed_nodes(&src, committed_len, src.len());
         w.nodes = nodes.into_iter().map(|(level, index, hash)| ((level, index), hash)).collect();
+        w.resident_bytes = heap_bytes
+            + vec_bytes(&w.deposits)
+            + vec_bytes(&w.leaves)
+            + table_bytes::<(u8, u64), Hash>(w.nodes.capacity())
+            + table_bytes::<String, Vec<u32>>(w.by_address.capacity())
+            + table_bytes::<String, Vec<u32>>(w.by_tx.capacity());
         w
+    }
+
+    #[cfg(test)]
+    pub(crate) fn walk_bytes(&self) -> u64 {
+        vec_bytes(&self.deposits)
+            + self.deposits.iter().map(deposit_heap_bytes).sum::<u64>()
+            + vec_bytes(&self.leaves)
+            + table_bytes::<(u8, u64), Hash>(self.nodes.capacity())
+            + index_walk_bytes(&self.by_address)
+            + index_walk_bytes(&self.by_tx)
     }
 
     pub(crate) fn len(&self) -> u64 {

@@ -855,6 +855,69 @@ mod tests {
     }
 
     #[test]
+    fn resident_estimate_is_incremental_and_equals_a_full_walk() {
+        let check = |m: &Model, step: &str| assert_eq!(m.resident_bytes_estimate(), m.resident_bytes_walk(), "{step}");
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8).progress(2, 100, 8);
+        let mut m = Model::new();
+        check(&m, "empty");
+        // Enough rows and keys that the vectors and tables grow several times.
+        for k in 0..1100u64 {
+            b.deposit(0, 1, if k < 1050 { 10 + k / 20 } else { 95 }, &format!("addr{}", k % 37));
+        }
+        for block in [10, 95, 96] {
+            b.deposit(1, 2, block, "B");
+        }
+        for k in 0..30 {
+            b.claim(1, 10 + k, &format!("n{k}"));
+        }
+        b.claim(2, 96, "w");
+        for checkpoint in 0..12 {
+            b.batch(1, 20 + checkpoint, checkpoint);
+        }
+        b.batch(1, 97, 99);
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        check(&m, "first tick");
+        b.progress(1, 104, 8);
+        b.deposit(0, 1, 100, "addr0");
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        assert_eq!(m.view().chains[&0].committed_len, 1100);
+        check(&m, "promotion");
+        b.deposits.get_mut(&0).unwrap().last_mut().unwrap().row.tx_hash = "0xreplaced".to_owned();
+        assert_eq!(b.apply_to(&mut m), published(&[0]));
+        check(&m, "reorg");
+        m.reset_chain(0);
+        check(&m, "reset_chain");
+        assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Published { .. }));
+        check(&m, "chain reloaded");
+        m.reset_all();
+        check(&m, "reset_all");
+        assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Published { .. }));
+        check(&m, "all reloaded");
+        assert!(m.resident_bytes_estimate() > 0);
+    }
+
+    #[test]
+    fn resident_estimate_includes_struct_and_key_sizes() {
+        use std::mem::size_of;
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        let row = b.deposit(0, 1, 10, "A");
+        let mut m = Model::new();
+        let empty = m.resident_bytes_estimate();
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        assert_eq!(m.view().chains[&0].committed_len, 1);
+        let strings = [&row.id, &row.shield_address, &row.token, &row.l2_token_contract_id, &row.amount, &row.note_commitment, &row.leaf_hash, &row.tx_hash]
+            .iter()
+            .map(|s| s.len())
+            .sum::<usize>();
+        let keys = row.shield_address.len() + row.tx_hash.len();
+        let floor = size_of::<DepositRow>() + strings + keys + 2 * size_of::<(String, Vec<u32>)>() + size_of::<Hash>();
+        let grown = m.resident_bytes_estimate() - empty;
+        assert!(grown >= floor as u64, "{grown} < {floor}");
+    }
+
+    #[test]
     fn resident_estimate_grows_with_rows() {
         let mut b = TickBuilder::new();
         b.progress(1, 100, 8);
