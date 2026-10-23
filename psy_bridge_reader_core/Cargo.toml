@@ -14,6 +14,9 @@ parth_core = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true, optional = true }
+psy_bridge_reader_api = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
