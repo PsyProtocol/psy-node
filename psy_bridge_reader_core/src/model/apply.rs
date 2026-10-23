@@ -287,7 +287,9 @@ impl Model {
             .collect::<BTreeMap<_, _>>();
         changed |= envio_chains != old.envio_chains;
 
-        let fault = self.chains.values().find_map(|s| s.fault.as_ref().map(|(reason, _)| reason.clone()));
+        // MetaMissing resets everything, so it goes before a one-chain fault.
+        let faults = self.chains.values().filter_map(|s| s.fault.as_ref().map(|(reason, _)| reason));
+        let fault = faults.clone().find(|r| matches!(r, ReloadReason::MetaMissing { .. })).or_else(|| faults.clone().next()).cloned();
         if !changed {
             // The data is unchanged but verified as of this tick: refresh
             // `as_of_unix_ms` and keep epoch and seq, so an idle Envio does not
@@ -852,6 +854,9 @@ mod tests {
         b.deposits.remove(&1);
         assert_eq!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::MetaMissing { chain_index: 1 }));
         assert!(matches!(root(&m.view(), 1, 1), Err(ReadError::NotReady(_))));
+        // A one-chain fault on a lower chain index does not hide it.
+        b.meta_root.insert(0, zero(3));
+        assert_eq!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::MetaMissing { chain_index: 1 }));
     }
 
     #[test]
