@@ -165,11 +165,26 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
+/// One second of a step, keyed by the second the request was due in.
+#[derive(Default)]
+struct SecStats {
+    sent: u64,
+    ok: u64,
+    errors: BTreeMap<String, u64>,
+    latency_us: Vec<u64>,
+    send_lag_us: Vec<u64>,
+}
+
 #[derive(Default)]
 struct StepStats {
     sent: u64,
     ok: u64,
+    /// Successful responses that completed inside the send window.
+    ok_in_window: u64,
+    timeouts: u64,
     errors: BTreeMap<String, u64>,
+    secs: Vec<SecStats>,
+    send_lag_us: Vec<u64>,
     latency_us: [Vec<u64>; 5],
     bytes_hist: [u64; 6],
     bytes_sum: [u64; 5],
@@ -200,13 +215,29 @@ struct EndpointReport {
 }
 
 #[derive(Serialize)]
+struct SecReport {
+    second: usize,
+    sent: u64,
+    ok: u64,
+    errors: BTreeMap<String, u64>,
+    latency_p50_us: u64,
+    latency_p99_us: u64,
+    send_lag_p99_us: u64,
+}
+
+#[derive(Serialize)]
 struct StepReport {
     rate: u64,
     step_secs: u64,
     sent: u64,
     ok: u64,
+    /// Requests that hit `--timeout-ms`; also counted under `errors["timeout"]`.
+    timeouts: u64,
     errors: BTreeMap<String, u64>,
+    /// Successful responses completed inside the send window / window length.
     throughput_ok_per_s: f64,
+    peak_inflight: u64,
+    per_second: Vec<SecReport>,
     endpoints: BTreeMap<&'static str, EndpointReport>,
     /// Count of responses per size bucket, keyed by upper bound in bytes.
     response_bytes_hist: BTreeMap<String, u64>,
@@ -214,12 +245,15 @@ struct StepReport {
     by_address_limit_counts: BTreeMap<u32, u64>,
     generator_cpu_seconds: f64,
     generator_cpu_cores: f64,
-    lag: Pct,
+    /// Actual send (just before `client.request`) minus due time. Gates `valid`.
+    send_lag: Pct,
+    /// Scheduler emit time minus due time (before the request task starts).
+    emit_lag: Pct,
     valid: bool,
     invalid_reasons: Vec<String>,
 }
 
-fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, st: StepStats) -> StepReport {
+fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, peak_inflight: u64, mut st: StepStats) -> StepReport {
     let mut endpoints = BTreeMap::new();
     for e in Endpoint::ALL {
         let i = e.index();
@@ -238,10 +272,31 @@ fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, s
         let key = if BYTE_BUCKETS[i] == u64::MAX { "inf".to_owned() } else { format!("le_{}", BYTE_BUCKETS[i]) };
         hist.insert(key, *c);
     }
-    let lag = pct(st.lag_us);
+    let emit_lag = pct(std::mem::take(&mut st.lag_us));
+    let send_lag = pct(std::mem::take(&mut st.send_lag_us));
+    let per_second = std::mem::take(&mut st.secs)
+        .into_iter()
+        .enumerate()
+        .map(|(second, mut sec)| {
+            sec.latency_us.sort_unstable();
+            sec.send_lag_us.sort_unstable();
+            SecReport {
+                second,
+                sent: sec.sent,
+                ok: sec.ok,
+                errors: sec.errors,
+                latency_p50_us: percentile(&sec.latency_us, 50.0),
+                latency_p99_us: percentile(&sec.latency_us, 99.0),
+                send_lag_p99_us: percentile(&sec.send_lag_us, 99.0),
+            }
+        })
+        .collect();
     let mut reasons = Vec::new();
-    if lag.p99_us > LAG_P99_LIMIT_US {
-        reasons.push(format!("generator lag p99 {} us exceeds {} us", lag.p99_us, LAG_P99_LIMIT_US));
+    if send_lag.p99_us > LAG_P99_LIMIT_US {
+        reasons.push(format!("send lag p99 {} us exceeds {} us", send_lag.p99_us, LAG_P99_LIMIT_US));
+    }
+    if emit_lag.p99_us > LAG_P99_LIMIT_US {
+        reasons.push(format!("emit lag p99 {} us exceeds {} us", emit_lag.p99_us, LAG_P99_LIMIT_US));
     }
     if let Some(c) = st.errors.get("cap") {
         reasons.push(format!("{c} requests hit the concurrency cap"));
@@ -253,13 +308,17 @@ fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, s
         sent: st.sent,
         ok: st.ok,
         errors: st.errors,
-        throughput_ok_per_s: st.ok as f64 / secs,
+        timeouts: st.timeouts,
+        throughput_ok_per_s: st.ok_in_window as f64 / secs,
+        peak_inflight,
+        per_second,
         endpoints,
         response_bytes_hist: hist,
         by_address_limit_counts: st.limits,
         generator_cpu_seconds: cpu_seconds,
         generator_cpu_cores: cpu_seconds / secs,
-        lag,
+        send_lag,
+        emit_lag,
         valid: reasons.is_empty(),
         invalid_reasons: reasons,
     }
@@ -383,9 +442,11 @@ struct Shared {
     stats: Mutex<StepStats>,
     inflight: AtomicUsize,
     peak_inflight: AtomicU64,
+    /// Set once the send window has closed (completions after it are drain).
+    draining: std::sync::atomic::AtomicBool,
 }
 
-async fn do_request(sh: Arc<Shared>, spec: Spec, due: Instant) {
+async fn do_request(sh: Arc<Shared>, spec: Spec, due: Instant, sec: usize) {
     let mut req = Request::builder().method(spec.method).uri(&spec.uri).header("authorization", format!("Bearer {}", sh.token));
     let body = match spec.body {
         Some(b) => {
@@ -394,10 +455,12 @@ async fn do_request(sh: Arc<Shared>, spec: Spec, due: Instant) {
         }
         None => Full::new(Bytes::new()),
     };
+    let mut send_at: Option<Instant> = None;
     let outcome: Result<(u16, Bytes), String> = match req.body(body) {
         Err(e) => Err(format!("transport:build:{e}")),
         Ok(req) => {
             let fut = async {
+                send_at = Some(Instant::now());
                 let resp = sh.client.request(req).await.map_err(|e| format!("transport:{}", short_err(&e)))?;
                 let status = resp.status().as_u16();
                 let bytes = resp.into_body().collect().await.map_err(|_| "transport:body".to_owned())?.to_bytes();
@@ -409,20 +472,38 @@ async fn do_request(sh: Arc<Shared>, spec: Spec, due: Instant) {
             }
         }
     };
-    let elapsed_us = Instant::now().saturating_duration_since(due).as_micros() as u64;
+    let done = Instant::now();
+    let elapsed_us = done.saturating_duration_since(due).as_micros() as u64;
+    let send_lag_us = send_at.map(|t| t.saturating_duration_since(due).as_micros() as u64);
+    let in_window = !sh.draining.load(Ordering::Relaxed);
     {
         let mut st = sh.stats.lock().unwrap();
+        if let Some(l) = send_lag_us {
+            st.send_lag_us.push(l);
+            st.secs[sec].send_lag_us.push(l);
+        }
         match outcome {
             Ok((status, bytes)) if status == 200 => {
                 st.ok += 1;
+                st.ok_in_window += in_window as u64;
+                st.secs[sec].ok += 1;
+                st.secs[sec].latency_us.push(elapsed_us);
                 record_bytes(&mut st, spec.endpoint, bytes.len() as u64);
                 st.latency_us[spec.endpoint.index()].push(elapsed_us);
             }
             Ok((status, bytes)) => {
                 let code = serde_json::from_slice::<ErrorBody>(&bytes).map(|b| b.code.as_str().to_owned()).unwrap_or_else(|_| "unparsed".to_owned());
-                *st.errors.entry(format!("{status}:{code}")).or_default() += 1;
+                let key = format!("{status}:{code}");
+                *st.secs[sec].errors.entry(key.clone()).or_default() += 1;
+                *st.errors.entry(key).or_default() += 1;
             }
-            Err(kind) => *st.errors.entry(kind).or_default() += 1,
+            Err(kind) => {
+                if kind == "timeout" {
+                    st.timeouts += 1;
+                }
+                *st.secs[sec].errors.entry(kind.clone()).or_default() += 1;
+                *st.errors.entry(kind).or_default() += 1;
+            }
         }
     }
     sh.inflight.fetch_sub(1, Ordering::Relaxed);
@@ -486,46 +567,93 @@ async fn load_dataset(sh: &Shared, base: &str, from: &str) -> Result<Dataset, St
 }
 
 async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u64, cap: usize) -> StepReport {
-    *sh.stats.lock().unwrap() = StepStats::default();
+    {
+        let mut st = sh.stats.lock().unwrap();
+        *st = StepStats::default();
+        st.secs = (0..step_secs).map(|_| SecStats::default()).collect();
+    }
+    sh.draining.store(false, Ordering::Relaxed);
+    sh.peak_inflight.store(0, Ordering::Relaxed);
     let count = rate * step_secs;
-    let cpu0 = process_cpu_seconds();
     let start = Instant::now() + Duration::from_millis(50);
+    let cpu0 = process_cpu_seconds();
+    let mut cpu_start = cpu0;
     let mut sent = 0u64;
     let mut limits: BTreeMap<u32, u64> = BTreeMap::new();
     let mut lags: Vec<u64> = Vec::with_capacity(count as usize);
     let mut capped = 0u64;
+    let mut sec_sent = vec![0u64; step_secs as usize];
+    let mut sec_capped = vec![0u64; step_secs as usize];
     run_schedule(start, rate, count, |i, lag| {
+        if i == 0 {
+            cpu_start = process_cpu_seconds();
+        }
         lags.push(lag.as_micros() as u64);
         let (spec, limit) = picker.next();
         if let Some(l) = limit {
             *limits.entry(l).or_default() += 1;
         }
         sent += 1;
+        let sec = ((i / rate) as usize).min(step_secs as usize - 1);
+        sec_sent[sec] += 1;
         let due = start + due_offset(rate, i);
         if sh.inflight.load(Ordering::Relaxed) >= cap {
             capped += 1;
+            sec_capped[sec] += 1;
             return;
         }
         let now = sh.inflight.fetch_add(1, Ordering::Relaxed) as u64 + 1;
         sh.peak_inflight.fetch_max(now, Ordering::Relaxed);
-        tokio::spawn(do_request(sh.clone(), spec, due));
+        tokio::spawn(do_request(sh.clone(), spec, due, sec));
     })
     .await;
+    // Window closes here: CPU and throughput cover the same interval.
+    sh.draining.store(true, Ordering::Relaxed);
     let window = Instant::now().saturating_duration_since(start);
+    let cpu = process_cpu_seconds() - cpu_start;
+    let peak = sh.peak_inflight.load(Ordering::Relaxed);
     // Drain in-flight requests (bounded by the request timeout).
     let drain_until = Instant::now() + sh.timeout + Duration::from_secs(1);
     while sh.inflight.load(Ordering::Relaxed) > 0 && Instant::now() < drain_until {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let cpu = process_cpu_seconds() - cpu0;
     let mut st = std::mem::take(&mut *sh.stats.lock().unwrap());
     st.sent = sent;
     st.lag_us = lags;
     st.limits = limits;
+    for (i, sec) in st.secs.iter_mut().enumerate() {
+        sec.sent = sec_sent[i];
+        if sec_capped[i] > 0 {
+            sec.errors.insert("cap".to_owned(), sec_capped[i]);
+        }
+    }
     if capped > 0 {
         st.errors.insert("cap".to_owned(), capped);
     }
-    build_report(rate, step_secs, window, cpu, st)
+    build_report(rate, step_secs, window, cpu, peak, st)
+}
+
+/// Raises the soft open-files limit to the hard limit; returns the new soft limit.
+fn raise_nofile() -> u64 {
+    // SAFETY: plain getrlimit/setrlimit calls on a local struct.
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return 0;
+        }
+        if lim.rlim_cur < lim.rlim_max {
+            let want = libc::rlimit { rlim_cur: lim.rlim_max, rlim_max: lim.rlim_max };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
+                lim.rlim_cur = lim.rlim_max;
+            }
+        }
+        lim.rlim_cur as u64
+    }
+}
+
+fn git_sha() -> Option<String> {
+    let out = std::process::Command::new("git").args(["rev-parse", "--short=12", "HEAD"]).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -555,7 +683,13 @@ async fn real_main(args: Args) -> Result<(), String> {
         stats: Mutex::new(StepStats::default()),
         inflight: AtomicUsize::new(0),
         peak_inflight: AtomicU64::new(0),
+        draining: std::sync::atomic::AtomicBool::new(false),
     });
+    let nofile = raise_nofile();
+    if nofile < 4 * args.concurrency_cap as u64 {
+        eprintln!("warning: open-files limit {nofile} is below 4x --concurrency-cap {}; expect connect errors", args.concurrency_cap);
+    }
+    let started_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let data = load_dataset(&sh, &args.url, &args.addresses_from).await?;
     eprintln!(
         "dataset: chain_id={} chain_index={} count={} addresses={} tx_hashes={} nullifiers={}",
@@ -572,11 +706,21 @@ async fn real_main(args: Args) -> Result<(), String> {
         eprintln!("step: {rate} req/s for {} s", args.step_secs);
         let report = run_step(&sh, &mut picker, rate, args.step_secs, args.concurrency_cap).await;
         eprintln!(
-            "  sent={} ok={} errors={:?} throughput={:.0}/s lag_p99={}us valid={}",
-            report.sent, report.ok, report.errors, report.throughput_ok_per_s, report.lag.p99_us, report.valid
+            "  sent={} ok={} errors={:?} throughput={:.0}/s send_lag_p99={}us valid={}",
+            report.sent, report.ok, report.errors, report.throughput_ok_per_s, report.send_lag.p99_us, report.valid
         );
         steps.push(report);
         let out = serde_json::json!({
+            "config": {
+                "url": args.url,
+                "concurrency_cap": args.concurrency_cap,
+                "timeout_ms": args.timeout_ms,
+                "step_secs": args.step_secs,
+                "rates": args.rates,
+                "started_unix": started_unix,
+                "git_sha": git_sha(),
+                "nofile_soft_limit": nofile,
+            },
             "mix": args.mix,
             "seed": args.seed,
             "dataset": { "chain_id": data.chain_id, "chain_index": data.chain_index, "count": data.count, "addresses": data.addresses.len(), "tx_hashes": data.tx_hashes.len() },
@@ -639,6 +783,33 @@ mod tests {
         assert_eq!(percentile(&[], 50.0), 0);
         let p = pct((1..=100).rev().collect());
         assert_eq!((p.count, p.p50_us, p.p99_us, p.max_us), (100, 50, 99, 100));
+    }
+
+    #[test]
+    fn send_lag_gates_validity_and_seconds_are_reported() {
+        let mk = |send_lag: u64| {
+            let mut st = StepStats::default();
+            st.secs = (0..2).map(|_| SecStats::default()).collect();
+            for i in 0..100u64 {
+                let sec = (i / 50) as usize;
+                st.sent += 1;
+                st.ok += 1;
+                st.ok_in_window += 1;
+                st.secs[sec].sent += 1;
+                st.secs[sec].ok += 1;
+                st.secs[sec].latency_us.push(i + 1);
+                st.secs[sec].send_lag_us.push(send_lag);
+                st.send_lag_us.push(send_lag);
+                st.lag_us.push(0);
+            }
+            build_report(50, 2, Duration::from_secs(2), 0.5, 7, st)
+        };
+        let good = mk(100);
+        assert!(good.valid && good.per_second.len() == 2);
+        assert_eq!((good.per_second[1].sent, good.per_second[1].latency_p99_us, good.peak_inflight), (50, 100, 7));
+        assert!((good.throughput_ok_per_s - 50.0).abs() < 1e-9);
+        let bad = mk(LAG_P99_LIMIT_US + 1);
+        assert!(!bad.valid && bad.invalid_reasons[0].contains("send lag"));
     }
 
     #[test]

@@ -113,15 +113,25 @@ for the Reader's internal API (the Python wallets top out near 2,000 req/s).
 CARGO_TARGET_DIR=$HOME/.cache/psy-bridge-reader-target-tree \
 cargo run --release -p psy_bridge_reader_core --example reader_bench -- \
   --url http://127.0.0.1:<port> --token-file <token> \
-  --rates 2000,5000,10000,15000 --step-secs 60 \
+  --rates 2000,5000,10000,15000 --step-secs 120 \
   --mix A4 --addresses-from status --out bench.json
 ```
 
 - Open loop: request `i` of a step is due at `i / rate`; a request is never
-  delayed by an earlier response. Latency is measured from the due time. Lag is
-  send time minus due time (tokio's 1 ms timer gives a ~1 ms floor). A step with
-  lag p99 over 5 ms, or one that hit `--concurrency-cap`, has `"valid": false`
-  with the reasons listed.
+  delayed by an earlier response. Latency is measured from the due time and
+  only for successful (HTTP 200) responses: failed requests, including
+  timeouts, are excluded from the latency percentiles and counted in `errors`
+  (`timeouts` is also reported separately). `send_lag` is the moment just
+  before `client.request` minus the due time, so worker queueing in a
+  CPU-bound generator shows up; `emit_lag` is the scheduler's own lag (tokio's
+  1 ms timer gives a ~1 ms floor). A step with send or emit lag p99 over 5 ms,
+  or one that hit `--concurrency-cap`, has `"valid": false` with the reasons
+  listed. Throughput counts only successes that completed inside the send
+  window, and generator CPU covers the same interval.
+- To find saturation, keep raising the rate: `--rates 20000,25000,30000,...`
+  until a step is invalid or the Reader's errors/latency climb. The bench
+  raises its open-files soft limit to the hard limit and warns if that is
+  under 4x `--concurrency-cap`. Pin it away from the Reader (`taskset`).
 - Mix `A4` (by request count): 70% `by-address`, 10% `by-tx`, 10%
   `withdrawal-claims` (10 nullifiers), 5% `tree/root`, 5% `tree/proof`; or
   `--mix by_address=70,by_tx=10,claims=10,root=5,proof=5`. `by-address` limits
@@ -134,7 +144,10 @@ cargo run --release -p psy_bridge_reader_core --example reader_bench -- \
   (`nullifiers` optional). Without nullifiers the bench uses 1,000 synthetic
   ones that no claim matches, so `withdrawal-claims` returns empty reads.
   `tree/root` and `tree/proof` use the fixed `count`, with a random `leaf`.
-- `--out` is rewritten after every step. Per step: rate, sent, ok, errors keyed
+- `--out` is rewritten after every step and starts with a `config` object (url,
+  cap, timeout, step_secs, start time, git sha, open-files limit). Each step
+  also has `per_second`: sent, ok, errors, latency p50/p99 and send-lag p99 for
+  every second (by due time), and `peak_inflight`. Per step: rate, sent, ok, errors keyed
   `status:code` (or `transport:*`, `timeout`, `cap`), ok throughput, p50/p95/p99
   per endpoint, response-byte histogram (upper bounds 256 B to 64 KiB) plus
   mean/max bytes per endpoint, generator CPU (`/proc/self/stat`), lag
