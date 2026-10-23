@@ -248,7 +248,7 @@ impl Model {
                 batches.insert(*chain_id, (b.block_number, b.id.clone()));
             }
         }
-        Cursors { deposits, claims, batches }
+        Cursors { deposits, claims, batches, skip: Default::default() }
     }
 
     pub fn view(&self) -> Arc<View> {

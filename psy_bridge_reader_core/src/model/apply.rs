@@ -56,9 +56,10 @@ impl Model {
             }
             safe_blocks.insert(p.chain_id, committed.max(envio_safe_block(p)));
         }
-        // Rule 3. A chain index whose rows break an invariant is held: its
-        // rows are neither promoted nor shown, and the rest of the tick applies.
-        let mut held = BTreeSet::new();
+        // Rule 3. A skipped chain index, and one whose rows break an invariant,
+        // is held: its rows are neither promoted nor shown, and the rest of the
+        // tick applies.
+        let mut held = tick.skipped.clone();
         let mut violation = None;
         for (&chain_index, rows) in &tick.deposits {
             if let Err(what) = self.check_deposits(chain_index, rows) {

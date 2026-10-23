@@ -123,7 +123,7 @@ impl EnvioSource for PgSource {
 
         let mut truncated = false;
         let mut deposits = BTreeMap::new();
-        for meta in &metas {
+        for meta in metas.iter().filter(|m| !cursors.skip.contains(&m.chain_index)) {
             let cursor = cursors.deposits.get(&meta.chain_index).copied().unwrap_or_default();
             let chain_index = to_int4(meta.chain_index, "chain_index")?;
             let from_deposit = to_int4(cursor.next_deposit_index, "next_deposit_index cursor")?;
@@ -184,7 +184,8 @@ impl EnvioSource for PgSource {
         }
 
         commit(tx).await?;
-        Ok(TickData { identity, started_unix_ms, progress, metas, deposits, claims, batches, truncated })
+        let skipped = cursors.skip.clone();
+        Ok(TickData { identity, started_unix_ms, progress, metas, deposits, claims, batches, truncated, skipped })
     }
 }
 
