@@ -108,6 +108,7 @@ toml = "0.8"
 # ---- Error handling ----
 anyhow = "1.0.75"
 thiserror = "2.0"
+prometheus = { version = "0.13.4", default-features = false }
 logos = "0.15"
 miette = { version = "7.2", features = ["fancy"] }
 color-eyre = "0.6"

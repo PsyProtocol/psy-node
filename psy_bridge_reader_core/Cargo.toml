@@ -17,6 +17,8 @@ serde_json = { workspace = true, optional = true }
 psy_bridge_reader_api = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
+prometheus = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
