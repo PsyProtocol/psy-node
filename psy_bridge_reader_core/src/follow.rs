@@ -181,6 +181,7 @@ impl FollowState {
             if let ApplyOutcome::Reload(reason) = &outcome {
                 self.reset_for(&mut model, reason);
             }
+            self.metrics.set_resident_bytes(model.resident_bytes_estimate());
             (outcome, model.view())
         };
         match &outcome {
@@ -468,6 +469,9 @@ mod tests {
         let startup = r.metric("psy_bridge_reader_startup_seconds ").unwrap();
         assert!((startup - 0.2).abs() < 1e-9, "{startup}");
         assert_eq!(r.metric("psy_bridge_reader_tick_seconds_count "), Some(4.0));
+        let resident = r.metric("psy_bridge_reader_resident_bytes ").unwrap();
+        assert!(resident > 0.0);
+        assert_eq!(resident, expected.resident_bytes_estimate() as f64);
     }
 
     #[tokio::test(start_paused = true)]

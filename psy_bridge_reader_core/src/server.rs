@@ -165,8 +165,8 @@ fn lane_header(headers: &HeaderMap) -> Result<Option<Lane>, ApiError> {
 }
 
 fn refresh_lane(admission: &Admission, metrics: &Metrics, lane: Lane) {
-    metrics.set_lane_queue(lane.clone(), admission.queue_len(lane.clone()) as i64);
-    metrics.set_lane_in_flight(lane.clone(), admission.in_flight(lane) as i64);
+    metrics.set_lane_queue(lane, admission.queue_len(lane) as i64);
+    metrics.set_lane_in_flight(lane, admission.in_flight(lane) as i64);
 }
 
 /// Refreshes a lane's gauges when dropped, so a request that leaves for any
@@ -178,7 +178,7 @@ struct LaneGauges<'a> {
 
 impl Drop for LaneGauges<'_> {
     fn drop(&mut self) {
-        refresh_lane(&self.state.admission, &self.state.metrics, self.lane.clone());
+        refresh_lane(&self.state.admission, &self.state.metrics, self.lane);
     }
 }
 
@@ -225,33 +225,32 @@ where
         *lane = chosen;
     }
     let q = input.map_err(|m| ApiError::new(ErrorCode::BadRequest, m))?;
-    let lane = lane.clone();
-    let _gauges = LaneGauges { state, lane: lane.clone() };
+    let lane = *lane;
+    let _gauges = LaneGauges { state, lane };
     let permit = {
-        let mut enter = std::pin::pin!(state.admission.enter(lane.clone()));
+        let mut enter = std::pin::pin!(state.admission.enter(lane));
         let first = std::future::poll_fn(|cx| Poll::Ready(enter.as_mut().poll(cx))).await;
         match first {
             Poll::Ready(r) => r,
             Poll::Pending => {
                 // Queued: the queue gauge counts this request while it waits.
-                refresh_lane(&state.admission, &state.metrics, lane.clone());
+                refresh_lane(&state.admission, &state.metrics, lane);
                 enter.await
             }
         }
     };
     let permit = permit.map_err(|code| {
-        state.metrics.inc_shed(lane.clone(), code.as_str());
+        state.metrics.inc_shed(lane, code.as_str());
         ApiError::new(code, format!("lane {} is full", lane.as_str()))
     })?;
-    refresh_lane(&state.admission, &state.metrics, lane.clone());
+    refresh_lane(&state.admission, &state.metrics, lane);
     // The deadline counts from arrival, so it covers the queue wait too.
-    let deadline = start + state.admission.budget(lane.clone()).deadline;
+    let deadline = start + state.admission.budget(lane).deadline;
     let view = state.view.load_full();
     let work = async {
         if blocking(&q) {
             let admission = state.admission.clone();
             let metrics = state.metrics.clone();
-            let lane = lane.clone();
             // The permit moves with the work: a read that outlives its
             // deadline still holds its slot until it finishes.
             let task = tokio::task::spawn_blocking(move || {
@@ -473,7 +472,7 @@ mod tests {
 
     async fn wait_queued(s: &ServerState, lane: Lane, n: usize) {
         let queued = async {
-            while s.admission.queue_len(lane.clone()) < n {
+            while s.admission.queue_len(lane) < n {
                 tokio::task::yield_now().await;
             }
         };
@@ -690,10 +689,10 @@ mod tests {
         assert_eq!(send(&s, req(ROOT)).await.0, StatusCode::OK);
     }
 
-    #[test]
-    fn a_timed_out_read_is_503_timeout_with_retry_after() {
-        // One blocking thread, held by the test: the request's blocking read
-        // cannot start, so it outlives its deadline whatever the machine speed.
+    /// Runs `f` on a runtime whose only blocking thread is held: a read sent
+    /// to the blocking pool cannot start and outlives its 50 ms deadline,
+    /// whatever the machine speed, while an inline read answers at once.
+    fn with_blocking_pool_held<F: Future<Output = ()>>(f: impl FnOnce(ServerState) -> F) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().max_blocking_threads(1).build().unwrap();
         rt.block_on(async {
             let (m, _) = ready_model();
@@ -706,11 +705,8 @@ mod tests {
                 let _ = hold.recv();
             });
             tokio::task::yield_now().await;
-            let wide = "/v1/deposits/by-address?shield_address=A&chain_id=1&limit=101&offset=0";
-            let r = send(&s, req(wide)).await;
-            assert_error(&r, 503, "timeout", Some("1"));
-            assert_eq!(r.2["retry_after_seconds"], 1);
-            // The read still holds its slot until it runs; free the thread.
+            f(s.clone()).await;
+            // A timed-out read still holds its slot until it runs; free the thread.
             release.send(()).unwrap();
             blocker.await.unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -720,6 +716,28 @@ mod tests {
             })
             .await
             .unwrap();
+        });
+    }
+
+    #[test]
+    fn a_timed_out_read_is_503_timeout_with_retry_after() {
+        with_blocking_pool_held(|s| async move {
+            let wide = "/v1/deposits/by-address?shield_address=A&chain_id=1&limit=101&offset=0";
+            let r = send(&s, req(wide)).await;
+            assert_error(&r, 503, "timeout", Some("1"));
+            assert_eq!(r.2["retry_after_seconds"], 1);
+        });
+    }
+
+    #[test]
+    fn deep_pages_run_off_the_async_workers() {
+        with_blocking_pool_held(|s| async move {
+            let page = |offset: u32| format!("/v1/deposits/by-address?shield_address=A&chain_id=1&limit=1&offset={offset}");
+            // offset + limit = 100 stays inline and answers.
+            let inline = send(&s, req(&page(99))).await;
+            assert_eq!((inline.0, inline.2["total"].clone()), (StatusCode::OK, Value::from(5)));
+            // offset + limit = 101 goes to the held blocking pool and times out.
+            assert_error(&send(&s, req(&page(100))).await, 503, "timeout", Some("1"));
         });
     }
 
