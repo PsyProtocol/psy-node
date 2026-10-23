@@ -181,10 +181,11 @@ impl View {
                 let indexed = self.chains_of(chain_id)?.iter().filter_map(|(_, c)| {
                     let r = c.read();
                     r.len().checked_sub(1).map(|last| r.row(last).deposit_index + 1)
-                }).max();
-                match indexed {
-                    Some(indexed) if target > indexed => Err(ReadError::CountNotIndexed { count: target, indexed }),
-                    _ => Ok(resolved),
+                }).max().unwrap_or(0);
+                if target > indexed {
+                    Err(ReadError::CountNotIndexed { count: target, indexed })
+                } else {
+                    Ok(resolved)
                 }
             }
             _ => Err(ReadError::BadRequest("give exactly one of count or target_deposit_count".to_owned())),
@@ -523,8 +524,20 @@ mod tests {
             assert_eq!(v.tree_root(&tree_root(chain_index, None, Some(5), Some(1))).map(|r| r.root), Err(not_indexed.clone()), "{chain_index}");
             assert_eq!(v.claim_proof(&proof_at_target(chain_index, 0, 5)).map(|r| r.proof), Err(not_indexed.clone()), "{chain_index}");
         }
-        // A chain_id with no deposits keeps count 0.
-        let r = v.tree_root(&tree_root(9, None, Some(5), Some(3))).unwrap();
+    }
+
+    #[test]
+    fn global_target_on_a_chain_id_without_deposits_is_count_not_indexed() {
+        let v = ready_model(&two_chain_ids()).view();
+        let not_indexed = ReadError::CountNotIndexed { count: 5, indexed: 0 };
+        assert_eq!(v.tree_root(&tree_root(9, None, Some(5), Some(3))).map(|r| r.root), Err(not_indexed.clone()));
+        assert_eq!(v.claim_proof(&ClaimProofQuery { chain_id: Some(3), ..proof_at_target(9, 0, 5) }).map(|r| r.proof), Err(not_indexed));
+    }
+
+    #[test]
+    fn global_target_zero_on_a_chain_id_without_deposits_is_served() {
+        let v = ready_model(&two_chain_ids()).view();
+        let r = v.tree_root(&tree_root(9, None, Some(0), Some(3))).unwrap();
         assert_eq!((r.chain_local_count, r.root), (0, to_display_hex(&zero(32))));
     }
 

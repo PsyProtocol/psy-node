@@ -208,7 +208,8 @@ pub struct WithdrawalClaimsResponse {
 /// `chain_id` (global, resolved through the prefix probe in the same view).
 /// A `target_deposit_count` above the highest indexed `deposit_index` + 1 over
 /// every chain index of `chain_id` is `count_not_indexed`, never a root of
-/// fewer leaves; a chain_id with no deposits resolves to count 0.
+/// fewer leaves; a chain_id with no deposits counts as 0 indexed, so a
+/// nonzero target is `count_not_indexed` and target 0 resolves to count 0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TreeRootQuery {
