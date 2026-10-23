@@ -48,6 +48,17 @@ the next database). The temp directory is removed at the end; set
 there. Each Reader check prints how long the Reader took to reach `last_count`
 after the test started waiting for it.
 
+`--hold-reader <dir>` (with `--with-reader`; the directory must exist) lets an
+external load generator attach to the running Reader. Before each reorg
+(scenarios 1, 2a, 2b, 3a, 3b, 3c) and before each Reader stop, the test writes
+`<dir>/<n>-<point>.json` and waits until `<dir>/<n>-<point>.go` exists (at most
+10 minutes). `<point>` is `reorg-scenario-1`, `reorg-deposit-<index>` or
+`reader-stop`. The JSON holds `database`, `atUnixMs`, `readerPid`, `readerUrl`,
+`tokenFile`, and `pending`: the events about to be orphaned (`kind`, `txHash`,
+`blockNumber`, `index`, `shieldAddress`, `nullifier`), so the load can include
+the tx hashes and addresses the reorg removes. The scenarios and their
+assertions are unchanged.
+
 ## What is asserted
 
 A baseline is taken once Envio has indexed fork A (scenario 1) or the initial sync

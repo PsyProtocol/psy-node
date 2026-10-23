@@ -63,6 +63,15 @@ if (readerFlag !== -1) {
   }
 }
 
+// Opt-in: --hold-reader <dir> pauses before each reorg and before a Reader is
+// stopped, so an external load generator can attach to the running Reader.
+const holdFlag = process.argv.indexOf('--hold-reader');
+const holdDir = holdFlag === -1 ? undefined : process.argv[holdFlag + 1];
+if (holdFlag !== -1 && (!readerBin || !holdDir || !fs.existsSync(holdDir) || !fs.statSync(holdDir).isDirectory())) {
+  console.error('--hold-reader needs --with-reader and an existing directory');
+  process.exit(1);
+}
+
 const ENVIO_DIR = path.join(__dirname, '../..');
 const CHAIN_ID = 31337;
 const BRIDGE = '0x00000000000000000000000000000000000b1d9e';
@@ -285,8 +294,41 @@ function codegen(depth) {
   });
 }
 
-function createDatabase() {
+// Writes <dir>/<n>-<point>.json (the Reader's address and the events about to
+// be orphaned) and waits for <dir>/<n>-<point>.go.
+const HOLD_TIMEOUT_MS = 600000;
+let holdCount = 0;
+async function holdReader(point, pending = []) {
+  if (!holdDir || !reader) return;
+  const name = `${String(++holdCount).padStart(2, '0')}-${point}`;
+  const hold = {
+    point,
+    database,
+    atUnixMs: Date.now(),
+    readerPid: reader.child.pid,
+    readerUrl: reader.base,
+    tokenFile: reader.tokenFile,
+    pending: pending.map(({ kind, event }) => ({
+      kind,
+      txHash: event.transaction.hash,
+      blockNumber: event.block.number,
+      index: event.params.index,
+      shieldAddress: event.params.shieldAddress,
+      nullifier: event.params.nullifier,
+    })),
+  };
+  fs.writeFileSync(path.join(holdDir, `${name}.json.tmp`), JSON.stringify(hold));
+  fs.renameSync(path.join(holdDir, `${name}.json.tmp`), path.join(holdDir, `${name}.json`));
+  const deadline = Date.now() + HOLD_TIMEOUT_MS;
+  while (!fs.existsSync(path.join(holdDir, `${name}.go`))) {
+    if (Date.now() > deadline) throw new Error(`hold ${name} was not released in ${HOLD_TIMEOUT_MS} ms`);
+    await sleep(100);
+  }
+}
+
+async function createDatabase() {
   const previous = reader; // the Reader follows one database; the next one gets its own
+  await holdReader('reader-stop');
   reader = undefined;
   previous?.stop();
   database = `envio_reorg_test_${process.pid}_depth_${reorgDepth}`;
@@ -391,6 +433,7 @@ async function replaceDepositBlock({
   const point = await rpc('evm_snapshot');
   const orphaned = await emitDeposit({ index, shield, amount });
   await beforeReorg(index, orphaned);
+  await holdReader(`reorg-deposit-${index}`, [orphaned]);
   const logOffset = envioLog.length;
   signalEnvio('SIGSTOP');
   try {
@@ -447,7 +490,7 @@ async function main() {
   await rpc('anvil_setCode', [BRIDGE, EMITTER_RUNTIME]);
 
   codegen(DEFAULT_REORG_DEPTH);
-  createDatabase();
+  await createDatabase();
 
   const S1 = hex32(0x51n);
   const S2 = hex32(0x52n);
@@ -482,6 +525,7 @@ async function main() {
     + `${stateA.DepositLeaf.length} leaves, history rows ${JSON.stringify(historyA)}`);
   orphan(forkA);
   const epoch1 = await readerBaseline('scenario 1 baseline');
+  await holdReader('reorg-scenario-1', forkA);
   await stopAndWait(envio);
 
   assert.equal(await rpc('evm_revert', [forkPoint]), true);
@@ -550,7 +594,7 @@ async function main() {
   // Envio checks the parent hash only while the parent is within the threshold
   // of the head the fetch saw; an older parent is skipped.
   codegen(LIVE_RELEASE_REORG_DEPTH);
-  createDatabase();
+  await createDatabase();
   envio = startEnvio({ isFreshParent: true });
   const headBefore = Number(await rpc('eth_blockNumber'));
   await waitFor('the chain to be indexed again', () => progress() >= headBefore);
@@ -625,6 +669,7 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
+    await holdReader('reader-stop').catch((error) => console.error(error.message));
     await reader?.stop();
     const keepDir = process.env.REORG_TEST_KEEP_LOGS; // opt-in: keep the Envio and Reader logs
     if (keepDir) {
