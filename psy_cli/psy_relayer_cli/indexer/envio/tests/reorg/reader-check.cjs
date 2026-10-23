@@ -5,7 +5,6 @@
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 
 const QUERIES_SQL = path.join(__dirname, '../../../../../../psy_bridge_reader_api/sql/queries.sql');
@@ -71,6 +70,8 @@ class Reader {
       },
     });
     fs.closeSync(logFd);
+    this.spawnError = undefined;
+    this.child.on('error', (error) => { this.spawnError = error; });
     this.seen = []; // raw text of every response since the last resetSeen()
   }
 
@@ -78,8 +79,17 @@ class Reader {
     try { return tail(fs.readFileSync(this.logFile, 'utf8')); } catch { return '(no log)'; }
   }
 
-  stop() {
-    if (this.child.exitCode == null && this.child.signalCode == null) this.child.kill('SIGTERM'); // this child only
+  // This child only: SIGTERM, then SIGKILL after 5 s.
+  async stop() {
+    const child = this.child;
+    if (child.exitCode != null || child.signalCode != null) return;
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    child.kill('SIGTERM');
+    await Promise.race([exited, sleep(5000)]);
+    if (child.exitCode == null && child.signalCode == null) {
+      child.kill('SIGKILL');
+      await Promise.race([exited, sleep(2000)]);
+    }
   }
 
   async call(method, route, body) {
@@ -115,6 +125,7 @@ class Reader {
     const deadline = Date.now() + SYNC_TIMEOUT_MS;
     let last = 'no answer';
     while (Date.now() < deadline) {
+      if (this.spawnError) throw new Error(`${label}: reader failed to start: ${this.spawnError.message}`);
       if (this.child.exitCode != null) {
         throw new Error(`${label}: reader exited with code ${this.child.exitCode}\n${this.logTail()}`);
       }
@@ -160,7 +171,16 @@ function assertRowsMatch(label, readerRows, sqlRows, keyOf) {
 
 // events: canonical events of the chain; expectedState: the test's replay;
 // removed: tx hashes that were on discarded forks only.
-async function verify(reader, {
+async function verify(reader, opts) {
+  try {
+    return await verifyInner(reader, opts);
+  } catch (error) {
+    error.message += `\nreader log tail:\n${reader.logTail()}`;
+    throw error;
+  }
+}
+
+async function verifyInner(reader, {
   label, chainId, chainIndex, psqlJson, events, expectedState, removed, removedNullifiers = [], epochBefore,
 }) {
   const meta = JSON.parse(psqlJson(`SELECT coalesce(json_agg(to_jsonb(t)), '[]') FROM "DepositTreeMeta" t WHERE chain_index = ${chainIndex}`))[0];
@@ -190,13 +210,15 @@ async function verify(reader, {
   const depositRows = JSON.parse(psqlJson(`SELECT coalesce(json_agg(to_jsonb(t)), '[]') FROM "Deposit" t WHERE chain_index = ${chainIndex}`));
   const shields = [...new Set(depositRows.map((r) => r.shield_address))];
   for (const shield of [...shields, '0x' + '99'.repeat(32)]) {
-    for (const offset of [0, 1]) {
-      const sqlRows = sql('deposit_list_offset_page', shield, chainIndex, chainId, offset);
-      const got = await reader.get(`/v1/deposits/by-address?shield_address=${shield}&chain_id=${chainId}&chain_index=${chainIndex}&limit=100&offset=${offset}`);
-      const total = Number(psqlJson(`SELECT count(*) FROM "Deposit" WHERE shield_address = '${shield}' AND chain_index = ${chainIndex} AND chain_id = ${chainId}`));
-      assert.equal(got.total, total, `${label}: by-address total for ${shield}`);
-      assert.deepEqual(got.rows.map((r) => r.chain_local_deposit_index), sqlRows.map((r) => Number(r.chain_local_deposit_index)), `${label}: by-address order for ${shield}`);
-      assertRowsMatch(`${label} by-address ${shield}`, got.rows, sqlRows, (r) => String(r.deposit_index));
+    const total = Number(psqlJson(`SELECT count(*) FROM "Deposit" WHERE shield_address = '${shield}' AND chain_index = ${chainIndex} AND chain_id = ${chainId}`));
+    const pages = [[100, 0], [100, 1], [100, total], [100, total + 5], [1, 0], [1, Math.max(total - 1, 0)]];
+    for (const [limit, offset] of pages) {
+      const sqlRows = sql('deposit_list_offset_page', shield, chainIndex, chainId, offset).slice(0, limit);
+      const got = await reader.get(`/v1/deposits/by-address?shield_address=${shield}&chain_id=${chainId}&chain_index=${chainIndex}&limit=${limit}&offset=${offset}`);
+      const where = `${label} by-address ${shield} limit ${limit} offset ${offset}`;
+      assert.equal(got.total, total, `${where}: total`);
+      assert.equal(got.rows.length, sqlRows.length, `${where}: row count`);
+      got.rows.forEach((row, i) => assertRowMatches(`${where} row ${i}`, row, sqlRows[i]));
     }
   }
   for (let index = 0; index <= lastCount; index++) { // one past the end must be null
@@ -208,7 +230,8 @@ async function verify(reader, {
   for (const hash of [...new Set(depositRows.map((r) => r.tx_hash)), ...removed]) {
     const sqlRows = sql('deposit_by_tx_hash', hash, chainIndex);
     const got = await reader.get(`/v1/deposits/by-tx?tx_hash=${hash}&chain_index=${chainIndex}`);
-    assertRowsMatch(`${label} by-tx ${hash}`, got.rows, sqlRows, (r) => String(r.deposit_index));
+    assert.equal(got.rows.length, sqlRows.length, `${label} by-tx ${hash}: row count`);
+    got.rows.forEach((row, i) => assertRowMatches(`${label} by-tx ${hash} row ${i}`, row, sqlRows[i])); // deposit_index desc
     if (removed.includes(hash)) assert.equal(got.rows.length, 0, `${label}: removed tx ${hash} is still served`);
   }
   for (let target = 0; target <= lastCount; target++) {
@@ -227,17 +250,15 @@ async function verify(reader, {
   assert.equal(discarded.status, 200, `${label}: withdrawal-claims (discarded) answered ${discarded.status}`);
   assert.equal(discarded.json.claims.length, 0, `${label}: a discarded claim is still served`);
 
-  // Explorer: the SQL orders by deposit_index desc within a chain_index, the
-  // Reader by (block_number desc, id desc); compare as sets, then check the
-  // Reader's own order rule.
+  // Explorer: ordered, field by field, against the query it replaces
+  // (explorer_feed_current: block_number desc, id desc, by chain_id); the set of
+  // explorer_latest_deposits (deposit_index desc within a chain_index) is a
+  // second check.
   const explorer = await reader.get(`/v1/explorer?chain_id=${chainId}`);
-  assertRowsMatch(`${label} explorer`, explorer.deposits, sql('explorer_latest_deposits', chainIndex), (r) => String(r.deposit_index));
-  for (let i = 1; i < explorer.deposits.length; i++) {
-    const a = explorer.deposits[i - 1];
-    const b = explorer.deposits[i];
-    assert.ok(a.block_number > b.block_number || (a.block_number === b.block_number && a.id > b.id),
-      `${label}: explorer order (block_number desc, id desc) broken at ${i}`);
-  }
+  const feed = sql('explorer_feed_current', chainId);
+  assert.equal(explorer.deposits.length, feed.length, `${label}: explorer deposit count`);
+  explorer.deposits.forEach((row, i) => assertRowMatches(`${label} explorer row ${i}`, row, feed[i]));
+  assertRowsMatch(`${label} explorer set`, explorer.deposits, sql('explorer_latest_deposits', chainIndex), (r) => String(r.deposit_index));
   const batchCount = Number(psqlJson(`SELECT count(*) FROM "FinalizedBatch" WHERE chain_id = ${chainId}`));
   assert.equal(explorer.batches.length, Math.min(batchCount, 100), `${label}: explorer batch count`);
 

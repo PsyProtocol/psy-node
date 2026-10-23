@@ -61,14 +61,21 @@ and 3b the test waits (30 s) for the Reader to reach `last_count` again, then ch
    `/v1/withdrawal-claims` and `/v1/explorer` equal the registered SQL
    (`deposit_list_offset_page`, `deposit_by_deposit_index`, `deposit_by_tx_hash`,
    `global_to_local_probe` plus `foreign_prefix_probe`, `withdrawal_claims_by_nullifier`,
-   `explorer_latest_deposits`) run with `psql` on the same database. The SQL text
-   is read from `psy_bridge_reader_api/sql/queries.sql` and its `$n` parameters are
-   bound as typed literals per the `-- params:` comments. Each field the SQL row
-   carries is compared as a string with the Reader's field (the SQL returns
-   `amount` and `block_timestamp` as text or numeric, the wire as number or string).
-   `/by-address` also checks `total` and the row order (`chain_local_deposit_index`);
-   `/by-index` asks one index past the end (must be `null`); `/prefix` is asked at
-   every target 0..=last_count.
+   `explorer_feed_current`, `explorer_latest_deposits`) run with `psql` on the same
+   database. The SQL text is read from `psy_bridge_reader_api/sql/queries.sql` and
+   its `$n` parameters are bound as typed literals per the `-- params:` comments.
+   Each field the SQL row carries is compared as a string with the Reader's field.
+   - `/by-address`: per shield address (and one unknown address), pages
+     (limit, offset) = (100, 0), (100, 1), (100, total), (100, total+5), (1, 0),
+     (1, total-1), each compared ordered, row by row, with the SQL page
+     (`deposit_list_offset_page` is `LIMIT 100`; a limit-1 page is its first row),
+     plus `total`.
+   - `/by-index`: every index, plus one past the end (must be `null`).
+   - `/by-tx`: ordered (`deposit_index` desc) against `deposit_by_tx_hash`. Known
+     coverage gap: every scenario puts one deposit in each transaction, so the
+     multi-row order of a shared transaction is not exercised here.
+   - `/prefix`: every target 0..=last_count.
+   - `/explorer`: see below.
 4. Across a reorg `revision.epoch` is greater than the baseline (scenarios 1, 2b
    and 3a, where Envio rolls back; 3b needs no rollback and checks no epoch).
 5. After the rollback no response served in the final state contains a discarded
@@ -78,12 +85,12 @@ and 3b the test waits (30 s) for the Reader to reach `last_count` again, then ch
 
 ### Explorer ordering
 
-The SQL `explorer_latest_deposits` orders by `deposit_index` desc within one
-`chain_index`; the Reader's explorer orders by `(block_number desc, id desc)`
-(the current Services feed, filtered by `chain_id`). The test therefore compares
-the two deposit lists as sets keyed by `deposit_index`, and separately checks the
-Reader's own order rule on its list. The batch list is checked by count
-(`FinalizedBatch` is empty in this test).
+The Reader's explorer deposits are compared ordered, field by field, against the
+query they replace, `explorer_feed_current` (`ORDER BY block_number DESC, id DESC
+LIMIT 100`, bound by `chain_id`); the SQL defines the tie order. As a second check
+the same rows are compared as a set against `explorer_latest_deposits`
+(`deposit_index` desc within a `chain_index`, a different order). The batch list is
+checked by count (`FinalizedBatch` is empty in this test).
 
 ## Acceptance coverage
 

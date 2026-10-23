@@ -286,8 +286,9 @@ function codegen(depth) {
 }
 
 function createDatabase() {
-  reader?.stop(); // the Reader follows one database; the next one gets its own
+  const previous = reader; // the Reader follows one database; the next one gets its own
   reader = undefined;
+  previous?.stop();
   database = `envio_reorg_test_${process.pid}_depth_${reorgDepth}`;
   psql(`CREATE DATABASE "${database}"`, 'postgres');
   createdDatabases.push(database);
@@ -528,8 +529,8 @@ async function main() {
   await stopAndWait(envio);
 
   // ── Scenario 2b: live reorg with the fresh reorg parent enabled ─────────
+  const epoch2 = await readerBaseline('scenario 2 baseline'); // Reader caught up, Envio stopped
   envio = startEnvio({ isFreshParent: true });
-  const epoch2 = readerBin ? await reader.epoch() : undefined;
   const patched = await replaceDepositBlock({ index: 4, shield: S2, amount: 104n, blocksAfter: 2 });
   const patchedOutcome = await waitForReorgOutcome({ index: 4, ...patched });
   console.log(`scenario 2b (${FRESH_PARENT_ENV}=1, threshold ${DEFAULT_REORG_DEPTH}): `
@@ -621,7 +622,8 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    reader?.stop();
+    await reader?.stop();
+    if (readerDir) fs.rmSync(readerDir, { recursive: true, force: true }); // holds the token file
     stop(envio);
     stop(anvil);
     await sleep(1500);
