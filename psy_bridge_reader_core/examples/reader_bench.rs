@@ -452,40 +452,39 @@ struct HostLimits {
 struct HostReport {
     reader_pid: u32,
     reader_cpus: String,
-    is_reader_unpinned: bool,
+    /// `null` when the online CPU list was unreadable.
+    is_reader_unpinned: Option<bool>,
     sibling_cpus: String,
-    is_sibling_topology_readable: bool,
+    /// Parts of the host check that could not run, with the read error.
+    host_check_degradations: Vec<String>,
     max_foreign_cores_allowed: f64,
     max_sibling_cores_allowed: f64,
     samples: usize,
     samples_expected: u64,
     sampler_error: Option<String>,
-    max_foreign_cpu_cores: f64,
+    /// The maxima and the mean are `null` when no second was sampled.
+    max_foreign_cpu_cores: Option<f64>,
     max_reader_runq_wait: Option<f64>,
-    max_sibling_busy_cores: f64,
-    mean_reader_cpu_cores: f64,
+    max_sibling_busy_cores: Option<f64>,
+    mean_reader_cpu_cores: Option<f64>,
     per_second: Vec<HostSecond>,
 }
 
 impl HostReport {
     fn invalid_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
-        if (self.samples as u64) < self.samples_expected.saturating_sub(1) {
-            let why = self.sampler_error.as_deref().map(|e| format!(": {e}")).unwrap_or_default();
-            reasons.push(format!("host samples missing ({}/{}){why}", self.samples, self.samples_expected));
+        let missing = format!("host samples missing ({}/{})", self.samples, self.samples_expected);
+        match &self.sampler_error {
+            Some(e) => reasons.push(format!("{missing}: {e}")),
+            None if (self.samples as u64) < self.samples_expected.saturating_sub(1).max(1) => reasons.push(missing),
+            None => {}
         }
-        if self.max_foreign_cpu_cores > self.max_foreign_cores_allowed {
-            let unpinned = if self.is_reader_unpinned { " (the Reader is not pinned: its allowed CPUs are every online CPU)" } else { "" };
-            reasons.push(format!(
-                "other processes used up to {:.2} cores of the Reader's CPUs (limit {:.2}){unpinned}",
-                self.max_foreign_cpu_cores, self.max_foreign_cores_allowed
-            ));
+        if let Some(max) = self.max_foreign_cpu_cores.filter(|m| *m > self.max_foreign_cores_allowed) {
+            let unpinned = if self.is_reader_unpinned == Some(true) { " (the Reader is not pinned: its allowed CPUs are every online CPU)" } else { "" };
+            reasons.push(format!("other processes used up to {max:.2} cores of the Reader's CPUs (limit {:.2}){unpinned}", self.max_foreign_cores_allowed));
         }
-        if self.max_sibling_busy_cores > self.max_sibling_cores_allowed {
-            reasons.push(format!(
-                "the SMT siblings of the Reader's CPUs were busy up to {:.2} cores (limit {:.2})",
-                self.max_sibling_busy_cores, self.max_sibling_cores_allowed
-            ));
+        if let Some(max) = self.max_sibling_busy_cores.filter(|m| *m > self.max_sibling_cores_allowed) {
+            reasons.push(format!("the SMT siblings of the Reader's CPUs were busy up to {max:.2} cores (limit {:.2})", self.max_sibling_cores_allowed));
         }
         reasons
     }
@@ -551,24 +550,32 @@ fn read_runq_wait_ns(pid: u32) -> Option<u64> {
 struct HostProbe {
     pid: u32,
     cpus: Vec<usize>,
-    is_reader_unpinned: bool,
+    is_reader_unpinned: Option<bool>,
     siblings: Vec<usize>,
-    is_sibling_topology_readable: bool,
+    host_check_degradations: Vec<String>,
 }
 
 impl HostProbe {
     fn new(pid: u32) -> Result<HostProbe, String> {
         let cpus = allowed_cpus(&pid.to_string())?;
-        let online = std::fs::read_to_string("/sys/devices/system/cpu/online").map_err(|e| format!("/sys/devices/system/cpu/online: {e}"))?;
-        let is_reader_unpinned = parse_cpulist(&online)? == cpus;
-        let (siblings, is_sibling_topology_readable) = match smt_siblings(&cpus) {
-            Ok(s) => (s, true),
+        let mut host_check_degradations = Vec::new();
+        let online_path = "/sys/devices/system/cpu/online";
+        let online = std::fs::read_to_string(online_path).map_err(|e| format!("{online_path}: {e}")).and_then(|l| parse_cpulist(&l));
+        let is_reader_unpinned = match online {
+            Ok(online) => Some(online == cpus),
             Err(e) => {
-                eprintln!("warning: SMT topology is unreadable ({e}); sibling load is not checked");
-                (Vec::new(), false)
+                host_check_degradations.push(format!("online CPU list unreadable ({e}); whether the Reader is pinned is unknown"));
+                None
             }
         };
-        Ok(HostProbe { pid, cpus, is_reader_unpinned, siblings, is_sibling_topology_readable })
+        let siblings = smt_siblings(&cpus).unwrap_or_else(|e| {
+            host_check_degradations.push(format!("SMT topology unreadable ({e}); sibling load is not checked"));
+            Vec::new()
+        });
+        for d in &host_check_degradations {
+            eprintln!("warning: host check degraded: {d}");
+        }
+        Ok(HostProbe { pid, cpus, is_reader_unpinned, siblings, host_check_degradations })
     }
 
     fn snap(&self) -> Result<HostSnap, String> {
@@ -631,24 +638,25 @@ impl HostProbe {
 
     fn report(&self, sampled: std::thread::Result<(Vec<HostSecond>, Option<String>)>, samples_expected: u64, limits: HostLimits) -> HostReport {
         let (per_second, sampler_error) = sampled.unwrap_or_else(|_| (Vec::new(), Some("the host sampler thread panicked".to_owned())));
-        let max = |f: fn(&HostSecond) -> f64| per_second.iter().map(f).fold(0.0, f64::max);
+        let max = |f: fn(&HostSecond) -> f64| per_second.iter().map(f).reduce(f64::max);
         let runq: Option<Vec<f64>> = per_second.iter().map(|s| s.reader_runq_wait).collect();
+        let reader_cpu_sum = per_second.iter().map(|s| s.reader_cpu_cores).reduce(|a, b| a + b);
         let fmt = |cs: &[usize]| cs.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
         HostReport {
             reader_pid: self.pid,
             reader_cpus: fmt(&self.cpus),
             is_reader_unpinned: self.is_reader_unpinned,
             sibling_cpus: fmt(&self.siblings),
-            is_sibling_topology_readable: self.is_sibling_topology_readable,
+            host_check_degradations: self.host_check_degradations.clone(),
             max_foreign_cores_allowed: limits.max_foreign_cores,
             max_sibling_cores_allowed: limits.max_sibling_cores,
             samples: per_second.len(),
             samples_expected,
             sampler_error,
             max_foreign_cpu_cores: max(|s| s.foreign_cpu_cores),
-            max_reader_runq_wait: runq.map(|v| v.into_iter().fold(0.0, f64::max)),
+            max_reader_runq_wait: runq.and_then(|v| v.into_iter().reduce(f64::max)),
             max_sibling_busy_cores: max(|s| s.sibling_busy_cores),
-            mean_reader_cpu_cores: per_second.iter().map(|s| s.reader_cpu_cores).sum::<f64>() / per_second.len().max(1) as f64,
+            mean_reader_cpu_cores: reader_cpu_sum.map(|sum| sum / per_second.len() as f64),
             per_second,
         }
     }
@@ -1161,7 +1169,7 @@ mod tests {
     const LIMITS: HostLimits = HostLimits { max_foreign_cores: 0.5, max_sibling_cores: 1.0 };
 
     fn probe() -> HostProbe {
-        HostProbe { pid: 1, cpus: vec![26, 27], is_reader_unpinned: false, siblings: vec![10, 11], is_sibling_topology_readable: true }
+        HostProbe { pid: 1, cpus: vec![26, 27], is_reader_unpinned: Some(false), siblings: vec![10, 11], host_check_degradations: vec![] }
     }
 
     fn snap(reader_ticks: u64, runq_wait_ns: Option<u64>, cpu_busy: u64, sibling_busy: u64, other_ticks: u64) -> HostSnap {
@@ -1229,6 +1237,40 @@ mod tests {
         assert_eq!(r.invalid_reasons, vec!["host samples missing (0/30): the host sampler thread panicked".to_owned()]);
         let read_failed = probe().report(Ok((vec![], Some("/proc/1/stat: gone".to_owned()))), 2, LIMITS);
         assert_eq!(read_failed.invalid_reasons(), vec!["host samples missing (0/2): /proc/1/stat: gone".to_owned()]);
+        // A read error invalidates even when the count is within tolerance.
+        let late_error = probe().report(Ok((vec![quiet(); 30], Some("/proc/1/stat: gone".to_owned()))), 30, LIMITS);
+        assert_eq!(late_error.invalid_reasons(), vec!["host samples missing (30/30): /proc/1/stat: gone".to_owned()]);
+    }
+
+    #[test]
+    fn a_one_second_step_without_host_samples_is_invalid() {
+        let quiet = host_second(0, &zero(), &snap(1000, Some(0), 0, 0, 0), 1.0, LIMITS);
+        let panicked = probe().report(Err(Box::new("boom")), 1, LIMITS);
+        assert_eq!(panicked.invalid_reasons(), vec!["host samples missing (0/1): the host sampler thread panicked".to_owned()]);
+        let read_failed = probe().report(Ok((vec![], Some("/proc/1/stat: gone".to_owned()))), 1, LIMITS);
+        assert_eq!(read_failed.invalid_reasons(), vec!["host samples missing (0/1): /proc/1/stat: gone".to_owned()]);
+        let empty = probe().report(Ok((vec![], None)), 1, LIMITS);
+        assert_eq!(empty.invalid_reasons(), vec!["host samples missing (0/1)".to_owned()]);
+        let maxima = (empty.max_foreign_cpu_cores, empty.max_reader_runq_wait, empty.max_sibling_busy_cores, empty.mean_reader_cpu_cores);
+        assert_eq!(maxima, (None, None, None, None), "no sample is not a zero reading");
+        let json = serde_json::to_value(&empty).unwrap();
+        assert!(json["max_foreign_cpu_cores"].is_null() && json["max_reader_runq_wait"].is_null());
+        let one = probe().report(Ok((vec![quiet], None)), 1, LIMITS);
+        assert!(one.invalid_reasons().is_empty());
+        assert_eq!((one.max_foreign_cpu_cores, one.max_reader_runq_wait), (Some(0.0), Some(0.0)));
+    }
+
+    #[test]
+    fn host_check_degradations_are_recorded_in_the_step() {
+        let mut p = probe();
+        p.is_reader_unpinned = None;
+        p.host_check_degradations = vec!["online CPU list unreadable (gone); whether the Reader is pinned is unknown".to_owned()];
+        let s = host_second(0, &zero(), &snap(1000, Some(0), 100, 0, 0), 1.0, LIMITS);
+        let r = p.report(Ok((vec![s], None)), 1, LIMITS);
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json["is_reader_unpinned"].is_null());
+        assert_eq!(json["host_check_degradations"][0], "online CPU list unreadable (gone); whether the Reader is pinned is unknown");
+        assert_eq!(r.invalid_reasons(), vec!["other processes used up to 2.00 cores of the Reader's CPUs (limit 0.50)".to_owned()]);
     }
 
     #[test]
@@ -1253,7 +1295,7 @@ mod tests {
     #[test]
     fn an_unpinned_reader_is_named_in_the_reason() {
         let mut p = probe();
-        p.is_reader_unpinned = true;
+        p.is_reader_unpinned = Some(true);
         let s = host_second(0, &zero(), &snap(1000, Some(0), 100, 0, 0), 1.0, LIMITS);
         assert!(p.report(Ok((vec![s], None)), 1, LIMITS).invalid_reasons()[0].ends_with("(the Reader is not pinned: its allowed CPUs are every online CPU)"));
     }

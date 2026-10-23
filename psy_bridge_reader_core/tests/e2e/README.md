@@ -157,14 +157,18 @@ cargo run --release -p psy_bridge_reader_core --example reader_bench -- \
   - sibling load exceeded `--max-sibling-cores` (default 1.0) in any second:
     the Reader's physical cores were shared, which slowed its CPU-bound
     work (claim proofs cost about 45% more with busy siblings);
-  - fewer than `step_secs - 1` host samples were taken ("host samples
-    missing (n/expected)"), for example when the Reader's `/proc` entry
-    could not be read or the sampler thread panicked.
+  - host samples are missing ("host samples missing (n/expected)"): always
+    when the sampler thread panicked or a read of the Reader's `/proc`
+    entry failed (the error is appended), and otherwise when fewer than
+    `max(1, step_secs - 1)` seconds were sampled. With no sample, the
+    `max_*` and `mean_*` fields are `null`, not 0.
   An unpinned process on a shared host can stall the Reader's lanes (first
   the 4-slot `claim_proof` lane), and such a step must not be read as a
   Reader result. The bench warns when its own CPUs include the Reader's CPUs
-  or their siblings, and when the SMT topology cannot be read (then sibling
-  load is not checked).
+  or their siblings. When the online CPU list or the SMT topology cannot be
+  read, it warns and the step records the gap under
+  `host.host_check_degradations` (`is_reader_unpinned` is then `null`, or
+  `sibling_cpus` is empty and sibling load is not checked).
 - Mix `A4` (by request count): 70% `by-address`, 10% `by-tx`, 10%
   `withdrawal-claims` (10 nullifiers), 5% `tree/root`, 5% `tree/proof`; or
   `--mix by_address=70,by_tx=10,claims=10,root=5,proof=5`. `by-address` limits
