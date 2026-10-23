@@ -2,6 +2,7 @@
 //! encoding Envio stores, bit-exact with the Envio `DepositRecorded` handler.
 
 pub mod admission;
+pub mod follow;
 pub mod metrics;
 pub mod model;
 pub mod server;

@@ -144,6 +144,12 @@ impl Metrics {
         self.window_rows.with_label_values(&[&chain_index.to_string()]).set(rows);
     }
 
+    /// Drops every `chain_id` and `chain_index` series, after a full reset.
+    pub fn clear_chain_gauges(&self) {
+        self.follow_lag_blocks.reset();
+        self.window_rows.reset();
+    }
+
     pub fn inc_reorgs(&self) {
         self.reorgs_total.inc();
     }
@@ -274,6 +280,19 @@ mod tests {
             let full = format!("psy_bridge_reader_{name}");
             assert!(text.contains(&full), "missing {full}");
         }
+    }
+
+    #[test]
+    fn clear_chain_gauges_drops_every_chain_series() {
+        let m = Metrics::new(1);
+        m.set_follow_lag_blocks(1, 2);
+        m.set_window_rows(3, 4);
+        m.clear_chain_gauges();
+        let text = m.render();
+        assert!(!text.contains("chain_id=\"1\""), "{text}");
+        assert!(!text.contains("chain_index=\"3\""), "{text}");
+        m.set_window_rows(5, 6);
+        assert_eq!(value_of(&m.render(), "psy_bridge_reader_window_rows{chain_index=\"5\"} "), Some(6.0));
     }
 
     #[test]
