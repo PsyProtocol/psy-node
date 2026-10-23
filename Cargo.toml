@@ -238,6 +238,7 @@ redis = { version = "0.30.0", default-features = false, features = [
 ] }
 bb8-redis = "0.22.0"
 bb8 = "0.9"
+tokio-postgres = "0.7"
 fred = "10.0.4"
 rsmq = { git = "https://github.com/PsyRepoForks/rsmq-async-rs", package = "rsmq_async", features = ["break-js-comp", "sync", "tokio"] }
 tikv-client = { git = "https://github.com/PsyProtocol/client-rust", rev = "3fe2b9d8482657a3442473084b365c9b9d9cf5eb" }

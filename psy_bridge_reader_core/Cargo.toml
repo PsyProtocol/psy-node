@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 serde_json = { workspace = true, optional = true }
 psy_bridge_reader_api = { workspace = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -3,6 +3,7 @@
 
 pub mod admission;
 pub mod model;
+pub mod source;
 pub mod tree;
 
 #[cfg(any(test, feature = "test-support"))]
