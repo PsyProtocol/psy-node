@@ -249,6 +249,7 @@ PARTH is a forest. Do not invent a second name for a tree that already has one.
 | `psy_user_cli` | Wallet, contract, tree, bridge, and private-note CLI. |
 | `psy_relayer_cli` | Bridge relayer. |
 | `psy_bridge_reader_api` | Contract shared by psy-bridge-reader and psy-services: wire types and registered Envio SQL. |
+| `psy_bridge_reader_core` | Bridge Reader core: in-memory read model, Poseidon deposit tree, Envio follow loop and admission lanes. |
 | `psy_dev_cli` | Operator CLI, including rollback. |
 | Prove proxy | `psy_user_cli prove-proxy`. Groth16 helper for withdrawal claims. |
 | ScyllaDB | Primary committed state backend. |

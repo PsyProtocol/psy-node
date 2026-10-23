@@ -31,6 +31,7 @@ members = [
 "psy_bridge_reader_api",
     "psy_cli/guardian_common",
     "psy_jtmb_testing_core",
+    "psy_bridge_reader_core",
 
     # ---- Client/Prover crates ----
     "client_prover/psy_core/kvq",
