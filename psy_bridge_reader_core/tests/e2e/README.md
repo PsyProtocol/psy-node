@@ -136,16 +136,35 @@ cargo run --release -p psy_bridge_reader_core --example reader_bench -- \
   (`/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`; on a
   16-core/32-thread host CPU `n` and `n+16` share a core, so a Reader on 26-29
   shares cores with 10-13).
-- `--reader-pid <pid>` (Reader on the same host): every second of a step
-  records under `host.per_second` the Reader's CPU, its threads' run-queue
-  wait (`schedstat`), `foreign_cpu_cores` (busy cores on the Reader's allowed
-  CPUs that the Reader did not use) and `sibling_busy_cores` (load on the SMT
-  siblings of those CPUs). A step where another process used more than
-  `--max-foreign-cores` (default 0.5) of the Reader's CPUs in any second is
-  invalid: an unpinned process on a shared host can stall the Reader's lanes
-  (first the 4-slot `claim_proof` lane) and must not be read as a Reader
-  result. The bench warns when its own CPUs include the Reader's CPUs or
-  their siblings.
+- Host check. Without `--reader-pid` the bench warns on stderr and every
+  step carries `"host_check": "not performed"`: contention on the Reader's
+  CPUs is then not checked, and a stall caused by another process cannot be
+  told apart from a Reader result. With `--reader-pid <pid>` (Reader on the
+  same host) each step carries `"host_check": "performed"` and `host`, with
+  one entry per second of the send window under `host.per_second`:
+  `reader_cpu_cores`; `reader_runq_wait` (seconds per second the Reader's
+  threads were runnable but not running, from `schedstat`; `null` when
+  unreadable); `foreign_cpu_cores`, an estimate: busy time of the Reader's
+  allowed CPUs (irq, softirq and steal included) minus the Reader's own CPU
+  time; `sibling_busy_cores`, load from any process on the SMT siblings of
+  those CPUs; and, in a second over either limit, `top_other_process` (pid,
+  comm, cores): the busiest process on the whole host other than the Reader
+  and the bench, from one `/proc/*/stat` scan per second (host-wide, not
+  per CPU). The step is invalid when:
+  - foreign load exceeded `--max-foreign-cores` (default 0.5) in any second:
+    another process took CPU time on the Reader's own CPUs. The reason notes
+    when the Reader is not pinned (its allowed CPUs are every online CPU);
+  - sibling load exceeded `--max-sibling-cores` (default 1.0) in any second:
+    the Reader's physical cores were shared, which slowed its CPU-bound
+    work (claim proofs cost about 45% more with busy siblings);
+  - fewer than `step_secs - 1` host samples were taken ("host samples
+    missing (n/expected)"), for example when the Reader's `/proc` entry
+    could not be read or the sampler thread panicked.
+  An unpinned process on a shared host can stall the Reader's lanes (first
+  the 4-slot `claim_proof` lane), and such a step must not be read as a
+  Reader result. The bench warns when its own CPUs include the Reader's CPUs
+  or their siblings, and when the SMT topology cannot be read (then sibling
+  load is not checked).
 - Mix `A4` (by request count): 70% `by-address`, 10% `by-tx`, 10%
   `withdrawal-claims` (10 nullifiers), 5% `tree/root`, 5% `tree/proof`; or
   `--mix by_address=70,by_tx=10,claims=10,root=5,proof=5`. `by-address` limits

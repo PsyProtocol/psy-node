@@ -79,6 +79,10 @@ struct Args {
     /// this many cores of the Reader's CPUs in any second is invalid.
     #[arg(long, default_value_t = 0.5)]
     max_foreign_cores: f64,
+    /// With `--reader-pid`, a step in which the SMT siblings of the Reader's
+    /// CPUs were busier than this many cores in any second is invalid.
+    #[arg(long, default_value_t = 1.0)]
+    max_sibling_cores: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -258,6 +262,9 @@ struct StepReport {
     send_lag: Pct,
     /// Scheduler emit time minus due time (before the request task starts).
     emit_lag: Pct,
+    /// `performed` with `--reader-pid`, else `not performed`: without it
+    /// host contention is not checked.
+    host_check: &'static str,
     /// With `--reader-pid`: load on and around the Reader's CPUs.
     host: Option<HostReport>,
     valid: bool,
@@ -312,12 +319,7 @@ fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, p
     if let Some(c) = st.errors.get("cap") {
         reasons.push(format!("{c} requests hit the concurrency cap"));
     }
-    if let Some(h) = host.as_ref().filter(|h| h.max_foreign_cpu_cores > h.max_foreign_cores_allowed) {
-        reasons.push(format!(
-            "other processes used up to {:.2} cores of the Reader's CPUs (limit {:.2})",
-            h.max_foreign_cpu_cores, h.max_foreign_cores_allowed
-        ));
-    }
+    reasons.extend(host.iter().flat_map(HostReport::invalid_reasons));
     let secs = window.as_secs_f64().max(1e-9);
     StepReport {
         rate,
@@ -336,6 +338,7 @@ fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, p
         generator_cpu_cores: cpu_seconds / secs,
         send_lag,
         emit_lag,
+        host_check: if host.is_some() { "performed" } else { "not performed" },
         host,
         valid: reasons.is_empty(),
         invalid_reasons: reasons,
@@ -384,18 +387,18 @@ fn allowed_cpus(pid: &str) -> Result<Vec<usize>, String> {
     parse_cpulist(line)
 }
 
-/// SMT siblings of `cpus` that are not in `cpus` themselves.
-fn smt_siblings(cpus: &[usize]) -> Vec<usize> {
-    let mut out: Vec<usize> = cpus
-        .iter()
-        .filter_map(|c| std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")).ok())
-        .filter_map(|s| parse_cpulist(&s).ok())
-        .flatten()
-        .filter(|s| !cpus.contains(s))
-        .collect();
+/// SMT siblings of `cpus` that are not in `cpus` themselves, or the first
+/// CPU whose sysfs topology could not be read.
+fn smt_siblings(cpus: &[usize]) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for c in cpus {
+        let path = format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list");
+        let list = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+        out.extend(parse_cpulist(&list)?.into_iter().filter(|s| !cpus.contains(s)));
+    }
     out.sort_unstable();
     out.dedup();
-    out
+    Ok(out)
 }
 
 /// Cumulative counters read at one instant.
@@ -403,11 +406,22 @@ fn smt_siblings(cpus: &[usize]) -> Vec<usize> {
 struct HostSnap {
     /// utime + stime of the Reader, in clock ticks.
     reader_ticks: u64,
-    /// Sum of the Reader threads' run-queue wait (`schedstat` field 2), in ns.
-    runq_wait_ns: u64,
+    /// Sum of the Reader threads' run-queue wait (`schedstat` field 2), in ns;
+    /// `None` when a thread's `schedstat` could not be read.
+    runq_wait_ns: Option<u64>,
     /// (busy, total) jiffies of each of the Reader's CPUs, then of each sibling.
     cpus: Vec<(u64, u64)>,
     siblings: Vec<(u64, u64)>,
+    /// utime + stime per other process on the host, with its command name.
+    processes: BTreeMap<u32, (String, u64)>,
+}
+
+/// The process outside the Reader and this bench with the most CPU in a second.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+struct TopProcess {
+    pid: u32,
+    comm: String,
+    cpu_cores: f64,
 }
 
 /// One second of host load around the Reader.
@@ -415,67 +429,156 @@ struct HostSnap {
 struct HostSecond {
     second: usize,
     reader_cpu_cores: f64,
-    /// Seconds per second that Reader threads were runnable but not running.
-    reader_runq_wait: f64,
-    /// Busy cores on the Reader's CPUs that the Reader did not use.
+    /// Seconds per second that Reader threads were runnable but not running;
+    /// `null` when `schedstat` was unreadable.
+    reader_runq_wait: Option<f64>,
+    /// Estimate: busy time of the Reader's allowed CPUs (irq, softirq and
+    /// steal included) minus the Reader's own CPU time.
     foreign_cpu_cores: f64,
     /// Busy cores on the SMT siblings of the Reader's CPUs (any process,
     /// including this bench if it runs there).
     sibling_busy_cores: f64,
+    /// Host-wide top other process, recorded only in a second over a limit.
+    top_other_process: Option<TopProcess>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HostLimits {
+    max_foreign_cores: f64,
+    max_sibling_cores: f64,
+}
+
+#[derive(Serialize, Debug)]
 struct HostReport {
     reader_pid: u32,
     reader_cpus: String,
+    is_reader_unpinned: bool,
     sibling_cpus: String,
+    is_sibling_topology_readable: bool,
     max_foreign_cores_allowed: f64,
+    max_sibling_cores_allowed: f64,
+    samples: usize,
+    samples_expected: u64,
+    sampler_error: Option<String>,
     max_foreign_cpu_cores: f64,
-    max_reader_runq_wait: f64,
+    max_reader_runq_wait: Option<f64>,
     max_sibling_busy_cores: f64,
     mean_reader_cpu_cores: f64,
     per_second: Vec<HostSecond>,
+}
+
+impl HostReport {
+    fn invalid_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if (self.samples as u64) < self.samples_expected.saturating_sub(1) {
+            let why = self.sampler_error.as_deref().map(|e| format!(": {e}")).unwrap_or_default();
+            reasons.push(format!("host samples missing ({}/{}){why}", self.samples, self.samples_expected));
+        }
+        if self.max_foreign_cpu_cores > self.max_foreign_cores_allowed {
+            let unpinned = if self.is_reader_unpinned { " (the Reader is not pinned: its allowed CPUs are every online CPU)" } else { "" };
+            reasons.push(format!(
+                "other processes used up to {:.2} cores of the Reader's CPUs (limit {:.2}){unpinned}",
+                self.max_foreign_cpu_cores, self.max_foreign_cores_allowed
+            ));
+        }
+        if self.max_sibling_busy_cores > self.max_sibling_cores_allowed {
+            reasons.push(format!(
+                "the SMT siblings of the Reader's CPUs were busy up to {:.2} cores (limit {:.2})",
+                self.max_sibling_busy_cores, self.max_sibling_cores_allowed
+            ));
+        }
+        reasons
+    }
 }
 
 fn busy_cores(a: &[(u64, u64)], b: &[(u64, u64)]) -> f64 {
     a.iter().zip(b).map(|(x, y)| y.0.saturating_sub(x.0) as f64 / (y.1.saturating_sub(x.1).max(1)) as f64).sum()
 }
 
-fn host_second(second: usize, a: &HostSnap, b: &HostSnap, secs: f64) -> HostSecond {
+fn top_other_process(a: &HostSnap, b: &HostSnap, secs: f64) -> Option<TopProcess> {
+    b.processes
+        .iter()
+        .filter_map(|(pid, (comm, ticks))| a.processes.get(pid).map(|(_, before)| (*pid, comm, ticks.saturating_sub(*before))))
+        .max_by_key(|(_, _, delta)| *delta)
+        .map(|(pid, comm, delta)| TopProcess { pid, comm: comm.clone(), cpu_cores: delta as f64 / clock_ticks_per_sec() / secs })
+}
+
+fn host_second(second: usize, a: &HostSnap, b: &HostSnap, secs: f64, limits: HostLimits) -> HostSecond {
     let reader = b.reader_ticks.saturating_sub(a.reader_ticks) as f64 / clock_ticks_per_sec() / secs;
+    let foreign = (busy_cores(&a.cpus, &b.cpus) - reader).max(0.0);
+    let sibling = busy_cores(&a.siblings, &b.siblings);
+    let is_contended = foreign > limits.max_foreign_cores || sibling > limits.max_sibling_cores;
     HostSecond {
         second,
         reader_cpu_cores: reader,
-        reader_runq_wait: b.runq_wait_ns.saturating_sub(a.runq_wait_ns) as f64 / 1e9 / secs,
-        foreign_cpu_cores: (busy_cores(&a.cpus, &b.cpus) - reader).max(0.0),
-        sibling_busy_cores: busy_cores(&a.siblings, &b.siblings),
+        reader_runq_wait: a.runq_wait_ns.zip(b.runq_wait_ns).map(|(x, y)| y.saturating_sub(x) as f64 / 1e9 / secs),
+        foreign_cpu_cores: foreign,
+        sibling_busy_cores: sibling,
+        top_other_process: if is_contended { top_other_process(a, b, secs) } else { None },
     }
+}
+
+/// utime + stime and command name of every process except `skip`.
+fn read_processes(skip: &[u32]) -> BTreeMap<u32, (String, u64)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else { return BTreeMap::new() };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| !skip.contains(pid))
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (head, rest) = stat.rsplit_once(')')?;
+            let comm = head.split_once('(')?.1.to_owned();
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            Some((pid, (comm, f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)))
+        })
+        .collect()
+}
+
+/// Sum of `schedstat` run-queue wait over the threads of `pid`; `None` if a
+/// live thread's `schedstat` is unreadable. A thread that exits mid-scan is skipped.
+fn read_runq_wait_ns(pid: u32) -> Option<u64> {
+    let mut total = 0u64;
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()?.flatten() {
+        match std::fs::read_to_string(task.path().join("schedstat")) {
+            Ok(s) => total += s.split_whitespace().nth(1)?.parse::<u64>().ok()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(total)
 }
 
 struct HostProbe {
     pid: u32,
     cpus: Vec<usize>,
+    is_reader_unpinned: bool,
     siblings: Vec<usize>,
+    is_sibling_topology_readable: bool,
 }
 
 impl HostProbe {
     fn new(pid: u32) -> Result<HostProbe, String> {
         let cpus = allowed_cpus(&pid.to_string())?;
-        let siblings = smt_siblings(&cpus);
-        Ok(HostProbe { pid, cpus, siblings })
+        let online = std::fs::read_to_string("/sys/devices/system/cpu/online").map_err(|e| format!("/sys/devices/system/cpu/online: {e}"))?;
+        let is_reader_unpinned = parse_cpulist(&online)? == cpus;
+        let (siblings, is_sibling_topology_readable) = match smt_siblings(&cpus) {
+            Ok(s) => (s, true),
+            Err(e) => {
+                eprintln!("warning: SMT topology is unreadable ({e}); sibling load is not checked");
+                (Vec::new(), false)
+            }
+        };
+        Ok(HostProbe { pid, cpus, is_reader_unpinned, siblings, is_sibling_topology_readable })
     }
 
-    fn snap(&self) -> Option<HostSnap> {
-        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
-        let f: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-        let reader_ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
-        let mut runq_wait_ns = 0;
-        for task in std::fs::read_dir(format!("/proc/{}/task", self.pid)).ok()?.flatten() {
-            let s = std::fs::read_to_string(task.path().join("schedstat")).unwrap_or_default();
-            runq_wait_ns += s.split_whitespace().nth(1).and_then(|w| w.parse::<u64>().ok()).unwrap_or(0);
-        }
+    fn snap(&self) -> Result<HostSnap, String> {
+        let path = format!("/proc/{}/stat", self.pid);
+        let stat = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+        let f: Vec<&str> = stat.rsplit_once(')').ok_or_else(|| format!("{path}: no ')'"))?.1.split_whitespace().collect();
+        let ticks = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).ok_or_else(|| format!("{path}: field {i} unreadable"));
+        let reader_ticks = ticks(11)? + ticks(12)?;
         let mut per_cpu = BTreeMap::new();
-        for line in std::fs::read_to_string("/proc/stat").ok()?.lines() {
+        for line in std::fs::read_to_string("/proc/stat").map_err(|e| format!("/proc/stat: {e}"))?.lines() {
             let mut it = line.split_whitespace();
             let Some(cpu) = it.next().and_then(|n| n.strip_prefix("cpu")).and_then(|n| n.parse::<usize>().ok()) else { continue };
             // user nice system idle iowait irq softirq steal; guest time is already in user/nice.
@@ -484,39 +587,66 @@ impl HostProbe {
             let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
             per_cpu.insert(cpu, (total - idle, total));
         }
-        let pick = |cs: &[usize]| cs.iter().map(|c| per_cpu.get(c).copied().unwrap_or_default()).collect();
-        Some(HostSnap { reader_ticks, runq_wait_ns, cpus: pick(&self.cpus), siblings: pick(&self.siblings) })
-    }
-
-    /// Samples once per second from `start` until `stop` is set.
-    fn spawn(self: Arc<Self>, start: std::time::Instant, stop: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<Vec<HostSecond>> {
-        std::thread::spawn(move || {
-            std::thread::sleep(start.saturating_duration_since(std::time::Instant::now()));
-            let mut out = Vec::new();
-            let (mut prev, mut prev_at) = (self.snap(), std::time::Instant::now());
-            while !stop.load(Ordering::Relaxed) {
-                let next = start + Duration::from_secs(out.len() as u64 + 1);
-                std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
-                let (now, at) = (self.snap(), std::time::Instant::now());
-                if let (Some(a), Some(b)) = (&prev, &now) {
-                    out.push(host_second(out.len(), a, b, at.duration_since(prev_at).as_secs_f64()));
-                }
-                (prev, prev_at) = (now, at);
-            }
-            out
+        let pick = |cs: &[usize]| cs.iter().map(|c| per_cpu.get(c).copied().ok_or_else(|| format!("/proc/stat has no cpu{c}"))).collect::<Result<Vec<_>, _>>();
+        Ok(HostSnap {
+            reader_ticks,
+            runq_wait_ns: read_runq_wait_ns(self.pid),
+            cpus: pick(&self.cpus)?,
+            siblings: pick(&self.siblings)?,
+            processes: read_processes(&[self.pid, std::process::id()]),
         })
     }
 
-    fn report(&self, per_second: Vec<HostSecond>, allowed: f64) -> HostReport {
+    /// Samples once per second from `start` until `stop` is set; a sample due
+    /// after `stop` is dropped. Returns the seconds and the first read error.
+    fn spawn(
+        self: Arc<Self>,
+        start: std::time::Instant,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        limits: HostLimits,
+    ) -> std::thread::JoinHandle<(Vec<HostSecond>, Option<String>)> {
+        std::thread::spawn(move || {
+            std::thread::sleep(start.saturating_duration_since(std::time::Instant::now()));
+            let mut out = Vec::new();
+            let mut error = None;
+            let (mut prev, mut prev_at) = (self.snap(), std::time::Instant::now());
+            for second in 0.. {
+                let next = start + Duration::from_secs(second as u64 + 1);
+                std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (now, at) = (self.snap(), std::time::Instant::now());
+                match (&prev, &now) {
+                    (Ok(a), Ok(b)) => out.push(host_second(second, a, b, at.duration_since(prev_at).as_secs_f64(), limits)),
+                    (Err(e), _) | (_, Err(e)) => {
+                        error.get_or_insert_with(|| e.clone());
+                    }
+                }
+                (prev, prev_at) = (now, at);
+            }
+            (out, error)
+        })
+    }
+
+    fn report(&self, sampled: std::thread::Result<(Vec<HostSecond>, Option<String>)>, samples_expected: u64, limits: HostLimits) -> HostReport {
+        let (per_second, sampler_error) = sampled.unwrap_or_else(|_| (Vec::new(), Some("the host sampler thread panicked".to_owned())));
         let max = |f: fn(&HostSecond) -> f64| per_second.iter().map(f).fold(0.0, f64::max);
+        let runq: Option<Vec<f64>> = per_second.iter().map(|s| s.reader_runq_wait).collect();
         let fmt = |cs: &[usize]| cs.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
         HostReport {
             reader_pid: self.pid,
             reader_cpus: fmt(&self.cpus),
+            is_reader_unpinned: self.is_reader_unpinned,
             sibling_cpus: fmt(&self.siblings),
-            max_foreign_cores_allowed: allowed,
+            is_sibling_topology_readable: self.is_sibling_topology_readable,
+            max_foreign_cores_allowed: limits.max_foreign_cores,
+            max_sibling_cores_allowed: limits.max_sibling_cores,
+            samples: per_second.len(),
+            samples_expected,
+            sampler_error,
             max_foreign_cpu_cores: max(|s| s.foreign_cpu_cores),
-            max_reader_runq_wait: max(|s| s.reader_runq_wait),
+            max_reader_runq_wait: runq.map(|v| v.into_iter().fold(0.0, f64::max)),
             max_sibling_busy_cores: max(|s| s.sibling_busy_cores),
             mean_reader_cpu_cores: per_second.iter().map(|s| s.reader_cpu_cores).sum::<f64>() / per_second.len().max(1) as f64,
             per_second,
@@ -749,7 +879,7 @@ async fn load_dataset(sh: &Shared, base: &str, from: &str) -> Result<Dataset, St
     Ok(d)
 }
 
-async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u64, cap: usize, probe: Option<(&Arc<HostProbe>, f64)>) -> StepReport {
+async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u64, cap: usize, probe: Option<(&Arc<HostProbe>, HostLimits)>) -> StepReport {
     {
         let mut st = sh.stats.lock().unwrap();
         *st = StepStats::default();
@@ -760,7 +890,7 @@ async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u
     let count = rate * step_secs;
     let start = Instant::now() + Duration::from_millis(50);
     let host_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let host_thread = probe.map(|(p, _)| p.clone().spawn(start.into_std(), host_stop.clone()));
+    let host_thread = probe.map(|(p, limits)| p.clone().spawn(start.into_std(), host_stop.clone(), limits));
     let cpu0 = process_cpu_seconds();
     let mut cpu_start = cpu0;
     let mut sent = 0u64;
@@ -798,8 +928,12 @@ async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u
     let cpu = process_cpu_seconds() - cpu_start;
     let peak = sh.peak_inflight.load(Ordering::Relaxed);
     host_stop.store(true, Ordering::Relaxed);
+    // Joining off the runtime keeps the in-flight completions from waiting on the sampler's sleep.
     let host = match (probe, host_thread) {
-        (Some((p, allowed)), Some(t)) => Some(p.report(t.join().unwrap_or_default(), allowed)),
+        (Some((p, limits)), Some(t)) => {
+            let sampled = tokio::task::spawn_blocking(move || t.join()).await.unwrap_or_else(|e| Err(Box::new(e.to_string())));
+            Some(p.report(sampled, step_secs, limits))
+        }
         _ => None,
     };
     // Drain in-flight requests (bounded by the request timeout).
@@ -898,12 +1032,14 @@ async fn real_main(args: Args) -> Result<(), String> {
             eprintln!("warning: the bench may run on CPUs {shared:?}, which are the Reader's CPUs or their SMT siblings");
         }
         eprintln!("reader pid {}: cpus {:?}, smt siblings {:?}", p.pid, p.cpus, p.siblings);
+    } else {
+        eprintln!("warning: no --reader-pid: host contention on the Reader's CPUs is not checked");
     }
     let mut picker = Picker::new(&args.url, data.clone(), weights, args.seed);
     let mut steps = Vec::new();
     for rate in rates {
         eprintln!("step: {rate} req/s for {} s", args.step_secs);
-        let report = run_step(&sh, &mut picker, rate, args.step_secs, args.concurrency_cap, probe.as_ref().map(|p| (p, args.max_foreign_cores))).await;
+        let report = run_step(&sh, &mut picker, rate, args.step_secs, args.concurrency_cap, probe.as_ref().map(|p| (p, HostLimits { max_foreign_cores: args.max_foreign_cores, max_sibling_cores: args.max_sibling_cores }))).await;
         eprintln!(
             "  sent={} ok={} errors={:?} throughput={:.0}/s send_lag_p99={}us valid={}",
             report.sent, report.ok, report.errors, report.throughput_ok_per_s, report.send_lag.p99_us, report.valid
@@ -1022,29 +1158,104 @@ mod tests {
         assert!(parse_cpulist("x").is_err());
     }
 
+    const LIMITS: HostLimits = HostLimits { max_foreign_cores: 0.5, max_sibling_cores: 1.0 };
+
+    fn probe() -> HostProbe {
+        HostProbe { pid: 1, cpus: vec![26, 27], is_reader_unpinned: false, siblings: vec![10, 11], is_sibling_topology_readable: true }
+    }
+
+    fn snap(reader_ticks: u64, runq_wait_ns: Option<u64>, cpu_busy: u64, sibling_busy: u64, other_ticks: u64) -> HostSnap {
+        HostSnap {
+            reader_ticks,
+            runq_wait_ns,
+            cpus: vec![(cpu_busy, 100), (cpu_busy, 100)],
+            siblings: vec![(sibling_busy, 100), (sibling_busy, 100)],
+            processes: [(808, ("prover".to_owned(), other_ticks)), (9, ("idle".to_owned(), 0))].into_iter().collect(),
+        }
+    }
+
+    fn zero() -> HostSnap {
+        HostSnap { cpus: vec![(0, 0), (0, 0)], siblings: vec![(0, 0), (0, 0)], ..snap(1000, Some(0), 0, 0, 0) }
+    }
+
+    /// A one-second step report over `per_second` host samples.
+    fn step_with_host(per_second: Vec<HostSecond>, samples_expected: u64) -> StepReport {
+        let mut st = StepStats::default();
+        st.secs = vec![SecStats::default()];
+        build_report(1, 1, Duration::from_secs(1), 0.0, 0, st, Some(probe().report(Ok((per_second, None)), samples_expected, LIMITS)))
+    }
+
     #[test]
     fn foreign_load_on_the_reader_cpus_invalidates_the_step() {
-        // Two Reader CPUs at 100 ticks/s: both fully busy, the Reader used
-        // 0.5 core, so 1.5 cores were someone else's; its threads waited 2 s/s.
-        let a = HostSnap { reader_ticks: 1000, runq_wait_ns: 0, cpus: vec![(0, 0), (0, 0)], siblings: vec![(0, 0)] };
-        let b = HostSnap { reader_ticks: 1050, runq_wait_ns: 2_000_000_000, cpus: vec![(100, 100), (100, 100)], siblings: vec![(25, 100)] };
-        let s = host_second(0, &a, &b, 1.0);
-        assert_eq!(s, HostSecond { second: 0, reader_cpu_cores: 0.5, reader_runq_wait: 2.0, foreign_cpu_cores: 1.5, sibling_busy_cores: 0.25 });
-        // The Reader's own load is never foreign.
-        let quiet = HostSnap { reader_ticks: 1100, cpus: vec![(50, 100), (50, 100)], ..a.clone() };
-        assert_eq!(host_second(0, &a, &quiet, 1.0).foreign_cpu_cores, 0.0);
+        // Both Reader CPUs fully busy, the Reader used 0.5 core: 1.5 cores were someone else's.
+        let s = host_second(0, &zero(), &snap(1050, Some(2_000_000_000), 100, 25, 300), 1.0, LIMITS);
+        let top = TopProcess { pid: 808, comm: "prover".to_owned(), cpu_cores: 3.0 };
+        assert_eq!(
+            s,
+            HostSecond { second: 0, reader_cpu_cores: 0.5, reader_runq_wait: Some(2.0), foreign_cpu_cores: 1.5, sibling_busy_cores: 0.5, top_other_process: Some(top) }
+        );
+        let quiet = host_second(0, &zero(), &snap(1100, Some(0), 50, 0, 300), 1.0, LIMITS);
+        assert_eq!((quiet.foreign_cpu_cores, &quiet.top_other_process), (0.0, &None), "the Reader's own load is never foreign");
 
-        let probe = HostProbe { pid: 1, cpus: vec![26, 27], siblings: vec![10, 11] };
-        let report = |per_second: Vec<HostSecond>| {
-            let mut st = StepStats::default();
-            st.secs = vec![SecStats::default()];
-            build_report(1, 1, Duration::from_secs(1), 0.0, 0, st, Some(probe.report(per_second, 0.5)))
-        };
-        let contended = report(vec![s.clone()]);
-        assert!(!contended.valid && contended.invalid_reasons[0].contains("1.50 cores"));
+        let contended = step_with_host(vec![s], 1);
+        assert_eq!(contended.invalid_reasons, vec!["other processes used up to 1.50 cores of the Reader's CPUs (limit 0.50)".to_owned()]);
         let h = contended.host.as_ref().unwrap();
-        assert_eq!((h.reader_cpus.as_str(), h.sibling_cpus.as_str(), h.max_reader_runq_wait), ("26,27", "10,11", 2.0));
-        assert!(report(vec![host_second(0, &a, &quiet, 1.0)]).valid);
+        assert_eq!((h.reader_cpus.as_str(), h.sibling_cpus.as_str(), h.max_reader_runq_wait), ("26,27", "10,11", Some(2.0)));
+        assert!(step_with_host(vec![quiet], 1).valid);
+    }
+
+    #[test]
+    fn busy_smt_siblings_invalidate_the_step() {
+        let s = host_second(0, &zero(), &snap(1000, Some(0), 0, 60, 120), 1.0, LIMITS);
+        assert_eq!((s.sibling_busy_cores, s.foreign_cpu_cores), (1.2, 0.0));
+        assert_eq!(s.top_other_process.as_ref().map(|t| t.pid), Some(808));
+        let r = step_with_host(vec![s], 1);
+        assert_eq!(r.invalid_reasons, vec!["the SMT siblings of the Reader's CPUs were busy up to 1.20 cores (limit 1.00)".to_owned()]);
+        let at_limit = host_second(0, &zero(), &snap(1000, Some(0), 0, 50, 0), 1.0, LIMITS);
+        assert!(step_with_host(vec![at_limit], 1).valid);
+    }
+
+    #[test]
+    fn missing_host_samples_invalidate_the_step() {
+        let quiet = || host_second(0, &zero(), &snap(1000, Some(0), 0, 0, 0), 1.0, LIMITS);
+        // One sample short of the step length is tolerated: the last second can end after the window.
+        assert!(step_with_host(vec![quiet(); 29], 30).valid);
+        let short = step_with_host(vec![quiet(); 28], 30);
+        assert_eq!(short.invalid_reasons, vec!["host samples missing (28/30)".to_owned()]);
+        let mut st = StepStats::default();
+        st.secs = vec![SecStats::default()];
+        let panicked = probe().report(Err(Box::new("boom")), 30, LIMITS);
+        let r = build_report(1, 1, Duration::from_secs(1), 0.0, 0, st, Some(panicked));
+        assert_eq!(r.invalid_reasons, vec!["host samples missing (0/30): the host sampler thread panicked".to_owned()]);
+        let read_failed = probe().report(Ok((vec![], Some("/proc/1/stat: gone".to_owned()))), 2, LIMITS);
+        assert_eq!(read_failed.invalid_reasons(), vec!["host samples missing (0/2): /proc/1/stat: gone".to_owned()]);
+    }
+
+    #[test]
+    fn unreadable_schedstat_is_null_not_zero() {
+        let s = host_second(0, &zero(), &snap(1000, None, 0, 0, 0), 1.0, LIMITS);
+        assert_eq!(s.reader_runq_wait, None);
+        let r = step_with_host(vec![s], 1);
+        assert_eq!(r.host.as_ref().unwrap().max_reader_runq_wait, None);
+        assert!(serde_json::to_value(&r).unwrap()["host"]["per_second"][0]["reader_runq_wait"].is_null());
+    }
+
+    #[test]
+    fn host_check_says_whether_contention_was_checked() {
+        let mut st = StepStats::default();
+        st.secs = vec![SecStats::default()];
+        let unchecked = build_report(1, 1, Duration::from_secs(1), 0.0, 0, st, None);
+        assert_eq!(serde_json::to_value(&unchecked).unwrap()["host_check"], "not performed");
+        let checked = step_with_host(vec![host_second(0, &zero(), &snap(1000, Some(0), 0, 0, 0), 1.0, LIMITS)], 1);
+        assert_eq!(serde_json::to_value(&checked).unwrap()["host_check"], "performed");
+    }
+
+    #[test]
+    fn an_unpinned_reader_is_named_in_the_reason() {
+        let mut p = probe();
+        p.is_reader_unpinned = true;
+        let s = host_second(0, &zero(), &snap(1000, Some(0), 100, 0, 0), 1.0, LIMITS);
+        assert!(p.report(Ok((vec![s], None)), 1, LIMITS).invalid_reasons()[0].ends_with("(the Reader is not pinned: its allowed CPUs are every online CPU)"));
     }
 
     #[test]
