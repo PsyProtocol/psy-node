@@ -117,10 +117,13 @@ pub async fn run_follow<S, F, Fut>(
                 let read = with_timeout(cfg.read_timeout, "read", src.read_tick(&cursors, cfg.max_rows));
                 match until_shutdown(&mut shutdown, read).await {
                     None => Step::Stop,
-                    Some(Ok(tick)) => {
-                        let is_catching_up = follow.apply(tick, tick_started_at) == ApplyOutcome::CatchingUp;
-                        Step::Ticked { next_read_at: (!is_catching_up).then(|| tick_started_at + cfg.tick) }
-                    }
+                    Some(Ok(tick)) => match follow.apply(tick, tick_started_at).await {
+                        None => Step::Stop,
+                        Some(outcome) => {
+                            let is_catching_up = outcome == ApplyOutcome::CatchingUp;
+                            Step::Ticked { next_read_at: (!is_catching_up).then(|| tick_started_at + cfg.tick) }
+                        }
+                    },
                     Some(Err(e)) => Step::Failed(e),
                 }
             }
@@ -210,18 +213,27 @@ impl FollowState {
         self.backoffs.insert(chain_index, ChainBackoff { reason, delay, until: now + delay });
     }
 
-    fn apply(&mut self, tick: TickData, tick_started_at: Instant) -> ApplyOutcome {
+    /// Runs `Model::apply` on the blocking pool, so a large tick never holds
+    /// an async worker. `None` when the runtime is shutting down.
+    async fn apply(&mut self, tick: TickData, tick_started_at: Instant) -> Option<ApplyOutcome> {
         self.is_schema_missing = false;
         let progress = tick.progress.clone();
-        let (outcome, view, reset_chain) = {
-            let mut model = self.model.lock();
+        let (model, metrics) = (self.model.clone(), self.metrics.clone());
+        let applied = tokio::task::spawn_blocking(move || {
+            let mut model = model.lock();
             let outcome = model.apply(tick);
             let reset_chain = match &outcome {
-                ApplyOutcome::Reload(reason) => reset_for(&mut model, &self.metrics, reason),
+                ApplyOutcome::Reload(reason) => reset_for(&mut model, &metrics, reason),
                 _ => None,
             };
-            self.metrics.set_resident_bytes(model.resident_bytes_estimate());
+            metrics.set_resident_bytes(model.resident_bytes_estimate());
             (outcome, model.view(), reset_chain)
+        })
+        .await;
+        let (outcome, view, reset_chain) = match applied {
+            Ok(applied) => applied,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => return None,
         };
         if let (Some(chain_index), ApplyOutcome::Reload(reason)) = (reset_chain, &outcome) {
             self.note_reload(chain_index, reason, Instant::now());
@@ -244,7 +256,7 @@ impl FollowState {
             self.is_startup_recorded = true;
             self.metrics.set_startup_seconds(self.started_at.elapsed().as_secs_f64());
         }
-        outcome
+        Some(outcome)
     }
 
     fn handle_source_error(&mut self, e: SourceError, backoff: Duration) {
