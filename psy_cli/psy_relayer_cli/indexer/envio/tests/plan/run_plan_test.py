@@ -51,7 +51,8 @@ TOKENS = [
     "0x4444444444444444444444444444444444444444",
 ]
 HASH_MULTIPLIER = 2654435761
-LOADED = ["Deposit", "DepositLeaf", "AccountDepositStats", "WithdrawalClaim", "DepositTreeMeta"]
+LOADED = ["Deposit", "DepositLeaf", "AccountDepositStats", "WithdrawalClaim", "DepositTreeMeta",
+          "FinalizedBatch"]
 SEQ_SCAN_ALLOWED = {"DepositTreeMeta"}
 AT_LEAST_ONE = -1   # expected row count: any non-empty result
 REPEATS = 5
@@ -144,6 +145,27 @@ CLAIM_COLUMNS = {
     "block_number": "2000000 + g / 3",
     "tx_hash": h64("ctx", "g"),
 }
+# Finalized batches: three consecutive g share a block number (across chains),
+# so the (block_number, id) cursor of follow_batches crosses equal blocks.
+BATCH_COLUMNS = {
+    "id": "cid || '-' || g",
+    "chain_id": "cid",
+    "finalized_checkpoint_id": "(g / 10)::numeric",
+    "deposit_tree_root": h64("droot", "g"),
+    "withdrawal_tree_root": h64("wroot", "g"),
+    "block_number": "3000000 + g / 3",
+    "tx_hash": h64("btx", "g"),
+}
+BATCH_ROW_SQL = """(
+  SELECT g, (CASE WHEN g % 10 < 7 THEN 11155111 WHEN g % 10 = 7 THEN 97 ELSE 84532 END) AS cid
+  FROM generate_series({lo}::bigint, {hi}::bigint - 1) AS g
+) s"""
+
+
+def batch_count(rows):
+    return rows // 10 // 10 * 10
+
+
 CLAIM_ROW_SQL = """(
   SELECT g, ci, (CASE ci WHEN 0 THEN 11155111 WHEN 1 THEN 97 ELSE 84532 END) AS cid,
          {nullifier} AS nullifier
@@ -287,6 +309,7 @@ def parallel(jobs, statements, label):
 
 def load(pg, rows, jobs, index_jobs):
     claims = rows // 3 // 10 * 10
+    batches = batch_count(rows)
     accounts = max(rows // 4, 1)
     indexes = [ix for ix in catalog_indexes(pg) if ix[0] in LOADED and ix[0] != "DepositTreeMeta"]
     for table, name, _, constraint, _ in indexes:
@@ -299,6 +322,7 @@ def load(pg, rows, jobs, index_jobs):
     deposit = insert_sql(pg, "Deposit", DEPOSIT_COLUMNS, ROW_SQL)
     leaf = insert_sql(pg, "DepositLeaf", LEAF_COLUMNS, ROW_SQL)
     claim = insert_sql(pg, "WithdrawalClaim", CLAIM_COLUMNS, CLAIM_ROW_SQL)
+    batch = insert_sql(pg, "FinalizedBatch", BATCH_COLUMNS, BATCH_ROW_SQL)
 
     def chunks(total, template):
         out = []
@@ -308,8 +332,9 @@ def load(pg, rows, jobs, index_jobs):
             out.append(lambda sql=sql: pg.run(sql))
         return out
 
-    parallel(jobs, chunks(rows, deposit) + chunks(rows, leaf) + chunks(claims, claim),
-             f"insert {rows:,} deposits, {rows:,} leaves, {claims:,} claims")
+    parallel(jobs, chunks(rows, deposit) + chunks(rows, leaf) + chunks(claims, claim)
+             + chunks(batches, batch),
+             f"insert {rows:,} deposits, {rows:,} leaves, {claims:,} claims, {batches:,} batches")
 
     started = time.time()
     pg.run("""SET work_mem = '4GB'; SET max_parallel_workers_per_gather = 8;
@@ -385,6 +410,11 @@ def cases(rows, claims, accounts):
     missing = [hex64("missing", n) for n in range(5)]
     mid_block = (count0 // 2) // 1024 * 1024
     head_block = count0 // 1024 * 1024
+    follow_limit = 1000
+    claim_g = next(g for g in range(claims // 3, claims) if g % 10 < 7)
+    claim_cursor = [CHAIN_ID[0], 2000000 + claim_g // 3, f"{CHAIN_ID[0]}-{hex64('null', claim_g)}", follow_limit]
+    batch_g = next(g for g in range(batch_count(rows) // 3, batch_count(rows)) if g % 10 < 7)
+    batch_cursor = [CHAIN_ID[0], 3000000 + batch_g // 3, f"{CHAIN_ID[0]}-{batch_g}", follow_limit]
     out = {
         "deposit_list_page": [
             ("light", [light, 0, CHAIN_ID[0]], (AT_LEAST_ONE, "11155111")),
@@ -416,6 +446,13 @@ def cases(rows, claims, accounts):
         "watermark": [("chain0", [0], (1, str(count0)))],
         "explorer_latest_deposits": [("chain0", [0], (100, "11155111"))],
         "explorer_feed_current": [("chain0", [CHAIN_ID[0]], (100, "11155111"))],
+        "follow_deposits": [("from_third", [0, count0 // 3, follow_limit], (follow_limit, None))],
+        "follow_leaves": [("from_third", [0, count0 // 3, follow_limit], (follow_limit, str(count0 // 3)))],
+        "follow_claims": [("from_third", claim_cursor, (follow_limit, None))],
+        "follow_batches": [("from_third", batch_cursor, (AT_LEAST_ONE, None))],
+        "tree_meta_all": [("all_chains", [], (len(CHAINS), "0"))],
+        "chain_progress": [("all_chains", [], None)],
+        "envio_identity": [("one_row", [], (1, None))],
     }
     if count0 % 1024:
         out["leaf_range_1024"].append(("head_partial_block", [0, head_block], (count0 - head_block, str(head_block))))
@@ -431,8 +468,10 @@ def plan_nodes(plan):
 def explain(pg, shape, params, mode):
     types = ", ".join(shape["params"])
     args = ", ".join(literal(p) for p in params)
-    prepare = f"SET plan_cache_mode = {mode};\nPREPARE q({types}) AS {shape['sql']};\n"
-    explain_sql = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE q({args});\n"
+    declared = f"({types})" if types else ""   # PREPARE and EXECUTE take no empty parentheses
+    called = f"({args})" if args else ""
+    prepare = f"SET plan_cache_mode = {mode};\nPREPARE q{declared} AS {shape['sql']};\n"
+    explain_sql = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE q{called};\n"
     out = pg.run(prepare + explain_sql * (REPEATS + 1))
     decoder, pos, plans = json.JSONDecoder(), 0, []
     while pos < len(out):
@@ -442,7 +481,7 @@ def explain(pg, shape, params, mode):
         value, pos = decoder.raw_decode(out, pos)
         plans.append(value[0])
     plans = plans[1:]  # first run warms the cache
-    rows = pg.run(prepare + f"EXECUTE q({args});\n").splitlines()
+    rows = pg.run(prepare + f"EXECUTE q{called};\n").splitlines()
     return plans, rows
 
 

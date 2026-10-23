@@ -27,11 +27,14 @@ WHERE shield_address = $1 AND chain_index = $2 AND chain_id = $3
 ORDER BY chain_local_deposit_index
 LIMIT 100;
 
+-- Measured 205 buffers at 100,000 rows (custom plan) and 106 at 1,000,000, so the
+-- old bound of 200 failed the 100,000-row run on an unchanged tree; 400 still
+-- catches a scan.
 -- name: deposit_list_next_page
 -- class: interactive
 -- params: text, int4, int4, int4
 -- index: Deposit_shield_address_chain_index_chain_local_deposit_index
--- max_buffers: 200
+-- max_buffers: 400
 -- gate: yes
 SELECT chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
        l2_token_contract_id, amount, note_commitment, chain_index, leaf_hash,
@@ -197,3 +200,95 @@ FROM "Deposit"
 WHERE chain_id = $1
 ORDER BY block_number DESC, id DESC
 LIMIT 100;
+
+-- Follow-loop shapes of the Bridge Reader (psy_bridge_reader). Each reads the
+-- next page after a cursor; the cursor for claims and batches is the pair
+-- (block_number, id). The runner binds LIMIT = 1000 (the page maximum) and a
+-- cursor one third into chain 0. max_buffers of each follow_* shape is twice
+-- the buffers measured at --rows 1000000 (the value is in the shape's comment).
+-- Measured 91 buffers at 1,000,000 rows.
+-- name: follow_deposits
+-- class: background
+-- params: int4, int4, int8
+-- index: Deposit_chain_index_deposit_index
+-- max_buffers: 182
+-- gate: yes
+SELECT id, chain_id, deposit_index, chain_local_deposit_index, shield_address, token,
+       l2_token_contract_id, amount::text, note_commitment, chain_index, leaf_hash,
+       block_number, block_timestamp::text, tx_hash
+FROM "Deposit"
+WHERE chain_index = $1 AND deposit_index >= $2
+ORDER BY deposit_index
+LIMIT $3;
+
+-- Measured 29 buffers at 1,000,000 rows.
+-- name: follow_leaves
+-- class: background
+-- params: int4, int4, int8
+-- index: DepositLeaf_chain_index_chain_local_deposit_index
+-- max_buffers: 58
+-- gate: yes
+SELECT chain_local_deposit_index, deposit_index, chain_id, poseidon_leaf_hash, block_number
+FROM "DepositLeaf"
+WHERE chain_index = $1 AND chain_local_deposit_index >= $2
+ORDER BY chain_local_deposit_index
+LIMIT $3;
+
+-- Measured 78 buffers at 1,000,000 rows.
+-- name: follow_claims
+-- class: background
+-- params: int4, int4, text, int8
+-- index: WithdrawalClaim_chain_id_block_number_id
+-- max_buffers: 156
+-- gate: yes
+SELECT id, chain_id, nullifier, recipient, token, amount::text, block_number, tx_hash
+FROM "WithdrawalClaim"
+WHERE chain_id = $1 AND (block_number, id) > ($2, $3)
+ORDER BY block_number, id
+LIMIT $4;
+
+-- Measured 55 buffers at 1,000,000 rows.
+-- name: follow_batches
+-- class: background
+-- params: int4, int4, text, int8
+-- index: FinalizedBatch_chain_id_block_number_id
+-- max_buffers: 110
+-- gate: yes
+SELECT id, chain_id, finalized_checkpoint_id::text, deposit_tree_root, withdrawal_tree_root,
+       block_number, tx_hash
+FROM "FinalizedBatch"
+WHERE chain_id = $1 AND (block_number, id) > ($2, $3)
+ORDER BY block_number, id
+LIMIT $4;
+
+-- One row per chain, like the watermark but for every chain at once.
+-- name: tree_meta_all
+-- class: background
+-- params:
+-- index:
+-- max_buffers: 10
+-- gate: yes
+SELECT chain_index, last_count, poseidon_deposit_tree_root
+FROM "DepositTreeMeta"
+ORDER BY chain_index;
+
+-- Envio's own progress table; reported only.
+-- name: chain_progress
+-- class: background
+-- params:
+-- index:
+-- max_buffers: 0
+-- gate: report
+SELECT id, progress_block, max_reorg_depth
+FROM envio_chains
+ORDER BY id;
+
+-- Identifies the Envio schema instance the Reader is following (it changes
+-- when the schema is dropped and re-created); reported only.
+-- name: envio_identity
+-- class: background
+-- params:
+-- index:
+-- max_buffers: 0
+-- gate: report
+SELECT 'envio_chains'::regclass::oid::int8 AS chains_oid, '"Deposit"'::regclass::oid::int8 AS deposit_oid;

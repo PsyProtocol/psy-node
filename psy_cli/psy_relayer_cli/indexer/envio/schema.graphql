@@ -6,6 +6,10 @@
 #   Deposit_chain_index_deposit_index: row by global deposit_index and the
 #     global-to-local probe (last row with deposit_index < N, descending).
 #   Deposit_tx_hash: lookup of a deposit by its L1 transaction hash.
+#   WithdrawalClaim_chain_id_block_number_id: the Bridge Reader's follow loop and
+#     start-up load of claims, paged by the (block_number, id) cursor on one chain.
+#   FinalizedBatch_chain_id_block_number_id: the same cursor paging for finalized
+#     batches in the Reader's follow loop and start-up load.
 # chain_index leads because chain_local_deposit_index is dense per chain_index
 # (DepositTreeMeta is keyed by it) and every Services read binds it; chain_id
 # is functionally dependent on chain_index (asserted by the handler).
@@ -56,7 +60,8 @@ type AccountDepositStats @entity {
   last_block_number: Int!
 }
 
-type FinalizedBatch @entity {
+type FinalizedBatch @entity
+  @index(fields: ["chain_id", "block_number", "id"]) {
   id: ID!
   chain_id: Int!
   finalized_checkpoint_id: BigInt!
@@ -110,7 +115,8 @@ type DepositTreeNode @entity {
 # instead of silently overwriting an existing claim. The composite index serves
 # lookups by nullifier list on one chain.
 type WithdrawalClaim @entity
-  @index(fields: ["chain_id", "nullifier"]) {
+  @index(fields: ["chain_id", "nullifier"])
+  @index(fields: ["chain_id", "block_number", "id"]) {
   id: ID!                         # "{chain_id}-{nullifier}"
   chain_id: Int!
   nullifier: String!
