@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use psy_bridge_reader_api::EnvioChainStatus;
+use psy_bridge_reader_api::{EnvioChainStatus, Revision};
 
 use super::chain::{ChainView, WindowChain};
 use super::claims::{ClaimChainView, ClaimWindow};
@@ -146,12 +146,17 @@ impl Model {
     }
 
     /// Marks one chain not ready until a reset and publishes that at once.
-    /// The rest of the view is unchanged, so it keeps its `as_of_unix_ms`.
+    /// The rest of the view is unchanged, so it keeps its `as_of_unix_ms`. A
+    /// fault the published view already shows publishes nothing.
     fn set_fault(&mut self, chain_index: u64, chain_id: Option<u64>, reason: ReloadReason) {
         let message = reason.to_string();
         let state = self.chains.entry(chain_index).or_insert_with(|| ChainState::new(chain_id));
-        state.fault = Some((reason, message.clone()));
         let old = self.view.load_full();
+        let shown = old.chains.get(&chain_index).is_some_and(|v| v.ready.as_ref().err() == Some(&message));
+        if shown && state.fault.as_ref().is_some_and(|(r, m)| *r == reason && *m == message) {
+            return;
+        }
+        state.fault = Some((reason, message.clone()));
         let view = match old.chains.get(&chain_index) {
             Some(v) => ChainView { ready: Err(message), ..v.clone() },
             None => ChainView::not_ready(state.data.clone(), state.chain_id, message),
@@ -250,7 +255,22 @@ impl Model {
 
         let fault = self.chains.values().find_map(|s| s.fault.as_ref().map(|(reason, _)| reason.clone()));
         if !changed {
-            return fault.map_or(ApplyOutcome::Unchanged, ApplyOutcome::Reload);
+            if let Some(reason) = fault {
+                return ApplyOutcome::Reload(reason);
+            }
+            // The data is unchanged but verified as of this tick: refresh
+            // `as_of_unix_ms` and keep epoch and seq, so an idle Envio does not
+            // make valid data look stale.
+            if old.revision.as_of_unix_ms != as_of {
+                self.publish(View {
+                    revision: Revision { as_of_unix_ms: as_of, ..old.revision.clone() },
+                    ready: old.ready.clone(),
+                    chains: old.chains.clone(),
+                    claim_chains: old.claim_chains.clone(),
+                    envio_chains: old.envio_chains.clone(),
+                });
+            }
+            return ApplyOutcome::Unchanged;
         }
         if !reorged.is_empty() || claims_reorged {
             self.epoch += 1;
@@ -667,5 +687,55 @@ mod tests {
         let mut m = Model::new();
         assert_eq!(m.apply(b.tick_limited(&m.cursors(), 2)), ApplyOutcome::Reload(ReloadReason::WindowOverLimit));
         assert!(matches!(by_address(&m.view(), 0, "A"), Err(ReadError::NotReady(_))));
+    }
+
+    #[test]
+    fn an_unchanged_tick_refreshes_as_of_without_bumping_seq() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit(0, 1, 10, "A");
+        b.deposit(0, 1, 95, "A");
+        let mut m = Model::new();
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        let v1 = m.view();
+        assert_eq!(v1.revision.as_of_unix_ms, 1_000);
+        b.started_unix_ms = 2_000;
+        assert_eq!(b.apply_to(&mut m), ApplyOutcome::Unchanged);
+        let v2 = m.view();
+        assert_eq!((v2.revision.epoch, v2.revision.seq), (v1.revision.epoch, v1.revision.seq));
+        assert_eq!(v2.revision.as_of_unix_ms, 2_000);
+        assert!(Arc::ptr_eq(&v2.chains[&0].window, &v1.chains[&0].window));
+        assert!(Arc::ptr_eq(&v2.chains[&0].data, &v1.chains[&0].data));
+        assert_eq!(by_address(&v2, 0, "A").unwrap(), b.rows(0));
+    }
+
+    #[test]
+    fn a_persisting_fault_does_not_bump_seq_every_tick() {
+        // An invariant violation found again on the next tick.
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit(0, 1, 95, "A");
+        let mut m = Model::new();
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        b.deposit(0, 1, 96, "A");
+        b.deposits.get_mut(&0).unwrap()[1].leaf_chain_id = 2;
+        assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::InvariantViolated { .. })));
+        let seq = m.view().revision.seq;
+        for _ in 0..3 {
+            assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::InvariantViolated { .. })));
+            assert_eq!(m.view().revision.seq, seq);
+        }
+        // A tree mismatch that Envio keeps reporting.
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit(0, 1, 95, "A");
+        b.meta_root.insert(0, zero(3));
+        let mut m = Model::new();
+        assert_eq!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::TreeMismatch { chain_index: 0 }));
+        let seq = m.view().revision.seq;
+        for _ in 0..3 {
+            assert_eq!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::TreeMismatch { chain_index: 0 }));
+            assert_eq!(m.view().revision.seq, seq);
+        }
     }
 }

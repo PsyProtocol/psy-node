@@ -593,4 +593,27 @@ mod tests {
         assert_eq!(m.view().revision.epoch, epoch + 1);
         assert_eq!(get(&m, &["n1", "n2"]), vec![committed]);
     }
+
+    #[test]
+    fn cross_chain_reads_on_a_chain_id_with_a_not_ready_chain_index_are_not_ready() {
+        // Chain indexes 0 and 1 are both on chain_id 1; chain index 1's tree
+        // does not match Envio's meta, so it is not ready.
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit_at(0, 1, 0, 10, "A");
+        b.deposit_at(1, 1, 1, 11, "A");
+        b.deposit_at(0, 1, 2, 95, "A");
+        b.meta_root.insert(1, zero(4));
+        let mut m = Model::new();
+        assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Reload(_)));
+        let v = m.view();
+        let not_ready = |r: Result<(), ReadError>| matches!(r, Err(ReadError::NotReady(_)));
+        assert!(not_ready(v.deposits_by_address(&address("A", None, 10, 0)).map(|_| ())));
+        assert!(not_ready(v.explorer(&ExplorerQuery { chain_id: 1 }).map(|_| ())));
+        assert!(not_ready(v.prefix(&PrefixQuery { chain_index: 0, chain_id: 1, target_deposit_count: 3 }).map(|_| ())));
+        assert!(not_ready(v.tree_root(&tree_root(0, None, Some(3), Some(1))).map(|_| ())));
+        // A read of the ready chain index alone is still served.
+        assert_eq!(v.deposits_by_address(&address("A", Some(0), 10, 0)).unwrap().total, 2);
+        assert_eq!(v.tree_root(&tree_root(0, Some(2), None, None)).unwrap().root, to_display_hex(&naive_root(&b.leaves(0), 2)));
+    }
 }
