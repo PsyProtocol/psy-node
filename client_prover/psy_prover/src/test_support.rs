@@ -21,6 +21,7 @@ pub(crate) fn dead_network_config() -> psy_config::NetworkConfigGoldilocks {
         "realm_user_tree_height": 4,
         "group_realm_height": 4,
         "realm_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:1"]}],
+        "p2p": {"checkpoints_per_epoch": 1},
         "coordinator_configs": [{"id": 0, "rpc_url": ["http://127.0.0.1:1"]}],
         "prove_proxy_url": [],
         "faucet_rpc_url": [],

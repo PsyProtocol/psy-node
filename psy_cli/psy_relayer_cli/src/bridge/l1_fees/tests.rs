@@ -392,8 +392,14 @@ async fn withdrawal_policy_refusal_precedes_proof_and_does_not_fail_claims() {
     ).await.unwrap();
     assert_eq!(report.requested, 1);
     assert_eq!(report.submitted_count, 0);
-    assert!(report.failure_reasons.is_empty());
-    assert!(report.deferrals.contains_key("test-only-leaf"));
+    assert!(matches!(
+        report.outcomes.as_slice(),
+        [super::super::claim_withdrawals::ClaimOutcome { leaf_hash, kind, tx_hash: None }]
+            if leaf_hash == "test-only-leaf"
+                && *kind == super::super::claim_withdrawals::ClaimOutcomeKind::Failed(
+                    super::super::claim_withdrawals::ClaimCode::FeeRefused,
+                )
+    ));
     // Any proof, contract-state or broadcast call would panic in this fixture.
     assert_eq!(rpc.calls.lock().unwrap().len(), 4);
 }

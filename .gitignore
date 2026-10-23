@@ -93,3 +93,7 @@ client_prover/psy_provider/bindings/
 .omp
 /docs/book/
 .rpi
+psy_cli/psy_dev_cli/examples/rollback_snapshot_smoke.rs
+psy_cli/psy_relayer_cli/examples/bridge_schema2_drain_inspector.rs
+/guardians-root/
+/psy_cli/psy_relayer_cli/indexer/envio/.npmrc

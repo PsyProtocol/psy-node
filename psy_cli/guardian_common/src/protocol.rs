@@ -9,53 +9,60 @@ use psy_crypto::hash::{core::sha256::CoreSha256Hasher, traits::hasher::{FieldQHa
 use psy_prover::trace::{GeneratedTxTraceJson, TxTrace, TraceStep};
 use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MultisigSignatures, MULTISIG_POLICY_CONTRACT_ID};
 use serde::{de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor}, Deserialize, Deserializer, Serialize, Serializer};
+use base64::{engine::general_purpose::STANDARD as STANDARD_B64, Engine as _};
 use serde_json::Value;
 
-pub const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 /// Outer storage/HTTP envelope. Distinct from the inner `PSYGS002` request domain.
 pub const RECORD_MAGIC: [u8; 8] = *b"PSYGR001";
 pub const RECORD_VERSION: u32 = 1;
 pub const RECORD_HEADER_LEN: usize = 20;
 pub const RECORD_COMPRESSION_LEVEL: i32 = 3;
-/// Hard cap on the compressed envelope, including the 20-byte header. Independent of the caller's uncompressed limit.
-pub const MAX_COMPRESSED_RECORD_BYTES: usize = 128 * 1024 * 1024;
-/// Uncompressed cap for a session or relayer row. Same 128 MiB as `MAX_BODY_BYTES`: a session must still fit `GuardianSessionsResponse::to_bytes`.
-pub const MAX_SESSION_RECORD_BYTES: usize = MAX_BODY_BYTES;
 
 /// Versioned zstd envelope around exact inner bytes. Canonical for database rows and HTTP bodies.
 ///
 /// Layout, little-endian: `PSYGR001` (8) | version `1` (u32) | uncompressed length (u64) | one zstd frame.
-/// `limit` bounds the uncompressed payload (`MAX_BODY_BYTES` / `MAX_SESSION_RECORD_BYTES`, both 128 MiB).
-/// The compressed envelope, header included, is capped at `MAX_COMPRESSED_RECORD_BYTES` (128 MiB).
-pub fn encode_record(bytes: &[u8], limit: usize) -> Result<Vec<u8>, GuardianSignError> {
-    if bytes.len() > limit || bytes.len() > MAX_SESSION_RECORD_BYTES { return Err(GuardianSignError::MalformedRequest); }
+pub fn encode_record(bytes: &[u8]) -> Result<Vec<u8>, GuardianSignError> {
+    let length = u64::try_from(bytes.len()).map_err(|_| GuardianSignError::MalformedRequest)?;
     let compressed = zstd::stream::encode_all(bytes, RECORD_COMPRESSION_LEVEL).map_err(|_| GuardianSignError::MalformedRequest)?;
-    if compressed.len() > MAX_COMPRESSED_RECORD_BYTES.saturating_sub(RECORD_HEADER_LEN) { return Err(GuardianSignError::MalformedRequest); }
-    let mut frame = Vec::with_capacity(RECORD_HEADER_LEN + compressed.len());
+    let total = RECORD_HEADER_LEN.checked_add(compressed.len()).ok_or(GuardianSignError::MalformedRequest)?;
+    let mut frame = Vec::with_capacity(total);
     frame.extend_from_slice(&RECORD_MAGIC);
     frame.extend_from_slice(&RECORD_VERSION.to_le_bytes());
-    frame.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&length.to_le_bytes());
     frame.extend_from_slice(&compressed);
     Ok(frame)
 }
 
 /// Inverse of `encode_record`. Returns the original inner bytes or `MalformedRequest`.
-pub fn decode_record(bytes: &[u8], limit: usize) -> Result<Vec<u8>, GuardianSignError> {
-    if bytes.len() > MAX_COMPRESSED_RECORD_BYTES || bytes.len() < RECORD_HEADER_LEN { return Err(GuardianSignError::MalformedRequest); }
+pub fn decode_record(bytes: &[u8]) -> Result<Vec<u8>, GuardianSignError> {
+    if bytes.len() < RECORD_HEADER_LEN { return Err(GuardianSignError::MalformedRequest); }
     if bytes[..8] != RECORD_MAGIC || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != RECORD_VERSION {
         return Err(GuardianSignError::MalformedRequest);
     }
     let advertised = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
     let advertised = usize::try_from(advertised).map_err(|_| GuardianSignError::MalformedRequest)?;
-    if advertised > limit || advertised > MAX_SESSION_RECORD_BYTES { return Err(GuardianSignError::MalformedRequest); }
     let zstd_frame = &bytes[RECORD_HEADER_LEN..];
     if zstd_frame.len() < 4 || zstd_frame[..4] != zstd::zstd_safe::MAGICNUMBER.to_le_bytes() { return Err(GuardianSignError::MalformedRequest); }
     let mut decoder = zstd::stream::read::Decoder::with_buffer(zstd_frame).map_err(|_| GuardianSignError::MalformedRequest)?.single_frame();
+    // Reading one byte past the advertised length reveals excess decoded output instead of
+    // silently truncating it. Checked addition: an unrepresentable allowance is malformed input,
+    // not an implicit size ceiling.
+    let allowance = advertised.checked_add(1).ok_or(GuardianSignError::MalformedRequest)?;
     let mut output = Vec::new();
-    let copied = std::io::copy(&mut std::io::Read::take(&mut decoder, (advertised as u64).saturating_add(1)), &mut output).map_err(|_| GuardianSignError::MalformedRequest)?;
-    if copied != advertised as u64 || output.len() != advertised { return Err(GuardianSignError::MalformedRequest); }
-    let rest = decoder.finish();
-    if !rest.is_empty() { return Err(GuardianSignError::MalformedRequest); }
+    {
+        let mut reader = std::io::Read::take(&mut decoder, allowance as u64);
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = std::io::Read::read(&mut reader, &mut chunk).map_err(|_| GuardianSignError::MalformedRequest)?;
+            if read == 0 { break; }
+            let decoded_len = output.len().checked_add(read).ok_or(GuardianSignError::MalformedRequest)?;
+            if decoded_len > advertised { return Err(GuardianSignError::MalformedRequest); }
+            output.try_reserve(read).map_err(|_| GuardianSignError::MalformedRequest)?;
+            output.extend_from_slice(&chunk[..read]);
+        }
+    }
+    if output.len() != advertised { return Err(GuardianSignError::MalformedRequest); }
+    if !decoder.finish().is_empty() { return Err(GuardianSignError::MalformedRequest); }
     Ok(output)
 }
 
@@ -78,16 +85,16 @@ impl<const N: usize> Serialize for Hex<N> {
 impl<'de, const N: usize> Deserialize<'de> for Hex<N> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let text = String::deserialize(d)?;
-        let bytes = decode_hex(&text, N).map_err(de::Error::custom)?;
+        let bytes = decode_hex(&text).map_err(de::Error::custom)?;
         if bytes.len() != N { return Err(de::Error::custom("invalid fixed hex width")); }
         let mut result = [0; N];
         result.copy_from_slice(&bytes);
         Ok(Self(result))
     }
 }
-fn decode_hex(text: &str, max_bytes: usize) -> Result<Vec<u8>, GuardianSignError> {
+fn decode_hex(text: &str) -> Result<Vec<u8>, GuardianSignError> {
     let raw = text.strip_prefix("0x").ok_or(GuardianSignError::MalformedRequest)?;
-    if raw.len() % 2 != 0 || raw.len() / 2 > max_bytes || !raw.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if raw.len() % 2 != 0 || !raw.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         return Err(GuardianSignError::MalformedRequest);
     }
     hex::decode(raw).map_err(|_| GuardianSignError::MalformedRequest)
@@ -156,7 +163,6 @@ impl<'de> Deserialize<'de> for UniqueJson {
     }
 }
 pub fn parse_duplicate_free_json(bytes: &[u8]) -> Result<Value, GuardianSignError> {
-    if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::MalformedRequest); }
     let UniqueJson(parsed) = serde_json::from_slice(bytes).map_err(|_| GuardianSignError::MalformedRequest)?;
     Ok(parsed)
 }
@@ -386,18 +392,15 @@ impl WithdrawalBurnRecord {
         Ok(amount)
     }
     pub fn token_address(&self) -> Result<Hex20, GuardianSignError> { Self::address(&self.token) }
-    pub fn recipient_address(&self) -> Result<Hex20, GuardianSignError> {
-        let address = Self::address(&self.recipient)?;
-        if address.0 == [0; 20] { return Err(GuardianSignError::WithdrawalMismatch); }
-        Ok(address)
-    }
+    /// Canonical 160-bit conversion. High bits are rejected, not truncated.
+    /// A zero recipient is accepted; L1 classifies that slot.
+    pub fn recipient_address(&self) -> Result<Hex20, GuardianSignError> { Self::address(&self.recipient) }
     fn address(words: &[u32; 8]) -> Result<Hex20, GuardianSignError> {
         if words[..3] != [0; 3] { return Err(GuardianSignError::WithdrawalMismatch); }
         let mut address = [0; 20];
         for (part, word) in address.chunks_exact_mut(4).zip(&words[3..]) { part.copy_from_slice(&word.to_be_bytes()); }
         Ok(Hex(address))
     }
-    pub fn selection_key(&self) -> (u8, u32, u32, [u32; 8]) { (self.destination_chain_index, self.sender_user_id, self.token_contract_id, self.nonce) }
     fn encode(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(&self.sender_user_id.to_le_bytes()); bytes.extend_from_slice(&self.token_contract_id.to_le_bytes());
         bytes.push(self.destination_chain_index);
@@ -405,27 +408,42 @@ impl WithdrawalBurnRecord {
     }
 }
 impl GuardianSignRequest {
-    pub fn parse(bytes: &[u8]) -> Result<Self, GuardianSignError> { let request: Self = parse_canonical_json(bytes)?; request.validate()?; Ok(request) }
+    /// Wire entry for canonical JSON sign bodies: schema 3 only. Schema 2 stays a
+    /// retained-row reader format; it is never signed again and keeps its request id.
+    pub fn parse(bytes: &[u8]) -> Result<Self, GuardianSignError> {
+        let request = Self::parse_retained(bytes)?;
+        if request.schema_version != 3 { return Err(GuardianSignError::MalformedRequest); }
+        Ok(request)
+    }
+    /// Retained-row JSON reader (archive restore, retained history text): accepts
+    /// schema 2 and 3. Never call this on a live sign body; `parse` is the wire gate.
+    pub fn parse_retained(bytes: &[u8]) -> Result<Self, GuardianSignError> {
+        let request: Self = parse_canonical_json(bytes)?;
+        request.validate()?;
+        Ok(request)
+    }
     pub fn validate(&self) -> Result<(), GuardianSignError> {
-        if self.schema_version != 2 || !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID || !canonical_field(self.session_nonce)
+        if !matches!(self.schema_version, 2 | 3) || !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID || !canonical_field(self.session_nonce)
             || self.deposit_anchors.len() > 256 || self.withdrawal_records.len() > 1024 { return Err(GuardianSignError::MalformedRequest); }
         if self.operation != GuardianOperation::Bridge && (!self.deposit_anchors.is_empty() || !self.withdrawal_records.is_empty()) { return Err(GuardianSignError::UnsupportedCall); }
         if self.operation == GuardianOperation::Bridge && self.deposit_anchors.is_empty() && self.withdrawal_records.is_empty() { return Err(GuardianSignError::UnsupportedCall); }
         if self.deposit_anchors.windows(2).any(|w| w[0].chain_index >= w[1].chain_index)
             || self.deposit_anchors.iter().any(|a| a.new_count <= a.old_count || a.block_hash.0 == [0; 32]) { return Err(GuardianSignError::DepositMismatch); }
-        if self.withdrawal_records.windows(2).any(|w| w[0].selection_key() >= w[1].selection_key()) { return Err(GuardianSignError::WithdrawalMismatch); }
-        let mut identities = BTreeSet::new(); let mut nonces = BTreeSet::new();
-        for record in &self.withdrawal_records {
-            record.amount_u64()?; record.token_address()?; record.recipient_address()?;
-            if !identities.insert((record.sender_user_id, record.token_contract_id, record.nonce)) || !nonces.insert((record.destination_chain_index, record.nonce)) { return Err(GuardianSignError::WithdrawalNonceConflict); }
-        }
+        for record in &self.withdrawal_records { record.amount_u64()?; }
         self.decode_trace()?;
         Ok(())
     }
     pub fn decode_trace(&self) -> Result<TxTrace, GuardianSignError> {
         let envelope = self.trace_json.decode()?;
         if envelope.trace.encoding != "json" { return Err(GuardianSignError::MalformedRequest); }
-        let trace: TxTrace = parse_canonical_json(envelope.trace.payload.as_bytes())?;
+        // Schema 3 payloads already carry base64 byte paths. A retained schema-2 payload
+        // is rewritten in memory only; the stored text and its request id are never modified.
+        let payload = match self.schema_version {
+            3 => envelope.trace.payload,
+            2 => rewrite_schema2_trace_payload(&envelope.trace.payload)?,
+            _ => return Err(GuardianSignError::MalformedRequest),
+        };
+        let trace: TxTrace = parse_canonical_json(payload.as_bytes())?;
         let _: ContractCallData = parse_canonical_json(&serde_json::to_vec(&envelope.call_data).map_err(|_| GuardianSignError::MalformedRequest)?)?;
         if envelope.user_id != self.user_id.to_string() || trace.meta.user_id != self.user_id || trace.meta.network_magic != self.network_magic
             || envelope.pk_hash != trace.meta.public_key.to_string() || envelope.sig_hash != trace.finalization.sig_hash.to_string()
@@ -449,7 +467,6 @@ impl GuardianSignRequest {
         for a in &self.deposit_anchors { bytes.push(a.chain_index); bytes.extend_from_slice(&a.block_number.to_le_bytes()); bytes.extend_from_slice(&a.block_hash.0); bytes.extend_from_slice(&a.old_count.to_le_bytes()); bytes.extend_from_slice(&a.new_count.to_le_bytes()); }
         bytes.extend_from_slice(&(self.withdrawal_records.len() as u64).to_le_bytes());
         for record in &self.withdrawal_records { record.encode(&mut bytes); }
-        if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::MalformedRequest); }
         Ok(bytes)
     }
     pub fn request_id(&self) -> Result<Hex32, GuardianSignError> { Ok(sha256(&self.canonical_bytes()?)) }
@@ -461,6 +478,66 @@ impl GuardianSignRequest {
         for record in &self.withdrawal_records { config.chain(record.destination_chain_index)?; }
         Ok(())
     }
+}
+/// Rewrites a retained schema-2 trace payload in memory: the seven human-readable
+/// byte paths move from JSON integer arrays (strict 0..=255) into padded standard
+/// base64 (`base64` 0.22 `STANDARD`, the exact text the codec's strict decode
+/// accepts), then the canonical typed parse runs unchanged. A string, object,
+/// float, negative, or integer above 255 at a listed path is `MalformedRequest`;
+/// arrays off the seven paths are never touched.
+fn rewrite_schema2_trace_payload(payload: &str) -> Result<String, GuardianSignError> {
+    let mut trace = parse_duplicate_free_json(payload.as_bytes())?;
+    rewrite_schema2_trace(&mut trace)?;
+    serde_json::to_string(&trace).map_err(|_| GuardianSignError::MalformedRequest)
+}
+
+fn rewrite_schema2_trace(trace: &mut Value) -> Result<(), GuardianSignError> {
+    if let Some(record) = trace.get_mut("ups_start_witness").and_then(Value::as_object_mut)
+        .and_then(|witness| witness.get_mut("proof")).and_then(Value::as_object_mut) {
+        if let Some(proof) = record.get_mut("proof") { rewrite_schema2_bytes(proof)?; }
+    }
+    if let Some(codes) = trace.get_mut("contract_codes").and_then(Value::as_array_mut) {
+        for code in codes {
+            if let Some(field) = code.as_object_mut().and_then(|object| object.get_mut("code")) { rewrite_schema2_bytes(field)?; }
+        }
+    }
+    let Some(steps) = trace.get_mut("steps").and_then(Value::as_array_mut) else { return Ok(()) };
+    for step in steps {
+        let Some(step) = step.as_object_mut() else { continue };
+        match step.get("kind").and_then(Value::as_str) {
+            Some("standard" | "burn_fee" | "inlined" | "deferred") => {
+                if let Some(proof) = step.get_mut("proof").and_then(Value::as_object_mut) {
+                    for path in ["cfc_proof", "ups_proof"] {
+                        if let Some(field) = proof.get_mut(path) { rewrite_schema2_bytes(field)?; }
+                    }
+                }
+            }
+            Some("external_proof") => {
+                if let Some(field) = step.get_mut("proof") { rewrite_schema2_bytes(field)?; }
+            }
+            Some("zk_sign") => {
+                if let Some(field) = step.get_mut("sign_witness") { rewrite_schema2_bytes(field)?; }
+                if let Some(source) = step.get_mut("sign_circuit_source").and_then(Value::as_object_mut) {
+                    if source.get("kind").and_then(Value::as_str) == Some("psy_software_defined") {
+                        if let Some(field) = source.get_mut("circuit_def") { rewrite_schema2_bytes(field)?; }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_schema2_bytes(field: &mut Value) -> Result<(), GuardianSignError> {
+    let Some(items) = field.as_array() else { return Err(GuardianSignError::MalformedRequest) };
+    let mut bytes = Vec::with_capacity(items.len());
+    for item in items {
+        let byte = item.as_u64().filter(|byte| *byte <= u64::from(u8::MAX)).ok_or(GuardianSignError::MalformedRequest)?;
+        bytes.push(byte as u8);
+    }
+    *field = Value::String(STANDARD_B64.encode(bytes));
+    Ok(())
 }
 pub fn sha256(bytes: &[u8]) -> Hex32 { Hex(CoreSha256Hasher::hash_bytes(bytes).0) }
 pub fn traces_equal(supplied: &TxTrace, replayed: &TxTrace) -> Result<bool, GuardianSignError> {
@@ -555,7 +632,7 @@ impl GuardianRuntimeConfig {
 impl GuardianSigned {
     pub fn validate(&self) -> Result<(), GuardianSignError> {
         if !canonical_field(self.network_magic) || self.user_id != BRIDGE_USER_ID || !canonical_field(self.nonce)
-            || self.request_bytes.len() > MAX_BODY_BYTES || self.deposit_tree_states.len() > 256 { return Err(GuardianSignError::DatabaseUnavailable); }
+            || self.deposit_tree_states.len() > 256 { return Err(GuardianSignError::DatabaseUnavailable); }
         let request = GuardianSignRequest::from_canonical_bytes(&self.request_bytes).map_err(|_| GuardianSignError::DatabaseUnavailable)?;
         if request.network_magic != self.network_magic || request.user_id != self.user_id || request.session_nonce != self.nonce {
             return Err(GuardianSignError::DatabaseUnavailable);
@@ -668,6 +745,16 @@ pub fn frontier_root(count: u32, frontier: &[Hash4; 32]) -> Hash4 {
     current
 }
 
+/// One verified deposit leaf, shared by the live L1 verifier and the offline
+/// bridge reset so the two cannot drift. The leaf joins the trailing partial
+/// page (cleared on every 32nd leaf) and the frontier; the returned hash is the
+/// root after the append.
+pub fn accumulate_deposit_leaf(frontier: &mut [Hash4; 32], occupied_partial_page_hashes: &mut Vec<Hash4>, index: u32, leaf: Hash4) -> Hash4 {
+    occupied_partial_page_hashes.push(leaf);
+    if (index + 1) % 32 == 0 { occupied_partial_page_hashes.clear(); }
+    append_merkle_leaf(frontier, index, leaf)
+}
+
 pub fn withdrawal_tree_leaf(record: &WithdrawalBurnRecord) -> Hash4 {
     let mut fields = [GoldilocksField::ZERO; 34];
     fields[0] = GoldilocksField::from_canonical_u32(record.sender_user_id);
@@ -694,13 +781,12 @@ impl GuardianSessionRecord {
         Ok(request)
     }
     pub fn proof_bytes(&self) -> Result<Vec<u8>, GuardianSignError> {
-        decode_hex(&self.endcap_proof_hex, MAX_BODY_BYTES)
+        decode_hex(&self.endcap_proof_hex)
     }
 }
 impl GuardianSessionsResponse {
     pub fn to_bytes(&self) -> Result<Vec<u8>, GuardianSignError> {
         let bytes = serde_json::to_vec(self).map_err(|_| GuardianSignError::MalformedRequest)?;
-        if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::MalformedRequest); }
         Ok(bytes)
     }
     pub fn validate_page(&self, after_nonce: u64, limit: u8) -> Result<(), GuardianSignError> {
@@ -739,7 +825,6 @@ impl<'a> RequestBytes<'a> {
 }
 impl GuardianSignRequest {
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GuardianSignError> {
-        if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::MalformedRequest); }
         let mut input = RequestBytes { remaining: bytes };
         if input.take::<8>()? != *b"PSYGS002" { return Err(GuardianSignError::MalformedRequest); }
         let schema_version = input.u32()?;
@@ -852,7 +937,24 @@ mod tests {
         let mut record = burn(1); record.amount[0] = 1; assert!(record.amount_u64().is_err());
         assert_eq!(record.token_address().unwrap().0, [0; 20]);
         record.token[2] = 1; assert!(record.token_address().is_err());
-        record.recipient = [0; 8]; assert!(record.recipient_address().is_err());
+        record.recipient = [0; 8]; assert_eq!(record.recipient_address().unwrap().0, [0; 20]);
+    }
+
+    #[test]
+    fn raw_high_bits_and_zero_recipient_are_not_request_rejections() {
+        let mut request = codec_request_fixture();
+        request.operation = GuardianOperation::Bridge;
+        let mut first = burn(1);
+        first.token[0] = 1;
+        first.recipient = [0; 8];
+        let mut second = burn(1);
+        second.nonce[7] = 8;
+        second.recipient[0] = 1;
+        request.withdrawal_records = vec![first.clone(), second.clone(), first];
+        assert!(request.validate().is_ok());
+        assert_eq!(request.withdrawal_records[0].token[0], 1);
+        assert_eq!(request.withdrawal_records[0].recipient, [0; 8]);
+        assert_eq!(request.withdrawal_records[1].recipient[0], 1);
     }
 
 
@@ -892,7 +994,7 @@ pub(crate) fn codec_request_fixture() -> GuardianSignRequest {
         finalization: TxFinalization { submit_end_cap_input: Default::default(), nonce: GoldilocksField(1), tx_hash: Hash4::ZERO, software_defined_call: Default::default(), sig_hash: Hash4::ZERO },
     };
     let generated = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(ContractCallData::new(vec![])).unwrap()).unwrap();
-    GuardianSignRequest { schema_version: 2, network_magic: 90101, user_id: BRIDGE_USER_ID, session_nonce: 1, operation: GuardianOperation::Bootstrap, trace_json: JsonText::from_value(&generated).unwrap(), deposit_anchors: vec![], withdrawal_records: vec![] }
+    GuardianSignRequest { schema_version: 3, network_magic: 90101, user_id: BRIDGE_USER_ID, session_nonce: 1, operation: GuardianOperation::Bootstrap, trace_json: JsonText::from_value(&generated).unwrap(), deposit_anchors: vec![], withdrawal_records: vec![] }
 }
 
 #[cfg(test)]
@@ -904,7 +1006,7 @@ mod request_tests {
         let request = codec_request_fixture();
         let bytes = request.canonical_bytes().unwrap();
         assert_eq!(&bytes[..8], b"PSYGS002");
-        assert_eq!(&bytes[8..12], &2u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &3u32.to_le_bytes());
         assert_eq!(&bytes[12..20], &90101u64.to_le_bytes());
         assert_eq!(&bytes[20..28], &524288u64.to_le_bytes());
         assert_eq!(&bytes[28..36], &1u64.to_le_bytes());
@@ -981,7 +1083,7 @@ mod bounds_tests {
     use super::*;
 
     #[test]
-    fn request_vector_bounds_and_destination_nonce_uniqueness_are_enforced() {
+    fn request_vector_bounds_keep_indexed_duplicates() {
         let mut request = codec_request_fixture(); request.operation = GuardianOperation::Bridge;
         request.deposit_anchors = (0..=256).map(|i| DepositAnchor { chain_index: i as u8, block_number: 1, block_hash: Hex([1; 32]), old_count: 0, new_count: 1 }).collect();
         assert_eq!(request.validate().unwrap_err(), GuardianSignError::MalformedRequest);
@@ -989,9 +1091,11 @@ mod bounds_tests {
         let burn = WithdrawalBurnRecord { sender_user_id: 1, token_contract_id: 4, destination_chain_index: 0, token: [0; 8], amount: [0, 0, 0, 0, 0, 0, 0, 1], recipient: [0, 0, 0, 0, 0, 0, 0, 1], nonce: [0; 8] };
         request.withdrawal_records = vec![burn.clone(); 1025];
         assert_eq!(request.validate().unwrap_err(), GuardianSignError::MalformedRequest);
-        let mut other = burn.clone(); other.sender_user_id = 2;
-        request.withdrawal_records = vec![burn, other];
-        assert_eq!(request.validate().unwrap_err(), GuardianSignError::WithdrawalNonceConflict);
+        let mut later = burn.clone(); later.sender_user_id = 2; later.destination_chain_index = 1;
+        let mut earlier = burn.clone(); earlier.destination_chain_index = 0; earlier.nonce[7] = 1;
+        request.withdrawal_records = vec![later, burn.clone(), earlier, burn];
+        assert!(request.validate().is_ok());
+        assert_eq!(request.withdrawal_records.iter().map(|record| (record.destination_chain_index, record.sender_user_id, record.nonce[7])).collect::<Vec<_>>(), vec![(1, 2, 0), (0, 1, 0), (0, 1, 1), (0, 1, 0)]);
     }
 
     #[test]
@@ -1000,9 +1104,10 @@ mod bounds_tests {
     }
 
     #[test]
-    fn proof_and_page_limits_are_not_request_size_estimates() {
-        assert!(decode_hex("0x0001", 1).is_err());
-        assert_eq!(decode_hex("0x0001", 2).unwrap(), [0, 1]);
+    fn proof_hex_has_no_size_ceiling_and_page_counts_stay_semantic() {
+        assert_eq!(decode_hex("0x0001").unwrap(), [0, 1]);
+        let long_proof = format!("0x{}", "ab".repeat(4096));
+        assert_eq!(decode_hex(&long_proof).unwrap().len(), 4096);
         let page = GuardianSessionsResponse { sessions: vec![], next_after_nonce: 7, has_more: false };
         assert!(page.validate_page(7, 1).is_ok());
         assert!(page.validate_page(6, 1).is_err());
@@ -1073,51 +1178,288 @@ mod record_codec_tests {
         assert!(inner.windows(8).any(|window| window == b"PSYGS002"));
         let nested = br#"{"trace":{"code":"fn main() {}","note":"a\"b\\c"},"list":[1,null,true]}"#;
         for payload in [inner.as_slice(), nested.as_slice(), b"".as_slice(), &[0, 255, 10, 13]] {
-            let frame = encode_record(payload, MAX_SESSION_RECORD_BYTES).unwrap();
+            let frame = encode_record(payload).unwrap();
             assert_eq!(&frame[..8], b"PSYGR001");
             assert_eq!(&frame[8..12], &RECORD_VERSION.to_le_bytes());
             assert_eq!(&frame[12..20], &(payload.len() as u64).to_le_bytes());
-            assert_eq!(decode_record(&frame, MAX_SESSION_RECORD_BYTES).unwrap(), payload);
-            if !payload.is_empty() { assert!(decode_record(&frame, payload.len() - 1).is_err()); }
+            assert_eq!(decode_record(&frame).unwrap(), payload);
         }
         let signed = codec_request_fixture();
-        let frame = encode_record(&signed.canonical_bytes().unwrap(), MAX_BODY_BYTES).unwrap();
-        assert_eq!(GuardianSignRequest::from_canonical_bytes(&decode_record(&frame, MAX_BODY_BYTES).unwrap()).unwrap().request_id().unwrap(), signed.request_id().unwrap());
+        let frame = encode_record(&signed.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(GuardianSignRequest::from_canonical_bytes(&decode_record(&frame).unwrap()).unwrap().request_id().unwrap(), signed.request_id().unwrap());
+    }
+    #[test]
+    fn record_roundtrips_a_real_payload_above_the_former_cap() {
+        // Deterministic near-incompressible stream: the real former cap plus one byte,
+        // not a zero-filled shortcut.
+        let former_cap = 128 * 1024 * 1024;
+        let mut payload = vec![0u8; former_cap + 1];
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for byte in &mut payload {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *byte = (state >> 33) as u8;
+        }
+        let frame = encode_record(&payload).unwrap();
+        assert_eq!(&frame[..8], b"PSYGR001");
+        assert_eq!(&frame[12..20], &((former_cap + 1) as u64).to_le_bytes());
+        assert_eq!(decode_record(&frame).unwrap(), payload);
     }
 
     #[test]
     fn record_rejects_malformed_unsupported_truncated_trailing_and_size_lies() {
         let payload = b"exact-inner";
-        let frame = encode_record(payload, MAX_BODY_BYTES).unwrap();
-        assert!(decode_record(&frame[..RECORD_HEADER_LEN - 1], MAX_BODY_BYTES).is_err());
+        let frame = encode_record(payload).unwrap();
+        assert!(decode_record(&frame[..RECORD_HEADER_LEN - 1]).is_err());
         let mut bad = frame.clone(); bad[..8].copy_from_slice(b"PSYGR000");
-        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        assert!(decode_record(&bad).is_err());
         let mut bad = frame.clone(); bad[8..12].copy_from_slice(&2u32.to_le_bytes());
-        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
-        assert!(decode_record(&frame[..frame.len() - 1], MAX_BODY_BYTES).is_err());
-        assert!(decode_record(&frame[..RECORD_HEADER_LEN], MAX_BODY_BYTES).is_err());
+        assert!(decode_record(&bad).is_err());
+        assert!(decode_record(&frame[..frame.len() - 1]).is_err());
+        assert!(decode_record(&frame[..RECORD_HEADER_LEN]).is_err());
         let mut bad = frame.clone(); bad.truncate(RECORD_HEADER_LEN + 4);
-        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        assert!(decode_record(&bad).is_err());
         let mut bad = frame.clone(); bad[RECORD_HEADER_LEN..RECORD_HEADER_LEN + 4].copy_from_slice(&0x184D2A50u32.to_le_bytes());
-        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        assert!(decode_record(&bad).is_err());
         let mut bad = frame.clone(); bad.extend_from_slice(&frame[RECORD_HEADER_LEN..]);
-        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        assert!(decode_record(&bad).is_err());
         let mut bad = frame.clone(); bad.extend_from_slice(&[0]);
-        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        assert!(decode_record(&bad).is_err());
         let mut bad = frame.clone(); bad[12..20].copy_from_slice(&(payload.len() as u64 + 1).to_le_bytes());
-        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
-        let mut bad = frame; bad[12..20].copy_from_slice(&(payload.len() as u64 - 1).to_le_bytes());
-        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
-        assert_eq!(MAX_COMPRESSED_RECORD_BYTES, MAX_BODY_BYTES);
-        assert_eq!(MAX_SESSION_RECORD_BYTES, MAX_BODY_BYTES);
-        assert_eq!(MAX_BODY_BYTES, 128 * 1024 * 1024);
+        assert!(decode_record(&bad).is_err());
+        let mut bad = frame.clone(); bad[12..20].copy_from_slice(&(payload.len() as u64 - 1).to_le_bytes());
+        assert!(decode_record(&bad).is_err());
+        let mut bad = frame.clone(); bad[12..20].copy_from_slice(&((64 * 1024 * 1024) as u64).to_le_bytes());
+        assert!(decode_record(&bad).is_err());
+        let mut bad = frame; bad[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode_record(&bad).is_err());
     }
 
     #[test]
     fn record_rejects_a_decompression_bomb_before_expanding_it() {
-        let mut bomb = encode_record(&vec![0u8; 64 * 1024], 64 * 1024).unwrap();
+        let mut bomb = encode_record(&vec![0u8; 64 * 1024]).unwrap();
         assert!(bomb.len() < 1024);
         bomb[12..20].copy_from_slice(&1024u64.to_le_bytes());
-        assert!(decode_record(&bomb, 64 * 1024).is_err());
+        assert!(decode_record(&bomb).is_err());
+    }
+}
+
+#[cfg(test)]
+mod schema_cutover_tests {
+    use super::*;
+    use psy_client_common::data::alt::AltVerifierOnlyCircuitData;
+    use psy_crypto::hash::merkle::core::DeltaMerkleProofCore;
+    use psy_prover::trace::{CfcProofRecord, CfcStateDelta, CfcStep, ExternalProofStep, SessionAnchor, TxFinalization, TraceContractCode, TraceMeta, TraceSignCircuitSource, TraceStepId, UpsStartProofRecord, UpsStartWitness, ZkSignStep};
+    use psy_vm::vm::cfc_input::DapenContractFunctionCircuitInput;
+
+    /// The old serializer wrote byte fields as JSON digit arrays; the codec now writes
+    /// padded standard base64. Tests build the old shape from the typed bytes directly,
+    /// never by decoding the new text, so the rewrite stays independently checked.
+    fn digit_array(bytes: &[u8]) -> Value {
+        Value::Array(bytes.iter().map(|byte| Value::from(*byte)).collect())
+    }
+
+    fn state_delta() -> CfcStateDelta {
+        CfcStateDelta {
+            cfc_transaction_input_context: Default::default(),
+            user_contract_tree_update_proof: DeltaMerkleProofCore { old_root: Hash4::ZERO, old_value: Hash4::ZERO, new_root: Hash4::ZERO, new_value: Hash4::ZERO, index: 0, siblings: Vec::new() },
+            deferred_tx_debt_pivot_proof: Default::default(),
+            inline_tx_debt_pivot_proof: Default::default(),
+        }
+    }
+
+    fn alt_verifier_data() -> AltVerifierOnlyCircuitData<GoldilocksField> {
+        AltVerifierOnlyCircuitData { constants_sigmas_cap: Vec::new(), circuit_digest: Hash4::ZERO }
+    }
+
+    fn cfc_step(proof: Option<CfcProofRecord>) -> TraceStep {
+        TraceStep::Standard(CfcStep {
+            id: TraceStepId(0), parent: None, inlined: Vec::new(), deferred: Vec::new(),
+            contract_id: 5, fn_id: 1, method_id: 2, method_name: "set_value".to_owned(),
+            cfc_fingerprint: Hash4::ZERO, ups_fingerprint: Hash4::ZERO,
+            proof_tree_start_root: Hash4::ZERO, proof_tree_end_root: Hash4::ZERO,
+            cfc_witness: DapenContractFunctionCircuitInput::default(),
+            state_delta: state_delta(),
+            cfc_inclusion_proof: Default::default(),
+            end_header: Default::default(),
+            debt_removal_proof: None,
+            proof,
+        })
+    }
+
+    fn external_step(proof: &[u8]) -> TraceStep {
+        TraceStep::ExternalProof(ExternalProofStep {
+            fingerprint: Hash4::ZERO, proof_tree_start_root: Hash4::ZERO, proof_tree_end_root: Hash4::ZERO,
+            proof: proof.to_vec(),
+            verifier_data_alt: alt_verifier_data(),
+            siblings: Vec::new(),
+        })
+    }
+
+    fn zk_sign_step() -> TraceStep {
+        TraceStep::ZkSign(ZkSignStep {
+            fingerprint: Hash4::ZERO, proof_tree_start_root: Hash4::ZERO, proof_tree_end_root: Hash4::ZERO,
+            sign_circuit_source: TraceSignCircuitSource::PsySoftwareDefined { circuit_def: vec![7, 8, 9], force_four_align: false },
+            sign_witness: vec![1, 2, 3, 4],
+            public_key_param: Hash4::ZERO,
+            sign_verifier_data_alt: alt_verifier_data(),
+        })
+    }
+
+    fn trace_with(ups_proof: Option<Vec<u8>>, contract_codes: Vec<TraceContractCode>, steps: Vec<TraceStep>) -> TxTrace {
+        TxTrace {
+            meta: TraceMeta { network_magic: 90101, user_id: BRIDGE_USER_ID, public_key: codec_config_fixture(90101).account_public_key().unwrap() },
+            anchor: SessionAnchor { start_checkpoint_id: 0, checkpoint_leaf: Default::default(), global_state_roots: Default::default(), ups_step_circuit_whitelist_root: Hash4::ZERO },
+            ups_start_witness: UpsStartWitness {
+                ups_header: Default::default(), state_roots: Default::default(),
+                checkpoint_tree_proof: Default::default(), user_tree_proof: Default::default(),
+                user_registration_tree_proof: None,
+                proof: ups_proof.map(|proof| UpsStartProofRecord { proof }),
+            },
+            contract_codes, steps,
+            finalization: TxFinalization { submit_end_cap_input: Default::default(), nonce: GoldilocksField(1), tx_hash: Hash4::ZERO, software_defined_call: Default::default(), sig_hash: Hash4::ZERO },
+        }
+    }
+
+    fn call_data() -> Value { serde_json::to_value(ContractCallData::new(vec![])).unwrap() }
+
+    fn request(schema_version: u32, generated: &GeneratedTxTraceJson) -> GuardianSignRequest {
+        GuardianSignRequest {
+            schema_version, network_magic: 90101, user_id: BRIDGE_USER_ID, session_nonce: 1,
+            operation: GuardianOperation::Bootstrap, trace_json: JsonText::from_value(generated).unwrap(),
+            deposit_anchors: vec![], withdrawal_records: vec![],
+        }
+    }
+
+    /// Mimics the old serializer: non-empty byte fields become digit arrays, empty ones
+    /// stay omitted, keyed off the typed trace instead of decoding the new base64 text.
+    fn schema2_payload(trace: &TxTrace, generated: &GeneratedTxTraceJson) -> String {
+        let mut payload: Value = serde_json::from_str(&generated.trace.payload).unwrap();
+        if let Some(record) = trace.ups_start_witness.proof.as_ref() {
+            if !record.proof.is_empty() { payload["ups_start_witness"]["proof"]["proof"] = digit_array(&record.proof); }
+        }
+        if let Some(code) = trace.contract_codes.first() {
+            if !code.code.is_empty() { payload["contract_codes"][0]["code"] = digit_array(&code.code); }
+        }
+        for (index, step) in trace.steps.iter().enumerate() {
+            match step {
+                TraceStep::Standard(_) | TraceStep::BurnFee(_) | TraceStep::Inlined(_) | TraceStep::Deferred(_) => {
+                    let record = step.as_cfc().unwrap().proof.as_ref();
+                    if let Some(record) = record {
+                        if !record.cfc_proof.is_empty() { payload["steps"][index]["proof"]["cfc_proof"] = digit_array(&record.cfc_proof); }
+                        if !record.ups_proof.is_empty() { payload["steps"][index]["proof"]["ups_proof"] = digit_array(&record.ups_proof); }
+                    }
+                }
+                TraceStep::ExternalProof(external) => {
+                    if !external.proof.is_empty() { payload["steps"][index]["proof"] = digit_array(&external.proof); }
+                }
+                TraceStep::ZkSign(sign) => {
+                    if !sign.sign_witness.is_empty() { payload["steps"][index]["sign_witness"] = digit_array(&sign.sign_witness); }
+                    if let TraceSignCircuitSource::PsySoftwareDefined { circuit_def, .. } = &sign.sign_circuit_source {
+                        if !circuit_def.is_empty() { payload["steps"][index]["sign_circuit_source"]["circuit_def"] = digit_array(circuit_def); }
+                    }
+                }
+            }
+        }
+        serde_json::to_string(&payload).unwrap()
+    }
+
+    #[test]
+    fn schema2_request_blob_keeps_identity_and_walks_the_old_trace() {
+        let trace = trace_with(None, vec![TraceContractCode { contract_id: 5, code: vec![1, 2, 3, 255] }], vec![cfc_step(None), zk_sign_step()]);
+        let generated = GeneratedTxTraceJson::from_trace(&trace, call_data()).unwrap();
+        let schema3 = request(3, &generated);
+        let schema3_blob = schema3.canonical_bytes().unwrap();
+        assert_eq!(&schema3_blob[8..12], &3u32.to_le_bytes());
+        let payload: Value = serde_json::from_str(&generated.trace.payload).unwrap();
+        assert!(payload["contract_codes"][0]["code"].is_string());
+        assert!(payload["steps"][1]["sign_witness"].is_string());
+        assert!(payload["steps"][1]["sign_circuit_source"]["circuit_def"].is_string());
+        let old = GuardianSignRequest { schema_version: 2, ..request(3, &schema2_generated(&trace)) };
+        let json = serde_json::to_vec(&old).unwrap();
+        let blob = old.canonical_bytes().unwrap();
+        assert_eq!(&blob[..8], b"PSYGS002");
+        assert_eq!(&blob[8..12], &2u32.to_le_bytes());
+        let decoded = GuardianSignRequest::from_canonical_bytes(&blob).unwrap();
+        assert_eq!(decoded.schema_version, 2);
+        assert_eq!(decoded.canonical_bytes().unwrap(), blob);
+        assert_eq!(decoded.request_id().unwrap(), sha256(&blob));
+        assert_ne!(decoded.request_id().unwrap(), schema3.request_id().unwrap());
+        assert!(traces_equal(&decoded.decode_trace().unwrap(), &trace).unwrap());
+        assert!(GuardianSignRequest::parse(&json).is_err());
+        assert!(GuardianSignRequest::parse_retained(&json).is_ok());
+    }
+
+    fn schema2_generated(trace: &TxTrace) -> GeneratedTxTraceJson {
+        let generated = GeneratedTxTraceJson::from_trace(trace, call_data()).unwrap();
+        let mut old = generated.clone();
+        old.trace.payload = schema2_payload(trace, &generated);
+        old
+    }
+
+    #[test]
+    fn seven_byte_paths_accept_digit_arrays_and_base64_strings() {
+        let trace = trace_with(Some(vec![1]), vec![TraceContractCode { contract_id: 5, code: vec![10, 20, 30] }],
+            vec![cfc_step(Some(CfcProofRecord { cfc_proof: vec![40, 50], ups_proof: vec![60] })), external_step(&[70, 80]), zk_sign_step()]);
+        let generated = GeneratedTxTraceJson::from_trace(&trace, call_data()).unwrap();
+        let direct: TxTrace = parse_canonical_json(generated.trace.payload.as_bytes()).unwrap();
+        assert!(traces_equal(&direct, &trace).unwrap());
+        let rewritten = rewrite_schema2_trace_payload(&schema2_payload(&trace, &generated)).unwrap();
+        let walked: TxTrace = parse_canonical_json(rewritten.as_bytes()).unwrap();
+        assert!(traces_equal(&walked, &trace).unwrap());
+        assert_eq!(walked.ups_start_witness.proof.unwrap().proof, vec![1]);
+        assert_eq!(walked.contract_codes[0].code, vec![10, 20, 30]);
+        let TraceStep::Standard(step) = &walked.steps[0] else { unreachable!() };
+        assert_eq!(step.proof.as_ref().unwrap().cfc_proof, vec![40, 50]);
+        assert_eq!(step.proof.as_ref().unwrap().ups_proof, vec![60]);
+        let TraceStep::ExternalProof(step) = &walked.steps[1] else { unreachable!() };
+        assert_eq!(step.proof, vec![70, 80]);
+        let TraceStep::ZkSign(step) = &walked.steps[2] else { unreachable!() };
+        assert_eq!(step.sign_witness, vec![1, 2, 3, 4]);
+        assert!(matches!(&step.sign_circuit_source, TraceSignCircuitSource::PsySoftwareDefined { circuit_def, .. } if circuit_def == &vec![7, 8, 9]));
+    }
+
+    #[test]
+    fn listed_paths_reject_wrong_types_while_unrelated_arrays_pass() {
+        let trace = trace_with(None, vec![TraceContractCode { contract_id: 5, code: vec![1, 2] }], vec![cfc_step(None), zk_sign_step()]);
+        let payload: Value = serde_json::from_str(&schema2_generated(&trace).trace.payload).unwrap();
+        for bad in [Value::String("aa".to_owned()), serde_json::json!([256]), serde_json::json!([-1]), serde_json::json!([1.5]), serde_json::json!({}), Value::Null] {
+            let mut payload = payload.clone();
+            payload["steps"][1]["sign_witness"] = bad;
+            assert!(rewrite_schema2_trace_payload(&serde_json::to_string(&payload).unwrap()).is_err());
+        }
+        {
+            let mut payload = payload.clone();
+            payload["contract_codes"][0]["code"] = Value::String("aa".to_owned());
+            assert!(rewrite_schema2_trace_payload(&serde_json::to_string(&payload).unwrap()).is_err());
+        }
+        // Off the seven listed paths a numeric array above 255 stays an array and stays valid.
+        let mut payload = payload.clone();
+        payload["steps"][0]["inlined"] = serde_json::json!([400]);
+        let rewritten = rewrite_schema2_trace_payload(&serde_json::to_string(&payload).unwrap()).unwrap();
+        let walked: TxTrace = parse_canonical_json(rewritten.as_bytes()).unwrap();
+        let TraceStep::Standard(step) = &walked.steps[0] else { unreachable!() };
+        assert_eq!(step.inlined, vec![TraceStepId(400)]);
+    }
+
+    #[test]
+    fn empty_digit_array_at_a_listed_path_fails_the_canonical_check() {
+        let trace = trace_with(None, vec![TraceContractCode { contract_id: 5, code: vec![1] }], vec![zk_sign_step()]);
+        let generated = schema2_generated(&trace);
+        let mut payload: Value = serde_json::from_str(&generated.trace.payload).unwrap();
+        payload["contract_codes"][0]["code"] = digit_array(&[]);
+        let rewritten = rewrite_schema2_trace_payload(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert!(parse_canonical_json::<TxTrace>(rewritten.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn precomputed_proofs_still_rejected_after_the_schema2_rewrite() {
+        for trace in [
+            trace_with(Some(vec![1, 2]), vec![], vec![zk_sign_step()]),
+            trace_with(None, vec![], vec![cfc_step(Some(CfcProofRecord { cfc_proof: vec![3], ups_proof: vec![4] })), zk_sign_step()]),
+            trace_with(None, vec![], vec![external_step(&[5]), zk_sign_step()]),
+        ] {
+            let old = GuardianSignRequest { schema_version: 2, ..request(3, &schema2_generated(&trace)) };
+            assert_eq!(old.validate().unwrap_err(), GuardianSignError::MalformedRequest);
+        }
     }
 }

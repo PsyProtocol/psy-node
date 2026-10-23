@@ -31,9 +31,10 @@ import {
     localAnvilLaunchArgs,
     isRepoAnvilProcess,
     runTeardownCommand,
+    removeOwnedContainersForPurge,
+    exactSnapshotNames,
     stopOwnedDevnetUiListeners,
     stopRepoAnvilsForPurge,
-    exactSnapshotNames,
     preservedAnvilGenesis,
     ROLLBACK_STOP_SENTINEL_CONTENT,
     ROLLBACK_STOP_SENTINEL_PATH,
@@ -1556,9 +1557,14 @@ password_env = "SYNTHETIC_PASSWORD"
     });
     it("requires an initialized unhalted guardian ready response", async () => {
         const ready = { schema_version: 3, user_id: 524288, network_magic: 1, runtime_initialized: true, halted: false };
+        // Genesis localhost magic 0x1337CF514544CF69; JSON.parse cannot preserve it as an identity.
+        const publicMagic = JSON.parse('{"network_magic":1384803358401154921}').network_magic;
         expect(await guardianServiceReady(Response.json(ready))).toBe(true);
+        expect(await guardianServiceReady(Response.json({ ...ready, network_magic: publicMagic }))).toBe(true);
         for (const body of [null, {}, [], { ...ready, schema_version: 1 }, { ...ready, runtime_initialized: false },
-            { ...ready, halted: true }, { ...ready, user_id: -1 }, { ...ready, network_magic: 0 }, { ...ready, user_id: "1" }]) {
+            { ...ready, halted: true }, { ...ready, user_id: -1 }, { ...ready, network_magic: 0 },
+            { ...ready, network_magic: -1 }, { ...ready, network_magic: 1.5 }, { ...ready, network_magic: "1" },
+            { ...ready, user_id: "1" }]) {
             expect(await guardianServiceReady(Response.json(body))).toBe(false);
         }
         expect(await guardianServiceReady(Response.json(ready, { status: 503 }))).toBe(false);
@@ -2477,6 +2483,7 @@ describe("purge Anvil ownership", () => {
     it("kills and reaps a harmless timeout child and returns failure", async () => {
         const result = await runTeardownCommand(["sleep", "30"], undefined, 200);
         expect(result.timedOut).toBe(true);
+        expect(result.reaped).toBe(true);
         expect(result.code).toBeNull();
         expect(result.argv0).toBe("sleep");
     });
@@ -2486,6 +2493,7 @@ describe("purge Anvil ownership", () => {
         const started = Date.now();
         const result = await runTeardownCommand(["sh", "-c", "sleep 30 & echo $!"], undefined, 200);
         expect(result.timedOut).toBe(true);
+        expect(result.reaped).toBe(true);
         expect(result.stdoutComplete).toBe(false);
         expect(Date.now() - started).toBeLessThan(2_000);
         const pid = Number(result.stdout);
@@ -2511,6 +2519,7 @@ describe("purge Anvil ownership", () => {
         const result = await runTeardownCommand([process.execPath, "-e", "process.stdout.write('x'.repeat(70000))"], undefined, 2_000);
         expect(result.code).toBe(0);
         expect(result.timedOut).toBe(false);
+        expect(result.reaped).toBe(true);
         expect(result.stdout.length).toBe(65_536);
         expect(result.stdoutComplete).toBe(false);
     });
@@ -2550,6 +2559,45 @@ describe("purge Anvil ownership", () => {
             }
         });
     });
+    function teardownResult(overrides: Partial<{ code: number | null; timedOut: boolean; reaped: boolean; stdoutComplete: boolean }>) {
+        return {
+            argv0: "docker",
+            code: overrides.code === undefined ? 0 : overrides.code,
+            timedOut: overrides.timedOut ?? false,
+            reaped: overrides.reaped ?? true,
+            stderrCategory: "empty" as const,
+            stdout: "scylla-server",
+            stdoutComplete: overrides.stdoutComplete ?? true,
+        };
+    }
+
+    it("accepts a reaped failed stop when force-remove of the same names succeeds", async () => {
+        const calls: string[][] = [];
+        const failures: string[] = [];
+        await removeOwnedContainersForPurge(["scylla-server"], failures, "docker", async (argv) => {
+            calls.push(argv);
+            return teardownResult(argv[1] === "stop" ? { code: null, timedOut: true, reaped: true } : {});
+        });
+        expect(failures).toEqual([]);
+        expect(calls[0]?.slice(0, 4)).toEqual(["docker", "stop", "-t", "10"]);
+        expect(calls[1]?.slice(0, 3)).toEqual(["docker", "rm", "-f"]);
+        expect(calls[0]?.slice(4)).toEqual(["scylla-server"]);
+        expect(calls[1]?.slice(3)).toEqual(["scylla-server"]);
+    });
+
+    it("fails when the stop client is unreaped even if force-remove succeeds", async () => {
+        const failures: string[] = [];
+        await removeOwnedContainersForPurge(["scylla-server"], failures, "docker", async (argv) => teardownResult(argv[1] === "stop" ? { code: null, timedOut: true, reaped: false } : {}));
+        expect(failures.some((failure) => failure.startsWith("docker-stop"))).toBe(true);
+    });
+
+    it("fails when force-remove fails", async () => {
+        const failures: string[] = [];
+        await removeOwnedContainersForPurge(["scylla-server"], failures, "docker", async (argv) => teardownResult(argv[1] === "rm" ? { code: 1, timedOut: false, reaped: true } : {}));
+        expect(failures.some((failure) => failure.startsWith("docker-rm"))).toBe(true);
+        expect(failures.some((failure) => failure.startsWith("docker-stop"))).toBe(false);
+    });
+
 
     it("treats a missing docker object as absent and a daemon error or leftover as failure", () => {
         const names = exactSnapshotNames("valkey-server\n\npsy-devnet-redis\n");
@@ -2619,6 +2667,43 @@ describe("owned devnet UI listener purge", () => {
         } finally {
             try { process.kill(-pgrp, "SIGKILL"); } catch { /* already reaped */ }
             await child.exited;
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("signals the exact bun dev wrapper and refuses a shell leader", async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), "owned-ui-bun-"));
+        const repo = path.join(dir, "repo");
+        const ide = path.join(repo, "psy-dapp/apps/ide");
+        await mkdir(ide, { recursive: true });
+        const cwd = realpathSync(ide);
+        const listener = { exe: nodeBin, cwd, cmdline: `${["node", "vite.js", "--port", "5176"].join("\0")}\0`, starttime: "20" };
+        const bunArgv = ["bun", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5176", "--strictPort"];
+        const bunExe = path.join(dir, "bin", "bun");
+        const leader = { exe: bunExe, cwd, cmdline: `${bunArgv.join("\0")}\0`, starttime: "19" };
+        const signals: number[] = [];
+        const control = {
+            portOpen: async (port: number) => port === 5176,
+            listenerOwner: async () => 100,
+            readIdentity: async (pid: number) => pid === 100 ? listener : pid === 200 ? leader : null,
+            readUid: async () => process.getuid?.() ?? 0,
+            readPgrp: async () => 200,
+            signalGroup: (pgrp: number) => { signals.push(pgrp); },
+            leaderAlive: () => false,
+            sleep: async () => {},
+        };
+        try {
+            await stopOwnedDevnetUiListeners(repo, control);
+            expect(signals).toEqual([200]);
+            signals.length = 0;
+            leader.exe = path.join(dir, "bin", "bash");
+            leader.cmdline = "bash\0-lc\0bun run dev -- --host 0.0.0.0 --port 5176 --strictPort\0";
+            await expect(stopOwnedDevnetUiListeners(repo, control)).rejects.toThrow("process group leader is not the owned listener context");
+            leader.exe = bunExe;
+            leader.cmdline = `${bunArgv.with(7, "5177").join("\0")}\0`;
+            await expect(stopOwnedDevnetUiListeners(repo, control)).rejects.toThrow("process group leader is not the owned listener context");
+            expect(signals).toEqual([]);
+        } finally {
             await rm(dir, { recursive: true, force: true });
         }
     });

@@ -19,7 +19,7 @@ use std::{fs, io::Write, net::SocketAddr, os::unix::fs::{MetadataExt, OpenOption
 
 use anyhow::{ensure, Context};
 use bincode::Options;
-use guardian_common::{protocol::{decode_record, encode_record, parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, BRIDGE_USER_ID, MAX_BODY_BYTES, MAX_COMPRESSED_RECORD_BYTES, MAX_SESSION_RECORD_BYTES}};
+use guardian_common::{protocol::{decode_record, encode_record, parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, BRIDGE_USER_ID}};
 use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
@@ -55,7 +55,7 @@ const SIGNED: TableDefinition<'_, (u64, u64, u64), &[u8]> = TableDefinition::new
 const SESSION: TableDefinition<'_, (u64, u64, u64), &[u8]> = TableDefinition::new("guardian_session");
 const GUARDIAN_DEPOSIT_TREE_STATES: TableDefinition<'_, GuardianDepositTreeKey, &[u8]> = TableDefinition::new("deposit_tree_states");
 const GUARDIAN_INCLUDED_WITHDRAWAL_BURNS: TableDefinition<'_, GuardianWithdrawalBurnKey, u64> = TableDefinition::new("included_withdrawal_burns");
-const GUARDIAN_NONCE: TableDefinition<'_, GuardianNonce, u64> = TableDefinition::new("guardian_withdrawal_nonce");
+const GUARDIAN_NONCE: TableDefinition<'_, GuardianWithdrawalNonceKey, u64> = TableDefinition::new("guardian_withdrawal_nonce");
 // Role-specific runtime-key mirrors of the writers' schemas: redb compares type_name
 // and fixed_width on open, so guardian-N.redb needs guardian_common::* names and
 // relayer.redb needs psy_relayer_cli::* names; byte payloads pass through unchanged.
@@ -64,23 +64,23 @@ struct GuardianDepositTreeKey([u8; 17]);
 #[derive(Debug)]
 struct GuardianWithdrawalBurnKey([u8; 56]);
 #[derive(Debug)]
-struct GuardianNonce([u8; 49]);
+struct GuardianWithdrawalNonceKey([u8; 49]);
 #[derive(Debug)]
 struct RelayerDepositTreeKey([u8; 17]);
 #[derive(Debug)]
 struct RelayerWithdrawalBurnKey([u8; 56]);
 #[derive(Debug)]
-struct RelayerNonce([u8; 49]);
+struct RelayerWithdrawalNonceKey([u8; 49]);
 macro_rules! runtime_key { ($ty:ident, $width:expr, $name:literal) => {
     impl redb::Value for $ty { type SelfType<'a> = Self; type AsBytes<'a> = [u8; $width]; fn fixed_width() -> Option<usize> { Some($width) } fn from_bytes<'a>(data: &'a [u8]) -> Self where Self: 'a { Self(data.try_into().unwrap()) } fn as_bytes<'a, 'b: 'a>(value: &'a Self) -> [u8; $width] where Self: 'a, Self: 'b { value.0 } fn type_name() -> redb::TypeName { redb::TypeName::new($name) } }
     impl redb::Key for $ty { fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering { a.cmp(b) } }
 }; }
 runtime_key!(GuardianDepositTreeKey, 17, "guardian_common::DepositTreeKey");
 runtime_key!(GuardianWithdrawalBurnKey, 56, "guardian_common::WithdrawalBurnKey");
-runtime_key!(GuardianNonce, 49, "guardian_common::NonceKey");
+runtime_key!(GuardianWithdrawalNonceKey, 49, "guardian_common::NonceKey");
 runtime_key!(RelayerDepositTreeKey, 17, "psy_relayer_cli::DepositTreeKey");
 runtime_key!(RelayerWithdrawalBurnKey, 56, "psy_relayer_cli::WithdrawalBurnKey");
-runtime_key!(RelayerNonce, 49, "psy_relayer_cli::NonceKey");
+runtime_key!(RelayerWithdrawalNonceKey, 49, "psy_relayer_cli::NonceKey");
 
 fn read(path: &Path) -> anyhow::Result<Vec<u8>> {
     fs::read(path).map_err(|_| anyhow::anyhow!("fixture/archive read failed (details redacted)"))
@@ -161,13 +161,13 @@ impl Journal {
             for nonce in nonces {
                 let key = (network, USER, *nonce);
                 if let Some(bytes) = signed_table.get(key).map_err(|_| anyhow::anyhow!("decision row unavailable"))?.map(|row| row.value().to_vec()) {
-                    let decoded = decode::<GuardianSigned>(&decode_record(&bytes, MAX_BODY_BYTES)?)?;
+                    let decoded = decode::<GuardianSigned>(&decode_record(&bytes)?)?;
                     decoded.validate().map_err(|_| anyhow::anyhow!("decision row rejected"))?;
                     ensure!((decoded.network_magic, decoded.user_id, decoded.nonce) == key, "decision key differs from encoded identity");
                     signed.push(decoded);
                 }
                 if let Some(bytes) = sessions.get(key).map_err(|_| anyhow::anyhow!("session row unavailable"))?.map(|row| row.value().to_vec()) {
-                    let decoded = decode::<GuardianSession>(&decode_record(&bytes, MAX_SESSION_RECORD_BYTES)?)?;
+                    let decoded = decode::<GuardianSession>(&decode_record(&bytes)?)?;
                     ensure!((decoded.network_magic, decoded.user_id, decoded.nonce) == key, "session key differs from encoded identity");
                     ensure!(decoded.record.request_json.decode().map_err(|_| anyhow::anyhow!("session request rejected"))?.session_nonce == decoded.nonce, "session request nonce mismatch");
                     retained_sessions.push(decoded);
@@ -334,10 +334,10 @@ impl Fixture {
         drop(tx.open_table(TableDefinition::<(), &[u8]>::new("finalization_batch")).map_err(|_| anyhow::anyhow!("finalization batch table unavailable"))?);
         drop(tx.open_table(TableDefinition::<RelayerDepositTreeKey, &[u8]>::new("deposit_tree_states")).map_err(|_| anyhow::anyhow!("relayer deposit tree states unavailable"))?);
         drop(tx.open_table(TableDefinition::<RelayerWithdrawalBurnKey, u64>::new("included_withdrawal_burns")).map_err(|_| anyhow::anyhow!("relayer withdrawal burn index unavailable"))?);
-        drop(tx.open_table(TableDefinition::<RelayerNonce, u64>::new("guardian_withdrawal_nonce")).map_err(|_| anyhow::anyhow!("relayer nonce unavailable"))?);
+        drop(tx.open_table(TableDefinition::<RelayerWithdrawalNonceKey, u64>::new("guardian_withdrawal_nonce")).map_err(|_| anyhow::anyhow!("relayer nonce unavailable"))?);
         let table = tx.open_table(TableDefinition::<u64, &[u8]>::new("relayer_request")).map_err(|_| anyhow::anyhow!("relayer request table unavailable"))?;
         table.get(nonce).map_err(|_| anyhow::anyhow!("relayer request row unavailable"))?.map(|row| {
-            let bytes = decode_record(row.value(), MAX_SESSION_RECORD_BYTES)?;
+            let bytes = decode_record(row.value())?;
             serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("relayer request row rejected"))
         }).transpose()
     }
@@ -383,7 +383,6 @@ impl Fixture {
         let path = self.path("next_members")?;
         protected(&path, false)?;
         let bytes = read(&path)?;
-        ensure!(bytes.len() <= MAX_BODY_BYTES, "replacement members exceed transport bound");
         let members = parse_canonical_json::<[guardian_common::protocol::Hash4; 3]>(&bytes).map_err(|_| anyhow::anyhow!("replacement members rejected"))?;
         ensure!(members.iter().all(|member| guardian_common::protocol::validate_hash(*member).is_ok()), "replacement member is not canonical");
         let serialized = serde_json::to_string(&members).map_err(|_| anyhow::anyhow!("replacement members rejected"))?;
@@ -519,14 +518,13 @@ impl Sessions {
         ensure!(response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case(expected)), "unexpected response representation");
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| anyhow::anyhow!("response interrupted"))? {
-            ensure!(body.len().checked_add(chunk.len()).is_some_and(|length| length <= if record { MAX_COMPRESSED_RECORD_BYTES } else { MAX_BODY_BYTES }), "response exceeds transport bound");
             body.extend_from_slice(&chunk);
         }
-        Ok(Some(if record { decode_record(&body, MAX_SESSION_RECORD_BYTES)? } else { body }))
+        Ok(Some(if record { decode_record(&body)? } else { body }))
     }
 
     async fn post_signature(&self, index: usize, request: &[u8]) -> anyhow::Result<Option<GuardianSignResponse>> {
-        let request = encode_record(request, MAX_BODY_BYTES)?;
+        let request = encode_record(request)?;
         let response = self.http.post(self.origins[index].join("v1/sign-session").map_err(|_| anyhow::anyhow!("signing URL unavailable"))?).header(reqwest::header::CONTENT_TYPE, RECORD_MEDIA).body(request).send().await;
         Ok(self.body(response, false).await?.and_then(|bytes| parse_canonical_json(&bytes).ok()))
     }

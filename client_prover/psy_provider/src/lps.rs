@@ -572,10 +572,11 @@ impl QTreeDataStoreReaderSync<F> for RpcProvider {
                 }
             }
             ResponseResult::Error(e) => {
-                error!("RPC call failed: {:?}", e);
                 if let Some(missing) = parse_missing_checkpoint_proof(&e, checkpoint_id) {
+                    debug!(checkpoint_id, "user tree proof not stored yet");
                     return Err(missing.into());
                 }
+                error!("RPC call failed: {:?}", e);
                 Err(anyhow::format_err!("get_user_tree_merkle_proof rpc call failed `{:?}`", e))
             }
         }

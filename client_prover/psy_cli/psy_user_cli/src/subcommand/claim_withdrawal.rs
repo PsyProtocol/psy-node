@@ -197,9 +197,50 @@ fn decimal_amount_to_hex(dec_str: &str) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
-async fn read_claimed_withdrawal_nonce(rpc_url: &str, bridge_address: &str, nonce_hex: &str) -> anyhow::Result<bool> {
-    let data = build_claimed_withdrawal_nonce_call_data(nonce_hex)?;
+/// A mined receipt's canonical identity: height plus the 32-byte block hash.
+/// State reads stay bound to this hash; a bare block number is never enough
+/// to attribute logs or claimedNullifiers.
+struct ReceiptBlockIdentity {
+    number: u64,
+    hash: String,
+}
 
+/// EIP-1898 block parameter. Mined state reads require this form; a provider
+/// rejection is an error and is not retried by block number.
+fn canonical_block_param(block_hash: &str) -> serde_json::Value {
+    serde_json::json!({ "blockHash": block_hash, "requireCanonical": true })
+}
+
+fn parse_block_hash(value: &serde_json::Value, context: &str) -> anyhow::Result<String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{context} is missing a block hash"))?;
+    let hex_body = raw.strip_prefix("0x").unwrap_or(raw);
+    anyhow::ensure!(
+        hex_body.len() == 64 && hex_body.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "{context} block hash is not 32 bytes: {raw}"
+    );
+    Ok(format!("0x{}", hex_body.to_ascii_lowercase()))
+}
+
+fn parse_block_number(value: &str, context: &str) -> anyhow::Result<u64> {
+    let raw = value.strip_prefix("0x").unwrap_or(value);
+    u64::from_str_radix(raw, 16).map_err(|err| anyhow::anyhow!("{context} block number {value:?} is invalid: {err}"))
+}
+
+/// One pinned eth_call. EIP-1898 `requireCanonical` is required. A provider
+/// that rejects it cannot be told apart from a reorg or an execution error, so
+/// there is no number-only fallback.
+async fn eth_call_at_receipt(rpc_url: &str, to: &str, data: &[u8], receipt: &ReceiptBlockIdentity) -> anyhow::Result<String> {
+    let call = serde_json::json!({ "to": to, "data": format!("0x{}", hex::encode(data)) });
+    let value = rpc_call(rpc_url, "eth_call", serde_json::json!([call, canonical_block_param(&receipt.hash)])).await?;
+    serde_json::from_value(value).map_err(|err| anyhow::anyhow!("eth_call result is not a string: {err}"))
+}
+
+/// Reads Bridge.claimedNullifiers(nonce). `block` is "latest" for pre-send
+/// checks; mined attribution uses `eth_call_at_receipt`.
+async fn read_claimed_withdrawal_nonce(rpc_url: &str, bridge_address: &str, nonce_hex: &str, block: &str) -> anyhow::Result<bool> {
+    let data = build_claimed_withdrawal_nonce_call_data(nonce_hex)?;
     let result: String = serde_json::from_value(
         rpc_call(
             rpc_url,
@@ -207,11 +248,44 @@ async fn read_claimed_withdrawal_nonce(rpc_url: &str, bridge_address: &str, nonc
             serde_json::json!([{
                 "to": bridge_address,
                 "data": format!("0x{}", hex::encode(&data)),
-            }, "latest"]),
+            }, block]),
         )
         .await?,
     )?;
-    Ok(U256::from_str_radix(result.trim_start_matches("0x"), 16).unwrap_or_default() != U256::ZERO)
+    parse_abi_bool_word(&result, "claimedNullifiers")
+}
+
+async fn read_claimed_withdrawal_nonce_at_receipt(
+    rpc_url: &str,
+    bridge_address: &str,
+    nonce_hex: &str,
+    receipt: &ReceiptBlockIdentity,
+) -> anyhow::Result<bool> {
+    let data = build_claimed_withdrawal_nonce_call_data(nonce_hex)?;
+    let raw = eth_call_at_receipt(rpc_url, bridge_address, &data, receipt).await?;
+    parse_abi_bool_word(&raw, "claimedNullifiers")
+}
+
+/// Decodes an ABI-encoded `bool` return word: exactly 32 bytes, canonical 0 or
+/// 1 in the last byte with the upper 31 bytes zero. A malformed, short, or
+/// non-canonical word is an error — never a silent false (or nonzero-true).
+fn parse_abi_bool_word(hex_str: &str, context: &str) -> anyhow::Result<bool> {
+    let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = hex::decode(raw).map_err(|err| anyhow::anyhow!("{context} returned a non-hex word: {err}"))?;
+    anyhow::ensure!(
+        bytes.len() == 32,
+        "{context} returned a {}-byte bool word, expected exactly 32",
+        bytes.len()
+    );
+    anyhow::ensure!(
+        bytes[..31].iter().all(|&byte| byte == 0),
+        "{context} returned a non-canonical bool word"
+    );
+    match bytes[31] {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => anyhow::bail!("{context} returned invalid bool value {other}"),
+    }
 }
 
 fn build_claimed_withdrawal_nonce_call_data(nonce_hex: &str) -> anyhow::Result<Vec<u8>> {
@@ -224,6 +298,204 @@ fn build_claimed_withdrawal_nonce_call_data(nonce_hex: &str) -> anyhow::Result<V
     data.extend_from_slice(&keccak256("claimedNullifiers(bytes32)".as_bytes())[..4]);
     data.extend_from_slice(&nonce_bytes);
     Ok(data)
+}
+
+/// Frozen `event WithdrawalClaimItemFailed(bytes32 indexed nonce, uint8 indexed slotIndex, uint8 reason)`
+/// from Bridge.sol: item-local failures skip the slot instead of reverting.
+const WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT: &str = "WithdrawalClaimItemFailed(bytes32,uint8,uint8)";
+
+/// Frozen `event WithdrawalPendingCreated(bytes32 indexed nonce, address indexed token, address indexed recipient, uint256 amount, uint64 claimableAt)`
+/// from Bridge.sol, emitted by `_registerPendingWithdrawal`; the only canonical
+/// per-nonce registration evidence, and it survives settlement.
+const WITHDRAWAL_PENDING_CREATED_EVENT: &str = "WithdrawalPendingCreated(bytes32,address,address,uint256,uint64)";
+
+/// Registration tuple carried by WithdrawalPendingCreated: (token, recipient, amount).
+type WithdrawalRegistrationTuple = ([u8; 32], [u8; 32], [u8; 32]);
+
+/// Frozen Bridge.sol CLAIM_REASON_* codes; 0 means valid and 11..=255 are reserved.
+fn describe_withdrawal_claim_failure_reason(reason: u8) -> String {
+    match reason {
+        1 => "address high bits nonzero (1)".to_string(),
+        2 => "wrong destination chain (2)".to_string(),
+        3 => "zero recipient (3)".to_string(),
+        4 => "zero amount (4)".to_string(),
+        5 => "nullifier already claimed (5)".to_string(),
+        6 => "token not configured (6)".to_string(),
+        7 => "registration paused (7)".to_string(),
+        8 => "amount out of range (8)".to_string(),
+        9 => "total overflow (9)".to_string(),
+        10 => "claimable-at overflow (10)".to_string(),
+        other => format!("unknown failure reason {other}"),
+    }
+}
+
+fn hex_word_bytes(value: &str) -> Option<Vec<u8>> {
+    hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()
+}
+
+fn hex_word_bytes32(value: &str) -> Option<[u8; 32]> {
+    hex_word_bytes(value).and_then(|bytes| bytes.try_into().ok())
+}
+
+fn log_emitter_matches(log: &serde_json::Value, bridge_address: &str) -> bool {
+    log.get("address")
+        .and_then(|v| v.as_str())
+        .is_some_and(|a| a.eq_ignore_ascii_case(bridge_address))
+}
+
+/// A log flagged `removed: true` was reorged out and is never evidence. The
+/// flag must be absent or a JSON bool — `"true"`, `1`, or `null` is malformed
+/// and cannot be treated as still canonical.
+fn log_removed_flag(log: &serde_json::Value) -> anyhow::Result<bool> {
+    match log.get("removed") {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("log removed flag is not a boolean: {value}")),
+    }
+}
+
+fn log_is_reorg_removed(log: &serde_json::Value) -> bool {
+    matches!(log_removed_flag(log), Ok(true))
+}
+
+/// Returns the first log in a JSON log array accepted by `matcher`.
+fn find_matching_log<T>(logs: &serde_json::Value, matcher: impl Fn(&serde_json::Value) -> Option<T>) -> Option<T> {
+    for log in logs.as_array()? {
+        if let Some(parsed) = matcher(log) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+/// `WithdrawalClaimItemFailed(bytes32 indexed nonce, uint8 indexed slotIndex, uint8 reason)`:
+/// topics [sig, nonce, slotIndex], reason non-indexed in the data word. The full
+/// emitter tuple must match (contract address, event topic, indexed nonce, and —
+/// for this single-slot submitter — slot 0), and the reason word must be exactly
+/// 32 bytes with the upper 31 zero. Malformed or unrelated logs are ignored;
+/// an undecodable event can never affect the classification, which is decided
+/// by the pinned claimedNullifiers read.
+fn parse_withdrawal_claim_item_failed_log(
+    log: &serde_json::Value,
+    bridge_address: &str,
+    nonce_bytes: &[u8; 32],
+) -> Option<u8> {
+    if log_is_reorg_removed(log) || !log_emitter_matches(log, bridge_address) {
+        return None;
+    }
+    let topics = log.get("topics")?.as_array()?;
+    if topics.len() != 3 {
+        return None;
+    }
+    let failed_topic0 = hex_word_bytes32(topics[0].as_str()?)?;
+    if failed_topic0.as_slice() != &keccak256(WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT.as_bytes())[..] {
+        return None;
+    }
+    if hex_word_bytes32(topics[1].as_str()?)?.as_slice() != nonce_bytes.as_slice() {
+        return None;
+    }
+    if hex_word_bytes32(topics[2].as_str()?)? != [0u8; 32] {
+        return None;
+    }
+    let data = hex_word_bytes(log.get("data")?.as_str()?)?;
+    if data.len() == 32 && data[..31].iter().all(|&byte| byte == 0) {
+        Some(data[31])
+    } else {
+        None
+    }
+}
+
+/// CLAIM_REASON_* code from the WithdrawalClaimItemFailed log for this nonce
+/// in the receipt's `logs` array.
+fn extract_withdrawal_claim_item_failure_reason(
+    logs: &serde_json::Value,
+    bridge_address: &str,
+    nonce_bytes: &[u8; 32],
+) -> Option<u8> {
+    find_matching_log(logs, |log| parse_withdrawal_claim_item_failed_log(log, bridge_address, nonce_bytes))
+}
+
+/// `WithdrawalPendingCreated(bytes32 indexed nonce, address indexed token,
+/// address indexed recipient, uint256 amount, uint64 claimableAt)`: topics
+/// [sig, nonce, token, recipient], data carries the 32-byte amount word then the
+/// claimable-at word (uint64, upper 24 bytes zero). Decodes the (token,
+/// recipient, amount) words of this bridge's event for the given nonce.
+/// Reorg-removed logs are never evidence; a present non-boolean `removed` flag
+/// is an error. Once topic0 identifies this event, the frozen ABI fixes four
+/// topics: a wrong count or malformed nonce topic is malformed evidence and an
+/// error, while a well-formed event for a different nonce stays irrelevant.
+fn parse_withdrawal_pending_created_log(
+    log: &serde_json::Value,
+    bridge_address: &str,
+    nonce_bytes: &[u8; 32],
+) -> anyhow::Result<Option<WithdrawalRegistrationTuple>> {
+    if log_removed_flag(log)? || !log_emitter_matches(log, bridge_address) {
+        return Ok(None);
+    }
+    let Some(topics) = log.get("topics").and_then(|value| value.as_array()) else {
+        return Ok(None);
+    };
+    let Some(created_topic0) = topics.first().and_then(|topic| topic.as_str()).and_then(hex_word_bytes32) else {
+        return Ok(None);
+    };
+    if created_topic0.as_slice() != &keccak256(WITHDRAWAL_PENDING_CREATED_EVENT.as_bytes())[..] {
+        return Ok(None);
+    }
+    // Recognized event: the frozen ABI fixes four topics. A malformed count —
+    // including a missing nonce topic — is malformed evidence, never an
+    // ignored log; a well-formed event for a different nonce stays irrelevant.
+    anyhow::ensure!(topics.len() == 4, "WithdrawalPendingCreated log has {} topics, expected 4", topics.len());
+    let Some(topic_nonce) = topics.get(1).and_then(|topic| topic.as_str()).and_then(hex_word_bytes32) else {
+        anyhow::bail!("WithdrawalPendingCreated log has a malformed nonce topic");
+    };
+    if topic_nonce.as_slice() != nonce_bytes.as_slice() {
+        return Ok(None);
+    }
+    let (Some(token), Some(recipient)) = (
+        topics[2].as_str().and_then(hex_word_bytes32),
+        topics[3].as_str().and_then(hex_word_bytes32),
+    ) else {
+        anyhow::bail!("WithdrawalPendingCreated log has a malformed token or recipient topic");
+    };
+    let Some(data) = log.get("data").and_then(|value| value.as_str()).and_then(hex_word_bytes) else {
+        anyhow::bail!("WithdrawalPendingCreated log has malformed data");
+    };
+    if data.len() != 64 || data[32..56].iter().any(|&byte| byte != 0) {
+        anyhow::bail!("WithdrawalPendingCreated log has a non-canonical amount or claimableAt word");
+    }
+    let mut amount = [0u8; 32];
+    amount.copy_from_slice(&data[..32]);
+    Ok(Some((token, recipient, amount)))
+}
+
+/// Every canonical WithdrawalPendingCreated for this nonce in a receipt's
+/// `logs` array — for the submitted transaction this is its own registration
+/// evidence. A non-array `logs` value or a malformed `removed` flag is an
+/// error — never an empty list.
+fn extract_withdrawal_pending_created_tuples(
+    logs: &serde_json::Value,
+    bridge_address: &str,
+    nonce_bytes: &[u8; 32],
+) -> anyhow::Result<Vec<WithdrawalRegistrationTuple>> {
+    let array = logs
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("registration log response is not an array"))?;
+    let mut tuples = Vec::new();
+    for log in array {
+        if let Some(tuple) = parse_withdrawal_pending_created_log(log, bridge_address, nonce_bytes)? {
+            tuples.push(tuple);
+        }
+    }
+    Ok(tuples)
+}
+
+/// The raw 32-byte nonce from the claimedNullifiers calldata builder.
+fn claimed_nonce_bytes(nonce_hex: &str) -> anyhow::Result<[u8; 32]> {
+    let call_data = build_claimed_withdrawal_nonce_call_data(nonce_hex)?;
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&call_data[4..]);
+    Ok(bytes)
 }
 
 fn parse_u256_word_array(proof_data: &serde_json::Value, field: &str, expected_len: usize) -> anyhow::Result<Vec<String>> {
@@ -331,13 +603,15 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
     if let Some(prove_proxy_url) = &args.prove_proxy_url {
         let deployments_network = resolve_current_deployments_network(&args.rpc_config)?;
         let bridge_addr = resolve_bridge_address_for_network(&deployments_network)?;
-        if read_claimed_withdrawal_nonce(&args.l1_rpc_url, &bridge_addr, &nonce_hex).await? {
-            println!("withdrawal already claimed on L1 for nonce {}", nonce_hex);
-            return Ok(CommandResult::L1Transaction(L1TransactionResult {
-                transaction_hash: None,
-                status: L1TransactionStatus::AlreadyClaimed,
-                chain_id: None,
-            }));
+        // A consumed nonce can never register again: the item would be skipped
+        // with reason 5 no matter which withdrawal consumed it. Advisory
+        // preflight at the provider's canonical head; mined attribution below
+        // stays pinned to the receipt.
+        if read_claimed_withdrawal_nonce(&args.l1_rpc_url, &bridge_addr, &nonce_hex, "latest").await? {
+            anyhow::bail!(
+                "withdrawal nonce {} is already consumed (claimedNullifiers is true); refusing to submit",
+                nonce_hex
+            );
         }
 
         tracing::info!("Generating Groth16 proof via prove-proxy: {}", prove_proxy_url);
@@ -437,7 +711,8 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
         )?;
         let nonce = u64::from_str_radix(account_nonce_hex.trim_start_matches("0x"), 16)?;
 
-        let gas_estimate = match rpc_call(
+        // An estimate failure must not invent success or trigger a retry.
+        let gas_estimate = rpc_call(
             rpc_url,
             "eth_estimateGas",
             serde_json::json!([{
@@ -446,21 +721,7 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
                 "data": format!("0x{}", hex::encode(&data)),
             }]),
         )
-        .await
-        {
-            Ok(val) => val,
-            Err(err) => {
-                if read_claimed_withdrawal_nonce(rpc_url, &bridge_addr, &nonce_hex).await.unwrap_or(false) {
-                    println!("withdrawal already claimed on L1 for nonce {}", nonce_hex);
-                    return Ok(CommandResult::L1Transaction(L1TransactionResult {
-                        transaction_hash: None,
-                        status: L1TransactionStatus::AlreadyClaimed,
-                        chain_id: Some(chain_id),
-                    }));
-                }
-                return Err(err);
-            }
-        };
+        .await?;
         let gas_hex: String = serde_json::from_value(gas_estimate)?;
         let gas_limit = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16)?;
         let gas_limit = (gas_limit as f64 * 1.2) as u64;
@@ -490,26 +751,16 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
         let mut encoded = Vec::new();
         signed.encode_2718(&mut encoded);
 
-        let tx_hash_raw: String = match rpc_call(
-            rpc_url,
-            "eth_sendRawTransaction",
-            serde_json::json!([format!("0x{}", hex::encode(&encoded))]),
-        )
-        .await
-        {
-            Ok(val) => serde_json::from_value(val)?,
-            Err(err) => {
-                if read_claimed_withdrawal_nonce(rpc_url, &bridge_addr, &nonce_hex).await.unwrap_or(false) {
-                    println!("withdrawal already claimed on L1 for nonce {}", nonce_hex);
-                    return Ok(CommandResult::L1Transaction(L1TransactionResult {
-                        transaction_hash: None,
-                        status: L1TransactionStatus::AlreadyClaimed,
-                        chain_id: Some(chain_id),
-                    }));
-                }
-                return Err(err);
-            }
-        };
+        // A send failure leaves the transaction outcome unknown: it is never
+        // retried here and never reported as success.
+        let tx_hash_raw: String = serde_json::from_value(
+            rpc_call(
+                rpc_url,
+                "eth_sendRawTransaction",
+                serde_json::json!([format!("0x{}", hex::encode(&encoded))]),
+            )
+            .await?,
+        )?;
         let tx_hash: alloy_primitives::TxHash = tx_hash_raw.parse()?;
         tracing::info!("claim_withdrawal tx submitted: {}", tx_hash);
         println!("claim_withdrawal tx: {}", tx_hash);
@@ -524,8 +775,8 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
         };
         let status_str = receipt["status"].as_str().unwrap_or("0x0");
         let status = u64::from_str_radix(status_str.trim_start_matches("0x"), 16).unwrap_or(0);
-        println!("status: {}", if status == 1 { "success" } else { "failed" });
         if status != 1 {
+            println!("status: failed");
             let trace = rpc_call(
                 rpc_url,
                 "debug_traceTransaction",
@@ -541,11 +792,68 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
                 revert_reason.as_deref().unwrap_or("unknown")
             );
         }
-        Ok(CommandResult::L1Transaction(L1TransactionResult {
-            transaction_hash: Some(format!("{:#x}", tx_hash)),
-            status: L1TransactionStatus::Confirmed,
-            chain_id: Some(chain_id),
-        }))
+
+        // A status-1 receipt does not prove this nonce registered. Bind the
+        // receipt's block hash first, then read claimedNullifiers there.
+        let receipt_block = parse_block_number(
+            receipt["blockNumber"].as_str().unwrap_or_default(),
+            "claim-withdrawal receipt",
+        )
+        .map_err(|err| anyhow::anyhow!("claim-withdrawal receipt missing valid blockNumber: tx_hash={:#x}: {err}", tx_hash))?;
+        let receipt_hash = parse_block_hash(&receipt["blockHash"], "claim-withdrawal receipt")
+            .map_err(|err| anyhow::anyhow!("claim-withdrawal receipt missing valid blockHash: tx_hash={:#x}: {err}", tx_hash))?;
+        let receipt_identity = ReceiptBlockIdentity { number: receipt_block, hash: receipt_hash };
+        let registered = read_claimed_withdrawal_nonce_at_receipt(rpc_url, &bridge_addr, &nonce_hex, &receipt_identity)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "could not verify claimedNullifiers for nonce {} at receipt block {:#x} {}: {}",
+                    nonce_hex, receipt_block, receipt_identity.hash, err
+                )
+            })?;
+        let nonce_bytes = claimed_nonce_bytes(&nonce_hex)?;
+        let receipt_logs = receipt
+            .get("logs")
+            .ok_or_else(|| anyhow::anyhow!("claim-withdrawal receipt missing logs: tx_hash={:#x}", tx_hash))?;
+        let own_tuples = extract_withdrawal_pending_created_tuples(receipt_logs, &bridge_addr, &nonce_bytes)
+            .map_err(|err| anyhow::anyhow!("claim-withdrawal receipt logs are malformed: tx_hash={:#x}: {err}", tx_hash))?;
+
+        let reason_code = extract_withdrawal_claim_item_failure_reason(receipt_logs, &bridge_addr, &nonce_bytes);
+        // A slot-0 failure for this nonce is authoritative and can never
+        // coexist with a registration of the same item; it is parsed before any
+        // success verdict so contradictory logs never confirm.
+        if let Some(reason) = reason_code {
+            anyhow::bail!(
+                "L1 claim-withdrawal failed: nonce {} item skipped with {}; the WithdrawalClaimItemFailed event for this nonce and slot 0 is authoritative and refuses success",
+                nonce_hex,
+                describe_withdrawal_claim_failure_reason(reason)
+            );
+        }
+
+        // This transaction's own WithdrawalPendingCreated for the nonce is the
+        // only registration evidence for the submitted call.
+        if registered && !own_tuples.is_empty() {
+            println!("status: success");
+            return Ok(CommandResult::L1Transaction(L1TransactionResult {
+                transaction_hash: Some(format!("{:#x}", tx_hash)),
+                status: L1TransactionStatus::Confirmed,
+                chain_id: Some(chain_id),
+            }));
+        }
+
+        let reason = if registered {
+            "claimedNullifiers is true but no WithdrawalClaimItemFailed event decoded".to_string()
+        } else {
+            "claimedNullifiers is false and no WithdrawalClaimItemFailed event decoded".to_string()
+        };
+        println!(
+            "claim not registered: nonce {} skipped at receipt block {:#x} ({})",
+            nonce_hex, receipt_block, reason
+        );
+        anyhow::bail!(
+            "L1 claim-withdrawal transaction succeeded but withdrawal nonce {} was not registered at receipt block {:#x}: {}",
+            nonce_hex, receipt_block, reason
+        );
     } else {
         Ok(CommandResult::L1Transaction(L1TransactionResult {
             transaction_hash: None,
@@ -558,18 +866,23 @@ pub async fn run(args: ClaimWithdrawalArgs) -> anyhow::Result<CommandResult> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         io::{Read, Write},
         net::TcpListener,
+        sync::{Arc, Mutex},
         thread,
     };
 
     use super::{
-        build_claimed_withdrawal_nonce_call_data, bytes32_hex_to_u32x8_be, compute_withdrawal_leaf_hash, hex_to_u32x8_be, keccak256,
-        normalize_u256_hex_32bytes, parse_u256_word_array, resolve_bridge_address_for_network, run, to_32byte_hex,
-        LEGACY_WITHDRAWAL_BATCH_CLAIM_SIGNATURE, WITHDRAWAL_BATCH_CLAIM_SIGNATURE, WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS,
+        build_claimed_withdrawal_nonce_call_data, bytes32_hex_to_u32x8_be, claimed_nonce_bytes, compute_withdrawal_leaf_hash,
+        decimal_amount_to_hex, describe_withdrawal_claim_failure_reason, extract_withdrawal_claim_item_failure_reason,
+        extract_withdrawal_pending_created_tuples, hex_to_u32x8_be, keccak256, normalize_u256_hex_32bytes, parse_u256_word_array,
+        resolve_bridge_address_for_network, run, to_32byte_hex, LEGACY_WITHDRAWAL_BATCH_CLAIM_SIGNATURE,
+        WITHDRAWAL_BATCH_CLAIM_SIGNATURE, WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS, WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT,
+        WITHDRAWAL_PENDING_CREATED_EVENT,
     };
-    use crate::subcommand::args::ClaimWithdrawalArgs;
     use crate::result::{CommandResult, L1TransactionStatus};
+    use crate::subcommand::args::ClaimWithdrawalArgs;
 
     fn spawn_single_response_server(body: serde_json::Value) -> String {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -700,5 +1013,635 @@ mod tests {
             .or_else(|| summary["core"]["Bridge"].as_str())
             .unwrap();
         assert_eq!(bridge, expected);
+    }
+
+    type RpcRequestLog = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    const L1_TEST_RPC_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../psy-genesis/config.json");
+    /// Well-known anvil devnet key #0 — public test fixture, not a secret.
+    const L1_TEST_PRIVATE_KEY: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    fn u256_word(value: u64) -> serde_json::Value {
+        serde_json::json!(format!("0x{:064x}", value))
+    }
+
+    fn repeat_words(count: usize) -> serde_json::Value {
+        serde_json::Value::Array((0..count).map(|_| serde_json::json!("0")).collect())
+    }
+
+    fn read_http_request_body(stream: &mut std::net::TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).ok()?;
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..header_end]);
+                let mut content_length = 0usize;
+                for line in head.lines() {
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let body_start = header_end + 4;
+                if buf.len() >= body_start + content_length {
+                    return Some(String::from_utf8_lossy(&buf[body_start..body_start + content_length]).into_owned());
+                }
+            }
+            if n == 0 {
+                return None;
+            }
+        }
+    }
+
+    fn write_http_json_response(stream: &mut std::net::TcpStream, body: &serde_json::Value) {
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    }
+
+    /// JSON-RPC node for the full claim flow. `eth_call` responses are keyed by
+    /// `<block tag>:<selector hex>` (see `call_key`) so the pre-send "latest"
+    /// read and the receipt-hash pinned reads are canned independently; every
+    /// request is recorded so tests can assert pinned blocks and call counts.
+    fn spawn_rpc_router(
+        methods: BTreeMap<&'static str, serde_json::Value>,
+        calls_by_block: BTreeMap<String, serde_json::Value>,
+        requests: RpcRequestLog,
+    ) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let methods = Arc::new(methods);
+        let calls_by_block = Arc::new(calls_by_block);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Some(body) = read_http_request_body(&mut stream) else { continue };
+                let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+                let method = request["method"].as_str().unwrap_or("").to_string();
+                let params = request["params"].clone();
+                requests.lock().unwrap().push((method.clone(), params));
+                let id = request["id"].clone();
+                let canned = if method == "eth_call" {
+                    let block_param = &request["params"][1];
+                    let block_tag = block_param["blockHash"].as_str().or_else(|| block_param.as_str()).unwrap_or("");
+                    let selector = request["params"][0]["data"].as_str().and_then(|data| data.get(2..10)).unwrap_or("");
+                    calls_by_block.get(&format!("{block_tag}:{selector}")).cloned()
+                } else {
+                    methods.get(method.as_str()).cloned()
+                };
+                let response = match canned {
+                    Some(value) if value.get("rpc_error").is_some() => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {
+                            "code": value["rpc_code"].as_i64().unwrap_or(-32000),
+                            "message": value["rpc_error"].as_str().unwrap_or("test rpc error")
+                        }
+                    }),
+                    Some(value) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": value }),
+                    None => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32601, "message": format!("test server has no canned response for {method}") }
+                    }),
+                };
+                write_http_json_response(&mut stream, &response);
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    const FIXTURE_BLOCK_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn mined_status1_receipt(block_number: &str, logs: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "status": "0x1",
+            "blockNumber": block_number,
+            "blockHash": FIXTURE_BLOCK_HASH,
+            "logs": logs
+        })
+    }
+
+    /// eth_call canned-response key: block tag plus the 4-byte selector hex, so
+    /// different getters at the same block can be canned independently.
+    fn call_key(block: &str, signature: &str) -> String {
+        format!("{}:{}", block, hex::encode(&keccak256(signature.as_bytes())[..4]))
+    }
+
+    fn claimed_key(block: &str) -> String {
+        call_key(block, "claimedNullifiers(bytes32)")
+    }
+
+    fn recorded_calls(requests: &RpcRequestLog) -> Vec<serde_json::Value> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == "eth_call")
+            .map(|(_, params)| params.clone())
+            .collect()
+    }
+
+    fn assert_eth_call_targets_claimed_nullifiers(params: &serde_json::Value) {
+        let data = params[0]["data"].as_str().unwrap();
+        let selector = format!("0x{}", hex::encode(&keccak256("claimedNullifiers(bytes32)".as_bytes())[..4]));
+        assert!(data.starts_with(&selector), "eth_call must target claimedNullifiers: {data}");
+        assert_eq!(hex::decode(&data[2 + selector.len() - 2..]).unwrap().len(), 32, "nonce word must be 32 bytes");
+    }
+
+    /// WithdrawalPendingCreated log for the fixture's withdrawal (nonce 13,
+    /// token 0xd970…, recipient 0x1f1a…). The amount word is opaque to the
+    /// submitter, which never compares payout fields.
+    fn pending_created_log(amount_word: &str) -> serde_json::Value {
+        let bridge = resolve_bridge_address_for_network("localhost").unwrap();
+        serde_json::json!([{
+            "address": bridge,
+            "topics": [
+                format!("0x{}", hex::encode(&keccak256(WITHDRAWAL_PENDING_CREATED_EVENT.as_bytes())[..])),
+                normalize_u256_hex_32bytes("13").unwrap(),
+                to_32byte_hex("0xd970407ff0af85d90d936c1c457504e5415af424"),
+                to_32byte_hex("0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9"),
+            ],
+            "data": format!("0x{}{}", &amount_word[2..], format!("{:064x}", 0u64)),
+        }])
+    }
+
+    /// WithdrawalClaimItemFailed log for nonce 13, slot 0, with a numeric reason.
+    fn item_failed_log(reason: u8) -> serde_json::Value {
+        let bridge = resolve_bridge_address_for_network("localhost").unwrap();
+        serde_json::json!([{
+            "address": bridge,
+            "topics": [
+                format!("0x{}", hex::encode(&keccak256(WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT.as_bytes())[..])),
+                normalize_u256_hex_32bytes("13").unwrap(),
+                format!("0x{:064x}", 0u64),
+            ],
+            "data": format!("0x{:064x}", reason as u64),
+        }])
+    }
+
+    /// The amount word the fixture's args decode to (matches prod's
+    /// decimal_amount_to_hex path).
+    fn fixture_amount_word() -> String {
+        decimal_amount_to_hex("990000000")
+    }
+
+    /// Full claim flow: services proof, prove-proxy proof, and a canned L1 node.
+    /// Receipt-block eth_call entries are inserted as
+    /// `claimed_key("<receipt number hex>")` and mirrored onto the receipt hash
+    /// the pinned read uses; the pre-send "latest" read defaults to unclaimed
+    /// unless the test overrides it. `method_overrides` replaces canned
+    /// non-call methods (e.g. an rpc_error for eth_estimateGas).
+    fn l1_claim_flow_fixture(
+        receipt: serde_json::Value,
+        mut calls_by_block: BTreeMap<String, serde_json::Value>,
+        method_overrides: BTreeMap<&'static str, serde_json::Value>,
+    ) -> (ClaimWithdrawalArgs, RpcRequestLog) {
+        let recipient = "0x1f1a375ecf83fc0524de82a53b7f3e9a2ff5d8a9";
+        let token_address = "0xd970407ff0af85d90d936c1c457504e5415af424";
+        let amount = "990000000";
+        let nonce = "13";
+        let sender_user_id = 42u64;
+        let normalized_nonce = normalize_u256_hex_32bytes(nonce).unwrap();
+        let leaf_hash = compute_withdrawal_leaf_hash(sender_user_id, recipient, token_address, amount, &normalized_nonce, 0).unwrap();
+
+        let services_url = spawn_single_response_server(serde_json::json!({
+            "success": true,
+            "data": {
+                "found": true,
+                "leaf_index": 0,
+                "leaf_hash": leaf_hash,
+                "siblings": [],
+                "withdrawal_root": "0x1234",
+                "withdrawal": { "sender_user_id": sender_user_id }
+            }
+        }));
+
+        let prove_proxy_url = spawn_single_response_server(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "solidity_proof": repeat_words(8),
+                "public_inputs": repeat_words(18),
+                "slot_data": repeat_words(WITHDRAWAL_BATCH_CLAIM_SLOT_DATA_WORDS),
+            }
+        }));
+
+        let mut methods = BTreeMap::new();
+        methods.insert("eth_chainId", serde_json::json!("0x7a69"));
+        methods.insert("eth_getTransactionCount", serde_json::json!("0x0"));
+        methods.insert("eth_estimateGas", serde_json::json!("0x186a0"));
+        methods.insert("eth_feeHistory", serde_json::json!({ "baseFeePerGas": ["0x1"], "reward": [["0x1"]] }));
+        methods.insert(
+            "eth_sendRawTransaction",
+            serde_json::json!("0x9f8c3f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e"),
+        );
+        methods.insert("eth_getTransactionReceipt", receipt);
+        for (method, value) in method_overrides {
+            methods.insert(method, value);
+        }
+
+        calls_by_block
+            .entry(claimed_key("latest"))
+            .or_insert_with(|| u256_word(0));
+        let receipt_number = methods
+            .get("eth_getTransactionReceipt")
+            .and_then(|receipt| receipt["blockNumber"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let receipt_hash = methods
+            .get("eth_getTransactionReceipt")
+            .and_then(|receipt| receipt["blockHash"].as_str())
+            .unwrap_or(FIXTURE_BLOCK_HASH)
+            .to_string();
+        let mirrored: Vec<(String, serde_json::Value)> = calls_by_block
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix(&format!("{receipt_number}:"))
+                    .map(|selector| (format!("{receipt_hash}:{selector}"), value.clone()))
+            })
+            .collect();
+        for (key, value) in mirrored {
+            calls_by_block.entry(key).or_insert(value);
+        }
+
+        let requests: RpcRequestLog = Arc::new(Mutex::new(Vec::new()));
+        let l1_rpc_url = spawn_rpc_router(methods, calls_by_block, requests.clone());
+
+        let args = ClaimWithdrawalArgs {
+            rpc_config: L1_TEST_RPC_CONFIG.to_string(),
+            services_url,
+            l1_rpc_url,
+            private_key: L1_TEST_PRIVATE_KEY.to_string(),
+            recipient: recipient.to_string(),
+            token_address: token_address.to_string(),
+            amount: amount.to_string(),
+            nonce: nonce.to_string(),
+            destination_chain_index: 0,
+            sender_user_id: None,
+            prove_proxy_url: Some(prove_proxy_url),
+            prove_proxy_token: None,
+        };
+        (args, requests)
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_pre_send_consumed_nonce_refuses_to_submit() {
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("latest"), u256_word(1));
+        let (args, requests) =
+            l1_claim_flow_fixture(mined_status1_receipt("0x10", serde_json::json!([])), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("a consumed nonce must not be submitted"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("already consumed"), "{err}");
+        assert!(requests.lock().unwrap().iter().all(|(method, _)| method != "eth_sendRawTransaction"));
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_own_registration_event_returns_confirmed() {
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), u256_word(1));
+        let receipt = mined_status1_receipt("0x10", pending_created_log(&fixture_amount_word()));
+        let (args, requests) = l1_claim_flow_fixture(receipt, calls_by_block, BTreeMap::new());
+
+        let result = run(args).await.unwrap();
+        let CommandResult::L1Transaction(result) = result else {
+            panic!("expected L1 transaction result");
+        };
+        assert!(matches!(result.status, L1TransactionStatus::Confirmed));
+        assert!(result.transaction_hash.is_some());
+        assert_eq!(result.chain_id, Some(31337));
+
+        // One pre-send read at "latest", then claimedNullifiers pinned to the
+        // receipt hash; status 1 alone never confirms.
+        let calls = recorded_calls(&requests);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1], serde_json::json!("latest"));
+        assert_eq!(calls[1][1]["blockHash"], serde_json::json!(FIXTURE_BLOCK_HASH));
+        assert_eq!(calls[1][1]["requireCanonical"], serde_json::json!(true));
+        for params in &calls {
+            assert_eth_call_targets_claimed_nullifiers(params);
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_unregistered_nonce_fails_closed() {
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), u256_word(0));
+        let (args, requests) =
+            l1_claim_flow_fixture(mined_status1_receipt("0x10", serde_json::json!([])), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("expected claim-withdrawal to fail closed"),
+            Err(error) => error,
+        };
+        let normalized_nonce = normalize_u256_hex_32bytes("13").unwrap();
+        let message = err.to_string();
+        assert!(message.contains(&normalized_nonce), "error must name the nonce: {message}");
+        assert!(message.contains("not registered"), "error must state the skip: {message}");
+        assert!(message.contains("claimedNullifiers is false"), "error must name the mapping state: {message}");
+
+        let calls = recorded_calls(&requests);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1], serde_json::json!("latest"));
+        assert_eq!(calls[1][1]["blockHash"], serde_json::json!(FIXTURE_BLOCK_HASH));
+        assert_eth_call_targets_claimed_nullifiers(&calls[1]);
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_registered_without_own_event_fails_closed() {
+        // claimedNullifiers is true at the receipt but this transaction's logs
+        // carry no WithdrawalPendingCreated for the nonce: nothing confirms and
+        // the nonce is never labeled as belonging to this withdrawal.
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), u256_word(1));
+        let (args, _) =
+            l1_claim_flow_fixture(mined_status1_receipt("0x10", serde_json::json!([])), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("registration without this tx's own event must not confirm"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
+        assert!(message.contains("not registered"), "{message}");
+        assert!(message.contains("no WithdrawalClaimItemFailed event decoded"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_reason5_item_failed_is_authoritative() {
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), u256_word(0));
+        let (args, _) = l1_claim_flow_fixture(mined_status1_receipt("0x10", item_failed_log(5)), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("reason 5 must fail"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
+        assert!(message.contains("nullifier already claimed (5)"), "error must carry the frozen reason: {message}");
+        assert!(message.contains("skipped"), "{message}");
+        assert!(!message.contains("not registered"), "reason 5 is reported verbatim: {message}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_item_failed_surfaces_frozen_reason() {
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), u256_word(0));
+        let (args, _) = l1_claim_flow_fixture(mined_status1_receipt("0x10", item_failed_log(8)), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("expected claim-withdrawal to fail closed"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
+        assert!(message.contains("amount out of range (8)"), "error must carry the frozen reason: {message}");
+        assert!(message.contains("authoritative"), "the failure event refuses success: {message}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_conflicting_created_and_failed_logs_fail_closed() {
+        // A receipt carrying both this nonce's WithdrawalPendingCreated and a
+        // slot-0 WithdrawalClaimItemFailed is contradictory evidence: the
+        // failure event is parsed before any success verdict and refuses
+        // confirmation.
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), u256_word(1));
+        let mut both = pending_created_log(&fixture_amount_word());
+        both.as_array_mut().unwrap().push(item_failed_log(5)[0].clone());
+        let (args, _) = l1_claim_flow_fixture(mined_status1_receipt("0x10", both), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("contradictory created+failed logs must never confirm"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
+        assert!(message.contains("nullifier already claimed (5)"), "{message}");
+        assert!(message.contains("authoritative"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_claimed_read_error_fails_closed() {
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), serde_json::json!({ "rpc_error": "node unavailable" }));
+        let (args, requests) =
+            l1_claim_flow_fixture(mined_status1_receipt("0x10", serde_json::json!([])), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("expected claim-withdrawal to fail closed"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
+        assert!(message.contains("could not verify claimedNullifiers"), "unexpected error: {message}");
+        assert!(message.contains("receipt block 0x10"), "error must pin the receipt block: {message}");
+
+        let calls = recorded_calls(&requests);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1], serde_json::json!("latest"));
+        assert_eq!(calls[1][1]["blockHash"], serde_json::json!(FIXTURE_BLOCK_HASH));
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_malformed_bool_word_fails_closed() {
+        // One-byte word: not a valid ABI bool return, must never decode as false.
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), serde_json::json!("0x01"));
+        let (args, requests) =
+            l1_claim_flow_fixture(mined_status1_receipt("0x10", serde_json::json!([])), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("expected claim-withdrawal to fail closed"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("could not verify claimedNullifiers"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("claimedNullifiers returned a 1-byte bool word, expected exactly 32"),
+            "error must name the malformed word: {message}"
+        );
+
+        let calls = recorded_calls(&requests);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1], serde_json::json!("latest"));
+        assert_eq!(calls[1][1]["blockHash"], serde_json::json!(FIXTURE_BLOCK_HASH));
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_noncanonical_bool_word_fails_closed() {
+        // 32 bytes but value 2: neither canonical true nor false.
+        let mut calls_by_block = BTreeMap::new();
+        calls_by_block.insert(claimed_key("0x10"), u256_word(2));
+        let (args, _requests) =
+            l1_claim_flow_fixture(mined_status1_receipt("0x10", serde_json::json!([])), calls_by_block, BTreeMap::new());
+
+        let err = match run(args).await {
+            Ok(_) => panic!("expected claim-withdrawal to fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("claimedNullifiers returned invalid bool value 2"),
+            "error must reject the non-canonical word"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_estimate_error_fails_closed_without_send() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("eth_estimateGas", serde_json::json!({ "rpc_error": "gas required exceeds allowance" }));
+        let (args, requests) =
+            l1_claim_flow_fixture(mined_status1_receipt("0x10", serde_json::json!([])), BTreeMap::new(), overrides);
+
+        let err = match run(args).await {
+            Ok(_) => panic!("an estimate failure must not invent success"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("eth_estimateGas"), "{err}");
+        assert!(requests.lock().unwrap().iter().all(|(method, _)| method != "eth_sendRawTransaction"));
+    }
+
+    #[tokio::test]
+    async fn claim_withdrawal_send_error_fails_closed_without_retry() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "eth_sendRawTransaction",
+            serde_json::json!({ "rpc_error": "replacement transaction underpriced" }),
+        );
+        let (args, requests) =
+            l1_claim_flow_fixture(mined_status1_receipt("0x10", serde_json::json!([])), BTreeMap::new(), overrides);
+
+        let err = match run(args).await {
+            Ok(_) => panic!("a send failure must not invent success"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("eth_sendRawTransaction"), "{err}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.iter().filter(|(method, _)| method == "eth_sendRawTransaction").count(),
+            1,
+            "the unknown-outcome transaction is never resubmitted"
+        );
+        assert!(requests.iter().all(|(method, _)| method != "eth_getTransactionReceipt"));
+    }
+
+    #[test]
+    fn claim_withdrawal_item_failed_event_requires_emitter_tuple() {
+        let normalized_nonce = normalize_u256_hex_32bytes("13").unwrap();
+        let nonce_bytes: [u8; 32] = hex::decode(normalized_nonce.trim_start_matches("0x")).unwrap().try_into().unwrap();
+        let bridge = resolve_bridge_address_for_network("localhost").unwrap();
+        let topic0 = format!("0x{}", hex::encode(&keccak256(WITHDRAWAL_CLAIM_ITEM_FAILED_EVENT.as_bytes())[..]));
+        let zero_word = format!("0x{:064x}", 0u64);
+        let log_with = |address: &str, nonce_topic: &str, slot_topic: &str, data: &str| {
+            serde_json::json!([{
+                "address": address,
+                "topics": [topic0.clone(), nonce_topic, slot_topic],
+                "data": data,
+            }])
+        };
+        let reason_word = format!("0x{:064x}", 8u64);
+
+        assert_eq!(
+            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &normalized_nonce, &zero_word, &reason_word), &bridge, &nonce_bytes),
+            Some(8)
+        );
+        assert_eq!(
+            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &normalized_nonce, &zero_word, &reason_word), &bridge, &[0u8; 32]),
+            None,
+            "a Failed event for a different nonce must be ignored"
+        );
+        assert_eq!(
+            extract_withdrawal_claim_item_failure_reason(
+                &log_with("0x000000000000000000000000000000000000dead", &normalized_nonce, &zero_word, &reason_word),
+                &bridge,
+                &nonce_bytes
+            ),
+            None,
+            "a Failed event from another emitter must be ignored"
+        );
+        assert_eq!(
+            extract_withdrawal_claim_item_failure_reason(
+                &log_with(&bridge, &normalized_nonce, &format!("0x{:064x}", 1u64), &reason_word),
+                &bridge,
+                &nonce_bytes
+            ),
+            None,
+            "a Failed event for a nonzero slot must be ignored (single-slot submitter)"
+        );
+        assert_eq!(
+            extract_withdrawal_claim_item_failure_reason(&log_with(&bridge, &normalized_nonce, &zero_word, "0x08"), &bridge, &nonce_bytes),
+            None,
+            "a malformed reason data word must be undecodable, not a reason"
+        );
+        assert_eq!(
+            extract_withdrawal_claim_item_failure_reason(
+                &log_with(&bridge, &normalized_nonce, &zero_word, &format!("0x{:063x}08", 1u64)),
+                &bridge,
+                &nonce_bytes
+            ),
+            None,
+            "a non-canonical reason word (upper bytes set) must be undecodable"
+        );
+        assert_eq!(
+            extract_withdrawal_claim_item_failure_reason(&serde_json::json!({}), &bridge, &nonce_bytes),
+            None
+        );
+    }
+
+    #[test]
+    fn claim_withdrawal_pending_created_log_presence_and_validation() {
+        let nonce_bytes = claimed_nonce_bytes("13").unwrap();
+        let bridge = resolve_bridge_address_for_network("localhost").unwrap();
+        let amount_word = fixture_amount_word();
+        let log = pending_created_log(&amount_word);
+
+        // This tx's own event for the nonce is registration evidence; presence
+        // is all the submitter reads — payout fields are never compared.
+        let tuples = extract_withdrawal_pending_created_tuples(&log, &bridge, &nonce_bytes).unwrap();
+        assert_eq!(tuples.len(), 1);
+        let expected_token = hex::decode(to_32byte_hex("0xd970407ff0af85d90d936c1c457504e5415af424").trim_start_matches("0x")).unwrap();
+        assert_eq!(tuples[0].0.as_slice(), expected_token.as_slice());
+
+        // A reorg-removed log is never evidence.
+        let mut removed = pending_created_log(&amount_word);
+        removed[0]["removed"] = serde_json::json!(true);
+        assert!(extract_withdrawal_pending_created_tuples(&removed, &bridge, &nonce_bytes).unwrap().is_empty());
+
+        // Wrong nonce / wrong emitter must not decode.
+        assert!(extract_withdrawal_pending_created_tuples(&log, &bridge, &[0u8; 32]).unwrap().is_empty());
+        assert!(
+            extract_withdrawal_pending_created_tuples(&log, "0x000000000000000000000000000000000000dead", &nonce_bytes)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A malformed `removed` flag is an error, never a silent skip.
+        for flag in [serde_json::json!("true"), serde_json::json!(1), serde_json::json!(null)] {
+            let mut bad = pending_created_log(&amount_word);
+            bad[0]["removed"] = flag;
+            let err = extract_withdrawal_pending_created_tuples(&bad, &bridge, &nonce_bytes).unwrap_err();
+            assert!(err.to_string().contains("not a boolean"), "{err}");
+        }
+
+        // A recognized event with a wrong topic count is an error, not an ignored log.
+        let mut short_topics = pending_created_log(&amount_word);
+        short_topics[0]["topics"] = serde_json::json!([short_topics[0]["topics"][0]]);
+        assert!(extract_withdrawal_pending_created_tuples(&short_topics, &bridge, &nonce_bytes).is_err());
+    }
+
+    #[test]
+    fn claim_withdrawal_failure_reason_names_are_frozen() {
+        assert_eq!(describe_withdrawal_claim_failure_reason(5), "nullifier already claimed (5)");
+        assert_eq!(describe_withdrawal_claim_failure_reason(10), "claimable-at overflow (10)");
+        assert!(describe_withdrawal_claim_failure_reason(11).contains("unknown"), "reserved codes stay unnamed");
     }
 }

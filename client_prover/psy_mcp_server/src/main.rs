@@ -1291,9 +1291,11 @@ struct WithdrawLegSpec {
     /// to).
     #[serde(default)]
     dest_chain_index: u64,
-    /// Unique per withdrawal; defaults to the current unix time.
+    /// Unique per withdrawal: `0x` + exactly 64 hex digits (32 bytes), non-zero.
+    /// Legacy u64 nonces are not accepted. When omitted the server draws a
+    /// fresh random nonce and returns it in the result.
     #[serde(default)]
-    nonce: Option<u64>,
+    nonce: Option<String>,
 }
 
 fn default_usdt() -> String {
@@ -1600,9 +1602,11 @@ struct WithdrawArgs {
     /// Psy's internal chain index for the destination (0 = the L1 it bridges to).
     #[serde(default)]
     dest_chain_index: u64,
-    /// Unique per withdrawal; defaults to the current unix time.
+    /// Unique per withdrawal: `0x` + exactly 64 hex digits (32 bytes), non-zero.
+    /// Legacy u64 nonces are not accepted. When omitted the server draws a
+    /// fresh random nonce and returns it in the result.
     #[serde(default)]
-    nonce: Option<u64>,
+    nonce: Option<String>,
 }
 
 fn network_l1_token(wallet: &WalletManager, network: &NetworkId, chain_index: u32, token: &str) -> Option<String> {

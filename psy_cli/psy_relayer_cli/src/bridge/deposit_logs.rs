@@ -15,25 +15,13 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{BlockNumberOrTag, Filter};
-use alloy_sol_types::{sol, SolEvent};
+use alloy_sol_types::SolEvent;
+use guardian_common::verify_l1::DepositRecorded;
 use anyhow::Context;
 
 // Keep both lookup and collection within the current RPC subscriptions' range limit.
 const MAX_LOG_BLOCKS_PER_QUERY: u64 = 5_000;
 
-sol! {
-    /// Emitted by the bridge contract when a deposit is recorded.
-    event DepositRecorded(
-        uint32 indexed index,
-        bytes32 shieldAddress,
-        address indexed token,
-        bytes32 l2TokenContractId,
-        uint256 amount,
-        uint8 chainIndex,
-        bytes32 noteCommitment,
-        bytes32 leafHash
-    );
-}
 
 /// Encodes a `u32` as an indexed event topic by placing the value in the last 4 bytes
 /// of a 32-byte `B256` (ABI-encoded uint256 layout for indexed arguments).

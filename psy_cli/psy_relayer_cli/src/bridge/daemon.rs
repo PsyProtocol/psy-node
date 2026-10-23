@@ -320,7 +320,7 @@ pub(crate) struct DaemonState {
     /// successful claims remove entries, and all remaining entries are
     /// retried next round. The key is leaf_hash.
     pending_claim_withdrawals: HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    /// Failure counts for the entries above, keyed by leaf_hash.
+    /// The one record per leaf above: attempt count, last reason, and any hold.
     claim_retry: HashMap<String, claim_attempts::ClaimAttempts>,
     /// Withdrawals that ran out of attempts. Nothing retries these; they are
     /// kept so the stuck funds stay traceable and can be re-armed by hand.
@@ -1264,12 +1264,29 @@ async fn run_multichain(
             tokio::time::sleep(Duration::from_secs(2)).await;
             for chain in &chains {
                 let now_unix = claim_attempts::now_unix();
-                let claims = claims_to_attempt(&state.pending_claim_withdrawals, &state.claim_retry)
-                    .into_iter()
-                    .filter(|w| w.destination_chain_index == u64::from(chain.chain_index))
-                    .collect::<Vec<_>>();
+                let resolutions = match chain.l1.release_claim_holds(&state.pending_claim_withdrawals, &mut state.claim_retry, &chain.config, Some(chain.chain_index)).await {
+                    Ok(resolutions) => resolutions,
+                    Err(error) => {
+                        tracing::warn!(chain_index = chain.chain_index, error = %error, "claim hold recheck failed; held leaves stay held");
+                        continue;
+                    }
+                };
+                for resolution in &resolutions {
+                    record_claim_outcome(&resolution.withdrawals, &resolution.report, &mut state.pending_claim_withdrawals, &mut state.claim_retry, &mut state.retired_claim_withdrawals, now_unix);
+                }
+                save_multichain_state(&guardian.root, &guardian.db, &state)?;
+                let mut claims = claims_to_attempt(&state.pending_claim_withdrawals, &state.claim_retry);
+                claims.retain(|withdrawal| withdrawal.destination_chain_index == u64::from(chain.chain_index));
+                claims.sort_by_key(|withdrawal| (withdrawal.destination_chain_index, withdrawal.event_id));
                 if claims.is_empty() { continue; }
-                let result = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint, &guardian.root.network).await;
+                let hook = claim_broadcast_hook(&guardian.root, &guardian.db);
+                let result = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint, &guardian.root.network, Some(hook)).await;
+                if result.is_err() {
+                    match persisted_claim_retry(&guardian.root, &guardian.db) {
+                        Ok(persisted) => adopt_persisted_receipt_holds(&claims, &mut state.claim_retry, &persisted),
+                        Err(error) => tracing::warn!(error = %error, "cannot re-read persisted claim holds; recording the failure without them"),
+                    }
+                }
                 record_claim_result(
                     &claims,
                     &result,
@@ -1476,6 +1493,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                     is_catchup_batch,
                     confirmation_lag_checkpoints,
                     &guardian.root.network,
+                    &guardian.root,
+                    &guardian.db,
                     max_checkpoint_batch,
                 ),
             )
@@ -1522,6 +1541,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                     is_catchup_batch,
                     confirmation_lag_checkpoints,
                     &guardian.root.network,
+                    &guardian.root,
+                    &guardian.db,
                     max_checkpoint_batch,
                 ),
             )
@@ -1658,6 +1679,8 @@ async fn run_single_chain(config: BridgeProposeDaemonConfig, config_path: &Path,
                         is_catchup_batch,
                         confirmation_lag_checkpoints,
                         &guardian.root.network,
+                        &guardian.root,
+                        &guardian.db,
                         max_checkpoint_batch,
                     ),
                 )
@@ -2082,14 +2105,21 @@ fn load_multichain_state(config: &guardian_common::protocol::GuardianConfig, db:
     Ok(state)
 }
 
+fn remove_full_leaf(pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>, leaf: &str) -> Option<propose_withdrawals::PendingWithdrawal> {
+    let keys: Vec<String> = pending.iter().filter(|(_, withdrawal)| withdrawal.leaf_hash == leaf).map(|(key, _)| key.clone()).collect();
+    let mut removed = None;
+    for key in keys { removed = pending.remove(&key).or(removed); }
+    removed
+}
+
 fn chain_claim_rows(state: &MultichainDaemonState) -> anyhow::Result<BTreeMap<u8, super::guardian_client::ChainClaims>> {
     let mut by_chain: BTreeMap<u8, DaemonState> = BTreeMap::new();
     for (leaf, withdrawal) in &state.pending_claim_withdrawals {
         by_chain.entry(chain_of(withdrawal)?).or_default().pending_claim_withdrawals.insert(leaf.clone(), withdrawal.clone());
     }
-    for (leaf, retry) in &state.claim_retry {
-        let withdrawal = state.pending_claim_withdrawals.get(leaf).context("claim retry has no pending withdrawal")?;
-        by_chain.entry(chain_of(withdrawal)?).or_default().claim_retry.insert(leaf.clone(), retry.clone());
+    for (leaf, leaf_state) in &state.claim_retry {
+        let withdrawal = state.pending_claim_withdrawals.values().find(|withdrawal| withdrawal.leaf_hash == leaf.as_str()).context("claim state has no pending withdrawal")?;
+        by_chain.entry(chain_of(withdrawal)?).or_default().claim_retry.insert(leaf.clone(), leaf_state.clone());
     }
     for (leaf, retired) in &state.retired_claim_withdrawals {
         by_chain.entry(chain_of(&retired.withdrawal)?).or_default().retired_claim_withdrawals.insert(leaf.clone(), retired.clone());
@@ -2103,6 +2133,29 @@ fn save_multichain_state(config: &guardian_common::protocol::GuardianConfig, db:
         finalized_chains: state.finalized_chains.iter().copied().collect(),
     })
 }
+
+fn claim_broadcast_hook(
+    config: &guardian_common::protocol::GuardianConfig,
+    db: &super::guardian_client::RelayerDb,
+) -> claim_withdrawals::BeforeBroadcast {
+    let config = config.clone();
+    let db = db.clone();
+    std::sync::Arc::new(move |leaves, tx_hash| {
+        let config = config.clone();
+        let db = db.clone();
+        let leaves = leaves.to_vec();
+        Box::pin(async move {
+            let mut state = load_multichain_state(&config, &db)?;
+            for leaf in &leaves {
+                anyhow::ensure!(state.pending_claim_withdrawals.get(&leaf.leaf_hash).is_some_and(|saved| claim_attempts::same_claim(saved, leaf)), "signed claim is not the stored pending row");
+                claim_attempts::hold_for_receipt(&mut state.claim_retry, &leaf.leaf_hash, Some(tx_hash));
+            }
+            save_multichain_state(&config, &db, &state)?;
+            Ok(())
+        })
+    })
+}
+
 
 // L1 may already be ahead of an older catch-up target. Keep the actual append
 // function's strict target check, and skip satisfied historical targets here.
@@ -2414,11 +2467,11 @@ pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
 /// list, so dropping a retired claim here is what actually stops the work.
 fn claims_to_attempt(
     pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    attempts: &HashMap<String, claim_attempts::ClaimAttempts>,
+    claim_retry: &HashMap<String, claim_attempts::ClaimAttempts>,
 ) -> Vec<propose_withdrawals::PendingWithdrawal> {
     pending
         .values()
-        .filter(|w| claim_attempts::is_retriable(attempts.get(&w.leaf_hash)))
+        .filter(|w| claim_attempts::is_retriable(claim_retry.get(&w.leaf_hash)))
         .cloned()
         .collect()
 }
@@ -2431,13 +2484,15 @@ fn insert_pending_claims(
 ) -> bool {
     let mut changed = false;
     for withdrawal in withdrawals {
-        if retired.contains_key(&withdrawal.leaf_hash) {
-            continue;
-        }
-        if let std::collections::hash_map::Entry::Vacant(entry) = pending.entry(withdrawal.leaf_hash.clone()) {
-            entry.insert(withdrawal.clone());
-            changed = true;
-        }
+        if retired.contains_key(&withdrawal.leaf_hash) { continue; }
+        // One pending entry per full leaf. An equal leaf is already queued: a
+        // replay whose event metadata differs (event_id is append ordering
+        // only, and an imported row carries 0) is not a content conflict, so
+        // it is skipped, while a distinct leaf that shares the nonce still
+        // gets its own entry.
+        if pending.values().any(|saved| saved.leaf_hash == withdrawal.leaf_hash) { continue; }
+        pending.insert(withdrawal.leaf_hash.clone(), withdrawal.clone());
+        changed = true;
     }
     changed
 }
@@ -2447,73 +2502,64 @@ fn record_claim_result(
     attempted: &[propose_withdrawals::PendingWithdrawal],
     result: &anyhow::Result<claim_withdrawals::BatchWithdrawalsReport>,
     pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
     retired: &mut HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
     now_unix: u64,
 ) {
     match result {
         Ok(report) => {
-            apply_claim_report(pending, report);
-            record_claim_outcome(attempted, report, pending, retry, retired, now_unix);
+            record_claim_outcome(attempted, report, pending, claim_retry, retired, now_unix);
         }
         Err(error) => {
             let reason = format!("claim batch failed: {error:#}");
+            // One strike per leaf, never per occurrence of the same leaf. A
+            // hold wins: a signed transaction may be in flight, so a generic
+            // batch error neither spends an attempt on it nor clears the hold.
+            let mut seen: HashSet<&str> = HashSet::new();
             for withdrawal in attempted {
-                record_claim_failure(withdrawal, &reason, pending, retry, retired, now_unix);
+                if !seen.insert(withdrawal.leaf_hash.as_str()) { continue; }
+                if claim_retry.get(&withdrawal.leaf_hash).is_some_and(|state| !matches!(state.hold, claim_attempts::ClaimHold::None)) { continue; }
+                record_claim_failure(withdrawal, &reason, pending, claim_retry, retired, now_unix);
             }
         }
     }
 }
 
-/// Book one round's outcome against the durable attempt count.
-///
-/// A claim counts as failed when it was attempted and did not resolve — not
-/// merely when it appears in `failure_reasons`. A withdrawal that falls out of
-/// a round named nowhere is precisely the case that used to retry forever in
-/// silence.
-///
-/// Deferrals are the exception. Waiting for a missing services proof or for
-/// bridge liquidity resolves on its own and must not spend an attempt.
-/// An unauthorized withdrawal root is a failure.
 fn record_claim_outcome(
     attempted: &[propose_withdrawals::PendingWithdrawal],
     report: &claim_withdrawals::BatchWithdrawalsReport,
     pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
-    retired: &mut HashMap<
-        String,
-        claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
-    >,
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    retired: &mut HashMap<String, claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>>,
     now_unix: u64,
 ) {
-    let resolved: HashSet<&str> = report.resolved_leaf_hashes.iter().map(String::as_str).collect();
-
-    for withdrawal in attempted {
-        let leaf_hash = withdrawal.leaf_hash.as_str();
-        if resolved.contains(leaf_hash) {
-            claim_attempts::clear(retry, leaf_hash);
+    let mut leaves: Vec<String> = attempted.iter().map(|withdrawal| withdrawal.leaf_hash.clone()).collect();
+    leaves.sort();
+    leaves.dedup();
+    for leaf in leaves {
+        let Some(withdrawal) = attempted.iter().find(|withdrawal| withdrawal.leaf_hash == leaf) else { continue };
+        let slots: Vec<&claim_withdrawals::ClaimOutcome> = report.outcomes.iter().filter(|outcome| outcome.leaf_hash == leaf).collect();
+        if slots.is_empty() {
+            record_claim_failure(withdrawal, "claim did not resolve and reported no reason", pending, claim_retry, retired, now_unix);
             continue;
         }
-        if let Some(reason) = report.deferrals.get(leaf_hash) {
-            tracing::info!(leaf_hash, reason, "withdrawal claim deferred; attempt not spent");
-            continue;
-        }
-
-        let reason = report
-            .failure_reasons
-            .get(leaf_hash)
-            .cloned()
-            .unwrap_or_else(|| "claim did not resolve and reported no reason".to_string());
-        record_claim_failure(withdrawal, &reason, pending, retry, retired, now_unix);
+        // Registration wins; otherwise an unresolved signed transaction wins
+        // over an ordinary failure: the hold is kept and no attempt is spent
+        // while that transaction may still land.
+        let selected = slots.iter().find(|outcome| matches!(outcome.kind, claim_withdrawals::ClaimOutcomeKind::Registered))
+            .or_else(|| slots.iter().find(|outcome| matches!(outcome.kind, claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ReceiptUnknown))))
+            .copied()
+            .unwrap_or(slots[0]);
+        apply_leaf_outcome(withdrawal, selected, pending, claim_retry, retired, now_unix);
     }
+    apply_resolved(pending, claim_retry, report);
 }
 
-/// Count one failed attempt, and give up on the withdrawal if that was its last.
-fn record_claim_failure(
+fn apply_leaf_outcome(
     withdrawal: &propose_withdrawals::PendingWithdrawal,
-    reason: &str,
+    outcome: &claim_withdrawals::ClaimOutcome,
     pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
     retired: &mut HashMap<
         String,
         claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
@@ -2521,19 +2567,125 @@ fn record_claim_failure(
     now_unix: u64,
 ) {
     let leaf_hash = withdrawal.leaf_hash.as_str();
-    let state = claim_attempts::record_failure(retry, leaf_hash, reason);
+    let nonce = claim_withdrawals::nonce_hex(withdrawal.nonce);
+    match outcome.kind {
+        claim_withdrawals::ClaimOutcomeKind::Registered => {
+            claim_attempts::clear(claim_retry, leaf_hash);
+            tracing::info!(
+                leaf_hash,
+                nonce = %nonce,
+                action = "resolved",
+                "withdrawal claim resolved; attempts cleared"
+            );
+        }
+        claim_withdrawals::ClaimOutcomeKind::Failed(code) => match code.action() {
+            claim_withdrawals::ClaimAction::Resolved => {
+                claim_attempts::clear(claim_retry, leaf_hash);
+            }
+            claim_withdrawals::ClaimAction::Terminal => {
+                retire_claim(withdrawal, code.label(), claim_retry, pending, retired, now_unix);
+                tracing::error!(
+                    leaf_hash,
+                    nonce = %nonce,
+                    reason = code.label(),
+                    action = "retired",
+                    "withdrawal claim can never succeed; retired without another attempt"
+                );
+            }
+            claim_withdrawals::ClaimAction::OperatorPending => {
+                claim_attempts::hold_for_operator(claim_retry, leaf_hash, code);
+                tracing::info!(
+                    leaf_hash,
+                    nonce = %nonce,
+                    reason = code.label(),
+                    action = "held",
+                    "withdrawal claim waits on chain state; attempt not spent"
+                );
+            }
+            claim_withdrawals::ClaimAction::Held => {
+                if matches!(code, claim_withdrawals::ClaimCode::ReceiptUnknown) {
+                    claim_attempts::hold_for_receipt(claim_retry, leaf_hash, outcome.tx_hash);
+                    tracing::warn!(
+                        leaf_hash,
+                        nonce = %nonce,
+                        tx_hash = outcome.tx_hash.map(|hash| format!("{hash:#x}")).unwrap_or_default(),
+                        action = "held",
+                        "claim transaction landing unknown; no new send until it resolves"
+                    );
+                } else {
+                    tracing::info!(
+                        leaf_hash,
+                        nonce = %nonce,
+                        reason = code.label(),
+                        action = "held",
+                        "withdrawal claim held; attempt not spent"
+                    );
+                }
+            }
+            claim_withdrawals::ClaimAction::AttemptSpent => {
+                record_claim_failure(withdrawal, code.label(), pending, claim_retry, retired, now_unix);
+            }
+        },
+    }
+}
 
+/// Move a leaf to the retired set immediately, keeping whatever attempt count
+/// it already had. A terminal payload does not get three strikes.
+fn retire_claim(
+    withdrawal: &propose_withdrawals::PendingWithdrawal,
+    reason: &str,
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    retired: &mut HashMap<
+        String,
+        claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
+    >,
+    now_unix: u64,
+) {
+    let leaf_hash = withdrawal.leaf_hash.as_str();
+    let attempts = claim_retry.get(leaf_hash).map(|state| state.attempts).unwrap_or(0);
+    if let Some(withdrawal) = remove_full_leaf(pending, leaf_hash) {
+        retired.insert(
+            leaf_hash.to_string(),
+            claim_attempts::RetiredClaim {
+                withdrawal,
+                attempts,
+                last_reason: reason.to_string(),
+                retired_at_unix: now_unix,
+            },
+        );
+    }
+    claim_attempts::clear(claim_retry, leaf_hash);
+}
+
+/// Count one failed attempt, and give up on the withdrawal if that was its last.
+fn record_claim_failure(
+    withdrawal: &propose_withdrawals::PendingWithdrawal,
+    reason: &str,
+    pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    retired: &mut HashMap<
+        String,
+        claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
+    >,
+    now_unix: u64,
+) {
+    let leaf_hash = withdrawal.leaf_hash.as_str();
+    let nonce = claim_withdrawals::nonce_hex(withdrawal.nonce);
+    let state = claim_attempts::record_failure(claim_retry, leaf_hash, reason);
     if claim_attempts::is_exhausted(&state) {
         // Stop paying for proofs, keep the record. The funds are stuck and this
         // needs a person, so it is an error, not a warning.
         tracing::error!(
             leaf_hash,
+            nonce = %nonce,
             attempts = state.attempts,
             reason = %state.last_reason,
             destination_chain_index = withdrawal.destination_chain_index,
+            action = "retired",
             "withdrawal claim given up on after its attempts were used; no further proofs will be requested for it"
         );
-        if let Some(w) = pending.remove(leaf_hash) {
+        if let Some(w) = remove_full_leaf(pending, leaf_hash) {
             retired.insert(
                 leaf_hash.to_string(),
                 claim_attempts::RetiredClaim {
@@ -2544,13 +2696,15 @@ fn record_claim_failure(
                 },
             );
         }
-        claim_attempts::clear(retry, leaf_hash);
+        claim_attempts::clear(claim_retry, leaf_hash);
     } else {
         tracing::warn!(
             leaf_hash,
+            nonce = %nonce,
             attempts = state.attempts,
             max_attempts = claim_attempts::CLAIM_MAX_ATTEMPTS,
             reason = %state.last_reason,
+            action = "retry",
             "withdrawal claim failed; will retry next round"
         );
     }
@@ -2573,7 +2727,7 @@ fn record_claim_failure(
 fn record_unroutable_claims(
     served_chain_indices: &HashSet<u8>,
     pending: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
     retired: &mut HashMap<
         String,
         claim_attempts::RetiredClaim<propose_withdrawals::PendingWithdrawal>,
@@ -2587,7 +2741,7 @@ fn record_unroutable_claims(
                 .map(|index| !served_chain_indices.contains(&index))
                 .unwrap_or(true)
         })
-        .filter(|w| claim_attempts::is_retriable(retry.get(&w.leaf_hash)))
+        .filter(|w| claim_attempts::is_retriable(claim_retry.get(&w.leaf_hash)))
         .cloned()
         .collect();
 
@@ -2605,25 +2759,60 @@ fn record_unroutable_claims(
             "no configured chain serves destination chain index {} (this relayer serves {served})",
             withdrawal.destination_chain_index
         );
-        record_claim_failure(withdrawal, &reason, pending, retry, retired, now_unix);
+        record_claim_failure(withdrawal, &reason, pending, claim_retry, retired, now_unix);
+    }
+}
+/// Drop resolved leaves once their record has been cleared. A leaf that is
+/// still recorded stays pending: resolution never removes a held leaf.
+fn apply_resolved(
+    pending_claim_withdrawals: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    claim_retry: &HashMap<String, claim_attempts::ClaimAttempts>,
+    report: &claim_withdrawals::BatchWithdrawalsReport,
+) {
+    for outcome in &report.outcomes {
+        if outcome.kind.action() == claim_withdrawals::ClaimAction::Resolved
+            && !claim_retry.contains_key(&outcome.leaf_hash)
+        {
+            remove_full_leaf(pending_claim_withdrawals, &outcome.leaf_hash);
+        }
+    }
+}
+/// The claim retry rows as last persisted, used to re-adopt holds the
+/// pre-broadcast hook wrote while a failed batch was in flight.
+fn persisted_claim_retry(
+    config: &guardian_common::protocol::GuardianConfig,
+    db: &super::guardian_client::RelayerDb,
+) -> anyhow::Result<HashMap<String, claim_attempts::ClaimAttempts>> {
+    let mut persisted = HashMap::new();
+    for row in db.chain_claims(config)?.into_values() {
+        persisted.extend(row.claim_retry);
+    }
+    Ok(persisted)
+}
+
+/// Adopt receipt holds the pre-broadcast hook persisted for this attempt.
+///
+/// The hook is the only writer that records a signed transaction hash while
+/// the batch is in flight, and a batch error produces no outcomes that would
+/// re-derive those holds. Without this merge the round's save would overwrite
+/// the durable hold and the next round would re-send a signed transaction.
+/// The caller state stays the single authoritative copy: a persisted hold is
+/// adopted monotonically and never overwritten by a stale absence, and a leaf
+/// the caller already holds is left alone.
+fn adopt_persisted_receipt_holds(
+    attempted: &[propose_withdrawals::PendingWithdrawal],
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    persisted: &HashMap<String, claim_attempts::ClaimAttempts>,
+) {
+    for withdrawal in attempted {
+        let leaf = withdrawal.leaf_hash.as_str();
+        if claim_retry.get(leaf).is_some_and(|state| !matches!(state.hold, claim_attempts::ClaimHold::None)) { continue; }
+        if let Some(claim_attempts::ClaimHold::ReceiptUnknown { tx_hash }) = persisted.get(leaf).map(|state| &state.hold) {
+            claim_attempts::hold_for_receipt(claim_retry, leaf, *tx_hash);
+        }
     }
 }
 
-fn apply_claim_report(
-    pending_claim_withdrawals: &mut HashMap<String, propose_withdrawals::PendingWithdrawal>,
-    report: &claim_withdrawals::BatchWithdrawalsReport,
-) {
-    for leaf_hash in &report.resolved_leaf_hashes {
-        pending_claim_withdrawals.remove(leaf_hash);
-    }
-    // Failures are not logged here. This used to warn "withdrawal claim
-    // deferred; will retry next round" for every one of them, which stopped
-    // being true when the attempt ceiling landed: record_claim_outcome runs
-    // straight after and may retire the very claim this line had just promised
-    // to retry, so the round that mattered most logged a warning and an error
-    // that contradicted each other, the false one first. It logs each failure
-    // with its attempt count, and each deferral as a deferral.
-}
 
 /// Durable pending-claim settlement shared by finalize rounds and append-only
 /// / no-confirmed-range rounds. Retries persisted claims under the same
@@ -2644,10 +2833,33 @@ async fn settle_pending_claim_withdrawals(
     mut is_catchup_batch: bool,
     confirmation_lag_checkpoints: u64,
     network: &psy_config::NetworkConfigGoldilocks,
+    guardian_config: &guardian_common::protocol::GuardianConfig,
+    db: &super::guardian_client::RelayerDb,
     max_checkpoint_batch: u64,
 ) -> bool {
     let now_unix = claim_attempts::now_unix();
-    let to_claim = claims_to_attempt(pending_claim_withdrawals, claim_retry);
+    match l1.release_claim_holds(pending_claim_withdrawals, claim_retry, config, None).await {
+        Ok(resolutions) => {
+            for resolution in &resolutions {
+                record_claim_outcome(
+                    &resolution.withdrawals,
+                    &resolution.report,
+                    pending_claim_withdrawals,
+                    claim_retry,
+                    retired_claim_withdrawals,
+                    now_unix,
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "claim hold recheck failed; held leaves stay held"
+            );
+        }
+    }
+    let mut to_claim = claims_to_attempt(pending_claim_withdrawals, claim_retry);
+    to_claim.sort_by_key(|withdrawal| (withdrawal.destination_chain_index, withdrawal.event_id));
     if to_claim.is_empty() {
         // Not the same as "nothing pending": every remaining entry can have
         // used up its attempts, which is the point of the ceiling.
@@ -2692,8 +2904,15 @@ async fn settle_pending_claim_withdrawals(
     }
 
     let result = l1
-        .claim_withdrawals(&to_claim, config, claim_cursor_checkpoint, network)
+        .claim_withdrawals(&to_claim, config, claim_cursor_checkpoint, network, Some(claim_broadcast_hook(guardian_config, db)))
         .await;
+    if result.is_err() {
+        match persisted_claim_retry(guardian_config, db) {
+            Ok(persisted) => adopt_persisted_receipt_holds(&to_claim, claim_retry, &persisted),
+            Err(error) => tracing::warn!(error = %error, "cannot re-read persisted claim holds; recording the failure without them"),
+        }
+    }
+
     record_claim_result(
         &to_claim,
         &result,
@@ -2704,14 +2923,13 @@ async fn settle_pending_claim_withdrawals(
     );
     match result {
         Ok(report) => {
-            if report.failure_reasons.is_empty() {
+            if report.count_by_action(claim_withdrawals::ClaimAction::AttemptSpent) == 0 {
                 tracing::info!(
                     claim_cursor_checkpoint,
                     requested = report.requested,
                     submitted_count = report.submitted_count,
-                    already_claimed_count = report.already_claimed_count,
-                    resolved = report.resolved_leaf_hashes.len(),
-                    failed = report.failure_reasons.len(),
+                    resolved = report.resolved_count(),
+                    failed = report.count_by_action(claim_withdrawals::ClaimAction::AttemptSpent),
                     pending_claims = pending_claim_withdrawals.len(),
                     "withdrawal claims finished"
                 );
@@ -2720,9 +2938,8 @@ async fn settle_pending_claim_withdrawals(
                     claim_cursor_checkpoint,
                     requested = report.requested,
                     submitted_count = report.submitted_count,
-                    already_claimed_count = report.already_claimed_count,
-                    resolved = report.resolved_leaf_hashes.len(),
-                    failed = report.failure_reasons.len(),
+                    resolved = report.resolved_count(),
+                    failed = report.count_by_action(claim_withdrawals::ClaimAction::AttemptSpent),
                     pending_claims = pending_claim_withdrawals.len(),
                     "withdrawal claims finished with pending retries"
                 );
@@ -2744,11 +2961,11 @@ async fn settle_pending_claim_withdrawals(
 
 fn record_claim_withdrawals(
     withdrawals: &[propose_withdrawals::PendingWithdrawal],
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<(u64, i64, String)>,
     claims: &mut Vec<propose_withdrawals::PendingWithdrawal>,
 ) {
     for withdrawal in withdrawals {
-        if seen.insert(withdrawal.leaf_hash.clone()) {
+        if seen.insert((withdrawal.destination_chain_index, withdrawal.event_id, withdrawal.leaf_hash.clone())) {
             claims.push(withdrawal.clone());
         }
     }
@@ -3498,10 +3715,10 @@ async fn restore_relayer_history(wallet: &WalletSession, provider: &RpcProvider,
     }
     for state in &deposit_tree_states {
         let chain = config.root.chain(state.anchor.chain_index).map_err(|error| anyhow::anyhow!(error))?;
-        let canonical = crate::guardian::verify_l1::verify_saved_deposit_anchor_headers(chain, &state.anchor).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        match crate::guardian::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash) {
+        let canonical = guardian_common::verify_l1::verify_saved_deposit_anchor_headers(chain, &state.anchor).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        match guardian_common::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash) {
             Ok(()) => {}
-            Err(crate::guardian::verify::GuardianAccountError::Conflict(reason @ guardian_common::protocol::HaltReason::FinalityConflict)) => {
+            Err(guardian_common::verify_l1::GuardianAccountError::Conflict(reason @ guardian_common::protocol::HaltReason::FinalityConflict)) => {
                 config.db.halt_account(network, user, reason)?;
                 anyhow::bail!("saved deposit anchor contradicts canonical finality");
             }
@@ -3510,11 +3727,9 @@ async fn restore_relayer_history(wallet: &WalletSession, provider: &RpcProvider,
     }
     let restored = RelayerHistory::restore(&account, &deposit_tree_states)?;
     if account.imported_nonce.is_some() {
-        let no_withdrawal_burns = std::collections::BTreeSet::<(u32, u32, [u32; 8])>::new();
-        let no_nonces = std::collections::BTreeSet::<(u8, [u32; 8])>::new();
-        let context = verification_context(wallet, provider, config, head, root, &restored.history, &[], &no_withdrawal_burns, &no_nonces);
+        let context = verification_context(wallet, provider, config, head, root, &restored.history, &[]);
         if let Err(error) = crate::guardian::verify::verify_restored_history(&context, &config.root, account.last_checkpoint_id).await {
-            if let crate::guardian::verify::GuardianAccountError::Conflict(reason) = error { config.db.halt_account(network, user, reason)?; }
+            if let guardian_common::verify_l1::GuardianAccountError::Conflict(reason) = error { config.db.halt_account(network, user, reason)?; }
             anyhow::bail!("{error:?}");
         }
     }
@@ -3536,33 +3751,10 @@ fn committed_history_snapshot(config: &super::guardian_client::LoadedGuardianCon
     RelayerHistory::restore(&account, &config.db.load_deposit_tree_states(network, user)?)
 }
 
-fn current_conflicts(archive: &super::guardian_client::RelayerDb, network: u64, user: u64, records: &[guardian_common::protocol::WithdrawalBurnRecord]) -> anyhow::Result<(std::collections::BTreeSet<(u32, u32, [u32; 8])>, std::collections::BTreeSet<(u8, [u32; 8])>)> {
-    let mut withdrawal_burns = std::collections::BTreeSet::new();
-    let mut nonces = std::collections::BTreeSet::new();
-    for record in records {
-        if archive.contains_included_withdrawal_burn(network, user, record.sender_user_id, record.token_contract_id, record.nonce)? { withdrawal_burns.insert((record.sender_user_id, record.token_contract_id, record.nonce)); }
-        if archive.contains_withdrawal_nonce(network, user, record.destination_chain_index, record.nonce)? { nonces.insert((record.destination_chain_index, record.nonce)); }
-    }
-    Ok((withdrawal_burns, nonces))
+fn verification_context<'a>(wallet: &'a WalletSession, provider: &'a RpcProvider, config: &'a super::guardian_client::LoadedGuardianConfig, head: u64, root: QHashOut<GoldilocksField>, history: &'a crate::guardian::verify::GuardianHistory, reserved: &'a [guardian_common::protocol::DepositTreeState]) -> crate::guardian::verify::GuardianVerificationContext<'a> {
+    crate::guardian::verify::GuardianVerificationContext { wallet, provider, network: &config.root.network, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_chains: &config.root.l1_chains, history, reserved_deposit_tree_states: reserved }
 }
 
-fn verification_context<'a>(wallet: &'a WalletSession, provider: &'a RpcProvider, config: &'a super::guardian_client::LoadedGuardianConfig, head: u64, root: QHashOut<GoldilocksField>, history: &'a crate::guardian::verify::GuardianHistory, reserved: &'a [guardian_common::protocol::DepositTreeState], withdrawal_burns: &'a std::collections::BTreeSet<(u32, u32, [u32; 8])>, nonces: &'a std::collections::BTreeSet<(u8, [u32; 8])>) -> crate::guardian::verify::GuardianVerificationContext<'a> {
-    crate::guardian::verify::GuardianVerificationContext { wallet, provider, network: &config.root.network, verified_checkpoint_id: head, verified_checkpoint_tree_root: root, l1_chains: &config.root.l1_chains, history, reserved_deposit_tree_states: reserved, conflicting_withdrawal_burns: withdrawal_burns, conflicting_nonces: nonces }
-}
-
-/// Drops withdrawals already present in either durable point index — the identity
-/// index or the destination-chain nonce index. In-batch duplicates are still
-/// rejected by the session's own duplicate checks.
-fn select_guardian_withdrawals(withdrawals: &[propose_withdrawals::PendingWithdrawal], mut identity_taken: impl FnMut(u32, u32, [u32; 8]) -> anyhow::Result<bool>, mut nonce_taken: impl FnMut(u8, [u32; 8]) -> anyhow::Result<bool>) -> anyhow::Result<Vec<propose_withdrawals::PendingWithdrawal>> {
-    let mut selected = Vec::new();
-    for withdrawal in withdrawals {
-        let sender = u32::try_from(withdrawal.sender_user_id)?;
-        let contract = u32::try_from(withdrawal.contract_id)?;
-        let chain = u8::try_from(withdrawal.destination_chain_index)?;
-        if !identity_taken(sender, contract, withdrawal.nonce)? && !nonce_taken(chain, withdrawal.nonce)? { selected.push(withdrawal.clone()); }
-    }
-    Ok(selected)
-}
 
 async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardianConfig, provider: &RpcProvider, calls: Vec<ContractCallArgs>, withdrawals: &[propose_withdrawals::PendingWithdrawal], operation: guardian_common::protocol::GuardianOperation, next_members: Option<[QHashOut<GoldilocksField>; 3]>, retained: &mut RelayerHistory) -> anyhow::Result<u64> {
     use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
@@ -3608,9 +3800,7 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
         let account_proof = provider.get_user_tree_merkle_proof(head, BRIDGE_USER_ID_U64).await?;
         let nonce = if account_proof.value == QHashOut::ZERO { 1 } else { provider.get_user_leaf_data(head, BRIDGE_USER_ID_U64).await?.nonce.to_canonical_u64().checked_add(1).context("account nonce overflow")? };
         ensure!(history.nonce().checked_add(1) == Some(nonce), "retained session prefix is incomplete");
-        let network_magic = config.root.network_magic()?;
-        let selected = select_guardian_withdrawals(withdrawals, |sender, contract, nonce| archive.contains_included_withdrawal_burn(network_magic, BRIDGE_USER_ID_U64, sender, contract, nonce), |chain, nonce| archive.contains_withdrawal_nonce(network_magic, BRIDGE_USER_ID_U64, chain, nonce))?;
-        let records = selected.iter().map(|withdrawal| Ok(WithdrawalBurnRecord {
+        let records = withdrawals.iter().map(|withdrawal| Ok(WithdrawalBurnRecord {
             sender_user_id: withdrawal.sender_user_id.try_into()?, token_contract_id: withdrawal.contract_id.try_into()?,
             destination_chain_index: withdrawal.destination_chain_index.try_into()?, token: withdrawal.token_address,
             amount: withdrawal.amount, recipient: withdrawal.recipient, nonce: withdrawal.nonce,
@@ -3624,8 +3814,8 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
             let old_count = u32::try_from(fetch_deposit_tree_next_index(provider, head, u64::from(index)).await?)?;
             let new_count = u32::try_from(call.inputs[1])?;
             if old_count == new_count { continue; }
-            let anchor = crate::guardian::verify_l1::finalized_deposit_anchor(chain, old_count, new_count).await?;
-            let (_, new_root, _state) = crate::guardian::verify_l1::verify_deposit_anchor(history.deposit_tree_states.get(&index), chain, &anchor).await?;
+            let anchor = guardian_common::verify_l1::finalized_deposit_anchor(chain, old_count, new_count).await?;
+            let (_, new_root, _state) = guardian_common::verify_l1::verify_deposit_anchor(history.deposit_tree_states.get(&index), chain, &anchor).await?;
             let root_bytes: Vec<_> = new_root.0.elements.iter().flat_map(|field| {
                 let value = field.to_canonical_u64();
                 (value as u32).to_be_bytes().into_iter().chain(((value >> 32) as u32).to_be_bytes())
@@ -3635,7 +3825,7 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
         }
         anchors.sort_by_key(|anchor| anchor.chain_index);
         approved_calls.sort_by_key(|call| call.inputs[0]);
-        approved_calls.extend(build_withdrawal_batch_calls(&selected));
+        approved_calls.extend(build_withdrawal_batch_calls(withdrawals));
         if operation != GuardianOperation::Bridge {
             ensure!(approved_calls.is_empty() && records.is_empty() && anchors.is_empty(), "policy operation cannot mix bridge calls");
             let next_members = next_members.context("policy operation requires exactly three members")?;
@@ -3660,17 +3850,15 @@ async fn submit_guardian_operation(config: &super::guardian_client::LoadedGuardi
         let trace_envelope = GeneratedTxTraceJson::from_trace(&trace, serde_json::to_value(&call_data).context("trace call_data json")?).context("guardian trace json build")?;
         let envelope_bytes = serde_json::to_string(&trace_envelope).context("guardian trace envelope serialize")?;
         tracing::info!(bytes = envelope_bytes.len(), "guardian request envelope built");
-        let request = GuardianSignRequest { schema_version: 2, network_magic: config.root.network_magic()?, user_id: BRIDGE_USER_ID_U64, session_nonce: nonce, operation, trace_json: JsonText::parse(envelope_bytes)?, deposit_anchors: anchors, withdrawal_records: records };
-        let (withdrawal_burns, nonce_conflicts) = current_conflicts(archive, config.root.network_magic()?, BRIDGE_USER_ID_U64, &request.withdrawal_records)?;
-        let context = verification_context(&wallet, provider, config, head, root, history, &[], &withdrawal_burns, &nonce_conflicts);
+        let request = GuardianSignRequest { schema_version: 3, network_magic: config.root.network_magic()?, user_id: BRIDGE_USER_ID_U64, session_nonce: nonce, operation, trace_json: JsonText::parse(envelope_bytes)?, deposit_anchors: anchors, withdrawal_records: records };
+        let context = verification_context(&wallet, provider, config, head, root, history, &[]);
         let (_verified, staged) = verify_guardian_session(&context, &config.root, &request).await.map_err(|error| anyhow::Error::from(error).context("fresh withdrawal request self-verification"))?;
-        archive.save_request(&config.root, &JsonText::from_value(&request)?, &staged, &selected)?;
+        archive.save_request(&config.root, &JsonText::from_value(&request)?, &staged, withdrawals)?;
         JsonText::from_value(&request)?
     };
     let request = request_json.decode().context("pending guardian request decode")?;
     let staged_deposit_tree_states = archive.pending_deposit_tree_states(request.session_nonce)?;
-    let (withdrawal_burns, nonce_conflicts) = current_conflicts(archive, config.root.network_magic()?, BRIDGE_USER_ID_U64, &request.withdrawal_records)?;
-    let context = verification_context(&wallet, provider, config, head, root, &retained.history, &staged_deposit_tree_states, &withdrawal_burns, &nonce_conflicts);
+    let context = verification_context(&wallet, provider, config, head, root, &retained.history, &staged_deposit_tree_states);
     verify_guardian_session(&context, &config.root, &request).await.map_err(|error| anyhow::Error::from(error).context("cached guardian request validation"))?;
     let trace = request.decode_trace()?;
     let client = GuardianClient::new(config.endpoints())?;
@@ -3779,8 +3967,7 @@ async fn recover_guardian_inclusion(
         record.included_checkpoint_hash = provider.get_checkpoint_tree_merkle_proof(head.checkpoint_id, included).await?.value;
         record
     };
-    let (withdrawal_burns, nonce_conflicts) = current_conflicts(archive, request.network_magic, request.user_id, &request.withdrawal_records)?;
-    let context = verification_context(wallet, provider, config, head.checkpoint_id, head.checkpoint_tree_root, history, pending_deposit_tree_states, &withdrawal_burns, &nonce_conflicts);
+    let context = verification_context(wallet, provider, config, head.checkpoint_id, head.checkpoint_tree_root, history, pending_deposit_tree_states);
     let (session, deposit_tree_states) = crate::guardian::verify::verify_session(&context, &config.root, adopted, history).await?;
     ensure!(pending_deposit_tree_states.is_empty() || deposit_tree_states.as_slice() == pending_deposit_tree_states, "verified deposit-tree states differ from the durable pending binding");
     let bound = if pending_deposit_tree_states.is_empty() { deposit_tree_states.clone() } else { pending_deposit_tree_states.to_vec() };
@@ -3848,9 +4035,9 @@ mod tests {
         let mut chain = test_l1().remove(0);
         chain.deployment_block = 100;
         let anchor = guardian_common::protocol::DepositAnchor { chain_index: 0, block_number: 99, block_hash: guardian_common::protocol::Hex([1; 32]), old_count: 0, new_count: 1 };
-        assert!(matches!(crate::guardian::verify_l1::verify_finalized_anchor(&chain, &anchor).await, Err(guardian_common::protocol::GuardianSignError::DepositMismatch)));
+        assert!(matches!(guardian_common::verify_l1::verify_finalized_anchor(&chain, &anchor).await, Err(guardian_common::protocol::GuardianSignError::DepositMismatch)));
         let inclusive = guardian_common::protocol::DepositAnchor { block_number: 100, ..anchor };
-        assert!(matches!(crate::guardian::verify_l1::verify_finalized_anchor(&chain, &inclusive).await, Err(error) if error != guardian_common::protocol::GuardianSignError::DepositMismatch));
+        assert!(matches!(guardian_common::verify_l1::verify_finalized_anchor(&chain, &inclusive).await, Err(error) if error != guardian_common::protocol::GuardianSignError::DepositMismatch));
     }
     use crate::bridge::propose_withdrawals::PendingWithdrawal;
 
@@ -4363,15 +4550,9 @@ mod tests {
         let mut restarted = load_chain_state(&crate::guardian::test_fixture::codec_guardian_config(), &restarted_db, 0).expect("restart must load pending claims");
         assert_eq!(restarted.pending_claim_withdrawals.len(), 1);
         assert_eq!(restarted.pending_claim_withdrawals[&withdrawal.leaf_hash].event_id, withdrawal.event_id);
-        let claim_report = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 1,
-            submitted_count: 1,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: vec![withdrawal.leaf_hash.clone()],
-            failure_reasons: HashMap::new(),
-            deferrals: HashMap::new(),
-        };
-        apply_claim_report(&mut restarted.pending_claim_withdrawals, &claim_report);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        record_claim_outcome(std::slice::from_ref(&withdrawal), &resolved(&withdrawal.leaf_hash), &mut restarted.pending_claim_withdrawals, &mut retry, &mut retired, 0);
         assert!(restarted.pending_claim_withdrawals.is_empty(), "the restarted daemon must resolve the landed withdrawal");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4523,15 +4704,31 @@ mod tests {
         }
     }
 
-    fn empty_report() -> claim_withdrawals::BatchWithdrawalsReport {
+    fn report_of(leaves: &[(&str, claim_withdrawals::ClaimOutcomeKind)]) -> claim_withdrawals::BatchWithdrawalsReport {
         claim_withdrawals::BatchWithdrawalsReport {
-            requested: 0,
-            submitted_count: 0,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: vec![],
-            failure_reasons: HashMap::new(),
-            deferrals: HashMap::new(),
+            requested: leaves.len(),
+            submitted_count: leaves.iter().filter(|(_, kind)| *kind == claim_withdrawals::ClaimOutcomeKind::Registered).count(),
+            outcomes: leaves
+                .iter()
+                .map(|(leaf, kind)| claim_withdrawals::ClaimOutcome {
+                    leaf_hash: (*leaf).to_string(),
+                    kind: *kind,
+                    tx_hash: None,
+                })
+                .collect(),
         }
+    }
+
+    fn empty_report() -> claim_withdrawals::BatchWithdrawalsReport {
+        report_of(&[])
+    }
+
+    fn failed(leaf: &str, code: claim_withdrawals::ClaimCode) -> claim_withdrawals::BatchWithdrawalsReport {
+        report_of(&[(leaf, claim_withdrawals::ClaimOutcomeKind::Failed(code))])
+    }
+
+    fn resolved(leaf: &str) -> claim_withdrawals::BatchWithdrawalsReport {
+        report_of(&[(leaf, claim_withdrawals::ClaimOutcomeKind::Registered)])
     }
 
     #[test]
@@ -4554,9 +4751,7 @@ mod tests {
         record_claim_outcome(&attempted, &empty_report(), &mut pending, &mut retry, &mut retired, 0);
         assert!(retry.contains_key("a"));
 
-        let mut resolved = empty_report();
-        resolved.resolved_leaf_hashes = vec!["a".to_string()];
-        record_claim_outcome(&attempted, &resolved, &mut pending, &mut retry, &mut retired, 0);
+        record_claim_outcome(&attempted, &resolved("a"), &mut pending, &mut retry, &mut retired, 0);
         assert!(!retry.contains_key("a"), "a success must clear the history");
     }
 
@@ -4659,15 +4854,14 @@ mod tests {
         let mut retired = HashMap::new();
         let attempted = vec![backoff_withdrawal("a")];
 
-        let mut report = empty_report();
-        report.deferrals.insert("a".to_string(), "bridge ERC20 liquidity insufficient".to_string());
+        let report = failed("a", claim_withdrawals::ClaimCode::LiquidityShort);
 
         for _ in 0..50 {
             record_claim_outcome(&attempted, &report, &mut pending, &mut retry, &mut retired, 0);
         }
 
-        assert!(retry.get("a").is_none(), "a deferral must not count as an attempt");
-        assert!(retired.is_empty(), "a deferred withdrawal must not be given up on");
+        assert!(retry.get("a").is_none(), "a pure liquidity hold creates no retry row");
+        assert!(retired.is_empty(), "a held withdrawal must not be given up on");
         assert_eq!(claims_to_attempt(&pending, &retry).len(), 1);
     }
 
@@ -4680,9 +4874,7 @@ mod tests {
         let attempted = vec![backoff_withdrawal("a")];
 
         record_claim_outcome(&attempted, &empty_report(), &mut pending, &mut retry, &mut retired, 0);
-        let mut deferred = empty_report();
-        deferred.deferrals.insert("a".to_string(), "waiting".to_string());
-        record_claim_outcome(&attempted, &deferred, &mut pending, &mut retry, &mut retired, 0);
+        record_claim_outcome(&attempted, &failed("a", claim_withdrawals::ClaimCode::LiquidityShort), &mut pending, &mut retry, &mut retired, 0);
 
         assert_eq!(retry["a"].attempts, 1, "the earlier failure still counts");
     }
@@ -4693,9 +4885,13 @@ mod tests {
         let mut pending = attempted.iter().map(|w| (w.leaf_hash.clone(), w.clone())).collect();
         let mut retry = HashMap::new();
         let mut retired = HashMap::new();
-        let mut report = empty_report();
-        report.deferrals.insert("not-found".to_string(), "withdrawal claim proof not available yet; L1 root not finalized".to_string());
-        report.failure_reasons.insert("root-mismatch".to_string(), "withdrawal root is not current or known: services=0x01 l1=0x02".to_string());
+        let report = claim_withdrawals::BatchWithdrawalsReport {
+            outcomes: vec![
+                claim_withdrawals::ClaimOutcome { leaf_hash: "not-found".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "root-mismatch".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RootUnauthorized), tx_hash: None },
+            ],
+            ..empty_report()
+        };
 
         for round in 0..claim_attempts::CLAIM_MAX_ATTEMPTS {
             record_claim_outcome(&attempted, &report, &mut pending, &mut retry, &mut retired, u64::from(round));
@@ -4706,22 +4902,144 @@ mod tests {
         assert_eq!(claims_to_attempt(&pending, &retry).len(), 1);
 
         let remaining: Vec<_> = pending.values().cloned().collect();
-        let mut failed = empty_report();
-        failed.failure_reasons.insert("not-found".to_string(), "fetch claim proof failed: RPC unavailable".to_string());
-        record_claim_outcome(&remaining, &failed, &mut pending, &mut retry, &mut retired, 10);
-        assert_eq!(retry["not-found"].attempts, 1);
+        record_claim_outcome(&remaining, &failed("not-found", claim_withdrawals::ClaimCode::RpcUnavailable), &mut pending, &mut retry, &mut retired, 10);
+        assert!(retry.get("not-found").is_none(), "an unavailable read does not spend an attempt");
         assert!(retired.contains_key("root-mismatch"));
 
-        let mut waiting = empty_report();
-        waiting.deferrals.insert("not-found".to_string(), "withdrawal claim proof not available yet; L1 root not finalized".to_string());
+        let waiting = failed("not-found", claim_withdrawals::ClaimCode::ProofNotReady);
         for round in 11..15 {
             let remaining: Vec<_> = pending.values().cloned().collect();
             record_claim_outcome(&remaining, &waiting, &mut pending, &mut retry, &mut retired, round);
-            assert_eq!(retry["not-found"].attempts, 1);
+            assert!(retry.get("not-found").is_none(), "waiting after an unavailable read still spends nothing");
             assert!(retired.contains_key("root-mismatch"));
             assert_eq!(claims_to_attempt(&pending, &retry).len(), 1);
         }
     }
+
+    #[test]
+    fn a_pause_holds_without_an_attempt_and_an_unpause_sends_again() {
+        let attempted = vec![backoff_withdrawal("paused")];
+        let mut pending = HashMap::from([("paused".to_string(), backoff_withdrawal("paused"))]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let paused = failed("paused", claim_withdrawals::ClaimCode::RegistrationPaused);
+
+        for _ in 0..10 {
+            record_claim_outcome(&attempted, &paused, &mut pending, &mut retry, &mut retired, 0);
+        }
+
+        assert_eq!(retry["paused"].attempts, 0, "a pause spends nothing");
+        assert!(matches!(retry["paused"].hold, claim_attempts::ClaimHold::OperatorPending(claim_withdrawals::ClaimCode::RegistrationPaused)));
+        assert!(claims_to_attempt(&pending, &retry).is_empty(), "a paused leaf is not sent");
+        assert!(retired.is_empty());
+
+        claim_attempts::release_hold(&mut retry, "paused");
+        let due = claims_to_attempt(&pending, &retry);
+        assert_eq!(due.len(), 1, "clearing the pause returns the leaf to the round");
+        assert_eq!(due[0].leaf_hash, "paused");
+    }
+
+    #[test]
+    fn a_terminal_payload_is_retired_once_and_never_retried() {
+        let attempted = vec![backoff_withdrawal("dead")];
+        let mut pending = HashMap::from([("dead".to_string(), backoff_withdrawal("dead"))]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+
+        record_claim_outcome(&attempted, &failed("dead", claim_withdrawals::ClaimCode::ZeroAddress), &mut pending, &mut retry, &mut retired, 7);
+        record_claim_outcome(&attempted, &failed("dead", claim_withdrawals::ClaimCode::ZeroAddress), &mut pending, &mut retry, &mut retired, 8);
+
+        assert!(pending.is_empty());
+        assert!(retry.is_empty(), "retirement leaves no retry record");
+        assert_eq!(retired["dead"].attempts, 0, "a terminal payload gets no strikes");
+        assert_eq!(retired["dead"].last_reason, claim_withdrawals::ClaimCode::ZeroAddress.label());
+        assert!(claims_to_attempt(&pending, &retry).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_transaction_without_a_hash_is_held_and_never_sent() {
+        let attempted = vec![backoff_withdrawal("lost")];
+        let mut pending = HashMap::from([("lost".to_string(), backoff_withdrawal("lost"))]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let unknown = failed("lost", claim_withdrawals::ClaimCode::ReceiptUnknown);
+
+        for _ in 0..5 {
+            record_claim_outcome(&attempted, &unknown, &mut pending, &mut retry, &mut retired, 0);
+        }
+
+        assert!(pending.contains_key("lost"));
+        assert_eq!(retry["lost"].attempts, 0, "an unknown landing spends nothing");
+        assert!(matches!(retry["lost"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None }));
+        assert!(claims_to_attempt(&pending, &retry).is_empty(), "no hash means no new send");
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn a_pending_recorded_transaction_is_not_sent_again() {
+        let attempted = vec![backoff_withdrawal("inflight")];
+        let mut pending = HashMap::from([("inflight".to_string(), backoff_withdrawal("inflight"))]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let mut unknown = failed("inflight", claim_withdrawals::ClaimCode::ReceiptUnknown);
+        unknown.outcomes[0].tx_hash = Some(alloy_primitives::B256::repeat_byte(0x11));
+
+        record_claim_outcome(&attempted, &unknown, &mut pending, &mut retry, &mut retired, 0);
+        record_claim_outcome(&attempted, &unknown, &mut pending, &mut retry, &mut retired, 1);
+
+        assert_eq!(retry["inflight"].attempts, 0);
+        assert!(matches!(
+            retry["inflight"].hold,
+            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash) } if hash == alloy_primitives::B256::repeat_byte(0x11)
+        ));
+        assert!(claims_to_attempt(&pending, &retry).is_empty(), "a recorded hash is reconciled, not resent");
+    }
+
+    #[test]
+    fn a_reverted_recorded_transaction_spends_one_attempt_and_only_then_is_due() {
+        let withdrawal = backoff_withdrawal("reverted");
+        let mut pending = HashMap::from([("reverted".to_string(), withdrawal.clone())]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        claim_attempts::hold_for_receipt(&mut retry, "reverted", Some(alloy_primitives::B256::repeat_byte(0x22)));
+        assert!(claims_to_attempt(&pending, &retry).is_empty());
+
+        let report = claim_withdrawals::reverted_claim_report(&withdrawal);
+        record_claim_outcome(std::slice::from_ref(&withdrawal), &report, &mut pending, &mut retry, &mut retired, 0);
+
+        assert_eq!(retry["reverted"].attempts, 1, "the revert is the one spent attempt");
+        assert!(matches!(retry["reverted"].hold, claim_attempts::ClaimHold::None));
+        assert_eq!(claims_to_attempt(&pending, &retry).len(), 1, "the leaf is due again only after the revert");
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn a_partial_batch_removes_the_good_leaf_and_holds_the_bad_one() {
+        let good = backoff_withdrawal("good");
+        let bad = backoff_withdrawal("bad");
+        let mut pending = HashMap::from([
+            ("good".to_string(), good.clone()),
+            ("bad".to_string(), bad.clone()),
+        ]);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        let report = claim_withdrawals::BatchWithdrawalsReport {
+            outcomes: vec![
+                claim_withdrawals::ClaimOutcome { leaf_hash: "good".into(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: "bad".into(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::RegistrationPaused), tx_hash: None },
+            ],
+            ..empty_report()
+        };
+
+        record_claim_outcome(&[good, bad], &report, &mut pending, &mut retry, &mut retired, 0);
+
+        assert!(!pending.contains_key("good"), "the registered leaf leaves pending");
+        assert!(pending.contains_key("bad"), "the paused leaf stays");
+        assert_eq!(retry.get("bad").map(|state| state.attempts), Some(0));
+        assert!(claims_to_attempt(&pending, &retry).is_empty(), "the held leaf is not sent next round");
+        assert!(retired.is_empty());
+    }
+
 
     #[test]
     fn a_withdrawal_that_never_succeeds_is_given_up_on_rather_than_retried_forever() {
@@ -4838,10 +5156,103 @@ mod tests {
     }
 
     #[test]
+    fn successive_signed_chunks_keep_every_recorded_hash() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let first = withdrawal_for_chain("first", 0);
+        let second = withdrawal_for_chain("second", 1);
+        let mut state = MultichainDaemonState::default();
+        insert_pending_claims(&[first.clone(), second.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+        save_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db, &state).unwrap();
+        let hook = claim_broadcast_hook(&crate::guardian::test_fixture::codec_guardian_config(), &db);
+        let first_hash = alloy_primitives::B256::repeat_byte(0x11);
+        let second_hash = alloy_primitives::B256::repeat_byte(0x22);
+        futures::executor::block_on(hook(std::slice::from_ref(&first), first_hash)).unwrap();
+        futures::executor::block_on(hook(std::slice::from_ref(&second), second_hash)).unwrap();
+        let saved = load_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db).unwrap();
+        assert!(matches!(saved.claim_retry["first"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash) } if hash == first_hash));
+        assert!(matches!(saved.claim_retry["second"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash) } if hash == second_hash));
+        assert!(claims_to_attempt(&saved.pending_claim_withdrawals, &saved.claim_retry).is_empty());
+        // A resolved leaf is removed from the real queue on the next save even
+        // though its hook hold was persisted first; the other chunk stays held.
+        let mut saved = saved;
+        record_claim_result(
+            &[first.clone()],
+            &Ok(resolved("first")),
+            &mut saved.pending_claim_withdrawals,
+            &mut saved.claim_retry,
+            &mut saved.retired_claim_withdrawals,
+            1,
+        );
+        save_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db, &saved).unwrap();
+        let reloaded = load_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db).unwrap();
+        assert!(!reloaded.pending_claim_withdrawals.contains_key("first"));
+        assert!(!reloaded.claim_retry.contains_key("first"));
+        assert!(matches!(reloaded.claim_retry["second"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(hash) } if hash == second_hash));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imported_leaves_with_event_zero_queue_alongside_a_shared_nonce() {
+        let mut first = withdrawal_for_chain("imported-a", 0);
+        let mut second = withdrawal_for_chain("imported-b", 0);
+        for withdrawal in [&mut first, &mut second] {
+            withdrawal.event_id = 0;
+            withdrawal.nonce = [7; 8];
+        }
+        let mut state = DaemonState::default();
+        assert!(insert_pending_claims(&[first.clone(), second.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals));
+        assert_eq!(state.pending_claim_withdrawals.len(), 2, "distinct leaves that share a nonce are both pending");
+
+        // The same full leaf replayed with the real event index is already
+        // queued: event metadata is append ordering, not content, so this is
+        // a skip, not a conflict — and the queued row keeps its imported 0.
+        let mut replay = first.clone();
+        replay.event_id = 41;
+        assert!(!insert_pending_claims(&[replay], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals));
+        assert_eq!(state.pending_claim_withdrawals.len(), 2);
+        assert_eq!(state.pending_claim_withdrawals[&first.leaf_hash].event_id, 0);
+    }
+
+    #[test]
+    fn a_batch_error_keeps_the_hook_persisted_unknown_hold() {
+        let (root, db) = super::super::guardian_client::tests_db();
+        bind_progress_to_fixture(&db);
+        let inflight = withdrawal_for_chain("inflight", 0);
+        let mut state = MultichainDaemonState::default();
+        insert_pending_claims(&[inflight.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+        save_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db, &state).unwrap();
+        let hook = claim_broadcast_hook(&crate::guardian::test_fixture::codec_guardian_config(), &db);
+        let hash = alloy_primitives::B256::repeat_byte(0x33);
+        futures::executor::block_on(hook(std::slice::from_ref(&inflight), hash)).unwrap();
+
+        // The batch dies after the hook persisted the signed hash. The
+        // persisted hold is adopted into the caller state before the error is
+        // recorded, so the hold wins: no attempt is spent, and the round's
+        // save does not overwrite the durable hold.
+        let persisted = persisted_claim_retry(&crate::guardian::test_fixture::codec_guardian_config(), &db).unwrap();
+        adopt_persisted_receipt_holds(&[inflight.clone()], &mut state.claim_retry, &persisted);
+        record_claim_result(
+            &[inflight.clone()],
+            &Err(anyhow::anyhow!("RPC unavailable")),
+            &mut state.pending_claim_withdrawals,
+            &mut state.claim_retry,
+            &mut state.retired_claim_withdrawals,
+            1,
+        );
+        save_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db, &state).unwrap();
+        let reloaded = load_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db).unwrap();
+        assert!(matches!(reloaded.claim_retry[&inflight.leaf_hash].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(kept) } if kept == hash));
+        assert_eq!(reloaded.claim_retry[&inflight.leaf_hash].attempts, 0);
+        assert!(claims_to_attempt(&reloaded.pending_claim_withdrawals, &reloaded.claim_retry).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn multichain_retirement_survives_restart_and_replayed_scans() {
         let (root, db) = super::super::guardian_client::tests_db();
         bind_progress_to_fixture(&db);
-        let failed = withdrawal_for_chain("failed", 0);
+        let failed_withdrawal = withdrawal_for_chain("failed", 0);
         let healthy = withdrawal_for_chain("healthy", 2);
         let range = PendingFinalizationRange { from_checkpoint: 10, to_checkpoint: 20 };
         let mut state = MultichainDaemonState {
@@ -4849,12 +5260,11 @@ mod tests {
             finalized_chains: served(&[0, 1]),
             ..Default::default()
         };
-        insert_pending_claims(&[failed.clone(), healthy.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
+        insert_pending_claims(&[failed_withdrawal.clone(), healthy.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals);
         for attempt in 1..=claim_attempts::CLAIM_MAX_ATTEMPTS {
-            let mut report = empty_report();
-            report.failure_reasons.insert("failed".to_string(), "invalid proof".to_string());
+            let report = failed("failed", claim_withdrawals::ClaimCode::ProofGenerationFailed);
             record_claim_result(
-                &[failed.clone()], &Ok(report), &mut state.pending_claim_withdrawals,
+                &[failed_withdrawal.clone()], &Ok(report), &mut state.pending_claim_withdrawals,
                 &mut state.claim_retry, &mut state.retired_claim_withdrawals, u64::from(attempt),
             );
             save_multichain_state(&crate::guardian::test_fixture::codec_guardian_config(), &db, &state).unwrap();
@@ -4866,17 +5276,16 @@ mod tests {
         assert_eq!(state.retired_claim_withdrawals["failed"].attempts, 3);
         for _ in 0..10 {
             assert!(!insert_pending_claims(
-                &[failed.clone(), healthy.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals,
+                &[failed_withdrawal.clone(), healthy.clone()], &mut state.pending_claim_withdrawals, &state.retired_claim_withdrawals,
             ));
             let due = claims_to_attempt(&state.pending_claim_withdrawals, &state.claim_retry);
             assert_eq!(due.len(), 1);
             assert_eq!(due[0].leaf_hash, "healthy");
         }
 
-        let mut resolved = empty_report();
-        resolved.resolved_leaf_hashes.push("healthy".to_string());
+        let resolved_report = resolved("healthy");
         record_claim_result(
-            &[healthy], &Ok(resolved), &mut state.pending_claim_withdrawals,
+            &[healthy], &Ok(resolved_report), &mut state.pending_claim_withdrawals,
             &mut state.claim_retry, &mut state.retired_claim_withdrawals, 4,
         );
         assert!(state.pending_claim_withdrawals.is_empty());
@@ -4916,14 +5325,14 @@ mod tests {
 
 
     #[test]
-    fn apply_claim_report_removes_resolved_and_already_claimed_keeps_failures() {
-        // resolved_leaf_hashes carries BOTH successfully submitted AND
-        // already-claimed withdrawals (claim_withdrawals.rs pushes the leaf
-        // hash in both cases). apply_claim_report must drop both from pending
-        // so already-claimed withdrawals are never retried (no double-claim).
+    fn outcome_report_removes_resolved_and_consumed_nonce_and_holds_the_rest() {
+        // A submitted leaf resolves and leaves pending. A leaf whose nonce is
+        // already consumed elsewhere is terminal: it is retired, never
+        // retried. A held leaf stays, so a partial batch never retries the
+        // good leaf or drops the bad one.
         let w1 = sample_withdrawal(1); // newly submitted
-        let w2 = sample_withdrawal(2); // already claimed on L1
-        let w3 = sample_withdrawal(3); // failed, must retry next round
+        let w2 = sample_withdrawal(2); // nonce already consumed elsewhere
+        let w3 = sample_withdrawal(3); // proof not ready, must stay
         let mut pending: HashMap<String, PendingWithdrawal> = [
             (w1.leaf_hash.clone(), w1.clone()),
             (w2.leaf_hash.clone(), w2.clone()),
@@ -4931,28 +5340,29 @@ mod tests {
         ]
         .into_iter()
         .collect();
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
         let report = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 3,
-            submitted_count: 1,
-            already_claimed_count: 1,
-            resolved_leaf_hashes: vec![w1.leaf_hash.clone(), w2.leaf_hash.clone()],
-            failure_reasons: HashMap::from([(w3.leaf_hash.clone(), "proof not ready".to_string())]),
-            deferrals: HashMap::new(),
+            outcomes: vec![
+                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::NonceConflict), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None },
+            ],
+            ..empty_report()
         };
-        apply_claim_report(&mut pending, &report);
+        record_claim_outcome(&[w1.clone(), w2.clone(), w3.clone()], &report, &mut pending, &mut retry, &mut retired, 0);
         assert!(!pending.contains_key(&w1.leaf_hash), "submitted withdrawal must be removed");
-        assert!(
-            !pending.contains_key(&w2.leaf_hash),
-            "already-claimed withdrawal must be removed to prevent double-claim"
-        );
-        assert!(pending.contains_key(&w3.leaf_hash), "failed withdrawal must remain for retry");
+        assert!(!pending.contains_key(&w2.leaf_hash), "consumed-nonce withdrawal must be retired, never retried");
+        assert!(pending.contains_key(&w3.leaf_hash), "held withdrawal must remain");
+        assert!(retry.get(&w3.leaf_hash).is_none(), "a Held proof-not-ready leaf writes no retry counter; it stays pending and unheld for the next readiness recheck");
+        assert!(retired.contains_key(&w2.leaf_hash));
         assert_eq!(pending.len(), 1);
     }
 
     #[test]
-    fn apply_claim_report_leaves_unreported_withdrawals_untouched() {
-        // Withdrawals absent from the report (e.g. claimed in a prior partial
-        // batch) must be retained so they are retried in a later round.
+    fn an_unreported_withdrawal_stays_pending_and_spends_nothing() {
+        // A withdrawal absent from the attempted set is not this round's
+        // business. One the round attempted but did not name spends an attempt.
         let w1 = sample_withdrawal(1);
         let w2 = sample_withdrawal(2);
         let mut pending: HashMap<String, PendingWithdrawal> = [
@@ -4961,17 +5371,12 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let report = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 1,
-            submitted_count: 1,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: vec![w1.leaf_hash.clone()],
-            failure_reasons: HashMap::new(),
-            deferrals: HashMap::new(),
-        };
-        apply_claim_report(&mut pending, &report);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        record_claim_outcome(&[w1.clone()], &resolved(&w1.leaf_hash), &mut pending, &mut retry, &mut retired, 0);
         assert!(!pending.contains_key(&w1.leaf_hash));
-        assert!(pending.contains_key(&w2.leaf_hash), "unreported withdrawal must be retained");
+        assert!(pending.contains_key(&w2.leaf_hash), "unattempted withdrawal must be retained");
+        assert!(retry.is_empty());
     }
 
     #[test]
@@ -5292,48 +5697,30 @@ mod tests {
     // ── apply_claim_report: additional double-claim-defence edges ──────────
 
     #[test]
-    fn apply_claim_report_empty_report_leaves_pending_untouched() {
-        // An empty report (no resolves, no failures) must not mutate pending.
+    fn an_empty_outcome_report_leaves_pending_untouched() {
         let w = sample_withdrawal(1);
         let mut pending: HashMap<String, PendingWithdrawal> =
             [(w.leaf_hash.clone(), w.clone())].into_iter().collect();
-        let report = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 0,
-            submitted_count: 0,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: Vec::new(),
-            failure_reasons: HashMap::new(),
-            deferrals: HashMap::new(),
-        };
-        apply_claim_report(&mut pending, &report);
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        record_claim_outcome(&[], &empty_report(), &mut pending, &mut retry, &mut retired, 0);
         assert_eq!(pending.len(), 1);
         assert!(pending.contains_key(&w.leaf_hash));
     }
 
     #[test]
-    fn apply_claim_report_resolving_unknown_leaf_is_a_safe_noop() {
-        // A resolved leaf_hash that was never pending must not panic and must not
-        // drop unrelated pending entries.
+    fn resolving_an_unknown_leaf_does_not_evict_a_pending_one() {
         let w1 = sample_withdrawal(1);
         let mut pending: HashMap<String, PendingWithdrawal> =
             [(w1.leaf_hash.clone(), w1.clone())].into_iter().collect();
-        let report = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 1,
-            submitted_count: 1,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: vec!["never-pending-leaf".to_string()],
-            failure_reasons: HashMap::new(),
-            deferrals: HashMap::new(),
-        };
-        apply_claim_report(&mut pending, &report);
-        assert_eq!(pending.len(), 1, "unknown resolved leaf must not evict w1");
-        assert!(pending.contains_key(&w1.leaf_hash));
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        record_claim_outcome(&[w1.clone()], &resolved("never-pending-leaf"), &mut pending, &mut retry, &mut retired, 0);
+        assert!(pending.contains_key(&w1.leaf_hash), "a report for another leaf must not evict w1");
     }
 
     #[test]
-    fn apply_claim_report_resolving_all_clears_pending() {
-        // Every pending withdrawal resolved → pending becomes empty (all claims
-        // complete; nothing left to retry).
+    fn resolving_every_pending_leaf_clears_the_set() {
         let w1 = sample_withdrawal(1);
         let w2 = sample_withdrawal(2);
         let mut pending: HashMap<String, PendingWithdrawal> = [
@@ -5342,34 +5729,28 @@ mod tests {
         ]
         .into_iter()
         .collect();
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
         let report = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 2,
-            submitted_count: 2,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: vec![w1.leaf_hash.clone(), w2.leaf_hash.clone()],
-            failure_reasons: HashMap::new(),
-            deferrals: HashMap::new(),
+            outcomes: vec![
+                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+            ],
+            ..empty_report()
         };
-        apply_claim_report(&mut pending, &report);
+        record_claim_outcome(&[w1, w2], &report, &mut pending, &mut retry, &mut retired, 0);
         assert!(pending.is_empty(), "all-resolved report must clear pending");
     }
 
     #[test]
-    fn apply_claim_report_failure_for_unknown_leaf_never_inserts() {
-        // failure_reasons only logs a warning; it must never ADD a leaf to pending.
+    fn a_failure_for_an_unknown_leaf_never_inserts_it() {
         let w1 = sample_withdrawal(1);
         let mut pending: HashMap<String, PendingWithdrawal> =
             [(w1.leaf_hash.clone(), w1.clone())].into_iter().collect();
-        let report = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 1,
-            submitted_count: 0,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: Vec::new(),
-            failure_reasons: HashMap::from([("never-pending-leaf".to_string(), "x".to_string())]),
-            deferrals: HashMap::new(),
-        };
-        apply_claim_report(&mut pending, &report);
-        assert_eq!(pending.len(), 1, "failure reason must not insert into pending");
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
+        record_claim_outcome(&[], &failed("never-pending-leaf", claim_withdrawals::ClaimCode::SendFailed), &mut pending, &mut retry, &mut retired, 0);
+        assert_eq!(pending.len(), 1, "a failure must not insert into pending");
         assert!(pending.contains_key(&w1.leaf_hash));
         assert!(!pending.contains_key("never-pending-leaf"));
     }
@@ -5385,32 +5766,35 @@ mod tests {
         assert!(claims.is_empty());
     }
 
+    fn indexed_seen(withdrawals: &[PendingWithdrawal]) -> HashSet<(u64, i64, String)> {
+        withdrawals.iter().map(|withdrawal| (withdrawal.destination_chain_index, withdrawal.event_id, withdrawal.leaf_hash.clone())).collect()
+    }
+
     #[test]
     fn record_claim_withdrawals_all_duplicates_produces_no_new_entries() {
-        // Pre-seed `seen` with every leaf_hash → input records nothing new.
         let w1 = sample_withdrawal(1);
         let w2 = sample_withdrawal(2);
-        let mut seen: HashSet<String> =
-            [w1.leaf_hash.clone(), w2.leaf_hash.clone()].into_iter().collect();
+        let mut seen = indexed_seen(&[w1.clone(), w2.clone()]);
         let mut claims = Vec::new();
-        record_claim_withdrawals(&[w1.clone(), w2], &mut seen, &mut claims);
-        assert_eq!(claims.len(), 0, "fully-duplicate input must record nothing");
+        record_claim_withdrawals(&[w1, w2], &mut seen, &mut claims);
+        assert_eq!(claims.len(), 0, "the same chain, event id, and leaf records nothing new");
     }
 
     #[test]
     fn record_claim_withdrawals_interleaved_new_and_duplicate_preserves_order() {
-        // Mixed input: w1 new, w2 duplicate (already seen), w3 new → only w1 and
-        // w3 are appended, in input order. Defends the within-round dedup
-        // boundary that prevents the same claim being submitted twice.
         let w1 = sample_withdrawal(1);
         let w2 = sample_withdrawal(2);
         let w3 = sample_withdrawal(3);
-        let mut seen: HashSet<String> = [w2.leaf_hash.clone()].into_iter().collect();
+        let mut same_leaf = w1.clone();
+        same_leaf.event_id = 11;
+        let mut seen = indexed_seen(&[w2.clone()]);
         let mut claims = Vec::new();
-        record_claim_withdrawals(&[w1.clone(), w2, w3.clone()], &mut seen, &mut claims);
-        assert_eq!(claims.len(), 2);
-        assert_eq!(claims[0].leaf_hash, w1.leaf_hash);
-        assert_eq!(claims[1].leaf_hash, w3.leaf_hash);
+        record_claim_withdrawals(&[w1.clone(), w2, same_leaf.clone(), w3.clone()], &mut seen, &mut claims);
+        assert_eq!(claims.len(), 3);
+        assert_eq!(claims[0].event_id, w1.event_id);
+        assert_eq!(claims[1].event_id, same_leaf.event_id);
+        assert_eq!(claims[1].leaf_hash, w1.leaf_hash);
+        assert_eq!(claims[2].event_id, w3.event_id);
     }
 
 
@@ -5468,13 +5852,13 @@ mod tests {
         // only the public-ish helpers (merge via or_insert_with + apply_claim_report),
         // the same sequence run() drives. Defends the externally observable
         // contract that pending_claim_withdrawals is the single source of truth:
-        //   - a withdrawal submitted or already-claimed in round N is removed and
+        //   - a withdrawal submitted or retired (consumed nonce) in round N is removed and
         //     NEVER retried (no double-claim);
         //   - a failed withdrawal persists and is retried next round;
         //   - re-scanning an existing leaf never duplicates or overwrites it;
         //   - pending keys stay unique throughout.
         let w1 = sample_withdrawal(1); // submitted round 1
-        let w2 = sample_withdrawal(2); // already-claimed on L1 round 1
+        let w2 = sample_withdrawal(2); // nonce consumed elsewhere round 1
         let w3 = sample_withdrawal(3); // fails round 1, submitted round 2
         let w4 = sample_withdrawal(4); // new in round 2, submitted
 
@@ -5487,22 +5871,20 @@ mod tests {
                 .or_insert_with(|| w.clone());
         }
         assert_eq!(pending.len(), 3, "round 1 merge must add all three uniquely");
-        // Claim report: w1 submitted, w2 already-claimed (both resolved), w3 fails.
+        let mut retry = HashMap::new();
+        let mut retired = HashMap::new();
         let report1 = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 3,
-            submitted_count: 1,
-            already_claimed_count: 1,
-            resolved_leaf_hashes: vec![w1.leaf_hash.clone(), w2.leaf_hash.clone()],
-            failure_reasons: HashMap::from([(w3.leaf_hash.clone(), "proof not ready".to_string())]),
-            deferrals: HashMap::new(),
+            outcomes: vec![
+                claim_withdrawals::ClaimOutcome { leaf_hash: w1.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w2.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::NonceConflict), tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Failed(claim_withdrawals::ClaimCode::ProofNotReady), tx_hash: None },
+            ],
+            ..empty_report()
         };
-        apply_claim_report(&mut pending, &report1);
+        record_claim_outcome(&[w1.clone(), w2.clone(), w3.clone()], &report1, &mut pending, &mut retry, &mut retired, 0);
         assert!(!pending.contains_key(&w1.leaf_hash), "submitted must leave pending");
-        assert!(
-            !pending.contains_key(&w2.leaf_hash),
-            "already-claimed must leave pending (no double-claim)"
-        );
-        assert!(pending.contains_key(&w3.leaf_hash), "failed must remain for retry");
+        assert!(!pending.contains_key(&w2.leaf_hash), "consumed-nonce must leave pending (retired, no double-claim)");
+        assert!(pending.contains_key(&w3.leaf_hash), "held must remain");
         assert_eq!(pending.len(), 1);
 
         // ── Round 2: re-scan reports w3 (retry) and w4 (new). ───────────────
@@ -5520,16 +5902,14 @@ mod tests {
         // w4 was inserted fresh.
         assert!(pending.contains_key(&w4.leaf_hash));
 
-        // Claim report: both w3 and w4 submitted this round; no failures.
         let report2 = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 2,
-            submitted_count: 2,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: vec![w3.leaf_hash.clone(), w4.leaf_hash.clone()],
-            failure_reasons: HashMap::new(),
-            deferrals: HashMap::new(),
+            outcomes: vec![
+                claim_withdrawals::ClaimOutcome { leaf_hash: w3.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+                claim_withdrawals::ClaimOutcome { leaf_hash: w4.leaf_hash.clone(), kind: claim_withdrawals::ClaimOutcomeKind::Registered, tx_hash: None },
+            ],
+            ..empty_report()
         };
-        apply_claim_report(&mut pending, &report2);
+        record_claim_outcome(&[w3.clone(), w4.clone()], &report2, &mut pending, &mut retry, &mut retired, 0);
         assert!(pending.is_empty(), "all claims resolved → pending must be empty");
         // Invariant: w2 (already-claimed in round 1) was never re-added even
         // though it was not re-scanned — double-claim prevented.
@@ -6765,14 +7145,7 @@ rpc_urls = ["http://127.0.0.1:4"]
         let mut pending = HashMap::from([(withdrawal.leaf_hash.clone(), withdrawal.clone())]);
         let mut retry = HashMap::new();
         let mut retired = HashMap::new();
-        let report = claim_withdrawals::BatchWithdrawalsReport {
-            requested: 1,
-            submitted_count: 0,
-            already_claimed_count: 0,
-            resolved_leaf_hashes: Vec::new(),
-            failure_reasons: HashMap::new(),
-            deferrals: HashMap::from([(withdrawal.leaf_hash.clone(), "fee source unavailable".into())]),
-        };
+        let report = failed(&withdrawal.leaf_hash, claim_withdrawals::ClaimCode::FeeRefused);
         for round in 0..10 {
             record_claim_result(&[withdrawal.clone()], &Ok(report.clone()), &mut pending, &mut retry, &mut retired, round);
         }
@@ -7058,23 +7431,4 @@ rpc_urls = ["http://127.0.0.1:4"]
         assert!(verify_system_prove_proxy(&url).await.is_err());
     }
 
-    #[test]
-    fn select_guardian_withdrawals_drops_both_index_conflicts_without_failing_the_session() {
-        let nonce_a = [0u32, 0, 0, 0, 0, 0, 0, 7];
-        let nonce_b = [0u32, 0, 0, 0, 0, 0, 0, 8];
-        let nonce_c = [0u32, 0, 0, 0, 0, 0, 0, 9];
-        let withdrawal = |nonce: [u32; 8], chain: u64, sender: u64| PendingWithdrawal {
-            event_id: 0, checkpoint_id: 0, user_id: 1, sender_user_id: sender, contract_id: 4,
-            destination_chain_index: chain, token_address: [0; 8], amount: [0; 8], recipient: [0; 8], nonce, leaf_hash: String::new(),
-        };
-        let withdrawals = vec![withdrawal(nonce_a, 0, 1000), withdrawal(nonce_b, 1, 1001), withdrawal(nonce_c, 1, 1002)];
-        let withdrawal_burns = std::collections::BTreeSet::from([(1000u32, 4u32, nonce_a)]);
-        let nonces = std::collections::BTreeSet::from([(1u8, nonce_b)]);
-        // A durable withdrawal-burn hit or a destination-chain nonce hit drops the withdrawal;
-        // neither conflict may abort the selection or fail the whole session here.
-        let selected = select_guardian_withdrawals(&withdrawals, |sender, contract, nonce| Ok(withdrawal_burns.contains(&(sender, contract, nonce))), |chain, nonce| Ok(nonces.contains(&(chain, nonce)))).unwrap();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].nonce, nonce_c);
-        assert_eq!(selected[0].destination_chain_index, 1);
-    }
 }

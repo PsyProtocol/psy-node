@@ -496,43 +496,57 @@ pub async fn fetch_pending_bridge_withdrawals(
             service_withdrawals.append(&mut page);
         }
     }
+    // Services returns one row per indexed leaf. Keep each chain's event_id
+    // order; do not reorder by sender, contract, or nonce.
     service_withdrawals.sort_by(|left, right| {
-        (
-            left.destination_chain_index,
-            left.sender_user_id,
-            left.contract_id,
-            left.nonce_limbs.unwrap_or([u32::MAX; 8]),
-            left.event_id,
-        )
-            .cmp(&(
-                right.destination_chain_index,
-                right.sender_user_id,
-                right.contract_id,
-                right.nonce_limbs.unwrap_or([u32::MAX; 8]),
-                right.event_id,
-            ))
+        left.destination_chain_index
+            .cmp(&right.destination_chain_index)
+            .then(left.event_id.cmp(&right.event_id))
     });
 
     let mut withdrawals: Vec<PendingWithdrawal> = Vec::new();
 
     for withdrawal in service_withdrawals {
-        // Each chain's event offset is the per-chain withdrawal cursor on the
-        // L2 withdrawal tree. It aligns with the first unappended entry in
-        // that chain's services event stream, so we intentionally do not
-        // re-filter by checkpoint window here.
+        // Each chain's event offset is the first unappended indexed leaf.
+        // Rows stay 1:1 with leaves; a hash or proof-field failure rejects
+        // the whole chain prefix instead of skipping a row.
         tracing::debug!(
             event_id = withdrawal.event_id,
             checkpoint_id = withdrawal.checkpoint_id,
             nonce = ?withdrawal.nonce_limbs,
             destination_chain_index = withdrawal.destination_chain_index,
             leaf_hash = %withdrawal.leaf_hash,
-            "evaluated bridge withdrawal"
+            "evaluated indexed bridge withdrawal"
         );
 
-        let token_words = withdrawal.token_address_words()?;
-        let amount_words = withdrawal.amount_words()?;
-        let recipient_words = withdrawal.recipient_words()?;
-        let nonce_words = withdrawal.nonce_words()?;
+        let token_words = withdrawal.token_address_words().map_err(|error| {
+            anyhow::anyhow!(
+                "indexed withdrawal prefix malformed at chain {} event_id {}: {error}",
+                withdrawal.destination_chain_index,
+                withdrawal.event_id
+            )
+        })?;
+        let amount_words = withdrawal.amount_words().map_err(|error| {
+            anyhow::anyhow!(
+                "indexed withdrawal prefix malformed at chain {} event_id {}: {error}",
+                withdrawal.destination_chain_index,
+                withdrawal.event_id
+            )
+        })?;
+        let recipient_words = withdrawal.recipient_words().map_err(|error| {
+            anyhow::anyhow!(
+                "indexed withdrawal prefix malformed at chain {} event_id {}: {error}",
+                withdrawal.destination_chain_index,
+                withdrawal.event_id
+            )
+        })?;
+        let nonce_words = withdrawal.nonce_words().map_err(|error| {
+            anyhow::anyhow!(
+                "indexed withdrawal prefix malformed at chain {} event_id {}: {error}",
+                withdrawal.destination_chain_index,
+                withdrawal.event_id
+            )
+        })?;
         let local_leaf = compute_withdrawal_leaf_hash(
             withdrawal.sender_user_id,
             recipient_words,
@@ -542,15 +556,12 @@ pub async fn fetch_pending_bridge_withdrawals(
             withdrawal.destination_chain_index,
         )?;
         if local_leaf != withdrawal.leaf_hash {
-            tracing::error!(
-                sender_user_id = withdrawal.sender_user_id,
-                destination_chain_index = withdrawal.destination_chain_index,
-                local = %local_leaf,
-                services = %withdrawal.leaf_hash,
-                nonce = ?nonce_words,
-                "leaf hash mismatch; services may have stale/incorrect data"
+            anyhow::bail!(
+                "indexed withdrawal prefix leaf hash mismatch at chain {} event_id {}: local {local_leaf} services {}",
+                withdrawal.destination_chain_index,
+                withdrawal.event_id,
+                withdrawal.leaf_hash
             );
-            continue;
         }
 
         withdrawals.push(PendingWithdrawal {
@@ -568,34 +579,24 @@ pub async fn fetch_pending_bridge_withdrawals(
         });
     }
 
-    let withdrawals = select_discovered_withdrawals(withdrawals)?;
+    let withdrawals = select_indexed_withdrawals(withdrawals)?;
 
     Ok(withdrawals)
 }
 
-fn select_discovered_withdrawals(mut withdrawals: Vec<PendingWithdrawal>) -> anyhow::Result<Vec<PendingWithdrawal>> {
-    // event_id is the services cursor, not part of burn identity. Equal
-    // identity and payload keep the minimum event id so a later duplicate
-    // cannot move the retained representative forward.
-    withdrawals.sort_by_key(|w| (w.destination_chain_index, w.sender_user_id, w.contract_id, w.nonce, w.event_id));
-    let mut unique = std::collections::BTreeMap::new();
-    for withdrawal in withdrawals {
-        let key = (withdrawal.sender_user_id, withdrawal.contract_id, withdrawal.nonce);
-        if let Some(previous) = unique.get(&key) {
-            let previous: &PendingWithdrawal = previous;
-            anyhow::ensure!(
-                previous.destination_chain_index == withdrawal.destination_chain_index
-                    && previous.token_address == withdrawal.token_address
-                    && previous.amount == withdrawal.amount
-                    && previous.recipient == withdrawal.recipient,
-                "conflicting duplicate burn identity"
-            );
-        } else {
-            unique.insert(key, withdrawal);
-        }
-    }
-    let mut withdrawals: Vec<_> = unique.into_values().collect();
-    withdrawals.sort_by_key(|w| (w.destination_chain_index, w.sender_user_id, w.contract_id, w.nonce, w.event_id));
+/// Keep one output row per indexed services row.
+///
+/// Order is `(destination_chain_index, event_id ASC)`, the stable order of
+/// each chain's offset query. `event_id` is the global `contract_events.id`,
+/// so values on one chain are not numerically consecutive. Equal nonces,
+/// senders, and contracts stay distinct leaves; L1 decides claim eligibility.
+/// No row is dropped and no placeholder leaf is inserted.
+fn select_indexed_withdrawals(mut withdrawals: Vec<PendingWithdrawal>) -> anyhow::Result<Vec<PendingWithdrawal>> {
+    withdrawals.sort_by(|left, right| {
+        left.destination_chain_index
+            .cmp(&right.destination_chain_index)
+            .then(left.event_id.cmp(&right.event_id))
+    });
     Ok(withdrawals)
 }
 
@@ -833,63 +834,49 @@ mod tests {
     }
 
     #[test]
-    fn select_discovered_withdrawals_orders_by_destination_sender_contract_nonce() {
-        let late_chain = sample_withdrawal(2, 1, 1, [0; 8], [1, 0, 0, 0, 0, 0, 0, 0], 1);
-        let higher_nonce = sample_withdrawal(1, 1, 1, [2, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], 2);
-        let higher_contract = sample_withdrawal(1, 1, 9, [0; 8], [1, 0, 0, 0, 0, 0, 0, 0], 3);
-        let first = sample_withdrawal(1, 1, 1, [1, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], 99);
-        let higher_sender = sample_withdrawal(1, 4, 1, [0; 8], [1, 0, 0, 0, 0, 0, 0, 0], 4);
-        let selected = select_discovered_withdrawals(vec![
-            late_chain,
-            higher_nonce.clone(),
-            higher_contract.clone(),
-            first.clone(),
-            higher_sender.clone(),
+    fn select_indexed_withdrawals_preserves_per_chain_event_id_order_and_count() {
+        let chain1_late = sample_withdrawal(1, 4, 9, [9, 0, 0, 0, 0, 0, 0, 0], [3, 0, 0, 0, 0, 0, 0, 0], 30);
+        let chain1_early = sample_withdrawal(1, 9, 3, [0; 8], [8, 0, 0, 0, 0, 0, 0, 0], 10);
+        let chain2_early = sample_withdrawal(2, 1, 1, [0; 8], [1, 0, 0, 0, 0, 0, 0, 0], 4);
+        let chain2_late = sample_withdrawal(2, 1, 1, [7, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], 40);
+        let selected = select_indexed_withdrawals(vec![
+            chain2_late.clone(),
+            chain1_late.clone(),
+            chain1_early.clone(),
+            chain2_early.clone(),
         ])
-        .expect("distinct burns");
-        let order: Vec<_> = selected
-            .iter()
-            .map(|w| (w.destination_chain_index, w.sender_user_id, w.contract_id, w.nonce[0], w.event_id))
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                (1, 1, 1, 1, first.event_id),
-                (1, 1, 1, 2, higher_nonce.event_id),
-                (1, 1, 9, 0, higher_contract.event_id),
-                (1, 4, 1, 0, higher_sender.event_id),
-                (2, 1, 1, 0, 1),
-            ]
-        );
+        .expect("gapped indexed rows stay in query order");
+        let order: Vec<_> = selected.iter().map(|w| (w.destination_chain_index, w.event_id)).collect();
+        assert_eq!(order, vec![(1, 10), (1, 30), (2, 4), (2, 40)]);
+        assert_eq!(selected.len(), 4);
+        assert_eq!(selected[0].sender_user_id, chain1_early.sender_user_id);
+        assert_eq!(selected[1].contract_id, chain1_late.contract_id);
     }
 
     #[test]
-    fn select_discovered_withdrawals_keeps_one_identical_burn() {
+    fn select_indexed_withdrawals_keeps_equal_nonces_for_different_users() {
+        let nonce = [4, 0, 0, 0, 0, 0, 0, 0];
+        let first_user = sample_withdrawal(1, 7, 3, nonce, [9, 0, 0, 0, 0, 0, 0, 0], 20);
+        let second_user = sample_withdrawal(1, 8, 3, nonce, [9, 0, 0, 0, 0, 0, 0, 0], 21);
+        let selected = select_indexed_withdrawals(vec![second_user.clone(), first_user.clone()]).expect("distinct users");
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].sender_user_id, first_user.sender_user_id);
+        assert_eq!(selected[1].sender_user_id, second_user.sender_user_id);
+        assert_eq!(selected[0].nonce, selected[1].nonce);
+    }
+
+    #[test]
+    fn select_indexed_withdrawals_keeps_duplicate_indexed_rows_for_same_burn() {
         let first = sample_withdrawal(1, 7, 3, [4, 0, 0, 0, 0, 0, 0, 0], [9, 0, 0, 0, 0, 0, 0, 0], 11);
         let repeat = sample_withdrawal(1, 7, 3, [4, 0, 0, 0, 0, 0, 0, 0], [9, 0, 0, 0, 0, 0, 0, 0], 12);
-        let selected = select_discovered_withdrawals(vec![repeat, first.clone()]).expect("identical burn");
-        assert_eq!(selected.len(), 1);
+        let selected = select_indexed_withdrawals(vec![repeat.clone(), first.clone()]).expect("duplicate indexed rows");
+        assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].event_id, first.event_id);
-        assert_eq!(selected[0].amount, first.amount);
+        assert_eq!(selected[1].event_id, repeat.event_id);
+        assert_eq!(selected[0].amount, selected[1].amount);
+        assert_eq!(selected[0].nonce, selected[1].nonce);
+        assert_eq!(selected[0].sender_user_id, selected[1].sender_user_id);
     }
 
-    #[test]
-    fn select_discovered_withdrawals_rejects_conflicting_duplicate_burn() {
-        let first = sample_withdrawal(1, 7, 3, [4, 0, 0, 0, 0, 0, 0, 0], [9, 0, 0, 0, 0, 0, 0, 0], 11);
-        let mut conflict = first.clone();
-        conflict.amount = [8, 0, 0, 0, 0, 0, 0, 0];
-        conflict.event_id = 12;
-        let error = select_discovered_withdrawals(vec![first, conflict]).expect_err("conflicting burn");
-        assert!(error.to_string().contains("conflicting duplicate burn identity"));
-    }
 
-    #[test]
-    fn select_discovered_withdrawals_rejects_conflicting_destination_for_same_burn_identity() {
-        let first = sample_withdrawal(1, 7, 3, [4, 0, 0, 0, 0, 0, 0, 0], [9, 0, 0, 0, 0, 0, 0, 0], 11);
-        let mut conflict = first.clone();
-        conflict.destination_chain_index = 2;
-        conflict.event_id = 12;
-        let error = select_discovered_withdrawals(vec![first, conflict]).expect_err("conflicting destination");
-        assert!(error.to_string().contains("conflicting duplicate burn identity"));
-    }
 }

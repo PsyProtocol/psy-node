@@ -235,7 +235,7 @@ The one secret path per guardian is `$HOME/.psy/keystore/guardian-<id>.keystore.
 
 #### 4.2.1 Offline compressed journal migration
 
-The compressed-journal release requires marker **3**, superseding the marker-2 requirement above. The eight table names and their key types do not change. Business requests remain `PSYGS002`: this is not a business-schema upgrade. Only `guardian_signed`, `guardian_session`, and `relayer_request` values gain the bounded `PSYGR001` Zstandard envelope. Full request code, trace, signature, and proof bytes are preserved; compression does not omit code. Runtime open and the fresh reset helper reject marker 2; neither silently migrates it (`psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:28-40`).
+The compressed-journal release requires marker **3**, superseding the marker-2 requirement above. The eight table names and their key types do not change. Business requests remain `PSYGS002`: this is not a business-schema upgrade. Only `guardian_signed`, `guardian_session`, and `relayer_request` values gain the `PSYGR001` Zstandard envelope. Full request code, trace, signature, and proof bytes are preserved; compression does not omit code. The envelope has no fixed decoded or compressed cap; the declared uncompressed length must be exact and each record is one zstd frame, and request work is bounded by the request deadline and concurrency limits, not a memory ceiling. Runtime open and the fresh reset helper reject marker 2; neither silently migrates it (`psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:28-40`).
 
 Stop **all three guardians and the relayer**, disable their automatic restarts, and retain an offline backup before invoking the operator-controlled command from the node checkout:
 

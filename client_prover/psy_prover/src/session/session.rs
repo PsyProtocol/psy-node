@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
@@ -1815,8 +1815,12 @@ impl<'a> TraceBuildSession<'a> {
         let anchor_global_state_roots = user_session_mgr.get_current_global_state_roots().clone();
 
         let mut contract_codes = Vec::new();
+        let mut seen_contract_ids = BTreeSet::new();
         for step in &self.trace_arena.steps {
             if let Some(cid) = step.contract_id() {
+                if !seen_contract_ids.insert(cid) {
+                    continue;
+                }
                 let code = user_session_mgr
                     .require_lps_mut()?
                     .resolve_get_contract_code_mut(&QSRCmdGetContractCodeDefinition { contract_id: cid })
@@ -6668,6 +6672,7 @@ pub(crate) mod offline_trace_pipeline_tests {
             "realm_user_tree_height": 4,
             "group_realm_height": 4,
             "realm_configs": [{"id": 0, "rpc_url": [format!("http://127.0.0.1:{}", port)]}],
+            "p2p": {"checkpoints_per_epoch": 1},
             "coordinator_configs": [{"id": 0, "rpc_url": [format!("http://127.0.0.1:{}", port)]}],
             "prove_proxy_url": [],
             "faucet_rpc_url": [],
@@ -7301,6 +7306,76 @@ pub(crate) mod offline_trace_pipeline_tests {
         assert!(
             trace.ups_start_witness.proof.is_none(),
             "freshly built traces carry no precomputed start proof"
+        );
+
+        let leaked = rpc_seen.lock().clone();
+        assert!(
+            leaked.iter().all(|method| method == "psy_get_checkpoint_global_state_roots"),
+            "offline build must only issue the checkpoint roots RPC, saw: {:?}",
+            leaked
+        );
+        Ok(())
+    }
+
+    /// Three CFC calls against one shared contract, then the burn-fee call.
+    /// The generated trace must keep every call's inputs distinct and embed
+    /// each contract id once. This is not a three-chain deposit-tree trace:
+    /// the offline fixture has no `set_chain_root` contract, only the helper
+    /// (`set_value`) and the token (`burn`).
+    #[tokio::test]
+    async fn offline_three_repeated_calls_embed_each_contract_code_once() -> anyhow::Result<()> {
+        let shared = shared_offline_wallet_session().await;
+        let public_key = offline_zk_public_key(&shared).await?;
+        let wallet_session = shared.read();
+
+        let chain = build_offline_chain(public_key, vec![seeded_helper_contract(), seeded_token_contract()]);
+        let (port, rpc_seen, responses) = spawn_offline_rpc().await;
+        set_offline_responses(&responses, &chain)?;
+        let cmd_provider = RpcProvider::new_with_config(&loopback_network_config(port))?.with_user_id_owned(OFFLINE_USER_ID);
+
+        let mut builder = offline_trace_build_session(&wallet_session, cmd_provider, public_key, &chain).await?;
+        let call_inputs = [11u64, 22, 33];
+        for input in call_inputs {
+            let is_view = builder
+                .trace_call(ContractCallArgs {
+                    contract_id: OFFLINE_HELPER_CONTRACT_ID,
+                    method_name: "set_value".to_string(),
+                    inputs: vec![input],
+                })
+                .await?;
+            assert!(!is_view, "set_value mutates state");
+        }
+
+        let trace = builder.finalize_tx_trace_with_opts(DPNSoftwareDefinedCallData::default()).await?;
+
+        assert_eq!(trace.steps.len(), 5, "three standard calls + burn fee + zk sign");
+        let standard_inputs: Vec<Vec<u64>> = trace
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                crate::trace::TraceStep::Standard(step) => Some(step.cfc_witness.inputs.iter().map(|value| value.to_canonical_u64()).collect()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(standard_inputs, call_inputs.map(|input| vec![input]), "each CFC call keeps its own input");
+
+        let burn = trace
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                crate::trace::TraceStep::BurnFee(step) => Some(step),
+                _ => None,
+            })
+            .expect("finalize appends the burn-fee CFC call");
+        assert_eq!(burn.contract_id, TOKEN_CONTRACT_ID as u64);
+        assert_eq!(burn.method_name, "burn");
+        assert!(matches!(trace.steps.last(), Some(crate::trace::TraceStep::ZkSign(_))));
+
+        let embedded_contract_ids: Vec<u64> = trace.contract_codes.iter().map(|code| code.contract_id).collect();
+        assert_eq!(
+            embedded_contract_ids,
+            vec![OFFLINE_HELPER_CONTRACT_ID, TOKEN_CONTRACT_ID as u64],
+            "contract_codes keeps the first appearance of each id: helper, then burn token"
         );
 
         let leaked = rpc_seen.lock().clone();

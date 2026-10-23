@@ -9,8 +9,30 @@ use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::DepositLe
 use psy_crypto::hash::traits::hasher::{FieldQHasher, MerkleZeroHasher};
 use serde_json::{json, Value};
 
-use crate::bridge::deposit_logs::DepositRecorded;
-use guardian_common::protocol::*;
+use crate::protocol::*;
+
+alloy_sol_types::sol! {
+    event DepositRecorded(
+        uint32 indexed index,
+        bytes32 shieldAddress,
+        address indexed token,
+        bytes32 l2TokenContractId,
+        uint256 amount,
+        uint8 chainIndex,
+        bytes32 noteCommitment,
+        bytes32 leafHash
+    );
+}
+
+#[derive(Debug)]
+pub enum GuardianAccountError { Unavailable(GuardianSignError), Conflict(HaltReason) }
+impl From<GuardianSignError> for GuardianAccountError {
+    fn from(error: GuardianSignError) -> Self { Self::Unavailable(error) }
+}
+impl std::fmt::Display for GuardianAccountError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(formatter, "{self:?}") }
+}
+impl std::error::Error for GuardianAccountError {}
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 
@@ -25,10 +47,10 @@ impl<'a> CustodyRpc<'a> {
     }
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut response = self.client.post(&self.endpoint.rpc_url).json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).send().await.map_err(|_| GuardianSignError::L1RpcUnavailable)?;
-        if !response.status().is_success() || response.content_length().is_some_and(|length|length>MAX_BODY_BYTES as u64) { return Err(GuardianSignError::L1RpcUnavailable); }
+        if !response.status().is_success() { return Err(GuardianSignError::L1RpcUnavailable); }
         let mut body=Vec::new();
         while let Some(chunk)=response.chunk().await.map_err(|_|GuardianSignError::L1RpcUnavailable)? {
-            if chunk.len()>MAX_BODY_BYTES.saturating_sub(body.len()) { return Err(GuardianSignError::L1RpcUnavailable); }
+            body.try_reserve(chunk.len()).map_err(|_|GuardianSignError::L1RpcUnavailable)?;
             body.extend_from_slice(&chunk);
         }
         let value: Value = serde_json::from_slice(&body).map_err(|_| GuardianSignError::L1ResponseMismatch)?;
@@ -157,7 +179,12 @@ async fn verify_token_mapping(rpc: &CustodyRpc<'_>, router: Hex20, token: Hex20,
     if forward != contract_id_word(contract_id) || reverse != address_argument(token) { return Err(GuardianSignError::DepositMismatch); }
     Ok(())
 }
-pub(crate) async fn verify_withdrawal_token(chain: &ChainEndpoint, burn: &WithdrawalBurnRecord) -> Result<()> {
+/// True only when the raw token slot itself has a non-zero bit above 160.
+/// L1 rejects that exact slot before registration, so the address-only Router
+/// lookup cannot authorize it and must not be fed a truncated substitute.
+pub fn token_slot_has_high_bits(token: &[u32; 8]) -> bool { token[..3] != [0; 3] }
+pub async fn verify_withdrawal_token(chain: &ChainEndpoint, burn: &WithdrawalBurnRecord) -> Result<()> {
+    if token_slot_has_high_bits(&burn.token) { return Ok(()); }
     let rpc = CustodyRpc::new(chain)?;
     let finalized = rpc.block(json!("finalized")).await?;
     let block = block_id(quantity(&finalized["number"])?);
@@ -199,7 +226,7 @@ pub async fn verify_finalized_anchor(chain: &ChainEndpoint, anchor: &DepositAnch
 /// below the finalized height or this fails closed with `FinalityPending`.
 /// Returns the canonical hash; the caller MUST compare it with the saved hash
 /// via `verify_cached_anchor_hash` before use.
-pub(crate) async fn verify_saved_deposit_anchor_headers(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<Hex32> {
+pub async fn verify_saved_deposit_anchor_headers(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<Hex32> {
     if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     let rpc = CustodyRpc::new(chain)?;
     let finalized = rpc.block(json!("finalized")).await?;
@@ -216,8 +243,8 @@ async fn saved_anchor_canonical_hash(rpc: &CustodyRpc<'_>, chain: &ChainEndpoint
     Ok(Hex(canonical_ancestor_header(rpc, anchor.block_number, finalized).await?))
 }
 
-pub(crate) fn verify_cached_anchor_hash(canonical: Hex32, saved: Hex32) -> Result<(),super::verify::GuardianAccountError> {
-    if canonical!=saved { return Err(super::verify::GuardianAccountError::Conflict(HaltReason::FinalityConflict)); }
+pub fn verify_cached_anchor_hash(canonical: Hex32, saved: Hex32) -> Result<(), GuardianAccountError> {
+    if canonical!=saved { return Err(GuardianAccountError::Conflict(HaltReason::FinalityConflict)); }
     Ok(())
 }
 
@@ -250,11 +277,11 @@ fn saved_deposit_tree_state_candidate(state: &DepositTreeState, anchor: &Deposit
 /// `matches_opening` compares the tip `(chain_index, count, root)` and, with
 /// `count == anchor.new_count` on an exact replay, can never certify the opening
 /// at `old_count`.
-pub async fn verify_deposit_anchor(reserved: Option<&DepositTreeState>, chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState),super::verify::GuardianAccountError> {
+pub async fn verify_deposit_anchor(reserved: Option<&DepositTreeState>, chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState), GuardianAccountError> {
     tokio::time::timeout(std::time::Duration::from_secs(120),verify_deposit_interval(reserved,chain,anchor)).await.map_err(|_|GuardianSignError::L1RpcUnavailable)?
 }
 
-async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState),super::verify::GuardianAccountError> {
+async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<(Hash4, Hash4, DepositTreeState), GuardianAccountError> {
     if anchor.chain_index != chain.chain_index { return Err(GuardianSignError::AuthorizationMismatch.into()); }
     if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch.into()); }
     if anchor.old_count >= anchor.new_count { return Err(GuardianSignError::DepositMismatch.into()); }
@@ -316,9 +343,7 @@ async fn verify_deposit_interval(reserved: Option<&DepositTreeState>, chain: &Ch
 }
 
 fn append_verified_deposit_leaf(frontier: &mut [Hash4;32], occupied_partial_page_hashes: &mut Vec<Hash4>, index: u32, leaf: Hash4) -> Hash4 {
-    occupied_partial_page_hashes.push(leaf);
-    if (index + 1) % 32 == 0 { occupied_partial_page_hashes.clear(); }
-    append_leaf(frontier, index, leaf)
+    crate::protocol::accumulate_deposit_leaf(frontier, occupied_partial_page_hashes, index, leaf)
 }
 
 
@@ -375,7 +400,7 @@ async fn fetch_deposit_events(rpc: &CustodyRpc<'_>, chain: &ChainEndpoint, route
     Ok((events,event_block))
 }
 
-pub(crate) async fn fetch_deposit_records(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<Vec<DepositLeafData>> {
+pub async fn fetch_deposit_records(chain: &ChainEndpoint, anchor: &DepositAnchor) -> Result<Vec<DepositLeafData>> {
     if anchor.chain_index != chain.chain_index { return Err(GuardianSignError::AuthorizationMismatch); }
     if anchor.block_number < chain.deployment_block { return Err(GuardianSignError::DepositMismatch); }
     if anchor.old_count >= anchor.new_count { return Err(GuardianSignError::DepositMismatch); }
@@ -412,10 +437,10 @@ fn address_words(address: &[u8]) -> [u32; 8] {
     bytes32_words(&bytes)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guardian::verify::GuardianAccountError;
     use alloy_primitives::{Address, B256};
     use alloy_sol_types::SolEvent;
     use plonky2::field::types::Field;
@@ -424,6 +449,24 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
+
+    fn mapping_rejection(forward: [u8; 32], reverse: [u8; 32]) -> bool {
+        forward != contract_id_word(4) || reverse != address_argument(Hex([0x11; 20]))
+    }
+
+    #[test]
+    fn canonical_wrong_token_mapping_is_rejected_and_high_bit_token_is_not_truncated() {
+        let token = Hex([0x11; 20]);
+        assert!(mapping_rejection(contract_id_word(0), address_argument(token)));
+        assert!(mapping_rejection(contract_id_word(4), address_argument(Hex([0x22; 20]))));
+        assert!(!mapping_rejection(contract_id_word(4), address_argument(token)));
+        let mut raw = [0u32; 8];
+        raw[3..].copy_from_slice(&address_words(&token.0)[3..]);
+        raw[0] = 1;
+        assert!(token_slot_has_high_bits(&raw));
+        assert!(!token_slot_has_high_bits(&address_words(&token.0)));
+        assert_ne!(&raw[..3], &[0; 3]);
+    }
 
     #[test]
     fn custody_frontier_only_reuses_contiguous_forward_interval() {
@@ -455,7 +498,6 @@ mod tests {
 
     #[test]
     fn cached_finalized_hash_contradiction_preserves_typed_halt_reason() {
-        use super::super::verify::GuardianAccountError;
         assert!(verify_cached_anchor_hash(Hex([1;32]),Hex([1;32])).is_ok());
         assert!(matches!(verify_cached_anchor_hash(Hex([2;32]),Hex([1;32])),Err(GuardianAccountError::Conflict(HaltReason::FinalityConflict))));
         let unavailable=GuardianAccountError::from(GuardianSignError::L1RpcUnavailable);
@@ -487,7 +529,6 @@ mod tests {
     }
     #[test]
     fn forward_extend_rechecks_saved_anchor_hash_before_frontier_use() {
-        use super::super::verify::GuardianAccountError;
         let saved_anchor=DepositAnchor {chain_index:0,block_number:100,block_hash:Hex([1;32]),old_count:0,new_count:30};
         let mut frontier=[Hash4::ZERO;32];
         let mut root=Hash4::ZERO;
@@ -876,7 +917,6 @@ mod tests {
 
     #[tokio::test]
     async fn saved_anchor_reorg_is_typed_finality_conflict_before_new_fetch() {
-        use super::super::verify::GuardianAccountError;
         let prepared = prepare_new_batch();
         let fixture = serve_l1(prepared.server).await;
         fixture.reorg.store(true, Ordering::Relaxed);
@@ -890,7 +930,6 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_saved_frontier_rejects_before_new_batch_fetch() {
-        use super::super::verify::GuardianAccountError;
         let prepared = prepare_new_batch();
         let fixture = serve_l1(prepared.server).await;
         let endpoint = fixture.endpoint();
@@ -911,7 +950,6 @@ mod tests {
 
     #[tokio::test]
     async fn new_batch_rejects_leaf_hash_that_is_not_the_event_commitment() {
-        use super::super::verify::GuardianAccountError;
         let prepared = prepare_new_batch();
         let fixture = serve_l1(prepared.server).await;
         fixture.tamper_leaf.store(true, Ordering::Relaxed);

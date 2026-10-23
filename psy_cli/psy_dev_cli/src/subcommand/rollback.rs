@@ -16,7 +16,7 @@ use url::Url;
 const SHUTDOWN_SENTINEL_CONTENT: &str =
     "rollback offline: all processors and relayer stopped; Scylla Redis NATS and checkpoints retained";
 const DEFAULT_PROBE_TIMEOUT_MS: u64 = 500;
-const MAX_PROBE_TIMEOUT_MS: u64 = 5_000;
+pub(super) const MAX_PROBE_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Args, Debug)]
 pub struct RollbackArgs {
@@ -137,7 +137,7 @@ async fn run_generate(args: RollbackArgs) -> anyhow::Result<()> {
     validate_rollback_plan(&plan).context("generated rollback plan failed validation")?;
     psy_node_common::rollback::write_rollback_plan_atomic(&generate.common.rp_path, &plan, true).await?;
     println!(
-        "Generated validated {:?} rollback plan for checkpoint {} at {}. Keep processors and relayer stopped. The local executor does not perform shared L1/relayer recovery; do not restart until every role-local plan and external recovery are verified complete, then use `make run-all` and wait for Coordinator readiness before Realm readiness.",
+        "Generated validated {:?} rollback plan for checkpoint {} at {}. Keep processors and relayer stopped. After every role-local plan has executed, run `restore-bridge-state` once before `make rollback-resume`; resume only after it reports journal restore completion, then confirm Coordinator readiness before Realm readiness.",
         plan.role,
         plan.target_checkpoint_id,
         generate.common.rp_path.display()
@@ -153,7 +153,7 @@ async fn run_execute(args: RollbackArgs) -> anyhow::Result<()> {
     validate_plan_identity(&execute.common, &config, &plan)?;
     execute::execute(&execute, &config, &mut plan).await?;
     println!(
-        "Executed validated {:?} local rollback plan to checkpoint {}. Keep processors and relayer stopped. The local executor does not perform shared L1/relayer recovery; restart with `make run-all` only after every role-local plan and external recovery are verified complete, then confirm Coordinator readiness before Realm readiness.",
+        "Executed validated {:?} local rollback plan to checkpoint {}. Keep processors and relayer stopped. After every role-local plan has executed, run `restore-bridge-state` once before `make rollback-resume`; resume only after it reports journal restore completion, then confirm Coordinator readiness before Realm readiness.",
         plan.role,
         plan.target_checkpoint_id
     );
@@ -270,7 +270,7 @@ fn validate_plan_identity(
     Ok(())
 }
 
-async fn require_shutdown_sentinel(path: &Path) -> anyhow::Result<()> {
+pub(super) async fn require_shutdown_sentinel(path: &Path) -> anyhow::Result<()> {
     let metadata = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("missing operator stop sentinel {}; stop every processor and the relayer without purging Scylla/Redis/NATS/checkpoints, then create the sentinel containing exactly `{SHUTDOWN_SENTINEL_CONTENT}`", path.display()))?;
@@ -286,7 +286,7 @@ async fn require_shutdown_sentinel(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn reject_reachable_processors(args: &CommonArgs) -> anyhow::Result<()> {
+pub(super) async fn reject_reachable_processors(args: &CommonArgs) -> anyhow::Result<()> {
     let timeout = Duration::from_millis(args.probe_timeout_ms);
     for (kind, endpoints) in [
         ("Coordinator", args.coordinator_endpoints.as_slice()),
@@ -301,7 +301,7 @@ async fn reject_reachable_processors(args: &CommonArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn endpoint_is_reachable(endpoint: &str, timeout: Duration) -> anyhow::Result<bool> {
+pub(super) async fn endpoint_is_reachable(endpoint: &str, timeout: Duration) -> anyhow::Result<bool> {
     let parsed = Url::parse(endpoint).with_context(|| format!("invalid processor endpoint URL {endpoint}"))?;
     ensure!(matches!(parsed.scheme(), "http" | "https"), "processor endpoint {endpoint} must use http or https");
     let host = parsed.host_str().ok_or_else(|| anyhow::anyhow!("processor endpoint {endpoint} has no host"))?.to_owned();

@@ -1118,17 +1118,29 @@ impl PsyWalletServer {
                 refund_all(&mut spent_auths);
                 return err_json("a withdraw leg has the zero L1 token address — the bridge routes it into the WETH branch, which reverts and stalls the relayer. Nothing was submitted.".to_string(), json!({ "gate": "args" }));
             }
+            let nonce = match spec.nonce.as_deref() {
+                // A caller-pinned nonce is used verbatim — never re-randomized.
+                Some(pinned) => match crate::wallet::parse_withdraw_nonce(pinned) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        refund_all(&mut spent_auths);
+                        return err_json(format!("{e:#}"), json!({ "gate": "args" }));
+                    }
+                },
+                None => match crate::wallet::random_withdraw_nonce() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        refund_all(&mut spent_auths);
+                        return err_json(format!("{e:#}"), json!({ "gate": "wallet" }));
+                    }
+                },
+            };
             withdraw_legs.push(crate::wallet::WithdrawLeg {
                 dest_chain_index: spec.dest_chain_index,
                 l1_token_address: token_addr,
                 amount_nano: spec.amount_nano,
                 l1_recipient: spec.l1_recipient.trim().to_string(),
-                nonce: spec.nonce.unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                }),
+                nonce,
                 contract_id: contract,
             });
         }
@@ -1294,7 +1306,7 @@ impl PsyWalletServer {
                     "endUserLeafHash": leaf,
                     "publicClaimedFrom": public_items.iter().map(|(s, _)| s).copied().collect::<Vec<_>>(),
                     "transfersSent": transfer_items.iter().map(|(to, amt, _)| json!({"toUserId": to, "amount": amt})).collect::<Vec<_>>(),
-                    "withdrawsBurned": withdraw_legs.iter().map(|w| json!({"l1Recipient": w.l1_recipient, "amount": w.amount_nano})).collect::<Vec<_>>(),
+                    "withdrawsBurned": withdraw_legs.iter().map(|w| json!({"l1Recipient": w.l1_recipient, "amount": w.amount_nano, "nonce": crate::wallet::withdraw_nonce_to_hex(&w.nonce)})).collect::<Vec<_>>(),
                     "depositsClaimed": claimed_deposits,
                     "alreadyClaimed": skipped_claimed,
                     "privateClaimed": private_parsed.len(),
@@ -1306,7 +1318,18 @@ impl PsyWalletServer {
                 // Nothing settled — the spends in this batch must give the
                 // headroom back, or a flaky chain burns the budget with failures.
                 refund_all(&mut spent_auths);
-                err_json(format!("claim_batch failed: {e:#}"), json!({ "gate": "execute" }))
+                err_json(
+                    format!("claim_batch failed: {e:#}"),
+                    json!({
+                        "gate": "execute",
+                        // Nothing settled, but the nonces are returned so a
+                        // retry of the same operation can pin exactly these.
+                        "withdraws": withdraw_legs.iter().map(|w| json!({
+                            "l1Recipient": w.l1_recipient, "amount": w.amount_nano,
+                            "nonce": crate::wallet::withdraw_nonce_to_hex(&w.nonce),
+                        })).collect::<Vec<_>>(),
+                    }),
+                )
             }
         }
     }
@@ -1389,13 +1412,27 @@ impl PsyWalletServer {
             );
         }
         // A withdrawal is irreversible once burned, so the nonce must be unique
-        // per withdrawal; derive one from the clock unless the caller pins it.
-        let nonce = a.nonce.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        });
+        // per withdrawal. A caller-pinned nonce is used verbatim — never
+        // re-randomized; otherwise a fresh one is drawn from OS entropy and
+        // returned so the caller can track (and, if needed, retry) the same
+        // operation with the identical nonce.
+        let nonce_bytes = match a.nonce.as_deref() {
+            Some(pinned) => match crate::wallet::parse_withdraw_nonce(pinned) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.policy.lock().unwrap().refund(&auth, charge);
+                    return err_json(format!("{e:#}"), json!({ "gate": "args" }));
+                }
+            },
+            None => match crate::wallet::random_withdraw_nonce() {
+                Ok(n) => n,
+                Err(e) => {
+                    self.policy.lock().unwrap().refund(&auth, charge);
+                    return err_json(format!("{e:#}"), json!({ "gate": "wallet" }));
+                }
+            },
+        };
+        let nonce = crate::wallet::withdraw_nonce_to_hex(&nonce_bytes);
         let execution = match auth.user_id {
             Some(user_id) => {
                 state
@@ -1407,7 +1444,7 @@ impl PsyWalletServer {
                         &token_addr,
                         a.amount_nano,
                         &a.l1_recipient,
-                        nonce,
+                        nonce_bytes,
                         contract,
                     )
                     .await
@@ -1425,7 +1462,7 @@ impl PsyWalletServer {
             })),
             Err(e) => {
                 self.policy.lock().unwrap().refund(&auth, charge);
-                err_json(format!("withdraw failed: {e:#}"), json!({ "gate": "execute" }))
+                err_json(format!("withdraw failed: {e:#}"), json!({ "gate": "execute", "nonce": nonce }))
             }
         }
     }

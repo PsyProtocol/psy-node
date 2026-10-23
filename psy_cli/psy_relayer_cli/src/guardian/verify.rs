@@ -27,11 +27,8 @@ pub struct GuardianVerificationContext<'a> {
     pub history: &'a GuardianHistory,
     /// Request-scoped reservation material (re-verification of the same exact request).
     pub reserved_deposit_tree_states: &'a [DepositTreeState],
-    /// Conflicts for the current request only, computed by the caller with journal
-    /// point queries; the verifier adds within-batch duplicate detection on top.
-    pub conflicting_withdrawal_burns: &'a BTreeSet<(u32, u32, [u32; 8])>,
-    pub conflicting_nonces: &'a BTreeSet<(u8, [u32; 8])>,
 }
+use guardian_common::verify_l1::GuardianAccountError;
 
 pub struct VerifiedGuardianSession {
     pub trace: TxTrace,
@@ -45,8 +42,8 @@ pub struct VerifiedGuardianSession {
 
 /// Bounded durable snapshot restored from the journal, never replayed from zero:
 /// the included account nonce and leaf, one withdrawal head per destination chain,
-/// and at most three included deposit anchors. Unbounded identity/nonce sets are
-/// gone; cross-request conflicts are caller-side point queries on the current batch.
+/// and at most three included deposit anchors. Withdrawal indexes are latest-inclusion
+/// metadata, not eligibility.
 #[derive(Default, Clone)]
 pub struct GuardianHistory {
     pub(crate) nonce: u64,
@@ -150,8 +147,6 @@ fn token_contract(id: u32) -> Result<()> {
 
 pub fn verify_withdrawal_burn(config: &GuardianConfig, record: &WithdrawalBurnRecord, proof: &psy_provider::lps::WithdrawalBurnProof, verified_checkpoint_root: Hash4) -> Result<()> {
     record.amount_u64()?;
-    record.recipient_address()?;
-    record.token_address()?;
     token_contract(record.token_contract_id)?;
     config.chain(record.destination_chain_index)?;
     verify_checkpoint(proof.checkpoint_id, &proof.checkpoint_leaf, &proof.global_roots, &proof.checkpoint_path, verified_checkpoint_root)?;
@@ -249,8 +244,6 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
     let (current_policy, ending_policy) = witness.policies().map_err(|_| GuardianSignError::PolicyMismatch)?;
     let mut calls = Vec::new();
     let mut appends = Vec::new();
-    let mut withdrawal_burns = BTreeSet::new();
-    let mut nonces = BTreeSet::new();
     let mut counts = BTreeMap::new();
     let mut staged_deposit_tree_states = Vec::with_capacity(request.deposit_anchors.len());
     let start_hash = supplied.finalization.submit_end_cap_input.core.state_transition.start_user_leaf_hash;
@@ -266,7 +259,7 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
         for anchor in &request.deposit_anchors {
             let chain = config.chain(anchor.chain_index)?;
             let reserved = reserved_deposit_tree_state(context.reserved_deposit_tree_states, context.history, anchor.chain_index);
-            let (old_root, new_root, state) = super::verify_l1::verify_deposit_anchor(reserved, chain, anchor).await?;
+            let (old_root, new_root, state) = guardian_common::verify_l1::verify_deposit_anchor(reserved, chain, anchor).await?;
             verify_chain_state(context, &supplied, 2, anchor.chain_index, anchor.old_count, old_root).await?;
             let mut inputs = vec![u64::from(anchor.chain_index), u64::from(anchor.new_count)];
             inputs.extend(hash_words(new_root));
@@ -275,14 +268,13 @@ async fn verify_sign_request_trace(context: &GuardianVerificationContext<'_>, co
         }
         let mut withdrawals = Vec::with_capacity(request.withdrawal_records.len());
         for burn in &request.withdrawal_records {
-            let burn_key = (burn.sender_user_id, burn.token_contract_id, burn.nonce);
-            let nonce = (burn.destination_chain_index, burn.nonce);
-            if context.conflicting_withdrawal_burns.contains(&burn_key) || context.conflicting_nonces.contains(&nonce) || !withdrawal_burns.insert(burn_key) || !nonces.insert(nonce) { return Err(GuardianSignError::WithdrawalNonceConflict.into()); }
             let chain = config.chain(burn.destination_chain_index)?;
             get_withdrawal_burn_proof(context, config, checkpoint, burn).await?;
-            // Current Router mapping applies only to a fresh or pending sign.
+            // Current Router mapping applies only to a fresh or pending sign of a
+            // canonical token address. A raw high-bit token slot is not truncated
+            // into that lookup; L1 rejects that exact slot before registration.
             // An already-included session authenticates the burn proof and checkpoint.
-            if !historical { super::verify_l1::verify_withdrawal_token(chain, burn).await?; }
+            if !historical { guardian_common::verify_l1::verify_withdrawal_token(chain, burn).await?; }
             let count = counts.entry(burn.destination_chain_index).or_insert_with(|| pending.chains.get(&burn.destination_chain_index).map_or(0, |state| state.0));
             appends.push(WithdrawalAppendRecord { chain_index: burn.destination_chain_index, append_index: *count, burn: burn.clone() });
             *count = count.checked_add(1).ok_or(GuardianSignError::WithdrawalMismatch)?;
@@ -342,6 +334,8 @@ fn verify_trace_contracts(trace: &TxTrace) -> Result<()> {
         verify_path(&inclusion.contract_function_merkle_proof, contract.contract_leaf.function_tree_root, u64::from(fingerprint_index), step.cfc_fingerprint, psy_config::network_constants::CONTRACT_FUNCTION_TREE_HEIGHT as usize)?;
         if inclusion.get_method_id() != step.method_id { return Err(GuardianSignError::ProofMismatch); }
     }
+    let called: BTreeSet<_> = trace.steps.iter().filter_map(|step| step.as_cfc().map(|step| step.contract_id)).collect();
+    if codes.len() != called.len() || codes.keys().any(|id| !called.contains(id)) { return Err(GuardianSignError::ProofMismatch); }
     Ok(())
 }
 
@@ -508,8 +502,8 @@ pub async fn verify_pending_signed_anchors(config: &GuardianConfig, pending: &[G
             state.validate()?;
             let anchor = &state.anchor;
             let chain = config.chain(anchor.chain_index)?;
-            let canonical = super::verify_l1::verify_saved_deposit_anchor_headers(chain, anchor).await?;
-            super::verify_l1::verify_cached_anchor_hash(canonical,anchor.block_hash)?;
+            let canonical = guardian_common::verify_l1::verify_saved_deposit_anchor_headers(chain, anchor).await?;
+            guardian_common::verify_l1::verify_cached_anchor_hash(canonical,anchor.block_hash)?;
         }
     }
     Ok(())
@@ -556,13 +550,6 @@ pub async fn verify_restored_history(context: &GuardianVerificationContext<'_>, 
     Ok(())
 }
 
-#[derive(Debug)]
-pub enum GuardianAccountError { Unavailable(GuardianSignError), Conflict(HaltReason) }
-impl From<GuardianSignError> for GuardianAccountError { fn from(error: GuardianSignError) -> Self { Self::Unavailable(error) } }
-impl std::fmt::Display for GuardianAccountError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(formatter,"{self:?}") }
-}
-impl std::error::Error for GuardianAccountError {}
 
 /// Reads the nonce authenticated at the context's fixed checkpoint. Missing user
 /// indexes wait only until the caller's observer/sign deadline, then return
@@ -624,8 +611,7 @@ where Fut: Future<Output = anyhow::Result<MerkleProofCore<Hash4>>> {
 
 fn decode_endcap_proof(bytes: &[u8]) -> Result<plonky2::plonk::proof::ProofWithPublicInputs<F,plonky2::plonk::config::PoseidonGoldilocksConfig,2>> {
     use bincode::Options;
-    if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::ProofMismatch); }
-    bincode::DefaultOptions::new().with_fixint_encoding().with_limit(MAX_BODY_BYTES as u64).reject_trailing_bytes().deserialize(bytes).map_err(|_|GuardianSignError::ProofMismatch)
+    bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().deserialize(bytes).map_err(|_|GuardianSignError::ProofMismatch)
 }
 
 #[cfg(test)]
@@ -886,6 +872,24 @@ mod tests {
         changed=burn.clone(); changed.amount=[0,0,0,0,0,0,0xffff_ffff,1];
         assert!(changed.amount_u64().is_err());
         changed.amount[7]=0; assert_eq!(changed.amount_u64().unwrap(),GOLDILOCKS_MODULUS-1);
+    }
+
+    #[test]
+    fn raw_high_bit_and_zero_recipient_stay_in_the_leaf() {
+        let mut burn = WithdrawalBurnRecord { sender_user_id: 7, token_contract_id: 4, destination_chain_index: 0, token: [1, 0, 0, 0, 0, 0, 0, 9], amount: [0, 0, 0, 0, 0, 0, 0, 1], recipient: [0; 8], nonce: [1, 2, 3, 4, 5, 6, 7, 8] };
+        assert!(burn.amount_u64().is_ok());
+        assert!(burn.token_address().is_err());
+        assert_eq!(burn.recipient_address().unwrap().0, [0; 20]);
+        let high = withdrawal_leaf(&burn);
+        burn.token[0] = 0;
+        assert_ne!(high, withdrawal_leaf(&burn));
+        burn.token = [0; 8];
+        burn.recipient[2] = 1;
+        let wide_recipient = withdrawal_leaf(&burn);
+        burn.recipient[2] = 0;
+        assert_ne!(wide_recipient, withdrawal_leaf(&burn));
+        assert!(guardian_common::verify_l1::token_slot_has_high_bits(&[1, 0, 0, 0, 0, 0, 0, 9]));
+        assert!(!guardian_common::verify_l1::token_slot_has_high_bits(&[0, 0, 0, 0, 0, 0, 0, 9]));
     }
 
     #[test]

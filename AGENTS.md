@@ -529,11 +529,12 @@ Violating any rule below requires an immediate fix before other work continues.
 
 ### Real End-to-End Flow First
 
-1. The first implementation milestone MUST connect the smallest complete real user flow across all required components and produce an observable result. Compilation, isolated component tests, mocks, queue admission, and disconnected implementations do not satisfy this milestone.
-2. Before that milestone, prioritize required interfaces, missing integration, and demonstrated blockers. Do not delay it for speculative hardening, optional abstractions, performance tuning, cosmetic renaming, exhaustive edge-case suites, or repeated reviews of unchanged code.
-3. Keep proof verification, authorization, replay protection, correct balances and supply, secret handling, and existing fail-closed checks intact. Never use dummy proofs, permissive mocks, skipped validation, or false success to claim the real flow works.
-4. Preserve required design and pre-execution review gates, scoped to the changed contract and its necessary negative cases. Re-review changed or affected paths after repairs; do not restart unrelated reviews without new evidence. Parallelize independent implementation and verification preparation.
-5. After the first real-flow result, finish all user-requested acceptance cases, applicable security checks, documentation, and cleanup before delivery. Record adjacent improvements in ISSUES.md rather than expanding the active task. This changes execution order, not the final completeness requirement.
+1. **Time-critical real flow first.** The requested real end-to-end flow is time-critical and outranks all nonblocking work; drive it to an observable result first, then finish all user-requested acceptance cases, applicable security checks, documentation, and cleanup before final delivery.
+2. **Only concrete critical-path safety blockers delay it.** Nonblocking unit tests, UI polish, naming, and refactors run in parallel or are deferred — never expanded into the active task.
+3. **Reuse what works.** Do not add new helper frameworks, abstractions, or custom cryptography when an existing command already performs the task.
+4. **Never weaken protection.** Authorization, proof verification, replay protection, correct balances and supply, secret handling, fail-closed checks, and uncertain transaction identity stay fully enforced; never weaken them to unblock or simplify the flow.
+5. **Bounded review after freeze.** Once changes are frozen, run one focused review scoped to changed and directly affected paths; no repeated reviews of unchanged code without new evidence.
+6. **Checkpoint before stopping.** Report the actual runtime checkpoint reached (command, state, result), not repeated plans; before pausing, prepare the minimum required artifacts so the work can resume.
 
 ### Outside-In Delivery for Large Tasks
 

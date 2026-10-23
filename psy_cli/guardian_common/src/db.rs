@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 
-use super::protocol::{advance_included_account, decode_record, encode_record, DepositTreeState, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianSession, GuardianSessionRecord, GuardianSignError, GuardianSigned, HaltReason, MAX_BODY_BYTES, MAX_SESSION_RECORD_BYTES};
+use super::protocol::{advance_included_account, decode_record, encode_record, DepositTreeState, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianSession, GuardianSessionRecord, GuardianSignError, GuardianSigned, HaltReason};
 
 type Result<T, E = GuardianSignError> = std::result::Result<T, E>;
 
@@ -88,7 +88,7 @@ fn decode_account(key: (u64, u64), bytes: &[u8]) -> Result<GuardianAccount> {
 }
 
 fn decode_signed(key: (u64, u64, u64), bytes: &[u8]) -> Result<GuardianSigned> {
-    let inner = decode_record(bytes, MAX_BODY_BYTES)?;
+    let inner = decode_record(bytes)?;
     let value: GuardianSigned = canonical_bytes(&inner)?;
     if (value.network_magic, value.user_id, value.nonce) != key { return Err(GuardianSignError::DatabaseUnavailable); }
     value.validate()?;
@@ -96,7 +96,7 @@ fn decode_signed(key: (u64, u64, u64), bytes: &[u8]) -> Result<GuardianSigned> {
 }
 
 fn decode_session(key: (u64, u64, u64), bytes: &[u8]) -> Result<GuardianSession> {
-    let inner = decode_record(bytes, MAX_SESSION_RECORD_BYTES)?;
+    let inner = decode_record(bytes)?;
     let value: GuardianSession = canonical_bytes(&inner)?;
     if (value.network_magic, value.user_id, value.nonce) != key { return Err(GuardianSignError::DatabaseUnavailable); }
     Ok(value)
@@ -399,7 +399,7 @@ impl GuardianDb {
     /// The service must authenticate the record and derive its deltas before calling.
     /// This transaction checks durable continuity; it does not assert provider trust.
     /// The caller proved the session and that `checkpoint_hash` is its bound checkpoint leaf.
-    /// One write commits the session, included deposit tree states, both nonce indexes, the sole account checkpoint, and drops this account's signed and session rows older than the imported nonce.
+    /// One write commits the session, included deposit tree states, latest-inclusion session-nonce metadata, the sole account checkpoint, and drops this account's signed and session rows older than the imported nonce.
     pub async fn import_session(&mut self, value: &GuardianSession, deposit_tree_states: &[DepositTreeState], checkpoint_id: u64, checkpoint_hash: super::protocol::Hash4) -> Result<GuardianSession> {
         let request = value.record.request_json.decode()?;
         request.validate_authorization(&self.config)?;
@@ -407,7 +407,7 @@ impl GuardianDb {
             return Err(GuardianSignError::StateMismatch);
         }
         if value.withdrawal_appends.len() != request.withdrawal_records.len()
-            || value.withdrawal_appends.iter().zip(&request.withdrawal_records).any(|(append, burn)| &append.burn != burn) {
+            || value.withdrawal_appends.iter().zip(&request.withdrawal_records).any(|(append, burn)| &append.burn != burn || append.chain_index != burn.destination_chain_index) {
             return Err(GuardianSignError::StateMismatch);
         }
         super::protocol::validate_changed_deposit_tree_states(&request, deposit_tree_states)?;
@@ -449,14 +449,6 @@ impl GuardianDb {
                 return Err(GuardianSignError::AccountHalted);
             }
         }
-        if let Err(error) = verify_batch_indexes(&tx, value) {
-            if matches!(error, GuardianSignError::WithdrawalNonceConflict | GuardianSignError::StateMismatch) {
-                write_halt(&tx, &account, HaltReason::AppendHistoryMismatch)?;
-                tx.commit().map_err(unavailable)?;
-                return Err(GuardianSignError::AccountHalted);
-            }
-            return Err(error);
-        }
         let included = deposit_tree_states_in(&tx, value.network_magic, value.user_id)?;
         let (advanced, included) = match advance_included_account(&account, &included, value, deposit_tree_states, checkpoint_id, checkpoint_hash) {
             Ok(advanced) => advanced,
@@ -481,16 +473,18 @@ impl GuardianDb {
         deposit_tree_states_in_read(&tx, network, user)
     }
 
-    pub async fn contains_included_withdrawal_burn(&mut self, network: u64, user: u64, sender: u32, contract: u32, nonce: [u32; 8]) -> Result<bool> {
+    #[cfg(test)]
+    async fn inclusion_session_nonce(&mut self, network: u64, user: u64, sender: u32, contract: u32, nonce: [u32; 8]) -> Result<Option<u64>> {
         let tx = self.db.begin_read().map_err(unavailable)?;
         let table = tx.open_table(INCLUDED_WITHDRAWAL_BURNS).map_err(unavailable)?;
-        Ok(table.get(WithdrawalBurnKey(network, user, sender, contract, nonce)).map_err(unavailable)?.is_some())
+        Ok(table.get(WithdrawalBurnKey(network, user, sender, contract, nonce)).map_err(unavailable)?.map(|row| row.value()))
     }
 
-    pub async fn contains_withdrawal_nonce(&mut self, network: u64, user: u64, chain: u8, nonce: [u32; 8]) -> Result<bool> {
+    #[cfg(test)]
+    async fn nonce_inclusion_session(&mut self, network: u64, user: u64, chain: u8, nonce: [u32; 8]) -> Result<Option<u64>> {
         let tx = self.db.begin_read().map_err(unavailable)?;
         let table = tx.open_table(WITHDRAWAL_NONCE).map_err(unavailable)?;
-        Ok(table.get(NonceKey(network, user, chain, nonce)).map_err(unavailable)?.is_some())
+        Ok(table.get(NonceKey(network, user, chain, nonce)).map_err(unavailable)?.map(|row| row.value()))
     }
 
 
@@ -642,7 +636,6 @@ fn rewrite_signed_rows(tx: &redb::WriteTransaction, keys: &[(u64, u64, u64)], ac
     let mut table = tx.open_table(GUARDIAN_SIGNED).map_err(unavailable)?;
     for key in keys {
         let guard = table.get(*key).map_err(unavailable)?.ok_or(GuardianSignError::LegacyJournalSchema)?;
-        if guard.value().len() > MAX_BODY_BYTES { return Err(GuardianSignError::LegacyJournalSchema); }
         let raw = guard.value().to_vec();
         drop(guard);
         let value: GuardianSigned = canonical_bytes(&raw).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
@@ -652,7 +645,7 @@ fn rewrite_signed_rows(tx: &redb::WriteTransaction, keys: &[(u64, u64, u64)], ac
         value.validate().map_err(|_| GuardianSignError::LegacyJournalSchema)?;
         config.validate_signed(&value).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
         let request_id = super::protocol::GuardianSignRequest::from_canonical_bytes(&value.request_bytes).map_err(|_| GuardianSignError::LegacyJournalSchema)?.request_id().map_err(|_| GuardianSignError::LegacyJournalSchema)?;
-        let frame = encode_record(&raw, MAX_BODY_BYTES).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
+        let frame = encode_record(&raw).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
         let decoded = decode_signed(*key, &frame).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
         if decoded.request_bytes != value.request_bytes
             || super::protocol::GuardianSignRequest::from_canonical_bytes(&decoded.request_bytes).map_err(|_| GuardianSignError::LegacyJournalSchema)?.request_id().map_err(|_| GuardianSignError::LegacyJournalSchema)? != request_id {
@@ -667,7 +660,6 @@ fn rewrite_session_rows(tx: &redb::WriteTransaction, keys: &[(u64, u64, u64)], a
     let mut table = tx.open_table(GUARDIAN_SESSION).map_err(unavailable)?;
     for key in keys {
         let guard = table.get(*key).map_err(unavailable)?.ok_or(GuardianSignError::LegacyJournalSchema)?;
-        if guard.value().len() > MAX_SESSION_RECORD_BYTES { return Err(GuardianSignError::LegacyJournalSchema); }
         let raw = guard.value().to_vec();
         drop(guard);
         let value: GuardianSession = canonical_bytes(&raw).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
@@ -677,7 +669,7 @@ fn rewrite_session_rows(tx: &redb::WriteTransaction, keys: &[(u64, u64, u64)], a
         let request = value.record.request_json.decode().map_err(|_| GuardianSignError::LegacyJournalSchema)?;
         value.validate(config).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
         let request_id = request.request_id().map_err(|_| GuardianSignError::LegacyJournalSchema)?;
-        let frame = encode_record(&raw, MAX_SESSION_RECORD_BYTES).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
+        let frame = encode_record(&raw).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
         let decoded = decode_session(*key, &frame).map_err(|_| GuardianSignError::LegacyJournalSchema)?;
         if decoded.record.request_json.as_str() != value.record.request_json.as_str()
             || decoded.record.request_json.decode().map_err(|_| GuardianSignError::LegacyJournalSchema)?.request_id().map_err(|_| GuardianSignError::LegacyJournalSchema)? != request_id {
@@ -771,14 +763,14 @@ fn insert_account(tx: &redb::WriteTransaction, value: &GuardianAccount) -> Resul
 
 fn insert_signed(tx: &redb::WriteTransaction, value: &GuardianSigned) -> Result<()> {
     let mut signed = tx.open_table(GUARDIAN_SIGNED).map_err(unavailable)?;
-    let bytes = encode_record(&encode(value)?, MAX_BODY_BYTES)?;
+    let bytes = encode_record(&encode(value)?)?;
     signed.insert((value.network_magic, value.user_id, value.nonce), bytes.as_slice()).map_err(unavailable)?;
     Ok(())
 }
 
 fn insert_session(tx: &redb::WriteTransaction, value: &GuardianSession) -> Result<()> {
     let mut sessions = tx.open_table(GUARDIAN_SESSION).map_err(unavailable)?;
-    let bytes = encode_record(&encode(value)?, MAX_SESSION_RECORD_BYTES)?;
+    let bytes = encode_record(&encode(value)?)?;
     sessions.insert((value.network_magic, value.user_id, value.nonce), bytes.as_slice()).map_err(unavailable)?;
     Ok(())
 }
@@ -854,24 +846,6 @@ fn replace_deposit_tree_states(tx: &redb::WriteTransaction, network: u64, user: 
         deposit_tree_state.validate()?;
         let bytes = encode(deposit_tree_state)?;
         table.insert(DepositTreeKey(network, user, deposit_tree_state.anchor.chain_index), bytes.as_slice()).map_err(unavailable)?;
-    }
-    Ok(())
-}
-
-fn verify_batch_indexes(tx: &redb::WriteTransaction, value: &GuardianSession) -> Result<()> {
-    let mut identities = BTreeSet::new();
-    let mut nonces = BTreeSet::new();
-    let included_withdrawal_burns = tx.open_table(INCLUDED_WITHDRAWAL_BURNS).map_err(unavailable)?;
-    let nonces_table = tx.open_table(WITHDRAWAL_NONCE).map_err(unavailable)?;
-    for append in &value.withdrawal_appends {
-        let burn = &append.burn;
-        if append.chain_index != burn.destination_chain_index
-            || !identities.insert((burn.sender_user_id, burn.token_contract_id, burn.nonce))
-            || !nonces.insert((append.chain_index, burn.nonce))
-            || included_withdrawal_burns.get(WithdrawalBurnKey(value.network_magic, value.user_id, burn.sender_user_id, burn.token_contract_id, burn.nonce)).map_err(unavailable)?.is_some()
-            || nonces_table.get(NonceKey(value.network_magic, value.user_id, append.chain_index, burn.nonce)).map_err(unavailable)?.is_some() {
-            return Err(GuardianSignError::WithdrawalNonceConflict);
-        }
     }
     Ok(())
 }
@@ -1227,35 +1201,22 @@ mod tests {
         }
         assert_halted_cursor(consumed.db(), 90103, 1).await;
 
-        let mut repeated_identity = append(0, 10, 1);
-        repeated_identity.chain_index = 1;
-        repeated_identity.burn.destination_chain_index = 1;
-        // Identity keys omit the chain; nonce keys omit the sender and token contract.
-        for (network, conflicting, identity_present, nonce_present) in [
-            (90104, append(3, 10, 2), false, false), // append gap, both keys new
-            (90105, repeated_identity, true, false), // existing identity, new chain nonce
-            (90106, append(1, 11, 1), false, true), // new identity, existing chain nonce
-            (90110, append(1, 10, 1), true, true), // both keys already included
-        ] {
-            let mut owned = TestDb::create(&active(network, 0)).await;
-            owned.db().import_session(&history(network, 1, vec![append(0, 10, 1)]), &[], 1, Hash4::default()).await.expect("first append");
-            let saved = owned.db().load_account(network, 524288).await.expect("included account");
-            let error = owned.db().import_session(&history(network, 2, vec![conflicting.clone()]), &[], 2, Hash4::default()).await
-                .expect_err("conflicting append must halt without committing either index");
-            assert_eq!(error, GuardianSignError::AccountHalted, "network {network}: append {conflicting:?}");
-            assert_halted_cursor(owned.db(), network, 1).await;
-            let halted = owned.db().load_account(network, 524288).await.expect("halted account");
-            assert_eq!(halted.last_checkpoint_id, saved.last_checkpoint_id, "network {network}: checkpoint must not advance");
-            assert_eq!(halted.withdrawal_chains, saved.withdrawal_chains, "network {network}: withdrawal frontier must not advance");
-            let burn = append(0, 10, 1).burn;
-            assert!(owned.db().contains_included_withdrawal_burn(network, 524288, burn.sender_user_id, burn.token_contract_id, burn.nonce).await.expect("retained identity"));
-            assert!(owned.db().contains_withdrawal_nonce(network, 524288, 0, burn.nonce).await.expect("retained nonce"));
-            let burn = &conflicting.burn;
-            assert_eq!(owned.db().contains_included_withdrawal_burn(network, 524288, burn.sender_user_id, burn.token_contract_id, burn.nonce).await.expect("conflicting identity point"), identity_present,
-                "network {network}: only previously included identity keys may remain");
-            assert_eq!(owned.db().contains_withdrawal_nonce(network, 524288, conflicting.chain_index, burn.nonce).await.expect("conflicting nonce point"), nonce_present,
-                "network {network}: only previously included chain nonce keys may remain");
-        }
+        let mut gapped = TestDb::create(&active(90104, 0)).await;
+        gapped.db().import_session(&history(90104, 1, vec![append(0, 10, 1)]), &[], 1, Hash4::default()).await.expect("first append");
+        let saved = gapped.db().load_account(90104, 524288).await.expect("included account");
+        let error = gapped.db().import_session(&history(90104, 2, vec![append(3, 10, 2)]), &[], 2, Hash4::default()).await
+            .expect_err("wrong append index must halt without committing either index");
+        assert_eq!(error, GuardianSignError::AccountHalted);
+        assert_halted_cursor(gapped.db(), 90104, 1).await;
+        let halted = gapped.db().load_account(90104, 524288).await.expect("halted account");
+        assert_eq!(halted.last_checkpoint_id, saved.last_checkpoint_id);
+        assert_eq!(halted.withdrawal_chains, saved.withdrawal_chains);
+        let burn = append(0, 10, 1).burn;
+        assert_eq!(gapped.db().inclusion_session_nonce(90104, 524288, burn.sender_user_id, burn.token_contract_id, burn.nonce).await.expect("retained identity"), Some(1));
+        assert_eq!(gapped.db().nonce_inclusion_session(90104, 524288, 0, burn.nonce).await.expect("retained nonce"), Some(1));
+        let later = append(3, 10, 2).burn;
+        assert_eq!(gapped.db().inclusion_session_nonce(90104, 524288, later.sender_user_id, later.token_contract_id, later.nonce).await.expect("uncommitted identity"), None);
+        assert_eq!(gapped.db().nonce_inclusion_session(90104, 524288, 0, later.nonce).await.expect("uncommitted nonce"), None);
 
         let mut advanced = TestDb::create(&active(90107, 0)).await;
         advanced.db().import_session(&history(90107, 1, vec![append(0, 10, 1)]), &[], 1, Hash4::default()).await.expect("initial append");
@@ -1359,10 +1320,10 @@ mod tests {
         assert_eq!(restored.load_account(90109, 524288).await.expect("halted").state, GuardianAccountState::Halted);
         assert_halted_cursor(&mut restored, 90109, 1).await;
         assert_eq!(restored.load_deposit_tree_states(90109, 524288).await.expect("retained deposit tree state after reopen"), signed.deposit_tree_states);
-        assert!(restored.contains_included_withdrawal_burn(90109, 524288, 10, 4, append(0, 10, 1).burn.nonce).await.expect("retained identity"));
-        assert!(!restored.contains_included_withdrawal_burn(90109, 524288, 11, 4, append(1, 11, 2).burn.nonce).await.expect("uncommitted identity absent"));
-        assert!(!restored.contains_withdrawal_nonce(90109, 524288, 0, append(1, 11, 2).burn.nonce).await.expect("uncommitted nonce absent"));
-        assert!(restored.contains_withdrawal_nonce(90109, 524288, 0, append(0, 10, 1).burn.nonce).await.expect("retained nonce"));
+        assert_eq!(restored.inclusion_session_nonce(90109, 524288, 10, 4, append(0, 10, 1).burn.nonce).await.expect("retained identity"), Some(1));
+        assert_eq!(restored.inclusion_session_nonce(90109, 524288, 11, 4, append(1, 11, 2).burn.nonce).await.expect("uncommitted identity absent"), None);
+        assert_eq!(restored.nonce_inclusion_session(90109, 524288, 0, append(1, 11, 2).burn.nonce).await.expect("uncommitted nonce absent"), None);
+        assert_eq!(restored.nonce_inclusion_session(90109, 524288, 0, append(0, 10, 1).burn.nonce).await.expect("retained nonce"), Some(1));
     }
 
 
@@ -1501,7 +1462,7 @@ mod tests {
                     insert_session(&tx, &session).unwrap();
                 } else {
                     let mut sessions = tx.open_table(GUARDIAN_SESSION).unwrap();
-                    let mut bytes = encode_record(&encode(&session).unwrap(), MAX_SESSION_RECORD_BYTES).unwrap();
+                    let mut bytes = encode_record(&encode(&session).unwrap()).unwrap();
                     bytes.push(1);
                     sessions.insert((session.network_magic, session.user_id, session.nonce), bytes.as_slice()).unwrap();
                 }
@@ -1564,8 +1525,8 @@ mod tests {
         let mut session_one = first;
         session_one.record.request_json = JsonText::from_value(&request).expect("request json");
         owned.db().import_session(&session_one, &[changed.clone()], 1, Hash4::default()).await.expect("import nonce 1");
-        assert!(owned.db().contains_included_withdrawal_burn(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity"));
-        assert!(owned.db().contains_withdrawal_nonce(network, user, 0, burn.burn.nonce).await.expect("nonce index"));
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity"), Some(1));
+        assert_eq!(owned.db().nonce_inclusion_session(network, user, 0, burn.burn.nonce).await.expect("nonce index"), Some(1));
 
         let second = history(network, 2, vec![]);
         let fourth = history(network, 4, vec![]);
@@ -1592,8 +1553,8 @@ mod tests {
         assert!(retained.signature.is_none());
         assert_eq!(retained.request_bytes, pending.request_bytes);
         assert_eq!(owned.db().load_deposit_tree_states(network, user).await.expect("deposits"), vec![changed.clone()]);
-        assert!(owned.db().contains_included_withdrawal_burn(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity kept"));
-        assert!(owned.db().contains_withdrawal_nonce(network, user, 0, burn.burn.nonce).await.expect("nonce index kept"));
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity kept"), Some(1));
+        assert_eq!(owned.db().nonce_inclusion_session(network, user, 0, burn.burn.nonce).await.expect("nonce index kept"), Some(1));
         let account = owned.db().load_account(network, user).await.expect("account");
         assert_eq!(account.imported_nonce, Some(2));
         assert_eq!(account.state, GuardianAccountState::Active);
@@ -1617,8 +1578,8 @@ mod tests {
         assert_eq!(kept.request_bytes, pending.request_bytes);
         assert_eq!(owned.db().load_account(network, user).await.expect("cursor").imported_nonce, Some(3));
         assert_eq!(owned.db().load_deposit_tree_states(network, user).await.expect("deposits after 3"), vec![changed.clone()]);
-        assert!(owned.db().contains_included_withdrawal_burn(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity after 3"));
-        assert!(owned.db().contains_withdrawal_nonce(network, user, 0, burn.burn.nonce).await.expect("nonce index after 3"));
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity after 3"), Some(1));
+        assert_eq!(owned.db().nonce_inclusion_session(network, user, 0, burn.burn.nonce).await.expect("nonce index after 3"), Some(1));
         assert_eq!(owned.db().load_account(network, user).await.expect("still active").state, GuardianAccountState::Active);
         assert_eq!(owned.db().import_session(&session_one, &[changed.clone()], 1, Hash4::default()).await.expect_err("old exact"), GuardianSignError::NonceConflict);
         let mut modified = session_one.clone();
@@ -1628,8 +1589,8 @@ mod tests {
         assert_eq!((unchanged.state, unchanged.imported_nonce), (GuardianAccountState::Active, Some(3)));
         assert_eq!(owned.db().load_sessions(network, user, None, 64).await.expect("latest remains").iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![3]);
         assert_eq!(owned.db().load_deposit_tree_states(network, user).await.expect("deposits unchanged"), vec![changed.clone()]);
-        assert!(owned.db().contains_included_withdrawal_burn(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity unchanged"));
-        assert!(owned.db().contains_withdrawal_nonce(network, user, 0, burn.burn.nonce).await.expect("nonce index unchanged"));
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("identity unchanged"), Some(1));
+        assert_eq!(owned.db().nonce_inclusion_session(network, user, 0, burn.burn.nonce).await.expect("nonce index unchanged"), Some(1));
         owned.db().import_session(&third, &[], 3, Hash4::default()).await.expect("exact latest retry");
         let mut different = third.clone();
         different.record.endcap_proof_hex = "0x01".to_owned();
@@ -1643,9 +1604,77 @@ mod tests {
         assert_eq!(restored.load_sessions(network, user, None, 64).await.expect("restored sessions").iter().map(|session| session.nonce).collect::<Vec<_>>(), vec![3]);
         assert!(restored.lookup_signed(network, user, 4).await.expect("pending retained").is_some());
         assert!(restored.lookup_signed(network, user, 3).await.expect("no fabricated").is_none());
-        assert!(restored.contains_included_withdrawal_burn(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("restored identity"));
-        assert!(restored.contains_withdrawal_nonce(network, user, 0, burn.burn.nonce).await.expect("restored nonce index"));
+        assert_eq!(restored.inclusion_session_nonce(network, user, burn.burn.sender_user_id, burn.burn.token_contract_id, burn.burn.nonce).await.expect("restored identity"), Some(1));
+        assert_eq!(restored.nonce_inclusion_session(network, user, 0, burn.burn.nonce).await.expect("restored nonce index"), Some(1));
     }
+    #[tokio::test]
+    async fn duplicate_keys_keep_latest_session_and_distinct_append_indexes() {
+        let network = 90113u64;
+        let user = 524288u64;
+        let mut owned = TestDb::create(&active(network, 0)).await;
+        let first = append(0, 10, 1);
+        let repeated = append(1, 10, 1);
+        let other_burn = append(2, 11, 1);
+        owned.db().import_session(&history(network, 1, vec![first.clone(), repeated.clone(), other_burn.clone()]), &[], 1, Hash4::default()).await.expect("duplicates within one session");
+        let account = owned.db().load_account(network, user).await.expect("advanced");
+        assert_eq!(account.state, GuardianAccountState::Active);
+        assert_eq!(account.imported_nonce, Some(1));
+        assert_eq!(account.withdrawal_chains, vec![(0, 3, account.withdrawal_chains[0].2, account.withdrawal_chains[0].3)]);
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, 10, 4, first.burn.nonce).await.expect("same burn"), Some(1));
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, 11, 4, other_burn.burn.nonce).await.expect("other burn"), Some(1));
+        assert_eq!(owned.db().nonce_inclusion_session(network, user, 0, first.burn.nonce).await.expect("shared destination nonce"), Some(1));
+        let saved = owned.db().load_sessions(network, user, None, 64).await.expect("session");
+        assert_eq!(saved[0].withdrawal_appends.iter().map(|append| append.append_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        let again = append(3, 10, 1);
+        owned.db().import_session(&history(network, 2, vec![again.clone()]), &[], 2, Hash4::default()).await.expect("same keys in a later session");
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, 10, 4, first.burn.nonce).await.expect("latest burn session"), Some(2));
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, 11, 4, other_burn.burn.nonce).await.expect("untouched burn stays at first session"), Some(1));
+        assert_eq!(owned.db().nonce_inclusion_session(network, user, 0, first.burn.nonce).await.expect("latest nonce session"), Some(2));
+        let advanced = owned.db().load_account(network, user).await.expect("second import");
+        assert_eq!(advanced.withdrawal_chains[0].1, 4);
+        assert_eq!(owned.db().load_sessions(network, user, Some(1), 1).await.expect("second session")[0].withdrawal_appends, vec![again]);
+    }
+    #[tokio::test]
+    async fn wrong_append_destination_rejects_without_advancing() {
+        let network = 90115u64;
+        let user = 524288u64;
+        let mut owned = TestDb::create(&active(network, 0)).await;
+        owned.db().import_session(&history(network, 1, vec![append(0, 10, 1)]), &[], 1, Hash4::default()).await.expect("first append");
+        let saved = owned.db().load_account(network, user).await.expect("included");
+        let mut mismatched = history(network, 2, vec![append(1, 11, 2)]);
+        mismatched.withdrawal_appends[0].chain_index = 1;
+        assert_eq!(owned.db().import_session(&mismatched, &[], 2, Hash4::default()).await.expect_err("wrong destination"), GuardianSignError::StateMismatch);
+        let account = owned.db().load_account(network, user).await.expect("unchanged");
+        assert_eq!((account.state, account.imported_nonce, account.withdrawal_chains), (saved.state, saved.imported_nonce, saved.withdrawal_chains));
+        assert_eq!(owned.db().inclusion_session_nonce(network, user, 11, 4, append(1, 11, 2).burn.nonce).await.expect("no burn metadata"), None);
+        assert_eq!(owned.db().nonce_inclusion_session(network, user, 1, append(1, 11, 2).burn.nonce).await.expect("no nonce metadata"), None);
+    }
+
+
+    #[tokio::test]
+    async fn signed_reservation_conflict_still_halts_without_import() {
+        let mut owned = TestDb::create(&active(90114, 0)).await;
+        let mut session = history(90114, 1, vec![append(0, 10, 1)]);
+        let mut own = reserved();
+        own.network_magic = 90114;
+        let request = session.record.request_json.decode().expect("request");
+        own.request_bytes = request.canonical_bytes().expect("bytes");
+        owned.db().reserve_guardian_nonce(&own).await.expect("reservation");
+        let mut changed = request;
+        changed.trace_json = JsonText::parse(format!(" {} ", changed.trace_json.as_str())).expect("distinct request");
+        session.record.request_json = JsonText::from_value(&changed).expect("request json");
+        assert_eq!(owned.db().import_session(&session, &[], 1, Hash4::default()).await.expect_err("reservation conflict"), GuardianSignError::AccountHalted);
+        let saved = owned.db().load_account(90114, 524288).await.expect("halt");
+        assert_eq!(saved.state, GuardianAccountState::Halted);
+        assert_eq!(saved.halt_reason, Some(HaltReason::NonceConsumedDifferently));
+        assert_eq!(saved.imported_nonce, None);
+        assert!(owned.db().load_sessions(90114, 524288, None, 1).await.expect("no session").is_empty());
+        let retained = owned.db().lookup_signed(90114, 524288, 1).await.expect("retained").expect("reservation");
+        assert!(same_reservation(&own, &retained));
+        assert_eq!(owned.db().inclusion_session_nonce(90114, 524288, 10, 4, append(0, 10, 1).burn.nonce).await.expect("no metadata"), None);
+    }
+
 
     fn raw_rows(db: &GuardianDb) -> Vec<(String, Vec<u8>)> {
         let tx = db.db.begin_read().unwrap();
@@ -1707,13 +1736,13 @@ mod tests {
             tx.open_table(GUARDIAN_SCHEMA).unwrap().insert((), RAW_SCHEMA_VERSION).unwrap();
             {
                 let mut signed = tx.open_table(GUARDIAN_SIGNED).unwrap();
-                for (key, bytes) in signed.iter().unwrap().map(|row| { let (key, value) = row.unwrap(); (key.value(), decode_record(value.value(), MAX_BODY_BYTES).unwrap()) }).collect::<Vec<_>>() {
+                for (key, bytes) in signed.iter().unwrap().map(|row| { let (key, value) = row.unwrap(); (key.value(), decode_record(value.value()).unwrap()) }).collect::<Vec<_>>() {
                     signed.insert(key, bytes.as_slice()).unwrap();
                 }
             }
             {
                 let mut sessions = tx.open_table(GUARDIAN_SESSION).unwrap();
-                for (key, bytes) in sessions.iter().unwrap().map(|row| { let (key, value) = row.unwrap(); (key.value(), decode_record(value.value(), MAX_SESSION_RECORD_BYTES).unwrap()) }).collect::<Vec<_>>() {
+                for (key, bytes) in sessions.iter().unwrap().map(|row| { let (key, value) = row.unwrap(); (key.value(), decode_record(value.value()).unwrap()) }).collect::<Vec<_>>() {
                     sessions.insert(key, bytes.as_slice()).unwrap();
                 }
             }
@@ -1746,8 +1775,8 @@ mod tests {
         for (key, bytes) in &raw {
             let saved = stored.iter().find(|(name, _)| name == key).unwrap().1.as_slice();
             if key.starts_with("account:") { assert_eq!(saved, bytes.as_slice()); assert_eq!(saved, account_before.as_slice()); }
-            if key.starts_with("signed:") { assert_eq!(decode_record(saved, MAX_BODY_BYTES).unwrap(), *bytes); }
-            if key.starts_with("session:") { assert_eq!(decode_record(saved, MAX_SESSION_RECORD_BYTES).unwrap(), *bytes); }
+            if key.starts_with("signed:") { assert_eq!(decode_record(saved).unwrap(), *bytes); }
+            if key.starts_with("session:") { assert_eq!(decode_record(saved).unwrap(), *bytes); }
         }
         drop(db);
         let mut restored = GuardianDb::open(OpenOptions::new().read(true).write(true).open(&owned.path).unwrap(), KEY, config).await.unwrap();

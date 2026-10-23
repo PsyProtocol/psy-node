@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use plonky2::field::{goldilocks_field::GoldilocksField as F, types::PrimeField64};
 use psy_client_common::{
     args::{ContractCallArgs, ContractCallData},
@@ -2257,12 +2257,19 @@ impl WalletManager {
 }
 
 /// Big-endian u32×8 limbs of a 256-bit value — the wire form the token
-/// contract's `withdraw` takes for tokens, amounts, recipients and the nonce.
+/// contract's `withdraw` takes for tokens and amounts.
 fn u256_to_u32x8_be(value: u128) -> [u64; 8] {
+    let mut bytes = [0u8; 32];
+    bytes[16..].copy_from_slice(&value.to_be_bytes());
+    u256_bytes_to_u32x8_be(&bytes)
+}
+
+/// Big-endian u32×8 limbs of exactly 32 bytes — bit-preserving, so a
+/// full-width nonce reaches the contract unchanged.
+fn u256_bytes_to_u32x8_be(bytes: &[u8; 32]) -> [u64; 8] {
     let mut out = [0u64; 8];
-    for i in 0..8 {
-        let shift = 32 * (7 - i);
-        out[i] = if shift >= 128 { 0 } else { ((value >> shift) & 0xffff_ffff) as u64 };
+    for (word, limb) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        *word = u64::from(u32::from_be_bytes(limb.try_into().expect("chunks_exact(4) yields 4 bytes")));
     }
     out
 }
@@ -2285,13 +2292,67 @@ fn evm_addr_to_u32x8_be(hex: &str) -> Result<[u64; 8]> {
     Ok(out)
 }
 
+// ─── Withdraw nonce: full 256 bits, canonical hex at the boundary ───────────
+
+/// Parses the withdraw nonce at the tool boundary: `0x` + exactly 64 hex
+/// digits (32 bytes), non-zero. The contract's nonce is a FULL 256-bit word,
+/// and a u64 would silently alias 2¹⁹² values onto one another — legacy u64
+/// nonces are NOT accepted; a caller that wants the old value 7 passes
+/// `0x0000…0007` explicitly.
+pub fn parse_withdraw_nonce(nonce: &str) -> Result<[u8; 32]> {
+    let trimmed = nonce.trim();
+    let raw = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(
+            "nonce `{nonce}` is not a 256-bit withdraw nonce: expected exactly 64 hex digits (32 bytes), \
+             optionally 0x-prefixed — legacy u64 nonces are not accepted, zero-pad explicitly"
+        );
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(raw, &mut out).with_context(|| format!("nonce `{nonce}` is not valid hex"))?;
+    if out == [0u8; 32] {
+        bail!("nonce `{nonce}` is all-zero — a withdraw nonce must be non-zero");
+    }
+    Ok(out)
+}
+
+/// Canonical boundary form of a withdraw nonce: `0x` + 64 lowercase hex digits.
+pub fn withdraw_nonce_to_hex(nonce: &[u8; 32]) -> String {
+    format!("0x{}", hex::encode(nonce))
+}
+
+/// Draws a fresh 256-bit withdraw nonce from the OS entropy pool. An all-zero
+/// draw is retried rather than accepted, the draw count is capped so a broken
+/// entropy source fails loudly, and the clock is never a fallback — a
+/// unix-seconds nonce has neither uniqueness nor width.
+fn generate_withdraw_nonce(rng: &mut impl RngCore) -> Result<[u8; 32]> {
+    const DRAWS: usize = 8;
+    for _ in 0..DRAWS {
+        let mut bytes = [0u8; 32];
+        rng.try_fill_bytes(&mut bytes).map_err(|e| anyhow!("OS entropy source failed: {e}"))?;
+        if bytes != [0u8; 32] {
+            return Ok(bytes);
+        }
+    }
+    bail!("OS entropy produced an all-zero withdraw nonce {DRAWS} times in a row")
+}
+
+/// Production draw from the OS entropy pool; tests inject their own RNG into
+/// `generate_withdraw_nonce` instead of sampling real randomness.
+pub fn random_withdraw_nonce() -> Result<[u8; 32]> {
+    generate_withdraw_nonce(&mut rand::rngs::OsRng)
+}
+
 impl WalletManager {
     /// Withdraw to an L1 address: burns on Psy, then the bridge relayer settles
     /// the L1 leg (so this costs the agent no Ethereum gas).
     ///
-    /// The deployed contract takes 33 inputs — the nonce is a FULL u32x8 word,
-    /// not a single felt. Sending 26 fails before any proof with
-    /// "expect 33 number of inputs, but got 26".
+    /// The deployed contract takes 33 inputs — the nonce is a FULL u32x8 word
+    /// built from 32 big-endian bytes, not a single felt. Sending 26 fails
+    /// before any proof with "expect 33 number of inputs, but got 26".
     pub async fn withdraw(
         &self,
         network: &NetworkId,
@@ -2299,13 +2360,13 @@ impl WalletManager {
         l1_token_address: &str,
         amount_nano: u64,
         l1_recipient: &str,
-        nonce: u64,
+        nonce: [u8; 32],
         contract_id: u64,
     ) -> Result<String> {
         let token = evm_addr_to_u32x8_be(l1_token_address).context("l1_token_address")?;
         let recipient = evm_addr_to_u32x8_be(l1_recipient).context("l1_recipient")?;
         let amount = u256_to_u32x8_be(amount_nano as u128);
-        let nonce_words = u256_to_u32x8_be(nonce as u128);
+        let nonce_words = u256_bytes_to_u32x8_be(&nonce);
 
         let mut inputs = Vec::with_capacity(33);
         inputs.push(dest_chain_index);
@@ -2326,13 +2387,13 @@ impl WalletManager {
         l1_token_address: &str,
         amount_nano: u64,
         l1_recipient: &str,
-        nonce: u64,
+        nonce: [u8; 32],
         contract_id: u64,
     ) -> Result<String> {
         let token = evm_addr_to_u32x8_be(l1_token_address).context("l1_token_address")?;
         let recipient = evm_addr_to_u32x8_be(l1_recipient).context("l1_recipient")?;
         let amount = u256_to_u32x8_be(amount_nano as u128);
-        let nonce_words = u256_to_u32x8_be(nonce as u128);
+        let nonce_words = u256_bytes_to_u32x8_be(&nonce);
         let mut inputs = vec![dest_chain_index];
         inputs.extend_from_slice(&token);
         inputs.extend_from_slice(&amount);
@@ -2351,7 +2412,7 @@ mod withdraw_encoding_tests {
         let token = evm_addr_to_u32x8_be("0xbBC0D21A312006eB0E902c279d5E53Dc8225cBB6").unwrap();
         let recipient = evm_addr_to_u32x8_be("0xfB11910FD59f62a9046884109905fa6f88B4be43").unwrap();
         let amount = u256_to_u32x8_be(50_000_000);
-        let nonce = u256_to_u32x8_be(7);
+        let nonce = u256_bytes_to_u32x8_be(&parse_withdraw_nonce(&format!("0x{:064x}", 7u64)).unwrap());
         let total = 1 + token.len() + amount.len() + recipient.len() + nonce.len();
         assert_eq!(total, 33, "the deployed contract rejects anything but 33 inputs");
     }
@@ -2387,6 +2448,86 @@ mod withdraw_encoding_tests {
         assert!(evm_addr_to_u32x8_be("").is_err());
         assert!(evm_addr_to_u32x8_be("0x0").is_err());
         assert!(evm_addr_to_u32x8_be("0x0000000000000000000000000000000000000000").is_err());
+    }
+
+    /// High bits set in every limb — pins the byte order end to end: byte 0 is
+    /// the top of limb 0, byte 31 the bottom of limb 7, nothing masked away.
+    #[test]
+    fn nonce_bytes_split_into_eight_be_u32_limbs_preserving_bits() {
+        let bytes = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
+            0x00, 0xFF, 0x00, 0xFF, 0x80, 0x00, 0x00, 0x01,
+            0x7F, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01,
+            0xAA, 0xBB, 0xCC, 0xDD, 0x12, 0x34, 0x56, 0x78,
+        ];
+        let w = u256_bytes_to_u32x8_be(&bytes);
+        assert_eq!(w, [0xDEADBEEF, 0x01020304, 0x00FF00FF, 0x80000001, 0x7FFFFFFF, 0x00000001, 0xAABBCCDD, 0x12345678]);
+    }
+
+    #[test]
+    fn nonce_parses_full_width_hex_and_round_trips_canonically() {
+        let canonical = format!("0x{}deadbeef", "0".repeat(56)); // 56 + 8 = 64 hex digits
+        let n = parse_withdraw_nonce(&canonical).unwrap();
+        assert_eq!(withdraw_nonce_to_hex(&n), canonical, "output must be the canonical form");
+        // Bare (no 0x) and uppercase-digit inputs parse to the same nonce.
+        assert_eq!(parse_withdraw_nonce(&canonical[2..]).unwrap(), n);
+        assert_eq!(parse_withdraw_nonce(&format!("0x{}DEADBEEF", "0".repeat(56))).unwrap(), n);
+        // Every high bit survives the parse.
+        assert_eq!(parse_withdraw_nonce(&format!("0x{}", "f".repeat(64))).unwrap(), [0xff; 32]);
+    }
+
+    /// The legacy u64 shape (short hex, a bare small value, wrong width, junk,
+    /// or zero) is refused — never padded or coerced.
+    #[test]
+    fn nonce_rejects_wrong_width_non_hex_and_zero() {
+        let bads = [
+            "0x7".to_string(),
+            "0xdeadbeef".to_string(),
+            format!("{}0007", "0".repeat(61)),      // 65 hex digits, no 0x
+            format!("0x{}deadbee", "0".repeat(56)), // 63 hex digits
+            format!("0x{}", "g".repeat(64)),        // full width but not hex
+            String::new(),
+            format!("0x{:064x}", 0u64),             // all-zero
+        ];
+        for bad in &bads {
+            assert!(parse_withdraw_nonce(bad).is_err(), "`{bad}` must be rejected");
+        }
+    }
+
+    /// Deterministic RngCore replays canned 32-byte draws, then zeros — so the
+    /// nonzero loop is proven without sampling real randomness.
+    struct CannedRng {
+        draws: Vec<[u8; 32]>,
+        next: usize,
+    }
+
+    impl RngCore for CannedRng {
+        fn next_u32(&mut self) -> u32 { 0 }
+        fn next_u64(&mut self) -> u64 { 0 }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.fill(0);
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            let draw = self.draws.get(self.next).copied().unwrap_or([0u8; 32]);
+            self.next += 1;
+            dest.copy_from_slice(&draw[..dest.len()]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn generated_nonce_loops_past_an_all_zero_draw() {
+        let mut rng = CannedRng {
+            draws: vec![[0u8; 32], [9u8; 32]],
+            next: 0,
+        };
+        assert_eq!(generate_withdraw_nonce(&mut rng).unwrap(), [9u8; 32]);
+    }
+
+    #[test]
+    fn generated_nonce_surrenders_after_repeated_zero_draws() {
+        let mut rng = CannedRng { draws: vec![], next: 0 };
+        assert!(generate_withdraw_nonce(&mut rng).is_err());
     }
 }
 
@@ -2862,7 +3003,8 @@ pub struct WithdrawLeg {
     pub l1_token_address: String,
     pub amount_nano: u64,
     pub l1_recipient: String,
-    pub nonce: u64,
+    /// Full 256-bit nonce, big-endian bytes — the exact word the contract sees.
+    pub nonce: [u8; 32],
     pub contract_id: u64,
 }
 
@@ -2871,7 +3013,7 @@ fn build_withdraw_item(leg: &WithdrawLeg) -> Result<ClaimBatchItem> {
     let token = evm_addr_to_u32x8_be(&leg.l1_token_address).context("l1_token_address")?;
     let recipient = evm_addr_to_u32x8_be(&leg.l1_recipient).context("l1_recipient")?;
     let amount = u256_to_u32x8_be(leg.amount_nano as u128);
-    let nonce_words = u256_to_u32x8_be(leg.nonce as u128);
+    let nonce_words = u256_bytes_to_u32x8_be(&leg.nonce);
     let mut inputs = Vec::with_capacity(33);
     inputs.push(leg.dest_chain_index);
     inputs.extend_from_slice(&token);

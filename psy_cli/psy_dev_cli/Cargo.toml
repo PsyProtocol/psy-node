@@ -93,6 +93,7 @@ psy_node_nats = { workspace = true }
 alloy-primitives = { workspace = true }
 toml = { workspace = true }
 guardian_common = { path = "../guardian_common" }
+psy_crypto = { workspace = true }
 
 
 [dev-dependencies]

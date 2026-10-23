@@ -1,6 +1,9 @@
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{collections::{BTreeMap, HashMap}, fs, path::Path, str::FromStr, time::Duration};
 
+use alloy_consensus::Transaction as ConsensusTransaction;
+use alloy_network::TransactionResponse;
 use alloy_primitives::Address;
+use alloy_provider::Provider;
 use anyhow::Context;
 use psy_provider::provider::RpcProvider;
 use serde::Deserialize;
@@ -9,7 +12,7 @@ use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::traits::qdatastore::qtreedata::QTreeDataStoreReaderSync;
 
 use crate::bridge::{
-    claim_withdrawals,
+    claim_attempts, claim_withdrawals,
     constants::DEFAULT_DEPLOYMENTS_NETWORK,
     daemon::{
         fetch_l1_last_finalized_checkpoint, resolve_bridge_address, resolve_system_prove_proxy_url,
@@ -207,6 +210,7 @@ impl L1Client {
         config: &BridgeProposeDaemonConfig,
         to_checkpoint: u64,
         network: &psy_config::NetworkConfigGoldilocks,
+        before_broadcast: Option<claim_withdrawals::BeforeBroadcast>,
     ) -> anyhow::Result<claim_withdrawals::BatchWithdrawalsReport> {
         let bridge_addr = resolve_bridge_address(config)?;
         tracing::info!(
@@ -215,10 +219,12 @@ impl L1Client {
             "claiming current batch withdrawals on L1"
         );
         let prove_proxy_url = resolve_system_prove_proxy_url(network)?;
+        let hook = before_broadcast.clone();
         self.with_rpc_failover("claim_withdrawals", |url| {
             let owned = url.to_string();
             let bridge_addr = bridge_addr.clone();
             let proxy = prove_proxy_url.clone();
+            let hook = hook.clone();
             async move {
                 let report = claim_withdrawal_chunks(
                     withdrawals,
@@ -226,15 +232,15 @@ impl L1Client {
                     &owned,
                     &bridge_addr,
                     Some(proxy.as_str()),
+                    hook,
                 )
                 .await?;
                 tracing::info!(
                     to_checkpoint,
                     requested = report.requested,
                     submitted_count = report.submitted_count,
-                    already_claimed_count = report.already_claimed_count,
-                    resolved = report.resolved_leaf_hashes.len(),
-                    failed = report.failure_reasons.len(),
+                    resolved = report.resolved_count(),
+                    failed = report.count_by_action(claim_withdrawals::ClaimAction::AttemptSpent),
                     "bridge daemon batch withdrawal step finished"
                 );
                 Ok(report)
@@ -242,6 +248,36 @@ impl L1Client {
         })
         .await
     }
+    /// Clear holds whose condition no longer applies, before a round sends.
+    ///
+    /// An operator hold is re-read from the bridge. A receipt hold is resolved
+    /// only by that transaction's own receipt: success removes the leaf, a
+    /// revert spends one attempt. A missing hash, a still-pending transaction,
+    /// or a nonce that moved without the receipt stays held. None of those is
+    /// a reason to send again.
+    pub async fn release_claim_holds(
+        &self,
+        pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
+        claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+        config: &BridgeProposeDaemonConfig,
+        chain: Option<u8>,
+    ) -> anyhow::Result<Vec<HoldResolution>> {
+        let bridge = resolve_bridge_address(config)?;
+        let network = config.finalize.deployments_network.as_deref().unwrap_or(DEFAULT_DEPLOYMENTS_NETWORK);
+        let scan_start = claim_withdrawals::bridge_deployment_block(network);
+        self.with_rpc_failover("release_claim_holds", |url| {
+            let owned = url.to_string();
+            let bridge = bridge.clone();
+            async move {
+                let provider = connect_l1_readonly(
+                    owned.parse().with_context(|| format!("invalid L1 rpc url: {owned}"))?,
+                )?;
+                release_claim_holds(&provider, &bridge, pending, claim_retry, scan_start, chain).await
+            }
+        })
+        .await
+    }
+
 
     pub async fn load_or_build_proof(
         &self,
@@ -402,20 +438,235 @@ async fn load_or_build_proof_impl(
     Ok(prove_result)
 }
 
+/// A recorded claim transaction whose receipt came back, grouped with every
+/// pending leaf held on that one transaction. The daemon accounts the whole
+/// group from this single read; this client never sends a replacement for it.
+pub(crate) struct HoldResolution {
+    pub withdrawals: Vec<propose_withdrawals::PendingWithdrawal>,
+    pub report: claim_withdrawals::BatchWithdrawalsReport,
+}
+
+/// One recorded claim transaction: its receipt and the pin to the block that
+/// carries it.
+struct RecordedClaimTx {
+    receipt: alloy_rpc_types_eth::TransactionReceipt,
+    pin: claim_withdrawals::ReadPin,
+}
+
+/// Fetch one recorded claim transaction and pin its receipt. `None` is a
+/// transaction that has not landed yet; that is a hold, not a reason to send.
+async fn recorded_claim_tx<P: alloy_provider::Provider>(
+    provider: &P,
+    tx_hash: alloy_primitives::B256,
+) -> anyhow::Result<Option<RecordedClaimTx>> {
+    let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else { return Ok(None); };
+    if receipt.transaction_hash != tx_hash { anyhow::bail!("receipt transaction hash does not match the recorded claim"); }
+    let (Some(number), Some(hash)) = (receipt.block_number, receipt.block_hash) else {
+        anyhow::bail!("recorded claim receipt has no block position");
+    };
+    let pin = claim_withdrawals::verify_receipt_pin(provider, number, hash, tx_hash).await?;
+    Ok(Some(RecordedClaimTx { receipt, pin }))
+}
+
+/// Decode the batch a recorded claim transaction carried, once its hash is the
+/// one on record.
+async fn recorded_claim_batch<P: alloy_provider::Provider>(
+    provider: &P,
+    tx_hash: alloy_primitives::B256,
+) -> anyhow::Result<(Vec<propose_withdrawals::PendingWithdrawal>, Vec<u8>)> {
+    let transaction = provider.get_transaction_by_hash(tx_hash).await?.context("recorded claim transaction is missing")?;
+    anyhow::ensure!(TransactionResponse::tx_hash(&transaction) == tx_hash, "fetched transaction hash does not match the recorded claim");
+    claim_withdrawals::recorded_claim_batch(ConsensusTransaction::input(&transaction))
+}
+
+fn held_pending(
+    pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    leaf: &str,
+    chain: Option<u8>,
+) -> Option<propose_withdrawals::PendingWithdrawal> {
+    pending
+        .values()
+        .find(|withdrawal| withdrawal.leaf_hash == leaf && chain.is_none_or(|chain| withdrawal.destination_chain_index == u64::from(chain)))
+        .cloned()
+}
+
+async fn release_claim_holds<P: alloy_provider::Provider>(
+    provider: &P,
+    bridge: &str,
+    pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
+    claim_retry: &mut HashMap<String, claim_attempts::ClaimAttempts>,
+    scan_start: u64,
+    chain: Option<u8>,
+) -> anyhow::Result<Vec<HoldResolution>> {
+    let bridge_address = Address::from_str(bridge).context("invalid bridge address")?;
+    let mut resolved = Vec::new();
+    let mut held: Vec<String> = claim_retry
+        .iter()
+        .filter(|(_, state)| !matches!(state.hold, claim_attempts::ClaimHold::None))
+        .map(|(leaf, _)| leaf.clone())
+        .collect();
+    held.sort();
+    let mut held_by_tx: BTreeMap<alloy_primitives::B256, Vec<String>> = BTreeMap::new();
+    for leaf in held {
+        let hold = claim_retry.get(&leaf).map(|state| state.hold.clone()).unwrap_or_default();
+        match hold {
+            claim_attempts::ClaimHold::OperatorPending(code) => {
+                let Some(withdrawal) = held_pending(pending, &leaf, chain) else { continue };
+                match claim_withdrawals::operator_condition_cleared(provider, bridge_address, &withdrawal, code).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            leaf_hash = %leaf,
+                            nonce = %claim_withdrawals::nonce_hex(withdrawal.nonce),
+                            reason = code.label(),
+                            action = "released",
+                            "operator hold cleared; leaf returns to the normal round"
+                        );
+                        claim_attempts::release_hold(claim_retry, &leaf);
+                    }
+                    Ok(false) => {
+                        tracing::info!(
+                            leaf_hash = %leaf,
+                            nonce = %claim_withdrawals::nonce_hex(withdrawal.nonce),
+                            reason = code.label(),
+                            action = "held",
+                            "operator hold still applies; no send"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            leaf_hash = %leaf,
+                            nonce = %claim_withdrawals::nonce_hex(withdrawal.nonce),
+                            error = %error,
+                            action = "held",
+                            "operator hold recheck failed; leaf stays held"
+                        );
+                    }
+                }
+            }
+            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None } => {
+                let Some(withdrawal) = held_pending(pending, &leaf, chain) else { continue };
+                tracing::error!(
+                    leaf_hash = %leaf,
+                    nonce = %claim_withdrawals::nonce_hex(withdrawal.nonce),
+                    action = "held",
+                    "claim send produced no transaction hash; held for manual reconciliation, no retry"
+                );
+            }
+            claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(tx_hash) } => {
+                held_by_tx.entry(tx_hash).or_default().push(leaf);
+            }
+            claim_attempts::ClaimHold::None => {}
+        }
+    }
+    // A recorded transaction is read once, and every pending leaf held on it is
+    // accounted from that single read: receipt, pin, and decoded batch are
+    // shared, so a full batch is applied once for all its leaves instead of
+    // one re-apply per leaf.
+    for (tx_hash, leaves) in held_by_tx {
+        let group: Vec<propose_withdrawals::PendingWithdrawal> =
+            leaves.iter().filter_map(|leaf| held_pending(pending, leaf, chain)).collect();
+        if group.is_empty() { continue; }
+        let recorded = match recorded_claim_tx(provider, tx_hash).await {
+            Ok(Some(recorded)) => recorded,
+            Ok(None) => {
+                tracing::warn!(
+                    tx_hash = %format!("{tx_hash:#x}"),
+                    leaves = group.len(),
+                    action = "held",
+                    "recorded claim transaction has no receipt; held, no new send"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tx_hash = %format!("{tx_hash:#x}"),
+                    leaves = group.len(),
+                    error = %error,
+                    action = "held",
+                    "recorded claim receipt read failed; held, no new send"
+                );
+                continue;
+            }
+        };
+        if !recorded.receipt.status() {
+            for withdrawal in &group {
+                resolved.push(HoldResolution {
+                    withdrawals: vec![withdrawal.clone()],
+                    report: claim_withdrawals::reverted_claim_report(withdrawal),
+                });
+            }
+            tracing::info!(
+                tx_hash = %format!("{tx_hash:#x}"),
+                leaves = group.len(),
+                action = "accounted",
+                "recorded claim transaction reverted; every held leaf it carried is accounted without a new send"
+            );
+            continue;
+        }
+        let (batch, call_data) = match recorded_claim_batch(provider, tx_hash).await {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::warn!(
+                    tx_hash = %format!("{tx_hash:#x}"),
+                    leaves = group.len(),
+                    error = %error,
+                    action = "held",
+                    "recorded claim input decode failed; held, no new send"
+                );
+                continue;
+            }
+        };
+        let report = claim_withdrawals::apply_recorded_claim_receipt(
+            provider,
+            bridge_address,
+            &recorded.receipt,
+            &batch,
+            &group[0],
+            &call_data,
+            scan_start,
+            Some(&recorded.pin),
+            tx_hash,
+        )
+        .await;
+        let accounted: Vec<propose_withdrawals::PendingWithdrawal> = group
+            .iter()
+            .filter(|withdrawal| report.outcomes.iter().any(|outcome| outcome.leaf_hash == withdrawal.leaf_hash))
+            .cloned()
+            .collect();
+        for withdrawal in &group {
+            if !accounted.iter().any(|kept| kept.leaf_hash == withdrawal.leaf_hash) {
+                tracing::error!(
+                    leaf_hash = %withdrawal.leaf_hash,
+                    tx_hash = %format!("{tx_hash:#x}"),
+                    action = "held",
+                    "held leaf is not part of the recorded claim batch; stays held for manual reconciliation"
+                );
+            }
+        }
+        if accounted.is_empty() { continue; }
+        tracing::info!(
+            tx_hash = %format!("{tx_hash:#x}"),
+            leaves = accounted.len(),
+            action = "accounted",
+            "recorded claim transaction has a receipt; the whole held group is accounted from one read without a new send"
+        );
+        resolved.push(HoldResolution { withdrawals: accounted, report });
+    }
+    Ok(resolved)
+}
+
 async fn claim_withdrawal_chunks(
     withdrawals: &[propose_withdrawals::PendingWithdrawal],
     config: &BridgeProposeDaemonConfig,
     l1_rpc: &str,
     bridge_addr: &str,
     prove_proxy_url: Option<&str>,
+    before_broadcast: Option<claim_withdrawals::BeforeBroadcast>,
 ) -> anyhow::Result<claim_withdrawals::BatchWithdrawalsReport> {
     let mut total = claim_withdrawals::BatchWithdrawalsReport {
         requested: 0,
         submitted_count: 0,
-        already_claimed_count: 0,
-        resolved_leaf_hashes: Vec::new(),
-        failure_reasons: HashMap::new(),
-        deferrals: HashMap::new(),
+        outcomes: Vec::new(),
     };
     let deployments_network = config
         .finalize
@@ -430,7 +681,7 @@ async fn claim_withdrawal_chunks(
         multicall3 = %multicall3_addr.as_deref().unwrap_or("none"),
         "claiming withdrawals"
     );
-    let report = claim_withdrawals::submit_batch(
+    let report = claim_withdrawals::submit_batch_with_hook(
         withdrawals,
         &config.services_url,
         l1_rpc,
@@ -442,14 +693,12 @@ async fn claim_withdrawal_chunks(
         config.finalize.password_env.as_deref().unwrap_or("WALLET_PASSWORD"),
         prove_proxy_url,
         config.finalize.fee_policy.as_ref(),
+        before_broadcast,
     )
     .await?;
     total.requested += report.requested;
     total.submitted_count += report.submitted_count;
-    total.already_claimed_count += report.already_claimed_count;
-    total.resolved_leaf_hashes.extend(report.resolved_leaf_hashes);
-    total.failure_reasons.extend(report.failure_reasons);
-    total.deferrals.extend(report.deferrals);
+    total.outcomes.extend(report.outcomes);
 
     Ok(total)
 }
@@ -459,6 +708,7 @@ mod tests {
     use super::*;
     use crate::bridge::rpc_providers::RpcProviderConfig;
     use std::path::PathBuf;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn business_callback_runs_once_and_synchronous_setup_is_scoped() {
@@ -485,6 +735,101 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(calls, 1);
     }
+
+    fn held_withdrawal(leaf: &str) -> propose_withdrawals::PendingWithdrawal {
+        propose_withdrawals::PendingWithdrawal {
+            event_id: 1, checkpoint_id: 1, user_id: 1, sender_user_id: 1, contract_id: 0,
+            destination_chain_index: 0, token_address: [0; 8], amount: [0, 0, 0, 0, 0, 0, 0, 1],
+            recipient: [0; 8], nonce: [0; 8], leaf_hash: leaf.to_string(),
+        }
+    }
+
+    /// One JSON-RPC responder. `eth_getTransactionReceipt` answers `receipt`;
+    /// every other call answers `other`.
+    async fn serve_receipt(receipt: Option<String>, other: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let (read, mut write) = socket.split();
+                let mut reader = tokio::io::BufReader::new(read);
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap() == 0 { break; }
+                    if line == "\r\n" { break; }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") { length = value.trim().parse().unwrap_or(0); }
+                    }
+                }
+                let mut body = vec![0; length];
+                if length > 0 { reader.read_exact(&mut body).await.unwrap(); }
+                let request = String::from_utf8_lossy(&body);
+                let payload = if request.contains("eth_getTransactionReceipt") {
+                    receipt.clone().unwrap_or_else(|| "null".to_string())
+                } else {
+                    other.to_string()
+                };
+                let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{payload}}}");
+                let _ = AsyncWriteExt::write_all(&mut write, format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len(),
+                ).as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_recorded_transaction_without_a_receipt_is_not_released() {
+        let url = serve_receipt(None, "null").await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let withdrawal = held_withdrawal("inflight");
+        let pending = HashMap::from([("inflight".to_string(), withdrawal)]);
+        let mut retry = HashMap::new();
+        claim_attempts::hold_for_receipt(&mut retry, "inflight", Some(alloy_primitives::B256::repeat_byte(0x11)));
+
+        let resolved = release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None).await.unwrap();
+
+        assert!(resolved.is_empty(), "no receipt means nothing to account");
+        assert!(matches!(retry["inflight"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: Some(_) }));
+    }
+
+    #[tokio::test]
+    async fn a_hold_without_a_transaction_hash_stays_held() {
+        let url = serve_receipt(None, "null").await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let pending = HashMap::from([("lost".to_string(), held_withdrawal("lost"))]);
+        let mut retry = HashMap::new();
+        claim_attempts::hold_for_receipt(&mut retry, "lost", None);
+
+        let resolved = release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None).await.unwrap();
+
+        assert!(resolved.is_empty());
+        assert!(matches!(retry["lost"].hold, claim_attempts::ClaimHold::ReceiptUnknown { tx_hash: None }));
+    }
+
+    #[tokio::test]
+    async fn a_pause_releases_only_when_the_flag_is_clear() {
+        // getPauseFlags returns (global, token, effective), each a 32-byte word.
+        let paused_flags = "\"0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000002\"";
+        let url = serve_receipt(None, paused_flags).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        let pending = HashMap::from([("paused".to_string(), held_withdrawal("paused"))]);
+        let mut retry = HashMap::new();
+        claim_attempts::hold_for_operator(&mut retry, "paused", claim_withdrawals::ClaimCode::RegistrationPaused);
+
+        release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None).await.unwrap();
+        assert!(matches!(retry["paused"].hold, claim_attempts::ClaimHold::OperatorPending(_)), "flag 2 still set");
+
+        let clear_flags = "\"0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"";
+        let url = serve_receipt(None, clear_flags).await;
+        let provider = connect_l1_readonly(url.parse().unwrap()).unwrap();
+        release_claim_holds(&provider, "0x00000000000000000000000000000000000000b1", &pending, &mut retry, 1, None).await.unwrap();
+        assert!(matches!(retry["paused"].hold, claim_attempts::ClaimHold::None), "a cleared flag releases the hold and keeps its reason");
+    }
+
 
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();

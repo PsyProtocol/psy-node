@@ -293,6 +293,8 @@ pub async fn prepare_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
     Ok(psy_db)
 }
 
+/// Open a store, creating keyspaces and tables only when `create_tables` is true.
+/// Otherwise both keyspaces must already exist; only statements are prepared.
 pub async fn setup_psy_scylla_database_store_from_connection_string<N: QNetworkDatabaseTypes>(
     keyspace: &str,
     connection_string: &str,
@@ -303,13 +305,13 @@ pub async fn setup_psy_scylla_database_store_from_connection_string<N: QNetworkD
     }
     let addresses = connection_string.split(",").map(|s| s.to_string()).collect::<Vec<String>>();
 
-    let scylla_db = ScyllaCoreStore::new(0, 0, keyspace.to_string(), &addresses).await?;
-
     if create_tables {
-        // Processor nodes: create tables then prepare statements
+        // Processor nodes: create keyspaces and tables, then prepare statements.
+        let scylla_db = ScyllaCoreStore::new(0, 0, keyspace.to_string(), &addresses).await?;
         setup_psy_scylla_database_store::<N>(Arc::new(scylla_db)).await
     } else {
-        // Edge nodes: only prepare statements, assume tables exist
+        // Existing stores: validate keyspaces and prepare statements without DDL.
+        let scylla_db = ScyllaCoreStore::open_existing(0, 0, keyspace.to_string(), &addresses).await?;
         prepare_psy_scylla_database_store::<N>(Arc::new(scylla_db)).await
     }
 }

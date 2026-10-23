@@ -11,6 +11,9 @@ pub mod generate_genesis;
 pub mod rollback;
 pub mod inspect_anvil_state;
 pub mod fresh_devnet_state;
+pub mod bridge_database;
+pub mod restore_bridge_state;
+pub(crate) mod bridge_state_snapshot;
 
 use chain_info::ChainInfoArgs;
 use generate_genesis::GenerateGenesisDataArgs;
@@ -52,6 +55,8 @@ pub enum Commands {
     GenerateGenesisData(GenerateGenesisDataArgs),
     #[command(name = "fresh-devnet-state", about = "Reset owned devnet state under exclusive database locks; the canonical configuration is read-only")]
     FreshDevnetState(FreshDevnetStateArgs),
+    #[command(name = "restore-bridge-state", about = "Rebuild the four bridge journals from checkpoint T after every role-local rollback has completed")]
+    RestoreBridgeState(restore_bridge_state::RestoreBridgeStateArgs),
 }
 
 #[derive(Parser, Debug)]

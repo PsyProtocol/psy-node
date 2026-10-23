@@ -146,7 +146,25 @@ pub fn connect_l1_readonly(rpc_url: Url) -> Result<impl Provider> {
     Ok(ProviderBuilder::new().connect_client(client))
 }
 
-pub fn connect_l1_with_wallet(rpc_url: Url, wallet: EthereumWallet) -> Result<impl Provider> {
+pub type ClaimWalletProvider = alloy_provider::fillers::FillProvider<
+    alloy_provider::fillers::JoinFill<
+        alloy_provider::fillers::JoinFill<
+            alloy_provider::Identity,
+            alloy_provider::fillers::JoinFill<
+                alloy_provider::fillers::GasFiller,
+                alloy_provider::fillers::JoinFill<
+                    alloy_provider::fillers::BlobGasFiller,
+                    alloy_provider::fillers::JoinFill<alloy_provider::fillers::NonceFiller, alloy_provider::fillers::ChainIdFiller>,
+                >,
+            >,
+        >,
+        alloy_provider::fillers::WalletFiller<EthereumWallet>,
+    >,
+    alloy_provider::RootProvider,
+    alloy_network::Ethereum,
+>;
+
+pub fn connect_l1_with_wallet(rpc_url: Url, wallet: EthereumWallet) -> Result<ClaimWalletProvider> {
     let client = build_rpc_client(rpc_url)?;
     Ok(ProviderBuilder::new().wallet(wallet).connect_client(client))
 }

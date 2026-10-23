@@ -1,7 +1,5 @@
 packages:
   - "generated"
 allowBuilds:
-  rescript: set this to true or false
-onlyBuiltDependencies:
-  - rescript
-  - esbuild
+  esbuild: true
+  rescript: true

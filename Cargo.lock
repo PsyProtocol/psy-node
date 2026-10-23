@@ -4014,7 +4014,10 @@ name = "guardian_common"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "alloy-sol-types",
  "anyhow",
+ "base64 0.22.1",
  "bincode",
  "hex",
  "home",
@@ -4025,6 +4028,7 @@ dependencies = [
  "psy_config",
  "psy_crypto",
  "psy_plonky2_basic_helpers",
+ "psy_plonky2_common_circuits",
  "psy_prover",
  "psy_provider",
  "psy_vm",
@@ -11816,8 +11820,8 @@ version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
- "cfg-if 1.0.4",
- "rand 0.8.5",
+ "cfg-if 0.1.10",
+ "rand 0.7.3",
  "static_assertions",
 ]
 

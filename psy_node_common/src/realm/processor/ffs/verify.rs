@@ -220,13 +220,12 @@ where
             {
                 let (tree_id, tree_sub_id, leaf_index, leaf_hash, leaf_key, _, next_key, next_index, is_new_key) =
                     deserialize_imt_leaf_ffs_entry_v2(chunk)?;
-                finals.entry((tree_id, tree_sub_id, leaf_index)).or_insert((
-                    leaf_hash,
-                    leaf_key,
-                    next_key,
-                    next_index,
-                    is_new_key,
-                ));
+                // First-encountered record is the newest; keep its hash/key/next
+                // binding and OR is_new_key across this index's records.
+                finals
+                    .entry((tree_id, tree_sub_id, leaf_index))
+                    .and_modify(|entry| entry.4 |= is_new_key)
+                    .or_insert((leaf_hash, leaf_key, next_key, next_index, is_new_key));
             }
         }
         let heights = load_previous_contract_heights(

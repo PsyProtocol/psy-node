@@ -161,10 +161,11 @@ where
     H: MerkleZeroHasher<Hash> + FieldQHasher<F, Hash>,
 {
     require_width(bytes, IMT_LEAF_FFS_ENTRY_SIZE_V2, "IMT leaf FFS")?;
-    let mut first: HashMap<(u64, u64, u64), ([u8; 32], bool)> = HashMap::new();
+    let mut first: HashMap<(u64, u64, u64), [u8; 32]> = HashMap::new();
     let mut first_key_index: HashMap<(u64, u64, [u8; 32]), u64> = HashMap::new();
-    let mut first_new_keys: HashSet<(u64, u64, [u8; 32])> = HashSet::new();
-    for chunk in bytes.chunks_exact(IMT_LEAF_FFS_ENTRY_SIZE_V2) {
+    // The encoded stream is newest-first; iterate chronologically so a key's
+    // birth record is seen before its later update records.
+    for chunk in bytes.chunks_exact(IMT_LEAF_FFS_ENTRY_SIZE_V2).rev() {
         let (tree_id, tree_sub_id, leaf_index, leaf_hash, leaf_key, leaf_value, next_key, next_index, is_new_key) =
             deserialize_imt_leaf_ffs_entry_v2(chunk)?;
         let leaf = IMTContractStateLeaf::<F, Hash> {
@@ -186,21 +187,16 @@ where
         } else {
             first_key_index.insert(key_id, leaf_index);
         }
-        if let Some((first_key, first_new)) = first.get(&id) {
-            if is_new_key && !first_new_keys.contains(&key_id) {
-                anyhow::bail!("InvalidStateUpdates: duplicate IMT key changed derived next fields");
-            }
-            if !*first_new && is_new_key {
-                anyhow::bail!("InvalidStateUpdates: duplicate IMT key changed derived next fields");
-            }
+        if let Some(first_key) = first.get(&id) {
+            anyhow::ensure!(
+                !is_new_key,
+                "InvalidStateUpdates: duplicate IMT birth user={tree_id} contract={tree_sub_id} index={leaf_index}"
+            );
             if *first_key != leaf_key {
                 anyhow::bail!("InvalidStateUpdates: duplicate IMT key changed derived next fields");
             }
         } else {
-            first.insert(id, (leaf_key, is_new_key));
-            if is_new_key {
-                first_new_keys.insert(key_id);
-            }
+            first.insert(id, leaf_key);
         }
     }
     let mut finals: HashMap<(u64, u64, u64), ([u8; 32], [u8; 32], u64)> = HashMap::new();
@@ -401,5 +397,111 @@ mod tests {
             .expect_err("terminal IMT next_index=0 with nonzero next_key must fail");
         assert!(error.to_string().contains("InvalidStateUpdates"), "{error}");
         assert!(error.to_string().contains("terminal next_key"), "{error}");
+    }
+
+    #[test]
+    fn history_imt_lifecycle_is_chronological() {
+        let zero = PGoldilocksHash::from_owned_32bytes([0u8; 32]);
+        // Newest-first encoding, interleaved across indices: checkpoint-final
+        // (is_new=false) records for both indices precede their older birth
+        // (is_new=true) records. Birth records carry distinct value/next fields
+        // so a mistaken reversal of the final-pointer first-wins pass is detected
+        // (birth_b's next_key does not match the key at its declared next_index).
+        let key_a = PGoldilocksHash::from_owned_32bytes([0x22; 32]);
+        let key_b = PGoldilocksHash::from_owned_32bytes([0x55; 32]);
+        let key_c = PGoldilocksHash::from_owned_32bytes([0x77; 32]);
+        let value_a_final = PGoldilocksHash::from_owned_32bytes([0x33; 32]);
+        let value_b_final = PGoldilocksHash::from_owned_32bytes([0x44; 32]);
+        let value_a_birth = PGoldilocksHash::from_owned_32bytes([0x66; 32]);
+        let value_b_birth = PGoldilocksHash::from_owned_32bytes([0x88; 32]);
+        let final_a = IMTContractStateLeaf::<PGoldilocksFelt, PGoldilocksHash> {
+            key: key_a,
+            value: value_a_final,
+            next_key: key_b,
+            next_index: parth_core::felt::FromPrimitiveValuesFelt::from_u64_value(4),
+        };
+        let final_b = IMTContractStateLeaf::<PGoldilocksFelt, PGoldilocksHash> {
+            key: key_b,
+            value: value_b_final,
+            next_key: zero,
+            next_index: parth_core::felt::FromPrimitiveValuesFelt::from_u64_value(0),
+        };
+        let birth_a = IMTContractStateLeaf::<PGoldilocksFelt, PGoldilocksHash> {
+            key: key_a,
+            value: value_a_birth,
+            next_key: key_b,
+            next_index: parth_core::felt::FromPrimitiveValuesFelt::from_u64_value(4),
+        };
+        let birth_b = IMTContractStateLeaf::<PGoldilocksFelt, PGoldilocksHash> {
+            key: key_b,
+            value: value_b_birth,
+            next_key: key_c,
+            next_index: parth_core::felt::FromPrimitiveValuesFelt::from_u64_value(3),
+        };
+        let mut interleaved = Vec::new();
+        for (leaf, index, next_index, is_new) in [
+            (&final_a, 3u64, 4u64, false),
+            (&final_b, 4, 0, false),
+            (&birth_a, 3, 4, true),
+            (&birth_b, 4, 3, true),
+        ] {
+            let hash = leaf.qfhash::<PoseidonHasher>();
+            interleaved.extend_from_slice(&psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+                1, 0, index, &hash, &leaf.key, &leaf.value, &leaf.next_key, next_index, is_new,
+            ));
+        }
+        require_imt_leaf_ffs_consistency::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&interleaved)
+            .expect("newest finals before older births across indices must pass chronological lifecycle");
+        // Negative: chronological existing/update-only state cannot later claim
+        // birth, so the newest-first encoding puts the true claims first.
+        let mut late_birth = Vec::new();
+        for (leaf, index, next_index, is_new) in [
+            (&birth_a, 3u64, 4u64, true),
+            (&birth_b, 4, 3, true),
+            (&final_a, 3, 4, false),
+            (&final_b, 4, 0, false),
+        ] {
+            let hash = leaf.qfhash::<PoseidonHasher>();
+            late_birth.extend_from_slice(&psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+                1, 0, index, &hash, &leaf.key, &leaf.value, &leaf.next_key, next_index, is_new,
+            ));
+        }
+        let error =
+            require_imt_leaf_ffs_consistency::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&late_birth)
+                .expect_err("chronological existing state cannot later claim birth");
+        assert!(error.to_string().contains("InvalidStateUpdates"), "{error}");
+        // Negative: the producer emits at most one birth per index, so a
+        // duplicate birth with identical preimages is invalid.
+        let mut twin_birth = Vec::new();
+        for _ in 0..2 {
+            let hash = birth_a.qfhash::<PoseidonHasher>();
+            twin_birth.extend_from_slice(&psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+                1, 0, 3, &hash, &birth_a.key, &birth_a.value, &birth_a.next_key, 4, true,
+            ));
+        }
+        let error =
+            require_imt_leaf_ffs_consistency::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(&twin_birth)
+                .expect_err("duplicate IMT birth with identical preimages must fail");
+        assert!(error.to_string().contains("InvalidStateUpdates"), "{error}");
+        // Negative: at most one birth per index — divergent preimages claiming
+        // the same key's birth are also rejected.
+        let birth_a_again = IMTContractStateLeaf::<PGoldilocksFelt, PGoldilocksHash> {
+            key: key_a,
+            value: value_b_birth,
+            next_key: key_b,
+            next_index: parth_core::felt::FromPrimitiveValuesFelt::from_u64_value(4),
+        };
+        let mut divergent_birth = Vec::new();
+        for leaf in [&birth_a, &birth_a_again] {
+            let hash = leaf.qfhash::<PoseidonHasher>();
+            divergent_birth.extend_from_slice(&psy_data::v1::qdata::contract::serialize_imt_leaf_ffs_entry_v2(
+                1, 0, 3, &hash, &leaf.key, &leaf.value, &leaf.next_key, 4, true,
+            ));
+        }
+        let error = require_imt_leaf_ffs_consistency::<PGoldilocksFelt, PGoldilocksHash, PoseidonHasher>(
+            &divergent_birth,
+        )
+        .expect_err("duplicate IMT birth with divergent preimages must fail");
+        assert!(error.to_string().contains("InvalidStateUpdates"), "{error}");
     }
 }

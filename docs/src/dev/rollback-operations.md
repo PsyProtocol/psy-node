@@ -18,7 +18,7 @@ Use five independent RPs to roll back the default local stack: one Coordinator a
 
 This procedure requires the default foreground stack on loopback, realms 0 and 1, two validators per Realm, one edge per validator, and one Coordinator edge. It does not cover a custom topology, daemonized stack, or remote network (`Makefile:96-99`; `dev/locSetupV4.ts:1004-1007,1125-1135,4195-4206,4224-4239,4293-4317`).
 
-**Never follow the current rollback CLI success text that suggests `make run-all`. Use only `make rollback-resume` after every RP and external recovery are complete.** The text is stale relative to the canonical lifecycle (`psy_cli/psy_dev_cli/src/subcommand/rollback.rs:139-156`; `docs/src/dev/devnet_lifecycle.md:190-199`).
+**Follow the current rollback CLI success text.** After every role-local plan has executed, run `restore-bridge-state` once with `--rpc-config "$PSY_CONFIG_PATH"` (`./local_checkpoints/realm_p2p/config.json`, not `psy-genesis/config.json`), then use `make rollback-resume` only after it reports journal-restore completion (`psy_cli/psy_dev_cli/src/subcommand/rollback.rs:139-156`; `docs/src/dev/devnet_lifecycle.md:430-439`).
 
 ## Table of contents
 
@@ -181,7 +181,7 @@ rollback_realm 1 2 --generate
 
 **Finish all five generation commands before any execution.** Coordinator generation requires the explicit nonempty reward Realm set; Realm generation uses its own Realm automatically. `--reward-realm-id` belongs only to generation (`psy_cli/psy_dev_cli/src/subcommand/rollback.rs:23-32`; `psy_cli/psy_dev_cli/src/subcommand/rollback/generate.rs:485-518`).
 
-These commands intentionally omit `--target-contract-state`. It is optional, generation-only, and retains a snapshot only when `last_finalized_checkpoint_id` equals `TARGET`. If attaching a separately recorded snapshot, assign its existing JSON path to `TARGET_CONTRACT_STATE` and append `--target-contract-state "$TARGET_CONTRACT_STATE"` to generation commands **before generating the set**. Do not add it to execution. Its fields are defined in `psy_node_common/src/rollback/plan.rs:72-90`; filtering occurs at `psy_node_common/src/rollback/generator.rs:847`. An omitted or mismatched snapshot does not block local rollback; **L1 force-state and relayer recovery are separate operator work**, never performed by this executor (`docs/src/dev/devnet_lifecycle.md:190,203`; `psy_cli/psy_dev_cli/src/subcommand/rollback.rs:148-159`).
+These commands intentionally omit `--target-contract-state`. It is optional, generation-only, and retains a snapshot only when `last_finalized_checkpoint_id` equals `TARGET`. If attaching a separately recorded snapshot, assign its existing JSON path to `TARGET_CONTRACT_STATE` and append `--target-contract-state "$TARGET_CONTRACT_STATE"` to generation commands **before generating the set**. Do not add it to execution. Its fields are defined in `psy_node_common/src/rollback/plan.rs:72-90`; filtering occurs at `psy_node_common/src/rollback/generator.rs:847`. An omitted or mismatched snapshot does not block local rollback; **L1 force-state remains separate operator work, and bridge journals are restored by `psy_dev_cli restore-bridge-state --rpc-config "$PSY_CONFIG_PATH"` before resume**, never by this executor (`docs/src/dev/devnet_lifecycle.md:430-439`; `psy_cli/psy_dev_cli/src/subcommand/rollback.rs:139-159`).
 
 ## 5. Inspect and validate the frozen RPs
 
@@ -276,7 +276,7 @@ If the operator shell was lost, return to the same repository root, restore `WOR
 
 ## 8. Resume and post-E2E acceptance
 
-Only after `check_all_plans completed` succeeds and the separately authorized L1/relayer recovery is verified complete:
+Only after `check_all_plans completed` succeeds and `restore-bridge-state --rpc-config "$PSY_CONFIG_PATH"` has reported journal-restore completion, with any separately authorized L1 recovery verified:
 
 ```bash
 make rollback-resume

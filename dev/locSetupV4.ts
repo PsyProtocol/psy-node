@@ -1028,6 +1028,8 @@ export class RunningProcess {
                         const host = guardianListener.host.includes(":") ? `[${guardianListener.host}]` : guardianListener.host;
                         await waitForHttpUrl(`http://${host}:${guardianListener.port}/v1/ready`, {
                             // One account read; it does not share the observer lock or session page.
+                            // No fallback to an older binary: the devnet shares one source tree, so a
+                            // guardian built from a different revision is a setup error, not a retry.
                             attempts: 1, timeoutMs: Math.min(1_500, remainingMs), name: "guardian-service ready",
                             validateResponse: guardianServiceReady,
                         });
@@ -1920,13 +1922,13 @@ export async function guardianSessionsReady(response: Response): Promise<boolean
         && Number.isInteger(page.next_after_nonce) && page.next_after_nonce >= 0
         && typeof page.has_more === "boolean";
 }
-/** HTTP 200 only when the runtime account is initialized and not halted. */
+/** HTTP 200 only when the runtime account is initialized and not halted. `network_magic` is a configured u64; JSON number parsing loses precision, so this check is status only and must not compare identity. */
 export async function guardianServiceReady(response: Response): Promise<boolean> {
     if (response.status !== 200) return false;
     const body = await response.json();
     return !!body && body.schema_version === 3 && body.runtime_initialized === true && body.halted === false
         && typeof body.user_id === "number" && Number.isSafeInteger(body.user_id) && body.user_id >= 0
-        && typeof body.network_magic === "number" && Number.isSafeInteger(body.network_magic) && body.network_magic > 0;
+        && typeof body.network_magic === "number" && Number.isInteger(body.network_magic) && body.network_magic > 0;
 }
 
 
@@ -4228,11 +4230,10 @@ async function resetScopedDevnetState(cwd: string, targets: ScopedDevnetReset): 
     await stopRepoAnvilsForPurge(cwd);
     const failures: string[] = [];
     if (targets.containers.length > 0) {
-        await runBoundedTeardown("fresh-docker-stop", ["docker", "stop", ...targets.containers], undefined, failures);
-        if (failures.length > 0) throw new Error("[DevNet] could not stop owned containers");
-        await runBoundedTeardown("fresh-docker-rm", ["docker", "rm", ...targets.containers], undefined, failures);
+        await removeOwnedContainersForPurge(targets.containers, failures, "fresh-docker");
+        if (failures.length > 0) throw new Error(`[DevNet] could not remove owned containers: ${failures.join(" | ")}`);
     }
-    if (targets.volumes.length > 0) await runBoundedTeardown("fresh-volume-rm", ["docker", "volume", "rm", ...targets.volumes], undefined, failures);
+    if (targets.volumes.length > 0) await runBoundedTeardown("fresh-volume-rm", ["docker", "volume", "rm", "-f", ...targets.volumes], undefined, failures);
     if (failures.length > 0) throw new Error(`[DevNet] fresh startup namespace cleanup failed: ${failures.join(" | ")}`);
 }
 
@@ -4612,12 +4613,17 @@ async function startEnvioIndexerForRelayer(
 }
 
 const PURGE_DOCKER_TIMEOUT_MS = 15_000;
+/** Seconds Docker may wait for a container's own stop handler before purge escalates. */
+const PURGE_DOCKER_STOP_GRACE_SECONDS = 10;
+
 const PURGE_ANVIL_SIGNAL_WAIT_MS = 5_000;
 
 export interface TeardownCommandResult {
     argv0: string;
     code: number | null;
     timedOut: boolean;
+    /** False when the deadline fired and the client was not reaped inside the extra second. */
+    reaped: boolean;
     stderrCategory: "empty" | "present";
     stdout: string;
     stdoutComplete: boolean;
@@ -4676,7 +4682,8 @@ export async function runTeardownCommand(argv: string[], cwd: string | undefined
     return {
         argv0: argv[0] ?? "",
         code: timedOut || !result ? null : result[0],
-        timedOut: timedOut || !result,
+        timedOut,
+        reaped: !!result,
         stderrCategory: !result || result[2].text.trim() ? "present" : "empty",
         stdout: result?.[1].text.trim() ?? "",
         stdoutComplete: !timedOut && !!result?.[1].complete,
@@ -4905,9 +4912,34 @@ async function runBoundedTeardown(phase: string, argv: string[], cwd: string | u
         return result;
     } catch (error) {
         failures.push(`${phase} ${argv[0] ?? ""} spawn failed: ${error instanceof Error ? error.message : String(error)}`);
-        return { argv0: argv[0] ?? "", code: null, timedOut: false, stderrCategory: "present", stdout: "", stdoutComplete: false };
+        return { argv0: argv[0] ?? "", code: null, timedOut: false, reaped: false, stderrCategory: "present", stdout: "", stdoutComplete: false };
     }
 }
+/** Explicit purge/fresh only: bounded stop, then force-remove the exact owned names.
+ * A stop timeout is ignored only when that stop client was reaped and `docker rm -f` succeeded.
+ * An unreaped stop client is fatal even if force-remove reports success. */
+export async function removeOwnedContainersForPurge(
+    containers: readonly string[],
+    failures: string[],
+    phase: string,
+    run: (argv: string[], cwd: string | undefined, timeoutMs: number) => Promise<TeardownCommandResult> = runTeardownCommand,
+): Promise<void> {
+    if (containers.length === 0) return;
+    const before = failures.length;
+    const stop = await run(
+        ["docker", "stop", "-t", String(PURGE_DOCKER_STOP_GRACE_SECONDS), ...containers],
+        undefined,
+        (PURGE_DOCKER_STOP_GRACE_SECONDS * 1_000) + 1_000,
+    );
+    try {
+        const removed = await run(["docker", "rm", "-f", ...containers], undefined, PURGE_DOCKER_TIMEOUT_MS);
+        if (removed.timedOut || removed.code !== 0 || !removed.stdoutComplete) failures.push(formatTeardownFailure(`${phase}-rm`, removed));
+    } catch (error) {
+        failures.push(`${phase}-rm docker spawn failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!stop.reaped || (failures.length > before && (stop.timedOut || stop.code !== 0))) failures.push(formatTeardownFailure(`${phase}-stop`, stop));
+}
+
 
 export function exactSnapshotNames(stdout: string): Set<string> {
     return new Set(stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0));
@@ -4928,8 +4960,7 @@ async function purgeDockerCleanup(cwd: string, failures: string[]): Promise<bool
     const liveContainers = containerTargets.filter((name) => containerNames.has(name));
     const liveVolumes = volumeTargets.filter((name) => volumeNames.has(name));
     if (liveContainers.length > 0) {
-        await runBoundedTeardown("docker-stop", ["docker", "stop", ...liveContainers], undefined, failures);
-        await runBoundedTeardown("docker-rm", ["docker", "rm", "-f", ...liveContainers], undefined, failures);
+        await removeOwnedContainersForPurge(liveContainers, failures, "docker");
     }
     if (liveVolumes.length > 0) await runBoundedTeardown("volume-rm", ["docker", "volume", "rm", "-f", ...liveVolumes], undefined, failures);
     if (await exists(composeFile)) {
@@ -5052,8 +5083,23 @@ export interface DevnetUiListenerControl {
     leaderAlive?: (pgrp: number) => boolean;
     sleep?: (ms: number) => Promise<void>;
 }
+/** Node listener sharing this app cwd, led by that same node or the exact `bun run dev` wrapper. */
+function ownedDevnetUiLeader(leader: AnvilProcessIdentity, listener: AnvilProcessIdentity, port: number): boolean {
+    if (leader.cwd !== listener.cwd || path.basename(listener.exe) !== "node") return false;
+    if (leader.exe === listener.exe) return true;
+    if (path.basename(leader.exe) !== "bun") return false;
+    const args = leader.cmdline.split("\0");
+    if (args.at(-1) === "") args.pop();
+    return args.length === 9
+        && path.basename(args[0] ?? "") === "bun"
+        && args[1] === "run" && args[2] === "dev" && args[3] === "--"
+        && args[4] === "--host" && args[5] === "0.0.0.0"
+        && args[6] === "--port" && args[7] === String(port)
+        && args[8] === "--strictPort";
+}
 
-/** SIGTERM then SIGKILL only a node group whose listener and leader share this checkout app cwd, exe, and uid. */
+
+/** SIGTERM then SIGKILL only an owned node listener whose group leader is that node or the exact bun dev wrapper. */
 export async function stopOwnedDevnetUiListeners(repoRoot: string, control: DevnetUiListenerControl = {}): Promise<void> {
     const canonical = await fs.promises.realpath(repoRoot);
     const appsRoot = `${canonical}${path.sep}psy-dapp${path.sep}apps${path.sep}`;
@@ -5107,7 +5153,7 @@ export async function stopOwnedDevnetUiListeners(repoRoot: string, control: Devn
         if (pgrp === null || protectedPids.has(pgrp)) throw new Error(`[DevNet] port ${port} process group is not an owned devnet UI process`);
         const leader = await readIdentity(pgrp);
         const leaderUid = await readUid(pgrp);
-        if (!leader || leaderUid !== uid || leader.exe !== identity.exe || path.basename(identity.exe) !== "node" || leader.cwd !== cwd) {
+        if (!leader || leaderUid !== uid || !ownedDevnetUiLeader(leader, identity, port)) {
             throw new Error(`[DevNet] port ${port} process group leader is not the owned listener context`);
         }
         const leaderAgain = await readIdentity(pgrp);

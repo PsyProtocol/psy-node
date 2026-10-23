@@ -6,9 +6,10 @@ use hyper::{body::Incoming, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
 use guardian_common::db::{GuardianDb, GuardianReadiness, GuardianSessionReader};
-use guardian_common::protocol::{decode_record, encode_record, parse_canonical_json, sha256, validate_hash, ChainEndpoint, DepositTreeState, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianRuntimeConfig, GuardianSessionRecord, GuardianSignError, GuardianSignErrorResponse, GuardianSignRequest, GuardianSessionsResponse, HaltReason, Hash4, Hex, Hex32, WithdrawalBurnRecord, GOLDILOCKS_MODULUS, MAX_BODY_BYTES, MAX_COMPRESSED_RECORD_BYTES, MAX_SESSION_RECORD_BYTES};
+use guardian_common::protocol::{decode_record, encode_record, parse_canonical_json, sha256, validate_hash, ChainEndpoint, DepositTreeState, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianRuntimeConfig, GuardianSessionRecord, GuardianSignError, GuardianSignErrorResponse, GuardianSignRequest, GuardianSessionsResponse, HaltReason, Hash4, Hex, Hex32, WithdrawalBurnRecord, GOLDILOCKS_MODULUS};
 use guardian_common::runtime::{create_db_file, load_network, load_signing_key, open_db_file};
-use super::verify::{GuardianHistory, GuardianVerificationContext, GuardianAccountError};
+use super::verify::{GuardianHistory, GuardianVerificationContext};
+use guardian_common::verify_l1::GuardianAccountError;
 use psy_client_common::data::base_types::hash256::Hash256;
 use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
 use psy_crypto::hash::traits::qhashable::QFieldHashable;
@@ -26,7 +27,7 @@ async fn committed_rpc<T: serde::de::DeserializeOwned>(provider: &RpcProvider, u
     let mut response = response;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| GuardianSignError::L2RpcUnavailable)? {
-        if chunk.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) { return Err(GuardianSignError::L2RpcUnavailable); }
+        bytes.try_reserve(chunk.len()).map_err(|_| GuardianSignError::L2RpcUnavailable)?;
         bytes.extend_from_slice(&chunk);
     }
     match serde_json::from_slice::<RpcResponse<T>>(&bytes).map_err(|_| GuardianSignError::L2RpcUnavailable)?.result {
@@ -83,13 +84,16 @@ impl GuardianService {
             let mut failed = false;
             loop {
                 match response.chunk().await {
-                    Ok(Some(chunk)) if chunk.len() <= MAX_COMPRESSED_RECORD_BYTES.saturating_sub(bytes.len()) => bytes.extend_from_slice(&chunk),
+                    Ok(Some(chunk)) => {
+                        if bytes.try_reserve(chunk.len()).is_err() { failed = true; break; }
+                        bytes.extend_from_slice(&chunk);
+                    }
                     Ok(None) => break,
                     _ => { failed = true; break; }
                 }
             }
             if failed || !response_is_record(response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok())) { continue; }
-            let Ok(decoded) = decode_record(&bytes, MAX_SESSION_RECORD_BYTES) else { continue; };
+            let Ok(decoded) = decode_record(&bytes) else { continue; };
             let Ok(page) = parse_canonical_json::<GuardianSessionsResponse>(&decoded) else { continue; };
             if page.validate_page(after, 1).is_err() { continue; }
             let Some(record) = page.sessions.into_iter().next() else { continue; };
@@ -108,23 +112,6 @@ impl GuardianService {
         let network_magic = psy_config::parse_magic_hex(&self.network.magic).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
         let deposit_tree_states = self.signer.db.load_deposit_tree_states(network_magic, self.stable.user_id()).await?;
         restored_history(account, deposit_tree_states, &self.stable)
-    }
-
-    /// Journal membership of the current request's batch keys only, via point queries.
-    async fn current_request_conflicts(&mut self, request: &GuardianSignRequest) -> Result<(BTreeSet<(u32, u32, [u32; 8])>, BTreeSet<(u8, [u32; 8])>), GuardianSignError> {
-        let network_magic = psy_config::parse_magic_hex(&self.network.magic).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
-        let user = self.stable.user_id();
-        let mut withdrawal_burns = BTreeSet::new();
-        let mut nonces = BTreeSet::new();
-        for record in &request.withdrawal_records {
-            if self.signer.db.contains_included_withdrawal_burn(network_magic, user, record.sender_user_id, record.token_contract_id, record.nonce).await? {
-                withdrawal_burns.insert((record.sender_user_id, record.token_contract_id, record.nonce));
-            }
-            if self.signer.db.contains_withdrawal_nonce(network_magic, user, record.destination_chain_index, record.nonce).await? {
-                nonces.insert((record.destination_chain_index, record.nonce));
-            }
-        }
-        Ok((withdrawal_burns, nonces))
     }
 
     /// Included deposit anchors are re-bound to current L1 headers the same way as
@@ -147,7 +134,7 @@ impl GuardianService {
         self.save_account_result(super::verify::verify_pending_signed_anchors(&self.stable, &pending).await).await
     }
 
-    async fn observe(&mut self, deadline: tokio::time::Instant) -> Result<GuardianCommittedHead, GuardianSignError> {
+    async fn sync_confirmed_state(&mut self, deadline: tokio::time::Instant) -> Result<GuardianCommittedHead, GuardianSignError> {
         let network_magic = psy_config::parse_magic_hex(&self.network.magic).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
         let stable = Arc::clone(&self.stable);
         let saved = self.signer.db.load_account(network_magic, stable.user_id()).await?;
@@ -169,17 +156,15 @@ impl GuardianService {
         }
         // Saved last_checkpoint_hash is already proven against this head. Checkpoint 0 is not re-compared.
         self.history = self.restore_history(&saved).await?;
-        tracing::info!(nonce = self.history.nonce(), "[observe] bounded history restored");
+        tracing::info!(nonce = self.history.nonce(), "[sync_confirmed_state] bounded history restored");
         // The snapshot is proven against the saved checkpoint, itself proven against the
         // current head: a contradictory or missing durable frontier halts at startup. A
         // fresh bootstrap account has no included state yet; its zeros are first proven
         // atomically at the first import.
         if saved.imported_nonce.is_some() {
-            let no_withdrawal_burns = BTreeSet::new();
-            let no_nonces = BTreeSet::new();
             let context = GuardianVerificationContext { wallet: &self.wallet, provider: &self.wallet.st_provider, network: &self.network, verified_checkpoint_id: head.checkpoint_id,
                 verified_checkpoint_tree_root: head.checkpoint_tree_root, l1_chains: &self.config.l1_rpc_urls, history: &self.history,
-                reserved_deposit_tree_states: &[], conflicting_withdrawal_burns: &no_withdrawal_burns, conflicting_nonces: &no_nonces };
+                reserved_deposit_tree_states: &[] };
             self.save_account_result(super::verify::verify_restored_history(&context, &stable, saved.last_checkpoint_id).await).await?;
         }
         // Included anchors are account-wide, not a property of the next request. A
@@ -187,13 +172,11 @@ impl GuardianService {
         // the canonical chain.
         self.check_included_deposit_anchors().await?;
         self.check_pending_signed_anchors().await?;
-        tracing::info!("[observe] pending signed anchors verified");
-        let no_withdrawal_burns = BTreeSet::new();
-        let no_nonces = BTreeSet::new();
+        tracing::info!("[sync_confirmed_state] pending signed anchors verified");
         let target = {
             let context = GuardianVerificationContext { wallet: &self.wallet, provider: &self.wallet.st_provider, network: &self.network, verified_checkpoint_id: head.checkpoint_id,
                 verified_checkpoint_tree_root: head.checkpoint_tree_root, l1_chains: &self.config.l1_rpc_urls, history: &self.history,
-                reserved_deposit_tree_states: &[], conflicting_withdrawal_burns: &no_withdrawal_burns, conflicting_nonces: &no_nonces };
+                reserved_deposit_tree_states: &[] };
             super::verify::verified_account_nonce(&context, &stable, deadline).await?
         };
         let mut imported = self.history.nonce();
@@ -201,10 +184,9 @@ impl GuardianService {
             let record = Self::fetch_history(&self.history_client, &self.config.history_urls, imported).await?;
             let request = record.request_json.decode()?;
             if request.session_nonce != imported.checked_add(1).ok_or(GuardianSignError::SessionHistoryUnavailable)? { return Err(GuardianSignError::SessionHistoryUnavailable); }
-            let (conflicting_withdrawal_burns, conflicting_nonces) = self.current_request_conflicts(&request).await?;
             let context = GuardianVerificationContext { wallet: &self.wallet, provider: &self.wallet.st_provider, network: &self.network, verified_checkpoint_id: head.checkpoint_id,
                 verified_checkpoint_tree_root: head.checkpoint_tree_root, l1_chains: &self.config.l1_rpc_urls, history: &self.history,
-                reserved_deposit_tree_states: &[], conflicting_withdrawal_burns: &conflicting_withdrawal_burns, conflicting_nonces: &conflicting_nonces };
+                reserved_deposit_tree_states: &[] };
             let result = super::verify::verify_session(&context, &stable, record, &self.history).await;
             let (session, deposit_tree_states) = save_guardian_account_result(&mut self.signer.db, network_magic, stable.user_id(), result).await?;
             // The already-verified included checkpoint leaf is supplied to the atomic import.
@@ -384,7 +366,7 @@ pub async fn run(rpc_config: &Path, guardian_root: &Path, local_documents: &[Pat
                 _ = interval.tick() => {
                     let mut service = observer_service.lock().await;
                     let deadline = tokio::time::Instant::now() + OBSERVE_TIMEOUT;
-                    let observed = tokio::time::timeout_at(deadline, service.observe(deadline)).await;
+                    let observed = tokio::time::timeout_at(deadline, service.sync_confirmed_state(deadline)).await;
                     let observer_error = match observed { Err(_) => Some(GuardianSignError::ObserverTimeout), Ok(result) => result.err() };
                     warn_observer_authorization(&mut warned, observer_error);
                 }
@@ -451,7 +433,6 @@ fn ready_body(status: &GuardianReadiness) -> Result<Vec<u8>, GuardianSignError> 
     struct Body { schema_version: u32, user_id: u64, network_magic: u64, runtime_initialized: bool, halted: bool }
     let body = Body { schema_version: status.schema_version, user_id: status.user_id, network_magic: status.network_magic, runtime_initialized: status.runtime_initialized, halted: status.halted };
     let bytes = serde_json::to_vec(&body).map_err(|_| GuardianSignError::DatabaseUnavailable)?;
-    if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::DatabaseUnavailable); }
     Ok(bytes)
 }
 
@@ -463,17 +444,17 @@ async fn handle_request(service: Arc<tokio::sync::Mutex<GuardianService>>, reque
     if !content_type_is(request.headers().get(hyper::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()), RECORD_MEDIA) {
         return status_response(415, JSON_MEDIA, Vec::new());
     }
-    let body = match tokio::time::timeout(Duration::from_secs(30), read_body(request.into_body(), MAX_COMPRESSED_RECORD_BYTES)).await {
+    let permit = match SIGN_REQUESTS.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => return error_response(None, GuardianSignError::SigningBusy),
+    };
+    let body = match tokio::time::timeout(Duration::from_secs(30), read_body(request.into_body())).await {
         Ok(Ok(body)) => body,
         _ => return error_response(None, GuardianSignError::MalformedRequest),
     };
-    let body = match decode_record(&body, MAX_BODY_BYTES) { Ok(body) => body, Err(error) => return error_response(None, error) };
+    let body = match decode_record(&body) { Ok(body) => body, Err(error) => return error_response(None, error) };
     let request = match GuardianSignRequest::parse(&body) { Ok(request) => request, Err(error) => return error_response(None, error) };
     let request_id = match request.request_id() { Ok(id) => id, Err(error) => return error_response(None, error) };
-    let permit = match SIGN_REQUESTS.try_acquire() {
-        Ok(permit) => permit,
-        Err(_) => return error_response(Some(request_id), GuardianSignError::SigningBusy),
-    };
     let signing = tokio::spawn(async move {
     let _permit = permit;
     let lock_deadline = tokio::time::Instant::now() + SIGN_PREPARE_TIMEOUT;
@@ -485,7 +466,7 @@ async fn handle_request(service: Arc<tokio::sync::Mutex<GuardianService>>, reque
     };
     let result = if cached.is_some() {
         let prepare_deadline = tokio::time::Instant::now() + SIGN_PREPARE_TIMEOUT;
-        let observed = tokio::time::timeout_at(prepare_deadline, service.observe(prepare_deadline)).await;
+        let observed = tokio::time::timeout_at(prepare_deadline, service.sync_confirmed_state(prepare_deadline)).await;
         match observed {
             Ok(Ok(_)) if service.history.nonce() < request.session_nonce && service.history.nonce().checked_add(1) == Some(request.session_nonce) => {
                 let GuardianService { signer, stable, config, .. } = &mut *service;
@@ -504,17 +485,15 @@ async fn handle_request(service: Arc<tokio::sync::Mutex<GuardianService>>, reque
             let canonical_bytes = request.canonical_bytes()?;
             let existing = service.signer.db.lookup_signed(request.network_magic, request.user_id, request.session_nonce).await?;
             if existing.as_ref().is_some_and(|signed| signed.request_bytes != canonical_bytes) { return Err(GuardianSignError::NonceConflict); }
-            let head = service.observe(prepare_deadline).await?;
+            let head = service.sync_confirmed_state(prepare_deadline).await?;
             // No deposit-tree-state rebuild: the bounded snapshot comes from the journal; consumed
             // nonces and nonce gaps fail closed instead of replaying old sessions.
             if service.history.nonce() >= request.session_nonce { return Err(GuardianSignError::NonceConflict); }
             if service.history.nonce().checked_add(1) != Some(request.session_nonce) { return Err(GuardianSignError::SessionHistoryUnavailable); }
-            let (conflicting_withdrawal_burns, conflicting_nonces) = service.current_request_conflicts(&request).await?;
             let stable = Arc::clone(&service.stable);
             let context = GuardianVerificationContext { wallet: &service.wallet, provider: &service.wallet.st_provider, network: &service.network, verified_checkpoint_id: head.checkpoint_id,
                 verified_checkpoint_tree_root: head.checkpoint_tree_root, l1_chains: &service.config.l1_rpc_urls, history: &service.history,
-                reserved_deposit_tree_states: existing.as_ref().map(|signed| signed.deposit_tree_states.as_slice()).unwrap_or(&[]),
-                conflicting_withdrawal_burns: &conflicting_withdrawal_burns, conflicting_nonces: &conflicting_nonces };
+                reserved_deposit_tree_states: existing.as_ref().map(|signed| signed.deposit_tree_states.as_slice()).unwrap_or(&[]) };
             let result = super::verify::verify_guardian_session(&context, &stable, &request).await;
             let (verified, deposit_tree_states) = save_guardian_account_result(&mut service.signer.db, request.network_magic, request.user_id, result).await?;
             Ok::<_, GuardianSignError>((verified, deposit_tree_states))
@@ -556,11 +535,11 @@ async fn authorize_cached_response(db: &mut GuardianDb, request: &GuardianSignRe
     for state in &stored.deposit_tree_states {
         state.validate()?;
         let chain = config.chain(state.anchor.chain_index)?;
-        let canonical = super::verify_l1::verify_saved_deposit_anchor_headers(chain, &state.anchor).await?;
-        save_guardian_account_result::<()>(db, request.network_magic, request.user_id, super::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash).map(|()| ())).await?;
+        let canonical = guardian_common::verify_l1::verify_saved_deposit_anchor_headers(chain, &state.anchor).await?;
+        save_guardian_account_result::<()>(db, request.network_magic, request.user_id, guardian_common::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash).map(|()| ())).await?;
     }
     for burn in &request.withdrawal_records {
-        super::verify_l1::verify_withdrawal_token(config.chain(burn.destination_chain_index)?, burn).await?;
+        guardian_common::verify_l1::verify_withdrawal_token(config.chain(burn.destination_chain_index)?, burn).await?;
     }
     let (commitment, member_index) = authorize_current_proved_policy(request, config, public_key)?;
     db.authorize_response(request.network_magic, request.user_id, request.session_nonce, &canonical_bytes, |signed, _config| {
@@ -627,8 +606,8 @@ async fn verify_included_deposit_anchors(config: &GuardianConfig, included: &[De
         state.validate()?;
         if !seen.insert(state.anchor.chain_index) { return Err(GuardianSignError::DatabaseUnavailable.into()); }
         let chain = config.chain(state.anchor.chain_index)?;
-        let canonical = super::verify_l1::verify_saved_deposit_anchor_headers(chain, &state.anchor).await?;
-        super::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash)?;
+        let canonical = guardian_common::verify_l1::verify_saved_deposit_anchor_headers(chain, &state.anchor).await?;
+        guardian_common::verify_l1::verify_cached_anchor_hash(canonical, state.anchor.block_hash)?;
     }
     Ok(())
 }
@@ -649,14 +628,12 @@ fn error_response(request_id: Option<Hex32>, code: GuardianSignError) -> HttpRes
 }
 
 
-async fn read_body(mut body: Incoming, limit: usize) -> Result<Vec<u8>, GuardianSignError> {
+async fn read_body(mut body: Incoming) -> Result<Vec<u8>, GuardianSignError> {
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| GuardianSignError::MalformedRequest)?;
         if let Ok(data) = frame.into_data() {
-            if data.len() > limit.saturating_sub(bytes.len()) {
-                return Err(GuardianSignError::MalformedRequest);
-            }
+            bytes.try_reserve(data.len()).map_err(|_| GuardianSignError::MalformedRequest)?;
             bytes.extend_from_slice(&data);
         } else {
             return Err(GuardianSignError::MalformedRequest);
@@ -731,7 +708,7 @@ fn response_is_record(value: Option<&str>) -> bool { content_type_is(value, RECO
 /// Shared by the guardian and relayer history servers. `record` selects the envelope.
 pub fn session_page_response(record: bool, page: Result<Vec<u8>, GuardianSignError>) -> HttpResponse {
     let body = match page {
-        Ok(body) if record => match encode_record(&body, MAX_SESSION_RECORD_BYTES) { Ok(body) => body, Err(error) => return error_response(None, error) },
+        Ok(body) if record => match encode_record(&body) { Ok(body) => body, Err(error) => return error_response(None, error) },
         Ok(body) => body,
         Err(error) => return error_response(None, error),
     };
@@ -1160,8 +1137,8 @@ mod tests {
     async fn pruned_history_origin_falls_through_to_the_next_contiguous_session() {
         let pruned = history_record(3);
         let contiguous = history_record(1);
-        let pruned_page = encode_record(&GuardianSessionsResponse { sessions: vec![pruned], next_after_nonce: 3, has_more: false }.to_bytes().unwrap(), MAX_SESSION_RECORD_BYTES).unwrap();
-        let contiguous_page = encode_record(&GuardianSessionsResponse { sessions: vec![contiguous], next_after_nonce: 1, has_more: false }.to_bytes().unwrap(), MAX_SESSION_RECORD_BYTES).unwrap();
+        let pruned_page = encode_record(&GuardianSessionsResponse { sessions: vec![pruned], next_after_nonce: 3, has_more: false }.to_bytes().unwrap()).unwrap();
+        let contiguous_page = encode_record(&GuardianSessionsResponse { sessions: vec![contiguous], next_after_nonce: 1, has_more: false }.to_bytes().unwrap()).unwrap();
         let (pruned_origin, pruned_server) = serve_history(Some(pruned_page), true).await;
         let (contiguous_origin, contiguous_server) = serve_history(Some(contiguous_page), true).await;
         let record = GuardianService::fetch_history(&history_client(), &[pruned_origin, contiguous_origin], 0).await.unwrap();
@@ -1265,7 +1242,7 @@ mod tests {
 
     fn included_deposit(chain_index: u8, block_hash: [u8; 32]) -> DepositTreeState {
         let mut frontier = [Hash4::ZERO; 32];
-        let root = crate::guardian::verify_l1::append_leaf(&mut frontier, 0, Hash4::ZERO);
+        let root = guardian_common::verify_l1::append_leaf(&mut frontier, 0, Hash4::ZERO);
         DepositTreeState {
             count: 1, frontier, root,
             anchor: guardian_common::protocol::DepositAnchor { chain_index, block_number: 100, block_hash: Hex(block_hash), old_count: 0, new_count: 1 },
@@ -1432,13 +1409,13 @@ mod tests {
         // every frontier must fold to its stored root at the stored count.
         let mut frontier = [Hash4::ZERO; 32];
         let mut chain_root = Hash4::ZERO;
-        for leaf in 0..2u32 { chain_root = crate::guardian::verify_l1::append_leaf(&mut frontier, leaf, Hash4::from_values(leaf as u64 + 1, 0, 0, 0)); }
+        for leaf in 0..2u32 { chain_root = guardian_common::verify_l1::append_leaf(&mut frontier, leaf, Hash4::from_values(leaf as u64 + 1, 0, 0, 0)); }
         let imported = GuardianAccount { imported_nonce: Some(3), imported_ending_leaf: Some(Hash4::from_values(7, 7, 7, 7)),
             withdrawal_chains: vec![(0, 2, frontier, chain_root), (1, 0, [Hash4::ZERO; 32], Hash4::ZERO)],
             ..fresh.clone() };
         let mut state_frontier = [Hash4::ZERO; 32];
         let mut state_root = Hash4::ZERO;
-        for leaf in 0..4u32 { state_root = crate::guardian::verify_l1::append_leaf(&mut state_frontier, leaf, Hash4::from_values(leaf as u64 + 1, 1, 1, 1)); }
+        for leaf in 0..4u32 { state_root = guardian_common::verify_l1::append_leaf(&mut state_frontier, leaf, Hash4::from_values(leaf as u64 + 1, 1, 1, 1)); }
         let deposit_tree_state = DepositTreeState { count: 4, frontier: state_frontier, root: state_root,
             anchor: guardian_common::protocol::DepositAnchor { chain_index: 0, block_number: 100, block_hash: Hex([1; 32]), old_count: 2, new_count: 4 },
             event_block: 99, previous_count: 2, previous_root: Hash4::ZERO, occupied_partial_page_hashes: vec![Hash4::ZERO; 4] };

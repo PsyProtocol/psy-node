@@ -27,6 +27,46 @@ fn default_plonky2_sdc_contract_state_tree_height() -> u8 {
     psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT
 }
 
+/// Private serde codec for the trace byte fields. Human-readable formats
+/// (JSON) carry the bytes as canonical `base64::engine::general_purpose::STANDARD`
+/// text — standard alphabet, padded; the decode side is strict, rejecting any
+/// non-canonical spelling via a re-encode comparison. Binary formats (bincode,
+/// cbor) pass through to `Vec<u8>`'s own impls, so pre-cutover binary payloads
+/// stay byte-identical. Fields opt in with
+/// `#[serde(with = "b64_bytes", default, skip_serializing_if = "Vec::is_empty")]`.
+mod b64_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+        } else {
+            // Binary formats keep the exact pre-cutover Vec<u8> encoding.
+            Serialize::serialize(bytes, serializer)
+        }
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        if deserializer.is_human_readable() {
+            let encoded = String::deserialize(deserializer)?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|error| serde::de::Error::custom(format!("invalid base64: {error}")))?;
+            // Strict canonicality: the decoded bytes must re-encode to the
+            // exact input, so unpadded or otherwise non-canonical spellings
+            // never enter the trace pipeline.
+            if base64::engine::general_purpose::STANDARD.encode(&bytes) != encoded {
+                return Err(serde::de::Error::custom(format!("non-canonical base64: {encoded}")));
+            }
+            Ok(bytes)
+        } else {
+            // Binary formats keep the exact pre-cutover Vec<u8> encoding.
+            Vec::deserialize(deserializer)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -476,7 +516,7 @@ pub struct UpsStartWitness {
 /// proof bytes are stored here.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct UpsStartProofRecord {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(with = "b64_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub proof: Vec<u8>,
 }
 
@@ -485,16 +525,16 @@ pub struct UpsStartProofRecord {
 /// the UPS step proof.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CfcProofRecord {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(with = "b64_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub cfc_proof: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(with = "b64_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub ups_proof: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TraceContractCode {
     pub contract_id: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(with = "b64_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub code: Vec<u8>,
 }
 
@@ -609,7 +649,7 @@ pub struct ExternalProofStep {
     pub proof_tree_start_root: QHashOut<F>,
     pub proof_tree_end_root: QHashOut<F>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(with = "b64_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub proof: Vec<u8>,
     pub verifier_data_alt: AltVerifierOnlyCircuitData<F>,
     pub siblings: Vec<[String; 4]>,
@@ -621,7 +661,7 @@ pub struct ZkSignStep {
     pub proof_tree_start_root: QHashOut<F>,
     pub proof_tree_end_root: QHashOut<F>,
     pub sign_circuit_source: TraceSignCircuitSource,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(with = "b64_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub sign_witness: Vec<u8>,
     pub public_key_param: QHashOut<F>,
     pub sign_verifier_data_alt: AltVerifierOnlyCircuitData<F>,
@@ -646,7 +686,7 @@ pub enum TraceSignCircuitSource {
         input_len: usize,
     },
     PsySoftwareDefined {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(with = "b64_bytes", default, skip_serializing_if = "Vec::is_empty")]
         circuit_def: Vec<u8>,
         force_four_align: bool,
     },
@@ -1076,5 +1116,202 @@ mod simulation_tests {
 
         let round_tripped: CfcStateDelta = ups.into();
         assert_eq!(serde_json::to_value(&delta).unwrap(), serde_json::to_value(&round_tripped).unwrap());
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod b64_bytes_tests {
+    // The helper is exercised on the real annotated field types directly; no
+    // full TxTrace is built. TraceSignCircuitSource is covered on JSON only:
+    // it is internally tagged, and bincode cannot deserialize internally
+    // tagged enums.
+    use super::*;
+
+    fn ups_record(proof: Vec<u8>) -> UpsStartProofRecord {
+        UpsStartProofRecord { proof }
+    }
+
+    #[test]
+    fn json_fields_are_canonical_padded_base64() {
+        assert_eq!(
+            serde_json::to_string(&ups_record(vec![0xDE, 0xAD, 0xBE, 0xEF])).unwrap(),
+            r#"{"proof":"3q2+7w=="}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&CfcProofRecord { cfc_proof: vec![1], ups_proof: vec![1, 2] }).unwrap(),
+            r#"{"cfc_proof":"AQ==","ups_proof":"AQI="}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&TraceContractCode { contract_id: 7, code: vec![1, 2, 3] }).unwrap(),
+            r#"{"contract_id":7,"code":"AQID"}"#
+        );
+
+        let alt_verifier = AltVerifierOnlyCircuitData { constants_sigmas_cap: Vec::new(), circuit_digest: QHashOut::ZERO };
+        let external = ExternalProofStep {
+            fingerprint: QHashOut::ZERO,
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::ZERO,
+            proof: vec![9],
+            verifier_data_alt: alt_verifier.clone(),
+            siblings: Vec::new(),
+        };
+        assert_eq!(serde_json::to_value(&external).unwrap()["proof"], "CQ==");
+        let back: ExternalProofStep = serde_json::from_value(serde_json::to_value(&external).unwrap()).unwrap();
+        assert_eq!(back.proof, vec![9]);
+
+        let zk_sign = ZkSignStep {
+            fingerprint: QHashOut::ZERO,
+            proof_tree_start_root: QHashOut::ZERO,
+            proof_tree_end_root: QHashOut::ZERO,
+            sign_circuit_source: TraceSignCircuitSource::ZkBuiltin,
+            sign_witness: vec![9],
+            public_key_param: QHashOut::ZERO,
+            sign_verifier_data_alt: alt_verifier,
+        };
+        assert_eq!(serde_json::to_value(&zk_sign).unwrap()["sign_witness"], "CQ==");
+        let back: ZkSignStep = serde_json::from_value(serde_json::to_value(&zk_sign).unwrap()).unwrap();
+        assert_eq!(back.sign_witness, vec![9]);
+
+        let source = TraceSignCircuitSource::PsySoftwareDefined {
+            circuit_def: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            force_four_align: true,
+        };
+        let json = serde_json::to_value(&source).unwrap();
+        assert_eq!(json["kind"], "psy_software_defined");
+        assert_eq!(json["circuit_def"], "3q2+7w==");
+    }
+
+    #[test]
+    fn trace_sign_circuit_source_json_round_trips_all_variants() {
+        let variants = [
+            TraceSignCircuitSource::ZkBuiltin,
+            TraceSignCircuitSource::SecpBuiltin,
+            TraceSignCircuitSource::EthPersonalSecpBuiltin,
+            TraceSignCircuitSource::Multisig,
+            TraceSignCircuitSource::SdKey { allowed_contract_ids: vec![1, 2], allowed_method_ids: vec![3], expected_tx_count: 4 },
+            TraceSignCircuitSource::Plonky2SoftwareDefined { contract_state_tree_height: 32, input_len: 8 },
+            TraceSignCircuitSource::PsySoftwareDefined { circuit_def: vec![0xDE, 0xAD, 0xBE, 0xEF], force_four_align: false },
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: TraceSignCircuitSource = serde_json::from_str(&json).unwrap();
+            // The enum has no PartialEq; equal JSON proves equal payloads.
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn json_decode_is_strict_about_canonical_base64() {
+        let back: UpsStartProofRecord = serde_json::from_str(r#"{"proof":"3q2+7w=="}"#).unwrap();
+        assert_eq!(back.proof, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // Canonical spellings are accepted, including the empty encoding.
+        let back: UpsStartProofRecord = serde_json::from_str(r#"{"proof":""}"#).unwrap();
+        assert!(back.proof.is_empty());
+
+        for encoded in ["3q2+7w", "QR==", "3q2-7w==", "QQ=", "3q2+7w===", "QUJD "] {
+            let json = format!(r#"{{"proof":"{encoded}"}}"#);
+            assert!(
+                serde_json::from_str::<UpsStartProofRecord>(&json).is_err(),
+                "expected rejection of non-canonical base64: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_preserves_default_and_skip_serializing_semantics() {
+        assert_eq!(serde_json::to_string(&ups_record(Vec::new())).unwrap(), "{}");
+        assert_eq!(serde_json::to_string(&CfcProofRecord::default()).unwrap(), "{}");
+        assert_eq!(
+            serde_json::to_string(&TraceSignCircuitSource::PsySoftwareDefined {
+                circuit_def: Vec::new(),
+                force_four_align: true,
+            })
+            .unwrap(),
+            r#"{"kind":"psy_software_defined","force_four_align":true}"#
+        );
+
+        let back: UpsStartProofRecord = serde_json::from_str("{}").unwrap();
+        assert!(back.proof.is_empty());
+        let back: CfcProofRecord = serde_json::from_str(r#"{"cfc_proof":"AQ=="}"#).unwrap();
+        assert_eq!(back.cfc_proof, vec![1]);
+        assert!(back.ups_proof.is_empty());
+        let back: TraceSignCircuitSource =
+            serde_json::from_str(r#"{"kind":"psy_software_defined","force_four_align":false}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            r#"{"kind":"psy_software_defined","force_four_align":false}"#
+        );
+    }
+
+    #[test]
+    fn binary_keeps_pre_cutover_byte_fixtures() {
+        // bincode 1.3.3 (fixed-int little-endian): a non-empty Vec<u8> field
+        // is a u64 element count followed by the raw bytes. An empty field is
+        // OMITTED — skip_serializing_if applies in binary formats too, which
+        // is pre-existing byte behavior the helper preserves: an all-empty
+        // record serializes to zero bytes, and deserializing those bytes
+        // fails (the deserializer still expects the field), so the empty
+        // case is documented as not round-tripping.
+        assert_eq!(bincode::serialize(&ups_record(vec![1])).unwrap(), [0x01, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+        assert_eq!(bincode::serialize(&ups_record(Vec::new())).unwrap(), Vec::<u8>::new());
+        assert!(bincode::deserialize::<UpsStartProofRecord>(&[]).is_err());
+        assert_eq!(
+            bincode::serialize(&CfcProofRecord { cfc_proof: vec![1, 2], ups_proof: vec![3] }).unwrap(),
+            [0x02, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x03]
+        );
+        assert_eq!(
+            bincode::serialize(&TraceContractCode { contract_id: 7, code: vec![9] }).unwrap(),
+            [0x07, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x09]
+        );
+
+        let back: UpsStartProofRecord = bincode::deserialize(&[0x01, 0, 0, 0, 0, 0, 0, 0, 0x01]).unwrap();
+        assert_eq!(back.proof, vec![1]);
+        let back: CfcProofRecord =
+            bincode::deserialize(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x03]).unwrap();
+        assert_eq!(back.cfc_proof, vec![1, 2]);
+        assert_eq!(back.ups_proof, vec![3]);
+        let back: TraceContractCode =
+            bincode::deserialize(&[0x07, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x09]).unwrap();
+        assert_eq!(back.contract_id, 7);
+        assert_eq!(back.code, vec![9]);
+    }
+
+    #[test]
+    fn binary_encoding_matches_plain_vec_for_all_size_variants() {
+        #[derive(Serialize, Deserialize, Debug)]
+        struct BeforeShape(#[serde(default, skip_serializing_if = "Vec::is_empty")] Vec<u8>);
+        #[derive(Serialize, Deserialize, Debug)]
+        struct AfterShape(
+            #[serde(with = "super::b64_bytes", default, skip_serializing_if = "Vec::is_empty")] Vec<u8>,
+        );
+
+        let variants: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![1],
+            vec![1, 2],
+            vec![1, 2, 3],
+            vec![0xFF; 4],
+            (0..=255u8).collect(),
+            vec![0xAB; 4096],
+        ];
+        for bytes in variants {
+            let before = bincode::serialize(&BeforeShape(bytes.clone())).unwrap();
+            let after = bincode::serialize(&AfterShape(bytes.clone())).unwrap();
+            assert_eq!(before, after, "binary drift at {} bytes", bytes.len());
+            // Core contract: identical bytes, and the decode side must agree
+            // too. Compare semantic decode results — serde's default handling
+            // differs between named and newtype shapes — instead of assuming
+            // an error for the empty encoding.
+            match (bincode::deserialize::<BeforeShape>(&before), bincode::deserialize::<AfterShape>(&before)) {
+                (Ok(before_back), Ok(after_back)) => assert_eq!(before_back.0, after_back.0, "decode divergence at {} bytes", bytes.len()),
+                (Err(_), Err(_)) => {} // both reject the encoding: consistent, no roundtrip claimed
+                (before_result, after_result) => panic!(
+                    "decode divergence at {} bytes: before={before_result:?} after={after_result:?}",
+                    bytes.len()
+                ),
+            }
+        }
     }
 }

@@ -49,6 +49,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Rollback(args) => {
             subcommand::rollback::run(args).await?;
         }
+        Commands::RestoreBridgeState(args) => {
+            subcommand::restore_bridge_state::run(args).await?;
+        }
         Commands::GenerateGenesisData(args) => {
             subcommand::generate_genesis::run(args).await?;
         }

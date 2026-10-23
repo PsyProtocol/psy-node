@@ -22,7 +22,7 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
 }
 
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hasher> {
-    pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, known_nodes: &[String]) -> anyhow::Result<Self> {
+    async fn connect(realm_id: u64, realm_sub_id: u64, keyspace: String, known_nodes: &[String]) -> anyhow::Result<Self> {
         let mut execution_profile = ExecutionProfile::builder()
             .request_timeout(Some(Duration::from_secs(300)));
         if known_nodes.len() == 1 {
@@ -42,28 +42,6 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
 
         let no_tablet_keyspace = format!("{}_no_tablet", keyspace);
 
-        println!("creating keyspaces: {} and {}", &keyspace, &no_tablet_keyspace);
-
-        session
-            .query_unpaged(
-                format!(
-                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
-                    &keyspace
-                ),
-                &[],
-            )
-            .await?;
-        session.await_schema_agreement().await?;
-        session
-            .query_unpaged(
-                format!(
-                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
-                    &no_tablet_keyspace
-                ),
-                &[],
-            )
-            .await?;
-        session.await_schema_agreement().await?;
         Ok(Self {
             session,
             keyspace,
@@ -73,6 +51,32 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             _phantom_hash: std::marker::PhantomData,
             _phantom_hasher: std::marker::PhantomData,
         })
+    }
+
+    /// Connect to existing keyspaces without creating or changing schema.
+    /// Missing keyspaces and metadata-query failures are returned as errors.
+    pub async fn open_existing(realm_id: u64, realm_sub_id: u64, keyspace: String, known_nodes: &[String]) -> anyhow::Result<Self> {
+        let store = Self::connect(realm_id, realm_sub_id, keyspace, known_nodes).await?;
+        let statement = store.session.prepare("SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?").await?;
+        for keyspace in [&store.keyspace, &store.no_tablet_keyspace] {
+            let result = store.session.execute_unpaged(&statement, (keyspace.as_str(),)).await?;
+            anyhow::ensure!(result.into_rows_result()?.maybe_first_row::<(String,)>()?.is_some(), "Scylla keyspace {keyspace} does not exist");
+        }
+        Ok(store)
+    }
+
+    /// Connect and create the primary and no-tablet keyspaces if absent.
+    pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, known_nodes: &[String]) -> anyhow::Result<Self> {
+        let store = Self::connect(realm_id, realm_sub_id, keyspace, known_nodes).await?;
+        println!("creating keyspaces: {} and {}", &store.keyspace, &store.no_tablet_keyspace);
+        for keyspace in [&store.keyspace, &store.no_tablet_keyspace] {
+            store.session.query_unpaged(
+                format!("CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}", keyspace),
+                &[],
+            ).await?;
+            store.session.await_schema_agreement().await?;
+        }
+        Ok(store)
     }
 
     pub async fn init_std_table<T: ScyllaStandardPreparedTableStatements>(
