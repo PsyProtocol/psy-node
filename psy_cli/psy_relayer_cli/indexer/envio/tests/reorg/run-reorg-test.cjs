@@ -43,7 +43,25 @@ const assert = require('node:assert/strict');
 const { spawn, execFileSync } = require('node:child_process');
 const net = require('node:net');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 const { loadHandlers, makeContext, ENTITIES } = require('../lib/handler-harness.cjs');
+const readerCheck = require('./reader-check.cjs');
+
+// Opt-in: --with-reader <path-to-psy-bridge-reader> also runs the Reader on the
+// test database and checks its roots and reads (see
+// psy_bridge_reader_core/tests/e2e/README.md). Checked before anything starts.
+const readerFlag = process.argv.indexOf('--with-reader');
+const readerBin = readerFlag === -1 ? undefined : process.argv[readerFlag + 1];
+if (readerFlag !== -1) {
+  try {
+    if (!readerBin || readerBin.startsWith('--')) throw new Error('reader binary not found: --with-reader needs a path');
+    readerCheck.assertReaderBinary(readerBin);
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+}
 
 const ENVIO_DIR = path.join(__dirname, '../..');
 const CHAIN_ID = 31337;
@@ -80,6 +98,10 @@ const INDEXING_BLOCK_LAG = 4;
 const createdDatabases = [];
 let database;
 let reorgDepth;
+let reader;
+let readerDir;
+const orphanedHashes = new Set();
+const orphanedNullifiers = new Set();
 
 const word = (value) => BigInt(value).toString(16).padStart(64, '0');
 const hex32 = (value) => '0x' + word(value);
@@ -264,9 +286,51 @@ function codegen(depth) {
 }
 
 function createDatabase() {
+  const previous = reader; // the Reader follows one database; the next one gets its own
+  reader = undefined;
+  previous?.stop();
   database = `envio_reorg_test_${process.pid}_depth_${reorgDepth}`;
   psql(`CREATE DATABASE "${database}"`, 'postgres');
   createdDatabases.push(database);
+}
+
+const orphan = (events) => events.forEach((e) => {
+  orphanedHashes.add(e.event.transaction.hash);
+  if (e.kind === 'WithdrawalClaimed') orphanedNullifiers.add(e.event.params.nullifier);
+});
+
+// Starts the Reader for the current database if it is not running, waits until
+// it has caught up with Envio's watermark, and returns its revision epoch.
+async function readerBaseline(label) {
+  if (!readerBin) return undefined;
+  if (!reader) {
+    readerDir ??= fs.mkdtempSync(path.join(os.tmpdir(), 'reorg-reader-'));
+    reader = new readerCheck.Reader({
+      bin: readerBin, pg: PG, database, schema: 'public', port: await freePort(), dir: readerDir,
+    });
+  }
+  const lastCount = Number(psql('SELECT last_count FROM "DepositTreeMeta" WHERE chain_index = 0'));
+  return (await reader.waitSynced(0, lastCount, label)).revision.epoch;
+}
+
+async function readerVerify(label, canonical, epochBefore) {
+  if (!readerBin) return;
+  const hashes = new Set(canonical.map((e) => e.event.transaction.hash));
+  const removed = [...orphanedHashes].filter((hash) => !hashes.has(hash));
+  const nullifiers = new Set(canonical.filter((e) => e.kind === 'WithdrawalClaimed').map((e) => e.event.params.nullifier));
+  const result = await readerCheck.verify(reader, {
+    label,
+    chainId: CHAIN_ID,
+    chainIndex: 0,
+    psqlJson: psql,
+    events: canonical,
+    expectedState,
+    removed,
+    removedNullifiers: [...orphanedNullifiers].filter((n) => !nullifiers.has(n)),
+    epochBefore,
+  });
+  console.log(`${label}: reader equals the replay and the registered SQL at ${result.lastCount} deposits `
+    + `(epoch ${epochBefore ?? 'n/a'} -> ${result.epoch}, ${removed.length} discarded tx hashes not served)`);
 }
 
 function startEnvio({ isFreshParent, indexingBlockLag }) {
@@ -413,6 +477,8 @@ async function main() {
   }
   console.log(`fork A indexed to block ${headA}: ${stateA.Deposit.length} deposits, `
     + `${stateA.DepositLeaf.length} leaves, history rows ${JSON.stringify(historyA)}`);
+  orphan(forkA);
+  const epoch1 = await readerBaseline('scenario 1 baseline');
   await stopAndWait(envio);
 
   assert.equal(await rpc('evm_revert', [forkPoint]), true);
@@ -439,9 +505,11 @@ async function main() {
     + `${stateB.Deposit.length} deposits, ${stateB.DepositLeaf.length} leaves, `
     + `${stateB.AccountDepositStats.length} stats rows, ${stateB.WithdrawalClaim.length} claims; `
     + `all ${ENTITIES.length} entity tables equal the replay`);
+  await readerVerify('scenario 1', canonical, epoch1);
 
   // ── Scenario 2a: live reorg, upstream RPC source (patch not enabled) ─────
   const unpatched = await replaceDepositBlock({ index: 3, shield: S1, amount: 103n, blocksAfter: 2 });
+  orphan([unpatched.orphaned]);
   const unpatchedOutcome = await waitForReorgOutcome({ index: 3, ...unpatched });
   console.log(`scenario 2a (${FRESH_PARENT_ENV} unset, threshold ${DEFAULT_REORG_DEPTH}): `
     + `${describeFork({ index: 3, ...unpatched })}; ${JSON.stringify(unpatchedOutcome)}`);
@@ -461,15 +529,18 @@ async function main() {
   await stopAndWait(envio);
 
   // ── Scenario 2b: live reorg with the fresh reorg parent enabled ─────────
+  const epoch2 = await readerBaseline('scenario 2 baseline'); // Reader caught up, Envio stopped
   envio = startEnvio({ isFreshParent: true });
   const patched = await replaceDepositBlock({ index: 4, shield: S2, amount: 104n, blocksAfter: 2 });
   const patchedOutcome = await waitForReorgOutcome({ index: 4, ...patched });
   console.log(`scenario 2b (${FRESH_PARENT_ENV}=1, threshold ${DEFAULT_REORG_DEPTH}): `
     + `${describeFork({ index: 4, ...patched })}; ${JSON.stringify(patchedOutcome)}`);
+  orphan([patched.orphaned]);
   canonical = [...canonical, patched.reincluded];
   await assertRolledBackLive(patchedOutcome, canonical, 'scenario 2b');
   console.log('scenario 2b passed: Envio rolled the live reorg back without a restart; '
     + `all ${ENTITIES.length} entity tables equal the replay`);
+  await readerVerify('scenario 2', canonical, epoch2);
   await stopAndWait(envio);
 
   // ── Scenario 3: the live release's confirmed_block_threshold ────────────
@@ -481,14 +552,17 @@ async function main() {
   const headBefore = Number(await rpc('eth_blockNumber'));
   await waitFor('the chain to be indexed again', () => progress() >= headBefore);
   assert.deepEqual(dbState(), await expectedState(canonical), 'threshold 8: initial sync differs from a replay');
+  const epoch3 = await readerBaseline('scenario 3 baseline');
 
   const within = await replaceDepositBlock({ index: 5, shield: S3, amount: 105n, blocksAfter: 2 });
   const withinOutcome = await waitForReorgOutcome({ index: 5, ...within });
   console.log(`scenario 3a (${FRESH_PARENT_ENV}=1, threshold ${LIVE_RELEASE_REORG_DEPTH}): `
     + `${describeFork({ index: 5, ...within })}; ${JSON.stringify(withinOutcome)}`);
+  orphan([within.orphaned]);
   canonical = [...canonical, within.reincluded];
   await assertRolledBackLive(withinOutcome, canonical, 'scenario 3a');
   console.log('scenario 3a passed: parent within the threshold, rolled back live');
+  await readerVerify('scenario 3a', canonical, epoch3);
 
   await stopAndWait(envio);
   envio = startEnvio({ isFreshParent: false, indexingBlockLag: INDEXING_BLOCK_LAG });
@@ -513,8 +587,10 @@ async function main() {
   console.log(`scenario 3b (${FRESH_PARENT_ENV} unset, ENVIO_INDEXING_BLOCK_LAG=${INDEXING_BLOCK_LAG}): `
     + `${describeFork({ index: 6, ...lagged })}; ${JSON.stringify(laggedOutcome)}`);
   assert.ok(!laggedOutcome.isDetected && !laggedOutcome.isHalted, `${JSON.stringify(laggedOutcome)}\n${tail(envioLog)}`);
+  orphan([lagged.orphaned]);
   canonical = [...canonical, lagged.reincluded];
   assert.deepEqual(dbState(), await expectedState(canonical), 'scenario 3b: state differs from a replay');
+  await readerVerify('scenario 3b', canonical, undefined);
   console.log('scenario 3b passed: the orphaned head block never reached the handlers; no rollback was needed');
   await stopAndWait(envio);
 
@@ -546,6 +622,8 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
+    await reader?.stop();
+    if (readerDir) fs.rmSync(readerDir, { recursive: true, force: true }); // holds the token file
     stop(envio);
     stop(anvil);
     await sleep(1500);
