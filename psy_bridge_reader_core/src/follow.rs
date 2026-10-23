@@ -226,7 +226,7 @@ impl FollowState {
                 model.reset_chain(*chain_index)
             }
             // reset_chain keeps the chain_id's committed safe block and claims, so only reset_all lowers them.
-            ReloadReason::IdentityChanged | ReloadReason::ProgressBelowCommitted { .. } => {
+            ReloadReason::IdentityChanged | ReloadReason::ProgressBelowCommitted { .. } | ReloadReason::MetaMissing { .. } => {
                 model.reset_all();
                 self.metrics.clear_chain_gauges();
             }
@@ -256,6 +256,7 @@ fn reload_label(reason: &ReloadReason) -> &'static str {
         ReloadReason::ProgressBelowCommitted { .. } => "progress_below_committed",
         ReloadReason::InvariantViolated { .. } => "invariant_violated",
         ReloadReason::TreeMismatch { .. } => "tree_mismatch",
+        ReloadReason::MetaMissing { .. } => "meta_missing",
         ReloadReason::WindowOverLimit => "window_over_limit",
     }
 }
@@ -778,6 +779,34 @@ mod tests {
         assert_eq!(by_address(after, 1, 0, "A").unwrap(), a.rows(0));
         assert_eq!(claims(after), 0);
         assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"progress_below_committed\"} "), Some(1.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_meta_row_under_committed_deposits_resets_everything() {
+        let mut a = TickBuilder::new();
+        a.progress(1, 100, 8).progress(2, 100, 8);
+        a.deposit(0, 1, 10, "A");
+        a.deposit(1, 2, 10, "A");
+        let mut expected = Model::new();
+        let first = a.tick(&expected.cursors());
+        expected.apply(first.clone());
+        let rows = a.deposits.remove(&0).unwrap();
+        let missing = a.tick(&expected.cursors());
+        a.deposits.insert(0, rows);
+        let reloaded = a.tick(&Cursors::default());
+        let r = run(FollowConfig::default(), vec![], vec![Ok(first), Ok(missing), Ok(reloaded)], Duration::ZERO).await;
+        use Call::{Connect, Read};
+        assert_eq!(r.calls(), [(Connect, 0), (Read, 0), (Read, 500), (Read, 1000), (Read, 1500)]);
+        assert!(r.events[2].view.status().ready);
+        let reset = &r.events[3];
+        assert_eq!(reset.cursors, Some(Cursors::default()));
+        assert!(!reset.view.status().ready && reset.view.status().chains.is_empty());
+        assert!(reset.view.revision().epoch > r.events[2].view.revision().epoch);
+        let after = &r.events[4].view;
+        assert!(after.status().ready);
+        assert_eq!(by_address(after, 1, 0, "A").unwrap(), a.rows(0));
+        assert_eq!(by_address(after, 2, 1, "A").unwrap(), a.rows(1));
+        assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"meta_missing\"} "), Some(1.0));
     }
 
     #[tokio::test(start_paused = true)]

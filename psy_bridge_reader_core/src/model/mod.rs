@@ -80,6 +80,8 @@ pub enum ReloadReason {
     ProgressBelowCommitted { chain_id: u64 },
     InvariantViolated { chain_index: u64, what: String },
     TreeMismatch { chain_index: u64 },
+    /// A chain index with committed deposits has no `DepositTreeMeta` row.
+    MetaMissing { chain_index: u64 },
     WindowOverLimit,
 }
 
@@ -95,6 +97,9 @@ impl fmt::Display for ReloadReason {
             }
             ReloadReason::TreeMismatch { chain_index } => {
                 write!(f, "chain_index {chain_index} tree does not match Envio's DepositTreeMeta")
+            }
+            ReloadReason::MetaMissing { chain_index } => {
+                write!(f, "chain_index {chain_index} has committed deposits but no DepositTreeMeta row")
             }
             ReloadReason::WindowOverLimit => write!(f, "the unsafe window is above the follow row limit"),
         }

@@ -184,14 +184,33 @@ impl Model {
         let as_of = tick.started_unix_ms;
         let mut changed = old.ready.is_err();
         let mut reorged = Vec::new();
-        for m in &tick.metas {
-            self.chains.entry(m.chain_index).or_insert_with(|| ChainState::new(None));
+        let metas = tick.metas.iter().map(|m| (m.chain_index, *m)).collect::<BTreeMap<_, _>>();
+        for &chain_index in metas.keys() {
+            self.chains.entry(chain_index).or_insert_with(|| ChainState::new(None));
+        }
+        // A chain index with no meta row and nothing committed is unknown again
+        // (Envio rolled back its first deposits); one with committed rows is
+        // a deep change that `next_chain_view` reports as `MetaMissing`.
+        let unknown = self
+            .chains
+            .iter()
+            .filter(|(chain_index, state)| !metas.contains_key(chain_index) && state.data.committed.read().len() == 0)
+            .map(|(&chain_index, _)| chain_index)
+            .collect::<Vec<_>>();
+        for chain_index in unknown {
+            self.chains.remove(&chain_index);
+            if let Some(o) = old.chains.get(&chain_index) {
+                changed = true;
+                if o.total() > 0 {
+                    reorged.push(chain_index);
+                }
+            }
         }
         let mut chains = BTreeMap::new();
         for (&chain_index, state) in self.chains.iter_mut() {
             let rows = tick.deposits.get(&chain_index).map_or(&[][..], Vec::as_slice);
             let window_rows = &rows[deposit_split.get(&chain_index).copied().unwrap_or(0)..];
-            let meta = tick.metas.iter().find(|m| m.chain_index == chain_index).copied();
+            let meta = metas.get(&chain_index).copied();
             let next = next_chain_view(chain_index, state, old.chains.get(&chain_index), window_rows, meta, as_of);
             if next.reorg {
                 reorged.push(chain_index);
@@ -350,7 +369,10 @@ fn next_chain_view(
         Ok(()) => {}
         Err(detail) => {
             if state.fault.is_none() {
-                let reason = ReloadReason::TreeMismatch { chain_index };
+                let reason = match meta {
+                    None => ReloadReason::MetaMissing { chain_index },
+                    Some(_) => ReloadReason::TreeMismatch { chain_index },
+                };
                 state.fault = Some((reason.clone(), format!("{reason}: {detail}")));
             }
         }
@@ -374,7 +396,7 @@ fn next_chain_view(
 mod tests {
     use std::sync::Arc;
 
-    use psy_bridge_reader_api::{ClaimProofQuery, DepositRow, DepositsByAddressQuery, DepositsByTxQuery, TreeRootQuery};
+    use psy_bridge_reader_api::{ClaimProofQuery, DepositRow, DepositsByAddressQuery, DepositsByTxQuery, PrefixQuery, TreeRootQuery};
 
     use crate::model::{ApplyOutcome, DepositCursor, Model, ReadError, ReloadReason, View};
     use crate::test_support::{naive_root, naive_siblings, TickBuilder};
@@ -737,6 +759,56 @@ mod tests {
             assert_eq!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::TreeMismatch { chain_index: 0 }));
             assert_eq!(m.view().revision.seq, seq);
         }
+    }
+
+    #[test]
+    fn a_rolled_back_first_deposit_removes_the_chain_and_keeps_its_sibling_ready() {
+        // Chain indexes 0 and 1 share chain_id 1. A reorg removes chain index
+        // 1's only deposit, and Envio's rollback deletes its DepositTreeMeta row.
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit_at(0, 1, 0, 10, "A");
+        b.deposit_at(0, 1, 1, 11, "A");
+        b.deposit_at(1, 1, 2, 95, "B");
+        let mut m = Model::new();
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        let v1 = m.view();
+        b.deposits.remove(&1);
+        assert_eq!(b.apply_to(&mut m), published(&[1]));
+        let v2 = m.view();
+        assert_eq!(v2.revision.epoch, v1.revision.epoch + 1);
+        let status = v2.status();
+        assert!(status.ready);
+        assert_eq!(status.chains.iter().map(|c| c.chain_index).collect::<Vec<_>>(), [0]);
+        let prefix = v2.prefix(&PrefixQuery { chain_index: 0, chain_id: 1, target_deposit_count: 2 }).unwrap();
+        assert_eq!((prefix.chain_local_count, prefix.has_foreign_deposits), (2, false));
+        let q = TreeRootQuery { chain_index: 0, count: None, target_deposit_count: Some(2), chain_id: Some(1) };
+        let r = v2.tree_root(&q).unwrap();
+        assert_eq!((r.chain_local_count, r.root), (2, naive_hex(&b.leaves(0), 2)));
+        // Chain index 1 is unknown again: count 0, root zero(32), no rows.
+        assert_eq!(root(&v2, 1, 0).unwrap(), to_display_hex(&zero(32)));
+        assert_eq!(by_address(&v2, 1, "B").unwrap(), vec![]);
+        assert!(m.cursors().deposits.get(&1).is_none());
+        // A further tick with nothing new neither reloads nor bumps the epoch.
+        b.started_unix_ms = 2_000;
+        assert_eq!(b.apply_to(&mut m), ApplyOutcome::Unchanged);
+        let v3 = m.view();
+        assert_eq!((v3.revision.epoch, v3.revision.seq), (v2.revision.epoch, v2.revision.seq));
+        assert_eq!(v3.revision.as_of_unix_ms, 2_000);
+    }
+
+    #[test]
+    fn a_missing_meta_row_under_committed_deposits_is_meta_missing() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit(0, 1, 10, "A");
+        b.deposit(1, 1, 11, "B");
+        let mut m = Model::new();
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        assert_eq!(m.view().chains[&1].committed_len, 1);
+        b.deposits.remove(&1);
+        assert_eq!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::MetaMissing { chain_index: 1 }));
+        assert!(matches!(root(&m.view(), 1, 1), Err(ReadError::NotReady(_))));
     }
 
     #[test]
