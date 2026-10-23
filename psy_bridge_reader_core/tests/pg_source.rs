@@ -158,6 +158,8 @@ fn deposit(local: u64) -> DepositWithLeaf {
             tx_hash: format!("0xtx{local}"),
         },
         leaf: leaf(local),
+        leaf_deposit_index: deposit_index,
+        leaf_chain_id: CHAIN_ID,
         leaf_block_number: block,
     }
 }
@@ -212,6 +214,8 @@ async fn reads_a_tick_from_envio_ddl() {
     assert_eq!(tick.progress, vec![ChainProgress { chain_id: CHAIN_ID, progress_block: 120, max_reorg_depth: 8 }]);
     assert_eq!(tick.metas, vec![TreeMetaRow { chain_index: 0, last_count: 3, root: tree_root() }]);
     assert_eq!(tick.deposits, BTreeMap::from([(0, vec![deposit(0), deposit(1), deposit(2)])]));
+    let leaf_keys: Vec<(u64, u64)> = tick.deposits[&0].iter().map(|d| (d.leaf_deposit_index, d.leaf_chain_id)).collect();
+    assert_eq!(leaf_keys, vec![(5, CHAIN_ID), (7, CHAIN_ID), (9, CHAIN_ID)]);
     assert_eq!(tick.claims, BTreeMap::from([(CHAIN_ID, vec![claim()])]));
     assert_eq!(tick.batches, BTreeMap::from([(CHAIN_ID, vec![batch()])]));
     assert!(!tick.truncated);
@@ -262,6 +266,30 @@ async fn reads_a_tick_from_envio_ddl() {
     assert_eq!(tick.deposits[&0].len(), 3);
     assert!(!tick.truncated);
 
+    drop(source);
+    drop(seed);
+    drop_db(db).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_leaf_that_disagrees_with_its_deposit_is_returned_for_the_model_to_catch() {
+    let db = clone_db().await;
+    let seed = seeded(&db).await;
+    // Local index 1 belongs to deposit_index 7 on CHAIN_ID; its leaf claims 8 on 97.
+    seed.batch_execute("UPDATE \"DepositLeaf\" SET deposit_index = 8, chain_id = 97 WHERE id = '0-1'")
+        .await
+        .unwrap();
+    let mut source = PgSource::connect(&cfg(&db.url)).await.expect("connect");
+    let tick = source.read_tick(&Cursors::default(), 10).await.expect("a mismatch is not a source error");
+    let d = &tick.deposits[&0];
+    assert_eq!(d.len(), 3);
+    assert_eq!((d[1].row.deposit_index, d[1].row.chain_id), (7, CHAIN_ID));
+    assert_eq!((d[1].leaf_deposit_index, d[1].leaf_chain_id), (8, 97));
+    assert_eq!(d[1].row.chain_local_deposit_index, 1);
+    assert_eq!(d[0], deposit(0));
+    assert_eq!(d[2], deposit(2));
+    assert!(!tick.truncated);
     drop(source);
     drop(seed);
     drop_db(db).await;

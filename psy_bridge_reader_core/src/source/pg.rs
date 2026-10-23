@@ -44,6 +44,7 @@ impl PgSource {
     /// Connects, applies the session settings, runs the schema guard and
     /// prepares the tick statements.
     pub async fn connect(cfg: &PgConfig) -> Result<PgSource, SourceError> {
+        check_config(cfg)?;
         let (client, connection) = tokio_postgres::connect(&cfg.url, NoTls)
             .await
             .map_err(|e| db_error("connect", e))?;
@@ -150,6 +151,8 @@ impl EnvioSource for PgSource {
                 out.push(DepositWithLeaf {
                     row: decode_deposit(row)?,
                     leaf: get_hash(leaf, "poseidon_leaf_hash", "follow_leaves")?,
+                    leaf_deposit_index: get_u64(leaf, "deposit_index", "follow_leaves")?,
+                    leaf_chain_id: get_u64(leaf, "chain_id", "follow_leaves")?,
                     leaf_block_number: get_u64(leaf, "block_number", "follow_leaves")?,
                 });
             }
@@ -183,6 +186,17 @@ impl EnvioSource for PgSource {
         commit(tx).await?;
         Ok(TickData { identity, started_unix_ms, progress, metas, deposits, claims, batches, truncated })
     }
+}
+
+/// Settings `connect` refuses before it opens a connection.
+fn check_config(cfg: &PgConfig) -> Result<(), SourceError> {
+    // 0 would disable the server-side statement timeout (design section 9).
+    if cfg.statement_timeout_ms == 0 {
+        return Err(SourceError::Unavailable(
+            "statement_timeout_ms is 0: a server-side statement timeout is required".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn commit(tx: Transaction<'_>) -> Result<(), SourceError> {
@@ -349,6 +363,22 @@ fn describe(e: &tokio_postgres::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_zero_statement_timeout_is_refused_before_connecting() {
+        // Nothing listens on port 1; the refusal must come first.
+        let cfg = PgConfig {
+            url: "postgresql://postgres:x@127.0.0.1:1/envio".to_owned(),
+            schema: "public".to_owned(),
+            statement_timeout_ms: 0,
+            application_name: "psy-bridge-reader".to_owned(),
+        };
+        match PgSource::connect(&cfg).await {
+            Err(SourceError::Unavailable(msg)) => assert!(msg.contains("statement_timeout_ms"), "{msg}"),
+            Err(other) => panic!("expected the statement timeout refusal, got {other:?}"),
+            Ok(_) => panic!("expected the statement timeout refusal, got a source"),
+        }
+    }
 
     #[test]
     fn identifiers_are_quoted() {

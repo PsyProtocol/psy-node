@@ -53,6 +53,12 @@ pub struct TreeMetaRow {
 pub struct DepositWithLeaf {
     pub row: DepositRow,
     pub leaf: Hash,
+    /// The DepositLeaf row's deposit_index; the model checks it equals the
+    /// deposit row's.
+    pub leaf_deposit_index: u64,
+    /// The DepositLeaf row's chain_id; the model checks it equals the deposit
+    /// row's.
+    pub leaf_chain_id: u64,
     pub leaf_block_number: u64,
 }
 
