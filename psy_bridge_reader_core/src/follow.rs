@@ -1,5 +1,4 @@
-//! The follow loop: start-up, catch-up and steady ticks read Envio from the
-//! model's cursors; reloads and reconnects keep the published view served.
+//! The follow loop: start-up, catch-up and steady ticks from the model's cursors, reloads and reconnects.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -21,13 +20,20 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(100);
 pub struct FollowConfig {
     pub tick: Duration,
     pub max_rows: usize,
-    /// Cap of the reconnect backoff, which starts at 100 ms and doubles.
     pub backoff_max: Duration,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
 }
 
 impl Default for FollowConfig {
     fn default() -> Self {
-        FollowConfig { tick: Duration::from_millis(500), max_rows: MAX_FOLLOW_ROWS, backoff_max: Duration::from_secs(10) }
+        FollowConfig {
+            tick: Duration::from_millis(500),
+            max_rows: MAX_FOLLOW_ROWS,
+            backoff_max: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(10),
+        }
     }
 }
 
@@ -37,6 +43,10 @@ pub enum FollowConfigError {
     TickOutOfRange(Duration),
     #[error("follow max_rows {0} is outside 1..=50000")]
     MaxRowsOutOfRange(usize),
+    #[error("follow connect_timeout is zero")]
+    ConnectTimeoutZero,
+    #[error("follow read_timeout is zero")]
+    ReadTimeoutZero,
 }
 
 impl FollowConfig {
@@ -46,6 +56,12 @@ impl FollowConfig {
         }
         if self.max_rows == 0 || self.max_rows > MAX_FOLLOW_ROWS {
             return Err(FollowConfigError::MaxRowsOutOfRange(self.max_rows));
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(FollowConfigError::ConnectTimeoutZero);
+        }
+        if self.read_timeout.is_zero() {
+            return Err(FollowConfigError::ReadTimeoutZero);
         }
         Ok(())
     }
@@ -70,12 +86,16 @@ pub async fn run_follow<S, F, Fut>(
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<S, SourceError>> + Send,
 {
-    let mut follow = FollowState { model, metrics, started_at: Instant::now(), is_startup_recorded: false };
+    if let Err(e) = cfg.validate() {
+        tracing::error!(error = %e, "bridge reader follow config refused");
+        return;
+    }
+    let mut follow = FollowState { model, metrics, started_at: Instant::now(), is_startup_recorded: false, is_schema_missing: false };
     let mut source: Option<S> = None;
     let mut backoff = FIRST_BACKOFF;
     loop {
         let step = match source.as_mut() {
-            None => match until_shutdown(&mut shutdown, connect()).await {
+            None => match until_shutdown(&mut shutdown, with_timeout(cfg.connect_timeout, "connect", connect())).await {
                 None => Step::Stop,
                 Some(Ok(connected)) => Step::Connected(connected),
                 Some(Err(e)) => Step::Failed(e),
@@ -83,7 +103,8 @@ pub async fn run_follow<S, F, Fut>(
             Some(src) => {
                 let cursors = follow.model.lock().cursors();
                 let tick_started_at = Instant::now();
-                match until_shutdown(&mut shutdown, src.read_tick(&cursors, cfg.max_rows)).await {
+                let read = with_timeout(cfg.read_timeout, "read", src.read_tick(&cursors, cfg.max_rows));
+                match until_shutdown(&mut shutdown, read).await {
                     None => Step::Stop,
                     Some(Ok(tick)) => {
                         let is_catching_up = follow.apply(tick, tick_started_at) == ApplyOutcome::CatchingUp;
@@ -108,7 +129,7 @@ pub async fn run_follow<S, F, Fut>(
             }
             Step::Failed(e) => {
                 source = None;
-                follow.handle_source_error(&e, backoff);
+                follow.handle_source_error(e, backoff);
                 let at = Instant::now() + backoff;
                 backoff = (backoff * 2).min(cfg.backoff_max).max(FIRST_BACKOFF);
                 at
@@ -128,6 +149,12 @@ async fn until_shutdown<T>(shutdown: &mut watch::Receiver<bool>, work: impl Futu
     }
 }
 
+async fn with_timeout<T>(limit: Duration, call: &str, work: impl Future<Output = Result<T, SourceError>>) -> Result<T, SourceError> {
+    tokio::time::timeout(limit, work)
+        .await
+        .unwrap_or_else(|_| Err(SourceError::Unavailable(format!("{call} timed out after {limit:?}"))))
+}
+
 async fn stop_requested(shutdown: &mut watch::Receiver<bool>) {
     loop {
         if *shutdown.borrow_and_update() || shutdown.changed().await.is_err() {
@@ -141,16 +168,18 @@ struct FollowState {
     metrics: Metrics,
     started_at: Instant,
     is_startup_recorded: bool,
+    is_schema_missing: bool,
 }
 
 impl FollowState {
     fn apply(&mut self, tick: TickData, tick_started_at: Instant) -> ApplyOutcome {
+        self.is_schema_missing = false;
         let progress = tick.progress.clone();
         let (outcome, view) = {
             let mut model = self.model.lock();
             let outcome = model.apply(tick);
             if let ApplyOutcome::Reload(reason) = &outcome {
-                reset_for(&mut model, reason);
+                self.reset_for(&mut model, reason);
             }
             (outcome, model.view())
         };
@@ -174,19 +203,34 @@ impl FollowState {
         outcome
     }
 
-    fn handle_source_error(&self, e: &SourceError, backoff: Duration) {
+    fn handle_source_error(&mut self, e: SourceError, backoff: Duration) {
         tracing::warn!(error = %e, backoff_ms = backoff.as_millis() as u64, "bridge reader Envio source failed");
+        let is_new_schema_missing = matches!(e, SourceError::SchemaMissing(_)) && !self.is_schema_missing;
         let view = {
             let mut model = self.model.lock();
-            if let SourceError::SchemaMissing(_) = e {
+            if is_new_schema_missing {
+                self.is_schema_missing = true;
                 model.reset_all();
+                self.metrics.clear_chain_gauges();
+                self.metrics.inc_reload("schema_missing");
             }
             model.view()
         };
-        if let SourceError::SchemaMissing(_) = e {
-            self.metrics.inc_reload("schema_missing");
-        }
         self.set_view_metrics(&view, &[]);
+    }
+
+    fn reset_for(&self, model: &mut Model, reason: &ReloadReason) {
+        match reason {
+            ReloadReason::InvariantViolated { chain_index, .. } | ReloadReason::TreeMismatch { chain_index } => {
+                model.reset_chain(*chain_index)
+            }
+            // reset_chain keeps the chain_id's committed safe block and claims, so only reset_all lowers them.
+            ReloadReason::IdentityChanged | ReloadReason::ProgressBelowCommitted { .. } => {
+                model.reset_all();
+                self.metrics.clear_chain_gauges();
+            }
+            ReloadReason::WindowOverLimit => {}
+        }
     }
 
     /// `follow_lag_blocks` is the tick's Envio progress block minus the
@@ -202,18 +246,6 @@ impl FollowState {
             self.metrics.set_follow_lag_blocks(p.chain_id, p.progress_block.saturating_sub(served).max(0));
         }
         self.metrics.refresh_process_rss();
-    }
-}
-
-fn reset_for(model: &mut Model, reason: &ReloadReason) {
-    match reason {
-        ReloadReason::InvariantViolated { chain_index, .. } | ReloadReason::TreeMismatch { chain_index } => {
-            model.reset_chain(*chain_index)
-        }
-        // reset_chain keeps the chain_id's committed safe block and claims, so only reset_all lowers them.
-        ReloadReason::IdentityChanged | ReloadReason::WindowOverLimit | ReloadReason::ProgressBelowCommitted { .. } => {
-            model.reset_all()
-        }
     }
 }
 
@@ -260,14 +292,29 @@ mod tests {
         reads: VecDeque<Result<TickData, SourceError>>,
         read_latency: Duration,
         max_rows: usize,
+        hangs: Hangs,
         events: Vec<Event>,
         stop: watch::Sender<bool>,
     }
 
+    /// The 0-based connect or read call that never resolves.
+    #[derive(Default)]
+    struct Hangs {
+        connect: Option<usize>,
+        read: Option<usize>,
+    }
+
     impl Script {
-        fn record(&mut self, call: Call, cursors: Option<Cursors>) {
+        /// Records the call; returns whether it hangs.
+        fn record(&mut self, call: Call, cursors: Option<Cursors>) -> bool {
             let at_ms = self.started_at.elapsed().as_millis();
+            let n = self.events.iter().filter(|e| e.call == call).count();
             self.events.push(Event { call, at_ms, cursors, view: self.view.load_full() });
+            let hang = match call {
+                Call::Connect => self.hangs.connect,
+                Call::Read => self.hangs.read,
+            };
+            hang == Some(n)
         }
     }
 
@@ -280,11 +327,14 @@ mod tests {
             let script = self.script.clone();
             let cursors = cursors.clone();
             async move {
-                let (next, latency) = {
+                let step = {
                     let mut s = script.lock();
                     assert_eq!(max_rows, s.max_rows);
-                    s.record(Call::Read, Some(cursors));
-                    (s.reads.pop_front(), s.read_latency)
+                    let hangs = s.record(Call::Read, Some(cursors));
+                    (!hangs).then(|| (s.reads.pop_front(), s.read_latency))
+                };
+                let Some((next, latency)) = step else {
+                    return std::future::pending().await;
                 };
                 let Some(next) = next else {
                     script.lock().stop.send_replace(true);
@@ -324,6 +374,16 @@ mod tests {
         reads: Vec<Result<TickData, SourceError>>,
         read_latency: Duration,
     ) -> Run {
+        run_with_hangs(cfg, connects, reads, read_latency, Hangs::default()).await
+    }
+
+    async fn run_with_hangs(
+        cfg: FollowConfig,
+        connects: Vec<Result<(), SourceError>>,
+        reads: Vec<Result<TickData, SourceError>>,
+        read_latency: Duration,
+        hangs: Hangs,
+    ) -> Run {
         let model = Arc::new(Mutex::new(Model::new()));
         let (stop, shutdown) = watch::channel(false);
         let script = Arc::new(Mutex::new(Script {
@@ -333,6 +393,7 @@ mod tests {
             reads: reads.into(),
             read_latency,
             max_rows: cfg.max_rows,
+            hangs,
             events: Vec::new(),
             stop,
         }));
@@ -342,8 +403,11 @@ mod tests {
             async move {
                 let result = {
                     let mut s = script.lock();
-                    s.record(Call::Connect, None);
-                    s.connects.pop_front().unwrap_or(Ok(()))
+                    let hangs = s.record(Call::Connect, None);
+                    (!hangs).then(|| s.connects.pop_front().unwrap_or(Ok(())))
+                };
+                let Some(result) = result else {
+                    return std::future::pending().await;
                 };
                 result.map(|()| ScriptedSource { script })
             }
@@ -445,6 +509,106 @@ mod tests {
         assert!(by_address(after, 1, 0, "A").unwrap().is_empty());
         assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"schema_missing\"} "), Some(1.0));
         assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"identity_changed\"} "), None);
+        assert_eq!(r.metric("psy_bridge_reader_window_rows{chain_index=\"1\"} "), None);
+        assert_eq!(r.metric("psy_bridge_reader_window_rows{chain_index=\"0\"} "), Some(1.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schema_missing_resets_once_while_it_persists() {
+        let mut a = TickBuilder::new();
+        a.progress(1, 100, 8);
+        a.deposit(0, 1, 95, "A");
+        let tick = a.tick(&Cursors::default());
+        let missing = || SourceError::SchemaMissing("index on DepositLeaf".to_owned());
+        let reads = vec![Ok(tick.clone()), Err(missing()), Ok(tick.clone()), Err(missing())];
+        let connects = vec![Ok(()), Err(missing()), Err(unavailable()), Err(missing()), Ok(()), Ok(())];
+        let r = run(FollowConfig::default(), connects, reads, Duration::ZERO).await;
+        use Call::{Connect, Read};
+        assert_eq!(
+            r.calls(),
+            [
+                (Connect, 0),
+                (Read, 0),
+                (Read, 500),
+                (Connect, 600),
+                (Connect, 800),
+                (Connect, 1200),
+                (Connect, 2000),
+                (Read, 2000),
+                (Read, 2500),
+                (Connect, 2600),
+                (Read, 2600),
+            ]
+        );
+        let reset = &r.events[3].view;
+        assert!(!reset.status().ready);
+        for e in &r.events[3..=7] {
+            assert!(Arc::ptr_eq(&e.view, reset), "a persisting SchemaMissing must not reset again");
+        }
+        assert!(r.events[8].view.status().ready);
+        let reset_again = &r.events[9].view;
+        assert!(!reset_again.status().ready);
+        assert!(reset_again.revision().epoch > reset.revision().epoch);
+        assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"schema_missing\"} "), Some(2.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_read_times_out_and_reconnects_keeping_the_view() {
+        let mut a = TickBuilder::new();
+        a.progress(1, 100, 8);
+        a.deposit(0, 1, 95, "A");
+        let first = a.tick(&Cursors::default());
+        a.deposit(0, 1, 96, "A");
+        let second = a.tick(&Cursors::default());
+        let hangs = Hangs { read: Some(1), ..Hangs::default() };
+        let r = run_with_hangs(FollowConfig::default(), vec![], vec![Ok(first), Ok(second)], Duration::ZERO, hangs).await;
+        use Call::{Connect, Read};
+        assert_eq!(r.calls(), [(Connect, 0), (Read, 0), (Read, 500), (Connect, 10_600), (Read, 10_600), (Read, 11_100)]);
+        let kept = &r.events[2].view;
+        assert!(kept.status().ready);
+        for e in &r.events[2..=4] {
+            assert!(Arc::ptr_eq(&e.view, kept));
+        }
+        assert_eq!(by_address(&r.events[5].view, 1, 0, "A").unwrap(), a.rows(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_connect_times_out_and_retries() {
+        let mut a = TickBuilder::new();
+        a.progress(1, 100, 8);
+        a.deposit(0, 1, 95, "A");
+        let cfg = FollowConfig { connect_timeout: Duration::from_secs(2), ..FollowConfig::default() };
+        let hangs = Hangs { connect: Some(0), ..Hangs::default() };
+        let r = run_with_hangs(cfg, vec![], vec![Ok(a.tick(&Cursors::default()))], Duration::ZERO, hangs).await;
+        use Call::{Connect, Read};
+        assert_eq!(r.calls(), [(Connect, 0), (Connect, 2100), (Read, 2100), (Read, 2600)]);
+        assert!(!r.events[1].view.status().ready);
+        assert_eq!(by_address(&r.events[3].view, 1, 0, "A").unwrap(), a.rows(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn window_over_limit_keeps_the_view_and_alarms() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit(0, 1, 95, "A");
+        b.deposit(0, 1, 96, "A");
+        let first = b.tick(&Cursors::default());
+        b.deposit(0, 1, 97, "A");
+        b.deposit(0, 1, 98, "A");
+        let over = b.tick_limited(&Cursors::default(), 2);
+        assert!(over.truncated);
+        let full = b.tick(&Cursors::default());
+        let r = run(FollowConfig::default(), vec![], vec![Ok(first), Ok(over), Ok(full)], Duration::ZERO).await;
+        use Call::{Connect, Read};
+        assert_eq!(r.calls(), [(Connect, 0), (Read, 0), (Read, 500), (Read, 1000), (Read, 1500)]);
+        let kept = &r.events[2].view;
+        assert!(kept.status().ready);
+        assert!(Arc::ptr_eq(&r.events[3].view, kept));
+        assert_eq!(r.events[3].cursors, r.events[2].cursors);
+        assert_eq!(local_count(r.events[3].cursors.as_ref().unwrap(), 0), 0);
+        assert_eq!(by_address(&r.events[3].view, 1, 0, "A").unwrap(), b.rows(0)[..2].to_vec());
+        assert_eq!(by_address(&r.events[4].view, 1, 0, "A").unwrap(), b.rows(0));
+        assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"window_over_limit\"} "), Some(1.0));
     }
 
     #[tokio::test(start_paused = true)]
@@ -533,6 +697,47 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn invariant_violation_resets_only_that_chain() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8).progress(2, 100, 8);
+        for block in [10, 11, 95] {
+            b.deposit(0, 1, block, "A");
+            b.deposit(1, 2, block, "A");
+        }
+        let mut expected = Model::new();
+        let first = b.tick(&expected.cursors());
+        expected.apply(first.clone());
+        let after_first = expected.cursors();
+        b.deposit(0, 1, 96, "A");
+        b.deposits.get_mut(&0).unwrap()[3].row.chain_local_deposit_index = 9;
+        let violating = b.tick(&after_first);
+        b.deposits.get_mut(&0).unwrap()[3].row.chain_local_deposit_index = 3;
+        let mut after_reset = after_first.clone();
+        after_reset.deposits.insert(0, DepositCursor::default());
+        let repaired = b.tick(&after_reset);
+        let r = run(FollowConfig::default(), vec![], vec![Ok(first), Ok(violating), Ok(repaired)], Duration::ZERO).await;
+        use Call::{Connect, Read};
+        assert_eq!(r.calls(), [(Connect, 0), (Read, 0), (Read, 500), (Read, 1000), (Read, 1500)]);
+
+        let before = &r.events[2].view;
+        assert!(before.status().ready);
+        let reloading = &r.events[3];
+        assert_eq!(local_count(&after_first, 1), 2);
+        assert_eq!(reloading.cursors.as_ref(), Some(&after_reset));
+        let status = reloading.view.status();
+        assert!(!status.chains[0].ready && status.chains[1].ready);
+        assert!(matches!(by_address(&reloading.view, 1, 0, "A"), Err(ReadError::NotReady(_))));
+        assert!(Arc::ptr_eq(&before.chains[&1].window, &reloading.view.chains[&1].window));
+
+        let after = &r.events[4].view;
+        assert!(after.status().ready);
+        assert_eq!(by_address(after, 1, 0, "A").unwrap(), b.rows(0));
+        assert_eq!(by_address(after, 2, 1, "A").unwrap(), b.rows(1));
+        assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"invariant_violated\"} "), Some(1.0));
+        assert_eq!(r.metric("psy_bridge_reader_tree_mismatch_total "), Some(0.0));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn progress_below_committed_resets_everything() {
         let mut a = TickBuilder::new();
         a.progress(1, 100, 8);
@@ -582,6 +787,11 @@ mod tests {
         for max_rows in [0, 50_001] {
             assert_eq!(FollowConfig { max_rows, ..FollowConfig::default() }.validate(), Err(FollowConfigError::MaxRowsOutOfRange(max_rows)));
         }
+        let zero = Duration::ZERO;
+        assert_eq!(FollowConfig { connect_timeout: zero, ..FollowConfig::default() }.validate(), Err(FollowConfigError::ConnectTimeoutZero));
+        assert_eq!(FollowConfig { read_timeout: zero, ..FollowConfig::default() }.validate(), Err(FollowConfigError::ReadTimeoutZero));
+        let refused = run(FollowConfig { tick: zero, ..FollowConfig::default() }, vec![], vec![], Duration::ZERO).await;
+        assert!(refused.events.is_empty(), "a refused config must not connect");
 
         let mut b = TickBuilder::new();
         b.progress(1, 100, 8);
