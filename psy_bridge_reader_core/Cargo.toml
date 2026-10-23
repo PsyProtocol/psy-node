@@ -1,0 +1,19 @@
+[package]
+name = "psy_bridge_reader_core"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[features]
+# Reference tree functions and the Envio fixture loader, for tests in this
+# crate and in crates that depend on it.
+test-support = ["dep:serde_json"]
+
+[dependencies]
+parth_core = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

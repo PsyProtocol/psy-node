@@ -30,6 +30,7 @@ members = [
     "psy_cli/psy_relayer_cli",
     "psy_cli/guardian_common",
     "psy_jtmb_testing_core",
+    "psy_bridge_reader_core",
 
     # ---- Client/Prover crates ----
     "client_prover/psy_core/kvq",

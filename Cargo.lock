@@ -7425,6 +7425,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_bridge_reader_core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "parth_core",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "psy_cli_common"
 version = "0.1.0"
 dependencies = [
