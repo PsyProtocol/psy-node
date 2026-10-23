@@ -27,6 +27,11 @@ impl UpperLevels {
         nodes.get(usize::try_from(index).ok()?).copied()
     }
 
+    /// Number of stored nodes over all levels.
+    pub fn node_count(&self) -> usize {
+        self.levels.iter().map(Vec::len).sum()
+    }
+
     /// Appends each node to its level. Panics unless every index equals that
     /// level's current length, so nodes can be neither skipped nor rewritten.
     /// The whole batch is checked first: a rejected batch appends nothing.

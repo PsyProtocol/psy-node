@@ -35,7 +35,7 @@ pub const MAX_BODY_BYTES: usize = 256 * 1024;
 /// A list read over this many rows runs on the blocking pool.
 const INLINE_ROWS: usize = 100;
 
-const LANES: [Lane; 4] = [Lane::BridgeProgress, Lane::ClaimProof, Lane::Interactive, Lane::Background];
+const LANES: [Lane; 4] = Lane::ALL;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -91,20 +91,6 @@ fn retry_after(code: ErrorCode) -> Option<u32> {
         | ErrorCode::SchemaMismatch
         | ErrorCode::Unavailable => Some(1),
         ErrorCode::BadRequest | ErrorCode::Unauthorized | ErrorCode::Internal => None,
-    }
-}
-
-fn code_name(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::BadRequest => "bad_request",
-        ErrorCode::Unauthorized => "unauthorized",
-        ErrorCode::CountNotIndexed => "count_not_indexed",
-        ErrorCode::NotReady => "not_ready",
-        ErrorCode::Overloaded => "overloaded",
-        ErrorCode::Timeout => "timeout",
-        ErrorCode::SchemaMismatch => "schema_mismatch",
-        ErrorCode::Unavailable => "unavailable",
-        ErrorCode::Internal => "internal",
     }
 }
 
@@ -171,14 +157,11 @@ fn authenticate(token: &str, headers: &HeaderMap) -> Result<(), ApiError> {
 
 fn lane_header(headers: &HeaderMap) -> Result<Option<Lane>, ApiError> {
     let Some(value) = headers.get(LANE_HEADER) else { return Ok(None) };
-    let lane = match value.as_bytes() {
-        b"bridge_progress" => Lane::BridgeProgress,
-        b"claim_proof" => Lane::ClaimProof,
-        b"interactive" => Lane::Interactive,
-        b"background" => Lane::Background,
-        _ => return Err(ApiError::new(ErrorCode::BadRequest, format!("unknown {LANE_HEADER} value"))),
-    };
-    Ok(Some(lane))
+    let parsed = value.to_str().ok().and_then(Lane::parse);
+    match parsed {
+        Some(lane) => Ok(Some(lane)),
+        None => Err(ApiError::new(ErrorCode::BadRequest, format!("unknown {LANE_HEADER} value"))),
+    }
 }
 
 fn refresh_lane(admission: &Admission, metrics: &Metrics, lane: Lane) {
@@ -257,8 +240,8 @@ where
         }
     };
     let permit = permit.map_err(|code| {
-        state.metrics.inc_shed(lane.clone(), code_name(code));
-        ApiError::new(code, format!("lane {} is full", lane_label(&lane)))
+        state.metrics.inc_shed(lane.clone(), code.as_str());
+        ApiError::new(code, format!("lane {} is full", lane.as_str()))
     })?;
     refresh_lane(&state.admission, &state.metrics, lane.clone());
     // The deadline counts from arrival, so it covers the queue wait too.
@@ -286,16 +269,7 @@ where
     };
     match tokio::time::timeout_at(deadline, work).await {
         Ok(result) => result,
-        Err(_) => Err(ApiError::new(ErrorCode::Timeout, format!("lane {} deadline passed", lane_label(&lane)))),
-    }
-}
-
-fn lane_label(lane: &Lane) -> &'static str {
-    match lane {
-        Lane::BridgeProgress => "bridge_progress",
-        Lane::ClaimProof => "claim_proof",
-        Lane::Interactive => "interactive",
-        Lane::Background => "background",
+        Err(_) => Err(ApiError::new(ErrorCode::Timeout, format!("lane {} deadline passed", lane.as_str()))),
     }
 }
 
@@ -316,7 +290,7 @@ async fn deposits_by_address(
     headers: HeaderMap,
     q: Result<Query<DepositsByAddressQuery>, QueryRejection>,
 ) -> Response {
-    let blocking = |q: &DepositsByAddressQuery| q.limit as usize > INLINE_ROWS;
+    let blocking = |q: &DepositsByAddressQuery| q.offset.saturating_add(u64::from(q.limit)) > INLINE_ROWS as u64;
     run(&s, &headers, "deposits_by_address", Lane::Interactive, query(q), blocking, View::deposits_by_address).await
 }
 
@@ -705,6 +679,48 @@ mod tests {
         for w in waiting {
             assert_eq!(w.await.unwrap(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_query_parameter_is_400() {
+        let (m, _) = ready_model();
+        let s = state_of(&m, &Budgets::default());
+        let r = send(&s, req("/v1/tree/root?chain_index=0&count=5&chain_idx=1")).await;
+        assert_error(&r, 400, "bad_request", None);
+        assert_eq!(send(&s, req(ROOT)).await.0, StatusCode::OK);
+    }
+
+    #[test]
+    fn a_timed_out_read_is_503_timeout_with_retry_after() {
+        // One blocking thread, held by the test: the request's blocking read
+        // cannot start, so it outlives its deadline whatever the machine speed.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().max_blocking_threads(1).build().unwrap();
+        rt.block_on(async {
+            let (m, _) = ready_model();
+            let mut budgets = small_budgets();
+            budgets.interactive.queue_wait = Duration::from_millis(5);
+            budgets.interactive.deadline = Duration::from_millis(50);
+            let s = state_of(&m, &budgets);
+            let (release, hold) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = hold.recv();
+            });
+            tokio::task::yield_now().await;
+            let wide = "/v1/deposits/by-address?shield_address=A&chain_id=1&limit=101&offset=0";
+            let r = send(&s, req(wide)).await;
+            assert_error(&r, 503, "timeout", Some("1"));
+            assert_eq!(r.2["retry_after_seconds"], 1);
+            // The read still holds its slot until it runs; free the thread.
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while s.admission.in_flight(Lane::Interactive) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
     }
 
     #[tokio::test]

@@ -738,4 +738,24 @@ mod tests {
             assert_eq!(m.view().revision.seq, seq);
         }
     }
+
+    #[test]
+    fn resident_estimate_grows_with_rows() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        let mut m = Model::new();
+        let empty = m.resident_bytes_estimate();
+        for block in [10, 11, 12] {
+            b.deposit(0, 1, block, "A");
+        }
+        b.claim(1, 10, "n1");
+        assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Published { .. }));
+        let one = m.resident_bytes_estimate();
+        for block in [13, 14, 15] {
+            b.deposit(0, 1, block, "A");
+        }
+        assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Published { .. }));
+        let two = m.resident_bytes_estimate();
+        assert!(empty < one && one < two, "{empty} {one} {two}");
+    }
 }

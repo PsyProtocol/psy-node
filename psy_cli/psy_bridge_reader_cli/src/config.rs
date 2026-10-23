@@ -10,7 +10,7 @@ use psy_bridge_reader_core::admission::{Budgets, LaneBudget};
 
 const MAX_TOKEN_BYTES: u64 = 4096;
 
-#[derive(Debug, Clone, Parser)]
+#[derive(Clone, Parser)]
 #[command(name = "psy-bridge-reader")]
 pub struct Config {
     #[arg(long, env = "PSY_BRIDGE_READER_LISTEN", default_value = "127.0.0.1:8740")]
@@ -62,6 +62,50 @@ pub struct Config {
     pub background_queue_wait_ms: Option<u64>,
     #[arg(long, env = "PSY_BRIDGE_READER_BACKGROUND_DEADLINE_MS")]
     pub background_deadline_ms: Option<u64>,
+}
+
+/// Scheme and host of a database URL; credentials, port, path and query are
+/// dropped. `<redacted>` when the URL does not parse.
+fn redact_database_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return "<redacted>".to_string() };
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let host_part = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let host = host_part.split(['/', ':']).next().unwrap_or("");
+    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) || host.is_empty() {
+        return "<redacted>".to_string();
+    }
+    format!("{scheme}://{host}")
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("token_file", &self.token_file)
+            .field("db_schema", &self.db_schema)
+            .field("tick_ms", &self.tick_ms)
+            .field("max_rows_per_tick", &self.max_rows_per_tick)
+            .field("memory_budget_bytes", &self.memory_budget_bytes)
+            .field("statement_timeout_ms", &self.statement_timeout_ms)
+            .field("bridge_progress_concurrency", &self.bridge_progress_concurrency)
+            .field("bridge_progress_max_queue", &self.bridge_progress_max_queue)
+            .field("bridge_progress_queue_wait_ms", &self.bridge_progress_queue_wait_ms)
+            .field("bridge_progress_deadline_ms", &self.bridge_progress_deadline_ms)
+            .field("claim_proof_concurrency", &self.claim_proof_concurrency)
+            .field("claim_proof_max_queue", &self.claim_proof_max_queue)
+            .field("claim_proof_queue_wait_ms", &self.claim_proof_queue_wait_ms)
+            .field("claim_proof_deadline_ms", &self.claim_proof_deadline_ms)
+            .field("interactive_concurrency", &self.interactive_concurrency)
+            .field("interactive_max_queue", &self.interactive_max_queue)
+            .field("interactive_queue_wait_ms", &self.interactive_queue_wait_ms)
+            .field("interactive_deadline_ms", &self.interactive_deadline_ms)
+            .field("background_concurrency", &self.background_concurrency)
+            .field("background_max_queue", &self.background_max_queue)
+            .field("background_queue_wait_ms", &self.background_queue_wait_ms)
+            .field("background_deadline_ms", &self.background_deadline_ms)
+            .field("database_url", &redact_database_url(&self.database_url))
+            .finish()
+    }
 }
 
 fn apply(
@@ -165,7 +209,8 @@ impl Config {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("token file {}: {e}", path.display()))?;
         let token = raw.strip_suffix('\n').unwrap_or(&raw);
-        if token.is_empty() {
+        let token = token.strip_suffix('\r').unwrap_or(token);
+        if token.trim().is_empty() {
             return Err(format!("token file {} is empty", path.display()));
         }
         Ok(token.to_string())
@@ -242,8 +287,36 @@ mod tests {
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(cfg().read_token().unwrap(), "secret");
-        std::fs::write(&path, "").unwrap();
-        assert!(cfg().read_token().is_err());
+        std::fs::write(&path, "crlf\r\n").unwrap();
+        assert_eq!(cfg().read_token().unwrap(), "crlf");
+        std::fs::write(&path, "bare").unwrap();
+        assert_eq!(cfg().read_token().unwrap(), "bare");
+        for blank in ["", "\n", "\r\n", "  \n", " \t\r\n"] {
+            std::fs::write(&path, blank).unwrap();
+            assert!(cfg().read_token().is_err(), "{blank:?}");
+        }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_database_password() {
+        for url in [
+            "postgres://user:hunter2@db.internal:5432/envio?sslmode=require",
+            "postgres://user:hunt@er2@db.internal/envio",
+            "not a url with hunter2",
+        ] {
+            let mut c = parse(&[]);
+            c.database_url = url.to_string();
+            let out = format!("{c:?}");
+            assert!(!out.contains("hunter2") && !out.contains("hunt@er"), "{out}");
+            assert!(!out.contains("user:"), "{out}");
+        }
+        let mut c = parse(&[]);
+        c.database_url = "postgres://user:hunter2@db.internal:5432/envio".to_string();
+        let out = format!("{c:?}");
+        assert!(out.contains("postgres://db.internal"), "{out}");
+        assert!(out.contains("db_schema"), "{out}");
+        c.database_url = "garbage".to_string();
+        assert!(format!("{c:?}").contains("<redacted>"));
     }
 }

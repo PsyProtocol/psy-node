@@ -21,9 +21,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use psy_bridge_reader_api::{EnvioChainStatus, Revision};
+use psy_bridge_reader_api::{DepositRow, EnvioChainStatus, FinalizedBatchRow, Revision, WithdrawalClaimRow};
 
-use self::chain::ChainData;
+use self::chain::{ChainData, RowIndex};
 use self::claims::ClaimData;
 
 pub use chain::ChainView;
@@ -168,6 +168,65 @@ impl Model {
             committed_safe_blocks: BTreeMap::new(),
             view: Arc::new(ArcSwap::from_pointee(View::empty(revision, STARTING))),
         }
+    }
+
+    /// An estimate of the model's own structures, in bytes: the capacity of
+    /// every row string, 32 bytes per leaf hash and per stored upper node, and
+    /// 16 bytes per index entry, over the committed parts and the current
+    /// window. Process RSS is exported separately. Nothing is cached; call it
+    /// once per tick.
+    pub fn resident_bytes_estimate(&self) -> u64 {
+        const HASH: u64 = 32;
+        const INDEX_ENTRY: u64 = 16;
+        fn deposits(rows: &[DepositRow]) -> u64 {
+            rows.iter()
+                .map(|r| {
+                    [&r.id, &r.shield_address, &r.token, &r.l2_token_contract_id, &r.amount, &r.note_commitment, &r.leaf_hash, &r.tx_hash]
+                        .iter()
+                        .map(|s| s.capacity() as u64)
+                        .sum::<u64>()
+                })
+                .sum()
+        }
+        fn claims(rows: &[WithdrawalClaimRow]) -> u64 {
+            rows.iter()
+                .map(|r| [&r.id, &r.nullifier, &r.recipient, &r.token, &r.amount, &r.tx_hash].iter().map(|s| s.capacity() as u64).sum::<u64>())
+                .sum()
+        }
+        fn batches(rows: &[FinalizedBatchRow]) -> u64 {
+            rows.iter()
+                .map(|r| {
+                    [&r.id, &r.finalized_checkpoint_id, &r.deposit_tree_root, &r.withdrawal_tree_root, &r.tx_hash]
+                        .iter()
+                        .map(|s| s.capacity() as u64)
+                        .sum::<u64>()
+                })
+                .sum()
+        }
+        fn entries(index: &RowIndex) -> u64 {
+            index.values().map(|v| v.len() as u64).sum::<u64>() * INDEX_ENTRY
+        }
+        let mut total = 0u64;
+        for state in self.chains.values() {
+            let c = state.data.committed.read();
+            total += deposits(&c.deposits) + c.leaves.len() as u64 * HASH + c.upper.node_count() as u64 * HASH;
+            total += entries(&c.by_address) + entries(&c.by_tx);
+        }
+        for data in self.claim_chains.values() {
+            let c = data.committed.read();
+            total += claims(&c.claims) + batches(&c.batches) + entries(&c.by_nullifier);
+        }
+        let view = self.view.load();
+        for chain in view.chains.values() {
+            let w = &chain.window;
+            total += deposits(&w.deposits) + w.leaves.len() as u64 * HASH + w.nodes.len() as u64 * HASH;
+            total += entries(&w.by_address) + entries(&w.by_tx);
+        }
+        for chain in view.claim_chains.values() {
+            let w = &chain.window;
+            total += claims(&w.claims) + batches(&w.batches) + entries(&w.by_nullifier);
+        }
+        total
     }
 
     /// The committed boundaries the next read starts from.

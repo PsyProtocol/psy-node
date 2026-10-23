@@ -28,13 +28,32 @@ pub struct Revision {
 }
 
 /// Admission lane of a request, sent in [`LANE_HEADER`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lane {
     BridgeProgress,
     ClaimProof,
     Interactive,
     Background,
+}
+
+impl Lane {
+    pub const ALL: [Lane; 4] = [Lane::BridgeProgress, Lane::ClaimProof, Lane::Interactive, Lane::Background];
+
+    /// The wire name, identical to the serde name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lane::BridgeProgress => "bridge_progress",
+            Lane::ClaimProof => "claim_proof",
+            Lane::Interactive => "interactive",
+            Lane::Background => "background",
+        }
+    }
+
+    /// Parses a wire name; `None` for anything else.
+    pub fn parse(s: &str) -> Option<Lane> {
+        Lane::ALL.into_iter().find(|l| l.as_str() == s)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -111,6 +130,7 @@ pub struct EnvioChainStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepositsByAddressQuery {
     pub shield_address: String,
     pub chain_id: u64,
@@ -130,6 +150,7 @@ pub struct DepositsByAddressResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepositByIndexQuery {
     pub chain_index: u64,
     pub chain_id: u64,
@@ -143,6 +164,7 @@ pub struct DepositByIndexResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepositsByTxQuery {
     pub tx_hash: String,
     pub chain_index: u64,
@@ -155,6 +177,7 @@ pub struct DepositsByTxResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrefixQuery {
     pub chain_index: u64,
     pub chain_id: u64,
@@ -169,6 +192,7 @@ pub struct PrefixResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WithdrawalClaimsRequest {
     pub chain_id: u64,
     pub nullifiers: Vec<String>,
@@ -183,6 +207,7 @@ pub struct WithdrawalClaimsResponse {
 /// Takes exactly one of `count` (chain-local) or `target_deposit_count` +
 /// `chain_id` (global, resolved through the prefix probe in the same view).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeRootQuery {
     pub chain_index: u64,
     pub count: Option<u64>,
@@ -202,6 +227,7 @@ pub struct TreeRootResponse {
 /// `chain_id` (global, resolved through the prefix probe in the same view),
 /// and exactly one of `leaf` (chain-local) or `deposit_index` + `chain_id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimProofQuery {
     pub chain_index: u64,
     pub leaf: Option<u64>,
@@ -232,6 +258,7 @@ pub struct DepositProof {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExplorerQuery {
     pub chain_id: u64,
 }
@@ -258,6 +285,33 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    pub const ALL: [ErrorCode; 9] = [
+        ErrorCode::BadRequest,
+        ErrorCode::Unauthorized,
+        ErrorCode::CountNotIndexed,
+        ErrorCode::NotReady,
+        ErrorCode::Overloaded,
+        ErrorCode::Timeout,
+        ErrorCode::SchemaMismatch,
+        ErrorCode::Unavailable,
+        ErrorCode::Internal,
+    ];
+
+    /// The wire name, identical to the serde name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::BadRequest => "bad_request",
+            ErrorCode::Unauthorized => "unauthorized",
+            ErrorCode::CountNotIndexed => "count_not_indexed",
+            ErrorCode::NotReady => "not_ready",
+            ErrorCode::Overloaded => "overloaded",
+            ErrorCode::Timeout => "timeout",
+            ErrorCode::SchemaMismatch => "schema_mismatch",
+            ErrorCode::Unavailable => "unavailable",
+            ErrorCode::Internal => "internal",
+        }
+    }
+
     pub fn http_status(self) -> u16 {
         match self {
             ErrorCode::BadRequest => 400,
@@ -306,5 +360,38 @@ mod tests {
     fn a_missing_deposit_serializes_as_null() {
         let r = DepositByIndexResponse { revision: Revision { epoch: 1, seq: 2, as_of_unix_ms: 3 }, deposit: None };
         assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"revision":{"epoch":1,"seq":2,"as_of_unix_ms":3},"deposit":null}"#);
+    }
+
+    #[test]
+    fn unknown_query_fields_are_rejected() {
+        let ok = r#"{"chain_id":1}"#;
+        assert!(serde_json::from_str::<ExplorerQuery>(ok).is_ok());
+        let typo = r#"{"chain_id":1,"chain_idx":2}"#;
+        assert!(serde_json::from_str::<ExplorerQuery>(typo).is_err());
+        let tree = r#"{"chain_index":0,"count":5,"chain_idx":2}"#;
+        assert!(serde_json::from_str::<TreeRootQuery>(tree).is_err());
+        let claims = r#"{"chain_id":1,"nullifiers":[],"nullifier":[]}"#;
+        assert!(serde_json::from_str::<WithdrawalClaimsRequest>(claims).is_err());
+        assert!(serde_json::from_str::<WithdrawalClaimsRequest>(r#"{"chain_id":1,"nullifiers":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn lane_and_code_names_match_serde() {
+        for lane in Lane::ALL {
+            assert_eq!(serde_json::to_value(lane).unwrap(), serde_json::Value::String(lane.as_str().into()));
+            assert_eq!(Lane::parse(lane.as_str()), Some(lane));
+        }
+        assert_eq!(Lane::parse("bogus"), None);
+        for code in ErrorCode::ALL {
+            assert_eq!(serde_json::to_value(code).unwrap(), serde_json::Value::String(code.as_str().into()));
+        }
+        // ALL lists every variant: this match fails to compile if one is added.
+        for code in ErrorCode::ALL {
+            match code {
+                ErrorCode::BadRequest | ErrorCode::Unauthorized | ErrorCode::CountNotIndexed | ErrorCode::NotReady
+                | ErrorCode::Overloaded | ErrorCode::Timeout | ErrorCode::SchemaMismatch | ErrorCode::Unavailable
+                | ErrorCode::Internal => {}
+            }
+        }
     }
 }

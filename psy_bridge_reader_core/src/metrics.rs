@@ -35,15 +35,6 @@ pub struct Metrics {
     shed_total: IntCounterVec,
 }
 
-fn lane_name(lane: &Lane) -> &'static str {
-    match lane {
-        Lane::BridgeProgress => "bridge_progress",
-        Lane::ClaimProof => "claim_proof",
-        Lane::Interactive => "interactive",
-        Lane::Background => "background",
-    }
-}
-
 fn status_class(status: u16) -> &'static str {
     match status {
         100..=199 => "1xx",
@@ -189,17 +180,17 @@ impl Metrics {
     }
 
     pub fn set_lane_queue(&self, lane: Lane, len: i64) {
-        self.lane_queue.with_label_values(&[lane_name(&lane)]).set(len);
+        self.lane_queue.with_label_values(&[lane.as_str()]).set(len);
     }
 
     pub fn set_lane_in_flight(&self, lane: Lane, count: i64) {
-        self.lane_in_flight.with_label_values(&[lane_name(&lane)]).set(count);
+        self.lane_in_flight.with_label_values(&[lane.as_str()]).set(count);
     }
 
     /// Counts a finished request (status bucketed by class) and records its
     /// latency.
     pub fn observe_request(&self, endpoint: &'static str, lane: Lane, status: u16, seconds: f64) {
-        let lane = lane_name(&lane);
+        let lane = lane.as_str();
         self.requests_total
             .with_label_values(&[endpoint, lane, status_class(status)])
             .inc();
@@ -207,7 +198,7 @@ impl Metrics {
     }
 
     pub fn inc_shed(&self, lane: Lane, code: &'static str) {
-        self.shed_total.with_label_values(&[lane_name(&lane), code]).inc();
+        self.shed_total.with_label_values(&[lane.as_str(), code]).inc();
     }
 
     /// Text exposition format, for `/metrics`.
