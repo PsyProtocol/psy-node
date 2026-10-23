@@ -207,6 +207,7 @@ static_assertions = "1.1.0"
 # ---- Concurrency ----
 rayon = "1.11.0"
 parking_lot = "0.12.5"
+arc-swap = "1.7.1"
 
 # ---- Logging / Tracing ----
 log = { version = "0.4.14", default-features = false }

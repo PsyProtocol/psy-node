@@ -7450,8 +7450,10 @@ dependencies = [
 name = "psy_bridge_reader_core"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "hex",
  "libc",
+ "parking_lot",
  "parth_core",
  "prometheus",
  "psy_bridge_reader_api",
