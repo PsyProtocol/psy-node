@@ -5,9 +5,10 @@ For each requested scale it initializes the schema with Envio's own code
 (generated/src/db/Migrations.res.js, i.e. the DDL `envio start` runs on an
 empty database), loads deterministic synthetic data, rebuilds the generated
 indexes from their captured definitions, and then plans and runs every shape in
-queries.sql with EXPLAIN (ANALYZE, BUFFERS) under both custom and generic
-plans. A gated shape fails on a Seq Scan (except DepositTreeMeta), on a missing
-expected index, on more shared buffers than its bound, or on a wrong result.
+the registered queries (psy_bridge_reader_api/sql/queries.sql, or --queries
+PATH) with EXPLAIN (ANALYZE, BUFFERS) under both custom and generic plans. A
+gated shape fails on a Seq Scan (except DepositTreeMeta), on a missing expected
+index, on more shared buffers than its bound, or on a wrong result.
 
 Usage, from the Envio directory after `pnpm install` and `pnpm codegen`
 (`--docker` starts and removes a throwaway postgres:16.13 container; with
@@ -37,7 +38,9 @@ import time
 from pathlib import Path
 
 ENVIO_DIR = Path(__file__).resolve().parents[2]
-QUERIES_PATH = Path(__file__).with_name("queries.sql")
+# Default registered-SQL file: the copy psy_bridge_reader_api embeds (override with --queries).
+DEFAULT_QUERIES_PATH = ENVIO_DIR.parents[3] / "psy_bridge_reader_api" / "sql" / "queries.sql"
+QUERIES_PATH = DEFAULT_QUERIES_PATH
 
 # (chain_index, chain_id, share of every 10 deposits). Sepolia-heavy, as on
 # the 2026-10-18 testnet.
@@ -573,6 +576,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rows", type=int, action="append", required=True,
                         help="deposit count of one scale (multiple of 1000); repeat for several scales")
+    parser.add_argument("--queries", type=Path, default=DEFAULT_QUERIES_PATH, help="registered SQL file")
     parser.add_argument("--docker", action="store_true", help="run a throwaway postgres container")
     parser.add_argument("--image", default="postgres:16.13")
     parser.add_argument("--cpus", type=float, default=None, help="docker --cpus limit")
@@ -593,6 +597,8 @@ def main():
     parser.add_argument("--min-free-gb", type=float, default=40)
     parser.add_argument("--report", type=Path, help="write the JSON report here")
     args = parser.parse_args()
+    global QUERIES_PATH
+    QUERIES_PATH = args.queries
     if any(r % 1000 or r < 10000 for r in args.rows):
         parser.error("--rows must be multiples of 1000 and at least 10000 (the probe cases assume it)")
     if not args.docker and not args.host:
