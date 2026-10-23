@@ -4,6 +4,7 @@
 pub mod admission;
 pub mod metrics;
 pub mod model;
+pub mod server;
 pub mod source;
 pub mod tree;
 
