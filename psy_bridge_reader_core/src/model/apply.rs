@@ -2,7 +2,7 @@
 //! window re-read reorg following (design C12), and tree verification against
 //! Envio's `DepositTreeMeta`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use psy_bridge_reader_api::{EnvioChainStatus, Revision};
@@ -10,7 +10,7 @@ use psy_bridge_reader_api::{EnvioChainStatus, Revision};
 use super::chain::{ChainView, WindowChain};
 use super::claims::{ClaimChainView, ClaimWindow};
 use super::tick::{ChainProgress, DepositWithLeaf, TickData, TreeMetaRow};
-use super::{ApplyOutcome, ChainState, Model, ReloadReason, View};
+use super::{ApplyOutcome, ChainState, Model, ReloadReason, View, RELOADING};
 use crate::tree::hash::{to_display_hex, zero};
 use crate::tree::snapshot::root_at;
 
@@ -56,12 +56,16 @@ impl Model {
             }
             safe_blocks.insert(p.chain_id, committed.max(envio_safe_block(p)));
         }
-        // Rule 3.
+        // Rule 3. A chain index whose rows break an invariant is held: its
+        // rows are neither promoted nor shown, and the rest of the tick applies.
+        let mut held = BTreeSet::new();
+        let mut violation = None;
         for (&chain_index, rows) in &tick.deposits {
             if let Err(what) = self.check_deposits(chain_index, rows) {
                 let reason = ReloadReason::InvariantViolated { chain_index, what };
                 self.set_fault(chain_index, rows.first().map(|r| r.row.chain_id), reason.clone());
-                return ApplyOutcome::Reload(reason);
+                violation.get_or_insert(reason);
+                held.insert(chain_index);
             }
         }
         self.identity = Some(tick.identity);
@@ -70,7 +74,7 @@ impl Model {
         // Rule 4: deposits, then claims and batches.
         let mut promoted_any = false;
         let mut deposit_split = BTreeMap::new();
-        for (&chain_index, rows) in &tick.deposits {
+        for (&chain_index, rows) in tick.deposits.iter().filter(|(chain_index, _)| !held.contains(*chain_index)) {
             let state = self.chains.entry(chain_index).or_insert_with(|| ChainState::new(None));
             if state.chain_id.is_none() {
                 state.chain_id = rows.first().map(|r| r.row.chain_id);
@@ -103,13 +107,15 @@ impl Model {
 
         // Rule 5.
         if tick.truncated {
-            return if promoted_any {
+            return if let Some(reason) = violation {
+                ApplyOutcome::Reload(reason)
+            } else if promoted_any {
                 ApplyOutcome::CatchingUp
             } else {
                 ApplyOutcome::Reload(ReloadReason::WindowOverLimit)
             };
         }
-        self.publish_tick(&tick, &deposit_split, &claim_split)
+        self.publish_tick(&tick, &held, &deposit_split, &claim_split)
     }
 
     /// Rule 3 over the rows read from this chain's cursor.
@@ -177,6 +183,7 @@ impl Model {
     fn publish_tick(
         &mut self,
         tick: &TickData,
+        held: &BTreeSet<u64>,
         deposit_split: &BTreeMap<u64, usize>,
         claim_split: &BTreeMap<u64, (usize, usize)>,
     ) -> ApplyOutcome {
@@ -208,6 +215,13 @@ impl Model {
         }
         let mut chains = BTreeMap::new();
         for (&chain_index, state) in self.chains.iter_mut() {
+            if held.contains(&chain_index) {
+                let view = old.chains.get(&chain_index).cloned();
+                changed |= view.is_none();
+                let view = view.unwrap_or_else(|| ChainView::not_ready(state.data.clone(), state.chain_id, RELOADING.to_owned()));
+                chains.insert(chain_index, view);
+                continue;
+            }
             let rows = tick.deposits.get(&chain_index).map_or(&[][..], Vec::as_slice);
             let window_rows = &rows[deposit_split.get(&chain_index).copied().unwrap_or(0)..];
             let meta = metas.get(&chain_index).copied();
@@ -274,9 +288,6 @@ impl Model {
 
         let fault = self.chains.values().find_map(|s| s.fault.as_ref().map(|(reason, _)| reason.clone()));
         if !changed {
-            if let Some(reason) = fault {
-                return ApplyOutcome::Reload(reason);
-            }
             // The data is unchanged but verified as of this tick: refresh
             // `as_of_unix_ms` and keep epoch and seq, so an idle Envio does not
             // make valid data look stale.
@@ -289,7 +300,7 @@ impl Model {
                     envio_chains: old.envio_chains.clone(),
                 });
             }
-            return ApplyOutcome::Unchanged;
+            return fault.map_or(ApplyOutcome::Unchanged, ApplyOutcome::Reload);
         }
         if !reorged.is_empty() || claims_reorged {
             self.epoch += 1;
@@ -795,6 +806,37 @@ mod tests {
         let v3 = m.view();
         assert_eq!((v3.revision.epoch, v3.revision.seq), (v2.revision.epoch, v2.revision.seq));
         assert_eq!(v3.revision.as_of_unix_ms, 2_000);
+    }
+
+    #[test]
+    fn an_invariant_violation_on_one_chain_lets_the_others_progress_and_refresh_as_of() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8).progress(2, 100, 8);
+        b.deposit(0, 1, 10, "A");
+        b.deposit(1, 2, 10, "A");
+        let mut m = Model::new();
+        assert_eq!(b.apply_to(&mut m), published(&[]));
+        let v1 = m.view();
+        // Chain index 0 gets a row with a chain-local gap; chain index 1 a new deposit.
+        b.deposit(0, 1, 95, "A");
+        b.deposits.get_mut(&0).unwrap()[1].row.chain_local_deposit_index = 5;
+        b.deposit(1, 2, 95, "B");
+        b.started_unix_ms = 2_000;
+        assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::InvariantViolated { chain_index: 0, .. })));
+        let v2 = m.view();
+        assert_eq!(v2.revision.as_of_unix_ms, 2_000);
+        assert!(v2.revision.seq > v1.revision.seq);
+        assert!(matches!(by_address(&v2, 0, "A"), Err(ReadError::NotReady(_))));
+        let q = DepositsByAddressQuery { shield_address: "B".to_owned(), chain_id: 2, chain_index: Some(1), limit: 10, offset: 0 };
+        assert_eq!(v2.deposits_by_address(&q).unwrap().rows, b.rows(1)[1..].to_vec());
+        assert_eq!(v2.status().chains[1].deposit_count, 2);
+        assert!(v2.status().chains[1].ready);
+        // The fault holds; a tick with nothing new still refreshes as_of.
+        b.started_unix_ms = 3_000;
+        assert!(matches!(b.apply_to(&mut m), ApplyOutcome::Reload(ReloadReason::InvariantViolated { chain_index: 0, .. })));
+        let v3 = m.view();
+        assert_eq!((v3.revision.epoch, v3.revision.seq), (v2.revision.epoch, v2.revision.seq));
+        assert_eq!(v3.revision.as_of_unix_ms, 3_000);
     }
 
     #[test]
