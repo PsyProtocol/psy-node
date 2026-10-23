@@ -7425,6 +7425,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_bridge_reader_api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "psy_cli_common"
 version = "0.1.0"
 dependencies = [

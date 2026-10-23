@@ -28,6 +28,7 @@ members = [
     "psy_cli/psy_node_cli",
     "psy_cli/psy_dev_cli",
     "psy_cli/psy_relayer_cli",
+"psy_bridge_reader_api",
     "psy_cli/guardian_common",
     "psy_jtmb_testing_core",
 
