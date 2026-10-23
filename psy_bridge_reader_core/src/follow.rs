@@ -281,9 +281,8 @@ impl FollowState {
     fn set_view_metrics(&self, view: &View, progress: &[ChainProgress]) {
         let now_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         self.metrics.set_view_age_seconds(now_unix_ms.saturating_sub(view.revision.as_of_unix_ms) as f64 / 1000.0);
-        for (&chain_index, chain) in &view.chains {
-            self.metrics.set_window_rows(chain_index, i64::try_from(chain.window.len()).unwrap_or(i64::MAX));
-        }
+        let window_rows = view.chains.iter().map(|(&chain_index, chain)| (chain_index, i64::try_from(chain.window.len()).unwrap_or(i64::MAX)));
+        self.metrics.set_window_rows(&window_rows.collect::<Vec<_>>());
         for p in progress {
             let served = view.envio_chains.get(&p.chain_id).map_or(-1, |e| i64::try_from(e.progress_block).unwrap_or(i64::MAX));
             self.metrics.set_follow_lag_blocks(p.chain_id, p.progress_block.saturating_sub(served).max(0));
@@ -866,6 +865,22 @@ mod tests {
         assert_eq!(by_address(after, 1, 0, "A").unwrap(), a.rows(0));
         assert_eq!(by_address(after, 2, 1, "A").unwrap(), a.rows(1));
         assert_eq!(r.metric("psy_bridge_reader_reloads_total{reason=\"meta_missing\"} "), Some(1.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_chain_index_loses_its_window_rows_series() {
+        let mut b = TickBuilder::new();
+        b.progress(1, 100, 8);
+        b.deposit(0, 1, 95, "A");
+        b.deposit(1, 1, 96, "B");
+        let first = b.tick(&Cursors::default());
+        b.deposits.remove(&1);
+        let rolled_back = b.tick(&Cursors::default());
+        let r = run(FollowConfig::default(), vec![], vec![Ok(first), Ok(rolled_back)], Duration::ZERO).await;
+        assert!(r.events[2].view.status().ready);
+        assert_eq!(r.metric("psy_bridge_reader_window_rows{chain_index=\"0\"} "), Some(1.0));
+        assert_eq!(r.metric("psy_bridge_reader_window_rows{chain_index=\"1\"} "), None);
+        assert_eq!(r.metric("psy_bridge_reader_reorgs_total "), Some(1.0));
     }
 
     type BuildTick = Box<dyn FnMut(u128, &Cursors) -> TickData + Send>;

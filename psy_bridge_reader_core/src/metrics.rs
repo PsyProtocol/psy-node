@@ -140,8 +140,13 @@ impl Metrics {
         self.tick_seconds.observe(seconds);
     }
 
-    pub fn set_window_rows(&self, chain_index: u64, rows: i64) {
-        self.window_rows.with_label_values(&[&chain_index.to_string()]).set(rows);
+    /// Replaces every `window_rows` series, so a chain index the view no
+    /// longer has loses its series.
+    pub fn set_window_rows(&self, rows: &[(u64, i64)]) {
+        self.window_rows.reset();
+        for (chain_index, count) in rows {
+            self.window_rows.with_label_values(&[&chain_index.to_string()]).set(*count);
+        }
     }
 
     /// Drops every `chain_id` and `chain_index` series, after a full reset.
@@ -247,7 +252,7 @@ mod tests {
         m.set_follow_lag_blocks(1, 2);
         m.set_view_age_seconds(0.5);
         m.observe_tick(0.1);
-        m.set_window_rows(0, 3);
+        m.set_window_rows(&[(0, 3)]);
         m.inc_reorgs();
         m.inc_tree_mismatch();
         m.inc_reload("identity_changed");
@@ -286,12 +291,15 @@ mod tests {
     fn clear_chain_gauges_drops_every_chain_series() {
         let m = Metrics::new(1);
         m.set_follow_lag_blocks(1, 2);
-        m.set_window_rows(3, 4);
+        m.set_window_rows(&[(3, 4)]);
         m.clear_chain_gauges();
         let text = m.render();
         assert!(!text.contains("chain_id=\"1\""), "{text}");
         assert!(!text.contains("chain_index=\"3\""), "{text}");
-        m.set_window_rows(5, 6);
+        m.set_window_rows(&[(5, 6)]);
+        m.set_window_rows(&[(7, 8)]);
+        assert_eq!(value_of(&m.render(), "psy_bridge_reader_window_rows{chain_index=\"5\"} "), None);
+        m.set_window_rows(&[(5, 6)]);
         assert_eq!(value_of(&m.render(), "psy_bridge_reader_window_rows{chain_index=\"5\"} "), Some(6.0));
     }
 
