@@ -21,7 +21,11 @@ prometheus = { workspace = true }
 libc = { workspace = true }
 arc-swap = { workspace = true }
 parking_lot = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
