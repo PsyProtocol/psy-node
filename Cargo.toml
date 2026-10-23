@@ -28,6 +28,7 @@ members = [
     "psy_cli/psy_node_cli",
     "psy_cli/psy_dev_cli",
     "psy_cli/psy_relayer_cli",
+    "psy_bridge_reader_api",
     "psy_cli/guardian_common",
     "psy_jtmb_testing_core",
     "psy_bridge_reader_core",
@@ -333,6 +334,7 @@ psy_plonky2_common_circuits = { path = "./psy_plonky2_common_circuits" }
 psy_plonky2_circuits = { path = "./psy_plonky2_circuits" }
 
 parth_core = { path = "./parth_core" }
+psy_bridge_reader_api = { path = "./psy_bridge_reader_api" }
 parth_common = { path = "./parth_common" }
 parth_crypto = { path = "./parth_crypto" }
 

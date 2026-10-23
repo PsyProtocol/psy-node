@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+name = "psy_bridge_reader_api"
+rust-version = "1.86"
+version = "0.1.0"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
