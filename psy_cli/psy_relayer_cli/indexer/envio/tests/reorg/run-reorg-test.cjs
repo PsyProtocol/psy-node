@@ -310,7 +310,9 @@ async function readerBaseline(label) {
     });
   }
   const lastCount = Number(psql('SELECT last_count FROM "DepositTreeMeta" WHERE chain_index = 0'));
-  return (await reader.waitSynced(0, lastCount, label)).revision.epoch;
+  const { epoch } = (await reader.waitSynced(0, lastCount, label)).revision;
+  console.log(`${label}: reader synced at ${lastCount} deposits in ${reader.lastSyncMs} ms (epoch ${epoch})`);
+  return epoch;
 }
 
 async function readerVerify(label, canonical, epochBefore) {
@@ -330,7 +332,8 @@ async function readerVerify(label, canonical, epochBefore) {
     epochBefore,
   });
   console.log(`${label}: reader equals the replay and the registered SQL at ${result.lastCount} deposits `
-    + `(epoch ${epochBefore ?? 'n/a'} -> ${result.epoch}, ${removed.length} discarded tx hashes not served)`);
+    + `(epoch ${epochBefore ?? 'n/a'} -> ${result.epoch}, ${removed.length} discarded tx hashes not served, `
+    + `synced in ${result.syncMs} ms)`);
 }
 
 function startEnvio({ isFreshParent, indexingBlockLag }) {
@@ -623,6 +626,14 @@ main()
   })
   .finally(async () => {
     await reader?.stop();
+    const keepDir = process.env.REORG_TEST_KEEP_LOGS; // opt-in: keep the Envio and Reader logs
+    if (keepDir) {
+      fs.mkdirSync(keepDir, { recursive: true });
+      fs.writeFileSync(path.join(keepDir, 'envio.log'), envioLog);
+      for (const name of readerDir ? fs.readdirSync(readerDir) : []) {
+        if (name.endsWith('.log')) fs.copyFileSync(path.join(readerDir, name), path.join(keepDir, name));
+      }
+    }
     if (readerDir) fs.rmSync(readerDir, { recursive: true, force: true }); // holds the token file
     stop(envio);
     stop(anvil);

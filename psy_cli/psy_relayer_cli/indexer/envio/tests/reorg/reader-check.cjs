@@ -7,6 +7,8 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
+const { hashNoPad } = require('poseidon-goldilocks-lite');
+
 const QUERIES_SQL = path.join(__dirname, '../../../../../../psy_bridge_reader_api/sql/queries.sql');
 const SYNC_TIMEOUT_MS = 30000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -20,6 +22,20 @@ function assertReaderBinary(bin) {
     throw new Error(`reader binary not found: ${bin}`);
   }
 }
+
+// Display hex (e3 first) of the empty subtree at each level, as handlers.ts
+// computes it: level 0 is the zero leaf, level l + 1 = hash(level l, level l).
+const TREE_DEPTH = 32;
+const ZERO_HEX = (() => {
+  const hex = (h) => '0x' + [h[3], h[2], h[1], h[0]].map((v) => BigInt(v).toString(16).padStart(16, '0')).join('');
+  let value = [0n, 0n, 0n, 0n];
+  const out = [hex(value)];
+  for (let level = 0; level < TREE_DEPTH; level++) {
+    value = hashNoPad([...value, ...value]);
+    out.push(hex(value));
+  }
+  return out;
+})();
 
 // name -> { params: [type...], body }
 function loadQueries() {
@@ -122,7 +138,8 @@ class Reader {
   // Waits until chain `chainIndex` is ready with the deposit count of the
   // Envio watermark.
   async waitSynced(chainIndex, lastCount, label) {
-    const deadline = Date.now() + SYNC_TIMEOUT_MS;
+    const started = Date.now();
+    const deadline = started + SYNC_TIMEOUT_MS;
     let last = 'no answer';
     while (Date.now() < deadline) {
       if (this.spawnError) throw new Error(`${label}: reader failed to start: ${this.spawnError.message}`);
@@ -133,7 +150,10 @@ class Reader {
         const { status, json } = await this.call('GET', '/v1/status');
         const chain = json?.chains?.find((c) => c.chain_index === chainIndex);
         last = `http ${status}, ready ${json?.ready}, chain ${JSON.stringify(chain)}`;
-        if (status === 200 && json.ready && chain?.ready && chain.deposit_count === lastCount) return json;
+        if (status === 200 && json.ready && chain?.ready && chain.deposit_count === lastCount) {
+          this.lastSyncMs = Date.now() - started; // reported by the caller
+          return json;
+        }
       } catch (error) {
         last = error.message;
       }
@@ -187,6 +207,7 @@ async function verifyInner(reader, {
   assert.ok(meta, `${label}: no DepositTreeMeta row`);
   const lastCount = Number(meta.last_count);
   const status = await reader.waitSynced(chainIndex, lastCount, label);
+  const syncMs = reader.lastSyncMs;
   reader.seen.length = 0; // only responses after the final state are scanned for removed hashes
   if (epochBefore != null) {
     assert.ok(status.revision.epoch > epochBefore, `${label}: revision.epoch did not increase across the reorg (${epochBefore} -> ${status.revision.epoch})`);
@@ -199,10 +220,24 @@ async function verifyInner(reader, {
   assert.equal(chainStatus.tree_root, meta.poseidon_deposit_tree_root, `${label}: status tree_root differs from DepositTreeMeta`);
   const deposits = events.filter((e) => e.kind === 'DepositRecorded');
   assert.equal(deposits.length, lastCount, `${label}: canonical deposit count`);
+  // Proofs: every leaf at every count, sibling by sibling, against the tree
+  // nodes of the same replay (a node the replay never wrote is an empty subtree).
   for (let count = 1; count <= lastCount; count++) {
     const replay = await expectedState(deposits.slice(0, count));
     const expected = replay.DepositTreeMeta.find((row) => row.chain_index === String(chainIndex)).poseidon_deposit_tree_root;
     assert.equal(await rootAt(count), expected, `${label}: root at count ${count} differs from the replay`);
+    const nodes = new Map(replay.DepositTreeNode.map((row) => [row.id, row.hash]));
+    const node = (level, index) => nodes.get(`${chainIndex}:${level}:${index}`) ?? ZERO_HEX[level];
+    for (let leaf = 0; leaf < count; leaf++) {
+      const where = `${label}: proof of leaf ${leaf} at count ${count}`;
+      const { proof } = await reader.get(`/v1/tree/proof?chain_index=${chainIndex}&leaf=${leaf}&count=${count}`);
+      assert.ok(proof, `${where}: no proof`);
+      assert.equal(proof.leaf_index, leaf, `${where}: leaf_index`);
+      assert.equal(proof.leaf_hash, node(0, leaf), `${where}: leaf_hash differs from the replay`);
+      assert.equal(proof.root, expected, `${where}: root differs from the replay`);
+      assert.deepEqual(proof.siblings, Array.from({ length: TREE_DEPTH }, (_, l) => node(l, (leaf >> l) ^ 1)),
+        `${where}: siblings differ from the replay`);
+    }
   }
 
   // Reads against the registered SQL.
@@ -267,7 +302,7 @@ async function verifyInner(reader, {
   // responses to those carry only the empty result, not the hash.
   const everything = reader.seen.join('\n');
   for (const hash of removed) assert.ok(!everything.includes(hash), `${label}: a response contains removed tx_hash ${hash}`);
-  return { lastCount, epoch: (await reader.get('/v1/status')).revision.epoch };
+  return { lastCount, syncMs, epoch: (await reader.get('/v1/status')).revision.epoch };
 }
 
 module.exports = { assertReaderBinary, Reader, verify };

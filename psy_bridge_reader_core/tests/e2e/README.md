@@ -43,7 +43,10 @@ temp directory, `PSY_BRIDGE_READER_DATABASE_URL`, `PSY_BRIDGE_READER_DB_SCHEMA=p
 and `PSY_BRIDGE_READER_TICK_MS=200`. Its stdout (the tracing log) and stderr go to
 `reorg-reader-*/reader-<database>.log` in the OS temp directory; failures print
 the log tail. The test kills exactly that child at the end (and when it moves to
-the next database).
+the next database). The temp directory is removed at the end; set
+`REORG_TEST_KEEP_LOGS=<dir>` to keep a copy of the Envio log and the Reader logs
+there. Each Reader check prints how long the Reader took to reach `last_count`
+after the test started waiting for it.
 
 ## What is asserted
 
@@ -57,6 +60,10 @@ and 3b the test waits (30 s) for the Reader to reach `last_count` again, then ch
    (and so does `/v1/status` `tree_root`).
 2. Root at every count `1..=last_count` equals the root of a replay of the first
    `count` canonical deposits through `handlers.ts` (the test's handler harness).
+   At each such count, `/v1/tree/proof` for every leaf below it returns that root,
+   the replay's leaf hash and all 32 siblings equal to the replay's
+   `DepositTreeNode` values (a node the replay never wrote is the empty subtree
+   of its level).
 3. `/v1/deposits/by-address`, `/by-index`, `/by-tx`, `/prefix`,
    `/v1/withdrawal-claims` and `/v1/explorer` equal the registered SQL
    (`deposit_list_offset_page`, `deposit_by_deposit_index`, `deposit_by_tx_hash`,
