@@ -103,3 +103,40 @@ checked by count (`FinalizedBatch` is empty in this test).
 
 Acceptance 5 and 8
 are covered at the Reader level only. The Services part is plan 2.
+
+## Reader-only bench (`reader_bench`)
+
+`psy_bridge_reader_core/examples/reader_bench.rs` is an open-loop load generator
+for the Reader's internal API (the Python wallets top out near 2,000 req/s).
+
+```
+CARGO_TARGET_DIR=$HOME/.cache/psy-bridge-reader-target-tree \
+cargo run --release -p psy_bridge_reader_core --example reader_bench -- \
+  --url http://127.0.0.1:<port> --token-file <token> \
+  --rates 2000,5000,10000,15000 --step-secs 60 \
+  --mix A4 --addresses-from status --out bench.json
+```
+
+- Open loop: request `i` of a step is due at `i / rate`; a request is never
+  delayed by an earlier response. Latency is measured from the due time. Lag is
+  send time minus due time (tokio's 1 ms timer gives a ~1 ms floor). A step with
+  lag p99 over 5 ms, or one that hit `--concurrency-cap`, has `"valid": false`
+  with the reasons listed.
+- Mix `A4` (by request count): 70% `by-address`, 10% `by-tx`, 10%
+  `withdrawal-claims` (10 nullifiers), 5% `tree/root`, 5% `tree/proof`; or
+  `--mix by_address=70,by_tx=10,claims=10,root=5,proof=5`. `by-address` limits
+  are drawn from 1/10/50/100 with weights 40/30/20/10 (offset 0); the output
+  states the counts sent per limit.
+- `--addresses-from status`: reads `/v1/status` (first ready chain; `count` is
+  its `committed_count`) and `/v1/explorer` (its 100 newest deposits give the
+  shield addresses and tx hashes). `--addresses-from file.json`: a file
+  `{"chain_id":..,"chain_index":..,"count":..,"addresses":[..],"tx_hashes":[..],"nullifiers":[..]}`
+  (`nullifiers` optional). Without nullifiers the bench uses 1,000 synthetic
+  ones that no claim matches, so `withdrawal-claims` returns empty reads.
+  `tree/root` and `tree/proof` use the fixed `count`, with a random `leaf`.
+- `--out` is rewritten after every step. Per step: rate, sent, ok, errors keyed
+  `status:code` (or `transport:*`, `timeout`, `cap`), ok throughput, p50/p95/p99
+  per endpoint, response-byte histogram (upper bounds 256 B to 64 KiB) plus
+  mean/max bytes per endpoint, generator CPU (`/proc/self/stat`), lag
+  percentiles and the `valid` flag.
+- Unit tests: `cargo test -p psy_bridge_reader_core --example reader_bench`.
