@@ -905,6 +905,7 @@ async fn run_multichain(
     let max_batch = config.max_checkpoint_batch.unwrap_or(DEFAULT_MAX_CHECKPOINT_BATCH);
     validate_max_checkpoint_batch(max_batch)?;
     let state_path = proof_dir.join("daemon_state_multichain.toml");
+    let mut claim_cursors: HashMap<u8, (i64, String)> = HashMap::new();
     let proxy = resolve_system_prove_proxy_url(&config)?;
     verify_system_prove_proxy(&proxy).await?;
     tracing::info!(prove_proxy = %proxy, "system prove proxy configured");
@@ -1070,6 +1071,7 @@ async fn run_multichain(
                     .into_iter()
                     .filter(|w| w.destination_chain_index == u64::from(chain.chain_index))
                     .collect::<Vec<_>>();
+                let claims = select_multichain_claim_batch(claims, claim_cursors.entry(chain.chain_index).or_default());
                 if claims.is_empty() { continue; }
                 let result = chain.l1.claim_withdrawals(&claims, &chain.config, to_checkpoint).await;
                 record_claim_result(
@@ -2327,6 +2329,22 @@ pub(crate) async fn run_l2_bridge_round_with_l1_snapshot(
 /// Everything a round does for a withdrawal — the claim-proof fetch from
 /// psy-services, and the Groth16 batch proof from prove-proxy — hangs off this
 /// list, so dropping a retired claim here is what actually stops the work.
+// Bound proof polling and registration work so an unavailable old claim cannot
+// hold the deposit/finalization lane for hours. Rotate even deferred claims.
+fn select_multichain_claim_batch(
+    mut claims: Vec<propose_withdrawals::PendingWithdrawal>,
+    cursor: &mut (i64, String),
+) -> Vec<propose_withdrawals::PendingWithdrawal> {
+    claims.sort_by(|a, b| (a.event_id, &a.leaf_hash).cmp(&(b.event_id, &b.leaf_hash)));
+    if claims.is_empty() { return claims; }
+    let start = claims.iter().position(|w| (w.event_id, &w.leaf_hash) > (cursor.0, &cursor.1)).unwrap_or(0);
+    let count = claims.len().min(32);
+    let selected: Vec<_> = (0..count).map(|i| claims[(start + i) % claims.len()].clone()).collect();
+    let last = selected.last().unwrap();
+    *cursor = (last.event_id, last.leaf_hash.clone());
+    selected
+}
+
 fn claims_to_attempt(
     pending: &HashMap<String, propose_withdrawals::PendingWithdrawal>,
     attempts: &HashMap<String, claim_attempts::ClaimAttempts>,
@@ -3503,6 +3521,35 @@ rpc_urls = ["http://127.0.0.1:8546"]
             nonce: words(seed * 10 + 301),
             leaf_hash: format!("leaf-{seed}"),
         }
+    }
+
+    #[test]
+    fn bounded_claim_rotation_visits_deferred_tail_without_losing_obligations() {
+        let claims: Vec<_> = (1..=65).map(sample_withdrawal).collect();
+        let mut cursor = (0, String::new());
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            let batch = select_multichain_claim_batch(claims.iter().rev().cloned().collect(), &mut cursor);
+            assert_eq!(batch.len(), 32);
+            assert_eq!(batch.iter().map(|w| &w.leaf_hash).collect::<HashSet<_>>().len(), 32);
+            seen.extend(batch.into_iter().map(|w| w.leaf_hash));
+        }
+        assert_eq!(seen.len(), 65, "unready old claims must not starve newer claims");
+        assert_eq!(claims.len(), 65, "selection never removes durable obligations");
+    }
+
+    #[test]
+    fn claim_rotation_handles_resolved_entries_and_independent_chains() {
+        let claims: Vec<_> = (1..=40).map(sample_withdrawal).collect();
+        let mut a = (0, String::new());
+        let first = select_multichain_claim_batch(claims.clone(), &mut a);
+        let remaining: Vec<_> = claims.into_iter().filter(|w| !first.iter().any(|old| old.leaf_hash == w.leaf_hash)).collect();
+        let tail = select_multichain_claim_batch(remaining, &mut a);
+        assert_eq!(tail.len(), 8);
+        assert_eq!(tail[0].event_id, 33);
+        let mut b = (0, String::new());
+        assert_eq!(select_multichain_claim_batch((1..=40).map(sample_withdrawal).collect(), &mut b)[0].event_id, 1);
+        assert!(select_multichain_claim_batch(Vec::new(), &mut a).is_empty());
     }
 
     #[test]

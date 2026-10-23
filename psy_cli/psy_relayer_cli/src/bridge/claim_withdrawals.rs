@@ -158,6 +158,59 @@ fn address_high_bits_are_zero(words: [u32; 8]) -> bool {
 const CLAIM_PROOF_FETCH_MAX_ATTEMPTS: usize = 12;
 const CLAIM_PROOF_FETCH_RETRY_DELAY_SECS: u64 = 5;
 
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimProofPolling {
+    Interactive,
+    NextRound,
+}
+
+async fn poll_claim_proof<Probe, ProbeFuture>(
+    policy: ClaimProofPolling,
+    mut probe: Probe,
+) -> Result<WithdrawalClaimProofResult>
+where
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: std::future::Future<Output = Result<(WithdrawalClaimProofResult, bool)>>,
+{
+    let max_attempts = if policy == ClaimProofPolling::NextRound { 1 } else { CLAIM_PROOF_FETCH_MAX_ATTEMPTS };
+    let mut last_err = None;
+    let mut last_not_ready = None;
+    let mut final_result = None;
+    for attempt in 1..=max_attempts {
+        match probe().await {
+            Ok((proof, true)) => return Ok(proof),
+            Ok((proof, false)) if proof.found => final_result = Some(proof),
+            Ok((proof, false)) => last_not_ready = Some(proof),
+            Err(error) => last_err = Some(error),
+        }
+        if attempt < max_attempts {
+            tokio::time::sleep(Duration::from_secs(CLAIM_PROOF_FETCH_RETRY_DELAY_SECS)).await;
+        }
+    }
+    select_claim_proof_poll_result(final_result, last_not_ready, last_err)
+}
+
+async fn recheck_claim_root<Read>(
+    read: Read,
+    policy: ClaimProofPolling,
+    leaf: &str,
+    deferrals: &mut HashMap<String, String>,
+    failures: &mut HashMap<String, String>,
+) -> Option<String>
+where
+    Read: std::future::Future<Output = Result<String>>,
+{
+    match read.await {
+        Ok(root) => Some(root),
+        Err(error) => {
+            let reasons = if policy == ClaimProofPolling::NextRound { deferrals } else { failures };
+            reasons.insert(leaf.to_string(), format!("failed to read L1 withdrawal root: {error}"));
+            None
+        }
+    }
+}
+
 /// Guard direct batch/CLI callers as well as daemon dispatch. Do this before
 /// claimedNullifiers reads: one occupied nonce cannot settle every colliding leaf.
 fn partition_claim_inputs(withdrawals: &[PendingWithdrawal]) -> (Vec<PendingWithdrawal>, HashMap<String, String>) {
@@ -632,6 +685,7 @@ pub async fn submit_batch(
     password_env: &str,
     prove_proxy_url: Option<&str>,
     fee_policy: Option<&super::l1_fees::BscFeePolicy>,
+    proof_polling: ClaimProofPolling,
 ) -> Result<BatchWithdrawalsReport> {
     let _phantom_c: std::marker::PhantomData<C> = std::marker::PhantomData;
     let requested = withdrawals.len();
@@ -798,91 +852,48 @@ pub async fn submit_batch(
             // the on-chain liquidity check provides the authoritative guard.
         }
 
-        let proof_result = {
-            let mut last_err: Option<anyhow::Error> = None;
-            let mut last_not_ready: Option<WithdrawalClaimProofResult> = None;
-            let mut final_result: Option<WithdrawalClaimProofResult> = None;
-            for attempt in 1..=CLAIM_PROOF_FETCH_MAX_ATTEMPTS {
-                match fetch_claim_proof(&http, services_url, w).await {
-                    Ok(r) => {
-                        if !r.found {
-                            tracing::debug!(
-                                index = i,
-                                attempt,
-                                max_attempts = CLAIM_PROOF_FETCH_MAX_ATTEMPTS,
-                                retry_delay_secs = CLAIM_PROOF_FETCH_RETRY_DELAY_SECS,
-                                recipient = %recipient_addr,
-                                "withdrawal claim proof not ready yet; will retry"
-                            );
-                            last_not_ready = Some(r);
-                        } else if let Some(ref root_hex) = r.withdrawal_root {
-                            match read_l1_withdrawal_subtree_root(&provider, state_manager).await {
-                                Ok(l1_root) => {
-                                    let normalized_l1 = normalize_l1_root_for_services(&l1_root);
-                                    let root_match = normalized_l1.trim_start_matches("0x").eq_ignore_ascii_case(
-                                        root_hex.trim_start_matches("0x")
-                                    );
-                                    tracing::debug!(
-                                        services_root = %root_hex,
-                                        l1_root = %l1_root,
-                                        root_match,
-                                        attempt,
-                                        max_attempts = CLAIM_PROOF_FETCH_MAX_ATTEMPTS,
-                                        retry_delay_secs = CLAIM_PROOF_FETCH_RETRY_DELAY_SECS,
-                                        "claim proof root comparison"
-                                    );
-                                    if root_match {
-                                        final_result = Some(r);
-                                        break;
-                                    }
-                                    final_result = Some(r);
-                                }
-                                Err(err) => {
-                                    last_err = Some(err.context("read L1 withdrawalSubtreeRoot failed"));
-                                }
-                            }
-                        } else {
-                            final_result = Some(r);
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        last_err = Some(err);
-                    }
-                }
-                if attempt < CLAIM_PROOF_FETCH_MAX_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_secs(CLAIM_PROOF_FETCH_RETRY_DELAY_SECS)).await;
-                }
+        let probe = poll_claim_proof(proof_polling, || async {
+            let proof = fetch_claim_proof(&http, services_url, w).await?;
+            let ready = if !proof.found {
+                false
+            } else if let Some(ref root_hex) = proof.withdrawal_root {
+                let l1_root = read_l1_withdrawal_subtree_root(&provider, state_manager).await?;
+                normalize_l1_root_for_services(&l1_root).trim_start_matches("0x")
+                    .eq_ignore_ascii_case(root_hex.trim_start_matches("0x"))
+            } else {
+                true // Preserve existing missing-field validation below.
+            };
+            Ok((proof, ready))
+        }).await;
+        let proof_result = match probe {
+            Ok(proof) => proof,
+            Err(error) if proof_polling == ClaimProofPolling::NextRound => {
+                deferrals.insert(w.leaf_hash.clone(), format!("claim proof query deferred: {error}"));
+                continue;
             }
-            match select_claim_proof_poll_result(final_result, last_not_ready, last_err) {
-                Ok(r) => r,
-                Err(err) => {
-                    failure_reasons.insert(w.leaf_hash.clone(), format!("fetch claim proof failed: {err}"));
-                    tracing::error!(index = i, recipient = %recipient_addr, error = %err, "fetch claim proof failed, skipping");
-                    continue;
-                }
+            Err(error) => {
+                failure_reasons.insert(w.leaf_hash.clone(), format!("fetch claim proof failed: {error}"));
+                continue;
             }
         };
 
         if !proof_result.found {
-            failure_reasons.insert(w.leaf_hash.clone(), "withdrawal claim proof not available yet; L1 root not finalized".to_string());
+            let reasons = if proof_polling == ClaimProofPolling::NextRound { &mut deferrals } else { &mut failure_reasons };
+            reasons.insert(w.leaf_hash.clone(), "withdrawal claim proof not available yet; L1 root not finalized".to_string());
             tracing::info!(index = i, recipient = %recipient_addr, "withdrawal claim proof not available yet (L1 root not finalized); deferring to next round");
             continue;
         }
         if let Some(ref root_hex) = proof_result.withdrawal_root {
-            let l1_root = match read_l1_withdrawal_subtree_root(&provider, state_manager).await {
-                Ok(r) => r,
-                Err(err) => {
-                    failure_reasons.insert(w.leaf_hash.clone(), format!("failed to read L1 withdrawal root: {err}"));
-                    tracing::error!(index = i, recipient = %recipient_addr, error = %err, "failed to read L1 withdrawal root, skipping");
-                    continue;
-                }
-            };
+            let Some(l1_root) = recheck_claim_root(
+                read_l1_withdrawal_subtree_root(&provider, state_manager), proof_polling,
+                &w.leaf_hash, &mut deferrals, &mut failure_reasons,
+            ).await else { continue; };
             let root_match = normalize_l1_root_for_services(&l1_root)
                 .trim_start_matches("0x")
                 .eq_ignore_ascii_case(root_hex.trim_start_matches("0x"));
             if !root_match {
-                failure_reasons.insert(w.leaf_hash.clone(), format!("withdrawal root still mismatched after retries: services={} l1={}", root_hex, l1_root));
+                let reasons = if proof_polling == ClaimProofPolling::NextRound { &mut deferrals } else { &mut failure_reasons };
+                reasons.insert(w.leaf_hash.clone(), format!("withdrawal root not ready: services={} l1={}", root_hex, l1_root));
                 tracing::warn!(index = i, recipient = %recipient_addr, services_root = %root_hex, l1_root = %l1_root, "withdrawal root mismatch after retries, skipping");
                 continue;
             }
@@ -1213,6 +1224,7 @@ pub async fn run(args: BatchWithdrawalsArgs) -> Result<()> {
         &args.password_env,
         None,
         args.l1_fee_policy.as_ref(),
+        ClaimProofPolling::Interactive,
     )
     .await?;
 
@@ -1233,6 +1245,54 @@ pub async fn run(args: BatchWithdrawalsArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn daemon_does_one_unready_probe_without_waiting_for_future_roots() {
+        let mut calls = 0;
+        let result = tokio::time::timeout(Duration::from_millis(100), poll_claim_proof(
+            ClaimProofPolling::NextRound,
+            || {
+                calls += 1;
+                async { Ok((WithdrawalClaimProofResult { found: false, leaf_index: None, withdrawal_root: None, siblings: None }, false)) }
+            },
+        )).await.expect("daemon probe must not sleep for another checkpoint").unwrap();
+        assert!(!result.found);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn daemon_preserves_mismatched_root_for_strict_defer_gate() {
+        let result = poll_claim_proof(ClaimProofPolling::NextRound, || async {
+            Ok((WithdrawalClaimProofResult { found: true, leaf_index: Some(1), withdrawal_root: Some("unfinalized".into()), siblings: Some(vec![]) }, false))
+        }).await.unwrap();
+        assert_eq!(result.withdrawal_root.as_deref(), Some("unfinalized"));
+    }
+
+    #[tokio::test]
+    async fn daemon_probe_surfaces_transport_failure_without_retry_sleep() {
+        let result = tokio::time::timeout(Duration::from_millis(100), poll_claim_proof(
+            ClaimProofPolling::NextRound, || async { anyhow::bail!("offline") },
+        )).await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("offline"));
+    }
+
+    #[tokio::test]
+    async fn second_root_read_outage_defers_daemon_without_retiring_the_obligation() {
+        for mode in [ClaimProofPolling::NextRound, ClaimProofPolling::Interactive] {
+            let mut deferred = HashMap::new();
+            let mut failures = HashMap::new();
+            let root = recheck_claim_root(async { anyhow::bail!("temporary RPC outage") },
+                mode, "still-unpaid", &mut deferred, &mut failures).await;
+            assert!(root.is_none());
+            if mode == ClaimProofPolling::NextRound {
+                assert!(deferred.contains_key("still-unpaid"));
+                assert!(failures.is_empty());
+            } else {
+                assert!(failures.contains_key("still-unpaid"));
+                assert!(deferred.is_empty());
+            }
+        }
+    }
 
     fn conflict_withdrawal(leaf: &str, user: u64, nonce: u32) -> PendingWithdrawal {
         PendingWithdrawal {
@@ -1295,7 +1355,7 @@ mod tests {
         let report = submit_batch(
             &[conflict_withdrawal("a", 1, 77), conflict_withdrawal("b", 2, 77)],
             "invalid-services-url", "invalid-rpc-url", "invalid-bridge", None,
-            "unused", None, None, "UNUSED_PASSWORD", Some("invalid-proxy-url"), None,
+            "unused", None, None, "UNUSED_PASSWORD", Some("invalid-proxy-url"), None, ClaimProofPolling::Interactive,
         ).await.expect("collisions must return before signer or network setup");
         assert_eq!(report.requested, 2);
         assert_eq!(report.deferrals.len(), 2);

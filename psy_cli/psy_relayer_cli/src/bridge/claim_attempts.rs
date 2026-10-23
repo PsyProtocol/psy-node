@@ -14,14 +14,12 @@
 //! person, so the withdrawal and its last failure reason move to a retired set
 //! and are logged at error level.
 //!
-//! Two things make a plain count safe enough without any backoff:
-//!
-//! * A round already absorbs short outages on its own. `claim_withdrawals`
-//!   polls psy-services for the claim proof 12 times at 5s intervals before it
-//!   reports failure, so a minute of unavailability costs no attempts at all.
-//! * Waiting for bridge liquidity is reported as a deferral rather than a
-//!   failure, so a withdrawal parked behind an empty bridge does not spend its
-//!   attempts while it waits.
+//! Proof readiness is not a failed payment attempt. The daemon probes once and
+//! defers unavailable proofs, root changes and proof-query transport failures
+//! to a later round. Interactive CLI callers retain the 12-probe wait policy.
+//! Bridge liquidity, fees and registered-payment waits are also deferrals.
+//! The multichain daemon rotates bounded claim batches so these waits cannot
+//! hold the deposit/finalization lane behind the entire durable backlog.
 
 use std::collections::HashMap;
 

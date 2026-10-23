@@ -513,7 +513,7 @@ async fn withdrawal_policy_refusal_precedes_proof_and_does_not_fail_claims() {
     let report = super::super::claim_withdrawals::submit_batch(
         &[withdrawal], "http://127.0.0.1:1", rpc.url.as_str(),
         "0x0000000000000000000000000000000000000001", None, "bscTestnet",
-        Some(&test_key), None, "UNUSED_TEST_PASSWORD", None, Some(&policy()),
+        Some(&test_key), None, "UNUSED_TEST_PASSWORD", None, Some(&policy()), super::super::claim_withdrawals::ClaimProofPolling::NextRound,
     ).await.unwrap();
     assert_eq!(report.requested, 1);
     assert_eq!(report.submitted_count, 0);
@@ -546,7 +546,7 @@ async fn live_fee_refusal_preserves_nonce_conflicts_and_healthy_claims() {
     let report = super::super::claim_withdrawals::submit_batch(
         &[a, b, healthy], "http://127.0.0.1:1", rpc.url.as_str(),
         "0x0000000000000000000000000000000000000001", None, "bscTestnet",
-        Some(&test_key), None, "UNUSED_TEST_PASSWORD", None, Some(&economical_policy()),
+        Some(&test_key), None, "UNUSED_TEST_PASSWORD", None, Some(&economical_policy()), super::super::claim_withdrawals::ClaimProofPolling::NextRound,
     ).await.unwrap();
 
     assert_eq!(report.requested, 3);
