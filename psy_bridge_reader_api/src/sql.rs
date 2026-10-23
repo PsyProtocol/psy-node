@@ -9,6 +9,10 @@ const QUERIES: &str = include_str!("../sql/queries.sql");
 /// `:envio_schema`).
 pub const READER_ROLE_SQL: &str = include_str!("../sql/reader-role.sql");
 
+/// Role script for the psy-services direct-PostgreSQL fallback role (design
+/// C13): `READER_TABLES` + `LEGACY_TABLES`, same psql variables.
+pub const FALLBACK_ROLE_SQL: &str = include_str!("../sql/fallback-role.sql");
+
 /// Every Envio table a registered statement reads.
 pub const READER_TABLES: &[&str] = &[
     "Deposit",
@@ -280,5 +284,16 @@ mod tests {
             assert!(!READER_ROLE_SQL.contains(&format!("\"{t}\"")), "{t}");
         }
         assert!(!READER_ROLE_SQL.contains("INSERT"));
+    }
+
+    #[test]
+    fn fallback_role_grants_reader_and_legacy_tables_only() {
+        for t in READER_TABLES.iter().chain(LEGACY_TABLES) {
+            assert!(FALLBACK_ROLE_SQL.contains(&format!("\"{t}\"")), "{t}");
+        }
+        assert!(FALLBACK_ROLE_SQL.contains("GRANT SELECT ON"));
+        for word in ["INSERT", "UPDATE", "DELETE", "TRUNCATE"] {
+            assert!(!FALLBACK_ROLE_SQL.contains(word), "{word}");
+        }
     }
 }
