@@ -206,10 +206,12 @@ pub struct WithdrawalClaimsResponse {
 
 /// Takes exactly one of `count` (chain-local) or `target_deposit_count` +
 /// `chain_id` (global, resolved through the prefix probe in the same view).
-/// A `target_deposit_count` above the highest indexed `deposit_index` + 1 over
-/// every chain index of `chain_id` is `count_not_indexed`, never a root of
-/// fewer leaves; a chain_id with no deposits counts as 0 indexed, so a
-/// nonzero target is `count_not_indexed` and target 0 resolves to count 0.
+/// A `count` above the chain's indexed count is `count_not_indexed`, never a
+/// root of fewer leaves. A `target_deposit_count` is never refused for being
+/// ahead of the index: it resolves to `chain_local_count`, this chain's
+/// indexed deposits of `chain_id` with `deposit_index` below the target
+/// (possibly fewer than the target asks for, and 0 for a chain_id with no
+/// deposits), and the root is the root at that count.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TreeRootQuery {
@@ -230,7 +232,8 @@ pub struct TreeRootResponse {
 /// Takes exactly one of `count` (chain-local) or `target_deposit_count` +
 /// `chain_id` (global, resolved through the prefix probe in the same view),
 /// and exactly one of `leaf` (chain-local) or `deposit_index` + `chain_id`.
-/// `target_deposit_count` follows the `TreeRootQuery` rule.
+/// `count` and `target_deposit_count` follow the `TreeRootQuery` rules: the
+/// proof is at the resolved `chain_local_count`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimProofQuery {

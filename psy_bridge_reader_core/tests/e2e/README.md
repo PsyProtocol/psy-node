@@ -81,7 +81,10 @@ and 3b the test waits (30 s) for the Reader to reach `last_count` again, then ch
    - `/by-tx`: ordered (`deposit_index` desc) against `deposit_by_tx_hash`. Known
      coverage gap: every scenario puts one deposit in each transaction, so the
      multi-row order of a shared transaction is not exercised here.
-   - `/prefix`: every target 0..=last_count.
+   - `/prefix`: every target 0..=last_count. Targets `last_count + 1` and
+     `last_count + 1000`, ahead of the index, go to `/v1/tree/root`: the answer
+     is the root at the chain-local count `global_to_local_probe` resolves them
+     to, never `count_not_indexed`.
    - `/explorer`: see below.
 4. Across a reorg `revision.epoch` is greater than the baseline (scenarios 1, 2b
    and 3a, where Envio rolls back; 3b needs no rollback and checks no epoch).

@@ -556,7 +556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn count_above_indexed_is_409() {
+    async fn local_count_above_indexed_is_409_and_a_global_target_is_served() {
         let (m, _) = ready_model();
         let s = state_of(&m, &Budgets::default());
         let r = send(&s, req("/v1/tree/root?chain_index=0&count=6")).await;
@@ -565,6 +565,12 @@ mod tests {
         let proof = send(&s, req("/v1/tree/proof?chain_index=0&leaf=0&count=6")).await;
         assert_error(&proof, 409, "count_not_indexed", Some("1"));
         assert_eq!(send(&s, req("/v1/tree/proof?chain_index=0&leaf=0&count=5")).await.0, StatusCode::OK);
+        // A global target ahead of the index is served at the indexed prefix.
+        let r = send(&s, req("/v1/tree/root?chain_index=0&target_deposit_count=9&chain_id=1")).await;
+        assert_eq!((r.0, r.2["chain_local_count"].clone()), (StatusCode::OK, Value::from(5)));
+        let proof = send(&s, req("/v1/tree/proof?chain_index=0&leaf=0&target_deposit_count=9&chain_id=1")).await;
+        assert_eq!((proof.0, proof.2["chain_local_count"].clone()), (StatusCode::OK, Value::from(5)));
+        assert_eq!(proof.2["proof"]["root"], r.2["root"]);
     }
 
     #[tokio::test]

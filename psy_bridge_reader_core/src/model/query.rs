@@ -164,8 +164,10 @@ impl View {
     }
 
     /// The chain-local count of a tree query: `count`, or `target` resolved
-    /// through the prefix probe in this view. A target above the deposits
-    /// indexed for the chain_id is `CountNotIndexed`, never fewer leaves.
+    /// through the prefix probe in this view. A target is global: it resolves
+    /// to the chain's indexed deposits below it, however far ahead of the
+    /// index it is, so the answer is the root of that prefix with the count it
+    /// covers. Only an explicit chain-local `count` can be `CountNotIndexed`.
     fn resolve_count(
         &self,
         chain_index: u64,
@@ -177,16 +179,7 @@ impl View {
             (Some(n), None) => Ok((n, false)),
             (None, Some(target)) => {
                 let chain_id = chain_id.ok_or_else(|| ReadError::BadRequest("target_deposit_count needs chain_id".to_owned()))?;
-                let resolved = self.resolve_prefix(chain_index, chain_id, target)?;
-                let indexed = self.chains_of(chain_id)?.iter().filter_map(|(_, c)| {
-                    let r = c.read();
-                    r.len().checked_sub(1).map(|last| r.row(last).deposit_index + 1)
-                }).max().unwrap_or(0);
-                if target > indexed {
-                    Err(ReadError::CountNotIndexed { count: target, indexed })
-                } else {
-                    Ok(resolved)
-                }
+                self.resolve_prefix(chain_index, chain_id, target)
             }
             _ => Err(ReadError::BadRequest("give exactly one of count or target_deposit_count".to_owned())),
         }
@@ -207,8 +200,9 @@ impl View {
         Ok(WithdrawalClaimsResponse { revision: self.revision.clone(), claims })
     }
 
-    /// Root at a chain-local count; a count above the indexed deposits is
-    /// `CountNotIndexed`, never a root over fewer leaves.
+    /// Root at a chain-local count; a `count` above the indexed deposits is
+    /// `CountNotIndexed`, never a root over fewer leaves. A global target
+    /// is served at the count it resolves to (see `resolve_count`).
     pub fn tree_root(&self, q: &TreeRootQuery) -> Result<TreeRootResponse, ReadError> {
         let (count, has_foreign_deposits) = self.resolve_count(q.chain_index, q.count, q.target_deposit_count, q.chain_id)?;
         let root = match self.chain(q.chain_index)? {
@@ -515,30 +509,52 @@ mod tests {
         ClaimProofQuery { chain_index, leaf: Some(leaf), deposit_index: None, chain_id: Some(1), count: None, target_deposit_count: Some(target) }
     }
 
+    /// A global target ahead of the index resolves to the indexed prefix, as
+    /// the PostgreSQL path does: the root and proof at the chain-local count
+    /// below the target, never `CountNotIndexed`.
     #[test]
-    fn global_target_above_indexed_is_count_not_indexed() {
-        let v = ready_model(&two_chain_ids()).view();
-        // Four deposits of chain_id 1 are indexed; chain_id 2's deposit 7 does not count.
-        let not_indexed = ReadError::CountNotIndexed { count: 5, indexed: 4 };
-        for chain_index in [0, 1, 2, 9] {
-            assert_eq!(v.tree_root(&tree_root(chain_index, None, Some(5), Some(1))).map(|r| r.root), Err(not_indexed.clone()), "{chain_index}");
-            assert_eq!(v.claim_proof(&proof_at_target(chain_index, 0, 5)).map(|r| r.proof), Err(not_indexed.clone()), "{chain_index}");
+    fn global_target_above_indexed_is_served_at_the_indexed_local_count() {
+        let b = two_chain_ids();
+        let v = ready_model(&b).view();
+        // Four deposits of chain_id 1 are indexed; targets 5 and 1000 are ahead of them.
+        for target in [5, 1000] {
+            for (chain_index, local) in [(0, 3), (1, 1)] {
+                let r = v.tree_root(&tree_root(chain_index, None, Some(target), Some(1))).unwrap();
+                assert_eq!((r.chain_local_count, r.has_foreign_deposits), (local, true), "{chain_index} {target}");
+                assert_eq!(r.root, to_display_hex(&naive_root(&b.leaves(chain_index), local)), "{chain_index} {target}");
+                let c = v.claim_proof(&proof_at_target(chain_index, 0, target)).unwrap();
+                assert_eq!(c.chain_local_count, local, "{chain_index} {target}");
+                let proof = c.proof.unwrap();
+                assert_eq!(proof.root, r.root, "{chain_index} {target}");
+                assert_eq!(proof.siblings, naive_siblings(&b.leaves(chain_index), 0, local).iter().map(to_display_hex).collect::<Vec<_>>());
+            }
+            // Chain index 2 belongs to chain_id 2 and index 9 is unknown: both
+            // hold none of chain_id 1's deposits, so count 0 and the zero root.
+            for chain_index in [2, 9] {
+                let r = v.tree_root(&tree_root(chain_index, None, Some(target), Some(1))).unwrap();
+                assert_eq!((r.chain_local_count, r.root), (0, to_display_hex(&zero(32))), "{chain_index} {target}");
+                assert_eq!(v.claim_proof(&proof_at_target(chain_index, 0, target)).unwrap().proof, None, "{chain_index} {target}");
+            }
         }
     }
 
     #[test]
-    fn global_target_on_a_chain_id_without_deposits_is_count_not_indexed() {
+    fn global_target_on_a_chain_id_without_deposits_is_count_zero() {
         let v = ready_model(&two_chain_ids()).view();
-        let not_indexed = ReadError::CountNotIndexed { count: 5, indexed: 0 };
-        assert_eq!(v.tree_root(&tree_root(9, None, Some(5), Some(3))).map(|r| r.root), Err(not_indexed.clone()));
-        assert_eq!(v.claim_proof(&ClaimProofQuery { chain_id: Some(3), ..proof_at_target(9, 0, 5) }).map(|r| r.proof), Err(not_indexed));
+        for target in [0, 5] {
+            let r = v.tree_root(&tree_root(9, None, Some(target), Some(3))).unwrap();
+            assert_eq!((r.chain_local_count, r.has_foreign_deposits, r.root), (0, false, to_display_hex(&zero(32))), "{target}");
+            let c = v.claim_proof(&ClaimProofQuery { chain_id: Some(3), ..proof_at_target(9, 0, target) }).unwrap();
+            assert_eq!((c.chain_local_count, c.deposit, c.proof), (0, None, None), "{target}");
+        }
     }
 
     #[test]
-    fn global_target_zero_on_a_chain_id_without_deposits_is_served() {
+    fn local_count_above_indexed_stays_count_not_indexed() {
         let v = ready_model(&two_chain_ids()).view();
-        let r = v.tree_root(&tree_root(9, None, Some(0), Some(3))).unwrap();
-        assert_eq!((r.chain_local_count, r.root), (0, to_display_hex(&zero(32))));
+        assert_eq!(v.tree_root(&tree_root(0, Some(4), None, None)), Err(ReadError::CountNotIndexed { count: 4, indexed: 3 }));
+        let q = ClaimProofQuery { count: Some(4), target_deposit_count: None, ..proof_at_target(0, 0, 0) };
+        assert_eq!(v.claim_proof(&q), Err(ReadError::CountNotIndexed { count: 4, indexed: 3 }));
     }
 
     #[test]
@@ -611,7 +627,7 @@ mod tests {
         let r = v.tree_root(&tree_root(7, Some(0), None, None)).unwrap();
         assert_eq!((r.chain_local_count, r.root), (0, to_display_hex(&zero(32))));
         assert_eq!(v.tree_root(&tree_root(7, Some(1), None, None)), Err(ReadError::CountNotIndexed { count: 1, indexed: 0 }));
-        assert_eq!(v.tree_root(&tree_root(7, None, Some(1), Some(1))).unwrap().chain_local_count, 0);
+        assert_eq!(v.tree_root(&tree_root(7, None, Some(10), Some(1))).unwrap().chain_local_count, 0);
         assert_eq!(v.deposits_by_address(&address("A", Some(7), 10, 0)).unwrap().total, 0);
         assert_eq!(v.deposit_by_index(&DepositByIndexQuery { chain_index: 7, chain_id: 1, deposit_index: 0 }).unwrap().deposit, None);
         let claims = v.withdrawal_claims(&WithdrawalClaimsRequest { chain_id: 9, nullifiers: vec!["n".to_owned()] }).unwrap();

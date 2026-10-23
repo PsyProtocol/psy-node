@@ -248,7 +248,7 @@ async function verifyInner(reader, {
     const total = Number(psqlJson(`SELECT count(*) FROM "Deposit" WHERE shield_address = '${shield}' AND chain_index = ${chainIndex} AND chain_id = ${chainId}`));
     const pages = [[100, 0], [100, 1], [100, total], [100, total + 5], [1, 0], [1, Math.max(total - 1, 0)]];
     for (const [limit, offset] of pages) {
-      const sqlRows = sql('deposit_list_offset_page', shield, chainIndex, chainId, offset).slice(0, limit);
+      const sqlRows = sql('deposit_list_offset_page', shield, chainIndex, chainId, offset, limit);
       const got = await reader.get(`/v1/deposits/by-address?shield_address=${shield}&chain_id=${chainId}&chain_index=${chainIndex}&limit=${limit}&offset=${offset}`);
       const where = `${label} by-address ${shield} limit ${limit} offset ${offset}`;
       assert.equal(got.total, total, `${where}: total`);
@@ -276,6 +276,15 @@ async function verifyInner(reader, {
     assert.equal(got.chain_local_count, probe.length ? Number(probe[0].chain_local_count) : 0, `${label}: prefix local count at ${target}`);
     assert.equal(got.has_foreign_deposits, foreign, `${label}: prefix foreign flag at ${target}`);
   }
+  // A global target ahead of the index is served at the indexed prefix: the
+  // root at the local count the probe resolves it to, never count_not_indexed.
+  for (const target of [lastCount + 1, lastCount + 1000]) {
+    const probe = sql('global_to_local_probe', chainIndex, chainId, target);
+    const local = probe.length ? Number(probe[0].chain_local_count) : 0;
+    const got = await reader.get(`/v1/tree/root?chain_index=${chainIndex}&chain_id=${chainId}&target_deposit_count=${target}`);
+    assert.equal(got.chain_local_count, local, `${label}: tree root local count at target ${target}`);
+    assert.equal(got.root, await rootAt(local), `${label}: tree root at target ${target}`);
+  }
   const claimRows = JSON.parse(psqlJson(`SELECT coalesce(json_agg(to_jsonb(t)), '[]') FROM "WithdrawalClaim" t WHERE chain_id = ${chainId}`));
   const nullifiers = [...claimRows.map((r) => r.nullifier), '0x' + 'ee'.repeat(32)];
   const claims = await reader.call('POST', '/v1/withdrawal-claims', { chain_id: chainId, nullifiers });
@@ -293,7 +302,7 @@ async function verifyInner(reader, {
   const feed = sql('explorer_feed_current', chainId);
   assert.equal(explorer.deposits.length, feed.length, `${label}: explorer deposit count`);
   explorer.deposits.forEach((row, i) => assertRowMatches(`${label} explorer row ${i}`, row, feed[i]));
-  assertRowsMatch(`${label} explorer set`, explorer.deposits, sql('explorer_latest_deposits', chainIndex), (r) => String(r.deposit_index));
+  assertRowsMatch(`${label} explorer set`, explorer.deposits, sql('explorer_latest_deposits', chainIndex, 100), (r) => String(r.deposit_index));
   const batchCount = Number(psqlJson(`SELECT count(*) FROM "FinalizedBatch" WHERE chain_id = ${chainId}`));
   assert.equal(explorer.batches.length, Math.min(batchCount, 100), `${label}: explorer batch count`);
 
