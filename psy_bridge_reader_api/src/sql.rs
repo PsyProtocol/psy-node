@@ -19,6 +19,10 @@ pub const READER_TABLES: &[&str] = &[
     "envio_chains",
 ];
 
+/// Tables read only by the psy-services direct-PostgreSQL fallback (design
+/// C13); the Reader never reads them (plan P11).
+pub const LEGACY_TABLES: &[&str] = &["AccountDepositStats"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryClass {
     Bridge,
@@ -92,12 +96,11 @@ pub fn query(name: &str) -> &'static Query {
         .unwrap_or_else(|| panic!("unregistered query {name}"))
 }
 
-/// Every index named by a registered query. The table is the reader table the
-/// index name is prefixed with (`<Table>_...`), which is also the table the
-/// statement reads it from; a join's driving `FROM` table can differ.
-/// An index on a table outside `READER_TABLES` (the legacy
-/// `account_deposit_stats` shape reads `AccountDepositStats`, which the Reader
-/// does not read, plan P11) is not the Reader's requirement and is left out.
+/// Every index named by a registered query. The table is the known table the
+/// index name is prefixed with (`<Table>_...`, longest match over
+/// `READER_TABLES` and `LEGACY_TABLES`), which is also the table the statement
+/// reads it from; a join's driving `FROM` table can differ. A name matching
+/// neither list panics: a typo or a new table must be added deliberately.
 pub fn required_indexes() -> Vec<RequiredIndex> {
     let mut out: Vec<RequiredIndex> = Vec::new();
     for q in registry() {
@@ -107,15 +110,24 @@ pub fn required_indexes() -> Vec<RequiredIndex> {
             }
             let table = READER_TABLES
                 .iter()
+                .chain(LEGACY_TABLES)
                 .copied()
                 .filter(|t| name.strip_prefix(t).is_some_and(|r| r.starts_with('_')))
-                .max_by_key(|t| t.len());
-            if let Some(table) = table {
-                out.push(RequiredIndex { table, name });
-            }
+                .max_by_key(|t| t.len())
+                .unwrap_or_else(|| panic!("index {name} of query {} names no known table", q.name));
+            out.push(RequiredIndex { table, name });
         }
     }
     out
+}
+
+/// `required_indexes()` restricted to `READER_TABLES`: the set the Reader's
+/// guard checks.
+pub fn reader_required_indexes() -> Vec<RequiredIndex> {
+    required_indexes()
+        .into_iter()
+        .filter(|i| READER_TABLES.contains(&i.table))
+        .collect()
 }
 
 fn parse(text: &'static str) -> Vec<Query> {
@@ -238,7 +250,16 @@ mod tests {
         let all = required_indexes();
         assert!(all.iter().any(|i| i.table == "WithdrawalClaim"
             && i.name == "WithdrawalClaim_chain_id_block_number_id"));
+        assert!(all
+            .iter()
+            .any(|i| i.table == "AccountDepositStats" && i.name == "AccountDepositStats_pkey"));
+    }
+
+    #[test]
+    fn reader_required_indexes_cover_only_reader_tables() {
+        let all = reader_required_indexes();
         assert!(all.iter().all(|i| READER_TABLES.contains(&i.table)));
+        assert!(!all.iter().any(|i| i.name == "AccountDepositStats_pkey"));
     }
 
     #[test]

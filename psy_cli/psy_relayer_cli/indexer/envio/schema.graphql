@@ -1,5 +1,5 @@
 # Secondary indexes serve the registered Services read paths (see
-# tests/plan/queries.sql). Envio 2.32.10 creates them only when it initializes
+# psy_bridge_reader_api/sql/queries.sql). Envio 2.32.10 creates them only when it initializes
 # an empty schema, with names "<table>_<fields joined by _>".
 #   Deposit_shield_address_chain_index_chain_local_deposit_index: wallet list
 #     by shield address, one protocol chain, in dense per-chain order.
