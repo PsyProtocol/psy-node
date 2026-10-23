@@ -163,6 +163,8 @@ fn vm_context() -> ExecutionContext {
         nonce: 0,
         user_public_key_hash: [0; 4],
         session_proof_tree_root: [0; 4],
+            transaction_log: vec![],
+            transaction_stack_hash: [0; 4],
     }
 }
 
@@ -265,6 +267,14 @@ impl ContextInput for VecInput<'_> {
     fn get_session_proof_tree_root(&self) -> [u64; 4] {
         [0; 4]
     }
+    fn get_transaction_count(&self) -> u64 { 0 }
+    fn get_transaction_stack_hash(&self) -> [u64; 4] { [0; 4] }
+    fn get_transaction_contract_id(&self, _index: u64) -> u64 { 0 }
+    fn get_transaction_caller_contract_id(&self, _index: u64) -> u64 { 0 }
+    fn get_transaction_method_id(&self, _index: u64) -> u64 { 0 }
+    fn get_transaction_inputs_hash(&self, _index: u64) -> [u64; 4] { [0; 4] }
+    fn get_transaction_input_length(&self, _index: u64) -> u64 { 0 }
+    fn get_transaction_input_word(&self, _tx_index: u64, _word_index: u64) -> u64 { 0 }
     fn get_self_current_contract_slot(&self, _index: u64) -> u64 {
         0
     }
@@ -671,6 +681,8 @@ fn random_compile_path_produces_valid_executable_defs() {
                 nonce: 0,
                 user_public_key_hash: [0; 4],
                 session_proof_tree_root: [0; 4],
+            transaction_log: vec![],
+            transaction_stack_hash: [0; 4],
             };
             let mut ex = VmExecutor::new(InMemoryStateBackend::new());
             let r = ex.execute(&defn, &ctx, &input_values).unwrap_or_else(|e| {

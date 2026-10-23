@@ -39,7 +39,7 @@ pub use guardians_root::preflight_fresh_devnet_inputs;
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
-const DEFAULT_SD_KEY_FINGERPRINT: &str = "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278";
+const DEFAULT_SD_KEY_FINGERPRINT: &str = "13815ec09024853c0324a0ca8469334210b2692df75cd601f6536f215a07cbe5";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
 
 

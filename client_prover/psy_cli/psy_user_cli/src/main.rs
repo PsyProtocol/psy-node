@@ -148,6 +148,7 @@ fn comparable_path(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf>
 
 fn push_wallet_paths<'a>(paths: &mut Vec<&'a str>, wallet: &'a psy_client_common::args::WalletSourceArgs) {
     paths.extend(wallet.keystore_path.as_deref());
+    paths.extend(wallet.sd_key_definition.as_deref());
 }
 
 fn push_session_paths<'a>(paths: &mut Vec<&'a str>, session: &'a psy_client_common::args::WalletSessionArgs) {
@@ -164,6 +165,11 @@ fn command_paths(cli: &Cli) -> Vec<&str> {
             WalletCommands::Create { output, wallet, .. } => { push_wallet_paths(&mut paths, wallet); paths.extend(output.as_deref()); }
             WalletCommands::Load { wallet } | WalletCommands::Info { wallet } => push_wallet_paths(&mut paths, wallet),
             WalletCommands::List { keystore_dir } => paths.extend(keystore_dir.as_deref()),
+            WalletCommands::SdKeyPolicyFingerprint { definition } => paths.push(definition),
+            WalletCommands::SdKeyPolicyTemplate { output, rpc_config, .. } => { paths.extend(output.as_deref()); paths.extend(rpc_config.as_deref()); }
+            WalletCommands::SdKeyPolicyCheck { definition, rpc_config, .. } => { paths.push(definition); paths.extend(rpc_config.as_deref()); }
+            WalletCommands::SdKeyPolicyDescribe { definition, rpc_config, .. } => { paths.push(definition); paths.extend(rpc_config.as_deref()); }
+            WalletCommands::SdKeyPolicyResolve { definition, rpc_config, output, .. } => { paths.push(definition); paths.extend(rpc_config.as_deref()); paths.extend(output.as_deref()); }
             WalletCommands::Random { .. } | WalletCommands::SdKeyFingerprint { .. } => {}
         },
         Commands::RegisterUser(args) => push_wallet_paths(&mut paths, &args.wallet),

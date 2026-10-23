@@ -1,0 +1,13 @@
+{
+  "per_transaction": {
+    "All": [
+      { "Contract": 7 },
+      { "Any": [{ "Method": 10 }, { "Method": 20 }] },
+      { "Input": { "word": 0, "comparison": "Lte", "value": 100 } }
+    ]
+  },
+  "transaction_rules": { "0": { "Method": 10 }, "1": { "Method": 20 } },
+  "totals": [{ "word": 0, "max_per_tx": 100, "max_total": 250 }],
+  "min_tx_count": 2,
+  "max_tx_count": 3
+}

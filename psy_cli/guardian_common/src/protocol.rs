@@ -1298,7 +1298,7 @@ mod schema_cutover_tests {
     fn zk_sign_step() -> TraceStep {
         TraceStep::ZkSign(ZkSignStep {
             fingerprint: Hash4::ZERO, proof_tree_start_root: Hash4::ZERO, proof_tree_end_root: Hash4::ZERO,
-            sign_circuit_source: TraceSignCircuitSource::PsySoftwareDefined { circuit_def: vec![7, 8, 9], force_four_align: false },
+            sign_circuit_source: TraceSignCircuitSource::SdKeyDpn { function_def: vec![7, 8, 9], config: psy_client_data::dpn::sd_key::SDKeyConfig::default() },
             sign_witness: vec![1, 2, 3, 4],
             public_key_param: Hash4::ZERO,
             sign_verifier_data_alt: alt_verifier_data(),
@@ -1354,8 +1354,8 @@ mod schema_cutover_tests {
                 }
                 TraceStep::ZkSign(sign) => {
                     if !sign.sign_witness.is_empty() { payload["steps"][index]["sign_witness"] = digit_array(&sign.sign_witness); }
-                    if let TraceSignCircuitSource::PsySoftwareDefined { circuit_def, .. } = &sign.sign_circuit_source {
-                        if !circuit_def.is_empty() { payload["steps"][index]["sign_circuit_source"]["circuit_def"] = digit_array(circuit_def); }
+                    if let TraceSignCircuitSource::SdKeyDpn { function_def, .. } = &sign.sign_circuit_source {
+                        if !function_def.is_empty() { payload["steps"][index]["sign_circuit_source"]["function_def"] = digit_array(function_def); }
                     }
                 }
             }
@@ -1373,7 +1373,7 @@ mod schema_cutover_tests {
         let payload: Value = serde_json::from_str(&generated.trace.payload).unwrap();
         assert!(payload["contract_codes"][0]["code"].is_string());
         assert!(payload["steps"][1]["sign_witness"].is_string());
-        assert!(payload["steps"][1]["sign_circuit_source"]["circuit_def"].is_string());
+        assert!(payload["steps"][1]["sign_circuit_source"]["function_def"].is_array());
         let old = GuardianSignRequest { schema_version: 2, ..request(3, &schema2_generated(&trace)) };
         let json = serde_json::to_vec(&old).unwrap();
         let blob = old.canonical_bytes().unwrap();
@@ -1415,7 +1415,7 @@ mod schema_cutover_tests {
         assert_eq!(step.proof, vec![70, 80]);
         let TraceStep::ZkSign(step) = &walked.steps[2] else { unreachable!() };
         assert_eq!(step.sign_witness, vec![1, 2, 3, 4]);
-        assert!(matches!(&step.sign_circuit_source, TraceSignCircuitSource::PsySoftwareDefined { circuit_def, .. } if circuit_def == &vec![7, 8, 9]));
+        assert!(matches!(&step.sign_circuit_source, TraceSignCircuitSource::SdKeyDpn { function_def, .. } if function_def == &vec![7, 8, 9]));
     }
 
     #[test]
