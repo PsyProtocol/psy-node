@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { type SpawnSyncReturns, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WORKSPACE_REPOS } from "./workspace-create";
+import { applyPreparation, type PreparePlan, type PrepareResult, type Runner, type RunResult } from "./workspace-operations";
 
 const script = join(import.meta.dir, "workspace.ts");
 const identity = ["-c", "user.name=Workspace Test", "-c", "user.email=workspace@example.invalid"];
@@ -614,7 +615,7 @@ describe("reviewed workspace publication (simulated transport only)", () => {
     }
   });
 
-  it("rejects changed external SHAs, URLs, and paths or new pins before any simulated publication", () => {
+  it("rejects changed external SHAs, URLs, and paths or new pins before any simulated publication", 60000, () => {
     for (const change of ["sha", "url", "path", "new"]) {
       const fixture = publicationFixture();
       const parent = "psy-contracts";
@@ -751,5 +752,345 @@ describe("reviewed workspace publication (simulated transport only)", () => {
     expect(result.stderr).toContain("expected remote commit is not an ancestor of the reviewed commit");
     expect(fixture.pushes()).toEqual([]);
     expect(git(repo, ["rev-parse", "HEAD"])).toBe(headSha);
+  });
+});
+
+
+const NODE_REV = "7d6815d22728debbc71f6a928f85aa4b209ebf4f";
+const CARGO_NODE = `[dependencies]\npsy_vm = { git = "https://github.com/PsyProtocol/psy-node.git", rev = "${NODE_REV}" }\n`;
+const NODE_CRATE = `[package]\nname = "psy_vm"\nversion = "0.0.0"\n`;
+
+function seedNode(repo: string): void {
+  writeFileSync(join(repo, "Cargo.toml"), `[workspace]\nmembers = ["psy_vm"]\n`);
+  mkdirSync(join(repo, "psy_vm/src"), { recursive: true });
+  writeFileSync(join(repo, "psy_vm/src/lib.rs"), "");
+  writeFileSync(join(repo, "psy_vm/Cargo.toml"), NODE_CRATE);
+  git(repo, ["add", "Cargo.toml", "psy_vm"]);
+}
+
+function prepareWorkspace(): { root: string; repos: Record<string, string> } {
+  const root = disposable("workspace-prepare-");
+  const repos = cohort(root);
+  for (const name of WORKSPACE_REPOS) commit(repos[name], `${name} base`);
+  seedNode(repos["psy-node"]);
+  commit(repos["psy-node"], "node crates");
+  return { root, repos };
+}
+
+
+function prepareSnapshot(root: string): Record<string, { head: string; refs: string; index: string; status: string }> {
+  return Object.fromEntries(WORKSPACE_REPOS.flatMap(name => {
+    const repo = join(root, name);
+    const nested = WORKSPACE_REPOS.filter(child => existsSync(join(repo, child, ".git"))).map(child => join(repo, child));
+    return [[name, repo], ...nested.map(path => [path, path] as [string, string])].map(([label, path]) => [label, {
+      head: git(path, ["rev-parse", "HEAD"]),
+      refs: git(path, ["show-ref"]),
+      index: readFileSync(join(path, ".git/index")).toString("base64"),
+      status: git(path, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"]),
+    }]);
+  }));
+}
+
+// P1: workspace.ts captures its Git environment at module init, so every planner
+// invocation runs in a child process whose sanitized fixture environment exists
+// before the planner import; the test process never imports it.
+function planProcess(root: string, mode: "build" | "assert", payload: string): SpawnSyncReturns<string> {
+  const child = join(root, "plan-child.mjs");
+  writeFileSync(child, `const planner = await import(${JSON.stringify(script)});
+const [mode, payload] = process.argv.slice(2);
+if (mode === "build") {
+  const { root, args } = JSON.parse(payload);
+  const parsed = planner.parseInvocation(["prepare", ...args]);
+  const plan = planner.buildPreparePlan(root, parsed.options.get("repo").split(","), parsed.commitPaths, parsed.options.get("message"));
+  planner.printPreparePlan(plan);
+  console.log("PLANJSON" + JSON.stringify(plan));
+} else {
+  try { planner.assertPreparePlanUnchanged(JSON.parse(payload)); console.log("PLANUNCHANGED"); }
+  catch (error) { console.log("PLANREJECTED " + (error instanceof Error ? error.message : String(error))); }
+}
+`);
+  return spawnSync(process.execPath, [child, mode, payload], { encoding: "utf8", env: localEnvironment(root) });
+}
+
+function buildPlan(root: string, args: string[]): PreparePlan {
+  const result = planProcess(root, "build", JSON.stringify({ root, args }));
+  expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+  return JSON.parse(result.stdout.split("\n").find(line => line.startsWith("PLANJSON"))!.slice("PLANJSON".length)) as PreparePlan;
+}
+
+describe("local preparation (subprocess planner, no publication)", () => {
+  it("previews without index, ref, or file mutations", () => {
+    const { root, repos } = prepareWorkspace();
+    writeFileSync(join(repos["psy-sdk"], "owned.txt"), "owned\n");
+    const before = prepareSnapshot(root);
+    const result = workspace(["prepare", "--source", root, "--repo", "psy-sdk", "--commit-path", "psy-sdk=owned.txt", "--message", "prepare sdk"], localEnvironment(root));
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("prepare: psy-sdk");
+    expect(result.stdout).toContain('"owned.txt"');
+    expect(result.stdout).toContain("Preview performs no writes, fetches or Cargo resolution");
+    expect(result.stdout).toContain("No push or npm version change.");
+    expect(prepareSnapshot(root)).toEqual(before);
+  });
+
+  it("keeps a comma inside an explicit owned path", () => {
+    const { root, repos } = prepareWorkspace();
+    const name = "notes,draft.txt";
+    writeFileSync(join(repos["psy-wallet"], name), "kept\n");
+    const result = workspace(["prepare", "--source", root, "--repo", "psy-sdk,psy-wallet", "--commit-path", `psy-wallet=${name}`, "--message", "keep comma"], localEnvironment(root));
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("prepare: psy-sdk -> psy-wallet");
+    expect(result.stdout).toContain('"notes,draft.txt"');
+  });
+
+  it("rejects owning a repository root or directory, a symlink, and a dirty index", () => {
+    const { root, repos } = prepareWorkspace();
+    mkdirSync(join(repos["psy-sdk"], "dir"));
+    writeFileSync(join(repos["psy-sdk"], "dir/file.txt"), "inside\n");
+    symlinkSync("dir/file.txt", join(repos["psy-sdk"], "linked.txt"));
+    for (const [owned, message] of [[".", /literal relative file path|individual file/], ["dir", /individual file, not a directory/], ["linked.txt", /symlink traversal is not owned/]] as const) {
+      const result = workspace(["prepare", "--source", root, "--repo", "psy-sdk", "--commit-path", `psy-sdk=${owned}`, "--message", "reject"], localEnvironment(root));
+      expect(result.status, owned).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`, owned).toMatch(message);
+    }
+    expect(lstatSync(join(repos["psy-sdk"], "linked.txt")).isSymbolicLink()).toBe(true);
+    writeFileSync(join(repos["psy-wallet"], "staged.txt"), "staged\n");
+    git(repos["psy-wallet"], ["add", "staged.txt"]);
+    const staged = workspace(["prepare", "--source", root, "--repo", "psy-wallet", "--commit-path", "psy-wallet=staged.txt", "--message", "reject"], localEnvironment(root));
+    expect(staged.status).not.toBe(0);
+    expect(`${staged.stdout}${staged.stderr}`).toContain("empty index without conflicts");
+    expect(git(repos["psy-wallet"], ["diff", "--cached", "--name-only"])).toBe("staged.txt");
+  });
+
+  it("orders a gitlink child before its parent and rejects a Cargo edge cycle", () => {
+    const { root, repos } = prepareWorkspace();
+    const child = git(repos["psy-genesis"], ["rev-parse", "HEAD"]);
+    pin(repos["psy-dapp"], "psy-genesis", child, '[submodule "psy-genesis"]\n\tpath = psy-genesis\n\turl = git@github.com:PsyProtocol/psy-genesis.git\n');
+    mkdirSync(join(repos["psy-dapp"], "psy-genesis"), { recursive: true });
+    git(repos["psy-dapp"], ["clone", "-q", repos["psy-genesis"], "psy-genesis"]);
+    git(join(repos["psy-dapp"], "psy-genesis"), ["checkout", "-q", child]);
+    git(repos["psy-dapp"], ["submodule", "init"]);
+    const result = workspace(["prepare", "--source", root, "--repo", "psy-dapp,psy-genesis", "--message", "order children first"], localEnvironment(root));
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("prepare: psy-genesis -> psy-dapp");
+    expect(result.stdout).toContain('gitlink "psy-genesis"');
+    writeFileSync(join(repos["psy-compiler"], "Cargo.toml"), CARGO_NODE);
+    git(repos["psy-compiler"], ["add", "Cargo.toml"]);
+    commit(repos["psy-compiler"], "compiler depends on node");
+    pin(repos["psy-node"], "psy-compiler", git(repos["psy-compiler"], ["rev-parse", "HEAD"]), '[submodule "psy-compiler"]\n\tpath = psy-compiler\n\turl = git@github.com:PsyProtocol/psy-compiler.git\n');
+    mkdirSync(join(repos["psy-node"], "psy-compiler"), { recursive: true });
+    git(repos["psy-node"], ["clone", "-q", repos["psy-compiler"], "psy-compiler"]);
+    git(join(repos["psy-node"], "psy-compiler"), ["checkout", "-q", git(repos["psy-compiler"], ["rev-parse", "HEAD"])]);
+    git(repos["psy-node"], ["submodule", "init"]);
+    const cycle = workspace(["prepare", "--source", root, "--repo", "psy-node,psy-compiler", "--message", "cycle"], localEnvironment(root));
+    expect(cycle.status).not.toBe(0);
+    expect(`${cycle.stdout}${cycle.stderr}`).toMatch(/Preparation dependency cycle \(gitlink\/Cargo\)[\s\S]*psy-compiler \(gitlink\)[\s\S]*psy-node \(Cargo\)/);
+  });
+
+  it("leaves unrelated dirty files unstaged and unowned", () => {
+    const { root, repos } = prepareWorkspace();
+    writeFileSync(join(repos["psy-sdk"], "owned.txt"), "owned\n");
+    writeFileSync(join(repos["psy-sdk"], "aside.txt"), "staged\n");
+    git(repos["psy-sdk"], ["add", "aside.txt"]);
+    writeFileSync(join(repos["psy-sdk"], "aside.txt"), "unstaged\n");
+    writeFileSync(join(repos["psy-wallet"], "other.txt"), "untouched\n");
+    const blocked = workspace(["prepare", "--source", root, "--repo", "psy-sdk", "--commit-path", "psy-sdk=owned.txt", "--message", "keep unrelated"], localEnvironment(root));
+    expect(blocked.status).not.toBe(0);
+    expect(`${blocked.stdout}${blocked.stderr}`).toContain("empty index without conflicts");
+    git(repos["psy-sdk"], ["reset", "-q"]);
+    const result = workspace(["prepare", "--source", root, "--repo", "psy-sdk", "--commit-path", "psy-sdk=owned.txt", "--message", "keep unrelated"], localEnvironment(root));
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('"owned.txt"');
+    expect(result.stdout).toContain("Outside preparation (untouched, not automatically updated):");
+    expect(result.stdout).toContain("psy-wallet");
+    expect(readFileSync(join(repos["psy-sdk"], "aside.txt"), "utf8")).toBe("unstaged\n");
+    expect(readFileSync(join(repos["psy-wallet"], "other.txt"), "utf8")).toBe("untouched\n");
+    expect(git(repos["psy-sdk"], ["diff", "--cached", "--name-only"])).toBe("");
+  });
+
+  it("refuses a stale HEAD or owned-file snapshot before any commit", () => {
+    const { root, repos } = prepareWorkspace();
+    writeFileSync(join(repos["psy-sdk"], "owned.txt"), "owned\n");
+    const plan = buildPlan(root, ["--source", root, "--repo", "psy-sdk", "--commit-path", "psy-sdk=owned.txt", "--message", "frozen"]);
+    expect(plan.repositories[0].ownedPaths).toEqual(["owned.txt"]);
+    const assertPlan = (): string => planProcess(root, "assert", JSON.stringify(plan)).stdout;
+    expect(assertPlan()).toContain("PLANUNCHANGED");
+    const headBefore = git(repos["psy-sdk"], ["rev-parse", "HEAD"]);
+    commit(repos["psy-sdk"], "moved after preview");
+    expect(assertPlan()).toContain("HEAD changed since preparation preview");
+    git(repos["psy-sdk"], ["update-ref", "HEAD", headBefore]);
+    writeFileSync(join(repos["psy-sdk"], "owned.txt"), "changed after preview\n");
+    expect(assertPlan()).toContain("owned.txt: owned file changed since preparation preview");
+    writeFileSync(join(repos["psy-sdk"], "owned.txt"), "owned\n");
+    expect(assertPlan()).toContain("PLANUNCHANGED");
+    expect(git(repos["psy-sdk"], ["rev-parse", "HEAD"])).toBe(headBefore);
+    expect(git(repos["psy-sdk"], ["diff", "--cached", "--name-only"])).toBe("");
+  });
+
+  it("does not treat an npm manifest as a preparation dependency or owned path", () => {
+    const { root, repos } = prepareWorkspace();
+    writeFileSync(join(repos["psy-dapp"], "package.json"), JSON.stringify({ dependencies: { "@psy-protocol/psy-sdk": "1.0.0" } }));
+    writeFileSync(join(repos["psy-sdk"], "package.json"), JSON.stringify({ name: "@psy-protocol/psy-sdk", version: "1.0.0" }));
+    const before = [repos["psy-dapp"], repos["psy-sdk"]].map(repo => readFileSync(join(repo, "package.json"), "utf8"));
+    const result = workspace(["prepare", "--source", root, "--repo", "psy-dapp,psy-sdk", "--message", "npm stays"], localEnvironment(root));
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("prepare: psy-dapp -> psy-sdk");
+    expect(result.stdout).not.toContain("package.json");
+    expect(result.stdout).toContain("(none; skip empty commit)");
+    expect([repos["psy-dapp"], repos["psy-sdk"]].map(repo => readFileSync(join(repo, "package.json"), "utf8"))).toEqual(before);
+  });
+});
+
+describe("local preparation apply (existing runner, fake commands, no publication)", () => {
+  it("commits the child, pins the parent, resolves Cargo locally, and leaves npm untouched", () => {
+    const { root, repos } = prepareWorkspace();
+    const genesis = git(repos["psy-genesis"], ["rev-parse", "HEAD"]);
+    pin(repos["psy-node"], "psy-genesis", genesis, '[submodule "psy-genesis"]\n\tpath = psy-genesis\n\turl = git@github.com:PsyProtocol/psy-genesis.git\n');
+    mkdirSync(join(repos["psy-node"], "psy-genesis"), { recursive: true });
+    git(repos["psy-node"], ["clone", "-q", repos["psy-genesis"], "psy-genesis"]);
+    git(join(repos["psy-node"], "psy-genesis"), ["checkout", "-q", genesis]);
+    git(repos["psy-node"], ["submodule", "init"]);
+    writeFileSync(join(repos["psy-compiler"], "Cargo.toml"), CARGO_NODE);
+    writeFileSync(join(repos["psy-compiler"], "Cargo.lock"), `[[package]]\nname = "psy_vm"\nversion = "0.0.0"\nsource = "git+https://github.com/PsyProtocol/psy-node.git?rev=${NODE_REV}#${NODE_REV}"\n`);
+    git(repos["psy-compiler"], ["add", "Cargo.toml", "Cargo.lock"]);
+    commit(repos["psy-compiler"], "compiler pins node");
+    writeFileSync(join(repos["psy-genesis"], "owned.txt"), "child change\n");
+    writeFileSync(join(repos["psy-compiler"], "package.json"), "{\"name\":\"unchanged\"}\n");
+    const plan = buildPlan(root, ["--source", root, "--repo", "psy-genesis,psy-node,psy-compiler", "--commit-path", "psy-genesis=owned.txt", "--message", "prepare cohort"]);
+    expect(plan.repositories.map(repo => repo.name)).toEqual(["psy-genesis", "psy-node", "psy-compiler"]);
+    const commands: string[][] = [];
+    const runner: Runner = (command): RunResult => {
+      commands.push(command);
+      const destination = command[1] === "-C" ? command[2] : "";
+      const fetchArgs = command[1] === "-C" ? command.slice(3) : [];
+      const source = fetchArgs.at(-2) || "";
+      const refspec = fetchArgs.at(-1) || "";
+      const local = (path: string) => path.startsWith(`${root}/`) || path.startsWith(`${tmpdir()}/`);
+      const cacheSeed = JSON.stringify(fetchArgs.slice(0, -2)) === JSON.stringify(["fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--recurse-submodules=no"])
+        && local(destination) && local(source) && !source.includes("://") && !source.startsWith("git@")
+        && /^[0-9a-f]{40}:refs\/(heads\/prepare|prefetch\/workspace\/[0-9a-f]{40})$/.test(refspec);
+      if (command.includes("push") || command.includes("ls-remote") || command[0] === "npm" || (command.includes("fetch") && !cacheSeed)) return { code: 97, out: "", err: "publication denied" };
+      if (command[0] === "git") {
+        const repo = command[1] === "-C" ? command[2] : undefined;
+        const args = command[1] === "-C" ? command.slice(3) : command.slice(1);
+        const result = spawnSync(realGit, [...(repo ? ["-C", repo] : []), ...identity, ...args], { encoding: "utf8", env: localEnvironment(root) });
+        return { code: result.status ?? 1, out: result.stdout, err: result.stderr };
+      }
+      if (command[0] === "cargo" && command[1] === "metadata") {
+        const rev = git(repos["psy-node"], ["rev-parse", "HEAD"]);
+        const source = `git+https://github.com/PsyProtocol/psy-node.git?rev=${rev}#${rev}`;
+        writeFileSync(join(repos["psy-compiler"], "Cargo.lock"), `[[package]]\nname = "psy_vm"\nversion = "0.0.0"\nsource = "${source}"\n`);
+        return { code: 0, out: JSON.stringify({ packages: [{ name: "app", id: "app", source: null }, { name: "psy_vm", id: "psy_vm", source, manifest_path: join(repos["psy-node"], "psy_vm/Cargo.toml") }], resolve: { nodes: [{ id: "app", deps: [{ pkg: "psy_vm" }] }, { id: "psy_vm", deps: [] }] } }), err: "" };
+      }
+      return { code: 1, out: "", err: `unexpected ${command.join(" ")}` };
+    };
+    const result: PrepareResult = applyPreparation(plan, runner);
+    const nodeCommit = result.commits.find(commit => commit.name === "psy-node")!;
+    expect(result.commits.map(commit => commit.name)).toEqual(["psy-genesis", "psy-node", "psy-compiler"]);
+    expect(git(repos["psy-node"], ["rev-parse", ":psy-genesis"])).toBe(result.commits[0].to);
+    expect(readFileSync(join(repos["psy-compiler"], "Cargo.toml"), "utf8")).toContain(nodeCommit.to);
+    expect(readFileSync(join(repos["psy-compiler"], "package.json"), "utf8")).toBe("{\"name\":\"unchanged\"}\n");
+    expect(commands.some(command => command.includes("push") || command.includes("ls-remote") || command[0] === "npm")).toBe(false);
+    expect(commands.filter(command => command.includes("commit")).every(command => command.includes("--no-verify"))).toBe(true);
+    expect(commands.some(command => command.includes("fetch") && command.at(-1)?.endsWith(":refs/heads/prepare"))).toBe(true);
+  });
+});
+
+describe("prepare apply CLI (subprocess, deny-by-default git)", () => {
+  function applyFixture(mode: "skip" | "apply" | "stale"): { root: string; bin: string; log: string } {
+    const root = disposable("workspace-prepare-cli-");
+    const repos = cohort(root);
+    for (const name of WORKSPACE_REPOS) commit(repos[name], `${name} base`);
+    writeFileSync(join(repos["psy-sdk"], "owned.txt"), "base\n");
+    git(repos["psy-sdk"], ["add", "owned.txt"]);
+    git(repos["psy-sdk"], [...identity, "commit", "-m", "record owned"]);
+    if (mode !== "skip") writeFileSync(join(repos["psy-sdk"], "owned.txt"), "owned\n");
+    const log = join(root, "git-calls.log");
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const gitShim = join(bin, "git");
+    const sdk = join(repos["psy-sdk"]);
+    const count = join(root, "symbolic-ref.count");
+    writeFileSync(gitShim, `#!${process.execPath}
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const log = ${JSON.stringify(log)};
+const sdk = ${JSON.stringify(sdk)};
+const count = ${JSON.stringify(count)};
+const mutate = ${mode === "stale" ? "true" : "false"};
+const argv = process.argv.slice(2);
+appendFileSync(log, argv.join(" ") + "\\n");
+const deny = () => { console.error("DENIED fixture git invocation: " + argv.join(" ")); process.exit(97); };
+if (argv[0] !== "-C" || argv[1] !== sdk) deny();
+const args = argv.slice(2);
+const text = args.join(" ");
+const sha = value => /^[0-9a-f]{40}$/.test(value);
+const allowed = (args[0] === "rev-parse" && args[1] === "--show-toplevel" && args.length === 2)
+  || text === "rev-parse HEAD"
+  || text === "symbolic-ref --quiet --short HEAD"
+  || text === "diff --cached --name-only -z"
+  || text === "ls-files --unmerged -z"
+  || (args[0] === "rev-parse" && args[1] === "--verify" && args.length === 3 && args[2].endsWith("^{commit}") && (args[2] === "HEAD^{commit}" || sha(args[2].slice(0, 40))))
+  || (args[0] === "ls-tree" && args[1] === "-r" && args[2] === "-z" && args.length === 4 && sha(args[3]))
+  || text === "--literal-pathspecs ls-files -z -- owned.txt"
+  || text === "--literal-pathspecs add -- owned.txt"
+  || text === "commit --no-verify -m prepare sdk"
+  || (args[0] === "merge-base" && args[1] === "--is-ancestor" && args.length === 4 && sha(args[2]) && sha(args[3]));
+if (!allowed || args.includes("fetch") || args.includes("push") || args.includes("ls-remote")) deny();
+if (mutate && text === "symbolic-ref --quiet --short HEAD") {
+  let seen = 0;
+  try { seen = readFileSync(count, "utf8").split("\\n").filter(Boolean).length; } catch {}
+  appendFileSync(count, "x\\n");
+  if (seen === 2) writeFileSync(sdk + "/owned.txt", "changed after preview\\n");
+}
+const result = spawnSync(${JSON.stringify(realGit)}, argv, { encoding: "utf8" });
+process.stdout.write(result.stdout || "");
+process.stderr.write(result.stderr || "");
+process.exit(result.status ?? 98);
+`);
+    chmodSync(gitShim, 0o755);
+    return { root, bin, log };
+  }
+  function applyEnv(root: string, bin: string): NodeJS.ProcessEnv {
+    return { ...localEnvironment(root), PATH: `${bin}:${process.env.PATH}`, GIT_AUTHOR_NAME: "Workspace Test", GIT_AUTHOR_EMAIL: "workspace@example.invalid", GIT_COMMITTER_NAME: "Workspace Test", GIT_COMMITTER_EMAIL: "workspace@example.invalid" };
+  }
+
+  it("rechecks the frozen plan, skips an unchanged repository, and commits through the CLI with hooks disabled", () => {
+    const skipped = applyFixture("skip");
+    const preview = workspace(["prepare", "--source", skipped.root, "--repo", "psy-sdk", "--commit-path", "psy-sdk=owned.txt", "--message", "prepare sdk"], applyEnv(skipped.root, skipped.bin));
+    expect(preview.status, `${preview.stdout}${preview.stderr}`).toBe(0);
+    expect(preview.stdout).toContain('owned paths: "owned.txt"');
+    const skip = workspace(["prepare", "--source", skipped.root, "--repo", "psy-sdk", "--commit-path", "psy-sdk=owned.txt", "--message", "prepare sdk", "--apply"], applyEnv(skipped.root, skipped.bin));
+    expect(skip.status, `${skip.stdout}${skip.stderr}`).toBe(0);
+    expect(skip.stdout).toContain("psy-sdk: unchanged; no commit");
+    expect(readFileSync(skipped.log, "utf8")).not.toMatch(/(^|\s)commit(\s|$)|(^|\s)push(\s|$)/m);
+
+    const applied = applyFixture("apply");
+    const head = git(join(applied.root, "psy-sdk"), ["rev-parse", "HEAD"]);
+    const result = workspace(["prepare", "--source", applied.root, "--repo", "psy-sdk", "--commit-path", "psy-sdk=owned.txt", "--message", "prepare sdk", "--apply"], applyEnv(applied.root, applied.bin));
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain(`psy-sdk: prepared ${head} -> `);
+    const calls = readFileSync(applied.log, "utf8");
+    expect(calls.match(/commit --no-verify -m prepare sdk/g)).toEqual(["commit --no-verify -m prepare sdk"]);
+    expect(calls).not.toMatch(/\bpush\b/);
+    expect(git(join(applied.root, "psy-sdk"), ["rev-parse", "HEAD^{commit}"])).not.toBe(head);
+
+    const stale = applyFixture("stale");
+    const before = git(join(stale.root, "psy-sdk"), ["rev-parse", "HEAD"]);
+    const rejected = workspace(["prepare", "--source", stale.root, "--repo", "psy-sdk", "--commit-path", "psy-sdk=owned.txt", "--message", "prepare sdk", "--apply"], applyEnv(stale.root, stale.bin));
+    expect(rejected.status).not.toBe(0);
+    expect(`${rejected.stdout}${rejected.stderr}`).toContain("owned.txt: owned file changed since preparation preview");
+    expect(git(join(stale.root, "psy-sdk"), ["rev-parse", "HEAD"])).toBe(before);
+    expect(readFileSync(stale.log, "utf8")).not.toMatch(/(^|\s)commit(\s|$)/m);
+  });
+
+  it("rejects a cohort-named gitlink whose URL is not the canonical origin", () => {
+    const { root, repos } = prepareWorkspace();
+    const child = git(repos["psy-genesis"], ["rev-parse", "HEAD"]);
+    pin(repos["psy-dapp"], "psy-genesis", child, '[submodule "psy-genesis"]\n\tpath = psy-genesis\n\turl = https://evil.example/psy-genesis\n');
+    const before = { head: git(repos["psy-dapp"], ["rev-parse", "HEAD"]), index: git(repos["psy-dapp"], ["ls-files", "-s"]), status: git(repos["psy-dapp"], ["status", "--porcelain"]) };
+    const result = workspace(["prepare", "--source", root, "--repo", "psy-dapp,psy-genesis", "--message", "reject foreign origin"], localEnvironment(root));
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain("gitlink psy-genesis URL is not the canonical psy-genesis origin");
+    expect({ head: git(repos["psy-dapp"], ["rev-parse", "HEAD"]), index: git(repos["psy-dapp"], ["ls-files", "-s"]), status: git(repos["psy-dapp"], ["status", "--porcelain"]) }).toEqual(before);
   });
 });

@@ -233,6 +233,27 @@ Those four files are runtime databases. The existing owner-only `db/` directory 
 
 The one secret path per guardian is `$HOME/.psy/keystore/guardian-<id>.keystore.json`, from `guardian_keystore_path`. Its password is the environment variable from `guardian_password_env`, never a file and never serialized. The fresh preflight walks keystore metadata without following symlinks and never opens the files. `guardian-service` alone reads keystore contents, through `load_signing_key` (`runtime.rs:101-115,248-263`).
 
+#### 4.2.1 Offline compressed journal migration
+
+The compressed-journal release requires marker **3**, superseding the marker-2 requirement above. The eight table names and their key types do not change. Business requests remain `PSYGS002`: this is not a business-schema upgrade. Only `guardian_signed`, `guardian_session`, and `relayer_request` values gain the bounded `PSYGR001` Zstandard envelope. Full request code, trace, signature, and proof bytes are preserved; compression does not omit code. Runtime open and the fresh reset helper reject marker 2; neither silently migrates it (`psy_cli/psy_dev_cli/src/subcommand/fresh_devnet_state.rs:28-40`).
+
+Stop **all three guardians and the relayer**, disable their automatic restarts, and retain an offline backup before invoking the operator-controlled command from the node checkout:
+
+```bash
+./target/release/psy_relayer_cli migrate-guardian-journals \
+  --rpc-config psy-genesis/config.json \
+  --guardian-root "$PSY_GUARDIAN_ROOT" \
+  --l1-config l1-deployments/chain-0.json \
+  --l1-config l1-deployments/chain-1.json \
+  --l1-config l1-deployments/chain-2.json
+```
+
+Use the existing deployment-document paths for this workspace; repeat `--l1-config` once per document. Omitting them retains the runtime's configured `l1_config_url` loading behavior. The command does not rewrite either source. Migration needs no private key or password and never opens signing-key files. After acquiring all four exclusive database handles, it reads each existing `guardian_signer` singleton, validates its compressed SEC1 public point, and passes that exact retained identity to the migration API. This checks retained identity consistency, not key possession or independent signer membership in the configured policy. Account/network checks against configuration and full record validation remain mandatory. Normal guardian startup still checks the actual encrypted keystore identity. Preserve the keystores: do not regenerate, replace, delete, or pass keys/passwords in migration arguments (`psy_cli/psy_relayer_cli/src/main.rs`, `migration_signer`, `migrate_guardian_journals`).
+
+The command requires the existing protected `db/guardian-1.redb`, `db/guardian-2.redb`, `db/guardian-3.redb`, and `db/relayer.redb` files. It does not create a missing file, initialize an empty file, reset the chain, delete rows, prune history, or write configuration. It obtains and retains all four exclusive redb handles before invoking either migration API; a live database owner prevents migration. Opening can still perform normal redb recovery/header housekeeping (`psy_cli/psy_relayer_cli/src/main.rs`, `open_migration_database`, `migrate_guardian_journals`).
+
+Each database migration validates its identities and records, preserves table keys and exact decoded record bytes, and commits the compressed values together with its marker in **one transaction**. The four databases are **not one atomic transaction**: the order is guardians 1, 2, 3, then relayer. A failure stops immediately; earlier successful commits remain. Keep services stopped, correct the reported prerequisite, and rerun the same command. Marker-3 files are validated without conversion, so a partially completed run can resume. Output reports database names and row counts, never requests, signatures, proofs, keys, or passwords. All rows survive migration; normal subsequent guardian runtime retention remains one latest included session plus pending work, while the relayer retains full compressed history. Restart the compatible services only after all four databases complete migration.
+
 ### 4.3 Trusted proxy config, anchors, and availability
 
 Provenance: user rulings `trusted_guardian_proxy`, `trusted_guardian_proxy_config`, `trusted_guardian_proxy_anchors`, and `trusted_guardian_proxy_availability` (2026-10-13). Implemented. The earlier design-only and no-separate-pinning statements are withdrawn.

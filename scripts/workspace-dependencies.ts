@@ -26,15 +26,15 @@ export function nodeDependencies(text: string): NodeDependency[] {
   return found;
 }
 
-export function nodeCratePaths(node: string): Map<string, string> {
-  const manifest = Bun.TOML.parse(readFileSync(join(node, "Cargo.toml"), "utf8")) as Table;
+export function nodeCratePaths(node: string, read: (path: string, encoding: "utf8") => string = readFileSync, real: (path: string) => string = realpathSync): Map<string, string> {
+  const manifest = Bun.TOML.parse(read(join(node, "Cargo.toml"), "utf8")) as Table;
   const directories = new Set<string>(manifest.workspace?.members ?? []);
   for (const value of Object.values(manifest.workspace?.dependencies ?? {}) as Table[]) if (typeof value.path === "string") directories.add(value.path);
   const packages = new Map<string, string>();
   for (const directory of directories) {
-    const path = realpathSync(resolve(node, directory));
-    if (relative(realpathSync(node), path).startsWith("..")) throw new Error(`crate escapes sibling node: ${directory}`);
-    const crate = Bun.TOML.parse(readFileSync(join(path, "Cargo.toml"), "utf8")) as Table;
+    const path = real(resolve(node, directory));
+    if (relative(real(node), path).startsWith("..")) throw new Error(`crate escapes sibling node: ${directory}`);
+    const crate = Bun.TOML.parse(read(join(path, "Cargo.toml"), "utf8")) as Table;
     if (typeof crate.package?.name !== "string") throw new Error(`${directory}: not a concrete crate`);
     const prior = packages.get(crate.package.name);
     if (prior && prior !== path) throw new Error(`duplicate crate ${crate.package.name}`);

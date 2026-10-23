@@ -160,13 +160,31 @@ pub async fn run(
         _ = ctrl_c => {
             info!("Ctrl-C signal received, cleaning up...");
         }
-        _ = async {
+        result = async {
+            let mut inner_error = None;
             for handle in handles {
-                if let Err(e) = handle.await {
-                    error!("Worker thread failed: {:?}", e);
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error!("Worker thread failed: {e:#}");
+                        if inner_error.is_none() {
+                            inner_error = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Worker thread failed: {e:?}");
+                        if inner_error.is_none() {
+                            inner_error = Some(anyhow::anyhow!("worker task panicked: {e}"));
+                        }
+                    }
                 }
             }
+            inner_error
         } => {
+            if let Some(e) = result {
+                info!("Worker exit.");
+                return Err(e);
+            }
             info!("All worker threads completed");
         }
     }

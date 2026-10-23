@@ -26,7 +26,7 @@ use super::generate_genesis::preflight_fresh_devnet_inputs;
 
 const DATABASES: [&str; 4] = ["guardian-1.redb", "guardian-2.redb", "guardian-3.redb", "relayer.redb"];
 /// Frozen runtime table sets: a populated database must match exactly, including
-/// the schema-2 marker (`guardian_schema` as `u32`, `journal_schema` as `u64`).
+/// the schema-3 marker (`guardian_schema` as `u32`, `journal_schema` as `u64`).
 /// Partial sets, a wrong marker version, and the previous 7-table journals fail
 /// closed before reset and are never wiped or migrated here.
 const GUARDIAN_TABLES: [&str; 8] = ["deposit_tree_states", "guardian_account", "guardian_schema", "guardian_session", "guardian_signed", "guardian_signer", "guardian_withdrawal_nonce", "included_withdrawal_burns"];
@@ -35,8 +35,8 @@ const LEGACY_GUARDIAN_TABLES: [&str; 7] = ["deposit_tree_states", "guardian_acco
 const LEGACY_RELAYER_TABLES: [&str; 7] = ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "relayer_request"];
 const GUARDIAN_SCHEMA: TableDefinition<(), u32> = TableDefinition::new("guardian_schema");
 const JOURNAL_SCHEMA: TableDefinition<(), u64> = TableDefinition::new("journal_schema");
-const GUARDIAN_SCHEMA_VERSION: u32 = 2;
-const JOURNAL_SCHEMA_VERSION: u64 = 2;
+const GUARDIAN_SCHEMA_VERSION: u32 = 3;
+const JOURNAL_SCHEMA_VERSION: u64 = 3;
 const LEGACY_JOURNAL: &str = "incompatible legacy journal schema; explicit operator-controlled migration is required";
 const TARGETS: [&str; 6] = [
     "db/anvil", "local_checkpoints", "genesis.json",

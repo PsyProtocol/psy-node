@@ -28,9 +28,13 @@ bun psy-node/scripts/workspace.ts --help
 bun psy-node/scripts/workspace.ts status
 bun psy-node/scripts/workspace.ts create --source . --destination ../feature-demo --branch feature/demo
 bun psy-node/scripts/workspace.ts gitlinks sync --source ../feature-demo
-bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' -- psy-ts-sdk/src/client.ts
+bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' -- psy-ts-sdk/packages/psy-sdk/src/coord-edge-rpc/client.ts
 # Alternatively, review the index yourself first, then commit only that index:
 bun psy-node/scripts/workspace.ts commit --source ../feature-demo --repo psy-sdk --message 'Update client' --staged
+# Preview selected local commits in dependency order; nothing is written:
+bun psy-node/scripts/workspace.ts prepare --source ../feature-demo --repo psy-node,psy-sdk --commit-path psy-sdk=psy-ts-sdk/packages/psy-sdk/src/coord-edge-rpc/client.ts --message 'Prepare cohort pins'
+# Apply the same plan: stage only owned paths, resolve Cargo locks, commit; never pushes:
+bun psy-node/scripts/workspace.ts prepare --source ../feature-demo --repo psy-node,psy-sdk --commit-path psy-sdk=psy-ts-sdk/packages/psy-sdk/src/coord-edge-rpc/client.ts --message 'Prepare cohort pins' --apply
 # Preview freezes each selected HEAD against the live origin tip. Publication needs --push:
 bun psy-node/scripts/workspace.ts push --source ../feature-demo
 bun psy-node/scripts/workspace.ts push --source ../feature-demo --repo psy-contracts,psy-node --push
@@ -55,8 +59,52 @@ after `--` or `--staged`. Explicit paths require an empty index and cannot name
 the repository root. There is no blanket staging. `push` freezes every selected
 HEAD (or an optional explicit reviewed SHA) and the live origin tip of its
 checked-out `mainnet-beta` or topic branch. That tip must be an ancestor of the
-frozen commit. Dirty files are printed and excluded. Nothing is fetched, merged,
-squashed, or published unless `--push` is present, and publication never forces.
+frozen commit. Dirty files are printed and excluded. Nothing is merged, squashed,
+or published unless `--push` is present, and publication never forces. `push`
+itself never fetches: without `--push` it only checks local objects and live
+remote tips, and publication performs no fetch either.
+
+`prepare`, `push`, and `prepare-merge` are distinct: `prepare` commits selected
+local work on the current branches; `push` publishes already-existing commits to
+the live tip of each checked-out branch without merging, squashing, or rewriting
+pins; `prepare-merge` builds dependency-ordered squash commits on new
+`workspace-integration/...` branches in the target workspace, and only
+`prepare-merge --push` publishes those integration commits to the remote base.
+
+`prepare` selection is explicit and unique (`--repo NAME[,NAME...]`); unselected
+siblings are outside the plan and are never touched or automatically updated.
+`--commit-path NAME=LITERAL_FILE` (repeatable) owns individual literal files —
+never a repository root, directory, or symlink — and a path that is a recorded
+gitlink requires selecting its child repository. Order is derived automatically
+from selected gitlink children and psy-node Cargo pins, children first; a cycle
+fails before any write. Gitlink paths, plus `Cargo.toml` and `Cargo.lock` when
+the repository carries psy-node pins and psy-node is selected, are automatically
+owned: they must be clean unless explicitly named with `--commit-path`, and a
+dirty `.gitmodules` beside a moving gitlink must be explicitly owned with its
+submodule mappings unchanged (mapping changes are committed separately before
+prepare). Unowned dirt is preserved and never staged; every index must be empty
+and conflict-free. The preview performs no writes, fetches, or Cargo resolution;
+it freezes branch, HEAD, owned bytes, gitlink index values, and nested
+checkouts, and `--apply` re-verifies all of it before its first write. `--apply`
+stages only owned paths and commits once per changed repository, reporting an
+unchanged repository as skipped. It never pushes, and its Git operations contact
+no remote: a moving gitlink is imported from the sibling repository into the
+nested checkout (`refs/prefetch/workspace/<sha>`, no fetch head) and may only
+move forward to a prepared child commit that descends from the recorded pin;
+psy-node Cargo pins are rewritten to canonical Git `rev` pins at the prepared
+psy-node commit, and `cargo metadata` (then `--locked`) resolves and validates
+`Cargo.lock`. psy crates resolve from local sibling paths and a temporary local
+git db seeded with the prepared psy-node commit. Cargo Git fetch is CLI-backed
+with `GIT_ALLOW_PROTOCOL=file`: selected siblings are rewritten to those local
+paths, so other external Git dependencies resolve only from cache or a local
+file. An uncached HTTPS or SSH Git dependency cannot be fetched even when the
+network is available; registry network access is separate, and no fully offline
+run is claimed. npm versions are never bumped,
+implicitly or otherwise, and nothing is pushed. A failure retains every partial
+commit, pin, lock edit, and index or worktree change for inspection (no reset,
+no stash, no rollback). Reconcile that state deliberately until every selected
+index is empty and conflict-free, then preview the new plan; rerunning the same
+command is not a resume and does not discard retained changes.
 
 `prepare-merge` requires clean topic worktrees but permits dirty target worktrees because
 it **never changes target files, indexes, or local base branches**. It freezes

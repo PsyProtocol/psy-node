@@ -4035,6 +4035,7 @@ dependencies = [
  "tokio",
  "url",
  "zeroize",
+ "zstd 0.13.3",
 ]
 
 [[package]]

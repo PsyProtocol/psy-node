@@ -2,7 +2,8 @@
 // entrypoint. Never builds, bumps implicitly, commits, or pushes.
 // Installs require --apply --install; other applies resolve locks.
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { WORKSPACE_REPOS } from "./workspace-create";
@@ -66,8 +67,17 @@ export function fail(message: string): never {
   throw new Error(redact(message));
 }
 
-export function runCommand(command: string[], cwd?: string, env: NodeJS.ProcessEnv = process.env): RunResult {
-  const result = Bun.spawnSync(command, { cwd, stdout: "pipe", stderr: "pipe", env });
+// One wall-clock bound for every spawned subprocess: a git hook, network stall, or
+// hung submodule checkout fails the run instead of blocking forever. 620 s is one
+// bound for all commands — a local submodule checkout with checkout overrides
+// completes in minutes, so this only ever trips on a genuine hang.
+const COMMAND_TIMEOUT_MS = 620_000;
+
+export function runCommand(command: string[], cwd?: string, env: NodeJS.ProcessEnv = process.env, timeoutMs = COMMAND_TIMEOUT_MS): RunResult {
+  const result = Bun.spawnSync(command, { cwd, stdout: "pipe", stderr: "pipe", env, timeout: timeoutMs });
+  // A timed-out child can still report a success exit code when a descendant holds
+  // the output pipe, so the timeout flag is authoritative and must fail loudly.
+  if (result.exitedDueToTimeout) fail(`command exceeded ${timeoutMs}ms timeout: ${JSON.stringify(command)}`);
   return { code: result.exitCode, out: result.stdout.toString(), err: result.stderr.toString() };
 }
 
@@ -1055,6 +1065,321 @@ export function guardSquashPins(input: {
     }
   }
   return { unchanged };
+}
+
+export type PrepareFile = { path: string; sha256: string | null; mode: number | null };
+export type PrepareGitlink = { path: string; child: string; from: string; nestedHead: string };
+export type PrepareNested = { path: string; head: string; branch: string; recorded: string; clean: true };
+export type PrepareRepository = {
+  name: string; path: string; branch: string; head: string;
+  explicitPaths: string[]; ownedPaths: string[]; files: PrepareFile[];
+  gitmodulesSha256: string | null;
+  gitlinks: PrepareGitlink[];
+  cargo: { dependency: "psy-node"; from: string[] } | null;
+  nested: PrepareNested[];
+};
+export type PreparePlan = { root: string; message: string; repositories: PrepareRepository[]; excluded: string[] };
+export type PrepareCommit = { name: string; from: string; to: string; paths: string[] };
+export type PrepareResult = { commits: PrepareCommit[]; skipped: string[]; retained: string[] };
+export type PrepareStat = { isFile: () => boolean; isDirectory?: () => boolean; isSymbolicLink?: () => boolean; mode: number };
+export type PrepareFs = {
+  readFileSync: (path: string) => string | Buffer;
+  writeFileSync: (path: string, text: string) => void;
+  existsSync: (path: string) => boolean;
+  realpathSync: (path: string) => string;
+  lstatSync: (path: string, options?: { throwIfNoEntry?: boolean }) => PrepareStat | undefined;
+  mkdtempSync: (prefix: string) => string;
+  rmSync: (path: string, options?: { recursive?: boolean; force?: boolean }) => void;
+};
+const prepareFs: PrepareFs = {
+  readFileSync: path => readFileSync(path),
+  writeFileSync: (path, text) => writeFileSync(path, text),
+  existsSync, realpathSync,
+  lstatSync: (path, options) => lstatSync(path, options),
+  mkdtempSync, rmSync,
+};
+
+
+
+function literalOwned(path: string): boolean {
+  return Boolean(path) && !isAbsolute(path) && !path.includes("\\") && !path.includes("\0")
+    && path.split("/").every(part => part && part !== "." && part !== ".." && part.toLowerCase() !== ".git");
+}
+
+function assertOwnedShape(repo: string, path: string, fs: PrepareFs, gitlink = false): void {
+  if (!literalOwned(path)) fail(`${repo}: require a literal relative file path: ${JSON.stringify(path)}`);
+  const parts = path.split("/");
+  for (let i = 0; i < parts.length; i++) {
+    const current = join(repo, ...parts.slice(0, i + 1));
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink?.()) fail(`${repo}: symlink traversal is not owned: ${path}`);
+    if (i < parts.length - 1 && fs.existsSync(join(current, ".git"))) fail(`${repo}: file belongs to a nested repository: ${path}`);
+    if (i === parts.length - 1 && stat && !stat.isFile() && !(gitlink && stat.isDirectory?.())) fail(`${repo}: require an individual file, not a directory: ${path}`);
+  }
+}
+
+function prepareGitEnvironment(): NodeJS.ProcessEnv {
+  const env = { ...gitEnvironment, GIT_ALLOW_PROTOCOL: "file", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/dev/null" };
+  for (const key of Object.keys(env)) if (/^GIT_CONFIG_(KEY|VALUE)_[1-9]/.test(key) || key === "GIT_CONFIG_PARAMETERS" || key.startsWith("GIT_ALTERNATE_OBJECT_DIRECTORIES")) delete env[key];
+  return env;
+}
+
+// prepare only ever runs read-only inspection plus explicit index/commit writes;
+// anything else (fetch, push, ls-remote, clone, ...) is rejected outright.
+const PREPARE_GIT_SUBCOMMANDS: Record<string, true> = {
+  status: true, "rev-parse": true, "symbolic-ref": true, "check-ref-format": true, diff: true, "ls-files": true,
+  add: true, commit: true, submodule: true, "merge-base": true, "update-index": true, config: true, "ls-tree": true,
+};
+// A .gitmodules subsection name is interpolated into a `-c submodule.<name>.update`
+// config key and a `--get` lookup argument, so it must be a plain name/path with no
+// whitespace, quotes, or shell-significant characters.
+const PREPARE_SUBMODULE_KEY = /^[A-Za-z0-9][A-Za-z0-9_.\/-]*$/;
+
+function prepareGit(runner: Runner, repo: string, args: string[], allowed = [0]): RunResult {
+  let offset = 0;
+  while (args[offset] === "--literal-pathspecs" || (args[offset] === "-c" && offset + 1 < args.length)) {
+    offset += args[offset] === "-c" ? 2 : 1;
+  }
+  const subcommand = args[offset] ?? "";
+  if (!PREPARE_GIT_SUBCOMMANDS[subcommand]) fail(`${repo}: prepare git subcommand is not allowed: ${JSON.stringify(subcommand || "(none)")}`);
+  const result = runner(["git", "-C", repo, ...args], undefined, prepareGitEnvironment());
+  if (!allowed.includes(result.code)) fail(`${repo}: git ${args[0]} failed (${result.code}): ${result.err.trim()}`);
+  return { ...result, out: result.out.trimEnd() };
+}
+
+function prepareHead(runner: Runner, repo: string, ref = "HEAD"): string {
+  return prepareGit(runner, repo, ["rev-parse", "--verify", `${ref}^{commit}`]).out;
+}
+
+function prepareAncestor(runner: Runner, repo: string, older: string, newer: string): boolean {
+  const result = runner(["git", "-C", repo, "merge-base", "--is-ancestor", older, newer], undefined, prepareGitEnvironment());
+  if (result.err.trim() || result.code > 1) fail(`${repo}: cannot compare ancestry: ${result.err.trim()}`);
+  return result.code === 0;
+}
+
+function fileDigest(path: string, fs: PrepareFs): { sha256: string | null; mode: number | null } {
+  const stat = fs.lstatSync(path, { throwIfNoEntry: false });
+  if (!stat?.isFile()) return { sha256: null, mode: null };
+  return { sha256: createHash("sha256").update(fs.readFileSync(path)).digest("hex"), mode: stat.mode };
+}
+
+function checkoutOverrides(runner: Runner, repo: string, gitlinkPath: string): string[] {
+  const overrides: string[] = [];
+  const config = prepareGit(runner, repo, ["config", "--file", ".gitmodules", "--get-regexp", "^submodule\\..*\\.path$"], [0, 1]).out;
+  for (const line of config.split("\n").filter(Boolean)) {
+    const split = line.indexOf(" ");
+    if (line.slice(split + 1) !== gitlinkPath) continue;
+    const key = line.slice(0, split).replace(/^submodule\./, "").replace(/\.path$/, "");
+    if (!PREPARE_SUBMODULE_KEY.test(key)) fail(`${repo}: .gitmodules submodule name is not a plain name or path: ${JSON.stringify(key)}`);
+    if (prepareGit(runner, repo, ["config", "--file", ".gitmodules", "--get", `submodule.${key}.update`], [0, 1]).out === "none") overrides.push("-c", `submodule.${key}.update=checkout`);
+  }
+  return overrides;
+}
+
+function recordedChildDrift(runner: Runner, nested: string, rev: string, fs: PrepareFs): string {
+  const entries = prepareGit(runner, nested, ["ls-tree", "-r", "-z", rev]).out.split("\0").filter(Boolean);
+  for (const entry of entries) {
+    const tab = entry.indexOf("\t");
+    const meta = entry.slice(0, tab).split(" ");
+    if (meta[1] !== "commit" || meta[0] !== "160000" || !SHA.test(meta[2] || "")) continue;
+    const path = entry.slice(tab + 1);
+    const checkout = join(nested, path);
+    if (!fs.existsSync(join(checkout, ".git")) || prepareHead(runner, checkout) !== meta[2]) return `${path} ${meta[2]}`;
+  }
+  return "";
+}
+
+function assertContained(root: string, path: string, fs: PrepareFs): void {
+  const relativePath = relative(root, path);
+  if (!relativePath || isAbsolute(relativePath) || relativePath.split("/").includes("..")) fail(`${path}: nested checkout escaped its selected repository`);
+  let current = root;
+  for (const component of relativePath.split("/")) {
+    current = join(current, component);
+    const stat = fs.lstatSync(current);
+    if (!stat || stat.isSymbolicLink?.() || !stat.isDirectory?.()) fail(`${path}: nested checkout path changed since preparation preview`);
+  }
+}
+
+function recheckPrepareRepository(repo: PrepareRepository, commits: Record<string, string>, runner: Runner, fs: PrepareFs, root: string): void {
+  const rootStat = fs.lstatSync(repo.path);
+  if (!rootStat || rootStat.isSymbolicLink?.() || !rootStat.isDirectory?.() || fs.realpathSync(repo.path) !== join(fs.realpathSync(root), repo.name)) fail(`${repo.name}: selected repository is not a real directory inside the workspace`);
+  const branch = prepareGit(runner, repo.path, ["symbolic-ref", "--quiet", "--short", "HEAD"], [0, 1]).out;
+  if (branch !== repo.branch || (commits[repo.name] || repo.head) !== prepareHead(runner, repo.path)) fail(`${repo.name}: branch or HEAD changed since preparation preview`);
+  if (prepareGit(runner, repo.path, ["diff", "--cached", "--name-only", "-z"]).out || prepareGit(runner, repo.path, ["ls-files", "--unmerged", "-z"]).out) fail(`${repo.path}: prepare requires an empty index without conflicts`);
+  for (const link of repo.gitlinks) assertOwnedShape(repo.path, link.path, fs, true);
+  for (const file of repo.files) {
+    assertOwnedShape(repo.path, file.path, fs, repo.gitlinks.some(link => link.path === file.path));
+    const fact = fileDigest(join(repo.path, file.path), fs);
+    if (fact.sha256 !== file.sha256 || fact.mode !== file.mode) fail(`${repo.name}/${file.path}: owned file changed since preparation preview`);
+  }
+  const modules = fileDigest(join(repo.path, ".gitmodules"), fs);
+  if (modules.sha256 !== repo.gitmodulesSha256) fail(`${repo.name}: .gitmodules changed since preparation preview`);
+  for (const link of repo.gitlinks) {
+    const line = prepareGit(runner, repo.path, ["ls-files", "-s", "--", link.path]).out.split("\n").find(entry => entry.startsWith("160000 "));
+    if (!line || line.split(" ")[1] !== link.from) fail(`${repo.name}/${link.path}: gitlink changed since preparation preview`);
+  }
+  for (const nested of repo.nested) {
+    assertContained(repo.path, nested.path, fs);
+    if (!nested.clean || !SHA.test(nested.head) || !SHA.test(nested.recorded) || nested.head !== nested.recorded) fail(`${nested.path}: nested checkout is not frozen at its recorded gitlink`);
+    const nestedBranch = prepareGit(runner, nested.path, ["symbolic-ref", "--quiet", "--short", "HEAD"], [0, 1]).out;
+    if (prepareHead(runner, nested.path) !== nested.head || nestedBranch !== nested.branch) fail(`${nested.path}: nested checkout changed since preparation preview`);
+    const dirt = prepareGit(runner, nested.path, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"]).out;
+    if (dirt) fail(`${nested.path}: dirty nested checkout; refusing before any index write:\n${dirt}`);
+  }
+  for (const link of repo.gitlinks) {
+    const recorded = repo.nested.find(item => item.path === join(repo.path, link.path));
+    if (!recorded || recorded.head !== link.nestedHead || recorded.recorded !== link.from || link.nestedHead !== link.from) fail(`${repo.name}/${link.path}: initialized nested HEAD is not the recorded gitlink`);
+  }
+}
+
+
+
+function seedNodeDb(runner: Runner, node: string, sha: string, db: string): void {
+  const env = prepareGitEnvironment();
+  if (!SHA.test(sha) || runner(["git", "-C", node, "rev-parse", "--verify", `${sha}^{commit}`], undefined, env).out.trim() !== sha) fail(`psy-node: prepared commit ${sha} is not a local commit`);
+  const init = runner(["git", "init", "--bare", "--quiet", db], undefined, env);
+  if (init.code !== 0) fail(`psy-node: cannot seed local git db: ${init.err.trim()}`);
+  const seeded = runner(["git", "-C", db, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--recurse-submodules=no", node, `${sha}:refs/heads/prepare`], undefined, env);
+  if (seeded.code !== 0 || runner(["git", "-C", db, "rev-parse", "--verify", "refs/heads/prepare^{commit}"], undefined, env).out.trim() !== sha) fail(`psy-node: local git db does not contain prepared commit ${sha}`);
+}
+
+function cargoResolutionEnv(db: string, plan: PreparePlan): NodeJS.ProcessEnv {
+  const node = plan.repositories.find(repo => repo.name === "psy-node");
+  const instead = plan.repositories.filter(repo => repo.name !== "psy-node").flatMap(repo => [`url.${repo.path}.insteadOf`, `https://github.com/PsyProtocol/${repo.name}`, `url.${repo.path}.insteadOf`, `https://github.com/PsyProtocol/${repo.name}.git`]);
+  if (node) instead.push(`url.${db}.insteadOf`, "https://github.com/PsyProtocol/psy-node", `url.${db}.insteadOf`, "https://github.com/PsyProtocol/psy-node.git");
+  const pairs = instead.length / 2;
+  const config: Record<string, string> = { GIT_CONFIG_COUNT: String(pairs + 2), GIT_CONFIG_KEY_0: "protocol.file.allow", GIT_CONFIG_VALUE_0: "always", [`GIT_CONFIG_KEY_${pairs + 1}`]: "core.hooksPath", [`GIT_CONFIG_VALUE_${pairs + 1}`]: "/dev/null" };
+  instead.forEach((value, index) => { config[index % 2 ? `GIT_CONFIG_VALUE_${(index >> 1) + 1}` : `GIT_CONFIG_KEY_${(index >> 1) + 1}`] = value; });
+  return { ...prepareGitEnvironment(), CARGO_NET_GIT_FETCH_WITH_CLI: "true", GIT_ALLOW_PROTOCOL: "file", ...config };
+}
+
+function canonicalNodePins(text: string, label: string, rev: string): void {
+  const pins = pinsFromManifest(text, label);
+  if (!pins.length || pins.some(pin => pin.rev !== rev || normalizeGitUrl(pin.url) !== "github.com/psyprotocol/psy-node")) fail(`${label}: committed pin is not canonical ${rev}`);
+}
+
+function resolvePreparedCargo(repo: string, rev: string, db: string, runner: Runner, env: NodeJS.ProcessEnv, fs: PrepareFs): void {
+  const label = basename(repo);
+  const updating = runner(["cargo", "metadata", "--format-version", "1", "--manifest-path", "Cargo.toml"], repo, env);
+  if (updating.code !== 0) fail(`${label}: cargo metadata resolver failed; changes remain, no reset:\n${updating.err.trim()}`);
+  const locked = runner(["cargo", "metadata", "--format-version", "1", "--manifest-path", "Cargo.toml", "--locked"], repo, env);
+  if (locked.code !== 0) fail(`${label}: cargo metadata --locked failed after resolution; changes remain, no reset:\n${locked.err.trim()}`);
+  const manifest = fs.readFileSync(join(repo, "Cargo.toml")).toString("utf8");
+  const lockToml = fs.readFileSync(join(repo, "Cargo.lock")).toString("utf8");
+  validateCargoGraph(locked.out, lockToml, rev);
+  const packages = nodeDependencies(manifest).map(dep => dep.package);
+  const nodes = new Map(packages.map(name => [name, join(repo, "..", "psy-node", name)]));
+  assertLocalCargoGraph(locked.out, lockToml, nodes, packages, false);
+  canonicalNodePins(manifest, `${label}/Cargo.toml`, rev);
+  if (db && (manifest.includes(db) || lockToml.includes(db))) fail(`${label}: local git db URL was written into Cargo files`);
+}
+
+export function applyPreparation(plan: PreparePlan, runner: Runner = runCommand, fs: PrepareFs = prepareFs): PrepareResult {
+  if (!plan.message.trim()) fail("prepare message is required");
+  if (!plan.repositories.length) fail("prepare requires an explicit repository selection");
+  const seen: Record<string, true> = {};
+  for (const repo of plan.repositories) {
+    if (seen[repo.name]) fail(`prepare lists ${repo.name} twice`);
+    seen[repo.name] = true;
+    const earlierCargo = plan.repositories.slice(0, plan.repositories.indexOf(repo)).some(item => item.cargo);
+    if (repo.name === "psy-node" && earlierCargo) fail("prepare order commits psy-node before a Cargo consumer");
+    const rootStat = fs.lstatSync(join(plan.root, repo.name));
+    if (!WORKSPACE_REPOS.includes(repo.name as typeof WORKSPACE_REPOS[number]) || !rootStat || rootStat.isSymbolicLink?.() || !rootStat.isDirectory?.() || fs.realpathSync(join(plan.root, repo.name)) !== join(plan.root, repo.name) || repo.path !== join(plan.root, repo.name)) fail(`${repo.name}: selected repository must be a real directory directly inside the workspace`);
+    for (const owned of repo.ownedPaths) assertOwnedShape(repo.path, owned, fs, repo.gitlinks.some(link => link.path === owned));
+    for (const file of repo.files) assertOwnedShape(repo.path, file.path, fs, repo.gitlinks.some(link => link.path === file.path));
+    for (const link of repo.gitlinks) {
+      assertOwnedShape(repo.path, link.path, fs, true);
+      if (!SHA.test(link.from) || !SHA.test(link.nestedHead)) fail(`${repo.name}/${link.path}: gitlink plan is not a recorded full SHA`);
+      const childAt = plan.repositories.findIndex(item => item.name === link.child);
+      if (childAt < 0 || childAt > plan.repositories.indexOf(repo)) fail(`${repo.name}/${link.path}: child ${link.child} is not an earlier selected repository`);
+    }
+    if (repo.cargo && (repo.cargo.dependency !== "psy-node" || !plan.repositories.some(item => item.name === "psy-node" && plan.repositories.indexOf(item) < plan.repositories.indexOf(repo)))) fail(`${repo.name}: Cargo pin requires an earlier selected psy-node`);
+  }
+  const commits: PrepareCommit[] = [];
+  const skipped: string[] = [];
+  const completed: Record<string, string> = {};
+  const retained: string[] = [];
+  for (const repo of plan.repositories) recheckPrepareRepository(repo, {}, runner, fs, plan.root);
+  const db = fs.mkdtempSync(join(tmpdir(), "workspace-prepare-"));
+  try {
+    for (const repo of plan.repositories) {
+      recheckPrepareRepository(repo, completed, runner, fs, plan.root);
+      const moves: { path: string; sha: string; child: string }[] = [];
+      for (const link of repo.gitlinks) {
+        const child = plan.repositories.find(item => item.name === link.child)!;
+        const sha = completed[child.name] || child.head;
+        if (!SHA.test(sha)) fail(`${repo.name}/${link.path}: child commit is not a full SHA`);
+        if (sha === link.from) continue;
+        if (!prepareAncestor(runner, join(plan.root, link.child), link.from, sha)) fail(`${repo.name}/${link.path}: pin ${link.from} is not an ancestor of prepared ${sha}; refusing backward or divergent gitlink`);
+        moves.push({ path: link.path, sha, child: link.child });
+      }
+      for (const move of moves) {
+        const nested = join(repo.path, move.path);
+        const env = prepareGitEnvironment();
+        if (runner(["git", "-C", nested, "cat-file", "-e", `${move.sha}^{commit}`], undefined, env).code !== 0) {
+          const imported = runner(["git", "-C", nested, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--recurse-submodules=no", join(plan.root, move.child), `${move.sha}:refs/prefetch/workspace/${move.sha}`], undefined, env);
+          if (imported.code !== 0) fail(`${nested}: local import of ${move.sha} failed; changes remain, no reset:\n${imported.err.trim()}`);
+        }
+        if (prepareHead(runner, nested, move.sha) !== move.sha) fail(`${nested}: local import of ${move.sha} failed`);
+        const drift = recordedChildDrift(runner, nested, move.sha, fs);
+        if (drift) fail(`${repo.name}/${move.path}: recorded child gitlink ${drift} differs from its initialized checkout; refusing before any index write`);
+      }
+      recheckPrepareRepository(repo, completed, runner, fs, plan.root);
+      for (const move of moves) {
+        prepareGit(runner, repo.path, ["update-index", "--cacheinfo", "160000", move.sha, move.path]);
+        const line = prepareGit(runner, repo.path, ["ls-files", "-s", "--", move.path]).out.split("\n").find(entry => entry.startsWith("160000 "));
+        if (!line || line.split(" ")[1] !== move.sha) fail(`${repo.name}/${move.path}: index was not updated`);
+        prepareGit(runner, repo.path, [...checkoutOverrides(runner, repo.path, move.path), "submodule", "update", "--checkout", "--no-fetch", "--", move.path]);
+        if (prepareHead(runner, join(repo.path, move.path)) !== move.sha) fail(`${repo.name}/${move.path}: nested checkout is not ${move.sha}`);
+        const after = prepareGit(runner, repo.path, ["ls-files", "-s", "--", move.path]).out.split("\n").find(entry => entry.startsWith("160000 "));
+        if (!after || after.split(" ")[1] !== move.sha) fail(`${repo.name}/${move.path}: checkout changed the staged gitlink`);
+      }
+      if (repo.cargo) {
+        const node = plan.repositories.find(item => item.name === "psy-node")!;
+        const sha = completed[node.name] || node.head;
+        const manifestPath = join(repo.path, "Cargo.toml");
+        const text = fs.readFileSync(manifestPath).toString("utf8");
+        const dependencies = nodeDependencies(text);
+        const sources: Record<string, true> = {};
+        for (const dep of dependencies) sources[String(dep.value.rev || dep.value.path || "unresolved")] = true;
+        const planned: Record<string, true> = {};
+        for (const source of repo.cargo.from) planned[source] = true;
+        if (!dependencies.length || Object.keys(sources).sort().join() !== Object.keys(planned).sort().join()) fail(`${repo.name}: Cargo node dependencies differ from the frozen plan`);
+        const rewritten = rewriteNodeDependencies(text, repo.path, nodeCratePaths(node.path, (path, _encoding) => fs.readFileSync(path).toString("utf8"), fs.realpathSync), sha);
+        canonicalNodePins(rewritten, `${repo.name}/Cargo.toml`, sha);
+        if (!fs.existsSync(join(db, "HEAD"))) seedNodeDb(runner, node.path, sha, db);
+        fs.writeFileSync(manifestPath, rewritten);
+        resolvePreparedCargo(repo.path, sha, db, runner, cargoResolutionEnv(db, plan), fs);
+      }
+      const stage = repo.ownedPaths.filter(path => !repo.gitlinks.some(link => link.path === path));
+      if (stage.length) prepareGit(runner, repo.path, ["--literal-pathspecs", "add", "--", ...stage]);
+      for (const link of repo.gitlinks) {
+        const expected = moves.find(move => move.path === link.path)?.sha || link.from;
+        const line = prepareGit(runner, repo.path, ["ls-files", "-s", "--", link.path]).out.split("\n").find(entry => entry.startsWith("160000 "));
+        if (!line || line.split(" ")[1] !== expected) fail(`${repo.name}/${link.path}: staged gitlink is not ${expected}`);
+      }
+      const staged = prepareGit(runner, repo.path, ["diff", "--cached", "--name-only", "-z"]).out.split("\0").filter(Boolean);
+      const allowed: Record<string, true> = {};
+      for (const path of repo.ownedPaths) allowed[path] = true;
+      const extra = staged.filter(path => !allowed[path]);
+      if (extra.length) fail(`${repo.name}: staged path is not owned: ${extra.join(", ")}`);
+      if (!staged.length) {
+        skipped.push(repo.name);
+        continue;
+      }
+      prepareGit(runner, repo.path, ["commit", "--no-verify", "-m", plan.message]);
+      const to = prepareHead(runner, repo.path);
+      if (!prepareAncestor(runner, repo.path, repo.head, to)) fail(`${repo.name}: prepared commit does not preserve ${repo.head}`);
+      completed[repo.name] = to;
+      commits.push({ name: repo.name, from: repo.head, to, paths: staged });
+      retained.push(repo.name);
+    }
+  } catch (error) {
+    fs.rmSync(db, { recursive: true, force: true });
+    fail(`partial prepare retained (no reset): ${retained.join(", ") || "none"}. ${error instanceof Error ? error.message : error}`);
+  }
+  fs.rmSync(db, { recursive: true, force: true });
+  return { commits, skipped, retained };
 }
 
 export function inconsistent(report: ReleaseReport): boolean {

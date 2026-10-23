@@ -12,6 +12,53 @@ use serde::{de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor}, Deseria
 use serde_json::Value;
 
 pub const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
+/// Outer storage/HTTP envelope. Distinct from the inner `PSYGS002` request domain.
+pub const RECORD_MAGIC: [u8; 8] = *b"PSYGR001";
+pub const RECORD_VERSION: u32 = 1;
+pub const RECORD_HEADER_LEN: usize = 20;
+pub const RECORD_COMPRESSION_LEVEL: i32 = 3;
+/// Hard cap on the compressed envelope, including the 20-byte header. Independent of the caller's uncompressed limit.
+pub const MAX_COMPRESSED_RECORD_BYTES: usize = 128 * 1024 * 1024;
+/// Uncompressed cap for a session or relayer row. Same 128 MiB as `MAX_BODY_BYTES`: a session must still fit `GuardianSessionsResponse::to_bytes`.
+pub const MAX_SESSION_RECORD_BYTES: usize = MAX_BODY_BYTES;
+
+/// Versioned zstd envelope around exact inner bytes. Canonical for database rows and HTTP bodies.
+///
+/// Layout, little-endian: `PSYGR001` (8) | version `1` (u32) | uncompressed length (u64) | one zstd frame.
+/// `limit` bounds the uncompressed payload (`MAX_BODY_BYTES` / `MAX_SESSION_RECORD_BYTES`, both 128 MiB).
+/// The compressed envelope, header included, is capped at `MAX_COMPRESSED_RECORD_BYTES` (128 MiB).
+pub fn encode_record(bytes: &[u8], limit: usize) -> Result<Vec<u8>, GuardianSignError> {
+    if bytes.len() > limit || bytes.len() > MAX_SESSION_RECORD_BYTES { return Err(GuardianSignError::MalformedRequest); }
+    let compressed = zstd::stream::encode_all(bytes, RECORD_COMPRESSION_LEVEL).map_err(|_| GuardianSignError::MalformedRequest)?;
+    if compressed.len() > MAX_COMPRESSED_RECORD_BYTES.saturating_sub(RECORD_HEADER_LEN) { return Err(GuardianSignError::MalformedRequest); }
+    let mut frame = Vec::with_capacity(RECORD_HEADER_LEN + compressed.len());
+    frame.extend_from_slice(&RECORD_MAGIC);
+    frame.extend_from_slice(&RECORD_VERSION.to_le_bytes());
+    frame.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&compressed);
+    Ok(frame)
+}
+
+/// Inverse of `encode_record`. Returns the original inner bytes or `MalformedRequest`.
+pub fn decode_record(bytes: &[u8], limit: usize) -> Result<Vec<u8>, GuardianSignError> {
+    if bytes.len() > MAX_COMPRESSED_RECORD_BYTES || bytes.len() < RECORD_HEADER_LEN { return Err(GuardianSignError::MalformedRequest); }
+    if bytes[..8] != RECORD_MAGIC || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != RECORD_VERSION {
+        return Err(GuardianSignError::MalformedRequest);
+    }
+    let advertised = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+    let advertised = usize::try_from(advertised).map_err(|_| GuardianSignError::MalformedRequest)?;
+    if advertised > limit || advertised > MAX_SESSION_RECORD_BYTES { return Err(GuardianSignError::MalformedRequest); }
+    let zstd_frame = &bytes[RECORD_HEADER_LEN..];
+    if zstd_frame.len() < 4 || zstd_frame[..4] != zstd::zstd_safe::MAGICNUMBER.to_le_bytes() { return Err(GuardianSignError::MalformedRequest); }
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(zstd_frame).map_err(|_| GuardianSignError::MalformedRequest)?.single_frame();
+    let mut output = Vec::new();
+    let copied = std::io::copy(&mut std::io::Read::take(&mut decoder, (advertised as u64).saturating_add(1)), &mut output).map_err(|_| GuardianSignError::MalformedRequest)?;
+    if copied != advertised as u64 || output.len() != advertised { return Err(GuardianSignError::MalformedRequest); }
+    let rest = decoder.finish();
+    if !rest.is_empty() { return Err(GuardianSignError::MalformedRequest); }
+    Ok(output)
+}
+
 pub const GOLDILOCKS_MODULUS: u64 = 0xffff_ffff_0000_0001;
 pub const BRIDGE_USER_ID: u64 = 524288;
 pub type Hash4 = QHashOut<GoldilocksField>;
@@ -1013,5 +1060,64 @@ mod cutover_tests {
         assert!(config.initial_account().is_err());
         config.network.guardian_initial_member_hashes = Some([Hash4::from_values(1, 0, 0, 0); 3]);
         assert!(config.initial_account().is_err());
+    }
+}
+
+#[cfg(test)]
+mod record_codec_tests {
+    use super::*;
+
+    #[test]
+    fn record_roundtrip_preserves_binary_and_nested_json_exactly() {
+        let inner = codec_request_fixture().canonical_bytes().unwrap();
+        assert!(inner.windows(8).any(|window| window == b"PSYGS002"));
+        let nested = br#"{"trace":{"code":"fn main() {}","note":"a\"b\\c"},"list":[1,null,true]}"#;
+        for payload in [inner.as_slice(), nested.as_slice(), b"".as_slice(), &[0, 255, 10, 13]] {
+            let frame = encode_record(payload, MAX_SESSION_RECORD_BYTES).unwrap();
+            assert_eq!(&frame[..8], b"PSYGR001");
+            assert_eq!(&frame[8..12], &RECORD_VERSION.to_le_bytes());
+            assert_eq!(&frame[12..20], &(payload.len() as u64).to_le_bytes());
+            assert_eq!(decode_record(&frame, MAX_SESSION_RECORD_BYTES).unwrap(), payload);
+            if !payload.is_empty() { assert!(decode_record(&frame, payload.len() - 1).is_err()); }
+        }
+        let signed = codec_request_fixture();
+        let frame = encode_record(&signed.canonical_bytes().unwrap(), MAX_BODY_BYTES).unwrap();
+        assert_eq!(GuardianSignRequest::from_canonical_bytes(&decode_record(&frame, MAX_BODY_BYTES).unwrap()).unwrap().request_id().unwrap(), signed.request_id().unwrap());
+    }
+
+    #[test]
+    fn record_rejects_malformed_unsupported_truncated_trailing_and_size_lies() {
+        let payload = b"exact-inner";
+        let frame = encode_record(payload, MAX_BODY_BYTES).unwrap();
+        assert!(decode_record(&frame[..RECORD_HEADER_LEN - 1], MAX_BODY_BYTES).is_err());
+        let mut bad = frame.clone(); bad[..8].copy_from_slice(b"PSYGR000");
+        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        let mut bad = frame.clone(); bad[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        assert!(decode_record(&frame[..frame.len() - 1], MAX_BODY_BYTES).is_err());
+        assert!(decode_record(&frame[..RECORD_HEADER_LEN], MAX_BODY_BYTES).is_err());
+        let mut bad = frame.clone(); bad.truncate(RECORD_HEADER_LEN + 4);
+        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        let mut bad = frame.clone(); bad[RECORD_HEADER_LEN..RECORD_HEADER_LEN + 4].copy_from_slice(&0x184D2A50u32.to_le_bytes());
+        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        let mut bad = frame.clone(); bad.extend_from_slice(&frame[RECORD_HEADER_LEN..]);
+        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        let mut bad = frame.clone(); bad.extend_from_slice(&[0]);
+        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        let mut bad = frame.clone(); bad[12..20].copy_from_slice(&(payload.len() as u64 + 1).to_le_bytes());
+        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        let mut bad = frame; bad[12..20].copy_from_slice(&(payload.len() as u64 - 1).to_le_bytes());
+        assert!(decode_record(&bad, MAX_BODY_BYTES).is_err());
+        assert_eq!(MAX_COMPRESSED_RECORD_BYTES, MAX_BODY_BYTES);
+        assert_eq!(MAX_SESSION_RECORD_BYTES, MAX_BODY_BYTES);
+        assert_eq!(MAX_BODY_BYTES, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn record_rejects_a_decompression_bomb_before_expanding_it() {
+        let mut bomb = encode_record(&vec![0u8; 64 * 1024], 64 * 1024).unwrap();
+        assert!(bomb.len() < 1024);
+        bomb[12..20].copy_from_slice(&1024u64.to_le_bytes());
+        assert!(decode_record(&bomb, 64 * 1024).is_err());
     }
 }

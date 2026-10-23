@@ -5,8 +5,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
-use guardian_common::db::GuardianDb;
-use guardian_common::protocol::{parse_canonical_json, sha256, validate_hash, ChainEndpoint, DepositTreeState, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianRuntimeConfig, GuardianSessionRecord, GuardianSignError, GuardianSignErrorResponse, GuardianSignRequest, GuardianSessionsResponse, HaltReason, Hash4, Hex, Hex32, WithdrawalBurnRecord, GOLDILOCKS_MODULUS, MAX_BODY_BYTES};
+use guardian_common::db::{GuardianDb, GuardianReadiness, GuardianSessionReader};
+use guardian_common::protocol::{decode_record, encode_record, parse_canonical_json, sha256, validate_hash, ChainEndpoint, DepositTreeState, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianRuntimeConfig, GuardianSessionRecord, GuardianSignError, GuardianSignErrorResponse, GuardianSignRequest, GuardianSessionsResponse, HaltReason, Hash4, Hex, Hex32, WithdrawalBurnRecord, GOLDILOCKS_MODULUS, MAX_BODY_BYTES, MAX_COMPRESSED_RECORD_BYTES, MAX_SESSION_RECORD_BYTES};
 use guardian_common::runtime::{create_db_file, load_network, load_signing_key, open_db_file};
 use super::verify::{GuardianHistory, GuardianVerificationContext, GuardianAccountError};
 use psy_client_common::data::base_types::hash256::Hash256;
@@ -44,6 +44,8 @@ pub(crate) async fn load_guardian_committed_head(provider: &RpcProvider, url: &s
 }
 
 
+const RECORD_MEDIA: &str = "application/vnd.psy.guardian-record+zstd";
+const JSON_MEDIA: &str = "application/json";
 type HttpResponse = Response<Full<Bytes>>;
 static SIGN_REQUESTS: Semaphore = Semaphore::const_new(4);
 /// Observer passes and sign preparation keep their existing user-bounded deadlines;
@@ -66,27 +68,34 @@ impl GuardianService {
         save_guardian_account_result(&mut self.signer.db, psy_config::parse_magic_hex(&self.network.magic).map_err(|_| GuardianSignError::AuthorizationMismatch)?, self.stable.user_id(), result).await
     }
 
-    async fn fetch_history(&self, after: u64) -> Result<GuardianSessionRecord, GuardianSignError> {
-        for origin in &self.config.history_urls {
+    /// The next imported session is exactly `after + 1`. A page that decodes but starts later
+    /// is a pruned prefix: try the next origin. Transport, status, and parse failures already do.
+    async fn fetch_history(client: &reqwest::Client, origins: &[String], after: u64) -> Result<GuardianSessionRecord, GuardianSignError> {
+        let Some(next) = after.checked_add(1) else { return Err(GuardianSignError::SessionHistoryUnavailable); };
+        for origin in origins {
             let mut url = url::Url::parse(origin).map_err(|_| GuardianSignError::AuthorizationMismatch)?;
             url.set_path("/v1/sessions");
             url.query_pairs_mut().append_pair("after_nonce", &after.to_string()).append_pair("limit", "1");
-            let response = self.history_client.get(url).send().await;
+            let response = client.get(url).header(reqwest::header::ACCEPT, RECORD_MEDIA).send().await;
             let Ok(mut response) = response else { continue; };
             if !response.status().is_success() { continue; }
             let mut bytes = Vec::new();
             let mut failed = false;
             loop {
                 match response.chunk().await {
-                    Ok(Some(chunk)) if chunk.len() <= MAX_BODY_BYTES.saturating_sub(bytes.len()) => bytes.extend_from_slice(&chunk),
+                    Ok(Some(chunk)) if chunk.len() <= MAX_COMPRESSED_RECORD_BYTES.saturating_sub(bytes.len()) => bytes.extend_from_slice(&chunk),
                     Ok(None) => break,
                     _ => { failed = true; break; }
                 }
             }
-            if failed { continue; }
-            let Ok(page) = parse_canonical_json::<GuardianSessionsResponse>(&bytes) else { continue; };
+            if failed || !response_is_record(response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok())) { continue; }
+            let Ok(decoded) = decode_record(&bytes, MAX_SESSION_RECORD_BYTES) else { continue; };
+            let Ok(page) = parse_canonical_json::<GuardianSessionsResponse>(&decoded) else { continue; };
             if page.validate_page(after, 1).is_err() { continue; }
-            if let Some(record) = page.sessions.into_iter().next() { return Ok(record); }
+            let Some(record) = page.sessions.into_iter().next() else { continue; };
+            let Ok(request) = record.request_json.decode() else { continue; };
+            if request.session_nonce != next { continue; }
+            return Ok(record);
         }
         Err(GuardianSignError::SessionHistoryUnavailable)
     }
@@ -189,7 +198,7 @@ impl GuardianService {
         };
         let mut imported = self.history.nonce();
         while imported < target {
-            let record = self.fetch_history(imported).await?;
+            let record = Self::fetch_history(&self.history_client, &self.config.history_urls, imported).await?;
             let request = record.request_json.decode()?;
             if request.session_nonce != imported.checked_add(1).ok_or(GuardianSignError::SessionHistoryUnavailable)? { return Err(GuardianSignError::SessionHistoryUnavailable); }
             let (conflicting_withdrawal_burns, conflicting_nonces) = self.current_request_conflicts(&request).await?;
@@ -350,8 +359,12 @@ pub async fn run(rpc_config: &Path, guardian_root: &Path, local_documents: &[Pat
     };
     initialize_runtime_after_authentication(&mut db, &wallet.st_provider, network_magic, &stable, guardian_id, public_key).await?;
     db.load_account(network_magic, stable.user_id()).await?;
+    let sessions = Arc::new(db.session_reader());
+    let sessions_user = stable.user_id();
+    let sessions_magic = stable.network.magic.clone();
     let history_client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(30))
+        .no_gzip().no_brotli().no_deflate().no_zstd()
         .build().map_err(|_| GuardianSignError::KeyUnavailable)?;
     let history = super::verify::GuardianHistory::new();
     let config = runtime.clone();
@@ -381,7 +394,18 @@ pub async fn run(rpc_config: &Path, guardian_root: &Path, local_documents: &[Pat
     let shutdown_service = service.clone();
     let result = serve_http(listener, move |request| {
         let service = service.clone();
-        async move { handle_request(service, request).await }
+        let sessions = Arc::clone(&sessions);
+        let user = sessions_user;
+        let magic = sessions_magic.clone();
+        async move {
+            if request.method() == hyper::Method::GET && request.uri().path() == "/v1/ready" && request.uri().query().is_none() {
+                return ready_response(sessions).await;
+            }
+            if request.method() == hyper::Method::GET && request.uri().path() == "/v1/sessions" {
+                return sessions_response(sessions, user, &magic, request.uri().query(), request.headers()).await;
+            }
+            handle_request(service, request).await
+        }
     }).await;
     let _ = stop.send(true);
     let _ = observer.await;
@@ -392,31 +416,58 @@ pub async fn run(rpc_config: &Path, guardian_root: &Path, local_documents: &[Pat
     result
 }
 
-async fn handle_request(service: Arc<tokio::sync::Mutex<GuardianService>>, request: Request<Incoming>) -> HttpResponse {
-    if request.method() == hyper::Method::GET && request.uri().path() == "/v1/sessions" {
-        let Ok((after, limit)) = history_query(request.uri().query()) else { return error_response(None, GuardianSignError::MalformedRequest); };
-        let mut service = service.lock().await;
-        let user = service.stable.user_id();
-        let Ok(network_magic) = psy_config::parse_magic_hex(&service.network.magic) else { return error_response(None, GuardianSignError::AuthorizationMismatch); };
-        let result = service.signer.db.load_sessions(network_magic, user, Some(after), 2).await;
-        return match result {
-            Ok(mut records) => {
-                let has_more = records.len() > 1;
-                records.truncate(1.min(limit as usize));
-                let next_after_nonce = records.last().map(|record| record.nonce).unwrap_or(after);
-                let page = GuardianSessionsResponse { sessions: records.into_iter().map(|session| session.record).collect(), next_after_nonce, has_more };
-                match page.to_bytes() { Ok(body) => json_response(200, body), Err(error) => error_response(None, error) }
-            }
-            Err(error) => error_response(None, error),
-        };
+async fn sessions_response(sessions: Arc<GuardianSessionReader>, user: u64, magic: &str, query: Option<&str>, headers: &hyper::HeaderMap) -> HttpResponse {
+    let Ok(representation) = session_representation(headers.get(hyper::header::ACCEPT).and_then(|value| value.to_str().ok())) else {
+        return not_acceptable();
+    };
+    let Ok((after, _limit)) = history_query(query) else { return vary_accept(error_response(None, GuardianSignError::MalformedRequest)); };
+    let Ok(network_magic) = psy_config::parse_magic_hex(magic) else { return vary_accept(error_response(None, GuardianSignError::AuthorizationMismatch)); };
+    // Accepted limit is 1..=64; this endpoint still returns at most the first matching record.
+    match sessions.load_session_page(network_magic, user, after).await {
+        Ok((row, has_more)) => {
+            let next_after_nonce = row.as_ref().map(|(nonce, _)| *nonce).unwrap_or(after);
+            let page = GuardianSessionsResponse { sessions: row.into_iter().map(|(_, record)| record).collect(), next_after_nonce, has_more };
+            session_page_response(representation, page.to_bytes())
+        }
+        Err(error) => vary_accept(error_response(None, error)),
     }
+}
+async fn ready_response(sessions: Arc<GuardianSessionReader>) -> HttpResponse {
+    match sessions.readiness().await {
+        Ok(status) if status.runtime_initialized && !status.halted => match ready_body(&status) {
+            Ok(body) => json_response(200, body),
+            Err(error) => error_response(None, error),
+        },
+        Ok(status) => match ready_body(&status) {
+            Ok(body) => json_response(503, body),
+            Err(error) => error_response(None, error),
+        },
+        Err(error) => error_response(None, error),
+    }
+}
+
+fn ready_body(status: &GuardianReadiness) -> Result<Vec<u8>, GuardianSignError> {
+    #[derive(serde::Serialize)]
+    struct Body { schema_version: u32, user_id: u64, network_magic: u64, runtime_initialized: bool, halted: bool }
+    let body = Body { schema_version: status.schema_version, user_id: status.user_id, network_magic: status.network_magic, runtime_initialized: status.runtime_initialized, halted: status.halted };
+    let bytes = serde_json::to_vec(&body).map_err(|_| GuardianSignError::DatabaseUnavailable)?;
+    if bytes.len() > MAX_BODY_BYTES { return Err(GuardianSignError::DatabaseUnavailable); }
+    Ok(bytes)
+}
+
+
+async fn handle_request(service: Arc<tokio::sync::Mutex<GuardianService>>, request: Request<Incoming>) -> HttpResponse {
     if request.method() != hyper::Method::POST || request.uri().path() != "/v1/sign-session" || request.uri().query().is_some() {
         return error_response(None, GuardianSignError::MalformedRequest);
     }
-    let body = match tokio::time::timeout(Duration::from_secs(30), read_body(request.into_body())).await {
+    if !content_type_is(request.headers().get(hyper::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()), RECORD_MEDIA) {
+        return status_response(415, JSON_MEDIA, Vec::new());
+    }
+    let body = match tokio::time::timeout(Duration::from_secs(30), read_body(request.into_body(), MAX_COMPRESSED_RECORD_BYTES)).await {
         Ok(Ok(body)) => body,
         _ => return error_response(None, GuardianSignError::MalformedRequest),
     };
+    let body = match decode_record(&body, MAX_BODY_BYTES) { Ok(body) => body, Err(error) => return error_response(None, error) };
     let request = match GuardianSignRequest::parse(&body) { Ok(request) => request, Err(error) => return error_response(None, error) };
     let request_id = match request.request_id() { Ok(id) => id, Err(error) => return error_response(None, error) };
     let permit = match SIGN_REQUESTS.try_acquire() {
@@ -597,20 +648,13 @@ fn error_response(request_id: Option<Hex32>, code: GuardianSignError) -> HttpRes
     json_response(code.http_status(), body)
 }
 
-fn json_response(status: u16, body: Vec<u8>) -> HttpResponse {
-    let mut response = Response::new(Full::new(Bytes::from(body)));
-    *response.status_mut() = StatusCode::from_u16(status).expect("guardian status is valid");
-    response.headers_mut().insert(hyper::header::CONTENT_TYPE, hyper::header::HeaderValue::from_static("application/json"));
-    response.headers_mut().insert(hyper::header::CACHE_CONTROL, hyper::header::HeaderValue::from_static("no-store"));
-    response
-}
 
-async fn read_body(mut body: Incoming) -> Result<Vec<u8>, GuardianSignError> {
+async fn read_body(mut body: Incoming, limit: usize) -> Result<Vec<u8>, GuardianSignError> {
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| GuardianSignError::MalformedRequest)?;
         if let Ok(data) = frame.into_data() {
-            if data.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) {
+            if data.len() > limit.saturating_sub(bytes.len()) {
                 return Err(GuardianSignError::MalformedRequest);
             }
             bytes.extend_from_slice(&data);
@@ -636,6 +680,80 @@ fn history_query(query: Option<&str>) -> Result<(u64, u32), GuardianSignError> {
         _ => Err(GuardianSignError::MalformedRequest),
     }
 }
+
+/// `Accept` for `/v1/sessions`. Absent or accepted JSON is the old supervisor body.
+/// Custom media is the exact `PSYGR001` envelope of that same JSON. Quality 0 excludes a type.
+pub fn session_representation(accept: Option<&str>) -> Result<bool, ()> {
+    let Some(accept) = accept.map(str::trim).filter(|value| !value.is_empty()) else { return Ok(false); };
+    let mut record = None;
+    let mut json = None;
+    let mut star = None;
+    for part in accept.split(',') {
+        let mut pieces = part.split(';');
+        let media = pieces.next().unwrap_or("").trim();
+        let mut quality = 1000u16;
+        for parameter in pieces {
+            let mut pair = parameter.splitn(2, '=');
+            if pair.next().unwrap_or("").trim().eq_ignore_ascii_case("q") {
+                quality = match pair.next().map(str::trim) {
+                    Some("0") => 0,
+                    Some("1" | "1.0" | "1.00" | "1.000") => 1000,
+                    Some(text) => {
+                        let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+                        if whole != "0" || fraction.is_empty() || fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) { return Err(()); }
+                        let mut digits = [b'0'; 3];
+                        digits[..fraction.len()].copy_from_slice(fraction.as_bytes());
+                        u16::from(digits[0] - b'0') * 100 + u16::from(digits[1] - b'0') * 10 + u16::from(digits[2] - b'0')
+                    }
+                    None => return Err(()),
+                };
+            }
+        }
+        let slot = if media.eq_ignore_ascii_case(RECORD_MEDIA) { &mut record }
+            else if media.eq_ignore_ascii_case(JSON_MEDIA) { &mut json }
+            else if media == "*/*" { &mut star }
+            else { continue };
+        if slot.is_none_or(|(_, previous)| quality > previous) { *slot = Some((media, quality)); }
+    }
+    if record.is_some_and(|(_, quality)| quality > 0) && record.map(|(_, quality)| quality) >= json.map(|(_, quality)| quality) && record.map(|(_, quality)| quality) >= star.map(|(_, quality)| quality) {
+        return Ok(true);
+    }
+    if json.is_some_and(|(_, quality)| quality > 0) || (star.is_some_and(|(_, quality)| quality > 0) && json.is_none_or(|(_, quality)| quality > 0)) { return Ok(false); }
+    Err(())
+}
+
+fn content_type_is(value: Option<&str>, media: &str) -> bool {
+    value.is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case(media))
+}
+
+fn response_is_record(value: Option<&str>) -> bool { content_type_is(value, RECORD_MEDIA) }
+
+/// Shared by the guardian and relayer history servers. `record` selects the envelope.
+pub fn session_page_response(record: bool, page: Result<Vec<u8>, GuardianSignError>) -> HttpResponse {
+    let body = match page {
+        Ok(body) if record => match encode_record(&body, MAX_SESSION_RECORD_BYTES) { Ok(body) => body, Err(error) => return error_response(None, error) },
+        Ok(body) => body,
+        Err(error) => return error_response(None, error),
+    };
+    vary_accept(status_response(200, if record { RECORD_MEDIA } else { JSON_MEDIA }, body))
+}
+
+fn not_acceptable() -> HttpResponse { vary_accept(status_response(406, JSON_MEDIA, Vec::new())) }
+
+fn vary_accept(mut response: HttpResponse) -> HttpResponse {
+    response.headers_mut().insert(hyper::header::VARY, hyper::header::HeaderValue::from_static("accept"));
+    response
+}
+
+fn status_response(status: u16, content_type: &'static str, body: Vec<u8>) -> HttpResponse {
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = StatusCode::from_u16(status).expect("guardian status is valid");
+    response.headers_mut().insert(hyper::header::CONTENT_TYPE, hyper::header::HeaderValue::from_static(content_type));
+    response.headers_mut().insert(hyper::header::CACHE_CONTROL, hyper::header::HeaderValue::from_static("no-store"));
+    response
+}
+
+fn json_response(status: u16, body: Vec<u8>) -> HttpResponse { status_response(status, JSON_MEDIA, body) }
 
 
 async fn serve_http<F, Fut>(listener: TcpListener, handler: F) -> Result<(), GuardianSignError>
@@ -686,17 +804,17 @@ pub async fn serve_relayer_history(
         let db = db.clone();
         async move {
             if request.method() != hyper::Method::GET || request.uri().path() != "/v1/sessions" {
-                return error_response(None, GuardianSignError::MalformedRequest);
+                return vary_accept(error_response(None, GuardianSignError::MalformedRequest));
             }
-            let result = history_query(request.uri().query()).and_then(|(after, limit)| {
+            let Ok(record) = session_representation(request.headers().get(hyper::header::ACCEPT).and_then(|value| value.to_str().ok())) else {
+                return not_acceptable();
+            };
+            let page = history_query(request.uri().query()).and_then(|(after, limit)| {
                 let page = db.sessions(after, limit as u8).map_err(|_| GuardianSignError::DatabaseUnavailable)?;
                 page.validate_page(after, limit as u8)?;
                 page.to_bytes()
             });
-            match result {
-                Ok(body) => json_response(200, body),
-                Err(error) => error_response(None, error),
-            }
+            session_page_response(record, page)
         }
     }).await
 }
@@ -705,6 +823,7 @@ pub async fn serve_relayer_history(
 mod tests {
     use super::*;
     use guardian_common::protocol::BRIDGE_USER_ID;
+    use plonky2::field::types::Field;
     /// Builds the exact policy member hash for a compressed signer key.
     fn member_hash(public_key: [u8; 33]) -> Hash4 {
         use plonky2::hash::poseidon::PoseidonPermutation;
@@ -902,7 +1021,167 @@ mod tests {
         }
         assert_eq!(history_query(Some("after_nonce=18446744073709551615&limit=64")), Ok((u64::MAX, 64)));
     }
+    /// The sessions page is the same bytes the service returns, and it does not touch the signer mutex.
+    #[tokio::test]
+    async fn sessions_http_page_is_empty_for_a_fresh_journal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = psy_provider::wallet::secp_wallet::Wallet::from_bytes(&[9; 32]).unwrap();
+        let config = approval_config(key.compressed_public_key());
+        let (mut db, root) = open_approval_journal(key.compressed_public_key(), "sessions-page", Arc::clone(&config)).await;
+        let account = GuardianAccount { network_magic: config.network_magic().unwrap(), user_id: BRIDGE_USER_ID, state: GuardianAccountState::Active,
+            last_checkpoint_id: 0, last_checkpoint_hash: Hash4::ZERO, imported_nonce: None,
+            account_public_key: config.account_public_key().unwrap(), imported_ending_leaf: None, withdrawal_chains: Vec::new(), halt_reason: None };
+        db.initialize_runtime(&account).await.unwrap();
+        let sessions = Arc::new(db.session_reader());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let magic = config.network.magic.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), hyper::service::service_fn(move |request: Request<Incoming>| {
+                let sessions = Arc::clone(&sessions);
+                let magic = magic.clone();
+                async move { Ok::<_, std::convert::Infallible>(sessions_response(sessions, BRIDGE_USER_ID, &magic, request.uri().query(), request.headers()).await) }
+            })).await;
+        });
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(b"GET /v1/sessions?after_nonce=0&limit=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await.unwrap().unwrap();
+        let text = String::from_utf8(response).unwrap();
+        let body = text.split("\r\n\r\n").nth(1).unwrap();
+        let page: GuardianSessionsResponse = parse_canonical_json(body.as_bytes()).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 "), "{text}");
+        assert!(page.sessions.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.next_after_nonce, 0);
+        server.await.unwrap();
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// `GET /v1/ready` reads one account and returns the bounded status body.
+    #[tokio::test]
+    async fn ready_http_returns_bounded_account_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = psy_provider::wallet::secp_wallet::Wallet::from_bytes(&[9; 32]).unwrap();
+        let config = approval_config(key.compressed_public_key());
+        let (mut db, root) = open_approval_journal(key.compressed_public_key(), "ready-page", Arc::clone(&config)).await;
+        let network = config.network_magic().unwrap();
+        let account = GuardianAccount { network_magic: network, user_id: BRIDGE_USER_ID, state: GuardianAccountState::Active,
+            last_checkpoint_id: 0, last_checkpoint_hash: Hash4::ZERO, imported_nonce: None,
+            account_public_key: config.account_public_key().unwrap(), imported_ending_leaf: None, withdrawal_chains: Vec::new(), halt_reason: None };
+        db.initialize_runtime(&account).await.unwrap();
+        let sessions = Arc::new(db.session_reader());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), hyper::service::service_fn(move |request: Request<Incoming>| {
+                let sessions = Arc::clone(&sessions);
+                async move { Ok::<_, std::convert::Infallible>(ready_response(sessions).await) }
+            })).await;
+        });
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(b"GET /v1/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await.expect("ready response").unwrap();
+        assert!(read > 0);
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 "), "{text}");
+        let body = text.split("\r\n\r\n").nth(1).unwrap();
+        let status: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(status["schema_version"], 3);
+        assert_eq!(status["user_id"], BRIDGE_USER_ID);
+        assert_eq!(status["network_magic"], network);
+        assert_eq!(status["runtime_initialized"], true);
+        assert_eq!(status["halted"], false);
+        assert!(status.get("sessions").is_none());
+        server.await.unwrap();
+        db.halt_account(network, BRIDGE_USER_ID, HaltReason::FinalityConflict).await.unwrap();
+        let halted = db.session_reader();
+        let response = ready_response(Arc::new(halted)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let halted_body: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(halted_body["halted"], true);
+        assert_eq!(halted_body["runtime_initialized"], true);
+        assert_eq!(halted_body["schema_version"], 3);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
+
+
+
+
+
+
+    fn history_record(nonce: u64) -> GuardianSessionRecord {
+        let mut request = crate::guardian::test_fixture::codec_request_fixture();
+        let mut trace = request.decode_trace().unwrap();
+        request.session_nonce = nonce;
+        trace.finalization.nonce = GoldilocksField::from_canonical_u64(nonce);
+        set_request_trace(&mut request, &trace);
+        GuardianSessionRecord {
+            request_json: guardian_common::protocol::JsonText::from_value(&request).unwrap(),
+            signatures_json: guardian_common::protocol::JsonText::parse(r#"{"member_indices":[],"signatures":[]}"#.into()).unwrap(),
+            endcap_input_json: guardian_common::protocol::JsonText::from_value(&trace.finalization.submit_end_cap_input).unwrap(),
+            endcap_proof_hex: "0x00".into(), included_checkpoint_id: nonce, included_checkpoint_hash: Hash4::ZERO,
+        }
+    }
+
+    /// One loopback history origin. `body` is `None` to close before any response.
+    async fn serve_history(body: Option<Vec<u8>>, record: bool) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let mut seen = Vec::new();
+            let mut byte = [0];
+            while !seen.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).await.unwrap_or(0) == 0 { return; }
+                seen.push(byte[0]);
+            }
+            let Some(body) = body else { return };
+            let media = if record { RECORD_MEDIA } else { JSON_MEDIA };
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {media}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+        (origin, server)
+    }
+
+    fn history_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(2)).no_gzip().no_brotli().no_deflate().no_zstd().build().unwrap()
+    }
+
+    /// A pruned first origin starts at nonce 3. The next origin still has nonce 1.
+    #[tokio::test]
+    async fn pruned_history_origin_falls_through_to_the_next_contiguous_session() {
+        let pruned = history_record(3);
+        let contiguous = history_record(1);
+        let pruned_page = encode_record(&GuardianSessionsResponse { sessions: vec![pruned], next_after_nonce: 3, has_more: false }.to_bytes().unwrap(), MAX_SESSION_RECORD_BYTES).unwrap();
+        let contiguous_page = encode_record(&GuardianSessionsResponse { sessions: vec![contiguous], next_after_nonce: 1, has_more: false }.to_bytes().unwrap(), MAX_SESSION_RECORD_BYTES).unwrap();
+        let (pruned_origin, pruned_server) = serve_history(Some(pruned_page), true).await;
+        let (contiguous_origin, contiguous_server) = serve_history(Some(contiguous_page), true).await;
+        let record = GuardianService::fetch_history(&history_client(), &[pruned_origin, contiguous_origin], 0).await.unwrap();
+        assert_eq!(record.request_json.decode().unwrap().session_nonce, 1);
+        pruned_server.abort();
+        contiguous_server.abort();
+    }
+
+    /// A refused or unreadable page is skipped. No remaining origin is still unavailable.
+    #[tokio::test]
+    async fn invalid_or_failed_history_origin_continues_and_exhaustion_stays_unavailable() {
+        let (refused_origin, refused_server) = serve_history(None, true).await;
+        let (invalid_origin, invalid_server) = serve_history(Some(b"{}".to_vec()), true).await;
+        let client = history_client();
+        assert!(matches!(GuardianService::fetch_history(&client, &[refused_origin, invalid_origin], 0).await, Err(GuardianSignError::SessionHistoryUnavailable)));
+        assert!(matches!(GuardianService::fetch_history(&client, &[], 0).await, Err(GuardianSignError::SessionHistoryUnavailable)));
+        assert!(matches!(GuardianService::fetch_history(&client, &[], u64::MAX).await, Err(GuardianSignError::SessionHistoryUnavailable)));
+        refused_server.abort();
+        invalid_server.abort();
+    }
     #[test]
     fn observer_warns_journal_failure_once_until_quiet_or_success_reset() {
         use std::io::Write;
@@ -1024,7 +1303,7 @@ mod tests {
             network_magic: request.network_magic, user_id: request.user_id, nonce: 1,
             record: guardian_common::protocol::GuardianSessionRecord {
                 request_json: guardian_common::protocol::JsonText::from_value(&request).unwrap(),
-                signatures_json: guardian_common::protocol::JsonText::parse("{\"member_indices\":[],\"signatures\":[]}".into()).unwrap(),
+                signatures_json: guardian_common::protocol::JsonText::from_value(&psy_vm::ups::multisig::MultisigSignatures { member_indices: vec![0, 1], signatures: vec![psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature { public_key: [2; 33], signature: [1; 64], message: Hash256([0; 32]) }; 2] }).unwrap(),
                 endcap_input_json: guardian_common::protocol::JsonText::from_value(&trace.finalization.submit_end_cap_input).unwrap(),
                 endcap_proof_hex: "0x00".into(), included_checkpoint_id: 1, included_checkpoint_hash: Hash4::ZERO,
             },

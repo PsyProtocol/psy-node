@@ -19,7 +19,7 @@ use std::{fs, io::Write, net::SocketAddr, os::unix::fs::{MetadataExt, OpenOption
 
 use anyhow::{ensure, Context};
 use bincode::Options;
-use guardian_common::{protocol::{parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, BRIDGE_USER_ID, MAX_BODY_BYTES}};
+use guardian_common::{protocol::{decode_record, encode_record, parse_canonical_json, GuardianAccount, GuardianAccountState, GuardianConfig, GuardianOperation, GuardianSession, GuardianSessionsResponse, GuardianSignRequest, GuardianSignResponse, GuardianSigned, BRIDGE_USER_ID, MAX_BODY_BYTES, MAX_COMPRESSED_RECORD_BYTES, MAX_SESSION_RECORD_BYTES}};
 use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::{config::store_config::PsyHasher, traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync}};
@@ -33,6 +33,7 @@ use tokio::{net::TcpStream, process::{Child, Command}, time::{sleep, timeout, In
 
 const CLI: &str = env!("CARGO_BIN_EXE_psy_relayer_cli");
 const USER: u64 = BRIDGE_USER_ID;
+const RECORD_MEDIA: &str = "application/vnd.psy.guardian-record+zstd";
 // Test-only ABI, matching psy-contracts/src/{StateManager,Bridge,Router}.sol.
 sol! {
     function lastFinalizedCheckpointId() external view returns (uint64);
@@ -47,7 +48,7 @@ sol! {
 const WITHDRAWAL_MAP_BASE: u64 = 8_589_934_680;
 const WITHDRAWAL_MAP_CAPACITY: u64 = 1_048_576;
 const GUARDIAN_SCHEMA: TableDefinition<'_, (), u32> = TableDefinition::new("guardian_schema");
-const GUARDIAN_SCHEMA_VERSION: u32 = 2;
+const GUARDIAN_SCHEMA_VERSION: u32 = 3;
 const SIGNER: TableDefinition<'_, (), [u8; 33]> = TableDefinition::new("guardian_signer");
 const ACCOUNT: TableDefinition<'_, (u64, u64), &[u8]> = TableDefinition::new("guardian_account");
 const SIGNED: TableDefinition<'_, (u64, u64, u64), &[u8]> = TableDefinition::new("guardian_signed");
@@ -160,13 +161,13 @@ impl Journal {
             for nonce in nonces {
                 let key = (network, USER, *nonce);
                 if let Some(bytes) = signed_table.get(key).map_err(|_| anyhow::anyhow!("decision row unavailable"))?.map(|row| row.value().to_vec()) {
-                    let decoded = decode::<GuardianSigned>(&bytes)?;
+                    let decoded = decode::<GuardianSigned>(&decode_record(&bytes, MAX_BODY_BYTES)?)?;
                     decoded.validate().map_err(|_| anyhow::anyhow!("decision row rejected"))?;
                     ensure!((decoded.network_magic, decoded.user_id, decoded.nonce) == key, "decision key differs from encoded identity");
                     signed.push(decoded);
                 }
                 if let Some(bytes) = sessions.get(key).map_err(|_| anyhow::anyhow!("session row unavailable"))?.map(|row| row.value().to_vec()) {
-                    let decoded = decode::<GuardianSession>(&bytes)?;
+                    let decoded = decode::<GuardianSession>(&decode_record(&bytes, MAX_SESSION_RECORD_BYTES)?)?;
                     ensure!((decoded.network_magic, decoded.user_id, decoded.nonce) == key, "session key differs from encoded identity");
                     ensure!(decoded.record.request_json.decode().map_err(|_| anyhow::anyhow!("session request rejected"))?.session_nonce == decoded.nonce, "session request nonce mismatch");
                     retained_sessions.push(decoded);
@@ -327,7 +328,7 @@ impl Fixture {
         names.sort();
         ensure!(names == ["chain_claims", "deposit_tree_states", "finalization_batch", "guardian_account", "guardian_withdrawal_nonce", "included_withdrawal_burns", "journal_schema", "relayer_request"], "relayer database table set mismatch");
         let schema = tx.open_table(TableDefinition::<(), u64>::new("journal_schema")).map_err(|_| anyhow::anyhow!("relayer schema unavailable"))?;
-        ensure!(schema.len().map_err(|_| anyhow::anyhow!("relayer schema unavailable"))? == 1 && schema.get(()).map_err(|_| anyhow::anyhow!("relayer schema unavailable"))?.is_some_and(|row| row.value() == 2), "incompatible legacy journal schema; explicit operator-controlled migration is required");
+        ensure!(schema.len().map_err(|_| anyhow::anyhow!("relayer schema unavailable"))? == 1 && schema.get(()).map_err(|_| anyhow::anyhow!("relayer schema unavailable"))?.is_some_and(|row| row.value() == 3), "incompatible legacy journal schema; explicit operator-controlled migration is required");
         drop(tx.open_table(TableDefinition::<(u64, u64), &[u8]>::new("guardian_account")).map_err(|_| anyhow::anyhow!("relayer account unavailable"))?);
         drop(tx.open_table(TableDefinition::<u8, &[u8]>::new("chain_claims")).map_err(|_| anyhow::anyhow!("chain claims table unavailable"))?);
         drop(tx.open_table(TableDefinition::<(), &[u8]>::new("finalization_batch")).map_err(|_| anyhow::anyhow!("finalization batch table unavailable"))?);
@@ -335,7 +336,10 @@ impl Fixture {
         drop(tx.open_table(TableDefinition::<RelayerWithdrawalBurnKey, u64>::new("included_withdrawal_burns")).map_err(|_| anyhow::anyhow!("relayer withdrawal burn index unavailable"))?);
         drop(tx.open_table(TableDefinition::<RelayerNonce, u64>::new("guardian_withdrawal_nonce")).map_err(|_| anyhow::anyhow!("relayer nonce unavailable"))?);
         let table = tx.open_table(TableDefinition::<u64, &[u8]>::new("relayer_request")).map_err(|_| anyhow::anyhow!("relayer request table unavailable"))?;
-        Ok(table.get(nonce).map_err(|_| anyhow::anyhow!("relayer request row unavailable"))?.map(|row| serde_json::from_slice(row.value())).transpose().map_err(|_| anyhow::anyhow!("relayer request row rejected"))?)
+        table.get(nonce).map_err(|_| anyhow::anyhow!("relayer request row unavailable"))?.map(|row| {
+            let bytes = decode_record(row.value(), MAX_SESSION_RECORD_BYTES)?;
+            serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("relayer request row rejected"))
+        }).transpose()
     }
     fn network(&self) -> u64 { self.config.network_magic().unwrap_or(0) }
     fn text(&self, key: &str) -> anyhow::Result<String> { self.manifest[key].as_str().context("missing manifest text").map(str::to_string) }
@@ -494,7 +498,7 @@ impl Children {
 struct Sessions { http: reqwest::Client, origins: [url::Url; 3], history: url::Url }
 impl Sessions {
     fn load(fixture: &Fixture) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(30)).build().map_err(|_| anyhow::anyhow!("session client unavailable"))?;
+        let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(30)).no_gzip().no_brotli().no_deflate().no_zstd().build().map_err(|_| anyhow::anyhow!("session client unavailable"))?;
         let mut origins = Vec::new();
         for value in &fixture.config.endpoints {
             let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("client endpoint invalid"))?;
@@ -508,20 +512,23 @@ impl Sessions {
         Ok(Self { http, origins, history })
     }
 
-    async fn body(&self, response: Result<reqwest::Response, reqwest::Error>) -> anyhow::Result<Option<Vec<u8>>> {
+    async fn body(&self, response: Result<reqwest::Response, reqwest::Error>, record: bool) -> anyhow::Result<Option<Vec<u8>>> {
         let Ok(mut response) = response else { return Ok(None); };
         if !response.status().is_success() { return Ok(None); }
+        let expected = if record { RECORD_MEDIA } else { "application/json" };
+        ensure!(response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).is_some_and(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case(expected)), "unexpected response representation");
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| anyhow::anyhow!("response interrupted"))? {
-            ensure!(body.len().checked_add(chunk.len()).is_some_and(|length| length <= MAX_BODY_BYTES), "response exceeds transport bound");
+            ensure!(body.len().checked_add(chunk.len()).is_some_and(|length| length <= if record { MAX_COMPRESSED_RECORD_BYTES } else { MAX_BODY_BYTES }), "response exceeds transport bound");
             body.extend_from_slice(&chunk);
         }
-        Ok(Some(body))
+        Ok(Some(if record { decode_record(&body, MAX_SESSION_RECORD_BYTES)? } else { body }))
     }
 
     async fn post_signature(&self, index: usize, request: &[u8]) -> anyhow::Result<Option<GuardianSignResponse>> {
-        let response = self.http.post(self.origins[index].join("v1/sign-session").map_err(|_| anyhow::anyhow!("signing URL unavailable"))?).header(reqwest::header::CONTENT_TYPE, "application/json").body(request.to_vec()).send().await;
-        Ok(self.body(response).await?.and_then(|bytes| parse_canonical_json(&bytes).ok()))
+        let request = encode_record(request, MAX_BODY_BYTES)?;
+        let response = self.http.post(self.origins[index].join("v1/sign-session").map_err(|_| anyhow::anyhow!("signing URL unavailable"))?).header(reqwest::header::CONTENT_TYPE, RECORD_MEDIA).body(request).send().await;
+        Ok(self.body(response, false).await?.and_then(|bytes| parse_canonical_json(&bytes).ok()))
     }
 
     async fn durable_signature(&self, children: &mut Children, mut daemon: usize, index: usize, fixture: &Fixture, nonce: u64) -> anyhow::Result<(usize, GuardianSignResponse)> {
@@ -560,7 +567,7 @@ impl Sessions {
         let mut url = origin.clone();
         url.set_path("/v1/sessions");
         url.query_pairs_mut().append_pair("after_nonce", &(nonce - 1).to_string()).append_pair("limit", "1");
-        let Some(body) = self.body(self.http.get(url).send().await).await? else { return Ok(None); };
+        let Some(body) = self.body(self.http.get(url).header(reqwest::header::ACCEPT, RECORD_MEDIA).send().await, true).await? else { return Ok(None); };
         let page = parse_canonical_json::<GuardianSessionsResponse>(&body).map_err(|_| anyhow::anyhow!("session page rejected"))?;
         page.validate_page(nonce - 1, 1).map_err(|_| anyhow::anyhow!("session page rejected"))?;
         Ok(page.sessions.into_iter().find(|record| record.request_json.decode().is_ok_and(|request| request.session_nonce == nonce)))

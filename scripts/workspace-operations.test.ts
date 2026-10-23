@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -5,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import {
+  applyPreparation,
   assertCompilerProvenance,
   assertEvmSdkPeer,
   assertPnpmLockfile,
@@ -18,7 +20,10 @@ import {
   switchConsumers,
   validatePacked,
   type Pack,
+  type PrepareFs,
+  type PrepareRepository,
   type RegistryPackage,
+  type Runner,
 } from "./workspace-operations";
 import { assertLocalCargoGraph, assertNoLocalDependencies, nodeCratePaths, nodeDependencies, parseBunLock, rewriteNodeDependencies } from "./workspace-dependencies";
 import { assertBunLock, assertLocalPnpmLock, replaceDirectDependencies, switchLocal } from "./workspace-operations";
@@ -36,13 +41,16 @@ describe("Cargo psy-node pins", () => {
       const text = readFileSync(join(root, repo, "Cargo.toml"), "utf8");
       const before = pinsFromManifest(text, repo);
       expect(before).toHaveLength(count);
-      expect(before.every(pin => pin.rev === OLD)).toBe(true);
       const rewritten = replacePsyNodeRevs(text, NEXT, repo);
       const after = pinsFromManifest(rewritten, repo);
       expect(after.map(pin => `${pin.table}.${pin.key}|${pin.url}|${JSON.stringify(pin.rest)}`)).toEqual(
         before.map(pin => `${pin.table}.${pin.key}|${pin.url}|${JSON.stringify(pin.rest)}`),
       );
       expect(after.every(pin => pin.rev === NEXT)).toBe(true);
+      expect(rewritten).toBe(text.replace(
+        /(\bgit\s*=\s*"https:\/\/github\.com\/PsyProtocol\/psy-node(?:\.git)?"[^}\n]*\brev\s*=\s*")[0-9a-f]{40}(?=")/g,
+        `$1${NEXT}`,
+      ));
     }
   });
 
@@ -485,5 +493,240 @@ describe("local dependency cutover", () => {
     expect(() => assertNoLocalDependencies("psy-sdk", "Cargo.lock", lock + node + `source = "git+https://github.com/PsyProtocol/psy-node?rev=${OLD}#${OLD}"\n`, context)).not.toThrow();
     expect(() => assertNoLocalDependencies("psy-node", "Cargo.lock", lock + node)).not.toThrow();
     expect(() => assertNoLocalDependencies("psy-sdk", "Cargo.lock", lock)).toThrow(/identities are required/);
+  });
+});
+
+describe("prepare apply", () => {
+  const parent = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const child = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const prepared = "cccccccccccccccccccccccccccccccccccccccc";
+  const nodeBase = "dddddddddddddddddddddddddddddddddddddddd";
+  const nodeNext = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  const mode = 0o100644;
+  const source = `git+https://github.com/PsyProtocol/psy-node.git?rev=${nodeNext}#${nodeNext}`;
+  function digest(text: string): string { return createHash("sha256").update(text).digest("hex"); }
+  function repository(name: string, head: string, files: Record<string, string>, gitlink?: { path: string; sha: string }): PrepareRepository {
+    const path = join("/workspace", name);
+    return {
+      name, path, branch: "mainnet-beta", head,
+      explicitPaths: Object.keys(files),
+      ownedPaths: [...Object.keys(files), ...(gitlink ? [gitlink.path] : [])],
+      files: [...Object.entries(files).map(([file, text]) => ({ path: file, sha256: digest(text), mode })), { path: ".gitmodules", sha256: null, mode: null }],
+      gitmodulesSha256: null,
+      gitlinks: gitlink ? [{ path: gitlink.path, child: "psy-genesis", from: gitlink.sha, nestedHead: gitlink.sha }] : [],
+      cargo: null,
+      nested: gitlink ? [{ path: join(path, gitlink.path), head: gitlink.sha, branch: "mainnet-beta", recorded: gitlink.sha, clean: true }] : [],
+    };
+  }
+  function fake(heads: Record<string, string>, next: Record<string, string> = {}) {
+    const calls: string[] = [];
+    const staged: Record<string, string[]> = {};
+    const links: Record<string, string> = {};
+    const refs: Record<string, string> = {};
+    const objects = new Set(Object.values(heads));
+    const runner: Runner = (command, _cwd, env) => {
+      calls.push(command.join(" "));
+      const ok = (out = "") => ({ code: 0, out, err: "" });
+      const denied = () => ({ code: 99, out: "", err: `unexpected command: ${command.join(" ")}` });
+      if (command[0] !== "git" || env?.GIT_ALLOW_PROTOCOL !== "file" || env.GIT_CONFIG_COUNT !== "1" || env.GIT_CONFIG_KEY_0 !== "core.hooksPath" || env.GIT_CONFIG_VALUE_0 !== "/dev/null") return denied();
+      if (command.slice(1, 4).join(" ") === "init --bare --quiet" && command.length === 5) return ok();
+      if (command[1] !== "-C") return denied();
+      const repo = command[2];
+      const args = command.slice(3);
+      const text = args.join(" ");
+      if (args[0] === "rev-parse" && args[1] === "--verify" && args.length === 3) {
+        const ref = args[2].replace(/\^\{commit\}$/, "");
+        const sha = ref === "HEAD" ? heads[repo] : refs[`${repo}:${ref}`] || (objects.has(ref) ? ref : undefined);
+        return sha ? ok(`${sha}\n`) : { code: 1, out: "", err: "unknown commit" };
+      }
+      if (text === "symbolic-ref --quiet --short HEAD") return ok("mainnet-beta\n");
+      if (text === "diff --cached --name-only -z") return ok((staged[repo] || []).map(path => `${path}\0`).join(""));
+      if (text === "ls-files --unmerged -z" || text === "status --porcelain=v1 --untracked-files=all --ignore-submodules=none") return ok();
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor" && args.length === 4) return ok();
+      if (args[0] === "ls-files" && args[1] === "-s" && args[2] === "--" && args.length === 4) return ok(`160000 ${links[join(repo, args[3])] || child} 0\t${args[3]}\n`);
+      if (args[0] === "ls-tree" && args[1] === "-r" && args[2] === "-z" && args.length === 4) return ok();
+      if (text === "config --file .gitmodules --get-regexp ^submodule\\..*\\.path$") return { code: 1, out: "", err: "" };
+      if (args[0] === "cat-file" && args[1] === "-e" && args.length === 3) return objects.has(args[2].replace(/\^\{commit\}$/, "")) ? ok() : { code: 1, out: "", err: "missing object" };
+      if (args.slice(0, 6).join(" ") === "fetch --no-tags --no-write-fetch-head --refmap= --recurse-submodules=no /workspace/psy-node" && args.length === 7) {
+        const [sha, ref] = args[6].split(":");
+        if (heads[args[5]] !== sha || ref !== "refs/heads/prepare") return denied();
+        refs[`${repo}:${ref}`] = sha;
+        return ok();
+      }
+      if (args[0] === "--literal-pathspecs" && args[1] === "add" && args[2] === "--" && args.length > 3) {
+        staged[repo] = [...(staged[repo] || []), ...args.slice(3)];
+        return ok();
+      }
+      if (args[0] === "update-index" && args[1] === "--cacheinfo" && args[2] === "160000" && args.length === 5) {
+        links[join(repo, args[4])] = args[3];
+        staged[repo] = [...(staged[repo] || []), args[4]];
+        return ok();
+      }
+      if (args.slice(0, 5).join(" ") === "submodule update --checkout --no-fetch --" && args.length === 6) {
+        heads[join(repo, args[5])] = links[join(repo, args[5])];
+        return ok();
+      }
+      if (args[0] === "commit" && args[1] === "--no-verify" && args[2] === "-m" && args.length === 4 && staged[repo]?.length && next[repo]) {
+        heads[repo] = next[repo];
+        objects.add(heads[repo]);
+        staged[repo] = [];
+        return ok();
+      }
+      return denied();
+    };
+    return { runner, calls, staged };
+  }
+  function memoryFs(files: Record<string, string>, directories: string[] = []): PrepareFs {
+    const file = { isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false, mode };
+    const directory = { isFile: () => false, isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40755 };
+    const isDirectory = (path: string) => directories.includes(path) || Object.keys(files).some(file => file.startsWith(`${path}/`));
+    return {
+      readFileSync: path => { if (!(path in files)) throw new Error(`missing fixture file: ${path}`); return files[path]; },
+      writeFileSync: (path, text) => { files[path] = text; },
+      existsSync: path => path in files || isDirectory(path),
+      realpathSync: path => path,
+      lstatSync: path => path in files ? file : isDirectory(path) ? directory : undefined,
+      mkdtempSync: () => "/tmp/workspace-prepare-memory",
+      rmSync: () => undefined,
+    };
+  }
+
+  it("commits only the owned path and skips a later empty repository", () => {
+    const text = "owned\n";
+    const first = repository("psy-genesis", parent, { "owned.txt": text });
+    const second = repository("psy-contracts", parent, {});
+    second.explicitPaths = [];
+    second.ownedPaths = [];
+    const files: Record<string, string> = { [join(first.path, "owned.txt")]: text };
+    const heads: Record<string, string> = { [first.path]: parent, [second.path]: parent };
+    files[join(first.path, "unrelated.rs")] = "unrelated dirt\n";
+    const base = fake(heads, { [first.path]: prepared });
+    const result = applyPreparation({ root: "/workspace", message: "prepare", repositories: [first, second], excluded: ["psy-node"] }, base.runner, memoryFs(files, [second.path]));
+    expect(result.commits).toEqual([{ name: "psy-genesis", from: parent, to: prepared, paths: ["owned.txt"] }]);
+    expect(result.skipped).toEqual(["psy-contracts"]);
+    expect(files[join(first.path, "unrelated.rs")]).toBe("unrelated dirt\n");
+    expect(base.calls.filter(call => call.includes(" add "))).toEqual([`git -C ${first.path} --literal-pathspecs add -- owned.txt`]);
+    expect(base.calls.indexOf(`git -C ${first.path} --literal-pathspecs add -- owned.txt`)).toBeLessThan(base.calls.indexOf(`git -C ${first.path} commit --no-verify -m prepare`));
+    expect(base.calls.some(call => call.startsWith("cargo") || call.includes("push"))).toBe(false);
+  });
+
+  it("pins the parent gitlink to the child's prepared commit without staging other paths", () => {
+    const childRepo = repository("psy-genesis", parent, { "owned.txt": "child\n" });
+    const parentRepo = repository("psy-node", parent, {}, { path: "psy-genesis", sha: child });
+    parentRepo.explicitPaths = [];
+    parentRepo.ownedPaths = ["psy-genesis"];
+    parentRepo.files = [{ path: ".gitmodules", sha256: null, mode: null }];
+    const heads: Record<string, string> = { [childRepo.path]: parent, [parentRepo.path]: parent, [join(parentRepo.path, "psy-genesis")]: child };
+    const base = fake(heads, { [childRepo.path]: prepared, [parentRepo.path]: nodeNext });
+    const result = applyPreparation({ root: "/workspace", message: "prepare", repositories: [childRepo, parentRepo], excluded: [] }, base.runner, memoryFs({ [join(childRepo.path, "owned.txt")]: "child\n", [join(parentRepo.path, "psy-genesis", ".git")]: "gitdir" }));
+    expect(result.commits.map(item => item.to)).toEqual([prepared, nodeNext]);
+    expect(base.calls.filter(call => call.includes("update-index"))).toEqual([`git -C ${parentRepo.path} update-index --cacheinfo 160000 ${result.commits[0].to} psy-genesis`]);
+    expect(heads[join(parentRepo.path, "psy-genesis")]).toBe(result.commits[0].to);
+    expect(base.calls.some(call => call.includes("push") || call.includes("reset"))).toBe(false);
+  });
+
+  it("resolves an unpublished node commit through a process-local git override and keeps the canonical URL", () => {
+    const node = repository("psy-node", nodeBase, { "crate.rs": "node\n" });
+    const sdk = repository("psy-sdk", parent, {});
+    const manifest = `[dependencies]\npsy_vm = { git = "https://github.com/PsyProtocol/psy-node", rev = "${nodeBase}", package = "psy_vm" }\n`;
+    const lock = `[[package]]\nname = "psy_vm"\nversion = "0.1.0"\nsource = "git+https://github.com/PsyProtocol/psy-node.git?rev=${nodeBase}#${nodeBase}"\n`;
+    sdk.explicitPaths = [];
+    sdk.ownedPaths = ["Cargo.toml", "Cargo.lock"];
+    sdk.files = [{ path: "Cargo.toml", sha256: digest(manifest), mode }, { path: "Cargo.lock", sha256: digest(lock), mode }, { path: ".gitmodules", sha256: null, mode: null }];
+    sdk.cargo = { dependency: "psy-node", from: [nodeBase] };
+    const heads: Record<string, string> = { [node.path]: nodeBase, [sdk.path]: parent };
+    const reads: Record<string, string> = {
+      [join(sdk.path, "Cargo.toml")]: manifest, [join(sdk.path, "Cargo.lock")]: lock,
+      [join(sdk.path, "package.json")]: '{"version":"2.0.8"}\n', [join(sdk.path, "pnpm-lock.yaml")]: "lockfileVersion: '9.0'\n",
+      [join(node.path, "crate.rs")]: "node\n", [join(node.path, "unrelated.rs")]: "unrelated dirt\n",
+      [join(node.path, "Cargo.toml")]: '[workspace]\nmembers = ["client_prover/psy_vm"]\n',
+      [join(node.path, "client_prover/psy_vm/Cargo.toml")]: '[package]\nname = "psy_vm"\n',
+    };
+    const base = fake(heads, { [node.path]: nodeNext, [sdk.path]: prepared });
+    let cargoEnv: NodeJS.ProcessEnv | undefined;
+    const cargoCalls: string[][] = [];
+    const runner: Runner = (command, cwd, env) => {
+      if (command[0] !== "cargo") return base.runner(command, cwd, env);
+      if (cwd !== sdk.path || !["metadata --format-version 1 --manifest-path Cargo.toml", "metadata --format-version 1 --manifest-path Cargo.toml --locked"].includes(command.slice(1).join(" "))) return { code: 99, out: "", err: "unexpected cargo command" };
+      cargoCalls.push([...command]);
+      cargoEnv = env;
+      expect(heads[node.path]).toBe(nodeNext);
+      expect(reads[join(sdk.path, "Cargo.toml")]).toContain(`rev = "${heads[node.path]}"`);
+      expect(base.staged[sdk.path] || []).toEqual([]);
+      if (!command.includes("--locked")) reads[join(sdk.path, "Cargo.lock")] = `[[package]]\nname = "psy_vm"\nversion = "0.1.0"\nsource = "${source}"\n`;
+      return { code: 0, out: JSON.stringify({ packages: [{ name: "psy_vm", version: "0.1.0", id: "psy_vm", source, manifest_path: "/tmp/cargo/git/checkouts/psy-node/client_prover/psy_vm/Cargo.toml" }], resolve: { nodes: [{ id: "psy_vm", deps: [] }] } }), err: "" };
+    };
+    const preparedFs = memoryFs(reads);
+    const result = applyPreparation({ root: "/workspace", message: "prepare", repositories: [node, sdk], excluded: [] }, runner, preparedFs);
+    expect(result.commits.map(item => item.name)).toEqual(["psy-node", "psy-sdk"]);
+    expect(reads[join(sdk.path, "Cargo.toml")]).toContain(`rev = "${nodeNext}"`);
+    expect(reads[join(sdk.path, "Cargo.toml")]).toContain("https://github.com/PsyProtocol/psy-node");
+    expect(reads[join(sdk.path, "Cargo.toml")]).not.toContain("/tmp/workspace-prepare-memory");
+    expect(reads[join(sdk.path, "Cargo.lock")]).toContain(source);
+    expect(reads[join(sdk.path, "package.json")]).toBe('{"version":"2.0.8"}\n');
+    expect(reads[join(sdk.path, "pnpm-lock.yaml")]).toBe("lockfileVersion: '9.0'\n");
+    expect(reads[join(node.path, "unrelated.rs")]).toBe("unrelated dirt\n");
+    expect(result.commits[0].to).toBe(nodeNext);
+    expect(result.commits[1].paths).toEqual(["Cargo.toml", "Cargo.lock"]);
+    expect(cargoCalls).toHaveLength(2);
+    expect(cargoCalls[1].at(-1)).toBe("--locked");
+    expect(cargoEnv?.CARGO_NET_GIT_FETCH_WITH_CLI).toBe("true");
+    expect(cargoEnv?.GIT_ALLOW_PROTOCOL).toBe("file");
+    expect(cargoEnv?.GIT_CONFIG_KEY_0).toBe("protocol.file.allow");
+    expect(cargoEnv?.GIT_CONFIG_VALUE_0).toBe("always");
+    expect(cargoEnv?.GIT_CONFIG_KEY_1).toBe("url./workspace/psy-sdk.insteadOf");
+    expect(cargoEnv?.GIT_CONFIG_VALUE_1).toBe("https://github.com/PsyProtocol/psy-sdk");
+    expect(cargoEnv?.GIT_CONFIG_KEY_3).toBe("url./tmp/workspace-prepare-memory.insteadOf");
+    expect(cargoEnv?.GIT_CONFIG_VALUE_3).toBe("https://github.com/PsyProtocol/psy-node");
+    expect(cargoEnv?.GIT_CONFIG_KEY_4).toBe("url./tmp/workspace-prepare-memory.insteadOf");
+    expect(cargoEnv?.GIT_CONFIG_VALUE_4).toBe("https://github.com/PsyProtocol/psy-node.git");
+    expect(cargoEnv?.GIT_CONFIG_COUNT).toBe("6");
+    expect(cargoEnv?.GIT_CONFIG_KEY_5).toBe("core.hooksPath");
+    expect(cargoEnv?.GIT_CONFIG_VALUE_5).toBe("/dev/null");
+    expect(base.calls.some(call => call.includes("push"))).toBe(false);
+    expect(base.calls.some(call => call.includes("fetch") && call.includes(node.path) && call.includes(`${nodeNext}:refs/heads/prepare`))).toBe(true);
+  });
+
+  it("stops after a failed cargo resolution and does not commit or reset the consumer", () => {
+    const node = repository("psy-node", nodeNext, {});
+    node.explicitPaths = [];
+    node.ownedPaths = [];
+    node.files = [{ path: ".gitmodules", sha256: null, mode: null }];
+    const sdk = repository("psy-sdk", parent, {});
+    const manifest = `[dependencies]\npsy_vm = { git = "https://github.com/PsyProtocol/psy-node", rev = "${nodeBase}", package = "psy_vm" }\n`;
+    sdk.ownedPaths = ["Cargo.toml", "Cargo.lock"];
+    sdk.files = [{ path: "Cargo.toml", sha256: digest(manifest), mode }, { path: "Cargo.lock", sha256: digest("lock\n"), mode }, { path: ".gitmodules", sha256: null, mode: null }];
+    sdk.cargo = { dependency: "psy-node", from: [nodeBase] };
+    const reads: Record<string, string> = { [join(sdk.path, "Cargo.toml")]: manifest, [join(sdk.path, "Cargo.lock")]: "lock\n", [join(node.path, "Cargo.toml")]: '[workspace]\nmembers = ["client_prover/psy_vm"]\n', [join(node.path, "client_prover/psy_vm/Cargo.toml")]: '[package]\nname = "psy_vm"\n' };
+    const base = fake({ [node.path]: nodeNext, [sdk.path]: parent });
+    const calls = base.calls;
+    const runner: Runner = (command, cwd, env) => {
+      if (command.join(" ") === "cargo metadata --format-version 1 --manifest-path Cargo.toml" && cwd === sdk.path) {
+        calls.push(command.join(" "));
+        return { code: 1, out: "", err: "unresolved" };
+      }
+      return base.runner(command, cwd, env);
+    };
+    const preparedFs = memoryFs(reads);
+    expect(() => applyPreparation({ root: "/workspace", message: "prepare", repositories: [node, sdk], excluded: [] }, runner, preparedFs)).toThrow(/partial prepare retained[\s\S]*unresolved/);
+    expect(calls.some(call => call.includes("push") || call.includes(" commit ") || call.includes(" reset "))).toBe(false);
+    expect(calls.some(call => call.includes("fetch") && call.includes(node.path) && call.includes(`${nodeNext}:refs/heads/prepare`))).toBe(true);
+    expect(reads[join(sdk.path, "Cargo.toml")]).toContain(`rev = "${nodeNext}"`);
+    expect(calls.filter(call => call.startsWith("cargo "))).toEqual(["cargo metadata --format-version 1 --manifest-path Cargo.toml"]);
+    expect(reads[join(sdk.path, "Cargo.lock")]).toBe("lock\n");
+  });
+
+  it("rejects a stale later repository before any file or index write", () => {
+    const first = repository("psy-genesis", parent, { "owned.txt": "first\n" });
+    const second = repository("psy-contracts", parent, { "owned.txt": "preview\n" });
+    const files = { [join(first.path, "owned.txt")]: "first\n", [join(second.path, "owned.txt")]: "changed\n" };
+    const before = { ...files };
+    const base = fake({ [first.path]: parent, [second.path]: parent }, { [first.path]: prepared });
+    const fs = memoryFs(files);
+    fs.writeFileSync = () => { throw new Error("must not write before all repositories pass preflight"); };
+    fs.mkdtempSync = () => { throw new Error("must not create db before all repositories pass preflight"); };
+    expect(() => applyPreparation({ root: "/workspace", message: "prepare", repositories: [first, second], excluded: [] }, base.runner, fs)).toThrow(/psy-contracts\/owned.txt: owned file changed since preparation preview/);
+    expect(files).toEqual(before);
+    expect(base.calls.some(call => / (add|commit|update-index|fetch) /.test(call))).toBe(false);
   });
 });

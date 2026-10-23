@@ -1026,9 +1026,10 @@ export class RunningProcess {
                     }
                     try {
                         const host = guardianListener.host.includes(":") ? `[${guardianListener.host}]` : guardianListener.host;
-                        await waitForHttpUrl(`http://${host}:${guardianListener.port}/v1/sessions?after_nonce=0&limit=1`, {
-                            attempts: 1, timeoutMs: Math.min(1500, remainingMs), name: "guardian-service sessions",
-                            validateResponse: guardianSessionsReady,
+                        await waitForHttpUrl(`http://${host}:${guardianListener.port}/v1/ready`, {
+                            // One account read; it does not share the observer lock or session page.
+                            attempts: 1, timeoutMs: Math.min(1_500, remainingMs), name: "guardian-service ready",
+                            validateResponse: guardianServiceReady,
                         });
                         if (performance.now() - readinessStartedMs >= readinessDeadlineMs) {
                             throw new Error(`[DevNet] guardian-service port ${guardianListener.port} not ready within ${readinessDeadlineMs}ms`);
@@ -1919,6 +1920,15 @@ export async function guardianSessionsReady(response: Response): Promise<boolean
         && Number.isInteger(page.next_after_nonce) && page.next_after_nonce >= 0
         && typeof page.has_more === "boolean";
 }
+/** HTTP 200 only when the runtime account is initialized and not halted. */
+export async function guardianServiceReady(response: Response): Promise<boolean> {
+    if (response.status !== 200) return false;
+    const body = await response.json();
+    return !!body && body.schema_version === 3 && body.runtime_initialized === true && body.halted === false
+        && typeof body.user_id === "number" && Number.isSafeInteger(body.user_id) && body.user_id >= 0
+        && typeof body.network_magic === "number" && Number.isSafeInteger(body.network_magic) && body.network_magic > 0;
+}
+
 
 async function waitForHttpUrl(
     url: string,

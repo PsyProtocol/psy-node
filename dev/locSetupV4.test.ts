@@ -99,6 +99,7 @@ import {
     resolveBridgeDaemonConfigPath,
     prepareGuardianService,
     guardianSessionsReady,
+    guardianServiceReady,
     validateRelayerTemplate,
     relayerStartedDetector,
     DevNetProcessManager,
@@ -1553,6 +1554,18 @@ password_env = "SYNTHETIC_PASSWORD"
         expect(await guardianSessionsReady(Response.json(page, { status: 404 }))).toBe(false);
         await expect(guardianSessionsReady(new Response("not JSON"))).rejects.toThrow();
     });
+    it("requires an initialized unhalted guardian ready response", async () => {
+        const ready = { schema_version: 3, user_id: 524288, network_magic: 1, runtime_initialized: true, halted: false };
+        expect(await guardianServiceReady(Response.json(ready))).toBe(true);
+        for (const body of [null, {}, [], { ...ready, schema_version: 1 }, { ...ready, runtime_initialized: false },
+            { ...ready, halted: true }, { ...ready, user_id: -1 }, { ...ready, network_magic: 0 }, { ...ready, user_id: "1" }]) {
+            expect(await guardianServiceReady(Response.json(body))).toBe(false);
+        }
+        expect(await guardianServiceReady(Response.json(ready, { status: 503 }))).toBe(false);
+        expect(await guardianServiceReady(Response.json({ ...ready, halted: true }, { status: 503 }))).toBe(false);
+        await expect(guardianServiceReady(new Response("not JSON"))).rejects.toThrow();
+    });
+
 
     it("starts three tracked guardians concurrently with independent saved journals", async () => {
         await fixture(async (cwd, env, ports) => {
@@ -1598,12 +1611,93 @@ password_env = "SYNTHETIC_PASSWORD"
         });
     });
 
-    it("rejects a sessions page that validates after the 600s deadline", async () => {
+    it("accepts a bounded guardian ready response within the 1500ms probe", async () => {
+        await fixture(async (cwd, env) => {
+            const ready = { schema_version: 3, user_id: 524288, network_magic: 1, runtime_initialized: true, halted: false };
+            let probes = 0;
+            const timer = spyOn(globalThis, "setTimeout");
+            const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
+                probes += 1;
+                expect(options?.signal?.aborted).toBe(false);
+                return Response.json(ready);
+            });
+            const sleep = spyOn(Bun, "sleep").mockResolvedValue(undefined);
+            let guardian: RunningProcess | undefined;
+            try {
+                guardian = await RunningProcess.spawn([
+                    process.execPath, "-e", "Bun.serve({ port: 0, fetch: () => new Response() })",
+                    "guardian-service", "--rpc-config", "rpc.json", "--guardian-root", "guardians", "--guardian-id", "1",
+                ], {
+                    cwd,
+                    env: env as Record<string, string>,
+                    stdoutLogFile: path.join(cwd, "guardian-ready.log"),
+                    stderrLogFile: path.join(cwd, "guardian-ready.err"),
+                });
+                expect(timer).toHaveBeenCalledWith(expect.any(Function), 1_500);
+                expect(timer).not.toHaveBeenCalledWith(expect.any(Function), 60_000);
+                expect(probes).toBe(1);
+                expect(sleep).not.toHaveBeenCalled();
+                expect(guardian.initializationReady).toBe(true);
+            } finally {
+                fetchSpy.mockRestore(); sleep.mockRestore(); timer.mockRestore();
+                if (guardian) {
+                    guardian.killWithSignal("SIGKILL");
+                    await guardian.proc.exited;
+                }
+            }
+        });
+    });
+
+    it("clamps the last guardian ready probe to the remaining 500ms", async () => {
+        await fixture(async (cwd, env) => {
+            const ready = { schema_version: 3, user_id: 524288, network_magic: 1, runtime_initialized: true, halted: false };
+            let virtualMs = 0;
+            let probes = 0;
+            const timer = spyOn(globalThis, "setTimeout");
+            const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
+                probes += 1;
+                if (probes === 1) {
+                    virtualMs = 599_000;
+                    throw new Error("synthetic connection refused");
+                }
+                expect(options?.signal?.aborted).toBe(false);
+                return Response.json(ready);
+            });
+            const sleep = spyOn(Bun, "sleep").mockImplementation(async (ms) => { virtualMs += ms ?? 0; });
+            const now = spyOn(performance, "now").mockImplementation(() => virtualMs);
+            let guardian: RunningProcess | undefined;
+            try {
+                guardian = await RunningProcess.spawn([
+                    process.execPath, "-e", "Bun.serve({ port: 0, fetch: () => new Response() })",
+                    "guardian-service", "--rpc-config", "rpc.json", "--guardian-root", "guardians", "--guardian-id", "1",
+                ], {
+                    cwd,
+                    env: env as Record<string, string>,
+                    stdoutLogFile: path.join(cwd, "guardian-clamp.log"),
+                    stderrLogFile: path.join(cwd, "guardian-clamp.err"),
+                });
+                expect(timer).toHaveBeenCalledWith(expect.any(Function), 1_500);
+                expect(timer).toHaveBeenCalledWith(expect.any(Function), 500);
+                expect(probes).toBe(2);
+                expect(virtualMs).toBe(599_500);
+                expect(guardian.initializationReady).toBe(true);
+            } finally {
+                fetchSpy.mockRestore(); sleep.mockRestore(); now.mockRestore(); timer.mockRestore();
+                if (guardian) {
+                    guardian.killWithSignal("SIGKILL");
+                    await guardian.proc.exited;
+                }
+            }
+        });
+    });
+
+
+    it("rejects a ready response that validates after the 600s deadline", async () => {
         await fixture(async (cwd, env, ports) => {
             let virtualMs = 0;
             const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () => {
                 virtualMs = 600_000;
-                return Response.json({ sessions: [], next_after_nonce: 0, has_more: false });
+                return Response.json({ schema_version: 3, user_id: 524288, network_magic: 1, runtime_initialized: true, halted: false });
             });
             const sleep = spyOn(Bun, "sleep").mockImplementation(async () => {
                 throw new Error("late guardian response must not retry after the deadline");

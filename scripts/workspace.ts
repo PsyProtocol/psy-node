@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { createWorkspace, WORKSPACE_REPOS } from "./workspace-create";
-import { assertNoLocalDependencies, type CargoGuardContext } from "./workspace-dependencies";
+import { assertNoLocalDependencies, nodeDependencies, type CargoGuardContext } from "./workspace-dependencies";
 import {
+  applyPreparation,
   assertPublishedDependencies as assertDependenciesPublished,
   guardSquashPins,
   inconsistent,
@@ -32,6 +34,11 @@ Commands (default: status; no implicit mutations):
   create --source DIR --destination DIR --branch TOPIC [--base mainnet-beta]
   gitlinks sync [--source DIR] [--base mainnet-beta]
   commit --source DIR --repo NAME --message TEXT [--staged | -- PATH...]
+  prepare --source DIR --repo NAME [--repo NAME ...] --message TEXT
+        [--commit-path NAME=LITERAL_FILE ...] [--apply]
+        Preview selected local commits in dependency order; --apply never pushes.
+        Only named files and selected gitlinks/Cargo pins are owned. Indexes must
+        be empty; unrelated edits stay untouched. Cargo resolves only on apply.
   push --source DIR [--repo NAME] [--base mainnet-beta] [--remote origin] [--push]
         [--reviewed NAME=FULL_SHA --expected NAME=FULL_SHA ...]
   prepare-merge --source DIR --target DIR --branch TOPIC --integration NEW_DIR
@@ -147,7 +154,7 @@ Examples:
 `;
 
 type Options = Map<string, string>;
-const gitEnvironment: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+const gitEnvironment: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" };
 for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) delete gitEnvironment[key];
 function fail(message: string): never {
   throw new Error(redact(message));
@@ -505,7 +512,17 @@ function sync(root: string, options: Options): void {
 type Link = { path: string; sha: string; child: string; url: string };
 type Plan = { name: string; source: string; target: string; tip: string; base: string; remote: string; links: Link[]; baseLinks: Link[]; worktree: string; integrationBranch: string; merged: string };
 
-function links(repo: string, ref: string): Link[] {
+function canonicalGitlink(name: string, url: string): boolean {
+  let parsed: URL;
+  try {
+    const scp = /^git@([^:]+):(.+)$/.exec(url);
+    parsed = new URL(scp ? `ssh://${scp[1]}/${scp[2]}` : url);
+  } catch { return false; }
+  const path = decodeURIComponent(parsed.pathname).replace(/\/+$/, "").replace(/\.git$/i, "");
+  return parsed.hostname.toLowerCase() === "github.com" && path === `/PsyProtocol/${name}`;
+}
+
+function links(repo: string, ref: string, enforceCanonical = false): Link[] {
   const entries = git(repo, ["ls-tree", "-r", "-z", ref]).split("\0").filter(Boolean);
   const modules = new Map<string, { child: string; url: string }>();
   if (entries.some(entry => entry.endsWith("\t.gitmodules"))) {
@@ -516,6 +533,7 @@ function links(repo: string, ref: string): Link[] {
       const path = line.slice(split + 1);
       const url = git(repo, ["config", "--blob", `${ref}:.gitmodules`, "--get", key.replace(/\.path$/, ".url")]);
       const child = url.replace(/\/$/, "").split(/[/:]/).pop()!.replace(/\.git$/, "");
+      if (enforceCanonical && names.includes(child) && !canonicalGitlink(child, url)) fail(`${repo}: gitlink ${path} URL is not the canonical ${child} origin`);
       modules.set(path, { child: names.includes(child) ? child : "", url });
     }
   }
@@ -539,6 +557,172 @@ function ordered<T extends { name: string; links: Link[]; baseLinks: Link[] }>(p
     output.push(next);
   }
   return output;
+}
+
+export type PrepareFile = { path: string; sha256: string | null; mode: number | null };
+export type PrepareGitlink = { path: string; child: string; from: string; nestedHead: string };
+export type PrepareRepository = {
+  name: string; path: string; branch: string; head: string;
+  explicitPaths: string[]; ownedPaths: string[]; files: PrepareFile[];
+  gitmodulesSha256: string | null;
+  gitlinks: PrepareGitlink[];
+  cargo: { dependency: "psy-node"; from: string[] } | null;
+  nested: { path: string; head: string; branch: string; recorded: string; clean: true }[];
+};
+export type PreparePlan = { root: string; message: string; repositories: PrepareRepository[]; excluded: string[] };
+
+function prepareIndexEmpty(repo: string): void {
+  if (git(repo, ["diff", "--cached", "--name-only", "-z"]) || git(repo, ["ls-files", "--unmerged", "-z"])) fail(`${repo}: prepare requires an empty index without conflicts`);
+}
+
+function prepareLiteralPath(repo: string, path: string, gitlinks: readonly string[] = []): string {
+  if (!path || isAbsolute(path) || path.includes("\\") || path.includes("\0") || path.split("/").some(part => !part || part === "." || part === ".." || part.toLowerCase() === ".git")) fail(`${repo}: require a literal relative file path: ${JSON.stringify(path)}`);
+  const parts = path.split("/");
+  for (let i = 0; i < parts.length; i++) {
+    const current = join(repo, ...parts.slice(0, i + 1));
+    const stat = lstatSync(current, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink()) fail(`${repo}: symlink traversal is not owned: ${path}`);
+    if (i < parts.length - 1 && existsSync(join(current, ".git"))) fail(`${repo}: file belongs to a nested repository: ${path}`);
+    if (i === parts.length - 1 && stat && !stat.isFile() && !(stat.isDirectory() && gitlinks.includes(path))) fail(`${repo}: require an individual file, not a directory: ${path}`);
+  }
+  return path;
+}
+
+function prepareFile(repo: string, path: string): PrepareFile {
+  prepareLiteralPath(repo, path);
+  const stat = lstatSync(join(repo, path), { throwIfNoEntry: false });
+  return { path, sha256: stat ? createHash("sha256").update(readFileSync(join(repo, path))).digest("hex") : null, mode: stat?.mode ?? null };
+}
+
+function prepareNested(repo: string, path: string, recorded: string, snapshots: PrepareRepository["nested"]): string {
+  prepareLiteralPath(repo, path, [path]);
+  const nested = nestedCheckout(repo, path);
+  if (realpathSync(git(nested, ["rev-parse", "--show-toplevel"])) !== realpathSync(nested)) fail(`${nested}: not a nested repository root`);
+  clean(nested);
+  const revision = head(nested);
+  if (revision !== recorded) fail(`${nested}: nested HEAD ${revision} differs from recorded gitlink ${recorded}`);
+  snapshots.push({ path: nested, head: revision, branch: branch(nested), recorded, clean: true });
+  for (const link of links(nested, revision, true)) {
+    prepareNested(nested, link.path, link.sha, snapshots);
+  }
+  return revision;
+}
+
+function prepareRepositoryPath(root: string, name: string): string {
+  const canonicalRoot = realpathSync(root);
+  const path = join(canonicalRoot, name);
+  const stat = lstatSync(path);
+  if (!names.includes(name) || stat.isSymbolicLink() || !stat.isDirectory() || realpathSync(path) !== path) fail(`${name}: selected repository must be a real directory directly inside the workspace`);
+  return repository(canonicalRoot, name);
+}
+
+function prepareRepository(root: string, name: string, selectedNames: readonly string[], explicitPaths: string[]): PrepareRepository {
+  const path = prepareRepositoryPath(root, name);
+  const currentBranch = branch(path);
+  if (!currentBranch || currentBranch.startsWith("workspace-integration/")) fail(`${name}: prepare requires a checked-out non-integration branch`);
+  prepareIndexEmpty(path);
+  const revision = head(path);
+  const recordedLinks = links(path, revision, true);
+  const activeLinks = recordedLinks.filter(link => selectedNames.includes(link.child));
+  const nested: PrepareRepository["nested"] = [];
+  const gitlinks = activeLinks.map(link => ({ path: link.path, child: link.child, from: link.sha, nestedHead: prepareNested(path, link.path, link.sha, nested) }));
+  for (const owned of explicitPaths) {
+    prepareLiteralPath(path, owned, gitlinks.map(link => link.path));
+    if (recordedLinks.some(link => link.path === owned) && !activeLinks.some(link => link.path === owned)) fail(`${name}/${owned}: gitlink ownership requires selecting its mapped child repository`);
+    if (!existsSync(join(path, owned)) && !git(path, ["--literal-pathspecs", "ls-files", "-z", "--", owned]).split("\0").includes(owned)) fail(`${name}: owned file does not exist and is not tracked: ${owned}`);
+  }
+  let cargo: PrepareRepository["cargo"] = null;
+  if (name !== "psy-node" && selectedNames.includes("psy-node") && existsSync(join(path, "Cargo.toml"))) {
+    prepareLiteralPath(path, "Cargo.toml");
+    const dependencies = nodeDependencies(readFileSync(join(path, "Cargo.toml"), "utf8"));
+    if (dependencies.length) cargo = { dependency: "psy-node", from: [...new Set(dependencies.map(dep => String(dep.value.rev || dep.value.path || "unresolved")))] };
+  }
+  const automatic = [...gitlinks.map(link => link.path), ...(cargo ? ["Cargo.toml", "Cargo.lock"] : [])];
+  for (const owned of automatic) {
+    prepareLiteralPath(path, owned, gitlinks.map(link => link.path));
+    if (!explicitPaths.includes(owned) && git(path, ["--literal-pathspecs", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--", owned])) fail(`${name}/${owned}: automatically owned path is dirty; name it with --commit-path to include it`);
+  }
+  if (gitlinks.length && git(path, ["--literal-pathspecs", "status", "--porcelain=v1", "-z", "--", ".gitmodules"])) {
+    if (!explicitPaths.includes(".gitmodules")) fail(`${name}/.gitmodules: relevant mapping file is dirty; explicitly own it before prepare`);
+    prepareLiteralPath(path, ".gitmodules");
+    const recorded = git(path, ["config", "--blob", `${revision}:.gitmodules`, "--null", "--list"]);
+    const current = git(path, ["config", "--file", ".gitmodules", "--null", "--list"]);
+    if (recorded !== current) fail(`${name}: commit .gitmodules mapping changes separately before prepare`);
+  }
+  const ownedPaths = [...new Set([...explicitPaths, ...automatic])];
+  const filePaths = ownedPaths.filter(owned => !gitlinks.some(link => link.path === owned));
+  if (!filePaths.includes(".gitmodules")) filePaths.push(".gitmodules");
+  const files = filePaths.map(owned => prepareFile(path, owned));
+  return { name, path, branch: currentBranch, head: revision, explicitPaths, ownedPaths, files, gitmodulesSha256: files.find(file => file.path === ".gitmodules")!.sha256, gitlinks, cargo, nested };
+}
+
+export function buildPreparePlan(root: string, selectedNames: readonly string[], commitPaths: readonly string[], message: string): PreparePlan {
+  if (!message.trim()) fail("--message is required");
+  if (!selectedNames.length || selectedNames.some((name, index) => !names.includes(name) || selectedNames.indexOf(name) !== index)) fail("prepare requires explicit, unique known --repo selections");
+  root = realpathSync(root);
+  const ownership = new Map(selectedNames.map(name => [name, [] as string[]]));
+  for (const mapping of commitPaths) {
+    const split = mapping.indexOf("=");
+    const name = mapping.slice(0, split);
+    const path = mapping.slice(split + 1);
+    const owned = ownership.get(name);
+    if (split < 1 || !path || !owned) fail(`--commit-path requires a selected repository and literal file: ${JSON.stringify(mapping)}`);
+    if (owned.includes(path)) fail(`Duplicate --commit-path: ${JSON.stringify(mapping)}`);
+    owned.push(path);
+  }
+  const pending = new Map(selectedNames.map(name => [name, prepareRepository(root, name, selectedNames, ownership.get(name)!)]));
+  const repositories: PrepareRepository[] = [];
+  while (pending.size) {
+    const next = [...pending.values()].find(repo => [...repo.gitlinks.map(link => link.child), ...(repo.cargo ? [repo.cargo.dependency] : [])].every(dependency => !pending.has(dependency)));
+    if (!next) fail(`Preparation dependency cycle (gitlink/Cargo): ${[...pending.values()].map(repo => `${repo.name} -> ${[...repo.gitlinks.map(link => `${link.child} (gitlink)`), ...(repo.cargo ? ["psy-node (Cargo)"] : [])].join(", ")}`).join("; ")}`);
+    repositories.push(next);
+    pending.delete(next.name);
+  }
+  const plan = { root: realpathSync(root), message, repositories, excluded: names.filter(name => !selectedNames.includes(name)) };
+  assertPreparePlanUnchanged(plan);
+  return plan;
+}
+
+export function assertPreparePlanUnchanged(plan: PreparePlan): void {
+  for (const repo of plan.repositories) {
+    if (prepareRepositoryPath(plan.root, repo.name) !== repo.path) fail(`${repo.name}: selected repository location changed since preparation preview`);
+    if (branch(repo.path) !== repo.branch || head(repo.path) !== repo.head) fail(`${repo.name}: branch or HEAD changed since preparation preview`);
+    prepareIndexEmpty(repo.path);
+    for (const file of repo.files) {
+      if (JSON.stringify(prepareFile(repo.path, file.path)) !== JSON.stringify(file)) fail(`${repo.name}/${file.path}: owned file changed since preparation preview`);
+    }
+    for (const link of repo.gitlinks) {
+      if (indexGitlink(repo.path, link.path) !== link.from) fail(`${repo.name}/${link.path}: gitlink changed since preparation preview`);
+    }
+    for (const nested of repo.nested) {
+      const nestedPath = relative(repo.path, nested.path);
+      if (!nestedPath || isAbsolute(nestedPath) || nestedPath.split("/").includes("..")) fail(`${nested.path}: nested checkout escaped its selected repository`);
+      let current = repo.path;
+      for (const component of nestedPath.split("/")) {
+        current = join(current, component);
+        const stat = lstatSync(current);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) fail(`${nested.path}: nested checkout path changed since preparation preview`);
+      }
+      if (head(nested.path) !== nested.head || branch(nested.path) !== nested.branch) fail(`${nested.path}: nested checkout changed since preparation preview`);
+      clean(nested.path);
+    }
+  }
+}
+
+export function printPreparePlan(plan: PreparePlan): void {
+  console.log(`prepare: ${plan.repositories.map(repo => repo.name).join(" -> ")}`);
+  for (const repo of plan.repositories) {
+    console.log(`${repo.name}: branch ${repo.branch}, frozen HEAD ${repo.head}`);
+    console.log(`  owned paths: ${repo.ownedPaths.map(path => JSON.stringify(path)).join(", ") || "(none; skip empty commit)"}`);
+    for (const link of repo.gitlinks) console.log(`  gitlink ${JSON.stringify(link.path)}: ${link.from} -> prepared ${link.child} commit`);
+    if (repo.cargo) {
+      console.log(`  Cargo: ${repo.cargo.from.join(", ")} -> prepared psy-node commit (canonical Git source)`);
+      console.log("  apply-time resolution: cargo metadata --format-version 1; cargo metadata --format-version 1 --locked");
+    }
+    console.log("  stage only owned paths; commit once if changed");
+  }
+  console.log(`Outside preparation (untouched, not automatically updated): ${plan.excluded.join(", ") || "none"}`);
+  console.log("Preview performs no writes, fetches or Cargo resolution; final child hashes and lock deltas are determined on apply. No push or npm version change.");
 }
 
 function merge(root: string, options: Options): void {
@@ -679,6 +863,7 @@ const commandSpecs: Record<string, CommandSpec> = {
   create: { valued: ["source", "destination", "branch", "base"], flags: [], paths: false, sourceDefault: false, required: ["source", "destination", "branch"] },
   "gitlinks sync": { valued: ["source", "base"], flags: [], paths: false, sourceDefault: true, required: [] },
   commit: { valued: ["source", "repo", "message", "base"], flags: ["staged"], paths: true, sourceDefault: false, required: ["source", "repo", "message"] },
+  prepare: { valued: ["source", "repo", "commit-path", "message"], flags: ["apply"], paths: false, sourceDefault: false, required: ["source", "repo", "message"] },
   push: { valued: ["source", "repo", "base", "remote", "reviewed", "expected"], flags: ["push"], paths: false, sourceDefault: false, required: ["source"] },
   "prepare-merge": { valued: ["source", "target", "branch", "integration", "base", "remote", "message"], flags: ["push"], paths: false, sourceDefault: false, required: ["source", "target", "branch", "integration"] },
   "deps show": { valued: ["source"], flags: [], paths: false, sourceDefault: true, required: [] },
@@ -691,7 +876,7 @@ const commandSpecs: Record<string, CommandSpec> = {
   "packages publish": { valued: ["source", "out", "version", "tag"], flags: [], paths: false, sourceDefault: false, required: ["source", "out", "version", "tag"] },
 };
 
-function parseInvocation(argv: string[]): { command: string; options: Options; paths: string[] } {
+export function parseInvocation(argv: string[]): { command: string; options: Options; paths: string[]; commitPaths: string[] } {
   const args = [...argv];
   let command: string;
   if (args[0] && !args[0].startsWith("--") && commandGroups[args[0]]) {
@@ -708,6 +893,7 @@ function parseInvocation(argv: string[]): { command: string; options: Options; p
   const allowed = [...spec.valued, ...spec.flags];
   const options: Options = new Map();
   let paths: string[] = [];
+  const commitPaths: string[] = [];
   while (args.length) {
     const arg = args.shift()!;
     if (arg === "--" && spec.paths) { paths = args.splice(0); break; }
@@ -716,18 +902,19 @@ function parseInvocation(argv: string[]): { command: string; options: Options; p
     if (spec.flags.includes(key)) { options.set(key, "true"); continue; }
     const value = args.shift();
     if (!value || value.startsWith("--")) fail(`Missing value for ${arg}`);
+    if (key === "commit-path") { commitPaths.push(value); continue; }
     if (key === "reviewed" || key === "expected") options.set(key, [options.get(key), value].filter(Boolean).join(","));
     else if (key === "repo") options.set(key, [options.get(key), value].filter(Boolean).join(","));
     else if (options.has(key)) fail(`Unexpected or duplicate option: ${arg}`);
     else options.set(key, value);
   }
-  return { command, options, paths };
+  return { command, options, paths, commitPaths };
 }
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.includes("--help") || args[0] === "help") { console.log(help); return; }
-  const { command, options, paths } = parseInvocation(args);
+  const { command, options, paths, commitPaths } = parseInvocation(args);
   if ((command === "deps use-local" || command === "deps use-npm-version") && options.has("install") && !options.has("apply")) fail("--install requires --apply");
   for (const name of commandSpecs[command].required) required(options, name);
   const root = resolve(commandSpecs[command].sourceDefault ? options.get("source") || join(import.meta.dir, "../..") : required(options, "source"));
@@ -737,6 +924,16 @@ async function main(): Promise<void> {
     await createWorkspace({ source: root, destination: resolve(required(options, "destination")), branch: required(options, "branch"), base: options.get("base") || "mainnet-beta" });
   } else if (command === "gitlinks sync") sync(root, options);
   else if (command === "commit") commit(root, options, paths);
+  else if (command === "prepare") {
+    const plan = buildPreparePlan(root, required(options, "repo").split(","), commitPaths, required(options, "message"));
+    printPreparePlan(plan);
+    if (options.has("apply")) {
+      assertPreparePlanUnchanged(plan);
+      const result = await applyPreparation(plan);
+      for (const commit of result.commits) console.log(`${commit.name}: prepared ${commit.from} -> ${commit.to}`);
+      for (const name of result.skipped) console.log(`${name}: unchanged; no commit`);
+    }
+  }
   else if (command === "push") push(root, options);
   else if (command === "prepare-merge") merge(root, options);
   else if (command === "deps show" || command === "deps check") {
@@ -763,4 +960,4 @@ async function main(): Promise<void> {
   } else fail(`Unknown command: ${command}`);
 }
 
-main().catch(error => { console.error(`workspace: ${redact(error instanceof Error ? error.message : String(error))}`); process.exitCode = 1; });
+if (import.meta.main) main().catch(error => { console.error(`workspace: ${redact(error instanceof Error ? error.message : String(error))}`); process.exitCode = 1; });

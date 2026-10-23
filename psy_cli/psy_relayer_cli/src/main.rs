@@ -36,6 +36,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Offline, in-place schema-2 to schema-3 journal migration; stop all guardians and the relayer first.
+    MigrateGuardianJournals {
+        #[arg(long)]
+        rpc_config: PathBuf,
+        #[arg(long)]
+        guardian_root: PathBuf,
+        /// Local deployment document. Repeated flags replace the network `l1_config_url`.
+        #[arg(long = "l1-config")]
+        l1_config: Vec<PathBuf>,
+    },
     /// Run one independently verifying guardian signer from the canonical network config.
     GuardianService {
         #[arg(long)]
@@ -197,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => run_bridge_daemon(cli.config, cli.l1_config).await,
+        Some(Commands::MigrateGuardianJournals { rpc_config, guardian_root, l1_config }) => migrate_guardian_journals(&rpc_config, &guardian_root, &l1_config).await,
         Some(Commands::GuardianService { rpc_config, guardian_root, guardian_id, l1_config }) => guardian::service::run(&rpc_config, &guardian_root, &l1_config, guardian_id).await.map_err(Into::into),
         Some(Commands::GuardianPolicy { rpc_config, guardian_root, intent, exclusive_registration_intake, next_members_json, l1_config }) => match intent {
             GuardianPolicyIntent::Register => {
@@ -268,6 +279,52 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::ComputeDepositLeaf(args)) => bridge::compute_deposit_leaf::run(args),
         Some(Commands::RegenerateGroth16Keystore(args)) => bridge::regen_groth16_keystore::run(args),
     }
+}
+
+async fn migrate_guardian_journals(rpc_config: &Path, guardian_root: &Path, l1_config: &[PathBuf]) -> anyhow::Result<()> {
+    let config = guardian_common::protocol::GuardianConfig::load(rpc_config, guardian_root, l1_config).await
+        .map_err(|_| anyhow!("migration configuration rejected; configuration was not changed"))?;
+    // Keep every backend lock alive until the command returns: no migration starts
+    // if any of the four journals still has a live owner.
+    let names = ["guardian-1.redb", "guardian-2.redb", "guardian-3.redb", "relayer.redb"];
+    let databases = names.iter().map(|name| open_migration_database(&config.guardian_root, name))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let public_keys = databases[..3].iter().enumerate().map(|(index, db)| {
+        migration_signer(db).map_err(|_| anyhow!("{}: existing signer singleton unavailable or invalid", names[index]))
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    for (index, public_key) in public_keys.into_iter().enumerate() {
+        let counts = guardian_common::db::migrate_guardian_journal(&databases[index], public_key, &config)
+            .map_err(|_| anyhow!("{}: migration rejected; this database may already be committed and earlier database commits remain; inspect the journal and rerun migration, which validates an existing schema 3", names[index]))?;
+        println!("database={} schema=3 signed_rows={} session_rows={} rewritten={}", names[index], counts.signed, counts.sessions, counts.rewritten);
+    }
+    let requests = bridge::guardian_client::migrate_relayer_journal(&databases[3], &config)
+        .map_err(|_| anyhow!("relayer.redb: migration rejected; this database may already be committed and earlier database commits remain; inspect the journal and rerun migration, which validates an existing schema 3"))?;
+    println!("database=relayer.redb schema=3 request_rows={requests}");
+    Ok(())
+}
+
+fn migration_signer(db: &redb::Database) -> anyhow::Result<[u8; 33]> {
+    use redb::ReadableTableMetadata;
+    let tx = db.begin_read()?;
+    let signer = tx.open_table(redb::TableDefinition::<(), [u8; 33]>::new("guardian_signer"))?;
+    anyhow::ensure!(signer.len()? == 1, "invalid signer singleton");
+    let key = signer.get(())?.ok_or_else(|| anyhow!("missing signer singleton"))?.value();
+    psy_crypto::signature::secp256k1::wallet::validate_compressed_secp256k1_public_key(
+        psy_client_common::data::secp256k1::CompressedPublicKey(key),
+    ).map_err(|_| anyhow!("invalid retained signer"))?;
+    // This preserves the existing identity; it does not prove key possession.
+    Ok(key)
+}
+
+fn open_migration_database(root: &Path, name: &str) -> anyhow::Result<redb::Database> {
+    use std::os::unix::fs::FileExt;
+    let file = guardian_common::runtime::open_db_file(root, &Path::new("db").join(name))
+        .map_err(|_| anyhow!("{name}: protected existing journal unavailable; no file was created"))?;
+    let mut magic = [0u8; 9];
+    file.read_exact_at(&mut magic, 0).map_err(|_| anyhow!("{name}: existing journal header unavailable"))?;
+    anyhow::ensure!(magic == [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A], "{name}: existing journal is not a redb database");
+    redb::Database::builder().create_file(file)
+        .map_err(|_| anyhow!("{name}: exclusive database open failed; stop all guardians and the relayer before migration"))
 }
 
 async fn run_bridge_daemon(config: PathBuf, l1_config: Vec<PathBuf>) -> anyhow::Result<()> {
