@@ -4236,6 +4236,31 @@ async function resetScopedDevnetState(cwd: string, targets: ScopedDevnetReset): 
     if (targets.volumes.length > 0) await runBoundedTeardown("fresh-volume-rm", ["docker", "volume", "rm", "-f", ...targets.volumes], undefined, failures);
     if (failures.length > 0) throw new Error(`[DevNet] fresh startup namespace cleanup failed: ${failures.join(" | ")}`);
 }
+/** Supplied path must already be a non-symlink regular file; the returned path is canonical. */
+export async function resolveScyllaIoProperties(value: string | undefined): Promise<string | undefined> {
+    const supplied = value?.trim();
+    if (!supplied) return undefined;
+    let suppliedStat: fs.Stats;
+    try {
+        suppliedStat = await fs.promises.lstat(supplied);
+    } catch {
+        throw new Error(`[DevNet] SCYLLA_IO_PROPERTIES must be an existing non-symlink regular file, received '${supplied}'`);
+    }
+    if (!suppliedStat.isFile() || suppliedStat.isSymbolicLink()) {
+        throw new Error(`[DevNet] SCYLLA_IO_PROPERTIES must be an existing non-symlink regular file, received '${supplied}'`);
+    }
+    let canonical: string;
+    try {
+        canonical = await fs.promises.realpath(path.resolve(supplied));
+    } catch {
+        throw new Error(`[DevNet] SCYLLA_IO_PROPERTIES must be an existing non-symlink regular file, received '${supplied}'`);
+    }
+    if (canonical.includes(":")) {
+        throw new Error(`[DevNet] SCYLLA_IO_PROPERTIES absolute path must not contain ':', received '${supplied}'`);
+    }
+    return canonical;
+}
+
 
 function daemonConfigError(field: string): Error {
     return new Error(`[DevNet] PSY_BRIDGE_DAEMON_CONFIG: invalid or unavailable ${field}; operator provisioning required`);
@@ -6166,6 +6191,7 @@ export class DevNetProcessManager {
             await loadBridgeRelayerSigner(cwd);
         }
         const names = await this.admitNamespace(cwd);
+        if (this.needsStartDb) await resolveScyllaIoProperties(this.getEnv().SCYLLA_IO_PROPERTIES);
         if (startAll && daemonConfigPath) {
             const daemon = Bun.TOML.parse(await fs.promises.readFile(daemonConfigPath, "utf8"));
             const guardianRoot = await resolveGuardianRoot(cwd, daemon.guardian_root as string);
@@ -7062,6 +7088,8 @@ export class DevNetProcessManager {
             "--write-request-timeout-in-ms", scyllaWriteTimeout,
             "--memory", resolveScyllaMemory(env.SCYLLA_MEMORY),
         ];
+        const scyllaIoProperties = await resolveScyllaIoProperties(env.SCYLLA_IO_PROPERTIES);
+        if (scyllaIoProperties) scyllaCommand.push("--io-properties-file", "/etc/scylla.d/io_properties.yaml");
         if (!runtimeResources.scyllaCpuSet) {
             scyllaCommand.push("--overprovisioned", "1");
         }
@@ -7111,14 +7139,15 @@ export class DevNetProcessManager {
             };
 
             services["scylla-server"] = {
-                image: "scylladb/scylla:latest",
+                image: "scylladb/scylla@sha256:43a600f5291e55f1239dd94680c95d2b8a8be11bc0d73ced062031c978c155ca",
                 container_name: names.containers.scylla,
                 ports: ["9042:9042"],
                 cap_add: ["PERFMON"],
                 ...(runtimeResources.scyllaCpuSet ? { cpuset: runtimeResources.scyllaCpuSet } : {}),
                 volumes: [
                     `${names.volumes.scylla}:/var/lib/scylla`,
-                    `${names.volumes.scyllaData}:/run/udev/data`
+                    `${names.volumes.scyllaData}:/run/udev/data`,
+                    ...(scyllaIoProperties ? [`${scyllaIoProperties}:/etc/scylla.d/io_properties.yaml:ro`] : []),
                 ],
                 command: scyllaCommand,
                 healthcheck: {
@@ -7834,6 +7863,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    - SCYLLA_MEMORY=<size>      Scylla Seastar memory budget, for example 8G
    - SCYLLA_CAS_CONTENTION_TIMEOUT_MS=<ms>  LWT contention timeout (default: 10000)
    - SCYLLA_WRITE_REQUEST_TIMEOUT_MS=<ms>   write timeout (default: 10000)
+   - SCYLLA_IO_PROPERTIES=<file> optional regular file; resolved to an absolute path before launch and mounted read-only at /etc/scylla.d/io_properties.yaml (unset: unchanged; ':' rejected)
    - PSY_WORKER_BATCH_SIZE=<n> Concurrent jobs per worker (default: 2)
    - RAYON_NUM_THREADS=<n>     Rayon threads per proving process (default: auto, max 4)
    - Linux full-devnet/--db launches auto-partition complete physical cores; macOS uses concurrency limits without affinity
