@@ -131,7 +131,21 @@ cargo run --release -p psy_bridge_reader_core --example reader_bench -- \
 - To find saturation, keep raising the rate: `--rates 20000,25000,30000,...`
   until a step is invalid or the Reader's errors/latency climb. The bench
   raises its open-files soft limit to the hard limit and warns if that is
-  under 4x `--concurrency-cap`. Pin it away from the Reader (`taskset`).
+  under 4x `--concurrency-cap`. Pin it away from the Reader (`taskset`), and
+  away from the SMT siblings of the Reader's CPUs too
+  (`/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`; on a
+  16-core/32-thread host CPU `n` and `n+16` share a core, so a Reader on 26-29
+  shares cores with 10-13).
+- `--reader-pid <pid>` (Reader on the same host): every second of a step
+  records under `host.per_second` the Reader's CPU, its threads' run-queue
+  wait (`schedstat`), `foreign_cpu_cores` (busy cores on the Reader's allowed
+  CPUs that the Reader did not use) and `sibling_busy_cores` (load on the SMT
+  siblings of those CPUs). A step where another process used more than
+  `--max-foreign-cores` (default 0.5) of the Reader's CPUs in any second is
+  invalid: an unpinned process on a shared host can stall the Reader's lanes
+  (first the 4-slot `claim_proof` lane) and must not be read as a Reader
+  result. The bench warns when its own CPUs include the Reader's CPUs or
+  their siblings.
 - Mix `A4` (by request count): 70% `by-address`, 10% `by-tx`, 10%
   `withdrawal-claims` (10 nullifiers), 5% `tree/root`, 5% `tree/proof`; or
   `--mix by_address=70,by_tx=10,claims=10,root=5,proof=5`. `by-address` limits

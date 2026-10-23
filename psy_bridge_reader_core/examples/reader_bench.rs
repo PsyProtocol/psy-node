@@ -70,6 +70,15 @@ struct Args {
     seed: u64,
     #[arg(long, default_value_t = 10_000)]
     timeout_ms: u64,
+    /// PID of the Reader, when it runs on this host. Every second of a step
+    /// then records the Reader's CPU, its threads' run-queue wait, other load
+    /// on the CPUs it may run on and load on their SMT siblings.
+    #[arg(long)]
+    reader_pid: Option<u32>,
+    /// With `--reader-pid`, a step in which other processes used more than
+    /// this many cores of the Reader's CPUs in any second is invalid.
+    #[arg(long, default_value_t = 0.5)]
+    max_foreign_cores: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -249,11 +258,13 @@ struct StepReport {
     send_lag: Pct,
     /// Scheduler emit time minus due time (before the request task starts).
     emit_lag: Pct,
+    /// With `--reader-pid`: load on and around the Reader's CPUs.
+    host: Option<HostReport>,
     valid: bool,
     invalid_reasons: Vec<String>,
 }
 
-fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, peak_inflight: u64, mut st: StepStats) -> StepReport {
+fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, peak_inflight: u64, mut st: StepStats, host: Option<HostReport>) -> StepReport {
     let mut endpoints = BTreeMap::new();
     for e in Endpoint::ALL {
         let i = e.index();
@@ -301,6 +312,12 @@ fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, p
     if let Some(c) = st.errors.get("cap") {
         reasons.push(format!("{c} requests hit the concurrency cap"));
     }
+    if let Some(h) = host.as_ref().filter(|h| h.max_foreign_cpu_cores > h.max_foreign_cores_allowed) {
+        reasons.push(format!(
+            "other processes used up to {:.2} cores of the Reader's CPUs (limit {:.2})",
+            h.max_foreign_cpu_cores, h.max_foreign_cores_allowed
+        ));
+    }
     let secs = window.as_secs_f64().max(1e-9);
     StepReport {
         rate,
@@ -319,6 +336,7 @@ fn build_report(rate: u64, step_secs: u64, window: Duration, cpu_seconds: f64, p
         generator_cpu_cores: cpu_seconds / secs,
         send_lag,
         emit_lag,
+        host,
         valid: reasons.is_empty(),
         invalid_reasons: reasons,
     }
@@ -339,6 +357,171 @@ fn process_cpu_seconds() -> f64 {
 fn clock_ticks_per_sec() -> f64 {
     // Linux USER_HZ is 100 on every supported platform.
     100.0
+}
+
+// ---------------------------------------------------------------- host load
+
+/// Parses a kernel CPU list such as `0-3,8,10-11`.
+fn parse_cpulist(s: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        let (a, b): (usize, usize) = (a.parse().map_err(|_| format!("bad cpu list {s:?}"))?, b.parse().map_err(|_| format!("bad cpu list {s:?}"))?);
+        if a > b {
+            return Err(format!("bad cpu list {s:?}"));
+        }
+        out.extend(a..=b);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// `Cpus_allowed_list` of `/proc/<pid>/status` (`self` for this process).
+fn allowed_cpus(pid: &str) -> Result<Vec<usize>, String> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).map_err(|e| format!("/proc/{pid}/status: {e}"))?;
+    let line = status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:")).ok_or_else(|| format!("/proc/{pid}/status has no Cpus_allowed_list"))?;
+    parse_cpulist(line)
+}
+
+/// SMT siblings of `cpus` that are not in `cpus` themselves.
+fn smt_siblings(cpus: &[usize]) -> Vec<usize> {
+    let mut out: Vec<usize> = cpus
+        .iter()
+        .filter_map(|c| std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")).ok())
+        .filter_map(|s| parse_cpulist(&s).ok())
+        .flatten()
+        .filter(|s| !cpus.contains(s))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Cumulative counters read at one instant.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct HostSnap {
+    /// utime + stime of the Reader, in clock ticks.
+    reader_ticks: u64,
+    /// Sum of the Reader threads' run-queue wait (`schedstat` field 2), in ns.
+    runq_wait_ns: u64,
+    /// (busy, total) jiffies of each of the Reader's CPUs, then of each sibling.
+    cpus: Vec<(u64, u64)>,
+    siblings: Vec<(u64, u64)>,
+}
+
+/// One second of host load around the Reader.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+struct HostSecond {
+    second: usize,
+    reader_cpu_cores: f64,
+    /// Seconds per second that Reader threads were runnable but not running.
+    reader_runq_wait: f64,
+    /// Busy cores on the Reader's CPUs that the Reader did not use.
+    foreign_cpu_cores: f64,
+    /// Busy cores on the SMT siblings of the Reader's CPUs (any process,
+    /// including this bench if it runs there).
+    sibling_busy_cores: f64,
+}
+
+#[derive(Serialize)]
+struct HostReport {
+    reader_pid: u32,
+    reader_cpus: String,
+    sibling_cpus: String,
+    max_foreign_cores_allowed: f64,
+    max_foreign_cpu_cores: f64,
+    max_reader_runq_wait: f64,
+    max_sibling_busy_cores: f64,
+    mean_reader_cpu_cores: f64,
+    per_second: Vec<HostSecond>,
+}
+
+fn busy_cores(a: &[(u64, u64)], b: &[(u64, u64)]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| y.0.saturating_sub(x.0) as f64 / (y.1.saturating_sub(x.1).max(1)) as f64).sum()
+}
+
+fn host_second(second: usize, a: &HostSnap, b: &HostSnap, secs: f64) -> HostSecond {
+    let reader = b.reader_ticks.saturating_sub(a.reader_ticks) as f64 / clock_ticks_per_sec() / secs;
+    HostSecond {
+        second,
+        reader_cpu_cores: reader,
+        reader_runq_wait: b.runq_wait_ns.saturating_sub(a.runq_wait_ns) as f64 / 1e9 / secs,
+        foreign_cpu_cores: (busy_cores(&a.cpus, &b.cpus) - reader).max(0.0),
+        sibling_busy_cores: busy_cores(&a.siblings, &b.siblings),
+    }
+}
+
+struct HostProbe {
+    pid: u32,
+    cpus: Vec<usize>,
+    siblings: Vec<usize>,
+}
+
+impl HostProbe {
+    fn new(pid: u32) -> Result<HostProbe, String> {
+        let cpus = allowed_cpus(&pid.to_string())?;
+        let siblings = smt_siblings(&cpus);
+        Ok(HostProbe { pid, cpus, siblings })
+    }
+
+    fn snap(&self) -> Option<HostSnap> {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
+        let f: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        let reader_ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
+        let mut runq_wait_ns = 0;
+        for task in std::fs::read_dir(format!("/proc/{}/task", self.pid)).ok()?.flatten() {
+            let s = std::fs::read_to_string(task.path().join("schedstat")).unwrap_or_default();
+            runq_wait_ns += s.split_whitespace().nth(1).and_then(|w| w.parse::<u64>().ok()).unwrap_or(0);
+        }
+        let mut per_cpu = BTreeMap::new();
+        for line in std::fs::read_to_string("/proc/stat").ok()?.lines() {
+            let mut it = line.split_whitespace();
+            let Some(cpu) = it.next().and_then(|n| n.strip_prefix("cpu")).and_then(|n| n.parse::<usize>().ok()) else { continue };
+            // user nice system idle iowait irq softirq steal; guest time is already in user/nice.
+            let v: Vec<u64> = it.take(8).filter_map(|x| x.parse().ok()).collect();
+            let total: u64 = v.iter().sum();
+            let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
+            per_cpu.insert(cpu, (total - idle, total));
+        }
+        let pick = |cs: &[usize]| cs.iter().map(|c| per_cpu.get(c).copied().unwrap_or_default()).collect();
+        Some(HostSnap { reader_ticks, runq_wait_ns, cpus: pick(&self.cpus), siblings: pick(&self.siblings) })
+    }
+
+    /// Samples once per second from `start` until `stop` is set.
+    fn spawn(self: Arc<Self>, start: std::time::Instant, stop: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<Vec<HostSecond>> {
+        std::thread::spawn(move || {
+            std::thread::sleep(start.saturating_duration_since(std::time::Instant::now()));
+            let mut out = Vec::new();
+            let (mut prev, mut prev_at) = (self.snap(), std::time::Instant::now());
+            while !stop.load(Ordering::Relaxed) {
+                let next = start + Duration::from_secs(out.len() as u64 + 1);
+                std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+                let (now, at) = (self.snap(), std::time::Instant::now());
+                if let (Some(a), Some(b)) = (&prev, &now) {
+                    out.push(host_second(out.len(), a, b, at.duration_since(prev_at).as_secs_f64()));
+                }
+                (prev, prev_at) = (now, at);
+            }
+            out
+        })
+    }
+
+    fn report(&self, per_second: Vec<HostSecond>, allowed: f64) -> HostReport {
+        let max = |f: fn(&HostSecond) -> f64| per_second.iter().map(f).fold(0.0, f64::max);
+        let fmt = |cs: &[usize]| cs.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
+        HostReport {
+            reader_pid: self.pid,
+            reader_cpus: fmt(&self.cpus),
+            sibling_cpus: fmt(&self.siblings),
+            max_foreign_cores_allowed: allowed,
+            max_foreign_cpu_cores: max(|s| s.foreign_cpu_cores),
+            max_reader_runq_wait: max(|s| s.reader_runq_wait),
+            max_sibling_busy_cores: max(|s| s.sibling_busy_cores),
+            mean_reader_cpu_cores: per_second.iter().map(|s| s.reader_cpu_cores).sum::<f64>() / per_second.len().max(1) as f64,
+            per_second,
+        }
+    }
 }
 
 // ------------------------------------------------------------------ requests
@@ -566,7 +749,7 @@ async fn load_dataset(sh: &Shared, base: &str, from: &str) -> Result<Dataset, St
     Ok(d)
 }
 
-async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u64, cap: usize) -> StepReport {
+async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u64, cap: usize, probe: Option<(&Arc<HostProbe>, f64)>) -> StepReport {
     {
         let mut st = sh.stats.lock().unwrap();
         *st = StepStats::default();
@@ -576,6 +759,8 @@ async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u
     sh.peak_inflight.store(0, Ordering::Relaxed);
     let count = rate * step_secs;
     let start = Instant::now() + Duration::from_millis(50);
+    let host_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let host_thread = probe.map(|(p, _)| p.clone().spawn(start.into_std(), host_stop.clone()));
     let cpu0 = process_cpu_seconds();
     let mut cpu_start = cpu0;
     let mut sent = 0u64;
@@ -612,6 +797,11 @@ async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u
     let window = Instant::now().saturating_duration_since(start);
     let cpu = process_cpu_seconds() - cpu_start;
     let peak = sh.peak_inflight.load(Ordering::Relaxed);
+    host_stop.store(true, Ordering::Relaxed);
+    let host = match (probe, host_thread) {
+        (Some((p, allowed)), Some(t)) => Some(p.report(t.join().unwrap_or_default(), allowed)),
+        _ => None,
+    };
     // Drain in-flight requests (bounded by the request timeout).
     let drain_until = Instant::now() + sh.timeout + Duration::from_secs(1);
     while sh.inflight.load(Ordering::Relaxed) > 0 && Instant::now() < drain_until {
@@ -630,7 +820,7 @@ async fn run_step(sh: &Arc<Shared>, picker: &mut Picker, rate: u64, step_secs: u
     if capped > 0 {
         st.errors.insert("cap".to_owned(), capped);
     }
-    build_report(rate, step_secs, window, cpu, peak, st)
+    build_report(rate, step_secs, window, cpu, peak, st, host)
 }
 
 /// Raises the soft open-files limit to the hard limit; returns the new soft limit.
@@ -700,11 +890,20 @@ async fn real_main(args: Args) -> Result<(), String> {
         data.tx_hashes.len(),
         data.nullifiers.len()
     );
+    let probe = args.reader_pid.map(HostProbe::new).transpose()?.map(Arc::new);
+    let bench_cpus = allowed_cpus("self").unwrap_or_default();
+    if let Some(p) = &probe {
+        let shared: Vec<usize> = bench_cpus.iter().copied().filter(|c| p.cpus.contains(c) || p.siblings.contains(c)).collect();
+        if !shared.is_empty() {
+            eprintln!("warning: the bench may run on CPUs {shared:?}, which are the Reader's CPUs or their SMT siblings");
+        }
+        eprintln!("reader pid {}: cpus {:?}, smt siblings {:?}", p.pid, p.cpus, p.siblings);
+    }
     let mut picker = Picker::new(&args.url, data.clone(), weights, args.seed);
     let mut steps = Vec::new();
     for rate in rates {
         eprintln!("step: {rate} req/s for {} s", args.step_secs);
-        let report = run_step(&sh, &mut picker, rate, args.step_secs, args.concurrency_cap).await;
+        let report = run_step(&sh, &mut picker, rate, args.step_secs, args.concurrency_cap, probe.as_ref().map(|p| (p, args.max_foreign_cores))).await;
         eprintln!(
             "  sent={} ok={} errors={:?} throughput={:.0}/s send_lag_p99={}us valid={}",
             report.sent, report.ok, report.errors, report.throughput_ok_per_s, report.send_lag.p99_us, report.valid
@@ -720,6 +919,8 @@ async fn real_main(args: Args) -> Result<(), String> {
                 "started_unix": started_unix,
                 "git_sha": git_sha(),
                 "nofile_soft_limit": nofile,
+                "bench_cpus": bench_cpus.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","),
+                "reader_pid": args.reader_pid,
             },
             "mix": args.mix,
             "seed": args.seed,
@@ -802,7 +1003,7 @@ mod tests {
                 st.send_lag_us.push(send_lag);
                 st.lag_us.push(0);
             }
-            build_report(50, 2, Duration::from_secs(2), 0.5, 7, st)
+            build_report(50, 2, Duration::from_secs(2), 0.5, 7, st, None)
         };
         let good = mk(100);
         assert!(good.valid && good.per_second.len() == 2);
@@ -810,6 +1011,40 @@ mod tests {
         assert!((good.throughput_ok_per_s - 50.0).abs() < 1e-9);
         let bad = mk(LAG_P99_LIMIT_US + 1);
         assert!(!bad.valid && bad.invalid_reasons[0].contains("send lag"));
+    }
+
+    #[test]
+    fn cpu_lists_parse() {
+        assert_eq!(parse_cpulist("26-29\n").unwrap(), vec![26, 27, 28, 29]);
+        assert_eq!(parse_cpulist("0-1,8,10-11").unwrap(), vec![0, 1, 8, 10, 11]);
+        assert_eq!(parse_cpulist("3").unwrap(), vec![3]);
+        assert!(parse_cpulist("4-2").is_err());
+        assert!(parse_cpulist("x").is_err());
+    }
+
+    #[test]
+    fn foreign_load_on_the_reader_cpus_invalidates_the_step() {
+        // Two Reader CPUs at 100 ticks/s: both fully busy, the Reader used
+        // 0.5 core, so 1.5 cores were someone else's; its threads waited 2 s/s.
+        let a = HostSnap { reader_ticks: 1000, runq_wait_ns: 0, cpus: vec![(0, 0), (0, 0)], siblings: vec![(0, 0)] };
+        let b = HostSnap { reader_ticks: 1050, runq_wait_ns: 2_000_000_000, cpus: vec![(100, 100), (100, 100)], siblings: vec![(25, 100)] };
+        let s = host_second(0, &a, &b, 1.0);
+        assert_eq!(s, HostSecond { second: 0, reader_cpu_cores: 0.5, reader_runq_wait: 2.0, foreign_cpu_cores: 1.5, sibling_busy_cores: 0.25 });
+        // The Reader's own load is never foreign.
+        let quiet = HostSnap { reader_ticks: 1100, cpus: vec![(50, 100), (50, 100)], ..a.clone() };
+        assert_eq!(host_second(0, &a, &quiet, 1.0).foreign_cpu_cores, 0.0);
+
+        let probe = HostProbe { pid: 1, cpus: vec![26, 27], siblings: vec![10, 11] };
+        let report = |per_second: Vec<HostSecond>| {
+            let mut st = StepStats::default();
+            st.secs = vec![SecStats::default()];
+            build_report(1, 1, Duration::from_secs(1), 0.0, 0, st, Some(probe.report(per_second, 0.5)))
+        };
+        let contended = report(vec![s.clone()]);
+        assert!(!contended.valid && contended.invalid_reasons[0].contains("1.50 cores"));
+        let h = contended.host.as_ref().unwrap();
+        assert_eq!((h.reader_cpus.as_str(), h.sibling_cpus.as_str(), h.max_reader_runq_wait), ("26,27", "10,11", 2.0));
+        assert!(report(vec![host_second(0, &a, &quiet, 1.0)]).valid);
     }
 
     #[test]
