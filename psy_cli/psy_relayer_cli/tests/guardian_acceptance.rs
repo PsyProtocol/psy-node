@@ -1024,7 +1024,7 @@ async fn run_user_operation(fixture: &Fixture, operation: &str) -> anyhow::Resul
     let l1_password = String::from_utf8(read(&fixture.path("l1_password_path")?)?).map_err(|_| anyhow::anyhow!("L1 password rejected"))?;
     let l1 = Wallet::load_encrypted_keystore(&fixture.path("l1_keystore_path")?, l1_password.trim()).map_err(|_| anyhow::anyhow!("L1 keystore rejected"))?;
     let claimant_password = String::from_utf8(read(&fixture.path("claimant_password_path")?)?).map_err(|_| anyhow::anyhow!("claimant password rejected"))?;
-    let wallet = psy_client_common::args::WalletSourceArgs { sign_type: psy_client_common::args::SignType::ZKSign, private_key: None, keystore_path: Some(fixture.path("claimant_keystore_path")?.display().to_string()), wallet_password: Some(claimant_password.trim().to_string()), fingerprint: None, sd_key_allowed_contract_id: Vec::new(), sd_key_allowed_method_id: Vec::new(), sd_key_expected_tx_count: 2 };
+    let wallet = psy_client_common::args::WalletSourceArgs { sign_type: psy_client_common::args::SignType::ZKSign, private_key: None, keystore_path: Some(fixture.path("claimant_keystore_path")?.display().to_string()), wallet_password: Some(claimant_password.trim().to_string()), fingerprint: None, sd_key_allowed_contract_id: Vec::new(), sd_key_allowed_method_id: Vec::new(), sd_key_min_tx_count: Some(2), sd_key_max_tx_count: Some(2), sd_key_definition: None };
     match operation {
         "deposit" => {
             let result = psy_user_cli::subcommand::deposit::run(psy_user_cli::subcommand::args::DepositArgs {

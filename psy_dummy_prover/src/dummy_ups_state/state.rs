@@ -39,7 +39,6 @@ pub struct DummyUPSStateBuilder<
     pub contract_state_dmps: HashMap<u32, Vec<DeltaMerkleProofCore<Hash>>>,
     pub start_user_leaf: PQEDUserLeaf<F, Hash>,
     pub public_key: PZKPublicKeyInfo<Hash>,
-    pub slots_modified: u64,
     pub pending_writes: Vec<(u32, u64, Hash)>,
     pub is_first_tx: bool,
 }
@@ -82,7 +81,6 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
             checkpoint_root_hash: checkpoint_root,
             contract_state_trees: HashMap::new(),
             start_user_leaf,
-            slots_modified: 0,
             pending_writes: vec![],
             contract_state_dmps: HashMap::new(),
             contract_state_tree_heights: HashMap::new(),
@@ -208,7 +206,6 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
             //println!("Current DMP for contract {}: {:#?}", contract_id, i);
         }
 
-        self.slots_modified += 1;
         Ok(())
     }
 
@@ -270,13 +267,14 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
         };
         let stats = GUTAStats {
             guta_fees_collected: F::from_u64_value(1000),
-            da_fees_collected: F::from_u64_value(1000 * self.slots_modified),
+            // filled in from the replayed count below
+            da_fees_collected: F::from_u64_value(0),
             user_ops_processed: F::from_u64_value(1),
             total_transactions: F::from_u64_value(1),
-            slots_modified: F::from_u64_value(self.slots_modified),
+            slots_modified: F::from_u64_value(0),
         };
 
-        Ok(SubmitUserEndCapNonProofInput {
+        let mut end_cap_input = SubmitUserEndCapNonProofInput {
             core: SubmitUserEndCapNonProofCoreInput {
                 checkpoint_id: F::from_u64_value(self.checkpoint_id),
                 stats: stats,
@@ -285,6 +283,14 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
             },
             contract_state_updates,
             events: vec![],
-        })
+        };
+        // The realm edge replays slot modifications from the submitted
+        // histories (repeated or no-op leaf writes telescope to one), so the
+        // declared count must come from that replay, not the raw write count.
+        let slots_modified = end_cap_input.replay_count_slots_modified();
+        end_cap_input.core.stats.slots_modified = F::from_u64_value(slots_modified);
+        let da_fees = slots_modified.checked_mul(1000).ok_or_else(|| anyhow::anyhow!("DA fee overflow"))?;
+        end_cap_input.core.stats.da_fees_collected = F::from_u64_value(da_fees);
+        Ok(end_cap_input)
     }
 }

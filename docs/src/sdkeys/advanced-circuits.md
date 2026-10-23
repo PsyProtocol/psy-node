@@ -28,6 +28,79 @@ The Psy-language and command examples in this guide are illustrative design sket
 
 Software-defined signatures enable authentication schemes that go beyond simple cryptographic signatures. Users can define custom circuits that implement complex authorization logic.
 
+### Authenticated transaction introspection
+
+An SD-key authorization method can inspect earlier transactions in the same proving session. Transaction and calldata indices must be compile-time constants:
+
+```psy
+#[contract_method]
+pub fn authorize(&mut self, ctx: &ChainContext, sd: &SDKeyContext) {
+    require(sd.num_transactions >= 1, "missing transaction");
+    require(sd.tx[0].contract_id == 42, "wrong contract");
+    require(sd.tx[0].caller_contract_id == 0, "wrong caller");
+    require(sd.tx[0].method_id == 7, "wrong method");
+    require(sd.tx[0].inputs_length >= 2, "short calldata");
+    require(sd.tx[0].inputs[1] == 500, "amount exceeds policy");
+}
+```
+
+The authenticated fields are `contract_id`, `caller_contract_id`, `method_id`,
+`inputs_length`, `inputs_hash`, and individual `inputs[word]`. The SD context
+also exposes `num_transactions` and `transaction_stack_hash`. A circuit may
+inspect at most 32 transactions and 128 Felt calldata words per transaction.
+
+SD keys that read `self` state must be compiled with the target contract ID
+using a contract-aware compiler entry point. Compilation fails if state is read
+without that binding; it never silently binds the state proof to contract zero.
+
+### Composable call policy builder
+
+Rust callers can build a read-only SD-key definition from nested `All` and
+`Any` rules. The common rule applies to every transaction. Optional ordered
+rules apply to explicitly selected transaction slots, in addition to the
+common rule. Transaction count can vary in an inclusive range. A selected rule
+is enforced only if that transaction exists.
+
+```rust
+use psy_vm::ups::sd_key::{
+    build_composed_sd_key_policy_with_transaction_rules, SDKeyCallRule as Rule,
+    SDKeyComparison, SDKeyInputTotalLimit,
+};
+use psy_client_data::dpn::sd_key::SDKeyTransactionRule;
+
+// This example assumes method 10 and method 20 both encode the quantity to
+// limit in calldata word 0, with the same units. Verify that against their ABIs.
+let common = Rule::All(vec![
+    Rule::Contract(7),
+    Rule::Any(vec![Rule::Method(10), Rule::Method(20)]),
+    Rule::Input { word: 0, comparison: SDKeyComparison::Lte, value: 100 },
+]);
+let transaction_rules = vec![
+    SDKeyTransactionRule { tx_index: 0, rule: Rule::Method(10) },
+    SDKeyTransactionRule { tx_index: 1, rule: Rule::Method(20) },
+];
+let (function, config) = build_composed_sd_key_policy_with_transaction_rules(
+    &common,
+    &transaction_rules, // first buy, then sell
+    &[SDKeyInputTotalLimit { word: 0, max_per_tx: 100, max_total: 300 }],
+    &[],
+    2, // minimum transaction count
+    3, // maximum transaction count
+)?;
+// Register (function, config) through register_sd_key_dpn_circuit.
+```
+
+`Rule::Caller(id)` restricts the calling contract. An input comparison requires
+that the selected calldata word exists; a missing word makes that rule false.
+A total limit sums the selected word across
+transactions. Every call must contain that word and remain within
+`max_per_tx`; the builder rejects a count whose worst-case sum could wrap the
+field. It does not know whether that word is an amount, price, recipient, or
+something else. For methods with different calldata layouts, this sum is not
+a meaningful amount limit; use an ABI-aware policy before calling it that.
+The builder checks at most 64 transactions
+and calldata word indices 0 through 127.
+
 ### Basic Extended Signature
 
 **Using Psy Language:**

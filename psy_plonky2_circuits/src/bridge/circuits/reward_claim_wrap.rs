@@ -25,7 +25,7 @@ use psy_network_circuit::gadgets::qdata::{
 use psy_plonky2_basic_helpers::builder::{comparison::CircuitBuilderComparison, core::CircuitBuilderHelpersCore, verify::CircuitBuilderVerifyProofHelpers};
 use psy_plonky2_common_circuits::hash::keccak::keccak256_bytes_targets;
 use psy_plonky2_common_circuits::hash::merkle::gadgets::merkle_proof::MerkleProofGadget;
-use psy_ups_circuit::signature::software_defined::get_zk_public_key_param;
+use psy_ups_circuit::signature::sd_key_plonky2::get_zk_public_key_param;
 
 use super::{
     historical_merkle_proof::historical_merkle_proof,

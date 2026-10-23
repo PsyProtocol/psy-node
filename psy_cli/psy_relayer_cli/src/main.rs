@@ -41,6 +41,9 @@ enum Commands {
     /// Prepare the five local Genesis contract approvals from Genesis and its ABIs.
     GuardianPrepareApprovedContracts {
         #[arg(long, default_value = "genesis.json")] genesis_data: PathBuf,
+        /// Compressed or plain genesis_contracts.json used as the contract source of truth
+        /// instead of the derived genesis.json; validated against the compiler stamp.
+        #[arg(long)] genesis_contracts: Option<PathBuf>,
         #[arg(long)] genesis_abi_dir: Option<PathBuf>,
         #[arg(long)] artifact: Vec<PathBuf>,
         #[arg(long)] policy_artifact_output: Option<PathBuf>,
@@ -243,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None => run_bridge_daemon(cli.config).await,
         Some(Commands::GuardianPrepareAccount { output, governance_output }) => guardian::account::run(&output, &governance_output),
-        Some(Commands::GuardianPrepareApprovedContracts { genesis_data, genesis_abi_dir, artifact, policy_artifact_output, output }) => guardian::service::prepare_approved_contracts(&genesis_data, genesis_abi_dir.as_deref(), &artifact, policy_artifact_output.as_deref(), &output),
+        Some(Commands::GuardianPrepareApprovedContracts { genesis_data, genesis_contracts, genesis_abi_dir, artifact, policy_artifact_output, output }) => guardian::service::prepare_approved_contracts(&genesis_data, genesis_contracts.as_deref(), genesis_abi_dir.as_deref(), &artifact, policy_artifact_output.as_deref(), &output),
         Some(Commands::GuardianServiceCheck { config, genesis_data, live, live_l1 }) => guardian::service::check(&config, &genesis_data, live, live_l1).await,
         Some(Commands::GuardianRefreshApprovedContracts { config, genesis_data, artifact, output }) => guardian::service::refresh_approved_contracts(&config, &genesis_data, &artifact, &output),
         Some(Commands::GuardianService { config, guardian_id, db_path }) => guardian::service::run(&config, guardian_id, &db_path).await.map_err(Into::into),

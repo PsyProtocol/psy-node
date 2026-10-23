@@ -195,8 +195,18 @@ if (import.meta.main) {
             if (!values["policy-only"]) await command([path.join(repoRoot, "target/release/psy_relayer_cli"), "guardian-prepare-approved-contracts",
                 "--genesis-data", path.join(repoRoot, "genesis.json"), ...Object.values(artifacts).flatMap((artifact) => ["--artifact", artifact]), "--output", approved]);
         } else {
+            const genesisDataPath = path.join(repoRoot, "genesis.json");
+            const genesisContractsPath = path.join(repoRoot, "psy-genesis/genesis_contracts.json");
+            let genesisReference: string[];
+            try {
+                await checkGenesisContracts(genesisDataPath, genesisContractsPath);
+                genesisReference = ["--genesis-data", genesisDataPath];
+            } catch {
+                console.log("genesis.json is stale against psy-genesis/genesis_contracts.json; validating against the Genesis contracts source of truth instead");
+                genesisReference = ["--genesis-contracts", genesisContractsPath];
+            }
             await command([path.join(repoRoot, "target/release/psy_relayer_cli"), "guardian-prepare-approved-contracts",
-                "--genesis-data", path.join(repoRoot, "genesis.json"), "--genesis-abi-dir", path.join(repoRoot, "psy-genesis/genesis_abi"),
+                ...genesisReference, "--genesis-abi-dir", path.join(repoRoot, "psy-genesis/genesis_abi"),
                 "--policy-artifact-output", policy, "--output", approved]);
         }
         await writePublic(path.join(output, "multisig_policy.json"), await fs.readFile(policy));

@@ -15,6 +15,7 @@ psy_client_common = { workspace = true }
 psy_client_data = { workspace = true }
 psy_config = { workspace = true }
 psy_crypto = { workspace = true }
+psy_data = { workspace = true }
 psy_plonky2_basic_helpers = { workspace = true }
 psy_provider = { workspace = true }
 psy_prover = { workspace = true }
@@ -26,6 +27,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 url = { workspace = true }
 zeroize = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

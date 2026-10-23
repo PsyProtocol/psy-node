@@ -16,7 +16,7 @@
 //! express — see `Mandate::LIMITS_NOTE`).
 //!
 //! ## Semantics of the underlying circuit (verified against
-//! `psy_prover::wallet::memory_wallet::build_allow_method_sd_key_circuit`)
+//! `psy_vm::ups::sd_key::build_allow_method_policy_function`)
 //!
 //! * The circuit asserts, for every call in the transaction, that its
 //!   `(contract_id, method_id)` is one of the allowed pairs.

@@ -41,7 +41,7 @@ mod guardians_root;
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
-const DEFAULT_SD_KEY_FINGERPRINT: &str = "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278";
+const DEFAULT_SD_KEY_FINGERPRINT: &str = "13815ec09024853c0324a0ca8469334210b2692df75cd601f6536f215a07cbe5";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
 const GUARDIANS_ROOT_MAX_FEE_DEFAULT: u64 = 2_000_000_000;
 const GOVERNANCE_REGISTRATION_ID: u64 = 15;
@@ -372,66 +372,8 @@ fn validate_policy_abi_slots(abi: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct GenesisContractsArtifactStamp {
-    compiler_revision: String,
-    compiler_sources_hash: String,
-    artifact_sha256: String,
-    artifact_byte_size: u64,
-    token_artifact_sha256: String,
-    token_artifact_byte_size: u64,
-    token_update_artifact_sha256: String,
-    token_update_artifact_byte_size: u64,
-}
-
-fn validate_contracts_stamp(bytes: &[u8], bundle: &[u8]) -> anyhow::Result<()> {
-    use sha2::{Digest, Sha256};
-    ensure!(bytes.len() <= 65_536, "Genesis compiler stamp exceeds 65536 bytes");
-    let stamp: GenesisContractsArtifactStamp = serde_json::from_slice(bytes).context("invalid Genesis compiler stamp")?;
-    for (value, length) in [(&stamp.compiler_revision, 40), (&stamp.compiler_sources_hash, 64),
-        (&stamp.artifact_sha256, 64), (&stamp.token_artifact_sha256, 64), (&stamp.token_update_artifact_sha256, 64)] {
-        ensure!(value.len() == length && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "Genesis compiler stamp requires lowercase fixed-width hexadecimal identities");
-    }
-    let _ = (stamp.token_artifact_byte_size, stamp.token_update_artifact_byte_size);
-    ensure!(stamp.artifact_byte_size == u64::try_from(bundle.len())?, "Genesis compiler stamp byte size mismatch");
-    ensure!(stamp.artifact_sha256 == hex::encode(Sha256::digest(bundle)), "Genesis compiler stamp SHA-256 mismatch");
-    Ok(())
-}
-
 fn load_contracts(path: &Path) -> anyhow::Result<Vec<PQBCDeployContract<Hash>>> {
-    use std::io::Read;
-    let genesis_bytes = std::fs::read(path)
-        .with_context(|| format!("reading genesis contracts {}", path.display()))?;
-    let stamp_path = path.parent().context("Genesis contracts path has no parent")?.join(".genesis_contracts.compiler-artifact.json");
-    let stamp_file = std::fs::File::open(&stamp_path).context("opening locally approved Genesis compiler stamp")?;
-    let metadata = stamp_file.metadata()?;
-    ensure!(metadata.is_file() && metadata.len() <= 65_536, "Genesis compiler stamp must be a regular file of at most 65536 bytes");
-    let mut stamp_bytes = Vec::with_capacity(metadata.len() as usize);
-    (&stamp_file).take(65_536).read_to_end(&mut stamp_bytes)?;
-    ensure!(stamp_file.metadata()?.len() == stamp_bytes.len() as u64, "Genesis compiler stamp changed size while reading");
-    validate_contracts_stamp(&stamp_bytes, &genesis_bytes)?;
-    let decoded;
-    let json = if genesis_bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        decoded = zstd::stream::decode_all(genesis_bytes.as_slice()).context("decoding zstd genesis_contracts.json")?;
-        decoded.as_slice()
-    } else {
-        genesis_bytes.as_slice()
-    };
-    #[derive(serde::Deserialize)]
-    struct NamedDeployment {
-        name: String,
-        #[serde(flatten)]
-        deployment: PQBCDeployContract<Hash>,
-    }
-    let named: Vec<NamedDeployment> = serde_json::from_slice(json).context("parsing flat named Genesis deployments")?;
-    let mut names = std::collections::HashSet::with_capacity(named.len());
-    for entry in &named {
-        ensure!(!entry.name.trim().is_empty() && names.insert(entry.name.as_str()), "Genesis contract names must be nonempty and unique");
-    }
-    ensure!(named.get(MULTISIG_POLICY_CONTRACT_ID as usize).map(|entry| entry.name.as_str()) == Some("multisig_policy"), "Genesis contract 1 must be multisig_policy");
-    Ok(named.into_iter().map(|entry| entry.deployment).collect())
+    guardian_common::genesis_contracts::load_genesis_contracts(path)
 }
 
 fn parse_qhash(hex: &str) -> anyhow::Result<QHashOut<F>> {

@@ -88,7 +88,7 @@ impl SignatureUser for MultisigUser {
 
     async fn sign(&self, wallet: &PsyMemoryWallet, _circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync), context: &SignContext, sighash: QHashOut<GoldilocksField>) -> Result<PsyProof> {
         let witness = context.multisig_signature_witness.as_ref().context("multisig signature witness missing")?;
-        ensure!(context.psy_signature_input.is_none() && context.plonky2_signature_input.is_none() && context.sd_key_signature_input.is_none(), "multisig cannot use another signature scheme's witness");
+        ensure!(context.sd_key_signature_input.is_none(), "multisig cannot use another signature scheme's witness");
         let input = self.signature_input(witness, sighash)?;
         let circuit = wallet.get_multisig_circuit()?;
         ensure!(context.fingerprint == circuit.get_fingerprint(), "multisig circuit fingerprint mismatch");

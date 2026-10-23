@@ -65,6 +65,9 @@ zstd = { workspace = true }
 
 
 [dev-dependencies]
+psy_config = { workspace = true }
+psy_vm = { workspace = true }
+psy_ups_circuit = { workspace = true }
 psy_node_core = { workspace = true }
 psy_node_store_memory = { workspace = true }
 psy_client_common = { workspace = true }

@@ -346,22 +346,28 @@ pub fn refresh_approved_contracts(config_path: &Path, genesis_data_path: &Path, 
     let proof_bound = approved_endcap_max_proof_bytes().context("guardian EndCap proof bound")?;
     let archive = load_authorization_archive(config_path, proof_bound).context("guardian authorization archive")?;
     let ids: Vec<_> = archive.active().0.approved_contracts.iter().map(|contract| contract.contract_id).collect();
-    build_approved_contracts(genesis_data_path, None, artifact_paths, &ids, None, output)
+    build_approved_contracts(genesis_data_path, None, None, artifact_paths, &ids, None, output)
 }
 
-pub fn prepare_approved_contracts(genesis_data_path: &Path, genesis_abi_dir: Option<&Path>, artifact_paths: &[PathBuf], policy_artifact_output: Option<&Path>, output: &Path) -> anyhow::Result<()> {
+pub fn prepare_approved_contracts(genesis_data_path: &Path, genesis_contracts_path: Option<&Path>, genesis_abi_dir: Option<&Path>, artifact_paths: &[PathBuf], policy_artifact_output: Option<&Path>, output: &Path) -> anyhow::Result<()> {
     ensure!(genesis_abi_dir.is_some() != !artifact_paths.is_empty(), "provide either --genesis-abi-dir or --artifact paths");
-    build_approved_contracts(genesis_data_path, genesis_abi_dir, artifact_paths, &[0, 1, 2, 3, 4], policy_artifact_output, output)
+    build_approved_contracts(genesis_data_path, genesis_contracts_path, genesis_abi_dir, artifact_paths, &[0, 1, 2, 3, 4], policy_artifact_output, output)
 }
 
-fn build_approved_contracts(genesis_data_path: &Path, genesis_abi_dir: Option<&Path>, artifact_paths: &[PathBuf], ids: &[u32], policy_artifact_output: Option<&Path>, output: &Path) -> anyhow::Result<()> {
+fn build_approved_contracts(genesis_data_path: &Path, genesis_contracts_path: Option<&Path>, genesis_abi_dir: Option<&Path>, artifact_paths: &[PathBuf], ids: &[u32], policy_artifact_output: Option<&Path>, output: &Path) -> anyhow::Result<()> {
     use guardian_common::protocol::{ApprovedContract, CompilerArtifact, JsonText};
     use psy_vm::dpn::contract::{cfc_code_definition_to_dapen_fc, dapen_fc_to_cfc_code_definition};
 
     ensure!(!output.exists(), "refusing to overwrite {}", output.display());
     if let Some(path) = policy_artifact_output { ensure!(!path.exists() && path != output, "refusing to overwrite {}", path.display()); }
-    let genesis_file = std::fs::File::open(genesis_data_path).with_context(|| format!("opening Genesis data {}", genesis_data_path.display()))?;
-    let genesis: GenesisContractsData = serde_json::from_reader(BufReader::new(genesis_file)).context("parsing Genesis contracts")?;
+    let contracts: Vec<PQBCDeployContract<QHashOut<GoldilocksField>>> = match genesis_contracts_path {
+        Some(path) => guardian_common::genesis_contracts::load_genesis_contracts(path)
+            .with_context(|| format!("loading Genesis contracts from {}", path.display()))?,
+        None => {
+            let genesis_file = std::fs::File::open(genesis_data_path).with_context(|| format!("opening Genesis data {}", genesis_data_path.display()))?;
+            serde_json::from_reader::<_, GenesisContractsData>(BufReader::new(genesis_file)).context("parsing Genesis contracts")?.contracts
+        }
+    };
     let paths: std::collections::BTreeMap<u32, &PathBuf> = artifact_paths.iter().map(|path| {
         let id = path.file_stem().and_then(|stem| stem.to_str()).and_then(|name| match name {
             "token" => Some(0), "multisig_policy" => Some(1), "deposit_tree" => Some(2), "withdrawal_tree" => Some(3), "usdt_token" => Some(4), _ => None,
@@ -371,7 +377,7 @@ fn build_approved_contracts(genesis_data_path: &Path, genesis_abi_dir: Option<&P
     let mut refreshed = Vec::new();
     let mut policy_artifact_json = None;
     for &id in ids {
-        let contract = genesis.contracts.get(id as usize).with_context(|| format!("Genesis has no contract {id}"))?;
+        let contract = contracts.get(id as usize).with_context(|| format!("Genesis has no contract {id}"))?;
         let compiler_artifact = if let Some(abi_dir) = genesis_abi_dir {
             let abi_name = match id {
                 0 => "PsyTokenContract.json", 1 => "MultisigPolicyContract.json",

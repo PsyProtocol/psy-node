@@ -90,9 +90,9 @@ const CHECKPOINT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::CHECKPOINT
 const GLOBAL_USER_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE;
 const GLOBAL_CONTRACT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
 const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
-    psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+    psy_config::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
-    psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+    psy_config::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const GROTH16_FILES: [&str; 3] = ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"];
 const REWARD_CLAIM_DIR: &str = "reward_claim";
 const REWARD_USER_ID: u32 = 7;
@@ -740,7 +740,7 @@ fn tagged_node(left: HashOut<F>, right: HashOut<F>, tag: HashOut<F>) -> HashOut<
 fn registration_membership(
     user_id: u32, private_key: HashOut<F>,
 ) -> (HashOut<F>, u64, [HashOut<F>; psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize], HashOut<F>) {
-    let public_key_param = psy_ups_circuit::signature::software_defined::get_sdc_public_key_param(&ClientQHashOut(private_key));
+    let public_key_param = psy_ups_circuit::signature::sd_key_plonky2::get_sdc_public_key_param(&ClientQHashOut(private_key));
     let fingerprint = PsyBasicZKSignatureCircuit::<C, D>::new().fingerprint.0;
     let registration_leaf = PoseidonHash::two_to_one(fingerprint, public_key_param.0);
     let registration_index = get_registration_id_from_user_id(u64::from(user_id));

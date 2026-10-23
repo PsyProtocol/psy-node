@@ -941,6 +941,9 @@ impl<
         )?;
         timer.lap_micros("ensure_simple_self_consistent");
 
+        user_end_cap_input.ensure_declared_slots_modified()?;
+        timer.lap_micros("ensure_declared_slots_modified");
+
         let proof_verifier = self.proof_verifier.clone();
         task::spawn_blocking(move || {
             proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)
@@ -2820,6 +2823,25 @@ pub(crate) mod tests {
             .await
             .expect_err("mismatched public inputs hash must fail");
         assert!(err.to_string().contains("Public inputs hash mismatch"), "unexpected error: {err}");
+
+        // declared slots_modified under-reports the replayed slot count: the
+        // public-inputs hash is recomputed from the tampered core, so the
+        // earlier gates pass and only the replay check rejects it
+        let mut under_declared = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
+        under_declared.core.stats.slots_modified = PF::from_u64_value(0);
+        let proof_bytes = under_declared
+            .core
+            .get_proof_public_inputs_hash::<PoseidonHasher>(EndCapTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT)
+            .into_owned_32bytes()
+            .to_vec();
+        let err = handler
+            .handle_user_end_cap_proof_submission(under_declared, proof_bytes, None)
+            .await
+            .expect_err("under-declared slots_modified must fail");
+        assert!(
+            err.to_string().contains("declared slots_modified"),
+            "unexpected error: {err}"
+        );
 
         // inconsistent new user leaf (end hash does not hash to the new leaf)
         let mut bad_leaf = gen_end_cap_input(REALM_USER_ID, checkpoint_root);
