@@ -71,6 +71,11 @@ if (holdFlag !== -1 && (!readerBin || !holdDir || !fs.existsSync(holdDir) || !fs
   console.error('--hold-reader needs --with-reader and an existing directory');
   process.exit(1);
 }
+const staleHolds = holdDir ? fs.readdirSync(holdDir).filter((name) => /^\d+-.*\.(json|json\.tmp|go)$/.test(name)) : [];
+if (staleHolds.length > 0) {
+  console.error(`--hold-reader directory ${holdDir} has leftover hold files: ${staleHolds.join(', ')}`);
+  process.exit(1);
+}
 
 const ENVIO_DIR = path.join(__dirname, '../..');
 const CHAIN_ID = 31337;
@@ -312,9 +317,9 @@ async function holdReader(point, pending = []) {
       kind,
       txHash: event.transaction.hash,
       blockNumber: event.block.number,
-      index: event.params.index,
-      shieldAddress: event.params.shieldAddress,
-      nullifier: event.params.nullifier,
+      index: event.params.index ?? null,
+      shieldAddress: event.params.shieldAddress ?? null,
+      nullifier: event.params.nullifier ?? null,
     })),
   };
   fs.writeFileSync(path.join(holdDir, `${name}.json.tmp`), JSON.stringify(hold));
@@ -669,7 +674,7 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    await holdReader('reader-stop').catch((error) => console.error(error.message));
+    if (!process.exitCode) await holdReader('reader-stop').catch((error) => console.error(error.message));
     await reader?.stop();
     const keepDir = process.env.REORG_TEST_KEEP_LOGS; // opt-in: keep the Envio and Reader logs
     if (keepDir) {

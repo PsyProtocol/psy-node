@@ -56,8 +56,13 @@ external load generator attach to the running Reader. Before each reorg
 `reader-stop`. The JSON holds `database`, `atUnixMs`, `readerPid`, `readerUrl`,
 `tokenFile`, and `pending`: the events about to be orphaned (`kind`, `txHash`,
 `blockNumber`, `index`, `shieldAddress`, `nullifier`), so the load can include
-the tx hashes and addresses the reorg removes. The scenarios and their
-assertions are unchanged.
+the tx hashes and addresses the reorg removes. A `DepositRecorded` event has
+`index` and `shieldAddress` and a `null` `nullifier`; a `WithdrawalClaimed`
+event has a `nullifier` and `null` `index` and `shieldAddress`. The directory
+must hold no hold files (`<n>-*.json`, `.json.tmp`, `.go`) from an earlier run,
+or the test exits at once. After a failure the final `reader-stop` hold is
+skipped, so cleanup is not delayed. The scenarios and their assertions are
+unchanged.
 
 ## What is asserted
 
