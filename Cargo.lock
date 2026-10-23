@@ -7433,6 +7433,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_bridge_reader_cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "psy_bridge_reader_api",
+ "psy_bridge_reader_core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "psy_bridge_reader_core"
 version = "0.1.0"
 dependencies = [
