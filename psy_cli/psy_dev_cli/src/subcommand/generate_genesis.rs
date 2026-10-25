@@ -14,7 +14,7 @@ use plonky2::{
     hash::poseidon::PoseidonHash,
 };
 use plonky2::field::types::Field64;
-use psy_ups_circuit::signature::multisig::MultisigSignatureCircuit;
+use psy_ups_circuit::signature::{multisig::MultisigSignatureCircuit, sd_key_dpn::SDKeyDpnCircuitGadget};
 use psy_vm::ups::multisig::{MultisigAccount, MultisigPolicy, MULTISIG_POLICY_CONTRACT_ID};
 use psy_client_common::data::qhashout::QHashOut as ClientHash;
 use psy_core::{
@@ -41,7 +41,6 @@ mod guardians_root;
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
-const DEFAULT_SD_KEY_FINGERPRINT: &str = "13815ec09024853c0324a0ca8469334210b2692df75cd601f6536f215a07cbe5";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
 const GUARDIANS_ROOT_MAX_FEE_DEFAULT: u64 = 2_000_000_000;
 const GOVERNANCE_REGISTRATION_ID: u64 = 15;
@@ -127,7 +126,8 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "faucet-operator-count", default_value_t = 10)]
     pub faucet_operator_count: usize,
 
-    #[arg(long = "sd-key-fingerprint", default_value = DEFAULT_SD_KEY_FINGERPRINT)]
+    /// Optional assertion against the fingerprint derived from the faucet SDKey policy.
+    #[arg(long = "sd-key-fingerprint", default_value = "")]
     pub sd_key_fingerprint: String,
 
     /// Hex Poseidon fingerprint for ZK users. Empty uses the local-devnet circuit constant.
@@ -164,8 +164,11 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "faucet-per-claim-amount", default_value = "1000000000000")]
     pub faucet_per_claim_amount: String,
 
-    #[arg(long = "sd-key-expected-tx-count", default_value_t = 3)]
-    pub sd_key_expected_tx_count: u64,
+    #[arg(long = "sd-key-min-tx-count", default_value_t = 1)]
+    pub sd_key_min_tx_count: u64,
+
+    #[arg(long = "sd-key-max-tx-count", default_value_t = 64)]
+    pub sd_key_max_tx_count: u64,
 
     #[arg(long = "sd-key-allowed-contract-id", default_values_t = vec![5u64, 0, 0])]
     pub sd_key_allowed_contract_ids: Vec<u64>,
@@ -173,6 +176,10 @@ pub struct GenerateGenesisDataArgs {
     /// Faucet, token transfer, and fee burn methods from the current precompile ABI.
     #[arg(long = "sd-key-allowed-method-id", default_values_t = vec![3375543263u32, 2789897329, TOKEN_BURN_METHOD_ID])]
     pub sd_key_allowed_method_ids: Vec<u32>,
+
+    /// Caller for each allowed contract/method pair; Transfer must come from the faucet contract.
+    #[arg(long = "sd-key-allowed-caller-contract-id", default_values_t = vec![psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64, 5, psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64])]
+    pub sd_key_allowed_caller_contract_ids: Vec<u64>,
 
     /// --guardians-root output directory. Reads the existing genesis and writes guardian
     /// configuration instead of genesis.json, private_keys.json, or faucetOperators.json.
@@ -435,10 +442,10 @@ fn genesis_users(
     args: &GenerateGenesisDataArgs,
     relayer: PsyCompactUserDefinition<Hash>,
     governance: PsyCompactUserDefinition<Hash>,
+    sd_key_fingerprint: QHashOut<F>,
 ) -> anyhow::Result<(Vec<PsyCompactUserDefinition<Hash>>, Vec<Option<Hash>>)> {
     let validator_slots = parse_validator_slots(&args.validator_slots)?;
     let zk_fingerprint = zk_fingerprint(args)?;
-    let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
     ensure!(args.relayer_registration_id == 2 && args.relayer_user_id == 524_288,
         "public multisig Genesis requires registration 2 and user 524288");
     ensure!(args.coordinator_global_user_tree_height == 12 && args.realm_global_user_tree_height == 20 && args.group_realm_height == 1,
@@ -516,12 +523,32 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
         repo_root.join("psy-genesis/genesis_contracts.json")
     });
     let contracts = load_contracts(&contracts_path)?;
-    let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
+    ensure!(args.sd_key_min_tx_count >= 1 && args.sd_key_max_tx_count <= 64,
+        "faucet SDKey transaction count must be within 1..=64");
+    let (function, config) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+        &args.sd_key_allowed_caller_contract_ids,
+        &args.sd_key_allowed_contract_ids,
+        &args.sd_key_allowed_method_ids,
+        args.sd_key_min_tx_count,
+        args.sd_key_max_tx_count,
+    )?;
+    for call in &config.transaction_count_policy.as_ref().context("faucet SDKey requires a transaction count policy")?.allowed_calls {
+        if call.contract_id == 0 && call.method_id == 2789897329 {
+            ensure!(call.caller_contract_id == Some(args.faucet_contract_id),
+                "faucet SDKey Transfer must be called by the faucet contract");
+        }
+    }
+    let circuit = SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &config)?;
+    let sd_key_fingerprint: QHashOut<F> = serde_json::from_value(serde_json::to_value(circuit.get_fingerprint())?)?;
+    if !args.sd_key_fingerprint.trim().is_empty() {
+        ensure!(parse_qhash(&args.sd_key_fingerprint)? == sd_key_fingerprint,
+            "--sd-key-fingerprint does not match the faucet SDKey policy");
+    }
     validate_multisig_policy_artifact(&contracts, &read_public_input(&repo_root, &args.multisig_policy_artifact)?)?;
     let multisig_circuit = MultisigSignatureCircuit::new()?;
     let relayer = initialized_multisig_user(&account, &multisig_circuit, args.initial_fee_balance, false)?;
     let governance = initialized_multisig_user(&governance_account, &multisig_circuit, args.initial_fee_balance, true)?;
-    let (users, private_keys) = genesis_users(args, relayer, governance)?;
+    let (users, private_keys) = genesis_users(args, relayer, governance, sd_key_fingerprint)?;
     let special_zk_user_count = parse_validator_slots(&args.validator_slots)?.len() + 1;
 
     let genesis_data = PsyGenesisBlockSetupData {
@@ -589,12 +616,16 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
             faucet_method_id: u64,
             #[serde(rename = "faucetPerClaimAmount")]
             faucet_per_claim_amount: String,
-            #[serde(rename = "sdKeyExpectedTxCount")]
-            sd_key_expected_tx_count: u64,
+            #[serde(rename = "sdKeyMinTxCount")]
+            sd_key_min_tx_count: u64,
+            #[serde(rename = "sdKeyMaxTxCount")]
+            sd_key_max_tx_count: u64,
             #[serde(rename = "sdKeyAllowedContractIds")]
             sd_key_allowed_contract_ids: Vec<u64>,
             #[serde(rename = "sdKeyAllowedMethodIds")]
             sd_key_allowed_method_ids: Vec<u32>,
+            #[serde(rename = "sdKeyAllowedCallerContractIds")]
+            sd_key_allowed_caller_contract_ids: Vec<u64>,
             operators: Vec<FaucetOperatorJson>,
         }
 
@@ -625,9 +656,11 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
             faucet_method_name: args.faucet_method_name.clone(),
             faucet_method_id: args.faucet_method_id,
             faucet_per_claim_amount: args.faucet_per_claim_amount.clone(),
-            sd_key_expected_tx_count: args.sd_key_expected_tx_count,
+            sd_key_min_tx_count: args.sd_key_min_tx_count,
+            sd_key_max_tx_count: args.sd_key_max_tx_count,
             sd_key_allowed_contract_ids: args.sd_key_allowed_contract_ids.clone(),
             sd_key_allowed_method_ids: args.sd_key_allowed_method_ids.clone(),
+            sd_key_allowed_caller_contract_ids: args.sd_key_allowed_caller_contract_ids.clone(),
             operators,
         };
         let faucet_operators_path = args.faucet_operators_out.clone().unwrap_or_else(|| {
@@ -760,7 +793,7 @@ mod tests {
             balance: 0, nonce: 0, last_checkpoint_id: 0, event_index: 0, constract_state_tree_records: vec![],
         };
         let governance = relayer.clone();
-        let (users, keys) = genesis_users(&args, relayer, governance).unwrap();
+        let (users, keys) = genesis_users(&args, relayer, governance, QHashOut::from_values(1, 2, 3, 4)).unwrap();
         assert_eq!(keys.len(), users.len());
         assert_eq!(keys.len(), 16);
         assert!(keys[2].is_none());
