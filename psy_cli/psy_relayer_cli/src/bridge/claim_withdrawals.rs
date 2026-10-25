@@ -612,15 +612,15 @@ fn slot_words(slot_data: &[U256], offset: usize) -> Result<[u32; 8]> {
     Ok(words)
 }
 
-struct ClaimSlotIdentity {
+struct EvmWithdrawal {
     nonce: B256,
     token: Address,
     recipient: Address,
     amount: U256,
 }
 
-fn claim_slot_identity(withdrawal: &PendingWithdrawal) -> ClaimSlotIdentity {
-    ClaimSlotIdentity {
+fn to_evm_withdrawal(withdrawal: &PendingWithdrawal) -> EvmWithdrawal {
+    EvmWithdrawal {
         nonce: withdrawal_nullifier_from_nonce(withdrawal.nonce),
         token: u32x8_to_address(withdrawal.token_address),
         recipient: u32x8_to_address(withdrawal.recipient),
@@ -642,11 +642,11 @@ struct ParsedClaimReceipt {
     outcomes: Vec<ClaimSlotOutcome>,
 }
 
-/// The nonce is the map key, so identity is token, recipient, and amount.
-fn registration_matches(event: &WithdrawalPendingCreated, identity: &ClaimSlotIdentity) -> bool {
-    event.token == identity.token
-        && event.recipient == identity.recipient
-        && event.amount == identity.amount
+/// The nonce is the map key, so the EVM withdrawal fields compared here are token, recipient, and amount.
+fn registration_matches(event: &WithdrawalPendingCreated, withdrawal: &EvmWithdrawal) -> bool {
+    event.token == withdrawal.token
+        && event.recipient == withdrawal.recipient
+        && event.amount == withdrawal.amount
 }
 
 /// Account one confirmed batch from its receipt.
@@ -661,7 +661,7 @@ fn parse_claim_receipt(
     logs: &[alloy_rpc_types_eth::Log],
     bridge: Address,
     expected_batch_commit: B256,
-    slots: &[ClaimSlotIdentity],
+    slots: &[EvmWithdrawal],
 ) -> Result<ParsedClaimReceipt> {
     anyhow::ensure!(
         !slots.is_empty() && slots.len() <= MAX_WITHDRAWAL_CLAIM_BATCH_SIZE,
@@ -887,9 +887,9 @@ fn apply_confirmed_claim_receipt(
             return chunk_failure(ClaimCode::MalformedReceipt);
         }
     };
-    let identities: Vec<ClaimSlotIdentity> =
-        chunk.iter().map(|pending| claim_slot_identity(&pending.withdrawal)).collect();
-    let parsed = match parse_claim_receipt(logs, bridge, sent.batch_commit, &identities) {
+    let evm_withdrawals: Vec<EvmWithdrawal> =
+        chunk.iter().map(|pending| to_evm_withdrawal(&pending.withdrawal)).collect();
+    let parsed = match parse_claim_receipt(logs, bridge, sent.batch_commit, &evm_withdrawals) {
         Ok(parsed) => parsed,
         Err(error) => {
             tracing::error!(error = %error, "claim receipt is malformed or inconsistent");
@@ -908,7 +908,7 @@ fn apply_confirmed_claim_receipt(
                 ClaimSlotOutcome::NonceConflict => {
                     tracing::warn!(
                         leaf_hash,
-                        nonce = %identities[slot].nonce,
+                        nonce = %evm_withdrawals[slot].nonce,
                         "slot's nonce is tied to a different withdrawal"
                     );
                     ClaimOutcomeKind::Failed(ClaimCode::NonceConflict)
@@ -958,34 +958,34 @@ pub(crate) async fn operator_condition_cleared<P: Provider>(
     withdrawal: &PendingWithdrawal,
     code: ClaimCode,
 ) -> Result<bool> {
-    let identity = claim_slot_identity(withdrawal);
+    let evm_withdrawal = to_evm_withdrawal(withdrawal);
     match code {
         ClaimCode::RegistrationPaused => {
-            let flags = view_call(provider, bridge, getPauseFlagsCall { token: identity.token }).await?;
+            let flags = view_call(provider, bridge, getPauseFlagsCall { token: evm_withdrawal.token }).await?;
             Ok(flags.effectiveFlags & PAUSE_WITHDRAWAL_REGISTRATION == 0)
         }
         ClaimCode::TokenNotConfigured => {
-            let config = view_call(provider, bridge, getTokenFlowConfigCall { token: identity.token }).await?;
+            let config = view_call(provider, bridge, getTokenFlowConfigCall { token: evm_withdrawal.token }).await?;
             Ok(config.configured)
         }
         ClaimCode::TotalOverflow => {
-            let total = view_call(provider, bridge, totalWithdrawalAmountCall { token: identity.token }).await?;
-            Ok(identity.amount <= U256::MAX - total)
+            let total = view_call(provider, bridge, totalWithdrawalAmountCall { token: evm_withdrawal.token }).await?;
+            Ok(evm_withdrawal.amount <= U256::MAX - total)
         }
         ClaimCode::ClaimableOverflow => {
-            let config = view_call(provider, bridge, getTokenFlowConfigCall { token: identity.token }).await?;
-            let total = view_call(provider, bridge, totalWithdrawalAmountCall { token: identity.token }).await?;
-            if identity.amount > U256::MAX - total {
+            let config = view_call(provider, bridge, getTokenFlowConfigCall { token: evm_withdrawal.token }).await?;
+            let total = view_call(provider, bridge, totalWithdrawalAmountCall { token: evm_withdrawal.token }).await?;
+            if evm_withdrawal.amount > U256::MAX - total {
                 return Ok(false);
             }
-            let next_total = total + identity.amount;
+            let next_total = total + evm_withdrawal.amount;
             let block = provider
                 .get_block(alloy_rpc_types_eth::BlockId::latest())
                 .await
                 .context("latest block read failed")?
                 .context("latest block missing")?;
             let timestamp = U256::from(block.header.timestamp);
-            let delay = U256::from(flow_delay(&config, identity.amount, next_total));
+            let delay = U256::from(flow_delay(&config, evm_withdrawal.amount, next_total));
             Ok(timestamp <= U256::from(u64::MAX) - delay)
         }
         _ => Ok(false),
@@ -2497,12 +2497,12 @@ mod tests {
     }
 
     fn registered(pending: &PendingProof) -> WithdrawalPendingCreated {
-        let identity = claim_slot_identity(&pending.withdrawal);
+        let evm_withdrawal = to_evm_withdrawal(&pending.withdrawal);
         WithdrawalPendingCreated {
-            nonce: identity.nonce,
-            token: identity.token,
-            recipient: identity.recipient,
-            amount: identity.amount,
+            nonce: evm_withdrawal.nonce,
+            token: evm_withdrawal.token,
+            recipient: evm_withdrawal.recipient,
+            amount: evm_withdrawal.amount,
             claimableAt: 1_700_000_000,
         }
     }

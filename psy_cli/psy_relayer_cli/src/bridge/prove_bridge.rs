@@ -1046,6 +1046,78 @@ mod top_tree_tests {
     }
 }
 
+#[cfg(test)]
+mod remote_public_input_tests {
+    use super::{deposit_leaf_to_circuit, assemble_remote_deposit_batch_calls, CircuitBatchAppendInputs, DepositBatchChunkPrep, F};
+    use crate::bridge::constants::BRIDGE_USER_ID_U64;
+    use crate::bridge::prove_proxy_client::BridgeDepositBatchGroth16Proof;
+    use alloy_primitives::U256;
+    use alloy_sol_types::SolCall;
+    use parth_core::pgoldilocks::QHashOut;
+    use psy_plonky2_common_circuits::bridge::deposit_batch_append_circuit::compute_batch_append_preimage;
+
+    use super::{batchAppendCall, DepositLeafData};
+
+    fn one_leaf() -> (DepositBatchChunkPrep, Vec<u64>) {
+        let leaves = vec![DepositLeafData {
+            shield_address: [1, 2, 3, 4, 5, 6, 7, 8],
+            token: [9, 10, 11, 12, 13, 14, 15, 16],
+            l2_token_contract_id: [17, 18, 19, 20, 21, 22, 23, 24],
+            amount: [25, 26, 27, 28, 29, 30, 31, 32],
+            chain_index: 1,
+            note_commitment: [33, 34, 35, 36, 37, 38, 39, 40],
+        }];
+        let preimage = compute_batch_append_preimage(&CircuitBatchAppendInputs {
+            frontier: [QHashOut::<F>::ZERO; 32],
+            from_index: 4,
+            deposits: leaves.iter().map(deposit_leaf_to_circuit).collect(),
+            bridge_user_id: BRIDGE_USER_ID_U64 as u32,
+        });
+        let expected = preimage.to_u32_words().into_iter().map(u64::from).collect();
+        let prep = DepositBatchChunkPrep {
+            from_index: preimage.from_index,
+            to_index: preimage.to_index,
+            batch_commit: preimage.batch_commit,
+            preimage,
+            circuit_deposits: leaves,
+            proxy_deposits: Vec::new(),
+            old_frontier_str: Vec::new(),
+        };
+        (prep, expected)
+    }
+
+    fn proof(public_inputs: Vec<u64>) -> BridgeDepositBatchGroth16Proof {
+        BridgeDepositBatchGroth16Proof { solidity_proof: std::array::from_fn(|_| "0x0".to_string()), public_inputs }
+    }
+
+    #[test]
+    fn proxy_public_inputs_must_match_local_preimage_words() {
+        let (prep, expected) = one_leaf();
+        let to_index = prep.to_index;
+        assert!(assemble_remote_deposit_batch_calls(vec![prep], vec![proof(Vec::new())]).is_err(), "short public inputs must not match");
+
+        let (prep, mut shifted) = one_leaf();
+        shifted[16] += 1;
+        let err = assemble_remote_deposit_batch_calls(vec![prep], vec![proof(shifted)]).expect_err("shifted word").to_string();
+        assert!(err.contains("from_index=4") && err.contains(&format!("to_index={to_index}")) && !err.contains(&format!("{expected:?}")), "{err}");
+
+        let (prep, mut high) = one_leaf();
+        high[0] = u64::from(u32::MAX) + 1;
+        assert!(assemble_remote_deposit_batch_calls(vec![prep], vec![proof(high)]).is_err(), "high bit above u32 must not match");
+
+        let (prep, expected) = one_leaf();
+        let calls = assemble_remote_deposit_batch_calls(vec![prep], vec![proof(expected.clone())]).expect("matching proxy public inputs");
+        let decoded = batchAppendCall::abi_decode(&calls[0].call_data).expect("calldata");
+        assert_eq!(decoded.publicInputs, expected.iter().copied().map(U256::from).collect::<Vec<_>>());
+        assert_eq!((calls.len(), calls[0].from_index, calls[0].to_index), (1, 4, to_index));
+
+        let (prep, expected) = one_leaf();
+        let matched = proof(expected);
+        let err = assemble_remote_deposit_batch_calls(vec![prep], vec![matched.clone(), matched]).expect_err("extra proxy output").to_string();
+        assert!(err.contains("proxy output count 2 != chunk count 1"), "{err}");
+    }
+}
+
 /// Build deposit batchAppend calls using a remote Prove Proxy instead of local Plonky2+Groth16.
 /// Fetches L1 data locally, sends frontier+leaves to Prove Proxy, and returns calldata.
 pub async fn build_deposit_batch_append_calls_remote(
@@ -1076,19 +1148,10 @@ pub async fn build_deposit_batch_append_calls_remote(
 
     // ── Phase 1: compute all chunk preimages locally (pure compute, no I/O) ──
     // This gives us from_index/to_index/new_frontier/batch_commit for each chunk.
-    struct ChunkPrep {
-        from_index: u32,
-        to_index: u32,
-        batch_commit: [u32; 8],
-        preimage: BatchAppendPreimage,
-        circuit_deposits: Vec<DepositLeafData>,
-        proxy_deposits: Vec<ProxyDepositLeafInput>,
-        old_frontier_str: Vec<String>,
-    }
 
     let mut frontier = inputs.old_frontier.clone();
     let mut from_index = inputs.from_index;
-    let mut prep_list: Vec<ChunkPrep> = Vec::new();
+    let mut prep_list: Vec<DepositBatchChunkPrep> = Vec::new();
 
     for chunk in inputs.leaves.chunks(MAX_DEPOSIT_BATCH_SIZE) {
         let old_frontier_str: Vec<String> = frontier.iter().map(|h| {
@@ -1123,7 +1186,7 @@ pub async fn build_deposit_batch_append_calls_remote(
             note_commitment: leaf.note_commitment,
         }).collect();
 
-        prep_list.push(ChunkPrep {
+        prep_list.push(DepositBatchChunkPrep {
             from_index,
             to_index: preimage.to_index,
             batch_commit: preimage.batch_commit,
@@ -1207,8 +1270,38 @@ pub async fn build_deposit_batch_append_calls_remote(
         .collect::<anyhow::Result<_>>()?;
 
     // ── Phase 4: assemble calldata from proxy outputs + preimages ──
-    let mut calls = Vec::with_capacity(proxy_outputs.len());
+    assemble_remote_deposit_batch_calls(prep_list, proxy_outputs)
+}
+
+struct DepositBatchChunkPrep {
+    from_index: u32,
+    to_index: u32,
+    batch_commit: [u32; 8],
+    preimage: BatchAppendPreimage,
+    circuit_deposits: Vec<DepositLeafData>,
+    proxy_deposits: Vec<ProxyDepositLeafInput>,
+    old_frontier_str: Vec<String>,
+}
+
+fn assemble_remote_deposit_batch_calls(
+    prep_list: Vec<DepositBatchChunkPrep>,
+    proxy_outputs: Vec<BridgeDepositBatchGroth16Proof>,
+) -> anyhow::Result<Vec<DepositBatchAppendCall>> {
+    anyhow::ensure!(prep_list.len() == proxy_outputs.len(), "deposit batch proxy output count {} != chunk count {}", proxy_outputs.len(), prep_list.len());
+    let mut calls = Vec::with_capacity(prep_list.len());
     for (prep, proxy_output) in prep_list.into_iter().zip(proxy_outputs.into_iter()) {
+        let expected_public_inputs = prep.preimage.to_u32_words();
+        let public_inputs_match = proxy_output.public_inputs.len() == expected_public_inputs.len()
+            && proxy_output.public_inputs.iter().zip(expected_public_inputs.iter()).all(|(got, expected)| {
+                u32::try_from(*got).ok().is_some_and(|got| got == *expected)
+            });
+        anyhow::ensure!(
+            public_inputs_match,
+            "deposit batch proxy public inputs diverged from local preimage: from_index={} to_index={}",
+            prep.from_index,
+            prep.to_index,
+        );
+
         let mut proof = [U256::ZERO; 8];
         for (i, value) in proxy_output.solidity_proof.iter().enumerate() {
             proof[i] = U256::from_str_radix(value.trim_start_matches("0x"), 16)?;

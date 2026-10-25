@@ -173,3 +173,7 @@ A signed claim hash is written to the existing per-leaf `ReceiptUnknown` hold be
 | `OperatorPending` | `TokenNotConfigured`, `RegistrationPaused`, `TotalOverflow`, `ClaimableOverflow` |
 | `Held` | `ProofNotReady`, `RpcUnavailable`, `ReceiptUnknown`, `FeeRefused`, `LiquidityShort` |
 | `AttemptSpent` | `MalformedReceipt`, `RootUnauthorized`, `ProofDataInvalid`, `ProofGenerationFailed`, `SendFailed`, `BatchReverted` |
+
+## Remote prover
+
+A remote deposit `batchAppend` proxy public-input list must match the locally computed preimage, including length and the `u32` range, before calldata is built. A mismatch is rejected locally. Existing on-chain verification is retained. This is not a fund-loss fix.
