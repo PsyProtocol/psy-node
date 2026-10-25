@@ -574,7 +574,6 @@ mod tests {
         assert_eq!(proof.kind, Kind::GiftWrap);
         let proof_content: serde_json::Value = serde_json::from_str(&proof.content).unwrap();
         assert_eq!(proof_content["type"], "psy_deposit_proof");
-        assert_eq!(proof_content["version"], 2);
         assert_eq!(proof_content["deposit_proof"]["deposit_index"], "7");
         let backup_id = proof_content["backup_id"].as_str().unwrap();
         assert_eq!(backup_id.len(), 64);

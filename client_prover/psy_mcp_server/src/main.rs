@@ -1925,16 +1925,16 @@ mod url_guard_tests {
 
     #[test]
     fn websocket_schemes_are_allowed_because_the_relay_override_needs_them() {
-        // private_transfer's `relay` is a Nostr websocket. Rejecting ws/wss
-        // would have made this guard unusable there.
-        assert!(guard_outbound_url("wss://nostr-stg.psy-protocol.xyz").is_ok());
+        // A public IP literal, not a hostname: the guard resolves the host,
+        // and these tests must not depend on external DNS.
+        assert!(guard_outbound_url("wss://1.1.1.1").is_ok());
     }
 
     #[test]
     fn a_public_https_override_is_allowed() {
-        let got = resolve_agent_url(Some("https://services-stg.psy-protocol.xyz"), default_url)
+        let got = resolve_agent_url(Some("https://1.1.1.1"), default_url)
             .expect("a public host is a legitimate override");
-        assert_eq!(got, "https://services-stg.psy-protocol.xyz");
+        assert_eq!(got, "https://1.1.1.1");
     }
 
     #[test]

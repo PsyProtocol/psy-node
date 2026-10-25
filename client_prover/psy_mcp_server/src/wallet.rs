@@ -2324,26 +2324,55 @@ pub fn withdraw_nonce_to_hex(nonce: &[u8; 32]) -> String {
     format!("0x{}", hex::encode(nonce))
 }
 
+/// Draw budget shared by generate_withdraw_nonce's all-zero retry and
+/// reserve_withdrawal_nonce's claimed redraw — one bounded policy, not two.
+pub const WITHDRAW_NONCE_DRAWS: usize = 8;
+
 /// Draws a fresh 256-bit withdraw nonce from the OS entropy pool. An all-zero
 /// draw is retried rather than accepted, the draw count is capped so a broken
 /// entropy source fails loudly, and the clock is never a fallback — a
 /// unix-seconds nonce has neither uniqueness nor width.
 fn generate_withdraw_nonce(rng: &mut impl RngCore) -> Result<[u8; 32]> {
-    const DRAWS: usize = 8;
-    for _ in 0..DRAWS {
+    for _ in 0..WITHDRAW_NONCE_DRAWS {
         let mut bytes = [0u8; 32];
         rng.try_fill_bytes(&mut bytes).map_err(|e| anyhow!("OS entropy source failed: {e}"))?;
         if bytes != [0u8; 32] {
             return Ok(bytes);
         }
     }
-    bail!("OS entropy produced an all-zero withdraw nonce {DRAWS} times in a row")
+    bail!("OS entropy produced an all-zero withdraw nonce {WITHDRAW_NONCE_DRAWS} times in a row")
 }
 
-/// Production draw from the OS entropy pool; tests inject their own RNG into
-/// `generate_withdraw_nonce` instead of sampling real randomness.
-pub fn random_withdraw_nonce() -> Result<[u8; 32]> {
-    generate_withdraw_nonce(&mut rand::rngs::OsRng)
+/// Pins or draws the withdraw nonce and reserves it against the destination
+/// bridge's claimedNullifiers, so a re-pinned retry of a settled burn fails
+/// BEFORE the burn. A pinned nonce is checked exactly once and never
+/// re-randomized; a generated nonce redraws only claimed draws, at most
+/// WITHDRAW_NONCE_DRAWS of them; any undeterminable check aborts immediately
+/// (fail closed — no further draws, nothing submitted). Every refusal is one
+/// preflight gate at the call sites; the message says whether the nonce was
+/// consumed or the check could not be made.
+pub async fn reserve_withdrawal_nonce(
+    client: &crate::l1::L1Client,
+    bridge: alloy_primitives::Address,
+    pinned: Option<[u8; 32]>,
+) -> Result<[u8; 32]> {
+    if let Some(nonce) = pinned {
+        if client.is_withdrawal_claimed(bridge, &nonce).await? {
+            bail!(
+                "withdraw nonce {} is already claimed on the destination bridge — nothing was submitted; pass a different nonce",
+                withdraw_nonce_to_hex(&nonce)
+            );
+        }
+        return Ok(nonce);
+    }
+    for _ in 0..WITHDRAW_NONCE_DRAWS {
+        let nonce = generate_withdraw_nonce(&mut rand::rngs::OsRng)?;
+        if client.is_withdrawal_claimed(bridge, &nonce).await? {
+            continue; // consumed draw — the budget bounds the retries
+        }
+        return Ok(nonce);
+    }
+    bail!("all {WITHDRAW_NONCE_DRAWS} generated withdraw nonces were already claimed on the destination bridge — nothing was submitted")
 }
 
 impl WalletManager {
@@ -3110,5 +3139,95 @@ impl WalletManager {
             )
             .await?;
         Ok(proof.value.0.elements[0].to_canonical_u64())
+    }
+}
+
+#[cfg(test)]
+mod withdraw_nonce_reservation_tests {
+    use super::*;
+    use crate::l1::tests::{rpc_err, rpc_ok, spawn_json_rpc_fixture};
+    use std::sync::atomic::Ordering;
+
+    fn test_bridge() -> alloy_primitives::Address {
+        "0x00000000000000000000000000000000000000b2".parse().unwrap()
+    }
+
+    fn claimed_word() -> String {
+        format!("0x{}1", "0".repeat(63))
+    }
+
+    fn unclaimed_word() -> String {
+        format!("0x{}", "0".repeat(64))
+    }
+
+    /// A pinned nonce the bridge reports consumed is refused with the
+    /// used-nonce family and checked EXACTLY once — never redrawn.
+    #[tokio::test]
+    async fn a_pinned_claimed_nonce_is_refused_and_never_redrawn() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(claimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [7u8; 32];
+        let err = reserve_withdrawal_nonce(&client, test_bridge(), Some(pinned)).await.unwrap_err();
+        assert!(err.to_string().contains("already claimed"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a pinned nonce is preflighted exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_unclaimed_nonce_is_returned_verbatim() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(unclaimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let pinned = [0xAA; 32];
+        assert_eq!(
+            reserve_withdrawal_nonce(&client, test_bridge(), Some(pinned)).await.unwrap(),
+            pinned,
+            "a pinned unclaimed nonce is used bit-verbatim"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The first 7 preflights report the draw consumed, the 8th is fresh —
+    /// retries consume draws and stay inside the budget.
+    #[tokio::test]
+    async fn generated_nonces_retry_only_claimed_draws_within_the_bound() {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served_for_fixture = served.clone();
+        let (url, calls) = spawn_json_rpc_fixture(move |_| {
+            let n = served_for_fixture.fetch_add(1, Ordering::SeqCst);
+            let word = if n < 7 { claimed_word() } else { unclaimed_word() };
+            rpc_ok(serde_json::json!(word))
+        });
+        let client = crate::l1::L1Client::read_only(url);
+        let nonce = reserve_withdrawal_nonce(&client, test_bridge(), None).await.unwrap();
+        assert_ne!(nonce, [0u8; 32], "a generated nonce is never zero");
+        assert_eq!(calls.load(Ordering::SeqCst), WITHDRAW_NONCE_DRAWS, "exactly the budget was drawn");
+    }
+
+    #[tokio::test]
+    async fn generated_nonces_refuse_after_the_full_bound_is_claimed() {
+        let (url, calls) = spawn_json_rpc_fixture(|_| rpc_ok(serde_json::json!(claimed_word())));
+        let client = crate::l1::L1Client::read_only(url);
+        let err = reserve_withdrawal_nonce(&client, test_bridge(), None).await.unwrap_err();
+        assert!(err.to_string().contains("already claimed"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), WITHDRAW_NONCE_DRAWS, "no draw beyond the budget");
+    }
+
+    /// A preflight that cannot decide aborts immediately — no further draws,
+    /// nothing submitted, and NOT the used-nonce family.
+    #[tokio::test]
+    async fn an_undeterminable_preflight_aborts_immediately() {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served_for_fixture = served.clone();
+        let (url, calls) = spawn_json_rpc_fixture(move |_| {
+            let n = served_for_fixture.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                rpc_ok(serde_json::json!(claimed_word()))
+            } else {
+                rpc_err("destination rpc is down")
+            }
+        });
+        let client = crate::l1::L1Client::read_only(url);
+        let err = reserve_withdrawal_nonce(&client, test_bridge(), None).await.unwrap_err();
+        assert!(!err.to_string().contains("already claimed"), "undetermined, not consumed: {err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "fail closed stops at the first undeterminable check");
     }
 }

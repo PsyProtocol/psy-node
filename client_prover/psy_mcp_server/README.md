@@ -273,6 +273,18 @@ that second, human-made call.
 | 4.3 | "Withdraw 0.005 PSY to 0xd307...10EF" then execute | `submitted=true` + txHash |
 | 4.4 | "Withdraw to 0x000...0" | Error: "zero address — would burn the funds" |
 
+**Withdraw nonce preflight (`withdraw` + `claim_batch` withdraw legs):** before
+anything burns, the destination chain's configured RPC and Bridge are resolved
+and the RPC must serve the configured chain id, then `claimedNullifiers` is read
+for the nonce via a strict one-word `eth_call` — an already-consumed nonce or an
+undeterminable check refuses the burn (nothing submitted, policy refunded). A
+caller-pinned nonce is used verbatim — never re-randomized; a generated nonce
+redraws only consumed draws, at most 8, then refuses. If a submission ends in an
+unknown state the result still carries that exact nonce — preserve it for
+status investigation; do not resubmit until the prior outcome is resolved.
+The L1 preflight narrows wasted burns; it does **not** prove the L2 leg is
+not already in flight.
+
 ### Group 5 — Contracts (~20 min)
 
 | # | Prompt | Expected |
