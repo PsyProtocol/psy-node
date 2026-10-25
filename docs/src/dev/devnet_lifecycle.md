@@ -775,6 +775,8 @@ Fresh start, application restart, and the supported stop/resume order are sectio
 
 Local deployment summaries are deleted with the snapshots, so localhost, localhostBsc, and localhostBase deploy with `--reset`. `REDEPLOY_L1=false` still governs non-local networks only. Envio storage for the bound namespace is reset with the new chain.
 
+`make resume-retained` is the only startup that reuses the existing localhost chain. It passes the same component set as `make run-all`, then `--resume --skip-bridge` and explicit zero coordinator-worker, realm-worker, and prove-proxy counts. It requires loopback, no fork, the canonical `genesis.json`, and no daemon, purge, teardown, or control selector. Before the first spawn it requires the existing genesis, three Anvil snapshots, three localhost deployment documents, Realm P2P config and secret files, and the bound Docker volumes. It starts the database with `start_db.sh --persist`, loads each Anvil snapshot, and checks the saved genesis, chain id, and Bridge and StateManager code. It does not reset volumes, generate genesis, deploy contracts, or run `envio compose down -v`. The services database must already exist. The privacy UI still starts, but the relayer, guardians, and bridge proposer do not, and no guardian or relayer key is loaded. A stopped database group is a prerequisite; this target does not stop one.
+
 Do not pass `--steps-tracing`. It records full execution traces into the state dump until the periodic write starves the RPC loop.
 
 ## 16. Control Socket and Application Lifecycle
