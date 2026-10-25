@@ -342,7 +342,7 @@ pub struct BatchWithdrawalsArgs {
     pub multicall3_address: Option<String>,
     #[arg(long, default_value = crate::bridge::constants::DEFAULT_DEPLOYMENTS_NETWORK)]
     pub deployments_network: String,
-    #[arg(long, env = "PRIVATE_KEY")]
+    #[arg(long, env = "PRIVATE_KEY", hide_env_values = true)]
     pub private_key: Option<String>,
     #[arg(long, env = "KEYSTORE_PATH")]
     pub keystore_path: Option<PathBuf>,

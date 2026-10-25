@@ -92,11 +92,11 @@ pub fn parse_contract_call_args(s: &str) -> anyhow::Result<Vec<ContractCallArgs>
 pub struct WalletSourceArgs {
     #[clap(long, default_value = "zk")]
     pub sign_type: SignType,
-    #[clap(short, long, env = "PRIVATE_KEY", conflicts_with = "keystore_path")]
+    #[clap(short, long, env = "PRIVATE_KEY", hide_env_values = true, conflicts_with = "keystore_path")]
     pub private_key: Option<String>,
     #[clap(long, env = "KEYSTORE_PATH", conflicts_with = "private_key")]
     pub keystore_path: Option<String>,
-    #[clap(long, env = "WALLET_PASSWORD")]
+    #[clap(long, env = "WALLET_PASSWORD", hide_env_values = true)]
     pub wallet_password: Option<String>,
     #[clap(long)]
     pub fingerprint: Option<String>,
@@ -288,7 +288,7 @@ pub struct RealmJobData {
 pub struct ExportKeyStoreArgs {
     #[clap(long, env = "KEYSTORE_PATH")]
     pub keystore_path: String,
-    #[clap(long, env = "WALLET_PASSWORD")]
+    #[clap(long, env = "WALLET_PASSWORD", hide_env_values = true)]
     pub wallet_password: String,
 }
 
