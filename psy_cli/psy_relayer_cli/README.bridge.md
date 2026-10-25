@@ -26,6 +26,47 @@ cargo run -p psy_relayer_cli -- export-solidity-verifier \
 - Any local checkout path for `gnark-plonky2-verifier` should be configured in the FFI dependency layer, not hardcoded in this README.
 - `generate-groth16` / `verify-groth16` currently use uncompressed proof/vk only.
 
+## Guardian policy approval
+
+Registration stays one command. Bootstrap and replacement are three processes: freeze, local custody signature, then resume. Transfer is stdin and stdout only. The commands create no request, response, or approval file. The frozen request already lives in `db/relayer.redb`.
+
+`guardian-policy --intent register` is unchanged. It still takes `--rpc-config`, `--guardian-root`, repeated `--l1-config`, and `--exclusive-registration-intake`. It rejects `--next-members-json`.
+
+`guardian-policy --intent bootstrap` requires `--exclusive-registration-intake` and rejects `--next-members-json`. Members come from the configured initial account, in configured order. `guardian-policy --intent replace` rejects exclusive intake and requires `--next-members-json`, a canonical JSON array of exactly three ordered member hashes. Both freeze the existing `Request` row, or return the stored row when it is the same request. A different pending request is rejected. Neither contacts a guardian, proves, nor submits.
+
+Stdout is one line: the exact stored canonical `GuardianSignRequest` JSON, plus a newline. Stderr carries `request_id=0x<64 lowercase hex> nonce=<u64> operation=Bootstrap|ReplacePolicy account=<canonical Hash4 JSON string>`, plus tracing. Those fields are for review. The sign flags are the operator's independently reviewed intent: the account and network selected from the canonical config, the nonce and request id the operator accepts, and the ordered target members the operator intends to authorize. Do not copy those values out of the request body. Pass the stdout line through unchanged. Do not re-serialize it or save it.
+
+Stop only the guardian that will sign. `guardian-policy-sign` opens that guardian's `db/guardian-{id}.redb` exclusively and does not open `db/relayer.redb`. The normal relayer daemon can keep serving history during the signature. Pipe prepare's stdout directly into each custodian's stdin:
+
+```bash
+psy_relayer_cli guardian-policy-sign \
+  --rpc-config <rpc-config.json> \
+  --guardian-root <guardian-root> \
+  --guardian-id <1|2|3> \
+  --request-id <0x64-hex> \
+  --account-public-key <0x64-hex> \
+  --nonce <session-nonce> \
+  --operation <bootstrap|replace-policy> \
+  --member-hash <0x64-hex> --member-hash <0x64-hex> --member-hash <0x64-hex> \
+  [--l1-config <deployment.json> ...]
+```
+
+The three `--member-hash` flags are the ordered target members the operator reviewed, not a copy of the current policy or of the request trace. `--request-id`, `--account-public-key`, `--nonce`, `--operation`, and those hashes are compared with the stdin request and its verified transition. Network magic and account identity come from the selected canonical config. The command loads only that guardian's existing keystore through `GUARDIAN_{1,2,3}_KEYSTORE_PASSWORD`. It writes one canonical `GuardianSignResponse` JSON line to stdout. Repeat for a second current member, passing the same unchanged prepare stdout and that member's own reviewed approval. Restart each guardian after its signature.
+
+Resume reads a canonical JSON array of exactly those two stdout lines on its own stdin. Pipe them through without writing a response file. It checks both against the frozen request, the exact message, and the authenticated current policy, stores the resulting signatures, then proves and submits:
+
+```bash
+psy_relayer_cli guardian-policy-resume \
+  --rpc-config <rpc-config.json> \
+  --guardian-root <guardian-root> \
+  --request-id <0x64-hex> \
+  [--l1-config <deployment.json> ...]
+```
+
+The resume `--request-id` is the same independently reviewed id, not a value read back from a saved response. Resume prints nothing on success. Its stdout stays empty. A pending policy request without those signatures is not collected over HTTP. `/v1/sign-session` refuses Bootstrap and ReplacePolicy before any cached signature can be returned. If resume stops after the request is frozen, repeat the same prepare command: it reprints the stored request on stdout. After both signatures are stored, repeat resume with the same two response streams; the existing inclusion recovery finishes that nonce.
+
+Prepare and resume are the commands that open `db/relayer.redb`; sign does not. Prepare does not serve history. Resume holds that relayer database exclusively and returns as soon as the policy operation does. It drops the history future when that operation finishes, on success or failure, leaves no listener running, and does not sleep. Stop the normal daemon before either command and start it again when resume returns. That daemon is the history owner: it exclusively opens `db/relayer.redb` and serves `/v1/sessions`. A second open fails while prepare, resume, or the daemon still holds it. Local signing does not require that stop. After the daemon is the history owner again, restart the guardians that were stopped for signing. Each guardian imports the `Included` session from that daemon before any further bridge work. The policy command does not push the inclusion into their journals.
+
 ## Guardian request archive
 
 The relayer archive advances each frozen request through `Request → Signed → Proved → Included`.

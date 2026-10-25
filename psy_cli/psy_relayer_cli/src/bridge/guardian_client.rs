@@ -106,6 +106,7 @@ impl GuardianClient {
 
     pub async fn collect(&self, request_json: &JsonText<GuardianSignRequest>, policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> anyhow::Result<MultisigSignatures> {
         let request = request_json.decode()?;
+        ensure!(request.operation == protocol::GuardianOperation::Bridge, "policy signatures require explicit local operator approval");
         // Cutover gate: retained schema-2 rows stay readable but are never posted, even to an
         // old guardian. Reject locally before any network I/O; the stored row is untouched.
         ensure!(request.schema_version == 3, "schema 2 signing obligation must be included before upgrading; retained request is unchanged");
@@ -204,7 +205,7 @@ async fn request_signature(http: &reqwest::Client, guardian: usize, url: url::Ur
     }
 }
 
-fn select_signatures(accepted: &mut [(u8, PsyCompressedSecp256K1Signature)], policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> Option<MultisigSignatures> {
+pub(crate) fn select_signatures(accepted: &mut [(u8, PsyCompressedSecp256K1Signature)], policy: &MultisigPolicy, sighash: QHashOut<GoldilocksField>) -> Option<MultisigSignatures> {
     accepted.sort_by_key(|member| member.0);
     for first in 0..accepted.len() {
         for second in first + 1..accepted.len() {
@@ -218,7 +219,7 @@ fn select_signatures(accepted: &mut [(u8, PsyCompressedSecp256K1Signature)], pol
     None
 }
 
-fn verify_response(request: &GuardianSignRequest, policy: &MultisigPolicy, message: Hash256, response: &GuardianSignResponse) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
+pub(crate) fn verify_response(request: &GuardianSignRequest, policy: &MultisigPolicy, message: Hash256, response: &GuardianSignResponse) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
     ensure!(response.request_id == request.request_id()? && response.network_magic == request.network_magic && response.user_id == request.user_id && response.session_nonce == request.session_nonce, "guardian response context mismatch");
     ensure!(response.policy_commitment == policy.commitment()? && response.member_index < 3 && response.message.0 == message.0, "guardian response policy/message mismatch");
     Ok(PsyCompressedSecp256K1Signature { public_key: response.public_key.0, signature: response.signature.0, message })
@@ -1308,11 +1309,12 @@ pub(crate) async fn prove_pending_request(
     archive.save_request(config, request_json, deposit_tree_states, &[])?;
     let signatures = match archive.signatures(request.session_nonce)? {
         Some(signatures) => signatures,
-        None => {
+        None if request.operation == protocol::GuardianOperation::Bridge => {
             let signatures = client.collect(request_json, &policy, trace.finalization.sig_hash).await?;
             archive.save_signatures(request.session_nonce, &signatures)?;
             signatures
         }
+        None => anyhow::bail!("local operator signatures are required for the frozen policy request"),
     };
     validate_policy_signatures(&signatures, &policy, trace.finalization.sig_hash)?;
     wallet.inject_multisig_signatures(trace.meta.public_key, signatures).await?;
@@ -2160,6 +2162,14 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
     }
 
+    fn bridge_collect_request() -> GuardianSignRequest {
+        let mut request = crate::guardian::test_fixture::codec_request_fixture();
+        request.operation = protocol::GuardianOperation::Bridge;
+        request.withdrawal_records = vec![protocol::WithdrawalBurnRecord { sender_user_id: 1, token_contract_id: 3, destination_chain_index: 0, token: [0, 0, 0, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b, 0x0b0b0b0b], amount: [0, 0, 0, 0, 0, 0, 0, 1], recipient: [0, 0, 0, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c, 0x0c0c0c0c], nonce: [0; 8] }];
+        request.validate().unwrap();
+        request
+    }
+
     fn authorized_signatures() -> (QHashOut<GoldilocksField>, MultisigPolicy, [PsyCompressedSecp256K1Signature; 3]) {
         use plonky2::hash::poseidon::PoseidonPermutation;
         use psy_client_common::data::secp256k1::CompressedPublicKey;
@@ -2245,7 +2255,7 @@ mod tests {
     #[test]
     fn quorum_succeeds_when_one_guardian_refuses() {
         let (sighash, policy, signatures) = authorized_signatures();
-        let request = crate::guardian::test_fixture::codec_request_fixture();
+        let request = bridge_collect_request();
         let json = JsonText::from_value(&request).unwrap();
         let later = Duration::from_millis(300);
         let origins = [
@@ -2261,9 +2271,23 @@ mod tests {
     }
 
     #[test]
+    fn collect_refuses_policy_before_any_network_request() {
+        let (sighash, policy, _) = authorized_signatures();
+        let mut request = crate::guardian::test_fixture::codec_request_fixture();
+        request.operation = protocol::GuardianOperation::ReplacePolicy;
+        let json = JsonText::from_value(&request).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origins = [format!("http://{}/", listener.local_addr().unwrap()), refused_origin(), refused_origin()];
+        let error = drive(async { GuardianClient::new(&origins).unwrap().collect(&json, &policy, sighash).await.unwrap_err() });
+        drop(listener);
+        assert!(error.to_string().contains("explicit local operator approval"), "{error:?}");
+    }
+
+    #[test]
     fn transport_and_retryable_failures_are_signature_quorum_unavailable() {
         let (sighash, policy, _) = authorized_signatures();
-        let json = JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap();
+        let request = bridge_collect_request();
+        let json = JsonText::from_value(&request).unwrap();
         let missing = [refused_origin(), refused_origin(), refused_origin()];
         let error = drive(async {
             GuardianClient::new(&missing).unwrap().collect(&json, &policy, sighash).await.unwrap_err()
@@ -2292,7 +2316,7 @@ mod tests {
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
         let (sighash, policy, signatures) = authorized_signatures();
-        let request = crate::guardian::test_fixture::codec_request_fixture();
+        let request = bridge_collect_request();
         let json = JsonText::from_value(&request).unwrap();
         let mut halt_id = [0u8; 32];
         halt_id[..4].copy_from_slice(&0xdeadbeefu32.to_be_bytes());
@@ -2456,7 +2480,8 @@ mod tests {
     #[test]
     fn hard_refusal_follows_guardian_id_not_arrival() {
         let (sighash, policy, _) = authorized_signatures();
-        let json = JsonText::from_value(&crate::guardian::test_fixture::codec_request_fixture()).unwrap();
+        let request = bridge_collect_request();
+        let json = JsonText::from_value(&request).unwrap();
         let origins = [
             serve_once(GuardianSignError::ProofMismatch.http_status(), refusal_body(GuardianSignError::ProofMismatch), Duration::from_millis(400)),
             refused_origin(),
