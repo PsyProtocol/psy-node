@@ -182,6 +182,7 @@ fn resolve_tx_count_range(config: &PsyFaucetOperatorsConfig) -> anyhow::Result<(
         (None, None) => anyhow::bail!("faucet config requires sdKeyMinTxCount or sdKeyMaxTxCount"),
     };
     anyhow::ensure!(range.0 <= range.1, "faucet sd-key min tx count exceeds max tx count");
+    anyhow::ensure!(range.0 >= 1 && range.1 <= 64, "faucet sd-key transaction count must be within 1..=64");
     Ok(range)
 }
 
@@ -254,6 +255,13 @@ impl PsyFaucetService {
             min_tx_count,
             max_tx_count,
         )?;
+        for call in &sd_key_config.transaction_count_policy.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("faucet SDKey requires a transaction count policy"))?.allowed_calls {
+            if call.contract_id == 0 && call.method_id == 2789897329 {
+                anyhow::ensure!(call.caller_contract_id == Some(config.faucet_contract_id),
+                    "faucet SDKey Transfer must be called by the faucet contract");
+            }
+        }
         let fingerprint = wallet_session.register_sd_key_dpn_circuit(function, sd_key_config).await?;
 
         let mut operators = Vec::with_capacity(config.operators.len());
@@ -895,6 +903,15 @@ mod tests {
         assert_eq!(config.operators[0].private_key, "key");
         assert_eq!(config.operators[0].fingerprint, "fingerprint");
         assert_eq!(config.operators[0].sign_type, "sd-key");
+        let mut range_config = config.clone();
+        range_config.sd_key_min_tx_count = Some(1);
+        range_config.sd_key_max_tx_count = Some(64);
+        assert_eq!(resolve_tx_count_range(&range_config).unwrap(), (1, 64));
+        range_config.sd_key_max_tx_count = Some(65);
+        assert!(resolve_tx_count_range(&range_config).is_err());
+        range_config.sd_key_min_tx_count = Some(0);
+        range_config.sd_key_max_tx_count = Some(64);
+        assert!(resolve_tx_count_range(&range_config).is_err());
     }
 
     #[tokio::test]

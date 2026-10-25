@@ -2153,8 +2153,8 @@ mod tests {
             &[DEFAULT_CALLER_CONTRACT_ID_U64, 5, DEFAULT_CALLER_CONTRACT_ID_U64],
             &[5, 0, 0],
             &[10, 20, 30],
-            3,
-            3,
+            1,
+            64,
         )
         .unwrap();
         let gadget = SDKeyDpnCircuitGadget::build_from_dpn_function(&definition, &config).unwrap();
@@ -2168,6 +2168,12 @@ mod tests {
 
         let valid = build_witness(vec![faucet, transfer, burn], inputs.clone(), 3);
         gadget.prove(dummy_private_key(), &valid, witness_sighash(&valid)).await.unwrap();
+
+        let at_limit = build_witness(vec![transfer; 64], vec![inputs[1].clone(); 64], 64);
+        gadget.prove(dummy_private_key(), &at_limit, witness_sighash(&at_limit)).await.unwrap();
+        assert!(psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+            &[5], &[0], &[20], 1, 65,
+        ).is_err());
 
         transfer.caller_contract_id = GF::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64);
         let direct_transfer = build_witness(vec![faucet, transfer, burn], inputs, 3);

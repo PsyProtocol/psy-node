@@ -59,6 +59,17 @@ network config -------------> build-time constants and runtime membership valida
 
 ## 1. Root `genesis.json`
 
+Faucet operator accounts use a caller-aware SDKey policy. The generator defaults
+to `--sd-key-min-tx-count 1 --sd-key-max-tx-count 64`: this counts the calls in
+one UPS, including nested calls and fee burn, rather than lifetime faucet claims.
+Top-level calls may invoke the faucet method and fee burn; token Transfer is
+authorized only when its caller is the faucet contract. The generator derives
+the account fingerprint from this policy and writes `sdKeyMinTxCount`,
+`sdKeyMaxTxCount`, and `sdKeyAllowedCallerContractIds` into the operator config.
+An explicit `--sd-key-fingerprint` must match the derived fingerprint. Changing
+these policy inputs changes faucet account identities; editing an existing
+operator config alone cannot change an account already registered on-chain.
+
 ### 1.1 Trigger
 
 Run generation only when at least one of these changed ([circuit-and-verifier-operations.md](circuit-and-verifier-operations.md) §6.1):
