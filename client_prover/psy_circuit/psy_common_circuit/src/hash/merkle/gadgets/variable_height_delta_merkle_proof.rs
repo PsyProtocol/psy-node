@@ -32,6 +32,10 @@ impl VariableHeightBitInfo {
         }
         BoolTarget::new_unsafe(base)
     }
+    /// Returns the PARENT index of the subtree root, i.e. `index >> (height + 1)`
+    /// — the direction bit towards the parent is already dropped. (The opt
+    /// variant returns the node index `index >> height` instead; see its
+    /// `get_root_index`.)
     pub fn get_root_parent_index<F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> Target {
         let mut sub_root_bit = builder.zero();
         let mut sub_root_index = builder.zero();
@@ -635,6 +639,33 @@ mod tests {
                 tree.set_leaf(rand_index, QHashOut::rand())
             })
             .collect()
+    }
+
+    /// Pins the semantics of the non-opt helper: for a proof at leaf `index`
+    /// with subtree `height`, `get_root_parent_index` is `index >> (height + 1)`
+    /// — the PARENT of the subtree root, with the direction bit already
+    /// dropped. (The opt variant returns the node index `index >> height`
+    /// instead; see its `get_root_index`.)
+    #[test]
+    fn get_root_parent_index_semantics() -> anyhow::Result<()> {
+        for (index, height) in [(0u64, 1usize), (1, 1), (5, 3), (0x1234_5678, 7), (0x7FFF_FFFF, 13)] {
+            let max_height = 32usize;
+            let config = CircuitConfig::standard_recursion_config();
+            let mut builder = CircuitBuilder::<F, D>::new(config);
+            let gadget = VariableHeightDeltaMerkleProofGadget::add_virtual_to_full::<PoseidonHash, F, D>(&mut builder, max_height, None);
+            let parent_index = gadget.bit_info.get_root_parent_index(&mut builder);
+            builder.register_public_inputs(&[parent_index]);
+            let data = builder.build::<C>();
+
+            let siblings: Vec<QHashOut<F>> = (0..height).map(|_| QHashOut::rand()).collect();
+            let mut pw = PartialWitness::new();
+            gadget.set_witness_params(&mut pw, F::from_noncanonical_u64(index), QHashOut::rand(), QHashOut::rand(), &siblings)?;
+
+            let proof = data.prove(pw)?;
+            data.verify(proof.clone())?;
+            assert_eq!(proof.public_inputs[0].to_canonical_u64(), index >> (height + 1), "parent index (index={index}, height={height})");
+        }
+        Ok(())
     }
 
     #[test]

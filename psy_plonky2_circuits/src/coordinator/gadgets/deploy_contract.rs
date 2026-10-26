@@ -62,7 +62,8 @@ impl BatchDeployContractsGadget {
             g.set_witness(witness, v)?;
         }
         if contract_leaves.len() < self.contract_leaves.len() {
-            let empty = PQEDContractLeaf::default();
+            let mut empty = PQEDContractLeaf::default();
+            empty.state_tree_height = F::from_canonical_u64(1);
             for i in contract_leaves.len()..self.contract_leaves.len() {
                 self.contract_leaves[i].set_witness(witness, &empty)?;
             }

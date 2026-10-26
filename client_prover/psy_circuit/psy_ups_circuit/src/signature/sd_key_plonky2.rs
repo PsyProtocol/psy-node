@@ -30,16 +30,9 @@ use psy_common_circuit::{
 };
 use psy_config::network_constants::PSY_NETWORK_MAGIC;
 use psy_crypto::{hash::traits::hasher::MerkleZeroHasher, signature::zk::wallet::PRIVATE_KEY_CONSTANTS};
-use psy_dpn_circuit::vm::compile::PsyContractFunctionBuilderGadget;
-use psy_network_circuit::gadgets::qdata::{
-    user::PsyUserLeafGadget,
-    user_contract_state::SignContextGadget,
-};
+use psy_network_circuit::gadgets::qdata::{user::PsyUserLeafGadget, user_contract_state::SignContextGadget};
 use psy_network_circuit::ups::gadgets::ups_signature_data::PsyUserProvingSessionSignatureDataCompactGadget;
-use psy_vm::{
-    dpn::vm::def::DPNFunctionCircuitDefinition,
-    ups::signature::{DPNSoftwareDefinedSignatureInput, Plonky2SoftwareDefinedSignatureInput},
-};
+use psy_vm::ups::signature::SDKeyPlonky2CircuitWitnessInput;
 
 use crate::signature::state_reader::StateReaderGadget;
 
@@ -98,183 +91,7 @@ pub(super) fn compute_sig_hash(
 }
 
 #[derive(Debug)]
-pub struct DPNSoftwareDefinedSignatureGadget {
-    pub fn_builder_gadget: PsyContractFunctionBuilderGadget,
-    pub fn_def: DPNFunctionCircuitDefinition,
-    pub contract_id: u64,
-    pub contract_state_tree_height: u8,
-    pub session_proof_tree_height: u8,
-    pub force_four_align: bool,
-    pub circuit_inputs: Vec<Target>,
-    pub private_key: HashOutTarget,
-    pub sig_hash: HashOutTarget,
-    pub sig_data: PsyUserProvingSessionSignatureDataCompactGadget,
-    pub sign_context: SignContextGadget,
-    pub start_user_leaf: PsyUserLeafGadget,
-    pub nonce: Target,
-    pub circuit_data: Option<CircuitData<GF, C, D>>,
-    pub minifier_chain: Option<PsyProofMinifierChain<D, GF, C>>,
-}
-
-impl DPNSoftwareDefinedSignatureGadget {
-    pub fn add_virtual_to(
-        builder: &mut CircuitBuilder<GF, D>,
-        fn_def: &DPNFunctionCircuitDefinition,
-        contract_id: u64,
-        contract_state_tree_height: u8,
-        session_proof_tree_height: u8,
-        force_four_align: bool,
-    ) -> Self {
-        let private_key = builder.add_virtual_hash();
-        let circuit_inputs = builder.add_virtual_targets(fn_def.circuit_inputs.len());
-        let nonce = builder.add_virtual_target();
-
-        let fn_builder_gadget = PsyContractFunctionBuilderGadget::add_virtual_to::<PoseidonHash, GF, D>(
-            builder,
-            fn_def,
-            contract_state_tree_height as usize,
-            session_proof_tree_height as usize,
-            circuit_inputs.clone(),
-            force_four_align,
-            Some(nonce),
-        );
-
-        let start_contract_state_tree_root = fn_builder_gadget.tx_ctx_header.transaction_call_start_ctx.start_contract_state_tree_root;
-        let end_contract_state_tree_root = fn_builder_gadget.tx_ctx_header.transaction_end_ctx.end_contract_state_tree_root;
-        builder.connect_hashes(start_contract_state_tree_root, end_contract_state_tree_root);
-
-        let sig_data = PsyUserProvingSessionSignatureDataCompactGadget::add_virtual_to(builder);
-        let sign_context = SignContextGadget::add_virtual_to(builder);
-        let start_user_leaf = PsyUserLeafGadget::create_virtual(builder);
-
-        let session_start = &fn_builder_gadget.tx_ctx_header.proving_session_start_ctx;
-        let call_start = &fn_builder_gadget.tx_ctx_header.transaction_call_start_ctx;
-
-        // Policy CFC session anchors ≡ signed session
-        builder.connect_hashes(session_start.checkpoint_tree_root, sign_context.checkpoint_tree_root);
-        let checkpoint_leaf_hash = session_start.checkpoint_leaf.to_hash::<PoseidonHash, GF, D>(builder);
-        builder.connect_hashes(checkpoint_leaf_hash, sig_data.checkpoint_leaf_hash);
-        session_start
-            .start_session_user_leaf
-            .connect_to_other(builder, start_user_leaf);
-        builder.connect_hashes(call_start.start_user_contract_tree_root, sign_context.user_leaf.user_state_tree_root);
-        builder.connect(call_start.start_user_balance, sign_context.user_leaf.balance);
-        builder.connect(call_start.start_user_event_index, sign_context.user_leaf.event_index);
-        builder.connect(session_start.checkpoint_id, sign_context.user_leaf.last_checkpoint_id);
-
-        let sig_hash = compute_sig_hash(builder, &sig_data, &sign_context, &start_user_leaf, nonce);
-
-        let public_key_param = get_zk_public_key_param::<C, D>(builder, &private_key);
-        let public_inputs_hash = builder.hash_two_to_one::<PoseidonHash>(sig_hash, public_key_param);
-        builder.register_public_inputs(&public_inputs_hash.elements);
-
-        Self {
-            fn_builder_gadget,
-            fn_def: fn_def.clone(),
-            contract_id,
-            contract_state_tree_height,
-            session_proof_tree_height,
-            force_four_align,
-            circuit_inputs,
-            private_key,
-            sig_hash,
-            sig_data,
-            sign_context,
-            start_user_leaf,
-            nonce,
-            circuit_data: None,
-            minifier_chain: None,
-        }
-    }
-
-    pub fn build_circuit(&mut self, builder: CircuitBuilder<GF, D>) -> anyhow::Result<()> {
-        let mut builder = builder;
-        builder.add_psy_type_b_common_gates();
-        pad_circuit_degree::<GF, D>(&mut builder, 11);
-
-        let circuit_data = builder.build::<C>();
-        let added_gates_for_minifier = [GateRef::new(ComparisonGate::new(32, 16))];
-        let minifier_chain =
-            PsyProofMinifierChain::<D, GF, C>::new_add_gates(&circuit_data.verifier_only, &circuit_data.common, 2, Some(&added_gates_for_minifier));
-
-        self.circuit_data = Some(circuit_data);
-        self.minifier_chain = Some(minifier_chain);
-        Ok(())
-    }
-
-    pub async fn prove(
-        &mut self,
-        private_key: QHashOut<GF>,
-        signature_input: &DPNSoftwareDefinedSignatureInput,
-        sig_hash: QHashOut<GF>,
-    ) -> anyhow::Result<ProofWithPublicInputs<GF, C, D>> {
-        let circuit_data = self.circuit_data.as_ref().ok_or_else(|| anyhow::anyhow!("Circuit not built"))?;
-        let minifier_chain = self
-            .minifier_chain
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Minifier chain not initialized"))?;
-
-        let expected = signature_input
-            .sig_data
-            .get_sig_action_for_user::<PoseidonHash>(
-                PSY_NETWORK_MAGIC,
-                signature_input.sign_context.user_leaf.user_id,
-                signature_input.nonce,
-                signature_input.sign_context.clone(),
-            )
-            .get_qhash::<PoseidonHash>();
-        anyhow::ensure!(
-            expected == sig_hash,
-            "SD prove sighash mismatch: host {} vs sig_hash {}",
-            sig_hash,
-            expected
-        );
-
-        let mut pw = PartialWitness::<GF>::new();
-        pw.set_hash_target(self.private_key, private_key.0)?;
-        pw.set_target_arr(&self.circuit_inputs, &signature_input.cfc_input.inputs)?;
-        set_sig_hash_witness(
-            &mut pw,
-            &self.sig_data,
-            &self.sign_context,
-            self.nonce,
-            &self.start_user_leaf,
-            &signature_input.sig_data,
-            &signature_input.sign_context,
-            signature_input.nonce,
-            &signature_input.start_session_user_leaf,
-        )?;
-
-        pw.set_hash_target(
-            self.fn_builder_gadget.session_proof_tree_root,
-            signature_input.cfc_input.session_proof_tree_root.0,
-        )?;
-        self.fn_builder_gadget
-            .tx_ctx_header
-            .set_witness(&mut pw, &signature_input.cfc_input.tx_input_ctx)?;
-        self.fn_builder_gadget
-            .state_reader
-            .set_witness(&mut pw, &signature_input.cfc_input, &self.fn_def)?;
-
-        let inner_proof = circuit_data.prove(pw)?;
-        let minified_proof = minifier_chain.prove(&inner_proof)?;
-        Ok(minified_proof)
-    }
-
-    pub fn get_fingerprint(&self) -> QHashOut<GF> {
-        self.minifier_chain
-            .as_ref()
-            .map(|chain| QHashOut(chain.get_fingerprint()))
-            .unwrap_or_default()
-    }
-
-    pub fn get_verifier_config_ref(&self) -> Option<&VerifierOnlyCircuitData<C, D>> {
-        self.minifier_chain.as_ref().map(|chain| chain.get_verifier_data())
-    }
-}
-
-#[derive(Debug)]
-pub struct Plonky2SoftwareDefinedSignatureGadget {
+pub struct SDKeyPlonky2CircuitGadget {
     pub state_reader_gadget: StateReaderGadget<GF, D>,
     pub contract_state_tree_height: u8,
     pub input_len: usize,
@@ -289,7 +106,7 @@ pub struct Plonky2SoftwareDefinedSignatureGadget {
     pub minifier_chain: Option<PsyProofMinifierChain<D, GF, C>>,
 }
 
-impl Plonky2SoftwareDefinedSignatureGadget {
+impl SDKeyPlonky2CircuitGadget {
     pub fn add_virtual_to(builder: &mut CircuitBuilder<GF, D>, contract_state_tree_height: u8, input_len: usize) -> Self {
         let private_key = builder.add_virtual_hash();
         let circuit_inputs = builder.add_virtual_targets(input_len);
@@ -353,7 +170,7 @@ impl Plonky2SoftwareDefinedSignatureGadget {
     pub async fn prove(
         &mut self,
         private_key: QHashOut<GF>,
-        input: &Plonky2SoftwareDefinedSignatureInput,
+        input: &SDKeyPlonky2CircuitWitnessInput,
         sig_hash: QHashOut<GF>,
     ) -> anyhow::Result<ProofWithPublicInputs<GF, C, D>> {
         let circuit_data = self.circuit_data.as_ref().ok_or_else(|| anyhow::anyhow!("Circuit not built"))?;
@@ -507,10 +324,10 @@ mod tests {
     };
     use psy_config::network_constants::PSY_NETWORK_MAGIC;
     use psy_crypto::hash::traits::qhashable::QFieldHashable;
-    use psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput;
+    use psy_vm::ups::signature::SDKeyPlonky2CircuitWitnessInput;
     use psy_vm::ups::state_reader::StateReaderResults;
 
-    use super::Plonky2SoftwareDefinedSignatureGadget;
+    use super::SDKeyPlonky2CircuitGadget;
 
     type F = GoldilocksField;
     const D: usize = 2;
@@ -571,7 +388,7 @@ mod tests {
     fn plonky2_sd_wires_sig_hash_not_free_hash() {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
-        let gadget = Plonky2SoftwareDefinedSignatureGadget::add_virtual_to(&mut builder, 1, 0);
+        let gadget = SDKeyPlonky2CircuitGadget::add_virtual_to(&mut builder, 1, 0);
         assert_eq!(
             gadget.state_reader_gadget.state.user_leaf.user_id,
             gadget.sign_context.user_leaf.user_id
@@ -586,7 +403,7 @@ mod tests {
     async fn plonky2_sd_prove_rejects_policy_sig_hash_mismatch() {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
-        let mut gadget = Plonky2SoftwareDefinedSignatureGadget::add_virtual_to(&mut builder, 1, 0);
+        let mut gadget = SDKeyPlonky2CircuitGadget::add_virtual_to(&mut builder, 1, 0);
         gadget.build_circuit(builder).expect("build");
 
         let (sig_data, sign_context, start_session_user_leaf, nonce) = sample_sig_hash_fields(7, 0);
@@ -598,7 +415,7 @@ mod tests {
             F::from_canonical_u64(1),
         );
 
-        let input = Plonky2SoftwareDefinedSignatureInput {
+        let input = SDKeyPlonky2CircuitWitnessInput {
             state_reader_results: StateReaderResults {
                 state: mismatched_state,
                 user_tree_root: QHashOut::ZERO,

@@ -87,6 +87,7 @@ serde_with = { version = "3.4.0", features = ["hex", "macros"] }
 serde_repr = "0.1.19"
 serde_yaml = "0.9"
 serde_cbor = { version = "0.11.2" }
+ciborium = { version = "0.2.2" }
 bincode = { version = "=1.3.3" }
 redb = "2.6"
 postcard = { version = "1.1.3", default-features = true, features = ["alloc", "use-std"] }
@@ -369,11 +370,10 @@ psy_dpn_circuit = { path = "./client_prover/psy_circuit/psy_dpn_circuit", defaul
 # The proving hot paths (batched Poseidon Merkle hashing, packed gate
 # evaluation, fused FFT layers) live on a plonky2-hwa branch. Third-party
 # crates pin the older revision themselves, so the revision is replaced for
-# the whole dependency graph instead of being bumped above. The URL differs
-# from the patched one only by a doubled slash because Cargo refuses to patch a
-# source with itself.
+# the whole dependency graph instead of being bumped above. The www.github.com
+# URL is a distinct Cargo source that GitHub redirects to the same repository.
 [patch."https://github.com/PsyProtocol/plonky2-hwa"]
-plonky2 = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
-plonky2_field = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
-plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
-plonky2_util = { git = "https://github.com/PsyProtocol//plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2 = { git = "https://www.github.com/PsyProtocol/plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_field = { git = "https://www.github.com/PsyProtocol/plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_maybe_rayon = { git = "https://www.github.com/PsyProtocol/plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }
+plonky2_util = { git = "https://www.github.com/PsyProtocol/plonky2-hwa", rev = "736572e9dd3ca93566471cf5a2a1cb67a13fe01d" }

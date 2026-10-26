@@ -46,7 +46,7 @@ impl QNetworkTreeCircuitSpecificConstants for TestNetworkConfig {
         [3896366420105793420, 17410332186442776169, 7329967984378645716, 6310665049578686403];
 
     const END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4: [u64; 4] =
-        [1412692327731855940, 17963365021580141687, 10532510199226356508, 3943799806037696098];
+        [15776645423652934074, 9502465051285048576, 11139549033047071923, 3497053190013805758];
 }
 
 impl QNetworkTreeConstants for TestNetworkConfig {
@@ -189,6 +189,7 @@ pub async fn setup_test_unified_db(store: Arc<TestInMemoryCoreStore>) -> anyhow:
         tree_table("global_checkpoint_tree_table", TestNetworkConfig::CHECKPOINT_TREE_HEIGHT),
         table("guta_reward_tag_tree_table"),
         tree_table("user_registration_tree_table", TestNetworkConfig::GLOBAL_USER_TREE_HEIGHT),
+        tree_table("validator_tree_table", psy_data::guta::realm_finalize::VALIDATOR_TREE_HEIGHT as u8),
         tree_table("global_contract_tree_table", TestNetworkConfig::GLOBAL_CONTRACT_TREE_HEIGHT),
         table("contract_function_tree_table"),
         table("contract_leaf_table"),

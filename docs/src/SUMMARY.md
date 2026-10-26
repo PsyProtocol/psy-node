@@ -59,6 +59,8 @@
 - [SDKeys Overview](./sdkeys/overview.md)
 - [Signature Schemes](./sdkeys/signature-schemes.md)
 - [Wallet Management](./sdkeys/wallet-management.md)
+- [Advanced Circuits](./sdkeys/advanced-circuits.md)
+- [Composed Policy Configuration](./sdkeys/policy-config.md)
 
 ---
 

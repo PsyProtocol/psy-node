@@ -43,7 +43,12 @@ impl QVariableHeightBitInfo {
         }
         base >= 1
     }
-    pub fn get_root_parent_index(&self) -> u32 {
+    /// Returns the subtree-root NODE index, i.e. `index >> height`. The low
+    /// bit is still the root's left/right direction relative to its parent;
+    /// divide by 2 (e.g. `div_rem(.., 1)`) to obtain the parent index. The
+    /// historic name `get_root_parent_index` was wrong for this variant —
+    /// unlike the non-opt/`opt_v2` helpers it does NOT drop the direction bit.
+    pub fn get_root_index(&self) -> u32 {
         let mut sub_root_bit = 0u32;
         let mut sub_root_index = 0u32;
         let one = 1u32;
@@ -95,7 +100,10 @@ impl VariableHeightBitInfo {
         }
         BoolTarget::new_unsafe(base)
     }
-    pub fn get_root_parent_index<F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> Target {
+    /// Circuit counterpart of [`QVariableHeightBitInfo::get_root_index`]:
+    /// returns the subtree-root node index `index >> height`, whose low bit
+    /// is the direction. NOT the parent index — see the native doc comment.
+    pub fn get_root_index<F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> Target {
         let mut sub_root_bit = builder.zero();
         let mut sub_root_index = builder.zero();
         let one = builder.one();
@@ -488,6 +496,7 @@ mod tests {
         },
     };
     use psy_client_common::data::qhashout::QHashOut;
+    use crate::builder::math::core::CircuitBuilderCoreMathHelpers;
     use psy_crypto::hash::{
         merkle::{
             core::DeltaMerkleProofCore,
@@ -572,8 +581,16 @@ mod tests {
                 Some(height_b),
             );
 
-            let computed_root_index_a = variable_dmp_gadget_a.bit_info.get_root_parent_index(&mut builder);
-            let computed_root_index_b = variable_dmp_gadget_b.bit_info.get_root_parent_index(&mut builder);
+            // The opt bit info returns the subtree-root NODE index (low bit =
+            // direction). Mirror the production wiring in
+            // sub_tree_update_proof_opt: strip the direction bit and compare
+            // PARENT indices. (Connecting the node indices directly is
+            // unsatisfiable for sibling subtrees — they differ in the low
+            // bit — which is why this test used to fail.)
+            let computed_child_index_a = variable_dmp_gadget_a.bit_info.get_root_index(&mut builder);
+            let computed_root_index_a = builder.div_rem(computed_child_index_a, 1).0;
+            let computed_child_index_b = variable_dmp_gadget_b.bit_info.get_root_index(&mut builder);
+            let computed_root_index_b = builder.div_rem(computed_child_index_b, 1).0;
 
             builder.connect(computed_root_index_a, computed_root_index_b);
 
@@ -932,6 +949,46 @@ mod tests {
         }
     }
 
+    /// Pins the semantics of the opt helper: for a proof at leaf `index`
+    /// with subtree `height`, `get_root_index` is `index >> height` (the
+    /// subtree-root NODE index, low bit = direction) and `is_right_child` is
+    /// bit `height` of `index`. Native and circuit sides must agree, and the
+    /// parent index is the node index shifted once more.
+    #[test]
+    fn get_root_index_semantics() -> anyhow::Result<()> {
+        use super::QVariableHeightBitInfo;
+
+        for (index, height) in [(0u64, 1usize), (1, 1), (5, 3), (0x1234_5678, 7), (0x7FFF_FFFF, 13)] {
+            let max_height = 32usize;
+
+            // native side
+            let native = QVariableHeightBitInfo::from_index_and_height(index, height, max_height);
+            assert_eq!(u64::from(native.get_root_index()), index >> height, "native get_root_index (index={index}, height={height})");
+            assert!(native.is_right_child() == ((index >> height) & 1 == 1), "native is_right_child (index={index}, height={height})");
+
+            // circuit side: real gadget path (virtual index/height, witness-set)
+            let config = CircuitConfig::standard_recursion_config();
+            let mut builder = CircuitBuilder::<F, D>::new(config);
+            let gadget = VariableHeightDeltaMerkleProofOptGadget::add_virtual_to_full::<PoseidonHash, F, D>(&mut builder, max_height, None);
+            let root_index = gadget.bit_info.get_root_index(&mut builder);
+            let is_right = gadget.bit_info.is_right_child(&mut builder);
+            builder.register_public_inputs(&[root_index, is_right.target]);
+            let data = builder.build::<C>();
+
+            let siblings: Vec<QHashOut<F>> = (0..height).map(|_| QHashOut::rand()).collect();
+            let mut pw = PartialWitness::new();
+            gadget.set_witness_params(&mut pw, F::from_noncanonical_u64(index), QHashOut::rand(), QHashOut::rand(), &siblings)?;
+
+            let proof = data.prove(pw)?;
+            data.verify(proof.clone())?;
+            assert_eq!(proof.public_inputs[0].to_canonical_u64(), index >> height, "circuit get_root_index (index={index}, height={height})");
+            assert_eq!(proof.public_inputs[1].to_canonical_u64(), (index >> height) & 1, "circuit is_right_child == bit(height) (index={index}, height={height})");
+            // the parent index used by the subtree-merge wiring
+            assert_eq!((index >> height) >> 1, index >> (height + 1), "parent index relation (index={index}, height={height})");
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_variable_height_bit_info() -> anyhow::Result<()> {
         use super::{QVariableHeightBitInfo, VariableHeightBitInfo};
@@ -945,21 +1002,21 @@ mod tests {
 
         let q_bit_info = QVariableHeightBitInfo::from_index_and_height(index, height, max_height);
         let expected_is_right = q_bit_info.is_right_child();
-        let expected_root_parent_index = q_bit_info.get_root_parent_index();
+        let expected_root_index = q_bit_info.get_root_index();
 
         let circuit_bit_info = VariableHeightBitInfo::from_q_bit_info(&mut builder, &q_bit_info);
 
         let circuit_is_right = circuit_bit_info.is_right_child(&mut builder);
-        let circuit_root_parent_index = circuit_bit_info.get_root_parent_index(&mut builder);
+        let circuit_root_index = circuit_bit_info.get_root_index(&mut builder);
 
         let expected_is_right_target = builder.constant_bool(expected_is_right);
-        let expected_index_target = builder.constant(F::from_canonical_u64(expected_root_parent_index as u64));
+        let expected_index_target = builder.constant(F::from_canonical_u64(expected_root_index as u64));
 
         builder.connect(circuit_is_right.target, expected_is_right_target.target);
-        builder.connect(circuit_root_parent_index, expected_index_target);
+        builder.connect(circuit_root_index, expected_index_target);
 
         builder.register_public_input(circuit_is_right.target);
-        builder.register_public_input(circuit_root_parent_index);
+        builder.register_public_input(circuit_root_index);
 
         let circuit = builder.build::<C>();
 
@@ -969,11 +1026,11 @@ mod tests {
         circuit.verify(proof.clone())?;
         println!("proof.public_inputs: {:?}", proof.public_inputs);
         assert_eq!(proof.public_inputs[0], F::from_canonical_u64(expected_is_right as u64));
-        assert_eq!(proof.public_inputs[1], F::from_canonical_u64(expected_root_parent_index as u64));
+        assert_eq!(proof.public_inputs[1], F::from_canonical_u64(expected_root_index as u64));
 
         println!(
-            "Test passed - Index: {}, Height: {}, Maximum height: {}, Right subtree: {}, Root parent index: {}",
-            index, height, max_height, expected_is_right, expected_root_parent_index
+            "Test passed - Index: {}, Height: {}, Maximum height: {}, Right subtree: {}, Root node index: {}",
+            index, height, max_height, expected_is_right, expected_root_index
         );
         Ok(())
     }

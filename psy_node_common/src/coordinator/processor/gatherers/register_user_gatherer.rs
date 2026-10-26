@@ -1602,6 +1602,7 @@ mod gatherer_builder_tests {
                 user_tree_root,
                 withdrawal_tree_root: zh(2),
                 user_registration_tree_root: user_tree_root,
+                validator_tree_root: zh(2),
             },
             should_revert_last_changes: should_revert,
             block_state: block_state(0),
@@ -1656,7 +1657,7 @@ mod gatherer_builder_tests {
         // below the minimum header size of 4 + 8 + 32 + 8 + 8 bytes
         fs.files.insert("too_small".to_string(), vec![0u8; 59]);
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let err = err_str(read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "too_small", &mut tree).await);
+        let err = err_str(read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(&fs, "too_small", &mut tree).await);
         assert!(err.contains("too small to be valid"), "got: {err}");
 
         // body length not a multiple of the 64-byte public key size
@@ -1664,7 +1665,7 @@ mod gatherer_builder_tests {
         let mut data = backup_bytes(0, tree.get_root(), &[], 0, 1_700_000_000);
         data.push(0u8);
         fs.files.insert("bad_multiple".to_string(), data);
-        let err = err_str(read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "bad_multiple", &mut tree).await);
+        let err = err_str(read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(&fs, "bad_multiple", &mut tree).await);
         assert!(err.contains("not a multiple of 64"), "got: {err}");
 
         // start user id already occupied in the tree
@@ -1673,14 +1674,14 @@ mod gatherer_builder_tests {
         tree.commit_changes();
         let data = backup_bytes(1, tree.get_root(), &[], 0, 1_700_000_000);
         fs.files.insert("occupied".to_string(), data);
-        let err = err_str(read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "occupied", &mut tree).await);
+        let err = err_str(read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(&fs, "occupied", &mut tree).await);
         assert!(err.contains("does not match tree zero hash"), "got: {err}");
 
         // start root that does not match the computed pivot root
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
         let data = backup_bytes(0, Hash::qp_rand_gen(), &[], 0, 1_700_000_000);
         fs.files.insert("wrong_root".to_string(), data);
-        let err = err_str(read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "wrong_root", &mut tree).await);
+        let err = err_str(read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(&fs, "wrong_root", &mut tree).await);
         assert!(err.contains("does not match tree computed root hash"), "got: {err}");
         Ok(())
     }
@@ -1695,7 +1696,7 @@ mod gatherer_builder_tests {
         let data = backup_bytes(0, start_root, &[key_a.clone(), key_b.clone()], 5, 1_700_000_000);
         fs.files.insert("happy".to_string(), data);
 
-        let output = read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, "happy", &mut tree).await?;
+        let output = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(&fs, "happy", &mut tree).await?;
         assert_eq!(output.start_next_user_id, 0);
         assert_eq!(output.next_user_id, 2);
         assert_eq!(output.start_user_registration_tree_hash, start_root);
@@ -1810,7 +1811,7 @@ mod gatherer_builder_tests {
         let bytes = fs.files.get(&backup_path).unwrap().value().clone();
         assert_eq!(bytes.len(), 4 + 8 + 32 + 128 + 8 + 8);
         let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let read_output = read_register_user_gatherer_backup_file_path::<Hasher, Hash, Fs>(&fs, &backup_path, &mut read_tree).await?;
+        let read_output = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(&fs, &backup_path, &mut read_tree).await?;
         assert_eq!(read_output.next_user_id, 2);
         assert_eq!(read_output.end_user_registration_tree_hash, output.db_output.end_user_registration_tree_hash);
         assert_eq!(read_output.total_jobs, total);

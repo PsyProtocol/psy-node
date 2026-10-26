@@ -1040,7 +1040,7 @@ impl RewardClient {
         let registration_index = get_registration_id_from_user_id(aggregate.public_inputs[0].to_canonical_u64());
         anyhow::ensure!(anchor.registration_index == registration_index, "reward registration index does not map to the user");
         let fingerprint = PsyBasicZKSignatureCircuit::<PoseidonGoldilocksConfig, 2>::new().fingerprint.0;
-        let public_key_param = psy_ups_circuit::signature::software_defined::get_sdc_public_key_param(&QHashOut(private_key));
+        let public_key_param = psy_ups_circuit::signature::sd_key_plonky2::get_sdc_public_key_param(&QHashOut(private_key));
         let registration_leaf = PoseidonHash::two_to_one(fingerprint, public_key_param.0);
         anyhow::ensure!(anchor.registration_leaf == registration_leaf && registration_leaf != HashOut::ZERO, "reward registration leaf does not match the private key");
         let registration_root = anchor.global_roots.user_registration_tree_root;

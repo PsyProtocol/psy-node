@@ -341,7 +341,9 @@ fn validate_def(
         | Op::GetCheckpointId
         | Op::GetNonce
         | Op::GetUserPublicKeyHash
-        | Op::GetSessionProofTreeRoot => {
+        | Op::GetSessionProofTreeRoot
+        | Op::GetTransactionCount
+        | Op::GetTransactionStackHash => {
             if def.inputs.len() > 1 {
                 return Err(ValidationError::BadArity { def_index: i, op, got: def.inputs.len() });
             }
@@ -374,6 +376,26 @@ fn validate_def(
             if !resolves_in_time {
                 return Err(ValidationError::BadStateCommandRef { def_index: i, op, command: def.inputs[0] });
             }
+            *seen_non_input = true;
+        }
+
+        Op::GetTransactionContractId
+        | Op::GetTransactionMethodId
+        | Op::GetTransactionInputsHash
+        | Op::GetTransactionInputLength
+        | Op::GetTransactionCallerContractId => {
+            if def.inputs.len() != 1 {
+                return Err(ValidationError::BadArity { def_index: i, op, got: def.inputs.len() });
+            }
+            check(0, def.inputs[0], SCALAR_LANES)?;
+            *seen_non_input = true;
+        }
+        Op::GetTransactionInputWord => {
+            if def.inputs.len() != 2 {
+                return Err(ValidationError::BadArity { def_index: i, op, got: def.inputs.len() });
+            }
+            check(0, def.inputs[0], SCALAR_LANES)?;
+            check(1, def.inputs[1], SCALAR_LANES)?;
             *seen_non_input = true;
         }
 

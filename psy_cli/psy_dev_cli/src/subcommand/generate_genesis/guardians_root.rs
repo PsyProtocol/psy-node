@@ -202,7 +202,7 @@ fn nofollow_metadata(directory: libc::c_int, name: &CString) -> anyhow::Result<N
     ensure!(result == 0, "reading protected metadata failed: {}", std::io::Error::last_os_error());
     let stat = unsafe { stat.assume_init() };
     ensure!((stat.st_mode & libc::S_IFMT) != libc::S_IFLNK, "protected path must not be a symlink");
-    Ok(NoFollowMetadata { mode: stat.st_mode, uid: stat.st_uid, file_type: stat.st_mode })
+    Ok(NoFollowMetadata { mode: u32::from(stat.st_mode), uid: stat.st_uid, file_type: stat.st_mode })
 }
 
 fn open_directory(path: &Path) -> anyhow::Result<std::fs::File> {

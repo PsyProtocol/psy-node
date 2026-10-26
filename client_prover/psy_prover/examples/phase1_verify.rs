@@ -126,9 +126,10 @@ async fn run_case(
         anyhow::bail!("{} expected deferred steps", label);
     }
     let tx_hash = wallet_session.prove_tx_trace(user_pk, &trace).await?;
+    let end_user_leaf_hash = trace.finalization.submit_end_cap_input.core.state_transition.end_user_leaf_hash;
     let cp = wallet_session
         .st_provider
-        .wait_for_endcap_inclusion(user_id, tx_hash, before, Some(600), 1)
+        .wait_for_endcap_inclusion(user_id, end_user_leaf_hash, before, Some(600), 1)
         .await?;
     println!("{} tx_hash={} included_checkpoint={}", label, tx_hash, cp);
     Ok(())

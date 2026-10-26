@@ -189,6 +189,7 @@ pub struct CoordinatorEdgeHandler<
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
     pub chain_id: u64,
+    pub genesis_checkpoint_state_transition_fingerprint: N::QHash,
     pub canonical_layout_verifier_fingerprint: N::QHash,
     pub canonical_layout_proof_verifier: Arc<CanonicalLayoutProofVerifier>,
 }
@@ -233,6 +234,7 @@ impl<
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
             chain_id: self.chain_id,
+            genesis_checkpoint_state_transition_fingerprint: self.genesis_checkpoint_state_transition_fingerprint.clone(),
             canonical_layout_verifier_fingerprint: self.canonical_layout_verifier_fingerprint,
             canonical_layout_proof_verifier: self.canonical_layout_proof_verifier.clone(),
         }
@@ -275,6 +277,7 @@ impl<
         chain_id: u64,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
+        genesis_checkpoint_state_transition_fingerprint: N::QHash,
         canonical_layout_verifier_fingerprint: N::QHash,
         canonical_layout_proof_verifier: Arc<CanonicalLayoutProofVerifier>,
     ) -> Self {
@@ -297,6 +300,7 @@ impl<
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
             chain_id,
+            genesis_checkpoint_state_transition_fingerprint,
             canonical_layout_verifier_fingerprint,
             canonical_layout_proof_verifier,
         }
@@ -1113,7 +1117,7 @@ pub(crate) mod tests {
         TestUnifiedDatabaseStore,
     };
     use parth_core::{
-        crypto::hash::traits::MerkleZeroHasher,
+        crypto::hash::traits::{FieldQHasher, MerkleZeroHasher},
         felt::{FromPrimitiveValuesFelt, ToU64Value},
         node::realm_identifier::QRealmIdentifier,
         protocol::core_types::QNetworkTreeConstants,
@@ -1142,7 +1146,7 @@ pub(crate) mod tests {
         },
         psy_core_db::traits::full::PsyNodeCheckpointObjectDatabaseWriter,
         psy_temp_db::{
-            QTempDBGutaInFlightStore, QTempDBPendingIdWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter,
+            QTempDBGutaInFlightStore, QTempDBPendingIdWriter, QTempDBProofWitnessWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter,
         },
         store::traits::proof_store::QParthProofStoreReader,
     };
@@ -1203,6 +1207,7 @@ pub(crate) mod tests {
             checkpoint_stats: PQEDCheckpointLeafStats::qp_rand_gen(),
             deposit_tree_root: PHash::from_values(4, 0, 0, 0),
             withdrawal_tree_root: PHash::from_values(5, 0, 0, 0),
+            validators: vec![],
         }
     }
 
@@ -1239,8 +1244,11 @@ pub(crate) mod tests {
                 Arc::clone(&contract_queue),
                 Arc::clone(&work_queue),
                 QRealmIdentifier::new(1, 2),
+                crate::worker_whitelist::WhiteListCache::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../psy-genesis/config.json"), psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet)?,
+                psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(),
                 Arc::new(crate::test_common::TestZKVerifier {}),
                 zh(25),
+                zh(26),
                 PHash::from_values(7, 0, 0, 0),
                 Arc::new(|proof| {
                     anyhow::ensure!(
@@ -1283,7 +1291,7 @@ pub(crate) mod tests {
             // seed both counters so handler reads behave like production.
             let rid = QRealmIdentifier::new(1, 2);
             temp_db.set_unique_pending_ids(&rid, 0, 0).await?;
-            temp_db.set_gathering_unique_pending_ids(&rid, 0, 0).await?;
+            temp_db.set_gathering_generation(&rid, psy_node_core::psy_temp_db::GatheringGeneration { unique_pending_id: 0, proc_checkpoint_unique_id: 0, checkpoint_id: 0 }).await?;
             Ok(Self { handler, db, guta_queue, register_queue, contract_queue, work_queue, temp_db })
         }
 
@@ -1301,7 +1309,7 @@ pub(crate) mod tests {
                 GenesisDatabaseDataBuilder::<PF, PHash>::setup_for_coordinator::<
                     parth_core::pgoldilocks::PoseidonHasher,
                     N,
-                >(&genesis_data, fp_config.checkpoint_state_transition_circuit_fingerprint)?;
+                >(&genesis_data, psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet.get_chain_id(), fp_config.checkpoint_state_transition_circuit_fingerprint)?;
             let mut processor = TestProcessor::new_init(
                 Arc::clone(&self.db),
                 Arc::clone(&self.db),
@@ -1327,6 +1335,54 @@ pub(crate) mod tests {
                 .await?;
             Ok(processor)
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_one_submit_is_anchored_to_edge_genesis() -> anyhow::Result<()> {
+        use psy_data::protocol::circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput;
+        use psy_node_core::psy_core_db::traits::full::{
+            PsyNodeCheckpointTreeDatabaseReader,
+            PsyNodeCheckpointTransitionZKProofDatabaseReader,
+        };
+
+        let env = EdgeTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let realm = QRealmIdentifier::new(1, 2);
+        let job = QProvingJobDataID {
+            topic: psy_core::job::job_id::QJobTopic::GenerateStandardProof,
+            goal_id: 1,
+            circuit_type: psy_core::job::job_id::ProvingJobCircuitType::GenerateRollupStateTransitionProof,
+            group_id: 0,
+            sub_group_id: 0,
+            task_index: 0,
+            data_type: psy_core::job::job_id::ProvingJobDataType::StandardProof,
+            data_index: 0,
+        };
+        let canonical = env.db.checkpoint_tree_get_merkle_proof(0, 0).await?;
+        let genesis_transition = env.db.get_verifiable_checkpoint_state_transition_and_zkp(0).await?;
+        let mut witness = QCQEDCheckpointStateTransitionInput::<PF, PHash>::qp_rand_gen();
+        witness.append_checkpoint_tree_proof.index = 1;
+        witness.append_checkpoint_tree_proof.old_root = canonical.root;
+        witness.append_checkpoint_tree_proof.old_value = canonical.value;
+        witness.previous_checkpoint_proof = canonical.clone();
+        witness.genesis_checkpoint_state_transition_hash =
+            genesis_transition.info.state_transition.genesis_checkpoint_state_transition_hash;
+        let root_leaf = parth_core::pgoldilocks::PoseidonHasher::q_two_to_one(canonical.root, canonical.value);
+        witness.previous_chain_hash = parth_core::pgoldilocks::PoseidonHasher::q_two_to_one(root_leaf, zh(26));
+        env.temp_db.set_tdb_proof_witness(&realm, 0, job.get_input_witness_id(), &witness).await?;
+        env.handler.get_root_state_transition_expected_public_inputs_hash_internal(job, 0, zh(40)).await?;
+
+        for corrupt in 0..3 {
+            let mut bad_witness = witness.clone();
+            match corrupt {
+                0 => bad_witness.append_checkpoint_tree_proof.old_value = zh(41),
+                1 => bad_witness.append_checkpoint_tree_proof.old_root = zh(42),
+                _ => bad_witness.previous_chain_hash = zh(43),
+            }
+            env.temp_db.set_tdb_proof_witness(&realm, 0, job.get_input_witness_id(), &bad_witness).await?;
+            assert!(env.handler.get_root_state_transition_expected_public_inputs_hash_internal(job, 0, zh(40)).await.is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1409,7 +1465,6 @@ pub(crate) mod tests {
         let handler = &env.handler;
 
         assert_eq!(handler.get_current_unique_pending_id_internal().await?, (0, 0));
-        assert_eq!(handler.get_current_gathering_unique_pending_id_internal().await?, (0, 0));
         // no pending-id mapping exists on a fresh database
         assert_eq!(handler.get_checkpoint_id_for_unique_pending_id_internal(0).await?, None);
         // genesis commit records pending id 0 -> checkpoint 0
@@ -1666,25 +1721,25 @@ pub(crate) mod tests {
         // wrong node level
         let mut bad_level = guta_input();
         bad_level.header.header.state_transition.node_level = PF::from_u64_value(5);
-        let err = handler.submit_guta_internal(bad_level, vec![]).await.expect_err("wrong level must fail");
+        let err = handler.submit_guta_internal(bad_level, vec![], None, None).await.expect_err("wrong level must fail");
         assert!(err.to_string().contains("invalid realm level"), "unexpected error: {err}");
 
         // realm id beyond the coordinator tree capacity
         let mut bad_realm = guta_input();
         bad_realm.header.header.state_transition.node_index =
             PF::from_u64_value((1u64 << N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT) + 1);
-        let err = handler.submit_guta_internal(bad_realm, vec![]).await.expect_err("invalid realm id must fail");
+        let err = handler.submit_guta_internal(bad_realm, vec![], None, None).await.expect_err("invalid realm id must fail");
         assert!(err.to_string().contains("invalid realm id"), "unexpected error: {err}");
 
         // unknown circuit type
         let mut bad_type = guta_input();
         bad_type.job_type_u32 = 999_999;
-        assert!(handler.submit_guta_internal(bad_type, vec![]).await.is_err());
+        assert!(handler.submit_guta_internal(bad_type, vec![], None, None).await.is_err());
 
         // stale realm root
         let mut stale = guta_input();
         stale.header.header.state_transition.old_node_value = PHash::from_values(123, 0, 0, 0);
-        let err = handler.submit_guta_internal(stale, vec![]).await.expect_err("stale root must fail");
+        let err = handler.submit_guta_internal(stale, vec![], None, None).await.expect_err("stale root must fail");
         assert!(err.to_string().contains("stale GUTA update rejected"), "unexpected error: {err}");
 
         // double submission for the same realm + pending id
@@ -1701,7 +1756,7 @@ pub(crate) mod tests {
         env.temp_db
             .set_submitted_status_for_pending(&QRealmIdentifier::new(1, 2), 0, 0, 1)
             .await?;
-        let err = handler.submit_guta_internal(input, vec![]).await.expect_err("double submit must fail");
+        let err = handler.submit_guta_internal(input, vec![], None, None).await.expect_err("double submit must fail");
         assert!(err.to_string().contains("already been submitted"), "unexpected error: {err}");
         Ok(())
     }
@@ -1715,7 +1770,7 @@ pub(crate) mod tests {
             PF::from_u64_value(1u64 << N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT);
 
         let err = handler
-            .submit_guta_internal(input, vec![])
+            .submit_guta_internal(input, vec![], None, None)
             .await
             .expect_err("realm id equal to tree capacity must fail");
         assert!(err.to_string().contains("invalid realm id"), "unexpected error: {err}");
@@ -1738,7 +1793,7 @@ pub(crate) mod tests {
             .await?;
         input.header.header.state_transition.old_node_value = current_root.value;
 
-        handler.submit_guta_internal(input, vec![]).await?;
+        handler.submit_guta_internal(input, vec![], None, None).await?;
 
         // the queue item was published and the proof stored for the derived job id
         assert_eq!(env.guta_queue.published_count(), 1);
@@ -1754,7 +1809,7 @@ pub(crate) mod tests {
         // the per-batch status guard (which `submit_guta_rejects_invalid_headers` covers)
         let mut second = guta_input();
         second.header.header.state_transition.old_node_value = current_root.value;
-        let err = handler.submit_guta_internal(second, vec![]).await.expect_err("double submit must fail");
+        let err = handler.submit_guta_internal(second, vec![], None, None).await.expect_err("double submit must fail");
         assert!(err.to_string().contains("already in flight"), "unexpected error: {err}");
         Ok(())
     }
@@ -1775,7 +1830,7 @@ pub(crate) mod tests {
     /// per-batch submitted-status guard of an earlier submission no longer applies.
     async fn advance_coordinator(env: &EdgeTestEnv, gathering_pending_id: u64, committed_checkpoint_id: u64) -> anyhow::Result<()> {
         env.temp_db
-            .set_gathering_unique_pending_ids(&QRealmIdentifier::new(1, 2), gathering_pending_id, gathering_pending_id as u128)
+            .set_gathering_generation(&QRealmIdentifier::new(1, 2), psy_node_core::psy_temp_db::GatheringGeneration { unique_pending_id: gathering_pending_id, proc_checkpoint_unique_id: gathering_pending_id as u128, checkpoint_id: 0 })
             .await?;
         env.db.set_latest_checkpoint_id(committed_checkpoint_id).await?;
         Ok(())
@@ -1786,7 +1841,7 @@ pub(crate) mod tests {
         let env = EdgeTestEnv::create().await?;
         let input = submittable_guta_input(&env).await?;
 
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        env.handler.submit_guta_internal(input, vec![], None, None).await?;
 
         let (record, _) = env
             .temp_db
@@ -1803,13 +1858,13 @@ pub(crate) mod tests {
     async fn submit_guta_rejects_a_second_copy_while_the_first_may_be_in_flight() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
         let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        env.handler.submit_guta_internal(input, vec![], None, None).await?;
 
         // two checkpoints later the first copy may still be in the batch that commits next
         advance_coordinator(&env, 1, 2).await?;
         let err = env
             .handler
-            .submit_guta_internal(input, vec![])
+            .submit_guta_internal(input, vec![], None, None)
             .await
             .expect_err("a second copy inside the window must be rejected");
 
@@ -1830,10 +1885,10 @@ pub(crate) mod tests {
     async fn submit_guta_accepts_a_copy_once_the_first_cannot_be_live() -> anyhow::Result<()> {
         let env = EdgeTestEnv::create().await?;
         let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        env.handler.submit_guta_internal(input, vec![], None, None).await?;
 
         advance_coordinator(&env, 1, 3).await?;
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        env.handler.submit_guta_internal(input, vec![], None, None).await?;
 
         assert_eq!(env.guta_queue.published_count(), 2);
         let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();
@@ -1852,7 +1907,7 @@ pub(crate) mod tests {
         assert!(env.temp_db.claim_guta_in_flight(&QRealmIdentifier::new(1, 2), 0, None, &earlier).await?);
 
         let input = submittable_guta_input(&env).await?;
-        env.handler.submit_guta_internal(input, vec![]).await?;
+        env.handler.submit_guta_internal(input, vec![], None, None).await?;
 
         assert_eq!(env.guta_queue.published_count(), 1);
         let (record, _) = env.temp_db.get_guta_in_flight(&QRealmIdentifier::new(1, 2), 0).await?.unwrap();

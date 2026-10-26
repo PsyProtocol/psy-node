@@ -542,6 +542,11 @@ impl<
         agg_part_1_reward_root: N::QHash,
     ) -> anyhow::Result<(PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>, Vec<u8>)> {
         let block_time = output_builder.register_users_gatherer_result.block_time;
+        let start_chain_hash = if self.db.ids.checkpoint_id == 0 {
+            self.db.last_committed.last_chain_hash // Unused by the genesis-predecessor branch.
+        } else {
+            self.db.get_checkpoint_chain_hash(self.db.ids.checkpoint_id - 1).await?
+        };
         let (job_metadata, job_and_witness_bytes) = output_builder.get_checkpoint_state_transition_job(
             self.db.ids.checkpoint_id,
             self.db.ids.checkpoint_id + 1,
@@ -550,6 +555,7 @@ impl<
             &self.db.circuit_fingerprint_config,
             agg_part_1_reward_root,
             self.db.genesis_checkpoint_state_transition_hash,
+            start_chain_hash,
             block_time,
         )?;
 

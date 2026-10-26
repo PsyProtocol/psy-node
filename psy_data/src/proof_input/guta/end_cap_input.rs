@@ -8,11 +8,12 @@ use parth_core::{
 };
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::{
     proof_input::guta::SubmitUserEndCapNonProofCoreInput,
     v1::qdata::{
-        contract::{IMTContractStateUpdate, PSimpleContractHeightCache, PsyContractSlotUpdates, PsySlotUpdate},
+        contract::{IMTContractStateLeaf, IMTContractStateUpdate, PSimpleContractHeightCache, PsyContractSlotUpdates, PsySlotUpdate},
         user::PQEDUserLeaf,
     },
 };
@@ -494,6 +495,91 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug> SubmitUser
 
         Ok(contract_updates)
     }
+    /// Recount the session's slot modifications from the submitted update
+    /// histories, mirroring the client-side `PsyLocalStateTracker` semantics
+    /// (`client_prover/psy_core/psy_data/src/qstore/controllers/state_tracker.rs`):
+    ///
+    /// - positional slots are submitted net per slot (first write's old value →
+    ///   last write's new value), so a slot counts once when those differ;
+    /// - IMT updates are submitted per op with full leaf preimages: a key counts
+    ///   +1 on first touch, and −1 when a non-inserted key returns to its
+    ///   session-start preimage (the entry drops, so a later touch counts +1
+    ///   again), with the running key total saturating at zero.
+    ///
+    /// Each key's count changes independently within its contract, so the
+    /// total is unchanged by the order of updates to different contracts.
+    pub fn replay_count_slots_modified(&self) -> u64 {
+        let mut positional_modified: u64 = 0;
+        let mut imt_keys_modified: i64 = 0;
+
+        for history in self.contract_state_updates.iter() {
+            let mut slot_first_last: HashMap<u64, (Hash, Hash)> = HashMap::new();
+            let mut imt_keys: HashMap<[u8; 32], ImtKeyReplayState<F, Hash>> = HashMap::new();
+
+            for update in history.updates.iter() {
+                match update {
+                    ContractStateUpdate::Positional { delta_proof } => {
+                        match slot_first_last.entry(delta_proof.index) {
+                            Entry::Occupied(mut occupied) => occupied.get_mut().1 = delta_proof.new_value,
+                            Entry::Vacant(vacant) => {
+                                vacant.insert((delta_proof.old_value, delta_proof.new_value));
+                            }
+                        }
+                    }
+                    ContractStateUpdate::IMT { update } => {
+                        let inc = match update {
+                            IMTContractStateUpdate::Update { old_preimage, new_preimage, .. } => {
+                                replay_imt_key_op(&mut imt_keys, old_preimage, new_preimage, false)
+                            }
+                            IMTContractStateUpdate::Insert {
+                                predecessor_old_preimage,
+                                predecessor_new_preimage,
+                                new_leaf_preimage,
+                                ..
+                            } => {
+                                let pred_inc =
+                                    replay_imt_key_op(&mut imt_keys, predecessor_old_preimage, predecessor_new_preimage, false);
+                                // The tracker records the default empty leaf as an
+                                // inserted key's start preimage, but never compares
+                                // against it (`is_insert` pins the count at +1), so
+                                // any placeholder start is behaviorally identical.
+                                let new_inc = replay_imt_key_op(&mut imt_keys, new_leaf_preimage, new_leaf_preimage, true);
+                                pred_inc + new_inc
+                            }
+                        };
+                        if inc > 0 {
+                            imt_keys_modified += inc as i64;
+                        } else if inc < 0 {
+                            imt_keys_modified = (imt_keys_modified + inc as i64).max(0);
+                        }
+                    }
+                }
+            }
+
+            positional_modified += slot_first_last.values().filter(|(old, new)| old != new).count() as u64;
+        }
+
+        positional_modified + imt_keys_modified as u64
+    }
+
+    /// Reject end caps whose declared `stats.slots_modified` does not match the
+    /// count replayed from `contract_state_updates`. The declared value is
+    /// bound to the proof's public inputs upstream, so a mismatch means the
+    /// proof under-declared (or over-declared) the session's slot
+    /// modifications — the DA fee-evasion vector this closes at the consensus
+    /// layer.
+    pub fn ensure_declared_slots_modified(&self) -> anyhow::Result<()> {
+        let replayed = self.replay_count_slots_modified();
+        let declared = self.core.stats.slots_modified.to_u64_value();
+        if declared != replayed {
+            anyhow::bail!(
+                "declared slots_modified ({}) does not match the {} slot modifications replayed from contract_state_updates",
+                declared,
+                replayed
+            );
+        }
+        Ok(())
+    }
     /*
     pub fn verify_and_generate_cst_updates<H: FieldQHasher<F, Hash>>(&self, checkpoint_id: u64, old_user_state_tree_root: Hash) -> anyhow::Result<CSTUserUpdate<Hash>> {
 
@@ -519,6 +605,53 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug> SubmitUser
         Ok(upd)
     }
     */
+}
+
+/// Per-key replay state mirroring the client tracker's `PsyIMTLocalStateSet`:
+/// `start_preimage` is the leaf preimage at the key's first touch in the
+/// session, and `is_insert` marks keys born from an insert op (their start is
+/// the default empty leaf, which the tracker never compares against). The
+/// current preimage is compared against `start_preimage` inline on each op, so
+/// it is not stored.
+struct ImtKeyReplayState<F, Hash> {
+    start_preimage: IMTContractStateLeaf<F, Hash>,
+    is_insert: bool,
+}
+
+/// Apply one IMT key op the way `PsyContractStateTracker::notify_imt_update`
+/// does: a first touch counts +1; a non-inserted key whose new preimage equals
+/// its session-start preimage stops counting (−1, with the entry dropped so a
+/// later touch counts +1 again); anything else is 0.
+fn replay_imt_key_op<F: QFelt64, Hash: Q256BitHash>(
+    entries: &mut HashMap<[u8; 32], ImtKeyReplayState<F, Hash>>,
+    old_preimage: &IMTContractStateLeaf<F, Hash>,
+    new_preimage: &IMTContractStateLeaf<F, Hash>,
+    is_insert: bool,
+) -> i32 {
+    let key = old_preimage.key.into_owned_32bytes();
+    let inc = match entries.get_mut(&key) {
+        Some(entry) => {
+            if !entry.is_insert && *new_preimage == entry.start_preimage {
+                -1
+            } else {
+                0
+            }
+        }
+        None => {
+            entries.insert(
+                key,
+                ImtKeyReplayState {
+                    start_preimage: old_preimage.clone(),
+                    is_insert,
+                },
+            );
+            1
+        }
+    };
+    if inc == -1 {
+        entries.remove(&old_preimage.key.into_owned_32bytes());
+    }
+    inc
 }
 
 /// Decompose a contract state tree delta proof into felt-level slot updates.
@@ -1341,6 +1474,79 @@ mod tests {
         assert_eq!(updates[1].slot_updates[1].slot, 9 * 4 + 2);
         assert_eq!(updates[1].slot_updates[2].slot, 5 * 4 + 1);
         Ok(())
+    }
+
+    fn imt_leaf(key: u64, value: u64) -> IMTContractStateLeaf<PF, PHash> {
+        IMTContractStateLeaf {
+            key: PHash::from_u64x4([key, 0, 0, 0]),
+            value: PHash::from_u64x4([value, 0, 0, 0]),
+            next_key: PHash::get_zero_value(),
+            next_index: PF::from_owned_u64(0),
+        }
+    }
+
+    #[test]
+    fn replay_count_tracks_positional_and_imt_tracker_semantics() {
+        let history = |contract_id: u64, updates: Vec<ContractStateUpdate<PF, PHash>>| ContractStateUpdateHistory {
+            user_contract_tree_update_proof: DeltaMerkleProofCore {
+                old_root: PHash::get_zero_value(),
+                old_value: PHash::get_zero_value(),
+                new_root: PHash::get_zero_value(),
+                new_value: PHash::get_zero_value(),
+                index: contract_id,
+                siblings: vec![],
+            },
+            updates,
+        };
+        let positional = |old: u64, new: u64, slot: u64| {
+            ContractStateUpdate::Positional {
+                delta_proof: slot_delta([old, 0, 0, 0], [new, 0, 0, 0], slot),
+            }
+        };
+        let imt_update = |old: IMTContractStateLeaf<PF, PHash>, new: IMTContractStateLeaf<PF, PHash>| ContractStateUpdate::IMT {
+            update: IMTContractStateUpdate::Update {
+                old_preimage: old,
+                new_preimage: new,
+                delta_proof: delta(1, 2, 2),
+            },
+        };
+
+        // Positional: slot 1 returns to its start value (0), slot 2 changes (+1),
+        // slot 3 is rewritten to the same value (0).
+        let positional_updates = vec![positional(1, 2, 1), positional(2, 1, 1), positional(5, 6, 2), positional(7, 7, 3)];
+
+        // IMT: key 10 is touched (+1), returns to start (−1), touched again (+1);
+        // an insert touches the predecessor key (+1) and adds key 20 (+1).
+        let imt_updates = vec![
+            imt_update(imt_leaf(10, 100), imt_leaf(10, 101)),
+            imt_update(imt_leaf(10, 101), imt_leaf(10, 100)),
+            imt_update(imt_leaf(10, 100), imt_leaf(10, 102)),
+            ContractStateUpdate::IMT {
+                update: IMTContractStateUpdate::Insert {
+                    predecessor_old_preimage: imt_leaf(5, 50),
+                    predecessor_new_preimage: imt_leaf(5, 51),
+                    new_leaf_preimage: imt_leaf(20, 200),
+                    predecessor_delta_proof: delta(3, 4, 2),
+                    new_leaf_delta_proof: delta(4, 5, 2),
+                },
+            },
+        ];
+
+        let mut input = SubmitUserEndCapNonProofInput {
+            core: SubmitUserEndCapNonProofCoreInput::qp_rand_gen(),
+            contract_state_updates: vec![history(1, positional_updates), history(2, imt_updates)],
+            events: vec![],
+        };
+
+        // 1 positional + 3 net IMT keys
+        assert_eq!(input.replay_count_slots_modified(), 4);
+
+        input.core.stats.slots_modified = PF::from_owned_u64(4);
+        assert!(input.ensure_declared_slots_modified().is_ok());
+
+        input.core.stats.slots_modified = PF::from_owned_u64(3);
+        let err = input.ensure_declared_slots_modified().unwrap_err();
+        assert!(err.to_string().contains("declared slots_modified"), "unexpected error: {err}");
     }
 
     #[test]

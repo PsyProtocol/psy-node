@@ -34,7 +34,7 @@ use crate::{
     builder::hash::core::CircuitBuilderHashCore,
     crypto::secp256k1::ecdsa::gadgets::biguint::WitnessBigUint,
     hash::base_types::hash256bytes::{CircuitBuilderHash256Bytes, Hash256BytesTarget, WitnessHash256Bytes},
-    u32::arithmetic_u32::CircuitBuilderU32,
+    u32::{arithmetic_u32::CircuitBuilderU32, range_check::range_check_u32_circuit},
 };
 fn biguint_from_array(arr: [u64; 4]) -> BigUint {
     BigUint::from_slice(&[
@@ -270,6 +270,14 @@ impl Secp256K1Gadget {
         let bigint_msg_target = builder.nonnative_to_canonical_biguint(&msg_target);
         let public_key_x_target = builder.nonnative_to_canonical_biguint(&public_key_target.0.x);
         let public_key_y_target = builder.nonnative_to_canonical_biguint(&public_key_target.0.y);
+
+        // Confine every externally-supplied limb of the public key and the
+        // signature to [0, 2^32) at the gadget boundary (H2 fix). The x limbs
+        // are already confined by `u32_reverse_endian`'s `split_le(x, 32)`
+        // below, so they are not re-checked here.
+        range_check_u32_circuit(builder, public_key_y_target.limbs.clone());
+        range_check_u32_circuit(builder, signature_r_target.limbs.clone());
+        range_check_u32_circuit(builder, signature_s_target.limbs.clone());
 
         let public_key_x_endian_reversed = public_key_x_target
             .limbs

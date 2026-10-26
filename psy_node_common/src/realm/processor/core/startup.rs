@@ -330,7 +330,7 @@ pub(crate) mod startup_tests {
     pub(crate) struct RealmProcessorTestEnv {
         pub db_env: RealmDbTestEnv,
         pub processor: TestProcessor,
-        pub guta_gatherer_handle: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        _proposal_backup_dir: tempfile::TempDir,
     }
 
     impl RealmProcessorTestEnv {
@@ -338,8 +338,10 @@ pub(crate) mod startup_tests {
         /// coordinator sitting consistently at the genesis checkpoint.
         pub(crate) async fn create_over_db_env(db_env: RealmDbTestEnv) -> anyhow::Result<Self> {
             db_env.coordinator.seed_realm_root(0, db_env.genesis.prepared_updates.new_realm_root);
-            let (processor, guta_gatherer_handle) = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
-                TEST_CHAIN_ID,
+            let proposal_backup_dir = tempfile::tempdir()?;
+            let proposal_backup = Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(proposal_backup_dir.path()).await?);
+            let processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
+                u64::from(TEST_CHAIN_ID),
                 &db_env.genesis_data,
                 Arc::clone(&db_env.file_system),
                 TEST_GUTA_BACKUP_DIR.to_string(),
@@ -353,6 +355,9 @@ pub(crate) mod startup_tests {
                 test_realm_identifier(),
                 fingerprint_config(),
                 Arc::clone(&db_env.coordinator),
+                Arc::new(crate::test_common::TestZKVerifier {}),
+                proposal_backup,
+                None,
             )
             .await?;
             // the genesis commit writes the realm-root node into the store;
@@ -360,7 +365,7 @@ pub(crate) mod startup_tests {
             // committed node value so sync_and_verify sees a consistent head
             // out of the box
             db_env.coordinator.seed_realm_root(0, db_env.local_realm_root().await?);
-            Ok(Self { db_env, processor, guta_gatherer_handle })
+            Ok(Self { db_env, processor, _proposal_backup_dir: proposal_backup_dir })
         }
 
         pub(crate) async fn create() -> anyhow::Result<Self> {
@@ -368,7 +373,7 @@ pub(crate) mod startup_tests {
         }
 
         pub(crate) fn abort_gatherers(&self) {
-            self.guta_gatherer_handle.abort();
+            if let Some(handle) = &self.processor.guta_gatherer_join { handle.abort(); }
         }
 
         /// The db-level processor from the underlying env, for seeding
@@ -396,7 +401,7 @@ pub(crate) mod startup_tests {
         assert_eq!(state.processing_proc_checkpoint_unique_id, 0u128);
         assert_ne!(state.gathering_proc_checkpoint_unique_id, 0u128);
         assert_eq!(state.last_committed_checkpoint_id, 0);
-        assert_eq!(state.chain_id, TEST_CHAIN_ID);
+        assert_eq!(state.chain_id, u64::from(TEST_CHAIN_ID));
         assert_eq!(state.realm_id_u64, crate::realm::processor::db::realm_db_test_env::TEST_REALM_ID);
 
         // processor defaults: unlimited worker wait, starting status
@@ -408,7 +413,7 @@ pub(crate) mod startup_tests {
         assert_eq!(env.processor.db.status.state(), ProcessorState::Starting);
 
         // the gatherer background task is alive until aborted
-        assert!(!env.guta_gatherer_handle.is_finished());
+        assert!(!env.processor.guta_gatherer_join.as_ref().unwrap().is_finished());
         env.abort_gatherers();
         Ok(())
     }
@@ -425,8 +430,10 @@ pub(crate) mod startup_tests {
 
         // restart with the same database, checkpoint-tree backup file and
         // coordinator, as a real process restart would
-        let (second_processor, second_gatherer_handle) = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
-            TEST_CHAIN_ID,
+        let second_proposal_backup_dir = tempfile::tempdir()?;
+        let second_proposal_backup = Arc::new(crate::realm::processor::proposal_backup::ProposalBackup::open(second_proposal_backup_dir.path()).await?);
+        let second_processor = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
+            u64::from(TEST_CHAIN_ID),
             &genesis_data,
             file_system,
             TEST_GUTA_BACKUP_DIR.to_string(),
@@ -440,9 +447,12 @@ pub(crate) mod startup_tests {
             test_realm_identifier(),
             fingerprint_config(),
             coordinator,
+            Arc::new(crate::test_common::TestZKVerifier {}),
+            second_proposal_backup,
+            None,
         )
         .await?;
-        second_gatherer_handle.abort();
+        second_processor.guta_gatherer_join.as_ref().unwrap().abort();
 
         // still exactly the genesis checkpoint, with the original pending-id
         // mapping intact (a re-commit would have rewritten checkpoint state)

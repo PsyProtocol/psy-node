@@ -1,0 +1,240 @@
+# Configuring a composed SD key policy
+
+Save a JSON file such as `sd-key-policy.json`:
+
+```json
+{
+  "per_transaction": {
+    "All": [
+      { "Contract": 7 },
+      { "Any": [{ "Method": 10 }, { "Method": 20 }] },
+      { "Input": { "word": 0, "comparison": "Lte", "value": 100 } }
+    ]
+  },
+  "transaction_rules": {
+    "0": { "Method": 10 },
+    "1": { "Method": 20 }
+  },
+  "totals": [{ "word": 0, "max_per_tx": 100, "max_total": 250 }],
+  "min_tx_count": 2,
+  "max_tx_count": 3
+}
+```
+
+`per_transaction` applies to every transaction. `transaction_rules` constrains
+specific zero-based transaction indexes; use consecutive indexes for an
+ordered sequence or leave earlier indexes out to constrain one transaction.
+The legacy `ordered` array is still accepted and converted to indexes starting
+at zero. `All` and `Any` can contain nested rules. Available leaf rules
+are `Contract`, `Method`, `Caller`, and `Input`. `Input.comparison` accepts
+`Eq`, `Lt`, `Lte`, `Gt`, or `Gte`. `Not` negates one nested rule. `IfThen`
+applies a rule when its condition matches. A missing
+calldata word makes an `Input` rule false, so `Not(Input(...))` is true when
+that word is absent.
+
+Use `transaction_rules` to constrain only selected transaction positions. The
+object keys are zero-based transaction indexes. A rule is applied only when
+that transaction exists; unspecified positions are unaffected by this field
+but still must satisfy `per_transaction`:
+
+```json
+{
+  "per_transaction": { "Contract": 0 },
+  "transaction_rules": {
+    "2": {
+      "All": [
+        { "Method": 30 },
+        { "Input": { "word": 0, "comparison": "Lte", "value": 10 } }
+      ]
+    }
+  },
+  "min_tx_count": 1,
+  "max_tx_count": 3
+}
+```
+
+This constrains only transaction index 2 (the third transaction). Consecutive
+`transaction_rules` indexes express an ordered sequence directly.
+
+Use `IfThen` to make a rule conditional. This example constrains input
+for calls to `(5, 10)` and `(8, 20)` while leaving other contract/method pairs
+unconstrained by these conditions:
+
+```json
+{
+  "per_transaction": {
+    "All": [
+      {
+        "Any": [
+          { "Not": { "All": [{ "Contract": 5 }, { "Method": 10 }] } },
+          { "Input": { "word": 0, "comparison": "Lte", "value": 100 } }
+        ]
+      },
+      {
+        "Any": [
+          { "Not": { "All": [{ "Contract": 8 }, { "Method": 20 }] } },
+          { "Input": { "word": 1, "comparison": "Eq", "value": 7 } }
+        ]
+      }
+    ]
+  },
+  "transaction_rules": {},
+  "totals": [],
+  "min_tx_count": 1,
+  "max_tx_count": 10
+}
+```
+
+Matching the contract and method therefore requires the input rule to pass. A missing
+required input word fails that implication.
+
+## Refer to ABI parameters by name
+
+For ABI-aware rules, use an `AbiInput` rule. `sd-key-policy-resolve` fetches
+the ABI from the current network's `api_services_url` in `--rpc-config` and
+expands the rule to contract, method, and calldata-word checks:
+
+```json
+{
+  "per_transaction": {
+    "AbiInput": {
+      "contract_id": 7,
+      "method": "submit_order",
+      "parameter": "order.amount",
+      "comparison": "Lte",
+      "value": 100
+    }
+  },
+  "transaction_rules": {},
+  "totals": [],
+  "min_tx_count": 1,
+  "max_tx_count": 3
+}
+```
+
+`parameter` is either a top-level method parameter such as `amount` or a
+dot-separated static struct path such as `order.amount` or
+`order.asset.amount`. The final field must be exactly one `Felt`. The ABI from
+psy-services provides each method ID and the flattened field offsets. The
+generated rule also pins the contract ID and method ID, so other calls do not inherit the
+parameter constraint. Arrays, hashes, non-Felt values, and unknown or
+ambiguous methods are rejected. The resolved numeric policy is what you
+inspect, fingerprint, and use for proving; proving does not fetch an ABI.
+
+`cross_transaction` compares calldata words in fixed transaction slots. Every
+referenced slot must be below `min_tx_count`, so it is guaranteed to exist:
+
+```json
+"cross_transaction": [
+  { "left_slot": 0, "left_word": 1, "comparison": "Lte", "right_slot": 1, "right_word": 1 }
+]
+```
+
+This requires word 1 in transaction 0 to be less than or equal to word 1 in
+transaction 1. Both words must be present. Supported comparisons are `Eq`,
+`Lt`, `Lte`, `Gt`, and `Gte`.
+
+`totals` sums the selected calldata word across the actual transactions. It
+does not read an ABI or know that a word is an amount. Confirm that every
+allowed method uses the same word and units before treating it as a spending
+limit. Each total also requires that word to exist in every transaction.
+
+Inspect the fingerprint before using the policy:
+
+```bash
+psy_user_cli wallet sd-key-policy-fingerprint --definition sd-key-policy.json
+```
+
+Pass the same file to wallet and transaction commands with
+`--sign-type sd-key-dpn --sd-key-definition sd-key-policy.json`. If
+`--fingerprint` is omitted, the wallet derives it from this file. If it is
+supplied, the wallet checks that it matches. Use the same file for proving and
+submission so the registered circuit matches the wallet key.
+
+Before proving, the prover re-evaluates the policy against the actual
+transactions and reports the violating transaction index, rule, or exceeded
+total instead of failing later with an unsatisfied circuit constraint.
+
+## Templates, checks, and reading a policy
+
+Generate a starter policy file instead of writing JSON by hand:
+
+```bash
+psy_user_cli wallet sd-key-policy-template --kind spending-limit \
+  --contract 7 --methods 10,20 --word 0 --max-per-tx 100 --max-total 300 \
+  --min-tx-count 1 --max-tx-count 3 --output sd-key-policy.json
+```
+
+`--kind` accepts `allow-method` (fixed call allowlist), `spending-limit`
+(adds a per-call bound and a session total on one calldata word), and
+`sequence` (the methods must appear in the given order). Omitted count
+flags default to the smallest range the template supports; every generated
+file round-trips through the policy loader, so a template can never be
+emitted in a state the wallet would reject.
+
+Simulate transactions against a policy before registering the key:
+
+```bash
+psy_user_cli wallet sd-key-policy-check --definition sd-key-policy.json \
+  --call 7:10:60 --call 7:20:80,7
+```
+
+Each `--call` is `contract:method` optionally followed by
+`:word0,word1,...` calldata. The check runs the same native evaluation
+the prover performs before proving, plus the transaction count range.
+Method may be a numeric id or an on-chain function name; names require
+`--rpc-config` and are resolved from the contract's code definition,
+while numeric ids keep the check fully offline. The simulated caller is
+the default caller contract (`0x100000000`), matching user-initiated
+transactions; a `Caller` rule therefore tells direct calls apart from
+cross-contract calls in the check exactly as it does in the circuit.
+`--methods` on the template command accepts names the same way.
+
+Inspect what a key authorizes, in words:
+
+```bash
+psy_user_cli wallet sd-key-policy-describe --definition sd-key-policy.json
+```
+
+It prints the transaction count range, the rule every transaction must
+satisfy, transaction-position constraints, session totals, and the fingerprint.
+With `--rpc-config --contract 7` it also annotates method ids with the
+on-chain function names from that contract.
+
+## Writing restrictions with method names
+
+Policy files may write `Method` rules as on-chain function names instead
+of numeric ids. A name is resolved against the contract named by a
+`Contract` rule in the same `All` group; names outside such a group, like
+position rules, use the `--contract` flag:
+
+```json
+{
+  "per_transaction": {
+    "All": [
+      { "Contract": 7 },
+      { "Any": [{ "Method": "buy" }, { "Method": "sell" }] }
+    ]
+  },
+  "transaction_rules": { "0": { "Method": "buy" } },
+  "totals": [],
+  "min_tx_count": 1,
+  "max_tx_count": 2
+}
+```
+
+Resolve ABI parameter paths from psy-services and method names against the
+chain once, then register the numeric result:
+
+```bash
+psy_user_cli wallet sd-key-policy-resolve --definition names.json \
+  --rpc-config rpc.json --output sd-key-policy.json
+```
+
+Resolving is deliberately a separate, one-time step: the numeric policy
+is self-contained and offline, and its fingerprint cannot drift when a
+contract is later updated on-chain. Register, prove, check, and
+fingerprint the resolved file, not the name-bearing one.
+
+`--sd-key-definition` also accepts the compiled JSON format containing
+`function` and `config` fields.

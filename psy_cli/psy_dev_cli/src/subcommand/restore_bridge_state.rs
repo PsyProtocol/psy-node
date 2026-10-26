@@ -410,6 +410,22 @@ fn remove_file(directory: &File, name: &str) -> anyhow::Result<()> {
     if result != 0 { let error = std::io::Error::last_os_error(); if error.kind() != std::io::ErrorKind::NotFound { return Err(error.into()); } }
     Ok(())
 }
+// renameat2 with RENAME_NOREPLACE is Linux-only; elsewhere approximate it by refusing
+// when the target already exists before falling back to renameat.
+fn renameat_noreplace(directory: &File, from: &CString, to: &CString) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let result = unsafe { libc::renameat2(directory.as_raw_fd(), from.as_ptr(), directory.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
+    #[cfg(not(target_os = "linux"))]
+    let result = {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstatat(directory.as_raw_fd(), to.as_ptr(), status.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+        }
+        unsafe { libc::renameat(directory.as_raw_fd(), from.as_ptr(), directory.as_raw_fd(), to.as_ptr()) }
+    };
+    if result != 0 { return Err(std::io::Error::last_os_error()); }
+    Ok(())
+}
 fn publish(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let temporary = format!("{name}.tmp");
     // Temporary files are never authoritative; no journal commit precedes published intent.
@@ -417,8 +433,7 @@ fn publish(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let mut file = create_file(directory, &temporary)?;
     file.write_all(bytes)?; file.sync_all()?;
     let from = CString::new(temporary)?; let to = CString::new(name)?;
-    let result = unsafe { libc::renameat2(directory.as_raw_fd(),from.as_ptr(),directory.as_raw_fd(),to.as_ptr(),libc::RENAME_NOREPLACE) };
-    ensure!(result == 0, "artifact publication failed: {}", std::io::Error::last_os_error());
+    renameat_noreplace(directory, &from, &to).context("artifact publication failed")?;
     directory.sync_all()?;
     Ok(())
 }
@@ -488,7 +503,7 @@ fn apply(directory: &File, proofs: &File, databases: &[HeldDatabase], snapshot: 
                 let mut reader = source.try_clone()?; reader.seek(SeekFrom::Start(0))?;
                 std::io::copy(&mut reader,&mut backup)?; backup.sync_all()?;
                 let from = CString::new(temporary)?; let to = CString::new(backup_name.as_str())?;
-                ensure!(unsafe { libc::renameat2(directory.as_raw_fd(),from.as_ptr(),directory.as_raw_fd(),to.as_ptr(),libc::RENAME_NOREPLACE) } == 0, "backup publication failed");
+                renameat_noreplace(directory, &from, &to).context("backup publication failed")?;
                 directory.sync_all()?;
             }
             journals.push(original); backups.push(backup_name);
@@ -1066,7 +1081,7 @@ mod tests {
                 backup.sync_all().unwrap();
                 let from = CString::new(temporary).unwrap();
                 let to = CString::new(backup_name).unwrap();
-                assert_eq!(unsafe { libc::renameat2(parent.as_raw_fd(), from.as_ptr(), parent.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) }, 0);
+                renameat_noreplace(&parent, &from, &to).unwrap();
                 journals.push(saved);
             }
             parent.sync_all().unwrap();
@@ -1122,7 +1137,7 @@ mod tests {
                         backup.sync_all().unwrap();
                         let from = CString::new(temporary).unwrap();
                         let to = CString::new(backup_name).unwrap();
-                        assert_eq!(unsafe { libc::renameat2(parent.as_raw_fd(), from.as_ptr(), parent.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) }, 0);
+                        renameat_noreplace(&parent, &from, &to).unwrap();
                         journals.push(saved);
                     }
                     parent.sync_all().unwrap();

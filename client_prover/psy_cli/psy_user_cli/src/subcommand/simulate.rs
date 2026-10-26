@@ -37,6 +37,8 @@ pub async fn run(args: SimulateArgs) -> anyhow::Result<()> {
         nonce: args.nonce.unwrap_or(0),
         user_public_key_hash: [0; 4],
         session_proof_tree_root: [0; 4],
+        transaction_log: vec![],
+        transaction_stack_hash: [0; 4],
     };
 
     // Create state backend (InMemory for simulation)
