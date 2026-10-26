@@ -408,7 +408,7 @@ mod runner_tests {
         let status = env.processor.db.status.clone();
 
         // a crashed gatherer surfaces as an error from the joined runner
-        env.guta_gatherer_handle.abort();
+        env.processor.guta_gatherer_join.as_ref().unwrap().abort();
 
         let RealmProcessorTestEnv { processor, db_env, .. } = env;
         let result = tokio::time::timeout(

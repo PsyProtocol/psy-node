@@ -29,6 +29,7 @@ pub struct ResolvedProgram {
     pub contract_layout: Option<ContractStateLayout>,
     pub contract_name: Option<String>,
     pub impl_block: Option<ResolvedImplBlock>,
+    pub inherent_methods: HashMap<String, Vec<ResolvedMethod>>,
     pub traits: HashMap<String, ResolvedTrait>,
     pub trait_impls: Vec<ResolvedTraitImpl>,
     pub ast: Program,
@@ -86,6 +87,7 @@ impl Resolver {
         let mut contract_layout: Option<ContractStateLayout> = None;
         let mut contract_name: Option<String> = None;
         let mut impl_block: Option<ResolvedImplBlock> = None;
+        let mut inherent_methods: HashMap<String, Vec<ResolvedMethod>> = HashMap::new();
         let mut traits: HashMap<String, ResolvedTrait> = HashMap::new();
         let mut trait_impls: Vec<ResolvedTraitImpl> = Vec::new();
 
@@ -137,16 +139,28 @@ impl Resolver {
                     contract_name = Some(cd.name.clone());
                 }
                 Item::ImplBlock(ib) => {
-                    let resolved_methods: Vec<ResolvedMethod> = ib
-                        .methods
-                        .iter()
-                        .map(|m| self.resolve_method(m, &constants, &struct_names))
-                        .collect::<Result<_>>()?;
-
-                    impl_block = Some(ResolvedImplBlock {
-                        contract_name: ib.contract_name.clone(),
-                        methods: resolved_methods,
-                    });
+                    if ib.is_contract_impl {
+                        let resolved_methods: Vec<ResolvedMethod> = ib
+                            .methods
+                            .iter()
+                            .map(|m| self.resolve_method(m, &constants, &struct_names))
+                            .collect::<Result<_>>()?;
+                        impl_block = Some(ResolvedImplBlock {
+                            contract_name: ib.contract_name.clone(),
+                            methods: resolved_methods,
+                        });
+                    } else {
+                        if !struct_names.contains_key(&ib.contract_name) {
+                            bail!("Unknown struct in impl: {}", ib.contract_name);
+                        }
+                        let methods = inherent_methods.entry(ib.contract_name.clone()).or_default();
+                        for method in &ib.methods {
+                            if methods.iter().any(|existing| existing.name == method.name) {
+                                bail!("Duplicate method {}::{}", ib.contract_name, method.name);
+                            }
+                            methods.push(self.resolve_method(method, &constants, &struct_names)?);
+                        }
+                    }
                 }
                 Item::TraitDef(td) => {
                     let resolved_methods: Vec<ResolvedTraitMethod> = td
@@ -220,6 +234,7 @@ impl Resolver {
             contract_layout,
             contract_name,
             impl_block,
+            inherent_methods,
             traits,
             trait_impls,
             ast: program.clone(),

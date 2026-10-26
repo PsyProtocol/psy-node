@@ -10,7 +10,7 @@ use plonky2::{
 use psy_client_common::data::qhashout::QHashOut;
 
 use crate::{
-    builder::{comparison::CircuitBuilderComparison, core::CircuitBuilderHelpersCore},
+    builder::{comparison::{split_canonical_low_high_32bits, CircuitBuilderComparison}, core::CircuitBuilderHelpersCore},
     hash::base_types::hash256::Hash256Target,
     u32::arithmetic_u32::U32Target,
 };
@@ -79,10 +79,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHashCore<F, D> 
     }
 
     fn hashout_to_hash256_le(&mut self, value: HashOutTarget) -> Hash256Target {
-        let (a_low, a_high) = self.split_low_high(value.elements[0], 32, 64);
-        let (b_low, b_high) = self.split_low_high(value.elements[1], 32, 64);
-        let (c_low, c_high) = self.split_low_high(value.elements[2], 32, 64);
-        let (d_low, d_high) = self.split_low_high(value.elements[3], 32, 64);
+        let (a_low, a_high) = split_canonical_low_high_32bits(self, value.elements[0]);
+        let (b_low, b_high) = split_canonical_low_high_32bits(self, value.elements[1]);
+        let (c_low, c_high) = split_canonical_low_high_32bits(self, value.elements[2]);
+        let (d_low, d_high) = split_canonical_low_high_32bits(self, value.elements[3]);
 
         [
             U32Target(a_low),
@@ -133,10 +133,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHashCore<F, D> 
     }
 
     fn hashout_to_hash256_be(&mut self, value: HashOutTarget) -> Hash256Target {
-        let (a_low, a_high) = self.split_low_high(value.elements[0], 32, 64);
-        let (b_low, b_high) = self.split_low_high(value.elements[1], 32, 64);
-        let (c_low, c_high) = self.split_low_high(value.elements[2], 32, 64);
-        let (d_low, d_high) = self.split_low_high(value.elements[3], 32, 64);
+        let (a_low, a_high) = split_canonical_low_high_32bits(self, value.elements[0]);
+        let (b_low, b_high) = split_canonical_low_high_32bits(self, value.elements[1]);
+        let (c_low, c_high) = split_canonical_low_high_32bits(self, value.elements[2]);
+        let (d_low, d_high) = split_canonical_low_high_32bits(self, value.elements[3]);
 
         [
             U32Target(d_high),
@@ -186,7 +186,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHashCore<F, D> 
         value: Target,
     ) -> HashOutTarget {
         let not_high_bit = self.not(index_high_bit);
-        let not_low_bit = self.not(index_high_bit);
+        let not_low_bit = self.not(index_low_bit);
 
         let index_is_0 = self.and(not_low_bit, not_high_bit);
         let index_is_1 = self.and(index_low_bit, not_high_bit);

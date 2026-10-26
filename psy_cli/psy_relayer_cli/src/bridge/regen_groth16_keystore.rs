@@ -89,9 +89,9 @@ const CHECKPOINT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::CHECKPOINT
 const GLOBAL_USER_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE;
 const GLOBAL_CONTRACT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
 const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
-    psy_config::network_constants::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+    psy_config::DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const WITHDRAWAL_CONTRACT_STATE_TREE_HEIGHT: usize =
-    psy_config::network_constants::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
+    psy_config::WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT as usize;
 const GROTH16_FILES: [&str; 3] = ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"];
 const REWARD_CLAIM_DIR: &str = "reward_claim";
 const REWARD_USER_ID: u32 = 7;
@@ -210,6 +210,8 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         worker_rewards_tree_tag,
     ).context("failed to generate dummy update-contracts aggregate proof")?;
 
+    // This is a dummy proving fixture; keep the synthetic genesis stats used
+    // by the original keystore generator.
     let genesis_stats = PQEDCheckpointLeafStats::<F, QHashOut<F>>::new_empty();
     let genesis_roots = checkpoint_global_state_roots;
     let genesis_leaf = PQEDCheckpointLeaf {
@@ -329,7 +331,7 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
     let checkpoint_input_partial = QCQEDCheckpointStateTransitionInputPartial {
         part_1_header,
         old_stats: genesis_stats,
-        block_time: F::ONE,
+        block_time: genesis_stats.block_time + F::ONE,
         final_random_seed_contribution: qhash(400),
         pm_jobs_completed: PPMJobsCompletedStats {
             deploy_contracts_completed: F::ONE,
@@ -356,8 +358,12 @@ fn regenerate_bridge_agg(keystore_dir: &Path) -> anyhow::Result<()> {
         last_old_checkpoint_tree_leaf_hash: QHashOut::ZERO,
         last_old_checkpoint_tree_root_hash: QHashOut::ZERO,
         previous_chain_hash: genesis_chain_hash,
+        // Only checkpoint 1 ignores the older cumulative commitment.
+        start_chain_hash: QHashOut::ZERO,
         checkpoint_state_transition_circuit_fingerprint: checkpoint_fingerprint,
     };
+    anyhow::ensure!(checkpoint_input.append_checkpoint_tree_proof.index == 1,
+        "bridge keystore fixture uses a genesis predecessor and zero older hash; target must be checkpoint 1");
     checkpoint_input.update_for_prover::<PoseidonHash>(checkpoint_reward_root);
 
     let part_1_actual_public_inputs = QHashOut::<F>::from_felt_slice(&part_1_proof.public_inputs);
@@ -725,7 +731,7 @@ fn tagged_node(left: HashOut<F>, right: HashOut<F>, tag: HashOut<F>) -> HashOut<
 fn registration_membership(
     user_id: u32, private_key: HashOut<F>,
 ) -> (HashOut<F>, u64, [HashOut<F>; psy_config::network_constants::GLOBAL_USER_TREE_HEIGHT as usize], HashOut<F>) {
-    let public_key_param = psy_ups_circuit::signature::software_defined::get_sdc_public_key_param(&ClientQHashOut(private_key));
+    let public_key_param = psy_ups_circuit::signature::sd_key_plonky2::get_sdc_public_key_param(&ClientQHashOut(private_key));
     let fingerprint = PsyBasicZKSignatureCircuit::<C, D>::new().fingerprint.0;
     let registration_leaf = PoseidonHash::two_to_one(fingerprint, public_key_param.0);
     let registration_index = get_registration_id_from_user_id(u64::from(user_id));

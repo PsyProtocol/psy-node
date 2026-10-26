@@ -73,7 +73,13 @@ pub struct RewardClaim {
 }
 
 impl RewardClaim {
-    pub fn from_public_inputs(inputs: &[u64; USER_REWARD_ROOT_PUBLIC_INPUT_COUNT]) -> Result<Self> {
+    pub fn from_public_inputs(inputs: &[u64]) -> Result<Self> {
+        if inputs.len() < USER_REWARD_ROOT_PUBLIC_INPUT_COUNT {
+            return Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes));
+        }
+        if inputs.len() > USER_REWARD_ROOT_PUBLIC_INPUT_COUNT {
+            return Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes));
+        }
         let user_id = read_u32(inputs[0])?;
         let mut recipient_limbs = [0u32; 8];
         for (index, limb) in recipient_limbs.iter_mut().enumerate() { *limb = read_u32(inputs[1 + index])?; }
@@ -136,7 +142,10 @@ mod public_input_tests {
 
     #[test]
     fn public_inputs_reject_width_and_noncanonical_root() {
-        assert!(RewardClaim::from_public_inputs(&[0; 22].as_slice().try_into().unwrap_or(&[0; 23])).is_err() || inputs().len() == 23);
+        assert_eq!(RewardClaim::from_public_inputs(&inputs()[..22]), Err(BridgeProofError::InvalidEncoding(EncodingError::MissingBytes)));
+        let mut extra = inputs().to_vec();
+        extra.push(0);
+        assert_eq!(RewardClaim::from_public_inputs(&extra), Err(BridgeProofError::InvalidEncoding(EncodingError::TrailingBytes)));
         let mut wide = inputs();
         wide[0] = u32::MAX as u64 + 1;
         assert!(RewardClaim::from_public_inputs(&wide).is_err());

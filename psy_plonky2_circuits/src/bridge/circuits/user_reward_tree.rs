@@ -733,7 +733,7 @@ pub(in crate::bridge::circuits) mod tests {
     pub(in crate::bridge::circuits) fn registration_membership(user_id: u32) -> (HashOut<F>, u64, [HashOut<F>; GLOBAL_USER_TREE_HEIGHT as usize], PsyCheckpointGlobalStateRoots<F>) {
         let private_key = QHashOut::from_values(17, 23, 31, 47);
         let client_key = psy_client_common::data::qhashout::QHashOut(private_key.0);
-        let public_key_param = psy_ups_circuit::signature::software_defined::get_sdc_public_key_param(&client_key);
+        let public_key_param = psy_ups_circuit::signature::sd_key_plonky2::get_sdc_public_key_param(&client_key);
         let fingerprint = psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureCircuit::<C, D>::new().fingerprint.0;
         let registration_leaf = PoseidonHash::two_to_one(fingerprint, public_key_param.0);
         let registration_index = psy_crypto::common::user_id::get_registration_id_from_user_id(u64::from(user_id));

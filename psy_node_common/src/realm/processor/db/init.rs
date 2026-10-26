@@ -1807,7 +1807,7 @@ pub(crate) mod realm_db_test_env {
                 Arc::clone(&guta_queue),
                 Arc::clone(&proof_queue),
                 Arc::clone(&coordinator),
-                TEST_CHAIN_ID,
+                u64::from(TEST_CHAIN_ID),
                 test_realm_identifier(),
                 fingerprint_config(),
                 Arc::clone(&proof_verifier),
@@ -2245,7 +2245,7 @@ mod init_tests {
             processor.state.last_committed_realm_end_root,
             env.genesis_realm_root()
         );
-        assert_eq!(processor.state.chain_id, TEST_CHAIN_ID);
+        assert_eq!(processor.state.chain_id, u64::from(TEST_CHAIN_ID));
         assert_eq!(processor.state.realm_id_u64, TEST_REALM_ID);
         assert_eq!(processor.state.realm_sub_id_u64, TEST_REALM_SUB_ID);
         assert!(!processor.needs_revert);
@@ -2288,7 +2288,7 @@ mod init_tests {
             Arc::clone(&env.guta_queue),
             Arc::clone(&env.proof_queue),
             Arc::clone(&env.coordinator),
-            TEST_CHAIN_ID,
+            u64::from(TEST_CHAIN_ID),
             test_realm_identifier(),
             fingerprint_config(),
             Arc::clone(&env.proof_verifier),

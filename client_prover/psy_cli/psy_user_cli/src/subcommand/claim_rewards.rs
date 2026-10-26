@@ -460,7 +460,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let private_key = QHashOut::from_values(17, 23, 31, 47);
-            let param = psy_ups_circuit::signature::software_defined::get_sdc_public_key_param(&private_key);
+            let param = psy_ups_circuit::signature::sd_key_plonky2::get_sdc_public_key_param(&private_key);
             let identity = psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureCircuit::<PoseidonGoldilocksConfig, 2>::new().fingerprint.0;
             let registration_leaf = PoseidonHash::two_to_one(identity, param.0);
             let registration_index = get_registration_id_from_user_id(7);
@@ -555,7 +555,7 @@ mod tests {
         let token = format!("0x{}", "05".repeat(20));
         let args = ClaimRewardsArgs {
             rpc_config: String::new(), reward_token: String::new(), recipient: String::new(), user_id: 7,
-            wallet: crate::subcommand::args::WalletSourceArgs { sign_type: psy_client_common::args::SignType::ZKSign, private_key: None, keystore_path: None, wallet_password: None, fingerprint: None, sd_key_allowed_contract_id: vec![], sd_key_allowed_method_id: vec![], sd_key_expected_tx_count: 2 },
+            wallet: crate::subcommand::args::WalletSourceArgs { sign_type: psy_client_common::args::SignType::ZKSign, private_key: None, keystore_path: None, wallet_password: None, fingerprint: None, sd_key_allowed_contract_id: vec![], sd_key_allowed_method_id: vec![], sd_key_min_tx_count: Some(2), sd_key_max_tx_count: Some(2), sd_key_definition: None },
             jobs_file: jobs_file.to_str().unwrap().to_owned(), proof_cache_dir: cache_dir.to_str().unwrap().to_owned(),
             l1_rpc_url: fixture.server.url.clone(), l1_private_key: String::new(), prove_proxy_url: String::new(), prove_proxy_token: None,
         };

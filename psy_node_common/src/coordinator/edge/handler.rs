@@ -189,6 +189,7 @@ pub struct CoordinatorEdgeHandler<
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
     pub chain_id: u64,
+    pub genesis_checkpoint_state_transition_fingerprint: N::QHash,
     pub canonical_layout_verifier_fingerprint: N::QHash,
     pub canonical_layout_proof_verifier: Arc<CanonicalLayoutProofVerifier>,
 }
@@ -233,6 +234,7 @@ impl<
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
             chain_id: self.chain_id,
+            genesis_checkpoint_state_transition_fingerprint: self.genesis_checkpoint_state_transition_fingerprint.clone(),
             canonical_layout_verifier_fingerprint: self.canonical_layout_verifier_fingerprint,
             canonical_layout_proof_verifier: self.canonical_layout_proof_verifier.clone(),
         }
@@ -275,6 +277,7 @@ impl<
         chain_id: u64,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
+        genesis_checkpoint_state_transition_fingerprint: N::QHash,
         canonical_layout_verifier_fingerprint: N::QHash,
         canonical_layout_proof_verifier: Arc<CanonicalLayoutProofVerifier>,
     ) -> Self {
@@ -297,6 +300,7 @@ impl<
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
             chain_id,
+            genesis_checkpoint_state_transition_fingerprint,
             canonical_layout_verifier_fingerprint,
             canonical_layout_proof_verifier,
         }
@@ -1106,6 +1110,7 @@ impl<
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use psy_node_core::psy_temp_db::QTempDBProofWitnessWriter;
     use crate::coordinator::processor::db::PsyCoordinatorDatabaseProcessor;
     use crate::coordinator::processor::startup::startup_tests::{genesis_validator, validator_signing_key};
     use crate::test_common::{
@@ -1114,7 +1119,7 @@ pub(crate) mod tests {
         TestUnifiedDatabaseStore,
     };
     use parth_core::{
-        crypto::hash::traits::MerkleZeroHasher,
+        crypto::hash::traits::{FieldQHasher, MerkleZeroHasher},
         felt::{FromPrimitiveValuesFelt, ToU64Value},
         node::realm_identifier::QRealmIdentifier,
         protocol::core_types::QNetworkTreeConstants,
@@ -1259,6 +1264,7 @@ pub(crate) mod tests {
                 PSY_CHAIN_ID_LOCAL_DEVNET,
                 Arc::new(crate::test_common::TestZKVerifier {}),
                 zh(25),
+                zh(26),
                 PHash::from_values(7, 0, 0, 0),
                 Arc::new(|proof| {
                     anyhow::ensure!(
@@ -1349,6 +1355,54 @@ pub(crate) mod tests {
                 .await?;
             Ok(processor)
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_one_submit_is_anchored_to_edge_genesis() -> anyhow::Result<()> {
+        use psy_data::protocol::circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput;
+        use psy_node_core::psy_core_db::traits::full::{
+            PsyNodeCheckpointTreeDatabaseReader,
+            PsyNodeCheckpointTransitionZKProofDatabaseReader,
+        };
+
+        let env = EdgeTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let realm = QRealmIdentifier::new(1, 2);
+        let job = QProvingJobDataID {
+            topic: psy_core::job::job_id::QJobTopic::GenerateStandardProof,
+            goal_id: 1,
+            circuit_type: psy_core::job::job_id::ProvingJobCircuitType::GenerateRollupStateTransitionProof,
+            group_id: 0,
+            sub_group_id: 0,
+            task_index: 0,
+            data_type: psy_core::job::job_id::ProvingJobDataType::StandardProof,
+            data_index: 0,
+        };
+        let canonical = env.db.checkpoint_tree_get_merkle_proof(0, 0).await?;
+        let genesis_transition = env.db.get_verifiable_checkpoint_state_transition_and_zkp(0).await?;
+        let mut witness = QCQEDCheckpointStateTransitionInput::<PF, PHash>::qp_rand_gen();
+        witness.append_checkpoint_tree_proof.index = 1;
+        witness.append_checkpoint_tree_proof.old_root = canonical.root;
+        witness.append_checkpoint_tree_proof.old_value = canonical.value;
+        witness.previous_checkpoint_proof = canonical.clone();
+        witness.genesis_checkpoint_state_transition_hash =
+            genesis_transition.info.state_transition.genesis_checkpoint_state_transition_hash;
+        let root_leaf = parth_core::pgoldilocks::PoseidonHasher::q_two_to_one(canonical.root, canonical.value);
+        witness.previous_chain_hash = parth_core::pgoldilocks::PoseidonHasher::q_two_to_one(root_leaf, zh(26));
+        env.temp_db.set_tdb_proof_witness(&realm, 0, job.get_input_witness_id(), &witness).await?;
+        env.handler.get_root_state_transition_expected_public_inputs_hash_internal(job, 0, zh(40)).await?;
+
+        for corrupt in 0..3 {
+            let mut bad_witness = witness.clone();
+            match corrupt {
+                0 => bad_witness.append_checkpoint_tree_proof.old_value = zh(41),
+                1 => bad_witness.append_checkpoint_tree_proof.old_root = zh(42),
+                _ => bad_witness.previous_chain_hash = zh(43),
+            }
+            env.temp_db.set_tdb_proof_witness(&realm, 0, job.get_input_witness_id(), &bad_witness).await?;
+            assert!(env.handler.get_root_state_transition_expected_public_inputs_hash_internal(job, 0, zh(40)).await.is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]

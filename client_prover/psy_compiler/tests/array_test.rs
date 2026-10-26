@@ -114,8 +114,9 @@ fn local_nested_array_reads_work() {
 }
 
 #[test]
-fn nested_array_inside_contract_state_array_element_should_write_second_slot_but_currently_fails() {
-    // Intentionally failing regression test:
+fn nested_array_inside_contract_state_array_element_writes_second_slot() {
+    // Regression test for nested array element writes inside a state-array
+    // struct element.
     // self.users[uid].vals[1] should update the second felt in `vals`,
     // but current lowering may collapse this to the start offset of `vals`.
     let source = r#"

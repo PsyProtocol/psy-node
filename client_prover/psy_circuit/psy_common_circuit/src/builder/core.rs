@@ -304,7 +304,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderHelpersCore<F, 
     }
 
     fn split_low_high_32bits(&mut self, x: Target) -> (Target, Target) {
-        let (a_low, a_high) = self.split_low_high(x, 32, 64);
-        (a_low, a_high)
+        super::comparison::split_canonical_low_high_32bits(self, x)
     }
 }

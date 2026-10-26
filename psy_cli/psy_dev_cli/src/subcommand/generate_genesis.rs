@@ -13,6 +13,7 @@ use plonky2::{
     hash::poseidon::PoseidonHash,
 };
 use plonky2::field::types::Field64;
+use psy_ups_circuit::signature::sd_key_dpn::SDKeyDpnCircuitGadget;
 use psy_vm::ups::multisig::{MultisigAccount, MULTISIG_POLICY_CONTRACT_ID};
 use psy_core::{
     constants::protocol::{DA_CHALLENGE_WINDOW, TOKEN_BURN_METHOD_ID},
@@ -39,7 +40,7 @@ pub use guardians_root::preflight_fresh_devnet_inputs;
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
-const DEFAULT_SD_KEY_FINGERPRINT: &str = "86dc54cd270fb9c5cb194bb11b7674979ccc26e75706e1ccf93900857e7fa278";
+const DEFAULT_SD_KEY_FINGERPRINT: &str = "9faca812159aeeca40980d2483315265c69249ee4537f1d962457f16f3fe527a";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
 
 
@@ -104,6 +105,7 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long, help = "Generate validator and faucet private keys from OS entropy; required outside localhost")]
     pub random_private_keys: bool,
 
+    /// Optional assertion against the fingerprint derived from the faucet SDKey policy.
     #[arg(long = "sd-key-fingerprint", default_value = DEFAULT_SD_KEY_FINGERPRINT)]
     pub sd_key_fingerprint: String,
 
@@ -141,8 +143,11 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "faucet-per-claim-amount", default_value = "1000000000000")]
     pub faucet_per_claim_amount: String,
 
-    #[arg(long = "sd-key-expected-tx-count", default_value_t = 3)]
-    pub sd_key_expected_tx_count: u64,
+    #[arg(long = "sd-key-min-tx-count", default_value_t = 1)]
+    pub sd_key_min_tx_count: u64,
+
+    #[arg(long = "sd-key-max-tx-count", default_value_t = 64)]
+    pub sd_key_max_tx_count: u64,
 
     #[arg(long = "sd-key-allowed-contract-id", default_values_t = vec![5u64, 0, 0])]
     pub sd_key_allowed_contract_ids: Vec<u64>,
@@ -151,6 +156,9 @@ pub struct GenerateGenesisDataArgs {
     #[arg(long = "sd-key-allowed-method-id", default_values_t = vec![3375543263u32, 2789897329, TOKEN_BURN_METHOD_ID])]
     pub sd_key_allowed_method_ids: Vec<u32>,
 
+    /// Caller for each allowed contract/method pair; Transfer must come from the faucet contract.
+    #[arg(long = "sd-key-allowed-caller-contract-id", default_values_t = vec![psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64, 5, psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64])]
+    pub sd_key_allowed_caller_contract_ids: Vec<u64>,
 }
 
 pub async fn run(args: GenerateGenesisDataArgs) -> anyhow::Result<()> {
@@ -522,7 +530,27 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
         repo_root.join("psy-genesis/genesis_contracts.json")
     });
     let contracts = load_contracts(&contracts_path)?;
-    let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
+    ensure!(args.sd_key_min_tx_count >= 1 && args.sd_key_max_tx_count <= 64,
+        "faucet SDKey transaction count must be within 1..=64");
+    let (function, config) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
+        &args.sd_key_allowed_caller_contract_ids,
+        &args.sd_key_allowed_contract_ids,
+        &args.sd_key_allowed_method_ids,
+        args.sd_key_min_tx_count,
+        args.sd_key_max_tx_count,
+    )?;
+    for call in &config.transaction_count_policy.as_ref().context("faucet SDKey requires a transaction count policy")?.allowed_calls {
+        if call.contract_id == 0 && call.method_id == 2789897329 {
+            ensure!(call.caller_contract_id == Some(args.faucet_contract_id),
+                "faucet SDKey Transfer must be called by the faucet contract");
+        }
+    }
+    let circuit = SDKeyDpnCircuitGadget::build_from_dpn_function(&function, &config)?;
+    let sd_key_fingerprint: QHashOut<F> = serde_json::from_value(serde_json::to_value(circuit.get_fingerprint())?)?;
+    if !args.sd_key_fingerprint.trim().is_empty() {
+        ensure!(parse_qhash(&args.sd_key_fingerprint)? == sd_key_fingerprint,
+            "--sd-key-fingerprint does not match the faucet SDKey policy");
+    }
     validate_multisig_policy_artifact(&contracts, &read_compiler_contract(&compiler_checkout(&repo_root)?, "multisig_policy")?)?;
     let relayer = initialized_multisig_user(&account, args.initial_fee_balance)?;
     let (users, private_keys) = genesis_users(args, relayer, &mut rand::rngs::OsRng)?;
@@ -588,7 +616,7 @@ fn faucet_operators_body(args: &GenerateGenesisDataArgs, private_keys: &[Option<
     #[derive(serde::Serialize)]
     struct FaucetOperatorJson { #[serde(rename = "userId")] user_id: String, address: String, #[serde(rename = "privateKey")] private_key: String, fingerprint: String, #[serde(rename = "signType")] sign_type: String }
     #[derive(serde::Serialize)]
-    struct FaucetOperatorsJson { #[serde(rename = "faucetContractId")] faucet_contract_id: u64, #[serde(rename = "faucetMethodName")] faucet_method_name: String, #[serde(rename = "faucetMethodId")] faucet_method_id: u64, #[serde(rename = "faucetPerClaimAmount")] faucet_per_claim_amount: String, #[serde(rename = "sdKeyExpectedTxCount")] sd_key_expected_tx_count: u64, #[serde(rename = "sdKeyAllowedContractIds")] sd_key_allowed_contract_ids: Vec<u64>, #[serde(rename = "sdKeyAllowedMethodIds")] sd_key_allowed_method_ids: Vec<u32>, operators: Vec<FaucetOperatorJson> }
+    struct FaucetOperatorsJson { #[serde(rename = "faucetContractId")] faucet_contract_id: u64, #[serde(rename = "faucetMethodName")] faucet_method_name: String, #[serde(rename = "faucetMethodId")] faucet_method_id: u64, #[serde(rename = "faucetPerClaimAmount")] faucet_per_claim_amount: String, #[serde(rename = "sdKeyMinTxCount")] sd_key_min_tx_count: u64, #[serde(rename = "sdKeyMaxTxCount")] sd_key_max_tx_count: u64, #[serde(rename = "sdKeyAllowedContractIds")] sd_key_allowed_contract_ids: Vec<u64>, #[serde(rename = "sdKeyAllowedMethodIds")] sd_key_allowed_method_ids: Vec<u32>, #[serde(rename = "sdKeyAllowedCallerContractIds")] sd_key_allowed_caller_contract_ids: Vec<u64>, operators: Vec<FaucetOperatorJson> }
     let operators = (0..args.faucet_operator_count).map(|i| {
         let slot = special_zk_user_count + i;
         let pk = private_keys.get(slot).copied().flatten().with_context(|| format!("faucet registration {slot} requires a private key"))?;
@@ -596,7 +624,7 @@ fn faucet_operators_body(args: &GenerateGenesisDataArgs, private_keys: &[Option<
         let address = PZKPublicKeyInfo { fingerprint: sd_key_fingerprint, public_key_param }.to_hash::<PoseidonHasher>();
         Ok(FaucetOperatorJson { user_id: user_id_for(args, slot as u64).to_string(), address: format!("{address}"), private_key: format!("{pk}"), fingerprint: format!("{sd_key_fingerprint}"), sign_type: "sd-key".to_string() })
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    serde_json::to_vec_pretty(&FaucetOperatorsJson { faucet_contract_id: args.faucet_contract_id, faucet_method_name: args.faucet_method_name.clone(), faucet_method_id: args.faucet_method_id, faucet_per_claim_amount: args.faucet_per_claim_amount.clone(), sd_key_expected_tx_count: args.sd_key_expected_tx_count, sd_key_allowed_contract_ids: args.sd_key_allowed_contract_ids.clone(), sd_key_allowed_method_ids: args.sd_key_allowed_method_ids.clone(), operators }).context("serializing faucet operators")
+    serde_json::to_vec_pretty(&FaucetOperatorsJson { faucet_contract_id: args.faucet_contract_id, faucet_method_name: args.faucet_method_name.clone(), faucet_method_id: args.faucet_method_id, faucet_per_claim_amount: args.faucet_per_claim_amount.clone(), sd_key_min_tx_count: args.sd_key_min_tx_count, sd_key_max_tx_count: args.sd_key_max_tx_count, sd_key_allowed_contract_ids: args.sd_key_allowed_contract_ids.clone(), sd_key_allowed_method_ids: args.sd_key_allowed_method_ids.clone(), sd_key_allowed_caller_contract_ids: args.sd_key_allowed_caller_contract_ids.clone(), operators }).context("serializing faucet operators")
 }
 
 fn save_genesis_outputs(random_private_keys: bool, genesis: (&Path, &[u8]), private_keys: (&Path, &[u8]), faucet: Option<(&Path, &[u8])>) -> anyhow::Result<()> {

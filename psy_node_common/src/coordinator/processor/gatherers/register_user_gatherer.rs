@@ -1811,7 +1811,7 @@ mod gatherer_builder_tests {
         let bytes = fs.files.get(&backup_path).unwrap().value().clone();
         assert_eq!(bytes.len(), 4 + 8 + 32 + 128 + 8 + 8);
         let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let read_output = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(fs.as_ref(), &backup_path, &mut read_tree).await?;
+        let read_output = read_register_user_gatherer_backup_file_path::<N, Hasher, Hash, Fs>(&fs, &backup_path, &mut read_tree).await?;
         assert_eq!(read_output.next_user_id, 2);
         assert_eq!(read_output.end_user_registration_tree_hash, output.db_output.end_user_registration_tree_hash);
         assert_eq!(read_output.total_jobs, total);

@@ -245,6 +245,7 @@ mod create_and_run_tests {
     use std::{sync::Arc, time::{Duration, Instant}};
 
     use parth_core::node::realm_identifier::QRealmIdentifier;
+    use psy_core::constants::chain_id::PsyChainNetworkType;
 
     use crate::{
         coordinator::processor::{
@@ -277,7 +278,7 @@ mod create_and_run_tests {
         let observe_guta_queue = Arc::clone(&guta_queue);
         let task = tokio::spawn(async move {
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
-                psy_core::constants::chain_id::PSY_CHAIN_ID_LOCAL_DEVNET,
+                PsyChainNetworkType::LocalDevnet.get_chain_id(),
                 &task_genesis_data,
                 fingerprint_config(),
                 Arc::clone(&file_system),

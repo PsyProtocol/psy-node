@@ -144,7 +144,7 @@ pub fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
 pub fn open_at(parent: &File, name: &OsStr, flags: i32) -> anyhow::Result<Option<File>> {
     ensure!(!name.as_bytes().is_empty() && !name.as_bytes().contains(&b'/') && name != "." && name != "..", "invalid relative path component");
     let name = CString::new(name.as_bytes())?;
-    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK, 0o600 as libc::mode_t) };
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK, 0o600 as libc::mode_t as libc::c_uint) };
     if descriptor < 0 {
         let error = io::Error::last_os_error();
         if error.kind() == ErrorKind::NotFound { return Ok(None); }
@@ -194,7 +194,10 @@ pub fn directory_names(directory: &File) -> anyhow::Result<Vec<OsString>> {
     }
     let mut names = Vec::new();
     let result = loop {
+        #[cfg(target_os = "linux")]
         unsafe { *libc::__errno_location() = 0 };
+        #[cfg(target_os = "macos")]
+        unsafe { *libc::__error() = 0 };
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
             let error = io::Error::last_os_error();

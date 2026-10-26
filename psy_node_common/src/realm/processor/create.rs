@@ -154,7 +154,7 @@ mod create_tests {
         assert_eq!(state.last_committed_realm_end_root, env.genesis_realm_root());
         assert_eq!(state.gathering_unique_pending_id, 1);
         assert_ne!(state.gathering_proc_checkpoint_unique_id, 0u128);
-        assert_eq!(state.chain_id, TEST_CHAIN_ID);
+        assert_eq!(state.chain_id, u64::from(TEST_CHAIN_ID));
         assert_eq!(state.realm_id_u64, TEST_REALM_ID);
         assert_eq!(state.realm_sub_id_u64, TEST_REALM_SUB_ID);
         let shared = processor.db.shared_state.load_core_state().await?;
