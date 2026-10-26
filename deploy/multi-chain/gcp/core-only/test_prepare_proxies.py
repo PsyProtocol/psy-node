@@ -16,7 +16,7 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location("prepare_proxies", Path(__file__).with_name("prepare_proxies.py"))
 p = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(p)
-SOURCE = "dcc1146514ef3eca2336640f6d95e5a1c04feff9"
+SOURCE = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
 
 
 class ProxyPreparationTests(unittest.TestCase):
@@ -155,7 +155,7 @@ class ProxyPreparationTests(unittest.TestCase):
         p.read_package(self.args.output, report["package_sha256"])
         self.assertIn("MemoryHigh=24G\nMemoryMax=32G", (self.args.output / p.unit_name("user")).read_text())
 
-    def test_new_approved_source_is_accepted_but_mutable_or_mismatched_source_is_not(self):
+    def test_only_pinned_source_is_accepted_even_with_matching_manifest(self):
         for source in ("main", "dcc11465", "0" * 40, "a" * 40):
             self.args.source_commit = source
             with self.assertRaises(p.ProxyError):
@@ -163,8 +163,9 @@ class ProxyPreparationTests(unittest.TestCase):
             self.assertFalse(self.args.output.exists())
         self.build["source_commit"] = "a" * 40
         self.args.source_commit = "a" * 40
-        report = self.package()
-        p.read_package(self.args.output, report["package_sha256"])
+        with self.assertRaises(p.ProxyError):
+            self.package()
+        self.assertFalse(self.args.output.exists())
 
     def test_wrong_testnet_magic_and_realm_ids_rejected(self):
         for mutation in (lambda n: n.update(magic="0x1"),

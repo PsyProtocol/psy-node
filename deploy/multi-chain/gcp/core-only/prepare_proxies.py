@@ -55,7 +55,8 @@ import sys
 from urllib.parse import urlsplit
 
 
-RELEASE_ID = "core-testnet-20261026"
+RELEASE_ID = "core-testnet-20261026-r2"
+SOURCE = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
 MAGIC = "0x1337CF514544CF69"
 ROLES = ("system", "user")
 MEMORY_GIB = {"system": (36, 44), "user": (40, 48)}
@@ -70,7 +71,8 @@ CONFIG_ROOT = Path("/etc/psy-core-prove-proxy")
 STATE_ROOT = Path("/var/lib/psy-core-prove-proxy")
 UNITS = Path("/etc/systemd/system")
 OLD_UNITS = ("parth-prove-proxy@system.service", "parth-prove-proxy@user.service",
-             "parth-offsite-prove-proxy.service")
+             "parth-offsite-prove-proxy.service", "psy-core-prove-proxy-system.service",
+             "psy-core-prove-proxy-user.service")
 
 
 class ProxyError(ValueError):
@@ -93,8 +95,7 @@ def validate_hash(value):
 
 
 def validate_source(value):
-    require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
-            and value != "0" * 40, "full immutable source commit required")
+    require(value == SOURCE, "source must match pinned r2 runtime")
     return value
 
 
@@ -287,7 +288,7 @@ def paths(role):
 
 
 def unit_name(role):
-    return "psy-core-prove-proxy-" + role + ".service"
+    return "psy-core-prove-proxy-r2-" + role + ".service"
 
 
 def memory_limits(role, high=None, maximum=None):
@@ -521,7 +522,7 @@ def check_destinations(role):
         require(not os.path.lexists(path), "release/config/state already exists; inspect before retry")
     search = command(["systemd-analyze", "unit-paths"]).splitlines()
     require(str(UNITS) in search and all(path.startswith("/") for path in search), "invalid unit search paths")
-    names = (unit_name(role), "psy-core-prove-proxy-.service", "psy-core-prove-.service",
+    names = (unit_name(role), "psy-core-prove-proxy-r2-.service", "psy-core-prove-proxy-.service", "psy-core-prove-.service",
              "psy-core-.service", "psy-.service", "service")
     for root in map(Path, search):
         for name in names:

@@ -15,9 +15,10 @@ import plan
 
 
 HERE = Path(__file__).resolve().parent
-NODE_SHA256 = "8d3ef23e9600d168f588b448840c7884c22f0505d666ecc902574684d8011056"
+# Deliberately closed until the r2 build and identity-preserving Genesis are reviewed.
+NODE_SHA256 = None
 CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
-GENESIS_SHA256 = "1126a26de4259367fa16fe15af989678a5ac7044fd4a357b501716d7bce9ca11"
+GENESIS_SHA256 = None
 
 
 def require(value, message):
@@ -88,6 +89,7 @@ def publish_packages(source, destination):
 
 
 def prepare(args):
+    require(NODE_SHA256 is not None and GENESIS_SHA256 is not None, "r2 artifact pins not frozen")
     topology, _ = plan.read_json(args.topology)
     config, config_hash = plan.read_json(regular(args.config))
     genesis, genesis_hash = plan.read_json(regular(args.genesis))

@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 
 HERE = Path(__file__).resolve().parent
-RUNTIME_COMMIT = "dcc1146514ef3eca2336640f6d95e5a1c04feff9"
+RUNTIME_COMMIT = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
          ((1, 1048576), (3, 1572864), (5, 1310720)))
 PROCESSORS = ("gcp-realm-processor", "realm-processors-b", "realm-processors-c")
@@ -86,7 +86,7 @@ def validate_topology(t):
     require(type(t["schema_version"]) is int and t["schema_version"] == 1, "unsupported schema")
     require(t["runtime_commit"] == RUNTIME_COMMIT,
             "runtime commit must match pinned published source")
-    require(t["release_id"] == "core-testnet-20261026", "unexpected release ID")
+    require(t["release_id"] == "core-testnet-20261026-r2", "unexpected release ID")
     require(t["psy_network"] == "testnet" and t["network"] == "psy-public-testnet",
             "network selection must be testnet / psy-public-testnet")
     require(t["proving_backend"] == "plonky2-poseidon-goldilocks", "unexpected proving backend")
@@ -113,7 +113,7 @@ def validate_topology(t):
     namespaces, sockets = set(), set()
 
     def namespace(value):
-        require(isinstance(value, str) and re.fullmatch(r"fresh20261026_[a-z0-9_]+", value)
+        require(isinstance(value, str) and re.fullmatch(r"fresh20261026r2_[a-z0-9_]+", value)
                 and len(value) <= 48, "invalid fresh namespace")
         require(value not in namespaces, "shared namespace across validators/coordinator")
         namespaces.add(value)
@@ -272,7 +272,7 @@ def services(t):
     def add(role, name, host, namespace, args):
         argv = [release + "/bin/psy_node_cli", "start-" + role, *common,
                 "--db-namespace", namespace, *args]
-        unit = "psy-core-" + name + ".service"
+        unit = "psy-core-r2-" + name + ".service"
         quote = lambda value: '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
         preview = "\n".join([
             "[Unit]", "Description=OFFLINE PREVIEW " + name, "After=network-online.target",

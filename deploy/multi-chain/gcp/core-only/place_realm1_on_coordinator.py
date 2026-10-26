@@ -31,7 +31,7 @@ import prepare_host_packages as packages
 
 
 CONFIG_NAME = "realm1-cp-ce-config.json"
-SLICE = "psy-realm1.slice"
+SLICE = "psy-realm1-r2.slice"
 DROPIN = "50-realm1-cp-ce.conf"
 HOSTS = ("gcp-cp-ce", "gcp-edge-2")
 KEY_NAMES = ("processor_identity.key", "bls.key", "zk.key")
@@ -39,7 +39,7 @@ require = install.require
 
 
 def unit_name(position, role):
-    return f"psy-core-realm-1-v{position}-{role}.service"
+    return f"psy-core-r2-realm-1-v{position}-{role}.service"
 
 
 def read_private(root, name):

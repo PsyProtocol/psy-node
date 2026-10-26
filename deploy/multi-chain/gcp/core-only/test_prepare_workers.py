@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import prepare_workers as workers
+from test_plan import fixture
 
 
 class WorkerPreparationTests(unittest.TestCase):
@@ -22,8 +23,10 @@ class WorkerPreparationTests(unittest.TestCase):
         self.release.mkdir()
         self.package = self.root / "package"
         self.network = self.root / "network.json"
-        self.topology = Path(__file__).with_name("topology.json")
-        self.topology_bytes = self.topology.read_bytes()
+        self.topology = self.root / "topology.json"
+        self.topology_bytes = workers.encode(fixture()[0])
+        self.topology.write_bytes(self.topology_bytes)
+        self.stack.enter_context(patch.object(workers, "TOPOLOGY_SHA256", workers.digest(self.topology_bytes)))
         self.binary = b"test-only-worker-binary"
         self.config = workers.encode({"defaultNetwork": "testnet", "networks": {"testnet": {
             "whitelist": {"enabled": True, "secp256k1": list(set(workers.PUBLIC_KEYS.values()))}}}})

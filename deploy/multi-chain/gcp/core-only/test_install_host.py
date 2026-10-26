@@ -17,6 +17,7 @@ from unittest.mock import patch
 import install_host as installer
 import plan
 import prepare_host_packages as packages
+from test_plan import fixture
 
 
 class InstallHostTests(unittest.TestCase):
@@ -70,7 +71,7 @@ class InstallHostTests(unittest.TestCase):
     def create_package(self):
         for name, raw in self.artifacts.items():
             self.write(name, raw)
-        topology = json.loads((Path(__file__).parent / "topology.json").read_text())
+        topology = fixture()[0]
         for service in plan.services(topology):
             if service["host"] != self.host:
                 continue
@@ -303,7 +304,7 @@ class InstallHostTests(unittest.TestCase):
     def test_unit_old_paths_and_wrong_keys_rejected(self):
         unit = next((self.package / "units").iterdir())
         original = unit.read_bytes()
-        for before, after in ((b"fresh20261026_r", b"parth_r"), (b"processor_identity.key", b"edge_identity.key"),
+        for before, after in ((b"fresh20261026r2_r", b"parth_r"), (b"processor_identity.key", b"edge_identity.key"),
                               (b"psy-public-testnet", b"psy-mainnet"), (b"/checkpoints", b"/old-checkpoints")):
             with self.subTest(after=after):
                 unit.write_bytes(original.replace(before, after))
@@ -354,15 +355,15 @@ class InstallHostTests(unittest.TestCase):
 
 class HostCommandTests(unittest.TestCase):
     def test_production_pins_match_release_and_builder_plan(self):
-        topology = json.loads((Path(__file__).parent / "topology.json").read_text())
+        topology = fixture()[0]
         self.assertEqual(installer.PINNED_SHA256, {
-            "bin/psy_node_cli": "8d3ef23e9600d168f588b448840c7884c22f0505d666ecc902574684d8011056",
+            "bin/psy_node_cli": None,
             "config.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
-            "genesis.json": "1126a26de4259367fa16fe15af989678a5ac7044fd4a357b501716d7bce9ca11",
+            "genesis.json": None,
         })
         self.assertEqual(installer.PINNED_SHA256["bin/psy_node_cli"], packages.NODE_SHA256)
         self.assertEqual(installer.PINNED_SHA256["config.json"], packages.CONFIG_SHA256)
-        self.assertEqual(installer.SOURCE_COMMIT, "dcc1146514ef3eca2336640f6d95e5a1c04feff9")
+        self.assertEqual(installer.SOURCE_COMMIT, "5d38eefc07b0925ed9875b74805d9c3fea73d998")
         self.assertEqual(installer.SOURCE_COMMIT, plan.RUNTIME_COMMIT)
         self.assertEqual(installer.SOURCE_COMMIT, topology["runtime_commit"])
         self.assertEqual(installer.HOSTS, topology["hosts"])

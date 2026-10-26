@@ -23,11 +23,11 @@ import sys
 
 
 HERE = Path(__file__).resolve().parent
-SOURCE = "dcc1146514ef3eca2336640f6d95e5a1c04feff9"
-RELEASE_ID = "core-testnet-20261026"
-WORKER_SHA256 = "7add12f1871540b01cf2268457a72fee0bb47458406b800a88ddc560deeafdfb"
+SOURCE = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
+RELEASE_ID = "core-testnet-20261026-r2"
+WORKER_SHA256 = None
 CONFIG_SHA256 = "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0"
-TOPOLOGY_SHA256 = "1f7b4f51656b7100895c82356f482a2f6f2e805bf6480158a37d7301a4c745aa"
+TOPOLOGY_SHA256 = None
 RELEASE = Path("/opt/psy-core-worker/releases") / RELEASE_ID
 CONFIG = Path("/etc/psy-core-worker") / RELEASE_ID
 STATE = Path("/var/lib/psy-core-worker") / RELEASE_ID
@@ -128,7 +128,7 @@ def worker_configs(topology):
 
 
 def unit_name(role):
-    return "psy-core-worker-" + role + ".service"
+    return "psy-core-worker-r2-" + role + ".service"
 
 
 def worker_unit(role):
@@ -137,7 +137,7 @@ def worker_unit(role):
         "Wants=network-online.target", "After=network-online.target",
         "StartLimitIntervalSec=600", "StartLimitBurst=3", "",
         "[Service]", "Type=simple", "User=parth", "Group=parth", "UMask=0077",
-        "Slice=psy-core-worker.slice", "WorkingDirectory=" + str(RELEASE),
+        "Slice=psy-core-worker-r2.slice", "WorkingDirectory=" + str(RELEASE),
         "Environment=PSY_NETWORK=testnet", "Environment=PSY_CONFIG_PATH=" + str(CONFIG / "network.json"),
         "Environment=RUST_LOG=info", "Environment=RUST_MIN_STACK=134217728",
         "Environment=RAYON_NUM_THREADS=" + str(THREADS[role]), "Environment=TOKIO_WORKER_THREADS=2",
@@ -174,7 +174,7 @@ def payloads(inputs):
     for role, template in worker_configs(topology).items():
         files[role + ".json"] = encode(template)
         files[unit_name(role)] = worker_unit(role)
-    files["psy-core-worker.slice"] = b"[Unit]\nDescription=Psy core workers\n[Slice]\nMemoryHigh=26G\nMemoryMax=28G\n"
+    files["psy-core-worker-r2.slice"] = b"[Unit]\nDescription=Psy core workers\n[Slice]\nMemoryHigh=26G\nMemoryMax=28G\n"
     return files
 
 
@@ -297,7 +297,7 @@ def install_paths(files, keys, user):
         targets[CONFIG / (role + ".json")] = (encode(config), 0o640, ROOT_UID, gid)
         directories[STATE / role] = (0o700, uid, gid)
         targets[UNITS / unit_name(role)] = (files[unit_name(role)], 0o644, ROOT_UID, ROOT_GID)
-    targets[UNITS / "psy-core-worker.slice"] = (files["psy-core-worker.slice"], 0o644, ROOT_UID, ROOT_GID)
+    targets[UNITS / "psy-core-worker-r2.slice"] = (files["psy-core-worker-r2.slice"], 0o644, ROOT_UID, ROOT_GID)
     for path in list(directories):
         for parent in path.parents:
             if parent != Path("/"):
@@ -308,7 +308,8 @@ def install_paths(files, keys, user):
 def check_destinations(targets, directories):
     for root in (RELEASE, CONFIG, STATE):
         require(not os.path.lexists(root), "worker release/config/state already exists; inspection required")
-    for name in [*(unit_name(role) for role in THREADS), "psy-core-worker.slice",
+    for name in [*(unit_name(role) for role in THREADS), "psy-core-worker-r2.slice",
+                 "psy-core-worker-r2-realm-.service", "psy-core-worker-r2-.service",
                  "psy-core-worker-.service", "psy-core-.service", "psy-.service", "service"]:
         for root in UNIT_SEARCH:
             require(not os.path.lexists(root / name) and not os.path.lexists(root / (name + ".d")),

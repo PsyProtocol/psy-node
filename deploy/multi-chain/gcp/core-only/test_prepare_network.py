@@ -21,6 +21,12 @@ WORKER_KEY = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
 
 def fixture():
     topology = json.loads((HERE / "topology.json").read_text())
+    topology["runtime_commit"] = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
+    topology["release_id"] = "core-testnet-20261026-r2"
+    topology["coordinator"]["namespace"] = "fresh20261026r2_coordinator"
+    for realm in topology["realms"]:
+        for position, validator in enumerate(realm["validators"], 1):
+            validator["namespace"] = f'fresh20261026r2_r{realm["id"]}_v{position}'
     network = copy.deepcopy(prepare.CONSENSUS)
     network.update(
         realm_configs=[{"id": rid, "rpc_url": ["https://old.example"], "validators": []}
@@ -129,7 +135,7 @@ class AssemblyTests(unittest.TestCase):
     def test_runtime_commit_is_separate_from_retained_guardian_identity(self):
         before = copy.deepcopy(self.commitments)
         first = self.assemble()
-        self.assertEqual(self.topology["runtime_commit"], "dcc1146514ef3eca2336640f6d95e5a1c04feff9")
+        self.assertEqual(self.topology["runtime_commit"], "5d38eefc07b0925ed9875b74805d9c3fea73d998")
         self.assertNotIn("runtime_source_base", self.topology)
         self.assertNotIn("runtime_patch_sha256", self.topology)
         self.assertEqual(self.assemble(), first)
@@ -142,7 +148,7 @@ class AssemblyTests(unittest.TestCase):
 
     def test_runtime_commit_must_match_published_pin(self):
         for value in (None, "", True, 123, [], {}, "0" * 40, prepare.SOURCE_BASE,
-                      "cd" * 20, "dcc11465", "dcc1146514ef3eca2336640f6d95e5a1c04feff9\n"):
+                      "cd" * 20, "dcc11465", "5d38eefc07b0925ed9875b74805d9c3fea73d998\n"):
             with self.subTest(value=value):
                 self.topology["runtime_commit"] = value
                 with self.assertRaisesRegex(prepare.PrepareError, "runtime commit must match pinned published source"):

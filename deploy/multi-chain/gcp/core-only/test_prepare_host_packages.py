@@ -16,7 +16,7 @@ from test_plan import fixture
 
 class PackageTests(unittest.TestCase):
     def test_unit_uses_pinned_commands_and_private_network(self):
-        topology = json.loads((package.HERE / "topology.json").read_bytes())
+        topology = fixture()[0]
         services = plan.services(topology)
         self.assertEqual(len(services), 16)
         for service in services:
@@ -123,7 +123,7 @@ class PrepareTests(unittest.TestCase):
                     expected[prefix + name] = (self.args.p2p_keys / f"realm_{rid}_sub_{position}_{name}").read_bytes()
             self.assertEqual(manifest, {
                 "schema_version": 1, "release_id": self.topology["release_id"],
-                "source_commit": "dcc1146514ef3eca2336640f6d95e5a1c04feff9", "network": "testnet",
+                "source_commit": "5d38eefc07b0925ed9875b74805d9c3fea73d998", "network": "testnet",
                 "host": host, "private_ip": ip,
                 "files": {name: hashlib.sha256(content).hexdigest() for name, content in expected.items()}})
             self.assertEqual({str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()},

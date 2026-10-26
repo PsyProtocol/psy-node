@@ -5,8 +5,8 @@ Usage: sudo python3 install_host.py --package /private/host --check-only
        sudo python3 install_host.py --package /private/host
 
 manifest.json must contain exactly:
-  {"schema_version": 1, "release_id": "core-testnet-20261026",
-   "source_commit": "dcc1146514ef3eca2336640f6d95e5a1c04feff9",
+  {"schema_version": 1, "release_id": "core-testnet-20261026-r2",
+   "source_commit": "5d38eefc07b0925ed9875b74805d9c3fea73d998",
    "network": "testnet", "host": "<topology alias>",
    "private_ip": "<host RFC1918 IPv4>", "files": {"relative/path": "sha256"}}
 files covers ALL payload files, excluding manifest.json itself. Allowed payloads:
@@ -43,13 +43,14 @@ import sys
 from urllib.parse import urlsplit
 
 
-SOURCE_COMMIT = "dcc1146514ef3eca2336640f6d95e5a1c04feff9"
+SOURCE_COMMIT = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
+# No r1 binary or Genesis may be accepted under the r2 release label.
 PINNED_SHA256 = {
-    "bin/psy_node_cli": "8d3ef23e9600d168f588b448840c7884c22f0505d666ecc902574684d8011056",
+    "bin/psy_node_cli": None,
     "config.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
-    "genesis.json": "1126a26de4259367fa16fe15af989678a5ac7044fd4a357b501716d7bce9ca11",
+    "genesis.json": None,
 }
-RELEASE_ID = "core-testnet-20261026"
+RELEASE_ID = "core-testnet-20261026-r2"
 RELEASE = Path("/opt/psy-core/releases") / RELEASE_ID
 CONFIG = Path("/etc/psy-core") / RELEASE_ID
 STATE = Path("/var/lib/psy-core") / RELEASE_ID
@@ -149,6 +150,7 @@ def read_package(path):
     finally:
         os.close(fd)
     require("manifest.json" in payloads, "manifest missing")
+    require(all(PINNED_SHA256.values()), "r2 artifact pins not frozen")
     manifest = decode_json(payloads["manifest.json"])
     require(set(manifest) == {"schema_version", "release_id", "source_commit", "network",
                               "host", "private_ip", "files"}, "unexpected manifest fields")
@@ -207,7 +209,7 @@ def host_inventory(host):
         keys = {f"keys/realm-{realm}-v{position}/edge_identity.key" for position in range(1, 4)}
     else:
         raise InstallError("unknown core host")
-    return {"psy-core-" + name + ".service" for name in names}, keys
+    return {"psy-core-r2-" + name + ".service" for name in names}, keys
 
 
 def validate_unit(name, raw, keys, host):
@@ -288,7 +290,7 @@ def validate_unit(name, raw, keys, host):
     require(options.get("--network") == ["psy-public-testnet"] and
             options.get("--proving-backend") == ["plonky2-poseidon-goldilocks"], "unsafe node network/backend")
     namespace = options.get("--db-namespace", [])
-    require(len(namespace) == 1 and re.fullmatch(r"fresh20261026_(coordinator|r[01]_v[123])", namespace[0]),
+    require(len(namespace) == 1 and re.fullmatch(r"fresh20261026r2_(coordinator|r[01]_v[123])", namespace[0]),
             "node namespace is not fresh")
     for option, scheme in (("--scylla-db-url", "tcp"), ("--redis-url", "redis"), ("--nats-jetstream-url", "nats")):
         require(option in options, "missing infrastructure option")
@@ -311,9 +313,9 @@ def validate_unit(name, raw, keys, host):
                    "--p2p-bls-key": "bls.key", "--p2p-zk-key": "zk.key"}
     required_keys = set()
     if role.startswith("realm"):
-        slot = name.removeprefix("psy-core-").rsplit("-", 1)[0]
+        slot = name.removeprefix("psy-core-r2-").rsplit("-", 1)[0]
         realm, position = slot.split("-")[1:]
-        require(namespace == [f"fresh20261026_r{realm}_{position}"]
+        require(namespace == [f"fresh20261026r2_r{realm}_{position}"]
                 and options.get("--realm-id") == [realm], "unit Realm/namespace mismatch")
         required_keys = {"--p2p-identity-key"}
         if role.endswith("processor"):
@@ -323,12 +325,12 @@ def validate_unit(name, raw, keys, host):
             require(relative in keys and options.get(option) == [str(CONFIG / relative)], "incorrect per-host key path")
     require(set(options) & set(key_options) == required_keys, "unexpected key option")
     if role.startswith("coordinator"):
-        require(namespace == ["fresh20261026_coordinator"]
+        require(namespace == ["fresh20261026r2_coordinator"]
                 and options.get("--coordinator-id") == ["0"]
                 and options.get("--coordinator-sub-id") == ["0"], "unit Coordinator/namespace mismatch")
     endpoints = {}
     if role == "coordinator-edge":
-        index = int(name.removeprefix("psy-core-coordinator-edge-").removesuffix(".service"))
+        index = int(name.removeprefix("psy-core-r2-coordinator-edge-").removesuffix(".service"))
         endpoints = {"--listen": [HOSTS[host]], "--port": [str(15370 + index)]}
     elif role.startswith("realm"):
         realm_id, validator_position = int(realm), int(position.removeprefix("v"))

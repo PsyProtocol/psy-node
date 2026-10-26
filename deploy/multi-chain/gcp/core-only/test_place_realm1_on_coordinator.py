@@ -113,6 +113,8 @@ class PlacementTests(unittest.TestCase):
                 if host == "gcp-cp-ce":
                     unit = payloads["units/" + placement.unit_name(position, "processor")].decode()
                     self.assertIn("Slice=" + placement.SLICE, unit)
+                    self.assertIn(f'"fresh20261026r2_r1_v{position}"', unit)
+                    self.assertIn("/core-testnet-20261026-r2/checkpoints", unit)
                     self.assertIn(f"/ip4/10.148.0.25/tcp/{41020 + position}", unit)
                     self.assertIn(str(install.CONFIG / placement.CONFIG_NAME), unit)
                 else:
