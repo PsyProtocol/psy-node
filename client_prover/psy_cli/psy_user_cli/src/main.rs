@@ -208,7 +208,6 @@ fn command_paths(cli: &Cli) -> Vec<&str> {
         Commands::GetLatestBlockState(args) => paths.push(&args.rpc_config),
         Commands::GetBlockState(args) => paths.push(&args.rpc_config),
         Commands::LocalProver(args) => paths.push(&args.rpc_config),
-        #[cfg(feature = "gnark-wrap")]
         Commands::ProveProxy(args) => paths.push(&args.rpc_config),
         Commands::FaucetServer(args) => paths.push(&args.rpc_config),
         Commands::GetClaimAmount(args) => paths.push(&args.rpc_config),
@@ -666,7 +665,6 @@ async fn main() -> anyhow::Result<()> {
             psy_prover::run_server(prover_args).await?;
             CommandResult::generic("local-prover")
         }
-        #[cfg(feature = "gnark-wrap")]
         Commands::ProveProxy(prove_proxy_args) => {
             crate::subcommand::prove_proxy::run(prove_proxy_args).await?;
             CommandResult::generic("prove-proxy")

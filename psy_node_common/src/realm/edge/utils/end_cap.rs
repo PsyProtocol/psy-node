@@ -480,4 +480,197 @@ mod tests {
 
         Ok(())
     }
+
+    /// Deterministic counterpart of the random generator above: three contract
+    /// state trees, each updated at four fixed leaf slots, all chained through
+    /// one user contract tree. Unlike the random generator the produced input
+    /// is byte-for-byte identical on every run.
+    fn gen_deterministic_end_cap_input() -> SubmitUserEndCapNonProofInput<parth_core::PF, PHash> {
+        type F = parth_core::PF;
+        type Hasher = PoseidonHasher;
+        let contract_tree_height = 24u8;
+        let user_id = 42u64;
+        let user_id_f = F::from_owned_u64(user_id);
+
+        let mut user_contract_tree = SimpleMemoryMerkleStoreV3::<Hasher, PHash>::new(contract_tree_height);
+        let mut contract_state_updates = Vec::new();
+        for contract_id in 0..3u64 {
+            let mut contract_state_tree = SimpleMemoryMerkleStoreV3::<Hasher, PHash>::new(contract_tree_height);
+            let updates = (0..4u64)
+                .map(|i| {
+                    let leaf_id = contract_id * 8 + i;
+                    let value = PHash::from_values(100 + contract_id * 10 + i, 0, 0, 0);
+                    contract_state_tree.set_leaf(leaf_id, value)
+                })
+                .collect::<Vec<_>>();
+            let end_root = contract_state_tree.get_root();
+            let user_contract_tree_update_proof = user_contract_tree.set_leaf(contract_id, end_root);
+            contract_state_updates.push(ContractStateUpdateHistory {
+                user_contract_tree_update_proof,
+                updates: updates
+                    .into_iter()
+                    .map(|delta_proof| ContractStateUpdate::Positional { delta_proof })
+                    .collect(),
+            });
+        }
+
+        let new_user_leaf = PQEDUserLeaf {
+            user_id: user_id_f,
+            last_checkpoint_id: F::from_owned_u64(0),
+            user_state_tree_root: user_contract_tree.get_root(),
+            public_key: PHash::from_values(7, 8, 9, 10),
+            balance: F::from_owned_u64(1_000_000),
+            nonce: F::from_owned_u64(1),
+            event_index: F::from_owned_u64(1),
+        };
+        let state_transition = PUPSEndCapResultCompact {
+            start_user_leaf_hash: PHash::from_values(1, 0, 0, 0),
+            end_user_leaf_hash: new_user_leaf.qfhash::<Hasher>(),
+            checkpoint_tree_root_hash: PHash::from_values(2, 0, 0, 0),
+            user_id: user_id_f,
+        };
+        let core = SubmitUserEndCapNonProofCoreInput {
+            checkpoint_id: F::from_owned_u64(0),
+            state_transition,
+            new_user_leaf,
+            stats: GUTAStats {
+                guta_fees_collected: F::from_owned_u64(1000),
+                da_fees_collected: F::from_owned_u64(12_000),
+                user_ops_processed: F::from_owned_u64(1),
+                total_transactions: F::from_owned_u64(3),
+                slots_modified: F::from_owned_u64(12),
+            },
+        };
+        SubmitUserEndCapNonProofInput { core, contract_state_updates, events: vec![] }
+    }
+
+    fn test_context() -> QBlobWriterContextMetadataHeader {
+        QBlobWriterContextMetadataHeader::new_at_now(0, 1, 2, 3, 4, 2000, 42)
+    }
+
+    #[test]
+    fn validate_end_cap_accepts_deterministic_input() -> anyhow::Result<()> {
+        let end_cap = gen_deterministic_end_cap_input();
+        let result = validate_end_cap_and_generate_node_data_for_edge::<parth_core::PF, PHash, PoseidonHasher>(
+            &test_context(),
+            42,
+            &end_cap,
+        )?;
+        assert!(!result.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn validate_end_cap_rejects_empty_update_histories() -> anyhow::Result<()> {
+        // no contract state updates at all
+        let mut end_cap = gen_deterministic_end_cap_input();
+        end_cap.contract_state_updates = vec![];
+        let err = validate_end_cap_and_generate_node_data_for_edge::<parth_core::PF, PHash, PoseidonHasher>(
+            &test_context(),
+            42,
+            &end_cap,
+        )
+        .expect_err("empty update list must fail");
+        assert!(
+            err.to_string().contains("End cap must have at least one contract state update"),
+            "unexpected error: {err}"
+        );
+
+        // a single history without per-contract updates
+        let mut end_cap = gen_deterministic_end_cap_input();
+        end_cap.contract_state_updates[1].updates = vec![];
+        let err = validate_end_cap_and_generate_node_data_for_edge::<parth_core::PF, PHash, PoseidonHasher>(
+            &test_context(),
+            42,
+            &end_cap,
+        )
+        .expect_err("empty per-contract updates must fail");
+        assert!(
+            err.to_string().contains("Contract state updates cannot be empty"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_end_cap_rejects_broken_user_contract_tree_chain() -> anyhow::Result<()> {
+        // swapping two histories breaks the user contract tree root chain: the
+        // first (most recent) history no longer starts where the previous one ended
+        let mut end_cap = gen_deterministic_end_cap_input();
+        end_cap.contract_state_updates.swap(0, 1);
+        let err = validate_end_cap_and_generate_node_data_for_edge::<parth_core::PF, PHash, PoseidonHasher>(
+            &test_context(),
+            42,
+            &end_cap,
+        )
+        .expect_err("reordered histories must fail");
+        assert!(
+            err.to_string().contains("Computed contract state update end root does not match expected end root"),
+            "unexpected error: {err}"
+        );
+
+        // appending a duplicate of the FIRST update leaves the recorded final
+        // contract state root disagreeing with the user contract tree proof
+        let mut end_cap = gen_deterministic_end_cap_input();
+        let first_update = match &end_cap.contract_state_updates[2].updates[0] {
+            ContractStateUpdate::Positional { delta_proof } => delta_proof.clone(),
+            _ => unreachable!("generator only produces positional updates"),
+        };
+        end_cap.contract_state_updates[2]
+            .updates
+            .push(ContractStateUpdate::Positional { delta_proof: first_update });
+        let err = validate_end_cap_and_generate_node_data_for_edge::<parth_core::PF, PHash, PoseidonHasher>(
+            &test_context(),
+            42,
+            &end_cap,
+        )
+        .expect_err("stale trailing update must fail");
+        assert!(
+            err.to_string()
+                .contains("User contract tree update proof new value does not match last contract state tree update new root"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_end_cap_rejects_broken_contract_state_chains() -> anyhow::Result<()> {
+        // swapping two updates inside one history breaks the positional root chain
+        let mut end_cap = gen_deterministic_end_cap_input();
+        let updates = &mut end_cap.contract_state_updates[0].updates;
+        updates.swap(1, 2);
+        let err = validate_end_cap_and_generate_node_data_for_edge::<parth_core::PF, PHash, PoseidonHasher>(
+            &test_context(),
+            42,
+            &end_cap,
+        )
+        .expect_err("reordered contract state updates must fail");
+        assert!(
+            err.to_string().contains("Positional update root chain mismatch"),
+            "unexpected error: {err}"
+        );
+
+        // prepending a duplicate of a LATER update (internally valid, but its
+        // old root is mid-tree) makes the history start at the wrong state
+        let mut end_cap = gen_deterministic_end_cap_input();
+        let later_update = match &end_cap.contract_state_updates[0].updates[2] {
+            ContractStateUpdate::Positional { delta_proof } => delta_proof.clone(),
+            _ => unreachable!("generator only produces positional updates"),
+        };
+        end_cap.contract_state_updates[0]
+            .updates
+            .insert(0, ContractStateUpdate::Positional { delta_proof: later_update });
+        let err = validate_end_cap_and_generate_node_data_for_edge::<parth_core::PF, PHash, PoseidonHasher>(
+            &test_context(),
+            42,
+            &end_cap,
+        )
+        .expect_err("history starting mid-tree must fail");
+        assert!(
+            err.to_string()
+                .contains("User contract tree update proof old value does not match first contract state tree update old root"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
 }

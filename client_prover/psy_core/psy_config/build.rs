@@ -1,5 +1,7 @@
 use std::{env, fs, path::Path};
 
+include!("src/stage_magic.rs");
+
 fn main() {
     let config_path = env::var("PSY_CONFIG_PATH").map(|p| Path::new(&p).to_path_buf()).unwrap_or_else(|_| {
         let mut current_dir = env::current_dir().expect("Failed to get current directory");
@@ -36,7 +38,18 @@ fn main() {
         }
     });
 
-    let network = env::var("PSY_NETWORK").unwrap_or_else(|_| "localhost".to_string());
+    // 不再有隐式默认值：构建必须说明自己属于哪个阶段。
+    // 从前这里默认 localhost，于是 testnet 部署一直在用 localhost 那个块。
+    let network = env::var("PSY_NETWORK").unwrap_or_else(|_| {
+        panic!(
+            "PSY_NETWORK is required and must be one of: {}. \
+             Set it in the build command, e.g. PSY_NETWORK=localhost cargo build",
+            known_stages()
+        )
+    });
+    let expected_magic = magic_for_stage(&network).unwrap_or_else(|| {
+        panic!("PSY_NETWORK '{}' is not a known stage; expected one of: {}", network, known_stages())
+    });
 
     println!("cargo:rerun-if-changed={}", config_path.display());
     println!("cargo:rerun-if-env-changed=PSY_CONFIG_PATH");
@@ -54,11 +67,17 @@ fn main() {
         .clone();
 
     let magic_str = network_config["magic"].as_str().expect("magic must be a hex string");
-    let magic = if magic_str.starts_with("0x") || magic_str.starts_with("0X") {
-        u64::from_str_radix(&magic_str[2..], 16).expect("Invalid hex magic value")
-    } else {
-        magic_str.parse::<u64>().expect("Invalid magic value")
-    };
+    let magic = parse_magic_hex(magic_str).unwrap_or_else(|e| panic!("{}", e));
+    if magic != expected_magic {
+        panic!(
+            "network '{}' in {} has magic {:#018X}, but stage '{}' must use {:#018X}",
+            network,
+            config_path.display(),
+            magic,
+            network,
+            expected_magic
+        );
+    }
 
     let global_user_tree_height = network_config["global_user_tree_height"]
         .as_u64()

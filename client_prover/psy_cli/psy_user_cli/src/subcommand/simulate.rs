@@ -36,6 +36,7 @@ pub async fn run(args: SimulateArgs) -> anyhow::Result<()> {
         checkpoint_id: args.checkpoint_id.unwrap_or(100),
         nonce: args.nonce.unwrap_or(0),
         user_public_key_hash: [0; 4],
+        session_proof_tree_root: [0; 4],
     };
 
     // Create state backend (InMemory for simulation)

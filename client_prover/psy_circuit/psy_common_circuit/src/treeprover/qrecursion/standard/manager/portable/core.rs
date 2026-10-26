@@ -321,6 +321,20 @@ where
         Ok(record)
     }
 
+    // The serial steps start by pairing queued leaves front to back, and those
+    // pairs do not depend on each other. Proving them at once yields the same
+    // records in the same order, which matters when each proof is a remote call.
+    async fn prove_leaf_pairs_concurrently<T: PortableQTreeRecursion<C, D> + ?Sized>(&mut self, circuit_mgr: &T) -> anyhow::Result<()> {
+        let pair_count = self.leaf_proofs.len() / 2;
+        if pair_count < 2 {
+            return Ok(());
+        }
+        let leaves: Vec<_> = self.leaf_proofs.drain(..pair_count * 2).collect();
+        let records = futures::future::try_join_all(leaves.chunks(2).map(|pair| self.prove_two_leaf(circuit_mgr, &pair[0], &pair[1]))).await?;
+        self.agg_proofs.extend(records);
+        Ok(())
+    }
+
     pub async fn prove_one_step_simple_serial<T: PortableQTreeRecursion<C, D> + ?Sized>(&mut self, circuit_mgr: &T) -> anyhow::Result<bool> {
         let leaf_proofs_len = self.leaf_proofs.len();
         let agg_proofs_len = self.agg_proofs.len();
@@ -386,6 +400,7 @@ where
     }
 
     pub async fn finalize_tree<T: PortableQTreeRecursion<C, D> + ?Sized>(&mut self, circuit_mgr: &T) -> anyhow::Result<()> {
+        self.prove_leaf_pairs_concurrently(circuit_mgr).await?;
         while self.prove_one_step_simple_serial(circuit_mgr).await? {
             // prove remaining tasks (if any)
         }

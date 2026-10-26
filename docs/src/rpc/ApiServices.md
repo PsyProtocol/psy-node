@@ -817,7 +817,7 @@ Get list of deployed contracts with metadata.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `deployer` | `string` | Filter by deployer public key |
+| `deployer` | `string` | Filter by deployer user id |
 | `limit` | `i64` | Pagination limit |
 | `offset` | `i64` | Pagination offset |
 
@@ -826,7 +826,7 @@ Get list of deployed contracts with metadata.
 [
   {
     "uuid": "contract-uuid-123",
-    "deployer": "0x...",
+    "deployer": "12345",
     "state_tree_height": 10,
     "function_count": 5,
     "functions": [

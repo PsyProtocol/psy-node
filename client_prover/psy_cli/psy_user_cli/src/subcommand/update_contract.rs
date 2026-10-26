@@ -1,7 +1,9 @@
 use std::{fs, path::Path, str::FromStr};
 
+use plonky2::{field::types::PrimeField64, plonk::proof::ProofWithPublicInputs};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::config::store_config::{PsyHasher, C, D, F};
+use psy_client_data::{qdata::contract::PsyContractLeaf, traits::qdatastore::qmetadata::QMetaDataStoreReaderSync};
 use psy_compiler::{abi::Abi, output::serialize::{CompilationArtifact, ContractOutput}};
 use psy_crypto::hash::traits::qhashable::QFieldHashable;
 use psy_prover::{
@@ -14,7 +16,7 @@ use psy_provider::{
 };
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
 
-use super::{args::UpdateContractArgs, contract_abi_upload};
+use super::{args::UpdateContractArgs, contract_abi_upload, resolve_deployer_user_id};
 use crate::result::{CommandResult, UpdateResult, UpdateStatus};
 
 // #[cfg(feature = "is_sync")]
@@ -33,7 +35,8 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
         .transpose()?;
 
     let fingerprint = fingerprint.unwrap_or_else(|| get_zk_fingerprint());
-    let deployer = get_public_key_info::<F>(private_key, fingerprint)?.qfhash::<PsyHasher>();
+    let public_key_hash = get_public_key_info::<F>(private_key, fingerprint)?.qfhash::<PsyHasher>();
+    let deployer = resolve_deployer_user_id(&rpc_provider, public_key_hash, args.user_id).await?;
 
     let contract_source = fs::read_to_string(&args.contract_path)?;
     // Prefer the unified compilation artifact (state_tree_height + defs + ABI).
@@ -47,12 +50,10 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
             (defs, None)
         };
 
-    let old_abi: Abi = match &args.old_abi_path {
-        Some(path) => read_abi_from_path(path)?,
-        None => artifact_abi
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--old-abi-path is required when --contract-path is a legacy circuit-definition array"))?,
-    };
+    let old_abi_path = args.old_abi_path.as_deref().ok_or_else(||
+        anyhow::anyhow!("--old-abi-path is required: supply the ABI of the currently deployed contract")
+    )?;
+    let old_abi: Abi = read_abi_from_path(old_abi_path)?;
     let new_abi: Abi = match &args.new_abi_path {
         Some(path) => read_abi_from_path(path)?,
         None => artifact_abi
@@ -91,6 +92,15 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
     let update_cmd = build_layout_aware_update_command(&old_output, &new_output, update_cmd)?;
     update_cmd.validate_shape()?;
 
+    if args.is_update {
+        let on_chain_leaf: PsyContractLeaf<F> = rpc_provider.get_contract_leaf_data(args.contract_id).await?;
+        validate_proof_old_layout_matches_chain(
+            &update_cmd.canonical_layout_proof,
+            args.contract_id,
+            &on_chain_leaf,
+        )?;
+    }
+
     match args.output_path {
         Some(output_path) => {
             tracing::debug!("update cmd save to {}", output_path);
@@ -127,6 +137,33 @@ pub async fn run(args: UpdateContractArgs) -> anyhow::Result<CommandResult> {
     }
 
     Ok(CommandResult::generic("update-contract"))
+}
+
+fn validate_proof_old_layout_matches_chain(
+    proof_bytes: &[u8],
+    contract_id: u64,
+    on_chain_leaf: &PsyContractLeaf<F>,
+) -> anyhow::Result<()> {
+    let proof: ProofWithPublicInputs<F, C, D> = bincode::deserialize(proof_bytes)?;
+    let pi = &proof.public_inputs;
+    anyhow::ensure!(pi.len() == 19, "canonical layout proof has an unexpected public input count");
+    let old_root = on_chain_leaf.state_layout_root.0.elements.map(|value| value.to_canonical_u64());
+    let proof_old_root = pi[2..6].iter().map(|value| value.to_canonical_u64()).collect::<Vec<_>>();
+    anyhow::ensure!(
+        pi[0].to_canonical_u64() == contract_id
+            && proof_old_root.as_slice() == old_root
+            && pi[6].to_canonical_u64() == on_chain_leaf.state_layout_field_count.to_canonical_u64()
+            && pi[7].to_canonical_u64() == on_chain_leaf.state_layout_slot_count.to_canonical_u64(),
+        "layout proof old endpoint does not match on-chain contract {}: proof root {:?}, fields {}, slots {}; chain root {:?}, fields {}, slots {}. Check --old-abi-path",
+        contract_id,
+        proof_old_root,
+        pi[6].to_canonical_u64(),
+        pi[7].to_canonical_u64(),
+        old_root,
+        on_chain_leaf.state_layout_field_count.to_canonical_u64(),
+        on_chain_leaf.state_layout_slot_count.to_canonical_u64(),
+    );
+    Ok(())
 }
 
 /// Read an ABI from a path that may contain either a unified compilation

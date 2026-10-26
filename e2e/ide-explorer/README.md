@@ -29,7 +29,7 @@ For **IDE-05 on-chain deploy** additionally:
 ls ../psy-wallet/dist/manifest.json
 # or: cd ../psy-wallet && npx vite build --mode dev
 
-# user CLI for register + simple_mint gas
+# user CLI for register + mint gas
 cargo build --release -p psy_user_cli
 ```
 

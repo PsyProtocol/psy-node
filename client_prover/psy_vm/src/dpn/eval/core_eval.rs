@@ -13,40 +13,7 @@ use plonky2::{
 use tiny_keccak::{Hasher as _, Keccak};
 
 use super::traits::{ContextEval, ContextInput, EvalCache};
-use crate::dpn::ops::{op_types::DPNOpType, sym_felt::SymFeltRef, sym_felt_store::SymFeltStore};
-fn split_bits(x: u64, num_bits: u64) -> Vec<u64> {
-    let mut result = vec![0u64; num_bits as usize];
-    for i in 0..num_bits {
-        result[i as usize] = (x >> i) & 1;
-    }
-    result
-}
-fn sum_bits(bits: &[u64]) -> u64 {
-    assert!(bits.len() <= 64, "cannot sum more than 64 bits");
-    let result = bits.iter().fold(0, |acc, x| acc + x);
-    GoldilocksField::from_noncanonical_u64(result).to_canonical_u64()
-}
-
-fn keccak_words_u32_be_to_u32_vec(words: &[u64]) -> Vec<u32> {
-    let mut bytes = Vec::with_capacity(words.len() * 4);
-    for word in words {
-        bytes.extend_from_slice(&(*word as u32).to_be_bytes());
-    }
-    let mut digest = [0u8; 32];
-    let mut keccak = Keccak::v256();
-    keccak.update(&bytes);
-    keccak.finalize(&mut digest);
-
-    digest
-        .chunks_exact(4)
-        .take(8)
-        .map(|chunk| {
-            let mut bytes = [0u8; 4];
-            bytes.copy_from_slice(chunk);
-            u32::from_be_bytes(bytes)
-        })
-        .collect()
-}
+use crate::dpn::ops::{op_types::DPNOpType, semantics, sym_felt::SymFeltRef, sym_felt_store::SymFeltStore};
 trait EvalHelpers: ContextEval {
     fn resolve_binary_felt_args<I: ContextInput, C: EvalCache>(&self, parent: SymFeltRef, input: &I, cache: &mut C) -> (u64, u64);
     fn resolve_unary_felt_arg<I: ContextInput, C: EvalCache>(&self, parent: SymFeltRef, input: &I, cache: &mut C) -> u64;
@@ -105,37 +72,49 @@ impl ContextEval for SymFeltStore {
                 DPNOpType::ConstantTrue => 1,
                 DPNOpType::ConstantFalse => 0,
                 DPNOpType::Add => {
-                    let (a, b) = self.resolve_binary_felt_args_gl(felt_ref, input, cache);
-                    (a + b).to_canonical_u64()
+                    let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
+                    semantics::felt_add(a, b)
                 }
                 DPNOpType::Sub => {
-                    let (a, b) = self.resolve_binary_felt_args_gl(felt_ref, input, cache);
-                    (a - b).to_canonical_u64()
+                    let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
+                    semantics::felt_sub(a, b)
                 }
                 DPNOpType::Mul => {
-                    let (a, b) = self.resolve_binary_felt_args_gl(felt_ref, input, cache);
-                    (a * b).to_canonical_u64()
+                    let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
+                    semantics::felt_mul(a, b)
                 }
                 DPNOpType::Div => {
                     let (a, b) = self.resolve_binary_felt_args_gl(felt_ref, input, cache);
-                    (a / b).to_canonical_u64()
+                    semantics::felt_div(a.to_canonical_u64(), b.to_canonical_u64()).unwrap_or_else(|e| panic!("{e}"))
                 }
-                DPNOpType::BoolNot => (self.resolve_unary_felt_arg(felt_ref, input, cache) == 0) as u64,
+                DPNOpType::BoolNot => {
+                    let v = semantics::resolve_bool_value("BoolNot", self.resolve_unary_felt_arg(felt_ref, input, cache))
+                        .unwrap_or_else(|e| panic!("{e}"));
+                    (!v) as u64
+                }
                 DPNOpType::BoolAnd => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    ((a != 0) && (b != 0)) as u64
+                    let (a, b) = (
+                        semantics::resolve_bool_value("BoolAnd", a).unwrap_or_else(|e| panic!("{e}")),
+                        semantics::resolve_bool_value("BoolAnd", b).unwrap_or_else(|e| panic!("{e}")),
+                    );
+                    (a && b) as u64
                 }
                 DPNOpType::BoolOr => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    ((a != 0) || (b != 0)) as u64
+                    let (a, b) = (
+                        semantics::resolve_bool_value("BoolOr", a).unwrap_or_else(|e| panic!("{e}")),
+                        semantics::resolve_bool_value("BoolOr", b).unwrap_or_else(|e| panic!("{e}")),
+                    );
+                    (a || b) as u64
                 }
                 DPNOpType::Xor => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    (a ^ b) & 0xFFFFFFFFu64
+                    semantics::bool_xor("Xor", a, b).unwrap_or_else(|e| panic!("{e}"))
                 }
                 DPNOpType::Nor => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    (!(a | b)) & 0xFFFFFFFFu64
+                    semantics::bool_nor("Nor", a, b).unwrap_or_else(|e| panic!("{e}"))
                 }
                 DPNOpType::Eq => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
@@ -158,7 +137,17 @@ impl ContextEval for SymFeltStore {
                     (a < b) as u64
                 }
                 DPNOpType::SplitBits => panic!("you cannot directly evaluate SumBits"),
-                DPNOpType::SumBits => sum_bits(&self.resolve_array_args(felt_ref, input, cache)),
+                DPNOpType::SumBits => {
+                    // Weighted binary reconstruction sum(bit[i] * 2^i),
+                    // reduced mod p — matches the witness and the circuit.
+                    let values = self.resolve_array_args(felt_ref, input, cache);
+                    let bits: Vec<bool> = values
+                        .iter()
+                        .map(|&v| semantics::resolve_bool_value("SumBits", v).unwrap_or_else(|e| panic!("{e}")))
+                        .collect();
+                    let sum = semantics::sum_bits_weighted(&bits).unwrap_or_else(|e| panic!("{e}"));
+                    GoldilocksField::from_noncanonical_u64(sum).to_canonical_u64()
+                }
                 DPNOpType::TargetAt => {
                     let base = &self.get(felt_ref).inputs;
                     let index = self.resolve_felt_ref_cached(base[1], input, cache);
@@ -178,53 +167,55 @@ impl ContextEval for SymFeltStore {
                         args[2]
                     }
                 }
-                DPNOpType::Exp => {
-                    let (base, exponent) = self.resolve_binary_felt_args_gl(felt_ref, input, cache);
-                    base.exp_u64(exponent.to_canonical_u64()).to_canonical_u64()
+                DPNOpType::Exp | DPNOpType::ExpConstantPower | DPNOpType::ExpConstantBase => {
+                    let (base, exponent) = self.resolve_binary_felt_args(felt_ref, input, cache);
+                    semantics::felt_pow(base, exponent)
                 }
-                DPNOpType::ExpConstantPower => panic!("ExpConstantPower is not implemented"),
-                DPNOpType::ExpConstantBase => panic!("ExpConstantBase is not implemented"),
-                DPNOpType::Mod => {
+                // ModConstant* carry their constant as a resolvable input
+                // node, so the plain Mod logic covers them (these arms
+                // previously panicked).
+                DPNOpType::Mod | DPNOpType::ModConstantDividend | DPNOpType::ModConstantDivisor => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    a % b
+                    semantics::felt_mod("Mod", a, b).unwrap_or_else(|e| panic!("{e}"))
                 }
-                DPNOpType::ModConstantDividend => panic!("ModConstantDividend is not implemented"),
-                DPNOpType::ModConstantDivisor => panic!("ModConstantDivisor is not implemented"),
-                DPNOpType::DivRem4 => {
-                    todo!("DivRem4 is not implemented");
-                }
+                DPNOpType::DivRem4 => panic!("you cannot directly evaluate DivRem4"),
                 DPNOpType::CastU32 => {
                     let value = self.resolve_unary_felt_arg(felt_ref, input, cache);
-                    assert!(value < 0xffffffffu64, "invalid u32 value");
-                    value & 0xFFFFFFFFu64
+                    semantics::cast_u32(value).unwrap_or_else(|e| panic!("{e}")) as u64
                 }
-                DPNOpType::U32And => {
+                DPNOpType::U32And | DPNOpType::U32AndConstant => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
                     (a & b) & 0xFFFFFFFFu64
                 }
-                DPNOpType::U32AndConstant => todo!("U32AndConstant is not implemented"),
-                DPNOpType::U32Or => {
+                DPNOpType::U32Or | DPNOpType::U32OrConstant => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
                     (a | b) & 0xFFFFFFFFu64
                 }
-                DPNOpType::U32OrConstant => todo!("U32OrConstant is not implemented"),
-                DPNOpType::U32Xor => {
+                DPNOpType::U32Xor | DPNOpType::U32XorConstant => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
                     (a ^ b) & 0xFFFFFFFFu64
                 }
-                DPNOpType::U32XorConstant => todo!("U32XorConstant is not implemented"),
-                DPNOpType::U32ShiftLeft => {
+                // u32 shifts: distances >= 32 evaluate to 0 — the unguarded
+                // `a << b` / `a >> b` on u64 panicked in debug and silently
+                // wrapped in release for distances >= 64. The Constant*
+                // variants carry their constant as a resolvable input, so
+                // the same logic covers them (they previously hit todo!()).
+                DPNOpType::U32ShiftLeft | DPNOpType::U32ShiftLeftConstantBitDistance | DPNOpType::U32ShiftLeftConstantValue => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    (a << b) & 0xFFFFFFFFu64
+                    let (a, b) = (
+                        semantics::u32_operand("u32 shift", a).unwrap_or_else(|e| panic!("{e}")),
+                        semantics::u32_operand("u32 shift", b).unwrap_or_else(|e| panic!("{e}")),
+                    );
+                    semantics::u32_shl(a, b) as u64
                 }
-                DPNOpType::U32ShiftLeftConstantBitDistance => todo!("U32ShiftLeftConstantBitDistance is not implemented"),
-                DPNOpType::U32ShiftLeftConstantValue => todo!("U32ShiftLeftConstantValue is not implemented"),
-                DPNOpType::U32ShiftRight => {
+                DPNOpType::U32ShiftRight | DPNOpType::U32ShiftRightConstantBitDistance | DPNOpType::U32ShiftRightConstantValue => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    (a >> b) & 0xFFFFFFFFu64
+                    let (a, b) = (
+                        semantics::u32_operand("u32 shift", a).unwrap_or_else(|e| panic!("{e}")),
+                        semantics::u32_operand("u32 shift", b).unwrap_or_else(|e| panic!("{e}")),
+                    );
+                    semantics::u32_shr(a, b) as u64
                 }
-                DPNOpType::U32ShiftRightConstantBitDistance => todo!("U32ShiftLeftConstantValue is not implemented"),
-                DPNOpType::U32ShiftRightConstantValue => todo!("U32ShiftLeftConstantValue is not implemented"),
                 DPNOpType::CalculateMerkleRoot => todo!("CalculateMerkleRoot is not implemented"),
                 DPNOpType::GetUserId => input.get_user_id(),
                 DPNOpType::GetContractId => input.get_contract_id(),
@@ -237,8 +228,11 @@ impl ContextEval for SymFeltStore {
                 }
                 DPNOpType::GetStateQueryResult => todo!(),
                 DPNOpType::GetStateQueryResultSingle => todo!(),
-                DPNOpType::UnaryInverse => self.resolve_unary_felt_arg_gl(felt_ref, input, cache).inverse().to_canonical_u64(),
-                DPNOpType::UnaryNegative => self.resolve_unary_felt_arg_gl(felt_ref, input, cache).neg().to_canonical_u64(),
+                DPNOpType::UnaryInverse => {
+                    let value = self.resolve_unary_felt_arg_gl(felt_ref, input, cache).to_canonical_u64();
+                    semantics::felt_inverse("UnaryInverse", value).unwrap_or_else(|e| panic!("{e}"))
+                }
+                DPNOpType::UnaryNegative => semantics::felt_neg(self.resolve_unary_felt_arg(felt_ref, input, cache)),
                 DPNOpType::GetStateCommandResultHash => todo!(),
                 DPNOpType::GetStateCommandResultSingle => todo!(),
                 DPNOpType::GetStateCommandResultArray => todo!(),
@@ -246,31 +240,19 @@ impl ContextEval for SymFeltStore {
                 DPNOpType::ConstantU32 => felt_ref.get_constant_value(),
                 DPNOpType::U32Add => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    assert!(a < 0xffffffffu64, "a is too large");
-                    assert!(b < 0xffffffffu64, "b is too large");
-                    assert!(a + b < 0xffffffffu64, "a + b is too large");
-                    (a + b) & 0xffffffffu64
+                    semantics::u32_add("u32 add", a, b).unwrap_or_else(|e| panic!("{e}")) as u64
                 }
                 DPNOpType::U32Sub => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    assert!(a < 0xffffffffu64, "a is too large");
-                    assert!(b < 0xffffffffu64, "b is too large");
-                    assert!(a > b, "a - b < 0");
-                    (a - b) & 0xffffffffu64
+                    semantics::u32_sub("u32 sub", a, b).unwrap_or_else(|e| panic!("{e}")) as u64
                 }
                 DPNOpType::U32Mul => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    assert!(a < 0xffffffffu64, "a is too large");
-                    assert!(b < 0xffffffffu64, "b is too large");
-                    assert!(a * b < 0xffffffffu64, "a * b is too large");
-                    (a * b) & 0xffffffffu64
+                    semantics::u32_mul("u32 mul", a, b).unwrap_or_else(|e| panic!("{e}")) as u64
                 }
                 DPNOpType::U32Div => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    assert!(a < 0xffffffffu64, "a is too large");
-                    assert!(b < 0xffffffffu64, "b is too large");
-                    assert!(a / b < 0xffffffffu64, "a / b is too large");
-                    (a / b) & 0xffffffffu64
+                    semantics::u32_div("u32 div", a, b).unwrap_or_else(|e| panic!("{e}")) as u64
                 }
                 DPNOpType::CastFelt => {
                     let value = self.resolve_unary_felt_arg(felt_ref, input, cache);
@@ -278,66 +260,78 @@ impl ContextEval for SymFeltStore {
                 }
                 DPNOpType::CastBool => {
                     let value = self.resolve_unary_felt_arg(felt_ref, input, cache);
-                    assert!(value <= 1, "bool value must be 0 or 1");
-                    (value != 0) as u64
+                    semantics::resolve_bool_value("CastBool", value).unwrap_or_else(|e| panic!("{e}")) as u64
                 }
                 DPNOpType::BoolInputTarget => input.get_input(felt_ref.get_input_index()),
                 DPNOpType::U32Mod => {
                     let (a, b) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    assert!(b != 0, "b must be non-zero");
-                    a % b
+                    semantics::u32_mod("u32 mod", a, b).unwrap_or_else(|e| panic!("{e}")) as u64
                 }
                 DPNOpType::U32Exp => {
                     let (base, exponent) = self.resolve_binary_felt_args_gl(felt_ref, input, cache);
-                    assert!(base.to_canonical_u64() < 0xffffffffu64, "a is too large");
-                    assert!(exponent.to_canonical_u64() < 0xffffffffu64, "b is too large");
-
-                    let res = base.exp_u64(exponent.to_canonical_u64()).to_canonical_u64();
-                    assert!(res < 0xffffffffu64, "u32 exp result is too large");
-                    res
+                    semantics::u32_exp("u32 exp", base.to_canonical_u64(), exponent.to_canonical_u64()).unwrap_or_else(|e| panic!("{e}")) as u64
                 }
                 DPNOpType::Secp256k1Verify => {
                     use k256::ecdsa::signature::hazmat::PrehashVerifier;
                     let inputs = self.resolve_array_args(felt_ref, input, cache);
                     assert!(inputs.len() == 36, "Secp256k1Verify input length must be 36");
-                    let pk_u32 = inputs[0..16]
-                        .to_vec()
-                        .iter()
-                        .map(|k| {
-                            assert!(*k < 0xffffffffu64, "secp pk.x must be [u32; 16]");
-                            *k as u32
-                        })
-                        .collect::<Vec<u32>>();
-                    let pk_x_bytes = pk_u32[0..8].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
-                    let pk_y_bytes = pk_u32[8..16].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
-                    let mut pk_sec1_bytes = vec![0x04];
-                    pk_sec1_bytes.extend(pk_x_bytes);
-                    pk_sec1_bytes.extend(pk_y_bytes);
-                    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_sec1_bytes).expect("secp pk must be valid");
-                    let signature_u32 = inputs[16..32]
-                        .to_vec()
-                        .iter()
-                        .map(|k| {
-                            assert!(*k < 0xffffffffu64, "secp signature must be [u32; 16]");
-                            *k as u32
-                        })
-                        .collect::<Vec<u32>>();
+                    // The early failures return 0 from this closure (not
+                    // from the evaluator) so the result still flows into
+                    // the scalar cache below.
+                    (|| -> u64 {
+                        let pk_u32 = inputs[0..16]
+                            .to_vec()
+                            .iter()
+                            .map(|k| {
+                                assert!(*k <= 0xffffffffu64, "secp pk.x must be [u32; 16]");
+                                *k as u32
+                            })
+                            .collect::<Vec<u32>>();
+                        let pk_x_bytes = pk_u32[0..8].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
+                        let pk_y_bytes = pk_u32[8..16].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
+                        let mut pk_sec1_bytes = vec![0x04];
+                        pk_sec1_bytes.extend(pk_x_bytes);
+                        pk_sec1_bytes.extend(pk_y_bytes);
+                        // A malformed public key (not a curve point) or an
+                        // out-of-range (r, s) fails verification — mapping them
+                        // to 0 keeps parity with `verify_prehash`'s Err => 0.
+                        // These previously `.expect`ed and aborted the whole
+                        // evaluation on attacker-controllable inputs.
+                        let vk = match k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_sec1_bytes) {
+                            Ok(vk) => vk,
+                            Err(_) => return 0,
+                        };
+                        let signature_u32 = inputs[16..32]
+                            .to_vec()
+                            .iter()
+                            .map(|k| {
+                                assert!(*k <= 0xffffffffu64, "secp signature must be [u32; 16]");
+                                *k as u32
+                            })
+                            .collect::<Vec<u32>>();
 
-                    let signature_r_bytes = signature_u32[0..8].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
-                    let signature_s_bytes = signature_u32[8..16].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
+                        let signature_r_bytes = signature_u32[0..8].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
+                        let signature_s_bytes = signature_u32[8..16].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
 
-                    let signature_bytes = signature_r_bytes.iter().chain(signature_s_bytes.iter()).cloned().collect::<Vec<_>>();
+                        let signature_bytes = signature_r_bytes.iter().chain(signature_s_bytes.iter()).cloned().collect::<Vec<_>>();
 
-                    let signature = Signature::from_slice(&signature_bytes).expect("secp signature must be valid");
+                        let signature = match Signature::from_slice(&signature_bytes) {
+                            Ok(signature) => signature,
+                            Err(_) => return 0,
+                        };
 
-                    let msg_bytes = inputs[32..36].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
+                        let msg_bytes = inputs[32..36].iter().flat_map(|&num| num.to_le_bytes()).rev().collect::<Vec<_>>();
 
-                    match vk.verify_prehash(&msg_bytes, &signature) {
-                        Ok(_) => 1,
-                        Err(_) => 0,
-                    }
+                        match vk.verify_prehash(&msg_bytes, &signature) {
+                            Ok(_) => 1,
+                            Err(_) => 0,
+                        }
+                    })()
                 }
             };
+            // Shared scalar subexpressions were recomputed on every use:
+            // only the array cache ever inserted. Pin the scalar too.
+            cache.insert(felt_ref, result);
             result
         }
     }
@@ -349,8 +343,12 @@ impl ContextEval for SymFeltStore {
             let result = match felt_ref.get_op_type() {
                 DPNOpType::SplitBits => {
                     let (x, num_bits) = self.resolve_binary_felt_args(felt_ref, input, cache);
-                    let bits = split_bits(x, num_bits);
-                    bits
+                    let bits = semantics::split_bits(x, num_bits).unwrap_or_else(|e| panic!("{e}"));
+                    bits.into_iter().map(|b| b as u64).collect()
+                }
+                DPNOpType::DivRem4 => {
+                    let value = self.resolve_unary_felt_arg(felt_ref, input, cache);
+                    semantics::div_rem4(value).to_vec()
                 }
                 DPNOpType::HashNoPad => {
                     let data = self.resolve_array_args_gl(felt_ref, input, cache);
@@ -371,7 +369,11 @@ impl ContextEval for SymFeltStore {
                 }
                 DPNOpType::Keccak256 => {
                     let data = self.resolve_array_args(felt_ref, input, cache);
-                    keccak_words_u32_be_to_u32_vec(&data).iter().map(|x| *x as u64).collect()
+                    semantics::keccak_u32_words_be(&data)
+                        .unwrap_or_else(|e| panic!("{e}"))
+                        .into_iter()
+                        .map(|x| x as u64)
+                        .collect()
                 }
                 DPNOpType::HashPad => {
                     let data = self.resolve_array_args_gl(felt_ref, input, cache);
@@ -385,6 +387,218 @@ impl ContextEval for SymFeltStore {
 
             cache.insert_arr(felt_ref, result);
             cache.get_arr_ref(felt_ref)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpn::eval::{cache::SimpleEvalCache, simple::DummyContextEvalInput};
+    use crate::dpn::ops::op_types::DPNBuiltInDataType;
+    use psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64;
+
+    fn op(store: &mut SymFeltStore, op_type: DPNOpType, inputs: Vec<SymFeltRef>) -> SymFeltRef {
+        store.insert(crate::dpn::ops::sym_felt::SymFeltRefValue { op_type, const_param: 0, inputs })
+    }
+
+    fn resolve(store: &SymFeltStore, reference: SymFeltRef) -> u64 {
+        store.resolve_felt_ref_cached(reference, &DummyContextEvalInput::new(vec![9, 3]), &mut SimpleEvalCache::new())
+    }
+
+    fn insert_and_resolve(store: &mut SymFeltStore, op_type: DPNOpType, inputs: Vec<SymFeltRef>) -> u64 {
+        let reference = op(store, op_type, inputs);
+        resolve(store, reference)
+    }
+
+    #[test]
+    fn evaluates_scalar_arithmetic_boolean_comparison_and_context_ops() {
+        let mut store = SymFeltStore::new();
+        let a = SymFeltRef::new_constant(9);
+        let b = SymFeltRef::new_constant(3);
+        let cases = [
+            (DPNOpType::Add, 12), (DPNOpType::Sub, 6), (DPNOpType::Mul, 27), (DPNOpType::Div, 3),
+            (DPNOpType::Eq, 0), (DPNOpType::Lte, 0), (DPNOpType::Gte, 1), (DPNOpType::Gt, 1),
+            (DPNOpType::Lt, 0), (DPNOpType::Exp, 729), (DPNOpType::Mod, 0), (DPNOpType::U32And, 1),
+            (DPNOpType::U32Or, 11), (DPNOpType::U32Xor, 10), (DPNOpType::U32ShiftLeft, 72),
+            (DPNOpType::U32ShiftRight, 1), (DPNOpType::U32Add, 12), (DPNOpType::U32Sub, 6),
+            (DPNOpType::U32Mul, 27), (DPNOpType::U32Div, 3), (DPNOpType::U32Mod, 0), (DPNOpType::U32Exp, 729),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(insert_and_resolve(&mut store, kind, vec![a, b]), expected, "{kind}");
+        }
+        let truth = SymFeltRef::new_constant(1);
+        let falsehood = SymFeltRef::new_constant(0);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::BoolAnd, vec![truth, falsehood]), 0);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::BoolOr, vec![truth, falsehood]), 1);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::Xor, vec![truth, falsehood]), 1);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::Nor, vec![truth, falsehood]), 0);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::BoolNot, vec![SymFeltRef::new_constant(0)]), 1);
+        let inverse = insert_and_resolve(&mut store, DPNOpType::UnaryInverse, vec![a]);
+        assert_eq!(GoldilocksField::from_noncanonical_u64(9).inverse().to_canonical_u64(), inverse);
+        let negative = insert_and_resolve(&mut store, DPNOpType::UnaryNegative, vec![a]);
+        assert_eq!(GoldilocksField::from_noncanonical_u64(9).neg().to_canonical_u64(), negative);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::CastU32, vec![a]), 9);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::CastFelt, vec![a]), 9);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::CastBool, vec![SymFeltRef::new_constant(1)]), 1);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::Select, vec![SymFeltRef::new_constant(1), a, b]), 9);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::GetUserId, vec![]), 0);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::GetContractId, vec![]), 0);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::GetCallerContractId, vec![]), DEFAULT_CALLER_CONTRACT_ID_U64);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::GetCheckpointId, vec![]), 1);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::GetNonce, vec![]), 1);
+        assert_eq!(insert_and_resolve(&mut store, DPNOpType::InputTarget, vec![]), 9);
+        assert_eq!(resolve(&store, SymFeltRef::new_input(1, DPNBuiltInDataType::Bool)), 3);
+        assert_eq!(resolve(&store, SymFeltRef::new_input(1, DPNBuiltInDataType::U32Target)), 3);
+    }
+
+    #[test]
+    fn evaluates_arrays_selection_hashes_and_caches_results() {
+        let mut store = SymFeltStore::new();
+        let values = vec![1, 2, 3, 4].into_iter().map(SymFeltRef::new_constant).collect::<Vec<_>>();
+        let split = op(&mut store, DPNOpType::SplitBits, vec![SymFeltRef::new_constant(13), SymFeltRef::new_constant(4)]);
+        let selected = op(&mut store, DPNOpType::TargetAt, vec![split, SymFeltRef::new_constant(2)]);
+        let sum = op(
+            &mut store,
+            DPNOpType::SumBits,
+            vec![SymFeltRef::new_constant(1), SymFeltRef::new_constant(0), SymFeltRef::new_constant(1), SymFeltRef::new_constant(1)],
+        );
+        let choice = op(&mut store, DPNOpType::Select, vec![SymFeltRef::new_constant(0), SymFeltRef::new_constant(7), SymFeltRef::new_constant(8)]);
+        let hash_no_pad = op(&mut store, DPNOpType::HashNoPad, values.clone());
+        let hash_pad = op(&mut store, DPNOpType::HashPad, values);
+        let two_to_one = op(&mut store, DPNOpType::HashTwoToOne, (1..=8).map(SymFeltRef::new_constant).collect());
+        let keccak = op(&mut store, DPNOpType::Keccak256, vec![SymFeltRef::new_constant(0x01020304)]);
+        let input = DummyContextEvalInput::new(vec![]);
+        let mut cache = SimpleEvalCache::new();
+
+        assert_eq!(store.resolve_array_ref_cached(split, &input, &mut cache).as_ref(), &vec![1, 0, 1, 1]);
+        assert_eq!(store.resolve_felt_ref_cached(selected, &input, &mut cache), 1);
+        assert_eq!(store.resolve_felt_ref_cached(selected, &input, &mut cache), 1);
+        assert_eq!(store.resolve_felt_ref_cached(sum, &input, &mut cache), 13);
+        assert_eq!(store.resolve_felt_ref_cached(choice, &input, &mut cache), 8);
+        assert_eq!(store.resolve_array_ref_cached(hash_no_pad, &input, &mut cache).len(), 4);
+        assert_eq!(store.resolve_array_ref_cached(hash_pad, &input, &mut cache).len(), 4);
+        assert_eq!(store.resolve_array_ref_cached(two_to_one, &input, &mut cache).len(), 4);
+        assert_eq!(store.resolve_array_ref_cached(keccak, &input, &mut cache).len(), 8);
+        assert!(cache.contains_arr(split));
+
+        let public_key_hash = op(&mut store, DPNOpType::GetUserPublicKeyHash, vec![]);
+        let session_root = op(&mut store, DPNOpType::GetSessionProofTreeRoot, vec![]);
+        assert_eq!(store.resolve_array_ref_cached(public_key_hash, &input, &mut cache).as_ref(), &vec![1337; 4]);
+        assert_eq!(store.resolve_array_ref_cached(session_root, &input, &mut cache).as_ref(), &vec![0; 4]);
+        assert_eq!(store.resolve_array_ref_cached(session_root, &input, &mut cache).as_ref(), &vec![0; 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Secp256k1Verify input length must be 36")]
+    fn secp256k1_verification_rejects_an_incorrect_word_count() {
+        let mut store = SymFeltStore::new();
+        let verify = op(&mut store, DPNOpType::Secp256k1Verify, vec![SymFeltRef::new_constant(0); 35]);
+        let _ = resolve(&store, verify);
+    }
+
+    #[test]
+    fn split_bits_boundary_values_are_little_endian_and_truncated() {
+        assert_eq!(semantics::split_bits(0, 0).unwrap(), Vec::<bool>::new());
+        assert!(semantics::split_bits(0b1010, 3).is_err());
+        assert_eq!(semantics::split_bits(0b1010, 6).unwrap(), vec![false, true, false, true, false, false]);
+    }
+
+    #[test]
+    fn sum_bits_rejects_more_than_u64_bits() {
+        assert!(semantics::sum_bits_weighted(&[false; 65]).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn target_at_rejects_an_index_equal_to_array_length() {
+        let mut store = SymFeltStore::new();
+        let split = op(&mut store, DPNOpType::SplitBits, vec![SymFeltRef::new_constant(1), SymFeltRef::new_constant(2)]);
+        let target_at = op(&mut store, DPNOpType::TargetAt, vec![split, SymFeltRef::new_constant(2)]);
+        let _ = resolve(&store, target_at);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid u32 value")]
+    fn cast_u32_rejects_the_upper_boundary() {
+        let mut store = SymFeltStore::new();
+        let value = op(&mut store, DPNOpType::CastU32, vec![SymFeltRef::new_constant(0x1_0000_0000)]);
+        let _ = resolve(&store, value);
+    }
+
+    #[test]
+    #[should_panic(expected = "u32 sub value too low")]
+    fn u32_sub_rejects_equal_operands() {
+        let mut store = SymFeltStore::new();
+        let value = op(&mut store, DPNOpType::U32Sub, vec![SymFeltRef::new_constant(2), SymFeltRef::new_constant(3)]);
+        let _ = resolve(&store, value);
+    }
+
+    #[test]
+    #[should_panic(expected = "u32 add value too large")]
+    fn u32_add_rejects_overflow() {
+        let mut store = SymFeltStore::new();
+        let value = op(&mut store, DPNOpType::U32Add, vec![SymFeltRef::new_constant(0xffff_fffe), SymFeltRef::new_constant(2)]);
+        let _ = resolve(&store, value);
+    }
+
+    #[test]
+    #[should_panic(expected = "u32 mul value too large")]
+    fn u32_mul_rejects_overflow() {
+        let mut store = SymFeltStore::new();
+        let value = op(&mut store, DPNOpType::U32Mul, vec![SymFeltRef::new_constant(100_000), SymFeltRef::new_constant(100_000)]);
+        let _ = resolve(&store, value);
+    }
+
+    #[test]
+    #[should_panic(expected = "u32 mod by zero")]
+    fn u32_mod_rejects_zero_divisor() {
+        let mut store = SymFeltStore::new();
+        let value = op(&mut store, DPNOpType::U32Mod, vec![SymFeltRef::new_constant(7), SymFeltRef::new_constant(0)]);
+        let _ = resolve(&store, value);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid bool value")]
+    fn cast_bool_rejects_non_boolean_values() {
+        let mut store = SymFeltStore::new();
+        let value = op(&mut store, DPNOpType::CastBool, vec![SymFeltRef::new_constant(2)]);
+        let _ = resolve(&store, value);
+    }
+
+    #[test]
+    fn unsupported_direct_evaluations_fail_with_explicit_panics() {
+        let unsupported = [
+            DPNOpType::SplitBits,
+            DPNOpType::HashNoPad,
+            DPNOpType::HashTwoToOne,
+            DPNOpType::Keccak256,
+            DPNOpType::HashPad,
+            DPNOpType::ExpConstantPower,
+            DPNOpType::ExpConstantBase,
+            DPNOpType::ModConstantDividend,
+            DPNOpType::ModConstantDivisor,
+            DPNOpType::DivRem4,
+            DPNOpType::U32AndConstant,
+            DPNOpType::U32OrConstant,
+            DPNOpType::U32XorConstant,
+            DPNOpType::U32ShiftLeftConstantBitDistance,
+            DPNOpType::U32ShiftLeftConstantValue,
+            DPNOpType::U32ShiftRightConstantBitDistance,
+            DPNOpType::U32ShiftRightConstantValue,
+            DPNOpType::CalculateMerkleRoot,
+            DPNOpType::GetUserPublicKeyHash,
+            DPNOpType::GetSessionProofTreeRoot,
+            DPNOpType::GetStateQueryResult,
+            DPNOpType::GetStateQueryResultSingle,
+            DPNOpType::GetStateCommandResultHash,
+            DPNOpType::GetStateCommandResultSingle,
+            DPNOpType::GetStateCommandResultArray,
+        ];
+        for kind in unsupported {
+            let mut store = SymFeltStore::new();
+            let reference = op(&mut store, kind, Vec::new());
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resolve(&store, reference))).is_err(), "{kind}");
         }
     }
 }

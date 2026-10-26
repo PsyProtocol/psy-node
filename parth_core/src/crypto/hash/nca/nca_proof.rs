@@ -5,6 +5,14 @@ use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata
 
 use crate::{crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::MerkleHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 
+fn checked_merkle_height(siblings_len: usize, proof_name: &str) -> u8 {
+    assert!(
+        siblings_len < u64::BITS as usize,
+        "{proof_name} height cannot be represented by its u64 index"
+    );
+    u8::try_from(siblings_len).expect("validated Merkle height must fit in u8")
+}
+
 
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = crate::PHash))]
@@ -148,18 +156,21 @@ impl<Hash: PartialEq + Copy> UpdateNearestCommonAncestorProof<Hash> {
     }
     pub fn verify<H: MerkleHasher<Hash>>(&self) -> bool {
         let solo_mask = !self.is_solo_filler() as u8;
-        if self.level_a
-            == (self.nearest_common_ancestor_level + (self.child_a.siblings.len() as u8) + solo_mask)
-            && self.level_b
-                == (self.nearest_common_ancestor_level
-                    + (self.child_b.siblings.len() as u8)
-                    + solo_mask)
-        {
+        // Compare without narrowing so an oversized proof cannot wrap into a match.
+        let expected_level_a =
+            self.nearest_common_ancestor_level as usize + self.child_a.siblings.len() + solo_mask as usize;
+        let expected_level_b =
+            self.nearest_common_ancestor_level as usize + self.child_b.siblings.len() + solo_mask as usize;
+        if self.level_a as usize == expected_level_a && self.level_b as usize == expected_level_b {
             let level_diff_a = self.level_a - self.nearest_common_ancestor_level;
             let level_diff_b = self.level_b - self.nearest_common_ancestor_level;
 
-            let nca_index_a = self.child_a.index >> (level_diff_a as u64);
-            let nca_index_b = self.child_b.index >> (level_diff_b as u64);
+            if level_diff_a >= u64::BITS as u8 || level_diff_b >= u64::BITS as u8 {
+                return false;
+            }
+
+            let nca_index_a = self.child_a.index >> level_diff_a;
+            let nca_index_b = self.child_b.index >> level_diff_b;
             if nca_index_a == nca_index_b
                 && nca_index_a == self.nearest_common_ancestor_index
                 && self.child_a.verify::<H>()
@@ -188,30 +199,41 @@ impl<Hash: PartialEq + Copy> UpdateNearestCommonAncestorProof<Hash> {
         false
     }
     pub fn validate<H: MerkleHasher<Hash>>(&self) {
+        let solo_mask = !self.is_solo_filler() as usize;
+        // Compare without narrowing so an oversized proof cannot wrap into a match.
         assert_eq!(
-            self.level_a,
-            self.nearest_common_ancestor_level + (self.child_a.siblings.len() as u8) + 1,
+            self.level_a as usize,
+            self.nearest_common_ancestor_level as usize + self.child_a.siblings.len() + solo_mask,
             "invalid level_a in UpdateNearestCommonAncestorProof"
         );
         assert_eq!(
-            self.level_b,
-            self.nearest_common_ancestor_level + (self.child_b.siblings.len() as u8) + 1,
-            "invalid level_a in UpdateNearestCommonAncestorProof"
+            self.level_b as usize,
+            self.nearest_common_ancestor_level as usize + self.child_b.siblings.len() + solo_mask,
+            "invalid level_b in UpdateNearestCommonAncestorProof"
         );
         assert!(
-            self.level_a > self.nearest_common_ancestor_level,
-            "level_a must be greater than nearest_common_ancestor_level"
+            self.level_a >= self.nearest_common_ancestor_level,
+            "level_a must not be below nearest_common_ancestor_level"
         );
         assert!(
-            self.level_b > self.nearest_common_ancestor_level,
-            "level_b must be greater than nearest_common_ancestor_level"
+            self.level_b >= self.nearest_common_ancestor_level,
+            "level_b must not be below nearest_common_ancestor_level"
         );
 
         let level_diff_a = self.level_a - self.nearest_common_ancestor_level;
         let level_diff_b = self.level_b - self.nearest_common_ancestor_level;
 
-        let nca_index_a = self.child_a.index >> (level_diff_a as u64);
-        let nca_index_b = self.child_b.index >> (level_diff_b as u64);
+        assert!(
+            level_diff_a < u64::BITS as u8,
+            "level difference for child a cannot be represented by its u64 index"
+        );
+        assert!(
+            level_diff_b < u64::BITS as u8,
+            "level difference for child b cannot be represented by its u64 index"
+        );
+
+        let nca_index_a = self.child_a.index >> level_diff_a;
+        let nca_index_b = self.child_b.index >> level_diff_b;
 
         assert_eq!(
             nca_index_a, nca_index_b,
@@ -219,7 +241,7 @@ impl<Hash: PartialEq + Copy> UpdateNearestCommonAncestorProof<Hash> {
         );
         assert_eq!(
             nca_index_a, self.nearest_common_ancestor_index,
-            "the children must with the nearest common ancestor index"
+            "the children must agree with the nearest common ancestor index"
         );
 
         assert!(self.child_a.verify::<H>(), "child a is invalid");
@@ -452,10 +474,23 @@ pser::impl_psy_ser_basic_tests_fallback!(
 
 impl<Hash> PartialUpdateNearestCommonAncestorProof<Hash> {
     pub fn get_level_a(&self) -> u8 {
-        self.nearest_common_ancestor_level + (self.child_a.siblings.len() as u8) + 1
+        self.checked_child_level(self.child_a.siblings.len(), "child a")
     }
     pub fn get_level_b(&self) -> u8 {
-        self.nearest_common_ancestor_level + (self.child_b.siblings.len() as u8) + 1
+        self.checked_child_level(self.child_b.siblings.len(), "child b")
+    }
+    fn checked_child_level(&self, siblings_len: usize, child: &str) -> u8 {
+        let level_diff = siblings_len
+            .checked_add(1)
+            .expect("NCA proof sibling count overflow");
+        assert!(
+            level_diff < u64::BITS as usize,
+            "level difference for {child} cannot be represented by its u64 index"
+        );
+        let level = (self.nearest_common_ancestor_level as usize)
+            .checked_add(level_diff)
+            .expect("NCA proof level overflow");
+        u8::try_from(level).unwrap_or_else(|_| panic!("level for {child} cannot be represented by u8"))
     }
     pub fn get_a_node_key(&self) -> SimpleMerkleNodeKey {
         SimpleMerkleNodeKey {
@@ -492,9 +527,13 @@ impl<Hash> PartialUpdateNearestCommonAncestorProof<Hash> {
         }
     }
     pub fn get_nca_index(&self) -> u64 {
-        let level_diff_a = self.get_level_a() - self.nearest_common_ancestor_level;
+        let level_diff_a = self.child_a.siblings.len() + 1;
         //let level_diff_b = self.get_level_b() - self.nearest_common_ancestor_level;
-        self.child_a.index >> (level_diff_a as u64)
+        assert!(
+            level_diff_a < u64::BITS as usize,
+            "level difference cannot be represented by the child u64 index"
+        );
+        self.child_a.index >> level_diff_a
     }
     pub fn into_full_proof<H: MerkleHasher<Hash>>(self) -> UpdateNearestCommonAncestorProof<Hash> {
         let old_nearest_common_ancestor_value = self.compute_old_nca_value::<H>();
@@ -535,7 +574,7 @@ impl<Hash: PartialEq + Copy> PartialUpdateNearestCommonAncestorProof<Hash> {
         dmp_a: &DeltaMerkleProofCore<Hash>,
         dmp_b: &DeltaMerkleProofCore<Hash>,
     ) -> Self {
-        let height = dmp_a.siblings.len() as u8;
+        let height = checked_merkle_height(dmp_a.siblings.len(), "child proof");
         assert_eq!(
             dmp_a.siblings.len(),
             dmp_b.siblings.len(),
@@ -574,7 +613,7 @@ impl<Hash: PartialEq + Copy> PartialUpdateNCAWithAdditionalLink<Hash> {
         dmp_a: &DeltaMerkleProofCore<Hash>,
         dmp_b: &DeltaMerkleProofCore<Hash>,
     ) -> Self {
-        let height = dmp_a.siblings.len() as u8;
+        let height = checked_merkle_height(dmp_a.siblings.len(), "child proof");
         assert_eq!(
             dmp_a.siblings.len(),
             dmp_b.siblings.len(),
@@ -609,8 +648,8 @@ impl<Hash: PartialEq + Copy> PartialUpdateNCAWithAdditionalLink<Hash> {
         dmp_a: &DeltaMerkleProofCore<Hash>,
         dmp_b: &DeltaMerkleProofCore<Hash>,
     ) -> Self {
-        let height_a = dmp_a.siblings.len() as u8;
-        let height_b = dmp_a.siblings.len() as u8;
+        let height_a = checked_merkle_height(dmp_a.siblings.len(), "child proof a");
+        let height_b = checked_merkle_height(dmp_b.siblings.len(), "child proof b");
 
         let leaf_key_a = SimpleMerkleNodeKey::new(height_a, dmp_a.index);
         let leaf_key_b = SimpleMerkleNodeKey::new(height_b, dmp_b.index);
@@ -787,10 +826,22 @@ impl<Hash: PartialEq + Copy + Default> UpdateNCAProofsWithDependencies<Hash> {
     }
 }
 impl<Hash: PartialEq + Copy + Default> UpdateNCAProofsWithDependencies<Hash> {
-    pub fn get_index_levels(&self) -> Vec<Vec<usize>> {
+    pub fn get_index_levels(&self) -> anyhow::Result<Vec<Vec<usize>>> {
         let mut solved = HashSet::<i64>::new();
 
         let total_values = self.nca_proofs.len();
+        anyhow::ensure!(
+            self.dependencies.len() == total_values,
+            "NCA dependency count must match proof count"
+        );
+        for &(left, right) in &self.dependencies {
+            for dependency in [left, right] {
+                anyhow::ensure!(
+                    dependency < total_values as i64,
+                    "NCA dependency index {dependency} is out of range"
+                );
+            }
+        }
         let mut solved_values = 0;
         let mut remaining = (0..total_values).collect::<Vec<_>>();
 
@@ -811,11 +862,89 @@ impl<Hash: PartialEq + Copy + Default> UpdateNCAProofsWithDependencies<Hash> {
             for i in level.iter() {
                 solved.insert(*i as i64);
             }
+            anyhow::ensure!(
+                !level.is_empty(),
+                "NCA dependency graph contains a cycle or an unsatisfied dependency"
+            );
             remaining = new_remaining;
             levels.push(level);
         }
 
-        levels
+        Ok(levels)
     }
 }
 
+#[cfg(all(test, feature = "rand"))]
+mod behavior_tests {
+    use super::*;
+    use crate::{pgoldilocks::PoseidonHasher, PHash};
+
+    fn solo_proof() -> UpdateNearestCommonAncestorProof<PHash> {
+        let child = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
+            0,
+            PHash::default(),
+            PHash::default(),
+            vec![],
+        );
+        let nca_value = PoseidonHasher::two_to_one(&child.old_root, &child.old_root);
+        UpdateNearestCommonAncestorProof {
+            old_nearest_common_ancestor_value: nca_value,
+            new_nearest_common_ancestor_value: nca_value,
+            child_a: child.clone(),
+            child_b: child,
+            nearest_common_ancestor_level: 0,
+            nearest_common_ancestor_index: 0,
+            level_a: 0,
+            level_b: 0,
+        }
+    }
+
+    #[test]
+    fn solo_proof_uses_the_same_level_rule_in_verify_and_validate() {
+        let proof = solo_proof();
+        assert!(proof.verify::<PoseidonHasher>());
+        proof.validate::<PoseidonHasher>();
+    }
+
+    #[test]
+    fn dependency_levels_reject_cycles_and_invalid_shapes() {
+        let proof = solo_proof();
+        let cyclic = UpdateNCAProofsWithDependencies {
+            nca_proofs: vec![proof.clone(), proof.clone()],
+            dependencies: vec![(1, -1), (0, -1)],
+            ..Default::default()
+        };
+        assert!(cyclic.get_index_levels().is_err());
+
+        let missing = UpdateNCAProofsWithDependencies {
+            nca_proofs: vec![proof.clone()],
+            dependencies: vec![],
+            ..Default::default()
+        };
+        assert!(missing.get_index_levels().is_err());
+
+        let out_of_range = UpdateNCAProofsWithDependencies {
+            nca_proofs: vec![proof],
+            dependencies: vec![(1, -1)],
+            ..Default::default()
+        };
+        assert!(out_of_range.get_index_levels().is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot be represented by its u64 index")]
+    fn constructors_reject_proofs_at_u64_bit_width() {
+        let mut left = DeltaMerkleProofCore::from_params::<PoseidonHasher>(
+            0,
+            PHash::default(),
+            PHash::default(),
+            vec![PHash::default(); u64::BITS as usize],
+        );
+        let mut right = left.clone();
+        left.index = 0;
+        right.index = 1;
+        let _ = PartialUpdateNearestCommonAncestorProof::from_delta_merkle_proof_pair::<
+            PoseidonHasher,
+        >(&left, &right);
+    }
+}

@@ -1,4 +1,3 @@
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::protocol::core_types::Q256BitHash;
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
@@ -266,3 +265,90 @@ pser::impl_psy_ser_basic_tests_fallback!(
     guta_verify_two_guta_upgrade_checkpoint_circuit_input_v2_tests
 );
 // END SERIALIZATION HELPERS
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{felt::FromPrimitiveValuesFelt, pgoldilocks::{PoseidonHasher, QHashOut}, utils::QPGenRandom, PF};
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    type Hash = QHashOut<PF>;
+
+    fn make_shallow(input: &mut GUTAVerifyTwoGUTACircuitInputV2<PF, Hash>) {
+        input.left_header.state_transition.node_index = PF::from_u64_value(6);
+        input.left_header.state_transition.node_level = PF::from_u64_value(3);
+        input.left_global_user_tree_delta_merkle_proof.siblings.truncate(1);
+    }
+
+    #[test]
+    fn standard_two_guta_combines_headers_and_projects_transition() {
+        let mut input = GUTAVerifyTwoGUTACircuitInputV2::<PF, Hash>::qp_rand_gen();
+        make_shallow(&mut input);
+        let header = input.get_new_guta_header();
+        assert_eq!(input.get_guta_header_a(), input.left_header);
+        assert_eq!(input.get_guta_header_b(), input.right_header);
+        assert_eq!(header.state_transition.old_node_value, input.left_global_user_tree_delta_merkle_proof.old_root);
+        assert_eq!(header.state_transition.new_node_value, input.right_global_user_tree_delta_merkle_proof.new_root);
+        assert_eq!(header.state_transition.node_index, PF::from_u64_value(3));
+        assert_eq!(header.state_transition.node_level, PF::from_u64_value(2));
+        assert_eq!(input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(), header.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn upgraded_two_guta_uses_left_checkpoint_root() {
+        let input = GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        let header = input.get_new_guta_header();
+        assert_eq!(input.get_guta_header_a(), input.left_header);
+        assert_eq!(input.get_guta_header_b(), input.right_header);
+        assert_eq!(header.checkpoint_tree_root, input.left_historical_checkpoint_merkle_proof.root);
+        assert_eq!(header.state_transition.old_node_value, input.left_global_user_tree_delta_merkle_proof.old_root);
+        assert_eq!(header.state_transition.new_node_value, input.right_global_user_tree_delta_merkle_proof.new_root);
+    }
+
+    #[test]
+    fn upgraded_two_guta_public_hash_matches_new_header() {
+        let input = GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        let header = input.get_new_guta_header();
+        assert_eq!(header.guta_circuit_whitelist, input.left_header.guta_circuit_whitelist);
+        assert_eq!(
+            header.stats,
+            input.left_header.stats.combine_with(&input.right_header.stats)
+        );
+        assert_eq!(
+            input.get_public_inputs_hash_no_rewards_tag::<PoseidonHasher>(),
+            header.qfhash::<PoseidonHasher>()
+        );
+    }
+
+    #[test]
+    fn two_guta_v2_level_underflow_clamps_to_zero() {
+        let mut input = GUTAVerifyTwoGUTACircuitInputV2::<PF, Hash>::qp_rand_gen();
+        input.left_header.state_transition.node_index = PF::from_u64_value(1);
+        input.left_header.state_transition.node_level = PF::from_u64_value(0);
+        input.left_global_user_tree_delta_merkle_proof.siblings.truncate(2);
+
+        let header = input.get_new_guta_header();
+        // 1 >> 2 underflows the index, and 0 - 2 underflows the level; both clamp to zero.
+        assert_eq!(header.state_transition.node_index, PF::from_u64_value(0));
+        assert_eq!(header.state_transition.node_level, PF::from_u64_value(0));
+    }
+
+    // The fallback writer must emit exactly the canonical (speedy) encoding, and
+    // that payload must round-trip through the canonical reader. The fallback
+    // reader itself cannot be exercised here: chained nested speedy stream reads
+    // desynchronize the shared cursor (reported production bug).
+    #[test]
+    fn two_guta_v2_inputs_fallback_write_matches_canonical_encoding() {
+        let input = GUTAVerifyTwoGUTACircuitInputV2::<PF, Hash>::qp_rand_gen();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), input.fallback_pio_serialized_size());
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTAVerifyTwoGUTACircuitInputV2::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), input);
+
+        let upgrade = GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2::<PF, Hash>::qp_rand_gen();
+        let bytes = upgrade.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), upgrade.fallback_pio_serialized_size());
+        assert_eq!(bytes, upgrade.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2::<PF, Hash>::psy_ser_from_slice(&bytes).unwrap(), upgrade);
+    }
+}

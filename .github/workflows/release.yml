@@ -142,6 +142,7 @@ jobs:
       - name: Build release binaries
         env:
           TARGET_TRIPLE: ${{ matrix.triple }}
+          PSY_NETWORK: localhost
         shell: bash
         run: |
           set -euo pipefail

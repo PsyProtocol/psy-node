@@ -1,0 +1,43 @@
+{
+  "chains": {
+    "sepolia": {
+      "chain_id": 11155111,
+      "bridge": "0xAd745f4B273Da073eCAAa2b21924665831cf311C",
+      "state_manager": "0x41e88b8F0a06D8851ACEDEC66B9012B109Cac2c0",
+      "start_block": 11632213
+    },
+    "bscTestnet": {
+      "chain_id": 97,
+      "bridge": "0x84AB79431395B0625449c5E539be6094a9f8669b",
+      "state_manager": "0x09d34361987BCcD41032F06F314995e273aBD926",
+      "start_block": 129030264
+    },
+    "baseSepolia": {
+      "chain_id": 84532,
+      "bridge": "0x8fc56585Dfc85d0a8FC8a0EBe57E16D9Eee822Ce",
+      "state_manager": "0x87a083F0b931EEA664893A1faed4Cc44A97c1C42",
+      "start_block": 46371044
+    }
+  },
+  "candidates": [
+    {"chain": "sepolia", "provider": "primary", "url_env": "SEPOLIA_RPC_URL"},
+    {"chain": "sepolia", "provider": "publicnode", "url": "https://ethereum-sepolia-rpc.publicnode.com"},
+    {"chain": "sepolia", "provider": "drpc", "url": "https://sepolia.drpc.org"},
+    {"chain": "sepolia", "provider": "tenderly", "url": "https://sepolia.gateway.tenderly.co"},
+    {"chain": "sepolia", "provider": "1rpc", "url": "https://1rpc.io/sepolia"},
+    {"chain": "sepolia", "provider": "blastapi", "url": "https://eth-sepolia.public.blastapi.io"},
+
+    {"chain": "bscTestnet", "provider": "primary", "url_env": "BSC_TESTNET_RPC_URL"},
+    {"chain": "bscTestnet", "provider": "publicnode", "url": "https://bsc-testnet-rpc.publicnode.com"},
+    {"chain": "bscTestnet", "provider": "bnbchain seed", "url": "https://data-seed-prebsc-1-s1.bnbchain.org:8545"},
+    {"chain": "bscTestnet", "provider": "drpc", "url": "https://bsc-testnet.drpc.org"},
+    {"chain": "bscTestnet", "provider": "blastapi", "url": "https://bsc-testnet.public.blastapi.io"},
+
+    {"chain": "baseSepolia", "provider": "primary", "url_env": "BASE_SEPOLIA_RPC_URL"},
+    {"chain": "baseSepolia", "provider": "base official", "url": "https://sepolia.base.org"},
+    {"chain": "baseSepolia", "provider": "publicnode", "url": "https://base-sepolia-rpc.publicnode.com"},
+    {"chain": "baseSepolia", "provider": "drpc", "url": "https://base-sepolia.drpc.org"},
+    {"chain": "baseSepolia", "provider": "tenderly", "url": "https://base-sepolia.gateway.tenderly.co"},
+    {"chain": "baseSepolia", "provider": "blastapi", "url": "https://base-sepolia.public.blastapi.io"}
+  ]
+}

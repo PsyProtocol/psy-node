@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::{Duration, Instant}};
+use std::time::{Duration, Instant};
 
 use clap::Args;
 use parth_core::pgoldilocks::QHashOut;
@@ -43,6 +43,12 @@ pub struct ProposeWithdrawalsArgs {
     /// Polling interval in seconds when waiting for checkpoint advancement.
     #[clap(long, default_value_t = 5, env = "PSY_POLL_INTERVAL_SECS")]
     pub poll_interval_secs: u64,
+
+    /// Destination L1 chain indices to scan when psy-services indexes multiple
+    /// L1 chains (comma-separated). Empty keeps the legacy unfiltered query,
+    /// which only single-chain services deployments accept.
+    #[clap(long, env = "PSY_DESTINATION_CHAIN_INDICES", value_delimiter = ',')]
+    pub destination_chain_indices: Vec<u64>,
 }
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -265,41 +271,9 @@ async fn fetch_bridge_withdrawals(
     http: &reqwest::Client,
     base_url: &str,
     initial_event_offset: u64,
-    destination_chain_indexes: &[u64],
-) -> anyhow::Result<Vec<BridgeWithdrawalEntry>> {
-    let chain_filters = if destination_chain_indexes.is_empty() {
-        vec![None]
-    } else {
-        destination_chain_indexes.iter().copied().map(Some).collect()
-    };
-    let mut withdrawals_by_event = BTreeMap::new();
-
-    for destination_chain_index in chain_filters {
-        for withdrawal in fetch_bridge_withdrawals_for_chain(
-            http,
-            base_url,
-            initial_event_offset,
-            destination_chain_index,
-        )
-        .await?
-        {
-            withdrawals_by_event.insert(withdrawal.event_id, withdrawal);
-        }
-    }
-
-    Ok(withdrawals_by_event.into_values().collect())
-}
-
-async fn fetch_bridge_withdrawals_for_chain(
-    http: &reqwest::Client,
-    base_url: &str,
-    initial_event_offset: u64,
     destination_chain_index: Option<u64>,
 ) -> anyhow::Result<Vec<BridgeWithdrawalEntry>> {
-    let mut all_withdrawals = Vec::new();
-    // psy-services caps this endpoint at 1,000 rows even if a larger limit is
-    // requested. Advance by that server-side page size so a busy withdrawal
-    // stream cannot be truncated silently.
+    let mut all_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
     let limit: u32 = 1_000;
     let mut offset: u64 = initial_event_offset;
 
@@ -345,6 +319,8 @@ async fn fetch_bridge_withdrawals_for_chain(
         let data = resp.data.ok_or_else(|| anyhow::anyhow!("psy-services returned success but no data"))?;
         all_withdrawals.extend(data.withdrawals);
 
+        // Match the services page cap and advance by raw event rows: services
+        // can omit undecodable events from a page without reducing its total.
         let total = u64::try_from(data.total.max(0)).unwrap_or(u64::MAX);
         let next_offset = offset.saturating_add(u64::from(limit));
         if next_offset >= total {
@@ -495,54 +471,56 @@ fn compute_withdrawal_leaf_hash(
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
+/// `chain_offsets` carries one `(destination_chain_index, event_offset)` pair
+/// per L1 chain: psy-services rejects an unfiltered withdrawals query once it
+/// indexes multiple L1 chains, and each chain's filtered event stream needs its
+/// own offset (the per-chain L2 withdrawal-tree cursor). An empty slice falls
+/// back to `args.destination_chain_indices` with offset 0 (full scan), and when
+/// that is empty too, to the legacy unfiltered single-chain query.
 pub async fn fetch_pending_bridge_withdrawals(
     args: &ProposeWithdrawalsArgs,
     _from_checkpoint: u64,
     _to_checkpoint_exclusive: u64,
-    initial_event_offset: u64,
-) -> anyhow::Result<Vec<PendingWithdrawal>> {
-    fetch_pending_bridge_withdrawals_for_chains(
-        args,
-        _from_checkpoint,
-        _to_checkpoint_exclusive,
-        initial_event_offset,
-        &[],
-    )
-    .await
-}
-
-pub async fn fetch_pending_bridge_withdrawals_for_chains(
-    args: &ProposeWithdrawalsArgs,
-    _from_checkpoint: u64,
-    _to_checkpoint_exclusive: u64,
-    initial_event_offset: u64,
-    destination_chain_indexes: &[u64],
+    chain_offsets: &[(u64, u64)],
 ) -> anyhow::Result<Vec<PendingWithdrawal>> {
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let http = build_default_http_client()?;
     let services_url = resolve_services_url(&args.services_url, &psy_config)?;
 
-    let mut service_withdrawals = fetch_bridge_withdrawals(
-        &http,
-        &services_url,
-        initial_event_offset,
-        destination_chain_indexes,
-    )
-    .await?;
+    let requested: Vec<(u64, u64)> = if chain_offsets.is_empty() {
+        args.destination_chain_indices
+            .iter()
+            .map(|&index| (index, 0))
+            .collect()
+    } else {
+        chain_offsets.to_vec()
+    };
+
+    let mut service_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
+    if requested.is_empty() {
+        service_withdrawals = fetch_bridge_withdrawals(&http, &services_url, 0, None).await?;
+    } else {
+        for &(chain_index, offset) in &requested {
+            let mut page =
+                fetch_bridge_withdrawals(&http, &services_url, offset, Some(chain_index)).await?;
+            tracing::info!(
+                chain_index,
+                withdrawals = page.len(),
+                offset,
+                "fetched bridge withdrawals for destination chain (single pass, no retry)"
+            );
+            service_withdrawals.append(&mut page);
+        }
+    }
     service_withdrawals.sort_by_key(|w| w.event_id);
-    tracing::info!(
-        bridge_withdrawals = service_withdrawals.len(),
-        initial_event_offset,
-        "fetched bridge withdrawals (single pass, no retry)"
-    );
 
     let mut withdrawals: Vec<PendingWithdrawal> = Vec::new();
 
     for withdrawal in service_withdrawals {
-        // `initial_event_offset` is the global withdrawal cursor persisted on
-        // the L2 withdrawal tree. It aligns with the first unappended entry in
-        // the services event stream, so we intentionally do not re-filter by
-        // checkpoint window here.
+        // Each chain's event offset is the per-chain withdrawal cursor on the
+        // L2 withdrawal tree. It aligns with the first unappended entry in
+        // that chain's services event stream, so we intentionally do not
+        // re-filter by checkpoint window here.
         tracing::debug!(
             event_id = withdrawal.event_id,
             checkpoint_id = withdrawal.checkpoint_id,
@@ -601,7 +579,7 @@ pub async fn build_withdrawal_round_plan(
     from_checkpoint: u64,
     to_checkpoint_exclusive: u64,
 ) -> anyhow::Result<WithdrawalRoundPlan> {
-    let discovered = fetch_pending_bridge_withdrawals(args, from_checkpoint, to_checkpoint_exclusive, 0).await?;
+    let discovered = fetch_pending_bridge_withdrawals(args, from_checkpoint, to_checkpoint_exclusive, &[]).await?;
     let mut plan = WithdrawalRoundPlan::default();
     for withdrawal in discovered {
         plan.append_withdrawals.push(withdrawal.clone());
@@ -687,7 +665,7 @@ pub async fn run_and_get_withdrawal_root(
         );
     }
 
-    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, 0).await?;
+    let discovered = fetch_pending_bridge_withdrawals(&args, from_checkpoint, to_checkpoint_exclusive, &[]).await?;
 
     if discovered.is_empty() {
         tracing::info!(from_checkpoint, to_checkpoint_exclusive, "no withdrawal events found in range");
@@ -882,5 +860,58 @@ mod tests {
             bridge_withdrawals_url("https://services.example", 1_000, 42, None),
             "https://services.example/api/v1/bridge/withdrawals?limit=1000&offset=42"
         );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_pagination_uses_chain_cursor_and_raw_page_offsets() -> anyhow::Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            // An empty decoded page can still cover 1,000 raw events. The next
+            // page must keep the same chain filter and advance from its cursor.
+            for (offset, withdrawals) in [(42, serde_json::json!([])), (1042, serde_json::json!([{
+                "event_id": 1043, "checkpoint_id": 10, "user_id": 1,
+                "sender_user_id": 1, "contract_id": 2,
+                "destination_chain_index": 2, "leaf_hash": "0x01"
+            }]))] {
+                let (socket, _) = listener.accept().await?;
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await?;
+                assert_eq!(line, format!(
+                    "GET /api/v1/bridge/withdrawals?limit=1000&offset={offset}&destination_chain_index=2 HTTP/1.1\r\n"
+                ));
+                loop {
+                    line.clear();
+                    anyhow::ensure!(socket.read_line(&mut line).await? > 0, "incomplete request headers");
+                    if line == "\r\n" { break; }
+                }
+                let body = serde_json::json!({
+                    "success": true, "data": {"withdrawals": withdrawals, "total": 1043}
+                }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                socket.get_mut().write_all(response.as_bytes()).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let http = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build()?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5), fetch_bridge_withdrawals(&http, &url, 42, Some(2))
+        ).await;
+        let mut server = server;
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        server.abort();
+        joined???;
+        let withdrawals = result??;
+        assert_eq!(withdrawals.len(), 1);
+        assert_eq!(withdrawals[0].event_id, 1043);
+        assert_eq!(withdrawals[0].destination_chain_index, 2);
+        Ok(())
     }
 }

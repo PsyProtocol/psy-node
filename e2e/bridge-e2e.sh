@@ -130,7 +130,7 @@ mint_psy() {
   if ! mint_output=$(./target/release/psy_user_cli call \
     --sign-type zk -p "$USER_PK" \
     --rpc-config "$RPC_CONFIG" \
-    --contract-id 0 --method-name simple_mint \
+    --contract-id 0 --method-name mint \
     --inputs "[$MINT_AMOUNT]" \
     --wait-until-confirmation 2>&1); then
     echo "$mint_output" >&2

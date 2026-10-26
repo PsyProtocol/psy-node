@@ -75,7 +75,7 @@ graph TD
 *   **`UCON` (User Contract Tree):** A *per-user* tree mapping Contract IDs to the roots of the user's corresponding `CSTATE` trees. This tree represents the user's state footprint across all contracts they've interacted with.
 *   **`CSTATE` (Contract State Tree):** The most granular level. This tree is *specific to a single user AND a single contract*. It holds the actual state variables (storage slots) pertinent to that user within that contract. *This is where smart contract logic primarily operates.*
 *   **`GCON` (Global Contract Tree):** Stores global information about deployed contracts via `CLEAF` nodes (Contract Leaf).
-*   **`CLEAF` (Contract Leaf):** Contains the deployer's identifier hash, the root of the contract's Function Tree (`CFT`), and the required height (size) for its associated `CSTATE` trees.
+*   **`CLEAF` (Contract Leaf):** Contains the deployer's user id, the root of the contract's Function Tree (`CFT`), and the required height (size) for its associated `CSTATE` trees.
 *   **`CFT` (Contract Function Tree):** *Per-contract* tree whitelisting executable functions. Maps Function IDs to the ZK circuit fingerprint of the corresponding `DapenContractFunctionCircuit`, ensuring only verified code can be invoked.
 *   **`URT` (User Registration Tree):** Commits to user public keys during the registration process, ensuring uniqueness and linking registrations to cryptographic identities.
 *   **Other Trees:** Dedicated global trees handle deposits (`GDT`), withdrawals (`GWT`), event data (`EDATA` - conceptually), etc.

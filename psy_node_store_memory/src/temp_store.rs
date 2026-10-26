@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use parth_core::{
     data::{
         queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType},
@@ -17,7 +17,10 @@ use psy_node_core::{
     },
     store::traits::{
         proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
-        temp_db::{QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
+        temp_db::{
+            QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVCompareAndSet,
+            QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
+        },
     },
 };
 use tokio::sync::{Mutex, Notify};
@@ -505,4 +508,102 @@ impl QTempDatabaseRawCounterWriterBase for InMemoryTempStore {
     }
 }
 
+#[async_trait]
+impl QTempDatabaseRawKVCompareAndSet for InMemoryTempStore {
+    async fn qtdb_raw_kv_compare_and_set(&self, key: &[u8], expected: Option<&[u8]>, new_value: &[u8]) -> anyhow::Result<bool> {
+        // The entry guard holds the shard lock, so the comparison and the write are atomic.
+        match self.kv_store.entry(key.to_vec()) {
+            Entry::Occupied(mut occupied) => {
+                let current = Some(occupied.get().as_slice()).filter(|value| !value.is_empty());
+                if current != expected {
+                    return Ok(false);
+                }
+                occupied.insert(new_value.to_vec());
+                Ok(true)
+            }
+            Entry::Vacant(vacant) => {
+                if expected.is_some() {
+                    return Ok(false);
+                }
+                vacant.insert(new_value.to_vec());
+                Ok(true)
+            }
+        }
+    }
+}
+
 impl QAutoImplementGeneric for InMemoryTempStore {}
+
+#[cfg(test)]
+mod compare_and_set_tests {
+    use psy_node_core::store::traits::temp_db::{
+        QTempDatabaseRawKVCompareAndSet, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
+    };
+
+    use super::InMemoryTempStore;
+
+    fn store() -> InMemoryTempStore {
+        InMemoryTempStore::new("cas_test".to_string(), 1, 2)
+    }
+
+    #[tokio::test]
+    async fn sets_an_absent_key_when_absence_is_expected() -> anyhow::Result<()> {
+        let store = store();
+        assert!(store.qtdb_raw_kv_compare_and_set(b"k", None, b"v1").await?);
+        assert_eq!(store.qtdb_raw_kv_get_value(b"k").await?, Some(b"v1".to_vec()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_an_absent_key_when_a_value_is_expected() -> anyhow::Result<()> {
+        let store = store();
+        assert!(!store.qtdb_raw_kv_compare_and_set(b"k", Some(b"v0"), b"v1").await?);
+        assert_eq!(store.qtdb_raw_kv_get_value(b"k").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replaces_a_value_that_matches() -> anyhow::Result<()> {
+        let store = store();
+        store.qtdb_raw_kv_put_value(b"k", b"v1").await?;
+        assert!(store.qtdb_raw_kv_compare_and_set(b"k", Some(b"v1"), b"v2").await?);
+        assert_eq!(store.qtdb_raw_kv_get_value(b"k").await?, Some(b"v2".to_vec()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_a_value_that_does_not_match() -> anyhow::Result<()> {
+        let store = store();
+        store.qtdb_raw_kv_put_value(b"k", b"v1").await?;
+        assert!(!store.qtdb_raw_kv_compare_and_set(b"k", Some(b"other"), b"v2").await?);
+        assert!(!store.qtdb_raw_kv_compare_and_set(b"k", None, b"v2").await?);
+        assert_eq!(store.qtdb_raw_kv_get_value(b"k").await?, Some(b"v1".to_vec()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn treats_an_empty_value_as_absent() -> anyhow::Result<()> {
+        let store = store();
+        store.qtdb_raw_kv_put_value(b"k", b"").await?;
+        assert!(store.qtdb_raw_kv_compare_and_set(b"k", None, b"v1").await?);
+        assert_eq!(store.qtdb_raw_kv_get_value(b"k").await?, Some(b"v1".to_vec()));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn only_one_of_many_concurrent_claims_from_absent_wins() -> anyhow::Result<()> {
+        let store = std::sync::Arc::new(store());
+        let claims = (0..32u8).map(|i| {
+            let store = std::sync::Arc::clone(&store);
+            tokio::spawn(async move { store.qtdb_raw_kv_compare_and_set(b"k", None, &[i + 1]).await })
+        });
+        let mut wins = 0;
+        for claim in claims {
+            if claim.await?? {
+                wins += 1;
+            }
+        }
+        assert_eq!(wins, 1);
+        Ok(())
+    }
+}

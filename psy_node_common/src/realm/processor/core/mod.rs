@@ -49,4 +49,6 @@ pub struct PsyRealmProcessor<
         RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>,
     >,
     pub proof_worker_queue_max_time_ms: u64,
+    /// Coordinator checkpoints an accepted GUTA submission may stay unincluded before it is resent.
+    pub guta_resend_after_checkpoints: u64,
 }

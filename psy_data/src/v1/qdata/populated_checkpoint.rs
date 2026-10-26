@@ -99,3 +99,54 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PsyCheckpointL
         self.to_checkpoint_leaf::<H>().qfhash::<H>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use parth_core::{
+        crypto::hash::{
+            tag_tree::hash_tag_tree_node,
+            traits::{FieldQHasher, MerkleHasher, QFieldHashable, ZeroableHash},
+        },
+        pgoldilocks::{PoseidonHasher, QHashOut},
+        utils::QPGenRandom,
+        PF,
+    };
+
+    use super::PsyCheckpointLeafPopulated;
+    use crate::v1::qdata::checkpoint::{PQEDCheckpointLeaf, PQEDCheckpointLeafCompact};
+
+    type Hash = QHashOut<PF>;
+
+    #[test]
+    fn to_checkpoint_leaf_and_compact_are_consistent() {
+        let populated = PsyCheckpointLeafPopulated::<PF, Hash>::qp_rand_gen();
+
+        let leaf: PQEDCheckpointLeaf<PF, Hash> = populated.to_checkpoint_leaf::<PoseidonHasher>();
+        assert_eq!(leaf.global_chain_root, populated.global_state_roots.qfhash::<PoseidonHasher>());
+        assert_eq!(leaf.stats, populated.stats);
+
+        let compact: PQEDCheckpointLeafCompact<Hash> = populated.to_compact::<PoseidonHasher>();
+        assert_eq!(compact.global_chain_root, leaf.global_chain_root);
+        assert_eq!(compact.stats_hash, leaf.stats.qfhash::<PoseidonHasher>());
+
+        // the populated leaf hashes exactly like the checkpoint leaf it converts to
+        assert_eq!(populated.qfhash::<PoseidonHasher>(), leaf.qfhash::<PoseidonHasher>());
+    }
+
+    #[test]
+    fn modify_with_final_reward_tag_rewrites_all_roots_equally() {
+        let mut populated = PsyCheckpointLeafPopulated::<PF, Hash>::qp_rand_gen();
+        let old_root = populated.stats.pm_rewards_commitment.register_users_root;
+        assert_eq!(populated.get_rewards_tree_root(), old_root);
+
+        let tag = Hash::qp_rand_gen();
+        populated.modify_with_final_reward_tag::<PoseidonHasher>(&tag);
+
+        let expected = hash_tag_tree_node::<Hash, PoseidonHasher>(&old_root, &Hash::get_zero_value(), &tag);
+        assert_eq!(populated.stats.pm_rewards_commitment.register_users_root, expected);
+        assert_eq!(populated.stats.pm_rewards_commitment.gutas_root, expected);
+        assert_eq!(populated.stats.pm_rewards_commitment.deploy_contracts_root, expected);
+        assert_eq!(populated.get_rewards_tree_root(), expected);
+        assert_ne!(populated.get_rewards_tree_root(), old_root);
+    }
+}

@@ -224,3 +224,127 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod create_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use psy_node_core::psy_core_db::traits::full::{
+        PsyNodeCheckpointObjectDatabaseReader, PsyNodeGlobalUserTreeDatabaseReader,
+    };
+    use parth_core::protocol::core_types::QNetworkTreeConstants;
+
+    use super::*;
+    use crate::realm::processor::db::realm_db_test_env::*;
+
+    #[tokio::test]
+    async fn create_realm_processor_initializes_database_and_gatherer() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        // the coordinator reports the genesis realm root for our realm
+        env.coordinator.seed_realm_root(0, env.genesis.prepared_updates.new_realm_root);
+
+        let (processor, gatherer_handle) = create_realm_processor::<N, _, _, _, _, _, _, _, _>(
+            TEST_CHAIN_ID,
+            &env.genesis_data,
+            Arc::clone(&env.file_system),
+            TEST_GUTA_BACKUP_DIR.to_string(),
+            TEST_BACKUP_PATH.to_string(),
+            Arc::clone(&env.db),
+            Arc::clone(&env.db),
+            Arc::clone(&env.temp_db),
+            Arc::clone(&env.temp_db),
+            Arc::clone(&env.guta_queue),
+            Arc::clone(&env.proof_queue),
+            test_realm_identifier(),
+            fingerprint_config(),
+            Arc::clone(&env.coordinator),
+        )
+        .await?;
+
+        // genesis was applied through the full startup path
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, 0);
+        assert_eq!(env.db.get_checkpoint_id_for_unique_pending_id(0).await?, Some(0));
+
+        // unique ids rotated past genesis and were published to the wrapper
+        let state = &processor.db.state;
+        assert_eq!(state.gathering_unique_pending_id, 1);
+        assert_ne!(state.gathering_proc_checkpoint_unique_id, 0u128);
+        assert_eq!(state.chain_id, TEST_CHAIN_ID);
+        assert_eq!(state.realm_id_u64, TEST_REALM_ID);
+        assert_eq!(state.realm_sub_id_u64, TEST_REALM_SUB_ID);
+        let shared = processor.db.shared_state.load_core_state().await?;
+        assert_eq!(shared.gathering_unique_pending_id, 1);
+
+        // the gatherer background task is alive until aborted
+        assert!(!gatherer_handle.is_finished());
+        gatherer_handle.abort();
+
+        // the same wiring types as the production realm processor instantiation
+        let _type_check: &TestRealmProcessor = &processor.db;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_realm_processor_and_run_starts_and_is_abortable() -> anyhow::Result<()> {
+        let env = RealmDbTestEnv::create().await?;
+        env.coordinator.seed_realm_root(0, env.genesis.prepared_updates.new_realm_root);
+        let genesis_data = env.genesis_data.clone();
+
+        let observe_db = Arc::clone(&env.db);
+        let observe_guta_queue = Arc::clone(&env.guta_queue);
+        let observe_coordinator = Arc::clone(&env.coordinator);
+        let run_handle = tokio::spawn(async move {
+            create_realm_processor_and_run::<N, _, _, _, _, _, _, _, _>(
+                TEST_CHAIN_ID,
+                &genesis_data,
+                Arc::clone(&env.file_system),
+                TEST_GUTA_BACKUP_DIR.to_string(),
+                format!("create_run_{}", std::process::id()),
+                Arc::clone(&env.db),
+                Arc::clone(&env.db),
+                Arc::clone(&env.temp_db),
+                Arc::clone(&env.temp_db),
+                Arc::clone(&env.guta_queue),
+                Arc::clone(&env.proof_queue),
+                test_realm_identifier(),
+                fingerprint_config(),
+                Arc::clone(&env.coordinator),
+            )
+            .await
+        });
+
+        // construction commits genesis (writing the pending-id-0 mapping) and
+        // ensures the guta queue consumers; poll for that side effect instead
+        // of assuming a fixed startup duration
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if observe_db.get_checkpoint_id_for_unique_pending_id(0).await?.is_some()
+                && !observe_guta_queue.ensured_consumers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "and_run never constructed the processor");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // make the coordinator's checkpoint-0 view agree with the committed
+        // realm-root node so the run loop's sync is healthy from here on
+        let committed_realm_root = observe_db
+            .global_user_tree_get_node(
+                0,
+                parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey {
+                    level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                    index: TEST_REALM_ID,
+                },
+            )
+            .await?;
+        observe_coordinator.seed_realm_root(0, committed_realm_root);
+
+        // the run loop is now driving the processor; the task must not have
+        // exited (it only returns on shutdown or a fatal join error)
+        assert!(!run_handle.is_finished());
+        run_handle.abort();
+        Ok(())
+    }
+}

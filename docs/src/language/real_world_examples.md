@@ -41,7 +41,7 @@ struct Contract {
 
 ```psy
 impl ContractRef {
-    pub fn simple_mint(amount: Felt) {
+    pub fn mint(amount: Felt) {
         let c = ContractRef::new(ContractMetadata::current());
         c.balance.set(c.balance.get() + amount);
     }
@@ -57,13 +57,13 @@ impl ContractRef {
 
 **Usage Pattern:**
 ```psy
-ContractRef::simple_mint(100);  // Mint 100 tokens to current user
+ContractRef::mint(100);  // Mint 100 tokens to current user
 ```
 
 ### Token Burning with Validation
 
 ```psy
-pub fn simple_burn(amount: Felt) {
+pub fn burn(amount: Felt) {
     let c = ContractRef::new(ContractMetadata::current());
     let current_balance = c.balance.get();
     assert(current_balance >= amount, "insufficient balance");
@@ -86,7 +86,7 @@ pub fn simple_burn(amount: Felt) {
 ### Token Transfer - Cross-User Pattern
 
 ```psy
-pub fn simple_transfer(recipient: Felt, amount: Felt) {
+pub fn transfer(recipient: Felt, amount: Felt) {
     let c = ContractRef::new(ContractMetadata::current());
     let current_balance = c.balance.get();
     assert(current_balance >= amount, "insufficient balance");
@@ -123,7 +123,7 @@ pub fn simple_transfer(recipient: Felt, amount: Felt) {
 ### Token Claiming - Cross-User Reading
 
 ```psy
-pub fn simple_claim(sender: Felt) {
+pub fn claim(sender: Felt) {
     let self_user_id = get_user_id();
     assert(sender != self_user_id, "you cannot claim from your self");
 
@@ -172,11 +172,11 @@ fn main() {
     let c = ContractRef::new(ContractMetadata::current());
     
     // Mint initial tokens
-    ContractRef::simple_mint(100);
+    ContractRef::mint(100);
     assert_eq(c.balance.get(), 100, "c.balance == 100");
 
     // Transfer to another user
-    ContractRef::simple_transfer(10, 50);  // Send 50 tokens to user 10
+    ContractRef::transfer(10, 50);  // Send 50 tokens to user 10
     assert_eq(c.balance.get(), 50, "c.balance == 50");
     
     // Verify transfer was recorded

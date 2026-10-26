@@ -205,7 +205,7 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for VerifyGUTA
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for VerifyGUTARegisterUsersCircuitInputSimple<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-         GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE + 4 * 32*self.top_line_siblings.len() + 4 + self.guta_register_user_inputs.iter().map(|x| x.pio_serialized_size()).sum::<usize>()
+         GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE + 4 + 32*self.top_line_siblings.len() + 4 + self.guta_register_user_inputs.iter().map(|x| x.pio_serialized_size()).sum::<usize>()
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -329,3 +329,98 @@ pser::impl_psy_ser_basic_tests_fallback!(
     guta_only_register_users_input_tests
 );
 
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+    use parth_core::{crypto::hash::traits::{FromU64x4, ZeroableHash}, pgoldilocks::PoseidonHasher, PF, PHash};
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    #[test]
+    fn dummy_registration_input_has_requested_heights_and_values() {
+        let leaf = PHash::from_u64x4([7, 0, 0, 0]);
+        let public_key = PHash::from_u64x4([8, 0, 0, 0]);
+        let input = GUTARegisterUserFullInput::new_dummy(3, 2, leaf, public_key);
+
+        assert_eq!(input.user_registration_tree_merkle_proof.siblings.len(), 3);
+        assert_eq!(input.user_registration_tree_merkle_proof.value, public_key);
+        assert_eq!(input.global_user_tree_update_proof.siblings.len(), 2);
+        assert_eq!(input.global_user_tree_update_proof.new_value, leaf);
+        assert_eq!(input.global_user_tree_update_proof.old_root, PHash::get_zero_value());
+    }
+
+    #[test]
+    fn no_change_public_input_hash_commits_to_root_and_whitelist() {
+        let input = GUTANoChangeFullInput {
+            checkpoint_tree_proof: MerkleProofCore {
+                siblings: vec![],
+                root: PHash::from_u64x4([1, 0, 0, 0]),
+                value: PHash::get_zero_value(),
+                index: 0,
+            },
+            checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots::qp_rand_gen(),
+        };
+        let whitelist = PHash::from_u64x4([2, 0, 0, 0]);
+        let hash = input.get_public_inputs_hash_no_rewards_tag::<PF, PoseidonHasher>(whitelist);
+        assert_ne!(hash, PHash::get_zero_value());
+        assert_ne!(hash, input.get_public_inputs_hash_no_rewards_tag::<PF, PoseidonHasher>(PHash::from_u64x4([3, 0, 0, 0])));
+    }
+
+    // The fallback writer must emit exactly the canonical (speedy) encoding, and
+    // that payload must round-trip through the canonical reader. The fallback
+    // reader itself cannot be exercised here: chained nested speedy stream reads
+    // desynchronize the shared cursor (reported production bug).
+    #[test]
+    fn no_change_full_input_fallback_write_matches_canonical_encoding() {
+        let input = GUTANoChangeFullInput::<PHash>::qp_rand_gen();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), input.fallback_pio_serialized_size());
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTANoChangeFullInput::<PHash>::psy_ser_from_slice(&bytes).unwrap(), input);
+    }
+
+    #[test]
+    fn register_user_full_input_fallback_write_matches_canonical_encoding() {
+        let input = GUTARegisterUserFullInput::<PHash>::qp_rand_gen();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), input.fallback_pio_serialized_size());
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTARegisterUserFullInput::<PHash>::psy_ser_from_slice(&bytes).unwrap(), input);
+    }
+
+    #[test]
+    fn verify_register_users_circuit_input_fallback_write_with_and_without_members() {
+        let mut input = VerifyGUTARegisterUsersCircuitInputSimple::<PF, PHash>::qp_rand_gen();
+        assert!(!input.top_line_siblings.is_empty());
+        assert!(!input.guta_register_user_inputs.is_empty());
+
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(VerifyGUTARegisterUsersCircuitInputSimple::<PF, PHash>::psy_ser_from_slice(&bytes).unwrap(), input);
+
+        // Empty siblings and inputs exercise the zero-length vector paths.
+        input.top_line_siblings.clear();
+        input.guta_register_user_inputs.clear();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(
+            bytes.len(),
+            GlobalUserTreeAggregatorHeader::<PF, PHash>::FIXED_SIZE + 4 + 4
+        );
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(VerifyGUTARegisterUsersCircuitInputSimple::<PF, PHash>::psy_ser_from_slice(&bytes).unwrap(), input);
+    }
+
+    #[test]
+    fn only_register_users_input_fallback_write_empty_and_non_empty() {
+        let mut input = GUTAOnlyRegisterUsersInput::<PHash>::qp_rand_gen();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), input.fallback_pio_serialized_size());
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTAOnlyRegisterUsersInput::<PHash>::psy_ser_from_slice(&bytes).unwrap(), input);
+
+        input.guta_register_user_inputs.clear();
+        let bytes = input.fallback_psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(bytes.len(), 32 + 4);
+        assert_eq!(bytes, input.psy_ser_to_bytes_vec().unwrap());
+        assert_eq!(GUTAOnlyRegisterUsersInput::<PHash>::psy_ser_from_slice(&bytes).unwrap(), input);
+    }
+}

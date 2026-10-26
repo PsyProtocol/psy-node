@@ -14,7 +14,7 @@ use psy_provider::{
     request::QDeployContractRPCRequest,
 };
 
-use super::{args::DeployContractArgs, contract_abi_upload};
+use super::{args::DeployContractArgs, contract_abi_upload, resolve_deployer_user_id};
 use crate::result::{CommandResult, DeployResult, DeployStatus};
 
 // #[cfg(feature = "is_sync")]
@@ -27,9 +27,9 @@ pub async fn run(args: DeployContractArgs) -> anyhow::Result<CommandResult> {
 
     // Load the deployer key the same way the other wallet commands do: from a
     // keystore (`--keystore-path` + `--wallet-password`) or an explicit
-    // `--private-key`. `public_key_hash` is the deployer identity.
+    // `--private-key`. The deployer identity is the registered user id.
     let info = load_wallet_key_info(&args.wallet, false)?;
-    let deployer = info.public_key_hash;
+    let deployer = resolve_deployer_user_id(&rpc_provider, info.public_key_hash, args.user_id).await?;
 
     let artifact: CompilationArtifact = serde_json::from_str(&fs::read_to_string(&args.contract_path)?)?;
 

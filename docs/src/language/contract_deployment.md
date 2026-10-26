@@ -58,17 +58,21 @@ The Contract Function Tree root is then stored as part of a **Contract Leaf** in
 
 ```rust
 pub struct PsyContractLeaf<F: RichField> {
-    pub deployer: QHashOut<F>,
+    pub deployer: F,
     pub function_tree_root: QHashOut<F>,
+    pub code_root: QHashOut<F>,
     pub state_tree_height: F,
+    pub state_layout_root: QHashOut<F>,
+    pub state_layout_field_count: F,
+    pub state_layout_slot_count: F,
 }
 ```
 
 #### Field Explanations
 
-##### `deployer: QHashOut<F>`
+##### `deployer: F`
 - **Purpose**: Identifies who deployed this contract
-- **Content**: The deployer's public key
+- **Content**: The deployer's on-chain user id
 - **Usage**: 
   - Access control and permissions
   - Contract ownership verification
@@ -95,11 +99,11 @@ pub struct PsyContractLeaf<F: RichField> {
 ```
 Global Contract Tree
 ├── Contract 0
-│   ├── deployer: QHashOut<F>
+│   ├── deployer: F (user id)
 │   ├── function_tree_root: QHashOut<F>  ──┐
 │   └── state_tree_height: F              │
 ├── Contract 1                            │
-│   ├── deployer: QHashOut<F>             │
+│   ├── deployer: F (user id)             │
 │   ├── function_tree_root: QHashOut<F>   │
 │   └── state_tree_height: F              │
 └── ...                                   │
@@ -143,7 +147,7 @@ contract Token {
 **Compiled Storage Structure:**
 ```
 Contract Leaf:
-├── deployer: deployer_public_key
+├── deployer: deployer_user_id
 ├── function_tree_root: merkle_root([
 │   │   mint_signature,
 │   │   mint_verifier_hash,

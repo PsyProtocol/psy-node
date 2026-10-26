@@ -71,7 +71,7 @@ pub struct StateTypeLayoutWitnessGadget {
 
 #[derive(Debug, Clone)]
 pub struct QEDContractLeafV2Gadget {
-    pub deployer: HashOutTarget,
+    pub deployer: Target,
     pub function_tree_root: HashOutTarget,
     pub code_root: HashOutTarget,
     pub state_tree_height: Target,
@@ -349,7 +349,7 @@ impl QEDContractLeafV2Gadget {
         builder: &mut CircuitBuilder<F, D>,
     ) -> Self {
         Self {
-            deployer: builder.add_virtual_hash(),
+            deployer: builder.add_virtual_target(),
             function_tree_root: builder.add_virtual_hash(),
             code_root: builder.add_virtual_hash(),
             state_tree_height: builder.add_virtual_target(),
@@ -370,10 +370,7 @@ impl QEDContractLeafV2Gadget {
         let domain = builder.constant_u64(CONTRACT_LEAF_DOMAIN);
         builder.hash_n_to_hash_no_pad::<H>(vec![
             domain,
-            self.deployer.elements[0],
-            self.deployer.elements[1],
-            self.deployer.elements[2],
-            self.deployer.elements[3],
+            self.deployer,
             self.function_tree_root.elements[0],
             self.function_tree_root.elements[1],
             self.function_tree_root.elements[2],
@@ -397,7 +394,7 @@ impl QEDContractLeafV2Gadget {
         witness: &mut impl Witness<F>,
         value: &PQEDContractLeafV2<F, QHashOut<F>>,
     ) -> anyhow::Result<()> {
-        witness.set_hash_target(self.deployer, value.deployer.0)?;
+        witness.set_target(self.deployer, value.deployer)?;
         witness.set_hash_target(
             self.function_tree_root,
             value.function_tree_root.0,
@@ -1131,7 +1128,7 @@ impl StateLayoutAppendGadget {
         );
 
         // Existing update invariants remain immutable across V2 updates.
-        builder.connect_hashes(old_leaf.deployer, new_leaf.deployer);
+        builder.connect(old_leaf.deployer, new_leaf.deployer);
         builder.connect(
             old_leaf.state_tree_height,
             new_leaf.state_tree_height,
@@ -1740,7 +1737,7 @@ mod tests {
         );
         let data = builder.build::<C>();
 
-        let deployer = QHashOut::rand();
+        let deployer = PF::from_u64_value(4242);
         let old_leaf = PQEDContractLeafV2 {
             deployer,
             function_tree_root: QHashOut::rand(),

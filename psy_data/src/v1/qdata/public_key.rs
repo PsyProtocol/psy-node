@@ -139,3 +139,79 @@ psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
     {Hash: Q256BitHash} => {Hash},
     64
 );
+
+#[cfg(test)]
+mod tests {
+    use parth_core::{
+        crypto::hash::traits::{FieldQHasher, FromU64x4, MerkleHasher, QFieldHashable, ZeroableHash},
+        data::queue::queue_key::PCoreQueueItemBase,
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::Q256BitHash,
+        PHash,
+    };
+    use psy_serialize::FastFixedSerializable;
+
+    use super::PZKPublicKeyInfo;
+
+    type TargetType = PZKPublicKeyInfo<PHash>;
+
+    fn sample() -> TargetType {
+        PZKPublicKeyInfo {
+            fingerprint: PHash::from_u64x4([1, 2, 3, 4]),
+            public_key_param: PHash::from_u64x4([5, 6, 7, 8]),
+        }
+    }
+
+    #[test]
+    fn to_hash_and_qfhash_match_direct_hasher_calls() {
+        let info = sample();
+        assert_eq!(info.to_hash::<PoseidonHasher>(), PoseidonHasher::two_to_one(&info.fingerprint, &info.public_key_param));
+        assert_eq!(info.qfhash::<PoseidonHasher>(), PoseidonHasher::q_two_to_one(info.fingerprint, info.public_key_param));
+        assert_ne!(info.to_hash::<PoseidonHasher>(), PHash::get_zero_value());
+    }
+
+    #[test]
+    fn ffs_round_trip_preserves_both_halves() {
+        let info = sample();
+        let bytes = info.ffs_to_bytes();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(TargetType::ffs_from_owned_bytes(info.ffs_into_bytes()), info);
+        assert_eq!(TargetType::ffs_from_slice_or_panic(&bytes), info);
+        let restored = TargetType::ffs_try_from_slice(&bytes).unwrap();
+        assert_eq!(restored, info);
+        // each hash occupies one half of the fixed byte layout
+        assert_eq!(bytes[0..32].to_vec(), info.fingerprint.into_owned_32bytes().to_vec());
+        assert_eq!(bytes[32..64].to_vec(), info.public_key_param.into_owned_32bytes().to_vec());
+    }
+
+    #[test]
+    fn ffs_try_from_slice_rejects_wrong_lengths() {
+        assert!(TargetType::ffs_try_from_slice(&[0u8; 63]).is_err());
+        assert!(TargetType::ffs_try_from_slice(&[0u8; 65]).is_err());
+        assert!(TargetType::ffs_try_from_slice(&[]).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid data length for PZKPublicKeyInfo")]
+    fn ffs_from_slice_or_panic_panics_on_wrong_length() {
+        let _ = TargetType::ffs_from_slice_or_panic(&[0u8; 63]);
+    }
+
+    #[test]
+    fn queue_item_helpers_round_trip_and_validate_length() {
+        let info = sample();
+        let bytes = info.encode_queue_item_vec().unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert!(TargetType::is_queue_item(&bytes));
+        assert!(!TargetType::is_queue_item(&bytes[..63]));
+        assert!(!TargetType::is_queue_item(&[]));
+
+        let decoded = TargetType::decode_queue_item_ref(&bytes).unwrap();
+        assert_eq!(decoded, info);
+        assert!(TargetType::decode_queue_item_ref(&bytes[..63]).is_err());
+
+        assert_eq!(info.get_restorable_job_id(), bytes);
+        assert_eq!(TargetType::get_size_hint(), 64);
+        assert!(TargetType::has_fixed_size());
+    }
+}
