@@ -21,6 +21,7 @@ import sys
 
 
 SOURCE_BASE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
+RUNTIME_COMMIT = "dcc1146514ef3eca2336640f6d95e5a1c04feff9"
 MAX_PUBLIC_INPUT_BYTES = 64 * 1024 * 1024
 MAX_GENESIS_INPUT_BYTES = 1024 * 1024 * 1024
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
@@ -102,16 +103,13 @@ def private_ip(value):
 
 
 def validate_topology(topology):
-    fields(topology, ("schema_version", "release_id", "runtime_commit",
-                      "runtime_source_base", "runtime_patch_sha256", "psy_network",
+    fields(topology, ("schema_version", "release_id", "runtime_commit", "psy_network",
                       "network", "proving_backend", "hosts", "infrastructure",
                       "coordinator", "realms", "faucet_operator_count"), "topology")
     integer(topology["faucet_operator_count"], 100, 100, "faucet operator count")
     integer(topology["schema_version"], 1, 1, "topology version")
-    require(topology["runtime_source_base"] == SOURCE_BASE, "unexpected runtime source base")
-    public_hex(topology["runtime_patch_sha256"], 32, "runtime patch SHA-256")
-    require(topology["runtime_commit"] is None,
-            "unpublished runtime candidate must have null runtime_commit")
+    require(topology["runtime_commit"] == RUNTIME_COMMIT,
+            "runtime commit must match pinned published source")
     require(topology["psy_network"] == "testnet" and topology["network"] == "psy-public-testnet",
             "runtime requires PSY_NETWORK=testnet with --network psy-public-testnet")
     require(topology["proving_backend"] == "plonky2-poseidon-goldilocks", "unexpected backend")
@@ -212,7 +210,7 @@ def assemble_config(canonical, p2p, commitments, topology, whitelist):
     source = p2p.get("networks", {}).get(source_name)
     validate_consensus(source)
     source_realms = ordered_realms(source)
-    # Existing custody provenance does not change when runtime source is patched.
+    # Existing custody provenance does not change when the runtime commit advances.
     require(commitments.get("node_source") == SOURCE_BASE, "Guardian commitments source must be de539")
     hashes = commitments.get("guardian_initial_member_hashes")
     require(isinstance(hashes, list) and len(hashes) == 3, "three Guardian commitments required")

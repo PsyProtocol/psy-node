@@ -77,14 +77,15 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(len(report["services"]), 16)
         self.assertEqual(len(report["blockers"]), 2)
 
-    def test_matching_inputs_do_not_approve_unpublished_runtime_candidate(self):
+    def test_matching_inputs_do_not_approve_published_runtime_installation(self):
         report = self.report()
         self.assertTrue(report["input_consistency_passed"])
         self.assertEqual(report["blockers"], [plan.RUNTIME_BLOCKER])
-        self.assertIn("not published", report["blockers"][0])
-        self.assertIsNone(report["runtime_commit"])
-        self.assertEqual(report["runtime_source_base"], plan.RUNTIME_SOURCE_BASE)
-        self.assertEqual(report["runtime_patch_sha256"], plan.RUNTIME_PATCH_SHA256)
+        self.assertIn("not installation approval", report["blockers"][0])
+        self.assertEqual(report["runtime_commit"], "dcc1146514ef3eca2336640f6d95e5a1c04feff9")
+        self.assertNotIn("runtime_source_base", report)
+        self.assertNotIn("runtime_patch_sha256", report)
+        self.assertTrue(report["pending_checks"])
         self.assertFalse(report["deployment_ready"])
         self.assertFalse(report["release_approved"])
         self.assertTrue(all(not service["deployment_ready"] for service in report["services"]))
@@ -235,11 +236,7 @@ class PlanTests(unittest.TestCase):
                     self.report()
 
     def test_frozen_revision_network_backend_rejected_on_change(self):
-        for field, value in (("runtime_commit", "0" * 40),
-                             ("runtime_commit", plan.RUNTIME_SOURCE_BASE),
-                             ("runtime_source_base", "0" * 40),
-                             ("runtime_patch_sha256", "0" * 64),
-                             ("psy_network", "localhost"), ("network", "local-devnet"),
+        for field, value in (("psy_network", "localhost"), ("network", "local-devnet"),
                              ("proving_backend", "jtmb-poseidon-goldilocks")):
             with self.subTest(field=field):
                 candidate = copy.deepcopy(self.t)
@@ -247,11 +244,25 @@ class PlanTests(unittest.TestCase):
                 with self.assertRaises(plan.PlanError):
                     plan.make_plan(candidate)
 
-    def test_runtime_provenance_fields_are_required(self):
-        for field in ("runtime_commit", "runtime_source_base", "runtime_patch_sha256"):
+    def test_runtime_commit_must_match_published_pin(self):
+        for value in (None, "", True, 123, [], {}, "0" * 40,
+                      "de539f565ec1a92f91bb4e9686e1442e89ba8639", "cd" * 20,
+                      "dcc11465", "dcc1146514ef3eca2336640f6d95e5a1c04feff9\n"):
+            with self.subTest(value=value):
+                self.t["runtime_commit"] = value
+                self.reject("runtime commit must match pinned published source")
+
+    def test_runtime_commit_is_required(self):
+        del self.t["runtime_commit"]
+        self.reject("missing fields")
+
+    def test_runtime_base_and_patch_fields_are_rejected(self):
+        for field, value in (("runtime_source_base", "de539f565ec1a92f91bb4e9686e1442e89ba8639"),
+                             ("runtime_patch_sha256", "d5d62decefd283fa9f9981b915595d3ebf1a1245d3319d050dbf308c5cbc32fa"),
+                             ("patch_sha256", "ab" * 32)):
             with self.subTest(field=field):
                 candidate = copy.deepcopy(self.t)
-                del candidate[field]
+                candidate[field] = value
                 with self.assertRaisesRegex(plan.PlanError, "missing fields"):
                     plan.make_plan(candidate)
 
@@ -344,6 +355,9 @@ class PlanTests(unittest.TestCase):
                 self.assertEqual(plan.main(paths), 2)
             report = json.loads(output.getvalue())
             self.assertFalse(report["deployment_ready"])
+            self.assertFalse(report["release_approved"])
+            self.assertTrue(report["input_consistency_passed"])
+            self.assertEqual(report["runtime_commit"], "dcc1146514ef3eca2336640f6d95e5a1c04feff9")
             self.assertEqual(set(report["input_sha256"]), {"topology", "config", "genesis", "whitelist"})
             self.assertEqual(before, {p.name: p.read_bytes() for p in Path(directory).iterdir()})
 

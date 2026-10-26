@@ -10,8 +10,7 @@ from urllib.parse import urlsplit
 
 
 HERE = Path(__file__).resolve().parent
-RUNTIME_SOURCE_BASE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
-RUNTIME_PATCH_SHA256 = "d5d62decefd283fa9f9981b915595d3ebf1a1245d3319d050dbf308c5cbc32fa"
+RUNTIME_COMMIT = "dcc1146514ef3eca2336640f6d95e5a1c04feff9"
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
          ((1, 1048576), (3, 1572864), (5, 1310720)))
 PROCESSORS = ("gcp-realm-processor", "realm-processors-b", "realm-processors-c")
@@ -22,9 +21,9 @@ HOSTS = {"gcp-cp-ce": "10.148.0.25", "gcp-realm-processor": "10.148.0.37",
 CONSENSUS = {"magic": "0x1337CF514544CF69", "users_per_realm": 1048576,
              "global_user_tree_height": 32, "realm_user_tree_height": 20,
              "group_realm_height": 1, "p2p": {"checkpoints_per_epoch": 10}}
-RUNTIME_BLOCKER = ("Patched testnet runtime candidate is not published; runtime_commit is null. "
-                   "runtime_source_base is only the de539 baseline, not a deployable candidate. "
-                   "The patch SHA256 identifies source changes, not an approved release.")
+RUNTIME_BLOCKER = ("Pinned published runtime source is not installation approval. "
+                   "Binary/circuit provenance, Genesis authentication and runtime acceptance "
+                   "remain required; offline input consistency does not approve a release.")
 PENDING = ["Binary checksums/build provenance and compiled circuit fingerprints",
            "Local Ed25519/BLS/ZK key possession and Genesis account authentication",
            "Cryptographic BLS/Ed25519/secp256k1 point validation by the pinned runtime",
@@ -80,15 +79,13 @@ def validators(topology):
 
 
 def validate_topology(t):
-    fields(t, ("schema_version", "release_id", "runtime_commit", "runtime_source_base",
-               "runtime_patch_sha256", "psy_network",
+    fields(t, ("schema_version", "release_id", "runtime_commit", "psy_network",
                "network", "proving_backend", "hosts", "infrastructure", "coordinator",
                "realms", "faucet_operator_count"), "topology")
     number(t["faucet_operator_count"], 100, 100, "faucet operator count")
     require(type(t["schema_version"]) is int and t["schema_version"] == 1, "unsupported schema")
-    require(t["runtime_commit"] is None, "unpublished runtime candidate must have null runtime_commit")
-    require(t["runtime_source_base"] == RUNTIME_SOURCE_BASE, "runtime source base must remain de539")
-    require(t["runtime_patch_sha256"] == RUNTIME_PATCH_SHA256, "runtime patch SHA256 mismatch")
+    require(t["runtime_commit"] == RUNTIME_COMMIT,
+            "runtime commit must match pinned published source")
     require(t["release_id"] == "core-testnet-20261026", "unexpected release ID")
     require(t["psy_network"] == "testnet" and t["network"] == "psy-public-testnet",
             "network selection must be testnet / psy-public-testnet")
@@ -338,8 +335,6 @@ def make_plan(topology, config=None, genesis=None, whitelist=None):
                 "required_generator_account_args": genesis_args,
                 "operator_inventory_verified": False,
                 "pending": "Verify 100 unique operator identities against Genesis and securely retain keys before Faucet startup"},
-            "runtime_source_base": topology["runtime_source_base"],
-            "runtime_patch_sha256": topology["runtime_patch_sha256"],
             "network_selection": {"build_stage": topology["psy_network"],
                                   "runtime_stage": topology["psy_network"],
                                   "cli_network": topology["network"],

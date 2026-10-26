@@ -126,27 +126,32 @@ class AssemblyTests(unittest.TestCase):
         self.assertNotIn("localhost", result["networks"])
         self.assertEqual(len(result["networks"]["testnet"]["realm_configs"][0]["validators"]), 3)
 
-    def test_runtime_patch_provenance_is_separate_from_retained_guardian_identity(self):
+    def test_runtime_commit_is_separate_from_retained_guardian_identity(self):
         before = copy.deepcopy(self.commitments)
         first = self.assemble()
-        self.assertIsNone(self.topology["runtime_commit"])
-        self.assertEqual(self.topology["runtime_source_base"], prepare.SOURCE_BASE)
-        self.assertEqual(len(self.topology["runtime_patch_sha256"]), 64)
+        self.assertEqual(self.topology["runtime_commit"], "dcc1146514ef3eca2336640f6d95e5a1c04feff9")
+        self.assertNotIn("runtime_source_base", self.topology)
+        self.assertNotIn("runtime_patch_sha256", self.topology)
         self.assertEqual(self.assemble(), first)
         self.assertEqual(self.commitments, before)
         self.assertEqual(self.commitments["node_source"], prepare.SOURCE_BASE)
-        for field, value in (("runtime_commit", prepare.SOURCE_BASE),
-                             ("runtime_commit", "cd" * 20),
-                             ("runtime_commit", "invalid"),
-                             ("runtime_source_base", "cd" * 20),
-                             ("runtime_patch_sha256", None), ("runtime_patch_sha256", "00" * 32),
-                             ("runtime_patch_sha256", "invalid")):
-            with self.subTest(field=field, value=value):
-                saved = self.topology[field]
-                self.topology[field] = value
-                with self.assertRaises(prepare.PrepareError):
+        self.assertEqual(self.commitments["node_source"], "de539f565ec1a92f91bb4e9686e1442e89ba8639")
+        self.commitments["node_source"] = self.topology["runtime_commit"]
+        with self.assertRaisesRegex(prepare.PrepareError, "Guardian commitments source"):
+            self.assemble()
+
+    def test_runtime_commit_must_match_published_pin(self):
+        for value in (None, "", True, 123, [], {}, "0" * 40, prepare.SOURCE_BASE,
+                      "cd" * 20, "dcc11465", "dcc1146514ef3eca2336640f6d95e5a1c04feff9\n"):
+            with self.subTest(value=value):
+                self.topology["runtime_commit"] = value
+                with self.assertRaisesRegex(prepare.PrepareError, "runtime commit must match pinned published source"):
                     self.assemble()
-                self.topology[field] = saved
+
+    def test_runtime_commit_is_required(self):
+        del self.topology["runtime_commit"]
+        with self.assertRaisesRegex(prepare.PrepareError, "topology: unexpected or missing fields"):
+            self.assemble()
 
     def test_whitelist_must_be_enabled_nonempty_and_testnet_only(self):
         invalid = [
@@ -163,10 +168,15 @@ class AssemblyTests(unittest.TestCase):
             with self.subTest(document=document), self.assertRaises(prepare.PrepareError):
                 prepare.validate_whitelist(document)
 
-    def test_topology_rejects_legacy_patch_field(self):
-        self.topology["patch_sha256"] = self.topology.pop("runtime_patch_sha256")
-        with self.assertRaisesRegex(prepare.PrepareError, "topology: unexpected or missing fields"):
-            self.assemble()
+    def test_topology_rejects_runtime_base_and_patch_fields(self):
+        for field, value in (("runtime_source_base", prepare.SOURCE_BASE),
+                             ("runtime_patch_sha256", "d5d62decefd283fa9f9981b915595d3ebf1a1245d3319d050dbf308c5cbc32fa"),
+                             ("patch_sha256", "ab" * 32)):
+            with self.subTest(field=field):
+                self.topology[field] = value
+                with self.assertRaisesRegex(prepare.PrepareError, "topology: unexpected or missing fields"):
+                    self.assemble()
+                del self.topology[field]
 
     def test_whitelist_rejects_bad_encodings_points_and_duplicate_keys(self):
         prime = (1 << 256) - (1 << 32) - 977

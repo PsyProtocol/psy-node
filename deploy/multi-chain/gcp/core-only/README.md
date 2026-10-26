@@ -1,17 +1,22 @@
-# Core-only offline deployment plan
+# Core-only deployment
 
-Status: preparation, not an installer or release approval. This directory owns
-the core network assembler, planner, topology and public worker policy. No old deployment
-script, Caddy configuration, live service, key, Genesis, or database is changed.
-Applicability: local tooling only; no generated artifacts or downstream pins.
+The assembler and planner remain offline tools, not release approval. The separate
+host package builder and installer below prepare and install an authorized fresh
+core release. Installation never starts services or clears databases. No old
+deployment, Caddy configuration, Guardian custody, or P2P identity is replaced.
 
 ## Frozen inputs
 
 - Tooling base: `deploy/staging` `6246dc871eebc3f8e80d4994360b45fc36a73040`.
-- Node source base: `de539f565ec1a92f91bb4e9686e1442e89ba8639` plus the staged
-  testnet runtime patch recorded in `topology.json`. `runtime_commit=null`
-  explicitly means the candidate has not been committed/published yet; the base
-  alone is NOT the new runtime. Final binary/source provenance remains pending.
+- Deployment tooling HEAD before this update: `286500236d3a13d25a0cc3db6032843da71f0459`.
+- Published node runtime commit: `dcc1146514ef3eca2336640f6d95e5a1c04feff9`, pinned
+  by `runtime_commit` in `topology.json` and both validators. Null, missing,
+  abbreviated or different commits are rejected. The superseded
+  `runtime_source_base` and `runtime_patch_sha256` fields are no longer accepted
+  or emitted. Source publication does not approve binaries or installation.
+- Retained Guardian commitments still require key-generation `node_source`
+  `de539f565ec1a92f91bb4e9686e1442e89ba8639`. This is custody provenance, not the
+  runtime pin; do not relabel it or regenerate identities for this update.
 - Requested environment: `PSY_NETWORK=testnet`.
 - CLI: `--network psy-public-testnet --proving-backend plonky2-poseidon-goldilocks`.
 - Two Realms, three ordered validators each, one distinct Edge per validator.
@@ -86,9 +91,11 @@ explicitly when their new-cohort launchers are prepared.
 This planner always reports `deployment_ready=false`, `release_approved=false`
 and exits 2. With supplied, matching inputs it can report
 `input_consistency_passed=true`; that is only an offline consistency result.
-There is no bypass flag. Unpublished runtime provenance, three-validator circuit
-cache acceptance, Genesis authentication and runtime acceptance remain gates;
-consistent parameters do not make those checks pass.
+There is no bypass flag. Binary/build provenance against the published runtime,
+three-validator circuit cache acceptance, Genesis authentication and runtime
+acceptance remain gates; consistent parameters do not make those checks pass.
+Validation is offline: it does not contact a remote to verify publication or
+install the pinned source. Genesis generation is a separate operation.
 
 ## Run locally
 
@@ -101,6 +108,7 @@ python3 -B deploy/multi-chain/gcp/core-only/plan.py \
   --genesis /absolute/path/to/genesis.json \
   --whitelist /absolute/path/to/worker-whitelist.json
 python3 -B -m unittest discover -s deploy/multi-chain/gcp/core-only -p test_plan.py -v
+python3 -B -m unittest discover -s deploy/multi-chain/gcp/core-only -p test_prepare_network.py -v
 ```
 
 Assemble a new public config without generating keys or Genesis:
@@ -168,3 +176,48 @@ provisioning, with `--validators-per-realm 3` and the six ordered user IDs above
 It is not invoked here. Existing fresh-topology/Guardian planners are reference
 models, not imported installers. Worker services, Guardian/Relayer, Services,
 indexers, proof proxies, L1 deployment, Caddy and frontends are outside this plan.
+
+## Host packages and installation
+
+`prepare_host_packages.py` requires the validated public config and new Genesis,
+the pinned release node binary, the retained private P2P inventory, and private
+Genesis/operator outputs. Run `--help` for the explicit path arguments. Its new
+output directory is private and contains one package per topology host. Never
+commit these packages: Processor packages contain only that host's Ed25519,
+BLS and ZK secrets; Edge packages contain only that host's Edge identities.
+The complete private registration/operator inventories are not distributed.
+
+The builder checks binary/config hashes, 107 registration slots and 100 distinct
+Faucet operator mappings. It renders systemd units with the existing planner's
+argv, private DB endpoints, bounded restart retries and a writable checkpoint
+directory. Generated configuration does not expose a public gateway.
+
+Transfer each package over SSH to its corresponding host, retaining mode 0700
+on the directory and 0600 on private files. Transfer the reviewed installer
+separately, outside the package (the package rejects unlisted files):
+
+```sh
+sudo python3 install_host.py --package /absolute/private/host-package --check-only
+sudo python3 install_host.py --package /absolute/private/host-package
+```
+
+The installer checks the package manifest, private host address, unit/key scope,
+existing destination conflicts and that core units are stopped. It creates the
+dedicated `psy-core` account, installs immutable artifacts and unit files, then
+runs `systemctl daemon-reload`. It never enables/starts units, initializes a DB,
+downloads dependencies, generates keys, or changes `parth-*` services. Exact
+retry is supported; conflicting bytes, modes or ownership stop installation.
+
+After all host packages are verified and installed, start Coordinator Processor,
+then its three Edges; wait for authenticated Genesis/checkpoint reads before
+starting Realm Processors and their Edges. Start matching Workers only against
+these fresh endpoints. Confirm real proof pickup/submission and increasing
+checkpoints before enabling the new units for reboot. Verify all three validator
+positions connect and synchronize; P2P rotation/transaction acceptance is a
+separate result, not implied by active systemd units.
+
+Wallet/SDK artifact work is deferred by the operator for this core rollout.
+Keep wallet, Faucet, Services/indexers and Bridge exposure disabled until their
+matching artifacts are ready. The subsequent L1/Bridge rollout is a **fresh
+deployment**: old contract addresses and old Groth16 setup are not inputs to it.
+Guardian signing keys remain reusable and are not regenerated for that rollout.

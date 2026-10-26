@@ -1,9 +1,7 @@
 {
   "schema_version": 1,
   "release_id": "core-testnet-20261026",
-  "runtime_commit": null,
-  "runtime_source_base": "de539f565ec1a92f91bb4e9686e1442e89ba8639",
-  "runtime_patch_sha256": "d5d62decefd283fa9f9981b915595d3ebf1a1245d3319d050dbf308c5cbc32fa",
+  "runtime_commit": "dcc1146514ef3eca2336640f6d95e5a1c04feff9",
   "psy_network": "testnet",
   "network": "psy-public-testnet",
   "proving_backend": "plonky2-poseidon-goldilocks",
