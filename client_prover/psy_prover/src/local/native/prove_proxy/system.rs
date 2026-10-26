@@ -11,7 +11,7 @@ use plonky2::{
     plonk::{circuit_data::CommonCircuitData, proof::ProofWithPublicInputs},
 };
 use psy_config::network_constants::{DEPOSIT_TREE_CONTRACT_STATE_TREE_HEIGHT, WITHDRAWAL_TREE_CONTRACT_STATE_TREE_HEIGHT};
-use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants};
+use psy_core::{job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants};
 use psy_data::v1::qdata::checkpoint::PQEDCheckpointGlobalStateRoots;
 use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibraryCore;
 use psy_plonky2_circuits::{
@@ -27,6 +27,7 @@ use psy_plonky2_circuits::{
     },
     circuit_library::get_plonky2_circuit_library_and_prover_for_network,
     coordinator::coordinator_helper::QEDCoordinatorCircuitManager,
+    node::config::networks::resolver::get_compiled_plonky2_network,
     proof_minifier::pm_chain::QEDProofMinifierChain,
 };
 use psy_plonky2_common_circuits::bridge::{
@@ -297,7 +298,7 @@ fn cached_bridge_coordinator_circuits() -> anyhow::Result<&'static QEDCoordinato
     CACHE
         .get_or_init(|| {
             tracing::info!("Building QEDCoordinatorCircuitManager for bridge agg...");
-            get_plonky2_circuit_library_and_prover_for_network::<C, D>(PsyChainNetworkType::LocalDevnet).map(|(_, circuits)| circuits)
+            get_plonky2_circuit_library_and_prover_for_network::<C, D>(get_compiled_plonky2_network()?).map(|(_, circuits)| circuits)
         })
         .as_ref()
         .map_err(|e| anyhow::anyhow!("failed to build/retrieve cached bridge circuits: {}", e))
