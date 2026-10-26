@@ -10,6 +10,15 @@ use crate::node::config::networks::local_devnet::{get_genesis_block_setup_data_f
 type F = parth_core::PF;
 type Hash = QHashOut<F>;
 
+/// Network names, not magic values, distinguish localhost from public testnet.
+pub fn get_compiled_plonky2_network() -> anyhow::Result<PsyChainNetworkType> {
+    match psy_config::CURRENT_NETWORK {
+        "localhost" => Ok(PsyChainNetworkType::LocalDevnet),
+        "testnet" => Ok(PsyChainNetworkType::PsyPublicTestnet),
+        name => anyhow::bail!("Unsupported compiled Plonky2 network: {name}"),
+    }
+}
+
 /// The cached circuits use the existing shared tree layout, not the unused
 /// historical public-testnet constants. Selecting a network must not change it.
 pub fn ensure_plonky2_network(network: PsyChainNetworkType) -> anyhow::Result<()> {
@@ -77,6 +86,19 @@ impl PsyGenesisBlockSetupDataProvider<F, Hash> for PsyPlonky2NodeConfigResolver 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_plonky2_network_uses_stage_not_shared_magic() -> anyhow::Result<()> {
+        if !matches!(psy_config::CURRENT_NETWORK, "localhost" | "testnet") {
+            assert!(get_compiled_plonky2_network().is_err());
+            return Ok(());
+        }
+        let network = get_compiled_plonky2_network()?;
+        assert_eq!(network.config_key()?, psy_config::CURRENT_NETWORK);
+        assert_eq!(network.get_chain_id(), psy_config::PSY_NETWORK_MAGIC);
+        ensure_plonky2_network(network)?;
+        Ok(())
+    }
 
     #[test]
     fn plonky2_network_requires_the_compiled_stage() {

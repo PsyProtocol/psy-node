@@ -12,7 +12,7 @@ use plonky2::{
     plonk::{circuit_data::CommonCircuitData, config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs},
 };
 use psy_client_data::traits::qdatastore::{qmetadata::QMetaDataStoreReaderSync, qtreedata::QTreeDataStoreReaderSync};
-use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants};
+use psy_core::{job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants};
 use psy_data::{
     v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeafCompact},
 };
@@ -31,6 +31,7 @@ use psy_plonky2_circuits::{
     },
     circuit_library::get_plonky2_circuit_library_and_prover_for_network,
     coordinator::coordinator_helper::QEDCoordinatorCircuitManager,
+    node::config::networks::resolver::get_compiled_plonky2_network,
     proof_minifier::pm_chain::QEDProofMinifierChain,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
     qstandard::QStandardCircuit,
@@ -64,7 +65,6 @@ type ClientQHashOut = psy_client_common::data::qhashout::QHashOut<F>;
 
 const CHECKPOINT_TREE_HEIGHT: usize = 32;
 const DEPOSIT_BATCH_TREE_HEIGHT: usize = 32;
-const NETWORK_TYPE: PsyChainNetworkType = PsyChainNetworkType::LocalDevnet;
 const GLOBAL_USER_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE;
 const GLOBAL_CONTRACT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
 const DEPOSIT_CONTRACT_STATE_TREE_HEIGHT: usize =
@@ -86,7 +86,7 @@ pub(crate) fn cached_bridge_coordinator_circuits() -> anyhow::Result<&'static QE
         return Ok(cached);
     }
     eprintln!("Building QEDCoordinatorCircuitManager via get_plonky2_circuit_library_and_prover_for_network...");
-    let (_, circuits) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(NETWORK_TYPE)
+    let (_, circuits) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(get_compiled_plonky2_network()?)
         .map_err(|e| anyhow::anyhow!("failed to build bridge coordinator circuits: {}", e))?;
     let _ = CACHE.set(circuits);
     CACHE.get().ok_or_else(|| anyhow::anyhow!("bridge coordinator circuit cache is unexpectedly empty"))
