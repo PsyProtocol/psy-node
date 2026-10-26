@@ -26,6 +26,56 @@ deployment, Caddy configuration, Guardian custody, or P2P identity is replaced.
 - P2P processor ports 41001..41003 and 41021..41023; Edge ports 41101..41103
   and 41121..41123. These are planned ports, not remotely verified free ports.
 
+### Temporary Realm 1 placement (2026-10-26)
+
+The baseline `topology.json` above remains the target after memory expansion.
+The operator authorized a temporary placement: Realm 0 positions 1/2/3 stay on
+their original hosts, while all three Realm 1 Processors run on the Coordinator
+host. This is a functional test layout, not host-fault-tolerant Realm 1 capacity.
+The Coordinator host was measured at 8 CPUs and approximately 30 GiB usable RAM,
+with 21 GiB available before adding Realm 1. Individual Realm Processors consumed
+approximately 4 GiB after startup; two do not fit safely on the original 8 GB VMs.
+
+`place_realm1_on_coordinator.py` prepares a small private package from the retained
+original packages. Only Realm 1 `processor_addresses` change to the Coordinator's
+private IP; identities, ports, namespaces, Genesis and consensus parameters do not
+change. The three new Processor units and the three Realm 1 Edge drop-ins select
+`realm1-cp-ce-config.json`. Other processes retain the original config. The three
+temporary Processors share `psy-realm1.slice` with `MemoryHigh=16G` and
+`MemoryMax=18G`; this bounds their aggregate memory, but does not guarantee
+availability if that limit is reached. Start them sequentially and inspect logs,
+memory, P2P connections and checkpoint synchronization before each next start.
+
+```sh
+python3 -B deploy/multi-chain/gcp/core-only/place_realm1_on_coordinator.py prepare \
+  --packages /absolute/private/original-host-packages \
+  --output /absolute/private/new-placement-packages
+```
+
+Copy only each host's package to that host, with the script and its imported
+`install_host.py`, `prepare_host_packages.py`, `plan.py` modules alongside it.
+Run `apply --package PATH --check-only`, then `apply --package PATH` as root.
+Neither command starts services. Keep the original Realm 1 units stopped and
+disabled. During this rollout each old unit also has a
+`90-temporary-placement-hold.conf` drop-in with a `ConditionPathExists` pointing
+to the absent `/var/lib/psy-core/core-testnet-20261026/realm1-return-authorized`.
+Do not create that file or remove the guard while its replacement is running.
+Before copying state, verify no old Realm 1 instance is active; the first temporary
+placement checked that no old `realm_1_N` checkpoint directory existed.
+
+Return after expansion is a state-preserving migration, not a second fresh start:
+quiesce Realm 1 admission, wait for pending work to drain, stop all three temporary
+Processors, then transfer each validator's complete `realm_1_N` checkpoint and
+proposal-backup directory to its original host with ownership preserved. Keep the
+same remote database namespaces and keys. Stop the Realm 1 Edges while restoring
+their original routing configuration. The script's `rollback --package PATH`
+removes only matching temporary config, units, drop-ins and slice files; it keeps
+keys and state and neither starts nor stops services. It is not a state-transfer
+command. Remove only the exact old-host hold drop-ins after replacement processes
+are confirmed stopped and state transfer is verified. Reload systemd and resume
+the original instances, then verify all three peer connections and checkpoints
+before reopening admission. Never run both copies of one validator identity.
+
 | Realm | Position | Registration | User ID |
 | --- | --- | --- | --- |
 | 0 | 1 | 0 | 0 |
