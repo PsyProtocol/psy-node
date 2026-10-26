@@ -48,7 +48,7 @@ SOURCE_COMMIT = "5d38eefc07b0925ed9875b74805d9c3fea73d998"
 PINNED_SHA256 = {
     "bin/psy_node_cli": "9b7a792da5c8cb45ec1c2db022ac52ce405e5cd05d154a1c7ac7c4941faaf9cb",
     "config.json": "c8ee7c97e1158cd09e8fee5167f80f838f6048084028f3f9e80e239aac24e8d0",
-    "genesis.json": None,
+    "genesis.json": "a5465bd712ceb66585660fddb4ac233afb747938395adaa200a63ead2f25f2c8",
 }
 RELEASE_ID = "core-testnet-20261026-r2"
 RELEASE = Path("/opt/psy-core/releases") / RELEASE_ID

@@ -45,13 +45,13 @@ class RestartReleaseTests(unittest.TestCase):
         self.assertEqual(proxies.unit_name("user"), "psy-core-prove-proxy-r2-user.service")
         self.assertIn("psy-core-prove-proxy-user.service", proxies.OLD_UNITS)
 
-    def test_frozen_build_pins_and_pending_genesis_cannot_reuse_r1(self):
+    def test_frozen_build_and_genesis_pins_cannot_reuse_r1(self):
         self.assertEqual(packages.NODE_SHA256,
                          "9b7a792da5c8cb45ec1c2db022ac52ce405e5cd05d154a1c7ac7c4941faaf9cb")
         self.assertEqual(install.PINNED_SHA256["bin/psy_node_cli"], packages.NODE_SHA256)
-        # Remain closed until the Genesis owner supplies the reviewed candidate.
-        self.assertIsNone(packages.GENESIS_SHA256)
-        self.assertIsNone(install.PINNED_SHA256["genesis.json"])
+        self.assertEqual(packages.GENESIS_SHA256,
+                         "a5465bd712ceb66585660fddb4ac233afb747938395adaa200a63ead2f25f2c8")
+        self.assertEqual(install.PINNED_SHA256["genesis.json"], packages.GENESIS_SHA256)
         self.assertEqual(workers.WORKER_SHA256,
                          "db160bf77e00fecc92907cc9eaf0bba371853d1c6d6c9f8589238853fbd96f45")
         self.assertEqual(workers.TOPOLOGY_SHA256,
