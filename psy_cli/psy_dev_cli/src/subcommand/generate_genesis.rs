@@ -40,7 +40,6 @@ pub use guardians_root::preflight_fresh_devnet_inputs;
 type F = GoldilocksField;
 type Hash = QHashOut<F>;
 
-const DEFAULT_SD_KEY_FINGERPRINT: &str = "9faca812159aeeca40980d2483315265c69249ee4537f1d962457f16f3fe527a";
 const DEFAULT_VALIDATOR_SLOTS: &[&str] = &["0,1,0", "1,1,1", "1,2,3", "0,2,4"];
 
 
@@ -106,7 +105,7 @@ pub struct GenerateGenesisDataArgs {
     pub random_private_keys: bool,
 
     /// Optional assertion against the fingerprint derived from the faucet SDKey policy.
-    #[arg(long = "sd-key-fingerprint", default_value = DEFAULT_SD_KEY_FINGERPRINT)]
+    #[arg(long = "sd-key-fingerprint", default_value = "")]
     pub sd_key_fingerprint: String,
 
     /// Hex Poseidon fingerprint for ZK users. Empty uses the local-devnet circuit constant.
@@ -448,11 +447,11 @@ fn compact_user(
 fn genesis_users(
     args: &GenerateGenesisDataArgs,
     relayer: PsyCompactUserDefinition<Hash>,
+    sd_key_fingerprint: Hash,
     rng: &mut (impl rand::RngCore + rand::CryptoRng),
 ) -> anyhow::Result<(Vec<PsyCompactUserDefinition<Hash>>, Vec<Option<Hash>>)> {
     let validator_slots = parse_validator_slots(&args.validator_slots)?;
     let zk_fingerprint = zk_fingerprint(args)?;
-    let sd_key_fingerprint = parse_qhash(&args.sd_key_fingerprint)?;
     ensure!(args.relayer_registration_id == 2 && args.relayer_user_id == 524_288,
         "public multisig Genesis requires registration 2 and user 524288");
     ensure!(args.coordinator_global_user_tree_height == 12 && args.realm_global_user_tree_height == 20 && args.group_realm_height == 1,
@@ -516,20 +515,7 @@ fn genesis_users(
     Ok((users, private_keys))
 }
 
-fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
-    ensure_private_key_mode(psy_config::CURRENT_NETWORK, args.random_private_keys)?;
-    ensure_faucet_output(args)?;
-    let repo_root = args.repo_root.canonicalize().with_context(|| {
-        format!("repo-root {} does not exist", args.repo_root.display())
-    })?;
-    let network = guardians_root::read_canonical_network(&repo_root)?;
-    let account = guardian_common::protocol::initial_account(&network).map_err(|error| {
-        anyhow::anyhow!("networks.{}.guardian_initial_member_hashes must be the three guardian member commitments: {error}", psy_config::CURRENT_NETWORK)
-    })?;
-    let contracts_path = args.genesis_contracts.clone().unwrap_or_else(|| {
-        repo_root.join("psy-genesis/genesis_contracts.json")
-    });
-    let contracts = load_contracts(&contracts_path)?;
+fn faucet_sd_key_fingerprint(args: &GenerateGenesisDataArgs) -> anyhow::Result<Hash> {
     ensure!(args.sd_key_min_tx_count >= 1 && args.sd_key_max_tx_count <= 64,
         "faucet SDKey transaction count must be within 1..=64");
     let (function, config) = psy_vm::ups::sd_key::build_allow_caller_and_method_policy_range(
@@ -551,9 +537,27 @@ fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Resu
         ensure!(parse_qhash(&args.sd_key_fingerprint)? == sd_key_fingerprint,
             "--sd-key-fingerprint does not match the faucet SDKey policy");
     }
+    Ok(sd_key_fingerprint)
+}
+
+fn generate_local_devnet_genesis(args: &GenerateGenesisDataArgs) -> anyhow::Result<()> {
+    ensure_private_key_mode(psy_config::CURRENT_NETWORK, args.random_private_keys)?;
+    ensure_faucet_output(args)?;
+    let repo_root = args.repo_root.canonicalize().with_context(|| {
+        format!("repo-root {} does not exist", args.repo_root.display())
+    })?;
+    let network = guardians_root::read_canonical_network(&repo_root)?;
+    let account = guardian_common::protocol::initial_account(&network).map_err(|error| {
+        anyhow::anyhow!("networks.{}.guardian_initial_member_hashes must be the three guardian member commitments: {error}", psy_config::CURRENT_NETWORK)
+    })?;
+    let contracts_path = args.genesis_contracts.clone().unwrap_or_else(|| {
+        repo_root.join("psy-genesis/genesis_contracts.json")
+    });
+    let contracts = load_contracts(&contracts_path)?;
+    let sd_key_fingerprint = faucet_sd_key_fingerprint(args)?;
     validate_multisig_policy_artifact(&contracts, &read_compiler_contract(&compiler_checkout(&repo_root)?, "multisig_policy")?)?;
     let relayer = initialized_multisig_user(&account, args.initial_fee_balance)?;
-    let (users, private_keys) = genesis_users(args, relayer, &mut rand::rngs::OsRng)?;
+    let (users, private_keys) = genesis_users(args, relayer, sd_key_fingerprint, &mut rand::rngs::OsRng)?;
     let special_zk_user_count = users.len() - args.faucet_operator_count;
 
     let genesis_data = PsyGenesisBlockSetupData {
@@ -899,10 +903,54 @@ mod tests {
     }
 
     #[test]
+    fn faucet_sd_policy_derived_fingerprint_binds_genesis_and_operator_output() {
+        let args = GenerateGenesisDataArgs::try_parse_from([
+            "generate-genesis-data", "--sd-key-min-tx-count", "2", "--sd-key-max-tx-count", "2",
+            "--faucet-operator-count", "1",
+        ]).unwrap();
+        assert!(args.sd_key_fingerprint.is_empty());
+        let fingerprint = faucet_sd_key_fingerprint(&args).unwrap();
+        assert_ne!(fingerprint, Hash::get_zero_value());
+        let (users, keys) = genesis_users(&args, relayer_fixture(), fingerprint, &mut KeyBytesRng(Default::default())).unwrap();
+        assert_eq!(users[5].public_key_info.fingerprint, fingerprint);
+        let faucet: serde_json::Value = serde_json::from_slice(&faucet_operators_body(&args, &keys, 5, fingerprint).unwrap()).unwrap();
+        let operator = &faucet["operators"][0];
+        assert_eq!(operator["fingerprint"], fingerprint.to_string());
+        assert_eq!(operator["address"], users[5].public_key_info.to_hash::<PoseidonHasher>().to_string());
+        assert_eq!(operator["privateKey"], keys[5].unwrap().to_string());
+        assert_eq!(faucet["sdKeyMinTxCount"], 2);
+        assert_eq!(faucet["sdKeyMaxTxCount"], 2);
+        assert_eq!(faucet["sdKeyAllowedCallerContractIds"], serde_json::json!(args.sd_key_allowed_caller_contract_ids));
+        assert!(faucet.get("sdKeyExpectedTxCount").is_none());
+        let mut asserted = args;
+        asserted.sd_key_fingerprint = fingerprint.to_string();
+        assert_eq!(faucet_sd_key_fingerprint(&asserted).unwrap(), fingerprint);
+        asserted.sd_key_fingerprint = Hash::get_zero_value().to_string();
+        assert!(faucet_sd_key_fingerprint(&asserted).unwrap_err().to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn faucet_sd_policy_rejects_invalid_ranges_and_direct_transfer() {
+        let mut args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
+        assert_eq!((args.sd_key_min_tx_count, args.sd_key_max_tx_count), (1, 64));
+        assert!(args.sd_key_fingerprint.is_empty());
+        for (min, max) in [(0, 64), (1, 65), (3, 2)] {
+            args.sd_key_min_tx_count = min;
+            args.sd_key_max_tx_count = max;
+            assert!(faucet_sd_key_fingerprint(&args).is_err());
+        }
+        args.sd_key_min_tx_count = 1;
+        args.sd_key_max_tx_count = 64;
+        args.sd_key_allowed_caller_contract_ids[1] = psy_config::network_constants::DEFAULT_CALLER_CONTRACT_ID_U64;
+        assert!(faucet_sd_key_fingerprint(&args).unwrap_err().to_string().contains("Transfer must be called by the faucet contract"));
+    }
+
+    #[test]
     fn random_genesis_keys_keep_registration_and_faucet_bindings() {
         let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data", "--random-private-keys"]).unwrap();
+        let sd_key_fingerprint = Hash::from_values(21, 22, 23, 24);
         let mut rng = KeyBytesRng((1..=14).map(|index| [index, 11, 12, 13]).collect());
-        let (users, keys) = genesis_users(&args, relayer_fixture(), &mut rng).unwrap();
+        let (users, keys) = genesis_users(&args, relayer_fixture(), sd_key_fingerprint, &mut rng).unwrap();
         assert_eq!(keys.len(), 15);
         assert_eq!(users.len(), keys.len());
         assert!(keys[2].is_none());
@@ -913,7 +961,7 @@ mod tests {
             assert!(!keys[..registration].contains(&Some(key)));
         }
         let faucet: serde_json::Value = serde_json::from_slice(&faucet_operators_body(
-            &args, &keys, 5, parse_qhash(&args.sd_key_fingerprint).unwrap(),
+            &args, &keys, 5, sd_key_fingerprint,
         ).unwrap()).unwrap();
         let operators = faucet["operators"].as_array().unwrap();
         assert_eq!(operators.len(), 10);
@@ -923,8 +971,8 @@ mod tests {
             assert_eq!(operator["address"], users[index + 5].public_key_info.to_hash::<PoseidonHasher>().to_string());
         }
         let mut duplicate = KeyBytesRng([[1, 2, 3, 4]; 2].into());
-        assert!(genesis_users(&args, relayer_fixture(), &mut duplicate).unwrap_err().to_string().contains("duplicate Genesis private key"));
-        assert!(genesis_users(&args, relayer_fixture(), &mut rng).unwrap_err().to_string().contains("OS entropy unavailable"));
+        assert!(genesis_users(&args, relayer_fixture(), sd_key_fingerprint, &mut duplicate).unwrap_err().to_string().contains("duplicate Genesis private key"));
+        assert!(genesis_users(&args, relayer_fixture(), sd_key_fingerprint, &mut rng).unwrap_err().to_string().contains("OS entropy unavailable"));
     }
 
     #[test]
@@ -1028,7 +1076,7 @@ mod tests {
     #[test]
     fn dense_export_keeps_validator_and_faucet_indices_without_relayer_secret() {
         let args = GenerateGenesisDataArgs::try_parse_from(["generate-genesis-data"]).unwrap();
-        let (users, keys) = genesis_users(&args, relayer_fixture(), &mut KeyBytesRng(Default::default())).unwrap();
+        let (users, keys) = genesis_users(&args, relayer_fixture(), Hash::from_values(21, 22, 23, 24), &mut KeyBytesRng(Default::default())).unwrap();
         assert_eq!(keys.len(), users.len());
         assert_eq!(keys.len(), 15);
         assert!(keys[2].is_none());
