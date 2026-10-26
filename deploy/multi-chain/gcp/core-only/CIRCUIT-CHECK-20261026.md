@@ -2,6 +2,51 @@
 
 Date: 2026-10-26. This records source preparation, not a completed deployment.
 
+## PR28 Supersedes The Prepared Release
+
+The historical artifacts below are NOT the release candidate after PR28.
+Do not start the fresh chain with those binaries or that Genesis.
+
+- Remote `testnet-dev` integrated PR28 `b280d714` through merge `ee281dc2`.
+- `efb42e9e` advances `psy-genesis` to
+  `59462d73c3b46d0211c5223f700e7f7142e0c2ab`, published on its
+  `feat/full-sd-key` branch. Its compiler producer is `3533edac`.
+- Follow-up `c8931002b61d026ed78c9cfb3426cf7094c1584c` binds Genesis Faucet
+  accounts and operator output to the same derived SD policy fingerprint. It
+  also corrects the checkpoint-one anchor test fixture without changing its
+  production handler. Independent review approved those two files. The five
+  Faucet-related unit tests passed in both CLI targets, the Faucet policy
+  integration test passed, and the checkpoint-one regression passed.
+- At `efb42e9e`, core Node/Worker/DevCLI/UserCLI and Node library test targets
+  passed release compilation checks with the intended testnet configuration.
+  This is compilation evidence, not service-start or transaction acceptance.
+- An actual testnet EndCap construction matched the complete checked-in verifier
+  JSON and fingerprint limbs
+  `[7003881527231760035, 6208563064171912847, 8989269122100945112, 8698490262779479146]`.
+  The emitted network magic was `0x1337cf514544cf69`.
+
+The cache-only generator ran twice from `c8931002` with the public testnet
+configuration below. Both resulting file hashes matched; the second run reported
+both files up to date. Only circuit entries 32, 40, 63 and inclusion proofs changed
+relative to that source. The circuit count (25), inclusion-proof mapping and
+EndCap entry were unchanged. Neither run emitted a Groth16 setup marker.
+
+| PR28 three-validator artifact | SHA-256 |
+| --- | --- |
+| Cached circuit library, both runs | `3f9744b90bf5e8a8b6ad6f01585843fa3385f7df9f1a55bc17153cc84eff6917` |
+| Cached common data, unchanged | `0a33b47a5a7235260d759ed2e34c29a33198b4e20794054fe452f17a0c03a8ac` |
+
+Final binaries, regenerated Genesis and runtime acceptance must be recorded
+separately before startup. Retain the
+existing Guardian and P2P signing identities. Do not overwrite private key
+inventory while regenerating public artifacts.
+
+Branch integration does not approve the old Faucet launch scripts: several
+still pass the removed `sd-key` sign type and expected-transaction-count flags.
+The new generator uses caller-aware SD policy and min/max transaction counts.
+Keep those old launchers out of this core-only rollout. Downstream SDK/compiler
+and wallet compatibility is a separate gate before exposing public applications.
+
 ## Source And Inputs
 
 - Functional branch: `testnet-dev`; deployment automation: `deploy/testnet`.
