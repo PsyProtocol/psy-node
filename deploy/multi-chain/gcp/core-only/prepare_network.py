@@ -21,6 +21,8 @@ import sys
 
 
 SOURCE_BASE = "de539f565ec1a92f91bb4e9686e1442e89ba8639"
+MAX_PUBLIC_INPUT_BYTES = 64 * 1024 * 1024
+MAX_GENESIS_INPUT_BYTES = 1024 * 1024 * 1024
 SLOTS = (((0, 0), (4, 262144), (6, 786432)),
          ((1, 1048576), (3, 1572864), (5, 1310720)))
 CONSENSUS = {"magic": "0x1337CF514544CF69", "users_per_realm": 1048576,
@@ -314,16 +316,16 @@ def reject_constant(_):
     raise PrepareError("non-finite JSON value")
 
 
-def read_public_json(path):
+def read_public_json(path, *, max_bytes=MAX_PUBLIC_INPUT_BYTES):
     require(Path(path).suffix == ".json" and Path(path).name != "private_keys.json"
             and "keystore" not in Path(path).name.lower(), "only public JSON inputs are accepted")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as handle:
         info = os.fstat(handle.fileno())
-        require(stat.S_ISREG(info.st_mode) and info.st_size <= 64 * 1024 * 1024,
-                "public input must be a regular JSON file of at most 64 MiB")
-        raw = handle.read(64 * 1024 * 1024 + 1)
-    require(len(raw) <= 64 * 1024 * 1024, "public input exceeds size limit")
+        require(stat.S_ISREG(info.st_mode) and info.st_size <= max_bytes,
+                f"public input must be a regular JSON file of at most {max_bytes // (1024 * 1024)} MiB")
+        raw = handle.read(max_bytes + 1)
+    require(len(raw) <= max_bytes, "public input exceeds size limit")
     value = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
     require(isinstance(value, dict), "public input must be a JSON object")
     return value
@@ -415,7 +417,8 @@ def main(argv=None):
         config = assemble_config(*(read_public_json(path) for path in inputs[:5]))
         documents = [(args.config_out, config)] if args.config_out else []
         if args.genesis_in:
-            documents.append((args.genesis_out, inject_genesis(read_public_json(args.genesis_in), config)))
+            genesis = read_public_json(args.genesis_in, max_bytes=MAX_GENESIS_INPUT_BYTES)
+            documents.append((args.genesis_out, inject_genesis(genesis, config)))
         write_new_outputs(documents)
     except (PrepareError, OSError, ValueError, KeyError, TypeError) as error:
         message = str(error) if isinstance(error, PrepareError) else "invalid input or unavailable output path"

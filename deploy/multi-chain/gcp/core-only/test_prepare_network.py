@@ -5,9 +5,11 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 
 HERE = Path(__file__).resolve().parent
@@ -283,6 +285,66 @@ class AssemblyTests(unittest.TestCase):
                 self.assemble()
 
 
+class PublicInputLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_size=2)
+        self.raw = MagicMock(spec=bytes)
+        self.raw.__len__.return_value = 2
+        self.handle = MagicMock()
+        self.handle.fileno.return_value = 37
+        self.handle.read.return_value = self.raw
+        self.open = self.enterContext(patch.object(prepare.os, "open", return_value=37))
+        self.fdopen = self.enterContext(patch.object(prepare.os, "fdopen"))
+        self.fdopen.return_value.__enter__.return_value = self.handle
+        self.fstat = self.enterContext(patch.object(prepare.os, "fstat", return_value=self.info))
+        self.loads = self.enterContext(patch.object(prepare.json, "loads", return_value={}))
+
+    def test_metadata_bounds_reject_before_reading(self):
+        for options, limit in (({}, 64 * 1024 * 1024),
+                               ({"max_bytes": prepare.MAX_GENESIS_INPUT_BYTES}, 1024 * 1024 * 1024)):
+            with self.subTest(limit=limit):
+                self.info.st_size = limit
+                self.assertEqual(prepare.read_public_json("input.json", **options), {})
+                self.handle.read.assert_called_with(limit + 1)
+                self.handle.read.reset_mock()
+                self.loads.reset_mock()
+                self.info.st_size = limit + 1
+                with self.assertRaisesRegex(prepare.PrepareError, "regular JSON file"):
+                    prepare.read_public_json("input.json", **options)
+                self.handle.read.assert_not_called()
+                self.loads.assert_not_called()
+
+    def test_actual_genesis_size_requires_explicit_genesis_limit(self):
+        self.info.st_size = 718298669
+        with self.assertRaisesRegex(prepare.PrepareError, "64 MiB"):
+            prepare.read_public_json("genesis.base.json")
+        self.handle.read.assert_not_called()
+        self.assertEqual(prepare.read_public_json(
+            "genesis.base.json", max_bytes=prepare.MAX_GENESIS_INPUT_BYTES), {})
+        self.handle.read.assert_called_once_with(1024 * 1024 * 1024 + 1)
+
+    def test_read_bounds_reject_growth_after_metadata_check(self):
+        for options, limit in (({}, 64 * 1024 * 1024),
+                               ({"max_bytes": prepare.MAX_GENESIS_INPUT_BYTES}, 1024 * 1024 * 1024)):
+            with self.subTest(limit=limit):
+                self.raw.__len__.return_value = limit
+                self.assertEqual(prepare.read_public_json("input.json", **options), {})
+                self.loads.reset_mock()
+                self.raw.__len__.return_value = limit + 1
+                with self.assertRaisesRegex(prepare.PrepareError, "exceeds size limit"):
+                    prepare.read_public_json("input.json", **options)
+                self.handle.read.assert_called_with(limit + 1)
+                self.loads.assert_not_called()
+
+    def test_genesis_limit_preserves_same_fd_and_nofollow(self):
+        prepare.read_public_json("genesis.json", max_bytes=prepare.MAX_GENESIS_INPUT_BYTES)
+        self.open.assert_called_once_with("genesis.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        self.fdopen.assert_called_once_with(37, "rb")
+        self.fstat.assert_called_once_with(37)
+        self.handle.read.assert_called_once_with(prepare.MAX_GENESIS_INPUT_BYTES + 1)
+        self.fdopen.return_value.__exit__.assert_called_once()
+
+
 class FilesystemTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="prepare-network-tests-")
@@ -317,6 +379,16 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(config["networks"]["localhost"], self.documents[0]["networks"]["localhost"])
         for path, payload in before.items():
             self.assertEqual(path.read_bytes(), payload)
+
+    def test_only_genesis_in_receives_larger_read_limit(self):
+        with patch.object(prepare, "read_public_json", wraps=prepare.read_public_json) as reader:
+            self.assertEqual(self.run_cli("--genesis-in", self.root / "genesis.json",
+                                         "--genesis-out", self.root / "injected.json"), 0, self.last_error)
+        self.assertEqual(reader.call_args_list, [
+            *[call(self.root / f"{name}.json") for name in
+              ("canonical", "p2p", "commitments", "topology", "whitelist")],
+            call(self.root / "genesis.json", max_bytes=prepare.MAX_GENESIS_INPUT_BYTES),
+        ])
 
     def test_no_overwrite_including_input_alias_and_dangling_symlink(self):
         target = self.root / "exists.json"
@@ -362,12 +434,14 @@ class FilesystemTests(unittest.TestCase):
                 prepare.read_public_json(path)
         link = self.root / "public-link.json"
         link.symlink_to(path)
-        with self.assertRaises(OSError):
-            prepare.read_public_json(link)
         fifo = self.root / "fifo.json"
         os.mkfifo(fifo)
-        with self.assertRaises(prepare.PrepareError):
-            prepare.read_public_json(fifo)
+        for options in ({}, {"max_bytes": prepare.MAX_GENESIS_INPUT_BYTES}):
+            with self.subTest(options=options):
+                with self.assertRaises(OSError):
+                    prepare.read_public_json(link, **options)
+                with self.assertRaises(prepare.PrepareError):
+                    prepare.read_public_json(fifo, **options)
 
     def test_invalid_arguments_and_same_outputs_leave_no_files(self):
         target = self.root / "output.json"
