@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "deposit_rate_limit": "legacy-amount-bucket-absent-deposits-paused",
+  "pause_deposits": true,
+  "governance": "deployer-admin-proxy-timelock",
+  "networks": {
+    "sepolia": {
+      "native": {"minDepositAmount":"1000000000000000","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true},
+      "PSY": {"minDepositAmount":"1","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true},
+      "pUSDT": {"minDepositAmount":"1000000","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true}
+    },
+    "bscTestnet": {
+      "native": {"minDepositAmount":"1","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true},
+      "PSY": {"minDepositAmount":"1","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true},
+      "pUSDT": {"minDepositAmount":"1000000","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true}
+    },
+    "baseSepolia": {
+      "native": {"minDepositAmount":"1000000000000000","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true},
+      "PSY": {"minDepositAmount":"1","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true},
+      "pUSDT": {"minDepositAmount":"1000000","depositCap":"340282366920938463463374607431768211455","smallWithdrawalMax":"340282366920938463463374607431768211454","mediumWithdrawalMax":"340282366920938463463374607431768211455","totalWithdrawalCap":"340282366920938463463374607431768211455","smallWithdrawalDelay":"0","mediumWithdrawalDelay":"0","largeWithdrawalDelay":"0","configured":true}
+    }
+  }
+}
