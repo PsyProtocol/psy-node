@@ -1128,11 +1128,11 @@ where
     }
 
     async fn verify_recovered_root(&self, checkpoint_id: u64, target_root: N::QHash) -> anyhow::Result<()> {
-        let latest_realm_root = self.get_realm_root_from_db().await?;
-        if latest_realm_root != target_root {
+        let recovered_realm_root = self.db.global_user_tree_get_node(checkpoint_id, self.realm_root_node).await?;
+        if recovered_realm_root != target_root {
             anyhow::bail!(
                 "Post-recovery root mismatch at checkpoint {}! Local: {:?}, Target: {:?}",
-                checkpoint_id, latest_realm_root, target_root
+                checkpoint_id, recovered_realm_root, target_root
             );
         }
         Ok(())
@@ -2145,6 +2145,75 @@ mod init_tests {
         assert_eq!(db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await?, Some((pending_id, proc_id)));
         assert_eq!(db.checkpoint_tree_get_root_hash(checkpoint_id).await?, membership.root);
         assert_eq!(processor.get_database_check_state().await?, DatabaseCheckState::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_recovered_root_uses_requested_checkpoint_with_newer_metadata() -> anyhow::Result<()> {
+        use parth_core::pgoldilocks::PoseidonHasher;
+        use psy_node_core::psy_core_db::traits::full::{
+            PsyNodeCoreDatabaseUserStoreReader, PsyNodeGlobalUserTreeDatabaseReader,
+        };
+
+        let mut env = RealmDbTestEnv::create().await?;
+        env.commit_genesis().await?;
+        let committed_checkpoint = env.db.get_latest_checkpoint_id().await?;
+        assert_eq!(committed_checkpoint, 0);
+        let committed_root = env.seed_consistent_coordinator_head().await?;
+        env.processor.verify_recovered_root(committed_checkpoint, committed_root).await?;
+        let changed_user_id = psy_core::user_id::get_user_id_from_user_registration_id(
+            1, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, N::REALM_GLOBAL_USER_TREE_HEIGHT, N::GROUP_REALM_HEIGHT,
+        );
+        let committed_user_leaf = env.db.get_user_leaf(committed_checkpoint, changed_user_id).await?;
+
+        // Build a real, distinct user-tree root; sync only its authenticated checkpoint records.
+        let mut changed_data = env.genesis_data.clone();
+        changed_data.users[1].balance += 1;
+        let mut update = build_realm_genesis(&changed_data)?.coordinator_update;
+        let newer_checkpoint = committed_checkpoint + 1;
+        update.checkpoint_sync_info.checkpoint_id = newer_checkpoint;
+        update.checkpoint_sync_info.block_state.checkpoint_id = newer_checkpoint;
+        update.checkpoint_sync_info.checkpoint_tree_root = checkpoint_tree_root_for_leaves(&[
+            env.genesis_leaf_hash(), update.checkpoint_sync_info.checkpoint_leaf_hash,
+        ]);
+        let newer_root = update.merkle_proof_to_realm_root.value;
+        assert_ne!(newer_root, committed_root);
+        assert!(update.merkle_proof_to_realm_root.verify::<PoseidonHasher>());
+        assert_eq!(update.merkle_proof_to_realm_root.root, update.checkpoint_sync_info.state_roots.user_tree_root);
+        env.seed_checkpoint_one(update.clone(), newer_root);
+        let membership = env.coordinator.rc_get_checkpoint_tree_merkle_proof(newer_checkpoint).await?;
+        update.checkpoint_sync_info.ensure_valid::<PoseidonHasher>(&membership.siblings)?;
+        assert!(membership.verify::<PoseidonHasher>());
+        assert_eq!(membership.root, update.checkpoint_sync_info.checkpoint_tree_root);
+        env.processor.sync_with_coordinator().await?;
+
+        let verification = env.processor.verify_recovered_root(committed_checkpoint, committed_root).await;
+        env.processor.verify_recovered_root(newer_checkpoint, newer_root).await?;
+        for (checkpoint_id, local_root, wrong_target) in [
+            (committed_checkpoint, committed_root, newer_root),
+            (newer_checkpoint, newer_root, committed_root),
+        ] {
+            let error = env.processor.verify_recovered_root(checkpoint_id, wrong_target).await.unwrap_err();
+            assert_eq!(error.to_string(), format!(
+                "Post-recovery root mismatch at checkpoint {}! Local: {:?}, Target: {:?}",
+                checkpoint_id, local_root, wrong_target,
+            ));
+        }
+        assert_eq!(env.db.get_latest_checkpoint_id().await?, committed_checkpoint);
+        assert_eq!(env.db.get_latest_l2_block_state().await?.checkpoint_id, committed_checkpoint);
+        assert_eq!(env.processor.state.last_committed_checkpoint_id, committed_checkpoint);
+        assert_eq!(env.processor.state.last_committed_realm_end_root, committed_root);
+        assert_eq!(env.db.global_user_tree_get_node(committed_checkpoint, env.processor.realm_root_node).await?, committed_root);
+        assert_eq!(env.db.get_user_leaf(committed_checkpoint, changed_user_id).await?, committed_user_leaf);
+        assert_eq!(env.db.get_user_leaf(newer_checkpoint, changed_user_id).await?, committed_user_leaf);
+        let committed_tree = crate::backup::realm::load_realm_memory_trees_from_db::<N, _>(
+            &env.db, committed_checkpoint, TEST_REALM_ID,
+        ).await?;
+        assert_eq!(committed_tree.global_user_tree.get_root(), committed_root);
+        assert_eq!(env.db.global_user_tree_get_node(newer_checkpoint, env.processor.realm_root_node).await?, newer_root);
+        assert_eq!(env.processor.get_realm_root_from_db().await?, newer_root);
+
+        assert!(verification.is_ok(), "checkpoint-C verification must ignore newer checkpoint metadata: {verification:?}");
         Ok(())
     }
 
